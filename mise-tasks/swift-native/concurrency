@@ -1,0 +1,8 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#MISE description="Explicit opt-in: run all seven frozen shared concurrency schedules through native Swift"
+#USAGE flag "-c --configuration <configuration>" default="debug" help="debug or release"
+
+require_relative "../../impl/swift-native/Tools/swift_task"
+SwiftNativeTasks.run("test", configuration: ENV.fetch("usage_configuration", "debug"),
+                    extra: ["--filter", "ConcurrencyCorpusBoundaryTests"])

@@ -42,13 +42,13 @@ internal enum FloatText {
         if !nonzero { return type == .f32 ? .f32(negative ? 0x8000_0000 : 0) : .f64(negative ? 0x8000_0000_0000_0000 : 0) }
         let source = String(decoding: bytes[start..<end], as: UTF8.self)
         if type == .f32 {
-            guard let value = Float(source) else { throw FloatFunctions.overflow() }
-            guard value.isFinite else { throw FloatFunctions.overflow() }
+            guard let value = Float(source) else { throw FloatFunctions.overflow(type) }
+            guard value.isFinite else { throw FloatFunctions.overflow(type) }
             guard value != 0 else { throw FloatFunctions.underflow() }
             return .f32(value.bitPattern)
         }
-        guard let value = Double(source) else { throw FloatFunctions.overflow() }
-        guard value.isFinite else { throw FloatFunctions.overflow() }
+        guard let value = Double(source) else { throw FloatFunctions.overflow(type) }
+        guard value.isFinite else { throw FloatFunctions.overflow(type) }
         guard value != 0 else { throw FloatFunctions.underflow() }
         return .f64(value.bitPattern)
     }

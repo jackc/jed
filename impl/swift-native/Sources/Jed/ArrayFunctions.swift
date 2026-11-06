@@ -44,9 +44,9 @@ internal enum ArrayFunctions {
         guard source.dimensions.count == 1 else { throw JedError("22000", "argument must be empty or one-dimensional array") }
         let lower = source.lowerBounds[0], count = source.elements.count
         if prepend {
-            guard lower > Int32.min else { throw JedError("22003", "value out of range for type i32") }
+            guard lower > Int32.min else { throw JedError("22003", "value out of range for type i32").withDataType("i32") }
         } else {
-            guard Int64(lower) + Int64(count) <= Int32.max else { throw JedError("22003", "value out of range for type i32") }
+            guard Int64(lower) + Int64(count) <= Int32.max else { throw JedError("22003", "value out of range for type i32").withDataType("i32") }
         }
         try checkSize(count + 1)
         if !prepend { try checkNextBound(lower, length: count + 1) }
@@ -327,7 +327,16 @@ internal enum ArrayFunctions {
         var unknown = false
         for value in array.elements {
             meter.charge(1); try meter.step()
-            try comparisonWork(operation, operand, value, element)
+            // Quantified membership has its own per-element schedule: decimal
+            // work and collated ordering, without ordinary varlen comparison.
+            switch (operand, value) {
+            case (.decimal, .decimal), (.decimal, .integer), (.integer, .decimal):
+                try comparisonWork(operation, operand, value, element)
+            default:
+                if let collation = element.collation, collation.utf8 != [67], ["<", "<=", ">", ">="].contains(operation) {
+                    try comparisonWork(operation, operand, value, element)
+                }
+            }
             let answer: SQLValue
             if operand.isNull || value.isNull { answer = .null }
             else if rowWise { answer = try ValueComparison.sql(operation, operand, value, type: element, collatedKey: collatedKey) }

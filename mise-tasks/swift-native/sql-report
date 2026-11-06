@@ -1,0 +1,119 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#MISE description="Explicit opt-in: group native Swift corpus diagnostics from a captured test log"
+#USAGE arg "<log>" help="Captured swift-native test output"
+#USAGE flag "--json" help="Emit structured diagnostics instead of a text table"
+
+require "json"
+
+# This reads test output only. It does not turn a missing diagnostic or an
+# interrupted run into an acceptance result, and it does not edit fixtures.
+path = ENV.fetch("usage_log")
+unless File.file?(path)
+  warn "SQL diagnostic log does not exist: #{path}"
+  exit 1
+end
+
+files = {}
+blocks = []
+aborted = []
+completion = nil
+invalid_utf8_lines = []
+file_pattern = /[A-Za-z0-9_.\/-]+\.test/
+entry = lambda do |name|
+  files[name] ||= { "file" => name, "reported_records" => nil, "reported_failures" => nil, "failures" => [] }
+end
+add = lambda do |name, body|
+  located = body.match(/\Aline (\d+): (.*)\z/)
+  item = { "line" => located ? located[1].to_i : nil, "message" => located ? located[2] : body }
+  failures = entry.call(name)["failures"]
+  failures << item unless failures.include?(item)
+end
+
+File.open(path, "rb") do |input|
+input.each_line.with_index(1) do |raw, number|
+  # A live log may end midway through a UTF-8 diagnostic; SQL diagnostics may
+  # also intentionally contain arbitrary byte input. Match and deduplicate the
+  # original bytes, preserving invalid lines for the JSON evidence record.
+  unless raw.dup.force_encoding(Encoding::UTF_8).valid_encoding?
+    invalid_utf8_lines << { "log_line" => number, "bytes_hex" => raw.unpack1("H*") }
+  end
+  line = raw.gsub(/\e\[[0-9;]*m/, "").chomp
+  if (match = line.match(/Whole SQL file (#{file_pattern}): (\d+) records, (\d+) failures; first: (.*)\z/))
+    info = entry.call(match[1])
+    info["reported_records"] = match[2].to_i
+    info["reported_failures"] = match[3].to_i
+    add.call(match[1], match[4])
+  elsif (match = line.match(/SQL failure (#{file_pattern}):(.*)\z/))
+    add.call(match[1], match[2])
+  elsif (match = line.match(/: failed - (#{file_pattern}):(.*)\z/))
+    add.call(match[1], match[2])
+  elsif (match = line.match(/SQL adapter blocked file(?: summary)?: (.*)\z/))
+    blocks << match[1] unless blocks.include?(match[1])
+  elsif (match = line.match(/SQL (?:host action|execution) aborted file: (#{file_pattern})\z/))
+    aborted << match[1] unless aborted.include?(match[1])
+  elsif line.start_with?("Whole SQL corpus:")
+    completion = line
+  end
+end
+end
+
+classified = files.values.sort_by { |item| item["file"].bytes }.map do |item|
+  item["failures"].sort_by! { |failure| [failure["line"] || 0, failure["message"].bytes] }
+  kinds = Hash.new(0)
+  item["failures"].each do |failure|
+    message = failure["message"]
+    categories = []
+    categories << "cost" if message.match?(/expected cost /)
+    categories << "types" if message.match?(/expected types /)
+    categories << "names" if message.match?(/expected names /)
+    categories << "sqlstate" if message.match?(/expected SQLSTATE |unexpected [0-9A-Z]{5}:/)
+    categories << "values" if message.match?(/expected \[|first differing cell /)
+    categories << "harness" if message.include?("harness ")
+    categories << "schedule" if message.match?(/schedule |expected (?:version|oldest_live) /)
+    categories << "other" if categories.empty?
+    categories.each { |kind| kinds[kind] += 1 }
+  end
+  item.merge("kinds" => kinds.sort.to_h)
+end
+report = {
+  "log" => File.expand_path(path),
+  "completion_summary" => completion,
+  "observed_failure_count" => classified.sum { |item| item["failures"].length },
+  "files" => classified,
+  "adapter_blocks" => blocks.sort_by(&:bytes),
+  "aborted_files" => aborted.sort_by(&:bytes),
+  "invalid_utf8_lines" => invalid_utf8_lines
+}
+
+# Replacement is display-only. Classification above never rewrites bytes, and
+# invalid original lines remain available losslessly in the JSON hex field.
+display = lambda do |value|
+  case value
+  when String then value.dup.force_encoding(Encoding::UTF_8).scrub
+  when Array then value.map { |item| display.call(item) }
+  when Hash then value.to_h { |key, item| [key, display.call(item)] }
+  else value
+  end
+end
+report = display.call(report)
+classified = report["files"]
+blocks = report["adapter_blocks"]
+aborted = report["aborted_files"]
+completion = report["completion_summary"]
+
+if ENV["usage_json"] == "true"
+  puts JSON.pretty_generate(report)
+else
+  puts completion || "Partial log: no whole-corpus completion summary was captured."
+  puts "Observed #{report['observed_failure_count']} distinct record failures in #{classified.length} files; #{blocks.length} adapter blocks; #{aborted.length} aborted files."
+  classified.each do |item|
+    details = item["kinds"].map { |kind, count| "#{kind}=#{count}" }.join(", ")
+    locations = item["failures"].map { |failure| failure["line"] || "file-end" }.uniq.join(",")
+    reported = item["reported_failures"]
+    incomplete = reported && reported != item["failures"].length ? " (file summary reported #{reported})" : ""
+    puts "#{item['file']}: #{item['failures'].length} observed failures#{incomplete} (#{details}); lines #{locations}"
+  end
+  blocks.sort_by(&:bytes).each { |block| puts "ADAPTER BLOCK: #{block}" }
+  aborted.sort_by(&:bytes).each { |name| puts "ABORTED FILE: #{name}" }
+end

@@ -9,22 +9,36 @@ internal final class WindowSelectExecution {
     private let plan: SelectPlan
     private let window: WindowQueryPlan
     private let context: ExpressionContext
+    private let hostBatch: HostBatch?
     private var rows: [[SQLValue]] = []
     private var rowBytes: [Int64] = []
     private var reserved: Int64 = 0
     private var position = 0
     private var produced: Int64 = 0
+    private var bounded: BlockingWindowExecution?
     private var started = false
 
     init(plan: SelectPlan, window: WindowQueryPlan, context: ExpressionContext) {
         self.plan = plan; self.window = window; self.context = context
+        hostBatch = HostBatch(expressions: plan.projections, context: context)
     }
     func next() throws -> [SQLValue]? {
+        if (plan.aggregation != nil || plan.distinctOn != nil || BlockingJoinRows.eligible(plan)), context.spill?.canSpill == true,
+           try !plan.scan.hasKnownContradiction(parameters: context.parameters, collatedKey: context.collatedKey) {
+            if bounded == nil { bounded = BlockingWindowExecution(plan: plan, context: context) }
+            return try bounded?.next()
+        }
         if !started { try prepare(); started = true }
         guard position < rows.count, plan.limit == nil || produced < plan.limit! else { return nil }
+        let at = position
+        let end = position + Int(min(Int64(rows.count - position), plan.limit.map { $0 - produced } ?? Int64.max))
         let row = rows[position]; position += 1; produced += 1
         if plan.productionCharge { context.meter.charge(1); try context.meter.guardCost() }
-        let current = window.rowContext(row, parent: context)
+        var current = window.rowContext(row, parent: context); current.hostBatch = hostBatch
+        try hostBatch?.setRow(at, count: end, context: current) { source, column in
+            let values = self.rows[source], slot = self.window.slot(column)
+            return values.indices.contains(slot) ? values[slot] : nil
+        }
         return try plan.projections.map { try current.evaluate($0) }
     }
     private func reserve(_ bytes: Int64) throws {
@@ -52,12 +66,12 @@ internal final class WindowSelectExecution {
                 try input.prime()
                 while Int64(rows.count) < prefix, let row = try input.next() {
                     var current = context; current.column = { row[$0] }
-                    if let predicate = plan.predicate, try !context.profile(plan.profileIdentity, .filter, { try current.matches(predicate) }) { continue }
+                    if !input.predicateApplied, let predicate = plan.predicate, try !context.profile(plan.profileIdentity, .filter, { try current.matches(predicate) }) { continue }
                     try append(row, bytes: MemorySizes.row(row))
                 }
             } else {
                 while let row = try input.next() { try append(row, bytes: MemorySizes.row(row)) }
-                if let predicate = plan.predicate {
+                if !input.predicateApplied, let predicate = plan.predicate {
                     var kept: [[SQLValue]] = [], sizes: [Int64] = []
                     for (row, bytes) in zip(rows, rowBytes) {
                         var current = context; current.column = { row[$0] }
@@ -127,6 +141,25 @@ internal final class WindowSelectExecution {
             if result != 0 { return term.descending ? -result : result }
         }
         return 0
+    }
+    static func boundedStage(_ input: RowSpool, plan: SelectPlan, context: ExpressionContext) throws -> RowSpool {
+        guard let window = plan.window else { return input }
+        defer { input.close() }
+        let execution = WindowSelectExecution(plan: plan, window: window, context: context)
+        defer { execution.close() }
+        return try context.profile(plan.profileIdentity, .window) {
+            let cursor = try input.cursor(); defer { cursor.close() }
+            while let row = try cursor.next() {
+                try execution.append(BlockingOutputLayout.expanded(row, aggregate: plan.aggregation), bytes: MemorySizes.row(row))
+            }
+            try execution.apply()
+            execution.release(execution.reserved)
+            let output = RowSpool(config: try BlockingRows.configuration(context))
+            do {
+                for row in execution.rows { try output.append(BlockingOutputLayout.compact(row, aggregate: plan.aggregation)) }
+                return output
+            } catch { output.close(); throw error }
+        }
     }
     private func apply() throws {
         guard !rows.isEmpty else { return }
@@ -339,7 +372,7 @@ internal final class WindowSelectExecution {
             for ordinal in plan.keyEvaluationOrder {
                 let term = plan.order[ordinal]
                 let value = try current.evaluate(term.expression)
-                if case .column = term.expression.node {} else {
+                if plan.materializesOrderKey(term) {
                     let bytes = MemorySizes.value(value); try reserve(bytes); rowBytes[index] = saturatingAdd(rowBytes[index], bytes)
                 }
                 values[ordinal] = value
@@ -368,6 +401,7 @@ internal final class WindowSelectExecution {
         }
         rows = indices.map { rows[$0] }; rowBytes = indices.map { rowBytes[$0] }
     }
-    func close() { rows = []; rowBytes = []; context.meter.resources.query.release(reserved); reserved = 0 }
+    func close() {
+        hostBatch?.reset(); bounded?.close(); bounded = nil; rows = []; rowBytes = []; context.meter.resources.query.release(reserved); reserved = 0 }
     deinit { close() }
 }

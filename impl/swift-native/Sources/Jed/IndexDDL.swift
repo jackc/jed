@@ -71,7 +71,7 @@ extension CatalogDDL {
             guard kind == 0 || kind == 2 && replacing != nil else { throw JedError("0A000", "a partial (WHERE) \(method) index is not supported yet") }
             try CatalogExpressionPolicy.validate(syntax, isDefault: false)
             let resolved = try resolver.resolve(syntax, expected: TypeDescriptor(.scalar(.boolean)))
-            guard resolved.type == nil || resolved.type?.type == .scalar(.boolean) else { throw JedError("42804", "argument of WHERE must be boolean") }
+            guard resolved.type == nil || resolved.type?.type == .scalar(.boolean) else { throw JedError("42804", "argument of WHERE must be boolean").at(syntax.expressionLocation) }
             expressions.append(resolved); predicate = try CatalogSQL.expression(syntax, source: source)
         }
         let dependencies = try IndexDependencies.resolve(expressions, environment: settings.environment)
@@ -102,6 +102,7 @@ extension CatalogDDL {
             let indexed = try plan.row(row.value, storageKey: record.key)
             if index.unique, let prefix = indexed.prefix, !prefix.hasNull && !unique.insert(prefix.bytes).inserted {
                 throw JedError("23505", "duplicate key value violates unique constraint: \(name)")
+                    .object(table: table.name, constraint: name, detail: context.errorDetail?.index(table, plan: plan, value: row.value, ending: "is duplicated."))
             }
             entries += indexed.entries
         }
@@ -126,7 +127,7 @@ extension CatalogDDL {
             if let table = catalog.tables.first(where: { $0.indexes.contains { $0.name == name } }),
                let index = table.indexes.first(where: { $0.name == name }) {
                 guard !index.isConstraint, !table.exclusions.contains(where: { $0.index == name }) else {
-                    throw JedError("2BP01", "cannot drop index \(name) because a constraint requires it")
+                    throw JedError("2BP01", "cannot drop index \(name) because a constraint requires it").hinted(DependencyDiagnostics.ownedIndex(name, table: table))
                 }
                 targets.insert(name)
             } else if relations.contains(name) { throw JedError("42809", "\(name) is not an index") }
@@ -141,7 +142,7 @@ extension CatalogDDL {
             for foreign in child.foreignKeys {
                 guard let parent = image.tables.first(where: { $0.name == foreign.referencedTable }) else { continue }
                 guard uniqueCover(foreign.referencedColumns, table: parent) else {
-                    throw JedError("2BP01", "cannot drop index because other objects depend on it: constraint \(foreign.name) on table \(child.name)")
+                    throw JedError("2BP01", "cannot drop index because other objects depend on it: constraint \(foreign.name) on table \(child.name)").hinted(DependencyDiagnostics.cascade)
                 }
             }
         }

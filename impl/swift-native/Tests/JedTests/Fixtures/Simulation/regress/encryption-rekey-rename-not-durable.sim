@@ -1,0 +1,413 @@
+# A rekey whose process died after its rename but before the directory barrier, then a power loss: the
+# older file comes back under its older key, and recovery must open it with that key (S12). The runner
+# first assumed the new key held. Found by the first encryption sweep.
+# format: simulation
+# profile: encryption
+# seed: 39
+# page_size: 1024
+# cache_bytes: 8192
+# encrypted: 1
+# clock: 1700000000000000
+open w1 write
+on w1 CREATE TABLE t1 (id i64 PRIMARY KEY, c1 bytea, c2 bytea)
+on w1 INSERT INTO t1 (id, c1, c2) SELECT g, decode(md5(g::text), 'hex'), decode(repeat(md5(g::text), 24), 'hex') FROM generate_series(1, 35) g
+commit w1
+open r1 read
+clock +3273386
+on r1 SELECT * FROM t1 ORDER BY id LIMIT 6
+rekey 1
+crash power survive=1000 tear=173
+check
+fault process_crash issue=519 nth=2
+rekey 3
+crash power survive=1000 tear=201
+open w2 write
+on w2 SELECT * FROM t1 ORDER BY md5(id::text) LIMIT 27
+check
+on w2 UPDATE t1 SET c1 = decode(repeat(md5(id::text), 11), 'hex'), c2 = decode(md5(id::text), 'hex') WHERE id % 5 = 4
+on w2 INSERT INTO t1 (id, c1, c2) SELECT g, decode(md5(g::text), 'hex'), decode(md5(g::text), 'hex') FROM generate_series(36, 73) g
+on w2 UPDATE t1 SET c1 = decode(md5(id::text), 'hex') WHERE id BETWEEN 15 AND 38
+on w2 SELECT * FROM t1 WHERE id BETWEEN 145 AND 165 ORDER BY id
+change_key 2
+on w2 INSERT INTO t1 (id, c1, c2) SELECT g, decode(md5(g::text), 'hex'), decode(md5(g::text), 'hex') FROM generate_series(74, 96) g
+on w2 UPDATE t1 SET c2 = decode(md5(id::text), 'hex') WHERE id % 3 = 1
+on w2 SELECT * FROM t1 WHERE id BETWEEN 259 AND 279 ORDER BY id
+open r2 read
+open r3 read
+rekey 2
+crash process
+compact
+open r4 read
+crash process
+fault process_crash issue=665 nth=3
+change_key 3
+open r5 read
+open w3 write
+fault process_crash issue=547 nth=1
+rekey 1
+open r6 read
+change_key 3
+close r6
+fault power_loss survive=102 tear=223 nth=2
+change_key 3
+open w4 write
+crash process
+crash power survive=1000 tear=0
+rekey 1
+reopen
+open w5 write
+commit w5
+crash process
+change_key 2
+open r7 read
+open w6 write
+change_key 3
+crash process
+open w7 write
+on w7 DELETE FROM t1 WHERE id BETWEEN 33 AND 55
+on w7 UPDATE t1 SET c1 = NULL, c2 = decode(md5(id::text), 'hex') WHERE id BETWEEN 8 AND 35
+on w7 UPDATE t1 SET c2 = decode(md5(id::text), 'hex') WHERE id BETWEEN 1 AND 16
+on w7 ALTER TABLE t1 ADD COLUMN c3x1 text
+on w7 SELECT * FROM t1 ORDER BY md5(id::text) LIMIT 9
+on w7 UPDATE t1 SET c1 = decode(md5(id::text), 'hex') WHERE id % 7 = 2
+on w7 INSERT INTO t1 (id, c1, c2, c3x1) SELECT g, decode(md5(g::text), 'hex'), decode(md5(g::text), 'hex'), NULL FROM generate_series(36, 67) g
+open r8 read
+open r9 read
+on w7 INSERT INTO t1 (id, c1, c2, c3x1) SELECT g, decode(md5(g::text), 'hex'), decode(md5(g::text), 'hex'), uuidv4()::text FROM generate_series(68, 99) g
+commit w7
+close r9
+open r10 read
+close r8
+change_key 2
+on r10 SELECT id % 3 AS k, count(*), max(id) FROM t1 GROUP BY 1
+open r11 read
+open w8 write
+change_key 3
+on r10 SELECT * FROM t1 WHERE id = 262
+rekey 2
+on w8 UPDATE t1 SET c2 = decode(md5(id::text), 'hex') WHERE id BETWEEN 32 AND 42
+on w8 SELECT * FROM t1 WHERE id = 271
+commit w8
+open w9 write
+on w9 INSERT INTO t1 (id, c1, c2, c3x1) SELECT g, decode(md5(g::text), 'hex'), decode(md5(g::text), 'hex'), md5(g::text || '485.1') || md5(g::text || '485.2') || md5(g::text || '485.3') || md5(g::text || '485.4') || md5(g::text || '485.5') || md5(g::text || '485.6') || md5(g::text || '485.7') || md5(g::text || '485.8') || md5(g::text || '485.9') || md5(g::text || '485.10') || md5(g::text || '485.11') || md5(g::text || '485.12') || md5(g::text || '485.13') FROM generate_series(100, 113) g
+on w9 INSERT INTO t1 (id, c1, c2, c3x1) SELECT g, decode(md5(g::text), 'hex'), decode(md5(g::text), 'hex'), uuidv4()::text FROM generate_series(114, 132) g
+on w9 INSERT INTO t1 (id, c1, c2, c3x1) SELECT g, decode(md5(g::text), 'hex'), decode(md5(g::text), 'hex'), md5(g::text) FROM generate_series(133, 153) g
+on w9 INSERT INTO t1 (id, c1, c2, c3x1) SELECT g, decode(md5(g::text), 'hex'), NULL, md5(g::text) FROM generate_series(154, 184) g
+check
+fault power_loss survive=1000 tear=22 nth=3
+change_key 2
+open w10 write
+on w10 INSERT INTO t1 (id, c1, c2, c3x1) SELECT g, decode(md5(g::text), 'hex'), decode(md5(g::text), 'hex'), md5(g::text) FROM generate_series(100, 125) g
+commit w10
+open r12 read
+crash process
+clock +2100482
+open r13 read
+on r13 SELECT * FROM t1 WHERE id = 12
+on r13 SELECT id % 2 AS k, count(*), max(id) FROM t1 GROUP BY 1
+on r13 SELECT * FROM t1 WHERE id = 106
+change_key 2
+change_key 2
+close r13
+open w11 write
+on w11 UPDATE t1 SET c2 = decode(md5(id::text), 'hex'), c3x1 = md5(id::text) WHERE id BETWEEN 34 AND 59
+on w11 UPDATE t1 SET c1 = decode(md5(id::text), 'hex'), c2 = decode(md5(id::text), 'hex'), c3x1 = md5(id::text || '79.1') || md5(id::text || '79.2') || md5(id::text || '79.3') || md5(id::text || '79.4') || md5(id::text || '79.5') || md5(id::text || '79.6') || md5(id::text || '79.7') || md5(id::text || '79.8') || md5(id::text || '79.9') || md5(id::text || '79.10') || md5(id::text || '79.11') || md5(id::text || '79.12') || md5(id::text || '79.13') || md5(id::text || '79.14') || md5(id::text || '79.15') || md5(id::text || '79.16') || md5(id::text || '79.17') || md5(id::text || '79.18') || md5(id::text || '79.19') WHERE id BETWEEN 87 AND 108
+on w11 SELECT * FROM t1 WHERE id = 62
+fault process_crash issue=1000
+commit w11
+rekey 3
+open r14 read
+on r14 SELECT * FROM t1 WHERE id BETWEEN 127 AND 147 ORDER BY id
+crash power survive=1000 tear=0
+open w12 write
+on w12 ALTER TABLE t1 ADD COLUMN c4x2 text
+on w12 INSERT INTO t1 (id, c1, c2, c3x1, c4x2) SELECT g, NULL, decode(md5(g::text), 'hex'), NULL, md5(g::text) FROM generate_series(126, 158) g
+rekey 1
+commit w12
+change_key 1
+change_key 2
+open r15 read
+on r15 SELECT id % 6 AS k, count(*), max(id) FROM t1 GROUP BY 1
+open r16 read
+change_key 2
+change_key 1
+close r15
+open w13 write
+on w13 UPDATE t1 SET c3x1 = md5(id::text), c4x2 = uuidv4()::text WHERE id BETWEEN 152 AND 162
+on w13 INSERT INTO t1 (id, c1, c2, c3x1, c4x2) SELECT g, NULL, decode(md5(g::text), 'hex'), NULL, NULL FROM generate_series(159, 164) g
+commit w13
+change_key 2
+close r16
+reopen
+open w14 write
+fault io_error op=write p=246
+commit w14
+open w15 write
+commit w15
+open r17 read
+close r17
+check
+open w16 write
+commit w16
+open r18 read
+fault process_crash issue=323 nth=2
+change_key 2
+fault power_loss survive=878 tear=135 nth=2
+change_key 1
+open w17 write
+commit w17
+change_key 1
+open w18 write
+on w18 INSERT INTO t1 (id, c1, c2, c3x1, c4x2) SELECT g, decode(md5(g::text), 'hex'), decode(md5(g::text), 'hex'), md5(g::text), md5(g::text) FROM generate_series(165, 180) g
+on w18 INSERT INTO t1 (id, c1, c2, c3x1, c4x2) SELECT g, decode(md5(g::text), 'hex'), decode(md5(g::text), 'hex'), uuidv4()::text, md5(g::text || '876.1') || md5(g::text || '876.2') || md5(g::text || '876.3') || md5(g::text || '876.4') || md5(g::text || '876.5') || md5(g::text || '876.6') || md5(g::text || '876.7') || md5(g::text || '876.8') || md5(g::text || '876.9') || md5(g::text || '876.10') || md5(g::text || '876.11') || md5(g::text || '876.12') FROM generate_series(181, 201) g
+clock +2200429
+change_key 3
+rollback w18
+crash process
+open r19 read
+change_key 1
+on r19 SELECT * FROM t1 ORDER BY id LIMIT 10
+check
+fault power_loss survive=184 tear=73 nth=1
+change_key 3
+reopen
+fault process_crash issue=1000 nth=2
+change_key 3
+open w19 write
+commit w19
+fault power_loss survive=167 tear=0 nth=1
+compact
+open w20 write
+on w20 SELECT * FROM t1 ORDER BY id LIMIT 3
+on w20 SELECT * FROM t1 WHERE id = 298
+on w20 SELECT count(*), sum(id) FROM t1
+open r20 read
+on w20 INSERT INTO t1 (id, c1, c2, c3x1, c4x2) SELECT g, decode(md5(g::text), 'hex'), decode(md5(g::text), 'hex'), md5(g::text), md5(g::text || '191.1') || md5(g::text || '191.2') || md5(g::text || '191.3') || md5(g::text || '191.4') || md5(g::text || '191.5') || md5(g::text || '191.6') FROM generate_series(165, 170) g
+close r20
+open r21 read
+on w20 DELETE FROM t1 WHERE id % 6 = 3
+commit w20
+crash power survive=1000 tear=323
+fault process_crash issue=858 nth=3
+compact
+open w21 write
+on w21 REINDEX TABLE t1
+commit w21
+open r22 read
+open w22 write
+clock +2432489
+on w22 INSERT INTO t1 (id, c1, c2, c3x1, c4x2) SELECT g, NULL, decode(repeat(md5(g::text), 7), 'hex'), md5(g::text), md5(g::text) FROM generate_series(171, 208) g
+on w22 ALTER TABLE t1 ADD COLUMN c5x3 i32
+on r22 SELECT count(*), sum(id) FROM t1
+open r23 read
+on w22 INSERT INTO t1 (id, c1, c2, c3x1, c4x2, c5x3) SELECT g, decode(md5(g::text), 'hex'), decode(md5(g::text), 'hex'), NULL, md5(g::text), (g * 69 + 47) % 1000 FROM generate_series(209, 230) g
+change_key 3
+rekey 2
+on w22 CREATE INDEX ix1 ON t1 (c5x3)
+on w22 CREATE INDEX ix2 ON t1 (c5x3)
+rollback w22
+fault process_crash issue=805 nth=3
+rekey 3
+check
+rekey 1
+open r24 read
+change_key 2
+open w23 write
+open r25 read
+on r24 SELECT * FROM t1 ORDER BY md5(id::text) LIMIT 20
+on w23 INSERT INTO t1 (id, c1, c2, c3x1, c4x2) SELECT g, decode(repeat(md5(g::text), 26), 'hex'), decode(md5(g::text), 'hex'), repeat(md5(g::text), 28), md5(g::text || '766.1') || md5(g::text || '766.2') || md5(g::text || '766.3') || md5(g::text || '766.4') || md5(g::text || '766.5') || md5(g::text || '766.6') FROM generate_series(20, 45) g ON CONFLICT (id) DO UPDATE SET c1 = excluded.c1, c2 = excluded.c2, c3x1 = excluded.c3x1, c4x2 = excluded.c4x2
+change_key 2
+open r26 read
+commit w23
+on r26 SELECT count(*), sum(id) FROM t1
+open w24 write
+fault power_loss survive=1000 tear=61 nth=3
+change_key 2
+reopen
+check
+open r27 read
+close r27
+crash power survive=1000 tear=188
+open w25 write
+on w25 DELETE FROM t1 WHERE id % 4 = 3
+check
+on w25 UPDATE t1 SET c2 = decode(md5(id::text), 'hex'), c4x2 = md5(id::text || '568.1') || md5(id::text || '568.2') || md5(id::text || '568.3') || md5(id::text || '568.4') || md5(id::text || '568.5') || md5(id::text || '568.6') || md5(id::text || '568.7') || md5(id::text || '568.8') || md5(id::text || '568.9') || md5(id::text || '568.10') || md5(id::text || '568.11') || md5(id::text || '568.12') || md5(id::text || '568.13') WHERE id BETWEEN 139 AND 169
+change_key 3
+on w25 UPDATE t1 SET c4x2 = md5(id::text) WHERE id BETWEEN 154 AND 161
+on w25 UPDATE t1 SET c2 = decode(md5(id::text), 'hex'), c3x1 = c3x1 || 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx' WHERE id % 5 = 1
+on w25 INSERT INTO t1 (id, c1, c2, c3x1, c4x2) SELECT g, decode(repeat(md5(g::text), 25), 'hex'), decode(md5(g::text), 'hex'), md5(g::text), md5(g::text) FROM generate_series(171, 205) g
+check
+on w25 INSERT INTO t1 (id, c1, c2, c3x1, c4x2) SELECT g, decode(md5(g::text), 'hex'), decode(md5(g::text), 'hex'), md5(g::text), md5(g::text || '555.1') || md5(g::text || '555.2') || md5(g::text || '555.3') || md5(g::text || '555.4') || md5(g::text || '555.5') || md5(g::text || '555.6') || md5(g::text || '555.7') || md5(g::text || '555.8') || md5(g::text || '555.9') || md5(g::text || '555.10') || md5(g::text || '555.11') || md5(g::text || '555.12') || md5(g::text || '555.13') || md5(g::text || '555.14') || md5(g::text || '555.15') || md5(g::text || '555.16') || md5(g::text || '555.17') || md5(g::text || '555.18') || md5(g::text || '555.19') || md5(g::text || '555.20') || md5(g::text || '555.21') || md5(g::text || '555.22') FROM generate_series(183, 210) g ON CONFLICT (id) DO UPDATE SET c1 = excluded.c1, c2 = excluded.c2, c3x1 = excluded.c3x1, c4x2 = excluded.c4x2
+commit w25
+open r28 read
+open w26 write
+on w26 UPDATE t1 SET c2 = decode(md5(id::text), 'hex'), c3x1 = md5(id::text), c4x2 = md5(id::text || '472.1') || md5(id::text || '472.2') || md5(id::text || '472.3') || md5(id::text || '472.4') || md5(id::text || '472.5') WHERE id % 4 = 3
+commit w26
+on r28 SELECT count(*), sum(id) FROM t1
+fault process_crash issue=1000 nth=2
+change_key 2
+open r29 read
+open w27 write
+commit w27
+close r29
+open r30 read
+change_key 3
+fault power_loss survive=603 tear=85 nth=2
+rekey 2
+open r31 read
+open r32 read
+reopen
+open r33 read
+open w28 write
+crash power survive=746 tear=16
+change_key 1
+crash power survive=339 tear=230
+open w29 write
+rekey 3
+on w29 INSERT INTO t1 (id, c1, c2, c3x1, c4x2) SELECT g, decode(md5(g::text), 'hex'), decode(md5(g::text), 'hex'), repeat(md5(g::text), 32), md5(g::text) FROM generate_series(211, 244) g
+open r34 read
+on r34 SELECT count(*), sum(id) FROM t1
+on w29 DELETE FROM t1 WHERE id % 3 = 0
+on w29 UPDATE t1 SET c1 = decode(md5(id::text), 'hex') WHERE id BETWEEN 166 AND 187
+on w29 UPDATE t1 SET c2 = NULL WHERE id BETWEEN 58 AND 65
+close r34
+open r35 read
+on r35 SELECT id % 4 AS k, count(*), max(id) FROM t1 GROUP BY 1
+commit w29
+close r35
+change_key 2
+open w30 write
+on w30 INSERT INTO t1 (id, c1, c2, c3x1, c4x2) SELECT g, decode(repeat(md5(g::text), 4), 'hex'), decode(md5(g::text), 'hex'), md5(g::text), NULL FROM generate_series(245, 263) g
+crash power survive=383 tear=0
+check
+open w31 write
+on w31 CREATE SEQUENCE IF NOT EXISTS s1
+on w31 SELECT nextval('s1')
+on w31 UPDATE t1 SET c2 = decode(md5(id::text), 'hex'), c4x2 = c4x2 || 'xxxxxxxxxxxxxxxxxxxxxxx' WHERE id BETWEEN 174 AND 175
+on w31 SELECT id % 8 AS k, count(*), max(id) FROM t1 GROUP BY 1
+on w31 UPDATE t1 SET c2 = decode(md5(id::text), 'hex') WHERE id BETWEEN 193 AND 219
+on w31 INSERT INTO t1 (id, c1, c2, c3x1, c4x2) SELECT g, decode(md5(g::text), 'hex'), decode(md5(g::text), 'hex'), md5(g::text), md5(g::text) FROM generate_series(245, 252) g
+on w31 INSERT INTO t1 (id, c1, c2, c3x1, c4x2) SELECT g, NULL, decode(md5(g::text), 'hex'), md5(g::text), md5(g::text) FROM generate_series(253, 270) g
+open r36 read
+rollback w31
+on r36 SELECT * FROM t1 WHERE id = 64
+open r37 read
+close r36
+on r37 SELECT * FROM t1 WHERE id = 195
+open r38 read
+crash process
+crash process
+open r39 read
+on r39 SELECT * FROM t1 ORDER BY md5(id::text) LIMIT 20
+on r39 SELECT * FROM t1 ORDER BY md5(id::text) LIMIT 32
+open w32 write
+on w32 INSERT INTO t1 (id, c1, c2, c3x1, c4x2) SELECT g, decode(md5(g::text), 'hex'), decode(repeat(md5(g::text), 17), 'hex'), md5(g::text || '884.1') || md5(g::text || '884.2') || md5(g::text || '884.3') || md5(g::text || '884.4') || md5(g::text || '884.5') || md5(g::text || '884.6') || md5(g::text || '884.7') || md5(g::text || '884.8') || md5(g::text || '884.9'), NULL FROM generate_series(245, 275) g
+on r39 SELECT * FROM t1 ORDER BY md5(id::text) LIMIT 36
+on w32 UPDATE t1 SET c1 = NULL, c2 = decode(repeat(md5(id::text), 8), 'hex'), c3x1 = md5(id::text) WHERE id BETWEEN 108 AND 138
+commit w32
+open w33 write
+on w33 INSERT INTO t1 (id, c1, c2, c3x1, c4x2) SELECT g, NULL, NULL, md5(g::text), repeat(md5(g::text), 55) FROM generate_series(276, 290) g
+on w33 INSERT INTO t1 (id, c1, c2, c3x1, c4x2) SELECT g, decode(repeat(md5(g::text), 34), 'hex'), decode(md5(g::text), 'hex'), md5(g::text || '841.1') || md5(g::text || '841.2') || md5(g::text || '841.3') || md5(g::text || '841.4') || md5(g::text || '841.5') || md5(g::text || '841.6') || md5(g::text || '841.7') || md5(g::text || '841.8') || md5(g::text || '841.9') || md5(g::text || '841.10') || md5(g::text || '841.11') || md5(g::text || '841.12') || md5(g::text || '841.13') || md5(g::text || '841.14'), md5(g::text) FROM generate_series(156, 171) g ON CONFLICT (id) DO UPDATE SET c1 = excluded.c1, c2 = excluded.c2, c3x1 = excluded.c3x1, c4x2 = excluded.c4x2
+on w33 CREATE TABLE t2 (id i64 PRIMARY KEY, c1 i32)
+crash process
+open w34 write
+on w34 INSERT INTO t1 (id, c1, c2, c3x1, c4x2) SELECT g, decode(repeat(md5(g::text), 11), 'hex'), decode(repeat(md5(g::text), 34), 'hex'), uuidv4()::text, repeat(md5(g::text), 29) FROM generate_series(276, 289) g
+on w34 UPDATE t1 SET c2 = decode(repeat(md5(id::text), 25), 'hex'), c4x2 = md5(id::text) WHERE id % 7 = 0
+check
+on w34 UPDATE t1 SET c1 = decode(md5(id::text), 'hex'), c2 = decode(repeat(md5(id::text), 28), 'hex'), c3x1 = c3x1 || 'x', c4x2 = md5(id::text || '913.1') || md5(id::text || '913.2') || md5(id::text || '913.3') || md5(id::text || '913.4') || md5(id::text || '913.5') || md5(id::text || '913.6') || md5(id::text || '913.7') || md5(id::text || '913.8') || md5(id::text || '913.9') || md5(id::text || '913.10') || md5(id::text || '913.11') || md5(id::text || '913.12') || md5(id::text || '913.13') || md5(id::text || '913.14') || md5(id::text || '913.15') || md5(id::text || '913.16') || md5(id::text || '913.17') || md5(id::text || '913.18') || md5(id::text || '913.19') || md5(id::text || '913.20') || md5(id::text || '913.21') || md5(id::text || '913.22') || md5(id::text || '913.23') || md5(id::text || '913.24') WHERE id BETWEEN 140 AND 148
+on w34 DELETE FROM t1 WHERE id % 4 = 3
+on w34 INSERT INTO t1 (id, c1, c2, c3x1, c4x2) SELECT g, decode(md5(g::text), 'hex'), decode(md5(g::text), 'hex'), repeat(md5(g::text), 57), md5(g::text) FROM generate_series(290, 329) g
+open r40 read
+on w34 UPDATE t1 SET c1 = decode(md5(id::text), 'hex'), c3x1 = repeat(md5(id::text), 48), c4x2 = c4x2 || 'xxx' WHERE id BETWEEN 323 AND 325
+reopen
+crash power survive=624 tear=353
+open w35 write
+on w35 UPDATE t1 SET c1 = decode(md5(id::text), 'hex'), c4x2 = md5(id::text) WHERE id % 6 = 5
+on w35 UPDATE t1 SET c1 = decode(repeat(md5(id::text), 17), 'hex'), c2 = decode(md5(id::text), 'hex'), c3x1 = md5(id::text), c4x2 = md5(id::text) WHERE id % 2 = 1
+on w35 UPDATE t1 SET c3x1 = c3x1 || 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx', c4x2 = md5(id::text) WHERE id BETWEEN 252 AND 268
+on w35 INSERT INTO t1 (id, c1, c2, c3x1, c4x2) SELECT g, decode(repeat(md5(g::text), 25), 'hex'), decode(md5(g::text), 'hex'), NULL, md5(g::text || '465.1') || md5(g::text || '465.2') || md5(g::text || '465.3') || md5(g::text || '465.4') FROM generate_series(276, 310) g
+on w35 DELETE FROM t1 WHERE id BETWEEN 295 AND 298
+commit w35
+change_key 1
+open r41 read
+open r42 read
+open w36 write
+check
+check
+on w36 UPDATE t1 SET c3x1 = c3x1 || 'xxxxxxxxxxxxxxxx', c4x2 = NULL WHERE id BETWEEN 163 AND 163
+on r41 SELECT * FROM t1 ORDER BY md5(id::text) LIMIT 22
+on w36 UPDATE t1 SET c3x1 = c3x1 || 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx', c4x2 = c4x2 || 'xxxxxxxxxxxxxxxxxxxxxx' WHERE id BETWEEN 183 AND 202
+commit w36
+open r43 read
+open w37 write
+on r43 SELECT * FROM t1 ORDER BY md5(id::text) LIMIT 36
+on w37 SELECT * FROM t1 ORDER BY id LIMIT 5
+rekey 2
+on w37 ANALYZE t1
+close r41
+open r44 read
+on w37 CREATE TABLE t3 (id i64 PRIMARY KEY, c1 i32, c2 bytea)
+commit w37
+close r43
+on r44 SELECT id % 2 AS k, count(*), max(id) FROM t1 GROUP BY 1
+crash process
+crash process
+reopen
+crash process
+open r45 read
+crash process
+crash process
+change_key 3
+open r46 read
+check
+close r46
+fault process_crash issue=476 nth=1
+change_key 2
+reopen
+open w38 write
+on w38 SELECT * FROM t3 ORDER BY id LIMIT 5
+on w38 SELECT * FROM t3 WHERE id = 234
+rollback w38
+crash power survive=728 tear=273
+open w39 write
+on w39 INSERT INTO t3 (id, c1, c2) SELECT g, (g * 24 + 30) % 1000, decode(md5(g::text), 'hex') FROM generate_series(1, 31) g
+on w39 SELECT * FROM t3 WHERE id = 149
+on w39 SELECT * FROM t1 ORDER BY md5(id::text) LIMIT 34
+on w39 CREATE TABLE t4 (id i64 PRIMARY KEY, c1 i64, c2 text)
+on w39 SELECT * FROM t4 ORDER BY id LIMIT 2
+on w39 SELECT * FROM t1 ORDER BY md5(id::text) LIMIT 13
+commit w39
+clock +4971666
+reopen
+open w40 write
+on w40 ALTER TABLE t1 ADD COLUMN c5x4 text
+check
+rollback w40
+open w41 write
+commit w41
+reopen
+reopen
+crash process
+crash process
+clock +687064
+check
+open w42 write
+on w42 CREATE SEQUENCE IF NOT EXISTS s2
+on w42 SELECT nextval('s2')
+on w42 DROP TABLE IF EXISTS t1
+crash process
+open r47 read
+open r48 read
+open w43 write
+open r49 read
+on w43 INSERT INTO t3 (id, c1, c2) SELECT g, (g * 93 + 38) % 1000, decode(md5(g::text), 'hex') FROM generate_series(32, 49) g
+close r48
+fault process_crash issue=331 nth=3
+rekey 2
+open w44 write
+commit w44
+crash process
+open r50 read
+close r50
+reopen
+check

@@ -89,7 +89,7 @@ internal enum TypeRules {
         if case .integer(let rank) = scalarFacts[scalar.name]?.metadata["rank"] { return rank }
         return 0
     }
-    private static func rows(_ table: [String: SpecDataValue], _ key: String) -> [[String: SpecDataValue]] {
+    static func rows(_ table: [String: SpecDataValue], _ key: String) -> [[String: SpecDataValue]] {
         guard case .array(let values) = table[key] else { return [] }
         return values.compactMap { if case .table(let row) = $0 { row } else { nil } }
     }
@@ -108,7 +108,7 @@ internal enum TypeRules {
         }
         guard let left, let right else { return }
         if let a = fields(left), let b = fields(right) {
-            guard a.count == b.count else { throw JedError("42804", "cannot compare rows of different sizes") }
+            guard a.count == b.count else { throw JedError("42804", "cannot compare rows of different sizes").hinted(nil) }
             for (a, b) in zip(a, b) { try comparable(a.descriptor.type, b.descriptor.type) }
             return
         }

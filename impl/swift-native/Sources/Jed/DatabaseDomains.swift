@@ -63,6 +63,19 @@ internal final class DatabaseDomains: @unchecked Sendable {
     /// Opening is outside the publication lock. Duplicate/refusal cleanup owns
     /// the newly opened handle and cannot disturb an existing attachment.
     func attach(_ name: SQLText, source: AttachSource, readOnly: Bool, main: Database) throws {
+        try attach(name, readOnly: readOnly, main: main) {
+            switch source {
+            case .memory: return try Database(environment: main.environment, pageSize: main.pageSize)
+            case .file(let path, var options):
+                options.environment = main.environment; options.readOnly = readOnly
+                options.synchronous = main.synchronous; options.flushIntervalMilliseconds = main.flushIntervalMilliseconds
+                return try Database.open(path, options: options)
+            }
+        }
+    }
+    /// First-party host factories supply only the opened handle. Identity,
+    /// writer admission, scratch policy and failure cleanup stay shared.
+    func attach(_ name: SQLText, readOnly: Bool, main: Database, open: () throws -> Database) throws {
         guard !name.utf8.isEmpty else { throw JedError("42710", "attachment name must not be empty") }
         let token = try writer.acquire(wait: false)
         defer { writer.release(token) }
@@ -72,13 +85,7 @@ internal final class DatabaseDomains: @unchecked Sendable {
                 throw JedError("42710", "database \"\(name)\" is already attached or reserved")
             }
         }
-        let database: Database
-        switch source {
-        case .memory: database = try Database(environment: main.environment, pageSize: main.pageSize)
-        case .file(let path, var options):
-            options.environment = main.environment; options.readOnly = readOnly
-            database = try Database.open(path, options: options)
-        }
+        let database = try open()
         do {
             if database.core.storage.pager.codec.reservedBytes != 0,
                let scratch = main.scratchFileHost, !scratch.sealed {
@@ -116,10 +123,40 @@ internal final class DatabaseDomains: @unchecked Sendable {
             do {
                 pins[DomainNames.main] = try main.core.beginRead()
                 for name in attachments.keys.sorted() { pins[name] = try attachments[name]!.database.core.beginRead() }
-                return DomainReadBundle(pins: pins)
+                return DomainReadBundle(pins: pins, database: main)
             } catch { for pin in pins.values { pin.close() }; throw error }
         }
     }
+    /// Export captures one committed target while attachment identity remains
+    /// fixed. Its pin survives publication and prevents detach/replacement;
+    /// other domains need no read admission or coordination RPC.
+    func pinCommitted(_ name: SQLText, main: Database) throws -> SnapshotPin {
+        try withPublication {
+            try checkOpen()
+            let target: Database
+            if name == DomainNames.main { target = main }
+            else {
+                guard let attachment = attachments[name] else {
+                    throw JedError("42704", "database \"\(name)\" is not attached")
+                }
+                target = attachment.database
+            }
+            try target.checkOpen()
+            return try target.core.beginRead()
+        }
+    }
+    func integrityPin(_ name: SQLText, main: Database) throws -> (Database, SnapshotPin) {
+        try withPublication {
+            try checkOpen()
+            let target: Database
+            if name == DomainNames.main { target = main }
+            else if let attachment = attachments[name] { target = attachment.database }
+            else { throw JedError("42704", "database is not attached") }
+            try target.checkOpen()
+            return (target, try target.core.beginRead())
+        }
+    }
+
     /// Provisional catalog routing must not open a reader before waiting for
     /// the writer gate: such a pin can cancel the owner's post-ack maintenance.
     /// These snapshots are for resident metadata only, never row/page access.
@@ -220,12 +257,12 @@ internal final class DomainWriteBundle {
         for name in leases.keys.sorted() { try leases[name]!.checkRole() }
         for name in reads.keys.sorted() { try reads[name]!.checkRole() }
     }
-    func pin(_ working: QueryDomains) throws -> DomainReadBundle {
+    func pin(_ working: QueryDomains, borrowingWriter: Bool = false) throws -> DomainReadBundle {
         var pins: [SQLText: SnapshotPin] = [:]
         do {
-            for name in leases.keys.sorted() { pins[name] = try leases[name]!.pin(working.snapshot(name)) }
+            for name in leases.keys.sorted() { pins[name] = try leases[name]!.pin(working.snapshot(name), borrowingWriter: borrowingWriter) }
             for name in reads.keys.sorted() { pins[name] = try reads[name]!.retain() }
-            return DomainReadBundle(pins: pins)
+            return DomainReadBundle(pins: pins, database: handles[DomainNames.main]?.database)
         } catch { for pin in pins.values { pin.close() }; throw error }
     }
     func requireWritable(_ name: SQLText) throws {
@@ -245,6 +282,14 @@ internal final class DomainWriteBundle {
         let participants = leases.keys.sorted().map { name -> DomainCommitParticipant in
             let database = handles[name]!.database
             var policy = DomainCommitPolicy(); policy.storageLimit = database.maxStorageBytes; policy.domainName = name
+            #if os(Linux) || canImport(Darwin)
+            // Direct file attachments use the frozen common-reader gate.
+            // Service attachments retain their own owner/client watermark.
+            if DomainNames.isAttachment(name), database.host is FileDatabaseHost,
+               handles[DomainNames.main]!.database.core.livePinCount > 0 {
+                policy.oldestPinnedVersion = 0
+            }
+            #endif
             return DomainCommitParticipant(name: name, lease: leases[name]!, working: working.snapshots[name]!,
                 policy: policy, entropy: database.keyEntropy, synchronous: synchronous)
         }

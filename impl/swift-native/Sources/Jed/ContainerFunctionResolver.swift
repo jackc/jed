@@ -2,7 +2,7 @@
 /// unification and literal adaptation remain handwritten, just like scalar
 /// overload selection; the catalog supplies names, slots, and result rules.
 internal enum ContainerFunctionResolver {
-    static func resolve(_ call: SQLCall, resolve: FunctionResolver.Resolve) throws -> ResolvedFunction? {
+    static func resolve(_ call: SQLCall, originals supplied: [ResolvedExpression]? = nil, resolve: FunctionResolver.Resolve) throws -> ResolvedFunction? {
         let range = GeneratedSpec.ranges.first { fact in
             fact.id == call.name.description || fact.aliases.contains(call.name.description)
         }
@@ -11,7 +11,12 @@ internal enum ContainerFunctionResolver {
                 (range != nil || FunctionResolver.strings(row.metadata, "arg_families").contains { $0.hasPrefix("any") && $0 != "any" })
         }
         guard !rows.isEmpty || call.name.description == "width_bucket" && call.arguments.count == 2 else { return nil }
-        let originals = try call.arguments.map { try resolve($0.value, nil) }
+        let originals = try supplied ?? call.arguments.map { try resolve($0.value, nil) }
+        return try finish(call, range: range, rows: rows, originals: originals, resolve: resolve)
+    }
+
+    private static func finish(_ call: SQLCall, range: RangeSpecFact?, rows: [FunctionSpecFact],
+                               originals: [ResolvedExpression], resolve: FunctionResolver.Resolve) throws -> ResolvedFunction? {
         if call.name.description == "array_to_string", originals.first.map({ if case .array = $0.type?.type { return false }; return true }) == true {
             throw JedError(originals[0].type == nil || FunctionResolver.bareString(call.arguments[0].value) ? "42804" : "42883", "array_to_string requires an array")
         }

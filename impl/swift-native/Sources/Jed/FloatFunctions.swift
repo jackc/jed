@@ -8,7 +8,7 @@ import Darwin
 /// explicitly exempted transcendental values use the host's libm (float.md §8).
 /// The evaluator charges the ordinary operator_eval; these kernels add no cost.
 internal enum FloatFunctions {
-    static func overflow() -> JedError { JedError("22003", "value out of range: overflow") }
+    static func overflow(_ type: ScalarType) -> JedError { JedError("22003", "value out of range: overflow").withDataType(type.name) }
     static func underflow() -> JedError { JedError("22003", "value out of range: underflow") }
     private static func domain() -> JedError { JedError("22003", "input is out of range") }
     private static let radiansPerDegree: Double = 0.0174532925199432957692
@@ -37,13 +37,13 @@ internal enum FloatFunctions {
         if op == "^" { return .f64(try power(number(left), number(right)).bitPattern) }
         if width == .f32 {
             guard case .f32(let a) = left, case .f32(let b) = right else { throw JedError("42804", "binary32 operation requires binary32 operands") }
-            return .f32(try arithmetic(op, Float(bitPattern: a), Float(bitPattern: b)).bitPattern)
+            return .f32(try arithmetic(op, Float(bitPattern: a), Float(bitPattern: b), width: .f32).bitPattern)
         }
         guard width == .f64 else { throw JedError("42804", "float operation requires a float result type") }
-        return .f64(try arithmetic(op, number(left), number(right)).bitPattern)
+        return .f64(try arithmetic(op, number(left), number(right), width: .f64).bitPattern)
     }
 
-    private static func arithmetic<T: BinaryFloatingPoint>(_ operation: String, _ left: T, _ right: T) throws -> T {
+    private static func arithmetic<T: BinaryFloatingPoint>(_ operation: String, _ left: T, _ right: T, width: ScalarType) throws -> T {
         if (operation == "/" || operation == "%" || operation == "mod") && right == 0 && !left.isNaN {
             throw JedError("22012", "division by zero")
         }
@@ -56,7 +56,7 @@ internal enum FloatFunctions {
         case "%", "mod": result = left.truncatingRemainder(dividingBy: right)
         default: throw JedError("42883", "unknown float binary operator")
         }
-        if left.isFinite && right.isFinite && !result.isFinite { throw overflow() }
+        if left.isFinite && right.isFinite && !result.isFinite { throw overflow(width) }
         if result == 0 {
             if operation == "*" && left != 0 && right != 0 { throw underflow() }
             if operation == "/" && left != 0 && right.isFinite { throw underflow() }
@@ -97,13 +97,13 @@ internal enum FloatFunctions {
         case "sqrt":
             guard !(x < 0) else { throw JedError("2201F", "cannot take square root of a negative number") }
             result = x.squareRoot()
-        case "radians": result = try arithmetic("*", x, radiansPerDegree)
-        case "degrees": result = try arithmetic("/", x, radiansPerDegree)
-        case "mod": result = try arithmetic("%", x, number(args[1]))
+        case "radians": result = try arithmetic("*", x, radiansPerDegree, width: .f64)
+        case "degrees": result = try arithmetic("/", x, radiansPerDegree, width: .f64)
+        case "mod": result = try arithmetic("%", x, number(args[1]), width: .f64)
         case "exp":
             result = exp(x)
             if x.isFinite {
-                if !result.isFinite { throw overflow() }
+                if !result.isFinite { throw overflow(.f64) }
                 if result == 0 { throw underflow() }
             }
         case "ln", "log10":
@@ -147,12 +147,12 @@ internal enum FloatFunctions {
         if places > 308 {
             let exact = try BinaryFloatDecimal.exact(bits64: value.bitPattern)
             let rounded = exact.rescaledUncapped(to: Int(places))
-            guard let result = Double(rounded.description) else { throw overflow() }
+            guard let result = Double(rounded.description) else { throw overflow(.f64) }
             return Double(sign: value.sign, exponent: 0, significand: result.magnitude)
         }
         // Parse an exact decimal power of ten to avoid platform-dependent libm
         // exponentiation in the otherwise correctly rounded scale/round path.
-        guard let scale = Double("1e\(places)") else { throw overflow() }
+        guard let scale = Double("1e\(places)") else { throw overflow(.f64) }
         let scaled = value * scale
         if scaled.isInfinite { return value }
         return scaled.rounded(.toNearestOrAwayFromZero) / scale
@@ -177,7 +177,7 @@ internal enum FloatFunctions {
             return Double(sign: sign, exponent: 0, significand: exponent > 0 ? .infinity : 0)
         }
         let result = pow(base, exponent)
-        if !result.isFinite { throw overflow() }
+        if !result.isFinite { throw overflow(.f64) }
         if result == 0 && base != 0 { throw underflow() }
         return result
     }

@@ -14,14 +14,15 @@ internal final class FileDatabaseHost: DatabaseHostLifetime, DatabaseFilesystemP
     let path: String
     private struct State { var store: any FileBlockStore; var closed = false; var poisoned = false }
     private let state: Mutex<State>
+    private let flusher = Mutex<BatchFlusher?>(nil)
     var store: any FileBlockStore { state.withLock { $0.store } }
     let scratch: any ScratchFileHost
     let fileOperations: any FileOperations
-    private let bundle: FileLockBundle?
+    private let bundle: (any FileOwnership)?
     private let opener: pid_t
     private let skipFsync: Bool
     var skipsFsync: Bool { skipFsync }
-    private init(path: String, store: any FileBlockStore, bundle: FileLockBundle?, skipFsync: Bool,
+    private init(path: String, store: any FileBlockStore, bundle: (any FileOwnership)?, skipFsync: Bool,
                  operations: any FileOperations, scratch: any ScratchFileHost) {
         self.path = path; self.state = Mutex(State(store: store)); self.bundle = bundle; self.skipFsync = skipFsync; opener = getpid()
         self.fileOperations = operations; self.scratch = scratch
@@ -35,6 +36,7 @@ internal final class FileDatabaseHost: DatabaseHostLifetime, DatabaseFilesystemP
         try bundle?.checkOpen()
     }
     func close() throws {
+        let worker = flusher.withLock { value in let previous = value; value = nil; return previous }; worker?.stop()
         try state.withLock { state in
             if state.closed { return }
             // close(2) consumes the descriptor even when a late I/O error is
@@ -45,6 +47,12 @@ internal final class FileDatabaseHost: DatabaseHostLifetime, DatabaseFilesystemP
     }
     deinit { try? close() }
 
+    func bindIdleFlusher(to core: DatabaseCore, failed: (@Sendable () -> Void)? = nil) {
+        let old = flusher.withLock { value in let old = value; value = nil; return old }; old?.stop()
+        guard fileOperations.backgroundBatchFlush, !core.storage.readOnly else { return }
+        let worker = BatchFlusher(core: core, failed: failed ?? { [weak self] in self?.poison() })
+        flusher.withLock { $0 = worker }
+    }
     func poison() { state.withLock { $0.poisoned = true } }
     func syncDirectory() throws { try fileOperations.syncDirectory(path, skipFsync: skipFsync) }
 
@@ -59,10 +67,9 @@ internal final class FileDatabaseHost: DatabaseHostLifetime, DatabaseFilesystemP
             }
             try source.pager.checkWritable()
             let temporary = path + ".jedtmp"
-            // A previous interrupted maintenance may leave this disposable
-            // sibling. Unlinking first also avoids following a stale symlink.
-            try fileOperations.remove(temporary)
-            let target = try fileOperations.create(temporary, skipFsync: skipFsync)
+            // Host preparation discards a previous interrupted sibling while
+            // preserving each platform's temporary-file creation policy.
+            let target = try fileOperations.createReplacementTemporary(temporary, skipFsync: skipFsync)
             var renamed = false
             defer { try? target.close(); if !renamed { try? fileOperations.remove(temporary) } }
             try fileOperations.copyPermissions(from: state.store, to: target)
@@ -99,6 +106,7 @@ internal final class FileDatabaseHost: DatabaseHostLifetime, DatabaseFilesystemP
                     validateCatalog: { try CatalogEnvironment.validate($0, environment: environment) },
                     durableDirectorySync: { [fileOperations, path, skipFsync] in try fileOperations.syncDirectory(path, skipFsync: skipFsync) })
                 replacement.pager.acknowledgeFreshDurableImage()
+                replacement.pager.copyBatchFlushSettings(from: source.pager)
                 state.store = device
                 return replacement
             } catch { try? opened?.close(); state.poisoned = true; throw error }
@@ -128,7 +136,7 @@ internal final class FileDatabaseHost: DatabaseHostLifetime, DatabaseFilesystemP
     /// simulated files execute this exact creation/publication sequence.
     static func createResolved(path: String, options: CreateOptions, catalogID: UInt64, random: any RandomSource,
                                operations: any FileOperations, scratch: (any ScratchFileHost)? = nil,
-                               bundle: FileLockBundle? = nil) throws -> Database {
+                               bundle: (any FileOwnership)? = nil) throws -> Database {
         var host: FileDatabaseHost?
         var temporary: String?
         do {
@@ -143,10 +151,18 @@ internal final class FileDatabaseHost: DatabaseHostLifetime, DatabaseFilesystemP
             let storage = try StorageDomain.create(store: store, kind: .file, catalogID: catalogID,
                 pageSize: options.pageSize, cacheBytes: options.cacheBytes, credential: options.credential,
                 parameters: options.kdf, entropy: { try random.bytes(count: $0) })
+            try store.close()
             try operations.rename(temporaryPath, to: path, replace: false); temporary = nil
             try operations.syncDirectory(path, skipFsync: options.skipFsync)
-            return Database(core: DatabaseCore(storage: storage, environment: options.environment), environment: options.environment,
-                maxStorageBytes: options.maxStorageBytes, keySource: random, host: owner)
+            // Adopt the published pathname only after its directory barrier.
+            // Reopening the same byte device preserves the fresh pager's state
+            // and makes a post-publication host failure fail creation itself.
+            try store.reopen(path: path)
+            storage.pager.configureBatchFlush(clock: options.environment.clockSource, milliseconds: options.flushIntervalMilliseconds)
+            let database = Database(core: DatabaseCore(storage: storage, environment: options.environment), environment: options.environment,
+                maxStorageBytes: options.maxStorageBytes, keySource: random, host: owner, flushIntervalMilliseconds: options.flushIntervalMilliseconds)
+            database.synchronous = options.synchronous; owner.bindIdleFlusher(to: database.core)
+            return database
         } catch {
             if let host { try? host.close() } else { bundle?.close() }
             if let temporary { try? operations.remove(temporary) }
@@ -166,7 +182,7 @@ internal final class FileDatabaseHost: DatabaseHostLifetime, DatabaseFilesystemP
         } catch { bundle?.close(); throw error }
     }
     static func openResolved(path: String, options: OpenOptions, catalogID: UInt64, operations: any FileOperations,
-                             scratch: (any ScratchFileHost)? = nil, bundle: FileLockBundle? = nil,
+                             scratch: (any ScratchFileHost)? = nil, bundle: (any FileOwnership)? = nil,
                              unlockedCodec: EncryptedPageCodec? = nil, structural: Bool = false) throws -> Database {
         var host: FileDatabaseHost?
         var store: (any FileBlockStore)?
@@ -184,8 +200,11 @@ internal final class FileDatabaseHost: DatabaseHostLifetime, DatabaseFilesystemP
             let owner = FileDatabaseHost(path: path, store: device, bundle: bundle, skipFsync: options.skipFsync,
                 operations: operations, scratch: scratch ?? NativeScratchFileHost(sealed: storage.pager.codec.reservedBytes != 0 || options.scratchEncryption == .on))
             host = owner
-            return Database(core: DatabaseCore(storage: storage, environment: options.environment), environment: options.environment,
-                maxStorageBytes: options.maxStorageBytes, host: owner)
+            storage.pager.configureBatchFlush(clock: options.environment.clockSource, milliseconds: options.flushIntervalMilliseconds)
+            let database = Database(core: DatabaseCore(storage: storage, environment: options.environment), environment: options.environment,
+                maxStorageBytes: options.maxStorageBytes, host: owner, flushIntervalMilliseconds: options.flushIntervalMilliseconds)
+            database.synchronous = options.synchronous; owner.bindIdleFlusher(to: database.core)
+            return database
         } catch {
             if let host { try? host.close() } else { try? store?.close(); bundle?.close() }
             throw error

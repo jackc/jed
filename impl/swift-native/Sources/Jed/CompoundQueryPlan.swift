@@ -5,20 +5,8 @@ internal final class CompoundQueryPlan {
     let body: Body
     let settings: SessionSettings
     init(body: Body, settings: SessionSettings) { self.body = body; self.settings = settings }
-    var expressions: [ResolvedExpression] {
-        switch body {
-        case .set(_, _, let left, let right): left.expressions + right.expressions
-        case .values(let rows, _): rows.flatMap { $0 }
-        case .nested(let child): child.expressions
-        }
-    }
-    var foldExpressions: [ResolvedExpression] {
-        switch body {
-        case .set(_, _, let left, let right): left.foldExpressions + right.foldExpressions
-        case .values(let rows, _): rows.flatMap { $0 }
-        case .nested(let child): child.foldExpressions
-        }
-    }
+    var expressions: [ResolvedExpression] { QueryExpressions.collect(.compound(self), folding: false) }
+    var foldExpressions: [ResolvedExpression] { QueryExpressions.collect(.compound(self), folding: true) }
     func context(from parent: ExpressionContext) -> ExpressionContext {
         var context = parent; context.patterns = PatternExecution()
         StatementServices(settings: settings, meter: parent.meter).install(into: &context)
@@ -39,14 +27,14 @@ internal final class CompoundQueryPlan {
             let matching = operation != "union" || !all
             projections = try left.columns.indices.map { index in
                 let a = left.projections[index], b = right.projections[index]
-                let type = try TypeRules.common(a.type?.type, b.type?.type)
-                if matching { try TypeRules.comparable(type, type) }
+                let type = try ResolutionDiagnostics.common(a.type?.type, b)
+                if matching { try ResolutionDiagnostics.comparable(type, at: a.location, ordering: false) }
                 var descriptor = type.map(TypeDescriptor.init)
                 if a.type == b.type { descriptor = a.type }
                 let derivation = try ExpressionCollation.combine([a, b])
                 if matching { _ = try derivation.orderingName() }
                 descriptor?.collation = derivation.name
-                return ResolvedExpression(type: descriptor, node: .column(index), position: 0, collation: derivation.asColumn)
+                return ResolvedExpression(type: descriptor, node: .column(index), position: 0, location: a.location, collation: derivation.asColumn)
             }
             columns = left.columns.indices.map { ResultColumn(name: left.columns[$0].name, type: projections[$0].type) }
             body = .set(operation, all, left, right)
@@ -59,7 +47,7 @@ internal final class CompoundQueryPlan {
             for row in syntax {
                 guard row.count == first.count else { throw JedError("42601", "VALUES lists must all be the same length") }
                 let resolved = try row.map { try resolver.resolve($0) }; rows.append(resolved)
-                for index in types.indices { types[index] = try TypeRules.common(types[index], resolved[index].type?.type) }
+                for index in types.indices { types[index] = try ResolutionDiagnostics.common(types[index], resolved[index]) }
             }
             for row in rows.indices {
                 for index in types.indices {
@@ -70,24 +58,29 @@ internal final class CompoundQueryPlan {
             }
             projections = try types.indices.map { index in
                 let operands = rows.map { $0[index] }
-                var type = types[index].map(TypeDescriptor.init)
-                if operands.allSatisfy({ $0.type == operands.first?.type }) { type = operands.first?.type }
+                var type: TypeDescriptor? = TypeDescriptor(types[index] ?? .scalar(.text))
+                if let firstType = operands.first?.type, operands.allSatisfy({ $0.type == firstType }) { type = firstType }
                 let derivation = try ExpressionCollation.combine(operands)
                 type?.collation = derivation.name
-                return ResolvedExpression(type: type, node: .column(index), position: 0, collation: derivation.asColumn)
+                return ResolvedExpression(type: type, node: .column(index), position: 0, location: operands.first?.location ?? 0, collation: derivation.asColumn)
             }
             columns = types.indices.map { ResultColumn(name: SQLText(validatedUTF8: Array("column\($0 + 1)".utf8)),
                 type: projections[$0].type) }
-            body = .values(rows, true)
+            body = .values(rows, false)
         case .nested(let query):
             let child = try SelectPlan.resolve(query, snapshot: snapshot, settings: settings, scalar: scalar, using: resolver, finalizeParameters: false)
             body = .nested(child); columns = child.columns
-            projections = child.projections.enumerated().map { ResolvedExpression(type: $0.element.type, node: .column($0.offset), position: 0, collation: $0.element.collation) }
+            projections = child.projections.enumerated().map { ResolvedExpression(type: $0.element.type, node: .column($0.offset), position: 0, location: $0.element.location, collation: $0.element.collation) }
         default: throw JedError("0A000", "compound query body is not yet connected")
         }
         let order = try query.orderBy.map { term -> ResolvedOrderTerm in
+            var expression = term.expression
+            var collations: [SQLText] = []
+            while case .collate(let child, let name) = expression.kind {
+                collations.append(name); expression = child
+            }
             let index: Int
-            switch term.expression.kind {
+            switch expression.kind {
             case .number(let spelling):
                 guard let ordinal = Int(spelling), ordinal > 0, ordinal <= columns.count else { throw JedError("42P10", "ORDER BY position is not in select list") }
                 index = ordinal - 1
@@ -99,20 +92,32 @@ internal final class CompoundQueryPlan {
             case .column: throw JedError("42P01", "ORDER BY has no relation scope after a set operation")
             default: throw JedError("0A000", "invalid set-operation ORDER BY expression")
             }
-            var type = columns[index].type ?? TypeDescriptor(.scalar(.text))
-            type.collation = try ExpressionCollation.derive(projections[index]).orderingName()
-            try TypeRules.comparable(type.type, type.type)
-            return ResolvedOrderTerm(expression: projections[index], type: type, descending: term.descending, nullsFirst: term.nullsFirst ?? term.descending)
+            var value = projections[index]
+            for name in collations.reversed() {
+                guard ExpressionCollation.collatable(value.type?.type) else {
+                    throw JedError("42804", "collations are not supported by this column's type")
+                }
+                _ = try resolver.unicode.resolve(name)
+                value.collation = .explicit(name); value.type?.collation = name
+            }
+            var type = value.type ?? TypeDescriptor(.scalar(.text))
+            type.collation = try ExpressionCollation.derive(value).orderingName()
+            try ResolutionDiagnostics.comparable(type.type, at: term.expression.expressionLocation, ordering: true)
+            return ResolvedOrderTerm(expression: value, type: type, descending: term.descending, nullsFirst: term.nullsFirst ?? term.descending)
         }
         func bound(_ spelling: String?, code: String) throws -> Int64? {
             guard let spelling else { return nil }
-            guard let value = Int64(spelling), value >= 0 else { throw JedError(code, "invalid row-count bound") }
-            return value
+            guard let value = try? TypeRules.unsignedLiteral(spelling), value <= UInt64(Int64.max) else {
+                throw JedError(code, "invalid row-count bound")
+            }
+            return Int64(value)
         }
-        return SelectPlan(columns: columns, projections: projections, predicate: nil, store: nil, touched: [],
+        var result = SelectPlan(columns: columns, projections: projections, predicate: nil, store: nil, touched: [],
             parameters: try finalizeParameters ? ParameterBinding.finalize(resolver) : [],
             limit: try bound(query.limit, code: "2201W"), offset: try bound(query.offset, code: "2201X") ?? 0,
             order: order, orderedByScan: false, descending: false, scan: BaseScanPlan(predicate: nil, keys: [], types: []),
             compound: CompoundQueryPlan(body: body, settings: settings))
+        result.offsetPresent = query.offset != nil
+        return result
     }
 }

@@ -1,0 +1,12 @@
+[package]
+name = "jed-swift-interop-peer"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "jed-interop-rust"
+path = "../rust.rs"
+
+[dependencies]
+jed = { path = "../../../../rust" }

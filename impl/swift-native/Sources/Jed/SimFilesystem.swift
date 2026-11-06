@@ -22,6 +22,7 @@ internal final class SimFilesystem: @unchecked Sendable {
     fileprivate var fault: SimFault?
     fileprivate(set) var fired = ""
     fileprivate var dead = false
+    var isDead: Bool { locked { dead } }
     fileprivate var oracle = false
     fileprivate(set) var syncs = 0
     fileprivate(set) var barriers = 0
@@ -50,7 +51,11 @@ internal final class SimFilesystem: @unchecked Sendable {
         }
     }
     func withOracle<T>(_ body: () throws -> T) rethrows -> T {
-        try locked { let old = oracle; oracle = true; defer { oracle = old }; return try body() }
+        let old = locked { let old = oracle; oracle = true; return old }
+        defer { locked { oracle = old } }
+        // A client oracle may wait for an owner thread that needs the byte
+        // device. The flag spans the operation; the filesystem lock must not.
+        return try body()
     }
     fileprivate func allFiles() -> [SimFileData] {
         var seen: Set<ObjectIdentifier> = [], result: [SimFileData] = []
@@ -79,10 +84,10 @@ internal final class SimFilesystem: @unchecked Sendable {
         }
     }
     func exists(_ path: String) throws -> Bool { try locked { try alive("stat"); return files[path] != nil } }
-    func create(_ path: String) throws -> SimDisk {
+    func create(_ path: String, replacing: Bool = false) throws -> SimDisk {
         try locked {
             try alive("create")
-            guard files[path] == nil else { throw JedError("58P02", "database file already exists: \(path)") }
+            guard replacing || files[path] == nil else { throw JedError("58P02", "database file already exists: \(path)") }
             let file = SimFileData(key: SimDecision.fileKey(path))
             files[path] = file
             directoryChanges.append(.init(kind: 99, from: "", to: path, file: file))
@@ -117,9 +122,23 @@ internal final class SimFilesystem: @unchecked Sendable {
     }
     func syncDirectory() throws {
         try locked {
-            fold(68); try alive("directory sync")
-            guard !directoryChanges.isEmpty else { return }
-            try barrier(); durable = files; directoryChanges = []
+            fold(68)
+            // The shared simulated directory hook is a void host call. Death
+            // at this barrier is observed by the next fallible operation;
+            // pending directory changes remain for the crash oracle.
+            guard !dead, !directoryChanges.isEmpty else { return }
+            do { try barrier() } catch { return }
+            durable = files; directoryChanges = []
+        }
+    }
+    /// Oracle inspection observes the model directly, including after an injected
+    /// process death. It does not perform a byte-device read or consume a fault.
+    func facts(_ path: String) -> SimDisk.Facts? {
+        locked {
+            guard let file = files[path] else { return nil }
+            return SimDisk.Facts(cache: file.cache, durable: file.durable,
+                pendingOffsets: file.pending.keys.sorted(), barrierComplete: file.barrierComplete,
+                writes: file.writes, pages: file.pages)
         }
     }
     func entryDurable(_ path: String) -> Bool { locked { files[path] === durable[path] } }
@@ -176,6 +195,19 @@ internal final class SimFilesystem: @unchecked Sendable {
         if let fault, fault.kind == .spill, !oracle,
            SimDecision.value(seed: seed, lane: 11, step: step, offset: ordinal) % 1000 < UInt64(fault.probability) {
             fired = "spill"; throw Self.injected("spill I/O error")
+        }
+    }
+
+    /// Host restore is durable by construction and starts a new inode. Its
+    /// archive includes abandoned pages from both source and replaced paths.
+    func restore(_ source: String, to destination: String) throws {
+        try locked {
+            guard let original = files[source] else { throw JedError("58P01", "backup does not exist") }
+            durable = files; directoryChanges = []
+            let restored = SimFileData(key: SimDecision.fileKey(destination))
+            restored.cache = original.cache; restored.durable = original.cache
+            restored.inherit(files[destination]); restored.inherit(original)
+            files[destination] = restored; durable[destination] = restored; fold(82, key: restored.key)
         }
     }
 }
@@ -324,13 +356,79 @@ internal final class SimDisk: FileBlockStore, @unchecked Sendable {
         let pages: Set<Int>
     }
     var facts: Facts { filesystem.locked { Facts(cache: file.cache, durable: file.durable, pendingOffsets: file.pending.keys.sorted(), barrierComplete: file.barrierComplete, writes: file.writes, pages: file.pages) } }
+
+    struct ChangedPage { let page: Int; let original: [UInt8] }
+    private func pending(in range: Range<Int>) -> Bool {
+        file.pending.contains { offset, versions in
+            versions.contains { offset < range.upperBound && offset + $0.count > range.lowerBound }
+        }
+    }
+    func corrupt(step: UInt64, flips: Int, pageCount: UInt32, reseal: Bool) throws -> [ChangedPage] {
+        try filesystem.locked {
+            guard pageCount > 2, flips > 0 else { return [] }
+            let size = filesystem.pageSize
+            var changed: [ChangedPage] = [], seen: Set<Int> = []
+            for ordinal in 0..<flips {
+                let page = 2 + Int(SimDecision.value(seed: filesystem.seed, lane: 12, step: step, offset: UInt64(ordinal)) % UInt64(pageCount - 2))
+                let bit = Int(SimDecision.value(seed: filesystem.seed, lane: 13, step: step, offset: UInt64(ordinal)) % UInt64(size * 8))
+                let offset = page * size, end = offset + size
+                guard end <= file.cache.count, end <= file.durable.count, !pending(in: offset..<end) else { continue }
+                if seen.insert(page).inserted { changed.append(ChangedPage(page: page, original: Array(file.durable[offset..<end]))) }
+                file.durable[offset + bit / 8] ^= 1 << (bit % 8)
+            }
+            for change in changed {
+                let start = change.page * size, range = start..<start + size
+                var bytes = Array(file.durable[range])
+                if reseal {
+                    let checksum = try PageEnvelope.checksum(bytes, at: 12)
+                    for i in 0..<4 { bytes[12 + i] = UInt8(truncatingIfNeeded: checksum >> (24 - i * 8)) }
+                    file.durable.replaceSubrange(range, with: bytes)
+                }
+                file.cache.replaceSubrange(range, with: bytes)
+            }
+            return changed
+        }
+    }
+    func restorePages(_ pages: [ChangedPage]) {
+        filesystem.locked {
+            for page in pages {
+                let start = page.page * filesystem.pageSize, range = start..<start + page.original.count
+                file.durable.replaceSubrange(range, with: page.original); file.cache.replaceSubrange(range, with: page.original)
+            }
+        }
+    }
+    func replayVersions(_ page: UInt32) -> [[UInt8]] {
+        filesystem.locked {
+            let offset = Int(page) * filesystem.pageSize, end = offset + filesystem.pageSize
+            guard end <= file.cache.count, !pending(in: offset..<end) else { return [] }
+            let current = Array(file.cache[offset..<end])
+            return (file.archive[Int(page)] ?? []).filter { $0 != current }.sorted { $0.lexicographicallyPrecedes($1) }
+        }
+    }
+    func replay(_ page: UInt32, bytes: [UInt8]) throws -> ChangedPage {
+        try filesystem.locked {
+            let offset = Int(page) * filesystem.pageSize, end = offset + filesystem.pageSize
+            guard bytes.count == filesystem.pageSize, end <= file.cache.count, end <= file.durable.count,
+                  !pending(in: offset..<end) else { throw SimFilesystem.injected("invalid replay destination") }
+            let original = ChangedPage(page: Int(page), original: Array(file.durable[offset..<end]))
+            file.cache.replaceSubrange(offset..<end, with: bytes); file.durable.replaceSubrange(offset..<end, with: bytes)
+            return original
+        }
+    }
 }
 
 extension SimFilesystem: FileOperations {
+    var backgroundBatchFlush: Bool { false }
     func resolve(_ path: String, creating: Bool) throws -> String { path }
     func temporaryCreatePath(_ path: String) throws -> String { path + ".jedtmp" }
     func create(_ path: String, skipFsync: Bool) throws -> any FileBlockStore {
-        try locked { let disk = try create(path); disk.skipFsync = skipFsync; return disk }
+        // All callers supply disposable temporary paths. The shared model's
+        // writeFile operation creates a fresh inode even if a stale temp exists;
+        // replacing it contributes one create event, without an extra unlink.
+        try locked { let disk = try create(path, replacing: true); disk.skipFsync = skipFsync; return disk }
+    }
+    func createReplacementTemporary(_ path: String, skipFsync: Bool) throws -> any FileBlockStore {
+        try create(path, skipFsync: skipFsync)
     }
     func open(_ path: String, readOnly: Bool, skipFsync: Bool) throws -> any FileBlockStore {
         try locked { let disk = try open(path); disk.readOnly = readOnly; disk.skipFsync = skipFsync; return disk }
@@ -340,4 +438,36 @@ extension SimFilesystem: FileOperations {
               source.filesystem === self, target.filesystem === self else { throw Self.injected("foreign simulated byte handle") }
     }
     func syncDirectory(_ path: String, skipFsync: Bool) throws { if !skipFsync { try syncDirectory() } }
+}
+
+internal struct SimScratchFileHost: ScratchFileHost {
+    let filesystem: SimFilesystem
+    let sealed: Bool
+    let random: any RandomSource
+    func create(kind: String) throws -> any ScratchStore {
+        try filesystem.locked {
+            try filesystem.spillOperation()
+            let raw = SimScratchStore(filesystem: filesystem)
+            if sealed { return try SealedScratchStore(inner: raw, random: random) }
+            return raw
+        }
+    }
+}
+
+private final class SimScratchStore: ScratchStore, @unchecked Sendable {
+    let filesystem: SimFilesystem
+    private let memory = MemoryBlockStore()
+    private var closed = false
+    init(filesystem: SimFilesystem) { self.filesystem = filesystem }
+    private func check() throws { guard !closed else { throw SimFilesystem.injected("closed spill file") } }
+    func read(at offset: UInt64, count: Int) throws -> [UInt8] {
+        try filesystem.locked { try check(); try filesystem.spillOperation(); return try memory.read(at: offset, count: count) }
+    }
+    func write(at offset: UInt64, bytes: [UInt8]) throws {
+        try filesystem.locked { try check(); try filesystem.spillOperation(); try memory.write(at: offset, bytes: bytes) }
+    }
+    func size() throws -> UInt64 { try filesystem.locked { try check(); return try memory.size() } }
+    func setSize(_ bytes: UInt64) throws { try filesystem.locked { try check(); try memory.setSize(bytes) } }
+    func sync() throws { try filesystem.locked { try check() } }
+    func close() throws { try filesystem.locked { closed = true; try memory.setSize(0) } }
 }

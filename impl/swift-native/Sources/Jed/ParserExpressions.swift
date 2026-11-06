@@ -10,7 +10,10 @@ extension SQLParser {
         if level == 7 { return try unaryExpression() }
         let start = cursor
         let base = depth; defer { depth = base }
-        var left = try binaryChain(level: level + 1)
+        return try finishBinaryChain(binaryChain(level: level + 1), level: level, start: start)
+    }
+    private func finishBinaryChain(_ initial: SQLExpression, level: Int, start: Int) throws -> SQLExpression {
+        var left = initial
         while true {
             var op: String?
             switch level {
@@ -44,7 +47,9 @@ extension SQLParser {
     }
     func comparison() throws -> SQLExpression {
         let start = cursor
-        let left = try binaryChain(level: 3)
+        return try finishComparison(binaryChain(level: 3), start: start)
+    }
+    private func finishComparison(_ left: SQLExpression, start: Int) throws -> SQLExpression {
         let position = sourcePosition(cursor)
         if eat("is") {
             let negated = eat("not")
@@ -117,8 +122,11 @@ extension SQLParser {
     func postfixExpression() throws -> SQLExpression {
         let start = cursor
         let base = depth; defer { depth = base }
-        var fieldAccessible = symbol("(")
-        var value = try primary()
+        let fieldAccessible = symbol("(")
+        return try finishPostfix(primary(), start: start, fieldAccessible: fieldAccessible)
+    }
+    private func finishPostfix(_ initial: SQLExpression, start: Int, fieldAccessible initialAccess: Bool) throws -> SQLExpression {
+        var value = initial, fieldAccessible = initialAccess
         if bareRowEnd == cursor { fieldAccessible = false }
         while symbol("::") || symbol("[") || (fieldAccessible && symbol(".")) || word() == "collate" {
             try deepen()
@@ -213,9 +221,10 @@ extension SQLParser {
         if eat("case") {
             let operand = try word() == "when" ? nil : expression()
             var arms: [SQLCaseArm] = []
-            while eat("when") {
+            while word() == "when" {
+                let whenPosition = sourcePosition(cursor); advance()
                 let condition = try expression(); try expect("then")
-                arms.append(SQLCaseArm(condition: condition, result: try expression()))
+                arms.append(SQLCaseArm(condition: condition, result: try expression(), whenPosition: whenPosition))
             }
             guard !arms.isEmpty else { throw syntax("CASE requires at least one WHEN clause") }
             let fallback = try eat("else") ? expression() : nil

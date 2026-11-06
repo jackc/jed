@@ -3,12 +3,12 @@
 internal enum BinaryFloatDecimal {
     static func exact(bits64 bits: UInt64) throws -> SQLDecimal {
         let exponent = Int((bits >> 52) & 2047), fraction = bits & 0x000f_ffff_ffff_ffff
-        guard exponent != 2047 else { throw JedError("22003", "cannot convert infinity or NaN to numeric") }
+        guard exponent != 2047 else { throw JedError("22003", "cannot convert infinity or NaN to numeric").withDataType("decimal") }
         return expand(mantissa: exponent == 0 ? fraction : fraction | (1 << 52), exponent: exponent == 0 ? -1074 : exponent - 1075, negative: bits >> 63 != 0)
     }
     static func exact(bits32 bits: UInt32) throws -> SQLDecimal {
         let exponent = Int((bits >> 23) & 255), fraction = bits & 0x007f_ffff
-        guard exponent != 255 else { throw JedError("22003", "cannot convert infinity or NaN to numeric") }
+        guard exponent != 255 else { throw JedError("22003", "cannot convert infinity or NaN to numeric").withDataType("decimal") }
         return expand(mantissa: UInt64(exponent == 0 ? fraction : fraction | (1 << 23)), exponent: exponent == 0 ? -149 : exponent - 150, negative: bits >> 31 != 0)
     }
     private static func expand(mantissa: UInt64, exponent: Int, negative: Bool) -> SQLDecimal {
@@ -62,7 +62,7 @@ internal enum NumericFormat {
                     else { before += 1 }
                     if id == "0" {
                         let position = before + after + multiplier
-                        if firstZero == nil { firstZero = position }
+                        if firstZero == nil && !decimal { firstZero = position }
                         lastZero = position
                     }
                 case "DEC", "D":
@@ -258,7 +258,14 @@ internal enum NumericFormat {
                     } else if !d.fill { output += " " }
                     continue
                 }
-                if !signWritten { output += leadingSign(); signWritten = true }
+                let predecimalSpace = !inFraction && !decimalNode && digitIndex == 0 &&
+                    number.digits.first == 48 && number.integerDigits == 1 && d.after > 0 &&
+                    d.firstZero == nil && !number.overflow
+                // A suppressed leading zero is padding, so an anchored sign
+                // follows that padding (and intervening template literals).
+                if !signWritten && (!predecimalSpace || d.fill && lastFraction == 0) {
+                    output += leadingSign(); signWritten = true
+                }
                 if decimalNode {
                     if digitIndex >= number.digits.count { return output }
                     if number.digits[digitIndex] == 46 { output += "."; digitIndex += 1 }

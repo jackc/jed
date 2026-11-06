@@ -8,7 +8,7 @@ extension MutationExecutor {
     }
     static func mergeWrites(_ changes: [WriteChange], relation: Relation, indexes: [StoredIndexPlan],
                             allocated: TableStore, snapshot: inout DomainSnapshot,
-                            settings: SessionSettings, twoPass: Bool = false) throws {
+                            settings: SessionSettings, twoPass: Bool = false, indexTwoPass: Bool? = nil) throws {
         var store = allocated
         let vacated = Set(changes.compactMap { $0.old?.key })
         var primary: Set<[UInt8]> = []
@@ -37,7 +37,7 @@ extension MutationExecutor {
                     if let prefix = indexed.prefix {
                         if index.index.unique && !prefix.hasNull {
                             guard batch.insert(prefix.bytes).inserted,
-                                  try !index.conflicts(prefix, store: existing, vacated: vacated) else { throw duplicateIndex(index.index.name) }
+                                  try !index.conflicts(prefix, store: existing, vacated: vacated) else { throw duplicateIndex(index.index.name, table: relation.table.name) }
                         }
                     }
                     after = indexed.entries
@@ -58,7 +58,7 @@ extension MutationExecutor {
             for ordinal in indexes.indices {
                 let index = indexes[ordinal]
                 guard var target = snapshot.indexes[index.index.name] else { throw JedError.corruption("missing writable CTE index") }
-                try index.apply(entries[ordinal], to: &target, twoPass: twoPass,
+                try index.apply(entries[ordinal], to: &target, twoPass: indexTwoPass ?? twoPass,
                     netStaging: settings.options.maxQueryMemoryBytes > 0)
                 snapshot.setIndexStore(index.index.name, target); try index.rebuild(target, snapshot: &snapshot)
             }

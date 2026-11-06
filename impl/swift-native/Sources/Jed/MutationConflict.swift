@@ -36,13 +36,13 @@ extension MutationExecutor {
                 for ordinal in resolver.columns.indices { resolver.columns[ordinal].ambiguousRelation = true }
             }
             var assigned: Set<Int> = [], changes: [(Int, ResolvedExpression)] = []
-            let targets = try syntax.assignments.map { try relation.view?.column($0.column) ?? relation.column($0.column) }
+            let targets = try syntax.assignments.map { try relation.view?.column($0.column, position: $0.position) ?? relation.column($0.column, position: $0.position) }
             let destinations = try relation.view?.destinations(targets) ?? targets
             for (ordinal, assignment) in syntax.assignments.enumerated() {
                 let column = destinations[ordinal]
                 guard assigned.insert(column).inserted else { throw JedError("42701", "multiple assignments to same column") }
                 if relation.table.columns[column].identity == true, assignment.value != nil || relation.view != nil {
-                    throw JedError("428C9", "identity column can only be updated to DEFAULT")
+                    throw JedError("428C9", "identity column can only be updated to DEFAULT").identity(relation.table.columns[column].name, insert: false)
                 }
                 let expression: ResolvedExpression
                 if let value = assignment.value { expression = try AssignmentValues.resolve(value, to: relation.types[column], resolver: resolver) }
@@ -56,7 +56,7 @@ extension MutationExecutor {
                 changes.append((column, expression))
             }
             predicate = try syntax.updatePredicate.map { try resolver.resolve($0, expected: TypeDescriptor(.scalar(.boolean))) }
-            guard predicate?.type == nil || predicate?.type?.type == .scalar(.boolean) else { throw JedError("42804", "WHERE requires a boolean expression") }
+            guard predicate?.type == nil || predicate?.type?.type == .scalar(.boolean) else { throw JedError("42804", "WHERE requires a boolean expression").at(syntax.updatePredicate?.expressionLocation ?? 0) }
             if !resolver.referencedColumns.isEmpty { try relation.requireSelect(inputSettings) }
             self.changes = changes
         }
@@ -101,7 +101,7 @@ extension MutationExecutor {
         let read = context.writeScope?.readSnapshot ?? snapshot
         let foreignState = context.writeScope?.foreignKeys ?? ForeignKeyActions.State()
         try plan.prepare(relation: relation, context: context)
-        let result = MutationResult(command: "INSERT", columns: returning.columns, meter: context.meter)
+        let result = MutationResult(command: "INSERT", columns: returning.columns, hasAffectedRows: !returning.present, meter: context.meter)
         var store = snapshot.tables[relation.table.name] ?? relation.store, inserted: [ConflictRow] = [], updated: [ConflictRow] = []
         var affected: Set<[UInt8]> = [], vacated: Set<[UInt8]> = []
         let compression = CostMeter(resources: context.meter.resources, cancellation: context.meter.cancellation)
@@ -145,7 +145,7 @@ extension MutationExecutor {
         for (ordinal, slot) in slots.enumerated() {
             try context.meter.checkpoint()
             let values = try insertedValues(slot, supplied: supplied[ordinal], relation: relation, context: context)
-            try relation.validateNotNull(Array(relation.types.indices), value: { values[$0] })
+            try relation.validateNotNull(Array(relation.types.indices), value: { values[$0] }, context: context)
             try validate(checks, relation: relation, value: { values[$0] }, context: context)
             if try skipped(values) { continue }
             let key = try plan.arbiter.key(values, relation: relation, indexes: indexes, context: context)
@@ -168,7 +168,7 @@ extension MutationExecutor {
                     replacements[column] = try relation.coerce(row.evaluate(expression), expression: expression, column: column, context: context)
                 }
                 let changed = try relation.types.indices.map { try replacements[$0] ?? oldRow.value($0) }
-                try relation.validateNotNull(plan.assigned.sorted(), value: { changed[$0] })
+                try relation.validateNotNull(plan.assigned.sorted(), value: { changed[$0] }, context: context)
                 try validate(checks, relation: relation, value: { changed[$0] }, context: context)
                 try relation.view?.validateNew({ changed[$0] }, context: context)
                 let storageKey: [UInt8]
@@ -203,8 +203,8 @@ extension MutationExecutor {
         let changes = inserted + updated
         var primaryKeys: Set<[UInt8]> = []
         for change in changes {
-            guard primaryKeys.insert(change.record.key).inserted else { throw duplicate(relation.table.name) }
-            if !vacated.contains(change.record.key), try relation.store.get(change.record.key) != nil { throw duplicate(relation.table.name) }
+            guard primaryKeys.insert(change.record.key).inserted else { throw duplicate(relation, value: { change.values[$0] }, context: context) }
+            if !vacated.contains(change.record.key), try relation.store.get(change.record.key) != nil { throw duplicate(relation, value: { change.values[$0] }, context: context) }
         }
         for ordinal in indexes.indices where indexes[ordinal].index.unique {
             guard let existing = read.indexes[indexes[ordinal].index.name] else { throw JedError.corruption("missing unique index") }
@@ -212,7 +212,7 @@ extension MutationExecutor {
             for change in changes {
                 guard let prefix = change.prefixes[ordinal], !prefix.hasNull else { continue }
                 guard keys.insert(prefix.bytes).inserted, try !indexes[ordinal].conflicts(prefix, store: existing, vacated: vacated) else {
-                    throw duplicateIndex(indexes[ordinal].index.name)
+                    throw duplicateIndex(indexes[ordinal], relation: relation, value: { change.values[$0] }, context: context)
                 }
             }
         }
@@ -245,11 +245,11 @@ extension MutationExecutor {
                 for foreign in foreignKeys where change.old == nil || !Set(foreign.foreign.columns).isDisjoint(with: plan.assigned) {
                     switch try foreign.childProbe(change.candidate.value, context: context) {
                     case .exempt: break
-                    case .missing: throw foreign.violation()
+                    case .missing: throw foreign.violation(value: change.candidate.value, context: context)
                     case .key(let key):
                         let same = foreign.parent.name == relation.table.name
                         guard try foreign.parentExists(key, snapshot: read, candidates: same ? candidates : [],
-                            vacated: same ? vacated : [], context: context) else { throw foreign.violation() }
+                            vacated: same ? vacated : [], context: context) else { throw foreign.violation(value: change.candidate.value, context: context) }
                     }
                 }
             }
@@ -278,6 +278,7 @@ extension MutationExecutor {
                 try install(store, relation: relation, countDelta: Int64(inserted.count), snapshot: &snapshot)
             }
         }
+        try context.meter.syncPending(snapshot.pendingBytes)
         if !changes.isEmpty {
             if !updated.isEmpty {
                 let transitions = updated.map { change -> ForeignKeyActions.Transition in

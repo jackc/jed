@@ -169,17 +169,32 @@ final class GistBoundaryTests: XCTestCase {
         var allocator = try PageAllocator(highWater: 2, free: [], firstBody: 2)
         let written = try tree.serialize(allocator: &allocator, codec: codec)
         let good = Dictionary(uniqueKeysWithValues: written.pages.map { ($0.index, $0.bytes) })
-        func reject(_ edit: (inout [UInt8]) throws -> Void) throws {
+        func edited(_ edit: (inout [UInt8]) throws -> Void) throws -> [UInt32: [UInt8]] {
             var pages = good, root = try XCTUnwrap(pages[written.root.index])
             try edit(&root); try PageEnvelope.putU32(PageEnvelope.checksum(root, at: 12), into: &root, at: 12)
             pages[written.root.index] = root
+            return pages
+        }
+        func reject(_ edit: (inout [UInt8]) throws -> Void) throws {
+            let pages = try edited(edit)
             assertCode { _ = try GistTree.open(root: written.root, pageCount: allocator.highWater,
                 opclasses: [scalar], codec: codec, read: { try XCTUnwrap(pages[$0.index]) }) }
         }
-        try reject { $0[23] &+= 1 } // first scalar minimum narrows a child union
+        func canonical(_ edit: (inout [UInt8]) throws -> Void) throws {
+            let pages = try edited(edit)
+            let reopened = try GistTree.open(root: written.root, pageCount: allocator.highWater,
+                opclasses: [scalar], codec: codec, read: { try XCTUnwrap(pages[$0.index]) })
+            XCTAssertEqual(try reopened.tree.leafKeys(), try tree.leafKeys())
+            var rebuiltAllocator = try PageAllocator(highWater: 2, free: [], firstBody: 2)
+            let rebuilt = try reopened.tree.serialize(allocator: &rebuiltAllocator, codec: codec)
+            XCTAssertEqual(rebuilt.pages.map(\.bytes), written.pages.map(\.bytes))
+        }
+        // Frozen readers reconstruct from leaf keys. IntegrityBoundaryTests
+        // checks the unchanged gist_bound_shrunk fixture's persisted-bound finding.
+        try canonical { $0[23] &+= 1 }
         try reject { try PageEnvelope.putU32(written.root.index, into: &$0, at: 30) } // cycle
         try reject { try PageEnvelope.putU32(5, into: &$0, at: 4) } // fanout
-        try reject { $0[$0.count - 1] = 1 } // nonzero padding
+        try canonical { $0[$0.count - 1] = 1 } // unused trailing bytes are ignored on read
         var badEntry = entries[0]
         badEntry = GistEntry(bound: badEntry.bound, storageKey: [UInt8](repeating: 1, count: 300))
         let oversized = try GistTree.build(opclasses: [scalar], entries: [badEntry]), before = allocator.highWater

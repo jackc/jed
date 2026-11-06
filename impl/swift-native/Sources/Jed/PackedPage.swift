@@ -111,23 +111,47 @@ internal final class PackedLeaf: Sendable {
     private let keys: [Range<Int>]
     private let regions: [Region]
 
-    init(bytes: [UInt8], types: [TypeDescriptor], codec: any PageCodec) throws {
-        guard bytes.count == codec.pageSize - codec.reservedBytes, bytes.count >= 16 else {
+    convenience init(bytes: [UInt8], types: [TypeDescriptor], codec: any PageCodec) throws {
+        try self.init(bytes: bytes, types: types, capacity: codec.capacity, encrypted: codec.reservedBytes != 0)
+    }
+
+    /// Dirty nodes stay packed even when no valid split exists. Pending writes
+    /// retain these bytes until commit preflight rejects the physical page fit;
+    /// the on-disk initializer above always uses the codec's exact capacity.
+    static func pending(_ records: [PackedRecord], types: [TypeDescriptor], codec: any PageCodec) throws -> PackedLeaf {
+        let total = records.reduce(overhead(records: records.count, types: types)) { $0 + $1.weight }
+        guard total <= UInt32.max else { throw JedError("0A000", "pending leaf exceeds the byte-format limit") }
+        let capacity = max(codec.capacity, total)
+        let payload = try encodePayload(records, types: types, capacity: capacity)
+        var writer = ByteWriter(); writer.u8(2); writer.u8(0); writer.u16(0)
+        writer.u32(UInt32(records.count)); writer.u32(0); writer.u32(0); writer.append(payload)
+        writer.append(repeatElement(UInt8(0), count: capacity - payload.count))
+        var bytes = writer.bytes
+        try PageEnvelope.putU32(PageEnvelope.checksum(bytes, at: 12), into: &bytes, at: 12)
+        return try PackedLeaf(bytes: bytes, types: types, capacity: capacity, encrypted: codec.reservedBytes != 0)
+    }
+
+    convenience init(integrityBytes bytes: [UInt8], types: [TypeDescriptor], codec: any PageCodec) throws {
+        try self.init(bytes: bytes, types: types, capacity: codec.capacity, encrypted: codec.reservedBytes != 0, integrity: true)
+    }
+
+    private init(bytes: [UInt8], types: [TypeDescriptor], capacity: Int, encrypted: Bool, integrity: Bool = false) throws {
+        guard bytes.count == capacity + 16, bytes.count >= 16 else {
             throw JedError.corruption("invalid packed leaf size")
         }
-        try PageEnvelope.validateHeader(bytes, encrypted: codec.reservedBytes != 0)
+        try PageEnvelope.validateHeader(bytes, encrypted: encrypted)
         guard bytes[0] == 2, try PageEnvelope.readU32(bytes, at: 12) == PageEnvelope.checksum(bytes, at: 12) else {
             throw JedError.corruption("invalid packed leaf header or checksum")
         }
         let count = Int(try PageEnvelope.readU32(bytes, at: 4))
-        guard count > 0, count <= codec.capacity / 4, types.count < codec.capacity / 4 else {
+        guard count > 0, count <= capacity / 4, types.count < capacity / 4 else {
             throw JedError.corruption("invalid packed leaf directory counts")
         }
         var reader = ByteReader(bytes[16...])
         var ends: [Int] = [], previous = 0
         for _ in 0..<count {
             let end = Int(try reader.u32())
-            guard end >= previous, end <= codec.capacity - 4 * count else {
+            guard end >= previous, end <= capacity - 4 * count else {
                 throw JedError.corruption("invalid key directory")
             }
             ends.append(end); previous = end
@@ -136,14 +160,14 @@ internal final class PackedLeaf: Sendable {
         _ = try reader.take(previous)
         var ranges: [Range<Int>] = [], start = keyStart
         for end in ends { ranges.append(start..<(keyStart + end)); start = keyStart + end }
-        for index in 1..<count {
+        for index in 1..<count where !integrity {
             guard bytes[ranges[index - 1]].lexicographicallyPrecedes(bytes[ranges[index]]) else {
                 throw JedError.corruption("leaf keys are not strictly increasing")
             }
         }
         var starts: [Int] = []
         for _ in 0...types.count { starts.append(Int(try reader.u32())) }
-        guard starts.first == reader.offset, let contentEnd = starts.last, contentEnd <= codec.capacity,
+        guard starts.first == reader.offset, let contentEnd = starts.last, contentEnd <= capacity,
               zip(starts, starts.dropFirst()).allSatisfy({ $0 <= $1 }),
               bytes[(16 + contentEnd)...].allSatisfy({ $0 == 0 }) else {
             throw JedError.corruption("invalid column directory or leaf padding")
@@ -179,7 +203,7 @@ internal final class PackedLeaf: Sendable {
                     guard end >= prior, end <= range.upperBound - valueStart else {
                         throw JedError.corruption("invalid value directory")
                     }
-                    if end > prior {
+                    if end > prior && !integrity {
                         let first = bytes[valueStart + prior]
                         guard first == 0 || first == 2 || first == 3 || first == 4 else {
                             throw JedError.corruption("invalid leaf value presence tag")

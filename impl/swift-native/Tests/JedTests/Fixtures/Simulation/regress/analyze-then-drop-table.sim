@@ -1,0 +1,20 @@
+# DROP TABLE kept the table's ANALYZE facts in Go and TS, so the next catalog write dereferenced a
+# missing table and crashed (fixed in 6e3c1f12). Found by the first simulation sweep.
+# format: simulation
+# seed: 16
+# page_size: 1024
+# clock: 1700000000000000
+open w1 write
+on w1 CREATE TABLE t1 (id i64 PRIMARY KEY, c1 i64)
+on w1 INSERT INTO t1 (id, c1) SELECT g, g * 7 FROM generate_series(1, 5) g
+on w1 ANALYZE t1
+commit w1
+open w2 write
+on w2 CREATE TABLE t2 (id i64 PRIMARY KEY, c1 text)
+on w2 DROP TABLE IF EXISTS t1
+fault io_error op=sync nth=1
+commit w2
+open w3 write
+on w3 INSERT INTO t2 (id, c1) SELECT g, md5(g::text) FROM generate_series(1, 9) g
+commit w3
+check

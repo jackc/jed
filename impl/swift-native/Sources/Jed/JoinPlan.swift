@@ -14,6 +14,14 @@ internal struct JoinPlan {
         let keyPairs = hashKeys(predicate, columns: left.columns.sorted { $0.index < $1.index } + right.columns.sorted { $0.index < $1.index }, boundary: boundary)
         guard case .base(let leftStore) = left.body, case .base(let rightStore) = right.body,
               let a = left.baseTable, let b = right.baseTable else {
+            // The fixed authored step still tries its right input's PK before
+            // considering a hash, even when the producer on the left is opaque.
+            if right.allowsIndexAccess, case .base(let store) = right.body,
+               let table = right.baseTable,
+               let bound = indexed(predicate, table: table, types: store.tree.types,
+                   innerOffset: boundary, innerWidth: right.columns.count) {
+                return JoinPlan(swapped: false, algorithm: .indexed(bound), estimate: 0)
+            }
             // The established two-relation path predates costed base-table
             // enumeration. Its authored right input is the build side, even
             // when either relation is a CTE, derived query or resident SRF.
@@ -86,9 +94,21 @@ internal struct JoinPlan {
     static func indexed(_ predicate: ResolvedExpression?, table: CatalogTable, types: [TypeDescriptor],
                                 innerOffset: Int, innerWidth: Int) -> BaseScanPlan? {
         func local(_ index: Int) -> Bool { index >= innerOffset && index < innerOffset + innerWidth }
+        func column(_ expression: ResolvedExpression) -> ResolvedExpression? {
+            switch expression.node {
+            case .column: return expression
+            case .convert(let child, let target):
+                guard case .scalar(let source) = child.type?.type, source.integerWidth != nil,
+                      case .scalar(let destination) = target.type,
+                      destination.integerWidth != nil || destination == .decimal else { return nil }
+                return column(child)
+            default: return nil
+            }
+        }
         var bounds: [ResolvedExpression] = []
         for term in QueryEstimate.conjuncts(predicate) {
-            guard case .binary(let op, let a, let b, let type) = term.node, ["=", "<", "<=", ">", ">="].contains(op),
+            guard case .binary(let op, let lhs, let rhs, let type) = term.node, ["=", "<", "<=", ">", ">="].contains(op),
+                  let a = column(lhs), let b = column(rhs),
                   case .column(let l) = a.node, case .column(let r) = b.node, local(l) != local(r) else { continue }
             func mapped(_ value: ResolvedExpression, _ index: Int) -> ResolvedExpression {
                 var result = value
@@ -112,14 +132,24 @@ internal struct JoinPlan {
 
     private static func hashKeys(_ predicate: ResolvedExpression?, columns: [ExpressionColumn], boundary: Int) -> [Key]? {
         var keys: [Key] = []
+        func leaf(_ value: ResolvedExpression) -> Bool {
+            switch value.node {
+            case .column: return true
+            case .constant(let value):
+                if case .composite = value { return false }
+                return true
+            default: return false
+            }
+        }
         for term in QueryEstimate.conjuncts(predicate) {
-            guard case .binary(let op, let a, let b, _) = term.node, ["=", "<>", "<", "<=", ">", ">="].contains(op),
-                  case .column(let left) = a.node, case .column(let right) = b.node else { return nil }
+            guard case .binary(let op, let a, let b, _) = term.node, ["=", "<>", "!="].contains(op),
+                  leaf(a), leaf(b) else { return nil }
+            guard case .column(let left) = a.node, case .column(let right) = b.node else { continue }
             if op != "=" || (left < boundary) == (right < boundary) { continue }
             let l = min(left, right), r = max(left, right)
-            guard columns.indices.contains(l), columns.indices.contains(r), columns[l].type.type == columns[r].type.type else { return nil }
+            guard columns.indices.contains(l), columns.indices.contains(r), columns[l].type.type == columns[r].type.type else { continue }
             let type = columns[l].type
-            guard keyable(type.type) else { return nil }
+            guard keyable(type.type) else { continue }
             keys.append(Key(left: l, right: r - boundary, type: type))
         }
         return keys.isEmpty ? nil : keys

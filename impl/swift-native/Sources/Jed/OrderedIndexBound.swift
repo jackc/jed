@@ -13,32 +13,64 @@ internal struct OrderedIndexBound {
     let equalCount: Int
     var bounded: Bool { prefixCount > 0 }
 
-    init(definition: OrderedIndexPlan, predicate: ResolvedExpression?) {
+    init(definition: OrderedIndexPlan, terms: [[Term]], accessPredicate: ResolvedExpression?,
+         prefixCount: Int, equalCount: Int) {
+        self.definition = definition; self.terms = terms; self.accessPredicate = accessPredicate
+        self.prefixCount = prefixCount; self.equalCount = equalCount
+    }
+
+    init(definition: OrderedIndexPlan, predicate: ResolvedExpression?, indexedJoin: Bool = false) {
         self.definition = definition
+        // The frozen ordinary secondary INL path probes one leading scalar
+        // column by sibling equality. Expression/range/multi-key probes remain
+        // ordinary scan candidates; interval sets have their separate path.
+        if indexedJoin && (!definition.index.keys.allSatisfy({ if case .column = $0 { true } else { false } }) ||
+            !definition.types.allSatisfy({ if case .scalar = $0.type { true } else { false } })) {
+            terms = []; accessPredicate = nil; prefixCount = 0; equalCount = 0
+            return
+        }
         let conjuncts = QueryEstimate.conjuncts(predicate)
         var selected: [[Term]] = [], admitted: [ResolvedExpression] = [], equalCount = 0
-        func source(_ expression: ResolvedExpression) -> Bool {
-            switch expression.node { case .constant, .parameter, .outerColumn: true; default: false }
+        func source(_ expression: ResolvedExpression) -> ResolvedExpression? {
+            switch expression.node {
+            case .constant, .parameter: return expression
+            default: return BaseScanPlan.outerSource(expression)
+            }
         }
         for ordinal in definition.keys.indices {
+            if indexedJoin && ordinal > 0 { break }
             let key = definition.keys[ordinal], type = definition.types[ordinal]
             var found: [Term] = []
             for predicate in conjuncts {
                 guard case .binary(let operation, let lhs, let rhs, let comparison) = predicate.node,
                       ["=", "<", "<=", ">", ">="].contains(operation) else { continue }
                 let value: ResolvedExpression, op: String
-                if Self.matches(key, lhs), source(rhs) { value = rhs; op = operation }
-                else if Self.matches(key, rhs), source(lhs) {
-                    value = lhs; op = Self.reversed(operation)
+                if Self.matches(key, lhs), let input = source(rhs) { value = input; op = operation }
+                else if Self.matches(key, rhs), let input = source(lhs) {
+                    value = input; op = Self.reversed(operation)
                 } else { continue }
-                guard (comparison.collation?.description ?? "C") == (type.collation?.description ?? "C") else { continue }
+                let keyCollation = type.collation?.description ?? "C"
+                let expressionEquality: Bool
+                if case .expression = definition.index.keys[ordinal] {
+                    expressionEquality = op == "=" && keyCollation == "C"
+                } else { expressionEquality = false }
+                // Persisted text expressions keep the earlier C-keyed rule.
+                // Equality remains byte identity under every query collation;
+                // an ordering predicate must agree with the stored key order.
+                guard (comparison.collation?.description ?? "C") == keyCollation || expressionEquality else { continue }
                 let compatible = value.type == nil || value.type?.type == type.type || {
                     guard case .scalar(let a) = value.type?.type, case .scalar(let b) = type.type else { return false }
-                    return a.integerWidth != nil && b.integerWidth != nil
+                    return a.integerWidth != nil && b.integerWidth != nil || BaseScanPlan.promotedOuter(value, key: type)
                 }()
                 if compatible { found.append(Term(operation: op, source: value, predicate: predicate)) }
             }
             guard !found.isEmpty else { break }
+            if indexedJoin {
+                guard found.contains(where: {
+                    if case .outerColumn = $0.source.node { return $0.operation == "=" }
+                    return false
+                }) else { break }
+            }
             if found.contains(where: { $0.operation == "=" }) {
                 let equalities = found.filter { $0.operation == "=" }
                 selected.append(equalities); admitted += equalities.map(\.predicate); equalCount += 1
@@ -56,7 +88,7 @@ internal struct OrderedIndexBound {
             if case .column(let column) = expression.node { return ordinal == column }
             return false
         }
-        return ExpressionIdentity.same(key, operand)
+        return ExpressionIdentity.sameIndexKey(key, operand)
     }
     private static func reversed(_ op: String) -> String {
         ["<": ">", "<=": ">=", ">": "<", ">=": "<="][op] ?? op
@@ -85,8 +117,7 @@ internal struct OrderedIndexBound {
             for term in terms[ordinal] {
                 let input = try value(term.source)
                 if input.isNull { return .empty }
-                if case .integer(let number) = input, case .scalar(let scalar) = type.type,
-                   scalar.integerWidth != nil, !scalar.admits(number) {
+                guard let input = IntervalPlan.pointValue(input, type: type) else {
                     if term.operation == "=" { return .empty }
                     continue
                 }

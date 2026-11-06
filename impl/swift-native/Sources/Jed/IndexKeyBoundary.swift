@@ -2,8 +2,15 @@
 /// never reconstructs SQL values or assumes a fixed-width primary key.
 internal enum IndexKeyBoundary {
     static func suffix(_ bytes: [UInt8], types: [TypeDescriptor], options: [UInt8]) throws -> [UInt8] {
+        let split = try prefix(bytes, types: types, options: options)
+        guard split.count < bytes.count else { throw JedError.corruption("index entry has no storage key") }
+        return Array(bytes.dropFirst(split.count))
+    }
+    /// Integrity uniqueness compares the encoded prefix and skips NULL keys.
+    /// Keep the ordinary suffix decoder's exact slot grammar in one place.
+    static func prefix(_ bytes: [UInt8], types: [TypeDescriptor], options: [UInt8]) throws -> (count: Int, hasNull: Bool) {
         guard options.isEmpty || options.count == types.count else { throw JedError.corruption("invalid index ordering arity") }
-        var offset = 0
+        var offset = 0, hasNull = false
         for ordinal in types.indices {
             let option = options.isEmpty ? 0 : options[ordinal]
             let descending = option & 1 != 0, first = option & 2 != 0
@@ -11,12 +18,11 @@ internal enum IndexKeyBoundary {
             let absent: UInt8 = descending ? (first ? 254 : 255) : (first ? 0 : 1)
             guard offset < bytes.count else { throw JedError.corruption("truncated index presence slot") }
             let tag = bytes[offset]; offset += 1
-            if tag == absent { continue }
+            if tag == absent { hasNull = true; continue }
             guard tag == present else { throw JedError.corruption("invalid index presence slot") }
             try body(bytes, offset: &offset, type: types[ordinal], inverted: descending, depth: 0)
         }
-        guard offset < bytes.count else { throw JedError.corruption("index entry has no storage key") }
-        return Array(bytes.dropFirst(offset))
+        return (offset, hasNull)
     }
     private static func body(_ bytes: [UInt8], offset: inout Int, type: TypeDescriptor,
                              inverted: Bool, depth: Int) throws {
@@ -73,7 +79,8 @@ internal enum IndexKeyBoundary {
                 try body(bytes, offset: &offset, type: child, inverted: inverted, depth: depth)
             }
             let dimensions = Int(try read(&offset))
-            guard dimensions <= 6 else { throw JedError.corruption("invalid array index dimensions") }
+            // The wire dimension count is u8. Input operations may impose
+            // narrower limits, but valid stored arrays retain all 255 slots.
             try skip(dimensions * 8, &offset)
         case .composite(let composite):
             guard depth < 32 else { throw JedError.corruption("index key nesting exceeds type limit") }

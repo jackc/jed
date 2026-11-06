@@ -16,14 +16,17 @@ module SwiftSpecGenerator
   ROOT = File.expand_path("../../..", __dir__)
   BASELINE = "362e0798ac3a8bd04bd2da556044b6ec73bf468a"
   INPUTS = %w[
+    spec/integrity/findings.toml
     spec/types/scalars.toml
     spec/types/ranges.toml
     spec/types/compare.toml
     spec/types/casts.toml
     spec/functions/catalog.toml
+    spec/functions/coercion_snapshot.toml
     spec/errors/registry.toml
     spec/cost/schedule.toml
     spec/cost/estimator.toml
+    spec/cost/estimator_vectors.toml
     spec/types/datetime_units.toml
     spec/types/formatting.toml
     spec/grammar/pg_keywords.toml
@@ -55,6 +58,7 @@ module SwiftSpecGenerator
     spec/collation/vectors/compiler.toml
     spec/collation/vectors/sortkey.toml
   ].freeze
+  TEXT_INPUTS = %w[spec/errors/detail_cases.txt spec/errors/position_cases.txt].freeze
   fixture_listing, fixture_error, fixture_status = Open3.capture3(
     "git", "ls-tree", "-r", "--name-only", BASELINE, "spec/fileformat/fixtures", chdir: ROOT
   )
@@ -81,6 +85,23 @@ module SwiftSpecGenerator
   abort "cannot list frozen process corpus: #{process_error}" unless process_status.success?
   PROCESS_INPUTS = process_listing.lines.map(&:strip).select { |path| path.end_with?(".process.toml") }.sort.freeze
   abort "frozen process inventory changed" unless PROCESS_INPUTS.length == 31
+
+  simulation_listing, simulation_error, simulation_status = Open3.capture3(
+    "git", "ls-tree", "-r", "--name-only", BASELINE,
+    "spec/conformance/sim/regress", "spec/conformance/sim/profiles", chdir: ROOT
+  )
+  abort "cannot list frozen simulation inputs: #{simulation_error}" unless simulation_status.success?
+  SIMULATION_INPUTS = simulation_listing.lines.map(&:strip).select { |path| path.end_with?(".sim", ".toml") }.sort.freeze
+  abort "frozen simulation inventory changed" unless SIMULATION_INPUTS.count { |path| path.end_with?(".sim") } == 18 &&
+    SIMULATION_INPUTS.count { |path| path.end_with?(".toml") } == 22
+
+  integrity_listing, integrity_error, integrity_status = Open3.capture3(
+    "git", "ls-tree", "-r", "--name-only", BASELINE, "spec/fileformat/integrity", chdir: ROOT
+  )
+  abort "cannot list frozen integrity fixtures: #{integrity_error}" unless integrity_status.success?
+  INTEGRITY_INPUTS = integrity_listing.lines.map(&:strip).select { |path| path.end_with?(".jed", ".json") }.sort.freeze
+  abort "frozen integrity inventory changed" unless INTEGRITY_INPUTS.count { |path| path.end_with?(".jed") } == 24 &&
+    INTEGRITY_INPUTS.count { |path| path.end_with?(".json") } == 24
 
   module_function
 
@@ -127,7 +148,7 @@ module SwiftSpecGenerator
   end
 
   def read_sources
-    (INPUTS + BYTE_INPUTS + CORPUS_INPUTS + PROCESS_INPUTS).to_h do |path|
+    (INPUTS + TEXT_INPUTS + BYTE_INPUTS + CORPUS_INPUTS + PROCESS_INPUTS + SIMULATION_INPUTS + INTEGRITY_INPUTS).to_h do |path|
       bytes, error, status = Open3.capture3("git", "show", "#{BASELINE}:#{path}", chdir: ROOT)
       abort "cannot read baseline #{path}: #{error}" unless status.success?
       [path, bytes.b]
@@ -228,6 +249,7 @@ module SwiftSpecGenerator
       ".init(id: #{swift_string(row.fetch('id'))}, element: #{swift_string(row.fetch('element'))}, aliases: #{strings(row.fetch('aliases'))}, discrete: #{row.fetch('discrete')})"
     end
     supplementary = {
+      "integrity" => "spec/integrity/findings.toml",
       "comparison" => "spec/types/compare.toml",
       "casts" => "spec/types/casts.toml",
       "estimator" => "spec/cost/estimator.toml",
@@ -256,7 +278,12 @@ module SwiftSpecGenerator
       "impl/swift-native/Tests/JedTests/Fixtures/SpecSnapshot.json" => JSON.pretty_generate(snapshot) + "\n",
       "impl/swift-native/Tests/JedCryptoTests/Fixtures/encryption_vectors.toml" => sources.fetch("spec/fileformat/encryption_vectors.toml")
     }
-    BYTE_INPUTS.each do |path|
+    INTEGRITY_INPUTS.each do |path|
+      outputs["impl/swift-native/Tests/JedTests/Fixtures/Integrity/#{File.basename(path)}"] = sources.fetch(path)
+    end
+    integrity_extras = Dir.glob("impl/swift-native/Tests/JedTests/Fixtures/Integrity/*.{jed,json}", base: ROOT) - outputs.keys
+    abort "unexpected Swift frozen integrity fixtures: #{integrity_extras.join(', ')}" unless integrity_extras.empty?
+    (BYTE_INPUTS + TEXT_INPUTS).each do |path|
       outputs["impl/swift-native/Tests/JedTests/Fixtures/#{File.basename(path)}"] = sources.fetch(path)
     end
     CORPUS_INPUTS.each do |path|
@@ -266,6 +293,13 @@ module SwiftSpecGenerator
     PROCESS_INPUTS.each do |path|
       outputs["impl/swift-native/Tools/Fixtures/Process/#{File.basename(path)}"] = sources.fetch(path)
     end
+    SIMULATION_INPUTS.each do |path|
+      relative = path.delete_prefix("spec/conformance/sim/")
+      outputs["impl/swift-native/Tests/JedTests/Fixtures/Simulation/#{relative}"] = sources.fetch(path)
+    end
+    simulation_root = "impl/swift-native/Tests/JedTests/Fixtures/Simulation"
+    simulation_extras = Dir.glob("#{simulation_root}/**/*.{sim,toml}", base: ROOT) - outputs.keys
+    abort "unexpected Swift frozen simulation files: #{simulation_extras.join(', ')}" unless simulation_extras.empty?
     process_root = "impl/swift-native/Tools/Fixtures/Process"
     process_extras = Dir.glob("#{process_root}/*.process.toml", base: ROOT) - outputs.keys
     abort "unexpected Swift frozen process files: #{process_extras.join(', ')}" unless process_extras.empty?

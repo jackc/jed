@@ -4,12 +4,13 @@ internal final class MutationResult {
     let command: String
     let columns: [ResultColumn]
     var affected: Int64 = 0
+    var hasAffectedRows: Bool
     private let meter: CostMeter
     private var rows: [[SQLValue]?] = []
     private var position = 0
     private var reserved: Int64 = 0
-    init(command: String, columns: [ResultColumn] = [], meter: CostMeter) {
-        self.command = command; self.columns = columns; self.meter = meter
+    init(command: String, columns: [ResultColumn] = [], hasAffectedRows: Bool = false, meter: CostMeter) {
+        self.command = command; self.columns = columns; self.hasAffectedRows = hasAffectedRows; self.meter = meter
     }
     func append(_ row: [SQLValue]) throws {
         let bytes = MemorySizes.row(row)
@@ -24,7 +25,7 @@ internal final class MutationResult {
     }
     func close() { rows = []; meter.resources.query.release(reserved); reserved = 0 }
     func cursor(guardCostOnPull: Bool = true, failure: @escaping (Error) -> Void = { _ in }) -> Rows {
-        Rows(columns: columns, meter: meter, command: command, affected: affected, guardCostOnPull: guardCostOnPull,
+        Rows(columns: columns, meter: meter, command: command, affected: hasAffectedRows ? affected : nil, guardCostOnPull: guardCostOnPull,
              pull: next, release: close, failure: failure)
     }
     deinit { close() }

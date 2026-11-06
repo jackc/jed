@@ -30,7 +30,7 @@ public struct SQLDecimal: Sendable, CustomStringConvertible, Equatable {
     internal func checked() throws -> Self {
         guard scale <= Self.maximumScale,
               isZero || magnitude.decimalDigits - scale <= Self.maximumIntegerDigits else {
-            throw JedError("22003", "numeric value out of range")
+            throw JedError("22003", "numeric value out of range").withDataType("decimal")
         }
         return self
     }
@@ -88,7 +88,7 @@ public struct SQLDecimal: Sendable, CustomStringConvertible, Equatable {
                 for digit in digits {
                     value = value.multiplying(UInt32(radix)).adding(BigMagnitude(UInt64(digit)))
                     if value.decimalDigits > maximumIntegerDigits {
-                        throw JedError("22003", "numeric value out of range")
+                        throw JedError("22003", "numeric value out of range").withDataType("decimal")
                     }
                 }
                 return Self(negative: negative, magnitude: value, scale: 0)
@@ -146,11 +146,11 @@ public struct SQLDecimal: Sendable, CustomStringConvertible, Equatable {
         }
         guard position == end else { throw invalid }
         let resultScale = fractionalDigits - exponent
-        guard resultScale <= maximumScale else { throw JedError("22003", "numeric value out of range") }
+        guard resultScale <= maximumScale else { throw JedError("22003", "numeric value out of range").withDataType("decimal") }
         let firstNonzero = digits.firstIndex(where: { $0 != 48 }) ?? digits.endIndex
         let significant = digits[firstNonzero...]
         if !significant.isEmpty && significant.count - resultScale > maximumIntegerDigits {
-            throw JedError("22003", "numeric value out of range")
+            throw JedError("22003", "numeric value out of range").withDataType("decimal")
         }
         var value = BigMagnitude(decimalDigits: significant)
         if resultScale < 0 { value = value.shiftedDecimal(-resultScale) }
@@ -296,7 +296,7 @@ public struct SQLDecimal: Sendable, CustomStringConvertible, Equatable {
         }
         let result = try rounded(to: target)
         if !result.isZero && result.magnitude.decimalDigits - target > precision - target {
-            throw JedError("22003", "numeric field overflow")
+            throw JedError("22003", "numeric field overflow").withDataType("decimal")
         }
         return result
     }

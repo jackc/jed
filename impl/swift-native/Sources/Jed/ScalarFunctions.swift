@@ -12,6 +12,7 @@ internal enum ScalarFunctions {
         var unicode = UnicodeDatabase()
         var timezones = TimeZoneDatabase()
         var hostCall: ((UInt64, [SQLValue]) throws -> SQLValue)?
+        var hostFunctions: [HostFunction] = []
         var stateCall: ((String, [SQLValue]) throws -> SQLValue)?
         var regexExecution: ((ResolvedFunction) throws -> RegexExecution)?
         var render: JSONFunctions.ScalarRenderer?
@@ -23,9 +24,14 @@ internal enum ScalarFunctions {
     static func evaluate(_ function: ResolvedFunction, values: [SQLValue], context: ExpressionContext,
                          environment: Environment = Environment()) throws -> SQLValue {
         guard values.count == function.arguments.count else { throw JedError("XX000", "function argument count mismatch") }
+        if function.hostID == nil, function.name == "substring", values.count == 3,
+           function.arguments[1].type?.type == .scalar(.text) {
+            return try context.patterns.similarSubstring(function, values: values, meter: context.meter)
+        }
         if function.nullBehavior == "propagates" && values.contains(where: \.isNull) { return .null }
         if let id = function.hostID {
             guard let call = environment.hostCall else { throw JedError("55000", "host function is unavailable") }
+            try context.meter.poll()
             return try call(id, values)
         }
         if function.metadata.category == "json" { return try JsonScalarFunctions.evaluate(function, values: values, context: context) }
@@ -61,8 +67,9 @@ internal enum ScalarFunctions {
         if arrayNames.contains(name) || name == "width_bucket" && values.count == 2 {
             let arrayType = types.first(where: { if case .array = $0.type { true } else { false } }) ?? function.resultType
             guard case .array(let element) = arrayType.type else { throw JedError("42804", "array descriptor required") }
-            let descriptor = ContainerText.elementDescriptor(arrayType, element: element)
+            var descriptor = ContainerText.elementDescriptor(arrayType, element: element)
             if name == "width_bucket" {
+                descriptor.collation = try ExpressionCollation.combine(function.arguments).comparisonName()
                 return try ArrayFunctions.widthBucket(values[0], thresholds: values[1], element: descriptor, meter: meter,
                                                      comparisonWork: { try context.comparisonWork($0, $1, $2, type: $3) }, collatedKey: context.collatedKey)
             }
@@ -78,9 +85,9 @@ internal enum ScalarFunctions {
         case "to_char":
             guard case .scalar(let type) = types[0].type else { throw JedError("42804", "scalar to_char argument required") }
             if type.integerWidth != nil || [.decimal, .f32, .f64].contains(type) {
-                return try NumericFormat.toChar(values[0], type: type, template: text(1), meter: meter)
+                return try NumericFormat.toChar(values[0], type: type, template: text(1), meter: constant ? nil : meter)
             }
-            return try TemporalFormat.toChar(values[0], template: text(1), timezone: context.scalar.timezone, meter: meter)
+            return try TemporalFormat.toChar(values[0], template: text(1), timezone: context.scalar.timezone, meter: meter, growth: !constant)
         case "to_date", "to_timestamp":
             return try TemporalFormat.parse(text(0), template: text(1), asDate: name == "to_date", timezone: context.scalar.timezone, meter: meter)
         case "to_number": return try NumericFormat.toNumber(text(0), template: text(1), meter: meter)
@@ -158,10 +165,10 @@ internal enum ScalarFunctions {
                 guard case .array(let array) = values[0], case .array(let element) = types[0].type else { throw JedError("42804", "VARIADIC argument must be an array") }
                 items = array.elements; descriptors = items.map { _ in TypeDescriptor(element) }
             }
-            return try JSONFunctions.build(items, types: descriptors, object: name.hasSuffix("object"), binary: name.hasPrefix("jsonb"), constant: constant, meter: meter, scalarRender: jsonRenderer)
+            return try JSONFunctions.build(items, types: descriptors, object: name.hasSuffix("object"), binary: name.hasPrefix("jsonb"), constant: constant, meter: meter, scalarRender: {
+                try JsonScalarFunctions.render($0, type: $1, context: context, meter: $2, zonePrecharged: true)
+            })
         case "similar_to_escape": return .text(try Similar.translate(text(0), escape: values.count > 1 ? text(1) : nil, meter: constant ? nil : meter).text)
-        case "substring" where values.count == 3 && types[1].type == .scalar(.text):
-            return try context.patterns.similarSubstring(function, values: values, meter: meter)
         default: break
         }
         if name.hasPrefix("regexp_") || name == "substring" && types.count > 1 && types[1].type == .scalar(.text) {
@@ -192,7 +199,7 @@ internal enum ScalarFunctions {
                     while y != 0 { let remainder = x % y; x = y; y = remainder }
                     result = name == "gcd" ? x : x == 0 ? 0 : (abs(Int128(a)) / x) * abs(Int128(b))
                 }
-                guard result >= Int64.min, result <= Int64.max else { throw JedError("22003", "integer out of range") }
+                guard result >= Int64.min, result <= Int64.max else { throw JedError("22003", "integer out of range").withDataType(type.name) }
                 return .integer(try ScalarCasts.checkedInteger(Int64(result), type: type))
             }
             if name == "mod", case .scalar(let width) = function.resultType.type, width == .f32 || width == .f64 {
@@ -202,7 +209,7 @@ internal enum ScalarFunctions {
                 return try FloatFunctions.call(name: name, args: values, meter: meter)
             }
             if name == "abs", case .integer(let value) = values[0], case .scalar(let type) = function.resultType.type {
-                guard value != Int64.min else { throw JedError("22003", "integer out of range") }
+                guard value != Int64.min else { throw JedError("22003", "integer out of range").withDataType(type.name) }
                 return .integer(try ScalarCasts.checkedInteger(value < 0 ? -value : value, type: type))
             }
             let arguments = try values.map { value -> SQLDecimal in
@@ -221,11 +228,11 @@ internal enum ScalarFunctions {
         guard low != high else { throw JedError("2201G", "lower bound cannot equal upper bound") }
         if low < high ? operand < low : operand > low { return 0 }
         if low < high ? operand >= high : operand <= high {
-            guard count < Int32.max else { throw JedError("22003", "integer out of range") }; return count + 1
+            guard count < Int32.max else { throw JedError("22003", "integer out of range").withDataType("i32") }; return count + 1
         }
         let fraction = (high - low).isInfinite ? (operand / 2 - low / 2) / (high / 2 - low / 2) : (operand - low) / (high - low)
         let result = min((fraction * Double(count)).rounded(.down) + 1, Double(count))
-        guard result <= Double(Int32.max) else { throw JedError("22003", "integer out of range") }; return Int64(result)
+        guard result <= Double(Int32.max) else { throw JedError("22003", "integer out of range").withDataType("i32") }; return Int64(result)
     }
 
 }

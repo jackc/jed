@@ -1,0 +1,5 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#MISE description="Explicit opt-in: check a database with the native Swift integrity API"
+require_relative "../../impl/swift-native/Tools/swift_task"
+SwiftNativeTasks.run_product("jed-check", arguments: ARGV)

@@ -1,0 +1,48 @@
+# Recovered-generation stabilization (validated-cow.md §3; simulation-testing.md §14 S1). A process
+# crash leaves a complete but unsynced generation in the kernel cache; the next opener adopts it and
+# must make it durable before its first write, or that write can overwrite pages the older durable
+# generation still needs. So: small tables churned until the free list compacts often, process
+# crashes that usually issue every write, and the first commit after a crash almost always faulted.
+
+description = "Process crashes that leave complete unsynced generations, then a faulted next commit"
+
+page_sizes = [256]
+cache_bytes = [2048]
+steps = 400
+max_tables = 2
+max_rows = 80
+max_readers = 1
+batch = [1, 8]
+
+[weights]
+open_write = 14
+open_read = 1
+close_read = 2
+read_query = 1
+insert = 6
+update = 14
+delete = 6
+commit = 16
+rollback = 1
+create_index = 1
+drop_index = 1
+drop_table = 0
+add_column = 0
+analyze = 0
+sequence = 0
+invalid = 0
+check = 1
+reopen = 0
+crash_power = 1
+crash_process = 4
+
+[faults]
+commit_fault = 200
+chain = 900
+power_loss = 5
+process_crash = 5
+io_error_write = 0
+io_error_sync = 0
+survive = [100, 1000]
+tear = [0, 300]
+issue = [900, 1000]

@@ -60,7 +60,7 @@ internal enum TextFunctions {
             let replacement = try text(1), start = try integer(2), count = try args.count > 3 ? integer(3) : Int64(replacement.scalarCount)
             guard start > 0 else { throw JedError("22011", "negative substring length not allowed") }
             let end = Int128(start) + Int128(count)
-            guard end >= Int32.min, end <= Int32.max else { throw JedError("22003", "integer out of range") }
+            guard end >= Int32.min, end <= Int32.max else { throw JedError("22003", "integer out of range").withDataType("i32") }
             let subject = RegexSubject(input)
             let head = try ByteaFunctions.window(length: subject.scalars.count, start: 1, count: start - 1)
             let tail = try ByteaFunctions.window(length: subject.scalars.count, start: Int64(end), count: nil)

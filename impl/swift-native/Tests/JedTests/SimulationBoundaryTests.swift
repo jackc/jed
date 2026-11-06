@@ -50,10 +50,38 @@ final class SimulationBoundaryTests: XCTestCase {
         try fs.syncDirectory(); XCTAssertEqual(fs.barriers, 0)
         let temporary = try fs.create("sim.jedtmp"); try temporary.setSize(256)
         XCTAssertEqual(fs.barriers, 0); XCTAssertFalse(temporary.facts.barrierComplete)
-        fails("58030") { try fs.syncDirectory() }
+        try fs.syncDirectory()
         XCTAssertEqual(fs.fired, "barrier"); XCTAssertEqual(fs.barriers, 1)
+        XCTAssertFalse(fs.entryDurable("sim.jedtmp"))
+        try fs.syncDirectory() // void directory calls cannot acknowledge death
+        XCTAssertEqual(fs.barriers, 1)
         fails("58030") { _ = try temporary.read(at: 0, count: 1) }
     }
+    func testTemporaryReplacementUsesOneCanonicalDirectoryCreate() throws {
+        for seed: UInt64 in 1...16 {
+            let fs = try SimFilesystem(seed: seed, pageSize: 256)
+            let main = try fs.create("sim.jed")
+            try main.setSize(256); try main.write(at: 0, bytes: [1]); try main.sync(); try fs.syncDirectory()
+            fs.beginStep(1)
+            let stale = try fs.create("sim.jed.jedtmp")
+            try stale.setSize(256); try stale.write(at: 0, bytes: [2]); try stale.sync()
+            fs.processDeath()
+            fs.beginStep(2)
+            let host: any FileOperations = fs
+            let replacement = try host.createReplacementTemporary("sim.jed.jedtmp", skipFsync: false)
+            try replacement.setSize(256); try replacement.write(at: 0, bytes: [3]); try replacement.sync()
+            try fs.rename("sim.jed.jedtmp", to: "sim.jed")
+            // The pending directory operations are create(stale),
+            // create(replacement), rename. No extra deletion may renumber
+            // the shared lane-10 ordered-prefix decision.
+            let prefix = SimDecision.value(seed: seed, lane: 10, step: 2, offset: 0, version: 0) % 4
+            fs.powerLoss(step: 2, survive: 0, tear: 0)
+            XCTAssertEqual(try fs.open("sim.jed").read(at: 0, count: 1), [prefix == 3 ? 3 : 1])
+            if prefix == 1 { XCTAssertEqual(try fs.open("sim.jed.jedtmp").read(at: 0, count: 1), [2]) }
+            if prefix == 2 { XCTAssertEqual(try fs.open("sim.jed.jedtmp").read(at: 0, count: 1), [3]) }
+        }
+    }
+
     func testReadFaultOracleExemptionAndFailedWriteLandNothing() throws {
         let fs = try SimFilesystem(seed: 7, pageSize: 256), file = try fs.create("sim.jed")
         try file.setSize(256); try fs.syncDirectory()
@@ -103,6 +131,20 @@ final class SimulationBoundaryTests: XCTestCase {
         XCTAssertEqual(reopened.version, before + 1)
         XCTAssertEqual(reopened.core.storage.committed.catalog.sequences.map { $0.name.description }, ["first"])
     }
+    func testCreateReopensPublishedPathAfterDirectoryBarrier() throws {
+        let fs = try SimFilesystem(seed: 2, pageSize: 256)
+        fs.beginStep(55, fault: SimFault(kind: .powerLoss, survive: 1000, tear: 128, nth: 2))
+        fails("58030") {
+            _ = try FileDatabaseHost.createResolved(path: "a1.jed", options: CreateOptions(pageSize: 256, locking: .none),
+                catalogID: 9105, random: SeededRandomSource(seed: 1), operations: fs)
+        }
+        XCTAssertTrue(fs.isDead); XCTAssertEqual(fs.fired, "barrier")
+        XCTAssertNotNil(fs.facts("a1.jed"))
+        XCTAssertFalse(fs.entryDurable("a1.jed"))
+        fs.powerLoss(step: 55, survive: 1000, tear: 128)
+        XCTAssertNil(fs.facts("a1.jed"), "a creation that never returned has no durability floor")
+    }
+
     func testReplacementFailureBeforeRenameLeavesOriginalUsable() throws {
         let fs = try SimFilesystem(seed: 32, pageSize: 256)
         let database = try FileDatabaseHost.createResolved(path: "sim.jed", options: CreateOptions(pageSize: 256, locking: .none),

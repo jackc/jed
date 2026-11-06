@@ -1,0 +1,11 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#MISE description="Explicit opt-in: frozen threaded reader/writer stress and cross-core final checksum"
+#USAGE flag "-c --configuration <configuration>" default="debug" help="Swift build configuration"
+#USAGE flag "--no-swift-build" help="Capture the existing Swift stress executable"
+#USAGE flag "--cores <cores>" default="swift,rust,go,ts" help="Unique cores including Swift; subsets are diagnostic only"
+#USAGE flag "--output <path>" help="Empty evidence directory"
+#USAGE flag "--check-adapter" help="Validate frozen input and strict result membership without executing cores"
+
+require_relative "../../impl/swift-native/Tools/stress"
+exit SwiftNativeStress.run

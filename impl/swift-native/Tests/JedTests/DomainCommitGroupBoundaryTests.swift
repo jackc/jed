@@ -52,7 +52,7 @@ final class DomainCommitGroupBoundaryTests: XCTestCase {
         XCTAssertThrowsError(try body(), file: file, line: line) { XCTAssertEqual(($0 as? JedError)?.code, code, file: file, line: line) }
     }
 
-    func testEveryBudgetAdmittedBeforeStagingAndPublishedAccountingStaysPure() throws {
+    func testEveryBudgetAdmittedBeforeStagingAndForcedCompactionSurvivesRefusal() throws {
         let events = GroupEvents(), aDevice = GroupDevice("a", events), bDevice = GroupDevice("b", events)
         let a = try core(aDevice, id: 1), b = try core(bDevice, id: 2)
         let seed = try a.acquireWriter()
@@ -64,7 +64,11 @@ final class DomainCommitGroupBoundaryTests: XCTestCase {
         events.values.withLock { $0.removeAll() }
         expect("54P06") { _ = try DomainCommitGroup.prepare([bi, ai]) }
         XCTAssertTrue(events.values.withLock { $0.isEmpty })
-        XCTAssertEqual(try a.storage.pager.allocationSnapshot(reuseAllowed: true).persistedFree, free)
+        let reclaimed = try a.storage.pager.allocationSnapshot(reuseAllowed: true).persistedFree
+        XCTAssertTrue(free.isEmpty); XCTAssertEqual(reclaimed, [2])
+        XCTAssertEqual(a.storage.pager.selected.meta.pageCount, 5)
+        XCTAssertNotNil(try a.storage.committed.tables[table]?.get(key(1)))
+        XCTAssertNil(try a.storage.committed.tables[table]?.get(key(2)))
         XCTAssertEqual(a.version, 1); XCTAssertEqual(b.version, 0)
     }
 

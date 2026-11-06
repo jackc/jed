@@ -1,0 +1,16 @@
+# The owner (p0) dies in a rekey while page client p2 sits idle, leaving the rekeyed file; p2's backup
+# promotes it with the data key it held, which authenticates neither meta slot of that file. That is 28P04 (the
+# host reopens with the credential), not XX001, in all three cores (encrypted.md §14). Found by the S13
+# encryption-service sweep.
+# format: simulation
+# profile: encryption-service
+# seed: 34
+# page_size: 2048
+# synchronous: off
+# encrypted: 1
+# processes: service
+# clock: 1700000000000000
+spawn p2
+fault process_crash issue=884 nth=3
+rekey 2
+backup compacted p2

@@ -1,0 +1,13 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#MISE description="Explicit opt-in: frozen SQL corpus through real Swift/supported page-service owner/client pairs"
+#USAGE flag "-c --configuration <configuration>" default="debug" help="debug or release"
+#USAGE flag "--no-build" help="Capture existing Swift XCTest/owner and supported binary actors"
+#USAGE flag "--no-swift-build" help="Capture existing Swift actors; build fresh supported peer actors without SwiftPM"
+#USAGE flag "--filter <filter>" help="Nonempty diagnostic frozen corpus path substring; omitted means full disk corpus"
+#USAGE flag "--pairs <pairs>" default="swift:rust,swift:go,swift:ts,rust:swift,go:swift,ts:swift" help="Exact client:owner pairs; subsets are diagnostic only"
+#USAGE flag "--output <path>" help="Empty evidence directory; defaults to retained unique /tmp directory"
+#USAGE flag "--check-adapter" help="Validate pairing, fixture classification and role evidence without builds or cores"
+
+require_relative "../../impl/swift-native/Tools/service_corpus"
+exit SwiftServiceCorpus.run

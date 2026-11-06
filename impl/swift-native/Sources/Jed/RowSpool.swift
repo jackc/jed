@@ -72,14 +72,21 @@ internal final class RowSpoolCursor {
         self.owner = owner; self.file = file; self.owning = owning
     }
     func next() throws -> [SQLValue]? {
-        guard let owner else { return nil }
+        guard owner != nil else { return nil }
         do {
-            try owner.checkOpen()
-            let row: [SQLValue]?
-            if let file { row = try file.next() } else { row = try owner.row(at: position) }
-            if let row { position += 1; return row }
+            if let row = try pullForReplay() { return row }
             close(); return nil
         } catch { close(); throw error }
+    }
+    /// Read-ahead owns the error boundary: keep the spool's charge until the
+    /// successful prefix has replayed or the enclosing emitter closes.
+    func pullForReplay() throws -> [SQLValue]? {
+        guard let owner else { return nil }
+        try owner.checkOpen()
+        let row: [SQLValue]?
+        if let file { row = try file.next() } else { row = try owner.row(at: position) }
+        if row != nil { position += 1 }
+        return row
     }
     func close() {
         file?.close(); file = nil

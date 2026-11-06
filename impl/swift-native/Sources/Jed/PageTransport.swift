@@ -15,13 +15,17 @@ public protocol PageTransport: AnyObject, Sendable {
 }
 extension PageTransport { public var diagnostic: String { "" } }
 
+internal protocol ServiceReaderLifetime: Sendable { func readerFinished() }
+
 internal protocol ServiceFrameTransport: Sendable {
     func readFrame(pageSize: Int, deadline: ContinuousClock.Instant?) throws -> ServiceFrame?
     func send(_ frame: ServiceFrame, pageSize: Int, deadline: ContinuousClock.Instant?) throws
     func close()
     var diagnostic: String { get }
+    func readerFinished()
 }
 extension ServiceFrameTransport {
+    func readerFinished() {}
     func readFrame(pageSize: Int) throws -> ServiceFrame? { try readFrame(pageSize: pageSize, deadline: nil) }
     func send(_ frame: ServiceFrame, pageSize: Int) throws { try send(frame, pageSize: pageSize, deadline: nil) }
     var diagnostic: String { "" }
@@ -68,6 +72,7 @@ internal final class PageFrameStream: ServiceFrameTransport, Sendable {
         try sendRaw(frame.encode(pageSize: pageSize), deadline: deadline)
     }
     func close() { transport.close() }
+    func readerFinished() { (transport as? any ServiceReaderLifetime)?.readerFinished() }
 }
 
 /// Owned nonblocking descriptors. Polling is bounded so close wakes a pipe read

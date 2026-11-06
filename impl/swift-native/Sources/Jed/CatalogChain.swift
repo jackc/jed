@@ -4,13 +4,13 @@ internal struct CatalogChainWrite: Sendable {
 }
 
 internal enum CatalogChain {
-    private struct Chunk {
+    struct Chunk {
         var bytes: [UInt8]
         var count: UInt32
         var continued: Bool
     }
 
-    private static func layout(_ entries: [CatalogEntry], codec: any PageCodec) throws -> [Chunk] {
+    static func layout(_ entries: [CatalogEntry], codec: any PageCodec) throws -> [Chunk] {
         let capacity = codec.capacity - (codec.reservedBytes == 0 ? 0 : 16)
         let encoded = try entries.map { try CatalogCodec.encode($0, encrypted: codec.reservedBytes != 0) }
         var chunks: [Chunk] = [], active = Chunk(bytes: [], count: 0, continued: false)

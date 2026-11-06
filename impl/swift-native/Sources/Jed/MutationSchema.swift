@@ -5,6 +5,12 @@ extension MutationExecutor {
     static func prepareReturning(_ statement: SQLStatement, snapshot: DomainSnapshot,
                                  settings: SessionSettings, context: ExpressionContext,
                                  using shared: ExpressionResolver) throws -> MutationSchema {
+        if case .merge(let syntax) = statement {
+            let plan = try MergeExecutor.prepare(syntax, snapshot: snapshot, settings: settings, context: context,
+                using: shared, schemaOnly: true)
+            return MutationSchema(columns: plan.returning.columns, expressions: plan.returning.expressions,
+                noReturning: syntax.returning == nil)
+        }
         let name: SQLName, returning: SQLReturning?, deleting: Bool, alias: SQLText?, operation: String
         switch statement {
         case .insert(let syntax):
@@ -30,17 +36,17 @@ extension MutationExecutor {
             case .insert(let syntax):
                 let targets: [Int]
                 if case .defaultValues = syntax.source { targets = [] }
-                else { targets = try syntax.columns.isEmpty ? Array(definition.columns.indices) : syntax.columns.map(view.column) }
+                else { targets = try syntax.columns.isEmpty ? Array(definition.columns.indices) : syntax.columns.enumerated().map { try view.column($0.element, position: syntax.columnPosition($0.offset)) } }
                 guard Set(targets).count == targets.count else { throw JedError("42701", "column specified more than once") }
                 if let conflict = syntax.conflict, !conflict.doNothing {
-                    let updates = try conflict.assignments.map { try view.column($0.column) }
+                    let updates = try conflict.assignments.map { try view.column($0.column, position: $0.position) }
                     guard Set(updates).count == updates.count else { throw JedError("42701", "multiple assignments to same column") }
                     _ = try view.destinations(Array(Set(targets + updates)).sorted(), allowDuplicates: true)
                     _ = try view.destinations(updates)
                 }
                 _ = try view.destinations(targets)
             case .update(let syntax):
-                let targets = try syntax.assignments.map { try view.column($0.column) }
+                let targets = try syntax.assignments.map { try view.column($0.column, position: $0.position) }
                 guard Set(targets).count == targets.count else { throw JedError("42701", "multiple assignments to same column") }
                 _ = try view.destinations(targets)
             default: break

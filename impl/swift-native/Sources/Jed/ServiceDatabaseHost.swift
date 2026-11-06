@@ -6,17 +6,22 @@ import Synchronization
 /// One pathname claim spans every owner/client incarnation of a public handle.
 /// The condition guards role changes; it is entirely resident on the ordinary
 /// owner's foreground path. Only election workers touch the lock bundle.
-internal final class ServiceDatabaseHost: CoordinatedDatabaseClose, DatabaseRoleCoordinator, DatabaseScratchPolicy, @unchecked Sendable {
+internal final class ServiceDatabaseHost: CoordinatedDatabaseClose, DatabaseRoleCoordinator, DatabaseScratchPolicy, DatabaseScratchProvider, DatabaseFilesystemProvider, @unchecked Sendable {
     private enum Role {
         case owner(FileDatabaseHost, PageServiceOwner?, String?)
         case client(PageServiceClient)
     }
     let path: String
-    private let claim: FilePathClaim
+    private let claim: any ServicePathClaim
+    private let platform: any ServiceHostPlatform
     private let options: OpenOptions
     private let structuralOnly: Bool
     var skipsFsync: Bool { options.skipFsync }
     var forceSealedScratch: Bool { options.scratchEncryption == .on }
+    var fileOperations: any FileOperations { platform.operations }
+    var scratchFileHost: any ScratchFileHost {
+        platform.scratch(sealed: forceSealedScratch || core?.storage.pager.codec.reservedBytes != 0, random: random)
+    }
     private let catalogID: UInt64
     private let random: any RandomSource
     private let condition = NSCondition()
@@ -36,20 +41,26 @@ internal final class ServiceDatabaseHost: CoordinatedDatabaseClose, DatabaseRole
     private var requester: UInt64?
     private var transferring = false
     private var noticeRequester: UInt64?
-    private var pauseUntil: ContinuousClock.Instant?
+    private var pauseUntil: Int64?
     private var heldCodec: EncryptedPageCodec?
 
-    private init(path: String, claim: FilePathClaim, options: OpenOptions, catalogID: UInt64, random: any RandomSource, structuralOnly: Bool = false) {
+    private init(path: String, claim: any ServicePathClaim, options: OpenOptions, catalogID: UInt64, random: any RandomSource, structuralOnly: Bool = false, platform: any ServiceHostPlatform = NativeServiceHostPlatform()) {
         self.structuralOnly = structuralOnly
-        self.path = path; self.claim = claim; self.options = options; self.catalogID = catalogID; self.random = random
+        self.platform = platform; self.path = path; self.claim = claim; self.options = options; self.catalogID = catalogID; self.random = random
     }
     static func open(path original: String, options: OpenOptions, catalogID: UInt64, structuralOnly: Bool = false) throws -> Database {
         try options.pageService.validate()
         let path = try FileLockBundle.normalize(original, creating: false)
         try FileLockBundle.checkHardLinks(path)
-        let claim = try FilePathClaim.acquire(path)
+        return try openResolved(path: path, options: options, catalogID: catalogID, structuralOnly: structuralOnly,
+            platform: NativeServiceHostPlatform())
+    }
+    static func openResolved(path: String, options: OpenOptions, catalogID: UInt64, structuralOnly: Bool = false,
+                             platform: any ServiceHostPlatform) throws -> Database {
+        try options.pageService.validate()
+        let claim = try platform.claim(path)
         let host = ServiceDatabaseHost(path: path, claim: claim, options: options, catalogID: catalogID,
-            random: options.environment.newKeySource(), structuralOnly: structuralOnly)
+            random: options.environment.newKeySource(), structuralOnly: structuralOnly, platform: platform)
         host.electing = true
         do { try host.elect(initial: true); return host.wrap() }
         catch { host.closeFailedOpen(); throw error }
@@ -61,7 +72,7 @@ internal final class ServiceDatabaseHost: CoordinatedDatabaseClose, DatabaseRole
         let opening = OpenOptions(environment: options.environment, cacheBytes: options.cacheBytes,
             maxStorageBytes: options.maxStorageBytes, credential: options.credential, locking: .automatic,
             fileLockTimeoutMilliseconds: options.fileLockTimeoutMilliseconds, skipFsync: options.skipFsync,
-            scratchEncryption: options.scratchEncryption, pageService: options.pageService)
+            synchronous: options.synchronous, flushIntervalMilliseconds: options.flushIntervalMilliseconds, scratchEncryption: options.scratchEncryption, pageService: options.pageService)
         let host = ServiceDatabaseHost(path: path, claim: claim, options: opening, catalogID: catalogID, random: random)
         host.electing = true
         do {
@@ -74,13 +85,14 @@ internal final class ServiceDatabaseHost: CoordinatedDatabaseClose, DatabaseRole
     }
     private func wrap() -> Database {
         let result = Database(core: core!, environment: options.environment,
-            maxStorageBytes: options.maxStorageBytes, keySource: random, host: self)
+            maxStorageBytes: options.maxStorageBytes, keySource: random, host: self, flushIntervalMilliseconds: options.flushIntervalMilliseconds)
+        result.synchronous = options.synchronous
         core!.coordinateRoles(with: self)
         condition.lock(); database = result; electing = false; condition.broadcast()
         let retry: Bool
         if case .client(let client) = role { retry = client.connection.isClosed } else { retry = false }
         condition.unlock()
-        if retry { Thread.detachNewThread { try? self.awaitAdmission() } }
+        if retry && platform.backgroundElection { Thread.detachNewThread { try? self.awaitAdmission() } }
         return result
     }
     var isClosed: Bool { condition.lock(); defer { condition.unlock() }; return closed }
@@ -112,7 +124,7 @@ internal final class ServiceDatabaseHost: CoordinatedDatabaseClose, DatabaseRole
     }
     private func maintenanceSettings() -> (Bool, Int64) {
         condition.lock(); defer { condition.unlock() }
-        return (database?.synchronous ?? true, database?.maxStorageBytes ?? options.maxStorageBytes)
+        return (database?.synchronous ?? options.synchronous, database?.maxStorageBytes ?? options.maxStorageBytes)
     }
     private func closeFailedOpen() {
         condition.lock(); let old = role; role = nil; closed = true; condition.broadcast(); condition.unlock()
@@ -121,7 +133,7 @@ internal final class ServiceDatabaseHost: CoordinatedDatabaseClose, DatabaseRole
     private func dispose(_ role: Role?) {
         switch role {
         case .owner(let file, let server, let endpoint):
-            server?.stop(); try? file.close(); if let endpoint { PageServiceEndpoint.remove(endpoint) }
+            server?.stop(); try? file.close(); if let endpoint { platform.remove(endpoint) }
         case .client(let client): client.close()
         case nil: break
         }
@@ -131,15 +143,15 @@ internal final class ServiceDatabaseHost: CoordinatedDatabaseClose, DatabaseRole
         else { core = DatabaseCore(storage: storage, environment: options.environment, remote: remote, sqlReady: !structural) }
         heldCodec = storage.pager.codec as? EncryptedPageCodec
     }
-    private func becomeOwner(_ local: Database, bundle: FileLockBundle, structural: Bool) throws {
+    private func becomeOwner(_ local: Database, bundle: any ServiceOwnership, structural: Bool) throws {
         guard let file = local.host as? FileDatabaseHost else { throw JedError("58030", "file owner host is unavailable") }
-        var incarnation = try OSRandomSource().bytes(count: 16)
-        while !incarnation.contains(where: { $0 != 0 }) { incarnation = try OSRandomSource().bytes(count: 16) }
-        let endpoint = options.pageService.serve ? PageServiceEndpoint.choose(database: path, incarnation: incarnation) : nil
+        var incarnation = try platform.incarnation()
+        while !incarnation.contains(where: { $0 != 0 }) { incarnation = try platform.incarnation() }
+        let endpoint = options.pageService.serve ? platform.endpoint(path: path, incarnation: incarnation) : nil
         do {
-            try bundle.writeOwner(ServiceOwnerRecord(serving: endpoint != nil, uid: UInt32(getuid()),
-                incarnation: incarnation, pid: UInt32(getpid()), endpoint: endpoint ?? ""))
-            let listener = try endpoint.map { try UnixServiceSocket.listen(path: $0) }
+            try bundle.writeOwner(ServiceOwnerRecord(serving: endpoint != nil, uid: platform.uid,
+                incarnation: incarnation, pid: platform.pid, endpoint: endpoint ?? ""))
+            let listener = try endpoint.map { try platform.listen($0) }
             adopt(local.core.storage, remote: nil, structural: structural)
             let current = core!
             let selected = current.storage.pager.selected
@@ -154,34 +166,37 @@ internal final class ServiceDatabaseHost: CoordinatedDatabaseClose, DatabaseRole
                     ended: { [weak self] in self?.connectionEnded($0) },
                     poisoned: { [weak self] in self?.ownerFailed() },
                     synchronous: { [weak self] in self?.maintenanceSettings().0 ?? true },
-                    storageLimit: { [weak self] in self?.maintenanceSettings().1 ?? 0 })
+                    storageLimit: { [weak self] in self?.maintenanceSettings().1 ?? 0 }, timers: platform.ownerTimers,
+                    dispatchWork: { [platform] in platform.dispatch($0) })
             }
             condition.lock(); let old = role; role = .owner(file, server, endpoint); condition.unlock()
+            file.bindIdleFlusher(to: current, failed: { [weak self] in self?.ownerFailed() })
             dispose(old); server?.start()
-        } catch { try? file.close(); if let endpoint { PageServiceEndpoint.remove(endpoint) }; throw error }
+        } catch { try? file.close(); if let endpoint { platform.remove(endpoint) }; throw error }
     }
     private func elect(initial: Bool) throws {
         let deadline = ContinuousClock.now.advanced(by: .milliseconds(max(0, options.fileLockTimeoutMilliseconds)))
-        let bundle = try FileLockBundle.prepare(path: path, timeoutMilliseconds: options.fileLockTimeoutMilliseconds, claim: claim)
+        let expires = ServiceHostTime.deadline(platform.now(), milliseconds: UInt64(max(0, options.fileLockTimeoutMilliseconds)))
+        let bundle = try platform.prepare(path: path, timeout: options.fileLockTimeoutMilliseconds, claim: claim)
         var transferred = false
         defer { if !transferred { bundle.close() } }
         while true {
             condition.lock(); let stop = closed || closing; let pause = pauseUntil; condition.unlock()
             if stop { throw JedError("55000", "database is closed") }
-            if options.pageService.ownership != .never, pause == nil || ContinuousClock.now >= pause!, try bundle.tryOwnership() {
-                let local = try FileDatabaseHost.open(path: path, options: options, catalogID: catalogID,
-                    bundle: bundle, unlockedCodec: heldCodec, structural: structuralOnly || !initial)
+            if options.pageService.ownership != .never, pause == nil || platform.now() >= pause!, try bundle.tryOwnership() {
+                let local = try platform.openFile(path: path, options: options, catalogID: catalogID, bundle: bundle,
+                    unlockedCodec: heldCodec, structural: structuralOnly || !initial, random: random)
                 transferred = true
                 try becomeOwner(local, bundle: bundle, structural: structuralOnly || !initial)
                 return
             }
-            if let owner = FileLockBundle.readOwner(path), owner.serving, owner.uid == UInt32(getuid()), !owner.endpoint.isEmpty {
+            if let owner = platform.owner(path), owner.serving, owner.uid == platform.uid, !owner.endpoint.isEmpty {
                 do {
-                    let socket = try UnixServiceSocket.connect(path: owner.endpoint, deadline: deadline)
+                    let socket = try platform.connect(owner.endpoint, deadline: deadline)
                     let connection = try PageServiceConnection.open(socket: socket,
                         hello: ServiceHello(flags: options.readOnly ? 1 : 0), deadline: deadline,
                         notice: { [weak self] kind, requester in self?.receiveNotice(kind, requester: requester) },
-                        disconnected: { [weak self] in self?.disconnected() })
+                        disconnected: { [weak self] in self?.disconnected() }, synchronousDisconnect: !platform.backgroundElection)
                     let opened = try PageServiceClient.open(connection: connection, credential: options.credential,
                         environment: options.environment, unlockedCodec: heldCodec, deadline: deadline, catalogID: catalogID, cacheBytes: options.cacheBytes, structuralOnly: structuralOnly,
                         resolve: { [weak self] txid, digest in
@@ -200,13 +215,24 @@ internal final class ServiceDatabaseHost: CoordinatedDatabaseClose, DatabaseRole
                     // may have exited between reading the record and hello.
                 }
             }
-            if ContinuousClock.now >= deadline {
+            if platform.now() >= expires {
                 let code = initial ? "55006" : "08006"
-                var error = JedError(code, "database file is in use: \(path)\(FileLockBundle.ownerDetail(path))")
+                var error = JedError(code, "database file is in use: \(path)\(ownerDetail())")
                 error.detail = path; throw error
             }
-            Thread.sleep(forTimeInterval: 0.002)
+            platform.pause()
         }
+    }
+    private func ownerDetail() -> String {
+        guard let owner = platform.owner(path) else { return "" }
+        if owner.uid != platform.uid { return " (owned by another user's process)" }
+        return owner.serving ? "" : " (owned by a non-serving process)"
+    }
+    private func finishElection() {
+        let result = Result { try elect(initial: false) }
+        condition.lock(); electing = false; electionCompletion &+= 1
+        if case .failure(let error) = result { electionFailure = error as? JedError ?? JedError("08006", "page-service election failed") }
+        condition.broadcast(); condition.unlock()
     }
     func awaitAdmission() throws { try awaitAdmission(deadline: nil, cancellation: nil) }
     private func awaitAdmission(deadline: ContinuousClock.Instant?, cancellation: CancellationToken?) throws {
@@ -226,11 +252,10 @@ internal final class ServiceDatabaseHost: CoordinatedDatabaseClose, DatabaseRole
                 electing = true; electionFailure = nil
                 // Election belongs to the handle. A canceled or timed-out
                 // writer leaves this bounded worker available to other callers.
-                Thread.detachNewThread {
-                    let result = Result { try self.elect(initial: false) }
-                    self.condition.lock(); self.electing = false; self.electionCompletion &+= 1
-                    if case .failure(let error) = result { self.electionFailure = error as? JedError ?? JedError("08006", "page-service election failed") }
-                    self.condition.broadcast(); self.condition.unlock()
+                if platform.backgroundElection {
+                    Thread.detachNewThread { self.finishElection() }
+                } else {
+                    condition.unlock(); finishElection(); condition.lock(); continue
                 }
             }
             if let deadline, ContinuousClock.now >= deadline {
@@ -249,13 +274,12 @@ internal final class ServiceDatabaseHost: CoordinatedDatabaseClose, DatabaseRole
             guard options.pageService.ownership != .never else { throw JedError("25006", "page-service owner is read only") }
             // Probe write permission without touching any page; the read-only
             // owner never needs to open its own descriptor with write access.
-            let fd = path.withCString { Glibc.open($0, O_RDWR | O_CLOEXEC) }
-            guard fd >= 0 else { throw JedError("25006", "database file cannot be opened read-write") }; _ = Glibc.close(fd)
+            try platform.probeWritable(path)
             _ = try client.connection.request(.requestOwnership).wait(cancellation: cancellation, deadline: deadline, timeoutCode: "55P03")
             while !client.connection.isClosed {
                 if cancellation?.isCancelled == true { throw JedError("57014", "canceling statement due to user request") }
                 if let deadline, ContinuousClock.now >= deadline { throw JedError("55P03", "canceling statement due to lock timeout") }
-                Thread.sleep(forTimeInterval: 0.002)
+                platform.pause()
             }
         }
     }
@@ -268,12 +292,12 @@ internal final class ServiceDatabaseHost: CoordinatedDatabaseClose, DatabaseRole
     private func disconnected() {
         condition.lock()
         if let requested = noticeRequester, case .client(let client) = role, requested != client.connection.hello.connection {
-            pauseUntil = ContinuousClock.now.advanced(by: .seconds(2))
+            pauseUntil = ServiceHostTime.deadline(platform.now(), milliseconds: 2000)
         }
         noticeRequester = nil
         let restart = core != nil && !closed && !closing && !electing
         condition.broadcast(); condition.unlock()
-        if restart { Thread.detachNewThread { try? self.awaitAdmission() } }
+        if restart && platform.backgroundElection { Thread.detachNewThread { try? self.awaitAdmission() } }
     }
     private func requestOwnership(_ id: UInt64) -> Bool {
         condition.lock()
@@ -282,7 +306,7 @@ internal final class ServiceDatabaseHost: CoordinatedDatabaseClose, DatabaseRole
               case .owner(_, let server?, _) = role else { condition.unlock(); return false }
         if let requester { condition.unlock(); return requester == id }
         requester = id; condition.unlock()
-        Thread.detachNewThread { self.yieldRole(server: server, requester: id) }
+        platform.dispatch { self.yieldRole(server: server, requester: id) }
         return true
     }
     private func connectionEnded(_ id: UInt64) {
@@ -302,11 +326,11 @@ internal final class ServiceDatabaseHost: CoordinatedDatabaseClose, DatabaseRole
         if resume { core.resumeAdmissions() }
         condition.unlock()
         if cancelledBeforeDrain { if resume { server.cancelDrain(requester: id) }; return }
-        let deadline = ContinuousClock.now.advanced(by: .milliseconds(Int64(clamping: options.pageService.yieldGraceMilliseconds)))
+        let deadline = ServiceHostTime.deadline(platform.now(), milliseconds: options.pageService.yieldGraceMilliseconds)
         while core.livePinCount != 0 || core.hasWriter {
             condition.lock(); let cancelled = requester != id || closing || closed; condition.unlock()
             if cancelled { return }
-            if ContinuousClock.now >= deadline { break }; Thread.sleep(forTimeInterval: 0.002)
+            if platform.now() >= deadline { break }; platform.pause()
         }
         condition.lock()
         guard requester == id, !closing, !closed else { condition.unlock(); return }
@@ -317,15 +341,19 @@ internal final class ServiceDatabaseHost: CoordinatedDatabaseClose, DatabaseRole
         catch { condition.lock(); failure = error as? JedError ?? JedError("58030", "owner handoff flush failed"); condition.unlock() }
         dispose(old)
         condition.lock(); requester = nil; transferring = false
-        pauseUntil = ContinuousClock.now.advanced(by: .seconds(2)); condition.broadcast(); condition.unlock()
-        try? awaitAdmission()
+        pauseUntil = ServiceHostTime.deadline(platform.now(), milliseconds: 2000); condition.broadcast(); condition.unlock()
+        if platform.backgroundElection { try? awaitAdmission() }
     }
     private func ownerFailed() {
         condition.lock()
         if closed || closing { condition.unlock(); return }
         failure = JedError("58030", "page-service owner storage failed; reopen the database")
-        let old = role; role = nil; condition.broadcast(); condition.unlock()
-        try? core?.quiesceRole(flush: false); dispose(old)
+        let current = role; condition.broadcast(); condition.unlock()
+        // Poisoning stops service but does not end the file owner's lifetime.
+        // Keep presence and the descriptor until the host closes or dies, so a
+        // client cannot promote during resolution of an in-flight failed commit.
+        try? core?.quiesceRole(flush: false)
+        if case .owner(_, let server, _) = current { server?.stop() }
     }
     private func resolve(txid: UInt64, digest: UInt64) throws -> Bool {
         do {
@@ -361,8 +389,8 @@ internal final class ServiceDatabaseHost: CoordinatedDatabaseClose, DatabaseRole
         let old = role; condition.unlock()
         if case .owner(_, let server?, _) = old {
             server.beginDrain(kind: 3)
-            let deadline = ContinuousClock.now.advanced(by: .milliseconds(Int64(clamping: options.pageService.shutdownGraceMilliseconds)))
-            while server.hasClientTransactions && ContinuousClock.now < deadline { Thread.sleep(forTimeInterval: 0.002) }
+            let deadline = ServiceHostTime.deadline(platform.now(), milliseconds: options.pageService.shutdownGraceMilliseconds)
+            while server.hasClientTransactions && platform.now() < deadline { platform.pause() }
             server.stop()
         }
         var problem: (any Error)?

@@ -1,0 +1,48 @@
+{
+  "fixture": "leaf_checksum.jed",
+  "runs": [
+    {
+      "level": "quick",
+      "max_findings": 100,
+      "report": {
+        "findings": [
+          {
+            "kind": "page_corrupt",
+            "database": "main",
+            "object": "t",
+            "page": 3,
+            "key": null
+          }
+        ],
+        "truncated": false,
+        "skipped": [],
+        "pages": 12,
+        "rows": 33
+      }
+    },
+    {
+      "level": "full",
+      "max_findings": 100,
+      "report": {
+        "findings": [
+          {
+            "kind": "page_corrupt",
+            "database": "main",
+            "object": "t",
+            "page": 3,
+            "key": null
+          }
+        ],
+        "truncated": false,
+        "skipped": [
+          {
+            "object": "t_v_idx",
+            "reason": "table_unreadable"
+          }
+        ],
+        "pages": 12,
+        "rows": 33
+      }
+    }
+  ]
+}

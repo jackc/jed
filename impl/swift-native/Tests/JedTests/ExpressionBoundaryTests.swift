@@ -2,6 +2,103 @@ import XCTest
 @testable import Jed
 
 final class ExpressionBoundaryTests: XCTestCase {
+    /// Constructor hints remain live while fixed-context descendants are
+    /// retained. Admission counts bound preparation work independently of CPU.
+    func testConstructorHintsRetainCompoundChildren() throws {
+        let count = 32
+        for wrapped in [false, true] {
+            var sql = "1"
+            for _ in 0..<count {
+                sql = "array_length(ARRAY[\(wrapped ? "-(\(sql))" : sql)], 1)"
+            }
+            let resolver = ExpressionResolver()
+            var admissions = 0
+            resolver.checkFunction = { _ in
+                admissions += 1
+                guard admissions <= count * 2 else { throw JedError("XX000", "repeated constructor child admission") }
+            }
+            _ = try resolver.resolve(SQLParser(sql).parseExpressionOnly())
+            XCTAssertEqual(admissions, count)
+        }
+
+        let resolver = ExpressionResolver()
+        let array = ExpressionResolver.Operand(try SQLParser("ARRAY[$1, 1]").parseExpressionOnly(), resolver: resolver)
+        let narrow = TypeDescriptor(.array(.scalar(.i16))), wide = TypeDescriptor(.array(.scalar(.i64)))
+        XCTAssertEqual(try array.resolve(expected: narrow).type, narrow)
+        XCTAssertEqual(try array.resolve(expected: wide).type, wide)
+        XCTAssertEqual(resolver.parameters[1]?.type, .scalar(.i64))
+        XCTAssertThrowsError(try array.resolve(expected: TypeDescriptor(.array(.scalar(.text))))) {
+            XCTAssertEqual(($0 as? JedError)?.code, "42804")
+        }
+
+        var admissions = 0
+        resolver.checkFunction = { _ in admissions += 1 }
+        let row = ExpressionResolver.Operand(try SQLParser("ROW(NULL, lower('A'))").parseExpressionOnly(), resolver: resolver)
+        for scalar in [ScalarType.i16, .i64] {
+            let type = TypeDescriptor(.record([
+                TypeField(name: try SQLText("f1"), descriptor: TypeDescriptor(.scalar(scalar))),
+                TypeField(name: try SQLText("f2"), descriptor: TypeDescriptor(.scalar(.text)))
+            ]))
+            XCTAssertEqual(try row.resolve(expected: type).type, type)
+        }
+        XCTAssertEqual(admissions, 1)
+    }
+
+    /// Function-family fallthrough must share resolved original operands, while
+    /// retaining the capability callback once for every authored call.
+    func testFunctionProbesRetainNestedCompoundArguments() throws {
+        for mode in 0..<5 {
+            // The terminal ARRAY adds one level beyond its scalar literal.
+            let count = mode == 2 ? 254 : 255
+            var sql = mode == 2 ? "ARRAY['a']" : mode >= 3 ? "1" : "'A'"
+            for depth in 0..<count {
+                if mode == 2 { sql = "array_append(\(sql), 'b')" }
+                else if mode == 3 { sql = "abs(\(sql))" }
+                else if mode == 4 { sql = "mod(\(sql), 2)" }
+                else { sql = "\(mode == 0 || depth % 2 == 0 ? "lower" : "upper")(\(sql))" }
+            }
+            let resolver = ExpressionResolver()
+            var admissions = 0
+            resolver.checkFunction = { _ in
+                admissions += 1
+                guard admissions <= count * 2 else { throw JedError("XX000", "repeated nested function admission") }
+            }
+            SQLCorpusTrace.write("Resolver nested function depth: mode=\(mode) calls=\(count)")
+            _ = try resolver.resolve(SQLParser(sql).parseExpressionOnly())
+            XCTAssertEqual(admissions, count)
+        }
+    }
+
+    /// Capability admission is observable through the resolver's host hook.
+    /// Operator selection must not revisit a resolved compound subtree for
+    /// every overloaded candidate; a long chain used to grow exponentially.
+    func testOperatorProbesRetainResolvedCompoundOperands() throws {
+        let count = 32
+        for (operand, operation) in [
+            ("abs(1)", "+"),
+            ("md5('x')", "||"),
+            ("decode('00', 'hex')", "||"),
+            ("ARRAY[abs(1)]", "||"),
+            ("jsonb_build_object('v', 1)", "||"),
+        ] {
+            let resolver = ExpressionResolver()
+            var admissions = 0
+            resolver.checkFunction = { _ in
+                admissions += 1
+                guard admissions <= count * 2 else { throw JedError("XX000", "repeated function admission: \(operand)") }
+            }
+            let sql = Array(repeating: operand, count: count).joined(separator: " \(operation) ")
+            SQLCorpusTrace.write("Resolver chain begin: \(operand)")
+            _ = try resolver.resolve(SQLParser(sql).parseExpressionOnly())
+            if operand.hasPrefix("ARRAY") {
+                // Array constructors legitimately revisit their elements under
+                // the selected polymorphic hint. That work must remain linear.
+                XCTAssertGreaterThanOrEqual(admissions, count, sql)
+                XCTAssertLessThanOrEqual(admissions, count * 2, sql)
+            } else { XCTAssertEqual(admissions, count, sql) }
+        }
+    }
+
     /// Parameter inference is host-visible metadata and must remain consistent
     /// across separately prepared expression trees in the same statement.
     func testConditionalParameterAdoptionAndByteInputBoundaries() throws {

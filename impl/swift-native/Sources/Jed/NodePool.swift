@@ -64,6 +64,11 @@ internal final class NodePool: Sendable {
     var residentLeaves: Int { state.withLock { $0.entries.count } }
     func readBody(_ reference: PageReference) throws -> [UInt8] { try read(reference) }
 
+    func integrityBody(_ reference: PageReference) throws -> [UInt8] {
+        if let bytes = state.withLock({ $0.entries[Identity(reference)]?.leaf.bytes }) { return bytes }
+        return try read(reference)
+    }
+
     func load(_ reference: PageReference, types: [TypeDescriptor]) throws -> PackedLeaf {
         while true {
             let identity = Identity(reference)

@@ -1,0 +1,34 @@
+# Strict root-string equality must find a top-level JSON string with and without
+# GIN. Its index term is KEY, even though strict object-member strings use VALUE.
+# PostgreSQL 18's forced GIN plan drops this row; its direct predicate and ordinary
+# sequential scan are the behavioral oracle (design/gin.md §9).
+# requires: ddl.create_table, ddl.primary_key, ddl.gin_index, dml.insert, dml.insert_multi_row, query.select, types.i32, types.jsonb, types.jsonpath, expr.jsonpath_filter, expr.jsonpath_match, query.gin_jsonb_ops, query.gin_jsonb_jsonpath
+
+statement ok
+CREATE TABLE d (id i32 PRIMARY KEY, doc jsonb)
+
+statement ok
+INSERT INTO d VALUES (1, '"x"'), (2, '"y"'), (3, '{"a":"x"}')
+
+query I nosort
+SELECT id FROM d WHERE doc @@ 'strict $ == "x"'
+----
+1
+
+query I nosort
+SELECT id FROM d WHERE doc @? 'strict $ ? (@ == "x")'
+----
+1
+
+statement ok
+CREATE INDEX d_doc_gin ON d USING gin (doc)
+
+query I nosort
+SELECT id FROM d WHERE doc @@ 'strict $ == "x"'
+----
+1
+
+query I nosort
+SELECT id FROM d WHERE doc @? 'strict $ ? (@ == "x")'
+----
+1

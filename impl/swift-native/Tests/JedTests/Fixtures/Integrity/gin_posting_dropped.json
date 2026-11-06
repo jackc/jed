@@ -1,0 +1,35 @@
+{
+  "fixture": "gin_posting_dropped.jed",
+  "runs": [
+    {
+      "level": "quick",
+      "max_findings": 100,
+      "report": {
+        "findings": [],
+        "truncated": false,
+        "skipped": [],
+        "pages": 53,
+        "rows": 40
+      }
+    },
+    {
+      "level": "full",
+      "max_findings": 100,
+      "report": {
+        "findings": [
+          {
+            "kind": "index_entry_missing",
+            "database": "main",
+            "object": "u_tags_gin",
+            "page": null,
+            "key": "8000000a"
+          }
+        ],
+        "truncated": false,
+        "skipped": [],
+        "pages": 53,
+        "rows": 40
+      }
+    }
+  ]
+}

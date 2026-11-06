@@ -78,7 +78,7 @@ internal enum DecimalTranscendental {
         if value.negative { throw JedError("2201E", "cannot take logarithm of a negative number") }
     }
 
-    private static func overflow() -> JedError { JedError("22003", "numeric value out of range") }
+    private static func overflow() -> JedError { JedError("22003", "numeric value out of range").withDataType("decimal") }
 
     private static func root(_ value: SQLDecimal, scale: Int, meter: CostMeter) throws -> SQLDecimal {
         if value.isZero { return SQLDecimal(negative: false, magnitude: BigMagnitude(0), scale: max(0, scale)) }

@@ -218,6 +218,92 @@ final class TreeBoundaryTests: XCTestCase {
         XCTAssertEqual(snapshot.count, 400)
     }
 
+    func testKeyOnlyLeafAndSeparatorCapacityAreDistinct() throws {
+        let codecs: [any PageCodec] = [try PlainPageCodec(pageSize: 256),
+            try EncryptedPageCodec(pageSize: 1024, dataKey: Array(repeating: 7, count: 32))]
+        for codec in codecs {
+            let leafMaximum = codec.capacity - PackedLeaf.overhead(records: 1, types: [])
+            let separatorMaximum = codec.capacity - (2 * PackedInterior.pointerWidth(codec) + 4)
+            var tree = BPlusTree(codec: codec, types: [])
+            let largest = key(1, width: leafMaximum)
+            try tree.insert(PackedRecord(key: largest, cells: []))
+            XCTAssertGreaterThan(largest.count, RecordDisposition.recordMaximum(capacity: codec.capacity, columns: 0))
+            var allocator = try PageAllocator(highWater: codec.firstBodyPage, free: [], firstBody: codec.firstBodyPage)
+            let written = try tree.serialize(allocator: &allocator, fromScratch: true,
+                entropy: { Array(repeating: 0xA5, count: $0) })
+            XCTAssertEqual(written.pages.count, 1)
+            let store = MemoryBlockStore(); try write(written.pages, to: store, pageSize: codec.pageSize)
+            let reopened = try BPlusTree.open(root: written.root, rowCount: 1, pageCount: allocator.highWater,
+                types: [], pool: pool(store, codec: codec))
+            XCTAssertEqual(try reopened.get(largest)?.key, largest)
+            // A smaller left neighbor copies the large entry into an oversized
+            // root separator. Keep the pending shape until serialization while
+            // its committed predecessor remains independently readable.
+            var pending = tree
+            try pending.insert(PackedRecord(key: key(0), cells: []))
+            XCTAssertEqual(pending.count, 2)
+            let highWater = allocator.highWater
+            XCTAssertThrowsError(try pending.serialize(allocator: &allocator, fromScratch: true,
+                entropy: { Array(repeating: 0xA5, count: $0) })) {
+                XCTAssertEqual(($0 as? JedError)?.code, "0A000")
+            }
+            XCTAssertEqual(allocator.highWater, highWater)
+            XCTAssertEqual(tree.count, 1); XCTAssertNil(try tree.get(key(0)))
+            pending = tree
+            try pending.insert(PackedRecord(key: key(2, width: leafMaximum + 1), cells: []))
+            XCTAssertThrowsError(try pending.serialize(allocator: &allocator, fromScratch: true,
+                entropy: { Array(repeating: 0xA5, count: $0) })) {
+                XCTAssertEqual(($0 as? JedError)?.code, "0A000")
+            }
+            // The reverse shape keeps the big entry in a leaf and copies only
+            // its small right neighbor, so it remains valid.
+            try tree.insert(PackedRecord(key: key(2), cells: [])); try validate(tree)
+            var boundary = BPlusTree(codec: codec, types: [])
+            try boundary.insert(PackedRecord(key: key(1, width: separatorMaximum), cells: []))
+            try boundary.insert(PackedRecord(key: key(0, width: codec.capacity - separatorMaximum), cells: []))
+            try validate(boundary)
+            XCTAssertEqual(try boundary.resolve(XCTUnwrap(boundary.root)).payloadSize, codec.capacity)
+        }
+    }
+
+    func testOversizedPendingLeafRetainsItsQ3ChargeWithoutRelaxingDiskValidation() throws {
+        let codecs: [any PageCodec] = [try PlainPageCodec(pageSize: 256),
+            try EncryptedPageCodec(pageSize: 1024, dataKey: Array(repeating: 7, count: 32))]
+        for codec in codecs {
+            var store = TableStore(tree: BPlusTree(codec: codec, types: []))
+            let small = PackedRecord(key: key(1), cells: [])
+            try store.put(small, netStaging: true); store.clearPending()
+            let committed = store
+            let large = PackedRecord(key: key(2, width: codec.capacity + 41), cells: [])
+            try store.put(large, netStaging: true)
+            XCTAssertEqual(store.pendingBytes, Int64(large.key.count))
+            XCTAssertEqual(try store.get(large.key)?.key, large.key)
+            XCTAssertEqual(try orderedKeys(store.tree), [small.key, large.key])
+            let leaf = try XCTUnwrap(store.tree.resolve(XCTUnwrap(store.tree.root)).leaf)
+            XCTAssertGreaterThan(leaf.bytes.count, codec.pageSize - codec.reservedBytes)
+            XCTAssertThrowsError(try PackedLeaf(bytes: leaf.bytes, types: [], codec: codec)) {
+                XCTAssertEqual(($0 as? JedError)?.code, "XX001")
+            }
+            XCTAssertThrowsError(try PackedLeaf.encodePayload([small, large],
+                types: [], capacity: codec.capacity)) {
+                XCTAssertEqual(($0 as? JedError)?.code, "0A000")
+            }
+            var allocation = try PageAllocator(highWater: codec.firstBodyPage, free: [], firstBody: codec.firstBodyPage)
+            XCTAssertThrowsError(try store.tree.serialize(allocator: &allocation,
+                entropy: { Array(repeating: 0xA5, count: $0) })) {
+                XCTAssertEqual(($0 as? JedError)?.code, "0A000")
+            }
+            XCTAssertEqual(allocation.highWater, codec.firstBodyPage)
+            XCTAssertEqual(committed.count, 1); XCTAssertNil(try committed.get(large.key))
+            try store.remove(large.key)
+            XCTAssertEqual(store.pendingBytes, 0)
+            let written = try store.tree.serialize(allocator: &allocation,
+                entropy: { Array(repeating: 0xA5, count: $0) })
+            XCTAssertEqual(written.pages.count, 1)
+            XCTAssertEqual(try written.tree.get(small.key)?.key, small.key)
+        }
+    }
+
     func testNearCapacitySeparatorsSurviveEveryDeleteAndSerialization() throws {
         let codec = try PlainPageCodec(pageSize: 256)
         var tree = BPlusTree(codec: codec, types: [])

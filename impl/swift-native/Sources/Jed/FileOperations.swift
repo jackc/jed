@@ -1,3 +1,9 @@
+/// Ownership lifetime retained by a file host until its byte handle closes.
+internal protocol FileOwnership: AnyObject, Sendable {
+    func checkOpen() throws
+    func close()
+}
+
 /// Byte handles may be closed independently of their inode. A failed native
 /// rename reopens the old inode into this same object, preserving pager users.
 internal protocol FileBlockStore: BlockStore {
@@ -9,10 +15,12 @@ internal protocol FileBlockStore: BlockStore {
 /// replacement, poisoning and recovery policy; both OS and simulation supply
 /// this seam. Neither adapter implements database commits or recovery.
 internal protocol FileOperations: Sendable {
+    var backgroundBatchFlush: Bool { get }
     func resolve(_ path: String, creating: Bool) throws -> String
     func exists(_ path: String) throws -> Bool
     func temporaryCreatePath(_ path: String) throws -> String
     func create(_ path: String, skipFsync: Bool) throws -> any FileBlockStore
+    func createReplacementTemporary(_ path: String, skipFsync: Bool) throws -> any FileBlockStore
     func open(_ path: String, readOnly: Bool, skipFsync: Bool) throws -> any FileBlockStore
     func copyPermissions(from source: any FileBlockStore, to target: any FileBlockStore) throws
     func remove(_ path: String) throws
@@ -34,6 +42,16 @@ import Darwin
 #endif
 
 extension UnixBlockStore: FileBlockStore {}
+
+extension FileOperations {
+    var backgroundBatchFlush: Bool { true }
+    /// Native replacement discards a stale sibling without following it. The
+    /// simulator models this host operation as one canonical create/truncate.
+    func createReplacementTemporary(_ path: String, skipFsync: Bool) throws -> any FileBlockStore {
+        try remove(path)
+        return try create(path, skipFsync: skipFsync)
+    }
+}
 
 internal struct NativeFileOperations: FileOperations {
     func resolve(_ path: String, creating: Bool) throws -> String { try FileLockBundle.normalize(path, creating: creating) }

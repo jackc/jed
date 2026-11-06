@@ -7,6 +7,16 @@ final class SQLCorpusBoundaryTests: XCTestCase {
     /// Every selected file's setup, successful query, and expected error runs.
     /// This is a subset report, not a declaration of corpus capability parity.
     static let selectedFiles = [
+        "dml/merge.test",
+        "dml/merge_jed.test",
+        "dml/merge_params.test",
+        "dml/merge_explain.test",
+        "dml/merge_view.test",
+        "dml/merge_constraints.test",
+        "dml/merge_join_source.test",
+        "dml/merge_ambiguous_alias.test",
+        "dml/merge_errors.test",
+        "dml/merge_hash.test",
         "ddl/create_index.test",
         "ddl/expression_index.test",
         "ddl/partial_index.test",
@@ -21,6 +31,9 @@ final class SQLCorpusBoundaryTests: XCTestCase {
         "query/order_by_index_key_order.test",
         "query/order_by_index_key_order_explain.test",
         "collation/collated_index_desc.test",
+        "collation/skew.test",
+        "collation/skew_full.test",
+        "collation/collation_upgrade.test",
         "collation/collated_index_vartail.test",
         "resource/param_index_limit.test",
         "ddl/create_gin_index.test",
@@ -30,6 +43,29 @@ final class SQLCorpusBoundaryTests: XCTestCase {
         "ddl/index_key_order.test",
         "ddl/alter_column_type_index_gate.test",
         "query/gin_mutation.test",
+        "query/gin_scan.test",
+        "query/gin_element_types.test",
+        "query/gin_text_elements.test",
+        "query/gin_text_elements_explain.test",
+        "query/gin_decimal_elements.test",
+        "query/gin_bytea_elements.test",
+        "query/gin_decimal_bytea_explain.test",
+        "query/gin_float_elements.test",
+        "query/gin_float_elements_explain.test",
+        "query/gin_interval_elements.test",
+        "query/gin_interval_elements_explain.test",
+        "query/gin_any_eq.test",
+        "query/gin_array_eq.test",
+        "query/gin_jsonb.test",
+        "query/gin_jsonb_explain.test",
+        "query/gin_jsonb_jsonpath.test",
+        "query/gin_jsonb_jsonpath_explain.test",
+        "query/gin_skip_scan.test",
+        "query/gin_multi_column.test",
+        "query/gin_multi_column_explain.test",
+        "query/gin_disjunction.test",
+        "query/gin_disjunction_explain.test",
+        "query/bounded_limit_streaming.test",
         "query/integers_basic.test",
         "ddl/views_recursive.test",
         "ddl/not_null.test",
@@ -218,6 +254,8 @@ final class SQLCorpusBoundaryTests: XCTestCase {
         "joins/using.test",
         "joins/natural.test",
         "resource/query_memory.test",
+        "resource/query_memory_eager.test",
+        "resource/query_memory_transient.test",
         "resource/query_memory_state.test",
         "resource/key_metering.test",
         "ddl/exclusion_constraint.test",
@@ -314,35 +352,127 @@ final class SQLCorpusBoundaryTests: XCTestCase {
         "ddl/explain_create_table_as.test",
     ]
 
+    static func selection(environment: [String: String], frozen: [String]) throws -> [String] {
+        let single = environment["JED_SWIFT_SQL_FILE"], multiple = environment["JED_SWIFT_SQL_FILES"]
+        guard single == nil || multiple == nil else { throw SQLCorpusError("sql-file and sql-files cannot be combined") }
+        let selected = single.map { [$0] } ?? multiple.map { $0.components(separatedBy: ",") }
+            ?? (environment["JED_SWIFT_ALL_SQL"] == "1" ? frozen : selectedFiles)
+        guard !selected.isEmpty, selected.allSatisfy({ !$0.isEmpty }) else { throw SQLCorpusError("SQL filenames must not be empty") }
+        guard Set(selected).count == selected.count else { throw SQLCorpusError("duplicate whole-file selection") }
+        let known = Set(frozen), unknown = selected.filter { !known.contains($0) }
+        guard unknown.isEmpty else { throw SQLCorpusError("unknown frozen SQL filename(s): " + unknown.joined(separator: ", ")) }
+        return selected
+    }
+
+    func testExactMultiFileSelectionRejectsSilentOmissions() throws {
+        let files = ["query/a.test", "resource/b.test"]
+        XCTAssertEqual(try Self.selection(environment: ["JED_SWIFT_SQL_FILES": "resource/b.test,query/a.test"], frozen: files), Array(files.reversed()))
+        XCTAssertEqual(try Self.selection(environment: ["JED_SWIFT_SQL_FILE": files[0]], frozen: files), [files[0]])
+        XCTAssertEqual(try Self.selection(environment: ["JED_SWIFT_ALL_SQL": "1"], frozen: files), files)
+        for value in ["", "query/a.test,", ",query/a.test", "query/a.test,,resource/b.test", "query/missing.test", "query/a.test,query/a.test"] {
+            XCTAssertThrowsError(try Self.selection(environment: ["JED_SWIFT_SQL_FILES": value], frozen: files))
+        }
+        XCTAssertThrowsError(try Self.selection(environment: ["JED_SWIFT_SQL_FILE": files[0], "JED_SWIFT_SQL_FILES": files[1]], frozen: files))
+    }
+
+    func testStorageModeSelectionRetainsCanonicalFileExclusions() throws {
+        let diskOnly = try SQLCorpusFile("# requires: query.select\n# skip: memory file host required\n")
+        let memoryOnly = try SQLCorpusFile("# requires: query.select\n# skip: disk retained session required\n")
+        XCTAssertEqual(SQLCorpusRunner.Mode.auto.resolved(for: diskOnly), .disk)
+        XCTAssertEqual(SQLCorpusRunner.Mode.auto.resolved(for: memoryOnly), .memory)
+        XCTAssertEqual(SQLCorpusRunner.Mode.disk.resolved(for: memoryOnly), .disk)
+        XCTAssertTrue(memoryOnly.skips("disk"))
+        XCTAssertFalse(memoryOnly.skips("memory"))
+    }
+
     func testWholeFrozenSQLFilesThroughDatabaseSession() throws {
         let root = try XCTUnwrap(Bundle.module.resourceURL?.appendingPathComponent("Fixtures/Corpus"))
         let enumerator = try XCTUnwrap(FileManager.default.enumerator(at: root, includingPropertiesForKeys: nil))
-        let totalFiles = enumerator.compactMap { $0 as? URL }.filter { $0.pathExtension == "test" }.count
-        var records = 0, queries = 0, statements = 0, cells = 0, costs = 0, names = 0, types = 0, failures = 0
-        var completedFiles = 0, blockedFiles: [String] = []
-        for name in Self.selectedFiles {
+        let frozenFiles = enumerator.compactMap { $0 as? URL }.filter { $0.pathExtension == "test" }
+            .map { String($0.path.dropFirst(root.path.count + 1)) }.sorted()
+        let totalFiles = frozenFiles.count
+        let environment = ProcessInfo.processInfo.environment
+        let selected = try Self.selection(environment: environment, frozen: frozenFiles)
+        let accounting = try SQLCorpusAccounting(environment: environment)
+        let variant = try SQLCorpusVariant(environment: environment)
+        var temporarySpills = 0
+        guard let mode = SQLCorpusRunner.Mode(rawValue: environment["JED_SWIFT_SQL_MODE"] ?? "auto") else {
+            throw SQLCorpusError("SQL storage mode must be auto, memory, or disk")
+        }
+        try variant.validate(mode: mode)
+        let service = try SQLCorpusServiceOwner.configured(environment: environment)
+        defer { try? service?.close() }
+        if service != nil, mode != .disk { throw SQLCorpusError("service corpus requires disk mode") }
+        var serviceClients = 0, serviceFixtures = 0
+        var records = 0, queries = 0, statements = 0, cells = 0, costs = 0, names = 0, types = 0, hostActions = 0, failures = 0
+        var completedFiles = 0, blockedFiles: [String] = [], abortedFiles: [String] = [], excludedFiles: [String] = []
+        for name in selected {
+            SQLCorpusTrace.write("SQL file begin: \(name)")
             var phase = "fixture read"
             do {
                 let source = try String(contentsOf: root.appendingPathComponent(name), encoding: .utf8)
-                phase = "adapter parse"
-                let file = try SQLCorpusFile(source)
-                phase = "runner setup"
-                let runner = try SQLCorpusRunner(file: file) { name, ext in
-                    let path = try XCTUnwrap(Bundle.module.url(forResource: name, withExtension: ext, subdirectory: "Fixtures"))
-                    return Array(try Data(contentsOf: path))
+                let report: SQLCorpusRunner.Report
+                if ConcurrencyCorpusFile.format(source) == "concurrency" {
+                    if mode == .disk {
+                        excludedFiles.append(name + " (#format: concurrency uses the memory schedule)")
+                        SQLCorpusTrace.write("SQL file excluded by disk mode: \(name)")
+                        continue
+                    }
+                    phase = "concurrency adapter parse"
+                    let file = try ConcurrencyCorpusFile(source)
+                    phase = "concurrency runner setup"
+                    let runner = try ConcurrencyCorpusRunner(file: file)
+                    let schedule = runner.run(file)
+                    report = schedule.sql
+                    phase = "concurrency runner cleanup"
+                    try runner.close()
+                    print("Concurrency file \(name): \(schedule.steps) steps, \(schedule.assertions) version/watermark assertions, \(schedule.handoffs) queued writer handoffs")
+                } else {
+                    phase = "adapter parse"
+                    let file = try SQLCorpusFile(source)
+                    if accounting.temporaryBuffers != nil {
+                        let uppercase = source.uppercased()
+                        if !uppercase.contains("CREATE TEMP ") && !uppercase.contains("CREATE TEMPORARY ") {
+                            excludedFiles.append(name + " (forced TEMP mode selects CREATE TEMP/TEMPORARY files)")
+                            continue
+                        }
+                    }
+                    if variant.encrypted, file.skips("encrypted") {
+                        excludedFiles.append(name + " (#skip: encrypted)")
+                        SQLCorpusTrace.write("SQL file excluded by encrypted mode: \(name)")
+                        continue
+                    }
+                    let resolvedMode = mode.resolved(for: file)
+                    if file.skips(resolvedMode.rawValue) {
+                        excludedFiles.append(name + " (#skip: " + resolvedMode.rawValue + ")")
+                        SQLCorpusTrace.write("SQL file excluded by \(resolvedMode.rawValue) mode: \(name)")
+                        continue
+                    }
+                    if service != nil, file.environment.contains(where: { $0.name == "fixture" }) {
+                        SQLCorpusTrace.write("SQL file service fixture-local: \(name)")
+                    }
+                    phase = "runner setup"
+                    let runner = try SQLCorpusRunner(file: file, mode: resolvedMode, name: name, accounting: accounting, variant: variant, service: service) { name, ext in
+                        let path = try XCTUnwrap(Bundle.module.url(forResource: name, withExtension: ext, subdirectory: "Fixtures"))
+                        return Array(try Data(contentsOf: path))
+                    }
+                    report = runner.run(file)
+                    temporarySpills += runner.temporarySpills
+                    phase = "runner cleanup"
+                    try runner.close()
                 }
-                let report = runner.run(file)
                 if !report.failures.isEmpty { print("Whole SQL file \(name): \(report.records) records, \(report.failures.count) failures; first: \(report.failures[0])") }
+                serviceClients += report.serviceClientRecords; serviceFixtures += report.serviceFixtureRecords
                 records += report.records; queries += report.queries; statements += report.statements; cells += report.cells
-                costs += report.costs; names += report.names; types += report.types
+                costs += report.costs; names += report.names; types += report.types; hostActions += report.hostActions
                 for failure in report.failures {
                     failures += 1
                     if failures > 40 { print("SQL failure \(name):\(failure)") }
                     if failures <= 40 { XCTFail("\(name):\(failure)") }
                 }
-                phase = "runner cleanup"
-                try runner.close()
-                completedFiles += 1
+                if report.completed { completedFiles += 1 }
+                else { abortedFiles.append(name) }
+                SQLCorpusTrace.write("SQL file end: \(name)")
             } catch {
                 let failure = "\(name) (\(phase)): \(error)"
                 blockedFiles.append(failure)
@@ -350,9 +480,22 @@ final class SQLCorpusBoundaryTests: XCTestCase {
                 XCTFail("SQL adapter blocked file: \(failure)")
             }
         }
+        if let service {
+            XCTAssertEqual(service.clientRecords, serviceClients)
+            XCTAssertEqual(serviceClients + serviceFixtures, records)
+            try service.close()
+            print("Service corpus: \(serviceClients) records run on a page client; \(serviceFixtures) canonical fixture-local records")
+        }
+        if accounting.temporaryBuffers != nil {
+            XCTAssertGreaterThan(temporarySpills, 0, "forced TEMP mode did not create any real temp scratch files")
+            print("Forced TEMP corpus: \(temporarySpills) native temp scratch files created")
+        }
+        XCTAssertGreaterThan(selected.count - excludedFiles.count, 0, "storage mode excludes every selected file")
         if failures > 40 { XCTFail("\(failures - 40) additional SQL corpus failures omitted") }
-        print("Whole SQL corpus: \(completedFiles)/\(Self.selectedFiles.count) selected files completed (\(totalFiles) frozen files), \(records) records (\(statements) statements, \(queries) queries), \(cells) result cells, \(costs) cost / \(names) name / \(types) type assertions; \(totalFiles - Self.selectedFiles.count) files not yet admitted; \(failures) SQL failures; \(blockedFiles.count) adapter-blocked files")
+        print("Whole SQL corpus: \(completedFiles)/\(selected.count - excludedFiles.count) selected files completed (\(totalFiles) frozen files), \(records) records (\(statements) statements, \(queries) queries), \(cells) result cells, \(costs) cost / \(names) name / \(types) type assertions, \(hostActions) host actions; \(totalFiles - selected.count) files not selected; \(failures) SQL failures; \(blockedFiles.count) adapter-blocked files, \(abortedFiles.count) files aborted by failed host actions or schedule controls; \(excludedFiles.count) explicit storage-mode exclusions (mode \(mode.rawValue))")
+        for name in excludedFiles { print("SQL storage-mode exclusion: \(name)") }
         for failure in blockedFiles { print("SQL adapter blocked file summary: \(failure)") }
+        for name in abortedFiles { print("SQL execution aborted file: \(name)") }
     }
 
     func testRecordAdapterRetainsSetupAndConsumesDirectives() throws {
@@ -383,7 +526,38 @@ final class SQLCorpusBoundaryTests: XCTestCase {
         XCTAssertTrue(file.records[2].directives.isEmpty)
         guard case .statement(let code) = file.records[2].kind else { return XCTFail("lost expected error") }
         XCTAssertEqual(code, "22003")
-        XCTAssertThrowsError(try SQLCorpusFile("# requires: harness.fixture_open\n# upgrade-collations:\n"))
+        let actions = try SQLCorpusFile("# requires: harness.upgrade_collations\n# cost: 7\n# upgrade-collations:\nstatement ok\nSELECT 1\n\n# upgrade-collations:\n")
+        XCTAssertEqual(actions.hostActions.map(\.beforeRecord), [0, 1])
+        XCTAssertEqual(actions.hostActions.map { $0.directive.name }, ["upgrade-collations", "upgrade-collations"])
+        XCTAssertEqual(actions.records.first?.directives.first?.value, "7")
+    }
+
+    func testFailedHostActionReportsUnconsumedFileAndTrailingActionRuns() throws {
+        let file = try SQLCorpusFile("""
+        # requires: harness.upgrade_collations
+        statement ok
+        BEGIN READ ONLY
+
+        # upgrade-collations:
+        query I nosort
+        SELECT 1
+        ----
+        1
+
+        """)
+        let runner = try SQLCorpusRunner(file: file) { _, _ in throw SQLCorpusError("unexpected fixture read") }
+        defer { try? runner.close() }
+        let report = runner.run(file)
+        XCTAssertFalse(report.completed)
+        XCTAssertEqual(report.records, 1); XCTAssertEqual(report.hostActions, 1)
+        XCTAssertEqual(report.queries, 0); XCTAssertEqual(report.failures.count, 1)
+        XCTAssertTrue(report.failures.first?.contains("25006") == true)
+        let trailing = try SQLCorpusFile("# requires: harness.upgrade_collations\n# upgrade-collations:\n")
+        let empty = try SQLCorpusRunner(file: trailing) { _, _ in throw SQLCorpusError("unexpected fixture read") }
+        defer { try? empty.close() }
+        let completed = empty.run(trailing)
+        XCTAssertTrue(completed.completed); XCTAssertEqual(completed.hostActions, 1)
+        XCTAssertEqual(completed.records, 0); XCTAssertTrue(completed.failures.isEmpty)
     }
 
     func testRowSortingPreservesColumnsAndByteIdentity() {

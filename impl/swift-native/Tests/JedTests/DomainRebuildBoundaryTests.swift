@@ -136,7 +136,10 @@ final class DomainRebuildBoundaryTests: XCTestCase {
             primaryKey: [0], root: PageReference(0)))
         try snapshot.updateCatalog(catalog, schemaChanged: true)
         var store = snapshot.emptyStore(types: [type])
-        let value = SQLValue.text(try SQLText(String(repeating: "x", count: 600)))
+        // RECORD_MAX is a disposition target, not a hard record limit. A
+        // 600-byte key fits the target's actual leaf capacity; use a key that
+        // fits the 4096-byte source but cannot fit even alone at 1024 bytes.
+        let value = SQLValue.text(try SQLText(String(repeating: "x", count: 1200)))
         try store.put(RecordDisposition.plan(key: KeyEncoding.encode(value, type: type), values: [.value(value)],
             types: [type], codec: source.pager.codec), netStaging: true)
         snapshot.setTableStore(name, store)

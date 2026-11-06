@@ -35,9 +35,9 @@ internal final class SequenceExecution {
 
     func install(into context: inout ExpressionContext) {
         context.sequences = self
-        let fallback = context.functions.stateCall
+        let fallback = context.functions.stateCall, meter = context.meter
         context.functions.stateCall = { name, values in
-            if ["nextval", "setval", "currval", "lastval"].contains(name) { return try self.call(name, values) }
+            if ["nextval", "setval", "currval", "lastval"].contains(name) { return try self.call(name, values, meter: meter) }
             guard let fallback else { throw JedError("55000", "function requires an execution-owned service: \(name)") }
             return try fallback(name, values)
         }
@@ -68,7 +68,7 @@ internal final class SequenceExecution {
         if changed { try snapshot.updateCatalog(image, schemaChanged: false) }
     }
 
-    private func call(_ function: String, _ values: [SQLValue]) throws -> SQLValue {
+    private func call(_ function: String, _ values: [SQLValue], meter: CostMeter) throws -> SQLValue {
         if values.contains(where: \.isNull) { return .null }
         if function == "lastval" {
             guard let name = history.lastName, let value = history.values[name] else {

@@ -174,7 +174,7 @@ extension CatalogDDL {
                     var kept: [CatalogForeignKey] = []
                     for foreign in image.tables[child].foreignKeys {
                         if foreign.referencedTable == table.name && !uniqueCover(foreign.referencedColumns, table: table) {
-                            guard cascade else { throw JedError("2BP01", "foreign key depends on the constraint") }
+                            guard cascade else { throw JedError("2BP01", "foreign key depends on the constraint").hinted(DependencyDiagnostics.cascade) }
                         } else { kept.append(foreign) }
                     }
                     image.tables[child].foreignKeys = kept
@@ -198,7 +198,7 @@ extension CatalogDDL {
                     var kept: [CatalogForeignKey] = []
                     for foreign in image.tables[child].foreignKeys {
                         if foreign.referencedTable == table.name && !uniqueCover(foreign.referencedColumns, table: table) {
-                            guard cascade else { throw JedError("2BP01", "foreign key depends on the primary key") }
+                            guard cascade else { throw JedError("2BP01", "foreign key depends on the primary key").hinted(DependencyDiagnostics.cascade) }
                             if child == position { addedConstraints.remove(foreign.name) }
                         } else { kept.append(foreign) }
                     }
@@ -254,7 +254,7 @@ extension CatalogDDL {
                 try context.meter.step(); context.meter.charge(1)
                 let row = ScanRecord(record, pager: originalStore.tree.pool?.pager)
                 for (ordinal, name) in notNull where try row.value(ordinal).isNull {
-                    throw JedError("23502", "column \(name) contains null values")
+                    throw JedError("23502", "column \(name) contains null values").object(table: table.name, column: name)
                 }
             }
         }

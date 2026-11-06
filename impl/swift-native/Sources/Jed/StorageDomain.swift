@@ -241,9 +241,18 @@ internal final class StorageDomain: Sendable {
             reached.formUnion(previous.lastWritten)
             let rebuilt = (pager.codec.firstBodyPage..<free.highWater).filter { !reached.contains($0) }
             if rebuilt.count > free.persistedFree.count {
-                // This is a reader-safe allocation proof for the prospective
-                // commit. Do not change published accounting during preflight:
-                // another domain may still refuse or fail its durable commit.
+                // Q4 forced compaction is an allocator change to the committed
+                // generation. Keep its reader-safe proof even if this or a later
+                // domain refuses: no pages, high-water or roots have changed.
+                try state.withLock { committed in
+                    guard committed.snapshot.identity === previous.snapshot.identity,
+                          committed.snapshot.txid == previous.snapshot.txid else {
+                        throw JedError("55006", "committed generation changed during memory compaction")
+                    }
+                    try pager.replaceMemoryFree(rebuilt)
+                    committed.liveAtCompaction = UInt32(reached.count)
+                    committed.freeGeneration = previous.snapshot.txid
+                }
                 current.liveAtCompaction = UInt32(reached.count); current.freeGeneration = previous.snapshot.txid
                 free = PagerAllocationState(highWater: free.highWater, persistedFree: rebuilt,
                     reusableFree: rebuilt, pending: free.pending, protected: free.protected)
@@ -263,8 +272,14 @@ internal final class StorageDomain: Sendable {
     func precheck(_ working: DomainSnapshot, policy: DomainCommitPolicy) throws { _ = try context(working, policy: policy) }
 
     func prepare(_ working: DomainSnapshot, policy: DomainCommitPolicy = DomainCommitPolicy(),
-                 entropy: KeyEntropy? = nil, verifyLiveCount: Bool = false, forceReclaim: Bool = false) throws -> PreparedDomainCommit? {
-        guard let (previous, free, layout, live) = try context(working, policy: policy) else { return nil }
+                 entropy: KeyEntropy? = nil, verifyLiveCount: Bool = false, forceReclaim: Bool = false, synchronous: Bool = true) throws -> PreparedDomainCommit? {
+        guard var preparation = try context(working, policy: policy) else { return nil }
+        // Q4 preflight above uses the current batch. Only after every domain's
+        // budget admission does a timed flush change this file's allocation view.
+        if kind == .file, try pager.beforeCommitTiming(synchronous: synchronous) {
+            guard let refreshed = try context(working, policy: policy) else { return nil }; preparation = refreshed
+        }
+        let (previous, free, layout, live) = preparation
         let codec = pager.codec
         let body = try DomainCommitPlanner.write(working, highWater: free.highWater, free: free.reusableFree, entropy: entropy)
         let written = Set(body.pages.map(\.index))
@@ -335,7 +350,10 @@ internal final class StorageDomain: Sendable {
                 throw JedError("55006", "invalid or obsolete memory domain stage")
             }
             pool.invalidate(Set(plan.pages.body.map(\.index)))
-            return try StagedDomainCommit(plan: plan, pages: pager.stageMemory(plan.pages))
+            let pages = try pager.stageMemory(plan.pages)
+            var stagedPlan = plan
+            stagedPlan.snapshot.finishPersistence(written: plan.written)
+            return StagedDomainCommit(plan: stagedPlan, pages: pages)
         }
     }
 
@@ -385,7 +403,10 @@ internal final class StorageDomain: Sendable {
             }
             pool.invalidate(Set(plan.pages.body.map(\.index)).union(plan.pages.manifest.pages.map(\.pageIndex)))
             try pager.adoptRemoteCommit(plan.pages)
-            current = DomainStorageState(snapshot: plan.snapshot, catalogPages: plan.catalogPages,
+            var snapshot = plan.snapshot
+            snapshot.finishPersistence(written: plan.written,
+                remotePages: Dictionary(uniqueKeysWithValues: plan.pages.body.map { ($0.index, $0.bytes) }))
+            current = DomainStorageState(snapshot: snapshot, catalogPages: plan.catalogPages,
                 gistPages: plan.gistPages, livePages: plan.livePages, liveAtCompaction: plan.liveAtCompaction,
                 freeGeneration: plan.freeGeneration, lastWritten: plan.written, repairCatalogPages: plan.catalogPages.count)
             return current.snapshot
@@ -408,7 +429,9 @@ internal final class StorageDomain: Sendable {
                 }
             }
             else { try pager.commitMemory(plan.pages) }
-            current = DomainStorageState(snapshot: plan.snapshot, catalogPages: plan.catalogPages,
+            var snapshot = plan.snapshot
+            snapshot.finishPersistence(written: plan.written)
+            current = DomainStorageState(snapshot: snapshot, catalogPages: plan.catalogPages,
                 gistPages: plan.gistPages, livePages: plan.livePages, liveAtCompaction: plan.liveAtCompaction,
                 freeGeneration: plan.freeGeneration, lastWritten: plan.written, repairCatalogPages: plan.catalogPages.count)
             return current.snapshot

@@ -1,0 +1,46 @@
+# Encrypted databases under the page service (spec/design/encryption.md §8, encrypted.md §14;
+# simulation-testing.md §14 S13): an owner and its page clients over an encrypted main and up to two
+# encrypted file attachments. Every process opens with the database's current key and its own
+# key-entropy stream; clients unlock from the key-block pages they read and seal their own commits,
+# which the owner checks. Credential changes (the owner's alone) and rekeys (refused while another
+# process is connected) run between client commits, promotions and lost connections; backups come from
+# any process and a restore copies one back over main.
+
+description = "Encrypted page service: client commits, promotion, credential changes, backups, restores"
+
+processes = "service"
+synchronous = ["on", "off"]
+max_procs = 3
+page_sizes = [1024, 2048]
+encrypted = [1]
+max_readers = 4
+attachments = 2
+attached_writes = 400
+conversion = 300
+
+[weights]
+backup = 3
+restore = 1
+spawn = 8
+exit = 2
+kill = 1
+disconnect = 2
+attach = 4
+change_key = 4
+rekey = 2
+open_read = 7
+close_read = 4
+crash_power = 1
+crash_process = 1
+
+[faults]
+backup_fault = 200
+commit_fault = 250
+attach_fault = 200
+key_fault = 300
+nth_max = 2
+power_loss = 2
+process_crash = 7
+disconnect = 4
+frames_max = 8
+issue = [800, 1000]

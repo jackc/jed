@@ -73,6 +73,11 @@ internal struct SessionPrivileges {
 internal struct SessionSettings {
     let environment: Environment
     var domains: QueryDomains?
+    var scratchFileHost: (any ScratchFileHost)?
+    /// Statement-local input for logical proofs. Admission still binds every
+    /// parameter after complete type resolution; no execution value is cached.
+    var planningParameters: [SQLValue]?
+    var planningProbe: PlanningProbe?
     var targetDomain: SQLText = DomainNames.main
     var options: SessionOptions
     let lifetime: LifetimeCost
@@ -83,6 +88,9 @@ internal struct SessionSettings {
 
     init(environment: Environment, options: SessionOptions) {
         self.environment = environment; self.options = options
+        // Inheritance happens once when the session is created. Later changes
+        // to either DDL gate do not change its independently mutable sibling.
+        self.options.allowTemporaryDDL = options.allowTemporaryDDL ?? options.allowDDL
         lifetime = LifetimeCost(limit: options.lifetimeMaxCost)
         privileges = SessionPrivileges(defaults: options.defaultPrivileges)
         if let zone = try? environment.timezones.resolve(options.timeZone) {
@@ -108,10 +116,10 @@ internal struct SessionSettings {
         return .null
     }
     func newMeter(pendingBytes: Int64 = 0, cancellation: CancellationToken? = nil) throws -> CostMeter {
-        let resources = StatementResources(queryLimit: options.maxQueryMemoryBytes, scalarLimit: options.maxScalarBytes)
+        let resources = StatementResources(queryLimit: options.maxQueryMemoryBytes, scalarLimit: options.maxScalarBytes,
+            pendingBytes: pendingBytes)
         let meter = CostMeter(limit: options.maxCost, lifetime: lifetime, resources: resources, cancellation: cancellation)
         try meter.checkpoint()
-        try meter.syncPending(pendingBytes)
         return meter
     }
     func checkSQLLength(_ sql: SQLText) throws {

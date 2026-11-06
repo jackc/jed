@@ -42,12 +42,13 @@ internal final class AlterConstraintValidation {
     func consume(key: [UInt8], value: @escaping (Int) throws -> SQLValue) throws {
         var execution = context; execution.column = value
         for (name, expression) in checks {
-            if case .boolean(false) = try execution.evaluate(expression) { throw JedError("23514", "check constraint \(name) is violated by some row") }
+            if case .boolean(false) = try execution.evaluate(expression) { throw JedError("23514", "check constraint \(name) is violated by some row").object(table: table.name, constraint: name) }
         }
         for ordinal in indexes.indices {
             let indexed = try indexes[ordinal].row(value, storageKey: key)
             if indexes[ordinal].index.unique, let prefix = indexed.prefix, !prefix.hasNull && !unique[ordinal].insert(prefix.bytes).inserted {
                 throw JedError("23505", "duplicate key value violates unique constraint \(indexes[ordinal].index.name)")
+                    .object(table: table.name, constraint: indexes[ordinal].index.name, detail: context.errorDetail?.index(table, plan: indexes[ordinal], value: value, ending: "is duplicated."))
             }
             entries[ordinal] += indexed.entries
         }
@@ -58,7 +59,7 @@ internal final class AlterConstraintValidation {
             for row in rows {
                 switch try plan.childProbe(row.value, context: context) {
                 case .exempt: continue
-                case .missing: throw plan.violation()
+                case .missing: throw plan.violation(value: row.value, context: context)
                 case .key(let key):
                     if plan.parent.name == table.name {
                         var found = false
@@ -66,8 +67,8 @@ internal final class AlterConstraintValidation {
                             context.meter.charge(1); try context.meter.step()
                             if try plan.parentProbe(candidate.value, context: context) == key { found = true; break }
                         }
-                        guard found else { throw plan.violation() }
-                    } else if try !plan.parentExists(key, snapshot: snapshot, context: context) { throw plan.violation() }
+                        guard found else { throw plan.violation(value: row.value, context: context) }
+                    } else if try !plan.parentExists(key, snapshot: snapshot, context: context) { throw plan.violation(value: row.value, context: context) }
                 }
             }
         }
@@ -84,8 +85,10 @@ internal final class AlterConstraintValidation {
         }
         var built: [SQLText: TableStore] = [:]
         for ordinal in indexes.indices {
+            // ALTER's fresh backing stores retain their rewrite balance just
+            // like the rewritten table, before later DML starts net tracking.
             let store = try indexes[ordinal].build(entries[ordinal], snapshot: snapshot,
-                netStaging: settings.options.maxQueryMemoryBytes > 0)
+                netStaging: false)
             built[indexes[ordinal].index.name] = store
         }
         return built

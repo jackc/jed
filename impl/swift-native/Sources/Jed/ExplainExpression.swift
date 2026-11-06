@@ -1,9 +1,14 @@
+import Foundation
+
 /// Plan spelling consumes resolved nodes. An explicit work stack keeps a flat
 /// SQL operator chain from turning into recursive host calls during rendering.
 internal enum ExplainExpression {
     private enum Work { case node(ResolvedExpression), text(String) }
 
     static func render(_ expression: ResolvedExpression) throws -> String {
+        try render(expression, column: { $0 })
+    }
+    static func render(_ expression: ResolvedExpression, column: (Int) -> Int) throws -> String {
         var pending: [Work] = [.node(expression)], output = ""
         func list(_ expressions: [ResolvedExpression], start: String, end: String) -> [Work] {
             var result: [Work] = [.text(start)]
@@ -23,7 +28,7 @@ internal enum ExplainExpression {
             let pieces: [Work]
             switch expression.node {
             case .constant(let value): pieces = [.text(try literal(value, type: expression.type))]
-            case .column(let slot): pieces = [.text("#\(slot)")]
+            case .column(let slot): pieces = [.text("#\(column(slot))")]
             case .outerColumn(let reference): pieces = [.text("outer(\(reference.depth),\(reference.index))")]
             case .parameter(let index): pieces = [.text("$\(index)")]
             case .currentTimestamp: pieces = [.text("current_timestamp")]
@@ -110,6 +115,27 @@ internal enum ExplainExpression {
         }
         return output
     }
+    /// Bound details admit only the frozen scalar literal spellings. NULL and
+    /// other resolved values use the placeholder; verbose expressions retain
+    /// their complete rendering separately.
+    static func bound(_ expression: ResolvedExpression) throws -> String {
+        switch expression.node {
+        case .parameter(let index): return "$\(index)"
+        case .outerColumn: return "outer"
+        case .column: return "join"
+        case .constant(let value):
+            switch value {
+            case .integer, .boolean, .decimal, .f32, .f64:
+                return try literal(value, type: expression.type)
+            case .text(let text):
+                return quote(text.description).replacingOccurrences(of: "\n", with: "\\n")
+                    .replacingOccurrences(of: "\r", with: "\\r").replacingOccurrences(of: "\t", with: "\\t")
+            default: return "<value>"
+            }
+        default: return "<value>"
+        }
+    }
+
     static func identifier(_ value: SQLText) -> String {
         let bytes = Array(value.description.utf8)
         let plain = !bytes.isEmpty && bytes.enumerated().allSatisfy { index, byte in

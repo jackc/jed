@@ -54,6 +54,7 @@ internal final class Pager: Sendable {
         var freePages: [UInt32]
         var floorFree: Set<UInt32> = []
         var pending: [UInt32: UInt64] = [:]
+        var batchFlush = BatchFlushState()
         var floorSlot: UInt32
         var recoverySync = true
         var directorySync = true
@@ -70,6 +71,7 @@ internal final class Pager: Sendable {
         var memoryStage: StorageRevision?
         var remote = false
         var remoteReuse = true
+        var serviceCommitInProgress = false
     }
     let pageSize: Int
     let codec: any PageCodec
@@ -80,7 +82,8 @@ internal final class Pager: Sendable {
         pageSize = selected.meta.pageSize
         self.codec = codec
         state = Mutex(State(store: store, allocatedPages: allocatedPages, selected: selected,
-            freePages: freePages, floorSlot: selected.floorSlot, keyBlock: keyBlock))
+            freePages: freePages, floorSlot: selected.floorSlot,
+            recoverySync: selected.meta.manifestEntries != 0, keyBlock: keyBlock))
     }
 
     static func open(store: any BlockStore, credential: Credential? = nil,
@@ -242,12 +245,29 @@ internal final class Pager: Sendable {
     var pendingEntries: [ManifestEntry] {
         state.withLock { state in state.pending.keys.sorted().map { ManifestEntry(pageIndex: $0, digest: state.pending[$0]!) } }
     }
+    /// A durable claim excludes recovered foreign generations until their
+    /// stabilization barrier and any required directory barrier have completed.
+    var isDurable: Bool { state.withLock { $0.pending.isEmpty && !$0.recoverySync && !$0.directorySync && !$0.poisoned } }
     var isPoisoned: Bool { state.withLock { $0.poisoned } }
 
     /// Only a fresh image whose barrier and directory publication already
     /// succeeded may bypass recovered/foreign-generation stabilization.
     func acknowledgeFreshDurableImage() {
         state.withLock { $0.recoverySync = false; $0.directorySync = false }
+    }
+
+    func integrityGeneration(txid: UInt64, memory: Bool) throws -> IntegrityGeneration? {
+        try state.withLock { state in
+            if state.roleRevoked { throw JedError("08006", "page-service role was lost") }
+            if state.revoked || state.poisoned { throw JedError("58030", "database storage is poisoned") }
+            guard state.selected.meta.txid == txid else { return nil }
+            let slots: [[UInt8]]?
+            if memory || state.remote { slots = nil }
+            else { slots = try [state.store.read(at: 0, count: pageSize),
+                                state.store.read(at: UInt64(pageSize), count: pageSize)] }
+            return IntegrityGeneration(selected: state.selected, freePages: state.freePages,
+                metaSlots: slots, remote: state.remote, memory: memory)
+        }
     }
 
     func readStored(_ index: UInt32) throws -> [UInt8] {
@@ -493,6 +513,7 @@ internal final class Pager: Sendable {
                 state.freePages = plan.freePages
                 if synchronous {
                     state.pending.removeAll(keepingCapacity: true); state.floorFree.removeAll(keepingCapacity: true)
+                    state.batchFlush.clear()
                     state.floorSlot = plan.slot
                     shrinkAfterBarrier(&state)
                 } else {
@@ -502,6 +523,9 @@ internal final class Pager: Sendable {
                         catch { state.poisoned = true; state.revoked = true }
                     }
                 }
+                if !state.poisoned, !state.pending.isEmpty, state.batchFlush.preparedEmpty,
+                   let reading = state.batchFlush.preparedReading { state.batchFlush.begin(at: reading) }
+                state.batchFlush.preparedReading = nil; state.batchFlush.preparedEmpty = false
             } catch { state.poisoned = true; throw error }
         }
     }
@@ -514,6 +538,8 @@ internal final class Pager: Sendable {
         try state.withLock { state in
             try Self.checkWritable(state)
             guard state.selected.meta.txid == baseTxid else { throw JedError("55006", "service writer generation changed") }
+            guard !state.serviceCommitInProgress else { throw JedError("58030", "a service commit is already in progress") }
+            state.serviceCommitInProgress = true
             do {
                 try stabilize(&state, syncDirectory: syncDirectory)
                 if state.pending.isEmpty { state.floorFree = Set(state.freePages) }
@@ -538,7 +564,13 @@ internal final class Pager: Sendable {
         try state.withLock { state in
             try Self.checkWritable(state)
             guard state.selected.meta.txid == baseTxid else { throw JedError("55006", "service writer generation changed") }
+            let beganEmpty = state.pending.isEmpty
             do {
+                // Prior streaming body writes keep the poison guard armed. Date
+                // a new batch before its meta write, so clock failure cannot be
+                // reported after durable success or leave partial writes usable.
+                let clientReading: Int64? = !synchronous && beganEmpty && state.batchFlush.enabled &&
+                    delta.ownEntries.count < delta.meta.inlineCapacity ? try state.batchFlush.clock!.microseconds() : nil
                 let slot = 1 - state.floorSlot
                 var bytes = delta.bytes
                 if let encrypted = codec as? EncryptedPageCodec {
@@ -562,14 +594,87 @@ internal final class Pager: Sendable {
                 if synchronous {
                     state.floorSlot = slot
                     state.pending.removeAll(keepingCapacity: true); state.floorFree.removeAll(keepingCapacity: true)
+                    state.batchFlush.clear()
                 } else {
                     for entry in delta.ownEntries { state.pending[entry.pageIndex] = entry.digest }
                 }
                 // Clients cannot shrink. Any earlier owner shrink must not run
                 // as a side effect of flushing a client's relaxed commit.
                 state.shrinkPending = false
+                if let clientReading, !state.pending.isEmpty {
+                    state.batchFlush.begin(at: clientReading)
+                } else if synchronous || state.pending.count >= state.selected.meta.inlineCapacity {
+                    state.batchFlush.clear()
+                }
+                state.serviceCommitInProgress = false
                 return selected
             } catch { state.poisoned = true; state.revoked = true; throw error }
+        }
+    }
+    /// Abandoning an incomplete client delta only drops its commit guard; body
+    /// pages remain unreachable and any physical I/O poison remains in force.
+    func abandonServiceDelta() { state.withLock { $0.serviceCommitInProgress = false } }
+    func configureBatchFlush(clock: any ClockSource, milliseconds: UInt64) {
+        state.withLock { $0.batchFlush.configure(clock: clock, milliseconds: milliseconds) }
+    }
+    func copyBatchFlushSettings(from other: Pager) {
+        let settings = other.state.withLock { ($0.batchFlush.clock, $0.batchFlush.interval) }
+        guard let clock = settings.0 else { return }
+        state.withLock { state in
+            state.batchFlush.clock = clock; state.batchFlush.interval = settings.1; state.batchFlush.clear()
+        }
+    }
+    /// The writer owns admission before any clock read. A remote planner never
+    /// times the owner's batch; memory domains never consult this policy.
+    @discardableResult func beforeCommitTiming(synchronous: Bool) throws -> Bool {
+        try state.withLock { state in
+            state.batchFlush.preparedReading = nil; state.batchFlush.preparedEmpty = false
+            guard !state.remote, !state.ephemeral, state.batchFlush.enabled,
+                  !synchronous || !state.pending.isEmpty else { return false }
+            try Self.checkWritable(state)
+            let now = try state.batchFlush.clock!.microseconds()
+            var flushed = false
+            if !state.pending.isEmpty, let deadline = state.batchFlush.deadline, now >= deadline {
+                do { try flushState(&state, shrink: true); flushed = true }
+                catch { state.poisoned = true; state.revoked = true; throw error }
+            }
+            state.batchFlush.preparedReading = now
+            state.batchFlush.preparedEmpty = state.pending.isEmpty
+            return flushed
+        }
+    }
+    /// A relaxed client joins the batch it planned against. Expiry is admitted
+    /// before write_begun, not again when its commit eventually arrives.
+    func beforeClientTiming() throws {
+        try state.withLock { state in
+            guard state.batchFlush.enabled, !state.pending.isEmpty else { return }
+            try Self.checkWritable(state)
+            let now = try state.batchFlush.clock!.microseconds()
+            if let deadline = state.batchFlush.deadline, now >= deadline {
+                do { try flushState(&state, shrink: false) }
+                catch { state.poisoned = true; state.revoked = true; throw error }
+            }
+        }
+    }
+    struct IdleFlushState: Sendable { let interval: Int64; let deadline: Int64?; let generation: UInt64 }
+    var idleFlushState: IdleFlushState {
+        state.withLock { state in IdleFlushState(interval: state.batchFlush.interval,
+            deadline: state.remote || state.ephemeral || state.poisoned ? nil : state.batchFlush.deadline,
+            generation: state.batchFlush.generation) }
+    }
+    /// Called only while the core's nonwaiting writer gate and physical commit
+    /// boundary are held. Returns the remaining wait without any second read.
+    func idleFlush() throws -> Int64? {
+        try state.withLock { state in
+            guard !state.remote, !state.ephemeral, !state.poisoned,
+                  let deadline = state.batchFlush.deadline, !state.pending.isEmpty else { return nil }
+            let now = try state.batchFlush.clock!.microseconds()
+            if now < deadline {
+                let (remaining, overflow) = deadline.subtractingReportingOverflow(now)
+                return min(overflow ? Int64.max : remaining, state.batchFlush.interval)
+            }
+            do { try flushState(&state, shrink: true); return nil }
+            catch { state.poisoned = true; state.revoked = true; throw error }
         }
     }
     func flushServiceCap() throws {
@@ -596,6 +701,7 @@ internal final class Pager: Sendable {
         state.floorSlot = state.selected.slot
         state.selected.floorSlot = state.floorSlot
         state.pending.removeAll(keepingCapacity: true); state.floorFree.removeAll(keepingCapacity: true)
+        state.batchFlush.clear()
         if shrink { shrinkAfterBarrier(&state) }
     }
 
@@ -620,6 +726,7 @@ internal final class Pager: Sendable {
 
     /// No stale snapshot may use a descriptor after maintenance changes its
     /// address space. Normal commits retain their narrower writer poison rule.
+    func poisonWriter() { state.withLock { $0.poisoned = true } }
     func revokeRole() { state.withLock { $0.roleRevoked = true; $0.poisoned = true } }
     func revoke() { state.withLock { $0.poisoned = true; $0.revoked = true } }
 
@@ -630,16 +737,22 @@ internal final class Pager: Sendable {
         let bytes = try replacement.encode(pageSize: pageSize)
         try state.withLock { state in
             try Self.checkWritable(state)
+            // Flush an existing relaxed floor before checking the streamed
+            // commit guard, matching ordinary key-block storage admission.
+            do { try flushState(&state, shrink: true) }
+            catch { state.poisoned = true; state.revoked = true; throw error }
+            guard !state.serviceCommitInProgress else { throw JedError("58030", "database writer has a commit in progress") }
             guard let selected = state.keyBlock, selected.block == expected,
                   expected.generation < UInt64.max, replacement.generation == expected.generation + 1 else {
                 throw JedError("55006", "the credential changed concurrently")
             }
             do {
-                // A pending relaxed batch receives its ordinary flush barrier;
-                // the key operation always has its own stabilization barrier.
-                try flushState(&state, shrink: true)
+                // The key operation always has its own stabilization barrier.
                 if state.directorySync { try syncDirectory(); state.directorySync = false }
-                try barrier(&state); state.recoverySync = false
+                // Key-block barriers preserve the pager's adopted-generation
+                // commit state. The next data commit still performs its own
+                // required stabilization, matching the frozen crash schedule.
+                try barrier(&state)
                 try write(selected.unselectedPage, bytes: bytes, state: &state)
                 try barrier(&state)
                 try write(selected.selectedPage, bytes: bytes, state: &state)

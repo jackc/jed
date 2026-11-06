@@ -317,7 +317,7 @@ internal final class StatementPrivileges {
                     }
                     switch statement {
                     case .insert(var value):
-                        let ordinals = try value.columns.isEmpty ? Array(view.columns.indices) : value.columns.map(resolved.column)
+                        let ordinals = try value.columns.isEmpty ? Array(view.columns.indices) : value.columns.map { try resolved.column($0) }
                         value.columns = try resolved.destinations(ordinals).map { resolved.table.columns[$0].name }
                         var seen: Set<Int> = []
                         for (column, valueDefault) in try resolved.insertDefaults() where seen.insert(column).inserted {

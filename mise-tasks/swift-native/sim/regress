@@ -1,0 +1,35 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#MISE description="Explicit opt-in: execute every frozen simulation regression through native Swift"
+#USAGE flag "-c --configuration <configuration>" default="debug" help="debug or release"
+#USAGE flag "--no-build" help="Use the existing native simulator"
+#USAGE flag "--input <path>" help="Explicit trace or directory; default is all 18 frozen regressions"
+#USAGE flag "--output <path>" help="Transcript directory; default is a unique /tmp directory"
+
+require_relative "../../../impl/swift-native/Tools/swift_task"
+require_relative "../../../impl/swift-native/Tools/generate_spec"
+require "digest"
+require "tmpdir"
+SwiftSpecGenerator.run(["--check"])
+configuration = ENV.fetch("usage_configuration", "debug")
+abort "configuration must be debug or release" unless %w[debug release].include?(configuration)
+unless ENV["usage_no_build"] == "true"
+  env, command = SwiftNativeTasks.command("build", configuration: configuration, extra: ["--product", "jed-sim"])
+  exit($?&.exitstatus || 1) unless system(env, *command, chdir: SwiftNativeTasks::PACKAGE)
+end
+binary = File.join(SwiftNativeTasks::BUILD, configuration, "jed-sim")
+abort "native Swift simulator is not built: #{binary}" unless File.executable?(binary)
+output = ENV["usage_output"] || Dir.mktmpdir("jed-swift-sim-results-")
+FileUtils.mkdir_p(output)
+input = ENV["usage_input"] || File.join(SwiftNativeTasks::PACKAGE, "Tests/JedTests/Fixtures/Simulation/regress")
+warn "Swift simulation outputs: #{output}"
+status = nil
+Dir.mktmpdir("jed-swift-sim-") do |directory|
+  snapshot = File.join(directory, "jed-sim")
+  FileUtils.copy_file(binary, snapshot); File.chmod(0o700, snapshot)
+  warn "Swift simulation executable: #{Digest::SHA256.file(snapshot).hexdigest}"
+  system({"JED_SIM_IN" => input, "JED_SIM_OUT" => output,
+          "JED_SIM_RESULTS" => File.join(output, "results.jsonl"), "JED_SIM_TRACEFILE" => File.join(output, "progress.log"), "JED_SIM_IMAGES" => File.join(output, "images")}, snapshot)
+  status = $?
+end
+exit(status&.exitstatus || 1)

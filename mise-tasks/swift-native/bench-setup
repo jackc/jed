@@ -1,0 +1,22 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#MISE description="Explicit opt-in: generate canonical local jed-only datasets for the Swift benchmark"
+#USAGE flag "--data <path>" help="Dataset directory; defaults to bench/data/swift-native on the repository filesystem"
+
+require "digest"
+require "fileutils"
+
+root = File.expand_path("../..", __dir__)
+corpus = File.join(root, "bench/corpus")
+expected = "b9bfb4cb1f27ae1757268a94434e96df67626bc6b39f005c3626ab3a6e289133"
+abort "frozen benchmark dataset specification changed" unless Digest::SHA256.file(File.join(corpus, "datasets.toml")).hexdigest == expected
+
+data = File.expand_path(ENV.fetch("usage_data", File.join(root, "bench/data/swift-native")))
+binary = File.join(root, "impl/swift-native/.build/tools/bench-setup")
+FileUtils.mkdir_p(File.dirname(binary))
+abort "canonical dataset generator build failed" unless system(
+  { "CGO_ENABLED" => "0", "GOPROXY" => "off" }, "go", "build", "-o", binary, "./cmd/bench-setup",
+  chdir: File.join(root, "bench/go")
+)
+warn "Generating canonical jed datasets in #{data}; no benchmark measurements will run."
+exec binary, corpus, data, "--engine", "jed"

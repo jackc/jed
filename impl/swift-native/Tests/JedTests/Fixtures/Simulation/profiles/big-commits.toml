@@ -1,0 +1,17 @@
+# Transactions that dirty many pages: manifest overflow chains and the free-list/manifest
+# planning retries (simulation-testing.md §9; validated-cow.md §2).
+
+description = "Transactions dirtying many pages: manifest overflow and planning retries"
+
+page_sizes = [256]
+max_rows = 600
+batch = [40, 160]
+
+[weights]
+insert = 16
+update = 12
+delete = 6
+commit = 4
+
+[faults]
+commit_fault = 250

@@ -3,7 +3,9 @@
 internal enum ColumnarExecution {
     static func enabled(_ plan: SelectPlan, _ context: ExpressionContext) -> Bool {
         plan.store != nil && plan.relation == nil && plan.scan.pointSets.isEmpty && !plan.scan.contradiction
-            && context.meter.limit == 0 && context.meter.lifetimeLimit == 0
+            && plan.chosenAccess?.intervals == nil && plan.chosenAccess?.orderedDefinition == nil
+            && plan.chosenAccess?.gin == nil && plan.chosenAccess?.gist == nil
+            && context.meter.limit == 0 && context.meter.lifetimeLimit == 0 && context.executionProfile == nil
     }
     static func projection(_ plan: SelectPlan, _ context: ExpressionContext) -> Bool {
         enabled(plan, context) && !plan.materializeSource && plan.aggregation == nil && plan.window == nil
@@ -11,7 +13,7 @@ internal enum ColumnarExecution {
             && !plan.projections.isEmpty && plan.projections.allSatisfy { if case .column = $0.node { return true }; return false }
     }
     static func aggregation(_ plan: SelectPlan, _ aggregate: AggregateQueryPlan, _ context: ExpressionContext) -> Bool {
-        guard enabled(plan, context), !plan.distinct, plan.window == nil, plan.order.isEmpty,
+        guard enabled(plan, context), !plan.distinct, plan.productionCharge, plan.window == nil, plan.order.isEmpty,
               aggregate.having == nil, aggregate.sets.count == 1, aggregate.grouping.isEmpty,
               aggregate.keys.count <= 1, aggregate.sets[0].count == aggregate.keys.count,
               !aggregate.calls.isEmpty else { return false }
@@ -59,7 +61,7 @@ internal final class ColumnarProjectionExecution {
         let input = SelectInput(plan: plan, context: context); defer { input.close() }
         while let row = try input.next() {
             var current = context; current.column = { row[$0] }
-            if let predicate = plan.predicate, try !context.profile(plan.profileIdentity, .filter, { try current.matches(predicate) }) { continue }
+            if !input.predicateApplied, let predicate = plan.predicate, try !context.profile(plan.profileIdentity, .filter, { try current.matches(predicate) }) { continue }
             for (lane, column) in columns.enumerated() { lanes[lane].append(row[column]) }
             count += 1
         }

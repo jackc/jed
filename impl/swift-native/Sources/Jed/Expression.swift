@@ -4,6 +4,8 @@ internal struct ResolvedExpression {
     var type: TypeDescriptor?
     var node: Node
     var position: Int
+    /// Start of the authored expression, distinct from its operator token.
+    var location: Int = 0
     /// Cached query provenance; nil on a synthesized node derives from children.
     var collation: CollationDerivation?
     /// Input folding can consume session state without retaining an operation
@@ -44,18 +46,28 @@ internal struct ResolvedSubscript {
 
 internal struct ExpressionContext {
     var scalar: ScalarCasts.Context
-    var column: (Int) throws -> SQLValue
+    var column: (Int) throws -> SQLValue { didSet { hostBatchColumn = nil } }
+    /// Only resident row owners install these peeks. Arbitrary column getters
+    /// (including view expressions) may perform work and are never prefetched.
+    var hostBatchColumn: ((Int) -> SQLValue?)?
     var parameters: [SQLValue]
-    let meter: CostMeter
+    var meter: CostMeter
     var collatedKey: KeyEncoding.CollatedKey?
     var functions = ScalarFunctions.Environment()
     var sequences: SequenceExecution?
     var patterns = PatternExecution()
-    var outerRows: [(Int) throws -> SQLValue] = []
+    var outerRows: [(Int) throws -> SQLValue] = [] { didSet { hostBatchOuterRows = [] } }
+    var hostBatchOuterRows: [((Int) -> SQLValue?)?] = []
     var subqueries = SubqueryExecution()
     var ctes: CTEExecution?
     var writeScope: StatementWriteScope?
     var executionProfile: ExecutionProfile?
+    var spill: SpillConfig?
+    var errorDetail: ErrorDetail?
+    var planningProbe: PlanningProbe?
+    var hostBatch: HostBatch?
+    // Derived/CTE bodies execute surviving subqueries at expression evaluation.
+    var eagerSubqueries = true
 
     init(meter: CostMeter, timezone: SQLTimeZone = .utc, statementMicros: Int64? = nil,
          parameters: [SQLValue] = [], column: @escaping (Int) throws -> SQLValue = { _ in throw JedError("XX000", "missing expression row") }) {
@@ -70,6 +82,13 @@ internal struct ExpressionContext {
         return try clock()
     }
 
+    mutating func encloseHostBatchRow(from parent: ExpressionContext) {
+        hostBatchOuterRows = [parent.hostBatchColumn] + parent.outerRows.indices.map {
+            parent.hostBatchOuterRows.indices.contains($0) ? parent.hostBatchOuterRows[$0] : nil
+        }
+        hostBatch = nil
+    }
+
     /// Filter contexts need only TRUE. In an AND, both FALSE and UNKNOWN reject
     /// the row before visiting the right child; value expressions retain 3VL.
     func matches(_ expression: ResolvedExpression) throws -> Bool {
@@ -77,11 +96,6 @@ internal struct ExpressionContext {
             if operation == "and" {
                 meter.charge(1); try meter.step()
                 guard try matches(left) else { return false }
-                return try matches(right)
-            }
-            if operation == "or" {
-                meter.charge(1); try meter.step()
-                if try matches(left) { return true }
                 return try matches(right)
             }
         }
@@ -106,6 +120,26 @@ internal struct ExpressionContext {
         default: meter.charge(1); try meter.step()
         }
         switch expression.node {
+        case .currentTimestamp, .currentDate, .dateInput:
+            return try evaluateState(expression)
+        case .cast, .unary:
+            return try evaluateUnary(expression)
+        case .binary:
+            return try evaluateBinary(expression)
+        case .isNull, .distinct:
+            return try evaluatePredicate(expression)
+        case .conditional, .coalesce, .extreme, .nullif:
+            return try evaluateConditional(expression)
+        case .row, .array, .subscriptValue, .rangeOperation, .quantified, .field:
+            return try evaluateContainer(expression)
+        case .json, .pattern, .call:
+            return try evaluateDelegated(expression)
+        case .constant, .column, .parameter, .convert, .outerColumn, .subquery: throw JedError("XX000", "invalid expression dispatch")
+        }
+    }
+
+    private func evaluateState(_ expression: ResolvedExpression) throws -> SQLValue {
+        switch expression.node {
         case .currentTimestamp:
             return .timestamptz(try now())
         case .currentDate:
@@ -114,6 +148,12 @@ internal struct ExpressionContext {
             return .date(try Temporal.finiteDate(Temporal.floorDiv(scalar.timezone.instantToLocal(clock), Temporal.microsPerDay)))
         case .dateInput(let text):
             return try ScalarCasts.input(text, to: TypeDescriptor(.scalar(.date)), context: scalar)
+        default: throw JedError("XX000", "invalid expression evaluator dispatch")
+        }
+    }
+
+    private func evaluateUnary(_ expression: ResolvedExpression) throws -> SQLValue {
+        switch expression.node {
         case .cast(let source, let target, let mode):
             let value = try evaluate(source)
             guard let sourceType = source.type else { return .null }
@@ -126,7 +166,8 @@ internal struct ExpressionContext {
             if op == "-" {
                 switch value {
                 case .integer(let n):
-                    guard n != .min, case .scalar(let type) = expression.type?.type else { throw JedError("22003", "integer out of range") }
+                    guard case .scalar(let type) = expression.type?.type else { throw JedError("22003", "integer out of range") }
+                    guard n != .min else { throw JedError("22003", "integer out of range").withDataType(type.name) }
                     return .integer(try ScalarCasts.checkedInteger(-n, type: type))
                 case .decimal(let n): return .decimal(n.negated())
                 case .f32, .f64: return try FloatFunctions.unary(op: op, value: value)
@@ -136,6 +177,12 @@ internal struct ExpressionContext {
             }
             if op == "~", case .integer(let n) = value { return .integer(~n) }
             throw JedError("42804", "invalid resolved unary operand")
+        default: throw JedError("XX000", "invalid expression evaluator dispatch")
+        }
+    }
+
+    private func evaluateBinary(_ expression: ResolvedExpression) throws -> SQLValue {
+        switch expression.node {
         case .binary(let op, let left, let right, let operandType):
             let a = try evaluate(left)
             if op == "and", case .boolean(false) = a { return .boolean(false) }
@@ -154,7 +201,14 @@ internal struct ExpressionContext {
                 return try ValueComparison.sql(op, a, b, type: operandType, collatedKey: collatedKey)
             }
             if a.isNull || b.isNull { return .null }
-            return try arithmetic(op, a, b, type: operandType, constant: left.isConstant && right.isConstant)
+            return try arithmetic(op, a, b, type: operandType,
+                constant: FunctionResolver.isConstant(left) && FunctionResolver.isConstant(right))
+        default: throw JedError("XX000", "invalid expression evaluator dispatch")
+        }
+    }
+
+    private func evaluatePredicate(_ expression: ResolvedExpression) throws -> SQLValue {
+        switch expression.node {
         case .isNull(let source, let negated): return .boolean(ValueComparison.isNull(try evaluate(source), negated: negated))
         case .distinct(let left, let right, let type, let negated):
             let a = try evaluate(left), b = try evaluate(right)
@@ -162,6 +216,12 @@ internal struct ExpressionContext {
             if a.isNull || b.isNull { equal = a.isNull && b.isNull }
             else { try comparisonWork("=", a, b, type: type); equal = try ValueComparison.total(a, b, type: type, collatedKey: collatedKey, equality: true) == 0 }
             return .boolean(negated ? equal : !equal)
+        default: throw JedError("XX000", "invalid expression evaluator dispatch")
+        }
+    }
+
+    private func evaluateConditional(_ expression: ResolvedExpression) throws -> SQLValue {
+        switch expression.node {
         case .conditional(let arms, let fallback):
             for (condition, value) in arms {
                 if case .boolean(true) = try evaluate(condition) { return try evaluate(value) }
@@ -187,9 +247,13 @@ internal struct ExpressionContext {
             try comparisonWork("=", a, b, type: type)
             if case .boolean(true) = try ValueComparison.sql("=", a, b, type: type, collatedKey: collatedKey) { return .null }
             return a
+        default: throw JedError("XX000", "invalid expression evaluator dispatch")
+        }
+    }
+
+    private func evaluateContainer(_ expression: ResolvedExpression) throws -> SQLValue {
+        switch expression.node {
         case .row(let fields): return .composite(try fields.map(evaluate))
-        case .json(let expression): return try expression.evaluate(context: self)
-        case .pattern(let pattern): return try pattern.evaluate(context: self)
         case .array(let sources, let nested):
             return try ArrayFunctions.construct(sources.map(evaluate), nested: nested,
                                                 constant: sources.allSatisfy(FunctionResolver.isConstant), meter: meter)
@@ -229,11 +293,25 @@ internal struct ExpressionContext {
             if value.isNull { return .null }
             guard case .composite(let fields) = value, fields.indices.contains(index) else { throw JedError("42804", "invalid record value") }
             return fields[index]
+        default: throw JedError("XX000", "invalid expression evaluator dispatch")
+        }
+    }
+
+    private func evaluateDelegated(_ expression: ResolvedExpression) throws -> SQLValue {
+        switch expression.node {
+        case .json(let expression): return try expression.evaluate(context: self)
+        case .pattern(let pattern): return try pattern.evaluate(context: self)
         case .call(let function):
+            if let result = try hostBatch?.take(function) { return result }
             var values = Array(repeating: SQLValue.null, count: function.arguments.count)
-            for index in function.evaluationOrder { values[index] = try evaluate(function.arguments[index]) }
+            let similarSubstring = function.hostID == nil && function.name == "substring" && function.arguments.count == 3
+                && function.arguments[1].type?.type == .scalar(.text)
+            for index in function.evaluationOrder {
+                values[index] = try evaluate(function.arguments[index])
+                if similarSubstring, case .constant(.null) = function.arguments[index].node { return .null }
+            }
             return try ScalarFunctions.evaluate(function, values: values, context: self, environment: functions)
-        case .constant, .column, .parameter, .convert, .outerColumn, .subquery: throw JedError("XX000", "invalid expression dispatch")
+        default: throw JedError("XX000", "invalid expression evaluator dispatch")
         }
     }
 
@@ -329,11 +407,11 @@ internal struct ExpressionContext {
             switch op {
             case "+", "-", "*":
                 let result = op == "+" ? x.addingReportingOverflow(y) : op == "-" ? x.subtractingReportingOverflow(y) : x.multipliedReportingOverflow(by: y)
-                guard !result.overflow else { throw JedError("22003", "\(width.name) out of range") }; value = result.partialValue
+                guard !result.overflow else { throw JedError("22003", "\(width.name) out of range").withDataType(width.name) }; value = result.partialValue
             case "/", "%":
                 guard y != 0 else { throw JedError("22012", "division by zero") }
                 if op == "%" && y == -1 { value = 0 }
-                else { guard x != .min || y != -1 else { throw JedError("22003", "\(width.name) out of range") }; value = op == "/" ? x / y : x % y }
+                else { guard x != .min || y != -1 else { throw JedError("22003", "\(width.name) out of range").withDataType(width.name) }; value = op == "/" ? x / y : x % y }
             case "&": value = x & y
             case "|": value = x | y
             case "#": value = x ^ y

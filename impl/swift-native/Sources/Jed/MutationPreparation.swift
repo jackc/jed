@@ -17,6 +17,7 @@ extension MutationExecutor {
         let returning: Returning
         let conflict: ConflictPlan?
         let parameterTypes: [TypeDescriptor]
+        var sourceValidationError: JedError? = nil
         let profileIdentity = QueryProfileIdentity()
     }
     struct MutationPreparation {
@@ -57,14 +58,18 @@ extension MutationExecutor {
     enum Preparation {
         case insert(InsertPreparation)
         case mutation(MutationPreparation)
+        case merge(MergePreparation)
         var parameterTypes: [TypeDescriptor] {
-            switch self { case .insert(let value): value.parameterTypes; case .mutation(let value): value.parameterTypes }
+            switch self { case .insert(let value): value.parameterTypes; case .mutation(let value): value.parameterTypes; case .merge(let value): value.parameterTypes }
         }
-        var returning: Returning {
-            switch self { case .insert(let value): value.returning; case .mutation(let value): value.returning }
+        var returningColumns: [ResultColumn] {
+            switch self { case .insert(let value): value.returning.columns; case .mutation(let value): value.returning.columns; case .merge(let value): value.returning.columns }
+        }
+        var returningExpressions: [ResolvedExpression] {
+            switch self { case .insert(let value): value.returning.expressions; case .mutation(let value): value.returning.expressions; case .merge(let value): value.returning.expressions }
         }
         var profileIdentity: QueryProfileIdentity {
-            switch self { case .insert(let value): value.profileIdentity; case .mutation(let value): value.profileIdentity }
+            switch self { case .insert(let value): value.profileIdentity; case .mutation(let value): value.profileIdentity; case .merge(let value): value.profileIdentity }
         }
     }
     static func prepare(_ statement: SQLStatement, snapshot: DomainSnapshot,
@@ -75,6 +80,7 @@ extension MutationExecutor {
             predicate: value.predicate, returning: value.returning, snapshot: snapshot, settings: settings, context: context))
         case .delete(let value): return .mutation(try prepareMutation(table: value.table, assignments: nil,
             predicate: value.predicate, returning: value.returning, snapshot: snapshot, settings: settings, context: context))
+        case .merge(let value): return .merge(try MergeExecutor.prepare(value, snapshot: snapshot, settings: settings, context: context))
         default: return nil
         }
     }
@@ -83,6 +89,7 @@ extension MutationExecutor {
         switch plan {
         case .insert(let value): return try executeInsert(value, snapshot: &snapshot, context: context, parameters: parameters)
         case .mutation(let value): return try executeMutation(value, snapshot: &snapshot, context: context, parameters: parameters)
+        case .merge(let value): return try MergeExecutor.execute(value, snapshot: &snapshot, context: context, parameters: parameters)
         }
     }
 }

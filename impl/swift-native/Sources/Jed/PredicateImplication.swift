@@ -1,6 +1,53 @@
 /// The shared bounded implication procedure. Planning consumes no SQL cost;
 /// explicit continuation frames keep a flat AND/OR tree off the Swift stack.
 internal enum PredicateImplication {
+    /// An inner partial index must not invent a NULL-extended outer-join row
+    /// that survives WHERE. The join's own ON is sufficient by itself; a proof
+    /// using WHERE also requires the specified syntactic NULL rejection test.
+    static func inlAdmissible(on: ResolvedExpression?, whereFilter: ResolvedExpression?,
+                              predicate: ResolvedExpression, columnOffset: Int = 0) -> Bool {
+        if let on, implies([on], predicate: predicate, columnOffset: columnOffset) { return true }
+        return rejectsNull(predicate) && implies([on, whereFilter].compactMap { $0 },
+                                                predicate: predicate, columnOffset: columnOffset)
+    }
+
+    /// This recognizes only the frozen bare-column shapes from indexes.md
+    /// section 9.1. Casts and otherwise strict functions do not add proofs.
+    static func rejectsNull(_ predicate: ResolvedExpression) -> Bool {
+        enum Step {
+            case visit(ResolvedExpression)
+            case conjunction(ResolvedExpression)
+            case disjunction(ResolvedExpression)
+        }
+        func bare(_ expression: ResolvedExpression) -> Bool {
+            if case .column = expression.node { return true }; return false
+        }
+        var pending: [Step] = [.visit(predicate)], result = false
+        while let step = pending.popLast() {
+            switch step {
+            case .conjunction(let right):
+                if !result { pending.append(.visit(right)) }
+            case .disjunction(let right):
+                if result { pending.append(.visit(right)) }
+            case .visit(let expression):
+                switch expression.node {
+                case .binary("and", let left, let right, _):
+                    pending.append(.conjunction(right)); pending.append(.visit(left))
+                case .binary("or", let left, let right, _):
+                    pending.append(.disjunction(right)); pending.append(.visit(left))
+                case .binary(let operation, let left, let right, _) where ["=", "<>", "<", "<=", ">", ">="].contains(operation):
+                    result = bare(left) || bare(right)
+                case .isNull(let child, true), .unary("not", let child): result = bare(child)
+                case .column: result = true
+                case .quantified(_, false, let child, _, _): result = bare(child)
+                case .pattern(let pattern): result = bare(pattern.subject)
+                default: result = false
+                }
+            }
+        }
+        return result
+    }
+
     private struct Atom {
         let expression: ResolvedExpression
         let operation: String
@@ -144,6 +191,16 @@ internal enum PredicateImplication {
         }
     }
     private static func same(_ a: ResolvedExpression, _ b: ResolvedExpression, offset: Int) -> Bool {
+        // Named-zone conversion is valid in a pinned index definition, but the
+        // frozen conservative identity matcher does not recognize its dedicated
+        // temporal node. Do not obtain a broader partial-index proof merely
+        // because Swift represents that node using a resolved function call.
+        var shapes = [a, b]
+        while let expression = shapes.popLast() {
+            if case .call(let function) = expression.node,
+               function.hostID == nil, function.name == "timezone" { return false }
+            shapes.append(contentsOf: StoredExpressionDependencies.children(expression))
+        }
         var work = [(a, b)]
         while let (a, b) = work.popLast() {
             switch (a.node, b.node) {

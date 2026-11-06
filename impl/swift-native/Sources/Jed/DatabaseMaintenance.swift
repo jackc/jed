@@ -68,7 +68,7 @@ extension Database {
         // Expensive KDF work and key-stream draws deliberately precede both gates.
         let replacement = try codec.rewrap(selected, credential: credential, parameters: kdf, entropy: target.keyEntropy)
         try domains.withMaintenance(identifier, main: self, expected: target) {
-            try target.core.maintenance {
+            try target.core.credentialMaintenance {
                 try target.checkOpen()
                 guard target.core.storage === expected else { throw JedError("55006", "database changed concurrently") }
                 do { try expected.pager.changeKeyBlock(replacement, replacing: selected, syncDirectory: host.syncDirectory) }
@@ -87,7 +87,6 @@ extension Database {
         let expected = target.core.storage
         guard expected.kind == .file else { throw JedError("55000", "in-memory databases cannot be rekeyed") }
         #if os(Linux) || canImport(Darwin)
-        guard let host = target.localFileHost else { throw JedError("55006", "page clients cannot rekey the database") }
         let scratch = scratchFileHost
         if credential != nil {
             guard expected.pager.pageSize >= 1024 else { throw JedError("0A000", "encryption requires pages of at least 1024 bytes") }
@@ -102,6 +101,7 @@ extension Database {
             codec = try EncryptedPageCodec(pageSize: expected.pager.pageSize, dataKey: created.dataKey)
             keyBlock = created.block
         } else { codec = try PlainPageCodec(pageSize: expected.pager.pageSize); keyBlock = nil }
+        guard let host = target.localFileHost else { throw JedError("55006", "page clients cannot rekey the database") }
         try domains.withMaintenance(identifier, main: self, expected: target) {
             try target.rekeyStorage(expected, host: host, random: random, codec: codec, keyBlock: keyBlock, scratch: scratch)
         }

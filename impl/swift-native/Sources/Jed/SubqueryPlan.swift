@@ -26,6 +26,9 @@ internal final class ResolvedSubquery {
     let rowArity: Int?
     let outerReferences: Set<OuterColumnReference>
     var correlated: Bool { !outerReferences.isEmpty }
+    // Frozen cores leave ORDER-only subqueries outside the initplan fold.
+    // A shared projection occurrence can still fold this identity first.
+    var runtimeOrderKey = false
     var operand: ResolvedExpression? {
         if case .membership(_, _, _, _, let value) = kind { return value }
         return nil
@@ -46,9 +49,14 @@ extension ExpressionResolver {
                 if let qualifier, scope.contains(where: { $0.qualifier == qualifier && $0.ambiguousRelation }) {
                     throw JedError("42P09", "table reference is ambiguous: \(qualifier)")
                 }
+                if let qualifier, scope.contains(where: { $0.qualifier == qualifier && $0.lateralDenied }) {
+                    throw JedError("42P10", "invalid reference to FROM-clause entry in a lateral outer join").detailed(ErrorHints.lateralDetail)
+                }
                 let matches = scope.filter { $0.name == name && (qualifier == nil ? !$0.qualifiedOnly : $0.qualifier == qualifier) }
                 if let column = matches.first {
+                    if column.lateralDenied { throw JedError("42P10", "invalid reference to FROM-clause entry in a lateral outer join").detailed(ErrorHints.lateralDetail) }
                     guard matches.count == 1 else { throw JedError("42702", "column reference is ambiguous: \(name)") }
+                    if column.ungroupedAncestor { throw JedError("42803", "subquery uses ungrouped column \(name) from outer query") }
                     let reference = OuterColumnReference(depth: level + 1, index: column.index)
                     outerReferences.insert(reference)
                     return ResolvedExpression(type: column.unresolved ? nil : column.type, node: .outerColumn(reference), position: position,
@@ -63,7 +71,9 @@ extension ExpressionResolver {
             for (level, scope) in ([columns] + outerScopes).enumerated() {
                 let matches = scope.filter { $0.scalarFunction && $0.qualifier == name }
                 if let column = matches.first {
+                    if column.lateralDenied { throw JedError("42P10", "invalid reference to FROM-clause entry in a lateral outer join").detailed(ErrorHints.lateralDetail) }
                     guard matches.count == 1 else { throw JedError("42702", "column reference is ambiguous: \(name)") }
+                    if column.ungroupedAncestor { throw JedError("42803", "subquery uses ungrouped column \(name) from outer query") }
                     let node: ResolvedExpression.Node
                     if level == 0 { referencedColumns.insert(column.index); node = .column(column.index) }
                     else {
@@ -108,10 +118,18 @@ extension ExpressionResolver {
         let key = SubqueryPlanKey(start: query.span.byteStart, end: query.span.byteEnd, kind: label, arity: rowArity ?? 0)
         if let existing = subqueryPlans[key] { return subqueryNode(existing, position: position) }
         let child = ExpressionResolver(composites: composites, scalar: scalar)
-        child.outerScopes = [columns] + outerScopes
+        let ancestorColumns = columns.map { column in
+            var column = column
+            if let groupedColumns { column.ungroupedAncestor = !groupedColumns.contains(column.index) }
+            return column
+        }
+        child.outerScopes = [ancestorColumns] + outerScopes
+        child.outerNameHints = [nameHints] + outerNameHints
+        child.nameHintFrames = nameHintFrames
         child.parameters = parameters; child.parameterUses = parameterUses
         child.viewExpansion = viewExpansion
         child.cteBindings = cteBindings
+        child.cteExpansionEnabled = cteExpansionEnabled
         let plan = try SelectPlan.resolve(query, snapshot: scope.snapshot, settings: scope.settings,
             scalar: scalar, using: child, finalizeParameters: false)
         parameters = child.parameters; parameterUses.formUnion(child.parameterUses)

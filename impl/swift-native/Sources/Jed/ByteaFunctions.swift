@@ -30,7 +30,7 @@ internal enum ByteaFunctions {
             let replacement = try bytes(1), start = try integer(2), count = try args.count > 3 ? integer(3) : Int64(replacement.count)
             guard start > 0 else { throw JedError("22011", "negative substring length not allowed") }
             let end = Int128(start) + Int128(count)
-            guard end >= Int32.min, end <= Int32.max else { throw JedError("22003", "integer out of range") }
+            guard end >= Int32.min, end <= Int32.max else { throw JedError("22003", "integer out of range").withDataType("i32") }
             let head = try window(length: input.count, start: 1, count: start - 1), tail = try window(length: input.count, start: Int64(end), count: nil)
             let result = Array(input[head]) + replacement + Array(input[tail])
             if !constant { meter.charge(Int64(result.count)); try meter.guardCost() }

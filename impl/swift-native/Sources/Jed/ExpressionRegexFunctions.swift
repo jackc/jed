@@ -59,7 +59,8 @@ extension PatternExecution {
         return ScalarFunctions.RegexExecution(program: prepared.program, chargeCompile: charge, scratch: state.scratch)
     }
     func similarSubstring(_ function: ResolvedFunction, values: [SQLValue], meter: CostMeter) throws -> SQLValue {
-        guard case .text(let source) = values[0], case .text(let pattern) = values[1], case .text(let escape) = values[2] else {
+        if values[1].isNull || values[2].isNull { return .null }
+        guard case .text(let pattern) = values[1], case .text(let escape) = values[2] else {
             throw JedError("42804", "SIMILAR substring operands must be text")
         }
         let state = function.regex.map(functionState)
@@ -72,6 +73,8 @@ extension PatternExecution {
             program = try Similar.compileSubstring(Similar.translate(pattern, escape: escape, meter: constant ? nil : meter))
             try program.chargeCompile(meter)
         }
+        if values[0].isNull { return .null }
+        guard case .text(let source) = values[0] else { throw JedError("42804", "SIMILAR substring subject must be text") }
         return try program.match(source, meter: meter, scratch: state?.similarScratch).map(SQLValue.text) ?? .null
     }
 }

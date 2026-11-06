@@ -21,24 +21,25 @@ internal final class HashJoinTable {
     func probe(_ row: [SQLValue], keys: [(column: Int, type: TypeDescriptor)], visit: (Int) throws -> Void) throws {
         guard let key = try Self.encode(row, keys: keys, context: context) else { return }
         for entry in buckets[Self.hash(key)] ?? [] {
-            context.meter.charge(Int64(max(1, min(key.count, entry.key.count)))); try context.meter.step()
+            try context.meter.step(); context.meter.charge(Int64(max(1, min(key.count, entry.key.count))))
             if entry.key == key { try visit(entry.position) }
         }
     }
-    private static func encode(_ row: [SQLValue], keys: [(column: Int, type: TypeDescriptor)], context: ExpressionContext) throws -> [UInt8]? {
+    static func encode(_ row: [SQLValue], keys: [(column: Int, type: TypeDescriptor)], context: ExpressionContext) throws -> [UInt8]? {
         var writer = ByteWriter(), present = true
         for key in keys {
+            try context.meter.step()
             let value = row[key.column]
-            if value.isNull { context.meter.charge(1); try context.meter.step(); present = false; continue }
+            if value.isNull { context.meter.charge(1); present = false; continue }
             var type = key.type; type.collation = nil
             let bytes = try KeyEncoding.encode(value, type: type)
-            context.meter.charge(Int64(max(1, bytes.count))); try context.meter.step()
+            context.meter.charge(Int64(max(1, bytes.count)))
             guard bytes.count <= UInt32.max else { throw JedError("54000", "hash key is too large") }
             writer.u32(UInt32(bytes.count)); writer.append(bytes)
         }
         return present ? writer.bytes : nil
     }
-    private static func hash(_ bytes: [UInt8]) -> UInt64 {
+    static func hash(_ bytes: [UInt8]) -> UInt64 {
         var value: UInt64 = 14_695_981_039_346_656_037
         for byte in bytes { value = (value ^ UInt64(byte)) &* 1_099_511_628_211 }
         return value

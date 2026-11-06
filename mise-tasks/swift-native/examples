@@ -1,0 +1,11 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#MISE description="Explicit opt-in: run native Swift embedding examples"
+#USAGE flag "-c --configuration <configuration>" default="debug" help="debug or release"
+#USAGE arg "[example]" default="all" help="all, memory, durable, or cancellation"
+
+require_relative "../../impl/swift-native/Tools/swift_task"
+example = ENV.fetch("usage_example", "all")
+abort "choose all, memory, durable, or cancellation" unless %w[all memory durable cancellation].include?(example)
+SwiftNativeTasks.run_product("jed-examples", arguments: [example],
+                            configuration: ENV.fetch("usage_configuration", "debug"))

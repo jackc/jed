@@ -1,0 +1,35 @@
+{
+  "fixture": "index_entry_extra.jed",
+  "runs": [
+    {
+      "level": "quick",
+      "max_findings": 100,
+      "report": {
+        "findings": [],
+        "truncated": false,
+        "skipped": [],
+        "pages": 12,
+        "rows": 40
+      }
+    },
+    {
+      "level": "full",
+      "max_findings": 100,
+      "report": {
+        "findings": [
+          {
+            "kind": "index_entry_count_mismatch",
+            "database": "main",
+            "object": "t_v_idx",
+            "page": null,
+            "key": null
+          }
+        ],
+        "truncated": false,
+        "skipped": [],
+        "pages": 12,
+        "rows": 40
+      }
+    }
+  ]
+}

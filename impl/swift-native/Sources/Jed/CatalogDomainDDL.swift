@@ -63,7 +63,7 @@ internal extension CatalogDDL {
                 let table = image.tables.first { $0.indexes.contains { $0.name == name } }
                 let index = table?.indexes.first { $0.name == name }
                 if let index, index.isConstraint || table!.exclusions.contains(where: { $0.index == name }) {
-                    throw JedError("2BP01", "cannot drop index \(name) because a constraint requires it")
+                    throw JedError("2BP01", "cannot drop index \(name) because a constraint requires it").hinted(DependencyDiagnostics.ownedIndex(name, table: table!))
                 }
                 exists = index != nil
             }
@@ -143,7 +143,7 @@ internal extension CatalogDDL {
                     return dependency.kind == kind && targets.contains { $0.name == dependency.name && visible($0.owner, from: owner) }
                 }
                 if depends {
-                    guard definition.cascade else { throw JedError("2BP01", "cannot drop \(definition.object) because view \(view.name) depends on it") }
+                    guard definition.cascade else { throw JedError("2BP01", "cannot drop \(definition.object) because view \(view.name) depends on it").hinted(["table", "view"].contains(definition.object) ? DependencyDiagnostics.cascade : nil) }
                     removedViews.insert(key); changed = true
                 }
             }

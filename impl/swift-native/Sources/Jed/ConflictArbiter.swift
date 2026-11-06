@@ -8,9 +8,9 @@ internal enum ConflictArbiter {
                         resolver: ExpressionResolver) throws -> ConflictArbiter {
         if let name = syntax.constraint {
             guard relation.view == nil else { throw JedError("42704", "constraint does not exist on view: \(name)") }
-            let primaryName = SQLText(validatedUTF8: relation.table.name.utf8 + Array("_pkey".utf8))
+            let primaryName = CatalogSQL.objectName(relation.table.name, label: "pkey")
             if !relation.table.primaryKey.isEmpty, name == primaryName { return .primary }
-            if let index = indexes.firstIndex(where: { $0.index.name == name && $0.index.unique }) { return .index(index) }
+            if let index = indexes.firstIndex(where: { $0.index.name == name && $0.index.unique && $0.index.isConstraint }) { return .index(index) }
             if let exclusion = exclusions.firstIndex(where: { $0.definition.name == name }) {
                 guard syntax.doNothing else { throw JedError("42809", "ON CONFLICT DO UPDATE not supported with exclusion constraints") }
                 return .exclusion(exclusion)

@@ -25,6 +25,9 @@ public final class Rows {
     public private(set) var error: JedError?
     public var cost: Int64 { meter.accrued }
     public var isClosed: Bool { pull == nil }
+    /// A statement count, including zero. Query results (also RETURNING), DDL
+    /// and transaction control have no affected-row count.
+    public var rowsAffected: Int64? { affected }
     public var commandTag: CommandTag { CommandTag(command: command, rowsAffected: affected ?? rowCount, cost: cost) }
 
     internal init(columns: [ResultColumn], meter: CostMeter, command: String = "SELECT", affected: Int64? = nil,

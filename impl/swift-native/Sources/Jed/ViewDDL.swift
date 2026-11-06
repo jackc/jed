@@ -78,12 +78,11 @@ extension CatalogDDL {
                 if !view.securityInvoker { bodySettings.privileges = settings.privileges.withTableAccess() }
                 let body = try SelectPlan.resolve(query, snapshot: snapshot, settings: bodySettings, scalar: context.scalar)
                 // Frozen view defaults are validated against the synthesized
-                // scalar column, whose declared output typmod is not carried
+                // column, whose declared output typmod is not carried
                 // into its default descriptor. Assignment applies that typmod
                 // when the default is later used by a write.
                 let target = TypeDescriptor(body.columns[position].type?.type ?? .scalar(.text))
                 try CatalogExpressionPolicy.validate(expression, isDefault: true)
-                guard case .scalar = target.type else { throw JedError("0A000", "view container columns do not support defaults") }
                 let resolver = try resolver(snapshot: snapshot, settings: settings, context: context)
                 let value = try defaultValue(expression, target: target, source: source, resolver: resolver, context: context)
                 switch value {
@@ -143,7 +142,7 @@ extension CatalogDDL {
             changed = false
             for view in snapshot.catalog.views.sorted(by: { $0.name < $1.name }) where !removed.contains(view.name) {
                 if view.dependencies.contains(where: { $0.kind == 1 && removed.contains($0.name) }) {
-                    guard syntax.cascade else { throw JedError("2BP01", "cannot drop view because view \(view.name) depends on it") }
+                    guard syntax.cascade else { throw JedError("2BP01", "cannot drop view because view \(view.name) depends on it").hinted(DependencyDiagnostics.cascade) }
                     removed.insert(view.name); changed = true
                 }
             }

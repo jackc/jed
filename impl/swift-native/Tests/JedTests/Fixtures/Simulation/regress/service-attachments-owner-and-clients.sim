@@ -1,0 +1,311 @@
+# format: simulation
+# profile: service-attachments
+# seed: 16
+# page_size: 512
+# cache_bytes: 2048
+# processes: service
+# clock: 1700000000000000
+open w1 write p0
+on w1 CREATE TABLE t1 (id i64 PRIMARY KEY, c1 i64, c2 bytea, c3 text)
+on w1 INSERT INTO t1 (id, c1, c2, c3) SELECT g, g * 7, decode(md5(g::text), 'hex'), repeat(md5(g::text), 8) FROM generate_series(1, 36) g
+commit w1
+attach a1
+spawn p2
+clock +1325618
+spawn p1
+open r1 read p0
+attach a1
+open w2 write p1
+on w2 SELECT * FROM t1 WHERE id = 110
+fault io_error op=sync nth=2
+commit w2
+kill p1
+on r1 SELECT * FROM t1 WHERE id = 52
+open r2 read p2
+spawn p1
+open w3 write p2
+disconnect p2
+fault disconnect nth=1
+commit w3
+crash process
+spawn p2
+spawn p1
+check
+open r3 read p1
+kill p1
+check
+reopen
+crash power survive=1000 tear=196
+open r4 read p0
+open r5 read p0
+on r4 SELECT * FROM t1 WHERE id = 59
+spawn p2
+check
+on r4 SELECT * FROM t1 ORDER BY md5(id::text) LIMIT 31
+on r5 SELECT count(*), sum(id) FROM t1
+on r4 SELECT id % 8 AS k, count(*), max(id) FROM t1 GROUP BY 1
+disconnect p2
+spawn p1
+open r6 read p0
+on r5 SELECT * FROM t1 ORDER BY id LIMIT 6
+on r5 SELECT * FROM t1 WHERE id BETWEEN 114 AND 134 ORDER BY id
+open w4 write p2
+commit w4
+on r5 SELECT * FROM t1 ORDER BY md5(id::text) LIMIT 22
+check
+on r5 SELECT * FROM t1 ORDER BY md5(id::text) LIMIT 32
+disconnect p1
+on r6 SELECT count(*), sum(id) FROM t1
+disconnect p1
+close r5
+clock +628848
+disconnect p2
+attach a1
+open w5 write p0
+on w5 UPDATE t1 SET c2 = NULL WHERE id BETWEEN 12 AND 24
+kill p1
+spawn p1
+commit w5
+check
+reopen
+attach a1
+spawn p1
+open r7 read p0
+spawn p2
+close r7
+open r8 read p1
+close r8
+open w6 write p1
+on w6 CREATE TABLE a1.t2 (id i64 PRIMARY KEY, c1 text)
+on w6 SELECT * FROM a1.t2 ORDER BY id LIMIT 7
+on w6 INSERT INTO a1.t2 (id, c1) SELECT g, md5(g::text) FROM generate_series(1, 12) g
+on w6 CREATE TABLE a1.t3 (id i64 PRIMARY KEY, c1 text)
+on w6 UPDATE a1.t2 SET c1 = md5(id::text) WHERE id BETWEEN 3 AND 9
+commit w6
+open w7 write p0
+check
+on w7 UPDATE a1.t2 SET c1 = md5(id::text) WHERE id BETWEEN 7 AND 22
+on w7 UPDATE a1.t2 SET c1 = md5(id::text) WHERE id % 7 = 4
+on w7 CREATE TABLE a1.t4 (id i64 PRIMARY KEY, c1 text, c2 text)
+commit w7
+open w8 write p0
+on w8 INSERT INTO t1 (id, c1, c2, c3) SELECT g, g * 7, decode(repeat(md5(g::text), 37), 'hex'), md5(g::text) FROM generate_series(37, 54) g ON CONFLICT (id) DO UPDATE SET c2 = excluded.c2, c3 = excluded.c3
+reopen
+crash process
+check
+check
+spawn p1
+spawn p2
+open w9 write p2
+on w9 INSERT INTO a1.t2 (id, c1) SELECT g, md5(g::text) FROM generate_series(13, 37) g
+clock +4618475
+on w9 INSERT INTO a1.t2 (id, c1) SELECT g, repeat(md5(g::text), 53) FROM generate_series(38, 71) g
+on w9 DELETE FROM a1.t2 WHERE id BETWEEN 29 AND 53
+exit p1
+check
+on w9 INSERT INTO a1.t4 (id, c1, c2) SELECT g, md5(g::text), md5(g::text) FROM generate_series(1, 8) g
+commit w9
+open w10 write p2
+on w10 INSERT INTO a1.t4 (id, c1, c2) SELECT g, NULL, repeat(md5(g::text), 45) FROM generate_series(9, 26) g
+fault process_crash issue=826 nth=1
+commit w10
+reopen
+open w11 write p0
+crash process
+kill p0
+attach a2
+open w12 write p0
+rollback w12
+check
+open w13 write p0
+on w13 INSERT INTO a1.t3 (id, c1) SELECT g, md5(g::text || '380.1') || md5(g::text || '380.2') || md5(g::text || '380.3') || md5(g::text || '380.4') || md5(g::text || '380.5') || md5(g::text || '380.6') || md5(g::text || '380.7') || md5(g::text || '380.8') || md5(g::text || '380.9') || md5(g::text || '380.10') || md5(g::text || '380.11') || md5(g::text || '380.12') || md5(g::text || '380.13') || md5(g::text || '380.14') || md5(g::text || '380.15') FROM generate_series(1, 23) g
+disconnect p0
+spawn p2
+on w13 UPDATE a1.t3 SET c1 = md5(id::text) WHERE id % 4 = 3
+crash process
+open w14 write p0
+commit w14
+spawn p1
+open w15 write p1
+open r9 read p0
+spawn p2
+check
+on w15 INSERT INTO t1 (id, c1, c2, c3) SELECT g, g * 7, decode(md5(g::text), 'hex'), md5(g::text) FROM generate_series(31, 64) g ON CONFLICT (id) DO UPDATE SET c2 = excluded.c2, c3 = excluded.c3
+kill p1
+spawn p1
+open w16 write p0
+check
+crash power survive=1000 tear=159
+spawn p1
+spawn p2
+open w17 write p0
+open r10 read p0
+on w17 CREATE TABLE t5 (id i64 PRIMARY KEY, c1 i64, c2 text)
+close r10
+on w17 UPDATE t1 SET c2 = NULL WHERE id BETWEEN 32 AND 39
+on w17 CREATE TABLE t6 (id i64 PRIMARY KEY, c1 i32, c2 text, c3 text, c4 text)
+disconnect p0
+on w17 SELECT * FROM t5 ORDER BY id LIMIT 2
+on w17 INSERT INTO t6 (id, c1, c2, c3, c4) SELECT g, (g * 90 + 3) % 1000, md5(g::text), NULL, md5(g::text) FROM generate_series(1, 18) g
+on w17 INSERT INTO t1 (id, c1, c2, c3) SELECT g, g * 7, decode(md5(g::text), 'hex'), md5(g::text || '853.1') || md5(g::text || '853.2') || md5(g::text || '853.3') || md5(g::text || '853.4') || md5(g::text || '853.5') FROM generate_series(37, 70) g
+crash process
+open w18 write p0
+on w18 CREATE TABLE IF NOT EXISTS a1.t4 (id i64 PRIMARY KEY, c1 text, c2 text)
+on w18 SELECT count(*), sum(id) FROM a1.t4
+commit w18
+open w19 write p0
+on w19 SELECT * FROM a1.t4 ORDER BY md5(id::text) LIMIT 6
+on w19 SELECT * FROM a1.t2 WHERE id BETWEEN 60 AND 80 ORDER BY id
+on w19 DELETE FROM a1.t4 WHERE id BETWEEN 17 AND 43
+fault process_crash issue=931 nth=2
+commit w19
+open r11 read p0
+open r12 read p0
+close r11
+open r13 read p0
+open w20 write p0
+on w20 INSERT INTO a1.t4 (id, c1, c2) SELECT g, md5(g::text), md5(g::text) FROM generate_series(27, 52) g
+on w20 UPDATE a1.t2 SET c1 = md5(id::text) WHERE id BETWEEN 70 AND 71
+on w20 UPDATE a1.t4 SET c1 = c1 || 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx', c2 = c2 || 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx' WHERE id BETWEEN 3 AND 16
+commit w20
+open w21 write p0
+on w21 INSERT INTO t1 (id, c1, c2, c3) SELECT g, g * 7, NULL, md5(g::text) FROM generate_series(21, 48) g ON CONFLICT (id) DO UPDATE SET c2 = excluded.c2, c3 = excluded.c3
+on r12 SELECT * FROM t1 WHERE id BETWEEN 10 AND 30 ORDER BY id
+rollback w21
+on r12 SELECT * FROM a1.t3 ORDER BY md5(id::text) LIMIT 40
+on r13 SELECT * FROM t1 WHERE id = 229
+on r13 SELECT id % 4 AS k, count(*), max(id) FROM a1.t3 GROUP BY 1
+open w22 write p0
+on r12 SELECT * FROM a1.t2 WHERE id BETWEEN 54 AND 74 ORDER BY id
+on w22 INSERT INTO t1 (id, c1, c2, c3) SELECT g, g * 7, decode(md5(g::text), 'hex'), md5(g::text) FROM generate_series(37, 57) g
+on w22 INSERT INTO t1 (id, c1, c2, c3) SELECT g, g * 7, decode(md5(g::text), 'hex'), md5(g::text || '628.1') || md5(g::text || '628.2') || md5(g::text || '628.3') || md5(g::text || '628.4') || md5(g::text || '628.5') || md5(g::text || '628.6') || md5(g::text || '628.7') || md5(g::text || '628.8') || md5(g::text || '628.9') || md5(g::text || '628.10') || md5(g::text || '628.11') || md5(g::text || '628.12') FROM generate_series(58, 84) g
+commit w22
+on r12 SELECT * FROM a1.t2 ORDER BY md5(id::text) LIMIT 27
+open r14 read p0
+open r15 read p0
+check
+on r14 SELECT * FROM a1.t4 ORDER BY md5(id::text) LIMIT 14
+reopen
+open r16 read p0
+open w23 write p0
+disconnect p0
+commit w23
+open w24 write p0
+on w24 ANALYZE a1.t4
+fault disconnect nth=1
+commit w24
+spawn p2
+close r16
+attach a2
+crash power survive=798 tear=0
+disconnect p0
+spawn p1
+spawn p2
+open r17 read p1
+attach a2
+open w25 write p2
+crash process
+disconnect p0
+crash process
+open r18 read p0
+spawn p1
+check
+open w26 write p1
+open r19 read p1
+on w26 UPDATE a1.t4 SET c2 = repeat(md5(id::text), 19) WHERE id BETWEEN 3 AND 29
+spawn p2
+on r19 SELECT id % 9 AS k, count(*), max(id) FROM t1 GROUP BY 1
+commit w26
+kill p1
+open r20 read p2
+open w27 write p2
+on r20 SELECT id % 8 AS k, count(*), max(id) FROM a1.t2 GROUP BY 1
+close r18
+commit w27
+open r21 read p2
+open w28 write p0
+commit w28
+attach a2
+on r20 SELECT count(*), sum(id) FROM a1.t2
+open w29 write p0
+on r20 SELECT * FROM a1.t3 ORDER BY id LIMIT 7
+commit w29
+kill p2
+spawn p2
+spawn p1
+open r22 read p2
+close r22
+check
+open w30 write p0
+on w30 SELECT * FROM a1.t3 WHERE id BETWEEN 179 AND 199 ORDER BY id
+on w30 INSERT INTO a1.t2 (id) VALUES (NULL)
+crash process
+spawn p2
+open w31 write p0
+on w31 CREATE SEQUENCE IF NOT EXISTS s1
+on w31 SELECT nextval('s1')
+on w31 ANALYZE t1
+on w31 CREATE TABLE t7 (id i64 PRIMARY KEY, c1 i32)
+on w31 SELECT * FROM t1 WHERE id BETWEEN 38 AND 58 ORDER BY id
+kill p2
+on w31 INSERT INTO t1 (id, c1, c2, c3) SELECT g, g * 7, decode(md5(g::text), 'hex'), md5(g::text) FROM generate_series(85, 92) g
+fault disconnect nth=3
+commit w31
+open w32 write p0
+spawn p2
+on w32 INSERT INTO a1.t2 (id, c1) SELECT g, md5(g::text) FROM generate_series(72, 99) g
+spawn p1
+on w32 INSERT INTO a1.t3 (id, c1) SELECT g, md5(g::text || '45.1') || md5(g::text || '45.2') || md5(g::text || '45.3') || md5(g::text || '45.4') || md5(g::text || '45.5') || md5(g::text || '45.6') || md5(g::text || '45.7') || md5(g::text || '45.8') || md5(g::text || '45.9') || md5(g::text || '45.10') || md5(g::text || '45.11') || md5(g::text || '45.12') || md5(g::text || '45.13') || md5(g::text || '45.14') FROM generate_series(1, 35) g
+on w32 SELECT * FROM a1.t4 ORDER BY id LIMIT 10
+on w32 DELETE FROM a1.t4 WHERE id BETWEEN 12 AND 21
+commit w32
+attach a2
+open w33 write p0
+rollback w33
+open r23 read p2
+open w34 write p2
+on w34 CREATE TABLE t8 (id i64 PRIMARY KEY, c1 bytea)
+fault disconnect nth=4
+commit w34
+on r23 SELECT * FROM a1.t3 WHERE id = 234
+open r24 read p0
+on r24 SELECT id % 4 AS k, count(*), max(id) FROM a1.t4 GROUP BY 1
+open w35 write p0
+on w35 CREATE TABLE IF NOT EXISTS t7 (id i64 PRIMARY KEY, c1 i32)
+on w35 INSERT INTO t7 (id, c1) SELECT g, (g * 46 + 22) % 1000 FROM generate_series(1, 35) g
+on w35 CREATE TABLE IF NOT EXISTS t8 (id i64 PRIMARY KEY, c1 bytea)
+on w35 CREATE TABLE IF NOT EXISTS t1 (id i64 PRIMARY KEY, c1 i64, c2 bytea, c3 text)
+on w35 DELETE FROM t1 WHERE id % 6 = 3
+commit w35
+disconnect p2
+open w36 write p1
+on w36 INSERT INTO a1.t2 (id, c1) SELECT g, uuidv4()::text FROM generate_series(100, 110) g
+commit w36
+open r25 read p0
+on r24 SELECT * FROM t7 WHERE id BETWEEN 25 AND 45 ORDER BY id
+exit p0
+open w37 write p1
+on w37 UPDATE t7 SET c1 = (c1 + 1) % 1000 WHERE id % 7 = 6
+commit w37
+kill p2
+open r26 read p1
+open w38 write p1
+commit w38
+on r26 SELECT * FROM t8 ORDER BY md5(id::text) LIMIT 38
+on r26 SELECT * FROM a1.t3 WHERE id = 105
+spawn p0
+open r27 read p1
+open w39 write p1
+close r26
+on w39 UPDATE a1.t3 SET c1 = md5(id::text) WHERE id BETWEEN 7 AND 25
+open r28 read p0
+on w39 INSERT INTO a1.t2 (id, c1) SELECT g, md5(g::text || '812.1') || md5(g::text || '812.2') || md5(g::text || '812.3') || md5(g::text || '812.4') || md5(g::text || '812.5') || md5(g::text || '812.6') || md5(g::text || '812.7') || md5(g::text || '812.8') || md5(g::text || '812.9') || md5(g::text || '812.10') || md5(g::text || '812.11') || md5(g::text || '812.12') || md5(g::text || '812.13') || md5(g::text || '812.14') || md5(g::text || '812.15') || md5(g::text || '812.16') || md5(g::text || '812.17') || md5(g::text || '812.18') || md5(g::text || '812.19') || md5(g::text || '812.20') FROM generate_series(111, 119) g
+fault power_loss survive=875 tear=380 nth=2
+commit w39
+check
+open w40 write p0
+open r29 read p0
+commit w40
+close r29
+reopen
+check

@@ -1,0 +1,21 @@
+# After a reopen, a commit rewrote a root leaf's spilled values into fresh chains and freed the old
+# ones, but the resident root kept referencing them; the next commit's page reuse corrupted the
+# table in all three cores (fixed in a0307b1b). Shrunk from reuse-under-pins seed 1.
+# format: simulation
+# profile: reuse-under-pins
+# seed: 1
+# page_size: 512
+# cache_bytes: 2048
+# clock: 1700000000000000
+open w1 write
+on w1 CREATE TABLE t1 (id i64 PRIMARY KEY, c1 i32, c2 i64, c3 text)
+on w1 INSERT INTO t1 (id, c1, c2, c3) SELECT g, (g * 32 + 1) % 1000, g * 7, md5(g::text || '870.1') || md5(g::text || '870.2') || md5(g::text || '870.3') || md5(g::text || '870.4') || md5(g::text || '870.5') || md5(g::text || '870.6') || md5(g::text || '870.7') || md5(g::text || '870.8') || md5(g::text || '870.9') || md5(g::text || '870.10') || md5(g::text || '870.11') || md5(g::text || '870.12') || md5(g::text || '870.13') || md5(g::text || '870.14') || md5(g::text || '870.15') || md5(g::text || '870.16') || md5(g::text || '870.17') || md5(g::text || '870.18') FROM generate_series(1, 6) g
+commit w1
+reopen
+open w6 write
+on w6 INSERT INTO t1 (id, c1, c2, c3) SELECT g, (g * 95 + 41) % 1000, g * 7, md5(g::text || '499.1') || md5(g::text || '499.2') || md5(g::text || '499.3') || md5(g::text || '499.4') || md5(g::text || '499.5') || md5(g::text || '499.6') || md5(g::text || '499.7') || md5(g::text || '499.8') || md5(g::text || '499.9') || md5(g::text || '499.10') || md5(g::text || '499.11') || md5(g::text || '499.12') || md5(g::text || '499.13') || md5(g::text || '499.14') || md5(g::text || '499.15') || md5(g::text || '499.16') || md5(g::text || '499.17') || md5(g::text || '499.18') || md5(g::text || '499.19') || md5(g::text || '499.20') || md5(g::text || '499.21') || md5(g::text || '499.22') FROM generate_series(7, 9) g
+commit w6
+open w7 write
+on w7 CREATE TABLE t2 (id i64 PRIMARY KEY, c1 text, c2 text, c3 text)
+commit w7
+check

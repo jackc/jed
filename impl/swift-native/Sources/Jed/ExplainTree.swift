@@ -20,10 +20,13 @@ internal final class ExplainTree {
     let options: SQLExplain
     let parameters: [SQLValue]?
     let context: ExpressionContext
+    let useUnregisteredCTEPlans: Bool
     private var bindings: [ObjectIdentifier: ExplainNode] = [:]
     private var inlineReferences: [ObjectIdentifier: Bool] = [:]
-    init(options: SQLExplain, parameters: [SQLValue]?, context: ExpressionContext) {
+    init(options: SQLExplain, parameters: [SQLValue]?, context: ExpressionContext,
+         useUnregisteredCTEPlans: Bool = true) {
         self.options = options; self.parameters = parameters; self.context = context
+        self.useUnregisteredCTEPlans = useUnregisteredCTEPlans
     }
     func register(_ binding: CTEBinding, body: ExplainNode, inlineAtReference: Bool? = nil) {
         let identity = ObjectIdentifier(binding)
@@ -54,12 +57,26 @@ internal final class ExplainTree {
             markRoot(result, plan); return result
         }
         if let compound = plan.compound { return try compoundQuery(plan, compound) }
+        // Execution addresses grouping keys in sparse source slots. The plan
+        // text exposes the compact grouped row, followed by window slots.
+        func outputColumn(_ slot: Int) -> Int {
+            let physical = plan.window?.slot(slot) ?? slot
+            guard let aggregate = plan.aggregation else { return physical }
+            if physical < 0 { return aggregate.keys.count + aggregate.calls.count - physical - 1 }
+            if let key = aggregate.keyColumns.firstIndex(of: physical) { return key }
+            if physical >= aggregate.layoutWidth { return aggregate.keys.count + physical - aggregate.layoutWidth }
+            return physical
+        }
         let model = PlanCardinality(table: plan.sourceTable, snapshot: plan.sourceSnapshot,
-                                   parameters: parameters, collatedKey: context.collatedKey)
+                                   parameters: parameters, collatedKey: context.collatedKey, planningProbe: context.planningProbe)
         var node: ExplainNode
         if let override {
             node = ExplainNode("Scan " + (plan.sourceTable?.name.description ?? "source"), rows: override.rows,
                 cost: override.cost, logicalRows: override.logicalRows)
+        } else if let selected = plan.chosenNWay {
+            node = try nway(selected, plan: plan)
+        } else if let selected = plan.chosenJoin {
+            node = try join(selected, plan: plan)
         } else if let candidate = plan.chosenAccess {
             node = try scan(candidate, touched: plan.touched)
         } else if let relation = plan.relation { node = try source(relation, touched: Set(plan.touched), offset: 0) }
@@ -68,32 +85,37 @@ internal final class ExplainTree {
                             snapshot: plan.sourceSnapshot, filter: nil)
         } else { node = ExplainNode("Result", rows: 1, cost: 0) }
         mark(node, plan, .source)
-        let contradiction = try plan.scan.hasKnownContradiction(parameters: parameters, collatedKey: context.collatedKey)
+        let contradiction = try plan.scan.hasKnownContradiction(parameters: parameters, collatedKey: context.collatedKey, planningProbe: context.planningProbe)
         if contradiction { zero(node) }
         if let limit = plan.limit, plan.relation == nil, plan.aggregation == nil,
            !plan.distinct, plan.distinctOn == nil, plan.order.isEmpty || plan.orderedByScan {
             let target = saturatingAdd(limit, plan.offset)
-            let matching = try model.rows(plan.predicate, input: node.logicalRows)
-            let pulled = target == 0 ? 0 : matching > target
-                ? min(node.rows, QueryEstimate.scale(node.rows, numerator: target, denominator: matching)) : node.rows
+            let pulled = try SelectEstimate.requiredInput(model: model, predicate: plan.predicate,
+                target: target, maximum: node.rows)
             if pulled < node.rows {
                 let prefix = try override?.prefix ?? plan.chosenAccess?.estimate(parameters: parameters, context: context).prefix
-                let pages = prefix?.scanPages ?? max(0, node.cost - node.rows)
-                let height = prefix?.minimumScanPages ?? Int64(plan.store?.tree.height ?? 0)
-                let expectedPages = pulled == 0 ? 0 : min(pages, max(height, QueryEstimate.scale(pages, numerator: pulled, denominator: max(1, node.rows))))
-                let perRow = saturatingAdd(1, prefix?.pointFetchPagesPerRow ?? 0)
-                node.rows = pulled; node.cost = saturatingAdd(QueryEstimate.multiply(pulled, perRow), expectedPages)
+                    ?? PlanEstimate.ScanPrefix(scanPages: max(0, node.cost - node.rows),
+                        minimumScanPages: Int64(plan.store?.tree.height ?? 0), pointFetchPagesPerRow: 0)
+                let perRow = saturatingAdd(1, prefix.pointFetchPagesPerRow)
+                node.rows = pulled
+                node.cost = saturatingAdd(QueryEstimate.multiply(pulled, perRow), prefix.pages(pulling: pulled))
             }
         }
         if plan.orderedByScan, !plan.order.isEmpty {
-            if let index = plan.chosenAccess?.ordered?.definition.index.name {
+            if let index = plan.chosenAccess?.orderedDefinition?.index.name {
                 node.attributes.append("ordered: index order: " + index.description)
             } else {
                 node.attributes.append(plan.relation == nil ? "ordered: pk ordered" + (plan.descending ? " (reverse)" : "") : "ordered: join pk ordered")
             }
         }
         if let predicate = plan.predicate {
-            let logical = try model.rows(predicate, input: node.logicalRows)
+            let logical: Int64
+            if let join = plan.chosenNWay {
+                logical = try join.cardinality(parameters: parameters, context: context).rows(predicate, input: node.logicalRows)
+            } else if let join = plan.chosenJoin {
+                logical = try JoinCardinality(left: join.left, right: join.right, parameters: parameters,
+                    collatedKey: context.collatedKey, planningProbe: context.planningProbe).rows(predicate, input: node.logicalRows)
+            } else { logical = try model.rows(predicate, input: node.logicalRows) }
             let cost = saturatingAdd(node.cost, try expressionCost([predicate], rows: node.rows))
             var attributes = [try condition(predicate, label: "filter", compact: "conjuncts=")]
             if contradiction { attributes.append("contradiction") }
@@ -101,20 +123,20 @@ internal final class ExplainTree {
             mark(node, plan, .filter)
         }
         if let aggregate = plan.aggregation {
-            var count: Int64 = 0
-            for set in aggregate.sets {
-                count = saturatingAdd(count, set.isEmpty ? 1 : model.distinct(set.map { aggregate.keys[$0] }, input: node.rows))
-            }
+            let groups = aggregate.keys.isEmpty ? 1 : model.distinct(aggregate.keys, input: node.rows)
+            var count = QueryEstimate.multiply(groups, Int64(max(1, aggregate.sets.count)))
             var cost = saturatingAdd(node.cost, QueryEstimate.multiply(node.rows, Int64(aggregate.calls.count)))
             cost = saturatingAdd(cost, try expressionCost(aggregate.keys, rows: node.rows))
             for call in aggregate.calls {
                 cost = saturatingAdd(cost, try expressionCost(call.arguments + call.order.map(\.expression) + (call.filter.map { [$0] } ?? []), rows: node.rows))
             }
             var attributes = ["groups=\(aggregate.keys.count) aggs=\(aggregate.calls.count)"]
+            if aggregate.sets.count > 1 { attributes.append("sets=\(aggregate.sets.count)") }
             if let having = aggregate.having {
                 cost = saturatingAdd(cost, try expressionCost([having], rows: count))
                 count = try model.rows(having, input: count)
-                attributes.append(try condition(having, label: "having", compact: "having:conjuncts="))
+                attributes.append(options.verbose ? "having=" + (try ExplainExpression.render(having, column: outputColumn))
+                    : "having:conjuncts=" + String(QueryEstimate.conjuncts(having).count))
             }
             node = ExplainNode("Aggregate", attributes, rows: count, cost: cost, children: [node])
             mark(node, plan, .aggregate)
@@ -137,7 +159,11 @@ internal final class ExplainTree {
             let keys = plan.order.map(\.expression)
             let cost = saturatingAdd(node.cost, try expressionCost(keys, rows: node.rows))
             var detail = "keys=\(plan.order.count)"
-            if let limit = plan.limit, !plan.distinct, plan.distinctOn == nil { detail += ", top-k=\(saturatingAdd(limit, plan.offset))" }
+            if let limit = plan.limit, !plan.distinct, plan.distinctOn == nil,
+               plan.aggregation == nil, plan.window == nil {
+                let (count, overflow) = plan.offset.addingReportingOverflow(limit)
+                if limit == 0 || !overflow { detail += ", top-k=\(limit == 0 ? 0 : count)" }
+            }
             node = ExplainNode("Sort", [detail], rows: node.rows, cost: cost, children: [node])
             mark(node, plan, .sort)
         }
@@ -155,7 +181,7 @@ internal final class ExplainTree {
         }
         if !projected { node.cost = saturatingAdd(node.cost, try expressionCost(plan.projections, rows: node.rows)) }
         node.cost = saturatingAdd(node.cost, node.rows)
-        if options.verbose { node.attributes.append("output=[" + (try plan.projections.map(ExplainExpression.render)).joined(separator: ", ") + "]") }
+        if options.verbose { node.attributes.append("output=[" + (try plan.projections.map { try ExplainExpression.render($0, column: outputColumn) }).joined(separator: ", ") + "]") }
         markRoot(node, plan)
         return node
     }
@@ -189,11 +215,14 @@ internal final class ExplainTree {
         if case .values(_, true) = compound.body { node.cost = saturatingAdd(node.cost, node.rows) }
         markRoot(node, plan); return node
     }
-    private func source(_ plan: RelationPlan, touched: Set<Int>, offset: Int) throws -> ExplainNode {
+    func source(_ plan: RelationPlan, touched: Set<Int>, offset: Int) throws -> ExplainNode {
         var node: ExplainNode
         var touched = touched
-        if case .join(_, _, _, let predicate) = plan.body, let predicate {
-            StoredExpressionDependencies.walk([predicate]) { if case .column(let column) = $0.node { touched.insert(offset + column) } }
+        if case .join(_, let right, _, let predicate) = plan.body {
+            if let predicate {
+                StoredExpressionDependencies.walk([predicate]) { if case .column(let column) = $0.node { touched.insert(offset + column) } }
+            }
+            touched.formUnion(right.lateralColumns.filter { $0 >= plan.precedingWidth }.map { offset + $0 - plan.precedingWidth })
         }
         switch plan.body {
         case .base(let store):
@@ -203,14 +232,17 @@ internal final class ExplainTree {
             node = try scan(table: table, store: store, bound: bound, touched: local, snapshot: plan.sourceSnapshot, filter: nil)
         case .derived(let body, _), .lateralDerived(let body, _):
             let child = try query(body)
-            let label = plan.columns.first?.qualifier?.description
+            let label = plan.subqueryAlias?.description
             node = ExplainNode("Subquery" + (label.map { " " + $0 } ?? ""), rows: child.rows, cost: child.cost, children: [child])
         case .cte(let reference):
             let binding = reference.binding
-            if reference.selfReference { node = ExplainNode("CTE Scan " + binding.name.description, rows: 0, cost: 0) }
+            if reference.selfReference || !useUnregisteredCTEPlans && bindings[ObjectIdentifier(binding)] == nil {
+                node = ExplainNode("CTE Scan " + binding.name.description, rows: 0, cost: 0)
+            }
             else {
                 let child: ExplainNode
-                if let existing = bindings[ObjectIdentifier(binding)] { child = existing }
+                if let inline = reference.inlinePlan { child = try query(inline) }
+                else if let existing = bindings[ObjectIdentifier(binding)] { child = existing }
                 else if let body = binding.plan { child = try query(body) }
                 else { throw JedError("XX000", "CTE estimate has no definition") }
                 node = ExplainNode("CTE Scan " + binding.name.description, rows: child.rows,
@@ -231,54 +263,86 @@ internal final class ExplainTree {
             node = ExplainNode("Catalog Scan " + system.kind.rawValue, ["db=" + system.sourceDomain.description], rows: count, cost: count)
         case .join(let left, let right, let kind, let predicate):
             let physical = JoinPlan.choose(left: left, right: right, kind: kind, predicate: predicate)
-            let a = try source(left, touched: touched, offset: offset), b = try source(right, touched: touched, offset: offset + left.columns.count)
+            let residual = plan.effectiveOn
+            let a = try source(left, touched: touched, offset: offset)
+            let rightNode = try source(right, touched: touched, offset: offset + left.columns.count)
+            let b = plan.repeatsRight ? repeatedSource(rightNode, times: a.rows) : rightNode
             let outer = physical.swapped ? b : a, inner = physical.swapped ? a : b
-            let model = JoinCardinality(left: left, right: right, parameters: parameters, collatedKey: context.collatedKey)
-            let product = QueryEstimate.multiply(a.rows, b.rows)
-            var count = try model.rows(predicate, input: product)
+            let model = JoinCardinality(left: left, right: right, parameters: parameters, collatedKey: context.collatedKey, planningProbe: context.planningProbe)
+            let product = QueryEstimate.multiply(a.rows, rightNode.rows)
+            var count = try model.rows(residual, input: product)
             if kind == "left" { count = max(count, a.rows) }
-            if kind == "right" { count = max(count, b.rows) }
-            if kind == "full" { count = max(count, max(a.rows, b.rows)) }
+            if kind == "right" { count = max(count, rightNode.rows) }
+            if kind == "full" { count = max(count, max(a.rows, rightNode.rows)) }
             var detail = [kind], label = "Nested Loop", cost = saturatingAdd(a.cost, b.cost)
             switch physical.algorithm {
-            case .nested: cost = saturatingAdd(cost, try expressionCost(predicate.map { [$0] } ?? [], rows: product))
+            case .nested: cost = saturatingAdd(cost, try expressionCost(residual.map { [$0] } ?? [], rows: product))
             case .hash(let keys):
                 label = "Hash Join"; detail.append("keys=\(keys.count)")
                 let width = keys.reduce(Int64(0)) { saturatingAdd($0, Int64(max(1, ValueCodec.fixedWidth($1.type.type) ?? 1))) }
                 let hash = QueryEstimate.multiply(saturatingAdd(a.rows, b.rows), width)
                 let check = QueryEstimate.multiply(count, saturatingAdd(width, Int64(keys.count * 4)))
-                cost = saturatingAdd(cost, saturatingAdd(hash, saturatingAdd(check, try expressionCost(predicate.map { [$0] } ?? [], rows: count))))
+                cost = saturatingAdd(cost, saturatingAdd(hash, saturatingAdd(check, try expressionCost(residual.map { [$0] } ?? [], rows: count))))
             case .indexed(let bound):
                 let input = physical.swapped ? left : right
                 if case .base(let store) = input.body, let table = input.baseTable {
                     let localOffset = physical.swapped ? offset : offset + left.columns.count
                     let local = touched.filter { $0 >= localOffset && $0 < localOffset + input.columns.count }.map { $0 - localOffset }.sorted()
                     let candidate = try scan(table: table, store: store, bound: bound, touched: local, snapshot: input.sourceSnapshot, filter: nil, joining: true)
-                    inner.attributes = candidate.attributes; inner.rows = candidate.rows; inner.cost = candidate.cost
+                    // The correlated bound already applies the join equality.
+                    // Its delivered pairs are not reduced a second time by ON.
+                    count = QueryEstimate.multiply(outer.rows, candidate.rows)
                     cost = saturatingAdd(outer.cost, QueryEstimate.multiply(outer.rows,
-                        saturatingAdd(inner.cost, try expressionCost(predicate.map { [$0] } ?? [], rows: inner.rows))))
-                    count = try model.rows(predicate, input: QueryEstimate.multiply(outer.rows, inner.rows))
+                        saturatingAdd(candidate.cost, try expressionCost(residual.map { [$0] } ?? [], rows: candidate.rows))))
+                    inner.attributes = candidate.attributes
+                    inner.rows = count; inner.logicalRows = count
+                    inner.cost = QueryEstimate.multiply(outer.rows, candidate.cost)
                     if kind == "left" { count = max(count, outer.rows) }
                 }
             }
-            if let predicate { detail.append(try condition(predicate, label: "on", compact: "on:conjuncts=")) }
+            if let residual { detail.append(try condition(residual, label: "on", compact: "on:conjuncts=")) }
             node = ExplainNode(label, detail, rows: count, cost: cost, children: [outer, inner])
         }
         if let filter = plan.scanFilter {
-            let model = PlanCardinality(table: plan.baseTable, snapshot: plan.sourceSnapshot, parameters: parameters, collatedKey: context.collatedKey)
+            let model = PlanCardinality(table: plan.baseTable, snapshot: plan.sourceSnapshot, parameters: parameters, collatedKey: context.collatedKey, planningProbe: context.planningProbe)
             node.cost = saturatingAdd(node.cost, try expressionCost([filter], rows: node.rows))
             node.rows = try model.rows(filter, input: node.logicalRows); node.logicalRows = node.rows
-            node.attributes.append(try condition(filter, label: "filter", compact: "filter:conjuncts="))
+            node.attributes.append(try condition(plan.scanDisplayFilter ?? filter, label: "filter", compact: "filter:conjuncts="))
         }
         let profile = context.executionProfile
         node.actual = { profile?.value(plan, .total) ?? 0 }
         return node
     }
+    private func repeatedSource(_ node: ExplainNode, times: Int64) -> ExplainNode {
+        let copy = ExplainNode(node.name, node.attributes, rows: QueryEstimate.multiply(node.rows, times),
+            cost: QueryEstimate.multiply(node.cost, times), logicalRows: QueryEstimate.multiply(node.logicalRows, times),
+            children: node.children.map { repeatedSource($0, times: times) })
+        copy.actual = node.actual
+        return copy
+    }
     func scan(_ candidate: ScanCandidate, touched: [Int]) throws -> ExplainNode {
         let estimate = try candidate.estimate(parameters: parameters, context: context)
         let node: ExplainNode
-        if let bound = candidate.ordered {
-            var attributes = [bound.bounded || bound.definition.predicate != nil ? "Index bound: using " + bound.definition.index.name.description : "Full scan"]
+        if let intervals = candidate.intervals {
+            var attributes = intervals.explain(table: candidate.table)
+            if !touched.isEmpty { attributes.append("touched=\(touched.count)") }
+            node = ExplainNode("Scan " + candidate.table.name.description, attributes, rows: estimate.rows,
+                cost: estimate.cost, logicalRows: estimate.logicalRows)
+        } else if let bound = candidate.ordered {
+            let access = bound.bounded ? "Index bound: using " + bound.definition.index.name.description
+                : bound.definition.predicate != nil ? "Index scan: using " + bound.definition.index.name.description
+                : "Full scan"
+            var attributes = [access]
+            if !touched.isEmpty { attributes.append("touched=\(touched.count)") }
+            node = ExplainNode("Scan " + candidate.table.name.description, attributes, rows: estimate.rows,
+                cost: estimate.cost, logicalRows: estimate.logicalRows)
+        } else if let gist = candidate.gist {
+            var attributes = ["GiST bound: using " + gist.index.name.description]
+            if !touched.isEmpty { attributes.append("touched=\(touched.count)") }
+            node = ExplainNode("Scan " + candidate.table.name.description, attributes, rows: estimate.rows,
+                cost: estimate.cost, logicalRows: estimate.logicalRows)
+        } else if let gin = candidate.gin {
+            var attributes = ["GIN bound: using " + gin.index.name.description]
             if !touched.isEmpty { attributes.append("touched=\(touched.count)") }
             node = ExplainNode("Scan " + candidate.table.name.description, attributes, rows: estimate.rows,
                 cost: estimate.cost, logicalRows: estimate.logicalRows)
@@ -303,7 +367,7 @@ internal final class ExplainTree {
             let spelled = try terms.map { key, term in
                 let source: String
                 if case .outerColumn = term.source.node { source = joining ? "join" : "outer" }
-                else { source = try ExplainExpression.render(term.source) }
+                else { source = try ExplainExpression.bound(term.source) }
                 return table.columns[key].name.description + " " + term.operation + " " + source
             }.joined(separator: " and ")
             details = [(joining ? "Index-nested-loop " : "") + "PK bound: " + spelled]
@@ -321,7 +385,7 @@ internal final class ExplainTree {
                 pages = selected == 0 ? 0 : min(Int64(store.tree.nodeCount), max(Int64(store.tree.height), pages))
             }
         }
-        if try bound.hasKnownContradiction(parameters: parameters, collatedKey: context.collatedKey) {
+        if try bound.hasKnownContradiction(parameters: parameters, collatedKey: context.collatedKey, planningProbe: context.planningProbe) {
             selected = 0; pages = 0
         }
         if !touched.isEmpty { details.append("touched=\(touched.count)") }
@@ -342,7 +406,7 @@ internal final class ExplainTree {
             case .constant, .column, .outerColumn, .parameter, .convert: own = 0
             case .call(let call): own = saturatingAdd(call.cost, ["nextval", "setval", "timezone"].contains(call.name) ? 1 : 0)
             case .quantified(_, _, _, let array, _):
-                let model = PlanCardinality(table: nil, snapshot: nil, parameters: parameters)
+                let model = PlanCardinality(table: nil, snapshot: nil, parameters: parameters, planningProbe: context.planningProbe)
                 if case .array(let value) = model.known(array) { own = saturatingAdd(1, Int64(value.elements.count)) }
                 else if case .array(let values, _) = array.node { own = saturatingAdd(1, Int64(values.count)) }
                 else { own = 1 }
@@ -367,7 +431,7 @@ internal final class ExplainTree {
     private func zero(_ node: ExplainNode) { node.rows = 0; node.logicalRows = 0; node.cost = 0; for child in node.children { zero(child) } }
     private func series(_ function: TableFunctionPlan) -> Int64? {
         guard function.function.name == "generate_series" else { return nil }
-        let model = PlanCardinality(table: nil, snapshot: nil, parameters: parameters)
+        let model = PlanCardinality(table: nil, snapshot: nil, parameters: parameters, planningProbe: context.planningProbe)
         let args = function.expressions.map(model.known)
         if args.contains(where: { $0?.isNull == true }) { return 0 }
         guard args.count >= 2, case .integer(let start) = args[0], case .integer(let end) = args[1] else { return nil }

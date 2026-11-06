@@ -8,6 +8,12 @@ let package = Package(
         .library(name: "JedCrypto", targets: ["JedCrypto"]),
         .executable(name: "jed-unicode", targets: ["JedUnicode"]),
         .executable(name: "jed-process", targets: ["JedProcess"]),
+        .executable(name: "jed-sim", targets: ["JedSim"]),
+        .executable(name: "jed-interop", targets: ["JedInterop"]),
+        .executable(name: "jed-examples", targets: ["JedExamples"]),
+        .executable(name: "jed-bench", targets: ["JedBench"]),
+        .executable(name: "jed-stress", targets: ["JedStress"]),
+        .executable(name: "jed-check", targets: ["JedCheck"]),
     ],
     dependencies: [
         .package(url: "https://github.com/apple/swift-crypto.git", exact: "5.1.1"),
@@ -21,6 +27,12 @@ let package = Package(
         .target(name: "JedUnicodeCompiler", dependencies: ["Jed"]),
         .executableTarget(name: "JedUnicode", dependencies: ["JedUnicodeCompiler"]),
         .executableTarget(name: "JedProcess", dependencies: ["Jed"]),
+        .executableTarget(name: "JedSim", dependencies: ["Jed"]),
+        .executableTarget(name: "JedInterop", dependencies: ["Jed"]),
+        .executableTarget(name: "JedExamples", dependencies: ["Jed"], path: "Examples"),
+        .executableTarget(name: "JedBench", dependencies: ["Jed"]),
+        .executableTarget(name: "JedStress", dependencies: ["Jed"]),
+        .executableTarget(name: "JedCheck", dependencies: ["Jed"]),
         .target(
             name: "JedCrypto",
             dependencies: [

@@ -47,18 +47,22 @@ internal final class PageServiceConnection: Sendable {
     private let outbound = NSLock()
     private let notice: @Sendable (UInt8, UInt64) -> Void
     private let disconnected: @Sendable () -> Void
+    private let synchronousDisconnect: Bool
 
     private init(socket: any ServiceFrameTransport, hello: ServiceHelloReply,
                  notice: @escaping @Sendable (UInt8, UInt64) -> Void,
-                 disconnected: @escaping @Sendable () -> Void) {
+                 disconnected: @escaping @Sendable () -> Void, synchronousDisconnect: Bool) {
         self.socket = socket; self.hello = hello; self.notice = notice; self.disconnected = disconnected
+        self.synchronousDisconnect = synchronousDisconnect
     }
     static func open(socket: any ServiceFrameTransport, hello request: ServiceHello,
                      deadline: ContinuousClock.Instant,
                      notice: @escaping @Sendable (UInt8, UInt64) -> Void = { _, _ in },
-                     disconnected: @escaping @Sendable () -> Void = {}) throws -> PageServiceConnection {
+                     disconnected: @escaping @Sendable () -> Void = {}, synchronousDisconnect: Bool = false) throws -> PageServiceConnection {
+        // A duplex stream need not buffer writes. Read the peer's hello while
+        // our hello write waits for that peer to finish handling it.
+        let outgoing = ServiceOpeningWrite(socket: socket, hello: request, deadline: deadline)
         do {
-            try socket.send(ServiceFrame(request: 1, message: .hello(request)), pageSize: 0, deadline: deadline)
             guard let frame = try socket.readFrame(pageSize: 0, deadline: deadline), frame.request == 1 else {
                 throw JedError("08006", "page-service hello ended without its reply")
             }
@@ -74,11 +78,13 @@ internal final class PageServiceConnection: Sendable {
                   reply.maxReadPages <= PageServiceProtocol.readLimit(pageSize: Int(reply.pageSize)) else {
                 throw PageServiceProtocol.violation("invalid hello limits")
             }
-            let result = PageServiceConnection(socket: socket, hello: reply, notice: notice, disconnected: disconnected)
+            let result = PageServiceConnection(socket: socket, hello: reply, notice: notice, disconnected: disconnected,
+                synchronousDisconnect: synchronousDisconnect)
             Thread.detachNewThread { result.receive() }
+            try outgoing.wait()
             return result
         } catch {
-            socket.close()
+            socket.close(); try? outgoing.wait(); socket.readerFinished()
             if let error = error as? JedError, error.code == "08006", !socket.diagnostic.isEmpty {
                 throw JedError("08006", error.message + ": " + socket.diagnostic)
             }
@@ -141,6 +147,7 @@ internal final class PageServiceConnection: Sendable {
         return JedError("08006", "page-service connection failed")
     }
     private func receive() {
+        defer { socket.readerFinished() }
         do {
             while let frame = try socket.readFrame(pageSize: Int(hello.pageSize)) {
                 if frame.request == 0, case .notice(let kind, let connection) = frame.message {
@@ -172,9 +179,27 @@ internal final class PageServiceConnection: Sendable {
         socket.close()
         // Notification may initiate re-election, which must not recursively
         // acquire an outbound lock still held by a failed sender.
-        Thread.detachNewThread { [disconnected] in disconnected() }
+        if synchronousDisconnect { disconnected() }
+        else { Thread.detachNewThread { [disconnected] in disconnected() } }
     }
     func close() { fail(JedError("08006", "page-service connection is closed")) }
     deinit { socket.close() }
+}
+/// One bounded opening write, joined on both success and failure. An error
+/// closes the transport so the caller's hello read cannot remain blocked.
+private final class ServiceOpeningWrite: @unchecked Sendable {
+    private let condition = NSCondition()
+    private var result: Result<Void, Error>?
+    init(socket: any ServiceFrameTransport, hello: ServiceHello, deadline: ContinuousClock.Instant) {
+        Thread.detachNewThread {
+            let result = Result { try socket.send(ServiceFrame(request: 1, message: .hello(hello)), pageSize: 0, deadline: deadline) }
+            if case .failure = result { socket.close() }
+            self.condition.lock(); self.result = result; self.condition.broadcast(); self.condition.unlock()
+        }
+    }
+    func wait() throws {
+        condition.lock(); while result == nil { condition.wait() }
+        let completed = result!; condition.unlock(); try completed.get()
+    }
 }
 #endif

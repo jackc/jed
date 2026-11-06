@@ -228,7 +228,10 @@ internal final class SQLParser {
             if case .with = body.body { throw syntax("multiple WITH clauses not allowed") }
             return SQLQuery(body: .with(bindings, body), span: span(start))
         }
-        var result = try setExpression(intersection: false)
+        return try finishQuery(setExpression(intersection: false), start: start)
+    }
+    private func finishQuery(_ initial: SQLQuery, start: Int) throws -> SQLQuery {
+        var result = initial
         if eat("order") {
             if !result.orderBy.isEmpty { throw syntax("multiple ORDER BY clauses not allowed") }
             try expect("by"); result.orderBy = try orderTerms()
@@ -268,21 +271,22 @@ internal final class SQLParser {
             var body = try query(); try expectSymbol(")")
             body.span = span(start); return body
         }
-        if eat("values") {
-            intoAllowed = false
-            var rows: [[SQLExpression]] = []
-            repeat {
-                try expectSymbol("(")
-                var row: [SQLExpression] = []
-                repeat {
-                    if word() == "default" && (symbol(",", 1) || symbol(")", 1)) { throw syntax("DEFAULT is not allowed in this context") }
-                    row.append(try expression())
-                } while eatSymbol(",")
-                try expectSymbol(")"); rows.append(row)
-            } while eatSymbol(",")
-            return SQLQuery(body: .values(rows), span: span(start))
-        }
+        if eat("values") { return try valuesOperand(start: start) }
         return SQLQuery(body: .select(try select()), span: span(start))
+    }
+    private func valuesOperand(start: Int) throws -> SQLQuery {
+        intoAllowed = false
+        var rows: [[SQLExpression]] = []
+        repeat {
+            try expectSymbol("(")
+            var row: [SQLExpression] = []
+            repeat {
+                if word() == "default" && (symbol(",", 1) || symbol(")", 1)) { throw syntax("DEFAULT is not allowed in this context") }
+                row.append(try expression())
+            } while eatSymbol(",")
+            try expectSymbol(")"); rows.append(row)
+        } while eatSymbol(",")
+        return SQLQuery(body: .values(rows), span: span(start))
     }
     func select() throws -> SQLSelect {
         try expect("select")
@@ -380,7 +384,10 @@ internal final class SQLParser {
         return .set([try expression()])
     }
     func fromItem() throws -> SQLFrom {
-        var left = try tableReference()
+        return try finishFromItem(tableReference())
+    }
+    private func finishFromItem(_ initial: SQLFrom) throws -> SQLFrom {
+        var left = initial
         while ["join", "inner", "left", "right", "full", "cross", "natural"].contains(word()) {
             let natural = eat("natural")
             var kind = "inner"
@@ -418,6 +425,9 @@ internal final class SQLParser {
         } else if word() == "json_table" && symbol("(", 1) { source = .jsonTable(try jsonTable()) }
         else if isIdentifier() && symbol("(", 1) { source = .function(try functionCall()) }
         else { source = .table(try qualifiedName()) }
+        return try finishTableReference(source, start: start, referenceDepth: referenceDepth, lateral: lateral)
+    }
+    private func finishTableReference(_ source: SQLFrom.Source, start: Int, referenceDepth: Int, lateral: Bool) throws -> SQLFrom {
         var result = SQLFrom(source: source, lateral: lateral, span: span(start), parserDepth: referenceDepth)
         let explicit = eat("as")
         if explicit && symbol("(") {

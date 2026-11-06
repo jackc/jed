@@ -497,9 +497,9 @@ extension SQLParser {
     func assignmentList() throws -> [SQLAssignment] {
         var result: [SQLAssignment] = []
         repeat {
-            let name = try identifier(); try expectSymbol("=")
+            let position = sourcePosition(cursor), name = try identifier(); try expectSymbol("=")
             let value = try eat("default") ? nil : expression()
-            result.append(SQLAssignment(column: name, value: value))
+            result.append(SQLAssignment(column: name, value: value, position: position))
         } while eatSymbol(",")
         return result
     }
@@ -531,7 +531,14 @@ extension SQLParser {
         let parenQuery = symbol("(", 1) || withStart(at: cursor + 1)
             || (word(1) == "values" && symbol("(", 2))
             || (word(1) == "select" && !symbol(",", 2) && !symbol(")", 2))
-        if symbol("(") && !parenQuery { advance(); columns = try identifierList() }
+        var columnPositions: [Int] = []
+        if symbol("(") && !parenQuery {
+            advance()
+            repeat {
+                columnPositions.append(sourcePosition(cursor)); columns.append(try identifier())
+            } while eatSymbol(",")
+            try expectSymbol(")")
+        }
         let override = try overriding()
         let source: SQLInsert.Source
         if eat("default") {
@@ -545,6 +552,7 @@ extension SQLParser {
             source = .query(try query())
         }
         var result = SQLInsert(table: table, alias: alias, columns: columns, overriding: override, source: source)
+        result.columnPositions = columnPositions
         if eat("on") { try expect("conflict"); result.conflict = try conflict() }
         result.returning = try returning(); return result
     }

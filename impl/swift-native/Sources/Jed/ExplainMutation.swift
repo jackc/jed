@@ -2,7 +2,10 @@ extension ExplainTree {
     func mutation(_ preparation: MutationExecutor.Preparation) throws -> ExplainNode {
         let node: ExplainNode
         switch preparation {
+        case .merge(let plan):
+            node = try merge(plan)
         case .insert(let plan):
+            if let error = plan.sourceValidationError { throw error }
             let child: ExplainNode
             if let source = plan.sourcePlan { child = try query(source) }
             else { child = ExplainNode("Values", ["rows=\(plan.slots.count)"], rows: Int64(plan.slots.count), cost: 0) }
@@ -17,8 +20,8 @@ extension ExplainTree {
             child.actual = { profile?.value(identity, .source) ?? 0 }
             if let predicate = plan.accessPredicate {
                 let model = PlanCardinality(table: plan.relation.table, snapshot: plan.read,
-                                           parameters: parameters, collatedKey: context.collatedKey)
-                let contradiction = try plan.scan.hasKnownContradiction(parameters: parameters, collatedKey: context.collatedKey)
+                                           parameters: parameters, collatedKey: context.collatedKey, planningProbe: context.planningProbe)
+                let contradiction = try plan.scan.hasKnownContradiction(parameters: parameters, collatedKey: context.collatedKey, planningProbe: context.planningProbe)
                 let count = contradiction ? 0 : try model.rows(predicate, input: plan.relation.table.rowCount)
                 var attributes = [try condition(predicate, label: "filter", compact: "conjuncts=")]
                 if contradiction { attributes.append("contradiction") }

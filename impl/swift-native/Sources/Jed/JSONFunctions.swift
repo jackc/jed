@@ -469,9 +469,23 @@ internal enum JSONFunctions {
         }
     }
 
+    /// Preflight session-zone work before a JSON render, including nested values.
+    static func zoneCount(_ value: SQLValue) -> Int64 {
+        switch value {
+        case .timestamptz(let n): return n == .min || n == .max ? 0 : 1
+        case .array(let array): return array.elements.reduce(0) { saturatingAdd($0, zoneCount($1)) }
+        case .composite(let fields): return fields.reduce(0) { saturatingAdd($0, zoneCount($1)) }
+        case .range(let range): return saturatingAdd(range.lower.map(zoneCount) ?? 0, range.upper.map(zoneCount) ?? 0)
+        default: return 0
+        }
+    }
+
     static func build(_ values: [SQLValue], types: [TypeDescriptor], object: Bool, binary: Bool,
                       constant: Bool, meter: CostMeter, scalarRender: ScalarRenderer) throws -> SQLValue {
         guard values.count == types.count else { throw JedError("XX000", "builder descriptor count mismatch") }
+        meter.charge(Int64(values.count))
+        meter.charge(values.reduce(Int64(0)) { saturatingAdd($0, zoneCount($1)) })
+        try meter.guardCost()
         if object && values.count % 2 != 0 { throw JedError("22023", "argument list must have even number of elements") }
         let result: SQLValue
         if object {

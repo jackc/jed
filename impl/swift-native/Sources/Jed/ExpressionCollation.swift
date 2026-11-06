@@ -37,7 +37,7 @@ internal enum CollationDerivation: Equatable {
     /// Comparisons demand a determined collation even for byte-identity equality.
     func comparisonName() throws -> SQLText? {
         switch self {
-        case .indeterminate, .conflicted: throw JedError("42P22", "could not determine which collation to use for string comparison")
+        case .indeterminate, .conflicted: throw JedError("42P22", "could not determine which collation to use for string comparison").hinted(ErrorHints.indeterminateCollation)
         default: return name
         }
     }
@@ -45,7 +45,7 @@ internal enum CollationDerivation: Equatable {
     /// reading a conflicted synthetic column still diagnoses missing collation.
     func orderingName() throws -> SQLText? {
         if case .indeterminate(let a, let b) = self {
-            throw JedError("42P21", "collation mismatch between implicit collations \"\(a)\" and \"\(b)\"")
+            throw JedError("42P21", "collation mismatch between implicit collations \"\(a)\" and \"\(b)\"").hinted(ErrorHints.implicitCollation)
         }
         return try comparisonName()
     }
@@ -105,7 +105,7 @@ extension ExpressionResolver {
             result.node = .quantified(op, all: all, a, array, type)
         case .extreme(let values, _):
             if ExpressionCollation.collatable(result.type?.type) { result.type?.collation = try demandCollation(values) }
-        case .call(let function) where ["@>", "<@", "&&"].contains(function.name):
+        case .call(let function) where ["@>", "<@", "&&"].contains(function.name) || function.name == "width_bucket" && function.arguments.count == 2:
             _ = try demandCollation(function.arguments)
         default: break
         }

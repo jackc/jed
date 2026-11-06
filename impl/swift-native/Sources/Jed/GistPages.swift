@@ -21,8 +21,8 @@ internal extension GistTree {
             guard root.tag.allSatisfy({ $0 == 0 }) else { throw JedError.corruption("nonzero empty GiST root tag") }
             return GistOpen(tree: GistTree(opclasses: opclasses, root: nil), pages: [])
         }
-        var visited: Set<UInt32> = [], pages: [UInt32] = [], allEntries: [GistEntry] = []
-        func visit(_ reference: PageReference, depth: Int) throws -> GistNode {
+        var visited: Set<UInt32> = [], pages: [UInt32] = [], leafKeys: [[UInt8]] = []
+        func visit(_ reference: PageReference, depth: Int) throws {
             guard depth <= maximumDepth, reference.index >= codec.firstBodyPage,
                   reference.index < pageCount, reference.tag.count == tagLength,
                   visited.insert(reference.index).inserted else {
@@ -36,57 +36,29 @@ internal extension GistTree {
                 throw JedError.corruption("invalid GiST page header or checksum")
             }
             let leaf = bytes[0] == 5, count = Int(try PageEnvelope.readU32(bytes, at: 4))
-            guard count > 0, count <= fanout else { throw JedError.corruption("invalid GiST fanout") }
-            var reader = ByteReader(bytes[16...]), entries: [GistEntry] = [], children: [GistNode] = []
-            var storedBounds: [[GistBound]] = [], childReferences: [PageReference] = []
+            guard count <= codec.capacity / (leaf ? 4 : 6 + tagLength) else {
+                throw JedError.corruption("GiST item count overruns page")
+            }
+            var reader = ByteReader(bytes[16...]), children: [PageReference] = []
             for _ in 0..<count {
-                let size = Int(try reader.u16())
-                var boundReader = ByteReader(try reader.take(size))
-                let bound = try GistTuple.decode(&boundReader, ops: opclasses, leaf: leaf)
-                try boundReader.requireEnd()
+                let boundSize = Int(try reader.u16()), bound = Array(try reader.take(boundSize))
                 if leaf {
-                    let keySize = Int(try reader.u16())
-                    guard keySize > 0 else { throw JedError.corruption("empty GiST row key") }
-                    let entry = GistEntry(bound: bound, storageKey: Array(try reader.take(keySize)))
-                    if let previous = entries.last, try !entryLess(previous, entry, ops: opclasses) {
-                        throw JedError.corruption("GiST leaf entries are not ordered")
-                    }
-                    entries.append(entry)
+                    let keySize = Int(try reader.u16()), key = Array(try reader.take(keySize))
+                    leafKeys.append(bound + key)
                 } else {
-                    let index = try reader.u32(), tag = Array(try reader.take(tagLength))
-                    storedBounds.append(bound); childReferences.append(PageReference(index, tag: tag))
+                    // Open reconstructs the canonical resident tree from leaf
+                    // entries. Persisted routing-bound agreement belongs to the
+                    // host integrity operation, which inspects the stored pages.
+                    children.append(PageReference(try reader.u32(), tag: Array(try reader.take(tagLength))))
                 }
             }
-            guard try reader.take(reader.remaining).allSatisfy({ $0 == 0 }) else {
-                throw JedError.corruption("nonzero GiST page padding")
-            }
-            let node: GistNode
-            if leaf {
-                allEntries.append(contentsOf: entries)
-                node = try GistNode(entries: entries, opclasses: opclasses)
-            } else {
-                for (index, reference) in childReferences.enumerated() {
-                    let child = try visit(reference, depth: depth + 1)
-                    // Canonical pages carry the exact subtree union. Comparing
-                    // values permits equivalent decimal representations while
-                    // rejecting a narrowed bound that could hide matching rows.
-                    guard try GistTuple.compare(storedBounds[index], child.bound, ops: opclasses) == 0 else {
-                        throw JedError.corruption("GiST interior bound differs from its subtree union")
-                    }
-                    if let previous = children.last, try !childLess(previous, child, ops: opclasses) {
-                        throw JedError.corruption("GiST child entries are not ordered")
-                    }
-                    children.append(child)
-                }
-                node = try GistNode(children: children, opclasses: opclasses)
-            }
+            for child in children { try visit(child, depth: depth + 1) }
             pages.append(reference.index)
-            return node
         }
-        _ = try visit(root, depth: 1)
+        try visit(root, depth: 1)
         // The same rebuild is used on open and after statement mutation. An
         // incidental persisted shape cannot change deterministic descent costs.
-        let tree = try build(opclasses: opclasses, entries: allEntries)
+        let tree = try build(opclasses: opclasses, leafKeys: leafKeys)
         return GistOpen(tree: tree, pages: pages)
     }
 

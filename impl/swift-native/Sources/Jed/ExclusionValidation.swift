@@ -19,7 +19,8 @@ internal struct ExclusionValidation {
     init(table: CatalogTable, definition: CatalogExclusion, snapshot: DomainSnapshot,
          settings: SessionSettings, context: ExpressionContext) throws {
         guard let index = table.indexes.first(where: { $0.name == definition.index }) else { throw JedError.corruption("missing exclusion backing index") }
-        self.table = table; self.definition = definition; self.settings = settings
+        self.table = table; self.definition = definition
+        self.settings = context.errorDetail?.settings ?? settings
         plan = try StoredIndexPlan.resolve(table: table, index: index, snapshot: snapshot, settings: settings, context: context)
         strategies = definition.elements.map { $0.strategy == 0 ? .overlaps : .equal }
     }

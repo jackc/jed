@@ -36,6 +36,10 @@ internal struct WindowQueryPlan {
             guard row.indices.contains(at) else { throw JedError("XX000", "window column is outside the synthetic row") }
             return row[at]
         }
+        current.hostBatchColumn = { index in
+            let at = slot(index)
+            return row.indices.contains(at) ? row[at] : nil
+        }
         return current
     }
 }
@@ -94,6 +98,20 @@ internal final class WindowQueryBuilder {
         guard base.frame == nil else { throw JedError("42P20", "cannot copy a window with a frame clause") }
         return SQLWindow(partitionBy: base.partitionBy, orderBy: base.orderBy.isEmpty ? definition.orderBy : base.orderBy, frame: definition.frame)
     }
+    func beginOrderExpression() { cached = [:]; reuseResults = false }
+    func restorePoint() -> () -> Void {
+        let savedCalls = calls, savedKeys = keys, savedCache = cached
+        return { self.calls = savedCalls; self.keys = savedKeys; self.cached = savedCache }
+    }
+    func sameColumn(_ left: Int, _ right: Int) -> Bool {
+        if left == right { return true }
+        let a = left - WindowQueryPlan.resultBase, b = right - WindowQueryPlan.resultBase
+        guard calls.indices.contains(a), calls.indices.contains(b) else { return false }
+        return (try? equivalent(calls[a], calls[b])) == true
+    }
+    func sameKey(_ left: ResolvedExpression, _ right: ResolvedExpression) -> Bool {
+        ExpressionIdentity.same(left, right, columns: sameColumn)
+    }
     private func equivalent(_ a: ResolvedWindow, _ b: ResolvedWindow) throws -> Bool {
         func expressions(_ left: [ResolvedExpression], _ right: [ResolvedExpression]) -> Bool {
             left.count == right.count && zip(left, right).allSatisfy { ExpressionIdentity.same($0, $1) }
@@ -149,7 +167,7 @@ internal final class WindowQueryBuilder {
             let (slot, expression) = try key(syntax.expression)
             var type = expression.type ?? TypeDescriptor(.scalar(.text))
             type.collation = try ExpressionCollation.derive(expression).orderingName()
-            try TypeRules.comparable(type.type, type.type)
+            try ResolutionDiagnostics.comparable(type.type, at: syntax.expression.expressionLocation, ordering: true)
             order.append(WindowOrder(slot: slot, type: type, descending: syntax.descending, nullsFirst: syntax.nullsFirst ?? syntax.descending))
         }
         let frame: WindowFrame?
@@ -177,7 +195,7 @@ internal final class WindowQueryBuilder {
         }
         func requireInteger(_ value: ResolvedExpression) throws {
             if let type = value.type, ![SQLType.scalar(.i16), .scalar(.i32), .scalar(.i64)].contains(type.type) {
-                throw JedError("42804", "window count or offset must be integer")
+                throw JedError("42804", "window count or offset must be integer").hinted(ErrorHints.function).at(0)
             }
         }
         var arguments: [ResolvedExpression] = [], plan: AggregatePlan?
@@ -201,7 +219,7 @@ internal final class WindowQueryBuilder {
                 if let actual = fallback.type {
                     guard let target = value.type, actual.type == target.type ||
                         ([SQLType.scalar(.i16), .scalar(.i32), .scalar(.i64)].contains(actual.type) && [SQLType.scalar(.i16), .scalar(.i32), .scalar(.i64)].contains(target.type)) else {
-                        throw JedError("42804", "window default must match the value type")
+                        throw JedError("42804", "window default must match the value type").hinted(ErrorHints.function).at(0)
                     }
                     if actual != target { fallback = ResolvedExpression(type: target, node: .convert(fallback, target), position: fallback.position, collation: fallback.collation) }
                 }
@@ -213,7 +231,7 @@ internal final class WindowQueryBuilder {
             let value = try argument(0); arguments = [value]; type = value.type
             if name == "nth_value" { let count = try argument(1); try requireInteger(count); arguments.append(count) }
         default:
-            guard aggregate else { throw JedError("42883", "function is not a window function: \(name)") }
+            guard aggregate else { throw JedError("42883", "function is not a window function: \(name)").hinted(GeneratedSpec.functions.contains { $0.name == name } ? nil : ErrorHints.function) }
             if call.star && name != "count" { throw JedError("42601", "* is only valid in COUNT") }
             for index in call.arguments.indices { arguments.append(try argument(index)) }
             if name == "string_agg", arguments.count == 2 {
@@ -226,7 +244,7 @@ internal final class WindowQueryBuilder {
             }
             if name == "array_agg", arguments.first?.type == nil { throw JedError("42725", "aggregate input type is ambiguous") }
             var types = arguments.map { $0.type ?? TypeDescriptor(.scalar(.text)) }
-            if ["min", "max"].contains(name), !types.isEmpty { types[0].collation = try ExpressionCollation.derive(arguments[0]).orderingName() }
+            if ["min", "max"].contains(name), !types.isEmpty { types[0].collation = try ExpressionCollation.derive(arguments[0]).comparisonName() }
             plan = try AggregatePlan.resolve(name: name, inputTypes: types, star: call.star)
             type = plan!.resultType
         }
@@ -244,7 +262,7 @@ internal final class WindowQueryBuilder {
         catch { resolver.resolveAggregate = aggregateCollector; throw error }
         resolver.resolveAggregate = aggregateCollector
         if let filter {
-            if let type = filter.type, type.type != .scalar(.boolean) { throw JedError("42804", "FILTER requires a boolean expression") }
+            if let type = filter.type, type.type != .scalar(.boolean) { throw JedError("42804", "FILTER requires a boolean expression").at(filter.location) }
             try validateGrouped?(filter)
         }
         try resolver.checkFunction?(call.name)

@@ -8,9 +8,21 @@ require_relative "../../impl/swift-native/Tools/swift_task"
 require_relative "../../impl/swift-native/Tools/generate_spec"
 require "digest"
 require "tmpdir"
-SwiftSpecGenerator.run(["--check"])
 configuration = ENV.fetch("usage_configuration", "debug")
 abort "configuration must be debug or release" unless %w[debug release].include?(configuration)
+cores = ENV.fetch("JED_PROCESS_CORES", "swift-native").split(",", -1)
+allowed = %w[swift-native rust go node]
+unless cores.include?("swift-native") && cores.uniq == cores && (cores - allowed).empty?
+  abort "JED_PROCESS_CORES must contain swift-native and unique known cores (swift-native,rust,go,node)"
+end
+corpus = File.join(SwiftNativeTasks::PACKAGE, "Tools/Fixtures/Process")
+scenarios = Dir.glob("*.process.toml", base: corpus).sort
+abort "frozen process inventory must contain 31 scenarios" unless scenarios.length == 31
+filter = ENV["JED_PROCESS_FILTER"]
+selected = scenarios.select { filter.nil? || _1.include?(filter) }
+abort "JED_PROCESS_FILTER selects no frozen scenario" if selected.empty?
+SwiftSpecGenerator.run(["--check"])
+warn "Frozen process selection: #{selected.length}/#{scenarios.length} scenarios, #{selected.length * cores.length * cores.length} ordered pairings"
 unless ENV["usage_no_build"] == "true"
   env, command = SwiftNativeTasks.command("build", configuration: configuration, extra: ["--product", "jed-process"])
   exit($?&.exitstatus || 1) unless system(env, *command, chdir: SwiftNativeTasks::PACKAGE)
@@ -18,8 +30,8 @@ end
 actor = File.join(SwiftNativeTasks::BUILD, configuration, "jed-process")
 abort "native Swift actor is not built: #{actor}" unless File.executable?(actor)
 environment = {
-  "JED_PROCESS_CORES" => ENV.fetch("JED_PROCESS_CORES", "swift-native"),
-  "JED_PROCESS_CORPUS" => File.join(SwiftNativeTasks::PACKAGE, "Tools/Fixtures/Process"),
+  "JED_PROCESS_CORES" => cores.join(","),
+  "JED_PROCESS_CORPUS" => corpus,
   "JED_PROCESS_FIXTURE_ROOT" => File.join(SwiftNativeTasks::PACKAGE, "Tests/JedTests/Fixtures"),
   # Frozen capability lists predate this experiment. Never silently substitute
   # another SQL engine for the selected actor when a capability is missing.

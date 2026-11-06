@@ -1,19 +1,20 @@
 extension ExpressionResolver {
-    func jsonOperation(_ op: String, _ left: SQLExpression, _ right: SQLExpression, position: Int) throws -> ResolvedExpression? {
+    func jsonOperation(_ op: String, _ lhs: Operand, _ rhs: Operand, position: Int) throws -> ResolvedExpression? {
+        let left = lhs.syntax, right = rhs.syntax
         guard ["->", "->>", "#>", "#>>", "@>", "<@", "?", "?|", "?&", "||", "-", "#-", "@?", "@@"].contains(op) else { return nil }
         // Most overloaded operators are arithmetic/text/container expressions.
         // Do not recursively resolve their children merely to reject a JSON
         // candidate: repeated speculative resolution makes long chains grow
         // exponentially before the parser's nesting bound is reached.
         if ["@>", "<@", "||", "-"].contains(op), !mayProduceJSON(left) && !mayProduceJSON(right) { return nil }
-        var a = try resolve(left), b = try resolve(right)
+        var a = try lhs.resolve(), b = try rhs.resolve()
         if op == "||", a.type?.type == .scalar(.json) || b.type?.type == .scalar(.json) { return nil }
         if op == "||", a.type?.type == .scalar(.text) && !FunctionResolver.bareString(left) || b.type?.type == .scalar(.text) && !FunctionResolver.bareString(right) { return nil }
         let access = ["->", "->>", "#>", "#>>"].contains(op)
         let jsonb = TypeDescriptor(.scalar(.jsonb)), text = TypeDescriptor(.scalar(.text)), textArray = TypeDescriptor(.array(.scalar(.text)))
         let jsonType = a.type?.type == .scalar(.json) || a.type?.type == .scalar(.jsonb)
         if ["@>", "<@", "||", "-"].contains(op), !jsonType && b.type?.type != .scalar(.jsonb) { return nil }
-        if a.type == nil || FunctionResolver.bareString(left) { a = try resolve(left, expected: jsonb) }
+        if a.type == nil || FunctionResolver.bareString(left) { a = try lhs.resolve(expected: jsonb) }
         guard a.type?.type == .scalar(.jsonb) || access && a.type?.type == .scalar(.json) else { throw JedError("42883", "JSON operator requires a JSON operand") }
         let wanted: TypeDescriptor
         switch op {
@@ -26,7 +27,7 @@ extension ExpressionResolver {
             else if op == "-", b.type?.type == textArray.type { wanted = textArray }
             else { wanted = text }
         }
-        b = try resolve(right, expected: wanted)
+        b = try rhs.resolve(expected: wanted)
         if wanted.type == .scalar(.i32), case .scalar(let scalar) = b.type?.type, scalar.integerWidth != nil {
             // Index operators narrow their integer operand with a checked cast.
             // Literal adoption already produced i32 without a runtime cast.

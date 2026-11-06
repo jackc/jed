@@ -120,10 +120,84 @@ internal final class AggregateState {
     private var collection: AggregateCollection?
     private var orderedSet: AggregateOrderedSet?
 
-    init(plan: AggregatePlan, context: ExpressionContext) {
+    init(plan: AggregatePlan, context: ExpressionContext, bounded: Bool = false) {
         self.plan = plan; self.context = context
-        if AggregateCollection.names.contains(plan.name) { collection = AggregateCollection(plan: plan, context: context) }
-        if !plan.withinGroup.isEmpty { orderedSet = AggregateOrderedSet(plan: plan, context: context) }
+        if AggregateCollection.names.contains(plan.name) { collection = AggregateCollection(plan: plan, context: context, measured: !bounded) }
+        if !plan.withinGroup.isEmpty { orderedSet = AggregateOrderedSet(plan: plan, context: context, measured: !bounded) }
+    }
+    /// Private finite-state tuple. Its field shape is also the bounded map's
+    /// logical residency measure; retained inputs have a different owner.
+    func packed() -> [SQLValue] {
+        if orderedSet != nil { return [] }
+        if let collection { return collection.packed() }
+        let name = plan.name
+        if ["count", "count_star", "regr_count"].contains(name) { return [.integer(count)] }
+        if AggregateStatistics.pairs.contains(name) {
+            return [moments.count, moments.sumX, moments.squareX, moments.sumY, moments.squareY, moments.cross].map { .f64($0.bitPattern) }
+        }
+        if AggregateStatistics.moments.contains(name) {
+            if plan.resultType.type == .scalar(.f64) {
+                return [moments.count, moments.sumX, moments.squareX].map { .f64($0.bitPattern) }
+            }
+            return [.integer(count), .decimal(sum), .decimal(squares)]
+        }
+        if name == "sum" || name == "avg" {
+            if plan.resultType.type == .scalar(.f32) || plan.resultType.type == .scalar(.f64) {
+                return [.f64(float.total.bitPattern), .integer(float.count), .boolean(float.nan),
+                        .boolean(float.positiveInfinity), .boolean(float.negativeInfinity)]
+            }
+            if name == "avg" { return [.decimal(sum), .integer(count)] }
+            return [plan.resultType.type == .scalar(.i64) ? .integer(integer) : .decimal(sum), .boolean(count > 0)]
+        }
+        return [current]
+    }
+    func restore(_ values: [SQLValue]) throws {
+        let expected = packed().count
+        // Array-of-array state has a shape-dependent tail checked by its owner.
+        if let collection { try collection.restore(values); return }
+        guard values.count == expected else { throw JedError("58030", "invalid aggregate state width") }
+        func integer(_ index: Int) throws -> Int64 {
+            guard case .integer(let value) = values[index] else { throw JedError("58030", "invalid aggregate integer state") }; return value
+        }
+        func decimal(_ index: Int) throws -> SQLDecimal {
+            guard case .decimal(let value) = values[index] else { throw JedError("58030", "invalid aggregate decimal state") }; return value
+        }
+        func number(_ index: Int) throws -> Double {
+            guard case .f64(let bits) = values[index] else { throw JedError("58030", "invalid aggregate floating state") }; return Double(bitPattern: bits)
+        }
+        func boolean(_ index: Int) throws -> Bool {
+            guard case .boolean(let value) = values[index] else { throw JedError("58030", "invalid aggregate boolean state") }; return value
+        }
+        if orderedSet != nil { return }
+        let name = plan.name
+        if ["count", "count_star", "regr_count"].contains(name) { count = try integer(0); return }
+        if AggregateStatistics.pairs.contains(name) {
+            moments.count = try number(0); moments.sumX = try number(1); moments.squareX = try number(2)
+            moments.sumY = try number(3); moments.squareY = try number(4); moments.cross = try number(5); return
+        }
+        if AggregateStatistics.moments.contains(name) {
+            if plan.resultType.type == .scalar(.f64) {
+                moments.count = try number(0); moments.sumX = try number(1); moments.squareX = try number(2)
+            } else { count = try integer(0); sum = try decimal(1); squares = try decimal(2) }
+            return
+        }
+        if name == "sum" || name == "avg" {
+            if plan.resultType.type == .scalar(.f32) || plan.resultType.type == .scalar(.f64) {
+                float.total = try number(0); float.count = try integer(1); float.nan = try boolean(2)
+                float.positiveInfinity = try boolean(3); float.negativeInfinity = try boolean(4); return
+            }
+            if name == "avg" { sum = try decimal(0); count = try integer(1) }
+            else {
+                if plan.resultType.type == .scalar(.i64) { self.integer = try integer(0) } else { sum = try decimal(0) }
+                count = try boolean(1) ? 1 : 0
+            }
+            return
+        }
+        current = values[0]
+    }
+    func drainRetained(_ visit: ([SQLValue]) throws -> Void) rethrows {
+        try collection?.drainRetained(visit)
+        try orderedSet?.drainRetained(visit)
     }
     func close() { closed = true; current = .null; collection?.close(); collection = nil; orderedSet?.close(); orderedSet = nil }
     deinit { close() }
@@ -172,7 +246,7 @@ internal final class AggregateState {
             if plan.resultType.type == .scalar(.i64) {
                 guard case .integer(let value) = value else { throw JedError("XX000", "integer aggregate operand mismatch") }
                 let next = integer.addingReportingOverflow(value)
-                guard !next.overflow else { throw JedError("22003", "bigint out of range") }; integer = next.partialValue
+                guard !next.overflow else { throw JedError("22003", "bigint out of range").withDataType("i64") }; integer = next.partialValue
             } else {
                 let value = try AggregateStatistics.decimal(value)
                 try DecimalFunctions.chargeWork("+", sum, value, meter: context.meter)

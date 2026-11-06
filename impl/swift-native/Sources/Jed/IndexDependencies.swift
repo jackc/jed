@@ -40,7 +40,7 @@ internal enum IndexDependencies {
             case .currentTimestamp, .currentDate, .dateInput, .subquery, .outerColumn: throw nonimmutable()
             case .cast(let source, let target, _), .convert(let source, let target):
                 let from = source.type?.type, to = target.type
-                if from == .scalar(.text) && (to == .scalar(.date) || containsInstant(to)) { throw nonimmutable() }
+                if from == .scalar(.text) && ([.scalar(.date), .scalar(.timestamp), .scalar(.interval)].contains(to) || containsInstant(to)) { throw nonimmutable() }
                 if to == .scalar(.text) && containsInstant(from) { throw nonimmutable() }
                 if from == .scalar(.timestamptz) && [.scalar(.date), .scalar(.timestamp)].contains(to)
                     || to == .scalar(.timestamptz) && [.scalar(.date), .scalar(.timestamp)].contains(from) { throw nonimmutable() }

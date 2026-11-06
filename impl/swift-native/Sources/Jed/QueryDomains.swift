@@ -66,8 +66,13 @@ internal struct QueryDomains {
 /// a cursor's roots, and closing one cursor must not release a sibling's roots.
 internal final class DomainReadBundle {
     private(set) var pins: [SQLText: SnapshotPin]
+    // A core pin protects page addresses, while the database owns the file or
+    // service host. An escaped cursor must keep both until its final close.
+    private var database: Database?
     var domains: QueryDomains { QueryDomains(snapshots: pins.mapValues(\.snapshot)) }
-    init(pins: [SQLText: SnapshotPin]) { self.pins = pins }
+    init(pins: [SQLText: SnapshotPin], database: Database? = nil) {
+        self.pins = pins; self.database = database
+    }
     func install(_ pin: SnapshotPin, for name: SQLText) {
         pins.updateValue(pin, forKey: name)?.close()
     }
@@ -76,9 +81,12 @@ internal final class DomainReadBundle {
         var retained: [SQLText: SnapshotPin] = [:]
         do {
             for name in pins.keys.sorted() { retained[name] = try pins[name]!.retain() }
-            return DomainReadBundle(pins: retained)
+            return DomainReadBundle(pins: retained, database: database)
         } catch { for pin in retained.values { pin.close() }; throw error }
     }
-    func close() { for name in pins.keys.sorted() { pins[name]!.close() } }
+    func close() {
+        for name in pins.keys.sorted() { pins[name]!.close() }
+        database = nil
+    }
     deinit { close() }
 }

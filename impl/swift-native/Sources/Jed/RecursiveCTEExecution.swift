@@ -20,11 +20,22 @@ internal final class RecursiveCTEExecution {
     }
     private func collect(_ plan: SelectPlan) throws -> [[SQLValue]] {
         var current = context; current.patterns = PatternExecution(); current.subqueries = SubqueryExecution()
-        StatementServices(settings: binding.settings, meter: context.meter).install(into: &current)
+        current.meter = CostMeter(limit: context.meter.limit, lifetime: context.meter.lifetime,
+            resources: context.meter.resources, cancellation: context.meter.cancellation)
+        current.scalar.meter = current.meter
+        current.sequences?.install(into: &current)
+        StatementServices(settings: binding.settings, meter: current.meter).install(into: &current)
         let execution = SelectExecution(plan: plan, context: current)
         defer { execution.close() }
         var result: [[SQLValue]] = []
-        while let row = try execution.next() { try reserve(MemorySizes.row(row)); result.append(row) }
+        while let row = try execution.next() {
+            let bytes = MemorySizes.row(row)
+            try current.meter.reserveQuery(bytes); reserved = saturatingAdd(reserved, bytes)
+            result.append(row)
+        }
+        try current.meter.guardCost()
+        execution.close()
+        context.meter.absorbChildCost(current.meter.accrued)
         try context.meter.guardCost()
         return result
     }

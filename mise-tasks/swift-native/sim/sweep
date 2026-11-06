@@ -1,0 +1,14 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#MISE description="Explicit opt-in: frozen Swift simulation profiles and supported-core comparison"
+#USAGE flag "-c --configuration <configuration>" default="debug" help="debug or release"
+#USAGE flag "--no-build" help="Reuse all existing simulator binaries"
+#USAGE flag "--profile <profile>" default="all" help="Frozen profile name or all 22"
+#USAGE flag "--seeds <seeds>" default="1..8" help="Explicit unsigned seed or inclusive seed range"
+#USAGE flag "--steps <steps>" help="Override each profile's canonical trace length"
+#USAGE flag "--cores <cores>" default="go,rust,ts" help="Supported cores compared with Swift"
+#USAGE flag "--regress" help="Compare all 18 frozen regressions instead of generating profiles"
+#USAGE flag "--output <path>" help="Empty output directory; defaults to unique /tmp path"
+
+require_relative "../../../impl/swift-native/Tools/simulation_sweep"
+exit SwiftSimulationSweep.run

@@ -112,7 +112,7 @@ internal enum AlterColumnDDL {
                 if child.name != table.name || !foreign.columns.contains(ordinal) { external = true }
             }
         }
-        guard cascade || !external else { throw JedError("2BP01", "cannot drop column \(name) because other objects depend on it") }
+        guard cascade || !external else { throw JedError("2BP01", "cannot drop column \(name) because other objects depend on it").hinted(DependencyDiagnostics.cascade) }
         var changed = true
         while changed {
             changed = false

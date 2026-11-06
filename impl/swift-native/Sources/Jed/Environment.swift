@@ -130,7 +130,7 @@ public struct HostFunction: Sendable {
     }
     internal func validateResult(_ value: SQLValue) throws -> SQLValue {
         if case .integer(let number) = value, result.integerWidth != nil, !result.admits(number) {
-            throw JedError("22003", "value out of range for type \(result.name)")
+            throw JedError("22003", "value out of range for type \(result.name)").withDataType(result.name)
         }
         do { return try ContainerCasts.store(value, to: TypeDescriptor(.scalar(result))) }
         catch { throw JedError("22000", "host function returned a value outside its declared type") }

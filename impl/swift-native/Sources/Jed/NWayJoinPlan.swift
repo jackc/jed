@@ -3,7 +3,7 @@
 /// dependency set; their internal evaluation order is never rewritten.
 internal struct NWayJoinPlan {
     struct Input { let source: RelationPlan; let offset: Int }
-    struct Edge { let owner: Int; let predicate: ResolvedExpression; let dependencies: Set<Int> }
+    struct Edge { let owner: Int; let predicate: ResolvedExpression; let residual: ResolvedExpression?; let dependencies: Set<Int> }
     struct Key { let outer: Int; let inner: Int; let type: TypeDescriptor }
     enum Algorithm { case indexed(BaseScanPlan), hash([Key]), nested }
     struct Step { let input: Int; let predicates: [ResolvedExpression]; let algorithm: Algorithm }
@@ -21,7 +21,7 @@ internal struct NWayJoinPlan {
     let predicates: [ResolvedExpression]
 
     static func resolve(_ source: RelationPlan) -> Self? {
-        var inputs: [Input] = [], authored: [(Int, ResolvedExpression)] = []
+        var inputs: [Input] = [], authored: [(Int, ResolvedExpression, ResolvedExpression?)] = []
         func flatten(_ plan: RelationPlan) -> Bool {
             guard plan.lateralColumns.isEmpty else { return false }
             if case .base = plan.body, plan.baseTable != nil {
@@ -30,17 +30,17 @@ internal struct NWayJoinPlan {
             guard case .join(let left, let right, let kind, let predicate) = plan.body,
                   kind == "inner" || kind == "cross", case .base = right.body,
                   flatten(left), flatten(right) else { return false }
-            if let predicate { authored.append((inputs.count - 1, predicate)) }; return true
+            if let predicate { authored.append((inputs.count - 1, predicate, plan.effectiveOn)) }; return true
         }
         guard flatten(source), inputs.count >= 3 else { return nil }
         func owner(_ column: Int) -> Int? {
             inputs.indices.first { column >= inputs[$0].offset && column < inputs[$0].offset + inputs[$0].source.columns.count }
         }
         var edges: [Edge] = []
-        for (index, predicate) in authored {
+        for (index, predicate, residual) in authored {
             var dependencies: Set<Int> = [index]
             StoredExpressionDependencies.walk([predicate]) { if case .column(let column) = $0.node, let input = owner(column) { dependencies.insert(input) } }
-            edges.append(Edge(owner: index, predicate: predicate, dependencies: dependencies))
+            edges.append(Edge(owner: index, predicate: predicate, residual: residual, dependencies: dependencies))
         }
         func rowCount(_ index: Int) -> Int64 { QueryEstimate.rows(inputs[index].source.scanFilter, input: inputs[index].source.baseTable!.rowCount) }
         func scanCost(_ index: Int) -> Int64 {
@@ -57,11 +57,12 @@ internal struct NWayJoinPlan {
         }
         func extend(_ state: State, _ index: Int) -> [State] {
             let members = state.members.union([index])
-            let ready = edges.filter { $0.dependencies.isSubset(of: members) && (state.order.count == 1 || !$0.dependencies.isSubset(of: state.members)) }.map(\.predicate)
+            let readyEdges = edges.filter { $0.dependencies.isSubset(of: members) && (state.order.count == 1 || !$0.dependencies.isSubset(of: state.members)) }
+            let ready = readyEdges.map(\.predicate), evaluated = readyEdges.compactMap(\.residual)
             let input = inputs[index], count = rowCount(index), product = QueryEstimate.multiply(state.rows, count)
-            let residual = ready.reduce(Int64(0)) { saturatingAdd($0, QueryEstimate.expression($1)) }
-            let rows = ready.reduce(product) { QueryEstimate.rows($1, input: $0) }
-            let logical = ready.reduce(QueryEstimate.multiply(state.logicalRows, count)) { QueryEstimate.rows($1, input: $0) }
+            let residual = evaluated.reduce(Int64(0)) { saturatingAdd($0, QueryEstimate.expression($1)) }
+            let rows = evaluated.reduce(product) { QueryEstimate.rows($1, input: $0) }
+            let logical = evaluated.reduce(QueryEstimate.multiply(state.logicalRows, count)) { QueryEstimate.rows($1, input: $0) }
             var alternatives: [(Algorithm, Int64, Int64, Int64)] = []
             if input.source.allowsIndexAccess, case .base(let store) = input.source.body,
                let bound = JoinPlan.indexed(QueryEstimate.and(ready), table: input.source.baseTable!, types: store.tree.types,
@@ -98,7 +99,7 @@ internal struct NWayJoinPlan {
             }
             alternatives.append((.nested, saturatingAdd(scanCost(index), QueryEstimate.multiply(product, residual)), rows, logical))
             return alternatives.map { algorithm, cost, rows, logicalRows in
-                State(order: state.order + [index], steps: state.steps + [Step(input: index, predicates: ready, algorithm: algorithm)],
+                State(order: state.order + [index], steps: state.steps + [Step(input: index, predicates: evaluated, algorithm: algorithm)],
                       cost: saturatingAdd(state.cost, cost), rows: rows, logicalRows: logicalRows)
             }
         }

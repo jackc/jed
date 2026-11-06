@@ -61,20 +61,25 @@ final class PagerTests: XCTestCase {
         }
     }
 
-    func testRecoveryStabilizesBeforeWritesAndSteadyCommitUsesOneBarrier() throws {
+    func testBootstrapSkipsDataStabilizationButRecoveredIncrementalCommitRequiresIt() throws {
         let (store, pager) = try opened()
         var directories = 0
         let plan = try prepared(pager)
         XCTAssertTrue(store.log.isEmpty)
         try pager.commit(plan, syncDirectory: { directories += 1 })
-        XCTAssertEqual(store.log, ["sync", "write:768:256", "write:0:256", "sync"])
+        XCTAssertEqual(store.log, ["write:768:256", "write:0:256", "sync"])
         XCTAssertEqual(directories, 1)
         XCTAssertEqual(pager.selected.meta.txid, 2)
         store.reset()
         try pager.commit(prepared(pager), syncDirectory: { directories += 1 })
         XCTAssertEqual(store.log, ["write:1024:256", "write:256:256", "sync"])
         XCTAssertEqual(directories, 1)
-        XCTAssertEqual(try Pager.open(store: store).selected.meta.txid, 3)
+        let reopened = try Pager.open(store: store)
+        XCTAssertEqual(reopened.selected.meta.txid, 3)
+        store.reset()
+        try reopened.commit(prepared(reopened), syncDirectory: { directories += 1 })
+        XCTAssertEqual(store.log, ["sync", "write:1280:256", "write:0:256", "sync"])
+        XCTAssertEqual(directories, 2)
     }
 
     func testSerializationFailureDoesNotPoisonAndStalePlanDoesNotWrite() throws {
@@ -94,7 +99,7 @@ final class PagerTests: XCTestCase {
     }
 
     func testTornWritesRecoverAndFailedHandleCannotContinue() throws {
-        for fault in [CommitFault.body(ordinal: 1, tearBytes: 18), .meta(tearBytes: 40), .sync(ordinal: 2)] {
+        for fault in [CommitFault.body(ordinal: 1, tearBytes: 18), .meta(tearBytes: 40), .sync(ordinal: 1)] {
             let (store, pager) = try opened()
             let plan = try prepared(pager)
             pager.armFault(fault)
@@ -107,7 +112,7 @@ final class PagerTests: XCTestCase {
             XCTAssertEqual(recovered.selected.meta.txid, expected)
             store.reset()
             try recovered.commit(prepared(recovered))
-            XCTAssertEqual(store.log.first, "sync")
+            XCTAssertEqual(store.log.first, expected == 1 ? "write:768:256" : "sync")
             XCTAssertEqual(recovered.selected.meta.txid, expected + 1)
         }
     }
@@ -121,7 +126,7 @@ final class PagerTests: XCTestCase {
         XCTAssertEqual(pager.pendingEntries.map(\.pageIndex), [3, 4, 5])
         XCTAssertEqual(pager.selected.entries.map(\.pageIndex), [3, 4, 5])
         XCTAssertEqual(try store.memory.read(at: 256, count: 256), floor)
-        XCTAssertEqual(store.log.filter { $0 == "sync" }.count, 1) // adopted-floor stabilization only
+        XCTAssertEqual(store.log.filter { $0 == "sync" }.count, 0) // independently durable bootstrap floor
         XCTAssertEqual(try Pager.open(store: store).selected.meta.txid, 4)
         store.reset()
         try pager.flush()
@@ -134,7 +139,7 @@ final class PagerTests: XCTestCase {
     func testFailedCapFlushRevokesReadsAfterPublication() throws {
         let (_, pager) = try opened()
         let plan = try prepared(pager, count: 17)
-        pager.armFault(.sync(ordinal: 2))
+        pager.armFault(.sync(ordinal: 1))
         try pager.commit(plan, synchronous: false)
         XCTAssertEqual(pager.selected.meta.txid, 2)
         XCTAssertTrue(pager.isPoisoned)

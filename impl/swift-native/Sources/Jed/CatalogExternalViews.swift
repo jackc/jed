@@ -92,7 +92,7 @@ internal enum CatalogExternalViews {
                             view.dependencies.contains { $0.kind == 0 && $0.name == name && $0.columns.contains(column)
                                 || $0.kind == 2 && owned.contains($0.name) }
                         }.map(\.name))
-                        guard cascade || dependent.isEmpty else { throw JedError("2BP01", "cannot drop column because a private view depends on it") }
+                        guard cascade || dependent.isEmpty else { throw JedError("2BP01", "cannot drop column because a private view depends on it").hinted(DependencyDiagnostics.cascade) }
                         remove(&image.views, names: dependent)
                         try ViewRewrite.droppingColumn(in: &image, table: name, ordinal: ordinal)
                         columns.remove(at: ordinal); sequences[column] = nil

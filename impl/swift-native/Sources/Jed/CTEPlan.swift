@@ -3,6 +3,7 @@
 internal struct CTEReference {
     unowned let binding: CTEBinding
     let selfReference: Bool
+    var inlinePlan: SelectPlan? = nil
 }
 
 internal final class CTEBinding {
@@ -15,18 +16,25 @@ internal final class CTEBinding {
     let settings: SessionSettings
     let materialized: Bool?
     var references = 0
+    var expansion: CTEReferenceExpansion?
+    var expanded = false
     var resolvingSelf = false
     var hiddenColumns: Int?
-    func reference() throws -> CTEReference {
+    func reference(using resolver: ExpressionResolver) throws -> CTEReference {
         guard mutationSchema?.noReturning != true else {
             throw JedError("0A000", "WITH query \(name) does not have a RETURNING clause")
         }
         if !resolvingSelf { references += 1 }
-        return CTEReference(binding: self, selfReference: resolvingSelf)
+        var result = CTEReference(binding: self, selfReference: resolvingSelf)
+        if !resolvingSelf, resolver.cteExpansionEnabled, !expanded, let expansion {
+            expanded = true
+            result.inlinePlan = try expansion.resolve(using: resolver)
+        }
+        return result
     }
     var recursive: RecursiveCTEPlan?
     var executionBuffers: Bool?
-    var buffers: Bool { executionBuffers ?? (mutation != nil || recursive != nil || (materialized ?? (references > 1))) }
+    var buffers: Bool { expanded ? false : executionBuffers ?? (mutation != nil || recursive != nil || (materialized ?? (references > 1))) }
     var expressions: [ResolvedExpression] {
         (plan?.expressions ?? mutationSchema?.expressions ?? []) + (recursive?.expressions ?? [])
     }
@@ -60,7 +68,7 @@ internal final class WithQueryPlan {
         guard clause.bindings.allSatisfy({ $0.body.queryBody != nil }) else {
             throw JedError("0A000", "WITH containing a data-modifying statement is only supported at the top level")
         }
-        let bindings = try resolveBindings(clause, snapshot: snapshot, settings: settings, scalar: scalar, using: resolver)
+        let bindings = try resolveBindings(clause, snapshot: snapshot, settings: settings, scalar: scalar, using: resolver, primary: .query(body))
         let plan = try SelectPlan.resolve(body, snapshot: snapshot, settings: settings, scalar: scalar,
             using: resolver, finalizeParameters: false)
         var result = plan
@@ -72,13 +80,16 @@ internal final class WithQueryPlan {
 
     static func resolveBindings(_ clause: SQLWith, snapshot: DomainSnapshot, settings: SessionSettings,
                                 scalar: ScalarCasts.Context, using resolver: ExpressionResolver,
-                                mutationContext: ExpressionContext? = nil) throws -> [CTEBinding] {
+                                mutationContext: ExpressionContext? = nil, primary: SQLStatement? = nil) throws -> [CTEBinding] {
+        let candidates = CTEReferenceCounts.expansionCandidates(clause, primary: primary)
         var names: Set<SQLText> = [], bindings: [CTEBinding] = []
         for syntax in clause.bindings {
             guard names.insert(syntax.name).inserted else { throw JedError("42712", "WITH query name specified more than once: \(syntax.name)") }
-            let child = ExpressionResolver(composites: snapshot.types, scalar: scalar)
+            var child = ExpressionResolver(composites: snapshot.types, scalar: scalar)
             child.cteBindings = resolver.cteBindings
+            child.cteExpansionEnabled = resolver.cteExpansionEnabled
             child.outerScopes = resolver.outerScopes
+            child.outerNameHints = resolver.outerNameHints; child.nameHintFrames = resolver.nameHintFrames
             child.parameters = resolver.parameters; child.parameterUses = resolver.parameterUses
             child.viewExpansion = resolver.viewExpansion
             guard let query = syntax.body.queryBody else {
@@ -112,13 +123,32 @@ internal final class WithQueryPlan {
             if shape == nil && (syntax.search != nil || syntax.cycle != nil) {
                 throw JedError("42601", "WITH query is not recursive")
             }
-            let anchor = try SelectPlan.resolve(shape?.anchor ?? query, snapshot: snapshot, settings: settings, scalar: scalar,
+            let candidate = candidates.contains(syntax.name) && shape == nil
+            child.cteExpansionEnabled = resolver.cteExpansionEnabled && !candidate
+            let priorReferences = resolver.cteBindings.values.map { ($0, $0.references) }
+            var anchor = try SelectPlan.resolve(shape?.anchor ?? query, snapshot: snapshot, settings: settings, scalar: scalar,
                 using: child, finalizeParameters: false)
+            if candidate, !child.outerReferences.isEmpty, resolver.cteExpansionEnabled {
+                // A correlated definition remains ordinary. Restore the first
+                // planning pass's counts before its one expansion-enabled pass.
+                for (binding, count) in priorReferences { binding.references = count }
+                child = ExpressionResolver(composites: snapshot.types, scalar: scalar)
+                child.cteBindings = resolver.cteBindings; child.outerScopes = resolver.outerScopes
+                child.outerNameHints = resolver.outerNameHints; child.nameHintFrames = resolver.nameHintFrames
+                child.parameters = resolver.parameters; child.parameterUses = resolver.parameterUses
+                child.viewExpansion = resolver.viewExpansion
+                anchor = try SelectPlan.resolve(shape?.anchor ?? query, snapshot: snapshot, settings: settings,
+                    scalar: scalar, using: child, finalizeParameters: false)
+            }
             guard syntax.columns.count <= anchor.columns.count else { throw JedError("42P10", "WITH query has fewer columns than specified") }
             let columns = anchor.columns.enumerated().map { index, column in
                 ResultColumn(name: index < syntax.columns.count ? syntax.columns[index] : column.name, type: column.type)
             }
             let binding = CTEBinding(name: syntax.name, columns: columns, plan: anchor, settings: settings, materialized: syntax.materialized)
+            if candidate, child.outerReferences.isEmpty {
+                binding.expansion = CTEReferenceExpansion(query: query, snapshot: snapshot,
+                    settings: settings, scalar: scalar, visible: resolver.cteBindings)
+            }
             if let shape {
                 let augmentation = try RecursiveColumns.resolve(syntax, columns: columns, marks: marks, resolver: child)
                 if let augmentation {

@@ -14,6 +14,7 @@ internal struct DomainSnapshot: Sendable {
     private(set) var gistTrees: [SQLText: GistTree]
     private(set) var catalogRevision = StorageRevision()
     private(set) var dataRevision = StorageRevision()
+    private var estimatorRevisions: [SQLText: StorageRevision]
     private var nextTypeID: UInt32
 
     init(catalogID: UInt64, txid: UInt64, catalog: CatalogImage, pool: NodePool,
@@ -21,6 +22,7 @@ internal struct DomainSnapshot: Sendable {
          borrowedTypes: [SQLText: CompositeType] = [:], borrowedReferences: CatalogBorrowedReferences = .init()) throws {
         identity = StorageRevision(); self.catalogID = catalogID; self.txid = txid; self.catalog = catalog
         self.pool = pool; self.tables = tables; self.indexes = indexes; self.gistTrees = gistTrees
+        estimatorRevisions = tables.mapValues { _ in StorageRevision() }
         self.borrowedTypes = borrowedTypes; self.borrowedReferences = borrowedReferences
         types = try catalog.resolvedTypes(catalogID: catalogID, borrowedTypes: borrowedTypes)
         guard types.count < UInt32.max else { throw JedError("54000", "composite type identity limit exceeded") }
@@ -77,7 +79,13 @@ internal struct DomainSnapshot: Sendable {
     func emptyStore(types: [TypeDescriptor]) -> TableStore {
         TableStore(tree: BPlusTree(codec: pool.codec, types: types, pool: pool))
     }
-    mutating func setTableStore(_ name: SQLText, _ store: TableStore?) { tables[name] = store }
+    func estimatorRevision(_ name: SQLText) -> StorageRevision? { estimatorRevisions[name] }
+    mutating func advanceEstimatorRevision(_ name: SQLText) { estimatorRevisions[name] = StorageRevision() }
+    mutating func setTableStore(_ name: SQLText, _ store: TableStore?) {
+        if store == nil { estimatorRevisions[name] = nil }
+        else if tables[name]?.revision !== store?.revision { advanceEstimatorRevision(name) }
+        tables[name] = store
+    }
     mutating func setIndexStore(_ name: SQLText, _ store: TableStore?) { indexes[name] = store }
     mutating func setGistTree(_ name: SQLText, _ tree: GistTree?) {
         gistTrees[name] = tree; dataRevision = StorageRevision()
@@ -129,6 +137,34 @@ internal struct DomainSnapshot: Sendable {
         for name in tables.keys { tables[name]!.forgetPendingKeys() }
         for name in indexes.keys { indexes[name]!.forgetPendingKeys() }
     }
+    /// Physical residency changes only after the bytes exist. A page client
+    /// re-reads its own prepared body, like the service store's pending writes;
+    /// local domains go through the ordinary pool. A failed post-commit read
+    /// poisons future writes but does not reverse a known durable commit.
+    mutating func finishPersistence(written: Set<UInt32>, remotePages: [UInt32: [UInt8]]? = nil) {
+        let pool = self.pool
+        func read(_ reference: PageReference, _ types: [TypeDescriptor]) throws -> PackedLeaf {
+            if let remotePages {
+                guard let bytes = remotePages[reference.index] else { throw JedError.corruption("missing committed root page") }
+                return try PackedLeaf(bytes: pool.codec.openBody(pageIndex: reference.index,
+                    sealed: bytes, expectedTag: reference.tag), types: types, codec: pool.codec)
+            }
+            return try pool.load(reference, types: types)
+        }
+        do {
+            for name in tables.keys.sorted() {
+                var tree = tables[name]!.tree
+                try tree.refaultRoot(afterWriting: written, read: read)
+                tables[name]!.installPersistedTree(tree)
+            }
+            for name in indexes.keys.sorted() {
+                var tree = indexes[name]!.tree
+                try tree.refaultRoot(afterWriting: written, read: read)
+                indexes[name]!.installPersistedTree(tree)
+            }
+        } catch { pool.pager?.poisonWriter() }
+    }
+
     mutating func finishCommit(txid: UInt64, catalog: CatalogImage,
                                tables: [SQLText: TableStore], indexes: [SQLText: TableStore]) {
         self.txid = txid; self.catalog = catalog; self.tables = tables; self.indexes = indexes

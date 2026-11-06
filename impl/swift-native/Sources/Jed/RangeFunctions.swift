@@ -38,10 +38,10 @@ internal enum RangeFunctions {
     private static func successor(_ value: SQLValue, scalar: ScalarType) throws -> SQLValue {
         switch value {
         case .integer(let number) where scalar == .i32 || scalar == .i64:
-            guard number < Int64.max, scalar != .i32 || number < Int32.max else { throw JedError("22003", "integer out of range") }
+            guard number < Int64.max, scalar != .i32 || number < Int32.max else { throw JedError("22003", "integer out of range").withDataType(scalar.name) }
             return .integer(number + 1)
         case .date(let day) where scalar == .date:
-            guard day < Int32.max - 1 else { throw JedError("22003", "integer out of range") }
+            guard day < Int32.max - 1 else { throw JedError("22003", "integer out of range").withDataType(scalar.name) }
             return .date(day + 1)
         default: throw JedError("42804", "value does not match range subtype")
         }

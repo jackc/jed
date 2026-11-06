@@ -122,6 +122,7 @@ internal enum CreateTableAs {
             guard let filled else { throw JedError("XX000", "CREATE TABLE AS fill did not execute") }
             defer { filled.close() }
             result.affected = filled.affected
+            result.hasAffectedRows = filled.hasAffectedRows
         }
         return result
     }

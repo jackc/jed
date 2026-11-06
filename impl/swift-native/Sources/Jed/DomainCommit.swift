@@ -12,7 +12,7 @@ internal struct DomainCommitPolicy: Sendable {
 internal struct PreparedDomainCommit: Sendable {
     let identity: StorageRevision
     let pages: PreparedPageCommit
-    let snapshot: DomainSnapshot
+    var snapshot: DomainSnapshot
     let catalogPages: [UInt32]
     let gistPages: [UInt32]
     let livePages: UInt32
@@ -71,6 +71,7 @@ internal enum DomainCommitPlanner {
             if let reference = child.reference { kept.insert(reference.index); return reference }
             let node = try source.resolve(child)
             for child in node.children { _ = try visitTree(child, source: source) }
+            guard node.payloadSize <= codec.capacity else { throw JedError("0A000", "tree node exceeds page capacity") }
             if node.isLeaf {
                 guard node.entryCount > 0 else { throw JedError.corruption("cannot plan an empty leaf") }
                 for row in 0..<node.entryCount {
@@ -113,6 +114,9 @@ internal enum DomainCommitPlanner {
         for position in image.tables.indices.sorted(by: { image.tables[$0].name < image.tables[$1].name }) {
             var table = image.tables[position]
             guard let store = snapshot.tables[table.name], let count = store.count, count >= 0 else { throw JedError.corruption("table has no exact cardinality") }
+            guard (count == 0) == store.tree.isEmpty else {
+                throw JedError.corruption("table cardinality disagrees with its root")
+            }
             let types = try snapshot.tableTypes(table)
             guard types == store.tree.types, store.tree.pool === snapshot.pool else { throw JedError.corruption("table row layout disagrees with catalog") }
             table.rowCount = count

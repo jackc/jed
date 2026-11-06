@@ -8,11 +8,12 @@ internal final class WriterGate: @unchecked Sendable {
     private let condition = NSCondition()
     private var owner: StorageRevision?
     private var serviceOwner = false
+    private var localMaintenance: StorageRevision?
 
     func acquire(cancellation: CancellationToken? = nil, wait: Bool = true, timeoutMilliseconds: UInt64 = 0, service: Bool = false) throws -> StorageRevision {
         let deadline = timeoutMilliseconds == 0 ? nil : ContinuousClock.now.advanced(by: .milliseconds(Int64(clamping: timeoutMilliseconds)))
         condition.lock(); defer { condition.unlock() }
-        while owner != nil {
+        while owner != nil || localMaintenance != nil {
             if cancellation?.isCancelled == true { throw JedError("57014", "canceling statement due to user request") }
             guard wait else { throw JedError("55006", "database has an active writer") }
             if let deadline, ContinuousClock.now >= deadline { throw JedError("55P03", "canceling statement due to lock timeout") }
@@ -26,8 +27,17 @@ internal final class WriterGate: @unchecked Sendable {
         condition.lock(); defer { condition.unlock() }
         if owner === token { owner = nil; condition.broadcast() }
     }
-    var hasLocalWriter: Bool { condition.lock(); defer { condition.unlock() }; return owner != nil && !serviceOwner }
-    var hasWriter: Bool { condition.lock(); defer { condition.unlock() }; return owner != nil }
+    func acquireLocalMaintenance() throws -> StorageRevision {
+        condition.lock(); defer { condition.unlock() }
+        guard localMaintenance == nil, owner == nil || serviceOwner else { throw JedError("55006", "database has an active local writer") }
+        let token = StorageRevision(); localMaintenance = token; return token
+    }
+    func releaseLocalMaintenance(_ token: StorageRevision) {
+        condition.lock(); defer { condition.unlock() }
+        if localMaintenance === token { localMaintenance = nil; condition.broadcast() }
+    }
+    var hasLocalWriter: Bool { condition.lock(); defer { condition.unlock() }; return localMaintenance != nil || owner != nil && !serviceOwner }
+    var hasWriter: Bool { condition.lock(); defer { condition.unlock() }; return owner != nil || localMaintenance != nil }
     func revokeCurrent() { condition.lock(); owner = nil; condition.broadcast(); condition.unlock() }
     func owns(_ token: StorageRevision) -> Bool {
         condition.lock(); defer { condition.unlock() }; return owner === token
@@ -61,10 +71,26 @@ internal final class SnapshotPin: Sendable {
     deinit { close() }
 }
 
+/// Transaction-owned cursors borrow the existing writer pin. Their owner
+/// closes every cursor before releasing that writer, so no begin_read RPC is
+/// needed. The token and epoch keep an escaped borrowed pin from remaining
+/// usable after its transaction ends or changes storage roles.
+private final class BorrowedWriterRole: SnapshotRole {
+    let core: DatabaseCore, token: StorageRevision, epoch: StorageRevision
+    let remote: (any DatabaseRemote)?
+    init(core: DatabaseCore, token: StorageRevision, epoch: StorageRevision, remote: (any DatabaseRemote)?) {
+        self.core = core; self.token = token; self.epoch = epoch; self.remote = remote
+    }
+    func checkRole() throws { try core.checkWriter(token: token, epoch: epoch); try remote?.checkRole() }
+    func retainRead(version: UInt64) throws { try checkRole() }
+    func releaseRead(version: UInt64) {}
+}
+
 /// Storage-domain coordination shared by every session. Root publication and
 /// pin registration use the same lock, including the persist→publish window.
 /// SQL/session state and attachment routing stay above this storage identity.
 internal final class DatabaseCore: Sendable {
+    let planIdentity = StorageRevision()
     struct Registry: Sendable {
         var storage: StorageDomain
         var snapshot: DomainSnapshot
@@ -205,6 +231,24 @@ internal final class DatabaseCore: Sendable {
         let token = try writer.acquire(wait: false); defer { writer.release(token) }
         return try operation()
     }
+    /// Rewrapping excludes this handle's local writers, but an idle page-client
+    /// writer may retain its grant: the data key and generation stay unchanged.
+    /// The commit boundary serializes key writes with streamed page delivery.
+    func credentialMaintenance<T>(_ operation: () throws -> T) throws -> T {
+        let token = try writer.acquireLocalMaintenance()
+        defer { writer.releaseLocalMaintenance(token) }
+        commitBoundary.lock(); defer { commitBoundary.unlock() }
+        let admitted = registry.withLock { $0.admitting && $0.remote == nil }
+        guard admitted else { throw JedError("08006", "database storage role changed") }
+        return try operation()
+    }
+    func idleBatchFlush(expected: StorageDomain) throws -> Int64? {
+        let token = try writer.acquire(wait: false); defer { writer.release(token) }
+        commitBoundary.lock(); defer { commitBoundary.unlock() }
+        let current = registry.withLock { state in state.admitting && state.remote == nil && state.storage === expected }
+        guard current else { return nil }
+        return try expected.pager.idleFlush()
+    }
     /// The watermark remains locked through streaming and replacement. A reader
     /// can pin either address space, never a root whose file has been replaced.
     func replaceStorage(_ operation: (StorageDomain, DomainSnapshot) throws -> StorageDomain) throws {
@@ -223,12 +267,17 @@ internal final class DatabaseCore: Sendable {
         try lease.checkRole()
         guard lease.core === self, writer.owns(lease.token) else { throw JedError("55000", "writer lease is closed") }
     }
+
+    fileprivate func checkWriter(token: StorageRevision, epoch: StorageRevision) throws {
+        try checkEpoch(epoch)
+        guard writer.owns(token) else { throw JedError("08006", "borrowed transaction snapshot ended") }
+    }
     fileprivate func policy(_ requested: DomainCommitPolicy) -> DomainCommitPolicy {
         registry.withLock { state in
             var result = requested
             if state.remote != nil { result.reclaimAllowed = false; result.canCompactCommitted = false }
             let next = state.snapshot.txid == UInt64.max ? UInt64.max : state.snapshot.txid + 1
-            result.oldestPinnedVersion = state.pins.keys.min() ?? next
+            result.oldestPinnedVersion = min(result.oldestPinnedVersion, state.pins.keys.min() ?? next)
             result.canCompactCommitted = result.canCompactCommitted && (state.pins.keys.min() ?? state.snapshot.txid) >= state.snapshot.txid
             return result
         }
@@ -333,6 +382,7 @@ internal final class DatabaseCore: Sendable {
             return try registry.withLock { state in
                 let pager = state.storage.pager
                 if !relaxed { try pager.flush(shrink: false) }
+                else { try pager.beforeClientTiming() }
                 let version = state.meta.meta.txid
                 let allowed = (state.pins.keys.min() ?? version) >= state.storage.freeGeneration
                 let allocation = try pager.allocationSnapshot(reuseAllowed: allowed)
@@ -380,7 +430,7 @@ internal final class DatabaseCore: Sendable {
             guard let (domain, snapshot, reclaim) = work else { return }
             var policy = DomainCommitPolicy(); policy.oldestPinnedVersion = snapshot.txid + 1
             policy.storageLimit = storageLimit
-            guard let plan = try domain.prepare(snapshot, policy: policy, entropy: entropy, forceReclaim: reclaim) else { return }
+            guard let plan = try domain.prepare(snapshot, policy: policy, entropy: entropy, forceReclaim: reclaim, synchronous: synchronous) else { return }
             try registry.withLock { state in
                 guard state.epoch === lease.epoch, state.pins.isEmpty,
                       state.storage === domain, domain.committed.identity === plan.identity,
@@ -398,7 +448,13 @@ internal final class DatabaseCore: Sendable {
         }
     }
     func serviceReleasePin(_ version: UInt64, epoch: StorageRevision) { releasePin(version, epoch: epoch) }
-    func serviceReleaseWriter(_ token: StorageRevision) { writer.release(token) }
+    func serviceReleaseWriter(_ token: StorageRevision) {
+        commitBoundary.lock(); defer { commitBoundary.unlock() }
+        if writer.owns(token) {
+            storage.pager.abandonServiceDelta()
+            writer.release(token)
+        }
+    }
     func serviceCheckWriter(_ lease: ServiceWriterLease) throws {
         try checkEpoch(lease.epoch)
         guard lease.core === self, writer.owns(lease.token) else { throw JedError("55000", "service writer is closed") }
@@ -472,9 +528,13 @@ internal final class WriterLease {
         try core.memoryCommit(self, body)
     }
     func checkRole() throws { try core.checkEpoch(epoch); try remote?.checkRole() }
-    func pin(_ working: DomainSnapshot) throws -> SnapshotPin {
+    func pin(_ working: DomainSnapshot, borrowingWriter: Bool = false) throws -> SnapshotPin {
         try core.check(self)
         guard working.identity === snapshot.identity, working.txid == snapshot.txid else { throw JedError("55000", "snapshot does not belong to this transaction") }
+        if borrowingWriter {
+            let role = BorrowedWriterRole(core: core, token: token, epoch: epoch, remote: remote)
+            return try core.pinRetained(working, epoch: epoch, role: role)
+        }
         try remote?.retainRead(version: working.txid)
         do { return try core.pinRetained(working, epoch: epoch, role: remote) }
         catch { remote?.releaseRead(version: working.txid); throw error }
@@ -482,9 +542,9 @@ internal final class WriterLease {
     func precheck(_ working: DomainSnapshot, policy: DomainCommitPolicy = .init()) throws {
         try core.check(self); try core.storage.precheck(working, policy: core.policy(policy))
     }
-    func prepare(_ working: DomainSnapshot, policy: DomainCommitPolicy = .init(), entropy: KeyEntropy? = nil) throws -> PreparedDomainCommit? {
+    func prepare(_ working: DomainSnapshot, policy: DomainCommitPolicy = .init(), entropy: KeyEntropy? = nil, synchronous: Bool = true) throws -> PreparedDomainCommit? {
         try core.check(self)
-        return try core.storage.prepare(working, policy: core.policy(policy), entropy: entropy)
+        return try core.storage.prepare(working, policy: core.policy(policy), entropy: entropy, synchronous: synchronous)
     }
     @discardableResult func persist(_ prepared: PreparedDomainCommit, synchronous: Bool = true,
                                    syncDirectory: () throws -> Void = {}, afterPersist: () throws -> Void = {}) throws -> DomainSnapshot {

@@ -2,6 +2,30 @@
 /// part. Targets are catalog names; only FROM references contribute. Inner
 /// WITH declarations shadow outer bindings in their lexical visibility region.
 internal enum CTEReferenceCounts {
+    /// Count each later part once. A DML reference disqualifies expansion even
+    /// when its syntax contains a SELECT, because that part plans at execution.
+    static func expansionCandidates(_ clause: SQLWith, primary: SQLStatement?) -> Set<SQLText> {
+        var queries: [SQLText: Int] = [:], mutations: [SQLText: Int] = [:]
+        func add(_ statement: SQLStatement) {
+            let counts = count(statement)
+            if statement.queryBody != nil {
+                for (name, count) in counts { queries[name, default: 0] += count }
+            } else {
+                for (name, count) in counts { mutations[name, default: 0] += count }
+            }
+        }
+        if let primary { add(primary) }
+        var result: Set<SQLText> = []
+        for binding in clause.bindings.reversed() {
+            if binding.body.queryBody != nil, binding.materialized != true,
+               queries[binding.name] == 1, mutations[binding.name, default: 0] == 0 {
+                result.insert(binding.name)
+            }
+            add(binding.body)
+        }
+        return result
+    }
+
     static func count(_ statement: SQLStatement) -> [SQLText: Int] {
         var counts: [SQLText: Int] = [:], shadowed: Set<SQLText> = []
         func expression(_ value: SQLExpression) {

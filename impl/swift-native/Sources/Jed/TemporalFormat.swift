@@ -141,7 +141,8 @@ internal enum FormatCalendar {
 }
 
 internal enum TemporalFormat {
-    static func toChar(_ value: SQLValue, template: SQLText, timezone: SQLTimeZone = .utc, meter: CostMeter? = nil) throws -> SQLValue {
+    static func toChar(_ value: SQLValue, template: SQLText, timezone: SQLTimeZone = .utc,
+                       meter: CostMeter? = nil, growth: Bool = true) throws -> SQLValue {
         if value.isNull || template.utf8.isEmpty { return .null }
         var civil: Temporal.Civil, isInterval = false
         var offset: Int32 = 0, abbreviation = ""
@@ -246,7 +247,7 @@ internal enum TemporalFormat {
             if id == "Y_YYY", let ordinal = node.ordinal { text += FormatTemplate.ordinal(displayYear(civil.year), upper: ordinal == "TH") }
             output += text
         }
-        meter?.charge(Int64(output.utf8.count)); try meter?.guardCost()
+        if growth { meter?.charge(Int64(output.utf8.count)); try meter?.guardCost() }
         return .text(SQLText(validatedUTF8: Array(output.utf8)))
     }
 

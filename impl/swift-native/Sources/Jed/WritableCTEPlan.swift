@@ -38,7 +38,7 @@ internal struct WritableCTEPlan {
         resolver.queryScope = SubqueryScope(snapshot: snapshot, settings: settings)
         resolver.checkFunction = { try settings.privileges.require(.execute, on: $0, function: true) }
         let bindings = try WithQueryPlan.resolveBindings(part.clause, snapshot: snapshot, settings: settings,
-            scalar: context.scalar, using: resolver, mutationContext: context)
+            scalar: context.scalar, using: resolver, mutationContext: context, primary: part.body)
         let query = try part.body.queryBody.map {
             try SelectPlan.resolve($0, snapshot: snapshot, settings: settings, scalar: context.scalar,
                                    using: resolver, finalizeParameters: false)

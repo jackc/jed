@@ -93,9 +93,9 @@ extension ExpressionResolver {
     func patternExpression(_ operation: String, _ source: SQLExpression, _ syntax: SQLExpression,
                            escape: SQLExpression? = nil, negated: Bool = false, position: Int) throws -> ResolvedExpression {
         let text = TypeDescriptor(.scalar(.text)), boolean = TypeDescriptor(.scalar(.boolean))
-        func operand(_ syntax: SQLExpression) throws -> ResolvedExpression {
+        func operand(_ syntax: SQLExpression, code: String = "42804") throws -> ResolvedExpression {
             let value = try resolve(syntax, expected: text)
-            guard value.type == nil || value.type?.type == text.type else { throw JedError("42804", "pattern operands must be text") }
+            guard value.type == nil || value.type?.type == text.type else { throw JedError(code, "pattern operands must be text").hinted(code == "42883" ? ErrorHints.function : ErrorHints.operatorBinary) }
             return value
         }
         let subject = try operand(source)
@@ -103,7 +103,7 @@ extension ExpressionResolver {
         let like = operation == "like" || operation == "ilike", similar = operation == "similar"
         if similar || escape != nil {
             var arguments = [pattern]
-            if let escape { arguments.append(try operand(escape)) }
+            if let escape { arguments.append(try operand(escape, code: "42883")) }
             if similar, arguments.allSatisfy({ if case .constant(.text) = $0.node { true } else { false } }) {
                 let values = arguments.map { expression -> SQLText in if case .constant(.text(let text)) = expression.node { return text }; preconditionFailure() }
                 pattern = ResolvedExpression(type: text, node: .constant(.text(try Similar.translate(values[0], escape: values.count > 1 ? values[1] : nil).text)), position: syntax.position)

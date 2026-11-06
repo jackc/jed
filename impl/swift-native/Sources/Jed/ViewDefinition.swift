@@ -70,7 +70,17 @@ internal enum ViewDefinition {
             var qualifiedOnly = false
             var mergedName = false
         }
-        var enclosing: [[Binding]] = []
+        struct QueryIdentity: Hashable {
+            let start: Int
+            let end: Int
+            init(_ query: SQLQuery) { start = query.span.byteStart; end = query.span.byteEnd }
+        }
+        // FROM subqueries inherit exactly their source's lexical scopes. A
+        // LATERAL item sees preceding bindings even inside an aliased fence;
+        // it cannot use labels introduced later by the surrounding group.
+        var inheritedScopes: [[Binding]] = []
+        var scopeStack: [[[Binding]]] = []
+        var sourceScopes: [QueryIdentity: [[Binding]]] = [:]
         var lexical: [SQLText: CTEBinding] = [:]
         var lexicalStack: [[SQLText: CTEBinding]] = []
         struct WithFrame {
@@ -86,8 +96,11 @@ internal enum ViewDefinition {
         }
         try ViewSyntax.walk(query, query: { block in
             lexicalStack.append(lexical)
+            scopeStack.append(inheritedScopes)
+            let outers = sourceScopes[QueryIdentity(block)] ?? inheritedScopes
+            inheritedScopes = outers
             let blockResolver = ExpressionResolver(composites: snapshot.types, scalar: scalar)
-            blockResolver.outerScopes = enclosing.reversed().map(expressionScope)
+            blockResolver.outerScopes = outers.map(expressionScope)
             blockResolver.cteBindings = lexical
             if case .with = block.body {
                 let scoped = try SelectPlan.resolve(block, snapshot: snapshot, settings: planningSettings, scalar: scalar, using: blockResolver)
@@ -99,7 +112,7 @@ internal enum ViewDefinition {
             let blockPlan = try SelectPlan.resolve(block, snapshot: snapshot, settings: planningSettings, scalar: scalar, using: blockResolver)
             var joins: [(SQLExpression, [Binding])] = []
             var implicitJoinUses: [Binding] = []
-            func bind(_ from: SQLFrom) throws -> [Binding] {
+            func bind(_ from: SQLFrom, preceding: [Binding]) throws -> [Binding] {
                 var columns: [Binding]
                 switch from.source {
                 case .table(let name):
@@ -138,13 +151,15 @@ internal enum ViewDefinition {
                     }
                 case .query(let child):
                     let nested = ExpressionResolver(composites: snapshot.types, scalar: scalar)
-                    nested.cteBindings = lexical; nested.outerScopes = blockResolver.outerScopes
+                    let childScopes = from.lateral ? [preceding] + outers : outers
+                    sourceScopes[QueryIdentity(child)] = childScopes
+                    nested.cteBindings = lexical; nested.outerScopes = childScopes.map(expressionScope)
                     let childPlan = try SelectPlan.resolve(child, snapshot: snapshot, settings: planningSettings, scalar: scalar, using: nested)
                     columns = childPlan.columns.enumerated().map { index, column in
                         Binding(label: nil, name: column.name, type: column.type ?? TypeDescriptor(.scalar(.text)),
                             collation: childPlan.projections[index].collation?.asColumn, unresolved: column.type == nil)
                     }
-                case .joined(let nested): columns = try bind(nested)
+                case .joined(let nested): columns = try bind(nested, preceding: preceding)
                 default: throw JedError("0A000", "view source dependency tracing is not yet connected")
                 }
                 for index in columns.indices {
@@ -152,7 +167,7 @@ internal enum ViewDefinition {
                     if index < from.columnAliases.count { columns[index].name = from.columnAliases[index] }
                 }
                 for join in from.joins {
-                    var right = try bind(join.right)
+                    var right = try bind(join.right, preceding: preceding + columns)
                     let names = join.natural ? columns.filter { !$0.qualifiedOnly && $0.starVisible }.map(\.name).filter { name in
                         right.contains { !$0.qualifiedOnly && $0.starVisible && $0.name == name }
                     } : join.using
@@ -168,7 +183,8 @@ internal enum ViewDefinition {
                 }
                 return columns
             }
-            var scope = try select.from.flatMap(bind)
+            var scope: [Binding] = []
+            for from in select.from { scope += try bind(from, preceding: scope) }
             // Row slots retain source order, while USING/NATURAL output metadata
             // carries merged-first star order and qualifier-only hidden copies.
             // Use the ordinary planner's mapping instead of a second join rule.
@@ -186,8 +202,8 @@ internal enum ViewDefinition {
             }
             for ordinal in blockPlan.touched where scope.indices.contains(ordinal) { use(scope[ordinal]) }
             for column in implicitJoinUses { use(column) }
-            for reference in blockResolver.outerReferences where reference.depth > 0 && reference.depth <= enclosing.count {
-                let bindings = enclosing[enclosing.count - reference.depth]
+            for reference in blockResolver.outerReferences where reference.depth > 0 && reference.depth <= outers.count {
+                let bindings = outers[reference.depth - 1]
                 if bindings.indices.contains(reference.index) { use(bindings[reference.index]) }
             }
             // Join predicates resolve before the SELECT expression scope. They
@@ -225,9 +241,9 @@ internal enum ViewDefinition {
                 }
                 edits.append((item.span, bytes))
             }
-            enclosing.append(scope)
+            inheritedScopes = [scope] + outers
         }, leaveQuery: { block in
-            if case .select = block.body { _ = enclosing.popLast() }
+            inheritedScopes = scopeStack.removeLast()
             if case .with = block.body { _ = withFrames.popLast() }
             lexical = lexicalStack.removeLast()
         }, withPart: { clause, ordinal in

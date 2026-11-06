@@ -17,8 +17,9 @@ internal struct JoinCardinality {
     private let inputs: [Input]
     let parameters: [SQLValue]?
     let collatedKey: KeyEncoding.CollatedKey?
+    let planningProbe: PlanningProbe?
     init(left: RelationPlan, right: RelationPlan, parameters: [SQLValue]? = nil,
-         collatedKey: KeyEncoding.CollatedKey? = nil) {
+         collatedKey: KeyEncoding.CollatedKey? = nil, planningProbe: PlanningProbe? = nil) {
         var inputs: [Input] = []
         func visit(_ plan: RelationPlan, offset: Int) {
             if case .join(let left, let right, _, _) = plan.body {
@@ -29,6 +30,7 @@ internal struct JoinCardinality {
         }
         visit(left, offset: 0); visit(right, offset: left.columns.count)
         self.inputs = inputs; self.parameters = parameters; self.collatedKey = collatedKey
+        self.planningProbe = planningProbe
     }
     private func column(_ global: Int) -> Column? {
         for (ordinal, input) in inputs.enumerated() where global >= input.offset && global < input.offset + input.width {
@@ -46,6 +48,14 @@ internal struct JoinCardinality {
     }
     func rows(_ predicate: ResolvedExpression?, input: Int64) throws -> Int64 {
         guard input > 0, let predicate else { return max(0, input) }
+        var references: Set<Int> = []
+        StoredExpressionDependencies.walk([predicate]) { if case .column(let column) = $0.node { references.insert(column) } }
+        if !references.isEmpty, let owner = inputs.first(where: { relation in
+            references.allSatisfy { $0 >= relation.offset && $0 < relation.offset + relation.width }
+        }), let local = RelationAccess.local(predicate, offset: owner.offset, width: owner.width, earlier: 0..<0) {
+            return try PlanCardinality(table: owner.table, snapshot: owner.snapshot,
+                parameters: parameters, collatedKey: collatedKey, planningProbe: planningProbe).rows(local, input: input)
+        }
         switch predicate.node {
         case .binary("=", let a, let b, _):
             if case .column(let x) = a.node, case .column(let y) = b.node,
@@ -61,7 +71,7 @@ internal struct JoinCardinality {
         case .unary("not", let child): return input - (try rows(child, input: input))
         default: break
         }
-        return try PlanCardinality(table: nil, snapshot: nil, parameters: parameters, collatedKey: collatedKey).rows(predicate, input: input)
+        return try PlanCardinality(table: nil, snapshot: nil, parameters: parameters, collatedKey: collatedKey, planningProbe: planningProbe).rows(predicate, input: input)
     }
     private static func productCeil(_ a: Int64, _ b: Int64, denominator: Int64) -> Int64 {
         guard a > 0, b > 0, denominator > 0 else { return 0 }

@@ -40,7 +40,7 @@ internal enum DomainCommitGroup {
         var plans: [(DomainCommitParticipant, PreparedDomainCommit)] = []
         for item in ordered {
             var policy = item.policy; policy.domainName = item.name
-            if let plan = try item.lease.prepare(item.working, policy: policy, entropy: item.entropy) {
+            if let plan = try item.lease.prepare(item.working, policy: policy, entropy: item.entropy, synchronous: item.synchronous) {
                 plans.append((item, plan))
             }
         }

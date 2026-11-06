@@ -7,11 +7,15 @@ internal final class GinCandidates {
     private(set) var isClosed = false
     var remainingCount: Int { keys.count - position }
     init(_ keys: [[UInt8]]) { self.keys = keys }
-    func next() -> [UInt8]? {
+    func next(descending: Bool = false) -> [UInt8]? {
         guard !isClosed, position < keys.count else { close(); return nil }
-        let key = keys[position]; position += 1
+        let key = keys[descending ? keys.count - 1 - position : position]; position += 1
         if position == keys.count { close() }
         return key
+    }
+    func forEach(_ visit: ([UInt8]) throws -> Void) rethrows {
+        guard !isClosed else { return }
+        for key in keys[position...] { try visit(key) }
     }
     func close() { keys.removeAll(keepingCapacity: false); position = 0; isClosed = true }
 }

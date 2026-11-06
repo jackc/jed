@@ -56,7 +56,7 @@ internal struct SQLSubscript: Sendable {
     var upper: SQLExpression?
     var isSlice: Bool
 }
-internal struct SQLCaseArm: Sendable { var condition: SQLExpression; var result: SQLExpression }
+internal struct SQLCaseArm: Sendable { var condition: SQLExpression; var result: SQLExpression; var whenPosition = 0 }
 internal struct SQLArgument: Sendable { var name: SQLText?; var value: SQLExpression; var variadic = false }
 internal struct SQLCall: Sendable {
     var name: SQLText
@@ -315,7 +315,7 @@ internal enum SQLAlterViewAction: Sendable {
     case setDefault(SQLText, SQLExpression), dropDefault(SQLText)
     case setOptions([SQLViewOption]), resetOptions([SQLText])
 }
-internal struct SQLAssignment: Sendable { var column: SQLText; var value: SQLExpression? }
+internal struct SQLAssignment: Sendable { var column: SQLText; var value: SQLExpression?; var position = 0 }
 internal struct SQLReturning: Sendable {
     var oldAlias: SQLText?
     var newAlias: SQLText?
@@ -329,6 +329,10 @@ internal struct SQLInsert: Sendable {
     var source: Source
     var conflict: SQLConflict?
     var returning: SQLReturning?
+    var columnPositions: [Int] = []
+    func columnPosition(_ ordinal: Int) -> Int {
+        columnPositions.indices.contains(ordinal) ? columnPositions[ordinal] : 0
+    }
     enum Source: Sendable { case defaultValues, values([[SQLExpression?]]), query(SQLQuery) }
 }
 internal struct SQLConflict: Sendable {

@@ -262,15 +262,24 @@ final class GinBoundaryTests: XCTestCase {
         }
     }
 
-    func testMalformedRunsAndAtomicEditFailure() throws {
+    func testMalformedRunsAndAtomicSerializationFailure() throws {
         for malformed: [UInt8] in [[], [1, 0, 1], [1, 2, 0xff, 0xff], [1, 2, 0x80, 0x80, 0x80, 0, 3],
                                    [1, 2, 3, 0, 0, 2], [1, 2, 0, 0, 0, 2]] {
             expectCorruption { _ = try GinPostingRun.decode(termLength: 1, bytes: malformed) }
         }
         let term = key(1), codec = try PlainPageCodec(pageSize: 256)
-        var index = try GinIndex.build(postings: [GinPosting(term: term, storageKey: key(1))], codec: codec)
+        let index = try GinIndex.build(postings: [GinPosting(term: term, storageKey: key(1))], codec: codec)
         let before = try recordKeys(index.tree)
-        XCTAssertThrowsError(try index.insert(term: term, key: [UInt8](repeating: 200, count: 300)))
+        // Pending key-only nodes retain their staged bytes until commit
+        // preflight checks page fit, just like the other index trees.
+        var pending = index
+        XCTAssertTrue(try pending.insert(term: term, key: [UInt8](repeating: 200, count: 300)))
+        var allocator = try PageAllocator(highWater: 4, free: [2, 3], firstBody: codec.firstBodyPage)
+        XCTAssertThrowsError(try pending.tree.serialize(allocator: &allocator, fromScratch: true)) {
+            XCTAssertEqual(($0 as? JedError)?.code, "0A000")
+        }
+        XCTAssertEqual(allocator.highWater, 4)
+        XCTAssertEqual(Array(allocator.remaining), [2, 3])
         XCTAssertEqual(try recordKeys(index.tree), before)
         let op = try GinOpclass(type: TypeDescriptor(.scalar(.jsonb)))
         for term in [[UInt8(0)], [0x12], [0x13, 0], [3, 2], [1, 0, 3]] {

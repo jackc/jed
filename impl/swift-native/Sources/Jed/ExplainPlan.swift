@@ -25,7 +25,7 @@ internal struct ExplainPlan {
                         parameters: [SQLValue]) throws -> Self {
         let statement = CreateTableAs.normalize(statement.queryBody.map(SQLStatement.query) ?? statement)
         let domains = QueryDomains.statement(snapshot: snapshot, settings: settings)
-        var planning = settings; planning.domains = domains
+        var planning = settings; planning.domains = domains; planning.planningParameters = parameters
         let profile = ExecutionProfile()
         let body: Body, types: [TypeDescriptor], skipped: Bool
         if case .query(let syntax) = statement, !WritableCTEPlan.containsWrite(statement) {

@@ -1,0 +1,15 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#MISE description="Explicit opt-in: exhaustive frozen file interchange between native Swift and Rust/Go/TS"
+#USAGE flag "-c --configuration <configuration>" default="debug" help="debug or release Swift actor"
+#USAGE flag "--skip-swift-build" help="Build selected peer actors, require an existing Swift actor, and snapshot all before running"
+#USAGE flag "--no-build" help="Require already-built Swift/Go/Rust actors; snapshot them before running"
+#USAGE flag "--peers <peers>" default="rust,go,ts" help="Comma-separated supported peers; a subset is diagnostic only"
+#USAGE flag "--filter <filter>" help="Fixture-name substring; a subset is diagnostic only"
+#USAGE flag "--fixtures-only" help="Omit generated plain/key/passphrase/attachment cases; diagnostic only"
+#USAGE flag "--output <path>" help="Absent or empty evidence directory; default retained unique /tmp directory"
+#USAGE flag "--inventory" help="Write pinned applicability and required phases without opening any database"
+#USAGE flag "--check-adapter" help="Check strict framing, applicability and coverage without building cores"
+
+require_relative "../../impl/swift-native/Tools/interchange"
+exit SwiftInterchange.run

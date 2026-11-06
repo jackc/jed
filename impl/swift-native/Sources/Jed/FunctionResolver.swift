@@ -19,6 +19,7 @@ internal struct ResolvedFunction {
     var evaluationOrder: [Int]
     var constantArguments: [Bool]
     var hostID: UInt64?
+    var hostCallIdentity: HostCallIdentity?
     var variadicArray = false
     var regex: ResolvedRegexFunction?
     var name: String { metadata.name }
@@ -64,6 +65,11 @@ internal enum FunctionResolver {
         let rows = GeneratedSpec.functions.filter { $0.kind == "function" && $0.name.utf8.elementsEqual(call.name.utf8) }
         try validateNotation(call)
         let original = try call.arguments.map { try resolve($0.value, nil) }
+        return try finish(call, hosts: hosts, rows: rows, original: original, resolve: resolve)
+    }
+
+    private static func finish(_ call: SQLCall, hosts: [HostFunctionSignature], rows: [FunctionSpecFact],
+                               original: [ResolvedExpression], resolve: Resolve) throws -> ResolvedFunction {
         let hostRows = hosts.filter { $0.name == call.name && $0.arguments.count == original.count }
         var placements: [(FunctionSpecFact, Placement)] = []
         for row in rows {
@@ -176,7 +182,8 @@ internal enum FunctionResolver {
         }
         return ResolvedFunction(metadata: selected.fact, arguments: arguments, resultType: result,
                                 evaluationOrder: Array(arguments.indices), constantArguments: arguments.map(isConstant),
-                                hostID: selected.host?.id, variadicArray: call.arguments.last?.variadic == true)
+                                hostID: selected.host?.id, hostCallIdentity: selected.host.map { _ in HostCallIdentity() },
+                                variadicArray: call.arguments.last?.variadic == true)
     }
     /// These signatures are explicitly resolver-routed in the spec; their
     /// results depend on argument types, so no scalar catalog row exists.
@@ -211,42 +218,50 @@ internal enum FunctionResolver {
         } else {
             guard syntax.count == (name == "width_bucket" ? 4 : 2) else { throw JedError("42883", "function does not exist: \(name)") }
             arguments = try syntax.map { try resolve($0, nil) }
-            let count = name == "width_bucket" ? 3 : 2
-            let hasFloat = arguments.prefix(count).contains { $0.type?.type == .scalar(.f32) || $0.type?.type == .scalar(.f64) }
-            if hasFloat {
-                guard name == "mod" || name == "width_bucket" else { throw JedError("42883", "function does not exist: \(name)") }
-                let float: ScalarType = name == "width_bucket" || arguments.prefix(count).contains { $0.type?.type == .scalar(.f64) } ? .f64 : .f32
-                for index in 0..<count where numericLiteral(syntax[index]) != nil && arguments[index].type?.type != .scalar(float) {
-                    arguments[index] = try resolve(syntax[index], TypeDescriptor(.scalar(float)))
-                }
-            }
-            var common: SQLType?
-            for argument in arguments.prefix(count) {
-                if let type = argument.type?.type {
-                    guard case .scalar(let scalar) = type, scalar.integerWidth != nil || scalar == .decimal || hasFloat && (scalar == .f32 || scalar == .f64) else { throw JedError("42883", "function does not exist: \(name)") }
-                    if hasFloat && scalar != .f32 && scalar != .f64 { throw JedError(name == "mod" ? "42804" : "42883", "numeric argument types cannot be matched") }
-                }
-                do { common = try TypeRules.common(common, argument.type?.type) }
-                catch { throw JedError(name == "mod" ? "42804" : "42883", "numeric argument types cannot be matched") }
-            }
-            if name == "div" { common = .scalar(.decimal) }
-            if name == "width_bucket" { common = .scalar(hasFloat ? .f64 : .decimal) }
-            let target = TypeDescriptor(common ?? .scalar(.i64))
-            for index in 0..<count {
-                if arguments[index].type == nil { arguments[index] = try resolve(syntax[index], target) }
-                else if arguments[index].type?.type != target.type {
-                    let original = arguments[index]
-                    let cast = name == "mod" && original.type?.type == .scalar(.f32) && target.type == .scalar(.f64)
-                    arguments[index] = ResolvedExpression(type: target, node: cast ? .cast(original, target, .implicitCast) : .convert(original, target), position: original.position)
-                }
-            }
-            if name == "width_bucket" {
-                if arguments[3].type == nil { arguments[3] = try resolve(syntax[3], TypeDescriptor(.scalar(.i64))) }
-                guard case .scalar(let scalar) = arguments[3].type?.type, scalar.integerWidth != nil else { throw JedError("42883", "width_bucket count must be an integer") }
-                result = TypeDescriptor(.scalar(.i32))
-            } else { result = target }
+            return try numericSpecial(name, syntax: syntax, arguments: arguments, resolve: resolve)
         }
         let metadata = FunctionSpecFact(category: "special", name: name, kind: "function", metadata: ["result": .text(result.type.name), "null": .text("propagates"), "volatility": .text(volatility)])
+        return ResolvedFunction(metadata: metadata, arguments: arguments, resultType: result, evaluationOrder: Array(arguments.indices), constantArguments: arguments.map(isConstant))
+    }
+    private static func numericSpecial(_ name: String, syntax: [SQLExpression],
+                                       arguments initial: [ResolvedExpression], resolve: Resolve) throws -> ResolvedFunction {
+        var arguments = initial
+        let result: TypeDescriptor
+        let count = name == "width_bucket" ? 3 : 2
+        let hasFloat = arguments.prefix(count).contains { $0.type?.type == .scalar(.f32) || $0.type?.type == .scalar(.f64) }
+        if hasFloat {
+            guard name == "mod" || name == "width_bucket" else { throw JedError("42883", "function does not exist: \(name)") }
+            let float: ScalarType = name == "width_bucket" || arguments.prefix(count).contains { $0.type?.type == .scalar(.f64) } ? .f64 : .f32
+            for index in 0..<count where numericLiteral(syntax[index]) != nil && arguments[index].type?.type != .scalar(float) {
+                arguments[index] = try resolve(syntax[index], TypeDescriptor(.scalar(float)))
+            }
+        }
+        var common: SQLType?
+        for argument in arguments.prefix(count) {
+            if let type = argument.type?.type {
+                guard case .scalar(let scalar) = type, scalar.integerWidth != nil || scalar == .decimal || hasFloat && (scalar == .f32 || scalar == .f64) else { throw JedError("42883", "function does not exist: \(name)") }
+                if hasFloat && scalar != .f32 && scalar != .f64 { throw JedError(name == "mod" ? "42804" : "42883", "numeric argument types cannot be matched") }
+            }
+            do { common = try TypeRules.common(common, argument.type?.type) }
+            catch { throw JedError(name == "mod" ? "42804" : "42883", "numeric argument types cannot be matched") }
+        }
+        if name == "div" { common = .scalar(.decimal) }
+        if name == "width_bucket" { common = .scalar(hasFloat ? .f64 : .decimal) }
+        let target = TypeDescriptor(common ?? .scalar(.i64))
+        for index in 0..<count {
+            if arguments[index].type == nil { arguments[index] = try resolve(syntax[index], target) }
+            else if arguments[index].type?.type != target.type {
+                let original = arguments[index]
+                let cast = name == "mod" && original.type?.type == .scalar(.f32) && target.type == .scalar(.f64)
+                arguments[index] = ResolvedExpression(type: target, node: cast ? .cast(original, target, .implicitCast) : .convert(original, target), position: original.position)
+            }
+        }
+        if name == "width_bucket" {
+            if arguments[3].type == nil { arguments[3] = try resolve(syntax[3], TypeDescriptor(.scalar(.i64))) }
+            guard case .scalar(let scalar) = arguments[3].type?.type, scalar.integerWidth != nil else { throw JedError("42883", "width_bucket count must be an integer") }
+            result = TypeDescriptor(.scalar(.i32))
+        } else { result = target }
+        let metadata = FunctionSpecFact(category: "special", name: name, kind: "function", metadata: ["result": .text(result.type.name), "null": .text("propagates"), "volatility": .text("immutable")])
         return ResolvedFunction(metadata: metadata, arguments: arguments, resultType: result, evaluationOrder: Array(arguments.indices), constantArguments: arguments.map(isConstant))
     }
     private static let stringFamilies: Set<String> = ["text", "any", "bytea", "uuid", "date", "timestamp", "timestamptz", "interval", "json", "jsonb", "jsonpath"]
@@ -336,7 +351,7 @@ internal enum FunctionResolver {
     static func bareString(_ syntax: SQLExpression) -> Bool {
         switch syntax.kind { case .string: true; case .parenthesized(let child): bareString(child); default: false }
     }
-    private static func bareParameter(_ syntax: SQLExpression) -> Bool {
+    static func bareParameter(_ syntax: SQLExpression) -> Bool {
         switch syntax.kind { case .parameter: true; case .parenthesized(let child): bareParameter(child); default: false }
     }
     static func numericLiteral(_ syntax: SQLExpression) -> String? {

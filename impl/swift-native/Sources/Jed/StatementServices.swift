@@ -30,11 +30,17 @@ internal final class StatementServices {
     /// functions to the previous handler (the transaction owns sequence state).
     func install(into context: inout ExpressionContext) {
         let environment = settings.environment, fallback = context.functions.stateCall
+        context.spill = SpillConfig(workMemoryBytes: settings.options.workMemoryBytes, host: settings.scratchFileHost, meter: context.meter)
+        // Generated referential actions can elevate execution capabilities;
+        // diagnostic visibility remains the originating caller's envelope.
+        if context.errorDetail == nil { context.errorDetail = ErrorDetail(settings: settings) }
+        context.planningProbe = settings.planningProbe
         context.scalar.timezone = settings.timeZone
         context.scalar.statementClock = { try self.now() }
         context.functions.unicode = environment.unicode
         context.functions.timezones = environment.timezones
         context.functions.hostCall = { try environment.call($0, arguments: $1) }
+        context.functions.hostFunctions = environment.functions
         context.functions.stateCall = { name, values in
             switch name {
             case "clock_timestamp", "uuidv4", "gen_random_uuid", "uuidv7", "current_setting": return try self.call(name, values)

@@ -1,0 +1,14 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#MISE description="Explicit opt-in: release Swift and supported cores on the 143 frozen shared benchmark workloads"
+#USAGE flag "--no-build" help="Capture existing release executables; immutable snapshots still required"
+#USAGE flag "--filter <filter>" help="Nonempty diagnostic workload name substring; default all 143"
+#USAGE flag "--cores <cores>" default="swift,rust,go,ts" help="Exact unique core list including Swift; subsets are diagnostic"
+#USAGE flag "--rounds <rounds>" default="3" help="Sequential rounds with rotated core order"
+#USAGE flag "--data <path>" help="Existing canonical datasets; default bench/data/swift-native; never regenerated here"
+#USAGE flag "--output <path>" help="Empty evidence directory; default unique retained /tmp directory"
+#USAGE flag "--timeout <seconds>" default="21600" help="Per-build/per-core timeout, failures remain counted"
+#USAGE flag "--check-adapter" help="Check pinned inventory and strict result accounting without builds or measurements"
+
+require_relative "../../impl/swift-native/Tools/benchmark"
+exit SwiftNativeBenchmark.run

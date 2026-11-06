@@ -77,6 +77,9 @@ internal struct SystemRelationPlan {
                         column.identity.map { Self.text($0 ? "ALWAYS" : "BY DEFAULT") } ?? .null])
                 }
             }
+            // Attached catalog views are inspectable, but their definitions
+            // cannot be resolved as attached query relations (introspection §5).
+            if sourceDomain != DomainNames.main && sourceDomain != DomainNames.temporary { break }
             for view in catalog.views.sorted(by: { $0.name < $1.name }) {
                 var unrestricted = settings
                 unrestricted.domains = try QueryDomains.statement(snapshot: snapshot, settings: settings).viewScope(owner: sourceDomain)

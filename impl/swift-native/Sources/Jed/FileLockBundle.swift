@@ -9,7 +9,7 @@ import Darwin
 
 /// The kernel lock on the stable presence inode is the sole authority. Bundle
 /// contents are diagnostics/protocol metadata; they never establish liveness.
-internal final class FileLockBundle: Sendable {
+internal final class FileLockBundle: FileOwnership, Sendable {
     private struct State {
         var directory: Int32; var presence: Int32; var arrival: Int32
         var ownsPresence = false; var closed = false

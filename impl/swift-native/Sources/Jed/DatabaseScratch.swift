@@ -1,3 +1,5 @@
+internal protocol DatabaseScratchProvider: Sendable { var scratchFileHost: any ScratchFileHost { get } }
+
 internal protocol DatabaseScratchPolicy: Sendable {
     var forceSealedScratch: Bool { get }
 }
@@ -9,6 +11,7 @@ extension Database {
     internal var scratchFileHost: (any ScratchFileHost)? {
         #if os(Linux) || canImport(Darwin)
         if let local = localFileHost { return local.scratch }
+        if let provider = host as? any DatabaseScratchProvider { return provider.scratchFileHost }
         if let policy = host as? any DatabaseScratchPolicy {
             return NativeScratchFileHost(sealed: policy.forceSealedScratch || core.storage.pager.codec.reservedBytes != 0)
         }

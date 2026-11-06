@@ -36,7 +36,9 @@ internal enum ViewDomain {
 /// capability and expression errors remain in ordinary target preparation.
 static func written(_ name: SQLName, domains: QueryDomains) throws -> SQLText {
     var scope = domains, reference = name
-    let first = try domains.relation(name).name
+    let first: SQLText
+    do { first = try domains.relation(name).name }
+    catch let error as JedError where error.code == "42P01" { throw error.at(name.span.position) }
     var visited: Set<SQLText> = []
     for _ in 0..<256 {
         let owner = try scope.relation(reference)

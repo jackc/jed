@@ -19,7 +19,7 @@ extension CatalogDDL {
             try CatalogExpressionPolicy.validate(expression, isDefault: false)
             let resolver = try resolver(snapshot: snapshot, settings: settings, context: context, table: table)
             let resolved = try resolver.resolve(expression, expected: TypeDescriptor(.scalar(.boolean)))
-            guard resolved.type == nil || resolved.type?.type == .scalar(.boolean) else { throw JedError("42804", "argument of CHECK must be boolean") }
+            guard resolved.type == nil || resolved.type?.type == .scalar(.boolean) else { throw JedError("42804", "argument of CHECK must be boolean").at(expression.expressionLocation) }
             let referenced = resolver.referencedColumns.sorted()
             let chosen = try name(referenced.count == 1 ? [table.columns[referenced[0]].name] : [], label: "check", relation: false)
             table.checks.append(CatalogCheck(name: chosen, expression: try CatalogSQL.expression(expression, source: source),

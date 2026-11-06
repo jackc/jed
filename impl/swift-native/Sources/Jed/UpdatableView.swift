@@ -49,7 +49,7 @@ internal struct UpdatableView {
         }
     }
     static func resolve(_ view: CatalogView, operation: String, snapshot: DomainSnapshot,
-                        settings: SessionSettings, context: ExpressionContext) throws -> UpdatableView {
+                        settings: SessionSettings, context: ExpressionContext, privilegeOverride: PrivilegeSet? = nil) throws -> UpdatableView {
         var layers: [Layer] = [], current = view, bodySettings = settings, visited: Set<SQLText> = []
         let domains = QueryDomains.statement(snapshot: snapshot, settings: settings)
         var currentOwner = settings.targetDomain, currentSnapshot = snapshot
@@ -64,7 +64,7 @@ internal struct UpdatableView {
             let selected = try scope.relation(base)
             bodySettings.domains = scope; bodySettings.targetDomain = currentOwner
             if current.securityInvoker && selected.name != DomainNames.temporary {
-                let privilege: PrivilegeSet = operation == "insert into" ? .insert : operation == "update" ? .update : .delete
+                let privilege: PrivilegeSet = privilegeOverride ?? (operation == "insert into" ? .insert : operation == "update" ? .update : .delete)
                 try bodySettings.privileges.require(privilege, on: base.name)
                 if operation != "insert into", select.predicate != nil { try bodySettings.privileges.require(.select, on: base.name) }
             } else if !current.securityInvoker { bodySettings.privileges = bodySettings.privileges.withTableAccess() }
@@ -90,7 +90,7 @@ internal struct UpdatableView {
             }
             let columns = plan.columns.enumerated().map { ResultColumn(name: current.columns[$0.offset].name, type: $0.element.type ?? TypeDescriptor(.scalar(.text))) }
             layers.append(Layer(view: current, owner: currentOwner, baseDomain: selected.name, base: base, columns: columns, projections: plan.projections,
-                                predicate: plan.predicate, mapping: mapping, settings: bodySettings))
+                                predicate: plan.completePredicate ?? plan.predicate, mapping: mapping, settings: bodySettings))
             if let table = selected.snapshot.catalog.tables.first(where: { $0.name == base.name }) {
                 return UpdatableView(layers: layers, table: table, tableDomain: selected.name, operation: operation)
             }
@@ -98,9 +98,9 @@ internal struct UpdatableView {
             current = nested; currentOwner = selected.name; currentSnapshot = selected.snapshot
         }
     }
-    func column(_ name: SQLText) throws -> Int {
+    func column(_ name: SQLText, position: Int = 0) throws -> Int {
         guard let first = layers.first, let index = first.view.columns.firstIndex(where: { $0.name == name }) else {
-            throw JedError("42703", "column \(name) of view does not exist")
+            throw JedError("42703", "column \(name) of view does not exist").at(position)
         }
         return index
     }

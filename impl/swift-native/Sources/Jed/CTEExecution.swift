@@ -18,9 +18,14 @@ internal final class CTEExecution {
         var current = context; current.ctes = self; current.subqueries = SubqueryExecution()
         return current
     }
-    func bindingContext(_ binding: CTEBinding) -> ExpressionContext {
+    func bindingContext(_ binding: CTEBinding, meter: CostMeter? = nil) -> ExpressionContext {
         var current = bodyContext(); current.patterns = PatternExecution()
-        StatementServices(settings: binding.settings, meter: context.meter).install(into: &current)
+        current.eagerSubqueries = false
+        if let meter {
+            current.meter = meter; current.scalar.meter = meter
+            current.sequences?.install(into: &current)
+        }
+        StatementServices(settings: binding.settings, meter: current.meter).install(into: &current)
         return current
     }
     func prepare(_ plan: WithQueryPlan) throws {
@@ -64,18 +69,21 @@ internal final class CTEExecution {
         }
         rows[ObjectIdentifier(binding)] = output
     }
-    func scan(_ binding: CTEBinding, visit: ([SQLValue]) throws -> Void) throws {
+    func scan(_ binding: CTEBinding, plan override: SelectPlan? = nil, meter: CostMeter, visit: ([SQLValue]) throws -> Void) throws {
         let key = ObjectIdentifier(binding)
         guard bindings[key] != nil else {
             guard let parent else { throw JedError("XX000", "missing WITH binding execution") }
-            try parent.scan(binding, visit: visit); return
+            try parent.scan(binding, plan: override, meter: meter, visit: visit); return
         }
         if binding.buffers {
             guard let values = working[key] ?? rows[key] else { throw JedError("XX000", "WITH binding read before materialization") }
-            for row in values { context.meter.charge(1); try context.meter.step(); try visit(row) }
+            // Reference scan work belongs to the invoking query block. The
+            // completed source is admitted only after all scan-row charges.
+            for _ in values { try meter.step(); meter.charge(1) }
+            for row in values { try visit(row) }
         } else {
-            guard let plan = binding.plan else { throw JedError("XX000", "data-modifying CTE cannot be inlined") }
-            let execution = SelectExecution(plan: plan, context: bindingContext(binding))
+            guard let plan = override ?? binding.plan else { throw JedError("XX000", "data-modifying CTE cannot be inlined") }
+            let execution = SelectExecution(plan: plan, context: bindingContext(binding, meter: meter))
             defer { execution.close() }
             while let row = try execution.next() { try visit(row) }
         }

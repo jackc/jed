@@ -1,7 +1,18 @@
 #if os(Linux)
 import Foundation
 import XCTest
+import Synchronization
 @testable import Jed
+
+private final class RekeyRecordedEntropy: RandomSource {
+    private let source = SeededRandomSource(seed: 311)
+    private let counts = Mutex<[Int]>([])
+    func bytes(count: Int) throws -> [UInt8] {
+        counts.withLock { $0.append(count) }
+        return try source.bytes(count: count)
+    }
+    var requests: [Int] { counts.withLock { $0 } }
+}
 
 final class PageServiceClientTests: XCTestCase {
     private func setup(encrypted: Bool = false, limits: PageServiceOwnerLimits = .init()) throws -> (owner: DatabaseCore, client: DatabaseCore, role: PageServiceClient) {
@@ -68,6 +79,21 @@ final class PageServiceClientTests: XCTestCase {
             XCTAssertEqual(pair.owner.livePinCount, 0)
         }
     }
+
+    func testTransactionOwnedCursorBorrowsWriterPinAndExpiresWithItsToken() throws {
+        let pair = try setup(), writer = try pair.client.acquireWriter()
+        let borrowed = try writer.pin(writer.snapshot, borrowingWriter: true)
+        let retained = try borrowed.retain()
+        try barrier(pair.role)
+        XCTAssertEqual(pair.owner.livePinCount, 1, "borrowing must not create a separate owner read pin")
+        borrowed.close(); try barrier(pair.role)
+        XCTAssertEqual(pair.owner.livePinCount, 1)
+        writer.close(); try barrier(pair.role)
+        XCTAssertEqual(pair.owner.livePinCount, 0)
+        XCTAssertThrowsError(try retained.checkRole()) { XCTAssertEqual(($0 as? JedError)?.code, "08006") }
+        retained.close(); try barrier(pair.role)
+        XCTAssertEqual(pair.owner.livePinCount, 0)
+    }
     func testExpiredWriterCannotLeakNewerReadPinDuringCursorRetention() throws {
         let pair = try setup(limits: .init(idleWriteMilliseconds: 20))
         let writer = try pair.client.acquireWriter(); defer { writer.close() }
@@ -82,6 +108,22 @@ final class PageServiceClientTests: XCTestCase {
         XCTAssertEqual(pair.owner.livePinCount, 0)
     }
 
+    func testRejectedClientRekeyConsumesKeyPreparationBeforeOwnerAdmission() throws {
+        let pair = try setup(encrypted: true), random = RekeyRecordedEntropy()
+        let database = Database(core: pair.client, environment: Environment.builder().build(), keySource: random)
+        defer { try? database.close() }
+        let before = pair.client.storage.pager.selectedKeyBlock, version = database.version
+        let credential = try Credential.hostKey([UInt8](repeating: 3, count: 32))
+        XCTAssertThrowsError(try database.rekey(credential: credential)) { XCTAssertEqual(($0 as? JedError)?.code, "55006") }
+        XCTAssertEqual(random.requests, [32, 32, 12])
+        XCTAssertEqual(pair.client.storage.pager.selectedKeyBlock, before)
+        XCTAssertEqual(database.version, version)
+        XCTAssertThrowsError(try database.rekey(credential: nil)) { XCTAssertEqual(($0 as? JedError)?.code, "55006") }
+        XCTAssertEqual(random.requests, [32, 32, 12], "a plaintext target draws no key material")
+        let reader = try database.readSession(); reader.close()
+        XCTAssertFalse(pair.client.storage.pager.isPoisoned)
+    }
+
     func testEndedClientRoleRefusesStatementAndCommitButAllowsRollback() throws {
         let pair = try setup(), database = Database(core: pair.client, environment: Environment.builder().build())
         let session = try database.session(), reader = try database.readSession()
@@ -92,6 +134,34 @@ final class PageServiceClientTests: XCTestCase {
         try session.rollback()
         XCTAssertEqual(session.status, .idle)
         try database.close()
+    }
+
+    func testPublicIntegrityUsesRemoteSnapshotAndReleasesOwnerPin() throws {
+        for encrypted in [false, true] {
+            let pair = try setup(encrypted: encrypted)
+            let owner = Database(core: pair.owner, environment: Environment.builder().build())
+            let client = Database(core: pair.client, environment: Environment.builder().build())
+            defer { try? client.close(); try? owner.close() }
+            try owner.execute("CREATE TABLE checked (id i32 PRIMARY KEY, value text)")
+            try owner.execute("INSERT INTO checked VALUES (1, repeat('x', 20000))")
+            for level in [IntegrityLevel.quick, .full] {
+                let report = try client.integrityCheck(options: .init(level: level, constraints: true, maxFindings: 0))
+                XCTAssertTrue(report.ok, "\(encrypted) \(level): \(report.findings)")
+                XCTAssertEqual(report.rows, 1)
+                try barrier(pair.role)
+                XCTAssertEqual(pair.owner.livePinCount, 0)
+            }
+            let writer = try owner.writeSession()
+            try writer.execute("INSERT INTO checked VALUES (2, 'pending')")
+            XCTAssertEqual(try client.integrityCheck().rows, 1)
+            try writer.commit(); writer.close()
+            XCTAssertEqual(try client.integrityCheck().rows, 2)
+            try barrier(pair.role)
+            XCTAssertEqual(pair.owner.livePinCount, 0)
+            pair.role.close()
+            XCTAssertThrowsError(try client.integrityCheck()) { XCTAssertEqual(($0 as? JedError)?.code, "08006") }
+            XCTAssertEqual(pair.client.livePinCount, 0)
+        }
     }
 }
 #endif

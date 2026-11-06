@@ -129,7 +129,7 @@ internal enum DecimalFunctions {
         guard direction != 0 else { throw JedError("2201G", "lower bound cannot equal upper bound") }
         if direction * operand.compare(to: low) > 0 { return 0 }
         if direction * operand.compare(to: high) <= 0 {
-            guard count < Int32.max else { throw JedError("22003", "integer out of range") }
+            guard count < Int32.max else { throw JedError("22003", "integer out of range").withDataType("i32") }
             return count + 1
         }
         let distance = direction < 0 ? operand.addingUncapped(low.negated()) : low.addingUncapped(operand.negated())
@@ -142,7 +142,7 @@ internal enum DecimalFunctions {
             if width.multiplyingUncapped(SQLDecimal(middle)).compare(to: numerator) <= 0 { lower = middle }
             else { upper = middle }
         }
-        guard lower < Int32.max else { throw JedError("22003", "integer out of range") }
+        guard lower < Int32.max else { throw JedError("22003", "integer out of range").withDataType("i32") }
         return lower + 1
     }
 }

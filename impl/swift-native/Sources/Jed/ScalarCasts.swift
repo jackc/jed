@@ -18,7 +18,9 @@ internal enum ScalarCasts {
         case .i16, .i32, .i64: value = .integer(try integer(text, type: type))
         case .decimal: value = .decimal(try SQLDecimal.parse(text.description))
         case .boolean: value = .boolean(try boolean(text))
-        case .f32, .f64: value = try FloatText.parse(text, type: type)
+        case .f32, .f64:
+            do { value = try FloatText.parse(text, type: type) }
+            catch let error as JedError where error.code == "22003" { throw error.withDataType(type.name) }
         case .uuid: value = .uuid(try SQLUUID(bytes: uuid(text)))
         case .bytea: value = .bytea(try bytea(text))
         case .timestamp, .timestamptz, .date, .interval:
@@ -58,6 +60,13 @@ internal enum ScalarCasts {
                 // never assignment coercion of text data or bound parameters.
                 inputContext.statementMicros = nil; inputContext.statementClock = nil
             }
+            if target == .interval {
+                // A runtime text cast parses the unqualified interval first;
+                // only literal/assignment input interprets text under a qualifier.
+                let interval = try input(text, to: TypeDescriptor(.scalar(.interval)),
+                                         explicit: mode == .explicit, context: inputContext)
+                return try applyTypmod(interval, descriptor: descriptor, explicit: mode == .explicit)
+            }
             return try input(text, to: descriptor, explicit: mode == .explicit, context: inputContext)
         } else if target == .text {
             result = .text(try render(value, context: context, growth: true))
@@ -70,16 +79,24 @@ internal enum ScalarCasts {
             case (.boolean(let b), .i32): result = .integer(b ? 1 : 0)
             case (.integer(let n), .f32), (.integer(let n), .f64): result = try FloatText.fromDecimal(SQLDecimal(n), type: target)
             case (.decimal(let n), .i16), (.decimal(let n), .i32), (.decimal(let n), .i64):
-                result = .integer(try checkedInteger(n.integerValue(), type: target))
+                result = try decimalCast(n, to: target)
             case (.decimal(let n), .f32), (.decimal(let n), .f64): result = try FloatText.fromDecimal(n, type: target)
             case (.f32(let bits), .f64): result = .f64(ValueCodec.canonicalFloat64(Double(Float(bitPattern: bits)).bitPattern))
             case (.f64(let bits), .f32):
                 let n = Double(bitPattern: bits), narrowed = Float(n)
-                guard !n.isFinite || narrowed.isFinite else { throw JedError("22003", "f32 out of range") }
+                guard !n.isFinite || narrowed.isFinite else { throw JedError("22003", "f32 out of range").withDataType(target.name) }
                 guard n == 0 || narrowed != 0 else { throw JedError("22003", "f32 out of range: underflow") }
                 result = .f32(ValueCodec.canonicalFloat32(narrowed.bitPattern))
-            case (.f32(let bits), _): result = try decimalCast(BinaryFloatDecimal.exact(bits32: bits), to: target)
-            case (.f64(let bits), _): result = try decimalCast(BinaryFloatDecimal.exact(bits64: bits), to: target)
+            case (.f32(let bits), _):
+                do { result = try decimalCast(BinaryFloatDecimal.exact(bits32: bits), to: target) }
+                catch let error as JedError where error.code == "22003" && target.integerWidth != nil {
+                    throw error.withDataType(target.name)
+                }
+            case (.f64(let bits), _):
+                do { result = try decimalCast(BinaryFloatDecimal.exact(bits64: bits), to: target) }
+                catch let error as JedError where error.code == "22003" && target.integerWidth != nil {
+                    throw error.withDataType(target.name)
+                }
             case (.uuid(let uuid), .bytea): result = .bytea(uuid.bytes)
             case (.bytea(let bytes), .uuid):
                 guard bytes.count == 16 else { throw JedError("22P02", "invalid input syntax for type uuid") }
@@ -97,10 +114,11 @@ internal enum ScalarCasts {
 
     private static func decimalCast(_ value: SQLDecimal, to target: ScalarType) throws -> SQLValue {
         if target == .decimal { return .decimal(value) }
-        return .integer(try checkedInteger(value.integerValue(), type: target))
+        do { return .integer(try checkedInteger(value.integerValue(), type: target)) }
+        catch let error as JedError where error.code == "22003" { throw error.withDataType(target.name) }
     }
     static func checkedInteger(_ value: Int64, type: ScalarType) throws -> Int64 {
-        guard type.admits(value) else { throw JedError("22003", "\(type.name) out of range") }
+        guard type.admits(value) else { throw JedError("22003", "\(type.name) out of range").withDataType(type.name) }
         return value
     }
 
@@ -118,7 +136,7 @@ internal enum ScalarCasts {
                 }
                 if offset < text.utf8.count {
                     guard explicit || text.utf8[offset...].allSatisfy({ $0 == 32 }) else {
-                        throw JedError("22001", "value too long for type character varying(\(limit))")
+                        throw JedError("22001", "value too long for type character varying(\(limit))").withDataType("varchar(\(limit))")
                     }
                     return .text(SQLText(validatedUTF8: Array(text.utf8[..<offset])))
                 }
@@ -172,7 +190,7 @@ internal enum ScalarCasts {
         let bytes = text.utf8
         var p = 0
         func malformed() -> JedError { JedError("22P02", "invalid input syntax for type \(type.name): \"\(text)\"") }
-        func overflow() -> JedError { JedError("22003", "value \"\(text)\" is out of range for type \(type.name)") }
+        func overflow() -> JedError { JedError("22003", "value \"\(text)\" is out of range for type \(type.name)").withDataType(type.name) }
         while p < bytes.count && Temporal.space(bytes[p]) { p += 1 }
         var negative = false
         if p < bytes.count && (bytes[p] == 43 || bytes[p] == 45) { negative = bytes[p] == 45; p += 1 }

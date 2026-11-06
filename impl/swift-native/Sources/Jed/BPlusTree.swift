@@ -100,7 +100,6 @@ internal struct BPlusTree: Sendable {
     var nodeCount: Int { root?.nodeCount ?? 0 }
     var height: Int { root?.height ?? 0 }
     var isEmpty: Bool { root == nil }
-    var recordMaximum: Int { (codec.capacity - max(12, 12 + 16 * types.count)) / 2 }
 
     static func open(root reference: PageReference, rowCount: Int64? = nil, pageCount: UInt32,
                      types: [TypeDescriptor], pool: NodePool) throws -> BPlusTree {
@@ -187,8 +186,10 @@ internal struct BPlusTree: Sendable {
 
     @discardableResult
     mutating func insert(_ record: PackedRecord) throws -> PackedRecord? {
-        guard record.cells.map(\.type) == types, record.weight <= recordMaximum else {
-            throw JedError("0A000", "record exceeds its tree's row size or type contract")
+        // Page fit is a commit-preflight condition. Keep an unsplittable
+        // pending node so its staged record still participates in Q3 admission.
+        guard record.cells.map(\.type) == types else {
+            throw JedError("0A000", "record differs from its tree's type contract")
         }
         guard count != Int64.max else { throw JedError("54000", "tree row count exhausted") }
         let result: Rebuild
@@ -233,20 +234,10 @@ internal struct BPlusTree: Sendable {
         if records.isEmpty {
             return TreeNode(leaf: nil, emptyPayload: PackedLeaf.overhead(records: 0, types: types))
         }
-        let payload = try PackedLeaf.encodePayload(records, types: types, capacity: codec.capacity)
-        let leaf = try PackedLeaf(bytes: logicalLeaf(payload, count: records.count), types: types, codec: codec)
+        let leaf = try PackedLeaf.pending(records, types: types, codec: codec)
         var pending: [Int: [Int: PendingOverflow]] = [:]
         for (row, record) in records.enumerated() where !record.overflows.isEmpty { pending[row] = record.overflows }
         return TreeNode(leaf: leaf, pending: pending, reference: reference)
-    }
-
-    private func logicalLeaf(_ payload: [UInt8], count: Int) throws -> [UInt8] {
-        var writer = ByteWriter(); writer.u8(2); writer.u8(0); writer.u16(0)
-        writer.u32(UInt32(count)); writer.u32(0); writer.u32(0); writer.append(payload)
-        writer.append(repeatElement(UInt8(0), count: codec.capacity - payload.count))
-        var bytes = writer.bytes
-        try PageEnvelope.putU32(PageEnvelope.checksum(bytes, at: 12), into: &bytes, at: 12)
-        return bytes
     }
 
     /// Exact format.md fan-out selection. nil is the first delete abandon guard.
@@ -269,7 +260,7 @@ internal struct BPlusTree: Sendable {
             capacity: codec.capacity, rightEdge: edited == n - 1,
             left: { prefix[$0] + PackedLeaf.overhead(records: $0, types: types) },
             right: { total - prefix[$0] + PackedLeaf.overhead(records: n - $0, types: types) }) else {
-            throw JedError("0A000", "leaf cannot fit the row-size contract")
+            return .whole(try makeLeaf(records))
         }
         return .split(try makeLeaf(Array(records[..<middle])), records[middle].key,
                       try makeLeaf(Array(records[middle...])))
@@ -277,8 +268,7 @@ internal struct BPlusTree: Sendable {
 
     private func buildInterior(_ keys: [[UInt8]], children: [TreeChild], edited: Int?) -> Rebuild? {
         let n = keys.count, payload = PackedInterior.payloadSize(keys: keys, codec: codec)
-        if payload <= codec.capacity { return .whole(TreeNode(keys: keys, children: children, codec: codec)) }
-        guard n >= 2 else { return nil }
+        if payload <= codec.capacity || n < 2 { return .whole(TreeNode(keys: keys, children: children, codec: codec)) }
         let middle: Int
         if n == 2 { middle = 1 }
         else {
@@ -293,7 +283,6 @@ internal struct BPlusTree: Sendable {
         }
         let left = TreeNode(keys: Array(keys[..<middle]), children: Array(children[...middle]), codec: codec)
         let right = TreeNode(keys: Array(keys[(middle + 1)...]), children: Array(children[(middle + 1)...]), codec: codec)
-        guard left.payloadSize <= codec.capacity, right.payloadSize <= codec.capacity else { return nil }
         return .split(left, keys[middle], right)
     }
 
@@ -314,10 +303,11 @@ internal struct BPlusTree: Sendable {
             keys.insert(separator, at: index); children[index] = .resident(left)
             children.insert(.resident(right), at: index + 1)
         }
-        guard let rebuilt = buildInterior(keys, children: children, edited: index) else {
-            throw JedError.corruption("insert cannot split a valid interior")
-        }
-        return rebuilt
+        // No admissible interior split is normally only a delete-merge case.
+        // An already oversized pending separator may also reach it: preserve
+        // the pending shape and let commit preflight reject it safely.
+        return buildInterior(keys, children: children, edited: index)
+            ?? .whole(TreeNode(keys: keys, children: children, codec: codec))
     }
 
     private func removing(_ node: TreeNode, key: [UInt8]) throws -> (TreeNode, PackedRecord?) {
@@ -372,6 +362,26 @@ internal struct BPlusTree: Sendable {
         return TreeNode(keys: keys, children: children, codec: codec)
     }
 
+    /// A mixed resident root is re-faulted after persistence when any unchanged
+    /// external value was inherited from disk. That converts the entire leaf
+    /// to stored references, including fresh values serialized beside it.
+    /// A root containing only resident values keeps those payloads instead.
+    mutating func refaultRoot(afterWriting written: Set<UInt32>,
+                             read: (PageReference, [TypeDescriptor]) throws -> PackedLeaf) throws {
+        guard pool != nil, case .resident(let node) = root, node.isLeaf,
+              let reference = node.reference, written.contains(reference.index) else { return }
+        for row in 0..<node.entryCount {
+            let record = node.record(at: row)
+            for column in record.cells.indices where record.overflows[column] == nil {
+                if try record.cells[column].largeFacts(encrypted: codec.reservedBytes != 0)?.external != nil {
+                    let leaf = try read(reference, types)
+                    root = .resident(TreeNode(leaf: leaf, reference: reference))
+                    return
+                }
+            }
+        }
+    }
+
     /// Prepares bytes without device writes or mutation of any published node.
     /// Whole-image export renumbers and copies inherited chains; incremental
     /// commit retains clean subtrees and unchanged chain pointers.
@@ -403,6 +413,7 @@ internal struct BPlusTree: Sendable {
             children.append(try serialize(child, allocator: &allocator, fromScratch: fromScratch, entropy: entropy,
                 pages: &pages, kept: &kept, chains: &chains))
         }
+        guard node.payloadSize <= codec.capacity else { throw JedError("0A000", "tree node exceeds page capacity") }
         // From-scratch: leaf's own id precedes its chains. Incremental: fresh
         // chains precede the leaf. Sealing always binds children/chains first.
         let earlyIndex = fromScratch ? try allocator.allocate() : nil

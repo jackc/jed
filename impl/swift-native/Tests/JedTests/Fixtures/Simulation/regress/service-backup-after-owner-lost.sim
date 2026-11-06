@@ -1,0 +1,22 @@
+# A backup that is the first look at main after a relaxed owner died (simulation-testing.md §8.2):
+# under synchronous = off the owner's batch may be lost back to the floor, so the client that backs up
+# promotes and may copy any version from the floor up. The backup oracle compared the copy against the
+# last published version and ignored the lost owner, which every session's observe already allowed.
+# Shrunk from the service profile, seed 63.
+# format: simulation
+# profile: service
+# seed: 63
+# page_size: 512
+# cache_bytes: 8192
+# synchronous: off
+# processes: service
+# clock: 1700000000000000
+open w1 write p0
+on w1 CREATE TABLE t1 (id i64 PRIMARY KEY, c1 i32, c2 text, c3 text)
+commit w1
+spawn p2
+open w15 write p0
+on w15 INSERT INTO t1 (id, c1, c2, c3) SELECT g, (g * 4 + 22) % 1000, md5(g::text), md5(g::text) FROM generate_series(106, 141) g
+fault process_crash issue=880 nth=2
+commit w15
+backup compacted

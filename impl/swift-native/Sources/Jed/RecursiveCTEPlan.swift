@@ -136,10 +136,10 @@ internal struct RecursiveCTEPlan {
         for index in anchor.columns.indices {
             let a = anchor.projections[index], b = term.projections[index]
             let common = try TypeRules.common(a.type?.type, b.type?.type)
-            guard common == a.type?.type else { throw JedError("42804", "recursive term widens its anchor column type") }
+            guard common == a.type?.type else { throw JedError("42804", "recursive term widens its anchor column type").hinted(ErrorHints.recursiveType).at(a.location) }
             if let type = a.type, type.decimal != nil || type.textLimit != nil || type.temporal != nil {
                 guard type.decimal == b.type?.decimal, type.textLimit == b.type?.textLimit, type.temporal == b.type?.temporal else {
-                    throw JedError("42804", "recursive term changes its anchor column type modifier")
+                    throw JedError("42804", "recursive term changes its anchor column type modifier").hinted(ErrorHints.recursiveType).at(a.location)
                 }
             }
             if !all { try TypeRules.comparable(common, common) }
@@ -149,7 +149,7 @@ internal struct RecursiveCTEPlan {
                 func identity(_ value: CollationDerivation) -> CollationDerivation {
                     value == .none ? .implicit(SQLText(validatedUTF8: [67])) : value.asColumn
                 }
-                guard identity(first) == identity(combined) else { throw JedError("42P21", "recursive term changes its anchor column collation") }
+                guard identity(first) == identity(combined) else { throw JedError("42P21", "recursive term changes its anchor column collation").hinted(ErrorHints.recursiveCollation).at(a.location) }
             }
         }
     }

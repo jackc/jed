@@ -3,41 +3,43 @@
 internal enum CatalogDDL {
     static func execute(_ statement: SQLStatement, source: SQLText, snapshot: inout DomainSnapshot,
                         settings: SessionSettings, context: ExpressionContext, meter: CostMeter) throws -> CommandTag? {
-        let command: String
-        switch statement {
-        case .createType: command = "CREATE TYPE"
-        case .createTable: command = "CREATE TABLE"
-        case .createIndex: command = "CREATE INDEX"
-        case .createSequence: command = "CREATE SEQUENCE"
-        case .createView: command = "CREATE VIEW"
-        case .alterView: command = "ALTER VIEW"
-        case .alterSequence: command = "ALTER SEQUENCE"
-        case .alterTable: command = "ALTER TABLE"
-        case .drop(let drop) where ["type", "table", "index", "sequence", "view"].contains(drop.object): command = "DROP " + drop.object.uppercased()
-        default: return nil
-        }
-        try CatalogDomain.requireDDL(settings, statement: statement)
-        var work = snapshot
-        if settings.targetDomain == DomainNames.temporary, let main = settings.domains?.snapshots[DomainNames.main] { try work.borrow(main) }
-        switch statement {
-        case .createType(let definition): try createType(definition, snapshot: &work, settings: settings)
-        case .createTable(let definition):
-            try createTable(definition, source: source, snapshot: &work, settings: settings, context: context)
-        case .createIndex(let definition):
-            try createIndex(definition, source: source, snapshot: &work, settings: settings, context: context)
-        case .createSequence(let definition): try createSequence(definition, snapshot: &work, settings: settings)
-        case .createView(let definition): try createView(definition, source: source, snapshot: &work, settings: settings, context: context)
-        case .alterView(let definition): try alterView(definition, source: source, snapshot: &work, settings: settings, context: context)
-        case .alterSequence(let definition): try alterSequence(definition, snapshot: &work, settings: settings)
-        case .alterTable(let definition): try alterTable(definition, source: source, snapshot: &work, settings: settings, context: context)
-        case .drop(let definition) where definition.object == "index": try dropIndexes(definition, snapshot: &work, settings: settings)
-        case .drop(let definition) where definition.object == "sequence": try dropSequences(definition, snapshot: &work, settings: settings)
-        case .drop(let definition) where definition.object == "view": try dropViews(definition, snapshot: &work, settings: settings)
-        case .drop(let definition): try drop(definition, snapshot: &work, settings: settings)
-        default: break
-        }
-        snapshot = work
-        return CommandTag(command: command, rowsAffected: 0, cost: meter.accrued)
+        do {
+            let command: String
+            switch statement {
+            case .createType: command = "CREATE TYPE"
+            case .createTable: command = "CREATE TABLE"
+            case .createIndex: command = "CREATE INDEX"
+            case .createSequence: command = "CREATE SEQUENCE"
+            case .createView: command = "CREATE VIEW"
+            case .alterView: command = "ALTER VIEW"
+            case .alterSequence: command = "ALTER SEQUENCE"
+            case .alterTable: command = "ALTER TABLE"
+            case .drop(let drop) where ["type", "table", "index", "sequence", "view"].contains(drop.object): command = "DROP " + drop.object.uppercased()
+            default: return nil
+            }
+            try CatalogDomain.requireDDL(settings, statement: statement)
+            var work = snapshot
+            if settings.targetDomain == DomainNames.temporary, let main = settings.domains?.snapshots[DomainNames.main] { try work.borrow(main) }
+            switch statement {
+            case .createType(let definition): try createType(definition, snapshot: &work, settings: settings)
+            case .createTable(let definition):
+                try createTable(definition, source: source, snapshot: &work, settings: settings, context: context)
+            case .createIndex(let definition):
+                try createIndex(definition, source: source, snapshot: &work, settings: settings, context: context)
+            case .createSequence(let definition): try createSequence(definition, snapshot: &work, settings: settings)
+            case .createView(let definition): try createView(definition, source: source, snapshot: &work, settings: settings, context: context)
+            case .alterView(let definition): try alterView(definition, source: source, snapshot: &work, settings: settings, context: context)
+            case .alterSequence(let definition): try alterSequence(definition, snapshot: &work, settings: settings)
+            case .alterTable(let definition): try alterTable(definition, source: source, snapshot: &work, settings: settings, context: context)
+            case .drop(let definition) where definition.object == "index": try dropIndexes(definition, snapshot: &work, settings: settings)
+            case .drop(let definition) where definition.object == "sequence": try dropSequences(definition, snapshot: &work, settings: settings)
+            case .drop(let definition) where definition.object == "view": try dropViews(definition, snapshot: &work, settings: settings)
+            case .drop(let definition): try drop(definition, snapshot: &work, settings: settings)
+            default: break
+            }
+            snapshot = work
+            return CommandTag(command: command, rowsAffected: 0, cost: meter.accrued)
+        } catch let error as JedError { throw error.inDatabase(settings.targetDomain) }
     }
 
     static func nameInMain(_ name: SQLName) throws -> SQLText {
@@ -173,7 +175,7 @@ internal enum CatalogDDL {
             try CatalogExpressionPolicy.validate(expression, isDefault: false)
             checkResolver.referencedColumns = []
             let resolved = try checkResolver.resolve(expression, expected: TypeDescriptor(.scalar(.boolean)))
-            guard resolved.type == nil || resolved.type?.type == .scalar(.boolean) else { throw JedError("42804", "argument of CHECK must be boolean") }
+            guard resolved.type == nil || resolved.type?.type == .scalar(.boolean) else { throw JedError("42804", "argument of CHECK must be boolean").at(expression.expressionLocation) }
             let references = checkResolver.referencedColumns.sorted()
             let hosts = try StoredExpressionDependencies.hosts([resolved], environment: settings.environment)
             checks.append((item.syntax, try CatalogSQL.expression(expression, source: source), references, hosts))
@@ -291,10 +293,13 @@ internal enum CatalogDDL {
         if case .null = literal.kind { return nil }
         if case .array = target.type { throw JedError("0A000", "array columns support only DEFAULT NULL") }
         if case .range = target.type { throw JedError("0A000", "range columns support only DEFAULT NULL") }
-        let resolved = try AssignmentValues.resolve(expression, to: target, resolver: resolver)
+        let resolved = try AssignmentValues.resolve(expression, to: target, resolver: resolver, assignmentPosition: 0)
         if case .composite = target.type { return .expression(try CatalogSQL.expression(expression, source: source)) }
         switch literal.kind {
         case .string(let text):
+            if case .dateInput = resolved.node {
+                return .expression(try CatalogSQL.expression(expression, source: source))
+            }
             return .constant(try ScalarCasts.input(text, to: target, explicit: false, context: resolver.scalar))
         case .number, .boolean:
             return .constant(try AssignmentValues.store(context.evaluate(resolved), expression: resolved, to: target, context: context))
@@ -357,7 +362,7 @@ internal enum CatalogDDL {
             if used || temporaryUse { throw JedError(definition.cascade ? "0A000" : "2BP01", "cannot drop type because other objects depend on it") }
         } else {
             let dependent = image.tables.contains { !targets.contains($0.name) && $0.foreignKeys.contains { targets.contains($0.referencedTable) } }
-            if dependent && !definition.cascade { throw JedError("2BP01", "cannot drop table because other objects depend on it") }
+            if dependent && !definition.cascade { throw JedError("2BP01", "cannot drop table because other objects depend on it").hinted(DependencyDiagnostics.cascade) }
         }
         let dependencyKind: UInt8 = definition.object == "table" ? 0 : 3
         var views: Set<SQLText> = []
@@ -366,7 +371,7 @@ internal enum CatalogDDL {
             changed = false
             for view in image.views where !views.contains(view.name) {
                 if view.dependencies.contains(where: { $0.kind == dependencyKind && targets.contains($0.name) || $0.kind == 1 && views.contains($0.name) }) {
-                    guard definition.cascade else { throw JedError("2BP01", "cannot drop \(definition.object) because other objects depend on it") }
+                    guard definition.cascade else { throw JedError("2BP01", "cannot drop \(definition.object) because other objects depend on it").hinted(DependencyDiagnostics.cascade) }
                     views.insert(view.name); changed = true
                 }
             }

@@ -7,10 +7,18 @@ internal final class AggregateOrderedSet {
     let context: ExpressionContext
     private var rows: [[SQLValue]] = []
     private var reserved: Int64 = 0
+    private let measured: Bool
 
-    init(plan: AggregatePlan, context: ExpressionContext) { self.plan = plan; self.context = context }
+    init(plan: AggregatePlan, context: ExpressionContext, measured: Bool = true) {
+        self.plan = plan; self.context = context; self.measured = measured
+    }
     private func reserve(_ bytes: Int64) throws {
+        guard measured else { return }
         try context.meter.reserveQuery(bytes); reserved = saturatingAdd(reserved, bytes)
+    }
+    func drainRetained(_ visit: ([SQLValue]) throws -> Void) rethrows {
+        defer { rows = [] }
+        for row in rows { try visit(row) }
     }
     static func chargeKey(_ value: SQLValue, type: TypeDescriptor, context: ExpressionContext) throws {
         let units: Int64
@@ -35,7 +43,9 @@ internal final class AggregateOrderedSet {
             value = .f64(try AggregateStatistics.number(value).bitPattern)
         }
         try Self.chargeKey(value, type: plan.withinGroup[0].type, context: context)
-        try reserve(MemorySizes.value(value)); rows.append([value])
+        // The retained-input contract measures the authored argument, even
+        // when percentile_cont stores its widened floating representation.
+        try reserve(MemorySizes.value(incoming[0])); rows.append([value])
     }
     func finish(direct: [SQLValue]) throws -> SQLValue {
         if Self.hypothetical.contains(plan.name) { return try hypothetical(direct) }

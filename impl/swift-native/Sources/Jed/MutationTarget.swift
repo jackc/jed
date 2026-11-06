@@ -9,16 +9,18 @@ internal enum MutationTarget {
     static func resolve(_ name: SQLName, operation: String, snapshot: DomainSnapshot,
                         settings: SessionSettings, context: ExpressionContext) throws -> Prepared {
         let domains = QueryDomains.statement(snapshot: snapshot, settings: settings)
-        let selected = try domains.relation(name)
-        let privilege: PrivilegeSet = operation == "insert into" ? .insert : operation == "update" ? .update : .delete
+        let selected: (name: SQLText, snapshot: DomainSnapshot)
+        do { selected = try domains.relation(name) }
+        catch let error as JedError where error.code == "42P01" { throw error.at(name.span.position) }
+        let privilege: PrivilegeSet = operation == "merge" ? .select : operation == "insert into" ? .insert : operation == "update" ? .update : .delete
         let relation: MutationExecutor.Relation
         var inherited = settings
         if let definition = selected.snapshot.catalog.views.first(where: { $0.name == name.name }) {
             guard !DomainNames.isAttachment(selected.name) else { throw JedError("0A000", "writes through attached views are not supported") }
             if selected.name != DomainNames.temporary { try settings.privileges.require(privilege, on: definition.name) }
             var scoped = settings; scoped.targetDomain = selected.name; scoped.domains = domains
-            let view = try UpdatableView.resolve(definition, operation: operation, snapshot: selected.snapshot,
-                                                settings: scoped, context: context)
+            let view = try UpdatableView.resolve(definition, operation: operation == "merge" ? "delete from" : operation, snapshot: selected.snapshot,
+                                                settings: scoped, context: context, privilegeOverride: operation == "merge" ? .select : nil)
             guard view.tableDomain == settings.targetDomain else { throw JedError("XX000", "view write owner was not admitted") }
             inherited = view.layers.last!.settings
             inherited.targetDomain = view.tableDomain; inherited.domains = domains

@@ -142,7 +142,7 @@ internal struct GistTree: Sendable {
         return keys
     }
 
-    func search(queries: [GistQuery], strategies: [GistStrategy]) throws -> GistSearchResult {
+    func search(queries: [GistQuery], strategies: [GistStrategy], meter: CostMeter? = nil) throws -> GistSearchResult {
         try GistTuple.validateCount(queries.count, opclasses)
         try GistTuple.validateCount(strategies.count, opclasses)
         var needsScan = false, impossible = false
@@ -171,12 +171,19 @@ internal struct GistTree: Sendable {
             return true
         }
         func visit(_ node: GistNode) throws {
+            try meter?.pollStep()
             nodes += 1
             if node.isLeaf {
-                for entry in node.entries where try matches(entry.bound, leaf: true) { keys.append(entry.storageKey) }
+                for entry in node.entries {
+                    try meter?.pollStep()
+                    if try matches(entry.bound, leaf: true) { keys.append(entry.storageKey) }
+                }
             } else {
                 interiors += 1
-                for child in node.children where try matches(child.bound, leaf: false) { try visit(child) }
+                for child in node.children {
+                    try meter?.pollStep()
+                    if try matches(child.bound, leaf: false) { try visit(child) }
+                }
             }
         }
         try visit(root)

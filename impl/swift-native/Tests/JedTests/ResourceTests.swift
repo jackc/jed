@@ -54,6 +54,27 @@ final class ResourceTests: XCTestCase {
         XCTAssertEqual(shared.scalarUsed, 10)
     }
 
+    func testOpeningPendingBalanceAndSuccessfulStatementHaveDistinctPeakPhases() throws {
+        let diagnostics = MemoryDiagnostics()
+        let resources = StatementResources(queryLimit: 83, pendingBytes: 52, diagnostics: diagnostics)
+        let meter = CostMeter(resources: resources)
+        XCTAssertEqual(resources.query.used, 52)
+        XCTAssertEqual(resources.query.floor, 52)
+        XCTAssertEqual(diagnostics.peak, 0)
+        XCTAssertThrowsError(try meter.reserveQuery(32)) { XCTAssertEqual(($0 as? JedError)?.code, "54P05") }
+        XCTAssertEqual(diagnostics.peak, 0, "a rejected reservation does not record inherited bytes")
+        try meter.syncPending(31)
+        try meter.checkPending(31)
+        XCTAssertEqual(diagnostics.peak, 31)
+
+        let lowered = StatementResources(queryLimit: 10, pendingBytes: 52, diagnostics: diagnostics)
+        let next = CostMeter(resources: lowered)
+        XCTAssertEqual(lowered.query.used, 52, "lowering a limit does not reject account construction")
+        XCTAssertThrowsError(try next.checkPending(52)) { XCTAssertEqual(($0 as? JedError)?.code, "54P05") }
+        XCTAssertEqual(diagnostics.peak, 52, "the poststatement check records even a rejected pending balance")
+        XCTAssertEqual(diagnostics.underflows, 0)
+    }
+
     func testCancellationDoesNotChangeCostsAndWinsAtCheckpoint() throws {
         let token = CancellationToken()
         let meter = CostMeter(limit: 1, cancellation: token)

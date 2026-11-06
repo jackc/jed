@@ -6,6 +6,14 @@ internal final class ExecutionProfile {
     enum Stage: Int, CaseIterable { case source, folded, filter, aggregate, window, sort, distinct, output, total }
     private struct Key: Hashable { let owner: ObjectIdentifier; let stage: Stage }
     private var costs: [Key: Int64] = [:]
+    private var capturedFrames: Set<ObjectIdentifier> = []
+    /// Repeated derived-query executions have separate profiling frames. The
+    /// rendered child tree consumes the first frame; its enclosing relation
+    /// still accumulates all executions in the parent profile.
+    func captureFirst(_ owner: AnyObject, from child: ExecutionProfile) {
+        guard capturedFrames.insert(ObjectIdentifier(owner)).inserted else { return }
+        for (key, cost) in child.costs { costs[key] = cost }
+    }
     func add(_ owner: AnyObject, _ stage: Stage, _ units: Int64) {
         precondition(units >= 0)
         let key = Key(owner: ObjectIdentifier(owner), stage: stage)

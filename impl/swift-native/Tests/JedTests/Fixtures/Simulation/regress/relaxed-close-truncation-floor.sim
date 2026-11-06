@@ -1,0 +1,77 @@
+# Under synchronous = off a clean close flushes the batch, and the flush may shorten the file to the
+# newest generation's high-water. The reopen step checked the file's length against the floor before
+# raising the floor to the version the close flushed, so it compared it with the previous
+# generation's longer high-water: a false trailing-truncation violation. The runner now treats a
+# clean close's published version as durable first (simulation-testing.md §8.3). Shrunk from
+# truncation seed 70.
+# format: simulation
+# profile: truncation
+# seed: 70
+# page_size: 512
+# synchronous: off
+# clock: 1700000000000000
+open w1 write
+on w1 CREATE TABLE t1 (id i64 PRIMARY KEY, c1 bytea, c2 i32, c3 i32, c4 text)
+on w1 INSERT INTO t1 (id, c1, c2, c3, c4) SELECT g, decode(md5(g::text), 'hex'), (g * 55 + 43) % 1000, (g * 19 + 46) % 1000, md5(g::text || '824.1') || md5(g::text || '824.2') || md5(g::text || '824.3') || md5(g::text || '824.4') || md5(g::text || '824.5') || md5(g::text || '824.6') || md5(g::text || '824.7') || md5(g::text || '824.8') || md5(g::text || '824.9') || md5(g::text || '824.10') FROM generate_series(1, 96) g
+commit w1
+open w15 write
+on w15 CREATE TABLE t2 (id i64 PRIMARY KEY, c1 bytea, c2 i64, c3 bytea, c4 i64)
+on w15 CREATE TABLE t3 (id i64 PRIMARY KEY, c1 text, c2 i64)
+on w15 INSERT INTO t3 (id, c1, c2) SELECT g, md5(g::text), g * 7 FROM generate_series(1, 79) g ON CONFLICT (id) DO UPDATE SET c1 = excluded.c1
+commit w15
+open w21 write
+on w21 INSERT INTO t2 (id, c1, c2, c3, c4) SELECT g, decode(md5(g::text), 'hex'), g * 7, NULL, g * 7 FROM generate_series(44, 156) g
+commit w21
+open w31 write
+on w31 DELETE FROM t2 WHERE id % 7 = 5
+commit w31
+open w33 write
+on w33 UPDATE t2 SET c1 = decode(repeat(md5(id::text), 29), 'hex') WHERE id % 5 = 4
+commit w33
+open w34 write
+on w34 DROP TABLE IF EXISTS t1
+commit w34
+open w49 write
+on w49 UPDATE t2 SET c1 = decode(md5(id::text), 'hex'), c3 = decode(md5(id::text), 'hex') WHERE id BETWEEN 135 AND 145
+on w49 DELETE FROM t2 WHERE id % 7 = 6
+commit w49
+open w50 write
+on w50 DELETE FROM t2 WHERE id % 3 = 1
+commit w50
+open w51 write
+on w51 DELETE FROM t2 WHERE id % 6 = 2
+commit w51
+open w52 write
+on w52 DELETE FROM t2 WHERE id BETWEEN 53 AND 59
+on w52 CREATE TABLE t4 (id i64 PRIMARY KEY, c1 text)
+commit w52
+open w54 write
+on w54 DROP TABLE IF EXISTS t4
+commit w54
+open w56 write
+on w56 UPDATE t2 SET c1 = decode(repeat(md5(id::text), 5), 'hex') WHERE id BETWEEN 120 AND 144
+commit w56
+open w59 write
+on w59 DELETE FROM t2 WHERE id BETWEEN 142 AND 163
+commit w59
+open w61 write
+on w61 DELETE FROM t2 WHERE id BETWEEN 77 AND 79
+on w61 CREATE TABLE t6 (id i64 PRIMARY KEY, c1 text, c2 text)
+commit w61
+open w63 write
+on w63 INSERT INTO t6 (id, c1, c2) SELECT g, NULL, md5(g::text) FROM generate_series(1, 70) g
+commit w63
+open w66 write
+on w66 UPDATE t2 SET c3 = NULL WHERE id BETWEEN 57 AND 81
+on w66 ANALYZE t2
+commit w66
+open w67 write
+on w67 DELETE FROM t2 WHERE id % 2 = 1
+commit w67
+open w68 write
+on w68 DELETE FROM t2 WHERE id BETWEEN 64 AND 67
+commit w68
+open w69 write
+on w69 UPDATE t2 SET c1 = decode(repeat(md5(id::text), 13), 'hex'), c3 = decode(md5(id::text), 'hex') WHERE id BETWEEN 113 AND 116
+commit w69
+reopen

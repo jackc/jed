@@ -38,8 +38,8 @@ internal enum RecordDisposition {
     static func plan(key: [UInt8], values: [RecordInput], types: [TypeDescriptor],
                      codec: any PageCodec, meter: CostMeter? = nil, pager: Pager? = nil,
                      pageCount: UInt32? = nil) throws -> PackedRecord {
-        guard values.count == types.count, types.count <= codec.capacity / 16 else {
-            throw JedError("0A000", "record layout exceeds the page capacity")
+        guard values.count == types.count else {
+            throw JedError("0A000", "record value count differs from its type layout")
         }
         var candidates: [Candidate] = []
         var total = key.count
@@ -56,11 +56,15 @@ internal enum RecordDisposition {
                 candidate.original = stored; candidate.null = stored.isNull
                 if let pending {
                     guard let facts = try stored.largeFacts(encrypted: codec.reservedBytes != 0),
-                          let head = facts.external, head.index == 0, head.tag.allSatisfy({ $0 == 0 }),
+                          let head = facts.external,
+                          head.index >= codec.firstBodyPage || head.index == 0 && head.tag.allSatisfy({ $0 == 0 }),
                           !pending.bytes.isEmpty, pending.bytes.count == facts.stored,
                           pending.rawLength == facts.raw, pending.compressed == facts.compressed else {
-                        throw JedError.corruption("pending kept value disagrees with its placeholder")
+                        throw JedError.corruption("retained kept value disagrees with its external cell")
                     }
+                    // A newly staged value has a zero placeholder. A committed
+                    // resident root may retain the same bytes beside its real
+                    // sealed chain reference; both carry these exact facts.
                     candidate.pending = pending
                 }
                 if let bytes = stored.bytes {
@@ -131,7 +135,9 @@ internal enum RecordDisposition {
             total -= candidates[index].size - encoded
             candidates[index].size = encoded; candidates[index].form = candidates[index].form == 3 ? 4 : 2
         }
-        guard total <= maximum else { throw JedError("0A000", "record exceeds the maximum stored size") }
+        // RECORD_MAX drives the two disposition passes; irreducible fixed
+        // slots and pointers may remain above it. The tree retains the pending
+        // record; commit preflight checks its exact leaf and separator fit.
         var cells: [StoredCell] = [], overflows: [Int: PendingOverflow] = [:]
         for (column, item) in candidates.enumerated() {
             if item.null { cells.append(StoredCell(bytes: nil, type: item.type)); continue }

@@ -24,7 +24,7 @@ internal final class PageServiceOwner: Sendable {
     let core: DatabaseCore
     let limits: PageServiceOwnerLimits
     let yields: Bool
-    private let listener: UnixServiceSocket
+    private let listener: any ServiceListener
     private let state = Mutex(State())
     private let entropy: @Sendable (Int) throws -> [UInt8]
     private let ownership: @Sendable (UInt64) -> Bool
@@ -32,33 +32,36 @@ internal final class PageServiceOwner: Sendable {
     private let poisoned: @Sendable () -> Void
     private let synchronous: @Sendable () -> Bool
     private let storageLimit: @Sendable () -> Int64
+    private let timers: Bool
+    private let dispatchWork: @Sendable (@escaping @Sendable () -> Void) -> Void
 
-    init(core: DatabaseCore, listener: UnixServiceSocket, limits: PageServiceOwnerLimits = .init(),
+    init(core: DatabaseCore, listener: any ServiceListener, limits: PageServiceOwnerLimits = .init(),
          yields: Bool = false, entropy: @escaping @Sendable (Int) throws -> [UInt8],
          ownership: @escaping @Sendable (UInt64) -> Bool = { _ in false },
          ended: @escaping @Sendable (UInt64) -> Void = { _ in },
          poisoned: @escaping @Sendable () -> Void = {},
          synchronous: @escaping @Sendable () -> Bool = { true },
-         storageLimit: @escaping @Sendable () -> Int64 = { 0 }) {
+         storageLimit: @escaping @Sendable () -> Int64 = { 0 }, timers: Bool = true,
+         dispatchWork: @escaping @Sendable (@escaping @Sendable () -> Void) -> Void = { Thread.detachNewThread($0) }) {
         self.core = core; self.listener = listener; self.limits = limits; self.yields = yields
         self.entropy = entropy; self.ownership = ownership; self.ended = ended; self.poisoned = poisoned
-        self.synchronous = synchronous; self.storageLimit = storageLimit
+        self.synchronous = synchronous; self.storageLimit = storageLimit; self.timers = timers; self.dispatchWork = dispatchWork
     }
     func start() {
         Thread.detachNewThread { self.acceptLoop() }
-        Thread.detachNewThread { self.timeoutLoop() }
+        if timers { Thread.detachNewThread { self.timeoutLoop() } }
     }
     private func acceptLoop() {
         do {
             while !state.withLock({ $0.closed }) {
-                let socket = try listener.accept()
+                let socket = try listener.acceptConnection()
                 let connection = state.withLock { state -> PageServiceOwnerConnection? in
                     guard !state.closed, state.nextConnection != 0 else { return nil }
                     let id = state.nextConnection; state.nextConnection &+= 1
                     let connection = PageServiceOwnerConnection(owner: self, socket: socket, id: id)
                     state.connections[id] = connection; return connection
                 }
-                if let connection { connection.start() } else { socket.close() }
+                if let connection { connection.start() } else { socket.close(); socket.readerFinished() }
             }
         } catch { if !state.withLock({ $0.closed }) { fail() } }
     }
@@ -129,10 +132,11 @@ internal final class PageServiceOwner: Sendable {
         }
         for client in clients { client.resumeAdmission(); client.notice(kind: 2, connection: 0) }
     }
+    fileprivate func dispatch(_ body: @escaping @Sendable () -> Void) { dispatchWork(body) }
     fileprivate func fail() {
         // A failing connection may hold its own operation lock. Stop from a
         // separate worker so draining cannot recursively acquire that lock.
-        Thread.detachNewThread { self.poisoned(); self.stop() }
+        dispatchWork { self.poisoned(); self.stop() }
     }
     func stop() {
         let connections = state.withLock { state -> [PageServiceOwnerConnection]? in
@@ -151,7 +155,7 @@ internal final class PageServiceOwner: Sendable {
 /// their ordinary stream order. No fields below escape that synchronization.
 private final class PageServiceOwnerConnection: @unchecked Sendable {
     private let owner: PageServiceOwner
-    private let socket: UnixServiceSocket
+    private let socket: any ServiceFrameTransport
     private let id: UInt64
     private let operation = NSRecursiveLock()
     private var closed = false
@@ -167,7 +171,7 @@ private final class PageServiceOwnerConnection: @unchecked Sendable {
     private var deltaError: JedError?
     private var revoked: UInt64?
 
-    init(owner: PageServiceOwner, socket: UnixServiceSocket, id: UInt64) {
+    init(owner: PageServiceOwner, socket: any ServiceFrameTransport, id: UInt64) {
         self.owner = owner; self.socket = socket; self.id = id
     }
     func start() { Thread.detachNewThread { self.run() } }
@@ -254,7 +258,7 @@ private final class PageServiceOwnerConnection: @unchecked Sendable {
             guard writer == nil, waiting == nil else { throw PageServiceProtocol.violation("connection already holds or awaits a writer") }
             guard !readOnly, !owner.core.storage.readOnly else { throw JedError("25006", "page-service connection or owner is read only") }
             let cancellation = CancellationToken(); waiting = cancellation; waitingFrame = frame
-            Thread.detachNewThread { self.acquireWriter(frame.request, point: point, timeout: timeout, relaxed: flags & 1 != 0, cancellation: cancellation) }
+            owner.dispatch { self.acquireWriter(frame.request, point: point, timeout: timeout, relaxed: flags & 1 != 0, cancellation: cancellation) }
         case .commitBegin(let begin):
             if revoked != nil { return }
             guard let writer else { throw PageServiceProtocol.violation("commit_begin has no writer") }
@@ -363,6 +367,7 @@ private final class PageServiceOwnerConnection: @unchecked Sendable {
         for pins in reads.values { for pin in pins { pin.close() } }; reads.removeAll()
         writer?.close(); writer = nil; delta = nil; deltaError = nil
         owner.remove(id)
+        socket.readerFinished()
     }
 }
 #endif

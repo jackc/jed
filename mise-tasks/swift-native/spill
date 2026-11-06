@@ -1,0 +1,35 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#MISE description="Explicit opt-in: run frozen Swift SQL with forced operator or TEMP spill"
+#USAGE flag "-c --configuration <configuration>" default="debug" help="debug or release"
+#USAGE flag "--no-build" help="Reuse the existing Swift test executable"
+#USAGE flag "--temp" help="Force TEMP residency spill on memory main instead of disk operator spill"
+#USAGE flag "--bytes <bytes>" default="256" help="Operator work_mem bytes in disk mode"
+#USAGE flag "--temp-buffers <bytes>" default="1" help="TEMP residency bytes in --temp mode"
+#USAGE flag "--filter <filter>" help="Diagnostic corpus path substring; omitted means all eligible frozen files"
+
+require_relative "../../impl/swift-native/Tools/query_memory"
+begin
+  files = SwiftQueryMemory.inventory(ENV["usage_filter"]).reject { |_, source| SwiftQueryMemory.concurrency?(source) }
+  temp = ENV["usage_temp"] == "true"
+  if temp
+    files.select! { |_, source| source.upcase.include?("CREATE TEMP ") || source.upcase.include?("CREATE TEMPORARY ") }
+  end
+  mode = temp ? "memory" : "disk"
+  raise "filter/mode matched no eligible frozen SQL files" if files.none? { |_, source| !SwiftQueryMemory.skip?(source, mode) }
+  value = Integer(ENV.fetch(temp ? "usage_temp_buffers" : "usage_bytes", temp ? "1" : "256"), 10)
+  raise "spill bytes must be positive Int64" unless (1..(2**63 - 1)).cover?(value)
+  ENV["JED_CONFORMANCE_WORK_MEM"] = temp ? nil : value.to_s
+  ENV["JED_CONFORMANCE_TEMP_BUFFERS"] = temp ? value.to_s : nil
+  ENV["JED_CONFORMANCE_QUERY_MEMORY"] = nil
+  ENV["JED_CONFORMANCE_QUERY_MEMORY_PEAKS"] = nil
+  ENV["JED_SWIFT_SQL_FILES"] = files.keys.sort.join(",")
+  ENV["JED_SWIFT_SQL_FILE"] = nil
+  ENV["JED_SWIFT_SQL_MODE"] = mode
+  extra = ["--filter", "SQLCorpusBoundaryTests/testWholeFrozenSQLFilesThroughDatabaseSession"]
+  extra.unshift("--skip-build") if ENV["usage_no_build"] == "true"
+  puts "Swift #{temp ? 'TEMP' : 'operator'} spill: #{files.length} frozen files selected (#{ENV['usage_filter'] ? 'diagnostic subset' : 'complete mode'}), #{value} bytes"
+  SwiftNativeTasks.run("test", configuration: ENV.fetch("usage_configuration", "debug"), extra: extra)
+rescue ArgumentError, RuntimeError, KeyError, SystemCallError => error
+  abort error.message
+end

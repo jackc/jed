@@ -39,6 +39,7 @@ internal enum AnalyzeExecution {
         image.statistics += facts
         image.statistics.sort { $0.table == $1.table ? $0.column < $1.column : $0.table < $1.table }
         try snapshot.updateCatalog(image, schemaChanged: false)
+        snapshot.advanceEstimatorRevision(table.name)
         return CommandTag(command: "ANALYZE", rowsAffected: 0, cost: context.meter.accrued)
     }
 

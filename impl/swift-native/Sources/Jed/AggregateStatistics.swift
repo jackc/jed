@@ -57,7 +57,7 @@ internal struct AggregateFloatSum {
         else if positiveInfinity { value = .infinity }
         else if negativeInfinity { value = -.infinity }
         else {
-            guard !total.isInfinite else { throw FloatFunctions.overflow() }
+            guard !total.isInfinite else { throw FloatFunctions.overflow(binary32 ? .f32 : .f64) }
             value = average ? (binary32 ? Double(Float(total) / Float(count)) : total / Double(count)) : total
         }
         return binary32 ? .f32(Float(value).bitPattern) : .f64(value.bitPattern)
@@ -77,7 +77,7 @@ internal struct AggregateFloatMoments {
             let product = x * n, delta = product - sum, squared = delta * delta, denominator = n * count
             square += squared / denominator
             if sum.isInfinite || square.isInfinite {
-                if !sumX.isInfinite && !x.isInfinite { throw FloatFunctions.overflow() }
+                if !sumX.isInfinite && !x.isInfinite { throw FloatFunctions.overflow(.f64) }
                 square = .nan
             }
         } else if !x.isFinite { square = .nan }
@@ -95,7 +95,7 @@ internal struct AggregateFloatMoments {
                 if (sx.isInfinite || xx.isInfinite) && !sumX.isInfinite && !x.isInfinite
                     || (sy.isInfinite || yy.isInfinite) && !sumY.isInfinite && !y.isInfinite
                     || xy.isInfinite && !sumX.isInfinite && !x.isInfinite && !sumY.isInfinite && !y.isInfinite {
-                    throw FloatFunctions.overflow()
+                    throw FloatFunctions.overflow(.f64)
                 }
                 if xx.isInfinite { xx = .nan }; if yy.isInfinite { yy = .nan }; if xy.isInfinite { xy = .nan }
             }

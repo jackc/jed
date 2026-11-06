@@ -45,7 +45,7 @@ internal enum AlterRowRewrite {
                 switch step {
                 case .append(let column, let type, let expression):
                     let value = try AssignmentValues.store(context.evaluate(expression), expression: expression, to: type, context: context)
-                    if column.notNull && value.isNull { throw JedError("23502", "column \(column.name) contains null values") }
+                    if column.notNull && value.isNull { throw JedError("23502", "column \(column.name) contains null values").object(table: table.name, column: column.name) }
                     values.append(value)
                 case .remove(let ordinal): values.remove(at: ordinal)
                 case .convert(let ordinal, let expression):
@@ -55,7 +55,7 @@ internal enum AlterRowRewrite {
                 }
             }
             for index in table.columns.indices where table.columns[index].notNull && values[index].isNull {
-                throw JedError("23502", "column \(table.columns[index].name) contains null values")
+                throw JedError("23502", "column \(table.columns[index].name) contains null values").object(table: table.name, column: table.columns[index].name)
             }
             let key: [UInt8]
             if !rekey { key = record.key }
@@ -65,7 +65,9 @@ internal enum AlterRowRewrite {
                 for column in table.primaryKey { bytes += try KeyEncoding.encode(values[column], type: types[column], collatedKey: context.collatedKey) }
                 key = bytes
             }
-            guard keys.insert(key).inserted else { throw JedError("23505", "duplicate key value violates primary key of \(table.name)") }
+            guard keys.insert(key).inserted else { throw JedError("23505", "duplicate key value violates primary key of \(table.name)")
+                .object(table: table.name, constraint: CatalogSQL.objectName(table.name, label: "pkey"),
+                    detail: context.errorDetail?.primary(table, types: types, value: { values[$0] }, ending: "is duplicated.")) }
             let rewritten = try RecordDisposition.plan(key: key, values: values.map(RecordInput.value), types: types,
                 codec: original.tree.codec, meter: compression, pager: original.tree.pool?.pager)
             rows.append(Row(key: key, values: values, record: rewritten))
@@ -77,7 +79,9 @@ internal enum AlterRowRewrite {
                         settings: SessionSettings) throws -> TableStore {
         var result = TableStore(tree: BPlusTree(codec: original.tree.codec, types: types, pool: original.tree.pool), nextRowID: nextID)
         for row in rows.sorted(by: { $0.key.lexicographicallyPrecedes($1.key) }) {
-            try result.put(row.record, netStaging: settings.options.maxQueryMemoryBytes > 0)
+            // Frozen ALTER rewrites retain a cumulative pending balance. Later
+            // DML starts tracking new versions without reclaiming these rows.
+            try result.put(row.record, netStaging: false)
         }
         return result
     }

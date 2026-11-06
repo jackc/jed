@@ -406,7 +406,7 @@ private struct JSONPathParser {
             if spelling == "is" {
                 guard left.parenthesized else { throw syntax() }
                 try expect("unknown")
-                left = .predicate(.unknown(try requirePredicate(left)), nesting: left.nesting + 1)
+                left = .predicate(.unknown(try requirePredicate(left)), nesting: left.nesting)
             } else if spelling == "like_regex" {
                 let operand = try requireExpression(left), pattern = try next()
                 guard pattern.kind == .string else { throw syntax() }
@@ -421,14 +421,14 @@ private struct JSONPathParser {
                 }
                 guard let regexCompiler else { throw JedError("0A000", "jsonpath regular-expression provider is not installed") }
                 let program = try regexCompiler(pattern.text, flags, meter)
-                left = .predicate(.regex(operand, pattern.text, flags, program), nesting: left.nesting + 1)
+                left = .predicate(.regex(operand, pattern.text, flags, program), nesting: left.nesting)
             } else if spelling == "starts" {
                 try expect("with")
                 let right = try next(), expression: JSONPathExpression
                 if right.kind == .string { expression = .literal(.string(right.text)) }
                 else if right.kind == .variable { expression = .variable(right.text) }
                 else { throw syntax() }
-                left = .predicate(.starts(try requireExpression(left), expression), nesting: left.nesting + 1)
+                left = .predicate(.starts(try requireExpression(left), expression), nesting: left.nesting)
             } else {
                 let right = try parseNode(minimum: precedence + 1)
                 let nesting = max(left.nesting, right.nesting) + 1
@@ -436,7 +436,7 @@ private struct JSONPathParser {
                 case "||": left = .predicate(.or(try requirePredicate(left), try requirePredicate(right)), nesting: nesting)
                 case "&&": left = .predicate(.and(try requirePredicate(left), try requirePredicate(right)), nesting: nesting)
                 case "==", "!=", "<>", "<", "<=", ">", ">=":
-                    left = .predicate(.compare(spelling, try requireExpression(left), try requireExpression(right)), nesting: nesting)
+                    left = .predicate(.compare(spelling, try requireExpression(left), try requireExpression(right)), nesting: nesting - 1)
                 default:
                     left = Parsed(expression: .binary(spelling, try requireExpression(left), try requireExpression(right)), nesting: nesting)
                 }
@@ -473,9 +473,10 @@ private struct JSONPathParser {
         case "!":
             let look = try peek()
             guard look.spelling == "(" || (look.kind == .name && look.keyword == "exists") else { throw syntax() }
-            try enter(); defer { depth -= 1 }
+            // The mandatory group (or exists operand) contributes the one
+            // nesting level; ! does not count that same delimiter again.
             let child = try prefix()
-            return .predicate(.not(try requirePredicate(child)), nesting: child.nesting + 1)
+            return .predicate(.not(try requirePredicate(child)), nesting: child.nesting + (look.spelling == "(" ? 1 : 0))
         case "+", "-":
             try enter(); defer { depth -= 1 }
             let child = try parseNode(minimum: 6), expression = try requireExpression(child)

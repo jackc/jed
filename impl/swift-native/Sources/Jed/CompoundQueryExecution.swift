@@ -23,7 +23,9 @@ internal final class CompoundQueryExecution {
         return row
     }
     private func collect(_ plan: SelectPlan) throws -> [[SQLValue]] {
-        let execution = SelectExecution(plan: plan, context: compound.context(from: context))
+        var current = compound.context(from: context)
+        current.eagerSubqueries = false
+        let execution = SelectExecution(plan: plan, context: current)
         defer { execution.close() }
         var result: [[SQLValue]] = []
         while let row = try execution.next() { try reserve(MemorySizes.row(row)); result.append(row) }
@@ -52,6 +54,7 @@ internal final class CompoundQueryExecution {
             for expressions in inputs {
                 try meter.checkpoint(); meter.charge(1)
                 let row = try expressions.enumerated().map { index, expression in
+                    try meter.guardCost()
                     let value = try current.evaluate(expression)
                     guard let target = plan.projections[index].type else { return value }
                     return try current.convert(value, from: expression.type?.type, to: target)

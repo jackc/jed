@@ -53,9 +53,15 @@ internal final class QueryMemoryAccount {
     private(set) var floor: Int64 = 0
     var active: Bool { limit > 0 }
 
-    init(limit: Int64 = 0, diagnostics: MemoryDiagnostics = .shared) {
+    init(limit: Int64 = 0, pendingBytes: Int64 = 0, diagnostics: MemoryDiagnostics = .shared) {
+        precondition(pendingBytes >= 0)
         self.limit = max(0, limit)
         self.diagnostics = diagnostics
+        // Opening a statement inherits its transaction's held bytes. This is
+        // not a new reservation: errors before admission do not raise the peak,
+        // and a lowered budget is checked at the next reservation or successful
+        // statement boundary, with the ordinary error precedence.
+        if limit > 0 { used = pendingBytes; floor = pendingBytes }
     }
 
     func tryReserve(_ bytes: Int64) -> Bool {
@@ -99,12 +105,31 @@ internal final class StatementResources {
     let query: QueryMemoryAccount
     let scalarLimit: Int64
     private(set) var scalarUsed: Int64 = 0
+    private var statementRows: [[[SQLValue]]] = []
+    private var statementRowBytes: Int64 = 0
 
-    init(queryLimit: Int64 = 0, scalarLimit: Int64 = 0,
+    init(queryLimit: Int64 = 0, scalarLimit: Int64 = 0, pendingBytes: Int64 = 0,
          diagnostics: MemoryDiagnostics = .shared) {
-        self.query = QueryMemoryAccount(limit: queryLimit, diagnostics: diagnostics)
+        self.query = QueryMemoryAccount(limit: queryLimit, pendingBytes: pendingBytes, diagnostics: diagnostics)
         self.scalarLimit = scalarLimit > 0 ? scalarLimit : GeneratedSpec.defaultScalarBytes
     }
+
+    /// INSERT SELECT and MERGE sources remain owned through every part of a
+    /// writable WITH and through outer EXPLAIN rendering. Adopt their charge;
+    /// the public statement boundary releases it, independently of its cursor.
+    func retainStatementRows(_ rows: [[SQLValue]], bytes: Int64) {
+        precondition(bytes >= 0)
+        statementRows.append(rows)
+        statementRowBytes = saturatingAdd(statementRowBytes, bytes)
+    }
+
+    func releaseStatementRows() {
+        query.release(statementRowBytes)
+        statementRowBytes = 0
+        statementRows.removeAll()
+    }
+
+    deinit { releaseStatementRows() }
 
     func reserveScalar(_ bytes: Int64) throws {
         precondition(bytes >= 0)
@@ -154,6 +179,15 @@ internal final class CostMeter {
         if let lifetime { lifetime.accrued = saturatingAdd(lifetime.accrued, units) }
     }
 
+    /// A completed query block already charged the shared lifetime meter.
+    /// Recursive WITH accumulates its returned cost without charging it twice;
+    /// its cumulative statement ceiling is observed between complete terms.
+    func absorbChildCost(_ units: Int64) {
+        precondition(units >= 0)
+        accrued = saturatingAdd(accrued, units)
+        if firstCeiling == nil, limit > 0, accrued >= limit { firstCeiling = .statement }
+    }
+
     func guardCost() throws {
         let statementOver = limit > 0 && accrued >= limit
         let lifetimeOver = lifetime != nil && lifetimeLimit > 0 && lifetime!.accrued >= lifetimeLimit
@@ -200,5 +234,17 @@ internal final class CostMeter {
     func syncPending(_ pending: Int64) throws {
         do { try resources.query.syncPending(saturatingAdd(pendingDomainBase, pendingDomainExcluded ? 0 : pending)) }
         catch { try guardCost(); throw error }
+    }
+
+    /// A completed statement checks pending writes alone, independently of its
+    /// temporary reservations. Unlike a rejected reservation, this observation
+    /// includes an over-limit balance in the peak (memory.md §7.3).
+    func checkPending(_ pending: Int64) throws {
+        guard resources.query.active else { return }
+        resources.query.diagnostics.recordBalance(pending)
+        if pending > resources.query.limit {
+            try guardCost()
+            throw JedError("54P05", "query memory exceeded the limit of \(resources.query.limit) bytes")
+        }
     }
 }

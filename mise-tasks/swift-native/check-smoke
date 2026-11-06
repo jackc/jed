@@ -1,0 +1,8 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#MISE description="Explicit opt-in: frozen integrity CLI reports and credential/exit/read-only boundaries"
+#USAGE flag "-c --configuration <configuration>" default="debug" help="debug or release"
+#USAGE flag "--no-build" help="Capture an existing jed-check executable without SwiftPM"
+#USAGE flag "--output <path>" help="Empty evidence directory; defaults to a retained /tmp directory"
+require_relative "../../impl/swift-native/Tools/integrity_cli"
+exit SwiftIntegrityCLI.run

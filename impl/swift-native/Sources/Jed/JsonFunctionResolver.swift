@@ -8,7 +8,7 @@ internal enum JsonFunctionResolver {
         let mutator = ["jsonb_set", "jsonb_insert", "jsonb_set_lax"].contains(name)
         let object = ["json_object", "jsonb_object"].contains(name)
         let strip = ["json_strip_nulls", "jsonb_strip_nulls"].contains(name)
-        guard mutator || object || strip || isPath || name == "row_to_json" else { return nil }
+        guard mutator || object || strip || isPath || name == "row_to_json" || name == "array_to_json" else { return nil }
         if !mutator && !isPath, call.arguments.contains(where: { $0.name != nil }) { throw JedError("42883", "named arguments are not supported by this JSON function") }
         guard !call.star, !call.distinct, call.orderBy.isEmpty, call.withinGroup.isEmpty, call.filter == nil,
               call.over == nil, call.overName == nil, call.arguments.allSatisfy({ !$0.variadic }) else { throw JedError("42883", "invalid JSON function arguments") }
@@ -42,6 +42,9 @@ internal enum JsonFunctionResolver {
         for index in names.indices {
             if let syntax = slots[index] {
                 var argument = try resolve(syntax, targets[index])
+                if name == "array_to_json", index == 0, let type = argument.type?.type {
+                    guard case .array = type else { throw JedError("42883", "array_to_json requires an array") }
+                }
                 if targets[index]?.type == .scalar(.boolean), FunctionResolver.bareString(syntax), case .constant(.text(let text)) = argument.node {
                     argument = ResolvedExpression(type: targets[index], node: .constant(try ScalarCasts.input(text, to: targets[index]!)), position: argument.position)
                 }
@@ -77,12 +80,12 @@ internal enum JsonScalarFunctions {
     static func textPath(_ array: SQLArray) throws -> [SQLText?] {
         try array.elements.map { value in if value.isNull { return nil }; guard case .text(let text) = value else { throw JedError("42804", "text array required") }; return text }
     }
-    static func render(_ value: SQLValue, type: TypeDescriptor, context: ExpressionContext, meter: CostMeter) throws -> SQLText {
+    static func render(_ value: SQLValue, type: TypeDescriptor, context: ExpressionContext, meter: CostMeter, zonePrecharged: Bool = false) throws -> SQLText {
         switch value {
-        case .timestamp, .timestamptz, .date: return try Temporal.render(value, timezone: context.scalar.timezone, iso: true, meter: meter)
+        case .timestamp, .timestamptz, .date: return try Temporal.render(value, timezone: context.scalar.timezone, iso: true, meter: zonePrecharged ? nil : meter)
         default:
             if let render = context.functions.render { return try render(value, type, meter) }
-            var scalar = context.scalar; scalar.meter = meter
+            var scalar = context.scalar; scalar.meter = zonePrecharged ? nil : meter
             return try ContainerText.render(value, type: type, context: scalar, growth: false)
         }
     }
@@ -119,7 +122,7 @@ internal enum JsonScalarFunctions {
             return try JSONFunctions.mutate(JSONFunctions.node(values[0]), path: textPath(keys), dimensions: keys.dimensions.count, replacement: JSONFunctions.node(values[2]), operation: name == "jsonb_set" ? .set(create: bool(3)) : .insert(after: bool(3)), constant: constant, meter: meter)
         case "json_object", "jsonb_object": return try JSONFunctions.object(path(0), values: values.count > 1 ? path(1) : nil, binary: name == "jsonb_object", constant: constant, meter: meter)
         case "json_strip_nulls", "jsonb_strip_nulls": return try JSONFunctions.stripNulls(values[0], arrays: bool(1))
-        case "row_to_json":
+        case "row_to_json", "array_to_json":
             return try JSONFunctions.chargeGrowth(JSONFunctions.image(values[0], type: function.arguments[0].type ?? TypeDescriptor(.record([])), binary: false, meter: meter, scalarRender: { try render($0, type: $1, context: context, meter: $2) }, pretty: bool(1)), constant: constant, meter: meter)
         case "@?", "@@": return try JSONPathFunctions.call(name, context: JSONFunctions.node(values[0]), path: text(1), constant: constant, operatorForm: true, meter: meter, regexCompiler: regexCompiler(context))
         default:

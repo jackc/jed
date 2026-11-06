@@ -76,6 +76,33 @@ final class MaintenanceBoundaryTests: XCTestCase {
         XCTAssertFalse(pager.isPoisoned)
     }
 
+    func testRewrapPreservesRecoveredGenerationStabilizationBeforeDataWrites() throws {
+        let source = MaintenanceRecordedStore(), random = SeededRandomSource(seed: 81)
+        let old = try key(0x4a), new = try key(0x5b)
+        let created = try StorageDomain.create(store: source, kind: .file, catalogID: 811, pageSize: 1024,
+            credential: old, entropy: { try random.bytes(count: $0) })
+        var first = created.committed, catalog = first.catalog
+        catalog.sequences.append(CatalogSequence(name: try SQLText("first")))
+        try first.updateCatalog(catalog, schemaChanged: true)
+        let initial = try XCTUnwrap(created.prepare(first, entropy: { try random.bytes(count: $0) }))
+        _ = try created.persist(initial)
+        let reopened = try StorageDomain.open(store: source, catalogID: 812, credential: old, validateCatalog: { _ in })
+        let pager = reopened.pager, selected = try XCTUnwrap(pager.selectedKeyBlock)
+        let codec = try XCTUnwrap(pager.codec as? EncryptedPageCodec)
+        let replacement = try codec.rewrap(selected, credential: new, parameters: .default, entropy: { try random.bytes(count: $0) })
+        try pager.changeKeyBlock(replacement, replacing: selected, syncDirectory: {})
+        var second = reopened.committed; catalog = second.catalog
+        catalog.sequences.append(CatalogSequence(name: try SQLText("second")))
+        try second.updateCatalog(catalog, schemaChanged: true)
+        let prepared = try XCTUnwrap(reopened.prepare(second, entropy: { try random.bytes(count: $0) }))
+        let before = try source.read(at: 0, count: Int(source.size()))
+        source.reset(); pager.armFault(.sync(ordinal: 1))
+        fails("58030") { _ = try reopened.persist(prepared) }
+        XCTAssertTrue(source.log.isEmpty, "the injected pre-write barrier must precede every body write")
+        XCTAssertEqual(try source.read(at: 0, count: Int(source.size())), before)
+        XCTAssertTrue(pager.isPoisoned)
+    }
+
     #if os(Linux) || canImport(Darwin)
     func testFileCompactionPreservesModeLockBundleAndCanonicalBody() throws {
         let root = try directory(), path = root.appendingPathComponent("database.jed")

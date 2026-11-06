@@ -29,11 +29,23 @@ internal final class SubqueryExecution {
         }
     }
 
-    private func execute(_ query: ResolvedSubquery, context: ExpressionContext) throws -> Result {
+    private func execute(_ query: ResolvedSubquery, context: ExpressionContext, runtime: Bool = false) throws -> Result {
         var current = context
+        // Correlated bodies keep their query-block counter while sharing the
+        // lifetime and allocation accounts, then fold cost on successful return.
+        if query.correlated || runtime {
+            current.meter = CostMeter(limit: context.meter.limit, lifetime: context.meter.lifetime,
+                resources: context.meter.resources, cancellation: context.meter.cancellation)
+            current.scalar.meter = current.meter
+            current.sequences?.install(into: &current)
+        }
         current.outerRows = [context.column] + context.outerRows
+        current.encloseHostBatchRow(from: context)
+        // The owning fold already visited this subplan. Runtime-only bodies do
+        // not acquire a new eager fold when entered from an expression.
+        current.eagerSubqueries = false
         current.patterns = PatternExecution()
-        StatementServices(settings: query.settings, meter: context.meter).install(into: &current)
+        StatementServices(settings: query.settings, meter: current.meter).install(into: &current)
         var plan = query.plan
         // Materialized query blocks retain their source while collecting the
         // projected result. Specialized aggregate and columnar lanes own theirs.
@@ -44,18 +56,21 @@ internal final class SubqueryExecution {
         do {
             while let row = try execution.next() {
                 let charge = MemorySizes.row(row)
-                try context.meter.reserveQuery(charge)
+                try current.meter.reserveQuery(charge)
                 bytes = saturatingAdd(bytes, charge); rows.append(row)
             }
         } catch { context.meter.resources.query.release(bytes); throw error }
+        if query.correlated || runtime { context.meter.charge(current.meter.accrued) }
         return Result(rows: rows, account: context.meter.resources.query, bytes: bytes)
     }
 
     func evaluate(_ query: ResolvedSubquery, context: ExpressionContext) throws -> SQLValue {
         let result: Result
-        if query.correlated {
+        let runtime = query.correlated || ((!context.eagerSubqueries || query.runtimeOrderKey)
+            && folded[ObjectIdentifier(query)] == nil)
+        if runtime {
             context.meter.charge(1); try context.meter.step()
-            result = try execute(query, context: context)
+            result = try execute(query, context: context, runtime: true)
         } else {
             if folded[ObjectIdentifier(query)] == nil {
                 // Standalone expression callers also use the same once-only
@@ -72,7 +87,7 @@ internal final class SubqueryExecution {
         case .exists: return .boolean(!result.rows.isEmpty)
         case .membership(let operation, let all, let negated, let membership, let operand):
             let rows = result.rows
-            if !query.correlated { context.meter.charge(1); try context.meter.step() }
+            if !runtime { context.meter.charge(1); try context.meter.step() }
             let once = try context.evaluate(operand)
             var unknown = false, matched = false
             for row in rows {

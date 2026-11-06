@@ -1,0 +1,13 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#MISE description="Explicit opt-in: compare full frozen encrypted SQL behavior and cost transcripts across Swift/Rust/Go/TS"
+#USAGE flag "-c --configuration <configuration>" default="debug" help="debug or release"
+#USAGE flag "--no-build" help="Capture existing Swift XCTest executable and resources"
+#USAGE flag "--filter <filter>" help="Diagnostic frozen corpus path substring; omitted means full encrypted disk corpus"
+#USAGE flag "--cores <cores>" default="swift,rust,go,ts" help="Explicit core list including swift; subsets are diagnostic only"
+#USAGE flag "--output <path>" help="Empty evidence directory; defaults to a retained unique /tmp directory"
+#USAGE flag "--check-adapter" help="Check strict transcript and file membership without building or running cores"
+#USAGE flag "--recheck <path>" help="Recheck retained full execution evidence; preserve the original report"
+
+require_relative "../../impl/swift-native/Tools/encrypted_corpus"
+exit SwiftEncryptedCorpus.run

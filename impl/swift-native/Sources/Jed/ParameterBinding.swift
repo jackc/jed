@@ -1,6 +1,20 @@
 /// Host binding is unmetered admission, before touching any row. It has no
 /// statement clock: text input follows type input, never special date words.
 internal enum ParameterBinding {
+    /// Logical rewrites run during resolution, before the complete parameter
+    /// schema exists. Convert only the types known so far, without reporting a
+    /// premature bind error. An invalid input supplies no proof; normal binding
+    /// retains its original admission and error precedence after resolution.
+    static func proofValues(_ supplied: [SQLValue]?, knownTypes: [Int: TypeDescriptor],
+                            timezone: SQLTimeZone) -> [SQLValue]? {
+        guard var values = supplied else { return nil }
+        for index in knownTypes.keys.sorted() {
+            guard values.indices.contains(index - 1),
+                  let value = try? value(values[index - 1], to: knownTypes[index]!, context: .init(timezone: timezone), depth: 0) else { return nil }
+            values[index - 1] = value
+        }
+        return values
+    }
     static func finalize(_ resolver: ExpressionResolver) throws -> [TypeDescriptor] {
         let count = resolver.parameterUses.max() ?? 0
         if count == 0 { return [] }

@@ -1,0 +1,2558 @@
+{
+  "baseline": "362e0798ac3a8bd04bd2da556044b6ec73bf468a",
+  "scope": "112 frozen spec/fileformat/fixtures images; excludes separate 24 integrity finding images",
+  "classes": {
+    "ordinary_writable": 77,
+    "skewed_collation": 1,
+    "writable_recovery": 18,
+    "expected_open_error": 4,
+    "encrypted_writable": 6,
+    "lazy_corruption": 5,
+    "unparsable_definitions": 1
+  },
+  "fixtures": [
+    {
+      "file": "array_composite_table.jed",
+      "sha256": "6be81bfe2c523370eb8f1042c8c431b8370cbcd75e5bd9822f082ccc5c8ce69d",
+      "class": "ordinary_writable",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit.",
+      "sources": [
+        "spec/fileformat/verify.rb:1995",
+        "impl/go/fileformat_golden_test.go:1280",
+        "impl/ts/tests/integrity.test.ts:145"
+      ]
+    },
+    {
+      "file": "array_pk_table.jed",
+      "sha256": "73f0aa83186184c21054b798afcaac09a10f7d7753ce972d7387f579466cc560",
+      "class": "ordinary_writable",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit.",
+      "sources": [
+        "spec/fileformat/verify.rb:1995",
+        "impl/go/fileformat_golden_test.go:1280",
+        "impl/ts/tests/integrity.test.ts:145"
+      ]
+    },
+    {
+      "file": "array_table.jed",
+      "sha256": "6914c84052ee7b63c194a9bda240bd53c06eae01fff1a41c59dc1d96e6b7b8e5",
+      "class": "ordinary_writable",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit.",
+      "sources": [
+        "spec/fileformat/verify.rb:1995",
+        "impl/go/fileformat_golden_test.go:1280",
+        "impl/ts/tests/integrity.test.ts:145"
+      ]
+    },
+    {
+      "file": "bool_pk_table.jed",
+      "sha256": "1da4e370eb852b155a07fb34d480516fbab16249f1f90da4ab74f04e52ae9bd2",
+      "class": "ordinary_writable",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit.",
+      "sources": [
+        "spec/fileformat/verify.rb:1995",
+        "impl/go/fileformat_golden_test.go:1280",
+        "impl/ts/tests/integrity.test.ts:145"
+      ]
+    },
+    {
+      "file": "bool_table.jed",
+      "sha256": "de2f6b5ba533e3c3c2d36a770917a846f4d7ab7d87ba375fdb9f306b36879f69",
+      "class": "ordinary_writable",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit.",
+      "sources": [
+        "spec/fileformat/verify.rb:1995",
+        "impl/go/fileformat_golden_test.go:1280",
+        "impl/ts/tests/integrity.test.ts:145"
+      ]
+    },
+    {
+      "file": "bytea_pk_table.jed",
+      "sha256": "5a7be0d400f794e65d4cc8aa29ec2c14f4a4928fed29ec0017549488f6278a9b",
+      "class": "ordinary_writable",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit.",
+      "sources": [
+        "spec/fileformat/verify.rb:1995",
+        "impl/go/fileformat_golden_test.go:1280",
+        "impl/ts/tests/integrity.test.ts:145"
+      ]
+    },
+    {
+      "file": "bytea_table.jed",
+      "sha256": "605abbf9fb6a1619956b09c337579eae0cc95ae734f506b728a9bc0ca503e37c",
+      "class": "ordinary_writable",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit.",
+      "sources": [
+        "spec/fileformat/verify.rb:1995",
+        "impl/go/fileformat_golden_test.go:1280",
+        "impl/ts/tests/integrity.test.ts:145"
+      ]
+    },
+    {
+      "file": "check_table.jed",
+      "sha256": "818766ff98f7a5cbc5fa383bb0cd2e9373cc1465a946580134e54f340caa18ea",
+      "class": "ordinary_writable",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit.",
+      "sources": [
+        "spec/fileformat/verify.rb:1995",
+        "impl/go/fileformat_golden_test.go:1280",
+        "impl/ts/tests/integrity.test.ts:145"
+      ]
+    },
+    {
+      "file": "collation_array_table.jed",
+      "sha256": "fa00afd3a21dd1dec1e9b225a138b3c0976d1568c542df971a929086ed6ee90c",
+      "class": "ordinary_writable",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [
+        "spec/collation/fixtures/unicode.jucd (unicode 17.0.0)"
+      ],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit.",
+      "sources": [
+        "spec/fileformat/verify.rb:1995",
+        "impl/go/fileformat_golden_test.go:1280",
+        "impl/ts/tests/integrity.test.ts:145"
+      ]
+    },
+    {
+      "file": "collation_pk_table.jed",
+      "sha256": "b7fa4917a52bd05a6ccf144e3b2db035186cf646259b11015e2432c803f8d897",
+      "class": "ordinary_writable",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [
+        "spec/collation/fixtures/unicode.jucd (unicode 17.0.0)"
+      ],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit.",
+      "sources": [
+        "spec/fileformat/verify.rb:1995",
+        "impl/go/fileformat_golden_test.go:1280",
+        "impl/ts/tests/integrity.test.ts:145"
+      ]
+    },
+    {
+      "file": "collation_skew_corrupt.jed",
+      "sha256": "20905e6df1a297b27dbb706d33c72814aa814da9fb94a164932f9993f631ada9",
+      "class": "skewed_collation",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [
+        "spec/collation/fixtures/unicode.jucd (unicode 17.0.0)"
+      ],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit.",
+      "sources": [
+        "spec/fileformat/verify.rb:1995",
+        "impl/go/fileformat_golden_test.go:1280",
+        "impl/ts/tests/integrity.test.ts:145",
+        "spec/conformance/suites/collation/skew.test",
+        "spec/conformance/suites/collation/collation_upgrade.test",
+        "impl/ts/tests/integrity.test.ts:185"
+      ],
+      "original_table_write": "XX002 until sanctioned upgrade_collations",
+      "probes": [
+        {
+          "sql": "SELECT id FROM t WHERE name >= 'b' COLLATE \"unicode\" ORDER BY name COLLATE \"unicode\"",
+          "rows": [
+            [
+              "4"
+            ],
+            [
+              "2"
+            ]
+          ]
+        },
+        {
+          "sql": "SELECT id FROM t ORDER BY name COLLATE \"unicode\"",
+          "rows": [
+            [
+              "1"
+            ],
+            [
+              "3"
+            ],
+            [
+              "4"
+            ],
+            [
+              "2"
+            ]
+          ]
+        },
+        {
+          "sql": "INSERT INTO t VALUES (5, 'c')",
+          "error": "XX002"
+        }
+      ]
+    },
+    {
+      "file": "collation_skew_twin.jed",
+      "sha256": "9254441f175481caa7b3e2daee4c55f31169f9ebc38cfd15a5e391865a13e193",
+      "class": "ordinary_writable",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [
+        "spec/collation/fixtures/unicode.jucd (unicode 17.0.0)"
+      ],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit.",
+      "sources": [
+        "spec/fileformat/verify.rb:1995",
+        "impl/go/fileformat_golden_test.go:1280",
+        "impl/ts/tests/integrity.test.ts:145"
+      ]
+    },
+    {
+      "file": "collation_table.jed",
+      "sha256": "64c0817b0a4276c471abdb786f95f021e65fdb6115b5da1296df459978d97aef",
+      "class": "ordinary_writable",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [
+        "spec/collation/fixtures/unicode.jucd (unicode 17.0.0)"
+      ],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit.",
+      "sources": [
+        "spec/fileformat/verify.rb:1995",
+        "impl/go/fileformat_golden_test.go:1280",
+        "impl/ts/tests/integrity.test.ts:145"
+      ]
+    },
+    {
+      "file": "composite_array_field_table.jed",
+      "sha256": "a5b59477825208f013c0782acbbfeae5e6cc4be5ba948462850b63168eb2226c",
+      "class": "ordinary_writable",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit.",
+      "sources": [
+        "spec/fileformat/verify.rb:1995",
+        "impl/go/fileformat_golden_test.go:1280",
+        "impl/ts/tests/integrity.test.ts:145"
+      ]
+    },
+    {
+      "file": "composite_key_table.jed",
+      "sha256": "1dae3e41f23c71246a48662c2d17f03c0d09ca459f9915c72c8c35bd44547a2f",
+      "class": "ordinary_writable",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit.",
+      "sources": [
+        "spec/fileformat/verify.rb:1995",
+        "impl/go/fileformat_golden_test.go:1280",
+        "impl/ts/tests/integrity.test.ts:145"
+      ]
+    },
+    {
+      "file": "composite_pk_table.jed",
+      "sha256": "87d0190d40f33bcf4258f2b9af31e6773722f6a85d0cb580aa7b114af8afb2d8",
+      "class": "ordinary_writable",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit.",
+      "sources": [
+        "spec/fileformat/verify.rb:1995",
+        "impl/go/fileformat_golden_test.go:1280",
+        "impl/ts/tests/integrity.test.ts:145"
+      ]
+    },
+    {
+      "file": "composite_range_field_table.jed",
+      "sha256": "c637b0cab95d054f0cf2e356443f0548a1b1bae822227aeec9b7c346b577fb02",
+      "class": "ordinary_writable",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit.",
+      "sources": [
+        "spec/fileformat/verify.rb:1995",
+        "impl/go/fileformat_golden_test.go:1280",
+        "impl/ts/tests/integrity.test.ts:145"
+      ]
+    },
+    {
+      "file": "composite_type_table.jed",
+      "sha256": "5b0dee2b89b7d724f6a32b8f1981cc3531f9511d0aca42bf28a2a705dce5e00e",
+      "class": "ordinary_writable",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit.",
+      "sources": [
+        "spec/fileformat/verify.rb:1995",
+        "impl/go/fileformat_golden_test.go:1280",
+        "impl/ts/tests/integrity.test.ts:145"
+      ]
+    },
+    {
+      "file": "compressed_table.jed",
+      "sha256": "943a48e62d84839735c8b9835844a9809f3bc96eb53bfdcf0d7bd8a7921d0d13",
+      "class": "ordinary_writable",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit.",
+      "sources": [
+        "spec/fileformat/verify.rb:1995",
+        "impl/go/fileformat_golden_test.go:1280",
+        "impl/ts/tests/integrity.test.ts:145"
+      ]
+    },
+    {
+      "file": "cow_bad_padding.jed",
+      "sha256": "021a296a0499a812247fb90e68ecc7b6a52077a11ef18bc45acf1ef9acaedc1e",
+      "class": "writable_recovery",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit.",
+      "sources": [
+        "spec/fileformat/verify.rb:1995",
+        "impl/go/fileformat_golden_test.go:1280",
+        "impl/ts/tests/integrity.test.ts:145",
+        "spec/fileformat/verify.rb:1889"
+      ],
+      "initial_version": 1,
+      "probes": [
+        {
+          "sql": "SELECT id, v FROM t ORDER BY id",
+          "rows": [
+            [
+              "1",
+              "10"
+            ]
+          ]
+        },
+        {
+          "sql": "UPDATE t SET v = 30 WHERE id = 1"
+        },
+        {
+          "sql": "INSERT INTO t VALUES (2,40)"
+        },
+        {
+          "sql": "SELECT id, v FROM t ORDER BY id",
+          "rows": [
+            [
+              "1",
+              "30"
+            ],
+            [
+              "2",
+              "40"
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "file": "cow_duplicate_entry.jed",
+      "sha256": "65712f82f783660b7659d3e0951552794ab9ec0c3961533bdfe6d1b6f861c373",
+      "class": "writable_recovery",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit.",
+      "sources": [
+        "spec/fileformat/verify.rb:1995",
+        "impl/go/fileformat_golden_test.go:1280",
+        "impl/ts/tests/integrity.test.ts:145",
+        "spec/fileformat/verify.rb:1889"
+      ],
+      "initial_version": 1,
+      "probes": [
+        {
+          "sql": "SELECT id, v FROM t ORDER BY id",
+          "rows": [
+            [
+              "1",
+              "10"
+            ]
+          ]
+        },
+        {
+          "sql": "UPDATE t SET v = 30 WHERE id = 1"
+        },
+        {
+          "sql": "INSERT INTO t VALUES (2,40)"
+        },
+        {
+          "sql": "SELECT id, v FROM t ORDER BY id",
+          "rows": [
+            [
+              "1",
+              "30"
+            ],
+            [
+              "2",
+              "40"
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "file": "cow_empty_tail.jed",
+      "sha256": "61768fea43c3622e301962157f369f2519d01ac3cbbd794737ca07e3039b881e",
+      "class": "writable_recovery",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit.",
+      "sources": [
+        "spec/fileformat/verify.rb:1995",
+        "impl/go/fileformat_golden_test.go:1280",
+        "impl/ts/tests/integrity.test.ts:145",
+        "spec/fileformat/verify.rb:1889"
+      ],
+      "initial_version": 2,
+      "probes": [
+        {
+          "sql": "SELECT id, v FROM t ORDER BY id",
+          "rows": [
+            [
+              "1",
+              "20"
+            ]
+          ]
+        },
+        {
+          "sql": "UPDATE t SET v = 30 WHERE id = 1"
+        },
+        {
+          "sql": "INSERT INTO t VALUES (2,40)"
+        },
+        {
+          "sql": "SELECT id, v FROM t ORDER BY id",
+          "rows": [
+            [
+              "1",
+              "30"
+            ],
+            [
+              "2",
+              "40"
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "file": "cow_free_head_manifest.jed",
+      "sha256": "c5f0654367900798838900748ec4a074b705370b8afb49aebd46c7e9a407c89b",
+      "class": "writable_recovery",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit.",
+      "sources": [
+        "spec/fileformat/verify.rb:1995",
+        "impl/go/fileformat_golden_test.go:1280",
+        "impl/ts/tests/integrity.test.ts:145",
+        "spec/fileformat/verify.rb:1889"
+      ],
+      "initial_version": 1,
+      "probes": [
+        {
+          "sql": "SELECT id, v FROM t ORDER BY id",
+          "rows": [
+            [
+              "1",
+              "10"
+            ]
+          ]
+        },
+        {
+          "sql": "UPDATE t SET v = 30 WHERE id = 1"
+        },
+        {
+          "sql": "INSERT INTO t VALUES (2,40)"
+        },
+        {
+          "sql": "SELECT id, v FROM t ORDER BY id",
+          "rows": [
+            [
+              "1",
+              "30"
+            ],
+            [
+              "2",
+              "40"
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "file": "cow_inline.jed",
+      "sha256": "bdc3737f3a457eddfb451a1f9ac82a3b35177fcabc08877c345e017ab474651f",
+      "class": "writable_recovery",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit.",
+      "sources": [
+        "spec/fileformat/verify.rb:1995",
+        "impl/go/fileformat_golden_test.go:1280",
+        "impl/ts/tests/integrity.test.ts:145",
+        "spec/fileformat/verify.rb:1889"
+      ],
+      "initial_version": 2,
+      "probes": [
+        {
+          "sql": "SELECT id, v FROM t ORDER BY id",
+          "rows": [
+            [
+              "1",
+              "20"
+            ]
+          ]
+        },
+        {
+          "sql": "UPDATE t SET v = 30 WHERE id = 1"
+        },
+        {
+          "sql": "INSERT INTO t VALUES (2,40)"
+        },
+        {
+          "sql": "SELECT id, v FROM t ORDER BY id",
+          "rows": [
+            [
+              "1",
+              "30"
+            ],
+            [
+              "2",
+              "40"
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "file": "cow_invalid_free_list.jed",
+      "sha256": "76a2fcd397f52709afd5217e70c3f35270551d62865bbb163ce7cb55b0b74b6e",
+      "class": "expected_open_error",
+      "open": "XX001",
+      "sidecar_mutation": false,
+      "environment": [],
+      "verification": "Copy exact original bytes and require XX001 at open from each core; do not rewrite/repair before testing.",
+      "sources": [
+        "spec/fileformat/verify.rb:1889",
+        "spec/fileformat/verify.rb:1935",
+        "spec/design/conformance.md:155"
+      ]
+    },
+    {
+      "file": "cow_manifest_cycle.jed",
+      "sha256": "30ac435bdc3877cefa2c36830b71b220ddeb2373e4cbf133b0a741b4192bfc17",
+      "class": "writable_recovery",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit.",
+      "sources": [
+        "spec/fileformat/verify.rb:1995",
+        "impl/go/fileformat_golden_test.go:1280",
+        "impl/ts/tests/integrity.test.ts:145",
+        "spec/fileformat/verify.rb:1889"
+      ],
+      "initial_version": 1,
+      "probes": [
+        {
+          "sql": "SELECT id, v FROM t ORDER BY id",
+          "rows": [
+            [
+              "1",
+              "10"
+            ]
+          ]
+        },
+        {
+          "sql": "UPDATE t SET v = 30 WHERE id = 1"
+        },
+        {
+          "sql": "INSERT INTO t VALUES (2,40)"
+        },
+        {
+          "sql": "SELECT id, v FROM t ORDER BY id",
+          "rows": [
+            [
+              "1",
+              "30"
+            ],
+            [
+              "2",
+              "40"
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "file": "cow_missing_root.jed",
+      "sha256": "abc36e203f35dd18f437e1a4775547e06dcf6c6ac8a7036fa72c17ab29971710",
+      "class": "writable_recovery",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit.",
+      "sources": [
+        "spec/fileformat/verify.rb:1995",
+        "impl/go/fileformat_golden_test.go:1280",
+        "impl/ts/tests/integrity.test.ts:145",
+        "spec/fileformat/verify.rb:1889"
+      ],
+      "initial_version": 1,
+      "probes": [
+        {
+          "sql": "SELECT id, v FROM t ORDER BY id",
+          "rows": [
+            [
+              "1",
+              "10"
+            ]
+          ]
+        },
+        {
+          "sql": "UPDATE t SET v = 30 WHERE id = 1"
+        },
+        {
+          "sql": "INSERT INTO t VALUES (2,40)"
+        },
+        {
+          "sql": "SELECT id, v FROM t ORDER BY id",
+          "rows": [
+            [
+              "1",
+              "30"
+            ],
+            [
+              "2",
+              "40"
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "file": "cow_out_of_bounds.jed",
+      "sha256": "1e58a0c51ea53354045a3a3cff1ab8853bcc911aad2c097a600874651ca64562",
+      "class": "writable_recovery",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit.",
+      "sources": [
+        "spec/fileformat/verify.rb:1995",
+        "impl/go/fileformat_golden_test.go:1280",
+        "impl/ts/tests/integrity.test.ts:145",
+        "spec/fileformat/verify.rb:1889"
+      ],
+      "initial_version": 1,
+      "probes": [
+        {
+          "sql": "SELECT id, v FROM t ORDER BY id",
+          "rows": [
+            [
+              "1",
+              "10"
+            ]
+          ]
+        },
+        {
+          "sql": "UPDATE t SET v = 30 WHERE id = 1"
+        },
+        {
+          "sql": "INSERT INTO t VALUES (2,40)"
+        },
+        {
+          "sql": "SELECT id, v FROM t ORDER BY id",
+          "rows": [
+            [
+              "1",
+              "30"
+            ],
+            [
+              "2",
+              "40"
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "file": "cow_overflow.jed",
+      "sha256": "86c2b5c241603982c61395c33991780d5c2ee5324f36bebd2102f9925eebcdf9",
+      "class": "writable_recovery",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit.",
+      "sources": [
+        "spec/fileformat/verify.rb:1995",
+        "impl/go/fileformat_golden_test.go:1280",
+        "impl/ts/tests/integrity.test.ts:145",
+        "spec/fileformat/verify.rb:1889"
+      ],
+      "initial_version": 2,
+      "probes": [
+        {
+          "sql": "SELECT id, v FROM t ORDER BY id",
+          "rows": [
+            [
+              "1",
+              "20"
+            ]
+          ]
+        },
+        {
+          "sql": "UPDATE t SET v = 30 WHERE id = 1"
+        },
+        {
+          "sql": "INSERT INTO t VALUES (2,40)"
+        },
+        {
+          "sql": "SELECT id, v FROM t ORDER BY id",
+          "rows": [
+            [
+              "1",
+              "30"
+            ],
+            [
+              "2",
+              "40"
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "file": "cow_root_manifest.jed",
+      "sha256": "214a18a52acf2d900a9c516a5214c5bef60d655f55e8a0ca373fab680416cb3e",
+      "class": "writable_recovery",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit.",
+      "sources": [
+        "spec/fileformat/verify.rb:1995",
+        "impl/go/fileformat_golden_test.go:1280",
+        "impl/ts/tests/integrity.test.ts:145",
+        "spec/fileformat/verify.rb:1889"
+      ],
+      "initial_version": 1,
+      "probes": [
+        {
+          "sql": "SELECT id, v FROM t ORDER BY id",
+          "rows": [
+            [
+              "1",
+              "10"
+            ]
+          ]
+        },
+        {
+          "sql": "UPDATE t SET v = 30 WHERE id = 1"
+        },
+        {
+          "sql": "INSERT INTO t VALUES (2,40)"
+        },
+        {
+          "sql": "SELECT id, v FROM t ORDER BY id",
+          "rows": [
+            [
+              "1",
+              "30"
+            ],
+            [
+              "2",
+              "40"
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "file": "cow_stale_body.jed",
+      "sha256": "b597aea10103a86b91c1f44618cc4aacf67f2f64b665dbbff7cf3f4c32b0b4cc",
+      "class": "writable_recovery",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit.",
+      "sources": [
+        "spec/fileformat/verify.rb:1995",
+        "impl/go/fileformat_golden_test.go:1280",
+        "impl/ts/tests/integrity.test.ts:145",
+        "spec/fileformat/verify.rb:1889"
+      ],
+      "initial_version": 1,
+      "probes": [
+        {
+          "sql": "SELECT id, v FROM t ORDER BY id",
+          "rows": [
+            [
+              "1",
+              "10"
+            ]
+          ]
+        },
+        {
+          "sql": "UPDATE t SET v = 30 WHERE id = 1"
+        },
+        {
+          "sql": "INSERT INTO t VALUES (2,40)"
+        },
+        {
+          "sql": "SELECT id, v FROM t ORDER BY id",
+          "rows": [
+            [
+              "1",
+              "30"
+            ],
+            [
+              "2",
+              "40"
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "file": "cow_stale_orphan.jed",
+      "sha256": "ff540508cf0f592bb1d633fb439fb27d9510f104c20e887ab85901e3d30a4d9a",
+      "class": "writable_recovery",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit.",
+      "sources": [
+        "spec/fileformat/verify.rb:1995",
+        "impl/go/fileformat_golden_test.go:1280",
+        "impl/ts/tests/integrity.test.ts:145",
+        "spec/fileformat/verify.rb:1889"
+      ],
+      "initial_version": 1,
+      "probes": [
+        {
+          "sql": "SELECT id, v FROM t ORDER BY id",
+          "rows": [
+            [
+              "1",
+              "10"
+            ]
+          ]
+        },
+        {
+          "sql": "UPDATE t SET v = 30 WHERE id = 1"
+        },
+        {
+          "sql": "INSERT INTO t VALUES (2,40)"
+        },
+        {
+          "sql": "SELECT id, v FROM t ORDER BY id",
+          "rows": [
+            [
+              "1",
+              "30"
+            ],
+            [
+              "2",
+              "40"
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "file": "cow_torn_body.jed",
+      "sha256": "891f157817b4523f415c0141e9409693640fa7b555299c8a7162cc7774474d4c",
+      "class": "writable_recovery",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit.",
+      "sources": [
+        "spec/fileformat/verify.rb:1995",
+        "impl/go/fileformat_golden_test.go:1280",
+        "impl/ts/tests/integrity.test.ts:145",
+        "spec/fileformat/verify.rb:1889"
+      ],
+      "initial_version": 1,
+      "probes": [
+        {
+          "sql": "SELECT id, v FROM t ORDER BY id",
+          "rows": [
+            [
+              "1",
+              "10"
+            ]
+          ]
+        },
+        {
+          "sql": "UPDATE t SET v = 30 WHERE id = 1"
+        },
+        {
+          "sql": "INSERT INTO t VALUES (2,40)"
+        },
+        {
+          "sql": "SELECT id, v FROM t ORDER BY id",
+          "rows": [
+            [
+              "1",
+              "30"
+            ],
+            [
+              "2",
+              "40"
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "file": "cow_torn_manifest.jed",
+      "sha256": "bd76e5c430dd4dc37a0bbc5cd1f2f0842177091d3f6155012bbeed5eeb113fb0",
+      "class": "writable_recovery",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit.",
+      "sources": [
+        "spec/fileformat/verify.rb:1995",
+        "impl/go/fileformat_golden_test.go:1280",
+        "impl/ts/tests/integrity.test.ts:145",
+        "spec/fileformat/verify.rb:1889"
+      ],
+      "initial_version": 1,
+      "probes": [
+        {
+          "sql": "SELECT id, v FROM t ORDER BY id",
+          "rows": [
+            [
+              "1",
+              "10"
+            ]
+          ]
+        },
+        {
+          "sql": "UPDATE t SET v = 30 WHERE id = 1"
+        },
+        {
+          "sql": "INSERT INTO t VALUES (2,40)"
+        },
+        {
+          "sql": "SELECT id, v FROM t ORDER BY id",
+          "rows": [
+            [
+              "1",
+              "30"
+            ],
+            [
+              "2",
+              "40"
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "file": "cow_torn_meta.jed",
+      "sha256": "259e230fc401d83e649791f462aa2454e3fe6dcd72f8e1215848d7f2971333cb",
+      "class": "writable_recovery",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit.",
+      "sources": [
+        "spec/fileformat/verify.rb:1995",
+        "impl/go/fileformat_golden_test.go:1280",
+        "impl/ts/tests/integrity.test.ts:145",
+        "spec/fileformat/verify.rb:1889"
+      ],
+      "initial_version": 1,
+      "probes": [
+        {
+          "sql": "SELECT id, v FROM t ORDER BY id",
+          "rows": [
+            [
+              "1",
+              "10"
+            ]
+          ]
+        },
+        {
+          "sql": "UPDATE t SET v = 30 WHERE id = 1"
+        },
+        {
+          "sql": "INSERT INTO t VALUES (2,40)"
+        },
+        {
+          "sql": "SELECT id, v FROM t ORDER BY id",
+          "rows": [
+            [
+              "1",
+              "30"
+            ],
+            [
+              "2",
+              "40"
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "file": "cow_wrong_manifest_txid.jed",
+      "sha256": "67beb95e6110fc43e6e3d30d147841454fc0eecf72acf1f7f30fe559037f7c6f",
+      "class": "writable_recovery",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit.",
+      "sources": [
+        "spec/fileformat/verify.rb:1995",
+        "impl/go/fileformat_golden_test.go:1280",
+        "impl/ts/tests/integrity.test.ts:145",
+        "spec/fileformat/verify.rb:1889"
+      ],
+      "initial_version": 1,
+      "probes": [
+        {
+          "sql": "SELECT id, v FROM t ORDER BY id",
+          "rows": [
+            [
+              "1",
+              "10"
+            ]
+          ]
+        },
+        {
+          "sql": "UPDATE t SET v = 30 WHERE id = 1"
+        },
+        {
+          "sql": "INSERT INTO t VALUES (2,40)"
+        },
+        {
+          "sql": "SELECT id, v FROM t ORDER BY id",
+          "rows": [
+            [
+              "1",
+              "30"
+            ],
+            [
+              "2",
+              "40"
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "file": "date_table.jed",
+      "sha256": "81c0d895612579d72492c48fba6548efdf604d8c6d88fe27dfb92ce7879c36d9",
+      "class": "ordinary_writable",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit.",
+      "sources": [
+        "spec/fileformat/verify.rb:1995",
+        "impl/go/fileformat_golden_test.go:1280",
+        "impl/ts/tests/integrity.test.ts:145"
+      ]
+    },
+    {
+      "file": "decimal_pk_table.jed",
+      "sha256": "e503c297d5f9feb5934e2a3d1027ae5c73f76168ee007c1b60a5ca4bcfed4de5",
+      "class": "ordinary_writable",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit.",
+      "sources": [
+        "spec/fileformat/verify.rb:1995",
+        "impl/go/fileformat_golden_test.go:1280",
+        "impl/ts/tests/integrity.test.ts:145"
+      ]
+    },
+    {
+      "file": "decimal_table.jed",
+      "sha256": "c038007d1c5a7e8ef20ad12a27d7dc612d4ccd0eda6c538342ee68d7a31704c7",
+      "class": "ordinary_writable",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit.",
+      "sources": [
+        "spec/fileformat/verify.rb:1995",
+        "impl/go/fileformat_golden_test.go:1280",
+        "impl/ts/tests/integrity.test.ts:145"
+      ]
+    },
+    {
+      "file": "default_expr_table.jed",
+      "sha256": "39ca5b07c23dce8e5022d651a875cf8409be94008d29823571f0d4ce6badbd2a",
+      "class": "ordinary_writable",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit.",
+      "sources": [
+        "spec/fileformat/verify.rb:1995",
+        "impl/go/fileformat_golden_test.go:1280",
+        "impl/ts/tests/integrity.test.ts:145"
+      ]
+    },
+    {
+      "file": "default_table.jed",
+      "sha256": "6a7a73ff8903973f8db6ca568e52645ba6dbdec2645864c20bcf84f0e721a3b2",
+      "class": "ordinary_writable",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit.",
+      "sources": [
+        "spec/fileformat/verify.rb:1995",
+        "impl/go/fileformat_golden_test.go:1280",
+        "impl/ts/tests/integrity.test.ts:145"
+      ]
+    },
+    {
+      "file": "empty_db.jed",
+      "sha256": "53e939a832809b749c669c9f006ea371fde07c1ad763de2fb7af3c75b49b77fe",
+      "class": "ordinary_writable",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit.",
+      "sources": [
+        "spec/fileformat/verify.rb:1995",
+        "impl/go/fileformat_golden_test.go:1280",
+        "impl/ts/tests/integrity.test.ts:145"
+      ]
+    },
+    {
+      "file": "encrypted_catalog.jed",
+      "sha256": "8e9b0c43b103924ec93da090cce14d6d710dd43ef4c40d42bfee3b182a07b5bf",
+      "class": "encrypted_writable",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit. Use actual file handoff/backup, not the plaintext-only serialize API. Deterministic byte comparisons require identical injected key/page entropy streams on both branches.",
+      "sources": [
+        "spec/fileformat/verify.rb:1995",
+        "impl/go/fileformat_golden_test.go:1280",
+        "impl/ts/tests/integrity.test.ts:145",
+        "spec/fileformat/verify.rb:1956",
+        "spec/fileformat/encrypted.md",
+        "impl/go/encrypted_golden_test.go:20",
+        "impl/rust/tests/encrypted_golden.rs:16"
+      ],
+      "credential": {
+        "kind": "raw_key",
+        "hex": "4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a"
+      },
+      "page_size": 1024,
+      "initial_version": 1
+    },
+    {
+      "file": "encrypted_empty_db.jed",
+      "sha256": "49ec67b6e0773f270f7148429b90e9cdd4e8ffd253a79504e1372e98fc12c267",
+      "class": "encrypted_writable",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit. Use actual file handoff/backup, not the plaintext-only serialize API. Deterministic byte comparisons require identical injected key/page entropy streams on both branches.",
+      "sources": [
+        "spec/fileformat/verify.rb:1995",
+        "impl/go/fileformat_golden_test.go:1280",
+        "impl/ts/tests/integrity.test.ts:145",
+        "spec/fileformat/verify.rb:1956",
+        "spec/fileformat/encrypted.md",
+        "impl/go/encrypted_golden_test.go:20",
+        "impl/rust/tests/encrypted_golden.rs:16"
+      ],
+      "credential": {
+        "kind": "raw_key",
+        "hex": "4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a"
+      },
+      "page_size": 1024,
+      "initial_version": 1
+    },
+    {
+      "file": "encrypted_index_table.jed",
+      "sha256": "94f32015e832b8c42dcd6881d4069659c98a5ac581c14835ff297b9f9d584d72",
+      "class": "encrypted_writable",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit. Use actual file handoff/backup, not the plaintext-only serialize API. Deterministic byte comparisons require identical injected key/page entropy streams on both branches.",
+      "sources": [
+        "spec/fileformat/verify.rb:1995",
+        "impl/go/fileformat_golden_test.go:1280",
+        "impl/ts/tests/integrity.test.ts:145",
+        "spec/fileformat/verify.rb:1956",
+        "spec/fileformat/encrypted.md",
+        "impl/go/encrypted_golden_test.go:20",
+        "impl/rust/tests/encrypted_golden.rs:16"
+      ],
+      "credential": {
+        "kind": "raw_key",
+        "hex": "4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a"
+      },
+      "page_size": 1024,
+      "initial_version": 1
+    },
+    {
+      "file": "encrypted_overflow_table.jed",
+      "sha256": "5e0f2d9d9fbd6d6d0281baa5c3b3daddd5af1cb204fbf4def2084d545a981fbe",
+      "class": "encrypted_writable",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit. Use actual file handoff/backup, not the plaintext-only serialize API. Deterministic byte comparisons require identical injected key/page entropy streams on both branches.",
+      "sources": [
+        "spec/fileformat/verify.rb:1995",
+        "impl/go/fileformat_golden_test.go:1280",
+        "impl/ts/tests/integrity.test.ts:145",
+        "spec/fileformat/verify.rb:1956",
+        "spec/fileformat/encrypted.md",
+        "impl/go/encrypted_golden_test.go:20",
+        "impl/rust/tests/encrypted_golden.rs:16"
+      ],
+      "credential": {
+        "kind": "raw_key",
+        "hex": "4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a"
+      },
+      "page_size": 1024,
+      "initial_version": 1
+    },
+    {
+      "file": "encrypted_pk_table.jed",
+      "sha256": "004157e8941ea31e22a890d46cf364d896fd2dd6ff1247c479e61517d87b0edd",
+      "class": "encrypted_writable",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit. Use actual file handoff/backup, not the plaintext-only serialize API. Deterministic byte comparisons require identical injected key/page entropy streams on both branches.",
+      "sources": [
+        "spec/fileformat/verify.rb:1995",
+        "impl/go/fileformat_golden_test.go:1280",
+        "impl/ts/tests/integrity.test.ts:145",
+        "spec/fileformat/verify.rb:1956",
+        "spec/fileformat/encrypted.md",
+        "impl/go/encrypted_golden_test.go:20",
+        "impl/rust/tests/encrypted_golden.rs:16"
+      ],
+      "credential": {
+        "kind": "raw_key",
+        "hex": "4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a"
+      },
+      "page_size": 1024,
+      "initial_version": 1
+    },
+    {
+      "file": "encrypted_rekey_index_table.jed",
+      "sha256": "3f9ce534c1c4a7aded53ec13d028cc957b45e4608f7e35a38e3304de9678f2fe",
+      "class": "encrypted_writable",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit. Use actual file handoff/backup, not the plaintext-only serialize API. Deterministic byte comparisons require identical injected key/page entropy streams on both branches.",
+      "sources": [
+        "spec/fileformat/verify.rb:1995",
+        "impl/go/fileformat_golden_test.go:1280",
+        "impl/ts/tests/integrity.test.ts:145",
+        "spec/fileformat/verify.rb:1956",
+        "spec/fileformat/encrypted.md",
+        "impl/go/encrypted_golden_test.go:20",
+        "impl/rust/tests/encrypted_golden.rs:16"
+      ],
+      "credential": {
+        "kind": "raw_key",
+        "hex": "4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a"
+      },
+      "page_size": 1024,
+      "initial_version": 155
+    },
+    {
+      "file": "exclude_followon_table.jed",
+      "sha256": "988aef99b2cfe8e828c5f1172e6458f534bcca92bfd06b434fb9f8bee86f9f3e",
+      "class": "ordinary_writable",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit.",
+      "sources": [
+        "spec/fileformat/verify.rb:1995",
+        "impl/go/fileformat_golden_test.go:1280",
+        "impl/ts/tests/integrity.test.ts:145"
+      ]
+    },
+    {
+      "file": "expr_index_table.jed",
+      "sha256": "9e857775a0519b16ef20bd6c9225b97682a0fbd2a9f2f01dcb5bed42d6e84c8c",
+      "class": "ordinary_writable",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit.",
+      "sources": [
+        "spec/fileformat/verify.rb:1995",
+        "impl/go/fileformat_golden_test.go:1280",
+        "impl/ts/tests/integrity.test.ts:145"
+      ]
+    },
+    {
+      "file": "fk_table.jed",
+      "sha256": "cb775a28febc6c8b14f367ebc32c5ed01000233810102d2a5613454ea83b0441",
+      "class": "ordinary_writable",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit.",
+      "sources": [
+        "spec/fileformat/verify.rb:1995",
+        "impl/go/fileformat_golden_test.go:1280",
+        "impl/ts/tests/integrity.test.ts:145"
+      ]
+    },
+    {
+      "file": "float32_pk_table.jed",
+      "sha256": "f1e858becee1b02031dbcbe1781e7307e08c5c6824cb3df4deaae6dedd5e90e0",
+      "class": "ordinary_writable",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit.",
+      "sources": [
+        "spec/fileformat/verify.rb:1995",
+        "impl/go/fileformat_golden_test.go:1280",
+        "impl/ts/tests/integrity.test.ts:145"
+      ]
+    },
+    {
+      "file": "float32_table.jed",
+      "sha256": "c62acef9cdcd6912f7e5cf92bbccf1252c1a07a2bb3b81ad46e665b0ab43a8e3",
+      "class": "ordinary_writable",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit.",
+      "sources": [
+        "spec/fileformat/verify.rb:1995",
+        "impl/go/fileformat_golden_test.go:1280",
+        "impl/ts/tests/integrity.test.ts:145"
+      ]
+    },
+    {
+      "file": "float64_pk_table.jed",
+      "sha256": "d78edec5364166eebd115bc2ad21b13398a0d7ae8db92947176dadc42f4c2117",
+      "class": "ordinary_writable",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit.",
+      "sources": [
+        "spec/fileformat/verify.rb:1995",
+        "impl/go/fileformat_golden_test.go:1280",
+        "impl/ts/tests/integrity.test.ts:145"
+      ]
+    },
+    {
+      "file": "float64_table.jed",
+      "sha256": "c5b928235084cdee412f1b8b750b0aa61f20a5b4a6b71c7856a926c6ae9b2361",
+      "class": "ordinary_writable",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit.",
+      "sources": [
+        "spec/fileformat/verify.rb:1995",
+        "impl/go/fileformat_golden_test.go:1280",
+        "impl/ts/tests/integrity.test.ts:145"
+      ]
+    },
+    {
+      "file": "gin_array_table.jed",
+      "sha256": "cb5b39e40a9e63807f9b9f06c0f8bbfb98c41a78ccbf97c98a15593249f10e5a",
+      "class": "ordinary_writable",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit.",
+      "sources": [
+        "spec/fileformat/verify.rb:1995",
+        "impl/go/fileformat_golden_test.go:1280",
+        "impl/ts/tests/integrity.test.ts:145"
+      ]
+    },
+    {
+      "file": "gin_decimal_bytea_table.jed",
+      "sha256": "fe927bf23023653da13b3d7b918502b174d60250aef51ef7c7dadc4492863a05",
+      "class": "ordinary_writable",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit.",
+      "sources": [
+        "spec/fileformat/verify.rb:1995",
+        "impl/go/fileformat_golden_test.go:1280",
+        "impl/ts/tests/integrity.test.ts:145"
+      ]
+    },
+    {
+      "file": "gin_float_table.jed",
+      "sha256": "e4742ecfab1dc0935e827ad78ba1c67647332d86867f6d4be280e2a8ec8236e9",
+      "class": "ordinary_writable",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit.",
+      "sources": [
+        "spec/fileformat/verify.rb:1995",
+        "impl/go/fileformat_golden_test.go:1280",
+        "impl/ts/tests/integrity.test.ts:145"
+      ]
+    },
+    {
+      "file": "gin_interval_table.jed",
+      "sha256": "bd3792fe46d989183a19b8e4f05918d9b0f819641afac4453e64e3dc5ac40fb9",
+      "class": "ordinary_writable",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit.",
+      "sources": [
+        "spec/fileformat/verify.rb:1995",
+        "impl/go/fileformat_golden_test.go:1280",
+        "impl/ts/tests/integrity.test.ts:145"
+      ]
+    },
+    {
+      "file": "gin_jsonb_table.jed",
+      "sha256": "13822c6bdd2ffefdccc01e6de74572ea803b9c07d6df7a5688ce01fcf4ca6601",
+      "class": "ordinary_writable",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit.",
+      "sources": [
+        "spec/fileformat/verify.rb:1995",
+        "impl/go/fileformat_golden_test.go:1280",
+        "impl/ts/tests/integrity.test.ts:145"
+      ]
+    },
+    {
+      "file": "gin_multi_table.jed",
+      "sha256": "327380b12484a36ff3617163a64c4b958bea78a5cf6425b878c754afce387ed7",
+      "class": "ordinary_writable",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit.",
+      "sources": [
+        "spec/fileformat/verify.rb:1995",
+        "impl/go/fileformat_golden_test.go:1280",
+        "impl/ts/tests/integrity.test.ts:145"
+      ]
+    },
+    {
+      "file": "gin_text_table.jed",
+      "sha256": "779ef321dfabfdefc7d20f70b625e641d41370f3461bd3095bd4b08ce8b40293",
+      "class": "ordinary_writable",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit.",
+      "sources": [
+        "spec/fileformat/verify.rb:1995",
+        "impl/go/fileformat_golden_test.go:1280",
+        "impl/ts/tests/integrity.test.ts:145"
+      ]
+    },
+    {
+      "file": "gin_uuid_table.jed",
+      "sha256": "5a2b527112b16cbdb3c3e8acc9f5bbd24084bf882317078b3e6313589d1c1907",
+      "class": "ordinary_writable",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit.",
+      "sources": [
+        "spec/fileformat/verify.rb:1995",
+        "impl/go/fileformat_golden_test.go:1280",
+        "impl/ts/tests/integrity.test.ts:145"
+      ]
+    },
+    {
+      "file": "gist_exclude_table.jed",
+      "sha256": "b32fb34d07d96ceea0b073590bb9145b2a95804f3529061cd4baf0c5bc354683",
+      "class": "ordinary_writable",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit.",
+      "sources": [
+        "spec/fileformat/verify.rb:1995",
+        "impl/go/fileformat_golden_test.go:1280",
+        "impl/ts/tests/integrity.test.ts:145"
+      ]
+    },
+    {
+      "file": "gist_range_table.jed",
+      "sha256": "595c97de51924e90939a3550cf6c3b2f8e967aaa1b4be81db2a147d51d61918a",
+      "class": "ordinary_writable",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit.",
+      "sources": [
+        "spec/fileformat/verify.rb:1995",
+        "impl/go/fileformat_golden_test.go:1280",
+        "impl/ts/tests/integrity.test.ts:145"
+      ]
+    },
+    {
+      "file": "gist_scalar_table.jed",
+      "sha256": "43b15d5c8245092479649a1a4caa4d0231bbc196f5fc6858ebd813bf9268be83",
+      "class": "ordinary_writable",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit.",
+      "sources": [
+        "spec/fileformat/verify.rb:1995",
+        "impl/go/fileformat_golden_test.go:1280",
+        "impl/ts/tests/integrity.test.ts:145"
+      ]
+    },
+    {
+      "file": "hostfunc_check_table.jed",
+      "sha256": "bcb14e6507c35d5180b85d75db29dfa4c22bcf166c1c0c43f3e0db0d4ff7e3b1",
+      "class": "ordinary_writable",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [
+        "geo_hash(i64)->i64 = input*10; immutable; component com.example/geo_hash; semanticVersion 1"
+      ],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit.",
+      "sources": [
+        "spec/fileformat/verify.rb:1995",
+        "impl/go/fileformat_golden_test.go:1280",
+        "impl/ts/tests/integrity.test.ts:145"
+      ]
+    },
+    {
+      "file": "hostfunc_index_table.jed",
+      "sha256": "7fa6348f4e989ad3f5235d224e7ca1f63654dcb0a4c65fac19d4aa712e9ad6d1",
+      "class": "ordinary_writable",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [
+        "geo_hash(i64)->i64 = input*10; immutable; component com.example/geo_hash; semanticVersion 1"
+      ],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit.",
+      "sources": [
+        "spec/fileformat/verify.rb:1995",
+        "impl/go/fileformat_golden_test.go:1280",
+        "impl/ts/tests/integrity.test.ts:145"
+      ]
+    },
+    {
+      "file": "identity_table.jed",
+      "sha256": "84f278b37314249f418e0fd9ce9a062da3c25ce6d7a4881bb76525295c8a0c1e",
+      "class": "ordinary_writable",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit.",
+      "sources": [
+        "spec/fileformat/verify.rb:1995",
+        "impl/go/fileformat_golden_test.go:1280",
+        "impl/ts/tests/integrity.test.ts:145"
+      ]
+    },
+    {
+      "file": "index_table.jed",
+      "sha256": "75a24cd44189ff3801f717f950a91e218cca166a480815d522b99bec13c3ff53",
+      "class": "ordinary_writable",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit.",
+      "sources": [
+        "spec/fileformat/verify.rb:1995",
+        "impl/go/fileformat_golden_test.go:1280",
+        "impl/ts/tests/integrity.test.ts:145"
+      ]
+    },
+    {
+      "file": "interval_pk_table.jed",
+      "sha256": "ac691c0d89ff27bd6f84fa34939f23b849787750909a834d0d8c14fb3125dbda",
+      "class": "ordinary_writable",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit.",
+      "sources": [
+        "spec/fileformat/verify.rb:1995",
+        "impl/go/fileformat_golden_test.go:1280",
+        "impl/ts/tests/integrity.test.ts:145"
+      ]
+    },
+    {
+      "file": "interval_table.jed",
+      "sha256": "73a96c127373a4972f16f8f7d218912e5c9017e6c87c005d65208696e53c4f5e",
+      "class": "ordinary_writable",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit.",
+      "sources": [
+        "spec/fileformat/verify.rb:1995",
+        "impl/go/fileformat_golden_test.go:1280",
+        "impl/ts/tests/integrity.test.ts:145"
+      ]
+    },
+    {
+      "file": "json_table.jed",
+      "sha256": "79923cd6c4a3b4f5c09f2202436cbf306ead62096e11aa60a4e135b7fe2fb26c",
+      "class": "ordinary_writable",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit.",
+      "sources": [
+        "spec/fileformat/verify.rb:1995",
+        "impl/go/fileformat_golden_test.go:1280",
+        "impl/ts/tests/integrity.test.ts:145"
+      ]
+    },
+    {
+      "file": "jsonb_table.jed",
+      "sha256": "ac6c1ad4f1ebf4178eae674e8ebc2d939b7bcea94bc5145492460a0d399e33ba",
+      "class": "ordinary_writable",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit.",
+      "sources": [
+        "spec/fileformat/verify.rb:1995",
+        "impl/go/fileformat_golden_test.go:1280",
+        "impl/ts/tests/integrity.test.ts:145"
+      ]
+    },
+    {
+      "file": "malformed_decimal_group.jed",
+      "sha256": "000250db96a8e1edc149b68ac2de4581e4ac30b325e4eb8b3780c073b0438857",
+      "class": "lazy_corruption",
+      "open": "success",
+      "sidecar_mutation": false,
+      "environment": [],
+      "verification": "Run the ordered probes on an untouched copy. Successful open alone is insufficient; final operation must produce XX001.",
+      "sources": [
+        "spec/conformance/suites/storage/malformed_decimal_group.test",
+        "spec/fileformat/verify.rb:1935"
+      ],
+      "probes": [
+        {
+          "sql": "SELECT count(*) FROM t",
+          "rows": [
+            [
+              "5"
+            ]
+          ]
+        },
+        {
+          "sql": "SELECT d FROM t WHERE id = 2",
+          "error": "XX001"
+        }
+      ]
+    },
+    {
+      "file": "malformed_fk_type.jed",
+      "sha256": "ae6bf93a7a530d761db56910a32daf5d3e384ce29ef5b5fde2ec3be256305ae1",
+      "class": "expected_open_error",
+      "open": "XX001",
+      "sidecar_mutation": false,
+      "environment": [],
+      "verification": "Copy exact original bytes and require XX001 at open from each core; do not rewrite/repair before testing.",
+      "sources": [
+        "spec/fileformat/verify.rb:1889",
+        "spec/fileformat/verify.rb:1935",
+        "spec/design/conformance.md:155"
+      ]
+    },
+    {
+      "file": "malformed_interior_cycle.jed",
+      "sha256": "ca0dbf11d955e41d213f5f5bc01ccf5971f37001ab1ca7e4ca99ea7ee62a7d0d",
+      "class": "expected_open_error",
+      "open": "XX001",
+      "sidecar_mutation": false,
+      "environment": [],
+      "verification": "Copy exact original bytes and require XX001 at open from each core; do not rewrite/repair before testing.",
+      "sources": [
+        "spec/fileformat/verify.rb:1889",
+        "spec/fileformat/verify.rb:1935",
+        "spec/design/conformance.md:155"
+      ]
+    },
+    {
+      "file": "malformed_leaf_directory.jed",
+      "sha256": "1f2fc74a957b76a75461aea6e5d33c6151e3b939f967e2efffd3eecb9758e411",
+      "class": "lazy_corruption",
+      "open": "success",
+      "sidecar_mutation": false,
+      "environment": [],
+      "verification": "Run the ordered probes on an untouched copy. Successful open alone is insufficient; final operation must produce XX001.",
+      "sources": [
+        "spec/conformance/suites/storage/malformed_leaf_directory.test",
+        "spec/fileformat/verify.rb:1935"
+      ],
+      "probes": [
+        {
+          "sql": "SELECT v FROM t WHERE id = 1",
+          "rows": [
+            [
+              "10"
+            ]
+          ]
+        },
+        {
+          "sql": "SELECT id, v FROM t ORDER BY id",
+          "error": "XX001"
+        }
+      ]
+    },
+    {
+      "file": "malformed_missing_type.jed",
+      "sha256": "56e3ade1ae4a0adc72650984bbe9ac50b2648b7095b9f4ff28044f3a69e56a67",
+      "class": "expected_open_error",
+      "open": "XX001",
+      "sidecar_mutation": false,
+      "environment": [],
+      "verification": "Copy exact original bytes and require XX001 at open from each core; do not rewrite/repair before testing.",
+      "sources": [
+        "spec/fileformat/verify.rb:1889",
+        "spec/fileformat/verify.rb:1935",
+        "spec/design/conformance.md:155"
+      ]
+    },
+    {
+      "file": "malformed_overflow_cycle.jed",
+      "sha256": "4868cade375e4b871d2e742b7cc2cc02db7eae9cc72c57059e5f76b5b9e218e8",
+      "class": "lazy_corruption",
+      "open": "success",
+      "sidecar_mutation": false,
+      "environment": [],
+      "verification": "Run the ordered probes on an untouched copy. Successful open alone is insufficient; final operation must produce XX001.",
+      "sources": [
+        "spec/conformance/suites/storage/malformed_overflow_cycle.test",
+        "spec/fileformat/verify.rb:1935"
+      ],
+      "probes": [
+        {
+          "sql": "SELECT id FROM t ORDER BY id",
+          "rows": [
+            [
+              "1"
+            ],
+            [
+              "2"
+            ],
+            [
+              "3"
+            ]
+          ]
+        },
+        {
+          "sql": "SELECT body, blob FROM t WHERE id = 1",
+          "error": "XX001"
+        }
+      ]
+    },
+    {
+      "file": "malformed_row_count.jed",
+      "sha256": "1f29d8b483e69dc6057449f8f6d02b959242df10f37a50119ce34e78b2102582",
+      "class": "lazy_corruption",
+      "open": "success",
+      "sidecar_mutation": false,
+      "environment": [],
+      "verification": "Run the ordered probes on an untouched copy. Successful open alone is insufficient; final operation must produce XX001.",
+      "sources": [
+        "spec/conformance/suites/storage/malformed_row_count.test",
+        "spec/fileformat/verify.rb:1935"
+      ],
+      "probes": [
+        {
+          "sql": "SELECT v FROM t WHERE id = 20",
+          "rows": [
+            [
+              "200"
+            ]
+          ]
+        },
+        {
+          "sql": "DELETE FROM t",
+          "error": "XX001"
+        }
+      ]
+    },
+    {
+      "file": "malformed_wrong_tree_leaf.jed",
+      "sha256": "d9813a84e739da7f70bb945447341a08cf13c33a617cbb246af89a799ea92b82",
+      "class": "lazy_corruption",
+      "open": "success",
+      "sidecar_mutation": false,
+      "environment": [],
+      "verification": "Run the ordered probes on an untouched copy. Successful open alone is insufficient; final operation must produce XX001.",
+      "sources": [
+        "spec/conformance/suites/storage/malformed_wrong_tree_leaf.test",
+        "spec/fileformat/verify.rb:1935"
+      ],
+      "probes": [
+        {
+          "sql": "SELECT id, a, b, c FROM u ORDER BY id",
+          "rows": [
+            [
+              "1",
+              "x",
+              "y",
+              "true"
+            ],
+            [
+              "2",
+              "z",
+              null,
+              "false"
+            ]
+          ]
+        },
+        {
+          "sql": "SELECT id, v FROM t ORDER BY id",
+          "error": "XX001"
+        }
+      ]
+    },
+    {
+      "file": "max_sep_table.jed",
+      "sha256": "da26a6fe23eed279542f3f1c35291374608e73c21ed9d62ad2c91a6749eaae15",
+      "class": "ordinary_writable",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit.",
+      "sources": [
+        "spec/fileformat/verify.rb:1995",
+        "impl/go/fileformat_golden_test.go:1280",
+        "impl/ts/tests/integrity.test.ts:145"
+      ]
+    },
+    {
+      "file": "nested_composite_table.jed",
+      "sha256": "7b6b3492a6c663cf35a6f6ed20a6d76ea08237575eff11e8f82826535a4d5e5a",
+      "class": "ordinary_writable",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit.",
+      "sources": [
+        "spec/fileformat/verify.rb:1995",
+        "impl/go/fileformat_golden_test.go:1280",
+        "impl/ts/tests/integrity.test.ts:145"
+      ]
+    },
+    {
+      "file": "nopk_table.jed",
+      "sha256": "417af9d1dab09908607b3d86e5732dc2c14cee0a386118aebcb129b5a50fb42e",
+      "class": "ordinary_writable",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit.",
+      "sources": [
+        "spec/fileformat/verify.rb:1995",
+        "impl/go/fileformat_golden_test.go:1280",
+        "impl/ts/tests/integrity.test.ts:145"
+      ]
+    },
+    {
+      "file": "one_table_empty.jed",
+      "sha256": "a22ac0fef45eec907c6c70fea69a422a0f0ae3f94ba8acab44f4bff446458c66",
+      "class": "ordinary_writable",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit.",
+      "sources": [
+        "spec/fileformat/verify.rb:1995",
+        "impl/go/fileformat_golden_test.go:1280",
+        "impl/ts/tests/integrity.test.ts:145"
+      ]
+    },
+    {
+      "file": "ordered_index_table.jed",
+      "sha256": "03a2fba666e8c96c1f909af0ad1fe258fca5bf02cdf706fe8a080ead3d7a1e55",
+      "class": "ordinary_writable",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit.",
+      "sources": [
+        "spec/fileformat/verify.rb:1995",
+        "impl/go/fileformat_golden_test.go:1280",
+        "impl/ts/tests/integrity.test.ts:145"
+      ]
+    },
+    {
+      "file": "overflow_table.jed",
+      "sha256": "227344c12731a64ffe43593e51b48402cfccbae4550ce42c6565b3cfec99a943",
+      "class": "ordinary_writable",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit.",
+      "sources": [
+        "spec/fileformat/verify.rb:1995",
+        "impl/go/fileformat_golden_test.go:1280",
+        "impl/ts/tests/integrity.test.ts:145"
+      ]
+    },
+    {
+      "file": "partial_index_table.jed",
+      "sha256": "2dd83f8daa4feb6e376107966e1fed2bc9ae42285208b0e329db1b23f6e6ae5f",
+      "class": "ordinary_writable",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit.",
+      "sources": [
+        "spec/fileformat/verify.rb:1995",
+        "impl/go/fileformat_golden_test.go:1280",
+        "impl/ts/tests/integrity.test.ts:145"
+      ]
+    },
+    {
+      "file": "pk_table.jed",
+      "sha256": "7ed0a5b03185ce5564c3c7d7f4e9656e7901fc5fd1f025fda7c2614854578975",
+      "class": "ordinary_writable",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit.",
+      "sources": [
+        "spec/fileformat/verify.rb:1995",
+        "impl/go/fileformat_golden_test.go:1280",
+        "impl/ts/tests/integrity.test.ts:145"
+      ]
+    },
+    {
+      "file": "range_pk_table.jed",
+      "sha256": "a2abcdfd18598532f413903af1edc80ff4e04a0dfeb625dfd10ef9710dcede2d",
+      "class": "ordinary_writable",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit.",
+      "sources": [
+        "spec/fileformat/verify.rb:1995",
+        "impl/go/fileformat_golden_test.go:1280",
+        "impl/ts/tests/integrity.test.ts:145"
+      ]
+    },
+    {
+      "file": "range_table.jed",
+      "sha256": "8ca6bd20fe3d2d31f6801181ca5577647d21ab5e52ca5ad159017bfccae517a0",
+      "class": "ordinary_writable",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit.",
+      "sources": [
+        "spec/fileformat/verify.rb:1995",
+        "impl/go/fileformat_golden_test.go:1280",
+        "impl/ts/tests/integrity.test.ts:145"
+      ]
+    },
+    {
+      "file": "row_count_table.jed",
+      "sha256": "f7a0215c56a13f1056cd2b2d3aeff95641fc0efb2e14da236cd41fdcbeecbeba",
+      "class": "ordinary_writable",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit.",
+      "sources": [
+        "spec/fileformat/verify.rb:1995",
+        "impl/go/fileformat_golden_test.go:1280",
+        "impl/ts/tests/integrity.test.ts:145"
+      ]
+    },
+    {
+      "file": "sequence_table.jed",
+      "sha256": "8f348eaee0814edf199f77f9003dc972774debfd0968a06120bef35723f4d12a",
+      "class": "ordinary_writable",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit.",
+      "sources": [
+        "spec/fileformat/verify.rb:1995",
+        "impl/go/fileformat_golden_test.go:1280",
+        "impl/ts/tests/integrity.test.ts:145"
+      ]
+    },
+    {
+      "file": "serial_table.jed",
+      "sha256": "f3ac5fe889c63457344fa99b2fc96ec65b92a832861cfa914ab637ad0701476a",
+      "class": "ordinary_writable",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit.",
+      "sources": [
+        "spec/fileformat/verify.rb:1995",
+        "impl/go/fileformat_golden_test.go:1280",
+        "impl/ts/tests/integrity.test.ts:145"
+      ]
+    },
+    {
+      "file": "statistics_table.jed",
+      "sha256": "aa7c0bed4df659b027dab1528454de767f9b60339336bdbc0da4201087ced990",
+      "class": "ordinary_writable",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit.",
+      "sources": [
+        "spec/fileformat/verify.rb:1995",
+        "impl/go/fileformat_golden_test.go:1280",
+        "impl/ts/tests/integrity.test.ts:145"
+      ]
+    },
+    {
+      "file": "statistics_terms_table.jed",
+      "sha256": "24dd1b085d87d04b2962ce54d22da8376c7a02cc41e5ab410e738e8b10cbfc61",
+      "class": "ordinary_writable",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit.",
+      "sources": [
+        "spec/fileformat/verify.rb:1995",
+        "impl/go/fileformat_golden_test.go:1280",
+        "impl/ts/tests/integrity.test.ts:145"
+      ]
+    },
+    {
+      "file": "tall_tree.jed",
+      "sha256": "9d2b0b255322c2400145b2edb2b74f81e1e4c87d87e4205719cf37c47de2feda",
+      "class": "ordinary_writable",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit.",
+      "sources": [
+        "spec/fileformat/verify.rb:1995",
+        "impl/go/fileformat_golden_test.go:1280",
+        "impl/ts/tests/integrity.test.ts:145"
+      ]
+    },
+    {
+      "file": "temporal_typmod_table.jed",
+      "sha256": "8be0ef11cea7aecd160739b46e306ae965886eb5d28fe1927809a4431b1b2aab",
+      "class": "ordinary_writable",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit.",
+      "sources": [
+        "spec/fileformat/verify.rb:1995",
+        "impl/go/fileformat_golden_test.go:1280",
+        "impl/ts/tests/integrity.test.ts:145"
+      ]
+    },
+    {
+      "file": "text_pk_table.jed",
+      "sha256": "f946971091fc96a13a08343a28c9b3df80e405ccdc344ecfa7d8c7cbd85db6cf",
+      "class": "ordinary_writable",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit.",
+      "sources": [
+        "spec/fileformat/verify.rb:1995",
+        "impl/go/fileformat_golden_test.go:1280",
+        "impl/ts/tests/integrity.test.ts:145"
+      ]
+    },
+    {
+      "file": "text_table.jed",
+      "sha256": "02a00277714aa88eef228075e7dba1a0eb8e3091c3952a131eded74301ecd1c2",
+      "class": "ordinary_writable",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit.",
+      "sources": [
+        "spec/fileformat/verify.rb:1995",
+        "impl/go/fileformat_golden_test.go:1280",
+        "impl/ts/tests/integrity.test.ts:145"
+      ]
+    },
+    {
+      "file": "timestamp_table.jed",
+      "sha256": "476ad804d363ca2c844289929cb26aec16d52fa5e5ce99537a2c336c149d3fb4",
+      "class": "ordinary_writable",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit.",
+      "sources": [
+        "spec/fileformat/verify.rb:1995",
+        "impl/go/fileformat_golden_test.go:1280",
+        "impl/ts/tests/integrity.test.ts:145"
+      ]
+    },
+    {
+      "file": "timestamptz_table.jed",
+      "sha256": "0053782c7be9adf7512599bd7199e4ecc6eb595b0a9591768c3ab1482e9b471e",
+      "class": "ordinary_writable",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit.",
+      "sources": [
+        "spec/fileformat/verify.rb:1995",
+        "impl/go/fileformat_golden_test.go:1280",
+        "impl/ts/tests/integrity.test.ts:145"
+      ]
+    },
+    {
+      "file": "timezone_index_table.jed",
+      "sha256": "5686595d1a769bba1bbbd180d1485403480487732108d17a09348edd895d30e6",
+      "class": "ordinary_writable",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [
+        "spec/tz/fixtures/tzdata.jtz (US/Eastern + America/New_York alias pins)"
+      ],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit.",
+      "sources": [
+        "spec/fileformat/verify.rb:1995",
+        "impl/go/fileformat_golden_test.go:1280",
+        "impl/ts/tests/integrity.test.ts:145"
+      ]
+    },
+    {
+      "file": "torn_meta_slot0.jed",
+      "sha256": "737870f57de37445aadb37b575a7840013be44bcb9657ec8bb82bd8155c29022",
+      "class": "writable_recovery",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit.",
+      "sources": [
+        "spec/fileformat/verify.rb:1995",
+        "impl/go/fileformat_golden_test.go:1280",
+        "impl/ts/tests/integrity.test.ts:145",
+        "spec/fileformat/verify.rb:2110"
+      ],
+      "probes": [
+        {
+          "sql": "SELECT id, v FROM t ORDER BY id",
+          "rows": [
+            [
+              "1",
+              "10"
+            ],
+            [
+              "2",
+              "20"
+            ],
+            [
+              "3",
+              null
+            ],
+            [
+              "4",
+              "40"
+            ],
+            [
+              "5",
+              "50"
+            ],
+            [
+              "6",
+              "60"
+            ],
+            [
+              "7",
+              "70"
+            ],
+            [
+              "8",
+              "80"
+            ],
+            [
+              "9",
+              "90"
+            ],
+            [
+              "10",
+              "100"
+            ],
+            [
+              "11",
+              "110"
+            ],
+            [
+              "12",
+              "120"
+            ],
+            [
+              "13",
+              "130"
+            ],
+            [
+              "14",
+              "140"
+            ],
+            [
+              "15",
+              "150"
+            ],
+            [
+              "16",
+              "160"
+            ],
+            [
+              "17",
+              "170"
+            ],
+            [
+              "18",
+              "180"
+            ],
+            [
+              "19",
+              "190"
+            ],
+            [
+              "20",
+              "200"
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "file": "torn_meta_slot1.jed",
+      "sha256": "35ce670e448a9fa60c00c55686edf5d9fdbe2884cd3d4ad230d76dec3a5a410d",
+      "class": "writable_recovery",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit.",
+      "sources": [
+        "spec/fileformat/verify.rb:1995",
+        "impl/go/fileformat_golden_test.go:1280",
+        "impl/ts/tests/integrity.test.ts:145",
+        "spec/fileformat/verify.rb:2110"
+      ],
+      "probes": [
+        {
+          "sql": "SELECT id, v FROM t ORDER BY id",
+          "rows": [
+            [
+              "1",
+              "10"
+            ],
+            [
+              "2",
+              "20"
+            ],
+            [
+              "3",
+              null
+            ],
+            [
+              "4",
+              "40"
+            ],
+            [
+              "5",
+              "50"
+            ],
+            [
+              "6",
+              "60"
+            ],
+            [
+              "7",
+              "70"
+            ],
+            [
+              "8",
+              "80"
+            ],
+            [
+              "9",
+              "90"
+            ],
+            [
+              "10",
+              "100"
+            ],
+            [
+              "11",
+              "110"
+            ],
+            [
+              "12",
+              "120"
+            ],
+            [
+              "13",
+              "130"
+            ],
+            [
+              "14",
+              "140"
+            ],
+            [
+              "15",
+              "150"
+            ],
+            [
+              "16",
+              "160"
+            ],
+            [
+              "17",
+              "170"
+            ],
+            [
+              "18",
+              "180"
+            ],
+            [
+              "19",
+              "190"
+            ],
+            [
+              "20",
+              "200"
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "file": "unique_table.jed",
+      "sha256": "b0f19df87ebebcfc01076faa6742d68f1a5cc468b868b0bdf818e7a1a250f2b9",
+      "class": "ordinary_writable",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit.",
+      "sources": [
+        "spec/fileformat/verify.rb:1995",
+        "impl/go/fileformat_golden_test.go:1280",
+        "impl/ts/tests/integrity.test.ts:145"
+      ]
+    },
+    {
+      "file": "unparsable_definitions.jed",
+      "sha256": "acd2d9cd72d3d2a9429346403b6981feee0338314a2251cec7beefc5a8d18692",
+      "class": "unparsable_definitions",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit.",
+      "sources": [
+        "spec/fileformat/verify.rb:1995",
+        "impl/go/fileformat_golden_test.go:1280",
+        "impl/ts/tests/integrity.test.ts:145",
+        "spec/conformance/suites/storage/unparsable_definitions.test",
+        "spec/design/unparsable-definitions.md",
+        "impl/ts/tests/integrity.test.ts:145",
+        "spec/fileformat/verify.rb:1846-1873"
+      ],
+      "original_table_write": "Per-object restrictions; sidecar is safe. Do not implicitly repair unknown SQL.",
+      "probes": [
+        {
+          "sql": "SELECT id FROM u",
+          "error": "XX003"
+        },
+        {
+          "sql": "SELECT id FROM w",
+          "error": "XX003"
+        },
+        {
+          "sql": "SELECT name FROM jed_columns",
+          "error": "XX003"
+        },
+        {
+          "sql": "SELECT name, column_default FROM jed_columns WHERE table_name = 'd' ORDER BY ordinal",
+          "error": "XX003",
+          "note": "The untouched fixture still has invalid views; corpus line181 succeeds only after those views are dropped or replaced."
+        },
+        {
+          "sql": "SELECT name, definition, columns::text FROM jed_views ORDER BY name"
+        }
+      ],
+      "base_columns": {
+        "c": [
+          [
+            "id",
+            "i32"
+          ],
+          [
+            "v",
+            "i32"
+          ]
+        ],
+        "d": [
+          [
+            "id",
+            "i32"
+          ],
+          [
+            "v",
+            "i32"
+          ],
+          [
+            "k",
+            "i32"
+          ]
+        ],
+        "e": [
+          [
+            "id",
+            "i32"
+          ],
+          [
+            "r",
+            "i32range"
+          ]
+        ],
+        "p": [
+          [
+            "id",
+            "i32"
+          ],
+          [
+            "v",
+            "i32"
+          ]
+        ],
+        "t": [
+          [
+            "id",
+            "i32"
+          ],
+          [
+            "v",
+            "i32"
+          ]
+        ],
+        "x": [
+          [
+            "id",
+            "i32"
+          ],
+          [
+            "v",
+            "i32"
+          ]
+        ]
+      }
+    },
+    {
+      "file": "uuid_table.jed",
+      "sha256": "c0882b88f4f764ee16cd3f638886e142616f4709498247e723c3bc47fab5f50f",
+      "class": "ordinary_writable",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit.",
+      "sources": [
+        "spec/fileformat/verify.rb:1995",
+        "impl/go/fileformat_golden_test.go:1280",
+        "impl/ts/tests/integrity.test.ts:145"
+      ]
+    },
+    {
+      "file": "varchar_table.jed",
+      "sha256": "008f1af68afeedca7d0c7dee910a4f7026cfcc9786406331f37abe81eb27884e",
+      "class": "ordinary_writable",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit.",
+      "sources": [
+        "spec/fileformat/verify.rb:1995",
+        "impl/go/fileformat_golden_test.go:1280",
+        "impl/ts/tests/integrity.test.ts:145"
+      ]
+    },
+    {
+      "file": "view_options_table.jed",
+      "sha256": "7ee7cb04321a2c38050e88c6715f5b110283b3c81097866205d1191744c28702",
+      "class": "ordinary_writable",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit.",
+      "sources": [
+        "spec/fileformat/verify.rb:1995",
+        "impl/go/fileformat_golden_test.go:1280",
+        "impl/ts/tests/integrity.test.ts:145"
+      ]
+    },
+    {
+      "file": "view_table.jed",
+      "sha256": "bb92f24fd8960e4ced9100f3133db67a57e6a9974bad5f321e74bcdf2e8f88cf",
+      "class": "ordinary_writable",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit.",
+      "sources": [
+        "spec/fileformat/verify.rb:1995",
+        "impl/go/fileformat_golden_test.go:1280",
+        "impl/ts/tests/integrity.test.ts:145"
+      ]
+    }
+  ]
+}

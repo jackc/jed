@@ -23,6 +23,7 @@ internal final class GroupedSelectExecution {
     private let plan: SelectPlan
     private let aggregate: AggregateQueryPlan
     private let context: ExpressionContext
+    private let hostBatch: HostBatch?
     private let rawOutput: Bool
     private var sources: [[SQLValue]] = []
     private var groups: [Group] = []
@@ -30,12 +31,14 @@ internal final class GroupedSelectExecution {
     private var outputs: [Output] = []
     private var reserved: Int64 = 0
     private var sourceBytes: Int64 = 0
+    private var bounded: BlockingAggregateExecution?
     private var started = false
     private var position = 0
     private var emitted: Int64 = 0
 
     init(plan: SelectPlan, aggregate: AggregateQueryPlan, context: ExpressionContext, rawOutput: Bool = false) {
         self.plan = plan; self.aggregate = aggregate; self.context = context; self.rawOutput = rawOutput
+        hostBatch = rawOutput ? nil : HostBatch(expressions: plan.projections, context: context)
     }
     func nextRaw() throws -> (row: [SQLValue], bytes: Int64)? {
         guard rawOutput else { throw JedError("XX000", "grouped raw output was not requested") }
@@ -47,11 +50,25 @@ internal final class GroupedSelectExecution {
         return (output.row, output.bytes)
     }
     func next() throws -> [SQLValue]? {
+        let wholeTableFold = context.executionProfile == nil && aggregate.keys.isEmpty && ColumnarExecution.aggregation(plan, aggregate, context)
+        if !rawOutput, context.spill?.canSpill == true, !wholeTableFold,
+           try !plan.scan.hasKnownContradiction(parameters: context.parameters, collatedKey: context.collatedKey) {
+            if bounded == nil { bounded = BlockingAggregateExecution(plan: plan, aggregate: aggregate, context: context) }
+            return try bounded?.next()
+        }
         if !started { try prepare(); started = true }
         guard position < outputs.count, plan.limit == nil || emitted < plan.limit! else { return nil }
+        let at = position
+        let end = position + Int(min(Int64(outputs.count - position), plan.limit.map { $0 - emitted } ?? Int64.max))
         let row = outputs[position].row; position += 1; emitted += 1
         if plan.productionCharge { context.meter.charge(1); try context.meter.guardCost() }
-        let current = groupedContext(row)
+        var current = groupedContext(row); current.hostBatch = hostBatch
+        let groupingBase = aggregate.layoutWidth + aggregate.calls.count
+        try hostBatch?.setRow(at, count: end, context: current) { source, column in
+            let values = self.outputs[source].row
+            let slot = column >= 0 ? column : groupingBase - column - 1
+            return values.indices.contains(slot) ? values[slot] : nil
+        }
         return try plan.projections.map { try current.evaluate($0) }
     }
     private func reserve(_ bytes: Int64) throws {
@@ -75,7 +92,7 @@ internal final class GroupedSelectExecution {
         if !columnar { while let row = try input.next() { try source(row) } }
         // WHERE consumes the complete source materialization, preserving error
         // and memory visitation before any aggregate argument is evaluated.
-        if let predicate = plan.predicate {
+        if !input.predicateApplied, let predicate = plan.predicate {
             var kept: [[SQLValue]] = []
             for row in sources {
                 var current = context; current.column = { row[$0] }
@@ -114,7 +131,9 @@ internal final class GroupedSelectExecution {
             else { index = try create(keys: allKeys.indices.map { membership.contains($0) ? allKeys[$0] : .null }, selected: keys, key: key) }
             let group = groups[index]
             for (ordinal, call) in aggregate.calls.enumerated() {
-                if let filter = call.filter, try !current.matches(filter) { continue }
+                if let filter = call.filter {
+                    guard case .boolean(true) = try current.evaluate(filter) else { continue }
+                }
                 meter.charge(1)
                 if AggregateOrderedSet.hypothetical.contains(call.plan.name), !call.plan.withinGroup.isEmpty {
                     var arguments: [SQLValue] = []
@@ -149,7 +168,7 @@ internal final class GroupedSelectExecution {
             if columnar {
                 while let row = try input.next() {
                     var current = context; current.column = { row[$0] }
-                    if let predicate = plan.predicate, try !context.profile(plan.profileIdentity, .filter, { try current.matches(predicate) }) { continue }
+                    if !input.predicateApplied, let predicate = plan.predicate, try !context.profile(plan.profileIdentity, .filter, { try current.matches(predicate) }) { continue }
                     try fold(row)
                 }
             } else { for row in sources { try fold(row) } }
@@ -205,6 +224,10 @@ internal final class GroupedSelectExecution {
         var current = context
         let groupingBase = aggregate.layoutWidth + aggregate.calls.count
         current.column = { index in row[index >= 0 ? index : groupingBase - index - 1] }
+        current.hostBatchColumn = { index in
+            let slot = index >= 0 ? index : groupingBase - index - 1
+            return row.indices.contains(slot) ? row[slot] : nil
+        }
         return current
     }
     private func unmeteredGroup(_ row: [SQLValue]) -> ExpressionContext {
@@ -213,6 +236,8 @@ internal final class GroupedSelectExecution {
         current.scalar = context.scalar; current.scalar.meter = meter
         current.collatedKey = context.collatedKey; current.functions = context.functions; current.patterns = context.patterns
         current.outerRows = context.outerRows; current.subqueries = context.subqueries
+        current.hostBatchOuterRows = context.hostBatchOuterRows
+        current.eagerSubqueries = context.eagerSubqueries
         current.ctes = context.ctes
         return current
     }
@@ -229,7 +254,7 @@ internal final class GroupedSelectExecution {
             for ordinal in plan.keyEvaluationOrder {
                 let term = plan.order[ordinal]
                 let value = try current.evaluate(term.expression)
-                if case .column = term.expression.node {} else {
+                if plan.materializesOrderKey(term) {
                     let bytes = MemorySizes.value(value); try reserve(bytes); outputs[index].bytes = saturatingAdd(outputs[index].bytes, bytes)
                 }
                 outputs[index].order[ordinal] = value
@@ -284,6 +309,8 @@ internal final class GroupedSelectExecution {
         release(decorations)
     }
     func close() {
+        hostBatch?.reset()
+        bounded?.close(); bounded = nil
         for group in groups { for state in group.states { state.close() }; for ordering in group.ordering { ordering?.close() } }
         sources = []; groups = []; lookup = [:]; outputs = []
         context.meter.resources.query.release(reserved); reserved = 0; sourceBytes = 0

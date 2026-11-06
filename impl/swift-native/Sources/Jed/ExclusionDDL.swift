@@ -56,7 +56,7 @@ extension CatalogDDL {
             let resolver = try resolver(snapshot: snapshot, settings: settings, context: context, table: table)
             resolver.storageCollation = true
             let expression = try resolver.resolve(predicate, expected: TypeDescriptor(.scalar(.boolean)))
-            guard expression.type == nil || expression.type?.type == .scalar(.boolean) else { throw JedError("42804", "argument of WHERE must be boolean") }
+            guard expression.type == nil || expression.type?.type == .scalar(.boolean) else { throw JedError("42804", "argument of WHERE must be boolean").at(predicate.expressionLocation) }
             dependencies = try IndexDependencies.resolve([expression], environment: settings.environment)
             stored = try CatalogSQL.expression(predicate, source: source)
         }

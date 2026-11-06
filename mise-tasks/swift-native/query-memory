@@ -1,0 +1,14 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#MISE description="Explicit opt-in: compare exact frozen Swift query-memory peaks and storage against supported cores"
+#USAGE flag "-c --configuration <configuration>" default="debug" help="debug or release"
+#USAGE flag "--no-build" help="Capture existing Swift XCTest executable/resources; supported runners keep their normal build cache"
+#USAGE flag "--bytes <bytes>" default="1099511627776" help="Huge active per-record default budget"
+#USAGE flag "--filter <filter>" help="Diagnostic corpus path substring; omitted means all frozen sequential SQL"
+#USAGE flag "--mode <mode>" default="all" help="all, memory, disk, or disk-spill"
+#USAGE flag "--cores <cores>" default="swift,rust,go,ts" help="Explicit core list including swift; subsets are diagnostic only"
+#USAGE flag "--output <path>" help="Empty evidence directory; defaults to a retained unique /tmp directory"
+#USAGE flag "--check-adapter" help="Run bounded strict-output/parser/comparison checks without building or executing cores"
+
+require_relative "../../impl/swift-native/Tools/query_memory"
+exit SwiftQueryMemory.run

@@ -24,10 +24,10 @@ internal enum ForeignKeyActions {
         /// the outer statement finishes; an immediate later error can win.
         func validateChildren(_ candidates: [ForeignKeyValidation.Candidate], child: CatalogTable,
                               snapshot: DomainSnapshot, assigned: Set<Int>? = nil,
-                              vacated: Set<[UInt8]> = [], context: ExpressionContext) throws {
+                              vacated: Set<[UInt8]> = [], context: ExpressionContext, selfCandidates: [ForeignKeyValidation.Candidate]? = nil) throws {
             if !deferUntilStatementEnd {
                 try ForeignKeyValidation.validateChildren(candidates, child: child, snapshot: snapshot,
-                    assigned: assigned, vacated: vacated, context: context)
+                    assigned: assigned, vacated: vacated, context: context, selfCandidates: selfCandidates)
                 return
             }
             let plans = try child.foreignKeys.sorted { $0.name < $1.name }.filter {
@@ -54,7 +54,8 @@ internal enum ForeignKeyActions {
             defer { checks.removeAll() }
             for (domain, check) in checks {
                 var scoped = settings; scoped.targetDomain = domain; scoped.domains = domains
-                try ForeignKeyActions.settle(check, snapshot: domains.snapshot(domain), settings: scoped, context: context)
+                do { try ForeignKeyActions.settle(check, snapshot: domains.snapshot(domain), settings: scoped, context: context) }
+                catch let error as JedError { throw error.inDatabase(domain) }
             }
         }
     }
@@ -63,14 +64,14 @@ internal enum ForeignKeyActions {
         switch check {
         case .parent(let plan, let key, let tuple, let update):
             if update, try plan.parentExists(key, snapshot: snapshot, context: context) { return }
-            if try plan.hasChild(tuple, snapshot: snapshot, settings: settings, context: context) { throw plan.violation(parentSide: true) }
+            if try plan.hasChild(tuple, snapshot: snapshot, settings: settings, context: context) { throw plan.parentViolation(tuple: tuple, context: context) }
         case .child(let plan, let tuple):
             let positions = Dictionary(uniqueKeysWithValues: plan.foreign.columns.enumerated().map { ($0.element, $0.offset) })
             switch try plan.childProbe({ tuple[positions[$0]!] }, context: context) {
             case .exempt: break
-            case .missing: throw plan.violation()
+            case .missing: throw plan.violation(value: { tuple[positions[$0]!] }, context: context)
             case .key(let key):
-                guard try plan.parentExists(key, snapshot: snapshot, context: context) else { throw plan.violation() }
+                guard try plan.parentExists(key, snapshot: snapshot, context: context) else { throw plan.violation(value: { tuple[positions[$0]!] }, context: context) }
             }
         }
     }

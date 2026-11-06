@@ -5,6 +5,19 @@ internal final class TableFunctionPlan {
     let columns: [ExpressionColumn]
     let recordFields: [TypeField]?
     var expressions: [ResolvedExpression] { function.arguments }
+    /// The frozen touched-set collector also visits the first FROM function at
+    /// depth one. Without a preceding sibling frame, those ordinals belong to
+    /// an enclosing query; retain that conservative mask for exact accounting.
+    var initialOuterTouched: Set<Int> {
+        var result: Set<Int> = []
+        StoredExpressionDependencies.walk(expressions) { expression in
+            if case .outerColumn(let reference) = expression.node, reference.depth == 1 { result.insert(reference.index) }
+            if case .subquery(let query) = expression.node {
+                for reference in query.outerReferences where reference.depth == 2 { result.insert(reference.index) }
+            }
+        }
+        return result
+    }
     var lateralColumns: Set<Int> {
         var result: Set<Int> = []
         StoredExpressionDependencies.walk(expressions) { expression in
@@ -19,6 +32,10 @@ internal final class TableFunctionPlan {
         self.function = function; self.columns = columns; self.recordFields = recordFields
     }
     static func resolve(_ input: SQLFrom, syntax: SQLExpression, resolver: ExpressionResolver) throws -> TableFunctionPlan {
+        do { return try resolveFunction(input, syntax: syntax, resolver: resolver) }
+        catch let error as JedError { throw ResolutionDiagnostics.locate(error, syntax: syntax) }
+    }
+    private static func resolveFunction(_ input: SQLFrom, syntax: SQLExpression, resolver: ExpressionResolver) throws -> TableFunctionPlan {
         guard case .call(let call) = syntax.kind else { throw JedError("42883", "FROM function does not exist") }
         let name = call.name.description
         guard !call.star, !call.distinct, call.orderBy.isEmpty, call.withinGroup.isEmpty,
@@ -67,6 +84,11 @@ internal final class TableFunctionPlan {
             else if let scalar = ScalarType.allCases.first(where: { $0.name == spelling }) { resultType = TypeDescriptor(.scalar(scalar)) }
             else { throw JedError("XX000", "unknown table function result") }
         }
+        let resultCollation: CollationDerivation?
+        if name == "unnest", ExpressionCollation.collatable(resultType.type) {
+            resultCollation = try ExpressionCollation.derive(arguments[0]).asColumn
+            resultType.collation = resultCollation?.name
+        } else { resultCollation = nil }
         try resolver.checkFunction?(call.name)
         var function = ResolvedFunction(metadata: FunctionSpecFact(category: fact.category, name: name, kind: fact.kind, metadata: fact.metadata),
             arguments: arguments, resultType: resultType, evaluationOrder: Array(arguments.indices), constantArguments: arguments.map(FunctionResolver.isConstant))
@@ -82,8 +104,15 @@ internal final class TableFunctionPlan {
                 guard seen.insert(column.name).inserted else { throw JedError("42701", "column name specified more than once") }
                 return TypeField(name: column.name, descriptor: try TypeRules.resolve(column.type, composites: resolver.composites))
             }
-            guard declared.count == actual.count, zip(actual, declared).allSatisfy({ recordCompatible($0.descriptor.type, $1.descriptor.type) }) else {
+            guard declared.count == actual.count else {
                 throw JedError("42804", "function return row and column definition list do not match")
+                    .detailed("Returned row contains \(actual.count) attribute\(actual.count == 1 ? "" : "s"), but query expects \(declared.count).")
+            }
+            for (index, fields) in zip(actual, declared).enumerated() {
+                guard recordCompatible(fields.0.descriptor.type, fields.1.descriptor.type) else {
+                    throw JedError("42804", "function return row and column definition list do not match")
+                        .detailed("Returned type \(fields.0.descriptor.type.name) at ordinal position \(index + 1), but query expects \(fields.1.descriptor.type.name).")
+                }
             }
             fields = declared
             columns = declared.enumerated().map { ExpressionColumn(name: $0.element.name, qualifier: qualifier, type: $0.element.descriptor, index: $0.offset) }
@@ -91,7 +120,7 @@ internal final class TableFunctionPlan {
             guard input.columnDefinitions.isEmpty else { throw JedError("42601", "column definition list is redundant for a function with a known result type") }
             let each = name == "json_each" || name == "jsonb_each" || name == "json_each_text" || name == "jsonb_each_text"
             columns = each ? [ExpressionColumn(name: SQLText(validatedUTF8: Array("key".utf8)), qualifier: qualifier, type: TypeDescriptor(.scalar(.text)), index: 0)] : []
-            columns.append(ExpressionColumn(name: columnName, qualifier: qualifier, type: resultType, index: columns.count, scalarFunction: !each))
+            columns.append(ExpressionColumn(name: columnName, qualifier: qualifier, type: resultType, index: columns.count, collation: resultCollation, scalarFunction: !each))
         }
         return TableFunctionPlan(function: function, columns: columns, recordFields: fields)
     }
@@ -105,12 +134,12 @@ internal final class TableFunctionPlan {
     }
     func produce(context: ExpressionContext, visit: ([SQLValue]) throws -> Void) throws {
         let meter = context.meter, name = function.name
-        let kernel = name.hasPrefix("regexp_") || name.hasPrefix("jsonb_path_query")
+        let kernel = name.hasPrefix("regexp_")
         if kernel { meter.charge(1); try meter.step() }
         let values = try function.arguments.map { try context.evaluate($0) }
         if JSONRecordPlan.names.contains(name) { try JSONRecordPlan.produce(self, values: values, context: context, visit: visit); return }
         guard !values.contains(where: \.isNull) else { return }
-        func emit(_ row: [SQLValue]) throws { meter.charge(1); try meter.checkpoint(); try visit(row) }
+        func emit(_ row: [SQLValue]) throws { try meter.step(); meter.charge(1); try visit(row) }
         if name == "generate_series" {
             guard case .integer(let start) = values[0], case .integer(let stop) = values[1] else { throw JedError("42804", "series values must be integers") }
             let step: Int64

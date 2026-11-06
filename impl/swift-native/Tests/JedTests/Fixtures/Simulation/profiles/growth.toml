@@ -1,0 +1,41 @@
+# Bounded growth (simulation-testing.md §8.3): readers that come and go between long runs of quiet
+# commits. A reader legitimately holds reclamation back while it is pinned; once every reader has
+# closed, the next quiet commit must reclaim and the one after must reuse. Crashes and reopens are
+# rare, since each starts a new process whose reclamation trigger restarts from the file it opens.
+
+description = "Short-lived readers between long runs of quiet commits; the file must stop growing"
+
+page_sizes = [256, 512]
+cache_bytes = [0, 2048]
+steps = 500
+max_tables = 2
+max_rows = 150
+max_readers = 2
+batch = [1, 10]
+
+[weights]
+open_write = 14
+open_read = 2
+close_read = 6
+read_query = 2
+insert = 6
+update = 14
+delete = 6
+upsert = 2
+commit = 16
+rollback = 1
+create_table = 1
+drop_table = 1
+create_index = 1
+drop_index = 1
+add_column = 0
+analyze = 1
+sequence = 0
+invalid = 0
+check = 1
+reopen = 0
+crash_power = 0
+crash_process = 0
+
+[faults]
+commit_fault = 10

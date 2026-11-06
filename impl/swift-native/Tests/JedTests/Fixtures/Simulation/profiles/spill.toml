@@ -1,0 +1,20 @@
+# Spill I/O (spill.md, temp-tables.md §6; simulation-testing.md §14 S3): a small work_mem spills the
+# generator's sorting and grouping reads to scratch files, a small temp_buffers spills session temp
+# tables to a scratch block store, and spill_error fails scratch-file operations mid-statement. A
+# failed spill must fail its statement (58030) without touching durable state. Spill bytes are each
+# core's own business, so a trace that arms spill_error is per-core; one that does not is compared.
+
+description = "Sort, aggregate, and temp-table spill with scratch-file I/O errors"
+
+page_sizes = [256, 512]
+work_mem = [512, 2048]
+temp_buffers = [1024, 4096]
+
+[weights]
+read_query = 14
+temp_table = 4
+temp_insert = 10
+temp_read = 6
+
+[faults]
+spill_fault = 150

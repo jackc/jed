@@ -87,6 +87,60 @@ final class StorageDomainBoundaryTests: XCTestCase {
         }
     }
 
+    func testMalformedPersistedCountFailsPreflightWithoutWritesOrImageOutput() throws {
+        let device = DomainTestDevice()
+        try device.write(at: 0, bytes: fixture("malformed_row_count"))
+        let domain = try StorageDomain.open(store: device, catalogID: 111, validateCatalog: { _ in })
+        let name = try name("t")
+        var working = domain.committed, store = try XCTUnwrap(working.tables[name])
+        XCTAssertEqual(store.count, 25)
+        var cursor = store.cursor(), removed = 0
+        while let record = try cursor.next() { try store.remove(record.key); removed += 1 }
+        XCTAssertEqual(removed, 20); XCTAssertEqual(store.count, 5); XCTAssertTrue(store.tree.isEmpty)
+        working.setTableStore(name, store)
+        device.reset()
+        expect("XX001") { _ = try domain.prepare(working) }
+        XCTAssertFalse(domain.pager.isPoisoned)
+        XCTAssertTrue(device.log.allSatisfy { $0 == "read" })
+        var emitted = 0
+        expect("XX001") { _ = try DomainImage.write(working, txid: working.txid + 1) { _ in emitted += 1 } }
+        XCTAssertEqual(emitted, 0)
+        XCTAssertEqual(domain.committed.tables[name]?.count, 25)
+    }
+
+    func testOversizedPendingIndexFailsPreflightBeforeStorageAdmissionOrWrites() throws {
+        let device = DomainTestDevice(), domain = try StorageDomain.create(store: device, kind: .file,
+            catalogID: 112, pageSize: 256)
+        var working = domain.committed
+        try table("a", snapshot: &working); try put(1, table: "a", snapshot: &working)
+        let before = try commit(working, to: domain), tableName = try name("a"), indexName = try name("a_id")
+        working = before
+        var image = working.catalog
+        image.tables[0].indexes.append(CatalogIndex(name: indexName, keys: [.column(0)],
+            root: PageSealer.nullReference(domain.pool.codec)))
+        try working.updateCatalog(image, schemaChanged: true)
+        var index = working.emptyStore(types: [])
+        let oversized = PackedRecord(key: [UInt8](repeating: 0x11, count: domain.pool.codec.capacity + 1), cells: [])
+        try index.put(oversized, netStaging: true); working.setIndexStore(indexName, index)
+        XCTAssertEqual(working.pendingBytes, Int64(oversized.key.count))
+        let oldBytes = try device.read(at: 0, count: Int(device.size()))
+        let oldMeta = domain.pager.selected.meta, oldFree = try domain.pager.allocationSnapshot(reuseAllowed: true).persistedFree
+        device.reset()
+        var policy = DomainCommitPolicy(); policy.storageLimit = 1
+        expect("0A000") { _ = try domain.prepare(working, policy: policy) }
+        XCTAssertFalse(domain.pager.isPoisoned)
+        XCTAssertTrue(device.log.allSatisfy { $0 == "read" })
+        XCTAssertEqual(domain.pager.selected.meta.pageCount, oldMeta.pageCount)
+        XCTAssertEqual(domain.pager.selected.meta.txid, oldMeta.txid)
+        XCTAssertEqual(try domain.pager.allocationSnapshot(reuseAllowed: true).persistedFree, oldFree)
+        XCTAssertEqual(try device.read(at: 0, count: Int(device.size())), oldBytes)
+        XCTAssertEqual(domain.committed.tables[tableName]?.count, 1)
+        XCTAssertNil(domain.committed.indexes[indexName])
+        var emitted = 0
+        expect("0A000") { _ = try DomainImage.write(working, txid: working.txid + 1) { _ in emitted += 1 } }
+        XCTAssertEqual(emitted, 0)
+    }
+
     func testFreshFileReclaimsBootstrapPageBeforeSecondAllocation() throws {
         let device = MemoryBlockStore()
         let fresh = try StorageDomain.create(store: device, kind: .file, catalogID: 100, pageSize: 1024)
@@ -177,7 +231,10 @@ final class StorageDomainBoundaryTests: XCTestCase {
         let freeBeforePrecheck = try domain.pager.allocationSnapshot(reuseAllowed: true).persistedFree
         device.reset(); try domain.precheck(working, policy: policy)
         XCTAssertFalse(device.log.contains("write")); XCTAssertFalse(device.log.contains("sync"))
-        XCTAssertEqual(try domain.pager.allocationSnapshot(reuseAllowed: true).persistedFree, freeBeforePrecheck)
+        let freeAfterPrecheck = try domain.pager.allocationSnapshot(reuseAllowed: true).persistedFree
+        XCTAssertGreaterThan(freeAfterPrecheck.count, freeBeforePrecheck.count)
+        XCTAssertEqual(domain.pager.selected.meta.pageCount, 5)
+        XCTAssertEqual(domain.committed.txid, 1)
         _ = try commit(working, to: domain, policy: policy)
         XCTAssertEqual(domain.pager.selected.meta.pageCount, 6)
         for _ in 0..<12 {
@@ -196,6 +253,45 @@ final class StorageDomainBoundaryTests: XCTestCase {
         try emptied.remove(key(1)); working.setTableStore(t, emptied)
         _ = try commit(working, to: domain, policy: policy)
         XCTAssertTrue(domain.committed.tables[t]!.tree.isEmpty)
+    }
+
+    func testRejectedMemoryCommitRetainsCompactionForUnlimitedRetry() throws {
+        let device = DomainTestDevice(), domain = try StorageDomain.create(store: device, catalogID: 112, pageSize: 256)
+        var working = domain.committed
+        try table("t", snapshot: &working); try put(1, table: "t", snapshot: &working)
+        _ = try commit(working, to: domain)
+        working = domain.committed; try put(1, table: "t", snapshot: &working)
+        _ = try commit(working, to: domain)
+        let before = domain.committed, highWater = domain.pager.selected.meta.pageCount
+        XCTAssertEqual(highWater, 7)
+        XCTAssertTrue(try domain.pager.allocationSnapshot(reuseAllowed: true).persistedFree.isEmpty)
+        let bytes = try device.memory.read(at: 0, count: Int(device.memory.size()))
+        working = before
+        for id in 2...60 { try put(Int64(id), table: "t", snapshot: &working) }
+        var limited = DomainCommitPolicy(); limited.storageLimit = 1; limited.oldestPinnedVersion = before.txid
+        device.reset()
+        expect("54P06") { _ = try domain.prepare(working, policy: limited) }
+        XCTAssertTrue(device.log.allSatisfy { $0 == "read" })
+        XCTAssertFalse(domain.pager.isPoisoned)
+        XCTAssertEqual(domain.committed.txid, before.txid)
+        XCTAssertEqual(domain.pager.selected.meta.pageCount, highWater)
+        XCTAssertEqual(try device.memory.read(at: 0, count: Int(device.memory.size())), bytes)
+        let reclaimed = try domain.pager.allocationSnapshot(reuseAllowed: true).persistedFree
+        XCTAssertEqual(reclaimed, [2, 3, 4])
+        XCTAssertEqual(domain.freeGeneration, before.txid)
+        // Clearing the limit must use the already reclaimed pages, even though
+        // unlimited admission does not itself run a forced reachability walk.
+        let retry = try XCTUnwrap(domain.prepare(working))
+        let written = Set(retry.pages.body.map(\.index))
+        XCTAssertTrue(Set(reclaimed).isSubset(of: written))
+        XCTAssertEqual(retry.pages.manifest.meta.pageCount,
+            highWater + UInt32(retry.pages.body.count - reclaimed.count))
+        _ = try domain.persist(retry)
+        let name = try name("t")
+        XCTAssertEqual(domain.committed.tables[name]?.count, 60)
+        XCTAssertEqual(before.tables[name]?.count, 1)
+        XCTAssertNotNil(try before.tables[name]?.get(key(1)))
+        XCTAssertNil(try before.tables[name]?.get(key(60)))
     }
 
     func testOverflowSharingAndLivePageDeltaAcrossPinnedReclamation() throws {

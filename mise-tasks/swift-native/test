@@ -3,7 +3,35 @@
 #MISE description="Explicit opt-in: test the native Swift experiment's host and invariant surface"
 #USAGE flag "-c --configuration <configuration>" default="debug" help="debug or release"
 #USAGE flag "--filter <filter>" help="Swift test name filter"
+#USAGE flag "--all-sql" help="Attempt all frozen SQL files, including unconnected surfaces"
+#USAGE flag "--sql-file <path>" help="Run one exact frozen SQL file for diagnosis"
+#USAGE flag "--sql-files <paths>" help="Run comma-separated exact frozen SQL filenames"
+#USAGE flag "--sql-mode <mode>" default="auto" help="auto, memory, or disk; auto uses file hosts for file-only corpus"
+#USAGE flag "--trace-sql" help="Write SQL file and record progress immediately"
 
 require_relative "../../impl/swift-native/Tools/swift_task"
+mode = ENV.fetch("usage_sql_mode", "auto")
+abort "--sql-mode must be auto, memory, or disk" unless %w[auto memory disk].include?(mode)
+ENV["JED_SWIFT_SQL_MODE"] = mode
 extra = ENV["usage_filter"] ? ["--filter", ENV.fetch("usage_filter")] : []
+ENV["JED_SWIFT_ALL_SQL"] = "1" if ENV["usage_all_sql"] == "true"
+single = ENV["usage_sql_file"]
+multiple = ENV["usage_sql_files"]
+abort "--sql-file and --sql-files cannot be combined" if single && multiple
+if single || multiple
+  names = single ? [single] : multiple.split(",", -1)
+  abort "SQL filenames must not be empty" if names.any?(&:empty?)
+  abort "duplicate SQL filename selection" unless names.uniq.length == names.length
+  corpus = File.join(SwiftNativeTasks::PACKAGE, "Tests/JedTests/Fixtures/Corpus")
+  known = Dir.glob("**/*.test", base: corpus)
+  unknown = names - known
+  abort "unknown frozen SQL filename(s): #{unknown.join(', ')}" unless unknown.empty?
+  ENV[single ? "JED_SWIFT_SQL_FILE" : "JED_SWIFT_SQL_FILES"] = single || multiple
+end
+if ENV["usage_trace_sql"] == "true"
+  ENV["JED_SWIFT_TRACE_SQL"] = "1"
+  ENV["JED_SWIFT_SQL_TRACE_PATH"] ||= File.join(SwiftNativeTasks::BUILD, "sql-progress.log")
+  FileUtils.mkdir_p(File.dirname(ENV.fetch("JED_SWIFT_SQL_TRACE_PATH")))
+  File.write(ENV.fetch("JED_SWIFT_SQL_TRACE_PATH"), "")
+end
 SwiftNativeTasks.run("test", configuration: ENV.fetch("usage_configuration", "debug"), extra: extra)

@@ -12,6 +12,9 @@ internal enum MutationExecutor {
         case .delete(let syntax): return try mutate(table: syntax.table, assignments: nil,
             predicate: syntax.predicate, returning: syntax.returning, snapshot: &snapshot,
             settings: settings, context: context, parameters: parameters)
+        case .merge(let syntax):
+            let plan = try MergeExecutor.prepare(syntax, snapshot: snapshot, settings: settings, context: context)
+            return try MergeExecutor.execute(plan, snapshot: &snapshot, context: context, parameters: parameters)
         default: return nil
         }
     }
@@ -24,7 +27,7 @@ internal enum MutationExecutor {
         init(_ name: SQLName, snapshot: DomainSnapshot, tableOverride: CatalogTable? = nil, view: UpdatableView? = nil, domain: SQLText = DomainNames.main) throws {
             guard name.database == nil || name.database == domain,
                   let table = tableOverride ?? snapshot.catalog.tables.first(where: { $0.name == name.name }),
-                  let store = snapshot.tables[name.name] else { throw JedError("42P01", "relation does not exist: \(name.name)") }
+                  let store = snapshot.tables[name.name] else { throw JedError("42P01", "relation does not exist: \(name.name)").at(name.span.position) }
             self.table = table; self.store = store; self.view = view
             types = try snapshot.tableTypes(table)
         }
@@ -34,12 +37,12 @@ internal enum MutationExecutor {
                 return layer.columns.enumerated().map {
                     ExpressionColumn(name: $0.element.name, qualifier: qualifier ?? layer.view.name,
                         type: $0.element.type ?? TypeDescriptor(.scalar(.text)), index: offset + $0.offset,
-                        collation: layer.projections[$0.offset].collation?.asColumn, qualifiedOnly: qualifiedOnly)
+                        collation: layer.projections[$0.offset].collation?.asColumn, qualifiedOnly: qualifiedOnly, catalogName: layer.view.name)
                 }
             }
             return table.columns.enumerated().map {
                 ExpressionColumn(name: $0.element.name, qualifier: qualifier ?? table.name, type: types[$0.offset],
-                                 index: offset + $0.offset, qualifiedOnly: qualifiedOnly)
+                                 index: offset + $0.offset, qualifiedOnly: qualifiedOnly, catalogName: table.name)
             }
         }
         func physicalColumns(_ columns: Set<Int>) -> Set<Int> { view?.physicalColumns(columns) ?? columns }
@@ -53,9 +56,9 @@ internal enum MutationExecutor {
             if let view { try view.requireSelect(settings) }
             else if settings.targetDomain != DomainNames.temporary { try settings.privileges.require(.select, on: table.name) }
         }
-        func column(_ name: SQLText) throws -> Int {
+        func column(_ name: SQLText, position: Int = 0) throws -> Int {
             guard let index = table.columns.firstIndex(where: { $0.name == name }) else {
-                throw JedError("42703", "column does not exist: \(name)")
+                throw JedError("42703", "column does not exist: \(name)").at(position)
             }
             return index
         }
@@ -66,11 +69,13 @@ internal enum MutationExecutor {
             return key
         }
         func coerce(_ value: SQLValue, expression: ResolvedExpression, column: Int, context: ExpressionContext) throws -> SQLValue {
-            try AssignmentValues.store(value, expression: expression, to: types[column], context: context)
+            do { return try AssignmentValues.store(value, expression: expression, to: types[column], context: context) }
+            catch let error as JedError { throw error.storing(table: table.name, column: table.columns[column], type: types[column]) }
         }
-        func validateNotNull(_ columns: [Int], value: (Int) throws -> SQLValue) throws {
+        func validateNotNull(_ columns: [Int], value: (Int) throws -> SQLValue, context: ExpressionContext) throws {
             for column in columns where table.columns[column].notNull || table.primaryKey.contains(column) {
-                if try value(column).isNull { throw JedError("23502", "null value in column \(table.columns[column].name) violates not-null constraint") }
+                if try value(column).isNull { throw JedError("23502", "null value in column \(table.columns[column].name) violates not-null constraint")
+                    .object(table: table.name, column: table.columns[column].name, detail: context.errorDetail?.row(table, types: types, value: value)) }
             }
         }
     }
@@ -79,6 +84,7 @@ internal enum MutationExecutor {
         let read = context.writeScope?.readSnapshot ?? snapshot
         let resolver = ExpressionResolver(columns: columns ? relation.columns() : [], composites: read.types, scalar: context.scalar)
         resolver.cteBindings = context.writeScope?.cteBindings ?? [:]
+        resolver.resolveAggregate = AggregateQueryPlan.forbidden
         resolver.hostFunctions = settings.environment.signatures; resolver.unicode = settings.environment.unicode
         resolver.queryScope = SubqueryScope(snapshot: read, settings: settings)
         resolver.checkFunction = { try settings.privileges.require(.execute, on: $0, function: true) }
@@ -98,7 +104,7 @@ internal enum MutationExecutor {
         let name: SQLText
         let expression: ResolvedExpression
     }
-    private static func checks(_ relation: Relation, resolver: ExpressionResolver, environment: Environment) throws -> [Check] {
+    static func checks(_ relation: Relation, resolver: ExpressionResolver, environment: Environment) throws -> [Check] {
         let old = resolver.columns, references = resolver.referencedColumns
         resolver.columns = relation.columns(physical: true); resolver.referencedColumns = []
         defer { resolver.columns = old; resolver.referencedColumns = references }
@@ -120,25 +126,51 @@ internal enum MutationExecutor {
         for check in checks {
             if case .boolean(false) = try row.evaluate(check.expression) {
                 throw JedError("23514", "new row for relation \(relation.table.name) violates check constraint \(check.name)")
+                    .object(table: relation.table.name, constraint: check.name, detail: context.errorDetail?.row(relation.table, types: relation.types, value: value))
             }
         }
     }
     struct Returning {
+        let present: Bool
         let columns: [ResultColumn]
         let expressions: [ResolvedExpression]
         let oldTouched: Set<Int>
         let newTouched: Set<Int>
         init(_ syntax: SQLReturning?, relation: Relation, resolver: ExpressionResolver, oldDefault: Bool,
              qualifier: SQLText? = nil) throws {
+            present = syntax != nil
             guard let syntax else { columns = []; expressions = []; oldTouched = []; newTouched = []; return }
             let width = relation.visibleCount
             let oldColumns = resolver.columns, oldReferences = resolver.referencedColumns
+            defer { resolver.columns = oldColumns; resolver.referencedColumns = oldReferences }
             resolver.referencedColumns = []
             let main = relation.columns(qualifier: qualifier, offset: oldDefault ? 0 : width)
-            resolver.columns = main
-                + relation.columns(qualifier: syntax.oldAlias ?? SQLText(validatedUTF8: Array("old".utf8)), qualifiedOnly: true)
-                + relation.columns(qualifier: syntax.newAlias ?? SQLText(validatedUTF8: Array("new".utf8)), offset: width, qualifiedOnly: true)
-            defer { resolver.columns = oldColumns; resolver.referencedColumns = oldReferences }
+            var scope = main
+            var labels: Set<SQLText> = [qualifier ?? relation.view?.layers.first?.view.name ?? relation.table.name]
+            // Authored aliases occupy their labels before either implicit row
+            // version. The target keeps its ordinary label even if it is old/new.
+            for (alias, offset) in [(syntax.oldAlias, 0), (syntax.newAlias, width)] {
+                guard let alias else { continue }
+                guard labels.insert(alias).inserted else { throw JedError("42712", "table name specified more than once: \(alias)") }
+                scope += relation.columns(qualifier: alias, offset: offset, qualifiedOnly: true).map {
+                    var column = $0; column.catalogName = nil; return column
+                }
+            }
+            for (name, offset, aliased) in [("old", 0, syntax.oldAlias != nil), ("new", width, syntax.newAlias != nil)] {
+                let label = SQLText(validatedUTF8: Array(name.utf8))
+                if !aliased && labels.insert(label).inserted {
+                    scope += relation.columns(qualifier: label, offset: offset, qualifiedOnly: true).map {
+                        var column = $0; column.catalogName = nil; return column
+                    }
+                }
+            }
+            var hintOrders: [SQLText: Int] = [:]
+            for index in scope.indices {
+                guard let label = scope[index].qualifier else { continue }
+                if hintOrders[label] == nil { hintOrders[label] = hintOrders.count }
+                scope[index].hintRelationOrder = hintOrders[label]!
+            }
+            resolver.columns = scope
             var columns: [ResultColumn] = [], expressions: [ResolvedExpression] = []
             for item in syntax.items {
                 if item.star {
@@ -190,6 +222,7 @@ internal enum MutationExecutor {
     }
     static func prepareInsert(_ syntax: SQLInsert, snapshot: DomainSnapshot, settings inputSettings: SessionSettings,
                               context baseContext: ExpressionContext) throws -> InsertPreparation {
+        do {
         try SystemRelationPlan.rejectTarget(syntax.table.name)
         let read = baseContext.writeScope?.readSnapshot ?? snapshot
         if DomainNames.isAttachment(inputSettings.targetDomain), syntax.conflict != nil { throw JedError("0A000", "ON CONFLICT on attached tables is not yet supported") }
@@ -202,10 +235,10 @@ internal enum MutationExecutor {
             let definition = view.layers[0].view
             let targets: [Int]
             if case .defaultValues = syntax.source { targets = [] }
-            else { targets = try syntax.columns.isEmpty ? Array(definition.columns.indices) : syntax.columns.map(view.column) }
+            else { targets = try syntax.columns.isEmpty ? Array(definition.columns.indices) : syntax.columns.enumerated().map { try view.column($0.element, position: syntax.columnPosition($0.offset)) } }
             guard Set(targets).count == targets.count else { throw JedError("42701", "column specified more than once") }
             if let conflict = syntax.conflict, !conflict.doNothing {
-                let updates = try conflict.assignments.map { try view.column($0.column) }
+                let updates = try conflict.assignments.map { try view.column($0.column, position: $0.position) }
                 guard Set(updates).count == updates.count else { throw JedError("42701", "multiple assignments to same column") }
                 _ = try view.destinations(Array(Set(targets + updates)).sorted(), allowDuplicates: true)
                 _ = try view.destinations(updates)
@@ -220,7 +253,7 @@ internal enum MutationExecutor {
             relation = try Relation(SQLName(database: nil, name: table.name, span: syntax.table.span), snapshot: read, tableOverride: table, view: view, domain: settings.targetDomain)
         } else {
             relation = targetPlan.relation
-            destinations = try syntax.columns.isEmpty ? Array(relation.types.indices) : syntax.columns.map(relation.column)
+            destinations = try syntax.columns.isEmpty ? Array(relation.types.indices) : syntax.columns.enumerated().map { try relation.column($0.element, position: syntax.columnPosition($0.offset)) }
         }
         try CatalogEnvironment.checkWritable(relation.table, image: read.catalog, environment: settings.environment,
             borrowedTypes: read.borrowedTypes, rowTypes: relation.types)
@@ -229,12 +262,12 @@ internal enum MutationExecutor {
         let discarded = Set(relation.types.indices.filter { syntax.overriding == "user" && relation.table.columns[$0].identity != nil })
         let always = Set(destinations.filter { relation.table.columns[$0].identity == true && syntax.overriding != "system" && !discarded.contains($0) })
         let source: [[SQLExpression?]]
-        var sourcePlan: SelectPlan?, inputLiterals: Set<Int> = []
+        var sourcePlan: SelectPlan?, inputLiterals: Set<Int> = [], sourceValidationError: JedError?
         switch syntax.source {
         case .defaultValues: source = [Array(repeating: nil, count: destinations.count)]
         case .values(let rows): source = rows
         case .query(let query):
-            guard always.isEmpty else { throw JedError("428C9", "cannot insert a non-DEFAULT value into an identity column") }
+            if let column = always.min() { throw JedError("428C9", "cannot insert a non-DEFAULT value into an identity column").identity(relation.table.columns[column].name, insert: true) }
             source = []
             sourcePlan = try SelectPlan.resolve(query, snapshot: read, settings: inputSettings, scalar: baseContext.scalar,
                                                using: resolver, finalizeParameters: false)
@@ -245,35 +278,33 @@ internal enum MutationExecutor {
                 sourcePlan!.materializeSource = plan.aggregation == nil && plan.window == nil && plan.relation == nil
                     && !plan.orderedByScan && plan.order.isEmpty && plan.limit == nil
             }
-            guard sourcePlan!.columns.count == destinations.count else { throw JedError("42601", "INSERT source column count does not match target") }
-            func literalStrings(_ query: SQLQuery) -> Set<Int> {
-                if case .nested(let child) = query.body { return literalStrings(child) }
-                guard case .select(let select) = query.body else { return [] }
-                return Set(select.items.enumerated().compactMap { index, item in
-                    guard let syntax = item.expression else { return nil }
-                    if case .string = syntax.kind { return index }; return nil
-                })
-            }
-            let stringLiterals = literalStrings(query)
-            for ordinal in destinations.indices {
-                if discarded.contains(destinations[ordinal]) { continue }
-                let target = relation.types[destinations[ordinal]], projected = sourcePlan!.projections[ordinal]
-                if AssignmentValues.admits(projected.type?.type, to: target.type) { continue }
-                if case .scalar(let type) = target.type, stringLiterals.contains(ordinal),
-                   [.uuid, .bytea, .date, .timestamp, .timestamptz, .interval, .json, .jsonb].contains(type) {
-                    inputLiterals.insert(ordinal); continue
+            // The source is an eager query result. Its admission/evaluation
+            // precedes the assignment gate even when no target row can be
+            // written. Retain the static error for replay after source drain;
+            // EXPLAIN validates it without running the source.
+            do {
+                guard sourcePlan!.columns.count == destinations.count else { throw JedError("42601", "INSERT source column count does not match target") }
+                let stringLiterals = InsertLiteralInput.columns(query)
+                for ordinal in destinations.indices {
+                    if discarded.contains(destinations[ordinal]) { continue }
+                    let target = relation.types[destinations[ordinal]], projected = sourcePlan!.projections[ordinal]
+                    if AssignmentValues.admits(projected.type?.type, to: target.type) { continue }
+                    if case .scalar(let type) = target.type, stringLiterals.contains(ordinal),
+                       [.uuid, .bytea, .date, .timestamp, .timestamptz, .interval, .json, .jsonb].contains(type) {
+                        inputLiterals.insert(ordinal); continue
+                    }
+                    if case .record = projected.type?.type, case .composite = target.type {
+                        throw JedError("42846", "cannot cast type record to \(target.type.name)")
+                    }
+                    throw JedError("42804", "INSERT source type cannot be assigned to \(target.type.name)").at(projected.location).hinted(ErrorHints.assignment)
                 }
-                if case .record = projected.type?.type, case .composite = target.type {
-                    throw JedError("42846", "cannot cast type record to \(target.type.name)")
-                }
-                throw JedError("42804", "INSERT source type cannot be assigned to \(target.type.name)")
-            }
+            } catch let error as JedError { sourceValidationError = error }
         }
         var slots: [InsertSlot] = [], defaults: [Int: ResolvedExpression] = [:]
         func defaultSlot(_ index: Int) throws -> ResolvedExpression {
             if let found = defaults[index] { return found }
             if viewDefaults.contains(index), relation.table.columns[index].identity == true, syntax.overriding != "system" {
-                throw JedError("428C9", "cannot insert a view default into a GENERATED ALWAYS identity column")
+                throw JedError("428C9", "cannot insert a view default into a GENERATED ALWAYS identity column").identity(relation.table.columns[index].name, insert: true)
             }
             let expression = try defaultExpression(index, relation: relation, resolver: resolver)
             defaults[index] = expression; return expression
@@ -285,12 +316,18 @@ internal enum MutationExecutor {
             for (index, value) in row.enumerated() {
                 let column = destinations[index]
                 if let value, !discarded.contains(column) {
-                    guard !always.contains(column) else { throw JedError("428C9", "cannot insert a non-DEFAULT value into an identity column") }
+                    guard !always.contains(column) else { throw JedError("428C9", "cannot insert a non-DEFAULT value into an identity column").identity(relation.table.columns[column].name, insert: true) }
                     provided[column] = value
                 }
             }
             let expressions = try relation.types.indices.map { column in
-                try provided[column].map { try AssignmentValues.resolve($0, to: relation.types[column], resolver: resolver) } ?? defaultSlot(column)
+                do { return try provided[column].map { try AssignmentValues.resolve($0, to: relation.types[column], resolver: resolver) } ?? defaultSlot(column) }
+                catch let error as JedError {
+                    guard let syntax = provided[column], ErrorDetail.literalSlot(syntax),
+                          case .scalar = relation.types[column].type,
+                          error.code == "42804" || error.code.hasPrefix("22") else { throw error }
+                    throw error.storing(table: relation.table.name, column: relation.table.columns[column], type: relation.types[column])
+                }
             }
             let supplied: Set<Int>
             if case .defaultValues = syntax.source { supplied = [] }
@@ -311,10 +348,12 @@ internal enum MutationExecutor {
         return InsertPreparation(read: read, settings: settings, inputSettings: inputSettings, relation: relation,
             destinations: destinations, discarded: discarded, sourcePlan: sourcePlan, inputLiterals: inputLiterals,
             slots: slots, defaults: defaults, checks: check, indexes: indexes, returning: returning,
-            conflict: conflict, parameterTypes: try ParameterBinding.finalize(resolver))
+            conflict: conflict, parameterTypes: try ParameterBinding.finalize(resolver), sourceValidationError: sourceValidationError)
+        } catch let error as JedError { throw error.inDatabase(inputSettings.targetDomain) }
     }
     static func executeInsert(_ plan: InsertPreparation, snapshot: inout DomainSnapshot,
                               context baseContext: ExpressionContext, parameters: [SQLValue]) throws -> MutationResult {
+        do {
         let read = plan.read, settings = plan.settings, inputSettings = plan.inputSettings, relation = plan.relation
         let destinations = plan.destinations, discarded = plan.discarded, sourcePlan = plan.sourcePlan
         let inputLiterals = plan.inputLiterals, check = plan.checks, indexes = plan.indexes, returning = plan.returning
@@ -330,13 +369,13 @@ internal enum MutationExecutor {
         defer { context.executionProfile?.add(plan.profileIdentity, .total, context.meter.accrued - profileStart) }
         var sourceReserved: Int64 = 0
         defer { context.meter.resources.query.release(sourceReserved) }
-        if let plan = sourcePlan {
-            try context.subqueries.prepare(plan.expressions, context: context)
+        if let source = sourcePlan {
+            try context.subqueries.prepare(source.foldExpressions, context: context)
             try returning.prepare(relation: relation, old: conflict?.doNothing == false, new: true, context: context)
             try relation.view?.prepareChecks(context: context)
             // The source reads the pre-statement roots and remains a Q1 buffer
             // beside all defaults, RETURNING rows and pending writes.
-            let execution = SelectExecution(plan: plan, context: context); defer { execution.close() }
+            let execution = SelectExecution(plan: source, context: context); defer { execution.close() }
             var rows: [[SQLValue]] = []
             while let row = try execution.next() {
                 let bytes = MemorySizes.row(row)
@@ -344,10 +383,13 @@ internal enum MutationExecutor {
                 rows.append(row)
             }
             execution.close()
+            context.meter.resources.retainStatementRows(rows, bytes: sourceReserved)
+            sourceReserved = 0
+            if let error = plan.sourceValidationError { throw error }
             for row in rows {
                 let expressions = try relation.types.indices.map { column in
                     if !discarded.contains(column), let ordinal = destinations.firstIndex(of: column) {
-                        return ResolvedExpression(type: plan.projections[ordinal].type, node: .constant(row[ordinal]), position: 0)
+                        return ResolvedExpression(type: source.projections[ordinal].type, node: .constant(row[ordinal]), position: 0)
                     }
                     return try defaultSlot(column)
                 }
@@ -375,7 +417,11 @@ internal enum MutationExecutor {
                 let expression = slot.expressions[column]
                 var value = try slot.literalSlots.contains(column) ? AssignmentValues.evaluateSlot(expression, context: context) : context.evaluate(expression)
                 if slot.inputLiterals.contains(column), case .text(let text) = value {
-                    value = try ScalarCasts.input(text, to: relation.types[column], explicit: false, context: context.scalar)
+                    // SELECT projections are row data even when their string
+                    // spelling is eligible for the target's input function.
+                    var input = context.scalar
+                    input.statementMicros = nil; input.statementClock = nil
+                    value = try ScalarCasts.input(text, to: relation.types[column], explicit: false, context: input)
                 }
                 values[column] = value
             }
@@ -390,7 +436,7 @@ internal enum MutationExecutor {
                 checks: check, returning: returning, snapshot: &snapshot, settings: settings,
                 inputSettings: inputSettings, context: context)
         }
-        let result = MutationResult(command: "INSERT", columns: returning.columns, meter: context.meter)
+        let result = MutationResult(command: "INSERT", columns: returning.columns, hasAffectedRows: !returning.present, meter: context.meter)
         var store = snapshot.tables[relation.table.name] ?? relation.store
         let compression = CostMeter()
         var prepared: [(record: PackedRecord, values: [SQLValue], entries: [[StoredIndexPlan.Entry]])] = [], batch: Set<[UInt8]> = []
@@ -398,15 +444,15 @@ internal enum MutationExecutor {
         for (rowIndex, slot) in slots.enumerated() {
             try context.meter.checkpoint()
             let values = try insertedValues(slot, supplied: materialized[rowIndex], relation: relation, context: context)
-            try relation.validateNotNull(Array(relation.types.indices), value: { values[$0] })
+            try relation.validateNotNull(Array(relation.types.indices), value: { values[$0] }, context: context)
             try validate(check, relation: relation, value: { values[$0] }, context: context)
             let key = try relation.key(values, store: &store, collatedKey: context.collatedKey)
-            guard try relation.store.get(key) == nil, batch.insert(key).inserted else { throw duplicate(relation.table.name) }
+            guard try relation.store.get(key) == nil, batch.insert(key).inserted else { throw duplicate(relation, value: { values[$0] }, context: context) }
             for ordinal in indexes.indices where indexes[ordinal].index.unique {
                 let index = indexes[ordinal]
                 guard let prefix = try index.prefix({ values[$0] }), !prefix.hasNull else { continue }
                 guard let existing = read.indexes[index.index.name] else { throw JedError.corruption("missing index store") }
-                guard indexBatches[ordinal].insert(prefix.bytes).inserted, try !index.conflicts(prefix, store: existing) else { throw duplicateIndex(index.index.name) }
+                guard indexBatches[ordinal].insert(prefix.bytes).inserted, try !index.conflicts(prefix, store: existing) else { throw duplicateIndex(index, relation: relation, value: { values[$0] }, context: context) }
             }
             let record = try RecordDisposition.plan(key: key, values: values.map(RecordInput.value), types: relation.types,
                 codec: store.tree.codec, meter: compression, pager: store.tree.pool?.pager)
@@ -448,6 +494,7 @@ internal enum MutationExecutor {
         }
         try context.meter.syncPending(snapshot.pendingBytes)
         return result
+        } catch let error as JedError { throw error.inDatabase(plan.settings.targetDomain) }
     }
     private struct Change {
         let old: PackedRecord
@@ -486,6 +533,7 @@ internal enum MutationExecutor {
                                 returning returningSyntax: SQLReturning?, snapshot: DomainSnapshot,
                                 settings inputSettings: SessionSettings, context baseContext: ExpressionContext,
                                 target: ForeignKeyActions.Target? = nil) throws -> MutationPreparation {
+        do {
         try SystemRelationPlan.rejectTarget(name.name)
         let read = baseContext.writeScope?.readSnapshot ?? snapshot
         let relation: Relation, deleting = assignments == nil
@@ -494,7 +542,7 @@ internal enum MutationExecutor {
         let settings = prepared.settings
         var viewTargets: [Int] = [], viewDestinations: [Int] = []
         if let view = prepared.relation.view {
-            viewTargets = try (assignments ?? []).map { try view.column($0.column) }
+            viewTargets = try (assignments ?? []).map { try view.column($0.column, position: $0.position) }
             guard Set(viewTargets).count == viewTargets.count else { throw JedError("42701", "multiple assignments to same column") }
             viewDestinations = try view.destinations(viewTargets)
             relation = try Relation(SQLName(name: view.table.name, span: name.span), snapshot: read, view: view, domain: settings.targetDomain)
@@ -502,13 +550,13 @@ internal enum MutationExecutor {
         try CatalogEnvironment.checkWritable(relation.table, image: read.catalog, environment: settings.environment,
             borrowedTypes: read.borrowedTypes, rowTypes: relation.types)
         let resolver = resolver(relation, snapshot: read, settings: inputSettings, context: baseContext, columns: true)
-        let predicate = try syntax.map { try resolver.resolve($0, expected: TypeDescriptor(.scalar(.boolean))) }
-        guard predicate?.type == nil || predicate?.type?.type == .scalar(.boolean) else { throw JedError("42804", "WHERE requires a boolean expression") }
+        let predicate = try syntax.map { PredicateOrdering.order(try resolver.resolve($0, expected: TypeDescriptor(.scalar(.boolean)))) }
+        guard predicate?.type == nil || predicate?.type?.type == .scalar(.boolean) else { throw JedError("42804", "WHERE requires a boolean expression").at(syntax?.expressionLocation ?? 0) }
         var changes: [(Int, ResolvedExpression)] = [], assigned: Set<Int> = []
         if let target, !deleting {
             for column in target.plan.foreign.columns {
                 if relation.table.columns[column].identity == true, target.action != 4 {
-                    throw JedError("428C9", "identity column can only be updated to DEFAULT")
+                    throw JedError("428C9", "identity column can only be updated to DEFAULT").identity(relation.table.columns[column].name, insert: false)
                 }
                 let expression: ResolvedExpression
                 if target.action == 4 { expression = try defaultExpression(column, relation: relation, resolver: resolver) }
@@ -519,10 +567,10 @@ internal enum MutationExecutor {
             }
         }
         for (ordinal, assignment) in (assignments ?? []).enumerated() {
-            let column = try relation.view == nil ? relation.column(assignment.column) : viewDestinations[ordinal]
+            let column = try relation.view == nil ? relation.column(assignment.column, position: assignment.position) : viewDestinations[ordinal]
             guard assigned.insert(column).inserted else { throw JedError("42701", "multiple assignments to same column") }
             if relation.table.columns[column].identity == true, assignment.value != nil || relation.view != nil {
-                throw JedError("428C9", "identity column can only be updated to DEFAULT")
+                throw JedError("428C9", "identity column can only be updated to DEFAULT").identity(relation.table.columns[column].name, insert: false)
             }
             let expression: ResolvedExpression
             if let value = assignment.value { expression = try AssignmentValues.resolve(value, to: relation.types[column], resolver: resolver) }
@@ -558,10 +606,12 @@ internal enum MutationExecutor {
             deleting: deleting, predicate: predicate, changes: changes, assigned: assigned, touched: touched,
             checks: check, indexes: indexes, returning: returning, filters: filters, target: target,
             parameterTypes: try ParameterBinding.finalize(resolver))
+        } catch let error as JedError { throw error.inDatabase(inputSettings.targetDomain) }
     }
     static func executeMutation(_ plan: MutationPreparation, snapshot: inout DomainSnapshot,
                                 context baseContext: ExpressionContext, parameters: [SQLValue],
                                 actionState suppliedState: ForeignKeyActions.State? = nil) throws -> MutationResult {
+        do {
         let read = plan.read, settings = plan.settings, inputSettings = plan.inputSettings, relation = plan.relation
         let deleting = plan.deleting, predicate = plan.predicate, changes = plan.changes, assigned = plan.assigned
         let touched = plan.touched, check = plan.checks, indexes = plan.indexes, returning = plan.returning
@@ -578,7 +628,7 @@ internal enum MutationExecutor {
         } else { try context.subqueries.prepare(changes.map { $0.1 } + (predicate.map { [$0] } ?? []), context: context) }
         try returning.prepare(relation: relation, old: true, new: !deleting, context: context)
         if !deleting { try relation.view?.prepareChecks(context: context) }
-        let result = MutationResult(command: deleting ? "DELETE" : "UPDATE", columns: returning.columns, meter: context.meter)
+        let result = MutationResult(command: deleting ? "DELETE" : "UPDATE", columns: returning.columns, hasAffectedRows: !returning.present, meter: context.meter)
         let candidate: ScanCandidate?
         if target == nil { candidate = try plan.selectAccess(parameters: context.parameters, context: context) }
         else { candidate = nil }
@@ -596,7 +646,12 @@ internal enum MutationExecutor {
         defer { cursor.close() }
         var staged: [Change] = [], store = snapshot.tables[relation.table.name] ?? relation.store
         let compression = CostMeter()
+        // Canonical intervals are disjoint today; retaining the fetched key
+        // also preserves first-probe mutation order if a later access method
+        // admits overlapping candidates. This is preparation scratch.
+        var intervalKeys: Set<[UInt8]> = []
         while let old = try context.profile(plan.profileIdentity, .source, { try cursor.next() }) {
+            if candidate?.intervals != nil, !intervalKeys.insert(old.key).inserted { continue }
             let row = try context.profile(plan.profileIdentity, .source) {
                 context.meter.charge(1); try context.meter.step()
                 let value = ScanRecord(old, pager: store.tree.pool?.pager)
@@ -639,7 +694,7 @@ internal enum MutationExecutor {
                     replacements[column] = try relation.coerce(value, expression: expression, column: column, context: context)
                 }
                 func updated(_ column: Int) throws -> SQLValue { try replacements[column] ?? row.value(column) }
-                try relation.validateNotNull(assigned.sorted(), value: updated)
+                try relation.validateNotNull(assigned.sorted(), value: updated, context: context)
                 if !check.isEmpty { try validate(check, relation: relation, value: updated, context: context) }
                 let key: [UInt8]
                 if assigned.isDisjoint(with: relation.table.primaryKey) { key = old.key }
@@ -664,8 +719,9 @@ internal enum MutationExecutor {
         var replacementKeys: Set<[UInt8]> = []
         for change in staged {
             guard let record = change.new else { continue }
-            guard replacementKeys.insert(record.key).inserted else { throw duplicate(relation.table.name) }
-            if !vacated.contains(record.key), try relation.store.get(record.key) != nil { throw duplicate(relation.table.name) }
+            let row = ScanRecord(record, pager: store.tree.pool?.pager)
+            guard replacementKeys.insert(record.key).inserted else { throw duplicate(relation, value: row.value, context: context) }
+            if !vacated.contains(record.key), try relation.store.get(record.key) != nil { throw duplicate(relation, value: row.value, context: context) }
         }
         var indexChanges: [[StoredIndexPlan.Change]] = []
         for index in indexes {
@@ -681,7 +737,7 @@ internal enum MutationExecutor {
                     if let prefix = indexed.prefix {
                         if index.index.unique && !prefix.hasNull {
                             guard batch.insert(prefix.bytes).inserted, try !index.conflicts(prefix, store: existing, vacated: vacated) else {
-                                throw duplicateIndex(index.index.name)
+                                throw duplicateIndex(index, relation: relation, value: row.value, context: context)
                             }
                         }
                     }
@@ -741,6 +797,7 @@ internal enum MutationExecutor {
                 try install(store, relation: relation, countDelta: deleting ? -result.affected : 0, snapshot: &snapshot)
             }
         }
+        try context.meter.syncPending(snapshot.pendingBytes)
         if !staged.isEmpty {
             let transitions = staged.map { change -> ForeignKeyActions.Transition in
                 let row = ScanRecord(change.old, pager: store.tree.pool?.pager)
@@ -756,12 +813,28 @@ internal enum MutationExecutor {
         if actionState.depth == 0 && !actionState.deferUntilStatementEnd { try actionState.settle(snapshot: snapshot, settings: settings, context: context) }
         try context.meter.syncPending(snapshot.pendingBytes)
         return result
+        } catch let error as JedError { throw error.inDatabase(plan.settings.targetDomain) }
     }
     static func duplicate(_ table: SQLText) -> JedError {
-        JedError("23505", "duplicate key value violates unique constraint \(table)_pkey")
+        let name = CatalogSQL.objectName(table, label: "pkey")
+        return JedError("23505", "duplicate key value violates unique constraint \(name)")
+            .object(table: table, constraint: name)
     }
-    static func duplicateIndex(_ name: SQLText) -> JedError {
-        JedError("23505", "duplicate key value violates unique constraint \(name)")
+    static func duplicateIndex(_ name: SQLText, table: SQLText? = nil) -> JedError {
+        var error = JedError("23505", "duplicate key value violates unique constraint \(name)")
+        error.constraintName = name.description; error.tableName = table?.description
+        return error
+    }
+    static func duplicate(_ relation: Relation, value: (Int) throws -> SQLValue, context: ExpressionContext) -> JedError {
+        var error = duplicate(relation.table.name)
+        error.detail = context.errorDetail?.primary(relation.table, types: relation.types, value: value)
+        return error
+    }
+    static func duplicateIndex(_ index: StoredIndexPlan, relation: Relation,
+                               value: @escaping (Int) throws -> SQLValue, context: ExpressionContext) -> JedError {
+        var error = duplicateIndex(index.index.name, table: relation.table.name)
+        error.detail = context.errorDetail?.index(relation.table, plan: index, value: value)
+        return error
     }
     static func install(_ store: TableStore, relation: Relation, countDelta: Int64, snapshot: inout DomainSnapshot) throws {
         snapshot.setTableStore(relation.table.name, store)

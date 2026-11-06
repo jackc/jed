@@ -11,10 +11,47 @@ internal final class AggregateCollection {
     private var reserved: Int64 = 0
     private var seen = false
     private var dimensions: [Int]?, lowerBounds: [Int32] = []
-    init(plan: AggregatePlan, context: ExpressionContext) { self.plan = plan; self.context = context }
+    private let measured: Bool
+    init(plan: AggregatePlan, context: ExpressionContext, measured: Bool = true) {
+        self.plan = plan; self.context = context; self.measured = measured
+    }
+    func packed() -> [SQLValue] {
+        if plan.name == "array_agg", case .array = plan.inputTypes[0].type {
+            var values: [SQLValue] = [.boolean(seen), .integer(Int64(dimensions?.count ?? 0))]
+            if let dimensions {
+                for index in dimensions.indices { values += [.integer(Int64(dimensions[index])), .integer(Int64(lowerBounds[index]))] }
+            }
+            return values
+        }
+        return [.boolean(seen)]
+    }
+    func restore(_ values: [SQLValue]) throws {
+        guard let first = values.first, case .boolean(let storedSeen) = first else { throw JedError("58030", "invalid aggregate collection state") }
+        seen = storedSeen
+        if plan.name == "array_agg", case .array = plan.inputTypes[0].type {
+            guard values.count >= 2, case .integer(let count) = values[1], count >= 0, count <= 6,
+                  values.count == 2 + Int(count) * 2 else { throw JedError("58030", "invalid aggregate array shape state") }
+            dimensions = count == 0 ? nil : []; lowerBounds = []
+            for index in 0..<Int(count) {
+                guard case .integer(let length) = values[2 + index * 2], length > 0, length <= Int64(Int32.max),
+                      case .integer(let lower) = values[3 + index * 2], lower >= Int64(Int32.min), lower <= Int64(Int32.max) else {
+                    throw JedError("58030", "invalid aggregate array dimension")
+                }
+                dimensions!.append(Int(length)); lowerBounds.append(Int32(lower))
+            }
+        } else if values.count != 1 { throw JedError("58030", "invalid aggregate collection state width") }
+    }
+    func drainRetained(_ visit: ([SQLValue]) throws -> Void) rethrows {
+        defer { values = []; keys = []; unique = [] }
+        if plan.name.contains("object") {
+            for (index, row) in values.enumerated() { try visit([.text(keys[index]), row[0]]) }
+        } else { for row in values { try visit(row) } }
+    }
     private func retain(_ incoming: [SQLValue], measured: [SQLValue]) throws {
-        let bytes = measured.reduce(Int64(0)) { saturatingAdd($0, MemorySizes.value($1)) }
-        try context.meter.reserveQuery(bytes); reserved = saturatingAdd(reserved, bytes)
+        if self.measured {
+            let bytes = measured.reduce(Int64(0)) { saturatingAdd($0, MemorySizes.value($1)) }
+            try context.meter.reserveQuery(bytes); reserved = saturatingAdd(reserved, bytes)
+        }
         values.append(incoming)
     }
     func fold(_ arguments: [SQLValue]) throws {
@@ -41,7 +78,7 @@ internal final class AggregateCollection {
         seen = true
         if !object && name.hasSuffix("_strict") && arguments[0].isNull { return }
         let meter = context.meter
-        let zoneUnits = arguments.reduce(Int64(0)) { saturatingAdd($0, Self.zoneCount($1)) }
+        let zoneUnits = arguments.reduce(Int64(0)) { saturatingAdd($0, JSONFunctions.zoneCount($1)) }
         meter.charge(saturatingAdd(1, zoneUnits)); try meter.step()
         let renderer: JSONFunctions.ScalarRenderer = { value, descriptor, _ in
             switch value {
@@ -104,15 +141,6 @@ internal final class AggregateCollection {
         let text = SQLText(validatedUTF8: output)
         _ = try JSONDocument(text, decodeStrings: false)
         return .json(text)
-    }
-    private static func zoneCount(_ value: SQLValue) -> Int64 {
-        switch value {
-        case .timestamptz(let n): return n == .min || n == .max ? 0 : 1
-        case .array(let array): return array.elements.reduce(0) { saturatingAdd($0, zoneCount($1)) }
-        case .composite(let fields): return fields.reduce(0) { saturatingAdd($0, zoneCount($1)) }
-        case .range(let range): return saturatingAdd(range.lower.map(zoneCount) ?? 0, range.upper.map(zoneCount) ?? 0)
-        default: return 0
-        }
     }
     func close() { values = []; keys = []; unique = []; context.meter.resources.query.release(reserved); reserved = 0 }
     deinit { close() }

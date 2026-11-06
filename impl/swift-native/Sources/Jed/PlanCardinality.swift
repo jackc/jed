@@ -5,21 +5,34 @@ internal struct PlanCardinality {
     let snapshot: DomainSnapshot?
     var parameters: [SQLValue]? = nil
     var collatedKey: KeyEncoding.CollatedKey? = nil
+    var planningProbe: PlanningProbe? = nil
+    // Every statistical fraction belongs to the complete visible table.
+    // AND and prefix inversion apply that fraction to their current input;
+    // they must not rebuild MCV/NULL/NDV populations after an earlier leaf.
+    var statisticsPopulation: Int64?
+    init(table: CatalogTable?, snapshot: DomainSnapshot?, parameters: [SQLValue]? = nil,
+         collatedKey: KeyEncoding.CollatedKey? = nil, planningProbe: PlanningProbe? = nil) {
+        self.table = table; self.snapshot = snapshot; self.parameters = parameters; self.collatedKey = collatedKey
+        self.planningProbe = planningProbe
+        statisticsPopulation = table?.rowCount
+    }
 
     static func constant(_ key: String) -> Int64 {
         guard case .integer(let value) = GeneratedSpec.estimator[key] else { preconditionFailure("missing estimator fact") }
         return value
     }
     func known(_ expression: ResolvedExpression) -> SQLValue? {
-        switch expression.node {
-        case .constant(let value): return value
-        case .parameter(let number): return parameters.flatMap { $0.indices.contains(number - 1) ? $0[number - 1] : nil }
-        case .convert(let value, let target):
-            // Planning must not evaluate a conversion or reinterpret its input.
-            // Same-type implicit nodes only preserve a value's representation.
-            return value.type?.type == target.type ? known(value) : nil
-        default: return nil
-        }
+        PlanningProbe.known(expression, parameters: parameters, probe: planningProbe)
+    }
+    func isNull(_ expression: ResolvedExpression) -> Bool {
+        PlanningProbe.isNull(expression, parameters: parameters, probe: planningProbe)
+    }
+    private func contradicts(_ first: Comparison, _ second: Comparison) -> Bool {
+        // Check both source shapes before either read. An outer-column peer
+        // cannot prove a contradiction and must not make a parameter sensitive.
+        guard PlanningProbe.literal(first.value), PlanningProbe.literal(second.value),
+              let a = known(first.value), let b = known(second.value) else { return false }
+        return PredicateContradiction.bounds(first.operation, a, second.operation, b)
     }
     private func column(_ expression: ResolvedExpression) -> Int? {
         if case .column(let slot) = expression.node { return slot }
@@ -40,8 +53,29 @@ internal struct PlanCardinality {
         }
         return nil
     }
+    /// A relation-constant array is a deliberately small estimator grammar.
+    /// Casts and arbitrary calls stay opaque even when execution can fold them.
+    private static func arrayOperand(_ expression: ResolvedExpression) -> Bool {
+        switch expression.node {
+        case .constant(.array), .constant(.null), .parameter, .outerColumn: return true
+        case .array(let elements, false):
+            return elements.allSatisfy { element in
+                switch element.node {
+                case .constant(.composite): false
+                case .constant, .parameter, .outerColumn: true
+                default: false
+                }
+            }
+        default: return false
+        }
+    }
     func rows(_ predicate: ResolvedExpression?, input: Int64) throws -> Int64 {
         guard input > 0, let predicate else { return max(0, input) }
+        if let rows = try ginRows(predicate, input: input) { return rows }
+        if let population = statisticsPopulation, population > 0,
+           let count = try statisticalAtom(predicate, population: population) {
+            return min(input, QueryEstimate.scale(input, numerator: count, denominator: population))
+        }
         if let known = known(predicate) {
             if known.isNull { return 0 }
             if case .boolean(let value) = known { return value ? input : 0 }
@@ -53,18 +87,12 @@ internal struct PlanCardinality {
             for (index, expression) in terms.enumerated() {
                 guard !consumed.contains(index) else { continue }
                 if let current = comparison(expression) {
-                    if known(current.value)?.isNull == true { return 0 }
+                    if isNull(current.value) { return 0 }
                     if current.operation == "=" { unique.insert(current.slot) }
                     let peers = terms.indices.filter { $0 > index && comparison(terms[$0])?.slot == current.slot }
                     for peer in peers {
-                        guard let other = comparison(terms[peer]), let a = known(current.value), let b = known(other.value),
-                              !a.isNull, !b.isNull else { continue }
-                        let equalityOnly = ["=", "<>", "!="].contains(current.operation)
-                            && ["=", "<>", "!="].contains(other.operation)
-                        let order = try ValueComparison.total(a, b, type: current.type, collatedKey: collatedKey, equality: equalityOnly)
-                        if current.operation == "=", other.operation == "=", order != 0 { return 0 }
-                        if current.operation == "=", !Self.matches(order, other.operation) { return 0 }
-                        if other.operation == "=", !Self.matches(-order, current.operation) { return 0 }
+                        guard let other = comparison(terms[peer]) else { continue }
+                        if contradicts(current, other) { return 0 }
                     }
                     let lower = [">", ">="].contains(current.operation), upper = ["<", "<="].contains(current.operation)
                     if lower || upper, let pair = peers.first(where: {
@@ -72,11 +100,7 @@ internal struct PlanCardinality {
                         return lower ? ["<", "<="].contains(candidate.operation) : [">", ">="].contains(candidate.operation)
                     }), let other = comparison(terms[pair]) {
                         let lo = lower ? current : other, hi = lower ? other : current
-                        if let a = known(lo.value), let b = known(hi.value) {
-                            if a.isNull || b.isNull { return 0 }
-                            let order = try ValueComparison.total(a, b, type: current.type, collatedKey: collatedKey)
-                            if order > 0 || order == 0 && (lo.operation == ">" || hi.operation == "<") { return 0 }
-                        }
+                        if isNull(lo.value) || isNull(hi.value) || contradicts(lo, hi) { return 0 }
                         if let selected = try statisticalRange(lo, hi, input: result) {
                             result = selected
                         } else { result = QueryEstimate.fraction("paired_range", rows: result) }
@@ -95,17 +119,18 @@ internal struct PlanCardinality {
             }
             var result: Int64 = 0, previous: [ResolvedExpression] = []
             for term in terms {
-                if let current = comparison(term), current.operation == "=", known(current.value) != nil,
+                if let current = comparison(term), current.operation == "=",
                    previous.contains(where: {
                        guard let prior = comparison($0), prior.operation == "=", prior.slot == current.slot else { return false }
-                       return ExpressionIdentity.same(prior.value, current.value)
+                       return PlanningProbe.literal(prior.value) && PlanningProbe.literal(current.value)
+                           && ExpressionIdentity.same(prior.value, current.value)
                    }) { continue }
                 previous.append(term); result = min(input, saturatingAdd(result, try rows(term, input: input)))
             }
             return result
         case .unary("not", let value): return max(0, input - (try rows(value, input: input)))
         case .binary(let op, let a, let b, _):
-            if known(a)?.isNull == true || known(b)?.isNull == true { return 0 }
+            if isNull(a) || isNull(b) { return 0 }
             if let comparison = comparison(predicate) {
                 if let count = try statistical(comparison, input: input) { return count }
                 if op == "=", let table, table.primaryKey == [comparison.slot] { return min(input, 1) }
@@ -114,12 +139,15 @@ internal struct PlanCardinality {
             if op == "<>" || op == "!=" { return input - QueryEstimate.fraction("equality", rows: input) }
             if ["<", "<=", ">", ">="].contains(op) { return QueryEstimate.fraction("inequality", rows: input) }
             return QueryEstimate.fraction("opaque", rows: input)
+        case .pattern(let pattern):
+            let matched = QueryEstimate.fraction("match", rows: input)
+            return pattern.negated ? input - matched : matched
         case .isNull(let value, let negated):
             let nulls = column(value).flatMap { facts($0) }.map { min(input, QueryEstimate.scale(input, numerator: $0.nulls, denominator: $0.analyzed)) }
                 ?? QueryEstimate.fraction("null_test", rows: input)
             return negated ? input - nulls : nulls
         case .quantified(let op, let all, let value, let array, _):
-            guard op == "=" && !all || ["<>", "!="].contains(op) && all else { return QueryEstimate.fraction("opaque", rows: input) }
+            guard (op == "=" && !all || ["<>", "!="].contains(op) && all), Self.arrayOperand(array) else { return QueryEstimate.fraction("opaque", rows: input) }
             let elements: [ResolvedExpression]
             if let literal = known(array) {
                 if literal.isNull { return 0 }
@@ -133,7 +161,7 @@ internal struct PlanCardinality {
             }
             var found: Int64 = 0
             for element in elements {
-                if known(element)?.isNull == true { if all { return 0 }; continue }
+                if isNull(element) { if all { return 0 }; continue }
                 let equality = ResolvedExpression(type: TypeDescriptor(.scalar(.boolean)), node: .binary("=", value, element, value.type ?? TypeDescriptor(.scalar(.text))), position: 0)
                 found = min(input, saturatingAdd(found, try rows(equality, input: input)))
             }
@@ -146,6 +174,63 @@ internal struct PlanCardinality {
         default: return QueryEstimate.fraction("opaque", rows: input)
         }
     }
+    /// A logical array equality retains the equality default. Other admitted GIN
+    /// leaves use full-population term frequencies independently of chosen access.
+    private func ginRows(_ expression: ResolvedExpression, input: Int64) throws -> Int64? {
+        guard let table, let snapshot else { return nil }
+        let types = try snapshot.tableTypes(table)
+        guard let predicate = GinPredicate.match(expression, columns: Array(types.indices), types: types),
+              !predicate.isArrayEquality,
+              snapshot.catalog.statistics.contains(where: { $0.table == table.name && $0.column == predicate.column && $0.termEligible && $0.analyzed > 0 }),
+              let query = try predicate.knownQuery(parameters: parameters, planningProbe: planningProbe),
+              let estimate = GinEstimate.resolve(query, column: predicate.column, table: table, snapshot: snapshot) else { return nil }
+        guard table.rowCount > 0 else { return 0 }
+        return min(input, QueryEstimate.scale(input, numerator: estimate.rows, denominator: table.rowCount))
+    }
+
+    /// Statistics-backed leaves are fractions of one fixed population. Boolean
+    /// composition is deliberately left to rows(_:input:) so structural AND/OR
+    /// keeps its prescribed sequence of ceiling operations.
+    private func statisticalAtom(_ expression: ResolvedExpression, population: Int64) throws -> Int64? {
+        var original = self; original.statisticsPopulation = nil
+        func nonnull(_ slot: Int) -> Int64? {
+            guard let fact = facts(slot), fact.distributionEligible else { return nil }
+            return population - min(population, QueryEstimate.scale(population, numerator: fact.nulls, denominator: fact.analyzed))
+        }
+        if let comparison = comparison(expression) { return try original.statistical(comparison, input: population) }
+        switch expression.node {
+        case .isNull(let value, let negated):
+            guard let slot = column(value), let fact = facts(slot) else { return nil }
+            let count = population - min(population, QueryEstimate.scale(population, numerator: fact.nulls, denominator: fact.analyzed))
+            return negated ? count : population - count
+        case .column(let slot):
+            guard nonnull(slot) != nil else { return nil }
+            return try original.rows(expression, input: population)
+        case .binary("or", _, _, _):
+            var pending = [expression], common: Int?
+            while let item = pending.popLast() {
+                if case .binary("or", let left, let right, _) = item.node { pending += [right, left]; continue }
+                guard let part = comparison(item), part.operation == "=", nonnull(part.slot) != nil else { return nil }
+                if let common, common != part.slot { return nil }
+                common = part.slot
+            }
+            return try original.rows(expression, input: population)
+        case .quantified(let op, let all, let value, let array, _):
+            guard op == "=" && !all || ["<>", "!="].contains(op) && all,
+                  Self.arrayOperand(array), let slot = column(value), nonnull(slot) != nil else { return nil }
+            return try original.rows(expression, input: population)
+        case .unary("not", let value):
+            if case .isNull = value.node {
+                return try statisticalAtom(value, population: population).map { population - $0 }
+            }
+            if let part = comparison(value), let count = nonnull(part.slot),
+               let selected = try original.statistical(part, input: population) {
+                return isNull(part.value) ? 0 : max(0, count - selected)
+            }
+            return nil
+        default: return nil
+        }
+    }
     private func facts(_ slot: Int) -> CatalogStatistics? {
         guard let table else { return nil }
         return snapshot?.catalog.statistics.first { $0.table == table.name && $0.column == slot && $0.analyzed > 0 }
@@ -154,6 +239,12 @@ internal struct PlanCardinality {
         switch operation { case "=": order == 0; case "<>", "!=": order != 0; case "<": order < 0; case "<=": order <= 0; case ">": order > 0; case ">=": order >= 0; default: false }
     }
     private func statisticalRange(_ lower: Comparison, _ upper: Comparison, input: Int64) throws -> Int64? {
+        if let population = statisticsPopulation, population > 0 {
+            var original = self; original.statisticsPopulation = nil
+            return try original.statisticalRange(lower, upper, input: population).map {
+                min(input, QueryEstimate.scale(input, numerator: $0, denominator: population))
+            }
+        }
         guard let facts = facts(lower.slot), facts.distributionEligible,
               let lo = known(lower.value), let hi = known(upper.value), !lo.isNull, !hi.isNull,
               let table, let snapshot else { return nil }
@@ -183,6 +274,12 @@ internal struct PlanCardinality {
         return min(nonnull, saturatingAdd(matched, QueryEstimate.scale(nonnull - mass, numerator: fraction, denominator: buckets)))
     }
     private func statistical(_ comparison: Comparison, input: Int64) throws -> Int64? {
+        if let population = statisticsPopulation, population > 0 {
+            var original = self; original.statisticsPopulation = nil
+            return try original.statistical(comparison, input: population).map {
+                min(input, QueryEstimate.scale(input, numerator: $0, denominator: population))
+            }
+        }
         guard let facts = facts(comparison.slot), facts.distributionEligible else { return nil }
         let storedType: TypeDescriptor
         if let table, let snapshot { storedType = try snapshot.tableTypes(table)[comparison.slot] }
@@ -192,8 +289,17 @@ internal struct PlanCardinality {
         guard analyzedNonnull > 0 else { return 0 }
         let ndv = min(nonnull, QueryEstimate.multiply(facts.distinct, 10) > analyzedNonnull
             ? QueryEstimate.scale(nonnull, numerator: facts.distinct, denominator: analyzedNonnull) : facts.distinct)
+        if isNull(comparison.value) { return 0 }
+        // With no MCV and no proof of absence, every non-NULL parameter takes
+        // the same NDV average. Avoid reading its payload merely to discover it.
+        if case .parameter = comparison.value.node,
+           ["=", "<>", "!="].contains(comparison.operation), facts.mcv.isEmpty,
+           !(!facts.stale && Int64(facts.sampleRows) == facts.analyzed && Int64(facts.mcv.count) == facts.distinct),
+           storedType.collation == nil {
+            let equality = QueryEstimate.scale(nonnull, numerator: 1, denominator: max(1, ndv))
+            return comparison.operation == "=" ? equality : nonnull - equality
+        }
         let value = known(comparison.value)
-        if value?.isNull == true { return 0 }
         guard let value else {
             if comparison.operation == "=" { return QueryEstimate.scale(nonnull, numerator: 1, denominator: max(1, ndv)) }
             if ["<>", "!="].contains(comparison.operation) { return nonnull - QueryEstimate.scale(nonnull, numerator: 1, denominator: max(1, ndv)) }

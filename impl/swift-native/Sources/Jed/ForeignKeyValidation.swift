@@ -39,6 +39,12 @@ internal enum ForeignKeyValidation {
             if mixedNulls { error.detail = "MATCH FULL does not allow mixing of null and nonnull key values." }
             return error
         }
+        func violation(value: (Int) throws -> SQLValue, context: ExpressionContext) -> JedError {
+            var error = violation(); error.detail = context.errorDetail?.child(self, value: value); return error
+        }
+        func parentViolation(tuple: [SQLValue], context: ExpressionContext) -> JedError {
+            var error = violation(parentSide: true); error.detail = context.errorDetail?.parent(self, tuple: tuple); return error
+        }
         func childProbe(_ value: (Int) throws -> SQLValue, context: ExpressionContext,
                         enforceMatch: Bool = true) throws -> Probe {
             let tuple = try foreign.columns.map(value), nulls = tuple.filter(\.isNull).count
@@ -161,7 +167,7 @@ internal enum ForeignKeyValidation {
         }
     }
     static func validateChildren(_ candidates: [Candidate], child: CatalogTable, snapshot: DomainSnapshot,
-                                 assigned: Set<Int>? = nil, vacated: Set<[UInt8]> = [], context: ExpressionContext) throws {
+                                 assigned: Set<Int>? = nil, vacated: Set<[UInt8]> = [], context: ExpressionContext, selfCandidates: [Candidate]? = nil) throws {
         let plans = try child.foreignKeys.sorted { $0.name < $1.name }.filter {
             assigned == nil || !Set($0.columns).isDisjoint(with: assigned!)
         }.map { try Plan(child: child, foreign: $0, snapshot: snapshot) }
@@ -169,11 +175,11 @@ internal enum ForeignKeyValidation {
             for plan in plans {
                 switch try plan.childProbe(candidate.value, context: context) {
                 case .exempt: continue
-                case .missing: throw plan.violation()
+                case .missing: throw plan.violation(value: candidate.value, context: context)
                 case .key(let key):
                     let selfReference = plan.parent.name == child.name
-                    guard try plan.parentExists(key, snapshot: snapshot, candidates: selfReference ? candidates : [],
-                        vacated: selfReference ? vacated : [], context: context) else { throw plan.violation() }
+                    guard try plan.parentExists(key, snapshot: snapshot, candidates: selfReference ? selfCandidates ?? candidates : [],
+                        vacated: selfReference ? vacated : [], context: context) else { throw plan.violation(value: candidate.value, context: context) }
                 }
             }
         }
