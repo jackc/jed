@@ -1,0 +1,17 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#MISE description="Explicit opt-in: summarize a complete benchmark baseline or compare complete before/after runs; no measurements"
+#USAGE flag "--baseline <path>" help="One successful full 143-workload × 4-core × 3-round run; exclusive with --before/--after"
+#USAGE flag "--before <path>" help="Complete baseline for comparison; requires --after instead of --baseline"
+#USAGE flag "--after <path>" help="Complete later run for comparison; requires --before"
+#USAGE flag "--output <path>" help="Required absent/empty output directory for JSON, workload/category CSVs and Markdown"
+#USAGE flag "--repo <path>" help="Canonical repository; defaults to this tool's checkout"
+#USAGE flag "--check-adapter" help="Only tiny synthetic arithmetic/validation checks; no run/output arguments or measurements"
+
+require_relative "../../impl/swift-native/Tools/benchmark_analysis"
+arguments = %w[baseline before after output repo].flat_map do |key|
+  value = ENV["usage_#{key}"]
+  value ? ["--#{key}", value] : []
+end
+arguments << "--check-adapter" if ENV["usage_check_adapter"] == "true"
+exit BenchmarkComparison.cli(arguments)
