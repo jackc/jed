@@ -1130,9 +1130,12 @@ Any view may have defaults; a view that is not updatable never uses them.
 **Validation**, in order: the view (`42P01` / `42809`, `IF EXISTS`), the column (`42703`, *column "c"
 of relation "v" does not exist*), then the expression exactly as a table column's `SET DEFAULT`
 validates it ([alter.md](alter.md), [constraints.md](constraints.md) §2) against the column's type
-from the planned body (an untyped NULL column is `text`; a container type is `0A000`): a column
-reference or subquery `0A000`, an aggregate `42803`, a type mismatch `42804`. `SET DEFAULT NULL` is no
-default (PostgreSQL stores none). `DROP DEFAULT` of a column without one is a no-op.
+from the planned body (an untyped NULL column is `text`): a column reference or subquery `0A000`,
+an aggregate `42803`, a type mismatch `42804`. A named composite accepts the same default
+expressions as a table column; array and range columns accept only `DEFAULT NULL`. The shared
+[composite-default case](../conformance/suites/ddl/views_owned_sequences.test) exercises this
+ordinary ALTER-default validation in all three cores. `SET DEFAULT NULL` is no default
+(PostgreSQL stores none). `DROP DEFAULT` of a column without one is a no-op.
 
 **Storage.** The default is persisted in the view entry as canonical text: an expression as its
 token text (format.md *Check-expression text*), a constant folded at `ALTER` time to the column type

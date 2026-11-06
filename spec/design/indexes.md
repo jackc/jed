@@ -242,8 +242,12 @@ so if a referenced value is a spilled/compressed large value the build charges i
 A **plain** column index may key a variable-width column (`text`/`bytea`/`decimal`, or an
 array/range/composite) whose value spilled to an overflow chain or compressed when its
 *table* record exceeded `RECORD_MAX` (large-values.md §12): the index entry key holds the
-full encoded value, which is admitted up to a page (a larger entry is `0A000`, from INSERT
-and UPDATE alike). Once the row's leaf faults in from disk that value is lazily
+full encoded value, including its storage-key suffix, and is admitted by actual node page fit,
+not the table's half-page `RECORD_MAX` limit. A one-entry leaf requires `8 + entry_key_bytes ≤ C`;
+any separator copied into an interior must also fit its directory and child pointers. A mutation
+that cannot produce fitting leaf/interior nodes is `0A000`, from INSERT and UPDATE alike, before
+storage work. Consequently a key may fit a single-leaf tree yet fail a later insertion that needs
+that key as an interior separator. Keys are neither truncated nor overflowed. Once the row's leaf faults in from disk that value is lazily
 **deferred**, and an UPDATE's new row carries its unassigned columns over still deferred,
 so every entry builder — B-tree, GIN, GiST, and the uniqueness/FK/EXCLUDE probes — resolves
 a deferred column value before encoding it, computing the same entry bytes the INSERT

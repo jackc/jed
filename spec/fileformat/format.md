@@ -635,22 +635,24 @@ page-payload capacities derive from the page size and recur throughout:
 
 ```
 C             = page_size - 16                    # PAGE_HEADER (v7); the bytes a page body may hold
-RECORD_MAX(K) = (C - max(12, 12 + 16·K)) / 2 (floor)  # largest a single B-tree LEAF record may serialize to
+RECORD_MAX(K) = max(0, floor((C - 12 - 16·K) / 2))  # table disposition target; admission uses page fit
 ```
 
 The `- 16` in `C` is the **v7 page header** (12-byte v6 header + a 4-byte per-page `crc32`).
-The reserve inside `RECORD_MAX` is a **separate** quantity that keeps a **two-record leaf** fitting
-`C` (since v24 records live only in leaves, so the cap is a **leaf** rule; v23's interior-pair
-co-justification evaporated with interior records — the value is deliberately **kept**,
-[../design/bplus-reshape.md §4.2](../design/bplus-reshape.md)). The v24 worst-case two-record leaf
-overhead is `leafOverhead(2, cols) ≤ 12 + 13·K` (all-variable columns — *Leaf node* below), so
-`2·RECORD_MAX(K) + leafOverhead(2, cols) ≤ C` holds for every column mix and a two-record leaf
-**never** overflows; leaf overflow therefore happens only at `N ≥ 3` records, which is what lets
-every leaf split be a clean 2-way with two non-empty halves (see *Why the record cap* below).
-`RECORD_MAX(0) = (C-12)/2` is exact for index trees: a two-record index leaf is
-`2·(C−12)/2 + 4·2 + 4 = C`. Interior nodes have **no record cap** — a separator is a copy of a key
-(itself ≤ `RECORD_MAX(0)` by the leaf cap), and the interior split rules handle the degenerate
-fan-out a near-cap separator forces (*Fan-out* below).
+The reserve inside `RECORD_MAX` is a separate quantity used by table-record compression and
+externalization. Its value is deliberately kept from v23
+([../design/bplus-reshape.md §4.2](../design/bplus-reshape.md)). When `C ≥ 12 + 16·K` and
+both records reach that target, the v24 overhead bound `leafOverhead(2, cols) ≤ 12 + 13·K`
+gives `2·RECORD_MAX(K) + leafOverhead(2, cols) ≤ C`. Such a leaf overflows only at `N ≥ 3`.
+The target is not an additional admission limit: irreducible fixed slots, pointers, or key
+bytes may leave a larger record. Its complete leaf and every resulting interior must fit.
+Key-only index entries do not run the disposition planner: they retain the full encoded entry key,
+including the storage-key suffix, and are admitted by the actual leaf and interior page-fit rules
+([../design/indexes.md §4](../design/indexes.md)). A one-entry index leaf needs `8 + key_len ≤ C`.
+If later mutations require a separator or a split that cannot fit, that mutation fails `0A000`
+before storage work. Interior nodes have **no record cap**; the separator is a copy of a boundary
+key, and every resulting interior must fit, including a new one-separator root. No index key is
+truncated or spilled to make it fit (*Fan-out* below).
 
 `leafOverhead(N, cols)` is the bytes a v24 leaf's payload carries **beyond** `Σ record_size` — the
 key directory (`4·N`), the column directory (`4·(K+1)`), and each column region's header: a
@@ -1337,19 +1339,25 @@ B+tree of exactly this shape, rooted at the catalog's `index_root_page`, whose r
 Every node, split/merge, allocation, commit, and reclamation rule below applies to an index tree
 unchanged — a GIN index's entry tree too ([../design/gin.md §4](../design/gin.md)).
 
-**`RECORD_MAX`.** A single record's **stored** on-disk size must be ≤ `RECORD_MAX(K) =
-(C − max(12, 12+16·K))/2` (floor), `K` the value-column count. The cap is what makes every leaf
-split clean (see *Why the record cap* below); its **value is deliberately kept from v23**
-([../design/bplus-reshape.md §4.2](../design/bplus-reshape.md)) so the overflow/spill thresholds of
-[../design/large-values.md](../design/large-values.md) do not churn. Since **v3**, a record over
-the cap is **not** rejected — its large values are **compressed** and/or **spill out-of-line** (the
-*Large values* section), so the *stored* record (with pointers) falls back under `RECORD_MAX`. Only a
-record that can't be reduced below the cap even after compressing and externalizing every spillable
-value remains a write-side `feature_not_supported` (**`0A000`**). At the 8192 default a `K = 1` table
-caps a stored record at `RECORD_MAX(1) = (8176−28)/2 = 4074`; the 256-byte fixtures cap a `K = 1` record
-at `(240−28)/2 = 106` bytes (a `K = 2` record at 98), which is what makes `overflow_table.jed`'s
-~600/300-byte values spill. `K = 0` (index trees) is `RECORD_MAX = (C-12)/2`, so an index entry
-key may be up to `(C-12)/2` bytes — the bound the interior separator rules below inherit.
+**`RECORD_MAX`.** The deterministic compression/externalization planner uses
+`RECORD_MAX(K) = max(0, floor((C − 12 − 16·K)/2))`, where `K` is the value-column count,
+as its target stored-record weight. Its value is deliberately kept from v23
+([../design/bplus-reshape.md §4.2](../design/bplus-reshape.md)) so the thresholds of
+[../design/large-values.md](../design/large-values.md) do not change. Since **v3**, a record
+over the target first has its large values compressed and/or externalized (*Large values*
+below). If those passes cannot reach the target, the remaining record is still admissible
+when its complete one-record leaf fits. At the 8192-byte default, the `K = 1` target is
+`(8176−28)/2 = 4074`; the 256-byte fixtures use 106 bytes for `K = 1` and 98 for `K = 2`,
+causing `overflow_table.jed`'s ~600/300-byte values to spill. A 600-column `i32` table has
+target zero, but an 8-byte key plus fixed slots and one-row overhead occupies only 6016
+of 8176 payload bytes; [../conformance/suites/ddl/views_long_definition.test](../conformance/suites/ddl/views_long_definition.test)
+pins its admission. Two such rows split into two one-record leaves.
+Key-only index trees (`K = 0`) retain full entry keys and use actual node page fit without
+disposition planning. An index over a spilled table value can retain a key larger than
+half a page, as pinned by `dml/index_spilled_key.test`. Every resulting leaf and interior
+must fit. A mutation for which the pinned split rules cannot form fitting nodes fails
+`feature_not_supported` (**`0A000`**) before storage work; a key that fits one leaf may
+fail when later copied to an interior separator.
 
 ### Leaf node (`page_type = 2`)
 
@@ -1413,9 +1421,12 @@ the degenerate product of splitting a two-separator interior whose separators ar
 2-way split can keep a separator on each side (*Fan-out* below; only reachable with near-cap keys —
 the `max_sep_table.jed` fixture pins the shape). A 0-key interior routes everything to its single
 child, is always underfull, and is merged away by the next rebalance that touches it. The
-**minimum-fanout invariant**: any single separator + two pointers always fits —
-`12 + sep_len ≤ 12 + RECORD_MAX(0) = 12 + (C−12)/2 ≤ C` — so every interior split can leave at
-least one side with a separator.
+**minimum-fanout invariant for capped table records**: any single separator + two pointers
+always fits — `12 + sep_len ≤ 12 + RECORD_MAX(0) = 12 + (C−12)/2 ≤ C` — so every interior split
+can leave at least one side with a separator. A key can exceed that target, including in
+a key-only index entry. Every resulting interior, including the root, must pass `12 + sep_len ≤ C` for a
+single separator (`44 + sep_len ≤ C` with encrypted bound pointers). A mutation that cannot
+produce fitting nodes is a write-side `0A000`, not persisted corruption.
 
 An empty table has `root_data_page = 0`, `row_count = 0`, and no node pages. A one-row table has
 `row_count = 1` and is a single leaf with `N = 1`. The root may be a leaf (small table) or an interior node (taller tree); it is
@@ -1441,6 +1452,9 @@ an underfull node, which is correct, just not compact.
 insert the record in key order, then walk back up: whenever a node overflows (`payload > C`),
 **split it 2-way** and hand one separator to the parent (which may then overflow and split, etc.;
 a root split grows the height by one, the new root an interior node with one separator).
+For a key-only index, a candidate node may have no fitting two-way split, or the new root may
+not fit its copied separator. The mutation then fails `0A000` before storage work; it does not
+change the split rule, invent an empty leaf, or emit an oversized page.
 
 **Split point (shared machinery).** For an overflowing node with entries `e[0 … N)`, define
 `leftpayload(m)` / `rightpayload(m)` as the payload of the would-be left / right node under the
@@ -1457,9 +1471,9 @@ A **right-edge edit** means the entry whose insert/replace triggered the rebuild
 last (`index N−1`; for an interior node, the separator the child split just handed up landed at
 the right edge) — sequential ascending loads land here every time and keep packing left nodes
 ~full. The delete path's **merge-overflow** split (below) has no edited position and always takes
-the balanced arm. `m_min ≤ m_max` always holds on the insert path (the cap arithmetic below); the
-one reachable exception — an interior **merge**-overflow with near-cap separators — **abandons the
-merge** instead (below).
+the balanced arm. `m_min ≤ m_max` always holds for capped table-record insertion (the cap
+arithmetic below). A key-only index insertion without a fitting split fails `0A000`. An
+interior **merge**-overflow with no fitting split instead **abandons the merge** (below).
 
 > Why two rules: largest-left-fit alone is optimal for ascending appends but degenerates to
 > a `[N-2 | 1]` splinter for **any other** insert position — under random-order inserts
@@ -1472,7 +1486,9 @@ merge** instead (below).
 leaf gets `[m, N)` — **no record leaves the leaf level** — and the parent gains a separator that is
 a **copy of `key[m]`** (the right leaf's first key). `leftpayload(m) = Σ_{i<m} record_size(i) +
 leafOverhead(m, cols)`; `rightpayload(m)` symmetrically over `[m, N)`. Both sides are non-empty by
-the range; both fit by the cap (*Why the record cap*).
+the range; both must fit. Records that reach the disposition target have the two-record-fit
+guarantee below. Every insertion, including irreducible records above that target, must
+produce fitting halves or fail `0A000` (*Why the record cap*).
 
 **Interior split (push-up).** The median separator **moves up** (it is a pure routing key —
 nothing below owns it): the left node gets separators `[0, m)` + children `[0, m]`, separator
@@ -1531,20 +1547,22 @@ rebalancing by **merge-then-maybe-split** (no borrow rotation — merge subsumes
   nonempty leaf or an interior with a separator; an empty leaf then empties the
   table. No committed leaf is empty, including below a degenerate interior.
 
-**Why the record cap.** Capping a **leaf** record at `RECORD_MAX(K) = (C − max(12, 12+16·K))/2`
-makes a two-record leaf never exceed `C`, for every column mix: the worst case is all-variable
-columns (`V = K`), where a two-record leaf's overhead is `leafOverhead(2, cols) = 8 + 4·(K+1) +
-K·(1 + 8) = 12 + 13·K ≤ 12 + 16·K`, so `2·RECORD_MAX(K) + leafOverhead(2, cols) ≤ (C − 12 − 16K) +
-(12 + 13K) = C − 3K ≤ C`; an index leaf (`K = 0`) is exact: `2·(C−12)/2 + 12 = C`. (This fit is
-what the v24 end-offset directories buy — with v23's `N+1`-entry prefix sums the same cap would
-overflow by `4 + 2K`.) So a leaf overflows only at `N ≥ 3` records and the split point always
-lands in `[1, N−1]` with both halves non-empty and fitting. Without the cap, a leaf could overflow
-on its **last**, oversized record, forcing an empty sibling or a multi-way spill — both of which
-complicate the byte contract across four implementations. Interior nodes carry no records, so the
-cap does not bind them; their guarantee is the **minimum-fanout invariant** (one separator + two
-pointers always fit — *Interior node* above) plus the pinned `N = 2` degenerate split and the two
-merge-abandon guards, which together make every interior operation total. The cap buys an
-all-2-way scheme at the cost of a tighter (and later-liftable) oversized-row limit.
+**Why the record cap.** When `C ≥ 12 + 16·K` and each table record reaches the
+`RECORD_MAX(K)` disposition target, a two-record leaf never exceeds `C`, for every column
+mix: the worst case is all-variable columns (`V = K`), whose overhead is
+`12 + 13·K ≤ 12 + 16·K`. Therefore
+`2·RECORD_MAX(K) + leafOverhead(2, cols) ≤ C − 3K ≤ C`. Such a leaf overflows only at
+`N ≥ 3`; the split can leave two nonempty fitting halves. The v24 directories provide
+this bound without changing the v23 disposition target.
+
+This is a conditional fit guarantee, not a separate row-admission rule. Fixed slots,
+external pointers, and keys cannot always be reduced to the target; wide rows can have
+a zero target and still fit a page. Those rows and full key-only index entries use the
+same two-way split algorithm with explicit page-fit checks. No empty sibling or multi-way
+spill is introduced: an insertion without a fitting split fails `0A000` before storage.
+Interiors carry no records and independently check all resulting payloads, including the
+new root. The pinned `N = 2` degenerate interior split and both merge-abandon guards remain
+unchanged.
 
 ### Value codec
 
@@ -1666,8 +1684,8 @@ the cap (the design rationale and decisions are in
 
 - **Inline-compressed (`0x03`).** The tag, then **`u32 raw_len`** (the content payload's
   decompressed length) + **`u16 comp_len`** + that many bytes of the [lz4.md](lz4.md) block —
-  `7 + comp_len` bytes in the record. `comp_len` fits `u16` because an inline form only survives
-  the disposition decision inside a record ≤ `RECORD_MAX ≤ 32762`. The reader decompresses to
+  `7 + comp_len` bytes in the record. `comp_len` fits `u16` because the complete inline
+  form must fit a page payload, whose maximum is 65520 bytes. The reader decompresses to
   `raw_len` bytes and reconstructs the value by column type (exactly the external content payload).
 
 - **External-compressed (`0x04`).** The tag, then **`u32 first_page`** + **`u32 stored_len`** +
@@ -1700,9 +1718,10 @@ the cap (the design rationale and decisions are in
   over live records). A from-scratch image copies a kept chain's stored bytes into fresh pages.
   Nothing a reader decodes changes.
 
-A record that still exceeds `RECORD_MAX` after compressing and externalizing **every** spillable
-value (pathological: a huge key, or very many columns at a tiny page) remains a write-side
-`feature_not_supported` (`0A000`).
+A record that still exceeds `RECORD_MAX` after both passes keeps the resulting dispositions.
+Its complete one-record leaf and every node formed by insertion must fit `C` under the
+pinned split rules. Failure of those actual-fit checks is write-side
+`feature_not_supported` (`0A000`) before storage work.
 
 ## Allocation & incremental commit
 
