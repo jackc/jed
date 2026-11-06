@@ -12,6 +12,7 @@ internal final class ExpressionResolver {
     var composites: [SQLText: CompositeType]
     var parameters: [Int: TypeDescriptor] = [:]
     var scalar: ScalarCasts.Context
+    var hostFunctions: [HostFunctionSignature] = []
 
     init(columns: [ExpressionColumn] = [], composites: [SQLText: CompositeType] = [:], scalar: ScalarCasts.Context = .init()) {
         self.columns = columns; self.composites = composites; self.scalar = scalar
@@ -59,7 +60,6 @@ internal final class ExpressionResolver {
             return result(TypeDescriptor(.scalar(type)), .constant(value))
         case .string(let text):
             if let expected, adaptsString(to: expected.type) {
-                guard case .scalar = expected.type else { throw JedError("0A000", "container input is not yet connected") }
                 return try literalInput(text, type: expected, position: syntax.position)
             }
             return result(TypeDescriptor(.scalar(.text)), .constant(.text(text)))
@@ -79,17 +79,21 @@ internal final class ExpressionResolver {
         case .currentDate: return result(TypeDescriptor(.scalar(.date)), .currentDate)
         case .typedString(let target, let text):
             let type = try TypeRules.resolve(target, composites: composites)
-            guard case .scalar = type.type else { throw JedError("0A000", "container input is not yet connected") }
             return try literalInput(text, type: type, position: syntax.position)
         case .cast(let source, let target):
             let type = try TypeRules.resolve(target, composites: composites)
             if let text = stringLiteral(source) {
-                guard case .scalar = type.type else { throw JedError("0A000", "container input is not yet connected") }
                 return try literalInput(text, type: type, position: syntax.position)
             }
-            if nullLiteral(source) { return result(type, .constant(.null)) }
+            if nullLiteral(source) {
+                if case .scalar(let scalar) = type.type, scalar.integerWidth != nil || [.decimal, .f32, .f64, .boolean].contains(scalar) {
+                    return result(type, .cast(result(nil, .constant(.null)), type, .explicit))
+                }
+                return result(type, .constant(.null))
+            }
             let hint = type.type == .scalar(.boolean) && numberLiteral(source) ? TypeDescriptor(.scalar(.i32)) : type
             let child = try resolve(source, expected: hint)
+            if case .range = type.type, child.type?.type == type.type { return child }
             if let from = child.type?.type, !TypeRules.admitsCast(from: from, to: type.type, mode: .explicit) {
                 if case .array = from, case .array = type.type { throw JedError("0A000", "this array element cast is not supported") }
                 if case .range = from { throw JedError("0A000", "range casts are not supported") }
@@ -107,6 +111,7 @@ internal final class ExpressionResolver {
             }
             return result(child.type, .unary(op, child))
         case .binary(let op, let left, let right):
+            if let container = try containerOperation(op, left, right, position: syntax.position) { return container }
             if op == "||" { return try concatenate(left, right, position: syntax.position) }
             if op == "and" || op == "or" {
                 let a = try resolve(left, expected: boolean), b = try resolve(right, expected: boolean)
@@ -179,15 +184,50 @@ internal final class ExpressionResolver {
             if name == "greatest" || name == "least" { try TypeRules.comparable(type.type, type.type); return result(type, .extreme(unified, greatest: name == "greatest")) }
             throw JedError("42883", "conditional function does not exist: \(name)")
         case .row(let fields):
-            let children = try fields.map { try resolve($0) }
+            let hints = expected.flatMap { TypeRules.fields($0.type) }
+            let children = try fields.enumerated().map { index, syntax -> ResolvedExpression in
+                let child = try resolve(syntax)
+                if child.type == nil, let hints, hints.count == fields.count { return try resolve(syntax, expected: hints[index].descriptor) }
+                return child
+            }
             let types = children.enumerated().map { index, child in TypeField(name: SQLText(validatedUTF8: Array("f\(index + 1)".utf8)), descriptor: child.type ?? TypeDescriptor(.scalar(.text))) }
             return result(TypeDescriptor(.record(types)), .row(children))
+        case .array(let fields): return try arrayConstructor(fields, expected: expected, position: syntax.position)
+        case .subscripted(let source, let subscripts):
+            let child = try resolve(source)
+            guard case .array(let element) = child.type?.type else { throw JedError("42804", "subscripted value is not an array") }
+            let indices = try subscripts.map { entry -> ResolvedSubscript in
+                func index(_ syntax: SQLExpression?) throws -> ResolvedExpression? {
+                    guard let syntax else { return nil }
+                    let expression = try resolve(syntax, expected: TypeDescriptor(.scalar(.i64)))
+                    if let type = expression.type?.type {
+                        guard case .scalar(let scalar) = type, scalar.integerWidth != nil else { throw JedError("42804", "array subscript must be an integer") }
+                    }
+                    return expression
+                }
+                return ResolvedSubscript(lower: try index(entry.lower), upper: try index(entry.upper), isSlice: entry.isSlice)
+            }
+            return result(subscripts.contains(where: \.isSlice) ? child.type : TypeDescriptor(element), .subscriptValue(child, indices))
+        case .quantified(let op, let operand, let all, let source):
+            var array = try resolve(source)
+            if array.type == nil { throw JedError("42P18", "could not determine ANY/ALL array type") }
+            guard case .array(let element) = array.type?.type else { throw JedError("42809", "ANY/ALL requires an array") }
+            let value = try resolve(operand, expected: TypeDescriptor(element))
+            if let type = value.type { array = try resolve(source, expected: TypeDescriptor(.array(type.type))) }
+            do { try TypeRules.comparable(value.type?.type, element) }
+            catch { throw JedError("42883", "ANY/ALL comparison operator does not exist") }
+            let compared = try TypeRules.common(value.type?.type, element) ?? element
+            return result(boolean, .quantified(op, all: all, value, array, TypeDescriptor(compared)))
         case .field(let source, let name):
             let child = try resolve(source)
             guard let type = child.type?.type, let fields = TypeRules.fields(type) else { throw JedError("42809", "field selection requires a composite type") }
             guard let name else { throw JedError("0A000", "record wildcard must expand in a target list") }
             guard let index = fields.firstIndex(where: { $0.name == name }) else { throw JedError("42703", "field does not exist: \(name)") }
             return result(fields[index].descriptor, .field(child, index))
+        case .call(let call):
+            let function = try ContainerFunctionResolver.resolve(call) { try self.resolve($0, expected: $1) }
+                ?? FunctionResolver.resolve(call, hosts: hostFunctions) { try self.resolve($0, expected: $1) }
+            return result(function.resultType, .call(function))
         default: throw JedError("0A000", "expression resolver slice is not yet connected")
         }
     }
@@ -207,7 +247,7 @@ internal final class ExpressionResolver {
         }
         var context = scalar
         context.meter = nil // literal conversion is preparation, not per-row work
-        return ResolvedExpression(type: type, node: .constant(try ScalarCasts.input(text, to: type, context: context)), position: position)
+        return ResolvedExpression(type: type, node: .constant(try ContainerText.input(text, to: type, explicit: true, context: context)), position: position)
     }
     private func stringLiteral(_ expression: SQLExpression) -> SQLText? {
         switch expression.kind { case .string(let text): text; case .parenthesized(let child): stringLiteral(child); default: nil }
@@ -241,6 +281,10 @@ internal final class ExpressionResolver {
         else { a = try resolve(left); b = try resolve(right, expected: adaptable(right) ? hint(a.type, right) : nil) }
         if a.type == nil { a = try resolve(left, expected: b.type) }
         if b.type == nil { b = try resolve(right, expected: a.type) }
+        if let l = a.type, let r = b.type, TypeRules.fields(l.type) != nil && TypeRules.fields(r.type) != nil {
+            a = try resolve(left, expected: r)
+            b = try resolve(right, expected: a.type)
+        }
         if let operation, let temporal = temporalResult(operation, a.type?.type, b.type?.type) { return (a, b, TypeDescriptor(.scalar(temporal))) }
         let type: TypeDescriptor
         if let l = a.type, let r = b.type, TypeRules.fields(l.type) != nil && TypeRules.fields(r.type) != nil {

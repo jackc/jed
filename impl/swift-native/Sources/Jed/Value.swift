@@ -66,8 +66,10 @@ public struct SQLArray: Sendable {
         guard dimensions.count == lowerBounds.count else {
             throw JedError("2202E", "array dimensions and lower bounds do not match")
         }
-        guard dimensions.count <= 6 else {
-            throw JedError("54000", "number of array dimensions exceeds the maximum allowed (6)")
+        // MAXDIM=6 is a literal-input rule in the frozen baseline. Constructors
+        // admit deeper shapes; the representation itself is bounded by ndim u8.
+        guard dimensions.count <= 255 else {
+            throw JedError("54000", "number of array dimensions exceeds the wire format maximum (255)")
         }
         var count = dimensions.isEmpty ? 0 : 1
         for (index, dimension) in dimensions.enumerated() {
@@ -75,7 +77,9 @@ public struct SQLArray: Sendable {
                   count <= 134_217_727 / dimension else {
                 throw JedError("54000", "array size exceeds the maximum allowed (134217727)")
             }
-            guard Int64(lowerBounds[index]) + Int64(dimension) <= Int32.max else {
+            // array_prepend may produce an upper bound of Int32.max. Other
+            // builders impose their own stricter next-subscript check.
+            guard Int64(lowerBounds[index]) + Int64(dimension) - 1 <= Int32.max else {
                 throw JedError("54000", "array lower bound is too large: \(lowerBounds[index])")
             }
             count *= dimension

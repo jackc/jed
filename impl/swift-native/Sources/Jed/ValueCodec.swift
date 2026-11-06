@@ -213,13 +213,13 @@ internal enum ValueCodec {
             let element: TypeDescriptor
             do { element = try arrayElement(elementType) } catch { throw JedError.corruption("invalid array element descriptor") }
             let dimensions = Int(try reader.u8()), flags = try reader.u8()
-            guard dimensions <= 6, flags <= 1, dimensions != 0 || flags == 0 else { throw JedError.corruption("invalid array header") }
+            guard flags <= 1, dimensions != 0 || flags == 0 else { throw JedError.corruption("invalid array header") }
             var lengths: [Int] = [], lowerBounds: [Int32] = []
             var count = dimensions == 0 ? 0 : 1
             for _ in 0..<dimensions {
                 let length = Int(try reader.u32()), lower = try reader.i32()
                 guard length > 0, length <= 134_217_727, count <= 134_217_727 / length,
-                      Int64(lower) + Int64(length) <= Int32.max else { throw JedError.corruption("invalid array shape") }
+                      Int64(lower) + Int64(length) - 1 <= Int32.max else { throw JedError.corruption("invalid array shape") }
                 count *= length; lengths.append(length); lowerBounds.append(lower)
             }
             let bits = flags == 1 ? Array(try reader.take((count + 7) / 8)) : []

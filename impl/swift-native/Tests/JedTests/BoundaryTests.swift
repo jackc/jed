@@ -55,7 +55,8 @@ final class BoundaryTests: XCTestCase {
 
     func testArrayShapeBoundaryCannotOverflow() throws {
         XCTAssertThrowsError(try SQLArray(dimensions: [Int.max], lowerBounds: [1], elements: []))
-        XCTAssertThrowsError(try SQLArray(dimensions: [1], lowerBounds: [.max], elements: [.integer(1)]))
+        XCTAssertThrowsError(try SQLArray(dimensions: [2], lowerBounds: [.max], elements: [.integer(1), .integer(2)]))
+        XCTAssertEqual(try SQLArray(dimensions: [1], lowerBounds: [.max], elements: [.integer(1)]).lowerBounds, [.max])
         let array = try SQLArray(dimensions: [2], lowerBounds: [-3], elements: [.null, .integer(1)])
         XCTAssertEqual(array.lowerBounds, [-3])
         XCTAssertEqual(try SQLArray(elements: []).dimensions, [])

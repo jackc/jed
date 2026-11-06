@@ -50,9 +50,12 @@ final class ExpressionBoundaryTests: XCTestCase {
                     // The FROM-less projection's owning row charge precedes its
                     // expression evaluations, exactly as the eventual query drive.
                     meter.charge(1); try meter.guardCost()
-                    let context = ExpressionContext(meter: meter, timezone: zone, statementMicros: record.clock)
+                    var context = ExpressionContext(meter: meter, timezone: zone, statementMicros: record.clock)
+                    context.functions.timezones = zones
                     let values = try expressions.map { try context.evaluate($0) }
-                    let actual = try values.map { $0.isNull ? "NULL" : try ScalarCasts.render($0, context: .init(timezone: zone)).description }
+                    let actual = try zip(values, expressions).map { value, expression in
+                        value.isNull ? "NULL" : try ContainerText.render(value, type: expression.type ?? TypeDescriptor(.scalar(.text)), context: .init(timezone: zone)).description
+                    }
                     if let expected = record.error { XCTFail("expected \(expected): \(label)") }
                     else {
                         XCTAssertEqual(actual.map { Array($0.utf8) }, record.expected.map { Array($0.utf8) }, label)
@@ -110,15 +113,31 @@ private enum ScalarExpressionRecords {
         case .cast(let e, let type): return scalar(type) && supports(e)
         case .typedString(let type, _): return scalar(type)
         case .binary(let op, let a, let b):
-            return ["+", "-", "*", "/", "%", "||", "=", "<>", "<", ">", "<=", ">=", "and", "or"].contains(op) && supports(a) && supports(b)
+            return ["+", "-", "*", "/", "%", "||", "=", "<>", "<", ">", "<=", ">=", "and", "or", "@>", "<@", "&&", "<<", ">>", "&<", "&>", "-|-"] .contains(op) && supports(a) && supports(b)
         case .isDistinct(let a, let b, _): return supports(a) && supports(b)
         case .between(let a, let b, let c, _): return supports(a) && supports(b) && supports(c)
         case .member(let a, let candidates, _): return supports(a) && candidates.allSatisfy(supports)
         case .conditional(let operand, let arms, let fallback):
             return (operand.map(supports) ?? true) && arms.allSatisfy { supports($0.condition) && supports($0.result) } && (fallback.map(supports) ?? true)
         case .conditionalFunction(let name, let args): return ["coalesce", "greatest", "least", "nullif"].contains(name) && args.allSatisfy(supports)
+        case .row(let args), .array(let args): return args.allSatisfy(supports)
+        case .field(let source, let name): return name != nil && supports(source)
+        case .subscripted(let source, let subscripts): return supports(source) && subscripts.allSatisfy { ($0.lower.map(supports) ?? true) && ($0.upper.map(supports) ?? true) }
+        case .quantified(_, let operand, _, let source): return supports(operand) && supports(source)
+        case .call(let call):
+            return connectedFunctions.contains(call.name.description) && !call.star && !call.distinct && call.orderBy.isEmpty && call.withinGroup.isEmpty && call.filter == nil && call.over == nil && call.overName == nil && call.arguments.allSatisfy { supports($0.value) }
         default: return false
         }
     }
-    static func scalar(_ type: SQLTypeSyntax) -> Bool { type.arrayDimensions == 0 && TypeRules.scalar(named: type.name) != nil }
+    static func scalar(_ type: SQLTypeSyntax) -> Bool { (try? TypeRules.resolve(type, composites: [:])) != nil }
+    static let connectedFunctions = TextFunctions.names.union([
+        "i32range", "int4range", "i64range", "int8range", "numrange", "tsrange", "tstzrange", "daterange", "isempty", "lower_inc", "upper_inc", "lower_inf", "upper_inf", "range_merge",
+        "array_ndims", "array_length", "array_lower", "array_upper", "cardinality", "array_dims", "array_append", "array_prepend", "array_cat", "array_remove", "array_replace", "array_position", "array_positions", "array_to_string", "string_to_array",
+        "encode", "decode", "get_byte", "set_byte", "get_bit", "set_bit",
+        "abs", "round", "trunc", "ceil", "ceiling", "floor", "sqrt", "exp", "ln", "log", "log10", "pow", "power", "sin", "cos", "tan", "cbrt", "pi", "radians", "degrees", "asin", "acos", "atan", "atan2", "cot", "sinh", "cosh", "tanh", "asinh", "acosh", "atanh", "sign", "factorial", "scale", "min_scale", "trim_scale", "mod", "div", "gcd", "lcm", "width_bucket",
+        "now", "current_timestamp", "current_date", "localtimestamp", "make_date", "make_timestamp", "make_timestamptz", "make_interval", "justify_hours", "justify_days", "justify_interval", "age", "date_trunc", "date_part", "extract", "timezone", "to_char", "to_date", "to_timestamp", "to_number",
+        "uuid_extract_version", "uuid_extract_timestamp", "md5", "sha224", "sha256", "sha384", "sha512", "length", "char_length", "character_length", "octet_length", "bit_length", "lower", "upper", "num_nulls", "num_nonnulls",
+        "jsonb_typeof", "json_typeof", "jsonb_array_length", "json_array_length", "jsonb_strip_nulls", "json_strip_nulls", "jsonb_pretty", "to_json", "to_jsonb", "json_scalar", "json_serialize", "json_build_array", "jsonb_build_array", "json_build_object", "jsonb_build_object", "similar_to_escape",
+        "regexp_like", "regexp_match", "regexp_count", "regexp_instr", "regexp_substr", "regexp_replace", "regexp_split_to_array"
+    ])
 }

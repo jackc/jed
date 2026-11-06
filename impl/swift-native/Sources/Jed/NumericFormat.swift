@@ -194,7 +194,7 @@ internal enum NumericFormat {
         let integerDigits = raw.utf8.firstIndex(of: 46).map { raw.utf8.distance(from: raw.utf8.startIndex, to: $0) } ?? raw.utf8.count
         let before = descriptor.before + descriptor.multiplier
         let overflow = integerDigits > before
-        if overflow { raw = String(repeating: "#", count: before) + (descriptor.after > 0 ? "." + String(repeating: "#", count: descriptor.after) : "") }
+        if overflow { raw = String(repeating: "#", count: before) + (descriptor.after > 0 ? "." + String(repeating: "#", count: after) : "") }
         return Prepared(digits: Array(raw.utf8), negative: negative, integerDigits: overflow ? before : integerDigits, overflow: overflow, roman: nil)
     }
     static func toChar(_ value: SQLValue, type: ScalarType, template: SQLText, meter: CostMeter? = nil) throws -> SQLValue {

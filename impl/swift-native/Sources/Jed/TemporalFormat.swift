@@ -359,7 +359,7 @@ private struct DateTemplateReader {
     }
     private mutating func timezone(index: Int, combined: Bool, skipped: Int) throws {
         let node = nodes[index]
-        if combined && position < input.count && FormatTemplate.alpha(input[position]) {
+        if ["TZ", "tz"].contains(node.keyword?.id ?? "") && position < input.count && FormatTemplate.alpha(input[position]) {
             throw JedError("0A000", "time zone abbreviations are not supported")
         }
         var sign: Int64 = 1

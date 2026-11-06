@@ -151,10 +151,31 @@ The separate user work under `tasks/memory` is not part of this experiment.
   preservation and conditional parameter-registry adoption; host metadata and all
   256 octal input bytes now have boundary checks. A zero interval scales to zero
   before factor-width rejection, after divide-by-zero checking.
+- Connected catalog-driven scalar overload selection, named/default/variadic
+  arguments, native text/bytea functions, and recursive array/range kernels.
+  Container input/output, casts, constructors, subscripts, quantified comparisons,
+  range accessors/set operations and compatible array widening now enter the
+  real expression resolver/evaluator. The expanded gate passes 2,202 frozen
+  records / 2,425 cells / 281 cost checks / 13 type checks; 2,070 records remain
+  explicitly outside its AST/query-shape gate. All 163 current tests pass.
+  This still does not establish database/query conformance.
+- Expansion first produced 118 failures (including one stale internal shape
+  assertion), then 19 and two before passing. Fixes include handwritten overloads
+  whose signatures are specified outside the catalog, recursive rendering costs,
+  array upper-bound representation versus stricter operation limits, transient
+  record/range arrays, subscript indexing, typed NULL cast costs, and numeric/
+  timezone template edge cases. No frozen expected outputs were changed.
+  Independent review checked container resolution and text/bytea kernels.
+- The storage lifecycle source set compiles: domain snapshots/stores, exact
+  commit layout/preflight, catalog-root patching, live-page deltas and deferred
+  free-page accounting. Focused lifecycle tests and database writer/pin
+  coordination are in progress; compilation is not durability acceptance.
 
 ## Verification ledger
 
-2026-11-05, Linux x86-64, Swift 6.4.2, debug configuration:
+2026-11-05, Linux x86-64, Swift 6.4.2, debug configuration.
+XCTest timestamps below are checkout-local CST (UTC−06:00); earlier ledger
+entries incorrectly labeled these local timestamps UTC.
 
 | Command | Result |
 |---|---|
@@ -162,18 +183,19 @@ The separate user work under `tasks/memory` is not part of this experiment.
 | `mise run oracle:status` | PASS after sandbox socket access: existing PG18 `jed_oracle`, builtin C.UTF-8 and all profile pins agree; no cluster provisioning |
 | `mise run swift-native:codegen --check` | PASS with expanded pinned encoding/temporal/TZ inputs and three binary fixtures; fingerprint `8d60f8b77c8a63bd5ea5815788eda7bb0743953e256a71f1d9128f26a454d974` |
 | `mise run swift-native:test` | PASS 32 foundation/crypto tests, then PASS 35 after byte-host/logical-size slice; 0 failures |
-| `mise run swift-native:test` | PASS 61 after lexer/numeric/encryption/meta slices; 0 failures (2026-11-05 16:31 UTC) |
-| `mise run swift-native:test` | PASS 92 after parser, temporal/value/key, pager and packed-page slices; 0 failures (2026-11-05 16:45 UTC) |
+| `mise run swift-native:test` | PASS 61 after lexer/numeric/encryption/meta slices; 0 failures (2026-11-05 16:31 CST) |
+| `mise run swift-native:test` | PASS 92 after parser, temporal/value/key, pager and packed-page slices; 0 failures (2026-11-05 16:45 CST) |
 | `mise run swift-native:parser-audit` | PASS 21,525 frozen SQL records; zero unexpected rejections (see Tools/PARSER_AUDIT.md) |
-| `mise run swift-native:test` | PASS 113 after tree/disposition, temporal/numeric formatting and JSON foundations; 0 failures (2026-11-05 17:01 UTC) |
-| `mise run swift-native:test` | PASS 120 after catalog/golden and regex/SIMILAR slices; 0 failures (2026-11-05 17:08 UTC) |
-| `mise run swift-native:test` | PASS 122 after comparator/key invariants and regex admission; 0 failures (17:14 UTC) |
-| `mise run swift-native:test` | FAIL 127 tests / 30 JSONPath kernel probe failures; adapter and kernel issues preserved in `/tmp/jed-swift-jsonpath-first.log` (17:16 UTC) |
-| `mise run swift-native:test` | PASS 133 after JSONPath fixes, float kernels and GiST slice; 0 failures (17:20 UTC); same 133 PASS after scalar-cast source compilation (17:22 UTC) |
-| `mise run swift-native:test` | PASS 135 after retained regex producers and encrypted GiST golden (17:24 UTC) |
-| `mise run swift-native:test` | FAIL 138 / two new Unicode decoder failures (17:30 UTC); subsequent expression probe failures retained in `/tmp/jed-swift-expression-first.log` |
-| `mise run swift-native:test` | PASS 146 after Unicode/interval corrections, GIN vectors/goldens and scalar-expression integration (17:35 UTC) |
-| `mise run swift-native:test` | FAIL 147 / 73 after full-corpus expression expansion; then PASS 147 after corrections (17:41 UTC), including 642 shared expression records |
+| `mise run swift-native:test` | PASS 113 after tree/disposition, temporal/numeric formatting and JSON foundations; 0 failures (2026-11-05 17:01 CST) |
+| `mise run swift-native:test` | PASS 120 after catalog/golden and regex/SIMILAR slices; 0 failures (2026-11-05 17:08 CST) |
+| `mise run swift-native:test` | PASS 122 after comparator/key invariants and regex admission; 0 failures (17:14 CST) |
+| `mise run swift-native:test` | FAIL 127 tests / 30 JSONPath kernel probe failures; adapter and kernel issues preserved in `/tmp/jed-swift-jsonpath-first.log` (17:16 CST) |
+| `mise run swift-native:test` | PASS 133 after JSONPath fixes, float kernels and GiST slice; 0 failures (17:20 CST); same 133 PASS after scalar-cast source compilation (17:22 CST) |
+| `mise run swift-native:test` | PASS 135 after retained regex producers and encrypted GiST golden (17:24 CST) |
+| `mise run swift-native:test` | FAIL 138 / two new Unicode decoder failures (17:30 CST); subsequent expression probe failures retained in `/tmp/jed-swift-expression-first.log` |
+| `mise run swift-native:test` | PASS 146 after Unicode/interval corrections, GIN vectors/goldens and scalar-expression integration (17:35 CST) |
+| `mise run swift-native:test` | FAIL 147 / 73 after full-corpus expression expansion; then PASS 147 after corrections (17:41 CST), including 642 shared expression records |
+| `mise run swift-native:test` | FAIL 156 / 118 after function/container expansion, then 160 / 19 and 163 / two; PASS 163 (17:56 CST), including 2,202 frozen expression records |
 | `mise run swift-native:codegen --check` | PASS frozen cast/type/expression corpus, Unicode and GIN fixtures; fingerprint `76da6b8479747b97050e7c7709a6ec4bd57bd2f322bd5d85aa781e1aa7547c28` |
 | `mise run swift-native:codegen --check` | PASS all 749 frozen corpus files; fingerprint `37257dce1710682ff656ee83474597acd4adc91e8f040d8155e9d16e8b63ff50` |
 | `mise run swift-native:codegen --check` | PASS all 112 frozen file fixtures plus regex vectors; fingerprint `802cfd6bda26761f7dc3c91d811278ced3bd0a4e368c3e11f3d6b21e917ba77f` |
@@ -241,6 +263,7 @@ Further local-only checkpoints: `111932fa` (float/regex/type foundations),
 `2e13d1b8` (shared GIN root-string correction).
 Further experimental checkpoints: `4c14d61c` (GiST), `ba7859bd` (JSONPath and full
 frozen corpus), `35579e82` (GIN and loaded Unicode runtime), all local-only.
+`e2503626` records the initial typed expression/scalar-cast slice, also local-only.
 
 Initial SwiftPM compile failed while SQLDecimal was not yet present, then four
 missing `try` markers in decimal test autoclosures were corrected. No expected

@@ -20,7 +20,18 @@ internal struct ResolvedExpression {
         case nullif(ResolvedExpression, ResolvedExpression, TypeDescriptor)
         case row([ResolvedExpression])
         case field(ResolvedExpression, Int)
+        case call(ResolvedFunction)
+        case array([ResolvedExpression], nested: Bool)
+        case subscriptValue(ResolvedExpression, [ResolvedSubscript])
+        case rangeOperation(String, ResolvedExpression, ResolvedExpression, SQLType)
+        case quantified(String, all: Bool, ResolvedExpression, ResolvedExpression, TypeDescriptor)
     }
+}
+
+internal struct ResolvedSubscript {
+    var lower: ResolvedExpression?
+    var upper: ResolvedExpression?
+    var isSlice: Bool
 }
 
 internal struct ExpressionContext {
@@ -29,6 +40,7 @@ internal struct ExpressionContext {
     var parameters: [SQLValue]
     let meter: CostMeter
     var collatedKey: KeyEncoding.CollatedKey?
+    var functions = ScalarFunctions.Environment()
 
     init(meter: CostMeter, timezone: SQLTimeZone = .utc, statementMicros: Int64? = nil,
          parameters: [SQLValue] = [], column: @escaping (Int) throws -> SQLValue = { _ in throw JedError("XX000", "missing expression row") }) {
@@ -46,6 +58,7 @@ internal struct ExpressionContext {
             return parameters[index - 1]
         case .convert(let source, let target):
             return try convert(evaluate(source), from: source.type?.type, to: target)
+        case .call(let function): meter.charge(function.cost); try meter.step()
         default: meter.charge(1); try meter.step()
         }
         switch expression.node {
@@ -60,9 +73,8 @@ internal struct ExpressionContext {
             return try ScalarCasts.input(text, to: TypeDescriptor(.scalar(.date)), context: scalar)
         case .cast(let source, let target, let mode):
             let value = try evaluate(source)
-            guard let sourceType = source.type?.type else { return .null }
-            guard case .scalar(let sourceType) = sourceType else { throw JedError("0A000", "container cast evaluation is not yet connected") }
-            return try ScalarCasts.cast(value, from: sourceType, to: target, mode: mode, context: scalar)
+            guard let sourceType = source.type else { return .null }
+            return try ContainerCasts.cast(value, from: sourceType, to: target, mode: mode, context: scalar, growth: !FunctionResolver.isConstant(source))
         case .unary(let op, let source):
             let value = try evaluate(source)
             if value.isNull { return .null }
@@ -133,11 +145,49 @@ internal struct ExpressionContext {
             if case .boolean(true) = try ValueComparison.sql("=", a, b, type: type, collatedKey: collatedKey) { return .null }
             return a
         case .row(let fields): return .composite(try fields.map(evaluate))
+        case .array(let sources, let nested):
+            return try ArrayFunctions.construct(sources.map(evaluate), nested: nested,
+                                                constant: sources.allSatisfy(FunctionResolver.isConstant), meter: meter)
+        case .subscriptValue(let source, let subscripts):
+            let value = try evaluate(source)
+            var bounds: [ArrayFunctions.Subscript] = []
+            func bound(_ expression: ResolvedExpression?) throws -> ArrayFunctions.Bound {
+                guard let expression else { return .omitted }
+                let value = try evaluate(expression)
+                if value.isNull { return .value(nil) }
+                guard case .integer(let number) = value else { throw JedError("42804", "array subscript must be an integer") }
+                return .value(number)
+            }
+            for subscriptValue in subscripts {
+                if subscriptValue.isSlice { bounds.append(.slice(lower: try bound(subscriptValue.lower), upper: try bound(subscriptValue.upper))) }
+                else {
+                    if case .value(let number) = try bound(subscriptValue.lower) { bounds.append(.index(number)) }
+                    else { bounds.append(.index(nil)) }
+                }
+            }
+            return try ArrayFunctions.subscriptValue(value, subscripts: bounds)
+        case .rangeOperation(let op, let left, let right, let element):
+            var a = try evaluate(left), b = try evaluate(right)
+            if left.type?.type != .range(element), let type = left.type {
+                a = try ContainerCasts.cast(a, from: type, to: TypeDescriptor(element), mode: .assignment, context: scalar)
+            }
+            if right.type?.type != .range(element), let type = right.type {
+                b = try ContainerCasts.cast(b, from: type, to: TypeDescriptor(element), mode: .assignment, context: scalar)
+            }
+            return try RangeFunctions.binary(op, a, b, element: element)
+        case .quantified(let op, let all, let operand, let array, let element):
+            return try ArrayFunctions.quantified(op, all: all, operand: evaluate(operand), source: evaluate(array),
+                                                 element: element,
+                                                 meter: meter, comparisonWork: comparisonWork, collatedKey: collatedKey)
         case .field(let source, let index):
             let value = try evaluate(source)
             if value.isNull { return .null }
             guard case .composite(let fields) = value, fields.indices.contains(index) else { throw JedError("42804", "invalid record value") }
             return fields[index]
+        case .call(let function):
+            var values = Array(repeating: SQLValue.null, count: function.arguments.count)
+            for index in function.evaluationOrder { values[index] = try evaluate(function.arguments[index]) }
+            return try ScalarFunctions.evaluate(function, values: values, context: self, environment: functions)
         case .constant, .column, .parameter, .convert: throw JedError("XX000", "invalid expression dispatch")
         }
     }
