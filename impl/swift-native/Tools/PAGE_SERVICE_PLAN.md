@@ -201,12 +201,21 @@ unratified backup operation and process-test role/page-count/ack-fault hooks;
 it contains no SQL evaluator. The actor implements the canonical line protocol,
 16 MiB bounded UTF-8 input, hex SQL, real read/write session lifetimes, explicit
 cursor draining, maintenance, backup and owner-idle setup. Attachment actions use
-the native multi-domain API; stream actions select the native Swift pages actor.
+the native multi-domain API; stream actions use the explicitly selected pages actor.
 Any unsupported actor operation returns a counted error rather than being skipped.
 
 `mise run swift-native:process` builds the actor and runs the canonical process
 driver against all 31 scenarios copied verbatim from the baseline by mechanical
 codegen. `--no-build` uses an already-built actor and avoids SwiftPM contention.
+`--pages-owner swift-native` is the default serving selection. Explicit
+`--pages-owner rust` captures the existing canonical
+`impl/rust/target/release/process_actor` for the frozen Rust serving role; it
+never builds or substitutes another Rust actor. Both selected executables are
+copied once, verified against source hashes before and after capture, and their
+hashes are logged. A Swift-only `_stream` filter selects exactly the two frozen
+plaintext/encrypted stream scenarios with a Swift client and the selected
+serving child. The canonical Rust process client always starts its own
+executable for remote service, independently of this selection.
 `JED_PROCESS_FILTER`, `JED_PROCESS_CORES` and `JED_PROCESS_JOBS` remain explicit
 selection controls; the task defaults to Swift→Swift. Frozen `cores` lists
 predate Swift, so this task enables strict actor selection and never silently
@@ -234,8 +243,28 @@ credential, then relays raw bounded frames to the selected local owner. If no
 owner is reachable it opens a structural-only yield owner with that credential,
 then relays to its endpoint. Structural server opens defer SQL/environment
 validation. A preference handoff ends the stream and a reconnect repeats this
-selection. The frozen opt-in Swift process task explicitly selects the Swift
-pages actor; normal shared runner defaults still select Rust's serving endpoint.
+selection. The opt-in Swift process task defaults to the Swift pages actor and
+can explicitly select the canonical Rust actor with `--pages-owner rust`.
+Normal shared runner defaults still select Rust's serving endpoint. The earlier
+496-pair acceptance used the wrapper's default; the additional Swift-client to
+Rust-serving two-scenario lane is reported separately below.
+
+The missing frozen serving-role lane now passes both exact scenarios:
+
+```text
+JED_PROCESS_CORES=swift-native JED_PROCESS_FILTER=_stream mise run swift-native:process --no-build --configuration release --pages-owner rust
+```
+
+`/tmp/jed-swift-native-process-rust-stream.log` records two selected scenarios,
+two successful ordered pairings and exit 0. The SQL actors are Swift in both
+pairings; their serving child is the canonical Rust actor. The captured Swift
+release executable is
+`8265ffa840d4f8fe4bb8bee024712097716970604ed2c398d73f77d749e5b19e`;
+the captured Rust serving executable is
+`e909fdfd8551c78798c2647928c5cfc0e71e22f624d994c2fcd1cf1f7dc55399`.
+This separately verifies plaintext/encrypted stream relay, transport ownership,
+reconnection and preference handoff without replacing the earlier Swift-serving
+matrix or changing any frozen scenario. No build occurs in this invocation.
 
 The additional CJedHost routines adapt ordinary process/descriptor operations.
 The synchronous write wrapper blocks SIGPIPE on the calling thread, preserves

@@ -3,6 +3,7 @@
 #MISE description="Explicit opt-in: run frozen process corpus with native Swift actors"
 #USAGE flag "-c --configuration <configuration>" default="debug" help="debug or release"
 #USAGE flag "--no-build" help="Use the existing actor without invoking SwiftPM"
+#USAGE flag "--pages-owner <core>" default="swift-native" help="Stream serving actor: swift-native or rust (requires existing canonical Rust process_actor)"
 
 require_relative "../../impl/swift-native/Tools/swift_task"
 require_relative "../../impl/swift-native/Tools/generate_spec"
@@ -10,6 +11,12 @@ require "digest"
 require "tmpdir"
 configuration = ENV.fetch("usage_configuration", "debug")
 abort "configuration must be debug or release" unless %w[debug release].include?(configuration)
+pages_owner = ENV.fetch("usage_pages_owner", "swift-native")
+abort "pages-owner must be swift-native or rust" unless %w[swift-native rust].include?(pages_owner)
+rust_pages_actor = File.join(SwiftNativeTasks::ROOT, "impl/rust/target/release/process_actor")
+if pages_owner == "rust" && !File.executable?(rust_pages_actor)
+  abort "canonical Rust pages actor is not built: #{rust_pages_actor}"
+end
 cores = ENV.fetch("JED_PROCESS_CORES", "swift-native").split(",", -1)
 allowed = %w[swift-native rust go node]
 unless cores.include?("swift-native") && cores.uniq == cores && (cores - allowed).empty?
@@ -39,14 +46,34 @@ environment = {
 }
 # A SwiftPM gate may relink the build product while this long-running matrix
 # starts later scenarios. Every actor and serving child must use the same bytes.
+def snapshot_actor(source, destination)
+  before = Digest::SHA256.file(source).hexdigest
+  FileUtils.copy_file(source, destination)
+  File.chmod(0o500, destination)
+  captured = Digest::SHA256.file(destination).hexdigest
+  unless before == captured && before == Digest::SHA256.file(source).hexdigest
+    abort "actor changed during capture: #{source}"
+  end
+  captured
+end
+
 status = nil
 Dir.mktmpdir("jed-swift-process-") do |directory|
   snapshot = File.join(directory, "jed-process")
-  FileUtils.copy_file(actor, snapshot)
-  File.chmod(0o700, snapshot)
-  warn "Swift process actor snapshot: #{Digest::SHA256.file(snapshot).hexdigest}"
+  swift_hash = snapshot_actor(actor, snapshot)
+  warn "Swift process actor snapshot: #{swift_hash}"
   environment["JED_SWIFT_PROCESS_ACTOR"] = snapshot
-  environment["JED_PROCESS_PAGES_ACTOR"] = snapshot
+  pages_snapshot = snapshot
+  pages_hash = swift_hash
+  if pages_owner == "rust"
+    pages_snapshot = File.join(directory, "rust-process-actor")
+    pages_hash = snapshot_actor(rust_pages_actor, pages_snapshot)
+  end
+  # The selected serving command is [snapshot, "pages"|"pages-read-only", path].
+  # This override applies to clients honoring JED_PAGES_ACTOR; the canonical
+  # Rust client always uses its own executable as its serving child.
+  warn "Stream pages owner: #{pages_owner}; actor snapshot: #{pages_hash}"
+  environment["JED_PROCESS_PAGES_ACTOR"] = pages_snapshot
   system(environment, "ruby", File.join(SwiftNativeTasks::ROOT, "scripts/process_conformance.rb"))
   status = $?
 end
