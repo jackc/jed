@@ -47,7 +47,7 @@ struct RangeSpecFact: Equatable, Sendable {
 
 enum GeneratedSpec {
     static let baseline = "362e0798ac3a8bd04bd2da556044b6ec73bf468a"
-    static let fingerprint = "37257dce1710682ff656ee83474597acd4adc91e8f040d8155e9d16e8b63ff50"
+    static let fingerprint = "7024bdb84a3dc257a81d965161303df5ae427f0870a4c5750dcc99432d6d7f83"
     static let sourceHashes: [String: String] = [
         "spec/types/scalars.toml": "8b82f81965452cf031d8fb2b91642ad5165fb7a8973421b9e333969a69874a8d",
         "spec/types/ranges.toml": "9209b33203992b39dbf2a05fc4eeb9ae7dcd56f347b80a2cc1f39c3995309aa4",
@@ -61,6 +61,7 @@ enum GeneratedSpec {
         "spec/types/formatting.toml": "9790738d02fd8d7b0ffe42ccb500f06faeeadfc8080265112257106afd15cf60",
         "spec/grammar/pg_keywords.toml": "897108620950faa56c1ce9f5d8d6f385644cae007d94ab2deed237fd8ee09c48",
         "spec/fileformat/lz4_vectors.toml": "e9882b5f9cb86272f307606afbfe111d310cf93ec166940ae73846a398a57a77",
+        "spec/encoding/prng.toml": "93ee9c5bbd6142e8cec16f8226ace5123363b55d9767615aefc1f5e1761fccfe",
         "spec/encoding/decimal.toml": "006049952dc0d0ac0253f2cdbe5bd49e4fd69fe1fb08fe30c0a13c060c248078",
         "spec/encoding/integers.toml": "ffdca7e1b0a892bbb8cd6f655e58bb6eb15edc455d87f710f265c9dbe5b23b03",
         "spec/encoding/text.toml": "f2531344da6e65eb995032cb377ebe4b1a7d6456e0635b1187189d118d3ad100",
@@ -202,6 +203,9 @@ enum GeneratedSpec {
         "spec/collation/fixtures/es.coll": "8332e4e6c4715723370105c71beb31f847d669688acd6f79783784ccc94be553",
         "spec/collation/fixtures/dev-root.allkeys": "1fc9bea1fb5110e544087fe49e91b465409f7c2ea39361cbc18e99db0448ec90",
         "spec/collation/fixtures/dev-nordic.ldml": "acb8c8cb02de01005eeb106cb59c5f1281ff07303f6e6e1ebd29a96f853eae06",
+        "spec/collation/17.0.0/root.allkeys": "f6f8961f6c51373bdc00b09fb61cc8c07bec4122bc4b8bcb50ff71c4b0901ab5",
+        "spec/collation/17.0.0/es.ldml": "47b65eebf993e846541bb587d14673eaeb47906e7033ca99e00358c948a63a91",
+        "spec/collation/17.0.0/casing.txt": "8c88b4dde16f79e94e66b2a6e4e1da743a62496bab1139e9fa7b782c1627c7d6",
         "spec/conformance/suites/aggregates/array_agg.test": "fec56627466de8a0492b6d84201a14cc98838069126bab1da115feabb48360c5",
         "spec/conformance/suites/aggregates/avg.test": "662fbb7d7b45d1ab8a48e345f2bf65c197e2c30d9f08fdc1c96e3078bec8dd7e",
         "spec/conformance/suites/aggregates/bit_and.test": "32e68c8672114c85e936f8190f6b638f71b577b6f75d0706ebbcfdfbae143c12",

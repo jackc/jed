@@ -6,6 +6,7 @@ let package = Package(
     products: [
         .library(name: "Jed", targets: ["Jed"]),
         .library(name: "JedCrypto", targets: ["JedCrypto"]),
+        .executable(name: "jed-unicode", targets: ["JedUnicode"]),
     ],
     dependencies: [
         .package(url: "https://github.com/apple/swift-crypto.git", exact: "5.1.1"),
@@ -15,6 +16,8 @@ let package = Package(
     ],
     targets: [
         .target(name: "Jed", dependencies: ["JedCrypto"]),
+        .target(name: "JedUnicodeCompiler", dependencies: ["Jed"]),
+        .executableTarget(name: "JedUnicode", dependencies: ["JedUnicodeCompiler"]),
         .target(
             name: "JedCrypto",
             dependencies: [
@@ -34,7 +37,7 @@ let package = Package(
             publicHeadersPath: "include",
             cSettings: [.define("ARGON2_NO_THREADS"), .headerSearchPath("src")]
         ),
-        .testTarget(name: "JedTests", dependencies: ["Jed"], resources: [.copy("Fixtures")]),
+        .testTarget(name: "JedTests", dependencies: ["Jed", "JedUnicodeCompiler"], resources: [.copy("Fixtures")]),
         .testTarget(name: "JedCryptoTests", dependencies: ["JedCrypto"], resources: [.copy("Fixtures")]),
     ],
     swiftLanguageModes: [.v6]

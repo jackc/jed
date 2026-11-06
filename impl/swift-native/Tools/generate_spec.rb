@@ -28,6 +28,7 @@ module SwiftSpecGenerator
     spec/types/formatting.toml
     spec/grammar/pg_keywords.toml
     spec/fileformat/lz4_vectors.toml
+    spec/encoding/prng.toml
     spec/encoding/decimal.toml
     spec/encoding/integers.toml
     spec/encoding/text.toml
@@ -59,7 +60,9 @@ module SwiftSpecGenerator
   BYTE_INPUTS = (fixture_listing.lines.map(&:strip).select { |path| path.end_with?(".jed") }.sort +
     %w[spec/tz/fixtures/tzdata.jtz spec/collation/fixtures/unicode.jucd
        spec/collation/fixtures/unicode.coll spec/collation/fixtures/es.coll
-       spec/collation/fixtures/dev-root.allkeys spec/collation/fixtures/dev-nordic.ldml]).freeze
+       spec/collation/fixtures/dev-root.allkeys spec/collation/fixtures/dev-nordic.ldml
+       spec/collation/17.0.0/root.allkeys spec/collation/17.0.0/es.ldml
+       spec/collation/17.0.0/casing.txt]).freeze
   corpus_listing, corpus_error, corpus_status = Open3.capture3(
     "git", "ls-tree", "-r", "--name-only", BASELINE,
     "spec/conformance/suites", chdir: ROOT

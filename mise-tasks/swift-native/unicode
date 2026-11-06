@@ -1,0 +1,6 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#MISE description="Explicit opt-in: run the native Swift Unicode compiler"
+
+require_relative "../../impl/swift-native/Tools/swift_task"
+SwiftNativeTasks.run_product("jed-unicode", arguments: ARGV)

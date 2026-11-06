@@ -1,6 +1,6 @@
 # Native Swift experiment
 
-**Work in progress. This package does not yet expose a SQL database.**
+**Work in progress. SQL and host API implementation is incomplete.**
 The acceptance target is the full supported jed surface at
 `362e0798ac3a8bd04bd2da556044b6ec73bf468a`. See [PROGRESS.md](PROGRESS.md) for
 implemented and verified foundations, current failures/omissions and resume steps.
@@ -20,6 +20,7 @@ mise run swift-native:codegen --check
 mise run swift-native:build
 mise run swift-native:test
 mise run swift-native:build --configuration release
+mise run swift-native:unicode -- --help
 ```
 
 Normal repository CI, tests, benchmarks and generated website references do not

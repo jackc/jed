@@ -274,13 +274,45 @@ successfully and emits an upstream deprecation warning. No sandbox IPC dependenc
 is introduced into the engine. SwiftPM also warns about the direct swift-asn1
 constraint, retained intentionally to pin CryptoExtras' required transitive package.
 
+## Current integration checkpoint
+
+Latest integrated run (2026-11-05 18:20 CST): **197 tests passed**. It includes
+3,235 frozen expression records / 3,793 cells / 294 cost checks / 13 type checks,
+with 2,547 records explicitly outside the expression adapter's gate. JSON/SQLJSON
+initially exposed 14 failures, fixed against unchanged expectations. A speculative
+JSON resolver path multiplied work on nested arithmetic; conservative type-candidate
+admission restored the suite's roughly 65-second runtime. This remains an expression
+slice, not full database conformance.
+
+The same run verifies seven storage-domain tests, six coordinator tests, streamed
+export of 85 canonical images plus normalized metadata for two torn-meta recovery
+images (all body pages exact), independent cursor pins, reader-watermark reclamation,
+Q4 preflight, and memory stage/adopt failure isolation. Export retains bounded packed
+leaf/page payloads and chain references rather than collecting the whole image.
+Two initial Q4 failures were test defects (a throwing XCTUnwrap recorded an expected
+error, and a proposed growth did not exceed the existing high-water mark). Two export
+assertions initially expected repaired meta CRCs to retain deliberate fixture damage.
+The corrected boundaries pass without changing storage policy or shared fixtures.
+
+The separate handwritten Unicode compiler rebuilds shared compiler vectors and
+production collation/casing/bundle artifacts byte-exactly. Its command-line smoke
+check, `mise run swift-native:unicode -- bundle --preset non-cjk --spec-dir spec
+--out /tmp/jed-swift-native-unicode-smoke.jucd`, produced 340,621 bytes identical to
+the shared fixture. Current snapshot fingerprint is
+`7024bdb84a3dc257a81d965161303df5ae427f0870a4c5750dcc99432d6d7f83`.
+Environment sources, host-kernel boundaries and lazy per-block clock/UUID services
+are included in the 197-test run. New Database/Session cursor tests and expanded
+clock/seed/variables expression probes were added afterwards and await validation.
+
 ## Next steps
 
-1. Active delegated slices: Unicode review and storage lifecycle (`host_inventory`),
-   function resolution/dispatch and expression review (`crypto_audit`), container
-   input/casts/array/range kernels (`scope_inventory`). Root owns integration,
-   scalar casts, type resolution and remaining catalog/storage wiring. Numeric/temporal format and JSON foundations passed internal
-   verification; SQL behavior remains unverified.
+1. Active delegated slices: streamed images and memory-domain staging
+   (`host_inventory`), pattern/collation resolution and host-overload review
+   (`crypto_audit`), statement services, frozen adapter expansion and host lifecycle
+   review (`scope_inventory`). Root owns database/session/query integration and
+   binding. The public read/transaction API is being connected; DDL/DML, prepared
+   caches, joins/aggregates/windows, complete file/process hosts and full corpus
+   execution remain incomplete.
 2. Build parser/resolver/evaluator and shared-corpus adapter over the established
    types, plus the pager/packed B+tree/validated-COW transaction path. Do not
    substitute decoded dictionary storage or engine-owned cursor collection.
