@@ -2,6 +2,23 @@ import XCTest
 @testable import Jed
 
 final class ViewBoundaryTests: XCTestCase {
+    func testRenameRewritesOnlyBoundRelationTokensAndPinsAliasPositions() throws {
+        let table = try SQLText("t"), a = try SQLText("a"), b = try SQLText("b")
+        let view = CatalogView(name: try SQLText("v"), columns: [.init(name: b)],
+            definition: try SQLText("select t.b from t"), dependencies: [.init(kind: 0, name: table, columns: [b])])
+        var image = CatalogImage(); image.views = [view]
+        try ViewRewrite.references(in: &image, name: table, kind: 0, column: (1, try SQLText("new")), columns: [a, b])
+        XCTAssertEqual(image.views[0].definition.description, "select t . b from t as \"t\" ( \"a\" , \"b\" )")
+        XCTAssertEqual(image.views[0].dependencies[0].columns, [try SQLText("new")])
+        try ViewRewrite.references(in: &image, name: table, kind: 0, renamed: SQLText("renamed"), columns: [a, b])
+        XCTAssertEqual(image.views[0].definition.description, "select t . b from \"renamed\" as \"t\" ( \"a\" , \"b\" )")
+
+        image.views[0] = CatalogView(name: try SQLText("v"), columns: [.init(name: b)],
+            definition: try SQLText("with t as (select b from main.t) select b from t"),
+            dependencies: [.init(kind: 0, name: table, columns: [b])])
+        try ViewRewrite.references(in: &image, name: table, kind: 0, renamed: SQLText("renamed"), columns: [a, b])
+        XCTAssertEqual(image.views[0].definition.description, "with t as ( select b from main . \"renamed\" as \"t\" ) select b from t")
+    }
     func testExpansionCountsPathsAndResetsForIndependentReferences() throws {
         let state = ViewExpansionState(), outer = try SQLText("outer"), child = try SQLText("child")
         for _ in 0..<2 {

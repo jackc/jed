@@ -226,11 +226,29 @@ internal enum CatalogDDL {
                 guard let onDelete = actions[reference.onDelete], let onUpdate = actions[reference.onUpdate] else { throw JedError("XX000", "unresolved foreign-key action") }
                 table.foreignKeys.append(CatalogForeignKey(name: foreignName, columns: local, referencedTable: parentName,
                     referencedColumns: remote, onDelete: onDelete, onUpdate: onUpdate, matchFull: reference.match == "full"))
-            case .exclude: throw JedError("0A000", "exclusion DDL is not yet connected")
             default: break
             }
         }
+        for item in constraints {
+            guard case .exclude(let method, let elements, let predicate) = item.syntax.kind else { continue }
+            let definition = try exclusionDefinition(method: method, elements: elements, predicate: predicate,
+                table: table, source: source, snapshot: snapshot, settings: settings, context: context)
+            let chosen: SQLText
+            if let explicit = item.syntax.name {
+                try CatalogSQL.reserved(explicit, kind: "constraint")
+                guard !usedRelations.contains(explicit) else { throw JedError("42P07", "relation \(explicit) already exists") }
+                chosen = explicit
+            } else {
+                chosen = CatalogSQL.objectName(name, columns: definition.columns.map { table.columns[$0].name },
+                    label: "excl", taken: schemaConstraints.union(usedRelations))
+            }
+            try addConstraintName(chosen, table: name, local: &localConstraints, schema: &schemaConstraints)
+            usedRelations.insert(chosen)
+            table.indexes.append(definition.index(chosen, root: root))
+            table.exclusions.append(CatalogExclusion(name: chosen, index: chosen, elements: definition.elements))
+        }
         table.checks.sort { $0.name < $1.name }; table.indexes.sort { $0.name < $1.name }; table.foreignKeys.sort { $0.name < $1.name }
+        table.exclusions.sort { $0.name < $1.name }
         var image = snapshot.catalog; image.tables.append(table); image.sequences += sequences
         for column in table.columns {
             if let name = column.type.collation, !image.collations.contains(where: { $0.name == name }),
@@ -241,7 +259,14 @@ internal enum CatalogDDL {
         }
         try snapshot.updateCatalog(image, schemaChanged: true)
         snapshot.setTableStore(name, snapshot.emptyStore(types: try table.columns.map { try $0.type.resolve(snapshot.types) }))
-        for index in table.indexes { snapshot.setIndexStore(index.name, snapshot.emptyStore(types: [])) }
+        for index in table.indexes {
+            let store = snapshot.emptyStore(types: [])
+            snapshot.setIndexStore(index.name, store)
+            if index.kind == 2 {
+                let plan = try StoredIndexPlan.resolve(table: table, index: index, snapshot: snapshot, settings: settings, context: context)
+                try plan.rebuild(store, snapshot: &snapshot)
+            }
+        }
     }
 
     static func resolver(snapshot: DomainSnapshot, settings: SessionSettings, context: ExpressionContext,
@@ -293,7 +318,6 @@ internal enum CatalogDDL {
         }
     }
     static func foreignKeyPair(_ left: SQLType, _ right: SQLType) -> Bool {
-        if case .composite = left { return false }
         if left == right { return true }
         guard case .scalar(let a) = left, case .scalar(let b) = right else { return false }
         return a.integerWidth != nil && (b.integerWidth != nil || b == .decimal)

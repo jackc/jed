@@ -7,32 +7,39 @@ extension CatalogDDL {
         if occupied && syntax.ifNotExists { return }
         guard !syntax.temporary else { throw JedError("0A000", "temporary view catalog is not yet connected") }
         guard !syntax.recursive else { throw JedError("0A000", "recursive view catalog is not yet connected") }
-        let prepared = try ViewDefinition.prepare(syntax.query, source: source, snapshot: snapshot, settings: settings, context: context)
-        var view = CatalogView(name: name, columns: [], definition: prepared.definition, dependencies: prepared.dependencies)
-        try ViewOptions.apply(syntax.options, trailingCheck: syntax.checkOption, to: &view)
-        if view.checkOption != 0 { try UpdatableView.checkShape(syntax.query, name: name, operation: "check") }
-        guard syntax.columns.count <= prepared.columns.count else { throw JedError("42601", "CREATE VIEW specifies more column names than columns") }
-        var names: Set<SQLText> = []
-        for (index, column) in prepared.columns.enumerated() {
-            let name = index < syntax.columns.count ? syntax.columns[index] : column.name
-            guard names.insert(name).inserted else { throw JedError("42701", "column \(name) specified more than once") }
-            _ = try CatalogSQL.typeUse(column.type ?? TypeDescriptor(.scalar(.text)))
-            view.columns.append(.init(name: name))
+        var view = CatalogView(name: name, columns: [], definition: SQLText(validatedUTF8: []), dependencies: [])
+        let prepared = try ViewDefinition.prepare(syntax.query, source: source, snapshot: snapshot, settings: settings, context: context) { columns in
+            try ViewOptions.apply(syntax.options, trailingCheck: syntax.checkOption, to: &view)
+            if view.checkOption != 0 { try UpdatableView.checkShape(syntax.query, name: name, operation: "check") }
+            guard syntax.columns.count <= columns.count else { throw JedError("42601", "CREATE VIEW specifies more column names than columns") }
+            var names: Set<SQLText> = []
+            for (index, column) in columns.enumerated() {
+                let name = index < syntax.columns.count ? syntax.columns[index] : column.name
+                guard names.insert(name).inserted else { throw JedError("42701", "column \(name) specified more than once") }
+                view.columns.append(.init(name: name))
+            }
+            for column in columns { _ = try CatalogSQL.typeUse(column.type ?? TypeDescriptor(.scalar(.text))) }
         }
+        view.definition = prepared.definition; view.dependencies = prepared.dependencies
         var image = snapshot.catalog
         if occupied {
             guard syntax.replace else { throw JedError("42P07", "relation \(name) already exists") }
             guard let index = image.views.firstIndex(where: { $0.name == name }) else { throw JedError("42809", "\(name) is not a view") }
             let old = image.views[index]
             guard view.columns.count >= old.columns.count else { throw JedError("42P16", "cannot drop columns from view") }
+            var bodySettings = settings; bodySettings.privileges = settings.privileges.withTableAccess()
+            let oldPlan = try? SelectPlan.resolve(ViewDefinition.query(old), snapshot: snapshot, settings: bodySettings, scalar: context.scalar)
             for position in old.columns.indices {
                 guard old.columns[position].name == view.columns[position].name else { throw JedError("42P16", "cannot change name of view column") }
                 view.columns[position].defaultText = old.columns[position].defaultText
-            }
-            if let oldQuery = try? ViewDefinition.query(old),
-               let oldPlan = try? SelectPlan.resolve(oldQuery, snapshot: snapshot, settings: settings, scalar: context.scalar) {
-                for position in old.columns.indices {
-                    guard (oldPlan.columns[position].type ?? TypeDescriptor(.scalar(.text))) == prepared.columns[position].type else { throw JedError("42P16", "cannot change data type of view column") }
+                if let oldPlan, oldPlan.columns.count == old.columns.count {
+                    var oldType = oldPlan.columns[position].type ?? TypeDescriptor(.scalar(.text))
+                    var newType = prepared.columns[position].type ?? TypeDescriptor(.scalar(.text))
+                    oldType.collation = nil; newType.collation = nil
+                    guard oldType == newType else { throw JedError("42P16", "cannot change data type of view column") }
+                    guard try ViewDefinition.outputCollation(oldPlan.projections[position], image: image) == prepared.collations[position] else {
+                        throw JedError("42P16", "cannot change collation of view column")
+                    }
                 }
             }
             image.views[index] = view
@@ -51,7 +58,8 @@ extension CatalogDDL {
             if syntax.ifExists { return }
             throw JedError("42P01", "view does not exist: \(name)")
         }
-        var image = snapshot.catalog, view = image.views[index]
+        let original = snapshot
+        var image = snapshot.catalog, view = image.views[index], renamed = false
         for action in syntax.actions {
             let wasInvoker = view.securityInvoker
             switch action {
@@ -87,18 +95,16 @@ extension CatalogDDL {
             case .rename(let renamed):
                 try CatalogSQL.reserved(renamed, kind: "view")
                 guard !CatalogSQL.relationNames(image).contains(renamed) else { throw JedError("42P07", "relation \(renamed) already exists") }
-                guard !image.views.contains(where: { $0.dependencies.contains(where: { $0.kind == 1 && $0.name == view.name }) }) else {
-                    throw JedError("0A000", "dependent view rename rewriting is not yet connected")
-                }
+                try ViewRewrite.references(in: &image, name: view.name, kind: 1, renamed: renamed, columns: view.columns.map(\.name))
                 view.name = renamed
             case .renameColumn(let old, let new):
                 let position = try viewColumn(old, view: view)
                 guard !view.columns.contains(where: { $0.name == new }) else { throw JedError("42701", "column \(new) of relation \(view.name) already exists") }
-                guard !image.views.contains(where: { $0.dependencies.contains(where: { $0.kind == 1 && $0.name == view.name }) }) else {
-                    throw JedError("0A000", "dependent view column rename rewriting is not yet connected")
-                }
+                try ViewRewrite.references(in: &image, name: view.name, kind: 1, column: (position, new), columns: view.columns.map(\.name))
                 view.columns[position].name = new
             }
+            switch action { case .rename, .renameColumn: renamed = true; default: break }
+            image.views[index] = view
             if wasInvoker && !view.securityInvoker {
                 // Becoming a definer view establishes a new table-capability
                 // boundary and therefore repeats the creator's owner check.
@@ -108,6 +114,7 @@ extension CatalogDDL {
         }
         image.views[index] = view
         try snapshot.updateCatalog(image, schemaChanged: true)
+        if renamed { try revalidateViews(dependingOn: name, old: original, new: snapshot, settings: settings, context: context, replacement: false) }
     }
 
     static func dropViews(_ syntax: SQLDrop, snapshot: inout DomainSnapshot) throws {
@@ -137,13 +144,15 @@ extension CatalogDDL {
         return position
     }
     static func revalidateViews(dependingOn changed: SQLText, old: DomainSnapshot, new: DomainSnapshot,
-                                settings: SessionSettings, context: ExpressionContext) throws {
+                                settings: SessionSettings, context: ExpressionContext, replacement: Bool = true) throws {
         var affected: Set<SQLText> = [changed], pending = true
         while pending {
             pending = false
             for view in old.catalog.views where !affected.contains(view.name) {
                 if view.dependencies.contains(where: { ($0.kind == 0 || $0.kind == 1) && affected.contains($0.name) }) {
-                    affected.insert(view.name); pending = true
+                    if replacement || view.dependencies.contains(where: { ($0.kind == 0 || $0.kind == 1) && $0.name == changed }) {
+                        affected.insert(view.name); pending = replacement
+                    }
                 }
             }
         }
@@ -156,12 +165,16 @@ extension CatalogDDL {
                 let next = try ViewDefinition.prepare(ViewDefinition.query(afterView), source: afterView.definition,
                     snapshot: new, settings: bodySettings, context: context)
                 guard prior.columns.count == next.columns.count,
-                      zip(prior.columns, next.columns).allSatisfy({ $0.name == $1.name && ($0.type ?? TypeDescriptor(.scalar(.text))) == $1.type }),
-                      view.dependencies.count == next.dependencies.count,
-                      zip(view.dependencies, next.dependencies).allSatisfy({ $0.kind == $1.kind && $0.name == $1.name && $0.columns == $1.columns }) else {
+                      afterView.dependencies.count == next.dependencies.count,
+                      zip(afterView.dependencies, next.dependencies).allSatisfy({ $0.kind == $1.kind && $0.name == $1.name && $0.columns == $1.columns }) else {
                     throw JedError("0A000", "changed view definition")
                 }
-            } catch { throw JedError("0A000", "cannot alter relation \(changed) because it would change the definition of view \(view.name)") }
+                if replacement, let replaced = old.catalog.views.first(where: { $0.name == changed }),
+                   next.viewUses[changed, default: []].contains(where: { $0 >= replaced.columns.count }) {
+                    throw JedError("0A000", "replacement captures an appended view column")
+                }
+            } catch let error as JedError where error.code == "XX003" { throw error }
+            catch { throw JedError("0A000", "cannot alter relation \(changed) because it would change the definition of view \(view.name)") }
         }
     }
 }

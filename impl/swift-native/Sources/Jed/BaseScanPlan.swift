@@ -6,12 +6,17 @@ internal struct BaseScanPlan {
     let types: [TypeDescriptor]
     let terms: [Int: [Term]]
     let contradiction: Bool
+    let pointSets: [Int: ResolvedSubquery]
 
     init(predicate: ResolvedExpression?, keys: [Int], types: [TypeDescriptor]) {
         self.keys = keys; self.types = types
-        var terms: [Int: [Term]] = [:], contradiction = false
+        var terms: [Int: [Term]] = [:], pointSets: [Int: ResolvedSubquery] = [:], contradiction = false
         func constant(_ expression: ResolvedExpression) -> Bool {
-            switch expression.node { case .constant, .parameter: true; default: false }
+            switch expression.node {
+            case .constant, .parameter, .outerColumn: return true
+            case .subquery(let query): if case .scalar = query.kind { return !query.correlated }; return false
+            default: return false
+            }
         }
         func column(_ expression: ResolvedExpression) -> Int? {
             if case .column(let index) = expression.node { return index }
@@ -19,11 +24,26 @@ internal struct BaseScanPlan {
             return nil
         }
         func visit(_ expression: ResolvedExpression) {
+            if case .subquery(let query) = expression.node, !query.correlated, query.rowArity == nil,
+               case .membership("=", false, false, let membership, let operand) = query.kind,
+               let index = column(operand), types.indices.contains(index), pointSets[index] == nil {
+                let type = types[index]
+                let input = query.plan.columns[0].type?.type
+                let numeric: Bool
+                if case .scalar(let a) = type.type, case .scalar(let b) = input {
+                    numeric = (a.integerWidth != nil || a == .decimal) && (b.integerWidth != nil || b == .decimal)
+                } else { numeric = false }
+                if (input == nil || input == type.type || numeric),
+                   (query.type?.collation?.description ?? "C") == (type.collation?.description ?? "C"),
+                   !membership || type.collation == nil || type.collation?.description == "C" {
+                    pointSets[index] = query
+                }
+            }
             if case .constant(let value) = expression.node {
                 if value.isNull { contradiction = true; return }
                 if case .boolean(false) = value { contradiction = true; return }
             }
-            guard case .binary(let operation, let left, let right, _) = expression.node else { return }
+            guard case .binary(let operation, let left, let right, let comparison) = expression.node else { return }
             if operation == "and" { visit(left); visit(right); return }
             guard ["=", "<", "<=", ">", ">="].contains(operation) else { return }
             let index: Int, source: ResolvedExpression, op: String
@@ -32,6 +52,8 @@ internal struct BaseScanPlan {
                 index = found; source = left; op = ["<": ">", "<=": ">=", ">": "<", ">=": "<="][operation] ?? operation
             } else { return }
             guard types.indices.contains(index) else { return }
+            if ExpressionCollation.collatable(types[index].type),
+               (comparison.collation?.description ?? "C") != (types[index].collation?.description ?? "C") { return }
             let compatible = source.type == nil || source.type?.type == types[index].type || {
                 if case .scalar(let a) = source.type?.type, case .scalar(let b) = types[index].type {
                     return a.integerWidth != nil && b.integerWidth != nil
@@ -42,9 +64,46 @@ internal struct BaseScanPlan {
             terms[index, default: []].append(Term(operation: op, source: source))
         }
         if let predicate { visit(predicate) }
-        self.terms = terms; self.contradiction = contradiction
+        self.terms = terms; self.contradiction = contradiction; self.pointSets = pointSets
     }
     func bind(_ context: ExpressionContext) throws -> ScanAccess {
+        let clip = try contiguous(context)
+        guard !clip.isEmpty, keys.count == 1, let column = keys.first,
+              let source = pointSets[column], let rows = context.subqueries.values(source) else { return clip }
+        var points: Set<[UInt8]> = []
+        for row in rows {
+            let input = row[0]
+            if input.isNull { continue }
+            let value: SQLValue
+            if case .scalar(let target) = types[column].type, target.integerWidth != nil {
+                let number: Int64
+                switch input {
+                case .integer(let integer): number = integer
+                case .decimal(let decimal):
+                    guard let integer = try? decimal.integerValue(), decimal.compare(to: SQLDecimal(integer)) == 0 else { continue }
+                    number = integer
+                default: continue
+                }
+                guard target.admits(number) else { continue }; value = .integer(number)
+            } else if types[column].type == .scalar(.decimal), case .integer(let number) = input { value = .decimal(SQLDecimal(number)) }
+            else { value = input }
+            let key = try KeyEncoding.encode(value, type: types[column], collatedKey: context.collatedKey)
+            if let lower = clip.lower, key.lexicographicallyPrecedes(lower.key) || key == lower.key && !lower.inclusive { continue }
+            if let upper = clip.upper, upper.key.lexicographicallyPrecedes(key) || key == upper.key && !upper.inclusive { continue }
+            points.insert(key)
+        }
+        let ordered = points.sorted { $0.lexicographicallyPrecedes($1) }
+        var intervals: [ScanInterval] = []
+        for key in ordered {
+            if ValueCodec.fixedWidth(types[column].type) != nil, let last = intervals.last,
+               let upper = last.upper, OrderedIndexPlan.successor(upper.key) == key {
+                intervals[intervals.count - 1] = ScanInterval(lower: last.lower, upper: TreeBound(key))
+            } else { intervals.append(ScanInterval(lower: TreeBound(key), upper: TreeBound(key))) }
+        }
+        return ScanAccess(lower: nil, upper: nil, isEmpty: intervals.isEmpty, intervals: intervals)
+    }
+
+    private func contiguous(_ context: ExpressionContext) throws -> ScanAccess {
         if contradiction { return .empty }
         if try contradicts(context) { return .empty }
         guard !keys.isEmpty else { return .full }
@@ -53,6 +112,7 @@ internal struct BaseScanPlan {
             switch expression.node {
             case .constant(let value): return value
             case .parameter(let index): return context.parameters[index - 1]
+            case .outerColumn, .subquery: return try context.evaluate(expression)
             default: throw JedError("XX000", "invalid constant scan operand")
             }
         }
@@ -116,6 +176,8 @@ internal struct BaseScanPlan {
                 switch term.source.node {
                 case .constant(let constant): value = constant
                 case .parameter(let index): value = context.parameters[index - 1]
+                case .subquery: value = try context.evaluate(term.source)
+                case .outerColumn: continue
                 default: continue
                 }
                 if value.isNull { return true }
@@ -152,11 +214,17 @@ internal struct ScanAccess {
     let lower: TreeBound?
     let upper: TreeBound?
     let isEmpty: Bool
+    var intervals: [ScanInterval]? = nil
     static let full = ScanAccess(lower: nil, upper: nil, isEmpty: false)
     static let empty = ScanAccess(lower: nil, upper: nil, isEmpty: true)
-    func cursor(_ store: TableStore, descending: Bool = false) -> TreeCursor { store.cursor(lower: lower, upper: upper, descending: descending) }
+    func cursor(_ store: TableStore, descending: Bool = false) -> ScanCursor {
+        ScanCursor(store: store, intervals: isEmpty ? [] : intervals ?? [ScanInterval(lower: lower, upper: upper)], descending: descending)
+    }
     func pages(_ tree: BPlusTree) -> Int64 {
         guard !isEmpty, let root = tree.root else { return 0 }
+        if let intervals {
+            return intervals.reduce(0) { saturatingAdd($0, ScanAccess(lower: $1.lower, upper: $1.upper, isEmpty: false).pages(tree)) }
+        }
         if lower == nil && upper == nil { return Int64(tree.nodeCount) }
         func overlaps(_ low: [UInt8]?, _ high: [UInt8]?) -> Bool {
             if let lower, let high, !lower.key.lexicographicallyPrecedes(high) { return false }
@@ -182,4 +250,31 @@ internal struct ScanAccess {
         case .onDisk: return 1
         }
     }
+}
+
+internal struct ScanInterval { let lower: TreeBound?; let upper: TreeBound? }
+
+/// Interval scans open one bounded packed-tree cursor at a time. The intervals
+/// are disjoint and canonical, so no row-dedup buffer is needed here.
+internal struct ScanCursor {
+    private let store: TableStore
+    private let intervals: [ScanInterval]
+    private let descending: Bool
+    private var position = 0
+    private var current: TreeCursor?
+    init(store: TableStore, intervals: [ScanInterval], descending: Bool) {
+        self.store = store; self.intervals = descending ? Array(intervals.reversed()) : intervals; self.descending = descending
+    }
+    mutating func next() throws -> PackedRecord? {
+        while true {
+            if current == nil {
+                guard position < intervals.count else { return nil }
+                let bounds = intervals[position]; position += 1
+                current = store.cursor(lower: bounds.lower, upper: bounds.upper, descending: descending)
+            }
+            if let row = try current?.next() { return row }
+            current?.close(); current = nil
+        }
+    }
+    mutating func close() { current?.close(); current = nil; position = intervals.count }
 }

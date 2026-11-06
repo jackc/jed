@@ -242,10 +242,13 @@ extension SQLParser {
         repeat {
             let start = cursor
             let key: SQLExpression
+            let isExpression = symbol("(") || isIdentifier() && symbol("(", 1)
             if eatSymbol("(") { key = try expression(); try expectSymbol(")") }
             else if isIdentifier() && symbol("(", 1) { key = try primary() }
             else { key = expressionNode(.column(qualifier: nil, name: try identifier()), from: start) }
             var term = SQLOrderTerm(expression: key, span: span(start))
+            term.indexExpression = isExpression
+            term.directionSpecified = word() == "desc" || word() == "asc"
             term.descending = eat("desc"); if !term.descending { eat("asc") }
             if eat("nulls") { term.nullsFirst = eat("first"); if term.nullsFirst == false { try expect("last") } }
             term.span = span(start); result.keys.append(term)

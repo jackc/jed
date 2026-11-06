@@ -101,13 +101,13 @@ extension ExpressionResolver {
         return ResolvedExpression(type: output, node: .json(resolved), position: position)
     }
 
-    private func jsonEncoding(_ encoding: SQLText?, type: TypeDescriptor?) throws {
+    func jsonEncoding(_ encoding: SQLText?, type: TypeDescriptor?) throws {
         guard let encoding else { return }
         guard type?.type == .scalar(.bytea) else { throw JedError("42804", "JSON ENCODING clause is only allowed for bytea input type") }
         guard encoding.description == "UTF8" else { throw JedError("22023", "invalid source encoding name \"\(encoding)\"") }
     }
 
-    private func jsonBehavior(_ syntax: SQLJSONBehavior?, returning: TypeDescriptor, exists: Bool) throws -> ResolvedJSONExpression.Behavior? {
+    func jsonBehavior(_ syntax: SQLJSONBehavior?, returning: TypeDescriptor, exists: Bool) throws -> ResolvedJSONExpression.Behavior? {
         guard let syntax else { return nil }
         guard let expression = syntax.value else { return .init(action: syntax.action, value: nil, itemCoercion: false) }
         guard !exists else { throw JedError("42601", "invalid ON ERROR behavior") }
@@ -192,7 +192,7 @@ internal struct ResolvedJSONExpression {
         FunctionResolver.isConstant(context) && (path.map(FunctionResolver.isConstant) ?? true) && passing.allSatisfy { FunctionResolver.isConstant($0.value) }
     }
 
-    func evaluate(context execution: ExpressionContext) throws -> SQLValue {
+    func evaluate(context execution: ExpressionContext, chargePathResults: Bool = true) throws -> SQLValue {
         let value = try execution.evaluate(context)
         if name == "json" {
             if value.isNull { return .null }
@@ -215,7 +215,7 @@ internal struct ResolvedJSONExpression {
             root = try JSONFunctions.node(.text(SQLText(utf8: bytes)))
         } else { root = try JSONFunctions.node(value) }
         var bindings: [(SQLText, SQLJSONValue)] = []
-        for binding in passing { bindings.append((binding.name, try passingValue(binding, execution: execution))) }
+        for binding in passing { bindings.append((binding.name, try Self.passingValue(binding, execution: execution))) }
         // Context/PASSING conversions and dynamic path input belong to their
         // operands and cannot be suppressed by ON ERROR.
         let program = try JSONPathProgram.compile(pathText, meter: execution.meter, regexCompiler: JsonScalarFunctions.regexCompiler(execution))
@@ -233,7 +233,7 @@ internal struct ResolvedJSONExpression {
                 if collect { items.append(item) }
                 if name == "json_exists" && !program.strict { break }
             }
-            execution.meter.charge(produced); try execution.meter.guardCost()
+            if chargePathResults { execution.meter.charge(produced); try execution.meter.guardCost() }
             if name == "json_exists" { return .boolean(first != nil) }
             if count == 0 { computed = nil }
             else if name == "json_value" {
@@ -293,7 +293,7 @@ internal struct ResolvedJSONExpression {
         return try ContainerText.input(text, to: type, explicit: false, context: context.scalar)
     }
 
-    private func passingValue(_ binding: Passing, execution: ExpressionContext) throws -> SQLJSONValue {
+    static func passingValue(_ binding: Passing, execution: ExpressionContext) throws -> SQLJSONValue {
         let value = try execution.evaluate(binding.value)
         if value.isNull { return .null }
         if binding.formatJSON {

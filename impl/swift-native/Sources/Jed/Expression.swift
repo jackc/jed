@@ -12,6 +12,7 @@ internal struct ResolvedExpression {
     var isConstant: Bool { if case .constant = node { return true }; return false }
     indirect enum Node {
         case constant(SQLValue), column(Int), parameter(Int)
+        case outerColumn(OuterColumnReference), subquery(ResolvedSubquery)
         case currentTimestamp, currentDate, dateInput(SQLText)
         case cast(ResolvedExpression, TypeDescriptor, TypeRules.CastMode)
         case convert(ResolvedExpression, TypeDescriptor)
@@ -49,6 +50,9 @@ internal struct ExpressionContext {
     var collatedKey: KeyEncoding.CollatedKey?
     var functions = ScalarFunctions.Environment()
     var patterns = PatternExecution()
+    var outerRows: [(Int) throws -> SQLValue] = []
+    var subqueries = SubqueryExecution()
+    var ctes: CTEExecution?
 
     init(meter: CostMeter, timezone: SQLTimeZone = .utc, statementMicros: Int64? = nil,
          parameters: [SQLValue] = [], column: @escaping (Int) throws -> SQLValue = { _ in throw JedError("XX000", "missing expression row") }) {
@@ -86,6 +90,10 @@ internal struct ExpressionContext {
         switch expression.node {
         case .constant(let value): return value
         case .column(let index): return try column(index)
+        case .outerColumn(let reference):
+            guard reference.depth > 0, reference.depth <= outerRows.count else { throw JedError("XX000", "missing enclosing expression row") }
+            return try outerRows[reference.depth - 1](reference.index)
+        case .subquery(let query): return try subqueries.evaluate(query, context: self)
         case .parameter(let index):
             guard index > 0 && index <= parameters.count else { throw JedError("42P02", "there is no parameter $\(index)") }
             return parameters[index - 1]
@@ -222,7 +230,7 @@ internal struct ExpressionContext {
             var values = Array(repeating: SQLValue.null, count: function.arguments.count)
             for index in function.evaluationOrder { values[index] = try evaluate(function.arguments[index]) }
             return try ScalarFunctions.evaluate(function, values: values, context: self, environment: functions)
-        case .constant, .column, .parameter, .convert: throw JedError("XX000", "invalid expression dispatch")
+        case .constant, .column, .parameter, .convert, .outerColumn, .subquery: throw JedError("XX000", "invalid expression dispatch")
         }
     }
 

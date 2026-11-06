@@ -32,8 +32,43 @@ extension CatalogDDL {
                 isConstraint: true, root: PageSealer.nullReference(snapshot.pool.codec)))
             return chosen
         case .primaryKey: throw JedError("0A000", "ALTER TABLE primary-key rewrite is not yet connected")
-        case .foreignKey: throw JedError("0A000", "ALTER TABLE foreign-key validation is not yet connected")
-        case .exclude: throw JedError("0A000", "ALTER TABLE exclusion validation is not yet connected")
+        case .foreignKey(let columns, let reference):
+            let local = try keyColumns(columns, own: nil, table: table, kind: "foreign key", keyable: false, types: snapshot.types)
+            let parentName = try nameInMain(reference.table)
+            let parent: CatalogTable
+            if parentName == table.name { parent = table }
+            else if let found = image.tables.first(where: { $0.name == parentName }) { parent = found }
+            else if CatalogSQL.relationNames(image).contains(parentName) { throw JedError("42809", "\(parentName) is not a table") }
+            else { throw JedError("42P01", "table does not exist: \(parentName)") }
+            let remote: [Int]
+            if reference.columns.isEmpty {
+                guard !parent.primaryKey.isEmpty else { throw JedError("42704", "there is no primary key for referenced table \(parentName)") }
+                remote = parent.primaryKey
+            } else {
+                remote = try keyColumns(reference.columns, own: nil, table: parent, kind: "foreign key", keyable: false, types: snapshot.types)
+            }
+            guard local.count == remote.count else { throw JedError("42830", "number of referencing and referenced columns for foreign key disagree") }
+            guard uniqueCover(remote, table: parent) else { throw JedError("42830", "there is no unique constraint matching given keys for referenced table \(parentName)") }
+            for (a, b) in zip(local, remote) {
+                guard try foreignKeyPair(table.columns[a].type.resolve(snapshot.types).type, parent.columns[b].type.resolve(snapshot.types).type) else {
+                    throw JedError("42804", "foreign key constraint cannot be implemented: incompatible key column types")
+                }
+            }
+            let chosen = try name(local.map { table.columns[$0].name }, label: "fkey", relation: false)
+            let actions: [String: UInt8] = ["no action": 0, "restrict": 1, "cascade": 2, "set null": 3, "set default": 4]
+            guard let onDelete = actions[reference.onDelete], let onUpdate = actions[reference.onUpdate] else {
+                throw JedError("XX000", "unresolved foreign-key action")
+            }
+            table.foreignKeys.append(CatalogForeignKey(name: chosen, columns: local, referencedTable: parentName,
+                referencedColumns: remote, onDelete: onDelete, onUpdate: onUpdate, matchFull: reference.match == "full"))
+            return chosen
+        case .exclude(let method, let elements, let predicate):
+            let definition = try exclusionDefinition(method: method, elements: elements, predicate: predicate,
+                table: table, source: source, snapshot: snapshot, settings: settings, context: context)
+            let chosen = try name(definition.columns.map { table.columns[$0].name }, label: "excl", relation: true)
+            table.indexes.append(definition.index(chosen, root: PageSealer.nullReference(snapshot.pool.codec)))
+            table.exclusions.append(CatalogExclusion(name: chosen, index: chosen, elements: definition.elements))
+            return chosen
         default: throw JedError("42601", "invalid table constraint")
         }
     }
@@ -54,16 +89,25 @@ extension CatalogDDL {
             checks.append((check.name, resolved))
         }
         let plans = try table.indexes.filter { added.contains($0.name) }.map {
-            try OrderedIndexPlan.resolve(table: table, index: $0, snapshot: snapshot, settings: settings, context: context)
+            try StoredIndexPlan.resolve(table: table, index: $0, snapshot: snapshot, settings: settings, context: context)
         }
         var entries = [[[UInt8]]](repeating: [], count: plans.count)
         var unique = Array(repeating: Set<[UInt8]>(), count: plans.count)
+        let foreign = try table.foreignKeys.filter { added.contains($0.name) }.sorted { $0.name < $1.name }.map {
+            try ForeignKeyValidation.Plan(child: table, foreign: $0, snapshot: snapshot,
+                parent: $0.referencedTable == table.name ? table : nil)
+        }
+        let exclusions = try table.exclusions.filter { added.contains($0.name) }.sorted { $0.name < $1.name }.map {
+            try ExclusionValidation(table: table, definition: $0, snapshot: snapshot, settings: settings, context: context)
+        }
+        var rows: [ScanRecord] = []
         try ScanCost.charge(store, touched: Array(table.columns.indices), meter: context.meter)
         var scan = store.cursor(); defer { scan.close() }
         while let record = try scan.next() {
             context.meter.charge(1); try context.meter.step()
             let row = ScanRecord(record, pager: store.tree.pool?.pager)
             for ordinal in table.columns.indices { _ = try row.value(ordinal) }
+            if !foreign.isEmpty || !exclusions.isEmpty { rows.append(row) }
             var execution = context; execution.column = row.value
             for (name, expression) in checks {
                 if case .boolean(false) = try execution.evaluate(expression) { throw JedError("23514", "check constraint \(name) is violated by some row") }
@@ -74,6 +118,40 @@ extension CatalogDDL {
                     throw JedError("23505", "duplicate key value violates unique constraint \(plans[ordinal].index.name)")
                 }
                 entries[ordinal].append(prefix.bytes + record.key)
+            }
+        }
+        // ALTER validates FKs after the complete CHECK/uniqueness pass, in FK
+        // name order. Self-references use the scanned final state and charge
+        // each candidate comparison, including the successful one.
+        for plan in foreign {
+            for row in rows {
+                let probe = try plan.childProbe(row.value, context: context)
+                switch probe {
+                case .exempt: continue
+                case .missing: throw plan.violation()
+                case .key(let key):
+                    if plan.parent.name == table.name {
+                        var found = false
+                        for candidate in rows {
+                            context.meter.charge(1); try context.meter.step()
+                            if try plan.parentProbe(candidate.value, context: context) == key { found = true; break }
+                        }
+                        guard found else { throw plan.violation() }
+                    } else {
+                        guard try plan.parentExists(key, snapshot: snapshot, context: context) else { throw plan.violation() }
+                    }
+                }
+            }
+        }
+        for exclusion in exclusions {
+            let members = try rows.compactMap { try exclusion.member($0.value) }
+            for second in members.indices {
+                for first in 0..<second {
+                    context.meter.charge(1); try context.meter.step()
+                    if let a = members[second].probe, let b = members[first].probe, try exclusion.conflicts(a, b) {
+                        throw exclusion.violation(a, other: b.values, alter: true)
+                    }
+                }
             }
         }
         var built: [SQLText: TableStore] = [:]

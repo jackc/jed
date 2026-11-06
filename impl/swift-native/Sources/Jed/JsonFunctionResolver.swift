@@ -2,13 +2,14 @@
 /// resolved by hand. The scalar catalog still owns ordinary fixed signatures.
 internal enum JsonFunctionResolver {
     static let pathNames: Set<String> = ["jsonb_path_exists", "jsonb_path_match", "jsonb_path_query_array", "jsonb_path_query_first", "jsonb_path_exists_tz", "jsonb_path_match_tz", "jsonb_path_query_array_tz", "jsonb_path_query_first_tz"]
-    static func resolve(_ call: SQLCall, resolve: FunctionResolver.Resolve) throws -> ResolvedFunction? {
+    static func resolve(_ call: SQLCall, setReturning: Bool = false, resolve: FunctionResolver.Resolve) throws -> ResolvedFunction? {
         let name = call.name.description
+        let isPath = pathNames.contains(name) || (setReturning && ["jsonb_path_query", "jsonb_path_query_tz"].contains(name))
         let mutator = ["jsonb_set", "jsonb_insert", "jsonb_set_lax"].contains(name)
         let object = ["json_object", "jsonb_object"].contains(name)
         let strip = ["json_strip_nulls", "jsonb_strip_nulls"].contains(name)
-        guard mutator || object || strip || pathNames.contains(name) || name == "row_to_json" else { return nil }
-        if !mutator && !pathNames.contains(name), call.arguments.contains(where: { $0.name != nil }) { throw JedError("42883", "named arguments are not supported by this JSON function") }
+        guard mutator || object || strip || isPath || name == "row_to_json" else { return nil }
+        if !mutator && !isPath, call.arguments.contains(where: { $0.name != nil }) { throw JedError("42883", "named arguments are not supported by this JSON function") }
         guard !call.star, !call.distinct, call.orderBy.isEmpty, call.withinGroup.isEmpty, call.filter == nil,
               call.over == nil, call.overName == nil, call.arguments.allSatisfy({ !$0.variadic }) else { throw JedError("42883", "invalid JSON function arguments") }
         let json = TypeDescriptor(.scalar(name.hasPrefix("jsonb") ? .jsonb : .json))
@@ -19,7 +20,7 @@ internal enum JsonFunctionResolver {
             names = ["jsonb_in", "path", "replacement", name == "jsonb_insert" ? "insert_after" : "create_if_missing"]
             targets = [json, array, json, boolean]; defaults = [.boolean(name != "jsonb_insert")]; minimum = 3
             if name == "jsonb_set_lax" { names.append("null_value_treatment"); targets.append(text); defaults.append(.text(SQLText(validatedUTF8: Array("use_json_null".utf8)))) }
-        } else if pathNames.contains(name) {
+        } else if isPath {
             names = ["target", "path", "vars", "silent"]; targets = [json, TypeDescriptor(.scalar(.jsonpath)), json, boolean]
             defaults = [.jsonb(.object([])), .boolean(false)]; minimum = 2
         } else if object {

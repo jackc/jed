@@ -49,6 +49,15 @@ internal struct SessionPrivileges {
         result.revocations = revocations.filter { $0.key.function }
         return result
     }
+    /// Creation fills a newly defined table without requiring INSERT on that
+    /// target. All source relation and function checks retain their envelope.
+    func allowing(_ privileges: PrivilegeSet, on name: SQLText) -> SessionPrivileges {
+        var result = self
+        let object = Object(name: name, function: false)
+        result.grants[object, default: []].formUnion(privileges)
+        result.revocations[object]?.subtract(privileges)
+        return result
+    }
     func require(_ privileges: PrivilegeSet, on name: SQLText, function: Bool = false) throws {
         let object = Object(name: name, function: function)
         let effective = (function ? PrivilegeSet.execute : defaults).union(grants[object] ?? []).subtracting(revocations[object] ?? [])

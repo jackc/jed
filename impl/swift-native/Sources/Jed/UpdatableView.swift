@@ -135,4 +135,120 @@ internal struct UpdatableView {
         }
         return result
     }
+
+    /// A caller supplies the physical old/new row. A computed output remains an
+    /// expression at every level and is evaluated once per reference, including
+    /// volatile outputs used several times by a predicate or RETURNING list.
+    func value(_ column: Int, level: Int = 0, base: @escaping (Int) throws -> SQLValue,
+               context: ExpressionContext) throws -> SQLValue {
+        if level == layers.count { return try base(column) }
+        guard layers[level].projections.indices.contains(column) else { throw JedError("XX000", "view column is outside its projection") }
+        var row = context
+        row.column = { try self.value($0, level: level + 1, base: base, context: context) }
+        return try row.evaluate(layers[level].projections[column])
+    }
+    func physicalColumns(_ columns: Set<Int>, level: Int = 0) -> Set<Int> {
+        var result: Set<Int> = []
+        var pending = columns.map { (ResolvedExpression(type: nil, node: .column($0), position: 0), level) }
+        while let (expression, depth) = pending.popLast() {
+            if case .column(let index) = expression.node {
+                if depth == layers.count { result.insert(index) }
+                else if layers[depth].projections.indices.contains(index) { pending.append((layers[depth].projections[index], depth + 1)) }
+            } else {
+                if case .subquery(let query) = expression.node {
+                    pending += query.outerReferences.filter { $0.depth == 1 }.map {
+                        (ResolvedExpression(type: nil, node: .column($0.index), position: 0), depth)
+                    }
+                }
+                pending += StoredExpressionDependencies.children(expression).map { ($0, depth) }
+            }
+        }
+        return result
+    }
+    func physicalColumns(_ expression: ResolvedExpression, level: Int) -> Set<Int> {
+        var columns: Set<Int> = []
+        StoredExpressionDependencies.walk([expression]) {
+            if case .column(let index) = $0.node { columns.insert(index) }
+            if case .subquery(let query) = $0.node { columns.formUnion(query.outerReferences.filter { $0.depth == 1 }.map(\.index)) }
+        }
+        return physicalColumns(columns, level: level)
+    }
+    /// Prepare the expressions that a textual view expansion would contain.
+    /// Traversal substitutes only references to this enclosing scope; inner
+    /// query-local columns remain local. RETURNING normalizes its old/new slot
+    /// ordinals at the entry scope and drops the absent side's constant NULLs.
+    func prepare(_ expressions: [ResolvedExpression], level: Int = 0, context: ExpressionContext,
+                 column: (Int) -> Int? = { $0 }) throws {
+        func visit(_ expression: ResolvedExpression, level: Int, queryDepth: Int,
+                   column: (Int) -> Int?) throws {
+            let index: Int?
+            switch expression.node {
+            case .column(let value) where queryDepth == 0: index = column(value)
+            case .outerColumn(let reference) where queryDepth > 0 && reference.depth == queryDepth: index = column(reference.index)
+            default: index = nil
+            }
+            if let index, level < layers.count, layers[level].projections.indices.contains(index) {
+                try visit(layers[level].projections[index], level: level + 1, queryDepth: 0, column: { $0 })
+            }
+            for child in StoredExpressionDependencies.children(expression) {
+                try visit(child, level: level, queryDepth: queryDepth, column: column)
+            }
+            if case .subquery(let query) = expression.node {
+                for child in query.plan.expressions { try visit(child, level: level, queryDepth: queryDepth + 1, column: column) }
+                try context.subqueries.prepare([expression], context: context)
+            }
+        }
+        for expression in expressions { try visit(expression, level: level, queryDepth: 0, column: column) }
+    }
+    func prepareChecks(context: ExpressionContext) throws {
+        for check in checked { try prepare([check.expression], level: check.level, context: context) }
+    }
+    /// Only scan-recognized nodes need physical remapping. Other nodes stay
+    /// opaque to BaseScanPlan; their execution still uses the original scope.
+    func scanExpression(_ input: ResolvedExpression, level: Int = 0) -> ResolvedExpression {
+        var output = input
+        switch input.node {
+        case .column(let index) where level < layers.count:
+            guard layers[level].projections.indices.contains(index) else { return input }
+            return scanExpression(layers[level].projections[index], level: level + 1)
+        case .binary(let operation, let a, let b, let type):
+            output.node = .binary(operation, scanExpression(a, level: level), scanExpression(b, level: level), type)
+        case .convert(let value, let type): output.node = .convert(scanExpression(value, level: level), type)
+        default: break
+        }
+        return output
+    }
+    var filters: [(expression: ResolvedExpression, level: Int)] {
+        layers.indices.reversed().compactMap { index in layers[index].predicate.map { ($0, index + 1) } }
+    }
+    var checked: [(name: SQLText, expression: ResolvedExpression, level: Int)] {
+        var cascade = false, result: [(SQLText, ResolvedExpression, Int)] = []
+        for (index, layer) in layers.enumerated() {
+            cascade = cascade || layer.view.checkOption == 2
+            if cascade || layer.view.checkOption != 0, let predicate = layer.predicate { result.append((layer.view.name, predicate, index + 1)) }
+        }
+        return Array(result.reversed())
+    }
+    func matches(_ expression: ResolvedExpression, level: Int, base: @escaping (Int) throws -> SQLValue,
+                 context: ExpressionContext) throws -> Bool {
+        var row = context
+        row.column = { try self.value($0, level: level, base: base, context: context) }
+        return try row.matches(expression)
+    }
+    func validateNew(_ base: @escaping (Int) throws -> SQLValue, context: ExpressionContext) throws {
+        for check in checked {
+            guard try matches(check.expression, level: check.level, base: base, context: context) else {
+                throw JedError("44000", "new row violates check option for view \(check.name)")
+            }
+        }
+    }
+    func requireSelect(_ settings: SessionSettings) throws {
+        guard let first = layers.first else { return }
+        try settings.privileges.require(.select, on: first.view.name)
+        var privileges = settings.privileges
+        for layer in layers {
+            if layer.view.securityInvoker { try privileges.require(.select, on: layer.base.name) }
+            else { privileges = privileges.withTableAccess() }
+        }
+    }
 }

@@ -276,6 +276,68 @@ constraint, retained intentionally to pin CryptoExtras' required transitive pack
 
 ## Current integration checkpoint
 
+Checkpoint `b7324c9b` saves the 250-test integration below, local-only and unpushed.
+The Linux page-service slice is checkpointed separately at `40c9c6a4`, also local-only.
+Work after it remains active. The latest complete integrated run (20:50 CST) ran
+**287 tests in 118.181 seconds**: all **286 tests outside the expanded whole-file
+SQL test passed**. That SQL test ran **187/749 files, 5,038 records (3,100 statements /
+1,938 queries), 7,800 cells, 482 cost / 874 name / 11 type assertions; 91 failures**.
+All records in every admitted file execute; no failing file or expectation was
+removed. Remaining failures include writable CTEs, ON CONFLICT, ALTER column
+rewrites, introspection/temp domains, EXPLAIN and two multi-table join costs.
+The 20:43 SQL-only run had 92 failures; the subsequent DISTINCT ON aggregate-key
+identity correction removed one. Earlier 178-file and 166-file runs had 124 and
+117 failures respectively. No frozen expected outputs changed.
+
+The selected ordinary and ordered-set/hypothetical window files, basic/nonrecursive
+CTEs, recursive structure/SEARCH/CYCLE, all 11 subquery files, composite casts,
+JSON record/populate, both JSON_TABLE files, JSON Unicode errors, DISTINCT ON and
+main CTAS file pass. CTAS/SELECT INTO remains incomplete for temporary domains and
+writable CTEs. Real columnar projection/group lanes, bounded top-k and eager-filter
+lifetimes now satisfy the selected query-memory cases apart from EXPLAIN gaps.
+Subqueries use isolated lexical scopes, statement-shared initplan results,
+depth-aware outer references and explicit Q1 result lifetimes. Independent review
+corrected scalar-subquery collation provenance and replaced recursive ordinary
+expression initplan walking with an explicit stack.
+
+The row-valued corpus pins IN-subquery as a flat node visiting every result
+element; grammar.md §26's older OR-chain description is stale (literal IN-lists
+still use an OR chain). Recursive UNION hash admission follows the frozen core
+batch schedule (sum payloads before the cost guard); prose suggesting a per-key
+guard needs a separate shared-spec audit.
+
+Linux automatic owner/client activation is now connected. Native tests cover 27
+frozen frames, two owner records, 14 malformed vectors, streamed deltas, Unix
+framing/close wakeup, encrypted foreign commits, request multiplexing, retained
+invalidations, role-epoch revocation, real-process election/promotion, read-only
+handoff, lost-ack resolution and writer timeout/cancellation during election.
+Independent review identified unsynchronized core publication and admission waits
+that could outlive writer deadlines; both were corrected before this run. A first
+full run was stopped after diagnosing the process-test helper's fixed-fill pipe
+read; it now uses one polled native read. The focused automatic/role/file-host gate
+then passed all 16 tests before the completed full run. Post-ack storage maintenance
+and the shared process/simulation adapters remain outstanding.
+
+The current snapshot fingerprint is
+`7a1bcf53fefb01e43484e760a68d9f61faabbc0c15c35d2b1da39c4c90db8043`.
+Latest command: `stdbuf -oL -eL mise run swift-native:test`, log
+`/tmp/jed-swift-native-full-187-fixed.log`. The adapter reports every mismatch;
+XCTest records the first 40 plus one summary failure while printing the remaining
+51. The earlier 43 selected non-SQL tests (including CTAS privileges/parameters,
+foreign keys and host boundaries) also passed. Scope rows remain unverified until
+the full applicable acceptance evidence is available.
+A final independent accounting review found JSON_TABLE admitted Q1 rows while
+later column expressions were still evaluating. Production now completes first,
+then generated-row charges run, then the relation admits Q1, as memory.md §5.1
+requires. The follow-up `mise run swift-native:test --filter
+'SQLCorpusBoundary|CreateTableAsBoundary'` completed at 20:55 CST: both CTAS boundary
+tests and two corpus-adapter boundary tests passed; the 187-file SQL run retained
+91 failures with unchanged counts. Log: `/tmp/jed-swift-native-sql-187-json-admission.log`.
+Review also identified the same delayed-admission requirement for other bounded
+SRFs and a missing general statement privilege-preflight phase (a denied-source
+CTAS must reject before an invalid target name); these are outstanding corrections.
+
+
 Verified integration (2026-11-05 19:24 CST): **250 tests passed, zero failures**
 with `mise run swift-native:test` (82.999 seconds). The public
 Database/Session/Rows path now executes DDL, INSERT/UPDATE/DELETE, ordered and bounded
@@ -355,8 +417,8 @@ clock/seed/variables expression probes added afterwards pass in the 250-test run
 ## Next steps
 
 1. Active delegated slices: Linux protocol-v2 page service (`host_inventory`),
-   ordered-set/hypothetical aggregates and corpus admission (`crypto_audit`), views and
-   ALTER/constraint DDL (`scope_inventory`). Root owns query/DML/session integration
+   columnar/memory/join planning and corpus admission (`crypto_audit`), views and
+   FK actions/ALTER/constraint DDL (`scope_inventory`). Root owns query/session integration
    and verification. Keep source publication coordinated with integrated checks.
    The experiment is not frozen.
 2. Extend the whole-file corpus gate and connected execution paths. Audit cost

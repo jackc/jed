@@ -12,6 +12,13 @@ internal final class CompoundQueryPlan {
         case .nested(let child): child.expressions
         }
     }
+    var foldExpressions: [ResolvedExpression] {
+        switch body {
+        case .set(_, _, let left, let right): left.foldExpressions + right.foldExpressions
+        case .values(let rows, _): rows.flatMap { $0 }
+        case .nested(let child): child.foldExpressions
+        }
+    }
     func context(from parent: ExpressionContext) -> ExpressionContext {
         var context = parent; context.patterns = PatternExecution()
         StatementServices(settings: settings, meter: parent.meter).install(into: &context)
@@ -20,6 +27,7 @@ internal final class CompoundQueryPlan {
     static func resolve(_ query: SQLQuery, snapshot: DomainSnapshot, settings: SessionSettings,
                         scalar: ScalarCasts.Context, using shared: ExpressionResolver?, finalizeParameters: Bool) throws -> SelectPlan {
         let resolver = shared ?? ExpressionResolver(composites: snapshot.types, scalar: scalar)
+        resolver.queryScope = SubqueryScope(snapshot: snapshot, settings: settings)
         resolver.hostFunctions = settings.environment.signatures; resolver.unicode = settings.environment.unicode
         resolver.checkFunction = { try settings.privileges.require(.execute, on: $0, function: true) }
         let body: Body, columns: [ResultColumn], projections: [ResolvedExpression]

@@ -2,6 +2,10 @@
 /// output-name disambiguation, never for evaluating or simplifying expressions.
 internal enum ExpressionIdentity {
     static func same(_ a: ResolvedExpression, _ b: ResolvedExpression) -> Bool {
+        same(a, b, columns: nil)
+    }
+    static func same(_ a: ResolvedExpression, _ b: ResolvedExpression, columns: ((Int, Int) -> Bool)?) -> Bool {
+        func same(_ a: ResolvedExpression, _ b: ResolvedExpression) -> Bool { Self.same(a, b, columns: columns) }
         guard a.type == b.type else { return false }
         func list(_ a: [ResolvedExpression], _ b: [ResolvedExpression]) -> Bool {
             a.count == b.count && zip(a, b).allSatisfy(same)
@@ -10,12 +14,15 @@ internal enum ExpressionIdentity {
             if let a, let b { return same(a, b) }; return a == nil && b == nil
         }
         switch (a.node, b.node) {
+        case (.outerColumn(let x), .outerColumn(let y)): return x == y
+        case (.subquery(let x), .subquery(let y)): return x === y
         case (.constant(let x), .constant(let y)):
             if x.isNull || y.isNull { return x.isNull && y.isNull }
             guard let type = a.type else { return false }
             guard let x = try? ValueCodec.encodeRawBody(x, type: type), let y = try? ValueCodec.encodeRawBody(y, type: type) else { return false }
             return x == y
-        case (.column(let x), .column(let y)), (.parameter(let x), .parameter(let y)): return x == y
+        case (.column(let x), .column(let y)): return columns?(x, y) ?? (x == y)
+        case (.parameter(let x), .parameter(let y)): return x == y
         case (.currentTimestamp, .currentTimestamp), (.currentDate, .currentDate): return true
         case (.dateInput(let x), .dateInput(let y)): return x == y
         case (.cast(let x, let xt, let xm), .cast(let y, let yt, let ym)): return xt == yt && xm == ym && same(x, y)

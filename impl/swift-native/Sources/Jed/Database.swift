@@ -215,7 +215,9 @@ public final class Session {
         try checkOpen()
         do {
             let text = try SQLText(sql); try settings.checkSQLLength(text)
-            let statement = try SQLParser(utf8: text.utf8).parse()
+            var statement = try SQLParser(utf8: text.utf8).parse()
+            if case .with = statement, let query = statement.queryBody { statement = .query(query) }
+            statement = CreateTableAs.normalize(statement)
             switch statement {
             case .begin, .commit, .rollback, .savepoint, .release, .rollbackTo:
                 guard parameters.isEmpty else { throw JedError("42601", "transaction control takes no bind parameters") }
@@ -323,7 +325,10 @@ public final class Session {
         let sequences = SequenceExecution(snapshot: working, history: sequenceHistory, meter: meter, writable: true)
         sequences.install(into: &context)
         let result: MutationResult
-        if let mutation = try MutationExecutor.execute(statement, snapshot: &working, settings: settings,
+        if case .createTable(let definition) = statement, definition.query != nil {
+            result = try CreateTableAs.execute(definition, snapshot: &working, settings: settings,
+                                              context: context, parameters: parameters)
+        } else if let mutation = try MutationExecutor.execute(statement, snapshot: &working, settings: settings,
                                                         context: context, parameters: parameters) { result = mutation }
         else if let tag = try CatalogDDL.execute(statement, source: source, snapshot: &working, settings: settings,
                                                 context: context, meter: meter) {

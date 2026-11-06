@@ -16,13 +16,14 @@ internal final class GroupedSelectExecution {
     }
     private struct Output {
         let row: [SQLValue]
-        let bytes: Int64
+        var bytes: Int64
         let ordinal: Int
         var order: [SQLValue] = []
     }
     private let plan: SelectPlan
     private let aggregate: AggregateQueryPlan
     private let context: ExpressionContext
+    private let rawOutput: Bool
     private var sources: [[SQLValue]] = []
     private var groups: [Group] = []
     private var lookup: [[UInt8]: Int] = [:]
@@ -33,8 +34,17 @@ internal final class GroupedSelectExecution {
     private var position = 0
     private var emitted: Int64 = 0
 
-    init(plan: SelectPlan, aggregate: AggregateQueryPlan, context: ExpressionContext) {
-        self.plan = plan; self.aggregate = aggregate; self.context = context
+    init(plan: SelectPlan, aggregate: AggregateQueryPlan, context: ExpressionContext, rawOutput: Bool = false) {
+        self.plan = plan; self.aggregate = aggregate; self.context = context; self.rawOutput = rawOutput
+    }
+    func nextRaw() throws -> (row: [SQLValue], bytes: Int64)? {
+        guard rawOutput else { throw JedError("XX000", "grouped raw output was not requested") }
+        if !started { try prepare(); started = true }
+        guard position < outputs.count else { return nil }
+        let output = outputs[position]; position += 1
+        outputs[position - 1] = Output(row: [], bytes: 0, ordinal: output.ordinal)
+        release(output.bytes)
+        return (output.row, output.bytes)
     }
     func next() throws -> [SQLValue]? {
         if !started { try prepare(); started = true }
@@ -56,9 +66,10 @@ internal final class GroupedSelectExecution {
     }
     private func prepare() throws {
         let meter = context.meter
+        let columnar = ColumnarExecution.aggregation(plan, aggregate, context)
         let input = SelectInput(plan: plan, context: context)
         defer { input.close() }
-        while let row = try input.next() { try source(row) }
+        if !columnar { while let row = try input.next() { try source(row) } }
         // WHERE consumes the complete source materialization, preserving error
         // and memory visitation before any aggregate argument is evaluated.
         if let predicate = plan.predicate {
@@ -85,13 +96,15 @@ internal final class GroupedSelectExecution {
         for members in aggregate.sets {
             let membership = Set(members)
             if members.isEmpty { _ = try create(keys: Array(repeating: .null, count: aggregate.keys.count), selected: [], key: []) }
-            for row in sources {
+            func fold(_ row: [SQLValue]) throws {
             try meter.checkpoint()
             var current = context; current.column = { row[$0] }
             let allKeys = aggregate.keyColumns.map { row[$0] }
             let keys = members.map { allKeys[$0] }
-            let payload = keys.reduce(Int64(0)) { saturatingAdd($0, MemorySizes.payload($1)) }
-            if payload > 0 { meter.charge(payload); try meter.guardCost() }
+            for value in keys {
+                let payload = MemorySizes.payload(value)
+                if payload > 0 { meter.charge(payload); try meter.guardCost() }
+            }
             let key = keys.isEmpty ? [] : try ValueEqualityKey.encode(keys)
             let index: Int
             if let existing = lookup[key] { index = existing }
@@ -99,10 +112,20 @@ internal final class GroupedSelectExecution {
             let group = groups[index]
             for (ordinal, call) in aggregate.calls.enumerated() {
                 if let filter = call.filter, try !current.matches(filter) { continue }
+                meter.charge(1)
+                if AggregateOrderedSet.hypothetical.contains(call.plan.name), !call.plan.withinGroup.isEmpty {
+                    var arguments: [SQLValue] = []
+                    for (index, expression) in call.arguments.enumerated() {
+                        let value = try current.evaluate(expression)
+                        try AggregateOrderedSet.chargeKey(value, type: call.plan.withinGroup[index].type, context: current)
+                        arguments.append(value)
+                    }
+                    try group.states[ordinal].fold(arguments)
+                    continue
+                }
                 // Multi-argument aggregates use one logical ROW operand.
-                if call.arguments.count > 1 { meter.charge(1); try meter.step() }
+                if call.arguments.count > 1 && call.plan.withinGroup.isEmpty { meter.charge(1); try meter.step() }
                 let arguments = try call.arguments.map { try current.evaluate($0) }
-                meter.charge(1); try meter.guardCost()
                 let ordered = try group.ordering[ordinal]?.tuple(arguments: arguments, current: current)
                 if call.distinct {
                     let operand = arguments.count == 1 ? arguments[0] : .composite(arguments)
@@ -120,11 +143,23 @@ internal final class GroupedSelectExecution {
                 else { try group.states[ordinal].fold(arguments) }
             }
         }
+            if columnar {
+                while let row = try input.next() {
+                    var current = context; current.column = { row[$0] }
+                    if let predicate = plan.predicate, try !current.matches(predicate) { continue }
+                    try fold(row)
+                }
+            } else { for row in sources { try fold(row) } }
+            var finalized: [Output] = []
         for group in groups {
             for index in group.states.indices { try group.ordering[index]?.fold(into: group.states[index]) }
-            let results = try group.states.map { try $0.finish() }
             var row = Array(repeating: SQLValue.null, count: aggregate.layoutWidth)
             for (index, value) in zip(aggregate.keyColumns, group.keys) { row[index] = value }
+            let directContext = unmeteredGroup(row)
+            let results = try group.states.indices.map { index in
+                let direct = try aggregate.calls[index].direct.map { try directContext.evaluate($0) }
+                return try group.states[index].finish(direct: direct)
+            }
             row.append(contentsOf: results)
             let masks = aggregate.grouping.map { positions -> SQLValue in
                 .integer(positions.reduce(Int64(0)) { ($0 << 1) | (membership.contains($1) ? 0 : 1) })
@@ -134,9 +169,11 @@ internal final class GroupedSelectExecution {
             for state in group.states { state.close() }
             for ordering in group.ordering { ordering?.close() }
             group.seen = []; release(group.reserved); group.reserved = 0
-            try reserve(bytes)
-            outputs.append(Output(row: row, bytes: bytes, ordinal: outputs.count))
+            let output = Output(row: row, bytes: bytes, ordinal: outputs.count + finalized.count)
+            if columnar { finalized.append(output) }
+            else { try reserve(bytes); outputs.append(output) }
         }
+            for output in finalized { try reserve(output.bytes); outputs.append(output) }
             groups = []; lookup = [:]
         }
         sources = []; release(sourceBytes); sourceBytes = 0
@@ -148,8 +185,10 @@ internal final class GroupedSelectExecution {
             }
             outputs = kept
         }
-        try sort()
-        position = Int(min(Int64(outputs.count), plan.offset))
+        if !rawOutput {
+            try sort()
+            position = Int(min(Int64(outputs.count), plan.offset))
+        }
     }
     private func create(keys: [SQLValue], selected: [SQLValue], key: [UInt8]) throws -> Int {
         let bytes = selected.reduce(GeneratedSpec.memoryEntry) { saturatingAdd($0, MemorySizes.value($1)) }
@@ -165,21 +204,34 @@ internal final class GroupedSelectExecution {
         current.column = { index in row[index >= 0 ? index : groupingBase - index - 1] }
         return current
     }
+    private func unmeteredGroup(_ row: [SQLValue]) -> ExpressionContext {
+        let meter = CostMeter(resources: context.meter.resources, cancellation: context.meter.cancellation)
+        var current = ExpressionContext(meter: meter, parameters: context.parameters, column: { row[$0] })
+        current.scalar = context.scalar; current.scalar.meter = meter
+        current.collatedKey = context.collatedKey; current.functions = context.functions; current.patterns = context.patterns
+        current.outerRows = context.outerRows; current.subqueries = context.subqueries
+        current.ctes = context.ctes
+        return current
+    }
     private func sort() throws {
         guard !plan.order.isEmpty else { return }
         let meter = context.meter
         for index in outputs.indices {
             let row = outputs[index].row
             let current = groupedContext(row)
-            for term in plan.order {
+            outputs[index].order = Array(repeating: .null, count: plan.order.count)
+            for ordinal in plan.keyEvaluationOrder {
+                let term = plan.order[ordinal]
                 let value = try current.evaluate(term.expression)
-                if case .column = term.expression.node {} else { try reserve(MemorySizes.value(value)) }
-                outputs[index].order.append(value)
+                if case .column = term.expression.node {} else {
+                    let bytes = MemorySizes.value(value); try reserve(bytes); outputs[index].bytes = saturatingAdd(outputs[index].bytes, bytes)
+                }
+                outputs[index].order[ordinal] = value
             }
         }
         var decorations: Int64 = 0
         for index in outputs.indices {
-            for ordinal in plan.order.indices {
+            for ordinal in plan.keyEvaluationOrder {
                 let value = outputs[index].order[ordinal], type = plan.order[ordinal].type
                 if let name = type.collation, name.description != "C", !value.isNull, ExpressionCollation.collatable(type.type) {
                     let units: Int64
@@ -213,6 +265,14 @@ internal final class GroupedSelectExecution {
                 if result != 0 { return term.descending ? result > 0 : result < 0 }
             }
             return a.ordinal < b.ordinal
+        }
+        if let distinct = plan.distinctOn {
+            var kept: [Output] = []
+            for output in outputs {
+                if let previous = kept.last, try distinct.same(previous.order, output.order, order: plan.order) { release(output.bytes) }
+                else { kept.append(output) }
+            }
+            outputs = kept
         }
         for index in outputs.indices { outputs[index].order = [] }
         release(decorations)

@@ -13,7 +13,6 @@ extension CatalogDDL {
     static func alterSequence(_ definition: SQLAlterSequence, snapshot: inout DomainSnapshot) throws {
         let name = try nameInMain(definition.name)
         guard let position = snapshot.catalog.sequences.firstIndex(where: { $0.name == name }) else {
-            if CatalogSQL.relationNames(snapshot.catalog).contains(name) { throw JedError("42809", "\(name) is not a sequence") }
             if definition.ifExists { return }
             throw JedError("42P01", "sequence does not exist: \(name)")
         }
@@ -55,11 +54,10 @@ extension CatalogDDL {
     }
     static func dropSequences(_ definition: SQLDrop, snapshot: inout DomainSnapshot) throws {
         var targets: Set<SQLText> = []
-        let catalog = snapshot.catalog, relations = CatalogSQL.relationNames(snapshot.catalog)
+        let catalog = snapshot.catalog
         for input in definition.names {
             let name = try nameInMain(input)
             if catalog.sequences.contains(where: { $0.name == name }) { targets.insert(name) }
-            else if relations.contains(name) { throw JedError("42809", "\(name) is not a sequence") }
             else if !definition.ifExists { throw JedError("42P01", "sequence does not exist: \(name)") }
         }
         if targets.isEmpty { return }

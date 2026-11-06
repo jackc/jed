@@ -54,7 +54,8 @@ final class DatabaseBoundaryTests: XCTestCase {
     }
     func testCollectorAdmissionFailureAbortsTransactionAndClosesPin() throws {
         let database = try Database(), session = try database.session()
-        session.maxQueryMemoryBytes = 1
+        // The virtual source row is 32 bytes; collecting the result needs 64 more.
+        session.maxQueryMemoryBytes = 32
         try session.begin(writable: false)
         let streamed = try session.query("SELECT 1")
         XCTAssertNotNil(try streamed.next()); streamed.close()

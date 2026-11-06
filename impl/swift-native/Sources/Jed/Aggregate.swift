@@ -12,9 +12,41 @@ internal struct AggregatePlan {
     static func resolve(name: String, inputTypes: [TypeDescriptor], star: Bool = false,
                         withinGroup: [AggregateOrder] = [], directTypes: [TypeDescriptor] = []) throws -> Self {
         let name = name.lowercased(), lookup = star && name == "count" ? "count_star" : name
-        guard withinGroup.isEmpty, directTypes.isEmpty else {
-            throw JedError("0A000", "ordered-set aggregate kernels are not yet connected")
+        if !withinGroup.isEmpty {
+            guard !star else { throw JedError("42883", "aggregate does not exist: \(name)") }
+            let result: TypeDescriptor
+            if AggregateOrderedSet.hypothetical.contains(name) {
+                guard inputTypes.count == withinGroup.count, directTypes.count == inputTypes.count,
+                      zip(inputTypes, directTypes).allSatisfy({ hypotheticalCompatible($1.type, $0.type) }) else {
+                    throw JedError("42883", "aggregate does not exist: \(name)")
+                }
+                for type in inputTypes { try TypeRules.comparable(type.type, type.type) }
+                result = TypeDescriptor(.scalar(name == "rank" || name == "dense_rank" ? .i64 : .f64))
+            } else {
+                guard AggregateOrderedSet.ordered.contains(name), inputTypes.count == 1, withinGroup.count == 1,
+                      directTypes.count == (name == "mode" ? 0 : 1) else { throw JedError("42883", "aggregate does not exist: \(name)") }
+                try TypeRules.comparable(inputTypes[0].type, inputTypes[0].type)
+                let base: TypeDescriptor
+                if name == "percentile_cont" {
+                    guard accepts("numeric", inputTypes[0].type) || inputTypes[0].type == .scalar(.interval) else {
+                        throw JedError("42883", "aggregate does not exist: \(name)")
+                    }
+                    base = TypeDescriptor(inputTypes[0].type == .scalar(.interval) ? .scalar(.interval) : .scalar(.f64))
+                } else { base = inputTypes[0] }
+                if let direct = directTypes.first {
+                    let numeric: SQLType
+                    if case .array(let element) = direct.type { numeric = element }
+                    else { numeric = direct.type }
+                    guard accepts("numeric", numeric) else { throw JedError("42883", "aggregate does not exist: \(name)") }
+                    if case .array = direct.type { result = TypeDescriptor(.array(base.type)) }
+                    else { result = base }
+                } else { result = base }
+            }
+            return Self(metadata: FunctionSpecFact(category: "aggregate", name: name, kind: "aggregate", metadata: [:]),
+                        name: name, inputTypes: inputTypes, directTypes: directTypes,
+                        withinGroup: withinGroup, resultType: result, star: false)
         }
+        guard directTypes.isEmpty else { throw JedError("42883", "aggregate does not exist: \(name)") }
         if ["json_object_agg", "jsonb_object_agg", "json_object_agg_unique", "jsonb_object_agg_unique"].contains(name) {
             guard !star, inputTypes.count == 2 else { throw JedError("42883", "aggregate does not exist: \(name)") }
             let result = TypeDescriptor(.scalar(name.hasPrefix("jsonb") ? .jsonb : .json))
@@ -53,6 +85,12 @@ internal struct AggregatePlan {
         default: return scalar.name == family
         }
     }
+    static func hypotheticalCompatible(_ argument: SQLType, _ key: SQLType) -> Bool {
+        guard case .scalar(let a) = argument, case .scalar(let b) = key else { return false }
+        if a.integerWidth != nil && b.integerWidth != nil { return true }
+        if [ScalarType.f32, .f64].contains(a) && [ScalarType.f32, .f64].contains(b) { return true }
+        return a == b && [.decimal, .text, .boolean, .bytea, .uuid, .timestamp, .timestamptz, .date, .interval].contains(a)
+    }
     func makeState(context: ExpressionContext) -> AggregateState { AggregateState(plan: self, context: context) }
 }
 
@@ -80,12 +118,14 @@ internal final class AggregateState {
     private var float = AggregateFloatSum()
     private var moments = AggregateFloatMoments()
     private var collection: AggregateCollection?
+    private var orderedSet: AggregateOrderedSet?
 
     init(plan: AggregatePlan, context: ExpressionContext) {
         self.plan = plan; self.context = context
         if AggregateCollection.names.contains(plan.name) { collection = AggregateCollection(plan: plan, context: context) }
+        if !plan.withinGroup.isEmpty { orderedSet = AggregateOrderedSet(plan: plan, context: context) }
     }
-    func close() { closed = true; current = .null; collection?.close(); collection = nil }
+    func close() { closed = true; current = .null; collection?.close(); collection = nil; orderedSet?.close(); orderedSet = nil }
     deinit { close() }
     private func increment() throws {
         guard count < Int64.max else { throw JedError("22003", "aggregate count out of range") }; count += 1
@@ -93,6 +133,7 @@ internal final class AggregateState {
     func fold(_ values: [SQLValue]) throws {
         guard !closed else { throw JedError("55000", "aggregate state is closed") }
         guard values.count == plan.inputTypes.count else { throw JedError("XX000", "aggregate argument width mismatch") }
+        if let orderedSet { try orderedSet.fold(values); return }
         if let collection { try collection.fold(values); return }
         let name = plan.name
         if name == "count_star" { try increment(); return }
@@ -156,8 +197,18 @@ internal final class AggregateState {
         default: throw JedError("0A000", "aggregate kernel is not yet connected: \(name)")
         }
     }
+    /// Only COUNT has an exact inverse across a moving window boundary.
+    func unfold(_ values: [SQLValue]) throws {
+        guard !closed, plan.name == "count" || plan.name == "count_star",
+              values.count == plan.inputTypes.count else { throw JedError("XX000", "aggregate cannot remove a frame operand") }
+        if plan.name == "count_star" || values.first?.isNull == false {
+            guard count > 0 else { throw JedError("XX000", "window count underflow") }
+            count -= 1
+        }
+    }
     func finish(direct: [SQLValue] = []) throws -> SQLValue {
         guard !closed else { throw JedError("55000", "aggregate state is closed") }
+        if let orderedSet { return try orderedSet.finish(direct: direct) }
         guard direct.isEmpty else { throw JedError("XX000", "ordinary aggregate has direct arguments") }
         if let collection { return try collection.finish() }
         let name = plan.name

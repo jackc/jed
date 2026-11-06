@@ -6,7 +6,7 @@ internal struct SelectPlan {
     let predicate: ResolvedExpression?
     let store: TableStore?
     let touched: [Int]
-    let parameters: [TypeDescriptor]
+    var parameters: [TypeDescriptor]
     let limit: Int64?
     let offset: Int64
     let order: [ResolvedOrderTerm]
@@ -18,15 +18,36 @@ internal struct SelectPlan {
     var relation: RelationPlan? = nil
     var productionCharge = true
     var distinct = false
+    var window: WindowQueryPlan? = nil
+    var withQuery: WithQueryPlan? = nil
+    var materializeSource = false
+    var distinctOn: DistinctOnPlan? = nil
+    var keyEvaluationOrder: [Int] { distinctOn?.evaluationOrder ?? Array(order.indices) }
 
     var expressions: [ResolvedExpression] {
-        projections + (predicate.map { [$0] } ?? []) + order.map(\.expression)
+        if let withQuery { return withQuery.expressions }
+        return projections + (predicate.map { [$0] } ?? []) + order.map(\.expression)
             + (aggregation?.expressions ?? []) + (compound?.expressions ?? []) + (relation?.expressions ?? [])
+            + (window?.expressions ?? [])
+    }
+
+    /// WITH bodies fold only after their runtime binding layer is installed.
+    var foldExpressions: [ResolvedExpression] {
+        guard withQuery == nil else { return [] }
+        return projections + (predicate.map { [$0] } ?? []) + order.map(\.expression)
+            + (aggregation?.expressions ?? []) + (window?.expressions ?? [])
+            + (compound?.foldExpressions ?? []) + (relation?.foldExpressions ?? [])
     }
 
     static func resolve(_ query: SQLQuery, snapshot: DomainSnapshot, settings: SessionSettings,
                         scalar: ScalarCasts.Context, using shared: ExpressionResolver? = nil,
                         finalizeParameters: Bool = true) throws -> SelectPlan {
+        if case .with(let clause, let child) = query.body {
+            let body = query.orderBy.isEmpty && query.limit == nil && query.offset == nil ? child
+                : SQLQuery(body: .nested(child), orderBy: query.orderBy, limit: query.limit, offset: query.offset, span: query.span)
+            return try WithQueryPlan.resolve(clause, body: body, snapshot: snapshot, settings: settings,
+                scalar: scalar, using: shared, finalizeParameters: finalizeParameters)
+        }
         if case .nested(let nested) = query.body, query.orderBy.isEmpty, query.limit == nil, query.offset == nil {
             return try resolve(nested, snapshot: snapshot, settings: settings, scalar: scalar, using: shared, finalizeParameters: finalizeParameters)
         }
@@ -34,13 +55,17 @@ internal struct SelectPlan {
             return try CompoundQueryPlan.resolve(query, snapshot: snapshot, settings: settings, scalar: scalar,
                 using: shared, finalizeParameters: finalizeParameters)
         }
-        guard select.distinctOn.isEmpty, select.windows.isEmpty, select.into == nil else {
+        guard select.into == nil else {
             throw JedError("0A000", "blocking query plan is not yet connected")
         }
         let resolver = shared ?? ExpressionResolver(composites: snapshot.types, scalar: scalar)
+        resolver.queryScope = SubqueryScope(snapshot: snapshot, settings: settings)
+        resolver.hostFunctions = settings.environment.signatures; resolver.unicode = settings.environment.unicode
+        resolver.checkFunction = { try settings.privileges.require(.execute, on: $0, function: true) }
         var source: TableStore?, scope: [ExpressionColumn] = [], primaryKey: [Int] = []
         var relation: RelationPlan?
         if select.from.count == 1, let from = select.from.first, from.joins.isEmpty, case .table(let name) = from.source,
+           (name.database != nil || resolver.cteBindings[name.name] == nil),
            snapshot.catalog.tables.contains(where: { $0.name == name.name }) {
             guard name.database == nil || name.database?.description == "main",
                   let table = snapshot.catalog.tables.first(where: { $0.name == name.name }),
@@ -61,20 +86,30 @@ internal struct SelectPlan {
         }
         let previousColumns = resolver.columns, previousTouched = resolver.referencedColumns
         let previousAggregate = resolver.resolveAggregate
+        let previousWindow = resolver.resolveWindow
         resolver.columns = scope; resolver.referencedColumns = []
         resolver.resolveAggregate = AggregateQueryPlan.forbidden
-        defer { resolver.columns = previousColumns; resolver.referencedColumns = previousTouched; resolver.resolveAggregate = previousAggregate }
+        resolver.resolveWindow = WindowQueryBuilder.forbidden
+        defer {
+            resolver.columns = previousColumns; resolver.referencedColumns = previousTouched
+            resolver.resolveAggregate = previousAggregate; resolver.resolveWindow = previousWindow
+        }
         resolver.hostFunctions = settings.environment.signatures
         resolver.unicode = settings.environment.unicode
         resolver.checkFunction = { try settings.privileges.require(.execute, on: $0, function: true) }
-        let predicate = try select.predicate.map { try resolver.resolve($0, expected: TypeDescriptor(.scalar(.boolean))) }
+        var predicate = try select.predicate.map { try resolver.resolve($0, expected: TypeDescriptor(.scalar(.boolean))) }
         guard predicate?.type == nil || predicate?.type?.type == .scalar(.boolean) else { throw JedError("42804", "WHERE requires a boolean expression") }
-        let aggregation = try AggregateQueryPlan.resolve(select, order: query.orderBy, resolver: resolver, scope: scope, primaryKey: primaryKey)
+        if let relation { predicate = RelationPushdown.whereFilter(predicate, into: relation) }
+        let windows = try WindowQueryBuilder(select: select, resolver: resolver)
+        let orderSyntax = query.orderBy + select.distinctOn.map { SQLOrderTerm(expression: $0, span: $0.span) }
+        let aggregation = try AggregateQueryPlan.resolve(select, order: orderSyntax, resolver: resolver, scope: scope, primaryKey: primaryKey,
+            functionalDependencies: relation?.functionalDependencies ?? [], windows: windows)
         var projections: [ResolvedExpression] = [], columns: [ResultColumn] = []
         if let aggregation { projections = aggregation.projections; columns = aggregation.columns }
         for item in aggregation == nil ? select.items : [] {
             if item.star {
-                let selected = scope.filter { item.qualifier == nil || item.qualifier == $0.qualifier }
+                var selected = scope.filter { !$0.hiddenFromStar && (item.qualifier == nil ? !$0.qualifiedOnly : item.qualifier == $0.qualifier) }
+                if item.qualifier != nil { selected.sort { $0.index < $1.index } }
                 guard !selected.isEmpty else { throw JedError(item.qualifier == nil ? "42601" : "42P01", "wildcard has no matching relation") }
                 for column in selected {
                     resolver.referencedColumns.insert(column.index)
@@ -83,13 +118,23 @@ internal struct SelectPlan {
                     columns.append(ResultColumn(name: column.name, type: column.unresolved ? nil : column.type))
                 }
             } else if let syntax = item.expression {
+                if case .field(let source, nil) = syntax.kind {
+                    let child = try resolver.resolve(source)
+                    guard let type = child.type?.type, let fields = TypeRules.fields(type) else { throw JedError("42809", "record wildcard requires a composite type") }
+                    for (index, field) in fields.enumerated() {
+                        projections.append(ResolvedExpression(type: field.descriptor, node: .field(child, index), position: syntax.position))
+                        columns.append(ResultColumn(name: field.name, type: field.descriptor))
+                    }
+                    continue
+                }
                 let expression = try resolver.resolve(syntax)
                 columns.append(ResultColumn(name: item.alias ?? outputName(syntax), type: expression.type))
                 projections.append(expression)
             }
         }
         guard !projections.isEmpty else { throw JedError("42601", "SELECT requires a target list") }
-        let order = try aggregation?.order ?? query.orderBy.map { term -> ResolvedOrderTerm in
+        windows.reuseResults = true
+        let resolvedOrder = try aggregation?.order ?? orderSyntax.map { term -> ResolvedOrderTerm in
             let expression: ResolvedExpression
             if case .number(let spelling) = term.expression.kind, let ordinal = Int(spelling) {
                 guard ordinal > 0 && ordinal <= projections.count else { throw JedError("42P10", "ORDER BY position is not in select list") }
@@ -108,14 +153,24 @@ internal struct SelectPlan {
             return ResolvedOrderTerm(expression: expression, type: type, descending: term.descending,
                                      nullsFirst: term.nullsFirst ?? term.descending)
         }
+        var order = Array(resolvedOrder.prefix(query.orderBy.count))
+        var distinctOn: DistinctOnPlan?
+        if !select.distinctOn.isEmpty {
+            let resolved = try DistinctOnPlan.resolve(keys: Array(resolvedOrder.dropFirst(query.orderBy.count)), order: order,
+                same: { a, b in aggregation?.sameKey(a, b) ?? ExpressionIdentity.same(a, b) })
+            distinctOn = resolved.plan; order = resolved.order
+        }
         let reverse = order.first?.descending ?? false
-        if select.distinct {
+        if aggregation == nil { try windows.validateDefinitions() }
+        let window = windows.finish(inputWidth: aggregation.map { $0.layoutWidth + $0.calls.count + $0.grouping.count } ?? scope.count,
+            aggregation: aggregation)
+        if select.distinct && distinctOn == nil {
             for expression in projections { try AggregateQueryPlan.equalityType(expression) }
             for term in order where !projections.contains(where: { ExpressionIdentity.same($0, term.expression) }) {
                 throw JedError("42P10", "for SELECT DISTINCT, ORDER BY expressions must appear in select list")
             }
         }
-        var orderedByScan = aggregation == nil && !order.isEmpty && !primaryKey.isEmpty && (!reverse || order.count >= primaryKey.count)
+        var orderedByScan = distinctOn == nil && aggregation == nil && !order.isEmpty && !primaryKey.isEmpty && (!reverse || order.count >= primaryKey.count)
         if order.contains(where: { if case .column = $0.expression.node { return false }; return true }) { orderedByScan = false }
         for ordinal in 0..<min(order.count, primaryKey.count) {
             let key = primaryKey[ordinal]
@@ -134,7 +189,7 @@ internal struct SelectPlan {
                           limit: try bound(query.limit, code: "2201W"), offset: try bound(query.offset, code: "2201X") ?? 0,
                           order: order, orderedByScan: orderedByScan, descending: orderedByScan && reverse,
                           scan: BaseScanPlan(predicate: predicate, keys: primaryKey, types: source?.tree.types ?? []), aggregation: aggregation,
-                          relation: relation, distinct: select.distinct)
+                          relation: relation, distinct: select.distinct && distinctOn == nil, window: window, distinctOn: distinctOn)
     }
 
     internal static func outputName(_ expression: SQLExpression) -> SQLText {
@@ -176,27 +231,41 @@ internal final class SelectExecution {
     private var grouped: GroupedSelectExecution?
     private var combined: CompoundQueryExecution?
     private var deduplicated: DistinctExecution?
+    private var windowed: WindowSelectExecution?
+    private var withQuery: WithQueryExecution?
+    private var columnar: ColumnarProjectionExecution?
+    private var initializedSubqueries = false
     init(plan: SelectPlan, context: ExpressionContext) {
         self.plan = plan; self.context = context; input = SelectInput(plan: plan, context: context)
-        if plan.distinct { deduplicated = DistinctExecution(plan: plan, context: context) }
+        if let withPlan = plan.withQuery { withQuery = WithQueryExecution(plan: withPlan, context: context) }
+        else if plan.distinct { deduplicated = DistinctExecution(plan: plan, context: context) }
         else if let compound = plan.compound { combined = CompoundQueryExecution(plan: plan, compound: compound, context: context) }
+        else if let window = plan.window { windowed = WindowSelectExecution(plan: plan, window: window, context: context) }
         else if let aggregation = plan.aggregation { grouped = GroupedSelectExecution(plan: plan, aggregate: aggregation, context: context) }
         else if !plan.order.isEmpty && !plan.orderedByScan { ordered = OrderedSelectExecution(plan: plan, context: context) }
+        else if ColumnarExecution.projection(plan, context) { columnar = ColumnarProjectionExecution(plan: plan, context: context) }
     }
     func next() throws -> [SQLValue]? {
+        if !initializedSubqueries {
+            try context.subqueries.prepare(plan.foldExpressions, context: context)
+            initializedSubqueries = true
+        }
+        if let withQuery { return try withQuery.next() }
         if let deduplicated { return try deduplicated.next() }
         if let combined { return try combined.next() }
+        if let windowed { return try windowed.next() }
         if let grouped { return try grouped.next() }
         if let ordered { return try ordered.next() }
+        if let columnar { return try columnar.next() }
         let meter = context.meter
         if !started { try input.prime(); started = true }
         if let limit = plan.limit, produced >= limit { return nil }
         while true {
             try meter.checkpoint()
-            guard let row = try input.next() else { return nil }
+            guard let row = try input.next(retaining: true) else { return nil }
             var rowContext = context; rowContext.column = { row[$0] }
-            if let predicate = plan.predicate {
-                guard try rowContext.matches(predicate) else { continue }
+            if let predicate = plan.predicate, !input.predicateApplied {
+                guard try rowContext.matches(predicate) else { input.discardRetained(row); continue }
             }
             if skipped < plan.offset { skipped += 1; continue }
             if plan.productionCharge { meter.charge(1); try meter.guardCost() }
@@ -205,7 +274,11 @@ internal final class SelectExecution {
             return values
         }
     }
-    func close() { input.close(); ordered?.close(); ordered = nil; grouped?.close(); grouped = nil; combined?.close(); combined = nil; deduplicated?.close(); deduplicated = nil }
+    func close() {
+        input.close(); ordered?.close(); ordered = nil; grouped?.close(); grouped = nil
+        combined?.close(); combined = nil; deduplicated?.close(); deduplicated = nil; windowed?.close(); windowed = nil
+        withQuery?.close(); withQuery = nil; columnar?.close(); columnar = nil
+    }
 }
 
 internal enum ScanCost {

@@ -26,7 +26,7 @@ struct SQLCorpusFile {
         "allow_ddl", "allow_temp_ddl",
     ]
     static let fileDirectives: Set<String> = ["requires", "load-collation", "load-timezone", "fixture", "skip", "format"]
-    static let actions: Set<String> = ["attach", "upgrade-collations", "collation"]
+    static let actions: Set<String> = ["attach", "upgrade-collations"]
 
     init(_ source: String) throws {
         let lines = source.components(separatedBy: "\n").map { $0.hasSuffix("\r") ? String($0.dropLast()) : $0 }

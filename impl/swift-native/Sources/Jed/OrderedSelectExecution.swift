@@ -12,6 +12,7 @@ internal final class OrderedSelectExecution {
         let row: [SQLValue]
         var keys: [SQLValue]
         let ordinal: Int
+        var bytes: Int64 = 0
     }
     private let plan: SelectPlan
     private let context: ExpressionContext
@@ -36,12 +37,17 @@ internal final class OrderedSelectExecution {
     }
     private func prepare() throws {
         let meter = context.meter
+        if plan.distinctOn == nil, plan.store != nil, plan.relation == nil, let limit = plan.limit,
+           !plan.order.contains(where: { ($0.type.collation?.description ?? "C") != "C" }) {
+            let (count, overflow) = plan.offset.addingReportingOverflow(limit)
+            if !overflow { try prepareTopK(limit == 0 ? 0 : count); return }
+        }
         let input = SelectInput(plan: plan, context: context); defer { input.close() }
         while let row = try input.next() {
             var current = context; current.column = { row[$0] }
             if let predicate = plan.predicate, try !current.matches(predicate) { continue }
             try reserve(MemorySizes.row(row))
-            entries.append(Entry(row: row, keys: [], ordinal: entries.count))
+            entries.append(Entry(row: row, keys: [], ordinal: entries.count, bytes: MemorySizes.row(row)))
         }
         input.close()
         // Expression keys are evaluated for the complete pre-sort input before
@@ -49,14 +55,18 @@ internal final class OrderedSelectExecution {
         for index in entries.indices {
             let row = entries[index].row
             var current = context; current.column = { row[$0] }
-            for term in plan.order {
+            entries[index].keys = Array(repeating: .null, count: plan.order.count)
+            for ordinal in plan.keyEvaluationOrder {
+                let term = plan.order[ordinal]
                 let key = try current.evaluate(term.expression)
-                if case .column = term.expression.node {} else { try reserve(MemorySizes.value(key)) }
-                entries[index].keys.append(key)
+                if case .column = term.expression.node {} else {
+                    let bytes = MemorySizes.value(key); try reserve(bytes); entries[index].bytes = saturatingAdd(entries[index].bytes, bytes)
+                }
+                entries[index].keys[ordinal] = key
             }
         }
         for index in entries.indices {
-            for ordinal in plan.order.indices {
+            for ordinal in plan.keyEvaluationOrder {
                 let value = entries[index].keys[ordinal], type = plan.order[ordinal].type
                 if let name = type.collation, name.description != "C", !value.isNull,
                    ExpressionCollation.collatable(type.type) {
@@ -92,8 +102,59 @@ internal final class OrderedSelectExecution {
             }
             return left.ordinal < right.ordinal
         }
+        if let distinct = plan.distinctOn {
+            var kept: [Entry] = []
+            for entry in entries {
+                if let previous = kept.last, try distinct.same(previous.keys, entry.keys, order: plan.order) {
+                    let bytes = entryBytes(entry); context.meter.resources.query.release(bytes); reserved -= bytes
+                } else { kept.append(entry) }
+            }
+            entries = kept
+        }
         for index in entries.indices { entries[index].keys = [] }
         context.meter.resources.query.release(decorations); reserved -= decorations; decorations = 0
+        position = Int(min(Int64(entries.count), plan.offset))
+    }
+    private func before(_ left: Entry, _ right: Entry) throws -> Bool {
+        for index in plan.order.indices {
+            let term = plan.order[index], a = left.keys[index], b = right.keys[index]
+            if a.isNull != b.isNull { return a.isNull == term.nullsFirst }
+            let order = try ValueComparison.total(a, b, type: term.type)
+            if order != 0 { return term.descending ? order > 0 : order < 0 }
+        }
+        return left.ordinal < right.ordinal
+    }
+    private func entryBytes(_ entry: Entry) -> Int64 {
+        if entry.bytes > 0 { return entry.bytes }
+        return zip(plan.order, entry.keys).reduce(MemorySizes.row(entry.row)) { total, pair in
+            if case .column = pair.0.expression.node { return total }
+            return saturatingAdd(total, MemorySizes.value(pair.1))
+        }
+    }
+    private func prepareTopK(_ count: Int64) throws {
+        let input = SelectInput(plan: plan, context: context); defer { input.close() }
+        var ordinal = 0
+        while let row = try input.next() {
+            var current = context; current.column = { row[$0] }
+            if let predicate = plan.predicate, try !current.matches(predicate) { continue }
+            let keys = try plan.order.map { try current.evaluate($0.expression) }
+            for key in keys {
+                let units = MemorySizes.payload(key)
+                if units > 0 { context.meter.charge(units); try context.meter.guardCost() }
+            }
+            let entry = Entry(row: row, keys: keys, ordinal: ordinal); ordinal += 1
+            guard count > 0 else { continue }
+            if Int64(entries.count) < count { try reserve(entryBytes(entry)); entries.append(entry); continue }
+            var worst = 0
+            for index in entries.indices.dropFirst() where try before(entries[worst], entries[index]) { worst = index }
+            guard try before(entry, entries[worst]) else { continue }
+            // Admission precedes eviction; both rows are momentarily live.
+            try reserve(entryBytes(entry))
+            let bytes = entryBytes(entries[worst]); context.meter.resources.query.release(bytes); reserved -= bytes
+            entries[worst] = entry
+        }
+        try entries.sort(by: before)
+        for index in entries.indices { entries[index].keys = [] }
         position = Int(min(Int64(entries.count), plan.offset))
     }
     func close() { entries = []; context.meter.resources.query.release(reserved); reserved = 0; decorations = 0 }

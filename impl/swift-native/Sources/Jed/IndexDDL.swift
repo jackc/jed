@@ -3,10 +3,20 @@ extension CatalogDDL {
                             settings: SessionSettings, context: ExpressionContext) throws {
         let tableName = try nameInMain(definition.table)
         guard let tablePosition = snapshot.catalog.tables.firstIndex(where: { $0.name == tableName }),
-              let store = snapshot.tables[tableName] else { throw JedError("42P01", "table does not exist: \(tableName)") }
+              let store = snapshot.tables[tableName] else {
+            if CatalogSQL.relationNames(snapshot.catalog).contains(tableName) { throw JedError("42809", "\(tableName) is not a table") }
+            throw JedError("42P01", "table does not exist: \(tableName)")
+        }
         let table = snapshot.catalog.tables[tablePosition]
+        try CatalogEnvironment.checkTableCollations(table, image: snapshot.catalog, environment: settings.environment)
         let method = definition.method?.description ?? "btree"
-        guard method == "btree" else { throw JedError("0A000", "\(method) index DDL is not yet connected") }
+        let kind: UInt8
+        switch method {
+        case "btree": kind = 0
+        case "gist": kind = 2
+        case "gin": throw JedError("0A000", "inverted index DDL is not yet connected")
+        default: throw JedError("42704", "access method does not exist: \(method)")
+        }
         let resolver = try resolver(snapshot: snapshot, settings: settings, context: context, table: table)
         resolver.storageCollation = true
         var keys: [CatalogIndexKey] = [], expressions: [ResolvedExpression] = [], parts: [SQLText] = [], options: [UInt8] = []
@@ -16,10 +26,11 @@ extension CatalogDDL {
         }
         for key in definition.keys {
             let expression = unwrapped(key.expression)
+            if kind == 2, key.indexExpression { throw JedError("0A000", "an expression key on a gist index is not supported yet") }
             try CatalogExpressionPolicy.validate(expression, isDefault: false)
             let resolved = try resolver.resolve(expression)
             var part: SQLText
-            if case .column(let ordinal) = resolved.node {
+            if case .column(let ordinal) = resolved.node, !key.indexExpression {
                 keys.append(.column(ordinal)); part = table.columns[ordinal].name
             } else {
                 keys.append(.expression(try CatalogSQL.expression(expression, source: source)))
@@ -28,7 +39,11 @@ extension CatalogDDL {
             }
             _ = try IndexDependencies.resolve([resolved], environment: settings.environment)
             guard let type = resolved.type else { throw JedError("42P18", "could not determine index expression type") }
-            try KeyEncoding.validateType(type.type)
+            if kind == 2 {
+                _ = try GistOpclass(type: type)
+                if key.directionSpecified { throw JedError("0A000", "access method gist does not support ASC/DESC options") }
+                if key.nullsFirst != nil { throw JedError("0A000", "access method gist does not support NULLS FIRST/LAST options") }
+            } else { try KeyEncoding.validateType(type.type) }
             _ = try ExpressionCollation.derive(resolved, storage: true).orderingName()
             let base = part; var suffix = 1
             while parts.contains(part) {
@@ -40,8 +55,13 @@ extension CatalogDDL {
             parts.append(part); expressions.append(resolved)
             options.append((key.descending ? 1 : 0) | ((key.nullsFirst ?? key.descending) ? 2 : 0))
         }
+        if kind == 2 {
+            guard !definition.unique else { throw JedError("0A000", "access method gist does not support unique indexes") }
+            guard keys.count == 1 else { throw JedError("0A000", "a multi-column gist index is not supported yet") }
+        }
         var predicate: CatalogExpression?
         if let syntax = definition.predicate {
+            guard kind == 0 else { throw JedError("0A000", "a partial (WHERE) gist index is not supported yet") }
             try CatalogExpressionPolicy.validate(syntax, isDefault: false)
             let resolved = try resolver.resolve(syntax, expected: TypeDescriptor(.scalar(.boolean)))
             guard resolved.type == nil || resolved.type?.type == .scalar(.boolean) else { throw JedError("42804", "argument of WHERE must be boolean") }
@@ -57,11 +77,11 @@ extension CatalogDDL {
             }
             name = explicit
         } else { name = CatalogSQL.objectName(tableName, columns: parts, label: "idx", taken: relations) }
-        var index = CatalogIndex(name: name, keys: keys, unique: definition.unique,
+        var index = CatalogIndex(name: name, keys: keys, unique: definition.unique, kind: kind,
                                  root: PageSealer.nullReference(snapshot.pool.codec), predicate: predicate)
         index.hosts = dependencies.hosts; index.dynamicZones = dependencies.dynamicZones; index.zones = dependencies.zones
         if options.contains(where: { $0 != 0 }) { index.keyOptions = options }
-        let plan = try OrderedIndexPlan.resolve(table: table, index: index, snapshot: snapshot, settings: settings, context: context)
+        let plan = try StoredIndexPlan.resolve(table: table, index: index, snapshot: snapshot, settings: settings, context: context)
         try ScanCost.charge(store, touched: plan.touched, meter: context.meter)
         var cursor = store.cursor(); defer { cursor.close() }
         var entries: [[UInt8]] = [], unique: Set<[UInt8]> = []
@@ -86,6 +106,7 @@ extension CatalogDDL {
         image.tables[tablePosition].indexes.sort { $0.name < $1.name }
         try snapshot.updateCatalog(image, schemaChanged: true)
         snapshot.setIndexStore(name, built)
+        try plan.rebuild(built, snapshot: &snapshot)
         try context.meter.syncPending(snapshot.pendingBytes)
     }
 

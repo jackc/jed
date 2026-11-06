@@ -37,7 +37,7 @@ internal enum IndexDependencies {
         try StoredExpressionDependencies.walk(expressions) { expression in
             if expression.nonimmutable { throw nonimmutable() }
             switch expression.node {
-            case .currentTimestamp, .currentDate, .dateInput: throw nonimmutable()
+            case .currentTimestamp, .currentDate, .dateInput, .subquery, .outerColumn: throw nonimmutable()
             case .cast(let source, let target, _), .convert(let source, let target):
                 let from = source.type?.type, to = target.type
                 if from == .scalar(.text) && (to == .scalar(.date) || containsInstant(to)) { throw nonimmutable() }

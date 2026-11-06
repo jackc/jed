@@ -65,7 +65,8 @@ internal final class CompoundQueryExecution {
             else {
                 for row in left + right {
                     for value in row {
-                        meter.charge(MemorySizes.payload(value)); try meter.guardCost()
+                        let units = MemorySizes.payload(value)
+                        if units > 0 { meter.charge(units); try meter.guardCost() }
                     }
                 }
                 var membership: [[UInt8]: Int] = [:], kept: Set<[UInt8]> = []
@@ -137,12 +138,14 @@ internal enum BufferedRowSort {
                     }
                     default: units = 0
                     }
-                    context.meter.charge(units); try context.meter.guardCost()
+                    if units > 0 { context.meter.charge(units); try context.meter.guardCost() }
                     let key = try KeyEncoding.encode(value, type: term.type, collatedKey: context.collatedKey)
                     let bytes = saturatingAdd(GeneratedSpec.memoryValue, Int64(key.count))
                     try reserve(bytes); decorations = saturatingAdd(decorations, bytes); keys.append(.bytea(key))
                 } else {
-                    context.meter.charge(MemorySizes.payload(value)); try context.meter.guardCost(); keys.append(value)
+                    let units = MemorySizes.payload(value)
+                    if units > 0 { context.meter.charge(units); try context.meter.guardCost() }
+                    keys.append(value)
                 }
             }
             decorated.append((row, keys, ordinal))

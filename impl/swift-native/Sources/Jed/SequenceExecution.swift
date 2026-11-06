@@ -89,7 +89,7 @@ internal final class SequenceExecution {
 
     static func mutates(_ expressions: [ResolvedExpression]) -> Bool {
         var result = false
-        StoredExpressionDependencies.walk(expressions) { expression in
+        StoredExpressionDependencies.walk(expressions, queryBodies: true) { expression in
             if case .call(let call) = expression.node, call.hostID == nil,
                call.name == "nextval" || call.name == "setval" { result = true }
         }

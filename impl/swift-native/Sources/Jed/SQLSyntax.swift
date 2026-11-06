@@ -74,6 +74,10 @@ internal struct SQLOrderTerm: Sendable {
     var descending = false
     var nullsFirst: Bool?
     var span: SQLSourceSpan
+    /// Index access methods distinguish an explicit ASC from omitted ordering,
+    /// and parenthesized expression keys from bare column spelling.
+    var directionSpecified = false
+    var indexExpression = false
 }
 internal struct SQLWindow: Sendable {
     var baseName: SQLText?

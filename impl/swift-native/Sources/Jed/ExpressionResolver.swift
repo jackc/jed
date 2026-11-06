@@ -8,6 +8,8 @@ internal struct ExpressionColumn {
     var collation: CollationDerivation?
     var qualifiedOnly = false
     var unresolved = false
+    var scalarFunction = false
+    var hiddenFromStar = false
 }
 
 /// One resolver per statement. Parameter inference is shared across every
@@ -24,7 +26,13 @@ internal final class ExpressionResolver {
     var referencedColumns: Set<Int> = []
     var checkFunction: ((SQLText) throws -> Void)?
     var viewExpansion = ViewExpansionState()
+    var queryScope: SubqueryScope?
+    var outerScopes: [[ExpressionColumn]] = []
+    var outerReferences: Set<OuterColumnReference> = []
+    var subqueryPlans: [SubqueryPlanKey: ResolvedSubquery] = [:]
+    var cteBindings: [SQLText: CTEBinding] = [:]
     var resolveAggregate: ((SQLCall, Int) throws -> ResolvedExpression?)?
+    var resolveWindow: ((SQLCall, Int) throws -> ResolvedExpression?)? = WindowQueryBuilder.forbidden
     /// Query stages may substitute an already-materialized expression value.
     /// Input expressions temporarily disable this hook while they resolve.
     var rewriteResolved: ((ResolvedExpression) throws -> ResolvedExpression)?
@@ -99,6 +107,7 @@ internal final class ExpressionResolver {
             return result(expected.map { TypeDescriptor($0.type) } ?? parameters[index], .parameter(index))
         case .column(let qualifier, let name):
             let candidates = columns.filter { $0.name == name && (qualifier == nil ? !$0.qualifiedOnly : $0.qualifier == qualifier) }
+            if candidates.isEmpty { return try resolveOuterColumn(qualifier: qualifier, name: name, position: syntax.position) }
             guard !candidates.isEmpty else { throw JedError("42703", "column does not exist: \(name)") }
             guard candidates.count == 1 else { throw JedError("42702", "column reference is ambiguous: \(name)") }
             referencedColumns.insert(candidates[0].index)
@@ -107,6 +116,12 @@ internal final class ExpressionResolver {
                 value.collation = candidates[0].collation ?? .implicit(candidates[0].type.collation ?? SQLText(validatedUTF8: [67]))
             }
             return value
+        case .scalarQuery(let query): return try subqueryExpression(query, kind: .scalar, position: syntax.position)
+        case .exists(let query): return try subqueryExpression(query, kind: .exists, position: syntax.position)
+        case .memberQuery(let left, let query, let negated):
+            return try membershipSubquery(left, query: query, operation: "=", all: false, negated: negated, membership: true, position: syntax.position)
+        case .quantifiedQuery(let operation, let left, let all, let query):
+            return try membershipSubquery(left, query: query, operation: operation, all: all, negated: false, membership: false, position: syntax.position)
         case .collate(let source, let name): return try collateExpression(source, name: name)
         case .currentTimestamp: return result(TypeDescriptor(.scalar(.timestamptz)), .currentTimestamp)
         case .currentDate: return result(TypeDescriptor(.scalar(.date)), .currentDate)
@@ -114,25 +129,7 @@ internal final class ExpressionResolver {
             let type = try TypeRules.resolve(target, composites: composites)
             return try literalInput(text, type: type, position: syntax.position)
         case .cast(let source, let target):
-            let type = try TypeRules.resolve(target, composites: composites)
-            if let text = stringLiteral(source) {
-                return try literalInput(text, type: type, position: syntax.position)
-            }
-            if nullLiteral(source) {
-                if case .scalar(let scalar) = type.type, scalar.integerWidth != nil || [.decimal, .f32, .f64, .boolean].contains(scalar) {
-                    return result(type, .cast(result(nil, .constant(.null)), type, .explicit))
-                }
-                return result(type, .constant(.null))
-            }
-            let hint = type.type == .scalar(.boolean) && numberLiteral(source) ? TypeDescriptor(.scalar(.i32)) : type
-            let child = try resolve(source, expected: hint)
-            if case .range = type.type, child.type?.type == type.type { return child }
-            if let from = child.type?.type, !TypeRules.admitsCast(from: from, to: type.type, mode: .explicit) {
-                if case .array = from, case .array = type.type { throw JedError("0A000", "this array element cast is not supported") }
-                if case .range = from { throw JedError("0A000", "range casts are not supported") }
-                throw JedError(type.type == .scalar(.jsonpath) ? "42846" : "42804", "cannot cast \(from.name) to \(type.type.name)")
-            }
-            return result(type, .cast(child, type, .explicit))
+            return try explicitCast(source, to: TypeRules.resolve(target, composites: composites))
         case .unary(let op, let source):
             let child = try resolve(source, expected: op == "not" ? boolean : expected)
             if op == "not" { try requireBoolean(child); return result(boolean, .unary(op, child)) }
@@ -144,6 +141,13 @@ internal final class ExpressionResolver {
             }
             return result(child.type, .unary(op, child))
         case .binary(let op, let left, let right):
+            if ["=", "<>", "<", "<=", ">", ">="].contains(op), let arity = syntacticRowArity(left),
+               let query = scalarSubquery(right) {
+                let b = try subqueryExpression(query, kind: .scalar, rowArity: arity, position: right.position)
+                let a = try resolve(left, expected: b.type)
+                try TypeRules.comparable(a.type?.type, b.type?.type)
+                return result(boolean, .binary(op, a, b, a.type ?? b.type ?? TypeDescriptor(.scalar(.text))))
+            }
             if op == "at time zone" {
                 let call = SQLCall(name: SQLText(validatedUTF8: Array("timezone".utf8)),
                     arguments: [SQLArgument(value: right), SQLArgument(value: left)])
@@ -207,7 +211,8 @@ internal final class ExpressionResolver {
             }
             let sources = arms.map(\.result) + (fallback.map { [$0] } ?? [])
             let outputs = try sources.map { try resolve($0) }
-            let type = try common(outputs)
+            var type = try common(outputs, keepTypmod: true)
+            if fallback == nil { type.decimal = nil; type.textLimit = nil; type.temporal = nil }
             let unified = try zip(sources, outputs).map { source, output in
                 try promote(output.type == nil ? resolve(source, expected: type) : output, to: type, floatCast: true)
             }
@@ -223,7 +228,7 @@ internal final class ExpressionResolver {
                 }
                 return result(a.type ?? type, .nullif(a, b, type))
             }
-            let children = try args.map { try resolve($0) }, type = try common(children)
+            let children = try args.map { try resolve($0) }, type = try common(children, keepTypmod: true)
             let unified = try zip(args, children).map { source, child in
                 try promote(child.type == nil ? resolve(source, expected: type) : child, to: type, floatCast: true)
             }
@@ -272,6 +277,7 @@ internal final class ExpressionResolver {
             guard let index = fields.firstIndex(where: { $0.name == name }) else { throw JedError("42703", "field does not exist: \(name)") }
             return result(fields[index].descriptor, .field(child, index))
         case .call(let call):
+            if let window = try resolveWindow?(call, syntax.position) { return window }
             if let aggregate = try resolveAggregate?(call, syntax.position) { return aggregate }
             var function = try JsonFunctionResolver.resolve(call) { try self.resolve($0, expected: $1) }
                 ?? ContainerFunctionResolver.resolve(call) { try self.resolve($0, expected: $1) }
@@ -279,8 +285,44 @@ internal final class ExpressionResolver {
             function.regex = try ResolvedRegexFunction.prepare(function, unicode: unicode)
             try checkFunction?(call.name)
             return result(function.resultType, .call(function))
-        default: throw JedError("0A000", "expression resolver slice is not yet connected")
         }
+    }
+
+    /// A constructor cast is a typed ROW whose fields are ordinary explicit
+    /// casts. It adds no synthetic outer operation or dynamic record coercion.
+    private func explicitCast(_ source: SQLExpression, to type: TypeDescriptor) throws -> ResolvedExpression {
+        if case .parenthesized(let child) = source.kind { return try explicitCast(child, to: type) }
+        func result(_ type: TypeDescriptor?, _ node: ResolvedExpression.Node) -> ResolvedExpression {
+            ResolvedExpression(type: type, node: node, position: source.position)
+        }
+        if let text = stringLiteral(source) {
+            return try literalInput(text, type: type, position: source.position)
+        }
+        if nullLiteral(source) {
+            if case .scalar(let scalar) = type.type, scalar.integerWidth != nil || [.decimal, .f32, .f64, .boolean].contains(scalar) {
+                return result(type, .cast(result(nil, .constant(.null)), type, .explicit))
+            }
+            return result(type, .constant(.null))
+        }
+        if case .composite(let composite) = type.type, case .row(let fields) = source.kind {
+            guard fields.count == composite.fields.count else { throw JedError("42846", "cannot cast type record to \(composite.name)") }
+            let children = try zip(fields, composite.fields).map { try finishCollation(explicitCast($0, to: $1.descriptor)) }
+            return result(type, .row(children))
+        }
+        let hint = type.type == .scalar(.boolean) && numberLiteral(source) ? TypeDescriptor(.scalar(.i32)) : type
+        let child = try resolve(source, expected: hint)
+        if child.type?.type == type.type {
+            switch type.type {
+            case .range, .composite, .array: return child
+            default: break
+            }
+        }
+        if let from = child.type?.type, !TypeRules.admitsCast(from: from, to: type.type, mode: .explicit) {
+            if case .array = from, case .array = type.type { throw JedError("0A000", "this array element cast is not supported") }
+            if case .range = from { throw JedError("0A000", "range casts are not supported") }
+            throw JedError(type.type == .scalar(.jsonpath) || TypeRules.fields(from) != nil || TypeRules.fields(type.type) != nil ? "42846" : "42804", "cannot cast \(from.name) to \(type.type.name)")
+        }
+        return result(type, .cast(child, type, .explicit))
     }
 
     private func requireBoolean(_ expression: ResolvedExpression) throws {
@@ -389,10 +431,16 @@ internal final class ExpressionResolver {
         }
         return ResolvedExpression(type: text, node: .binary("||", try asText(left, a), try asText(right, b), text), position: position)
     }
-    private func common(_ expressions: [ResolvedExpression]) throws -> TypeDescriptor {
+    private func common(_ expressions: [ResolvedExpression], keepTypmod: Bool = false) throws -> TypeDescriptor {
         var type: SQLType?
         for expression in expressions { type = try TypeRules.common(type, expression.type?.type) }
         var descriptor = TypeDescriptor(type ?? .scalar(.text))
+        if keepTypmod, let first = expressions.first?.type, expressions.allSatisfy({
+            $0.type?.type == first.type && $0.type?.decimal == first.decimal
+                && $0.type?.textLimit == first.textLimit && $0.type?.temporal == first.temporal
+        }) {
+            descriptor.decimal = first.decimal; descriptor.textLimit = first.textLimit; descriptor.temporal = first.temporal
+        }
         if ExpressionCollation.collatable(descriptor.type) {
             descriptor.collation = try ExpressionCollation.combine(expressions, storage: storageCollation).name
         }

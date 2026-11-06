@@ -4,6 +4,19 @@ extension CatalogDDL {
     static func alterTable(_ definition: SQLAlterTable, source: SQLText, snapshot: inout DomainSnapshot,
                            settings: SessionSettings, context: ExpressionContext) throws {
         let name = try nameInMain(definition.name)
+        if snapshot.catalog.views.contains(where: { $0.name == name }) {
+            let actions = try definition.actions.map { action -> SQLAlterViewAction in
+                switch action {
+                case .renameTable(let name): return .rename(name)
+                case .renameColumn(let old, let new): return .renameColumn(old, new)
+                case .setDefault(let name, let value): return .setDefault(name, value)
+                case .dropDefault(let name): return .dropDefault(name)
+                default: throw JedError("42809", "\(name) is not a table")
+                }
+            }
+            return try alterView(SQLAlterView(name: definition.name, ifExists: definition.ifExists, actions: actions),
+                                 source: source, snapshot: &snapshot, settings: settings, context: context)
+        }
         guard let position = snapshot.catalog.tables.firstIndex(where: { $0.name == name }),
               let originalStore = snapshot.tables[name] else {
             if CatalogSQL.relationNames(snapshot.catalog).contains(name) { throw JedError("42809", "\(name) is not a table") }
@@ -11,6 +24,7 @@ extension CatalogDDL {
             throw JedError("42P01", "table does not exist: \(name)")
         }
         let original = snapshot.catalog.tables[position]
+        let before = snapshot
         var image = snapshot.catalog, table = original
         var removedIndexes: Set<SQLText> = [], renamedIndexes: [(SQLText, SQLText)] = []
         var addedConstraints: Set<SQLText> = []
@@ -26,32 +40,27 @@ extension CatalogDDL {
                   }) else { throw JedError.corruption("identity column has no owned sequence") }
             return found
         }
-        func dependentViews() throws {
-            for view in image.views where view.dependencies.contains(where: { $0.kind == 0 && $0.name == name }) {
-                guard (try? SQLParser(utf8: view.definition.utf8).parse()) != nil else { throw JedError("XX003", "stored view cannot be parsed") }
-                throw JedError("0A000", "dependent view ALTER revalidation is not yet connected")
-            }
-        }
         for action in definition.actions {
             switch action {
             case .renameTable(let new):
                 try CatalogSQL.reserved(new, kind: "table")
                 guard !CatalogSQL.relationNames(image).contains(new) else { throw JedError("42P07", "relation already exists: \(new)") }
-                try dependentViews()
+                let oldName = table.name
+                try ViewRewrite.references(in: &image, name: oldName, kind: 0, renamed: new, columns: table.columns.map(\.name))
                 try CatalogRewrite.tableExpressions(&table, renamedTable: new)
                 table.name = new
                 for child in image.tables.indices {
-                    for foreign in image.tables[child].foreignKeys.indices where image.tables[child].foreignKeys[foreign].referencedTable == name {
+                    for foreign in image.tables[child].foreignKeys.indices where image.tables[child].foreignKeys[foreign].referencedTable == oldName {
                         image.tables[child].foreignKeys[foreign].referencedTable = new
                     }
                 }
-                for foreign in table.foreignKeys.indices where table.foreignKeys[foreign].referencedTable == name { table.foreignKeys[foreign].referencedTable = new }
-                for index in image.sequences.indices where image.sequences[index].owner?.table == name { image.sequences[index].owner?.table = new }
-                for index in image.statistics.indices where image.statistics[index].table == name { image.statistics[index].table = new }
+                for foreign in table.foreignKeys.indices where table.foreignKeys[foreign].referencedTable == oldName { table.foreignKeys[foreign].referencedTable = new }
+                for index in image.sequences.indices where image.sequences[index].owner?.table == oldName { image.sequences[index].owner?.table = new }
+                for index in image.statistics.indices where image.statistics[index].table == oldName { image.statistics[index].table = new }
             case .renameColumn(let old, let new):
                 let ordinal = try column(old)
                 guard !table.columns.contains(where: { $0.name == new }) else { throw JedError("42701", "column already exists: \(new)") }
-                try dependentViews()
+                try ViewRewrite.references(in: &image, name: table.name, kind: 0, column: (ordinal, new), columns: table.columns.map(\.name))
                 try CatalogRewrite.tableExpressions(&table, column: (old, new))
                 table.columns[ordinal].name = new
             case .renameConstraint(let old, let new):
@@ -106,8 +115,21 @@ extension CatalogDDL {
                     if ifExists { continue }
                     throw JedError("55000", "column is not an identity column")
                 }
-                image.sequences.remove(at: try ownedSequence(ordinal))
+                let owned = try ownedSequence(ordinal), sequenceName = image.sequences[owned].name
+                guard !image.views.contains(where: { $0.dependencies.contains { $0.kind == 2 && $0.name == sequenceName } }) else {
+                    throw JedError("2BP01", "cannot drop identity because other objects depend on its sequence")
+                }
+                image.sequences.remove(at: owned)
                 table.columns[ordinal].identity = nil; table.columns[ordinal].defaultValue = nil
+            case .dropColumn(let name, let ifExists, let cascade):
+                guard let ordinal = table.columns.firstIndex(where: { $0.name == name }) else {
+                    if ifExists { continue }
+                    throw JedError("42703", "column does not exist: \(name)")
+                }
+                if !cascade, image.views.contains(where: { view in
+                    view.dependencies.contains { $0.kind == 0 && $0.name == table.name && $0.columns.contains(table.columns[ordinal].name) }
+                }) { throw JedError("2BP01", "cannot drop column because other objects depend on it") }
+                throw JedError("0A000", "ALTER TABLE column rewrite is not yet connected")
             case .dropConstraint(let name, let ifExists, let cascade):
                 guard CatalogSQL.constraints(table).contains(name) else {
                     if ifExists { continue }
@@ -137,7 +159,6 @@ extension CatalogDDL {
             }
             image.tables[position] = table
         }
-        try dependentViews()
         let notNull = table.columns.indices.filter { table.columns[$0].notNull && !original.columns[$0].notNull }
         if !notNull.isEmpty {
             try ScanCost.charge(originalStore, touched: notNull, meter: context.meter)
@@ -162,7 +183,15 @@ extension CatalogDDL {
             snapshot.setIndexStore(new, snapshot.indexes[old]); snapshot.setIndexStore(old, nil)
             if let tree = snapshot.gistTrees[old] { snapshot.setGistTree(new, tree); snapshot.setGistTree(old, nil) }
         }
-        for (name, index) in built { snapshot.setIndexStore(name, index) }
+        for name in built.keys.sorted() {
+            let store = built[name]!
+            snapshot.setIndexStore(name, store)
+            if let index = table.indexes.first(where: { $0.name == name }), index.kind == 2 {
+                let plan = try StoredIndexPlan.resolve(table: table, index: index, snapshot: snapshot, settings: settings, context: context)
+                try plan.rebuild(store, snapshot: &snapshot)
+            }
+        }
+        try revalidateViews(dependingOn: name, old: before, new: snapshot, settings: settings, context: context, replacement: false)
         try context.meter.syncPending(snapshot.pendingBytes)
     }
 }

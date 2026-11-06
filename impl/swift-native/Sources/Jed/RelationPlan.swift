@@ -1,24 +1,55 @@
 /// Materialized FROM inputs retain packed base stores or independent query
 /// plans. All observable traversal follows authored relation and row order.
 internal final class RelationPlan {
-    enum Body { case base(TableStore), derived(SelectPlan, SessionSettings), join(RelationPlan, RelationPlan, String, ResolvedExpression?) }
+    enum Body {
+        case base(TableStore), derived(SelectPlan, SessionSettings), lateralDerived(SelectPlan, SessionSettings)
+        case cte(CTEReference), function(TableFunctionPlan), jsonTable(JSONTablePlan), join(RelationPlan, RelationPlan, String, ResolvedExpression?)
+    }
     let body: Body
     let columns: [ExpressionColumn]
-    init(body: Body, columns: [ExpressionColumn]) { self.body = body; self.columns = columns }
+    let functionalDependencies: [(primaryKey: [Int], columns: [Int])]
+    let baseTable: CatalogTable?
+    let lateralColumns: Set<Int>
+    let precedingWidth: Int
+    var scanFilter: ResolvedExpression?
+    init(body: Body, columns: [ExpressionColumn], functionalDependencies: [(primaryKey: [Int], columns: [Int])] = [], baseTable: CatalogTable? = nil,
+         lateralColumns: Set<Int> = [], precedingWidth: Int = 0) {
+        self.body = body; self.columns = columns; self.functionalDependencies = functionalDependencies; self.baseTable = baseTable
+        self.lateralColumns = lateralColumns
+        self.precedingWidth = precedingWidth
+    }
     var expressions: [ResolvedExpression] {
         switch body {
-        case .base: []
-        case .derived(let plan, _): plan.expressions
+        case .base, .cte: []
+        case .derived(let plan, _), .lateralDerived(let plan, _): plan.expressions
+        case .function(let function): function.expressions
+        case .jsonTable(let table): table.expressions
         case .join(let left, let right, _, let predicate): left.expressions + right.expressions + (predicate.map { [$0] } ?? [])
+        }
+    }
+    var foldExpressions: [ResolvedExpression] {
+        switch body {
+        case .base, .cte: []
+        case .derived(let plan, _), .lateralDerived(let plan, _): plan.foldExpressions
+        case .function(let function): function.expressions
+        case .jsonTable(let table): table.expressions
+        case .join(let left, let right, _, let predicate): left.foldExpressions + right.foldExpressions + (predicate.map { [$0] } ?? [])
         }
     }
     static func resolve(_ from: [SQLFrom], snapshot: DomainSnapshot, settings: SessionSettings,
                         resolver: ExpressionResolver) throws -> RelationPlan {
-        func source(_ input: SQLFrom) throws -> RelationPlan {
-            guard !input.lateral else { throw JedError("0A000", "lateral relation execution is not yet connected") }
+        func source(_ input: SQLFrom, preceding: [ExpressionColumn] = []) throws -> RelationPlan {
             let result: RelationPlan
             switch input.source {
             case .table(let name):
+                if name.database == nil, let binding = resolver.cteBindings[name.name] {
+                    let columns = binding.columns.enumerated().map { index, column in ExpressionColumn(name: column.name,
+                        qualifier: input.alias ?? name.name, type: column.type ?? TypeDescriptor(.scalar(.text)), index: index,
+                        collation: binding.collations[index]?.asColumn, unresolved: column.type == nil,
+                        hiddenFromStar: binding.hiddenColumns.map { index >= $0 } ?? false) }
+                    result = RelationPlan(body: .cte(binding.reference()), columns: columns)
+                    break
+                }
                 if (name.database == nil || name.database?.description == "main"),
                    let view = snapshot.catalog.views.first(where: { $0.name == name.name }) {
                     try settings.privileges.require(.select, on: view.name)
@@ -46,53 +77,155 @@ internal final class RelationPlan {
                 try settings.privileges.require(.select, on: table.name)
                 let columns = try table.columns.enumerated().map { ExpressionColumn(name: $0.element.name,
                     qualifier: input.alias ?? table.name, type: try $0.element.type.resolve(snapshot.types), index: $0.offset) }
-                result = RelationPlan(body: .base(store), columns: columns)
+                result = RelationPlan(body: .base(store), columns: columns,
+                    functionalDependencies: [(primaryKey: table.primaryKey, columns: Array(columns.indices))], baseTable: table)
             case .query(let query):
+                let child = ExpressionResolver(composites: resolver.composites, scalar: resolver.scalar)
+                child.outerScopes = input.lateral ? [preceding] + resolver.outerScopes : resolver.outerScopes
+                child.cteBindings = resolver.cteBindings; child.viewExpansion = resolver.viewExpansion
+                child.parameters = resolver.parameters; child.parameterUses = resolver.parameterUses
                 var plan = try SelectPlan.resolve(query, snapshot: snapshot, settings: settings, scalar: resolver.scalar,
-                                                  using: resolver, finalizeParameters: false)
+                                                  using: child, finalizeParameters: false)
+                resolver.parameters = child.parameters; resolver.parameterUses.formUnion(child.parameterUses)
+                var lateral: Set<Int> = []
+                for reference in child.outerReferences {
+                    if input.lateral, reference.depth == 1 { lateral.insert(reference.index) }
+                    else { resolver.outerReferences.insert(OuterColumnReference(depth: reference.depth - (input.lateral ? 1 : 0), index: reference.index)) }
+                }
                 if let compound = plan.compound, case .values(let rows, _) = compound.body {
                     plan.compound = CompoundQueryPlan(body: .values(rows, false), settings: settings)
                 }
                 let columns = plan.columns.enumerated().map { ExpressionColumn(name: $0.element.name, qualifier: input.alias,
                     type: $0.element.type ?? TypeDescriptor(.scalar(.text)), index: $0.offset,
                     collation: plan.projections[$0.offset].collation?.asColumn, unresolved: $0.element.type == nil) }
-                result = RelationPlan(body: .derived(plan, settings), columns: columns)
-            case .joined(let nested): result = try source(nested)
+                result = RelationPlan(body: input.lateral ? .lateralDerived(plan, settings) : .derived(plan, settings), columns: columns, lateralColumns: lateral)
+            case .function(let syntax):
+                let previous = resolver.columns
+                resolver.columns = preceding
+                defer { resolver.columns = previous }
+                let function = try TableFunctionPlan.resolve(input, syntax: syntax, resolver: resolver)
+                result = RelationPlan(body: .function(function), columns: function.columns, lateralColumns: function.lateralColumns)
+            case .jsonTable(let syntax):
+                let previous = resolver.columns; resolver.columns = preceding
+                defer { resolver.columns = previous }
+                let table = try JSONTablePlan.resolve(input, syntax: syntax, resolver: resolver)
+                result = RelationPlan(body: .jsonTable(table), columns: table.columns, lateralColumns: table.lateralColumns)
+            case .joined(let nested): result = fence(try source(nested, preceding: preceding))
             default: throw JedError("0A000", "this relation source is not yet connected")
             }
             guard input.columnAliases.count <= result.columns.count else {
-                let view = if case .table(let name) = input.source { snapshot.catalog.views.contains { $0.name == name.name } } else { false }
-                throw JedError(view ? "42P10" : "42601", "too many column aliases")
+                let derived: Bool
+                switch input.source {
+                case .table(let name): derived = resolver.cteBindings[name.name] != nil || snapshot.catalog.views.contains { $0.name == name.name }
+                case .query, .function: derived = true
+                default: derived = false
+                }
+                throw JedError(derived ? "42P10" : "42601", "too many column aliases")
             }
             var columns = result.columns
             for index in columns.indices {
                 let old = columns[index]
                 columns[index] = ExpressionColumn(name: index < input.columnAliases.count ? input.columnAliases[index] : old.name,
-                    qualifier: input.alias ?? old.qualifier, type: old.type, index: index, collation: old.collation, unresolved: old.unresolved)
+                    qualifier: input.alias ?? old.qualifier, type: old.type, index: old.index, collation: old.collation,
+                    qualifiedOnly: old.qualifiedOnly, unresolved: old.unresolved,
+                    scalarFunction: old.scalarFunction, hiddenFromStar: old.hiddenFromStar)
             }
-            var combined = RelationPlan(body: result.body, columns: columns)
-            for join in input.joins { combined = try combine(combined, source(join.right), kind: join.kind, syntax: join.condition,
-                                                           natural: join.natural, using: join.using) }
+            var combined = RelationPlan(body: result.body, columns: columns, functionalDependencies: result.functionalDependencies, baseTable: result.baseTable,
+                lateralColumns: result.lateralColumns, precedingWidth: result.precedingWidth)
+            for join in input.joins {
+                let scope = preceding + combined.columns.map { column in
+                    ExpressionColumn(name: column.name, qualifier: column.qualifier, type: column.type,
+                        index: preceding.count + column.index, collation: column.collation, qualifiedOnly: column.qualifiedOnly,
+                        unresolved: column.unresolved, scalarFunction: column.scalarFunction, hiddenFromStar: column.hiddenFromStar)
+                }
+                combined = try combine(combined, source(join.right, preceding: scope), kind: join.kind, syntax: join.condition,
+                    natural: join.natural, using: join.using, precedingWidth: preceding.count)
+            }
             return combined
         }
+        func fence(_ input: RelationPlan) -> RelationPlan {
+            let physical = input.columns.sorted { $0.index < $1.index }
+            let projections = physical.map { ResolvedExpression(type: $0.unresolved ? nil : $0.type, node: .column($0.index), position: 0, collation: $0.collation) }
+            let plan = SelectPlan(columns: physical.map { ResultColumn(name: $0.name, type: $0.unresolved ? nil : $0.type) },
+                projections: projections, predicate: nil, store: nil, touched: Array(physical.indices), parameters: [], limit: nil,
+                offset: 0, order: [], orderedByScan: false, descending: false,
+                scan: BaseScanPlan(predicate: nil, keys: [], types: []), relation: input)
+            return RelationPlan(body: .derived(plan, settings), columns: input.columns,
+                lateralColumns: input.lateralColumns, precedingWidth: input.precedingWidth)
+        }
         func combine(_ left: RelationPlan, _ right: RelationPlan, kind: String, syntax: SQLExpression?,
-                     natural: Bool = false, using: [SQLText] = []) throws -> RelationPlan {
-            guard !natural, using.isEmpty else { throw JedError("0A000", "JOIN USING and NATURAL column merging is not yet connected") }
+                     natural: Bool = false, using: [SQLText] = [], precedingWidth: Int = 0) throws -> RelationPlan {
+            let leftLabels = Set(left.columns.compactMap(\.qualifier)), rightLabels = Set(right.columns.compactMap(\.qualifier))
+            guard leftLabels.isDisjoint(with: rightLabels) else { throw JedError("42712", "table name specified more than once") }
+            if right.lateralColumns.contains(where: { $0 >= precedingWidth }) && (kind == "right" || kind == "full") {
+                throw JedError("42P10", "invalid reference to FROM-clause entry in a lateral outer join")
+            }
             var columns = left.columns
             for column in right.columns {
                 columns.append(ExpressionColumn(name: column.name, qualifier: column.qualifier, type: column.type,
-                    index: left.columns.count + column.index, collation: column.collation, unresolved: column.unresolved))
+                    index: left.columns.count + column.index, collation: column.collation, qualifiedOnly: column.qualifiedOnly, unresolved: column.unresolved,
+                    scalarFunction: column.scalarFunction, hiddenFromStar: column.hiddenFromStar))
             }
-            let previous = resolver.columns, aggregate = resolver.resolveAggregate
+            let previous = resolver.columns, aggregate = resolver.resolveAggregate, window = resolver.resolveWindow
             resolver.columns = columns; resolver.resolveAggregate = AggregateQueryPlan.forbidden
-            defer { resolver.columns = previous; resolver.resolveAggregate = aggregate }
-            let predicate = try syntax.map { try resolver.resolve($0, expected: TypeDescriptor(.scalar(.boolean))) }
+            resolver.resolveWindow = WindowQueryBuilder.forbidden
+            defer { resolver.columns = previous; resolver.resolveAggregate = aggregate; resolver.resolveWindow = window }
+            var predicate = try syntax.map { try resolver.resolve($0, expected: TypeDescriptor(.scalar(.boolean))) }
+            var mergeNames = using
+            if natural {
+                var seen: Set<SQLText> = []
+                mergeNames = left.columns.filter { !$0.qualifiedOnly && !$0.hiddenFromStar }.compactMap { column in
+                    guard right.columns.contains(where: { !$0.qualifiedOnly && !$0.hiddenFromStar && $0.name == column.name }),
+                          seen.insert(column.name).inserted else { return nil }
+                    return column.name
+                }
+            }
+            guard mergeNames.isEmpty || kind != "full" else { throw JedError("0A000", "FULL JOIN USING is not supported") }
+            var merged: [Int] = [], names: Set<SQLText> = []
+            for name in mergeNames {
+                guard names.insert(name).inserted else { throw JedError("42701", "column name appears more than once in USING clause") }
+                let a = left.columns.filter { !$0.qualifiedOnly && $0.name == name }
+                let b = right.columns.filter { !$0.qualifiedOnly && $0.name == name }
+                guard !a.isEmpty, !b.isEmpty else { throw JedError("42703", "column specified in USING clause does not exist: \(name)") }
+                guard a.count == 1, b.count == 1 else { throw JedError("42702", "common column name appears more than once: \(name)") }
+                let lhs = a[0], rhs = b[0]
+                func expression(_ column: ExpressionColumn, offset: Int = 0) -> ResolvedExpression {
+                    ResolvedExpression(type: column.unresolved ? nil : column.type, node: .column(column.index + offset), position: 0,
+                        collation: column.collation ?? (ExpressionCollation.collatable(column.type.type)
+                            ? .implicit(column.type.collation ?? SQLText(validatedUTF8: [67])) : nil))
+                }
+                let x = expression(lhs), y = expression(rhs, offset: left.columns.count)
+                try TypeRules.comparable(x.type?.type, y.type?.type)
+                let common = try TypeRules.common(x.type?.type, y.type?.type)
+                var type = TypeDescriptor(common ?? .scalar(.text))
+                if ExpressionCollation.collatable(common) { type.collation = try ExpressionCollation.combine([x, y]).orderingName() }
+                let equal = ResolvedExpression(type: TypeDescriptor(.scalar(.boolean)), node: .binary("=", x, y, type), position: 0)
+                predicate = predicate.map { ResolvedExpression(type: TypeDescriptor(.scalar(.boolean)), node: .binary("and", $0, equal, TypeDescriptor(.scalar(.boolean))), position: 0) } ?? equal
+                let kept = kind == "right" ? rhs.index + left.columns.count : lhs.index
+                let hidden = kind == "right" ? lhs.index : rhs.index + left.columns.count
+                merged.append(kept)
+                if let index = columns.firstIndex(where: { $0.index == hidden }) { columns[index].qualifiedOnly = true }
+            }
+            if !merged.isEmpty {
+                let first = merged.compactMap { key in columns.first { $0.index == key } }
+                columns = first + columns.filter { !merged.contains($0.index) }
+            }
             guard predicate?.type == nil || predicate?.type?.type == .scalar(.boolean) else { throw JedError("42804", "JOIN ON requires a boolean expression") }
-            return RelationPlan(body: .join(left, right, kind, predicate), columns: columns)
+            let dependencies = left.functionalDependencies + right.functionalDependencies.map { fact in
+                (primaryKey: fact.primaryKey.map { $0 + left.columns.count }, columns: fact.columns.map { $0 + left.columns.count })
+            }
+            return RelationPlan(body: .join(left, right, kind, predicate), columns: columns, functionalDependencies: dependencies,
+                lateralColumns: left.lateralColumns.union(right.lateralColumns.filter { $0 < precedingWidth }), precedingWidth: precedingWidth)
         }
         guard let first = from.first else { throw JedError("XX000", "empty materialized FROM") }
         var result = try source(first)
-        for next in from.dropFirst() { result = try combine(result, source(next), kind: "cross", syntax: nil) }
+        for next in from.dropFirst() {
+            var input = try source(next, preceding: result.columns)
+            // A comma before RIGHT/FULL fences that complete join subtree as
+            // an independently projected relation, once per preceding row.
+            if next.joins.contains(where: { $0.kind == "right" || $0.kind == "full" }) { input = fence(input) }
+            result = try combine(result, input, kind: "cross", syntax: nil)
+        }
         return result
     }
 }
@@ -110,48 +243,151 @@ internal final class RelationExecution {
         let bytes = MemorySizes.row(row); try context.meter.reserveQuery(bytes); reserved = saturatingAdd(reserved, bytes)
     }
     private func release(_ bytes: Int64) { context.meter.resources.query.release(bytes); reserved -= bytes }
-    func next() throws -> [SQLValue]? {
+    func next(retaining: Bool = false) throws -> [SQLValue]? {
         if !started { rows = try materialize(plan, touched: touched).map(Optional.some); started = true }
         guard position < rows.count, let row = rows[position] else { return nil }
-        rows[position] = nil; position += 1; release(MemorySizes.row(row)); return row
+        rows[position] = nil; position += 1
+        if !retaining { release(MemorySizes.row(row)) }
+        return row
     }
-    private func materialize(_ plan: RelationPlan, touched: Set<Int>) throws -> [[SQLValue]] {
+    func discardRetained(_ row: [SQLValue]) { release(MemorySizes.row(row)) }
+    private func materialize(_ plan: RelationPlan, touched: Set<Int>, context: ExpressionContext? = nil) throws -> [[SQLValue]] {
+        let context = context ?? self.context
         let meter = context.meter
+        func masked(_ row: [SQLValue]) -> [SQLValue] {
+            row.enumerated().map { touched.contains($0.offset) ? $0.element : .null }
+        }
         switch plan.body {
+        case .cte(let reference):
+            guard let ctes = context.ctes else { throw JedError("XX000", "WITH reference has no runtime scope") }
+            var rows: [[SQLValue]] = []
+            try ctes.scan(reference.binding) { row in let value = masked(row); try reserve(value); rows.append(value) }
+            return rows
+        case .function(let function):
+            var rows: [[SQLValue]] = []
+            try function.produce(context: context) { row in let value = masked(row); try reserve(value); rows.append(value) }
+            return rows
+        case .jsonTable(let table):
+            var rows: [[SQLValue]] = []
+            try table.produce(context: context) { rows.append(masked($0)) }
+            // Bounded JSON sources finish evaluating and generating their
+            // rows before the relation admits the completed output (Q1).
+            for row in rows { try reserve(row) }
+            return rows
         case .base(let store):
-            try ScanCost.charge(store, touched: touched.sorted(), meter: meter)
-            var cursor = store.cursor(); defer { cursor.close() }
+            let scan = BaseScanPlan(predicate: plan.scanFilter, keys: plan.baseTable?.primaryKey ?? [], types: store.tree.types)
+            let access = try scan.bind(context)
+            try ScanCost.charge(store, touched: touched.sorted(), meter: meter, access: access)
+            var cursor = access.cursor(store); defer { cursor.close() }
             var rows: [[SQLValue]] = []
             while let record = try cursor.next() {
                 meter.charge(1); try meter.step()
                 var row = Array(repeating: SQLValue.null, count: plan.columns.count)
                 for column in touched.sorted() { row[column] = try record.materialize(column: column, pager: store.tree.pool?.pager) }
+                if let filter = plan.scanFilter {
+                    var current = context; current.column = { row[$0] }
+                    if try !current.matches(filter) { continue }
+                }
                 try reserve(row); rows.append(row)
             }
             return rows
-        case .derived(let plan, let settings):
+        case .derived(let child, let settings), .lateralDerived(let child, let settings):
             var current = context; current.patterns = PatternExecution()
+            if case .lateralDerived = plan.body { current.outerRows = [context.column] + context.outerRows }
             StatementServices(settings: settings, meter: meter).install(into: &current)
-            let execution = SelectExecution(plan: plan, context: current); defer { execution.close() }
+            let execution = SelectExecution(plan: child, context: current); defer { execution.close() }
             var rows: [[SQLValue]] = []
-            while let row = try execution.next() { try reserve(row); rows.append(row) }
+            while let row = try execution.next() { let value = masked(row); try reserve(value); rows.append(value) }
             return rows
         case .join(let lhs, let rhs, let kind, let predicate):
-            var needed = touched
+            let localLateral = Set(rhs.lateralColumns.filter { $0 >= plan.precedingWidth }.map { $0 - plan.precedingWidth })
+            var needed = touched.union(localLateral)
             if let predicate { StoredExpressionDependencies.walk([predicate]) { if case .column(let index) = $0.node { needed.insert(index) } } }
             let width = lhs.columns.count
-            let left = try materialize(lhs, touched: Set(needed.filter { $0 < width }))
-            let right = try materialize(rhs, touched: Set(needed.filter { $0 >= width }.map { $0 - width }))
+            let physical = JoinPlan.choose(left: lhs, right: rhs, kind: kind, predicate: predicate)
+            let leftTouched = Set(needed.filter { $0 < width }), rightTouched = Set(needed.filter { $0 >= width }.map { $0 - width })
+            if !localLateral.isEmpty {
+                let left = try materialize(lhs, touched: leftTouched, context: context)
+                var output: [[SQLValue]] = []
+                for a in left {
+                    var current = context
+                    current.column = { index in
+                        if index < plan.precedingWidth { return try context.column(index) }
+                        return a[index - plan.precedingWidth]
+                    }
+                    current.subqueries = SubqueryExecution()
+                    let right = try materialize(rhs, touched: rightTouched, context: current)
+                    var matched = false
+                    for b in right {
+                        try meter.pollStep()
+                        let joined = a + b
+                        var joinedContext = context; joinedContext.column = { joined[$0] }
+                        if let predicate, try !joinedContext.matches(predicate) { continue }
+                        try reserve(joined); output.append(joined); matched = true
+                    }
+                    if !matched && kind == "left" {
+                        let joined = a + Array(repeating: SQLValue.null, count: rhs.columns.count)
+                        try reserve(joined); output.append(joined)
+                    }
+                    for row in right { release(MemorySizes.row(row)) }
+                }
+                for row in left { release(MemorySizes.row(row)) }
+                return output
+            }
+            if case .indexed(let bound) = physical.algorithm {
+                let outer = try materialize(physical.swapped ? rhs : lhs, touched: physical.swapped ? rightTouched : leftTouched, context: context)
+                let inner = physical.swapped ? lhs : rhs
+                guard case .base(let store) = inner.body else { throw JedError("XX000", "index join requires a base input") }
+                let columns = (physical.swapped ? leftTouched : rightTouched).sorted()
+                var output: [[SQLValue]] = []
+                for row in outer {
+                    let placeholder = Array(repeating: SQLValue.null, count: inner.columns.count)
+                    let logical = physical.swapped ? placeholder + row : row + placeholder
+                    var boundsContext = context; boundsContext.outerRows = [{ logical[$0] }] + context.outerRows
+                    let access = try bound.bind(boundsContext)
+                    try ScanCost.charge(store, touched: columns, meter: meter, access: access)
+                    var cursor = access.cursor(store); defer { cursor.close() }
+                    var matched = false
+                    while let record = try cursor.next() {
+                        meter.charge(1); try meter.step()
+                        var innerRow = placeholder
+                        for column in columns { innerRow[column] = try record.materialize(column: column, pager: store.tree.pool?.pager) }
+                        let joined = physical.swapped ? innerRow + row : row + innerRow
+                        var current = context; current.column = { joined[$0] }
+                        if let predicate, try !current.matches(predicate) { continue }
+                        try reserve(joined); output.append(joined); matched = true
+                    }
+                    if !matched && kind == "left" { try reserve(logical); output.append(logical) }
+                }
+                for row in outer { release(MemorySizes.row(row)) }
+                return output
+            }
+            let left: [[SQLValue]], right: [[SQLValue]]
+            if physical.swapped {
+                right = try materialize(rhs, touched: rightTouched, context: context); left = try materialize(lhs, touched: leftTouched, context: context)
+            } else {
+                left = try materialize(lhs, touched: leftTouched, context: context); right = try materialize(rhs, touched: rightTouched, context: context)
+            }
             var output: [[SQLValue]] = [], matchedRight: Set<Int> = []
-            for a in left {
+            let outer = physical.swapped ? right : left, inner = physical.swapped ? left : right
+            let hash: HashJoinTable?, probeKeys: [(column: Int, type: TypeDescriptor)]
+            if case .hash(let keys) = physical.algorithm {
+                let buildKeys = keys.map { (column: physical.swapped ? $0.left : $0.right, type: $0.type) }
+                probeKeys = keys.map { (column: physical.swapped ? $0.right : $0.left, type: $0.type) }
+                hash = try HashJoinTable(rows: inner, keys: buildKeys, context: context)
+            } else { hash = nil; probeKeys = [] }
+            defer { hash?.close() }
+            for a in outer {
                 var matched = false
-                for (index, b) in right.enumerated() {
+                func candidate(_ index: Int) throws {
                     try meter.pollStep()
-                    let row = a + b
+                    let b = inner[index], row = physical.swapped ? b + a : a + b
                     var current = context; current.column = { row[$0] }
-                    if let predicate, try !current.matches(predicate) { continue }
+                    if let predicate, try !current.matches(predicate) { return }
                     try reserve(row); output.append(row); matched = true; matchedRight.insert(index)
                 }
+                if let hash { try hash.probe(a, keys: probeKeys, visit: candidate) }
+                else { for index in inner.indices { try candidate(index) } }
                 if !matched && (kind == "left" || kind == "full") {
                     let row = a + Array(repeating: SQLValue.null, count: rhs.columns.count)
                     try reserve(row); output.append(row)
@@ -176,11 +412,16 @@ internal final class RelationExecution {
 internal final class SelectInput {
     private let plan: SelectPlan
     private let context: ExpressionContext
-    private var cursor: TreeCursor?
+    private var cursor: ScanCursor?
     private var relation: RelationExecution?
     private var started = false
     private var singleton = true
     private var empty = false
+    private var buffered: [[SQLValue]?]?
+    private var bufferedPosition = 0
+    private var bufferedBytes: Int64 = 0
+    private var virtualBytes: Int64 = 0
+    private(set) var predicateApplied = false
     init(plan: SelectPlan, context: ExpressionContext) { self.plan = plan; self.context = context }
     func prime() throws {
         if !started {
@@ -188,26 +429,75 @@ internal final class SelectInput {
             if let source = plan.relation { relation = RelationExecution(plan: source, context: context, touched: Set(plan.touched)) }
             else {
                 let access = try plan.scan.bind(context); empty = access.isEmpty
+                if plan.store == nil && !empty {
+                    try context.meter.reserveQuery(GeneratedSpec.memoryRow); virtualBytes = GeneratedSpec.memoryRow
+                }
                 if let store = plan.store, !empty {
                     try ScanCost.charge(store, touched: plan.touched, meter: context.meter, access: access)
                     cursor = access.cursor(store, descending: plan.descending)
+                    if access.intervals != nil || plan.materializeSource {
+                        buffered = []
+                        while let record = try cursor?.next() {
+                            let row = try materialize(record, store: store)
+                            let bytes = MemorySizes.row(row)
+                            try context.meter.reserveQuery(bytes); bufferedBytes = saturatingAdd(bufferedBytes, bytes)
+                            buffered!.append(row)
+                        }
+                        cursor?.close(); cursor = nil
+                        if plan.materializeSource, let predicate = plan.predicate {
+                            var kept: [[SQLValue]?] = []
+                            for item in buffered! {
+                                guard let row = item else { continue }
+                                var current = context; current.column = { row[$0] }
+                                if try current.matches(predicate) { kept.append(row) }
+                                else {
+                                    let bytes = MemorySizes.row(row); context.meter.resources.query.release(bytes); bufferedBytes -= bytes
+                                }
+                            }
+                            buffered = kept; predicateApplied = true
+                        }
+                    }
                 }
             }
         }
     }
-    func next() throws -> [SQLValue]? {
+    func next(retaining: Bool = false) throws -> [SQLValue]? {
         try prime()
-        if let relation { return try relation.next() }
+        if let relation { return try relation.next(retaining: retaining) }
         if empty { return nil }
+        if buffered != nil {
+            guard bufferedPosition < buffered!.count, let row = buffered![bufferedPosition] else { return nil }
+            buffered![bufferedPosition] = nil; bufferedPosition += 1
+            if !retaining {
+                let bytes = MemorySizes.row(row); context.meter.resources.query.release(bytes); bufferedBytes -= bytes
+            }
+            return row
+        }
         if let store = plan.store {
             guard let record = try cursor?.next() else { return nil }
-            context.meter.charge(1); try context.meter.step()
-            var row = Array(repeating: SQLValue.null, count: store.tree.types.count)
-            for column in plan.touched { row[column] = try record.materialize(column: column, pager: store.tree.pool?.pager) }
-            return row
+            return try materialize(record, store: store)
         }
         guard singleton else { return nil }; singleton = false; return []
     }
-    func close() { cursor?.close(); cursor = nil; relation?.close(); relation = nil }
+    private func materialize(_ record: PackedRecord, store: TableStore) throws -> [SQLValue] {
+        context.meter.charge(1); try context.meter.step()
+        var row = Array(repeating: SQLValue.null, count: store.tree.types.count)
+        for column in plan.touched { row[column] = try record.materialize(column: column, pager: store.tree.pool?.pager) }
+        return row
+    }
+    func discardRetained(_ row: [SQLValue]) {
+        if let relation { relation.discardRetained(row) }
+        else if buffered != nil {
+            let bytes = MemorySizes.row(row)
+            context.meter.resources.query.release(bytes); bufferedBytes -= bytes
+        } else if plan.store == nil {
+            context.meter.resources.query.release(virtualBytes); virtualBytes = 0
+        }
+    }
+    func close() {
+        cursor?.close(); cursor = nil; relation?.close(); relation = nil; buffered = nil
+        context.meter.resources.query.release(bufferedBytes); bufferedBytes = 0
+        context.meter.resources.query.release(virtualBytes); virtualBytes = 0
+    }
     deinit { close() }
 }

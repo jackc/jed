@@ -4,7 +4,7 @@ internal enum StoredExpressionDependencies {
     static func hosts(_ expressions: [ResolvedExpression], environment: Environment,
                       immutable: Bool = false) throws -> [CatalogHostDependency] {
         var result: [CatalogHostDependency] = [], seen: Set<UInt64> = []
-        try walk(expressions) { expression in
+        try walk(expressions, queryBodies: true) { expression in
             guard case .call(let call) = expression.node, let id = call.hostID, seen.insert(id).inserted else { return }
             guard id < environment.functions.count else { throw JedError("XX002", "stored host function is unavailable") }
             let host = environment.functions[Int(id)]
@@ -43,11 +43,12 @@ internal enum StoredExpressionDependencies {
     private static func precedes(_ a: CatalogHostDependency, _ b: CatalogHostDependency) -> Bool {
         a.name != b.name ? a.name < b.name : a.arguments.map(\.rawValue).lexicographicallyPrecedes(b.arguments.map(\.rawValue))
     }
-    static func walk(_ expressions: [ResolvedExpression], visit: (ResolvedExpression) throws -> Void) rethrows {
+    static func walk(_ expressions: [ResolvedExpression], queryBodies: Bool = false, visit: (ResolvedExpression) throws -> Void) rethrows {
         var work = Array(expressions.reversed())
         while let expression = work.popLast() {
             try visit(expression)
             work.append(contentsOf: children(expression).reversed())
+            if queryBodies, case .subquery(let query) = expression.node { work.append(contentsOf: query.plan.expressions.reversed()) }
         }
     }
     static func children(_ expression: ResolvedExpression) -> [ResolvedExpression] {
@@ -62,6 +63,7 @@ internal enum StoredExpressionDependencies {
         case .json(let value): return [value.context] + (value.path.map { [$0] } ?? []) + value.passing.map(\.value)
             + [value.onEmpty?.value, value.onError?.value].compactMap { $0 }
         case .pattern(let value): return [value.subject, value.pattern]
+        case .subquery(let query): return query.operand.map { [$0] } ?? []
         default: return []
         }
     }

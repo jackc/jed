@@ -3,6 +3,7 @@
 internal struct ResolvedAggregateCall {
     let plan: AggregatePlan
     let arguments: [ResolvedExpression]
+    let direct: [ResolvedExpression]
     let filter: ResolvedExpression?
     let distinct: Bool
     let order: [ResolvedOrderTerm]
@@ -22,8 +23,32 @@ internal struct AggregateQueryPlan {
     let layoutWidth: Int
 
     var expressions: [ResolvedExpression] {
-        keys + calls.flatMap { $0.arguments + ($0.filter.map { [$0] } ?? []) + $0.order.map(\.expression) }
+        keys + calls.flatMap { $0.arguments + $0.direct + ($0.filter.map { [$0] } ?? []) + $0.order.map(\.expression) }
             + (having.map { [$0] } ?? []) + projections + order.map(\.expression)
+    }
+    /// Repeated aggregate spellings keep their fold occurrences but designate
+    /// the same DISTINCT ON sort key. This does not perform aggregate CSE.
+    func sameKey(_ a: ResolvedExpression, _ b: ResolvedExpression) -> Bool {
+        ExpressionIdentity.same(a, b, columns: { a, b in
+            if a == b { return true }
+            let x = a - layoutWidth, y = b - layoutWidth
+            guard calls.indices.contains(x), calls.indices.contains(y) else { return false }
+            let left = calls[x], right = calls[y]
+            func list(_ a: [ResolvedExpression], _ b: [ResolvedExpression]) -> Bool {
+                a.count == b.count && zip(a, b).allSatisfy(ExpressionIdentity.same)
+            }
+            func order(_ a: [ResolvedOrderTerm], _ b: [ResolvedOrderTerm]) -> Bool {
+                a.count == b.count && zip(a, b).allSatisfy {
+                    $0.type == $1.type && $0.descending == $1.descending && $0.nullsFirst == $1.nullsFirst && ExpressionIdentity.same($0.expression, $1.expression)
+                }
+            }
+            guard left.plan.name == right.plan.name, left.plan.star == right.plan.star, left.distinct == right.distinct,
+                  list(left.arguments, right.arguments), list(left.direct, right.direct), order(left.order, right.order),
+                  left.plan.withinGroup.count == right.plan.withinGroup.count,
+                  zip(left.plan.withinGroup, right.plan.withinGroup).allSatisfy({ $0.type == $1.type && $0.descending == $1.descending && $0.nullsFirst == $1.nullsFirst }) else { return false }
+            if let a = left.filter, let b = right.filter { return ExpressionIdentity.same(a, b) }
+            return left.filter == nil && right.filter == nil
+        })
     }
     static let names: Set<String> = Set(GeneratedSpec.functions.filter { $0.kind == "aggregate" }.map(\.name))
         .union(["json_object_agg", "jsonb_object_agg", "json_object_agg_unique", "jsonb_object_agg_unique",
@@ -35,6 +60,9 @@ internal struct AggregateQueryPlan {
         var work = [expression]
         while let node = work.popLast() {
             if case .call(let call) = node.kind, isAggregate(call), call.over == nil, call.overName == nil { return true }
+            if case .call(let call) = node.kind, let window = call.over {
+                work.append(contentsOf: window.partitionBy + window.orderBy.map(\.expression))
+            }
             work.append(contentsOf: CatalogExpressionPolicy.children(node))
         }
         return false
@@ -47,14 +75,18 @@ internal struct AggregateQueryPlan {
         return nil
     }
     static func resolve(_ select: SQLSelect, order: [SQLOrderTerm], resolver: ExpressionResolver,
-                        scope: [ExpressionColumn], primaryKey: [Int]) throws -> Self? {
-        let syntax = select.items.compactMap(\.expression) + order.map(\.expression)
+                        scope: [ExpressionColumn], primaryKey: [Int],
+                        functionalDependencies: [(primaryKey: [Int], columns: [Int])] = [],
+                        windows: WindowQueryBuilder? = nil) throws -> Self? {
+        let syntax = select.items.compactMap(\.expression) + order.map(\.expression) + select.windows.flatMap { $0.definition.partitionBy + $0.definition.orderBy.map(\.expression) }
         guard !select.grouping.isEmpty || select.having != nil || syntax.contains(where: containsAggregate) else { return nil }
         let previous = resolver.resolveAggregate
         let previousRewrite = resolver.rewriteResolved
+        let previousWindow = resolver.resolveWindow
         resolver.resolveAggregate = forbidden
+        resolver.resolveWindow = WindowQueryBuilder.forbidden
         resolver.rewriteResolved = nil
-        defer { resolver.resolveAggregate = previous; resolver.rewriteResolved = previousRewrite }
+        defer { resolver.resolveAggregate = previous; resolver.rewriteResolved = previousRewrite; resolver.resolveWindow = previousWindow; windows?.validateGrouped = nil }
         var keys: [ResolvedExpression] = [], keyColumns: [Int] = []
         var sets: [[Int]] = [], grouping: [[Int]] = []
         var materializedKeys = 0
@@ -62,10 +94,18 @@ internal struct AggregateQueryPlan {
         var targets: [(SQLText, SQLExpression)] = []
         for item in select.items {
             if item.star {
-                for column in scope where item.qualifier == nil || item.qualifier == column.qualifier {
+                var selected = scope.filter { !$0.hiddenFromStar && (item.qualifier == nil ? !$0.qualifiedOnly : item.qualifier == $0.qualifier) }
+                if item.qualifier != nil { selected.sort { $0.index < $1.index } }
+                for column in selected {
                     targets.append((column.name, SQLExpression(kind: .column(qualifier: column.qualifier, name: column.name), span: item.span, position: item.span.position)))
                 }
-            } else if let expression = item.expression { targets.append((item.alias ?? SelectPlan.outputName(expression), expression)) }
+            } else if let expression = item.expression {
+                if case .field(let source, nil) = expression.kind {
+                    let value = try resolver.resolve(source)
+                    guard let type = value.type?.type, let fields = TypeRules.fields(type) else { throw JedError("42809", "record wildcard requires a composite type") }
+                    for field in fields { targets.append((field.name, SQLExpression(kind: .field(source, field.name), span: expression.span, position: expression.position))) }
+                } else { targets.append((item.alias ?? SelectPlan.outputName(expression), expression)) }
+            }
         }
         for expressions in try GroupingExpansion.expand(select.grouping) {
             var members: [Int] = []
@@ -99,8 +139,9 @@ internal struct AggregateQueryPlan {
         }
         // A complete primary key makes the other source columns groupable.
         let plain = select.grouping.allSatisfy { if case .set = $0 { return true }; return false }
-        if plain, !primaryKey.isEmpty, primaryKey.allSatisfy(keyColumns.contains) {
-            for column in scope where !keyColumns.contains(column.index) {
+        let dependencies = primaryKey.isEmpty ? functionalDependencies : [(primaryKey: primaryKey, columns: scope.map(\.index))]
+        for dependency in dependencies where plain && !dependency.primaryKey.isEmpty && dependency.primaryKey.allSatisfy(keyColumns.contains) {
+            for column in scope where dependency.columns.contains(column.index) && !keyColumns.contains(column.index) {
                 let expression = ResolvedExpression(type: column.type, node: .column(column.index), position: 0,
                     collation: column.collation ?? (ExpressionCollation.collatable(column.type.type) ? .implicit(column.type.collation ?? SQLText(validatedUTF8: [67])) : nil))
                 sets[0].append(keys.count)
@@ -108,6 +149,7 @@ internal struct AggregateQueryPlan {
             }
         }
         let allowed = Set(keyColumns), width = scope.count + materializedKeys
+        resolver.resolveWindow = previousWindow
         var calls: [ResolvedAggregateCall] = []
         var resolvedCalls: [Int: ResolvedExpression] = [:]
         resolver.resolveAggregate = { call, position in
@@ -122,9 +164,10 @@ internal struct AggregateQueryPlan {
                       call.orderBy.isEmpty, call.withinGroup.isEmpty, call.filter == nil else {
                     throw JedError("42601", "invalid GROUPING call")
                 }
-                let collector = resolver.resolveAggregate, rewrite = resolver.rewriteResolved
+                let collector = resolver.resolveAggregate, rewrite = resolver.rewriteResolved, windowCollector = resolver.resolveWindow
                 resolver.resolveAggregate = forbidden; resolver.rewriteResolved = nil
-                defer { resolver.resolveAggregate = collector; resolver.rewriteResolved = rewrite }
+                resolver.resolveWindow = WindowQueryBuilder.aggregateForbidden
+                defer { resolver.resolveAggregate = collector; resolver.rewriteResolved = rewrite; resolver.resolveWindow = windowCollector }
                 let positions = try call.arguments.map { argument -> Int in
                     let expression = try resolver.resolve(argument.value)
                     guard case .column = expression.node,
@@ -140,13 +183,66 @@ internal struct AggregateQueryPlan {
             }
             guard call.over == nil, call.overName == nil else { throw JedError("0A000", "window aggregate plan is not yet connected") }
             guard call.arguments.allSatisfy({ $0.name == nil && !$0.variadic }) else { throw JedError("42883", "aggregate named or variadic arguments are not supported") }
-            guard call.withinGroup.isEmpty else { throw JedError("0A000", "ordered-set aggregate plan is not yet connected") }
+            if !call.withinGroup.isEmpty {
+                let name = call.name.description, hypothetical = AggregateOrderedSet.hypothetical.contains(call.name.description)
+                guard hypothetical || AggregateOrderedSet.ordered.contains(name) else { throw JedError("42883", "aggregate does not exist: \(name)") }
+                guard !call.distinct else { throw JedError("42601", "DISTINCT is not allowed with ordered-set aggregates") }
+                guard !call.star, call.orderBy.isEmpty,
+                      hypothetical ? !call.arguments.isEmpty && call.arguments.count == call.withinGroup.count : call.withinGroup.count == 1 else {
+                    throw JedError("42883", "aggregate does not exist: \(name)")
+                }
+                let collector = resolver.resolveAggregate, rewrite = resolver.rewriteResolved, windowCollector = resolver.resolveWindow
+                resolver.resolveAggregate = forbidden; resolver.rewriteResolved = nil
+                resolver.resolveWindow = WindowQueryBuilder.aggregateForbidden
+                defer { resolver.resolveAggregate = collector; resolver.rewriteResolved = rewrite; resolver.resolveWindow = windowCollector }
+                var arguments: [ResolvedExpression] = [], direct: [ResolvedExpression] = [], ordering: [AggregateOrder] = []
+                for (index, term) in call.withinGroup.enumerated() {
+                    resolver.rewriteResolved = nil
+                    let expression = try resolver.resolve(term.expression)
+                    var type = expression.type ?? TypeDescriptor(.scalar(.text))
+                    type.collation = try ExpressionCollation.derive(expression).orderingName()
+                    try TypeRules.comparable(type.type, type.type)
+                    arguments.append(expression)
+                    ordering.append(AggregateOrder(type: type, descending: term.descending, nullsFirst: term.nullsFirst))
+                    if hypothetical {
+                        resolver.rewriteResolved = rewrite
+                        let value = try resolver.resolve(call.arguments[index].value, expected: type)
+                        try validate(value)
+                        guard value.type == nil || AggregatePlan.hypotheticalCompatible(value.type!.type, type.type) else {
+                            throw JedError("42883", "aggregate does not exist: \(name)")
+                        }
+                        direct.append(value)
+                    }
+                }
+                if !hypothetical {
+                    guard call.arguments.count == (name == "mode" ? 0 : 1) else { throw JedError("42883", "aggregate does not exist: \(name)") }
+                    resolver.rewriteResolved = rewrite
+                    for argument in call.arguments {
+                        let value = try resolver.resolve(argument.value, expected: TypeDescriptor(.scalar(.f64)))
+                        try validate(value); direct.append(value)
+                    }
+                }
+                resolver.rewriteResolved = nil
+                let filter = try call.filter.map { try resolver.resolve($0, expected: TypeDescriptor(.scalar(.boolean))) }
+                if let type = filter?.type, type.type != .scalar(.boolean) { throw JedError("42804", "FILTER requires a boolean expression") }
+                let types = arguments.enumerated().map { $0.element.type ?? ordering[$0.offset].type }
+                let directTypes = direct.enumerated().map { $0.element.type ?? (hypothetical ? types[$0.offset] : TypeDescriptor(.scalar(.f64))) }
+                let plan = try AggregatePlan.resolve(name: name, inputTypes: types, withinGroup: ordering, directTypes: directTypes)
+                try resolver.checkFunction?(call.name)
+                let slot = width + calls.count
+                calls.append(ResolvedAggregateCall(plan: plan, arguments: arguments, direct: direct, filter: filter, distinct: false, order: []))
+                let derivation = ExpressionCollation.collatable(plan.resultType.type) ? try ExpressionCollation.combine(arguments) : CollationDerivation.none
+                let result = ResolvedExpression(type: plan.resultType, node: .column(slot), position: position, collation: derivation)
+                resolvedCalls[position] = result; return result
+            }
             if call.star && call.name.description != "count" { throw JedError("42601", "* is only valid in COUNT") }
             let collector = resolver.resolveAggregate
             let rewrite = resolver.rewriteResolved
+            let windowCollector = resolver.resolveWindow
             resolver.resolveAggregate = forbidden
+            resolver.resolveWindow = WindowQueryBuilder.aggregateForbidden
             resolver.rewriteResolved = nil
-            defer { resolver.resolveAggregate = collector; resolver.rewriteResolved = rewrite }
+            defer { resolver.resolveAggregate = collector; resolver.rewriteResolved = rewrite; resolver.resolveWindow = windowCollector }
             var arguments = try call.arguments.map { try resolver.resolve($0.value) }
             // The two string_agg slots adopt unknown string/NULL operands only
             // after an exact family match has failed (aggregates.md §23).
@@ -183,7 +279,7 @@ internal struct AggregateQueryPlan {
             if let type = filter?.type, type.type != .scalar(.boolean) { throw JedError("42804", "FILTER requires a boolean expression") }
             try resolver.checkFunction?(call.name)
             let slot = width + calls.count
-            calls.append(ResolvedAggregateCall(plan: plan, arguments: arguments, filter: filter, distinct: call.distinct, order: order))
+            calls.append(ResolvedAggregateCall(plan: plan, arguments: arguments, direct: [], filter: filter, distinct: call.distinct, order: order))
             let derivation = ExpressionCollation.collatable(plan.resultType.type) ? try ExpressionCollation.combine(arguments) : CollationDerivation.none
             let result = ResolvedExpression(type: plan.resultType, node: .column(slot), position: position, collation: derivation)
             resolvedCalls[position] = result
@@ -202,6 +298,7 @@ internal struct AggregateQueryPlan {
                 }
             }
         }
+        windows?.validateGrouped = validate
         var projections: [ResolvedExpression] = [], columns: [ResultColumn] = []
         for (name, syntax) in targets {
             let expression = try resolver.resolve(syntax)
@@ -209,11 +306,14 @@ internal struct AggregateQueryPlan {
             projections.append(expression); columns.append(ResultColumn(name: name, type: expression.type))
         }
         guard !projections.isEmpty else { throw JedError("42601", "SELECT requires a target list") }
+        resolver.resolveWindow = WindowQueryBuilder.forbidden
         let having = try select.having.map { try resolver.resolve($0, expected: TypeDescriptor(.scalar(.boolean))) }
+        resolver.resolveWindow = previousWindow
         if let having {
             guard having.type == nil || having.type?.type == .scalar(.boolean) else { throw JedError("42804", "HAVING requires a boolean expression") }
             try validate(having)
         }
+        windows?.reuseResults = true
         let resolvedOrder = try order.map { term -> ResolvedOrderTerm in
             let expression: ResolvedExpression
             if case .number(let spelling) = term.expression.kind, let ordinal = Int(spelling) {
@@ -232,6 +332,11 @@ internal struct AggregateQueryPlan {
             try TypeRules.comparable(type.type, type.type)
             return ResolvedOrderTerm(expression: expression, type: type, descending: term.descending, nullsFirst: term.nullsFirst ?? term.descending)
         }
+        // Unused named definitions are validated under the grouped scope, but
+        // their scratch aggregate occurrences must not change execution.
+        let savedCalls = calls, savedGrouping = grouping, savedResolved = resolvedCalls
+        try windows?.validateDefinitions()
+        calls = savedCalls; grouping = savedGrouping; resolvedCalls = savedResolved
         return Self(keys: keys, keyColumns: keyColumns, sets: sets, grouping: grouping, calls: calls, having: having, projections: projections,
                     columns: columns, order: resolvedOrder, sourceWidth: scope.count, layoutWidth: width)
     }

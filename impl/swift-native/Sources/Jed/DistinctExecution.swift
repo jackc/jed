@@ -24,16 +24,21 @@ internal final class DistinctExecution {
         rows[position] = nil; position += 1; release(MemorySizes.row(row)); return row
     }
     private func inputPlan() -> SelectPlan {
-        SelectPlan(columns: plan.columns, projections: plan.projections, predicate: plan.predicate,
+        var input = SelectPlan(columns: plan.columns, projections: plan.projections, predicate: plan.predicate,
             store: plan.store, touched: plan.touched, parameters: plan.parameters, limit: nil, offset: 0, order: plan.order,
             orderedByScan: plan.orderedByScan, descending: plan.descending, scan: plan.scan, aggregation: plan.aggregation,
-            relation: plan.relation, productionCharge: false)
+            relation: plan.relation, productionCharge: false, window: plan.window)
+        input.materializeSource = !plan.orderedByScan
+        return input
     }
     private func stream() throws -> [SQLValue]? {
         if plan.limit.map({ emitted >= $0 }) == true { return nil }
         if streaming == nil { streaming = SelectExecution(plan: inputPlan(), context: context) }
         while let row = try streaming?.next() {
-            for value in row { context.meter.charge(MemorySizes.payload(value)); try context.meter.guardCost() }
+            for value in row {
+                let units = MemorySizes.payload(value)
+                if units > 0 { context.meter.charge(units); try context.meter.guardCost() }
+            }
             let key = try ValueEqualityKey.encode(row)
             if seen.contains(key) { continue }
             try reserve(row.reduce(GeneratedSpec.memoryEntry) { saturatingAdd($0, MemorySizes.value($1)) })
@@ -49,7 +54,10 @@ internal final class DistinctExecution {
         let execution = SelectExecution(plan: inputPlan(), context: context); defer { execution.close() }
         var seen: Set<[UInt8]> = [], output: [[SQLValue]] = [], entries: Int64 = 0
         while let row = try execution.next() {
-            for value in row { meter.charge(MemorySizes.payload(value)); try meter.guardCost() }
+            for value in row {
+                let units = MemorySizes.payload(value)
+                if units > 0 { meter.charge(units); try meter.guardCost() }
+            }
             let key = try ValueEqualityKey.encode(row)
             if seen.contains(key) { continue }
             let bytes = row.reduce(GeneratedSpec.memoryEntry) { saturatingAdd($0, MemorySizes.value($1)) }
