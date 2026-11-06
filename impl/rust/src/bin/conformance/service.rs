@@ -17,6 +17,7 @@ pub struct OwnerActor {
     stdout: BufReader<ChildStdout>,
     /// Whether the actor currently owns the running file's database.
     owns: bool,
+    require_client: bool,
 }
 
 /// The owner actor in service mode; `None` in the memory and disk modes.
@@ -30,13 +31,34 @@ pub fn start(core: &str, root: &Path) -> Result<(), String> {
     let mut argv: Vec<PathBuf> = match core {
         "rust" => vec![root.join("impl/rust/target/release/process_actor")],
         "go" => vec![root.join("impl/go/process_actor")],
+        "swift-native" => {
+            let actor = std::env::var_os("JED_SWIFT_PROCESS_ACTOR")
+                .map(PathBuf::from)
+                .ok_or("swift-native owner requires JED_SWIFT_PROCESS_ACTOR")?;
+            let metadata =
+                std::fs::metadata(&actor).map_err(|e| format!("Swift owner executable: {e}"))?;
+            #[cfg(unix)]
+            let executable = {
+                use std::os::unix::fs::PermissionsExt;
+                metadata.permissions().mode() & 0o111 != 0
+            };
+            #[cfg(not(unix))]
+            let executable = false;
+            if !actor.is_absolute() || !metadata.is_file() || !executable {
+                return Err(
+                    "swift-native owner requires an absolute executable JED_SWIFT_PROCESS_ACTOR"
+                        .into(),
+                );
+            }
+            vec![actor]
+        }
         "node" => vec![
             PathBuf::from("node"),
             root.join("impl/ts/src/bin/process_actor.ts"),
         ],
         other => {
             return Err(format!(
-                "JED_SERVICE_OWNER must be rust, go, or node; got {other:?}"
+                "JED_SERVICE_OWNER must be rust, go, node, or explicit swift-native; got {other:?}"
             ));
         }
     };
@@ -63,6 +85,7 @@ pub fn start(core: &str, root: &Path) -> Result<(), String> {
         stdin,
         stdout,
         owns: false,
+        require_client: core == "swift-native",
     });
     Ok(())
 }
@@ -150,4 +173,18 @@ pub fn stop() {
 
 pub fn count_client_record() {
     CLIENT_RECORDS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Reject accidental local-owner execution for the explicit experimental lane.
+pub fn check_role(db: &jed::Database) -> Result<(), String> {
+    if ACTOR
+        .lock()
+        .expect("actor lock poisoned")
+        .as_ref()
+        .is_some_and(|actor| actor.require_client)
+        && db.page_service_role_for_testing() != "client"
+    {
+        return Err("Swift owner conformance record did not use a page client".into());
+    }
+    Ok(())
 }

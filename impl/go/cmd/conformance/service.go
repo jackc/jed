@@ -19,9 +19,10 @@ import (
 // ownerActor is the other core's process actor, started once with `owner-idle` and told to open
 // and close each corpus file's database as its owner.
 type ownerActor struct {
-	cmd    *exec.Cmd
-	stdin  *bufio.Writer
-	stdout *bufio.Reader
+	cmd           *exec.Cmd
+	stdin         *bufio.Writer
+	stdout        *bufio.Reader
+	requireClient bool
 }
 
 func startOwnerActor(core string) (*ownerActor, error) {
@@ -33,10 +34,17 @@ func startOwnerActor(core string) (*ownerActor, error) {
 		argv = []string{filepath.Join(root, "impl/rust/target/release/process_actor")}
 	case "go":
 		argv = []string{filepath.Join(root, "impl/go/process_actor")}
+	case "swift-native":
+		actor := os.Getenv("JED_SWIFT_PROCESS_ACTOR")
+		info, err := os.Stat(actor)
+		if !filepath.IsAbs(actor) || err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0o111 == 0 {
+			return nil, fmt.Errorf("swift-native owner requires an absolute executable JED_SWIFT_PROCESS_ACTOR")
+		}
+		argv = []string{actor}
 	case "node":
 		argv = []string{"node", filepath.Join(root, "impl/ts/src/bin/process_actor.ts")}
 	default:
-		return nil, fmt.Errorf("JED_SERVICE_OWNER must be rust, go, or node; got %q", core)
+		return nil, fmt.Errorf("JED_SERVICE_OWNER must be rust, go, node, or explicit swift-native; got %q", core)
 	}
 	argv = append(argv, "owner-idle", root)
 	cmd := exec.Command(argv[0], argv[1:]...)
@@ -52,7 +60,7 @@ func startOwnerActor(core string) (*ownerActor, error) {
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("start %s owner actor: %w", core, err)
 	}
-	a := &ownerActor{cmd: cmd, stdin: bufio.NewWriter(stdin), stdout: bufio.NewReader(stdout)}
+	a := &ownerActor{cmd: cmd, stdin: bufio.NewWriter(stdin), stdout: bufio.NewReader(stdout), requireClient: core == "swift-native"}
 	line, err := a.stdout.ReadString('\n')
 	if err != nil || line != "READY\n" {
 		return nil, fmt.Errorf("%s owner actor did not start: %q %v", core, line, err)
@@ -103,4 +111,12 @@ var clientRecords int
 // serviceLocking is the file locking mode the harness opens with: the default, the page service.
 func serviceLocking() jed.Locking {
 	return jed.LockingAuto
+}
+
+// The experimental owner token must exercise a real cross-process client.
+func (a *ownerActor) checkRole(db *jed.Database) error {
+	if a != nil && a.requireClient && jed.PageServiceRoleForTesting(db) != "client" {
+		return fmt.Errorf("Swift owner conformance record did not use a page client")
+	}
+	return nil
 }

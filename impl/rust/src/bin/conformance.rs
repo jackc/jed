@@ -1284,6 +1284,7 @@ fn run_file(text: &str, disk: bool) -> std::result::Result<(), String> {
                 },
             )
             .map_err(|e| format!("disk reopen: open {}: {}", p.display(), e.message))?;
+            service::check_role(&db)?;
             db.set_max_storage_bytes("main", main_storage_limit)
                 .map_err(|e| format!("disk reopen: max_storage_bytes: {}", e.message))?;
             sess = db.session(jed::SessionOptions::default());

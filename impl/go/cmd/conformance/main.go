@@ -1129,6 +1129,10 @@ func runFile(text string, disk bool) error {
 		if err != nil {
 			return fmt.Errorf("disk reopen: open %s: %w", tmpPath, err)
 		}
+		if err := serviceOwner.checkRole(reDB); err != nil {
+			_ = reDB.Close()
+			return err
+		}
 		db = reDB
 		if err := db.SetMaxStorageBytes("main", mainStorageLimit); err != nil {
 			return fmt.Errorf("disk reopen: max_storage_bytes: %w", err)

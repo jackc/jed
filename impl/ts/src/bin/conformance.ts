@@ -1193,6 +1193,7 @@ async function runFile(text: string, disk: boolean): Promise<void> {
               locking: serviceLocking(),
               credential: modeCredential(),
             });
+        serviceOwner?.checkRole(dbHandle);
         dbHandle.setMaxStorageBytes("main", mainStorageLimit);
         attachDb = dbHandle;
         db = dbHandle.session();

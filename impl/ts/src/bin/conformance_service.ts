@@ -5,7 +5,9 @@
 // The harness is synchronous, so the actor's pipes are driven from a worker thread: the harness posts
 // a command line and blocks in Atomics.wait (BlockingChannel) until the worker relays the reply line.
 
-import { join } from "node:path";
+import { join, isAbsolute } from "node:path";
+import { accessSync, constants, statSync } from "node:fs";
+import { pageServiceRoleForTesting } from "../tooling.ts";
 import { Worker } from "node:worker_threads";
 
 import { BlockingChannel } from "../pageservice/blocking.ts";
@@ -75,11 +77,24 @@ export class OwnerActor {
       case "go":
         argv = [join(root, "impl/go/process_actor")];
         break;
+      case "swift-native": {
+        const actor = process.env.JED_SWIFT_PROCESS_ACTOR;
+        if (!actor || !isAbsolute(actor) || !statSync(actor).isFile()) {
+          throw new Error(
+            "swift-native owner requires an absolute executable JED_SWIFT_PROCESS_ACTOR",
+          );
+        }
+        accessSync(actor, constants.X_OK);
+        argv = [actor];
+        break;
+      }
       case "node":
         argv = [process.execPath, join(root, "impl/ts/src/bin/process_actor.ts")];
         break;
       default:
-        throw new Error(`JED_SERVICE_OWNER must be rust, go, or node; got "${core}"`);
+        throw new Error(
+          `JED_SERVICE_OWNER must be rust, go, node, or explicit swift-native; got "${core}"`,
+        );
     }
     argv.push("owner-idle", root);
     const worker = new Worker(RELAY, {
@@ -102,6 +117,12 @@ export class OwnerActor {
       const [status, code, detail] = reply.split("\t");
       const message = Buffer.from(detail ?? "", "hex").toString("utf8");
       throw new Error(`owner actor ${name} failed: ${status} ${code} ${message}`);
+    }
+  }
+
+  checkRole(database: object): void {
+    if (this.core === "swift-native" && pageServiceRoleForTesting(database) !== "client") {
+      throw new Error("Swift owner conformance record did not use a page client");
     }
   }
 
