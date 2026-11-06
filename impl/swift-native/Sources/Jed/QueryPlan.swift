@@ -65,6 +65,7 @@ internal struct SelectPlan {
         var source: TableStore?, scope: [ExpressionColumn] = [], primaryKey: [Int] = []
         var relation: RelationPlan?
         if select.from.count == 1, let from = select.from.first, from.joins.isEmpty, case .table(let name) = from.source,
+           !SystemRelationPlan.contains(name.name),
            (name.database != nil || resolver.cteBindings[name.name] == nil),
            snapshot.catalog.tables.contains(where: { $0.name == name.name }) {
             guard name.database == nil || name.database?.description == "main",

@@ -32,7 +32,7 @@ internal struct AggregatePlan {
                         throw JedError("42883", "aggregate does not exist: \(name)")
                     }
                     base = TypeDescriptor(inputTypes[0].type == .scalar(.interval) ? .scalar(.interval) : .scalar(.f64))
-                } else { base = inputTypes[0] }
+                } else { base = TypeDescriptor(inputTypes[0].type) }
                 if let direct = directTypes.first {
                     let numeric: SQLType
                     if case .array(let element) = direct.type { numeric = element }
@@ -62,10 +62,10 @@ internal struct AggregatePlan {
         if name == "min" || name == "max" { try TypeRules.comparable(inputTypes[0].type, inputTypes[0].type) }
         let result: TypeDescriptor
         switch FunctionResolver.text(metadata.metadata, "result") {
-        case "same_as_input": result = inputTypes[0]
+        case "same_as_input": result = TypeDescriptor(inputTypes[0].type)
         case "sum_widen": result = TypeDescriptor(inputTypes[0].type == .scalar(.i64) ? .scalar(.decimal) : .scalar(.i64))
         case "array_of_input":
-            if case .array = inputTypes[0].type { result = inputTypes[0] }
+            if case .array = inputTypes[0].type { result = TypeDescriptor(inputTypes[0].type) }
             else { result = TypeDescriptor(.array(inputTypes[0].type)) }
         case .some(let name):
             guard let scalar = ScalarType.allCases.first(where: { $0.name == name }) else { throw JedError("XX000", "invalid aggregate result catalog") }

@@ -34,6 +34,7 @@ internal struct SessionPrivileges {
     private var grants: [Object: PrivilegeSet] = [:]
     private var revocations: [Object: PrivilegeSet] = [:]
     init(defaults: PrivilegeSet) { self.defaults = defaults }
+    var isUnrestricted: Bool { defaults.isSuperset(of: .allTables) && revocations.values.allSatisfy(\.isEmpty) }
     mutating func grant(_ privileges: PrivilegeSet, on name: SQLText, function: Bool = false) {
         grants[Object(name: name, function: function), default: []].formUnion(privileges)
     }

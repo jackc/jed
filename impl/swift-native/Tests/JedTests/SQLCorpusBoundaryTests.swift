@@ -134,6 +134,21 @@ final class SQLCorpusBoundaryTests: XCTestCase {
         "ddl/foreign_key_lazy_child.test",
         "ddl/foreign_key_large_child.test",
         "ddl/alter_table_constraints.test",
+        "ddl/alter_table.test",
+        "ddl/alter_table_add_column.test",
+        "ddl/alter_table_add_column_determinism.test",
+        "ddl/alter_table_deferred.test",
+        "ddl/alter_table_drop_column.test",
+        "ddl/alter_table_drop_column_dependencies.test",
+        "ddl/alter_table_drop_column_foreign_key.test",
+        "ddl/alter_table_drop_column_index.test",
+        "ddl/alter_table_identity.test",
+        "ddl/alter_table_identity_jed.test",
+        "ddl/alter_table_identity_tx.test",
+        "ddl/alter_table_scope.test",
+        "ddl/alter_table_tx.test",
+        "ddl/alter_table_type_oracle.test",
+        "ddl/alter_table_type_primary_key.test",
         "aggregates/grouping_sets_window.test",
         "window/aggregate.test",
         "window/aggregate_filter.test",
@@ -194,6 +209,36 @@ final class SQLCorpusBoundaryTests: XCTestCase {
         "json/json_table_columns.test",
         "json/json_unicode_escapes.test",
         "query/distinct_on.test",
+        "introspection/attached.test",
+        "introspection/jed_columns.test",
+        "introspection/jed_columns_identity.test",
+        "introspection/jed_constraints.test",
+        "introspection/jed_indexes.test",
+        "introspection/jed_sequences.test",
+        "introspection/jed_sequences_identity.test",
+        "introspection/jed_sequences_txn.test",
+        "introspection/jed_tables.test",
+        "introspection/jed_types.test",
+        "introspection/jed_views.test",
+        "introspection/jed_views_alter.test",
+        "introspection/jed_views_rename.test",
+        "introspection/statistics_scope_p9.test",
+        "introspection/temp_scope.test",
+        "introspection/temporal_typmod.test",
+        "introspection/unicode_escapes_stored.test",
+        "session/privileges.test",
+        "session/privileges_column_reads.test",
+        "session/privileges_positions.test",
+        "dml/insert_on_conflict.test",
+        "dml/insert_on_conflict_decorations.test",
+        "dml/insert_on_conflict_default.test",
+        "dml/insert_on_conflict_exclusion.test",
+        "dml/insert_on_conflict_exclusion_rekey.test",
+        "dml/insert_on_conflict_partial.test",
+        "dml/insert_on_conflict_partial_decorated.test",
+        "dml/insert_on_conflict_rekey.test",
+        "dml/insert_on_conflict_rekey_savepoint.test",
+        "dml/view_on_conflict.test",
     ]
 
     func testWholeFrozenSQLFilesThroughDatabaseSession() throws {
@@ -201,26 +246,40 @@ final class SQLCorpusBoundaryTests: XCTestCase {
         let enumerator = try XCTUnwrap(FileManager.default.enumerator(at: root, includingPropertiesForKeys: nil))
         let totalFiles = enumerator.compactMap { $0 as? URL }.filter { $0.pathExtension == "test" }.count
         var records = 0, queries = 0, statements = 0, cells = 0, costs = 0, names = 0, types = 0, failures = 0
+        var completedFiles = 0, blockedFiles: [String] = []
         for name in Self.selectedFiles {
-            let source = try String(contentsOf: root.appendingPathComponent(name), encoding: .utf8)
-            let file = try SQLCorpusFile(source)
-            let runner = try SQLCorpusRunner(file: file) { name, ext in
-                let path = try XCTUnwrap(Bundle.module.url(forResource: name, withExtension: ext, subdirectory: "Fixtures"))
-                return Array(try Data(contentsOf: path))
-            }
-            let report = runner.run(file)
-            try runner.close()
-            if !report.failures.isEmpty { print("Whole SQL file \(name): \(report.records) records, \(report.failures.count) failures; first: \(report.failures[0])") }
-            records += report.records; queries += report.queries; statements += report.statements; cells += report.cells
-            costs += report.costs; names += report.names; types += report.types
-            for failure in report.failures {
-                failures += 1
-                if failures > 40 { print("SQL failure \(name):\(failure)") }
-                if failures <= 40 { XCTFail("\(name):\(failure)") }
+            var phase = "fixture read"
+            do {
+                let source = try String(contentsOf: root.appendingPathComponent(name), encoding: .utf8)
+                phase = "adapter parse"
+                let file = try SQLCorpusFile(source)
+                phase = "runner setup"
+                let runner = try SQLCorpusRunner(file: file) { name, ext in
+                    let path = try XCTUnwrap(Bundle.module.url(forResource: name, withExtension: ext, subdirectory: "Fixtures"))
+                    return Array(try Data(contentsOf: path))
+                }
+                let report = runner.run(file)
+                if !report.failures.isEmpty { print("Whole SQL file \(name): \(report.records) records, \(report.failures.count) failures; first: \(report.failures[0])") }
+                records += report.records; queries += report.queries; statements += report.statements; cells += report.cells
+                costs += report.costs; names += report.names; types += report.types
+                for failure in report.failures {
+                    failures += 1
+                    if failures > 40 { print("SQL failure \(name):\(failure)") }
+                    if failures <= 40 { XCTFail("\(name):\(failure)") }
+                }
+                phase = "runner cleanup"
+                try runner.close()
+                completedFiles += 1
+            } catch {
+                let failure = "\(name) (\(phase)): \(error)"
+                blockedFiles.append(failure)
+                print("SQL adapter blocked file: \(failure)")
+                XCTFail("SQL adapter blocked file: \(failure)")
             }
         }
         if failures > 40 { XCTFail("\(failures - 40) additional SQL corpus failures omitted") }
-        print("Whole SQL corpus: \(Self.selectedFiles.count)/\(totalFiles) complete files, \(records) records (\(statements) statements, \(queries) queries), \(cells) result cells, \(costs) cost / \(names) name / \(types) type assertions; \(totalFiles - Self.selectedFiles.count) files not yet admitted; \(failures) failures")
+        print("Whole SQL corpus: \(completedFiles)/\(Self.selectedFiles.count) selected files completed (\(totalFiles) frozen files), \(records) records (\(statements) statements, \(queries) queries), \(cells) result cells, \(costs) cost / \(names) name / \(types) type assertions; \(totalFiles - Self.selectedFiles.count) files not yet admitted; \(failures) SQL failures; \(blockedFiles.count) adapter-blocked files")
+        for failure in blockedFiles { print("SQL adapter blocked file summary: \(failure)") }
     }
 
     func testRecordAdapterRetainsSetupAndConsumesDirectives() throws {

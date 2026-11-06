@@ -3,6 +3,7 @@ extension CatalogDDL {
     /// in one scan. The caller publishes this working snapshot only on success.
     static func alterTable(_ definition: SQLAlterTable, source: SQLText, snapshot: inout DomainSnapshot,
                            settings: SessionSettings, context: ExpressionContext) throws {
+        try SystemRelationPlan.rejectTarget(definition.name.name)
         let name = try nameInMain(definition.name)
         if snapshot.catalog.views.contains(where: { $0.name == name }) {
             let actions = try definition.actions.map { action -> SQLAlterViewAction in
@@ -25,9 +26,16 @@ extension CatalogDDL {
         }
         let original = snapshot.catalog.tables[position]
         let before = snapshot
+        try context.sequences?.apply(to: &snapshot)
+        context.sequences?.synchronizeDefinitions(from: snapshot.catalog)
         var image = snapshot.catalog, table = original
         var removedIndexes: Set<SQLText> = [], renamedIndexes: [(SQLText, SQLText)] = []
         var addedConstraints: Set<SQLText> = []
+        var sources = original.columns.indices.map(AlterRowSource.original)
+        var steps: [AlterRowStep] = []
+        var changedTypes: Set<Int> = [], changedViewColumns: Set<SQLText> = []
+        var clearStatistics = false
+        var preparationCost: Int64 = 0
         func column(_ name: SQLText) throws -> Int {
             guard let found = table.columns.firstIndex(where: { $0.name == name }) else { throw JedError("42703", "column does not exist: \(name)") }
             return found
@@ -42,6 +50,15 @@ extension CatalogDDL {
         }
         for action in definition.actions {
             switch action {
+            case .addColumn(let syntax, let ifNotExists):
+                if table.columns.contains(where: { $0.name == syntax.name }) {
+                    if ifNotExists { continue }
+                    throw JedError("42701", "column already exists: \(syntax.name)")
+                }
+                let captured = try AlterColumnDDL.add(syntax, table: &table, image: &image, source: source,
+                    snapshot: snapshot, settings: settings, context: context, added: &addedConstraints)
+                sources.append(.added(captured))
+                steps.append(try AlterRowRewrite.append(captured, snapshot: snapshot, settings: settings, context: context))
             case .renameTable(let new):
                 try CatalogSQL.reserved(new, kind: "table")
                 guard !CatalogSQL.relationNames(image).contains(new) else { throw JedError("42P07", "relation already exists: \(new)") }
@@ -126,10 +143,10 @@ extension CatalogDDL {
                     if ifExists { continue }
                     throw JedError("42703", "column does not exist: \(name)")
                 }
-                if !cascade, image.views.contains(where: { view in
-                    view.dependencies.contains { $0.kind == 0 && $0.name == table.name && $0.columns.contains(table.columns[ordinal].name) }
-                }) { throw JedError("2BP01", "cannot drop column because other objects depend on it") }
-                throw JedError("0A000", "ALTER TABLE column rewrite is not yet connected")
+                try AlterColumnDDL.drop(ordinal, table: &table, image: &image, cascade: cascade,
+                    removedIndexes: &removedIndexes, added: &addedConstraints)
+                sources.remove(at: ordinal); steps.append(.remove(ordinal)); clearStatistics = true
+                changedTypes = Set(changedTypes.filter { $0 != ordinal }.map { $0 > ordinal ? $0 - 1 : $0 })
             case .dropConstraint(let name, let ifExists, let cascade):
                 guard CatalogSQL.constraints(table).contains(name) else {
                     if ifExists { continue }
@@ -152,32 +169,104 @@ extension CatalogDDL {
                 }
                 table.foreignKeys = image.tables[position].foreignKeys
             case .addConstraint(let syntax):
-                let name = try addAlterConstraint(syntax, table: &table, image: image, source: source,
-                    snapshot: snapshot, settings: settings, context: context)
-                addedConstraints.insert(name)
-            default: throw JedError("0A000", "ALTER TABLE rewrite or constraint addition is not yet connected")
+                if case .primaryKey(let names) = syntax.kind {
+                    guard table.primaryKey.isEmpty else { throw JedError("42P16", "multiple primary keys are not allowed") }
+                    table.primaryKey = try keyColumns(names, own: nil, table: table, kind: "primary key", keyable: true, types: snapshot.types)
+                    for ordinal in table.primaryKey { table.columns[ordinal].notNull = true }
+                } else {
+                    let name = try addAlterConstraint(syntax, table: &table, image: image, source: source,
+                        snapshot: snapshot, settings: settings, context: context)
+                    addedConstraints.insert(name)
+                }
+            case .dropPrimaryKey(let cascade):
+                guard !table.primaryKey.isEmpty else { throw JedError("42704", "table has no primary key") }
+                table.primaryKey = []
+                image.tables[position] = table
+                for child in image.tables.indices {
+                    var kept: [CatalogForeignKey] = []
+                    for foreign in image.tables[child].foreignKeys {
+                        if foreign.referencedTable == table.name && !uniqueCover(foreign.referencedColumns, table: table) {
+                            guard cascade else { throw JedError("2BP01", "foreign key depends on the primary key") }
+                            if child == position { addedConstraints.remove(foreign.name) }
+                        } else { kept.append(foreign) }
+                    }
+                    image.tables[child].foreignKeys = kept
+                }
+                table.foreignKeys = image.tables[position].foreignKeys
+            case .setType(let name, let target, let using):
+                let ordinal = try column(name)
+                if case .original(let old) = sources[ordinal] { changedViewColumns.insert(original.columns[old].name) }
+                let value = try AlterColumnType.apply(ordinal, target: target, using: using, table: &table,
+                    image: &image, source: source, snapshot: snapshot, settings: settings, context: context, preparationCost: &preparationCost)
+                changedTypes.insert(ordinal); clearStatistics = true; steps.append(.convert(ordinal, value))
+                addedConstraints.formUnion(table.checks.map(\.name)); addedConstraints.formUnion(table.indexes.map(\.name))
+                addedConstraints.formUnion(table.foreignKeys.map(\.name)); addedConstraints.formUnion(table.exclusions.map(\.name))
             }
             image.tables[position] = table
         }
-        let notNull = table.columns.indices.filter { table.columns[$0].notNull && !original.columns[$0].notNull }
+        for view in image.views {
+            if view.dependencies.contains(where: { $0.kind == 0 && $0.name == table.name && !$0.columns.filter(changedViewColumns.contains).isEmpty }) {
+                throw JedError("0A000", "cannot alter type of a column used by a view")
+            }
+        }
+        if !changedTypes.isEmpty { try AlterColumnType.validateEndState(table: table, changed: changedTypes, image: image, snapshot: snapshot) }
+        let rekey = table.primaryKey.count != original.primaryKey.count || table.primaryKey.enumerated().contains { position, ordinal in
+            guard case .original(let old) = sources[ordinal] else { return true }
+            return old != original.primaryKey[position] || changedTypes.contains(ordinal)
+        }
+        let rewriting = rekey || !steps.isEmpty
+        // Frozen cores charge each saved-default conversion to a session meter,
+        // then transfer its cost after action/end-state validation. This also
+        // preserves their current lifetime double accrual for that preparation.
+        context.meter.charge(preparationCost); try context.meter.checkpoint()
+        if clearStatistics { image.statistics.removeAll { $0.table == table.name } }
+        context.sequences?.synchronizeDefinitions(from: image)
+        var actionSnapshot = snapshot
+        try actionSnapshot.updateCatalog(image, schemaChanged: false)
+        let rewritten: (rows: [AlterRowRewrite.Row], nextID: Int64)?
+        if rewriting {
+            rewritten = try AlterRowRewrite.materialize(table: table, steps: steps, original: originalStore,
+                rekey: rekey, snapshot: actionSnapshot, context: context)
+        } else { rewritten = nil }
+        // The frozen contract validates newly NOT NULL original columns with a
+        // second original-row scan even if a preceding rewrite checked its rows.
+        let notNull = table.columns.indices.compactMap { index -> (Int, SQLText)? in
+            guard table.columns[index].notNull, case .original(let ordinal) = sources[index], !original.columns[ordinal].notNull else { return nil }
+            return (ordinal, table.columns[index].name)
+        }
         if !notNull.isEmpty {
-            try ScanCost.charge(originalStore, touched: notNull, meter: context.meter)
+            try ScanCost.charge(originalStore, touched: notNull.map { $0.0 }, meter: context.meter)
             var scan = originalStore.cursor(); defer { scan.close() }
             while let record = try scan.next() {
-                context.meter.charge(1); try context.meter.step()
+                try context.meter.step(); context.meter.charge(1)
                 let row = ScanRecord(record, pager: originalStore.tree.pool?.pager)
-                for ordinal in notNull where try row.value(ordinal).isNull {
-                    throw JedError("23502", "column \(table.columns[ordinal].name) contains null values")
+                for (ordinal, name) in notNull where try row.value(ordinal).isNull {
+                    throw JedError("23502", "column \(name) contains null values")
                 }
             }
         }
-        let built = try validateAlterConstraints(&table, added: addedConstraints, store: originalStore,
-            snapshot: snapshot, settings: settings, context: context)
+        let built: [SQLText: TableStore], tableStore: TableStore
+        if let rewritten {
+            let validation = try AlterConstraintValidation(table: &table, added: addedConstraints,
+                rebuilt: rekey ? Set(table.indexes.map(\.name)) : [], snapshot: actionSnapshot, settings: settings, context: context)
+            for row in rewritten.rows {
+                try context.meter.step()
+                try validation.consume(key: row.key, value: { row.values[$0] })
+            }
+            built = try validation.finish()
+            tableStore = try AlterRowRewrite.publish(rewritten.rows, nextID: rewritten.nextID,
+                types: table.columns.map { try $0.type.resolve(snapshot.types) }, original: originalStore, settings: settings)
+        } else {
+            tableStore = originalStore
+            built = try validateAlterConstraints(&table, added: addedConstraints, store: originalStore,
+                snapshot: actionSnapshot, settings: settings, context: context)
+        }
         table.checks.sort { $0.name < $1.name }; table.indexes.sort { $0.name < $1.name }
         table.foreignKeys.sort { $0.name < $1.name }; table.exclusions.sort { $0.name < $1.name }
         image.tables[position] = table
         try snapshot.updateCatalog(image, schemaChanged: true)
-        if table.name != name { snapshot.setTableStore(name, nil); snapshot.setTableStore(table.name, originalStore) }
+        if table.name != name { snapshot.setTableStore(name, nil) }
+        if rewriting || table.name != name { snapshot.setTableStore(table.name, tableStore) }
         for name in removedIndexes { snapshot.setIndexStore(name, nil); snapshot.setGistTree(name, nil) }
         for (old, new) in renamedIndexes {
             snapshot.setIndexStore(new, snapshot.indexes[old]); snapshot.setIndexStore(old, nil)
@@ -191,6 +280,7 @@ extension CatalogDDL {
                 try plan.rebuild(store, snapshot: &snapshot)
             }
         }
+        try context.sequences?.apply(to: &snapshot)
         try revalidateViews(dependingOn: name, old: before, new: snapshot, settings: settings, context: context, replacement: false)
         try context.meter.syncPending(snapshot.pendingBytes)
     }

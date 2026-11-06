@@ -98,7 +98,7 @@ internal struct UpdatableView {
     }
     /// Check every level in its own column order before detecting a duplicate
     /// physical destination. This preserves the view-write error precedence.
-    func destinations(_ columns: [Int]) throws -> [Int] {
+    func destinations(_ columns: [Int], allowDuplicates: Bool = false) throws -> [Int] {
         var mapped = columns
         for layer in layers {
             for index in Set(mapped).sorted() {
@@ -109,7 +109,7 @@ internal struct UpdatableView {
             }
             mapped = mapped.map { layer.mapping[$0]! }
         }
-        guard Set(mapped).count == mapped.count else { throw JedError("42701", "column assigned more than once") }
+        guard allowDuplicates || Set(mapped).count == mapped.count else { throw JedError("42701", "column assigned more than once") }
         return mapped
     }
     func baseColumn(layer: Int, column: Int) throws -> Int {

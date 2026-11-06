@@ -326,23 +326,36 @@ internal enum JSONFunctions {
     /// One visitor supports the JSON SRFs; yielding rows and generated_row cost
     /// belong to the evaluator. A caller can stop without copying later values.
     static func each(_ value: SQLValue, array: Bool, asText: Bool = false, keysOnly: Bool = false,
-                     meter: CostMeter, yield: (SQLText?, SQLValue) throws -> Bool) throws {
+                     meter: CostMeter, constant: Bool = false, beforeElement: () throws -> Void = {},
+                     yield: (SQLText?, SQLValue) throws -> Bool) throws {
         let kind = array ? "array" : "object"
         if case .json(let text) = value {
             let error = JedError("22023", array ? "cannot call json_array_elements on a non-array" : "cannot deconstruct a scalar")
             let document = try JSONDocument(text, decodeStrings: !array || asText || keysOnly, expectedRoot: kind, rootError: error)
             if case .array(let elements, _) = document.root {
-                for element in elements { if try !yield(nil, document.extract(element, asText: asText)) { break } }
+                for element in elements {
+                    try beforeElement()
+                    if try !yield(nil, document.extract(element, asText: asText)) { break }
+                }
             } else if case .object(let members, _) = document.root {
-                for member in members { if try !yield(member.key, keysOnly ? .null : document.extract(member.value, asText: asText)) { break } }
+                for member in members {
+                    try beforeElement()
+                    if try !yield(member.key, keysOnly ? .null : document.extract(member.value, asText: asText)) { break }
+                }
             }
             return
         }
         let root = try node(value)
         if array, case .array(let elements) = root {
-            for element in elements { if try !yield(nil, asText ? scalarText(element, meter: meter) : .jsonb(element)) { break } }
+            for element in elements {
+                try beforeElement()
+                if try !yield(nil, asText ? scalarText(element, meter: meter, constant: constant) : .jsonb(element)) { break }
+            }
         } else if !array, case .object(let members) = root {
-            for member in members { if try !yield(member.key, keysOnly ? .null : asText ? scalarText(member.value, meter: meter) : .jsonb(member.value)) { break } }
+            for member in members {
+                try beforeElement()
+                if try !yield(member.key, keysOnly ? .null : asText ? scalarText(member.value, meter: meter, constant: constant) : .jsonb(member.value)) { break }
+            }
         } else { throw JedError("22023", array ? "cannot extract elements from a non-array" : "cannot call jsonb_each on a non-object") }
     }
 

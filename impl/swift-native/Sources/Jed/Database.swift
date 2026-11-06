@@ -247,6 +247,7 @@ public final class Session {
             case .query(let query):
                 let pin = try transaction?.cursorPin() ?? readPin?.retain() ?? database.core.beginRead()
                 do {
+                    try StatementPrivileges.check(statement, snapshot: pin.snapshot, settings: settings)
                     let services = StatementServices(settings: settings, meter: meter)
                     var context = services.context()
                     let plan = try SelectPlan.resolve(query, snapshot: pin.snapshot, settings: settings, scalar: context.scalar)
@@ -325,6 +326,7 @@ public final class Session {
         let sequences = SequenceExecution(snapshot: working, history: sequenceHistory, meter: meter, writable: true)
         sequences.install(into: &context)
         let result: MutationResult
+        try StatementPrivileges.check(statement, snapshot: working, settings: settings)
         if case .createTable(let definition) = statement, definition.query != nil {
             result = try CreateTableAs.execute(definition, snapshot: &working, settings: settings,
                                               context: context, parameters: parameters)

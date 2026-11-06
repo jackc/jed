@@ -52,6 +52,7 @@ extension CatalogDDL {
 
     static func alterView(_ syntax: SQLAlterView, source: SQLText, snapshot: inout DomainSnapshot,
                           settings: SessionSettings, context: ExpressionContext) throws {
+        try SystemRelationPlan.rejectTarget(syntax.name.name)
         let name = try nameInMain(syntax.name)
         guard let index = snapshot.catalog.views.firstIndex(where: { $0.name == name }) else {
             if CatalogSQL.relationNames(snapshot.catalog).contains(name) { throw JedError("42809", "\(name) is not a view") }
@@ -120,6 +121,7 @@ extension CatalogDDL {
     static func dropViews(_ syntax: SQLDrop, snapshot: inout DomainSnapshot) throws {
         var removed: Set<SQLText> = []
         for input in syntax.names {
+            try SystemRelationPlan.rejectTarget(input.name, dropping: true)
             let name = try nameInMain(input)
             if snapshot.catalog.views.contains(where: { $0.name == name }) { removed.insert(name) }
             else if CatalogSQL.relationNames(snapshot.catalog).contains(name) { throw JedError("42809", "\(name) is not a view") }

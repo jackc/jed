@@ -66,6 +66,7 @@ internal enum ViewDefinition {
             var ordinal: Int?
             var starVisible = true
             var qualifiedOnly = false
+            var mergedName = false
         }
         var enclosing: [[Binding]] = []
         var lexical: [SQLText: CTEBinding] = [:]
@@ -109,6 +110,10 @@ internal enum ViewDefinition {
                                 collation: binding.collations[index]?.asColumn, unresolved: column.type == nil,
                                 starVisible: binding.hiddenColumns.map { index < $0 } ?? true)
                         }
+                    } else if let system = try SystemRelationPlan.resolve(name, alias: nil, snapshot: snapshot, settings: planningSettings) {
+                        // System relations have fixed engine-owned columns and
+                        // no persisted catalog object to pin as a dependency.
+                        columns = system.columns.map { Binding(label: name.name, name: $0.name, type: $0.type) }
                     } else if let table = snapshot.catalog.tables.first(where: { $0.name == name.name }) {
                         add(0, name.name)
                         columns = try table.columns.map { Binding(label: name.name, name: $0.name, type: try $0.type.resolve(snapshot.types), table: name.name, column: $0.name) }
@@ -133,17 +138,20 @@ internal enum ViewDefinition {
                 default: throw JedError("0A000", "view source dependency tracing is not yet connected")
                 }
                 for index in columns.indices {
-                    if let alias = from.alias { columns[index].label = alias }
+                    if let alias = from.alias { columns[index].label = alias; columns[index].mergedName = false }
                     if index < from.columnAliases.count { columns[index].name = from.columnAliases[index] }
                 }
                 for join in from.joins {
-                    let right = try bind(join.right)
+                    var right = try bind(join.right)
                     let names = join.natural ? columns.filter { !$0.qualifiedOnly && $0.starVisible }.map(\.name).filter { name in
                         right.contains { !$0.qualifiedOnly && $0.starVisible && $0.name == name }
                     } : join.using
                     for name in names {
                         implicitJoinUses += columns.filter { !$0.qualifiedOnly && $0.name == name }
                         implicitJoinUses += right.filter { !$0.qualifiedOnly && $0.name == name }
+                        if join.kind == "right" {
+                            if let position = right.firstIndex(where: { !$0.qualifiedOnly && $0.name == name }) { right[position].mergedName = true }
+                        } else if let position = columns.firstIndex(where: { !$0.qualifiedOnly && $0.name == name }) { columns[position].mergedName = true }
                     }
                     columns += right
                     if let predicate = join.condition { joins.append((predicate, columns)) }
@@ -188,7 +196,16 @@ internal enum ViewDefinition {
                 if let relation = blockPlan.relation {
                     var columns = relation.columns.filter { !$0.hiddenFromStar && (item.qualifier == nil ? !$0.qualifiedOnly : $0.qualifier == item.qualifier) }
                     if item.qualifier != nil { columns.sort { $0.index < $1.index } }
-                    selected = columns.compactMap { scope.indices.contains($0.index) ? scope[$0.index] : nil }
+                    selected = columns.compactMap { column in
+                        guard scope.indices.contains(column.index) else { return nil }
+                        var binding = scope[column.index]
+                        // A USING merge and its qualified source copy share a
+                        // physical slot. Render the selected output metadata,
+                        // not whichever copy last populated that slot.
+                        binding.label = item.qualifier == nil && binding.mergedName ? nil : column.qualifier
+                        binding.name = column.name
+                        return binding
+                    }
                 } else { selected = scope.filter { $0.starVisible && (item.qualifier == nil ? !$0.qualifiedOnly : $0.label == item.qualifier) } }
                 var bytes: [UInt8] = []
                 for column in selected {

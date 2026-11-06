@@ -43,6 +43,9 @@ extension ExpressionResolver {
         // requested column is absent from that local relation.
         if qualifier == nil || !columns.contains(where: { $0.qualifier == qualifier }) {
             for (level, scope) in outerScopes.enumerated() {
+                if let qualifier, scope.contains(where: { $0.qualifier == qualifier && $0.ambiguousRelation }) {
+                    throw JedError("42P09", "table reference is ambiguous: \(qualifier)")
+                }
                 let matches = scope.filter { $0.name == name && (qualifier == nil ? !$0.qualifiedOnly : $0.qualifier == qualifier) }
                 if let column = matches.first {
                     guard matches.count == 1 else { throw JedError("42702", "column reference is ambiguous: \(name)") }

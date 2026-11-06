@@ -11,7 +11,7 @@ internal struct JoinPlan {
         let fallback = JoinPlan(swapped: false, algorithm: .nested, estimate: 0)
         guard kind == "inner" || kind == "cross" || kind == "left" else { return fallback }
         let boundary = left.columns.count
-        let keyPairs = hashKeys(predicate, columns: left.columns + right.columns, boundary: boundary)
+        let keyPairs = hashKeys(predicate, columns: left.columns.sorted { $0.index < $1.index } + right.columns.sorted { $0.index < $1.index }, boundary: boundary)
         guard case .base(let leftStore) = left.body, case .base(let rightStore) = right.body,
               let a = left.baseTable, let b = right.baseTable else {
             // The established two-relation path predates costed base-table
@@ -82,7 +82,7 @@ internal struct JoinPlan {
         return winner ?? fallback
     }
 
-    private static func indexed(_ predicate: ResolvedExpression?, table: CatalogTable, types: [TypeDescriptor],
+    static func indexed(_ predicate: ResolvedExpression?, table: CatalogTable, types: [TypeDescriptor],
                                 innerOffset: Int, innerWidth: Int) -> BaseScanPlan? {
         func local(_ index: Int) -> Bool { index >= innerOffset && index < innerOffset + innerWidth }
         var bounds: [ResolvedExpression] = []
@@ -101,6 +101,14 @@ internal struct JoinPlan {
         return bound
     }
 
+    static func keyable(_ type: SQLType) -> Bool {
+        switch type {
+        case .scalar(let scalar): return ![.json, .jsonb, .jsonpath].contains(scalar)
+        case .array(.scalar(let scalar)), .range(.scalar(let scalar)): return ![.json, .jsonb, .jsonpath].contains(scalar)
+        default: return false
+        }
+    }
+
     private static func hashKeys(_ predicate: ResolvedExpression?, columns: [ExpressionColumn], boundary: Int) -> [Key]? {
         var keys: [Key] = []
         for term in QueryEstimate.conjuncts(predicate) {
@@ -110,13 +118,6 @@ internal struct JoinPlan {
             let l = min(left, right), r = max(left, right)
             guard columns.indices.contains(l), columns.indices.contains(r), columns[l].type.type == columns[r].type.type else { return nil }
             let type = columns[l].type
-            func keyable(_ type: SQLType) -> Bool {
-                switch type {
-                case .scalar(let scalar): return ![.json, .jsonb, .jsonpath].contains(scalar)
-                case .array(.scalar(let scalar)), .range(.scalar(let scalar)): return ![.json, .jsonb, .jsonpath].contains(scalar)
-                default: return false
-                }
-            }
             guard keyable(type.type) else { return nil }
             keys.append(Key(left: l, right: r - boundary, type: type))
         }

@@ -82,6 +82,9 @@ internal struct DomainSnapshot: Sendable {
         catalog = image; types = resolved; nextTypeID = next
         if schemaChanged { catalogRevision = StorageRevision() } else { dataRevision = StorageRevision() }
     }
+    /// Explicit storage maintenance is the only unchanged-data commit kind.
+    /// It rewrites the catalog/free list without resolving persisted SQL.
+    mutating func requireStorageMaintenance() { dataRevision = StorageRevision() }
     mutating func forgetPendingKeys() {
         for name in tables.keys { tables[name]!.forgetPendingKeys() }
         for name in indexes.keys { indexes[name]!.forgetPendingKeys() }

@@ -1,6 +1,7 @@
 extension CatalogDDL {
     static func createIndex(_ definition: SQLCreateIndex, source: SQLText, snapshot: inout DomainSnapshot,
                             settings: SessionSettings, context: ExpressionContext) throws {
+        try SystemRelationPlan.rejectTarget(definition.table.name)
         let tableName = try nameInMain(definition.table)
         guard let tablePosition = snapshot.catalog.tables.firstIndex(where: { $0.name == tableName }),
               let store = snapshot.tables[tableName] else {

@@ -3,7 +3,7 @@
 internal final class RelationPlan {
     enum Body {
         case base(TableStore), derived(SelectPlan, SessionSettings), lateralDerived(SelectPlan, SessionSettings)
-        case cte(CTEReference), function(TableFunctionPlan), jsonTable(JSONTablePlan), join(RelationPlan, RelationPlan, String, ResolvedExpression?)
+        case cte(CTEReference), function(TableFunctionPlan), jsonTable(JSONTablePlan), system(SystemRelationPlan), join(RelationPlan, RelationPlan, String, ResolvedExpression?)
     }
     let body: Body
     let columns: [ExpressionColumn]
@@ -20,7 +20,7 @@ internal final class RelationPlan {
     }
     var expressions: [ResolvedExpression] {
         switch body {
-        case .base, .cte: []
+        case .base, .cte, .system: []
         case .derived(let plan, _), .lateralDerived(let plan, _): plan.expressions
         case .function(let function): function.expressions
         case .jsonTable(let table): table.expressions
@@ -29,7 +29,7 @@ internal final class RelationPlan {
     }
     var foldExpressions: [ResolvedExpression] {
         switch body {
-        case .base, .cte: []
+        case .base, .cte, .system: []
         case .derived(let plan, _), .lateralDerived(let plan, _): plan.foldExpressions
         case .function(let function): function.expressions
         case .jsonTable(let table): table.expressions
@@ -48,6 +48,10 @@ internal final class RelationPlan {
                         collation: binding.collations[index]?.asColumn, unresolved: column.type == nil,
                         hiddenFromStar: binding.hiddenColumns.map { index >= $0 } ?? false) }
                     result = RelationPlan(body: .cte(binding.reference()), columns: columns)
+                    break
+                }
+                if let system = try SystemRelationPlan.resolve(name, alias: input.alias, snapshot: snapshot, settings: settings) {
+                    result = RelationPlan(body: .system(system), columns: system.columns)
                     break
                 }
                 if (name.database == nil || name.database?.description == "main"),
@@ -265,7 +269,18 @@ internal final class RelationExecution {
             return rows
         case .function(let function):
             var rows: [[SQLValue]] = []
-            try function.produce(context: context) { row in let value = masked(row); try reserve(value); rows.append(value) }
+            let admitsAsGenerated = function.function.name == "generate_series" || function.function.name == "unnest"
+            try function.produce(context: context) { row in
+                let value = masked(row)
+                if admitsAsGenerated { try reserve(value) }
+                rows.append(value)
+            }
+            if !admitsAsGenerated { for row in rows { try reserve(row) } }
+            return rows
+        case .system(let system):
+            var rows: [[SQLValue]] = []
+            try system.produce(context: context) { rows.append(masked($0)) }
+            for row in rows { try reserve(row) }
             return rows
         case .jsonTable(let table):
             var rows: [[SQLValue]] = []
@@ -300,6 +315,7 @@ internal final class RelationExecution {
             while let row = try execution.next() { let value = masked(row); try reserve(value); rows.append(value) }
             return rows
         case .join(let lhs, let rhs, let kind, let predicate):
+            if let island = NWayJoinPlan.resolve(plan) { return try materialize(island, touched: touched, context: context) }
             let localLateral = Set(rhs.lateralColumns.filter { $0 >= plan.precedingWidth }.map { $0 - plan.precedingWidth })
             var needed = touched.union(localLateral)
             if let predicate { StoredExpressionDependencies.walk([predicate]) { if case .column(let index) = $0.node { needed.insert(index) } } }
@@ -402,6 +418,76 @@ internal final class RelationExecution {
             for row in left + right { release(MemorySizes.row(row)) }
             return output
         }
+    }
+    private func materialize(_ island: NWayJoinPlan, touched: Set<Int>, context: ExpressionContext) throws -> [[SQLValue]] {
+        var needed = touched
+        StoredExpressionDependencies.walk(island.predicates) { if case .column(let index) = $0.node { needed.insert(index) } }
+        let masks = island.inputs.map { input in Set(needed.filter { $0 >= input.offset && $0 < input.offset + input.source.columns.count }.map { $0 - input.offset }) }
+        var relations = Array(repeating: [[SQLValue]](), count: island.inputs.count)
+        let indexed = Set(island.winner.steps.compactMap { step -> Int? in if case .indexed = step.algorithm { return step.input }; return nil })
+        for index in island.winner.order where !indexed.contains(index) {
+            relations[index] = try materialize(island.inputs[index].source, touched: masks[index], context: context)
+        }
+        func combined(_ prefix: [SQLValue]?, _ row: [SQLValue], input: NWayJoinPlan.Input) -> [SQLValue] {
+            var result = prefix ?? Array(repeating: .null, count: island.width)
+            for index in row.indices { result[input.offset + index] = row[index] }
+            return result
+        }
+        let driver = island.winner.order[0]
+        var running: [[SQLValue]] = []
+        for row in relations[driver] {
+            let value = combined(nil, row, input: island.inputs[driver]); try reserve(value); running.append(value)
+        }
+        for step in island.winner.steps {
+            let input = island.inputs[step.input]
+            var output: [[SQLValue]] = []
+            func keep(_ prefix: [SQLValue], _ row: [SQLValue]) throws {
+                try context.meter.pollStep()
+                let value = combined(prefix, row, input: input)
+                var current = context; current.column = { value[$0] }
+                for predicate in step.predicates where try !current.matches(predicate) { return }
+                try reserve(value); output.append(value)
+            }
+            switch step.algorithm {
+            case .indexed(let bound):
+                guard case .base(let store) = input.source.body else { throw JedError("XX000", "indexed island input is not a table") }
+                for prefix in running {
+                    var current = context; current.outerRows = [{ prefix[$0] }] + context.outerRows
+                    let access = try bound.bind(current)
+                    let columns = masks[step.input].sorted()
+                    try ScanCost.charge(store, touched: columns, meter: context.meter, access: access)
+                    var cursor = access.cursor(store); defer { cursor.close() }
+                    var candidates: [[SQLValue]] = []
+                    while let record = try cursor.next() {
+                        context.meter.charge(1); try context.meter.step()
+                        var row = Array(repeating: SQLValue.null, count: input.source.columns.count)
+                        for column in columns { row[column] = try record.materialize(column: column, pager: store.tree.pool?.pager) }
+                        if let filter = input.source.scanFilter {
+                            var filtered = context; filtered.column = { row[$0] }
+                            if try !filtered.matches(filter) { continue }
+                        }
+                        try reserve(row); candidates.append(row)
+                    }
+                    // Each seek materializes its candidate relation before ON.
+                    // Those rows overlap this prefix's output until its probe ends.
+                    for row in candidates { try keep(prefix, row) }
+                    for row in candidates { release(MemorySizes.row(row)) }
+                }
+            case .hash(let keys):
+                let rows = relations[step.input]
+                let hash = try HashJoinTable(rows: rows, keys: keys.map { (column: $0.inner, type: $0.type) }, context: context)
+                defer { hash.close() }
+                for prefix in running {
+                    try hash.probe(prefix, keys: keys.map { (column: $0.outer, type: $0.type) }) { try keep(prefix, rows[$0]) }
+                }
+            case .nested:
+                for prefix in running { for row in relations[step.input] { try keep(prefix, row) } }
+            }
+            for row in running { release(MemorySizes.row(row)) }
+            running = output
+        }
+        for rows in relations { for row in rows { release(MemorySizes.row(row)) } }
+        return running
     }
     func close() { rows = []; context.meter.resources.query.release(reserved); reserved = 0 }
     deinit { close() }

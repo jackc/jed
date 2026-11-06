@@ -9,7 +9,7 @@ internal struct SequenceHistory {
 /// Keeping this small pending set separate avoids aliasing the inout snapshot;
 /// successful statement publication applies both sets of edits together.
 internal final class SequenceExecution {
-    private let definitions: [SQLText: CatalogSequence]
+    private var definitions: [SQLText: CatalogSequence]
     private var pending: [SQLText: CatalogSequence] = [:]
     private(set) var history: SequenceHistory
     private let meter: CostMeter
@@ -21,12 +21,20 @@ internal final class SequenceExecution {
     }
 
     func install(into context: inout ExpressionContext) {
+        context.sequences = self
         let fallback = context.functions.stateCall
         context.functions.stateCall = { name, values in
             if ["nextval", "setval", "currval", "lastval"].contains(name) { return try self.call(name, values) }
             guard let fallback else { throw JedError("55000", "function requires an execution-owned service: \(name)") }
             return try fallback(name, values)
         }
+    }
+
+    /// Apply pending counters before editing definitions. Refreshing the action
+    /// namespace removes stale objects, including a dropped and reused name.
+    func synchronizeDefinitions(from image: CatalogImage) {
+        definitions = Dictionary(uniqueKeysWithValues: image.sequences.map { ($0.name, $0) })
+        pending.removeAll(keepingCapacity: false)
     }
 
     func apply(to snapshot: inout DomainSnapshot) throws {

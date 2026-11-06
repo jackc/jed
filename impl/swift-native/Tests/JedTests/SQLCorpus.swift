@@ -159,10 +159,11 @@ final class SQLCorpusRunner {
                 try configure(record.directives)
                 let params = try last("params", in: record.directives).map(ParameterDirective.parse) ?? []
                 let priorCost = session.lifetimeCost
+                var statementCost: Int64?
                 var actual: [String] = [], columnNames: [String] = [], columnTypes: [String] = [], failure: Error?
                 do {
                     let rows = try session.query(record.sql, parameters: params)
-                    defer { rows.close() }
+                    defer { statementCost = rows.cost; rows.close() }
                     columnNames = rows.columns.map { $0.name.description }
                     columnTypes = rows.columns.map { $0.type?.type.name ?? "unknown" }
                     var bytes = 0, cells = 0
@@ -180,7 +181,9 @@ final class SQLCorpusRunner {
                         }
                     }
                 } catch { failure = error }
-                let cost = session.lifetimeCost - priorCost
+                // Preparation meters may accrue separately to session lifetime.
+                // A returned cursor carries the statement's own cost contract.
+                let cost = statementCost ?? (session.lifetimeCost - priorCost)
                 var problems: [String] = []
                 switch record.kind {
                 case .statement(let expected):
@@ -195,6 +198,14 @@ final class SQLCorpusRunner {
                     else if columnNames.count != tags.count { problems.append("expected \(tags.count) columns, got \(columnNames.count)") }
                     else if !Self.match(record.expected, actual, tags: tags, sort: sort) {
                         problems.append("expected \(Self.preview(record.expected)), got \(Self.preview(actual))")
+                        if sort == .nosort, record.expected.count == actual.count,
+                           let index = actual.indices.first(where: {
+                               tags[$0 % tags.count] == 82
+                                   ? !Self.realEqual(record.expected[$0], actual[$0])
+                                   : !record.expected[$0].utf8.elementsEqual(actual[$0].utf8)
+                           }) {
+                            problems.append("first differing cell \(index + 1): expected \(Self.preview([record.expected[index]])), got \(Self.preview([actual[index]]))")
+                        }
                     }
                 }
                 if let expected = try integer("cost", in: record.directives) {

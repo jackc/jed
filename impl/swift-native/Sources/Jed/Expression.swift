@@ -49,6 +49,7 @@ internal struct ExpressionContext {
     let meter: CostMeter
     var collatedKey: KeyEncoding.CollatedKey?
     var functions = ScalarFunctions.Environment()
+    var sequences: SequenceExecution?
     var patterns = PatternExecution()
     var outerRows: [(Int) throws -> SQLValue] = []
     var subqueries = SubqueryExecution()

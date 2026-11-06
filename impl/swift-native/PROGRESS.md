@@ -4,6 +4,48 @@ Status: **active implementation; incomplete**. Baseline:
 `362e0798ac3a8bd04bd2da556044b6ec73bf468a` (2026-11-05).
 Branch: `codex/swift-native-experiment`, local-only, not pushed.
 
+## Current integration checkpoint (2026-11-05 21:22 CST)
+
+Latest focused command: `mise run swift-native:test --filter
+'SQLCorpusBoundary|StatementAdmissionBoundary|BackupBoundary|HeldKeyBoundary|PageServiceMaintenance'`.
+**16 non-SQL tests pass; the whole-file SQL test remains failing.** It completed
+229 of 232 selected files from 749 frozen files: 6,471 records (4,142 statements,
+2,329 queries), 9,379 cells, 506 cost / 874 name / 13 type assertions, **71 SQL
+failures**. Three selected files are explicitly adapter-blocked on attachment
+directives; 517 files are not admitted yet. Full log:
+`/tmp/jed-swift-native-sql-232.log`. No record expectations or frozen inputs changed.
+
+The preceding 222-file gate completed 219 files / 6,059 records with 97 SQL
+failures and the same three attachment blocks. The current gate adds all ten
+whole `ON CONFLICT` files and verifies ALTER column/constraint rewrites, privilege
+preflight, system-relation metadata, and broader join planning. New upsert files
+fail only at currently missing writable-CTE and GIN-DDL paths and their downstream
+effects. Remaining failures also include temp/attachment routing, EXPLAIN, and a
+USING-column view-definition rendering issue; this is not full SQL acceptance.
+
+The native boundaries cover five backup tests (including 87 ordinary frozen file
+images), four held-key recovery classifications, three page-service maintenance
+tests, two privilege/JSON production-order tests and two corpus-adapter tests.
+Successful/mid-drain cost assertions now use `Rows.cost`; only failures before a
+cursor exists fall back to session-lifetime delta. This preserves the recorded
+frozen ALTER preparation lifetime behavior while checking statement cost correctly.
+
+Local-only checkpoints `40c9c6a4` and `f615ed6b` contain automatic Linux file
+ownership/page service and the previous SQL expansion respectively. The next
+uncommitted slice adds the features above plus a native `jed-process` executable,
+strict opt-in driver selection and all 31 frozen process scenarios. Initial
+`mise run swift-native:process --no-build` completed **22 passing / nine failing**
+Swift-to-Swift scenarios (`/tmp/jed-swift-native-process-first.log`). Four require
+attachments and two require stream transport, both still unconnected. The other
+three expose a backup free-list-count mismatch and two client-close failures after
+the owner exits; these are active defects, not skipped acceptance. Current frozen-input
+fingerprint: `52909f248d3829bbbed754ca784fa0a4e5a3b105af0fa505028683b5cb7c6249`.
+
+Active next work: writable CTEs and mutation ordering (query/DML agents), staged
+multi-domain commit (host agent), attachment/temp snapshot routing and integration
+(root). Apple builds, complete shared acceptance, interchange, simulation and
+measured optimization remain outstanding. Older ledger entries below are historical.
+
 ## Accepted constraints
 
 Read [experiment design](../../spec/design/swift-native-experiment.md),
@@ -337,6 +379,33 @@ Review also identified the same delayed-admission requirement for other bounded
 SRFs and a missing general statement privilege-preflight phase (a denied-source
 CTAS must reject before an invalid target name); these are outstanding corrections.
 
+
+Next integration (after local-only SQL checkpoint `f615ed6b`) adds the nine main
+catalog relations, ALTER ADD/DROP/TYPE/PRIMARY KEY rewrites, initial costed N-way
+base join islands, bounded-SRF admission corrections and post-ack page maintenance.
+The first 219-file attempt compiled after two Swift-only annotation/exclusivity
+fixes. At 21:08 CST, all 14 selected native tests passed (CTAS2, FK2, Automatic7,
+Maintenance3), as did two corpus-adapter checks; the SQL run aborted while parsing
+`introspection/attached.test` because its `attach` harness action is unconnected.
+Log: `/tmp/jed-swift-native-sql-219-3.log`. This is **not** a completed219-file run.
+The adapter now records each blocked file as an explicit failure, continues with
+other selected files and distinguishes completed from selected files. No file or
+expected result was removed. A follow-up run is pending, with statement privilege
+preflight, three whole privilege files and backup boundary coverage being added.
+
+Independent review verified main-domain catalog shape/rendering/cost and corrected
+N-way physical/logical cardinality and per-prefix INL Q1 retention, ALTER CHECK
+name ordering and deferred preparation-cost admission, and bounded JSON producer
+row-cost timing. Statement privilege review corrected short INSERT-row default
+selection, first duplicate target selection, non-updatable invoker-view descent
+and function error ordering. TEMP/attachment catalog scopes, MERGE-view admission
+and the shared process/simulation adapter remain incomplete.
+
+Potential separate shared defect: frozen ALTER TYPE default conversions accrue
+lifetime cost in their preparation meters and again when transferring prepCost to
+the statement meter. Preserved for frozen conformance, not adopted as new design.
+Evidence: Go ddl.go2723–2733/2873–2877 and engine.go1442–1446; Rust executor/ddl.rs
+3658–3661/3874–3876 and executor/mod.rs1271–1282; TS executor.ts10163–10174/10310–10312.
 
 Verified integration (2026-11-05 19:24 CST): **250 tests passed, zero failures**
 with `mise run swift-native:test` (82.999 seconds). The public

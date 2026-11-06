@@ -148,11 +148,16 @@ internal final class TableFunctionPlan {
             let rows = try JSONPathFunctions.query(context: JSONFunctions.node(values[0]), path: path,
                 variables: JSONFunctions.node(values[2]), silent: silent, meter: meter, regexCompiler: JsonScalarFunctions.regexCompiler(context))
             defer { rows.close() }
-            while let value = try rows.next() { try emit([.jsonb(value)]) }
+            var items: [SQLJSONValue] = []
+            while let value = try rows.next() { items.append(value) }
+            // Relation generation follows complete path evaluation. The cursor
+            // remains the retained kernel seam used by other streaming callers.
+            for value in items { try emit([.jsonb(value)]) }
         } else {
             let array = name.contains("array_elements"), keys = name.contains("object_keys"), text = name.hasSuffix("_text")
-            try JSONFunctions.each(values[0], array: array, asText: text, keysOnly: keys, meter: meter) { key, value in
-                try emit(keys ? [.text(key!)] : array ? [value] : [.text(key!), value]); return true
+            try JSONFunctions.each(values[0], array: array, asText: text, keysOnly: keys, meter: meter,
+                constant: function.constantArguments[0], beforeElement: { meter.charge(1); try meter.checkpoint() }) { key, value in
+                try visit(keys ? [.text(key!)] : array ? [value] : [.text(key!), value]); return true
             }
         }
     }

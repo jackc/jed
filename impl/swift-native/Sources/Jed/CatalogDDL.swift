@@ -283,12 +283,14 @@ internal enum CatalogDDL {
     static func defaultValue(_ expression: SQLExpression, target: TypeDescriptor, source: SQLText,
                              resolver: ExpressionResolver, context: ExpressionContext) throws -> CatalogDefault? {
         try CatalogExpressionPolicy.validate(expression, isDefault: true)
-        if case .null = expression.kind { return nil }
+        var literal = expression
+        while case .parenthesized(let inner) = literal.kind { literal = inner }
+        if case .null = literal.kind { return nil }
         if case .array = target.type { throw JedError("0A000", "array columns support only DEFAULT NULL") }
         if case .range = target.type { throw JedError("0A000", "range columns support only DEFAULT NULL") }
         let resolved = try AssignmentValues.resolve(expression, to: target, resolver: resolver)
         if case .composite = target.type { return .expression(try CatalogSQL.expression(expression, source: source)) }
-        switch expression.kind {
+        switch literal.kind {
         case .string(let text):
             return .constant(try ScalarCasts.input(text, to: target, explicit: false, context: resolver.scalar))
         case .number, .boolean:
@@ -331,6 +333,7 @@ internal enum CatalogDDL {
         var targets: Set<SQLText> = []
         let relations = CatalogSQL.relationNames(snapshot.catalog)
         for input in definition.names {
+            if definition.object == "table" { try SystemRelationPlan.rejectTarget(input.name, dropping: true) }
             let name = try nameInMain(input)
             let exists = definition.object == "type" ? snapshot.types[name] != nil : snapshot.catalog.tables.contains { $0.name == name }
             if exists { targets.insert(name) }

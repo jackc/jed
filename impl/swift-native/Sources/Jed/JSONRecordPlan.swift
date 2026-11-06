@@ -45,11 +45,17 @@ internal enum JSONRecordPlan {
         else { base = Array(repeating: .null, count: fields.count) }
         func emit(_ object: SQLValue) throws {
             var result = base
+            // Verbatim JSON decodes each element before generated_row, except an
+            // array root: its kind error precedes reading anything inside it.
+            if case .json(let text) = object,
+               text.utf8.first(where: { ![9, 10, 13, 32].contains($0) }) != 91 {
+                _ = try JSONDocument(text, decodeStrings: true)
+            }
+            context.meter.charge(1); try context.meter.checkpoint()
             if !object.isNull {
-                let error = JedError("22023", "cannot call a record function on a non-object")
-                if case .json(let text) = object {
-                    _ = try JSONDocument(text, decodeStrings: true, expectedRoot: "object", rootError: error)
-                } else if try JSONFunctions.typeOf(object).description != "object" { throw error }
+                guard try JSONFunctions.typeOf(object).description == "object" else {
+                    throw JedError("22023", "cannot call a record function on a non-object")
+                }
                 for (index, field) in fields.enumerated() {
                     let value = try JSONFunctions.field(object, key: field.name, constant: true, meter: context.meter)
                     if value.isNull { continue }
@@ -59,7 +65,7 @@ internal enum JSONRecordPlan {
                     else { result[index] = try ResolvedJSONExpression.coerce(node, to: field.descriptor, context: context) }
                 }
             }
-            context.meter.charge(1); try context.meter.checkpoint(); try visit(result)
+            try visit(result)
         }
         if set {
             guard !document.isNull else { return }
@@ -68,6 +74,6 @@ internal enum JSONRecordPlan {
                     rootError: JedError("22023", "cannot call a recordset function on a non-array"))
             }
             try JSONFunctions.each(document, array: true, meter: context.meter) { _, item in try emit(item); return true }
-        } else { try emit(document) }
+        } else if populate || !document.isNull { try emit(document) }
     }
 }

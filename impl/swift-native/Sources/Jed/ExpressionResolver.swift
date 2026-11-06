@@ -10,6 +10,8 @@ internal struct ExpressionColumn {
     var unresolved = false
     var scalarFunction = false
     var hiddenFromStar = false
+    /// Only ON CONFLICT can introduce two relations under the label excluded.
+    var ambiguousRelation = false
 }
 
 /// One resolver per statement. Parameter inference is shared across every
@@ -106,6 +108,9 @@ internal final class ExpressionResolver {
             // the widest integer constraint across the complete statement.
             return result(expected.map { TypeDescriptor($0.type) } ?? parameters[index], .parameter(index))
         case .column(let qualifier, let name):
+            if let qualifier, columns.contains(where: { $0.qualifier == qualifier && $0.ambiguousRelation }) {
+                throw JedError("42P09", "table reference is ambiguous: \(qualifier)")
+            }
             let candidates = columns.filter { $0.name == name && (qualifier == nil ? !$0.qualifiedOnly : $0.qualifier == qualifier) }
             if candidates.isEmpty { return try resolveOuterColumn(qualifier: qualifier, name: name, position: syntax.position) }
             guard !candidates.isEmpty else { throw JedError("42703", "column does not exist: \(name)") }
