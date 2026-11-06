@@ -7,52 +7,38 @@ import Glibc
 import Darwin
 #endif
 
-/// Destination-only OS adapter. The engine supplies pages and retains its
+/// Destination publication policy. The engine supplies pages and retains its
 /// source pin; this host owns the temporary inode and atomic publication.
 internal enum FileBackupHost {
     static func write(destination original: String, skipFsync: Bool,
+                      operations: any FileOperations = NativeFileOperations(),
                       checkRole: () throws -> Void,
-                      body: (UnixBlockStore) throws -> Void) throws {
-        let path = try FileLockBundle.normalize(original, creating: true)
-        var info = stat()
-        if path.withCString({ lstat($0, &info) }) == 0 {
+                      body: (any FileBlockStore) throws -> Void) throws {
+        let path = try operations.resolve(original, creating: true)
+        if try operations.exists(path) {
             throw JedError("58P02", "database file already exists: \(path)")
         }
-        guard errno == ENOENT else { throw io("inspect backup destination") }
         let temporary = path + ".jedtmp"
         // O_EXCL prevents two copies to one destination from sharing an inode.
         // An existing temp file belongs to its creator and is not removed here.
-        let store = try UnixBlockStore(path: temporary, mode: .createExclusive,
-                                      durability: skipFsync ? .unsynced : .durable)
+        let store = try operations.create(temporary, skipFsync: skipFsync)
         var published = false, complete = false
         defer {
             try? store.close()
             if !complete {
-                _ = (published ? path : temporary).withCString { unlink($0) }
-                if published { try? FileDatabaseHost.syncDirectory(path, skip: skipFsync) }
+                try? operations.remove(published ? path : temporary)
+                if published { try? operations.syncDirectory(path, skipFsync: skipFsync) }
             }
         }
         try body(store)
         try store.sync()
         try store.close()
         try checkRole()
-        let result = temporary.withCString { source in path.withCString { target in
-            jed_host_rename_noreplace(source, target)
-        } }
-        guard result == 0 else {
-            if errno == EEXIST { throw JedError("58P02", "database file already exists: \(path)") }
-            if errno == ENOSYS || errno == EOPNOTSUPP || errno == EINVAL {
-                throw JedError("0A000", "atomic no-replace file publication is unavailable")
-            }
-            throw io("publish backup file")
-        }
+        try operations.rename(temporary, to: path, replace: false)
         published = true
-        try FileDatabaseHost.syncDirectory(path, skip: skipFsync)
+        try operations.syncDirectory(path, skipFsync: skipFsync)
         try checkRole()
         complete = true
-    }
-    private static func io(_ operation: String) -> JedError {
-        JedError("58030", "\(operation) failed (errno \(errno))")
     }
 }
 #endif

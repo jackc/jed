@@ -104,6 +104,7 @@ extension Database {
         if let service = host as? ServiceDatabaseHost { skip = service.skipsFsync }
         #endif
         try FileBackupHost.write(destination: destination, skipFsync: skip,
+            operations: (host as? any DatabaseFilesystemProvider)?.fileOperations ?? localFileHost?.fileOperations ?? NativeFileOperations(),
             checkRole: { try source.pin.checkRole() }) { store in
             let image = try BackupImage.write(source, form: form, entropy: keyEntropy) { page in
                 try store.write(at: UInt64(page.index) * UInt64(page.bytes.count), bytes: page.bytes)

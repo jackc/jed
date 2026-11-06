@@ -10,19 +10,21 @@ import Darwin
 
 /// Native file ownership is retained independently of query snapshots. Closing
 /// the byte descriptor precedes releasing presence, including failure cleanup.
-internal final class FileDatabaseHost: DatabaseHostLifetime {
+internal final class FileDatabaseHost: DatabaseHostLifetime, DatabaseFilesystemProvider {
     let path: String
-    private struct State { var store: UnixBlockStore; var closed = false; var poisoned = false }
+    private struct State { var store: any FileBlockStore; var closed = false; var poisoned = false }
     private let state: Mutex<State>
-    var store: UnixBlockStore { state.withLock { $0.store } }
-    let scratch: NativeScratchFileHost
+    var store: any FileBlockStore { state.withLock { $0.store } }
+    let scratch: any ScratchFileHost
+    let fileOperations: any FileOperations
     private let bundle: FileLockBundle?
     private let opener: pid_t
     private let skipFsync: Bool
     var skipsFsync: Bool { skipFsync }
-    private init(path: String, store: UnixBlockStore, bundle: FileLockBundle?, skipFsync: Bool, sealedScratch: Bool) {
+    private init(path: String, store: any FileBlockStore, bundle: FileLockBundle?, skipFsync: Bool,
+                 operations: any FileOperations, scratch: any ScratchFileHost) {
         self.path = path; self.state = Mutex(State(store: store)); self.bundle = bundle; self.skipFsync = skipFsync; opener = getpid()
-        scratch = NativeScratchFileHost(sealed: sealedScratch)
+        self.fileOperations = operations; self.scratch = scratch
     }
     func checkOpen() throws {
         try state.withLock { state in
@@ -44,7 +46,7 @@ internal final class FileDatabaseHost: DatabaseHostLifetime {
     deinit { try? close() }
 
     func poison() { state.withLock { $0.poisoned = true } }
-    func syncDirectory() throws { try Self.syncDirectory(path, skip: skipFsync) }
+    func syncDirectory() throws { try fileOperations.syncDirectory(path, skipFsync: skipFsync) }
 
     /// All preparation writes go to the private replacement. The caller holds
     /// the writer gate and pin registry until the new storage is published.
@@ -59,12 +61,11 @@ internal final class FileDatabaseHost: DatabaseHostLifetime {
             let temporary = path + ".jedtmp"
             // A previous interrupted maintenance may leave this disposable
             // sibling. Unlinking first also avoids following a stale symlink.
-            if temporary.withCString({ unlink($0) }) != 0, errno != ENOENT { throw Self.io("remove stale maintenance image") }
-            let target = try UnixBlockStore(path: temporary, mode: .createExclusive,
-                durability: skipFsync ? .unsynced : .durable)
+            try fileOperations.remove(temporary)
+            let target = try fileOperations.create(temporary, skipFsync: skipFsync)
             var renamed = false
-            defer { try? target.close(); if !renamed { _ = temporary.withCString { unlink($0) } } }
-            try target.setPermissions(state.store.permissions())
+            defer { try? target.close(); if !renamed { try? fileOperations.remove(temporary) } }
+            try fileOperations.copyPermissions(from: state.store, to: target)
             let image = try DomainImage.write(snapshot, txid: txid, codec: codec, keyBlock: keyBlock, entropy: entropy) { page in
                 try target.write(at: UInt64(page.index) * UInt64(codec.pageSize), bytes: page.bytes)
             }
@@ -78,16 +79,17 @@ internal final class FileDatabaseHost: DatabaseHostLifetime {
                 do { try state.store.reopen(path: path) } catch { state.poisoned = true; source.pager.revoke() }
                 throw error
             }
-            if temporary.withCString({ from in path.withCString { to in rename(from, to) } }) != 0 {
-                let failure = Self.io("replace database image")
+            do { try fileOperations.rename(temporary, to: path, replace: true) }
+            catch {
+                let failure = error
                 do { try state.store.reopen(path: path) } catch { state.poisoned = true; source.pager.revoke() }
                 throw failure
             }
             renamed = true; source.pager.revoke()
-            var opened: UnixBlockStore?
+            var opened: (any FileBlockStore)?
             do {
-                try Self.syncDirectory(path, skip: skipFsync)
-                let device = try UnixBlockStore(path: path, mode: .readWrite, durability: skipFsync ? .unsynced : .durable)
+                try fileOperations.syncDirectory(path, skipFsync: skipFsync)
+                let device = try fileOperations.open(path, readOnly: false, skipFsync: skipFsync)
                 opened = device
                 let capacity = source.pool.capacity.map { $0 * codec.pageSize }
                 let replacement = try StorageDomain.open(store: device, kind: .file, catalogID: snapshot.catalogID,
@@ -95,7 +97,7 @@ internal final class FileDatabaseHost: DatabaseHostLifetime {
                     collatedKey: { try environment.unicode.key($0, collation: $1) },
                     collationVerdict: { try CatalogEnvironment.verdict($0, environment: environment) },
                     validateCatalog: { try CatalogEnvironment.validate($0, environment: environment) },
-                    durableDirectorySync: { [path, skipFsync] in try Self.syncDirectory(path, skip: skipFsync) })
+                    durableDirectorySync: { [fileOperations, path, skipFsync] in try fileOperations.syncDirectory(path, skipFsync: skipFsync) })
                 replacement.pager.acknowledgeFreshDurableImage()
                 state.store = device
                 return replacement
@@ -103,14 +105,6 @@ internal final class FileDatabaseHost: DatabaseHostLifetime {
         }
     }
 
-    private static func io(_ operation: String) -> JedError { JedError("58030", "\(operation) failed (errno \(errno))") }
-    private static func closeFD(_ fd: Int32) {
-        #if os(Linux)
-        _ = Glibc.close(fd)
-        #else
-        _ = Darwin.close(fd)
-        #endif
-    }
     private static func lock(path: String, mode: FileLocking, timeout: Int64) throws -> FileLockBundle? {
         guard timeout >= 0 else { throw JedError("22023", "negative file lock timeout") }
         switch mode {
@@ -120,65 +114,42 @@ internal final class FileDatabaseHost: DatabaseHostLifetime {
         }
     }
     static func syncDirectory(_ path: String, skip: Bool) throws {
-        if skip { return }
-        let directory = URL(fileURLWithPath: path).deletingLastPathComponent().path
-        let fd = directory.withCString {
-            #if os(Linux)
-            Glibc.open($0, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
-            #else
-            Darwin.open($0, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
-            #endif
-        }
-        guard fd >= 0 else { throw io("open database directory") }
-        defer { closeFD(fd) }
-        while fsync(fd) != 0 { if errno != EINTR { throw io("sync database directory") } }
-    }
-    private static func exists(_ path: String) throws -> Bool {
-        var info = stat()
-        if path.withCString({ lstat($0, &info) }) == 0 { return true }
-        if errno == ENOENT { return false }; throw io("inspect create destination")
-    }
-    private static func temporaryPath(_ path: String) throws -> String {
-        let bytes = try OSRandomSource().bytes(count: 16), digits = Array("0123456789abcdef".utf8)
-        return path + ".create-" + String(decoding: bytes.flatMap { [digits[Int($0 >> 4)], digits[Int($0 & 15)]] }, as: UTF8.self)
-    }
-    /// Native no-replace rename avoids a check/publish race even when the caller
-    /// deliberately selected external coordination with locking=none.
-    private static func publish(_ temporary: String, to path: String) throws {
-        let result = temporary.withCString { source in path.withCString { target in
-            jed_host_rename_noreplace(source, target)
-        } }
-        guard result == 0 else {
-            if errno == EEXIST { throw JedError("58P02", "database file already exists: \(path)") }
-            if errno == ENOSYS || errno == EOPNOTSUPP || errno == EINVAL { throw JedError("0A000", "atomic no-replace file publication is unavailable") }
-            throw io("publish database file")
-        }
+        try NativeFileOperations().syncDirectory(path, skipFsync: skip)
     }
     static func create(path original: String, options: CreateOptions, catalogID: UInt64, random: any RandomSource,
                        bundle supplied: FileLockBundle? = nil) throws -> Database {
         try PageEnvelope.validateSize(options.pageSize, encrypted: options.credential != nil, opening: false)
         let path = try FileLockBundle.normalize(original, creating: true)
         let bundle = try supplied ?? lock(path: path, mode: options.locking, timeout: options.fileLockTimeoutMilliseconds)
+        return try createResolved(path: path, options: options, catalogID: catalogID, random: random,
+            operations: NativeFileOperations(), bundle: bundle)
+    }
+    /// Resolved pathname and ownership are supplied by the host. Both native and
+    /// simulated files execute this exact creation/publication sequence.
+    static func createResolved(path: String, options: CreateOptions, catalogID: UInt64, random: any RandomSource,
+                               operations: any FileOperations, scratch: (any ScratchFileHost)? = nil,
+                               bundle: FileLockBundle? = nil) throws -> Database {
         var host: FileDatabaseHost?
         var temporary: String?
         do {
-            guard try !exists(path) else { throw JedError("58P02", "database file already exists: \(path)") }
-            let temporaryPath = try self.temporaryPath(path)
-            let store = try UnixBlockStore(path: temporaryPath, mode: .createExclusive, durability: options.skipFsync ? .unsynced : .durable)
+            try PageEnvelope.validateSize(options.pageSize, encrypted: options.credential != nil, opening: false)
+            guard try !operations.exists(path) else { throw JedError("58P02", "database file already exists: \(path)") }
+            let temporaryPath = try operations.temporaryCreatePath(path)
+            let store = try operations.create(temporaryPath, skipFsync: options.skipFsync)
             temporary = temporaryPath
             let owner = FileDatabaseHost(path: path, store: store, bundle: bundle, skipFsync: options.skipFsync,
-                sealedScratch: options.credential != nil || options.scratchEncryption == .on)
+                operations: operations, scratch: scratch ?? NativeScratchFileHost(sealed: options.credential != nil || options.scratchEncryption == .on))
             host = owner
             let storage = try StorageDomain.create(store: store, kind: .file, catalogID: catalogID,
                 pageSize: options.pageSize, cacheBytes: options.cacheBytes, credential: options.credential,
                 parameters: options.kdf, entropy: { try random.bytes(count: $0) })
-            try publish(temporaryPath, to: path); temporary = nil
-            try syncDirectory(path, skip: options.skipFsync)
+            try operations.rename(temporaryPath, to: path, replace: false); temporary = nil
+            try operations.syncDirectory(path, skipFsync: options.skipFsync)
             return Database(core: DatabaseCore(storage: storage, environment: options.environment), environment: options.environment,
                 maxStorageBytes: options.maxStorageBytes, keySource: random, host: owner)
         } catch {
             if let host { try? host.close() } else { bundle?.close() }
-            if let temporary { _ = temporary.withCString { unlink($0) } }
+            if let temporary { try? operations.remove(temporary) }
             throw error
         }
     }
@@ -188,12 +159,19 @@ internal final class FileDatabaseHost: DatabaseHostLifetime {
         let path = try FileLockBundle.normalize(original, creating: false)
         if options.locking != .none { try FileLockBundle.checkHardLinks(path) }
         let bundle = try supplied ?? lock(path: path, mode: options.locking, timeout: options.fileLockTimeoutMilliseconds)
-        var host: FileDatabaseHost?
-        var store: UnixBlockStore?
         do {
             if options.locking != .none { try FileLockBundle.checkHardLinks(path) }
-            let device = try UnixBlockStore(path: path, mode: options.readOnly ? .readOnly : .readWrite,
-                durability: options.skipFsync ? .unsynced : .durable)
+            return try openResolved(path: path, options: options, catalogID: catalogID, operations: NativeFileOperations(),
+                bundle: bundle, unlockedCodec: unlockedCodec, structural: structural)
+        } catch { bundle?.close(); throw error }
+    }
+    static func openResolved(path: String, options: OpenOptions, catalogID: UInt64, operations: any FileOperations,
+                             scratch: (any ScratchFileHost)? = nil, bundle: FileLockBundle? = nil,
+                             unlockedCodec: EncryptedPageCodec? = nil, structural: Bool = false) throws -> Database {
+        var host: FileDatabaseHost?
+        var store: (any FileBlockStore)?
+        do {
+            let device = try operations.open(path, readOnly: options.readOnly, skipFsync: options.skipFsync)
             store = device
             let storage = try StorageDomain.open(store: device, kind: .file, catalogID: catalogID,
                 cacheBytes: options.cacheBytes, credential: options.credential, readOnly: options.readOnly, unlockedCodec: unlockedCodec,
@@ -201,10 +179,10 @@ internal final class FileDatabaseHost: DatabaseHostLifetime {
                 collatedKey: { try options.environment.unicode.key($0, collation: $1) },
                 collationVerdict: { if structural { return false }; return try CatalogEnvironment.verdict($0, environment: options.environment) },
                 validateCatalog: { if !structural { try CatalogEnvironment.validate($0, environment: options.environment) } },
-                durableDirectorySync: { try syncDirectory(path, skip: options.skipFsync) },
-                syncDirectory: { try syncDirectory(path, skip: options.skipFsync) })
+                durableDirectorySync: { try operations.syncDirectory(path, skipFsync: options.skipFsync) },
+                syncDirectory: { try operations.syncDirectory(path, skipFsync: options.skipFsync) })
             let owner = FileDatabaseHost(path: path, store: device, bundle: bundle, skipFsync: options.skipFsync,
-                sealedScratch: storage.pager.codec.reservedBytes != 0 || options.scratchEncryption == .on)
+                operations: operations, scratch: scratch ?? NativeScratchFileHost(sealed: storage.pager.codec.reservedBytes != 0 || options.scratchEncryption == .on))
             host = owner
             return Database(core: DatabaseCore(storage: storage, environment: options.environment), environment: options.environment,
                 maxStorageBytes: options.maxStorageBytes, host: owner)
