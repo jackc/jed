@@ -5,6 +5,7 @@ import Synchronization
 public final class Database: Sendable {
     private static let nextCatalog = Atomic<UInt64>(1)
     internal let core: DatabaseCore
+    internal let domains = DatabaseDomains()
     internal let host: (any DatabaseHostLifetime)?
     public let environment: Environment
     private let keySource: Mutex<any RandomSource>
@@ -60,7 +61,20 @@ public final class Database: Sendable {
         try session().execute(sql, parameters: parameters, cancellation: cancellation)
     }
     public func flush() throws { try checkOpen(); try core.maintenance { try core.storage.pager.flush() } }
+    public func attach(_ name: SQLText, source: AttachSource, readOnly: Bool) throws {
+        try checkOpen(); try domains.attach(name, source: source, readOnly: readOnly, main: self)
+    }
+    public func detach(_ name: SQLText) throws { try checkOpen(); try domains.detach(name) }
+    public func setMaxStorageBytes(_ name: SQLText, _ limit: Int64) throws {
+        try checkOpen()
+        guard limit >= 0 else { throw JedError("22023", "negative storage limit") }
+        if name == DomainNames.main { maxStorageBytes = limit }
+        else { try domains.handle(name).maxStorageBytes = limit }
+    }
     public func close() throws {
+        try domains.withClose(main: self) { try closePrimary() }
+    }
+    private func closePrimary() throws {
         if isClosed { return }
         if let coordinated = host as? any CoordinatedDatabaseClose {
             do { try coordinated.closeDatabase(core); state.withLock { $0.closed = true } }
@@ -81,24 +95,46 @@ public final class Database: Sendable {
 public enum TransactionStatus: Sendable { case idle, open, failed }
 
 internal final class SessionTransaction {
-    struct Savepoint { let name: SQLText; let snapshot: DomainSnapshot; let sequences: SequenceHistory }
+    struct Savepoint {
+        let name: SQLText; let snapshot: QueryDomains; let sequences: SequenceHistory
+        let temporaryActions: [SQLText: String]
+    }
     private final class CursorReference {
         weak var rows: Rows?
         init(_ rows: Rows) { self.rows = rows }
     }
-    var working: DomainSnapshot
-    let writer: WriterLease?
-    let pin: SnapshotPin?
+    var working: QueryDomains
+    let writer: DomainWriteBundle?
+    let pin: DomainReadBundle?
+    let temporaryWriter: WriterLease
+    var temporaryActions: [SQLText: String]
     var failed = false
     var savepoints: [Savepoint] = []
     var savedSequences = SequenceHistory()
     private var cursors: [CursorReference] = []
-    init(writer: WriterLease) { self.writer = writer; pin = nil; working = writer.snapshot }
-    init(pin: SnapshotPin) { writer = nil; self.pin = pin; working = pin.snapshot }
-    func checkRole() throws { try writer?.checkRole(); try pin?.checkRole() }
-    func cursorPin() throws -> SnapshotPin {
-        if let writer { return try writer.pin(working) }
-        return try pin!.retain()
+    init(writer: DomainWriteBundle, temporary: WriterLease, actions: [SQLText: String]) {
+        self.writer = writer; pin = nil; working = writer.initial
+        temporaryWriter = temporary; temporaryActions = actions
+        working.snapshots[DomainNames.temporary] = temporary.snapshot
+    }
+    init(pin: DomainReadBundle, temporary: WriterLease, actions: [SQLText: String]) {
+        writer = nil; self.pin = pin; working = pin.domains
+        temporaryWriter = temporary; temporaryActions = actions
+        working.snapshots[DomainNames.temporary] = temporary.snapshot
+    }
+    func checkRole() throws { try writer?.checkRole(); try pin?.checkRole(); try temporaryWriter.checkRole() }
+    func cursorPin() throws -> DomainReadBundle {
+        let result = try writer?.pin(working) ?? pin!.retain()
+        do {
+            result.install(try temporaryWriter.pin(working.snapshot(DomainNames.temporary)), for: DomainNames.temporary)
+            return result
+        } catch { result.close(); throw error }
+    }
+    var writableDomains: Set<SQLText> { Set(writer?.leases.keys.map { $0 } ?? []).union([DomainNames.temporary]) }
+    func requireWritable(_ name: SQLText) throws {
+        if name == DomainNames.temporary { return }
+        guard let writer else { throw JedError("25006", "cannot execute a write in a read-only transaction") }
+        try writer.requireWritable(name)
     }
     func own(_ rows: Rows) -> Rows {
         cursors.removeAll { $0.rows == nil || $0.rows?.isClosed == true }
@@ -108,7 +144,7 @@ internal final class SessionTransaction {
     func close() {
         let opened = cursors; cursors = []
         for cursor in opened { cursor.rows?.close() }
-        writer?.close(); pin?.close()
+        temporaryWriter.close(); writer?.close(); pin?.close()
     }
     deinit { close() }
 }
@@ -120,13 +156,16 @@ public final class Session {
     internal var settings: SessionSettings
     internal var transaction: SessionTransaction?
     private var sequenceHistory = SequenceHistory()
-    private let readPin: SnapshotPin?
+    private var temporary: TemporaryDomain?
+    private var temporaryActions: [SQLText: String] = [:]
+    private let readPin: DomainReadBundle?
     private var closed = false
     private var scoped = false
     internal init(database: Database, options: SessionOptions, readOnly: Bool) throws {
         self.database = database
         settings = SessionSettings(environment: database.environment, options: options)
-        readPin = try readOnly ? database.core.beginRead() : nil
+        readPin = try readOnly ? database.domains.read(main: database) : nil
+        temporary = try TemporaryDomain(database: database, bufferBytes: options.temporaryBufferBytes)
     }
     public var status: TransactionStatus { transaction.map { $0.failed ? .failed : .open } ?? .idle }
     public var isClosed: Bool { closed }
@@ -167,13 +206,53 @@ public final class Session {
     private func requireClean() throws {
         if transaction?.failed == true { throw JedError("25P02", "current transaction is aborted, commands ignored until end of transaction block") }
     }
+    private func readBundle() throws -> DomainReadBundle {
+        if let transaction { return try transaction.cursorPin() }
+        let result = try readPin?.retain() ?? database.domains.read(main: database)
+        do {
+            result.install(try temporary!.core.beginRead(), for: DomainNames.temporary)
+            return result
+        } catch { result.close(); throw error }
+    }
+    private func writeFrame(shared: Bool, cancellation: CancellationToken?) throws -> SessionTransaction {
+        if let transaction { return transaction }
+        let privateWriter = try temporary!.core.acquireWriter(cancellation: cancellation)
+        do {
+            if shared {
+                guard readPin == nil, !database.isReadOnly else { throw JedError("25006", "cannot execute a write in a read-only transaction") }
+                let writer = try database.domains.acquire(main: database, cancellation: cancellation,
+                    timeoutMilliseconds: settings.options.lockTimeoutMilliseconds)
+                return SessionTransaction(writer: writer, temporary: privateWriter, actions: temporaryActions)
+            }
+            return SessionTransaction(pin: try readPin?.retain() ?? database.domains.read(main: database),
+                temporary: privateWriter, actions: temporaryActions)
+        } catch { privateWriter.close(); throw error }
+    }
+    private func publish(_ frame: SessionTransaction) throws {
+        var working = frame.working, actions = frame.temporaryActions
+        var temp = try working.snapshot(DomainNames.temporary)
+        var commitSettings = settings; commitSettings.domains = working; commitSettings.targetDomain = DomainNames.temporary
+        if try TemporaryCommitActions.apply(snapshot: &temp, actions: &actions, settings: commitSettings) {
+            try temporary!.checkBudget(settings.options.maxTemporaryStorageBytes)
+        }
+        working.snapshots[DomainNames.temporary] = temp
+        try temporary!.configure(bufferBytes: settings.options.temporaryBufferBytes)
+        let participant = DomainCommitParticipant(name: DomainNames.temporary, lease: frame.temporaryWriter, working: temp)
+        if let writer = frame.writer {
+            try writer.commit(working, through: database.domains, synchronous: database.synchronous, additional: [participant])
+        } else {
+            let group = try DomainCommitGroup.prepare([participant])
+            _ = try group.commit()
+        }
+        temporaryActions = actions
+    }
     public func begin(writable: Bool = true, cancellation: CancellationToken? = nil) throws {
         try checkOpen(); try checkStatementRole(); try requireClean()
         guard transaction == nil else { throw JedError("25001", "there is already a transaction in progress") }
         if writable {
             guard readPin == nil else { throw JedError("25006", "cannot set transaction read-write mode on a read-only session") }
-            transaction = SessionTransaction(writer: try database.core.acquireWriter(cancellation: cancellation, relaxed: !database.synchronous, timeoutMilliseconds: settings.options.lockTimeoutMilliseconds))
-        } else { transaction = SessionTransaction(pin: try readPin?.retain() ?? database.core.beginRead()) }
+        }
+        transaction = try writeFrame(shared: writable, cancellation: cancellation)
         transaction?.savedSequences = sequenceHistory
     }
     public func commit() throws {
@@ -182,13 +261,10 @@ public final class Session {
         guard let active = transaction else { return }
         transaction = nil; defer { active.close() }
         do { try active.checkRole() } catch { sequenceHistory = active.savedSequences; throw error }
-        if active.failed { sequenceHistory = active.savedSequences }
-        if !active.failed, let writer = active.writer {
+        if active.failed || active.writer == nil { sequenceHistory = active.savedSequences }
+        if !active.failed, active.writer != nil {
             do {
-                var policy = DomainCommitPolicy(); policy.storageLimit = database.maxStorageBytes
-                if let plan = try writer.prepare(active.working, policy: policy, entropy: database.keyEntropy) {
-                    try writer.persist(plan, synchronous: database.synchronous)
-                }
+                try publish(active)
             } catch { sequenceHistory = active.savedSequences; throw error }
         }
     }
@@ -236,7 +312,8 @@ public final class Session {
                 return emptyRows("BEGIN", meter: meter)
             case .savepoint(let name):
                 guard let transaction else { throw JedError("25P01", "SAVEPOINT can only be used in transaction blocks") }
-                transaction.savepoints.append(.init(name: name, snapshot: transaction.working, sequences: sequenceHistory))
+                transaction.savepoints.append(.init(name: name, snapshot: transaction.working, sequences: sequenceHistory,
+                    temporaryActions: transaction.temporaryActions))
                 transaction.working.forgetPendingKeys()
                 return emptyRows("SAVEPOINT", meter: meter)
             case .release(let name):
@@ -245,21 +322,26 @@ public final class Session {
                 transaction.savepoints.removeSubrange(index...)
                 return emptyRows("RELEASE", meter: meter)
             case .query(let query):
-                let pin = try transaction?.cursorPin() ?? readPin?.retain() ?? database.core.beginRead()
+                if WritableCTEPlan.containsWrite(statement) {
+                    return try write(statement, source: text, parameters: parameters, meter: meter, cancellation: cancellation)
+                }
+                let pin = try readBundle()
                 do {
-                    try StatementPrivileges.check(statement, snapshot: pin.snapshot, settings: settings)
-                    let services = StatementServices(settings: settings, meter: meter)
+                    var planning = settings; planning.domains = pin.domains
+                    let snapshot = try pin.domains.snapshot(DomainNames.main)
+                    try StatementPrivileges.check(statement, snapshot: snapshot, settings: planning)
+                    let services = StatementServices(settings: planning, meter: meter)
                     var context = services.context()
-                    let plan = try SelectPlan.resolve(query, snapshot: pin.snapshot, settings: settings, scalar: context.scalar)
+                    let plan = try SelectPlan.resolve(query, snapshot: snapshot, settings: planning, scalar: context.scalar)
                     if SequenceExecution.mutates(plan.expressions) {
                         pin.close()
                         return try writeQuery(query, parameters: parameters, meter: meter, cancellation: cancellation)
                     }
-                    let sequences = SequenceExecution(snapshot: pin.snapshot, history: sequenceHistory, meter: meter, writable: false)
+                    let sequences = SequenceExecution(domains: pin.domains, history: sequenceHistory, meter: meter, writable: false)
                     sequences.install(into: &context)
                     context.parameters = try ParameterBinding.bind(parameters, types: plan.parameters, timezone: settings.timeZone)
                     let execution = SelectExecution(plan: plan, context: context), active = transaction
-                    let rows = Rows(columns: plan.columns, meter: meter, pull: execution.next,
+                    let rows = Rows(columns: plan.columns, meter: meter, pull: { try pin.checkRole(); return try execution.next() },
                                     release: { execution.close(); pin.close() }, failure: { _ in active?.failed = true })
                     return active?.own(rows) ?? rows
                 } catch { pin.close(); throw error }
@@ -280,18 +362,18 @@ public final class Session {
     }
     private func writeQuery(_ query: SQLQuery, parameters: [SQLValue], meter: CostMeter,
                             cancellation: CancellationToken?) throws -> Rows {
-        guard readPin == nil, !database.isReadOnly, transaction == nil || transaction?.writer != nil else {
-            throw JedError("25006", "cannot advance a sequence in a read-only transaction")
-        }
         let active = transaction
-        let writer = try active?.writer ?? database.core.acquireWriter(cancellation: cancellation, relaxed: !database.synchronous, timeoutMilliseconds: settings.options.lockTimeoutMilliseconds)
-        defer { if active == nil { writer.close() } }
-        var working = active?.working ?? writer.snapshot
-        let services = StatementServices(settings: settings, meter: meter)
+        let frame = try writeFrame(shared: readPin == nil && !database.isReadOnly, cancellation: cancellation)
+        defer { if active == nil { frame.close() } }
+        var working = frame.working
+        let snapshot = try working.snapshot(DomainNames.main)
+        var planning = settings; planning.domains = working
+        let services = StatementServices(settings: planning, meter: meter)
         var context = services.context()
-        let plan = try SelectPlan.resolve(query, snapshot: working, settings: settings, scalar: context.scalar)
+        let plan = try SelectPlan.resolve(query, snapshot: snapshot, settings: planning, scalar: context.scalar)
         context.parameters = try ParameterBinding.bind(parameters, types: plan.parameters, timezone: settings.timeZone)
-        let sequences = SequenceExecution(snapshot: working, history: sequenceHistory, meter: meter, writable: true)
+        let sequences = SequenceExecution(domains: working, history: sequenceHistory, meter: meter,
+            writable: true, writableDomains: frame.writableDomains)
         sequences.install(into: &context)
         let execution = SelectExecution(plan: plan, context: context)
         defer { execution.close() }
@@ -299,62 +381,92 @@ public final class Session {
         while let row = try execution.next() { try result.append(row); result.affected += 1 }
         execution.close()
         try sequences.apply(to: &working)
-        try meter.checkpoint(); try meter.syncPending(working.pendingBytes)
-        if let active { active.working = working }
-        else {
-            var policy = DomainCommitPolicy(); policy.storageLimit = database.maxStorageBytes
-            if let plan = try writer.prepare(working, policy: policy, entropy: database.keyEntropy) {
-                try writer.persist(plan, synchronous: database.synchronous)
-            }
-            try meter.syncPending(0)
-        }
+        try finishWrite(working, statement: .query(query), frame: frame, active: active, meter: meter)
         sequenceHistory = sequences.history
         let rows = result.cursor(failure: { _ in active?.failed = true })
         return active?.own(rows) ?? rows
     }
     private func write(_ statement: SQLStatement, source: SQLText, parameters: [SQLValue],
                        meter: CostMeter, cancellation: CancellationToken?) throws -> Rows {
-        guard readPin == nil, !database.isReadOnly, transaction == nil || transaction?.writer != nil else {
-            throw JedError("25006", "cannot execute a write in a read-only transaction")
-        }
         let active = transaction
-        let writer = try active?.writer ?? database.core.acquireWriter(cancellation: cancellation, relaxed: !database.synchronous, timeoutMilliseconds: settings.options.lockTimeoutMilliseconds)
-        defer { if active == nil { writer.close() } }
-        var working = active?.working ?? writer.snapshot
-        let services = StatementServices(settings: settings, meter: meter)
+        let probe = try active == nil ? readBundle() : nil
+        let admissionDomains = active?.working ?? probe!.domains
+        let targets: [SQLText]
+        do {
+            var admission = settings; admission.domains = admissionDomains
+            try StatementPrivileges.check(statement, snapshot: admissionDomains.snapshot(DomainNames.main), settings: admission)
+            targets = try StatementDomain.targets(statement, in: admissionDomains)
+        }
+        catch { probe?.close(); throw error }
+        probe?.close()
+        let frame = try writeFrame(shared: targets.contains { $0 != DomainNames.temporary }, cancellation: cancellation)
+        defer { if active == nil { frame.close() } }
+        var working = frame.working
+        if var temp = working.snapshots[DomainNames.temporary], let main = working.snapshots[DomainNames.main] {
+            try temp.borrowTypes(main.types); working.snapshots[DomainNames.temporary] = temp
+        }
+        let target = try StatementDomain.target(statement, in: working)
+        var executionSettings = settings
+        executionSettings.domains = working; executionSettings.targetDomain = target
+        let services = StatementServices(settings: executionSettings, meter: meter)
         var context = services.context()
-        let sequences = SequenceExecution(snapshot: working, history: sequenceHistory, meter: meter, writable: true)
+        let sequences = SequenceExecution(domains: working, targetDomain: target, history: sequenceHistory,
+            meter: meter, writable: true, writableDomains: frame.writableDomains)
         sequences.install(into: &context)
         let result: MutationResult
-        try StatementPrivileges.check(statement, snapshot: working, settings: settings)
+        try StatementPrivileges.check(statement, snapshot: working.snapshot(target), settings: executionSettings)
+        defer { meter.pendingDomainBase = 0; meter.pendingDomainExcluded = false }
         if case .createTable(let definition) = statement, definition.query != nil {
-            result = try CreateTableAs.execute(definition, snapshot: &working, settings: settings,
-                                              context: context, parameters: parameters)
-        } else if let mutation = try MutationExecutor.execute(statement, snapshot: &working, settings: settings,
-                                                        context: context, parameters: parameters) { result = mutation }
-        else if let tag = try CatalogDDL.execute(statement, source: source, snapshot: &working, settings: settings,
-                                                context: context, meter: meter) {
-            guard parameters.isEmpty else { throw JedError("42601", "DDL takes no bind parameters") }
-            result = MutationResult(command: tag.command, meter: meter); result.affected = tag.rowsAffected
-        } else { throw JedError("0A000", "statement execution is not yet connected") }
-        try sequences.apply(to: &working)
-        try meter.checkpoint(); try meter.syncPending(working.pendingBytes)
-        if let active { active.working = working }
+            result = try CreateTableAs.execute(definition, working: &working, settings: executionSettings,
+                context: context, parameters: parameters, requireWritable: frame.requireWritable)
+        } else if let mutation = try WritableCTEExecution.execute(statement, working: &working, settings: executionSettings,
+            context: context, parameters: parameters, requireWritable: frame.requireWritable) { result = mutation }
         else {
-            var policy = DomainCommitPolicy(); policy.storageLimit = database.maxStorageBytes
-            if let plan = try writer.prepare(working, policy: policy, entropy: database.keyEntropy) {
-                try writer.persist(plan, synchronous: database.synchronous)
+            try frame.requireWritable(target)
+            var snapshot = try working.snapshot(target)
+            meter.pendingDomainExcluded = target == DomainNames.temporary
+            meter.pendingDomainBase = working.pendingBytes - (meter.pendingDomainExcluded ? 0 : snapshot.pendingBytes)
+            if let mutation = try MutationExecutor.execute(statement, snapshot: &snapshot, settings: executionSettings,
+                context: context, parameters: parameters) {
+                result = mutation; working.snapshots[target] = snapshot
+            } else {
+                meter.pendingDomainBase = 0; meter.pendingDomainExcluded = false
+                guard let tag = try CatalogDDL.execute(statement, source: source, working: &working, settings: executionSettings,
+                    context: context, meter: meter, requireWritable: frame.requireWritable) else {
+                    throw JedError("0A000", "statement execution is not yet connected")
+                }
+                guard parameters.isEmpty else { throw JedError("42601", "DDL takes no bind parameters") }
+                result = MutationResult(command: tag.command, meter: meter); result.affected = tag.rowsAffected
             }
-            try meter.syncPending(0)
         }
+        try sequences.apply(to: &working)
+        meter.pendingDomainBase = 0; meter.pendingDomainExcluded = false
+        try finishWrite(working, statement: statement, frame: frame, active: active, meter: meter)
         sequenceHistory = sequences.history
         let rows = result.cursor(failure: { _ in active?.failed = true })
         return active?.own(rows) ?? rows
+    }
+    private func finishWrite(_ working: QueryDomains, statement: SQLStatement, frame: SessionTransaction,
+                             active: SessionTransaction?, meter: CostMeter) throws {
+        let before = try frame.working.snapshot(DomainNames.temporary)
+        let after = try working.snapshot(DomainNames.temporary)
+        var actions = frame.temporaryActions
+        TemporaryCommitActions.record(statement, before: before.catalog, after: after.catalog, actions: &actions)
+        if after.hasChanges(comparedTo: frame.temporaryWriter.snapshot) {
+            try temporary!.checkBudget(settings.options.maxTemporaryStorageBytes)
+        }
+        try meter.checkpoint(); try meter.syncPending(working.pendingBytes)
+        frame.working = working; frame.temporaryActions = actions
+        if active == nil {
+            try publish(frame)
+            try meter.syncPending(0)
+        }
     }
     private func restoreSavepoint(_ name: SQLText) throws {
         guard let transaction else { throw JedError("25P01", "ROLLBACK TO can only be used in transaction blocks") }
         guard let index = transaction.savepoints.lastIndex(where: { $0.name == name }) else { throw JedError("3B001", "savepoint does not exist: \(name)") }
         transaction.working = transaction.savepoints[index].snapshot
+        transaction.temporaryActions = transaction.savepoints[index].temporaryActions
         sequenceHistory = transaction.savepoints[index].sequences
         transaction.working.forgetPendingKeys()
         transaction.savepoints.removeSubrange((index + 1)...)
@@ -362,7 +474,7 @@ public final class Session {
     }
     public func close() {
         if closed { return }; closed = true
-        transaction?.close(); transaction = nil; readPin?.close()
+        transaction?.close(); transaction = nil; readPin?.close(); temporary = nil
     }
     deinit { close() }
 }

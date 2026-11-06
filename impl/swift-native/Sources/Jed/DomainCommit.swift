@@ -107,13 +107,13 @@ internal enum DomainCommitPlanner {
             let reference = try allocate(); gistPages.append(reference.index); return reference
         }
         var image = snapshot.catalog
-        try image.validateReferences(catalogID: snapshot.catalogID)
+        try image.validateReferences(catalogID: snapshot.catalogID, borrowedTypes: snapshot.borrowedTypes, borrowedReferences: snapshot.borrowedReferences)
         guard Set(image.tables.map(\.name)) == Set(snapshot.tables.keys) else { throw JedError.corruption("catalog and table stores disagree") }
         var names: Set<SQLText> = []
         for position in image.tables.indices.sorted(by: { image.tables[$0].name < image.tables[$1].name }) {
             var table = image.tables[position]
             guard let store = snapshot.tables[table.name], let count = store.count, count >= 0 else { throw JedError.corruption("table has no exact cardinality") }
-            let types = try table.columns.map { try $0.type.resolve(snapshot.types) }
+            let types = try snapshot.tableTypes(table)
             guard types == store.tree.types, store.tree.pool === snapshot.pool else { throw JedError.corruption("table row layout disagrees with catalog") }
             table.rowCount = count
             table.root = try store.tree.root.map { try visitTree($0, source: store.tree) } ?? zero

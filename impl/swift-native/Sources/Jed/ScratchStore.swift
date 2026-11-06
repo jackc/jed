@@ -28,7 +28,8 @@ internal final class SpillableScratchStore: ScratchStore {
     private func check(_ state: State) throws {
         guard !state.closed else { throw JedError("58030", "scratch storage is closed") }
     }
-    func spillIfNeeded(committedBytes: UInt64) throws {
+    func spillIfNeeded(committedBytes: UInt64, budget override: Int64? = nil) throws {
+        let budget = override.map { UInt64(max(0, $0)) } ?? self.budget
         try state.withLock { state in
             try check(state)
             guard state.scratch == nil, budget > 0, committedBytes > budget, let host else { return }

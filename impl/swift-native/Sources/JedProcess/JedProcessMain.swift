@@ -11,7 +11,11 @@ import Darwin
 @main struct JedProcessMain {
     static func main() {
         do { try run() }
-        catch { reply(error); exit(1) }
+        catch {
+            reply(error)
+            FileHandle.standardError.write(Data((String(describing: error) + "\n").utf8))
+            exit(1)
+        }
     }
     private static func reply(_ value: String = "") {
         FileHandle.standardOutput.write(Data(("OK\t" + value + "\n").utf8))
@@ -66,6 +70,9 @@ import Darwin
         guard arguments.count >= 2 else { throw JedError("22023", "usage: jed-process ACTION PATH [OPTIONS]") }
         let action = arguments[0], path = arguments[1]
         if action == "owner-idle" { try ownerIdle(root: path); return }
+        if action == "pages" || action == "pages-read-only" {
+            try DatabaseTooling.servePageStream(path: path, readOnly: action == "pages-read-only"); return
+        }
         var options: [String: String] = [:], positional: [String] = []
         for argument in arguments.dropFirst(2) {
             if let at = argument.firstIndex(of: "=") { options[String(argument[..<at])] = String(argument[argument.index(after: at)...]) }
@@ -97,8 +104,12 @@ import Darwin
         case "open", "open-exclusive", "open-read-only":
             database = try Database.open(path, options: OpenOptions(credential: credential, readOnly: action == "open-read-only",
                 locking: locking, fileLockTimeoutMilliseconds: Int64(timeout), pageService: service))
-        case "open-remote", "open-remote-read-only", "pages", "pages-read-only":
-            throw JedError("0A000", "Swift stream page transport is not implemented")
+        case "open-remote", "open-remote-read-only":
+            guard let actor = ProcessInfo.processInfo.environment["JED_PAGES_ACTOR"] else {
+                throw JedError("22023", "stream process actor is not configured")
+            }
+            database = try Database.openRemote(command: [actor, action == "open-remote-read-only" ? "pages-read-only" : "pages", path],
+                options: OpenOptions(credential: credential, fileLockTimeoutMilliseconds: Int64(timeout)))
         default: throw JedError("22023", "unknown actor action \(action)")
         }
         database.synchronous = options["synchronous"] != "off"
@@ -129,7 +140,14 @@ import Darwin
                     guard let writer else { throw JedError("25000", "no actor writer") }; try writer.commit()
                 case "WRITE_ROLLBACK":
                     guard let writer else { throw JedError("25000", "no actor writer") }; try writer.rollback()
-                case "ATTACH", "DETACH": throw JedError("0A000", "Swift attachment host API is not implemented")
+                case "ATTACH":
+                    let fields = argument.split(separator: "\t", maxSplits: 2, omittingEmptySubsequences: false)
+                    guard fields.count == 3, fields[1] == "0" || fields[1] == "1" else {
+                        throw JedError("22023", "invalid attachment actor arguments")
+                    }
+                    try database.attach(SQLText(String(fields[0])),
+                        source: .file(String(fields[2]), OpenOptions(fileLockTimeoutMilliseconds: Int64(timeout))), readOnly: fields[1] == "1")
+                case "DETACH": try database.detach(SQLText(argument))
                 case "COMPACT": try database.compact(argument.isEmpty ? "main" : argument)
                 case "BACKUP":
                     let fields = argument.split(separator: "\t", maxSplits: 1, omittingEmptySubsequences: false)
@@ -139,7 +157,7 @@ import Darwin
                 case "REKEY": try database.rekey(credential: argument.isEmpty ? nil : .hostKey(bytes(argument)))
                 case "MAX_STORAGE_BYTES":
                     guard let limit = Int64(argument), limit >= 0 else { throw JedError("22023", "invalid storage limit") }
-                    database.maxStorageBytes = limit
+                    try database.setMaxStorageBytes(SQLText("main"), limit)
                 case "STORAGE_BYTES": value = String(database.storageBytes)
                 case "TXID": value = String(database.version)
                 case "PAGE_COUNT": value = String(try DatabaseTooling.pageCount(database))

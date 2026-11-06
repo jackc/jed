@@ -23,7 +23,7 @@ internal final class PageServiceClient: DatabaseRemote, @unchecked Sendable {
     }
     static func open(connection: PageServiceConnection, credential: Credential?, environment: Environment,
                      unlockedCodec: EncryptedPageCodec? = nil, deadline: ContinuousClock.Instant? = nil,
-                     catalogID: UInt64, cacheBytes: Int,
+                     catalogID: UInt64, cacheBytes: Int, structuralOnly: Bool = false, readAhead: Bool = false,
                      resolve: @escaping @Sendable (UInt64, UInt64) throws -> Bool = { _, _ in
                          throw JedError("08007", "commit outcome is unknown after losing the page-service connection")
                      }) throws -> (core: DatabaseCore, client: PageServiceClient) {
@@ -53,11 +53,21 @@ internal final class PageServiceClient: DatabaseRemote, @unchecked Sendable {
             let selected = try client.authenticate(reply, codec: codec, staleKey: unlockedCodec != nil)
             let store = PageServiceReadStore(client: client, pageSize: meta.pageSize)
             let pager = try Pager.remote(store: store, selected: selected, codec: codec, keyBlock: keyBlock)
-            let pool = try NodePool(pager: pager, cacheBytes: cacheBytes)
+            let batch: (@Sendable ([PageReference]) throws -> [[UInt8]])?
+            if readAhead {
+                batch = { references in
+                    let stored = try client.readPages(references.map(\.index))
+                    return try zip(references, stored).map { reference, bytes in
+                        try codec.openBody(pageIndex: reference.index, sealed: bytes, expectedTag: reference.tag)
+                    }
+                }
+            } else { batch = nil }
+            let pool = try NodePool(codec: codec, cacheBytes: cacheBytes, pager: pager,
+                readMany: batch, batchLimit: Int(connection.hello.maxReadPages), read: pager.readBody)
             let storage = try StorageDomain.remote(pager: pager, pool: pool, catalogID: catalogID,
-                readOnly: connection.hello.flags & 1 != 0, environment: environment)
+                readOnly: connection.hello.flags & 1 != 0, environment: environment, structuralOnly: structuralOnly)
             client.cache = reply.point
-            let core = DatabaseCore(storage: storage, environment: environment, remote: client)
+            let core = DatabaseCore(storage: storage, environment: environment, remote: client, sqlReady: !structuralOnly)
             return (core, client)
         } catch { client.close(); throw error }
     }

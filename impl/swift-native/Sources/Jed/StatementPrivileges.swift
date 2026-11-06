@@ -2,39 +2,68 @@
 /// without planning it, so a later missing name/type cannot conceal a denial on
 /// an existing object (session.md §5.3; create-table-as.md §3).
 internal final class StatementPrivileges {
-    struct TableRequirement { let name: SQLText; var privileges: PrivilegeSet }
+    struct TableRequirement { let name: SQLName; var privileges: PrivilegeSet }
+    private struct ViewKey: Hashable { let domain: SQLText; let name: SQLText }
+    let domains: QueryDomains
     var tables: [TableRequirement] = []
     var functions: [SQLText] = []
     var reads: [SQLName] = []
     var catalogWrites: [SQLStatement] = []
     var ddl = false
     var temporary = false
+    init(domains: QueryDomains) { self.domains = domains }
 
     static func check(_ statement: SQLStatement, snapshot: DomainSnapshot, settings: SessionSettings) throws {
         if settings.options.allowDDL && (settings.options.allowTemporaryDDL ?? settings.options.allowDDL)
             && settings.privileges.isUnrestricted { return }
-        let requirements = StatementPrivileges()
+        let domains = QueryDomains.statement(snapshot: snapshot, settings: settings)
+        let requirements = StatementPrivileges(domains: domains)
         requirements.collect(statement)
-        requirements.collectViewFunctions(snapshot)
-        requirements.collectStoredExpressions(snapshot, settings: settings)
+        requirements.collectViewFunctions()
+        requirements.collectStoredExpressions(settings: settings)
         if case .reindex(let value) = statement, value.object == "index", let name = value.name,
-           let table = snapshot.catalog.tables.first(where: { $0.indexes.contains { $0.name == name.name } }) {
-            requirements.need(table.name, .select)
+           let owner = try? domains.relation(name),
+           let table = owner.snapshot.catalog.tables.first(where: { $0.indexes.contains { $0.name == name.name } }) {
+            requirements.need(SQLName(database: owner.name, name: table.name, span: name.span), .select)
         }
         if requirements.ddl {
-            let allowed = requirements.temporary ? settings.options.allowTemporaryDDL ?? settings.options.allowDDL : settings.options.allowDDL
+            let temporary = requirements.temporary || requirements.targetsTemporaryDDL(statement)
+            let allowed = temporary ? settings.options.allowTemporaryDDL ?? settings.options.allowDDL : settings.options.allowDDL
             guard allowed else { throw JedError("42501", "DDL is not permitted in this session") }
         }
         for table in requirements.tables {
-            if SystemRelationPlan.contains(table.name) || snapshot.catalog.tables.contains(where: { $0.name == table.name })
-                || snapshot.catalog.views.contains(where: { $0.name == table.name }) {
-                try settings.privileges.require(table.privileges, on: table.name)
+            guard let owner = try? domains.relation(table.name) else { continue }
+            if owner.name == DomainNames.temporary && !SystemRelationPlan.contains(table.name.name) { continue }
+            if SystemRelationPlan.contains(table.name.name) || owner.snapshot.catalog.tables.contains(where: { $0.name == table.name.name })
+                || owner.snapshot.catalog.views.contains(where: { $0.name == table.name.name }) {
+                try settings.privileges.require(table.privileges, on: table.name.name)
             }
         }
         for function in requirements.functions { try settings.privileges.require(.execute, on: function, function: true) }
     }
-    func need(_ name: SQLText, _ privileges: PrivilegeSet) {
-        tables.append(TableRequirement(name: name, privileges: privileges))
+    private func qualified(_ name: SQLName) -> SQLName {
+        guard name.database == nil, let owner = try? domains.relation(name) else { return name }
+        return SQLName(database: owner.name, name: name.name, span: name.span)
+    }
+    func need(_ name: SQLName, _ privileges: PrivilegeSet) {
+        tables.append(TableRequirement(name: qualified(name), privileges: privileges))
+    }
+    private func targetsTemporaryDDL(_ statement: SQLStatement) -> Bool {
+        func temporary(_ name: SQLName) -> Bool {
+            guard let owner = try? domains.relation(name) else { return false }
+            return owner.name == DomainNames.temporary && QueryDomains.hasRelation(name.name, in: owner.snapshot)
+        }
+        switch statement {
+        case .createTable(let value): return value.temporary || value.name.database == DomainNames.temporary
+        case .createView(let value): return value.temporary || value.name.database == DomainNames.temporary
+        case .createIndex(let value): return temporary(value.table)
+        case .alterTable(let value): return temporary(value.name)
+        case .alterView(let value): return temporary(value.name)
+        case .alterSequence(let value): return temporary(value.name)
+        case .drop(let value) where value.object != "type": return value.names.contains(where: temporary)
+        case .explain(_, let body): return targetsTemporaryDDL(body)
+        default: return false
+        }
     }
     func function(_ name: SQLText) { if !functions.contains(name) { functions.append(name) } }
     func collect(_ statement: SQLStatement, locals: Set<SQLText> = []) {
@@ -47,17 +76,17 @@ internal final class StatementPrivileges {
             if value.withData, let body = value.query { query(body, locals: locals) }
         case .createView(let value): ddl = true; temporary = value.temporary || value.name.database?.description == "temp"
         case .createType, .createSequence, .alterSequence, .createIndex, .alterTable, .alterView, .drop: ddl = true
-        case .analyze(let name, _): ddl = true; need(name.name, .select)
+        case .analyze(let name, _): ddl = true; need(name, .select)
         case .reindex(let value):
             ddl = true
-            if value.object == "table", let name = value.name { need(name.name, .select) }
+            if value.object == "table", let name = value.name { need(name, .select) }
         case .insert(let value):
-            catalogWrites.append(statement); need(value.table.name, .insert)
+            catalogWrites.append(statement); need(value.table, .insert)
             if let conflict = value.conflict {
-                if !conflict.columns.isEmpty || conflict.constraint != nil { need(value.table.name, .select) }
-                if !conflict.doNothing { need(value.table.name, .update) }
+                if !conflict.columns.isEmpty || conflict.constraint != nil { need(value.table, .select) }
+                if !conflict.doNothing { need(value.table, .update) }
             }
-            if returnsColumns(value.returning) { need(value.table.name, .select) }
+            if returnsColumns(value.returning) { need(value.table, .select) }
             switch value.source {
             case .query(let body): query(body, locals: locals)
             case .values(let rows): for row in rows { for item in row { expression(item, locals: locals) } }
@@ -69,23 +98,23 @@ internal final class StatementPrivileges {
             }
             returning(value.returning, locals: locals)
         case .update(let value):
-            catalogWrites.append(statement); need(value.table.name, .update)
+            catalogWrites.append(statement); need(value.table, .update)
             if readsColumns(value.predicate) || returnsColumns(value.returning) || value.assignments.contains(where: { readsColumns($0.value) }) {
-                need(value.table.name, .select)
+                need(value.table, .select)
             }
             for item in value.assignments { expression(item.value, locals: locals) }
             expression(value.predicate, locals: locals); returning(value.returning, locals: locals)
         case .delete(let value):
-            need(value.table.name, .delete)
-            if readsColumns(value.predicate) || returnsColumns(value.returning) { need(value.table.name, .select) }
+            need(value.table, .delete)
+            if readsColumns(value.predicate) || returnsColumns(value.returning) { need(value.table, .select) }
             expression(value.predicate, locals: locals); returning(value.returning, locals: locals)
         case .merge(let value):
-            catalogWrites.append(statement); need(value.table.name, .select)
+            catalogWrites.append(statement); need(value.table, .select)
             for clause in value.clauses {
                 switch clause.action {
-                case .insert: need(value.table.name, .insert)
-                case .update: need(value.table.name, .update)
-                case .delete: need(value.table.name, .delete)
+                case .insert: need(value.table, .insert)
+                case .update: need(value.table, .update)
+                case .delete: need(value.table, .delete)
                 case .nothing: break
                 }
             }
@@ -131,7 +160,7 @@ internal final class StatementPrivileges {
     private func from(_ value: SQLFrom, locals: Set<SQLText>) {
         switch value.source {
         case .table(let name):
-            if name.database != nil || !locals.contains(name.name) { need(name.name, .select); reads.append(name) }
+            if name.database != nil || !locals.contains(name.name) { need(name, .select); reads.append(qualified(name)) }
         case .query(let value): query(value, locals: locals)
         case .function(let value): expression(value, locals: locals)
         case .joined(let value): from(value, locals: locals)
@@ -203,52 +232,62 @@ internal final class StatementPrivileges {
         }
         return false
     }
-    private func collectViewFunctions(_ snapshot: DomainSnapshot) {
+    private func collectViewFunctions() {
         let originalTables = tables
         let writeTargets = originalTables.filter { !$0.privileges.intersection([.insert, .update, .delete]).isEmpty }.map(\.name)
-        var pending = reads + writeTargets.map { SQLName(database: nil, name: $0, span: .init(byteStart: 0, byteEnd: 0, position: 0)) }
-        var visited: Set<SQLText> = []
+        var pending = reads + writeTargets
+        var visited: Set<ViewKey> = []
         while let read = pending.popLast() {
-            guard read.database == nil || read.database?.description == "main", visited.insert(read.name).inserted,
-                  let view = snapshot.catalog.views.first(where: { $0.name == read.name }), let body = try? ViewDefinition.parsed(view) else { continue }
-            let nested = StatementPrivileges(); nested.query(body.query)
+            guard let owner = try? domains.relation(read), !DomainNames.isAttachment(owner.name),
+                  visited.insert(ViewKey(domain: owner.name, name: read.name)).inserted,
+                  let view = owner.snapshot.catalog.views.first(where: { $0.name == read.name }),
+                  let body = try? ViewDefinition.parsed(view), let scope = try? domains.viewScope(owner: owner.name) else { continue }
+            let nested = StatementPrivileges(domains: scope); nested.query(body.query)
             for name in nested.functions { function(name) }
             pending += nested.reads
         }
         pending = reads; visited = []
         while let read = pending.popLast() {
-            guard read.database == nil || read.database?.description == "main", visited.insert(read.name).inserted,
-                  let view = snapshot.catalog.views.first(where: { $0.name == read.name }), view.securityInvoker,
-                  let body = try? ViewDefinition.parsed(view) else { continue }
-            let nested = StatementPrivileges(); nested.query(body.query)
+            guard let owner = try? domains.relation(read), !DomainNames.isAttachment(owner.name),
+                  visited.insert(ViewKey(domain: owner.name, name: read.name)).inserted,
+                  let view = owner.snapshot.catalog.views.first(where: { $0.name == read.name }), view.securityInvoker,
+                  let body = try? ViewDefinition.parsed(view), let scope = try? domains.viewScope(owner: owner.name) else { continue }
+            let nested = StatementPrivileges(domains: scope); nested.query(body.query)
             tables += nested.tables; pending += nested.reads
         }
         for target in writeTargets {
-            var name = target, seen: Set<SQLText> = []
-            var privileges = originalTables.filter { $0.name == target }.map(\.privileges)
-            while seen.insert(name).inserted,
-                  let view = snapshot.catalog.views.first(where: { $0.name == name }), view.securityInvoker,
+            var name = target, seen: Set<ViewKey> = []
+            var privileges = originalTables.filter { $0.name.name == target.name && $0.name.database == target.database }.map(\.privileges)
+            while let owner = try? domains.relation(name), !DomainNames.isAttachment(owner.name),
+                  seen.insert(ViewKey(domain: owner.name, name: name.name)).inserted,
+                  let view = owner.snapshot.catalog.views.first(where: { $0.name == name.name }), view.securityInvoker,
                   let body = try? ViewDefinition.parsed(view), case .select(let select) = body.query.body,
                   select.from.count == 1, let source = select.from.first, source.joins.isEmpty, case .table(let base) = source.source {
-                guard !source.lateral, base.database == nil || base.database?.description == "main",
-                      (try? UpdatableView.checkShape(body.query, name: name, operation: "delete from")) != nil else { break }
+                guard !source.lateral, let scope = try? domains.viewScope(owner: owner.name),
+                      (try? UpdatableView.checkShape(body.query, name: name.name, operation: "delete from")) != nil else { break }
+                let nested = StatementPrivileges(domains: scope)
                 if let predicate = select.predicate {
                     if privileges.contains(where: { !$0.intersection([.update, .delete]).isEmpty }), !privileges.contains(.select) { privileges.append(.select) }
-                    let nested = StatementPrivileges(); nested.expression(predicate); tables += nested.tables
+                    nested.expression(predicate)
                 }
-                for privilege in privileges { need(base.name, privilege) }
-                name = base.name
+                for privilege in privileges { nested.need(base, privilege) }
+                tables += nested.tables
+                name = nested.qualified(base)
             }
         }
     }
-    private func collectStoredExpressions(_ snapshot: DomainSnapshot, settings: SessionSettings) {
+    private func collectStoredExpressions(settings: SessionSettings) {
         for original in catalogWrites {
             var statement = original
-            let name: SQLText
-            switch statement { case .insert(let v): name = v.table.name; case .update(let v): name = v.table.name; case .merge(let v): name = v.table.name; default: continue }
-            var target = snapshot.catalog.tables.first(where: { $0.name == name })
-            if let view = snapshot.catalog.views.first(where: { $0.name == name }) {
+            let name: SQLName
+            switch statement { case .insert(let v): name = v.table; case .update(let v): name = v.table; case .merge(let v): name = v.table; default: continue }
+            guard let owner = try? domains.relation(name) else { continue }
+            let snapshot = owner.snapshot
+            var target = snapshot.catalog.tables.first(where: { $0.name == name.name })
+            if let view = snapshot.catalog.views.first(where: { $0.name == name.name }) {
+                guard !DomainNames.isAttachment(owner.name) else { continue }
                 var unrestricted = settings; unrestricted.privileges = SessionPrivileges(defaults: .allTables)
+                unrestricted.domains = try? domains.viewScope(owner: owner.name); unrestricted.targetDomain = owner.name
                 let context = StatementServices(settings: unrestricted, meter: CostMeter()).context()
                 let operation: String
                 switch statement { case .insert: operation = "insert into"; case .update: operation = "update"; default: continue }

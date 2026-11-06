@@ -65,6 +65,91 @@ final class TreeBoundaryTests: XCTestCase {
         for page in pages { try store.write(at: UInt64(page.index) * UInt64(pageSize), bytes: page.bytes) }
     }
 
+    func testCacheResizePreservesCursorLeavesAndCapacityAcrossInvalidation() throws {
+        let codec = try PlainPageCodec(pageSize: 256), device = MemoryBlockStore()
+        var tree = BPlusTree(codec: codec, types: [])
+        for id in 0..<200 { try tree.insert(PackedRecord(key: key(id), cells: [])) }
+        var allocator = try PageAllocator(highWater: 2, free: [], firstBody: 2)
+        let written = try tree.serialize(allocator: &allocator, fromScratch: true)
+        try write(written.pages, to: device, pageSize: 256)
+        let cache = try pool(device, codec: codec, cacheBytes: nil)
+        let source = try BPlusTree.open(root: written.root, pageCount: allocator.highWater, types: [], pool: cache)
+        XCTAssertEqual(try orderedKeys(source).count, 200)
+        XCTAssertGreaterThan(cache.residentLeaves, 1)
+        var cursor = TreeCursor(source)
+        XCTAssertEqual(try cursor.next()?.key, key(0))
+        try cache.resizeCache(bytes: 256)
+        XCTAssertEqual(cache.capacity, 1); XCTAssertEqual(cache.residentLeaves, 1)
+        for id in 1..<200 { XCTAssertEqual(try cursor.next()?.key, key(id)) }
+        XCTAssertNil(try cursor.next())
+        cache.invalidateAll(); XCTAssertEqual(cache.capacity, 1)
+        try cache.resizeCache(bytes: nil)
+        XCTAssertNil(cache.capacity)
+        XCTAssertEqual(try orderedKeys(source).count, 200)
+        XCTAssertGreaterThan(cache.residentLeaves, 1)
+    }
+
+    func testStreamReadAheadStartsAtOneAndFailedHintsRemainPhysicalOnly() throws {
+        let codec = try PlainPageCodec(pageSize: 256), device = MemoryBlockStore()
+        var tree = BPlusTree(codec: codec, types: [])
+        for id in 0..<800 { try tree.insert(PackedRecord(key: key(id), cells: [])) }
+        var allocator = try PageAllocator(highWater: 2, free: [], firstBody: 2)
+        let written = try tree.serialize(allocator: &allocator, fromScratch: true)
+        try write(written.pages, to: device, pageSize: 256)
+        let batches = Mutex<[Int]>([])
+        let read: @Sendable (PageReference) throws -> [UInt8] = { reference in
+            try codec.openBody(pageIndex: reference.index,
+                sealed: device.read(at: UInt64(reference.index) * 256, count: 256), expectedTag: reference.tag)
+        }
+        let cache = try NodePool(codec: codec, cacheBytes: 64 * 256, readMany: { references in
+            batches.withLock { $0.append(references.count) }
+            if references.count > 1 { throw JedError("58030", "injected speculative batch failure") }
+            return try references.map(read)
+        }, batchLimit: 5, read: read)
+        let source = try BPlusTree.open(root: written.root, pageCount: allocator.highWater, types: [], pool: cache)
+        var cursor = TreeCursor(source)
+        XCTAssertEqual(try cursor.next()?.key, key(0))
+        XCTAssertEqual(batches.withLock { $0 }, [1])
+        for id in 1..<800 { XCTAssertEqual(try cursor.next()?.key, key(id)) }
+        XCTAssertNil(try cursor.next())
+        let counts = batches.withLock { $0 }
+        XCTAssertTrue(counts.contains(where: { $0 > 1 }))
+        XCTAssertTrue(counts.allSatisfy { $0 <= 5 })
+        XCTAssertLessThanOrEqual(cache.residentLeaves, 64)
+    }
+
+    func testDemandWaitingOnFailedHintRetriesItsOwnPage() throws {
+        let codec = try PlainPageCodec(pageSize: 256)
+        let payload = try PackedLeaf.encodePayload([PackedRecord(key: [7], cells: [])], types: [], capacity: codec.capacity)
+        let bytes = try PageSealer.seal(codec: codec, index: 2, type: 2, count: 1, payload: payload).page.bytes
+        let started = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0)
+        let hinted = DispatchSemaphore(value: 0), demanded = DispatchSemaphore(value: 0)
+        let calls = TreeReadCounter(), results = TreeLoadResults()
+        let cache = try NodePool(codec: codec, cacheBytes: 4096, readMany: { _ in
+            started.signal()
+            guard release.wait(timeout: .now() + 5) == .success else { throw JedError("XX000", "test hint timed out") }
+            throw JedError("XX001", "corruption in a different hinted page")
+        }, read: { _ in calls.value.withLock { $0 += 1 }; return bytes })
+        DispatchQueue.global().async {
+            cache.prefetch([PageReference(2), PageReference(3)], types: []); hinted.signal()
+        }
+        guard started.wait(timeout: .now() + 5) == .success else { XCTFail("hint did not start"); return }
+        defer { release.signal() }
+        DispatchQueue.global().async {
+            let result = Result { try cache.load(PageReference(2), types: []) }
+            results.values.withLock { $0.append(result) }; demanded.signal()
+        }
+        // The hinted page is still in flight, so an ordinary demand must wait.
+        XCTAssertEqual(demanded.wait(timeout: .now() + .milliseconds(20)), .timedOut)
+        XCTAssertEqual(calls.value.withLock { $0 }, 0)
+        release.signal()
+        XCTAssertEqual(hinted.wait(timeout: .now() + 5), .success)
+        XCTAssertEqual(demanded.wait(timeout: .now() + 5), .success)
+        let leaf = try results.values.withLock { try XCTUnwrap($0.first).get() }
+        XCTAssertEqual(Array(leaf.key(at: 0)), [7])
+        XCTAssertEqual(calls.value.withLock { $0 }, 1)
+    }
+
     func testSharedGoldenTreePagesRebuildByteExactly() throws {
         // The shared fixtures were built in ascending order. Rebuilding their
         // leaf records checks split boundaries, copy/push-up, directories,

@@ -1,11 +1,12 @@
 extension CatalogDDL {
     static func createView(_ syntax: SQLCreateView, source: SQLText, snapshot: inout DomainSnapshot,
                            settings: SessionSettings, context: ExpressionContext) throws {
-        let name = try nameInMain(syntax.name)
+        // A body-dependent temporary promotion keeps an explicit main spelling.
+        let name = syntax.name.name
         try CatalogSQL.reserved(name, kind: "view")
-        let occupied = CatalogSQL.relationNames(snapshot.catalog).contains(name)
+        let occupied = CatalogDomain.relations(snapshot.catalog, settings: settings).contains(name)
         if occupied && syntax.ifNotExists { return }
-        guard !syntax.temporary else { throw JedError("0A000", "temporary view catalog is not yet connected") }
+        guard !DomainNames.isAttachment(settings.targetDomain) else { throw JedError("0A000", "views in attached databases are not supported") }
         guard !syntax.recursive else { throw JedError("0A000", "recursive view catalog is not yet connected") }
         var view = CatalogView(name: name, columns: [], definition: SQLText(validatedUTF8: []), dependencies: [])
         let prepared = try ViewDefinition.prepare(syntax.query, source: source, snapshot: snapshot, settings: settings, context: context) { columns in
@@ -24,7 +25,13 @@ extension CatalogDDL {
         var image = snapshot.catalog
         if occupied {
             guard syntax.replace else { throw JedError("42P07", "relation \(name) already exists") }
-            guard let index = image.views.firstIndex(where: { $0.name == name }) else { throw JedError("42809", "\(name) is not a view") }
+            guard let index = image.views.firstIndex(where: { $0.name == name }) else {
+                if settings.targetDomain == DomainNames.temporary,
+                   settings.domains?.snapshots[DomainNames.main]?.catalog.views.contains(where: { $0.name == name }) == true {
+                    throw JedError("42P07", "relation \(name) already exists")
+                }
+                throw JedError("42809", "\(name) is not a view")
+            }
             let old = image.views[index]
             guard view.columns.count >= old.columns.count else { throw JedError("42P16", "cannot drop columns from view") }
             var bodySettings = settings; bodySettings.privileges = settings.privileges.withTableAccess()
@@ -53,7 +60,7 @@ extension CatalogDDL {
     static func alterView(_ syntax: SQLAlterView, source: SQLText, snapshot: inout DomainSnapshot,
                           settings: SessionSettings, context: ExpressionContext) throws {
         try SystemRelationPlan.rejectTarget(syntax.name.name)
-        let name = try nameInMain(syntax.name)
+        let name = try CatalogDomain.name(syntax.name, settings: settings)
         guard let index = snapshot.catalog.views.firstIndex(where: { $0.name == name }) else {
             if CatalogSQL.relationNames(snapshot.catalog).contains(name) { throw JedError("42809", "\(name) is not a view") }
             if syntax.ifExists { return }
@@ -70,7 +77,11 @@ extension CatalogDDL {
                 var bodySettings = settings
                 if !view.securityInvoker { bodySettings.privileges = settings.privileges.withTableAccess() }
                 let body = try SelectPlan.resolve(query, snapshot: snapshot, settings: bodySettings, scalar: context.scalar)
-                let target = body.columns[position].type ?? TypeDescriptor(.scalar(.text))
+                // Frozen view defaults are validated against the synthesized
+                // scalar column, whose declared output typmod is not carried
+                // into its default descriptor. Assignment applies that typmod
+                // when the default is later used by a write.
+                let target = TypeDescriptor(body.columns[position].type?.type ?? .scalar(.text))
                 try CatalogExpressionPolicy.validate(expression, isDefault: true)
                 guard case .scalar = target.type else { throw JedError("0A000", "view container columns do not support defaults") }
                 let resolver = try resolver(snapshot: snapshot, settings: settings, context: context)
@@ -95,7 +106,7 @@ extension CatalogDDL {
                 }
             case .rename(let renamed):
                 try CatalogSQL.reserved(renamed, kind: "view")
-                guard !CatalogSQL.relationNames(image).contains(renamed) else { throw JedError("42P07", "relation \(renamed) already exists") }
+                guard !CatalogDomain.relations(image, settings: settings).contains(renamed) else { throw JedError("42P07", "relation \(renamed) already exists") }
                 try ViewRewrite.references(in: &image, name: view.name, kind: 1, renamed: renamed, columns: view.columns.map(\.name))
                 view.name = renamed
             case .renameColumn(let old, let new):
@@ -118,11 +129,11 @@ extension CatalogDDL {
         if renamed { try revalidateViews(dependingOn: name, old: original, new: snapshot, settings: settings, context: context, replacement: false) }
     }
 
-    static func dropViews(_ syntax: SQLDrop, snapshot: inout DomainSnapshot) throws {
+    static func dropViews(_ syntax: SQLDrop, snapshot: inout DomainSnapshot, settings: SessionSettings) throws {
         var removed: Set<SQLText> = []
         for input in syntax.names {
             try SystemRelationPlan.rejectTarget(input.name, dropping: true)
-            let name = try nameInMain(input)
+            let name = try CatalogDomain.name(input, settings: settings)
             if snapshot.catalog.views.contains(where: { $0.name == name }) { removed.insert(name) }
             else if CatalogSQL.relationNames(snapshot.catalog).contains(name) { throw JedError("42809", "\(name) is not a view") }
             else if !syntax.ifExists { throw JedError("42P01", "view does not exist: \(name)") }

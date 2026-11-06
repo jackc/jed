@@ -4,47 +4,61 @@ Status: **active implementation; incomplete**. Baseline:
 `362e0798ac3a8bd04bd2da556044b6ec73bf468a` (2026-11-05).
 Branch: `codex/swift-native-experiment`, local-only, not pushed.
 
-## Current integration checkpoint (2026-11-05 21:22 CST)
+## Current integration checkpoint (2026-11-05 22:16 CST)
 
-Latest focused command: `mise run swift-native:test --filter
-'SQLCorpusBoundary|StatementAdmissionBoundary|BackupBoundary|HeldKeyBoundary|PageServiceMaintenance'`.
-**16 non-SQL tests pass; the whole-file SQL test remains failing.** It completed
-229 of 232 selected files from 749 frozen files: 6,471 records (4,142 statements,
-2,329 queries), 9,379 cells, 506 cost / 874 name / 13 type assertions, **71 SQL
-failures**. Three selected files are explicitly adapter-blocked on attachment
-directives; 517 files are not admitted yet. Full log:
-`/tmp/jed-swift-native-sql-232.log`. No record expectations or frozen inputs changed.
+Status remains incomplete. The latest SQL gate is
+`mise run swift-native:test --filter
+'SQLCorpusBoundary|PageTransportBoundary|TreeBoundary|SessionCursor|TemporarySessionBoundary|TempTypeBoundary|DomainCommitGroupBoundary'`
+(`/tmp/jed-swift-native-sql-265-transport-2.log`). **All 31 tests outside the whole
+SQL corpus test passed.** All **265/265** selected whole files completed from 749
+frozen files: 7,821 records (5,213 statements / 2,608 queries), 10,067 result cells,
+549 cost / 887 name / 13 type assertions; **84 SQL failures**, no adapter blocks,
+484 files not admitted. The preceding 265-file run had149 SQL failures; both run
+the same frozen records. Remaining failures concentrate on REINDEX, ANALYZE,
+EXPLAIN, cross-domain temp-view writes and secondary-index planning. No expected
+results or frozen inputs changed.
 
-The preceding 222-file gate completed 219 files / 6,059 records with 97 SQL
-failures and the same three attachment blocks. The current gate adds all ten
-whole `ON CONFLICT` files and verifies ALTER column/constraint rewrites, privilege
-preflight, system-relation metadata, and broader join planning. New upsert files
-fail only at currently missing writable-CTE and GIN-DDL paths and their downstream
-effects. Remaining failures also include temp/attachment routing, EXPLAIN, and a
-USING-column view-definition rendering issue; this is not full SQL acceptance.
+The current integration implements actual named attachment roots, session-private
+temp storage with spill hooks and ON COMMIT actions, multi-domain writable CTEs,
+scoped sequence state, atomic staged memory/file commit, and native page stream
+transport. Internal tests cover borrowed nominal type identity, private view
+validation facts, temp writes without the main writer gate, cursor retention
+across session close, role revocation, pre-file spill failure, bounded read-ahead,
+and failed speculative-load isolation. Q3 excludes temp pending writes as
+memory.md specifies; eager INSERT SELECT source accounting now passes the frozen
+443/444-byte threshold. A general temp-target expression that advances a main
+sequence still needs shared-writer classification; this remains an explicit gap.
 
-The native boundaries cover five backup tests (including 87 ordinary frozen file
-images), four held-key recovery classifications, three page-service maintenance
-tests, two privilege/JSON production-order tests and two corpus-adapter tests.
-Successful/mid-drain cost assertions now use `Rows.cost`; only failures before a
-cursor exists fall back to session-lifetime delta. This preserves the recorded
-frozen ALTER preparation lifetime behavior while checking statement cost correctly.
+Native `mise run swift-native:process --no-build` completed **28/31** scenarios
+(`/tmp/jed-swift-native-process-domains-stream.log`), including ordinary and
+encrypted Swift-to-Swift streams, attachments, backup and handoff. Two subsequent
+unchanged focused scenarios now pass: `attachment_gate_order` (reject a second
+durable writer at COMMIT, as the corpus requires) and `service_idle_timeout`
+(existing-writer statement admission must not make an extra remote read pin).
+Logs: `/tmp/jed-swift-native-process-attachment-order.log` and
+`/tmp/jed-swift-native-process-idle.log`. The remaining full-run failure is
+`storage_limit`: expected33 pages, observed37 after client writes; a maintenance
+ordering investigation is active. This is not a second full31-pass result.
 
-Local-only checkpoints `40c9c6a4` and `f615ed6b` contain automatic Linux file
-ownership/page service and the previous SQL expansion respectively. The next
-uncommitted slice adds the features above plus a native `jed-process` executable,
-strict opt-in driver selection and all 31 frozen process scenarios. Initial
-`mise run swift-native:process --no-build` completed **22 passing / nine failing**
-Swift-to-Swift scenarios (`/tmp/jed-swift-native-process-first.log`). Four require
-attachments and two require stream transport, both still unconnected. The other
-three expose a backup free-list-count mismatch and two client-close failures after
-the owner exits; these are active defects, not skipped acceptance. Current frozen-input
-fingerprint: `52909f248d3829bbbed754ca784fa0a4e5a3b105af0fa505028683b5cb7c6249`.
+The stream process lifetime initially hung on Foundation Process's child-exit
+notification. The native transport now owns stable pidfd process identities,
+bounded termination and reaping, avoiding both that hang and PID reuse under an
+embedding application's SIGCHLD handler. All three transport boundary tests pass.
+The latest focused gate after that hardening and full-map DROP integration passed
+**18 tests**: `mise run swift-native:test --filter
+'PageTransportBoundary|TemporarySessionBoundary|SessionCursor|TempTypeBoundary|DomainCommitGroupBoundary'`
+(`/tmp/jed-swift-native-pidfd-domains-2.log`). Full-map DROP and the latest temp-view
+narrowing/default fixes still need the next whole SQL rerun.
 
-Active next work: writable CTEs and mutation ordering (query/DML agents), staged
-multi-domain commit (host agent), attachment/temp snapshot routing and integration
-(root). Apple builds, complete shared acceptance, interchange, simulation and
-measured optimization remain outstanding. Older ledger entries below are historical.
+Default `mise run verify` passed (`/tmp/jed-swift-default-verify-domains.log`).
+Frozen-input fingerprint remains
+`52909f248d3829bbbed754ca784fa0a4e5a3b105af0fa505028683b5cb7c6249`.
+All experiment commits remain local-only/unpushed. Active next work: remaining
+process page-count defect, cross-domain writable views, REINDEX/ANALYZE/EXPLAIN,
+then broader SQL admission and complete shared host/concurrency/interchange,
+encrypted, simulation and release-performance acceptance. Apple platforms remain
+unverified. See `Tools/BASELINE_FINDINGS.md` for explicit spec/baseline mismatches.
+Older entries below are historical.
 
 ## Accepted constraints
 

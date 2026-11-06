@@ -13,10 +13,11 @@ internal enum DomainRebuilder {
         }
         let codec = scratch.pool.codec
         var target = try DomainSnapshot(catalogID: source.catalogID, txid: 0, catalog: source.catalog,
-            pool: scratch.pool, tables: [:], indexes: [:], gistTrees: [:])
+            pool: scratch.pool, tables: [:], indexes: [:], gistTrees: [:],
+            borrowedTypes: source.borrowedTypes, borrowedReferences: source.borrowedReferences)
         for table in source.catalog.tables {
             guard let old = source.tables[table.name] else { throw JedError.corruption("missing source table store") }
-            let types = try table.columns.map { try $0.type.resolve(target.types) }
+            let types = try source.tableTypes(table)
             target.setTableStore(table.name, TableStore(tree: BPlusTree(codec: codec, types: types, pool: scratch.pool),
                 nextRowID: old.nextRowID))
         }
@@ -48,7 +49,7 @@ internal enum DomainRebuilder {
         try scratch.stage(&target)
         for table in source.catalog.tables {
             for index in table.indexes where index.kind == 2 {
-                let rowTypes = try table.columns.map { try $0.type.resolve(target.types) }
+                let rowTypes = try target.tableTypes(table)
                 let ops = try index.keys.map { key -> GistOpclass in
                     guard case .column(let ordinal) = key, rowTypes.indices.contains(ordinal) else {
                         throw JedError.corruption("invalid GiST rebuild column")

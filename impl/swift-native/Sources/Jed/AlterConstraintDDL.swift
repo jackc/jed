@@ -3,13 +3,13 @@ extension CatalogDDL {
                                    source: SQLText, snapshot: DomainSnapshot, settings: SessionSettings,
                                    context: ExpressionContext) throws -> SQLText {
         let local = CatalogSQL.constraints(table)
-        let schema = image.tables.reduce(into: Set<SQLText>()) { $0.formUnion(CatalogSQL.constraints($1)) }
+        let schema = CatalogDomain.constraints(image, settings: settings)
         func name(_ columns: [SQLText], label: String, relation: Bool) throws -> SQLText {
             let name = syntax.name ?? CatalogSQL.objectName(table.name, columns: columns, label: label,
-                taken: relation ? schema.union(CatalogSQL.relationNames(image)) : schema)
+                taken: relation ? schema.union(CatalogDomain.relations(image, settings: settings)) : schema)
             if relation {
                 try CatalogSQL.reserved(name, kind: "constraint")
-                guard !CatalogSQL.relationNames(image).contains(name) else { throw JedError("42P07", "relation already exists: \(name)") }
+                guard !CatalogDomain.relations(image, settings: settings).contains(name) else { throw JedError("42P07", "relation already exists: \(name)") }
             }
             guard !local.contains(name) else { throw JedError("42710", "constraint already exists: \(name)") }
             return name
@@ -38,12 +38,9 @@ extension CatalogDDL {
             return CatalogSQL.objectName(table.name, label: "pkey")
         case .foreignKey(let columns, let reference):
             let local = try keyColumns(columns, own: nil, table: table, kind: "foreign key", keyable: false, types: snapshot.types)
-            let parentName = try nameInMain(reference.table)
-            let parent: CatalogTable
-            if parentName == table.name { parent = table }
-            else if let found = image.tables.first(where: { $0.name == parentName }) { parent = found }
-            else if CatalogSQL.relationNames(image).contains(parentName) { throw JedError("42809", "\(parentName) is not a table") }
-            else { throw JedError("42P01", "table does not exist: \(parentName)") }
+            let parent = try CatalogDomain.foreignParent(reference.table, child: table, image: image,
+                snapshot: snapshot, settings: settings)
+            let parentName = parent.name
             let remote: [Int]
             if reference.columns.isEmpty {
                 guard !parent.primaryKey.isEmpty else { throw JedError("42704", "there is no primary key for referenced table \(parentName)") }

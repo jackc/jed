@@ -2,11 +2,12 @@
 /// the seen table have distinct logical owners even when Swift shares storage.
 internal final class RecursiveCTEExecution {
     private let binding: CTEBinding
+    private let anchorPlan: SelectPlan
     private let recursive: RecursiveCTEPlan
     private let context: ExpressionContext
     private var reserved: Int64 = 0
-    init(binding: CTEBinding, recursive: RecursiveCTEPlan, context: ExpressionContext) {
-        self.binding = binding; self.recursive = recursive; self.context = context
+    init(binding: CTEBinding, anchor: SelectPlan, recursive: RecursiveCTEPlan, context: ExpressionContext) {
+        self.binding = binding; self.anchorPlan = anchor; self.recursive = recursive; self.context = context
     }
     private func reserve(_ bytes: Int64) throws {
         try context.meter.reserveQuery(bytes); reserved = saturatingAdd(reserved, bytes)
@@ -43,7 +44,7 @@ internal final class RecursiveCTEExecution {
             }
             if !anchor, let predicate = columns.filter, !(try current.matches(predicate)) { continue }
             let values = try expressions.map { try current.evaluate($0) }
-            output.append(Array(row.prefix(binding.plan.columns.count)) + values)
+            output.append(Array(row.prefix(anchorPlan.columns.count)) + values)
         }
         try adjust(from: before, to: measure(output))
         try context.meter.guardCost()
@@ -72,7 +73,7 @@ internal final class RecursiveCTEExecution {
                 result.append(row); next.append(row)
             }
         }
-        try retain(augment(collect(binding.plan), anchor: true))
+        try retain(augment(collect(anchorPlan), anchor: true))
         // Earlier materialized bindings remain visible to the term. Their
         // independent retained buffer copy is admitted once, after the seed.
         try reserve(priorBufferBytes)
@@ -83,8 +84,8 @@ internal final class RecursiveCTEExecution {
             var produced = try collect(recursive.term)
             let before = measure(produced)
             for row in produced.indices {
-                for column in binding.plan.columns.indices {
-                    if let target = binding.plan.columns[column].type {
+                for column in anchorPlan.columns.indices {
+                    if let target = anchorPlan.columns[column].type {
                         produced[row][column] = try context.convert(produced[row][column],
                             from: recursive.term.columns[column].type?.type, to: target)
                     }

@@ -20,6 +20,7 @@ internal struct TreeCursor: Sendable {
     private var row = 0
     private var started = false
     private var finished = false
+    private var hintWindow = 1
     private(set) var visitedNodes = 0
 
     init(_ tree: BPlusTree, lower: TreeBound? = nil, upper: TreeBound? = nil, descending: Bool = false) {
@@ -56,7 +57,7 @@ internal struct TreeCursor: Sendable {
     mutating func rewind() {
         guard tree != nil else { return }
         stack.removeAll(keepingCapacity: true); leaf = nil; row = 0
-        started = false; finished = false; visitedNodes = 0
+        started = false; finished = false; visitedNodes = 0; hintWindow = 1
     }
 
     mutating func close() {
@@ -79,8 +80,26 @@ internal struct TreeCursor: Sendable {
                 return
             }
             let index = seek.map { node.childSlot($0.key) } ?? (descending ? node.children.count - 1 : 0)
+            hint(node, index: index, tree: tree)
             stack.append(Frame(node: node, child: index)); child = node.children[index]
         }
+    }
+
+    private mutating func hint(_ node: TreeNode, index: Int, tree: BPlusTree) {
+        guard let pool = tree.pool, pool.readAheadEnabled,
+              case .onDisk = node.children[index] else { return }
+        var references: [PageReference] = [], next = index
+        while node.children.indices.contains(next), references.count < hintWindow {
+            if let lower, next < node.keys.count, !lower.key.lexicographicallyPrecedes(node.keys[next]) { break }
+            if let upper, next > 0 {
+                let boundary = node.keys[next - 1]
+                if upper.key.lexicographicallyPrecedes(boundary) || (boundary == upper.key && !upper.inclusive) { break }
+            }
+            guard case .onDisk(let reference, _, _) = node.children[next] else { break }
+            references.append(reference); next += descending ? -1 : 1
+        }
+        pool.prefetch(references, types: tree.types)
+        hintWindow = min(64, hintWindow * 2)
     }
 
     private mutating func advanceLeaf(_ tree: BPlusTree) throws {
@@ -88,6 +107,7 @@ internal struct TreeCursor: Sendable {
         while var frame = stack.popLast() {
             frame.child += descending ? -1 : 1
             if frame.child >= 0, frame.child < frame.node.children.count {
+                hint(frame.node, index: frame.child, tree: tree)
                 stack.append(frame)
                 try descend(frame.node.children[frame.child], seek: nil, tree: tree)
                 return

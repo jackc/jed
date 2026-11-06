@@ -13,8 +13,9 @@ internal struct OrderedIndexPlan {
                         settings: SessionSettings, context: ExpressionContext) throws -> OrderedIndexPlan {
         guard index.kind == 0 else { throw JedError("0A000", "inverted and GiST index maintenance is not yet connected") }
         try IndexDependencies.validateZones(index, environment: settings.environment)
-        let columns = try table.columns.enumerated().map {
-            ExpressionColumn(name: $0.element.name, qualifier: table.name, type: try $0.element.type.resolve(snapshot.types), index: $0.offset)
+        let rowTypes = try snapshot.tableTypes(table)
+        let columns = table.columns.enumerated().map {
+            ExpressionColumn(name: $0.element.name, qualifier: table.name, type: rowTypes[$0.offset], index: $0.offset)
         }
         let resolver = ExpressionResolver(columns: columns, composites: snapshot.types, scalar: context.scalar)
         resolver.hostFunctions = settings.environment.signatures; resolver.unicode = settings.environment.unicode

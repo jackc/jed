@@ -8,6 +8,7 @@ internal struct SystemRelationPlan {
     }
     let kind: Kind
     let snapshot: DomainSnapshot
+    let sourceDomain: SQLText
     let settings: SessionSettings
     let columns: [ExpressionColumn]
 
@@ -18,9 +19,9 @@ internal struct SystemRelationPlan {
     static func resolve(_ name: SQLName, alias: SQLText?, snapshot: DomainSnapshot,
                         settings: SessionSettings) throws -> SystemRelationPlan? {
         guard let kind = Kind(rawValue: name.name.description) else { return nil }
-        guard name.database == nil || name.database?.description == "main" else {
-            throw JedError("42P01", "database \"\(name.database!)\" is not attached")
-        }
+        let domains = QueryDomains.statement(snapshot: snapshot, settings: settings)
+        let sourceDomain = name.database ?? domains.implicitDomain
+        let owner = try domains.snapshot(sourceDomain)
         try settings.privileges.require(.select, on: name.name)
         let text = SQLType.scalar(.text), bool = SQLType.scalar(.boolean)
         let i32 = SQLType.scalar(.i32), i64 = SQLType.scalar(.i64)
@@ -44,7 +45,7 @@ internal struct SystemRelationPlan {
         case .views: definition = [("name", text), ("definition", text), ("columns", .array(text)), ("check_option", text),
             ("security_barrier", bool), ("security_invoker", bool)]
         }
-        return SystemRelationPlan(kind: kind, snapshot: snapshot, settings: settings,
+        return SystemRelationPlan(kind: kind, snapshot: owner, sourceDomain: sourceDomain, settings: settings,
             columns: definition.enumerated().map { ExpressionColumn(name: sqlText($0.element.0), qualifier: alias ?? name.name,
                 type: TypeDescriptor($0.element.1), index: $0.offset) })
     }
@@ -67,16 +68,19 @@ internal struct SystemRelationPlan {
             for table in tables { try row([.text(table.name)]) }
         case .columns:
             for table in tables {
+                let types = try snapshot.tableTypes(table)
                 for (index, column) in table.columns.enumerated() {
                     let pk = table.primaryKey.firstIndex(of: index)
                     try row([.text(table.name), .text(column.name), .integer(Int64(index + 1)),
-                        Self.text(Self.typeText(try column.type.resolve(snapshot.types))), .boolean(column.notNull || pk != nil),
-                        pk.map { .integer(Int64($0 + 1)) } ?? .null, try defaultText(column),
+                        Self.text(Self.typeText(types[index])), .boolean(column.notNull || pk != nil),
+                        pk.map { .integer(Int64($0 + 1)) } ?? .null, try defaultText(column, type: types[index]),
                         column.identity.map { Self.text($0 ? "ALWAYS" : "BY DEFAULT") } ?? .null])
                 }
             }
             for view in catalog.views.sorted(by: { $0.name < $1.name }) {
                 var unrestricted = settings
+                unrestricted.domains = try QueryDomains.statement(snapshot: snapshot, settings: settings).viewScope(owner: sourceDomain)
+                unrestricted.targetDomain = sourceDomain
                 unrestricted.privileges = SessionPrivileges(defaults: .allTables)
                 let body = try ViewDefinition.parsed(view)
                 var scalar = context.scalar; scalar.meter = nil
@@ -160,13 +164,12 @@ internal struct SystemRelationPlan {
         }
     }
 
-    private func defaultText(_ column: CatalogColumn) throws -> SQLValue {
+    private func defaultText(_ column: CatalogColumn, type: TypeDescriptor) throws -> SQLValue {
         switch column.defaultValue {
         case nil: return .null
         case .expression(let expression): return .text(expression.text)
         case .constant(let value):
             if value.isNull { return .null }
-            let type = try column.type.resolve(snapshot.types)
             let text = try ContainerText.render(value, type: type).description
             switch value {
             case .integer, .decimal, .boolean: return Self.text(text)

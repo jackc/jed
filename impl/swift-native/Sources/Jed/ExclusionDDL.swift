@@ -14,6 +14,9 @@ extension CatalogDDL {
     static func exclusionDefinition(method: SQLText?, elements: [SQLExcludeElement], predicate: SQLExpression?,
                                     table: CatalogTable, source: SQLText, snapshot: DomainSnapshot,
                                     settings: SessionSettings, context: ExpressionContext) throws -> ExclusionDefinition {
+        guard settings.targetDomain == DomainNames.main else {
+            throw JedError("0A000", "exclusion constraints on temporary or attached tables are not supported")
+        }
         let kind: UInt8
         switch method?.description ?? "btree" {
         case "btree": kind = 0

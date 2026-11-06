@@ -211,16 +211,17 @@ internal struct CatalogImage: Sendable {
 
     /// Resolve nominal identities without trusting file order. The catalog ID
     /// is supplied by the owning database; persisted bytes never select it.
-    func resolvedTypes(catalogID: UInt64) throws -> [SQLText: CompositeType] {
+    func resolvedTypes(catalogID: UInt64, borrowedTypes: [SQLText: CompositeType] = [:]) throws -> [SQLText: CompositeType] {
+        guard borrowedTypes.isEmpty || composites.isEmpty else { throw JedError.corruption("borrowed and owned composite catalogs cannot be mixed") }
         var definitions: [SQLText: CatalogComposite] = [:], ids: [SQLText: UInt32] = [:]
         for (index, definition) in composites.sorted(by: { $0.name < $1.name }).enumerated() {
-            guard !definition.name.utf8.isEmpty, !definition.fields.isEmpty,
+            guard borrowedTypes[definition.name] == nil, !definition.name.utf8.isEmpty, !definition.fields.isEmpty,
                   definitions.updateValue(definition, forKey: definition.name) == nil else {
                 throw JedError.corruption("duplicate or empty composite definition")
             }
             ids[definition.name] = UInt32(index + 1)
         }
-        var resolved: [SQLText: CompositeType] = [:], active: Set<SQLText> = [], depths: [SQLText: Int] = [:]
+        var resolved = borrowedTypes, active: Set<SQLText> = [], depths: [SQLText: Int] = [:]
         func visit(_ name: SQLText) throws {
             if resolved[name] != nil { return }
             guard let definition = definitions[name], active.insert(name).inserted else {

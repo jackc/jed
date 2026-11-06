@@ -21,8 +21,8 @@ internal enum ForeignKeyValidation {
                 throw JedError.corruption("foreign key references a missing table")
             }
             self.child = child; self.foreign = foreign; self.parent = parent
-            childTypes = try child.columns.map { try $0.type.resolve(snapshot.types) }
-            parentTypes = try parent.columns.map { try $0.type.resolve(snapshot.types) }
+            childTypes = try snapshot.tableTypes(child)
+            parentTypes = try snapshot.tableTypes(parent)
             if !parent.primaryKey.isEmpty, Set(parent.primaryKey) == Set(foreign.referencedColumns) {
                 keyColumns = parent.primaryKey; index = nil
             } else {

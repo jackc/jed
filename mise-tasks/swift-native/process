@@ -18,6 +18,7 @@ abort "native Swift actor is not built: #{actor}" unless File.executable?(actor)
 environment = {
   "JED_PROCESS_CORES" => ENV.fetch("JED_PROCESS_CORES", "swift-native"),
   "JED_SWIFT_PROCESS_ACTOR" => actor,
+  "JED_PROCESS_PAGES_ACTOR" => actor,
   "JED_PROCESS_CORPUS" => File.join(SwiftNativeTasks::PACKAGE, "Tools/Fixtures/Process"),
   "JED_PROCESS_FIXTURE_ROOT" => File.join(SwiftNativeTasks::PACKAGE, "Tests/JedTests/Fixtures"),
   # Frozen capability lists predate this experiment. Never silently substitute

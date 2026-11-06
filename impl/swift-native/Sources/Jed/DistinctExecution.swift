@@ -27,7 +27,8 @@ internal final class DistinctExecution {
         var input = SelectPlan(columns: plan.columns, projections: plan.projections, predicate: plan.predicate,
             store: plan.store, touched: plan.touched, parameters: plan.parameters, limit: nil, offset: 0, order: plan.order,
             orderedByScan: plan.orderedByScan, descending: plan.descending, scan: plan.scan, aggregation: plan.aggregation,
-            relation: plan.relation, productionCharge: false, window: plan.window)
+            relation: plan.relation, productionCharge: false, window: plan.window,
+            sourceDomain: plan.sourceDomain, sourceSnapshot: plan.sourceSnapshot)
         input.materializeSource = !plan.orderedByScan
         return input
     }

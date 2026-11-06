@@ -7,6 +7,8 @@ internal struct DomainSnapshot: Sendable {
     private(set) var txid: UInt64
     private(set) var catalog: CatalogImage
     private(set) var types: [SQLText: CompositeType]
+    private(set) var borrowedTypes: [SQLText: CompositeType] = [:]
+    private(set) var borrowedReferences = CatalogBorrowedReferences()
     private(set) var tables: [SQLText: TableStore]
     private(set) var indexes: [SQLText: TableStore]
     private(set) var gistTrees: [SQLText: GistTree]
@@ -15,13 +17,51 @@ internal struct DomainSnapshot: Sendable {
     private var nextTypeID: UInt32
 
     init(catalogID: UInt64, txid: UInt64, catalog: CatalogImage, pool: NodePool,
-         tables: [SQLText: TableStore], indexes: [SQLText: TableStore], gistTrees: [SQLText: GistTree]) throws {
+         tables: [SQLText: TableStore], indexes: [SQLText: TableStore], gistTrees: [SQLText: GistTree],
+         borrowedTypes: [SQLText: CompositeType] = [:], borrowedReferences: CatalogBorrowedReferences = .init()) throws {
         identity = StorageRevision(); self.catalogID = catalogID; self.txid = txid; self.catalog = catalog
         self.pool = pool; self.tables = tables; self.indexes = indexes; self.gistTrees = gistTrees
-        types = try catalog.resolvedTypes(catalogID: catalogID)
+        self.borrowedTypes = borrowedTypes; self.borrowedReferences = borrowedReferences
+        types = try catalog.resolvedTypes(catalogID: catalogID, borrowedTypes: borrowedTypes)
         guard types.count < UInt32.max else { throw JedError("54000", "composite type identity limit exceeded") }
         nextTypeID = UInt32(types.count + 1)
     }
+    /// Temp catalogs borrow immutable main type trees without importing main
+    /// catalog entries or page ownership. Retain names already used by temp
+    /// stores even after another session drops their persistent definition.
+    mutating func borrowTypes(_ available: [SQLText: CompositeType]) throws {
+        guard catalog.composites.isEmpty else { throw JedError.corruption("a borrowed-type domain cannot define composite types") }
+        borrowedTypes.merge(available) { _, current in current }
+        types = borrowedTypes
+        try catalog.validateReferences(catalogID: catalogID, borrowedTypes: borrowedTypes, borrowedReferences: borrowedReferences)
+    }
+
+    /// Private views may name main objects without importing their catalog or
+    /// page roots. Retained facts validate unrelated private commits after a
+    /// different session removes a main object; using that view still replans
+    /// against the current named roots and reports the ordinary missing name.
+    mutating func borrow(_ main: DomainSnapshot) throws {
+        borrowedReferences.include(main.catalog)
+        try borrowTypes(main.types)
+    }
+
+
+    /// Existing stores own fully resolved nominal identities. A same-named
+    /// composite recreated in main cannot reinterpret previously stored rows.
+    /// A prospective ALTER layout falls back to resolving its new declaration.
+    func tableTypes(_ table: CatalogTable) throws -> [TypeDescriptor] {
+        if !borrowedTypes.isEmpty, let stored = tables[table.name]?.tree.types, stored.count == table.columns.count {
+            let matches = try zip(stored, table.columns).allSatisfy { descriptor, column in
+                let raw = try CatalogSQL.typeUse(descriptor), declared = column.type
+                return raw.type == declared.type && raw.decimal == declared.decimal
+                    && raw.textLimit == declared.textLimit && raw.temporal == declared.temporal
+                    && raw.collation == declared.collation
+            }
+            if matches { return stored }
+        }
+        return try table.columns.map { try $0.type.resolve(types) }
+    }
+
     var pendingBytes: Int64 {
         tables.values.reduce(indexes.values.reduce(Int64(0)) { saturatingAdd($0, $1.pendingBytes) }) {
             saturatingAdd($0, $1.pendingBytes)
@@ -45,7 +85,7 @@ internal struct DomainSnapshot: Sendable {
     /// Call only for an actual metadata mutation. Schema revisions invalidate
     /// prepared plans; sequence/statistics metadata uses the separate data token.
     mutating func updateCatalog(_ image: CatalogImage, schemaChanged: Bool) throws {
-        try image.validateReferences(catalogID: catalogID)
+        try image.validateReferences(catalogID: catalogID, borrowedTypes: borrowedTypes, borrowedReferences: borrowedReferences)
         var next = nextTypeID, ids: [SQLText: UInt32] = [:]
         for definition in image.composites.sorted(by: { $0.name < $1.name }) {
             if let old = types[definition.name] { ids[definition.name] = old.id }
@@ -55,7 +95,7 @@ internal struct DomainSnapshot: Sendable {
             }
         }
         let definitions = Dictionary(uniqueKeysWithValues: image.composites.map { ($0.name, $0) })
-        var resolved: [SQLText: CompositeType] = [:], active: Set<SQLText> = [], depths: [SQLText: Int] = [:]
+        var resolved = borrowedTypes, active: Set<SQLText> = [], depths: [SQLText: Int] = [:]
         func visit(_ name: SQLText) throws {
             if resolved[name] != nil { return }
             guard let definition = definitions[name], active.insert(name).inserted, active.count <= 32 else {

@@ -72,6 +72,8 @@ internal struct SessionPrivileges {
 /// the environment and lifetime counter but copy variables and capabilities.
 internal struct SessionSettings {
     let environment: Environment
+    var domains: QueryDomains?
+    var targetDomain: SQLText = DomainNames.main
     var options: SessionOptions
     let lifetime: LifetimeCost
     var privileges: SessionPrivileges

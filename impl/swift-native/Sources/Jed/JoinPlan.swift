@@ -41,8 +41,9 @@ internal struct JoinPlan {
             let outer = swapped ? 1 : 0, inner = 1 - outer
             let outerRows = tables[outer].rowCount, innerRows = tables[inner].rowCount
             let offset = inner == 0 ? 0 : boundary
-            let bound = indexed(predicate, table: tables[inner], types: stores[inner].tree.types,
-                                innerOffset: offset, innerWidth: inner == 0 ? boundary : right.columns.count)
+            let bound = (inner == 0 ? left : right).allowsIndexAccess
+                ? indexed(predicate, table: tables[inner], types: stores[inner].tree.types,
+                          innerOffset: offset, innerWidth: inner == 0 ? boundary : right.columns.count) : nil
             var candidates: [JoinPlan] = []
             if let bound {
                 let unique = !tables[inner].primaryKey.isEmpty && tables[inner].primaryKey.allSatisfy { key in

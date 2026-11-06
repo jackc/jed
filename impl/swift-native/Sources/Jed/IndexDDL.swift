@@ -2,7 +2,7 @@ extension CatalogDDL {
     static func createIndex(_ definition: SQLCreateIndex, source: SQLText, snapshot: inout DomainSnapshot,
                             settings: SessionSettings, context: ExpressionContext) throws {
         try SystemRelationPlan.rejectTarget(definition.table.name)
-        let tableName = try nameInMain(definition.table)
+        let tableName = try CatalogDomain.name(definition.table, settings: settings)
         guard let tablePosition = snapshot.catalog.tables.firstIndex(where: { $0.name == tableName }),
               let store = snapshot.tables[tableName] else {
             if CatalogSQL.relationNames(snapshot.catalog).contains(tableName) { throw JedError("42809", "\(tableName) is not a table") }
@@ -11,6 +11,10 @@ extension CatalogDDL {
         let table = snapshot.catalog.tables[tablePosition]
         try CatalogEnvironment.checkTableCollations(table, image: snapshot.catalog, environment: settings.environment)
         let method = definition.method?.description ?? "btree"
+        if DomainNames.isAttachment(settings.targetDomain), method != "btree" { throw JedError("0A000", "non-btree indexes on attachments are not yet supported") }
+        if settings.targetDomain == DomainNames.temporary, method == "gist" {
+            throw JedError("0A000", "GiST indexes on temporary tables are not supported")
+        }
         let kind: UInt8
         switch method {
         case "btree": kind = 0
@@ -69,7 +73,7 @@ extension CatalogDDL {
             expressions.append(resolved); predicate = try CatalogSQL.expression(syntax, source: source)
         }
         let dependencies = try IndexDependencies.resolve(expressions, environment: settings.environment)
-        let relations = CatalogSQL.relationNames(snapshot.catalog), name: SQLText
+        let relations = CatalogDomain.relations(snapshot.catalog, settings: settings), name: SQLText
         if let explicit = definition.name {
             try CatalogSQL.reserved(explicit, kind: "index")
             if relations.contains(explicit) {
@@ -111,11 +115,11 @@ extension CatalogDDL {
         try context.meter.syncPending(snapshot.pendingBytes)
     }
 
-    static func dropIndexes(_ definition: SQLDrop, snapshot: inout DomainSnapshot) throws {
+    static func dropIndexes(_ definition: SQLDrop, snapshot: inout DomainSnapshot, settings: SessionSettings) throws {
         var targets: Set<SQLText> = []
         let catalog = snapshot.catalog, relations = CatalogSQL.relationNames(snapshot.catalog)
         for input in definition.names {
-            let name = try nameInMain(input)
+            let name = try CatalogDomain.name(input, settings: settings)
             if let table = catalog.tables.first(where: { $0.indexes.contains { $0.name == name } }),
                let index = table.indexes.first(where: { $0.name == name }) {
                 guard !index.isConstraint, !table.exclusions.contains(where: { $0.index == name }) else {

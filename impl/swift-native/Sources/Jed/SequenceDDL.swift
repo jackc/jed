@@ -1,8 +1,9 @@
 extension CatalogDDL {
-    static func createSequence(_ definition: SQLCreateSequence, snapshot: inout DomainSnapshot) throws {
-        let name = try nameInMain(definition.name)
+    static func createSequence(_ definition: SQLCreateSequence, snapshot: inout DomainSnapshot, settings: SessionSettings) throws {
+        guard settings.targetDomain == DomainNames.main else { throw JedError("0A000", "standalone sequences must be created in the main database") }
+        let name = try CatalogDomain.name(definition.name, settings: settings)
         try CatalogSQL.reserved(name, kind: "sequence")
-        if CatalogSQL.relationNames(snapshot.catalog).contains(name) {
+        if CatalogDomain.relations(snapshot.catalog, settings: settings).contains(name) {
             if definition.ifNotExists { return }
             throw JedError("42P07", "relation already exists: \(name)")
         }
@@ -10,8 +11,8 @@ extension CatalogDDL {
         var image = snapshot.catalog; image.sequences.append(sequence)
         try snapshot.updateCatalog(image, schemaChanged: true)
     }
-    static func alterSequence(_ definition: SQLAlterSequence, snapshot: inout DomainSnapshot) throws {
-        let name = try nameInMain(definition.name)
+    static func alterSequence(_ definition: SQLAlterSequence, snapshot: inout DomainSnapshot, settings: SessionSettings) throws {
+        let name = try CatalogDomain.name(definition.name, settings: settings)
         guard let position = snapshot.catalog.sequences.firstIndex(where: { $0.name == name }) else {
             if definition.ifExists { return }
             throw JedError("42P01", "sequence does not exist: \(name)")
@@ -19,7 +20,7 @@ extension CatalogDDL {
         var image = snapshot.catalog
         if let renamed = definition.rename {
             try CatalogSQL.reserved(renamed, kind: "sequence")
-            guard !CatalogSQL.relationNames(image).contains(renamed) else { throw JedError("42P07", "relation already exists: \(renamed)") }
+            guard !CatalogDomain.relations(image, settings: settings).contains(renamed) else { throw JedError("42P07", "relation already exists: \(renamed)") }
             image.sequences[position].name = renamed
             for table in image.tables.indices {
                 for column in image.tables[table].columns.indices {
@@ -52,11 +53,11 @@ extension CatalogDDL {
         }
         try snapshot.updateCatalog(image, schemaChanged: true)
     }
-    static func dropSequences(_ definition: SQLDrop, snapshot: inout DomainSnapshot) throws {
+    static func dropSequences(_ definition: SQLDrop, snapshot: inout DomainSnapshot, settings: SessionSettings) throws {
         var targets: Set<SQLText> = []
         let catalog = snapshot.catalog
         for input in definition.names {
-            let name = try nameInMain(input)
+            let name = try CatalogDomain.name(input, settings: settings)
             if catalog.sequences.contains(where: { $0.name == name }) { targets.insert(name) }
             else if !definition.ifExists { throw JedError("42P01", "sequence does not exist: \(name)") }
         }

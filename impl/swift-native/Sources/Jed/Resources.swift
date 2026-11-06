@@ -125,6 +125,11 @@ internal final class CostMeter {
     let lifetimeLimit: Int64
     let resources: StatementResources
     let cancellation: CancellationToken?
+    /// Other domains' pending writes stay resident while one target mutation
+    /// updates its own reservation. The statement coordinator resets this to
+    /// zero before synchronizing the complete working-root set.
+    var pendingDomainBase: Int64 = 0
+    var pendingDomainExcluded = false
 
     init(limit: Int64 = 0, lifetime: LifetimeCost? = nil,
          resources: StatementResources = StatementResources(), cancellation: CancellationToken? = nil) {
@@ -193,7 +198,7 @@ internal final class CostMeter {
     }
 
     func syncPending(_ pending: Int64) throws {
-        do { try resources.query.syncPending(pending) }
+        do { try resources.query.syncPending(saturatingAdd(pendingDomainBase, pendingDomainExcluded ? 0 : pending)) }
         catch { try guardCost(); throw error }
     }
 }

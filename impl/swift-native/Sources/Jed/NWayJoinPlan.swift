@@ -63,7 +63,7 @@ internal struct NWayJoinPlan {
             let rows = ready.reduce(product) { QueryEstimate.rows($1, input: $0) }
             let logical = ready.reduce(QueryEstimate.multiply(state.logicalRows, count)) { QueryEstimate.rows($1, input: $0) }
             var alternatives: [(Algorithm, Int64, Int64, Int64)] = []
-            if case .base(let store) = input.source.body,
+            if input.source.allowsIndexAccess, case .base(let store) = input.source.body,
                let bound = JoinPlan.indexed(QueryEstimate.and(ready), table: input.source.baseTable!, types: store.tree.types,
                    innerOffset: input.offset, innerWidth: input.source.columns.count) {
                 let table = input.source.baseTable!

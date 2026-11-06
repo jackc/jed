@@ -22,12 +22,12 @@ extension MutationExecutor {
             if syntax.doNothing { changes = []; predicate = nil; return }
             if let view = relation.view {
                 var privileges = inputSettings.privileges
-                try privileges.require(.update, on: view.layers[0].view.name)
+                if settings.targetDomain != DomainNames.temporary { try privileges.require(.update, on: view.layers[0].view.name) }
                 for layer in view.layers {
                     if layer.view.securityInvoker { try privileges.require(.update, on: layer.base.name) }
                     else { privileges = privileges.withTableAccess() }
                 }
-            } else { try settings.privileges.require(.update, on: relation.table.name) }
+            } else if settings.targetDomain != DomainNames.temporary { try settings.privileges.require(.update, on: relation.table.name) }
             let width = relation.visibleCount, excluded = SQLText(validatedUTF8: Array("excluded".utf8))
             resolver.columns += relation.columns(qualifier: excluded, offset: width, qualifiedOnly: true)
             if (alias ?? relation.view?.layers.first?.view.name ?? relation.table.name) == excluded {
@@ -95,9 +95,11 @@ extension MutationExecutor {
                        relation: Relation, indexes: [StoredIndexPlan], checks: [Check], returning: Returning,
                        snapshot: inout DomainSnapshot, settings: SessionSettings,
                        inputSettings: SessionSettings, context: ExpressionContext) throws -> MutationResult {
+        let read = context.writeScope?.readSnapshot ?? snapshot
+        let foreignState = context.writeScope?.foreignKeys ?? ForeignKeyActions.State()
         try plan.prepare(relation: relation, context: context)
         let result = MutationResult(command: "INSERT", columns: returning.columns, meter: context.meter)
-        var store = relation.store, inserted: [ConflictRow] = [], updated: [ConflictRow] = []
+        var store = snapshot.tables[relation.table.name] ?? relation.store, inserted: [ConflictRow] = [], updated: [ConflictRow] = []
         var affected: Set<[UInt8]> = [], vacated: Set<[UInt8]> = []
         let compression = CostMeter(resources: context.meter.resources, cancellation: context.meter.cancellation)
         func skipped(_ values: [SQLValue]) throws -> Bool {
@@ -106,19 +108,19 @@ extension MutationExecutor {
                 if !relation.table.primaryKey.isEmpty {
                     let primary = ConflictArbiter.primary
                     if let key = try primary.key(values, relation: relation, indexes: indexes, context: context) {
-                        if try store.get(key) != nil || inserted.contains(where: { $0.record.key == key }) { return true }
+                        if try relation.store.get(key) != nil || inserted.contains(where: { $0.record.key == key }) { return true }
                     }
                 }
                 for ordinal in indexes.indices where indexes[ordinal].index.unique {
                     let arbiter = ConflictArbiter.index(ordinal)
                     if let key = try arbiter.key(values, relation: relation, indexes: indexes, context: context) {
-                        if try arbiter.existing(key, relation: relation, indexes: indexes, snapshot: snapshot, vacated: []) != nil { return true }
+                        if try arbiter.existing(key, relation: relation, indexes: indexes, snapshot: read, vacated: []) != nil { return true }
                         if inserted.contains(where: { $0.prefixes[ordinal]?.bytes == key && $0.prefixes[ordinal]?.hasNull == false }) { return true }
                     }
                 }
                 for exclusion in plan.exclusions {
                     guard let probe = try exclusion.member({ values[$0] })?.probe else { continue }
-                    if try exclusion.existing(probe, snapshot: snapshot, vacated: []) != nil { return true }
+                    if try exclusion.existing(probe, snapshot: read, vacated: []) != nil { return true }
                     for previous in inserted {
                         if let other = try exclusion.member({ previous.values[$0] })?.probe,
                            try exclusion.conflicts(probe, other) { return true }
@@ -128,7 +130,7 @@ extension MutationExecutor {
             case .exclusion(let ordinal):
                 let exclusion = plan.exclusions[ordinal]
                 guard let probe = try exclusion.member({ values[$0] })?.probe else { return false }
-                if try exclusion.existing(probe, snapshot: snapshot, vacated: []) != nil { return true }
+                if try exclusion.existing(probe, snapshot: read, vacated: []) != nil { return true }
                 for previous in inserted {
                     if let other = try exclusion.member({ previous.values[$0] })?.probe,
                        try exclusion.conflicts(probe, other) { return true }
@@ -144,7 +146,7 @@ extension MutationExecutor {
             try validate(checks, relation: relation, value: { values[$0] }, context: context)
             if try skipped(values) { continue }
             let key = try plan.arbiter.key(values, relation: relation, indexes: indexes, context: context)
-            let existing = try key.flatMap { try plan.arbiter.existing($0, relation: relation, indexes: indexes, snapshot: snapshot, vacated: vacated) }
+            let existing = try key.flatMap { try plan.arbiter.existing($0, relation: relation, indexes: indexes, snapshot: read, vacated: vacated) }
             if let old = existing {
                 if plan.doNothing { continue }
                 let oldRow = ScanRecord(old, pager: store.tree.pool?.pager)
@@ -197,10 +199,10 @@ extension MutationExecutor {
         var primaryKeys: Set<[UInt8]> = []
         for change in changes {
             guard primaryKeys.insert(change.record.key).inserted else { throw duplicate(relation.table.name) }
-            if !vacated.contains(change.record.key), try store.get(change.record.key) != nil { throw duplicate(relation.table.name) }
+            if !vacated.contains(change.record.key), try relation.store.get(change.record.key) != nil { throw duplicate(relation.table.name) }
         }
         for ordinal in indexes.indices where indexes[ordinal].index.unique {
-            guard let existing = snapshot.indexes[indexes[ordinal].index.name] else { throw JedError.corruption("missing unique index") }
+            guard let existing = read.indexes[indexes[ordinal].index.name] else { throw JedError.corruption("missing unique index") }
             var keys: Set<[UInt8]> = []
             for change in changes {
                 guard let prefix = change.prefixes[ordinal], !prefix.hasNull else { continue }
@@ -213,65 +215,79 @@ extension MutationExecutor {
         // updates of self-referenced parent keys. UPDATE checks only assigned
         // local FK columns; INSERT checks every FK.
         let candidates = changes.map(\.candidate)
-        let foreignKeys = try relation.table.foreignKeys.sorted { $0.name < $1.name }.map {
-            try ForeignKeyValidation.Plan(child: relation.table, foreign: $0, snapshot: snapshot)
-        }
-        for change in changes {
-            for foreign in foreignKeys where change.old == nil || !Set(foreign.foreign.columns).isDisjoint(with: plan.assigned) {
-                switch try foreign.childProbe(change.candidate.value, context: context) {
-                case .exempt: break
-                case .missing: throw foreign.violation()
-                case .key(let key):
-                    let same = foreign.parent.name == relation.table.name
-                    guard try foreign.parentExists(key, snapshot: snapshot, candidates: same ? candidates : [],
-                        vacated: same ? vacated : [], context: context) else { throw foreign.violation() }
+        try ExclusionValidation.validate(candidates, table: relation.table, snapshot: read,
+            settings: inputSettings, context: context, vacated: vacated)
+        if foreignState.deferUntilStatementEnd {
+            for change in changes {
+                try foreignState.validateChildren([change.candidate], child: relation.table, snapshot: snapshot,
+                    assigned: change.old == nil ? nil : plan.assigned, vacated: vacated, context: context)
+            }
+        } else {
+            let foreignKeys = try relation.table.foreignKeys.sorted { $0.name < $1.name }.map {
+                try ForeignKeyValidation.Plan(child: relation.table, foreign: $0, snapshot: read)
+            }
+            for change in changes {
+                for foreign in foreignKeys where change.old == nil || !Set(foreign.foreign.columns).isDisjoint(with: plan.assigned) {
+                    switch try foreign.childProbe(change.candidate.value, context: context) {
+                    case .exempt: break
+                    case .missing: throw foreign.violation()
+                    case .key(let key):
+                        let same = foreign.parent.name == relation.table.name
+                        guard try foreign.parentExists(key, snapshot: read, candidates: same ? candidates : [],
+                            vacated: same ? vacated : [], context: context) else { throw foreign.violation() }
+                    }
                 }
             }
         }
-        try ExclusionValidation.validate(candidates, table: relation.table, snapshot: snapshot,
-            settings: inputSettings, context: context, vacated: vacated)
         context.meter.charge(compression.accrued); try context.meter.checkpoint()
         for change in changes {
             let old = change.old.map { ScanRecord($0, pager: store.tree.pool?.pager) }
             try returning.emit(old: old.map { $0.value }, new: { change.values[$0] }, relation: relation, context: context, result: result)
         }
-        for change in updated { try store.remove(change.old!.key) }
-        for change in changes { try store.put(change.record, netStaging: settings.options.maxQueryMemoryBytes > 0) }
-        if !changes.isEmpty {
-            for ordinal in indexes.indices {
-                let name = indexes[ordinal].index.name
-                guard var indexStore = snapshot.indexes[name] else { throw JedError.corruption("missing index store") }
-                for change in updated {
-                    let old = ScanRecord(change.old!, pager: store.tree.pool?.pager)
-                    if let prefix = try indexes[ordinal].prefix(old.value) {
-                        let before = prefix.bytes + change.old!.key
-                        let after = change.prefixes[ordinal].map { $0.bytes + change.record.key }
-                        if before != after { try indexStore.remove(before) }
-                    }
-                }
-                for change in changes {
-                    if let prefix = change.prefixes[ordinal] {
-                        let after = prefix.bytes + change.record.key
-                        if let old = change.old {
-                            let row = ScanRecord(old, pager: store.tree.pool?.pager)
-                            if try indexes[ordinal].prefix(row.value).map({ $0.bytes + old.key }) == after { continue }
+        result.affected = Int64(changes.count)
+        if context.writeScope != nil {
+            try mergeWrites(changes.map { WriteChange(old: $0.old, new: $0.record) }, relation: relation,
+                indexes: indexes, allocated: store, snapshot: &snapshot, settings: settings)
+        } else {
+            for change in updated { try store.remove(change.old!.key) }
+            for change in changes { try store.put(change.record, netStaging: settings.options.maxQueryMemoryBytes > 0) }
+            if !changes.isEmpty {
+                for ordinal in indexes.indices {
+                    let name = indexes[ordinal].index.name
+                    guard var indexStore = snapshot.indexes[name] else { throw JedError.corruption("missing index store") }
+                    for change in updated {
+                        let old = ScanRecord(change.old!, pager: store.tree.pool?.pager)
+                        if let prefix = try indexes[ordinal].prefix(old.value) {
+                            let before = prefix.bytes + change.old!.key
+                            let after = change.prefixes[ordinal].map { $0.bytes + change.record.key }
+                            if before != after { try indexStore.remove(before) }
                         }
-                        try indexStore.put(PackedRecord(key: after, cells: []), netStaging: settings.options.maxQueryMemoryBytes > 0)
                     }
+                    for change in changes {
+                        if let prefix = change.prefixes[ordinal] {
+                            let after = prefix.bytes + change.record.key
+                            if let old = change.old {
+                                let row = ScanRecord(old, pager: store.tree.pool?.pager)
+                                if try indexes[ordinal].prefix(row.value).map({ $0.bytes + old.key }) == after { continue }
+                            }
+                            try indexStore.put(PackedRecord(key: after, cells: []), netStaging: settings.options.maxQueryMemoryBytes > 0)
+                        }
+                    }
+                    snapshot.setIndexStore(name, indexStore); try indexes[ordinal].rebuild(indexStore, snapshot: &snapshot)
                 }
-                snapshot.setIndexStore(name, indexStore); try indexes[ordinal].rebuild(indexStore, snapshot: &snapshot)
+                try install(store, relation: relation, countDelta: Int64(inserted.count), snapshot: &snapshot)
             }
-            result.affected = Int64(changes.count)
-            try install(store, relation: relation, countDelta: Int64(inserted.count), snapshot: &snapshot)
+        }
+        if !changes.isEmpty {
             if !updated.isEmpty {
                 let transitions = updated.map { change -> ForeignKeyActions.Transition in
                     let old = ScanRecord(change.old!, pager: store.tree.pool?.pager)
                     return .init(old: .init(key: change.old!.key, value: old.value), new: change.candidate)
                 }
-                let state = ForeignKeyActions.State()
+                let state = foreignState
                 try ForeignKeyActions.apply(transitions, parent: relation.table, deleting: false,
                     snapshot: &snapshot, settings: settings, context: context, state: state)
-                try state.settle(snapshot: snapshot, settings: settings, context: context)
+                if !state.deferUntilStatementEnd { try state.settle(snapshot: snapshot, settings: settings, context: context) }
             }
         }
         try context.meter.syncPending(snapshot.pendingBytes)

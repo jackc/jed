@@ -7,42 +7,60 @@ internal final class CTEExecution {
     private var rows: [ObjectIdentifier: [[SQLValue]]] = [:]
     private var bytes: Int64 = 0
     private var working: [ObjectIdentifier: [[SQLValue]]] = [:]
-    init(plan: WithQueryPlan, context: ExpressionContext) {
+    convenience init(plan: WithQueryPlan, context: ExpressionContext) {
+        self.init(bindings: plan.bindings, context: context)
+    }
+    init(bindings: [CTEBinding], context: ExpressionContext) {
         parent = context.ctes; self.context = context
-        bindings = Dictionary(uniqueKeysWithValues: plan.bindings.map { (ObjectIdentifier($0), $0) })
+        self.bindings = Dictionary(uniqueKeysWithValues: bindings.map { (ObjectIdentifier($0), $0) })
     }
     func bodyContext() -> ExpressionContext {
         var current = context; current.ctes = self; current.subqueries = SubqueryExecution()
         return current
     }
-    private func bindingContext(_ binding: CTEBinding) -> ExpressionContext {
+    func bindingContext(_ binding: CTEBinding) -> ExpressionContext {
         var current = bodyContext(); current.patterns = PatternExecution()
         StatementServices(settings: binding.settings, meter: context.meter).install(into: &current)
         return current
     }
     func prepare(_ plan: WithQueryPlan) throws {
         for binding in plan.bindings where binding.references > 0 && binding.buffers {
-            if let recursive = binding.recursive {
-                let key = ObjectIdentifier(binding)
-                defer { working.removeValue(forKey: key) }
-                let prior = rows.values.reduce(Int64(0)) { total, rows in
-                    rows.reduce(total) { saturatingAdd($0, MemorySizes.row($1)) }
-                }
-                let execution = RecursiveCTEExecution(binding: binding, recursive: recursive, context: bindingContext(binding))
-                let result = try execution.run(priorBufferBytes: prior) { working[key] = $0 }
-                rows[key] = result.rows; bytes = saturatingAdd(bytes, result.bytes)
-                continue
-            }
-            let execution = SelectExecution(plan: binding.plan, context: bindingContext(binding))
-            defer { execution.close() }
-            var output: [[SQLValue]] = []
-            while let row = try execution.next() {
-                let charge = MemorySizes.row(row)
-                try context.meter.reserveQuery(charge); bytes = saturatingAdd(bytes, charge)
-                output.append(row)
-            }
-            rows[ObjectIdentifier(binding)] = output
+            try prepare(binding)
         }
+    }
+    func prepare(_ binding: CTEBinding) throws {
+        guard let plan = binding.plan else { throw JedError("XX000", "data-modifying CTE needs the statement coordinator") }
+        if let recursive = binding.recursive {
+            let key = ObjectIdentifier(binding)
+            defer { working.removeValue(forKey: key) }
+            let prior = rows.values.reduce(Int64(0)) { total, rows in
+                rows.reduce(total) { saturatingAdd($0, MemorySizes.row($1)) }
+            }
+            let execution = RecursiveCTEExecution(binding: binding, anchor: plan, recursive: recursive, context: bindingContext(binding))
+            let result = try execution.run(priorBufferBytes: prior) { working[key] = $0 }
+            rows[key] = result.rows; bytes = saturatingAdd(bytes, result.bytes)
+            return
+        }
+        let execution = SelectExecution(plan: plan, context: bindingContext(binding))
+        defer { execution.close() }
+        var output: [[SQLValue]] = []
+        while let row = try execution.next() {
+            let charge = MemorySizes.row(row)
+            try context.meter.reserveQuery(charge); bytes = saturatingAdd(bytes, charge)
+            output.append(row)
+        }
+        rows[ObjectIdentifier(binding)] = output
+    }
+    func adopt(_ result: MutationResult, for binding: CTEBinding) throws {
+        var output: [[SQLValue]] = []
+        while let row = result.next() {
+            // Transfer the RETURNING owner: next releases exactly this charge.
+            // Re-admission never overlaps the former reservation.
+            let charge = MemorySizes.row(row)
+            try context.meter.reserveQuery(charge); bytes = saturatingAdd(bytes, charge)
+            output.append(row)
+        }
+        rows[ObjectIdentifier(binding)] = output
     }
     func scan(_ binding: CTEBinding, visit: ([SQLValue]) throws -> Void) throws {
         let key = ObjectIdentifier(binding)
@@ -54,7 +72,8 @@ internal final class CTEExecution {
             guard let values = working[key] ?? rows[key] else { throw JedError("XX000", "WITH binding read before materialization") }
             for row in values { context.meter.charge(1); try context.meter.step(); try visit(row) }
         } else {
-            let execution = SelectExecution(plan: binding.plan, context: bindingContext(binding))
+            guard let plan = binding.plan else { throw JedError("XX000", "data-modifying CTE cannot be inlined") }
+            let execution = SelectExecution(plan: plan, context: bindingContext(binding))
             defer { execution.close() }
             while let row = try execution.next() { try visit(row) }
         }

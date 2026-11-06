@@ -7,6 +7,18 @@ internal final class StagedDomainCommit: Sendable {
     var snapshot: DomainSnapshot { plan.snapshot }
 }
 
+internal final class AdmittedMemoryDomainCommit {
+    let snapshot: DomainSnapshot
+    fileprivate let accounting: DomainStorageState
+    fileprivate let pages: AdmittedMemoryPages
+    fileprivate init(plan: PreparedDomainCommit, pages: AdmittedMemoryPages) {
+        snapshot = plan.snapshot; self.pages = pages
+        accounting = DomainStorageState(snapshot: plan.snapshot, catalogPages: plan.catalogPages,
+            gistPages: plan.gistPages, livePages: plan.livePages, liveAtCompaction: plan.liveAtCompaction,
+            freeGeneration: plan.freeGeneration, lastWritten: plan.written, repairCatalogPages: plan.catalogPages.count)
+    }
+}
+
 /// Owns one byte-device address space. The DatabaseCore writer gate surrounds
 /// precheck/prepare/persist/publication; readers obtain snapshots through its
 /// atomic pin registry, never by racing this object's storage bookkeeping.
@@ -16,6 +28,10 @@ internal final class StorageDomain: Sendable {
     let kind: StorageDomainKind
     let readOnly: Bool
     private let state: Mutex<DomainStorageState>
+    private let memoryStageHook = Mutex<(@Sendable (UInt32) throws -> Void)?>(nil)
+    func installMemoryStageHook(_ hook: (@Sendable (UInt32) throws -> Void)?) {
+        memoryStageHook.withLock { $0 = hook }
+    }
     private let durableDirectorySync: @Sendable () throws -> Void
 
     private init(pager: Pager, pool: NodePool, kind: StorageDomainKind, readOnly: Bool, initial: DomainStorageState,
@@ -47,11 +63,11 @@ internal final class StorageDomain: Sendable {
     }
 
     static func remote(pager: Pager, pool: NodePool, catalogID: UInt64, readOnly: Bool,
-                       environment: Environment) throws -> StorageDomain {
+                       environment: Environment, structuralOnly: Bool = false) throws -> StorageDomain {
         let initial = try loadSnapshot(pager: pager, pool: pool, selected: pager.selected, kind: .file,
             catalogID: catalogID, collatedKey: { try environment.unicode.key($0, collation: $1) },
-            collationVerdict: { try CatalogEnvironment.verdict($0, environment: environment) },
-            validateCatalog: { try CatalogEnvironment.validate($0, environment: environment) })
+            collationVerdict: { if structuralOnly { return false }; return try CatalogEnvironment.verdict($0, environment: environment) },
+            validateCatalog: { if !structuralOnly { try CatalogEnvironment.validate($0, environment: environment) } })
         return StorageDomain(pager: pager, pool: pool, kind: .file, readOnly: readOnly, initial: initial)
     }
 
@@ -220,10 +236,12 @@ internal final class StorageDomain: Sendable {
             reached.formUnion(previous.lastWritten)
             let rebuilt = (pager.codec.firstBodyPage..<free.highWater).filter { !reached.contains($0) }
             if rebuilt.count > free.persistedFree.count {
-                try pager.replaceMemoryFree(rebuilt)
+                // This is a reader-safe allocation proof for the prospective
+                // commit. Do not change published accounting during preflight:
+                // another domain may still refuse or fail its durable commit.
                 current.liveAtCompaction = UInt32(reached.count); current.freeGeneration = previous.snapshot.txid
-                state.withLock { $0.liveAtCompaction = current.liveAtCompaction; $0.freeGeneration = current.freeGeneration }
-                free = try pager.allocationSnapshot(reuseAllowed: true)
+                free = PagerAllocationState(highWater: free.highWater, persistedFree: rebuilt,
+                    reusableFree: rebuilt, pending: free.pending, protected: free.protected)
                 layout = try DomainCommitPlanner.layout(working, highWater: free.highWater, free: free.reusableFree)
                 live = try DomainCommitPlanner.live(after: layout, previous: current, pageCount: free.highWater)
             }
@@ -283,7 +301,8 @@ internal final class StorageDomain: Sendable {
                 reuseAllowed: policy.oldestPinnedVersion >= previous.freeGeneration, entropy: entropy)
         } else {
             prepared = try pager.prepareMemory(body: body.pages, root: body.root, pageCount: body.allocation.highWater,
-                freePages: persist, reuseAllowed: policy.oldestPinnedVersion >= previous.freeGeneration)
+                freePages: persist, reuseAllowed: policy.oldestPinnedVersion >= previous.freeGeneration,
+                reusablePages: free.reusableFree)
         }
         return PreparedDomainCommit(identity: working.identity, pages: prepared, snapshot: body.snapshot,
             catalogPages: body.catalogPages, gistPages: body.gistPages, livePages: live,
@@ -295,6 +314,17 @@ internal final class StorageDomain: Sendable {
     /// A staged snapshot must not become reader-visible before adoption.
     func stageMemory(_ plan: PreparedDomainCommit) throws -> StagedDomainCommit {
         try state.withLock { current in
+            guard kind == .memory, plan.identity === current.snapshot.identity,
+                  plan.pages.baseTxid == current.snapshot.txid else {
+                throw JedError("55006", "invalid or obsolete memory domain stage")
+            }
+        }
+        // The temporary host may spill its current bytes before staging. This
+        // happens after every group precheck and before the durable file phase.
+        // No storage mutex is held across the host copy or its cache resize.
+        let hook = memoryStageHook.withLock { $0 }
+        try hook?(plan.pages.manifest.meta.pageCount)
+        return try state.withLock { current in
             guard kind == .memory, plan.identity === current.snapshot.identity,
                   plan.pages.baseTxid == current.snapshot.txid else {
                 throw JedError("55006", "invalid or obsolete memory domain stage")
@@ -317,6 +347,28 @@ internal final class StorageDomain: Sendable {
             current = DomainStorageState(snapshot: plan.snapshot, catalogPages: plan.catalogPages,
                 gistPages: plan.gistPages, livePages: plan.livePages, liveAtCompaction: plan.liveAtCompaction,
                 freeGeneration: plan.freeGeneration, lastWritten: plan.written, repairCatalogPages: plan.catalogPages.count)
+            return current.snapshot
+        }
+    }
+
+    /// Called while the owning memory core's commit boundary is held. All
+    /// failure checks precede another domain's durable point.
+    func admitMemory(_ staged: StagedDomainCommit) throws -> AdmittedMemoryDomainCommit {
+        try state.withLock { current in
+            let plan = staged.plan
+            guard kind == .memory, plan.identity === current.snapshot.identity,
+                  plan.pages.baseTxid == current.snapshot.txid else {
+                throw JedError("55006", "invalid or obsolete staged memory domain")
+            }
+            return try AdmittedMemoryDomainCommit(plan: plan, pages: pager.admitMemory(staged.pages))
+        }
+    }
+    /// Nonthrowing after pre-admission. The caller retains the same memory
+    /// commit boundary and writer lease throughout durable commit/publication.
+    func finishMemory(_ admitted: AdmittedMemoryDomainCommit) -> DomainSnapshot {
+        state.withLock { current in
+            pager.finishMemory(admitted.pages)
+            current = admitted.accounting
             return current.snapshot
         }
     }

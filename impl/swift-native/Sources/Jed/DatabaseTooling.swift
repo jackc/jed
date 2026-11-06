@@ -9,9 +9,15 @@
     }
     public static func role(_ database: Database, attachment: String = "") throws -> String {
         try database.checkOpen()
-        guard attachment.isEmpty || attachment == "main" else { throw JedError("0A000", "attachment role tooling is not implemented") }
+        let selected: Database
+        if attachment.isEmpty || attachment == "main" { selected = database }
+        else {
+            guard let attached = try? database.domains.handle(SQLText(attachment)) else { return "none" }
+            selected = attached
+        }
         #if os(Linux)
-        return (database.host as? ServiceDatabaseHost)?.toolingRole ?? "none"
+        if selected.host is RemoteDatabaseHost { return "client" }
+        return (selected.host as? ServiceDatabaseHost)?.toolingRole ?? "none"
         #else
         return "none"
         #endif

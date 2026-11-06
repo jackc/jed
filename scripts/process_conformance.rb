@@ -14,7 +14,7 @@ CORPUS = ENV.fetch("JED_PROCESS_CORPUS", File.join(ROOT, "spec/conformance/proce
 CORES = (ENV["JED_PROCESS_CORES"]&.split(",") || %w[rust go node]).freeze
 # The serving end of the stream transport (`jed pages`) is the Rust core's: every core's stream client
 # runs the Rust actor's `pages` as its transport command.
-ENV["JED_PAGES_ACTOR"] = File.join(ROOT, "impl/rust/target/release/process_actor")
+ENV["JED_PAGES_ACTOR"] = ENV.fetch("JED_PROCESS_PAGES_ACTOR", File.join(ROOT, "impl/rust/target/release/process_actor"))
 START_TIMEOUT = 15
 COMMAND_TIMEOUT = 10
 

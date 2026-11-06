@@ -9,15 +9,28 @@ internal struct SequenceHistory {
 /// Keeping this small pending set separate avoids aliasing the inout snapshot;
 /// successful statement publication applies both sets of edits together.
 internal final class SequenceExecution {
-    private var definitions: [SQLText: CatalogSequence]
-    private var pending: [SQLText: CatalogSequence] = [:]
+    private struct Key: Hashable { let domain: SQLText; let name: SQLText }
+    private var definitions: [Key: CatalogSequence]
+    private var pending: [Key: CatalogSequence] = [:]
+    private let owners: [ObjectIdentifier: SQLText]
+    private let targetDomain: SQLText
+    private let writableDomains: Set<SQLText>?
     private(set) var history: SequenceHistory
     private let meter: CostMeter
     private let writable: Bool
 
-    init(snapshot: DomainSnapshot, history: SequenceHistory, meter: CostMeter, writable: Bool) {
-        definitions = Dictionary(uniqueKeysWithValues: snapshot.catalog.sequences.map { ($0.name, $0) })
-        self.history = history; self.meter = meter; self.writable = writable
+    convenience init(snapshot: DomainSnapshot, history: SequenceHistory, meter: CostMeter, writable: Bool) {
+        self.init(domains: QueryDomains(snapshots: [DomainNames.main: snapshot]), history: history, meter: meter, writable: writable)
+    }
+    init(domains: QueryDomains, targetDomain: SQLText = DomainNames.main, history: SequenceHistory,
+         meter: CostMeter, writable: Bool, writableDomains: Set<SQLText>? = nil) {
+        var values: [Key: CatalogSequence] = [:], owners: [ObjectIdentifier: SQLText] = [:]
+        for (domain, snapshot) in domains.snapshots {
+            owners[ObjectIdentifier(snapshot.identity)] = domain
+            for sequence in snapshot.catalog.sequences { values[Key(domain: domain, name: sequence.name)] = sequence }
+        }
+        definitions = values; self.owners = owners; self.targetDomain = targetDomain
+        self.history = history; self.meter = meter; self.writable = writable; self.writableDomains = writableDomains
     }
 
     func install(into context: inout ExpressionContext) {
@@ -32,18 +45,27 @@ internal final class SequenceExecution {
 
     /// Apply pending counters before editing definitions. Refreshing the action
     /// namespace removes stale objects, including a dropped and reused name.
-    func synchronizeDefinitions(from image: CatalogImage) {
-        definitions = Dictionary(uniqueKeysWithValues: image.sequences.map { ($0.name, $0) })
-        pending.removeAll(keepingCapacity: false)
+    func synchronizeDefinitions(from image: CatalogImage, domain: SQLText = DomainNames.main) {
+        definitions = definitions.filter { $0.key.domain != domain }
+        for sequence in image.sequences { definitions[Key(domain: domain, name: sequence.name)] = sequence }
+        pending = pending.filter { $0.key.domain != domain }
+    }
+    func apply(to domains: inout QueryDomains) throws {
+        for domain in Set(pending.keys.map(\.domain)).sorted() {
+            guard var snapshot = domains.snapshots[domain] else { throw JedError("42P01", "sequence database is not attached") }
+            try apply(to: &snapshot)
+            domains.snapshots[domain] = snapshot
+        }
     }
 
     func apply(to snapshot: inout DomainSnapshot) throws {
         guard !pending.isEmpty else { return }
-        var image = snapshot.catalog
+        let domain = owners[ObjectIdentifier(snapshot.identity)] ?? targetDomain
+        var image = snapshot.catalog, changed = false
         for index in image.sequences.indices {
-            if let sequence = pending[image.sequences[index].name] { image.sequences[index] = sequence }
+            if let sequence = pending[Key(domain: domain, name: image.sequences[index].name)] { image.sequences[index] = sequence; changed = true }
         }
-        try snapshot.updateCatalog(image, schemaChanged: false)
+        if changed { try snapshot.updateCatalog(image, schemaChanged: false) }
     }
 
     private func call(_ function: String, _ values: [SQLValue]) throws -> SQLValue {
@@ -60,7 +82,12 @@ internal final class SequenceExecution {
         }
         guard let first = values.first, case .text(let text) = first else { throw JedError("42804", "sequence name must be text") }
         let name = try SequenceName.parse(text)
-        guard var sequence = pending[name] ?? definitions[name] else { throw JedError("42P01", "relation does not exist: \(name)") }
+        let domains = [DomainNames.temporary, DomainNames.main]
+        guard let key = domains.map({ Key(domain: $0, name: name) }).first(where: { pending[$0] != nil || definitions[$0] != nil }),
+              var sequence = pending[key] ?? definitions[key] else { throw JedError("42P01", "relation does not exist: \(name)") }
+        if function == "nextval" || function == "setval", let writableDomains, !writableDomains.contains(key.domain) {
+            throw JedError("25006", "cannot advance a sequence in a read-only database")
+        }
         if function == "currval" {
             guard let value = history.values[name] else { throw JedError("55000", "currval of sequence \(name) is not yet defined in this session") }
             return .integer(value)
@@ -91,7 +118,7 @@ internal final class SequenceExecution {
             sequence.last = value; sequence.called = called
             if called { history.values[name] = value }
         }
-        pending[name] = sequence
+        pending[key] = sequence
         return .integer(sequence.last)
     }
 

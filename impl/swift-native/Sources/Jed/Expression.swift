@@ -54,6 +54,7 @@ internal struct ExpressionContext {
     var outerRows: [(Int) throws -> SQLValue] = []
     var subqueries = SubqueryExecution()
     var ctes: CTEExecution?
+    var writeScope: StatementWriteScope?
 
     init(meter: CostMeter, timezone: SQLTimeZone = .utc, statementMicros: Int64? = nil,
          parameters: [SQLValue] = [], column: @escaping (Int) throws -> SQLValue = { _ in throw JedError("XX000", "missing expression row") }) {

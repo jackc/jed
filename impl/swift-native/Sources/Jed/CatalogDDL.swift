@@ -16,23 +16,24 @@ internal enum CatalogDDL {
         case .drop(let drop) where ["type", "table", "index", "sequence", "view"].contains(drop.object): command = "DROP " + drop.object.uppercased()
         default: return nil
         }
-        guard settings.options.allowDDL else { throw JedError("42501", "DDL is not permitted in this session") }
+        try CatalogDomain.requireDDL(settings, statement: statement)
         var work = snapshot
+        if settings.targetDomain == DomainNames.temporary, let main = settings.domains?.snapshots[DomainNames.main] { try work.borrow(main) }
         switch statement {
-        case .createType(let definition): try createType(definition, snapshot: &work)
+        case .createType(let definition): try createType(definition, snapshot: &work, settings: settings)
         case .createTable(let definition):
             try createTable(definition, source: source, snapshot: &work, settings: settings, context: context)
         case .createIndex(let definition):
             try createIndex(definition, source: source, snapshot: &work, settings: settings, context: context)
-        case .createSequence(let definition): try createSequence(definition, snapshot: &work)
+        case .createSequence(let definition): try createSequence(definition, snapshot: &work, settings: settings)
         case .createView(let definition): try createView(definition, source: source, snapshot: &work, settings: settings, context: context)
         case .alterView(let definition): try alterView(definition, source: source, snapshot: &work, settings: settings, context: context)
-        case .alterSequence(let definition): try alterSequence(definition, snapshot: &work)
+        case .alterSequence(let definition): try alterSequence(definition, snapshot: &work, settings: settings)
         case .alterTable(let definition): try alterTable(definition, source: source, snapshot: &work, settings: settings, context: context)
-        case .drop(let definition) where definition.object == "index": try dropIndexes(definition, snapshot: &work)
-        case .drop(let definition) where definition.object == "sequence": try dropSequences(definition, snapshot: &work)
-        case .drop(let definition) where definition.object == "view": try dropViews(definition, snapshot: &work)
-        case .drop(let definition): try drop(definition, snapshot: &work)
+        case .drop(let definition) where definition.object == "index": try dropIndexes(definition, snapshot: &work, settings: settings)
+        case .drop(let definition) where definition.object == "sequence": try dropSequences(definition, snapshot: &work, settings: settings)
+        case .drop(let definition) where definition.object == "view": try dropViews(definition, snapshot: &work, settings: settings)
+        case .drop(let definition): try drop(definition, snapshot: &work, settings: settings)
         default: break
         }
         snapshot = work
@@ -55,8 +56,9 @@ internal enum CatalogDDL {
         default: return 0
         }
     }
-    private static func createType(_ definition: SQLCreateType, snapshot: inout DomainSnapshot) throws {
-        let name = try nameInMain(definition.name)
+    private static func createType(_ definition: SQLCreateType, snapshot: inout DomainSnapshot, settings: SessionSettings) throws {
+        guard settings.targetDomain == DomainNames.main else { throw JedError("0A000", "composite types must be created in the main database") }
+        let name = try CatalogDomain.name(definition.name, settings: settings)
         try CatalogSQL.reserved(name, kind: "type")
         guard snapshot.types[name] == nil, TypeRules.scalar(named: name) == nil,
               !GeneratedSpec.ranges.contains(where: { $0.id == name.description || $0.aliases.contains(name.description) }) else {
@@ -86,14 +88,14 @@ internal enum CatalogDDL {
     }
     private static func createTable(_ definition: SQLCreateTable, source: SQLText, snapshot: inout DomainSnapshot,
                                     settings: SessionSettings, context: ExpressionContext) throws {
-        let name = try nameInMain(definition.name)
+        let name = try CatalogDomain.name(definition.name, settings: settings)
         try CatalogSQL.reserved(name, kind: "table")
-        let relations = CatalogSQL.relationNames(snapshot.catalog)
+        let relations = CatalogDomain.relations(snapshot.catalog, settings: settings)
         if relations.contains(name) {
             if definition.ifNotExists { return }
             throw JedError("42P07", "relation \(name) already exists")
         }
-        guard !definition.temporary, definition.onCommit == nil else { throw JedError("0A000", "temporary catalog DDL is not yet connected") }
+        guard definition.onCommit == nil || settings.targetDomain == DomainNames.temporary else { throw JedError("42P16", "ON COMMIT can only be used on temporary tables") }
         guard definition.query == nil else { throw JedError("0A000", "CREATE TABLE AS execution is not yet connected") }
         let root = PageSealer.nullReference(snapshot.pool.codec)
         var table = CatalogTable(name: name, columns: [], root: root)
@@ -112,7 +114,7 @@ internal enum CatalogDDL {
             guard !hasDefault || serial == nil && identities.isEmpty else { throw JedError("42601", "multiple default values or both default and identity specified for column \(column.name)") }
             guard serial == nil || identities.isEmpty else { throw JedError("42601", "both default and identity specified for column \(column.name)") }
             if ExpressionCollation.collatable(descriptor.type) {
-                descriptor.collation = snapshot.catalog.collations.first(where: \.isDefault)?.name
+                descriptor.collation = (settings.domains?.snapshots[DomainNames.main]?.catalog ?? snapshot.catalog).collations.first(where: \.isDefault)?.name
             }
             var output = CatalogColumn(name: column.name, type: try CatalogSQL.typeUse(descriptor))
             for constraint in column.constraints {
@@ -176,7 +178,7 @@ internal enum CatalogDDL {
             let hosts = try StoredExpressionDependencies.hosts([resolved], environment: settings.environment)
             checks.append((item.syntax, try CatalogSQL.expression(expression, source: source), references, hosts))
         }
-        var schemaConstraints = snapshot.catalog.tables.reduce(into: Set<SQLText>()) { $0.formUnion(CatalogSQL.constraints($1)) }
+        var schemaConstraints = CatalogDomain.constraints(snapshot.catalog, settings: settings)
         var localConstraints: Set<SQLText> = [], usedRelations = sequenceNames
         for (syntax, expression, referenced, hosts) in checks {
             let checkName = syntax.name ?? CatalogSQL.objectName(name,
@@ -203,12 +205,9 @@ internal enum CatalogDDL {
             switch item.syntax.kind {
             case .foreignKey(let columns, let reference):
                 let local = try keyColumns(columns, own: item.column, table: table, kind: "foreign key", keyable: false, types: snapshot.types)
-                let parentName = try nameInMain(reference.table)
-                let parent: CatalogTable
-                if parentName == table.name { parent = table }
-                else if let found = snapshot.catalog.tables.first(where: { $0.name == parentName }) { parent = found }
-                else if relations.contains(parentName) { throw JedError("42809", "referenced relation \(parentName) is not a table") }
-                else { throw JedError("42P01", "table does not exist: \(parentName)") }
+                let parent = try CatalogDomain.foreignParent(reference.table, child: table, image: snapshot.catalog,
+                    snapshot: snapshot, settings: settings)
+                let parentName = parent.name
                 let remote: [Int]
                 if reference.columns.isEmpty {
                     guard !parent.primaryKey.isEmpty else { throw JedError("42704", "there is no primary key for referenced table \(parentName)") }
@@ -247,6 +246,7 @@ internal enum CatalogDDL {
             table.indexes.append(definition.index(chosen, root: root))
             table.exclusions.append(CatalogExclusion(name: chosen, index: chosen, elements: definition.elements))
         }
+        try CatalogDomain.validateTable(table, sequences: sequences, settings: settings, types: snapshot.types)
         table.checks.sort { $0.name < $1.name }; table.indexes.sort { $0.name < $1.name }; table.foreignKeys.sort { $0.name < $1.name }
         table.exclusions.sort { $0.name < $1.name }
         var image = snapshot.catalog; image.tables.append(table); image.sequences += sequences
@@ -271,9 +271,12 @@ internal enum CatalogDDL {
 
     static func resolver(snapshot: DomainSnapshot, settings: SessionSettings, context: ExpressionContext,
                          table: CatalogTable? = nil) throws -> ExpressionResolver {
-        let scope = try table.map { table in try table.columns.enumerated().map { index, column in
-            ExpressionColumn(name: column.name, qualifier: table.name, type: try column.type.resolve(snapshot.types), index: index)
-        } } ?? []
+        let scope: [ExpressionColumn] = try table.map { table in
+            let types = try snapshot.tableTypes(table)
+            return table.columns.enumerated().map { index, column in
+                ExpressionColumn(name: column.name, qualifier: table.name, type: types[index], index: index)
+            }
+        } ?? []
         var scalar = context.scalar; scalar.meter = nil
         let result = ExpressionResolver(columns: scope, composites: snapshot.types, scalar: scalar)
         result.hostFunctions = settings.environment.signatures; result.unicode = settings.environment.unicode
@@ -329,12 +332,12 @@ internal enum CatalogDDL {
         guard local.insert(name).inserted else { throw JedError("42710", "constraint \(name) for relation \(table) already exists") }
         schema.insert(name)
     }
-    private static func drop(_ definition: SQLDrop, snapshot: inout DomainSnapshot) throws {
+    private static func drop(_ definition: SQLDrop, snapshot: inout DomainSnapshot, settings: SessionSettings) throws {
         var targets: Set<SQLText> = []
         let relations = CatalogSQL.relationNames(snapshot.catalog)
         for input in definition.names {
             if definition.object == "table" { try SystemRelationPlan.rejectTarget(input.name, dropping: true) }
-            let name = try nameInMain(input)
+            let name = try CatalogDomain.name(input, settings: settings)
             let exists = definition.object == "type" ? snapshot.types[name] != nil : snapshot.catalog.tables.contains { $0.name == name }
             if exists { targets.insert(name) }
             else if definition.object == "table" && relations.contains(name) { throw JedError("42809", "\(name) is not a table") }
@@ -348,7 +351,10 @@ internal enum CatalogDDL {
         if definition.object == "type" {
             let used = image.composites.contains { !targets.contains($0.name) && $0.fields.contains { references($0.type.type) } }
                 || image.tables.contains { $0.columns.contains { references($0.type.type) } }
-            if used { throw JedError(definition.cascade ? "0A000" : "2BP01", "cannot drop type because other objects depend on it") }
+            let temporaryUse = settings.domains?.snapshots[DomainNames.temporary]?.catalog.tables.contains {
+                $0.columns.contains { references($0.type.type) }
+            } ?? false
+            if used || temporaryUse { throw JedError(definition.cascade ? "0A000" : "2BP01", "cannot drop type because other objects depend on it") }
         } else {
             let dependent = image.tables.contains { !targets.contains($0.name) && $0.foreignKeys.contains { targets.contains($0.referencedTable) } }
             if dependent && !definition.cascade { throw JedError("2BP01", "cannot drop table because other objects depend on it") }

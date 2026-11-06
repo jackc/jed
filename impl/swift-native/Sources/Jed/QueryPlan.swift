@@ -22,6 +22,8 @@ internal struct SelectPlan {
     var withQuery: WithQueryPlan? = nil
     var materializeSource = false
     var distinctOn: DistinctOnPlan? = nil
+    var sourceDomain: SQLText? = nil
+    var sourceSnapshot: DomainSnapshot? = nil
     var keyEvaluationOrder: [Int] { distinctOn?.evaluationOrder ?? Array(order.indices) }
 
     var expressions: [ResolvedExpression] {
@@ -63,23 +65,32 @@ internal struct SelectPlan {
         resolver.hostFunctions = settings.environment.signatures; resolver.unicode = settings.environment.unicode
         resolver.checkFunction = { try settings.privileges.require(.execute, on: $0, function: true) }
         var source: TableStore?, scope: [ExpressionColumn] = [], primaryKey: [Int] = []
+        var sourceDomain: SQLText?, sourceSnapshot: DomainSnapshot?, functionalKey: [Int] = []
+        let domains = QueryDomains.statement(snapshot: snapshot, settings: settings)
+        let single: (name: SQLText, snapshot: DomainSnapshot)?
+        if select.from.count == 1, let from = select.from.first, from.joins.isEmpty,
+           case .table(let name) = from.source, !SystemRelationPlan.contains(name.name),
+           (name.database != nil || resolver.cteBindings[name.name] == nil) {
+            single = try domains.relation(name)
+        } else { single = nil }
         var relation: RelationPlan?
         if select.from.count == 1, let from = select.from.first, from.joins.isEmpty, case .table(let name) = from.source,
-           !SystemRelationPlan.contains(name.name),
-           (name.database != nil || resolver.cteBindings[name.name] == nil),
-           snapshot.catalog.tables.contains(where: { $0.name == name.name }) {
-            guard name.database == nil || name.database?.description == "main",
-                  let table = snapshot.catalog.tables.first(where: { $0.name == name.name }),
-                  let store = snapshot.tables[name.name] else { throw JedError("42P01", "relation does not exist: \(name.name)") }
-            try settings.privileges.require(.select, on: table.name)
+           let selected = single,
+           let table = selected.snapshot.catalog.tables.first(where: { $0.name == name.name }) {
+            let owner = selected.snapshot
+            guard let store = owner.tables[name.name] else { throw JedError("42P01", "relation does not exist: \(name.name)") }
+            if selected.name != DomainNames.temporary { try settings.privileges.require(.select, on: table.name) }
             guard from.columnAliases.count <= table.columns.count else { throw JedError("42601", "too many column aliases") }
             source = store
-            primaryKey = table.primaryKey
+            sourceDomain = selected.name; sourceSnapshot = owner
+            functionalKey = table.primaryKey
+            primaryKey = DomainNames.isAttachment(selected.name) ? [] : table.primaryKey
             if primaryKey.contains(where: { !CatalogEnvironment.collationMatches(table.columns[$0].type.collation,
-                image: snapshot.catalog, environment: settings.environment) }) { primaryKey = [] }
-            scope = try table.columns.enumerated().map { index, column in
+                image: owner.catalog, environment: settings.environment) }) { primaryKey = [] }
+            let types = try owner.tableTypes(table)
+            scope = table.columns.enumerated().map { index, column in
                 ExpressionColumn(name: index < from.columnAliases.count ? from.columnAliases[index] : column.name,
-                                 qualifier: from.alias ?? table.name, type: try column.type.resolve(snapshot.types), index: index)
+                                 qualifier: from.alias ?? table.name, type: types[index], index: index)
             }
         } else if !select.from.isEmpty {
             relation = try RelationPlan.resolve(select.from, snapshot: snapshot, settings: settings, resolver: resolver)
@@ -103,7 +114,7 @@ internal struct SelectPlan {
         if let relation { predicate = RelationPushdown.whereFilter(predicate, into: relation) }
         let windows = try WindowQueryBuilder(select: select, resolver: resolver)
         let orderSyntax = query.orderBy + select.distinctOn.map { SQLOrderTerm(expression: $0, span: $0.span) }
-        let aggregation = try AggregateQueryPlan.resolve(select, order: orderSyntax, resolver: resolver, scope: scope, primaryKey: primaryKey,
+        let aggregation = try AggregateQueryPlan.resolve(select, order: orderSyntax, resolver: resolver, scope: scope, primaryKey: functionalKey,
             functionalDependencies: relation?.functionalDependencies ?? [], windows: windows)
         var projections: [ResolvedExpression] = [], columns: [ResultColumn] = []
         if let aggregation { projections = aggregation.projections; columns = aggregation.columns }
@@ -190,7 +201,8 @@ internal struct SelectPlan {
                           limit: try bound(query.limit, code: "2201W"), offset: try bound(query.offset, code: "2201X") ?? 0,
                           order: order, orderedByScan: orderedByScan, descending: orderedByScan && reverse,
                           scan: BaseScanPlan(predicate: predicate, keys: primaryKey, types: source?.tree.types ?? []), aggregation: aggregation,
-                          relation: relation, distinct: select.distinct && distinctOn == nil, window: window, distinctOn: distinctOn)
+                          relation: relation, distinct: select.distinct && distinctOn == nil, window: window, distinctOn: distinctOn,
+                          sourceDomain: sourceDomain, sourceSnapshot: sourceSnapshot)
     }
 
     internal static func outputName(_ expression: SQLExpression) -> SQLText {

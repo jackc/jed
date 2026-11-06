@@ -29,6 +29,8 @@ internal enum ViewDefinition {
         var scalar = context.scalar; scalar.meter = nil
         var planningSettings = settings
         planningSettings.privileges = settings.privileges.withTableAccess()
+        let domains = QueryDomains.statement(snapshot: snapshot, settings: settings)
+        planningSettings.domains = domains
         // Structural exclusions precede resolution; a known type for $1 must
         // never make a persisted view capture a statement binding.
         try ViewSyntax.walk(query, expression: { expression in
@@ -101,7 +103,7 @@ internal enum ViewDefinition {
                 var columns: [Binding]
                 switch from.source {
                 case .table(let name):
-                    guard name.database == nil || name.database?.description == "main" else {
+                    guard name.database == nil || name.database == DomainNames.main || name.database == DomainNames.temporary else {
                         throw JedError("0A000", "views cannot reference attached databases")
                     }
                     if name.database == nil, let binding = lexical[name.name] {
@@ -114,18 +116,26 @@ internal enum ViewDefinition {
                         // System relations have fixed engine-owned columns and
                         // no persisted catalog object to pin as a dependency.
                         columns = system.columns.map { Binding(label: name.name, name: $0.name, type: $0.type) }
-                    } else if let table = snapshot.catalog.tables.first(where: { $0.name == name.name }) {
-                        add(0, name.name)
-                        columns = try table.columns.map { Binding(label: name.name, name: $0.name, type: try $0.type.resolve(snapshot.types), table: name.name, column: $0.name) }
-                    } else if let view = snapshot.catalog.views.first(where: { $0.name == name.name }) {
-                        add(1, name.name)
-                        let body = try SelectPlan.resolve(ViewDefinition.query(view), snapshot: snapshot, settings: planningSettings, scalar: scalar)
-                        columns = view.columns.enumerated().map { index, column in
-                            Binding(label: name.name, name: column.name, type: body.columns[index].type ?? TypeDescriptor(.scalar(.text)),
-                                collation: body.projections[index].collation?.asColumn, unresolved: body.columns[index].type == nil,
-                                view: name.name, ordinal: index)
-                        }
-                    } else { throw JedError("42P01", "relation does not exist: \(name.name)") }
+                    } else {
+                        let owner = try domains.relation(name)
+                        if let table = owner.snapshot.catalog.tables.first(where: { $0.name == name.name }) {
+                            add(0, name.name)
+                            let types = try owner.snapshot.tableTypes(table)
+                            columns = table.columns.enumerated().map { index, column in
+                                Binding(label: name.name, name: column.name, type: types[index], table: name.name, column: column.name)
+                            }
+                        } else if let view = owner.snapshot.catalog.views.first(where: { $0.name == name.name }) {
+                            add(1, name.name)
+                            var inner = planningSettings
+                            inner.domains = try domains.viewScope(owner: owner.name); inner.targetDomain = owner.name
+                            let body = try SelectPlan.resolve(ViewDefinition.query(view), snapshot: owner.snapshot, settings: inner, scalar: scalar)
+                            columns = view.columns.enumerated().map { index, column in
+                                Binding(label: name.name, name: column.name, type: body.columns[index].type ?? TypeDescriptor(.scalar(.text)),
+                                    collation: body.projections[index].collation?.asColumn, unresolved: body.columns[index].type == nil,
+                                    view: name.name, ordinal: index)
+                            }
+                        } else { throw JedError("42P01", "relation does not exist: \(name.name)") }
+                    }
                 case .query(let child):
                     let nested = ExpressionResolver(composites: snapshot.types, scalar: scalar)
                     nested.cteBindings = lexical; nested.outerScopes = blockResolver.outerScopes
@@ -227,12 +237,13 @@ internal enum ViewDefinition {
             for binding in frame.bindings.prefix(preceding) { lexical[binding.name] = binding }
             if let ordinal, clause.recursive, frame.bindings[ordinal].recursive != nil {
                 let binding = frame.bindings[ordinal]
+                guard let anchor = binding.plan else { throw JedError("XX000", "recursive view binding has no anchor plan") }
                 // The traced recursive body's self-reference sees named SEARCH
                 // and CYCLE outputs, but its wildcard keeps the anchor arity.
-                let recursive = CTEBinding(name: binding.name, columns: binding.columns, plan: binding.plan,
+                let recursive = CTEBinding(name: binding.name, columns: binding.columns, plan: anchor,
                     settings: binding.settings, materialized: binding.materialized)
                 recursive.collations = binding.collations
-                recursive.hiddenColumns = binding.plan.columns.count; recursive.resolvingSelf = true
+                recursive.hiddenColumns = anchor.columns.count; recursive.resolvingSelf = true
                 lexical[binding.name] = recursive
             }
         }, expression: { expression in
@@ -240,7 +251,7 @@ internal enum ViewDefinition {
             case .call(let call) where ["nextval", "currval", "setval"].contains(call.name.description):
                 if let argument = call.arguments.first, case .string(let text) = argument.value.kind {
                     let name = try SequenceName.parse(text)
-                    guard snapshot.catalog.sequences.contains(where: { $0.name == name }) else {
+                    guard domains.snapshots[DomainNames.temporary]?.catalog.sequences.contains(where: { $0.name == name }) == true || domains.snapshots[DomainNames.main]?.catalog.sequences.contains(where: { $0.name == name }) == true else {
                         throw JedError("42P01", "relation does not exist: \(name)")
                     }
                     add(2, name)

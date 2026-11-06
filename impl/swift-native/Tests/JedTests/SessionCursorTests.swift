@@ -2,6 +2,16 @@ import XCTest
 @testable import Jed
 
 final class SessionCursorTests: XCTestCase {
+    func testResidentCursorFailsWhenItsStorageRoleIsRevoked() throws {
+        let database = try Database(), session = try database.session()
+        let rows = try session.query("VALUES (1), (2)")
+        XCTAssertNotNil(try rows.next())
+        try database.core.quiesceRole(flush: false)
+        XCTAssertThrowsError(try rows.next()) { XCTAssertEqual(($0 as? JedError)?.code, "08006") }
+        XCTAssertTrue(rows.isClosed)
+        XCTAssertEqual(database.core.livePinCount, 0)
+        session.close()
+    }
     func testTransactionEndClosesUnreadRowsAndReleasesPins() throws {
         for writable in [false, true] {
             for commit in [false, true] {

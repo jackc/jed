@@ -35,20 +35,23 @@ internal enum CatalogEnvironment {
         for column in table.columns { try checkCollation(column.type.collation, image: image, environment: environment) }
     }
 
-    static func checkWritable(_ table: CatalogTable, image: CatalogImage, environment: Environment) throws {
+    static func checkWritable(_ table: CatalogTable, image: CatalogImage, environment: Environment,
+                              borrowedTypes: [SQLText: CompositeType] = [:], rowTypes: [TypeDescriptor]? = nil) throws {
         try checkTableCollations(table, image: image, environment: environment)
         for index in table.indexes.sorted(by: { $0.name < $1.name }) {
-            try checkIndex(index, table: table, image: image, environment: environment)
+            try checkIndex(index, table: table, image: image, environment: environment, borrowedTypes: borrowedTypes, rowTypes: rowTypes)
         }
     }
 
-    static func checkIndex(_ index: CatalogIndex, table: CatalogTable, image: CatalogImage, environment: Environment) throws {
+    static func checkIndex(_ index: CatalogIndex, table: CatalogTable, image: CatalogImage, environment: Environment,
+                           borrowedTypes: [SQLText: CompositeType] = [:], rowTypes: [TypeDescriptor]? = nil) throws {
         try IndexDependencies.validateZones(index, environment: environment)
         // Resolve only definition metadata; this never evaluates a stored row or
         // calls a host kernel. Fresh nominal IDs cannot escape this check.
-        let types = try image.resolvedTypes(catalogID: 0)
+        let types = try image.resolvedTypes(catalogID: 0, borrowedTypes: borrowedTypes)
+        let stored = try rowTypes ?? table.columns.map { try $0.type.resolve(types) }
         let columns = try table.columns.enumerated().map {
-            ExpressionColumn(name: $0.element.name, qualifier: table.name, type: try $0.element.type.resolve(types), index: $0.offset)
+            ExpressionColumn(name: $0.element.name, qualifier: table.name, type: stored[$0.offset], index: $0.offset)
         }
         let resolver = ExpressionResolver(columns: columns, composites: types)
         resolver.hostFunctions = environment.signatures; resolver.unicode = environment.unicode; resolver.storageCollation = true

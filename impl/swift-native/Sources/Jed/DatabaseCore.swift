@@ -84,9 +84,10 @@ internal final class DatabaseCore: Sendable {
     private let coordinator = WeakRoleCoordinator()
     private var remote: (any DatabaseRemote)? { registry.withLock { $0.remote } }
 
-    init(storage: StorageDomain, environment: Environment? = nil, remote: (any DatabaseRemote)? = nil) {
+    init(storage: StorageDomain, environment: Environment? = nil, remote: (any DatabaseRemote)? = nil, sqlReady: Bool = true) {
         self.environment = environment
-        registry = Mutex(Registry(storage: storage, snapshot: storage.committed, meta: storage.pager.selected, remote: remote))
+        var initial = Registry(storage: storage, snapshot: storage.committed, meta: storage.pager.selected, remote: remote)
+        initial.sqlReady = sqlReady; registry = Mutex(initial)
     }
     var version: UInt64 { registry.withLock { $0.meta.meta.txid } }
     var oldestLiveVersion: UInt64 { registry.withLock { $0.pins.keys.min() ?? $0.meta.meta.txid } }
@@ -294,6 +295,13 @@ internal final class DatabaseCore: Sendable {
         try check(lease); return try body()
     }
 
+    fileprivate func memoryCommit<T>(_ lease: WriterLease, _ body: (MemoryCommitGuard) throws -> T) throws -> T {
+        commitBoundary.lock(); defer { commitBoundary.unlock() }
+        try check(lease)
+        guard storage.kind == .memory else { throw JedError("55000", "memory commit guard requires an in-memory domain") }
+        return try body(MemoryCommitGuard(lease: lease, storage: storage))
+    }
+
     /// Start serving after recovery and before accepting clients. The caller
     /// supplies the other slot only after ordinary recovery has validated it.
     func startService(incarnation: [UInt8], predecessor: [UInt8]? = nil) throws {
@@ -424,6 +432,24 @@ internal final class DatabaseCore: Sendable {
 
 }
 
+/// Borrowed only inside WriterLease.withMemoryCommitGuard. Group commit nests
+/// these guards in deterministic domain order and performs all throwing work
+/// before the one file persist. No callback escapes the guarded scope.
+internal final class MemoryCommitGuard {
+    private let lease: WriterLease
+    private let storage: StorageDomain
+    fileprivate init(lease: WriterLease, storage: StorageDomain) { self.lease = lease; self.storage = storage }
+    func stage(_ plan: PreparedDomainCommit) throws -> AdmittedMemoryDomainCommit {
+        try lease.core.check(lease)
+        return try storage.admitMemory(storage.stageMemory(plan))
+    }
+    func publish(_ admitted: AdmittedMemoryDomainCommit) -> DomainSnapshot {
+        let snapshot = storage.finishMemory(admitted)
+        lease.core.publish(snapshot, epoch: lease.epoch)
+        return snapshot
+    }
+}
+
 /// The owner serializes calls on this lease. Prepared commits are immutable and
 /// may be preflighted across every changed domain before any domain persists.
 internal final class WriterLease {
@@ -432,9 +458,14 @@ internal final class WriterLease {
     let snapshot: DomainSnapshot
     private let remote: (any DatabaseRemote)?
     private var closed = false
-    private let epoch: StorageRevision
+    fileprivate let epoch: StorageRevision
     fileprivate init(core: DatabaseCore, token: StorageRevision, snapshot: DomainSnapshot, epoch: StorageRevision, remote: (any DatabaseRemote)? = nil) {
         self.core = core; self.token = token; self.snapshot = snapshot; self.remote = remote; self.epoch = epoch
+    }
+    var domainKind: StorageDomainKind { core.storage.kind }
+    var domainIdentity: ObjectIdentifier { ObjectIdentifier(core) }
+    func withMemoryCommitGuard<T>(_ body: (MemoryCommitGuard) throws -> T) throws -> T {
+        try core.memoryCommit(self, body)
     }
     func checkRole() throws { try core.checkEpoch(epoch); try remote?.checkRole() }
     func pin(_ working: DomainSnapshot) throws -> SnapshotPin {

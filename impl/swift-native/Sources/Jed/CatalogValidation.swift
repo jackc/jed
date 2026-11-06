@@ -134,13 +134,14 @@ internal extension CatalogImage {
         return image
     }
 
-    func validateReferences(catalogID: UInt64) throws {
+    func validateReferences(catalogID: UInt64, borrowedTypes: [SQLText: CompositeType] = [:],
+                            borrowedReferences: CatalogBorrowedReferences = .init()) throws {
         func unique(_ names: [SQLText]) throws {
             guard names.allSatisfy({ !$0.utf8.isEmpty }), Set(names).count == names.count else {
                 throw JedError.corruption("empty or duplicate catalog name")
             }
         }
-        let types = try resolvedTypes(catalogID: catalogID)
+        let types = try resolvedTypes(catalogID: catalogID, borrowedTypes: borrowedTypes)
         try unique(tables.map(\.name) + views.map(\.name) + sequences.map(\.name))
         try unique(collations.map(\.name))
         guard collations.filter(\.isDefault).count <= 1 else { throw JedError.corruption("multiple default collations") }
@@ -204,11 +205,12 @@ internal extension CatalogImage {
                 try unique(dep.columns)
                 switch dep.kind {
                 case 0:
-                    guard let table = tableMap[dep.name], dep.columns.allSatisfy({ name in table.columns.contains { $0.name == name } }) else {
+                    let columns = tableMap[dep.name].map { Set($0.columns.map(\.name)) } ?? borrowedReferences.tables[dep.name]
+                    guard let columns, dep.columns.allSatisfy(columns.contains) else {
                         throw JedError.corruption("view references missing table or column")
                     }
-                case 1: guard viewMap[dep.name] != nil else { throw JedError.corruption("view references missing view") }
-                case 2: guard sequenceNames.contains(dep.name) else { throw JedError.corruption("view references missing sequence") }
+                case 1: guard viewMap[dep.name] != nil || borrowedReferences.views.contains(dep.name) else { throw JedError.corruption("view references missing view") }
+                case 2: guard sequenceNames.contains(dep.name) || borrowedReferences.sequences.contains(dep.name) else { throw JedError.corruption("view references missing sequence") }
                 case 3: guard types[dep.name] != nil else { throw JedError.corruption("view references missing composite type") }
                 default: throw JedError.corruption("invalid view dependency kind")
                 }
@@ -218,7 +220,7 @@ internal extension CatalogImage {
         func visit(_ name: SQLText) throws {
             if complete.contains(name) { return }
             guard active.insert(name).inserted, active.count <= 256 else { throw JedError.corruption("cyclic or excessively nested view graph") }
-            for dep in viewMap[name]!.dependencies where dep.kind == 1 { try visit(dep.name) }
+            for dep in viewMap[name]!.dependencies where dep.kind == 1 && viewMap[dep.name] != nil { try visit(dep.name) }
             active.remove(name); complete.insert(name)
         }
         for name in viewMap.keys.sorted() { try visit(name) }

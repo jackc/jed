@@ -385,7 +385,7 @@ internal struct BPlusTree: Sendable {
         var result = fromScratch ? BPlusTree(codec: codec, types: types) : self
         result.count = count
         if let root {
-            result.root = try serialize(root, allocator: &allocation, fromScratch: fromScratch, entropy: entropy,
+            result.root = try serialize(root, isRoot: true, allocator: &allocation, fromScratch: fromScratch, entropy: entropy,
                 pages: &pages, kept: &kept, chains: &chains)
         }
         allocator = allocation
@@ -393,7 +393,7 @@ internal struct BPlusTree: Sendable {
                          pages: pages, keptRoots: kept, keptOverflowHeads: chains)
     }
 
-    private func serialize(_ child: TreeChild, allocator: inout PageAllocator, fromScratch: Bool,
+    private func serialize(_ child: TreeChild, isRoot: Bool = false, allocator: inout PageAllocator, fromScratch: Bool,
                            entropy: KeyEntropy?, pages: inout [StoredPage], kept: inout Set<UInt32>,
                            chains: inout [PageReference]) throws -> TreeChild {
         if !fromScratch, let reference = child.reference { kept.insert(reference.index); return child }
@@ -426,7 +426,12 @@ internal struct BPlusTree: Sendable {
                 }
                 if !pending.isEmpty { record = PackedRecord(key: record.key, cells: record.cells, overflows: pending) }
                 let sealed = try record.sealOverflow(allocator: &allocator, codec: codec, entropy: entropy)
-                records.append(sealed.record); overflowPages.append(contentsOf: sealed.pages)
+                // The baseline root leaf stays resident. Preserve only payloads
+                // already resident before this commit; inherited disk pointers
+                // remain references. Non-root leaves shed these after sealing.
+                let retained = isRoot && !fromScratch ? record.overflows : [:]
+                records.append(PackedRecord(key: sealed.record.key, cells: sealed.record.cells, overflows: retained))
+                overflowPages.append(contentsOf: sealed.pages)
             }
             payload = try PackedLeaf.encodePayload(records, types: types, capacity: codec.capacity)
         } else {
@@ -438,7 +443,7 @@ internal struct BPlusTree: Sendable {
         if fromScratch { pages.append(sealed.page); pages.append(contentsOf: overflowPages) }
         else { pages.append(contentsOf: overflowPages); pages.append(sealed.page) }
         if node.isLeaf {
-            if pool != nil, !fromScratch { return .onDisk(sealed.reference, lower: records.first?.key, upper: nil) }
+            if pool != nil, !fromScratch, !isRoot { return .onDisk(sealed.reference, lower: records.first?.key, upper: nil) }
             return .resident(try makeLeaf(records, reference: sealed.reference))
         }
         return .resident(TreeNode(keys: node.keys, children: children, codec: codec, reference: sealed.reference))

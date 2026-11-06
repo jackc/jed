@@ -6,7 +6,7 @@ import Synchronization
 /// One pathname claim spans every owner/client incarnation of a public handle.
 /// The condition guards role changes; it is entirely resident on the ordinary
 /// owner's foreground path. Only election workers touch the lock bundle.
-internal final class ServiceDatabaseHost: CoordinatedDatabaseClose, DatabaseRoleCoordinator, @unchecked Sendable {
+internal final class ServiceDatabaseHost: CoordinatedDatabaseClose, DatabaseRoleCoordinator, DatabaseScratchPolicy, @unchecked Sendable {
     private enum Role {
         case owner(FileDatabaseHost, PageServiceOwner?, String?)
         case client(PageServiceClient)
@@ -14,7 +14,9 @@ internal final class ServiceDatabaseHost: CoordinatedDatabaseClose, DatabaseRole
     let path: String
     private let claim: FilePathClaim
     private let options: OpenOptions
+    private let structuralOnly: Bool
     var skipsFsync: Bool { options.skipFsync }
+    var forceSealedScratch: Bool { options.scratchEncryption == .on }
     private let catalogID: UInt64
     private let random: any RandomSource
     private let condition = NSCondition()
@@ -37,16 +39,17 @@ internal final class ServiceDatabaseHost: CoordinatedDatabaseClose, DatabaseRole
     private var pauseUntil: ContinuousClock.Instant?
     private var heldCodec: EncryptedPageCodec?
 
-    private init(path: String, claim: FilePathClaim, options: OpenOptions, catalogID: UInt64, random: any RandomSource) {
+    private init(path: String, claim: FilePathClaim, options: OpenOptions, catalogID: UInt64, random: any RandomSource, structuralOnly: Bool = false) {
+        self.structuralOnly = structuralOnly
         self.path = path; self.claim = claim; self.options = options; self.catalogID = catalogID; self.random = random
     }
-    static func open(path original: String, options: OpenOptions, catalogID: UInt64) throws -> Database {
+    static func open(path original: String, options: OpenOptions, catalogID: UInt64, structuralOnly: Bool = false) throws -> Database {
         try options.pageService.validate()
         let path = try FileLockBundle.normalize(original, creating: false)
         try FileLockBundle.checkHardLinks(path)
         let claim = try FilePathClaim.acquire(path)
         let host = ServiceDatabaseHost(path: path, claim: claim, options: options, catalogID: catalogID,
-            random: options.environment.newKeySource())
+            random: options.environment.newKeySource(), structuralOnly: structuralOnly)
         host.electing = true
         do { try host.elect(initial: true); return host.wrap() }
         catch { host.closeFailedOpen(); throw error }
@@ -125,7 +128,7 @@ internal final class ServiceDatabaseHost: CoordinatedDatabaseClose, DatabaseRole
     }
     private func adopt(_ storage: StorageDomain, remote: PageServiceClient?, structural: Bool) {
         if let core { core.installRole(storage: storage, remote: remote, sqlReady: !structural) }
-        else { core = DatabaseCore(storage: storage, environment: options.environment, remote: remote) }
+        else { core = DatabaseCore(storage: storage, environment: options.environment, remote: remote, sqlReady: !structural) }
         heldCodec = storage.pager.codec as? EncryptedPageCodec
     }
     private func becomeOwner(_ local: Database, bundle: FileLockBundle, structural: Bool) throws {
@@ -167,9 +170,9 @@ internal final class ServiceDatabaseHost: CoordinatedDatabaseClose, DatabaseRole
             if stop { throw JedError("55000", "database is closed") }
             if options.pageService.ownership != .never, pause == nil || ContinuousClock.now >= pause!, try bundle.tryOwnership() {
                 let local = try FileDatabaseHost.open(path: path, options: options, catalogID: catalogID,
-                    bundle: bundle, unlockedCodec: heldCodec, structural: !initial)
+                    bundle: bundle, unlockedCodec: heldCodec, structural: structuralOnly || !initial)
                 transferred = true
-                try becomeOwner(local, bundle: bundle, structural: !initial)
+                try becomeOwner(local, bundle: bundle, structural: structuralOnly || !initial)
                 return
             }
             if let owner = FileLockBundle.readOwner(path), owner.serving, owner.uid == UInt32(getuid()), !owner.endpoint.isEmpty {
@@ -180,16 +183,16 @@ internal final class ServiceDatabaseHost: CoordinatedDatabaseClose, DatabaseRole
                         notice: { [weak self] kind, requester in self?.receiveNotice(kind, requester: requester) },
                         disconnected: { [weak self] in self?.disconnected() })
                     let opened = try PageServiceClient.open(connection: connection, credential: options.credential,
-                        environment: options.environment, unlockedCodec: heldCodec, deadline: deadline, catalogID: catalogID, cacheBytes: options.cacheBytes,
+                        environment: options.environment, unlockedCodec: heldCodec, deadline: deadline, catalogID: catalogID, cacheBytes: options.cacheBytes, structuralOnly: structuralOnly,
                         resolve: { [weak self] txid, digest in
                             guard let self else { throw JedError("08007", "database handle ended during commit resolution") }
                             return try self.resolve(txid: txid, digest: digest)
                         })
-                    adopt(opened.core.storage, remote: opened.client, structural: false)
+                    adopt(opened.core.storage, remote: opened.client, structural: structuralOnly)
                     condition.lock(); let old = role; role = .client(opened.client); condition.unlock()
                     dispose(old)
                     if options.pageService.ownership == .prefer, connection.hello.flags & 4 != 0 {
-                        _ = try connection.request(.requestOwnership).wait()
+                        _ = try connection.request(.requestOwnership).wait(deadline: deadline, onCancel: { connection.close() })
                     }
                     return
                 } catch let error as JedError where error.code == "08006" {
@@ -348,10 +351,14 @@ internal final class ServiceDatabaseHost: CoordinatedDatabaseClose, DatabaseRole
         condition.lock()
         if closed { condition.unlock(); return }
         if closing { while !closed { condition.wait() }; condition.unlock(); return }
-        if electing || transferring { condition.unlock(); throw JedError("55006", "database ownership is changing") }
         do { try core.pauseAdmissions(rejectLocalWriter: true) }
         catch { condition.unlock(); throw error }
-        closing = true; requester = nil; let old = role; condition.broadcast(); condition.unlock()
+        // Close cancels future admission/election and waits for an in-flight
+        // role installation to finish before releasing its file/path lifetime.
+        // Owner EOF can start election just before an otherwise idle close.
+        closing = true; requester = nil; condition.broadcast()
+        while electing || transferring { condition.wait() }
+        let old = role; condition.unlock()
         if case .owner(_, let server?, _) = old {
             server.beginDrain(kind: 3)
             let deadline = ContinuousClock.now.advanced(by: .milliseconds(Int64(clamping: options.pageService.shutdownGraceMilliseconds)))

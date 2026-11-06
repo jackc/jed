@@ -239,6 +239,39 @@ final class SQLCorpusBoundaryTests: XCTestCase {
         "dml/insert_on_conflict_rekey.test",
         "dml/insert_on_conflict_rekey_savepoint.test",
         "dml/view_on_conflict.test",
+        "cte/data_modifying.test",
+        "cte/data_modifying_errors.test",
+        "cte/data_modifying_foreign_key.test",
+        "cte/data_modifying_foreign_key_exclusion.test",
+        "cte/data_modifying_temp.test",
+        "cte/with_dml.test",
+        "attach/constraint_names.test",
+        "attach/create_table_as.test",
+        "attach/foreign_key_qualified.test",
+        "attach/in_memory.test",
+        "attach/views.test",
+        "attach/writable_cte.test",
+        "ddl/constraint_name_schema_temp.test",
+        "ddl/create_table_as_temp.test",
+        "ddl/drop_index_foreign_key_temp.test",
+        "ddl/qualified_temp.test",
+        "ddl/reindex_jed.test",
+        "ddl/reserved_names.test",
+        "ddl/temp_composite.test",
+        "ddl/temp_foreign_key.test",
+        "ddl/temp_index.test",
+        "ddl/temp_on_commit.test",
+        "ddl/temp_on_commit_foreign_key.test",
+        "ddl/temp_serial_identity.test",
+        "ddl/temp_table.test",
+        "ddl/views_followons_jed.test",
+        "ddl/views_temp.test",
+        "ddl/views_temp_ctas.test",
+        "resource/query_memory_pending.test",
+        "resource/storage_memory.test",
+        "resource/temp_budget.test",
+        "transactions/savepoint.test",
+        "transactions/savepoint_jed.test",
     ]
 
     func testWholeFrozenSQLFilesThroughDatabaseSession() throws {
@@ -285,6 +318,7 @@ final class SQLCorpusBoundaryTests: XCTestCase {
     func testRecordAdapterRetainsSetupAndConsumesDirectives() throws {
         let file = try SQLCorpusFile("""
         # requires: harness.params
+        # attach: Aux
         # lifetime_max_cost: 10
         statement ok
         CREATE TABLE t (id i32)
@@ -303,6 +337,7 @@ final class SQLCorpusBoundaryTests: XCTestCase {
 
         """)
         XCTAssertEqual(file.records.count, 3)
+        XCTAssertEqual(file.environment.map(\.value), ["Aux"])
         XCTAssertEqual(file.records[0].directives.map(\.name), ["lifetime_max_cost"])
         XCTAssertEqual(file.records[1].directives.map(\.name), ["params", "names", "types", "cost"])
         XCTAssertTrue(file.records[2].directives.isEmpty)

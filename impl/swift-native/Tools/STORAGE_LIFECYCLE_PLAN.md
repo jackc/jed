@@ -381,8 +381,9 @@ symlink rejection, process-claim cleanup after failures, hard-link refusal,
 read-only/cache configuration, retained first-commit directory barriers, and key-stream continuity. All seven passed in the parent-owned integrated run at 19:04:07 on 2026-11-05; these are host/byte invariants, not SQL or
 multi-process conformance claims.
 
-The first-party `CJedHost` target contains only the atomic no-replace rename OS
-call absent from Swift's Linux Glibc module. The safe Swift wrapper borrows its
+The first-party `CJedHost` publication adapter contains the atomic no-replace
+rename OS call absent from Swift's Linux Glibc module. Stream transport adds only
+ordinary process/descriptor adapters, documented in `PAGE_SERVICE_PLAN.md`. The safe Swift wrapper borrows its
 owned path strings synchronously and checks errno; the shim retains no pointer.
 This is the approved ordinary-OS host seam, not an engine or library dependency.
 
@@ -439,3 +440,40 @@ these host/byte invariants, including a frozen encrypted GiST fixture rebuilt
 through plaintext, encryption and key rotation. All five passed in the
 parent-owned integrated selected run at 19:18:54 on 2026-11-05 (0.861 seconds). Process/crash simulations and attachment maintenance remain separate
 acceptance requirements.
+
+## Grouped domain commit integration
+
+`DomainCommitParticipant` carries one exact SQLText domain name, held WriterLease,
+working DomainSnapshot, policy, entropy source and synchronous setting.
+`DomainCommitGroup.prepare` rejects duplicate names/storage identities and a
+second actually changed file domain, omits unchanged domains, checks every
+changed domain's Q4/catalog layout before sealing any pages, then prepares in
+attachment-name order with main last. Statement admission must also reject a
+second attempted durable write, as required by attached-databases.md §5.
+
+The root database owns writer acquisition order and a publication boundary
+shared by bundled read admission. It retains that boundary and every writer
+lease across `PreparedDomainCommitGroup.commit()` and installation of the
+returned changed-root map. Commit stages all memory bodies first. Each memory
+core's commit boundary remains held, and staged-token validation plus adoption
+accounting construction finish before the sole file persist. Once that file
+reports known success, memory accounting and per-core root adoption are
+nonthrowing; a remote file role replacement keeps the existing known-commit
+resolution behavior. No unchanged file gets a txid, meta write or barrier.
+
+Failure before file success leaves memory roots and selected accounting
+unchanged. Staged bytes occupy only safe slots; an abandoned group is discarded
+and a later transaction prepares and stages again. A memory device I/O failure
+poisons that domain only. Forced memory Q4 reclamation now produces a private
+allocation proof during preflight, rather than mutating the published free list
+while another domain may still refuse. Old pins continue to protect their own
+domain's pages. Five host invariant tests cover these phase and failure rules;
+their publication awaits the parent-owned integrated verification.
+
+The frozen process backup prefix also exposed the explicit large-values.md
+§15.2 root-leaf exception: newly written resident overflow values continue to
+allocate fresh chains while their single root leaf stays resident. Swift now
+retains those original pending payloads alongside its packed root leaf and
+demotes other leaves. Reloaded values keep their stored chain pointers. This
+preserves the baseline's allocation/free-list behavior without decoding table
+maps or changing the shared golden expectations.

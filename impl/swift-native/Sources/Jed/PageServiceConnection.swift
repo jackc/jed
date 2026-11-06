@@ -42,18 +42,18 @@ internal final class PageServiceConnection: Sendable {
         var failure: JedError?
     }
     let hello: ServiceHelloReply
-    private let socket: UnixServiceSocket
+    private let socket: any ServiceFrameTransport
     private let state = Mutex(State())
     private let outbound = NSLock()
     private let notice: @Sendable (UInt8, UInt64) -> Void
     private let disconnected: @Sendable () -> Void
 
-    private init(socket: UnixServiceSocket, hello: ServiceHelloReply,
+    private init(socket: any ServiceFrameTransport, hello: ServiceHelloReply,
                  notice: @escaping @Sendable (UInt8, UInt64) -> Void,
                  disconnected: @escaping @Sendable () -> Void) {
         self.socket = socket; self.hello = hello; self.notice = notice; self.disconnected = disconnected
     }
-    static func open(socket: UnixServiceSocket, hello request: ServiceHello,
+    static func open(socket: any ServiceFrameTransport, hello request: ServiceHello,
                      deadline: ContinuousClock.Instant,
                      notice: @escaping @Sendable (UInt8, UInt64) -> Void = { _, _ in },
                      disconnected: @escaping @Sendable () -> Void = {}) throws -> PageServiceConnection {
@@ -77,7 +77,13 @@ internal final class PageServiceConnection: Sendable {
             let result = PageServiceConnection(socket: socket, hello: reply, notice: notice, disconnected: disconnected)
             Thread.detachNewThread { result.receive() }
             return result
-        } catch { socket.close(); throw error }
+        } catch {
+            socket.close()
+            if let error = error as? JedError, error.code == "08006", !socket.diagnostic.isEmpty {
+                throw JedError("08006", error.message + ": " + socket.diagnostic)
+            }
+            throw error
+        }
     }
     var isClosed: Bool { state.withLock { $0.failure != nil } }
 

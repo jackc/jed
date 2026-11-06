@@ -37,6 +37,11 @@ internal final class StagedMemoryPages: Sendable {
     fileprivate init(_ plan: PreparedPageCommit) { self.plan = plan }
 }
 
+internal final class AdmittedMemoryPages {
+    fileprivate let staged: StagedMemoryPages
+    fileprivate init(_ staged: StagedMemoryPages) { self.staged = staged }
+}
+
 /// Host-independent page I/O, recovery and commit publication. A database's
 /// single writer supplies immutable prepared pages; readers retain their roots.
 /// This mutex serializes physical reads against the short storage commit. Tree
@@ -297,13 +302,19 @@ internal final class Pager: Sendable {
     }
 
     func prepareMemory(body: [StoredPage], root: PageReference, pageCount: UInt32,
-                       freePages: [UInt32], reuseAllowed: Bool) throws -> PreparedPageCommit {
+                       freePages: [UInt32], reuseAllowed: Bool,
+                       reusablePages: [UInt32]? = nil) throws -> PreparedPageCommit {
         try state.withLock { state in
             try Self.checkWritable(state)
             guard state.ephemeral, state.selected.meta.txid < UInt64.max else {
                 throw JedError.corruption("invalid ephemeral commit state")
             }
-            let safe = Set(reuseAllowed ? state.freePages : []), free = Set(freePages)
+            let reusable = reusablePages ?? state.freePages
+            guard zip(reusable, reusable.dropFirst()).allSatisfy({ $0 < $1 }),
+                  reusable.allSatisfy({ $0 >= codec.firstBodyPage && $0 < state.selected.meta.pageCount }) else {
+                throw JedError.corruption("invalid planned ephemeral reusable pages")
+            }
+            let safe = Set(reuseAllowed ? reusable : []), free = Set(freePages)
             var written: Set<UInt32> = []
             for page in body {
                 guard page.index >= codec.firstBodyPage, page.index < pageCount, page.bytes.count == pageSize,
@@ -353,6 +364,29 @@ internal final class Pager: Sendable {
                   plan.baseTxid == state.selected.meta.txid else {
                 throw JedError("55006", "obsolete staged memory commit")
             }
+            state.selected = ValidatedMeta(meta: plan.manifest.meta, slot: plan.slot, floorSlot: plan.slot,
+                bytes: plan.metaBytes, entries: [], chain: [])
+            state.floorSlot = plan.slot; state.freePages = plan.freePages
+            state.recoverySync = false; state.directorySync = false; state.memoryStage = nil
+        }
+    }
+
+    func admitMemory(_ staged: StagedMemoryPages) throws -> AdmittedMemoryPages {
+        try state.withLock { state in
+            try Self.checkWritable(state)
+            guard state.ephemeral, state.memoryStage === staged.token,
+                  staged.plan.baseTxid == state.selected.meta.txid else {
+                throw JedError("55006", "obsolete staged memory admission")
+            }
+            return AdmittedMemoryPages(staged)
+        }
+    }
+    /// The memory core commit guard excludes epoch replacement and the writer
+    /// lease excludes another stage. This pointer/accounting update cannot fail
+    /// after the group's file domain has crossed its durable point.
+    func finishMemory(_ admitted: AdmittedMemoryPages) {
+        state.withLock { state in
+            let plan = admitted.staged.plan
             state.selected = ValidatedMeta(meta: plan.manifest.meta, slot: plan.slot, floorSlot: plan.slot,
                 bytes: plan.metaBytes, entries: [], chain: [])
             state.floorSlot = plan.slot; state.freePages = plan.freePages

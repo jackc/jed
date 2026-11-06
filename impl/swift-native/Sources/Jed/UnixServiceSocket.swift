@@ -130,18 +130,19 @@ internal final class UnixServiceSocket: @unchecked Sendable {
         }
     }
     /// Nil is clean EOF before the length prefix. EOF within a frame is 08006.
-    func readFrame(pageSize: Int, deadline: ContinuousClock.Instant? = nil) throws -> ServiceFrame? {
+    func readRaw(deadline: ContinuousClock.Instant? = nil) throws -> [UInt8]? {
         let fd = try acquire(); defer { release() }
-        guard let lengthBytes = try readExactly(fd, count: 4, allowEOF: true, deadline: deadline) else { return nil }
-        var header = ByteReader(lengthBytes); let length = try header.u32()
+        guard let header = try readExactly(fd, count: 4, allowEOF: true, deadline: deadline) else { return nil }
+        var reader = ByteReader(header); let length = try reader.u32()
         try PageServiceProtocol.checkLength(length)
-        let body = try readExactly(fd, count: Int(length), allowEOF: false, deadline: deadline)!
-        do { return try ServiceFrame.decode(lengthBytes + body, pageSize: pageSize) }
+        return header + (try readExactly(fd, count: Int(length), allowEOF: false, deadline: deadline)!)
+    }
+    func readFrame(pageSize: Int, deadline: ContinuousClock.Instant? = nil) throws -> ServiceFrame? {
+        guard let bytes = try readRaw(deadline: deadline) else { return nil }
+        do { return try ServiceFrame.decode(bytes, pageSize: pageSize) }
         catch {
-            var header = ByteReader(body)
-            _ = try header.u8()
-            let request = try header.u32()
-            throw ServiceFrameFailure(request: request, underlying: error)
+            var reader = ByteReader(bytes); _ = try reader.take(5)
+            throw ServiceFrameFailure(request: try reader.u32(), underlying: error)
         }
     }
     private func readExactly(_ fd: Int32, count: Int, allowEOF: Bool,
@@ -163,7 +164,9 @@ internal final class UnixServiceSocket: @unchecked Sendable {
         return bytes
     }
     func send(_ frame: ServiceFrame, pageSize: Int, deadline: ContinuousClock.Instant? = nil) throws {
-        let bytes = try frame.encode(pageSize: pageSize)
+        try sendRaw(frame.encode(pageSize: pageSize), deadline: deadline)
+    }
+    func sendRaw(_ bytes: [UInt8], deadline: ContinuousClock.Instant? = nil) throws {
         writes.lock(); defer { writes.unlock() }
         let fd = try acquire(); defer { release() }
         var position = 0

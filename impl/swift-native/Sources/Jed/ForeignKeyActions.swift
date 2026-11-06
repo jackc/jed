@@ -8,22 +8,75 @@ internal enum ForeignKeyActions {
     }
     final class State {
         var depth = 0
-        var checks: [Check] = []
-        func settle(snapshot: DomainSnapshot, settings: SessionSettings, context: ExpressionContext) throws {
-            defer { checks.removeAll() }
-            for check in checks {
-                if check.update, try check.plan.parentExists(check.key, snapshot: snapshot, context: context) { continue }
-                if try check.plan.hasChild(check.tuple, snapshot: snapshot, settings: settings, context: context) {
-                    throw check.plan.violation(parentSide: true)
+        let deferUntilStatementEnd: Bool
+        private var checks: [Check] = []
+        private let journal: Journal?
+        private let domain: SQLText
+        init(deferUntilStatementEnd: Bool = false, journal: Journal? = nil, domain: SQLText = DomainNames.main) {
+            self.deferUntilStatementEnd = deferUntilStatementEnd; self.journal = journal; self.domain = domain
+        }
+        func enqueue(_ check: Check) {
+            if let journal { journal.append(check, domain: domain) }
+            else { checks.append(check) }
+        }
+        /// Capture child tuples when visited, preserving their place beside
+        /// parent checks. Even MATCH FULL's partly-NULL rejection waits until
+        /// the outer statement finishes; an immediate later error can win.
+        func validateChildren(_ candidates: [ForeignKeyValidation.Candidate], child: CatalogTable,
+                              snapshot: DomainSnapshot, assigned: Set<Int>? = nil,
+                              vacated: Set<[UInt8]> = [], context: ExpressionContext) throws {
+            if !deferUntilStatementEnd {
+                try ForeignKeyValidation.validateChildren(candidates, child: child, snapshot: snapshot,
+                    assigned: assigned, vacated: vacated, context: context)
+                return
+            }
+            let plans = try child.foreignKeys.sorted { $0.name < $1.name }.filter {
+                assigned == nil || !Set($0.columns).isDisjoint(with: assigned!)
+            }.map { try ForeignKeyValidation.Plan(child: child, foreign: $0, snapshot: snapshot) }
+            for candidate in candidates {
+                for plan in plans {
+                    enqueue(.child(plan, try plan.foreign.columns.map(candidate.value)))
                 }
             }
         }
+        func settle(snapshot: DomainSnapshot, settings: SessionSettings, context: ExpressionContext) throws {
+            defer { checks.removeAll() }
+            for check in checks { try ForeignKeyActions.settle(check, snapshot: snapshot, settings: settings, context: context) }
+        }
     }
-    struct Check {
-        let plan: ForeignKeyValidation.Plan
-        let key: [UInt8]
-        let tuple: [SQLValue]
-        let update: Bool
+    /// A writable WITH shares one lexical check order across all of its target
+    /// domains. Each entry retains its originating tuple and owner, while its
+    /// final probes use that owner's final working roots.
+    final class Journal {
+        private var checks: [(SQLText, Check)] = []
+        fileprivate func append(_ check: Check, domain: SQLText) { checks.append((domain, check)) }
+        func settle(domains: QueryDomains, settings: SessionSettings, context: ExpressionContext) throws {
+            defer { checks.removeAll() }
+            for (domain, check) in checks {
+                var scoped = settings; scoped.targetDomain = domain; scoped.domains = domains
+                try ForeignKeyActions.settle(check, snapshot: domains.snapshot(domain), settings: scoped, context: context)
+            }
+        }
+    }
+    private static func settle(_ check: Check, snapshot: DomainSnapshot, settings: SessionSettings,
+                               context: ExpressionContext) throws {
+        switch check {
+        case .parent(let plan, let key, let tuple, let update):
+            if update, try plan.parentExists(key, snapshot: snapshot, context: context) { return }
+            if try plan.hasChild(tuple, snapshot: snapshot, settings: settings, context: context) { throw plan.violation(parentSide: true) }
+        case .child(let plan, let tuple):
+            let positions = Dictionary(uniqueKeysWithValues: plan.foreign.columns.enumerated().map { ($0.element, $0.offset) })
+            switch try plan.childProbe({ tuple[positions[$0]!] }, context: context) {
+            case .exempt: break
+            case .missing: throw plan.violation()
+            case .key(let key):
+                guard try plan.parentExists(key, snapshot: snapshot, context: context) else { throw plan.violation() }
+            }
+        }
+    }
+    enum Check {
+        case parent(ForeignKeyValidation.Plan, key: [UInt8], tuple: [SQLValue], update: Bool)
+        case child(ForeignKeyValidation.Plan, [SQLValue])
     }
     struct Target {
         let plan: ForeignKeyValidation.Plan
@@ -160,7 +213,7 @@ internal enum ForeignKeyActions {
             for transition in transitions {
                 guard let key = try plan.parentProbe(transition.old.value, context: context) else { continue }
                 if let new = transition.new, try plan.parentProbe(new.value, context: context) == key { continue }
-                state.checks.append(Check(plan: plan, key: key, tuple: try plan.foreign.referencedColumns.map(transition.old.value), update: !deleting))
+                state.enqueue(.parent(plan, key: key, tuple: try plan.foreign.referencedColumns.map(transition.old.value), update: !deleting))
             }
         }
     }

@@ -9,14 +9,19 @@ internal final class RelationPlan {
     let columns: [ExpressionColumn]
     let functionalDependencies: [(primaryKey: [Int], columns: [Int])]
     let baseTable: CatalogTable?
+    let sourceDomain: SQLText?
+    let sourceSnapshot: DomainSnapshot?
     let lateralColumns: Set<Int>
     let precedingWidth: Int
     var scanFilter: ResolvedExpression?
+    var allowsIndexAccess: Bool { sourceDomain.map { !DomainNames.isAttachment($0) } ?? true }
     init(body: Body, columns: [ExpressionColumn], functionalDependencies: [(primaryKey: [Int], columns: [Int])] = [], baseTable: CatalogTable? = nil,
-         lateralColumns: Set<Int> = [], precedingWidth: Int = 0) {
+         lateralColumns: Set<Int> = [], precedingWidth: Int = 0,
+         sourceDomain: SQLText? = nil, sourceSnapshot: DomainSnapshot? = nil) {
         self.body = body; self.columns = columns; self.functionalDependencies = functionalDependencies; self.baseTable = baseTable
         self.lateralColumns = lateralColumns
         self.precedingWidth = precedingWidth
+        self.sourceDomain = sourceDomain; self.sourceSnapshot = sourceSnapshot
     }
     var expressions: [ResolvedExpression] {
         switch body {
@@ -47,24 +52,30 @@ internal final class RelationPlan {
                         qualifier: input.alias ?? name.name, type: column.type ?? TypeDescriptor(.scalar(.text)), index: index,
                         collation: binding.collations[index]?.asColumn, unresolved: column.type == nil,
                         hiddenFromStar: binding.hiddenColumns.map { index >= $0 } ?? false) }
-                    result = RelationPlan(body: .cte(binding.reference()), columns: columns)
+                    result = RelationPlan(body: .cte(try binding.reference()), columns: columns)
                     break
                 }
                 if let system = try SystemRelationPlan.resolve(name, alias: input.alias, snapshot: snapshot, settings: settings) {
                     result = RelationPlan(body: .system(system), columns: system.columns)
                     break
                 }
-                if (name.database == nil || name.database?.description == "main"),
-                   let view = snapshot.catalog.views.first(where: { $0.name == name.name }) {
-                    try settings.privileges.require(.select, on: view.name)
+                let domains = QueryDomains.statement(snapshot: snapshot, settings: settings)
+                let selected = try domains.relation(name), owner = selected.snapshot
+                if let view = owner.catalog.views.first(where: { $0.name == name.name }) {
+                    guard !DomainNames.isAttachment(selected.name) || domains.implicitDomain == selected.name else {
+                        throw JedError("0A000", "views in attached databases are not supported")
+                    }
+                    if selected.name != DomainNames.temporary { try settings.privileges.require(.select, on: view.name) }
                     var inner = settings
+                    inner.domains = try domains.viewScope(owner: selected.name)
+                    inner.targetDomain = selected.name
                     if !view.securityInvoker { inner.privileges = settings.privileges.withTableAccess() }
                     let parsed = try ViewDefinition.parsed(view)
-                    let isolated = ExpressionResolver(composites: snapshot.types, scalar: resolver.scalar)
+                    let isolated = ExpressionResolver(composites: owner.types, scalar: resolver.scalar)
                     isolated.viewExpansion = resolver.viewExpansion
                     let plan = try resolver.viewExpansion.withBody(view.name, referenceDepth: input.parserDepth,
                         offset: input.span.byteStart, bodyDepth: parsed.depth) {
-                        try SelectPlan.resolve(parsed.query, snapshot: snapshot, settings: inner, scalar: resolver.scalar,
+                        try SelectPlan.resolve(parsed.query, snapshot: owner, settings: inner, scalar: resolver.scalar,
                                                using: isolated, finalizeParameters: false)
                     }
                     guard plan.columns.count == view.columns.count else { throw JedError("XX003", "stored view output changed") }
@@ -74,15 +85,16 @@ internal final class RelationPlan {
                     result = RelationPlan(body: .derived(plan, inner), columns: columns)
                     break
                 }
-                guard name.database == nil || name.database?.description == "main",
-                      let table = snapshot.catalog.tables.first(where: { $0.name == name.name }), let store = snapshot.tables[name.name] else {
+                guard let table = owner.catalog.tables.first(where: { $0.name == name.name }), let store = owner.tables[name.name] else {
                     throw JedError("42P01", "relation does not exist: \(name.name)")
                 }
-                try settings.privileges.require(.select, on: table.name)
-                let columns = try table.columns.enumerated().map { ExpressionColumn(name: $0.element.name,
-                    qualifier: input.alias ?? table.name, type: try $0.element.type.resolve(snapshot.types), index: $0.offset) }
+                if selected.name != DomainNames.temporary { try settings.privileges.require(.select, on: table.name) }
+                let types = try owner.tableTypes(table)
+                let columns = table.columns.enumerated().map { ExpressionColumn(name: $0.element.name,
+                    qualifier: input.alias ?? table.name, type: types[$0.offset], index: $0.offset) }
                 result = RelationPlan(body: .base(store), columns: columns,
-                    functionalDependencies: [(primaryKey: table.primaryKey, columns: Array(columns.indices))], baseTable: table)
+                    functionalDependencies: [(primaryKey: table.primaryKey, columns: Array(columns.indices))], baseTable: table,
+                    sourceDomain: selected.name, sourceSnapshot: owner)
             case .query(let query):
                 let child = ExpressionResolver(composites: resolver.composites, scalar: resolver.scalar)
                 child.outerScopes = input.lateral ? [preceding] + resolver.outerScopes : resolver.outerScopes
@@ -120,7 +132,8 @@ internal final class RelationPlan {
             guard input.columnAliases.count <= result.columns.count else {
                 let derived: Bool
                 switch input.source {
-                case .table(let name): derived = resolver.cteBindings[name.name] != nil || snapshot.catalog.views.contains { $0.name == name.name }
+                case .table:
+                    switch result.body { case .cte, .derived: derived = true; default: derived = false }
                 case .query, .function: derived = true
                 default: derived = false
                 }
@@ -135,7 +148,8 @@ internal final class RelationPlan {
                     scalarFunction: old.scalarFunction, hiddenFromStar: old.hiddenFromStar)
             }
             var combined = RelationPlan(body: result.body, columns: columns, functionalDependencies: result.functionalDependencies, baseTable: result.baseTable,
-                lateralColumns: result.lateralColumns, precedingWidth: result.precedingWidth)
+                lateralColumns: result.lateralColumns, precedingWidth: result.precedingWidth,
+                sourceDomain: result.sourceDomain, sourceSnapshot: result.sourceSnapshot)
             for join in input.joins {
                 let scope = preceding + combined.columns.map { column in
                     ExpressionColumn(name: column.name, qualifier: column.qualifier, type: column.type,
@@ -290,7 +304,7 @@ internal final class RelationExecution {
             for row in rows { try reserve(row) }
             return rows
         case .base(let store):
-            let scan = BaseScanPlan(predicate: plan.scanFilter, keys: plan.baseTable?.primaryKey ?? [], types: store.tree.types)
+            let scan = BaseScanPlan(predicate: plan.scanFilter, keys: plan.allowsIndexAccess ? plan.baseTable?.primaryKey ?? [] : [], types: store.tree.types)
             let access = try scan.bind(context)
             try ScanCost.charge(store, touched: touched.sorted(), meter: meter, access: access)
             var cursor = access.cursor(store); defer { cursor.close() }

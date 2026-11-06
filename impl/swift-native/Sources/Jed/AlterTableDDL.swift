@@ -4,7 +4,7 @@ extension CatalogDDL {
     static func alterTable(_ definition: SQLAlterTable, source: SQLText, snapshot: inout DomainSnapshot,
                            settings: SessionSettings, context: ExpressionContext) throws {
         try SystemRelationPlan.rejectTarget(definition.name.name)
-        let name = try nameInMain(definition.name)
+        let name = try CatalogDomain.name(definition.name, settings: settings)
         if snapshot.catalog.views.contains(where: { $0.name == name }) {
             let actions = try definition.actions.map { action -> SQLAlterViewAction in
                 switch action {
@@ -25,9 +25,12 @@ extension CatalogDDL {
             throw JedError("42P01", "table does not exist: \(name)")
         }
         let original = snapshot.catalog.tables[position]
+        if DomainNames.isAttachment(settings.targetDomain), snapshot.catalog.views.contains(where: {
+            $0.dependencies.contains { $0.kind == 0 && $0.name == name }
+        }) { throw JedError("0A000", "ALTER of an attached table referenced by a view is not supported") }
         let before = snapshot
         try context.sequences?.apply(to: &snapshot)
-        context.sequences?.synchronizeDefinitions(from: snapshot.catalog)
+        context.sequences?.synchronizeDefinitions(from: snapshot.catalog, domain: settings.targetDomain)
         var image = snapshot.catalog, table = original
         var removedIndexes: Set<SQLText> = [], renamedIndexes: [(SQLText, SQLText)] = []
         var addedConstraints: Set<SQLText> = []
@@ -61,7 +64,7 @@ extension CatalogDDL {
                 steps.append(try AlterRowRewrite.append(captured, snapshot: snapshot, settings: settings, context: context))
             case .renameTable(let new):
                 try CatalogSQL.reserved(new, kind: "table")
-                guard !CatalogSQL.relationNames(image).contains(new) else { throw JedError("42P07", "relation already exists: \(new)") }
+                guard !CatalogDomain.relations(image, settings: settings).contains(new) else { throw JedError("42P07", "relation already exists: \(new)") }
                 let oldName = table.name
                 try ViewRewrite.references(in: &image, name: oldName, kind: 0, renamed: new, columns: table.columns.map(\.name))
                 try CatalogRewrite.tableExpressions(&table, renamedTable: new)
@@ -85,7 +88,7 @@ extension CatalogDDL {
                 guard !CatalogSQL.constraints(table).contains(new) else { throw JedError("42710", "constraint already exists: \(new)") }
                 if let index = table.indexes.firstIndex(where: { $0.name == old && ($0.isConstraint || table.exclusions.contains { $0.index == old }) }) {
                     try CatalogSQL.reserved(new, kind: "constraint")
-                    guard !CatalogSQL.relationNames(image).contains(new) else { throw JedError("42P07", "relation already exists: \(new)") }
+                    guard !CatalogDomain.relations(image, settings: settings).contains(new) else { throw JedError("42P07", "relation already exists: \(new)") }
                     table.indexes[index].name = new; renamedIndexes.append((old, new))
                 }
                 for i in table.checks.indices where table.checks[i].name == old { table.checks[i].name = new }
@@ -218,9 +221,10 @@ extension CatalogDDL {
         // Frozen cores charge each saved-default conversion to a session meter,
         // then transfer its cost after action/end-state validation. This also
         // preserves their current lifetime double accrual for that preparation.
+        try CatalogDomain.validateTable(table, sequences: image.sequences.filter { $0.owner?.table == table.name }, settings: settings, types: snapshot.types)
         context.meter.charge(preparationCost); try context.meter.checkpoint()
         if clearStatistics { image.statistics.removeAll { $0.table == table.name } }
-        context.sequences?.synchronizeDefinitions(from: image)
+        context.sequences?.synchronizeDefinitions(from: image, domain: settings.targetDomain)
         var actionSnapshot = snapshot
         try actionSnapshot.updateCatalog(image, schemaChanged: false)
         let rewritten: (rows: [AlterRowRewrite.Row], nextID: Int64)?

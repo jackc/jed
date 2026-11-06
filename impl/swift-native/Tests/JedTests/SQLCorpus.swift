@@ -25,8 +25,8 @@ struct SQLCorpusFile {
         "max_storage_bytes", "max_temp_storage_bytes", "work_mem", "default_privileges", "grant", "revoke",
         "allow_ddl", "allow_temp_ddl",
     ]
-    static let fileDirectives: Set<String> = ["requires", "load-collation", "load-timezone", "fixture", "skip", "format"]
-    static let actions: Set<String> = ["attach", "upgrade-collations"]
+    static let fileDirectives: Set<String> = ["requires", "load-collation", "load-timezone", "fixture", "skip", "format", "attach"]
+    static let actions: Set<String> = ["upgrade-collations"]
 
     init(_ source: String) throws {
         let lines = source.components(separatedBy: "\n").map { $0.hasSuffix("\r") ? String($0.dropLast()) : $0 }
@@ -127,7 +127,6 @@ final class SQLCorpusRunner {
     private let database: Database
     private let session: Session
     private let maxCells = 200_000, maxBytes = 16 * 1024 * 1024
-    private var storageLimit: Int64 = 0
 
     init(file: SQLCorpusFile, fixture: (String, String) throws -> [UInt8]) throws {
         var builder = Environment.builder()
@@ -140,13 +139,19 @@ final class SQLCorpusRunner {
         builder.setRandomSource(random); builder.setClockSource(clock)
         for directive in file.environment {
             switch directive.name {
-            case "load-collation", "load-timezone": break
+            case "load-collation", "load-timezone", "attach": break
             case "skip" where directive.value.split(whereSeparator: \.isWhitespace).first == "disk": break
             default: throw SQLCorpusError("line \(directive.line): file directive \(directive.name) is not connected in this memory runner")
             }
         }
-        database = try Database(environment: builder.build())
-        session = try database.session()
+        let opened = try Database(environment: builder.build())
+        do {
+            for directive in file.environment where directive.name == "attach" {
+                try opened.attach(SQLText(directive.value), source: .memory, readOnly: false)
+            }
+            session = try opened.session()
+            database = opened
+        } catch { try? opened.close(); throw error }
     }
     func close() throws { session.close(); try database.close() }
 
@@ -250,8 +255,14 @@ final class SQLCorpusRunner {
             else { session.revoke(privileges, on: name, function: privileges.contains(.execute)) }
         }
         if let limit = try integer("lifetime_max_cost", in: directives) { session.lifetimeMaxCost = limit }
-        if let limit = try integer("max_storage_bytes", in: directives) { storageLimit = limit }
-        database.maxStorageBytes = storageLimit
+        for directive in directives where directive.name == "max_storage_bytes" {
+            let words = directive.value.split(whereSeparator: \.isWhitespace)
+            guard (1...2).contains(words.count), let limit = Int64(words[0]), limit >= 0 else {
+                throw SQLCorpusError("invalid max_storage_bytes directive")
+            }
+            let domain = try words.count == 2 ? SQLText(String(words[1])) : DomainNames.main
+            try database.setMaxStorageBytes(domain, limit)
+        }
         for name in Array(session.settings.variables.keys) { try session.resetVariable(name) }
         for directive in directives where directive.name == "set" {
             for entry in directive.value.split(separator: ",") {

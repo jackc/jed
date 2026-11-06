@@ -144,9 +144,10 @@ final class StorageDomainBoundaryTests: XCTestCase {
         XCTAssertEqual(domain.pager.selected.meta.pageCount, 5)
         var policy = DomainCommitPolicy(); policy.storageLimit = 6 * 256
         working = domain.committed; try put(1, table: "t", snapshot: &working)
+        let freeBeforePrecheck = try domain.pager.allocationSnapshot(reuseAllowed: true).persistedFree
         device.reset(); try domain.precheck(working, policy: policy)
         XCTAssertFalse(device.log.contains("write")); XCTAssertFalse(device.log.contains("sync"))
-        XCTAssertEqual(try domain.pager.allocationSnapshot(reuseAllowed: true).persistedFree, [2])
+        XCTAssertEqual(try domain.pager.allocationSnapshot(reuseAllowed: true).persistedFree, freeBeforePrecheck)
         _ = try commit(working, to: domain, policy: policy)
         XCTAssertEqual(domain.pager.selected.meta.pageCount, 6)
         for _ in 0..<12 {
@@ -194,6 +195,40 @@ final class StorageDomainBoundaryTests: XCTestCase {
         _ = try commit(working, to: domain)
         XCTAssertEqual(domain.livePages, 1)
         XCTAssertGreaterThan(try domain.pager.allocationSnapshot(reuseAllowed: true).persistedFree.count, 0)
+    }
+
+    func testResidentRootRewritesFreshChainsUntilReload() throws {
+        let device = MemoryBlockStore(), domain = try StorageDomain.create(store: device, kind: .file, catalogID: 40, pageSize: 256)
+        var working = domain.committed
+        try table("t", snapshot: &working, blob: true)
+        var seed: UInt64 = 901, blob: [UInt8] = []
+        for _ in 0..<600 { seed = seed &* 6364136223846793005 &+ 1; blob.append(UInt8(truncatingIfNeeded: seed >> 32)) }
+        for id: Int64 in 1...3 { try put(id, table: "t", snapshot: &working, blob: blob) }
+        _ = try commit(working, to: domain)
+        let t = try name("t"), old = domain.committed
+        guard case .resident(let root) = old.tables[t]!.tree.root else { return XCTFail("root leaf must stay resident") }
+        XCTAssertTrue(root.isLeaf)
+        XCTAssertNotNil(try old.tables[t]!.get(key(1))!.overflows[1])
+        working = old; var store = working.tables[t]!
+        try store.remove(key(3)); working.setTableStore(t, store)
+        let plan = try XCTUnwrap(domain.prepare(working, verifyLiveCount: true))
+        XCTAssertEqual(plan.pages.body.filter { $0.bytes[0] == 4 }.count, 6)
+        _ = try domain.persist(plan)
+        guard case .bytea(let pinned) = try old.tables[t]!.get(key(3))!.materialize(column: 1, pager: domain.pager) else {
+            return XCTFail("pinned overflow value changed kind")
+        }
+        XCTAssertEqual(pinned, blob)
+        let reopened = try StorageDomain.open(store: device, catalogID: 40, validateCatalog: { _ in })
+        working = reopened.committed; store = working.tables[t]!
+        XCTAssertTrue(try store.get(key(1))!.overflows.isEmpty)
+        try store.remove(key(2)); working.setTableStore(t, store)
+        let inherited = try XCTUnwrap(reopened.prepare(working, verifyLiveCount: true))
+        XCTAssertEqual(inherited.pages.body.filter { $0.bytes[0] == 4 }.count, 0)
+        _ = try reopened.persist(inherited)
+        guard case .bytea(let recovered) = try reopened.committed.tables[t]!.get(key(1))!.materialize(column: 1, pager: reopened.pager) else {
+            return XCTFail("reopened overflow value changed kind")
+        }
+        XCTAssertEqual(recovered, blob)
     }
 
     func testMultiDomainPreflightAndFailureLeaveOtherDevicesUntouched() throws {

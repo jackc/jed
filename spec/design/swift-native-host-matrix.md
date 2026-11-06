@@ -224,13 +224,16 @@ transcripts, seeds and exact reproduction commands for failures.
 ### First-party native publication shim
 
 `Sources/CJedHost/host.c` is a narrow ordinary-OS adapter under the experiment's
-approved host-interface exception. It exposes one operation omitted by Swift's
-Linux Glibc module: atomic no-replace rename. Linux calls `renameat2` with
+approved host-interface exception. Its initial publication operation is atomic no-replace rename, omitted by Swift's
+Linux Glibc module. Linux calls `renameat2` with
 `RENAME_NOREPLACE`; Darwin calls `renameatx_np` with `RENAME_EXCL`. Both inputs are
 borrowed NUL-terminated paths for one synchronous call, no pointer or buffer is
 retained, and the return is the OS status/errno. There is no third-party
-library, allocation, SQL, codec, locking policy, or storage algorithm in this C
-target. The file host retains the exclusive protocol-v2 bundle while publishing.
+library, SQL, codec, locking policy, or storage algorithm in this C
+target. The stream adapter also uses a borrowed synchronous SIGPIPE-safe write
+and ordinary `pidfd_spawnp`/close-on-exec pipe setup; cleanup signals and reaps
+through the stable kernel process descriptor, never a potentially reused PID.
+These retain no caller buffers and alter no process-wide signal handler. The file host retains the exclusive protocol-v2 bundle while publishing.
 Unsupported hosts fail `0A000`; there is no link/unlink publication fallback that
 could leave a hard-link crash window.
 
@@ -257,3 +260,23 @@ passed five, with all 87 ordinary images asserted inside its fixture test.
 `Tools/PAGE_SERVICE_PLAN.md` records the ownership, lock-order, epoch, structural
 adoption, pin-watermark and publication invariants. All checkpoints reported in
 this development session are local-only until explicitly described as pushed.
+### Frozen real-process progress (2026-11-05)
+
+The first complete 31-scenario native actor run executed every selected scenario:
+22 passed and nine failed. Four failures were attachment API actions not yet
+connected, two were stream transport opens not yet connected, two exposed a
+close/election race, and one exposed the documented resident-root overflow
+allocation exception. No scenario was skipped and no frozen expected value was
+changed. The last three defects now have passing focused reruns of
+`cow_stale_orphan`, `unchanged_commits`, and the complete `backup` scenario
+through `mise run swift-native:process --no-build` with `JED_PROCESS_FILTER`.
+This is focused follow-up evidence, not a second complete 31-scenario result.
+
+The native grouped storage phase passed five host invariant tests, with the
+root-leaf regression included in nine passing storage-domain tests. Attachment
+actor routing and native stream client/serving code are published for the next
+integration run. `Database.openRemote` supports an explicit byte-transport
+factory and a process-command convenience; the opt-in actor task selects the
+Swift serving process explicitly. Remaining host acceptance still includes the
+complete rerun, cross-core pairings, simulation, and other matrix rows without
+their own complete evidence.

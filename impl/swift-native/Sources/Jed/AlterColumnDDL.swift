@@ -33,7 +33,7 @@ internal enum AlterColumnDDL {
                 if case .unique = constraint.kind { return constraint.name }; return nil
             })
             let sequence = try SequenceDefinition.owned(table: table.name, column: syntax.name, ordinal: ordinal,
-                type: scalar, options: identities.first?.options ?? [], taken: CatalogSQL.relationNames(image).union(reserved), composites: snapshot.types)
+                type: scalar, options: identities.first?.options ?? [], taken: CatalogDomain.relations(image, settings: settings).union(reserved), composites: snapshot.types)
             image.sequences.append(sequence); column.notNull = true; column.identity = identities.first?.always
             column.defaultValue = .expression(SequenceName.defaultExpression(sequence.name))
         }
