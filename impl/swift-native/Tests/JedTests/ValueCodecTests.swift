@@ -213,6 +213,39 @@ final class ValueCodecTests: XCTestCase {
         code("0A000") { _ = try ValueCodec.encode(.bytea(Array(repeating: 0, count: 65_536)), type: descriptor("bytea")) }
     }
 
+    func testBorrowedDecodersRespectSliceBoundsThroughRecursiveValues() throws {
+        let cases = [
+            ("i32", "008000002a"), ("boolean", "0001"), ("text", "000002c3a9"),
+            ("decimal", "0000000200010096"), ("addr", "000000044d61696e80016062"),
+            ("i32[]", "0001010000000300000001408000000180000003"),
+            ("i32range", "00088000000180000005"), ("jsonb", "0006020002"),
+        ]
+        for (name, encoded) in cases {
+            let type = try descriptor(name), bytes = hex(encoded)
+            let backing: [UInt8] = [0xff, 0xee, 0xdd] + bytes + [0xcc]
+            let start = 3, end = start + bytes.count
+            XCTAssertEqual(try ValueCodec.encode(ValueCodec.decode(backing[start..<end], type: type), type: type), bytes, name)
+            XCTAssertEqual(try ValueCodec.encodeBody(ValueCodec.decodeBody(backing[(start + 1)..<end], type: type), type: type), Array(bytes.dropFirst()), name)
+            // The excluded suffix still holds the rest of each valid value.
+            // Neither decoder may read beyond the borrowed slice to finish it.
+            for cut in start..<end {
+                code("XX001") { _ = try ValueCodec.decode(backing[start..<cut], type: type) }
+            }
+            for cut in (start + 1)..<end {
+                code("XX001") { _ = try ValueCodec.decodeBody(backing[(start + 1)..<cut], type: type) }
+            }
+            code("XX001") { _ = try ValueCodec.decode(backing[start...], type: type) }
+            code("XX001") { _ = try ValueCodec.decodeBody(backing[(start + 1)...], type: type) }
+        }
+        let null: [UInt8] = [0xaa, 1, 0xbb]
+        XCTAssertTrue(try ValueCodec.decode(null[1..<2], type: descriptor("text")).isNull)
+        code("XX001") { _ = try ValueCodec.decode(null[1...], type: descriptor("text")) }
+        for (name, encoded) in [("boolean", "0002"), ("text", "000001ff"), ("i32range", "0003")] {
+            let bytes = hex(encoded), backing: [UInt8] = [0xaa] + bytes + [0xbb]
+            code("XX001") { _ = try ValueCodec.decode(backing[1..<(1 + bytes.count)], type: descriptor(name)) }
+        }
+    }
+
     func testJSONBCanonicalBodiesAndMalformedCounts() throws {
         let type = TypeDescriptor(.scalar(.jsonb))
         let node = SQLJSONValue.object([

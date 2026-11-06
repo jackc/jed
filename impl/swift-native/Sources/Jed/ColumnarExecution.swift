@@ -30,6 +30,21 @@ internal enum ColumnarExecution {
             return call.plan.name == "avg" && [.scalar(.f32), .scalar(.f64)].contains(type)
         }
     }
+
+    /// The first direct packed fold deliberately retains the existing lane's
+    /// eligibility and narrows it to an unfiltered full walk of fixed cells.
+    /// Variable-width operands, filters and grouping keep their current driver.
+    static func packedWholeTable(_ plan: SelectPlan, _ aggregate: AggregateQueryPlan, _ context: ExpressionContext) -> Bool {
+        guard aggregation(plan, aggregate, context), aggregate.keys.isEmpty,
+              plan.predicate == nil, !plan.materializeSource,
+              plan.chosenJoin == nil, plan.chosenNWay == nil, plan.scan.terms.isEmpty,
+              let store = plan.store,
+              plan.touched.allSatisfy({ ValueCodec.fixedWidth(store.tree.types[$0].type) != nil }) else { return false }
+        if let candidate = plan.chosenAccess {
+            guard case .full = candidate.path else { return false }
+        }
+        return true
+    }
 }
 
 internal final class ColumnarProjectionExecution {

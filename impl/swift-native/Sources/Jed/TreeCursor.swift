@@ -4,6 +4,26 @@ internal struct TreeBound: Sendable {
     init(_ key: [UInt8], inclusive: Bool = true) { self.key = key; self.inclusive = inclusive }
 }
 
+/// A retained position in an immutable leaf. Readers that need only selected
+/// columns can borrow their cells without copying a key or constructing every
+/// column of a PackedRecord. The node keeps both page bytes and pending values
+/// alive independently of the cursor's next leaf or close.
+internal struct TreePosition: Sendable {
+    let node: TreeNode
+    let row: Int
+
+    func record() -> PackedRecord { node.record(at: row) }
+    func cell(_ column: Int) -> StoredCell { node.leaf!.cell(row: row, column: column) }
+    func materialize(_ column: Int, pager: Pager?) throws -> SQLValue {
+        let cell = cell(column)
+        if let overflow = node.pending[row]?[column] {
+            let raw = overflow.compressed ? try LZ4.decompress(overflow.bytes, rawLength: overflow.rawLength) : overflow.bytes
+            return try ValueCodec.decodeRawBody(raw, type: cell.type)
+        }
+        return try cell.materialize(pager: pager)
+    }
+}
+
 /// A snapshot cursor owns only its root, one interior frame per level, and its
 /// current packed leaf. It never collects a range or follows sibling links.
 internal struct TreeCursor: Sendable {
@@ -28,6 +48,10 @@ internal struct TreeCursor: Sendable {
     }
 
     mutating func next() throws -> PackedRecord? {
+        try nextPosition()?.record()
+    }
+
+    mutating func nextPosition() throws -> TreePosition? {
         guard let tree, !finished else { return nil }
         if !started {
             started = true
@@ -41,13 +65,19 @@ internal struct TreeCursor: Sendable {
         }
         while let leaf {
             if row >= 0, row < leaf.entryCount {
-                let record = leaf.record(at: row)
-                if let lower, record.key.lexicographicallyPrecedes(lower.key) ||
-                    (record.key == lower.key && !lower.inclusive) { finish(); return nil }
-                if let upper, upper.key.lexicographicallyPrecedes(record.key) ||
-                    (record.key == upper.key && !upper.inclusive) { finish(); return nil }
+                if let lower {
+                    let key = leaf.leaf!.key(at: row)
+                    if key.lexicographicallyPrecedes(lower.key) ||
+                        (key.elementsEqual(lower.key) && !lower.inclusive) { finish(); return nil }
+                }
+                if let upper {
+                    let key = leaf.leaf!.key(at: row)
+                    if upper.key.lexicographicallyPrecedes(key) ||
+                        (key.elementsEqual(upper.key) && !upper.inclusive) { finish(); return nil }
+                }
+                let position = TreePosition(node: leaf, row: row)
                 row += descending ? -1 : 1
-                return record
+                return position
             }
             try advanceLeaf(tree)
         }

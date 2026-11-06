@@ -9,10 +9,10 @@ internal struct StoredCell: Sendable {
 
     func materialize(pager: Pager? = nil, pageCount: UInt32? = nil) throws -> SQLValue {
         guard let bytes else { return .null }
-        if fixedWidth != nil { return try ValueCodec.decodeBody(Array(bytes), type: type) }
+        if fixedWidth != nil { return try ValueCodec.decodeBody(bytes, type: type) }
         var reader = ByteReader(bytes)
         let tag = try reader.u8()
-        if tag == 0 { return try ValueCodec.decode(Array(bytes), type: type) }
+        if tag == 0 { return try ValueCodec.decode(bytes, type: type) }
         if tag == 3 {
             let raw = Int(try reader.u32()), compressed = Int(try reader.u16())
             let block = Array(try reader.take(compressed)); try reader.requireEnd()

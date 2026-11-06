@@ -165,7 +165,9 @@ internal final class GroupedSelectExecution {
                 else { try group.states[ordinal].fold(arguments) }
             }
         }
-            if columnar {
+            if ColumnarExecution.packedWholeTable(plan, aggregate, context) {
+                try foldPackedWholeTable(groups[0])
+            } else if columnar {
                 while let row = try input.next() {
                     var current = context; current.column = { row[$0] }
                     if !input.predicateApplied, let predicate = plan.predicate, try !context.profile(plan.profileIdentity, .filter, { try current.matches(predicate) }) { continue }
@@ -210,6 +212,34 @@ internal final class GroupedSelectExecution {
         if !rawOutput {
             try sort()
             position = Int(min(Int64(outputs.count), plan.offset))
+        }
+    }
+    private func foldPackedWholeTable(_ group: Group) throws {
+        let store = plan.store!, meter = context.meter
+        // As on SelectInput's scalar drive, the group exists before the access
+        // block is charged. No rows are gathered or admitted to the Q1 account.
+        try ScanCost.charge(store, touched: plan.touched, meter: meter)
+        var cursor = TreeCursor(store.tree, descending: plan.descending)
+        defer { cursor.close() }
+        let operands = aggregate.calls.map { call -> Int? in
+            guard let argument = call.arguments.first, case .column(let column) = argument.node else { return nil }
+            return plan.touched.firstIndex(of: column)!
+        }
+        var values = Array(repeating: SQLValue.null, count: plan.touched.count)
+        while let position = try cursor.nextPosition() {
+            // Decode touched cells in their original order before any fold.
+            // Bare columns add no expression cost; every aggregate, including
+            // COUNT(*) and NULL operands, still pays its own accumulation unit.
+            try meter.step(); meter.charge(1)
+            for (slot, column) in plan.touched.enumerated() {
+                values[slot] = try position.materialize(column, pager: store.tree.pool?.pager)
+            }
+            try meter.checkpoint()
+            for ordinal in group.states.indices {
+                meter.charge(1)
+                if let slot = operands[ordinal] { try group.states[ordinal].fold([values[slot]]) }
+                else { try group.states[ordinal].fold([]) }
+            }
         }
     }
     private func create(keys: [SQLValue], selected: [SQLValue], key: [UInt8]) throws -> Int {

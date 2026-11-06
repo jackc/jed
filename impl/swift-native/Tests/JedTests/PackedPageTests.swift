@@ -54,6 +54,34 @@ final class PackedPageTests: XCTestCase {
         }
     }
 
+    func testBorrowedCellMaterializationKeepsFixedAndInlineExtents() throws {
+        let integerBacking: [UInt8] = [0xff, 0x80, 0, 0, 42, 0xee]
+        let textBacking: [UInt8] = [0xff, 0, 0, 3, 97, 98, 99, 0xee]
+        guard case .integer(let number) = try StoredCell(bytes: integerBacking[1..<5], type: integer).materialize(),
+              case .text(let value) = try StoredCell(bytes: textBacking[1..<7], type: text).materialize() else {
+            return XCTFail("wrong decoded cell values")
+        }
+        XCTAssertEqual(number, 42)
+        XCTAssertEqual(value.utf8, [97, 98, 99])
+        for (type, backing) in [(integer, integerBacking), (text, textBacking)] {
+            let end = backing.count - 1
+            for cut in 1..<end {
+                XCTAssertThrowsError(try StoredCell(bytes: backing[1..<cut], type: type).materialize()) {
+                    XCTAssertEqual(($0 as? JedError)?.code, "XX001")
+                }
+            }
+            XCTAssertThrowsError(try StoredCell(bytes: backing[1...], type: type).materialize()) {
+                XCTAssertEqual(($0 as? JedError)?.code, "XX001")
+            }
+        }
+        XCTAssertTrue(try StoredCell(bytes: nil, type: text).materialize().isNull)
+        // Leaf NULLs have no bytes; the single-value NULL tag is not a leaf cell.
+        let taggedNull: [UInt8] = [0xff, 1, 0xee]
+        XCTAssertThrowsError(try StoredCell(bytes: taggedNull[1..<2], type: text).materialize()) {
+            XCTAssertEqual(($0 as? JedError)?.code, "XX001")
+        }
+    }
+
     func testOverflowAllocationChainOrderAndExactSlabValidation() throws {
         let codec = try PlainPageCodec(pageSize: 256)
         var allocator = try PageAllocator(highWater: 10, free: [3, 7], firstBody: 2)

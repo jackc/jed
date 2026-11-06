@@ -7,6 +7,10 @@ internal enum ValueCodec {
     }
 
     static func decode(_ bytes: [UInt8], type: TypeDescriptor) throws -> SQLValue {
+        try decode(bytes[...], type: type)
+    }
+
+    static func decode(_ bytes: ArraySlice<UInt8>, type: TypeDescriptor) throws -> SQLValue {
         var reader = ByteReader(bytes)
         let tag = try reader.u8()
         let value: SQLValue
@@ -26,6 +30,10 @@ internal enum ValueCodec {
     }
 
     static func decodeBody(_ bytes: [UInt8], type: TypeDescriptor) throws -> SQLValue {
+        try decodeBody(bytes[...], type: type)
+    }
+
+    static func decodeBody(_ bytes: ArraySlice<UInt8>, type: TypeDescriptor) throws -> SQLValue {
         var reader = ByteReader(bytes)
         let value = try readBody(&reader, type: type, depth: 0)
         try reader.requireEnd()
