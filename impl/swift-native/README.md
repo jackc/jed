@@ -1,13 +1,15 @@
 # Native Swift experiment
 
-**Work in progress: Linux correctness acceptance passes; measured optimization
-and the final freeze remain pending.**
-The acceptance target is the full supported jed surface at
-`362e0798ac3a8bd04bd2da556044b6ec73bf468a`. See [PROGRESS.md](PROGRESS.md) for
-implemented and verified behavior, historical failures and resume steps.
-The [verification report](VERIFICATION.md) records completed gates and their limits.
+**Frozen experimental snapshot** at `cec8170bfc33f087fa98949ae661b1eaa5490218`.
+The semantic target remains the full supported jed surface at
+`362e0798ac3a8bd04bd2da556044b6ec73bf468a`, with separately recorded shared corrections
+and postbaseline regressions. [VERIFICATION.md](VERIFICATION.md) maps completed
+Linux acceptance to its actual actors; [BENCHMARKS.md](BENCHMARKS.md) records the
+complete release baseline and measured optimization comparison, including limits.
+[PROGRESS.md](PROGRESS.md) preserves implementation history and failed attempts.
 The [experiment design](../../spec/design/swift-native-experiment.md) and its linked
-scope/host matrices define completion.
+scope/host matrices preserve the baseline boundaries. This locally committed
+snapshot is not a pushed release, package publication or promotion.
 
 The independent engine is handwritten Swift. Approved crypto utilities are isolated
 in `JedCrypto`, using exact-pinned SwiftPM dependencies and pinned reference Argon2
@@ -39,8 +41,9 @@ mise run swift-native:unicode -- --help
 
 Normal repository CI, tests, benchmarks and generated website references do not
 include Swift. Generated metadata is pinned to the recorded baseline Git blobs;
-updating supported cores does not refresh the experiment. Completion is followed
-by a freeze, with promotion subject to a separate decision.
+updating supported cores does not refresh this frozen snapshot. Further work
+requires explicit authorization; promotion and production delivery remain
+separate decisions. Apple platforms remain unverified.
 
 The runnable [embedding examples](Examples/main.swift) import only public `Jed`
 APIs. `mise run swift-native:examples` runs memory, durable-file and cancellation
@@ -69,8 +72,8 @@ files; `--temp` selects forced TEMP spilling with memory main and real native
 scratch. `swift-native:query-memory` compares every sequential record's exact
 peak and committed-main storage across Swift/Rust/Go/TS in memory, disk and
 disk-spill modes. Filters are diagnostic subsets; see
-[resource acceptance evidence](Tools/RESOURCE_ACCEPTANCE.md) for current results
-and outstanding full-mode verification.
+[resource acceptance evidence](Tools/RESOURCE_ACCEPTANCE.md) for the complete
+241,412-measurement comparison and its postoptimization refresh.
 
 `swift-native:interop` exercises all 112 frozen images with Swift and each
 supported core in both writer orders, plus generated plaintext/key/passphrase
@@ -80,8 +83,10 @@ missing phases fail. See [interchange acceptance](Tools/INTERCHANGE_PLAN.md).
 fixed test credential and compares all cost/EXPLAIN transcripts across the four
 cores. It checks ordinary values/errors and exact file/record coverage, retains
 an immutable Swift actor and logs, and supports labelled diagnostic filters.
-The refreshed full encrypted and six-direction service comparisons pass; later
-handoff behavior also passes the complete release host and process gates.
+The full encrypted and six-direction service comparisons pass. The optimized
+snapshot also passes the 77,612-record encrypted refresh and all 2,691 interchange
+phases; VERIFICATION.md records exact actors, the native host checks and earlier
+service/process evidence without extending old actors to later edits.
 
 `swift-native:service` runs all six Swift/supported-core client-owner directions
 through real external owner processes. It captures actors, asserts actual client
@@ -129,8 +134,11 @@ handle's interval and synchronous setting.
 all 18 frozen regression traces twice. It writes per-step diagnostic progress,
 canonical transcripts, images, and explicit results to a unique temporary directory.
 All 18 frozen regressions, including page-service histories, pass deterministic
-double replay. The 22-profile sweep and supported-core transcript/image
-comparison remain separate acceptance gates; see `Tools/SIMULATION_PLAN.md`.
+double replay. Separate four-core comparison and generated-sweep acceptance also
+pass. The postoptimization saved replay passes all 18 traces per core, 54 transcript
+comparisons and 153 independently checked Swift images; earlier generated sweeps
+retain their own actors. These finite checks are not exhaustive fault coverage;
+see [SIMULATION_PLAN.md](Tools/SIMULATION_PLAN.md).
 
 The SQL path uses explicit sessions and pull cursors:
 
@@ -151,7 +159,8 @@ try database.close()
 Keep a session for transactions, variables and sequence history. Convenience
 queries on `Database` create fresh sessions. Result-column `type` is optional:
 nil represents the unresolved SQL `unknown` type of an all-NULL output. Consult
-the progress record for the currently admitted SQL subset.
+the [scope matrix](../../spec/design/swift-native-scope.md) for the verified baseline
+surface and deliberate exclusions.
 
 Prepare once and execute on the session that should supply the transaction,
 settings and privileges:
@@ -246,6 +255,6 @@ a `PageTransport` factory or a command array for a native page-service stream.
 The command form requires Linux pidfd spawn support (glibc 2.39+); an unsupported
 host returns `0A000` and can supply its own transport. Credentials travel in the
 protocol hello, not the command arguments. Run the frozen process scenarios with
-`mise run swift-native:process`; consult the progress record for verified modes
-and outstanding acceptance work. These experimental APIs do not change supported
+`mise run swift-native:process`; consult VERIFICATION.md for verified modes and
+their actor-specific evidence. These experimental APIs do not change supported
 core delivery or normal repository verification.

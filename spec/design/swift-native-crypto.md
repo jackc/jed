@@ -144,12 +144,30 @@ TOML field counts are not vector counts. XAES is only the already-specified doub
 derivation over library AES and AES-GCM. SQL digest cases come from the shared
 corpus. Adapter tests cover invalid sizes, authentication failures, embedded
 zero input, lifetime-safe empty input, and reference Argon2 with multiple lanes.
-At storage integration, run encrypted
-goldens, bidirectional interchange, rekey/credential changes, scratch sealing,
-process tests, and encrypted simulations. Passing primitive vectors alone does
-not establish file-format, durability, or security correctness.
+Storage integration additionally requires encrypted goldens, bidirectional
+interchange, rekey/credential changes, scratch sealing, process tests and encrypted
+simulations. Those later Linux gates are recorded below. Passing primitive vectors
+alone does not establish file-format, durability, or security correctness.
 
 No dependency approval blocker has been identified. The SHA-224 bridge's
 compile/link and execution proof is established on the inspected Linux host.
-This is cryptographic and page-codec foundation evidence, not completion of
-database open/create, validated-COW commits, credential repair, or rotation.
+The dated primitive results above establish cryptographic and page-codec
+foundations; alone they do not establish database open/create, validated-COW
+commits, credential repair or rotation.
+
+### Subsequent Linux integration acceptance
+
+The frozen snapshot at `cec8170bfc33f087fa98949ae661b1eaa5490218` passes all 515
+native tests including all 749 frozen SQL files. Postoptimization verification
+also passes the full 77,612-record four-core encrypted comparison, all 2,691
+bidirectional interchange phases, 241,412 exact-account measurements and the
+18-trace four-core saved-simulation comparison. Earlier complete service,
+process and 176-trace-per-core generated-simulation gates retain their own actors.
+[VERIFICATION.md](../../impl/swift-native/VERIFICATION.md) records commands, hashes,
+credential/maintenance coverage, failures and later corrections. The measured
+comparison is separate in [BENCHMARKS.md](../../impl/swift-native/BENCHMARKS.md).
+
+These checks reproduce the implemented encryption contract; they do not certify
+constant-time behavior, complete memory erasure, a new security review or Apple
+support. Dependency pins and approved native boundaries above remain unchanged.
+Swift remains opt-in, with production delivery and promotion undecided.

@@ -1,8 +1,13 @@
 # Native Swift core experiment
 
-Approved 2026-11-05. **Linux correctness acceptance passes; performance acceptance
-and the final freeze remain in progress.** The target is the supported
-Rust/Go/TypeScript surface at `362e0798ac3a8bd04bd2da556044b6ec73bf468a`.
+Approved 2026-11-05. **Frozen experimental snapshot** at
+`cec8170bfc33f087fa98949ae661b1eaa5490218`. Linux acceptance and the measured
+optimization pass are complete for the recorded actors and inputs; see
+[VERIFICATION.md](../../impl/swift-native/VERIFICATION.md) and
+[BENCHMARKS.md](../../impl/swift-native/BENCHMARKS.md). The semantic target remains the
+supported Rust/Go/TypeScript surface at `362e0798ac3a8bd04bd2da556044b6ec73bf468a`.
+Recorded shared corrections and postbaseline regressions supplement the frozen
+inventory without changing its identity.
 The language-neutral specification and shared corpus define behavior. Existing cores
 provide implementation patterns, never authority over the spec. Ruby's frozen surface
 is not a scope limit.
@@ -14,8 +19,9 @@ It cannot call another engine, run SQL subprocesses, or transpile engine logic.
 Tests, conformance, code generation and benchmarks require explicit `swift-native:*`
 mise tasks. No normal task depends on Swift, and this experiment adds no website
 documentation, generated website references or live panels. Local examples and reports
-live with the package. The experiment freezes on completion; future features do not
-update it, and production delivery/promotion requires a separate decision.
+live with the package. This snapshot is frozen: future supported-core features do not
+update it automatically. Further work requires explicit authorization; production
+delivery and promotion require separate decisions.
 
 Development and verification target Linux x86-64. Swift 6.4.2 is installed through
 Swiftly in the current checkout environment. Keep host OS code isolated for eventual
@@ -41,9 +47,14 @@ they must not swap in engine-owned result collection or evade accounting checkpo
 Independent review covers durability, crypto, accounting and adapters, followed by
 integrated tests. Review alone does not establish conformance.
 
-After correctness, preserve a release-build performance baseline, measure optimization
-against matching supported-core workloads, and retain checksums, dataset/durability
-settings, toolchain/hardware, warmup and exact commands. No parity claim without data.
+The completed release baseline and optimization comparison each cover all 143
+workloads, four cores and three rounds, with matched checksums and row counts.
+[BENCHMARKS.md](../../impl/swift-native/BENCHMARKS.md) retains source and actor identities,
+dataset/durability settings, toolchain/hardware, warmup, exact commands, raw-result
+locations and the comparison's limits. Its workload-specific findings are not a
+universal parity claim or a production delivery decision. Postoptimization checks
+and their actor mapping are recorded separately in VERIFICATION.md; earlier actors
+are not silently credited with testing later edits.
 
 ## Implementation boundaries
 
@@ -93,9 +104,10 @@ thread-affine where their underlying Session, Rows or PreparedStatement is.
 
 ## Progress and ownership
 
-The durable [progress record](../../impl/swift-native/PROGRESS.md) records slices,
-commands/results, failures and next steps. The primary agent owns architecture,
-integration, public boundaries and final verification. Delegated work has disjoint
-file ownership and agreed interfaces. Commits use `codex/swift-native-experiment`;
-they are local-only unless explicitly pushed. No master merge or package publication
+The durable [progress record](../../impl/swift-native/PROGRESS.md) preserves the
+implementation history, commands/results, failed attempts and later corrections.
+[VERIFICATION.md](../../impl/swift-native/VERIFICATION.md) and
+[BENCHMARKS.md](../../impl/swift-native/BENCHMARKS.md) are the final acceptance and
+measurement records for this freeze. Commits on `codex/swift-native-experiment`
+remain local-only unless explicitly pushed. No master merge or package publication
 is part of this task. Existing unrelated `tasks/memory` files are preserved.

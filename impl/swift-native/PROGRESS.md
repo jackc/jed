@@ -1,10 +1,64 @@
 # Swift experiment progress
 
-Status: **Linux correctness acceptance passes; performance work remains**. Baseline:
+Status: **Frozen experimental snapshot; required Linux acceptance and measured
+optimization are complete.** Semantic baseline:
 `362e0798ac3a8bd04bd2da556044b6ec73bf468a` (2026-11-05).
 Branch: `codex/swift-native-experiment`, local-only, not pushed.
 
-## Current performance checkpoint (2026-11-06 11:45 CST)
+## Completed experiment (2026-11-06)
+
+The frozen implementation revision is
+**cec8170bfc33f087fa98949ae661b1eaa5490218**. The [verification report](VERIFICATION.md)
+maps completed Linux gates to their actual actors and source identities; the
+[benchmark report](BENCHMARKS.md) records the complete before/after comparison,
+methodology, slower workloads and measurement limits. The scope and host/tool
+matrices contain no remaining required Linux implementation omission. Apple
+platforms remain unbuilt and untested. Swift remains opt-in, outside default
+tasks and future lockstep updates; promotion and production delivery remain
+separate decisions. No merge, push or package publication was performed.
+
+Postoptimization acceptance passes **515 native tests and all 749 frozen SQL
+files**, **241,412 exact resource measurements**, **77,612 encrypted records**,
+**2,691 interchange phases**, and **18 saved traces per core / 54 transcript
+comparisons / 153 independently checked Swift images**, all with zero failures.
+The [compact evidence archive](results/verification-postoptimization-20261106/manifest.json)
+retains exact actor/resource identities and original logs; manifest SHA-256 is
+`2be0039648767a32276d6a5675f1ca160994e9f6bcd3cc2ca32c9f60a60d4762`.
+The separate Linux CLI PTY check passes correct, wrong and empty passphrases,
+with actual ECHO disabled, exact terminal restoration and unchanged database
+copies. Its actor is
+`887b902725495e796643f4f19cf31406f3aeea8ce1fa1fc9c212c27c59d3588f`;
+see [integrity acceptance](Tools/INTEGRITY_PLAN.md). Earlier process, generated
+simulation, service and stress gates remain explicitly preoptimization evidence.
+
+Both full release benchmarks pass **143 workloads × four cores × three rounds**,
+12/12 runs each, with matching logical results and zero failures. Baseline source
+is `76f4c4c866ddf04f01a9b7d38f6e0b7573c592c6`; the after capture observes
+`afbde4c6d2e87e5d3405e228ea233e7012eb209d`, which differs from the optimized
+implementation only in this progress document. Swift benchmark actors are
+`44a127af9e7891bb245e846fa38edd3cb1a186c3be6c90267365407ff39d3aa7`
+before and `e33fd8a85db9193a84e9d6a0ae7a2531bd69bb2297dabda48dbc019133325d1f`
+after. Retained runs are `results/benchmark-baseline-20261106` and
+`results/benchmark-after-20261106`; strict comparison is
+`results/benchmark-comparison-20261106`. Commands and complete provenance are in
+the benchmark report. Independent raw-result review agrees with all 143 workload
+signatures, all 1,144 medians and all 11 category groups.
+
+Measured full-scan aggregate time falls from **1,119.919 to 217.729 ms (5.1436×)**;
+full-scan min/max falls from **1,227.483 to 284.925 ms (4.3081×)**. Across all
+143 workloads, the equal-weight geometric mean of before/after ratios is
+**1.0325×**: 100 Swift medians are faster and 43 slower. Final Swift/peer geometric
+means are **9.1990× Rust, 7.5125× Go and 2.1292× TypeScript**. Three rounds and
+observed peer drift do not establish statistical significance or performance
+parity. All slower medians, including substantial percentage changes on small
+operations, remain in the committed CSV and report.
+
+No implementation or required verification work remains queued. The historical
+checkpoints below preserve unsuccessful attempts and their resolutions; their
+then-pending work is superseded by this completed checkpoint and the final
+reports. Unrelated `tasks/memory/` work remains untouched.
+
+## Historical performance checkpoint (2026-11-06 11:45 CST)
 
 The complete preoptimization release baseline passed: **143 workloads × four
 cores × three rounds**, all 12 runs complete, zero failures. Values, row counts,
@@ -71,7 +125,7 @@ remain outstanding. The strict opt-in report task is committed locally as
 
 ## Preoptimization correctness acceptance (2026-11-06 07:04 CST)
 
-**Latest release acceptance is green:** all **509 native tests and 749 frozen SQL
+**Preoptimization release acceptance is green:** all **509 native tests and 749 frozen SQL
 files** pass, with 21,597 records, 39,148 cells, 2,271 cost / 1,154 name / 100 type
 assertions and five host actions. There are zero SQL failures, blocked files or
 aborted host controls. Command:
@@ -111,6 +165,11 @@ The successful preoptimization evidence is also retained durably in
 `impl/swift-native/results/verification-preoptimization-20261106`: 50 reports,
 logs and TSVs, 10.86 MiB, with a complete per-file hash manifest. Manifest SHA-256:
 `f5aa79e7f6e4213f7cb088a5ffdb883a1e01b9be889224c5417638f35c4a2f00`.
+
+### Prior attempts superseded by the acceptance above
+
+The following checkpoints retain their original failure and pending-work wording
+as an audit trail. They do not describe the final state of the experiment.
 
 Local-only integration commit **33a0add5** records the reviewed engine, host APIs,
 fixtures and opt-in runners; **40d15151** records the shared Go float metadata

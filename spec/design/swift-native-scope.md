@@ -4,8 +4,10 @@ Durable preoptimization evidence is preserved in the ignored ext4
 [verification archive](../../impl/swift-native/results/verification-preoptimization-20261106/manifest.json):
 50 successful report/log/TSV files, 11,386,296 bytes, with original paths and
 SHA-256 hashes in its manifest. Originals remain intact; binaries and simulation
-images are excluded. The complete correctness matrix passes; only performance
-baseline/optimization/reporting remains outstanding.
+images are excluded. This archive remains preoptimization evidence; the final
+actor-specific correctness and measured comparison are recorded in
+[VERIFICATION.md](../../impl/swift-native/VERIFICATION.md) and
+[BENCHMARKS.md](../../impl/swift-native/BENCHMARKS.md).
 
 This is the acceptance inventory for the explicitly requested independent Swift
 experiment under `impl/swift-native`. The target is the supported Rust, Go, and
@@ -15,18 +17,21 @@ frozen Ruby experiment's coverage. Inventory date: **2026-11-05**.
 The language-neutral contracts and corpus are authoritative. Existing cores are
 implementation-pattern evidence, not reference implementations. The inventory
 was recorded before implementation with every target marked U.
-The current audit below reconciles those rows to the handwritten implementation
-and completed gates as of **2026-11-06**. The experiment is still **in progress**:
-only the preserved performance baseline, measured optimization and final
-performance report remain outstanding. Full exact-account acceptance now passes. Direct shared diagnostic
-acceptance and its
-RETURNING/GIN/deep-view follow-up now pass. A subsequent guard audit found a
-reachable view-definition gap for set-returning and JSON_TABLE sources; its
-reviewed correction passes its 41-record/23-cell regression in memory and disk.
-The fourth release refresh passes all 509 native tests and all 749 SQL files.
-The prior handoff/client and old-pin assertions are resolved; their failed logs
-remain preserved. Default CI also passes its canonical 18/18 retry.
-The experiment is neither complete nor frozen.
+The completed audit reconciles those rows to the handwritten implementation and
+recorded Linux gates. The experiment is frozen at
+`cec8170bfc33f087fa98949ae661b1eaa5490218`; the semantic baseline above is unchanged.
+The final [verification report](../../impl/swift-native/VERIFICATION.md) maps each
+acceptance gate to its tested actor, and the [benchmark report](../../impl/swift-native/BENCHMARKS.md)
+records the complete release baseline, optimization comparison and measured limits.
+The optimized release run passes all 515 native tests and all 749 frozen SQL files.
+Direct diagnostics, exact accounting and affected postoptimization checks pass as
+recorded there. The separately corrected view-source regression passes 41 records
+and 23 cells in memory and disk. Earlier handoff/client/old-pin failures and their
+corrections remain below; default CI passes its canonical 18/18 retry.
+
+Swift remains experimental and opt-in, excluded from default tasks and automatic
+future feature maintenance. Apple platforms are unverified, production delivery
+and promotion are undecided, and no package publication or push is implied.
 
 The companion [host and runner matrix](swift-native-host-matrix.md) specifies the
 embedding, process, and test-adapter obligations in greater detail. Progress and
@@ -34,19 +39,20 @@ verification evidence must update these matrices without moving the baseline.
 When later work changes a row to verified, record the implementation path, exact
 opt-in command, result, platform, and revision; preserve failed/remaining lanes.
 
-### Current evidence and state legend (2026-11-06)
+### Frozen evidence and state legend
 
 Implementation remains on local-only branch `codex/swift-native-experiment`.
 The platform exercised is Linux x86-64, Swift 6.4.2. The
 [verification report](../../impl/swift-native/VERIFICATION.md) and
 [progress record](../../impl/swift-native/PROGRESS.md) retain exact commands,
-logs, actor hashes, failures and later corrections. Current state abbreviations
-below distinguish evidence from final completion:
+logs, actor hashes, failures and later corrections. The benchmark report records
+measured results separately from correctness. State abbreviations distinguish the
+following contracts; none broadens the frozen baseline:
 
 - **O** — implemented; its shared SQL tests were included in the successful
-  whole frozen run. The sixth run passed all 749 files and 21,597 executed
-  records; an earlier release run passed all 505 native tests. The latest
-  509-test refresh passes the same SQL corpus with zero native failures.
+  whole frozen run. The optimized release run passes all 515 native tests,
+  including all 749 files and 21,597 executed SQL records. Earlier passing
+  505-/509-test runs retain their own source and actor identities.
   O does not cover combinations absent from those files or claim that
   SQLSTATE-only checks cover structured diagnostic fields. The view-source
   correction has its own postbaseline regression evidence.
@@ -66,11 +72,14 @@ below distinguish evidence from final completion:
   Earlier debug/release runs each had 376 GiST-load differences; the integrated
   supported-core correction resolves them. Earlier stack/socket failures and
   the stale private Rust manifest incident remain historical evidence.
-- **P** — performance is unmeasured. The release harness is reviewed and compiled,
-  all 143 workloads inventoried, and canonical data generated. Correctness must
-  pass before preserving a release baseline and measuring optimization.
+- **P** — the release baseline and optimization comparison are measured for all
+  143 workloads, four cores and three rounds. BENCHMARKS.md records commands,
+  provenance, checksums, row counts, results and limits. P does not mean universal
+  performance parity or select production Swift delivery.
 
-**Every O/H row still requires final integrated refresh after dependent edits.**
+Final affected-path verification is mapped to actors in VERIFICATION.md.
+Preoptimization checks below retain their original scope; any explicitly
+requested future edits require appropriate revalidation.
 V07's additional Swift-client/Rust-pages combination passes both frozen
 plaintext/encrypted stream scenarios (`/tmp/jed-swift-native-process-rust-stream.log`).
 The prior 496-pair matrix uses Swift pages for Swift/Go/Node clients; Rust clients
@@ -82,19 +91,25 @@ The final generated release sweep also passes all 176 traces per core,
 (`/tmp/jed-swift-sim-sweep-20261106-2104641-awof5y/summary.json`).
 No required Linux omission is reclassified as an exclusion. Apple platforms remain
 unverified. States apply to the exact row contract; D records direct diagnostic
-evidence; A now records completed exact accounting, while P remains outstanding.
+evidence; A records completed exact accounting, and P records measured performance
+with the workload and host limits in BENCHMARKS.md.
 
-| Completed gate | Evidence and scope | Remaining obligation |
+### Preserved preoptimization checkpoints
+
+These counts and actor identities preceded the optimized snapshot. The final
+postoptimization gate map is in VERIFICATION.md; no historical actor is relabeled.
+
+| Completed gate | Evidence and scope | Later evidence / scope boundary |
 |---|---|---|
 | Full ordinary/native | Sixth SQL run: all 749 files, 21,597 records, 39,148 cells, 2,271 cost / 1,154 name / 100 type assertions pass. The earlier release suite passed all 505 native tests, including the corrected GIN boundary and all 749 SQL files | Fourth release refresh passes all 509 native tests and all 749 SQL files; recheck affected paths after any later edits |
 | Active-account repairs | Current complete debug and release memory lanes: 21,477 records per core each, zero exact differences; three prior residuals also match all four cores in all three modes | A passes: corrected full release matrix has 241,412 exact measurements, zero failures, complete_matrix=true and all 12 runs complete |
 | Encrypted / service SQL | Refreshed 77,612 encrypted records across four cores pass; refreshed 116,628 service records in all six Swift/peer client-owner directions pass | Service actor refresh passes all six directions; new postbaseline files require their own supported-core checks |
 | Bytes / interchange | Shared vector consumers; refreshed 112 images and all 2,691 interchange phases pass; 246 coercion captures and 23 estimator vectors pass | Refresh affected paths if subsequent changes warrant it; view-source SQL/diagnostic checks pass |
-| Structured diagnostics | Final 42-native-test gate passes all 407 shared cases, 10 object-field cases, 20 runtime probes, four RETURNING cases, GIN boundary and three SQL files / 78 records including unchanged deep-view | Recheck dependent diagnostics if the view-source correction changes them |
+| Structured diagnostics | Final 42-native-test gate passes all 407 shared cases, 10 object-field cases, 20 runtime probes, four RETURNING cases, GIN boundary and three SQL files / 78 records including unchanged deep-view | Later full release suites include these checks; actor-specific results are in VERIFICATION.md |
 | Public integrity | 24 damaged images / 50 exact API reports; 112 goldens with 108 opens and four exact refusals; native/remote API and 61 CLI probes pass | Fresh saved release simulations pass 18/54/153; final generated release sweep passes 176 per core/459 comparisons/7,049 checked Swift images |
 | Concurrency / process / simulation | Seven shared schedules; refreshed 496 mixed process cases and 18 saved traces / 54 comparisons / 153 checked images pass; refreshed generated sweep passes all 22 profiles × seeds 1–8, 176 traces per core, 459 comparisons and 7,049 images; Layer 3 stress 20,000 invariants/5,000 writes | Fresh release mixed process passes 496/496; saved simulations pass 18/54/153; Rust-pages supplement passes 2/2. Final generated release sweep passes 176 per core/459 comparisons/7,049 checked Swift images |
 | Default/oracle | Verify 17 checks and canonical shared-GiST CI retry 18/18 pass; relevant oracle corpus regenerates byte-identically | Preserve failed 16/18 attempt and default isolation; recheck affected paths after later edits |
-| Package / performance | Public examples pass; pinned package and approved native boundaries; reviewed/compiled benchmark harness | P; no parity or freeze claim |
+| Package / performance | Public examples pass; pinned package and approved native boundaries; reviewed/compiled benchmark harness | The later full measured comparison and its limitations are recorded in BENCHMARKS.md |
 
 The earlier passing CI log is `/tmp/jed-swift-native-default-ci-float-fields.log`.
 The shared-GiST attempt at `/tmp/jed-swift-native-default-ci-gist-load.log`
@@ -143,11 +158,12 @@ and corrected comparison pass. Historical release report:
 The Swift-only GiST reopen regression passes 33 records/10 cells in each of memory
 and disk. Its focused process had four service-host assertion failures, now
 resolved; `/tmp/jed-swift-native-release-gist-service-first.log` separates those
-historical outcomes. Both reviewed postbaseline regressions are now published
+historical outcomes. Both reviewed postbaseline regressions are committed locally
 under shared `ddl/views_table_functions.test` and
 `resource/query_memory_gist_reopen.test`; frozen Swift copies are unchanged.
-No performance measurements have started. Complete main logs, not the shared
-mutable progress trace, establish counts for these overlapping queued runs.
+Performance was unmeasured at these checkpoints; the completed measurement record
+is BENCHMARKS.md. Complete main logs, not the shared mutable progress trace,
+establish counts for these overlapping queued runs.
 
 The historical foundation checkpoint (2026-11-05) covered decimal/float/temporal,
 regex, Unicode and collation kernels before SQL integration. Its limited
@@ -170,7 +186,7 @@ they are superseded here by the complete ordinary run and the separate gates abo
    Apple platform builds/tests are a separate unverified lane, not a Linux blocker.
 4. Tests, tooling, benchmarks, and codegen integration are opt-in. Normal CI and
    default tasks must remain independent of Swift. No website changes are required
-   or authorized for this experiment. Freeze the completed experiment against this
+   or authorized for this experiment. The completed snapshot is frozen against this
    baseline; promotion and production Swift delivery require separate decisions.
 5. Keep the implemented/future distinction below. Historical prose in some README
    files and early slice descriptions is stale: for example encryption, timezones,
@@ -379,24 +395,24 @@ These are integration constraints, not a replacement for each subsystem's spec.
 The host matrix defines adapter details. These are independent required lanes;
 passing one does not imply any other.
 
-| Lane | Required comparison / exercised boundary | Current result / remaining gate |
+| Lane | Required comparison / exercised boundary | Verified result / scope limit |
 |---|---|---|
-| SQL memory | Every applicable suite, real prepare/query/cursor path, all directives and capabilities | O; current 21,477 records per core pass with zero exact memory differences; disk/spill A remains |
-| SQL durable | File-backed create/commit/reopen and same corpus values/types/errors/costs | O; latest 19,438 Swift disk records pass; final all-core A remains |
-| SQL spill | Tiny `work_mem`, native file spill and deterministic hash/sort replay | O/H; forced TEMP 28 files/26 actual spills pass; complete disk-spill A remains |
+| SQL memory | Every applicable suite, real prepare/query/cursor path, all directives and capabilities | O/A; all 21,477 records per core pass with exact accounting; final actor mapping in VERIFICATION.md |
+| SQL durable | File-backed create/commit/reopen and same corpus values/types/errors/costs | O/A; all 19,438 disk records per core pass with exact accounting; final actor mapping in VERIFICATION.md |
+| SQL spill | Tiny `work_mem`, native file spill and deterministic hash/sort replay | O/H/A; all 19,438 disk-spill records per core pass with exact accounting; forced TEMP separately passes 28 files/26 actual spills |
 | Query memory | Memory/disk/disk-spill account peaks, release invariants, pending writes and storage TSV parity | A verified; corrected full release passes all 241,412 exact measurements across 12 runs with complete membership and zero failures; historical GiST differences/cache incident preserved |
-| Encryption | Encrypted file mode, encrypted cost/EXPLAIN transcript parity and credentials | H; refreshed 77,612 records, zero failures; dependent view-source checks remain |
+| Encryption | Encrypted file mode, encrypted cost/EXPLAIN transcript parity and credentials | H; full 77,612-record comparison and postoptimization encrypted refresh pass; view-source checks have separate memory/disk evidence |
 | SQL via service | Same engine SQL through page-client storage against supported owners | H; refreshed 116,628 records, six directions, zero failures |
-| Shared concurrency | All seven schedules, real writer/read handles, pins/watermark/gate blocking | O/H; all 7 shared schedules pass; final actor refresh |
+| Shared concurrency | All seven schedules, real writer/read handles, pins/watermark/gate blocking | O/H; all seven shared schedules pass in the final native suite |
 | Real processes | 31 scenarios with Swift owner/client and supported-core pairings | H; refreshed 496 ordered pairings pass; exact final bytes retained |
 | Simulation | 18 regressions, seeded sweeps covering all 22 profiles, matching transcripts and crash images | H; refreshed 18 regressions / 54 comparisons / 153 images pass; refreshed generated 22 × 8 sweep passes 176 traces per core / 459 comparisons / 7,049 images |
 | Bytes | Every encoding/LZ4/crypto/wire/vector contract; all golden reads/writes and integrity reports | H; shared vectors, 112 goldens and 24 integrity/50 reports pass; diagnostic D also passes |
-| Interchange | Swift-to-each-supported-core and reverse, plaintext/encrypted, initial/incremental states | H; refreshed 112 images/2,691 phases pass; dependent view-source checks remain |
-| Host APIs | Lifecycle/prepared/cursors/cancel/environment/functions/capabilities/resources/attachments/maintenance | H/D; lifecycle/batch/settings/resource/integrity and direct diagnostics pass; A and integrated refresh remain |
-| Independent review | Storage durability, approved crypto integration, resource accounting, conformance adapters | H; completed for authored durability/crypto/resources/adapters and later corrections; continue for final edits |
+| Interchange | Swift-to-each-supported-core and reverse, plaintext/encrypted, initial/incremental states | H; all 112 images/2,691 phases and postoptimization interchange refresh pass; view-source checks have separate evidence |
+| Host APIs | Lifecycle/prepared/cursors/cancel/environment/functions/capabilities/resources/attachments/maintenance | H/D/A; lifecycle/batch/settings/resource/integrity, direct diagnostics, full exact-account comparison and final native suite pass |
+| Independent review | Storage durability, approved crypto integration, resource accounting, conformance adapters | H; independent review covers authored durability/crypto/resources/adapters, corrections and the measured optimization; final gate map in VERIFICATION.md |
 | Oracle | Relevant PG-clean corpus checks under the checkout's declared oracle profile | H; relevant shared changes checked, latest short_circuit/correlated regenerate unchanged |
 | Default gates | No implicit Swift dependency in normal CI/tests/benchmarks/codegen | H; verify 17 and latest CI 18/18 pass; default isolation retained |
-| Release performance | Correctness first, preserved baseline, matched workload/durability/checksums, measured optimization | P; 143-workload release harness reviewed/compiled, datasets generated; no measurements |
+| Release performance | Correctness first, preserved baseline, matched workload/durability/checksums, measured optimization | P; complete before/after release runs cover 143 workloads × four cores × three rounds with matching checksums/row counts; results and limits in BENCHMARKS.md |
 | Apple builds | macOS/iOS builds and tests, separately from Linux acceptance | Unverified platform; Linux scope is unaffected |
 
 
@@ -438,11 +454,13 @@ The identifiers and numeric counts below remain the mechanically enumerated
 baseline inventory. All 26 suite directories and 475 capability declarations are
 included in the successful whole frozen run (O); the 19 profiles are not used
 to narrow membership. Coverage of their assertions does not prove every allowed
-combination: the newly corrected view-source combination in D12 has separate focused evidence and awaits its dependent full release refresh. Resource capabilities marked A additionally
-need the exact all-mode accounting gate. Structured fields D are an orthogonal
-host contract, now established by the direct shared cases and host probes, not
-by the two SQL error capabilities alone. Every row
-retains the final-refresh obligation in the legend.
+combination. The corrected view-source combination in D12 has separate memory/disk
+regression evidence and is included in the subsequent full release suites.
+Resource capabilities marked A have completed the exact all-mode accounting gate.
+Structured fields D are an orthogonal host contract established by the direct
+shared cases and host probes, not by the two SQL error capabilities alone. Final
+actor-specific verification is mapped in
+[VERIFICATION.md](../../impl/swift-native/VERIFICATION.md).
 
 ### Suite files and SQL directives
 
@@ -474,7 +492,7 @@ retains the final-refresh obligation in the legend.
 | [transactions](../conformance/suites/transactions/) | 11 | 292 | 55 | O |
 | [types](../conformance/suites/types/) | 44 | 652 | 746 | O |
 | [window](../conformance/suites/window/) | 22 | 141 | 165 | O |
-| **Total** | **749** | **11,944** | **9,581** | **O/D; final refresh/A pending** |
+| **Total** | **749** | **11,944** | **9,581** | **O/D/A; final actor mapping in VERIFICATION.md** |
 
 ### Named profiles
 

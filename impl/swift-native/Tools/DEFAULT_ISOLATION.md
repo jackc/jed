@@ -1,8 +1,10 @@
 # Default-task and oracle audit
 
 Audit baseline: `362e0798ac3a8bd04bd2da556044b6ec73bf468a`.
-This is a read-only integration audit on 2026-11-06, not a claim that the full
-default CI gate was executed at this checkpoint.
+The original read-only integration audit on 2026-11-06 did not execute default
+CI itself. Subsequent verification passed all 17 default checks and all 18 CI
+steps; [VERIFICATION.md](../VERIFICATION.md) records those commands, logs and
+the resolved intermediate failures. The final freeze changes documentation only.
 
 ## Default selection remains unchanged
 
@@ -60,14 +62,18 @@ process acceptance is inferred from those negative checks.
 `mise run verify` is the exact toolchain-light default check: its 17 entries
 validate shared encoding/PRNG/corpus/page-service/file fixtures, function and
 cost/estimator data, coercion capture, and supported-core generated-file drift.
-It requires no Swift installation or SwiftPM build. Prior successful runs are
-recorded in `PROGRESS.md`; a fresh final run should follow the final spec state.
+It requires no Swift installation or SwiftPM build. The completed final run
+passes all 17 checks in `/tmp/jed-swift-default-verify-final.log`; the subsequent
+default CI also passes its verification step after the shared corrections.
 
 `mise run ci` remains the full default merge gate. It includes default
 conformance, unit/binding/CLI/migration tests, formatting/lint/typechecks,
 process and simulation checks, browser tests, and metamorphic tools. Its broader
-workload and required local services are coordinated by the parent agent; this
-audit did not launch it or silently provision browser/reference dependencies.
+workload and required local services were coordinated separately from this
+audit. The final canonical retry passes 18/18 steps in 137.9 seconds at
+`/tmp/jed-swift-native-default-ci-gist-canonical-retry.log`, without adding Swift
+to its dependencies. No browser/reference dependencies were provisioned by this
+audit.
 
 Relevant PostgreSQL checks use this checkout's mise environment without
 overriding `PGHOST` or `PGPORT`:

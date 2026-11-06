@@ -147,12 +147,17 @@ experiment, and promotion requires a separate decision. See
 [ruby-native-experiment.md](spec/design/ruby-native-experiment.md).
 
 The separately approved **native Swift experiment** (`impl/swift-native`, 2026-11-05)
-targets the entire supported Rust/Go/TypeScript surface at
+is frozen at `cec8170bfc33f087fa98949ae661b1eaa5490218`. Its semantic target remains
+the entire supported Rust/Go/TypeScript surface at
 `362e0798ac3a8bd04bd2da556044b6ec73bf468a`, not Ruby's frozen coverage. It is a
-handwritten independent Swift engine, with opt-in tooling only, Linux verification,
-and no website documentation or automatic future feature updates. Completion requires
-the full recorded conformance, host, file, crypto, process/simulation and performance
-acceptance matrix; then the experiment freezes. It neither promotes Swift into the
+handwritten independent Swift engine. Linux conformance, host, file, crypto,
+process/simulation and optimization verification are recorded in
+[VERIFICATION.md](impl/swift-native/VERIFICATION.md); the complete release
+baseline and measured comparison are in [BENCHMARKS.md](impl/swift-native/BENCHMARKS.md).
+Results apply to the recorded workloads, host and actors, not universal performance parity.
+Swift remains opt-in, outside default tasks and automatic future feature updates,
+with no website integration. The snapshot is committed locally; no push, master
+merge or package publication is implied. It neither promotes Swift into the
 differential set nor selects native versus wrapped production delivery. Apple platforms
 remain unverified until built and tested there. See
 [swift-native-experiment.md](spec/design/swift-native-experiment.md).

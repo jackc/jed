@@ -52,9 +52,11 @@ files in the same change.
   requested. Record coverage and omissions against the experiment's source revision;
   promotion to supported status requires a separate decision. See
   `spec/design/ruby-native-experiment.md` and `spec/design/swift-native-experiment.md`.
-  The Swift experiment targets the complete supported surface at its recorded baseline,
-  develops and verifies on Linux, and freezes when completed. It selects no production
-  Swift delivery strategy and adds no website docs, references, or live panels.
+  The Swift experiment is frozen at `cec8170bfc33f087fa98949ae661b1eaa5490218` against
+  its recorded semantic baseline; Linux verification and measured results are in
+  `impl/swift-native/VERIFICATION.md` and `impl/swift-native/BENCHMARKS.md`.
+  Apple platforms remain unverified. Production Swift delivery is undecided;
+  the experiment adds no website docs, references, or live panels.
 - SQL is the primary access path and every built-in capability must be reachable
   through SQL, while storage must keep room for non-SQL access paths later.
 

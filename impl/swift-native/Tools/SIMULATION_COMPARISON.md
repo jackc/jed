@@ -4,20 +4,42 @@ Durable preoptimization evidence is preserved in the ignored ext4
 [verification archive](../results/verification-preoptimization-20261106/manifest.json):
 50 successful report/log/TSV files, 11,386,296 bytes, with original paths and
 SHA-256 hashes in its manifest. Originals remain intact; binaries and simulation
-images are excluded. The complete correctness matrix passes; only performance
-baseline/optimization/reporting remains outstanding.
+images are excluded. This archive remains preoptimization evidence. Final
+actor-specific verification and the measured comparison are recorded separately
+in [VERIFICATION.md](../VERIFICATION.md) and [BENCHMARKS.md](../BENCHMARKS.md).
 
-Current refreshed acceptance (2026-11-06): all 18 saved regressions pass in
+## Postoptimization saved comparison
+
+For optimized source `cec8170bfc33f087fa98949ae661b1eaa5490218`, all four cores pass
+all 18 saved regressions. All 54 transcript comparisons pass; 612 images are
+emitted with no byte differences, and all 153 Swift images pass the independent
+checker. There are no failures or per-core-fault comparison exemptions in this saved set.
+
+- [Summary](../results/sim-regress-postoptimization-20261106/summary.json):
+  SHA-256 `f1c4857be5e421a78dd1d7171c00e56d10611b234fa16d0a0153da35a8d33462`.
+- [Manifest](../results/sim-regress-postoptimization-20261106/manifest.json):
+  SHA-256 `8cd5321e91bab8b90a2aab90e8517ce6fa1dd3422e78b507f27d9a6587e5d226`.
+- Swift actor: `b700af5d38441fb611eb6f463dfe19b94b53ad89cef0e00a8e18c7d05a420e12`.
+- Log: `/tmp/jed-swift-native-sim-regress-packed.log`.
+
+[VERIFICATION.md](../VERIFICATION.md) maps the other final affected-path gates;
+[BENCHMARKS.md](../BENCHMARKS.md) records the completed measured comparison. The
+prior generated/process evidence below retains its earlier actors; these finite
+checks are not exhaustive fault coverage or a performance measurement.
+
+## Preserved preoptimization acceptance (2026-11-06)
+
+All 18 saved regressions pass in
 all four cores, with 54 transcript comparisons and 153 independently checked
 Swift images. The generated 22-profile × eight-seed sweep also passes:
 **176 traces per core, 459 transcript comparisons, 7,049 independently checked
 Swift images, zero failures**. Its 28,196 emitted images and 23 shared per-core-
 fault comparison exemptions are retained in the report, not silently omitted.
 
-The generated summary is
+An earlier generated summary is
 `/tmp/jed-swift-sim-sweep-20261106-980401-9e3v3g/summary.json` and its manifest
 records Swift actor `40c80ea64c8eb37d78cea74192d60d59c8ea95b73645b66c399c349462894709`.
-The newest saved release regression summary is
+The preoptimization saved release regression summary is
 `/tmp/jed-swift-sim-sweep-20261106-2057112-ozakk7/summary.json`: 18 per core, 54 comparisons,
 153 checked Swift images and zero failures. Earlier saved-regression log:
 `/tmp/jed-swift-native-sim-regress-final.log`.
@@ -41,7 +63,7 @@ release simulations pass as above. The final generated release sweep passes
 all 176 traces per core, 459 comparisons and 7,049 independently checked Swift
 images at `/tmp/jed-swift-sim-sweep-20261106-2104641-awof5y/summary.json`. Its 28,196 emitted
 images and 23 explicit canonical fault exemptions remain recorded; failures
-are empty. Performance is the only remaining acceptance work.
+are empty. Performance was outstanding at this checkpoint; the completed comparison is recorded separately in BENCHMARKS.md.
 
 ## Historical comparison and corrections
 

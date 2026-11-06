@@ -184,7 +184,7 @@ Peer speedup[p,w] = M[before,p,w] / M[after,p,w]
 Geomean(R,W) = exp(sum(log(R[w]) for w in W) / count(W))
 ```
 
-The central value is the median of three round means, not a pooled median of all query samples. Whole-suite and category geometric means give one equal weight to each workload's dimensionless ratio. Category membership and median ratios are also published. Timings across unlike operation units are not summed, and long-running workloads receive no implicit extra weight.
+The central value is the median of three round means, not a pooled median of all query samples. Whole-suite and category geometric means give one equal weight to each workload's dimensionless ratio. Category membership and median ratios are also reported. Timings across unlike operation units are not summed, and long-running workloads receive no implicit extra weight.
 
 The strict comparison completed successfully with:
 

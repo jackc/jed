@@ -4,16 +4,28 @@ Durable preoptimization evidence is preserved in the ignored ext4
 [verification archive](../results/verification-preoptimization-20261106/manifest.json):
 50 successful report/log/TSV files, 11,386,296 bytes, with original paths and
 SHA-256 hashes in its manifest. Originals remain intact; binaries and simulation
-images are excluded. The complete correctness matrix passes; only performance
-baseline/optimization/reporting remains outstanding.
+images are excluded. This archive remains preoptimization evidence. Final
+actor-specific verification and the measured comparison are recorded separately
+in [VERIFICATION.md](../VERIFICATION.md) and [BENCHMARKS.md](../BENCHMARKS.md).
 
-This records the implemented storage architecture of the frozen Swift experiment,
-not a new shared storage design. The contracts are `transactions.md` §§2–3, 6–8,
+This records the implemented storage architecture at
+`cec8170bfc33f087fa98949ae661b1eaa5490218` in the frozen Swift experiment, not a new
+shared storage design. The contracts are `transactions.md` §§2–3, 6–8,
 11; `pager.md` §§2–5; `validated-cow.md` §§1–4; `memory.md` §§7–8;
 `large-values.md` §15; `gist.md` §4.1; and the v50 plain/encrypted formats.
 The dated foundation checkpoints below are history, not current omissions.
 
-Current evidence (2026-11-06): refreshed interchange passes all 112 frozen images
+Final optimized-source checks pass 515 native tests including all 749 frozen SQL
+files, 241,412 exact-account measurements, 77,612 encrypted records and all
+2,691 interchange phases over 112 fixtures plus generated histories. The saved
+simulation refresh passes all 18 traces per core, 54 transcript comparisons and
+153 independently checked Swift images. VERIFICATION.md maps their actual actors;
+BENCHMARKS.md records the measured optimization separately. The packed aggregate
+and slice-decoder changes preserve file format and storage policy.
+
+## Preserved preoptimization evidence (2026-11-06)
+
+Refreshed interchange passes all 112 frozen images
 and 2,691 phases; the process matrix passes 496 ordered pairs; saved simulations
 pass 18 traces/54 comparisons/153 checked Swift images; generated simulations
 pass 176 traces per core/459 comparisons/7,049 checked Swift images. Reports:
@@ -39,8 +51,8 @@ release mixed process passes 496/496; saved simulations pass 18 per core,
 54 comparisons and 153 checked Swift images at
 `/tmp/jed-swift-sim-sweep-20261106-2057112-ozakk7/summary.json`. The final generated release sweep
 also passes 176 traces per core, 459 comparisons and 7,049 checked Swift images
-(/tmp/jed-swift-sim-sweep-20261106-2104641-awof5y/summary.json); only performance remains
-pending.
+(/tmp/jed-swift-sim-sweep-20261106-2104641-awof5y/summary.json). Performance was still
+outstanding at that checkpoint; the completed comparison is recorded in BENCHMARKS.md.
 
 ## State and ownership
 
@@ -167,7 +179,7 @@ domain on behalf of a multi-domain coordinator.
 | Dirty-region accounting | Incremental live counts equal an independent reachability recount, including kept overflow chains, drops, rewrites, and GiST. |
 | Reuse safety | Fallback readers, manifest-only dependencies, deferred reuse, relaxed batches, and cache flights cannot observe overwritten pages. |
 | Limits and failure | Q3 net/savepoint rules and Q4 file/memory/repair/multi-root cases; no storage writes on preparation rejection; I/O failures poison and recovery selects a valid generation. |
-| Shared execution | Whole SQL, concurrency, simulation, process, integrity and interop gates have separate retained evidence. Corrected exact accounting, all 509 release native tests, fresh mixed process/saved simulations and the refreshed service SQL matrix pass. Final generated release simulations also pass; only performance remains pending. |
+| Shared execution | Whole SQL, concurrency, simulation, process, integrity and interop gates have separate retained evidence. Optimized release passes 515 native tests/all 749 SQL files, complete V04, encrypted/interchange and saved-simulation refreshes. Earlier process/service/generated-simulation gates retain their actors. Final evidence and measured results are in VERIFICATION.md and BENCHMARKS.md. |
 
 ## Implemented integration interfaces
 
@@ -296,8 +308,8 @@ Mechanical codegen verification also passed with the complete frozen corpus,
 112 database byte fixtures, Unicode source/artifact fixtures, and PRNG vectors:
 `7024bdb84a3dc257a81d965161303df5ae427f0870a4c5750dcc99432d6d7f83`.
 That checkpoint established internal storage/host behavior only. The later SQL,
-process, maintenance and migration gates are recorded separately; the current
-acceptance summary identifies the remaining failures and required reruns.
+process, maintenance and migration gates are recorded separately; the acceptance
+summary above records their later outcomes and actor-specific scope.
 
 ## Scratch record rebuild implementation
 

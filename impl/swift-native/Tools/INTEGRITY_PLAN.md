@@ -69,6 +69,30 @@ reviewed driver captures the executable before launching any probe. Evidence:
 `/tmp/jed-swift-integrity-cli-20261106-675919-qw5gej/report.json`, log
 `/tmp/jed-swift-native-integrity-cli-first.log`, executable SHA-256
 `d4f3288582f7e803b5cbbb4868db896695d9c96f8bc8a0dfe2ce933dcf3ef5d2`.
-The no-echo interactive prompt was reviewed but not driven by these file-based
-credential probes. The final full simulation/native refresh remains separate
-required evidence; these focused results do not claim completion of the experiment.
+These earlier file-based probes did not drive the interactive prompt. Final
+native/simulation acceptance is recorded separately in [VERIFICATION.md](../VERIFICATION.md).
+
+The Linux interactive no-echo caveat is now closed by a separate PTY check of the
+postoptimization release `jed-check` actor (SHA-256
+`887b902725495e796643f4f19cf31406f3aeea8ce1fa1fc9c212c27c59d3588f`). The tested
+implementation source is `cec8170bfc33f087fa98949ae661b1eaa5490218`; the later
+benchmark capture HEAD `afbde4c6` is a separate provenance fact, not the CLI's
+actor identity. The temporary mise task uses Ruby's standard-library PTY and
+io-console support, keeps the slave terminal open for observation, checks the
+exact `stty -a` ECHO flag at each live prompt, and compares the complete `stty -g`
+state before and after the child. Correct, wrong and empty passphrases all pass:
+the correct phrase exits 0 with a JSON integrity report (six pages, five rows, no
+findings; the unavailable `hosted_geo` function is explicitly skipped), while
+wrong and empty phrases exit 1 with `28P01` and the empty-passphrase usage error.
+No entered passphrase appears in captured terminal output, all three terminal
+states are restored exactly, and every child is reaped under bounded deadlines.
+Only copies of the completed generated interchange image were opened; its
+SHA-256 `121ca8f66ea92357f9d99427e29a550b5e87e61d3c4b996b10b949d047828ab0`
+and all copied database bytes remain unchanged. Script, temporary mise task,
+transcripts, terminal-state evidence and final results are retained under
+`results/cli-pty-postoptimization-20261106/verified/`, with
+`results/cli-pty-postoptimization-20261106/verified.log`. Earlier harness attempts
+are preserved beside them: Ruby's `echo?` also considers ancillary echo modes
+and therefore reported true although the actual ECHO bit was cleared
+(`8a7b` to `8a73`, with `-echo` in `stty -a`). This was a measurement correction,
+not a CLI source change. These Linux PTY results make no Apple-platform claim.

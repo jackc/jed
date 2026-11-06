@@ -4,21 +4,30 @@ Durable preoptimization evidence is preserved in the ignored ext4
 [verification archive](../results/verification-preoptimization-20261106/manifest.json):
 50 successful report/log/TSV files, 11,386,296 bytes, with original paths and
 SHA-256 hashes in its manifest. Originals remain intact; binaries and simulation
-images are excluded. The complete correctness matrix passes; only performance
-baseline/optimization/reporting remains outstanding.
+images are excluded. This archive remains preoptimization evidence. Final
+actor-specific verification and the measured comparison are recorded separately
+in [VERIFICATION.md](../VERIFICATION.md) and [BENCHMARKS.md](../BENCHMARKS.md).
 
 This audit uses **R01–R07 in `swift-native-host-matrix.md`**, not the differently
 numbered scope ledger. Baseline: `362e0798ac3a8bd04bd2da556044b6ec73bf468a`.
-Current evidence (2026-11-06) separates ordinary correctness from exact resource
-accounting. The sixth frozen SQL run passes all 749 files and 21,597 records;
+Final optimized-source verification for `cec8170bfc33f087fa98949ae661b1eaa5490218`
+passes 515 native tests including all 749 frozen SQL files. Its complete V04 refresh
+passes all 241,412 measurements with zero failures: all four cores in memory,
+disk and disk-spill, with exact peak/storage comparisons and complete membership.
+[VERIFICATION.md](../VERIFICATION.md) maps these gates to their captured actors;
+[BENCHMARKS.md](../BENCHMARKS.md) records measured performance separately.
+
+## Preserved preoptimization evidence (2026-11-06)
+
+The sixth frozen SQL run passes all 749 files and 21,597 records;
 the earlier release suite passed all 505 native tests including those files.
 The view FROM-producer correction subsequently passes its 41-record/23-cell
 regression in memory and disk and host capability checks. The latest release
 refresh passes all 509 native tests and all 749 SQL files
 (`/tmp/jed-swift-native-release-all749-eof-fourth.log`). The prior handoff/client
 and old-pin assertion failures remain preserved in their original logs; all
-are resolved in the fourth release refresh. Performance
-has not been measured. The refreshed service corpus passes all six directions
+are resolved in the fourth release refresh. Performance was unmeasured at this
+checkpoint. The refreshed service corpus passes all six directions
 and 116,628 frozen records with zero failures:
 `/tmp/jed-swift-service-corpus-20261106-1040687-2wheah/report.json`.
 
@@ -54,7 +63,7 @@ run. Default CI passes its canonical 18/18 retry. Preserve the failed evidence:
 Earlier prefix differences, stack aborts and socket-refused runs remain preserved
 as history in `../PROGRESS.md`; they are not the current result.
 
-| Row | Existing implementation and direct evidence | Remaining acceptance work |
+| Row | Existing implementation and direct evidence | Acceptance evidence / scope boundary |
 |---|---|---|
 | R01 cost | `CostMeter` captures limits, retains first crossed ceiling under saturation, shares lifetime and statement resources. `ResourceTests` cover equality, saturation, precedence and internal meters. `DatabaseBoundaryTests` cover frozen cursor cost settings and later lifetime admission. All frozen cost/resource SQL remains admitted. | All current V04 ordinary SQL mode assertions pass. All native assertions and the corrected exact-account matrix pass. H07 charge-at-open/checkpoint-on-pull behavior is resolved by actual Rust/Go/TS probes and the separately recorded narrow streaming prose correction; CursorAdmission tests pass. |
 | R02 structural limits | UTF-8 length and scalar positions, parameter/index limits, parser/expression/view expansion, regex/JSON/composite bounds are implemented. Parser/JSON/value/catalog tests cover byte and internal boundaries; unchanged depth-limit SQL plus 255-deep function and deep-view tests exposed and verified stack-frame/traversal repairs. | The complete release run and focused view-source gate pass unchanged depth limits. The fourth release refresh also passes all 509 native tests; no additional missing limit mechanism was found. |
@@ -127,10 +136,13 @@ directions, including reopened mutation and byte/checker reports. Plaintext,
 raw-key/passphrase encryption, attachments, recovery, corruption and host-function
 environments are explicit. Failed actors and missing phases fail the task.
 See [INTERCHANGE_PLAN.md](INTERCHANGE_PLAN.md) for its 2,691-phase matrix and current
-verification status. The refreshed full 112-image, 2,691-phase interchange
-matrix passes with zero failures at
-`/tmp/jed-swift-interchange-20261106-996175-9832xa/report.json`. The separate
-24 integrity images pass 50 exact API/CLI reports and 11 CLI boundary probes.
+verification status. The preoptimization full 112-image, 2,691-phase interchange
+matrix passed with zero failures at
+`/tmp/jed-swift-interchange-20261106-996175-9832xa/report.json`; the postoptimization
+refresh also passes all 2,691 phases at
+[its retained report](../results/interchange-postoptimization-20261106/report.json).
+The separate 24 integrity images pass 50 exact API/CLI reports and 11 CLI boundary
+probes; VERIFICATION.md retains their actual actors and later checks.
 
 ## Q4 forced compaction after rejected admission
 
@@ -159,8 +171,8 @@ corrected while preserving their no-write/root/high-water assertions. A new
 native boundary test checks exact reclaimed pages `[2,3,4]` after refusal and
 that an unlimited retry consumes them before growing. Independent parent review
 approved the narrow change. The subsequent 71-native-test focused gate passed
-these invariants. Both current complete active-account comparisons now agree
-on committed-storage bytes; the original 446-difference prefix report remains
+these invariants. The subsequent complete active-account comparisons agree on
+committed-storage bytes; the original 446-difference prefix report remains
 historical evidence.
 
 ## Oversized pending index entries and Q3 error timing

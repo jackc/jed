@@ -4,24 +4,37 @@ Durable preoptimization evidence is preserved in the ignored ext4
 [verification archive](../../impl/swift-native/results/verification-preoptimization-20261106/manifest.json):
 50 successful report/log/TSV files, 11,386,296 bytes, with original paths and
 SHA-256 hashes in its manifest. Originals remain intact; binaries and simulation
-images are excluded. The complete correctness matrix passes; only performance
-baseline/optimization/reporting remains outstanding.
+images are excluded. This archive remains preoptimization evidence; the final
+actor-specific correctness and measured comparison are recorded in
+[VERIFICATION.md](../../impl/swift-native/VERIFICATION.md) and
+[BENCHMARKS.md](../../impl/swift-native/BENCHMARKS.md).
 
-Audit target: **`362e0798ac3a8bd04bd2da556044b6ec73bf468a`**. This is an
-inventory of the supported Rust/Go/TypeScript surface at that revision, not a
-claim that Swift implements it. The companion [scope matrix](swift-native-scope.md)
-inventories SQL, shared data, and storage subsystems. Ruby's frozen experiment is
-not an acceptance baseline.
+Semantic audit target: **`362e0798ac3a8bd04bd2da556044b6ec73bf468a`**. The frozen
+Swift implementation is `cec8170bfc33f087fa98949ae661b1eaa5490218`. The companion
+[scope matrix](swift-native-scope.md) inventories SQL, shared data and storage;
+Ruby's frozen experiment is not an acceptance baseline. Linux acceptance and the
+complete measured optimization comparison are recorded in VERIFICATION.md and
+BENCHMARKS.md. Each gate retains its actual actor and scope. Apple platforms are
+unverified; Swift remains opt-in, outside default tasks and automatic future
+maintenance. Production delivery and promotion are undecided. Commits remain
+local-only; no push, master merge or package publication is implied.
 
-This matrix began with every row **missing**. The implementation audit below now
-links concrete sources and host tests; **implemented** does not imply the final
-cross-core acceptance refresh has passed. A row becomes **verified** only
-when the progress record names its Swift implementation, executable checks,
-commands, and results. Compiling an interface, declaring a capability, or passing
-an unrelated SQL query does not satisfy a row. Substantial rows should be split
-as their vertical slices land; retain the original identifiers for traceability.
+This matrix began with every row **missing**. It now links implementation and
+acceptance evidence for the frozen baseline. The final optimized release passes
+515 native tests including all 749 frozen SQL files. Full exact accounting,
+encrypted SQL, interchange and saved-simulation postoptimization checks are mapped
+to their captured actors in VERIFICATION.md. The complete before/after benchmark
+comparison covers 143 workloads, four cores and three rounds; BENCHMARKS.md records
+its measured scope and limits, not a universal performance or delivery claim.
+Compiling an interface, declaring a capability, or passing an unrelated SQL query
+does not establish another row's acceptance. Preserve each gate's provenance.
 
-Current checkpoint (**2026-11-06**, Linux x86-64, Swift 6.4.2): all 407 shared
+### Preserved preoptimization checkpoint
+
+These earlier counts and hashes retain their own actors; final affected-path
+verification is recorded separately above and in VERIFICATION.md.
+
+Checkpoint (**2026-11-06**, Linux x86-64, Swift 6.4.2): all 407 shared
 diagnostic cases, 10 object-field cases and 20 runtime metadata probes pass.
 The earlier normal CI passed all 18 steps after the shared Go typed-float
 correction, **local-only** commit `40d15151`. The first shared-GiST integration
@@ -50,7 +63,7 @@ integrated. The corrected complete comparison now passes without added exception
 The Swift-only GiST reopen regression passes 33 records/10 cells in each of
 memory and disk; its focused process had four service-host assertions, now
 resolved (`/tmp/jed-swift-native-release-gist-service-first.log`). The reviewed
-shared regressions are published; their frozen Swift copies remain unchanged.
+shared regressions are committed locally; their frozen Swift copies remain unchanged.
 Refreshed encrypted SQL passes 77,612 records, and refreshed interchange passes
 all 2,691 phases over 112 fixtures. These are correctness checks, not performance
 measurements.
@@ -66,8 +79,9 @@ The fresh full release process matrix passes 496/496; saved simulations pass
 (`/tmp/jed-swift-sim-sweep-20261106-2057112-ozakk7/summary.json`). The final generated release
 simulation sweep passes all 176 traces per core, 459 comparisons and 7,049
 checked Swift images, zero failures (/tmp/jed-swift-sim-sweep-20261106-2104641-awof5y/summary.json).
-Performance remains **unmeasured (P)**; exact-account acceptance **passes (A)**.
-Running lanes do not establish acceptance.
+Performance was unmeasured at this checkpoint; it is now recorded separately in
+BENCHMARKS.md. Exact-account acceptance passes (A). Running or incomplete lanes
+never establish acceptance.
 
 Logs, immutable actor hashes and commands are retained in
 [VERIFICATION.md](../../impl/swift-native/VERIFICATION.md). In particular,
@@ -153,7 +167,7 @@ The evidence column names the existing test family, generally present as
 | H04 | The total `query` operation returns a cursor for every statement; DDL, transaction control and DML without RETURNING have no columns. Command count is optional, with no-count distinct from zero. `execute` drains the same cursor and returns its command result. | api.md §§1,4; `api` tests `QueryOnNonQueryStatementIsTotal` and `RowsAffectedReportsDMLCounts` | Implemented: `Rows`, `CommandTag`, optional affected count; RowsMetadata tests and whole-file query adapter. All 749 SQL files and all 509 native tests pass in the fourth release refresh. |
 | H05 | Explicit begin/read-write/read-only, commit, rollback, scoped view/update, autocommit and SQL transaction control use one state machine. Expose idle/open/failed status; block errors poison the transaction, including errors discovered while pulling rows; savepoint rollback restores the required state. Scoped callbacks cannot terminate the transaction underneath their owner. | api.md §2.3–2.5; session.md §2.2; `api`, `session`; shared transaction/savepoint/concurrency corpus | Implemented: Session state machine, `DatabaseScopes`, savepoint/failed-block hooks; seven shared concurrency schedules and transaction corpus; scoped/session boundary tests. Included in the passing fourth release refresh of all 509 native tests; exact-account and mixed-process/saved-simulation gates also pass; the final generated release sweep also passes. |
 | H06 | Prepared statement parse/resolve/bind behavior and parameter count/types; execution on database/session/transaction; relation-scoped cache invalidation and exact binding-sensitive plans. Host NULL, integer, exact decimal, byte, date/time and recursive values obey SQL static typing. Do not substitute SQL interpolation for binding. | api.md §2.4; estimator.md §6.1; `api`, `ergonomic`; parameter and planning corpus | Implemented; focused 10 prepared and six planning-probe tests pass. Included in the passing fourth release native/SQL refresh; corrected full shared GiST accounting also passes. |
-| H07 | Cursor metadata is available without materializing all rows; values are lossless. Cost advances as rows are consumed, is final only after full drain, and remains inspectable after close. End-of-stream and terminal error remain distinguishable. Closing a prefix cancels remaining work and releases reader pins and retained allocations. | streaming.md §§4–6; `streaming`, `api`, `query_memory`, `lifetime_cost` | Implemented; three direct-cursor admission tests and one escaped-file cursor lifetime test pass. Native batching and latest whole SQL pass; exact-account acceptance and the latest service-host assertions remain separate. |
+| H07 | Cursor metadata is available without materializing all rows; values are lossless. Cost advances as rows are consumed, is final only after full drain, and remains inspectable after close. End-of-stream and terminal error remain distinguishable. Closing a prefix cancels remaining work and releases reader pins and retained allocations. | streaming.md §§4–6; `streaming`, `api`, `query_memory`, `lifetime_cost` | Verified by direct-cursor admission and escaped-file lifetime tests, native batching, the full exact-account comparison and native/service gates. Each has its own contract and actor evidence in VERIFICATION.md. |
 | H08 | Cursor captures the snapshot and execution settings required by streaming.md, keeps its pin after its session finishes when required, and does not accidentally read a newer commit. One cursor's closure must not release another cursor's or transaction's pin. Read-only cursors do not take the writer gate. | `streaming`, `shared`; `concurrency/{snapshot_isolation,watermark_refcount,storage_watermark}.test` | Implemented: `SnapshotPin`, `DomainReadBundle`, `SessionTransaction`; SessionCursor, DatabaseCore, PageServiceClient and shared watermark schedules. Included in the passing fourth release refresh of all 509 native tests; exact-account and mixed-process/saved-simulation gates also pass; the final generated release sweep also passes. |
 | H09 | Idiomatic value conversions and typed row access preserve NULL, widths, narrowing checks, exact i64/decimal, copied bytes and open-type identity. Single-row and collecting helpers propagate cursor errors and meter engine-owned collection. Swift protocols/helpers may replace reflection-specific Go and JavaScript spellings. | api.md §11; Rust `ergonomic.rs`; Go `ergonomic.go`; `ergonomic`, `query_memory` | Implemented: `ValueConversion`, `Row`, `Ergonomic`; six ergonomic host tests including finite collector/streaming budgets. Included in the passing fourth release refresh of all 509 native tests; exact-account and mixed-process/saved-simulation gates also pass; the final generated release sweep also passes. |
 | H10 | Cancellation can be requested independently from the running operation; pre-cancel, execution checkpoints, zero-row loops, batch kernels and mid-cursor cancellation return `57014`, clean up pins, preserve cost limits and restore session cancellation context. Canceled statements do not publish partial writes. | api.md §11.4; `cancellation`; Go `TestCancellationWithoutRowEmission`, `TestCancellationSamplingIndependentOfCost`, `TestCancellationRestoresSession` | Implemented: independent atomic CancellationToken, work checkpoints, cleanup; Resource, HostBatch, Session and threaded writer-admission tests. Included in the passing fourth release refresh of all 509 native tests; exact-account and mixed-process/saved-simulation gates also pass; the final generated release sweep also passes. |
@@ -171,11 +185,11 @@ The evidence column names the existing test family, generally present as
 |---|---|---|---|
 | R01 | Per-statement `max_cost` and session `lifetime_max_cost` charge the exact schedule, including cursor pulls, internal meters and errors. Admission after lifetime exhaustion and equality-at-limit aborts must match. A timeout is not a deterministic cost meter. | cost.md; `spec/cost/schedule.toml`; `cost_limit`, `lifetime_cost`, `operator_cost`, `overflow_cost`, `compressed_cost` | Implemented: Resource/Database/CursorAdmission tests and exact SQL costs. Charge-at-open/check-on-pull ambiguity resolved from all3 probes. Included in the passing fourth release refresh of all 509 native tests; exact-account and mixed-process/saved-simulation gates also pass; the final generated release sweep also passes. |
 | R02 | SQL input, parser/expression nesting, parameter index, identifier, view expansion, regex program and JSON/composite depth limits reject before unsafe recursion or excessive allocation. UTF-8 byte length must not become Swift grapheme count. | api.md §8; cost.md §7; `suites/resource/` | Implemented: unchanged depth/UTF8 limits with parser/resolver/view stack repairs; all 749 frozen SQL files and unchanged deep-view fixtures pass in debug and release. Direct diagnostics pass under H11; the fourth release refresh passes all native host tests. |
-| R03 | Finite default `max_scalar_bytes` is a cumulative logical statement allowance with frozen cursor/internal meter inheritance; covered amplification/output/scratch is checked before allocation and reports `54P04`. Non-positive values restore the default, not unlimited. | memory.md; `scalar_memory`; scalar resource corpus | Implemented: Resource/FrozenResource and scalar kernel tests; default/frozen cursor/inner meter semantics. Ordinary assertions pass in both complete V04 configurations; the separate query-account differences are tracked under R04. |
+| R03 | Finite default `max_scalar_bytes` is a cumulative logical statement allowance with frozen cursor/internal meter inheritance; covered amplification/output/scratch is checked before allocation and reports `54P04`. Non-positive values restore the default, not unlimited. | memory.md; `scalar_memory`; scalar resource corpus | Verified: Resource/FrozenResource and scalar kernel tests cover default/frozen cursor/inner meter semantics. Ordinary assertions and exact-account comparisons pass in the complete corrected V04 matrix; prior differences remain under R04. |
 | R04 | `max_query_memory_bytes` charges live Q1 row buffers/engine collectors, Q2 operator/spill state and Q3 pending record versions on the shared logical schedule; reserve before allocating, release exactly once, and preserve pending holds between statements. Report `54P05`, compare exact peaks, detect under-release/over-release. | memory.md; `spec/cost/memory_sizes.toml`; `query_memory`, `memory_sizes`; resource corpus and query-memory peak runner | Verified: corrected full release V04 passes 241,412 measurements with zero peak/storage differences, complete_matrix=true and all 12 runs complete. Earlier 376 GiST-load differences and the cache incident remain historical evidence; see RESOURCE_ACCEPTANCE. |
 | R05 | File cache is evict-only under `cache_bytes`, with at least one leaf, no semantic/cost change and no query failure. `work_mem` drives bounded external sort/hash/group/distinct spill; a query-account refusal spills earlier when possible. Real disk scratch, failure cleanup, ordered replay and identical cost are required. | pager.md; spill.md; `spill`, `blocking_spill`, `query_memory`; forced-spill corpus | Implemented and verified: bounded native/sealed spools, hash stores, sort/joins/aggregate/dedup; Spill*, ExternalSort and BlockingOperator tests. Corrected disk-spill passes all 19,438 records per core with exact peaks/storage; forced TEMP also passes. |
 | R06 | TEMP residency (`temp_buffers`) differs from retained temporary storage (`max_temp_storage_bytes`, `54P03`); spill preserves values/errors/cost and ON COMMIT behavior. Encrypted handles seal scratch under the scratch policy. | temp-tables.md; encryption.md §6; Go/TS `temp_spill`, `temp_blockstore`, `temp_on_commit`; resource temp corpus | First complete forced-TEMP gate passed:28 files,1255 records,26 actual scratch files. TemporaryDomain and temp host tests cover lifecycle. Included in the passing fourth release refresh of all 509 native tests; exact-account and mixed-process/saved-simulation gates also pass; the final generated release sweep also passes. |
-| R07 | Database/attachment-owned `max_storage_bytes` checks memory committed pages or file live pages before writes, with exact persisted live-page deltas and `54P06`. Setter and `storage_bytes(name)` do not mistake physical file size, dead pages or free list for live storage. | memory.md §8; `storage_memory`; resource/storage and process/storage_limit corpus | Implemented: StorageDomain/DomainCommitGroup no-write admission and allocator retention tests; process storage_limit passed. Committed-storage bytes agree in both complete debug and release V04 matrices; their query-peak differences remain separate under R04. |
+| R07 | Database/attachment-owned `max_storage_bytes` checks memory committed pages or file live pages before writes, with exact persisted live-page deltas and `54P06`. Setter and `storage_bytes(name)` do not mistake physical file size, dead pages or free list for live storage. | memory.md §8; `storage_memory`; resource/storage and process/storage_limit corpus | Verified: StorageDomain/DomainCommitGroup no-write admission and allocator retention tests; process storage_limit passed. Committed-storage bytes and query peaks agree in the corrected complete V04 matrix; prior differences remain under R04. |
 | S01 | Attach/detach memory and file databases with exact name resolution, read-only flags, per-file credential/storage settings and one environment. Capture all participating roots consistently; allow only one durable written domain per transaction; take writer gates in real-path byte order. | attached-databases.md; `attach`; shared attach/concurrency/process suites | Implemented: DatabaseDomains, per-domain roots/group commit and target validation; shared attachment/concurrency/process corpus and domain host tests. Included in the passing fourth release refresh of all 509 native tests; exact-account and mixed-process/saved-simulation gates also pass; the final generated release sweep also passes. |
 | S02 | Compact a selected database/attachment through the storage seam, with correct gate/pin exclusions, same rows and cost, and durable rename/directory-sync ordering. Close/reopen and mid-operation failure do not publish a partial replacement. | api.md §2.6; `compact`, `reclaim_compaction`; process/compact and sim compaction traces | Implemented: DatabaseMaintenance/DomainRebuilder, attachment routing; Maintenance/AttachmentMaintenance tests and simulation/process replacement histories. Included in the passing fourth release refresh of all 509 native tests; exact-account and mixed-process/saved-simulation gates also pass; the final generated release sweep also passes. |
 | S03 | Integrity check produces the shared finding kinds/order and truncation/completeness behavior across structural, key/index and optional constraint checks; supports cancellation and does not mutate the database. Unavailable host definitions are reported/skipped only as specified. | api.md §2.7; integrity-check.md; Rust `integrity_check`; Go/TS `integrity`; `spec/integrity/` fixtures | Implemented and independently reviewed. Focused gate passes all 24 frozen damaged images/50 exact reports,108 opening goldens/4 exact refusals, local host and real encrypted/plaintext page-client API tests. CLI passes50 reports+11 boundary probes. The generated integrity-hook refresh passes 176 traces per core and independently checks 7,049 Swift images. The fourth release refresh passes all 509 native tests; fresh process/saved-simulation gates pass; the final generated release sweep also passes. |
@@ -199,8 +213,9 @@ The evidence column names the existing test family, generally present as
 
 ## 5. Proposed Swift interfaces and ownership boundaries
 
-These are implementation recommendations for the experiment; exact spelling can
-change without changing the acceptance rows.
+These are the original implementation recommendations. Their illustrative names
+are not an alternate public API: the package README and source describe the frozen
+Swift interfaces. Acceptance is established by the independent rows and checks.
 
 Use a SwiftPM library product `Jed` with handwritten modules separated by responsibility:
 `Value`/`SQLType`/exact arithmetic; lexer/parser/resolver; estimator/planner;
@@ -249,16 +264,16 @@ commands and aliases are recorded in VERIFICATION and the individual tool plans.
 existence is not verification. Existing default task core lists stay unchanged;
 adding an explicitly selected runner registration must not add Swift to default
 `test`, `ci`, `conformance`, `sim:*` or benchmark dependencies. The completed
-experiment freezes at its recorded baseline; later supported-core features do
-not silently expand its obligations.
+experiment is frozen at its recorded implementation revision and semantic baseline;
+later supported-core features do not silently expand its obligations.
 
 | ID | Explicit Swift task / mode | Required evidence and integration | Status |
 |---|---|---|---|
-| V01 | `swift-native:build`, `swift-native:test` | Reproducible pinned SwiftPM dependency graph; Linux debug and release builds; host-only tests for H/R/S/L rows; no unapproved dependency or system crypto installation requirement. | Linux debug/release package and all targets compile with the pinned graph. Fourth release refresh passes all 509 native tests and all 749 SQL files with zero failures. Performance remains unmeasured. |
+| V01 | `swift-native:build`, `swift-native:test` | Reproducible pinned SwiftPM dependency graph; Linux debug and release builds; host-only tests for H/R/S/L rows; no unapproved dependency or system crypto installation requirement. | Linux debug/release package and all targets compile with the pinned graph. Optimized release passes all 515 native tests including all 749 SQL files. Actor-specific final verification is in VERIFICATION.md; measured results are in BENCHMARKS.md. |
 | V02 | `swift-native:conformance` | All baseline SQL in each applicable memory/disk mode, plus the seven canonical in-memory concurrency schedules (the shared disk runner excludes schedule files); baseline capability coverage ledger; every missing capability and file counted as a failure for completion rather than silently skipped. | Sixth full SQL passes 749 files / 21,597 records / 39,148 cells. Earlier release suite: 505 native tests pass, including the corrected GIN boundary and all 749 SQL files. The SRF/JSON_TABLE view-source correction outside frozen assertions passes 41 records/23 cells in both memory and disk plus host capability checks; fourth release refresh passes all 509 native tests and all 749 SQL files. |
 | V03 | `swift-native:spill` | All applicable disk corpus with `JED_CONFORMANCE_WORK_MEM=256`; temporary spill modes as baseline tasks exercise them; rows/errors/cost unchanged. | Complete forced-TEMP passes 28 files/1,255 records/26 actual scratch files. Corrected full work_mem=256 disk-spill comparison passes all 19,438 records per core with ordinary assertions and exact accounting. |
 | V04 | `swift-native:query-memory` | Huge-but-active account and per-record peak/main-storage TSVs for memory, disk and disk-spill; compare with supported cores using the same fixture exception as `scripts/lib/query_memory_peaks.rb`; assert complete record-key coverage separately because that comparator alone tolerates absent records. | Corrected full release passes 241,412 measurements, zero failures, complete_matrix=true and all 12 runs: 21,477 memory and 19,438 disk/disk-spill records per core. No comparator exception added. Report: /tmp/jed-swift-query-memory-20261106-1996511-bxwolu/report.json. Earlier 376 differences and the failed cached-manifest run remain preserved. |
-| V05 | `swift-native:encrypted` | Encrypted disk corpus; rows/errors unchanged; costs and EXPLAIN recorded with the baseline transcript format and compared to encrypted supported cores. Only baseline documented encrypted-mode exclusions apply. | Refreshed full four-core encrypted comparison passes 77,612 records with exact retained transcripts; dependent view-source checks remain separate. |
+| V05 | `swift-native:encrypted` | Encrypted disk corpus; rows/errors unchanged; costs and EXPLAIN recorded with the baseline transcript format and compared to encrypted supported cores. Only baseline documented encrypted-mode exclusions apply. | Full four-core encrypted comparison and the postoptimization refresh pass 77,612 records with exact retained transcripts. View-source memory/disk checks have their own evidence; final actors are recorded in VERIFICATION.md. |
 | V06 | `swift-native:service` | Shared SQL corpus runs through a real supported-core owner and Swift client, and Swift owner with supported clients. A fake local service or same-process fallback does not exercise L04. | First complete six-direction service corpus passed116628records, zero failures. Four canonical fixture-local exceptions are explicitly counted. Final actor refresh passes all six directions and 116,628 records. |
 | V07 | `swift-native:process` | Register Swift actor only for explicit `JED_PROCESS_CORES`; all applicable process scenarios across Swift↔Rust/Go/Node and Swift↔Swift, in both role orders; image checker and final byte comparisons retained. Verify pinned Rust-only serving roles separately. | The prior matrix passes 31 scenarios × 16 ordered pairings = 496 with exact final bytes. Its Swift/Go/Node clients use Swift pages; Rust clients self-launch Rust pages. Swift-client → Rust-pages remote stream coverage now passes service_stream and encrypted_stream (2/2), recorded in /tmp/jed-swift-native-process-rust-stream.log. The fresh full release 496-pair refresh also passes; these two cases supplement it. |
 | V08 | `swift-native:concurrency` | Deterministic stepped corpus plus genuine threaded gate waits and reader/writer stress with invariant/final-checksum checks. Swift Thread Sanitizer is supplemental where the installed platform supports it, never a replacement for scheduled corpus or process tests. | Seven stepped schedules plus real-thread Layer3 stress passed:20000invariants5000writertransactions, final checksum f3e75496a3111181. Included in the passing fourth release refresh of all 509 native tests; exact-account and mixed-process/saved-simulation gates also pass; the final generated release sweep also passes. |
@@ -266,8 +281,8 @@ not silently expand its obligations.
 | V10 | `swift-native:fixtures`, `swift-native:interop` | Every baseline key/value/compression/crypto/page-service fixture and file golden; Swift writes and supported cores read, supported cores write and Swift reads; mutations continue after cross-core reopen. Include encrypted keys/passphrases, attachments, recovery and host-function requirements. | Refreshed full 112-image interchange passes all 2,691 phases; shared vectors pass. Separate24 integrity images pass50 exact API and CLI reports; golden integrity and remote-client checks pass. |
 | V11 | `swift-native:oracle` | Relevant baseline PostgreSQL oracle checks through checkout mise environment, with declared oracle profile and overrides unchanged. PostgreSQL-comparable behavior only; host and file invariants use shared tests/fixtures. | Relevant oracle profile/corpus probes passed and retained in DEFAULT_ISOLATION. Final shared-correction oracle refresh only where changes warrant it. |
 | V12 | `swift-native:verify-defaults` | Existing default verification remains healthy without Swift installation or dependency resolution. Inspection must show unchanged default core/dependency lists; run applicable default gates and record infrastructure blockers distinctly. | Default verify passes 17 checks; earlier CI passed 18/18 after local-only shared fix 40d15151. The first shared-GiST attempt failed 16/18 because of formatting and a stale private Rust manifest path; the canonical retry passes 18/18 (/tmp/jed-swift-native-default-ci-gist-canonical-retry.log). Default core/dependency lists remain unchanged. |
-| V13 | `swift-native:bench` and comparison task | Correctness first, then preserved release baseline and measured optimization pass with supported-core matching workload/data/durability and checksums; record CPU, OS, Swift version, flags, warmup, samples, commands and data paths. No speed claim from SQL subset or debug/release mismatch. | Reviewed143workload harness, exact peer comparison driver and canonical local datasets are ready. No measurements yet; correctness gate remains prerequisite. |
-| V14 | Local package/examples/reports | Runnable in-memory and durable examples, bound parameters, explicit cursor cleanup, transactions and cancellation; internal design/progress/verification/benchmark records. No website docs or publication. Apple targets remain unverified until actually built/tested. | Linux public examples run successfully; design/progress/verification records present. Final benchmark/report/matrix reconciliation and freeze remain required; Apple unverified. |
+| V13 | `swift-native:bench` and comparison task | Correctness first, then preserved release baseline and measured optimization pass with supported-core matching workload/data/durability and checksums; record CPU, OS, Swift version, flags, warmup, samples, commands and data paths. No speed claim from SQL subset or debug/release mismatch. | Measured: complete release baseline and after-optimization runs each cover 143 workloads × four cores × three rounds, with matching checksums and row counts. BENCHMARKS.md records provenance, raw samples, results and limitations; no universal parity claim. |
+| V14 | Local package/examples/reports | Runnable in-memory and durable examples, bound parameters, explicit cursor cleanup, transactions and cancellation; internal design/progress/verification/benchmark records. No website docs or publication. Apple targets remain unverified until actually built/tested. | Linux public examples pass; the final verification and benchmark reports record the frozen snapshot. Swift remains opt-in, with no package publication or promotion; Apple platforms are unverified and production delivery is undecided. |
 
 ## 7. Adapter correctness review checklist
 
@@ -507,14 +522,14 @@ reported independently.
 
 ## Public embedding audit, H01–H17 (2026-11-06)
 
-This is a source/API audit against the frozen host matrix, not a declaration that
-every row is verified. The third full SQL run completed all 749 files with seven
-mismatches; the subsequent 13-file gate passed all 437 records covering those
-seven mismatches and neighbors. Host behavior still requires its own evidence.
-No SQL expectations were changed. Later integrated results and current open
-gates are recorded above; H09 now has its own implementation and host evidence.
+This audit retains the implementation evidence and earlier gate counts. The third
+full SQL run completed all 749 files with seven mismatches; the subsequent 13-file
+gate passed all 437 records covering those mismatches and neighbors. No SQL
+expectations were changed. Later complete acceptance is recorded above and in
+VERIFICATION.md; host behavior has its own checks rather than inheriting a pass
+from ordinary SQL. Earlier 509-test references below are preoptimization evidence.
 
-| Row | Implemented surface and evidence | Outstanding acceptance or concrete gap |
+| Row | Implemented surface and evidence | Acceptance evidence / scope boundary |
 |---|---|---|
 | H01 | `DatabaseFiles` provides memory/durable create, existing-file open, deserialize; `FileDatabaseHost` and `ServiceDatabaseHost` provide no-clobber publication and format/error validation. `FileHostBoundaryTests`, frozen file fixtures and process runs exercise these. | Implemented: `DatabaseFiles`, `FileDatabaseHost`; FileHost/StorageDomain/Automatic boundary tests. Included in the passing fourth release refresh of all 509 native tests; exact-account and mixed-process/saved-simulation gates also pass; the final generated release sweep also passes. |
 | H02 | `CreateOptions`, `OpenOptions`, `PageServiceOptions`, `SessionOptions` expose storage/host/session settings with explicit defaults. Work memory belongs to an explicit session in Swift. Runtime work-memory/input-length/lock-timeout properties are now implemented separately. | Implemented: `CreateOptions`, `OpenOptions`, `SessionOptions`, `PageServiceOptions`; FileHost, SessionSettingsAccess, BatchFlush, CredentialWriter tests. Included in the passing fourth release refresh of all 509 native tests; exact-account and mixed-process/saved-simulation gates also pass; the final generated release sweep also passes. |
@@ -522,7 +537,7 @@ gates are recorded above; H09 now has its own implementation and host evidence.
 | H04 | Total `query`/`queryPrepared` returns `Rows` for all statements, `execute` drains it, and `Rows.rowsAffected` distinguishes absent from zero. `RowsMetadataBoundaryTests` covers RETURNING and CTAS/DDL count presence. | Implemented: `Rows`, `CommandTag`, optional affected count; RowsMetadata tests and whole-file query adapter. All 749 SQL files and all 509 native tests pass in the fourth release refresh. |
 | H05 | Public begin/commit/rollback/view/update, SQL controls, savepoints and failed-block state share `SessionTransaction`. `DatabaseBoundaryTests`, `SessionCursorTests`, the transaction/savepoint corpus and concurrency adapter cover ownership and poisoning. | Implemented: Session state machine, `DatabaseScopes`, savepoint/failed-block hooks; seven shared concurrency schedules and transaction corpus; scoped/session boundary tests. Included in the passing fourth release refresh of all 509 native tests; exact-account and mixed-process/saved-simulation gates also pass; the final generated release sweep also passes. |
 | H06 | `PreparedStatement`, detached INSERT/SELECT blueprints, exact binding-sensitive probe/custom cache, fresh-root rebinding and memo-8 FIFO are implemented. Ten original prepared and six probe tests passed; dynamic-zone exclusion adds another host test. | The dynamic-zone exclusion test passes in the latest 509-test release log; the fourth release refresh passes all 509 native tests. All subquery/derived/CTE/temp/SRF exclusions intentionally match the frozen cache baseline; this is not an omission of general SQL execution. |
-| H07 | `Rows` supplies metadata, lossless values, cost, terminal error, explicit close, prefix cleanup and Q1 collectors. Direct full/contiguous-PK scans now charge their initial block at public open, defer fixed-only point leaf reads, and preserve one fused spillable-point fetch. Three admission tests pass. | Three actual supported-core probes established charge-at-open/checkpoint-on-pull; `BASELINE_FINDINGS.md` records setup, commands and all 15 matching observations. The narrow streaming prose correction changes no supported algorithm. Blocking/WITH/set bodies remain deferred; H16 batching and all-mode resource acceptance remain separate. |
+| H07 | `Rows` supplies metadata, lossless values, cost, terminal error, explicit close, prefix cleanup and Q1 collectors. Direct full/contiguous-PK scans now charge their initial block at public open, defer fixed-only point leaf reads, and preserve one fused spillable-point fetch. Three admission tests pass. | Three actual supported-core probes established charge-at-open/checkpoint-on-pull; `BASELINE_FINDINGS.md` records setup, commands and all 15 matching observations. The narrow streaming prose correction changes no supported algorithm. Blocking/WITH/set bodies remain deferred by design; H16 batching and all-mode resource acceptance have separate completed evidence. |
 | H08 | Snapshot pins, borrowed-writer pins, frozen `StatementServices` settings and independent row cleanup are implemented and covered by cursor/database/page-service tests plus all seven stepped concurrency files. The escaped-file test verifies two independent cold-cache cursors after their Session and external Database references are dropped. | Implemented: `SnapshotPin`, `DomainReadBundle`, `SessionTransaction`; SessionCursor, DatabaseCore, PageServiceClient and shared watermark schedules. Included in the passing fourth release refresh of all 509 native tests; exact-account and mixed-process/saved-simulation gates also pass; the final generated release sweep also passes. |
 | H09 | `ValueConversion`, `Row`, `Ergonomic` and six host tests implement typed access, exact conversions and collecting helpers. | Implemented: `ValueConversion`, `Row`, `Ergonomic`; six ergonomic host tests including finite collector/streaming budgets. Included in the passing fourth release refresh of all 509 native tests; exact-account and mixed-process/saved-simulation gates also pass; the final generated release sweep also passes. |
 | H10 | Public atomic `CancellationToken` flows through statement meters, row pulls, shared execution loops, gate waits and maintenance. `ResourceTests`, `DatabaseBoundaryTests`, prepared, service and gate tests exercise cancellation and restoration. | Implemented: independent atomic CancellationToken, work checkpoints, cleanup; Resource, HostBatch, Session and threaded writer-admission tests. Included in the passing fourth release refresh of all 509 native tests; exact-account and mixed-process/saved-simulation gates also pass; the final generated release sweep also passes. |
@@ -553,23 +568,24 @@ duplicate/unknown/empty core tokens, a wrong frozen inventory count and an empty
 scenario filter before building or running an actor. Three invalid-input mise
 probes passed; default process selection remains unchanged.
 
-## Current audit checkpoint (2026-11-06)
+## Final audit and freeze
 
-The implementation and gate statuses above supersede the initial missing-state
-inventory and historical partial milestones below it. Exact commands, actor
-hashes and retained reports live in `impl/swift-native/VERIFICATION.md` and the
-individual `Tools/*_PLAN.md` records. This audit found public integrity and
-structured error-field acceptance omissions after ordinary SQL passed; they
-were required work, not exclusions. Integrity passes its fixture, local/remote
-API, CLI and refreshed simulation gates. All 407 shared diagnostic cases,
+The completed matrix applies to `cec8170bfc33f087fa98949ae661b1eaa5490218` against the
+unchanged semantic baseline. Exact commands, source/actor hashes and retained
+reports are mapped in [VERIFICATION.md](../../impl/swift-native/VERIFICATION.md).
+The initial missing-state inventory, failed attempts and intermediate counts remain
+historical evidence. Public integrity and structured diagnostics were required
+work, not exclusions: their fixture/API/CLI checks, all 407 shared cases,
 10 object-field cases, 20 runtime probes and four RETURNING-order checks pass.
-The later view-source gap is corrected and its memory/disk regression passes.
+The view-source correction has its own passing memory/disk regression.
 
-Remaining acceptance is performance: preserve and measure the release baseline,
-complete the measured optimization pass and final performance report.
-The corrected exact-account matrix, fresh release mixed-process and both saved
-and generated simulation gates, native suite, canonical CI retry and supplemental
-Rust-pages stream combination now pass. Keep each successful gate's actor hashes; none
-is silently extended to later code. Performance remains unmeasured.
-After correctness gates pass, preserve a release baseline and complete the
-measured optimization pass before claiming completion or freezing the experiment.
+[BENCHMARKS.md](../../impl/swift-native/BENCHMARKS.md) records the complete release
+baseline and measured optimization comparison, including the actual workloads,
+provenance and limitations. Postoptimization native/SQL, exact-account, encrypted,
+interchange and saved-simulation gates cover the affected paths. Earlier complete
+mixed-process/generated-simulation, canonical default CI and supplemental Rust-pages
+checks retain their own actors; none is silently extended to later code.
+
+This is a frozen, locally committed experiment, not a package release or promotion.
+No default task or future lockstep obligation includes Swift. Apple platforms are
+unverified, and production native-versus-wrapped delivery remains a separate decision.
