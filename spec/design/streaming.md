@@ -249,10 +249,11 @@ happens and *when* cost accrues, never *what* a fully-drained query observes.**
   pre-existing scan-wide block: cursor construction performs the one fused descent, computes chain
   pages/decompression slabs, and retains the optional row for first pull. A corrupt leaf therefore
   still errors at open for that spillable case and at first pull for the fixed-only case; an external
-  value body is resolved (and can error) on first pull. A cost ceiling below the up-front block still
-  aborts at open; ceilings reached by `storage_row_read`/residual/projection still abort during
-  iteration. The direct cursor removes the former second descent/reconstruction without moving any
-  of these boundaries.
+  value body is resolved (and can error) on first pull. Charging the up-front block records a reached
+  cost ceiling without adding a new enforcement checkpoint: the first pulled row checks the meter
+  before `storage_row_read`, and residual/projection retain their existing checks. A missing point
+  or `LIMIT 0` reaches no row checkpoint and can finish with cost at or above the ceiling. The direct
+  cursor removes the former second descent/reconstruction without moving any of these boundaries.
 - **The conformance harness drains fully.** The corpus contract is a query's complete result
   multiset + total cost (compared `rowsort` where unordered — CLAUDE.md §8). The per-core harness
   therefore **drains the cursor to exhaustion, reads `cost()` after drain, and surfaces any error
