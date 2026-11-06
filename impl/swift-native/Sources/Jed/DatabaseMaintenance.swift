@@ -12,8 +12,8 @@ extension Database {
     public func compact(_ name: String = "main") throws {
         let expected = try maintenanceStorage(name)
         #if os(Linux) || canImport(Darwin)
-        if expected.kind == .file, !(host is FileDatabaseHost) {
-            throw JedError("0A000", "file host cannot atomically replace this database")
+        if expected.kind == .file, localFileHost == nil {
+            throw JedError("55006", "page clients cannot compact the database")
         }
         #else
         guard expected.kind == .memory else { throw JedError("0A000", "file replacement is unavailable") }
@@ -38,7 +38,7 @@ extension Database {
                 return replacement
             }
             #if os(Linux) || canImport(Darwin)
-            return try (host as! FileDatabaseHost).replace(source: storage, snapshot: snapshot, txid: snapshot.txid + 1,
+            return try localFileHost!.replace(source: storage, snapshot: snapshot, txid: snapshot.txid + 1,
                 codec: storage.pager.codec, keyBlock: storage.pager.selectedKeyBlock,
                 entropy: keyEntropy, environment: self.environment)
             #else
@@ -54,7 +54,7 @@ extension Database {
         guard let codec = expected.pager.codec as? EncryptedPageCodec,
               let selected = expected.pager.selectedKeyBlock else { throw JedError("28P03", "database is not encrypted") }
         #if os(Linux) || canImport(Darwin)
-        guard let host = host as? FileDatabaseHost else { throw JedError("55000", "file host cannot change credentials") }
+        guard let host = localFileHost else { throw JedError("55000", "file host cannot change credentials") }
         // Expensive KDF work and key-stream draws deliberately precede the gate.
         let replacement = try codec.rewrap(selected, credential: credential, parameters: kdf, entropy: keyEntropy)
         try core.maintenance {
@@ -73,7 +73,7 @@ extension Database {
         let expected = try maintenanceStorage(name)
         guard expected.kind == .file else { throw JedError("55000", "in-memory databases cannot be rekeyed") }
         #if os(Linux) || canImport(Darwin)
-        guard let host = host as? FileDatabaseHost else { throw JedError("55000", "file host cannot rekey this database") }
+        guard let host = localFileHost else { throw JedError("55000", "file host cannot rekey this database") }
         if credential != nil {
             guard expected.pager.pageSize >= 1024 else { throw JedError("0A000", "encryption requires pages of at least 1024 bytes") }
             guard host.scratch.sealed else { throw JedError("55000", "encrypting requires sealed scratch storage") }

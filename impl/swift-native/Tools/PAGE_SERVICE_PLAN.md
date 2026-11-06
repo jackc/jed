@@ -88,3 +88,73 @@ handoff pause follow README §6.5, not PID or timestamp leases.
 
 Parent owns integrated SwiftPM builds and checkpoint commits. Coherent draft
 source sets are staged outside Sources until a publication cue.
+
+## Verified primitive milestone
+
+The parent-owned focused run on 2026-11-05 passed all six initial page-service
+tests: the complete frozen frame/owner-record/malformed-fixture adapters, plus
+streamed delta admission, pending-floor identities, forbidden reuse, encrypted
+meta authentication under either slot, and normalized commit-resolution digests.
+The mechanical fixture fingerprint is now
+`7a1bcf53fefb01e43484e760a68d9f61faabbc0c15c35d2b1da39c4c90db8043`.
+This verifies codecs and validation primitives only. Automatic owner/client
+activation, remote publication, handoff, backup and process scenarios remain
+unimplemented at this milestone.
+
+## Automatic host and role lifetime integration
+
+The first native owner/client transport milestone passed the focused suite:
+owner framing and multiplexed gate waits, exact shared wire fixtures, delta
+validation, encrypted resealing, structural publication, client pin accounting,
+client native commit planning, and encrypted refresh. These checks do not yet
+claim automatic file election, process-corpus coverage, handoff, backup, or
+stream transport completion.
+
+The automatic host retains `FilePathClaim` while bundle handles and storage roles
+change. `DatabaseCore` gives each role a distinct epoch: an old pin cannot reduce
+a new role's count merely because both histories use the same txid, and an old
+transaction cannot commit through newly installed storage. Local physical commit
+and publication share a short exclusion boundary with role replacement; remote
+commit-status resolution stays outside that boundary so reconnecting cannot wait
+on its own commit guard. Old cached immutable leaves may finish a cursor; an old
+pager fault fails `08006`.
+
+`ServiceDatabaseHost` will supply a weak coordinator at logical begin. An owner
+checks only resident role/admission state. A disconnected client re-elects under
+its open timeout, retaining its unlocked data key and process-local path claim.
+A local writer blocks host close with `55006`; an automatic owner's remote writers
+and pins instead receive shutdown notice and the configured grace period before
+final gate acquisition, flush, descriptor close, and presence release. Yield
+admission pauses new begins while existing transactions drain; cancelled yield
+resumes those requests. This differs from generic exclusive-host close, which
+keeps its current immediate writer-gate admission.
+
+Automatic file roles (drafted for the next isolated host gate): `PageServiceOptions`
+exposes serve/preference and the five baseline grace/connection controls. One
+`FilePathClaim` outlives every native owner/client role. `DatabaseCore` retains a
+weak coordinator and a role epoch, and pauses local admission under its pin
+registry before drain. Owner queries use only resident synchronization. A native
+owner publishes its incarnation/endpoint after winning presence; a client drops
+all bundle descriptors after hello/bootstrap. Reconnection retains the unlocked
+DEK, invalidates the old pager and pins, and reopens structurally before SQL
+adoption. Lost acknowledgements resolve through the bounded owner history.
+
+The automatic-host tests launch the same already compiled XCTest binary as a
+small host-only peer. This exercises genuine distinct process path claims and OS
+locks without another build, another engine, or per-core SQL expectation copies.
+It does not replace the 31 canonical process scenarios, which still need their
+experimental runner.
+
+Post-ack maintenance preserves two boundaries. First, the service lease releases
+its read pin only after its commit has been acknowledged, retaining the exclusive
+writer token through cap flushing and maintenance. Second, maintenance makes its
+structural snapshot under the registry, prepares outside that lock, then checks
+that the role, empty reader watermark, storage identity, and base txid still
+match before any physical maintenance write. A reader or local environment
+adoption during preparation makes maintenance abandon its plan. It cannot undo
+or turn the already acknowledged client commit into an error. Serialization
+failure is similarly contained; a poisoned physical commit stops the owner.
+Structural adoption marks the SQL snapshot unvalidated, including when the txid
+already matches, so maintenance can neither consult nor bypass the owner's
+Environment. History records both the client commit and the optional next-txid
+maintenance commit, and maintenance uses the owner's current durability option.

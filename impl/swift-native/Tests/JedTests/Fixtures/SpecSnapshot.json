@@ -1,6 +1,6 @@
 {
   "baseline": "362e0798ac3a8bd04bd2da556044b6ec73bf468a",
-  "fingerprint": "7024bdb84a3dc257a81d965161303df5ae427f0870a4c5750dcc99432d6d7f83",
+  "fingerprint": "7a1bcf53fefb01e43484e760a68d9f61faabbc0c15c35d2b1da39c4c90db8043",
   "source_hashes": {
     "spec/types/scalars.toml": "8b82f81965452cf031d8fb2b91642ad5165fb7a8973421b9e333969a69874a8d",
     "spec/types/ranges.toml": "9209b33203992b39dbf2a05fc4eeb9ae7dcd56f347b80a2cc1f39c3995309aa4",
@@ -32,6 +32,8 @@
     "spec/tz/vectors/bundle.toml": "7fd87e29aeeb1a9b24c709cd68fd8aaf568b346e82413dccd17ca076159f9d6f",
     "spec/tz/vectors/tzif.toml": "746a96dac17a6913ba8cbb1327e0a5df73b33aedf3080cfcd20bdabaa7a4fb66",
     "spec/fileformat/encryption_vectors.toml": "68295024e6df842fd653fced20a5b0b9838f4cbd48e3fc829c85e78da535d067",
+    "spec/pageservice/messages.toml": "2dca139217731709156083e57a6264dd2393916b1315ef98a07d3093757eada5",
+    "spec/pageservice/fixtures.toml": "7bf94100c38448cc51abea884210b0b7ca33bd14200b1fddce7af47cfd48a961",
     "spec/regex/program_vectors.toml": "ebf3dc0441976d7e60e57f237bf404d40028dd7abd7c7e9fa09407c84d27b02c",
     "spec/regex/match_vectors.toml": "c3e8ab48b220f03780611cd7ef64e8bcf76b10143481b176e8931e24e45f368a",
     "spec/regex/similar_vectors.toml": "b48e02a66159f852b0bc2a03e1c14530f44e37fa65f7571ac98b1dd8f4820ace",
@@ -18215,6 +18217,649 @@
         "parallelism": 1,
         "key_hex": "09316115d5cf24ed5a15a31a3ba326e5cf32edc24702987c02b6566f61913cf7"
       }
+    },
+    "spec/pageservice/messages.toml": {
+      "schema_version": 1,
+      "protocol_version": 1,
+      "max_frame_length": 16777216,
+      "header_length": 9,
+      "max_read_pages_cap": 1024,
+      "max_invalidation_entries": 65536,
+      "max_reuse_pages": 65536,
+      "invalidation_window_commits": 256,
+      "endpoint_max_path_bytes": 100,
+      "owner_record_magic": "JEDOWNER",
+      "owner_record_version": 1,
+      "message": [
+        {
+          "name": "hello",
+          "code": 1,
+          "direction": "request",
+          "reply": "hello_ok",
+          "phase": 2,
+          "fields": [
+            "protocol_min:u16",
+            "protocol_max:u16",
+            "format_version:u16",
+            "flags:u8",
+            "client_name:string",
+            "credential:credential"
+          ]
+        },
+        {
+          "name": "begin_read",
+          "code": 2,
+          "direction": "request",
+          "reply": "read_begun",
+          "phase": 2,
+          "fields": [
+            "incarnation:id16",
+            "last_txid:u64"
+          ]
+        },
+        {
+          "name": "read_pages",
+          "code": 3,
+          "direction": "request",
+          "reply": "pages",
+          "phase": 2,
+          "fields": [
+            "txid:u64",
+            "indices:u32_list"
+          ]
+        },
+        {
+          "name": "end_read",
+          "code": 4,
+          "direction": "request",
+          "reply": "none",
+          "phase": 2,
+          "fields": [
+            "txid:u64"
+          ]
+        },
+        {
+          "name": "begin_write",
+          "code": 5,
+          "direction": "request",
+          "reply": "write_begun",
+          "phase": 3,
+          "fields": [
+            "incarnation:id16",
+            "last_txid:u64",
+            "lock_timeout_ms:u64",
+            "flags:u8"
+          ]
+        },
+        {
+          "name": "commit_begin",
+          "code": 6,
+          "direction": "request",
+          "reply": "none",
+          "phase": 3,
+          "fields": [
+            "txid:u64",
+            "meta:page",
+            "manifest_pages:indexed_page_list"
+          ]
+        },
+        {
+          "name": "commit_pages",
+          "code": 7,
+          "direction": "request",
+          "reply": "none",
+          "phase": 3,
+          "fields": [
+            "pages:indexed_page_list"
+          ]
+        },
+        {
+          "name": "commit_end",
+          "code": 8,
+          "direction": "request",
+          "reply": "committed",
+          "phase": 3,
+          "fields": []
+        },
+        {
+          "name": "abort",
+          "code": 9,
+          "direction": "request",
+          "reply": "none",
+          "phase": 3,
+          "fields": []
+        },
+        {
+          "name": "commit_status",
+          "code": 10,
+          "direction": "request",
+          "reply": "commit_status_reply",
+          "phase": 3,
+          "fields": [
+            "txid:u64",
+            "digest:u64"
+          ]
+        },
+        {
+          "name": "request_ownership",
+          "code": 11,
+          "direction": "request",
+          "reply": "ownership_reply",
+          "phase": 4,
+          "fields": []
+        },
+        {
+          "name": "snapshot_stream",
+          "code": 12,
+          "direction": "request",
+          "reply": "reserved",
+          "phase": 5,
+          "fields": []
+        },
+        {
+          "name": "subscribe",
+          "code": 13,
+          "direction": "request",
+          "reply": "reserved",
+          "phase": 7,
+          "fields": []
+        },
+        {
+          "name": "hello_ok",
+          "code": 65,
+          "direction": "reply",
+          "phase": 2,
+          "fields": [
+            "protocol:u16",
+            "format_version:u16",
+            "page_size:u32",
+            "connection_id:u64",
+            "flags:u8",
+            "max_read_pages:u32"
+          ]
+        },
+        {
+          "name": "read_begun",
+          "code": 66,
+          "direction": "reply",
+          "phase": 2,
+          "fields": [
+            "incarnation:id16",
+            "txid:u64",
+            "invalidate:u8",
+            "indices:u32_list",
+            "meta:page"
+          ]
+        },
+        {
+          "name": "pages",
+          "code": 67,
+          "direction": "reply",
+          "phase": 2,
+          "fields": [
+            "pages:page_list"
+          ]
+        },
+        {
+          "name": "write_begun",
+          "code": 69,
+          "direction": "reply",
+          "phase": 3,
+          "fields": [
+            "incarnation:id16",
+            "txid:u64",
+            "invalidate:u8",
+            "indices:u32_list",
+            "reuse_grant:bool",
+            "meta:page",
+            "pending:digest_list",
+            "reuse:u32_list"
+          ]
+        },
+        {
+          "name": "committed",
+          "code": 72,
+          "direction": "reply",
+          "phase": 3,
+          "fields": [
+            "txid:u64"
+          ]
+        },
+        {
+          "name": "commit_status_reply",
+          "code": 74,
+          "direction": "reply",
+          "phase": 3,
+          "fields": [
+            "status:u8"
+          ]
+        },
+        {
+          "name": "ownership_reply",
+          "code": 75,
+          "direction": "reply",
+          "phase": 4,
+          "fields": [
+            "status:u8"
+          ]
+        },
+        {
+          "name": "notice",
+          "code": 126,
+          "direction": "notice",
+          "phase": 4,
+          "fields": [
+            "kind:u8",
+            "connection_id:u64"
+          ]
+        },
+        {
+          "name": "error",
+          "code": 127,
+          "direction": "reply",
+          "phase": 2,
+          "fields": [
+            "sqlstate:sqlstate",
+            "message:string",
+            "detail:string",
+            "flags:u8"
+          ]
+        }
+      ]
+    },
+    "spec/pageservice/fixtures.toml": {
+      "schema_version": 1,
+      "frame": [
+        {
+          "name": "hello",
+          "message": "hello",
+          "request_id": "1",
+          "page_size": "0",
+          "f_protocol_min": "1",
+          "f_protocol_max": "1",
+          "f_format_version": "42",
+          "f_flags": "1",
+          "f_client_name": "jed-go",
+          "f_credential": "",
+          "hex": "00000017010000000100010001002a01000000066a65642d676f00"
+        },
+        {
+          "name": "hello_unicode_name",
+          "message": "hello",
+          "request_id": "1",
+          "page_size": "0",
+          "f_protocol_min": "1",
+          "f_protocol_max": "3",
+          "f_format_version": "42",
+          "f_flags": "0",
+          "f_client_name": "jéd",
+          "f_credential": "",
+          "hex": "00000015010000000100010003002a00000000046ac3a96400"
+        },
+        {
+          "name": "hello_passphrase",
+          "message": "hello",
+          "request_id": "1",
+          "page_size": "0",
+          "f_protocol_min": "1",
+          "f_protocol_max": "1",
+          "f_format_version": "49",
+          "f_flags": "0",
+          "f_client_name": "jed-rust",
+          "f_credential": "passphrase:correct horse",
+          "hex": "0000002a010000000100010001003100000000086a65642d72757374010000000d636f727265637420686f727365"
+        },
+        {
+          "name": "hello_key",
+          "message": "hello",
+          "request_id": "1",
+          "page_size": "0",
+          "f_protocol_min": "1",
+          "f_protocol_max": "1",
+          "f_format_version": "49",
+          "f_flags": "1",
+          "f_client_name": "jed-rust",
+          "f_credential": "key:000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+          "hex": "00000039010000000100010001003101000000086a65642d7275737402000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+        },
+        {
+          "name": "hello_ok",
+          "message": "hello_ok",
+          "request_id": "1",
+          "page_size": "0",
+          "f_protocol": "1",
+          "f_format_version": "42",
+          "f_page_size": "4096",
+          "f_connection_id": "7",
+          "f_flags": "1",
+          "f_max_read_pages": "1024",
+          "hex": "0000001a41000000010001002a0000100000000000000000070100000400"
+        },
+        {
+          "name": "begin_read_cold",
+          "message": "begin_read",
+          "request_id": "2",
+          "page_size": "0",
+          "f_incarnation": "00000000000000000000000000000000",
+          "f_last_txid": "0",
+          "hex": "0000001d0200000002000000000000000000000000000000000000000000000000"
+        },
+        {
+          "name": "begin_read_warm",
+          "message": "begin_read",
+          "request_id": "4294967295",
+          "page_size": "0",
+          "f_incarnation": "0123456789abcdeffedcba9876543210",
+          "f_last_txid": "18446744073709551615",
+          "hex": "0000001d02ffffffff0123456789abcdeffedcba9876543210ffffffffffffffff"
+        },
+        {
+          "name": "read_begun_list",
+          "message": "read_begun",
+          "request_id": "2",
+          "page_size": "256",
+          "f_incarnation": "0123456789abcdeffedcba9876543210",
+          "f_txid": "12",
+          "f_invalidate": "0",
+          "f_indices": "2,5,9",
+          "f_meta": "4a454442002a0000/00",
+          "hex": "0000012e42000000020123456789abcdeffedcba9876543210000000000000000c00000000030000000200000005000000094a454442002a00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+        },
+        {
+          "name": "read_begun_all",
+          "message": "read_begun",
+          "request_id": "3",
+          "page_size": "256",
+          "f_incarnation": "ffffffffffffffffffffffffffffffff",
+          "f_txid": "1",
+          "f_invalidate": "1",
+          "f_indices": "",
+          "f_meta": "/5a",
+          "hex": "000001224200000003ffffffffffffffffffffffffffffffff000000000000000101000000005a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a"
+        },
+        {
+          "name": "read_pages",
+          "message": "read_pages",
+          "request_id": "5",
+          "page_size": "0",
+          "f_txid": "12",
+          "f_indices": "2,3,4096",
+          "hex": "0000001d0300000005000000000000000c00000003000000020000000300001000"
+        },
+        {
+          "name": "pages",
+          "message": "pages",
+          "request_id": "5",
+          "page_size": "256",
+          "f_pages": "0201/00;/ff",
+          "hex": "0000020943000000050000000202010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+        },
+        {
+          "name": "pages_empty",
+          "message": "pages",
+          "request_id": "6",
+          "page_size": "256",
+          "f_pages": "",
+          "hex": "00000009430000000600000000"
+        },
+        {
+          "name": "end_read",
+          "message": "end_read",
+          "request_id": "6",
+          "page_size": "0",
+          "f_txid": "12",
+          "hex": "0000000d0400000006000000000000000c"
+        },
+        {
+          "name": "error_fatal",
+          "message": "error",
+          "request_id": "9",
+          "page_size": "0",
+          "f_sqlstate": "08P01",
+          "f_message": "protocol violation",
+          "f_detail": "read_pages names txid 3, which this connection has not pinned",
+          "f_flags": "1",
+          "hex": "000000627f0000000930385030310000001270726f746f636f6c2076696f6c6174696f6e0000003d726561645f7061676573206e616d6573207478696420332c207768696368207468697320636f6e6e656374696f6e20686173206e6f742070696e6e656401"
+        },
+        {
+          "name": "error_empty_text",
+          "message": "error",
+          "request_id": "0",
+          "page_size": "0",
+          "f_sqlstate": "0A000",
+          "f_message": "",
+          "f_detail": "",
+          "f_flags": "0",
+          "hex": "000000137f000000003041303030000000000000000000"
+        },
+        {
+          "name": "begin_write",
+          "message": "begin_write",
+          "request_id": "10",
+          "page_size": "0",
+          "f_incarnation": "0123456789abcdeffedcba9876543210",
+          "f_last_txid": "12",
+          "f_lock_timeout_ms": "5000",
+          "f_flags": "1",
+          "hex": "00000026050000000a0123456789abcdeffedcba9876543210000000000000000c000000000000138801"
+        },
+        {
+          "name": "write_begun",
+          "message": "write_begun",
+          "request_id": "10",
+          "page_size": "256",
+          "f_incarnation": "0123456789abcdeffedcba9876543210",
+          "f_txid": "13",
+          "f_invalidate": "0",
+          "f_indices": "7",
+          "f_reuse_grant": "true",
+          "f_meta": "4a454442/00",
+          "f_pending": "9=1311768467463790320,12=18446744073709551615",
+          "f_reuse": "4,5",
+          "hex": "0000014f450000000a0123456789abcdeffedcba9876543210000000000000000d000000000100000007014a4544420000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000200000009123456789abcdef00000000cffffffffffffffff000000020000000400000005"
+        },
+        {
+          "name": "commit_begin",
+          "message": "commit_begin",
+          "request_id": "11",
+          "page_size": "256",
+          "f_txid": "14",
+          "f_meta": "4a454442/00",
+          "f_manifest_pages": "20=08/00",
+          "hex": "00000215060000000b000000000000000e4a454442000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000010000001408000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+        },
+        {
+          "name": "commit_pages",
+          "message": "commit_pages",
+          "request_id": "12",
+          "page_size": "256",
+          "f_pages": "18=02/00;19=03/11",
+          "hex": "00000211070000000c0000000200000012020000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001303111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111"
+        },
+        {
+          "name": "commit_end",
+          "message": "commit_end",
+          "request_id": "13",
+          "page_size": "0",
+          "hex": "00000005080000000d"
+        },
+        {
+          "name": "committed",
+          "message": "committed",
+          "request_id": "13",
+          "page_size": "0",
+          "f_txid": "14",
+          "hex": "0000000d480000000d000000000000000e"
+        },
+        {
+          "name": "abort",
+          "message": "abort",
+          "request_id": "14",
+          "page_size": "0",
+          "hex": "00000005090000000e"
+        },
+        {
+          "name": "commit_status",
+          "message": "commit_status",
+          "request_id": "1",
+          "page_size": "0",
+          "f_txid": "14",
+          "f_digest": "9223372036854775808",
+          "hex": "000000150a00000001000000000000000e8000000000000000"
+        },
+        {
+          "name": "commit_status_reply",
+          "message": "commit_status_reply",
+          "request_id": "1",
+          "page_size": "0",
+          "f_status": "2",
+          "hex": "000000064a0000000102"
+        },
+        {
+          "name": "request_ownership",
+          "message": "request_ownership",
+          "request_id": "3",
+          "page_size": "0",
+          "hex": "000000050b00000003"
+        },
+        {
+          "name": "ownership_reply",
+          "message": "ownership_reply",
+          "request_id": "3",
+          "page_size": "0",
+          "f_status": "0",
+          "hex": "000000064b0000000300"
+        },
+        {
+          "name": "notice_yield",
+          "message": "notice",
+          "request_id": "0",
+          "page_size": "0",
+          "f_kind": "1",
+          "f_connection_id": "42",
+          "hex": "0000000e7e0000000001000000000000002a"
+        }
+      ],
+      "owner_record": [
+        {
+          "name": "serving",
+          "f_flags": "1",
+          "f_uid": "1000",
+          "f_incarnation": "0123456789abcdeffedcba9876543210",
+          "f_pid": "4242",
+          "f_endpoint": "/srv/app.jed.lock/uid-1000/endpoint",
+          "hex": "4a45444f574e4552000101000003e80123456789abcdeffedcba987654321000001092000000232f7372762f6170702e6a65642e6c6f636b2f7569642d313030302f656e64706f696e74e73404bb"
+        },
+        {
+          "name": "not_serving",
+          "f_flags": "0",
+          "f_uid": "0",
+          "f_incarnation": "ffffffffffffffffffffffffffffffff",
+          "f_pid": "1",
+          "f_endpoint": "",
+          "hex": "4a45444f574e455200010000000000ffffffffffffffffffffffffffffffff0000000100000000c94dd496"
+        }
+      ],
+      "malformed": [
+        {
+          "name": "length_below_header",
+          "page_size": "0",
+          "kind": "length",
+          "reason": "length 4 is below the 5-byte code + request_id minimum",
+          "hex": "0000000401000000"
+        },
+        {
+          "name": "length_above_max",
+          "page_size": "0",
+          "kind": "length",
+          "reason": "length 16777217 exceeds max_frame_length; rejected before the body is read",
+          "hex": "010000010400000006"
+        },
+        {
+          "name": "unknown_code",
+          "page_size": "0",
+          "kind": "code",
+          "reason": "0x3e names no message",
+          "hex": "000000053e00000001"
+        },
+        {
+          "name": "reserved_code",
+          "page_size": "0",
+          "kind": "code",
+          "reason": "snapshot_stream is reserved in protocol 1",
+          "hex": "000000050c00000001"
+        },
+        {
+          "name": "truncated_field",
+          "page_size": "0",
+          "kind": "truncated",
+          "reason": "end_read's txid u64 is one byte short",
+          "hex": "0000000c04000000060000000000000c"
+        },
+        {
+          "name": "trailing_bytes",
+          "page_size": "0",
+          "kind": "trailing",
+          "reason": "end_read has a byte after its last field",
+          "hex": "0000000e0400000006000000000000000c00"
+        },
+        {
+          "name": "bad_bool",
+          "page_size": "256",
+          "kind": "bool",
+          "reason": "write_begun's reuse_grant bool is 2",
+          "hex": "00000123450000000a01010101010101010101010101010101000000000000000d00000000000200000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+        },
+        {
+          "name": "bad_utf8",
+          "page_size": "0",
+          "kind": "utf8",
+          "reason": "client_name is not valid UTF-8",
+          "hex": "00000012010000000100010001002a0100000002c328"
+        },
+        {
+          "name": "list_count_exceeds_body",
+          "page_size": "0",
+          "kind": "count",
+          "reason": "a u32_list count of 0xffffffff with no entries; the count is checked before allocating",
+          "hex": "000000110300000005000000000000000cffffffff"
+        },
+        {
+          "name": "digest_list_count_exceeds_body",
+          "page_size": "256",
+          "kind": "count",
+          "reason": "write_begun pending digest_list count of 0xffffffff with no entries; the count is checked before allocating",
+          "hex": "0000012b450000000a0123456789abcdeffedcba9876543210000000000000000d000000000100000007014a454442000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000ffffffff"
+        },
+        {
+          "name": "page_list_short_page",
+          "page_size": "256",
+          "kind": "count",
+          "reason": "a page_list page shorter than page_size",
+          "hex": "0000000d430000000500000001aabbccdd"
+        },
+        {
+          "name": "bad_sqlstate",
+          "page_size": "0",
+          "kind": "sqlstate",
+          "reason": "sqlstate characters must be ASCII digits or upper-case letters",
+          "hex": "000000137f000000093038703031000000000000000001"
+        },
+        {
+          "name": "bad_credential_kind",
+          "page_size": "0",
+          "kind": "credential",
+          "reason": "hello's credential kind 3 names no credential",
+          "hex": "00000015010000000100010001003100000000046a65642d03"
+        },
+        {
+          "name": "short_credential_key",
+          "page_size": "0",
+          "kind": "truncated",
+          "reason": "hello's key credential has 31 of its 32 bytes",
+          "hex": "00000034010000000100010001003100000000046a65642d0200000000000000000000000000000000000000000000000000000000000000"
+        }
+      ]
     },
     "spec/regex/program_vectors.toml": {
       "schema_version": 1,

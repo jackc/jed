@@ -28,7 +28,7 @@ include Swift. Generated metadata is pinned to the recorded baseline Git blobs;
 updating supported cores does not refresh the experiment. Completion is followed
 by a freeze, with promotion subject to a separate decision.
 
-The current native file host supports explicit exclusive ownership. For example:
+The native file host supports explicit exclusive ownership. For example:
 
 ```swift
 let database = try Database.open("example.jed", options: OpenOptions(locking: .exclusive))
@@ -61,7 +61,10 @@ the progress record for the currently admitted SQL subset.
 export. File maintenance also exposes `changeCredential(credential:kdf:)` and
 `rekey(credential:kdf:)`; a nil rekey credential produces plaintext. Open a
 plaintext source with `scratchEncryption: .on` before encrypting it. Maintenance
-currently targets `"main"`; attachments and the automatic page-service host are
-still being implemented. The default `.automatic` locking mode reports `0A000`
-until that host is available. These experimental APIs do not change supported
+currently targets `"main"`; attachments are still being implemented. Linux's
+default `.automatic` locking mode now connects the native page-service owner/client
+host. Its multi-process verification is in progress; see the progress record for
+tested scenarios and outstanding failures. `PageServiceOptions` controls serving,
+ownership preference, grace periods, connection limits, and idle timeouts.
+These experimental APIs do not change supported
 core delivery or normal repository verification.

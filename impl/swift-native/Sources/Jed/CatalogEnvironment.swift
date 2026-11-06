@@ -31,8 +31,12 @@ internal enum CatalogEnvironment {
 
     /// CHECK dependencies deliberately do not belong here: DELETE never
     /// evaluates checks, and a missing CHECK function has ordinary 42883.
-    static func checkWritable(_ table: CatalogTable, image: CatalogImage, environment: Environment) throws {
+    static func checkTableCollations(_ table: CatalogTable, image: CatalogImage, environment: Environment) throws {
         for column in table.columns { try checkCollation(column.type.collation, image: image, environment: environment) }
+    }
+
+    static func checkWritable(_ table: CatalogTable, image: CatalogImage, environment: Environment) throws {
+        try checkTableCollations(table, image: image, environment: environment)
         for index in table.indexes.sorted(by: { $0.name < $1.name }) {
             try checkIndex(index, table: table, image: image, environment: environment)
         }

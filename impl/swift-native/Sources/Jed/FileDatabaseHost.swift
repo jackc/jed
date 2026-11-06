@@ -153,10 +153,11 @@ internal final class FileDatabaseHost: DatabaseHostLifetime {
             throw io("publish database file")
         }
     }
-    static func create(path original: String, options: CreateOptions, catalogID: UInt64, random: any RandomSource) throws -> Database {
+    static func create(path original: String, options: CreateOptions, catalogID: UInt64, random: any RandomSource,
+                       bundle supplied: FileLockBundle? = nil) throws -> Database {
         try PageEnvelope.validateSize(options.pageSize, encrypted: options.credential != nil, opening: false)
         let path = try FileLockBundle.normalize(original, creating: true)
-        let bundle = try lock(path: path, mode: options.locking, timeout: options.fileLockTimeoutMilliseconds)
+        let bundle = try supplied ?? lock(path: path, mode: options.locking, timeout: options.fileLockTimeoutMilliseconds)
         var host: FileDatabaseHost?
         var temporary: String?
         do {
@@ -172,7 +173,7 @@ internal final class FileDatabaseHost: DatabaseHostLifetime {
                 parameters: options.kdf, entropy: { try random.bytes(count: $0) })
             try publish(temporaryPath, to: path); temporary = nil
             try syncDirectory(path, skip: options.skipFsync)
-            return Database(core: DatabaseCore(storage: storage), environment: options.environment,
+            return Database(core: DatabaseCore(storage: storage, environment: options.environment), environment: options.environment,
                 maxStorageBytes: options.maxStorageBytes, keySource: random, host: owner)
         } catch {
             if let host { try? host.close() } else { bundle?.close() }
@@ -180,10 +181,12 @@ internal final class FileDatabaseHost: DatabaseHostLifetime {
             throw error
         }
     }
-    static func open(path original: String, options: OpenOptions, catalogID: UInt64) throws -> Database {
+    static func open(path original: String, options: OpenOptions, catalogID: UInt64,
+                     bundle supplied: FileLockBundle? = nil, unlockedCodec: EncryptedPageCodec? = nil,
+                     structural: Bool = false) throws -> Database {
         let path = try FileLockBundle.normalize(original, creating: false)
         if options.locking != .none { try FileLockBundle.checkHardLinks(path) }
-        let bundle = try lock(path: path, mode: options.locking, timeout: options.fileLockTimeoutMilliseconds)
+        let bundle = try supplied ?? lock(path: path, mode: options.locking, timeout: options.fileLockTimeoutMilliseconds)
         var host: FileDatabaseHost?
         var store: UnixBlockStore?
         do {
@@ -192,16 +195,16 @@ internal final class FileDatabaseHost: DatabaseHostLifetime {
                 durability: options.skipFsync ? .unsynced : .durable)
             store = device
             let storage = try StorageDomain.open(store: device, kind: .file, catalogID: catalogID,
-                cacheBytes: options.cacheBytes, credential: options.credential, readOnly: options.readOnly,
+                cacheBytes: options.cacheBytes, credential: options.credential, readOnly: options.readOnly, unlockedCodec: unlockedCodec,
                 collatedKey: { try options.environment.unicode.key($0, collation: $1) },
-                collationVerdict: { try CatalogEnvironment.verdict($0, environment: options.environment) },
-                validateCatalog: { try CatalogEnvironment.validate($0, environment: options.environment) },
+                collationVerdict: { if structural { return false }; return try CatalogEnvironment.verdict($0, environment: options.environment) },
+                validateCatalog: { if !structural { try CatalogEnvironment.validate($0, environment: options.environment) } },
                 durableDirectorySync: { try syncDirectory(path, skip: options.skipFsync) },
                 syncDirectory: { try syncDirectory(path, skip: options.skipFsync) })
             let owner = FileDatabaseHost(path: path, store: device, bundle: bundle, skipFsync: options.skipFsync,
                 sealedScratch: storage.pager.codec.reservedBytes != 0 || options.scratchEncryption == .on)
             host = owner
-            return Database(core: DatabaseCore(storage: storage), environment: options.environment,
+            return Database(core: DatabaseCore(storage: storage, environment: options.environment), environment: options.environment,
                 maxStorageBytes: options.maxStorageBytes, host: owner)
         } catch {
             if let host { try? host.close() } else { try? store?.close(); bundle?.close() }

@@ -47,10 +47,10 @@ public final class Database: Sendable {
         try host?.checkOpen()
     }
     public func session(options: SessionOptions = SessionOptions()) throws -> Session {
-        try checkOpen(); return Session(database: self, options: options, readOnly: false)
+        try checkOpen(); return try Session(database: self, options: options, readOnly: false)
     }
     public func readSession(options: SessionOptions = SessionOptions()) throws -> Session {
-        try checkOpen(); return Session(database: self, options: options, readOnly: true)
+        try checkOpen(); return try Session(database: self, options: options, readOnly: true)
     }
     public func writeSession(options: SessionOptions = SessionOptions()) throws -> Session { try session(options: options) }
     public func query(_ sql: String, parameters: [SQLValue] = [], cancellation: CancellationToken? = nil) throws -> Rows {
@@ -62,6 +62,11 @@ public final class Database: Sendable {
     public func flush() throws { try checkOpen(); try core.maintenance { try core.storage.pager.flush() } }
     public func close() throws {
         if isClosed { return }
+        if let coordinated = host as? any CoordinatedDatabaseClose {
+            do { try coordinated.closeDatabase(core); state.withLock { $0.closed = true } }
+            catch { if coordinated.isClosed { state.withLock { $0.closed = true } }; throw error }
+            return
+        }
         try core.maintenance {
             // Once close owns the gate it must release the native descriptor
             // and lock even when a previous storage failure prevents flushing.
@@ -90,6 +95,7 @@ internal final class SessionTransaction {
     private var cursors: [CursorReference] = []
     init(writer: WriterLease) { self.writer = writer; pin = nil; working = writer.snapshot }
     init(pin: SnapshotPin) { writer = nil; self.pin = pin; working = pin.snapshot }
+    func checkRole() throws { try writer?.checkRole(); try pin?.checkRole() }
     func cursorPin() throws -> SnapshotPin {
         if let writer { return try writer.pin(working) }
         return try pin!.retain()
@@ -117,10 +123,10 @@ public final class Session {
     private let readPin: SnapshotPin?
     private var closed = false
     private var scoped = false
-    internal init(database: Database, options: SessionOptions, readOnly: Bool) {
+    internal init(database: Database, options: SessionOptions, readOnly: Bool) throws {
         self.database = database
         settings = SessionSettings(environment: database.environment, options: options)
-        readPin = readOnly ? database.core.pinLatest() : nil
+        readPin = try readOnly ? database.core.beginRead() : nil
     }
     public var status: TransactionStatus { transaction.map { $0.failed ? .failed : .open } ?? .idle }
     public var isClosed: Bool { closed }
@@ -157,16 +163,17 @@ public final class Session {
         guard !closed else { throw JedError("55000", "session is closed") }
         try database.checkOpen()
     }
+    private func checkStatementRole() throws { try readPin?.checkRole(); try transaction?.checkRole() }
     private func requireClean() throws {
         if transaction?.failed == true { throw JedError("25P02", "current transaction is aborted, commands ignored until end of transaction block") }
     }
     public func begin(writable: Bool = true, cancellation: CancellationToken? = nil) throws {
-        try checkOpen(); try requireClean()
+        try checkOpen(); try checkStatementRole(); try requireClean()
         guard transaction == nil else { throw JedError("25001", "there is already a transaction in progress") }
         if writable {
             guard readPin == nil else { throw JedError("25006", "cannot set transaction read-write mode on a read-only session") }
-            transaction = SessionTransaction(writer: try database.core.acquireWriter(cancellation: cancellation))
-        } else { transaction = SessionTransaction(pin: try readPin?.retain() ?? database.core.pinLatest()) }
+            transaction = SessionTransaction(writer: try database.core.acquireWriter(cancellation: cancellation, relaxed: !database.synchronous, timeoutMilliseconds: settings.options.lockTimeoutMilliseconds))
+        } else { transaction = SessionTransaction(pin: try readPin?.retain() ?? database.core.beginRead()) }
         transaction?.savedSequences = sequenceHistory
     }
     public func commit() throws {
@@ -174,6 +181,7 @@ public final class Session {
         guard !scoped else { throw JedError("2D000", "cannot end a scoped transaction") }
         guard let active = transaction else { return }
         transaction = nil; defer { active.close() }
+        do { try active.checkRole() } catch { sequenceHistory = active.savedSequences; throw error }
         if active.failed { sequenceHistory = active.savedSequences }
         if !active.failed, let writer = active.writer {
             do {
@@ -216,8 +224,8 @@ public final class Session {
             switch statement {
             case .commit: try commit(); return emptyRows("COMMIT")
             case .rollback: try rollback(); return emptyRows("ROLLBACK")
-            case .rollbackTo(let name): try restoreSavepoint(name); return emptyRows("ROLLBACK")
-            default: try requireClean()
+            case .rollbackTo(let name): try checkStatementRole(); try restoreSavepoint(name); return emptyRows("ROLLBACK")
+            default: try checkStatementRole(); try requireClean()
             }
             let meter = try settings.newMeter(pendingBytes: transaction?.working.pendingBytes ?? 0, cancellation: cancellation)
             switch statement {
@@ -235,7 +243,7 @@ public final class Session {
                 transaction.savepoints.removeSubrange(index...)
                 return emptyRows("RELEASE", meter: meter)
             case .query(let query):
-                let pin = try transaction?.cursorPin() ?? readPin?.retain() ?? database.core.pinLatest()
+                let pin = try transaction?.cursorPin() ?? readPin?.retain() ?? database.core.beginRead()
                 do {
                     let services = StatementServices(settings: settings, meter: meter)
                     var context = services.context()
@@ -273,7 +281,7 @@ public final class Session {
             throw JedError("25006", "cannot advance a sequence in a read-only transaction")
         }
         let active = transaction
-        let writer = try active?.writer ?? database.core.acquireWriter(cancellation: cancellation)
+        let writer = try active?.writer ?? database.core.acquireWriter(cancellation: cancellation, relaxed: !database.synchronous, timeoutMilliseconds: settings.options.lockTimeoutMilliseconds)
         defer { if active == nil { writer.close() } }
         var working = active?.working ?? writer.snapshot
         let services = StatementServices(settings: settings, meter: meter)
@@ -307,7 +315,7 @@ public final class Session {
             throw JedError("25006", "cannot execute a write in a read-only transaction")
         }
         let active = transaction
-        let writer = try active?.writer ?? database.core.acquireWriter(cancellation: cancellation)
+        let writer = try active?.writer ?? database.core.acquireWriter(cancellation: cancellation, relaxed: !database.synchronous, timeoutMilliseconds: settings.options.lockTimeoutMilliseconds)
         defer { if active == nil { writer.close() } }
         var working = active?.working ?? writer.snapshot
         let services = StatementServices(settings: settings, meter: meter)

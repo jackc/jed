@@ -254,7 +254,7 @@ internal enum MetaRecovery {
         throw JedError.corruption("neither meta slot has a complete generation")
     }
 
-    static func validateManifest(_ meta: MetaPage, bytes: [UInt8],
+    static func validateManifest(_ meta: MetaPage, bytes: [UInt8], verifyBodies: Bool = true,
                                  read: (UInt32) throws -> [UInt8]) throws -> (entries: [ManifestEntry], chain: [UInt32]) {
         var entries: [ManifestEntry] = []
         var previous: UInt32 = 0
@@ -307,6 +307,9 @@ internal enum MetaRecovery {
                 (meta.freeList.index == 0 || entries.contains { $0.pageIndex == meta.freeList.index })) else {
             throw JedError.corruption("manifest identities do not match the meta")
         }
+        // The service validates manifest structure before receiving body pages;
+        // each arriving body then receives its identity check before its write.
+        if !verifyBodies { return (entries, chain) }
         for entry in entries {
             let page = try read(entry.pageIndex)
             guard page.count == meta.pageSize, Checksums.crc64(page) == entry.digest else {

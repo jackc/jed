@@ -1,3 +1,5 @@
+import Synchronization
+
 /// Catalog type references retain names until the complete type graph has been
 /// collected. Stream name order is deliberately unrelated to dependency order.
 internal indirect enum CatalogType: Sendable, Equatable {
@@ -38,13 +40,26 @@ internal struct CatalogTypeUse: Sendable {
     }
 }
 
+/// Structural service loading never parses SQL. The first ordinary use caches
+/// either the AST or its absent result; every snapshot copy shares that outcome.
+private final class CatalogExpressionCache: Sendable {
+    private struct State { var attempted = false; var value: SQLExpression? }
+    private let state = Mutex(State())
+    func parsed(_ text: SQLText) -> SQLExpression? {
+        state.withLock { state in
+            if !state.attempted {
+                state.value = try? SQLParser(utf8: text.utf8).parseExpressionOnly()
+                state.attempted = true
+            }
+            return state.value
+        }
+    }
+}
 internal struct CatalogExpression: Sendable {
     let text: SQLText
-    let parsed: SQLExpression?
-    init(_ text: SQLText) {
-        self.text = text
-        parsed = try? SQLParser(utf8: text.utf8).parseExpressionOnly()
-    }
+    private let cache = CatalogExpressionCache()
+    var parsed: SQLExpression? { cache.parsed(text) }
+    init(_ text: SQLText) { self.text = text }
 }
 
 internal enum CatalogDefault: Sendable {

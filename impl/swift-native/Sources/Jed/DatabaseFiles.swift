@@ -3,6 +3,37 @@ import Foundation
 public enum FileLocking: Sendable { case automatic, exclusive, none }
 public enum ScratchEncryption: Sendable { case automatic, on }
 
+public enum OwnershipPreference: Sendable { case prefer, yield, never }
+
+/// Native local-file coordination. Limits govern host waits and connections;
+/// they never contribute to deterministic SQL cost.
+public struct PageServiceOptions: Sendable {
+    public var serve: Bool
+    public var ownership: OwnershipPreference
+    public var yieldGraceMilliseconds: UInt64
+    public var shutdownGraceMilliseconds: UInt64
+    public var idleSessionMilliseconds: UInt64
+    public var idleWriteMilliseconds: UInt64
+    public var maxConnections: Int
+    public init(serve: Bool = true, ownership: OwnershipPreference = .prefer,
+                yieldGraceMilliseconds: UInt64 = 5000, shutdownGraceMilliseconds: UInt64 = 30_000,
+                idleSessionMilliseconds: UInt64 = 0, idleWriteMilliseconds: UInt64 = 60_000,
+                maxConnections: Int = 0) {
+        self.serve = serve; self.ownership = ownership; self.yieldGraceMilliseconds = yieldGraceMilliseconds
+        self.shutdownGraceMilliseconds = shutdownGraceMilliseconds; self.idleSessionMilliseconds = idleSessionMilliseconds
+        self.idleWriteMilliseconds = idleWriteMilliseconds; self.maxConnections = maxConnections
+    }
+    internal func validate() throws {
+        guard maxConnections >= 0 else { throw JedError("22023", "negative page-service connection limit") }
+    }
+    #if os(Linux)
+    internal var ownerLimits: PageServiceOwnerLimits {
+        PageServiceOwnerLimits(idleSessionMilliseconds: idleSessionMilliseconds,
+            idleWriteMilliseconds: idleWriteMilliseconds, maxConnections: maxConnections)
+    }
+    #endif
+}
+
 public struct CreateOptions: Sendable {
     public var environment: Environment
     public var path: String?
@@ -15,14 +46,16 @@ public struct CreateOptions: Sendable {
     public var fileLockTimeoutMilliseconds: Int64
     public var skipFsync: Bool
     public var scratchEncryption: ScratchEncryption
+    public var pageService: PageServiceOptions
     public init(environment: Environment = Environment.builder().build(), path: String? = nil,
                 pageSize: Int = 8192, cacheBytes: Int = 256 * 1024 * 1024, maxStorageBytes: Int64 = 0,
                 credential: Credential? = nil, kdf: Argon2Parameters = .default,
                 locking: FileLocking = .automatic, fileLockTimeoutMilliseconds: Int64 = 5000,
-                skipFsync: Bool = false, scratchEncryption: ScratchEncryption = .automatic) {
+                skipFsync: Bool = false, scratchEncryption: ScratchEncryption = .automatic,
+                pageService: PageServiceOptions = PageServiceOptions()) {
         self.environment = environment; self.path = path; self.pageSize = pageSize; self.cacheBytes = cacheBytes
         self.maxStorageBytes = maxStorageBytes; self.credential = credential; self.kdf = kdf; self.locking = locking
-        self.fileLockTimeoutMilliseconds = fileLockTimeoutMilliseconds; self.skipFsync = skipFsync; self.scratchEncryption = scratchEncryption
+        self.fileLockTimeoutMilliseconds = fileLockTimeoutMilliseconds; self.skipFsync = skipFsync; self.scratchEncryption = scratchEncryption; self.pageService = pageService
     }
 }
 
@@ -36,13 +69,15 @@ public struct OpenOptions: Sendable {
     public var fileLockTimeoutMilliseconds: Int64
     public var skipFsync: Bool
     public var scratchEncryption: ScratchEncryption
+    public var pageService: PageServiceOptions
     public init(environment: Environment = Environment.builder().build(), cacheBytes: Int = 256 * 1024 * 1024,
                 maxStorageBytes: Int64 = 0, credential: Credential? = nil, readOnly: Bool = false,
                 locking: FileLocking = .automatic, fileLockTimeoutMilliseconds: Int64 = 5000,
-                skipFsync: Bool = false, scratchEncryption: ScratchEncryption = .automatic) {
+                skipFsync: Bool = false, scratchEncryption: ScratchEncryption = .automatic,
+                pageService: PageServiceOptions = PageServiceOptions()) {
         self.environment = environment; self.cacheBytes = cacheBytes; self.maxStorageBytes = maxStorageBytes
         self.credential = credential; self.readOnly = readOnly; self.locking = locking
-        self.fileLockTimeoutMilliseconds = fileLockTimeoutMilliseconds; self.skipFsync = skipFsync; self.scratchEncryption = scratchEncryption
+        self.fileLockTimeoutMilliseconds = fileLockTimeoutMilliseconds; self.skipFsync = skipFsync; self.scratchEncryption = scratchEncryption; self.pageService = pageService
     }
 }
 
@@ -57,6 +92,16 @@ public struct DeserializeOptions: Sendable {
 extension Database {
     public var path: String? { host?.path }
     public var residentLeaves: Int { core.storage.pool.residentLeaves }
+    #if os(Linux) || canImport(Darwin)
+    internal var localFileHost: FileDatabaseHost? {
+        if let host = host as? FileDatabaseHost { return host }
+        #if os(Linux)
+        return (host as? ServiceDatabaseHost)?.localHost
+        #else
+        return nil
+        #endif
+    }
+    #endif
 
     public static func create(options: CreateOptions = CreateOptions()) throws -> Database {
         let catalogID = allocateCatalogID(), random = options.environment.newKeySource()
@@ -67,6 +112,11 @@ extension Database {
                 maxStorageBytes: options.maxStorageBytes, keySource: random)
         }
         #if os(Linux) || canImport(Darwin)
+        #if os(Linux)
+        if options.locking == .automatic {
+            return try ServiceDatabaseHost.create(path: path, options: options, catalogID: catalogID, random: random)
+        }
+        #endif
         return try FileDatabaseHost.create(path: path, options: options, catalogID: catalogID, random: random)
         #else
         throw JedError("0A000", "native file databases are unavailable on this host")
@@ -75,6 +125,11 @@ extension Database {
 
     public static func open(_ path: String, options: OpenOptions = OpenOptions()) throws -> Database {
         #if os(Linux) || canImport(Darwin)
+        #if os(Linux)
+        if options.locking == .automatic {
+            return try ServiceDatabaseHost.open(path: path, options: options, catalogID: allocateCatalogID())
+        }
+        #endif
         return try FileDatabaseHost.open(path: path, options: options, catalogID: allocateCatalogID())
         #else
         throw JedError("0A000", "native file databases are unavailable on this host")
@@ -97,7 +152,7 @@ extension Database {
         try checkOpen()
         guard name == "main" else { throw JedError("42704", "database \"\(name)\" is not attached") }
         guard core.storage.pager.codec.reservedBytes == 0 else { throw JedError("0A000", "serialization of an encrypted database is not supported") }
-        let pin = core.pinLatest(); defer { pin.close() }
+        let pin = try core.beginRead(); defer { pin.close() }
         var bytes: [UInt8] = []
         _ = try DomainImage.write(pin.snapshot, txid: pin.snapshot.txid) { page in
             let offset = UInt64(page.index) * UInt64(page.bytes.count), end = offset + UInt64(page.bytes.count)

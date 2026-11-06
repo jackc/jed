@@ -39,7 +39,28 @@ internal final class StorageDomain: Sendable {
         let pager = try Pager.open(store: store, credential: credential, writable: !readOnly,
             ephemeral: kind == .memory, unlockedCodec: unlockedCodec, syncDirectory: syncDirectory)
         let pool = try NodePool(pager: pager, cacheBytes: kind == .memory ? nil : cacheBytes)
-        let meta = pager.selected.meta
+        let initial = try loadSnapshot(pager: pager, pool: pool, selected: pager.selected,
+            kind: kind, catalogID: catalogID, collatedKey: collatedKey,
+            collationVerdict: collationVerdict, validateCatalog: validateCatalog)
+        return StorageDomain(pager: pager, pool: pool, kind: kind, readOnly: readOnly,
+            initial: initial, durableDirectorySync: durableDirectorySync)
+    }
+
+    static func remote(pager: Pager, pool: NodePool, catalogID: UInt64, readOnly: Bool,
+                       environment: Environment) throws -> StorageDomain {
+        let initial = try loadSnapshot(pager: pager, pool: pool, selected: pager.selected, kind: .file,
+            catalogID: catalogID, collatedKey: { try environment.unicode.key($0, collation: $1) },
+            collationVerdict: { try CatalogEnvironment.verdict($0, environment: environment) },
+            validateCatalog: { try CatalogEnvironment.validate($0, environment: environment) })
+        return StorageDomain(pager: pager, pool: pool, kind: .file, readOnly: readOnly, initial: initial)
+    }
+
+    private static func loadSnapshot(pager: Pager, pool: NodePool, selected: ValidatedMeta,
+                                     kind: StorageDomainKind, catalogID: UInt64,
+                                     collatedKey: KeyEncoding.CollatedKey?,
+                                     collationVerdict: ((CatalogCollation) throws -> Bool)?,
+                                     validateCatalog: (CatalogImage) throws -> Void) throws -> DomainStorageState {
+        let meta = selected.meta
         let chain = try CatalogChain.read(root: meta.root, pageCount: meta.pageCount, codec: pager.codec, read: pager.readBody)
         let catalog = try CatalogImage.collect(chain.entries, catalogID: catalogID, collatedKey: collatedKey, collationVerdict: collationVerdict)
         try validateCatalog(catalog)
@@ -85,11 +106,48 @@ internal final class StorageDomain: Sendable {
         let snapshot = try DomainSnapshot(catalogID: catalogID, txid: meta.txid, catalog: catalog,
             pool: pool, tables: tables, indexes: indexes, gistTrees: gistTrees)
         let free = try pager.allocationSnapshot(reuseAllowed: true)
-        return StorageDomain(pager: pager, pool: pool, kind: kind, readOnly: readOnly,
-            initial: DomainStorageState(snapshot: snapshot, catalogPages: chain.pages, gistPages: gistPages,
-                livePages: meta.livePages, liveAtCompaction: meta.pageCount - UInt32(free.persistedFree.count),
-                freeGeneration: meta.txid, lastWritten: [], repairCatalogPages: kind == .file ? chain.pages.count : 0),
-            durableDirectorySync: durableDirectorySync)
+        return DomainStorageState(snapshot: snapshot, catalogPages: chain.pages, gistPages: gistPages,
+            livePages: meta.livePages, liveAtCompaction: meta.pageCount - UInt32(free.persistedFree.count),
+            freeGeneration: meta.txid, lastWritten: [], repairCatalogPages: kind == .file ? chain.pages.count : 0)
+    }
+
+    var freeGeneration: UInt64 { state.withLock { $0.freeGeneration } }
+    var lastWritten: Set<UInt32> { state.withLock { $0.lastWritten } }
+    func serviceDirectorySync() throws { try durableDirectorySync() }
+
+    /// Publish structural accounting immediately, without parsing stored SQL or
+    /// consulting the local Environment. The coordinator publishes its meta and
+    /// invalidation window in the same critical section as reader pins.
+    func noteServiceCommit(_ selected: ValidatedMeta, written: Set<UInt32>) {
+        state.withLock { current in
+            current.livePages = selected.meta.livePages; current.lastWritten = written
+        }
+    }
+
+    /// Called by the coordinator only when a foreign commit advanced its meta.
+    /// Failure affects that logical begin alone; the already published commit
+    /// remains available to clients with a suitable environment.
+    func adoptServiceSnapshot(_ selected: ValidatedMeta, environment: Environment?, force: Bool = false) throws -> DomainSnapshot {
+        let current = state.withLock { $0 }
+        if !force, current.snapshot.txid == selected.meta.txid { return current.snapshot }
+        let loaded: DomainStorageState
+        if let environment {
+            loaded = try Self.loadSnapshot(pager: pager, pool: pool, selected: selected, kind: kind,
+                catalogID: current.snapshot.catalogID,
+                collatedKey: { try environment.unicode.key($0, collation: $1) },
+                collationVerdict: { try CatalogEnvironment.verdict($0, environment: environment) },
+                validateCatalog: { try CatalogEnvironment.validate($0, environment: environment) })
+        } else {
+            loaded = try Self.loadSnapshot(pager: pager, pool: pool, selected: selected, kind: kind,
+                catalogID: current.snapshot.catalogID, collatedKey: nil,
+                collationVerdict: { _ in false }, validateCatalog: { _ in })
+        }
+        var adopted = loaded
+        adopted.freeGeneration = current.freeGeneration
+        adopted.liveAtCompaction = current.liveAtCompaction
+        adopted.lastWritten = current.lastWritten
+        state.withLock { $0 = adopted }
+        return adopted.snapshot
     }
 
     /// The caller owns creation of an empty destination and any atomic path
@@ -246,6 +304,20 @@ internal final class StorageDomain: Sendable {
                 throw JedError("55006", "invalid or obsolete memory domain adoption")
             }
             try pager.adoptMemory(staged.pages)
+            current = DomainStorageState(snapshot: plan.snapshot, catalogPages: plan.catalogPages,
+                gistPages: plan.gistPages, livePages: plan.livePages, liveAtCompaction: plan.liveAtCompaction,
+                freeGeneration: plan.freeGeneration, lastWritten: plan.written, repairCatalogPages: plan.catalogPages.count)
+            return current.snapshot
+        }
+    }
+
+    func persistRemote(_ plan: PreparedDomainCommit) throws -> DomainSnapshot {
+        try state.withLock { current in
+            guard plan.identity === current.snapshot.identity, plan.pages.baseTxid == current.snapshot.txid else {
+                throw JedError("08006", "remote domain commit is obsolete")
+            }
+            pool.invalidate(Set(plan.pages.body.map(\.index)).union(plan.pages.manifest.pages.map(\.pageIndex)))
+            try pager.adoptRemoteCommit(plan.pages)
             current = DomainStorageState(snapshot: plan.snapshot, catalogPages: plan.catalogPages,
                 gistPages: plan.gistPages, livePages: plan.livePages, liveAtCompaction: plan.liveAtCompaction,
                 freeGeneration: plan.freeGeneration, lastWritten: plan.written, repairCatalogPages: plan.catalogPages.count)

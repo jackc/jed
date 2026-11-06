@@ -92,7 +92,12 @@ final class FileHostBoundaryTests: XCTestCase {
         fails("58P02") { _ = try Database.create(options: CreateOptions(path: path, locking: .exclusive)) }
         let reopened = try Database.open(path, options: OpenOptions(locking: .exclusive))
         try reopened.close()
+        #if os(Linux)
+        let automatic = try Database.open(path)
+        XCTAssertNotNil(automatic.host as? ServiceDatabaseHost); try automatic.close()
+        #else
         fails("0A000") { _ = try Database.open(path) }
+        #endif
     }
     func testSymlinkIdentityHardLinkRefusalAndReadOnlyBudget() throws {
         let root = try directory(), path = root.appendingPathComponent("source.jed").path

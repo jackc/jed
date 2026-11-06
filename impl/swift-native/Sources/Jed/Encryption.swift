@@ -14,6 +14,15 @@ public struct Credential: Sendable, CustomStringConvertible, CustomDebugStringCo
         Credential(kind: 1, bytes: Array(text.utf8))
     }
 
+    /// Local sockets always send no credential. Only a requested stream
+    /// transport uses this redacted value's wire representation in its hello.
+    internal func pageServiceBytes() throws -> [UInt8] {
+        guard bytes.count <= 16_777_207 else { throw JedError("08P01", "credential exceeds page-service frame limit") }
+        var output = ByteWriter(); output.u8(kind)
+        if kind == 1 { output.u32(UInt32(bytes.count)) }
+        output.append(bytes); return output.bytes
+    }
+
     public var description: String { "Credential(<redacted>)" }
     public var debugDescription: String { description }
 }

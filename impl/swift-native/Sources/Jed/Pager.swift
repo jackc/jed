@@ -54,6 +54,7 @@ internal final class Pager: Sendable {
         var directorySync = true
         var poisoned = false
         var revoked = false
+        var roleRevoked = false
         var shrinkPending = false
         var shrinkPages: UInt32 = 0
         var fault: CommitFault?
@@ -62,6 +63,8 @@ internal final class Pager: Sendable {
         var keyBlock: KeyBlockSelection?
         var ephemeral = false
         var memoryStage: StorageRevision?
+        var remote = false
+        var remoteReuse = true
     }
     let pageSize: Int
     let codec: any PageCodec
@@ -113,8 +116,57 @@ internal final class Pager: Sendable {
         let pager = Pager(store: store, selected: selected, codec: codec, freePages: free.entries,
             keyBlock: keyBlock, allocatedPages: UInt32(allocated))
         pager.state.withLock { $0.ephemeral = ephemeral }
-        if writable, keyBlock?.needsRepair == true { try pager.repairKeyBlock(syncDirectory: syncDirectory) }
+        if writable, unlockedCodec == nil, keyBlock?.needsRepair == true { try pager.repairKeyBlock(syncDirectory: syncDirectory) }
         return pager
+    }
+
+    /// The owner already validated recovery. Client metadata is trusted for
+    /// selection, while encrypted clients authenticate it and every logical
+    /// page still passes through the ordinary page codec.
+    static func remote(store: any BlockStore, selected: ValidatedMeta, codec: any PageCodec,
+                       keyBlock: KeyBlockSelection?) throws -> Pager {
+        let pager = Pager(store: store, selected: selected, codec: codec, freePages: [],
+            keyBlock: keyBlock, allocatedPages: selected.meta.pageCount)
+        pager.state.withLock { $0.remote = true; $0.remoteReuse = false; $0.recoverySync = false; $0.directorySync = false }
+        try pager.adoptRemoteMeta(selected)
+        return pager
+    }
+    func adoptRemoteMeta(_ selected: ValidatedMeta) throws {
+        let store = state.withLock { $0.store }
+        let free = try FreeList.load(meta: selected.meta, protected: selected.protectedPages) { reference in
+            try codec.openBody(pageIndex: reference.index,
+                sealed: store.read(at: UInt64(reference.index) * UInt64(pageSize), count: pageSize), expectedTag: reference.tag)
+        }
+        try state.withLock { state in
+            guard state.remote, selected.meta.pageSize == pageSize,
+                  selected.meta.encrypted == (codec.reservedBytes != 0) else {
+                throw JedError("08006", "remote storage identity changed")
+            }
+            state.selected = selected; state.allocatedPages = selected.meta.pageCount
+            state.freePages = free.entries; state.pending.removeAll(); state.floorFree.removeAll()
+            state.floorSlot = 0; state.remoteReuse = false
+        }
+    }
+    func grantRemoteWrite(_ reply: ServiceWriteReply) throws {
+        try state.withLock { state in
+            guard state.remote, state.selected.meta.txid == reply.read.point.txid else {
+                throw JedError("08006", "remote writer base changed")
+            }
+            state.remoteReuse = reply.reuseGrant
+            state.pending = Dictionary(uniqueKeysWithValues: reply.pending.map { ($0.pageIndex, $0.digest) })
+            state.floorFree = Set(reply.reuse)
+        }
+    }
+    func adoptRemoteCommit(_ plan: PreparedPageCommit) throws {
+        try state.withLock { state in
+            guard state.remote, plan.baseTxid == state.selected.meta.txid else {
+                throw JedError("08006", "remote prepared generation changed")
+            }
+            state.selected = ValidatedMeta(meta: plan.manifest.meta, slot: plan.slot, floorSlot: plan.slot,
+                bytes: plan.metaBytes, entries: plan.entries, chain: plan.manifest.pages.map(\.pageIndex))
+            state.allocatedPages = plan.manifest.meta.pageCount; state.freePages = plan.freePages
+            state.pending.removeAll(); state.floorFree.removeAll(); state.remoteReuse = false
+        }
     }
 
     /// A private scratch address space has synthetic metadata only. The host
@@ -159,6 +211,7 @@ internal final class Pager: Sendable {
 
     func readStored(_ index: UInt32) throws -> [UInt8] {
         try state.withLock { state in
+            guard !state.roleRevoked else { throw JedError("08006", "database storage role changed") }
             guard !state.revoked else { throw JedError("58030", "storage was revoked after a failed flush") }
             guard index < state.allocatedPages else { throw JedError.corruption("page address exceeds file bounds") }
             return try state.store.read(at: UInt64(index) * UInt64(pageSize), count: pageSize)
@@ -179,7 +232,7 @@ internal final class Pager: Sendable {
     func allocationState(reuseAllowed: Bool) throws -> (highWater: UInt32, free: [UInt32], slot: UInt32) {
         try state.withLock { state in
             try Self.checkWritable(state)
-            let free = !reuseAllowed ? [] : state.freePages.filter { state.pending.isEmpty || state.floorFree.contains($0) }
+            let free = !reuseAllowed || !state.remoteReuse ? [] : state.freePages.filter { state.pending.isEmpty || state.floorFree.contains($0) }
             return (state.selected.meta.pageCount, free, 1 - state.floorSlot)
         }
     }
@@ -189,7 +242,7 @@ internal final class Pager: Sendable {
             try Self.checkWritable(state)
             return PagerAllocationState(highWater: state.selected.meta.pageCount,
                 persistedFree: state.freePages,
-                reusableFree: reuseAllowed ? state.freePages.filter { state.pending.isEmpty || state.floorFree.contains($0) } : [],
+                reusableFree: reuseAllowed && state.remoteReuse ? state.freePages.filter { state.pending.isEmpty || state.floorFree.contains($0) } : [],
                 pending: state.pending.keys.sorted().map { ManifestEntry(pageIndex: $0, digest: state.pending[$0]!) },
                 protected: state.selected.protectedPages)
         }
@@ -298,7 +351,7 @@ internal final class Pager: Sendable {
         let snapshot = try state.withLock { state -> State in try Self.checkWritable(state); return state }
         guard snapshot.selected.meta.txid < UInt64.max else { throw JedError.corruption("transaction id exhausted") }
         let txid = snapshot.selected.meta.txid + 1
-        let safe = Set(reuseAllowed ? snapshot.freePages.filter { snapshot.pending.isEmpty || snapshot.floorFree.contains($0) } : [])
+        let safe = Set(reuseAllowed && snapshot.remoteReuse ? snapshot.freePages.filter { snapshot.pending.isEmpty || snapshot.floorFree.contains($0) } : [])
         var identities = snapshot.pending
         let oldProtected = snapshot.selected.protectedPages
         var written: Set<UInt32> = []
@@ -383,8 +436,84 @@ internal final class Pager: Sendable {
         }
     }
 
+
+    /// Check A is complete before entering this phase. A failed or abandoned
+    /// delta leaves only unreachable pages; it never changes the selected meta.
+    func beginServiceDelta(_ delta: ServiceIncomingDelta, baseTxid: UInt64,
+                           syncDirectory: () throws -> Void) throws {
+        try state.withLock { state in
+            try Self.checkWritable(state)
+            guard state.selected.meta.txid == baseTxid else { throw JedError("55006", "service writer generation changed") }
+            do {
+                try stabilize(&state, syncDirectory: syncDirectory)
+                if state.pending.isEmpty { state.floorFree = Set(state.freePages) }
+                try reserve(delta.meta.pageCount, state: &state)
+                for page in delta.manifest { try write(page.pageIndex, bytes: page.bytes, state: &state) }
+            } catch { state.poisoned = true; throw error }
+        }
+    }
+    /// The streaming validator performs check B before passing each page here.
+    func writeServicePage(_ page: StoredPage, baseTxid: UInt64) throws {
+        try state.withLock { state in
+            try Self.checkWritable(state)
+            guard state.selected.meta.txid == baseTxid else { throw JedError("55006", "service writer generation changed") }
+            do { try write(page.index, bytes: page.bytes, state: &state) }
+            catch { state.poisoned = true; throw error }
+        }
+    }
+    /// Check C passing precedes this call. Failures now close the connection;
+    /// the client resolves whether the meta reached the durable floor.
+    func finishServiceDelta(_ delta: ServiceIncomingDelta, baseTxid: UInt64,
+                            synchronous: Bool, entropy: KeyEntropy?) throws -> ValidatedMeta {
+        try state.withLock { state in
+            try Self.checkWritable(state)
+            guard state.selected.meta.txid == baseTxid else { throw JedError("55006", "service writer generation changed") }
+            do {
+                let slot = 1 - state.floorSlot
+                var bytes = delta.bytes
+                if let encrypted = codec as? EncryptedPageCodec {
+                    guard let entropy else { throw JedError("58030", "encrypted service commit requires key entropy") }
+                    bytes = try encrypted.sealMeta(bytes, slot: slot, manifest: delta.manifest,
+                        nonce: EncryptionPolicy.entropy(24, from: entropy))
+                }
+                try write(slot, bytes: bytes, state: &state)
+                if synchronous { try barrier(&state) }
+                let selected = ValidatedMeta(meta: delta.meta, slot: slot,
+                    floorSlot: synchronous ? slot : state.floorSlot, bytes: bytes,
+                    entries: delta.entries, chain: delta.manifest.map(\.pageIndex))
+                // This is structural adoption only; stored SQL and the owner's
+                // environment do not participate in accepting a client commit.
+                let free = try FreeList.load(meta: delta.meta, protected: delta.protected) { reference in
+                    try codec.openBody(pageIndex: reference.index,
+                        sealed: state.store.read(at: UInt64(reference.index) * UInt64(pageSize), count: pageSize),
+                        expectedTag: reference.tag)
+                }
+                state.selected = selected; state.freePages = free.entries
+                if synchronous {
+                    state.floorSlot = slot
+                    state.pending.removeAll(keepingCapacity: true); state.floorFree.removeAll(keepingCapacity: true)
+                } else {
+                    for entry in delta.ownEntries { state.pending[entry.pageIndex] = entry.digest }
+                }
+                // Clients cannot shrink. Any earlier owner shrink must not run
+                // as a side effect of flushing a client's relaxed commit.
+                state.shrinkPending = false
+                return selected
+            } catch { state.poisoned = true; state.revoked = true; throw error }
+        }
+    }
+    func flushServiceCap() throws {
+        try state.withLock { state in
+            try Self.checkWritable(state)
+            guard state.pending.count >= state.selected.meta.inlineCapacity else { return }
+            do { try flushState(&state, shrink: false) }
+            catch { state.poisoned = true; state.revoked = true; throw error }
+        }
+    }
+
     func flush(shrink: Bool = true) throws {
         try state.withLock { state in
+            if state.remote { return }
             try Self.checkWritable(state)
             do { try flushState(&state, shrink: shrink) }
             catch { state.poisoned = true; state.revoked = true; throw error }
@@ -421,6 +550,7 @@ internal final class Pager: Sendable {
 
     /// No stale snapshot may use a descriptor after maintenance changes its
     /// address space. Normal commits retain their narrower writer poison rule.
+    func revokeRole() { state.withLock { $0.roleRevoked = true; $0.poisoned = true } }
     func revoke() { state.withLock { $0.poisoned = true; $0.revoked = true } }
 
     /// Rewrapping changes only the redundant key pages. The KDF and encoding

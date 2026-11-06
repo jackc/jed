@@ -46,6 +46,8 @@ module SwiftSpecGenerator
     spec/tz/vectors/bundle.toml
     spec/tz/vectors/tzif.toml
     spec/fileformat/encryption_vectors.toml
+    spec/pageservice/messages.toml
+    spec/pageservice/fixtures.toml
     spec/regex/program_vectors.toml
     spec/regex/match_vectors.toml
     spec/regex/similar_vectors.toml

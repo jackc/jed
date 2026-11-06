@@ -105,6 +105,8 @@ internal final class NodePool: Sendable {
         }
     }
 
+    func invalidateAll() { state.withLock { $0 = State() } }
+
     private func insert(_ leaf: PackedLeaf, identity: Identity, state: inout State) {
         if let capacity, state.entries.count >= capacity {
             while !state.slots.isEmpty {
