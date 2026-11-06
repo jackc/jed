@@ -1,0 +1,159 @@
+# Committed GiST entries are not pending writes (memory.md §§7.1–7.3).
+# Every statement below autocommits. Disk/service modes reopen before each
+# record; loading the committed GiST search tree must begin with zero staged
+# bytes, just like an already-resident committed tree. SELECT 1 needs only its
+# 32-byte virtual row, regardless of the number or kind of committed indexes.
+# The 31-byte failures also pin that the query account remains active.
+# This is a jed resource contract, not a PostgreSQL limit; do not oracle-import.
+# requires: query.select, ddl.create_table, ddl.drop_table, ddl.primary_key, ddl.gist_index, ddl.gist_scalar_index, ddl.exclusion_constraint, dml.insert, dml.insert_multi_row, dml.update, dml.delete, query.where_eq, types.i32, types.range, resource.query_memory
+
+# max_query_memory_bytes: 32
+query I nosort
+SELECT 1
+----
+1
+
+# max_query_memory_bytes: 31
+statement error 54P05
+SELECT 1
+
+# The index exists before the rows: INSERT maintains its committed entries.
+statement ok
+CREATE TABLE ranges (id i32 PRIMARY KEY, r i32range)
+
+statement ok
+CREATE INDEX ranges_gist ON ranges USING gist (r)
+
+# max_query_memory_bytes: 1099511627776
+statement ok
+INSERT INTO ranges VALUES (1, '[1,5)'), (2, '[10,20)')
+
+# max_query_memory_bytes: 32
+query I nosort
+SELECT 1
+----
+1
+
+# max_query_memory_bytes: 31
+statement error 54P05
+SELECT 1
+
+# A point miss stages nothing and retains no input row. Committed index keys
+# must not create an inherited pending balance even for a write statement.
+# max_query_memory_bytes: 1
+statement ok
+DELETE FROM ranges WHERE id = 99
+
+# max_query_memory_bytes: 1099511627776
+statement ok
+UPDATE ranges SET r = '[20,30)' WHERE id = 2
+
+# max_query_memory_bytes: 32
+query I nosort
+SELECT 1
+----
+1
+
+# Deleting a committed version returns no pending bytes; it also stages none.
+# max_query_memory_bytes: 1099511627776
+statement ok
+DELETE FROM ranges WHERE id = 1
+
+# max_query_memory_bytes: 32
+query I nosort
+SELECT 1
+----
+1
+
+statement ok
+DROP TABLE ranges
+
+# Build an index from already committed rows. Its build bytes end at commit,
+# and loading its scalar GiST opclass must not recreate that pending balance.
+statement ok
+CREATE TABLE scalars (id i32 PRIMARY KEY, k i32)
+
+statement ok
+INSERT INTO scalars VALUES (1, 10), (2, 20)
+
+# max_query_memory_bytes: 1099511627776
+statement ok
+CREATE INDEX scalars_gist ON scalars USING gist (k)
+
+# max_query_memory_bytes: 32
+query I nosort
+SELECT 1
+----
+1
+
+# max_query_memory_bytes: 31
+statement error 54P05
+SELECT 1
+
+# max_query_memory_bytes: 1
+statement ok
+DELETE FROM scalars WHERE id = 99
+
+# max_query_memory_bytes: 1099511627776
+statement ok
+DELETE FROM scalars WHERE id = 1
+
+# max_query_memory_bytes: 32
+query I nosort
+SELECT 1
+----
+1
+
+statement ok
+DROP TABLE scalars
+
+# Exclusion-backed multi-column GiST entries use the same loading contract.
+statement ok
+CREATE TABLE bookings (id i32 PRIMARY KEY, room i32, during i32range, EXCLUDE USING gist (room WITH =, during WITH &&))
+
+# max_query_memory_bytes: 1099511627776
+statement ok
+INSERT INTO bookings VALUES (1, 10, '[1,5)'), (2, 10, '[10,20)')
+
+# max_query_memory_bytes: 32
+query I nosort
+SELECT 1
+----
+1
+
+# max_query_memory_bytes: 31
+statement error 54P05
+SELECT 1
+
+# max_query_memory_bytes: 1099511627776
+statement error 23P01
+INSERT INTO bookings VALUES (3, 10, '[2,4)')
+
+# max_query_memory_bytes: 32
+query I nosort
+SELECT 1
+----
+1
+
+# max_query_memory_bytes: 1
+statement ok
+DELETE FROM bookings WHERE id = 99
+
+# max_query_memory_bytes: 1099511627776
+statement ok
+DELETE FROM bookings WHERE id = 1
+
+# max_query_memory_bytes: 32
+query I nosort
+SELECT 1
+----
+1
+
+statement ok
+DROP TABLE bookings
+
+# max_query_memory_bytes: 32
+query I nosort
+SELECT 1
+----
+1

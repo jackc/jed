@@ -589,6 +589,12 @@ excluded, since `max_temp_storage_bytes` bounds them ([temp-tables.md](temp-tabl
 Bytes are tracked whether or not a budget is active, so a budget set in the middle
 of a transaction sees the writes already staged.
 
+Loading committed state starts with zero pending bytes. This includes opening or
+refreshing a file, attaching one, and deserializing an image. Reconstructing a
+resident GiST leaf store from committed keys is a load, not an index build or a
+transaction write: its insertion machinery must not leave a staged balance.
+Later mutations charge only the new record versions they stage, as in §7.1.
+
 ### 7.3 Admission
 
 Under a finite budget:

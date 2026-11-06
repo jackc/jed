@@ -1856,6 +1856,8 @@ func loadEngineSharedPagingAt(paging *sharedPaging, env *Environment, at loadAt)
 							return nil, err
 						}
 					}
+					// These keys reconstruct committed state; opening a file stages no writes.
+					istore.clearStaged()
 				} else {
 					istore.attachPaging(paging)
 					if indexRoots[k].page != 0 {

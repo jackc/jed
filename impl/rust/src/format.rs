@@ -3203,6 +3203,8 @@ impl Engine {
                             for k in keys {
                                 istore.insert(k, Vec::new())?;
                             }
+                            // These keys reconstruct committed state; opening a file stages no writes.
+                            istore.clear_staged();
                         } else {
                             istore.attach_paging(paging.clone());
                             // An index tree has zero value columns (empty-payload records); its

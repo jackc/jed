@@ -244,6 +244,8 @@ mod writable_cte;
 #[path = "../tests/zone_shift_range.rs"]
 mod zone_shift_range;
 
+#[path = "../tests/gist_load_memory.rs"]
+mod gist_load_memory;
 #[path = "../tests/index_dependencies.rs"]
 mod index_dependencies;
 #[path = "../tests/memory_sizes.rs"]

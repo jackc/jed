@@ -15,6 +15,9 @@ final class PostbaselineSQLTests: XCTestCase {
     func testSharedViewTableFunctionDependencies() throws {
         try run("views_table_functions", digest: "d96c518d2ad1f3b519c5829f36fb05a3b23b64b7f5d79ca2fe502f23a0a43abf", records: 41, modes: [.memory, .disk])
     }
+    func testSharedCommittedGiSTReopenAccounting() throws {
+        try run("query_memory_gist_reopen", digest: "ec64560154bb95b886f3441841f622181b1b625156638d37acc87c6405300457", records: 33, modes: [.memory, .disk])
+    }
     private func run(_ name: String, digest expectedDigest: String, records: Int,
                      modes: [SQLCorpusRunner.Mode] = [.auto]) throws {
         let path = try XCTUnwrap(Bundle.module.url(forResource: name, withExtension: "test",

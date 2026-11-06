@@ -4906,6 +4906,8 @@ function* loadAtMetaSteps(
             cap.tag,
           );
           for (const key of out) istore.insert(key, []);
+          // These keys reconstruct committed state; opening a file stages no writes.
+          istore.clearStaged();
           snap.indexStores.set(table.indexes[k]!.name, istore);
           snap.gistRoots.set(table.indexes[k]!.name, iroot);
           continue;
