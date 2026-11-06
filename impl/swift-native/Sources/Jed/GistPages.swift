@@ -92,8 +92,15 @@ internal extension GistTree {
 
     func serialize(allocator: inout PageAllocator, codec: any PageCodec,
                    entropy: KeyEntropy? = nil) throws -> GistWrite {
-        guard let root else { return GistWrite(root: PageSealer.nullReference(codec), pages: []) }
-        var working = allocator, pages: [StoredPage] = []
+        var pages: [StoredPage] = []
+        let root = try writeImage(allocator: &allocator, codec: codec, entropy: entropy) { pages.append($0) }
+        return GistWrite(root: root, pages: pages)
+    }
+
+    func writeImage(allocator: inout PageAllocator, codec: any PageCodec,
+                    entropy: KeyEntropy? = nil, sink: (StoredPage) throws -> Void) throws -> PageReference {
+        guard let root else { return PageSealer.nullReference(codec) }
+        var working = allocator
         func appendBound(_ bound: [GistBound], to writer: inout ByteWriter) throws {
             let bytes = try GistTuple.encode(bound, ops: opclasses)
             guard bytes.count <= UInt16.max else { throw JedError.corruption("GiST bound exceeds wire length") }
@@ -120,11 +127,11 @@ internal extension GistTree {
             let index = try working.allocate()
             let sealed = try PageSealer.seal(codec: codec, index: index, type: node.isLeaf ? 5 : 6,
                 count: UInt32(node.entryCount), payload: writer.bytes, entropy: entropy)
-            pages.append(sealed.page)
+            try sink(sealed.page)
             return sealed.reference
         }
         let reference = try visit(root)
         allocator = working
-        return GistWrite(root: reference, pages: pages)
+        return reference
     }
 }

@@ -10,10 +10,7 @@ internal enum CatalogChain {
         var continued: Bool
     }
 
-    /// Every entry is encoded before allocating or writing a page. Long entries
-    /// begin and end on their own pages; ordinary entries pack greedily.
-    static func write(_ entries: [CatalogEntry], allocator: inout PageAllocator,
-                      codec: any PageCodec, entropy: KeyEntropy? = nil) throws -> CatalogChainWrite {
+    private static func layout(_ entries: [CatalogEntry], codec: any PageCodec) throws -> [Chunk] {
         let capacity = codec.capacity - (codec.reservedBytes == 0 ? 0 : 16)
         let encoded = try entries.map { try CatalogCodec.encode($0, encrypted: codec.reservedBytes != 0) }
         var chunks: [Chunk] = [], active = Chunk(bytes: [], count: 0, continued: false)
@@ -32,6 +29,18 @@ internal enum CatalogChain {
             }
         }
         if active.count > 0 || chunks.isEmpty { chunks.append(active) }
+        return chunks
+    }
+
+    static func pageCount(_ entries: [CatalogEntry], codec: any PageCodec) throws -> Int {
+        try layout(entries, codec: codec).count
+    }
+
+    /// Every entry is encoded before allocating or writing a page. Long entries
+    /// begin and end on their own pages; ordinary entries pack greedily.
+    static func write(_ entries: [CatalogEntry], allocator: inout PageAllocator,
+                      codec: any PageCodec, entropy: KeyEntropy? = nil) throws -> CatalogChainWrite {
+        let chunks = try layout(entries, codec: codec)
         var ids: [UInt32] = []
         for _ in chunks { ids.append(try allocator.allocate()) }
         var next = PageSealer.nullReference(codec), pages: [StoredPage] = []
@@ -42,6 +51,24 @@ internal enum CatalogChain {
             pages.append(sealed.page); next = sealed.reference
         }
         return CatalogChainWrite(root: next, pages: pages.reversed())
+    }
+
+    /// Metadata is resident; only one sealed catalog page is handed to the
+    /// image sink at a time. Nonces follow reverse chain order.
+    static func writeImage(_ entries: [CatalogEntry], allocator: inout PageAllocator,
+                           codec: any PageCodec, entropy: KeyEntropy? = nil,
+                           sink: (StoredPage) throws -> Void) throws -> PageReference {
+        let chunks = try layout(entries, codec: codec)
+        var ids: [UInt32] = []
+        for _ in chunks { ids.append(try allocator.allocate()) }
+        var next = PageSealer.nullReference(codec)
+        for ordinal in chunks.indices.reversed() {
+            let chunk = chunks[ordinal]
+            let sealed = try PageSealer.seal(codec: codec, index: ids[ordinal], type: 1, flags: chunk.continued ? 1 : 0,
+                count: chunk.count, next: next, payload: chunk.bytes, entropy: entropy)
+            try sink(sealed.page); next = sealed.reference
+        }
+        return next
     }
 
     /// Catalog metadata is resident, but each physical read remains bounded by

@@ -17,10 +17,24 @@ internal struct PreparedPageCommit: Sendable {
     let entries: [ManifestEntry]
 }
 
+internal struct PagerAllocationState: Sendable {
+    let highWater: UInt32
+    let persistedFree: [UInt32]
+    let reusableFree: [UInt32]
+    let pending: [ManifestEntry]
+    let protected: Set<UInt32>
+}
+
 internal enum CommitFault: Sendable {
     case body(ordinal: UInt32, tearBytes: Int)
     case meta(tearBytes: Int)
     case sync(ordinal: UInt32)
+}
+
+internal final class StagedMemoryPages: Sendable {
+    let plan: PreparedPageCommit
+    fileprivate let token = StorageRevision()
+    fileprivate init(_ plan: PreparedPageCommit) { self.plan = plan }
 }
 
 /// Host-independent page I/O, recovery and commit publication. A database's
@@ -46,6 +60,8 @@ internal final class Pager: Sendable {
         var bodyWrites: UInt32 = 0
         var syncs: UInt32 = 0
         var keyBlock: KeyBlockSelection?
+        var ephemeral = false
+        var memoryStage: StorageRevision?
     }
     let pageSize: Int
     let codec: any PageCodec
@@ -60,8 +76,10 @@ internal final class Pager: Sendable {
     }
 
     static func open(store: any BlockStore, credential: Credential? = nil,
-                     writable: Bool = false, syncDirectory: () throws -> Void = {}) throws -> Pager {
+                     writable: Bool = false, ephemeral: Bool = false,
+                     syncDirectory: () throws -> Void = {}) throws -> Pager {
         let selected = try MetaRecovery.open(store)
+        guard !ephemeral || !selected.meta.encrypted else { throw JedError("55000", "in-memory databases cannot be encrypted") }
         try EncryptionPolicy.checkCredential(encrypted: selected.meta.encrypted, credential: credential)
         let size = selected.meta.pageSize
         let codec: any PageCodec
@@ -89,15 +107,23 @@ internal final class Pager: Sendable {
         guard allocated <= UInt32.max else { throw JedError.corruption("file exceeds the page-address range") }
         let pager = Pager(store: store, selected: selected, codec: codec, freePages: free.entries,
             keyBlock: keyBlock, allocatedPages: UInt32(allocated))
+        pager.state.withLock { $0.ephemeral = ephemeral }
         if writable, keyBlock?.needsRepair == true { try pager.repairKeyBlock(syncDirectory: syncDirectory) }
         return pager
     }
 
     var selected: ValidatedMeta { state.withLock { $0.selected } }
+    var selectedKeyBlock: KeyBlock? { state.withLock { $0.keyBlock?.block } }
     var pendingEntries: [ManifestEntry] {
         state.withLock { state in state.pending.keys.sorted().map { ManifestEntry(pageIndex: $0, digest: state.pending[$0]!) } }
     }
     var isPoisoned: Bool { state.withLock { $0.poisoned } }
+
+    /// Only a fresh image whose barrier and directory publication already
+    /// succeeded may bypass recovered/foreign-generation stabilization.
+    func acknowledgeFreshDurableImage() {
+        state.withLock { $0.recoverySync = false; $0.directorySync = false }
+    }
 
     func readStored(_ index: UInt32) throws -> [UInt8] {
         try state.withLock { state in
@@ -123,6 +149,114 @@ internal final class Pager: Sendable {
             try Self.checkWritable(state)
             let free = !reuseAllowed ? [] : state.freePages.filter { state.pending.isEmpty || state.floorFree.contains($0) }
             return (state.selected.meta.pageCount, free, 1 - state.floorSlot)
+        }
+    }
+
+    func allocationSnapshot(reuseAllowed: Bool) throws -> PagerAllocationState {
+        try state.withLock { state in
+            try Self.checkWritable(state)
+            return PagerAllocationState(highWater: state.selected.meta.pageCount,
+                persistedFree: state.freePages,
+                reusableFree: reuseAllowed ? state.freePages.filter { state.pending.isEmpty || state.floorFree.contains($0) } : [],
+                pending: state.pending.keys.sorted().map { ManifestEntry(pageIndex: $0, digest: state.pending[$0]!) },
+                protected: state.selected.protectedPages)
+        }
+    }
+
+    /// Ephemeral stores keep their free list in memory. The caller supplies a
+    /// reader-safe reachability proof; no file meta or free-list page is written.
+    func replaceMemoryFree(_ pages: [UInt32]) throws {
+        try state.withLock { state in
+            guard state.ephemeral, zip(pages, pages.dropFirst()).allSatisfy({ $0 < $1 }),
+                  pages.allSatisfy({ $0 >= codec.firstBodyPage && $0 < state.selected.meta.pageCount }) else {
+                throw JedError.corruption("invalid ephemeral free-list replacement")
+            }
+            state.freePages = pages
+        }
+    }
+
+    func prepareMemory(body: [StoredPage], root: PageReference, pageCount: UInt32,
+                       freePages: [UInt32], reuseAllowed: Bool) throws -> PreparedPageCommit {
+        try state.withLock { state in
+            try Self.checkWritable(state)
+            guard state.ephemeral, state.selected.meta.txid < UInt64.max else {
+                throw JedError.corruption("invalid ephemeral commit state")
+            }
+            let safe = Set(reuseAllowed ? state.freePages : []), free = Set(freePages)
+            var written: Set<UInt32> = []
+            for page in body {
+                guard page.index >= codec.firstBodyPage, page.index < pageCount, page.bytes.count == pageSize,
+                      written.insert(page.index).inserted, !free.contains(page.index),
+                      page.index >= state.selected.meta.pageCount || safe.contains(page.index) else {
+                    throw JedError.corruption("unsafe ephemeral body page")
+                }
+            }
+            guard free.count == freePages.count, zip(freePages, freePages.dropFirst()).allSatisfy({ $0 < $1 }),
+                  freePages.allSatisfy({ $0 >= codec.firstBodyPage && $0 < pageCount }) else {
+                throw JedError.corruption("invalid ephemeral free list")
+            }
+            let txid = state.selected.meta.txid + 1
+            let manifest = try CommitManifest.build(pageSize: pageSize, encrypted: false, txid: txid,
+                root: root, pageCount: pageCount, freeList: PageReference(0), livePages: 0, entries: [], chain: [])
+            return PreparedPageCommit(baseTxid: state.selected.meta.txid, body: body, manifest: manifest,
+                metaBytes: try manifest.meta.encode(inline: []), slot: UInt32(txid & 1), freePages: freePages, entries: [])
+        }
+    }
+
+    /// An attachment writes only safe body slots before main persists. It
+    /// changes neither the selected generation nor the free-page accounting.
+    func stageMemory(_ plan: PreparedPageCommit) throws -> StagedMemoryPages {
+        try state.withLock { state in
+            try Self.checkWritable(state)
+            guard state.ephemeral, plan.baseTxid == state.selected.meta.txid,
+                  plan.entries.isEmpty, plan.manifest.pages.isEmpty else {
+                throw JedError("55006", "obsolete or invalid staged memory commit")
+            }
+            let staged = StagedMemoryPages(plan)
+            do {
+                try reserve(plan.manifest.meta.pageCount, state: &state)
+                for page in plan.body { try write(page.index, bytes: page.bytes, state: &state) }
+                state.memoryStage = staged.token
+                return staged
+            } catch { state.memoryStage = nil; state.poisoned = true; throw error }
+        }
+    }
+
+    /// No I/O after durable main succeeds. An abandoned or superseded stage
+    /// cannot install accounting for bytes another plan has overwritten.
+    func adoptMemory(_ staged: StagedMemoryPages) throws {
+        try state.withLock { state in
+            try Self.checkWritable(state)
+            let plan = staged.plan
+            guard state.ephemeral, state.memoryStage === staged.token,
+                  plan.baseTxid == state.selected.meta.txid else {
+                throw JedError("55006", "obsolete staged memory commit")
+            }
+            state.selected = ValidatedMeta(meta: plan.manifest.meta, slot: plan.slot, floorSlot: plan.slot,
+                bytes: plan.metaBytes, entries: [], chain: [])
+            state.floorSlot = plan.slot; state.freePages = plan.freePages
+            state.recoverySync = false; state.directorySync = false; state.memoryStage = nil
+        }
+    }
+
+    /// No persisted free-list or manifest pages: the memory high-water is the
+    /// baseline Q4 measure. MemoryBlockStore's barriers have no host effect.
+    func commitMemory(_ plan: PreparedPageCommit) throws {
+        try state.withLock { state in
+            try Self.checkWritable(state)
+            guard state.ephemeral, plan.baseTxid == state.selected.meta.txid,
+                  plan.slot == UInt32(plan.manifest.meta.txid & 1), plan.entries.isEmpty, plan.manifest.pages.isEmpty else {
+                throw JedError("55006", "obsolete or invalid ephemeral commit")
+            }
+            do {
+                try reserve(plan.manifest.meta.pageCount, state: &state)
+                for page in plan.body { try write(page.index, bytes: page.bytes, state: &state) }
+                try barrier(&state); try write(plan.slot, bytes: plan.metaBytes, state: &state); try barrier(&state)
+                state.selected = ValidatedMeta(meta: plan.manifest.meta, slot: plan.slot, floorSlot: plan.slot,
+                    bytes: plan.metaBytes, entries: [], chain: [])
+                state.floorSlot = plan.slot; state.freePages = plan.freePages
+                state.recoverySync = false; state.directorySync = false; state.memoryStage = nil
+            } catch { state.poisoned = true; throw error }
         }
     }
 

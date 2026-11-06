@@ -8,6 +8,7 @@ internal struct GinPosting: Sendable {
 /// decodes one run; it never materializes the complete posting list.
 internal struct GinIndex: Sendable {
     private(set) var tree: BPlusTree
+    private(set) var lastChanges: (removed: [[UInt8]], inserted: [[UInt8]]) = ([], [])
     init(tree: BPlusTree) throws {
         guard tree.types.isEmpty else { throw JedError.corruption("GIN entry tree must have no value columns") }
         self.tree = tree
@@ -69,8 +70,10 @@ internal struct GinIndex: Sendable {
         if let old { _ = try changed.remove(old) }
         for run in runs { _ = try changed.insert(PackedRecord(key: run, cells: [])) }
         tree = changed
+        lastChanges = (old.map { [$0] } ?? [], runs)
     }
     @discardableResult mutating func insert(term: [UInt8], key: [UInt8]) throws -> Bool {
+        lastChanges = ([], [])
         guard !key.isEmpty else { throw JedError.corruption("empty GIN storage key") }
         if let run = try runAtOrAfter(term: term, key: key) {
             var keys = try GinPostingRun.decode(termLength: term.count, bytes: run)
@@ -87,6 +90,7 @@ internal struct GinIndex: Sendable {
         try replace(nil, with: [GinPostingRun.encode(term: term, keys: [key])]); return true
     }
     @discardableResult mutating func remove(term: [UInt8], key: [UInt8]) throws -> Bool {
+        lastChanges = ([], [])
         guard !key.isEmpty else { throw JedError.corruption("empty GIN storage key") }
         guard let run = try runAtOrAfter(term: term, key: key) else { return false }
         var keys = try GinPostingRun.decode(termLength: term.count, bytes: run)
