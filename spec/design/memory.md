@@ -294,7 +294,9 @@ them:
   engine-owned collector re-reserving it nets one charge per row.
 
 Rows retained for the rest of the statement stay charged until it ends: folded
-uncorrelated subquery results and the source rows of `INSERT ... SELECT`.
+uncorrelated subquery results and the source rows of `INSERT ... SELECT` and
+`MERGE`. This includes the outer statement's remaining writable CTE parts and
+EXPLAIN result construction.
 
 ### 5.4 Lanes
 
