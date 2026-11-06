@@ -112,25 +112,52 @@ internal final class PageServiceOwner: Sendable {
         for client in connections { client.notice(kind: kind, connection: connection) }
     }
     var isDraining: Bool { state.withLock { $0.draining } }
+    fileprivate func isDraining(requester: UInt64) -> Bool {
+        state.withLock { !$0.closed && $0.draining && $0.drainRequester == requester }
+    }
     var hasClientTransactions: Bool {
         let clients = state.withLock { Array($0.connections.values) }
         return clients.contains { $0.hasTransaction }
     }
+    /// Close the resident admission gate before acknowledging an ownership
+    /// request. Notices/cancellation take connection locks and run separately.
+    func markDraining(requester: UInt64) -> Bool {
+        state.withLock { state in
+            guard !state.closed, state.drainRequester == nil || state.drainRequester == requester else { return false }
+            state.draining = true; state.drainRequester = requester
+            return true
+        }
+    }
     func beginDrain(kind: UInt8, requester: UInt64 = 0) {
         let clients = state.withLock { state -> [PageServiceOwnerConnection] in
-            if state.drainRequester == 0 { return [] }
-            state.draining = true; state.drainRequester = requester
+            guard !state.closed else { return [] }
+            if requester == 0 {
+                guard state.drainRequester != 0 else { return [] }
+                state.draining = true; state.drainRequester = 0
+            } else {
+                // An asynchronous worker only announces its existing
+                // reservation; it cannot resurrect or replace a canceled one.
+                guard state.draining, state.drainRequester == requester else { return [] }
+            }
             return Array(state.connections.values)
         }
-        for client in clients { client.pauseAdmission(); client.notice(kind: kind, connection: requester) }
+        for client in clients { client.announceDrain(kind: kind, requester: requester) }
+    }
+    func clearDrainReservation(requester: UInt64) -> Bool {
+        state.withLock { state in
+            guard state.drainRequester == requester else { return false }
+            state.draining = false; state.drainRequester = nil
+            return true
+        }
+    }
+    func announceDrainCancellation() {
+        let clients = state.withLock { state in
+            state.draining ? [] : Array(state.connections.values)
+        }
+        for client in clients { client.announceDrainCancellation() }
     }
     func cancelDrain(requester: UInt64) {
-        let clients = state.withLock { state -> [PageServiceOwnerConnection] in
-            guard state.drainRequester == requester else { return [] }
-            state.draining = false; state.drainRequester = nil
-            return Array(state.connections.values)
-        }
-        for client in clients { client.resumeAdmission(); client.notice(kind: 2, connection: 0) }
+        if clearDrainReservation(requester: requester) { announceDrainCancellation() }
     }
     fileprivate func dispatch(_ body: @escaping @Sendable () -> Void) { dispatchWork(body) }
     fileprivate func fail() {
@@ -338,8 +365,19 @@ private final class PageServiceOwnerConnection: @unchecked Sendable {
         operation.lock(); defer { operation.unlock() }
         return !reads.isEmpty || writer != nil
     }
-    func pauseAdmission() {
-        operation.lock(); defer { operation.unlock() }; waiting?.cancel()
+    func announceDrain(kind: UInt8, requester: UInt64) {
+        operation.lock(); defer { operation.unlock() }
+        // State may have changed while this connection's current operation
+        // finished. Check under the recipient lock, before pausing or sending.
+        guard !closed, owner.isDraining(requester: requester) else { return }
+        waiting?.cancel()
+        notice(kind: kind, connection: requester)
+    }
+    func announceDrainCancellation() {
+        operation.lock(); defer { operation.unlock() }
+        guard !closed, !owner.isDraining else { return }
+        resumeAdmission()
+        notice(kind: 2, connection: 0)
     }
     func resumeAdmission() {
         operation.lock(); defer { operation.unlock() }

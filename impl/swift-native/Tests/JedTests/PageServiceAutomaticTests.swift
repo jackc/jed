@@ -2,6 +2,7 @@
 import Foundation
 import Glibc
 import XCTest
+import Synchronization
 @testable import Jed
 
 final class PageServiceAutomaticTests: XCTestCase {
@@ -46,6 +47,10 @@ final class PageServiceAutomaticTests: XCTestCase {
         XCTAssertEqual(try names(owner), ["first"])
         XCTAssertEqual(try child.command("pin"), "ok")
         try owner.close()
+        // Owner shutdown and the child's unrelated command pipe do not order
+        // the child's socket reader. Observe EOF on the captured connection
+        // before asserting that its retained pin has ended (§8.1).
+        XCTAssertEqual(try child.command("old-connection"), "08006")
         XCTAssertEqual(try child.command("old-pin"), "08006")
         XCTAssertEqual(try child.command("add second"), "ok")
         XCTAssertEqual(try child.command("names"), "first,second")
@@ -64,6 +69,84 @@ final class PageServiceAutomaticTests: XCTestCase {
         XCTAssertThrowsError(try old.checkRole()) { XCTAssertEqual(($0 as? JedError)?.code, "08006") }; old.close()
         XCTAssertEqual(try names(owner), ["handed_off"])
         try owner.close()
+    }
+    func testAcceptedYieldParksBeginsBeforeWorkerRuns() throws {
+        let path = try path()
+        let created = try Database.create(options: CreateOptions(path: path, pageSize: 1024, locking: .exclusive))
+        try created.close()
+        let platform = HeldServiceWorkPlatform()
+        let owner = try ServiceDatabaseHost.openResolved(path: path,
+            options: OpenOptions(pageService: PageServiceOptions(ownership: .yield,
+                yieldGraceMilliseconds: 0, shutdownGraceMilliseconds: 0)),
+            catalogID: 1121, platform: platform)
+        defer { try? owner.close(); platform.discardWork() }
+        let host = try XCTUnwrap(owner.host as? ServiceDatabaseHost)
+        let localAdmission = HeldLocalAdmission(base: host)
+        owner.core.coordinateRoles(with: localAdmission)
+        let cancellation = CancellationToken(), completed = DispatchSemaphore(value: 0)
+        let outcome = Mutex<String?>(nil)
+        Thread.detachNewThread {
+            do {
+                let writer = try owner.core.acquireWriter(cancellation: cancellation)
+                writer.close(); outcome.withLock { $0 = "acquired" }
+            } catch { outcome.withLock { $0 = (error as? JedError)?.code ?? "unexpected" } }
+            completed.signal()
+        }
+        defer { cancellation.cancel(); localAdmission.proceed.signal(); owner.core.coordinateRoles(with: host) }
+        XCTAssertEqual(localAdmission.admitted.wait(timeout: .now() + 2), .success)
+        let endpoint = try XCTUnwrap(FileLockBundle.readOwner(path)).endpoint
+        let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+        let client = try PageServiceConnection.open(socket: UnixServiceSocket.connect(path: endpoint, deadline: deadline),
+            hello: ServiceHello(), deadline: deadline)
+        defer { client.close() }
+        guard case .ownershipReply(let status) = try client.request(.requestOwnership).wait(deadline: deadline) else {
+            return XCTFail("missing ownership reply")
+        }
+        XCTAssertEqual(status, 0)
+        // This caller passed coordinator admission before the handoff request.
+        // The registry gate must still stop it from becoming a local writer.
+        localAdmission.proceed.signal()
+        XCTAssertEqual(localAdmission.retried.wait(timeout: .now() + 2), .success)
+        XCTAssertFalse(owner.core.hasLocalWriter)
+        cancellation.cancel()
+        XCTAssertEqual(completed.wait(timeout: .now() + 2), .success)
+        XCTAssertEqual(outcome.withLock { $0 }, "57014")
+        owner.core.coordinateRoles(with: host)
+        XCTAssertEqual(platform.pendingWork, 1, "yield worker remains deliberately suspended")
+        let server = try XCTUnwrap((owner.host as? ServiceDatabaseHost)?.serviceOwner)
+        XCTAssertTrue(server.isDraining, "accepted ownership must stop admission before dispatch")
+        let pendingRead = try client.request(.beginRead(.cold))
+        let pendingWrite = try client.request(.beginWrite(.cold, timeout: 0, flags: 0))
+        // This reply orders both earlier begin requests without letting the
+        // deliberately suspended worker run or relying on a timing sleep.
+        _ = try client.request(.commitStatus(txid: UInt64.max, digest: 0)).wait(deadline: deadline)
+        XCTAssertEqual(owner.core.livePinCount, 0, "a read must remain parked")
+        XCTAssertEqual(platform.pendingWork, 1, "a writer must not dispatch before handoff")
+        client.close()
+        XCTAssertThrowsError(try pendingRead.wait(deadline: deadline)) { XCTAssertEqual(($0 as? JedError)?.code, "08006") }
+        XCTAssertThrowsError(try pendingWrite.wait(deadline: deadline)) { XCTAssertEqual(($0 as? JedError)?.code, "08006") }
+        while server.isDraining, ContinuousClock.now < deadline { Thread.sleep(forTimeInterval: 0.001) }
+        XCTAssertFalse(server.isDraining, "disconnect cancels the first reservation")
+        let replacement = try PageServiceConnection.open(socket: UnixServiceSocket.connect(path: endpoint, deadline: deadline),
+            hello: ServiceHello(), deadline: deadline)
+        defer { replacement.close() }
+        guard case .ownershipReply(let nextStatus) = try replacement.request(.requestOwnership).wait(deadline: deadline) else {
+            return XCTFail("missing replacement ownership reply")
+        }
+        XCTAssertEqual(nextStatus, 0)
+        XCTAssertEqual(platform.pendingWork, 2)
+        // A canceled request's delayed worker must not reopen admissions for
+        // its replacement or overwrite the replacement's reservation.
+        platform.runFirstWork()
+        XCTAssertTrue(server.isDraining)
+        let replacementRead = try replacement.request(.beginRead(.cold))
+        let replacementWrite = try replacement.request(.beginWrite(.cold, timeout: 0, flags: 0))
+        _ = try replacement.request(.commitStatus(txid: UInt64.max, digest: 0)).wait(deadline: deadline)
+        XCTAssertEqual(owner.core.livePinCount, 0)
+        XCTAssertEqual(platform.pendingWork, 1)
+        replacement.close()
+        XCTAssertThrowsError(try replacementRead.wait(deadline: deadline)) { XCTAssertEqual(($0 as? JedError)?.code, "08006") }
+        XCTAssertThrowsError(try replacementWrite.wait(deadline: deadline)) { XCTAssertEqual(($0 as? JedError)?.code, "08006") }
     }
     func testWriterAdmissionTimeoutAndCancellationDuringYield() throws {
         let path = try path(), owner = try Database.create(options: CreateOptions(path: path, pageSize: 1024,
@@ -116,12 +199,23 @@ final class PageServiceAutomaticTests: XCTestCase {
         let database = try Database.open(path, options: OpenOptions(pageService: PageServiceOptions(ownership: preference,
             yieldGraceMilliseconds: 0, shutdownGraceMilliseconds: 0)))
         var pin: SnapshotPin?
+        var pinnedConnection: PageServiceConnection?
         func reply(_ value: String) { FileHandle.standardOutput.write(Data(("PEER:" + value + "\n").utf8)) }
         reply("ready")
         while let line = readLine() {
             do {
                 if line == "quit" { pin?.close(); try database.close(); reply("bye"); return }
-                if line == "pin" { pin = try database.core.beginRead(); reply("ok") }
+                if line == "pin" {
+                    pin = try database.core.beginRead()
+                    pinnedConnection = (database.host as? ServiceDatabaseHost)?.serviceClient?.connection
+                    reply("ok")
+                }
+                else if line == "old-connection" {
+                    guard let pinnedConnection else { throw JedError("XX000", "test pin has no captured client connection") }
+                    _ = try pinnedConnection.request(.commitStatus(txid: UInt64.max, digest: 0))
+                        .wait(deadline: .now.advanced(by: .seconds(2)), timeoutCode: "XX000")
+                    reply("ok")
+                }
                 else if line == "old-pin" { try pin?.checkRole(); reply("ok") }
                 else if line == "names" { reply(try names(database).joined(separator: ",")) }
                 else if line.hasPrefix("add ") { try sequence(database, String(line.dropFirst(4))); reply("ok") }
@@ -129,6 +223,62 @@ final class PageServiceAutomaticTests: XCTestCase {
             } catch { reply((error as? JedError)?.code ?? "unexpected-error") }
         }
         pin?.close(); try database.close()
+    }
+    private final class HeldLocalAdmission: DatabaseRoleCoordinator, Sendable {
+        let base: any DatabaseRoleCoordinator
+        let admitted = DispatchSemaphore(value: 0), proceed = DispatchSemaphore(value: 0)
+        let retried = DispatchSemaphore(value: 0)
+        private let first = Mutex(true)
+        init(base: any DatabaseRoleCoordinator) { self.base = base }
+        func awaitAdmission() throws { try base.awaitAdmission() }
+        func awaitWriteAdmission(timeoutMilliseconds: UInt64, cancellation: CancellationToken?) throws {
+            let initial = first.withLock { value in let old = value; value = false; return old }
+            if !initial { retried.signal() }
+            try base.awaitWriteAdmission(timeoutMilliseconds: timeoutMilliseconds, cancellation: cancellation)
+            if initial {
+                admitted.signal()
+                guard proceed.wait(timeout: .now() + 2) == .success else { throw JedError("XX000", "test admission wait timed out") }
+            }
+        }
+    }
+    /// Real file/lock/socket devices with background work held by the test.
+    /// Only worker scheduling is controlled; protocol reads still run normally.
+    private final class HeldServiceWorkPlatform: ServiceHostPlatform, Sendable {
+        private let base = NativeServiceHostPlatform()
+        private let work = Mutex<[@Sendable () -> Void]>([])
+        var operations: any FileOperations { base.operations }
+        var uid: UInt32 { base.uid }
+        var pid: UInt32 { base.pid }
+        var backgroundElection: Bool { base.backgroundElection }
+        var ownerTimers: Bool { base.ownerTimers }
+        var pendingWork: Int { work.withLock { $0.count } }
+        func discardWork() { work.withLock { $0.removeAll() } }
+        func runFirstWork() {
+            let body = work.withLock { $0.isEmpty ? nil : $0.removeFirst() }
+            body?()
+        }
+        func incarnation() throws -> [UInt8] { try base.incarnation() }
+        func dispatch(_ body: @escaping @Sendable () -> Void) { work.withLock { $0.append(body) } }
+        func claim(_ path: String) throws -> any ServicePathClaim { try base.claim(path) }
+        func prepare(path: String, timeout: Int64, claim: any ServicePathClaim) throws -> any ServiceOwnership {
+            try base.prepare(path: path, timeout: timeout, claim: claim)
+        }
+        func openFile(path: String, options: OpenOptions, catalogID: UInt64, bundle: any ServiceOwnership,
+                      unlockedCodec: EncryptedPageCodec?, structural: Bool, random: any RandomSource) throws -> Database {
+            try base.openFile(path: path, options: options, catalogID: catalogID, bundle: bundle,
+                unlockedCodec: unlockedCodec, structural: structural, random: random)
+        }
+        func owner(_ path: String) -> ServiceOwnerRecord? { base.owner(path) }
+        func endpoint(path: String, incarnation: [UInt8]) -> String? { base.endpoint(path: path, incarnation: incarnation) }
+        func listen(_ endpoint: String) throws -> any ServiceListener { try base.listen(endpoint) }
+        func connect(_ endpoint: String, deadline: ContinuousClock.Instant) throws -> any ServiceFrameTransport {
+            try base.connect(endpoint, deadline: deadline)
+        }
+        func remove(_ endpoint: String) { base.remove(endpoint) }
+        func probeWritable(_ path: String) throws { try base.probeWritable(path) }
+        func now() -> Int64 { base.now() }
+        func pause() { base.pause() }
+        func scratch(sealed: Bool, random: any RandomSource) -> any ScratchFileHost { base.scratch(sealed: sealed, random: random) }
     }
     private final class Peer {
         let process = Process()

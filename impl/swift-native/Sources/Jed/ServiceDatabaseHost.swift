@@ -100,6 +100,10 @@ internal final class ServiceDatabaseHost: CoordinatedDatabaseClose, DatabaseRole
         condition.lock(); defer { condition.unlock() }
         if case .owner(_, let server, _) = role { return server }; return nil
     }
+    var serviceClient: PageServiceClient? {
+        condition.lock(); defer { condition.unlock() }
+        if case .client(let client) = role { return client }; return nil
+    }
     var toolingRole: String {
         condition.lock(); defer { condition.unlock() }
         switch role {
@@ -305,6 +309,13 @@ internal final class ServiceDatabaseHost: CoordinatedDatabaseClose, DatabaseRole
               options.pageService.ownership == .yield || options.readOnly,
               case .owner(_, let server?, _) = role else { condition.unlock(); return false }
         if let requester { condition.unlock(); return requester == id }
+        // The accepted reply may reach a fast client before the worker runs.
+        // Publish the service admission state now; broadcasting here would
+        // recursively take the requesting connection's operation lock.
+        guard server.markDraining(requester: id) else { condition.unlock(); return false }
+        // Also stop local callers that passed the coordinator and are still
+        // waiting for the writer token before their registry admission check.
+        try? core?.pauseAdmissions()
         requester = id; condition.unlock()
         platform.dispatch { self.yieldRole(server: server, requester: id) }
         return true
@@ -312,17 +323,24 @@ internal final class ServiceDatabaseHost: CoordinatedDatabaseClose, DatabaseRole
     private func connectionEnded(_ id: UInt64) {
         condition.lock()
         guard requester == id, !transferring, !closing else { condition.unlock(); return }
+        let server: PageServiceOwner?
+        if case .owner(_, let current, _) = role { server = current } else { server = nil }
+        // Clear both resident gates before another requester can be admitted;
+        // recipient notifications must stay outside the host condition.
+        let cleared = server?.clearDrainReservation(requester: id) ?? false
         requester = nil; core?.resumeAdmissions()
-        let selected = role; condition.broadcast(); condition.unlock()
-        if case .owner(_, let server, _) = selected { server?.cancelDrain(requester: id) }
+        condition.broadcast(); condition.unlock()
+        if cleared { server?.announceDrainCancellation() }
     }
     private func yieldRole(server: PageServiceOwner, requester id: UInt64) {
         guard let core else { return }
-        try? core.pauseAdmissions()
+        condition.lock()
+        guard requester == id, !closing, !closed else { condition.unlock(); return }
+        condition.unlock()
         server.beginDrain(kind: 1, requester: id)
         condition.lock()
         let cancelledBeforeDrain = requester != id || closing || closed
-        let resume = requester != id && !closing && !closed
+        let resume = requester == nil && !closing && !closed
         if resume { core.resumeAdmissions() }
         condition.unlock()
         if cancelledBeforeDrain { if resume { server.cancelDrain(requester: id) }; return }

@@ -66,11 +66,15 @@ final class PageServiceClientTests: XCTestCase {
         for encrypted in [false, true] {
             let pair = try setup(encrypted: encrypted)
             let random = SeededRandomSource(seed: 141), entropy: KeyEntropy = { try random.bytes(count: $0) }
+            // Keep this refresh test independent of the permitted post-ACK
+            // maintenance commit (§6): the old reader prevents reclamation.
+            let beforeCommit = try pair.owner.beginRead(); defer { beforeCommit.close() }
             try appendSequence(pair.client, "from_client", entropy: entropy)
+            try barrier(pair.role) // owner finished its post-ACK work
             XCTAssertEqual(pair.owner.version, 2); XCTAssertEqual(pair.client.version, 2)
             let ownerRead = try pair.owner.beginRead()
             XCTAssertEqual(ownerRead.snapshot.catalog.sequences.map { $0.name.description }, ["from_client"])
-            ownerRead.close()
+            ownerRead.close(); beforeCommit.close()
             try appendSequence(pair.owner, "from_owner", entropy: entropy)
             let refreshed = try pair.client.beginRead()
             XCTAssertEqual(refreshed.snapshot.txid, 3)
