@@ -119,8 +119,11 @@ types, and cost remain unchanged. Physical checksums and recovery reads are not 
 
 Validation establishes readable completeness, not durable completeness. After a process
 crash, the kernel cache can contain all of a failed commit even though a machine crash would
-lose some of it. A writable opener therefore stabilizes the adopted generation with a
-durable sync **before the first new write**. Otherwise a later transaction could overwrite
+lose some of it. A writable opener therefore stabilizes an adopted incremental generation
+(nonzero manifest entry count) with a durable sync **before the first new write**.
+A zero-manifest bootstrap image is already independently durable (§1), so it needs
+no additional data-file stabilization barrier. Its directory entry still follows
+the separate first-write rule below. Otherwise a later transaction could overwrite
 the only actually durable fallback, then a power failure could lose both generations.
 
 This rule also applies to a process that becomes owner, by election or promotion
