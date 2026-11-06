@@ -112,6 +112,47 @@ internal enum ViewDefinition {
             let blockPlan = try SelectPlan.resolve(block, snapshot: snapshot, settings: planningSettings, scalar: scalar, using: blockResolver)
             var joins: [(SQLExpression, [Binding])] = []
             var implicitJoinUses: [Binding] = []
+            var sourceUses: [Binding] = []
+            // FROM producers resolve against preceding siblings, just as the
+            // ordinary relation planner does. Embedded queries must retain
+            // that frame when the later syntax walk traces their dependencies.
+            func sourceResolver(_ expressions: [SQLExpression], preceding: [Binding]) -> ExpressionResolver {
+                let nested = ExpressionResolver(columns: expressionScope(preceding), composites: snapshot.types, scalar: scalar)
+                nested.queryScope = SubqueryScope(snapshot: snapshot, settings: planningSettings)
+                nested.outerScopes = outers.map(expressionScope); nested.cteBindings = lexical
+                nested.hostFunctions = planningSettings.environment.signatures
+                nested.unicode = planningSettings.environment.unicode
+                nested.checkFunction = { try planningSettings.privileges.require(.execute, on: $0, function: true) }
+                nested.resolveAggregate = AggregateQueryPlan.forbidden
+                var pending = expressions
+                while let expression = pending.popLast() {
+                    switch expression.kind {
+                    case .scalarQuery(let child), .exists(let child):
+                        sourceScopes[QueryIdentity(child)] = [preceding] + outers
+                    case .memberQuery(let left, let child, _), .quantifiedQuery(_, let left, _, let child):
+                        sourceScopes[QueryIdentity(child)] = [preceding] + outers
+                        pending.append(left)
+                    default: pending += CatalogExpressionPolicy.children(expression)
+                    }
+                }
+                return nested
+            }
+            func sourceColumns(_ columns: [ExpressionColumn], resolver: ExpressionResolver,
+                               preceding: [Binding]) -> [Binding] {
+                for index in resolver.referencedColumns.sorted() where preceding.indices.contains(index) {
+                    sourceUses.append(preceding[index])
+                }
+                for reference in resolver.outerReferences where reference.depth > 0 && reference.depth <= outers.count {
+                    let bindings = outers[reference.depth - 1]
+                    if bindings.indices.contains(reference.index) { sourceUses.append(bindings[reference.index]) }
+                }
+                return columns.map { column in
+                    addType(column.type.type)
+                    return Binding(label: column.qualifier, name: column.name, type: column.type,
+                        collation: column.collation, unresolved: column.unresolved,
+                        starVisible: !column.hiddenFromStar, qualifiedOnly: column.qualifiedOnly)
+                }
+            }
             func bind(_ from: SQLFrom, preceding: [Binding]) throws -> [Binding] {
                 var columns: [Binding]
                 switch from.source {
@@ -160,7 +201,14 @@ internal enum ViewDefinition {
                             collation: childPlan.projections[index].collation?.asColumn, unresolved: column.type == nil)
                     }
                 case .joined(let nested): columns = try bind(nested, preceding: preceding)
-                default: throw JedError("0A000", "view source dependency tracing is not yet connected")
+                case .function(let expression):
+                    let nested = sourceResolver([expression], preceding: preceding)
+                    let function = try TableFunctionPlan.resolve(from, syntax: expression, resolver: nested)
+                    columns = sourceColumns(function.columns, resolver: nested, preceding: preceding)
+                case .jsonTable(let syntax):
+                    let nested = sourceResolver(ViewSyntax.tableExpressions(syntax), preceding: preceding)
+                    let table = try JSONTablePlan.resolve(from, syntax: syntax, resolver: nested)
+                    columns = sourceColumns(table.columns, resolver: nested, preceding: preceding)
                 }
                 for index in columns.indices {
                     if let alias = from.alias { columns[index].label = alias; columns[index].mergedName = false }
@@ -201,7 +249,7 @@ internal enum ViewDefinition {
                 if let view = column.view, let ordinal = column.ordinal { viewUses[view, default: []].insert(ordinal) }
             }
             for ordinal in blockPlan.touched where scope.indices.contains(ordinal) { use(scope[ordinal]) }
-            for column in implicitJoinUses { use(column) }
+            for column in implicitJoinUses + sourceUses { use(column) }
             for reference in blockResolver.outerReferences where reference.depth > 0 && reference.depth <= outers.count {
                 let bindings = outers[reference.depth - 1]
                 if bindings.indices.contains(reference.index) { use(bindings[reference.index]) }
@@ -323,6 +371,22 @@ internal enum ViewDefinition {
 /// A syntax walk visits isolated query blocks without treating their columns as
 /// references in the surrounding block. Parser admission bounds this recursion.
 internal enum ViewSyntax {
+    /// Include column defaults as well as context/path/PASSING expressions:
+    /// each can contain a stored dependency or a forbidden view parameter.
+    static func tableExpressions(_ table: SQLJSONTable) -> [SQLExpression] {
+        var result = [table.context, table.path] + table.passing.map(\.value)
+        var pending = Array(table.columns.reversed())
+        while let column = pending.popLast() {
+            switch column {
+            case .ordinality: break
+            case .regular(_, _, _, _, _, _, _, let empty, let error):
+                result += [empty?.value, error?.value].compactMap { $0 }
+            case .nested(_, _, let children): pending += children.reversed()
+            }
+        }
+        if let value = table.onError?.value { result.append(value) }
+        return result
+    }
     static func walk(_ input: SQLQuery, query visitQuery: (SQLQuery) throws -> Void = { _ in },
                      leaveQuery: (SQLQuery) -> Void = { _ in }, withPart: (SQLWith, Int?) throws -> Void = { _, _ in },
                      expression visitExpression: (SQLExpression) throws -> Void = { _ in },
@@ -362,8 +426,7 @@ internal enum ViewSyntax {
             case .function(let value): try expression(value)
             case .joined(let value): try from(value)
             case .jsonTable(let value):
-                try expression(value.context); try expression(value.path)
-                for item in value.passing { try expression(item.value) }
+                for value in tableExpressions(value) { try expression(value) }
             case .table: break
             }
             for join in value.joins { try from(join.right); if let condition = join.condition { try expression(condition) } }

@@ -1,0 +1,165 @@
+# View FROM producers use ordinary query resolution (views.md §§1,5,6).
+# A producer creates no relation dependency of its own, but its arguments,
+# JSON_TABLE defaults/PASSING expressions, and embedded queries retain theirs.
+# PostgreSQL-comparable regression; checked with the declared local oracle.
+# requires: ddl.view, ddl.create_table, ddl.drop_table, ddl.alter_table, ddl.view_alter, ddl.sequence, dml.insert, query.select, query.select_star, query.qualified_star, query.order_by, query.comma_from, query.lateral, query.subquery_scalar, query.subquery_correlated, query.derived_table, query.cte, query.table_alias, query.column_alias, types.i32, types.jsonb, types.array, query.set_returning, func.unnest, func.json_table
+
+statement ok
+CREATE VIEW v_series AS SELECT * FROM generate_series(1, 2) AS g
+
+query I nosort
+SELECT * FROM v_series ORDER BY g
+----
+1
+2
+
+statement ok
+CREATE VIEW v_unnest AS SELECT u.* FROM unnest(ARRAY[3,4]) AS u(n)
+
+query I nosort
+SELECT * FROM v_unnest ORDER BY n
+----
+3
+4
+
+statement ok
+CREATE VIEW v_json AS SELECT * FROM JSON_TABLE('[{"id":5,"items":[{"x":7},{}]}]', '$[*]' COLUMNS (id int, NESTED PATH '$.items[*]' COLUMNS (x int DEFAULT 9 ON EMPTY))) AS jt
+
+query II nosort
+SELECT * FROM v_json ORDER BY x
+----
+5
+7
+5
+9
+
+statement ok
+CREATE TABLE source (n int, document jsonb, fallback int, unused int)
+
+statement ok
+INSERT INTO source VALUES (2, '[{"x":4},{}]', 8, 99)
+
+statement ok
+CREATE VIEW v_lateral AS SELECT g FROM source s, generate_series(1, s.n) AS g
+
+query I nosort
+SELECT * FROM v_lateral ORDER BY g
+----
+1
+2
+
+# A source column read only by the producer is still pinned.
+statement error 2BP01
+ALTER TABLE source DROP COLUMN n
+
+# Ordinary revalidation still accepts a change to an unused source column.
+statement ok
+ALTER TABLE source DROP COLUMN unused
+
+statement ok
+ALTER TABLE source RENAME COLUMN n TO stop
+
+query I nosort
+SELECT * FROM v_lateral ORDER BY g
+----
+1
+2
+
+statement ok
+CREATE VIEW v_arg_query AS SELECT g FROM source s, generate_series(1, (SELECT s.stop)) AS g
+
+query I nosort
+SELECT * FROM v_arg_query ORDER BY g
+----
+1
+2
+
+statement ok
+CREATE VIEW v_json_lateral AS SELECT jt.* FROM source s, JSON_TABLE(s.document, '$[*]' COLUMNS (x int DEFAULT 8 ON EMPTY)) AS jt
+
+query I nosort
+SELECT * FROM v_json_lateral ORDER BY x
+----
+4
+8
+
+statement error 2BP01
+ALTER TABLE source DROP COLUMN document
+
+# JSON_TABLE DEFAULT retains ordinary constant-expression restrictions.
+statement error 42804
+CREATE VIEW v_json_column_default AS SELECT jt.* FROM source s, JSON_TABLE('[{}]', '$[*]' COLUMNS (x int DEFAULT s.fallback ON EMPTY)) AS jt
+
+statement error 42804
+CREATE VIEW v_json_query_default AS SELECT jt.* FROM source s, JSON_TABLE('[{}]', '$[*]' COLUMNS (x int DEFAULT (SELECT s.fallback) ON EMPTY)) AS jt
+
+statement ok
+ALTER TABLE source DROP COLUMN fallback
+
+statement ok
+CREATE VIEW v_json_passing AS SELECT jt.* FROM source s, JSON_TABLE('[1,2,3]', '$[*] ? (@ <= $max)' PASSING s.stop AS max COLUMNS (x int PATH '$')) AS jt
+
+query I nosort
+SELECT * FROM v_json_passing ORDER BY x
+----
+1
+2
+
+statement ok
+CREATE TABLE argument_source (n int)
+
+statement ok
+INSERT INTO argument_source VALUES (2)
+
+statement ok
+CREATE VIEW v_argument_table AS SELECT * FROM generate_series(1, (SELECT n FROM argument_source)) AS g
+
+statement error 2BP01
+DROP TABLE argument_source
+
+statement error 2BP01
+ALTER TABLE argument_source DROP COLUMN n
+
+statement ok
+CREATE VIEW v_cte_source AS WITH inputs AS (SELECT stop FROM source) SELECT g FROM inputs, generate_series(1, inputs.stop) AS g
+
+query I nosort
+SELECT * FROM v_cte_source ORDER BY g
+----
+1
+2
+
+statement ok
+CREATE VIEW v_nested AS SELECT d.* FROM (SELECT * FROM generate_series(1,2) AS g) AS d
+
+query I nosort
+SELECT * FROM v_nested ORDER BY g
+----
+1
+2
+
+statement ok
+CREATE SEQUENCE view_seq
+
+statement ok
+CREATE VIEW v_json_sequence AS SELECT * FROM JSON_TABLE('[{"items":[{}]}]', '$[*]' COLUMNS (NESTED PATH '$.items[*]' COLUMNS (x bigint DEFAULT nextval('view_seq') ON EMPTY))) AS jt
+
+statement error 2BP01
+DROP SEQUENCE view_seq
+
+statement ok
+CREATE VIEW v_json_error AS SELECT * FROM JSON_TABLE('[{"x":"bad"}]', '$[*]' COLUMNS (x int DEFAULT 6 ON ERROR)) AS jt
+
+query I nosort
+SELECT * FROM v_json_error
+----
+6
+
+statement ok
+CREATE SEQUENCE error_seq
+
+statement ok
+CREATE VIEW v_json_error_sequence AS SELECT * FROM JSON_TABLE('[{"x":"bad"}]', '$[*]' COLUMNS (x bigint DEFAULT nextval('error_seq') ON ERROR)) AS jt
+
+statement error 2BP01
+DROP SEQUENCE error_seq
