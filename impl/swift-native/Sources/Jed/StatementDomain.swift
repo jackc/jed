@@ -20,10 +20,10 @@ internal enum StatementDomain {
             for owner in try targets(value, in: domains) { append(owner) }
         }
         switch statement {
-        case .insert(let value): try existing(value.table)
-        case .update(let value): try existing(value.table)
-        case .delete(let value): try existing(value.table)
-        case .merge(let value): try existing(value.table)
+        case .insert(let value): append(try ViewDomain.written(value.table, domains: domains))
+        case .update(let value): append(try ViewDomain.written(value.table, domains: domains))
+        case .delete(let value): append(try ViewDomain.written(value.table, domains: domains))
+        case .merge(let value): append(try ViewDomain.written(value.table, domains: domains))
         case .createTable(let value):
             try created(value.name, temporary: value.temporary)
             if value.withData, let query = value.query { try nested(.query(query)) }

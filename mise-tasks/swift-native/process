@@ -6,6 +6,8 @@
 
 require_relative "../../impl/swift-native/Tools/swift_task"
 require_relative "../../impl/swift-native/Tools/generate_spec"
+require "digest"
+require "tmpdir"
 SwiftSpecGenerator.run(["--check"])
 configuration = ENV.fetch("usage_configuration", "debug")
 abort "configuration must be debug or release" unless %w[debug release].include?(configuration)
@@ -17,12 +19,23 @@ actor = File.join(SwiftNativeTasks::BUILD, configuration, "jed-process")
 abort "native Swift actor is not built: #{actor}" unless File.executable?(actor)
 environment = {
   "JED_PROCESS_CORES" => ENV.fetch("JED_PROCESS_CORES", "swift-native"),
-  "JED_SWIFT_PROCESS_ACTOR" => actor,
-  "JED_PROCESS_PAGES_ACTOR" => actor,
   "JED_PROCESS_CORPUS" => File.join(SwiftNativeTasks::PACKAGE, "Tools/Fixtures/Process"),
   "JED_PROCESS_FIXTURE_ROOT" => File.join(SwiftNativeTasks::PACKAGE, "Tests/JedTests/Fixtures"),
   # Frozen capability lists predate this experiment. Never silently substitute
   # another SQL engine for the selected actor when a capability is missing.
   "JED_PROCESS_STRICT_CORES" => "1"
 }
-exec(environment, "ruby", File.join(SwiftNativeTasks::ROOT, "scripts/process_conformance.rb"))
+# A SwiftPM gate may relink the build product while this long-running matrix
+# starts later scenarios. Every actor and serving child must use the same bytes.
+status = nil
+Dir.mktmpdir("jed-swift-process-") do |directory|
+  snapshot = File.join(directory, "jed-process")
+  FileUtils.copy_file(actor, snapshot)
+  File.chmod(0o700, snapshot)
+  warn "Swift process actor snapshot: #{Digest::SHA256.file(snapshot).hexdigest}"
+  environment["JED_SWIFT_PROCESS_ACTOR"] = snapshot
+  environment["JED_PROCESS_PAGES_ACTOR"] = snapshot
+  system(environment, "ruby", File.join(SwiftNativeTasks::ROOT, "scripts/process_conformance.rb"))
+  status = $?
+end
+exit(status&.exitstatus || 1)

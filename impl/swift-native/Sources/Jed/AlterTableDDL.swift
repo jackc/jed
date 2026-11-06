@@ -32,11 +32,12 @@ extension CatalogDDL {
         try context.sequences?.apply(to: &snapshot)
         context.sequences?.synchronizeDefinitions(from: snapshot.catalog, domain: settings.targetDomain)
         var image = snapshot.catalog, table = original
+        var externalViews = CatalogExternalViews.privateViews(settings)
         var removedIndexes: Set<SQLText> = [], renamedIndexes: [(SQLText, SQLText)] = []
         var addedConstraints: Set<SQLText> = []
         var sources = original.columns.indices.map(AlterRowSource.original)
         var steps: [AlterRowStep] = []
-        var changedTypes: Set<Int> = [], changedViewColumns: Set<SQLText> = []
+        var changedTypes: Set<Int> = []
         var clearStatistics = false
         var preparationCost: Int64 = 0
         func column(_ name: SQLText) throws -> Int {
@@ -66,7 +67,8 @@ extension CatalogDDL {
                 try CatalogSQL.reserved(new, kind: "table")
                 guard !CatalogDomain.relations(image, settings: settings).contains(new) else { throw JedError("42P07", "relation already exists: \(new)") }
                 let oldName = table.name
-                try ViewRewrite.references(in: &image, name: oldName, kind: 0, renamed: new, columns: table.columns.map(\.name))
+                try ViewRewrite.references(in: &image, name: oldName, kind: 0, renamed: new, columns: table.columns.map(\.name), domain: settings.targetDomain)
+                CatalogExternalViews.rename(&externalViews, name: oldName, renamed: new)
                 try CatalogRewrite.tableExpressions(&table, renamedTable: new)
                 table.name = new
                 for child in image.tables.indices {
@@ -80,7 +82,8 @@ extension CatalogDDL {
             case .renameColumn(let old, let new):
                 let ordinal = try column(old)
                 guard !table.columns.contains(where: { $0.name == new }) else { throw JedError("42701", "column already exists: \(new)") }
-                try ViewRewrite.references(in: &image, name: table.name, kind: 0, column: (ordinal, new), columns: table.columns.map(\.name))
+                try ViewRewrite.references(in: &image, name: table.name, kind: 0, column: (ordinal, new), columns: table.columns.map(\.name), domain: settings.targetDomain)
+                CatalogExternalViews.rename(&externalViews, name: table.name, column: (old, new))
                 try CatalogRewrite.tableExpressions(&table, column: (old, new))
                 table.columns[ordinal].name = new
             case .renameConstraint(let old, let new):
@@ -136,7 +139,7 @@ extension CatalogDDL {
                     throw JedError("55000", "column is not an identity column")
                 }
                 let owned = try ownedSequence(ordinal), sequenceName = image.sequences[owned].name
-                guard !image.views.contains(where: { $0.dependencies.contains { $0.kind == 2 && $0.name == sequenceName } }) else {
+                guard !(image.views + externalViews).contains(where: { $0.dependencies.contains { $0.kind == 2 && $0.name == sequenceName } }) else {
                     throw JedError("2BP01", "cannot drop identity because other objects depend on its sequence")
                 }
                 image.sequences.remove(at: owned)
@@ -146,8 +149,14 @@ extension CatalogDDL {
                     if ifExists { continue }
                     throw JedError("42703", "column does not exist: \(name)")
                 }
+                let removedSequences = Set(image.sequences.filter {
+                    $0.owner?.table == table.name && $0.owner?.column == ordinal
+                }.map(\.name))
+                let removedTable = table.name
                 try AlterColumnDDL.drop(ordinal, table: &table, image: &image, cascade: cascade,
-                    removedIndexes: &removedIndexes, added: &addedConstraints)
+                    removedIndexes: &removedIndexes, added: &addedConstraints,
+                    externalViews: externalViews, domain: settings.targetDomain)
+                CatalogExternalViews.drop(&externalViews, table: removedTable, column: name, sequences: removedSequences)
                 sources.remove(at: ordinal); steps.append(.remove(ordinal)); clearStatistics = true
                 changedTypes = Set(changedTypes.filter { $0 != ordinal }.map { $0 > ordinal ? $0 - 1 : $0 })
             case .dropConstraint(let name, let ifExists, let cascade):
@@ -198,7 +207,6 @@ extension CatalogDDL {
                 table.foreignKeys = image.tables[position].foreignKeys
             case .setType(let name, let target, let using):
                 let ordinal = try column(name)
-                if case .original(let old) = sources[ordinal] { changedViewColumns.insert(original.columns[old].name) }
                 let value = try AlterColumnType.apply(ordinal, target: target, using: using, table: &table,
                     image: &image, source: source, snapshot: snapshot, settings: settings, context: context, preparationCost: &preparationCost)
                 changedTypes.insert(ordinal); clearStatistics = true; steps.append(.convert(ordinal, value))
@@ -207,7 +215,8 @@ extension CatalogDDL {
             }
             image.tables[position] = table
         }
-        for view in image.views {
+        let changedViewColumns = Set(changedTypes.map { table.columns[$0].name })
+        for view in image.views + externalViews {
             if view.dependencies.contains(where: { $0.kind == 0 && $0.name == table.name && !$0.columns.filter(changedViewColumns.contains).isEmpty }) {
                 throw JedError("0A000", "cannot alter type of a column used by a view")
             }

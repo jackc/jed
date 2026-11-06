@@ -200,8 +200,9 @@ Session and Rows operations. A small `ExperimentalTools` SPI exposes the
 unratified backup operation and process-test role/page-count/ack-fault hooks;
 it contains no SQL evaluator. The actor implements the canonical line protocol,
 16 MiB bounded UTF-8 input, hex SQL, real read/write session lifetimes, explicit
-cursor draining, maintenance, backup and owner-idle setup. Unimplemented stream
-and attachment operations return counted `0A000` failures.
+cursor draining, maintenance, backup and owner-idle setup. Attachment actions use
+the native multi-domain API; stream actions select the native Swift pages actor.
+Any unsupported actor operation returns a counted error rather than being skipped.
 
 `mise run swift-native:process` builds the actor and runs the canonical process
 driver against all 31 scenarios copied verbatim from the baseline by mechanical

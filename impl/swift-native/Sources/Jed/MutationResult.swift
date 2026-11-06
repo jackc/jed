@@ -23,8 +23,8 @@ internal final class MutationResult {
         return row
     }
     func close() { rows = []; meter.resources.query.release(reserved); reserved = 0 }
-    func cursor(failure: @escaping (Error) -> Void = { _ in }) -> Rows {
-        Rows(columns: columns, meter: meter, command: command, affected: affected,
+    func cursor(guardCostOnPull: Bool = true, failure: @escaping (Error) -> Void = { _ in }) -> Rows {
+        Rows(columns: columns, meter: meter, command: command, affected: affected, guardCostOnPull: guardCostOnPull,
              pull: next, release: close, failure: failure)
     }
     deinit { close() }

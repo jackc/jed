@@ -151,12 +151,22 @@ internal final class PageServiceClient: DatabaseRemote, @unchecked Sendable {
         if let count = readers[version] { readers[version] = count + 1; return }
         // A cursor born in a write transaction needs an independent read pin
         // before commit/abort releases the write pin. The held gate fixes txid.
-        guard writePin == version,
-              case .readBegun(let reply) = try connection.request(.beginRead(cache)).wait(), reply.point.txid == version else {
-            throw JedError("08006", "cannot retain an unpinned remote snapshot")
+        guard writePin == version else { throw JedError("08006", "cannot retain an unpinned remote snapshot") }
+        guard case .readBegun(let reply) = try connection.request(.beginRead(cache)).wait() else {
+            throw PageServiceProtocol.violation("begin_read received another reply kind")
         }
-        _ = try validate(reply); readers[version] = 1
+        do {
+            _ = try validate(reply)
+            guard reply.point.txid == version else { throw JedError("25P03", "remote writer snapshot was revoked") }
+            readers[version] = 1
+        } catch {
+            // A revoked writer may receive the owner's newer snapshot. This
+            // request acquired a real read pin even though we cannot adopt it.
+            try? connection.notify(.endRead(reply.point.txid))
+            throw error
+        }
     }
+
     func releaseRead(version: UInt64) {
         pins.lock(); defer { pins.unlock() }
         guard let count = readers[version] else { return }

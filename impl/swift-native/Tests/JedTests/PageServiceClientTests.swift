@@ -4,7 +4,7 @@ import XCTest
 @testable import Jed
 
 final class PageServiceClientTests: XCTestCase {
-    private func setup(encrypted: Bool = false) throws -> (owner: DatabaseCore, client: DatabaseCore, role: PageServiceClient) {
+    private func setup(encrypted: Bool = false, limits: PageServiceOwnerLimits = .init()) throws -> (owner: DatabaseCore, client: DatabaseCore, role: PageServiceClient) {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("jed-swift-client-" + UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
         addTeardownBlock { try FileManager.default.removeItem(at: directory) }
@@ -16,7 +16,7 @@ final class PageServiceClientTests: XCTestCase {
         try owner.startService(incarnation: [UInt8](repeating: 5, count: 16))
         let endpoint = directory.appendingPathComponent("s").path
         let server = PageServiceOwner(core: owner, listener: try UnixServiceSocket.listen(path: endpoint),
-            entropy: { try random.bytes(count: $0) })
+            limits: limits, entropy: { try random.bytes(count: $0) })
         server.start(); addTeardownBlock { server.stop() }
         let deadline = ContinuousClock.now.advanced(by: .seconds(2))
         let connection = try PageServiceConnection.open(socket: UnixServiceSocket.connect(path: endpoint, deadline: deadline),
@@ -68,6 +68,20 @@ final class PageServiceClientTests: XCTestCase {
             XCTAssertEqual(pair.owner.livePinCount, 0)
         }
     }
+    func testExpiredWriterCannotLeakNewerReadPinDuringCursorRetention() throws {
+        let pair = try setup(limits: .init(idleWriteMilliseconds: 20))
+        let writer = try pair.client.acquireWriter(); defer { writer.close() }
+        Thread.sleep(forTimeInterval: 0.08)
+        try appendSequence(pair.owner, "after_expiry")
+        XCTAssertThrowsError(try writer.pin(writer.snapshot)) { XCTAssertEqual(($0 as? JedError)?.code, "25P03") }
+        try barrier(pair.role)
+        XCTAssertEqual(pair.owner.livePinCount, 0)
+        XCTAssertFalse(pair.role.connection.isClosed)
+        writer.close(); try barrier(pair.role)
+        let current = try pair.client.beginRead(); current.close(); try barrier(pair.role)
+        XCTAssertEqual(pair.owner.livePinCount, 0)
+    }
+
     func testEndedClientRoleRefusesStatementAndCommitButAllowsRollback() throws {
         let pair = try setup(), database = Database(core: pair.client, environment: Environment.builder().build())
         let session = try database.session(), reader = try database.readSession()

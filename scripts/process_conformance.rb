@@ -2,6 +2,7 @@
 # Layer-4 real-process shared-file driver (spec/design/concurrency-testing.md §10).
 
 require "json"
+require "fileutils"
 require "open3"
 require "tmpdir"
 require "timeout"
@@ -285,6 +286,13 @@ def run_scenario(path, first_core, second_core)
     end
     # byte_identical_files: further files (backups) whose bytes must agree across core pairings.
     files = data.fetch("byte_identical_files", []).to_h { |p| [p, File.binread(File.join(dir, "#{p}.jed"))] }
+    if destination = ENV["JED_PROCESS_ARTIFACTS"]
+      # Explicit diagnostic output only; normal conformance keeps no artifacts.
+      target = File.join(destination, File.basename(path, ".process.toml"), "#{first_core}-#{second_core}")
+      FileUtils.mkdir_p(target)
+      files.each { |file, bytes| File.binwrite(File.join(target, "#{file}.jed"), bytes) }
+      File.binwrite(File.join(target, "shared.jed"), image) if image
+    end
     [name, image ? { "shared" => image }.merge(files) : (files.empty? ? nil : files)]
   end
 end

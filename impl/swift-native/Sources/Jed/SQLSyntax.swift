@@ -221,7 +221,7 @@ internal indirect enum SQLStatement: Sendable {
     case begin(writable: Bool?), commit, rollback
     case savepoint(SQLText), release(SQLText), rollbackTo(SQLText)
 }
-internal struct SQLExplain: Sendable { var analyze = false; var verbose = false; var costs = true; var lane = true }
+internal struct SQLExplain: Sendable { var analyze = false; var verbose = false; var costs = true; var lane = false }
 internal struct SQLDrop: Sendable { var object: String; var names: [SQLName]; var ifExists: Bool; var cascade: Bool }
 internal struct SQLReindex: Sendable {
     var object: String

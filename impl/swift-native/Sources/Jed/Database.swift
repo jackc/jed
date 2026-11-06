@@ -206,6 +206,27 @@ public final class Session {
     private func requireClean() throws {
         if transaction?.failed == true { throw JedError("25P02", "current transaction is aborted, commands ignored until end of transaction block") }
     }
+    /// Host catalog APIs share the session snapshot and publication machinery.
+    /// Their validation errors leave an existing SQL block usable.
+    internal func withHostCatalogRead<T>(_ body: (DomainSnapshot) throws -> T) throws -> T {
+        try checkOpen(); try checkStatementRole()
+        let pin = try readBundle(); defer { pin.close() }
+        return try body(pin.domains.snapshot(DomainNames.main))
+    }
+    internal func withHostCatalogWrite<T>(_ body: (inout DomainSnapshot) throws -> T) throws -> T {
+        try checkOpen(); try checkStatementRole(); try requireClean()
+        guard readPin == nil, !database.isReadOnly, transaction == nil || transaction?.writer != nil else {
+            throw JedError("25006", "cannot modify a catalog in a read-only transaction")
+        }
+        let active = transaction, frame = try writeFrame(shared: true, cancellation: nil)
+        defer { if active == nil { frame.close() } }
+        var working = frame.working, snapshot = try frame.working.snapshot(DomainNames.main)
+        let result = try body(&snapshot)
+        working.snapshots[DomainNames.main] = snapshot
+        frame.working = working
+        if active == nil { try publish(frame) }
+        return result
+    }
     private func readBundle() throws -> DomainReadBundle {
         if let transaction { return try transaction.cursorPin() }
         let result = try readPin?.retain() ?? database.domains.read(main: database)
@@ -305,6 +326,12 @@ public final class Session {
             case .rollbackTo(let name): try checkStatementRole(); try restoreSavepoint(name); return emptyRows("ROLLBACK")
             default: try checkStatementRole(); try requireClean()
             }
+            if case .reindex(let options) = statement, let active = transaction,
+               options.concurrently || options.object == "database" || options.object == "system" {
+                active.failed = true
+                let form = options.concurrently ? "CONCURRENTLY" : options.object.uppercased()
+                throw JedError("25001", "REINDEX \(form) cannot run inside a transaction block")
+            }
             let meter = try settings.newMeter(pendingBytes: transaction?.working.pendingBytes ?? 0, cancellation: cancellation)
             switch statement {
             case .begin(let writable):
@@ -321,6 +348,8 @@ public final class Session {
                 guard let index = transaction.savepoints.lastIndex(where: { $0.name == name }) else { throw JedError("3B001", "savepoint does not exist: \(name)") }
                 transaction.savepoints.removeSubrange(index...)
                 return emptyRows("RELEASE", meter: meter)
+            case .explain(let options, let body):
+                return try explain(options, statement: body, parameters: parameters, meter: meter, cancellation: cancellation)
             case .query(let query):
                 if WritableCTEPlan.containsWrite(statement) {
                     return try write(statement, source: text, parameters: parameters, meter: meter, cancellation: cancellation)
@@ -360,6 +389,79 @@ public final class Session {
     private func emptyRows(_ command: String, meter: CostMeter = CostMeter()) -> Rows {
         Rows(columns: [], meter: meter, command: command, pull: { nil })
     }
+    private func explain(_ options: SQLExplain, statement: SQLStatement, parameters: [SQLValue],
+                         meter: CostMeter, cancellation: CancellationToken?) throws -> Rows {
+        let pin = try readBundle(), active = transaction
+        do {
+            var planning = settings; planning.domains = pin.domains
+            let snapshot = try pin.domains.snapshot(DomainNames.main)
+            try StatementPrivileges.check(statement, snapshot: snapshot, settings: planning)
+            let services = StatementServices(settings: planning, meter: meter)
+            let plan = try ExplainPlan.resolve(options, statement: statement, snapshot: snapshot,
+                settings: planning, context: services.context(), parameters: parameters)
+            if options.analyze && plan.writes {
+                pin.close()
+                return try explainWriting(options, statement: statement, parameters: parameters,
+                    meter: meter, cancellation: cancellation)
+            }
+            var cost: Int64 = 0, count: Int64 = 0
+            if options.analyze {
+                let inner = CostMeter(limit: meter.limit, lifetime: meter.lifetime,
+                    resources: meter.resources, cancellation: meter.cancellation)
+                let executionServices = StatementServices(settings: planning, meter: inner)
+                var context = executionServices.context(), working = pin.domains
+                let sequences = SequenceExecution(domains: working, targetDomain: plan.targetDomain,
+                    history: sequenceHistory, meter: inner, writable: false)
+                sequences.install(into: &context)
+                count = try plan.analyze(working: &working, settings: planning, context: context,
+                    requireWritable: { _ in throw JedError("25006", "cannot write in a read-only transaction") }, checkRole: pin.checkRole)
+                try inner.checkpoint(); cost = inner.accrued
+            }
+            let result = try plan.render(meter: meter, analyzedCost: cost, analyzedRows: count)
+            let rows = Rows(columns: result.columns, meter: meter, command: "EXPLAIN", guardCostOnPull: false,
+                pull: { try pin.checkRole(); return result.next() }, release: { result.close(); pin.close() },
+                failure: { _ in active?.failed = true })
+            return active?.own(rows) ?? rows
+        } catch { pin.close(); throw error }
+    }
+    private func explainWriting(_ options: SQLExplain, statement: SQLStatement, parameters: [SQLValue],
+                                meter: CostMeter, cancellation: CancellationToken?) throws -> Rows {
+        let active = transaction
+        var admissionDomains = try active?.working ?? readPin?.domains ?? database.domains.routing(main: database)
+        if active == nil { admissionDomains.snapshots[DomainNames.temporary] = temporary!.core.routingSnapshot }
+        var admission = settings; admission.domains = admissionDomains
+        try StatementPrivileges.check(statement, snapshot: admissionDomains.snapshot(DomainNames.main), settings: admission)
+        let targets = try StatementDomain.targets(statement, in: admissionDomains)
+        let sequenceWrites = StatementSequenceWrites.requiresSharedWriter(statement, domains: admissionDomains, settings: admission)
+        let frame = try writeFrame(shared: sequenceWrites || targets.contains { $0 != DomainNames.temporary }, cancellation: cancellation)
+        defer { if active == nil { frame.close() } }
+        var working = frame.working, planning = settings
+        if var temp = working.snapshots[DomainNames.temporary], let main = working.snapshots[DomainNames.main] {
+            try temp.borrowTypes(main.types); working.snapshots[DomainNames.temporary] = temp
+        }
+        planning.domains = working
+        let snapshot = try working.snapshot(DomainNames.main)
+        try StatementPrivileges.check(statement, snapshot: snapshot, settings: planning)
+        let services = StatementServices(settings: planning, meter: meter)
+        let plan = try ExplainPlan.resolve(options, statement: statement, snapshot: snapshot,
+            settings: planning, context: services.context(), parameters: parameters)
+        let inner = CostMeter(limit: meter.limit, lifetime: meter.lifetime,
+            resources: meter.resources, cancellation: meter.cancellation)
+        let executionServices = StatementServices(settings: planning, meter: inner)
+        var context = executionServices.context()
+        let sequences = SequenceExecution(domains: working, targetDomain: plan.targetDomain, history: sequenceHistory,
+            meter: inner, writable: true, writableDomains: frame.writableDomains)
+        sequences.install(into: &context)
+        let count = try plan.analyze(working: &working, settings: planning, context: context,
+            requireWritable: frame.requireWritable, checkRole: frame.checkRole)
+        try inner.checkpoint()
+        try sequences.apply(to: &working)
+        let result = try plan.render(meter: meter, analyzedCost: inner.accrued, analyzedRows: count)
+        try finishWrite(working, statement: statement, frame: frame, active: active, meter: meter, guardCost: false)
+        sequenceHistory = sequences.history
+        let rows = result.cursor(guardCostOnPull: false, failure: { _ in active?.failed = true })
+        return active?.own(rows) ?? rows
+    }
     private func writeQuery(_ query: SQLQuery, parameters: [SQLValue], meter: CostMeter,
                             cancellation: CancellationToken?) throws -> Rows {
         let active = transaction
@@ -389,17 +491,19 @@ public final class Session {
     private func write(_ statement: SQLStatement, source: SQLText, parameters: [SQLValue],
                        meter: CostMeter, cancellation: CancellationToken?) throws -> Rows {
         let active = transaction
-        let probe = try active == nil ? readBundle() : nil
-        let admissionDomains = active?.working ?? probe!.domains
+        var admissionDomains = try active?.working ?? readPin?.domains ?? database.domains.routing(main: database)
+        if active == nil { admissionDomains.snapshots[DomainNames.temporary] = temporary!.core.routingSnapshot }
         let targets: [SQLText]
-        do {
-            var admission = settings; admission.domains = admissionDomains
-            try StatementPrivileges.check(statement, snapshot: admissionDomains.snapshot(DomainNames.main), settings: admission)
-            targets = try StatementDomain.targets(statement, in: admissionDomains)
+        var admission = settings; admission.domains = admissionDomains
+        try StatementPrivileges.check(statement, snapshot: admissionDomains.snapshot(DomainNames.main), settings: admission)
+        targets = try StatementDomain.targets(statement, in: admissionDomains)
+        let maintenance: Bool
+        switch statement { case .reindex, .analyze: maintenance = true; default: maintenance = false }
+        if maintenance, let active, active.writer == nil {
+            throw JedError("25006", "cannot execute maintenance in a read-only transaction")
         }
-        catch { probe?.close(); throw error }
-        probe?.close()
-        let frame = try writeFrame(shared: targets.contains { $0 != DomainNames.temporary }, cancellation: cancellation)
+        let sequenceWrites = StatementSequenceWrites.requiresSharedWriter(statement, domains: admissionDomains, settings: admission)
+        let frame = try writeFrame(shared: maintenance || sequenceWrites || targets.contains { $0 != DomainNames.temporary }, cancellation: cancellation)
         defer { if active == nil { frame.close() } }
         var working = frame.working
         if var temp = working.snapshots[DomainNames.temporary], let main = working.snapshots[DomainNames.main] {
@@ -416,7 +520,20 @@ public final class Session {
         let result: MutationResult
         try StatementPrivileges.check(statement, snapshot: working.snapshot(target), settings: executionSettings)
         defer { meter.pendingDomainBase = 0; meter.pendingDomainExcluded = false }
-        if case .createTable(let definition) = statement, definition.query != nil {
+        if case .reindex(let syntax) = statement {
+            guard parameters.isEmpty else { throw JedError("42601", "REINDEX takes no bind parameters") }
+            let tag = try ReindexExecution.execute(syntax, working: &working, settings: executionSettings,
+                context: context, requireWritable: frame.requireWritable)
+            result = MutationResult(command: tag.command, meter: meter)
+        } else if case .analyze(let name, let columns) = statement {
+            guard parameters.isEmpty else { throw JedError("42601", "ANALYZE takes no bind parameters") }
+            try frame.requireWritable(target)
+            var snapshot = try working.snapshot(target)
+            let tag = try AnalyzeExecution.execute(name, columns: columns, snapshot: &snapshot,
+                settings: executionSettings, context: context)
+            working.snapshots[target] = snapshot
+            result = MutationResult(command: tag.command, meter: meter)
+        } else if case .createTable(let definition) = statement, definition.query != nil {
             result = try CreateTableAs.execute(definition, working: &working, settings: executionSettings,
                 context: context, parameters: parameters, requireWritable: frame.requireWritable)
         } else if let mutation = try WritableCTEExecution.execute(statement, working: &working, settings: executionSettings,
@@ -447,7 +564,7 @@ public final class Session {
         return active?.own(rows) ?? rows
     }
     private func finishWrite(_ working: QueryDomains, statement: SQLStatement, frame: SessionTransaction,
-                             active: SessionTransaction?, meter: CostMeter) throws {
+                             active: SessionTransaction?, meter: CostMeter, guardCost: Bool = true) throws {
         let before = try frame.working.snapshot(DomainNames.temporary)
         let after = try working.snapshot(DomainNames.temporary)
         var actions = frame.temporaryActions
@@ -455,7 +572,8 @@ public final class Session {
         if after.hasChanges(comparedTo: frame.temporaryWriter.snapshot) {
             try temporary!.checkBudget(settings.options.maxTemporaryStorageBytes)
         }
-        try meter.checkpoint(); try meter.syncPending(working.pendingBytes)
+        if guardCost { try meter.checkpoint() } else { try meter.poll() }
+        try meter.syncPending(working.pendingBytes)
         frame.working = working; frame.temporaryActions = actions
         if active == nil {
             try publish(frame)

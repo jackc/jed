@@ -58,13 +58,21 @@ nil represents the unresolved SQL `unknown` type of an all-NULL output. Consult
 the progress record for the currently admitted SQL subset.
 
 `Database.create`, `deserialize` and `serialize` provide creation and byte import/
-export. File maintenance also exposes `changeCredential(credential:kdf:)` and
-`rekey(credential:kdf:)`; a nil rekey credential produces plaintext. Open a
-plaintext source with `scratchEncryption: .on` before encrypting it. Maintenance
-currently targets `"main"`; attachments are still being implemented. Linux's
-default `.automatic` locking mode now connects the native page-service owner/client
-host. Its multi-process verification is in progress; see the progress record for
-tested scenarios and outstanding failures. `PageServiceOptions` controls serving,
-ownership preference, grace periods, connection limits, and idle timeouts.
-These experimental APIs do not change supported
+export. `attach(_:source:readOnly:)` and `detach(_:)` manage named memory or file
+domains. `compact`, `changeCredential` and `rekey` accept an exact domain name,
+defaulting to `"main"`. A nil rekey credential produces plaintext. Open a
+plaintext root with `scratchEncryption: .on` before encrypting a file attachment
+or main; the root's scratch policy governs the whole handle. Maintenance refuses
+active writers immediately, and replacement also requires the target's readers
+to finish. Credential rewrapping permits existing readers.
+
+Linux's default `.automatic` locking mode connects the native page-service
+owner/client host. `PageServiceOptions` controls serving, ownership preference,
+grace periods, connection limits, and idle timeouts. `Database.openRemote` accepts
+a `PageTransport` factory or a command array for a native page-service stream.
+The command form requires Linux pidfd spawn support (glibc 2.39+); an unsupported
+host returns `0A000` and can supply its own transport. Credentials travel in the
+protocol hello, not the command arguments. Run the frozen process scenarios with
+`mise run swift-native:process`; consult the progress record for verified modes
+and outstanding acceptance work. These experimental APIs do not change supported
 core delivery or normal repository verification.

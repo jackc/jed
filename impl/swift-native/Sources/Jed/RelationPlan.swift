@@ -272,6 +272,8 @@ internal final class RelationExecution {
     private func materialize(_ plan: RelationPlan, touched: Set<Int>, context: ExpressionContext? = nil) throws -> [[SQLValue]] {
         let context = context ?? self.context
         let meter = context.meter
+        let before = meter.accrued
+        defer { context.executionProfile?.add(plan, .total, meter.accrued - before) }
         func masked(_ row: [SQLValue]) -> [SQLValue] {
             row.enumerated().map { touched.contains($0.offset) ? $0.element : .null }
         }
@@ -525,6 +527,12 @@ internal final class SelectInput {
     init(plan: SelectPlan, context: ExpressionContext) { self.plan = plan; self.context = context }
     func prime() throws {
         if !started {
+            let before = context.meter.accrued
+            let filters = context.executionProfile?.value(plan.profileIdentity, .filter) ?? 0
+            defer {
+                let after = context.executionProfile?.value(plan.profileIdentity, .filter) ?? 0
+                context.executionProfile?.add(plan.profileIdentity, .source, max(0, context.meter.accrued - before - (after - filters)))
+            }
             started = true
             if let source = plan.relation { relation = RelationExecution(plan: source, context: context, touched: Set(plan.touched)) }
             else {
@@ -549,7 +557,7 @@ internal final class SelectInput {
                             for item in buffered! {
                                 guard let row = item else { continue }
                                 var current = context; current.column = { row[$0] }
-                                if try current.matches(predicate) { kept.append(row) }
+                                if try context.profile(plan.profileIdentity, .filter, { try current.matches(predicate) }) { kept.append(row) }
                                 else {
                                     let bytes = MemorySizes.row(row); context.meter.resources.query.release(bytes); bufferedBytes -= bytes
                                 }
@@ -563,6 +571,8 @@ internal final class SelectInput {
     }
     func next(retaining: Bool = false) throws -> [SQLValue]? {
         try prime()
+        let before = context.meter.accrued
+        defer { context.executionProfile?.add(plan.profileIdentity, .source, context.meter.accrued - before) }
         if let relation { return try relation.next(retaining: retaining) }
         if empty { return nil }
         if buffered != nil {

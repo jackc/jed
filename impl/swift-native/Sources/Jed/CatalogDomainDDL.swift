@@ -23,7 +23,12 @@ internal extension CatalogDDL {
         defer { meter.pendingDomainBase = oldPendingBase; meter.pendingDomainExcluded = oldPendingExcluded }
         guard let tag = try execute(statement, source: source, snapshot: &snapshot, settings: scoped,
                                     context: context, meter: meter) else { return nil }
-        working.snapshots[owner] = snapshot
+        var frame = working
+        frame.snapshots[owner] = snapshot
+        try CatalogExternalViews.apply(statement, before: working, after: &frame, settings: scoped, context: context)
+        if let before = working.snapshots[DomainNames.temporary], let after = frame.snapshots[DomainNames.temporary],
+           after.hasChanges(comparedTo: before) { try requireWritable(DomainNames.temporary) }
+        working = frame
         return tag
     }
 

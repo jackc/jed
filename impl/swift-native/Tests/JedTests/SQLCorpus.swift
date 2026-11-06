@@ -75,14 +75,13 @@ struct SQLCorpusFile {
                 sql.append(lines[index]); index += 1
             }
             guard !sql.isEmpty else { throw invalid("empty SQL record", line) }
-            if case .query(let tags, _) = kind {
+            if case .query = kind {
                 guard index < lines.count, lines[index] == "----" else { throw invalid("query is missing ----", line) }
                 index += 1
                 while index < lines.count, !lines[index].isEmpty { expected.append(lines[index]); index += 1 }
                 if expected.count == 1, expected[0].contains(" values hashing to ") {
                     throw invalid("hashed query results are not connected", line)
                 }
-                guard expected.count % tags.count == 0 else { throw invalid("expected cells do not form complete rows", line) }
             } else if pending.contains(where: { $0.name == "names" || $0.name == "types" }) {
                 throw invalid("names/types directive decorates a statement", line)
             }
@@ -200,7 +199,7 @@ final class SQLCorpusRunner {
                 case .query(let tags, let sort):
                     report.cells += actual.count
                     if let failure { problems.append("unexpected \(failure)") }
-                    else if columnNames.count != tags.count { problems.append("expected \(tags.count) columns, got \(columnNames.count)") }
+                    else if sort != .nosort, columnNames.count != tags.count { problems.append("expected \(tags.count) columns, got \(columnNames.count)") }
                     else if !Self.match(record.expected, actual, tags: tags, sort: sort) {
                         problems.append("expected \(Self.preview(record.expected)), got \(Self.preview(actual))")
                         if sort == .nosort, record.expected.count == actual.count,
@@ -318,7 +317,11 @@ final class SQLCorpusRunner {
         return "\(items)\(values.count > 12 ? " (\(values.count) cells)" : "")"
     }
     static func match(_ expected: [String], _ actual: [String], tags: [UInt8], sort: SQLCorpusFile.Sort) -> Bool {
-        guard !tags.isEmpty, expected.count == actual.count, actual.count % tags.count == 0 else { return false }
+        guard !tags.isEmpty, expected.count == actual.count else { return false }
+        // The canonical nosort harness compares flattened cells. Historical
+        // headers may have fewer rendering tags; #names/#types assert metadata.
+        // A rowsort still needs complete rows so no trailing cell can disappear.
+        if sort == .rowsort, actual.count % tags.count != 0 { return false }
         func less(_ a: String, _ b: String) -> Bool { a.utf8.lexicographicallyPrecedes(b.utf8) }
         func ordered(_ values: [String]) -> [String] {
             switch sort {

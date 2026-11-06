@@ -247,9 +247,9 @@ They do not establish process-corpus, SQL, simulation or cross-core completion.
 |---|---|---|
 | H01–H03, file portions of H08 and R07 | `FileDatabaseHost`, `FileLockBundle`, `DatabaseCore`, `StorageDomain`, ordinary POSIX byte devices, reader pins and independent COW domains; file-host, coordinator and storage lifecycle tests pass. | Complete session/attachment matrix and cross-core mode runs. |
 | Storage maintenance and encryption lifetime | `DatabaseMaintenance`, `DomainImage`, `DomainRebuilder`, `ScratchDomain`, key rewrap/rekey and no-clobber publication; ordinary and encrypted frozen images exercise the native page sink. | All canonical maintenance and process scenarios; fault coverage remains focused rather than exhaustive. |
-| Linux automatic page service | Native codec, Unix transport, connection multiplexing, structural owner, client pager, automatic election, yielded ownership, lost-ack resolution, timeout/cancellation and close draining. Seven `PageServiceAutomaticTests` plus role/file checks passed; the subsequent full run had 286 passing non-SQL tests and one failing SQL corpus test. | Canonical 31-scenario process corpus, every supported-core pairing, stream transport and attachment roles. No Apple-platform claim. |
-| Owner post-ack maintenance | Writer token spans reply, cap flush and one optional structural maintenance commit. The writer read pin is released after acknowledgement; registry epoch, reader set, committed identity and base version are rechecked before writes. Three `PageServiceMaintenanceTests` passed; independent review found no concrete durability/pin race. | Shared process reclamation scenarios and mixed-core verification. |
-| Internal backup | `Database.backup(_:form:)` streams page-identical and compacted forms with an ordinary pin retained through atomic destination publication. Five `BackupBoundaryTests` passed, covering all 87 ordinary frozen images (including six encrypted), retained relaxed generations, rewrapped key blocks, role revocation and cleanup before/after rename. Independent review found no concrete defect. | Canonical backup scenarios and remote transport; public API naming is intentionally still the shared deferred product decision. |
+| Linux automatic page service | Native codec, Unix transport, connection multiplexing, structural owner, client pager, automatic election, yielded ownership, lost-ack resolution, timeout/cancellation and close draining. Seven `PageServiceAutomaticTests` plus role/file checks passed. The full 31-scenario frozen Swift→Swift process run now passes, including attachment roles and native ordinary/encrypted streams. | Every supported-core pairing and simulation coverage. No Apple-platform claim. |
+| Owner post-ack maintenance | Writer token spans reply, cap flush and one optional structural maintenance commit. The writer read pin is released after acknowledgement; registry epoch, reader set, committed identity and base version are rechecked before writes. Three `PageServiceMaintenanceTests` passed; independent review found no concrete durability/pin race. Frozen process reclamation and exact storage-limit page counts pass. | Mixed-core verification and simulation. |
+| Internal backup | `Database.backup(_:form:)` streams page-identical and compacted forms with an ordinary pin retained through atomic destination publication. Five `BackupBoundaryTests` passed, covering all 87 ordinary frozen images (including six encrypted), retained relaxed generations, rewrapped key blocks, role revocation and cleanup before/after rename. Both canonical backup process scenarios pass. Independent review found no concrete defect. | Mixed-core verification; public API naming is intentionally still the shared deferred product decision. |
 
 Focused checks are reproducible through
 `mise run swift-native:test --filter 'PageServiceMaintenanceTests|BackupBoundaryTests'`
@@ -270,13 +270,23 @@ allocation exception. No scenario was skipped and no frozen expected value was
 changed. The last three defects now have passing focused reruns of
 `cow_stale_orphan`, `unchanged_commits`, and the complete `backup` scenario
 through `mise run swift-native:process --no-build` with `JED_PROCESS_FILTER`.
-This is focused follow-up evidence, not a second complete 31-scenario result.
+The subsequent full run passed 28 scenarios and exposed three further issues:
+attachment writes were rejected before the specified COMMIT phase; an idle
+writer was unnecessarily asked to retain a revoked remote snapshot; and an
+autocommit routing read pin prevented the owner's post-ack maintenance, producing
+37 pages instead of the specified 33. Corrections preserve actual pinned reads
+while using resident catalog metadata for provisional writer admission. All
+three focused reruns passed.
 
 The native grouped storage phase passed five host invariant tests, with the
 root-leaf regression included in nine passing storage-domain tests. Attachment
-actor routing and native stream client/serving code are published for the next
-integration run. `Database.openRemote` supports an explicit byte-transport
+actor routing and native stream client/serving code now pass their focused
+integration checks. `Database.openRemote` supports an explicit byte-transport
 factory and a process-command convenience; the opt-in actor task selects the
-Swift serving process explicitly. Remaining host acceptance still includes the
-complete rerun, cross-core pairings, simulation, and other matrix rows without
-their own complete evidence.
+Swift serving process explicitly. The final complete frozen run on 2026-11-05,
+`mise run swift-native:process --no-build`, exited zero with **31/31 PASS** for
+Swift→Swift (`/tmp/jed-swift-native-process-all-rerun.log`). No selected scenario
+was skipped or delegated to another SQL engine; ordinary and encrypted streams
+used the Swift pages actor. This closes that native process mode only. Remaining
+host acceptance includes cross-core pairings, simulation, named maintenance
+verification, and other matrix rows without their own complete evidence.

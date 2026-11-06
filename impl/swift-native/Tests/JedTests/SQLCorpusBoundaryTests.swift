@@ -272,6 +272,22 @@ final class SQLCorpusBoundaryTests: XCTestCase {
         "resource/temp_budget.test",
         "transactions/savepoint.test",
         "transactions/savepoint_jed.test",
+        "ddl/reindex.test",
+        "ddl/reindex_savepoint.test",
+        "ddl/exclusion_reindex.test",
+        "query/analyze_oracle.test",
+        "query/statistics_estimates_p9.test",
+        "query/statistics_gin_terms.test",
+        "query/statistics_p9.test",
+        "transactions/statistics_p9.test",
+        "query/explain.test",
+        "query/explain_estimates.test",
+        "query/explain_shapes.test",
+        "query/explain_followon.test",
+        "query/explain_analyze.test",
+        "query/explain_formatting.test",
+        "dml/explain_dml.test",
+        "ddl/explain_create_table_as.test",
     ]
 
     func testWholeFrozenSQLFilesThroughDatabaseSession() throws {

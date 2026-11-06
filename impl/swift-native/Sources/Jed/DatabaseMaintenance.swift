@@ -1,16 +1,24 @@
 /// Host-only maintenance. SQL transactions never invoke these entry points;
 /// each call either acquires the writer gate immediately or returns 55006.
 extension Database {
-    private func maintenanceStorage(_ name: String) throws -> StorageDomain {
+    public func compact(_ name: String = "main") throws {
         try checkOpen()
-        guard name == "main" else { throw JedError("42704", "database is not attached: \(name)") }
-        let storage = core.storage
-        guard !storage.readOnly else { throw JedError("25006", "database is read-only") }
-        return storage
+        let identifier = try SQLText(name), target = try domains.maintenanceTarget(identifier, main: self)
+        let expected = target.core.storage
+        // Host capability checks precede the nonwaiting writer admission.
+        #if os(Linux) || canImport(Darwin)
+        if expected.kind == .file, target.localFileHost == nil {
+            throw JedError("55006", "page clients cannot compact the database")
+        }
+        #else
+        guard expected.kind == .memory else { throw JedError("0A000", "file replacement is unavailable") }
+        #endif
+        try domains.withMaintenance(identifier, main: self, expected: target) {
+            try target.compactStorage(expected)
+        }
     }
 
-    public func compact(_ name: String = "main") throws {
-        let expected = try maintenanceStorage(name)
+    private func compactStorage(_ expected: StorageDomain) throws {
         #if os(Linux) || canImport(Darwin)
         if expected.kind == .file, localFileHost == nil {
             throw JedError("55006", "page clients cannot compact the database")
@@ -49,19 +57,23 @@ extension Database {
 
     public func changeCredential(_ name: String = "main", credential: Credential,
                                  kdf: Argon2Parameters = .default) throws {
-        let expected = try maintenanceStorage(name)
+        try checkOpen()
+        let identifier = try SQLText(name), target = try domains.maintenanceTarget(identifier, main: self)
+        let expected = target.core.storage
         guard expected.kind == .file else { throw JedError("55000", "in-memory databases cannot change credentials") }
         guard let codec = expected.pager.codec as? EncryptedPageCodec,
               let selected = expected.pager.selectedKeyBlock else { throw JedError("28P03", "database is not encrypted") }
         #if os(Linux) || canImport(Darwin)
-        guard let host = localFileHost else { throw JedError("55000", "file host cannot change credentials") }
-        // Expensive KDF work and key-stream draws deliberately precede the gate.
-        let replacement = try codec.rewrap(selected, credential: credential, parameters: kdf, entropy: keyEntropy)
-        try core.maintenance {
-            try checkOpen()
-            guard core.storage === expected else { throw JedError("55006", "database changed concurrently") }
-            do { try expected.pager.changeKeyBlock(replacement, replacing: selected, syncDirectory: host.syncDirectory) }
-            catch { if expected.pager.isPoisoned { host.poison() }; throw error }
+        guard let host = target.localFileHost else { throw JedError("55000", "file host cannot change credentials") }
+        // Expensive KDF work and key-stream draws deliberately precede both gates.
+        let replacement = try codec.rewrap(selected, credential: credential, parameters: kdf, entropy: target.keyEntropy)
+        try domains.withMaintenance(identifier, main: self, expected: target) {
+            try target.core.maintenance {
+                try target.checkOpen()
+                guard target.core.storage === expected else { throw JedError("55006", "database changed concurrently") }
+                do { try expected.pager.changeKeyBlock(replacement, replacing: selected, syncDirectory: host.syncDirectory) }
+                catch { if expected.pager.isPoisoned { host.poison() }; throw error }
+            }
         }
         #else
         throw JedError("55000", "file credential changes are unavailable")
@@ -70,15 +82,18 @@ extension Database {
 
     public func rekey(_ name: String = "main", credential: Credential?,
                       kdf: Argon2Parameters = .default) throws {
-        let expected = try maintenanceStorage(name)
+        try checkOpen()
+        let identifier = try SQLText(name), target = try domains.maintenanceTarget(identifier, main: self)
+        let expected = target.core.storage
         guard expected.kind == .file else { throw JedError("55000", "in-memory databases cannot be rekeyed") }
         #if os(Linux) || canImport(Darwin)
-        guard let host = localFileHost else { throw JedError("55000", "file host cannot rekey this database") }
+        guard let host = target.localFileHost else { throw JedError("55006", "page clients cannot rekey the database") }
+        let scratch = scratchFileHost
         if credential != nil {
             guard expected.pager.pageSize >= 1024 else { throw JedError("0A000", "encryption requires pages of at least 1024 bytes") }
-            guard host.scratch.sealed else { throw JedError("55000", "encrypting requires sealed scratch storage") }
+            if let scratch, !scratch.sealed { throw JedError("55000", "encrypting requires sealed scratch storage") }
         }
-        let random = expected.pager.codec.reservedBytes == 0 ? environment.newKeySource() : currentKeySource
+        let random = expected.pager.codec.reservedBytes == 0 ? target.environment.newKeySource() : target.currentKeySource
         let entropy: KeyEntropy = { try random.bytes(count: $0) }
         let codec: any PageCodec
         let keyBlock: KeyBlock?
@@ -87,6 +102,19 @@ extension Database {
             codec = try EncryptedPageCodec(pageSize: expected.pager.pageSize, dataKey: created.dataKey)
             keyBlock = created.block
         } else { codec = try PlainPageCodec(pageSize: expected.pager.pageSize); keyBlock = nil }
+        try domains.withMaintenance(identifier, main: self, expected: target) {
+            try target.rekeyStorage(expected, host: host, random: random, codec: codec, keyBlock: keyBlock, scratch: scratch)
+        }
+        #else
+        throw JedError("55000", "file rekeying is unavailable")
+        #endif
+    }
+
+    #if os(Linux) || canImport(Darwin)
+    private func rekeyStorage(_ expected: StorageDomain, host: FileDatabaseHost,
+                              random: any RandomSource, codec: any PageCodec, keyBlock: KeyBlock?,
+                              scratch: (any ScratchFileHost)?) throws {
+        let entropy: KeyEntropy = { try random.bytes(count: $0) }
         try core.replaceStorage { storage, snapshot in
             try checkOpen()
             guard storage === expected else { throw JedError("55006", "database changed concurrently") }
@@ -94,7 +122,7 @@ extension Database {
             guard snapshot.txid < UInt64.max else { throw JedError.corruption("transaction id exhausted") }
             let capacity = storage.pool.capacity ?? (Int.max / codec.pageSize)
             let budget = max(1_048_576, capacity * codec.pageSize)
-            let temporary = try SpillableScratchStore(budget: Int64(budget), host: host.scratch)
+            let temporary = try SpillableScratchStore(budget: Int64(budget), host: scratch)
             defer { try? temporary.close() }
             let scratchCodec: any PageCodec
             let scratchEntropy: KeyEntropy?
@@ -110,8 +138,6 @@ extension Database {
             installKeySource(random)
             return replacement
         }
-        #else
-        throw JedError("55000", "file rekeying is unavailable")
-        #endif
     }
+    #endif
 }

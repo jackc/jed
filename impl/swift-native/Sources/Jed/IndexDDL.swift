@@ -1,6 +1,6 @@
 extension CatalogDDL {
     static func createIndex(_ definition: SQLCreateIndex, source: SQLText, snapshot: inout DomainSnapshot,
-                            settings: SessionSettings, context: ExpressionContext) throws {
+                            settings: SessionSettings, context: ExpressionContext, replacing: CatalogIndex? = nil) throws {
         try SystemRelationPlan.rejectTarget(definition.table.name)
         let tableName = try CatalogDomain.name(definition.table, settings: settings)
         guard let tablePosition = snapshot.catalog.tables.firstIndex(where: { $0.name == tableName }),
@@ -62,18 +62,20 @@ extension CatalogDDL {
         }
         if kind == 2 {
             guard !definition.unique else { throw JedError("0A000", "access method gist does not support unique indexes") }
-            guard keys.count == 1 else { throw JedError("0A000", "a multi-column gist index is not supported yet") }
+            guard keys.count == 1 || replacing != nil else { throw JedError("0A000", "a multi-column gist index is not supported yet") }
         }
         var predicate: CatalogExpression?
         if let syntax = definition.predicate {
-            guard kind == 0 else { throw JedError("0A000", "a partial (WHERE) gist index is not supported yet") }
+            guard kind == 0 || replacing != nil else { throw JedError("0A000", "a partial (WHERE) gist index is not supported yet") }
             try CatalogExpressionPolicy.validate(syntax, isDefault: false)
             let resolved = try resolver.resolve(syntax, expected: TypeDescriptor(.scalar(.boolean)))
             guard resolved.type == nil || resolved.type?.type == .scalar(.boolean) else { throw JedError("42804", "argument of WHERE must be boolean") }
             expressions.append(resolved); predicate = try CatalogSQL.expression(syntax, source: source)
         }
         let dependencies = try IndexDependencies.resolve(expressions, environment: settings.environment)
-        let relations = CatalogDomain.relations(snapshot.catalog, settings: settings), name: SQLText
+        var relations = CatalogDomain.relations(snapshot.catalog, settings: settings)
+        if let replacing { relations.remove(replacing.name) }
+        let name: SQLText
         if let explicit = definition.name {
             try CatalogSQL.reserved(explicit, kind: "index")
             if relations.contains(explicit) {
@@ -85,6 +87,7 @@ extension CatalogDDL {
         var index = CatalogIndex(name: name, keys: keys, unique: definition.unique, kind: kind,
                                  root: PageSealer.nullReference(snapshot.pool.codec), predicate: predicate)
         index.hosts = dependencies.hosts; index.dynamicZones = dependencies.dynamicZones; index.zones = dependencies.zones
+        if let replacing { index.isConstraint = replacing.isConstraint }
         if options.contains(where: { $0 != 0 }) { index.keyOptions = options }
         let plan = try StoredIndexPlan.resolve(table: table, index: index, snapshot: snapshot, settings: settings, context: context)
         try ScanCost.charge(store, touched: plan.touched, meter: context.meter)
@@ -107,7 +110,9 @@ extension CatalogDDL {
             try built.put(PackedRecord(key: key, cells: []), netStaging: settings.options.maxQueryMemoryBytes > 0)
         }
         var image = snapshot.catalog
-        image.tables[tablePosition].indexes.append(index)
+        if let replacing, let position = image.tables[tablePosition].indexes.firstIndex(where: { $0.name == replacing.name }) {
+            image.tables[tablePosition].indexes[position] = index
+        } else { image.tables[tablePosition].indexes.append(index) }
         image.tables[tablePosition].indexes.sort { $0.name < $1.name }
         try snapshot.updateCatalog(image, schemaChanged: true)
         snapshot.setIndexStore(name, built)

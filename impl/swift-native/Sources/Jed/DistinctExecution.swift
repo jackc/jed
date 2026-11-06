@@ -28,7 +28,8 @@ internal final class DistinctExecution {
             store: plan.store, touched: plan.touched, parameters: plan.parameters, limit: nil, offset: 0, order: plan.order,
             orderedByScan: plan.orderedByScan, descending: plan.descending, scan: plan.scan, aggregation: plan.aggregation,
             relation: plan.relation, productionCharge: false, window: plan.window,
-            sourceDomain: plan.sourceDomain, sourceSnapshot: plan.sourceSnapshot)
+            sourceDomain: plan.sourceDomain, sourceSnapshot: plan.sourceSnapshot, sourceTable: plan.sourceTable,
+            profileIdentity: plan.profileIdentity, profilesRoot: false)
         input.materializeSource = !plan.orderedByScan
         return input
     }
@@ -51,6 +52,9 @@ internal final class DistinctExecution {
         return nil
     }
     private func prepare() throws {
+        try context.profile(plan.profileIdentity, .distinct, excluding: [.source, .folded, .filter, .aggregate, .window, .sort]) { try prepareBody() }
+    }
+    private func prepareBody() throws {
         let meter = context.meter
         let execution = SelectExecution(plan: inputPlan(), context: context); defer { execution.close() }
         var seen: Set<[UInt8]> = [], output: [[SQLValue]] = [], entries: Int64 = 0

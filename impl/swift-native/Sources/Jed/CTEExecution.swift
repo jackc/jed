@@ -29,6 +29,8 @@ internal final class CTEExecution {
         }
     }
     func prepare(_ binding: CTEBinding) throws {
+        let before = context.meter.accrued
+        defer { context.executionProfile?.add(binding, .total, context.meter.accrued - before) }
         guard let plan = binding.plan else { throw JedError("XX000", "data-modifying CTE needs the statement coordinator") }
         if let recursive = binding.recursive {
             let key = ObjectIdentifier(binding)

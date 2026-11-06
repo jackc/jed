@@ -11,6 +11,8 @@ internal final class StatementPrivileges {
     var catalogWrites: [SQLStatement] = []
     var ddl = false
     var temporary = false
+    var observeCall: ((SQLCall) -> Void)?
+    var observeWrite: ((CatalogTable, SQLStatement, SQLText) -> Void)?
     init(domains: QueryDomains) { self.domains = domains }
 
     static func check(_ statement: SQLStatement, snapshot: DomainSnapshot, settings: SessionSettings) throws {
@@ -19,8 +21,7 @@ internal final class StatementPrivileges {
         let domains = QueryDomains.statement(snapshot: snapshot, settings: settings)
         let requirements = StatementPrivileges(domains: domains)
         requirements.collect(statement)
-        requirements.collectViewFunctions()
-        requirements.collectStoredExpressions(settings: settings)
+        requirements.collectDependencies(settings: settings)
         if case .reindex(let value) = statement, value.object == "index", let name = value.name,
            let owner = try? domains.relation(name),
            let table = owner.snapshot.catalog.tables.first(where: { $0.indexes.contains { $0.name == name.name } }) {
@@ -105,7 +106,7 @@ internal final class StatementPrivileges {
             for item in value.assignments { expression(item.value, locals: locals) }
             expression(value.predicate, locals: locals); returning(value.returning, locals: locals)
         case .delete(let value):
-            need(value.table, .delete)
+            catalogWrites.append(statement); need(value.table, .delete)
             if readsColumns(value.predicate) || returnsColumns(value.returning) { need(value.table, .select) }
             expression(value.predicate, locals: locals); returning(value.returning, locals: locals)
         case .merge(let value):
@@ -187,6 +188,7 @@ internal final class StatementPrivileges {
         while let value = pending.popLast() {
             switch value.kind {
             case .call(let call):
+                observeCall?(call)
                 function(call.name)
                 for argument in call.arguments { expression(argument.value, locals: locals) }
                 expression(call.filter, locals: locals)
@@ -232,6 +234,12 @@ internal final class StatementPrivileges {
         }
         return false
     }
+    /// Shared admission traversal: selected defaults, CHECKs, and view bodies
+    /// are walked without evaluating any SQL expression or host function.
+    func collectDependencies(settings: SessionSettings) {
+        collectViewFunctions()
+        collectStoredExpressions(settings: settings)
+    }
     private func collectViewFunctions() {
         let originalTables = tables
         let writeTargets = originalTables.filter { !$0.privileges.intersection([.insert, .update, .delete]).isEmpty }.map(\.name)
@@ -242,7 +250,7 @@ internal final class StatementPrivileges {
                   visited.insert(ViewKey(domain: owner.name, name: read.name)).inserted,
                   let view = owner.snapshot.catalog.views.first(where: { $0.name == read.name }),
                   let body = try? ViewDefinition.parsed(view), let scope = try? domains.viewScope(owner: owner.name) else { continue }
-            let nested = StatementPrivileges(domains: scope); nested.query(body.query)
+            let nested = StatementPrivileges(domains: scope); nested.observeCall = observeCall; nested.query(body.query)
             for name in nested.functions { function(name) }
             pending += nested.reads
         }
@@ -252,7 +260,7 @@ internal final class StatementPrivileges {
                   visited.insert(ViewKey(domain: owner.name, name: read.name)).inserted,
                   let view = owner.snapshot.catalog.views.first(where: { $0.name == read.name }), view.securityInvoker,
                   let body = try? ViewDefinition.parsed(view), let scope = try? domains.viewScope(owner: owner.name) else { continue }
-            let nested = StatementPrivileges(domains: scope); nested.query(body.query)
+            let nested = StatementPrivileges(domains: scope); nested.observeCall = observeCall; nested.query(body.query)
             tables += nested.tables; pending += nested.reads
         }
         for target in writeTargets {
@@ -265,7 +273,7 @@ internal final class StatementPrivileges {
                   select.from.count == 1, let source = select.from.first, source.joins.isEmpty, case .table(let base) = source.source {
                 guard !source.lateral, let scope = try? domains.viewScope(owner: owner.name),
                       (try? UpdatableView.checkShape(body.query, name: name.name, operation: "delete from")) != nil else { break }
-                let nested = StatementPrivileges(domains: scope)
+                let nested = StatementPrivileges(domains: scope); nested.observeCall = observeCall
                 if let predicate = select.predicate {
                     if privileges.contains(where: { !$0.intersection([.update, .delete]).isEmpty }), !privileges.contains(.select) { privileges.append(.select) }
                     nested.expression(predicate)
@@ -280,9 +288,10 @@ internal final class StatementPrivileges {
         for original in catalogWrites {
             var statement = original
             let name: SQLName
-            switch statement { case .insert(let v): name = v.table; case .update(let v): name = v.table; case .merge(let v): name = v.table; default: continue }
+            switch statement { case .insert(let v): name = v.table; case .update(let v): name = v.table; case .delete(let v): name = v.table; case .merge(let v): name = v.table; default: continue }
             guard let owner = try? domains.relation(name) else { continue }
             let snapshot = owner.snapshot
+            var targetDomain = owner.name
             var target = snapshot.catalog.tables.first(where: { $0.name == name.name })
             if let view = snapshot.catalog.views.first(where: { $0.name == name.name }) {
                 guard !DomainNames.isAttachment(owner.name) else { continue }
@@ -290,9 +299,9 @@ internal final class StatementPrivileges {
                 unrestricted.domains = try? domains.viewScope(owner: owner.name); unrestricted.targetDomain = owner.name
                 let context = StatementServices(settings: unrestricted, meter: CostMeter()).context()
                 let operation: String
-                switch statement { case .insert: operation = "insert into"; case .update: operation = "update"; default: continue }
+                switch statement { case .insert: operation = "insert into"; case .update: operation = "update"; case .delete: operation = "delete from"; default: continue }
                 guard let resolved = try? UpdatableView.resolve(view, operation: operation, snapshot: snapshot, settings: unrestricted, context: context) else { continue }
-                target = resolved.table
+                target = resolved.table; targetDomain = resolved.tableDomain
                 var viewDefaults: [SQLExpression] = []
                 do {
                     func assignment(_ value: SQLAssignment) throws -> SQLAssignment {
@@ -324,6 +333,7 @@ internal final class StatementPrivileges {
                 for value in viewDefaults { expression(value) }
             }
             guard let table = target else { continue }
+            observeWrite?(table, statement, targetDomain)
             var defaulted: Set<Int> = [], checks = true
             func assignments(_ items: [SQLAssignment]) {
                 for item in items where item.value == nil {
@@ -348,6 +358,7 @@ internal final class StatementPrivileges {
                 }
                 if let conflict = value.conflict, !conflict.doNothing { assignments(conflict.assignments) }
             case .update(let value): assignments(value.assignments)
+            case .delete: checks = false
             case .merge(let value):
                 checks = false
                 for clause in value.clauses {

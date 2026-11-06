@@ -107,12 +107,12 @@ extension CatalogDDL {
             case .rename(let renamed):
                 try CatalogSQL.reserved(renamed, kind: "view")
                 guard !CatalogDomain.relations(image, settings: settings).contains(renamed) else { throw JedError("42P07", "relation \(renamed) already exists") }
-                try ViewRewrite.references(in: &image, name: view.name, kind: 1, renamed: renamed, columns: view.columns.map(\.name))
+                try ViewRewrite.references(in: &image, name: view.name, kind: 1, renamed: renamed, columns: view.columns.map(\.name), domain: settings.targetDomain)
                 view.name = renamed
             case .renameColumn(let old, let new):
                 let position = try viewColumn(old, view: view)
                 guard !view.columns.contains(where: { $0.name == new }) else { throw JedError("42701", "column \(new) of relation \(view.name) already exists") }
-                try ViewRewrite.references(in: &image, name: view.name, kind: 1, column: (position, new), columns: view.columns.map(\.name))
+                try ViewRewrite.references(in: &image, name: view.name, kind: 1, column: (position, new), columns: view.columns.map(\.name), domain: settings.targetDomain)
                 view.columns[position].name = new
             }
             switch action { case .rename, .renameColumn: renamed = true; default: break }
@@ -157,7 +157,8 @@ extension CatalogDDL {
         return position
     }
     static func revalidateViews(dependingOn changed: SQLText, old: DomainSnapshot, new: DomainSnapshot,
-                                settings: SessionSettings, context: ExpressionContext, replacement: Bool = true) throws {
+                                settings: SessionSettings, context: ExpressionContext, replacement: Bool = true,
+                                previousDomains: QueryDomains? = nil) throws {
         var affected: Set<SQLText> = [changed], pending = true
         while pending {
             pending = false
@@ -174,7 +175,9 @@ extension CatalogDDL {
             guard let afterView = new.catalog.views.first(where: { $0.name == view.name }) else { continue }
             do {
                 var bodySettings = settings; bodySettings.privileges = settings.privileges.withTableAccess()
-                let prior = try SelectPlan.resolve(before, snapshot: old, settings: bodySettings, scalar: context.scalar)
+                var priorSettings = bodySettings
+                if let previousDomains { priorSettings.domains = previousDomains }
+                let prior = try SelectPlan.resolve(before, snapshot: old, settings: priorSettings, scalar: context.scalar)
                 let next = try ViewDefinition.prepare(ViewDefinition.query(afterView), source: afterView.definition,
                     snapshot: new, settings: bodySettings, context: context)
                 guard prior.columns.count == next.columns.count,
@@ -182,7 +185,8 @@ extension CatalogDDL {
                       zip(afterView.dependencies, next.dependencies).allSatisfy({ $0.kind == $1.kind && $0.name == $1.name && $0.columns == $1.columns }) else {
                     throw JedError("0A000", "changed view definition")
                 }
-                if replacement, let replaced = old.catalog.views.first(where: { $0.name == changed }),
+                if replacement, let replaced = old.catalog.views.first(where: { $0.name == changed })
+                    ?? previousDomains?.snapshots[DomainNames.main]?.catalog.views.first(where: { $0.name == changed }),
                    next.viewUses[changed, default: []].contains(where: { $0 >= replaced.columns.count }) {
                     throw JedError("0A000", "replacement captures an appended view column")
                 }

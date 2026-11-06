@@ -398,10 +398,12 @@ case verifies old-order preservation plus malformed typed bytes/count rejection.
 ## Atomic maintenance and credential replacement
 
 `Database.compact`, `changeCredential` and `rekey` now have handwritten native
-implementations for main. Attachment routing and page-service ownership remain
-missing. Compaction and rekey acquire the writer gate without waiting and hold
-the pin registry through serialization and publication. Any existing pin refuses
-replacement with `55006`; incoming pins wait until the new storage is published.
+implementations for main and exact named attachments. Each operation obtains the
+root logical writer gate without waiting and rechecks the preflight target's
+identity under the attachment publication boundary. Compaction and rekey also
+acquire the target's writer gate and hold its pin registry through serialization
+and publication. An existing target pin refuses replacement with `55006`; pins
+on another domain do not. Incoming bundled pins wait until publication completes.
 Memory compaction writes a fresh chunked byte device. File replacement streams to
 `<path>.jedtmp`, preserves permission bits, syncs the completed file, closes the
 old descriptor, atomically renames, syncs the directory and opens a cold pool at
@@ -439,7 +441,10 @@ maintenance gate leaves the handle open. Five MaintenanceBoundaryTests cover
 these host/byte invariants, including a frozen encrypted GiST fixture rebuilt
 through plaintext, encryption and key rotation. All five passed in the
 parent-owned integrated selected run at 19:18:54 on 2026-11-05 (0.861 seconds). Process/crash simulations and attachment maintenance remain separate
-acceptance requirements.
+acceptance requirements. The named maintenance publication adds four host tests
+for target-only pin exclusion, root writer exclusion, attachment identity after
+preflight, credential readers, and root scratch policy; their verification is
+recorded separately when the integrated run completes.
 
 ## Grouped domain commit integration
 
@@ -448,8 +453,10 @@ working DomainSnapshot, policy, entropy source and synchronous setting.
 `DomainCommitGroup.prepare` rejects duplicate names/storage identities and a
 second actually changed file domain, omits unchanged domains, checks every
 changed domain's Q4/catalog layout before sealing any pages, then prepares in
-attachment-name order with main last. Statement admission must also reject a
-second attempted durable write, as required by attached-databases.md §5.
+attachment-name order with main last. A statement that attempts writes in two
+durable domains is rejected by statement admission. Separate statements may
+stage those changes, but COMMIT rejects the transaction before any page writes,
+as asserted by the frozen attachment gate-order process scenario.
 
 The root database owns writer acquisition order and a publication boundary
 shared by bundled read admission. It retains that boundary and every writer
@@ -468,7 +475,8 @@ poisons that domain only. Forced memory Q4 reclamation now produces a private
 allocation proof during preflight, rather than mutating the published free list
 while another domain may still refuse. Old pins continue to protect their own
 domain's pages. Five host invariant tests cover these phase and failure rules;
-their publication awaits the parent-owned integrated verification.
+all five passed in the parent-owned integrated verification. A sixth test covers
+the pre-durable memory staging hook used by private temp spill.
 
 The frozen process backup prefix also exposed the explicit large-values.md
 §15.2 root-leaf exception: newly written resident overflow values continue to

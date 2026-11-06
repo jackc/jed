@@ -65,6 +65,9 @@ internal final class GroupedSelectExecution {
         try reserve(bytes); sourceBytes = saturatingAdd(sourceBytes, bytes); sources.append(row)
     }
     private func prepare() throws {
+        try context.profile(plan.profileIdentity, .aggregate, excluding: [.source, .filter, .sort]) { try prepareBody() }
+    }
+    private func prepareBody() throws {
         let meter = context.meter
         let columnar = ColumnarExecution.aggregation(plan, aggregate, context)
         let input = SelectInput(plan: plan, context: context)
@@ -76,7 +79,7 @@ internal final class GroupedSelectExecution {
             var kept: [[SQLValue]] = []
             for row in sources {
                 var current = context; current.column = { row[$0] }
-                if try current.matches(predicate) { kept.append(row) }
+                if try context.profile(plan.profileIdentity, .filter, { try current.matches(predicate) }) { kept.append(row) }
                 else { let bytes = MemorySizes.row(row); release(bytes); sourceBytes -= bytes }
             }
             sources = kept
@@ -146,7 +149,7 @@ internal final class GroupedSelectExecution {
             if columnar {
                 while let row = try input.next() {
                     var current = context; current.column = { row[$0] }
-                    if let predicate = plan.predicate, try !current.matches(predicate) { continue }
+                    if let predicate = plan.predicate, try !context.profile(plan.profileIdentity, .filter, { try current.matches(predicate) }) { continue }
                     try fold(row)
                 }
             } else { for row in sources { try fold(row) } }
@@ -214,6 +217,9 @@ internal final class GroupedSelectExecution {
         return current
     }
     private func sort() throws {
+        try context.profile(plan.profileIdentity, .sort) { try sortBody() }
+    }
+    private func sortBody() throws {
         guard !plan.order.isEmpty else { return }
         let meter = context.meter
         for index in outputs.indices {

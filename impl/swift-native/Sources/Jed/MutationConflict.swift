@@ -22,9 +22,11 @@ extension MutationExecutor {
             if syntax.doNothing { changes = []; predicate = nil; return }
             if let view = relation.view {
                 var privileges = inputSettings.privileges
-                if settings.targetDomain != DomainNames.temporary { try privileges.require(.update, on: view.layers[0].view.name) }
+                if view.layers[0].owner != DomainNames.temporary { try privileges.require(.update, on: view.layers[0].view.name) }
                 for layer in view.layers {
-                    if layer.view.securityInvoker { try privileges.require(.update, on: layer.base.name) }
+                    if layer.view.securityInvoker {
+                        if layer.baseDomain != DomainNames.temporary { try privileges.require(.update, on: layer.base.name) }
+                    }
                     else { privileges = privileges.withTableAccess() }
                 }
             } else if settings.targetDomain != DomainNames.temporary { try settings.privileges.require(.update, on: relation.table.name) }

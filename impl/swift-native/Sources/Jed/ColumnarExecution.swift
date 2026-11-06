@@ -59,7 +59,7 @@ internal final class ColumnarProjectionExecution {
         let input = SelectInput(plan: plan, context: context); defer { input.close() }
         while let row = try input.next() {
             var current = context; current.column = { row[$0] }
-            if let predicate = plan.predicate, try !current.matches(predicate) { continue }
+            if let predicate = plan.predicate, try !context.profile(plan.profileIdentity, .filter, { try current.matches(predicate) }) { continue }
             for (lane, column) in columns.enumerated() { lanes[lane].append(row[column]) }
             count += 1
         }

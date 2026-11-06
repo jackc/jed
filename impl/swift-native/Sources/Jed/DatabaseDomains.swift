@@ -33,6 +33,33 @@ internal final class DatabaseDomains: @unchecked Sendable {
             return value.database
         }
     }
+    private func maintenanceTargetLocked(_ name: SQLText, main: Database) throws -> Database {
+        try checkOpen()
+        if name == DomainNames.main {
+            guard !main.isReadOnly else { throw JedError("25006", "database is read-only") }
+            return main
+        }
+        guard let value = attachments[name] else { throw JedError("42704", "database \"\(name)\" is not attached") }
+        guard !value.readOnly else { throw JedError("25006", "database is read-only") }
+        return value.database
+    }
+    /// Preflight/KDF retains the handle without holding either writer gate.
+    func maintenanceTarget(_ name: SQLText, main: Database) throws -> Database {
+        try withPublication { try maintenanceTargetLocked(name, main: main) }
+    }
+    /// Recheck the selected identity after preflight, then exclude root writers
+    /// and attach/detach while the target's own gate/watermark admits maintenance.
+    func withMaintenance<T>(_ name: SQLText, main: Database, expected: Database,
+                            _ body: () throws -> T) throws -> T {
+        let token = try writer.acquire(wait: false)
+        defer { writer.release(token) }
+        return try withPublication {
+            let current = try maintenanceTargetLocked(name, main: main)
+            guard current === expected else { throw JedError("42704", "maintenance target is no longer attached") }
+            try current.checkOpen()
+            return try body()
+        }
+    }
     /// Opening is outside the publication lock. Duplicate/refusal cleanup owns
     /// the newly opened handle and cannot disturb an existing attachment.
     func attach(_ name: SQLText, source: AttachSource, readOnly: Bool, main: Database) throws {
@@ -91,6 +118,17 @@ internal final class DatabaseDomains: @unchecked Sendable {
                 for name in attachments.keys.sorted() { pins[name] = try attachments[name]!.database.core.beginRead() }
                 return DomainReadBundle(pins: pins)
             } catch { for pin in pins.values { pin.close() }; throw error }
+        }
+    }
+    /// Provisional catalog routing must not open a reader before waiting for
+    /// the writer gate: such a pin can cancel the owner's post-ack maintenance.
+    /// These snapshots are for resident metadata only, never row/page access.
+    func routing(main: Database) throws -> QueryDomains {
+        try withPublication {
+            try checkOpen()
+            var snapshots = [DomainNames.main: main.core.routingSnapshot]
+            for name in attachments.keys.sorted() { snapshots[name] = attachments[name]!.database.core.routingSnapshot }
+            return QueryDomains(snapshots: snapshots)
         }
     }
     func acquire(main: Database, cancellation: CancellationToken?, timeoutMilliseconds: UInt64) throws -> DomainWriteBundle {

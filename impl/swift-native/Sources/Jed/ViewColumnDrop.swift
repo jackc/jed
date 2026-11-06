@@ -1,14 +1,14 @@
 extension ViewRewrite {
     /// An unreferenced dropped column may still occupy an alias-list position.
     /// Remove that alias so subsequent aliases continue to name the same slots.
-    static func droppingColumn(in image: inout CatalogImage, table: SQLText, ordinal: Int) throws {
+    static func droppingColumn(in image: inout CatalogImage, table: SQLText, ordinal: Int, domain: SQLText = DomainNames.main) throws {
         for index in image.views.indices where image.views[index].dependencies.contains(where: { $0.kind == 0 && $0.name == table }) {
             let view = image.views[index], query = try ViewDefinition.query(view)
             let tokens = try SQLLexer(utf8: view.definition.utf8).tokenize()
             var edits: [(Int, Int, [UInt8])] = []
             try ViewSyntax.walk(query, from: { from, ctes in
                 guard case .table(let reference) = from.source, reference.name == table,
-                      reference.database == nil || reference.database?.description == "main",
+                      reference.database == nil || reference.database == domain,
                       reference.database != nil || !ctes.contains(table), ordinal < from.columnAliases.count else { return }
                 let relevant = tokens.filter { $0.byteStart >= reference.span.byteEnd && $0.byteEnd <= from.span.byteEnd && $0.kind != .end }
                 guard let open = relevant.first(where: { $0.kind == .symbol("(") }),

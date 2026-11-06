@@ -79,7 +79,8 @@ internal enum AlterColumnDDL {
         return found
     }
     static func drop(_ ordinal: Int, table: inout CatalogTable, image: inout CatalogImage,
-                     cascade: Bool, removedIndexes: inout Set<SQLText>, added: inout Set<SQLText>) throws {
+                     cascade: Bool, removedIndexes: inout Set<SQLText>, added: inout Set<SQLText>,
+                     externalViews: [CatalogView] = [], domain: SQLText = DomainNames.main) throws {
         guard !table.primaryKey.contains(ordinal) else { throw JedError("0A000", "dropping a primary-key column is not supported yet") }
         let name = table.columns[ordinal].name
         // Every CHECK and index definition must be parsable, including ones
@@ -99,11 +100,12 @@ internal enum AlterColumnDDL {
             if keyUses || predicateUses { indexes.insert(index.name) }
             if predicateUses && !keyUses { predicateIndexes.insert(index.name) }
         }
-        var views = Set(image.views.filter { view in
+        let dependentViews = image.views + externalViews
+        var views = Set(dependentViews.filter { view in
             view.dependencies.contains { $0.kind == 0 && $0.name == table.name && $0.columns.contains(name) }
         }.map(\.name))
         let sequences = Set(image.sequences.filter { $0.owner?.table == table.name && $0.owner?.column == ordinal }.map(\.name))
-        for view in image.views where view.dependencies.contains(where: { $0.kind == 2 && sequences.contains($0.name) }) { views.insert(view.name) }
+        for view in dependentViews where view.dependencies.contains(where: { $0.kind == 2 && sequences.contains($0.name) }) { views.insert(view.name) }
         var external = !views.isEmpty || table.exclusions.contains { predicateIndexes.contains($0.index) }
         for child in image.tables {
             for foreign in child.foreignKeys where foreign.referencedTable == table.name && foreign.referencedColumns.contains(ordinal) {
@@ -119,7 +121,7 @@ internal enum AlterColumnDDL {
             }
         }
         image.views.removeAll { views.contains($0.name) }
-        try ViewRewrite.droppingColumn(in: &image, table: table.name, ordinal: ordinal)
+        try ViewRewrite.droppingColumn(in: &image, table: table.name, ordinal: ordinal, domain: domain)
         table.checks.removeAll { checks.contains($0.name) }
         table.indexes.removeAll { indexes.contains($0.name) }
         table.exclusions.removeAll { indexes.contains($0.index) }

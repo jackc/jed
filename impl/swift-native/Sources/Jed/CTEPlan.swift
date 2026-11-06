@@ -66,6 +66,7 @@ internal final class WithQueryPlan {
         var result = plan
         result.parameters = try finalizeParameters ? ParameterBinding.finalize(resolver) : []
         result.withQuery = WithQueryPlan(bindings: bindings, body: plan)
+        result.profileIdentity = QueryProfileIdentity()
         return result
     }
 

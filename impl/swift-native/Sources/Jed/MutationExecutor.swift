@@ -188,16 +188,21 @@ internal enum MutationExecutor {
     }
     private static func insert(_ syntax: SQLInsert, snapshot: inout DomainSnapshot, settings inputSettings: SessionSettings,
                                context baseContext: ExpressionContext, parameters: [SQLValue]) throws -> MutationResult {
+        let plan = try prepareInsert(syntax, snapshot: snapshot, settings: inputSettings, context: baseContext)
+        return try executeInsert(plan, snapshot: &snapshot, context: baseContext, parameters: parameters)
+    }
+    static func prepareInsert(_ syntax: SQLInsert, snapshot: DomainSnapshot, settings inputSettings: SessionSettings,
+                              context baseContext: ExpressionContext) throws -> InsertPreparation {
         try SystemRelationPlan.rejectTarget(syntax.table.name)
         let read = baseContext.writeScope?.readSnapshot ?? snapshot
         if DomainNames.isAttachment(inputSettings.targetDomain), syntax.conflict != nil { throw JedError("0A000", "ON CONFLICT on attached tables is not yet supported") }
-        var settings = inputSettings
+        let targetPlan = try MutationTarget.resolve(syntax.table, operation: "insert into", snapshot: read,
+            settings: inputSettings, context: baseContext)
+        let settings = targetPlan.settings
         let relation: Relation, destinations: [Int]
         var viewDefaults: Set<Int> = []
-        if (syntax.table.database == nil || syntax.table.database == settings.targetDomain),
-           let definition = read.catalog.views.first(where: { $0.name == syntax.table.name }) {
-            if settings.targetDomain != DomainNames.temporary { try settings.privileges.require(.insert, on: definition.name) }
-            let view = try UpdatableView.resolve(definition, operation: "insert into", snapshot: read, settings: settings, context: baseContext)
+        if let view = targetPlan.relation.view {
+            let definition = view.layers[0].view
             let targets: [Int]
             if case .defaultValues = syntax.source { targets = [] }
             else { targets = try syntax.columns.isEmpty ? Array(definition.columns.indices) : syntax.columns.map(view.column) }
@@ -215,13 +220,11 @@ internal enum MutationExecutor {
                 table.columns[column].defaultValue = .expression(expression)
                 viewDefaults.insert(column)
             }
-            settings = view.layers.last!.settings
             relation = try Relation(SQLName(database: nil, name: table.name, span: syntax.table.span), snapshot: read, tableOverride: table, view: view, domain: settings.targetDomain)
         } else {
-            relation = try Relation(syntax.table, snapshot: read, domain: settings.targetDomain)
+            relation = targetPlan.relation
             destinations = try syntax.columns.isEmpty ? Array(relation.types.indices) : syntax.columns.map(relation.column)
         }
-        if settings.targetDomain != DomainNames.temporary { try settings.privileges.require(.insert, on: relation.table.name) }
         try CatalogEnvironment.checkWritable(relation.table, image: read.catalog, environment: settings.environment,
             borrowedTypes: read.borrowedTypes, rowTypes: relation.types)
         let resolver = resolver(relation, snapshot: read, settings: inputSettings, context: baseContext, columns: false)
@@ -308,8 +311,26 @@ internal enum MutationExecutor {
         if !returning.oldTouched.isEmpty || !returning.newTouched.isEmpty { try relation.requireSelect(inputSettings) }
         let conflict = try syntax.conflict.map { try ConflictPlan($0, alias: syntax.alias, relation: relation,
             indexes: indexes, resolver: resolver, snapshot: read, settings: settings, inputSettings: inputSettings, context: baseContext) }
+        return InsertPreparation(read: read, settings: settings, inputSettings: inputSettings, relation: relation,
+            destinations: destinations, discarded: discarded, sourcePlan: sourcePlan, inputLiterals: inputLiterals,
+            slots: slots, defaults: defaults, checks: check, indexes: indexes, returning: returning,
+            conflict: conflict, parameterTypes: try ParameterBinding.finalize(resolver))
+    }
+    static func executeInsert(_ plan: InsertPreparation, snapshot: inout DomainSnapshot,
+                              context baseContext: ExpressionContext, parameters: [SQLValue]) throws -> MutationResult {
+        let read = plan.read, settings = plan.settings, inputSettings = plan.inputSettings, relation = plan.relation
+        let destinations = plan.destinations, discarded = plan.discarded, sourcePlan = plan.sourcePlan
+        let inputLiterals = plan.inputLiterals, check = plan.checks, indexes = plan.indexes, returning = plan.returning
+        let conflict = plan.conflict
+        var slots = plan.slots
+        func defaultSlot(_ column: Int) throws -> ResolvedExpression {
+            guard let value = plan.defaults[column] else { throw JedError("XX000", "prepared INSERT default is missing") }
+            return value
+        }
         var context = baseContext
-        context.parameters = try ParameterBinding.bind(parameters, types: ParameterBinding.finalize(resolver), timezone: settings.timeZone)
+        context.parameters = try ParameterBinding.bind(parameters, types: plan.parameterTypes, timezone: settings.timeZone)
+        let profileStart = context.meter.accrued
+        defer { context.executionProfile?.add(plan.profileIdentity, .total, context.meter.accrued - profileStart) }
         var sourceReserved: Int64 = 0
         defer { context.meter.resources.query.release(sourceReserved) }
         if let plan = sourcePlan {
@@ -459,23 +480,28 @@ internal enum MutationExecutor {
                                settings inputSettings: SessionSettings, context baseContext: ExpressionContext,
                                parameters: [SQLValue], target: ForeignKeyActions.Target? = nil,
                                actionState: ForeignKeyActions.State? = nil) throws -> MutationResult {
+        let state = actionState ?? baseContext.writeScope?.foreignKeys ?? ForeignKeyActions.State()
+        let plan = try prepareMutation(table: name, assignments: assignments, predicate: syntax, returning: returningSyntax,
+            snapshot: snapshot, settings: inputSettings, context: baseContext, target: target)
+        return try executeMutation(plan, snapshot: &snapshot, context: baseContext, parameters: parameters, actionState: state)
+    }
+    static func prepareMutation(table name: SQLName, assignments: [SQLAssignment]?, predicate syntax: SQLExpression?,
+                                returning returningSyntax: SQLReturning?, snapshot: DomainSnapshot,
+                                settings inputSettings: SessionSettings, context baseContext: ExpressionContext,
+                                target: ForeignKeyActions.Target? = nil) throws -> MutationPreparation {
         try SystemRelationPlan.rejectTarget(name.name)
         let read = baseContext.writeScope?.readSnapshot ?? snapshot
-        let actionState = actionState ?? baseContext.writeScope?.foreignKeys ?? ForeignKeyActions.State()
         let relation: Relation, deleting = assignments == nil
-        var settings = inputSettings, viewTargets: [Int] = [], viewDestinations: [Int] = []
-        if (name.database == nil || name.database == settings.targetDomain),
-           let definition = read.catalog.views.first(where: { $0.name == name.name }) {
-            if settings.targetDomain != DomainNames.temporary { try settings.privileges.require(deleting ? .delete : .update, on: definition.name) }
-            let view = try UpdatableView.resolve(definition, operation: deleting ? "delete from" : "update",
-                                                snapshot: read, settings: settings, context: baseContext)
+        let prepared = try MutationTarget.resolve(name, operation: deleting ? "delete from" : "update", snapshot: read,
+            settings: inputSettings, context: baseContext)
+        let settings = prepared.settings
+        var viewTargets: [Int] = [], viewDestinations: [Int] = []
+        if let view = prepared.relation.view {
             viewTargets = try (assignments ?? []).map { try view.column($0.column) }
             guard Set(viewTargets).count == viewTargets.count else { throw JedError("42701", "multiple assignments to same column") }
             viewDestinations = try view.destinations(viewTargets)
-            settings = view.layers.last!.settings
             relation = try Relation(SQLName(name: view.table.name, span: name.span), snapshot: read, view: view, domain: settings.targetDomain)
-        } else { relation = try Relation(name, snapshot: read, domain: settings.targetDomain) }
-        if settings.targetDomain != DomainNames.temporary { try settings.privileges.require(deleting ? .delete : .update, on: relation.table.name) }
+        } else { relation = prepared.relation }
         try CatalogEnvironment.checkWritable(relation.table, image: read.catalog, environment: settings.environment,
             borrowedTypes: read.borrowedTypes, rowTypes: relation.types)
         let resolver = resolver(relation, snapshot: read, settings: inputSettings, context: baseContext, columns: true)
@@ -531,8 +557,23 @@ internal enum MutationExecutor {
                 for check in view.checked { touched.formUnion(view.physicalColumns(check.expression, level: check.level).subtracting(assigned)) }
             }
         }
+        return MutationPreparation(read: read, settings: settings, inputSettings: inputSettings, relation: relation,
+            deleting: deleting, predicate: predicate, changes: changes, assigned: assigned, touched: touched,
+            checks: check, indexes: indexes, returning: returning, filters: filters, target: target,
+            parameterTypes: try ParameterBinding.finalize(resolver))
+    }
+    static func executeMutation(_ plan: MutationPreparation, snapshot: inout DomainSnapshot,
+                                context baseContext: ExpressionContext, parameters: [SQLValue],
+                                actionState suppliedState: ForeignKeyActions.State? = nil) throws -> MutationResult {
+        let read = plan.read, settings = plan.settings, inputSettings = plan.inputSettings, relation = plan.relation
+        let deleting = plan.deleting, predicate = plan.predicate, changes = plan.changes, assigned = plan.assigned
+        let touched = plan.touched, check = plan.checks, indexes = plan.indexes, returning = plan.returning
+        let filters = plan.filters, target = plan.target
+        let actionState = suppliedState ?? baseContext.writeScope?.foreignKeys ?? ForeignKeyActions.State()
         var context = baseContext
-        context.parameters = try ParameterBinding.bind(parameters, types: ParameterBinding.finalize(resolver), timezone: settings.timeZone)
+        context.parameters = try ParameterBinding.bind(parameters, types: plan.parameterTypes, timezone: settings.timeZone)
+        let profileStart = context.meter.accrued
+        defer { context.executionProfile?.add(plan.profileIdentity, .total, context.meter.accrued - profileStart) }
         if let view = relation.view {
             try view.prepare(changes.map { $0.1 }, context: context)
             for filter in filters { try view.prepare([filter.expression], level: filter.level, context: context) }
@@ -541,52 +582,50 @@ internal enum MutationExecutor {
         try returning.prepare(relation: relation, old: true, new: !deleting, context: context)
         if !deleting { try relation.view?.prepareChecks(context: context) }
         let result = MutationResult(command: deleting ? "DELETE" : "UPDATE", columns: returning.columns, meter: context.meter)
-        var accessPredicate: ResolvedExpression?
-        func addFilter(_ expression: ResolvedExpression) {
-            if let previous = accessPredicate {
-                accessPredicate = ResolvedExpression(type: TypeDescriptor(.scalar(.boolean)),
-                    node: .binary("and", previous, expression, TypeDescriptor(.scalar(.boolean))), position: 0)
-            } else { accessPredicate = expression }
-        }
-        if let view = relation.view {
-            for filter in filters { addFilter(view.scanExpression(filter.expression, level: filter.level)) }
-            if let predicate { addFilter(view.scanExpression(predicate)) }
-        } else { accessPredicate = predicate }
-        let access = try BaseScanPlan(predicate: accessPredicate, keys: relation.table.primaryKey, types: relation.types).bind(context)
+        let access = try plan.scan.bind(context)
         if access.isEmpty { return result }
         var cursor: ForeignKeyActions.Gather
         if let target { cursor = try target.gather(snapshot: read, settings: settings, context: context, touched: touched.sorted()) }
         else {
-            try ScanCost.charge(relation.store, touched: touched.sorted(), meter: context.meter, access: access)
+            try context.profile(plan.profileIdentity, .source) {
+                try ScanCost.charge(relation.store, touched: touched.sorted(), meter: context.meter, access: access)
+            }
             cursor = ForeignKeyActions.Gather(scan: access.cursor(relation.store))
         }
         defer { cursor.close() }
         var staged: [Change] = [], store = snapshot.tables[relation.table.name] ?? relation.store
         let compression = CostMeter()
         while let old = try cursor.next() {
-            context.meter.charge(1); try context.meter.step()
-            let row = ScanRecord(old, pager: store.tree.pool?.pager)
-            for column in touched.sorted() { _ = try row.value(column) }
+            let row = try context.profile(plan.profileIdentity, .source) {
+                context.meter.charge(1); try context.meter.step()
+                let value = ScanRecord(old, pager: store.tree.pool?.pager)
+                for column in touched.sorted() { _ = try value.value(column) }
+                return value
+            }
             var targetPosition: Int?
             if let target {
                 targetPosition = try target.match(row.value, context: context)
                 if targetPosition == nil { continue }
             }
             let rowContext = relation.row(row.value, context: context)
-            let filterCount = filters.count + (predicate == nil ? 0 : 1)
-            if filterCount > 1 {
-                // The equivalent base WHERE is left-deep: all inter-level AND
-                // nodes are visited before its first innermost conjunct.
-                for _ in 1..<filterCount { context.meter.charge(1); try context.meter.step() }
-            }
-            var visible = true
-            if let view = relation.view {
-                for filter in filters where visible {
-                    visible = try view.matches(filter.expression, level: filter.level, base: row.value, context: context)
+            let matches = try context.profile(plan.profileIdentity, .filter) {
+                let filterCount = filters.count + (predicate == nil ? 0 : 1)
+                if filterCount > 1 {
+                    // The equivalent base WHERE is left-deep: all inter-level AND
+                    // nodes are visited before its first innermost conjunct.
+                    for _ in 1..<filterCount { context.meter.charge(1); try context.meter.step() }
                 }
+                var visible = true
+                if let view = relation.view {
+                    for filter in filters where visible {
+                        visible = try view.matches(filter.expression, level: filter.level, base: row.value, context: context)
+                    }
+                }
+                if !visible { return false }
+                if let predicate, try !rowContext.matches(predicate) { return false }
+                return true
             }
-            if !visible { continue }
-            if let predicate, try !rowContext.matches(predicate) { continue }
+            if !matches { continue }
             if deleting {
                 staged.append(Change(old: old, new: nil))
             } else {

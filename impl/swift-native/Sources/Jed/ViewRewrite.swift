@@ -3,7 +3,7 @@
 internal enum ViewRewrite {
     static func references(in image: inout CatalogImage, name: SQLText, kind: UInt8,
                            renamed: SQLText? = nil, column: (ordinal: Int, name: SQLText)? = nil,
-                           columns: [SQLText]) throws {
+                           columns: [SQLText], domain: SQLText = DomainNames.main) throws {
         for index in image.views.indices where image.views[index].dependencies.contains(where: { $0.kind == kind && $0.name == name }) {
             var view = image.views[index]
             let query = try ViewDefinition.query(view)
@@ -11,7 +11,7 @@ internal enum ViewRewrite {
             var edits: [(start: Int, end: Int, bytes: [UInt8])] = []
             try ViewSyntax.walk(query, from: { from, ctes in
                 guard case .table(let reference) = from.source, reference.name == name,
-                      reference.database == nil || reference.database?.description == "main",
+                      reference.database == nil || reference.database == domain,
                       reference.database != nil || !ctes.contains(name) else { return }
                 if let renamed {
                     guard let token = tokens.last(where: { $0.byteStart >= reference.span.byteStart && $0.byteEnd <= reference.span.byteEnd && $0.kind != .end }) else {

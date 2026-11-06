@@ -15,6 +15,7 @@ public struct CommandTag: Sendable {
 public final class Rows {
     public let columns: [ResultColumn]
     private let meter: CostMeter
+    private let guardCostOnPull: Bool
     private var pull: (() throws -> [SQLValue]?)?
     private var release: (() -> Void)?
     private var failure: ((Error) -> Void)?
@@ -27,16 +28,18 @@ public final class Rows {
     public var commandTag: CommandTag { CommandTag(command: command, rowsAffected: affected ?? rowCount, cost: cost) }
 
     internal init(columns: [ResultColumn], meter: CostMeter, command: String = "SELECT", affected: Int64? = nil,
+                  guardCostOnPull: Bool = true,
                   pull: @escaping () throws -> [SQLValue]?, release: @escaping () -> Void = {},
                   failure: @escaping (Error) -> Void = { _ in }) {
         self.columns = columns; self.meter = meter; self.command = command; self.affected = affected
+        self.guardCostOnPull = guardCostOnPull
         self.pull = pull; self.release = release
         self.failure = failure
     }
     public func next() throws -> [SQLValue]? {
         guard let pull else { return nil }
         do {
-            try meter.checkpoint()
+            if guardCostOnPull { try meter.checkpoint() } else { try meter.poll() }
             guard let row = try pull() else { close(); return nil }
             rowCount = saturatingAdd(rowCount, 1)
             return row

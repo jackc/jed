@@ -20,29 +20,18 @@ internal enum CreateTableAs {
                         parameters: [SQLValue], requireWritable: (SQLText) throws -> Void) throws -> MutationResult {
         try CatalogDomain.requireDDL(settings)
         try requireWritable(settings.targetDomain)
-        var snapshot = try working.snapshot(settings.targetDomain)
-        if settings.targetDomain == DomainNames.temporary, let main = working.snapshots[DomainNames.main] {
-            try snapshot.borrow(main)
-        }
-        var planning = settings
-        planning.domains = working
-        planning.domains?.snapshots[settings.targetDomain] = snapshot
-        let name = try CatalogDomain.name(definition.name, settings: planning)
-        try CatalogSQL.reserved(name, kind: "table")
-        guard let query = definition.query else { throw JedError("XX000", "CREATE TABLE AS has no query") }
-        if !definition.withData { planning.privileges = SessionPrivileges(defaults: .allTables) }
-        let writable = try WritableCTEPlan.resolve(.query(query), snapshot: snapshot, settings: planning, context: context)
-        let plan: SelectPlan
-        if let writable {
-            guard let output = writable.query else { throw JedError("42601", "CREATE TABLE AS requires a query") }
-            plan = output
-        } else { plan = try SelectPlan.resolve(query, snapshot: snapshot, settings: planning, scalar: context.scalar) }
-        _ = try ParameterBinding.bind(parameters, types: writable?.parameters ?? plan.parameters, timezone: settings.timeZone)
+        let prepared = try prepare(definition, working: working, settings: settings, context: context, parameters: parameters)
+        return try execute(definition, prepared: prepared, working: &working, settings: settings, context: context,
+                           parameters: parameters, requireWritable: requireWritable)
+    }
+    static func execute(_ definition: SQLCreateTable, prepared: Preparation, working: inout QueryDomains,
+                        settings: SessionSettings, context: ExpressionContext, parameters: [SQLValue],
+                        requireWritable: (SQLText) throws -> Void) throws -> MutationResult {
+        var snapshot = prepared.snapshot
+        let planning = prepared.settings, name = prepared.name, query = prepared.query
+        let writable = prepared.writable, plan = prepared.plan
         let result = MutationResult(command: "CREATE TABLE", meter: context.meter)
-        if CatalogDomain.relations(snapshot.catalog, settings: planning).contains(name) {
-            if definition.ifNotExists { return result }
-            throw JedError("42P07", "relation \(name) already exists")
-        }
+        if prepared.skipped { return result }
         let names = plan.columns.enumerated().map {
             $0.offset < definition.queryColumnNames.count ? definition.queryColumnNames[$0.offset] : $0.element.name
         }
@@ -107,8 +96,11 @@ internal enum CreateTableAs {
                     context.meter.pendingDomainBase = oldPendingBase
                     context.meter.pendingDomainExcluded = oldPendingExcluded
                 }
-                filled = try MutationExecutor.execute(.insert(insert), snapshot: &snapshot, settings: filling,
-                    context: context, parameters: parameters)
+                var insertion = try MutationExecutor.prepareInsert(insert, snapshot: snapshot, settings: filling, context: context)
+                var source = plan
+                source.materializeSource = insertion.sourcePlan?.materializeSource ?? source.materializeSource
+                insertion.sourcePlan = source
+                filled = try MutationExecutor.executeInsert(insertion, snapshot: &snapshot, context: context, parameters: parameters)
                 working.snapshots[settings.targetDomain] = snapshot
             }
             guard let filled else { throw JedError("XX000", "CREATE TABLE AS fill did not execute") }
@@ -116,6 +108,45 @@ internal enum CreateTableAs {
             result.affected = filled.affected
         }
         return result
+    }
+
+    struct Preparation {
+        let snapshot: DomainSnapshot
+        let settings: SessionSettings
+        let name: SQLText
+        let query: SQLQuery
+        let writable: WritableCTEPlan?
+        let plan: SelectPlan
+        let skipped: Bool
+    }
+    /// The early CTAS phase is also used by plain EXPLAIN: analyze the query,
+    /// then admit the target name, without checking or creating result columns.
+    static func prepare(_ definition: SQLCreateTable, working: QueryDomains, settings: SessionSettings,
+                        context: ExpressionContext, parameters: [SQLValue]?) throws -> Preparation {
+        try CatalogDomain.requireDDL(settings)
+        var snapshot = try working.snapshot(settings.targetDomain)
+        if settings.targetDomain == DomainNames.temporary, let main = working.snapshots[DomainNames.main] {
+            try snapshot.borrow(main)
+        }
+        var planning = settings
+        planning.domains = working
+        planning.domains?.snapshots[settings.targetDomain] = snapshot
+        let name = try CatalogDomain.name(definition.name, settings: planning)
+        try CatalogSQL.reserved(name, kind: "table")
+        guard let query = definition.query else { throw JedError("XX000", "CREATE TABLE AS has no query") }
+        if !definition.withData { planning.privileges = SessionPrivileges(defaults: .allTables) }
+        let writable = try WritableCTEPlan.resolve(.query(query), snapshot: snapshot, settings: planning, context: context)
+        let plan: SelectPlan
+        if let writable {
+            guard let output = writable.query else { throw JedError("42601", "CREATE TABLE AS requires a query") }
+            plan = output
+        } else { plan = try SelectPlan.resolve(query, snapshot: snapshot, settings: planning, scalar: context.scalar) }
+        if let parameters { _ = try ParameterBinding.bind(parameters, types: writable?.parameters ?? plan.parameters, timezone: settings.timeZone) }
+        if CatalogDomain.relations(snapshot.catalog, settings: planning).contains(name) {
+            if definition.ifNotExists { return Preparation(snapshot: snapshot, settings: planning, name: name, query: query, writable: writable, plan: plan, skipped: true) }
+            throw JedError("42P07", "relation \(name) already exists")
+        }
+        return Preparation(snapshot: snapshot, settings: planning, name: name, query: query, writable: writable, plan: plan, skipped: false)
     }
 
     /// The parser has already enforced where INTO may occur. Remove only the

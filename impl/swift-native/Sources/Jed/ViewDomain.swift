@@ -32,4 +32,24 @@ internal enum ViewDomain {
         })
         return temporary ? DomainNames.temporary : written
     }
+/// Writer classification follows only the stored single-base chain. Shape,
+/// capability and expression errors remain in ordinary target preparation.
+static func written(_ name: SQLName, domains: QueryDomains) throws -> SQLText {
+    var scope = domains, reference = name
+    let first = try domains.relation(name).name
+    var visited: Set<SQLText> = []
+    for _ in 0..<256 {
+        let owner = try scope.relation(reference)
+        guard let view = owner.snapshot.catalog.views.first(where: { $0.name == reference.name }),
+              visited.insert(view.name).inserted, let query = try? ViewDefinition.query(view),
+              case .select(let select) = query.body, select.from.count == 1,
+              let from = select.from.first, from.joins.isEmpty, case .table(let base) = from.source else {
+            return owner.name
+        }
+        scope = try domains.viewScope(owner: owner.name)
+        reference = base
+    }
+    return first
+}
+
 }

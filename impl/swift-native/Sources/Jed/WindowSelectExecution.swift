@@ -39,6 +39,9 @@ internal final class WindowSelectExecution {
         try reserve(bytes); rowBytes[row] = saturatingAdd(rowBytes[row], bytes); rows[row].append(value)
     }
     private func prepare() throws {
+        try context.profile(plan.profileIdentity, .window, excluding: [.source, .filter, .aggregate, .sort]) { try prepareBody() }
+    }
+    private func prepareBody() throws {
         if let aggregate = plan.aggregation {
             let input = GroupedSelectExecution(plan: plan, aggregate: aggregate, context: context, rawOutput: true)
             defer { input.close() }
@@ -49,7 +52,7 @@ internal final class WindowSelectExecution {
                 try input.prime()
                 while Int64(rows.count) < prefix, let row = try input.next() {
                     var current = context; current.column = { row[$0] }
-                    if let predicate = plan.predicate, try !current.matches(predicate) { continue }
+                    if let predicate = plan.predicate, try !context.profile(plan.profileIdentity, .filter, { try current.matches(predicate) }) { continue }
                     try append(row, bytes: MemorySizes.row(row))
                 }
             } else {
@@ -58,7 +61,7 @@ internal final class WindowSelectExecution {
                     var kept: [[SQLValue]] = [], sizes: [Int64] = []
                     for (row, bytes) in zip(rows, rowBytes) {
                         var current = context; current.column = { row[$0] }
-                        if try current.matches(predicate) { kept.append(row); sizes.append(bytes) } else { release(bytes) }
+                        if try context.profile(plan.profileIdentity, .filter, { try current.matches(predicate) }) { kept.append(row); sizes.append(bytes) } else { release(bytes) }
                     }
                     rows = kept; rowBytes = sizes
                 }
@@ -324,6 +327,9 @@ internal final class WindowSelectExecution {
         }
     }
     private func sortOutput() throws {
+        try context.profile(plan.profileIdentity, .sort) { try sortOutputBody() }
+    }
+    private func sortOutputBody() throws {
         guard !plan.order.isEmpty else { return }
         var ordering: [[SQLValue]] = [], decorations: Int64 = 0
         defer { release(decorations) }

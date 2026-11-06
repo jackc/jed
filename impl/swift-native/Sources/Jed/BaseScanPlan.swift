@@ -14,7 +14,6 @@ internal struct BaseScanPlan {
         func constant(_ expression: ResolvedExpression) -> Bool {
             switch expression.node {
             case .constant, .parameter, .outerColumn: return true
-            case .subquery(let query): if case .scalar = query.kind { return !query.correlated }; return false
             default: return false
             }
         }
@@ -112,7 +111,7 @@ internal struct BaseScanPlan {
             switch expression.node {
             case .constant(let value): return value
             case .parameter(let index): return context.parameters[index - 1]
-            case .outerColumn, .subquery: return try context.evaluate(expression)
+            case .outerColumn: return try context.evaluate(expression)
             default: throw JedError("XX000", "invalid constant scan operand")
             }
         }
@@ -176,7 +175,6 @@ internal struct BaseScanPlan {
                 switch term.source.node {
                 case .constant(let constant): value = constant
                 case .parameter(let index): value = context.parameters[index - 1]
-                case .subquery: value = try context.evaluate(term.source)
                 case .outerColumn: continue
                 default: continue
                 }

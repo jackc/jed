@@ -36,6 +36,9 @@ internal final class OrderedSelectExecution {
         try context.meter.reserveQuery(bytes); reserved = saturatingAdd(reserved, bytes)
     }
     private func prepare() throws {
+        try context.profile(plan.profileIdentity, .sort, excluding: [.source, .filter]) { try prepareBody() }
+    }
+    private func prepareBody() throws {
         let meter = context.meter
         if plan.distinctOn == nil, plan.store != nil, plan.relation == nil, let limit = plan.limit,
            !plan.order.contains(where: { ($0.type.collation?.description ?? "C") != "C" }) {
@@ -45,7 +48,7 @@ internal final class OrderedSelectExecution {
         let input = SelectInput(plan: plan, context: context); defer { input.close() }
         while let row = try input.next() {
             var current = context; current.column = { row[$0] }
-            if let predicate = plan.predicate, try !current.matches(predicate) { continue }
+            if let predicate = plan.predicate, try !context.profile(plan.profileIdentity, .filter, { try current.matches(predicate) }) { continue }
             try reserve(MemorySizes.row(row))
             entries.append(Entry(row: row, keys: [], ordinal: entries.count, bytes: MemorySizes.row(row)))
         }
@@ -136,7 +139,7 @@ internal final class OrderedSelectExecution {
         var ordinal = 0
         while let row = try input.next() {
             var current = context; current.column = { row[$0] }
-            if let predicate = plan.predicate, try !current.matches(predicate) { continue }
+            if let predicate = plan.predicate, try !context.profile(plan.profileIdentity, .filter, { try current.matches(predicate) }) { continue }
             let keys = try plan.order.map { try current.evaluate($0.expression) }
             for key in keys {
                 let units = MemorySizes.payload(key)

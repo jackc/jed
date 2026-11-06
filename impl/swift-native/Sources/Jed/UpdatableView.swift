@@ -3,6 +3,8 @@
 internal struct UpdatableView {
     struct Layer {
         let view: CatalogView
+        let owner: SQLText
+        let baseDomain: SQLText
         let base: SQLName
         let columns: [ResultColumn]
         let projections: [ResolvedExpression]
@@ -13,6 +15,7 @@ internal struct UpdatableView {
     }
     let layers: [Layer] // target outward to the table
     let table: CatalogTable
+    let tableDomain: SQLText
     let operation: String
 
     static func checkShape(_ query: SQLQuery, name: SQLText, operation: String) throws {
@@ -48,6 +51,8 @@ internal struct UpdatableView {
     static func resolve(_ view: CatalogView, operation: String, snapshot: DomainSnapshot,
                         settings: SessionSettings, context: ExpressionContext) throws -> UpdatableView {
         var layers: [Layer] = [], current = view, bodySettings = settings, visited: Set<SQLText> = []
+        let domains = QueryDomains.statement(snapshot: snapshot, settings: settings)
+        var currentOwner = settings.targetDomain, currentSnapshot = snapshot
         while true {
             guard visited.insert(current.name).inserted, layers.count < 256 else { throw JedError("54001", "view expansion exceeds maximum nesting") }
             let parsed = try ViewDefinition.parsed(current), query = parsed.query
@@ -55,18 +60,21 @@ internal struct UpdatableView {
             guard case .select(let select) = query.body, let from = select.from.first, case .table(let base) = from.source else {
                 throw JedError("XX000", "updatable view shape changed during planning")
             }
-            if current.securityInvoker {
+            let scope = try domains.viewScope(owner: currentOwner)
+            let selected = try scope.relation(base)
+            bodySettings.domains = scope; bodySettings.targetDomain = currentOwner
+            if current.securityInvoker && selected.name != DomainNames.temporary {
                 let privilege: PrivilegeSet = operation == "insert into" ? .insert : operation == "update" ? .update : .delete
                 try bodySettings.privileges.require(privilege, on: base.name)
                 if operation != "insert into", select.predicate != nil { try bodySettings.privileges.require(.select, on: base.name) }
-            } else { bodySettings.privileges = bodySettings.privileges.withTableAccess() }
+            } else if !current.securityInvoker { bodySettings.privileges = bodySettings.privileges.withTableAccess() }
             // INSERT does not read the body's rows or WHERE. Planning its
             // output types must not add an unrelated SELECT capability gate.
             var planSettings = bodySettings
             if operation == "insert into" || select.predicate == nil { planSettings.privileges = bodySettings.privileges.withTableAccess() }
-            let isolated = ExpressionResolver(composites: snapshot.types, scalar: context.scalar)
+            let isolated = ExpressionResolver(composites: currentSnapshot.types, scalar: context.scalar)
             let plan = try isolated.viewExpansion.withBody(current.name, referenceDepth: 0, offset: 0, bodyDepth: parsed.depth) {
-                try SelectPlan.resolve(query, snapshot: snapshot, settings: planSettings, scalar: context.scalar, using: isolated)
+                try SelectPlan.resolve(query, snapshot: currentSnapshot, settings: planSettings, scalar: context.scalar, using: isolated)
             }
             guard plan.columns.count == current.columns.count else { throw JedError("0A000", "stored view column count no longer matches its definition") }
             var mapping: [Int?] = [], ordinal = 0
@@ -81,13 +89,13 @@ internal struct UpdatableView {
                 ordinal += 1
             }
             let columns = plan.columns.enumerated().map { ResultColumn(name: current.columns[$0.offset].name, type: $0.element.type ?? TypeDescriptor(.scalar(.text))) }
-            layers.append(Layer(view: current, base: base, columns: columns, projections: plan.projections,
+            layers.append(Layer(view: current, owner: currentOwner, baseDomain: selected.name, base: base, columns: columns, projections: plan.projections,
                                 predicate: plan.predicate, mapping: mapping, settings: bodySettings))
-            if let table = snapshot.catalog.tables.first(where: { $0.name == base.name }) {
-                return UpdatableView(layers: layers, table: table, operation: operation)
+            if let table = selected.snapshot.catalog.tables.first(where: { $0.name == base.name }) {
+                return UpdatableView(layers: layers, table: table, tableDomain: selected.name, operation: operation)
             }
-            guard let nested = snapshot.catalog.views.first(where: { $0.name == base.name }) else { throw JedError("42P01", "relation does not exist: \(base.name)") }
-            current = nested
+            guard let nested = selected.snapshot.catalog.views.first(where: { $0.name == base.name }) else { throw JedError("42P01", "relation does not exist: \(base.name)") }
+            current = nested; currentOwner = selected.name; currentSnapshot = selected.snapshot
         }
     }
     func column(_ name: SQLText) throws -> Int {
@@ -244,10 +252,12 @@ internal struct UpdatableView {
     }
     func requireSelect(_ settings: SessionSettings) throws {
         guard let first = layers.first else { return }
-        try settings.privileges.require(.select, on: first.view.name)
+        if first.owner != DomainNames.temporary { try settings.privileges.require(.select, on: first.view.name) }
         var privileges = settings.privileges
         for layer in layers {
-            if layer.view.securityInvoker { try privileges.require(.select, on: layer.base.name) }
+            if layer.view.securityInvoker {
+                if layer.baseDomain != DomainNames.temporary { try privileges.require(.select, on: layer.base.name) }
+            }
             else { privileges = privileges.withTableAccess() }
         }
     }

@@ -90,6 +90,10 @@ internal final class DatabaseCore: Sendable {
         initial.sqlReady = sqlReady; registry = Mutex(initial)
     }
     var version: UInt64 { registry.withLock { $0.meta.meta.txid } }
+    /// Resident facts for provisional name/capability routing only. This does
+    /// not adopt a newer service catalog or protect on-disk pages. The caller
+    /// must revalidate under a writer lease or read pin before execution.
+    var routingSnapshot: DomainSnapshot { registry.withLock { $0.snapshot } }
     var oldestLiveVersion: UInt64 { registry.withLock { $0.pins.keys.min() ?? $0.meta.meta.txid } }
     var livePinCount: Int { registry.withLock { $0.pins.values.reduce(0, +) } }
 

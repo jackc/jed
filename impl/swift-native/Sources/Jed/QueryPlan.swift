@@ -24,6 +24,9 @@ internal struct SelectPlan {
     var distinctOn: DistinctOnPlan? = nil
     var sourceDomain: SQLText? = nil
     var sourceSnapshot: DomainSnapshot? = nil
+    var sourceTable: CatalogTable? = nil
+    var profileIdentity = QueryProfileIdentity()
+    var profilesRoot = true
     var keyEvaluationOrder: [Int] { distinctOn?.evaluationOrder ?? Array(order.indices) }
 
     var expressions: [ResolvedExpression] {
@@ -65,7 +68,7 @@ internal struct SelectPlan {
         resolver.hostFunctions = settings.environment.signatures; resolver.unicode = settings.environment.unicode
         resolver.checkFunction = { try settings.privileges.require(.execute, on: $0, function: true) }
         var source: TableStore?, scope: [ExpressionColumn] = [], primaryKey: [Int] = []
-        var sourceDomain: SQLText?, sourceSnapshot: DomainSnapshot?, functionalKey: [Int] = []
+        var sourceDomain: SQLText?, sourceSnapshot: DomainSnapshot?, sourceTable: CatalogTable?, functionalKey: [Int] = []
         let domains = QueryDomains.statement(snapshot: snapshot, settings: settings)
         let single: (name: SQLText, snapshot: DomainSnapshot)?
         if select.from.count == 1, let from = select.from.first, from.joins.isEmpty,
@@ -83,6 +86,7 @@ internal struct SelectPlan {
             guard from.columnAliases.count <= table.columns.count else { throw JedError("42601", "too many column aliases") }
             source = store
             sourceDomain = selected.name; sourceSnapshot = owner
+            sourceTable = table
             functionalKey = table.primaryKey
             primaryKey = DomainNames.isAttachment(selected.name) ? [] : table.primaryKey
             if primaryKey.contains(where: { !CatalogEnvironment.collationMatches(table.columns[$0].type.collation,
@@ -202,7 +206,7 @@ internal struct SelectPlan {
                           order: order, orderedByScan: orderedByScan, descending: orderedByScan && reverse,
                           scan: BaseScanPlan(predicate: predicate, keys: primaryKey, types: source?.tree.types ?? []), aggregation: aggregation,
                           relation: relation, distinct: select.distinct && distinctOn == nil, window: window, distinctOn: distinctOn,
-                          sourceDomain: sourceDomain, sourceSnapshot: sourceSnapshot)
+                          sourceDomain: sourceDomain, sourceSnapshot: sourceSnapshot, sourceTable: sourceTable)
     }
 
     internal static func outputName(_ expression: SQLExpression) -> SQLText {
@@ -259,8 +263,10 @@ internal final class SelectExecution {
         else if ColumnarExecution.projection(plan, context) { columnar = ColumnarProjectionExecution(plan: plan, context: context) }
     }
     func next() throws -> [SQLValue]? {
+        let before = context.meter.accrued
+        defer { if plan.profilesRoot { context.executionProfile?.add(plan.profileIdentity, .total, context.meter.accrued - before) } }
         if !initializedSubqueries {
-            try context.subqueries.prepare(plan.foldExpressions, context: context)
+            try context.profile(plan.profileIdentity, .folded) { try context.subqueries.prepare(plan.foldExpressions, context: context) }
             initializedSubqueries = true
         }
         if let withQuery { return try withQuery.next() }
@@ -278,7 +284,7 @@ internal final class SelectExecution {
             guard let row = try input.next(retaining: true) else { return nil }
             var rowContext = context; rowContext.column = { row[$0] }
             if let predicate = plan.predicate, !input.predicateApplied {
-                guard try rowContext.matches(predicate) else { input.discardRetained(row); continue }
+                guard try context.profile(plan.profileIdentity, .filter, { try rowContext.matches(predicate) }) else { input.discardRetained(row); continue }
             }
             if skipped < plan.offset { skipped += 1; continue }
             if plan.productionCharge { meter.charge(1); try meter.guardCost() }

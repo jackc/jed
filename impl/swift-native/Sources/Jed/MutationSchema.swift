@@ -19,14 +19,11 @@ extension MutationExecutor {
         default: throw JedError("0A000", "this data-modifying WITH body is not connected")
         }
         try SystemRelationPlan.rejectTarget(name.name)
-        let relation: Relation
-        if (name.database == nil || name.database == settings.targetDomain),
-           let definition = snapshot.catalog.views.first(where: { $0.name == name.name }) {
-            guard !DomainNames.isAttachment(settings.targetDomain) else {
-                throw JedError("0A000", "views in attached databases are not supported")
-            }
-            let view = try UpdatableView.resolve(definition, operation: operation,
-                snapshot: snapshot, settings: settings, context: context)
+        let prepared = try MutationTarget.resolve(name, operation: operation, snapshot: snapshot,
+                                                 settings: settings, context: context)
+        let relation = prepared.relation
+        if let view = relation.view {
+            let definition = view.layers[0].view
             // Target rewriting validates view-column mappings even when the
             // statement has no RETURNING. Reuse the same mapping implementation.
             switch statement {
@@ -48,8 +45,7 @@ extension MutationExecutor {
                 _ = try view.destinations(targets)
             default: break
             }
-            relation = try Relation(SQLName(name: view.table.name, span: name.span), snapshot: snapshot, view: view, domain: settings.targetDomain)
-        } else { relation = try Relation(name, snapshot: snapshot, domain: settings.targetDomain) }
+        }
         let resolver = resolver(relation, snapshot: snapshot, settings: settings, context: context, columns: true)
         resolver.cteBindings = shared.cteBindings
         resolver.outerScopes = shared.outerScopes
