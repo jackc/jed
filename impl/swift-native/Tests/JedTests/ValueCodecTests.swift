@@ -136,12 +136,36 @@ final class ValueCodecTests: XCTestCase {
                         actual = try KeyEncoding.encodeSlot(input, type: type, descending: descending, nullsFirst: nullsFirst)
                     }
                     XCTAssertEqual(actual, hex(try XCTUnwrap(row[field] as? String)), "\(name)/\(field): \(row)")
+                    var type = name.hasPrefix("collated text") ? TypeDescriptor(.scalar(.text)) : try descriptor(name)
+                    if name.hasPrefix("collated text") { type.collation = try SQLText("unicode") }
+                    let option: UInt8 = (descending ? 1 : 0) | (nullsFirst ? 2 : 0)
+                    let suffix: [UInt8] = [0, 255, 0, 1, 3, 255, 128, 0]
+                    XCTAssertEqual(try IndexKeyBoundary.suffix(actual + suffix, types: [type], options: [option]), suffix)
+                    code("XX001") { _ = try IndexKeyBoundary.suffix(actual, types: [type], options: [option]) }
                 }
             }
         }
     }
 
+    func testIndexSuffixContainerDepthAndInvalidArity() throws {
+        let integer = TypeDescriptor(.scalar(.i32))
+        code("XX001") { _ = try IndexKeyBoundary.suffix([0, 1], types: [integer, integer], options: [0]) }
+        var type = TypeDescriptor(.array(integer.type))
+        var value = SQLValue.array(try SQLArray(elements: [.integer(1), .null, .integer(-1)]))
+        for ordinal in 1...32 {
+            type = TypeDescriptor(.composite(CompositeType(catalogID: 1, id: UInt32(ordinal), name: try SQLText("c\(ordinal)"),
+                fields: [TypeField(name: try SQLText("member"), descriptor: type)])))
+            value = .composite([value])
+        }
+        let suffix = try KeyEncoding.encode(.text(SQLText("variable    func testScalarBodiesPreserveBitsAndExactBytes() throws {key")), type: descriptor("text"))
+        for option: UInt8 in 0...3 {
+            let slot = try KeyEncoding.encodeSlot(value, type: type, descending: option & 1 != 0, nullsFirst: option & 2 != 0)
+            XCTAssertEqual(try IndexKeyBoundary.suffix(slot + suffix, types: [type], options: [option]), suffix)
+        }
+    }
+
     func testScalarBodiesPreserveBitsAndExactBytes() throws {
+
         let cases: [(String, SQLValue, String)] = [
             ("i16", .integer(-1), "007fff"), ("i32", .integer(1), "0080000001"),
             ("i64", .integer(Int64.min), "000000000000000000"), ("boolean", .boolean(true), "0001"),

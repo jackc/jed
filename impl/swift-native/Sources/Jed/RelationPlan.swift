@@ -377,13 +377,18 @@ internal final class RelationExecution {
                     let logical = physical.swapped ? placeholder + row : row + placeholder
                     var boundsContext = context; boundsContext.outerRows = [{ logical[$0] }] + context.outerRows
                     let access = try bound.bind(boundsContext)
-                    try ScanCost.charge(store, touched: columns, meter: meter, access: access)
+                    try context.profile(inner, .total) {
+                        try ScanCost.charge(store, touched: columns, meter: meter, access: access)
+                    }
                     var cursor = access.cursor(store); defer { cursor.close() }
                     var matched = false
                     while let record = try cursor.next() {
-                        meter.charge(1); try meter.step()
-                        var innerRow = placeholder
-                        for column in columns { innerRow[column] = try record.materialize(column: column, pager: store.tree.pool?.pager) }
+                        let innerRow = try context.profile(inner, .total) {
+                            meter.charge(1); try meter.step()
+                            var value = placeholder
+                            for column in columns { value[column] = try record.materialize(column: column, pager: store.tree.pool?.pager) }
+                            return value
+                        }
                         let joined = physical.swapped ? innerRow + row : row + innerRow
                         var current = context; current.column = { joined[$0] }
                         if let predicate, try !current.matches(predicate) { continue }
@@ -471,18 +476,21 @@ internal final class RelationExecution {
                     var current = context; current.outerRows = [{ prefix[$0] }] + context.outerRows
                     let access = try bound.bind(current)
                     let columns = masks[step.input].sorted()
-                    try ScanCost.charge(store, touched: columns, meter: context.meter, access: access)
-                    var cursor = access.cursor(store); defer { cursor.close() }
-                    var candidates: [[SQLValue]] = []
-                    while let record = try cursor.next() {
-                        context.meter.charge(1); try context.meter.step()
-                        var row = Array(repeating: SQLValue.null, count: input.source.columns.count)
-                        for column in columns { row[column] = try record.materialize(column: column, pager: store.tree.pool?.pager) }
-                        if let filter = input.source.scanFilter {
-                            var filtered = context; filtered.column = { row[$0] }
-                            if try !filtered.matches(filter) { continue }
+                    let candidates: [[SQLValue]] = try context.profile(input.source, .total) {
+                        try ScanCost.charge(store, touched: columns, meter: context.meter, access: access)
+                        var cursor = access.cursor(store); defer { cursor.close() }
+                        var candidates: [[SQLValue]] = []
+                        while let record = try cursor.next() {
+                            context.meter.charge(1); try context.meter.step()
+                            var row = Array(repeating: SQLValue.null, count: input.source.columns.count)
+                            for column in columns { row[column] = try record.materialize(column: column, pager: store.tree.pool?.pager) }
+                            if let filter = input.source.scanFilter {
+                                var filtered = context; filtered.column = { row[$0] }
+                                if try !filtered.matches(filter) { continue }
+                            }
+                            try reserve(row); candidates.append(row)
                         }
-                        try reserve(row); candidates.append(row)
+                        return candidates
                     }
                     // Each seek materializes its candidate relation before ON.
                     // Those rows overlap this prefix's output until its probe ends.
@@ -515,6 +523,7 @@ internal final class SelectInput {
     private let plan: SelectPlan
     private let context: ExpressionContext
     private var cursor: ScanCursor?
+    private var physicalCursor: AccessCursor?
     private var relation: RelationExecution?
     private var started = false
     private var singleton = true
@@ -536,22 +545,28 @@ internal final class SelectInput {
             started = true
             if let source = plan.relation { relation = RelationExecution(plan: source, context: context, touched: Set(plan.touched)) }
             else {
-                let access = try plan.scan.bind(context); empty = access.isEmpty
+                let access = try plan.chosenAccess?.bind(context) ?? plan.scan.bind(context); empty = access.isEmpty
                 if plan.store == nil && !empty {
                     try context.meter.reserveQuery(GeneratedSpec.memoryRow); virtualBytes = GeneratedSpec.memoryRow
                 }
                 if let store = plan.store, !empty {
-                    try ScanCost.charge(store, touched: plan.touched, meter: context.meter, access: access)
-                    cursor = access.cursor(store, descending: plan.descending)
+                    if let candidate = plan.chosenAccess {
+                        physicalCursor = try candidate.makeCursor(context: context, touched: plan.touched,
+                            descending: plan.descending, access: access)
+                    } else {
+                        try ScanCost.charge(store, touched: plan.touched, meter: context.meter, access: access)
+                        cursor = access.cursor(store, descending: plan.descending)
+                    }
+
                     if access.intervals != nil || plan.materializeSource {
                         buffered = []
-                        while let record = try cursor?.next() {
+                        while let record = try nextRecord() {
                             let row = try materialize(record, store: store)
                             let bytes = MemorySizes.row(row)
                             try context.meter.reserveQuery(bytes); bufferedBytes = saturatingAdd(bufferedBytes, bytes)
                             buffered!.append(row)
                         }
-                        cursor?.close(); cursor = nil
+                        cursor?.close(); cursor = nil; physicalCursor?.close(); physicalCursor = nil
                         if plan.materializeSource, let predicate = plan.predicate {
                             var kept: [[SQLValue]?] = []
                             for item in buffered! {
@@ -584,10 +599,14 @@ internal final class SelectInput {
             return row
         }
         if let store = plan.store {
-            guard let record = try cursor?.next() else { return nil }
+            guard let record = try nextRecord() else { return nil }
             return try materialize(record, store: store)
         }
         guard singleton else { return nil }; singleton = false; return []
+    }
+    private func nextRecord() throws -> PackedRecord? {
+        if let physicalCursor { return try physicalCursor.next() }
+        return try cursor?.next()
     }
     private func materialize(_ record: PackedRecord, store: TableStore) throws -> [SQLValue] {
         context.meter.charge(1); try context.meter.step()
@@ -605,7 +624,7 @@ internal final class SelectInput {
         }
     }
     func close() {
-        cursor?.close(); cursor = nil; relation?.close(); relation = nil; buffered = nil
+        cursor?.close(); cursor = nil; physicalCursor?.close(); physicalCursor = nil; relation?.close(); relation = nil; buffered = nil
         context.meter.resources.query.release(bufferedBytes); bufferedBytes = 0
         context.meter.resources.query.release(virtualBytes); virtualBytes = 0
     }

@@ -35,6 +35,34 @@ internal struct GinIndex: Sendable {
         return try GinIndex(tree: tree)
     }
 
+    /// Greedy canonical runs from ascending, distinct postings. At most one
+    /// <=64-byte run (or one oversized singleton) is decoded at any time.
+    static func buildSorted(codec: any PageCodec, pool: NodePool? = nil,
+                            next: () throws -> GinPosting?) throws -> GinIndex {
+        var tree = BPlusTree(codec: codec, types: [], pool: pool)
+        var term: [UInt8]?, keys: [[UInt8]] = [], previous: [UInt8]?
+        func flush() throws {
+            if let term, !keys.isEmpty {
+                _ = try tree.insert(PackedRecord(key: GinPostingRun.encode(term: term, keys: keys), cells: []))
+                keys.removeAll(keepingCapacity: true)
+            }
+        }
+        while let posting = try next() {
+            let key = posting.key
+            guard !posting.storageKey.isEmpty, previous.map({ $0.lexicographicallyPrecedes(key) }) ?? true else {
+                throw JedError.corruption("GIN sorted postings are not strictly ascending")
+            }
+            previous = key
+            if term != posting.term { try flush(); term = posting.term }
+            if !keys.isEmpty, try GinPostingRun.encode(term: posting.term, keys: keys + [posting.storageKey]).count > GinPostingRun.maximumBytes {
+                try flush()
+            }
+            keys.append(posting.storageKey)
+        }
+        try flush()
+        return try GinIndex(tree: tree)
+    }
+
     static func postings(values: [SQLValue], opclasses: [GinOpclass], storageKey: [UInt8]) throws -> [GinPosting] {
         guard !storageKey.isEmpty, values.count == opclasses.count, (1...32).contains(values.count) else {
             throw JedError.corruption("invalid GIN index tuple")

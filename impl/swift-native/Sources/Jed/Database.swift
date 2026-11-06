@@ -221,10 +221,14 @@ public final class Session {
         let active = transaction, frame = try writeFrame(shared: true, cancellation: nil)
         defer { if active == nil { frame.close() } }
         var working = frame.working, snapshot = try frame.working.snapshot(DomainNames.main)
+        let original = snapshot
         let result = try body(&snapshot)
         working.snapshots[DomainNames.main] = snapshot
         frame.working = working
-        if active == nil { try publish(frame) }
+        if active == nil, snapshot.hasChanges(comparedTo: original), let writer = frame.writer {
+            // Host catalog maintenance has no SQL temporary-table commit actions.
+            try writer.commit(working, through: database.domains, synchronous: database.synchronous)
+        }
         return result
     }
     private func readBundle() throws -> DomainReadBundle {
@@ -426,6 +430,7 @@ public final class Session {
     }
     private func explainWriting(_ options: SQLExplain, statement: SQLStatement, parameters: [SQLValue],
                                 meter: CostMeter, cancellation: CancellationToken?) throws -> Rows {
+        let statement = CreateTableAs.normalize(statement)
         let active = transaction
         var admissionDomains = try active?.working ?? readPin?.domains ?? database.domains.routing(main: database)
         if active == nil { admissionDomains.snapshots[DomainNames.temporary] = temporary!.core.routingSnapshot }

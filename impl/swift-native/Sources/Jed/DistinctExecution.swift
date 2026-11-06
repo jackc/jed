@@ -30,6 +30,7 @@ internal final class DistinctExecution {
             relation: plan.relation, productionCharge: false, window: plan.window,
             sourceDomain: plan.sourceDomain, sourceSnapshot: plan.sourceSnapshot, sourceTable: plan.sourceTable,
             profileIdentity: plan.profileIdentity, profilesRoot: false)
+        input.accessCandidates = plan.accessCandidates; input.chosenAccess = plan.chosenAccess
         input.materializeSource = !plan.orderedByScan
         return input
     }

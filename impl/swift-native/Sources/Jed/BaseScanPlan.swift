@@ -104,7 +104,7 @@ internal struct BaseScanPlan {
 
     private func contiguous(_ context: ExpressionContext) throws -> ScanAccess {
         if contradiction { return .empty }
-        if try contradicts(context) { return .empty }
+        if try hasKnownContradiction(parameters: context.parameters, collatedKey: context.collatedKey) { return .empty }
         guard !keys.isEmpty else { return .full }
         var prefix: [UInt8] = [], lower: TreeBound?, upper: TreeBound?, bounded = false
         func value(_ expression: ResolvedExpression) throws -> SQLValue {
@@ -167,14 +167,19 @@ internal struct BaseScanPlan {
         return ScanAccess(lower: lower, upper: upper, isEmpty: false)
     }
 
-    private func contradicts(_ context: ExpressionContext) throws -> Bool {
+    /// Resolve only already-known endpoint values. Generic EXPLAIN parameters
+    /// and correlated operands remain unknown, without evaluating expressions.
+    func hasKnownContradiction(parameters: [SQLValue]?, collatedKey: KeyEncoding.CollatedKey?) throws -> Bool {
+        if contradiction { return true }
         for column in terms.keys.sorted() {
             var equal: [UInt8]?, lower: TreeBound?, upper: TreeBound?
             for term in terms[column]! {
                 let value: SQLValue
                 switch term.source.node {
                 case .constant(let constant): value = constant
-                case .parameter(let index): value = context.parameters[index - 1]
+                case .parameter(let index):
+                    guard let parameters, parameters.indices.contains(index - 1) else { continue }
+                    value = parameters[index - 1]
                 case .outerColumn: continue
                 default: continue
                 }
@@ -184,7 +189,7 @@ internal struct BaseScanPlan {
                 // the access candidate still handles it.
                 if case .integer(let number) = value, case .scalar(let type) = types[column].type,
                    type.integerWidth != nil, !type.admits(number) { continue }
-                guard let key = try? KeyEncoding.encode(value, type: types[column], collatedKey: context.collatedKey) else { continue }
+                guard let key = try? KeyEncoding.encode(value, type: types[column], collatedKey: collatedKey) else { continue }
                 switch term.operation {
                 case "=":
                     if let equal, equal != key { return true }; equal = key

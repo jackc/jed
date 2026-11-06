@@ -1,8 +1,8 @@
 /// Plans retain static metadata and packed storage roots. Scan execution owns a
 /// bounded tree cursor and decodes only the statement's touched columns.
 internal struct SelectPlan {
-    let columns: [ResultColumn]
-    let projections: [ResolvedExpression]
+    var columns: [ResultColumn]
+    var projections: [ResolvedExpression]
     let predicate: ResolvedExpression?
     let store: TableStore?
     let touched: [Int]
@@ -10,8 +10,8 @@ internal struct SelectPlan {
     let limit: Int64?
     let offset: Int64
     let order: [ResolvedOrderTerm]
-    let orderedByScan: Bool
-    let descending: Bool
+    var orderedByScan: Bool
+    var descending: Bool
     let scan: BaseScanPlan
     var aggregation: AggregateQueryPlan? = nil
     var compound: CompoundQueryPlan? = nil
@@ -27,6 +27,8 @@ internal struct SelectPlan {
     var sourceTable: CatalogTable? = nil
     var profileIdentity = QueryProfileIdentity()
     var profilesRoot = true
+    var accessCandidates: [ScanCandidate]? = nil
+    var chosenAccess: ScanCandidate? = nil
     var keyEvaluationOrder: [Int] { distinctOn?.evaluationOrder ?? Array(order.indices) }
 
     var expressions: [ResolvedExpression] {
@@ -200,13 +202,20 @@ internal struct SelectPlan {
             guard let value = Int64(spelling), value >= 0 else { throw JedError(code, "invalid row-count bound") }
             return value
         }
-        return SelectPlan(columns: columns, projections: projections, predicate: predicate, store: source,
+        var plan = SelectPlan(columns: columns, projections: projections, predicate: predicate, store: source,
                           touched: resolver.referencedColumns.sorted(), parameters: parameters,
                           limit: try bound(query.limit, code: "2201W"), offset: try bound(query.offset, code: "2201X") ?? 0,
                           order: order, orderedByScan: orderedByScan, descending: orderedByScan && reverse,
                           scan: BaseScanPlan(predicate: predicate, keys: primaryKey, types: source?.tree.types ?? []), aggregation: aggregation,
                           relation: relation, distinct: select.distinct && distinctOn == nil, window: window, distinctOn: distinctOn,
                           sourceDomain: sourceDomain, sourceSnapshot: sourceSnapshot, sourceTable: sourceTable)
+        if let table = sourceTable, let owner = sourceSnapshot, let domain = sourceDomain, let store = source {
+            let context = StatementServices(settings: settings, meter: CostMeter()).context()
+            plan.accessCandidates = try AccessInventory.resolve(table: table, store: store, snapshot: owner, domain: domain,
+                predicate: predicate, base: plan.scan, settings: settings, context: context,
+                orderOnly: plan.limit != nil && aggregation == nil && distinctOn == nil ? order : [])
+        }
+        return plan
     }
 
     internal static func outputName(_ expression: SQLExpression) -> SQLText {
@@ -238,9 +247,9 @@ internal final class ScanRecord {
 }
 
 internal final class SelectExecution {
-    let plan: SelectPlan
+    private(set) var plan: SelectPlan
     let context: ExpressionContext
-    private let input: SelectInput
+    private var input: SelectInput
     private var started = false
     private var skipped: Int64 = 0
     private var produced: Int64 = 0
@@ -252,8 +261,15 @@ internal final class SelectExecution {
     private var withQuery: WithQueryExecution?
     private var columnar: ColumnarProjectionExecution?
     private var initializedSubqueries = false
+    private var initializedBackend = false
     init(plan: SelectPlan, context: ExpressionContext) {
         self.plan = plan; self.context = context; input = SelectInput(plan: plan, context: context)
+    }
+    private func initialize() throws {
+        guard !initializedBackend else { return }
+        plan = try plan.selectAccess(parameters: context.parameters, context: context)
+        input = SelectInput(plan: plan, context: context)
+        initializedBackend = true
         if let withPlan = plan.withQuery { withQuery = WithQueryExecution(plan: withPlan, context: context) }
         else if plan.distinct { deduplicated = DistinctExecution(plan: plan, context: context) }
         else if let compound = plan.compound { combined = CompoundQueryExecution(plan: plan, compound: compound, context: context) }
@@ -263,6 +279,7 @@ internal final class SelectExecution {
         else if ColumnarExecution.projection(plan, context) { columnar = ColumnarProjectionExecution(plan: plan, context: context) }
     }
     func next() throws -> [SQLValue]? {
+        try initialize()
         let before = context.meter.accrued
         defer { if plan.profilesRoot { context.executionProfile?.add(plan.profileIdentity, .total, context.meter.accrued - before) } }
         if !initializedSubqueries {

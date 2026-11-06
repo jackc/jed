@@ -9,7 +9,7 @@ internal final class AlterConstraintValidation {
     private let indexes: [StoredIndexPlan]
     private let foreign: [ForeignKeyValidation.Plan]
     private let exclusions: [ExclusionValidation]
-    private var entries: [[[UInt8]]]
+    private var entries: [[StoredIndexPlan.Entry]]
     private var unique: [Set<[UInt8]>]
     private var rows: [ForeignKeyValidation.Candidate] = []
 
@@ -45,11 +45,11 @@ internal final class AlterConstraintValidation {
             if case .boolean(false) = try execution.evaluate(expression) { throw JedError("23514", "check constraint \(name) is violated by some row") }
         }
         for ordinal in indexes.indices {
-            guard let prefix = try indexes[ordinal].prefix(value) else { continue }
-            if indexes[ordinal].index.unique && !prefix.hasNull && !unique[ordinal].insert(prefix.bytes).inserted {
+            let indexed = try indexes[ordinal].row(value, storageKey: key)
+            if indexes[ordinal].index.unique, let prefix = indexed.prefix, !prefix.hasNull && !unique[ordinal].insert(prefix.bytes).inserted {
                 throw JedError("23505", "duplicate key value violates unique constraint \(indexes[ordinal].index.name)")
             }
-            entries[ordinal].append(prefix.bytes + key)
+            entries[ordinal] += indexed.entries
         }
         if !foreign.isEmpty || !exclusions.isEmpty { rows.append(.init(key: key, value: value)) }
     }
@@ -84,10 +84,8 @@ internal final class AlterConstraintValidation {
         }
         var built: [SQLText: TableStore] = [:]
         for ordinal in indexes.indices {
-            var store = snapshot.emptyStore(types: [])
-            for key in entries[ordinal].sorted(by: { $0.lexicographicallyPrecedes($1) }) {
-                try store.put(PackedRecord(key: key, cells: []), netStaging: settings.options.maxQueryMemoryBytes > 0)
-            }
+            let store = try indexes[ordinal].build(entries[ordinal], snapshot: snapshot,
+                netStaging: settings.options.maxQueryMemoryBytes > 0)
             built[indexes[ordinal].index.name] = store
         }
         return built

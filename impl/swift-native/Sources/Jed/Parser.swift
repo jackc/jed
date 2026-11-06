@@ -27,9 +27,15 @@ internal final class SQLParser {
     convenience init(_ sql: String, recordPositions: Bool = true) throws {
         try self.init(utf8: Array(sql.utf8), recordPositions: recordPositions)
     }
-    init(utf8: [UInt8], recordPositions: Bool = true) throws {
+    init(utf8: [UInt8], recordPositions: Bool = true, tokenPositions: [Int]? = nil) throws {
         sourceUTF8 = utf8
-        tokens = try SQLLexer(utf8: utf8).tokenize()
+        let scanned = try SQLLexer(utf8: utf8).tokenize()
+        if let tokenPositions {
+            guard tokenPositions.count == scanned.count else { throw JedError("XX000", "token position map has the wrong size") }
+            tokens = zip(scanned, tokenPositions).map { token, position in
+                SQLToken(kind: token.kind, byteStart: token.byteStart, byteEnd: token.byteEnd, position: position)
+            }
+        } else { tokens = scanned }
         self.recordPositions = recordPositions
         computeQueryBoundaries()
     }

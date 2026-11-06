@@ -4,7 +4,60 @@ Status: **active implementation; incomplete**. Baseline:
 `362e0798ac3a8bd04bd2da556044b6ec73bf468a` (2026-11-05).
 Branch: `codex/swift-native-experiment`, local-only, not pushed.
 
-## Current integration checkpoint (2026-11-05 22:42 CST)
+## Current integration checkpoint (2026-11-05 23:06 CST)
+
+Status remains **incomplete**. Latest completed SQL gate:
+`mise run swift-native:test --filter 'SQLCorpusBoundary|GinBoundary'`
+(`/tmp/jed-swift-native-sql-289-gin-with.log`): **289/289** selected files,
+8,528 records (5,645 statements / 2,883 queries), 12,851 result cells,
+588 cost / 893 name / 14 type assertions; **54 SQL failures**, no adapter
+blocks, 460 frozen files not admitted. All nine GIN boundary tests and both
+adapter tests passed. GIN DDL, incremental posting maintenance, rebuilds, and
+ordinary/upsert mutation history now run through shared stored-index plans.
+Recursive views and writable-WITH EXPLAIN are connected. The preceding 282-file
+SQL/storage gate completed all selected files with 77 SQL failures, no adapter
+blocks, and all ten storage-domain invariant tests passing
+(`/tmp/jed-swift-native-sql-282-bootstrap.log`). SELECT INTO EXPLAIN now acquires
+its normalized write target.
+
+The mixed process matrix now passes **496/496** (31 scenarios × 16 pairings of
+Swift/Rust/Go/Node), including ordinary/encrypted stream modes and all backup
+byte comparisons: `/tmp/jed-swift-native-process-mixed-fixed.log`. The focused
+backup rerun also passed all 16 pairings. Swift actor snapshot SHA-256:
+`392161151fbe4add55a0219335a28c616b482262189958c99fe0d40a93c53a41`.
+The byte difference was fresh-file reclamation initialization: creation now
+starts with the same zero compaction baseline as the supported cores, while
+reopening preserves its recovered live count. A new allocation-history test
+pins the distinct fresh/reopened paths. The prior 484/496 result below is
+historical, not an outstanding backup failure.
+
+The subsequent gate now compiled and ran B-tree candidate inventory,
+complete-pipeline pricing, physical index-to-table cursors, shared DML target
+selection, and collation host migration:
+`mise run swift-native:test --filter 'SQLCorpusBoundary|ValueCodec|CollationMigrationBoundary'`
+(`/tmp/jed-swift-native-sql-305-access.log`). **305/305** whole files completed,
+8,904 records (5,868 statements / 3,036 queries), 13,747 cells,
+726 cost / 893 name / 14 type assertions; **62 SQL failures**, no adapter
+blocks, 444 frozen files not admitted. All 14 tests outside the whole SQL test
+passed: four collation migration, eight value/key boundary, two adapter tests.
+The added 16 index/collation files expose remaining paths; temp-index,
+statistics_p9, basic EXPLAIN and EXPLAIN-estimates files now pass. New key framing
+checks consume the shared ordered-slot bytes and cover recursive composite depth,
+variable storage-key suffixes, malformed metadata and missing suffixes.
+
+Remaining failures include GIN/GiST and interval access inventory, secondary
+access in joins, LIMIT prefix estimates, expression-key collation identity, and
+some exact frozen bound-admission details. MERGE is being implemented separately.
+The collation host APIs use retained metadata and atomic rebuilds; no-op and
+catalog-only autocommits leave temporary ON COMMIT actions alone. The tests pin
+skewed-file migration, retained old readers, rollback/failure phases and canonical
+GIN rebuild packing. Named attachment serialization and adapter migration actions
+are the next host slice. Remaining acceptance still includes the rest of the
+frozen SQL corpus, shared host/concurrency/simulation/interchange and encrypted
+coverage, then measured release optimization. Apple platforms remain unverified.
+All commits remain local-only/unpushed; no default task depends on Swift.
+
+## Previous checkpoint (2026-11-05 22:42 CST)
 
 Status remains incomplete. Latest gate:
 `mise run swift-native:test --filter 'SQLCorpusBoundary|PostbaselineSQL|SequenceWriterBoundary|AttachmentMaintenance|PageServiceClient|SessionCursor'`

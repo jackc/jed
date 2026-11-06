@@ -26,7 +26,7 @@ internal enum CreateTableAs {
     }
     static func execute(_ definition: SQLCreateTable, prepared: Preparation, working: inout QueryDomains,
                         settings: SessionSettings, context: ExpressionContext, parameters: [SQLValue],
-                        requireWritable: (SQLText) throws -> Void) throws -> MutationResult {
+                        requireWritable: (SQLText) throws -> Void, explainWith: ExplainWithPlan? = nil) throws -> MutationResult {
         var snapshot = prepared.snapshot
         let planning = prepared.settings, name = prepared.name, query = prepared.query
         let writable = prepared.writable, plan = prepared.plan
@@ -83,8 +83,24 @@ internal enum CreateTableAs {
             let filled: MutationResult?
             if writable != nil, let part = WritableCTEPlan.extract(.query(query)), let source = part.body.queryBody {
                 let insert = SQLInsert(table: target, source: .query(source))
-                filled = try WritableCTEExecution.execute(.with(part.clause, .insert(insert)), working: &working,
-                    settings: filling, context: context, parameters: parameters, requireWritable: requireWritable)
+                if let explainWith, let writable {
+                    var preparationContext = context
+                    preparationContext.writeScope = StatementWriteScope(readSnapshot: snapshot,
+                        cteBindings: writable.visibleBindings, foreignKeys: ForeignKeyActions.State(deferUntilStatementEnd: true))
+                    var insertion = try MutationExecutor.prepareInsert(insert, snapshot: snapshot,
+                        settings: filling, context: preparationContext)
+                    var sourcePlan = plan
+                    sourcePlan.materializeSource = insertion.sourcePlan?.materializeSource ?? sourcePlan.materializeSource
+                    insertion.sourcePlan = sourcePlan
+                    let fillPlan = WritableCTEPlan(bindings: writable.bindings, body: .insert(insert), query: nil,
+                        parameters: writable.parameters, visibleBindings: writable.visibleBindings)
+                    filled = try WritableCTEExecution.execute(fillPlan, working: &working, settings: filling,
+                        context: context, parameters: parameters, requireWritable: requireWritable,
+                        prepared: explainWith.filling(fillPlan, primary: .insert(insertion)))
+                } else {
+                    filled = try WritableCTEExecution.execute(.with(part.clause, .insert(insert)), working: &working,
+                        settings: filling, context: context, parameters: parameters, requireWritable: requireWritable)
+                }
             } else {
                 let insert = SQLInsert(table: target, source: .query(query))
                 let oldPendingBase = context.meter.pendingDomainBase

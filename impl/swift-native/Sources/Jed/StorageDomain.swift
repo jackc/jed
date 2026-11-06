@@ -215,6 +215,11 @@ internal final class StorageDomain: Sendable {
         let domain = try open(store: store, kind: kind, catalogID: catalogID, cacheBytes: cacheBytes,
             credential: credential, validateCatalog: { _ in })
         domain.pager.acknowledgeFreshDurableImage()
+        // Creation has no prior reclamation baseline. The supported file
+        // allocators rebuild on the first unpinned commit, retaining even a
+        // lone bootstrap-page residue for the next allocation. An ordinary
+        // reopen instead seeds its baseline from the loaded high-water/list.
+        if kind == .file { domain.state.withLock { $0.liveAtCompaction = 0 } }
         return domain
     }
 

@@ -7,11 +7,11 @@ extension CatalogDDL {
         let occupied = CatalogDomain.relations(snapshot.catalog, settings: settings).contains(name)
         if occupied && syntax.ifNotExists { return }
         guard !DomainNames.isAttachment(settings.targetDomain) else { throw JedError("0A000", "views in attached databases are not supported") }
-        guard !syntax.recursive else { throw JedError("0A000", "recursive view catalog is not yet connected") }
+        let body = try RecursiveView.body(syntax, source: source)
         var view = CatalogView(name: name, columns: [], definition: SQLText(validatedUTF8: []), dependencies: [])
-        let prepared = try ViewDefinition.prepare(syntax.query, source: source, snapshot: snapshot, settings: settings, context: context) { columns in
+        let prepared = try ViewDefinition.prepare(body.query, source: body.source, snapshot: snapshot, settings: settings, context: context) { columns in
             try ViewOptions.apply(syntax.options, trailingCheck: syntax.checkOption, to: &view)
-            if view.checkOption != 0 { try UpdatableView.checkShape(syntax.query, name: name, operation: "check") }
+            if view.checkOption != 0 { try UpdatableView.checkShape(body.query, name: name, operation: "check") }
             guard syntax.columns.count <= columns.count else { throw JedError("42601", "CREATE VIEW specifies more column names than columns") }
             var names: Set<SQLText> = []
             for (index, column) in columns.enumerated() {

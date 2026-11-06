@@ -87,6 +87,36 @@ final class StorageDomainBoundaryTests: XCTestCase {
         }
     }
 
+    func testFreshFileReclaimsBootstrapPageBeforeSecondAllocation() throws {
+        let device = MemoryBlockStore()
+        let fresh = try StorageDomain.create(store: device, kind: .file, catalogID: 100, pageSize: 1024)
+        var first = fresh.committed
+        try table("a", snapshot: &first)
+        first = try commit(first, to: fresh)
+        XCTAssertEqual(fresh.pager.selected.meta.root.index, 3)
+        XCTAssertEqual(fresh.pager.selected.meta.pageCount, 4)
+        XCTAssertEqual(fresh.pager.selected.meta.freeList.index, 0)
+        XCTAssertEqual(try fresh.pager.allocationSnapshot(reuseAllowed: true).persistedFree, [2])
+
+        // The one-page residue intentionally has no on-disk free-list page.
+        // Reopening the same durable bytes must not manufacture that residue.
+        let reopenedDevice = MemoryBlockStore()
+        try reopenedDevice.write(at: 0, bytes: device.read(at: 0, count: Int(device.size())))
+        let reopened = try StorageDomain.open(store: reopenedDevice, catalogID: 101, validateCatalog: { _ in })
+        XCTAssertEqual(try reopened.pager.allocationSnapshot(reuseAllowed: true).persistedFree, [])
+        var reopenedSecond = reopened.committed
+        try table("b", snapshot: &reopenedSecond)
+        _ = try commit(reopenedSecond, to: reopened)
+        XCTAssertEqual(reopened.pager.selected.meta.root.index, 4)
+        XCTAssertEqual(reopened.pager.selected.meta.pageCount, 5)
+
+        var second = first
+        try table("b", snapshot: &second)
+        _ = try commit(second, to: fresh)
+        XCTAssertEqual(fresh.pager.selected.meta.root.index, 2)
+        XCTAssertEqual(fresh.pager.selected.meta.pageCount, 4)
+    }
+
     func testNoopHasNoIOAndNewStoresUseLazyPaging() throws {
         let device = DomainTestDevice(), domain = try StorageDomain.create(store: device, kind: .file, catalogID: 2, pageSize: 256, cacheBytes: 256)
         device.reset(); XCTAssertNil(try domain.prepare(domain.committed)); XCTAssertTrue(device.log.isEmpty)

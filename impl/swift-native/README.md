@@ -66,6 +66,14 @@ or main; the root's scratch policy governs the whole handle. Maintenance refuses
 active writers immediately, and replacement also requires the target's readers
 to finish. Credential rewrapping permits existing readers.
 
+`Environment.loadedCollations()` lists loaded deterministic tables. Sessions and
+`Database` expose `collations()`, `defaultCollation()`, `setDefaultCollation(_:)`
+and `upgradeCollations()`. Migration atomically rebuilds keys under loaded table
+versions, clears affected statistics, and repins the referenced collations.
+These host catalog operations use the session's transaction snapshot; a failed
+migration leaves an existing block usable. Affected expression or partial
+indexes currently return the frozen baseline's `0A000` refusal.
+
 Linux's default `.automatic` locking mode connects the native page-service
 owner/client host. `PageServiceOptions` controls serving, ownership preference,
 grace periods, connection limits, and idle timeouts. `Database.openRemote` accepts

@@ -21,10 +21,17 @@ internal final class ExplainTree {
     let parameters: [SQLValue]?
     let context: ExpressionContext
     private var bindings: [ObjectIdentifier: ExplainNode] = [:]
+    private var inlineReferences: [ObjectIdentifier: Bool] = [:]
     init(options: SQLExplain, parameters: [SQLValue]?, context: ExpressionContext) {
         self.options = options; self.parameters = parameters; self.context = context
     }
-    func query(_ plan: SelectPlan) throws -> ExplainNode {
+    func register(_ binding: CTEBinding, body: ExplainNode, inlineAtReference: Bool? = nil) {
+        let identity = ObjectIdentifier(binding)
+        bindings[identity] = body
+        if let inlineAtReference { inlineReferences[identity] = inlineAtReference }
+    }
+    func query(_ input: SelectPlan, source override: PlanEstimate? = nil) throws -> ExplainNode {
+        let plan = try override == nil ? input.selectAccess(parameters: parameters, context: context) : input
         if let withQuery = plan.withQuery {
             var definitions: [ExplainNode] = [], cost: Int64 = 0
             for binding in withQuery.bindings {
@@ -50,13 +57,19 @@ internal final class ExplainTree {
         let model = PlanCardinality(table: plan.sourceTable, snapshot: plan.sourceSnapshot,
                                    parameters: parameters, collatedKey: context.collatedKey)
         var node: ExplainNode
-        if let relation = plan.relation { node = try source(relation, touched: Set(plan.touched), offset: 0) }
+        if let override {
+            node = ExplainNode("Scan " + (plan.sourceTable?.name.description ?? "source"), rows: override.rows,
+                cost: override.cost, logicalRows: override.logicalRows)
+        } else if let candidate = plan.chosenAccess {
+            node = try scan(candidate, touched: plan.touched)
+        } else if let relation = plan.relation { node = try source(relation, touched: Set(plan.touched), offset: 0) }
         else if let store = plan.store, let table = plan.sourceTable {
             node = try scan(table: table, store: store, bound: plan.scan, touched: plan.touched,
                             snapshot: plan.sourceSnapshot, filter: nil)
         } else { node = ExplainNode("Result", rows: 1, cost: 0) }
         mark(node, plan, .source)
-        if plan.scan.contradiction { zero(node) }
+        let contradiction = try plan.scan.hasKnownContradiction(parameters: parameters, collatedKey: context.collatedKey)
+        if contradiction { zero(node) }
         if let limit = plan.limit, plan.relation == nil, plan.aggregation == nil,
            !plan.distinct, plan.distinctOn == nil, plan.order.isEmpty || plan.orderedByScan {
             let target = saturatingAdd(limit, plan.offset)
@@ -64,20 +77,26 @@ internal final class ExplainTree {
             let pulled = target == 0 ? 0 : matching > target
                 ? min(node.rows, QueryEstimate.scale(node.rows, numerator: target, denominator: matching)) : node.rows
             if pulled < node.rows {
-                let pages = max(0, node.cost - node.rows)
-                let height = Int64(plan.store?.tree.height ?? 0)
+                let prefix = try override?.prefix ?? plan.chosenAccess?.estimate(parameters: parameters, context: context).prefix
+                let pages = prefix?.scanPages ?? max(0, node.cost - node.rows)
+                let height = prefix?.minimumScanPages ?? Int64(plan.store?.tree.height ?? 0)
                 let expectedPages = pulled == 0 ? 0 : min(pages, max(height, QueryEstimate.scale(pages, numerator: pulled, denominator: max(1, node.rows))))
-                node.rows = pulled; node.cost = saturatingAdd(pulled, expectedPages)
+                let perRow = saturatingAdd(1, prefix?.pointFetchPagesPerRow ?? 0)
+                node.rows = pulled; node.cost = saturatingAdd(QueryEstimate.multiply(pulled, perRow), expectedPages)
             }
         }
         if plan.orderedByScan, !plan.order.isEmpty {
-            node.attributes.append(plan.relation == nil ? "ordered: pk ordered" + (plan.descending ? " (reverse)" : "") : "ordered: join pk ordered")
+            if let index = plan.chosenAccess?.ordered?.definition.index.name {
+                node.attributes.append("ordered: index order: " + index.description)
+            } else {
+                node.attributes.append(plan.relation == nil ? "ordered: pk ordered" + (plan.descending ? " (reverse)" : "") : "ordered: join pk ordered")
+            }
         }
         if let predicate = plan.predicate {
             let logical = try model.rows(predicate, input: node.logicalRows)
             let cost = saturatingAdd(node.cost, try expressionCost([predicate], rows: node.rows))
             var attributes = [try condition(predicate, label: "filter", compact: "conjuncts=")]
-            if plan.scan.contradiction { attributes.append("contradiction") }
+            if contradiction { attributes.append("contradiction") }
             node = ExplainNode("Filter", attributes, rows: min(node.rows, logical), cost: cost, logicalRows: logical, children: [node])
             mark(node, plan, .filter)
         }
@@ -195,7 +214,8 @@ internal final class ExplainTree {
                 else if let body = binding.plan { child = try query(body) }
                 else { throw JedError("XX000", "CTE estimate has no definition") }
                 node = ExplainNode("CTE Scan " + binding.name.description, rows: child.rows,
-                    cost: binding.buffers ? child.rows : child.cost, children: binding.buffers ? [] : [child])
+                    cost: binding.buffers ? child.rows : child.cost,
+                    children: binding.buffers || inlineReferences[ObjectIdentifier(binding)] == false ? [] : [child])
             }
         case .function(let function):
             let count = series(function) ?? PlanCardinality.constant("default_srf_rows")
@@ -213,7 +233,7 @@ internal final class ExplainTree {
             let physical = JoinPlan.choose(left: left, right: right, kind: kind, predicate: predicate)
             let a = try source(left, touched: touched, offset: offset), b = try source(right, touched: touched, offset: offset + left.columns.count)
             let outer = physical.swapped ? b : a, inner = physical.swapped ? a : b
-            let model = PlanCardinality(table: nil, snapshot: nil)
+            let model = JoinCardinality(left: left, right: right, parameters: parameters, collatedKey: context.collatedKey)
             let product = QueryEstimate.multiply(a.rows, b.rows)
             var count = try model.rows(predicate, input: product)
             if kind == "left" { count = max(count, a.rows) }
@@ -254,13 +274,28 @@ internal final class ExplainTree {
         node.actual = { profile?.value(plan, .total) ?? 0 }
         return node
     }
+    func scan(_ candidate: ScanCandidate, touched: [Int]) throws -> ExplainNode {
+        let estimate = try candidate.estimate(parameters: parameters, context: context)
+        let node: ExplainNode
+        if let bound = candidate.ordered {
+            var attributes = [bound.bounded || bound.definition.predicate != nil ? "Index bound: using " + bound.definition.index.name.description : "Full scan"]
+            if !touched.isEmpty { attributes.append("touched=\(touched.count)") }
+            node = ExplainNode("Scan " + candidate.table.name.description, attributes, rows: estimate.rows,
+                cost: estimate.cost, logicalRows: estimate.logicalRows)
+        } else {
+            node = try scan(table: candidate.table, store: candidate.store, bound: candidate.primary!, touched: touched,
+                snapshot: candidate.snapshot, filter: nil)
+            node.rows = estimate.rows; node.cost = estimate.cost; node.logicalRows = estimate.logicalRows
+        }
+        return node
+    }
     func scan(table: CatalogTable, store: TableStore, bound: BaseScanPlan, touched: [Int],
                       snapshot: DomainSnapshot?, filter: ResolvedExpression?, joining: Bool = false) throws -> ExplainNode {
         var terms: [(Int, BaseScanPlan.Term)] = [], unique = !bound.keys.isEmpty
         for key in bound.keys {
             guard let found = bound.terms[key], !found.isEmpty else { unique = false; break }
-            if let equality = found.first(where: { $0.operation == "=" }) { terms.append((key, equality)) }
-            else { terms += found.map { (key, $0) }; unique = false; break }
+            terms += found.map { (key, $0) }
+            if !found.contains(where: { $0.operation == "=" }) { unique = false; break }
         }
         var selected = table.rowCount, pages = Int64(store.tree.nodeCount), details: [String]
         if terms.isEmpty { details = ["Full scan"] }
@@ -286,7 +321,7 @@ internal final class ExplainTree {
                 pages = selected == 0 ? 0 : min(Int64(store.tree.nodeCount), max(Int64(store.tree.height), pages))
             }
         }
-        if bound.contradiction || terms.contains(where: { PlanCardinality(table: table, snapshot: snapshot, parameters: parameters).known($0.1.source)?.isNull == true }) {
+        if try bound.hasKnownContradiction(parameters: parameters, collatedKey: context.collatedKey) {
             selected = 0; pages = 0
         }
         if !touched.isEmpty { details.append("touched=\(touched.count)") }

@@ -27,9 +27,6 @@ internal enum MutationExecutor {
                   let store = snapshot.tables[name.name] else { throw JedError("42P01", "relation does not exist: \(name.name)") }
             self.table = table; self.store = store; self.view = view
             types = try snapshot.tableTypes(table)
-            guard table.indexes.allSatisfy({ $0.kind == 0 || $0.kind == 2 }) else {
-                throw JedError("0A000", "inverted-index mutation is not yet connected")
-            }
         }
         var visibleCount: Int { view?.layers.first?.columns.count ?? types.count }
         func columns(qualifier: SQLText? = nil, offset: Int = 0, qualifiedOnly: Bool = false, physical: Bool = false) -> [ExpressionColumn] {
@@ -396,7 +393,7 @@ internal enum MutationExecutor {
         let result = MutationResult(command: "INSERT", columns: returning.columns, meter: context.meter)
         var store = snapshot.tables[relation.table.name] ?? relation.store
         let compression = CostMeter()
-        var prepared: [(record: PackedRecord, values: [SQLValue], prefixes: [OrderedIndexPlan.Prefix?])] = [], batch: Set<[UInt8]> = []
+        var prepared: [(record: PackedRecord, values: [SQLValue], entries: [[StoredIndexPlan.Entry]])] = [], batch: Set<[UInt8]> = []
         var indexBatches = Array(repeating: Set<[UInt8]>(), count: indexes.count)
         for (rowIndex, slot) in slots.enumerated() {
             try context.meter.checkpoint()
@@ -413,9 +410,9 @@ internal enum MutationExecutor {
             }
             let record = try RecordDisposition.plan(key: key, values: values.map(RecordInput.value), types: relation.types,
                 codec: store.tree.codec, meter: compression, pager: store.tree.pool?.pager)
-            let prefixes = try indexes.map { try $0.prefix { values[$0] } }
+            let entries = try indexes.map { try $0.entries({ values[$0] }, storageKey: key) }
             try relation.view?.validateNew({ values[$0] }, context: context)
-            prepared.append((record, values, prefixes))
+            prepared.append((record, values, entries))
             result.affected += 1
         }
         let candidates = prepared.map { candidate in
@@ -439,8 +436,8 @@ internal enum MutationExecutor {
                     let name = indexes[ordinal].index.name
                     guard var indexStore = snapshot.indexes[name] else { throw JedError.corruption("missing index store") }
                     for candidate in prepared {
-                        if let prefix = candidate.prefixes[ordinal] {
-                            try indexStore.put(PackedRecord(key: prefix.bytes + candidate.record.key, cells: []), netStaging: settings.options.maxQueryMemoryBytes > 0)
+                        for entry in candidate.entries[ordinal] {
+                            try indexes[ordinal].insert(entry, into: &indexStore, netStaging: settings.options.maxQueryMemoryBytes > 0)
                         }
                     }
                     snapshot.setIndexStore(name, indexStore)
@@ -582,20 +579,24 @@ internal enum MutationExecutor {
         try returning.prepare(relation: relation, old: true, new: !deleting, context: context)
         if !deleting { try relation.view?.prepareChecks(context: context) }
         let result = MutationResult(command: deleting ? "DELETE" : "UPDATE", columns: returning.columns, meter: context.meter)
-        let access = try plan.scan.bind(context)
+        let candidate: ScanCandidate?
+        if target == nil { candidate = try plan.selectAccess(parameters: context.parameters, context: context) }
+        else { candidate = nil }
+        let access = try candidate?.bind(context) ?? plan.scan.bind(context)
         if access.isEmpty { return result }
-        var cursor: ForeignKeyActions.Gather
-        if let target { cursor = try target.gather(snapshot: read, settings: settings, context: context, touched: touched.sorted()) }
-        else {
-            try context.profile(plan.profileIdentity, .source) {
-                try ScanCost.charge(relation.store, touched: touched.sorted(), meter: context.meter, access: access)
+        var cursor: MutationScanCursor
+        if let target {
+            cursor = .foreign(try target.gather(snapshot: read, settings: settings, context: context, touched: touched.sorted()))
+        } else {
+            guard let candidate else { throw JedError("XX000", "mutation lost its selected scan") }
+            cursor = try context.profile(plan.profileIdentity, .source) {
+                .access(try candidate.makeCursor(context: context, touched: touched.sorted(), access: access))
             }
-            cursor = ForeignKeyActions.Gather(scan: access.cursor(relation.store))
         }
         defer { cursor.close() }
         var staged: [Change] = [], store = snapshot.tables[relation.table.name] ?? relation.store
         let compression = CostMeter()
-        while let old = try cursor.next() {
+        while let old = try context.profile(plan.profileIdentity, .source, { try cursor.next() }) {
             let row = try context.profile(plan.profileIdentity, .source) {
                 context.meter.charge(1); try context.meter.step()
                 let value = ScanRecord(old, pager: store.tree.pool?.pager)
@@ -666,26 +667,27 @@ internal enum MutationExecutor {
             guard replacementKeys.insert(record.key).inserted else { throw duplicate(relation.table.name) }
             if !vacated.contains(record.key), try relation.store.get(record.key) != nil { throw duplicate(relation.table.name) }
         }
-        var indexChanges: [[(old: [UInt8]?, new: [UInt8]?)]] = []
+        var indexChanges: [[StoredIndexPlan.Change]] = []
         for index in indexes {
             guard let existing = read.indexes[index.index.name] else { throw JedError.corruption("missing index store") }
-            var entries: [(old: [UInt8]?, new: [UInt8]?)] = [], batch: Set<[UInt8]> = []
+            var entries: [StoredIndexPlan.Change] = [], batch: Set<[UInt8]> = []
             for change in staged {
                 let old = ScanRecord(change.old, pager: store.tree.pool?.pager)
-                let before = try index.prefix(old.value).map { $0.bytes + change.old.key }
-                var after: [UInt8]?
+                let before = try index.entries(old.value, storageKey: change.old.key)
+                var after: [StoredIndexPlan.Entry] = []
                 if let record = change.new {
                     let row = ScanRecord(record, pager: store.tree.pool?.pager)
-                    if let prefix = try index.prefix(row.value) {
+                    let indexed = try index.row(row.value, storageKey: record.key)
+                    if let prefix = indexed.prefix {
                         if index.index.unique && !prefix.hasNull {
                             guard batch.insert(prefix.bytes).inserted, try !index.conflicts(prefix, store: existing, vacated: vacated) else {
                                 throw duplicateIndex(index.index.name)
                             }
                         }
-                        after = prefix.bytes + record.key
                     }
+                    after = indexed.entries
                 }
-                entries.append((before, after))
+                entries.append(StoredIndexPlan.Change(before: before, after: after))
             }
             indexChanges.append(entries)
         }
@@ -716,9 +718,11 @@ internal enum MutationExecutor {
         }
         if context.writeScope != nil {
             try mergeWrites(staged.map { WriteChange(old: $0.old, new: $0.new) }, relation: relation,
-                indexes: indexes, allocated: store, snapshot: &snapshot, settings: settings)
+                indexes: indexes, allocated: store, snapshot: &snapshot, settings: settings,
+                twoPass: !assigned.isDisjoint(with: relation.table.primaryKey))
         } else {
-            for change in staged { try store.remove(change.old.key) }
+            let twoPass = !assigned.isDisjoint(with: relation.table.primaryKey)
+            if deleting || twoPass { for change in staged { try store.remove(change.old.key) } }
             for change in staged {
                 guard let record = change.new else { continue }
                 try store.put(record, netStaging: settings.options.maxQueryMemoryBytes > 0)
@@ -727,12 +731,8 @@ internal enum MutationExecutor {
                 for ordinal in indexes.indices {
                     let name = indexes[ordinal].index.name
                     guard var indexStore = snapshot.indexes[name] else { throw JedError.corruption("missing index store") }
-                    for entry in indexChanges[ordinal] where entry.old != entry.new {
-                        if let key = entry.old { try indexStore.remove(key) }
-                    }
-                    for entry in indexChanges[ordinal] where entry.old != entry.new {
-                        if let key = entry.new { try indexStore.put(PackedRecord(key: key, cells: []), netStaging: settings.options.maxQueryMemoryBytes > 0) }
-                    }
+                    try indexes[ordinal].apply(indexChanges[ordinal], to: &indexStore, twoPass: twoPass,
+                        netStaging: settings.options.maxQueryMemoryBytes > 0)
                     snapshot.setIndexStore(name, indexStore)
                     try indexes[ordinal].rebuild(indexStore, snapshot: &snapshot)
                 }

@@ -3,6 +3,23 @@ import XCTest
 @testable import Jed
 
 final class GinBoundaryTests: XCTestCase {
+    private func maintenance(type: CatalogTypeUse = CatalogTypeUse(.array(.scalar(.i32))),
+                             collatedKey: KeyEncoding.CollatedKey? = nil) throws -> (StoredIndexPlan, DomainSnapshot) {
+        let codec = try PlainPageCodec(pageSize: 4096), root = PageSealer.nullReference(codec)
+        let pool = try NodePool(codec: codec, cacheBytes: nil) { _ in throw JedError.corruption("resident index must not read a device") }
+        let index = CatalogIndex(name: try SQLText("postings"), keys: [.column(0)], kind: 1, root: root)
+        let table = CatalogTable(name: try SQLText("items"), columns: [
+            CatalogColumn(name: try SQLText("tags"), type: type)
+        ], indexes: [index], root: root)
+        var image = CatalogImage(); image.tables = [table]
+        let snapshot = try DomainSnapshot(catalogID: 86, txid: 0, catalog: image, pool: pool,
+            tables: [:], indexes: [:], gistTrees: [:])
+        let settings = SessionSettings(environment: Environment.builder().build(), options: SessionOptions())
+        var context = ExpressionContext(meter: CostMeter()); context.collatedKey = collatedKey
+        let plan = try StoredIndexPlan.resolve(table: table, index: index, snapshot: snapshot,
+            settings: settings, context: context)
+        return (plan, snapshot)
+    }
     private func bytes(_ hex: String) throws -> [UInt8] {
         let utf8 = Array(hex.utf8)
         return try stride(from: 0, to: utf8.count, by: 2).map {
@@ -55,6 +72,66 @@ final class GinBoundaryTests: XCTestCase {
         }
     }
 
+    func testSharedPostingRunsThroughStoredMaintenanceAndNetPendingAccount() throws {
+        let (plan, snapshot) = try maintenance(), path = "spec/encoding/gin_posting_runs.toml"
+        for row in try rows(path, "pack") {
+            let term = try bytes(XCTUnwrap(row["term"] as? String)), keys = try XCTUnwrap(row["keys"] as? [String]).map(bytes)
+            let entries = keys.reversed().map { StoredIndexPlan.Entry(bytes: term + $0, storageKeyLength: $0.count) }
+            let store = try plan.build(entries, snapshot: snapshot, netStaging: true)
+            let expected = try XCTUnwrap(row["runs"] as? [String]).map(bytes)
+            XCTAssertEqual(try recordKeys(store.tree), expected)
+            XCTAssertEqual(store.pendingBytes, Int64(expected.reduce(0) { $0 + $1.count }))
+        }
+        for row in try rows(path, "history") {
+            let term = try bytes(XCTUnwrap(row["term"] as? String))
+            var store = snapshot.emptyStore(types: [])
+            for operation in try XCTUnwrap(row["ops"] as? [String]) {
+                let key = try bytes(String(operation.dropFirst()))
+                let entry = StoredIndexPlan.Entry(bytes: term + key, storageKeyLength: key.count)
+                let pin = store, before = try recordKeys(pin.tree)
+                if operation.first == "+" { try plan.insert(entry, into: &store, netStaging: true) }
+                else { try plan.remove(entry, from: &store, netStaging: true) }
+                let actual = try recordKeys(store.tree)
+                XCTAssertEqual(store.pendingBytes, Int64(actual.reduce(0) { $0 + $1.count }))
+                XCTAssertEqual(try recordKeys(pin.tree), before, "posting-run edits must preserve a pinned root")
+            }
+            XCTAssertEqual(try recordKeys(store.tree), try XCTUnwrap(row["runs"] as? [String]).map(bytes))
+        }
+    }
+
+    func testUnchangedPostingSetRetainsPhysicalRunsAndPendingVersions() throws {
+        let (plan, snapshot) = try maintenance()
+        let values = [SQLValue.array(try SQLArray(elements: [.integer(2), .integer(2), .integer(3)]))]
+        let entries = try plan.entries({ values[$0] }, storageKey: key(7))
+        XCTAssertEqual(entries.count, 2)
+        var store = try plan.build(entries, snapshot: snapshot, netStaging: true)
+        let revision = store.revision, pending = store.pendingBytes, before = try recordKeys(store.tree)
+        let unchanged = StoredIndexPlan.Change(before: entries, after: entries)
+        XCTAssertTrue(unchanged.removed.isEmpty); XCTAssertTrue(unchanged.inserted.isEmpty)
+        try plan.apply([unchanged], to: &store, twoPass: false, netStaging: true)
+        XCTAssertTrue(store.revision === revision); XCTAssertEqual(store.pendingBytes, pending)
+        XCTAssertEqual(try recordKeys(store.tree), before)
+        let rekeyed = try plan.entries({ values[$0] }, storageKey: key(9))
+        let moved = StoredIndexPlan.Change(before: entries, after: rekeyed)
+        XCTAssertEqual(moved.removed.count, 2); XCTAssertEqual(moved.inserted.count, 2)
+        try plan.apply([moved], to: &store, twoPass: true, netStaging: true)
+        for record in try recordKeys(store.tree) {
+            XCTAssertEqual(try GinIndex.decodeRun(record, opclasses: XCTUnwrap(plan.ginOpclasses)).keys, [key(9)])
+        }
+        XCTAssertEqual(store.pendingBytes, Int64(try recordKeys(store.tree).reduce(0) { $0 + $1.count }))
+    }
+
+    func testCollatedArrayTermsNeverDemandCollationSortKeys() throws {
+        var type = CatalogTypeUse(.array(.scalar(.text))); type.collation = try SQLText("unicode")
+        let (plan, _) = try maintenance(type: type, collatedKey: { _, _ in
+            XCTFail("GIN byte-identity terms must not demand a collation key")
+            throw JedError("0A000", "unexpected collation demand")
+        })
+        let value = SQLValue.array(try SQLArray(elements: [.text(SQLText("é")), .text(SQLText("e"))]))
+        let actual = try plan.entries({ _ in value }, storageKey: key(1)).map(\.term)
+        XCTAssertEqual(actual, [GinTerms.terminated(Array("e".utf8)), GinTerms.terminated(Array("é".utf8))])
+    }
+
     func testAllSharedJSONTermVectorsAndFraming() throws {
         let path = "spec/encoding/gin_jsonb_terms.toml", op = try GinOpclass(type: TypeDescriptor(.scalar(.jsonb)))
         for row in try rows(path, "index") {
@@ -102,7 +179,14 @@ final class GinBoundaryTests: XCTestCase {
                         pageIDs.append(try XCTUnwrap(child.reference).index)
                     }
                     if let root = source.root { try visit(root) }
-                    let rebuilt = try GinIndex.build(postings: postings, codec: pager.codec)
+                    let snapshot = try DomainSnapshot(catalogID: 1, txid: 0, catalog: image, pool: pool,
+                        tables: [:], indexes: [:], gistTrees: [:])
+                    let settings = SessionSettings(environment: Environment.builder().build(), options: SessionOptions())
+                    let plan = try StoredIndexPlan.resolve(table: table, index: definition, snapshot: snapshot,
+                        settings: settings, context: ExpressionContext(meter: CostMeter()))
+                    let rebuilt = try plan.build(postings.map {
+                        StoredIndexPlan.Entry(bytes: $0.key, storageKeyLength: $0.storageKey.count)
+                    }, snapshot: snapshot, netStaging: true)
                     XCTAssertEqual(try recordKeys(rebuilt.tree), try recordKeys(source), name)
                     var allocator = try PageAllocator(highWater: pager.selected.meta.pageCount, free: pageIDs.sorted(), firstBody: pager.codec.firstBodyPage)
                     var salts = pageIDs.map { page in

@@ -11,15 +11,11 @@ extension CatalogDDL {
         let table = snapshot.catalog.tables[tablePosition]
         try CatalogEnvironment.checkTableCollations(table, image: snapshot.catalog, environment: settings.environment)
         let method = definition.method?.description ?? "btree"
-        if DomainNames.isAttachment(settings.targetDomain), method != "btree" { throw JedError("0A000", "non-btree indexes on attachments are not yet supported") }
-        if settings.targetDomain == DomainNames.temporary, method == "gist" {
-            throw JedError("0A000", "GiST indexes on temporary tables are not supported")
-        }
         let kind: UInt8
         switch method {
         case "btree": kind = 0
         case "gist": kind = 2
-        case "gin": throw JedError("0A000", "inverted index DDL is not yet connected")
+        case "gin": kind = 1
         default: throw JedError("42704", "access method does not exist: \(method)")
         }
         let resolver = try resolver(snapshot: snapshot, settings: settings, context: context, table: table)
@@ -31,7 +27,7 @@ extension CatalogDDL {
         }
         for key in definition.keys {
             let expression = unwrapped(key.expression)
-            if kind == 2, key.indexExpression { throw JedError("0A000", "an expression key on a gist index is not supported yet") }
+            if kind != 0, key.indexExpression { throw JedError("0A000", "an expression key on a \(method) index is not supported yet") }
             try CatalogExpressionPolicy.validate(expression, isDefault: false)
             let resolved = try resolver.resolve(expression)
             var part: SQLText
@@ -44,10 +40,11 @@ extension CatalogDDL {
             }
             _ = try IndexDependencies.resolve([resolved], environment: settings.environment)
             guard let type = resolved.type else { throw JedError("42P18", "could not determine index expression type") }
-            if kind == 2 {
-                _ = try GistOpclass(type: type)
-                if key.directionSpecified { throw JedError("0A000", "access method gist does not support ASC/DESC options") }
-                if key.nullsFirst != nil { throw JedError("0A000", "access method gist does not support NULLS FIRST/LAST options") }
+            if kind != 0 {
+                if kind == 1 { _ = try GinOpclass(type: type) }
+                else { _ = try GistOpclass(type: type) }
+                if key.directionSpecified { throw JedError("0A000", "access method \(method) does not support ASC/DESC options") }
+                if key.nullsFirst != nil { throw JedError("0A000", "access method \(method) does not support NULLS FIRST/LAST options") }
             } else { try KeyEncoding.validateType(type.type) }
             _ = try ExpressionCollation.derive(resolved, storage: true).orderingName()
             let base = part; var suffix = 1
@@ -60,13 +57,18 @@ extension CatalogDDL {
             parts.append(part); expressions.append(resolved)
             options.append((key.descending ? 1 : 0) | ((key.nullsFirst ?? key.descending) ? 2 : 0))
         }
-        if kind == 2 {
+        if kind == 1 {
+            guard !definition.unique else { throw JedError("0A000", "access method gin does not support unique indexes") }
+            guard keys.count <= 32 else { throw JedError("54011", "cannot use more than 32 columns in an index") }
+        } else if kind == 2 {
             guard !definition.unique else { throw JedError("0A000", "access method gist does not support unique indexes") }
             guard keys.count == 1 || replacing != nil else { throw JedError("0A000", "a multi-column gist index is not supported yet") }
+            guard settings.targetDomain != DomainNames.temporary else { throw JedError("0A000", "GiST indexes on temporary tables are not supported") }
         }
+        if DomainNames.isAttachment(settings.targetDomain), kind != 0 { throw JedError("0A000", "non-btree indexes on attachments are not yet supported") }
         var predicate: CatalogExpression?
         if let syntax = definition.predicate {
-            guard kind == 0 || replacing != nil else { throw JedError("0A000", "a partial (WHERE) gist index is not supported yet") }
+            guard kind == 0 || kind == 2 && replacing != nil else { throw JedError("0A000", "a partial (WHERE) \(method) index is not supported yet") }
             try CatalogExpressionPolicy.validate(syntax, isDefault: false)
             let resolved = try resolver.resolve(syntax, expected: TypeDescriptor(.scalar(.boolean)))
             guard resolved.type == nil || resolved.type?.type == .scalar(.boolean) else { throw JedError("42804", "argument of WHERE must be boolean") }
@@ -92,23 +94,19 @@ extension CatalogDDL {
         let plan = try StoredIndexPlan.resolve(table: table, index: index, snapshot: snapshot, settings: settings, context: context)
         try ScanCost.charge(store, touched: plan.touched, meter: context.meter)
         var cursor = store.cursor(); defer { cursor.close() }
-        var entries: [[UInt8]] = [], unique: Set<[UInt8]> = []
+        var entries: [StoredIndexPlan.Entry] = [], unique: Set<[UInt8]> = []
         while let record = try cursor.next() {
             context.meter.charge(1); try context.meter.step()
             let row = ScanRecord(record, pager: store.tree.pool?.pager)
             for column in plan.touched { _ = try row.value(column) }
-            guard let prefix = try plan.prefix(row.value) else { continue }
-            if index.unique && !prefix.hasNull && !unique.insert(prefix.bytes).inserted {
+            let indexed = try plan.row(row.value, storageKey: record.key)
+            if index.unique, let prefix = indexed.prefix, !prefix.hasNull && !unique.insert(prefix.bytes).inserted {
                 throw JedError("23505", "duplicate key value violates unique constraint: \(name)")
             }
-            entries.append(prefix.bytes + record.key)
+            entries += indexed.entries
         }
         // Entry-key order fixes right-edge splits and persisted tree shape.
-        entries.sort { $0.lexicographicallyPrecedes($1) }
-        var built = snapshot.emptyStore(types: [])
-        for key in entries {
-            try built.put(PackedRecord(key: key, cells: []), netStaging: settings.options.maxQueryMemoryBytes > 0)
-        }
+        let built = try plan.build(entries, snapshot: snapshot, netStaging: settings.options.maxQueryMemoryBytes > 0)
         var image = snapshot.catalog
         if let replacing, let position = image.tables[tablePosition].indexes.firstIndex(where: { $0.name == replacing.name }) {
             image.tables[tablePosition].indexes[position] = index

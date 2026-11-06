@@ -241,15 +241,18 @@ could leave a hard-link crash window.
 
 These milestones provide evidence for parts of the rows above; the original
 rows remain unverified until their complete contracts and shared modes pass.
-They do not establish process-corpus, SQL, simulation or cross-core completion.
+The completed real-process matrix is recorded separately below; these focused
+checks do not establish SQL, simulation or full host-surface completion.
 
 | Scope | Native implementation and focused evidence | Remaining acceptance |
 |---|---|---|
 | H01–H03, file portions of H08 and R07 | `FileDatabaseHost`, `FileLockBundle`, `DatabaseCore`, `StorageDomain`, ordinary POSIX byte devices, reader pins and independent COW domains; file-host, coordinator and storage lifecycle tests pass. | Complete session/attachment matrix and cross-core mode runs. |
 | Storage maintenance and encryption lifetime | `DatabaseMaintenance`, `DomainImage`, `DomainRebuilder`, `ScratchDomain`, key rewrap/rekey and no-clobber publication; ordinary and encrypted frozen images exercise the native page sink. | All canonical maintenance and process scenarios; fault coverage remains focused rather than exhaustive. |
-| Linux automatic page service | Native codec, Unix transport, connection multiplexing, structural owner, client pager, automatic election, yielded ownership, lost-ack resolution, timeout/cancellation and close draining. Seven `PageServiceAutomaticTests` plus role/file checks passed. The full 31-scenario frozen Swift→Swift process run now passes, including attachment roles and native ordinary/encrypted streams. | Every supported-core pairing and simulation coverage. No Apple-platform claim. |
-| Owner post-ack maintenance | Writer token spans reply, cap flush and one optional structural maintenance commit. The writer read pin is released after acknowledgement; registry epoch, reader set, committed identity and base version are rechecked before writes. Three `PageServiceMaintenanceTests` passed; independent review found no concrete durability/pin race. Frozen process reclamation and exact storage-limit page counts pass. | Mixed-core verification and simulation. |
-| Internal backup | `Database.backup(_:form:)` streams page-identical and compacted forms with an ordinary pin retained through atomic destination publication. Five `BackupBoundaryTests` passed, covering all 87 ordinary frozen images (including six encrypted), retained relaxed generations, rewrapped key blocks, role revocation and cleanup before/after rename. Both canonical backup process scenarios pass. Independent review found no concrete defect. | Mixed-core verification; public API naming is intentionally still the shared deferred product decision. |
+| Linux automatic page service | Native codec, Unix transport, connection multiplexing, structural owner, client pager, automatic election, yielded ownership, lost-ack resolution, timeout/cancellation and close draining. Seven `PageServiceAutomaticTests` plus role/file checks passed. The full 31-scenario frozen Swift→Swift process run now passes, including attachment roles and native ordinary/encrypted streams. | Full mixed-core process matrix passed below; simulation remains. No Apple-platform claim. |
+| Owner post-ack maintenance | Writer token spans reply, cap flush and one optional structural maintenance commit. The writer read pin is released after acknowledgement; registry epoch, reader set, committed identity and base version are rechecked before writes. Three `PageServiceMaintenanceTests` passed; independent review found no concrete durability/pin race. Frozen process reclamation and exact storage-limit page counts pass. | Mixed-core process verification passed below; simulation remains. |
+| Internal backup | `Database.backup(_:form:)` streams page-identical and compacted forms with an ordinary pin retained through atomic destination publication. Five `BackupBoundaryTests` passed, covering all 87 ordinary frozen images (including six encrypted), retained relaxed generations, rewrapped key blocks, role revocation and cleanup before/after rename. Both canonical backup process scenarios pass. Independent review found no concrete defect. | Mixed-core process byte verification passed below; public API naming remains the shared deferred product decision. |
+
+| Collation host metadata and migration | `DatabaseCollations` exposes exact-name defaults, referenced version verdicts and loaded content hashes. `CollationMigration` streams bounded row passes, atomically rebuilds affected table/ordered/GIN/GiST keys, clears affected statistics and advances pins only on success. All four `CollationMigrationBoundaryTests` passed, including the frozen skew fixture, retained old readers, no-op/default transaction behavior, atomic unsupported-index failure and shared GIN packing vectors. Independent review checked error ordering and publication. | Full collation corpus harness actions and end-to-end SQL acceptance remain separate. |
 
 Focused checks are reproducible through
 `mise run swift-native:test --filter 'PageServiceMaintenanceTests|BackupBoundaryTests'`
@@ -290,3 +293,48 @@ was skipped or delegated to another SQL engine; ordinary and encrypted streams
 used the Swift pages actor. This closes that native process mode only. Remaining
 host acceptance includes cross-core pairings, simulation, named maintenance
 verification, and other matrix rows without their own complete evidence.
+
+The first four-core matrix (`JED_PROCESS_CORES=swift-native,rust,go,node`) ran
+496 scenario/pairings: **484 passed, 12 failed**. A separate rerun using an
+immutable actor snapshot (SHA256
+`d8575448e10190da480d379f4c001a6e1a98bf41b0c03e46f2a988e0c291b2ff`)
+reproduced **484/12**. The first log is
+`/tmp/jed-swift-native-process-mixed.log`; the snapshot run is
+`/tmp/jed-swift-native-process-mixed-snapshot.log`. All functional protocol
+steps passed. The failures are the `backup` scenario's cross-pairing byte
+comparisons of `client_pi` and `owner_pi`; compacted copies match. These are
+real acceptance failures, not exclusions. The opt-in process task now snapshots
+its executable before spawning actors, so a concurrent SwiftPM gate cannot
+change the executable partway through a matrix. `JED_PROCESS_ARTIFACTS` optionally
+preserves successful scenario images for byte diagnosis without changing
+normal driver behavior.
+
+The retained allocation probe at `/tmp/jed-swift-backup-prefix` found the first
+divergence at the second catalog commit after creation. Fresh Swift creation
+accidentally seeded the reopened-file reclamation baseline; the supported cores
+retain the zero sentinel until the first unpinned commit, which reclaims the
+bootstrap page as an unpersisted one-page residue. That residue is reused by
+the next commit. Consequently two surviving table leaves retained different
+page indices in the page-identical backup while compacted images normalized
+identically. A narrow fresh-file accounting correction and separate fresh-create
+versus reopen allocation test are under verification; the original results above
+remain recorded until the fixed matrix passes.
+
+The corrected bootstrap gate passed all **10 StorageDomainBoundaryTests**,
+including the new allocation-history test. The focused backup rerun then passed
+**16/16 pairings**, including all required byte comparisons, with actor SHA256
+`392161151fbe4add55a0219335a28c616b482262189958c99fe0d40a93c53a41`
+(`/tmp/jed-swift-native-process-backup-fixed.log`). The complete 496-pairing rerun
+is separately recorded when finished; a focused pass does not replace it.
+
+The complete corrected matrix finished with **496/496 PASS, zero failures**
+(`/tmp/jed-swift-native-process-mixed-fixed.log`): all 31 frozen scenarios across
+all 16 ordered Swift/Rust/Go/Node pairings, including every required byte
+comparison. It used the same `39216115…c53a41` immutable Swift executable as the
+focused pass and verified the unchanged frozen spec fingerprint
+`52909f248d3829bbbed754ca784fa0a4e5a3b105af0fa505028683b5cb7c6249`.
+Both stream scenarios selected the native Swift page server. No selected scenario
+was skipped; each Swift actor executed SQL through its native Swift core. This
+verifies the frozen real-process matrix, including cross-core page service and
+backup bytes. Simulation, exhaustive fault coverage and other incomplete host
+matrix rows remain independent acceptance requirements.

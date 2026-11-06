@@ -39,7 +39,14 @@ internal enum WritableCTEExecution {
 
     static func execute(_ plan: WritableCTEPlan, working: inout QueryDomains,
                         settings: SessionSettings, context: ExpressionContext,
-                        parameters: [SQLValue], requireWritable: (SQLText) throws -> Void) throws -> MutationResult {
+                        parameters: [SQLValue], requireWritable: (SQLText) throws -> Void,
+                        prepared: ExplainWithPlan? = nil) throws -> MutationResult {
+        let profileStart = context.meter.accrued
+        defer {
+            if let prepared {
+                context.executionProfile?.add(prepared.profileIdentity, .total, context.meter.accrued - profileStart)
+            }
+        }
         let readDomains = working
         var pinned = settings; pinned.domains = readDomains
         let journal = ForeignKeyActions.Journal()
@@ -64,7 +71,8 @@ internal enum WritableCTEExecution {
         }
 
         func mutate(_ statement: SQLStatement, context part: ExpressionContext,
-                    visible: [SQLText: CTEBinding], working: inout QueryDomains) throws -> MutationResult {
+                    visible: [SQLText: CTEBinding], working: inout QueryDomains,
+                    preparation: MutationExecutor.Preparation? = nil) throws -> MutationResult {
             let owner = try StatementDomain.target(statement, in: readDomains)
             try requireWritable(owner)
             var executionSettings = pinned; executionSettings.targetDomain = owner
@@ -75,9 +83,15 @@ internal enum WritableCTEExecution {
             let excluded = owner == DomainNames.temporary
             context.meter.pendingDomainBase = working.pendingBytes - (excluded ? 0 : snapshot.pendingBytes)
             context.meter.pendingDomainExcluded = excluded
-            guard let result = try MutationExecutor.execute(statement, snapshot: &snapshot,
-                settings: executionSettings, context: execution, parameters: parameters) else {
-                throw JedError("0A000", "this data-modifying WITH body is not connected")
+            let result: MutationResult
+            if let preparation {
+                result = try MutationExecutor.execute(preparation, snapshot: &snapshot, context: execution, parameters: parameters)
+            } else {
+                guard let executed = try MutationExecutor.execute(statement, snapshot: &snapshot,
+                    settings: executionSettings, context: execution, parameters: parameters) else {
+                    throw JedError("0A000", "this data-modifying WITH body is not connected")
+                }
+                result = executed
             }
             working.snapshots[owner] = snapshot
             return result
@@ -88,7 +102,7 @@ internal enum WritableCTEExecution {
             try context.meter.checkpoint()
             if let statement = binding.mutation {
                 let result = try mutate(statement, context: runtime.bindingContext(binding),
-                                        visible: visible, working: &working)
+                                        visible: visible, working: &working, preparation: prepared?.mutations[ObjectIdentifier(binding)])
                 defer { result.close() }
                 try runtime.adopt(result, for: binding)
             } else if binding.buffers {
@@ -108,7 +122,7 @@ internal enum WritableCTEExecution {
             do { while let row = try execution.next() { try result.append(row) } }
             catch { result.close(); throw error }
         } else {
-            result = try mutate(plan.body, context: body, visible: plan.visibleBindings, working: &working)
+            result = try mutate(plan.body, context: body, visible: plan.visibleBindings, working: &working, preparation: prepared?.primary)
         }
         do { try journal.settle(domains: working, settings: pinned, context: body) }
         catch { result.close(); throw error }

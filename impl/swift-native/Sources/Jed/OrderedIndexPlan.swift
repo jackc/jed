@@ -10,7 +10,8 @@ internal struct OrderedIndexPlan {
     let context: ExpressionContext
 
     static func resolve(table: CatalogTable, index: CatalogIndex, snapshot: DomainSnapshot,
-                        settings: SessionSettings, context: ExpressionContext) throws -> OrderedIndexPlan {
+                        settings: SessionSettings, context: ExpressionContext,
+                        orderedKeys: Bool = true) throws -> OrderedIndexPlan {
         guard index.kind == 0 else { throw JedError("0A000", "inverted and GiST index maintenance is not yet connected") }
         try IndexDependencies.validateZones(index, environment: settings.environment)
         let rowTypes = try snapshot.tableTypes(table)
@@ -33,8 +34,11 @@ internal struct OrderedIndexPlan {
         }
         let types = try keys.map { key -> TypeDescriptor in
             guard var type = key.type else { throw JedError("42P18", "could not determine index key type") }
-            type.collation = try ExpressionCollation.derive(key, storage: true).orderingName()
-            try KeyEncoding.validateType(type.type); return type
+            if orderedKeys {
+                type.collation = try ExpressionCollation.derive(key, storage: true).orderingName()
+                try KeyEncoding.validateType(type.type)
+            }
+            return type
         }
         let predicate = try index.predicate.map { definition in
             guard let syntax = definition.parsed else { throw JedError("XX003", "stored index predicate cannot be parsed") }

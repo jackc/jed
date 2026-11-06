@@ -91,6 +91,7 @@ extension MutationExecutor {
         let record: PackedRecord
         let values: [SQLValue]
         let prefixes: [OrderedIndexPlan.Prefix?]
+        let entries: [[StoredIndexPlan.Entry]]
         var candidate: ForeignKeyValidation.Candidate { .init(key: record.key, value: { values[$0] }) }
     }
     static func upsert(_ plan: ConflictPlan, slots: [InsertSlot], supplied: [[Int: SQLValue]],
@@ -179,8 +180,9 @@ extension MutationExecutor {
                 }
                 let record = try RecordDisposition.plan(key: storageKey, values: inputs, types: relation.types,
                     codec: store.tree.codec, meter: compression, pager: store.tree.pool?.pager)
-                let prefixes = try indexes.map { try $0.prefix { changed[$0] } }
-                updated.append(ConflictRow(old: old, record: record, values: changed, prefixes: prefixes))
+                let indexed = try indexes.map { try $0.row({ changed[$0] }, storageKey: record.key) }
+                updated.append(ConflictRow(old: old, record: record, values: changed,
+                    prefixes: indexed.map(\.prefix), entries: indexed.map(\.entries)))
                 vacated.insert(old.key)
                 if let key = try plan.arbiter.key(changed, relation: relation, indexes: indexes, context: context) { affected.insert(key) }
             } else {
@@ -192,8 +194,9 @@ extension MutationExecutor {
                 let storageKey = try relation.key(values, store: &store, collatedKey: context.collatedKey)
                 let record = try RecordDisposition.plan(key: storageKey, values: values.map(RecordInput.value), types: relation.types,
                     codec: store.tree.codec, meter: compression, pager: store.tree.pool?.pager)
-                let prefixes = try indexes.map { try $0.prefix { values[$0] } }
-                inserted.append(ConflictRow(old: nil, record: record, values: values, prefixes: prefixes))
+                let indexed = try indexes.map { try $0.row({ values[$0] }, storageKey: record.key) }
+                inserted.append(ConflictRow(old: nil, record: record, values: values,
+                    prefixes: indexed.map(\.prefix), entries: indexed.map(\.entries)))
                 if let key { affected.insert(key) }
             }
         }
@@ -211,6 +214,16 @@ extension MutationExecutor {
                 guard keys.insert(prefix.bytes).inserted, try !indexes[ordinal].conflicts(prefix, store: existing, vacated: vacated) else {
                     throw duplicateIndex(indexes[ordinal].index.name)
                 }
+            }
+        }
+        let indexChanges = try indexes.indices.map { ordinal in
+            try changes.map { change -> StoredIndexPlan.Change in
+                let before: [StoredIndexPlan.Entry]
+                if let old = change.old {
+                    let row = ScanRecord(old, pager: store.tree.pool?.pager)
+                    before = try indexes[ordinal].entries(row.value, storageKey: old.key)
+                } else { before = [] }
+                return StoredIndexPlan.Change(before: before, after: change.entries[ordinal])
             }
         }
         // Child checks see the complete end state, including inserts and
@@ -247,34 +260,19 @@ extension MutationExecutor {
             try returning.emit(old: old.map { $0.value }, new: { change.values[$0] }, relation: relation, context: context, result: result)
         }
         result.affected = Int64(changes.count)
+        let rekeyed = updated.contains { $0.old?.key != $0.record.key }
         if context.writeScope != nil {
             try mergeWrites(changes.map { WriteChange(old: $0.old, new: $0.record) }, relation: relation,
-                indexes: indexes, allocated: store, snapshot: &snapshot, settings: settings)
+                indexes: indexes, allocated: store, snapshot: &snapshot, settings: settings, twoPass: rekeyed)
         } else {
-            for change in updated { try store.remove(change.old!.key) }
+            if rekeyed { for change in updated { try store.remove(change.old!.key) } }
             for change in changes { try store.put(change.record, netStaging: settings.options.maxQueryMemoryBytes > 0) }
             if !changes.isEmpty {
                 for ordinal in indexes.indices {
                     let name = indexes[ordinal].index.name
                     guard var indexStore = snapshot.indexes[name] else { throw JedError.corruption("missing index store") }
-                    for change in updated {
-                        let old = ScanRecord(change.old!, pager: store.tree.pool?.pager)
-                        if let prefix = try indexes[ordinal].prefix(old.value) {
-                            let before = prefix.bytes + change.old!.key
-                            let after = change.prefixes[ordinal].map { $0.bytes + change.record.key }
-                            if before != after { try indexStore.remove(before) }
-                        }
-                    }
-                    for change in changes {
-                        if let prefix = change.prefixes[ordinal] {
-                            let after = prefix.bytes + change.record.key
-                            if let old = change.old {
-                                let row = ScanRecord(old, pager: store.tree.pool?.pager)
-                                if try indexes[ordinal].prefix(row.value).map({ $0.bytes + old.key }) == after { continue }
-                            }
-                            try indexStore.put(PackedRecord(key: after, cells: []), netStaging: settings.options.maxQueryMemoryBytes > 0)
-                        }
-                    }
+                    try indexes[ordinal].apply(indexChanges[ordinal], to: &indexStore, twoPass: rekeyed,
+                        netStaging: settings.options.maxQueryMemoryBytes > 0)
                     snapshot.setIndexStore(name, indexStore); try indexes[ordinal].rebuild(indexStore, snapshot: &snapshot)
                 }
                 try install(store, relation: relation, countDelta: Int64(inserted.count), snapshot: &snapshot)
