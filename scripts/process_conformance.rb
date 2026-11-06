@@ -9,7 +9,7 @@ require_relative "lib/bundle_setup" # works under mise and when invoked directly
 require "toml-rb"
 
 ROOT = File.expand_path("..", __dir__)
-CORPUS = File.join(ROOT, "spec/conformance/process")
+CORPUS = ENV.fetch("JED_PROCESS_CORPUS", File.join(ROOT, "spec/conformance/process"))
 # JED_PROCESS_CORES=rust,go narrows the pairings while a core is being brought up; CI runs all three.
 CORES = (ENV["JED_PROCESS_CORES"]&.split(",") || %w[rust go node]).freeze
 # The serving end of the stream transport (`jed pages`) is the Rust core's: every core's stream client
@@ -31,6 +31,7 @@ class Actor
               when "rust" then [File.join(ROOT, "impl/rust/target/release/process_actor")]
               when "go" then [File.join(ROOT, "impl/go/process_actor")]
               when "node" then ["node", File.join(ROOT, "impl/ts/src/bin/process_actor.ts")]
+              when "swift-native" then [ENV.fetch("JED_SWIFT_PROCESS_ACTOR")]
               when "ruby-native" then ["ruby", File.join(ROOT, "impl/ruby-native/bin/process_actor.rb")]
               else raise "unknown actor core #{core}"
               end
@@ -159,7 +160,7 @@ def run_scenario(path, first_core, second_core)
       fixture_path = File.expand_path(fixture, File.join(ROOT, "spec"))
       fixture_root = File.join(ROOT, "spec/fileformat/fixtures/")
       raise "fixture must name a file-format golden" unless fixture_path.start_with?(fixture_root)
-      File.binwrite(File.join(dir, "shared.jed"), File.binread(fixture_path))
+      File.binwrite(File.join(dir, "shared.jed"), File.binread(ENV["JED_PROCESS_FIXTURE_ROOT"] ? File.join(ENV.fetch("JED_PROCESS_FIXTURE_ROOT"), File.basename(fixture_path)) : fixture_path))
     end
     actors = {}
     closing = {}
@@ -173,7 +174,7 @@ def run_scenario(path, first_core, second_core)
             # to the cores that implement the role (the stream transport's client), falling back to the
             # first listed. Otherwise "a" runs the pairing's first core, every other actor its second.
             core = step["core"] || (actor_name == "a" ? first_core : second_core)
-            core = step["cores"].first if step["cores"] && !step["cores"].include?(core)
+            core = step["cores"].first if step["cores"] && !step["cores"].include?(core) && ENV["JED_PROCESS_STRICT_CORES"] != "1"
             actor_path = File.join(dir, "#{step.fetch('path', 'shared')}.jed")
             begin
               actors[actor_name] = Actor.new(core, step.fetch("argument"), actor_path)

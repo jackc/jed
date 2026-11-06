@@ -19,6 +19,7 @@ internal final class FileDatabaseHost: DatabaseHostLifetime {
     private let bundle: FileLockBundle?
     private let opener: pid_t
     private let skipFsync: Bool
+    var skipsFsync: Bool { skipFsync }
     private init(path: String, store: UnixBlockStore, bundle: FileLockBundle?, skipFsync: Bool, sealedScratch: Bool) {
         self.path = path; self.state = Mutex(State(store: store)); self.bundle = bundle; self.skipFsync = skipFsync; opener = getpid()
         scratch = NativeScratchFileHost(sealed: sealedScratch)
@@ -196,6 +197,7 @@ internal final class FileDatabaseHost: DatabaseHostLifetime {
             store = device
             let storage = try StorageDomain.open(store: device, kind: .file, catalogID: catalogID,
                 cacheBytes: options.cacheBytes, credential: options.credential, readOnly: options.readOnly, unlockedCodec: unlockedCodec,
+                heldSessionKey: structural && unlockedCodec != nil,
                 collatedKey: { try options.environment.unicode.key($0, collation: $1) },
                 collationVerdict: { if structural { return false }; return try CatalogEnvironment.verdict($0, environment: options.environment) },
                 validateCatalog: { if !structural { try CatalogEnvironment.validate($0, environment: options.environment) } },

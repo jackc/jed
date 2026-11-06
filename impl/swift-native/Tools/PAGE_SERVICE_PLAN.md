@@ -158,3 +158,60 @@ Structural adoption marks the SQL snapshot unvalidated, including when the txid
 already matches, so maintenance can neither consult nor bypass the owner's
 Environment. History records both the client commit and the optional next-txid
 maintenance commit, and maintenance uses the owner's current durability option.
+
+### Internal streamed backup
+
+`Database.backup(_:form:)` is internal tooling surface until the shared API is
+named. It captures ordinary read admission plus the matching resident selected
+meta; a publication racing capture retries at most 1,000 times. This retains the
+exact generation even if relaxed commits overwrite its physical meta slot.
+The pin remains alive through destination sync and no-clobber rename. Every
+emitted page and both sides of publication check its role epoch; failure removes
+the owned temporary/output file.
+
+Page-identical backup validates and copies catalog, B+tree, GiST, overflow and
+free-list pages at their original addresses, checks exact live count, zeros every
+other body index, and emits fresh bootstrap meta in both slots. Compacted backup
+uses the ordinary bounded `DomainImage` sink at pinned txid + 1. Both encrypted
+forms read the currently selected key-block pair through the pinned pager and
+write that copy twice, so a credential rewrap since client open is respected.
+Payload residency is bounded by pages and existing catalog/tree metadata; no
+whole serialized image is retained. Byte-level host tests cover all 87 ordinary
+frozen images, pin persistence across relaxed commits, key rewrap, role failure,
+and native publication cleanup. These are not canonical process-corpus results.
+
+### Held-key promotion error classification
+
+Only an automatic promoted owner opts into Pager's held-session-key mode. It
+keeps its DEK across credential rewrap, adopts the selected key-block copy, and
+leaves differing valid key copies unrepaired. A valid plaintext replacement or
+neither structurally valid meta authenticating the held key is `28P04`. If an
+older valid slot authenticates, the selected newer slot's auth failure stays
+`XX001`; recovery still does not fall back on authentication failure. Corrupt
+metadata remains `XX001`, and physical read failures during classification
+propagate `58030`. Ordinary maintenance-held codec reopen retains corruption
+classification. Four host/byte tests cover rewrap, divergent key copies,
+rekey/decryption, retained older authentication, and a classification read fault.
+
+### Frozen process actor and explicit runner
+
+`jed-process` is an opt-in SwiftPM executable using public native Database,
+Session and Rows operations. A small `ExperimentalTools` SPI exposes the
+unratified backup operation and process-test role/page-count/ack-fault hooks;
+it contains no SQL evaluator. The actor implements the canonical line protocol,
+16 MiB bounded UTF-8 input, hex SQL, real read/write session lifetimes, explicit
+cursor draining, maintenance, backup and owner-idle setup. Unimplemented stream
+and attachment operations return counted `0A000` failures.
+
+`mise run swift-native:process` builds the actor and runs the canonical process
+driver against all 31 scenarios copied verbatim from the baseline by mechanical
+codegen. `--no-build` uses an already-built actor and avoids SwiftPM contention.
+`JED_PROCESS_FILTER`, `JED_PROCESS_CORES` and `JED_PROCESS_JOBS` remain explicit
+selection controls; the task defaults to Swift→Swift. Frozen `cores` lists
+predate Swift, so this task enables strict actor selection and never silently
+substitutes a supported SQL engine. Frozen golden paths point to the same pinned
+byte resources used by unit fixtures. Default driver core lists, corpus paths
+and behavior are unchanged when the opt-in environment is absent. No process
+scenario pass is claimed merely from compiling the actor. Timed helper commands
+currently use bound query/execute operations; performance acceptance still
+requires the full prepared-statement benchmark path and recorded measurements.

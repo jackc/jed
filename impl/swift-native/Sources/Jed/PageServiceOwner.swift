@@ -17,6 +17,7 @@ internal final class PageServiceOwner: Sendable {
         var connections: [UInt64: PageServiceOwnerConnection] = [:]
         var admitted: Set<UInt64> = []
         var dropNextAcknowledgement = false
+        var beforeNextAcknowledgement: (@Sendable () -> Void)?
         var draining = false
         var drainRequester: UInt64?
     }
@@ -29,14 +30,19 @@ internal final class PageServiceOwner: Sendable {
     private let ownership: @Sendable (UInt64) -> Bool
     private let ended: @Sendable (UInt64) -> Void
     private let poisoned: @Sendable () -> Void
+    private let synchronous: @Sendable () -> Bool
+    private let storageLimit: @Sendable () -> Int64
 
     init(core: DatabaseCore, listener: UnixServiceSocket, limits: PageServiceOwnerLimits = .init(),
          yields: Bool = false, entropy: @escaping @Sendable (Int) throws -> [UInt8],
          ownership: @escaping @Sendable (UInt64) -> Bool = { _ in false },
          ended: @escaping @Sendable (UInt64) -> Void = { _ in },
-         poisoned: @escaping @Sendable () -> Void = {}) {
+         poisoned: @escaping @Sendable () -> Void = {},
+         synchronous: @escaping @Sendable () -> Bool = { true },
+         storageLimit: @escaping @Sendable () -> Int64 = { 0 }) {
         self.core = core; self.listener = listener; self.limits = limits; self.yields = yields
         self.entropy = entropy; self.ownership = ownership; self.ended = ended; self.poisoned = poisoned
+        self.synchronous = synchronous; self.storageLimit = storageLimit
     }
     func start() {
         Thread.detachNewThread { self.acceptLoop() }
@@ -82,8 +88,20 @@ internal final class PageServiceOwner: Sendable {
     }
     fileprivate func requestOwnership(_ id: UInt64) -> Bool { ownership(id) }
     fileprivate func keyEntropy(_ count: Int) throws -> [UInt8] { try entropy(count) }
+    fileprivate func afterAcknowledgement(_ lease: ServiceWriterLease) throws {
+        try lease.afterAcknowledgement(entropy: entropy, synchronous: synchronous(), storageLimit: storageLimit())
+    }
     fileprivate func dropAcknowledgement() -> Bool {
-        state.withLock { state in let drop = state.dropNextAcknowledgement; state.dropNextAcknowledgement = false; return drop }
+        let action = state.withLock { state -> (Bool, (@Sendable () -> Void)?) in
+            let result = (state.dropNextAcknowledgement, state.beforeNextAcknowledgement)
+            state.dropNextAcknowledgement = false; state.beforeNextAcknowledgement = nil
+            return result
+        }
+        action.1?()
+        return action.0
+    }
+    func beforeNextCommitAcknowledgement(_ action: @escaping @Sendable () -> Void) {
+        state.withLock { $0.beforeNextAcknowledgement = action }
     }
     func dropNextCommitAcknowledgement() { state.withLock { $0.dropNextAcknowledgement = true } }
     func notice(kind: UInt8, connection: UInt64) {
@@ -263,7 +281,7 @@ private final class PageServiceOwnerConnection: @unchecked Sendable {
             if owner.dropAcknowledgement() { socket.close() }
             var sendFailure: (any Error)?
             do { try send(frame.request, .committed(txid)) } catch { sendFailure = error }
-            try writer.afterAcknowledgement()
+            try owner.afterAcknowledgement(writer)
             if let sendFailure { throw sendFailure }
         case .abort:
             if revoked != nil { revoked = nil; return }

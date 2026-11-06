@@ -74,6 +74,14 @@ module SwiftSpecGenerator
   abort "frozen corpus inventory changed" unless CORPUS_INPUTS.length == 749 &&
     CORPUS_INPUTS.count { |path| path.include?("/concurrency/") } == 7
 
+  process_listing, process_error, process_status = Open3.capture3(
+    "git", "ls-tree", "-r", "--name-only", BASELINE,
+    "spec/conformance/process", chdir: ROOT
+  )
+  abort "cannot list frozen process corpus: #{process_error}" unless process_status.success?
+  PROCESS_INPUTS = process_listing.lines.map(&:strip).select { |path| path.end_with?(".process.toml") }.sort.freeze
+  abort "frozen process inventory changed" unless PROCESS_INPUTS.length == 31
+
   module_function
 
   def swift_string(value)
@@ -119,7 +127,7 @@ module SwiftSpecGenerator
   end
 
   def read_sources
-    (INPUTS + BYTE_INPUTS + CORPUS_INPUTS).to_h do |path|
+    (INPUTS + BYTE_INPUTS + CORPUS_INPUTS + PROCESS_INPUTS).to_h do |path|
       bytes, error, status = Open3.capture3("git", "show", "#{BASELINE}:#{path}", chdir: ROOT)
       abort "cannot read baseline #{path}: #{error}" unless status.success?
       [path, bytes.b]
@@ -255,6 +263,12 @@ module SwiftSpecGenerator
       relative = path.delete_prefix("spec/conformance/suites/")
       outputs["impl/swift-native/Tests/JedTests/Fixtures/Corpus/#{relative}"] = sources.fetch(path)
     end
+    PROCESS_INPUTS.each do |path|
+      outputs["impl/swift-native/Tools/Fixtures/Process/#{File.basename(path)}"] = sources.fetch(path)
+    end
+    process_root = "impl/swift-native/Tools/Fixtures/Process"
+    process_extras = Dir.glob("#{process_root}/*.process.toml", base: ROOT) - outputs.keys
+    abort "unexpected Swift frozen process files: #{process_extras.join(', ')}" unless process_extras.empty?
     # Keep future accidental working-tree corpus copies out of this immutable
     # snapshot. This check never removes files; it reports the unexpected paths.
     corpus_root = "impl/swift-native/Tests/JedTests/Fixtures/Corpus"

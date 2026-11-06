@@ -31,13 +31,13 @@ internal final class StorageDomain: Sendable {
 
     static func open(store: any BlockStore, kind: StorageDomainKind = .file, catalogID: UInt64,
                      cacheBytes: Int? = 256 * 1024 * 1024, credential: Credential? = nil,
-                     readOnly: Bool = false, unlockedCodec: EncryptedPageCodec? = nil, collatedKey: KeyEncoding.CollatedKey? = nil,
+                     readOnly: Bool = false, unlockedCodec: EncryptedPageCodec? = nil, heldSessionKey: Bool = false, collatedKey: KeyEncoding.CollatedKey? = nil,
                      collationVerdict: ((CatalogCollation) throws -> Bool)? = nil,
                      validateCatalog: (CatalogImage) throws -> Void,
                      durableDirectorySync: @escaping @Sendable () throws -> Void = {},
                      syncDirectory: () throws -> Void = {}) throws -> StorageDomain {
         let pager = try Pager.open(store: store, credential: credential, writable: !readOnly,
-            ephemeral: kind == .memory, unlockedCodec: unlockedCodec, syncDirectory: syncDirectory)
+            ephemeral: kind == .memory, unlockedCodec: unlockedCodec, heldSessionKey: heldSessionKey, syncDirectory: syncDirectory)
         let pool = try NodePool(pager: pager, cacheBytes: kind == .memory ? nil : cacheBytes)
         let initial = try loadSnapshot(pager: pager, pool: pool, selected: pager.selected,
             kind: kind, catalogID: catalogID, collatedKey: collatedKey,
@@ -114,6 +114,16 @@ internal final class StorageDomain: Sendable {
     var freeGeneration: UInt64 { state.withLock { $0.freeGeneration } }
     var lastWritten: Set<UInt32> { state.withLock { $0.lastWritten } }
     func serviceDirectorySync() throws { try durableDirectorySync() }
+
+    /// Evaluate the specified owner-only trigger without decoding table rows.
+    func serviceMaintenanceTrigger() throws -> (needed: Bool, reclaim: Bool) {
+        guard kind == .file, !readOnly, pager.selected.meta.txid < UInt64.max else { return (false, false) }
+        let current = state.withLock { $0 }, free = try pager.allocationSnapshot(reuseAllowed: true)
+        let reclaim = current.liveAtCompaction == 0 || DomainCommitPlanner.reclaimDue(
+            pageCount: free.highWater, free: free.persistedFree.count, live: current.liveAtCompaction)
+        let tail = free.highWater > pager.codec.firstBodyPage && free.persistedFree.last == free.highWater - 1
+        return (reclaim || tail, reclaim)
+    }
 
     /// Publish structural accounting immediately, without parsing stored SQL or
     /// consulting the local Environment. The coordinator publishes its meta and
@@ -230,7 +240,7 @@ internal final class StorageDomain: Sendable {
     func precheck(_ working: DomainSnapshot, policy: DomainCommitPolicy) throws { _ = try context(working, policy: policy) }
 
     func prepare(_ working: DomainSnapshot, policy: DomainCommitPolicy = DomainCommitPolicy(),
-                 entropy: KeyEntropy? = nil, verifyLiveCount: Bool = false) throws -> PreparedDomainCommit? {
+                 entropy: KeyEntropy? = nil, verifyLiveCount: Bool = false, forceReclaim: Bool = false) throws -> PreparedDomainCommit? {
         guard let (previous, free, layout, live) = try context(working, policy: policy) else { return nil }
         let codec = pager.codec
         let body = try DomainCommitPlanner.write(working, highWater: free.highWater, free: free.reusableFree, entropy: entropy)
@@ -247,7 +257,7 @@ internal final class StorageDomain: Sendable {
         let consumed = Set(free.reusableFree).subtracting(body.allocation.remaining)
         let remaining = free.persistedFree.filter { !consumed.contains($0) }
         let reclaim = policy.reclaimAllowed && policy.oldestPinnedVersion >= body.snapshot.txid &&
-            (previous.liveAtCompaction == 0 || DomainCommitPlanner.reclaimDue(pageCount: body.allocation.highWater, free: remaining.count, live: previous.liveAtCompaction))
+            (forceReclaim || previous.liveAtCompaction == 0 || DomainCommitPlanner.reclaimDue(pageCount: body.allocation.highWater, free: remaining.count, live: previous.liveAtCompaction))
         var reached: Set<UInt32>?
         if reclaim || verifyLiveCount {
             reached = try PageReachability.collect(body.snapshot, catalogPages: body.catalogPages, gistPages: body.gistPages,

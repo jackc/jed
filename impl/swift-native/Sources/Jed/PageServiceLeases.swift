@@ -26,7 +26,8 @@ internal final class ServiceWriterLease: Sendable {
     let reply: ServiceWriteReply
     let base: ServiceDeltaBase
     let relaxed: Bool
-    private let active = Mutex(true)
+    private struct State { var active = true; var pinned = true; var acknowledged = false }
+    private let state = Mutex(State())
     init(core: DatabaseCore, token: StorageRevision, selected: ValidatedMeta,
          reply: ServiceWriteReply, base: ServiceDeltaBase, relaxed: Bool, epoch: StorageRevision) {
         self.core = core; self.token = token; self.selected = selected
@@ -41,15 +42,25 @@ internal final class ServiceWriterLease: Sendable {
     func finish(_ delta: ServiceIncomingDelta, entropy: KeyEntropy?) throws -> UInt64 {
         try core.serviceFinishDelta(self, delta: delta, entropy: entropy)
     }
-    /// The acknowledgement is sent before this cap flush. The writer stays held
-    /// until it completes, even when the client disconnects after publication.
-    func afterAcknowledgement() throws { try core.storage.pager.flushServiceCap() }
-    func close() {
-        let release = active.withLock { value in let old = value; value = false; return old }
-        if release {
-            core.serviceReleasePin(selected.meta.txid, epoch: epoch)
-            core.serviceReleaseWriter(token)
+    /// Release only the writer's read pin after acknowledgement; retain its
+    /// exclusive token through cap flushing and at most one maintenance commit.
+    func afterAcknowledgement(entropy: KeyEntropy? = nil, synchronous: Bool = true, storageLimit: Int64 = 0) throws {
+        let first = state.withLock { state in
+            guard state.active, !state.acknowledged else { return false }
+            state.acknowledged = true; return true
         }
+        guard first else { throw JedError("55000", "service writer acknowledgement is already complete") }
+        releasePin()
+        try core.serviceAfterAcknowledgement(self, entropy: entropy, synchronous: synchronous, storageLimit: storageLimit)
+    }
+    private func releasePin() {
+        let release = state.withLock { state in let old = state.pinned; state.pinned = false; return old }
+        if release { core.serviceReleasePin(selected.meta.txid, epoch: epoch) }
+    }
+    func close() {
+        releasePin()
+        let release = state.withLock { state in let old = state.active; state.active = false; return old }
+        if release { core.serviceReleaseWriter(token) }
     }
     deinit { close() }
 }

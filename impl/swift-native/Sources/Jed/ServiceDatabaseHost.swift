@@ -14,6 +14,7 @@ internal final class ServiceDatabaseHost: CoordinatedDatabaseClose, DatabaseRole
     let path: String
     private let claim: FilePathClaim
     private let options: OpenOptions
+    var skipsFsync: Bool { options.skipFsync }
     private let catalogID: UInt64
     private let random: any RandomSource
     private let condition = NSCondition()
@@ -84,6 +85,14 @@ internal final class ServiceDatabaseHost: CoordinatedDatabaseClose, DatabaseRole
         condition.lock(); defer { condition.unlock() }
         if case .owner(_, let server, _) = role { return server }; return nil
     }
+    var toolingRole: String {
+        condition.lock(); defer { condition.unlock() }
+        switch role {
+        case .owner: return "owner"
+        case .client: return "client"
+        case nil: return "none"
+        }
+    }
     var localHost: FileDatabaseHost? {
         condition.lock(); defer { condition.unlock() }
         if case .owner(let host, _, _) = role { return host }; return nil
@@ -97,6 +106,10 @@ internal final class ServiceDatabaseHost: CoordinatedDatabaseClose, DatabaseRole
     private func entropy(_ count: Int) throws -> [UInt8] {
         condition.lock(); let source = database?.currentKeySource ?? random; condition.unlock()
         return try source.bytes(count: count)
+    }
+    private func maintenanceSettings() -> (Bool, Int64) {
+        condition.lock(); defer { condition.unlock() }
+        return (database?.synchronous ?? true, database?.maxStorageBytes ?? options.maxStorageBytes)
     }
     private func closeFailedOpen() {
         condition.lock(); let old = role; role = nil; closed = true; condition.broadcast(); condition.unlock()
@@ -136,7 +149,9 @@ internal final class ServiceDatabaseHost: CoordinatedDatabaseClose, DatabaseRole
                         guard let self else { throw JedError("08006", "database owner ended") }; return try self.entropy(count)
                     }, ownership: { [weak self] in self?.requestOwnership($0) ?? false },
                     ended: { [weak self] in self?.connectionEnded($0) },
-                    poisoned: { [weak self] in self?.ownerFailed() })
+                    poisoned: { [weak self] in self?.ownerFailed() },
+                    synchronous: { [weak self] in self?.maintenanceSettings().0 ?? true },
+                    storageLimit: { [weak self] in self?.maintenanceSettings().1 ?? 0 })
             }
             condition.lock(); let old = role; role = .owner(file, server, endpoint); condition.unlock()
             dispose(old); server?.start()

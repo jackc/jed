@@ -233,3 +233,27 @@ library, allocation, SQL, codec, locking policy, or storage algorithm in this C
 target. The file host retains the exclusive protocol-v2 bundle while publishing.
 Unsupported hosts fail `0A000`; there is no link/unlink publication fallback that
 could leave a hard-link crash window.
+
+## 8. Linux host implementation milestones (2026-11-05)
+
+These milestones provide evidence for parts of the rows above; the original
+rows remain unverified until their complete contracts and shared modes pass.
+They do not establish process-corpus, SQL, simulation or cross-core completion.
+
+| Scope | Native implementation and focused evidence | Remaining acceptance |
+|---|---|---|
+| H01–H03, file portions of H08 and R07 | `FileDatabaseHost`, `FileLockBundle`, `DatabaseCore`, `StorageDomain`, ordinary POSIX byte devices, reader pins and independent COW domains; file-host, coordinator and storage lifecycle tests pass. | Complete session/attachment matrix and cross-core mode runs. |
+| Storage maintenance and encryption lifetime | `DatabaseMaintenance`, `DomainImage`, `DomainRebuilder`, `ScratchDomain`, key rewrap/rekey and no-clobber publication; ordinary and encrypted frozen images exercise the native page sink. | All canonical maintenance and process scenarios; fault coverage remains focused rather than exhaustive. |
+| Linux automatic page service | Native codec, Unix transport, connection multiplexing, structural owner, client pager, automatic election, yielded ownership, lost-ack resolution, timeout/cancellation and close draining. Seven `PageServiceAutomaticTests` plus role/file checks passed; the subsequent full run had 286 passing non-SQL tests and one failing SQL corpus test. | Canonical 31-scenario process corpus, every supported-core pairing, stream transport and attachment roles. No Apple-platform claim. |
+| Owner post-ack maintenance | Writer token spans reply, cap flush and one optional structural maintenance commit. The writer read pin is released after acknowledgement; registry epoch, reader set, committed identity and base version are rechecked before writes. Three `PageServiceMaintenanceTests` passed; independent review found no concrete durability/pin race. | Shared process reclamation scenarios and mixed-core verification. |
+| Internal backup | `Database.backup(_:form:)` streams page-identical and compacted forms with an ordinary pin retained through atomic destination publication. Five `BackupBoundaryTests` passed, covering all 87 ordinary frozen images (including six encrypted), retained relaxed generations, rewrapped key blocks, role revocation and cleanup before/after rename. Independent review found no concrete defect. | Canonical backup scenarios and remote transport; public API naming is intentionally still the shared deferred product decision. |
+
+Focused checks are reproducible through
+`mise run swift-native:test --filter 'PageServiceMaintenanceTests|BackupBoundaryTests'`
+and `mise run swift-native:test --filter 'PageServiceAutomaticTests|PageServiceRoleTests|FileHostBoundaryTests'`.
+Native socket/process checks require an execution environment that permits Unix
+sockets. The recorded focused automatic run passed 16 tests; the backup run
+passed five, with all 87 ordinary images asserted inside its fixture test.
+`Tools/PAGE_SERVICE_PLAN.md` records the ownership, lock-order, epoch, structural
+adoption, pin-watermark and publication invariants. All checkpoints reported in
+this development session are local-only until explicitly described as pushed.

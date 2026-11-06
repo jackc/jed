@@ -1,0 +1,142 @@
+schema_version = 1
+name = "backup-while-the-owner-writes"
+description = "A page client backs up the database while the owner commits (spec/design/page-service.md §9): each backup is one committed snapshot, whichever the pin caught, and decodes independently. After the owner dies, the next backup promotes the client and reads its own file (spec/pageservice/README.md §6.5, §6.6)."
+requires = ["file.page_service"]
+
+[[step]]
+actor = "a"
+command = "start"
+argument = "create"
+
+[[step]]
+actor = "a"
+command = "exec"
+sql = "CREATE TABLE t (id i64 PRIMARY KEY, pad text)"
+
+[[step]]
+actor = "a"
+command = "exec"
+sql = "INSERT INTO t SELECT g, repeat(md5(g::text), 10) FROM generate_series(1, 3000) g"
+
+[[step]]
+actor = "b"
+command = "start"
+argument = "open"
+
+# Every commit adds ten rows, so a consistent snapshot holds a multiple of ten.
+[[step]]
+actor = "b"
+command = "backup"
+form = "page_identical"
+path = "during_pi"
+async = true
+
+[[step]]
+actor = "a"
+command = "exec"
+sql = "INSERT INTO t SELECT (SELECT max(id) FROM t) + g, 'w' FROM generate_series(1, 10) g"
+repeat = 20
+
+[[step]]
+actor = "b"
+command = "await"
+
+[[step]]
+actor = "b"
+command = "backup"
+form = "compacted"
+path = "during_c"
+async = true
+
+[[step]]
+actor = "a"
+command = "exec"
+sql = "INSERT INTO t SELECT (SELECT max(id) FROM t) + g, 'w' FROM generate_series(1, 10) g"
+repeat = 20
+
+[[step]]
+actor = "b"
+command = "await"
+
+[[step]]
+actor = "-"
+command = "check_image"
+path = "during_pi"
+
+[[step]]
+actor = "-"
+command = "check_image"
+path = "during_c"
+
+[[step]]
+actor = "c"
+command = "start"
+argument = "open"
+path = "during_pi"
+
+[[step]]
+actor = "c"
+command = "query_i64"
+sql = "SELECT CASE WHEN count(*) % 10 = 0 AND count(*) BETWEEN 3000 AND 3200 THEN 1 ELSE 0 END FROM t"
+expect = "1"
+
+[[step]]
+actor = "c"
+command = "close"
+
+[[step]]
+actor = "c"
+command = "start"
+argument = "open"
+path = "during_c"
+
+[[step]]
+actor = "c"
+command = "query_i64"
+sql = "SELECT CASE WHEN count(*) % 10 = 0 AND count(*) BETWEEN 3000 AND 3400 THEN 1 ELSE 0 END FROM t"
+expect = "1"
+
+[[step]]
+actor = "c"
+command = "close"
+
+# The owner dies: the client's next backup re-elects it as owner and reads the file directly.
+[[step]]
+actor = "a"
+command = "kill"
+
+[[step]]
+actor = "b"
+command = "backup"
+form = "page_identical"
+path = "after_kill"
+
+[[step]]
+actor = "b"
+command = "role"
+expect = "owner"
+
+[[step]]
+actor = "-"
+command = "check_image"
+path = "after_kill"
+
+[[step]]
+actor = "c"
+command = "start"
+argument = "open"
+path = "after_kill"
+
+[[step]]
+actor = "c"
+command = "query_i64"
+sql = "SELECT count(*), max(id) FROM t"
+expect = "3400:3400"
+
+[[step]]
+actor = "c"
+command = "close"
+
+[[step]]
+actor = "b"
+command = "close"

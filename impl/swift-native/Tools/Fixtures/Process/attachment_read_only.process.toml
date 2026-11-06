@@ -1,0 +1,111 @@
+schema_version = 1
+name = "attachment-read-only-owner"
+description = "A read-only attachment that owns its file serves it (page-service.md §5.5): another process's read-write attachment of the file is its page client, and that client's first write takes ownership from the read-only owner, which continues as a read-only client of it."
+requires = ["file.page_service"]
+
+[[step]]
+actor = "b"
+command = "start"
+argument = "create"
+path = "ref"
+
+[[step]]
+actor = "b"
+command = "exec"
+sql = "CREATE TABLE t (id i64 PRIMARY KEY)"
+
+[[step]]
+actor = "b"
+command = "exec"
+sql = "INSERT INTO t VALUES (1)"
+
+[[step]]
+actor = "b"
+command = "close"
+
+[[step]]
+actor = "a"
+command = "start"
+argument = "create"
+path = "main_a"
+
+[[step]]
+actor = "a"
+command = "attach"
+name = "ref"
+path = "ref"
+read_only = true
+
+[[step]]
+actor = "a"
+command = "role"
+argument = "ref"
+expect = "owner"
+
+[[step]]
+actor = "a"
+command = "exec"
+sql = "INSERT INTO ref.t VALUES (9)"
+expect_error = "25006"
+
+[[step]]
+actor = "b"
+command = "start"
+argument = "create"
+path = "main_b"
+
+[[step]]
+actor = "b"
+command = "attach"
+name = "ref"
+path = "ref"
+
+[[step]]
+actor = "b"
+command = "role"
+argument = "ref"
+expect = "client"
+
+[[step]]
+actor = "b"
+command = "exec"
+sql = "INSERT INTO ref.t VALUES (2)"
+
+[[step]]
+actor = "b"
+command = "role"
+argument = "ref"
+expect = "owner"
+
+[[step]]
+actor = "a"
+command = "role"
+argument = "ref"
+expect = "client"
+retry_ms = 5000
+
+[[step]]
+actor = "a"
+command = "query_i64"
+sql = "SELECT id FROM ref.t ORDER BY id"
+expect = "1,2"
+
+[[step]]
+actor = "b"
+command = "close"
+
+[[step]]
+actor = "a"
+command = "query_i64"
+sql = "SELECT id FROM ref.t ORDER BY id"
+expect = "1,2"
+
+[[step]]
+actor = "a"
+command = "role"
+argument = "ref"
+expect = "owner"
+
+[[step]]
+actor = "a"
+command = "close"

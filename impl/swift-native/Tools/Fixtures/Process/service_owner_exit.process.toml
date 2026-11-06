@@ -1,0 +1,122 @@
+schema_version = 1
+name = "service-owner-exit-and-promotion"
+description = "Page service phase 4: when the owner dies, its client promotes itself to owner at once and carries on; a transaction open across the change fails 08006 at its next statement, and the next opener is a client of the promoted owner."
+requires = ["file.page_service"]
+
+[[step]]
+actor = "a"
+command = "start"
+argument = "create"
+
+[[step]]
+actor = "a"
+command = "exec"
+sql = "CREATE TABLE t (id i64 PRIMARY KEY)"
+
+[[step]]
+actor = "a"
+command = "exec"
+sql = "INSERT INTO t VALUES (1), (2), (3)"
+
+[[step]]
+actor = "b"
+command = "start"
+argument = "open"
+
+[[step]]
+actor = "b"
+command = "role"
+expect = "client"
+
+[[step]]
+actor = "b"
+command = "read_open"
+
+[[step]]
+actor = "b"
+command = "read_query_i64"
+sql = "SELECT id FROM t ORDER BY id"
+expect = "1,2,3"
+
+[[step]]
+actor = "a"
+command = "kill"
+
+# The open read transaction began under the lost connection.
+[[step]]
+actor = "b"
+command = "read_query_i64"
+sql = "SELECT id FROM t ORDER BY id"
+expect_error = "08006"
+# The client notices the lost connection asynchronously.
+retry_ms = 2000
+
+[[step]]
+actor = "b"
+command = "read_close"
+
+# Autocommit statements run under the new role: b promoted itself.
+[[step]]
+actor = "b"
+command = "query_i64"
+sql = "SELECT id FROM t ORDER BY id"
+expect = "1,2,3"
+
+[[step]]
+actor = "b"
+command = "role"
+expect = "owner"
+
+[[step]]
+actor = "b"
+command = "exec"
+sql = "INSERT INTO t VALUES (4)"
+
+[[step]]
+actor = "b"
+command = "read_open"
+
+[[step]]
+actor = "b"
+command = "read_query_i64"
+sql = "SELECT id FROM t ORDER BY id"
+expect = "1,2,3,4"
+
+[[step]]
+actor = "b"
+command = "read_close"
+
+[[step]]
+actor = "a"
+command = "start"
+argument = "open"
+
+[[step]]
+actor = "a"
+command = "role"
+expect = "client"
+
+[[step]]
+actor = "a"
+command = "query_i64"
+sql = "SELECT id FROM t ORDER BY id"
+expect = "1,2,3,4"
+
+[[step]]
+actor = "a"
+command = "exec"
+sql = "INSERT INTO t VALUES (5)"
+
+[[step]]
+actor = "b"
+command = "query_i64"
+sql = "SELECT id FROM t ORDER BY id"
+expect = "1,2,3,4,5"
+
+[[step]]
+actor = "a"
+command = "close"
+
+[[step]]
+actor = "b"
+command = "close"

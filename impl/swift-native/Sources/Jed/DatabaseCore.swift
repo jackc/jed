@@ -109,6 +109,25 @@ internal final class DatabaseCore: Sendable {
         }
         throw JedError("08006", "database role changed during read admission")
     }
+    /// Capture the exact metadata belonging to a normal logical read pin.
+    /// Publication racing the two steps retries before the backup writes bytes;
+    /// the resident copy remains valid even when relaxed commits replace its slot.
+    func beginBackup() throws -> PinnedBackup {
+        for _ in 0..<1000 {
+            let pin = try beginRead()
+            let selected = registry.withLock { state -> PinnedBackup? in
+                guard state.meta.meta.txid == pin.snapshot.txid,
+                      state.storage.pool === pin.snapshot.pool else { return nil }
+                return PinnedBackup(pin: pin, selected: state.meta, kind: state.storage.kind)
+            }
+            if let selected {
+                do { try pin.checkRole(); return selected }
+                catch { pin.close(); throw error }
+            }
+            pin.close()
+        }
+        throw JedError("55006", "could not pin a stable backup generation")
+    }
     private func adoptIfNeeded(_ state: inout Registry) throws {
         if !state.sqlReady || state.snapshot.txid != state.meta.meta.txid {
             state.snapshot = try state.storage.adoptServiceSnapshot(state.meta, environment: environment, force: !state.sqlReady)
@@ -320,9 +339,50 @@ internal final class DatabaseCore: Sendable {
         } catch { writer.release(token); throw error }
     }
     func serviceStatus(txid: UInt64, digest: UInt64) throws -> UInt8 {
-        try registry.withLock { state in
+        // Include local commits' persist-to-publication window, not only the
+        // registry-held remote commit barrier.
+        commitBoundary.lock(); defer { commitBoundary.unlock() }
+        return try registry.withLock { state in
             guard let history = state.history else { throw JedError("08006", "page service is not active") }
             return history.status(txid: txid, digest: digest, current: state.meta.meta.txid)
+        }
+    }
+    func serviceAfterAcknowledgement(_ lease: ServiceWriterLease, entropy: KeyEntropy?,
+                                     synchronous: Bool, storageLimit: Int64) throws {
+        commitBoundary.lock(); defer { commitBoundary.unlock() }
+        try serviceCheckWriter(lease)
+        try storage.pager.flushServiceCap()
+        // A reader may arrive while the plan is prepared. Recheck the watermark
+        // and identity before storage writes; abandoning only maintenance never
+        // changes the already acknowledged client commit.
+        do {
+            let work = try registry.withLock { state -> (StorageDomain, DomainSnapshot, Bool)? in
+                guard state.epoch === lease.epoch, state.pins.isEmpty else { return nil }
+                let trigger = try state.storage.serviceMaintenanceTrigger()
+                guard trigger.needed else { return nil }
+                state.snapshot = try state.storage.adoptServiceSnapshot(state.meta, environment: nil, force: true)
+                state.sqlReady = false
+                var snapshot = state.snapshot; snapshot.requireStorageMaintenance()
+                return (state.storage, snapshot, trigger.reclaim)
+            }
+            guard let (domain, snapshot, reclaim) = work else { return }
+            var policy = DomainCommitPolicy(); policy.oldestPinnedVersion = snapshot.txid + 1
+            policy.storageLimit = storageLimit
+            guard let plan = try domain.prepare(snapshot, policy: policy, entropy: entropy, forceReclaim: reclaim) else { return }
+            try registry.withLock { state in
+                guard state.epoch === lease.epoch, state.pins.isEmpty,
+                      state.storage === domain, domain.committed.identity === plan.identity,
+                      state.meta.meta.txid == plan.pages.baseTxid else { return }
+                let committed = try domain.persist(plan, synchronous: synchronous)
+                state.snapshot = committed; state.meta = domain.pager.selected; state.sqlReady = false
+                let written = plan.pages.body.map(\.index) + plan.pages.manifest.pages.map(\.pageIndex)
+                state.history?.publish(txid: state.meta.meta.txid,
+                    digest: PageServiceHistory.digest(state.meta), indices: written)
+            }
+        } catch {
+            // Serialization/adoption failure is local maintenance failure. Only
+            // a failed physical commit revokes serving after the client reply.
+            if storage.pager.isPoisoned { throw error }
         }
     }
     func serviceReleasePin(_ version: UInt64, epoch: StorageRevision) { releasePin(version, epoch: epoch) }

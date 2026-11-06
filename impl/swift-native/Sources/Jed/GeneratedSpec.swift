@@ -47,7 +47,7 @@ struct RangeSpecFact: Equatable, Sendable {
 
 enum GeneratedSpec {
     static let baseline = "362e0798ac3a8bd04bd2da556044b6ec73bf468a"
-    static let fingerprint = "7a1bcf53fefb01e43484e760a68d9f61faabbc0c15c35d2b1da39c4c90db8043"
+    static let fingerprint = "52909f248d3829bbbed754ca784fa0a4e5a3b105af0fa505028683b5cb7c6249"
     static let sourceHashes: [String: String] = [
         "spec/types/scalars.toml": "8b82f81965452cf031d8fb2b91642ad5165fb7a8973421b9e333969a69874a8d",
         "spec/types/ranges.toml": "9209b33203992b39dbf2a05fc4eeb9ae7dcd56f347b80a2cc1f39c3995309aa4",
@@ -957,6 +957,37 @@ enum GeneratedSpec {
         "spec/conformance/suites/window/row_number.test": "00870e67e87c72cd5ba88b61fa17c805ca6bb15806f43d65fc393fe3f1bc7cf9",
         "spec/conformance/suites/window/topn.test": "31efa01144cee2d68b5b57fa245ef7b631015b3e352733ed6a61cfbdbca4ee9c",
         "spec/conformance/suites/window/window_collation.test": "8e719eb5e467cf91d2c41862491a856d9942c6386e498a877b48fbeb61e1ef08",
+        "spec/conformance/process/attachment_gate_order.process.toml": "aba68e4c1a2103838994f1b74d3e4f586889a705a1fe0cdca02984a2be44f611",
+        "spec/conformance/process/attachment_read_only.process.toml": "766174b43bea629275113fc92ddf3c32bab7bb82916fe573d816e11b450171cb",
+        "spec/conformance/process/attachment_service.process.toml": "f72679c53e50474cf6be65d961b22522e25c7337063407408ee9022cd53c2510",
+        "spec/conformance/process/backup.process.toml": "bc1bcc076a3747cec6d8e911d143414d72730a51f0c7166da655c1282f6077ba",
+        "spec/conformance/process/backup_concurrent.process.toml": "40011077a54b0158b8c1b5d8b8549450daa31de5ed40319ea9aaf00ac170233d",
+        "spec/conformance/process/compact.process.toml": "332374e678b304051e63e27129c79e66266baad727d7d8db9144d979eceba81e",
+        "spec/conformance/process/cow_overflow.process.toml": "afd7cb18d85e2e1a120e46f1a0eca8b363c3946dfd8657150757aca5cb0c74f1",
+        "spec/conformance/process/cow_reuse.process.toml": "e32e318e8e2f1ee641e9c341f134345fb9774c8b694d40a6eb939bf7bd34fd84",
+        "spec/conformance/process/cow_serialization_error.process.toml": "cb6870b5e196ab012f1984e446b765acbab0703971594e3c1ec58dc49d7e9b8a",
+        "spec/conformance/process/cow_stale_orphan.process.toml": "efe8b724d321098bfc993a3aa75e00bfe552cc0aae747783466d09808475a6df",
+        "spec/conformance/process/encrypted_commit_resolution.process.toml": "a6995235b099cd621ed72ecb9485874149c36fa65e12e347d765f251001d9e94",
+        "spec/conformance/process/encrypted_service.process.toml": "34d1bf21f196da63cc1cc3968134fe525e8240d359e01431ff5cd520dd351554",
+        "spec/conformance/process/encrypted_stream.process.toml": "a96c76b469eb45dadb7f91308cd7b9a6571d4219e719c0de459fdfe653aa2553",
+        "spec/conformance/process/multi_process_handoff.process.toml": "13c60809ca84231ba7c328243998b60ac6d519403e6add7680a2b45946ce2bfb",
+        "spec/conformance/process/service_client_churn.process.toml": "6fc856b94c126c7db1dd61dc1544067ea84457e9719a4c302f041c9c36a5d489",
+        "spec/conformance/process/service_commit_crash.process.toml": "b94dd2d01d26a1f8c3197dee359a2c77c9a7dbe627aca7b710504f86fd2b3bd3",
+        "spec/conformance/process/service_commit_resolution.process.toml": "30954b5059b19f86fb99baed24b9128a11a1318a60908dd8fe425e8d2841b4b5",
+        "spec/conformance/process/service_gate.process.toml": "2cf0623ad129e039cc1947355820775dc106327c9d6a7f2325787425e33f7185",
+        "spec/conformance/process/service_idle_timeout.process.toml": "4f86a7863c6f6db8890f595ef32fb79de80a5d7a2993dcf2cadc7ce985ec04cb",
+        "spec/conformance/process/service_limits.process.toml": "610fe5662d3446b623ad0a24c634c332fc25d2814971ff07585e3fa781e0b333",
+        "spec/conformance/process/service_never.process.toml": "d613ef9bccf28d4863a3f72402d910de247d73d1f74c25325dcf5dc2710a023d",
+        "spec/conformance/process/service_owner_exit.process.toml": "77c32db825859545e92faa4f4e7efb2968a9a042e491afc35d8a546d9e247a48",
+        "spec/conformance/process/service_reads.process.toml": "db9c87d76554e82da32528cb0dcd1c673c1817135ee7cb1cd8f0ab8b1e02ae43",
+        "spec/conformance/process/service_relaxed_clients.process.toml": "9c3e1922e99f0c8992820148367e3f9d52412f61b48ccc077f3624c760a6c898",
+        "spec/conformance/process/service_shutdown_drain.process.toml": "24890fa11b561b98b69890d94dfca53f0ec0b95587572819ca85dd95b915d96e",
+        "spec/conformance/process/service_stream.process.toml": "bbb3dbfd6b4d0cb3d245504f2e3522f58f9c6f8ff40ce53859892687ea120ebf",
+        "spec/conformance/process/service_writes.process.toml": "e3d768cab926468b2575b0d87cbebe72e387ad02b40b6e01d1b2a74acabf506e",
+        "spec/conformance/process/service_yield.process.toml": "a11dc5948d7c8481aa7906920d3f413e99de9070336aac80c4b3af97dc052dcc",
+        "spec/conformance/process/service_yield_read_only.process.toml": "640ecd82d0aa5bd43ae8bf4ce16288037a6f57988a328118dec64aac8ead19d2",
+        "spec/conformance/process/storage_limit.process.toml": "66ba7aa98eea8f972adb1fb2238888b593942436fff8e528b0f05e33d553cc36",
+        "spec/conformance/process/unchanged_commits.process.toml": "d7d57f7a00ce18fdac113469be054794e5478fb706b5b768f3c157c240b2c3be",
     ]
     static let defaultScalarBytes: Int64 = 67108864
     static let memoryRow: Int64 = 32

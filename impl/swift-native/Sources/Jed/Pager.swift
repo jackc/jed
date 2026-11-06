@@ -80,14 +80,17 @@ internal final class Pager: Sendable {
 
     static func open(store: any BlockStore, credential: Credential? = nil,
                      writable: Bool = false, ephemeral: Bool = false,
-                     unlockedCodec: EncryptedPageCodec? = nil,
+                     unlockedCodec: EncryptedPageCodec? = nil, heldSessionKey: Bool = false,
                      syncDirectory: () throws -> Void = {}) throws -> Pager {
         let selected = try MetaRecovery.open(store)
         guard !ephemeral || !selected.meta.encrypted else { throw JedError("55000", "in-memory databases cannot be encrypted") }
         if unlockedCodec == nil {
             try EncryptionPolicy.checkCredential(encrypted: selected.meta.encrypted, credential: credential)
-        } else if !selected.meta.encrypted || unlockedCodec!.pageSize != selected.meta.pageSize {
-            throw JedError.corruption("unlocked codec does not match replacement image")
+        } else {
+            if heldSessionKey && !selected.meta.encrypted { throw JedError("28P04", "database was decrypted since this client unlocked it") }
+            guard selected.meta.encrypted, unlockedCodec!.pageSize == selected.meta.pageSize else {
+                throw JedError.corruption("unlocked codec does not match replacement image")
+            }
         }
         let size = selected.meta.pageSize
         let codec: any PageCodec
@@ -103,7 +106,13 @@ internal final class Pager: Sendable {
                 chain.append(ManifestPageBytes(pageIndex: index,
                     bytes: try store.read(at: UInt64(index) * UInt64(size), count: size)))
             }
-            try encrypted.verifyMeta(selected.bytes, slot: selected.slot, manifest: chain)
+            do { try encrypted.verifyMeta(selected.bytes, slot: selected.slot, manifest: chain) }
+            catch {
+                if heldSessionKey, try heldKeyStale(encrypted, store: store) {
+                    throw JedError("28P04", "database data key changed since this client unlocked it")
+                }
+                throw error
+            }
             codec = encrypted; keyBlock = block
         } else { codec = try PlainPageCodec(pageSize: size, opening: true) }
         // Logical free-list corruption cannot trigger selection of an older root.
@@ -118,6 +127,33 @@ internal final class Pager: Sendable {
         pager.state.withLock { $0.ephemeral = ephemeral }
         if writable, unlockedCodec == nil, keyBlock?.needsRepair == true { try pager.repairKeyBlock(syncDirectory: syncDirectory) }
         return pager
+    }
+
+    /// Only promotion uses stale-key classification. At least one structurally
+    /// valid meta must exist, and neither valid slot may authenticate; an older
+    /// slot authenticating the held key proves the selected-slot failure is
+    /// ordinary damage. Physical I/O and unparseable metadata stay XX001/58030.
+    private static func heldKeyStale(_ codec: EncryptedPageCodec, store: any BlockStore) throws -> Bool {
+        var parsed = false
+        for slot: UInt32 in 0...1 {
+            do {
+                let size = codec.pageSize
+                let bytes = try store.read(at: UInt64(slot) * UInt64(size), count: size)
+                let meta = try MetaPage.decode(bytes)
+                guard meta.encrypted, meta.pageSize == size else { continue }
+                let validated = try MetaRecovery.validateManifest(meta, bytes: bytes, verifyBodies: false) { index in
+                    try store.read(at: UInt64(index) * UInt64(size), count: size)
+                }
+                var chain: [ManifestPageBytes] = []
+                for index in validated.chain {
+                    chain.append(ManifestPageBytes(pageIndex: index,
+                        bytes: try store.read(at: UInt64(index) * UInt64(size), count: size)))
+                }
+                parsed = true
+                if (try? codec.verifyMeta(bytes, slot: slot, manifest: chain)) != nil { return false }
+            } catch let error as JedError where error.code == "XX001" { continue }
+        }
+        return parsed
     }
 
     /// The owner already validated recovery. Client metadata is trusted for

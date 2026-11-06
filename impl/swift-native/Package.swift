@@ -7,6 +7,7 @@ let package = Package(
         .library(name: "Jed", targets: ["Jed"]),
         .library(name: "JedCrypto", targets: ["JedCrypto"]),
         .executable(name: "jed-unicode", targets: ["JedUnicode"]),
+        .executable(name: "jed-process", targets: ["JedProcess"]),
     ],
     dependencies: [
         .package(url: "https://github.com/apple/swift-crypto.git", exact: "5.1.1"),
@@ -19,6 +20,7 @@ let package = Package(
         .target(name: "Jed", dependencies: ["JedCrypto", "CJedHost"]),
         .target(name: "JedUnicodeCompiler", dependencies: ["Jed"]),
         .executableTarget(name: "JedUnicode", dependencies: ["JedUnicodeCompiler"]),
+        .executableTarget(name: "JedProcess", dependencies: ["Jed"]),
         .target(
             name: "JedCrypto",
             dependencies: [

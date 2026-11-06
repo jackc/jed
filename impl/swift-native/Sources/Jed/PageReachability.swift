@@ -42,7 +42,7 @@ internal enum PageReachability {
     }
 
     static func collect(_ snapshot: DomainSnapshot, catalogPages: [UInt32], gistPages: [UInt32],
-                        pageCount: UInt32, read: (PageReference) throws -> [UInt8]) throws -> Set<UInt32> {
+                        pageCount: UInt32, readAllPages: Bool = false, read: (PageReference) throws -> [UInt8]) throws -> Set<UInt32> {
         let codec = snapshot.pool.codec, encrypted = codec.reservedBytes != 0
         let start = encrypted ? 32 : 16, slab = codec.capacity - (encrypted ? 16 : 0)
         var reached: Set<UInt32> = []
@@ -79,12 +79,13 @@ internal enum PageReachability {
         func tree(_ child: TreeChild, types: [TypeDescriptor]) throws {
             guard let reference = child.reference else { throw JedError.corruption("unpersisted node in live-page walk") }
             try add(reference.index)
+            let checked = readAllPages ? try read(reference) : nil
             if case .resident(let node) = child, !node.isLeaf {
                 for child in node.children { try tree(child, types: types) }
                 return
             }
             guard types.contains(where: { ValueCodec.fixedWidth($0.type) == nil }) else { return }
-            let leaf = try PackedLeaf(bytes: read(reference), types: types, codec: codec)
+            let leaf = try PackedLeaf(bytes: checked ?? read(reference), types: types, codec: codec)
             for row in 0..<leaf.count {
                 for column in types.indices {
                     if let facts = try leaf.cell(row: row, column: column).largeFacts(encrypted: encrypted), let head = facts.external {

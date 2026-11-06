@@ -1,0 +1,174 @@
+schema_version = 1
+name = "validated-cow-serialization-error"
+description = "Serialization errors leave exclusive writers, page-service owners and clients, and file attachments usable; failed explicit commits discard already encoded dirty rows."
+requires = ["file.page_service"]
+fixture = "fileformat/fixtures/cow_inline.jed"
+byte_identical = true
+# The serialization error: a CHECK whose text exceeds its u16 length field (format.md *Catalog*;
+# `{{repeat x 70000}}` is expanded by the driver). A long catalog entry itself spans pages since v48.
+
+[[step]]
+actor = "a"
+command = "start"
+argument = "open-exclusive"
+
+[[step]]
+actor = "a"
+command = "exec"
+sql = "CREATE TABLE wide (c text CHECK (c <> '{{repeat x 70000}}'))"
+expect_error = "0A000"
+
+[[step]]
+actor = "a"
+command = "exec"
+sql = "UPDATE t SET v = 21 WHERE id = 1"
+
+[[step]]
+actor = "a"
+command = "write_open"
+
+[[step]]
+actor = "a"
+command = "write_exec"
+sql = "INSERT INTO t VALUES (2, 999)"
+
+[[step]]
+actor = "a"
+command = "write_exec"
+sql = "CREATE TABLE wide (c text CHECK (c <> '{{repeat x 70000}}'))"
+
+[[step]]
+actor = "a"
+command = "write_commit"
+expect_error = "0A000"
+
+[[step]]
+actor = "a"
+command = "write_rollback"
+
+[[step]]
+actor = "a"
+command = "query_i64"
+sql = "SELECT id, v FROM t ORDER BY id"
+expect = "1:21"
+
+[[step]]
+actor = "a"
+command = "exec"
+sql = "UPDATE t SET v = 22 WHERE id = 1"
+
+[[step]]
+actor = "a"
+command = "close"
+
+[[step]]
+actor = "a"
+command = "start"
+argument = "open"
+
+[[step]]
+actor = "b"
+command = "start"
+argument = "open"
+
+[[step]]
+actor = "a"
+command = "exec"
+sql = "CREATE TABLE wide (c text CHECK (c <> '{{repeat x 70000}}'))"
+expect_error = "0A000"
+
+[[step]]
+actor = "a"
+command = "exec"
+sql = "UPDATE t SET v = 23 WHERE id = 1"
+
+[[step]]
+actor = "b"
+command = "query_i64"
+sql = "SELECT id, v FROM t ORDER BY id"
+expect = "1:23"
+
+[[step]]
+actor = "b"
+command = "write_open"
+
+[[step]]
+actor = "b"
+command = "write_exec"
+sql = "INSERT INTO t VALUES (2, 999)"
+
+[[step]]
+actor = "b"
+command = "write_exec"
+sql = "CREATE TABLE wide (c text CHECK (c <> '{{repeat x 70000}}'))"
+
+[[step]]
+actor = "b"
+command = "write_commit"
+expect_error = "0A000"
+
+[[step]]
+actor = "b"
+command = "write_rollback"
+
+[[step]]
+actor = "b"
+command = "exec"
+sql = "UPDATE t SET v = 24 WHERE id = 1"
+
+[[step]]
+actor = "a"
+command = "query_i64"
+sql = "SELECT id, v FROM t ORDER BY id"
+expect = "1:24"
+
+[[step]]
+actor = "a"
+command = "close"
+
+# A file attachment owns its file: no other process may hold it.
+[[step]]
+actor = "b"
+command = "close"
+
+[[step]]
+actor = "a"
+command = "start"
+argument = "create"
+path = "host"
+
+[[step]]
+actor = "a"
+command = "attach"
+name = "aux"
+path = "shared"
+
+[[step]]
+actor = "a"
+command = "exec"
+sql = "CREATE TABLE aux.wide (c text CHECK (c <> '{{repeat x 70000}}'))"
+expect_error = "0A000"
+
+[[step]]
+actor = "a"
+command = "exec"
+sql = "UPDATE aux.t SET v = 25 WHERE id = 1"
+
+[[step]]
+actor = "a"
+command = "close"
+
+[[step]]
+actor = "a"
+command = "start"
+argument = "open-exclusive"
+
+[[step]]
+actor = "a"
+command = "query_i64"
+sql = "SELECT id, v FROM t ORDER BY id"
+expect = "1:25"
+
+[[step]]
+actor = "a"
+command = "close"
