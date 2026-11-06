@@ -168,23 +168,27 @@ fn retain_lowest_sample(heap: &mut BinaryHeap<SampleRow>, row: SampleRow) {
     }
 }
 
-fn retain_kmv(heap: &mut BinaryHeap<u64>, seen: &mut HashSet<u64>, hash: u64) {
+// Return true only after observing a distinct hash beyond the exact-count capacity.
+fn retain_kmv(heap: &mut BinaryHeap<u64>, seen: &mut HashSet<u64>, hash: u64) -> bool {
     if seen.contains(&hash) {
-        return;
+        return false;
     }
     if heap.len() < STATISTICS_KMV_HASHES {
         heap.push(hash);
         seen.insert(hash);
-    } else if heap.peek().is_some_and(|largest| hash < *largest) {
+        return false;
+    }
+    if heap.peek().is_some_and(|largest| hash < *largest) {
         let removed = heap.pop().expect("nonempty KMV heap");
         seen.remove(&removed);
         heap.push(hash);
         seen.insert(hash);
     }
+    true
 }
 
-fn kmv_count(heap: &BinaryHeap<u64>, nonnull_rows: i64) -> i64 {
-    if heap.len() < STATISTICS_KMV_HASHES {
+fn kmv_count(heap: &BinaryHeap<u64>, nonnull_rows: i64, overflow: bool) -> i64 {
+    if !overflow {
         return heap.len() as i64;
     }
     let r = u128::from(*heap.peek().expect("full KMV heap"));
@@ -1426,6 +1430,7 @@ impl Engine {
             let mut sample = BinaryHeap::new();
             let mut kmv = BinaryHeap::new();
             let mut kmv_seen = HashSet::new();
+            let mut kmv_overflow = false;
             let mut analyzed_rows = 0i64;
             let mut null_count = 0i64;
             let mut width_sum = 0i64;
@@ -1476,7 +1481,7 @@ impl Engine {
                     COSTS.statistics_value * i64::try_from(width.max(1)).unwrap_or(i64::MAX),
                 );
                 if let Some(key) = &key {
-                    retain_kmv(&mut kmv, &mut kmv_seen, fnv1a64(key));
+                    kmv_overflow |= retain_kmv(&mut kmv, &mut kmv_seen, fnv1a64(key));
                 }
                 if let Some(opclass) = term_opclass {
                     for term in gin_value_terms(opclass, value) {
@@ -1511,7 +1516,7 @@ impl Engine {
             }
             meter.checkpoint()?;
             let nonnull_rows = analyzed_rows.saturating_sub(null_count);
-            let distinct_count = eligible.then(|| kmv_count(&kmv, nonnull_rows));
+            let distinct_count = eligible.then(|| kmv_count(&kmv, nonnull_rows, kmv_overflow));
             let sample_rows = sample.len() as u32;
             let (sample_nonnull_rows, mcv, histogram) = if let Some(ndv) = distinct_count {
                 finish_distribution(sample.into_vec(), analyzed_rows, ndv)

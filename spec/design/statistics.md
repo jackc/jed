@@ -162,6 +162,9 @@ distinct hashes in ascending order. Equal hashes are one KMV item; a hash collis
 estimate quality, never SQL results, and is deterministic.
 
 - If no more than 4,096 distinct hashes were seen, `distinct_count` is that exact hash count.
+- Filling the retained heap does not by itself leave exact counting: duplicates may make the
+  non-NULL population larger than 4,096 while only 4,096 hashes have been seen. Remember whether
+  any additional distinct hash was observed, including one too large to enter the retained heap.
 - Otherwise let `R` be the largest retained hash and `K = 4096`:
 
 ```text

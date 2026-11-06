@@ -1,0 +1,65 @@
+# The exact KMV boundary is the number of distinct hashes ever seen, not the retained heap size
+# (statistics.md §4.2). Duplicate rows can take the population above K while the hash count stays
+# exactly K. These are jed-owned deterministic statistics, not PostgreSQL's sampling estimates.
+# requires: maintenance.analyze, introspect.statistics, ddl.create_table, dml.insert, dml.insert_select, query.select, query.set_returning, cast.operator, types.i32, types.i64
+
+statement ok
+CREATE TABLE kmv_boundary (v i32)
+
+statement ok
+INSERT INTO kmv_boundary SELECT g::i32 FROM generate_series(1, 4095) AS g
+
+statement ok
+INSERT INTO kmv_boundary VALUES (1)
+
+statement ok
+ANALYZE kmv_boundary
+
+query III nosort
+SELECT analyzed_rows, null_count, distinct_count FROM jed_statistics
+----
+4096
+0
+4095
+
+statement ok
+INSERT INTO kmv_boundary VALUES (4096)
+
+statement ok
+ANALYZE kmv_boundary
+
+# A full 4096-item heap still represents an exact population of 4096 distinct hashes.
+query III nosort
+SELECT analyzed_rows, null_count, distinct_count FROM jed_statistics
+----
+4097
+0
+4096
+
+statement ok
+INSERT INTO kmv_boundary VALUES (NULL)
+
+statement ok
+ANALYZE kmv_boundary
+
+query III nosort
+SELECT analyzed_rows, null_count, distinct_count FROM jed_statistics
+----
+4098
+1
+4096
+
+# The 4097th distinct hash switches to estimation. For these i32 keys the estimate exceeds the
+# non-NULL population, so the canonical upper clamp gives 4098, not the exact distinct count.
+statement ok
+INSERT INTO kmv_boundary VALUES (4097)
+
+statement ok
+ANALYZE kmv_boundary
+
+query III nosort
+SELECT analyzed_rows, null_count, distinct_count FROM jed_statistics
+----
+4099
+1
+4098

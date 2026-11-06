@@ -136,22 +136,26 @@ function uint64SiftDown(heap: bigint[], index: number): void {
   }
 }
 
-function retainKmv(heap: bigint[], seen: Set<bigint>, hash: bigint): void {
-  if (seen.has(hash)) return;
+// Return true only after observing a distinct hash beyond the exact-count capacity.
+function retainKmv(heap: bigint[], seen: Set<bigint>, hash: bigint): boolean {
+  if (seen.has(hash)) return false;
   if (heap.length < STATISTICS_KMV_HASHES) {
     heap.push(hash);
     seen.add(hash);
     uint64SiftUp(heap, heap.length - 1);
-  } else if (hash < heap[0]!) {
+    return false;
+  }
+  if (hash < heap[0]!) {
     seen.delete(heap[0]!);
     heap[0] = hash;
     seen.add(hash);
     uint64SiftDown(heap, 0);
   }
+  return true;
 }
 
-function kmvCount(heap: bigint[], nonnullRows: bigint): bigint {
-  if (heap.length < STATISTICS_KMV_HASHES) return BigInt(heap.length);
+function kmvCount(heap: bigint[], nonnullRows: bigint, overflow: boolean): bigint {
+  if (!overflow) return BigInt(heap.length);
   const numerator = BigInt(STATISTICS_KMV_HASHES - 1) << 64n;
   const denominator = heap[0]! + 1n;
   let estimate = (numerator + denominator - 1n) / denominator;
@@ -283,6 +287,7 @@ export function* collectColumnStatisticsSteps(
   const sample: SampleRow[] = [];
   const kmv: bigint[] = [];
   const kmvSeen = new Set<bigint>();
+  let kmvOverflow = false;
   let analyzedRows = 0n;
   let nullCount = 0n;
   let widthSum = 0n;
@@ -329,7 +334,7 @@ export function* collectColumnStatisticsSteps(
       widthSum += BigInt(width);
       if (widthSum > I64_MAX) widthSum = I64_MAX;
       meter.charge(COSTS.statisticsValue * BigInt(Math.max(1, width)));
-      if (key !== null) retainKmv(kmv, kmvSeen, fnv1a64(key));
+      if (key !== null) kmvOverflow = retainKmv(kmv, kmvSeen, fnv1a64(key)) || kmvOverflow;
       if (termCounter !== null) {
         for (const term of ginValueTerms(columnType, value)) {
           meter.charge(COSTS.statisticsValue * BigInt(Math.max(1, term.length)));
@@ -352,7 +357,7 @@ export function* collectColumnStatisticsSteps(
   }
   meter.guard();
   const nonnullRows = analyzedRows - nullCount;
-  const distinctCount = eligible ? kmvCount(kmv, nonnullRows) : null;
+  const distinctCount = eligible ? kmvCount(kmv, nonnullRows, kmvOverflow) : null;
   const distribution =
     distinctCount === null
       ? {

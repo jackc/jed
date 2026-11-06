@@ -1200,23 +1200,27 @@ func retainStatisticsSample(h *sampleHeap, row statisticsSample) {
 	}
 }
 
-func retainStatisticsKMV(h *uint64MaxHeap, seen map[uint64]bool, hash uint64) {
+// Return true only after observing a distinct hash beyond the exact-count capacity.
+func retainStatisticsKMV(h *uint64MaxHeap, seen map[uint64]bool, hash uint64) bool {
 	if seen[hash] {
-		return
+		return false
 	}
 	if h.Len() < statisticsKMVHashes {
 		heap.Push(h, hash)
 		seen[hash] = true
-	} else if hash < (*h)[0] {
+		return false
+	}
+	if hash < (*h)[0] {
 		removed := heap.Pop(h).(uint64)
 		delete(seen, removed)
 		heap.Push(h, hash)
 		seen[hash] = true
 	}
+	return true
 }
 
-func statisticsKMVCount(h uint64MaxHeap, nonnull int64) int64 {
-	if len(h) < statisticsKMVHashes {
+func statisticsKMVCount(h uint64MaxHeap, nonnull int64, overflow bool) int64 {
+	if !overflow {
 		return int64(len(h))
 	}
 	numerator := new(big.Int).Lsh(big.NewInt(statisticsKMVHashes-1), 64)
@@ -1375,6 +1379,7 @@ func (db *engine) executeAnalyze(analyze *analyzeStmt) (outcome, error) {
 		sample := &sampleHeap{}
 		kmv := &uint64MaxHeap{}
 		kmvSeen := map[uint64]bool{}
+		kmvOverflow := false
 		analyzedRows, nullCount, widthSum := int64(0), int64(0), int64(0)
 		mask := make([]bool, len(table.Columns))
 		mask[column] = true
@@ -1428,7 +1433,7 @@ func (db *engine) executeAnalyze(analyze *analyzeStmt) (outcome, error) {
 			}
 			meter.Charge(costs.StatisticsValue * int64(max(1, width)))
 			if eligible {
-				retainStatisticsKMV(kmv, kmvSeen, statisticsFNV1a64(key))
+				kmvOverflow = retainStatisticsKMV(kmv, kmvSeen, statisticsFNV1a64(key)) || kmvOverflow
 			}
 			if termsEligible {
 				resident, err := residentValue(value)
@@ -1456,7 +1461,7 @@ func (db *engine) executeAnalyze(analyze *analyzeStmt) (outcome, error) {
 		var mcv []statisticsMCV
 		var histogram []statisticsValue
 		if eligible {
-			n := statisticsKMVCount(*kmv, nonnull)
+			n := statisticsKMVCount(*kmv, nonnull, kmvOverflow)
 			distinct = &n
 			sampleNonNull, mcv, histogram = finishStatisticsDistribution(*sample, analyzedRows, n)
 		} else {
