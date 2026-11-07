@@ -157,15 +157,22 @@ commits, credential repair or rotation.
 
 ### Subsequent Linux integration acceptance
 
-The frozen snapshot at `cec8170bfc33f087fa98949ae661b1eaa5490218` passes all 515
-native tests including all 749 frozen SQL files. Postoptimization verification
-also passes the full 77,612-record four-core encrypted comparison, all 2,691
+The original snapshot at `cec8170bfc33f087fa98949ae661b1eaa5490218` passed all 515
+native tests including all 749 frozen SQL files. Its postoptimization verification
+also passed the full 77,612-record four-core encrypted comparison, all 2,691
 bidirectional interchange phases, 241,412 exact-account measurements and the
 18-trace four-core saved-simulation comparison. Earlier complete service,
 process and 176-trace-per-core generated-simulation gates retain their own actors.
 [VERIFICATION.md](../../impl/swift-native/VERIFICATION.md) records commands, hashes,
 credential/maintenance coverage, failures and later corrections. The measured
 comparison is separate in [BENCHMARKS.md](../../impl/swift-native/BENCHMARKS.md).
+
+The structural follow-up at `43481e2047da1cee34a627b910c8a7c7c59c473f` passes 543
+native tests and all 749 frozen SQL files. Refreshed encrypted, interchange,
+accounting, service, process and simulation gates are mapped to current actors
+in VERIFICATION.md. Separate diagnostic comparisons of 22 peer, eight paired Swift
+and three Ruby workloads are complete in BENCHMARKS.md. The earlier
+primitive, debug, CLI, oracle and default-CI evidence retains its original scope.
 
 These checks reproduce the implemented encryption contract; they do not certify
 constant-time behavior, complete memory erasure, a new security review or Apple

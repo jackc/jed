@@ -10,12 +10,18 @@ in [VERIFICATION.md](../VERIFICATION.md) and [BENCHMARKS.md](../BENCHMARKS.md).
 
 This audit uses **R01–R07 in `swift-native-host-matrix.md`**, not the differently
 numbered scope ledger. Baseline: `362e0798ac3a8bd04bd2da556044b6ec73bf468a`.
-Final optimized-source verification for `cec8170bfc33f087fa98949ae661b1eaa5490218`
-passes 515 native tests including all 749 frozen SQL files. Its complete V04 refresh
-passes all 241,412 measurements with zero failures: all four cores in memory,
+Original optimized-source verification for `cec8170bfc33f087fa98949ae661b1eaa5490218`
+passed 515 native tests including all 749 frozen SQL files. Its complete V04 refresh
+passed all 241,412 measurements with zero failures: all four cores in memory,
 disk and disk-spill, with exact peak/storage comparisons and complete membership.
 [VERIFICATION.md](../VERIFICATION.md) maps these gates to their captured actors;
 [BENCHMARKS.md](../BENCHMARKS.md) records measured performance separately.
+
+The structural follow-up at `43481e2047da1cee34a627b910c8a7c7c59c473f` passes
+543 native tests, all 749 frozen SQL files and a fresh complete 241,412-measurement
+V04 comparison. The [structural acceptance record](../VERIFICATION.md#structural-follow-up-acceptance)
+identifies its actors and additional resource/storage/process gates. Earlier
+evidence below retains its original scope.
 
 ## Preserved preoptimization evidence (2026-11-06)
 

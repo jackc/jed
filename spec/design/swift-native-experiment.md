@@ -1,8 +1,9 @@
 # Native Swift core experiment
 
 Approved 2026-11-05. **Frozen experimental snapshot** at
-`cec8170bfc33f087fa98949ae661b1eaa5490218`. Linux acceptance and the measured
-optimization pass are complete for the recorded actors and inputs; see
+`43481e2047da1cee34a627b910c8a7c7c59c473f`. Structural implementation and Linux
+correctness revalidation are complete: 543 native tests and all 749 frozen SQL
+files pass. Diagnostic performance comparisons are complete; see
 [VERIFICATION.md](../../impl/swift-native/VERIFICATION.md) and
 [BENCHMARKS.md](../../impl/swift-native/BENCHMARKS.md). The semantic target remains the
 supported Rust/Go/TypeScript surface at `362e0798ac3a8bd04bd2da556044b6ec73bf468a`.
@@ -47,8 +48,12 @@ they must not swap in engine-owned result collection or evade accounting checkpo
 Independent review covers durability, crypto, accounting and adapters, followed by
 integrated tests. Review alone does not establish conformance.
 
-The completed release baseline and optimization comparison each cover all 143
-workloads, four cores and three rounds, with matched checksums and row counts.
+The original `cec8170bfc33f087fa98949ae661b1eaa5490218` snapshot's completed release
+baseline and optimization comparison each cover all 143 workloads, four cores and
+three rounds, with matched checksums and row counts. Those results remain historical
+evidence. The structural follow-up's completed measurements cover separate
+22-workload peer, 8-workload Swift before/after and 3-workload Ruby diagnostic
+subsets, each with three rounds per actor; they do not constitute a new full-suite result.
 [BENCHMARKS.md](../../impl/swift-native/BENCHMARKS.md) retains source and actor identities,
 dataset/durability settings, toolchain/hardware, warmup, exact commands, raw-result
 locations and the comparison's limits. Its workload-specific findings are not a

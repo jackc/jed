@@ -1,6 +1,51 @@
 # Swift experiment progress
 
-## Authorized structural performance follow-up (2026-11-06, in progress)
+## Authorized structural performance follow-up (2026-11-06, complete)
+
+### Final result
+
+Implementation is frozen at local-only `43481e2047da1cee34a627b910c8a7c7c59c473f`.
+All affected correctness gates and final measurements are complete. The updated
+[benchmark report](BENCHMARKS.md) leads with direct peer comparisons and retains
+the original complete 143-workload evidence. [VERIFICATION.md](VERIFICATION.md)
+records 543 native tests, all 749 SQL files and the refreshed resource, storage,
+process and simulation gates. No engine source changed during measurement.
+
+The final 22-workload peer matrix completes all 12 actor-rounds with zero
+failures. Swift/peer geometric means are 5.4065× Rust, 5.1083× Go and 1.0423×
+TypeScript; median wins are 0/22, 0/22 and 13/22 respectively. The separate
+eight-workload paired run also completes all six actor-rounds: lookup 1.93×,
+fixed aggregate 2.74×, array COUNT 11.55× and array containment 12.58× faster
+than the retained original Swift actor under matched conditions. These are
+diagnostic subsets, not a new complete 143-workload result.
+
+The first Ruby supplement passes its Swift process but stops before executing
+Ruby: the supplemental worker closes a `lambda do` with a brace. Its failure
+and captured worker remain in `results/architecture-20261106/final-ruby-supplement`.
+Only the staged runner is corrected and syntax-checked; no engine source or
+retained result is changed. A new output directory holds the retry.
+
+The corrected `final-ruby-supplement-retry` completes all six actor-rounds.
+Ruby/YJIT wins lookup (16.757 versus 23.620 µs); Swift wins full aggregation by
+23.81× and durable insertion by 2.71×. Source review confirms normal Ruby compiler
+loading and default work-memory/accounting settings. Its file-backed aggregate
+uses the existing streaming fold; the compiled-aggregate path declines storage.
+
+The strict `final-report` summary revalidates all 22/8/3-workload memberships,
+authored inputs, result signatures, Swift/Ruby raw sample statistics and actual
+archived actor bytes. It confirms the same final Swift actor in all three runs:
+`5bc33bffebd2064a393e0f8a8acecd5c3792d4ef8affeeccb64fb2f6575d4c6d`.
+The report's `evidence-sha256.json` digest is
+`9fd2aa16e2281fbd3d040c9cf0e62eab26d3d38c3abc3c387d1cba156ecd0e9e`.
+Three exact CSV copies are committed alongside BENCHMARKS.md. The complete
+original evidence, intermediate regression, failed matrix setup and failed
+Ruby runner remain preserved. Swift remains opt-in and Apple platforms remain
+unverified; no push, master merge, publication or promotion is implied.
+
+### Investigation record
+
+The following notes preserve intermediate pending and failed states. The final
+status and actor-specific acceptance are above.
 
 The maintainer requested investigation and broad fixes for the final Swift/peer
 gap. The original completed snapshot and all evidence below remain preserved;
@@ -123,6 +168,16 @@ failures. Disassembly confirms the old Go adapter lacked the existing
 `01c483cc` committed-GiST staging fix; the Swift binary and fixtures did not
 change. Both failure and successful retries remain in `verification-final`.
 Production source is ready for the isolated final 22/8/3 workload comparisons.
+
+The verified source is committed locally as
+`43481e2047da1cee34a627b910c8a7c7c59c473f`. The first matrix setup failed before
+starting an actor because the diagnostic singleton method used unqualified
+`CORES`; qualifying it as `SwiftNativeBenchmark::CORES` fixes only the harness.
+The initial directory/log remain retained. The unchanged production actor is
+running in `results/architecture-20261106/final-peer-matrix-retry`; its first
+complete four-core round passes all 22 signatures. Final three-round results,
+the paired original/current Swift comparison and aligned Ruby comparison are
+still pending. No new whole-suite performance claim is implied.
 
 ## Original completed experiment
 

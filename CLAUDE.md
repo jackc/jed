@@ -147,13 +147,16 @@ experiment, and promotion requires a separate decision. See
 [ruby-native-experiment.md](spec/design/ruby-native-experiment.md).
 
 The separately approved **native Swift experiment** (`impl/swift-native`, 2026-11-05)
-is frozen at `cec8170bfc33f087fa98949ae661b1eaa5490218`. Its semantic target remains
+is frozen at `43481e2047da1cee34a627b910c8a7c7c59c473f`. Its semantic target remains
 the entire supported Rust/Go/TypeScript surface at
 `362e0798ac3a8bd04bd2da556044b6ec73bf468a`, not Ruby's frozen coverage. It is a
 handwritten independent Swift engine. Linux conformance, host, file, crypto,
 process/simulation and optimization verification are recorded in
-[VERIFICATION.md](impl/swift-native/VERIFICATION.md); the complete release
-baseline and measured comparison are in [BENCHMARKS.md](impl/swift-native/BENCHMARKS.md).
+[VERIFICATION.md](impl/swift-native/VERIFICATION.md). The original `cec8170` snapshot's
+complete release baseline and measured comparison remain preserved in
+[BENCHMARKS.md](impl/swift-native/BENCHMARKS.md). The completed structural follow-up
+adds separate diagnostic comparisons of 22 peer, eight paired Swift and three
+Ruby workloads; it does not replace the original 143-workload full-suite evidence.
 Results apply to the recorded workloads, host and actors, not universal performance parity.
 Swift remains opt-in, outside default tasks and automatic future feature updates,
 with no website integration. The snapshot is committed locally; no push, master
@@ -163,8 +166,10 @@ remain unverified until built and tested there. See
 [swift-native-experiment.md](spec/design/swift-native-experiment.md).
 The maintainer authorized a structural performance investigation on 2026-11-06;
 see [swift-native-performance.md](spec/design/swift-native-performance.md).
-It may revise the frozen implementation while preserving its original evidence,
-without changing experimental status or the separate production decision.
+Its implementation, correctness revalidation and diagnostic measurements are
+complete, including 543 native tests and all 749 frozen SQL files. Original
+evidence remains preserved, without changing experimental status or the separate
+production decision.
 
 The maintainer approved Ruby's OpenSSL binding for vetted cryptographic digest
 functions and stdlib Zlib for byte-identical CRC32 checksums in this experiment.

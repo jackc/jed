@@ -19,15 +19,17 @@ implementation-pattern evidence, not reference implementations. The inventory
 was recorded before implementation with every target marked U.
 The completed audit reconciles those rows to the handwritten implementation and
 recorded Linux gates. The experiment is frozen at
-`cec8170bfc33f087fa98949ae661b1eaa5490218`; the semantic baseline above is unchanged.
+`43481e2047da1cee34a627b910c8a7c7c59c473f`; the semantic baseline above is unchanged.
 The final [verification report](../../impl/swift-native/VERIFICATION.md) maps each
 acceptance gate to its tested actor, and the [benchmark report](../../impl/swift-native/BENCHMARKS.md)
-records the complete release baseline, optimization comparison and measured limits.
-The optimized release run passes all 515 native tests and all 749 frozen SQL files.
+preserves the original `cec8170` release baseline, optimization comparison and
+measured limits. Structural-follow-up measurements are complete for separate
+22-workload peer, eight-workload paired Swift and three-workload Ruby diagnostics.
+The current release run passes all 543 native tests and all 749 frozen SQL files.
 Direct diagnostics, exact accounting and affected postoptimization checks pass as
 recorded there. The separately corrected view-source regression passes 41 records
 and 23 cells in memory and disk. Earlier handoff/client/old-pin failures and their
-corrections remain below; default CI passes its canonical 18/18 retry.
+corrections remain below; the historical canonical default-CI retry passed 18/18.
 
 Swift remains experimental and opt-in, excluded from default tasks and automatic
 future feature maintenance. Apple platforms are unverified, production delivery
@@ -50,9 +52,9 @@ measured results separately from correctness. State abbreviations distinguish th
 following contracts; none broadens the frozen baseline:
 
 - **O** — implemented; its shared SQL tests were included in the successful
-  whole frozen run. The optimized release run passes all 515 native tests,
+  whole frozen run. The current release run passes all 543 native tests,
   including all 749 files and 21,597 executed SQL records. Earlier passing
-  505-/509-test runs retain their own source and actor identities.
+  505-/509-/515-test runs retain their own source and actor identities.
   O does not cover combinations absent from those files or claim that
   SQLSTATE-only checks cover structured diagnostic fields. The view-source
   correction has its own postbaseline regression evidence.
@@ -68,14 +70,18 @@ following contracts; none broadens the frozen baseline:
   contains 241,412 measurements with zero failures and `complete_matrix=true`:
   21,477 memory records and 19,438 disk/disk-spill records per core, all 12 runs
   complete. Peaks and committed-storage bytes agree without comparator changes.
-  Evidence: `/tmp/jed-swift-query-memory-20261106-1996511-bxwolu/report.json`.
+  Current actors and evidence are mapped in VERIFICATION.md. Original report:
+  `/tmp/jed-swift-query-memory-20261106-1996511-bxwolu/report.json`.
   Earlier debug/release runs each had 376 GiST-load differences; the integrated
   supported-core correction resolves them. Earlier stack/socket failures and
   the stale private Rust manifest incident remain historical evidence.
-- **P** — the release baseline and optimization comparison are measured for all
-  143 workloads, four cores and three rounds. BENCHMARKS.md records commands,
-  provenance, checksums, row counts, results and limits. P does not mean universal
-  performance parity or select production Swift delivery.
+- **P** — the original `cec8170` release baseline and optimization comparison
+  are measured for all 143 workloads, four cores and three rounds. The current
+  structural follow-up adds completed diagnostic comparisons of 22 peer, eight
+  paired Swift and three Ruby workloads, each with three rounds per actor.
+  BENCHMARKS.md records commands, provenance, checksums, row counts,
+  results and limits. P does not credit later source with earlier measurements,
+  imply universal performance parity or select production Swift delivery.
 
 Final affected-path verification is mapped to actors in VERIFICATION.md.
 Preoptimization checks below retain their original scope; any explicitly
@@ -349,7 +355,7 @@ to run only those files.
 | V01 | Real shared-corpus runner with exact capability declaration, errors/types/rendering/sorts/hashes, params/options/directives and actual public cursor route | [conformance](conformance.md), [host matrix](swift-native-host-matrix.md) | All suites in every applicable runner mode | O/H; A/D; [SQLCorpus.swift](../../impl/swift-native/Tests/JedTests/SQLCorpus.swift), [SQLCorpusVariant.swift](../../impl/swift-native/Tests/JedTests/SQLCorpusVariant.swift), [SQLCorpusBoundaryTests.swift](../../impl/swift-native/Tests/JedTests/SQLCorpusBoundaryTests.swift) |
 | V02 | Deterministic scheduler/real process actors/simulated disk+lock+network+spill; exact transcripts, durability floor and byte crash images | [simulation](simulation-testing.md), [concurrency](concurrency-testing.md) | 7 schedules, 31 process cases, 22 sim profiles, 18 regressions | O/H; [SimRunner.swift](../../impl/swift-native/Sources/Jed/SimRunner.swift), [SimFilesystem.swift](../../impl/swift-native/Sources/Jed/SimFilesystem.swift), [ConcurrencyCorpusBoundaryTests.swift](../../impl/swift-native/Tests/JedTests/ConcurrencyCorpusBoundaryTests.swift) |
 | V03 | Bidirectional current-format interchange with Rust/Go/TS, plaintext/encrypted, incremental histories and fixture reading/writing | [format](../fileformat/format.md), [encrypted bytes](../fileformat/encrypted.md) | Goldens and cross-core process/round-trip runs | H; [DatabaseFiles.swift](../../impl/swift-native/Sources/Jed/DatabaseFiles.swift), [DomainImage.swift](../../impl/swift-native/Sources/Jed/DomainImage.swift), [SerializationBoundaryTests.swift](../../impl/swift-native/Tests/JedTests/SerializationBoundaryTests.swift) |
-| V04 | Oracle checks for relevant PG-comparable behavior; default repository gates remain healthy without Swift | [conformance](conformance.md), [oracle profile](../conformance/oracle_profile.toml) | `mise run corpus:check`; default verify/test/CI checks | H; verify 17 and latest CI 18/18 pass; DEFAULT_ISOLATION and VERIFICATION reports |
+| V04 | Oracle checks for relevant PG-comparable behavior; default repository gates remain healthy without Swift | [conformance](conformance.md), [oracle profile](../conformance/oracle_profile.toml) | `mise run corpus:check`; default verify/test/CI checks | H; earlier verify 17 and CI 18/18 passes retain their actors; DEFAULT_ISOLATION and VERIFICATION reports |
 | V05 | Usable Swift package and local embedding examples; correctness report, release baseline, matched-checksum benchmark and measured optimization | [benchmarks](benchmarks.md), [cores](cores.md) | Opt-in release benchmark runs; recorded commands/hardware/toolchain | H; P; [Ergonomic.swift](../../impl/swift-native/Sources/Jed/Ergonomic.swift), [ErgonomicBoundaryTests.swift](../../impl/swift-native/Tests/JedTests/ErgonomicBoundaryTests.swift) |
 
 ## 4. Shared type and module constraints
@@ -410,9 +416,9 @@ passing one does not imply any other.
 | Interchange | Swift-to-each-supported-core and reverse, plaintext/encrypted, initial/incremental states | H; all 112 images/2,691 phases and postoptimization interchange refresh pass; view-source checks have separate evidence |
 | Host APIs | Lifecycle/prepared/cursors/cancel/environment/functions/capabilities/resources/attachments/maintenance | H/D/A; lifecycle/batch/settings/resource/integrity, direct diagnostics, full exact-account comparison and final native suite pass |
 | Independent review | Storage durability, approved crypto integration, resource accounting, conformance adapters | H; independent review covers authored durability/crypto/resources/adapters, corrections and the measured optimization; final gate map in VERIFICATION.md |
-| Oracle | Relevant PG-clean corpus checks under the checkout's declared oracle profile | H; relevant shared changes checked, latest short_circuit/correlated regenerate unchanged |
-| Default gates | No implicit Swift dependency in normal CI/tests/benchmarks/codegen | H; verify 17 and latest CI 18/18 pass; default isolation retained |
-| Release performance | Correctness first, preserved baseline, matched workload/durability/checksums, measured optimization | P; complete before/after release runs cover 143 workloads × four cores × three rounds with matching checksums/row counts; results and limits in BENCHMARKS.md |
+| Oracle | Relevant PG-clean corpus checks under the checkout's declared oracle profile | H; relevant shared changes checked; earlier short_circuit/correlated regeneration unchanged |
+| Default gates | No implicit Swift dependency in normal CI/tests/benchmarks/codegen | H; earlier verify 17 and CI 18/18 passes retain their actors; current repository checks are mapped in VERIFICATION.md; default isolation retained |
+| Release performance | Correctness first, preserved baseline, matched workload/durability/checksums, measured optimization | P for the original `cec8170` before/after release runs: 143 workloads × four cores × three rounds with matching checksums/row counts. Current diagnostic comparisons cover 22 peer, eight paired Swift and three Ruby workloads, each with three rounds per actor; results and limits in BENCHMARKS.md. |
 | Apple builds | macOS/iOS builds and tests, separately from Linux acceptance | Unverified platform; Linux scope is unaffected |
 
 

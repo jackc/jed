@@ -52,13 +52,15 @@ files in the same change.
   requested. Record coverage and omissions against the experiment's source revision;
   promotion to supported status requires a separate decision. See
   `spec/design/ruby-native-experiment.md` and `spec/design/swift-native-experiment.md`.
-  The Swift experiment is frozen at `cec8170bfc33f087fa98949ae661b1eaa5490218` against
+  The Swift experiment is frozen at `43481e2047da1cee34a627b910c8a7c7c59c473f` against
   its recorded semantic baseline; Linux verification and measured results are in
   `impl/swift-native/VERIFICATION.md` and `impl/swift-native/BENCHMARKS.md`.
   Apple platforms remain unverified. Production Swift delivery is undecided;
   the experiment adds no website docs, references, or live panels.
-  An explicitly authorized performance investigation (2026-11-06) may revise
-  this snapshot while preserving its baseline evidence; see
+  The explicitly authorized structural follow-up (2026-11-06) is complete,
+  including correctness revalidation and diagnostic comparisons of 22 peer,
+  eight paired Swift and three Ruby workloads. Original `cec8170` full-suite
+  evidence is preserved; see
   `spec/design/swift-native-performance.md`. It remains opt-in and experimental.
 - SQL is the primary access path and every built-in capability must be reachable
   through SQL, while storage must keep room for non-SQL access paths later.

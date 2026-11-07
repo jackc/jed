@@ -1,11 +1,14 @@
 # Native Swift experiment
 
-**Frozen experimental snapshot** at `cec8170bfc33f087fa98949ae661b1eaa5490218`.
+**Frozen experimental snapshot** at `43481e2047da1cee34a627b910c8a7c7c59c473f`.
 The semantic target remains the full supported jed surface at
 `362e0798ac3a8bd04bd2da556044b6ec73bf468a`, with separately recorded shared corrections
 and postbaseline regressions. [VERIFICATION.md](VERIFICATION.md) maps completed
-Linux acceptance to its actual actors; [BENCHMARKS.md](BENCHMARKS.md) records the
-complete release baseline and measured optimization comparison, including limits.
+Linux acceptance to its actual actors. The completed structural follow-up passes
+543 native tests and all 749 frozen SQL files. [BENCHMARKS.md](BENCHMARKS.md) records
+its diagnostic comparisons of 22 peer, eight paired Swift and three Ruby workloads,
+and preserves the original `cec8170` snapshot's complete 143-workload release
+baseline and optimization comparison. Each result retains its scope and limits.
 [PROGRESS.md](PROGRESS.md) preserves implementation history and failed attempts.
 The [experiment design](../../spec/design/swift-native-experiment.md) and its linked
 scope/host matrices preserve the baseline boundaries. This locally committed

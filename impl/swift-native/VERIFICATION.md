@@ -1,8 +1,10 @@
 # Swift experiment verification
 
-Status: **Frozen experimental snapshot; required Linux acceptance and the measured
-optimization pass are complete.** Implementation revision:
-`cec8170bfc33f087fa98949ae661b1eaa5490218`. Semantic target revision: `362e0798ac3a8bd04bd2da556044b6ec73bf468a`.
+Status: **Linux acceptance and structural-performance revalidation are complete.**
+Current implementation revision: `43481e2047da1cee34a627b910c8a7c7c59c473f`.
+The original snapshot and its evidence below remain preserved at
+`cec8170bfc33f087fa98949ae661b1eaa5490218`. Semantic target revision:
+`362e0798ac3a8bd04bd2da556044b6ec73bf468a`.
 Platform exercised: Ubuntu Linux x86-64, Swift 6.4.2. Apple platforms are
 unverified. The package and all runners are explicitly opt-in.
 
@@ -20,7 +22,75 @@ simulation images. Its SHA-256 is
 The ignored archive supplements this committed report; the original `/tmp`
 paths below remain useful provenance references.
 
-## Postoptimization acceptance
+## Structural follow-up acceptance
+
+The explicitly authorized follow-up changes value representation, scan and
+aggregate execution, immutable dirty leaves, and prepared-query ownership.
+It changes no shared fixture, logical accounting rule, file format or dependency.
+The production source checkpoint is local-only `43481e2047da1cee34a627b910c8a7c7c59c473f`.
+Performance evidence and its subset limits are separate in [BENCHMARKS.md](BENCHMARKS.md).
+
+Evidence root: `results/architecture-20261106/verification-final`. Its compact
+`manifest.json` covers 2,093 report/log/accounting/source-identity files; SHA-256
+`8b11c003440238e3a704f3e6c5060371e95b37807fe35e958424c70b92b05080`.
+Captured executables, resource bundles and emitted images remain in the gate
+directories but are outside this compact manifest. The source patch, added
+files and 1,490 source/fixture/tool hashes record the precommit worktree used
+for these builds. Committing it did not change production source.
+
+| Gate | Result | Evidence relative to this root |
+|---|---|---|
+| Release native/API and all frozen SQL | **543 tests**, zero failures; **749/749 files**, 21,597 records, 39,148 cells, 2,271 cost / 1,154 name / 100 type assertions and five host actions. Zero omitted files, blocked adapters, aborted host actions or auto-mode exclusions. | `native-all749.log` |
+| Exact resource accounting | All four cores × memory/disk/disk-spill; **241,412 measurements**, zero discrepancies. The diagnostic ceiling remains 1 TiB, not a physical heap guarantee. | `v04/report.json` |
+| Encrypted SQL | Four cores, 662 applicable files and 19,403 records each; **77,612 records**, zero discrepancies. Frozen and postbaseline exclusions remain explicit. | `encrypted/report.json` |
+| File interchange | All 112 ordinary frozen images plus generated cases; **2,691/2,691 phases**, zero failures. | `interchange/report.json` |
+| Saved fault simulations | All 18 traces in four cores, 54 transcript comparisons and 153 independent Swift image checks; zero failures/exemptions. | `simulation-saved/summary.json` |
+| Generated fault simulations | 22 profiles × eight seeds; **176 traces per core**, 459 transcript comparisons, **7,049 independent Swift image checks**, zero failures. The original 23 per-core-fault exemptions remain explicit. | `simulation-generated/summary.json` |
+| Mixed processes | **496/496** pairings plus both plaintext/encrypted Swift-client/Rust-owner streams pass. | `process-driver.log`, `rust-stream-driver.log` |
+| Concurrent stress | Five core/storage runs, **20,000 snapshot invariants**, 5,000 writer transactions; identical final checksum `f3e75496a3111181`. Correctness only, not timing evidence. | `stress/report.json` |
+| Page-service SQL | Complete six-direction matrix, **116,628 records**, zero failures with freshly built supported adapters. | `service-fresh-peers/report.json` |
+| Repository spec/code generation | All checks pass; default tasks remain independent of Swift. | `repository-verify.log` |
+
+Commands, all through `mise run`: `swift-native:test --configuration release
+--all-sql --trace-sql`; `swift-native:query-memory`, `swift-native:encrypted`,
+`swift-native:interop`, and both forms of `swift-native:sim:sweep` use
+`--configuration release --no-build`, with `--regress` or `--seeds 1..8` for
+simulations. Process checks use `JED_PROCESS_CORES=swift-native,rust,go,node`,
+then `JED_PROCESS_CORES=swift-native JED_PROCESS_FILTER=_stream` with
+`--pages-owner rust`. Stress uses `--configuration release --no-swift-build`;
+the successful full service refresh uses those same flags. Each report retains
+its output paths and actor identities; driver logs preserve invocation details.
+
+The first service run with `--no-build` **failed** and is retained in `service/`.
+Only Go-client/Swift-owner failed: a reused Go adapter lacked the already
+committed `01c483cc` GiST-loader staging correction. Disassembly, old/fresh
+binary hashes and the exact record-8/25-unrun-record diagnosis are retained in
+`stale-go-audit.txt`. The rebuilt-Go probe in `service-fresh-go-probe/`, followed
+by the complete rebuilt-peer matrix, passed against the **unchanged Swift owner**.
+No fixture or Swift fix was used to make the retry pass.
+
+The release XCTest actor is
+`3bed91b6345d597308d2101c385fd615e6fbcb8b7cbc5832a8d4c758200c30bd`,
+with unchanged resource identity
+`0568c671be49ea6e8e3ff902f41b48a110b612ab428fd105a8bbd67cabb5ba10`.
+The separate production build completes in 183.73 seconds. Its compiler
+descriptions confirm `-O` and whole-module optimization without testability,
+sanitizers or library evolution. Production actors:
+
+| Actor | SHA-256 |
+|---|---|
+| Benchmark | `5bc33bffebd2064a393e0f8a8acecd5c3792d4ef8affeeccb64fb2f6575d4c6d` |
+| Process/page owner | `6e75981e14c5a19c7958c021828d6dc2008297180f6b2a6cb288f27b87424dc2` |
+| Simulation | `abc854fe6fb1b72fb424fab0a13bab7b5a1b5715c3dbef19f51a5625aa4a4bbf` |
+| Interchange | `a8dc02326367c6191328b886ee93da48f42053865edfcf42744ad88dc9e9a445` |
+| Stress | `c62de8ea6b2546139db13e1a46c3811f5bbe254273ca25d89cc92cefd061a093` |
+
+These gates refresh the affected execution, resource, storage, ownership and
+process paths. Earlier CLI PTY, debug-build, oracle and default-CI results below
+retain their original actors and dates; they are not claimed as reruns of this
+source. Apple platforms remain unverified.
+
+## Original postoptimization acceptance
 
 Optimized implementation: `cec8170bfc33f087fa98949ae661b1eaa5490218`.
 The complete release benchmark comparison and its limits are recorded separately
@@ -125,9 +195,11 @@ subsequent source edits cannot alter a running comparison.
 ## Coverage and limits
 
 All required Linux behavior in the recorded scope and host/tool matrices is
-implemented and verified. The complete 143-workload, four-core, three-round release
-baseline and after run passed their logical comparisons; [BENCHMARKS.md](BENCHMARKS.md)
-records measured improvements, regressions and peer drift without a parity claim.
+implemented and verified. The original `cec8170` snapshot's complete 143-workload,
+four-core, three-round release baseline and after run passed their logical
+comparisons. The structural follow-up uses separate diagnostic performance
+subsets; [BENCHMARKS.md](BENCHMARKS.md) records their membership, measurements
+and limits without extending them into a new whole-suite or parity claim.
 This is a finite experimental acceptance record, not exhaustive fault coverage,
 cryptographic certification, or a whole-engine physical memory guarantee.
 

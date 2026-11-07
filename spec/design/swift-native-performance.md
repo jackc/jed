@@ -2,17 +2,53 @@
 
 Authorized 2026-11-06 after the completed native Swift experiment. This work is
 explicitly opt-in and does not promote Swift, change its semantic baseline, or
-select production delivery. The frozen implementation `cec8170bfc33f087fa98949ae661b1eaa5490218`
+select production delivery. The original frozen implementation `cec8170bfc33f087fa98949ae661b1eaa5490218`
 and its complete benchmark/verification evidence remain preserved. The starting
 checkout for this investigation is local-only `56972d2f`.
 
-The question is why the final experimental Swift engine takes geometric-mean
+The original question was why the experimental Swift engine took geometric-mean
 times of 9.1990× Rust, 7.5125× Go and 2.1292× TypeScript on the same 143 workloads.
 The language-neutral contracts remain authoritative. Changes must preserve
 values, types, diagnostics, logical costs, resource schedules, cancellation,
 durability and byte encodings. No unsafe arithmetic, unchecked builds, alternate
 storage path, fixture weakening, dependency addition or workload-specific result
 shortcut is authorized by this investigation.
+
+## Completed result
+
+The structural implementation is complete and frozen at local-only
+`43481e2047da1cee34a627b910c8a7c7c59c473f`. It preserves the semantic target and
+experimental status. [BENCHMARKS.md](../../impl/swift-native/BENCHMARKS.md) now
+leads with direct peer timings, followed by controlled Swift and aligned Ruby
+comparisons. All selected results pass exact validation; no slower result or
+failed setup is discarded.
+
+The final 22-workload, four-core, three-round diagnostic matrix gives equal-weight
+Swift/peer geometric means of **5.4065× Rust, 5.1083× Go and 1.0423× TypeScript**;
+Swift has lower medians on 0/22, 0/22 and 13/22 respectively. These are not an
+updated result for all 143 workloads. In the separate eight-workload alternating
+Swift comparison, lookup improves **1.93×**, fixed aggregation **2.74×**, array
+COUNT **11.55×** and array containment **12.58×**. All eight medians improve;
+durable insertion's 1.18× result has overlapping round ranges.
+
+The aligned three-workload Ruby/YJIT comparison is mixed: Ruby wins lookup
+(16.757 versus 23.620 µs), while Swift wins full aggregation by 23.81× and
+durable insertion by 2.71×. The runner preserves Ruby's normal compiler loading
+and defaults; its file aggregate uses the existing streaming fold, while the
+separate compiled-aggregate path declines file-backed execution. These are
+implementation comparisons, not evidence of an inherent language ranking.
+
+The current source passes **543 native tests and all 749 frozen SQL files**,
+241,412 exact resource measurements, 77,612 encrypted records, 2,691 interchange
+phases, all saved and generated fault sweeps, 496 mixed-process pairings, both
+Swift-client/Rust-owner streams, stress and the six-direction service corpus.
+[VERIFICATION.md](../../impl/swift-native/VERIFICATION.md#structural-follow-up-acceptance)
+maps each gate to its actual actor and preserves the stale-Go-adapter failure.
+
+The measured gains establish substantial representation/execution overhead in
+the original Swift core. They do not establish Rust/Go parity or a Swift
+performance ceiling. The remaining source-level opportunities below are
+documented hypotheses for separate controlled work, not claimed attribution.
 
 ## Investigation and controlled changes
 
@@ -45,8 +81,8 @@ shortcut is authorized by this investigation.
    Mutable builders and ownership tokens are a separate decision: an implicitly
    copied Swift value must never retain permission to mutate an aliased snapshot.
 7. Treat prepared-plan requirements as immutable facts of the cached plan.
-   Reuse admitted parameters only when their exact cached schema provenance is
-   established, and cache sequence/subquery requirements on the detached plan.
+   Reuse admitted parameters on generic hits only when their exact cached schema
+   provenance is established, and cache sequence/subquery requirements on the detached plan.
    Keep miss, custom-plan and uncacheable admission/error order unchanged.
    Read bundles own their snapshot map and deterministic pin order; execution
    creates a scalar input only when its selected backend needs one.
@@ -102,3 +138,41 @@ tests only for invariants unavailable to the corpus. Broader verification follow
 the affected paths; earlier actors do not establish later source correctness.
 Record accepted changes, rejected hypotheses, commands and results before
 refreezing the resulting snapshot.
+
+## Remaining structural work identified by source review
+
+These are concrete implementation differences, not a measured allocation or CPU
+breakdown of the final actor. They explain where another controlled experiment
+could begin; this follow-up does not claim they account for the entire remaining
+peer gap.
+
+- `GroupedSelectExecution` still asks `TreePosition.cell(...).isNull` for COUNT.
+  That constructs typed cell metadata and a slice. Rust/Go expose direct leaf
+  bitmap/offset nullness checks. The Swift leaf API could distinguish nullness,
+  borrowed encoded bytes and decoded values more completely.
+- `TreeCursor` returns a strong node-owning position per row, and filtered
+  `PackedLaneRow` replaces that position each row. Rust/Go perform their packed
+  folds inside a leaf traversal over node/index pairs. A leaf-scoped Swift
+  execution interface could amortize ownership; actual final ARC counts have
+  not been measured.
+- The admitted integer-group packed lane builds key arrays and encodes a generic
+  byte key for each survivor. Rust/Go use integer keys plus a separate NULL
+  sentinel. Selecting the key representation once could remove this work while
+  preserving first-occurrence order and exact logical reservations.
+- Variable-width cost preflight traverses the input before execution. Peers can
+  accumulate large-value facts in their packed fold and batch charges in an
+  unlimited lane. Fusion in Swift needs error/cancellation-cost validation;
+  equal totals on successful queries are insufficient.
+- General bounded grouping restores and repacks aggregate state through the
+  spill representation. That broad algorithm also exists in Go, but Swift adds
+  row-context capture, argument arrays and full state objects. Retaining typed
+  resident accumulators until spill is a larger representation change that
+  must preserve memory admission, thresholds, fold order and cleanup.
+- Prepared execution still copies a large `SelectPlan` while rebinding physical
+  roots. Separating immutable plan metadata from per-execution bindings is a
+  larger design change than making the entire mutable plan a reference type.
+
+Do not use unsafe memory access, weaker checks, changed accounting or generated
+SQL-specific shortcuts to obtain a language-performance ranking. Ruby's approved
+runtime-compiled kernels also differ materially from interpreted execution;
+the supplementary measurements compare these engines, not abstract languages.
