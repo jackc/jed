@@ -304,13 +304,12 @@ impl Decimal {
         if self.limbs.is_empty() {
             return (false, Vec::new(), 0);
         }
-        let mut digits = mag_to_decimal_str(&self.limbs);
-        let mut scale = self.scale;
-        while scale > 0 && digits.ends_with('0') {
-            digits.pop();
-            scale -= 1;
-        }
-        (self.neg, mag_from_decimal_str(&digits), scale)
+        let strip = mag_trailing_zeros(&self.limbs).min(self.scale);
+        (
+            self.neg,
+            mag_div_pow10_exact(&self.limbs, strip),
+            self.scale - strip,
+        )
     }
 
     /// The value-canonical form as `(neg, coefficient digits, scale)` — the coefficient as a decimal
@@ -332,10 +331,18 @@ impl Decimal {
                 Ordering::Greater
             };
         }
-        let s = self.scale.max(other.scale);
-        let a = mag_mul_pow10(&self.limbs, s - self.scale);
-        let b = mag_mul_pow10(&other.limbs, s - other.scale);
-        let m = mag_cmp(&a, &b);
+        // Only the operand of smaller scale is rescaled; equal scales compare in place.
+        let m = match self.scale.cmp(&other.scale) {
+            Ordering::Equal => mag_cmp(&self.limbs, &other.limbs),
+            Ordering::Less => mag_cmp(
+                &mag_mul_pow10(&self.limbs, other.scale - self.scale),
+                &other.limbs,
+            ),
+            Ordering::Greater => mag_cmp(
+                &self.limbs,
+                &mag_mul_pow10(&other.limbs, self.scale - other.scale),
+            ),
+        };
         if self.neg { m.reverse() } else { m }
     }
 
@@ -1318,6 +1325,10 @@ fn mag_isqrt(n: &[u32]) -> Vec<u32> {
 // Value-canonical equality / hashing (1.5 == 1.50; spec/design/decimal.md §5).
 impl PartialEq for Decimal {
     fn eq(&self, other: &Decimal) -> bool {
+        // At one scale the canonical forms agree exactly when the coefficients do (zero has no sign).
+        if self.scale == other.scale {
+            return self.limbs == other.limbs && (self.neg == other.neg || self.limbs.is_empty());
+        }
         self.canonical() == other.canonical()
     }
 }
@@ -1594,26 +1605,83 @@ fn mag_mul_pow10(a: &[u32], e: u32) -> Vec<u32> {
     shifted
 }
 
+/// The number of trailing decimal zeros of a non-zero magnitude.
+fn mag_trailing_zeros(limbs: &[u32]) -> u32 {
+    let zero_limbs = limbs.iter().take_while(|&&limb| limb == 0).count();
+    let mut low = limbs[zero_limbs];
+    let mut zeros = zero_limbs as u32 * BASE_DIGITS;
+    while low % 10 == 0 {
+        low /= 10;
+        zeros += 1;
+    }
+    zeros
+}
+
+/// Divide by 10^e, which must divide the magnitude exactly.
+fn mag_div_pow10_exact(a: &[u32], e: u32) -> Vec<u32> {
+    let mut out = a[(e / BASE_DIGITS) as usize..].to_vec();
+    let den = 10u64.pow(e % BASE_DIGITS);
+    if den > 1 {
+        let mut rem = 0u64;
+        for limb in out.iter_mut().rev() {
+            let cur = rem * BASE + *limb as u64;
+            *limb = (cur / den) as u32;
+            rem = cur % den;
+        }
+        debug_assert_eq!(rem, 0);
+        mag_trim(&mut out);
+    }
+    out
+}
+
 /// 10^e as a magnitude.
 fn mag_pow10(e: u32) -> Vec<u32> {
     mag_mul_pow10(&[1], e)
 }
 
-/// Long division: `(quotient, remainder)` of `num / den` (den != 0). Each quotient limb is
-/// found by binary search in `[0, BASE)` — boring and identical across cores.
+/// Long division: `(quotient, remainder)` of `num / den` (den != 0). A one-limb divisor divides
+/// limb by limb. Otherwise each quotient limb is found by binary search, exactly, inside a bracket
+/// the leading limbs prove contains it, so the search takes a step or two rather than thirty.
 fn mag_divmod(num: &[u32], den: &[u32]) -> (Vec<u32>, Vec<u32>) {
     debug_assert!(!den.is_empty());
     if mag_cmp(num, den) == std::cmp::Ordering::Less {
         return (Vec::new(), num.to_vec());
     }
     let mut quo = vec![0u32; num.len()];
-    let mut rem: Vec<u32> = Vec::new();
+    if let [den] = *den {
+        let den = den as u64;
+        let mut rem = 0u64;
+        for i in (0..num.len()).rev() {
+            let cur = rem * BASE + num[i] as u64; // rem < den < BASE, so this is below BASE²
+            quo[i] = (cur / den) as u32;
+            rem = cur % den;
+        }
+        mag_trim(&mut quo);
+        return (quo, mag_from_u64(rem));
+    }
+    let n = den.len();
+    // The divisor's top two limbs: den is in [den_top, den_top + 1) × BASE^(n-2).
+    let den_top = den[n - 1] as u128 * BASE as u128 + den[n - 2] as u128;
+    let mut rem: Vec<u32> = Vec::with_capacity(n + 1);
     for i in (0..num.len()).rev() {
         // rem = rem * BASE + num[i]  (shift up one limb, set the low limb).
         rem.insert(0, num[i]);
         mag_trim(&mut rem);
-        // Largest q in [0, BASE) with den*q <= rem.
-        let (mut lo, mut hi) = (0u64, BASE - 1);
+        // Largest q in [0, BASE) with den*q <= rem. rem < den × BASE has at most n + 1 limbs, so
+        // its limbs from n-2 up are at most three: rem is in [top, top + 1) × BASE^(n-2), which
+        // puts q in [top / (den_top + 1), (top + 1) / den_top].
+        let (mut lo, mut hi) = if rem.len() < n {
+            (0, 0)
+        } else {
+            let top = rem[n - 2..]
+                .iter()
+                .rev()
+                .fold(0u128, |top, &limb| top * BASE as u128 + limb as u128);
+            (
+                (top / (den_top + 1)) as u64,
+                (((top + 1) / den_top) as u64).min(BASE - 1),
+            )
+        };
         while lo < hi {
             let mid = (lo + hi).div_ceil(2);
             if mag_cmp(&mag_mul_small(den, mid), &rem) != std::cmp::Ordering::Greater {
@@ -1634,22 +1702,23 @@ fn mag_to_nbase4(limbs: &[u32]) -> Vec<u16> {
     if limbs.is_empty() {
         return Vec::new();
     }
-    let s = mag_to_decimal_str(limbs);
-    let bytes = s.as_bytes();
-    // Pad on the left to a multiple of 4, then split into 4-digit groups MS-first.
-    let pad = (4 - bytes.len() % 4) % 4;
-    let mut padded = vec![b'0'; pad];
-    padded.extend_from_slice(bytes);
-    let mut out = Vec::with_capacity(padded.len() / 4);
-    let mut i = 0;
-    while i < padded.len() {
-        let mut g: u16 = 0;
-        for &b in &padded[i..i + 4] {
-            g = g * 10 + (b - b'0') as u16;
+    // Four limbs are 36 digits, exactly nine groups, so the radix converts chunk by chunk from the
+    // low end. Groups are collected low-first and reversed.
+    let mut out = Vec::with_capacity(limbs.len().div_ceil(4) * 9);
+    for chunk in limbs.chunks(4) {
+        let mut v = chunk
+            .iter()
+            .rev()
+            .fold(0u128, |v, &limb| v * BASE as u128 + limb as u128);
+        for _ in 0..9 {
+            out.push((v % 10_000) as u16);
+            v /= 10_000;
         }
-        out.push(g);
-        i += 4;
     }
+    while out.last() == Some(&0) {
+        out.pop();
+    }
+    out.reverse();
     out
 }
 
@@ -1658,16 +1727,119 @@ fn mag_from_nbase4(groups: &[u16]) -> Vec<u32> {
     if groups.is_empty() {
         return Vec::new();
     }
-    let mut s = groups[0].to_string();
-    for &g in &groups[1..] {
-        s.push_str(&format!("{g:04}"));
+    // Nine groups are 36 digits, exactly four limbs (see `mag_to_nbase4`).
+    let mut out = Vec::with_capacity(groups.len().div_ceil(9) * 4);
+    for chunk in groups.rchunks(9) {
+        let mut v = chunk.iter().fold(0u128, |v, &g| v * 10_000 + g as u128);
+        for _ in 0..4 {
+            out.push((v % BASE as u128) as u32);
+            v /= BASE as u128;
+        }
     }
-    mag_from_decimal_str(&s)
+    mag_trim(&mut out);
+    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A deterministic stream of magnitudes of 0..=`max_limbs` limbs, biased toward the limb
+    /// values where carries and quotient estimates are tightest.
+    fn sample_mags(seed: u64, count: usize, max_limbs: usize) -> Vec<Vec<u32>> {
+        let mut state = seed;
+        let mut next = move || {
+            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        };
+        (0..count)
+            .map(|_| {
+                let len = (next() % (max_limbs as u64 + 1)) as usize;
+                let mut mag: Vec<u32> = (0..len)
+                    .map(|_| match next() % 5 {
+                        0 => 0,
+                        1 => (BASE - 1) as u32,
+                        2 => (next() % 10) as u32,
+                        _ => (next() % BASE) as u32,
+                    })
+                    .collect();
+                mag_trim(&mut mag);
+                mag
+            })
+            .collect()
+    }
+
+    /// The bracketed long division returns exactly what division defines: `num = quo × den + rem`
+    /// with `rem < den`.
+    #[test]
+    fn mag_divmod_satisfies_the_division_identity() {
+        let nums = sample_mags(1, 400, 9);
+        let dens = sample_mags(2, 400, 5);
+        for num in &nums {
+            for den in dens.iter().filter(|den| !den.is_empty()) {
+                let (quo, rem) = mag_divmod(num, den);
+                assert_eq!(
+                    mag_cmp(&rem, den),
+                    std::cmp::Ordering::Less,
+                    "{num:?} / {den:?}"
+                );
+                assert_eq!(
+                    &mag_add(&mag_mul(&quo, den), &rem),
+                    num,
+                    "{num:?} / {den:?}"
+                );
+            }
+        }
+    }
+
+    /// The chunked radix conversions agree with the digit strings they replaced, and invert each
+    /// other.
+    #[test]
+    fn nbase4_conversions_match_the_digit_string() {
+        for mag in sample_mags(3, 2000, 11) {
+            let digits = mag_to_decimal_str(&mag);
+            let groups = mag_to_nbase4(&mag);
+            let rendered: String = match groups.split_first() {
+                None => "0".to_string(),
+                Some((first, rest)) => {
+                    first.to_string() + &rest.iter().map(|g| format!("{g:04}")).collect::<String>()
+                }
+            };
+            assert_eq!(rendered, digits);
+            assert_eq!(mag_from_nbase4(&groups), mag);
+        }
+    }
+
+    /// The canonical form strips exactly the trailing fractional zeros the digit string shows.
+    #[test]
+    fn canonical_strips_trailing_fractional_zeros() {
+        for mag in sample_mags(4, 2000, 6) {
+            for scale in [0u32, 1, 8, 9, 10, 27, 40] {
+                let value = Decimal {
+                    neg: false,
+                    scale,
+                    limbs: mag.clone(),
+                };
+                let (_, coeff, canon_scale) = value.canonical();
+                let mut digits = mag_to_decimal_str(&mag);
+                let mut want_scale = scale;
+                while want_scale > 0 && digits.ends_with('0') && !mag.is_empty() {
+                    digits.pop();
+                    want_scale -= 1;
+                }
+                if mag.is_empty() {
+                    want_scale = 0;
+                }
+                assert_eq!(
+                    (mag_to_decimal_str(&coeff), canon_scale),
+                    (digits, want_scale)
+                );
+            }
+        }
+    }
 
     fn dec(s: &str) -> Decimal {
         // Test helper: parse "[-]int[.frac]" into a Decimal (mirrors the lexer/parser).
