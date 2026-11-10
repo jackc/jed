@@ -1,8 +1,9 @@
 //! Statement executor (CLAUDE.md §10).
 //!
-//! SCAFFOLD (step-5 Phase A): dispatches a parsed statement; each arm is filled in
-//! feature-by-feature (Phases B–E). The result of running a statement is an
-//! `Outcome`: either a bare success (DDL/DML) or a query result set.
+//! This module holds the executor's shared types — session and transaction state, resolver
+//! scopes, the resolved expression IR (`RExpr`) and the plan IR (`SelectPlan` and friends) —
+//! and re-exports the submodules that resolve, plan and run each statement kind. The result of
+//! running a statement is an `Outcome`: either a bare success (DDL/DML) or a query result set.
 
 pub(crate) use crate::api::Rows;
 pub(crate) use crate::ast::{
@@ -4754,9 +4755,7 @@ fn validate_recursive_term(name: &str, sel: &Select) -> Result<()> {
         ));
     }
     // An aggregate in the recursive term is rejected (matching PostgreSQL).
-    if items_have_aggregate(&sel.items)
-        || sel.having.as_ref().is_some_and(|h| expr_has_aggregate(h))
-    {
+    if items_have_aggregate(&sel.items) || sel.having.as_ref().is_some_and(expr_has_aggregate) {
         return Err(EngineError::new(
             SqlState::InvalidRecursion,
             "aggregate functions are not allowed in a recursive query's recursive term".to_string(),
@@ -5102,18 +5101,17 @@ fn cte_refs_dml(body: &CteBody, shadowed: &[&str], visit: &mut CteRefVisitor) ->
                     })
                     .sum(),
             };
-            if let Some(oc) = &ins.on_conflict {
-                if let ConflictAction::DoUpdate {
+            if let Some(oc) = &ins.on_conflict
+                && let ConflictAction::DoUpdate {
                     assignments,
                     filter,
                 } = &oc.action
-                {
-                    for a in assignments {
-                        n += cte_refs_expr(&a.value, shadowed, visit);
-                    }
-                    if let Some(f) = filter {
-                        n += cte_refs_expr(f, shadowed, visit);
-                    }
+            {
+                for a in assignments {
+                    n += cte_refs_expr(&a.value, shadowed, visit);
+                }
+                if let Some(f) = filter {
+                    n += cte_refs_expr(f, shadowed, visit);
                 }
             }
             n + cte_refs_returning(&ins.returning, shadowed, visit)
@@ -5750,7 +5748,7 @@ pub(crate) struct SrfPlan {
 /// the user catalog (post-I0 the two can never collide; for a pre-reservation legacy file the
 /// built-in wins and the user relation is unreachable by name — §5).
 fn catalog_rel_kind(name: &str) -> Option<SrfKind> {
-    match name.to_string().as_str() {
+    match name {
         "jed_tables" => Some(SrfKind::JedTables),
         "jed_columns" => Some(SrfKind::JedColumns),
         "jed_indexes" => Some(SrfKind::JedIndexes),
@@ -6031,10 +6029,10 @@ fn srf_table(func_name: &str, alias: Option<&str>, col_ty: Type) -> Box<Table> {
 /// by the table alias when one is given, else by the function name. A column-alias list renames
 /// the result afterwards.
 fn srf_column_name(func_name: &str, alias: Option<&str>) -> String {
-    if let Some(d) = SET_RETURNING.iter().find(|d| d.name == func_name) {
-        if d.column_source == "out_param" {
-            return d.column.to_string();
-        }
+    if let Some(d) = SET_RETURNING.iter().find(|d| d.name == func_name)
+        && d.column_source == "out_param"
+    {
+        return d.column.to_string();
     }
     alias.unwrap_or(func_name).to_string()
 }

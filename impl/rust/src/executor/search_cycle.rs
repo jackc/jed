@@ -95,15 +95,14 @@ impl Engine {
         // A bare string literal is PostgreSQL's `unknown`: it takes the other constant's type.
         let adapt = |e: &mut Expr, other: &ResolvedType| {
             if let (Expr::Literal(Literal::Text(s), pos), Some(st)) = (&*e, elem_scalar_hint(other))
+                && !st.is_text()
             {
-                if !st.is_text() {
-                    *e = Expr::TypedLiteral {
-                        type_name: st.canonical_name().to_string(),
-                        text: s.clone(),
-                        pos: *pos,
-                        type_pos: SrcPos::NONE,
-                    };
-                }
+                *e = Expr::TypedLiteral {
+                    type_name: st.canonical_name().to_string(),
+                    text: s.clone(),
+                    pos: *pos,
+                    type_pos: SrcPos::NONE,
+                };
             }
         };
         adapt(&mut value, &dt);
@@ -150,16 +149,16 @@ impl Engine {
             Some(s) => Some(clause_columns(&s.columns, &names, "search", s.pos)?),
             None => None,
         };
-        if let Some(s) = &cte.search {
-            if names.contains(&s.set_column.as_str()) {
-                return Err(clause_error(
-                    format!(
-                        "search sequence column name \"{}\" already used in WITH query column list",
-                        s.set_column
-                    ),
-                    s.pos,
-                ));
-            }
+        if let Some(s) = &cte.search
+            && names.contains(&s.set_column.as_str())
+        {
+            return Err(clause_error(
+                format!(
+                    "search sequence column name \"{}\" already used in WITH query column list",
+                    s.set_column
+                ),
+                s.pos,
+            ));
         }
         let cycle_cols = match &cte.cycle {
             Some(c) => Some(clause_columns(&c.columns, &names, "cycle", c.pos)?),
@@ -343,10 +342,10 @@ impl Engine {
         let mut out = Vec::with_capacity(rows.len());
         for row in rows {
             meter.checkpoint()?;
-            if let Some(f) = filter {
-                if f.eval(&row, &env, &mut meter)? != Value::Bool(true) {
-                    continue;
-                }
+            if let Some(f) = filter
+                && f.eval(&row, &env, &mut meter)? != Value::Bool(true)
+            {
+                continue;
             }
             let mut added = Vec::with_capacity(exprs.len());
             for e in exprs {

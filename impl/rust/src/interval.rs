@@ -1666,7 +1666,7 @@ fn parse_iso8601_number(s: &[u8], i: usize) -> Dt<(i64, i128, usize)> {
         return Err(DtErr::FieldOverflow);
     }
     let is_hex = at(j) == b'0'
-        && at(j + 1).to_ascii_lowercase() == b'x'
+        && at(j + 1).eq_ignore_ascii_case(&b'x')
         && (at(j + 2).is_ascii_hexdigit() || (at(j + 2) == b'.' && at(j + 3).is_ascii_hexdigit()));
     let (ipart, frac, end) = if is_hex {
         scan_hex(s, j + 2)?

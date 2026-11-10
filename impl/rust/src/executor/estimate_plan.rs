@@ -559,15 +559,15 @@ impl Engine {
             let body = self.estimate_query_plan(derived, ctx);
             return EstimatedPlan::parent(body.root.clone(), &[&body]);
         }
-        if let (Some(cte), Some(ctx)) = (rel.cte, ctx) {
-            if let Some(body) = ctx.bodies.get(cte) {
-                if ctx.modes.get(cte) == Some(&CteMode::Materialize) {
-                    let mut estimate = PlanEstimate::empty(body.root.rows);
-                    estimate.add_unit(UNIT_CTE_SCAN_ROW, body.root.rows);
-                    return EstimatedPlan::leaf(estimate);
-                }
-                return EstimatedPlan::leaf(body.root.clone());
+        if let (Some(cte), Some(ctx)) = (rel.cte, ctx)
+            && let Some(body) = ctx.bodies.get(cte)
+        {
+            if ctx.modes.get(cte) == Some(&CteMode::Materialize) {
+                let mut estimate = PlanEstimate::empty(body.root.rows);
+                estimate.add_unit(UNIT_CTE_SCAN_ROW, body.root.rows);
+                return EstimatedPlan::leaf(estimate);
             }
+            return EstimatedPlan::leaf(body.root.clone());
         }
         if let Some(srf) = &rel.srf {
             let rows = match srf.kind {
@@ -590,15 +590,16 @@ impl Engine {
         let mut estimate = estimate_selected_scan(bound, sp.filter.access(), &scope, self);
         // An unbounded secondary-index ORDER BY walks the index and point-fetches the table; it is
         // physically different from the full-table candidate that supplied the legacy access bound.
-        if index == 0 && bound.is_none() {
-            if let Some(order) = &sp.phys.index_order {
-                let table_store = self.store_scoped(rel.db.as_deref(), &rel.table_name);
-                let index_store = self.index_store_scoped(rel.db.as_deref(), &order.name_key);
-                estimate.units[UNIT_PAGE_READ] = sat_add(
-                    index_store.node_count() as i64,
-                    sat_mul(estimate.rows, table_store.height() as i64),
-                );
-            }
+        if index == 0
+            && bound.is_none()
+            && let Some(order) = &sp.phys.index_order
+        {
+            let table_store = self.store_scoped(rel.db.as_deref(), &rel.table_name);
+            let index_store = self.index_store_scoped(rel.db.as_deref(), &order.name_key);
+            estimate.units[UNIT_PAGE_READ] = sat_add(
+                index_store.node_count() as i64,
+                sat_mul(estimate.rows, table_store.height() as i64),
+            );
         }
         // A pushed WHERE filter (planner.md §3.2) runs on every row the access path delivers. Its
         // logical selectivity applies once to the relation's logical population; the delivered rows
@@ -717,30 +718,30 @@ impl Engine {
         root.rows = rows;
         root.logical_rows = logical_rows;
         let mut invocations = physical_pairs;
-        if n == 2 {
-            if let Some(hash) = &sp.phys.hash_join {
-                let (build_bytes, probe_bytes, framed_bytes) =
-                    hash.keys
-                        .iter()
-                        .fold((0, 0, 0), |(build, probe, framed), key| {
-                            let build_width = self.estimate_hash_width(sp, key.right, &key.ty);
-                            let probe_width = self.estimate_hash_width(sp, key.left, &key.ty);
-                            (
-                                sat_add(build, build_width),
-                                sat_add(probe, probe_width),
-                                sat_add(framed, sat_add(4, build_width.min(probe_width))),
-                            )
-                        });
-                root.add_unit(UNIT_HASH_BUILD, sat_mul(right.root.rows, build_bytes));
-                root.add_unit(
-                    UNIT_HASH_PROBE,
-                    sat_add(
-                        sat_mul(left.root.rows, probe_bytes),
-                        sat_mul(rows, framed_bytes),
-                    ),
-                );
-                invocations = rows;
-            }
+        if n == 2
+            && let Some(hash) = &sp.phys.hash_join
+        {
+            let (build_bytes, probe_bytes, framed_bytes) =
+                hash.keys
+                    .iter()
+                    .fold((0, 0, 0), |(build, probe, framed), key| {
+                        let build_width = self.estimate_hash_width(sp, key.right, &key.ty);
+                        let probe_width = self.estimate_hash_width(sp, key.left, &key.ty);
+                        (
+                            sat_add(build, build_width),
+                            sat_add(probe, probe_width),
+                            sat_add(framed, sat_add(4, build_width.min(probe_width))),
+                        )
+                    });
+            root.add_unit(UNIT_HASH_BUILD, sat_mul(right.root.rows, build_bytes));
+            root.add_unit(
+                UNIT_HASH_PROBE,
+                sat_add(
+                    sat_mul(left.root.rows, probe_bytes),
+                    sat_mul(rows, framed_bytes),
+                ),
+            );
+            invocations = rows;
         }
         self.add_join_on_units(&mut root, on.as_ref(), invocations, ctx);
         EstimatedPlan::parent(root, &[&left, &right])
@@ -803,21 +804,22 @@ impl Engine {
 
         let mut outer_calls = outer.root.rows;
         let mut delivered_rows = full_rows;
-        if n == sp.rels.len() && sp.phys.join_pk_ordered {
-            if let Some(limit) = sp.limit {
-                let target = sat_add(limit, sp.offset.unwrap_or(0));
-                let post_filter_rows = sp.post_join_filter().map_or(full_rows, |filter| {
-                    estimate_rows(&self.estimate_chain_selectivity(sp, &filter), full_rows)
-                });
-                if target == 0 {
-                    outer_calls = 0;
-                    delivered_rows = 0;
-                } else if post_filter_rows > target && full_rows > 0 {
-                    outer_calls = ceil_estimate_mul_div(target, outer.root.rows, post_filter_rows)
-                        .min(outer.root.rows);
-                    delivered_rows = ceil_estimate_mul_div(outer_calls, full_rows, outer.root.rows)
-                        .min(full_rows);
-                }
+        if n == sp.rels.len()
+            && sp.phys.join_pk_ordered
+            && let Some(limit) = sp.limit
+        {
+            let target = sat_add(limit, sp.offset.unwrap_or(0));
+            let post_filter_rows = sp.post_join_filter().map_or(full_rows, |filter| {
+                estimate_rows(&self.estimate_chain_selectivity(sp, &filter), full_rows)
+            });
+            if target == 0 {
+                outer_calls = 0;
+                delivered_rows = 0;
+            } else if post_filter_rows > target && full_rows > 0 {
+                outer_calls = ceil_estimate_mul_div(target, outer.root.rows, post_filter_rows)
+                    .min(outer.root.rows);
+                delivered_rows =
+                    ceil_estimate_mul_div(outer_calls, full_rows, outer.root.rows).min(full_rows);
             }
         }
 
@@ -923,21 +925,21 @@ impl Engine {
 
         let mut outer_calls = outer.root.rows;
         let mut delivered_rows = full_rows;
-        if sp.phys.join_pk_ordered {
-            if let Some(limit) = sp.limit {
-                let target = sat_add(limit, sp.offset.unwrap_or(0));
-                let post_filter_rows = sp.post_join_filter().map_or(full_rows, |filter| {
-                    estimate_rows(&self.estimate_chain_selectivity(sp, &filter), full_rows)
-                });
-                if target == 0 {
-                    outer_calls = 0;
-                    delivered_rows = 0;
-                } else if post_filter_rows > target && full_rows > 0 {
-                    outer_calls = ceil_estimate_mul_div(target, outer.root.rows, post_filter_rows)
-                        .min(outer.root.rows);
-                    delivered_rows = ceil_estimate_mul_div(outer_calls, full_rows, outer.root.rows)
-                        .min(full_rows);
-                }
+        if sp.phys.join_pk_ordered
+            && let Some(limit) = sp.limit
+        {
+            let target = sat_add(limit, sp.offset.unwrap_or(0));
+            let post_filter_rows = sp.post_join_filter().map_or(full_rows, |filter| {
+                estimate_rows(&self.estimate_chain_selectivity(sp, &filter), full_rows)
+            });
+            if target == 0 {
+                outer_calls = 0;
+                delivered_rows = 0;
+            } else if post_filter_rows > target && full_rows > 0 {
+                outer_calls = ceil_estimate_mul_div(target, outer.root.rows, post_filter_rows)
+                    .min(outer.root.rows);
+                delivered_rows =
+                    ceil_estimate_mul_div(outer_calls, full_rows, outer.root.rows).min(full_rows);
             }
         }
 
@@ -1000,23 +1002,22 @@ impl Engine {
         } else {
             self.estimate_join_tree(sp, sp.rels.len(), ctx)
         };
-        if let Some(limit) = sp.limit {
-            if !sp.distinct
-                && sp.distinct_on == 0
-                && (streaming_scan_eligible(sp)
-                    || sp.phys.index_order.is_some()
-                    || self.window_top_n_eligible(sp))
-            {
-                let target = sat_add(limit, sp.offset.unwrap_or(0));
-                let cap = sp.filter.get().map_or(target, |filter| {
-                    required_estimate_input(
-                        &self.estimate_predicate_selectivity_with_statistics(sp, Some(filter)),
-                        target,
-                        plan.root.rows,
-                    )
-                });
-                self.cap_streaming_scan_estimate(&mut plan, sp, cap);
-            }
+        if let Some(limit) = sp.limit
+            && !sp.distinct
+            && sp.distinct_on == 0
+            && (streaming_scan_eligible(sp)
+                || sp.phys.index_order.is_some()
+                || self.window_top_n_eligible(sp))
+        {
+            let target = sat_add(limit, sp.offset.unwrap_or(0));
+            let cap = sp.filter.get().map_or(target, |filter| {
+                required_estimate_input(
+                    &self.estimate_predicate_selectivity_with_statistics(sp, Some(filter)),
+                    target,
+                    plan.root.rows,
+                )
+            });
+            self.cap_streaming_scan_estimate(&mut plan, sp, cap);
         }
 
         if let Some(filter) = sp.post_join_filter() {

@@ -590,32 +590,19 @@ impl Engine {
         // An in-memory database has no paging context — a no-op success (the committed swap happens
         // in `commit_tx` after this returns Ok). Compute the dirty-page set + meta before locking the
         // pager (so `self.free_pages`/`page_size`/`page_count` are read first).
-        if self.paging.is_none() {
+        let Some(paging) = self.paging.clone() else {
             return Ok(());
-        }
-        self.paging
-            .as_ref()
-            .expect("paging present")
-            .pager()
-            .check_commit()?;
+        };
+        paging.pager().check_commit()?;
         let ps = self.page_size as usize;
         let free = self.free_pages.clone();
         // A bare single-handle engine has no cross-session reader registry (oldest_live == committed), so
         // reuse is always safe (transactions.md §8): the shared-core path is the one that gates reuse.
-        let write = snap.incremental_image(
-            self.page_size,
-            self.page_count,
-            &free,
-            true,
-            self.paging.as_deref(),
-        )?;
+        let write =
+            snap.incremental_image(self.page_size, self.page_count, &free, true, Some(&*paging))?;
         // The live-page count this commit publishes (spec/design/memory.md §8.7): `self.committed`
         // is still the previous snapshot here.
-        let live = self.live.after(
-            &write,
-            &self.committed,
-            self.paging.as_deref().expect("paging present"),
-        )?;
+        let live = self.live.after(&write, &self.committed, &paging)?;
         // v25: write the dirty tree + catalog first (unsynced), so the in-commit reachability walk can
         // read the new catalog back through the pager (read-your-writes) — the free-list persisted this
         // commit thus reclaims this commit's fresh orphans (`plan_free_list`); a short open→commit→close
@@ -625,12 +612,7 @@ impl Engine {
         // durable commit after open syncs the directory once (validated-cow.md §3).
         if !self.dir_synced {
             self.dir_synced = true;
-            let skips_sync = self
-                .paging
-                .as_ref()
-                .expect("paging present")
-                .pager()
-                .skips_sync();
+            let skips_sync = paging.pager().skips_sync();
             if let (false, Some(path)) = (skips_sync, &self.path) {
                 let files = crate::filehost::OsFileHost;
                 if let Ok(real) = files.real_path(path)
@@ -641,7 +623,6 @@ impl Engine {
             }
         }
         {
-            let paging = self.paging.as_ref().expect("paging present");
             let mut pager = paging.pager();
             pager.begin_commit()?;
             pager.reserve(write.page_count)?;
@@ -652,7 +633,6 @@ impl Engine {
         // Watermark-gated by this handle's live streaming cursors; periodic (~2×-live) inside
         // `plan_free_list`. A file is never reopened concurrently by this bare-`Engine` handle.
         let can_reclaim = self.open_streams.load(std::sync::atomic::Ordering::Relaxed) == 0;
-        let paging = self.paging.clone().expect("paging present");
         let plan = crate::format::plan_free_list(
             snap,
             &paging,
@@ -844,10 +824,8 @@ pub(crate) fn rewrite_file(
         return Err(error);
     }
     old.pager().poison();
-    if !no_sync {
-        if let Some(dir) = path.parent() {
-            files.sync_dir(dir);
-        }
+    if !no_sync && let Some(dir) = path.parent() {
+        files.sync_dir(dir);
     }
     let mut pager = Pager::from_store(files.open_store(&path, no_sync, false)?)?;
     if codec.is_some() {

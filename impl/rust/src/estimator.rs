@@ -45,11 +45,11 @@ pub(crate) fn or_selectivities(mut parts: Vec<Selectivity>) -> Selectivity {
 }
 
 pub(crate) fn sat_add(a: i64, b: i64) -> i64 {
-    a.saturating_add(b).min(MAX_ESTIMATE)
+    a.saturating_add(b)
 }
 
 pub(crate) fn sat_mul(a: i64, b: i64) -> i64 {
-    a.saturating_mul(b).min(MAX_ESTIMATE)
+    a.saturating_mul(b)
 }
 
 /// `ceil(n * numerator / denominator)` without a wider intermediate.

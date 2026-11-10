@@ -664,17 +664,16 @@ impl Engine {
         let mut layer = Some(&vw.top);
         while let Some(l) = layer {
             if let Some(view) = &l.view {
-                if l.check.is_some() || cascaded {
-                    if let Some(filter) = &l.filter {
-                        let below = l
-                            .below
-                            .as_deref()
-                            .expect("a view layer reads a level below");
-                        let lscope = Scope::layer_body(self, table, 0, &l.below_label, below);
-                        let node =
-                            resolve_boolean_filter(&lscope, filter, &mut ParamTypes::default())?;
-                        out.push((view.clone(), node));
-                    }
+                if (l.check.is_some() || cascaded)
+                    && let Some(filter) = &l.filter
+                {
+                    let below = l
+                        .below
+                        .as_deref()
+                        .expect("a view layer reads a level below");
+                    let lscope = Scope::layer_body(self, table, 0, &l.below_label, below);
+                    let node = resolve_boolean_filter(&lscope, filter, &mut ParamTypes::default())?;
+                    out.push((view.clone(), node));
                 }
                 cascaded |= l.check == Some(CheckOption::Cascaded);
             }

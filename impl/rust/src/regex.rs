@@ -1558,7 +1558,7 @@ impl Program {
     fn for_each_piece(&self, repl: &[char], caps: &Captures, mut f: impl FnMut(Piece)) {
         // An unset (`-1`) group expands to nothing.
         let span = |start: i64, end: i64| {
-            (start >= 0 && end >= 0).then(|| Piece::Span(start as usize, end as usize))
+            (start >= 0 && end >= 0).then_some(Piece::Span(start as usize, end as usize))
         };
         let mut i = 0;
         while i < repl.len() {
@@ -1567,10 +1567,10 @@ impl Program {
                 let n = repl[i + 1];
                 if let Some(d) = n.to_digit(10).filter(|d| *d >= 1) {
                     let g = d as usize;
-                    if g <= self.ngroups {
-                        if let Some(p) = span(self.slot(caps, 2 * g), self.slot(caps, 2 * g + 1)) {
-                            f(p);
-                        }
+                    if g <= self.ngroups
+                        && let Some(p) = span(self.slot(caps, 2 * g), self.slot(caps, 2 * g + 1))
+                    {
+                        f(p);
                     }
                 } else if n == '&' {
                     if let Some(p) = span(self.slot(caps, 0), self.slot(caps, 1)) {

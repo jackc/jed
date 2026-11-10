@@ -147,17 +147,11 @@ impl Engine {
             return;
         }
 
-        #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-        enum Algorithm {
-            Inl,
-            Hash,
-            Nested,
-        }
         struct Candidate {
             order: [usize; 2],
             outer_identity: ScanCandidateIdentity,
             inner_identity: ScanCandidateIdentity,
-            algorithm: Algorithm,
+            algorithm: JoinSearchAlgorithm,
             outer_bound: Option<ScanBound>,
             inner_bound: Option<ScanBound>,
             inner_inl: Option<ScanBound>,
@@ -184,7 +178,7 @@ impl Engine {
                             order,
                             outer_identity: oc.identity.clone(),
                             inner_identity: ic.identity.clone(),
-                            algorithm: Algorithm::Hash,
+                            algorithm: JoinSearchAlgorithm::Hash,
                             outer_bound: None,
                             inner_bound: ic.bound.take(),
                             inner_inl: None,
@@ -204,7 +198,7 @@ impl Engine {
                         order,
                         outer_identity: oc.identity.clone(),
                         inner_identity: ic.identity,
-                        algorithm: Algorithm::Nested,
+                        algorithm: JoinSearchAlgorithm::Nested,
                         outer_bound: None,
                         inner_bound: ic.bound,
                         inner_inl: None,
@@ -221,7 +215,7 @@ impl Engine {
                         order,
                         outer_identity: oc.identity.clone(),
                         inner_identity: ic.identity,
-                        algorithm: Algorithm::Inl,
+                        algorithm: JoinSearchAlgorithm::Inl,
                         outer_bound: None,
                         inner_bound: None,
                         inner_inl: ic.bound,
@@ -239,20 +233,8 @@ impl Engine {
         candidates.sort_by(|a, b| {
             a.order
                 .cmp(&b.order)
-                .then_with(|| a.outer_identity.kind.cmp(&b.outer_identity.kind))
-                .then_with(|| {
-                    a.outer_identity
-                        .index_name
-                        .as_bytes()
-                        .cmp(b.outer_identity.index_name.as_bytes())
-                })
-                .then_with(|| a.inner_identity.kind.cmp(&b.inner_identity.kind))
-                .then_with(|| {
-                    a.inner_identity
-                        .index_name
-                        .as_bytes()
-                        .cmp(b.inner_identity.index_name.as_bytes())
-                })
+                .then_with(|| a.outer_identity.cmp(&b.outer_identity))
+                .then_with(|| a.inner_identity.cmp(&b.inner_identity))
                 .then_with(|| a.algorithm.cmp(&b.algorithm))
         });
 
@@ -271,7 +253,7 @@ impl Engine {
             plan.phys.rel_bounds[outer] = candidate.outer_bound.take();
             plan.phys.rel_bounds[inner] = candidate.inner_bound.take();
             plan.phys.rel_inl_bounds[inner] = candidate.inner_inl.take();
-            plan.phys.hash_join = matches!(candidate.algorithm, Algorithm::Hash)
+            plan.phys.hash_join = matches!(candidate.algorithm, JoinSearchAlgorithm::Hash)
                 .then(|| self.hash_join_plan_for(plan, scope, outer, inner))
                 .flatten();
             plan.phys.pk_ordered = false;
@@ -296,7 +278,7 @@ impl Engine {
             plan.phys.rel_bounds[outer] = selected.outer_bound.take();
             plan.phys.rel_bounds[inner] = selected.inner_bound.take();
             plan.phys.rel_inl_bounds[inner] = selected.inner_inl.take();
-            plan.phys.hash_join = matches!(selected.algorithm, Algorithm::Hash)
+            plan.phys.hash_join = matches!(selected.algorithm, JoinSearchAlgorithm::Hash)
                 .then(|| self.hash_join_plan_for(plan, scope, outer, inner))
                 .flatten();
         }
@@ -594,8 +576,7 @@ impl Engine {
             ) {
                 inl_choices.push((candidate.identity, None));
             }
-            inl_choices
-                .sort_by(|a, b| compare_scan_identity(&a.0, &b.0).then_with(|| a.1.cmp(&b.1)));
+            inl_choices.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
             inl_choices.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
             for (identity, on_index) in inl_choices {
                 let mut candidate = state.clone();
@@ -816,15 +797,6 @@ impl Engine {
     }
 }
 
-fn compare_scan_identity(
-    a: &ScanCandidateIdentity,
-    b: &ScanCandidateIdentity,
-) -> std::cmp::Ordering {
-    a.kind
-        .cmp(&b.kind)
-        .then_with(|| a.index_name.as_bytes().cmp(b.index_name.as_bytes()))
-}
-
 fn compare_nway_state(a: &JoinSearchState, b: &JoinSearchState) -> std::cmp::Ordering {
     a.order
         .cmp(&b.order)
@@ -833,7 +805,7 @@ fn compare_nway_state(a: &JoinSearchState, b: &JoinSearchState) -> std::cmp::Ord
                 .iter()
                 .zip(&b.access)
                 .find_map(|(left, right)| {
-                    let identity = compare_scan_identity(left.identity(), right.identity());
+                    let identity = left.identity().cmp(right.identity());
                     if identity != std::cmp::Ordering::Equal {
                         return Some(identity);
                     }
@@ -965,15 +937,14 @@ fn insert_nway_frontier(frontier: &mut Vec<JoinSearchState>, candidate: JoinSear
 }
 
 fn expression_relation_dependencies(plan: &SelectPlan, expr: &RExpr, present: &mut [bool]) {
-    if let RExpr::Column(index) = expr {
-        if let Some((ordinal, _)) = plan
+    if let RExpr::Column(index) = expr
+        && let Some((ordinal, _)) = plan
             .rels
             .iter()
             .enumerate()
             .find(|(_, rel)| *index >= rel.offset && *index < rel.offset + rel.col_count)
-        {
-            present[ordinal] = true;
-        }
+    {
+        present[ordinal] = true;
     }
     for child in estimator_expression_children(expr) {
         expression_relation_dependencies(plan, child, present);
@@ -1233,14 +1204,7 @@ impl Engine {
                 index_order: Some(order),
             });
         }
-        pipelines.sort_by(|a, b| {
-            a.identity.kind.cmp(&b.identity.kind).then_with(|| {
-                a.identity
-                    .index_name
-                    .as_bytes()
-                    .cmp(b.identity.index_name.as_bytes())
-            })
-        });
+        pipelines.sort_by(|a, b| a.identity.cmp(&b.identity));
 
         let mut winner: Option<(i64, PipelineCandidate)> = None;
         for mut candidate in pipelines {
@@ -1386,14 +1350,15 @@ impl Engine {
             || plan.has_window
             || plan.distinct
             || plan.order.is_empty()
-            || plan.limit.is_none()
             || plan.phys.pk_ordered
             || plan.phys.index_order.is_some()
             || plan.phys.join_pk_ordered
         {
             return;
         }
-        let limit = plan.limit.unwrap();
+        let Some(limit) = plan.limit else {
+            return;
+        };
         plan.phys.top_k = if limit == 0 {
             Some(0)
         } else {

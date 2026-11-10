@@ -447,6 +447,7 @@ impl<T: FromValue> FromValue for Option<T> {
 /// methods; `get::<T>(idx)` / `get_by_name::<T>(name)` convert a column via [`FromValue`], and
 /// `value(idx)` hands back the raw [`Value`]. The column names are shared (`Rc`) across every row of
 /// one result, so building a `Vec<Row>` does not clone the header per row.
+#[derive(Clone, Debug)]
 pub struct Row {
     names: Rc<[String]>,
     values: Vec<Value>,
@@ -519,7 +520,7 @@ fn run_with(q: impl FnOnce(&[Value]) -> Result<Rows>, params: impl Params) -> Re
 fn rows_with(q: impl FnOnce(&[Value]) -> Result<Rows>, params: impl Params) -> Result<Vec<Row>> {
     let values = params.into_values()?;
     let mut rows = q(&values)?;
-    let names: Rc<[String]> = Rc::from(rows.column_names().to_vec());
+    let names = rows.column_names_rc();
     let mut out = Vec::new();
     while let Some(values) = rows.next() {
         rows.admit_collected(&values)?;

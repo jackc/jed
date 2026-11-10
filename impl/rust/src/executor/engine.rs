@@ -118,7 +118,7 @@ impl Engine {
                 return;
             }
             None => "main".to_string(),
-            Some(s) if s == "temp" => {
+            Some("temp") => {
                 self.temp_working_mut().mark_statistics_stale(table);
                 return;
             }
@@ -339,7 +339,7 @@ impl Engine {
         let Some(q) = qualifier else {
             return Ok(());
         };
-        match q.to_string().as_str() {
+        match q {
             "temp" => {
                 if !self.is_temp_table(name) {
                     return Err(EngineError::new(
@@ -554,7 +554,7 @@ impl Engine {
     /// attachment registry would re-share it across sessions (what Slice 0 removed). So temp routes like
     /// an attachment here but keeps its own home.
     pub(crate) fn snap_for_scope(&self, scope: &str) -> Option<&Snapshot> {
-        match scope.to_string().as_str() {
+        match scope {
             "temp" => Some(self.temp_read_snap()),
             "main" => Some(self.read_snap()),
             other => self.attach_read_snap(other),
@@ -598,14 +598,12 @@ impl Engine {
     pub(crate) fn store_scoped(&self, scope: Option<&str>, name: &str) -> &TableStore {
         match scope {
             None => self.store(name),
-            Some(q) => match q.to_string().as_str() {
-                "temp" => self.temp_read_snap().store(name),
-                "main" => self.read_snap().store(name),
-                other => self
-                    .attach_read_snap(other)
-                    .expect("attachment resolved upstream")
-                    .store(name),
-            },
+            Some("temp") => self.temp_read_snap().store(name),
+            Some("main") => self.read_snap().store(name),
+            Some(other) => self
+                .attach_read_snap(other)
+                .expect("attachment resolved upstream")
+                .store(name),
         }
     }
 
@@ -615,14 +613,9 @@ impl Engine {
         let net = self.session.net_staging();
         let store = match scope {
             None => self.store_mut(name),
-            Some(q) => match q.to_string().as_str() {
-                "temp" => self.temp_working_mut().store_mut(name),
-                "main" => self.working_mut().store_mut(name),
-                other => {
-                    let other = other.to_string();
-                    self.attach_write_snap(&other).store_mut(name)
-                }
-            },
+            Some("temp") => self.temp_working_mut().store_mut(name),
+            Some("main") => self.working_mut().store_mut(name),
+            Some(other) => self.attach_write_snap(other).store_mut(name),
         };
         store.set_net_staging(net);
         store
@@ -633,14 +626,12 @@ impl Engine {
     pub(crate) fn index_store_scoped(&self, scope: Option<&str>, name_key: &str) -> &TableStore {
         match scope {
             None => self.index_store(name_key),
-            Some(q) => match q.to_string().as_str() {
-                "temp" => self.temp_read_snap().index_store(name_key),
-                "main" => self.read_snap().index_store(name_key),
-                other => self
-                    .attach_read_snap(other)
-                    .expect("attachment resolved upstream")
-                    .index_store(name_key),
-            },
+            Some("temp") => self.temp_read_snap().index_store(name_key),
+            Some("main") => self.read_snap().index_store(name_key),
+            Some(other) => self
+                .attach_read_snap(other)
+                .expect("attachment resolved upstream")
+                .index_store(name_key),
         }
     }
 
@@ -654,14 +645,9 @@ impl Engine {
         let net = self.session.net_staging();
         let store = match scope {
             None => self.index_store_mut(name_key),
-            Some(q) => match q.to_string().as_str() {
-                "temp" => self.temp_working_mut().index_store_mut(name_key),
-                "main" => self.working_mut().index_store_mut(name_key),
-                other => {
-                    let other = other.to_string();
-                    self.attach_write_snap(&other).index_store_mut(name_key)
-                }
-            },
+            Some("temp") => self.temp_working_mut().index_store_mut(name_key),
+            Some("main") => self.working_mut().index_store_mut(name_key),
+            Some(other) => self.attach_write_snap(other).index_store_mut(name_key),
         };
         store.set_net_staging(net);
         store

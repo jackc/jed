@@ -1318,7 +1318,7 @@ impl RExpr {
                 // §16) before matching — 1:1 folding so `_`/length semantics survive.
                 let matched = if *insensitive {
                     let prop = env.exec.session.env.property();
-                    let p_ref = prop.as_deref();
+                    let p_ref = prop;
                     let s = crate::collation::fold_lower_simple(s, p_ref);
                     let p = crate::collation::fold_lower_simple(p, p_ref);
                     like_match(&s, &p)?
@@ -1359,7 +1359,7 @@ impl RExpr {
                 };
                 let subj_folded;
                 let subj_chars: Vec<char> = if *insensitive {
-                    subj_folded = crate::collation::fold_lower_simple(s, prop.as_deref());
+                    subj_folded = crate::collation::fold_lower_simple(s, prop);
                     subj_folded.chars().collect()
                 } else {
                     s.chars().collect()
@@ -1379,7 +1379,7 @@ impl RExpr {
                         // Non-constant pattern: compile now (charging regex_compile) and run.
                         let pat_folded;
                         let pat_ref = if *insensitive {
-                            pat_folded = crate::regex::fold_pattern(p, prop.as_deref());
+                            pat_folded = crate::regex::fold_pattern(p, prop);
                             pat_folded.as_str()
                         } else {
                             p
@@ -1578,7 +1578,7 @@ impl RExpr {
                     None
                 };
                 let match_chars: Vec<char> = if insensitive {
-                    crate::collation::fold_lower_simple(&source, prop.as_deref())
+                    crate::collation::fold_lower_simple(&source, prop)
                         .chars()
                         .collect()
                 } else {
@@ -1598,7 +1598,7 @@ impl RExpr {
                     }
                     None => {
                         let pat = if insensitive {
-                            crate::regex::fold_pattern(&pattern, prop.as_deref())
+                            crate::regex::fold_pattern(&pattern, prop)
                         } else {
                             pattern.clone()
                         };
@@ -1710,11 +1710,7 @@ impl RExpr {
                     Value::Null => Ok(Value::Null),
                     Value::Text(s) => {
                         let prop = env.exec.session.env.property();
-                        Ok(Value::Text(crate::collation::fold_case(
-                            &s,
-                            *upper,
-                            prop.as_deref(),
-                        )))
+                        Ok(Value::Text(crate::collation::fold_case(&s, *upper, prop)))
                     }
                     _ => unreachable!("resolver restricts upper/lower to text operands"),
                 }
@@ -2145,11 +2141,7 @@ impl RExpr {
                     // round_to_scale(0) only drops the (already-zero) fraction. 22012 on a zero
                     // divisor (the a%b step traps, like the `%` operator). Integer operands promote.
                     ScalarFunc::Div => {
-                        let to_dec = |v: &Value| match v {
-                            Value::Int(n) => Decimal::from_i64(*n),
-                            Value::Decimal(d) => d.clone(),
-                            _ => unreachable!("resolver restricts div to integer/decimal operands"),
-                        };
+                        let to_dec = value_to_decimal;
                         let a = to_dec(&vals[0]);
                         let b = to_dec(&vals[1]);
                         let r = a.rem(&b)?;
@@ -2289,13 +2281,7 @@ impl RExpr {
                         Ok(Value::Float64(round_f64_places(f, places)))
                     }
                     ScalarFunc::Round => {
-                        let d = match &vals[0] {
-                            Value::Int(n) => Decimal::from_i64(*n),
-                            Value::Decimal(d) => d.clone(),
-                            _ => {
-                                unreachable!("resolver restricts round to numeric operands")
-                            }
-                        };
+                        let d = value_to_decimal(&vals[0]);
                         let places = match vals.get(1) {
                             None => 0,
                             Some(Value::Int(k)) => *k,
@@ -2309,27 +2295,15 @@ impl RExpr {
                     // round to scale 0 toward ±∞ (a round-up carry can trap 22003); trunc truncates
                     // toward zero to scale 0 or its `n`-place argument (never overflows).
                     ScalarFunc::Ceil if !matches!(&vals[0], Value::Float64(_)) => {
-                        let d = match &vals[0] {
-                            Value::Int(n) => Decimal::from_i64(*n),
-                            Value::Decimal(d) => d.clone(),
-                            _ => unreachable!("resolver restricts ceil to numeric operands"),
-                        };
+                        let d = value_to_decimal(&vals[0]);
                         Ok(Value::Decimal(d.ceil()?))
                     }
                     ScalarFunc::Floor if !matches!(&vals[0], Value::Float64(_)) => {
-                        let d = match &vals[0] {
-                            Value::Int(n) => Decimal::from_i64(*n),
-                            Value::Decimal(d) => d.clone(),
-                            _ => unreachable!("resolver restricts floor to numeric operands"),
-                        };
+                        let d = value_to_decimal(&vals[0]);
                         Ok(Value::Decimal(d.floor()?))
                     }
                     ScalarFunc::Trunc if !matches!(&vals[0], Value::Float64(_)) => {
-                        let d = match &vals[0] {
-                            Value::Int(n) => Decimal::from_i64(*n),
-                            Value::Decimal(d) => d.clone(),
-                            _ => unreachable!("resolver restricts trunc to numeric operands"),
-                        };
+                        let d = value_to_decimal(&vals[0]);
                         let places = match vals.get(1) {
                             None => 0,
                             Some(Value::Int(k)) => *k,
@@ -3460,7 +3434,7 @@ impl RExpr {
                         }
                     }
                     JsonBuildKind::Object => {
-                        if vals.len() % 2 != 0 {
+                        if !vals.len().is_multiple_of(2) {
                             return Err(EngineError::new(
                                 SqlState::InvalidParameterValue,
                                 "argument list must have even number of elements",

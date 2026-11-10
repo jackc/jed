@@ -75,7 +75,6 @@ impl Engine {
 
     /// Execute canonical logical intervals over the row's own B-tree. Storage keys are retained for
     /// mutation consumers, and each disjoint interval's page/slab block is summed.
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn pk_key_set_rows(
         &self,
         store: &TableStore,
@@ -84,17 +83,12 @@ impl Engine {
         outer: &[&[Value]],
         mask: &[bool],
         left: &[Value],
-        masked: bool,
     ) -> Result<(Vec<(Vec<u8>, Row)>, (usize, usize))> {
         let mut entries: Vec<(Vec<u8>, Row)> = Vec::new();
         let mut pages = 0usize;
         let mut slabs = 0usize;
         for b in ks.intervals(params, outer, left) {
-            let (es, p, s) = if masked {
-                store.range_scan_with_units(&b, mask)?
-            } else {
-                store.range_scan_with_units(&b, mask)?
-            };
+            let (es, p, s) = store.range_scan_with_units(&b, mask)?;
             entries.extend(es);
             pages += p;
             slabs += s;
@@ -194,7 +188,7 @@ impl Engine {
                 self.gist_bound_rows(table_name, gb, query, &[], env, meter, mask, false)?
             }
             Some(ScanBound::PkSet(ks)) => {
-                self.pk_key_set_rows(store, ks, params, env.outer, mask, &[], false)?
+                self.pk_key_set_rows(store, ks, params, env.outer, mask, &[])?
             }
             Some(ScanBound::IndexSet(ks)) => {
                 let (mut entries, units) =
@@ -226,7 +220,8 @@ impl Engine {
     /// `meter` directly. Degenerate constant queries (gin.md §6): a NULL `Q`, an `@>` whose `Q`
     /// holds a NULL element, an `&&` with no non-NULL term, and a NULL `= ANY` scalar are provably
     /// empty (read nothing); `@> '{}'` and array `=` with no non-NULL term fall back to the full scan.
-    /// Gather a GIN-bounded scan's candidate rows as `(storage_key, row)` pairs (the candidate
+    ///
+    /// Gathers the scan's scan's candidate rows as `(storage_key, row)` pairs (the candidate
     /// set *is* the storage keys), with the up-front `(page_read nodes, value_decompress slabs)`
     /// block. SELECT drops the keys; UPDATE/DELETE keep them to rewrite/remove the rows
     /// (gin.md §6). `gin_entry` is charged inside (during the gather); the caller charges the
@@ -244,7 +239,7 @@ impl Engine {
     ) -> Result<(Vec<(Vec<u8>, Row)>, (usize, usize))> {
         let store = self.store(table_name);
         // Extract the query's distinct terms. This (the opclass `extract_query_terms`) is a pure
-        // planning step, NOT metered (cost.md §3) — evaluate `Q` on a scratch meter. `Q` is a
+        // planning step, NOT metered (cost.md §3) — evaluate `Q` on a scratch meter.
         // `query_row` is empty for a constant bound and the combined left row for a sibling INL.
         let Some(query) = query else {
             return Ok((Vec::new(), (0, 0)));

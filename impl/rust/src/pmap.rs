@@ -657,6 +657,11 @@ fn build_leaf(
     }
 }
 
+/// An interior node's payload for these separators (format.md "Interior node"; encrypted.md §2).
+fn interior_payload(cap: Cap, keys: &[Vec<u8>]) -> usize {
+    cap.ptr() * (keys.len() + 1) + 4 * keys.len() + keys.iter().map(Vec::len).sum::<usize>()
+}
+
 /// Build an interior node from its parts; if its payload overflows `cap`, split it 2-way
 /// **push-up** (format.md "Interior split"): the left node keeps separators `[0, m)` + children
 /// `[0, m]`, separator `m` moves up, the right node keeps `[m+1, N)` + children `[m+1, N]`. With
@@ -664,11 +669,6 @@ fn build_leaf(
 /// legal `N = 0` right interior (the degenerate fan-out contract). Returns `None` when the node
 /// overflows and no valid split point exists — the caller (only the interior **merge** path can
 /// hit it) abandons the merge.
-/// An interior node's payload for these separators (format.md "Interior node"; encrypted.md §2).
-fn interior_payload(cap: Cap, keys: &[Vec<u8>]) -> usize {
-    cap.ptr() * (keys.len() + 1) + 4 * keys.len() + keys.iter().map(Vec::len).sum::<usize>()
-}
-
 fn build_interior(
     keys: Vec<Vec<u8>>,
     children: Vec<Child>,
@@ -937,8 +937,7 @@ impl PMap {
             // root hands the root down a level (height shrinks). The root is exempt from the
             // underfull rule, so no rebalance here. A root reached by a removal is decoded (a
             // dirty leaf or an interior), so `keys` is its true key list.
-            while self.root.as_ref().is_some_and(|n| n.len() == 0) {
-                let root = self.root.as_ref().unwrap();
+            while let Some(root) = self.root.as_ref().filter(|n| n.len() == 0) {
                 self.root = if root.is_leaf() {
                     None
                 } else {
@@ -1007,10 +1006,10 @@ impl PMap {
                 node.page_ref(),
             ))
         }
-        if let Some(root) = &self.root {
-            if let Some(rebuilt) = demote(root) {
-                self.root = Some(rebuilt);
-            }
+        if let Some(root) = &self.root
+            && let Some(rebuilt) = demote(root)
+        {
+            self.root = Some(rebuilt);
         }
     }
 

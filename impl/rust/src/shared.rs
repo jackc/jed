@@ -439,10 +439,6 @@ pub(crate) fn cap_flush(paging: &crate::paging::SharedPaging) -> Result<()> {
     result
 }
 
-/// The `max_storage_bytes` state of one domain (memory.md §8.1–§8.3, §8.7): the limit, plus what
-/// the last successful commit wrote, so a commit that would exceed the limit can first compact the
-/// committed snapshot (its catalog root and written pages — the latter cover a GiST R-tree, which
-/// [`crate::format::reachable_pages`] cannot see).
 /// The budget context of one in-memory domain's commit (memory.md §8.3): its name (for the `54P06`
 /// message), its committed snapshot (what a forced compaction rebuilds the free list from), and whether
 /// the reader watermark allows compacting that snapshot — no live reader pins an older version.
@@ -455,6 +451,10 @@ pub(crate) struct BudgetCtx<'a> {
     pub(crate) stages_rows: bool,
 }
 
+/// The `max_storage_bytes` state of one domain (memory.md §8.1–§8.3, §8.7): the limit, plus what
+/// the last successful commit wrote, so a commit that would exceed the limit can first compact the
+/// committed snapshot (its catalog root and written pages — the latter cover a GiST R-tree, which
+/// [`crate::format::reachable_pages`] cannot see).
 #[derive(Default)]
 struct StorageBudget {
     /// Positive: the limit in bytes over `page_count × page_size`. Zero or negative: unlimited.
@@ -648,13 +648,15 @@ impl Storage {
         // pages; within-session reclamation is the post-commit RAM rebuild (`maybe_compact`).
         let staged = self.stage_in_memory(snap, None, String::new())?;
         let bytes = staged.page_count as u64 * self.page_size as u64;
-        if !self.spilled && temp_buffers > 0 && bytes > temp_buffers as u64 {
-            if let Some(spill) = spill {
-                let store = crate::blockstore::ScratchBlockStore::create(spill.as_ref())?;
-                self.paging.pager().migrate_store(Box::new(store))?;
-                self.spilled = true;
-                TEMP_SPILLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
+        if !self.spilled
+            && temp_buffers > 0
+            && bytes > temp_buffers as u64
+            && let Some(spill) = spill
+        {
+            let store = crate::blockstore::ScratchBlockStore::create(spill.as_ref())?;
+            self.paging.pager().migrate_store(Box::new(store))?;
+            self.spilled = true;
+            TEMP_SPILLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         if self.spilled {
             let capacity = if temp_buffers == 0 {
@@ -1683,7 +1685,11 @@ impl Shared {
     }
 
     fn release_local_writer(&self) {
-        let mut active = self.writer_active.lock().expect("writer lock not poisoned");
+        // Reached from `Drop for Session`, so never panic on a poisoned lock (see `ReaderPin`).
+        let mut active = self
+            .writer_active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         *active = false;
         self.writer_free.notify_one();
     }
@@ -1920,7 +1926,7 @@ impl Shared {
         relaxed: bool,
     ) -> Result<bool> {
         let mut st = self.storage.lock().expect("storage lock not poisoned");
-        let mut began_empty = false;
+        let began_empty;
         let cap_reached = {
             let mut pager = st.paging.pager();
             // The slot not holding the floor (README.md §3.5). A synchronous client's commit keeps
@@ -2931,10 +2937,12 @@ struct ReaderPin {
 
 impl Drop for ReaderPin {
     fn drop(&mut self) {
+        // A destructor must not panic (a second panic while unwinding aborts the process), so a
+        // poisoned lock is entered anyway: deregistering a pin is safe on any registry state.
         self.shared
             .live
             .lock()
-            .expect("live lock not poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .deregister_in(self.generation, self.version);
     }
 }
@@ -3061,12 +3069,12 @@ impl Database {
         Database(shared)
     }
 
-    /// Build an **in-memory** shared core from an existing database image (the bytes a file-backed
-    /// commit would write). Lifts the reconstructed committed snapshot into the published roots with
-    /// no backing file (so a write republishes in memory, never persisting). Used by the conformance
-    /// harness's `# fixture:` path to run records against a pre-built on-disk state that SQL cannot
-    /// construct (the collation version-skew read-safety guard, collation.md §12).
-    /// Reconstruct an **in-memory** shared core from a database image (`XX001` on a malformed image).
+    /// Reconstruct an **in-memory** shared core from a database image — the bytes a file-backed
+    /// commit would write (`XX001` on a malformed image). A write republishes in memory and never
+    /// persists. The conformance harness's `# fixture:` path uses it to run records against a
+    /// pre-built on-disk state that SQL cannot construct (the collation version-skew read-safety
+    /// guard, collation.md §12).
+    ///
     /// The shared-core analogue of [`Engine::from_image`] — since B3 the image becomes the core's
     /// `MemoryBlockStore`, demand-paged like a file (one read path).
     ///
@@ -3101,7 +3109,7 @@ impl Database {
     pub fn deserialize(bytes: &[u8], opts: crate::file::DeserializeOptions) -> Result<Database> {
         let engine = match Engine::from_image_in(bytes, &opts.environment) {
             Ok(engine) => engine,
-            Err(e) if e.code() == SqlState::CredentialRequired.code() => {
+            Err(e) if e.state == SqlState::CredentialRequired => {
                 return Err(credential_without_file());
             }
             Err(e) => return Err(e),
@@ -4567,17 +4575,11 @@ impl Session {
         // resolution sees the snapshot the read will use. Reads only: transaction control must still
         // work in a failed block, and a write is gated inside dispatch on the fall-through below (the
         // safe-total-`query` contract, CLAUDE.md §13).
-        if !matches!(
-            ast,
-            Statement::Begin { .. }
-                | Statement::Commit
-                | Statement::Rollback
-                | Statement::Savepoint { .. }
-        ) && !self.engine.stmt_is_write_with_views(ast)
+        if !ast.is_transaction_control()
+            && !self.engine.stmt_is_write_with_views(ast)
+            && let Err(e) = self.engine.gate_read_lanes(ast)
         {
-            if let Err(e) = self.engine.gate_read_lanes(ast) {
-                return Err(self.engine.poison_on_lane_err(e));
-            }
+            return Err(self.engine.poison_on_lane_err(e));
         }
         // One plan-once scan lane serves streaming AND buffered; a prepared statement reuses its
         // cached plan (`cache`). Register the pinned snapshot version in the watermark (streaming.md
@@ -4849,10 +4851,11 @@ impl Session {
             self.gate_held = false;
         }
         if let Some(v) = self.pinned.take() {
+            // Reached from `Drop for Session`, so never panic on a poisoned lock (see `ReaderPin`).
             self.shared
                 .live
                 .lock()
-                .expect("live lock not poisoned")
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .deregister_in(self.pin_gen, v);
             drop(std::mem::take(&mut self.pin_atts)); // after main's pin
         }

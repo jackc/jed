@@ -373,10 +373,10 @@ pub fn offset_at(data: &TzData, instant_secs: i64) -> Offset {
     if instant_secs < data.trans[0] {
         return first_std_offset(data);
     }
-    if let Some(f) = &data.footer {
-        if instant_secs >= data.trans[n - 1] {
-            return eval_posix(f, instant_secs);
-        }
+    if let Some(f) = &data.footer
+        && instant_secs >= data.trans[n - 1]
+    {
+        return eval_posix(f, instant_secs);
     }
     // largest i with trans[i] <= instant_secs
     let i = data.trans.partition_point(|&t| t <= instant_secs) - 1;

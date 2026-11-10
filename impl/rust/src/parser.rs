@@ -510,13 +510,13 @@ impl Parser {
         self.parse_subquery()?;
         (self.into_ok, self.into_top, self.into_view) = (false, false, false);
         let end = self.pos;
-        if let Some((at, _)) = trailing {
-            if end != at {
-                return Err(syntax(format!(
-                    "unexpected trailing input: {:?}",
-                    self.peek()
-                )));
-            }
+        if let Some((at, _)) = trailing
+            && end != at
+        {
+            return Err(syntax(format!(
+                "unexpected trailing input: {:?}",
+                self.peek()
+            )));
         }
         if recursive && check_option.is_some() {
             return Err(EngineError::new(
@@ -1305,13 +1305,13 @@ impl Parser {
             self.tokens[at] = Token::Eof;
         }
         let query = self.parse_subquery()?;
-        if let Some((at, _)) = trailing {
-            if self.pos != at {
-                return Err(syntax(format!(
-                    "unexpected trailing input: {:?}",
-                    self.peek()
-                )));
-            }
+        if let Some((at, _)) = trailing
+            && self.pos != at
+        {
+            return Err(syntax(format!(
+                "unexpected trailing input: {:?}",
+                self.peek()
+            )));
         }
         Ok(CreateTable {
             name,
@@ -3155,13 +3155,12 @@ impl Parser {
             other => return Err(syntax(format!("expected an integer, found {other:?}"))),
         };
         let v: i128 = if neg { -(m as i128) } else { m as i128 };
-        if v < i64::MIN as i128 || v > i64::MAX as i128 {
-            return Err(EngineError::new(
+        i64::try_from(v).map_err(|_| {
+            EngineError::new(
                 SqlState::NumericValueOutOfRange,
                 "sequence parameter out of i64 range".to_string(),
-            ));
-        }
-        Ok(v as i64)
+            )
+        })
     }
 
     /// `INSERT INTO <table> [( <col> [, <col>]* )] ( VALUES <row> [, <row>]* | <select> )`. The
@@ -4258,10 +4257,8 @@ impl Parser {
             Token::QuotedIdent(_) => true,
             _ => false,
         };
-        if is_base {
-            if let Token::Word(w) | Token::QuotedIdent(w) = self.advance() {
-                return Some(w);
-            }
+        if is_base && let Token::Word(w) | Token::QuotedIdent(w) = self.advance() {
+            return Some(w);
         }
         None
     }
@@ -4776,10 +4773,11 @@ impl Parser {
             None
         };
         // An unaliased join keeps its inner relation labels visible to the enclosing query.
-        if join_group && alias.is_none() {
-            if let Some(QueryExpr::Select(sel)) = subquery.as_deref_mut() {
-                sel.join_group = true;
-            }
+        if join_group
+            && alias.is_none()
+            && let Some(QueryExpr::Select(sel)) = subquery.as_deref_mut()
+        {
+            sel.join_group = true;
         }
         Ok(TableRef {
             name: alias.clone().unwrap_or_default(),
@@ -6044,10 +6042,10 @@ impl Parser {
                     });
                 }
                 self.expect_keyword("null")?;
-                return Ok(Expr::IsNull {
+                Ok(Expr::IsNull {
                     operand: Box::new(lhs),
                     negated,
-                });
+                })
             });
         }
         // `NOT`? (`IN` (...) | `BETWEEN` lo `AND` hi) — a `NOT` here is consumed only when
@@ -6101,12 +6099,12 @@ impl Parser {
                     }
                 }
                 self.expect(&Token::RParen)?;
-                return Ok(Expr::In {
+                Ok(Expr::In {
                     lhs: Box::new(lhs),
                     list,
                     negated,
                     pos: op_pos,
-                });
+                })
             });
         }
         if self.peek_keyword().as_deref() == Some("between") {
@@ -6119,13 +6117,13 @@ impl Parser {
                 let lo = self.parse_concat()?;
                 self.expect_keyword("and")?;
                 let hi = self.parse_concat()?;
-                return Ok(Expr::Between {
+                Ok(Expr::Between {
                     lhs: Box::new(lhs),
                     lo: Box::new(lo),
                     hi: Box::new(hi),
                     negated,
                     pos: op_pos,
-                });
+                })
             });
         }
         // LIKE / ILIKE (case-insensitive) — grammar.md §22. Both bind at the comparison level; the
@@ -6156,13 +6154,13 @@ impl Parser {
                         pos: like_pos,
                     };
                 }
-                return Ok(Expr::Like {
+                Ok(Expr::Like {
                     lhs: Box::new(lhs),
                     rhs: Box::new(rhs),
                     negated,
                     insensitive,
                     pos: op_pos,
-                });
+                })
             });
         }
         // `[NOT] SIMILAR TO p [ESCAPE e]` (grammar.md §22c) desugars, as in PostgreSQL, to
@@ -6194,14 +6192,14 @@ impl Parser {
                     agg_order: None,
                     pos: similar_pos,
                 };
-                return Ok(Expr::Regex {
+                Ok(Expr::Regex {
                     lhs: Box::new(lhs),
                     rhs: Box::new(rhs),
                     negated,
                     insensitive: false,
                     similar: true,
                     pos: op_pos,
-                });
+                })
             });
         }
         // `~` / `~*` / `!~` / `!~*` — regular-expression match (grammar.md §22b, regex.md). These are
@@ -6219,14 +6217,14 @@ impl Parser {
             return outline(|| {
                 self.advance();
                 let rhs = self.parse_concat()?;
-                return Ok(Expr::Regex {
+                Ok(Expr::Regex {
                     lhs: Box::new(lhs),
                     rhs: Box::new(rhs),
                     negated: rx_negated,
                     insensitive: rx_insensitive,
                     similar: false,
                     pos: op_pos,
-                });
+                })
             });
         }
         let op = match self.peek() {
@@ -6492,13 +6490,12 @@ impl Parser {
         // the integer fold). Decimal negation never overflows. Same `::` suppression.
         if matches!(self.peek(), Token::Decimal(..))
             && self.tokens.get(self.pos + 1) != Some(&Token::DoubleColon)
+            && let Token::Decimal(digits, scale) = self.advance()
         {
-            if let Token::Decimal(digits, scale) = self.advance() {
-                return Ok(Expr::Literal(
-                    Literal::Decimal(Decimal::from_digits_scale(true, &digits, scale)),
-                    minus,
-                ));
-            }
+            return Ok(Expr::Literal(
+                Literal::Decimal(Decimal::from_digits_scale(true, &digits, scale)),
+                minus,
+            ));
         }
         // each chained unary `-` is one more AST level (recursion here, so the depth guard
         // also protects the parser's own stack against `- - - … x`).
@@ -6679,11 +6676,11 @@ impl Parser {
                 let qualifier = self.expect_identifier()?;
                 self.expect(&Token::Dot)?;
                 let name = self.expect_identifier()?;
-                return Ok(Expr::QualifiedColumn {
+                Ok(Expr::QualifiedColumn {
                     qualifier,
                     name,
                     pos,
-                });
+                })
             });
         }
         if matches!(self.peek(), Token::LParen) {
@@ -6713,7 +6710,7 @@ impl Parser {
                     return Ok(Expr::Row(fields, paren_pos));
                 }
                 self.expect(&Token::RParen)?;
-                return Ok(e);
+                Ok(e)
             });
         }
         // `EXISTS ( SELECT ... )` — the existence predicate (grammar.md §26). Recognized only when
@@ -6729,7 +6726,7 @@ impl Parser {
                 self.expect(&Token::LParen)?;
                 let q = self.parse_subquery()?;
                 self.expect(&Token::RParen)?;
-                return Ok(Expr::Exists(Box::new(q), pos));
+                Ok(Expr::Exists(Box::new(q), pos))
             });
         }
         if self.peek_keyword().as_deref() == Some("cast") {
@@ -6749,14 +6746,14 @@ impl Parser {
                     base_type
                 };
                 self.expect(&Token::RParen)?;
-                return Ok(Expr::Cast {
+                Ok(Expr::Cast {
                     inner: Box::new(inner),
                     type_name,
                     type_mod,
                     pos: cast_pos,
                     cast_pos,
                     type_pos,
-                });
+                })
             });
         }
         // `EXTRACT(field FROM source)` (grammar.md §50, timezones.md §9.2). Recognized only when
@@ -6789,11 +6786,11 @@ impl Parser {
                 self.expect_keyword("from")?;
                 let source = self.parse_expr()?;
                 self.expect(&Token::RParen)?;
-                return Ok(Expr::Extract {
+                Ok(Expr::Extract {
                     field: field.to_ascii_lowercase(),
                     source: Box::new(source),
                     pos,
-                });
+                })
             });
         }
         // `ROW(e1, e2, …)` composite constructor (spec/design/composite.md §1). Recognized when
@@ -6822,7 +6819,7 @@ impl Parser {
                 } else {
                     self.advance(); // the empty ROW() — consume ')'
                 }
-                return Ok(Expr::Row(fields, pos));
+                Ok(Expr::Row(fields, pos))
             });
         }
         // `ARRAY[e1, e2, …]` array constructor (spec/design/array.md §1). Recognized only when
@@ -6852,7 +6849,7 @@ impl Parser {
                 } else {
                     self.advance(); // the empty ARRAY[] — consume ']'
                 }
-                return Ok(Expr::Array(elems, pos));
+                Ok(Expr::Array(elems, pos))
             });
         }
         // A typed string literal `type '...'` (grammar.md §36) — PostgreSQL's `type 'string'`,
@@ -6944,11 +6941,11 @@ impl Parser {
                     _ => false,
                 };
                 self.expect(&Token::RParen)?;
-                return Ok(Expr::JsonCtor {
+                Ok(Expr::JsonCtor {
                     operand: Box::new(operand),
                     unique_keys,
                     pos,
-                });
+                })
             });
         }
         // The SQL/JSON query functions `JSON_EXISTS` / `JSON_VALUE` / `JSON_QUERY`
@@ -6983,7 +6980,7 @@ impl Parser {
                     self.advance(); // ,
                 }
                 self.expect(&Token::RParen)?;
-                return Ok(Expr::Coalesce(args, pos));
+                Ok(Expr::Coalesce(args, pos))
             });
         }
         // `GREATEST(a, b, …)` / `LEAST(a, b, …)` — the variadic max/min (grammar.md §52).
@@ -7015,11 +7012,11 @@ impl Parser {
                     self.advance(); // ,
                 }
                 self.expect(&Token::RParen)?;
-                return Ok(Expr::GreatestLeast {
+                Ok(Expr::GreatestLeast {
                     args,
                     greatest,
                     pos,
-                });
+                })
             });
         }
         // `NULLIF(a, b)` — NULL when `a = b`, else `a` (grammar.md §58). Recognized only when
@@ -7074,13 +7071,13 @@ impl Parser {
                     None
                 };
                 self.expect_keyword("end")?;
-                return Ok(Expr::Case {
+                Ok(Expr::Case {
                     operand,
                     whens,
                     els,
                     pos: case_pos,
                     when_pos,
-                });
+                })
             });
         }
         // The primary token's character position (spec/design/error-fields.md §10.2).

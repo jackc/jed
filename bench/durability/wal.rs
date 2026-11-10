@@ -113,8 +113,7 @@ fn frame_length(header: &[u8], remaining: usize) -> Option<usize> {
         return None;
     }
     let length = usize::try_from(u64_at(header, 8)).ok()?;
-    (length >= FRAME_ALIGNMENT
-        && length <= MAX_FRAME_BYTES
+    ((FRAME_ALIGNMENT..=MAX_FRAME_BYTES).contains(&length)
         && length <= remaining
         && length % FRAME_ALIGNMENT == 0)
         .then_some(length)
@@ -242,7 +241,8 @@ pub struct Journal {
 impl Journal {
     /// The region must already be durably allocated. Creation is outside timing.
     pub fn new(base: u64, capacity: usize, checkpoint_txid: u64) -> io::Result<Self> {
-        if base % FRAME_ALIGNMENT as u64 != 0 || capacity % FRAME_ALIGNMENT != 0 {
+        if !base.is_multiple_of(FRAME_ALIGNMENT as u64) || !capacity.is_multiple_of(FRAME_ALIGNMENT)
+        {
             return Err(invalid("journal region must be page aligned"));
         }
         base.checked_add(capacity as u64)

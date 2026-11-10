@@ -429,10 +429,9 @@ impl Engine {
             && meter.can_batch_costs()
             && self.explain_actual.borrow().is_none()
             && vectorized_project_eligible(plan)
+            && let Some(em) = self.project_columnar(plan, &env, params, outer, meter)?
         {
-            if let Some(em) = self.project_columnar(plan, &env, params, outer, meter)? {
-                return Ok(em);
-            }
+            return Ok(em);
         }
 
         if fast && self.blocking_spill_eligible(plan) {
@@ -746,15 +745,14 @@ impl Engine {
                         .join_steps
                         .last()
                         .is_some_and(|step| step.hash_join.is_some());
-                if let Some(profile) = self.explain_actual.borrow_mut().as_mut() {
-                    if select_actual_root_node(plan)
+                if let Some(profile) = self.explain_actual.borrow_mut().as_mut()
+                    && select_actual_root_node(plan)
                         != if is_hash { "Hash Join" } else { "Nested Loop" }
-                    {
-                        profile.record_parent(
-                            if is_hash { "Hash Join" } else { "Nested Loop" }.to_string(),
-                            meter.accrued,
-                        );
-                    }
+                {
+                    profile.record_parent(
+                        if is_hash { "Hash Join" } else { "Nested Loop" }.to_string(),
+                        meter.accrued,
+                    );
                 }
             }
 
@@ -778,10 +776,9 @@ impl Engine {
             }
             if filter.is_some()
                 && let Some(profile) = self.explain_actual.borrow_mut().as_mut()
+                && select_actual_root_node(plan) != "Filter"
             {
-                if select_actual_root_node(plan) != "Filter" {
-                    profile.record_parent("Filter".to_string(), meter.accrued);
-                }
+                profile.record_parent("Filter".to_string(), meter.accrued);
             }
 
             // WINDOW stage (spec/design/window.md §5.2): a blocking operator over the post-WHERE rows,
@@ -2037,7 +2034,7 @@ impl Engine {
             let ix = child
                 .indexes
                 .iter()
-                .find(|ix| ix.name.to_string() == *name)
+                .find(|ix| ix.name == *name)
                 .expect("the reverse-path index exists");
             for (i, key) in ix.keys.iter().enumerate().skip(path.cols.len()) {
                 let c = key

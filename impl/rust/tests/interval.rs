@@ -114,7 +114,7 @@ fn key_encoding_is_order_preserving() {
         iv(1200, 0, 0),       // 100 years
     ];
     let mut by_key = ordered;
-    by_key.sort_by(|a, b| a.encode_key().cmp(&b.encode_key()));
+    by_key.sort_by_key(|a| a.encode_key());
     let want: Vec<i128> = ordered.iter().map(|x| x.span()).collect();
     let got: Vec<i128> = by_key.iter().map(|x| x.span()).collect();
     assert_eq!(got, want, "encode_key order must equal span order");

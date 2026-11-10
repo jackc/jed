@@ -3312,13 +3312,11 @@ impl Parser<'_> {
         } else {
             self.i = save;
         }
-        if flags & REGEX_Q == 0 {
-            if flags & REGEX_X != 0 {
-                return Err(EngineError::new(
-                    SqlState::FeatureNotSupported,
-                    "XQuery \"x\" flag (expanded regular expressions) is not implemented",
-                ));
-            }
+        if flags & REGEX_Q == 0 && flags & REGEX_X != 0 {
+            return Err(EngineError::new(
+                SqlState::FeatureNotSupported,
+                "XQuery \"x\" flag (expanded regular expressions) is not implemented",
+            ));
         }
         let program = compile_like_regex(&pattern, flags, self.casing)?;
         self.regex_insts += program.ninst() as i64;

@@ -48,7 +48,7 @@ fn sort_host_deps(deps: &mut [HostFuncDep]) {
                 .collect::<Vec<u8>>(),
         )
     };
-    deps.sort_by_key(dep_sort_key);
+    deps.sort_by_cached_key(dep_sort_key);
 }
 
 /// The shared walk behind [`collect_index_host_deps`] / [`collect_check_host_deps`]: it admits each
@@ -108,18 +108,18 @@ fn verify_index_host_deps(
     reg: &crate::extension::ExtensionRegistry,
     deps: &[HostFuncDep],
 ) -> Result<()> {
-    if let RExpr::HostFunc { id, name, .. } = node {
-        if !host_dep_matches(reg.function(*id), deps) {
-            return Err(EngineError::new(
-                // XX002 — the graded "a versioned dependency no longer matches" reopen verdict, shared
-                // with the collation version-skew case (extensibility.md §11/§15).
-                SqlState::CollationVersionMismatch,
-                format!(
-                    "index depends on host function {name} whose registered component/version no \
+    if let RExpr::HostFunc { id, name, .. } = node
+        && !host_dep_matches(reg.function(*id), deps)
+    {
+        return Err(EngineError::new(
+            // XX002 — the graded "a versioned dependency no longer matches" reopen verdict, shared
+            // with the collation version-skew case (extensibility.md §11/§15).
+            SqlState::CollationVersionMismatch,
+            format!(
+                "index depends on host function {name} whose registered component/version no \
                      longer matches the file; the index is unusable until it is rebuilt"
-                ),
-            ));
-        }
+            ),
+        ));
     }
     for child in estimator_expression_children(node) {
         verify_index_host_deps(child, reg, deps)?;
@@ -169,16 +169,16 @@ fn verify_check_host_deps(
     reg: &crate::extension::ExtensionRegistry,
     deps: &[HostFuncDep],
 ) -> Result<()> {
-    if let RExpr::HostFunc { id, name, .. } = node {
-        if !host_dep_matches(reg.function(*id), deps) {
-            return Err(EngineError::new(
-                SqlState::CollationVersionMismatch,
-                format!(
-                    "check constraint {check_name} depends on host function {name} whose registered \
+    if let RExpr::HostFunc { id, name, .. } = node
+        && !host_dep_matches(reg.function(*id), deps)
+    {
+        return Err(EngineError::new(
+            SqlState::CollationVersionMismatch,
+            format!(
+                "check constraint {check_name} depends on host function {name} whose registered \
                      component/version no longer matches the file; the constraint must be re-added"
-                ),
-            ));
-        }
+            ),
+        ));
     }
     for child in estimator_expression_children(node) {
         verify_check_host_deps(check_name, child, reg, deps)?;
@@ -216,8 +216,6 @@ fn check_fk_persistence(child_temp: bool, parent_temp: bool) -> Result<()> {
     Ok(())
 }
 
-/// The error for a FOREIGN KEY parent that is not a table of the parent's database: a view is the
-/// wrong object kind (42809, views.md §2); any other name is missing (42P01).
 /// Whether a REFERENCES database qualifier names the child's own domain — the condition under
 /// which a parent spelled with the child's name is a self-reference (bare, or `temp.` for a temp
 /// child, `main.` for a persistent one; an attachment never is).
@@ -271,6 +269,8 @@ impl Engine {
     }
 }
 
+/// The error for a FOREIGN KEY parent that is not a table of the parent's database: a view is the
+/// wrong object kind (42809, views.md §2); any other name is missing (42P01).
 fn fk_parent_missing(snap: &Snapshot, name: &str) -> EngineError {
     if snap.view(name).is_some() {
         return EngineError::new(
@@ -625,7 +625,7 @@ impl Engine {
                             ),
                         ));
                     }
-                    Some(elem) if !is_gin_element_type(&elem) => {
+                    Some(elem) if !is_gin_element_type(elem) => {
                         return Err(EngineError::new(
                             SqlState::FeatureNotSupported,
                             format!(
@@ -904,7 +904,7 @@ impl Engine {
         let mut target_temp = ct.temp;
         let mut attach_name: Option<String> = None;
         if let Some(qual) = &ct.db {
-            match qual.to_string().as_str() {
+            match qual.as_str() {
                 "main" => {
                     if ct.temp {
                         return Err(EngineError::new(
@@ -2312,9 +2312,9 @@ impl Engine {
             }
             if working.indexes.iter().any(|i| i.name == name) {
                 true
-            } else if original.indexes.iter().any(|i| i.name == name) {
-                false
-            } else if dropped_sequences.contains(&name.to_string()) {
+            } else if original.indexes.iter().any(|i| i.name == name)
+                || dropped_sequences.contains(name)
+            {
                 false
             } else {
                 relation_taken(name)
@@ -2604,19 +2604,17 @@ impl Engine {
                             )
                             .hinted(error_hint::DROP_CASCADE));
                         }
-                        if cascade {
-                            if let ColumnSource::Original(old_ci) = column_sources[ci] {
-                                for (key, child) in snap.tables.iter() {
-                                    if key == &old_key {
-                                        continue;
-                                    }
-                                    for fk in &child.foreign_keys {
-                                        if fk.ref_table == original.name
-                                            && fk.ref_columns.contains(&old_ci)
-                                        {
-                                            cascade_dropped_column_fks
-                                                .insert((key.to_string(), fk.name.to_string()));
-                                        }
+                        if cascade && let ColumnSource::Original(old_ci) = column_sources[ci] {
+                            for (key, child) in snap.tables.iter() {
+                                if key == &old_key {
+                                    continue;
+                                }
+                                for fk in &child.foreign_keys {
+                                    if fk.ref_table == original.name
+                                        && fk.ref_columns.contains(&old_ci)
+                                    {
+                                        cascade_dropped_column_fks
+                                            .insert((key.to_string(), fk.name.to_string()));
                                     }
                                 }
                             }
@@ -2686,10 +2684,10 @@ impl Engine {
                         }
                         for ix in &mut table.indexes {
                             for key in &mut ix.keys {
-                                if let IndexKey::Column(c) = key {
-                                    if *c > ci {
-                                        *c -= 1;
-                                    }
+                                if let IndexKey::Column(c) = key
+                                    && *c > ci
+                                {
+                                    *c -= 1;
                                 }
                             }
                         }
@@ -3271,9 +3269,7 @@ impl Engine {
                                             && fk_cols == *old_cols
                                             && !cascade_dropped_column_fks
                                                 .contains(&(key.to_string(), fk.name.to_string()))
-                                            && !cascade_unique_cols
-                                                .iter()
-                                                .any(|prior| *prior == fk_cols)
+                                            && !cascade_unique_cols.contains(&fk_cols)
                                         {
                                             external_deps += 1;
                                         }
@@ -3996,11 +3992,12 @@ impl Engine {
         let mut mask = vec![false; original.columns.len()];
         let mut not_null_names = vec![None::<String>; original.columns.len()];
         for (i, source) in column_sources.iter().enumerate() {
-            if let ColumnSource::Original(old) = source {
-                if !original.columns[*old].not_null && table.columns[i].not_null {
-                    mask[*old] = true;
-                    not_null_names[*old] = Some(table.columns[i].name.clone());
-                }
+            if let ColumnSource::Original(old) = source
+                && !original.columns[*old].not_null
+                && table.columns[i].not_null
+            {
+                mask[*old] = true;
+                not_null_names[*old] = Some(table.columns[i].name.clone());
             }
         }
         if mask.iter().any(|x| *x) {
@@ -4028,7 +4025,7 @@ impl Engine {
             for ix in table
                 .indexes
                 .iter()
-                .filter(|ix| added_constraints.contains(&ix.name.to_string()))
+                .filter(|ix| added_constraints.contains(&ix.name))
             {
                 constraint_entries.insert(ix.name.to_string(), Vec::new());
             }
@@ -4097,32 +4094,32 @@ impl Engine {
                 for ix in table
                     .indexes
                     .iter()
-                    .filter(|i| added_constraints.contains(&i.name.to_string()))
+                    .filter(|i| added_constraints.contains(&i.name))
                 {
                     let ri = self.resolve_index(&table, ix)?;
-                    if ix.unique {
-                        if let Some(p) = self.index_prefix(&col_types, &colls, &ri, &row)? {
-                            let s = seen.entry(ix.name.to_string()).or_default();
-                            if !s.insert(p) {
-                                let env = EvalEnv {
-                                    exec: self,
-                                    params: &[],
-                                    outer: &[],
-                                    rng: &rng,
-                                    ctes: CteCtx::empty(),
-                                    host_batch: None,
-                                };
-                                return Err(EngineError::unique_violation(&table.name, &ix.name)
-                                    .with_detail(self.index_detail(
-                                        &table.name,
-                                        &table.columns,
-                                        ix,
-                                        &ri,
-                                        &row,
-                                        &env,
-                                        DUPLICATED,
-                                    )));
-                            }
+                    if ix.unique
+                        && let Some(p) = self.index_prefix(&col_types, &colls, &ri, &row)?
+                    {
+                        let s = seen.entry(ix.name.to_string()).or_default();
+                        if !s.insert(p) {
+                            let env = EvalEnv {
+                                exec: self,
+                                params: &[],
+                                outer: &[],
+                                rng: &rng,
+                                ctes: CteCtx::empty(),
+                                host_batch: None,
+                            };
+                            return Err(EngineError::unique_violation(&table.name, &ix.name)
+                                .with_detail(self.index_detail(
+                                    &table.name,
+                                    &table.columns,
+                                    ix,
+                                    &ri,
+                                    &row,
+                                    &env,
+                                    DUPLICATED,
+                                )));
                         }
                     }
                     constraint_entries
@@ -4145,7 +4142,7 @@ impl Engine {
             for fk in table
                 .foreign_keys
                 .iter()
-                .filter(|f| added_constraints.contains(&f.name.to_string()))
+                .filter(|f| added_constraints.contains(&f.name))
             {
                 let parent = if fk.ref_table == table.name {
                     &table
@@ -4167,11 +4164,10 @@ impl Engine {
                                 store.resolve_inline_columns(&mut candidate)?;
                                 if let Some(pp) =
                                     fk_probe(fk, parent, &pc, &candidate, &fk.ref_columns)?
+                                    && p.bytes() == pp.bytes()
                                 {
-                                    if p.bytes() == pp.bytes() {
-                                        found = true;
-                                        break;
-                                    }
+                                    found = true;
+                                    break;
                                 }
                             }
                             found
@@ -4198,7 +4194,7 @@ impl Engine {
             let validated: Vec<ExclusionConstraint> = table
                 .exclusions
                 .iter()
-                .filter(|e| added_constraints.contains(&e.name.to_string()))
+                .filter(|e| added_constraints.contains(&e.name))
                 .cloned()
                 .collect();
             for ex in &validated {
@@ -6028,7 +6024,7 @@ impl Engine {
                             self.index_detail(
                                 &table.name,
                                 &columns,
-                                &def,
+                                def,
                                 &rindex,
                                 &row,
                                 &env,

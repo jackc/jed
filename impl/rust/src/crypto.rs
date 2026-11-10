@@ -157,7 +157,7 @@ fn hkdf(ikm: &[u8], salt: &[u8], info: &str) -> [u8; 32] {
     out
 }
 
-/// The 8-byte AD prefix of every seal: `"JEDB" ‖ suite ‖ role ‖ u32 position` (encrypted.md §3).
+/// The 10-byte AD prefix of every seal: `"JEDB" ‖ suite ‖ role ‖ u32 position` (encrypted.md §3).
 fn ad_prefix(role: u8, position: u32) -> [u8; 10] {
     let mut ad = [0u8; 10];
     ad[..4].copy_from_slice(b"JEDB");

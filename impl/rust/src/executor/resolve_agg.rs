@@ -1221,9 +1221,9 @@ pub(crate) fn resolve_array_func(
 /// row whose `arg_families` mention `anyrange` (range-functions.md §1). Data-driven, so a new
 /// range-function row wires here without touching this gate.
 pub(crate) fn is_range_func_name(name: &str) -> bool {
-    OPERATORS.iter().any(|o| {
-        o.kind == "function" && o.name == name && o.arg_families.iter().any(|f| *f == "anyrange")
-    })
+    OPERATORS
+        .iter()
+        .any(|o| o.kind == "function" && o.name == name && o.arg_families.contains(&"anyrange"))
 }
 
 /// The kernel id for range accessor `name` (each is single-arity, so the name selects the kernel).
@@ -2129,7 +2129,7 @@ pub(crate) fn resolve_agg_order(
                 (RExpr::Column(i), RExpr::Column(j)) => i == j,
                 _ => false,
             };
-            if !args.iter().any(|a| *a == kexpr) && !arg_nodes.iter().any(same_column) {
+            if !args.contains(&kexpr) && !arg_nodes.iter().any(same_column) {
                 return Err(EngineError::new(
                     SqlState::InvalidColumnReference,
                     "in an aggregate with DISTINCT, ORDER BY expressions must appear in argument list",
@@ -2689,7 +2689,7 @@ pub(crate) fn is_aggregate_name(name: &str) -> bool {
 /// 2-argument aggregates are hand-resolved (the single-operand aggregate catalog can't express a
 /// key/value pair), like `jsonb_set` among the scalar functions. (json-sql-functions.md §4)
 pub(crate) fn object_agg_classify(name: &str) -> Option<(bool, bool)> {
-    match name.to_string().as_str() {
+    match name {
         "jsonb_object_agg" => Some((false, false)),
         "json_object_agg" => Some((true, false)),
         "jsonb_object_agg_unique" => Some((false, true)),

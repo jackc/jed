@@ -138,7 +138,7 @@ fn streaming_cursor_pins_its_snapshot_and_watermark() {
     let mut reader = db.session(SessionOptions::default());
     // Open a streaming cursor over the v1 snapshot but pull only ONE row (cursor stays live).
     let mut rows = reader.query("SELECT id FROM t ORDER BY id", &[]).unwrap();
-    let first = (&mut rows).next().unwrap();
+    let first = rows.next().unwrap();
     assert_eq!(first, vec![Value::Int(1)]);
     // The live cursor pins v1 in the watermark.
     assert_eq!(db.oldest_live_txid(), 1, "open cursor pins its version");
@@ -194,7 +194,7 @@ fn write_transaction_cursor_is_stable_across_later_inserts() {
         .unwrap();
 
     let mut pinned = writer.query("SELECT id FROM t ORDER BY id", &[]).unwrap();
-    assert_eq!((&mut pinned).next(), Some(vec![Value::Int(1)]));
+    assert_eq!(pinned.next(), Some(vec![Value::Int(1)]));
     for id in 5..=67 {
         writer
             .query_outcome(&format!("INSERT INTO t VALUES ({id}, {})", id * 10), &[])
@@ -299,7 +299,7 @@ fn bare_handle_query_pins_watermark_under_reclamation() {
     // Open a bare-handle streaming cursor (the transient session closes before `query` returns; the
     // pin rides the `Rows`) and pull ONE row so the scan is live mid-tree.
     let mut rows = db.query("SELECT id, v FROM t ORDER BY id", &[]).unwrap();
-    let first = (&mut rows).next().unwrap();
+    let first = rows.next().unwrap();
     assert_eq!(first, vec![Value::Int(1), Value::Int(10)]);
     assert_eq!(
         db.oldest_live_txid(),
@@ -413,7 +413,7 @@ fn buffered_cursor_pins_its_snapshot_and_watermark() {
     // A blocking query (ORDER BY v — not PK order) → the buffered cursor. Pull one row (this runs the
     // blocking part over the v1 snapshot), keep the cursor live.
     let mut rows = reader.query("SELECT v FROM t ORDER BY v", &[]).unwrap();
-    let first = (&mut rows).next().unwrap();
+    let first = rows.next().unwrap();
     assert_eq!(first, vec![Value::Int(10)]);
     assert_eq!(
         db.oldest_live_txid(),
@@ -681,7 +681,7 @@ fn deferred_runs_fully_on_first_pull() {
 
     // Pull just one row, then read the cost: the whole run already happened on that first pull.
     let mut rows = s.query(sql, &[]).unwrap();
-    let _first = (&mut rows).next().unwrap();
+    let _first = rows.next().unwrap();
     let after_one = rows.cost();
     rows.error().unwrap();
     assert_eq!(
@@ -707,7 +707,7 @@ fn deferred_cursor_pins_its_snapshot_and_watermark() {
             &[],
         )
         .unwrap();
-    let first = (&mut rows).next().unwrap();
+    let first = rows.next().unwrap();
     assert_eq!(first, vec![Value::Int(10)]);
     assert_eq!(
         db.oldest_live_txid(),
@@ -914,7 +914,7 @@ fn prepared_query_pins_its_snapshot_and_watermark() {
     let mut reader = db.session(SessionOptions::default());
     let stmt = reader.prepare("SELECT id FROM t ORDER BY id").unwrap();
     let mut rows = reader.query_prepared(&stmt, &[]).unwrap();
-    let first = (&mut rows).next().unwrap();
+    let first = rows.next().unwrap();
     assert_eq!(first, vec![Value::Int(1)]);
     assert_eq!(db.oldest_live_txid(), 1, "open prepared cursor pins v1");
 

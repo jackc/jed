@@ -25,7 +25,7 @@ enum Frame {
         types: Vec<Option<ColType>>,
     },
     Custom {
-        values: std::rc::Rc<Vec<Value>>,
+        values: Vec<Value>,
         /// A restarted statement adopts this frame at its own `begin` instead of probing again.
         adopt: bool,
     },
@@ -108,7 +108,7 @@ pub(crate) fn value_const(v: &Value) -> Option<RExpr> {
 
 fn custom_frame(bound: &[Value], adopt: bool) -> Frame {
     Frame::Custom {
-        values: std::rc::Rc::new(bound.to_vec()),
+        values: bound.to_vec(),
         adopt,
     }
 }
@@ -122,11 +122,11 @@ pub(crate) struct Planning {
 pub(crate) fn begin() -> Planning {
     FRAMES.with(|frames| {
         let mut frames = frames.borrow_mut();
-        if let Some(Frame::Custom { adopt, .. }) = frames.last_mut() {
-            if *adopt {
-                *adopt = false;
-                return Planning { depth: 0 };
-            }
+        if let Some(Frame::Custom { adopt, .. }) = frames.last_mut()
+            && *adopt
+        {
+            *adopt = false;
+            return Planning { depth: 0 };
         }
         frames.push(Frame::Probe {
             sensitive: false,

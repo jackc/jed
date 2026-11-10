@@ -73,7 +73,7 @@ fn explicit_transaction_on_a_session_persists_then_rolls_back() {
     let path = tmp("file_sessions_explicit_tx.jed");
     let _ = std::fs::remove_file(&path);
     {
-        let mut db = Database::create(CreateOptions {
+        let db = Database::create(CreateOptions {
             path: Some(std::path::PathBuf::from(&path)),
             skip_fsync: true,
             ..Default::default()

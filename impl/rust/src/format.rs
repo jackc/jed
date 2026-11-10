@@ -1926,7 +1926,7 @@ impl Snapshot {
                         )
                     })?
                 } else {
-                    let istore = self.index_store(&idx.name.to_string());
+                    let istore = self.index_store(&idx.name);
                     match istore.tree_root() {
                         Some(root) => serialize_node(root, istore, &mut next_index, &mut body)?,
                         None => PageRef::NONE,
@@ -2533,7 +2533,7 @@ impl Snapshot {
                         Ok(tag)
                     })?
                 } else {
-                    let istore = self.index_store(&idx.name.to_string());
+                    let istore = self.index_store(&idx.name);
                     match istore.tree_root() {
                         Some(root) => serialize_dirty(
                             root,
@@ -2923,7 +2923,7 @@ impl Engine {
                 .enumerate()
                 .filter_map(|(slot, b)| parse_meta(b).map(|m| (m, b, slot as u32)))
                 .collect();
-            candidates.sort_by(|a, b| b.0.txid.cmp(&a.0.txid));
+            candidates.sort_by_key(|c| std::cmp::Reverse(c.0.txid));
             let mut selected = None;
             let encrypted = paging.codec().is_some();
             for (mut m, bytes, slot) in candidates {
@@ -3125,13 +3125,13 @@ impl Engine {
                     types_checked = true;
                 }
                 for c in &table.columns {
-                    if let Some(r) = c.ty.composite_ref() {
-                        if snap.composite_type(&r.name).is_none() {
-                            return Err(corrupt(&format!(
-                                "table {} references unknown type {}",
-                                table.name, r.name
-                            )));
-                        }
+                    if let Some(r) = c.ty.composite_ref()
+                        && snap.composite_type(&r.name).is_none()
+                    {
+                        return Err(corrupt(&format!(
+                            "table {} references unknown type {}",
+                            table.name, r.name
+                        )));
                     }
                 }
                 if snap.table(&table.name).is_some() {
@@ -3943,7 +3943,7 @@ where
         .iter()
         .map(|&ci| crate::gist::opclass_for(&table.columns[ci].ty))
         .collect();
-    let istore = snap.index_store(&idx.name.to_string());
+    let istore = snap.index_store(&idx.name);
     let keys: Vec<Vec<u8>> = istore.iter_entries()?.into_iter().map(|(k, _)| k).collect();
     if keys.is_empty() {
         return Ok(PageRef::NONE);
@@ -4030,12 +4030,6 @@ fn take_bytes(buf: &[u8], pos: &mut usize, n: usize) -> Result<Vec<u8>> {
     Ok(v)
 }
 
-/// Encode a record (`key_len | key | each column value`), spilling over-large values out-of-line
-/// per the disposition plan (large-values.md §12). For each externalized value, allocate overflow
-/// page(s) via `take`, append them to `ovf`, and write a fixed `tag | first_page | len` pointer
-/// into the record instead of the inline body. `cap` is the page payload (the slab size + the
-/// spill-plan input). Shared by the whole-image (`serialize_node`) and incremental (`serialize_dirty`)
-/// writers, which differ only in how `take` allocates a page.
 /// Build a v24 **interior** node payload (spec/fileformat/format.md "Interior node"): `N+1` child
 /// pointers ‖ an `N`-entry end-offset separator directory ‖ the separator key blob. Record-free —
 /// no value codec, no overflow chains; a separator is raw order-preserving key bytes.
@@ -5263,7 +5257,7 @@ pub(crate) fn sim_selected_meta(paging: &SharedPaging) -> Result<SimMeta> {
         .iter()
         .filter_map(|b| parse_meta(b).map(|m| (m, b)))
         .collect();
-    candidates.sort_by(|a, b| b.0.txid.cmp(&a.0.txid));
+    candidates.sort_by_key(|c| std::cmp::Reverse(c.0.txid));
     for (m, bytes) in candidates {
         if let Some(protected) = pg.cached_validation(bytes) {
             let u32_at = |at: usize| u32::from_be_bytes(bytes[at..at + 4].try_into().unwrap());
@@ -5680,7 +5674,7 @@ fn select_meta(image: &[u8], ps: usize) -> Result<Meta> {
     let mut candidates: Vec<_> = (0..2)
         .filter_map(|slot| read_meta(image, ps, slot).map(|m| (m, slot)))
         .collect();
-    candidates.sort_by(|a, b| b.0.txid.cmp(&a.0.txid));
+    candidates.sort_by_key(|c| std::cmp::Reverse(c.0.txid));
     for (mut meta, slot) in candidates {
         if let Some(protected) = commit_manifest::validate(
             &image[slot * ps..(slot + 1) * ps],
@@ -5744,9 +5738,6 @@ fn page_block(image: &[u8], ps: usize, index: u32) -> Result<Vec<u8>> {
     Ok(image[off..off + ps].to_vec())
 }
 
-/// A validated PAX (column-major) leaf's page-backed directories (spec/fileformat/format.md v24
-/// "Leaf node"). All offsets index into the page payload; value bytes are read in place
-/// (`value_off`) so the lazy decoder's zero-copy form still references the shared page block.
 /// One leaf column region's parsed shape (v24 — spec/fileformat/format.md "Leaf node"), class-
 /// dependent: a fixed-width region is a null bitmap + dense untagged slots; a variable region is
 /// an end-offset value directory + tagged codec bytes (NULL = zero-length span).
@@ -5767,6 +5758,9 @@ enum RegionDir {
     },
 }
 
+/// A validated PAX (column-major) leaf's page-backed directories (spec/fileformat/format.md v24
+/// "Leaf node"). All offsets index into the page payload; value bytes are read in place
+/// (`value_off`) so the lazy decoder's zero-copy form still references the shared page block.
 struct PaxDirs {
     key_dir: usize,  // payload offset of the N-entry key end-offset directory (v24)
     key_blob: usize, // payload offset where the key blob starts
@@ -6124,9 +6118,6 @@ pub(crate) fn decode_leaf_node(
     Ok(Node::leaf_loaded_packed(packed, page))
 }
 
-/// Decode one catalog table entry: the `Table` (its pk list, checks, and index definitions
-/// included), its `root_data_page`, and each index's root page (parallel to
-/// `Table::indexes`).
 /// Serialize a composite-type catalog entry's BODY (after its `entry_kind = 1` byte): name,
 /// field count, then per field — name, type code, [type name when code 14 (nested composite), the
 /// element descriptor when code 15 (array) or 17 (range)], flags (bit0 `not_null`), [decimal
@@ -6799,6 +6790,9 @@ fn validate_loaded_references(snap: &Snapshot) -> Result<()> {
     Ok(())
 }
 
+/// Decode one catalog table entry: the `Table` (its pk list, checks, and index definitions
+/// included), its `root_data_page`, and each index's root page (parallel to
+/// `Table::indexes`).
 fn decode_table_entry(
     buf: &[u8],
     pos: &mut usize,
@@ -9182,7 +9176,6 @@ mod tests {
             ColType::Array(Box::new(ColType::Scalar(ScalarType::Int32))),
         ];
         let ps = 8192usize; // large page → every value stays inline-plain (no spill)
-        let cap = ps - PAGE_HEADER;
 
         let rows: Vec<Vec<Value>> = (0..3i64)
             .map(|i| {
@@ -9392,7 +9385,6 @@ mod tests {
             ColType::Scalar(ScalarType::Int64),
         ];
         let ps = 8192usize;
-        let cap = ps - PAGE_HEADER;
         let rows: Vec<Vec<Value>> = (0..4i64)
             .map(|i| {
                 vec![

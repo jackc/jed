@@ -105,12 +105,12 @@ pub fn compile_collation(name: &str, definition: &str) -> Result<Collation> {
         if let Some(rest) = line.strip_prefix('@') {
             // records: only @version is consumed; @implicitweights et al. are deferred (§1.1).
             let mut it = rest.split_whitespace();
-            if let Some(rec) = it.next() {
-                if rec == "version" {
-                    unicode_version = it.next().unwrap_or("").to_string();
-                }
-                // other records: ignored in slice 1b.
+            if let Some(rec) = it.next()
+                && rec == "version"
+            {
+                unicode_version = it.next().unwrap_or("").to_string();
             }
+            // other records: ignored in slice 1b.
             continue;
         }
         if line.starts_with('&') {
@@ -733,7 +733,7 @@ pub fn fold_case(s: &str, upper: bool, prop: Option<&PropertyTable>) -> String {
 /// length semantics are preserved (grammar.md §22). ASCII baseline when `prop` is `None`.
 pub fn fold_lower_simple(s: &str, prop: Option<&PropertyTable>) -> String {
     match prop {
-        None => s.chars().map(|c| c.to_ascii_lowercase()).collect(),
+        None => s.to_ascii_lowercase(),
         Some(p) => s
             .chars()
             .map(|c| match prop_lookup_simple(p, c as u32) {

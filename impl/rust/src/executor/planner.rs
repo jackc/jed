@@ -369,7 +369,6 @@ impl Engine {
                     })?;
                 } else if let Some(args) = &tref.args {
                     src = outline(|| -> Result<RelSrc> {
-                        let src: RelSrc;
                         // A table function (SRF) — implicitly lateral. At i>0 its args resolve against the
                         // prefix scope (a sibling column then correlates); at i==0 against `parent` (the
                         // enclosing query / params — functions.md §10), or inside a fenced parenthesized join
@@ -445,12 +444,11 @@ impl Engine {
                         srf_meta.push(Some((si, rargs, kind, None, String::new())));
                         derived_meta.push(None);
                         derived_plans.push(None);
-                        src = RelSrc::Synthetic(si);
+                        let src: RelSrc = RelSrc::Synthetic(si);
                         Ok(src)
                     })?;
                 } else if let Some(jt) = &tref.json_table {
                     src = outline(|| -> Result<RelSrc> {
-                        let src: RelSrc;
                         // A JSON_TABLE source (T1, json-table.md §3) — implicitly lateral like an SRF; its
                         // `ctx` resolves against the prefix scope (so `JSON_TABLE(sibling.doc, …)` works).
                         let scope_parent;
@@ -511,7 +509,7 @@ impl Engine {
                         )));
                         derived_meta.push(None);
                         derived_plans.push(None);
-                        src = RelSrc::Synthetic(si);
+                        let src: RelSrc = RelSrc::Synthetic(si);
                         Ok(src)
                     })?;
                 } else if tref.db.is_some() {
@@ -583,7 +581,6 @@ impl Engine {
                     })?;
                 } else {
                     src = outline(|| -> Result<RelSrc> {
-                        let src: RelSrc;
                         // A base table NAME — may resolve to a CTE, which SHADOWS a catalog table of the same
                         // name (cte.md §2; byte-exact). A CTE hit bumps the binding's reference count
                         // (the inline-vs-materialize decision — cost.md §3). A built-in catalog relation
@@ -593,20 +590,20 @@ impl Engine {
                         derived_meta.push(None);
                         derived_plans.push(None);
                         let lname = tref.name.to_string();
-                        src = match ctes.iter().rposition(|b| b.name == lname) {
+                        let src: RelSrc = match ctes.iter().rposition(|b| b.name == lname) {
                             Some(ci) => {
                                 // A data-modifying CTE with no RETURNING produces no columns, so a FROM
                                 // reference to it is 0A000 (writable-cte.md §5; PostgreSQL's
                                 // addRangeTableEntryForCTE check), raised at resolution before any execution.
-                                if let CteSource::Dml(dm) = &ctes[ci].source {
-                                    if dm.no_returning {
-                                        return Err(EngineError::new(
-                                            SqlState::FeatureNotSupported,
-                                            format!(
-                                                "WITH query {lname} does not have a RETURNING clause"
-                                            ),
-                                        ));
-                                    }
+                                if let CteSource::Dml(dm) = &ctes[ci].source
+                                    && dm.no_returning
+                                {
+                                    return Err(EngineError::new(
+                                        SqlState::FeatureNotSupported,
+                                        format!(
+                                            "WITH query {lname} does not have a RETURNING clause"
+                                        ),
+                                    ));
                                 }
                                 ctes[ci].refs.set(ctes[ci].refs.get() + 1);
                                 // A CTE inlined at its reference plans its body here, like a derived table
@@ -643,7 +640,7 @@ impl Engine {
                                         )?);
                                         RelSrc::CteRenamed(synthetic.len() - 1, ci)
                                     }
-                                    None => RelSrc::Cte(&*ctes[ci].table, ci),
+                                    None => RelSrc::Cte(&ctes[ci].table, ci),
                                 }
                             }
                             None => match catalog_rel_kind(&tref.name) {
@@ -1871,57 +1868,59 @@ impl Engine {
             // that STRUCTURALLY matches a select-list item. Otherwise 42P10 (matching PostgreSQL). Aliases
             // are invisible to ORDER BY (§8), so an aliased bare column still counts as projecting it. A
             // `SELECT DISTINCT *` projects every column, so the restriction never bites.
-            if sel.distinct && sel.distinct_on.is_empty() && !sel.order_by.is_empty() {
-                if let SelectItems::Items(items) = items_ref {
-                    let mut projected: HashSet<usize> = HashSet::new();
-                    for it in items {
-                        let idx = match &it.expr {
-                            Expr::Column(name, _) => match scope.resolve_bare(name) {
-                                Ok(Resolved::Local(i)) => Some(i),
-                                _ => None,
-                            },
-                            Expr::QualifiedColumn {
-                                qualifier, name, ..
-                            } => match scope.resolve_qualified(qualifier, name) {
-                                Ok(Resolved::Local(i)) => Some(i),
-                                _ => None,
-                            },
+            if sel.distinct
+                && sel.distinct_on.is_empty()
+                && !sel.order_by.is_empty()
+                && let SelectItems::Items(items) = items_ref
+            {
+                let mut projected: HashSet<usize> = HashSet::new();
+                for it in items {
+                    let idx = match &it.expr {
+                        Expr::Column(name, _) => match scope.resolve_bare(name) {
+                            Ok(Resolved::Local(i)) => Some(i),
                             _ => None,
-                        };
-                        if let Some(i) = idx {
-                            projected.insert(i);
-                        }
-                    }
-                    let in_list = |key: &OrderKey| -> bool {
-                        if key.ordinal.is_some() {
-                            return true;
-                        }
-                        if let Some(e) = &key.expr {
-                            return items.iter().any(|it| &it.expr == e);
-                        }
-                        // A bare name that binds an output column (an alias / derived name) names a
-                        // select-list item by definition, so it is projected (the alias form, §10). Any
-                        // ambiguity was already raised in the resolution loop above, so `Ok(Some(_))` is safe.
-                        if key.qualifier.is_none()
-                            && matches!(
-                                order_alias_match(items_ref, &key.column, &scope),
-                                Ok(Some(_))
-                            )
-                        {
-                            return true;
-                        }
-                        let r = match &key.qualifier {
-                            Some(q) => scope.resolve_qualified(q, &key.column),
-                            None => scope.resolve_bare(&key.column),
-                        };
-                        matches!(r, Ok(Resolved::Local(i)) if projected.contains(&i))
+                        },
+                        Expr::QualifiedColumn {
+                            qualifier, name, ..
+                        } => match scope.resolve_qualified(qualifier, name) {
+                            Ok(Resolved::Local(i)) => Some(i),
+                            _ => None,
+                        },
+                        _ => None,
                     };
-                    if !order_by_ref.iter().all(in_list) {
-                        return Err(EngineError::new(
-                            SqlState::InvalidColumnReference,
-                            "for SELECT DISTINCT, ORDER BY expressions must appear in select list",
-                        ));
+                    if let Some(i) = idx {
+                        projected.insert(i);
                     }
+                }
+                let in_list = |key: &OrderKey| -> bool {
+                    if key.ordinal.is_some() {
+                        return true;
+                    }
+                    if let Some(e) = &key.expr {
+                        return items.iter().any(|it| &it.expr == e);
+                    }
+                    // A bare name that binds an output column (an alias / derived name) names a
+                    // select-list item by definition, so it is projected (the alias form, §10). Any
+                    // ambiguity was already raised in the resolution loop above, so `Ok(Some(_))` is safe.
+                    if key.qualifier.is_none()
+                        && matches!(
+                            order_alias_match(items_ref, &key.column, &scope),
+                            Ok(Some(_))
+                        )
+                    {
+                        return true;
+                    }
+                    let r = match &key.qualifier {
+                        Some(q) => scope.resolve_qualified(q, &key.column),
+                        None => scope.resolve_bare(&key.column),
+                    };
+                    matches!(r, Ok(Resolved::Local(i)) if projected.contains(&i))
+                };
+                if !order_by_ref.iter().all(in_list) {
+                    return Err(EngineError::new(
+                        SqlState::InvalidColumnReference,
+                        "for SELECT DISTINCT, ORDER BY expressions must appear in select list",
+                    ));
                 }
             }
 
@@ -2283,10 +2282,10 @@ fn compute_rel_masks(plan: &SelectPlan) -> Vec<Vec<bool>> {
             if let Some(f) = &s.filter {
                 collect_touched(f, 0, &mut touched);
             }
-            if let Some(osa) = &s.osa {
-                if let Some(frac) = &osa.frac {
-                    collect_touched(frac, 0, &mut touched);
-                }
+            if let Some(osa) = &s.osa
+                && let Some(frac) = &osa.frac
+            {
+                collect_touched(frac, 0, &mut touched);
             }
             if let Some(hypo) = &s.hypo {
                 for k in &hypo.keys {

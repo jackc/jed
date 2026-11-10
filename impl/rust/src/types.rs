@@ -127,7 +127,7 @@ impl ScalarType {
     /// §1/§4). The two-word `character varying` alias is recognized here, though this slice's
     /// parser only produces single-word type names (a documented narrowing — types.md §11).
     pub fn from_name(name: &str) -> Option<ScalarType> {
-        match name.to_string().as_str() {
+        match name {
             "i16" | "smallint" | "int2" => Some(ScalarType::Int16),
             "i32" | "int" | "integer" | "int4" => Some(ScalarType::Int32),
             "i64" | "bigint" | "int8" => Some(ScalarType::Int64),

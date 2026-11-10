@@ -817,8 +817,8 @@ impl Engine {
         let columns: Vec<Column> = table.columns.clone();
         let pk: Vec<(usize, Type)> = table
             .pk_indices()
-            .into_iter()
-            .map(|i| (i, table.columns[i].ty.clone()))
+            .iter()
+            .map(|&i| (i, table.columns[i].ty.clone()))
             .collect();
         let indexes = table.indexes.clone();
         let rindexes: Vec<ResolvedIndex> = self.resolve_table_indexes(table)?;

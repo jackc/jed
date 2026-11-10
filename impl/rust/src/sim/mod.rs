@@ -2092,10 +2092,8 @@ impl<'a> Runner<'a> {
             "change_key" => self.step_change_key(i, &st.sid, target_key(&st.mode)),
             "backup" => self.step_backup(i, st),
             "attach" => self.step_attach(i, &st.sid),
-            "reopen" => {
-                if !self.step_reopen(i) {
-                    return false;
-                }
+            "reopen" if !self.step_reopen(i) => {
+                return false;
             }
             _ => {}
         }
@@ -2223,12 +2221,12 @@ impl<'a> Runner<'a> {
         // Every faulted step ends the process; a power loss also discards the unsynced writes (§5).
         let fired = {
             let disk = self.disk();
-            let fired = if disk.fired.is_empty() {
+
+            if disk.fired.is_empty() {
                 "end"
             } else {
                 disk.fired
-            };
-            fired
+            }
         };
         if armed.kind == FaultKind::PowerLoss {
             self.disk().power_loss(i as u64, armed.survive, armed.tear);
@@ -3208,7 +3206,7 @@ impl<'a> Runner<'a> {
             Err(e) => {
                 let opens = (-1..4)
                     .filter(|&k| self.sim_unlocks(Some(&image), k))
-                    .last()
+                    .next_back()
                     .unwrap_or(-2);
                 let key = self.main_db().key;
                 self.fail(

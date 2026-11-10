@@ -592,17 +592,18 @@ pub(crate) fn resolve_set_op(
     let array_or_range =
         |t: &ResolvedType| matches!(t, ResolvedType::Array(_) | ResolvedType::Range(_));
     let (mut adopted_l, mut adopted_r) = (false, false);
-    if array_or_range(&fl.ty) {
-        if let Some(adopted) = adopt_container_param(scope, rhs, &fl.ty, params)? {
-            fr = FirstPass::opaque(adopted);
-            adopted_r = true;
-        }
+    if array_or_range(&fl.ty)
+        && let Some(adopted) = adopt_container_param(scope, rhs, &fl.ty, params)?
+    {
+        fr = FirstPass::opaque(adopted);
+        adopted_r = true;
     }
-    if !adopted_r && array_or_range(&fr.ty) {
-        if let Some(adopted) = adopt_container_param(scope, lhs, &fr.ty, params)? {
-            fl = FirstPass::opaque(adopted);
-            adopted_l = true;
-        }
+    if !adopted_r
+        && array_or_range(&fr.ty)
+        && let Some(adopted) = adopt_container_param(scope, lhs, &fr.ty, params)?
+    {
+        fl = FirstPass::opaque(adopted);
+        adopted_l = true;
     }
     let (lt, rt) = (fl.ty.clone(), fr.ty.clone());
     // RANGE axis if either operand is a range. (The five positional operators are range-only; on a
@@ -1498,18 +1499,18 @@ pub(crate) fn resolve_scalar_array_operands(
     let fa = resolve_first(scope, array, agg, params)?;
     // A bare parameter array operand takes the array of `x`'s type (api.md §5): `id = ANY($1)`
     // binds a list of ids.
-    if let Expr::Param(n1, _) = array {
-        if let Some(elem) = array_param_elem(scope, &lt) {
-            let arr_rt = ResolvedType::Array(Box::new(lt.clone()));
-            let (ra, at) = resolve_param_node(
-                scope,
-                *n1,
-                Some(ColType::Array(Box::new(elem))),
-                arr_rt,
-                params,
-            )?;
-            return Ok((rl, lt, ra, at));
-        }
+    if let Expr::Param(n1, _) = array
+        && let Some(elem) = array_param_elem(scope, &lt)
+    {
+        let arr_rt = ResolvedType::Array(Box::new(lt.clone()));
+        let (ra, at) = resolve_param_node(
+            scope,
+            *n1,
+            Some(ColType::Array(Box::new(elem))),
+            arr_rt,
+            params,
+        )?;
+        return Ok((rl, lt, ra, at));
     }
     // A bare string literal array operand is PostgreSQL's `unknown`: it reads through `array_in` as
     // the array of `x`'s type (`id = ANY('{1,5}')`).
@@ -1531,12 +1532,11 @@ pub(crate) fn resolve_scalar_array_operands(
     };
     // If the array resolved to `E[]` and `x` is an adaptable bare literal, adapt `x` to `E` (with a
     // range check) — exactly the operand pairing `=` uses (`5 = ANY(i32[]_col)` lands `x` on i32).
-    if let ResolvedType::Array(e) = &at {
-        if is_adaptable_operand(lhs) {
-            if let Some(s) = elem_scalar_hint(e) {
-                (rl, lt) = resolve(scope, lhs, Some(s), agg, params)?;
-            }
-        }
+    if let ResolvedType::Array(e) = &at
+        && is_adaptable_operand(lhs)
+        && let Some(s) = elem_scalar_hint(e)
+    {
+        (rl, lt) = resolve(scope, lhs, Some(s), agg, params)?;
     }
     Ok((rl, lt, ra, at))
 }
@@ -1756,11 +1756,11 @@ pub(crate) fn resolve_concat(
             fr = FirstPass::opaque(adopted);
             adopted_r = true;
         }
-    } else if matches!(fr.ty, ResolvedType::Array(_)) {
-        if let Some(adopted) = adopt_container_param(scope, lhs, &fr.ty, params)? {
-            fl = FirstPass::opaque(adopted);
-            adopted_l = true;
-        }
+    } else if matches!(fr.ty, ResolvedType::Array(_))
+        && let Some(adopted) = adopt_container_param(scope, lhs, &fr.ty, params)?
+    {
+        fl = FirstPass::opaque(adopted);
+        adopted_l = true;
     }
     let (lt, rt) = (fl.ty.clone(), fr.ty.clone());
     // A TYPED text operand (not a bare string literal, which is PostgreSQL's `unknown` and adapts)

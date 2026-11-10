@@ -249,10 +249,11 @@ impl Engine {
         }
         drop(scan);
         rows = filtered;
-        if filter.is_some() && root != "Filter" {
-            if let Some(profile) = self.explain_actual.borrow_mut().as_mut() {
-                profile.record_parent("Filter".to_string(), meter.accrued);
-            }
+        if filter.is_some()
+            && root != "Filter"
+            && let Some(profile) = self.explain_actual.borrow_mut().as_mut()
+        {
+            profile.record_parent("Filter".to_string(), meter.accrued);
         }
         if plan.has_window && !plan.is_agg {
             rows = self.blocking_window(plan, rows, env, meter)?;
@@ -270,10 +271,10 @@ impl Engine {
                 }
                 rows = kept;
             }
-            if root != "Aggregate" {
-                if let Some(profile) = self.explain_actual.borrow_mut().as_mut() {
-                    profile.record_parent("Aggregate".to_string(), meter.accrued);
-                }
+            if root != "Aggregate"
+                && let Some(profile) = self.explain_actual.borrow_mut().as_mut()
+            {
+                profile.record_parent("Aggregate".to_string(), meter.accrued);
             }
             if plan.has_window {
                 rows = self.blocking_window(plan, rows, env, meter)?;
@@ -328,10 +329,10 @@ impl Engine {
                 meter.poll()?;
                 rows.push(row)?;
             }
-            if root != "Sort" {
-                if let Some(profile) = self.explain_actual.borrow_mut().as_mut() {
-                    profile.record_parent("Sort".to_string(), meter.accrued);
-                }
+            if root != "Sort"
+                && let Some(profile) = self.explain_actual.borrow_mut().as_mut()
+            {
+                profile.record_parent("Sort".to_string(), meter.accrued);
             }
         }
         if plan.distinct_on > 0 {
@@ -355,10 +356,10 @@ impl Engine {
                 kept.push(row)?;
             }
             rows = kept;
-            if root != "Distinct" {
-                if let Some(profile) = self.explain_actual.borrow_mut().as_mut() {
-                    profile.record_parent("Distinct".to_string(), meter.accrued);
-                }
+            if root != "Distinct"
+                && let Some(profile) = self.explain_actual.borrow_mut().as_mut()
+            {
+                profile.record_parent("Distinct".to_string(), meter.accrued);
             }
         }
         let mode = if plan.distinct {
@@ -378,10 +379,10 @@ impl Engine {
                 }
             }
             rows = distinct;
-            if root != "Distinct" {
-                if let Some(profile) = self.explain_actual.borrow_mut().as_mut() {
-                    profile.record_parent("Distinct".to_string(), meter.accrued);
-                }
+            if root != "Distinct"
+                && let Some(profile) = self.explain_actual.borrow_mut().as_mut()
+            {
+                profile.record_parent("Distinct".to_string(), meter.accrued);
             }
             EmitMode::Identity
         } else {
@@ -495,11 +496,11 @@ impl Engine {
                     combined[offset..offset + right.len()].clone_from_slice(&right);
                     let mut keep = true;
                     for &oi in &on_indices {
-                        if let Some(on) = &join_ons[oi] {
-                            if !on.eval_filter(&combined, env, meter)? {
-                                keep = false;
-                                break;
-                            }
+                        if let Some(on) = &join_ons[oi]
+                            && !on.eval_filter(&combined, env, meter)?
+                        {
+                            keep = false;
+                            break;
                         }
                     }
                     if !keep {
@@ -597,10 +598,10 @@ impl Engine {
         for row in materialized {
             out.push(row)?;
         }
-        if super::explain_exec::select_actual_root_node(plan) != "Window" {
-            if let Some(profile) = self.explain_actual.borrow_mut().as_mut() {
-                profile.record_parent("Window".to_string(), meter.accrued);
-            }
+        if super::explain_exec::select_actual_root_node(plan) != "Window"
+            && let Some(profile) = self.explain_actual.borrow_mut().as_mut()
+        {
+            profile.record_parent("Window".to_string(), meter.accrued);
         }
         Ok(out)
     }
@@ -699,11 +700,11 @@ impl Engine {
                     combined[offset..offset + right.len()].clone_from_slice(&right);
                     let mut keep = true;
                     for &on_index in &on_indices {
-                        if let Some(predicate) = &join_ons[on_index] {
-                            if !predicate.eval_filter(&combined, env, meter)? {
-                                keep = false;
-                                break;
-                            }
+                        if let Some(predicate) = &join_ons[on_index]
+                            && !predicate.eval_filter(&combined, env, meter)?
+                        {
+                            keep = false;
+                            break;
                         }
                     }
                     if keep {
@@ -733,18 +734,20 @@ impl Engine {
             }
             rows = next;
             inputs[inner] = self.blocking_spool();
-            if physical && plan.rels.len() >= 3 && position + 1 < plan.phys.join_steps.len() {
-                if let Some(profile) = self.explain_actual.borrow_mut().as_mut() {
-                    profile.record_parent(
-                        if hash.is_some() {
-                            "Hash Join"
-                        } else {
-                            "Nested Loop"
-                        }
-                        .to_string(),
-                        meter.accrued,
-                    );
-                }
+            if physical
+                && plan.rels.len() >= 3
+                && position + 1 < plan.phys.join_steps.len()
+                && let Some(profile) = self.explain_actual.borrow_mut().as_mut()
+            {
+                profile.record_parent(
+                    if hash.is_some() {
+                        "Hash Join"
+                    } else {
+                        "Nested Loop"
+                    }
+                    .to_string(),
+                    meter.accrued,
+                );
             }
         }
         Ok(rows)
@@ -802,10 +805,10 @@ impl Engine {
                     }
                 };
                 for (si, spec) in plan.agg_specs.iter().enumerate() {
-                    if let Some(f) = &spec.filter {
-                        if !f.eval(&row, env, meter)?.is_true() {
-                            continue;
-                        }
+                    if let Some(f) = &spec.filter
+                        && !f.eval(&row, env, meter)?.is_true()
+                    {
+                        continue;
                     }
                     meter.charge(COSTS.aggregate_accumulate);
                     let Value::Int(group) = state[0] else {
@@ -1170,11 +1173,11 @@ impl Engine {
                         let Value::Text(key) = row.pop().unwrap() else {
                             unreachable!()
                         };
-                        if let Some((old_key, old_value)) = members.last_mut() {
-                            if old_key == &key {
-                                *old_value = value;
-                                continue;
-                            }
+                        if let Some((old_key, old_value)) = members.last_mut()
+                            && old_key == &key
+                        {
+                            *old_value = value;
+                            continue;
                         }
                         members.push((key, value));
                     }
@@ -1207,16 +1210,15 @@ fn fold_spilled_value(
         unique: true,
         ..
     } = &acc
+        && let Some((key, _)) = pairs.first()
     {
-        if let Some((key, _)) = pairs.first() {
-            let mut entry = prefix.to_vec();
-            entry.push(Value::Text(key.clone()));
-            if !unique.insert(entry)? {
-                return Err(EngineError::new(
-                    SqlState::DuplicateJsonObjectKeyValue,
-                    "duplicate JSON object key value",
-                ));
-            }
+        let mut entry = prefix.to_vec();
+        entry.push(Value::Text(key.clone()));
+        if !unique.insert(entry)? {
+            return Err(EngineError::new(
+                SqlState::DuplicateJsonObjectKeyValue,
+                "duplicate JSON object key value",
+            ));
         }
     }
     match acc {

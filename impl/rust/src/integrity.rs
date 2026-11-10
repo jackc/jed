@@ -1028,7 +1028,7 @@ impl Checker<'_> {
                         let present = match lookup {
                             Lookup::Btree => istore.get(&entry)?.is_some(),
                             Lookup::Gin => {
-                                match crate::gin_runs::run_at_or_after(&istore, head, key)? {
+                                match crate::gin_runs::run_at_or_after(istore, head, key)? {
                                     // A run that does not decode holds nothing (§3.4).
                                     Some(run) => crate::gin_runs::decode_run(head.len(), &run)
                                         .is_ok_and(|keys| keys.iter().any(|k| k == key)),

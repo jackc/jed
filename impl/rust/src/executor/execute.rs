@@ -899,24 +899,24 @@ impl Engine {
         // check every in-memory budget first, so a later domain's 54P06 discards the whole
         // transaction — session state restored as on ROLLBACK — before any domain has packed a page
         // (memory.md §8.3). An unchanged main does not persist, so it has no budget to check.
-        if tx.temp_dirty || !tx.attach_dirty.is_empty() {
-            if let Some(c) = &self.core {
-                let attached: Vec<(&str, &Snapshot)> = tx
-                    .attach_dirty
-                    .iter()
-                    .filter_map(|name| tx.attach_working.get(name).map(|ws| (name.as_str(), ws)))
-                    .collect();
-                let main = tx.main_dirty.then(|| {
-                    let mut main = tx.working.clone();
-                    main.txid = c.committed_version() + 1;
-                    main
-                });
-                let main_stages_rows = tx.main_dirty && tx.working.staged_bytes() != 0;
-                if let Err(e) = c.precheck_budgets(main.as_ref(), main_stages_rows, &attached) {
-                    drop(attached);
-                    self.restore_session_state(tx);
-                    return Err(e);
-                }
+        if (tx.temp_dirty || !tx.attach_dirty.is_empty())
+            && let Some(c) = &self.core
+        {
+            let attached: Vec<(&str, &Snapshot)> = tx
+                .attach_dirty
+                .iter()
+                .filter_map(|name| tx.attach_working.get(name).map(|ws| (name.as_str(), ws)))
+                .collect();
+            let main = tx.main_dirty.then(|| {
+                let mut main = tx.working.clone();
+                main.txid = c.committed_version() + 1;
+                main
+            });
+            let main_stages_rows = tx.main_dirty && tx.working.staged_bytes() != 0;
+            if let Err(e) = c.precheck_budgets(main.as_ref(), main_stages_rows, &attached) {
+                drop(attached);
+                self.restore_session_state(tx);
+                return Err(e);
             }
         }
         let main_dirty = tx.main_dirty;

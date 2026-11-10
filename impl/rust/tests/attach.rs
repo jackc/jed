@@ -138,14 +138,8 @@ fn attachment_working_roots_and_cursors_do_not_alias() {
     let mut work_pin = s
         .query("SELECT id, v FROM work.t ORDER BY id", &[])
         .unwrap();
-    assert_eq!(
-        (&mut main_pin).next(),
-        Some(vec![Value::Int(1), Value::Int(10)])
-    );
-    assert_eq!(
-        (&mut work_pin).next(),
-        Some(vec![Value::Int(1), Value::Int(100)])
-    );
+    assert_eq!(main_pin.next(), Some(vec![Value::Int(1), Value::Int(10)]));
+    assert_eq!(work_pin.next(), Some(vec![Value::Int(1), Value::Int(100)]));
 
     for id in 4..=40 {
         exec(&mut s, &format!("INSERT INTO t VALUES ({id}, {})", id * 10));

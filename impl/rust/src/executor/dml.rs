@@ -107,8 +107,8 @@ impl Engine {
                 }
                 self.read_snap()
             }
-            Some(scope) if scope == "temp" => return None,
-            Some(scope) if scope == "main" => self.read_snap(),
+            Some("temp") => return None,
+            Some("main") => self.read_snap(),
             Some(scope) => self.attach_read_snap(scope)?,
         };
         snap.table_by_key(&table)?;
@@ -136,9 +136,9 @@ impl Engine {
                 }
                 &self.committed
             }
-            Some(scope) if scope == "temp" => return None,
-            Some(scope) if scope == "main" => &self.committed,
-            Some(scope) => self.attached_committed.get(&scope.to_string())?.as_ref(),
+            Some("temp") => return None,
+            Some("main") => &self.committed,
+            Some(scope) => self.attached_committed.get(scope)?.as_ref(),
         };
         snap.table_by_key(&table)?;
         Some(InsertTargetSignature {
@@ -294,8 +294,8 @@ impl Engine {
         // range-aware key codec (encoding.md §2.11).
         let pk: Vec<(usize, Type)> = tdef
             .pk_indices()
-            .into_iter()
-            .map(|i| (i, tdef.columns[i].ty.clone()))
+            .iter()
+            .map(|&i| (i, tdef.columns[i].ty.clone()))
             .collect();
         // The CHECK constraints, resolved once per statement in evaluation (name) order;
         // `insert_rows` evaluates them per candidate row (constraints.md §4.4).
@@ -999,8 +999,8 @@ impl Engine {
         let colls = self.column_collations(&table.columns);
         let pk = table
             .pk_indices()
-            .into_iter()
-            .map(|i| (i, table.columns[i].ty.clone()))
+            .iter()
+            .map(|&i| (i, table.columns[i].ty.clone()))
             .collect();
 
         let n = table.columns.len();
@@ -1427,7 +1427,7 @@ impl Engine {
                 // The composite key is the concatenation of the members' bare encodings in
                 // key order (encoding.md §2.3 — `encode_pk_key`); a single-column key is the
                 // one-member case of the same rule.
-                let k = encode_pk_key(pk, col_types, &colls, &row)?;
+                let k = encode_pk_key(pk, col_types, colls, &row)?;
                 if seen_keys.contains(&k) || self.store_scoped(db_scope, table).get(&k)?.is_some() {
                     // The PK's 23505 reports PostgreSQL's derived auto-name for the PK
                     // index, `<table>_pkey` — jed persists/reserves no such relation
@@ -1448,7 +1448,7 @@ impl Engine {
             // match no existing entry and no earlier row of this batch. Unmetered
             // validation, like the PK duplicate check (cost.md §3).
             for (u, rindex) in uniq.iter().enumerate() {
-                let Some(prefix) = index_prefix_key(col_types, &colls, rindex, &row, &env)? else {
+                let Some(prefix) = index_prefix_key(col_types, colls, rindex, &row, &env)? else {
                     continue;
                 };
                 let istore = self.index_store_scoped(db_scope, &rindex.name.to_string());
@@ -1479,7 +1479,7 @@ impl Engine {
                 row_prefixes.push(index_entry_keys(
                     columns,
                     col_types,
-                    &colls,
+                    colls,
                     rindex,
                     &[],
                     &row,
@@ -1664,7 +1664,7 @@ impl Engine {
         let key = if pk.is_empty() {
             None
         } else {
-            let key = encode_pk_key(pk, col_types, &colls, &row)?;
+            let key = encode_pk_key(pk, col_types, colls, &row)?;
             if self.store_scoped(db_scope, table).get(&key)?.is_some() {
                 let pk_ords: Vec<usize> = pk.iter().map(|(o, _)| *o).collect();
                 return Err(
@@ -1676,7 +1676,7 @@ impl Engine {
         };
 
         for rindex in rindexes.iter().filter(|d| d.unique) {
-            let Some(prefix) = index_prefix_key(col_types, &colls, rindex, &row, &env)? else {
+            let Some(prefix) = index_prefix_key(col_types, colls, rindex, &row, &env)? else {
                 continue;
             };
             let stored = !self
@@ -1705,7 +1705,7 @@ impl Engine {
             index_entries.push(index_entry_keys(
                 columns,
                 col_types,
-                &colls,
+                colls,
                 rindex,
                 &[],
                 &row,
@@ -1964,7 +1964,7 @@ impl Engine {
             Arbiter::Exclusion(_) => unreachable!("an exclusion arbiter has no existing-row probe"),
             Arbiter::Index(i) => {
                 let def = &indexes[*i];
-                let istore = self.index_store(&def.name.to_string());
+                let istore = self.index_store(&def.name);
                 match istore.range_entries(&unique_probe_bound(ak))?.first() {
                     None => None,
                     Some((ekey, _)) => {
@@ -2224,10 +2224,10 @@ impl Engine {
                                 // An optional WHERE that is not TRUE skips the update (existing row
                                 // unchanged, not returned, and still unaffected — a later proposal
                                 // may conflict with it again, upsert.md §4).
-                                if let Some(f) = filter {
-                                    if !f.eval_filter(&combined, &env, meter)? {
-                                        continue;
-                                    }
+                                if let Some(f) = filter
+                                    && !f.eval_filter(&combined, &env, meter)?
+                                {
+                                    continue;
                                 }
                                 let mut new_row = erow.clone();
                                 let mut null_col: Option<&str> = None;
@@ -2312,7 +2312,7 @@ impl Engine {
                 updates.iter().map(|(k, _, _, _)| k.as_slice()).collect();
             for &ix in &uniq_idx {
                 let rindex = &rindexes[ix];
-                let istore = self.index_store(&rindex.name.to_string());
+                let istore = self.index_store(&rindex.name);
                 let mut batch: HashSet<Vec<u8>> = HashSet::new();
                 for new_row in updates.iter().map(|(_, _, nr, _)| nr).chain(inserts.iter()) {
                     let Some(prefix) = self.index_prefix(&col_types, &colls, rindex, new_row)?
@@ -2551,7 +2551,7 @@ impl Engine {
             }
         }
         for (k, def) in indexes.iter().enumerate() {
-            let istore = self.index_store_mut(&def.name.to_string());
+            let istore = self.index_store_mut(&def.name);
             if rekeyed {
                 for (removals, _) in &index_moves[k] {
                     for (old_ek, skey_len) in removals {
@@ -2675,22 +2675,22 @@ impl Engine {
         let hit: Option<Vec<u8>> = match key {
             ExclusionKey::Btree(prefix) => {
                 // Entries sharing the prefix sit adjacent in storage-key order (indexes.md §8).
-                let istore = self.index_store(&chk.rindex.name.to_string());
+                let istore = self.index_store(&chk.rindex.name);
                 istore
                     .range_entries(&unique_probe_bound(prefix))?
                     .into_iter()
                     .map(|(ekey, _)| ekey[prefix.len()..].to_vec())
                     .find(|suffix| !rewritten.contains(suffix.as_slice()))
             }
-            ExclusionKey::Gist(query, strats) => self
-                .gist_tree(&chk.rindex.name.to_string())
-                .and_then(|tree| {
+            ExclusionKey::Gist(query, strats) => {
+                self.gist_tree(&chk.rindex.name).and_then(|tree| {
                     tree.search(query, strats)
                         .0
                         .into_iter()
                         .filter(|h| !rewritten.contains(h.as_slice()))
                         .min()
-                }),
+                })
+            }
         };
         let Some(hit) = hit else {
             return Ok(None);
@@ -2726,10 +2726,10 @@ impl Engine {
             return Ok(true);
         }
         for p in planned {
-            if let Some(pk) = self.exclusion_key(chk, columns, col_types, colls, p)? {
-                if exclusion_keys_conflict(columns, &chk.exc, &key, row, &pk, p)? {
-                    return Ok(true);
-                }
+            if let Some(pk) = self.exclusion_key(chk, columns, col_types, colls, p)?
+                && exclusion_keys_conflict(columns, &chk.exc, &key, row, &pk, p)?
+            {
+                return Ok(true);
             }
         }
         Ok(false)
@@ -2912,7 +2912,7 @@ impl Engine {
                 continue;
             };
             if !self
-                .index_store(&rindex.name.to_string())
+                .index_store(&rindex.name)
                 .range_entries(&unique_probe_bound(&prefix))?
                 .is_empty()
             {

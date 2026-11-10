@@ -252,10 +252,10 @@ impl Prover {
             }
             return any;
         }
-        if let RExpr::Or(a, b) = p {
-            if self.clause_implies(w, a) || self.clause_implies(w, b) {
-                return true;
-            }
+        if let RExpr::Or(a, b) = p
+            && (self.clause_implies(w, a) || self.clause_implies(w, b))
+        {
+            return true;
         }
         match comparison_atom(w) {
             Some((operand, op, value, c_order)) => {

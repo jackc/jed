@@ -1009,11 +1009,11 @@ pub(crate) fn combine_setop(
             }
             let mut out = Vec::new();
             for row in left {
-                if let Some(c) = counts.get_mut(&row) {
-                    if *c > 0 {
-                        *c -= 1;
-                        out.push(row);
-                    }
+                if let Some(c) = counts.get_mut(&row)
+                    && *c > 0
+                {
+                    *c -= 1;
+                    out.push(row);
                 }
             }
             out

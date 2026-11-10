@@ -60,7 +60,7 @@ impl Snapshot {
         column: usize,
     ) -> Option<&ColumnStatistics> {
         self.statistics
-            .get(&table.to_string())
+            .get(table)
             .and_then(|columns| columns.get(&column))
     }
 
@@ -70,7 +70,7 @@ impl Snapshot {
         column: usize,
     ) -> Option<&mut ColumnStatistics> {
         std::sync::Arc::make_mut(&mut self.statistics)
-            .get_mut(&table.to_string())
+            .get_mut(table)
             .and_then(|columns| columns.get_mut(&column))
     }
 
@@ -101,7 +101,7 @@ impl Snapshot {
     pub(crate) fn mark_statistics_stale(&mut self, table: &str) {
         self.data_gen += 1;
         let all = std::sync::Arc::make_mut(&mut self.statistics);
-        if let Some(columns) = all.get_mut(&table.to_string()) {
+        if let Some(columns) = all.get_mut(table) {
             for statistics in columns.values_mut() {
                 statistics.stale = true;
             }
@@ -110,7 +110,7 @@ impl Snapshot {
 
     pub(crate) fn clear_statistics(&mut self, table: &str) {
         self.data_gen += 1;
-        std::sync::Arc::make_mut(&mut self.statistics).remove(&table.to_string());
+        std::sync::Arc::make_mut(&mut self.statistics).remove(table);
     }
 
     pub(crate) fn clear_column_statistics(&mut self, table: &str, column: usize) {
@@ -127,7 +127,7 @@ impl Snapshot {
 
     /// Look up a table definition by exact name.
     pub fn table(&self, name: &str) -> Option<&Table> {
-        self.tables.get(&name.to_string())
+        self.tables.get(name)
     }
 
     pub(crate) fn table_by_key(&self, key: &str) -> Option<&Table> {
@@ -161,7 +161,7 @@ impl Snapshot {
 
     /// Look up a composite type definition by exact name.
     pub fn composite_type(&self, name: &str) -> Option<&CompositeType> {
-        self.types.get(&name.to_string())
+        self.types.get(name)
     }
 
     /// Resolve a catalog [`Type`] to its self-contained [`ColType`] against this snapshot's composite
@@ -217,7 +217,7 @@ impl Snapshot {
 
     /// Look up a sequence by exact name.
     pub fn sequence(&self, name: &str) -> Option<&SequenceDef> {
-        self.sequences.get(&name.to_string())
+        self.sequences.get(name)
     }
 
     /// Register a sequence (CREATE SEQUENCE). The exact name is the key. The caller has already
@@ -689,16 +689,16 @@ impl Snapshot {
         // `composite_ref` looks through one array level) names a registered type.
         for ct in self.types.values() {
             for f in &ct.fields {
-                if let Some(r) = f.ty.composite_ref() {
-                    if self.composite_type(&r.name).is_none() {
-                        return Err(EngineError::new(
-                            SqlState::DataCorrupted,
-                            format!(
-                                "composite type {} references unknown type {}",
-                                ct.name, r.name
-                            ),
-                        ));
-                    }
+                if let Some(r) = f.ty.composite_ref()
+                    && self.composite_type(&r.name).is_none()
+                {
+                    return Err(EngineError::new(
+                        SqlState::DataCorrupted,
+                        format!(
+                            "composite type {} references unknown type {}",
+                            ct.name, r.name
+                        ),
+                    ));
                 }
             }
         }
@@ -806,14 +806,14 @@ impl Snapshot {
     /// The store for a table (panics if absent — callers resolve the table first).
     pub(crate) fn store(&self, name: &str) -> &TableStore {
         self.stores
-            .get(&name.to_string())
+            .get(name)
             .expect("store exists for a resolved table")
     }
 
     /// The store for a table, mutable (panics if absent).
     pub(crate) fn store_mut(&mut self, name: &str) -> &mut TableStore {
         std::sync::Arc::make_mut(&mut self.stores)
-            .get_mut(&name.to_string())
+            .get_mut(name)
             .expect("store exists for a resolved table")
     }
 
@@ -822,7 +822,7 @@ impl Snapshot {
     /// I/O errors); every value is fully materialized — the helper's callers compare whole rows, so
     /// no unfetched reference may escape (large-values.md §14). The fault-`Result` is unwrapped here.
     pub(crate) fn rows_in_key_order(&self, name: &str) -> Option<Vec<Row>> {
-        self.stores.get(&name.to_string()).map(|s| {
+        self.stores.get(name).map(|s| {
             let mut rows = s.iter_in_key_order().expect("test-helper read failed");
             for row in &mut rows {
                 s.resolve_all(row).expect("test-helper resolve failed");
@@ -885,7 +885,7 @@ impl Snapshot {
             // Disjoint field borrows: `t` reads `self.tables` while we mutate `self.index_stores`.
             let index_stores = std::sync::Arc::make_mut(&mut self.index_stores);
             for idx in &t.indexes {
-                index_stores.remove(&idx.name.to_string());
+                index_stores.remove(&idx.name);
             }
         }
         std::sync::Arc::make_mut(&mut self.tables).remove(key);
@@ -1079,11 +1079,11 @@ impl Snapshot {
         column: usize,
         default_expr: DefaultExpr,
     ) {
-        if let Some(table) = std::sync::Arc::make_mut(&mut self.tables).get_mut(table_key) {
-            if let Some(col) = table.columns.get_mut(column) {
-                col.default_expr = Some(default_expr);
-                self.cat_gen += 1;
-            }
+        if let Some(table) = std::sync::Arc::make_mut(&mut self.tables).get_mut(table_key)
+            && let Some(col) = table.columns.get_mut(column)
+        {
+            col.default_expr = Some(default_expr);
+            self.cat_gen += 1;
         }
     }
 
@@ -1350,10 +1350,10 @@ impl Snapshot {
         // An index store created in-session binds the domain's pager like a table store
         // (put_table_resolved) so it joins the post-commit residency flip; a store loaded from a
         // file already attached it.
-        if let Some(paging) = &self.store_paging {
-            if !store.is_file_backed() {
-                store.attach_paging(paging.clone());
-            }
+        if let Some(paging) = &self.store_paging
+            && !store.is_file_backed()
+        {
+            store.attach_paging(paging.clone());
         }
         std::sync::Arc::make_mut(&mut self.index_stores).insert(name_key, store);
     }

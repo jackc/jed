@@ -219,11 +219,6 @@ pub mod tooling {
 
 /// The capabilities this implementation currently supports (spec/conformance:
 /// the gating axis). The harness runs a corpus file iff every capability in the
-/// file's `# requires:` header is in this set. GROWS as Phases B–E land; in the
-/// Phase A scaffold the engine supports no SQL features yet, so this is empty and
-/// zero conformance files run (the foundation tests still pass).
-/// The capabilities this implementation currently supports (spec/conformance:
-/// the gating axis). The harness runs a corpus file iff every capability in the
 /// file's `# requires:` header is in this set. GROWS as Phases B–E land. A whole
 /// corpus file only runs once *all* its required capabilities are present, so the
 /// harness stays all-skip until the `core` profile is complete (Phase E); per-phase

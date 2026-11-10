@@ -147,10 +147,10 @@ impl<T> BufferPool<T> {
                 .loading
                 .get(&page_id)
                 .is_some_and(|current| Arc::ptr_eq(current, &flight));
-            if !flight.is_invalidated() {
-                if let Ok(value) = &result {
-                    state.insert(page_id, Arc::clone(value));
-                }
+            if !flight.is_invalidated()
+                && let Ok(value) = &result
+            {
+                state.insert(page_id, Arc::clone(value));
             }
             // Publish before removing the flight while the state mutex excludes a new leader. A new
             // caller then either hits the inserted value or starts a fresh load after an error /

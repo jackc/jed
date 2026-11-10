@@ -50,10 +50,7 @@ pub(crate) struct TermStatistics {
 /// Does this column type have a GIN operator class (statistics.md §4.5)? `jsonb`, or an array whose
 /// element type a GIN index admits.
 pub(crate) fn term_eligible(ty: &Type) -> bool {
-    ty.is_jsonb()
-        || ty
-            .array_element()
-            .is_some_and(|elem| is_gin_element_type(&elem))
+    ty.is_jsonb() || ty.array_element().is_some_and(is_gin_element_type)
 }
 
 /// PostgreSQL's lossy counting over GIN term occurrences (statistics.md §4.5), bucket width
@@ -1391,8 +1388,7 @@ impl Engine {
             columns.extend(0..table.columns.len());
         } else {
             for name in &analyze.columns {
-                let key = name.to_string();
-                if !seen.insert(key.clone()) {
+                if !seen.insert(name.to_string()) {
                     return Err(EngineError::new(
                         SqlState::DuplicateColumn,
                         format!("column {name} appears more than once"),

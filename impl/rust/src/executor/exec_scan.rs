@@ -1191,8 +1191,8 @@ impl Engine {
                 }
                 self.read_snap()
             }
-            Some(scope) if scope == "temp" => return None,
-            Some(scope) if scope == "main" => self.read_snap(),
+            Some("temp") => return None,
+            Some("main") => self.read_snap(),
             Some(scope) => self.attach_read_snap(scope)?,
         };
         let table = rel.table_name.to_string();
@@ -1232,8 +1232,8 @@ impl Engine {
                     }
                     self.read_snap()
                 }
-                Some(scope) if scope == "temp" => return false,
-                Some(scope) if scope == "main" => self.read_snap(),
+                Some("temp") => return false,
+                Some("main") => self.read_snap(),
                 Some(scope) => match self.attach_read_snap(scope) {
                     Some(snap) => snap,
                     None => return false,
@@ -2211,7 +2211,7 @@ impl Engine {
                 for row in &rows {
                     meter.admit_row_masked(row, mask)?;
                 }
-                return Ok(rows);
+                Ok(rows)
             });
         }
         // A CTE reference delivers its rows from the per-statement context (cte.md §3/§5): a
@@ -2256,7 +2256,7 @@ impl Engine {
                         r.rows
                     }
                 };
-                return Ok(rows);
+                Ok(rows)
             });
         }
         // A DERIVED TABLE runs its body in place (grammar.md §42), charging its intrinsic cost — no
@@ -2399,15 +2399,8 @@ impl Engine {
                 Some(ScanBound::PkSet(ks)) => {
                     // Merged PK point-set (cost.md §3 "OR / IN-list"): a union of point probes over the
                     // distinct sorted keys; the whole WHERE stays the residual filter downstream.
-                    let (entries, units) = self.pk_key_set_rows(
-                        store,
-                        ks,
-                        params,
-                        outer,
-                        &plan.rel_masks[ri],
-                        left,
-                        true,
-                    )?;
+                    let (entries, units) =
+                        self.pk_key_set_rows(store, ks, params, outer, &plan.rel_masks[ri], left)?;
                     // SELECT discards the storage keys (UPDATE/DELETE keep them).
                     (entries.into_iter().map(|(_, v)| v).collect(), units)
                 }

@@ -554,6 +554,9 @@ impl PartialEq for Value {
             // value-level equality (verbatim text) only so DISTINCT/Hash containers don't panic —
             // it is never reached through SQL.
             (Value::Json(a), Value::Json(b)) => a == b,
+            // jsonpath is not comparable either (jsonpath.md §2); the arm keeps `Eq` reflexive and
+            // consistent with the `Hash` impl below.
+            (Value::JsonPath(a), Value::JsonPath(b)) => a == b,
             (Value::Unfetched(a), Value::Unfetched(b)) => a == b,
             _ => false,
         }
@@ -1099,10 +1102,10 @@ pub fn parse_record_tokens(input: &str) -> Option<Vec<Option<String>>> {
                             break; // closing quote
                         }
                     }
-                    Some('\\') => match chars.next() {
-                        Some(c) => buf.push(c),
-                        None => return None,
-                    },
+                    Some('\\') => {
+                        let c = chars.next()?;
+                        buf.push(c)
+                    }
                     Some(c) => buf.push(c),
                 }
             }
@@ -1118,12 +1121,10 @@ pub fn parse_record_tokens(input: &str) -> Option<Vec<Option<String>>> {
                     Some(',') | Some(')') => break,
                     Some('\\') => {
                         chars.next();
-                        match chars.next() {
-                            Some(c) => {
-                                buf.push(c);
-                                present = true;
-                            }
-                            None => return None,
+                        {
+                            let c = chars.next()?;
+                            buf.push(c);
+                            present = true;
                         }
                     }
                     Some(&c) => {
@@ -1766,7 +1767,7 @@ fn float_native_shortest_agrees(m: u64, e: i32, lower_tight: bool) -> bool {
         if k < 0 {
             k >= -25
         } else {
-            (k < 57 && o < 1 << (57 - k)) || o % 5 == 0
+            (k < 57 && o < 1 << (57 - k)) || o.is_multiple_of(5)
         }
     };
     if bound_may_be_short(2 * m + 1, e - 1) {

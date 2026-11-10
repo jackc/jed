@@ -226,7 +226,6 @@ impl Sorter {
             heap: BinaryHeap::new(),
             heads,
         };
-        self.runs.clear();
         merger.prime(&keys)?;
         Ok(SortedRows::Merge(merger, charge))
     }

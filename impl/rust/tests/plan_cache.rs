@@ -891,7 +891,7 @@ fn transaction_runs_prepared() {
             1
         );
         let mut rows = tx.query_prepared(&select, &[Value::Int(2)])?;
-        let row = (&mut rows).next().expect("in-tx prepared read");
+        let row = rows.next().expect("in-tx prepared read");
         assert_eq!(row, vec![Value::Int(200)]);
         rows.error()?;
         Ok(())

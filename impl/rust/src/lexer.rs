@@ -169,6 +169,12 @@ fn scan_number(sql: &str, start: usize) -> Result<(Token, usize)> {
     Ok((Token::Decimal(digits, scale), end))
 }
 
+/// The largest bind-parameter index a statement may name (`$65535`, spec/design/api.md §5):
+/// PostgreSQL's wire-protocol limit on the parameters of one statement. A fixed, cross-core-identical
+/// bound, like `MAX_EXPR_DEPTH` — the parameter table a statement allocates is sized by its largest
+/// index, so the bound is what keeps `SELECT $4294967295` from allocating four billion slots.
+pub const MAX_PARAM_INDEX: u64 = 65535;
+
 /// Tokenize `sql` into tokens terminated by `Token::Eof`. Whitespace separates
 /// tokens; an integer literal is an unsigned magnitude (the leading `-`, if any, is
 /// the `Minus` operator, folded by the parser). Errors are structured (SQLSTATE
@@ -176,12 +182,6 @@ fn scan_number(sql: &str, start: usize) -> Result<(Token, usize)> {
 ///
 /// This is the stored-text entry point (a view body, a CHECK expression, a rename rewrite), so an
 /// error carries no position: it would point into text the host never wrote (§10.1).
-/// The largest bind-parameter index a statement may name (`$65535`, spec/design/api.md §5):
-/// PostgreSQL's wire-protocol limit on the parameters of one statement. A fixed, cross-core-identical
-/// bound, like `MAX_EXPR_DEPTH` — the parameter table a statement allocates is sized by its largest
-/// index, so the bound is what keeps `SELECT $4294967295` from allocating four billion slots.
-pub const MAX_PARAM_INDEX: u64 = 65535;
-
 pub fn lex(sql: &str) -> Result<Vec<Token>> {
     lex_with_positions(sql)
         .map(|(tokens, _)| tokens)

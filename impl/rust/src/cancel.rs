@@ -22,7 +22,7 @@ use crate::sqlstate::SqlState;
 /// A clonable cancellation handle (spec/design/api.md §11.4). Cloning shares the underlying flag
 /// (`Arc<AtomicBool>`), so a clone handed to another thread cancels the statement the original is
 /// arming. Cheap to clone and to poll (a single relaxed atomic load on the hot path).
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct CancellationToken(Arc<AtomicBool>);
 
 impl CancellationToken {

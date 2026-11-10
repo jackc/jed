@@ -439,10 +439,10 @@ pub(crate) fn build_index_access_predicate(
     // WHERE AND-chain must contain a conjunct STRUCTURALLY EQUAL to the resolved predicate. A miss
     // yields no bound — a correct full scan. (The resolved predicate is in table-local column coords;
     // a WHERE conjunct is global, so it is matched shifted by `rel.offset`.)
-    if let Some(pred) = &rindex.predicate {
-        if !filter_implies_predicate(filter, pred, rel.offset) {
-            return None;
-        }
+    if let Some(pred) = &rindex.predicate
+        && !filter_implies_predicate(filter, pred, rel.offset)
+    {
+        return None;
     }
     // (A partial index's predicate needs no NULL-rejection here: every bound term below is a strict
     // comparison on this relation's key, so its WHERE conjunct rejects a NULL-extended row.)
@@ -619,14 +619,7 @@ pub(crate) fn inventory_single_relation_candidates<'a>(
 }
 
 fn sort_scan_candidates(candidates: &mut [ScanCandidate<'_>]) {
-    candidates.sort_by(|a, b| {
-        a.identity.kind.cmp(&b.identity.kind).then_with(|| {
-            a.identity
-                .index_name
-                .as_bytes()
-                .cmp(b.identity.index_name.as_bytes())
-        })
-    });
+    candidates.sort_by(|a, b| a.identity.cmp(&b.identity));
 }
 
 /// Canonical access-path rank from estimator.toml. Keep declaration order byte-identical to the
@@ -643,8 +636,10 @@ pub(crate) enum ScanCandidateKind {
 }
 
 /// Collision-free physical identity of one base-relation access candidate. `index_name` is the
-/// exact catalog name for index-bearing paths and empty for PK/PK-interval/full paths.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// exact catalog name for index-bearing paths and empty for PK/PK-interval/full paths. The derived
+/// `Ord` IS the canonical tie order (estimator.md): access-path rank, then index-name bytes — so
+/// the field order here is load-bearing.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct ScanCandidateIdentity {
     pub(crate) kind: ScanCandidateKind,
     pub(crate) index_name: String,
@@ -2421,7 +2416,28 @@ pub(crate) fn estimator_expression_children(expr: &RExpr) -> Vec<&RExpr> {
             }
             children
         }
-        _ => Vec::new(),
+        RExpr::Column(_)
+        | RExpr::OuterColumn { .. }
+        | RExpr::Param(_)
+        | RExpr::ConstInt(_)
+        | RExpr::ConstBool(_)
+        | RExpr::ConstText(_)
+        | RExpr::ConstDecimal(_)
+        | RExpr::ConstFloat32(_)
+        | RExpr::ConstFloat64(_)
+        | RExpr::ConstBytea(_)
+        | RExpr::ConstUuid(_)
+        | RExpr::ConstJsonPath(_)
+        | RExpr::ConstJson(_)
+        | RExpr::ConstJsonb(_)
+        | RExpr::ConstTimestamp(_)
+        | RExpr::ConstTimestamptz(_)
+        | RExpr::ConstDate(_)
+        | RExpr::ConstInterval(_)
+        | RExpr::ConstArray(_)
+        | RExpr::ConstRange(_)
+        | RExpr::DateClock { .. }
+        | RExpr::ConstNull => Vec::new(),
     }
 }
 
@@ -3817,14 +3833,7 @@ pub(crate) fn inventory_inl_candidates<'a>(
             }
         }
     }
-    candidates.sort_by(|a, b| {
-        a.identity.kind.cmp(&b.identity.kind).then_with(|| {
-            a.identity
-                .index_name
-                .as_bytes()
-                .cmp(b.identity.index_name.as_bytes())
-        })
-    });
+    candidates.sort_by(|a, b| a.identity.cmp(&b.identity));
     candidates
 }
 
@@ -3957,7 +3966,7 @@ pub(crate) fn pk_storage_width(table: &Table) -> Option<usize> {
         return None; // a no-PK table keys on a synthetic rowid — not handled this slice
     }
     let mut w = 0usize;
-    for &ci in &pk {
+    for &ci in pk {
         let s = table.columns[ci].ty.as_scalar()?; // a non-scalar (range/composite) PK has no fixed width
         if !s.is_fixed_width() {
             return None; // a variable-width (text/decimal/…) PK suffix is not a fixed peel
@@ -4252,11 +4261,11 @@ pub(crate) fn gist_sibling_match<'a>(
     )
 }
 
-fn gist_match_operand<'a, F>(
-    filter: &'a RExpr,
+fn gist_match_operand<F>(
+    filter: &RExpr,
     col_global: usize,
     query_ok: F,
-) -> Option<(crate::gist::GistStrategy, &'a RExpr)>
+) -> Option<(crate::gist::GistStrategy, &RExpr)>
 where
     F: Fn(&RExpr) -> bool + Copy,
 {
@@ -4314,11 +4323,11 @@ pub(crate) fn gist_scalar_sibling_match<'a>(
     )
 }
 
-fn gist_scalar_match_operand<'a, F>(
-    filter: &'a RExpr,
+fn gist_scalar_match_operand<F>(
+    filter: &RExpr,
     col_global: usize,
     query_ok: F,
-) -> Option<(crate::gist::GistStrategy, &'a RExpr)>
+) -> Option<(crate::gist::GistStrategy, &RExpr)>
 where
     F: Fn(&RExpr) -> bool + Copy,
 {
@@ -4393,11 +4402,11 @@ pub(crate) fn gin_sibling_match<'a>(
 /// The `jsonb_ops` conjunct shapes (gin.md §2.1): the containment node with the indexed column as
 /// the CONTAINING operand (`col @> Q`, and `Q <@ col`, which resolves to the same node), and the
 /// key-existence operators with the column as the base. The recovered operand is `Q` / `k` / `K`.
-fn gin_jsonb_match_operand<'a, F>(
-    filter: &'a RExpr,
+fn gin_jsonb_match_operand<F>(
+    filter: &RExpr,
     col_global: usize,
     query_ok: F,
-) -> Option<(GinStrategy, &'a RExpr)>
+) -> Option<(GinStrategy, &RExpr)>
 where
     F: Fn(&RExpr) -> bool + Copy,
 {
@@ -4432,11 +4441,11 @@ where
     }
 }
 
-fn gin_match_operand<'a, F>(
-    filter: &'a RExpr,
+fn gin_match_operand<F>(
+    filter: &RExpr,
     col_global: usize,
     query_ok: F,
-) -> Option<(GinStrategy, &'a RExpr)>
+) -> Option<(GinStrategy, &RExpr)>
 where
     F: Fn(&RExpr) -> bool + Copy,
 {
@@ -5887,7 +5896,7 @@ pub(crate) fn detect_pk_bound(
     }
     let mut eq_cols = Vec::new();
     let mut range = None;
-    for ci in &pk {
+    for ci in pk {
         let Some(ty) = rel.table.columns[*ci].ty.as_scalar() else {
             break;
         };
@@ -5934,7 +5943,7 @@ pub(crate) fn detect_pk_bound(
         }
         break;
     }
-    (!eq_cols.is_empty() || range.is_some()).then(|| PkBound {
+    (!eq_cols.is_empty() || range.is_some()).then_some(PkBound {
         eq_cols,
         range,
         member_count: pk.len(),
@@ -6893,10 +6902,10 @@ pub(crate) fn build_key_bound(
             let mut endpoint = p.clone();
             endpoint.extend_from_slice(&key);
             match t.op {
-                CmpOp::Gt => match prefix_successor(&endpoint) {
-                    Some(next) => intersect_lo(&mut b, &next, true),
-                    None => return None,
-                },
+                CmpOp::Gt => {
+                    let next = prefix_successor(&endpoint)?;
+                    intersect_lo(&mut b, &next, true)
+                }
                 CmpOp::Ge => intersect_lo(&mut b, &endpoint, true),
                 CmpOp::Lt => intersect_hi(&mut b, &endpoint, false),
                 CmpOp::Le => {
@@ -7910,7 +7919,7 @@ pub(crate) fn finalize_ordered_set(
             // percentile_cont over interval input: interpolate in the interval domain (PG
             // `interval_lerp` — aggregates.md §13). Values are sorted by their canonical span
             // (interval has no collation, so `sort_osa_vals` uses the value order).
-            sort_osa_vals(&mut vals, collation, desc, meter.as_deref_mut())?;
+            sort_osa_vals(&mut vals, collation, desc, meter)?;
             finalize_percentile(frac, vals.is_empty(), |p| {
                 let n = vals.len();
                 let pos = p * ((n - 1) as f64);
@@ -8982,10 +8991,10 @@ pub(crate) fn reject_default_structure(e: &Expr) -> Result<()> {
 pub(crate) fn check_referenced_columns(e: &Expr, columns: &[Column]) -> Vec<usize> {
     pub(crate) fn walk(e: &Expr, columns: &[Column], out: &mut Vec<usize>) {
         let mut note = |name: &str| {
-            if let Some(i) = columns.iter().position(|c| c.name == name) {
-                if !out.contains(&i) {
-                    out.push(i);
-                }
+            if let Some(i) = columns.iter().position(|c| c.name == name)
+                && !out.contains(&i)
+            {
+                out.push(i);
             }
         };
         match e {
@@ -9567,7 +9576,7 @@ mod candidate_inventory_tests {
                 Some("btree:a_btree"),
             ),
         ] {
-            let filter = planned_inventory_filter(&mut db, sql);
+            let filter = planned_inventory_filter(&db, sql);
             let shape_candidates = inventory_scan_candidates(Some(&filter), &rel, &db);
             for (candidate, estimate) in shape_candidates.iter().zip(estimate_scan_candidates(
                 &shape_candidates,

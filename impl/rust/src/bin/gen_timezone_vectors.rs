@@ -20,7 +20,7 @@ const SECS_PER_DAY: i64 = 86_400;
 fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
     let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = (y - era * 400) as i64;
+    let yoe = y - era * 400;
     let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     era * 146097 + doe - 719468
@@ -185,16 +185,16 @@ fn main() {
          # Links are flat \"alias=target\" strings so every core's minimal TOML reader handles them.\n\n\
          schema_version = 1\n\n[[bundle]]\n",
     );
-    write!(b, "tzdata_version = {:?}\n", parsed.tzdata_version).unwrap();
-    write!(b, "roundtrip_byte_identical = {roundtrip}\n").unwrap();
+    writeln!(b, "tzdata_version = {:?}", parsed.tzdata_version).unwrap();
+    writeln!(b, "roundtrip_byte_identical = {roundtrip}").unwrap();
     let names: Vec<String> = parsed.zones.iter().map(|(n, _)| format!("{n:?}")).collect();
-    write!(b, "zones = [{}]\n", names.join(", ")).unwrap();
+    writeln!(b, "zones = [{}]", names.join(", ")).unwrap();
     let links: Vec<String> = parsed
         .links
         .iter()
         .map(|(a, t)| format!("{:?}", format!("{a}={t}")))
         .collect();
-    write!(b, "links = [{}]\n", links.join(", ")).unwrap();
+    writeln!(b, "links = [{}]", links.join(", ")).unwrap();
     std::fs::write(tz_dir().join("vectors/bundle.toml"), &b).expect("write bundle.toml");
 
     eprintln!(

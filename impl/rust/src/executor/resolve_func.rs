@@ -556,7 +556,7 @@ pub(crate) fn regex_func_node(
         (RExpr::ConstText(pat), Some(insensitive)) => {
             let pat = if insensitive {
                 let prop = scope.catalog.session.env.property();
-                crate::regex::fold_pattern(pat, prop.as_deref())
+                crate::regex::fold_pattern(pat, prop)
             } else {
                 pat.clone()
             };
@@ -669,14 +669,14 @@ pub(crate) fn require_int_or_null(ty: &ResolvedType, name: &str) -> Result<()> {
 /// Named notation is only valid for a function that declares parameter names. Reject it on any
 /// other function — PG's "function ... has no parameter named X" (42883).
 pub(crate) fn reject_named(name: &str, arg_names: Option<&[Option<String>]>) -> Result<()> {
-    if let Some(names) = arg_names {
-        if let Some(Some(pn)) = names.iter().find(|n| n.is_some()) {
-            return Err(EngineError::new(
-                SqlState::UndefinedFunction,
-                format!("function {name} has no parameter named \"{pn}\""),
-            )
-            .hinted(error_hint::FUNCTION_NO_MATCH));
-        }
+    if let Some(names) = arg_names
+        && let Some(Some(pn)) = names.iter().find(|n| n.is_some())
+    {
+        return Err(EngineError::new(
+            SqlState::UndefinedFunction,
+            format!("function {name} has no parameter named \"{pn}\""),
+        )
+        .hinted(error_hint::FUNCTION_NO_MATCH));
     }
     Ok(())
 }
@@ -1589,14 +1589,14 @@ pub(crate) fn resolve_projections(
                     scope.trace_flat(idx);
                 }
                 // A written `*` in a view body is frozen into its expansion (views.md §5).
-                if let Some(pos) = star_pos.0 {
-                    if scope.catalog.view_tracing() {
-                        let cols = star
-                            .iter()
-                            .map(|&idx| (scope.star_label(idx), scope.column_at(idx).name.clone()))
-                            .collect();
-                        scope.catalog.trace_star(pos, false, cols);
-                    }
+                if let Some(pos) = star_pos.0
+                    && scope.catalog.view_tracing()
+                {
+                    let cols = star
+                        .iter()
+                        .map(|&idx| (scope.star_label(idx), scope.column_at(idx).name.clone()))
+                        .collect();
+                    scope.catalog.trace_star(pos, false, cols);
                 }
                 return Ok((nodes, names, types, derivs, typmods));
             }
@@ -1710,16 +1710,16 @@ pub(crate) fn resolve_projections(
                     }
                     // A written `rel.*` in a view body is frozen into `"rel" . "col"` references
                     // (views.md §5).
-                    if let Some(pos) = pos.0 {
-                        if scope.catalog.view_tracing() {
-                            let cols = table
-                                .columns
-                                .iter()
-                                .take(slots.len())
-                                .map(|c| (Some(want.clone()), c.name.clone()))
-                                .collect();
-                            scope.catalog.trace_star(pos, true, cols);
-                        }
+                    if let Some(pos) = pos.0
+                        && scope.catalog.view_tracing()
+                    {
+                        let cols = table
+                            .columns
+                            .iter()
+                            .take(slots.len())
+                            .map(|c| (Some(want.clone()), c.name.clone()))
+                            .collect();
+                        scope.catalog.trace_star(pos, true, cols);
                     }
                     continue;
                 }
@@ -1985,10 +1985,10 @@ fn flatten_and_owned(e: RExpr, out: &mut Vec<RExpr>) {
 /// Whether `e` contains a subquery that is re-run per row (one that references this query level or
 /// an enclosing one, so the uncorrelated fold leaves it in place).
 fn has_correlated_subquery(e: &RExpr) -> bool {
-    if let RExpr::Subquery { plan, .. } = e {
-        if query_plan_references_outer(plan, 0) {
-            return true;
-        }
+    if let RExpr::Subquery { plan, .. } = e
+        && query_plan_references_outer(plan, 0)
+    {
+        return true;
     }
     if let RExpr::And(..) | RExpr::Or(..) = e {
         // A left-deep AND / OR chain (an IN list's desugar, grammar.md §20) is walked along its
@@ -2190,10 +2190,9 @@ fn adapt_string_literal_to_container(
             let Some(elem_col) = array_param_elem(scope, elem) else {
                 return Ok(None);
             };
-            let val = fold_in_session_zone(scope, params, |iz| {
-                coerce_string_to_array(s, &elem_col, iz)
-            })
-            .map_err(|e| e.with_position(pos.0))?;
+            let val =
+                fold_in_session_zone(scope, params, |iz| coerce_string_to_array(s, &elem_col, iz))
+                    .map_err(|e| e.with_position(pos.0))?;
             Ok(Some((value_to_rexpr(&val), other.clone())))
         }
         ResolvedType::Range(elem) => {
@@ -2202,11 +2201,9 @@ fn adapt_string_literal_to_container(
             else {
                 return Ok(None);
             };
-            fold_in_session_zone(scope, params, |iz| {
-                coerce_string_to_range_expr(s, desc, iz)
-            })
-            .map_err(|e| e.with_position(pos.0))
-            .map(Some)
+            fold_in_session_zone(scope, params, |iz| coerce_string_to_range_expr(s, desc, iz))
+                .map_err(|e| e.with_position(pos.0))
+                .map(Some)
         }
         _ => Ok(None),
     }
@@ -2251,10 +2248,11 @@ pub(crate) fn unify_param_type(a: ColType, b: ColType, idx0: usize) -> Result<Co
     if a == b {
         return Ok(a);
     }
-    if let (ColType::Scalar(x), ColType::Scalar(y)) = (&a, &b) {
-        if x.is_integer() && y.is_integer() {
-            return Ok(if x.rank() >= y.rank() { a } else { b });
-        }
+    if let (ColType::Scalar(x), ColType::Scalar(y)) = (&a, &b)
+        && x.is_integer()
+        && y.is_integer()
+    {
+        return Ok(if x.rank() >= y.rank() { a } else { b });
     }
     Err(EngineError::new(
         SqlState::DatatypeMismatch,
@@ -2837,10 +2835,10 @@ fn render_explain_json_sql(
 }
 
 fn explain_json_returning(returning: ScalarType, decimal: Option<&DecimalTypmod>) -> String {
-    if returning == ScalarType::Decimal {
-        if let Some(decimal) = decimal {
-            return format!("decimal({},{})", decimal.precision, decimal.scale);
-        }
+    if returning == ScalarType::Decimal
+        && let Some(decimal) = decimal
+    {
+        return format!("decimal({},{})", decimal.precision, decimal.scale);
     }
     returning.canonical_name().to_string()
 }
@@ -3261,7 +3259,7 @@ pub(crate) fn count_true(mask: &[bool]) -> usize {
 /// any other name. Recognized **only** in a CREATE TABLE column-type position (the one caller); the
 /// match is byte-exact (the parser passes the folded / quoted name).
 pub(crate) fn serial_pseudo_type(name: &str) -> Option<ScalarType> {
-    match name.to_string().as_str() {
+    match name {
         "serial" | "serial4" => Some(ScalarType::Int32),
         "bigserial" | "serial8" => Some(ScalarType::Int64),
         "smallserial" | "serial2" => Some(ScalarType::Int16),
@@ -3308,27 +3306,27 @@ pub(crate) fn build_sequence_def(
     let (def_min, def_max) = dtype.default_bounds(increment);
     // An explicit MAXVALUE/MINVALUE outside the type range is 22023 — checked (MAX first, PG order)
     // BEFORE the MIN > MAX consistency check (§14.2).
-    if let Some(Some(v)) = options.max_value {
-        if v > type_max {
-            return Err(EngineError::new(
-                SqlState::InvalidParameterValue,
-                format!(
-                    "MAXVALUE ({v}) is out of range for sequence data type {}",
-                    dtype.pg_name()
-                ),
-            ));
-        }
+    if let Some(Some(v)) = options.max_value
+        && v > type_max
+    {
+        return Err(EngineError::new(
+            SqlState::InvalidParameterValue,
+            format!(
+                "MAXVALUE ({v}) is out of range for sequence data type {}",
+                dtype.pg_name()
+            ),
+        ));
     }
-    if let Some(Some(v)) = options.min_value {
-        if v < type_min {
-            return Err(EngineError::new(
-                SqlState::InvalidParameterValue,
-                format!(
-                    "MINVALUE ({v}) is out of range for sequence data type {}",
-                    dtype.pg_name()
-                ),
-            ));
-        }
+    if let Some(Some(v)) = options.min_value
+        && v < type_min
+    {
+        return Err(EngineError::new(
+            SqlState::InvalidParameterValue,
+            format!(
+                "MINVALUE ({v}) is out of range for sequence data type {}",
+                dtype.pg_name()
+            ),
+        ));
     }
     // `Some(Some(v))` MINVALUE v / `Some(None)` NO MINVALUE / `None` unset → the type default.
     let min_value = match options.min_value {
@@ -3886,18 +3884,17 @@ pub(crate) fn collect_insert_privs(ins: &Insert, req: &mut PrivReq, locals: &Has
             }
         }
     }
-    if let Some(oc) = &ins.on_conflict {
-        if let ConflictAction::DoUpdate {
+    if let Some(oc) = &ins.on_conflict
+        && let ConflictAction::DoUpdate {
             assignments,
             filter,
         } = &oc.action
-        {
-            for a in assignments {
-                collect_expr_privs(&a.value, req, locals);
-            }
-            if let Some(f) = filter {
-                collect_expr_privs(f, req, locals);
-            }
+    {
+        for a in assignments {
+            collect_expr_privs(&a.value, req, locals);
+        }
+        if let Some(f) = filter {
+            collect_expr_privs(f, req, locals);
         }
     }
     collect_returning_privs(&ins.returning, req, locals);
@@ -4111,7 +4108,7 @@ pub(crate) fn collect_table_ref_privs(t: &TableRef, req: &mut PrivReq, locals: &
         for p in &jt.passing {
             collect_expr_privs(&p.expr, req, locals);
         }
-    } else if t.db.is_some() || !locals.contains(&t.name.to_string()) {
+    } else if t.db.is_some() || !locals.contains(&t.name) {
         // A base-table reference (not a CTE / derived-table label) — needs SELECT. A qualified
         // name never resolves to a CTE (attached-databases.md §3), so a CTE cannot shadow it.
         req.need_table(&t.name, Privilege::Select);
@@ -5318,7 +5315,7 @@ fn resolve_node(
                     ));
                 }
                 let Some(keys) = within_group.as_deref() else {
-                    return Err(no_agg_overload(&name.to_string()));
+                    return Err(no_agg_overload(name));
                 };
                 return resolve_ordered_set_aggregate(
                     scope,
@@ -5334,7 +5331,7 @@ fn resolve_node(
             // WITHIN GROUP on a non-ordered-set function (an ordinary aggregate or a scalar function)
             // is 42883 — PG models it as a missing overload (`sum(numeric, numeric) does not exist`).
             if within_group.is_some() {
-                return Err(no_agg_overload(&name.to_string()));
+                return Err(no_agg_overload(name));
             }
             // An `OVER name` the desugar pass did not reach (window.md §5.3) sits where a window
             // function cannot run (WHERE, HAVING, GROUP BY, a JOIN ON, …) — 42P20, PostgreSQL's
@@ -5558,10 +5555,10 @@ fn resolve_node(
             let (target, _) = resolve_type_and_typmod(type_name, &None)?;
             // DATE 'today' / DATE 'now' / … — the clock-relative specials become the STABLE
             // DateClock node, exactly like the ctx-adaptation form (date.md §6).
-            if target.is_date() {
-                if let Some((node, rt)) = date_clock_literal(text, params) {
-                    return Ok((node, rt));
-                }
+            if target.is_date()
+                && let Some((node, rt)) = date_clock_literal(text, params)
+            {
+                return Ok((node, rt));
             }
             fold_in_session_zone(scope, params, |iz| {
                 coerce_string_literal(text, target, Typmod::NONE, iz)
@@ -5968,10 +5965,10 @@ fn resolve_node(
             if let Expr::Literal(Literal::Text(s), pos) = inner.as_ref() {
                 // 'today'::date / CAST('now' AS date) — the clock-relative specials become the
                 // STABLE DateClock node, exactly like the ctx-adaptation form (date.md §6).
-                if target.is_date() {
-                    if let Some((node, rt)) = date_clock_literal(s, params) {
-                        return Ok((node, rt));
-                    }
+                if target.is_date()
+                    && let Some((node, rt)) = date_clock_literal(s, params)
+                {
+                    return Ok((node, rt));
                 }
                 // The literal's input error points at the literal (PostgreSQL coerces it at parse
                 // time — spec/design/error-fields.md §10.2).
@@ -6754,26 +6751,23 @@ fn resolve_node(
             require_text_or_null(&rt)?;
             // SIMILAR TO (regex.md §8f.2): a similar_to_escape call over constant text is translated
             // now, so the pattern precompiles below (and a translation error surfaces at resolve).
-            if *similar {
-                if let RExpr::ScalarFunc {
+            if *similar
+                && let RExpr::ScalarFunc {
                     func: ScalarFunc::SimilarToEscape,
                     args,
                     ..
                 } = &rr
-                {
-                    let consts: Option<Vec<&str>> = args
-                        .iter()
-                        .map(|a| match a {
-                            RExpr::ConstText(t) => Some(t.as_str()),
-                            _ => None,
-                        })
-                        .collect();
-                    if let Some(c) = consts {
-                        rr = RExpr::ConstText(crate::regex::similar_to_escape(
-                            c[0],
-                            c.get(1).copied(),
-                        )?);
-                    }
+            {
+                let consts: Option<Vec<&str>> = args
+                    .iter()
+                    .map(|a| match a {
+                        RExpr::ConstText(t) => Some(t.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                if let Some(c) = consts {
+                    rr =
+                        RExpr::ConstText(crate::regex::similar_to_escape(c[0], c.get(1).copied())?);
                 }
             }
             // Precompile a CONSTANT pattern ONCE (regex.md §5); a non-constant pattern compiles per
@@ -6784,7 +6778,7 @@ fn resolve_node(
                 let folded;
                 let pat_ref = if *insensitive {
                     let prop = scope.catalog.session.env.property();
-                    folded = crate::regex::fold_pattern(pat, prop.as_deref());
+                    folded = crate::regex::fold_pattern(pat, prop);
                     folded.as_str()
                 } else {
                     pat.as_str()
@@ -6882,10 +6876,10 @@ fn resolve_node(
                     params.note((*n as usize) - 1, hint)?;
                 }
             }
-            if let Some(result) = els {
-                if let Expr::Param(n, _) = &**result {
-                    params.note((*n as usize) - 1, hint)?;
-                }
+            if let Some(result) = els
+                && let Expr::Param(n, _) = &**result
+            {
+                params.note((*n as usize) - 1, hint)?;
             }
             Ok((
                 RExpr::Case {

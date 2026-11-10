@@ -149,7 +149,7 @@ fn spilling_operator_state_releases_its_charge() {
         other => panic!("expected rows, got {other:?}"),
     }
     s.set_work_mem(0);
-    let err = s.query_outcome(sql, &[]).err().expect("54P05");
+    let err = s.query_outcome(sql, &[]).expect_err("54P05");
     assert_eq!(err.code(), "54P05");
     drop(s);
     drop(db);

@@ -4,16 +4,17 @@
 
 use super::*;
 
-/// `lpad`/`rpad` over CODE POINTS (string-functions.md §3): pad `s` to `len` characters with `fill`
-/// (cyclically), on the left if `left` else the right; a string longer than `len` is truncated to
-/// its first `len` characters; an empty `fill` cannot pad (returns the truncated string); `len ≤ 0`
-/// is empty. A `len` above `MAX_RESULT_CHARS` traps `54000`. Matches PostgreSQL's lpad/rpad.
+/// The byte length of `s`'s first `chars` code points (all of `s` when it is shorter).
 fn text_prefix_bytes(s: &str, chars: i64) -> usize {
     s.char_indices()
         .nth(chars as usize)
         .map_or(s.len(), |(i, _)| i)
 }
 
+/// `lpad`/`rpad` over CODE POINTS (string-functions.md §3): pad `s` to `len` characters with `fill`
+/// (cyclically), on the left if `left` else the right; a string longer than `len` is truncated to
+/// its first `len` characters; an empty `fill` cannot pad (returns the truncated string); `len ≤ 0`
+/// is empty. A `len` above `MAX_RESULT_CHARS` traps `54000`. Matches PostgreSQL's lpad/rpad.
 pub(crate) fn pad_chars(
     s: &str,
     len: i64,

@@ -131,6 +131,17 @@ pub(crate) struct PsConnection {
     pub(crate) cache: Mutex<CacheId>,
 }
 
+/// A page index from a byte offset's quotient. Page indices are `u32` on the wire and in the file
+/// format, so an offset past that range is an error rather than a silently aliased low page.
+fn page_index(index: u64) -> Result<u32> {
+    u32::try_from(index).map_err(|_| {
+        EngineError::new(
+            SqlState::IoError,
+            "page-service offset is beyond the page index range",
+        )
+    })
+}
+
 fn connection_lost(detail: &str) -> EngineError {
     EngineError::new(
         SqlState::ConnectionFailure,
@@ -888,8 +899,8 @@ fn client_read_only() -> EngineError {
 impl BlockStore for ServiceBlockStore {
     fn read_at(&mut self, offset: u64, len: usize) -> Result<Vec<u8>> {
         let page_size = self.page_size();
-        let index = offset / page_size;
-        let within = (offset - index * page_size) as usize;
+        let index = page_index(offset / page_size)?;
+        let within = (offset % page_size) as usize;
         if within + len > page_size as usize {
             return Err(EngineError::new(
                 SqlState::IoError,
@@ -898,10 +909,10 @@ impl BlockStore for ServiceBlockStore {
         }
         let page = if index < 2 {
             self.conn.meta()
-        } else if let Some(page) = self.pending.get(&(index as u32)) {
+        } else if let Some(page) = self.pending.get(&index) {
             page.clone()
         } else {
-            self.conn.read_pages(&[index as u32])?.remove(0)
+            self.conn.read_pages(&[index])?.remove(0)
         };
         if page.len() != page_size as usize {
             return Err(EngineError::new(
@@ -923,7 +934,7 @@ impl BlockStore for ServiceBlockStore {
                 "page-service write must be one whole page",
             ));
         }
-        let index = (offset / page_size) as u32;
+        let index = page_index(offset / page_size)?;
         if index < 2 {
             self.pending_meta = Some(bytes.to_vec());
         } else {

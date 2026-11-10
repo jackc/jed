@@ -1124,16 +1124,16 @@ impl VerbatimWalk<'_, '_> {
             }
             b'[' => {
                 let b = self.b;
-                if let Some(i) = self.index[depth] {
-                    if i < 0 {
-                        let mut count = 0i64;
-                        for_each_element(b, pos, |_, s| {
-                            count += 1;
-                            Ok(skip_json_value(b, s))
-                        })?;
-                        if i.checked_neg().is_some_and(|m| m <= count) {
-                            self.index[depth] = Some(i + count);
-                        }
+                if let Some(i) = self.index[depth]
+                    && i < 0
+                {
+                    let mut count = 0i64;
+                    for_each_element(b, pos, |_, s| {
+                        count += 1;
+                        Ok(skip_json_value(b, s))
+                    })?;
+                    if i.checked_neg().is_some_and(|m| m <= count) {
+                        self.index[depth] = Some(i + count);
                     }
                 }
                 for_each_element(b, pos, |ord, vstart| {
@@ -1730,10 +1730,10 @@ fn set_path_walk(
                     Some(nelems + i64::from(parsed))
                 };
             }
-            if let Some(i) = idx {
-                if i > nelems {
-                    idx = Some(nelems);
-                }
+            if let Some(i) = idx
+                && i > nelems
+            {
+                idx = Some(nelems);
             }
             let mut out: Vec<JsonNode> = Vec::with_capacity(e.len() + 1);
             let mut done = false;

@@ -340,7 +340,7 @@ fn relaxed_newest_meta_vouches_for_the_whole_batch() {
         Outcome::Query { rows, .. } => rows,
         other => panic!("expected rows, got {other:?}"),
     };
-    let floor = Value::Text("a".repeat(20).into());
+    let floor = Value::Text("a".repeat(20));
     assert!(
         rows.len() == 2 && rows[0][0] == floor && rows[1][0] == floor,
         "recovery over a half-landed batch returned {rows:?}, want the floor's rows"
@@ -544,7 +544,7 @@ fn relaxed_trailing_truncation_waits_for_the_flush() {
         "close flushed the batch but left the file {} bytes (at most {limit})",
         len()
     );
-    let mut re = Database::open(&path).unwrap();
+    let re = Database::open(&path).unwrap();
     assert_eq!(state(&re).0, pc, "reopened page count");
     let mut s = re.session(SessionOptions::default());
     let mut rows = s.query("SELECT count(*) FROM t", &[]).unwrap();

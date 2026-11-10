@@ -710,7 +710,7 @@ pub fn resolve_col_type(ty: &Type, types: &HashMap<String, CompositeType>) -> Co
         Type::Scalar(s) => ColType::Scalar(*s),
         Type::Composite(r) => {
             let def = types
-                .get(&r.name.to_string())
+                .get(&r.name)
                 .expect("composite type reference resolved by validate_composite_types");
             ColType::Composite {
                 name: def.name.clone(),
@@ -802,14 +802,14 @@ impl Table {
     /// The primary-key member columns' indices in KEY order (the explicit `pk` list — the
     /// v5 catalog persists key order independent of declaration order). Empty = the table
     /// has no primary key (synthetic rowid keys).
-    pub fn pk_indices(&self) -> Vec<usize> {
-        self.pk.clone()
+    pub fn pk_indices(&self) -> &[usize] {
+        &self.pk
     }
 
     /// The primary-key column's index iff the key is SINGLE-column. Callers that genuinely require
     /// one member (notably OR/IN interval sets) use this helper; tuple bounds iterate `pk_indices`.
     pub fn primary_key_index(&self) -> Option<usize> {
-        match self.pk_indices().as_slice() {
+        match self.pk.as_slice() {
             [i] => Some(*i),
             _ => None,
         }

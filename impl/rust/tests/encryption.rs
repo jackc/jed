@@ -362,7 +362,7 @@ fn changing_the_credential_rewraps_the_key_block_only() {
 
 #[test]
 fn credential_change_errors() {
-    let code = |r: jed::Result<()>| r.err().expect("must fail").code().to_string();
+    let code = |r: jed::Result<()>| r.expect_err("must fail").code().to_string();
     let path = tmp("enc_change_errors.jed");
     let db = create(&path, Credential::Key(KEY));
     let new = || Credential::Key([2; 32]);
@@ -745,7 +745,7 @@ fn rekey_rotates_encrypts_and_decrypts() {
 
 #[test]
 fn rekey_errors() {
-    let code = |r: jed::Result<()>| r.err().expect("must fail").code().to_string();
+    let code = |r: jed::Result<()>| r.expect_err("must fail").code().to_string();
     let key = || Some(Credential::Key(KEY));
     // A handle whose scratch files are plaintext cannot encrypt.
     let plain = Database::create(CreateOptions {
@@ -833,8 +833,7 @@ fn a_rekey_the_target_cannot_store_leaves_the_file_untouched() {
     let before = std::fs::read(&path).unwrap();
     let err = db
         .rekey("main", Some(Credential::Key(KEY)), Argon2Params::default())
-        .err()
-        .expect("the key does not fit the encrypted layout");
+        .expect_err("the key does not fit the encrypted layout");
     assert_ne!(err.code(), "XX001", "{}", err.message);
     assert_eq!(std::fs::read(&path).unwrap(), before);
     assert_eq!(rows(&db, "SELECT length(k) FROM t")[0][0], Value::Int(len));

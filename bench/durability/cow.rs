@@ -200,7 +200,10 @@ impl Manifest {
 
 impl ValidatedCow {
     pub fn new(manifest_offset: u64, slot_bytes: usize, base_seq: u64) -> io::Result<Self> {
-        if slot_bytes < HEADER || slot_bytes % 512 != 0 || manifest_offset % 512 != 0 {
+        if slot_bytes < HEADER
+            || !slot_bytes.is_multiple_of(512)
+            || !manifest_offset.is_multiple_of(512)
+        {
             return Err(invalid(
                 "COW manifest slots must be sector-aligned and nonempty",
             ));
@@ -329,10 +332,11 @@ impl ValidatedCow {
         let mut candidates = Vec::new();
         for slot in 0..2 {
             let mut bytes = device.read(manifest_offset + slot * slot_bytes as u64, slot_bytes)?;
-            if let Some(manifest) = Manifest::decode(&mut bytes) {
-                if manifest.seq > base_seq && manifest.seq & 1 == slot {
-                    candidates.push(manifest);
-                }
+            if let Some(manifest) = Manifest::decode(&mut bytes)
+                && manifest.seq > base_seq
+                && manifest.seq & 1 == slot
+            {
+                candidates.push(manifest);
             }
         }
         candidates.sort_by(|a, b| b.seq.cmp(&a.seq));
@@ -456,10 +460,7 @@ mod tests {
         fn sync(&mut self) -> io::Result<()> {
             self.syncs += 1;
             if self.fail_sync {
-                return Err(Error::new(
-                    ErrorKind::Other,
-                    "simulated crash before barrier",
-                ));
+                return Err(Error::other("simulated crash before barrier"));
             }
             for write in self.pending.drain(..) {
                 Self::apply(&mut self.stable, &write);

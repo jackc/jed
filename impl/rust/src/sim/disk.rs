@@ -490,14 +490,13 @@ impl SimFs {
                         self.arena[id].unissued.push((off, version as usize));
                     }
                 }
-                FaultKind::IoWrite => {
+                FaultKind::IoWrite
                     if self.fired.is_empty()
                         && self.decide_at(id, LANE_IO_WRITE, self.step, off, version) % 1000
-                            < permille(f.p)
-                    {
-                        self.fired = "write";
-                        return Err(injected("write error"));
-                    }
+                            < permille(f.p) =>
+                {
+                    self.fired = "write";
+                    return Err(injected("write error"));
                 }
                 _ => {}
             }
@@ -582,8 +581,9 @@ impl SimFs {
         let pending = std::mem::take(&mut self.arena[id].pending);
         for (off, vs) in &pending {
             let newest = vs.last().expect("a pending offset holds a version");
-            let land =
-                self.decide_at(id, LANE_LAND, self.step, *off, (vs.len() - 1) as u64) % 2 == 0;
+            let land = self
+                .decide_at(id, LANE_LAND, self.step, *off, (vs.len() - 1) as u64)
+                .is_multiple_of(2);
             let file = &mut self.arena[id];
             if land {
                 put_durable(&mut file.durable, *off, newest);

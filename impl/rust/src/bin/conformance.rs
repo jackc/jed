@@ -1643,7 +1643,7 @@ fn take_sql_until_separator<'a, I: Iterator<Item = &'a str>>(
     lines: &mut std::iter::Peekable<I>,
 ) -> String {
     let mut sql = Vec::new();
-    while let Some(l) = lines.next() {
+    for l in lines.by_ref() {
         if l.trim() == "----" {
             break;
         }
@@ -1688,7 +1688,7 @@ fn drain_query(sess: &mut JedSession, sql: &str, params: &[jed::Value]) -> jed::
     let column_names = rows.column_names().to_vec();
     let column_types = rows.column_types().to_vec();
     let mut values = Vec::new();
-    while let Some(row) = rows.next() {
+    for row in rows.by_ref() {
         values.push(row);
     }
     rows.error()?;
@@ -2150,12 +2150,11 @@ fn parse_attaches(text: &str) -> Vec<String> {
     let mut header = Vec::new();
     for line in text.lines() {
         let t = line.trim();
-        if let Some(rest) = t.strip_prefix('#') {
-            if parse_attach_directive(rest).is_some()
-                || parse_max_storage_bytes_directive(rest).is_some()
-            {
-                header.push(rest.to_string());
-            }
+        if let Some(rest) = t.strip_prefix('#')
+            && (parse_attach_directive(rest).is_some()
+                || parse_max_storage_bytes_directive(rest).is_some())
+        {
+            header.push(rest.to_string());
         }
     }
     header
@@ -2476,22 +2475,20 @@ impl Driver {
                     ));
                 }
                 let releasing = self.gate_holder.as_deref() == Some(sid.as_str());
-                if releasing {
-                    if let Some((bsid, bw)) = &self.blocked {
-                        // Layer 2 real-blocking verification (§5): the queued writer must NOT have
-                        // acquired the gate yet — its ack must still be pending while the holder holds.
-                        match bw.reply.try_recv() {
-                            Err(mpsc::TryRecvError::Empty) => {} // still blocked — good
-                            Ok(_) => {
-                                return Err(format!(
-                                    "blocked writer '{bsid}' acquired the gate before '{sid}' released it"
-                                ));
-                            }
-                            Err(mpsc::TryRecvError::Disconnected) => {
-                                return Err(format!(
-                                    "blocked writer '{bsid}' worker terminated unexpectedly"
-                                ));
-                            }
+                if releasing && let Some((bsid, bw)) = &self.blocked {
+                    // Layer 2 real-blocking verification (§5): the queued writer must NOT have
+                    // acquired the gate yet — its ack must still be pending while the holder holds.
+                    match bw.reply.try_recv() {
+                        Err(mpsc::TryRecvError::Empty) => {} // still blocked — good
+                        Ok(_) => {
+                            return Err(format!(
+                                "blocked writer '{bsid}' acquired the gate before '{sid}' released it"
+                            ));
+                        }
+                        Err(mpsc::TryRecvError::Disconnected) => {
+                            return Err(format!(
+                                "blocked writer '{bsid}' worker terminated unexpectedly"
+                            ));
                         }
                     }
                 }
@@ -2510,25 +2507,25 @@ impl Driver {
                 };
                 if releasing {
                     self.gate_holder = None;
-                    if end.is_ok() {
-                        if let Some((bsid, bw)) = self.blocked.take() {
-                            // The gate is free now: the queued writer's parked `write()` returns and
-                            // its thread sends the deferred ack. Receive it (the open logically
-                            // completes), promoting it to the live gate holder — capturing the version
-                            // the holder just published (§5).
-                            match recv_reply(&bw.reply) {
-                                Ok(Ok(())) => {
-                                    self.workers.insert(bsid.clone(), bw);
-                                    self.gate_holder = Some(bsid);
-                                }
-                                Ok(Err(e)) => {
-                                    let _ = bw.handle.join();
-                                    return Err(format!("open {bsid}: {e}"));
-                                }
-                                Err(e) => {
-                                    let _ = bw.handle.join();
-                                    return Err(format!("open {bsid}: {e}"));
-                                }
+                    if end.is_ok()
+                        && let Some((bsid, bw)) = self.blocked.take()
+                    {
+                        // The gate is free now: the queued writer's parked `write()` returns and
+                        // its thread sends the deferred ack. Receive it (the open logically
+                        // completes), promoting it to the live gate holder — capturing the version
+                        // the holder just published (§5).
+                        match recv_reply(&bw.reply) {
+                            Ok(Ok(())) => {
+                                self.workers.insert(bsid.clone(), bw);
+                                self.gate_holder = Some(bsid);
+                            }
+                            Ok(Err(e)) => {
+                                let _ = bw.handle.join();
+                                return Err(format!("open {bsid}: {e}"));
+                            }
+                            Err(e) => {
+                                let _ = bw.handle.join();
+                                return Err(format!("open {bsid}: {e}"));
                             }
                         }
                     }

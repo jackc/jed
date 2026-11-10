@@ -757,7 +757,7 @@ fn map_pushdown_safe(e: &RExpr, column: &dyn Fn(usize) -> Option<RExpr>) -> Opti
         } => RExpr::Cast {
             inner: boxed(inner)?,
             target: *target,
-            typmod: typmod.clone(),
+            typmod: *typmod,
             varchar_len: *varchar_len,
             trap: *trap,
             temporal: *temporal,

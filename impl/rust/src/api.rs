@@ -170,6 +170,12 @@ impl Rows {
         &self.column_names
     }
 
+    /// The shared column-name list itself, for a consumer that keeps it per row (the typed
+    /// [`Row`](crate::Row)) without copying every name.
+    pub(crate) fn column_names_rc(&self) -> std::rc::Rc<[String]> {
+        std::rc::Rc::clone(&self.column_names)
+    }
+
     /// The canonical type name of each output column (parallel to [`column_names`](Rows::column_names);
     /// empty for a non-query statement) — `i16`/`text`/`decimal`/…, or `unknown` for an untyped NULL
     /// column (spec/design/conformance.md §7).
@@ -551,17 +557,11 @@ impl Engine {
         // read-path admission gates (25P02 / 54P02 / 42501) up front — reads only (transaction control
         // must work in a failed block; a write is gated inside dispatch on the fall-through). Keeps the
         // bare-engine `query` a safe total seam (CLAUDE.md §13).
-        if !matches!(
-            ast,
-            Statement::Begin { .. }
-                | Statement::Commit
-                | Statement::Rollback
-                | Statement::Savepoint { .. }
-        ) && !self.stmt_is_write_with_views(ast)
+        if !ast.is_transaction_control()
+            && !self.stmt_is_write_with_views(ast)
+            && let Err(e) = self.gate_read_lanes(ast)
         {
-            if let Err(e) = self.gate_read_lanes(ast) {
-                return Err(self.poison_on_lane_err(e));
-            }
+            return Err(self.poison_on_lane_err(e));
         }
         match self.try_scan_query(ast, params, cache) {
             Err(e) => return Err(self.poison_on_lane_err(e)),
@@ -633,7 +633,6 @@ impl Engine {
     /// on either the `Ok` or the `Err` path with no duplication — and so [`Session::execute_script`]
     /// (crate::Session) can reuse it under a shared-core-aware wrapper (session.md §2.4).
     pub(crate) fn run_script_body(&mut self, sql: &str) -> Result<crate::executor::ScriptSummary> {
-        use crate::ast::Statement;
         let mut summary = crate::executor::ScriptSummary::default();
         // The characters before the current statement, counted incrementally: a statement's error
         // position is shifted into the script's coordinates (spec/design/error-fields.md §10.1).
@@ -646,13 +645,7 @@ impl Engine {
                 .map_err(|e| e.shift_position(before))?;
             // Transaction control inside a script is the v1 narrowing (session.md §4.2): the implicit
             // wrapper owns the boundary, so BEGIN/COMMIT/ROLLBACK is 0A000 (partitioning deferred).
-            if matches!(
-                ast,
-                Statement::Begin { .. }
-                    | Statement::Commit
-                    | Statement::Rollback
-                    | Statement::Savepoint { .. }
-            ) {
+            if ast.is_transaction_control() {
                 return Err(EngineError::new(
                     SqlState::FeatureNotSupported,
                     "transaction control (BEGIN/COMMIT/ROLLBACK) is not supported inside execute_script; \
@@ -694,7 +687,7 @@ pub(crate) fn drain_to_outcome(mut rows: Rows) -> Result<Outcome> {
     let column_names = rows.column_names().to_vec();
     let column_types = rows.column_types().to_vec();
     let mut out_rows = Vec::new();
-    while let Some(row) = rows.next() {
+    for row in rows.by_ref() {
         out_rows.push(row);
     }
     rows.error()?;

@@ -293,12 +293,11 @@ impl Engine {
         if matches!(inner, Statement::With(_) | Statement::SetOp(_)) {
             return "deferred".to_string();
         }
-        if let Statement::Select(_) = inner {
-            if let Ok(QueryPlan::Select(sp)) = self.plan_explain_inner(inner) {
-                if pull_streaming_scan_eligible(&sp) {
-                    return "streaming".to_string();
-                }
-            }
+        if let Statement::Select(_) = inner
+            && let Ok(QueryPlan::Select(sp)) = self.plan_explain_inner(inner)
+            && pull_streaming_scan_eligible(&sp)
+        {
+            return "streaming".to_string();
         }
         "buffered".to_string()
     }
@@ -332,10 +331,10 @@ impl Engine {
                 let qp = self.plan_explain_inner(inner)?;
                 // A top-level pure WITH is orchestrated directly by run_with rather than
                 // exec_query_plan. Its wrapper is frame 0; only CTE/body query plans open frames.
-                if matches!(inner, Statement::With(_)) {
-                    if let QueryPlan::With(wp) = &qp {
-                        return self.render_with_plan(r, wp, depth);
-                    }
+                if matches!(inner, Statement::With(_))
+                    && let QueryPlan::With(wp) = &qp
+                {
+                    return self.render_with_plan(r, wp, depth);
                 }
                 self.render_query_plan(r, &qp, depth)
             }
@@ -1247,12 +1246,11 @@ impl Engine {
     /// found or has no primary key (a defensive fallback — the plan-only path already resolved the
     /// table, and a bounded scan implies a single-column PK).
     pub(crate) fn first_pk_col_name(&self, table_name: &str) -> String {
-        if let Some(t) = self.table(table_name) {
-            if let Some(&i) = t.pk.first() {
-                if i < t.columns.len() {
-                    return t.columns[i].name.clone();
-                }
-            }
+        if let Some(t) = self.table(table_name)
+            && let Some(&i) = t.pk.first()
+            && i < t.columns.len()
+        {
+            return t.columns[i].name.clone();
         }
         "pk".to_string()
     }

@@ -78,6 +78,20 @@ pub enum Statement {
     },
 }
 
+impl Statement {
+    /// Whether this is a transaction-control statement (`BEGIN` / `COMMIT` / `ROLLBACK` / a savepoint
+    /// statement) — the statements that change the block state rather than read or write data.
+    pub(crate) fn is_transaction_control(&self) -> bool {
+        matches!(
+            self,
+            Statement::Begin { .. }
+                | Statement::Commit
+                | Statement::Rollback
+                | Statement::Savepoint { .. }
+        )
+    }
+}
+
 /// Which savepoint statement a [`Statement::Savepoint`] is (spec/design/transactions.md §11).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SavepointOp {
@@ -1487,9 +1501,9 @@ impl GroupItem {
     /// walks that scan a SELECT's expressions (privilege collection, sublink/sequence detection).
     pub fn for_each_expr<'a>(&'a self, f: &mut impl FnMut(&'a Expr)) {
         match self {
-            GroupItem::Set(cols) => cols.iter().for_each(|e| f(e)),
+            GroupItem::Set(cols) => cols.iter().for_each(&mut *f),
             GroupItem::Rollup(groups) | GroupItem::Cube(groups) => {
-                groups.iter().flatten().for_each(|e| f(e));
+                groups.iter().flatten().for_each(&mut *f);
             }
             GroupItem::GroupingSets(elems) => elems.iter().for_each(|e| e.for_each_expr(f)),
         }

@@ -55,18 +55,6 @@ pub(crate) fn materialize_order_exprs(
     Ok(())
 }
 
-/// The WINDOW stage (spec/design/window.md §5.2): for each window function, partition the rows,
-/// sort each partition by the window ORDER BY (stable → PK tie-break, as `rows` arrives in PK scan
-/// order), compute the per-row result, and APPEND it to every row (so window result `i` lands at
-/// flat slot `input_width + i`, where the projection reads it). The partition + sort are unmetered
-/// (like ORDER BY / GROUP BY); each computed result charges `window_result` and guards the ceiling.
-/// S0: `row_number()` only; partitions bucket value-canonically via an insertion-ordered list, so
-/// no hash-map iteration order leaks (CLAUDE.md §8/§10).
-///
-/// The frame-sensitive plans (aggregate windows, first/last/nth_value) use a `FrameCtx`, which
-/// precomputes the partition's peer-group structure once and maps each row to its `[lo, hi)` frame.
-/// spec/design/window.md §6.
-
 /// The integer count of a `ROWS`/`GROUPS` offset bound (widened to `i128` so the index arithmetic
 /// cannot overflow). The offset is `Value::Int` by construction (resolve_int_bound).
 pub(crate) fn offset_count(v: &Value) -> i128 {
@@ -494,6 +482,17 @@ pub(crate) fn window_coll_keys(
     Ok(all)
 }
 
+/// The WINDOW stage (spec/design/window.md §5.2): for each window function, partition the rows,
+/// sort each partition by the window ORDER BY (stable → PK tie-break, as `rows` arrives in PK scan
+/// order), compute the per-row result, and APPEND it to every row (so window result `i` lands at
+/// flat slot `input_width + i`, where the projection reads it). The partition + sort are unmetered
+/// (like ORDER BY / GROUP BY); each computed result charges `window_result` and guards the ceiling.
+/// S0: `row_number()` only; partitions bucket value-canonically via an insertion-ordered list, so
+/// no hash-map iteration order leaks (CLAUDE.md §8/§10).
+///
+/// The frame-sensitive plans (aggregate windows, first/last/nth_value) use a `FrameCtx`, which
+/// precomputes the partition's peer-group structure once and maps each row to its `[lo, hi)` frame.
+/// spec/design/window.md §6.
 pub(crate) fn apply_window_stage(
     rows: &mut [Row],
     specs: &[WindowSpec],

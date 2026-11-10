@@ -240,13 +240,26 @@ impl Drop for StateCharge {
     }
 }
 
+/// Which cost ceiling a charge crossed first (see `Meter::charge`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum CeilingHit {
+    #[default]
+    None,
+    /// The per-statement `max_cost` (`54P01`).
+    Statement,
+    /// The session `lifetime_max_cost` budget (`54P02`).
+    Lifetime,
+}
+
 /// Accrues deterministic execution cost and enforces an optional per-statement ceiling **and** an
 /// optional per-session budget (CLAUDE.md §13; spec/design/session.md §5.4). Threaded by `&mut`
 /// through the executor and the recursive expression evaluator; the accrued (per-statement) total is
 /// reported on `Outcome`, while the session cumulative is updated live through [`Lifetime`].
 #[derive(Default)]
 pub struct Meter {
-    ceiling_hit: u8,
+    /// Which ceiling the first over-limit charge crossed, latched so the reported error does not
+    /// change as later charges accrue.
+    ceiling_hit: CeilingHit,
     pub(crate) scalar_bytes: Rc<Cell<i64>>,
     pub(crate) scalar_limit: i64,
     /// The statement's live query-memory account (spec/design/memory.md §2), shared by every meter
@@ -413,14 +426,9 @@ impl Meter {
     /// Used where there is no session cumulative to thread (tests, isolated build scans).
     pub fn with_limit(limit: i64) -> Self {
         Meter {
-            ceiling_hit: 0,
-            scalar_bytes: Rc::new(Cell::new(0)),
             scalar_limit: crate::costs::DEFAULT_SCALAR_BYTES,
-            query: QueryAccount::default(),
-            accrued: 0,
             limit,
-            lifetime: None,
-            cancel: None,
+            ..Meter::default()
         }
     }
 
@@ -432,14 +440,9 @@ impl Meter {
     /// statement at the next cancellation checkpoint.
     pub fn for_session(limit: i64, lifetime: Lifetime, cancel: Option<CancellationToken>) -> Self {
         Meter {
-            ceiling_hit: 0,
-            scalar_bytes: Rc::new(Cell::new(0)),
-            scalar_limit: crate::costs::DEFAULT_SCALAR_BYTES,
-            query: QueryAccount::default(),
-            accrued: 0,
-            limit,
             lifetime: Some(lifetime),
             cancel,
+            ..Meter::with_limit(limit)
         }
     }
 
@@ -450,14 +453,14 @@ impl Meter {
     /// cross-core accrual count is untouched.
     #[inline]
     pub fn charge(&mut self, units: i64) {
-        if self.ceiling_hit == 0 {
+        if self.ceiling_hit == CeilingHit::None {
             let stmt = self.limit > 0 && units >= self.limit - self.accrued;
             let life = self
                 .lifetime
                 .as_ref()
                 .is_some_and(|l| l.limit > 0 && units >= l.limit - l.total.get());
             if stmt {
-                self.ceiling_hit = 1;
+                self.ceiling_hit = CeilingHit::Statement;
             }
             if life
                 && (!stmt
@@ -466,7 +469,7 @@ impl Meter {
                         .as_ref()
                         .is_some_and(|l| l.limit - l.total.get() < self.limit - self.accrued))
             {
-                self.ceiling_hit = 2;
+                self.ceiling_hit = CeilingHit::Lifetime;
             }
         }
 
@@ -549,8 +552,8 @@ impl Meter {
         } else {
             life_over
         };
-        if self.ceiling_hit != 0 {
-            pick_life = self.ceiling_hit == 2;
+        if self.ceiling_hit != CeilingHit::None {
+            pick_life = self.ceiling_hit == CeilingHit::Lifetime;
         }
         if pick_life {
             let (total, limit) = life.expect("pick_life implies a budget");
