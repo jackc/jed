@@ -7,10 +7,10 @@ package jed
 // content changed. An interior node whose only change is which page a child lives at keeps its page;
 // the meta page records "the node the disk calls page D is now at page C" in a remap list. Open
 // applies the list as it reads child pointers. When the list would overflow, or a commit cannot defer
-// (a relaxed batch, a page client, an encrypted file), the commit folds: every stale interior and its
+// (more dirty nodes than the list has room for), the commit folds: every stale interior and its
 // ancestors are written fresh and the list empties.
 //
-// Go-only, plaintext only, no format version bump. The other cores, verify.rb, backup, and the page
+// Go-only, no format version bump. The other cores, verify.rb, backup, and the page
 // service do not understand the list.
 
 import (
@@ -22,41 +22,59 @@ import (
 // deferInterior turns the prototype on.
 var deferInterior = os.Getenv("JED_DEFER_INTERIOR") == "on"
 
-// remapCap is the most entries a meta page carries; remapReserve the bytes it sets aside for them at
-// the end of the page, taken from the inline manifest: 8 bytes per entry, then the count and a marker.
-const (
-	remapCap     = 340
-	remapReserve = 8*remapCap + 8
-)
+// remapBudget is the bytes a meta page of 4 KiB or more sets aside for its remap list, taken from the
+// end of the inline manifest area: a 4-byte count and a 4-byte marker after the entries. An entry is
+// the on-disk page id and the current page id (8 bytes); in an encrypted file it also carries the
+// current page's tag (encrypted.md §2), 24 bytes, since every pointer binds the page it names.
+const remapBudget = 2728
 
-// remapCapFor is the entries a meta page of ps bytes carries: remapCap from 4 KiB up, and a third of
-// the space after the header on the small pages the simulator uses. remapReserveFor is their bytes.
-func remapCapFor(ps int) int {
-	if ps >= 4096 {
-		return remapCap
+func remapEntrySize(encrypted bool) int {
+	if encrypted {
+		return 8 + cryptoTagLen
 	}
-	return (ps - 64) / 24
+	return 8
 }
 
-func remapReserveFor(ps int) int { return 8*remapCapFor(ps) + 8 }
+// remapArea is the bytes of a meta page of ps bytes that can hold manifest entries and the list:
+// after the header (and an encrypted meta's tags), before an encrypted meta's reserve.
+func remapArea(ps int, encrypted bool) (int, int) {
+	if encrypted {
+		return 96, ps - cryptoReserve
+	}
+	return 64, ps
+}
 
-// remapMinPage is the smallest page size that carries a remap list.
-const remapMinPage = 256
+// remapCapFor is the entries a meta page carries: remapBudget's worth from 4 KiB up, and a third of
+// the area on the small pages the simulator uses. remapReserveFor is their bytes.
+func remapCapFor(ps int, encrypted bool) int {
+	budget := remapBudget
+	if ps < 4096 {
+		lo, hi := remapArea(ps, encrypted)
+		budget = (hi - lo) / 3
+	}
+	return max(0, (budget-8)/remapEntrySize(encrypted))
+}
 
-// deferOn reports whether a plaintext file of page size ps defers interior pages.
-func deferOn(ps int) bool { return deferInterior && ps >= remapMinPage }
+func remapReserveFor(ps int, encrypted bool) int {
+	return remapEntrySize(encrypted)*remapCapFor(ps, encrypted) + 8
+}
+
+// deferOn reports whether a file of page size ps defers interior pages.
+func deferOn(ps int, encrypted bool) bool {
+	return deferInterior && ps >= 256 && remapCapFor(ps, encrypted) > 0
+}
 
 var remapMagic = [4]byte{'J', 'R', 'M', 'P'}
 
-// remapState is the remap list in memory. fwd maps the page id an on-disk pointer holds to the page
-// the node is at now; rev is its inverse.
+// remapState is the remap list in memory. fwd maps the page id an on-disk pointer holds to where the
+// node is now (with its tag in an encrypted file); rev maps a current page back to that id.
 type remapState struct {
-	fwd map[uint32]uint32
+	fwd map[uint32]pageRef
 	rev map[uint32]uint32
 }
 
 func newRemapState() *remapState {
-	return &remapState{fwd: map[uint32]uint32{}, rev: map[uint32]uint32{}}
+	return &remapState{fwd: map[uint32]pageRef{}, rev: map[uint32]uint32{}}
 }
 
 func (r *remapState) len() int {
@@ -71,22 +89,22 @@ func (r *remapState) clone() *remapState {
 	if r != nil {
 		for k, v := range r.fwd {
 			out.fwd[k] = v
-			out.rev[v] = k
+			out.rev[v.page] = k
 		}
 	}
 	return out
 }
 
-// replace records that the node at page old now lives at page cur, in the same slot of a parent whose
+// replace records that the node at page old now lives at cur, in the same slot of a parent whose
 // page is not rewritten.
-func (r *remapState) replace(old, cur uint32) {
+func (r *remapState) replace(old uint32, cur pageRef) {
 	disk := old
 	if d, ok := r.rev[old]; ok {
 		disk = d
 		delete(r.rev, old)
 	}
 	r.fwd[disk] = cur
-	r.rev[cur] = disk
+	r.rev[cur.page] = disk
 }
 
 // drop forgets the entry that resolves to page: its parent was written fresh and names it directly.
@@ -98,9 +116,9 @@ func (r *remapState) drop(page uint32) {
 }
 
 // lookup is where the node an on-disk pointer calls page lives now.
-func (r *remapState) lookup(page uint32) (uint32, bool) {
+func (r *remapState) lookup(page uint32) (pageRef, bool) {
 	if r == nil {
-		return 0, false
+		return pageRef{}, false
 	}
 	to, ok := r.fwd[page]
 	return to, ok
@@ -119,30 +137,39 @@ func (r *remapState) held() []uint32 {
 	return out
 }
 
-// metaRemapReserve is the bytes a meta page sets aside for its remap list: remapReserve when it
-// carries the marker, else 0.
+// metaRemapReserve is the bytes a meta page sets aside for its remap list: remapReserveFor when it
+// carries the marker at the end of its area, else 0.
 func metaRemapReserve(m []byte) int {
 	n := len(m)
-	if n < remapMinPage || m[6] != 0 {
+	if n < 256 {
 		return 0
 	}
-	if [4]byte(m[n-4:]) != remapMagic {
+	encrypted := m[6] != 0
+	_, hi := remapArea(n, encrypted)
+	if remapCapFor(n, encrypted) == 0 || [4]byte(m[hi-4:hi]) != remapMagic {
 		return 0
 	}
-	return remapReserveFor(n)
+	return remapReserveFor(n, encrypted)
 }
 
-// encodeRemap writes the list into a plaintext meta page (before its checksum is computed).
+// encodeRemap writes the list into a meta page, before its checksum is computed and before an
+// encrypted meta is sealed (the seal authenticates the whole page, the list included).
 func encodeRemap(m []byte, r *remapState) {
-	n := len(m)
-	copy(m[n-4:], remapMagic[:])
+	encrypted := m[6] != 0
+	_, hi := remapArea(len(m), encrypted)
+	size := remapEntrySize(encrypted)
+	copy(m[hi-4:], remapMagic[:])
 	keys := r.held()
 	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
-	binary.BigEndian.PutUint32(m[n-8:], uint32(len(keys)))
+	binary.BigEndian.PutUint32(m[hi-8:], uint32(len(keys)))
 	for i, k := range keys {
-		at := n - 8 - 8*(i+1)
+		at := hi - 8 - size*(i+1)
+		to := r.fwd[k]
 		binary.BigEndian.PutUint32(m[at:], k)
-		binary.BigEndian.PutUint32(m[at+4:], r.fwd[k])
+		binary.BigEndian.PutUint32(m[at+4:], to.page)
+		if encrypted {
+			copy(m[at+8:at+size], to.tag[:])
+		}
 	}
 }
 
@@ -151,20 +178,26 @@ func decodeRemap(m []byte) (*remapState, bool) {
 	if metaRemapReserve(m) == 0 {
 		return nil, true
 	}
-	n := len(m)
-	count := int(binary.BigEndian.Uint32(m[n-8:]))
-	if count > remapCapFor(n) {
+	encrypted := m[6] != 0
+	_, hi := remapArea(len(m), encrypted)
+	size := remapEntrySize(encrypted)
+	count := int(binary.BigEndian.Uint32(m[hi-8:]))
+	if count > remapCapFor(len(m), encrypted) {
 		return nil, false
 	}
 	r := newRemapState()
 	for i := 0; i < count; i++ {
-		at := n - 8 - 8*(i+1)
-		k, v := binary.BigEndian.Uint32(m[at:]), binary.BigEndian.Uint32(m[at+4:])
-		if _, dup := r.fwd[k]; dup || k == 0 || v == 0 {
+		at := hi - 8 - size*(i+1)
+		k := binary.BigEndian.Uint32(m[at:])
+		to := pageRef{page: binary.BigEndian.Uint32(m[at+4:])}
+		if encrypted {
+			copy(to.tag[:], m[at+8:at+size])
+		}
+		if _, dup := r.fwd[k]; dup || k == 0 || to.page == 0 {
 			return nil, false
 		}
-		r.fwd[k] = v
-		r.rev[v] = k
+		r.fwd[k] = to
+		r.rev[to.page] = k
 	}
 	return r, true
 }
@@ -185,9 +218,9 @@ type catState struct {
 
 // originOf is the persisted page a copy of n replaces, and whether the copy's separators are still
 // that page's.
-func originOf(n *pnode) (uint32, bool) {
+func originOf(n *pnode) (pageRef, bool) {
 	if n.page != 0 {
-		return n.page, true
+		return n.ref(), true
 	}
 	return n.origin, n.sameKeys
 }

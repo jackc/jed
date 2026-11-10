@@ -44,18 +44,22 @@ page from disk consults the list.
 
 ## 3. What the prototype does
 
-**Meta page.** A plaintext meta ends with a 4-byte marker, a 4-byte count, and up to 340 eight-byte
-entries (`disk page`, `current page`), sorted by disk page. The inline manifest ends before this
-region (2,728 bytes), so it holds 450 entries instead of 677 at 8 KiB. Below 4 KiB the list takes a
-third of the space after the header (8 entries at 256 bytes, 40 at 1,024), so the simulator's small
-pages carry one. A meta without the marker has the v50 layout.
+**Meta page.** The inline manifest area of a meta ends with a 4-byte marker, a 4-byte count, and
+before them the entries, sorted by disk page: `disk page`, `current page` (8 bytes), and in an
+encrypted file the current page's tag as well (24 bytes), since every pointer there binds the page it
+names. The region is 2,728 bytes from 4 KiB up: 340 entries in a plaintext meta, 113 in an encrypted
+one, leaving 450 inline manifest entries instead of 677 at 8 KiB. Below 4 KiB the list takes a third
+of the area, so the simulator's small pages carry one (7 entries at 256 bytes plaintext, 12 at 1,024
+encrypted). In an encrypted meta the region sits before the reserve and is covered by the meta's
+seal like the rest of the page. A meta without the marker has the v50 layout.
 
 **Commit.** Tree mutation records, on each dirty node, the persisted page it replaces one for one
 (`origin`) and whether an interior's separators are still that page's (`sameKeys`). At serialization
 an interior with both, whose rewritten children all have origins, keeps its page; its moved children
 become entries. Otherwise it is written and names its children directly, so their entries are
-dropped. The commit defers when the file is plaintext, the handle is the owner, no relaxed batch is
-pending, and the list has room for every dirty node; otherwise it folds.
+dropped. A retained interior keeps its origin's page and tag. The commit defers when the list has room for
+every dirty node; otherwise it folds. Encrypted files, page clients, and commits inside a
+`synchronous = off` batch all defer (§6).
 
 **Recovery and validation.** The manifest no longer has to name the catalog root, which an earlier
 commit may have written (the same relaxation the kept chain needed for the free-list head).
@@ -116,8 +120,21 @@ know the list; anything cross-core; the page-service process corpus; the race de
   without a list.
 - **Trailing truncation** is weaker: held page ids and stale interiors can sit at the top of the file
   (one truncation test fails with the switch on).
-- **Encrypted files, page clients, and relaxed batches** fold on every commit, so they gain nothing.
-  An encrypted entry must carry the moved page's tag (24 bytes instead of 8).
+- **Relaxed batches defer.** One rule was needed: a batch is open while its pending set is non-empty,
+  so a relaxed commit must write at least one page. A commit with no dirty tree node rewrites the
+  catalog instead of keeping it. (Without the rule the simulator's durability oracle failed 2 of
+  1,320 traces.)
+- **Page clients defer.** Every reload takes the list from the meta it selects, and forgets the kept
+  catalog chain, since another process may have written the catalog. The owner does not yet check a
+  client's list against the client's pages, and the wire fixtures are unchanged.
+- **Encrypted files defer.** The same single-row commits on an encrypted copy of the test database
+  write 17, 46, and 45 KB, against 41, 91, and 90 KB without deferral: slightly more than plaintext,
+  because a third as many entries fit and folds come sooner. The randomized test passes on an
+  encrypted file. The simulator's `replay` step does not yet put an old page back at a remap
+  entry, which is a new kind of bound pointer; that case is untested and needs the security review.
+- With all three on, `mise run sim:sweep 1..200 all go` (4,400 traces) passes; the four encryption
+  profiles (60 seeds each) recorded 1,014 commits that left a non-empty list and 5,556 opens that
+  applied one.
 - **Fold mutates nothing shared**, but deferral sets a page id on the committing snapshot's own nodes
   and the commit path swaps `paging.remap` during planning; neither was reviewed for races.
 - **A discarded plan** (`unassignPages`) does not undo a retained interior. The budget precheck

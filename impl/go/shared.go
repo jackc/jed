@@ -734,21 +734,25 @@ func (st *storage) commitDurable(snap *snapshot, canReclaim, canReuse bool, budg
 		// is stale, fold — write every stale interior fresh and empty the remap list.
 		var d *deferCtx
 		var prevCat *catState
-		if st.paging.codec() == nil {
-			canDefer := deferOn(int(st.pageSize)) && !st.serviceClient && !pending && !st.relaxedFile() &&
-				st.paging.remap.len()+snap.dirtyNodeCount() <= remapCapFor(int(st.pageSize))
-			if canDefer {
-				d = &deferCtx{remap: st.paging.remap.clone()}
-				prevCat = st.paging.cat
-			} else {
-				snap.unstale()
+		encrypted := st.paging.codec() != nil
+		canDefer := deferOn(int(st.pageSize), encrypted) &&
+			st.paging.remap.len()+snap.dirtyNodeCount() <= remapCapFor(int(st.pageSize), encrypted)
+		if canDefer {
+			d = &deferCtx{remap: st.paging.remap.clone()}
+			prevCat = st.paging.cat
+			// A relaxed batch is open while its pending set is non-empty, so a relaxed commit must
+			// write at least one page: with no dirty tree node, rewrite the catalog.
+			if st.relaxedFile() && snap.dirtyNodeCount() == 0 {
+				prevCat = nil
 			}
+		} else {
+			snap.unstale()
 		}
 		write, err := snap.incrementalImageDeferred(st.pageSize, st.pageCount, st.freePages, canReuse, allowed, st.paging, d, prevCat)
 		if err != nil {
 			return err
 		}
-		if deferOn(int(st.pageSize)) && st.paging.codec() == nil && write.remap == nil {
+		if deferOn(int(st.pageSize), encrypted) && write.remap == nil {
 			write.remap = newRemapState() // a folded commit publishes an empty list
 		}
 		live, err := st.admitFile(write, budget)

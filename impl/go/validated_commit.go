@@ -55,22 +55,18 @@ func zeroBytes(b []byte) bool {
 // after the header, before an encrypted meta's reserve. An encrypted meta's inline manifest starts
 // after the catalog-root and free-list tags (spec/fileformat/encrypted.md §6).
 func manifestInlineArea(ps int, pcap pageCap) (int, int) {
-	if pcap.encrypted() {
-		return 96, ps - cryptoReserve
+	lo, hi := remapArea(ps, pcap.encrypted())
+	if deferOn(ps, pcap.encrypted()) { // PROTOTYPE (remap.go): the remap list takes the end of the area
+		hi -= remapReserveFor(ps, pcap.encrypted())
 	}
-	if deferOn(ps) { // PROTOTYPE (remap.go): the remap list takes the end of the page
-		return 64, ps - remapReserveFor(ps)
-	}
-	return 64, ps
+	return lo, hi
 }
 
 // manifestInlineAreaOf is the inline manifest area of the meta page m as m itself declares it: a
 // meta carrying a remap list (remap.go) ends its manifest before the list.
 func manifestInlineAreaOf(m []byte, pcap pageCap) (int, int) {
-	if pcap.encrypted() {
-		return 96, len(m) - cryptoReserve
-	}
-	return 64, len(m) - metaRemapReserve(m)
+	lo, hi := remapArea(len(m), pcap.encrypted())
+	return lo, hi - metaRemapReserve(m)
 }
 
 func manifestInlineCapacity(ps int, pcap pageCap) int {
@@ -447,7 +443,7 @@ func commitManifest(pcap pageCap, ps uint32, txid uint64, root pageRef, pageCoun
 		pages = append(pages, dirtyPage{index: id, bytes: block})
 	}
 	binary.BigEndian.PutUint64(meta[48:], chainCRC)
-	if deferOn(int(ps)) && !pcap.encrypted() { // PROTOTYPE (remap.go)
+	if deferOn(int(ps), pcap.encrypted()) { // PROTOTYPE (remap.go)
 		encodeRemap(meta, remap)
 	}
 	binary.BigEndian.PutUint32(meta[32:], metaCRC(meta))

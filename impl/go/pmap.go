@@ -80,7 +80,7 @@ type pnode struct {
 	// parent's slot (0: none — a split or merge product). sameKeys says a dirty interior's separators
 	// are still that page's, so only its child pointers differ. stale marks a persisted interior whose
 	// on-disk child pointers are behind the resident ones (the remap list covers the difference).
-	origin   uint32
+	origin   pageRef
 	sameKeys bool
 	stale    bool
 }

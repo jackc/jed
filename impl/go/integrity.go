@@ -323,9 +323,7 @@ func (k *integrityChecker) checkLiveGeneration(pin *integrityPin) error {
 			return err
 		}
 	}
-	if k.paging.codec() == nil {
-		k.remap, _ = decodeRemap(pin.metaRaw)
-	}
+	k.remap, _ = decodeRemap(pin.metaRaw)
 	protected, bad, valid, err := commitManifestDependencies(k.gen.meta, pin.metaRaw, k.paging.pgr.pageSize, k.paging.readBlock)
 	if err != nil {
 		return err
@@ -1690,7 +1688,7 @@ func (k *integrityChecker) checkFreeList() error {
 func (k *integrityChecker) remapChildren(children []pageRef) {
 	for i := range children {
 		if to, ok := k.remap.lookup(children[i].page); ok {
-			children[i].page = to
+			children[i] = to
 		}
 	}
 }

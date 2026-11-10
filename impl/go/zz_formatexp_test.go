@@ -90,7 +90,7 @@ func expScale(n int) int {
 }
 
 func expBuild(t testing.TB, path string, pageSize uint32) *Database {
-	db, err := CreateDatabase(CreateOptions{Path: path, PageSize: pageSize, SkipFsync: true})
+	db, err := CreateDatabase(CreateOptions{Path: path, PageSize: pageSize, SkipFsync: true, Credential: expCredential()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1058,7 +1058,7 @@ func TestCommitWriteExperiment(t *testing.T) {
 	}
 	before := countRows(t, db, "orders")
 	db.Close()
-	db, err = OpenDatabase(path)
+	db, err = OpenDatabaseWithOptions(path, OpenOptions{SkipFsync: true, Credential: expCredential()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1160,10 +1160,15 @@ func TestDeferInteriorStress(t *testing.T) {
 	if !deferInterior {
 		t.Skip("set JED_DEFER_INTERIOR=on")
 	}
+	t.Run("plaintext", func(t *testing.T) { deferInteriorStress(t, nil) })
+	t.Run("encrypted", func(t *testing.T) { deferInteriorStress(t, KeyCredential([32]byte{1, 2, 3})) })
+}
+
+func deferInteriorStress(t *testing.T, cred *Credential) {
 	SetVerifyLivePages(true)
 	defer SetVerifyLivePages(false)
 	path := filepath.Join(t.TempDir(), "defer.jed")
-	db, err := CreateDatabase(CreateOptions{Path: path, SkipFsync: true})
+	db, err := CreateDatabase(CreateOptions{Path: path, SkipFsync: true, Credential: cred})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1256,7 +1261,7 @@ func TestDeferInteriorStress(t *testing.T) {
 		if i%400 == 399 {
 			pendingEntries := db.core.storage.paging.remap.len()
 			db.Close()
-			if db, err = OpenDatabase(path); err != nil {
+			if db, err = OpenDatabaseWithOptions(path, OpenOptions{SkipFsync: true, Credential: cred}); err != nil {
 				t.Fatalf("commit %d: reopen: %v", i, err)
 			}
 			if got := db.core.storage.paging.remap.len(); got != pendingEntries {
@@ -1277,4 +1282,13 @@ func TestDeferInteriorStress(t *testing.T) {
 	}
 	t.Logf("%d reopens; %d commits left an empty remap list; final list %d entries", reopens, folds, db.core.storage.paging.remap.len())
 	db.Close()
+}
+
+// expCredential is a fixed key when JED_FORMAT_EXP_ENCRYPT is set, so the experiments run on an
+// encrypted file; nil otherwise.
+func expCredential() *Credential {
+	if os.Getenv("JED_FORMAT_EXP_ENCRYPT") == "" {
+		return nil
+	}
+	return KeyCredential([32]byte{7})
 }

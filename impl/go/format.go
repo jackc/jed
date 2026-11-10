@@ -1450,18 +1450,18 @@ func serializeDirty(n *pnode, colTypes []colType, memo *compressMemo, seal seale
 		// PROTOTYPE (remap.go): an interior whose separators are its persisted page's, and whose
 		// rewritten children each replace a persisted node one for one, keeps its page. The remap
 		// list records where those children went.
-		deferrable := n.origin != 0 && n.sameKeys
+		deferrable := n.origin.page != 0 && n.sameKeys
 		for _, i := range moved {
 			c := n.children[i].node
-			deferrable = deferrable && (c.origin != 0)
+			deferrable = deferrable && (c.origin.page != 0)
 		}
 		if deferrable {
 			for _, i := range moved {
-				if c := n.children[i].node; childPages[i].page != c.origin {
-					d.remap.replace(c.origin, childPages[i].page)
+				if c := n.children[i].node; childPages[i].page != c.origin.page {
+					d.remap.replace(c.origin.page, childPages[i])
 				}
 			}
-			n.setRef(pageRef{page: n.origin})
+			n.setRef(n.origin) // its page and, in an encrypted file, that page's tag
 			n.stale = true
 			d.retained++
 			return n.ref(), nil
@@ -1469,8 +1469,8 @@ func serializeDirty(n *pnode, colTypes []colType, memo *compressMemo, seal seale
 		// Written fresh: it names its children directly, so their entries go.
 		for i, c := range n.children {
 			d.remap.drop(childPages[i].page)
-			if c.node != nil && c.node.origin != 0 {
-				d.remap.drop(c.node.origin)
+			if c.node != nil && c.node.origin.page != 0 {
+				d.remap.drop(c.node.origin.page)
 			}
 		}
 	}
@@ -1743,6 +1743,7 @@ func loadEngineSharedPagingAt(paging *sharedPaging, env *Environment, at loadAt)
 		// PROTOTYPE (remap.go): the selected meta's remap list redirects child pointers as the
 		// skeleton is read.
 		paging.remap = mt.remap
+		paging.cat = nil // another process may have written the catalog since this one last did
 		if mt.remap.len() > 0 {
 			remapStat('o')
 		} else {
@@ -2167,7 +2168,7 @@ func collectLeafOverflowWith(read func(pageRef) ([]byte, error), pcap pageCap, p
 				return err
 			}
 			if to, ok := remap.lookup(cp.page); ok { // PROTOTYPE (remap.go)
-				cp.page = to
+				cp = to
 			}
 			cps = append(cps, cp)
 		}
@@ -2708,9 +2709,9 @@ func freeListCandidates(snap *snapshot, paging *sharedPaging, catRoot pageRef, w
 		// can be listed free and reused; the ids the surviving entries are keyed by stay off the list.
 		if remap != nil {
 			for disk, cur := range remap.fwd {
-				if !reached[cur] {
+				if !reached[cur.page] {
 					delete(remap.fwd, disk)
-					delete(remap.rev, cur)
+					delete(remap.rev, cur.page)
 				}
 			}
 			for _, p := range remap.held() {
@@ -2802,7 +2803,7 @@ func readSkeletonNode(paging *sharedPaging, pageIdx pageRef, colTypes []colType,
 				return childRef{}, 0, err
 			}
 			if to, ok := remap.lookup(cp.page); ok { // PROTOTYPE (remap.go)
-				cp.page, stale = to, true
+				cp, stale = to, true
 			}
 			childPtrs = append(childPtrs, cp)
 		}
