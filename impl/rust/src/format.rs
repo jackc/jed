@@ -1350,6 +1350,10 @@ fn value_facts(ty: &ColType, v: &Value) -> (usize, usize) {
             };
             (payload + inline_header_len(ty), payload)
         }
+        // text and bytea are a tag, a u16 length and the bytes ([`encode_scalar`]), and their
+        // payload is the bytes: no encoding is needed to size them.
+        Value::Text(s) => (3 + s.len(), if is_spillable(ty) { s.len() } else { 0 }),
+        Value::Bytea(b) => (3 + b.len(), if is_spillable(ty) { b.len() } else { 0 }),
         v => {
             let inline = encode_value(ty, v).len();
             let payload = if is_spillable(ty) {
@@ -1379,6 +1383,22 @@ fn value_facts(ty: &ColType, v: &Value) -> (usize, usize) {
 /// (pass 2 ran, so pass 1 visited every candidate first), and an inline- or external-compressed
 /// one was adopted with the block it stores. Only an inline-deferred value, whose stored form
 /// records no outcome, is compressed when an attempt reaches it — from the bytes it holds.
+/// The record's size with every value inline and uncompressed, when that fits `RECORD_MAX` — the
+/// common case, in which [`plan_dispositions`] changes nothing: every disposition is inline, the
+/// record size is this, and nothing is compressed or externalized.
+fn all_inline_size(col_types: &[ColType], key: &[u8], row: &[Value], cap: Cap) -> Option<usize> {
+    let size = key.len()
+        + col_types
+            .iter()
+            .zip(row.iter())
+            .map(|(ty, v)| match fixed_value_width(ty) {
+                Some(w) => w,
+                None => value_facts(ty, v).0,
+            })
+            .sum::<usize>();
+    (size <= record_max(cap.c, col_types.len())).then_some(size)
+}
+
 fn plan_dispositions(col_types: &[ColType], key: &[u8], row: &[Value], cap: Cap) -> RecordPlan {
     // Each column's inline-plain contribution to `record_size` (the v24 basis — format.md
     // "Record"): a fixed-width column always its width (a NULL occupies a zero-filled slot); a
@@ -1567,6 +1587,9 @@ pub(crate) fn record_footprint(
     row: &Row,
     cap: Cap,
 ) -> (usize, usize) {
+    if let Some(size) = all_inline_size(col_types, key, row, cap) {
+        return (size, size);
+    }
     let plan = plan_dispositions(col_types, key, row, cap);
     (plan.size, plan.size + plan.external)
 }
@@ -4247,29 +4270,35 @@ fn encode_leaf_pax<K: AsRef<[u8]>>(
     // Encode each value in (record, column) order; overflow chains allocate here. A fixed-width
     // column's slot is the untagged inline body (`encode_value` minus its 0x00 tag; zeros for
     // NULL); a variable column's bytes are the tagged disposed form (empty for NULL).
-    let mut val_bytes: Vec<Vec<Vec<u8>>> = (0..k).map(|_| Vec::with_capacity(n)).collect();
+    // Each column's bodies are laid end to end in one buffer; a variable column also records each
+    // value's end offset, which is its value directory.
+    let mut bodies: Vec<Vec<u8>> = (0..k).map(|_| Vec::new()).collect();
+    let mut ends: Vec<Vec<u32>> = (0..k).map(|_| Vec::new()).collect();
     let mut nulls: Vec<Vec<bool>> = (0..k).map(|_| vec![false; n]).collect();
     for (i, &row) in rows.iter().enumerate() {
-        let plan = plan_dispositions(col_types, keys[i].as_ref(), row, cap);
+        // A record that fits inline needs no plan: every disposition is inline.
+        let plan = match all_inline_size(col_types, keys[i].as_ref(), row, cap) {
+            Some(_) => None,
+            None => Some(plan_dispositions(col_types, keys[i].as_ref(), row, cap)),
+        };
         for (c, (ty, val)) in col_types.iter().zip(row.iter()).enumerate() {
             let is_null = matches!(val, Value::Null);
             nulls[c][i] = is_null;
-            let bytes = match (fixed_value_width(ty), is_null) {
-                (Some(w), true) => vec![0u8; w],
-                (Some(_), false) => encode_value(ty, val)[1..].to_vec(),
-                (None, true) => Vec::new(),
-                (None, false) => encode_disposed_value(
-                    ty,
-                    val,
-                    &plan.disp[c],
-                    plan.payload_len[c],
-                    seal,
-                    take,
-                    ovf,
-                    src,
-                )?,
-            };
-            val_bytes[c].push(bytes);
+            match (fixed_value_width(ty), is_null) {
+                (Some(w), true) => bodies[c].extend(std::iter::repeat_n(0u8, w)),
+                (Some(_), false) => bodies[c].extend_from_slice(&encode_value(ty, val)[1..]),
+                (None, true) => ends[c].push(bodies[c].len() as u32),
+                (None, false) => {
+                    let (disp, payload_len) = match &plan {
+                        Some(plan) => (&plan.disp[c], plan.payload_len[c]),
+                        None => (&Disp::Inline, 0),
+                    };
+                    let bytes =
+                        encode_disposed_value(ty, val, disp, payload_len, seal, take, ovf, src)?;
+                    bodies[c].extend_from_slice(&bytes);
+                    ends[c].push(bodies[c].len() as u32);
+                }
+            }
         }
     }
     let mut out = Vec::new();
@@ -4288,10 +4317,9 @@ fn encode_leaf_pax<K: AsRef<[u8]>>(
     let mut cur = base_after_col_dir;
     for c in 0..k {
         col_start[c] = cur;
-        let bodies: usize = val_bytes[c].iter().map(Vec::len).sum();
         cur += 1 + match fixed_value_width(&col_types[c]) {
-            Some(_) => n.div_ceil(8) + bodies,
-            None => 4 * n + bodies,
+            Some(_) => n.div_ceil(8) + bodies[c].len(),
+            None => 4 * n + bodies[c].len(),
         };
     }
     col_start[k] = cur;
@@ -4311,15 +4339,11 @@ fn encode_leaf_pax<K: AsRef<[u8]>>(
             }
             out.extend_from_slice(&bitmap);
         } else {
-            let mut voff = 0u32;
-            for vb in &val_bytes[c] {
-                voff += vb.len() as u32;
-                out.extend_from_slice(&voff.to_be_bytes());
+            for end in &ends[c] {
+                out.extend_from_slice(&end.to_be_bytes());
             }
         }
-        for vb in &val_bytes[c] {
-            out.extend_from_slice(vb);
-        }
+        out.extend_from_slice(&bodies[c]);
     }
     Ok(out)
 }
