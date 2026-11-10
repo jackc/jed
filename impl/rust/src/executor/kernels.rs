@@ -1,6 +1,7 @@
-//! Scalar string/numeric value kernels (mirrors part of impl/go kernels.go): the string builtins
-//! (pad/trim/translate/split_part, base64/hex codecs, quote_literal/quote_ident, substr/left/right) and
-//! the width_bucket / numeric formatting helpers, as pure value-in/value-out free functions.
+//! Scalar value kernels, as pure value-in/value-out free functions: the string builtins
+//! (pad/trim/translate/split_part, base64/hex codecs, quote_literal/quote_ident, substr/left/right,
+//! LIKE matching), `width_bucket` over an array, and the row / quantified (`ANY`/`ALL`) comparison
+//! kernels.
 
 use super::*;
 
@@ -1119,4 +1120,346 @@ pub(crate) fn string_to_array_value(vals: &[Value]) -> Value {
             })
             .collect(),
     ))
+}
+
+/// Widen a numeric value to `Decimal` (an integer operand of decimal arithmetic).
+pub(crate) fn to_decimal(v: Value) -> Decimal {
+    match v {
+        Value::Decimal(d) => d,
+        Value::Int(n) => Decimal::from_i64(n),
+        _ => unreachable!("resolver guarantees a numeric operand here"),
+    }
+}
+
+// === string / text function kernels (spec/design/string-functions.md) ===============
+
+/// The character-count cap for the result-amplifying string functions (lpad / rpad / repeat):
+/// PostgreSQL's `MaxAllocSize` (0x3FFFFFFF). A requested length above it traps `54000`
+/// (program_limit_exceeded), bounding the allocation an untrusted query can request (CLAUDE.md §13).
+pub(crate) const MAX_RESULT_CHARS: i64 = 0x3FFF_FFFF;
+
+/// The i64 of an integer Value (every int width is stored as `Value::Int`). For the string
+/// functions' integer arguments (start / count / pad length / field number).
+pub(crate) fn int_value(v: &Value) -> i64 {
+    match v {
+        Value::Int(n) => *n,
+        _ => unreachable!("resolver guarantees an integer operand here"),
+    }
+}
+
+/// The three-valued membership fold for `lhs op ANY/ALL(array)` (array-functions.md §11), the
+/// generalization of `in_membership` to all five comparison operators and both quantifiers. A NULL
+/// array → NULL; otherwise, over the flattened elements, `ANY`/`SOME` (all=false) is the OR-fold
+/// (TRUE if any `lhs op e` is TRUE, else NULL if any is NULL, else FALSE; empty → FALSE) and `ALL`
+/// (all=true) is the AND-fold (FALSE if any is FALSE, else NULL if any is NULL, else TRUE; empty →
+/// TRUE). Each element comparison charges one `operator_eval` (+ size-scaled `decimal_work`),
+/// exactly like `in_membership`, so `max_cost` bounds the walk (54P01, CLAUDE.md §13).
+///
+/// `row_wise` is the folded ROW-VALUED subquery form (grammar.md §26): each element compares by
+/// the row-constructor 3VL (`row_cmp3`) rather than `quantified_cmp3`'s composite total order.
+pub(crate) fn quantified_membership(
+    op: CmpOp,
+    all: bool,
+    row_wise: bool,
+    lv: &Value,
+    av: &Value,
+    collation: Option<&Collation>,
+    m: &mut Meter,
+) -> Result<Value> {
+    let arr = match av {
+        Value::Null => return Ok(Value::Null),
+        Value::Array(a) => a,
+        _ => unreachable!("the resolver requires an array right operand"),
+    };
+    let mut any_null = false;
+    for e in &arr.elements {
+        m.charge(COSTS.operator_eval);
+        m.charge(COSTS.decimal_work * ((decimal_cmp_work(lv, e) - 1) as i64));
+        m.guard()?;
+        // A collated ORDERING comparison of two text (or text[]) values sorts by the collation
+        // (spec/design/collation.md §1 "IN / ANY / ALL"), charging `collate` per code point like
+        // `RExpr::Compare`.
+        let collated = match (collation, op, lv, e) {
+            (
+                Some(c),
+                CmpOp::Lt | CmpOp::Gt | CmpOp::Le | CmpOp::Ge,
+                Value::Text(x),
+                Value::Text(y),
+            ) => {
+                m.charge(COSTS.collate * (x.chars().count() as i64 + y.chars().count() as i64));
+                m.guard()?;
+                let ord = collated_cmp(c, x, y)?;
+                let res = match op {
+                    CmpOp::Lt => ord.is_lt(),
+                    CmpOp::Gt => ord.is_gt(),
+                    CmpOp::Le => ord.is_le(),
+                    _ => ord.is_ge(),
+                };
+                Some(if res {
+                    ThreeValued::True
+                } else {
+                    ThreeValued::False
+                })
+            }
+            // Two text[] values (an array-valued `x op ANY/ALL (SELECT …)`) walk their element pairs
+            // under the collation, charging `collate` per compared pair (collation.md §11).
+            (
+                Some(c),
+                CmpOp::Lt | CmpOp::Gt | CmpOp::Le | CmpOp::Ge,
+                Value::Array(x),
+                Value::Array(y),
+            ) => {
+                let ord = collated_array_cmp(c, x, y, Some(m))?;
+                let res = match op {
+                    CmpOp::Lt => ord.is_lt(),
+                    CmpOp::Gt => ord.is_gt(),
+                    CmpOp::Le => ord.is_le(),
+                    _ => ord.is_ge(),
+                };
+                Some(if res {
+                    ThreeValued::True
+                } else {
+                    ThreeValued::False
+                })
+            }
+            _ => Option::None,
+        };
+        let tv = if let Some(tv) = collated {
+            tv
+        } else if row_wise {
+            row_cmp3(op, lv, e)
+        } else {
+            quantified_cmp3(op, lv, e)
+        };
+        match tv {
+            ThreeValued::True => {
+                // ANY short-circuits TRUE; ALL keeps going (TRUE is its neutral element).
+                if !all {
+                    return Ok(Value::Bool(true));
+                }
+            }
+            ThreeValued::False => {
+                // ALL short-circuits FALSE; ANY keeps going (FALSE is its neutral element).
+                if all {
+                    return Ok(Value::Bool(false));
+                }
+            }
+            ThreeValued::Unknown => any_null = true,
+        }
+    }
+    // Drained without a short-circuit: a NULL seen → UNKNOWN; else the quantifier's identity
+    // (ALL → TRUE, ANY → FALSE — also the empty-array result).
+    Ok(if any_null {
+        Value::Null
+    } else {
+        Value::Bool(all)
+    })
+}
+
+/// `width_bucket(operand, thresholds)` (array-functions.md §14) — PostgreSQL's `width_bucket_array`
+/// ported step for step. Both arguments are non-NULL here (the node is strict). A multidimensional
+/// array is 2202E and a NULL element 22004 (checked in that order, before any search, as PG does).
+/// Then the binary search over the thresholds (ASSUMED sorted ascending — not checked, so an
+/// unsorted array yields whatever the search lands on, exactly as in PG): `mid = (left + right) /
+/// 2`; `operand < thresholds[mid]` moves `right` to `mid`, else `left` to `mid + 1`; the result is
+/// the final `left` — the number of thresholds `<=` operand, i.e. the rightmost of equal ones. A
+/// NaN float operand sorts at or above every threshold, so it returns the element count without
+/// searching (PG's float8 shortcut). Each search step charges one `operator_eval` plus the
+/// size-scaled work of the comparison, guarded — `collate` per code point of a collated text pair,
+/// else `decimal_work` / `varlen_compare` — metered like an explicit `<` (the GREATEST/LEAST rule,
+/// cost.md §3), over at most `⌈log₂(n+1)⌉` steps.
+pub(crate) fn width_bucket_array(
+    operand: &Value,
+    thresholds: &Value,
+    collation: Option<&Collation>,
+    m: &mut Meter,
+) -> Result<Value> {
+    let arr = match thresholds {
+        Value::Array(a) => a,
+        _ => unreachable!("the resolver requires an array thresholds argument"),
+    };
+    if arr.dims.len() > 1 {
+        return Err(EngineError::new(
+            SqlState::ArraySubscriptError,
+            "thresholds must be one-dimensional array",
+        ));
+    }
+    if arr.elements.iter().any(|e| matches!(e, Value::Null)) {
+        return Err(EngineError::new(
+            SqlState::NullValueNotAllowed,
+            "thresholds array must not contain NULLs",
+        ));
+    }
+    let mut left = 0usize;
+    let mut right = arr.elements.len();
+    let is_nan = match operand {
+        Value::Float32(f) => f.is_nan(),
+        Value::Float64(f) => f.is_nan(),
+        _ => false,
+    };
+    if is_nan {
+        return Ok(Value::Int(right as i64));
+    }
+    while left < right {
+        let mid = (left + right) / 2;
+        let t = &arr.elements[mid];
+        m.charge(COSTS.operator_eval);
+        let ord = if let (Some(c), Value::Text(x), Value::Text(y)) = (collation, operand, t) {
+            m.charge(COSTS.collate * (x.chars().count() as i64 + y.chars().count() as i64));
+            m.guard()?;
+            collated_cmp(c, x, y)?
+        } else {
+            m.charge(COSTS.decimal_work * ((decimal_cmp_work(operand, t) - 1) as i64));
+            m.charge(COSTS.varlen_compare * (varlen_compare_work(operand, t) - 1));
+            m.guard()?;
+            match (operand, t) {
+                (Value::Int(x), Value::Decimal(y)) => Decimal::from_i64(*x).cmp_value(y),
+                (Value::Decimal(x), Value::Int(y)) => x.cmp_value(&Decimal::from_i64(*y)),
+                (Value::Float32(x), Value::Float64(y)) => {
+                    crate::value::total_cmp_f64(*x as f64, *y)
+                }
+                (Value::Float64(x), Value::Float32(y)) => {
+                    crate::value::total_cmp_f64(*x, *y as f64)
+                }
+                _ => value_cmp(operand, t),
+            }
+        };
+        if ord == std::cmp::Ordering::Less {
+            right = mid;
+        } else {
+            left = mid + 1;
+        }
+    }
+    Ok(Value::Int(left as i64))
+}
+
+/// The row-constructor three-valued comparison `lhs op e` (composite.md §5): the same
+/// `eq3`/`lt3`/`gt3` decomposition `RExpr::Compare` evaluates, so a NULL field at the deciding
+/// position is UNKNOWN (PostgreSQL's row comparison against a subquery row).
+pub(crate) fn row_cmp3(op: CmpOp, x: &Value, e: &Value) -> ThreeValued {
+    match op {
+        CmpOp::Eq => x.eq3(e),
+        CmpOp::Ne => x.eq3(e).not(),
+        CmpOp::Lt => x.lt3(e),
+        CmpOp::Gt => x.gt3(e),
+        CmpOp::Le => x.lt3(e).or(x.eq3(e)),
+        CmpOp::Ge => x.gt3(e).or(x.eq3(e)),
+    }
+}
+
+/// The per-element three-valued comparison `lhs op e` for a quantified node, normalizing a
+/// mixed-width float pair to `f64` first (the resolver admits `f32` vs `f64`, matching
+/// `RExpr::Compare`'s promote — here the array elements are runtime values, so the widen happens per
+/// element). Bottoms out in the value module's `eq3`/`lt3`/`gt3` kernels.
+///
+/// A **composite** operand pair routes through the composite **total order** (`value_cmp`), NOT the
+/// bare-`ROW` 3VL `eq3`/`lt3`/`gt3` (array-functions.md §13): PostgreSQL's `= ANY(addr[])` dispatches
+/// on the composite `=` *operator* = `record_eq`, which is **definite with NULL fields comparable**
+/// (`ROW('a',NULL)::addr = ANY(ARRAY[ROW('a',NULL)::addr])` is TRUE), the same total order
+/// `array_eq` / `@>` already use for composite elements (array.md §5). A **whole-element NULL** is
+/// still UNKNOWN — the operator stays strict at the value level — so the resolver-guaranteed
+/// same-type pair is composite-vs-composite or composite-vs-NULL.
+pub(crate) fn quantified_cmp3(op: CmpOp, x: &Value, e: &Value) -> ThreeValued {
+    if matches!(x, Value::Composite(_)) || matches!(e, Value::Composite(_)) {
+        // A whole-element NULL → UNKNOWN (3VL at the value level); else the definite total order.
+        if matches!(x, Value::Null) || matches!(e, Value::Null) {
+            return ThreeValued::Unknown;
+        }
+        let ord = value_cmp(x, e);
+        let matched = match op {
+            CmpOp::Eq => ord == std::cmp::Ordering::Equal,
+            CmpOp::Ne => ord != std::cmp::Ordering::Equal,
+            CmpOp::Lt => ord == std::cmp::Ordering::Less,
+            CmpOp::Gt => ord == std::cmp::Ordering::Greater,
+            CmpOp::Le => ord != std::cmp::Ordering::Greater,
+            CmpOp::Ge => ord != std::cmp::Ordering::Less,
+        };
+        return if matched {
+            ThreeValued::True
+        } else {
+            ThreeValued::False
+        };
+    }
+    let (xw, ew);
+    let (a, b): (&Value, &Value) = match (x, e) {
+        (Value::Float32(v), Value::Float64(_)) => {
+            xw = Value::Float64(*v as f64);
+            (&xw, e)
+        }
+        (Value::Float64(_), Value::Float32(v)) => {
+            ew = Value::Float64(*v as f64);
+            (x, &ew)
+        }
+        _ => (x, e),
+    };
+    match op {
+        CmpOp::Eq => a.eq3(b),
+        CmpOp::Ne => a.eq3(b).not(),
+        CmpOp::Lt => a.lt3(b),
+        CmpOp::Gt => a.gt3(b),
+        CmpOp::Le => a.lt3(b).or(a.eq3(b)),
+        CmpOp::Ge => a.gt3(b).or(a.eq3(b)),
+    }
+}
+
+/// The SQL `LIKE` matcher (spec/design/grammar.md §22): `%` matches any (possibly empty) run
+/// of characters, `_` matches exactly one character, and `\` (the default escape) makes the
+/// next pattern character literal. It iterates by Unicode **code point** (so astral characters
+/// match `_` correctly — a CLAUDE.md §8 determinism surface), via a two-pointer greedy
+/// backtracking walk identical across the cores. It returns `Err(22025)` when the escape
+/// character is the **last** pattern character *reached during matching* (PostgreSQL's "LIKE
+/// pattern must not end with escape character") — data-dependent, since an earlier mismatch
+/// returns `false` before the escape is reached.
+pub(crate) fn like_match(subject: &str, pattern: &str) -> Result<bool> {
+    let s: Vec<char> = subject.chars().collect();
+    let p: Vec<char> = pattern.chars().collect();
+    let mut si = 0usize;
+    let mut pi = 0usize;
+    // The last '%' position in the pattern (a backtrack point) and the subject index when it
+    // was taken; `None` until a '%' has been seen.
+    let mut star_pi: Option<usize> = None;
+    let mut star_si = 0usize;
+    while si < s.len() {
+        if pi < p.len() && p[pi] == '\\' {
+            // Escape: the next pattern character must match the subject literally.
+            if pi + 1 >= p.len() {
+                return Err(EngineError::new(
+                    SqlState::InvalidEscapeSequence,
+                    "LIKE pattern must not end with escape character",
+                ));
+            }
+            if s[si] == p[pi + 1] {
+                si += 1;
+                pi += 2;
+                continue;
+            }
+            // literal mismatch → fall through to backtrack
+        } else if pi < p.len() && p[pi] == '_' {
+            si += 1;
+            pi += 1;
+            continue;
+        } else if pi < p.len() && p[pi] == '%' {
+            star_pi = Some(pi);
+            star_si = si;
+            pi += 1;
+            continue;
+        } else if pi < p.len() && p[pi] == s[si] {
+            si += 1;
+            pi += 1;
+            continue;
+        }
+        // Mismatch: backtrack to the last '%' (it absorbs one more subject character), else no.
+        if let Some(sp) = star_pi {
+            pi = sp + 1;
+            star_si += 1;
+            si = star_si;
+            continue;
+        }
+        return Ok(false);
+    }
+    // Subject consumed: any pattern remainder must be all '%' to match.
+    while pi < p.len() && p[pi] == '%' {
+        pi += 1;
+    }
+    Ok(pi == p.len())
 }
