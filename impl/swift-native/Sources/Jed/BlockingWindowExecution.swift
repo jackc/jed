@@ -66,7 +66,7 @@ internal final class BlockingWindowExecution {
                 return values[slot]
             }
         }
-        return try plan.projections.map(current.evaluate)
+        return try plan.projections.map { try current.evaluate($0) }
     }
     private func prepare() throws {
         let source = try BlockingRows.gather(plan, context: context)

@@ -31,7 +31,7 @@ internal final class TreeNode: @unchecked Sendable {
     let recordLeaf: RecordLeaf?
     let pending: [Int: [Int: PendingOverflow]]
     fileprivate(set) var keys: [[UInt8]]
-    fileprivate(set) var children: [TreeChild]
+    fileprivate(set) var children: ChildList
     let reference: PageReference?
     fileprivate(set) var payloadSize: Int
     let height: Int
@@ -47,18 +47,23 @@ internal final class TreeNode: @unchecked Sendable {
          emptyPayload: Int = 0) {
         self.leaf = leaf; self.pending = pending; self.reference = reference
         recordLeaf = nil; owner = nil
-        keys = []; children = []; payloadSize = leaf?.payloadSize ?? emptyPayload
+        keys = []; children = ChildList(); payloadSize = leaf?.payloadSize ?? emptyPayload
         height = 1; nodeCount = 1
         containsRecords = leaf != nil
     }
 
     init(records: RecordLeaf, reference: PageReference? = nil) {
         leaf = nil; recordLeaf = records; pending = records.pending; self.reference = reference; owner = nil
-        keys = []; children = []; payloadSize = records.payloadSize
+        keys = []; children = ChildList(); payloadSize = records.payloadSize
         height = 1; nodeCount = 1; containsRecords = !records.records.isEmpty
     }
 
-    init(keys: [[UInt8]], children: [TreeChild], codec: any PageCodec, reference: PageReference? = nil,
+    convenience init(keys: [[UInt8]], children: [TreeChild], codec: any PageCodec, reference: PageReference? = nil,
+                     owner: TreeEditToken? = nil) {
+        self.init(keys: keys, children: ChildList(children), codec: codec, reference: reference, owner: owner)
+    }
+
+    init(keys: [[UInt8]], children: ChildList, codec: any PageCodec, reference: PageReference? = nil,
          owner: TreeEditToken? = nil) {
         leaf = nil; recordLeaf = nil; pending = [:]; self.keys = keys; self.children = children; self.reference = reference
         self.owner = owner
@@ -98,15 +103,15 @@ internal final class TreeNode: @unchecked Sendable {
 
     /// Hands this node's routing arrays to its owning batch, leaving them
     /// unshared so the batch can edit them without a copy.
-    fileprivate func takeRouting() -> (keys: [[UInt8]], children: [TreeChild]) {
+    fileprivate func takeRouting() -> (keys: [[UInt8]], children: ChildList) {
         let taken = (keys, children)
-        keys = []; children = []
+        keys = []; children = ChildList()
         return taken
     }
 
     /// `init(keys:children:codec:)` applied to this node itself: the same
     /// derived sizes. Siblings have equal depth, so the height stands.
-    fileprivate func setRouting(keys: [[UInt8]], children: [TreeChild], codec: any PageCodec) {
+    fileprivate func setRouting(keys: [[UInt8]], children: ChildList, codec: any PageCodec) {
         self.keys = keys; self.children = children
         payloadSize = PackedInterior.payloadSize(keys: keys, codec: codec)
         nodeCount = children.reduce(1) { $0 + $1.nodeCount }
@@ -292,6 +297,20 @@ internal struct BPlusTree: Sendable {
         }
     }
 
+    /// Where `key` is stored, by the same descent as `get`, without building
+    /// its record.
+    func position(of key: [UInt8]) throws -> TreePosition? {
+        guard var child = root else { return nil }
+        while true {
+            let node = try resolve(child)
+            if node.isLeaf {
+                let slot = node.leafSlot(key)
+                return slot.found ? TreePosition(node: node, row: slot.index) : nil
+            }
+            child = node.children[node.childSlot(key)]
+        }
+    }
+
     func get(_ key: [UInt8]) throws -> PackedRecord? {
         guard var child = root else { return nil }
         while true {
@@ -432,7 +451,7 @@ internal struct BPlusTree: Sendable {
         // No admissible interior split is normally only a delete-merge case.
         // An already oversized pending separator may also reach it: preserve
         // the pending shape and let commit preflight reject it safely.
-        return buildInterior(keys, children: children, edited: index)
+        return buildInterior(keys, children: Array(children), edited: index)
             ?? .whole(TreeNode(keys: keys, children: children, codec: codec, owner: editToken))
     }
 
@@ -476,7 +495,7 @@ internal struct BPlusTree: Sendable {
         if left.isLeaf { result = try buildLeaf(left.records() + right.records(), edited: nil) }
         else {
             guard let merged = buildInterior(left.keys + [parent.keys[index]] + right.keys,
-                children: left.children + right.children, edited: nil) else { return parent }
+                children: Array(left.children) + Array(right.children), edited: nil) else { return parent }
             result = merged
         }
         if case .split(_, let separator, _) = result {

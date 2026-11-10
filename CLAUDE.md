@@ -180,6 +180,10 @@ statement-scoped structs and added in-place edit batches for one statement's
 writes. Swift/Rust is 2.92× overall (per-statement paths 3.86×, scans 2.56×);
 the same four gates were re-run, plus new unit tests for the batch and the
 Swift-only saved simulation regressions and encrypted corpus.
+A fourth pass the same day added encoded integer predicates, in-place page
+reads, a leaf-at-a-time fold for statements with no cost ceiling or
+cancellation token, and cheaper general grouping. Swift/Rust is 1.52× overall
+(scans 0.79×; per-statement paths 3.69×), with the same gates re-run.
 
 The maintainer approved Ruby's OpenSSL binding for vetted cryptographic digest
 functions and stdlib Zlib for byte-identical CRC32 checksums in this experiment.

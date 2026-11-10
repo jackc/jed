@@ -258,11 +258,34 @@ internal final class GroupedSelectExecution {
         }
         // Without grouping keys the single group and its states never change.
         let fixedStates: [AggregateState]? = aggregate.keys.isEmpty ? groups[0].states : nil
+        // When nothing can observe one row's charge apart from the next, an
+        // ungrouped fold of integer cells is computed a leaf at a time.
+        var runKernels: [AggregateState.RunKernel] = []
+        if direct, meter.isUnobserved, let fixedStates {
+            let types = plan.store!.tree.types
+            for (ordinal, state) in fixedStates.enumerated() {
+                guard let kernel = state.runKernel else { break }
+                switch (reads[ordinal], kernel) {
+                case (.star, .countStar), (.nullness, .count): runKernels.append(kernel)
+                case (.direct(let slot), .integerSum), (.direct(let slot), .extreme):
+                    guard case .scalar(let scalar) = types[decoded[slot]].type, scalar.integerWidth != nil else { break }
+                    runKernels.append(kernel)
+                default: break
+                }
+            }
+            if runKernels.count != fixedStates.count { runKernels = [] }
+        }
         while let run = try input.nextRun() {
             let node = run.node
             // A clean page decodes common scalars in place; pending overflow
             // values and writer leaves take the general position path.
             let packed: PackedLeaf? = node.pending.isEmpty ? node.leaf : nil
+            if !runKernels.isEmpty, let packed, let fixedStates,
+               Self.foldRun(run, leaf: packed, states: fixedStates, kernels: runKernels, reads: reads, decoded: decoded) {
+                // Per row: one admission unit and one unit per aggregate.
+                meter.charge(Int64(run.count) * Int64(1 + fixedStates.count))
+                continue
+            }
             for ordinal in 0..<run.count {
                 let index = run.row(ordinal)
                 try input.admitRow()
@@ -309,6 +332,48 @@ internal final class GroupedSelectExecution {
                 }
             }
         }
+    }
+    /// Folds every row of `run` into `states`, or changes nothing and returns
+    /// false when a row needs the one-at-a-time path to report its error (an
+    /// overflowing sum or count, a closed state). The caller has matched each
+    /// kernel to its operand and to an integer column.
+    private static func foldRun(_ run: TreeRun, leaf: PackedLeaf, states: [AggregateState],
+                                kernels: [AggregateState.RunKernel], reads: [PackedOperand], decoded: [Int]) -> Bool {
+        var rows = [Int64](repeating: 0, count: states.count)
+        var values = [Int64?](repeating: nil, count: states.count)
+        for ordinal in states.indices {
+            let start = states[ordinal].runStart
+            guard start.usable else { return false }
+            var counted: Int64 = 0
+            switch (reads[ordinal], kernels[ordinal]) {
+            case (.star, _): counted = Int64(run.count)
+            case (.nullness(let column), _):
+                for position in 0..<run.count where !leaf.isNull(row: run.row(position), column: column) { counted += 1 }
+            case (.direct(let slot), .integerSum):
+                let column = decoded[slot]
+                var sum = start.value ?? 0
+                for position in 0..<run.count {
+                    guard let value = leaf.fastInteger(row: run.row(position), column: column) else { continue }
+                    let next = sum.addingReportingOverflow(value)
+                    if next.overflow { return false }
+                    sum = next.partialValue; counted += 1
+                }
+                values[ordinal] = sum
+            case (.direct(let slot), .extreme(let minimum)):
+                let column = decoded[slot]
+                var best = start.value
+                for position in 0..<run.count {
+                    guard let value = leaf.fastInteger(row: run.row(position), column: column) else { continue }
+                    if let held = best { if minimum ? value < held : value > held { best = value } } else { best = value }
+                }
+                values[ordinal] = best
+            default: return false
+            }
+            guard counted <= states[ordinal].runHeadroom else { return false }
+            rows[ordinal] = counted
+        }
+        for ordinal in states.indices { states[ordinal].applyRun(rows: rows[ordinal], value: values[ordinal]) }
+        return true
     }
     private func create(keys: [SQLValue], selected: [SQLValue], key: [UInt8]) throws -> Int {
         let bytes = selected.reduce(GeneratedSpec.memoryEntry) { saturatingAdd($0, MemorySizes.value($1)) }

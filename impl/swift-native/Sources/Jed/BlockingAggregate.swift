@@ -78,6 +78,19 @@ internal enum BlockingAggregate {
             }
         }
         if members.isEmpty { try groups.put([], value: fresh(0)); try keys.append([]) }
+        // Per-call facts and scratch accumulators that do not vary by row. A
+        // plain accumulator is wholly replaced by `restore`, so one serves
+        // every row; a state that retains inputs is still made per row.
+        let calls = aggregate.calls
+        let hypothetical = calls.map { AggregateOrderedSet.hypothetical.contains($0.plan.name) && !$0.plan.withinGroup.isEmpty }
+        let keepsNull = calls.map { ["array_agg", "json_agg", "jsonb_agg", "json_agg_strict", "jsonb_agg_strict"].contains($0.plan.name) }
+        let scratch: [AggregateState?] = calls.map { call in
+            guard call.order.isEmpty else { return nil }
+            let state = AggregateState(plan: call.plan, context: context, bounded: true)
+            if state.retainsInputs { state.close(); return nil }
+            return state
+        }
+        defer { for state in scratch { state?.close() } }
         do {
             let cursor = try input.cursor(); defer { cursor.close() }
             // One evaluation context serves every row; only the row it reads
@@ -93,14 +106,16 @@ internal enum BlockingAggregate {
                     if bytes > 0 { context.meter.charge(bytes); try context.meter.guardCost() }
                 }
                 var packed: [SQLValue]
-                if let stored = try groups.get(key) { packed = stored }
+                let found = try groups.find(key)
+                if let stored = found.value { packed = stored }
                 else { packed = fresh(keys.count); try keys.append(key) }
                 guard case .integer(let group) = packed[0] else { throw JedError("58030", "invalid aggregate group state") }
-                for (ordinal, call) in aggregate.calls.enumerated() {
+                for ordinal in calls.indices {
+                    let call = calls[ordinal]
                     if let filter = call.filter, case .boolean(true) = try current.evaluate(filter) {} else if call.filter != nil { continue }
                     context.meter.charge(1)
-                    let owner = try owner(group: group, ordinal: ordinal, count: aggregate.calls.count)
-                    if AggregateOrderedSet.hypothetical.contains(call.plan.name), !call.plan.withinGroup.isEmpty {
+                    let owner = try owner(group: group, ordinal: ordinal, count: calls.count)
+                    if hypothetical[ordinal] {
                         var arguments: [SQLValue] = []
                         for (index, expression) in call.arguments.enumerated() {
                             let value = try current.evaluate(expression)
@@ -110,28 +125,28 @@ internal enum BlockingAggregate {
                         try collections.append(hash: owner, row: arguments); continue
                     }
                     if call.arguments.count > 1 && call.plan.withinGroup.isEmpty { context.meter.charge(1); try context.meter.step() }
-                    let arguments = try call.arguments.map(current.evaluate)
+                    let arguments = try call.arguments.map { try current.evaluate($0) }
                     let ordered: [SQLValue]?
                     if call.order.isEmpty { ordered = nil }
                     else { ordered = try AggregateOrdering(order: call.order, context: context).tuple(arguments: arguments, current: current) }
                     if call.distinct {
                         let operand = arguments.count == 1 ? arguments[0] : .composite(arguments)
-                        let keepsNull = ["array_agg", "json_agg", "jsonb_agg", "json_agg_strict", "jsonb_agg_strict"].contains(call.plan.name)
-                        if operand.isNull && !keepsNull { continue }
+                        if operand.isNull && !keepsNull[ordinal] { continue }
                         let bytes = MemorySizes.payload(operand)
                         if bytes > 0 { context.meter.charge(bytes); try context.meter.guardCost() }
                         guard try seen.insert([.integer(group), .integer(Int64(ordinal)), operand]) else { continue }
                     }
                     if let ordered { try collections.append(hash: owner, row: ordered); continue }
                     guard case .composite(let fields) = packed[ordinal + 1] else { throw JedError("58030", "invalid accumulator tuple") }
-                    let state = AggregateState(plan: call.plan, context: context, bounded: true)
-                    defer { state.close() }
+                    let shared = scratch[ordinal]
+                    let state = shared ?? AggregateState(plan: call.plan, context: context, bounded: true)
+                    defer { if shared == nil { state.close() } }
                     try state.restore(fields)
                     try BlockingAggregateFinalizer.fold(state, arguments: arguments, unique: unique,
                         prefix: [.integer(group), .integer(Int64(ordinal))], collections: collections, owner: owner)
                     packed[ordinal + 1] = .composite(state.packed())
                 }
-                try groups.put(key, value: packed)
+                try groups.put(found, key: key, value: packed)
             }
         }
         let cursor = try keys.cursor(); defer { cursor.close() }
@@ -146,7 +161,7 @@ internal enum BlockingAggregate {
                 defer { state.close() }
                 if call.order.isEmpty { try state.restore(fields) }
                 let current = unmetered(rowContext(row, aggregate: aggregate, context: context))
-                let direct = try call.direct.map(current.evaluate)
+                let direct = try call.direct.map { try current.evaluate($0) }
                 let value = try BlockingAggregateFinalizer.finish(state, call: call, direct: direct,
                     collections: collections, owner: owner(group: group, ordinal: ordinal, count: aggregate.calls.count), context: context)
                 row.append(value)
@@ -210,7 +225,7 @@ internal final class BlockingAggregateExecution {
                 return values[slot]
             }
         }
-        return try plan.projections.map(current.evaluate)
+        return try plan.projections.map { try current.evaluate($0) }
     }
     private func prepare() throws {
         var rows = try context.profile(plan.profileIdentity, .aggregate, excluding: [.source, .filter, .sort]) {

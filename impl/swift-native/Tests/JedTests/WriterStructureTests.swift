@@ -66,6 +66,77 @@ final class WriterStructureTests: XCTestCase {
         XCTAssertTrue(RecordList().isEmpty)
     }
 
+    func testChildListMatchesArrayAndCopiesAreIndependent() {
+        func leaf() -> TreeChild { .resident(TreeNode(leaf: nil)) }
+        func same(_ list: ChildList, _ model: [TreeChild]) -> Bool {
+            guard list.count == model.count else { return false }
+            for index in model.indices {
+                guard case .resident(let a) = list[index], case .resident(let b) = model[index], a === b else { return false }
+            }
+            return true
+        }
+        var random = Random(state: 31)
+        var model: [TreeChild] = (0..<150).map { _ in leaf() }
+        var list = ChildList(model)
+        let original = list, originalModel = model
+        for _ in 0..<3000 {
+            switch model.isEmpty ? 0 : random.next(3) {
+            case 0:
+                let child = leaf(), index = random.next(model.count + 1)
+                list.insert(child, at: index); model.insert(child, at: index)
+            case 1:
+                let index = random.next(model.count)
+                list.remove(at: index); model.remove(at: index)
+            default:
+                let child = leaf(), index = random.next(model.count)
+                list[index] = child; model[index] = child
+            }
+            XCTAssertTrue(same(list, model))
+        }
+        XCTAssertTrue(same(original, originalModel))
+        XCTAssertTrue(same(ChildList(Array(list)), model))
+        XCTAssertTrue(ChildList().isEmpty)
+    }
+
+    /// A leaf-at-a-time fold runs only when no ceiling or token can observe a
+    /// row. With a ceiling set (never reached here) the same statements take
+    /// the row-at-a-time path, and must give the same rows. (An integer SUM
+    /// cannot overflow from a table this small, so that fallback is not
+    /// reachable here.)
+    func testRunFoldAgreesWithRowFold() throws {
+        let database = try Database()
+        defer { try? database.close() }
+        try database.execute("CREATE TABLE t(id i32 PRIMARY KEY, a i64, b i16, c i32)")
+        try database.execute("INSERT INTO t SELECT g, CASE WHEN g % 7 = 0 THEN NULL ELSE g::i64 * 1000 END, " +
+            "(g % 100 - 50)::i16, CASE WHEN g % 3 = 0 THEN NULL ELSE (500 - g)::i32 END FROM generate_series(1, 900) s(g)")
+        try database.execute("CREATE TABLE big(id i32 PRIMARY KEY, v i64)")
+        try database.execute("INSERT INTO big SELECT g, CASE WHEN g = 700 THEN 9223372036854775807 ELSE g::i64 END " +
+            "FROM generate_series(1, 900) s(g)")
+        let statements = [
+            "SELECT count(*), count(a), sum(a), min(a), max(a) FROM t",
+            "SELECT sum(b), min(b), max(b), count(c), sum(c), min(c), max(c) FROM t",
+            "SELECT count(*), sum(a) FROM t WHERE id BETWEEN 100 AND 640",
+            "SELECT min(c), max(c) FROM t WHERE id > 5000",
+            "SELECT sum(v) FROM big",
+            "SELECT count(*), min(v), max(v) FROM big",
+        ]
+        func outcome(_ sql: String, limit: Int64) throws -> String {
+            let session = try database.session()
+            defer { session.close() }
+            session.maxCost = limit
+            do {
+                let rows = try session.query(sql)
+                var lines: [String] = []
+                while let row = try rows.next() { lines.append(String(describing: try SpillRowCodec.encode(row))) }
+                return lines.joined(separator: "|")
+            } catch let error as JedError { return "error " + error.code }
+        }
+        for sql in statements {
+            let batched = try outcome(sql, limit: 0), stepped = try outcome(sql, limit: 1_000_000_000)
+            XCTAssertEqual(batched, stepped, sql)
+        }
+    }
+
     /// One line per node, in order: enough to tell any two shapes apart.
     private func shape(_ tree: BPlusTree) throws -> [String] {
         var lines: [String] = []

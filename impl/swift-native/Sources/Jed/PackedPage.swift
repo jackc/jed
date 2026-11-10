@@ -331,6 +331,54 @@ internal final class PackedLeaf: Sendable {
         }
     }
 
+    /// The value of a non-NULL i16/i32/i64 cell, exactly as `fastValue`
+    /// decodes it; nil for NULL and for every other column kind.
+    func fastInteger(row: Int, column: Int) -> Int64? {
+        let region = regions[column]
+        guard region.kind == .i16 || region.kind == .i32 || region.kind == .i64,
+              let range = span(row: row, region: region) else { return nil }
+        let at = range.lowerBound
+        switch region.kind {
+        case .i16: return Int64(Int16(bitPattern: (UInt16(bytes[at]) << 8 | UInt16(bytes[at + 1])) ^ 0x8000))
+        case .i32: return Int64(Int32(bitPattern: be32(at) ^ 0x8000_0000))
+        default: return Int64(bitPattern: be64(at) ^ 0x8000_0000_0000_0000)
+        }
+    }
+
+    /// A variable-width cell as an encoded predicate reads it: NULL, an inline
+    /// value (tag 0 and a u16 length filling the span) given as the byte range
+    /// of its body in `bytes`, or anything else.
+    enum ShortBody { case null, inline(Range<Int>), other }
+    func shortBody(row: Int, column: Int) -> ShortBody {
+        let region = regions[column]
+        guard region.width == 0 else { return .other }
+        guard let range = span(row: row, region: region) else { return .null }
+        let at = range.lowerBound
+        guard bytes[at] == 0, range.count >= 3 else { return .other }
+        let length = Int(bytes[at + 1]) << 8 | Int(bytes[at + 2])
+        guard length == range.count - 3 else { return .other }
+        return .inline((at + 3)..<range.upperBound)
+    }
+
+    /// A variable-width cell split at its tag byte: NULL, an inline value
+    /// (tag 0) given as the byte range after the tag, or anything else.
+    func taggedBody(row: Int, column: Int) -> ShortBody {
+        let region = regions[column]
+        guard region.width == 0 else { return .other }
+        guard let range = span(row: row, region: region) else { return .null }
+        guard bytes[range.lowerBound] == 0 else { return .other }
+        return .inline((range.lowerBound + 1)..<range.upperBound)
+    }
+
+    /// True when `cell(...).largeFacts` is certainly nil without an error: a
+    /// fixed-width cell, a NULL, or a variable cell with the inline tag.
+    func hasNoLargeFacts(row: Int, column: Int) -> Bool {
+        let region = regions[column]
+        if region.width > 0 { return true }
+        guard let range = span(row: row, region: region) else { return true }
+        return bytes[range.lowerBound] == 0
+    }
+
     func record(at row: Int) -> PackedRecord {
         PackedRecord(key: Array(key(at: row)), cells: types.indices.map { cell(row: row, column: $0) })
     }

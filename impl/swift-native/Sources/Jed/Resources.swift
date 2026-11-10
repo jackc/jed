@@ -168,6 +168,11 @@ internal final class CostMeter {
         unbounded = self.limit == 0 && self.lifetimeLimit == 0
     }
 
+    /// No ceiling and no cancellation token: `step`, `poll`, `checkpoint`
+    /// and `guardCost` cannot fail, and only the total of the charges is ever
+    /// seen. A loop may then add one charge for many rows.
+    var isUnobserved: Bool { unbounded && cancellation == nil }
+
     func charge(_ units: Int64) {
         precondition(units >= 0)
         if !unbounded, firstCeiling == nil {

@@ -216,6 +216,12 @@ internal struct ScanAccess {
     func cursor(_ store: TableStore, descending: Bool = false) -> ScanCursor {
         ScanCursor(store: store, intervals: isEmpty ? [] : intervals ?? [ScanInterval(lower: lower, upper: upper)], descending: descending)
     }
+    /// The one key this access can return, when both bounds name it.
+    var pointKey: [UInt8]? {
+        guard !isEmpty, intervals == nil, let lower, let upper, lower.inclusive, upper.inclusive,
+              lower.key == upper.key else { return nil }
+        return lower.key
+    }
     func pages(_ tree: BPlusTree) -> Int64 {
         guard !isEmpty, tree.root != nil else { return 0 }
         if let intervals {

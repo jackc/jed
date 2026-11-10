@@ -791,12 +791,43 @@ internal enum ScanCost {
         if !variable.isEmpty {
             let slab = tree.codec.capacity, encrypted = tree.codec.reservedBytes != 0
             var scan = access.cursor(store); defer { scan.close() }
-            while let position = try scan.nextPosition() {
-                try meter.pollStep()
-                units = saturatingAdd(units, try payload(position, slab: slab, encrypted: encrypted, touched: variable))
+            // Leaf runs visit the rows `nextPosition` would, in its order.
+            while let run = try scan.nextRun() {
+                let node = run.node
+                let packed: PackedLeaf? = node.pending.isEmpty ? node.leaf : nil
+                for ordinal in 0..<run.count {
+                    let row = run.row(ordinal)
+                    try meter.pollStep()
+                    // Inline and NULL cells have no large-value facts; only a
+                    // row holding some other tag takes the general reading.
+                    if let packed, variable.allSatisfy({ packed.hasNoLargeFacts(row: row, column: $0) }) { continue }
+                    units = saturatingAdd(units, try payload(TreePosition(node: node, row: row), slab: slab,
+                        encrypted: encrypted, touched: variable))
+                }
             }
         }
         return units
+    }
+    /// `charge` for an access that names one key (`ScanAccess.pointKey`): the
+    /// same units, charged at the same moment. When a variable-width column
+    /// makes the preflight visit the row, its position is returned so the scan
+    /// need not descend again; otherwise the row has not been looked up yet.
+    static func chargePoint(_ store: TableStore, key: [UInt8], touched: [Int], meter: CostMeter,
+                            access: ScanAccess) throws -> (visited: Bool, position: TreePosition?) {
+        let tree = store.tree
+        var units = access.pages(tree)
+        let variable = touched.filter { ValueCodec.fixedWidth(tree.types[$0].type) == nil }
+        var position: TreePosition?
+        if !variable.isEmpty {
+            position = try tree.position(of: key)
+            if let position {
+                try meter.pollStep()
+                units = saturatingAdd(units, try payload(position, slab: tree.codec.capacity,
+                    encrypted: tree.codec.reservedBytes != 0, touched: variable))
+            }
+        }
+        meter.charge(units); try meter.guardCost()
+        return (!variable.isEmpty, position)
     }
     /// Decode the point's packed record once; accounting consumes its retained
     /// large-value facts without walking the same table interval again.

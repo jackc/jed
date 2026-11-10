@@ -245,7 +245,8 @@ cross-core resource accounting, cross-core encrypted matrix, Rust and
 TypeScript interchange, generated simulation sweeps, process and page-service
 gates were not re-run.
 
-What remains, by expected value:
+What remained after this pass (the path-copy and select-setup items were
+taken up in the fourth follow-up below):
 
 - **Access selection per write** is now the largest single cost of a
   single-row UPDATE or DELETE (about a fifth). The estimator is specified
@@ -261,6 +262,104 @@ What remains, by expected value:
   per execution; together about half of the remaining 12 µs.
 - The typed-fold, operator-enum and exclusivity items of the second follow-up
   are unchanged.
+
+## Fourth follow-up: scans, grouping and lookup setup (2026-11-10)
+
+After the third pass scans were still about 2.6 times slower than Rust.
+Profiles showed that most scan predicates and the plain aggregate fold still
+went through per-row objects, and that general grouping rebuilt its
+accumulators for every row.
+
+Causes found:
+
+- **Only text and bytea equality, nullness and array operators had an encoded
+  predicate.** An integer comparison such as `amount > $1` fell back to the
+  generic evaluator through the row frame, which cost a third of a filtered
+  scan. The encoded predicates that did exist read each cell through a
+  `StoredCell` slice, several reference-count updates per row.
+- **The variable-width cost preflight built a cell per row** to learn that an
+  inline value has no large-value facts.
+- **The ungrouped fold retained its states and re-read its meter per row**:
+  about three quarters of `full_scan_agg` was reference counting.
+- **General grouping made, restored, packed and freed an accumulator object
+  per aggregate per row**, compared the function name against string sets on
+  each pack and restore, encoded each group key twice and looked it up three
+  times, and copied the expression context through a method reference
+  (`map(current.evaluate)`).
+- **A point lookup descended the tree twice**, once for the cost preflight and
+  once for the scan, and recompiled its predicate through a private meter.
+- **Names hash a byte at a time.** `SQLText` keys most catalog dictionaries.
+
+Changes, all preserving results, costs, errors and bytes:
+
+- An encoded integer predicate: a bare integer column against an integer
+  literal or parameter, for all six comparisons. It declines on NULL and on a
+  writer leaf, charging nothing, exactly as the other encoded atoms do. Text,
+  bytea and array atoms read a clean page's bytes in place.
+- The preflight walks leaf runs and skips inline and NULL cells without
+  building them.
+- **Leaf-at-a-time fold.** When the statement has no cost ceiling and no
+  cancellation token, nothing can observe one row's charge apart from the
+  next. An ungrouped, unfiltered fold of COUNT, integer SUM and integer
+  MIN/MAX then computes a whole leaf and adds the leaf's charges once. An
+  overflowing sum or count makes that leaf fall back to the row-at-a-time
+  path, which reports the error at its exact row. With a ceiling or a token
+  the row-at-a-time path runs as before.
+- General grouping reuses one scratch accumulator per aggregate (a plain
+  accumulator's whole state is the tuple `restore` installs), decides each
+  state's tuple shape once in the plan, and carries the key's encoding and
+  resident entry from the lookup to the store. `AggregatePlan` and
+  `ResolvedAggregateCall` are boxed.
+- A single-key access keeps the row position found by the cost preflight, or
+  looks it up once when no variable-width column makes the preflight visit
+  the row. The charge order is unchanged.
+- `SQLText` and the spill map's key hash eight bytes per step with the same
+  seeded hasher. Interior nodes hold their children in fixed chunks of 32
+  (`ChildList`), so a single-row write copies one chunk and the chunk list.
+
+Two alternating rounds for the two Swift builds (best of two) and one round
+for the peers, one CPU, identical checksums
+([CSV](../../impl/swift-native/BENCHMARK_FOLLOWUP_20261110B.csv)). "Before" is
+the third follow-up's source:
+
+| Group | Swift before / Rust | Swift after / Rust | Swift after / Go | Speedup |
+|---|---:|---:|---:|---:|
+| Scans and aggregates (12) | 2.57× | 0.79× | 0.80× | 3.25× |
+| Per-statement lookups and writes (8) | 4.01× | 3.69× | 3.41× | 1.09× |
+| All 22 | 2.97× | 1.52× | 1.50× | 1.96× |
+
+`full_scan_agg` goes from 37.2 to 5.1 ms (Rust 21.3, Go 14.5),
+`full_scan_agg_filter` from 107.8 to 53.3 ms (Rust 54.5), `varscan_text_eq`
+from 8.2 to 2.5 ms (Rust 2.4), `varscan_project_needle` from 23.2 to 4.5 ms
+(Rust 8.5), `group_by_agg` from 1.70 to 1.05 s (Rust 0.67, Go 1.05) and
+`point_lookup_pk` from 12.4 to 10.4 µs (Rust 2.5). The two plain aggregate
+scans now beat both peers because of the leaf-at-a-time fold; that says
+nothing about the peers' design, which keeps per-row charging there.
+
+Verified on this source: 548 native tests and all 749 frozen SQL files (21,597
+records, 2,271 cost assertions), the threaded stress run with the frozen final
+checksum, 897/897 Swift–Go interchange phases, the 18 saved fault-simulation
+regressions and the encrypted SQL corpus for Swift alone. Two more unit tests
+cover `ChildList` against a plain array and the leaf-at-a-time fold against
+the row-at-a-time one. The existing packed-aggregate tests already compare an
+unlimited statement with a cost-limited one for equal rows and equal cost. The
+cross-core resource accounting, cross-core encrypted matrix, Rust and
+TypeScript interchange, generated simulation sweeps, process and page-service
+gates were not re-run.
+
+What remains, by expected value:
+
+- **Per-statement overhead.** A single-row INSERT or DELETE is still six to
+  eight times Rust (19 and 23 µs against 3). No one item dominates: access
+  selection is about a fifth of a DELETE, and the rest is statement admission,
+  snapshot and settings handling, index maintenance and record encoding in
+  pieces of a few percent each. A point lookup is four times Rust for the same
+  reason.
+- **General grouping** is at Go's speed and 1.6 times Rust. It still packs
+  and restores a tuple per aggregate per row and encodes a generic key.
+- **Filtered and grouped folds** do not use the leaf-at-a-time form.
+- The operator-enum and exclusivity items of the second follow-up are
+  unchanged.
 
 ## Investigation and controlled changes
 

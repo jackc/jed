@@ -15,6 +15,22 @@ public struct SQLText: Sendable, Hashable, Comparable, CustomStringConvertible {
     /// Only for engine-produced text whose construction preserves valid UTF-8.
     internal init(validatedUTF8: [UInt8]) { self.utf8 = validatedUTF8 }
 
+    public static func == (lhs: SQLText, rhs: SQLText) -> Bool { lhs.utf8 == rhs.utf8 }
+    /// Names key most catalog dictionaries. This is the standard seeded
+    /// hasher fed eight bytes per step; an array feeds it one byte at a time.
+    public func hash(into hasher: inout Hasher) {
+        let count = utf8.count
+        var index = 0
+        while index + 8 <= count {
+            var word: UInt64 = 0
+            for offset in 0..<8 { word = word << 8 | UInt64(utf8[index + offset]) }
+            hasher.combine(word); index += 8
+        }
+        var tail: UInt64 = 0
+        while index < count { tail = tail << 8 | UInt64(utf8[index]); index += 1 }
+        hasher.combine(tail); hasher.combine(count)
+    }
+
     public var description: String { String(decoding: utf8, as: UTF8.self) }
     public var scalarCount: Int {
         utf8.reduce(0) { $0 + (($1 & 0xc0) == 0x80 ? 0 : 1) }

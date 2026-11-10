@@ -57,6 +57,13 @@ internal final class PackedLaneRow {
         return packed?.isNull(row: index, column: column) ?? node.isNull(row: index, column: column)
     }
 
+    /// The current row on a clean packed page, for predicates that read its
+    /// bytes in place; nil on a writer leaf or one with pending overflow.
+    func packedPosition() -> (leaf: PackedLeaf, row: Int)? {
+        guard let packed else { return nil }
+        return (packed, index)
+    }
+
     /// Pending overflow bodies belong to the writer and must use materialize.
     /// Other cells borrow immutable encoded slices. Both packed pages and
     /// writer record vectors retain this encoding; no SQL values are stored.
@@ -88,6 +95,8 @@ internal final class PackedLaneInput {
     let row: PackedLaneRow
     private let meter: CostMeter
     private var cursor: ScanCursor
+    private struct Point { let tree: BPlusTree; let key: [UInt8]; var resolved: Bool; var position: TreePosition? }
+    private var point: Point?
 
     init(plan: SelectPlan, context: ExpressionContext) throws {
         guard let store = plan.store else { throw JedError("XX000", "packed lane has no table") }
@@ -97,13 +106,34 @@ internal final class PackedLaneInput {
         } else {
             access = try plan.chosenAccess?.bind(context) ?? plan.scan.bind(context)
         }
-        try ScanCost.charge(store, touched: plan.touched, meter: context.meter, access: access)
-        cursor = access.cursor(store, descending: plan.descending)
         meter = context.meter
+        if let key = access.pointKey {
+            // One key: the cost preflight's lookup also serves the scan.
+            let probe = try ScanCost.chargePoint(store, key: key, touched: plan.touched, meter: context.meter, access: access)
+            point = Point(tree: store.tree, key: key, resolved: probe.visited, position: probe.position)
+            cursor = ScanAccess.empty.cursor(store)
+        } else {
+            try ScanCost.charge(store, touched: plan.touched, meter: context.meter, access: access)
+            cursor = access.cursor(store, descending: plan.descending)
+        }
         row = PackedLaneRow(width: store.tree.types.count, touched: plan.touched, pager: store.tree.pool?.pager)
     }
 
+    /// The row of a single-key access, looked up at most once.
+    private func takePoint() throws -> TreePosition? {
+        guard var held = point else { return nil }
+        if !held.resolved { held.position = try held.tree.position(of: held.key); held.resolved = true }
+        let found = held.position
+        held.position = nil; point = held
+        return found
+    }
+
     func nextPosition() throws -> TreePosition? {
+        if point != nil {
+            guard let position = try takePoint() else { return nil }
+            try meter.step(); meter.charge(1)
+            return position
+        }
         guard let position = try cursor.nextPosition() else { return nil }
         try meter.step(); meter.charge(1)
         return position
@@ -112,7 +142,12 @@ internal final class PackedLaneInput {
     /// Leaf-at-a-time form of `nextPosition`. The caller admits each row of
     /// the run with `admitRow` before using it, keeping the per-row order of
     /// cancellation polls and charges.
-    func nextRun() throws -> TreeRun? { try cursor.nextRun() }
+    func nextRun() throws -> TreeRun? {
+        if point != nil {
+            return try takePoint().map { TreeRun(node: $0.node, first: $0.row, count: 1, descending: false) }
+        }
+        return try cursor.nextRun()
+    }
     @inline(__always) func admitRow() throws { try meter.step(); meter.charge(1) }
 
     func next() throws -> Bool {
@@ -121,6 +156,6 @@ internal final class PackedLaneInput {
         return true
     }
 
-    func close() { cursor.close(); row.close() }
+    func close() { cursor.close(); row.close(); point = nil }
     deinit { close() }
 }

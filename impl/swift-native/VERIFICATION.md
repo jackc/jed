@@ -22,11 +22,30 @@ simulation images. Its SHA-256 is
 The ignored archive supplements this committed report; the original `/tmp`
 paths below remain useful provenance references.
 
+## Fourth follow-up revalidation (2026-11-10)
+
+The scan, grouping and lookup changes recorded in
+[swift-native-performance.md](../../spec/design/swift-native-performance.md#fourth-follow-up-scans-grouping-and-lookup-setup-2026-11-10)
+were checked with the same gates, on top of `13db292f`.
+
+| Gate | Result |
+|---|---|
+| Release native/API and all frozen SQL | **548 tests**, zero failures; **749/749 files**, 21,597 records, 39,148 cells, 2,271 cost / 1,154 name / 100 type assertions. |
+| New unit tests (`WriterStructureTests`) | `ChildList` against a plain array; leaf-at-a-time folds give the rows of row-at-a-time folds. |
+| Concurrent stress, Swift only | Two core/storage runs, 8,000 snapshot checks, zero failures; final checksum `f3e75496a3111181`. |
+| File interchange, Go peer only | **897/897 phases**, zero failures (diagnostic subset matrix). |
+| Saved fault-simulation regressions, Swift only (debug) | All **18** frozen traces pass. |
+| Encrypted SQL corpus, Swift only (debug) | **19,403/19,403** frozen record measurements, zero failures (diagnostic subset matrix). |
+
+Not re-run: exact cross-core resource accounting, the cross-core encrypted
+matrix, Rust and TypeScript interchange, generated fault-simulation sweeps,
+mixed processes and the page service.
+
 ## Third follow-up revalidation (2026-11-10)
 
 The per-statement and bulk-write changes recorded in
 [swift-native-performance.md](../../spec/design/swift-native-performance.md#third-follow-up-per-statement-and-bulk-write-costs-2026-11-10)
-were checked with the same subset of gates, on top of `3bea4580`.
+were checked with the same subset of gates. Committed as `13db292f`.
 
 | Gate | Result |
 |---|---|

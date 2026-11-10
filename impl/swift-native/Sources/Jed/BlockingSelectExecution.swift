@@ -38,7 +38,7 @@ internal final class BlockingSelectExecution {
                 return values.indices.contains(column) ? values[column] : nil
             }
         }
-        return try plan.projections.map(current.evaluate)
+        return try plan.projections.map { try current.evaluate($0) }
     }
     private func prepare() throws {
         projected = plan.orderedByScan && plan.limit != nil && !plan.order.isEmpty

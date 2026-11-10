@@ -26,6 +26,16 @@ before). [Per-workload results](BENCHMARK_FOLLOWUP_20261109.csv). It ran on a
 tmpfs data directory with one round, so it supplements the tables below and
 does not replace them.
 
+## Fourth follow-up (2026-11-10)
+
+A further pass on scans, grouping and lookup setup; see
+[the design record](../../spec/design/swift-native-performance.md#fourth-follow-up-scans-grouping-and-lookup-setup-2026-11-10).
+On the same 22 workloads Swift/Rust geometric means are 0.79× on the twelve
+scan and aggregate workloads (2.57× for the third follow-up's source in the
+same run), 3.69× on the eight per-statement workloads (4.01×) and 1.52×
+overall (2.97×). [Per-workload results](BENCHMARK_FOLLOWUP_20261110B.csv),
+best of two alternating rounds per Swift build on a tmpfs data directory.
+
 ## Third follow-up (2026-11-10)
 
 A further pass removed per-statement and bulk-write costs; see

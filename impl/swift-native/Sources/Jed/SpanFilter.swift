@@ -82,6 +82,9 @@ private final class PackedPredicateAtom {
     private enum Kind {
         case nullness(Bool)
         case equal(bytes: [UInt8], width: Int, text: Bool, negated: Bool, charge: Int64)
+        /// A bare integer column against an integer literal or parameter:
+        /// the evaluator's comparison code and the right-hand constant.
+        case integer(code: Int, constant: Int64)
         case array(ArrayOperation, Element, [[UInt8]], hasNull: Bool, charge: Int64)
     }
     let expression: ResolvedExpression
@@ -105,11 +108,29 @@ private final class PackedPredicateAtom {
             guard let column = column(operand), TypeRules.fields(types[column].type) == nil else { return nil }
             return PackedPredicateAtom(expression: expression, column: column, kind: .nullness(negated))
         case .binary(let operation, let left, let right, _):
-            guard operation == "=" || operation == "<>" else { return nil }
-            let selected: Int, other: ResolvedExpression
-            if let index = column(left), column(right) == nil { selected = index; other = right }
-            else if let index = column(right), column(left) == nil { selected = index; other = left }
+            let selected: Int, other: ResolvedExpression, flipped: Bool
+            if let index = column(left), column(right) == nil { selected = index; other = right; flipped = false }
+            else if let index = column(right), column(left) == nil { selected = index; other = left; flipped = true }
             else { return nil }
+            if case .scalar(let scalar) = types[selected].type, scalar.integerWidth != nil {
+                // The evaluator charges one unit for the operator, nothing
+                // for either operand, and compares an integer pair directly.
+                let codes = ["=": 3, "<>": 4, "<": 5, "<=": 6, ">": 7, ">=": 8]
+                let mirrored = [3: 3, 4: 4, 5: 7, 6: 8, 7: 5, 8: 6]
+                // Either operand form evaluates to itself at no charge.
+                let constant: SQLValue
+                switch other.node {
+                case .constant(let literal): constant = literal
+                case .parameter(let index):
+                    guard index > 0, index <= context.parameters.count else { return nil }
+                    constant = context.parameters[index - 1]
+                default: return nil
+                }
+                guard let code = codes[operation], case .integer(let value) = constant else { return nil }
+                return PackedPredicateAtom(expression: expression, column: selected,
+                    kind: .integer(code: flipped ? mirrored[code]! : code, constant: value))
+            }
+            guard operation == "=" || operation == "<>" else { return nil }
             guard let (constant, charge) = constant(other, context: context) else { return nil }
             let bytes: [UInt8], width: Int, text: Bool
             switch (types[selected].type, constant) {
@@ -190,7 +211,43 @@ private final class PackedPredicateAtom {
         case .nullness(let negated):
             meter.charge(1); try meter.step()
             return try row.isNull(column) != negated
+        case .integer(let code, let constant):
+            // Declining (NULL, a writer leaf) charges nothing; the caller
+            // then evaluates the original expression.
+            guard let (leaf, index) = row.packedPosition(),
+                  let value = leaf.fastInteger(row: index, column: column) else { return nil }
+            meter.charge(1); try meter.step()
+            switch code {
+            case 3: return value == constant
+            case 4: return value != constant
+            case 5: return value < constant
+            case 6: return value <= constant
+            case 7: return value > constant
+            default: return value >= constant
+            }
         case .equal(let constant, let constantWidth, let text, let negated, let charge):
+            if let (leaf, index) = row.packedPosition() {
+                // The same decisions as below, read from the page in place.
+                switch leaf.shortBody(row: index, column: column) {
+                case .other: return nil
+                case .null: meter.charge(charge); try meter.step(); return false
+                case .inline(let range):
+                    let width: Int
+                    if text {
+                        guard let count = Self.utf8Width(leaf.bytes, range) else { return nil }
+                        width = count
+                    } else { width = range.count }
+                    meter.charge(charge); try meter.step()
+                    meter.charge(Int64(max(0, min(width, constantWidth) - 1))); try meter.guardCost()
+                    var equal = range.count == constant.count
+                    if equal {
+                        for offset in 0..<constant.count where leaf.bytes[range.lowerBound + offset] != constant[offset] {
+                            equal = false; break
+                        }
+                    }
+                    return equal != negated
+                }
+            }
             guard let cell = try row.storedCell(column) else { return nil }
             guard let bytes = cell.bytes else { meter.charge(charge); try meter.step(); return false }
             guard bytes.first == 0, let body = Self.shortBody(bytes.dropFirst()) else { return nil }
@@ -203,22 +260,24 @@ private final class PackedPredicateAtom {
             meter.charge(Int64(max(0, min(width, constantWidth) - 1))); try meter.guardCost()
             return body.elementsEqual(constant) != negated
         case .array(let operation, let element, let constant, let constantHasNull, let charge):
+            if let (leaf, index) = row.packedPosition() {
+                // The same decisions as below, read from the page in place.
+                switch leaf.taggedBody(row: index, column: column) {
+                case .other: return nil
+                case .null: meter.charge(charge); try meter.step(); return false
+                case .inline(let range):
+                    guard let hasNull = arraySpans(leaf.bytes, range, element: element) else { return nil }
+                    meter.charge(charge); try meter.step()
+                    return arrayResult(operation, leaf.bytes, constant: constant, constantHasNull: constantHasNull, hasNull: hasNull)
+                }
+            }
             guard let cell = try row.storedCell(column) else { return nil }
             guard let bytes = cell.bytes else { meter.charge(charge); try meter.step(); return false }
             guard bytes.first == 0 else { return nil }
             let body = bytes.dropFirst()
-            guard let hasNull = arraySpans(body, element: element) else { return nil }
+            guard let hasNull = arraySpans(body, body.startIndex..<body.endIndex, element: element) else { return nil }
             meter.charge(charge); try meter.step()
-            switch operation {
-            case .contains:
-                if constantHasNull { return false }
-                return constant.allSatisfy { value in elements.contains { body[$0].elementsEqual(value) } }
-            case .contained:
-                if hasNull { return false }
-                return elements.allSatisfy { range in constant.contains { body[range].elementsEqual($0) } }
-            case .overlaps:
-                return elements.contains { range in constant.contains { body[range].elementsEqual($0) } }
-            }
+            return arrayResult(operation, body, constant: constant, constantHasNull: constantHasNull, hasNull: hasNull)
         }
     }
 
@@ -231,8 +290,13 @@ private final class PackedPredicateAtom {
     /// Match SQLText's valid, NUL-free UTF-8 contract while counting codepoints
     /// directly in a page slice. No String or owned byte array is constructed.
     private static func utf8Width(_ bytes: ArraySlice<UInt8>) -> Int? {
-        var position = bytes.startIndex, count = 0
-        while position < bytes.endIndex {
+        utf8Width(bytes, bytes.startIndex..<bytes.endIndex)
+    }
+    @inline(__always)
+    private static func utf8Width<Bytes: RandomAccessCollection>(_ bytes: Bytes, _ range: Range<Int>) -> Int?
+    where Bytes.Element == UInt8, Bytes.Index == Int {
+        var position = range.lowerBound, count = 0
+        while position < range.upperBound {
             let first = bytes[position]
             if first > 0 && first < 0x80 { position += 1; count += 1; continue }
             let length: Int
@@ -240,7 +304,7 @@ private final class PackedPredicateAtom {
             else if first >= 0xe0 && first < 0xf0 { length = 3 }
             else if first >= 0xf0 && first <= 0xf4 { length = 4 }
             else { return nil }
-            guard length <= bytes.endIndex - position else { return nil }
+            guard length <= range.upperBound - position else { return nil }
             for offset in 1..<length where bytes[position + offset] & 0xc0 != 0x80 { return nil }
             let second = bytes[position + 1]
             if first == 0xe0 && second < 0xa0 || first == 0xed && second >= 0xa0
@@ -251,42 +315,85 @@ private final class PackedPredicateAtom {
     }
 
     /// Validate every structural rule of ValueCodec's array body before an
-    /// atom charges or compares anything. Offsets refer to the borrowed slice;
+    /// atom charges or compares anything. Offsets are indices into `bytes`;
     /// NULL elements match nothing, and dimensions do not affect containment.
-    private func arraySpans(_ body: ArraySlice<UInt8>, element: Element) -> Bool? {
-        elements.removeAll(keepingCapacity: true)
-        var reader = ByteReader(body)
-        guard let dimensions = try? reader.u8(), let flags = try? reader.u8(),
-              flags <= 1, dimensions != 0 || flags == 0 else { return nil }
+    private func arraySpans<Bytes: RandomAccessCollection>(_ bytes: Bytes, _ range: Range<Int>, element: Element) -> Bool?
+    where Bytes.Element == UInt8, Bytes.Index == Int {
+        // Build in a local so the loop does not touch this object per element.
+        var spans = elements
+        elements = []
+        spans.removeAll(keepingCapacity: true)
+        defer { elements = spans }
+        var at = range.lowerBound
+        let end = range.upperBound
+        func u32(_ index: Int) -> UInt32 {
+            UInt32(bytes[index]) << 24 | UInt32(bytes[index + 1]) << 16 | UInt32(bytes[index + 2]) << 8 | UInt32(bytes[index + 3])
+        }
+        guard end - at >= 2 else { return nil }
+        let dimensions = Int(bytes[at]), flags = bytes[at + 1]
+        at += 2
+        guard flags <= 1, dimensions != 0 || flags == 0 else { return nil }
         var count = dimensions == 0 ? 0 : 1
-        for _ in 0..<Int(dimensions) {
-            guard let rawLength = try? reader.u32(), let lower = try? reader.i32() else { return nil }
-            let length = Int(rawLength)
+        for _ in 0..<dimensions {
+            guard end - at >= 8 else { return nil }
+            let length = Int(u32(at)), lower = Int32(bitPattern: u32(at + 4))
+            at += 8
             guard length > 0, length <= 134_217_727, count <= 134_217_727 / length,
                   Int64(lower) + Int64(length) - 1 <= Int32.max else { return nil }
             count *= length
         }
-        let bitmap: ArraySlice<UInt8>
+        let bitmap = at
         if flags == 1 {
-            guard let bytes = try? reader.take((count + 7) / 8) else { return nil }
-            bitmap = bytes
-            if count % 8 != 0, let last = bitmap.last, last & (UInt8.max >> (count % 8)) != 0 { return nil }
-        } else { bitmap = body[body.startIndex..<body.startIndex] }
+            let size = (count + 7) / 8
+            guard end - at >= size else { return nil }
+            at += size
+            if count % 8 != 0, size > 0, bytes[at - 1] & (UInt8.max >> (count % 8)) != 0 { return nil }
+        }
         var hasNull = false
         for index in 0..<count {
-            if flags == 1, bitmap[bitmap.startIndex + index / 8] & (0x80 >> (index % 8)) != 0 {
+            if flags == 1, bytes[bitmap + index / 8] & (0x80 >> (index % 8)) != 0 {
                 hasNull = true; continue
             }
-            let start = body.startIndex + reader.offset
+            let start = at
             switch element {
-            case .integer(let width): guard (try? reader.take(width)) != nil else { return nil }
+            case .integer(let width):
+                guard end - at >= width else { return nil }
+                at += width
             case .text, .bytes:
-                guard let length = try? reader.u16(), let bytes = try? reader.take(Int(length)) else { return nil }
-                if case .text = element, Self.utf8Width(bytes) == nil { return nil }
+                guard end - at >= 2 else { return nil }
+                let length = Int(bytes[at]) << 8 | Int(bytes[at + 1])
+                at += 2
+                guard end - at >= length else { return nil }
+                if case .text = element, Self.utf8Width(bytes, at..<(at + length)) == nil { return nil }
+                at += length
             }
-            elements.append(start..<(body.startIndex + reader.offset))
+            spans.append(start..<at)
         }
-        guard reader.remaining == 0 else { return nil }
+        guard at == end else { return nil }
         return hasNull
+    }
+
+    @inline(__always)
+    private static func equal<Bytes: RandomAccessCollection>(_ bytes: Bytes, _ range: Range<Int>, _ constant: [UInt8]) -> Bool
+    where Bytes.Element == UInt8, Bytes.Index == Int {
+        guard range.count == constant.count else { return false }
+        for offset in 0..<constant.count where bytes[range.lowerBound + offset] != constant[offset] { return false }
+        return true
+    }
+
+    private func arrayResult<Bytes: RandomAccessCollection>(_ operation: ArrayOperation, _ bytes: Bytes, constant: [[UInt8]],
+                                                           constantHasNull: Bool, hasNull: Bool) -> Bool
+    where Bytes.Element == UInt8, Bytes.Index == Int {
+        let spans = elements
+        switch operation {
+        case .contains:
+            if constantHasNull { return false }
+            return constant.allSatisfy { value in spans.contains { Self.equal(bytes, $0, value) } }
+        case .contained:
+            if hasNull { return false }
+            return spans.allSatisfy { range in constant.contains { Self.equal(bytes, range, $0) } }
+        case .overlaps:
+            return spans.contains { range in constant.contains { Self.equal(bytes, range, $0) } }
+        }
     }
 }

@@ -1,12 +1,34 @@
 /// Aggregate calls become ordinary synthetic-column reads. Input expressions
 /// keep the source scope; grouping validation applies only to output trees.
 internal struct ResolvedAggregateCall {
-    let plan: AggregatePlan
-    let arguments: [ResolvedExpression]
-    let direct: [ResolvedExpression]
-    let filter: ResolvedExpression?
-    let distinct: Bool
-    let order: [ResolvedOrderTerm]
+    /// Stored fields live in one copy-on-write box, so passing this value
+    /// around costs one retain instead of a field-by-field copy.
+    private final class Storage {
+        let plan: AggregatePlan
+        let arguments: [ResolvedExpression]
+        let direct: [ResolvedExpression]
+        let filter: ResolvedExpression?
+        let distinct: Bool
+        let order: [ResolvedOrderTerm]
+        init(plan: AggregatePlan, arguments: [ResolvedExpression], direct: [ResolvedExpression], filter: ResolvedExpression?, distinct: Bool, order: [ResolvedOrderTerm]) {
+            self.plan = plan
+            self.arguments = arguments
+            self.direct = direct
+            self.filter = filter
+            self.distinct = distinct
+            self.order = order
+        }
+    }
+    private let storage: Storage
+    init(plan: AggregatePlan, arguments: [ResolvedExpression], direct: [ResolvedExpression], filter: ResolvedExpression?, distinct: Bool, order: [ResolvedOrderTerm]) {
+        storage = Storage(plan: plan, arguments: arguments, direct: direct, filter: filter, distinct: distinct, order: order)
+    }
+    var plan: AggregatePlan { storage.plan }
+    var arguments: [ResolvedExpression] { storage.arguments }
+    var direct: [ResolvedExpression] { storage.direct }
+    var filter: ResolvedExpression? { storage.filter }
+    var distinct: Bool { storage.distinct }
+    var order: [ResolvedOrderTerm] { storage.order }
 }
 
 internal struct AggregateQueryPlan {

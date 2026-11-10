@@ -179,7 +179,7 @@ internal enum BlockingJoinRows {
                 let value = try context.profile(plan.profileIdentity, .output) {
                     try meter.step()
                     if plan.productionCharge { meter.charge(1) }
-                    return try plan.projections.map(current.evaluate)
+                    return try plan.projections.map { try current.evaluate($0) }
                 }
                 try next.append(value)
                 if let limit = plan.limit, next.count >= limit { stopped = true }

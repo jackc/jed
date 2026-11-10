@@ -109,7 +109,7 @@ internal final class JoinAccessExecution {
                 let output = try context.profile(plan.profileIdentity, .output) {
                     try meter.step()
                     if plan.productionCharge { meter.charge(1) }
-                    return try plan.projections.map(current.evaluate)
+                    return try plan.projections.map { try current.evaluate($0) }
                 }
                 try reserve(output); rows.append(output); emitted += 1
                 if let limit = plan.limit, emitted >= limit { stopped = true }

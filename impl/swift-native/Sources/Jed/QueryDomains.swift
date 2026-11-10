@@ -79,7 +79,9 @@ internal final class DomainReadBundle {
     func install(_ pin: SnapshotPin, for name: SQLText) {
         let previous = pins.updateValue(pin, forKey: name)
         domains.snapshots[name] = pin.snapshot
-        orderedPins = pins.keys.sorted().map { (name: $0, pin: pins[$0]!) }
+        // Keep name order by placing the one changed entry.
+        if let index = orderedPins.firstIndex(where: { $0.name == name }) { orderedPins[index] = (name, pin) }
+        else { orderedPins.insert((name, pin), at: orderedPins.firstIndex(where: { name < $0.name }) ?? orderedPins.count) }
         previous?.close()
     }
     func checkRole() throws { for entry in orderedPins { try entry.pin.checkRole() } }

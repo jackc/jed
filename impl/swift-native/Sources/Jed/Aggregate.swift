@@ -1,22 +1,74 @@
+/// Which accumulator fields make up the finite-state tuple. It follows
+/// from the plan alone, so it is decided once and not by comparing the
+/// function name on every pack and restore.
+internal enum AggregateStateShape {
+    case count, pairs, floatMoments, exactMoments, floatSum, average, integerSum, exactSum, current
+    var width: Int {
+        switch self {
+        case .count, .current: 1
+        case .pairs: 6
+        case .floatMoments, .exactMoments: 3
+        case .floatSum: 5
+        case .average, .integerSum, .exactSum: 2
+        }
+    }
+    init(name: String, result: SQLType) {
+        if ["count", "count_star", "regr_count"].contains(name) { self = .count }
+        else if AggregateStatistics.pairs.contains(name) { self = .pairs }
+        else if AggregateStatistics.moments.contains(name) { self = result == .scalar(.f64) ? .floatMoments : .exactMoments }
+        else if name == "sum" || name == "avg" {
+            if result == .scalar(.f32) || result == .scalar(.f64) { self = .floatSum }
+            else if name == "avg" { self = .average }
+            else { self = result == .scalar(.i64) ? .integerSum : .exactSum }
+        } else { self = .current }
+    }
+}
+
 /// Aggregate input types have already passed literal/parameter adoption. The
 /// catalog chooses overload and result type; the transitions remain handwritten.
 internal struct AggregatePlan {
-    let metadata: FunctionSpecFact
-    let name: String
-    let inputTypes: [TypeDescriptor]
-    let directTypes: [TypeDescriptor]
-    let withinGroup: [AggregateOrder]
-    let resultType: TypeDescriptor
-    let star: Bool
-    let kernel: AggregateKernel
+    /// Stored fields live in one copy-on-write box, so passing this value
+    /// around costs one retain instead of a field-by-field copy.
+    private final class Storage {
+        let metadata: FunctionSpecFact
+        let name: String
+        let inputTypes: [TypeDescriptor]
+        let directTypes: [TypeDescriptor]
+        let withinGroup: [AggregateOrder]
+        let resultType: TypeDescriptor
+        let star: Bool
+        let kernel: AggregateKernel
+        let stateShape: AggregateStateShape
+        init(metadata: FunctionSpecFact, name: String, inputTypes: [TypeDescriptor], directTypes: [TypeDescriptor], withinGroup: [AggregateOrder], resultType: TypeDescriptor, star: Bool, kernel: AggregateKernel, stateShape: AggregateStateShape) {
+            self.stateShape = stateShape
+            self.metadata = metadata
+            self.name = name
+            self.inputTypes = inputTypes
+            self.directTypes = directTypes
+            self.withinGroup = withinGroup
+            self.resultType = resultType
+            self.star = star
+            self.kernel = kernel
+        }
+    }
+    private let storage: Storage
+    var metadata: FunctionSpecFact { storage.metadata }
+    var name: String { storage.name }
+    var inputTypes: [TypeDescriptor] { storage.inputTypes }
+    var directTypes: [TypeDescriptor] { storage.directTypes }
+    var withinGroup: [AggregateOrder] { storage.withinGroup }
+    var resultType: TypeDescriptor { storage.resultType }
+    var star: Bool { storage.star }
+    var kernel: AggregateKernel { storage.kernel }
+    var stateShape: AggregateStateShape { storage.stateShape }
 
     private init(metadata: FunctionSpecFact, name: String, inputTypes: [TypeDescriptor],
                  directTypes: [TypeDescriptor], withinGroup: [AggregateOrder],
                  resultType: TypeDescriptor, star: Bool) {
-        self.metadata = metadata; self.name = name; self.inputTypes = inputTypes
-        self.directTypes = directTypes; self.withinGroup = withinGroup
-        self.resultType = resultType; self.star = star
-        kernel = AggregateKernel.resolve(name: name, result: resultType.type, ordered: !withinGroup.isEmpty)
+        storage = Storage(metadata: metadata, name: name, inputTypes: inputTypes, directTypes: directTypes,
+            withinGroup: withinGroup, resultType: resultType, star: star,
+            kernel: AggregateKernel.resolve(name: name, result: resultType.type, ordered: !withinGroup.isEmpty),
+            stateShape: AggregateStateShape(name: name, result: resultType.type))
     }
 
     static func resolve(name: String, inputTypes: [TypeDescriptor], star: Bool = false,
@@ -159,6 +211,10 @@ internal final class AggregateState {
     /// expression context made every state construction copy it.
     private let meter: CostMeter
     private let collatedKey: KeyEncoding.CollatedKey?
+    private let shape: AggregateStateShape
+    /// Read on every fold; copied out of the plan's box once.
+    private let kernel: AggregateKernel
+    private let inputWidth: Int
     private var closed = false
     private var count: Int64 = 0
     private var integer: Int64 = 0
@@ -172,39 +228,76 @@ internal final class AggregateState {
 
     init(plan: AggregatePlan, context: ExpressionContext, bounded: Bool = false) {
         self.plan = plan; meter = context.meter; collatedKey = context.collatedKey
-        if case .collection = plan.kernel { collection = AggregateCollection(plan: plan, context: context, measured: !bounded) }
-        if case .orderedSet = plan.kernel { orderedSet = AggregateOrderedSet(plan: plan, context: context, measured: !bounded) }
+        shape = plan.stateShape
+        kernel = plan.kernel; inputWidth = plan.inputTypes.count
+        if case .collection = kernel { collection = AggregateCollection(plan: plan, context: context, measured: !bounded) }
+        if case .orderedSet = kernel { orderedSet = AggregateOrderedSet(plan: plan, context: context, measured: !bounded) }
+    }
+    /// False for a plain accumulator: its whole state is the tuple that
+    /// `restore` installs, so one object can serve every group in turn.
+    var retainsInputs: Bool { collection != nil || orderedSet != nil }
+
+    /// Kernels whose transitions over one leaf of integer cells a scan can
+    /// compute itself and hand over once (`applyRun`).
+    enum RunKernel { case countStar, count, integerSum, extreme(minimum: Bool) }
+    var runKernel: RunKernel? {
+        switch kernel {
+        case .countStar: .countStar
+        case .count: .count
+        case .integerSum: .integerSum
+        case .extreme(let minimum): .extreme(minimum: minimum)
+        default: nil
+        }
+    }
+    /// The integer accumulator a run continues from: the running sum, or the
+    /// current extreme when one is held. `usable` is false when folding one
+    /// value at a time is required (a closed state, a non-integer extreme).
+    var runStart: (usable: Bool, value: Int64?) {
+        if closed { return (false, nil) }
+        if case .extreme = kernel {
+            switch current {
+            case .null: return (true, nil)
+            case .integer(let value): return (true, value)
+            default: return (false, nil)
+            }
+        }
+        return (true, integer)
+    }
+    /// Rows this state can still count.
+    var runHeadroom: Int64 { Int64.max - count }
+    /// The result of folding a run: `rows` counted transitions and the new
+    /// accumulator. The caller has checked `runStart` and `runHeadroom`.
+    func applyRun(rows: Int64, value: Int64?) {
+        switch kernel {
+        case .extreme: if let value { current = .integer(value) }
+        case .integerSum: count += rows; if let value { integer = value }
+        default: count += rows
+        }
     }
     /// Private finite-state tuple. Its field shape is also the bounded map's
     /// logical residency measure; retained inputs have a different owner.
     func packed() -> [SQLValue] {
         if orderedSet != nil { return [] }
         if let collection { return collection.packed() }
-        let name = plan.name
-        if ["count", "count_star", "regr_count"].contains(name) { return [.integer(count)] }
-        if AggregateStatistics.pairs.contains(name) {
+        switch shape {
+        case .count: return [.integer(count)]
+        case .pairs:
             return [moments.count, moments.sumX, moments.squareX, moments.sumY, moments.squareY, moments.cross].map { .f64($0.bitPattern) }
+        case .floatMoments: return [moments.count, moments.sumX, moments.squareX].map { .f64($0.bitPattern) }
+        case .exactMoments: return [.integer(count), .decimal(sum), .decimal(squares)]
+        case .floatSum:
+            return [.f64(float.total.bitPattern), .integer(float.count), .boolean(float.nan),
+                    .boolean(float.positiveInfinity), .boolean(float.negativeInfinity)]
+        case .average: return [.decimal(sum), .integer(count)]
+        case .integerSum: return [.integer(integer), .boolean(count > 0)]
+        case .exactSum: return [.decimal(sum), .boolean(count > 0)]
+        case .current: return [current]
         }
-        if AggregateStatistics.moments.contains(name) {
-            if plan.resultType.type == .scalar(.f64) {
-                return [moments.count, moments.sumX, moments.squareX].map { .f64($0.bitPattern) }
-            }
-            return [.integer(count), .decimal(sum), .decimal(squares)]
-        }
-        if name == "sum" || name == "avg" {
-            if plan.resultType.type == .scalar(.f32) || plan.resultType.type == .scalar(.f64) {
-                return [.f64(float.total.bitPattern), .integer(float.count), .boolean(float.nan),
-                        .boolean(float.positiveInfinity), .boolean(float.negativeInfinity)]
-            }
-            if name == "avg" { return [.decimal(sum), .integer(count)] }
-            return [plan.resultType.type == .scalar(.i64) ? .integer(integer) : .decimal(sum), .boolean(count > 0)]
-        }
-        return [current]
     }
     func restore(_ values: [SQLValue]) throws {
-        let expected = packed().count
         // Array-of-array state has a shape-dependent tail checked by its owner.
         if let collection { try collection.restore(values); return }
+        let expected = orderedSet != nil ? 0 : shape.width
         guard values.count == expected else { throw JedError("58030", "invalid aggregate state width") }
         func integer(_ index: Int) throws -> Int64 {
             guard case .integer(let value) = values[index] else { throw JedError("58030", "invalid aggregate integer state") }; return value
@@ -219,31 +312,22 @@ internal final class AggregateState {
             guard case .boolean(let value) = values[index] else { throw JedError("58030", "invalid aggregate boolean state") }; return value
         }
         if orderedSet != nil { return }
-        let name = plan.name
-        if ["count", "count_star", "regr_count"].contains(name) { count = try integer(0); return }
-        if AggregateStatistics.pairs.contains(name) {
+        switch shape {
+        case .count: count = try integer(0)
+        case .pairs:
             moments.count = try number(0); moments.sumX = try number(1); moments.squareX = try number(2)
-            moments.sumY = try number(3); moments.squareY = try number(4); moments.cross = try number(5); return
+            moments.sumY = try number(3); moments.squareY = try number(4); moments.cross = try number(5)
+        case .floatMoments:
+            moments.count = try number(0); moments.sumX = try number(1); moments.squareX = try number(2)
+        case .exactMoments: count = try integer(0); sum = try decimal(1); squares = try decimal(2)
+        case .floatSum:
+            float.total = try number(0); float.count = try integer(1); float.nan = try boolean(2)
+            float.positiveInfinity = try boolean(3); float.negativeInfinity = try boolean(4)
+        case .average: sum = try decimal(0); count = try integer(1)
+        case .integerSum: self.integer = try integer(0); count = try boolean(1) ? 1 : 0
+        case .exactSum: sum = try decimal(0); count = try boolean(1) ? 1 : 0
+        case .current: current = values[0]
         }
-        if AggregateStatistics.moments.contains(name) {
-            if plan.resultType.type == .scalar(.f64) {
-                moments.count = try number(0); moments.sumX = try number(1); moments.squareX = try number(2)
-            } else { count = try integer(0); sum = try decimal(1); squares = try decimal(2) }
-            return
-        }
-        if name == "sum" || name == "avg" {
-            if plan.resultType.type == .scalar(.f32) || plan.resultType.type == .scalar(.f64) {
-                float.total = try number(0); float.count = try integer(1); float.nan = try boolean(2)
-                float.positiveInfinity = try boolean(3); float.negativeInfinity = try boolean(4); return
-            }
-            if name == "avg" { sum = try decimal(0); count = try integer(1) }
-            else {
-                if plan.resultType.type == .scalar(.i64) { self.integer = try integer(0) } else { sum = try decimal(0) }
-                count = try boolean(1) ? 1 : 0
-            }
-            return
-        }
-        current = values[0]
     }
     func drainRetained(_ visit: ([SQLValue]) throws -> Void) rethrows {
         try collection?.drainRetained(visit)
@@ -256,14 +340,14 @@ internal final class AggregateState {
     }
     private func checkFold(width: Int) throws {
         guard !closed else { throw JedError("55000", "aggregate state is closed") }
-        guard width == plan.inputTypes.count else { throw JedError("XX000", "aggregate argument width mismatch") }
+        guard width == inputWidth else { throw JedError("XX000", "aggregate argument width mismatch") }
     }
 
     /// The general tuple adapter remains the entry for grouped, window and
     /// spill owners. A scalar owner need not allocate a one-element array.
     func fold(_ values: [SQLValue]) throws {
         try checkFold(width: values.count)
-        switch plan.kernel {
+        switch kernel {
         case .orderedSet: try orderedSet!.fold(values)
         case .collection: try collection!.fold(values)
         case .countStar: try increment()
@@ -281,7 +365,7 @@ internal final class AggregateState {
 
     func foldScalar(_ value: SQLValue) throws {
         try checkFold(width: 1)
-        switch plan.kernel {
+        switch kernel {
         case .orderedSet: try orderedSet!.fold([value])
         case .collection: try collection!.fold([value])
         default: try foldValue(value)
@@ -291,13 +375,13 @@ internal final class AggregateState {
     /// COUNT's packed operand is stored nullness, not a fabricated SQL value.
     func foldCount(isNull: Bool) throws {
         try checkFold(width: 1)
-        guard case .count = plan.kernel else { throw JedError("XX000", "aggregate does not accept a nullness operand") }
+        guard case .count = kernel else { throw JedError("XX000", "aggregate does not accept a nullness operand") }
         if !isNull { try increment() }
     }
 
     func foldStar() throws {
         try checkFold(width: 0)
-        guard case .countStar = plan.kernel else { throw JedError("XX000", "aggregate is missing its argument") }
+        guard case .countStar = kernel else { throw JedError("XX000", "aggregate is missing its argument") }
         try increment()
     }
 
@@ -305,7 +389,7 @@ internal final class AggregateState {
     /// accumulator fields, work charges, overflow order and finalization.
     private func foldValue(_ value: SQLValue) throws {
         if value.isNull { return }
-        switch plan.kernel {
+        switch kernel {
         case .count: try increment()
         case .integerSum:
             guard case .integer(let value) = value else { throw JedError("XX000", "integer aggregate operand mismatch") }

@@ -54,7 +54,7 @@ internal final class BlockingDistinctExecution {
                 while let row = try cursor.next() {
                     try context.meter.pollStep()
                     let current = rowContext(row)
-                    let projected = try plan.projections.map(current.evaluate)
+                    let projected = try plan.projections.map { try current.evaluate($0) }
                     for value in projected {
                         let bytes = MemorySizes.payload(value)
                         if bytes > 0 { context.meter.charge(bytes); try context.meter.guardCost() }
