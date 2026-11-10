@@ -28,7 +28,7 @@ import {
   truncateToChars,
   typeError,
 } from "./store.ts";
-import type { BinaryOp, Expr, TypeMod } from "./ast.ts";
+import type { BinaryOp, Expr, SrcLoc, TypeMod } from "./ast.ts";
 import type { AggCtx, RExpr, ResolvedType } from "./executor.ts";
 import { EngineError, atPosition, engineError, positionedAt } from "./errors.ts";
 import { assignableTo, exprLocation } from "./eval_ops.ts";
@@ -152,19 +152,55 @@ export function resolveParamNode(
   return { node: { kind: "param", index: idx0 }, type };
 }
 
-// adoptContainerParam types e, when it is a bare parameter, as the container type other — an array,
-// range, or named composite (spec/design/api.md §5, container-typed parameters). null when e is not
-// a parameter or other is not such a container.
+// adoptContainerParam types e as the container type other of the operand beside it, when e is a bare
+// parameter facing an array, range, or named composite (spec/design/api.md §5, container-typed
+// parameters), or a bare string literal facing an array or range. The literal is PostgreSQL's
+// unknown, so it takes its sibling's type and folds through that type's input function
+// (x = '{1,2}', r && '[2,6)' — types.md §5). A string literal beside a composite stays text:
+// PostgreSQL reads it as an anonymous record, which it rejects. null when neither applies.
 export function adoptContainerParam(
   scope: Scope,
   e: Expr,
   other: ResolvedType,
   params: ParamTypes,
 ): { node: RExpr; type: ResolvedType } | null {
+  if (e.kind === "literal" && e.literal.kind === "text") {
+    return adaptStringLiteralToContainer(scope, e.literal.text, e.loc, other, params);
+  }
   if (e.kind !== "param") return null;
   const ct = containerParamType(scope, other);
   if (ct === null) return null;
   return resolveParamNode(scope, e, ct, other, params);
+}
+
+// adaptStringLiteralToContainer folds the bare string literal text as a value of the array or range
+// type other, through array_in / range_in (22P02 on malformed input, positioned at the literal).
+// null when other is neither.
+function adaptStringLiteralToContainer(
+  scope: Scope,
+  text: string,
+  loc: SrcLoc | undefined,
+  other: ResolvedType,
+  params: ParamTypes,
+): { node: RExpr; type: ResolvedType } | null {
+  if (other.kind === "array") {
+    const elemCol = arrayParamElem(scope, other.elem);
+    if (elemCol === null) return null;
+    const iz = scope.catalog.inputZone();
+    const val = atPosition(loc, () => coerceStringToArray(text, elemCol, iz));
+    params.noteInputZone(iz);
+    return { node: valueToRExpr(val), type: other };
+  }
+  if (other.kind === "range") {
+    const elem = resolvedRangeElementScalar(other.elem);
+    const desc = elem === undefined ? undefined : rangeForElement(elem);
+    if (desc === undefined) return null;
+    const iz = scope.catalog.inputZone();
+    const out = atPosition(loc, () => coerceStringToRangeExpr(text, desc, iz));
+    params.noteInputZone(iz);
+    return out;
+  }
+  return null;
 }
 
 // containerParamType is the parameter type of a container-typed context: an array whose element is a

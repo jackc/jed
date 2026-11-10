@@ -5404,7 +5404,7 @@ fn type_from_resolved(rt: &ResolvedType) -> Result<Type> {
 /// The scalar element type of a resolved range element (`ResolvedType::Range(elem)`'s `elem`). A
 /// range's element is always one of the six scalar subtypes; `None` for anything else (which never
 /// occurs for a valid range). Used to name a range (`i32` → `i32range`) and to build its codec.
-fn resolved_range_element_scalar(elem: &ResolvedType) -> Option<ScalarType> {
+pub(crate) fn resolved_range_element_scalar(elem: &ResolvedType) -> Option<ScalarType> {
     match elem {
         ResolvedType::Int(s) => Some(*s),
         ResolvedType::Decimal => Some(ScalarType::Decimal),

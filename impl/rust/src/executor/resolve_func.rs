@@ -2151,15 +2151,21 @@ pub(crate) fn resolve_param_node(
     Ok((RExpr::Param(idx0), rty))
 }
 
-/// Type `e`, when it is a bare parameter, as the container type `other` — an array, range, or named
-/// composite (spec/design/api.md §5, container-typed parameters). `None` when `e` is not a
-/// parameter or `other` is not such a container.
+/// Type `e` as the container type `other` of the operand beside it, when `e` is a bare parameter
+/// facing an array, range, or named composite (spec/design/api.md §5, container-typed parameters),
+/// or a bare string literal facing an array or range. The literal is PostgreSQL's `unknown`, so it
+/// takes its sibling's type and folds through that type's input function (`x = '{1,2}'`,
+/// `r && '[2,6)'` — types.md §5). A string literal beside a composite stays `text`: PostgreSQL reads
+/// it as an anonymous record, which it rejects. `None` when neither case applies.
 pub(crate) fn adopt_container_param(
     scope: &Scope,
     e: &Expr,
     other: &ResolvedType,
     params: &mut ParamTypes,
 ) -> Result<Option<(RExpr, ResolvedType)>> {
+    if let Expr::Literal(Literal::Text(s), pos) = e {
+        return adapt_string_literal_to_container(scope, s, *pos, other, params);
+    }
     let Expr::Param(n1, _) = e else {
         return Ok(None);
     };
@@ -2167,6 +2173,43 @@ pub(crate) fn adopt_container_param(
         return Ok(None);
     };
     resolve_param_node(scope, *n1, Some(ct), other.clone(), params).map(Some)
+}
+
+/// Fold the bare string literal `s` as a value of the array or range type `other`, through
+/// `array_in` / `range_in` (22P02 on malformed input, positioned at the literal). `None` when `other`
+/// is neither.
+fn adapt_string_literal_to_container(
+    scope: &Scope,
+    s: &str,
+    pos: SrcPos,
+    other: &ResolvedType,
+    params: &mut ParamTypes,
+) -> Result<Option<(RExpr, ResolvedType)>> {
+    match other {
+        ResolvedType::Array(elem) => {
+            let Some(elem_col) = array_param_elem(scope, elem) else {
+                return Ok(None);
+            };
+            let val = fold_in_session_zone(scope, params, |iz| {
+                coerce_string_to_array(s, &elem_col, iz)
+            })
+            .map_err(|e| e.with_position(pos.0))?;
+            Ok(Some((value_to_rexpr(&val), other.clone())))
+        }
+        ResolvedType::Range(elem) => {
+            let Some(desc) =
+                resolved_range_element_scalar(elem).and_then(crate::range::range_for_element)
+            else {
+                return Ok(None);
+            };
+            fold_in_session_zone(scope, params, |iz| {
+                coerce_string_to_range_expr(s, desc, iz)
+            })
+            .map_err(|e| e.with_position(pos.0))
+            .map(Some)
+        }
+        _ => Ok(None),
+    }
 }
 
 /// The parameter type of a container-typed context: an array whose element is a scalar or a named

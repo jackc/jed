@@ -5041,6 +5041,12 @@ export function resolveScalarArrayOperands(
       return [rl, resolveParamNode(scope, array, { kind: "array", elem }, arrayType, params)];
     }
   }
+  // A bare string literal array operand is PostgreSQL's unknown: it reads through array_in as the
+  // array of `x`'s type (`id = ANY('{1,5}')`).
+  if (array.kind === "literal" && array.literal.kind === "text") {
+    const adopted = adoptContainerParam(scope, array, { kind: "array", elem: rl.type }, params);
+    if (adopted !== null) return [rl, adopted];
+  }
   // If `x` is a CONCRETE scalar (not itself an adaptable bare literal) and the array operand is a
   // bare ARRAY[…] constructor, re-resolve the array with `x`'s type as the element hint so the
   // constructor adapts (`c = ANY(ARRAY[1,2])` over an i32 column → i32[]). Harmless for a

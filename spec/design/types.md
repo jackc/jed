@@ -273,8 +273,17 @@ listed).
 - **Strictness is preserved.** The string→number/bool coercion fires only when the type is
   **named** (a literal or CAST). A **bare** string in a numeric context does **not** silently
   become a number: `WHERE int_col = '42'` is `42804` (§4), and a bare string adapts *only* to the
-  string-native types (bytea/uuid/timestamp/timestamptz/interval, where the string is the only
-  literal form) — never to int/decimal/boolean. Only a *literal* adapts: a text-typed expression (a
+  string-native types (bytea/uuid/date/timestamp/timestamptz/interval/json/jsonb/jsonpath, where the
+  string is the only literal form) and to the array and range containers — never to
+  int/decimal/boolean. Beside an array or range operand — a comparison, `IN`, `BETWEEN`, the
+  containment/overlap/positional operators, array `||`, range `+`/`*`/`-` — the literal takes that
+  operand's type and reads through `array_in` / `range_in` (`x = '{1,2}'`, `r && '[2,6)'`); as the
+  array operand of `ANY`/`ALL` or `width_bucket` it is the array of the other operand's type
+  (`id = ANY('{1,5}')`). A malformed literal is the input function's `22P02`. Beside a composite a
+  bare string is not adapted (PostgreSQL reads it as an anonymous `record`, which it rejects). The
+  adaptation is to a *sibling operand*: `CASE`/`COALESCE`/`GREATEST`/`LEAST` arms and set-operation
+  columns unify by `common_type` without it, so `COALESCE(date_col, '2024-01-01')` is `42804`
+  where PostgreSQL resolves the literal to `date`. Only a *literal* adapts: a text-typed expression (a
   text column, `||`, a subquery) stored into a string-native column is `42804`, as in PostgreSQL
   ([grammar.md](grammar.md) §24). So `type 'string'` admits the *explicit* spelling of a
   text→scalar cast without weakening the implicit rules.

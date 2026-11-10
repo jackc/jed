@@ -537,6 +537,10 @@ own, as in PostgreSQL: the result's element type is the common type of the argum
 `ARRAY[1::i32] || 9000000000::i64` is an `i64[]` and `ARRAY[1, 2] || 2.5` a `numeric[]`. A float
 never meets an integer or `numeric` implicitly, so mixing those is still an error (`42883`).
 
+Beside an array, a bare string literal needs no cast, as in PostgreSQL: `xs = '{1,2}'`,
+`tags @> '{a}'`, and `xs || '{3}'` read the literal as the other operand's array type, and
+`id = ANY('{1,5}')` reads it as an array of `id`'s type. A malformed literal raises `22P02`.
+
 To join an array's elements with a separator, or split a string into a `text[]`, use
 `array_to_string(array, sep [, null_string])` and `string_to_array(text, sep [, null_string])`.
 `array_to_string` writes each element's plain text (no `{…}` quoting) and skips `NULL` elements
@@ -708,6 +712,9 @@ adjacent), and combine ranges with the set operators — `+` (union), `*` (inter
 the gap instead:
 
 <LiveSql demo="rangeDemo" query={rangeDemo} rows={3} />
+
+Beside a range, a bare string literal is read as that range type, so `during && '[2,6)'` and
+`r = '[1,3)'` need no cast.
 
 <a id="time-zones"></a>
 

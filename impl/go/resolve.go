@@ -2147,10 +2147,16 @@ func resolveParamNode(s *scope, e exprNode, ct *colType, rty resolvedType, param
 	return &rExpr{kind: reParam, index: idx0, plan: frame}, rty, nil
 }
 
-// adoptContainerParam types e, when it is a bare parameter, as the container type other — an array,
-// range, or named composite (spec/design/api.md §5, container-typed parameters). ok is false when e
-// is not a parameter or other is not such a container.
+// adoptContainerParam types e as the container type other of the operand beside it, when e is a bare
+// parameter facing an array, range, or named composite (spec/design/api.md §5, container-typed
+// parameters), or a bare string literal facing an array or range. The literal is PostgreSQL's
+// unknown, so it takes its sibling's type and folds through that type's input function
+// (x = '{1,2}', r && '[2,6)' — types.md §5). A string literal beside a composite stays text:
+// PostgreSQL reads it as an anonymous record, which it rejects. ok is false when neither applies.
 func adoptContainerParam(s *scope, e exprNode, other resolvedType, params *paramTypes) (*rExpr, resolvedType, bool, error) {
+	if e.Kind == exprLiteral && e.Literal != nil && e.Literal.Kind == literalText {
+		return adaptStringLiteralToContainer(s, e.Literal.Str, e.Pos, other, params)
+	}
 	if e.Kind != exprParam {
 		return nil, resolvedType{}, false, nil
 	}
@@ -2160,6 +2166,43 @@ func adoptContainerParam(s *scope, e exprNode, other resolvedType, params *param
 	}
 	node, ty, err := resolveParamNode(s, e, &ct, other, params)
 	return node, ty, true, err
+}
+
+// adaptStringLiteralToContainer folds the bare string literal str as a value of the array or range
+// type other, through array_in / range_in (22P02 on malformed input, positioned at the literal). ok
+// is false when other is neither.
+func adaptStringLiteralToContainer(s *scope, str string, pos srcPos, other resolvedType, params *paramTypes) (*rExpr, resolvedType, bool, error) {
+	switch other.kind {
+	case rtArray:
+		elemCol, ok := arrayParamElem(s, *other.elem)
+		if !ok {
+			return nil, resolvedType{}, false, nil
+		}
+		iz := s.catalog.inputZone()
+		val, err := coerceStringToArray(str, elemCol, iz)
+		if err != nil {
+			return nil, resolvedType{}, true, positionError(err, pos)
+		}
+		params.noteInputZone(iz)
+		return valueToRExpr(val), other, true, nil
+	case rtRange:
+		elem, ok := resolvedRangeElementScalar(other.elem)
+		if !ok {
+			return nil, resolvedType{}, false, nil
+		}
+		desc, ok := rangeForElement(elem)
+		if !ok {
+			return nil, resolvedType{}, false, nil
+		}
+		iz := s.catalog.inputZone()
+		node, rt, err := coerceStringToRangeExpr(str, desc, iz)
+		if err != nil {
+			return nil, resolvedType{}, true, positionError(err, pos)
+		}
+		params.noteInputZone(iz)
+		return node, rt, true, nil
+	}
+	return nil, resolvedType{}, false, nil
 }
 
 // containerParamType is the parameter type of a container-typed context: an array whose element is a

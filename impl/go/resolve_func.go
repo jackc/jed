@@ -1998,6 +1998,18 @@ func resolveScalarArrayOperands(s *scope, lhs, array exprNode, ag *aggCtx, param
 			return rl, lt, ra, at, nil
 		}
 	}
+	// A bare string literal array operand is PostgreSQL's unknown: it reads through array_in as the
+	// array of `x`'s type (`id = ANY('{1,5}')`).
+	if array.Kind == exprLiteral && array.Literal != nil && array.Literal.Kind == literalText {
+		arrRT := resolvedType{kind: rtArray, elem: &lt}
+		node, ty, ok, err := adoptContainerParam(s, array, arrRT, params)
+		if err != nil {
+			return nil, resolvedType{}, nil, resolvedType{}, err
+		}
+		if ok {
+			return rl, lt, node, ty, nil
+		}
+	}
 	// If `x` is a CONCRETE scalar (not itself an adaptable bare literal) and the array operand is a
 	// bare ARRAY[…] constructor, re-resolve the array with `x`'s type as the element hint so the
 	// constructor adapts (`c = ANY(ARRAY[1,2])` over an i32 column → i32[]). Harmless for a

@@ -1511,6 +1511,14 @@ pub(crate) fn resolve_scalar_array_operands(
             return Ok((rl, lt, ra, at));
         }
     }
+    // A bare string literal array operand is PostgreSQL's `unknown`: it reads through `array_in` as
+    // the array of `x`'s type (`id = ANY('{1,5}')`).
+    if matches!(array, Expr::Literal(Literal::Text(_), _)) {
+        let arr_rt = ResolvedType::Array(Box::new(lt.clone()));
+        if let Some((ra, at)) = adopt_container_param(scope, array, &arr_rt, params)? {
+            return Ok((rl, lt, ra, at));
+        }
+    }
     // If `x` is a CONCRETE scalar (not itself an adaptable bare literal) and the array operand is a
     // bare `ARRAY[…]` constructor, re-resolve the array with `x`'s type as the element hint so the
     // constructor adapts (`c = ANY(ARRAY[1,2])` over an i32 column → i32[]). Harmless for a
