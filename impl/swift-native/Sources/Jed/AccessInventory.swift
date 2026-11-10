@@ -10,11 +10,37 @@ internal struct ScanCandidate {
         case orderedIntervals(IntervalPlan, TableStore)
         case full(BaseScanPlan)
     }
-    let path: Path
-    let table: CatalogTable
-    let store: TableStore
-    let snapshot: DomainSnapshot
-    let predicate: ResolvedExpression?
+    /// Stored fields live in one copy-on-write box, so passing this value
+    /// around costs one retain instead of a field-by-field copy.
+    private final class Storage {
+        let path: Path
+        let table: CatalogTable
+        let store: TableStore
+        let snapshot: DomainSnapshot
+        let predicate: ResolvedExpression?
+        /// The key-less plan of `predicate`, which every candidate of one
+        /// inventory uses for the same contradiction check.
+        let check: BaseScanPlan?
+        init(path: Path, table: CatalogTable, store: TableStore, snapshot: DomainSnapshot,
+             predicate: ResolvedExpression?, check: BaseScanPlan?) {
+            self.path = path
+            self.table = table
+            self.store = store
+            self.snapshot = snapshot
+            self.predicate = predicate
+            self.check = check
+        }
+    }
+    private let storage: Storage
+    init(path: Path, table: CatalogTable, store: TableStore, snapshot: DomainSnapshot, predicate: ResolvedExpression?,
+         check: BaseScanPlan? = nil) {
+        storage = Storage(path: path, table: table, store: store, snapshot: snapshot, predicate: predicate, check: check)
+    }
+    var path: Path { storage.path }
+    var table: CatalogTable { storage.table }
+    var store: TableStore { storage.store }
+    var snapshot: DomainSnapshot { storage.snapshot }
+    var predicate: ResolvedExpression? { storage.predicate }
 
     var ordered: OrderedIndexBound? {
         if case .ordered(let bound, _) = path { return bound }; return nil
@@ -69,7 +95,7 @@ internal struct ScanCandidate {
     }
     func estimate(parameters: [SQLValue]?, context: ExpressionContext) throws -> PlanEstimate {
         let model = PlanCardinality(table: table, snapshot: snapshot, parameters: parameters, collatedKey: context.collatedKey, planningProbe: context.planningProbe)
-        let check = BaseScanPlan(predicate: predicate, keys: [], types: store.tree.types)
+        let check = storage.check ?? BaseScanPlan(predicate: predicate, keys: [], types: store.tree.types)
         if try check.hasKnownContradiction(parameters: parameters, collatedKey: context.collatedKey, planningProbe: context.planningProbe) {
             return PlanEstimate(rows: 0, cost: 0, logicalRows: 0)
         }
@@ -182,10 +208,11 @@ internal enum AccessInventory {
                         predicate: ResolvedExpression?, base: BaseScanPlan, settings: SessionSettings,
                         context: ExpressionContext, orderOnly: [ResolvedOrderTerm] = [],
                         forJoin: Bool = false, allowOuter: Bool = false) throws -> [ScanCandidate] {
+        let unkeyed = BaseScanPlan(predicate: predicate, keys: [], types: store.tree.types)
         func candidate(_ path: ScanCandidate.Path) -> ScanCandidate {
-            ScanCandidate(path: path, table: table, store: store, snapshot: snapshot, predicate: predicate)
+            ScanCandidate(path: path, table: table, store: store, snapshot: snapshot, predicate: predicate, check: unkeyed)
         }
-        let full = candidate(.full(BaseScanPlan(predicate: predicate, keys: [], types: store.tree.types)))
+        let full = candidate(.full(unkeyed))
         guard !DomainNames.isAttachment(domain) else { return [full] }
         var result: [ScanCandidate] = []
         if base.accessPredicate != nil { result.append(candidate(.primary(base))) }

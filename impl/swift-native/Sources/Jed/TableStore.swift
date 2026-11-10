@@ -4,14 +4,52 @@ internal final class StorageRevision: Sendable {}
 /// A store owns a packed tree and only the accounting metadata of pending
 /// versions. Statement, savepoint, and cursor copies share immutable tree nodes.
 internal struct TableStore: Sendable {
-    private(set) var tree: BPlusTree
-    private(set) var nextRowID: Int64
-    private(set) var pendingBytes: Int64 = 0
-    private var pendingKeys: [[UInt8]: Int64] = [:]
-    private(set) var revision = StorageRevision()
+    /// Stored fields live in one copy-on-write box, so passing this value
+    /// around costs one retain instead of a field-by-field copy.
+    private final class Storage: @unchecked Sendable {
+        var tree: BPlusTree
+        var nextRowID: Int64
+        var pendingBytes: Int64
+        var pendingKeys: PendingKeyMap
+        var revision: StorageRevision
+        init(tree: BPlusTree, nextRowID: Int64, pendingBytes: Int64, pendingKeys: PendingKeyMap, revision: StorageRevision) {
+            self.tree = tree
+            self.nextRowID = nextRowID
+            self.pendingBytes = pendingBytes
+            self.pendingKeys = pendingKeys
+            self.revision = revision
+        }
+        func copy() -> Storage {
+            Storage(tree: tree, nextRowID: nextRowID, pendingBytes: pendingBytes, pendingKeys: pendingKeys, revision: revision)
+        }
+    }
+    private var storage: Storage
+    @inline(__always) private mutating func unique() {
+        if !isKnownUniquelyReferenced(&storage) { storage = storage.copy() }
+    }
+    private(set) var tree: BPlusTree {
+        get { storage.tree }
+        _modify { unique(); yield &storage.tree }
+    }
+    private(set) var nextRowID: Int64 {
+        get { storage.nextRowID }
+        _modify { unique(); yield &storage.nextRowID }
+    }
+    private(set) var pendingBytes: Int64 {
+        get { storage.pendingBytes }
+        _modify { unique(); yield &storage.pendingBytes }
+    }
+    private var pendingKeys: PendingKeyMap {
+        get { storage.pendingKeys }
+        _modify { unique(); yield &storage.pendingKeys }
+    }
+    private(set) var revision: StorageRevision {
+        get { storage.revision }
+        _modify { unique(); yield &storage.revision }
+    }
 
     init(tree: BPlusTree, nextRowID: Int64 = 0) {
-        self.tree = tree; self.nextRowID = nextRowID
+        storage = Storage(tree: tree, nextRowID: nextRowID, pendingBytes: 0, pendingKeys: PendingKeyMap(), revision: StorageRevision())
     }
     var count: Int64? { tree.count }
     func get(_ key: [UInt8]) throws -> PackedRecord? { try tree.get(key) }
@@ -40,9 +78,8 @@ internal struct TableStore: Sendable {
     }
     /// The caller checks SQL uniqueness and constraints; this storage primitive
     /// replaces a key atomically and reports the prior packed version.
-    /// Fallible work runs against a copy of the tree alone. Copying the whole
-    /// store instead would alias `pendingKeys` and force a full dictionary
-    /// copy on every staged key.
+    /// Fallible work runs against a copy of the tree alone, so a failure
+    /// leaves the staged accounting untouched.
     @discardableResult mutating func put(_ record: PackedRecord, netStaging: Bool) throws -> PackedRecord? {
         var edited = tree
         let old = try edited.insert(record)
@@ -77,11 +114,17 @@ internal struct TableStore: Sendable {
         revision = StorageRevision()
         return true
     }
+    /// One statement's run of `put`/`remove` on this value alone: the tree
+    /// reuses the interior nodes that run created (`BPlusTree.beginBatch`).
+    /// The store must not be copied or published until `endBatch`, and is
+    /// discarded if an edit throws.
+    mutating func beginBatch() { tree.beginBatch() }
+    mutating func endBatch() { tree.endBatch() }
     mutating func allocateRowID() throws -> Int64 {
         guard nextRowID < Int64.max else { throw JedError("54000", "synthetic row identifier exhausted") }
         let result = nextRowID; nextRowID += 1; revision = StorageRevision(); return result
     }
-    mutating func forgetPendingKeys() { pendingKeys.removeAll(keepingCapacity: false) }
+    mutating func forgetPendingKeys() { pendingKeys.removeAll() }
     mutating func clearPending() { pendingBytes = 0; forgetPendingKeys() }
     mutating func installPersistedTree(_ tree: BPlusTree) { self.tree = tree; clearPending() }
     func truncated() -> TableStore {

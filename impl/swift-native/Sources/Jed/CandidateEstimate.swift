@@ -13,27 +13,55 @@ internal struct CandidateEstimate {
         }
     }
     let rows: Int64
-    let units: [String: Int64]
     let cost: Int64
+    private let scanned: Int64, pages: Int64, evaluations: Int64, produced: Int64
+    private let ginEntries: Int64?, gistDescents: Int64?
+    /// Per-unit counts, built on demand for the shared estimator vectors.
+    var units: [String: Int64] {
+        var units: [String: Int64] = [
+            "storage_row_read": scanned, "page_read": pages,
+            "operator_eval": evaluations, "row_produced": produced,
+        ]
+        if let ginEntries { units["gin_entry"] = ginEntries }
+        if let gistDescents { units["gist_descent"] = gistDescents }
+        return units
+    }
     let tieKey: String
+
+    /// The schedule's weights for the units a candidate can estimate. Terms
+    /// are products of non-negative counts and weights joined by a saturating
+    /// sum, so adding only these in a fixed order equals the sum over the
+    /// whole schedule.
+    private static let weights: [String: Int64] = {
+        var result: [String: Int64] = [:]
+        for fact in GeneratedSpec.costs { result[fact.id] = fact.weight }
+        return result
+    }()
+    private static let rowReadWeight = weights["storage_row_read"] ?? 0
+    private static let pageReadWeight = weights["page_read"] ?? 0
+    private static let operatorWeight = weights["operator_eval"] ?? 0
+    private static let producedWeight = weights["row_produced"] ?? 0
+    private static let ginWeight = weights["gin_entry"] ?? 0
+    private static let gistWeight = weights["gist_descent"] ?? 0
 
     init(kind: Kind, indexName: String = "", scanRows: Int64, outputRows: Int64,
          accessPages: Int64, tableHeight: Int64, filterNodes: Int64 = 0,
          accessWork: Int64 = 0, producesRows: Bool = false) {
         let scanned = max(0, scanRows), output = max(0, outputRows)
-        var units: [String: Int64] = [
-            "storage_row_read": scanned,
-            "page_read": max(0, accessPages),
-            "operator_eval": QueryEstimate.multiply(scanned, max(0, filterNodes)),
-            "row_produced": producesRows ? output : 0,
-        ]
-        if kind.fetchesTable {
-            units["page_read"] = saturatingAdd(units["page_read"]!, QueryEstimate.multiply(scanned, max(0, tableHeight)))
-        }
-        if kind == .gin { units["gin_entry"] = max(0, accessWork) }
-        if kind == .gist { units["gist_descent"] = max(0, accessWork) }
-        self.rows = output; self.units = units
-        cost = GeneratedSpec.costs.reduce(0) { saturatingAdd($0, QueryEstimate.multiply(units[$1.id] ?? 0, $1.weight)) }
+        var pages = max(0, accessPages)
+        if kind.fetchesTable { pages = saturatingAdd(pages, QueryEstimate.multiply(scanned, max(0, tableHeight))) }
+        let evaluations = QueryEstimate.multiply(scanned, max(0, filterNodes))
+        let produced = producesRows ? output : 0
+        var total = QueryEstimate.multiply(scanned, Self.rowReadWeight)
+        total = saturatingAdd(total, QueryEstimate.multiply(pages, Self.pageReadWeight))
+        total = saturatingAdd(total, QueryEstimate.multiply(evaluations, Self.operatorWeight))
+        total = saturatingAdd(total, QueryEstimate.multiply(produced, Self.producedWeight))
+        let work = max(0, accessWork)
+        if kind == .gin { total = saturatingAdd(total, QueryEstimate.multiply(work, Self.ginWeight)) }
+        if kind == .gist { total = saturatingAdd(total, QueryEstimate.multiply(work, Self.gistWeight)) }
+        self.rows = output; cost = total
+        self.scanned = scanned; self.pages = pages; self.evaluations = evaluations; self.produced = produced
+        ginEntries = kind == .gin ? work : nil; gistDescents = kind == .gist ? work : nil
         tieKey = String(kind.rank) + ":" + indexName
     }
 }

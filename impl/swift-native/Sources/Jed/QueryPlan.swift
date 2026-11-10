@@ -784,13 +784,16 @@ internal enum ScanCost {
     }
     static func units(_ store: TableStore, touched: [Int], meter: CostMeter, access: ScanAccess = .full) throws -> Int64 {
         guard !access.isEmpty else { return 0 }
-        var units = access.pages(store.tree)
-        let variable = touched.filter { ValueCodec.fixedWidth(store.tree.types[$0].type) == nil }
+        // Read the store's facts once: this loop visits every row in range.
+        let tree = store.tree
+        var units = access.pages(tree)
+        let variable = touched.filter { ValueCodec.fixedWidth(tree.types[$0].type) == nil }
         if !variable.isEmpty {
+            let slab = tree.codec.capacity, encrypted = tree.codec.reservedBytes != 0
             var scan = access.cursor(store); defer { scan.close() }
             while let position = try scan.nextPosition() {
                 try meter.pollStep()
-                units = saturatingAdd(units, try payload(position, store: store, touched: variable))
+                units = saturatingAdd(units, try payload(position, slab: slab, encrypted: encrypted, touched: variable))
             }
         }
         return units
@@ -809,11 +812,12 @@ internal enum ScanCost {
         return (record, saturatingAdd(Int64(store.tree.height), units))
     }
     private static func payload(_ record: PackedRecord, store: TableStore, touched: [Int]) throws -> Int64 {
-        let slab = store.tree.codec.capacity
-        let chainSlab = slab - (store.tree.codec.reservedBytes == 0 ? 0 : 16)
+        let tree = store.tree, cells = record.cells
+        let slab = tree.codec.capacity, encrypted = tree.codec.reservedBytes != 0
+        let chainSlab = slab - (encrypted ? 16 : 0)
         var units: Int64 = 0
-        for column in touched where ValueCodec.fixedWidth(store.tree.types[column].type) == nil {
-            guard let facts = try record.cells[column].largeFacts(encrypted: store.tree.codec.reservedBytes != 0) else { continue }
+        for column in touched where ValueCodec.fixedWidth(tree.types[column].type) == nil {
+            guard let facts = try cells[column].largeFacts(encrypted: encrypted) else { continue }
             if facts.external != nil { units = saturatingAdd(units, Int64((facts.stored + chainSlab - 1) / chainSlab)) }
             if facts.compressed { units = saturatingAdd(units, Int64((facts.raw + slab - 1) / slab)) }
         }
@@ -821,12 +825,11 @@ internal enum ScanCost {
     }
     /// A preflight inspects the same packed tags, including dirty placeholder
     /// cells, without reconstructing an unused key and every column's cell.
-    private static func payload(_ position: TreePosition, store: TableStore, touched: [Int]) throws -> Int64 {
-        let slab = store.tree.codec.capacity
-        let chainSlab = slab - (store.tree.codec.reservedBytes == 0 ? 0 : 16)
+    private static func payload(_ position: TreePosition, slab: Int, encrypted: Bool, touched: [Int]) throws -> Int64 {
+        let chainSlab = slab - (encrypted ? 16 : 0)
         var units: Int64 = 0
         for column in touched {
-            guard let facts = try position.cell(column).largeFacts(encrypted: store.tree.codec.reservedBytes != 0) else { continue }
+            guard let facts = try position.cell(column).largeFacts(encrypted: encrypted) else { continue }
             if facts.external != nil { units = saturatingAdd(units, Int64((facts.stored + chainSlab - 1) / chainSlab)) }
             if facts.compressed { units = saturatingAdd(units, Int64((facts.raw + slab - 1) / slab)) }
         }

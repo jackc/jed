@@ -22,12 +22,30 @@ simulation images. Its SHA-256 is
 The ignored archive supplements this committed report; the original `/tmp`
 paths below remain useful provenance references.
 
+## Third follow-up revalidation (2026-11-10)
+
+The per-statement and bulk-write changes recorded in
+[swift-native-performance.md](../../spec/design/swift-native-performance.md#third-follow-up-per-statement-and-bulk-write-costs-2026-11-10)
+were checked with the same subset of gates, on top of `3bea4580`.
+
+| Gate | Result |
+|---|---|
+| Release native/API and all frozen SQL | **546 tests**, zero failures; **749/749 files**, 21,597 records, 39,148 cells, 2,271 cost / 1,154 name / 100 type assertions. |
+| New unit tests (`WriterStructureTests`) | `PendingKeyMap` and `RecordList` against the plain collections; batched tree edits equal unbatched ones node for node, and leave earlier snapshots untouched. |
+| Concurrent stress, Swift only | Two core/storage runs, 8,000 snapshot checks, zero failures; final checksum `f3e75496a3111181`. |
+| File interchange, Go peer only | **897/897 phases**, zero failures (diagnostic subset matrix). |
+| Saved fault-simulation regressions, Swift only (debug) | All **18** frozen traces pass. |
+| Encrypted SQL corpus, Swift only (debug) | **19,403/19,403** frozen record measurements, zero failures (diagnostic subset matrix). |
+
+Not re-run: exact cross-core resource accounting, the cross-core encrypted
+matrix, Rust and TypeScript interchange, generated fault-simulation sweeps,
+mixed processes and the page service.
+
 ## Second follow-up revalidation (2026-11-09)
 
 The copy-cost changes recorded in
 [swift-native-performance.md](../../spec/design/swift-native-performance.md#second-follow-up-copy-and-dispatch-costs-2026-11-09)
-were checked with a subset of the gates below. Uncommitted at the time of
-writing, on top of `a551b969`.
+were checked with a subset of the gates below. Committed as `3bea4580`.
 
 | Gate | Result |
 |---|---|

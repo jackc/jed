@@ -331,7 +331,10 @@ internal final class AggregateState {
             sum = sum.addingUncapped(x); squares = squares.addingUncapped(square); try increment()
         case .extreme(let minimum):
             if current.isNull { current = value }
-            else {
+            else if case .integer(let incoming) = value, case .integer(let held) = current {
+                // Integer types order numerically; no descriptor is needed.
+                if minimum ? incoming < held : incoming > held { current = value }
+            } else {
                 let comparison = try ValueComparison.total(value, current, type: plan.inputTypes[0], collatedKey: collatedKey)
                 if minimum ? comparison < 0 : comparison > 0 { current = value }
             }

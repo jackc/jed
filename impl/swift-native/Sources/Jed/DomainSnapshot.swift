@@ -1,32 +1,115 @@
 /// One database domain's immutable published state. Dictionaries map catalog
 /// names to independent packed trees; they never contain decoded table rows.
 internal struct DomainSnapshot: Sendable {
-    let identity: StorageRevision
-    let catalogID: UInt64
-    let pool: NodePool
-    private(set) var txid: UInt64
-    private(set) var catalog: CatalogImage
-    private(set) var types: [SQLText: CompositeType]
-    private(set) var borrowedTypes: [SQLText: CompositeType] = [:]
-    private(set) var borrowedReferences = CatalogBorrowedReferences()
-    private(set) var tables: [SQLText: TableStore]
-    private(set) var indexes: [SQLText: TableStore]
-    private(set) var gistTrees: [SQLText: GistTree]
-    private(set) var catalogRevision = StorageRevision()
-    private(set) var dataRevision = StorageRevision()
-    private var estimatorRevisions: [SQLText: StorageRevision]
-    private var nextTypeID: UInt32
+    /// Stored fields live in one copy-on-write box, so passing this value
+    /// around costs one retain instead of a field-by-field copy.
+    private final class Storage: @unchecked Sendable {
+        var identity: StorageRevision
+        var catalogID: UInt64
+        var pool: NodePool
+        var txid: UInt64
+        var catalog: CatalogImage
+        var types: [SQLText: CompositeType]
+        var borrowedTypes: [SQLText: CompositeType]
+        var borrowedReferences: CatalogBorrowedReferences
+        var tables: [SQLText: TableStore]
+        var indexes: [SQLText: TableStore]
+        var gistTrees: [SQLText: GistTree]
+        var catalogRevision: StorageRevision
+        var dataRevision: StorageRevision
+        var estimatorRevisions: [SQLText: StorageRevision]
+        var nextTypeID: UInt32
+        /// The last successful `borrowTypes(from:)`: the lender's identity and
+        /// catalog revision, and this catalog's revision at that time.
+        var borrowStamp: (StorageRevision, StorageRevision, StorageRevision)?
+        init(identity: StorageRevision, catalogID: UInt64, pool: NodePool, txid: UInt64, catalog: CatalogImage, types: [SQLText: CompositeType], borrowedTypes: [SQLText: CompositeType], borrowedReferences: CatalogBorrowedReferences, tables: [SQLText: TableStore], indexes: [SQLText: TableStore], gistTrees: [SQLText: GistTree], catalogRevision: StorageRevision, dataRevision: StorageRevision, estimatorRevisions: [SQLText: StorageRevision], nextTypeID: UInt32) {
+            self.identity = identity
+            self.catalogID = catalogID
+            self.pool = pool
+            self.txid = txid
+            self.catalog = catalog
+            self.types = types
+            self.borrowedTypes = borrowedTypes
+            self.borrowedReferences = borrowedReferences
+            self.tables = tables
+            self.indexes = indexes
+            self.gistTrees = gistTrees
+            self.catalogRevision = catalogRevision
+            self.dataRevision = dataRevision
+            self.estimatorRevisions = estimatorRevisions
+            self.nextTypeID = nextTypeID
+        }
+        func copy() -> Storage {
+            let copy = Storage(identity: identity, catalogID: catalogID, pool: pool, txid: txid, catalog: catalog, types: types, borrowedTypes: borrowedTypes, borrowedReferences: borrowedReferences, tables: tables, indexes: indexes, gistTrees: gistTrees, catalogRevision: catalogRevision, dataRevision: dataRevision, estimatorRevisions: estimatorRevisions, nextTypeID: nextTypeID)
+            copy.borrowStamp = borrowStamp
+            return copy
+        }
+    }
+    private var storage: Storage
+    @inline(__always) private mutating func unique() {
+        if !isKnownUniquelyReferenced(&storage) { storage = storage.copy() }
+    }
+    var identity: StorageRevision { storage.identity }
+    var catalogID: UInt64 { storage.catalogID }
+    var pool: NodePool { storage.pool }
+    private(set) var txid: UInt64 {
+        get { storage.txid }
+        _modify { unique(); yield &storage.txid }
+    }
+    private(set) var catalog: CatalogImage {
+        get { storage.catalog }
+        _modify { unique(); yield &storage.catalog }
+    }
+    private(set) var types: [SQLText: CompositeType] {
+        get { storage.types }
+        _modify { unique(); yield &storage.types }
+    }
+    private(set) var borrowedTypes: [SQLText: CompositeType] {
+        get { storage.borrowedTypes }
+        _modify { unique(); yield &storage.borrowedTypes }
+    }
+    private(set) var borrowedReferences: CatalogBorrowedReferences {
+        get { storage.borrowedReferences }
+        _modify { unique(); yield &storage.borrowedReferences }
+    }
+    private(set) var tables: [SQLText: TableStore] {
+        get { storage.tables }
+        _modify { unique(); yield &storage.tables }
+    }
+    private(set) var indexes: [SQLText: TableStore] {
+        get { storage.indexes }
+        _modify { unique(); yield &storage.indexes }
+    }
+    private(set) var gistTrees: [SQLText: GistTree] {
+        get { storage.gistTrees }
+        _modify { unique(); yield &storage.gistTrees }
+    }
+    private(set) var catalogRevision: StorageRevision {
+        get { storage.catalogRevision }
+        _modify { unique(); yield &storage.catalogRevision }
+    }
+    private(set) var dataRevision: StorageRevision {
+        get { storage.dataRevision }
+        _modify { unique(); yield &storage.dataRevision }
+    }
+    private var estimatorRevisions: [SQLText: StorageRevision] {
+        get { storage.estimatorRevisions }
+        _modify { unique(); yield &storage.estimatorRevisions }
+    }
+    private var nextTypeID: UInt32 {
+        get { storage.nextTypeID }
+        _modify { unique(); yield &storage.nextTypeID }
+    }
 
     init(catalogID: UInt64, txid: UInt64, catalog: CatalogImage, pool: NodePool,
          tables: [SQLText: TableStore], indexes: [SQLText: TableStore], gistTrees: [SQLText: GistTree],
          borrowedTypes: [SQLText: CompositeType] = [:], borrowedReferences: CatalogBorrowedReferences = .init()) throws {
-        identity = StorageRevision(); self.catalogID = catalogID; self.txid = txid; self.catalog = catalog
-        self.pool = pool; self.tables = tables; self.indexes = indexes; self.gistTrees = gistTrees
-        estimatorRevisions = tables.mapValues { _ in StorageRevision() }
-        self.borrowedTypes = borrowedTypes; self.borrowedReferences = borrowedReferences
-        types = try catalog.resolvedTypes(catalogID: catalogID, borrowedTypes: borrowedTypes)
+        let types = try catalog.resolvedTypes(catalogID: catalogID, borrowedTypes: borrowedTypes)
         guard types.count < UInt32.max else { throw JedError("54000", "composite type identity limit exceeded") }
-        nextTypeID = UInt32(types.count + 1)
+        storage = Storage(identity: StorageRevision(), catalogID: catalogID, pool: pool, txid: txid, catalog: catalog,
+            types: types, borrowedTypes: borrowedTypes, borrowedReferences: borrowedReferences, tables: tables,
+            indexes: indexes, gistTrees: gistTrees, catalogRevision: StorageRevision(), dataRevision: StorageRevision(),
+            estimatorRevisions: tables.mapValues { _ in StorageRevision() }, nextTypeID: UInt32(types.count + 1))
     }
     /// Temp catalogs borrow immutable main type trees without importing main
     /// catalog entries or page ownership. Retain names already used by temp
@@ -36,6 +119,18 @@ internal struct DomainSnapshot: Sendable {
         borrowedTypes.merge(available) { _, current in current }
         types = borrowedTypes
         try catalog.validateReferences(catalogID: catalogID, borrowedTypes: borrowedTypes, borrowedReferences: borrowedReferences)
+    }
+
+    /// Borrows the lender's composite types before each statement. Types
+    /// change only with a schema revision, and borrowing never replaces a name
+    /// already held, so repeating it against unchanged catalogs changes
+    /// nothing and is skipped.
+    mutating func borrowTypes(from lender: DomainSnapshot) throws {
+        if let stamp = storage.borrowStamp, stamp.0 === lender.identity, stamp.1 === lender.catalogRevision,
+           stamp.2 === catalogRevision { return }
+        try borrowTypes(lender.types)
+        unique()
+        storage.borrowStamp = (lender.identity, lender.catalogRevision, catalogRevision)
     }
 
     /// Private views may name main objects without importing their catalog or
@@ -129,6 +224,19 @@ internal struct DomainSnapshot: Sendable {
         for name in definitions.keys.sorted() { try visit(name) }
         catalog = image; types = resolved; nextTypeID = next
         if schemaChanged { catalogRevision = StorageRevision() } else { dataRevision = StorageRevision() }
+    }
+    /// DML changes only a row count and statistics staleness. Neither names
+    /// another catalog object, so references and resolved types stand as
+    /// validated; this is `updateCatalog(_:schemaChanged: false)` without
+    /// repeating that whole-catalog work per statement.
+    mutating func recordRowChange(_ table: SQLText, countDelta: Int64) {
+        let index = catalog.tables.firstIndex { $0.name == table }!
+        catalog.tables[index].rowCount += countDelta
+        for statistic in catalog.statistics.indices where catalog.statistics[statistic].table == table
+            && !catalog.statistics[statistic].stale {
+            catalog.statistics[statistic].stale = true
+        }
+        dataRevision = StorageRevision()
     }
     /// Explicit storage maintenance is the only unchanged-data commit kind.
     /// It rewrites the catalog/free list without resolving persisted SQL.

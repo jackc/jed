@@ -56,11 +56,13 @@ internal struct PreparedInsertPlan {
         returning = plan.returning; parameters = plan.parameterTypes
     }
     func bind(_ syntax: SQLInsert, snapshot: DomainSnapshot, settings: SessionSettings,
-              context: ExpressionContext) throws -> MutationExecutor.InsertPreparation {
+              context: ExpressionContext, writable: Bool = false) throws -> MutationExecutor.InsertPreparation {
         let relation = try MutationExecutor.Relation(syntax.table, snapshot: snapshot, domain: domain)
         try settings.privileges.require(.insert, on: relation.table.name)
-        try CatalogEnvironment.checkWritable(relation.table, image: snapshot.catalog,
-            environment: settings.environment, borrowedTypes: snapshot.borrowedTypes, rowTypes: relation.types)
+        if !writable {
+            try CatalogEnvironment.checkWritable(relation.table, image: snapshot.catalog,
+                environment: settings.environment, borrowedTypes: snapshot.borrowedTypes, rowTypes: relation.types)
+        }
         if !returning.oldTouched.isEmpty || !returning.newTouched.isEmpty { try relation.requireSelect(settings) }
         return MutationExecutor.InsertPreparation(read: snapshot, settings: settings, inputSettings: settings,
             relation: relation, destinations: destinations, discarded: discarded, sourcePlan: nil, inputLiterals: [],

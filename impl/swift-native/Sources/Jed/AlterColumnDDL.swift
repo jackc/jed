@@ -126,8 +126,9 @@ internal enum AlterColumnDDL {
         table.indexes.removeAll { indexes.contains($0.name) }
         table.exclusions.removeAll { indexes.contains($0.index) }
         removedIndexes.formUnion(indexes); added.subtract(checks); added.subtract(indexes)
+        let ownName = table.name
         table.foreignKeys.removeAll {
-            let removed = $0.columns.contains(ordinal) || ($0.referencedTable == table.name && $0.referencedColumns.contains(ordinal))
+            let removed = $0.columns.contains(ordinal) || ($0.referencedTable == ownName && $0.referencedColumns.contains(ordinal))
             if removed { added.remove($0.name) }
             return removed
         }

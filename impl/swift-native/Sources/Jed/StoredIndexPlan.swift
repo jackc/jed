@@ -96,6 +96,12 @@ internal struct StoredIndexPlan {
         else { try store.remove(entry.bytes) }
     }
     func apply(_ changes: [Change], to store: inout TableStore, twoPass: Bool, netStaging: Bool) throws {
+        // The caller's store is a private copy that it publishes afterwards
+        // and abandons on failure. A GIN edit rewrites runs through its own
+        // tree value and keeps its unbatched all-or-nothing form.
+        let batched = ginOpclasses == nil
+        if batched { store.beginBatch() }
+        defer { if batched { store.endBatch() } }
         if twoPass {
             for change in changes {
                 for entry in change.removed { try remove(entry, from: &store, netStaging: netStaging) }

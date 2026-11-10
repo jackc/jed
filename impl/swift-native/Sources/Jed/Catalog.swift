@@ -136,15 +136,76 @@ internal struct CatalogExclusion: Sendable {
 }
 
 internal struct CatalogTable: Sendable {
-    var name: SQLText
-    var columns: [CatalogColumn]
-    var primaryKey: [Int] = []
-    var checks: [CatalogCheck] = []
-    var indexes: [CatalogIndex] = []
-    var foreignKeys: [CatalogForeignKey] = []
-    var exclusions: [CatalogExclusion] = []
-    var root: PageReference
-    var rowCount: Int64 = 0
+    /// Stored fields live in one copy-on-write box, so passing this value
+    /// around costs one retain instead of a field-by-field copy.
+    private final class Storage: @unchecked Sendable {
+        var name: SQLText
+        var columns: [CatalogColumn]
+        var primaryKey: [Int]
+        var checks: [CatalogCheck]
+        var indexes: [CatalogIndex]
+        var foreignKeys: [CatalogForeignKey]
+        var exclusions: [CatalogExclusion]
+        var root: PageReference
+        var rowCount: Int64
+        init(name: SQLText, columns: [CatalogColumn], primaryKey: [Int], checks: [CatalogCheck], indexes: [CatalogIndex], foreignKeys: [CatalogForeignKey], exclusions: [CatalogExclusion], root: PageReference, rowCount: Int64) {
+            self.name = name
+            self.columns = columns
+            self.primaryKey = primaryKey
+            self.checks = checks
+            self.indexes = indexes
+            self.foreignKeys = foreignKeys
+            self.exclusions = exclusions
+            self.root = root
+            self.rowCount = rowCount
+        }
+        func copy() -> Storage {
+            Storage(name: name, columns: columns, primaryKey: primaryKey, checks: checks, indexes: indexes, foreignKeys: foreignKeys, exclusions: exclusions, root: root, rowCount: rowCount)
+        }
+    }
+    private var storage: Storage
+    @inline(__always) private mutating func unique() {
+        if !isKnownUniquelyReferenced(&storage) { storage = storage.copy() }
+    }
+    init(name: SQLText, columns: [CatalogColumn], primaryKey: [Int] = [], checks: [CatalogCheck] = [], indexes: [CatalogIndex] = [], foreignKeys: [CatalogForeignKey] = [], exclusions: [CatalogExclusion] = [], root: PageReference, rowCount: Int64 = 0) {
+        storage = Storage(name: name, columns: columns, primaryKey: primaryKey, checks: checks, indexes: indexes, foreignKeys: foreignKeys, exclusions: exclusions, root: root, rowCount: rowCount)
+    }
+    var name: SQLText {
+        get { storage.name }
+        _modify { unique(); yield &storage.name }
+    }
+    var columns: [CatalogColumn] {
+        get { storage.columns }
+        _modify { unique(); yield &storage.columns }
+    }
+    var primaryKey: [Int] {
+        get { storage.primaryKey }
+        _modify { unique(); yield &storage.primaryKey }
+    }
+    var checks: [CatalogCheck] {
+        get { storage.checks }
+        _modify { unique(); yield &storage.checks }
+    }
+    var indexes: [CatalogIndex] {
+        get { storage.indexes }
+        _modify { unique(); yield &storage.indexes }
+    }
+    var foreignKeys: [CatalogForeignKey] {
+        get { storage.foreignKeys }
+        _modify { unique(); yield &storage.foreignKeys }
+    }
+    var exclusions: [CatalogExclusion] {
+        get { storage.exclusions }
+        _modify { unique(); yield &storage.exclusions }
+    }
+    var root: PageReference {
+        get { storage.root }
+        _modify { unique(); yield &storage.root }
+    }
+    var rowCount: Int64 {
+        get { storage.rowCount }
+        _modify { unique(); yield &storage.rowCount }
+    }
 }
 
 internal struct CatalogSequence: Sendable {

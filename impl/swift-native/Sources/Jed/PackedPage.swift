@@ -61,11 +61,25 @@ internal struct StoredCell: Sendable {
 }
 
 internal struct PackedRecord: Sendable {
-    let key: [UInt8]
-    let cells: [StoredCell]
-    let overflows: [Int: PendingOverflow]
+    /// The fields share one immutable box: a writer leaf holds its records in
+    /// an array, and every edit of that leaf copies the array, so a record
+    /// must cost one retain to copy rather than one per field.
+    private final class Storage: @unchecked Sendable {
+        let key: [UInt8]
+        let cells: [StoredCell]
+        let overflows: [Int: PendingOverflow]
+        init(key: [UInt8], cells: [StoredCell], overflows: [Int: PendingOverflow]) {
+            self.key = key
+            self.cells = cells
+            self.overflows = overflows
+        }
+    }
+    private let storage: Storage
+    var key: [UInt8] { storage.key }
+    var cells: [StoredCell] { storage.cells }
+    var overflows: [Int: PendingOverflow] { storage.overflows }
     init(key: [UInt8], cells: [StoredCell], overflows: [Int: PendingOverflow] = [:]) {
-        self.key = key; self.cells = cells; self.overflows = overflows
+        storage = Storage(key: key, cells: cells, overflows: overflows)
     }
     var weight: Int { cells.reduce(key.count) { $0 + $1.storedSize } }
 

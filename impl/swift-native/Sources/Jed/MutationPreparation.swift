@@ -36,6 +36,8 @@ extension MutationExecutor {
         let filters: [(expression: ResolvedExpression, level: Int)]
         let target: ForeignKeyActions.Target?
         let parameterTypes: [TypeDescriptor]
+        /// Whether WHERE or SET read a target column, which needs SELECT.
+        var readsColumns = false
         let profileIdentity = QueryProfileIdentity()
         var accessPredicate: ResolvedExpression? {
             var result: ResolvedExpression?

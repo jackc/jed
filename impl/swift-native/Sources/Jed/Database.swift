@@ -500,7 +500,7 @@ public final class Session {
         defer { if active == nil { frame.close() } }
         var working = frame.working, planning = settings
         if var temp = working.snapshots[DomainNames.temporary], let main = working.snapshots[DomainNames.main] {
-            try temp.borrowTypes(main.types); working.snapshots[DomainNames.temporary] = temp
+            try temp.borrowTypes(from: main); working.snapshots[DomainNames.temporary] = temp
         }
         planning.domains = working
         let snapshot = try working.snapshot(DomainNames.main)
@@ -574,12 +574,15 @@ public final class Session {
         if maintenance, let active, active.writer == nil {
             throw JedError("25006", "cannot execute maintenance in a read-only transaction")
         }
-        let sequenceWrites = StatementSequenceWrites.requiresSharedWriter(statement, domains: admissionDomains, settings: admission)
-        let frame = try writeFrame(shared: maintenance || sequenceWrites || targets.contains { $0 != DomainNames.temporary }, cancellation: cancellation)
+        // The sequence walk is a pure predicate; it decides only statements
+        // whose every target is temporary.
+        let shared = maintenance || targets.contains { $0 != DomainNames.temporary }
+            || StatementSequenceWrites.requiresSharedWriter(statement, domains: admissionDomains, settings: admission)
+        let frame = try writeFrame(shared: shared, cancellation: cancellation)
         defer { if active == nil { frame.close() } }
         var working = frame.working
         if var temp = working.snapshots[DomainNames.temporary], let main = working.snapshots[DomainNames.main] {
-            try temp.borrowTypes(main.types); working.snapshots[DomainNames.temporary] = temp
+            try temp.borrowTypes(from: main); working.snapshots[DomainNames.temporary] = temp
         }
         let target = try StatementDomain.target(statement, in: working)
         var executionSettings = settings
@@ -592,6 +595,7 @@ public final class Session {
         sequences.install(into: &context)
         let result: MutationResult
         var insertCandidate: PreparedInsertPlan?
+        var mutationCandidate: PreparedMutationPlan?
         try StatementPrivileges.check(statement, snapshot: working.snapshot(target), settings: executionSettings)
         defer { meter.pendingDomainBase = 0; meter.pendingDomainExcluded = false }
         if case .reindex(let syntax) = statement {
@@ -624,7 +628,9 @@ public final class Session {
                 let plan: MutationExecutor.InsertPreparation
                 if let cached = prepared.insertCache, cached.signature == signature {
                     prepared.insertHit()
-                    plan = try cached.bind(syntax, snapshot: snapshot, settings: executionSettings, context: context)
+                    plan = try cached.bind(syntax, snapshot: snapshot, settings: executionSettings, context: context,
+                        writable: prepared.provenWritable(signature, snapshot: snapshot, settings: executionSettings))
+                    prepared.proveWritable(signature, snapshot: snapshot, settings: executionSettings)
                 } else {
                     prepared.insertMiss()
                     plan = try MutationExecutor.prepareInsert(syntax, snapshot: snapshot, settings: executionSettings, context: context)
@@ -634,6 +640,24 @@ public final class Session {
                     }
                 }
                 mutation = try MutationExecutor.executeInsert(plan, snapshot: &snapshot, context: context, parameters: parameters)
+            } else if let prepared, target != DomainNames.temporary, context.writeScope == nil,
+                      let syntax = PreparedMutationPlan.syntax(statement) {
+                let signature = PreparedSchemaSignature(core: database.core.planIdentity, snapshot: snapshot, name: syntax.table.name)
+                let plan: MutationExecutor.MutationPreparation
+                if let cached = prepared.mutationCache, cached.signature == signature {
+                    plan = try cached.bind(syntax.table, snapshot: snapshot, settings: executionSettings, context: context,
+                        writable: prepared.provenWritable(signature, snapshot: snapshot, settings: executionSettings))
+                    prepared.proveWritable(signature, snapshot: snapshot, settings: executionSettings)
+                } else {
+                    plan = try MutationExecutor.prepareMutation(table: syntax.table, assignments: syntax.assignments,
+                        predicate: syntax.predicate, returning: syntax.returning, snapshot: snapshot,
+                        settings: executionSettings, context: context)
+                    if let base = frame.writer?.initial.snapshots[target],
+                       signature == PreparedSchemaSignature(core: database.core.planIdentity, snapshot: base, name: syntax.table.name) {
+                        mutationCandidate = PreparedMutationPlan(plan, signature: signature)
+                    }
+                }
+                mutation = try MutationExecutor.executeMutation(plan, snapshot: &snapshot, context: context, parameters: parameters)
             } else {
                 mutation = try MutationExecutor.execute(statement, snapshot: &snapshot, settings: executionSettings,
                     context: context, parameters: parameters)
@@ -654,6 +678,7 @@ public final class Session {
         meter.pendingDomainBase = 0; meter.pendingDomainExcluded = false
         try finishWrite(working, statement: statement, frame: frame, active: active, meter: meter)
         if let insertCandidate { prepared?.insertCache = insertCandidate }
+        if let mutationCandidate { prepared?.mutationCache = mutationCandidate }
         sequenceHistory = sequences.history
         let rows = result.cursor(failure: { _ in active?.failed = true })
         return active?.own(rows) ?? rows

@@ -125,7 +125,8 @@ checksum, and 897/897 Swift–Go file interchange phases. The cross-core resourc
 accounting, encrypted, simulation, process and page-service gates were not
 re-run.
 
-What remains, by expected value:
+What remained after this pass, by expected value (the first three items were
+taken up in the third follow-up below):
 
 - **Prepared mutation plans.** Cache the resolved preparation and selected
   access for UPDATE and DELETE as INSERT and SELECT already do, and cache
@@ -145,6 +146,121 @@ What remains, by expected value:
   classifier here covers only the evaluator's hot path.
 - Dynamic exclusivity checks on class-held arrays are roughly a tenth of a
   filtered scan's samples. `-enforce-exclusivity=unchecked` would remove them; it was not used.
+
+## Third follow-up: per-statement and bulk-write costs (2026-11-10)
+
+The second pass left lookups and row writes about eight times slower than
+Rust. Profiles of a prepared point SELECT, INSERT and DELETE showed no single
+hot spot: each statement repeated work whose result could not have changed,
+and each write copied far more of the tree than it edited.
+
+Causes found:
+
+- **Snapshot, store and candidate structs were still copied field by field.**
+  `DomainSnapshot` (fifteen fields), `TableStore`, `ScanCandidate`,
+  `CatalogTable` and `SessionSettings` are passed and stored many times per
+  statement. They were about a fifth of a point lookup.
+- **UPDATE and DELETE resolved their SQL on every execution** (23% of a
+  prepared single-row DELETE), unlike INSERT and SELECT.
+- **Every write validated the whole catalog.** Updating a row count went
+  through `updateCatalog`, which re-validates every reference and re-resolves
+  every composite type. Every statement also re-borrowed the main domain's
+  types into the temporary domain and re-ran the table's writability check.
+- **A sequence-writer walk ran for every write**, though its answer matters
+  only when every target is temporary (8% of a DELETE).
+- **Each edit copied multi-reference elements.** A writer leaf's record array
+  held three references per record and an interior node's child array three
+  per clean child, so one row edit cost roughly a thousand reference-count
+  updates and as many again when the old nodes were freed.
+- **Bulk writes path-copied the interior nodes once per row.** A 10,000-row
+  DELETE spent two thirds of its time copying and freeing child arrays.
+- **Candidate costing hashed strings.** Each access candidate built a
+  string-keyed dictionary and looked up every unit of the cost schedule in it;
+  each candidate also rebuilt the same contradiction check.
+
+Changes, all preserving results, costs, errors and bytes:
+
+- The five structs above keep their fields in a copy-on-write box, as
+  `SelectPlan` does. `PackedRecord` shares one immutable box and a clean
+  child's payload is `indirect`, so either copies with one retain.
+- `PreparedMutationPlan` caches UPDATE/DELETE resolution against the same
+  schema signature as `PreparedInsertPlan`, with the same eligibility (a base
+  table outside the temporary domain, reusable expressions, no dynamic-zone
+  index). Privileges, roots and index contexts are rebound per execution. The
+  **access path is still selected on every execution**: its estimator inputs
+  change with every write, so there is no signature under which to reuse it.
+- DML records a row-count change without whole-catalog validation; type
+  borrowing and the writability check are skipped while the catalogs (and, for
+  the latter, the environment) are the same objects that passed before. The
+  sequence walk runs only when it can decide the outcome.
+- A writer leaf holds its records in chunks of at most 32 (`RecordList`), so
+  an edit copies one chunk and the chunk list.
+- **Edit batches.** One statement's run of `put`/`remove` on its private store
+  marks the interior nodes it creates with a token and updates those nodes in
+  place afterwards. The steps and the resulting tree are exactly those of the
+  unbatched edits; only the copying differs. A batch never touches a node that
+  existed before it, so earlier snapshots are unaffected. The cost is the
+  failure guarantee of a removal: an I/O or corruption error while rebalancing
+  can leave the batch's own tree half edited, so a batch whose edit throws is
+  discarded, which every caller already does with a failed statement's store.
+  GIN edits stay unbatched.
+- Pending-key accounting uses a persistent hash trie (`PendingKeyMap`). A
+  statement's first staged key no longer copies every key its transaction has
+  staged. This did not move the 1,000-row rollback workloads; it removes a
+  quadratic cost from longer transactions.
+- Candidate cost comes from six cached schedule weights; the candidates of one
+  inventory share their contradiction check. MIN/MAX compare integers without
+  a type descriptor, and the variable-width cost preflight reads its store's
+  facts once rather than per row.
+
+Two alternating rounds of the 22 diagnostic workloads for the two Swift builds
+(best of two) and one round for the peers, all on one CPU with identical
+checksums ([CSV](../../impl/swift-native/BENCHMARK_FOLLOWUP_20261110.csv)).
+"Before" is the second follow-up's source:
+
+| Group | Swift before / Rust | Swift after / Rust | Swift after / Go | Speedup |
+|---|---:|---:|---:|---:|
+| Scans and aggregates (12) | 2.62× | 2.56× | 2.59× | 1.03× |
+| Per-statement lookups and writes (8) | 7.44× | 3.86× | 3.72× | 1.93× |
+| All 22 | 3.78× | 2.92× | 2.95× | 1.29× |
+
+`point_lookup_pk` goes from 21.7 to 12.3 µs (Rust 2.6, Go 2.1),
+`insert_rollback` from 39.0 to 19.7 ms per 1,000 rows (Rust 2.9),
+`delete_rollback_serial` from 58.5 to 27.3 ms (Rust 2.8) and
+`delete_range_rollback` from 102.3 to 20.9 ms (Rust 8.1, Go 12.9).
+`full_scan_minmax` goes from 61.0 to 47.6 ms; the other scans are unchanged
+within 3%. As before the data directory is tmpfs and this is a diagnostic, not
+a replacement for the three-round matrix.
+
+Verified on this source: 546 native tests and all 749 frozen SQL files (21,597
+records, 2,271 cost assertions), the threaded stress run with the frozen final
+checksum, and 897/897 Swift–Go file interchange phases. Three new unit tests
+cover what the corpus cannot: `PendingKeyMap` and `RecordList` against the
+plain collections they replace, and batched edits against unbatched ones node
+for node across leaf merges and splits. That last test caught a real defect
+during development (a parent's node count went stale when its child had been
+edited in place), which the SQL corpus had not. The saved fault-simulation
+regressions and the encrypted SQL corpus also pass for Swift alone. The
+cross-core resource accounting, cross-core encrypted matrix, Rust and
+TypeScript interchange, generated simulation sweeps, process and page-service
+gates were not re-run.
+
+What remains, by expected value:
+
+- **Access selection per write** is now the largest single cost of a
+  single-row UPDATE or DELETE (about a fifth). The estimator is specified
+  cross-core, so the route is making inventory and estimation cheaper, not
+  skipping them.
+- **Single-row writes still path-copy.** A batch helps only within one
+  statement: each statement keeps its predecessor's tree for statement
+  atomicity and for cursors pinned in the transaction, so its first edit copies
+  the root-to-leaf path, a retain per child. Chunked child arrays would cut
+  that; a transaction-wide token is unsafe for the reasons above.
+- **Select setup.** A point lookup descends the tree twice (cost preflight,
+  then the scan), compiles its packed predicate and rebuilds its read bundle
+  per execution; together about half of the remaining 12 µs.
+- The typed-fold, operator-enum and exclusivity items of the second follow-up
+  are unchanged.
 
 ## Investigation and controlled changes
 

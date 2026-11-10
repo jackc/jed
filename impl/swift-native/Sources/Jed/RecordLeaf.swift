@@ -3,7 +3,7 @@
 /// serializing a page; eligible inline spans remain available to read kernels.
 /// A retained root can keep this form after commit, like its pending values.
 internal final class RecordLeaf: Sendable {
-    let records: [PackedRecord]
+    let records: RecordList
     let types: [TypeDescriptor]
     let pending: [Int: [Int: PendingOverflow]]
     let payloadSize: Int
@@ -41,12 +41,12 @@ internal final class RecordLeaf: Sendable {
             }
             if !record.overflows.isEmpty { pending[row] = record.overflows }
         }
-        self.records = canonical; self.types = types; self.pending = pending; payloadSize = total
+        self.records = RecordList(canonical); self.types = types; self.pending = pending; payloadSize = total
     }
 
     /// Records already admitted by the validating initializer (or read from a
     /// validated page), in key order, with their exact payload size.
-    private init(admitted records: [PackedRecord], types: [TypeDescriptor],
+    private init(admitted records: RecordList, types: [TypeDescriptor],
                  pending: [Int: [Int: PendingOverflow]], payloadSize: Int) {
         self.records = records; self.types = types; self.pending = pending; self.payloadSize = payloadSize
     }
@@ -92,7 +92,7 @@ internal final class RecordLeaf: Sendable {
                 records.append(PackedRecord(key: record.key, cells: record.cells, overflows: overflows))
             } else { records.append(record) }
         }
-        self.init(admitted: records, types: leaf.types, pending: pending, payloadSize: leaf.payloadSize)
+        self.init(admitted: RecordList(records), types: leaf.types, pending: pending, payloadSize: leaf.payloadSize)
     }
 
     private static func rekeyed(_ pending: [Int: [Int: PendingOverflow]], from row: Int, by delta: Int,
@@ -113,7 +113,7 @@ internal final class RecordLeaf: Sendable {
         var edited = records, moved = pending
         if replacing {
             total -= records[slot].weight
-            edited[slot] = record
+            edited.replace(at: slot, with: record)
             if moved[slot] != nil { moved[slot] = nil }
         } else {
             edited.insert(record, at: slot)

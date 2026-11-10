@@ -1,8 +1,10 @@
 /// A child is either an immutable resident node or a clean leaf address. The
 /// bounds survive lazy loading so a misdirected leaf fails before yielding rows.
+/// Every write copies the child array of each interior node on its path, so
+/// a child must cost one retain to copy: the clean-leaf payload is boxed.
 internal enum TreeChild: Sendable {
     case resident(TreeNode)
-    case onDisk(PageReference, lower: [UInt8]?, upper: [UInt8]?)
+    indirect case onDisk(PageReference, lower: [UInt8]?, upper: [UInt8]?)
 
     var height: Int { if case .resident(let node) = self { return node.height }; return 1 }
     var nodeCount: Int { if case .resident(let node) = self { return node.nodeCount }; return 1 }
@@ -12,20 +14,31 @@ internal enum TreeChild: Sendable {
     }
 }
 
+/// Identity of one batch of tree edits (see `BPlusTree.beginBatch`).
+internal final class TreeEditToken: Sendable {}
+
 /// Clean leaves borrow packed bytes; writer leaves retain immutable stored
 /// records until serialization. Fresh overflow bytes live beside their
 /// placeholder cells, indexed by row and then declared column ordinal.
-internal final class TreeNode: Sendable {
+///
+/// A node is immutable once any snapshot can reach it. The one exception is
+/// an interior node created inside an edit batch: until that batch ends only
+/// the batch's own tree reaches it, and the batch may update its routing
+/// fields in place instead of copying its whole fan-out for every row. The
+/// class is therefore Sendable by that discipline, not by construction.
+internal final class TreeNode: @unchecked Sendable {
     let leaf: PackedLeaf?
     let recordLeaf: RecordLeaf?
     let pending: [Int: [Int: PendingOverflow]]
-    let keys: [[UInt8]]
-    let children: [TreeChild]
+    fileprivate(set) var keys: [[UInt8]]
+    fileprivate(set) var children: [TreeChild]
     let reference: PageReference?
-    let payloadSize: Int
+    fileprivate(set) var payloadSize: Int
     let height: Int
-    let nodeCount: Int
-    let containsRecords: Bool
+    fileprivate(set) var nodeCount: Int
+    fileprivate(set) var containsRecords: Bool
+    /// The batch that created this interior node, while it may still edit it.
+    fileprivate let owner: TreeEditToken?
 
     var isLeaf: Bool { children.isEmpty }
     var entryCount: Int { isLeaf ? leaf?.count ?? recordLeaf?.records.count ?? 0 : keys.count }
@@ -33,20 +46,22 @@ internal final class TreeNode: Sendable {
     init(leaf: PackedLeaf?, pending: [Int: [Int: PendingOverflow]] = [:], reference: PageReference? = nil,
          emptyPayload: Int = 0) {
         self.leaf = leaf; self.pending = pending; self.reference = reference
-        recordLeaf = nil
+        recordLeaf = nil; owner = nil
         keys = []; children = []; payloadSize = leaf?.payloadSize ?? emptyPayload
         height = 1; nodeCount = 1
         containsRecords = leaf != nil
     }
 
     init(records: RecordLeaf, reference: PageReference? = nil) {
-        leaf = nil; recordLeaf = records; pending = records.pending; self.reference = reference
+        leaf = nil; recordLeaf = records; pending = records.pending; self.reference = reference; owner = nil
         keys = []; children = []; payloadSize = records.payloadSize
         height = 1; nodeCount = 1; containsRecords = !records.records.isEmpty
     }
 
-    init(keys: [[UInt8]], children: [TreeChild], codec: any PageCodec, reference: PageReference? = nil) {
+    init(keys: [[UInt8]], children: [TreeChild], codec: any PageCodec, reference: PageReference? = nil,
+         owner: TreeEditToken? = nil) {
         leaf = nil; recordLeaf = nil; pending = [:]; self.keys = keys; self.children = children; self.reference = reference
+        self.owner = owner
         payloadSize = PackedInterior.payloadSize(keys: keys, codec: codec)
         height = 1 + (children.first?.height ?? 0)
         nodeCount = children.reduce(1) { $0 + $1.nodeCount }
@@ -58,15 +73,44 @@ internal final class TreeNode: Sendable {
 
     /// Same keys with one child replaced: sizes follow from the old node, so
     /// nothing is re-measured across the whole fan-out.
-    init(replacing index: Int, in node: TreeNode, with child: TreeNode) {
-        leaf = nil; recordLeaf = nil; pending = [:]; keys = node.keys; reference = nil
+    /// `replacedCount` is the node count of the child being replaced, as it
+    /// was when `node` last counted it.
+    init(replacing index: Int, in node: TreeNode, with child: TreeNode, replacedCount: Int,
+         owner: TreeEditToken? = nil) {
+        leaf = nil; recordLeaf = nil; pending = [:]; keys = node.keys; reference = nil; self.owner = owner
         var children = node.children
-        let old = children[index]
         children[index] = .resident(child)
         self.children = children
         payloadSize = node.payloadSize; height = node.height
-        nodeCount = node.nodeCount - old.nodeCount + child.nodeCount
+        nodeCount = node.nodeCount - replacedCount + child.nodeCount
         containsRecords = child.containsRecords || (node.containsRecords && children.contains { $0.containsRecords })
+    }
+
+    /// `init(replacing:in:with:)` applied to this node itself. Only the batch
+    /// that owns the node calls it.
+    /// `child` may be the resident child itself, already edited in place, so
+    /// its former count comes from the caller and not from the slot.
+    fileprivate func replaceChild(at index: Int, with child: TreeNode, replacedCount: Int) {
+        children[index] = .resident(child)
+        nodeCount += child.nodeCount - replacedCount
+        containsRecords = child.containsRecords || (containsRecords && children.contains { $0.containsRecords })
+    }
+
+    /// Hands this node's routing arrays to its owning batch, leaving them
+    /// unshared so the batch can edit them without a copy.
+    fileprivate func takeRouting() -> (keys: [[UInt8]], children: [TreeChild]) {
+        let taken = (keys, children)
+        keys = []; children = []
+        return taken
+    }
+
+    /// `init(keys:children:codec:)` applied to this node itself: the same
+    /// derived sizes. Siblings have equal depth, so the height stands.
+    fileprivate func setRouting(keys: [[UInt8]], children: [TreeChild], codec: any PageCodec) {
+        self.keys = keys; self.children = children
+        payloadSize = PackedInterior.payloadSize(keys: keys, codec: codec)
+        nodeCount = children.reduce(1) { $0 + $1.nodeCount }
+        containsRecords = children.contains { $0.containsRecords }
     }
 
     /// The writer-record form of this leaf, or nil for an empty placeholder.
@@ -81,7 +125,7 @@ internal final class TreeNode: Sendable {
         return PackedRecord(key: record.key, cells: record.cells, overflows: pending[index] ?? [:])
     }
 
-    func records() -> [PackedRecord] { recordLeaf?.records ?? (0..<entryCount).map { record(at: $0) } }
+    func records() -> [PackedRecord] { recordLeaf?.records.flat ?? (0..<entryCount).map { record(at: $0) } }
 
     func key(at index: Int) -> ArraySlice<UInt8> {
         if let leaf { return leaf.key(at: index) }
@@ -139,6 +183,12 @@ internal struct TreeWrite: Sendable {
 
 /// Value snapshots share immutable nodes. Every mutation builds a replacement
 /// path before publishing root/count, so a failure leaves this tree unchanged.
+///
+/// Inside an edit batch the replacement path reuses interior nodes the batch
+/// itself created. The steps, and so the resulting tree, are exactly those of
+/// the unbatched edits. What is given up is the failure guarantee for a
+/// removal: an I/O or corruption error raised while rebalancing can leave the
+/// batch's tree half edited, so a batch whose edit throws must be discarded.
 internal struct BPlusTree: Sendable {
     static let maximumDepth = 256
     let codec: any PageCodec
@@ -146,6 +196,22 @@ internal struct BPlusTree: Sendable {
     let pool: NodePool?
     private(set) var root: TreeChild?
     private(set) var count: Int64?
+    private var editToken: TreeEditToken?
+
+    /// Starts a run of edits applied to this value alone. The caller must not
+    /// copy the tree, or read it through another copy, until `endBatch`.
+    mutating func beginBatch() { editToken = TreeEditToken() }
+    mutating func endBatch() { editToken = nil }
+
+    /// `replacedCount` must be read before the child is edited: within a
+    /// batch the edit may update that same child object in place.
+    private func replacing(_ index: Int, in node: TreeNode, with child: TreeNode, replacedCount: Int) -> TreeNode {
+        if let editToken, node.owner === editToken {
+            node.replaceChild(at: index, with: child, replacedCount: replacedCount)
+            return node
+        }
+        return TreeNode(replacing: index, in: node, with: child, replacedCount: replacedCount, owner: editToken)
+    }
 
     init(codec: any PageCodec, types: [TypeDescriptor], pool: NodePool? = nil) {
         self.codec = codec; self.types = types; self.pool = pool; root = nil; count = 0
@@ -254,7 +320,7 @@ internal struct BPlusTree: Sendable {
         switch result {
         case .whole(let node): newRoot = node
         case .split(let left, let separator, let right):
-            newRoot = TreeNode(keys: [separator], children: [.resident(left), .resident(right)], codec: codec)
+            newRoot = TreeNode(keys: [separator], children: [.resident(left), .resident(right)], codec: codec, owner: editToken)
         }
         guard newRoot.height <= Self.maximumDepth else { throw JedError("54000", "tree nesting limit exceeded") }
         root = .resident(newRoot)
@@ -316,7 +382,7 @@ internal struct BPlusTree: Sendable {
 
     private func buildInterior(_ keys: [[UInt8]], children: [TreeChild], edited: Int?) -> Rebuild? {
         let n = keys.count, payload = PackedInterior.payloadSize(keys: keys, codec: codec)
-        if payload <= codec.capacity || n < 2 { return .whole(TreeNode(keys: keys, children: children, codec: codec)) }
+        if payload <= codec.capacity || n < 2 { return .whole(TreeNode(keys: keys, children: children, codec: codec, owner: editToken)) }
         let middle: Int
         if n == 2 { middle = 1 }
         else {
@@ -329,8 +395,8 @@ internal struct BPlusTree: Sendable {
                 right: { (width + 4) * (n - 1 - $0) + width + prefix[n] - prefix[$0 + 1] }) else { return nil }
             middle = split
         }
-        let left = TreeNode(keys: Array(keys[..<middle]), children: Array(children[...middle]), codec: codec)
-        let right = TreeNode(keys: Array(keys[(middle + 1)...]), children: Array(children[(middle + 1)...]), codec: codec)
+        let left = TreeNode(keys: Array(keys[..<middle]), children: Array(children[...middle]), codec: codec, owner: editToken)
+        let right = TreeNode(keys: Array(keys[(middle + 1)...]), children: Array(children[(middle + 1)...]), codec: codec, owner: editToken)
         return .split(left, keys[middle], right)
     }
 
@@ -343,7 +409,7 @@ internal struct BPlusTree: Sendable {
                 if slot.found { previous = base.records[slot.index] }
                 let edited = try base.placing(record, at: slot.index, replacing: slot.found)
                 if edited.payloadSize <= codec.capacity { return .whole(TreeNode(records: edited)) }
-                return try buildLeaf(edited.records, edited: slot.index)
+                return try buildLeaf(edited.records.flat, edited: slot.index)
             }
             var records = node.records()
             if slot.found { previous = records[slot.index]; records[slot.index] = record }
@@ -351,9 +417,10 @@ internal struct BPlusTree: Sendable {
             return try buildLeaf(records, edited: slot.index)
         }
         let index = node.childSlot(record.key)
+        let replacedCount = node.children[index].nodeCount
         let result = try inserting(resolve(node.children[index]), record: record, previous: &previous)
         if case .whole(let child) = result {
-            return .whole(TreeNode(replacing: index, in: node, with: child))
+            return .whole(replacing(index, in: node, with: child, replacedCount: replacedCount))
         }
         var keys = node.keys, children = node.children
         switch result {
@@ -366,7 +433,7 @@ internal struct BPlusTree: Sendable {
         // An already oversized pending separator may also reach it: preserve
         // the pending shape and let commit preflight reject it safely.
         return buildInterior(keys, children: children, edited: index)
-            ?? .whole(TreeNode(keys: keys, children: children, codec: codec))
+            ?? .whole(TreeNode(keys: keys, children: children, codec: codec, owner: editToken))
     }
 
     private func removing(_ node: TreeNode, key: [UInt8]) throws -> (TreeNode, PackedRecord?) {
@@ -381,6 +448,7 @@ internal struct BPlusTree: Sendable {
             return (try makeLeaf(records), old)
         }
         let index = node.childSlot(key)
+        let replacedCount = node.children[index].nodeCount
         let (child, old) = try removing(resolve(node.children[index]), key: key)
         guard old != nil else { return (node, nil) }
         // A zero-key interior has no sibling for its sole leaf. If that
@@ -391,9 +459,9 @@ internal struct BPlusTree: Sendable {
             var keys = node.keys, children = node.children
             children.remove(at: index)
             keys.remove(at: min(index, keys.count - 1))
-            return (TreeNode(keys: keys, children: children, codec: codec), old)
+            return (TreeNode(keys: keys, children: children, codec: codec, owner: editToken), old)
         }
-        let parent = TreeNode(replacing: index, in: node, with: child)
+        let parent = replacing(index, in: node, with: child, replacedCount: replacedCount)
         guard child.payloadSize < codec.capacity / 2, node.children.count > 1 else { return (parent, old) }
         let pair = index + 1 < node.children.count ? index : index - 1
         return (try merge(parent, at: pair), old)
@@ -411,16 +479,23 @@ internal struct BPlusTree: Sendable {
                 children: left.children + right.children, edited: nil) else { return parent }
             result = merged
         }
-        var keys = parent.keys, children = parent.children
+        if case .split(_, let separator, _) = result {
+            // A longer replacement separator cannot force a delete-path split.
+            guard parent.payloadSize - parent.keys[index].count + separator.count <= codec.capacity else { return parent }
+        }
+        let owned = editToken != nil && parent.owner === editToken
+        var (keys, children) = owned ? parent.takeRouting() : (parent.keys, parent.children)
         switch result {
         case .whole(let merged):
             keys.remove(at: index); children[index] = .resident(merged); children.remove(at: index + 1)
         case .split(let newLeft, let separator, let newRight):
-            // A longer replacement separator cannot force a delete-path split.
-            guard parent.payloadSize - keys[index].count + separator.count <= codec.capacity else { return parent }
             keys[index] = separator; children[index] = .resident(newLeft); children[index + 1] = .resident(newRight)
         }
-        return TreeNode(keys: keys, children: children, codec: codec)
+        if owned {
+            parent.setRouting(keys: keys, children: children, codec: codec)
+            return parent
+        }
+        return TreeNode(keys: keys, children: children, codec: codec, owner: editToken)
     }
 
     /// A mixed resident root is re-faulted after persistence when any unchanged

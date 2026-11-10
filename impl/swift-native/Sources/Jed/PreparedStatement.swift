@@ -6,6 +6,7 @@ public final class PreparedStatement {
     internal let source: SQLText
     internal let statement: SQLStatement
     internal var insertCache: PreparedInsertPlan?
+    internal var mutationCache: PreparedMutationPlan?
     internal var selectCache: PreparedSelectCache?
     internal var selectCacheHits = 0
     internal var selectCacheMisses = 0
@@ -16,6 +17,21 @@ public final class PreparedStatement {
 
     internal init(source: SQLText, statement: SQLStatement) {
         self.source = source; self.statement = statement
+    }
+    /// A cached write plan's target passed `CatalogEnvironment.checkWritable`
+    /// for this exact schema and environment. That check reads only the
+    /// table's definition, the catalog's types and collations, and the
+    /// environment's loaded data, so it need not be repeated while all three
+    /// are the same objects. A domain with borrowed types is never recorded.
+    private var writableProof: (signature: PreparedSchemaSignature, environment: Environment)?
+    internal func provenWritable(_ signature: PreparedSchemaSignature, snapshot: DomainSnapshot,
+                                 settings: SessionSettings) -> Bool {
+        guard snapshot.borrowedTypes.isEmpty, let proof = writableProof else { return false }
+        return proof.signature == signature && proof.environment === settings.environment
+    }
+    internal func proveWritable(_ signature: PreparedSchemaSignature, snapshot: DomainSnapshot,
+                                settings: SessionSettings) {
+        if snapshot.borrowedTypes.isEmpty { writableProof = (signature, settings.environment) }
     }
     internal func insertHit() { insertCacheHits += 1 }
     internal func insertMiss() { insertCacheMisses += 1 }
