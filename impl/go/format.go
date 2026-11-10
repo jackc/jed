@@ -3254,6 +3254,25 @@ func valuePayload(ty colType, v Value) []byte {
 	}
 }
 
+// valueFromStringPayload is valueFromPayload for a text / bytea / json payload already held as a
+// string (stringPayload types), so the value takes the string without another copy.
+func valueFromStringPayload(ty colType, payload string) (Value, error) {
+	switch {
+	case ty.Scalar.IsText():
+		if !utf8.ValidString(payload) {
+			return Value{}, newError(DataCorrupted, "non-UTF-8 text value")
+		}
+		return TextValue(payload), nil
+	case ty.Scalar.IsBytea():
+		return Value{Kind: ValBytea, ref: payload}, nil
+	default: // json
+		if !utf8.ValidString(payload) {
+			return Value{}, newError(DataCorrupted, "non-UTF-8 json value")
+		}
+		return JsonValue(payload), nil
+	}
+}
+
 // valueFromPayload reconstructs a value from the P(v) content gathered from its overflow chain
 // (inverse of valuePayload) — large-values.md §12.
 func valueFromPayload(ty colType, payload []byte) (Value, error) {
@@ -3409,14 +3428,23 @@ func encodeDisposedValue(ty colType, v Value, plan *recordPlan, c int, seal seal
 		if err != nil {
 			return nil, err
 		}
-		payload := valuePayload(ty, r)
-		first, err := writeOverflowChain(payload, seal, take, ovf)
+		// A text / bytea / json body is written to its chain from the string, without a copy.
+		var first pageRef
+		var length int
+		if stringPayload(ty) {
+			first, err = writeOverflowChain(r.str(), seal, take, ovf)
+			length = len(r.str())
+		} else {
+			payload := valuePayload(ty, r)
+			first, err = writeOverflowChain(payload, seal, take, ovf)
+			length = len(payload)
+		}
 		if err != nil {
 			return nil, err
 		}
 		out := []byte{tagExternal}
 		out = appendU32(out, first.page)
-		out = appendU32(out, uint32(len(payload)))
+		out = appendU32(out, uint32(length))
 		return append(out, first.tag[:pcap.tag]...), nil
 	case dispInlineComp:
 		comp, err := planBlock(plan, c, u, src)
@@ -3591,7 +3619,7 @@ func encodeLeafPAXMemo(colTypes []colType, keys [][]byte, rows []storedRow, seal
 // first so each binds its successor (encrypted.md §7), appending them to ovf as they are sealed.
 // Returns the pointer to the first page for the record. payload is always non-empty (only values
 // larger than the pointer spill — planDispositions).
-func writeOverflowChain(payload []byte, seal sealer, take func() uint32, ovf *[]dirtyPage) (pageRef, error) {
+func writeOverflowChain[S ~string | ~[]byte](payload S, seal sealer, take func() uint32, ovf *[]dirtyPage) (pageRef, error) {
 	slab := seal.cap.chain()
 	n := (len(payload) + slab - 1) / slab
 	indices := make([]uint32, n)
@@ -3602,7 +3630,7 @@ func writeOverflowChain(payload []byte, seal sealer, take func() uint32, ovf *[]
 	for j := n - 1; j >= 0; j-- {
 		lo := j * slab
 		hi := min(lo+slab, len(payload))
-		bytes, tag, err := seal.page(indices[j], pageOverflow, 0, uint32(hi-lo), next, payload[lo:hi])
+		bytes, tag, err := sealPage(seal, indices[j], pageOverflow, 0, uint32(hi-lo), next, payload[lo:hi])
 		if err != nil {
 			return pageRef{}, err
 		}
@@ -5194,7 +5222,7 @@ func metaPage(pcap pageCap, pageSize uint32, txid uint64, root pageRef, pageCoun
 // makePage is a catalog/B-tree page's full pageSize bytes (header + payload, zero-padded). ToImage
 // copies it into the image; an incremental commit pwrites it directly (file.go). Single-sources the
 // page byte layout.
-func makePage(ps int, pageType byte, itemCount, nextPage uint32, payload []byte) []byte {
+func makePage[S ~string | ~[]byte](ps int, pageType byte, itemCount, nextPage uint32, payload S) []byte {
 	p := make([]byte, ps)
 	p[0] = pageType
 	binary.BigEndian.PutUint32(p[4:], itemCount)
@@ -6394,6 +6422,15 @@ func resolveUnfetched(ty colType, u *Unfetched, fetch func(pageRef) ([]byte, err
 		p := 0
 		return readInlineBody(ty, u.Comp, &p, decodeConstruct)
 	case tagExternal:
+		if stringPayload(ty) {
+			// Gather a text / bytea / json chain straight into the value's string.
+			var b strings.Builder
+			b.Grow(min(int(u.StoredLen), decodePreallocCap))
+			if err := walkOverflowChain(u.first(), int(u.StoredLen), fetch, pcap, &sink, func(slab []byte) { b.Write(slab) }); err != nil {
+				return Value{}, err
+			}
+			return valueFromStringPayload(ty, b.String())
+		}
 		payload, err := readOverflowChain(u.first(), int(u.StoredLen), fetch, pcap, &sink)
 		if err != nil {
 			return Value{}, err
@@ -7022,40 +7059,51 @@ func decodeDecimalBody(buf []byte, pos *int, mode decodeMode) (Value, error) {
 // reachability walk). fetch returns a page's full block by index.
 func readOverflowChain(first pageRef, length int, fetch func(pageRef) ([]byte, error), pcap pageCap, visited *[]uint32) ([]byte, error) {
 	out := make([]byte, 0, min(length, decodePreallocCap))
+	if err := walkOverflowChain(first, length, fetch, pcap, visited, func(slab []byte) { out = append(out, slab...) }); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// walkOverflowChain follows the chain from first, handing each page's slab to emit in order until
+// length bytes have been emitted (readOverflowChain's checks; emit must not retain the slab).
+func walkOverflowChain(first pageRef, length int, fetch func(pageRef) ([]byte, error), pcap pageCap, visited *[]uint32, emit func([]byte)) error {
+	got := 0
 	seen := map[uint32]bool{}
 	p := first
-	for len(out) < length {
+	for got < length {
 		if p.page == 0 {
-			return nil, newError(DataCorrupted, "overflow chain ended before the value length")
+			return newError(DataCorrupted, "overflow chain ended before the value length")
 		}
 		if seen[p.page] {
-			return nil, newError(DataCorrupted, "overflow chain revisits a page")
+			return newError(DataCorrupted, "overflow chain revisits a page")
 		}
 		seen[p.page] = true
 		*visited = append(*visited, p.page)
 		block, err := fetch(p)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		pg, err := parsePage(block)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		if pg.pageType != pageOverflow {
-			return nil, newError(DataCorrupted, "expected an overflow page")
+			return newError(DataCorrupted, "expected an overflow page")
 		}
 		next, slab, err := chainContent(pg, pcap)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		n := int(pg.itemCount)
-		if n == 0 || n > len(slab) || len(out)+n > length {
-			return nil, newError(DataCorrupted, "overflow page slab out of range")
+		if n == 0 || n > len(slab) || got+n > length {
+			return newError(DataCorrupted, "overflow page slab out of range")
 		}
-		out = append(out, slab[:n]...)
+		emit(slab[:n])
+		got += n
 		p = next
 	}
-	return out, nil
+	return nil
 }
 
 // plainFetch adapts a page-index reader to the bound-pointer reader the chain walks take, for a

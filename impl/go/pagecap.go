@@ -110,6 +110,12 @@ func sealerOf(ps int, paging *sharedPaging) sealer {
 // page builds a body page and returns its bytes and the tag a pointer to it binds. next is the
 // successor of a chain page (catalog, overflow, free-list), else the zero pageRef.
 func (s sealer) page(index uint32, pageType, flags byte, itemCount uint32, next pageRef, payload []byte) ([]byte, pageTag, error) {
+	return sealPage(s, index, pageType, flags, itemCount, next, payload)
+}
+
+// sealPage is sealer.page over a payload held as a string or a byte slice — an overflow slab of a
+// resident text value is copied onto its page straight from the string.
+func sealPage[S ~string | ~[]byte](s sealer, index uint32, pageType, flags byte, itemCount uint32, next pageRef, payload S) ([]byte, pageTag, error) {
 	if s.codec == nil {
 		p := makePage(s.ps, pageType, itemCount, next.page, payload)
 		if flags != 0 {
