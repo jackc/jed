@@ -99,6 +99,14 @@ impl NwayInventoryMemo {
     }
 }
 
+/// One inventoried access path of a single base relation, without the borrow of the filter a
+/// [`ScanCandidate`] carries.
+struct OwnedPipelineAccess {
+    identity: ScanCandidateIdentity,
+    bound: Option<ScanBound>,
+    scan_order: ScanOrderCapability,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum JoinSearchAlgorithm {
     Inl,
@@ -170,12 +178,12 @@ impl Engine {
     }
 
     fn optimize_select_rules(&self, plan: &mut SelectPlan, scope: &Scope<'_>) {
-        self.rule_scan_bounds(plan, scope);
+        let single_inventory = self.rule_scan_bounds(plan, scope);
         self.rule_index_nested_loop(plan, scope);
         self.rule_hash_join(plan, scope);
         self.rule_order_by_pk_scan(plan, scope);
         self.rule_order_by_index_scan(plan, scope);
-        self.rule_costed_single_relation_pipeline(plan, scope);
+        self.rule_costed_single_relation_pipeline(plan, scope, single_inventory);
         self.rule_costed_two_relation_join(plan, scope);
         self.rule_costed_nway_join(plan, scope);
         self.rule_join_pk_ordered(plan, scope);
@@ -1129,7 +1137,15 @@ impl Engine {
     /// (functions.md §10), so skip detection for it (the synthetic table would return None
     /// anyway, but gate it explicitly). A CTE relation needs no skip — `detect_scan_bound`
     /// returns None for it.
-    fn rule_scan_bounds(&self, plan: &mut SelectPlan, scope: &Scope<'_>) {
+    ///
+    /// Returns a single base relation's complete inventory, owned, for
+    /// [`Self::rule_costed_single_relation_pipeline`] to choose from without building it again.
+    fn rule_scan_bounds(
+        &self,
+        plan: &mut SelectPlan,
+        scope: &Scope<'_>,
+    ) -> Option<Vec<OwnedPipelineAccess>> {
+        let mut single_inventory = None;
         plan.phys.rel_bounds = Vec::with_capacity(scope.rels.len());
         plan.phys.rel_estimates = Vec::with_capacity(scope.rels.len());
         for (i, rel) in scope.rels.iter().enumerate() {
@@ -1158,6 +1174,18 @@ impl Engine {
                     && !plan.has_window,
             );
             let bound = if plan.rels.len() == 1 {
+                if scope.rels.len() == 1 {
+                    single_inventory = Some(
+                        candidates
+                            .iter()
+                            .map(|candidate| OwnedPipelineAccess {
+                                identity: candidate.identity.clone(),
+                                bound: candidate.bound.clone(),
+                                scan_order: candidate.scan_order.clone(),
+                            })
+                            .collect(),
+                    );
+                }
                 select_costed_scan_candidate(candidates, &estimates)
             } else {
                 select_legacy_scan_candidate(candidates)
@@ -1165,13 +1193,19 @@ impl Engine {
             plan.phys.rel_estimates.push(estimates);
             plan.phys.rel_bounds.push(bound);
         }
+        single_inventory
     }
 
     /// Compose every legal access path with its natural ordering, add missing order-only B-tree
     /// top-N walks, and choose the minimum cumulative scheduled estimate through LIMIT/OFFSET.
     /// Blocking-sort bookkeeping remains unmetered. Candidates are sorted by canonical
     /// access-kind/name identity, so the first exact-cost winner is the P0 tie-break.
-    fn rule_costed_single_relation_pipeline(&self, plan: &mut SelectPlan, scope: &Scope<'_>) {
+    fn rule_costed_single_relation_pipeline(
+        &self,
+        plan: &mut SelectPlan,
+        scope: &Scope<'_>,
+        inventory: Option<Vec<OwnedPipelineAccess>>,
+    ) {
         if scope.rels.len() != 1
             || plan.rels.len() != 1
             || plan.rels[0].srf.is_some()
@@ -1181,7 +1215,17 @@ impl Engine {
             return;
         }
         let rel = &scope.rels[0];
-        let access = inventory_single_relation_candidates(plan.filter.access(), rel, scope.catalog);
+        // `rule_scan_bounds` inventoried this relation already; nothing since changed the filter.
+        let access = inventory.unwrap_or_else(|| {
+            inventory_single_relation_candidates(plan.filter.access(), rel, scope.catalog)
+                .into_iter()
+                .map(|candidate| OwnedPipelineAccess {
+                    identity: candidate.identity,
+                    bound: candidate.bound,
+                    scan_order: candidate.scan_order,
+                })
+                .collect()
+        });
         if access.is_empty() {
             return;
         }
