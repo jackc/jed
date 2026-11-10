@@ -37535,6 +37535,13 @@ type HostFuncNode = Extract<RExpr, { kind: "hostFunc" }>;
 // child-bearing RExpr kind). An index key / predicate expression can never contain a
 // subquery/aggregate/window/param (all rejected at CREATE INDEX), but the walk covers every kind for
 // robustness — the analogue of Rust's estimator_expression_children recursion.
+// exprCallsHostFunction reports whether e calls a host function, by the walk index dependencies use.
+export function exprCallsHostFunction(e: RExpr): boolean {
+  const nodes: HostFuncNode[] = [];
+  collectHostFuncNodes(e, nodes);
+  return nodes.length > 0;
+}
+
 function collectHostFuncNodes(e: RExpr, out: HostFuncNode[]): void {
   switch (e.kind) {
     case "hostFunc":

@@ -307,7 +307,10 @@ gates the vectorized lanes, or file versus in-memory backing, which gates the
 bounded-spill lane) but never on the core.
 
 - A **streaming lane** that hands each row to the host as it is produced (the pull
-  scan) holds no row buffer and reserves nothing for its output; a lazily driven
+  scan) holds no row buffer and reserves nothing for its output. A single-table scan
+  with no `ORDER BY`, `LIMIT`, `DISTINCT`, aggregate, or window takes it when a
+  projection computes a value; a projection of bare columns keeps the columnar or
+  eager lane, whose buffer is its output. A lazily driven
   projecting, sorted, spool, or columnar emission reserves nothing for rows it
   hands to the host either. A lazily driven projecting buffer stays charged until
   the cursor is exhausted (the materialized drive releases it after its last row),

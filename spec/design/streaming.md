@@ -135,8 +135,10 @@ Cursor.close()                           # release the pinned snapshot (§5); id
   touched columns → `WHERE` → project, **one row per `next()`**. This subsumes the existing
   LIMIT-short-circuit, ORDER-BY-by-PK, and ORDER-BY-by-index paths ([cost.md](cost.md)): they were
   already row-at-a-time internally and were materializing only because the cursor demanded a `Vec`.
-  Peak memory is one row (plus the scan's root→leaf path of pinned nodes). A caller that stops early
-  faults no further leaves and produces no further rows.
+  With neither `ORDER BY` nor `LIMIT`, the scan streams when a projection computes a value; a
+  projection of bare columns keeps the columnar lane, whose gather is its output
+  ([memory.md](memory.md) §5.4). Peak memory is one row (plus the scan's root→leaf path of pinned
+  nodes). A caller that stops early faults no further leaves and produces no further rows.
 - **`Buffered`** — every plan with a blocking operator (`ORDER BY` the scan doesn't satisfy,
   `DISTINCT`, aggregate/`GROUP BY`, window, multi-table join, set operation, `VALUES`, a
   materialized CTE). On first `next()` it runs the blocking part to completion into its existing

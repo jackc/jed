@@ -7287,7 +7287,8 @@ pub(crate) struct EvalEnv<'a> {
 /// Whether `plan` is the single-table, no-blocking-operator **streaming scan** shape
 /// (spec/design/cost.md §3, streaming.md §4) — a single relation, no join / aggregate / window, an
 /// output order the chosen bound already yields, and a real table store. Without ORDER BY, LIMIT
-/// observes the access path's existing deterministic order. With ORDER BY, a PK/PK-set bound must
+/// observes the access path's existing deterministic order; with neither, the scan streams when a
+/// projection computes a value. With ORDER BY, a PK/PK-set bound must
 /// preserve PK order, or an ordered-index bound/set must walk the exact ordering index.
 pub(crate) fn streaming_scan_eligible(plan: &SelectPlan) -> bool {
     if !(plan.rels.len() == 1
@@ -7302,7 +7303,18 @@ pub(crate) fn streaming_scan_eligible(plan: &SelectPlan) -> bool {
     }
     let bound = plan.phys.rel_bounds[0].as_ref();
     if plan.order.is_empty() {
-        return !plan.distinct && plan.limit.is_some();
+        if plan.limit.is_some() {
+            return !plan.distinct;
+        }
+        // Without a LIMIT, the scan streams when a projection computes a value: the rows it reads are
+        // needed only one at a time (streaming.md §4, memory.md §5.4). A projection of bare columns
+        // keeps its columnar or eager lane, whose buffer is the output itself, and a scan that calls a
+        // host function keeps the buffered projection, which feeds a batched kernel in larger chunks
+        // than a streaming read-ahead window (extensibility.md §4.2.1).
+        return !plan.distinct
+            && plan.distinct_on == 0
+            && !projects_only_columns(plan)
+            && !calls_host_function(plan);
     }
     if plan.phys.pk_ordered {
         return matches!(
@@ -7317,6 +7329,24 @@ pub(crate) fn streaming_scan_eligible(plan: &SelectPlan) -> bool {
         (Some(io), Some(bound)) => index_order_compatible_bound(io, Some(bound)),
         _ => false,
     }
+}
+
+/// Whether every projection is a bare column reference (none computes a value). An empty projection
+/// list counts as bare.
+fn projects_only_columns(plan: &SelectPlan) -> bool {
+    plan.projections
+        .iter()
+        .all(|p| matches!(p, RExpr::Column(_)))
+}
+
+/// Whether the plan's projections or WHERE call a host function, by the walk index dependencies use
+/// (`estimator_expression_children`).
+fn calls_host_function(plan: &SelectPlan) -> bool {
+    fn calls(expr: &RExpr) -> bool {
+        matches!(expr, RExpr::HostFunc { .. })
+            || estimator_expression_children(expr).into_iter().any(calls)
+    }
+    plan.filter.get().is_some_and(calls) || plan.projections.iter().any(calls)
 }
 
 pub(crate) fn pull_streaming_scan_eligible(plan: &SelectPlan) -> bool {

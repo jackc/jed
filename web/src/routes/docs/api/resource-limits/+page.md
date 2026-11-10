@@ -104,7 +104,10 @@ hash-table entry, plus the UTF-8 length of text, the length of bytea, and simila
 the runtime's actual allocations. That makes the limit deterministic: the same query aborts at the same row on every
 core. Rows released along the way (filtered out, consumed by the next stage, handed to your cursor)
 give their bytes back, and a streaming query that hands each row to you as it is produced holds
-almost nothing. A cursor keeps its statement's budget until it closes.
+almost nothing. A single-table query streams when nothing needs all its rows at once: no join,
+aggregate, window, or `DISTINCT`, an `ORDER BY` its index or primary key already provides (or none),
+and, without `ORDER BY` or `LIMIT`, a select list that computes a value and calls no host function.
+A cursor keeps its statement's budget until it closes.
 
 TypeScript's public async `all()` gathers its result objects on the application thread. That
 collection has a separate `runtime.maxResultBytes` limit (default **2 MiB**) and rejects oversized

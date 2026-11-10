@@ -12,6 +12,7 @@ import {
   DEFAULT_TEMP_BUFFERS,
   type Engine,
   distinctRowKey,
+  exprCallsHostFunction,
   finalizeAcc,
   foldAcc,
   needsEagerScan,
@@ -394,7 +395,8 @@ export class SessionState {
 // streamingScanEligible reports whether plan is the single-table, no-blocking-operator STREAMING SCAN
 // shape (spec/design/cost.md §3, streaming.md §4) — a single relation, no join/aggregate/window, an
 // output order the chosen bound already yields, and a real table store. Without ORDER BY, LIMIT
-// observes the access path's deterministic order. With ORDER BY, a PK/PK-set bound must preserve PK
+// observes the access path's deterministic order; with neither, the scan streams when a projection
+// computes a value. With ORDER BY, a PK/PK-set bound must preserve PK
 // order, or an ordered-index bound/set must walk the exact ordering index.
 export function streamingScanEligible(plan: SelectPlan): boolean {
   if (
@@ -408,7 +410,21 @@ export function streamingScanEligible(plan: SelectPlan): boolean {
   )
     return false;
   const bound = plan.phys.relBounds[0]!;
-  if (plan.order.length === 0) return !plan.distinct && plan.limit !== null;
+  if (plan.order.length === 0) {
+    if (plan.limit !== null) return !plan.distinct;
+    // Without a LIMIT, the scan streams when a projection computes a value: the rows it reads are
+    // needed only one at a time (streaming.md §4, memory.md §5.4). A projection of bare columns
+    // keeps its columnar or eager lane, whose buffer is the output itself, and a scan that calls a
+    // host function keeps the buffered projection, which feeds a batched kernel in larger chunks
+    // than a streaming read-ahead window (extensibility.md §4.2.1).
+    return (
+      !plan.distinct &&
+      plan.distinctOn === 0 &&
+      !projectsOnlyColumns(plan) &&
+      !(plan.filter !== null && exprCallsHostFunction(plan.filter)) &&
+      !plan.projections.some(exprCallsHostFunction)
+    );
+  }
   if (plan.phys.pkOrdered)
     return (
       bound === null ||
@@ -452,6 +468,12 @@ export function frameBackwardSafe(
     default:
       return false; // following / unboundedFollowing look forward
   }
+}
+
+// projectsOnlyColumns reports whether every projection is a bare column reference (none computes a
+// value). An empty projection list counts as bare.
+function projectsOnlyColumns(plan: SelectPlan): boolean {
+  return plan.projections.every((p) => p.kind === "column");
 }
 
 // vectorizedProjectEligible reports whether plan is a shape projectColumnar specializes: a bare-column

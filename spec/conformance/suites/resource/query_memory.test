@@ -243,7 +243,9 @@ SELECT id, (SELECT count(*) FROM t i WHERE i.id <= o.id % 3) FROM n o ORDER BY i
 statement error 54P05
 SELECT id, (SELECT count(*) FROM t i WHERE i.id <= o.id % 3) FROM n o ORDER BY id DESC
 
-# max_query_memory_bytes: 384
+# EXISTS's inner scan computes its projection, so it streams and holds no relation buffer: the peak
+# is its one-row result (memory.md §5.4).
+# max_query_memory_bytes: 64
 query IB nosort
 SELECT id, EXISTS (SELECT 1 FROM t i WHERE i.id = o.id % 4) FROM n o ORDER BY id DESC
 ----
@@ -260,7 +262,7 @@ true
 1
 true
 
-# max_query_memory_bytes: 383
+# max_query_memory_bytes: 63
 statement error 54P05
 SELECT id, EXISTS (SELECT 1 FROM t i WHERE i.id = o.id % 4) FROM n o ORDER BY id DESC
 

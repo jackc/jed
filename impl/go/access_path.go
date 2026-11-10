@@ -3,6 +3,7 @@ package jed
 import (
 	"bytes"
 	"cmp"
+	"errors"
 	"math"
 	"slices"
 	"sort"
@@ -3830,7 +3831,8 @@ func boundEmpty(b keyBound) bool {
 // streamingScanEligible reports whether plan is the single-table, no-blocking-operator STREAMING SCAN
 // shape (spec/design/cost.md §3, streaming.md §4) — a single relation, no join/aggregate/window, an
 // output order the chosen bound already yields, and a real table store (not an SRF / CTE / derived
-// source). Without ORDER BY, LIMIT observes the chosen access path's existing deterministic order.
+// source). Without ORDER BY, LIMIT observes the chosen access path's existing deterministic order;
+// with neither, the scan streams when a projection computes a value.
 // With ORDER BY, PK/PK-interval bounds must preserve PK order, or an ordered-index bound/set must
 // walk the exact index that satisfies the order.
 func streamingScanEligible(plan *selectPlan) bool {
@@ -3840,13 +3842,50 @@ func streamingScanEligible(plan *selectPlan) bool {
 	}
 	sb := plan.phys.relBounds[0]
 	if len(plan.order) == 0 {
-		return !plan.distinct && plan.limit != nil
+		if plan.limit != nil {
+			return !plan.distinct
+		}
+		// Without a LIMIT, the scan streams when a projection computes a value: the rows it reads are
+		// needed only one at a time (streaming.md §4, memory.md §5.4). A projection of bare columns
+		// keeps its columnar or eager lane, whose buffer is the output itself, and a scan that calls a
+		// host function keeps the buffered projection, which feeds a batched kernel in larger chunks
+		// than a streaming read-ahead window (extensibility.md §4.2.1).
+		return !plan.distinct && plan.distinctOn == 0 && !projectsOnlyColumns(plan) && !callsHostFunction(plan)
 	}
 	if plan.phys.pkOrdered {
 		return sb == nil || sb.pk != nil || sb.pkSet != nil || sb.gin != nil || sb.gist != nil
 	}
 	return plan.phys.indexOrder != nil && indexOrderCompatibleBound(plan.phys.indexOrder, sb) && sb != nil
 }
+
+// projectsOnlyColumns reports whether every projection is a bare column reference (none computes a
+// value). An empty projection list counts as bare.
+func projectsOnlyColumns(plan *selectPlan) bool {
+	for _, p := range plan.projections {
+		if p.kind != reColumn {
+			return false
+		}
+	}
+	return true
+}
+
+// callsHostFunction reports whether the plan's projections or WHERE call a host function, by the
+// walk index dependencies use (walkIndexExprHostFuncs).
+func callsHostFunction(plan *selectPlan) bool {
+	found := func(*rExpr) error { return errHostCallFound }
+	if plan.filter != nil && walkIndexExprHostFuncs(plan.filter, found) != nil {
+		return true
+	}
+	for _, p := range plan.projections {
+		if walkIndexExprHostFuncs(p, found) != nil {
+			return true
+		}
+	}
+	return false
+}
+
+// errHostCallFound stops callsHostFunction's walk at its first host call.
+var errHostCallFound = errors.New("host function call")
 
 // pullStreamingScanEligible is the narrower gate for the Query API's direct storeScan cursor. The
 // generalized bound streams still execute lazily through bufferedScanCursor on first pull, but that

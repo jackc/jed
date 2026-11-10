@@ -30,11 +30,11 @@ EXPLAIN (VERBOSE TRUE, COSTS OFF, LANE ON) SELECT v + 1 FROM t WHERE id = 1 AND 
 0
 Filter
 filter=((#0 = 1) and (#1 > 0)); output=[(#1 + 1)]
-buffered
+streaming
 1
 Scan t
 PK bound: id = 1; touched=2
-buffered
+streaming
 
 # The verbose printer covers resolved control-flow and function nodes, not only binary predicates.
 query ITT nosort

@@ -278,12 +278,13 @@ SELECT count(*) FROM t
 3
 
 # INSERT ... SELECT keeps its source rows charged until the statement ends (memory.md §5.3), and they
-# are still held when its 52 staged bytes join the account: the statement needs both.
-# max_query_memory_bytes: 443
+# are still held when its 52 staged bytes join the account: the statement needs both. The source scan
+# computes a projection, so it streams (memory.md §5.4): its rows are the two projected rows, 222 bytes.
+# max_query_memory_bytes: 273
 statement error 54P05
 INSERT INTO t SELECT id + 10, v FROM t WHERE id <= 2
 
-# max_query_memory_bytes: 444
+# max_query_memory_bytes: 274
 statement ok
 INSERT INTO t SELECT id + 10, v FROM t WHERE id <= 2
 
