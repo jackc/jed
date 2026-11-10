@@ -1848,10 +1848,18 @@ pub(crate) fn float_json_number(f: f64, is32: bool) -> Decimal {
 fn render_bytea_hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(2 + bytes.len() * 2);
     s.push_str("\\x");
-    for b in bytes {
-        s.push_str(&format!("{b:02x}"));
-    }
+    push_hex(&mut s, bytes);
     s
+}
+
+/// Append each byte as two lowercase hex digits.
+pub(crate) fn push_hex(out: &mut String, bytes: &[u8]) {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    out.reserve(bytes.len() * 2);
+    for &b in bytes {
+        out.push(DIGITS[(b >> 4) as usize] as char);
+        out.push(DIGITS[(b & 0x0f) as usize] as char);
+    }
 }
 
 /// Decode a bytea literal from its hex input form (spec/design/types.md §13): a `\x`
@@ -1936,7 +1944,7 @@ pub fn render_uuid(u: &[u8; 16]) -> String {
         if matches!(i, 4 | 6 | 8 | 10) {
             s.push('-');
         }
-        s.push_str(&format!("{b:02x}"));
+        push_hex(&mut s, std::slice::from_ref(b));
     }
     s
 }

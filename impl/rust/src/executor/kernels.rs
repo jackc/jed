@@ -386,7 +386,11 @@ pub(crate) const BASE64_ALPHABET: &[u8; 64] =
 /// `'base64'`); an unrecognized format traps `22023`.
 pub(crate) fn encode_bytea(bytes: &[u8], format: &str) -> Result<String> {
     match format.to_ascii_lowercase().as_str() {
-        "hex" => Ok(bytes.iter().map(|b| format!("{b:02x}")).collect()),
+        "hex" => {
+            let mut out = String::new();
+            crate::value::push_hex(&mut out, bytes);
+            Ok(out)
+        }
         "escape" => {
             let mut out = String::with_capacity(bytes.len());
             for &b in bytes {
@@ -411,10 +415,9 @@ pub(crate) fn encode_bytea(bytes: &[u8], format: &str) -> Result<String> {
 /// digits. The digest is RustCrypto's (CLAUDE.md §14 clause 3), never hand-rolled.
 pub(crate) fn md5_hex(bytes: &[u8]) -> String {
     use md5::Digest;
-    md5::Md5::digest(bytes)
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
+    let mut out = String::new();
+    crate::value::push_hex(&mut out, &md5::Md5::digest(bytes));
+    out
 }
 
 /// `sha224`/`sha256`/`sha384`/`sha512(bytes)` (string-functions.md §4): the FIPS 180-4 digest of
@@ -1411,8 +1414,18 @@ pub(crate) fn quantified_cmp3(op: CmpOp, x: &Value, e: &Value) -> ThreeValued {
 /// pattern must not end with escape character") — data-dependent, since an earlier mismatch
 /// returns `false` before the escape is reached.
 pub(crate) fn like_match(subject: &str, pattern: &str) -> Result<bool> {
+    // In ASCII text a byte is a code point, so the walk runs over the bytes in place.
+    if subject.is_ascii() && pattern.is_ascii() {
+        return like_match_units(subject.as_bytes(), pattern.as_bytes());
+    }
     let s: Vec<char> = subject.chars().collect();
     let p: Vec<char> = pattern.chars().collect();
+    like_match_units(&s, &p)
+}
+
+/// [`like_match`] over one unit per code point: `char`s, or the bytes of ASCII text.
+fn like_match_units<T: Copy + PartialEq + From<u8>>(s: &[T], p: &[T]) -> Result<bool> {
+    let (escape, any_one, any_run) = (T::from(b'\\'), T::from(b'_'), T::from(b'%'));
     let mut si = 0usize;
     let mut pi = 0usize;
     // The last '%' position in the pattern (a backtrack point) and the subject index when it
@@ -1420,7 +1433,7 @@ pub(crate) fn like_match(subject: &str, pattern: &str) -> Result<bool> {
     let mut star_pi: Option<usize> = None;
     let mut star_si = 0usize;
     while si < s.len() {
-        if pi < p.len() && p[pi] == '\\' {
+        if pi < p.len() && p[pi] == escape {
             // Escape: the next pattern character must match the subject literally.
             if pi + 1 >= p.len() {
                 return Err(EngineError::new(
@@ -1434,11 +1447,11 @@ pub(crate) fn like_match(subject: &str, pattern: &str) -> Result<bool> {
                 continue;
             }
             // literal mismatch → fall through to backtrack
-        } else if pi < p.len() && p[pi] == '_' {
+        } else if pi < p.len() && p[pi] == any_one {
             si += 1;
             pi += 1;
             continue;
-        } else if pi < p.len() && p[pi] == '%' {
+        } else if pi < p.len() && p[pi] == any_run {
             star_pi = Some(pi);
             star_si = si;
             pi += 1;
@@ -1458,7 +1471,7 @@ pub(crate) fn like_match(subject: &str, pattern: &str) -> Result<bool> {
         return Ok(false);
     }
     // Subject consumed: any pattern remainder must be all '%' to match.
-    while pi < p.len() && p[pi] == '%' {
+    while pi < p.len() && p[pi] == any_run {
         pi += 1;
     }
     Ok(pi == p.len())
