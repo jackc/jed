@@ -940,3 +940,26 @@ function rowsReferenceChains(rows: Row[]): boolean {
   }
   return false;
 }
+
+// retainedOldRow is the old row a rewrite keeps until its maintenance runs (index entries,
+// foreign-key actions, RETURNING old.*): resolved, except that each column whose stored value is a
+// large form (out of line or compressed) returns to that stored, deferred form unless keep marks it.
+// That is the picture the maintenance paths expect (resolveInlineColumns: a key column is always
+// inline, and the key encoders and evaluator resolve a deferred value on touch, as they do for the
+// new row's carried values), so the statement holds each large value decoded only while it builds
+// the row's new version. keep may be null (keep nothing resolved).
+export function retainedOldRow(resolved: Row, stored: Row, keep: boolean[] | null): Row {
+  let out = resolved;
+  let copied = false;
+  for (let i = 0; i < stored.length; i++) {
+    const sv = stored[i]!;
+    if (sv.kind !== "unfetched" || sv.ref.form === 0x00) continue;
+    if (resolved[i]!.kind === "unfetched" || keep?.[i]) continue;
+    if (!copied) {
+      out = resolved.slice();
+      copied = true;
+    }
+    out[i] = sv;
+  }
+  return out;
+}

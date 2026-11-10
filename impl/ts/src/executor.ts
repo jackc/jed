@@ -434,7 +434,7 @@ import {
   SpoolSorter,
 } from "./blocking.ts";
 import { KeyMap, KeySet } from "./keyset.ts";
-import { type Entry, type Row, TableStore } from "./storage.ts";
+import { type Entry, type Row, retainedOldRow, TableStore } from "./storage.ts";
 import {
   type DecimalTypmod,
   type TemporalTypmod,
@@ -16571,6 +16571,9 @@ export class Engine {
     // Each entry is (old key, new key, new row, OLD row) — the old row feeds the index
     // maintenance and the new key the re-keying; for a non-PK UPDATE the new key equals the old.
     const updates: { key: Uint8Array; newKey: Uint8Array; row: Row; oldRow: Row }[] = [];
+    // oldReturned marks the columns RETURNING reads from the old side, which the retained old row
+    // keeps resolved (retainedOldRow).
+    let oldReturned: boolean[] | null = null;
     // UPDATE's touched set (cost.md §3): the filter's columns, every assignment SOURCE's, and
     // the RETURNING items' MINUS the assigned columns — an assigned column's returned value is
     // the freshly computed one, not a storage read. The rewrite re-stores an untouched spilled
@@ -16605,6 +16608,7 @@ export class Engine {
         if (retMask[i] && !plans.some((p) => p.idx === i)) mask[i] = true; // new side
         if (retMask[ncols + i]) mask[i] = true; // old side — always a storage read
       }
+      oldReturned = retMask.slice(ncols);
     }
     // A primary-key bound seeks/ranges instead of walking the whole B-tree (cost.md §3 "bounded
     // scan"); an empty bound updates nothing — with RETURNING that is still a query result
@@ -16713,11 +16717,13 @@ export class Engine {
       // A carried value stays deferred only where the new row's plan stores it in its stored form;
       // the rest are resolved, so the stored row plans exactly as a resident one would
       // (large-values.md §15).
+      // The old row is kept only for maintenance; its large values return to their stored forms
+      // unless RETURNING reads them from the old side.
       updates.push({
         key: e.key,
         newKey,
         row: yield* store.settleCarriedSteps(newKey, newRow),
-        oldRow: row,
+        oldRow: retainedOldRow(row, e.row, oldReturned),
       });
     }
     this.recordExplainActual("Scan " + upd.table, scanActual);
@@ -17534,6 +17540,8 @@ export class Engine {
 
     // The touched set (§9): every target column any part of the statement reads.
     const mask = mergeTouched(plan, n);
+    // A retained old row (retainedOldRow) keeps every column resolved when RETURNING may read it.
+    const keepOld: boolean[] | null = plan.returning !== null ? new Array(n).fill(true) : null;
 
     const stmtRng = new StmtRng();
     const env: EvalEnv = {
@@ -17576,7 +17584,7 @@ export class Engine {
       }
       if (action.kind === "delete") {
         affected.add(k);
-        actions.push({ kind: "delete", key, oldRow: row, src });
+        actions.push({ kind: "delete", key, oldRow: retainedOldRow(row, stored, keepOld), src });
         return;
       }
       if (action.kind !== "update") {
@@ -17618,7 +17626,7 @@ export class Engine {
         oldKey: key,
         newKey,
         newRow: settled,
-        oldRow: row,
+        oldRow: retainedOldRow(row, stored, keepOld),
         src,
         clause: ci,
       });
