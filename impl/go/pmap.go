@@ -232,6 +232,35 @@ func (n *pnode) decodedParts() ([][]byte, []storedRow, []uint32, error) {
 	return keys, vals, weights, nil
 }
 
+// leafParts returns a leaf's keys, rows, and weights for reading only: a Decoded leaf's own slices,
+// which the caller must not modify, or a Packed leaf's freshly decoded parts.
+func (n *pnode) leafParts() ([][]byte, []storedRow, []uint32, error) {
+	if n.packed == nil {
+		return n.keys, n.vals, n.weights, nil
+	}
+	return n.decodedParts()
+}
+
+// concatRange returns a fresh slice of elements [lo, hi) of the concatenation a ++ b.
+func concatRange[T any](a, b []T, lo, hi int) []T {
+	out := make([]T, 0, hi-lo)
+	if lo < len(a) {
+		out = append(out, a[lo:min(hi, len(a))]...)
+	}
+	if hi > len(a) {
+		out = append(out, b[max(lo-len(a), 0):hi-len(a)]...)
+	}
+	return out
+}
+
+// concatAt is element i of the concatenation a ++ b.
+func concatAt[T any](a, b []T, i int) T {
+	if i < len(a) {
+		return a[i]
+	}
+	return b[i-len(a)]
+}
+
 // childRef is a B+tree node's reference to one child. Under demand paging (P6.4b, spec/design/pager.md
 // §4) a clean leaf need not be resident: an interior node keeps an OnDisk page id for such a child and
 // the read path faults it through the buffer pool on access. node != nil ⇒ resident (a dirty node, a
@@ -1204,14 +1233,28 @@ func splitPoint(mLo, mHi, payload, cap int, rightEdge bool, leftpayload, rightpa
 // leaf with a single over-cap record is left whole (defensive — the oversize surfaces as 0A000 when
 // serialized).
 func buildLeaf(keys [][]byte, vals []storedRow, weights []uint32, cap pageCap, shape leafShape, edited int, owner *mutationGeneration) insOut {
-	n := len(keys)
+	m, split := leafSplit(weights, cap, shape, edited)
+	if !split {
+		return insOut{whole: &pnode{keys: keys, vals: vals, weights: weights, owner: owner}}
+	}
+	return insOut{
+		left:  &pnode{keys: cloneKeys(keys[:m]), vals: cloneVals(vals[:m]), weights: cloneWeights(weights[:m]), owner: owner},
+		sep:   keys[m],
+		right: &pnode{keys: cloneKeys(keys[m:]), vals: cloneVals(vals[m:]), weights: cloneWeights(weights[m:]), owner: owner},
+	}
+}
+
+// leafSplit is buildLeaf's split decision over a leaf's record weights: split is false when the leaf
+// stays whole, else m is the first record of the right half.
+func leafSplit(weights []uint32, cap pageCap, shape leafShape, edited int) (m int, split bool) {
+	n := len(weights)
 	payload := 0
 	for _, w := range weights {
 		payload += int(w)
 	}
 	payload += leafOverhead(n, shape)
 	if payload <= cap.c || n < 2 {
-		return insOut{whole: &pnode{keys: keys, vals: vals, weights: weights, owner: owner}}
+		return 0, false
 	}
 	prefix := make([]int, n+1)
 	for i, w := range weights {
@@ -1220,17 +1263,9 @@ func buildLeaf(keys [][]byte, vals []storedRow, weights []uint32, cap pageCap, s
 	total := prefix[n]
 	leftpayload := func(m int) int { return prefix[m] + leafOverhead(m, shape) }
 	rightpayload := func(m int) int { return total - prefix[m] + leafOverhead(n-m, shape) }
-	m, ok := splitPoint(1, n-1, payload, cap.c, edited == n-1, leftpayload, rightpayload)
-	if !ok {
-		// Unreachable under the RECORD_MAX cap (a two-record leaf always fits — format.md "Why the
-		// record cap"); defensively leave the node whole (0A000 at serialize).
-		return insOut{whole: &pnode{keys: keys, vals: vals, weights: weights, owner: owner}}
-	}
-	return insOut{
-		left:  &pnode{keys: cloneKeys(keys[:m]), vals: cloneVals(vals[:m]), weights: cloneWeights(weights[:m]), owner: owner},
-		sep:   keys[m],
-		right: &pnode{keys: cloneKeys(keys[m:]), vals: cloneVals(vals[m:]), weights: cloneWeights(weights[m:]), owner: owner},
-	}
+	// !ok is unreachable under the RECORD_MAX cap (a two-record leaf always fits — format.md "Why the
+	// record cap"); defensively leave the node whole (0A000 at serialize).
+	return splitPoint(1, n-1, payload, cap.c, edited == n-1, leftpayload, rightpayload)
 }
 
 // buildInterior builds an interior node from its parts; if its payload overflows cap, it splits
@@ -1491,25 +1526,38 @@ func mergeAt(n *pnode, j int, generation *mutationGeneration, src leafSource, ca
 
 	var merged insOut
 	if left.isLeaf() {
-		// Materialize both leaves (either may be Packed) before merging — the merged node is Decoded.
-		leftKeys, leftRows, leftWeights, err := left.decodedParts()
+		// Read both leaves (either may be Packed) and copy each record once, straight into the merged
+		// node or its two halves (buildLeaf's split rule; merge-overflow splits balanced). The two
+		// inputs are left untouched, so an abandoned merge below keeps them exactly as they were.
+		leftKeys, leftRows, leftWeights, err := left.leafParts()
 		if err != nil {
 			return nil, err
 		}
-		rightKeys, rightRows, rightWeights, err := right.decodedParts()
+		rightKeys, rightRows, rightWeights, err := right.leafParts()
 		if err != nil {
 			return nil, err
 		}
-		mkeys := make([][]byte, 0, len(leftKeys)+len(rightKeys))
-		mkeys = append(mkeys, leftKeys...)
-		mkeys = append(mkeys, rightKeys...)
-		mvals := make([]storedRow, 0, len(leftRows)+len(rightRows))
-		mvals = append(mvals, leftRows...)
-		mvals = append(mvals, rightRows...)
-		mweights := make([]uint32, 0, len(leftWeights)+len(rightWeights))
-		mweights = append(mweights, leftWeights...)
-		mweights = append(mweights, rightWeights...)
-		merged = buildLeaf(mkeys, mvals, mweights, cap, shape, -1, generation) // merge-overflow: balanced
+		mweights := concatRange(leftWeights, rightWeights, 0, len(leftWeights)+len(rightWeights))
+		if m, split := leafSplit(mweights, cap, shape, -1); split {
+			n := len(mweights)
+			merged = insOut{
+				left: &pnode{
+					keys: concatRange(leftKeys, rightKeys, 0, m), vals: concatRange(leftRows, rightRows, 0, m),
+					weights: mweights[:m:m], owner: generation,
+				},
+				sep: concatAt(leftKeys, rightKeys, m),
+				right: &pnode{
+					keys: concatRange(leftKeys, rightKeys, m, n), vals: concatRange(leftRows, rightRows, m, n),
+					weights: concatRange(mweights, nil, m, n), owner: generation,
+				},
+			}
+		} else {
+			n := len(mweights)
+			merged = insOut{whole: &pnode{
+				keys: concatRange(leftKeys, rightKeys, 0, n),
+				vals: concatRange(leftRows, rightRows, 0, n), weights: mweights, owner: generation,
+			}}
+		}
 	} else {
 		mkeys := make([][]byte, 0, len(left.keys)+1+len(right.keys))
 		mkeys = append(mkeys, left.keys...)
