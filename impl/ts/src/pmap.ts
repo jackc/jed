@@ -555,7 +555,14 @@ export class PMap {
     src: LeafSource | null,
   ): Steps<Row | undefined> {
     if (this.root === null) return undefined;
-    const res = yield* nodeRemoveSteps(this.root, key, src, cap, shape);
+    const res = yield* nodeRemoveSteps(
+      this.root,
+      key,
+      this.currentMutationGeneration(),
+      src,
+      cap,
+      shape,
+    );
     if (!res.ok) return undefined;
     let newRoot: PNode | null = res.node;
     // The root may have drained: an empty leaf becomes the empty map; a 0-key interior root hands
@@ -1222,13 +1229,16 @@ function* nodeInsertSteps(
 
 type RemOut = { ok: boolean; node: PNode; removed: Row | undefined };
 
-// nodeRemove is the recursive delete (copy-on-write). It descends to the holding LEAF (a separator
-// equal to the key just routes right — it is never itself deleted or replaced; separators may go
-// stale, format.md "Delete"). Returns the rebuilt subtree (possibly underfull — the caller
-// rebalances it) and the removed row; the touched child is rebalanced via rebalanceChild.
+// nodeRemove is the recursive delete. It descends to the holding LEAF (a separator equal to the key
+// just routes right — it is never itself deleted or replaced; separators may go stale, format.md
+// "Delete"). Returns the rebuilt subtree (possibly underfull — the caller rebalances it) and the
+// removed row; the touched child is rebalanced via rebalanceChild. A dirty node the active
+// generation owns is edited in place, as nodeInsert does; any other node is path-copied into a new
+// one the generation owns, so a later remove in the same statement reuses it.
 function* nodeRemoveSteps(
   n: PNode,
   key: Uint8Array,
+  generation: MutationGeneration,
   src: LeafSource | null,
   cap: Cap,
   shape: LeafShape,
@@ -1236,31 +1246,50 @@ function* nodeRemoveSteps(
   if (isLeaf(n)) {
     const { index, found } = search(n, key);
     if (!found) return { ok: false, node: n, removed: undefined };
+    if (ownedBy(n, generation)) {
+      const removed = n.vals[index];
+      n.keys.splice(index, 1);
+      n.vals.splice(index, 1);
+      n.weights.splice(index, 1);
+      return { ok: true, node: n, removed };
+    }
+    // decodedParts returns fresh arrays, so the copy is edited directly.
     const { keys, vals: rows, weights } = decodedParts(n);
     const removed = rows[index];
-    return {
-      ok: true,
-      node: newLeaf(removeAt(keys, index), removeAt(rows, index), removeAt(weights, index)),
-      removed,
-    };
+    keys.splice(index, 1);
+    rows.splice(index, 1);
+    weights.splice(index, 1);
+    return { ok: true, node: newLeaf(keys, rows, weights, generation), removed };
   }
   const i = childSlot(n, key);
   const res = yield* nodeRemoveSteps(
     yield* resolveChildSteps(n.children[i], src),
     key,
+    generation,
     src,
     cap,
     shape,
   );
   if (!res.ok) return { ok: false, node: n, removed: undefined };
-  const children = n.children.slice();
-  children[i] = residentRef(res.node);
-  const rebuilt = newInterior(n.keys.slice(), children);
+  let rebuilt = n;
+  if (ownedBy(n, generation)) {
+    n.children[i] = residentRef(res.node);
+  } else {
+    const children = n.children.slice();
+    children[i] = residentRef(res.node);
+    rebuilt = newInterior(n.keys.slice(), children, generation);
+  }
   return {
     ok: true,
-    node: yield* rebalanceChildSteps(rebuilt, i, src, cap, shape),
+    node: yield* rebalanceChildSteps(rebuilt, i, generation, src, cap, shape),
     removed: res.removed,
   };
+}
+
+// ownedBy reports whether n is a dirty node generation may edit in place: only the active generation
+// that built it, which a clone, cursor pin, or publication invalidates before exposing an alias.
+function ownedBy(n: PNode, generation: MutationGeneration): boolean {
+  return n.page === 0 && n[mutationOwner] === generation && generation.active;
 }
 
 // rebalanceChild: if children[i] is underfull (payload < cap/2), merge it with an adjacent sibling
@@ -1270,6 +1299,7 @@ function* nodeRemoveSteps(
 function* rebalanceChildSteps(
   n: PNode,
   i: number,
+  generation: MutationGeneration,
   src: LeafSource | null,
   cap: Cap,
   shape: LeafShape,
@@ -1283,10 +1313,15 @@ function* rebalanceChildSteps(
     return n;
   }
   if (!isLeaf(child) && emptyUnarySubtree(child)) {
-    return newInterior(removeAt(n.keys, Math.min(i, n.keys.length - 1)), removeAt(n.children, i));
+    const parent = ownedBy(n, generation)
+      ? n
+      : newInterior(n.keys.slice(), n.children.slice(), generation);
+    parent.keys.splice(Math.min(i, parent.keys.length - 1), 1);
+    parent.children.splice(i, 1);
+    return parent;
   }
   const j = i + 1 < n.children.length ? i : i - 1;
-  return yield* mergeAtSteps(n, j, src, cap, shape);
+  return yield* mergeAtSteps(n, j, generation, src, cap, shape);
 }
 
 // An empty leaf below zero-key interiors has no same-parent sibling. Its first
@@ -1315,6 +1350,7 @@ function emptyUnarySubtree(node: PNode): boolean {
 function* mergeAtSteps(
   n: PNode,
   j: number,
+  generation: MutationGeneration,
   src: LeafSource | null,
   cap: Cap,
   shape: LeafShape,
@@ -1332,11 +1368,11 @@ function* mergeAtSteps(
     const mkeys = [...l.keys, ...r.keys];
     const mvals = [...l.vals, ...r.vals];
     const mweights = [...l.weights, ...r.weights];
-    merged = buildLeaf(mkeys, mvals, mweights, cap, shape, null);
+    merged = buildLeaf(mkeys, mvals, mweights, cap, shape, null, generation);
   } else {
     const mkeys = [...left.keys, n.keys[j]!, ...right.keys];
     const mchildren = [...left.children, ...right.children];
-    const out = buildInterior(mkeys, mchildren, cap, null);
+    const out = buildInterior(mkeys, mchildren, cap, null, generation);
     // No valid 2-way split point (near-cap separators): abandon the merge — the two children and
     // the parent separator stay exactly as they were (underfull tolerated).
     if (out === null) return n;
@@ -1352,18 +1388,19 @@ function* mergeAtSteps(
     return n;
   }
 
-  const keys = n.keys.slice();
-  const children = n.children.slice();
+  const parent = ownedBy(n, generation)
+    ? n
+    : newInterior(n.keys.slice(), n.children.slice(), generation);
   if (merged.whole !== null) {
-    keys.splice(j, 1);
-    children[j] = residentRef(merged.whole);
-    children.splice(j + 1, 1);
-    return newInterior(keys, children);
+    parent.keys.splice(j, 1);
+    parent.children[j] = residentRef(merged.whole);
+    parent.children.splice(j + 1, 1);
+    return parent;
   }
-  keys[j] = merged.sep;
-  children[j] = residentRef(merged.left);
-  children[j + 1] = residentRef(merged.right);
-  return newInterior(keys, children);
+  parent.keys[j] = merged.sep;
+  parent.children[j] = residentRef(merged.left);
+  parent.children[j + 1] = residentRef(merged.right);
+  return parent;
 }
 
 // --- immutable array helpers (each returns a fresh array, leaving the input untouched) -------
@@ -1371,11 +1408,5 @@ function* mergeAtSteps(
 function insertAt<T>(a: T[], i: number, x: T): T[] {
   const out = a.slice();
   out.splice(i, 0, x);
-  return out;
-}
-
-function removeAt<T>(a: T[], i: number): T[] {
-  const out = a.slice();
-  out.splice(i, 1);
   return out;
 }
