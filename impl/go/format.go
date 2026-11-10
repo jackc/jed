@@ -5474,6 +5474,8 @@ type meta struct {
 	dirtyCount    uint32
 	manifestPages uint32
 	manifestCRC   uint64
+	// narrow says the manifest's entries are 8 bytes (PROTOTYPE, manifest_crc32.go).
+	narrow bool
 	// remap is the meta's remap list (PROTOTYPE, remap.go); nil when it carries none.
 	remap *remapState
 }
@@ -5511,6 +5513,10 @@ func parseMeta(m []byte) (meta, bool) {
 	}
 	head := binary.BigEndian.Uint32(m[36:40])
 	count := binary.BigEndian.Uint32(m[40:44])
+	// PROTOTYPE (manifest_crc32.go): the top bit marks 8-byte entries.
+	narrow := count&manifestNarrowFlag != 0
+	count &^= manifestNarrowFlag
+	esize := manifestEntrySize(narrow)
 	pages := binary.BigEndian.Uint32(m[44:48])
 	chainCRC := binary.BigEndian.Uint64(m[48:56])
 	body := pageCount - first
@@ -5520,12 +5526,12 @@ func parseMeta(m []byte) (meta, bool) {
 		return meta{}, false
 	}
 	lo, hi := manifestInlineAreaOf(m, pcap)
-	inline := min(int(count), (hi-lo)/12)
+	inline := min(int(count), (hi-lo)/esize)
 	remap, ok := decodeRemap(m)
 	if !ok {
 		return meta{}, false
 	}
-	if !zeroBytes(m[lo+12*inline:hi]) || uint64(count) > uint64(inline)+uint64(pages)*uint64(manifestOverflowCapacity(len(m))) {
+	if !zeroBytes(m[lo+esize*inline:hi]) || uint64(count) > uint64(inline)+uint64(pages)*uint64(manifestOverflowCapacityFor(len(m), narrow)) {
 		return meta{}, false
 	}
 	// v25: offset 28 is the free-list head — 0 (empty) or a real body page in [first, page_count).
@@ -5563,6 +5569,7 @@ func parseMeta(m []byte) (meta, bool) {
 		livePages:     livePages,
 		manifestHead:  head,
 		dirtyCount:    count,
+		narrow:        narrow,
 		manifestPages: pages,
 		manifestCRC:   chainCRC,
 		remap:         remap,

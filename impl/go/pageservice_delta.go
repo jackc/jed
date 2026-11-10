@@ -101,16 +101,17 @@ func beginDelta(base psDeltaBase, cb psCommitBegin) (*psDelta, error) {
 	last := uint32(1)
 	rootSeen := false
 	listed, carried := uint32(0), 0
+	size := manifestEntrySize(m.narrow)
 	list := func(entries []byte, count uint32) error {
 		for i := uint32(0); i < count; i++ {
-			e := entries[int(i)*12:]
+			e := entries[int(i)*size:]
 			index := binary.BigEndian.Uint32(e)
 			if index <= last {
 				return errDelta("manifest indices are not strictly ascending")
 			}
 			if digest, ok := base.pending[index]; ok {
 				// A page an earlier commit of the batch wrote: listed, never sent again.
-				if binary.BigEndian.Uint64(e[4:]) != digest {
+				if entryDigest(e, m.narrow) != digest {
 					return errDelta("pending page " + strconv.FormatUint(uint64(index), 10) + " is listed with another digest")
 				}
 				last = index
@@ -124,7 +125,7 @@ func beginDelta(base psDeltaBase, cb psCommitBegin) (*psDelta, error) {
 				return errDelta("page " + strconv.FormatUint(uint64(index), 10) + " is neither beyond the high-water nor a granted free page")
 			}
 			last = index
-			d.expected[index] = binary.BigEndian.Uint64(e[4:])
+			d.expected[index] = entryDigest(e, m.narrow)
 			d.protected[index] = true
 			rootSeen = rootSeen || index == m.rootPage
 			listed++
@@ -132,8 +133,8 @@ func beginDelta(base psDeltaBase, cb psCommitBegin) (*psDelta, error) {
 		return nil
 	}
 	pcap := capOf(uint32(ps), base.encrypted)
-	inlineAt, _ := manifestInlineArea(ps, pcap)
-	if err := list(cb.meta[inlineAt:], min(m.dirtyCount, uint32(manifestInlineCapacity(ps, pcap)))); err != nil {
+	inlineAt, inlineEnd := manifestInlineAreaOf(cb.meta, pcap)
+	if err := list(cb.meta[inlineAt:], min(m.dirtyCount, uint32((inlineEnd-inlineAt)/size))); err != nil {
 		return nil, err
 	}
 	id := m.manifestHead
@@ -144,16 +145,16 @@ func beginDelta(base psDeltaBase, cb psCommitBegin) (*psDelta, error) {
 		}
 		block := pg.page
 		parsed, err := parsePage(block)
-		count := min(m.dirtyCount-listed, uint32(manifestOverflowCapacity(ps)))
+		count := min(m.dirtyCount-listed, uint32(manifestOverflowCapacityFor(ps, m.narrow)))
 		if err != nil || pageCRC(block) != binary.BigEndian.Uint32(block[12:16]) || parsed.pageType != pageManifest ||
 			!zeroBytes(block[1:4]) || parsed.itemCount != count || binary.BigEndian.Uint64(block[16:24]) != m.txid ||
-			binary.BigEndian.Uint32(block[24:28]) != uint32(ordinal) || !zeroBytes(block[28:32]) || !zeroBytes(block[32+12*int(count):]) {
+			binary.BigEndian.Uint32(block[24:28]) != uint32(ordinal) || !zeroBytes(block[28:32]) || !zeroBytes(block[32+size*int(count):]) {
 			return nil, errDelta("a manifest page is malformed")
 		}
 		var index [4]byte
 		binary.BigEndian.PutUint32(index[:], id)
-		chainCRC = commitCRC64(chainCRC, index[:])
-		chainCRC = commitCRC64(chainCRC, block)
+		chainCRC = chainDigest(chainCRC, index[:], m.narrow)
+		chainCRC = chainDigest(chainCRC, block, m.narrow)
 		d.protected[id] = true
 		if err := list(block[32:], count); err != nil {
 			return nil, err
@@ -215,7 +216,7 @@ func (d *psDelta) checkPage(pg psIndexedPage) error {
 	}
 	b := pg.page
 	plainOK := d.encrypted || (b[0] >= 1 && b[0] <= 7 && pageCRC(b) == binary.BigEndian.Uint32(b[12:16]))
-	if len(b) != len(d.meta) || !plainOK || commitCRC64(0, b) != crc {
+	if len(b) != len(d.meta) || !plainOK || pageDigest(b, d.encrypted, d.m.narrow) != crc {
 		return errDelta("page " + strconv.FormatUint(uint64(pg.index), 10) + " does not match its manifest identity")
 	}
 	d.received[pg.index] = true

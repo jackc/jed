@@ -241,7 +241,7 @@ func TestValidatedManifestDependenciesAreNotReusedUntilNextGeneration(t *testing
 		raw := base.image()[int(current.txid&1)*256:][:256]
 		check := func(entries []byte, n uint32) {
 			for i := uint32(0); i < n; i++ {
-				if id := binary.BigEndian.Uint32(entries[int(i)*12:]); free[id] {
+				if id := binary.BigEndian.Uint32(entries[int(i)*manifestEntrySize(manifestCRC32):]); free[id] {
 					t.Fatalf("manifest dependency %d is reusable", id)
 				}
 			}

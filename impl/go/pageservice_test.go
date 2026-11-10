@@ -141,7 +141,7 @@ func testDelta(t *testing.T, ps, committedPages uint32, indices []uint32) (psCom
 		ids[i] = pageCount
 		pageCount++
 	}
-	meta, chain := commitManifest(plainCap(ps), ps, 6, plainRef(indices[0]), pageCount, pageRef{}, 0, uint32(len(indices)), manifestEntriesOf(dirty), ids, nil)
+	meta, chain := commitManifest(plainCap(ps), ps, 6, plainRef(indices[0]), pageCount, pageRef{}, 0, uint32(len(indices)), manifestEntriesOf(dirty, false), ids, nil)
 	cb := psCommitBegin{txid: 6, meta: meta}
 	for _, pg := range chain {
 		cb.manifestPages = append(cb.manifestPages, psIndexedPage{index: pg.index, page: pg.bytes})
@@ -189,7 +189,8 @@ func TestPageServiceDeltaValidation(t *testing.T) {
 	base := psDeltaBase{committedTxid: 5, pageSize: ps, pageCount: 10, granted: map[uint32]bool{3: true}}
 	// 40 dirty pages overflow the 512-byte meta's 37 inline entries into one manifest page.
 	indices := []uint32{12, 3}
-	for i := uint32(13); len(indices) < 40; i++ {
+	// (60 with narrow entries, whose inline area holds 56 — manifest_crc32.go.)
+	for i := uint32(13); len(indices) < 40 || (manifestCRC32 && len(indices) < 60); i++ {
 		indices = append(indices, i)
 	}
 	cb, body := testDelta(t, ps, 10, indices)
@@ -307,7 +308,7 @@ func TestPageServiceRelaxedDeltaValidation(t *testing.T) {
 	pending := map[uint32]uint64{}
 	for _, pg := range all {
 		if pg.index == 4 {
-			pending[4] = commitCRC64(0, pg.page)
+			pending[4] = pageDigest(pg.page, false, manifestCRC32)
 		} else {
 			body = append(body, pg)
 		}
