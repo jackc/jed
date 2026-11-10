@@ -314,7 +314,7 @@ final class StorageDomainBoundaryTests: XCTestCase {
             XCTAssertEqual(domain.livePages, originalLive)
             XCTAssertEqual(try domain.committed.tables[t]!.get(key(1))!.cells[1].largeFacts(encrypted: false)?.external, pointer)
         }
-        guard case .bytea(let restored) = try pinnedRecord.materialize(column: 1, pager: domain.pager) else { return XCTFail("expected bytea") }
+        guard case .bytea(let restored) = try pinnedRecord.materialize(column: 1, type: TypeDescriptor(.scalar(.bytea)), pager: domain.pager) else { return XCTFail("expected bytea") }
         XCTAssertEqual(restored, blob)
         working = domain.committed; var store = working.tables[t]!
         try store.remove(key(1)); working.setTableStore(t, store)
@@ -340,7 +340,7 @@ final class StorageDomainBoundaryTests: XCTestCase {
         let plan = try XCTUnwrap(domain.prepare(working, verifyLiveCount: true))
         XCTAssertEqual(plan.pages.body.filter { $0.bytes[0] == 4 }.count, 6)
         _ = try domain.persist(plan)
-        guard case .bytea(let pinned) = try old.tables[t]!.get(key(3))!.materialize(column: 1, pager: domain.pager) else {
+        guard case .bytea(let pinned) = try old.tables[t]!.get(key(3))!.materialize(column: 1, type: TypeDescriptor(.scalar(.bytea)), pager: domain.pager) else {
             return XCTFail("pinned overflow value changed kind")
         }
         XCTAssertEqual(pinned, blob)
@@ -351,7 +351,7 @@ final class StorageDomainBoundaryTests: XCTestCase {
         let inherited = try XCTUnwrap(reopened.prepare(working, verifyLiveCount: true))
         XCTAssertEqual(inherited.pages.body.filter { $0.bytes[0] == 4 }.count, 0)
         _ = try reopened.persist(inherited)
-        guard case .bytea(let recovered) = try reopened.committed.tables[t]!.get(key(1))!.materialize(column: 1, pager: reopened.pager) else {
+        guard case .bytea(let recovered) = try reopened.committed.tables[t]!.get(key(1))!.materialize(column: 1, type: TypeDescriptor(.scalar(.bytea)), pager: reopened.pager) else {
             return XCTFail("reopened overflow value changed kind")
         }
         XCTAssertEqual(recovered, blob)

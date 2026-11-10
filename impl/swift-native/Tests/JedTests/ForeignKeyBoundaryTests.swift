@@ -50,7 +50,7 @@ final class ForeignKeyBoundaryTests: XCTestCase {
             defer { gather.close() }
             var ids: [Int64] = []
             while let record = try gather.next() {
-                if case .integer(let value) = try ScanRecord(record, pager: nil).value(0) { ids.append(value) }
+                if case .integer(let value) = try ScanRecord(record, types: plan.childTypes, pager: nil).value(0) { ids.append(value) }
             }
             XCTAssertEqual(ids, [2, 10])
             XCTAssertEqual(meter.accrued, 3, "one index leaf plus two table point lookups; row reads belong to the mutation loop")

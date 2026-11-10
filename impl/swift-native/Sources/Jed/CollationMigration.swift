@@ -33,7 +33,7 @@ internal enum CollationMigration {
             guard let old = snapshot.tables[table.name] else { throw JedError.corruption("collation upgrade table store is absent") }
             let types = try snapshot.tableTypes(table)
             func values(_ record: PackedRecord) throws -> [SQLValue] {
-                try types.indices.map { try record.materialize(column: $0, pager: snapshot.pool.pager) }
+                try types.indices.map { try record.materialize(column: $0, type: types[$0], pager: snapshot.pool.pager) }
             }
             func storageKey(_ record: PackedRecord, _ row: [SQLValue]) throws -> [UInt8] {
                 guard primary else { return record.key }

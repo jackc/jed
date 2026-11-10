@@ -27,13 +27,13 @@ final class PendingDispositionBoundaryTests: XCTestCase {
             XCTAssertEqual(keptMeter.accrued, freshMeter.accrued)
             XCTAssertEqual(kept.cells[0].bytes, original.cells[0].bytes)
             XCTAssertEqual(kept.overflows[0]?.bytes, pending.bytes)
-            if case .bytea(let value) = try kept.materialize(column: 0) { XCTAssertEqual(value, payload) }
+            if case .bytea(let value) = try kept.materialize(column: 0, type: type) { XCTAssertEqual(value, payload) }
             else { XCTFail("wrong kept value") }
             let smaller = try RecordDisposition.plan(key: [1], values: [.kept(kept.cells[0], pending: kept.overflows[0]), .value(.bytea([]))],
                 types: [type, type], codec: codec)
             XCTAssertEqual(smaller.cells[0].bytes?.first, compressed ? 3 : 0)
             XCTAssertNil(smaller.overflows[0])
-            if case .bytea(let value) = try smaller.materialize(column: 0) { XCTAssertEqual(value, payload) }
+            if case .bytea(let value) = try smaller.materialize(column: 0, type: type) { XCTAssertEqual(value, payload) }
             else { XCTFail("wrong redisposed value") }
             XCTAssertThrowsError(try RecordDisposition.plan(key: [1], values: [.kept(original.cells[0]), .value(.bytea(other))],
                 types: [type, type], codec: codec)) { XCTAssertEqual(($0 as? JedError)?.code, "XX001") }

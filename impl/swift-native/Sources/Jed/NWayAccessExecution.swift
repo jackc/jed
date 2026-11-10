@@ -81,7 +81,7 @@ internal final class NWayAccessExecution {
                     try meter.step(); meter.charge(1)
                     var row = Array(repeating: SQLValue.null, count: input.source.columns.count)
                     for column in masks[ordinal] {
-                        row[column] = try record.materialize(column: column, pager: access.store.tree.pool?.pager)
+                        row[column] = try record.materialize(column: column, type: access.store.tree.types[column], pager: access.store.tree.pool?.pager)
                     }
                     if let filter = input.source.scanFilter {
                         var filtered = current; filtered.column = { row[$0] }

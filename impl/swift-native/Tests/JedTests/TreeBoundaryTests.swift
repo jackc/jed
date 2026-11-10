@@ -403,7 +403,7 @@ final class TreeBoundaryTests: XCTestCase {
         }
         var cursor = TreeCursor(tree)
         while let record = try cursor.next() {
-            if case .bytea(let bytes) = try record.materialize(column: 0) { XCTAssertEqual(bytes, raw) }
+            if case .bytea(let bytes) = try record.materialize(column: 0, type: type) { XCTAssertEqual(bytes, raw) }
             else { XCTFail("wrong pending value type") }
         }
         var allocator = try PageAllocator(highWater: 2, free: [], firstBody: 2)

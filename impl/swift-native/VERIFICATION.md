@@ -22,6 +22,23 @@ simulation images. Its SHA-256 is
 The ignored archive supplements this committed report; the original `/tmp`
 paths below remain useful provenance references.
 
+## Second follow-up revalidation (2026-11-09)
+
+The copy-cost changes recorded in
+[swift-native-performance.md](../../spec/design/swift-native-performance.md#second-follow-up-copy-and-dispatch-costs-2026-11-09)
+were checked with a subset of the gates below. Uncommitted at the time of
+writing, on top of `a551b969`.
+
+| Gate | Result |
+|---|---|
+| Release native/API and all frozen SQL | **543 tests**, zero failures; **749/749 files**, 21,597 records, 39,148 cells, 2,271 cost / 1,154 name / 100 type assertions. |
+| Concurrent stress, Swift only | Two core/storage runs, 8,000 snapshot checks, zero failures; final checksum `f3e75496a3111181`. |
+| File interchange, Go peer only | **897/897 phases**, zero failures (diagnostic subset matrix). |
+
+Not re-run: exact cross-core resource accounting, encrypted SQL, Rust and
+TypeScript interchange, saved and generated fault simulations, mixed processes
+and page-service SQL. The tables below describe `43481e20`, not this source.
+
 ## Structural follow-up acceptance
 
 The explicitly authorized follow-up changes value representation, scan and

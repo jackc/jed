@@ -33,8 +33,8 @@ final class PackedPageTests: XCTestCase {
                 XCTAssertEqual(leaf.cell(row: row, column: column).bytes, rows[row].cells[column].bytes)
             }
         }
-        XCTAssertTrue(try leaf.cell(row: 1, column: 0).materialize().isNull)
-        if case .text(let value) = try leaf.cell(row: 0, column: 1).materialize() {
+        XCTAssertTrue(try leaf.cell(row: 1, column: 0).materialize(type: types[0]).isNull)
+        if case .text(let value) = try leaf.cell(row: 0, column: 1).materialize(type: types[1]) {
             XCTAssertEqual(value.utf8, [97, 98, 99])
         } else { XCTFail("wrong decoded value") }
     }
@@ -57,8 +57,8 @@ final class PackedPageTests: XCTestCase {
     func testBorrowedCellMaterializationKeepsFixedAndInlineExtents() throws {
         let integerBacking: [UInt8] = [0xff, 0x80, 0, 0, 42, 0xee]
         let textBacking: [UInt8] = [0xff, 0, 0, 3, 97, 98, 99, 0xee]
-        guard case .integer(let number) = try StoredCell(bytes: integerBacking[1..<5], type: integer).materialize(),
-              case .text(let value) = try StoredCell(bytes: textBacking[1..<7], type: text).materialize() else {
+        guard case .integer(let number) = try StoredCell(bytes: integerBacking[1..<5], type: integer).materialize(type: integer),
+              case .text(let value) = try StoredCell(bytes: textBacking[1..<7], type: text).materialize(type: text) else {
             return XCTFail("wrong decoded cell values")
         }
         XCTAssertEqual(number, 42)
@@ -66,18 +66,18 @@ final class PackedPageTests: XCTestCase {
         for (type, backing) in [(integer, integerBacking), (text, textBacking)] {
             let end = backing.count - 1
             for cut in 1..<end {
-                XCTAssertThrowsError(try StoredCell(bytes: backing[1..<cut], type: type).materialize()) {
+                XCTAssertThrowsError(try StoredCell(bytes: backing[1..<cut], type: type).materialize(type: type)) {
                     XCTAssertEqual(($0 as? JedError)?.code, "XX001")
                 }
             }
-            XCTAssertThrowsError(try StoredCell(bytes: backing[1...], type: type).materialize()) {
+            XCTAssertThrowsError(try StoredCell(bytes: backing[1...], type: type).materialize(type: type)) {
                 XCTAssertEqual(($0 as? JedError)?.code, "XX001")
             }
         }
-        XCTAssertTrue(try StoredCell(bytes: nil, type: text).materialize().isNull)
+        XCTAssertTrue(try StoredCell(bytes: nil, type: text).materialize(type: text).isNull)
         // Leaf NULLs have no bytes; the single-value NULL tag is not a leaf cell.
         let taggedNull: [UInt8] = [0xff, 1, 0xee]
-        XCTAssertThrowsError(try StoredCell(bytes: taggedNull[1..<2], type: text).materialize()) {
+        XCTAssertThrowsError(try StoredCell(bytes: taggedNull[1..<2], type: text).materialize(type: text)) {
             XCTAssertEqual(($0 as? JedError)?.code, "XX001")
         }
     }

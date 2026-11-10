@@ -1,38 +1,205 @@
 /// Plans retain static metadata and packed storage roots. Scan execution owns a
 /// bounded tree cursor and decodes only the statement's touched columns.
 internal struct SelectPlan {
-    var columns: [ResultColumn]
-    var projections: [ResolvedExpression]
-    var predicate: ResolvedExpression?
-    var store: TableStore?
-    var touched: [Int]
-    var parameters: [TypeDescriptor]
-    let limit: Int64?
-    let offset: Int64
-    var offsetPresent = false
-    let order: [ResolvedOrderTerm]
-    var orderedByScan: Bool
-    var descending: Bool
-    var scan: BaseScanPlan
-    var aggregation: AggregateQueryPlan? = nil
-    var compound: CompoundQueryPlan? = nil
-    var relation: RelationPlan? = nil
-    var productionCharge = true
-    var distinct = false
-    var window: WindowQueryPlan? = nil
-    var withQuery: WithQueryPlan? = nil
-    var materializeSource = false
-    var distinctOn: DistinctOnPlan? = nil
-    var sourceDomain: SQLText? = nil
-    var sourceSnapshot: DomainSnapshot? = nil
-    var sourceTable: CatalogTable? = nil
-    var profileIdentity = QueryProfileIdentity()
-    var profilesRoot = true
-    var accessCandidates: [ScanCandidate]? = nil
-    var chosenAccess: ScanCandidate? = nil
-    var chosenJoin: JoinAccessPlan? = nil
-    var chosenNWay: NWayAccessPlan? = nil
-    var completePredicate: ResolvedExpression? = nil
+    /// Stored fields live in one copy-on-write box, so passing this value
+    /// around costs one retain instead of a field-by-field copy.
+    private final class Storage {
+        var columns: [ResultColumn]
+        var projections: [ResolvedExpression]
+        var predicate: ResolvedExpression?
+        var store: TableStore?
+        var touched: [Int]
+        var parameters: [TypeDescriptor]
+        var limit: Int64?
+        var offset: Int64
+        var offsetPresent: Bool
+        var order: [ResolvedOrderTerm]
+        var orderedByScan: Bool
+        var descending: Bool
+        var scan: BaseScanPlan
+        var aggregation: AggregateQueryPlan?
+        var compound: CompoundQueryPlan?
+        var relation: RelationPlan?
+        var productionCharge: Bool
+        var distinct: Bool
+        var window: WindowQueryPlan?
+        var withQuery: WithQueryPlan?
+        var materializeSource: Bool
+        var distinctOn: DistinctOnPlan?
+        var sourceDomain: SQLText?
+        var sourceSnapshot: DomainSnapshot?
+        var sourceTable: CatalogTable?
+        var profileIdentity: QueryProfileIdentity
+        var profilesRoot: Bool
+        var accessCandidates: [ScanCandidate]?
+        var chosenAccess: ScanCandidate?
+        var chosenJoin: JoinAccessPlan?
+        var chosenNWay: NWayAccessPlan?
+        var completePredicate: ResolvedExpression?
+        init(columns: [ResultColumn], projections: [ResolvedExpression], predicate: ResolvedExpression?, store: TableStore?, touched: [Int], parameters: [TypeDescriptor], limit: Int64?, offset: Int64, offsetPresent: Bool, order: [ResolvedOrderTerm], orderedByScan: Bool, descending: Bool, scan: BaseScanPlan, aggregation: AggregateQueryPlan?, compound: CompoundQueryPlan?, relation: RelationPlan?, productionCharge: Bool, distinct: Bool, window: WindowQueryPlan?, withQuery: WithQueryPlan?, materializeSource: Bool, distinctOn: DistinctOnPlan?, sourceDomain: SQLText?, sourceSnapshot: DomainSnapshot?, sourceTable: CatalogTable?, profileIdentity: QueryProfileIdentity, profilesRoot: Bool, accessCandidates: [ScanCandidate]?, chosenAccess: ScanCandidate?, chosenJoin: JoinAccessPlan?, chosenNWay: NWayAccessPlan?, completePredicate: ResolvedExpression?) {
+            self.columns = columns
+            self.projections = projections
+            self.predicate = predicate
+            self.store = store
+            self.touched = touched
+            self.parameters = parameters
+            self.limit = limit
+            self.offset = offset
+            self.offsetPresent = offsetPresent
+            self.order = order
+            self.orderedByScan = orderedByScan
+            self.descending = descending
+            self.scan = scan
+            self.aggregation = aggregation
+            self.compound = compound
+            self.relation = relation
+            self.productionCharge = productionCharge
+            self.distinct = distinct
+            self.window = window
+            self.withQuery = withQuery
+            self.materializeSource = materializeSource
+            self.distinctOn = distinctOn
+            self.sourceDomain = sourceDomain
+            self.sourceSnapshot = sourceSnapshot
+            self.sourceTable = sourceTable
+            self.profileIdentity = profileIdentity
+            self.profilesRoot = profilesRoot
+            self.accessCandidates = accessCandidates
+            self.chosenAccess = chosenAccess
+            self.chosenJoin = chosenJoin
+            self.chosenNWay = chosenNWay
+            self.completePredicate = completePredicate
+        }
+        func copy() -> Storage {
+            Storage(columns: columns, projections: projections, predicate: predicate, store: store, touched: touched, parameters: parameters, limit: limit, offset: offset, offsetPresent: offsetPresent, order: order, orderedByScan: orderedByScan, descending: descending, scan: scan, aggregation: aggregation, compound: compound, relation: relation, productionCharge: productionCharge, distinct: distinct, window: window, withQuery: withQuery, materializeSource: materializeSource, distinctOn: distinctOn, sourceDomain: sourceDomain, sourceSnapshot: sourceSnapshot, sourceTable: sourceTable, profileIdentity: profileIdentity, profilesRoot: profilesRoot, accessCandidates: accessCandidates, chosenAccess: chosenAccess, chosenJoin: chosenJoin, chosenNWay: chosenNWay, completePredicate: completePredicate)
+        }
+    }
+    private var storage: Storage
+    @inline(__always) private mutating func unique() {
+        if !isKnownUniquelyReferenced(&storage) { storage = storage.copy() }
+    }
+    init(columns: [ResultColumn], projections: [ResolvedExpression], predicate: ResolvedExpression? = nil, store: TableStore? = nil, touched: [Int], parameters: [TypeDescriptor], limit: Int64?, offset: Int64, offsetPresent: Bool = false, order: [ResolvedOrderTerm], orderedByScan: Bool, descending: Bool, scan: BaseScanPlan, aggregation: AggregateQueryPlan? = nil, compound: CompoundQueryPlan? = nil, relation: RelationPlan? = nil, productionCharge: Bool = true, distinct: Bool = false, window: WindowQueryPlan? = nil, withQuery: WithQueryPlan? = nil, materializeSource: Bool = false, distinctOn: DistinctOnPlan? = nil, sourceDomain: SQLText? = nil, sourceSnapshot: DomainSnapshot? = nil, sourceTable: CatalogTable? = nil, profileIdentity: QueryProfileIdentity = QueryProfileIdentity(), profilesRoot: Bool = true, accessCandidates: [ScanCandidate]? = nil, chosenAccess: ScanCandidate? = nil, chosenJoin: JoinAccessPlan? = nil, chosenNWay: NWayAccessPlan? = nil, completePredicate: ResolvedExpression? = nil) {
+        storage = Storage(columns: columns, projections: projections, predicate: predicate, store: store, touched: touched, parameters: parameters, limit: limit, offset: offset, offsetPresent: offsetPresent, order: order, orderedByScan: orderedByScan, descending: descending, scan: scan, aggregation: aggregation, compound: compound, relation: relation, productionCharge: productionCharge, distinct: distinct, window: window, withQuery: withQuery, materializeSource: materializeSource, distinctOn: distinctOn, sourceDomain: sourceDomain, sourceSnapshot: sourceSnapshot, sourceTable: sourceTable, profileIdentity: profileIdentity, profilesRoot: profilesRoot, accessCandidates: accessCandidates, chosenAccess: chosenAccess, chosenJoin: chosenJoin, chosenNWay: chosenNWay, completePredicate: completePredicate)
+    }
+    var columns: [ResultColumn] {
+        get { storage.columns }
+        _modify { unique(); yield &storage.columns }
+    }
+    var projections: [ResolvedExpression] {
+        get { storage.projections }
+        _modify { unique(); yield &storage.projections }
+    }
+    var predicate: ResolvedExpression? {
+        get { storage.predicate }
+        _modify { unique(); yield &storage.predicate }
+    }
+    var store: TableStore? {
+        get { storage.store }
+        _modify { unique(); yield &storage.store }
+    }
+    var touched: [Int] {
+        get { storage.touched }
+        _modify { unique(); yield &storage.touched }
+    }
+    var parameters: [TypeDescriptor] {
+        get { storage.parameters }
+        _modify { unique(); yield &storage.parameters }
+    }
+    var limit: Int64? { storage.limit }
+    var offset: Int64 { storage.offset }
+    var offsetPresent: Bool {
+        get { storage.offsetPresent }
+        _modify { unique(); yield &storage.offsetPresent }
+    }
+    var order: [ResolvedOrderTerm] { storage.order }
+    var orderedByScan: Bool {
+        get { storage.orderedByScan }
+        _modify { unique(); yield &storage.orderedByScan }
+    }
+    var descending: Bool {
+        get { storage.descending }
+        _modify { unique(); yield &storage.descending }
+    }
+    var scan: BaseScanPlan {
+        get { storage.scan }
+        _modify { unique(); yield &storage.scan }
+    }
+    var aggregation: AggregateQueryPlan? {
+        get { storage.aggregation }
+        _modify { unique(); yield &storage.aggregation }
+    }
+    var compound: CompoundQueryPlan? {
+        get { storage.compound }
+        _modify { unique(); yield &storage.compound }
+    }
+    var relation: RelationPlan? {
+        get { storage.relation }
+        _modify { unique(); yield &storage.relation }
+    }
+    var productionCharge: Bool {
+        get { storage.productionCharge }
+        _modify { unique(); yield &storage.productionCharge }
+    }
+    var distinct: Bool {
+        get { storage.distinct }
+        _modify { unique(); yield &storage.distinct }
+    }
+    var window: WindowQueryPlan? {
+        get { storage.window }
+        _modify { unique(); yield &storage.window }
+    }
+    var withQuery: WithQueryPlan? {
+        get { storage.withQuery }
+        _modify { unique(); yield &storage.withQuery }
+    }
+    var materializeSource: Bool {
+        get { storage.materializeSource }
+        _modify { unique(); yield &storage.materializeSource }
+    }
+    var distinctOn: DistinctOnPlan? {
+        get { storage.distinctOn }
+        _modify { unique(); yield &storage.distinctOn }
+    }
+    var sourceDomain: SQLText? {
+        get { storage.sourceDomain }
+        _modify { unique(); yield &storage.sourceDomain }
+    }
+    var sourceSnapshot: DomainSnapshot? {
+        get { storage.sourceSnapshot }
+        _modify { unique(); yield &storage.sourceSnapshot }
+    }
+    var sourceTable: CatalogTable? {
+        get { storage.sourceTable }
+        _modify { unique(); yield &storage.sourceTable }
+    }
+    var profileIdentity: QueryProfileIdentity {
+        get { storage.profileIdentity }
+        _modify { unique(); yield &storage.profileIdentity }
+    }
+    var profilesRoot: Bool {
+        get { storage.profilesRoot }
+        _modify { unique(); yield &storage.profilesRoot }
+    }
+    var accessCandidates: [ScanCandidate]? {
+        get { storage.accessCandidates }
+        _modify { unique(); yield &storage.accessCandidates }
+    }
+    var chosenAccess: ScanCandidate? {
+        get { storage.chosenAccess }
+        _modify { unique(); yield &storage.chosenAccess }
+    }
+    var chosenJoin: JoinAccessPlan? {
+        get { storage.chosenJoin }
+        _modify { unique(); yield &storage.chosenJoin }
+    }
+    var chosenNWay: NWayAccessPlan? {
+        get { storage.chosenNWay }
+        _modify { unique(); yield &storage.chosenNWay }
+    }
+    var completePredicate: ResolvedExpression? {
+        get { storage.completePredicate }
+        _modify { unique(); yield &storage.completePredicate }
+    }
     var keyEvaluationOrder: [Int] { distinctOn?.evaluationOrder ?? Array(order.indices) }
 
     var expressions: [ResolvedExpression] { QueryExpressions.collect(.query(self), folding: false) }
@@ -346,13 +513,16 @@ internal struct SelectPlan {
 /// demand-fault backstop for a column missed by a static touched-set collector.
 internal final class ScanRecord {
     let record: PackedRecord
+    let types: [TypeDescriptor]
     let pager: Pager?
     private var values: [Int: SQLValue] = [:]
-    init(_ record: PackedRecord, pager: Pager?) { self.record = record; self.pager = pager }
+    init(_ record: PackedRecord, types: [TypeDescriptor], pager: Pager?) {
+        self.record = record; self.types = types; self.pager = pager
+    }
     func value(_ column: Int) throws -> SQLValue {
         guard record.cells.indices.contains(column) else { throw JedError("XX000", "resolved column is outside the row") }
         if let value = values[column] { return value }
-        let value = try record.materialize(column: column, pager: pager)
+        let value = try record.materialize(column: column, type: types[column], pager: pager)
         values[column] = value; return value
     }
 }
@@ -555,7 +725,7 @@ internal final class SelectExecution {
             if let predicate = plan.predicate, !input.predicateApplied {
                 if let index = rawIndex, let ahead = readAhead, let batch = filterBatch {
                     try batch.setRow(index, count: ahead.rows.count, context: rowContext) { r, c in
-                        r == index ? row[c] : try Self.prefetch(ahead.rows[r], column: c)
+                        r == index ? row[c] : try Self.prefetch(ahead.rows[r], column: c, types: self.plan.store?.tree.types ?? [])
                     }
                     rowContext.hostBatch = batch
                 }
@@ -567,7 +737,7 @@ internal final class SelectExecution {
             if let batch = projectionBatch {
                 if let index = rawIndex, let ahead = readAhead {
                     try batch.setRow(index, count: ahead.rows.count, context: rowContext) { r, c in
-                        r == index ? row[c] : try Self.prefetch(ahead.rows[r], column: c)
+                        r == index ? row[c] : try Self.prefetch(ahead.rows[r], column: c, types: self.plan.store?.tree.types ?? [])
                     }
                     rowContext.hostBatch = batch
                 } else if let window = input.hostBatchWindow {
@@ -589,11 +759,12 @@ internal final class SelectExecution {
         guard let outer = hostBatchRemaining?() else { return own }
         return own.map { min($0, outer) } ?? outer
     }
-    private static func prefetch(_ record: PackedRecord, column: Int) throws -> SQLValue? {
-        guard record.cells.indices.contains(column), record.overflows[column] == nil else { return nil }
+    private static func prefetch(_ record: PackedRecord, column: Int, types: [TypeDescriptor]) throws -> SQLValue? {
+        guard record.cells.indices.contains(column), types.indices.contains(column),
+              record.overflows[column] == nil else { return nil }
         let cell = record.cells[column]
         guard cell.isNull || cell.fixedWidth != nil || cell.bytes?.first == 0 else { return nil }
-        return try cell.materialize()
+        return try cell.materialize(type: types[column])
     }
     func close() {
         bufferedScan = nil

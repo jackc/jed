@@ -17,7 +17,7 @@ internal enum TreeChild: Sendable {
 /// placeholder cells, indexed by row and then declared column ordinal.
 internal final class TreeNode: Sendable {
     let leaf: PackedLeaf?
-    private let recordLeaf: RecordLeaf?
+    let recordLeaf: RecordLeaf?
     let pending: [Int: [Int: PendingOverflow]]
     let keys: [[UInt8]]
     let children: [TreeChild]
@@ -53,6 +53,28 @@ internal final class TreeNode: Sendable {
         containsRecords = children.contains { $0.containsRecords }
     }
 
+    /// Column descriptors of a non-empty leaf.
+    var types: [TypeDescriptor] { leaf?.types ?? recordLeaf?.types ?? [] }
+
+    /// Same keys with one child replaced: sizes follow from the old node, so
+    /// nothing is re-measured across the whole fan-out.
+    init(replacing index: Int, in node: TreeNode, with child: TreeNode) {
+        leaf = nil; recordLeaf = nil; pending = [:]; keys = node.keys; reference = nil
+        var children = node.children
+        let old = children[index]
+        children[index] = .resident(child)
+        self.children = children
+        payloadSize = node.payloadSize; height = node.height
+        nodeCount = node.nodeCount - old.nodeCount + child.nodeCount
+        containsRecords = child.containsRecords || (node.containsRecords && children.contains { $0.containsRecords })
+    }
+
+    /// The writer-record form of this leaf, or nil for an empty placeholder.
+    func writerLeaf() -> RecordLeaf? {
+        if let recordLeaf { return recordLeaf }
+        return leaf.map { RecordLeaf(adopting: $0, pending: pending) }
+    }
+
     func record(at index: Int) -> PackedRecord {
         if let recordLeaf { return recordLeaf.records[index] }
         let record = leaf!.record(at: index)
@@ -71,6 +93,19 @@ internal final class TreeNode: Sendable {
         return recordLeaf!.records[row].cells[column]
     }
 
+    func isNull(row: Int, column: Int) -> Bool {
+        if let leaf { return leaf.isNull(row: row, column: column) }
+        return recordLeaf!.records[row].cells[column].isNull
+    }
+
+    /// Negative when the stored key at `index` sorts before `key`.
+    func compareKey(at index: Int, with key: [UInt8]) -> Int {
+        if let leaf { return leaf.compareKey(at: index, with: key) }
+        let stored = recordLeaf!.records[index].key
+        if stored == key { return 0 }
+        return stored.lexicographicallyPrecedes(key) ? -1 : 1
+    }
+
     func childSlot(_ key: [UInt8]) -> Int {
         var lower = 0, upper = keys.count
         while lower < upper {
@@ -85,10 +120,10 @@ internal final class TreeNode: Sendable {
         var lower = 0, upper = entryCount
         while lower < upper {
             let middle = lower + (upper - lower) / 2
-            if self.key(at: middle).lexicographicallyPrecedes(key) { lower = middle + 1 }
+            if compareKey(at: middle, with: key) < 0 { lower = middle + 1 }
             else { upper = middle }
         }
-        return (lower, lower < entryCount && self.key(at: lower).elementsEqual(key))
+        return (lower, lower < entryCount && compareKey(at: lower, with: key) == 0)
     }
 }
 
@@ -207,15 +242,10 @@ internal struct BPlusTree: Sendable {
     mutating func insert(_ record: PackedRecord) throws -> PackedRecord? {
         // Page fit is a commit-preflight condition. Keep an unsplittable
         // pending node so its staged record still participates in Q3 admission.
-        guard record.cells.map(\.type) == types else {
-            throw JedError("0A000", "record differs from its tree's type contract")
-        }
+        // Cells carry no descriptor, so the tree's own metadata is always the
+        // decode contract. Admission checks the incoming record's shape once.
+        let canonical = try RecordLeaf.admit(record, types: types)
         guard count != Int64.max else { throw JedError("54000", "tree row count exhausted") }
-        // Composite equality is nominal. Retain the tree's current metadata,
-        // as reconstructing this record from a packed page would do.
-        let canonical = PackedRecord(key: record.key, cells: record.cells.enumerated().map {
-            StoredCell(bytes: $0.element.bytes, type: types[$0.offset])
-        }, overflows: record.overflows)
         let result: Rebuild
         var previous: PackedRecord?
         if let root { result = try inserting(resolve(root), record: canonical, previous: &previous) }
@@ -306,14 +336,25 @@ internal struct BPlusTree: Sendable {
 
     private func inserting(_ node: TreeNode, record: PackedRecord, previous: inout PackedRecord?) throws -> Rebuild {
         if node.isLeaf {
-            var records = node.records()
             let slot = node.leafSlot(record.key)
+            // One record changes: derive the new leaf from the old one rather
+            // than re-admitting and re-measuring every record it holds.
+            if let base = node.writerLeaf() {
+                if slot.found { previous = base.records[slot.index] }
+                let edited = try base.placing(record, at: slot.index, replacing: slot.found)
+                if edited.payloadSize <= codec.capacity { return .whole(TreeNode(records: edited)) }
+                return try buildLeaf(edited.records, edited: slot.index)
+            }
+            var records = node.records()
             if slot.found { previous = records[slot.index]; records[slot.index] = record }
             else { records.insert(record, at: slot.index) }
             return try buildLeaf(records, edited: slot.index)
         }
         let index = node.childSlot(record.key)
         let result = try inserting(resolve(node.children[index]), record: record, previous: &previous)
+        if case .whole(let child) = result {
+            return .whole(TreeNode(replacing: index, in: node, with: child))
+        }
         var keys = node.keys, children = node.children
         switch result {
         case .whole(let child): children[index] = .resident(child)
@@ -332,6 +373,9 @@ internal struct BPlusTree: Sendable {
         if node.isLeaf {
             let slot = node.leafSlot(key)
             guard slot.found else { return (node, nil) }
+            if let base = node.writerLeaf() {
+                return (TreeNode(records: base.removing(at: slot.index)), base.records[slot.index])
+            }
             var records = node.records()
             let old = records.remove(at: slot.index)
             return (try makeLeaf(records), old)
@@ -339,20 +383,19 @@ internal struct BPlusTree: Sendable {
         let index = node.childSlot(key)
         let (child, old) = try removing(resolve(node.children[index]), key: key)
         guard old != nil else { return (node, nil) }
-        var children = node.children; children[index] = .resident(child)
         // A zero-key interior has no sibling for its sole leaf. If that
         // descendant drains, carry the empty unary subtree upward until a
         // parent can remove its edge. Pulling a separator down into it would
         // otherwise retain an empty leaf after the degenerate split.
-        if !child.isLeaf, !child.containsRecords, children.count > 1 {
-            var keys = node.keys
+        if !child.isLeaf, !child.containsRecords, node.children.count > 1 {
+            var keys = node.keys, children = node.children
             children.remove(at: index)
             keys.remove(at: min(index, keys.count - 1))
             return (TreeNode(keys: keys, children: children, codec: codec), old)
         }
-        let parent = TreeNode(keys: node.keys, children: children, codec: codec)
-        guard child.payloadSize < codec.capacity / 2, children.count > 1 else { return (parent, old) }
-        let pair = index + 1 < children.count ? index : index - 1
+        let parent = TreeNode(replacing: index, in: node, with: child)
+        guard child.payloadSize < codec.capacity / 2, node.children.count > 1 else { return (parent, old) }
+        let pair = index + 1 < node.children.count ? index : index - 1
         return (try merge(parent, at: pair), old)
     }
 

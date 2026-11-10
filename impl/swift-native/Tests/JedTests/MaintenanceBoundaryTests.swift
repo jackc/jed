@@ -179,10 +179,11 @@ final class MaintenanceBoundaryTests: XCTestCase {
         XCTAssertEqual(afterCatalog.map(\.name), oldCatalog.map(\.name))
         XCTAssertEqual(afterCatalog.map(\.rowCount), oldCatalog.map(\.rowCount))
         for table in afterCatalog {
-            var cursor = try XCTUnwrap(database.core.storage.committed.tables[table.name]).cursor()
+            let stored = try XCTUnwrap(database.core.storage.committed.tables[table.name])
+            var cursor = stored.cursor()
             var count: Int64 = 0
             while let record = try cursor.next() {
-                for column in record.cells.indices { _ = try record.materialize(column: column, pager: database.core.storage.pager, pageCount: database.core.storage.pager.selected.meta.pageCount) }
+                for column in record.cells.indices { _ = try record.materialize(column: column, type: stored.tree.types[column], pager: database.core.storage.pager, pageCount: database.core.storage.pager.selected.meta.pageCount) }
                 count += 1
             }
             XCTAssertEqual(count, table.rowCount)

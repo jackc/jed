@@ -189,7 +189,7 @@ internal enum SimIntegrity {
             while let record = try cursor.next() {
                 guard previous.map({ $0.lexicographicallyPrecedes(record.key) }) ?? true else { throw violation("table storage keys are not strictly increasing") }
                 previous = record.key; count += 1
-                let values = try record.cells.indices.map { try record.materialize(column: $0, pager: pager, pageCount: pageCount) }
+                let values = try record.cells.indices.map { try record.materialize(column: $0, type: store.tree.types[$0], pager: pager, pageCount: pageCount) }
                 if !table.primaryKey.isEmpty {
                     var key: [UInt8] = []
                     for column in table.primaryKey {

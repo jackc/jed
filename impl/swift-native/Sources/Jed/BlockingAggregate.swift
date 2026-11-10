@@ -1,6 +1,11 @@
 /// Group keys, finite state and retained values have separate bounded owners.
 /// Rows fold globally in input order; only finalization visits groups in their
 /// first-occurrence order, so spilling cannot reorder errors or decimal work.
+/// The row a reused evaluation context currently reads.
+internal final class RowFrame {
+    var row: [SQLValue] = []
+}
+
 internal enum BlockingAggregate {
     static func columnSlot(_ index: Int, aggregate: AggregateQueryPlan) -> Int? {
         if index < 0 { return aggregate.keys.count + aggregate.calls.count - index - 1 }
@@ -75,9 +80,13 @@ internal enum BlockingAggregate {
         if members.isEmpty { try groups.put([], value: fresh(0)); try keys.append([]) }
         do {
             let cursor = try input.cursor(); defer { cursor.close() }
+            // One evaluation context serves every row; only the row it reads
+            // changes. Nothing below retains `current` past its iteration.
+            let frame = RowFrame()
+            var current = context; current.column = { frame.row[$0] }
             while let row = try cursor.next() {
                 try context.meter.checkpoint()
-                var current = context; current.column = { row[$0] }
+                frame.row = row
                 let key = members.map { row[aggregate.keyColumns[$0]] }
                 for value in key {
                     let bytes = MemorySizes.payload(value)

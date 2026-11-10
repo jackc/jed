@@ -252,7 +252,7 @@ extension CatalogDDL {
             var scan = originalStore.cursor(); defer { scan.close() }
             while let record = try scan.next() {
                 try context.meter.step(); context.meter.charge(1)
-                let row = ScanRecord(record, pager: originalStore.tree.pool?.pager)
+                let row = ScanRecord(record, types: originalStore.tree.types, pager: originalStore.tree.pool?.pager)
                 for (ordinal, name) in notNull where try row.value(ordinal).isNull {
                     throw JedError("23502", "column \(name) contains null values").object(table: table.name, column: name)
                 }

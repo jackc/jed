@@ -1,16 +1,63 @@
 /// Resolved expressions carry static types independently of their current value.
 /// A nil descriptor is an untyped SQL NULL/parameter, never an inferred row type.
+/// The fields live in one copy-on-write box: the evaluator, planner and plan
+/// caches copy expressions constantly, and a copy is then one retain rather
+/// than a field-by-field copy of descriptors and child nodes.
 internal struct ResolvedExpression {
-    var type: TypeDescriptor?
-    var node: Node
-    var position: Int
+    private final class Storage {
+        var type: TypeDescriptor?
+        var node: Node
+        var position: Int
+        var location: Int
+        var collation: CollationDerivation?
+        var nonimmutable: Bool
+        init(type: TypeDescriptor?, node: Node, position: Int, location: Int,
+             collation: CollationDerivation?, nonimmutable: Bool) {
+            self.type = type; self.node = node; self.position = position; self.location = location
+            self.collation = collation; self.nonimmutable = nonimmutable
+        }
+    }
+    private var storage: Storage
+    init(type: TypeDescriptor?, node: Node, position: Int, location: Int = 0,
+         collation: CollationDerivation? = nil, nonimmutable: Bool = false) {
+        storage = Storage(type: type, node: node, position: position, location: location,
+                          collation: collation, nonimmutable: nonimmutable)
+    }
+    private mutating func unique() -> Storage {
+        if !isKnownUniquelyReferenced(&storage) {
+            storage = Storage(type: storage.type, node: storage.node, position: storage.position,
+                location: storage.location, collation: storage.collation, nonimmutable: storage.nonimmutable)
+        }
+        return storage
+    }
+    var type: TypeDescriptor? {
+        get { storage.type }
+        set { unique().type = newValue }
+    }
+    var node: Node {
+        get { storage.node }
+        set { unique().node = newValue }
+    }
+    var position: Int {
+        get { storage.position }
+        set { unique().position = newValue }
+    }
     /// Start of the authored expression, distinct from its operator token.
-    var location: Int = 0
+    var location: Int {
+        get { storage.location }
+        set { unique().location = newValue }
+    }
     /// Cached query provenance; nil on a synthesized node derives from children.
-    var collation: CollationDerivation?
+    var collation: CollationDerivation? {
+        get { storage.collation }
+        set { unique().collation = newValue }
+    }
     /// Input folding can consume session state without retaining an operation
     /// node (notably offsetless timestamptz inside a container text literal).
-    var nonimmutable = false
+    var nonimmutable: Bool {
+        get { storage.nonimmutable }
+        set { unique().nonimmutable = newValue }
+    }
     var isConstant: Bool { if case .constant = node { return true }; return false }
     indirect enum Node {
         case constant(SQLValue), column(Int), parameter(Int)
@@ -45,7 +92,10 @@ internal struct ResolvedSubscript {
 }
 
 internal struct ExpressionContext {
-    var scalar: ScalarCasts.Context
+    // Row-varying and per-evaluation fields stay inline. Row loops copy a
+    // context and rebind `column` for every row, so everything else lives in
+    // one copy-on-write box below: such a copy retains a handful of
+    // references instead of every statement service.
     var column: (Int) throws -> SQLValue { didSet { hostBatchColumn = nil } }
     /// Only resident row owners install these peeks. Arbitrary column getters
     /// (including view expressions) may perform work and are never prefetched.
@@ -53,26 +103,102 @@ internal struct ExpressionContext {
     var parameters: [SQLValue]
     var meter: CostMeter
     var collatedKey: KeyEncoding.CollatedKey?
-    var functions = ScalarFunctions.Environment()
-    var sequences: SequenceExecution?
-    var patterns = PatternExecution()
     var outerRows: [(Int) throws -> SQLValue] = [] { didSet { hostBatchOuterRows = [] } }
     var hostBatchOuterRows: [((Int) -> SQLValue?)?] = []
-    var subqueries = SubqueryExecution()
-    var ctes: CTEExecution?
-    var writeScope: StatementWriteScope?
-    var executionProfile: ExecutionProfile?
-    var spill: SpillConfig?
-    var errorDetail: ErrorDetail?
-    var planningProbe: PlanningProbe?
     var hostBatch: HostBatch?
+    /// Stored fields live in one copy-on-write box, so passing this value
+    /// around costs one retain instead of a field-by-field copy.
+    private final class Storage {
+        var scalar: ScalarCasts.Context
+        var functions: ScalarFunctions.Environment
+        var sequences: SequenceExecution?
+        var patterns: PatternExecution
+        var subqueries: SubqueryExecution
+        var ctes: CTEExecution?
+        var writeScope: StatementWriteScope?
+        var executionProfile: ExecutionProfile?
+        var spill: SpillConfig?
+        var errorDetail: ErrorDetail?
+        var planningProbe: PlanningProbe?
+        var eagerSubqueries: Bool
+        init(scalar: ScalarCasts.Context, functions: ScalarFunctions.Environment, sequences: SequenceExecution?, patterns: PatternExecution, subqueries: SubqueryExecution, ctes: CTEExecution?, writeScope: StatementWriteScope?, executionProfile: ExecutionProfile?, spill: SpillConfig?, errorDetail: ErrorDetail?, planningProbe: PlanningProbe?, eagerSubqueries: Bool) {
+            self.scalar = scalar
+            self.functions = functions
+            self.sequences = sequences
+            self.patterns = patterns
+            self.subqueries = subqueries
+            self.ctes = ctes
+            self.writeScope = writeScope
+            self.executionProfile = executionProfile
+            self.spill = spill
+            self.errorDetail = errorDetail
+            self.planningProbe = planningProbe
+            self.eagerSubqueries = eagerSubqueries
+        }
+        func copy() -> Storage {
+            Storage(scalar: scalar, functions: functions, sequences: sequences, patterns: patterns, subqueries: subqueries, ctes: ctes, writeScope: writeScope, executionProfile: executionProfile, spill: spill, errorDetail: errorDetail, planningProbe: planningProbe, eagerSubqueries: eagerSubqueries)
+        }
+    }
+    private var storage: Storage
+    @inline(__always) private mutating func unique() {
+        if !isKnownUniquelyReferenced(&storage) { storage = storage.copy() }
+    }
+    var scalar: ScalarCasts.Context {
+        get { storage.scalar }
+        _modify { unique(); yield &storage.scalar }
+    }
+    var functions: ScalarFunctions.Environment {
+        get { storage.functions }
+        _modify { unique(); yield &storage.functions }
+    }
+    var sequences: SequenceExecution? {
+        get { storage.sequences }
+        _modify { unique(); yield &storage.sequences }
+    }
+    var patterns: PatternExecution {
+        get { storage.patterns }
+        _modify { unique(); yield &storage.patterns }
+    }
+    var subqueries: SubqueryExecution {
+        get { storage.subqueries }
+        _modify { unique(); yield &storage.subqueries }
+    }
+    var ctes: CTEExecution? {
+        get { storage.ctes }
+        _modify { unique(); yield &storage.ctes }
+    }
+    var writeScope: StatementWriteScope? {
+        get { storage.writeScope }
+        _modify { unique(); yield &storage.writeScope }
+    }
+    var executionProfile: ExecutionProfile? {
+        get { storage.executionProfile }
+        _modify { unique(); yield &storage.executionProfile }
+    }
+    var spill: SpillConfig? {
+        get { storage.spill }
+        _modify { unique(); yield &storage.spill }
+    }
+    var errorDetail: ErrorDetail? {
+        get { storage.errorDetail }
+        _modify { unique(); yield &storage.errorDetail }
+    }
+    var planningProbe: PlanningProbe? {
+        get { storage.planningProbe }
+        _modify { unique(); yield &storage.planningProbe }
+    }
     // Derived/CTE bodies execute surviving subqueries at expression evaluation.
-    var eagerSubqueries = true
-
+    var eagerSubqueries: Bool {
+        get { storage.eagerSubqueries }
+        _modify { unique(); yield &storage.eagerSubqueries }
+    }
     init(meter: CostMeter, timezone: SQLTimeZone = .utc, statementMicros: Int64? = nil,
          parameters: [SQLValue] = [], column: @escaping (Int) throws -> SQLValue = { _ in throw JedError("XX000", "missing expression row") }) {
         self.meter = meter
-        scalar = ScalarCasts.Context(timezone: timezone, statementMicros: statementMicros, meter: meter)
+        storage = Storage(scalar: ScalarCasts.Context(timezone: timezone, statementMicros: statementMicros, meter: meter),
+            functions: ScalarFunctions.Environment(), sequences: nil, patterns: PatternExecution(),
+            subqueries: SubqueryExecution(), ctes: nil, writeScope: nil, executionProfile: nil, spill: nil,
+            errorDetail: nil, planningProbe: nil, eagerSubqueries: true)
         self.parameters = parameters; self.column = column
     }
 
@@ -93,7 +219,7 @@ internal struct ExpressionContext {
     /// the row before visiting the right child; value expressions retain 3VL.
     func matches(_ expression: ResolvedExpression) throws -> Bool {
         if case .binary(let operation, let left, let right, _) = expression.node {
-            if operation == "and" {
+            if Self.operatorCode(operation) == 1 {
                 meter.charge(1); try meter.step()
                 guard try matches(left) else { return false }
                 return try matches(right)
@@ -104,7 +230,8 @@ internal struct ExpressionContext {
     }
 
     func evaluate(_ expression: ResolvedExpression) throws -> SQLValue {
-        switch expression.node {
+        let node = expression.node
+        switch node {
         case .constant(let value): return value
         case .column(let index): return try column(index)
         case .outerColumn(let reference):
@@ -116,16 +243,17 @@ internal struct ExpressionContext {
             return parameters[index - 1]
         case .convert(let source, let target):
             return try convert(evaluate(source), from: source.type?.type, to: target)
+        case .binary(let op, let left, let right, _):
+            meter.charge(1); try meter.step()
+            return try evaluateBinary(op, left, right, expression)
         case .call(let function): meter.charge(function.cost); try meter.step()
         default: meter.charge(1); try meter.step()
         }
-        switch expression.node {
+        switch node {
         case .currentTimestamp, .currentDate, .dateInput:
             return try evaluateState(expression)
         case .cast, .unary:
             return try evaluateUnary(expression)
-        case .binary:
-            return try evaluateBinary(expression)
         case .isNull, .distinct:
             return try evaluatePredicate(expression)
         case .conditional, .coalesce, .extreme, .nullif:
@@ -134,7 +262,7 @@ internal struct ExpressionContext {
             return try evaluateContainer(expression)
         case .json, .pattern, .call:
             return try evaluateDelegated(expression)
-        case .constant, .column, .parameter, .convert, .outerColumn, .subquery: throw JedError("XX000", "invalid expression dispatch")
+        case .constant, .column, .parameter, .convert, .outerColumn, .subquery, .binary: throw JedError("XX000", "invalid expression dispatch")
         }
     }
 
@@ -181,30 +309,109 @@ internal struct ExpressionContext {
         }
     }
 
-    private func evaluateBinary(_ expression: ResolvedExpression) throws -> SQLValue {
-        switch expression.node {
-        case .binary(let op, let left, let right, let operandType):
-            let a = try evaluate(left)
-            if op == "and", case .boolean(false) = a { return .boolean(false) }
-            if op == "or", case .boolean(true) = a { return .boolean(true) }
-            let b = try evaluate(right)
-            if op == "and" {
-                if case .boolean(false) = b { return .boolean(false) }
-                return a.isNull || b.isNull ? .null : .boolean(true)
+    /// Operators are resolved strings. Comparing Swift strings that differ
+    /// takes the slow Unicode path, so classify the UTF-8 bytes once instead.
+    /// 0 other, 1 and, 2 or, 3 =, 4 <>, 5 <, 6 <=, 7 >, 8 >=,
+    /// 9 +, 10 -, 11 *, 12 /, 13 %, 14 &, 15 |, 16 #.
+    @inline(__always)
+    private static func operatorCode(_ op: String) -> Int {
+        let utf8 = op.utf8, count = utf8.count
+        guard count >= 1, count <= 3 else { return 0 }
+        let first = utf8[utf8.startIndex]
+        if count == 1 {
+            switch first {
+            case 61: return 3
+            case 60: return 5
+            case 62: return 7
+            case 43: return 9
+            case 45: return 10
+            case 42: return 11
+            case 47: return 12
+            case 37: return 13
+            case 38: return 14
+            case 124: return 15
+            case 35: return 16
+            default: return 0
             }
-            if op == "or" {
-                if case .boolean(true) = b { return .boolean(true) }
-                return a.isNull || b.isNull ? .null : .boolean(false)
-            }
-            if ["=", "<>", "<", "<=", ">", ">="].contains(op) {
-                try comparisonWork(op, a, b, type: operandType)
-                return try ValueComparison.sql(op, a, b, type: operandType, collatedKey: collatedKey)
-            }
-            if a.isNull || b.isNull { return .null }
-            return try arithmetic(op, a, b, type: operandType,
-                constant: FunctionResolver.isConstant(left) && FunctionResolver.isConstant(right))
-        default: throw JedError("XX000", "invalid expression evaluator dispatch")
         }
+        let second = utf8[utf8.index(after: utf8.startIndex)]
+        if count == 2 {
+            if first == 60 { return second == 62 ? 4 : (second == 61 ? 6 : 0) }
+            if first == 62 { return second == 61 ? 8 : 0 }
+            return first == 111 && second == 114 ? 2 : 0
+        }
+        return first == 97 && second == 110 && utf8[utf8.index(utf8.startIndex, offsetBy: 2)] == 100 ? 1 : 0
+    }
+
+    /// The operand descriptor is copied out of the node only on the paths
+    /// that consult it; integer comparisons never do.
+    private func evaluateBinary(_ op: String, _ left: ResolvedExpression, _ right: ResolvedExpression,
+                                _ expression: ResolvedExpression) throws -> SQLValue {
+        let code = Self.operatorCode(op)
+        let a = try evaluate(left)
+        if code == 1, case .boolean(false) = a { return .boolean(false) }
+        if code == 2, case .boolean(true) = a { return .boolean(true) }
+        let b = try evaluate(right)
+        if code == 1 {
+            if case .boolean(false) = b { return .boolean(false) }
+            return a.isNull || b.isNull ? .null : .boolean(true)
+        }
+        if code == 2 {
+            if case .boolean(true) = b { return .boolean(true) }
+            return a.isNull || b.isNull ? .null : .boolean(false)
+        }
+        if code >= 3 && code <= 8 {
+            // Integer pairs charge no comparison work and order exactly
+            // as ValueComparison.total orders them.
+            if case .integer(let x) = a, case .integer(let y) = b {
+                switch code {
+                case 3: return .boolean(x == y)
+                case 4: return .boolean(x != y)
+                case 5: return .boolean(x < y)
+                case 6: return .boolean(x <= y)
+                case 7: return .boolean(x > y)
+                default: return .boolean(x >= y)
+                }
+            }
+            guard case .binary(_, _, _, let operandType) = expression.node else {
+                throw JedError("XX000", "invalid expression evaluator dispatch")
+            }
+            try comparisonWork(op, a, b, type: operandType)
+            return try ValueComparison.sql(op, a, b, type: operandType, collatedKey: collatedKey)
+        }
+        if a.isNull || b.isNull { return .null }
+        guard case .binary(_, _, _, let operandType) = expression.node else {
+            throw JedError("XX000", "invalid expression evaluator dispatch")
+        }
+        if code >= 9, case .integer(let x) = a, case .integer(let y) = b, case .scalar(let width) = operandType.type,
+           width == .i16 || width == .i32 || width == .i64 {
+            return try Self.integerArithmetic(code, x, y, width: width)
+        }
+        return try arithmetic(op, a, b, type: operandType,
+            constant: FunctionResolver.isConstant(left) && FunctionResolver.isConstant(right))
+    }
+
+    /// The integer arm of `arithmetic`, dispatched by operator code. Integer
+    /// operands of an integer-typed operator reach no earlier arm there.
+    private static func integerArithmetic(_ code: Int, _ x: Int64, _ y: Int64, width: ScalarType) throws -> SQLValue {
+        let value: Int64
+        switch code {
+        case 9, 10, 11:
+            let result = code == 9 ? x.addingReportingOverflow(y) : code == 10 ? x.subtractingReportingOverflow(y) : x.multipliedReportingOverflow(by: y)
+            guard !result.overflow else { throw JedError("22003", "\(width.name) out of range").withDataType(width.name) }
+            value = result.partialValue
+        case 12, 13:
+            guard y != 0 else { throw JedError("22012", "division by zero") }
+            if code == 13 && y == -1 { value = 0 }
+            else {
+                guard x != .min || y != -1 else { throw JedError("22003", "\(width.name) out of range").withDataType(width.name) }
+                value = code == 12 ? x / y : x % y
+            }
+        case 14: value = x & y
+        case 15: value = x | y
+        default: value = x ^ y
+        }
+        return .integer(try ScalarCasts.checkedInteger(value, type: width))
     }
 
     private func evaluatePredicate(_ expression: ResolvedExpression) throws -> SQLValue {

@@ -77,7 +77,7 @@ internal extension IntegrityChecker {
                     try poll(); report.rows += 1
                     let key = keys[row]
                     do {
-                        let values = try decodeRow(leaf.record(at: row), object: object, page: reference.index)
+                        let values = try decodeRow(leaf.record(at: row), types: leaf.types, object: object, page: reference.index)
                         if !table.primaryKey.isEmpty {
                             do {
                                 let context = try freshContext()
@@ -117,7 +117,7 @@ internal extension IntegrityChecker {
                 for ordinal in 0..<leaf.count {
                     try poll()
                     let record = leaf.record(at: ordinal)
-                    let values = try record.cells.map { try $0.materialize(pager: pager, pageCount: meta.pageCount) }
+                    let values = try record.cells.indices.map { try record.cells[$0].materialize(type: types[$0], pager: pager, pageCount: meta.pageCount) }
                     try consume(record.key, values)
                 }
             } else if bytes[0] == 3 {
@@ -126,12 +126,12 @@ internal extension IntegrityChecker {
         }
         if root.index != 0 { try visit(root, depth: 0) }
     }
-    func decodeRow(_ record: PackedRecord, object: SQLText, page: UInt32) throws -> [SQLValue] {
+    func decodeRow(_ record: PackedRecord, types: [TypeDescriptor], object: SQLText, page: UInt32) throws -> [SQLValue] {
         var values: [SQLValue] = []
-        for cell in record.cells {
+        for (column, cell) in record.cells.enumerated() {
             let external = cell.fixedWidth == nil && (cell.bytes?.first == 2 || cell.bytes?.first == 4)
             do {
-                if !external { values.append(try cell.materialize()); continue }
+                if !external { values.append(try cell.materialize(type: types[column])); continue }
                 let bytes = cell.bytes!, compressed = bytes.first == 4
                 var reader = ByteReader(bytes); _ = try reader.u8()
                 let reference = try reader.u32(), length = Int(try reader.u32())
@@ -157,7 +157,7 @@ internal extension IntegrityChecker {
                     current = PageReference(next, tag: tag)
                 }
                 let raw = compressed ? try LZ4.decompress(output, rawLength: rawLength) : output
-                values.append(try ValueCodec.decodeRawBody(raw, type: cell.type))
+                values.append(try ValueCodec.decodeRawBody(raw, type: types[column]))
             } catch let error as JedError where error.code == "XX001" {
                 try add(external ? "overflow_chain_corrupt" : "value_undecodable", object, page: page, key: record.key, error.message)
                 throw IntegrityStop.unreadable

@@ -262,7 +262,7 @@ internal enum BlockingJoinRows {
                 func accept(_ record: PackedRecord) throws {
                     try context.meter.step(); context.meter.charge(1)
                     var row = Array(repeating: SQLValue.null, count: input.relation.columns.count)
-                    for column in mask { row[column] = try record.materialize(column: column, pager: store.tree.pool?.pager) }
+                    for column in mask { row[column] = try record.materialize(column: column, type: store.tree.types[column], pager: store.tree.pool?.pager) }
                     if let predicate = input.relation.scanFilter {
                         var current = context; current.column = { row[$0] }
                         if try !current.matches(predicate) { return }

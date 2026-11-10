@@ -95,7 +95,7 @@ internal struct ExclusionValidation {
                 if let key = try validation.existing(probe, snapshot: snapshot, vacated: vacated) {
                     var other: [SQLValue]?
                     if let store = snapshot.tables[table.name], let record = try? store.get(key) {
-                        let row = ScanRecord(record, pager: store.tree.pool?.pager)
+                        let row = ScanRecord(record, types: store.tree.types, pager: store.tree.pool?.pager)
                         other = try? definition.elements.map { try row.value($0.column) }
                     }
                     throw validation.violation(probe, other: other)

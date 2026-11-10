@@ -62,7 +62,7 @@ final class RecordLeafBoundaryTests: XCTestCase {
             try opened.insert(replacement)
             packed.close(); pool.invalidateAll()
             check(try position.materialize(0, pager: nil), .integer(42))
-            check(try XCTUnwrap(opened.get([1])).materialize(column: 0), .integer(99))
+            check(try XCTUnwrap(opened.get([1])).materialize(column: 0, type: types[0]), .integer(99))
         }
     }
 
@@ -86,7 +86,7 @@ final class RecordLeafBoundaryTests: XCTestCase {
             XCTAssertTrue(store.revision === revision)
             XCTAssertEqual(store.count, saved.count)
             XCTAssertEqual(store.pendingBytes, saved.pendingBytes)
-            check(try XCTUnwrap(store.get([1])).materialize(column: 0), .integer(42))
+            check(try XCTUnwrap(store.get([1])).materialize(column: 0, type: types[0]), .integer(42))
         }
         cursor.close()
         check(try position.materialize(1, pager: nil), .text(try SQLText("old")))
@@ -111,8 +111,7 @@ final class RecordLeafBoundaryTests: XCTestCase {
             var tree = BPlusTree(codec: codec, types: [type])
             try tree.insert(PackedRecord(key: [1], cells: [StoredCell(bytes: bytes[...], type: oldType)]))
             let stored = try XCTUnwrap(tree.get([1])).cells[0]
-            XCTAssertEqual(stored.type.type.name, type.type.name)
-            XCTAssertEqual(try ValueCodec.encode(stored.materialize(), type: type), bytes)
+            XCTAssertEqual(try ValueCodec.encode(stored.materialize(type: type), type: type), bytes)
         }
     }
 
@@ -133,7 +132,7 @@ final class RecordLeafBoundaryTests: XCTestCase {
         try store.remove([1]); cursor.close()
         XCTAssertEqual(store.pendingBytes, 0)
         check(try position.materialize(0, pager: nil), .bytea(raw))
-        check(try XCTUnwrap(saved.get([1])).materialize(column: 0), .bytea(raw))
+        check(try XCTUnwrap(saved.get([1])).materialize(column: 0, type: type), .bytea(raw))
         XCTAssertEqual(saved.pendingBytes, try TableStore.footprint(original, encrypted: false))
     }
 }

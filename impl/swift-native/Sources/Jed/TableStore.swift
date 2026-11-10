@@ -30,9 +30,9 @@ internal struct TableStore: Sendable {
         }
         return bytes
     }
-    private mutating func stage(_ record: PackedRecord, net: Bool) throws {
-        let bytes = try Self.footprint(record, encrypted: tree.codec.reservedBytes != 0)
-        let old = net ? pendingKeys.updateValue(bytes, forKey: record.key) ?? 0 : 0
+    /// Never throws, so callers apply it only after every fallible step.
+    private mutating func stage(_ key: [UInt8], bytes: Int64, net: Bool) {
+        let old = net ? pendingKeys.updateValue(bytes, forKey: key) ?? 0 : 0
         pendingBytes = saturatingAdd(pendingBytes, bytes) - old
     }
     private mutating func unstage(_ key: [UInt8]) {
@@ -40,30 +40,41 @@ internal struct TableStore: Sendable {
     }
     /// The caller checks SQL uniqueness and constraints; this storage primitive
     /// replaces a key atomically and reports the prior packed version.
+    /// Fallible work runs against a copy of the tree alone. Copying the whole
+    /// store instead would alias `pendingKeys` and force a full dictionary
+    /// copy on every staged key.
     @discardableResult mutating func put(_ record: PackedRecord, netStaging: Bool) throws -> PackedRecord? {
-        var changed = self
-        let old = try changed.tree.insert(record)
-        try changed.stage(record, net: netStaging)
-        changed.revision = StorageRevision(); self = changed
+        var edited = tree
+        let old = try edited.insert(record)
+        let bytes = try Self.footprint(record, encrypted: tree.codec.reservedBytes != 0)
+        tree = edited
+        stage(record.key, bytes: bytes, net: netStaging)
+        revision = StorageRevision()
         return old
     }
     @discardableResult mutating func remove(_ key: [UInt8]) throws -> PackedRecord? {
-        var changed = self
-        guard let old = try changed.tree.remove(key) else { return nil }
-        changed.unstage(key); changed.revision = StorageRevision(); self = changed
+        var edited = tree
+        guard let old = try edited.remove(key) else { return nil }
+        tree = edited
+        unstage(key); revision = StorageRevision()
         return old
     }
     /// GIN edits replace one run with zero or more runs. Tracking those physical
     /// records preserves Q3's exact index-version measure without a posting scan.
     @discardableResult mutating func editGIN(term: [UInt8], key: [UInt8], insert: Bool,
                                             netStaging: Bool) throws -> Bool {
-        var changed = self, index = try GinIndex(tree: tree)
+        var index = try GinIndex(tree: tree)
         let edited = try insert ? index.insert(term: term, key: key) : index.remove(term: term, key: key)
         guard edited else { return false }
-        changed.tree = index.tree
-        for old in index.lastChanges.removed { changed.unstage(old) }
-        for added in index.lastChanges.inserted { try changed.stage(PackedRecord(key: added, cells: []), net: netStaging) }
-        changed.revision = StorageRevision(); self = changed
+        let encrypted = tree.codec.reservedBytes != 0
+        var added: [([UInt8], Int64)] = []
+        for key in index.lastChanges.inserted {
+            added.append((key, try Self.footprint(PackedRecord(key: key, cells: []), encrypted: encrypted)))
+        }
+        tree = index.tree
+        for old in index.lastChanges.removed { unstage(old) }
+        for (key, bytes) in added { stage(key, bytes: bytes, net: netStaging) }
+        revision = StorageRevision()
         return true
     }
     mutating func allocateRowID() throws -> Int64 {

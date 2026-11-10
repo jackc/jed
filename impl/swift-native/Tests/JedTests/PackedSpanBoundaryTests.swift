@@ -33,16 +33,25 @@ final class PackedSpanBoundaryTests: XCTestCase {
             evaluationOrder: [0,1], constantArguments: args.map(FunctionResolver.isConstant))
         return ResolvedExpression(type: boolean, node: .call(function), position: 0)
     }
-    private func cell(_ value: SQLValue, _ type: TypeDescriptor) throws -> StoredCell {
-        if value.isNull { return StoredCell(bytes: nil, type: type) }
+    /// Stored cells carry only their storage class; these probes keep the
+    /// column descriptor beside each cell to build the leaf and the filter.
+    private struct TypedCell {
+        let stored: StoredCell
+        let type: TypeDescriptor
+        init(bytes: ArraySlice<UInt8>?, type: TypeDescriptor) {
+            stored = StoredCell(bytes: bytes, type: type); self.type = type
+        }
+    }
+    private func cell(_ value: SQLValue, _ type: TypeDescriptor) throws -> TypedCell {
+        if value.isNull { return TypedCell(bytes: nil, type: type) }
         let bytes: [UInt8]
         if ValueCodec.fixedWidth(type.type) == nil { bytes = try ValueCodec.encode(value, type: type) }
         else { bytes = try ValueCodec.encodeBody(value, type: type) }
-        return StoredCell(bytes: bytes[...], type: type)
+        return TypedCell(bytes: bytes[...], type: type)
     }
-    private func frame(_ cells: [StoredCell], pending: [Int: PendingOverflow] = [:], packed: Bool = true) throws -> PackedLaneRow {
+    private func frame(_ cells: [TypedCell], pending: [Int: PendingOverflow] = [:], packed: Bool = true) throws -> PackedLaneRow {
         let types = cells.map(\.type), codec = try PlainPageCodec(pageSize: 8192)
-        let record = PackedRecord(key: [1], cells: cells, overflows: pending)
+        let record = PackedRecord(key: [1], cells: cells.map(\.stored), overflows: pending)
         let position: TreePosition
         if packed {
             // Keep encoded-path probes on an actual packed page even when
@@ -60,7 +69,7 @@ final class PackedSpanBoundaryTests: XCTestCase {
         row.begin(position)
         return row
     }
-    private func assertEquivalent(_ expression: ResolvedExpression, cells: [StoredCell],
+    private func assertEquivalent(_ expression: ResolvedExpression, cells: [TypedCell],
                                   parameters: [SQLValue] = [], pending: [Int: PendingOverflow] = [:],
                                   expectEncoded: Bool = true, requireSpan: Bool = true, packed: Bool = true,
                                   file: StaticString = #filePath, line: UInt = #line) throws {
@@ -102,7 +111,7 @@ final class PackedSpanBoundaryTests: XCTestCase {
                 try assertEquivalent(equal(bytea, .bytea([0,255,0,42]), negated: negated), cells: [try cell(value, bytea)])
             }
         }
-        let malformed = StoredCell(bytes: [UInt8(0),0,2,41][...], type: text)
+        let malformed = TypedCell(bytes: [UInt8(0),0,2,41][...], type: text)
         // IS NULL has no value-decoding requirement, even for an invalid body.
         let row = try frame([malformed]); defer { row.close() }
         let meter = CostMeter(), context = ExpressionContext(meter: CostMeter())
@@ -173,7 +182,7 @@ final class PackedSpanBoundaryTests: XCTestCase {
             + [badFlags, badShape, badUTF8, badBitmap, validArray + [0]].map { (array, $0, arrayExpression) }
         for (type, bytes, expression) in probes {
           for packed in [false, true] {
-            let row = try frame([StoredCell(bytes: bytes[...], type: type)], packed: packed); defer { row.close() }
+            let row = try frame([TypedCell(bytes: bytes[...], type: type)], packed: packed); defer { row.close() }
             let meter = CostMeter(), context = ExpressionContext(meter: CostMeter())
             let filter = PackedLaneFilter(predicate: expression, types: [type], touched: [0], context: context)
             XCTAssertTrue(filter.hasEncodedPredicates)
@@ -187,7 +196,7 @@ final class PackedSpanBoundaryTests: XCTestCase {
     func testAndShortCircuitDoesNotDecodeAnUnreachedMalformedCell() throws {
         let left = nullTest(text), right = equal(bytea, .bytea([1]), index: 1)
         let expression = ResolvedExpression(type: boolean, node: .binary("and", left, right, boolean), position: 0)
-        let row = try frame([try cell(.text(SQLText("not null")), text), StoredCell(bytes: [UInt8(0),0,2,1][...], type: bytea)])
+        let row = try frame([try cell(.text(SQLText("not null")), text), TypedCell(bytes: [UInt8(0),0,2,1][...], type: bytea)])
         defer { row.close() }
         let meter = CostMeter(), context = ExpressionContext(meter: meter, column: { try row.value($0) })
         let filter = PackedLaneFilter(predicate: expression, types: [text,bytea], touched: [0,1], context: context)
@@ -273,7 +282,7 @@ final class PackedSpanBoundaryTests: XCTestCase {
         let expression = equal(text, value)
         for compressed in [false, true] {
             let pending = PendingOverflow(bytes: compressed ? LZ4.compress(raw) : raw, rawLength: raw.count, compressed: compressed)
-            let stored = StoredCell(bytes: try pending.pointer(PageReference(0))[...], type: text)
+            let stored = TypedCell(bytes: try pending.pointer(PageReference(0))[...], type: text)
             for packed in [false, true] {
                 try assertEquivalent(expression, cells: [stored], pending: [0:pending], requireSpan: false, packed: packed)
             }
@@ -281,7 +290,7 @@ final class PackedSpanBoundaryTests: XCTestCase {
         let compressed = LZ4.compress(raw)
         var writer = ByteWriter(); writer.u8(3); writer.u32(UInt32(raw.count)); writer.u16(UInt16(compressed.count)); writer.append(compressed)
         for packed in [false, true] {
-            try assertEquivalent(expression, cells: [StoredCell(bytes: writer.bytes[...], type: text)], requireSpan: false, packed: packed)
+            try assertEquivalent(expression, cells: [TypedCell(bytes: writer.bytes[...], type: text)], requireSpan: false, packed: packed)
         }
     }
 
@@ -296,7 +305,7 @@ final class PackedSpanBoundaryTests: XCTestCase {
         for name in ["@>", "<@", "&&"] {
             try assertEquivalent(arrayOperation(name, array, expected), cells: [try cell(values, array)], packed: false)
         }
-        // Writer record vectors hold StoredCells, not decoded SQL values. Their
+        // Writer record vectors hold TypedCells, not decoded SQL values. Their
         // validated inline encoding remains eligible for the same span atoms.
         let row = try frame([try cell(value, text)], packed: false); defer { row.close() }
         XCTAssertNotNil(try row.storedCell(0))
@@ -307,7 +316,7 @@ final class PackedSpanBoundaryTests: XCTestCase {
         let cases = [PendingOverflow(bytes: [0xff], rawLength: 1, compressed: false),
             PendingOverflow(bytes: [0xff], rawLength: 1, compressed: true)]
         for pending in cases {
-            let stored = StoredCell(bytes: try pending.pointer(PageReference(0))[...], type: text)
+            let stored = TypedCell(bytes: try pending.pointer(PageReference(0))[...], type: text)
             let row = try frame([stored], pending: [0:pending], packed: false); defer { row.close() }
             let meter = CostMeter(), context = ExpressionContext(meter: meter, column: { _ in
                 throw JedError("XX000", "malformed pending value reached the expression getter")
@@ -317,7 +326,7 @@ final class PackedSpanBoundaryTests: XCTestCase {
             XCTAssertEqual(meter.accrued, 0)
         }
         var writer = ByteWriter(); writer.u8(3); writer.u32(1); writer.u16(1); writer.u8(0xff)
-        let row = try frame([StoredCell(bytes: writer.bytes[...], type: text)], packed: false); defer { row.close() }
+        let row = try frame([TypedCell(bytes: writer.bytes[...], type: text)], packed: false); defer { row.close() }
         let meter = CostMeter(), context = ExpressionContext(meter: meter, column: { _ in
             throw JedError("XX000", "malformed compressed value reached the expression getter")
         })

@@ -50,6 +50,102 @@ the original Swift core. They do not establish Rust/Go parity or a Swift
 performance ceiling. The remaining source-level opportunities below are
 documented hypotheses for separate controlled work, not claimed attribution.
 
+## Second follow-up: copy and dispatch costs (2026-11-09)
+
+The maintainer asked why Swift, usually between Go and Rust, stayed about
+five times slower after the structural work above. Sampled release profiles
+answer it: the compiler and build are not the cause. On every workload examined,
+50–70% of the time was `swift_retain`/`swift_release` and value-witness copies.
+The engine is written in a value-semantic style whose per-row and per-statement
+copies each cost many atomic reference-count updates. Rust moves or borrows
+the same data and Go's collector makes a pointer copy free, so neither pays.
+
+Causes found, in order of measured weight:
+
+- **Large structs copied by value.** `ExpressionContext` holds every statement
+  service (about thirty references). Forty row loops copy it per row to rebind
+  one closure, and each bounded-aggregate state held its own copy: 48% of
+  `group_by_agg`. `SelectPlan`, `DomainSnapshot` and `ScanCandidate` copies
+  were about a third of a point lookup.
+- **Per-cell and per-row ownership.** Each `StoredCell` carried a full
+  `TypeDescriptor`; each scanned row built a node-owning `TreePosition`, a
+  page slice and a descriptor copy before decoding one integer.
+- **String-typed operators.** Resolved operators are `String`s. Comparing two
+  different Swift strings takes the slow Unicode path, and the evaluator built
+  an array of six strings per comparison to test membership.
+- **Expression nodes copied on dispatch.** Pattern-matching a node copied both
+  child expressions and the operand descriptor out of the enum on every
+  evaluation.
+- **Writes re-validated whole leaves.** Each insert or delete rebuilt its leaf
+  through the validating initializer, re-checking every record, and
+  `TableStore.put` copied the whole store, forcing a full copy of the
+  pending-key dictionary for each staged key.
+- **Statements are re-planned and re-admitted every execution.** UPDATE and
+  DELETE have no prepared plan; each execution resolves, inventories and
+  estimates again, and every statement repeats privilege, domain and catalog
+  validation. This is the main remaining cost and is not fixed here.
+
+Changes, all preserving results, costs, errors and bytes:
+
+- `ResolvedExpression` and `SelectPlan` keep their fields in a copy-on-write
+  box; a copy is one retain. `ExpressionContext` keeps row-varying fields
+  inline and boxes the rest. Aggregate states hold only the meter and the
+  collation key.
+- `StoredCell` carries its fixed width, not a descriptor; decoding takes the
+  column type from the owning tree. Packed leaves keep plain-integer region
+  facts and decode common scalars straight from page bytes.
+- Cursors hand out leaf **runs**; the packed aggregate fold holds each leaf
+  once and still polls, charges and checkpoints per row in the old order.
+- The evaluator classifies an operator's bytes once and compares or adds
+  integer pairs directly. `ByteReader` reads integers without sub-slices.
+- Leaf edits derive the new leaf from the old one, and a clean page is adopted
+  as writer records without re-validation. `TableStore` copies only the tree
+  for failure atomicity. An unbounded cost meter skips ceiling arithmetic.
+
+One round of the 22 diagnostic workloads, all four actors on one CPU with
+identical checksums ([CSV](../../impl/swift-native/BENCHMARK_FOLLOWUP_20261109.csv)):
+
+| Group | Swift before / Rust | Swift after / Rust | Swift after / Go | Speedup |
+|---|---:|---:|---:|---:|
+| Scans and aggregates (12) | 4.96× | 2.63× | 2.68× | 1.89× |
+| Per-statement lookups and writes (8) | 9.00× | 7.81× | 7.26× | 1.15× |
+| All 22 | 5.75× | 3.85× | 3.85× | 1.49× |
+
+`full_scan_agg` goes from 83.5 to 37.0 ms (Rust 21.7, Go 13.9),
+`varscan_text_isnull` from 12.3 to 4.4 ms and `group_by_agg` from 2.98 to
+1.67 s (Rust 0.65, Go 1.03). Point lookups improve only 1.1× (22.0 µs against
+2.5 µs) and row writes 1.07–1.4×. The run used a tmpfs data directory, so the
+two durable workloads measure engine overhead without a real barrier and are
+not comparable with the earlier disk-backed table. This is a single-round
+diagnostic, not a replacement for the three-round matrix above.
+
+Verified on this source: 543 native tests and all 749 frozen SQL files (21,597
+records, 2,271 cost assertions), the threaded stress run with the frozen final
+checksum, and 897/897 Swift–Go file interchange phases. The cross-core resource
+accounting, encrypted, simulation, process and page-service gates were not
+re-run.
+
+What remains, by expected value:
+
+- **Prepared mutation plans.** Cache the resolved preparation and selected
+  access for UPDATE and DELETE as INSERT and SELECT already do, and cache
+  statement admission (privileges, targets, sequence-writer need) against the
+  schema signature. A profiled prepared DELETE spends about 40% of its time
+  re-planning and about 30% in statement admission and snapshot handling.
+- **Statement-scoped copies.** `DomainSnapshot`, `TableStore`, `ScanCandidate`
+  and `SessionSettings` are still copied field by field several times per
+  statement, and each statement's first staged key copies the transaction's
+  pending-key dictionary.
+- **Ownership tokens for dirty nodes.** Interior nodes are still path-copied
+  per mutation, a retain per child. Go mutates nodes its generation owns.
+- **Typed, batched folds.** The per-row fold still retains each aggregate
+  state and decodes through `SQLValue`. With no cost ceiling and no
+  cancellation token, charges could be batched per leaf as the peers do.
+- **Operator codes.** Resolved operators should be an enum; the byte
+  classifier here covers only the evaluator's hot path.
+- Dynamic exclusivity checks on class-held arrays are roughly a tenth of a
+  filtered scan's samples. `-enforce-exclusivity=unchecked` would remove them; it was not used.
+
 ## Investigation and controlled changes
 
 1. Inspect captured compiler commands, flags, libraries, host controls and
@@ -146,15 +242,8 @@ breakdown of the final actor. They explain where another controlled experiment
 could begin; this follow-up does not claim they account for the entire remaining
 peer gap.
 
-- `GroupedSelectExecution` still asks `TreePosition.cell(...).isNull` for COUNT.
-  That constructs typed cell metadata and a slice. Rust/Go expose direct leaf
-  bitmap/offset nullness checks. The Swift leaf API could distinguish nullness,
-  borrowed encoded bytes and decoded values more completely.
-- `TreeCursor` returns a strong node-owning position per row, and filtered
-  `PackedLaneRow` replaces that position each row. Rust/Go perform their packed
-  folds inside a leaf traversal over node/index pairs. A leaf-scoped Swift
-  execution interface could amortize ownership; actual final ARC counts have
-  not been measured.
+- The first two items of this list (direct nullness, leaf-scoped traversal)
+  were done in the second follow-up above.
 - The admitted integer-group packed lane builds key arrays and encodes a generic
   byte key for each survivor. Rust/Go use integer keys plus a separate NULL
   sentinel. Selecting the key representation once could remove this work while

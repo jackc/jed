@@ -84,7 +84,7 @@ extension CatalogDDL {
         var scan = store.cursor(); defer { scan.close() }
         while let record = try scan.next() {
             context.meter.charge(1); try context.meter.step()
-            let row = ScanRecord(record, pager: store.tree.pool?.pager)
+            let row = ScanRecord(record, types: store.tree.types, pager: store.tree.pool?.pager)
             for ordinal in table.columns.indices { _ = try row.value(ordinal) }
             try validation.consume(key: record.key, value: row.value)
         }

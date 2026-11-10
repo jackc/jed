@@ -256,41 +256,56 @@ internal final class GroupedSelectExecution {
             if operand.nullness { return .nullness(column) }
             return direct ? .direct(decoded.firstIndex(of: column)!) : .cached(column)
         }
-        while let position = try input.nextPosition() {
-            if direct {
-                for (slot, column) in decoded.enumerated() { values[slot] = try position.materialize(column, pager: pager) }
-            } else {
-                row.begin(position)
-                guard try filter.keep(row, context: current) else { continue }
-                try row.prepare(decoded)
-            }
-            try meter.checkpoint()
-            let group: Group
-            if aggregate.keys.isEmpty { group = groups[0] }
-            else {
-                let allKeys: [SQLValue]
-                if direct { allKeys = keySlots.map { values[$0] } }
-                else { allKeys = try aggregate.keyColumns.map { try row.value($0) } }
-                let keys = members.map { allKeys[$0] }
-                for value in keys {
-                    let payload = MemorySizes.payload(value)
-                    if payload > 0 { meter.charge(payload); try meter.guardCost() }
+        // Without grouping keys the single group and its states never change.
+        let fixedStates: [AggregateState]? = aggregate.keys.isEmpty ? groups[0].states : nil
+        while let run = try input.nextRun() {
+            let node = run.node
+            // A clean page decodes common scalars in place; pending overflow
+            // values and writer leaves take the general position path.
+            let packed: PackedLeaf? = node.pending.isEmpty ? node.leaf : nil
+            for ordinal in 0..<run.count {
+                let index = run.row(ordinal)
+                try input.admitRow()
+                if direct {
+                    for slot in 0..<decoded.count {
+                        let column = decoded[slot]
+                        if let packed, let value = try packed.fastValue(row: index, column: column) { values[slot] = value }
+                        else { values[slot] = try TreePosition(node: node, row: index).materialize(column, pager: pager) }
+                    }
+                } else {
+                    row.begin(TreePosition(node: node, row: index))
+                    guard try filter.keep(row, context: current) else { continue }
+                    try row.prepare(decoded)
                 }
-                let key = try ValueEqualityKey.encode(keys)
-                let index: Int
-                if let existing = lookup[key] { index = existing }
-                else { index = try create(keys: allKeys.indices.map { membership.contains($0) ? allKeys[$0] : .null }, selected: keys, key: key) }
-                group = groups[index]
-            }
-            for ordinal in group.states.indices {
-                // Bare columns add no expression cost; every aggregate,
-                // including COUNT(*) and NULL, pays its accumulation unit.
-                meter.charge(1)
-                switch reads[ordinal] {
-                case .star: try group.states[ordinal].foldStar()
-                case .nullness(let column): try group.states[ordinal].foldCount(isNull: position.cell(column).isNull)
-                case .direct(let slot): try group.states[ordinal].foldScalar(values[slot])
-                case .cached(let column): try group.states[ordinal].foldScalar(row.value(column))
+                try meter.checkpoint()
+                let states: [AggregateState]
+                if let fixedStates { states = fixedStates }
+                else {
+                    let allKeys: [SQLValue]
+                    if direct { allKeys = keySlots.map { values[$0] } }
+                    else { allKeys = try aggregate.keyColumns.map { try row.value($0) } }
+                    let keys = members.map { allKeys[$0] }
+                    for value in keys {
+                        let payload = MemorySizes.payload(value)
+                        if payload > 0 { meter.charge(payload); try meter.guardCost() }
+                    }
+                    let key = try ValueEqualityKey.encode(keys)
+                    let found: Int
+                    if let existing = lookup[key] { found = existing }
+                    else { found = try create(keys: allKeys.indices.map { membership.contains($0) ? allKeys[$0] : .null }, selected: keys, key: key) }
+                    states = groups[found].states
+                }
+                for ordinal in states.indices {
+                    // Bare columns add no expression cost; every aggregate,
+                    // including COUNT(*) and NULL, pays its accumulation unit.
+                    meter.charge(1)
+                    switch reads[ordinal] {
+                    case .star: try states[ordinal].foldStar()
+                    case .nullness(let column):
+                        try states[ordinal].foldCount(isNull: packed?.isNull(row: index, column: column) ?? node.isNull(row: index, column: column))
+                    case .direct(let slot): try states[ordinal].foldScalar(values[slot])
+                    case .cached(let column): try states[ordinal].foldScalar(row.value(column))
+                    }
                 }
             }
         }

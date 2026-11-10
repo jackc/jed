@@ -152,7 +152,7 @@ extension MutationExecutor {
             let existing = try key.flatMap { try plan.arbiter.existing($0, relation: relation, indexes: indexes, snapshot: read, vacated: vacated) }
             if let old = existing {
                 if plan.doNothing { continue }
-                let oldRow = ScanRecord(old, pager: store.tree.pool?.pager)
+                let oldRow = ScanRecord(old, types: store.tree.types, pager: store.tree.pool?.pager)
                 var row = context
                 row.column = { index in
                     let proposed = index >= relation.visibleCount
@@ -220,7 +220,7 @@ extension MutationExecutor {
             try changes.map { change -> StoredIndexPlan.Change in
                 let before: [StoredIndexPlan.Entry]
                 if let old = change.old {
-                    let row = ScanRecord(old, pager: store.tree.pool?.pager)
+                    let row = ScanRecord(old, types: store.tree.types, pager: store.tree.pool?.pager)
                     before = try indexes[ordinal].entries(row.value, storageKey: old.key)
                 } else { before = [] }
                 return StoredIndexPlan.Change(before: before, after: change.entries[ordinal])
@@ -256,7 +256,7 @@ extension MutationExecutor {
         }
         context.meter.charge(compression.accrued); try context.meter.checkpoint()
         for change in changes {
-            let old = change.old.map { ScanRecord($0, pager: store.tree.pool?.pager) }
+            let old = change.old.map { ScanRecord($0, types: store.tree.types, pager: store.tree.pool?.pager) }
             try returning.emit(old: old.map { $0.value }, new: { change.values[$0] }, relation: relation, context: context, result: result)
         }
         result.affected = Int64(changes.count)
@@ -282,7 +282,7 @@ extension MutationExecutor {
         if !changes.isEmpty {
             if !updated.isEmpty {
                 let transitions = updated.map { change -> ForeignKeyActions.Transition in
-                    let old = ScanRecord(change.old!, pager: store.tree.pool?.pager)
+                    let old = ScanRecord(change.old!, types: store.tree.types, pager: store.tree.pool?.pager)
                     return .init(old: .init(key: change.old!.key, value: old.value), new: change.candidate)
                 }
                 let state = foreignState

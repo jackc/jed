@@ -96,7 +96,7 @@ internal enum AnalyzeExecution {
                 if facts.compressed { units = saturatingAdd(units, Int64((facts.raw + slab - 1) / slab)) }
             }
             meter.charge(units)
-            let value = try ScanRecord(record, pager: store.tree.pool?.pager).value(column)
+            let value = try ScanRecord(record, types: store.tree.types, pager: store.tree.pool?.pager).value(column)
             let ordinal = result.analyzed
             result.analyzed = saturatingAdd(result.analyzed, 1)
             var key: [UInt8] = [], bytes: [UInt8] = [], oversized = false

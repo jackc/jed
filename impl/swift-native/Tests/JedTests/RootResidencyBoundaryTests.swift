@@ -63,7 +63,7 @@ final class RootResidencyBoundaryTests: XCTestCase {
         for id in [Int64(1), Int64(2)] {
             let record = try XCTUnwrap(committed.tables[tableName]?.get(key(id)))
             XCTAssertTrue(record.overflows.isEmpty)
-            if case .bytea(let value) = try record.materialize(column: 1, pager: domain.pager) { XCTAssertEqual(value, payload(UInt32(id))) }
+            if case .bytea(let value) = try record.materialize(column: 1, type: types[1], pager: domain.pager) { XCTAssertEqual(value, payload(UInt32(id))) }
             else { XCTFail("wrong stored value") }
         }
         var working = committed, store = try XCTUnwrap(working.tables[tableName])

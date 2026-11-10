@@ -170,6 +170,11 @@ Its implementation, correctness revalidation and diagnostic measurements are
 complete, including 543 native tests and all 749 frozen SQL files. Original
 evidence remains preserved, without changing experimental status or the separate
 production decision.
+A second pass on 2026-11-09, requested by the maintainer, removed per-row and
+per-statement copy costs found by profiling. On the 22 diagnostic workloads
+Swift/Rust falls from 5.75× to 3.85× (scans 2.63×; per-statement paths remain
+about 8×, chiefly because UPDATE/DELETE re-plan every execution). Only the
+native tests, SQL corpus, Swift stress and Go interchange gates were re-run.
 
 The maintainer approved Ruby's OpenSSL binding for vetted cryptographic digest
 functions and stdlib Zlib for byte-identical CRC32 checksums in this experiment.

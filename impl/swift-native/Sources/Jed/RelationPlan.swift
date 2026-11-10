@@ -504,7 +504,7 @@ internal final class RelationExecution {
         while let record = try cursor.next() {
             try meter.step(); meter.charge(1)
             var row = Array(repeating: SQLValue.null, count: plan.columns.count)
-            for column in touched.sorted() { row[column] = try record.materialize(column: column, pager: store.tree.pool?.pager) }
+            for column in touched.sorted() { row[column] = try record.materialize(column: column, type: store.tree.types[column], pager: store.tree.pool?.pager) }
             if let filter = plan.scanFilter {
                 var current = context; current.column = { row[$0] }
                 if try !current.matches(filter) { continue }
@@ -605,7 +605,7 @@ internal final class RelationExecution {
                     let innerRow: [SQLValue]? = try context.profile(inner, .total) {
                         try meter.step(); meter.charge(1)
                         var value = placeholder
-                        for column in columns { value[column] = try record.materialize(column: column, pager: store.tree.pool?.pager) }
+                        for column in columns { value[column] = try record.materialize(column: column, type: store.tree.types[column], pager: store.tree.pool?.pager) }
                         if let filter = inner.scanFilter {
                             var filtered = context; filtered.column = { value[$0] }
                             if try !filtered.matches(filter) { return nil }
@@ -711,7 +711,7 @@ internal final class RelationExecution {
                         while let record = try cursor.next() {
                             try context.meter.step(); context.meter.charge(1)
                             var row = Array(repeating: SQLValue.null, count: input.source.columns.count)
-                            for column in columns { row[column] = try record.materialize(column: column, pager: store.tree.pool?.pager) }
+                            for column in columns { row[column] = try record.materialize(column: column, type: store.tree.types[column], pager: store.tree.pool?.pager) }
                             if let filter = input.source.scanFilter {
                                 var filtered = context; filtered.column = { row[$0] }
                                 if try !filtered.matches(filter) { continue }
@@ -924,7 +924,7 @@ internal final class SelectInput {
         // next row. The terminal guard observes the last completed row.
         try context.meter.step(); context.meter.charge(1)
         var row = Array(repeating: SQLValue.null, count: store.tree.types.count)
-        for column in plan.touched { row[column] = try record.materialize(column: column, pager: store.tree.pool?.pager) }
+        for column in plan.touched { row[column] = try record.materialize(column: column, type: store.tree.types[column], pager: store.tree.pool?.pager) }
         return row
     }
     func discardRetained(_ row: [SQLValue]) {

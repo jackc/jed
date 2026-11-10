@@ -47,12 +47,13 @@ final class DomainRebuildBoundaryTests: XCTestCase {
                     let r = try XCTUnwrap(right.next(), file: file, line: line)
                     XCTAssertEqual(l.key, r.key, file: file, line: line)
                     for column in l.cells.indices {
-                        let lv = try l.materialize(column: column, pager: source.pool.pager)
-                        let rv = try r.materialize(column: column, pager: target.pool.pager)
+                        let type = a[name]!.tree.types[column]
+                        let lv = try l.materialize(column: column, type: type, pager: source.pool.pager)
+                        let rv = try r.materialize(column: column, type: b[name]!.tree.types[column], pager: target.pool.pager)
                         XCTAssertEqual(lv.isNull, rv.isNull, file: file, line: line)
                         if !lv.isNull {
-                            XCTAssertEqual(try ValueCodec.encodeRawBody(lv, type: l.cells[column].type),
-                                try ValueCodec.encodeRawBody(rv, type: r.cells[column].type), file: file, line: line)
+                            XCTAssertEqual(try ValueCodec.encodeRawBody(lv, type: type),
+                                try ValueCodec.encodeRawBody(rv, type: type), file: file, line: line)
                         }
                     }
                 }
@@ -73,7 +74,7 @@ final class DomainRebuildBoundaryTests: XCTestCase {
                 var rebuilt = TableStore(tree: BPlusTree(codec: plainScratch.pool.codec, types: old.tree.types,
                     pool: plainScratch.pool), nextRowID: old.nextRowID)
                 while let record = try cursor.next() {
-                    let values = try record.cells.indices.map { RecordInput.value(try record.materialize(column: $0, pager: plainScratch.pager)) }
+                    let values = try record.cells.indices.map { RecordInput.value(try record.materialize(column: $0, type: old.tree.types[$0], pager: plainScratch.pager)) }
                     try rebuilt.put(RecordDisposition.plan(key: record.key, values: values,
                         types: old.tree.types, codec: plainScratch.pool.codec), netStaging: true)
                 }

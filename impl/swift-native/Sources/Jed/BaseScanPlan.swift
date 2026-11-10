@@ -252,5 +252,16 @@ internal struct ScanCursor {
             current?.close(); current = nil
         }
     }
+    mutating func nextRun() throws -> TreeRun? {
+        while true {
+            if current == nil {
+                guard position < intervals.count else { return nil }
+                let bounds = intervals[position]; position += 1
+                current = store.cursor(lower: bounds.lower, upper: bounds.upper, descending: descending)
+            }
+            if let run = try current?.nextRun() { return run }
+            current?.close(); current = nil
+        }
+    }
     mutating func close() { current?.close(); current = nil; position = intervals.count }
 }

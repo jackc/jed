@@ -26,7 +26,7 @@ final class DatabaseCoreBoundaryTests: XCTestCase {
     }
     private func stored(_ snapshot: DomainSnapshot, pager: Pager) throws -> Int64 {
         let record = try XCTUnwrap(snapshot.tables[tableName]?.get(rowKey))
-        guard case .integer(let value) = try record.materialize(column: 0, pager: pager) else {
+        guard case .integer(let value) = try record.materialize(column: 0, type: TypeDescriptor(.scalar(.i64)), pager: pager) else {
             throw JedError("XX001", "expected integer in test record")
         }
         return value

@@ -164,7 +164,7 @@ extension MergeExecutor {
         }
         func read(_ record: PackedRecord, materialize: Bool = true) throws -> ScanRecord {
             context.meter.charge(1); try context.meter.step()
-            let row = ScanRecord(record, pager: relation.store.tree.pool?.pager)
+            let row = ScanRecord(record, types: relation.store.tree.types, pager: relation.store.tree.pool?.pager)
             if materialize { for column in plan.touched { _ = try row.value(column) } }
             return row
         }

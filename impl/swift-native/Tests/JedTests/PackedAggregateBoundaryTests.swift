@@ -207,7 +207,7 @@ final class PackedAggregateBoundaryTests: XCTestCase {
         let bodies: [[UInt8]] = [[0,0,2,41], external.bytes]
         for body in bodies {
             var cells = record.cells
-            cells[1] = StoredCell(bytes: body[...], type: cells[1].type)
+            cells[1] = StoredCell(bytes: body[...], width: 0)
             var table = original
             try table.put(PackedRecord(key: record.key, cells: cells), netStaging: false)
             var snapshot = base; snapshot.setTableStore(name, table)

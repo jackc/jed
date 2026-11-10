@@ -9,7 +9,10 @@ internal final class PackedLaneRow {
     private var values: [SQLValue]
     private var stamps: [UInt64]
     private var generation: UInt64 = 0
-    private var position: TreePosition?
+    private var node: TreeNode?
+    /// The clean packed page of `node`, when values can decode in place.
+    private var packed: PackedLeaf?
+    private var index = 0
 
     init(width: Int, touched: [Int], pager: Pager?) {
         self.pager = pager
@@ -26,37 +29,43 @@ internal final class PackedLaneRow {
             generation = 0
         }
         generation += 1
-        self.position = position
+        // Rows arrive leaf by leaf; swap the retained node only when it changes.
+        if node !== position.node {
+            node = position.node
+            packed = position.node.pending.isEmpty ? position.node.leaf : nil
+        }
+        index = position.row
     }
 
     func value(_ column: Int) throws -> SQLValue {
-        guard let position, slots.indices.contains(column), slots[column] >= 0 else {
+        guard let node, column >= 0, column < slots.count, slots[column] >= 0 else {
             throw JedError("XX000", "packed lane read is outside the touched columns")
         }
         let slot = slots[column]
         if stamps[slot] != generation {
-            values[slot] = try position.materialize(column, pager: pager)
+            if let packed, let value = try packed.fastValue(row: index, column: column) { values[slot] = value }
+            else { values[slot] = try TreePosition(node: node, row: index).materialize(column, pager: pager) }
             stamps[slot] = generation
         }
         return values[slot]
     }
 
     func isNull(_ column: Int) throws -> Bool {
-        guard let position, slots.indices.contains(column), slots[column] >= 0 else {
+        guard let node, column >= 0, column < slots.count, slots[column] >= 0 else {
             throw JedError("XX000", "packed lane null test is outside the touched columns")
         }
-        return position.cell(column).isNull
+        return packed?.isNull(row: index, column: column) ?? node.isNull(row: index, column: column)
     }
 
     /// Pending overflow bodies belong to the writer and must use materialize.
     /// Other cells borrow immutable encoded slices. Both packed pages and
     /// writer record vectors retain this encoding; no SQL values are stored.
     func storedCell(_ column: Int) throws -> StoredCell? {
-        guard let position, slots.indices.contains(column), slots[column] >= 0 else {
+        guard let node, column >= 0, column < slots.count, slots[column] >= 0 else {
             throw JedError("XX000", "packed lane span read is outside the touched columns")
         }
-        guard position.node.pending[position.row]?[column] == nil else { return nil }
-        return position.cell(column)
+        if !node.pending.isEmpty, node.pending[index]?[column] != nil { return nil }
+        return node.cell(row: index, column: column)
     }
 
     /// Generic predicates keep the scalar lane's eager touched-column order.
@@ -66,7 +75,7 @@ internal final class PackedLaneRow {
     }
 
     func close() {
-        position = nil
+        node = nil; packed = nil
         values.removeAll(keepingCapacity: false)
         stamps.removeAll(keepingCapacity: false)
     }
@@ -99,6 +108,12 @@ internal final class PackedLaneInput {
         try meter.step(); meter.charge(1)
         return position
     }
+
+    /// Leaf-at-a-time form of `nextPosition`. The caller admits each row of
+    /// the run with `admitRow` before using it, keeping the per-row order of
+    /// cancellation polls and charges.
+    func nextRun() throws -> TreeRun? { try cursor.nextRun() }
+    @inline(__always) func admitRow() throws { try meter.step(); meter.charge(1) }
 
     func next() throws -> Bool {
         guard let position = try nextPosition() else { return false }

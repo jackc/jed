@@ -654,7 +654,7 @@ internal enum MutationExecutor {
             if candidate?.intervals != nil, !intervalKeys.insert(old.key).inserted { continue }
             let row = try context.profile(plan.profileIdentity, .source) {
                 context.meter.charge(1); try context.meter.step()
-                let value = ScanRecord(old, pager: store.tree.pool?.pager)
+                let value = ScanRecord(old, types: store.tree.types, pager: store.tree.pool?.pager)
                 for column in touched.sorted() { _ = try value.value(column) }
                 return value
             }
@@ -719,7 +719,7 @@ internal enum MutationExecutor {
         var replacementKeys: Set<[UInt8]> = []
         for change in staged {
             guard let record = change.new else { continue }
-            let row = ScanRecord(record, pager: store.tree.pool?.pager)
+            let row = ScanRecord(record, types: store.tree.types, pager: store.tree.pool?.pager)
             guard replacementKeys.insert(record.key).inserted else { throw duplicate(relation, value: row.value, context: context) }
             if !vacated.contains(record.key), try relation.store.get(record.key) != nil { throw duplicate(relation, value: row.value, context: context) }
         }
@@ -728,11 +728,11 @@ internal enum MutationExecutor {
             guard let existing = read.indexes[index.index.name] else { throw JedError.corruption("missing index store") }
             var entries: [StoredIndexPlan.Change] = [], batch: Set<[UInt8]> = []
             for change in staged {
-                let old = ScanRecord(change.old, pager: store.tree.pool?.pager)
+                let old = ScanRecord(change.old, types: store.tree.types, pager: store.tree.pool?.pager)
                 let before = try index.entries(old.value, storageKey: change.old.key)
                 var after: [StoredIndexPlan.Entry] = []
                 if let record = change.new {
-                    let row = ScanRecord(record, pager: store.tree.pool?.pager)
+                    let row = ScanRecord(record, types: store.tree.types, pager: store.tree.pool?.pager)
                     let indexed = try index.row(row.value, storageKey: record.key)
                     if let prefix = indexed.prefix {
                         if index.index.unique && !prefix.hasNull {
@@ -750,7 +750,7 @@ internal enum MutationExecutor {
         if let view = relation.view, !deleting {
             for change in staged {
                 if let record = change.new {
-                    let row = ScanRecord(record, pager: store.tree.pool?.pager)
+                    let row = ScanRecord(record, types: store.tree.types, pager: store.tree.pool?.pager)
                     try view.validateNew(row.value, context: context)
                 }
             }
@@ -758,7 +758,7 @@ internal enum MutationExecutor {
         if !deleting {
             let candidates = staged.compactMap { change -> ForeignKeyValidation.Candidate? in
                 guard let record = change.new else { return nil }
-                let row = ScanRecord(record, pager: store.tree.pool?.pager)
+                let row = ScanRecord(record, types: store.tree.types, pager: store.tree.pool?.pager)
                 return ForeignKeyValidation.Candidate(key: record.key, value: row.value)
             }
             try ExclusionValidation.validate(candidates, table: relation.table, snapshot: read,
@@ -768,8 +768,8 @@ internal enum MutationExecutor {
         }
         context.meter.charge(compression.accrued); try context.meter.checkpoint()
         for change in staged {
-            let old = ScanRecord(change.old, pager: store.tree.pool?.pager)
-            let new = change.new.map { ScanRecord($0, pager: store.tree.pool?.pager) }
+            let old = ScanRecord(change.old, types: store.tree.types, pager: store.tree.pool?.pager)
+            let new = change.new.map { ScanRecord($0, types: store.tree.types, pager: store.tree.pool?.pager) }
             try returning.emit(old: old.value, new: new.map { $0.value }, relation: relation, context: context, result: result)
         }
         if context.writeScope != nil {
@@ -800,9 +800,9 @@ internal enum MutationExecutor {
         try context.meter.syncPending(snapshot.pendingBytes)
         if !staged.isEmpty {
             let transitions = staged.map { change -> ForeignKeyActions.Transition in
-                let row = ScanRecord(change.old, pager: store.tree.pool?.pager)
+                let row = ScanRecord(change.old, types: store.tree.types, pager: store.tree.pool?.pager)
                 let next = change.new.map { record -> ForeignKeyValidation.Candidate in
-                    let values = ScanRecord(record, pager: store.tree.pool?.pager)
+                    let values = ScanRecord(record, types: store.tree.types, pager: store.tree.pool?.pager)
                     return ForeignKeyValidation.Candidate(key: record.key, value: values.value)
                 }
                 return ForeignKeyActions.Transition(old: ForeignKeyValidation.Candidate(key: change.old.key, value: row.value), new: next)

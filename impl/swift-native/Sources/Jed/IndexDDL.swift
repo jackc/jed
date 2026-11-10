@@ -97,7 +97,7 @@ extension CatalogDDL {
         var entries: [StoredIndexPlan.Entry] = [], unique: Set<[UInt8]> = []
         while let record = try cursor.next() {
             context.meter.charge(1); try context.meter.step()
-            let row = ScanRecord(record, pager: store.tree.pool?.pager)
+            let row = ScanRecord(record, types: store.tree.types, pager: store.tree.pool?.pager)
             for column in plan.touched { _ = try row.value(column) }
             let indexed = try plan.row(row.value, storageKey: record.key)
             if index.unique, let prefix = indexed.prefix, !prefix.hasNull && !unique.insert(prefix.bytes).inserted {

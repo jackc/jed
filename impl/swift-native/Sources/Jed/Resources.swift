@@ -150,6 +150,8 @@ internal final class CostMeter {
     let lifetimeLimit: Int64
     let resources: StatementResources
     let cancellation: CancellationToken?
+    /// Neither ceiling is set, so no charge can reach one.
+    private let unbounded: Bool
     /// Other domains' pending writes stay resident while one target mutation
     /// updates its own reservation. The statement coordinator resets this to
     /// zero before synchronizing the complete working-root set.
@@ -163,11 +165,12 @@ internal final class CostMeter {
         self.lifetimeLimit = max(0, lifetime?.limit ?? 0)
         self.resources = resources
         self.cancellation = cancellation
+        unbounded = self.limit == 0 && self.lifetimeLimit == 0
     }
 
     func charge(_ units: Int64) {
         precondition(units >= 0)
-        if firstCeiling == nil {
+        if !unbounded, firstCeiling == nil {
             let statementRemaining = limit > 0 ? limit - accrued : Int64.max
             let lifetimeRemaining = lifetime.map { lifetimeLimit > 0 ? lifetimeLimit - $0.accrued : Int64.max } ?? Int64.max
             let statementHit = limit > 0 && units >= statementRemaining
@@ -189,6 +192,7 @@ internal final class CostMeter {
     }
 
     func guardCost() throws {
+        if unbounded { return }
         let statementOver = limit > 0 && accrued >= limit
         let lifetimeOver = lifetime != nil && lifetimeLimit > 0 && lifetime!.accrued >= lifetimeLimit
         guard statementOver || lifetimeOver else { return }

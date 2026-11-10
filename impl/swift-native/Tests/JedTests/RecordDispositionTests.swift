@@ -18,7 +18,7 @@ final class RecordDispositionTests: XCTestCase {
         let kept = try RecordDisposition.plan(key: [2], values: [.kept(resident.cells[0], pending: pending)], types: [bytea], codec: codec)
         XCTAssertEqual(kept.cells[0].bytes, resident.cells[0].bytes)
         XCTAssertEqual(kept.overflows[0]?.bytes, pending.bytes)
-        if case .bytea(let actual) = try kept.materialize(column: 0) { XCTAssertEqual(actual, payload) }
+        if case .bytea(let actual) = try kept.materialize(column: 0, type: bytea) { XCTAssertEqual(actual, payload) }
         else { XCTFail("wrong materialized value") }
         let wrong = PendingOverflow(bytes: pending.bytes, rawLength: pending.rawLength + 1, compressed: pending.compressed)
         XCTAssertThrowsError(try RecordDisposition.plan(key: [3], values: [.kept(resident.cells[0], pending: wrong)], types: [bytea], codec: codec)) {
@@ -101,7 +101,7 @@ final class RecordDispositionTests: XCTestCase {
         XCTAssertEqual(row.cells.map { $0.bytes?.first }, [3, 0])
         XCTAssertEqual(meter.accrued, 1)
         XCTAssertLessThanOrEqual(row.weight, RecordDisposition.recordMaximum(capacity: codec.capacity, columns: 2))
-        if case .text(let result) = try row.cells[0].materialize() { XCTAssertEqual(result, try SQLText(String(repeating: "a", count: 70))) }
+        if case .text(let result) = try row.cells[0].materialize(type: text) { XCTAssertEqual(result, try SQLText(String(repeating: "a", count: 70))) }
         else { XCTFail("wrong value") }
     }
 
@@ -111,7 +111,7 @@ final class RecordDispositionTests: XCTestCase {
             types: [bytea, bytea], codec: codec, meter: meter)
         XCTAssertEqual(row.cells.map { $0.bytes?.first }, [2, 2])
         XCTAssertEqual(meter.accrued, 6)
-        if case .bytea(let materialized) = try row.materialize(column: 1) { XCTAssertEqual(materialized, payload) }
+        if case .bytea(let materialized) = try row.materialize(column: 1, type: bytea) { XCTAssertEqual(materialized, payload) }
         else { XCTFail("wrong value") }
         var allocator = try PageAllocator(highWater: 10, free: [3, 7], firstBody: 2)
         let sealed = try row.sealOverflow(allocator: &allocator, codec: codec)

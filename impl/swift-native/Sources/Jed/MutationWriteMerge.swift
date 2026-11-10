@@ -28,11 +28,11 @@ extension MutationExecutor {
                 // an earlier part. Remove the entry the working tree owns.
                 var before: [StoredIndexPlan.Entry] = [], after: [StoredIndexPlan.Entry] = []
                 if let key = change.old?.key, let record = try store.get(key) {
-                    let row = ScanRecord(record, pager: store.tree.pool?.pager)
+                    let row = ScanRecord(record, types: store.tree.types, pager: store.tree.pool?.pager)
                     before = try index.entries(row.value, storageKey: key)
                 }
                 if let record = change.new {
-                    let row = ScanRecord(record, pager: store.tree.pool?.pager)
+                    let row = ScanRecord(record, types: store.tree.types, pager: store.tree.pool?.pager)
                     let indexed = try index.row(row.value, storageKey: record.key)
                     if let prefix = indexed.prefix {
                         if index.index.unique && !prefix.hasNull {

@@ -37,7 +37,7 @@ internal extension BPlusTree {
                         stored = facts.stored; raw = facts.raw; compressed = facts.compressed
                     } else { continue }
                     let bytes = try ImageOverflow.pointer(head, stored: stored, raw: raw, compressed: compressed)
-                    cells[column] = StoredCell(bytes: bytes[...], type: cells[column].type)
+                    cells[column] = StoredCell(bytes: bytes[...], width: 0)
                 }
                 records.append(PackedRecord(key: record.key, cells: cells))
             }

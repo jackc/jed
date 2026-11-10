@@ -14,14 +14,29 @@ internal struct TreePosition: Sendable {
 
     func record() -> PackedRecord { node.record(at: row) }
     func cell(_ column: Int) -> StoredCell { node.cell(row: row, column: column) }
+    func isNull(_ column: Int) -> Bool { node.isNull(row: row, column: column) }
     func materialize(_ column: Int, pager: Pager?) throws -> SQLValue {
-        let cell = cell(column)
-        if let overflow = node.pending[row]?[column] {
-            let raw = overflow.compressed ? try LZ4.decompress(overflow.bytes, rawLength: overflow.rawLength) : overflow.bytes
-            return try ValueCodec.decodeRawBody(raw, type: cell.type)
+        // Clean packed leaves decode common scalars straight from the page.
+        if node.pending.isEmpty, let leaf = node.leaf, let value = try leaf.fastValue(row: row, column: column) {
+            return value
         }
-        return try cell.materialize(pager: pager)
+        let type = node.types[column]
+        if !node.pending.isEmpty, let overflow = node.pending[row]?[column] {
+            let raw = overflow.compressed ? try LZ4.decompress(overflow.bytes, rawLength: overflow.rawLength) : overflow.bytes
+            return try ValueCodec.decodeRawBody(raw, type: type)
+        }
+        return try cell(column).materialize(type: type, pager: pager)
     }
+}
+
+/// Consecutive admitted rows of one leaf, in cursor order. A consumer holds
+/// the node once for the whole run instead of once per row.
+internal struct TreeRun: Sendable {
+    let node: TreeNode
+    let first: Int
+    let count: Int
+    let descending: Bool
+    @inline(__always) func row(_ ordinal: Int) -> Int { descending ? first - ordinal : first + ordinal }
 }
 
 /// A snapshot cursor owns only its root, one interior frame per level, and its
@@ -65,15 +80,16 @@ internal struct TreeCursor: Sendable {
         }
         while let leaf {
             if row >= 0, row < leaf.entryCount {
-                if let lower {
-                    let key = leaf.key(at: row)
-                    if key.lexicographicallyPrecedes(lower.key) ||
-                        (key.elementsEqual(lower.key) && !lower.inclusive) { finish(); return nil }
-                }
-                if let upper {
-                    let key = leaf.key(at: row)
-                    if upper.key.lexicographicallyPrecedes(key) ||
-                        (key.elementsEqual(upper.key) && !upper.inclusive) { finish(); return nil }
+                // The seek already satisfied the bound on the entry side, and
+                // keys are strictly ordered, so only the exit bound can fail.
+                if descending {
+                    if let lower {
+                        let order = leaf.compareKey(at: row, with: lower.key)
+                        if order < 0 || (order == 0 && !lower.inclusive) { finish(); return nil }
+                    }
+                } else if let upper {
+                    let order = leaf.compareKey(at: row, with: upper.key)
+                    if order > 0 || (order == 0 && !upper.inclusive) { finish(); return nil }
                 }
                 let position = TreePosition(node: leaf, row: row)
                 row += descending ? -1 : 1
@@ -81,6 +97,52 @@ internal struct TreeCursor: Sendable {
             }
             // The tree is needed only at a leaf transition. Binding it before
             // the row loop copies its reference-bearing snapshot on every pull.
+            guard let tree else { finish(); return nil }
+            try advanceLeaf(tree)
+        }
+        finish(); return nil
+    }
+
+    /// The rest of the current leaf that lies inside the bounds, visiting
+    /// exactly the rows and nodes `nextPosition` would, in the same order.
+    mutating func nextRun() throws -> TreeRun? {
+        guard !finished else { return nil }
+        if !started {
+            started = true
+            guard let tree, let root = tree.root else { finish(); return nil }
+            if let lower, let upper,
+               upper.key.lexicographicallyPrecedes(lower.key) ||
+                (upper.key == lower.key && (!upper.inclusive || !lower.inclusive)) {
+                finish(); return nil
+            }
+            try descend(root, seek: descending ? upper : lower, tree: tree)
+        }
+        while let leaf {
+            let entries = leaf.entryCount
+            if row >= 0, row < entries {
+                if descending {
+                    var stop = 0
+                    if let lower {
+                        let slot = leaf.leafSlot(lower.key)
+                        stop = slot.index + (slot.found && !lower.inclusive ? 1 : 0)
+                    }
+                    guard stop <= row else { finish(); return nil }
+                    let run = TreeRun(node: leaf, first: row, count: row - stop + 1, descending: true)
+                    // A bound inside this leaf ends the scan; otherwise the
+                    // next call moves to the preceding leaf.
+                    if stop > 0 { finish() } else { row = -1 }
+                    return run
+                }
+                var end = entries
+                if let upper {
+                    let slot = leaf.leafSlot(upper.key)
+                    end = slot.index + (slot.found && upper.inclusive ? 1 : 0)
+                }
+                guard end > row else { finish(); return nil }
+                let run = TreeRun(node: leaf, first: row, count: end - row, descending: false)
+                if end < entries { finish() } else { row = entries }
+                return run
+            }
             guard let tree else { finish(); return nil }
             try advanceLeaf(tree)
         }

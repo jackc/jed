@@ -64,7 +64,7 @@ internal final class JoinAccessExecution {
                 while let record = try cursor.next() {
                     try meter.step(); meter.charge(1)
                     var row = Array(repeating: SQLValue.null, count: relation.columns.count)
-                    for column in columns { row[column] = try record.materialize(column: column, pager: access.store.tree.pool?.pager) }
+                    for column in columns { row[column] = try record.materialize(column: column, type: access.store.tree.types[column], pager: access.store.tree.pool?.pager) }
                     if let filter = relation.scanFilter {
                         var filtered = current; filtered.column = { row[$0] }
                         if try !filtered.matches(filter) { continue }

@@ -35,7 +35,7 @@ internal enum DomainRebuilder {
                 while let record = try cursor.next() {
                     var destination = (isIndex ? target.indexes[name] : target.tables[name])!
                     let values = try record.cells.indices.map {
-                        RecordInput.value(try record.materialize(column: $0, pager: source.pool.pager, pageCount: sourcePages))
+                        RecordInput.value(try record.materialize(column: $0, type: stores[name]!.tree.types[$0], pager: source.pool.pager, pageCount: sourcePages))
                     }
                     let rebuilt = try RecordDisposition.plan(key: record.key, values: values,
                         types: destination.tree.types, codec: codec)

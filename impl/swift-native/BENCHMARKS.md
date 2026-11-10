@@ -15,6 +15,17 @@ report](VERIFICATION.md#structural-follow-up-acceptance) separately records 543
 native tests, all 749 frozen SQL files and the refreshed resource/storage/process
 gates. Swift remains a frozen, opt-in experiment; Apple platforms are unverified.
 
+## Second follow-up (2026-11-09)
+
+A later pass removed per-row and per-statement copy costs found by profiling;
+see [the design record](../../spec/design/swift-native-performance.md#second-follow-up-copy-and-dispatch-costs-2026-11-09).
+One diagnostic round of the same 22 workloads gives Swift/Rust geometric means
+of 2.63× on the twelve scan and aggregate workloads (4.96× before), 7.81× on
+the eight per-statement workloads (9.00× before) and 3.85× overall (5.75×
+before). [Per-workload results](BENCHMARK_FOLLOWUP_20261109.csv). It ran on a
+tmpfs data directory with one round, so it supplements the tables below and
+does not replace them.
+
 ## Current comparison with Rust, Go and TypeScript
 
 Each cell is the median of three process means for one authored operation.

@@ -4,6 +4,7 @@
 /// A retained root can keep this form after commit, like its pending values.
 internal final class RecordLeaf: Sendable {
     let records: [PackedRecord]
+    let types: [TypeDescriptor]
     let pending: [Int: [Int: PendingOverflow]]
     let payloadSize: Int
 
@@ -32,7 +33,7 @@ internal final class RecordLeaf: Sendable {
                     // An empty variable span is the on-disk NULL representation.
                     // Preserve the normalization formerly supplied by packing.
                     if normalized == nil { normalized = record.cells }
-                    normalized![column] = StoredCell(bytes: nil, type: types[column])
+                    normalized![column] = StoredCell(bytes: nil, width: 0)
                 }
             }
             if let normalized {
@@ -40,6 +41,96 @@ internal final class RecordLeaf: Sendable {
             }
             if !record.overflows.isEmpty { pending[row] = record.overflows }
         }
-        self.records = canonical; self.pending = pending; payloadSize = total
+        self.records = canonical; self.types = types; self.pending = pending; payloadSize = total
+    }
+
+    /// Records already admitted by the validating initializer (or read from a
+    /// validated page), in key order, with their exact payload size.
+    private init(admitted records: [PackedRecord], types: [TypeDescriptor],
+                 pending: [Int: [Int: PendingOverflow]], payloadSize: Int) {
+        self.records = records; self.types = types; self.pending = pending; self.payloadSize = payloadSize
+    }
+
+    /// Validate and normalize one incoming record exactly as the full
+    /// initializer does for every record.
+    static func admit(_ record: PackedRecord, types: [TypeDescriptor]) throws -> PackedRecord {
+        guard record.cells.count == types.count else {
+            throw JedError("0A000", "record differs from its tree's type contract")
+        }
+        var normalized: [StoredCell]?
+        for column in types.indices {
+            let cell = record.cells[column]
+            let width = ValueCodec.fixedWidth(types[column].type)
+            guard Int(cell.width) == (width ?? 0) else {
+                throw JedError("0A000", "record differs from its tree's type contract")
+            }
+            guard let bytes = cell.bytes else { continue }
+            if let width {
+                guard bytes.count == width else { throw JedError.corruption("invalid fixed-width cell") }
+            } else if let tag = bytes.first {
+                guard tag == 0 || tag == 2 || tag == 3 || tag == 4 else {
+                    throw JedError.corruption("invalid leaf value presence tag")
+                }
+            } else {
+                if normalized == nil { normalized = record.cells }
+                normalized![column] = StoredCell(bytes: nil, width: 0)
+            }
+        }
+        guard let normalized else { return record }
+        return PackedRecord(key: record.key, cells: normalized, overflows: record.overflows)
+    }
+
+    /// A validated clean page as writer records, without re-validating it.
+    /// A packed leaf's payload size is exactly its overhead plus the record
+    /// weights, and its accessor already reports an empty span as NULL.
+    convenience init(adopting leaf: PackedLeaf, pending: [Int: [Int: PendingOverflow]]) {
+        var records: [PackedRecord] = []
+        records.reserveCapacity(leaf.count)
+        for row in 0..<leaf.count {
+            let record = leaf.record(at: row)
+            if let overflows = pending[row] {
+                records.append(PackedRecord(key: record.key, cells: record.cells, overflows: overflows))
+            } else { records.append(record) }
+        }
+        self.init(admitted: records, types: leaf.types, pending: pending, payloadSize: leaf.payloadSize)
+    }
+
+    private static func rekeyed(_ pending: [Int: [Int: PendingOverflow]], from row: Int, by delta: Int,
+                                dropping: Int? = nil) -> [Int: [Int: PendingOverflow]] {
+        if pending.isEmpty { return pending }
+        var result: [Int: [Int: PendingOverflow]] = [:]
+        for (index, value) in pending where index != dropping { result[index >= row ? index + delta : index] = value }
+        return result
+    }
+
+    /// This leaf with one admitted record placed at `slot`: replacing the
+    /// record there, or inserted before it. Only the edited record is
+    /// examined; the others keep the admission this leaf already gave them.
+    func placing(_ record: PackedRecord, at slot: Int, replacing: Bool) throws -> RecordLeaf {
+        let count = records.count + (replacing ? 0 : 1)
+        var total = payloadSize - PackedLeaf.overhead(records: records.count, types: types)
+            + PackedLeaf.overhead(records: count, types: types) + record.weight
+        var edited = records, moved = pending
+        if replacing {
+            total -= records[slot].weight
+            edited[slot] = record
+            if moved[slot] != nil { moved[slot] = nil }
+        } else {
+            edited.insert(record, at: slot)
+            moved = Self.rekeyed(pending, from: slot, by: 1)
+        }
+        guard total <= UInt32.max else { throw JedError("0A000", "pending leaf exceeds the byte-format limit") }
+        if !record.overflows.isEmpty { moved[slot] = record.overflows }
+        return RecordLeaf(admitted: edited, types: types, pending: moved, payloadSize: total)
+    }
+
+    /// This leaf without the record at `slot`.
+    func removing(at slot: Int) -> RecordLeaf {
+        var edited = records
+        let old = edited.remove(at: slot)
+        let total = payloadSize - PackedLeaf.overhead(records: records.count, types: types)
+            + PackedLeaf.overhead(records: records.count - 1, types: types) - old.weight
+        return RecordLeaf(admitted: edited, types: types, pending: Self.rekeyed(pending, from: slot, by: -1, dropping: slot),
+                          payloadSize: total)
     }
 }

@@ -160,7 +160,7 @@ internal enum ForeignKeyValidation {
             var cursor = store.cursor(); defer { cursor.close() }
             while let record = try cursor.next() {
                 context.meter.charge(1); try context.meter.step()
-                let row = ScanRecord(record, pager: store.tree.pool?.pager)
+                let row = ScanRecord(record, types: store.tree.types, pager: store.tree.pool?.pager)
                 if case .key(let candidate) = try childProbe(row.value, context: context, enforceMatch: false), candidate == key { return true }
             }
             return false

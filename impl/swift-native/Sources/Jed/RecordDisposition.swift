@@ -52,7 +52,9 @@ internal enum RecordDisposition {
                 if !value.isNull { candidate.raw = try ValueCodec.encodeRawBody(value, type: type) }
                 candidate.rawLength = candidate.raw?.count ?? 0
             case .kept(let stored, let pending):
-                guard stored.type == type else { throw JedError("42804", "kept value changed its static type") }
+                // A kept cell is the same column of the same table's prior record;
+                // cells carry only their storage class, which must still agree.
+                guard Int(stored.width) == (width ?? 0) else { throw JedError("42804", "kept value changed its static type") }
                 candidate.original = stored; candidate.null = stored.isNull
                 if let pending {
                     guard let facts = try stored.largeFacts(encrypted: codec.reservedBytes != 0),

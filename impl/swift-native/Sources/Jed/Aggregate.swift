@@ -155,7 +155,10 @@ internal enum AggregateKernel {
 /// argument evaluation, and in-aggregate ORDER BY. Fixed state rides group ENTRY.
 internal final class AggregateState {
     let plan: AggregatePlan
-    let context: ExpressionContext
+    /// Only these two services are consulted while folding. Holding the whole
+    /// expression context made every state construction copy it.
+    private let meter: CostMeter
+    private let collatedKey: KeyEncoding.CollatedKey?
     private var closed = false
     private var count: Int64 = 0
     private var integer: Int64 = 0
@@ -168,7 +171,7 @@ internal final class AggregateState {
     private var orderedSet: AggregateOrderedSet?
 
     init(plan: AggregatePlan, context: ExpressionContext, bounded: Bool = false) {
-        self.plan = plan; self.context = context
+        self.plan = plan; meter = context.meter; collatedKey = context.collatedKey
         if case .collection = plan.kernel { collection = AggregateCollection(plan: plan, context: context, measured: !bounded) }
         if case .orderedSet = plan.kernel { orderedSet = AggregateOrderedSet(plan: plan, context: context, measured: !bounded) }
     }
@@ -311,7 +314,7 @@ internal final class AggregateState {
             try increment()
         case .exactSum:
             let value = try AggregateStatistics.decimal(value)
-            try DecimalFunctions.chargeWork("+", sum, value, meter: context.meter)
+            try DecimalFunctions.chargeWork("+", sum, value, meter: meter)
             sum = sum.addingUncapped(value)
             try increment()
         case .floatSum(let binary32): try float.add(value, binary32: binary32)
@@ -324,12 +327,12 @@ internal final class AggregateState {
             let square = x.multiplyingUncapped(x)
             let work = DecimalFunctions.work("*", x, x) - 1 + DecimalFunctions.work("+", sum, x) - 1
                 + DecimalFunctions.work("+", squares, square) - 1
-            context.meter.charge(work); try context.meter.guardCost()
+            meter.charge(work); try meter.guardCost()
             sum = sum.addingUncapped(x); squares = squares.addingUncapped(square); try increment()
         case .extreme(let minimum):
             if current.isNull { current = value }
             else {
-                let comparison = try ValueComparison.total(value, current, type: plan.inputTypes[0], collatedKey: context.collatedKey)
+                let comparison = try ValueComparison.total(value, current, type: plan.inputTypes[0], collatedKey: collatedKey)
                 if minimum ? comparison < 0 : comparison > 0 { current = value }
             }
         case .boolean(let or):

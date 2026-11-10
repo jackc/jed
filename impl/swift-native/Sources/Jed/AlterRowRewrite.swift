@@ -39,7 +39,7 @@ internal enum AlterRowRewrite {
         var cursor = original.cursor(); defer { cursor.close() }
         while let record = try cursor.next() {
             try context.meter.step(); context.meter.charge(1)
-            let source = ScanRecord(record, pager: original.tree.pool?.pager)
+            let source = ScanRecord(record, types: original.tree.types, pager: original.tree.pool?.pager)
             var values = try original.tree.types.indices.map { try source.value($0) }
             for step in steps {
                 switch step {

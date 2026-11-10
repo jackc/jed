@@ -17,15 +17,30 @@ internal struct ByteReader {
         return bytes[start..<(start + count)]
     }
 
-    mutating func u8() throws -> UInt8 { try take(1).first! }
+    /// Fixed-width reads check the remaining length once and index the slice
+    /// directly; building a sub-slice and folding it per integer dominated
+    /// every decode loop.
+    @inline(__always)
+    private mutating func advance(_ count: Int) throws -> Int {
+        guard count <= bytes.count - offset else { throw JedError.corruption("truncated byte field") }
+        let start = bytes.startIndex + offset
+        offset += count
+        return start
+    }
+    mutating func u8() throws -> UInt8 { bytes[try advance(1)] }
     mutating func u16() throws -> UInt16 {
-        try take(2).reduce(UInt16(0)) { ($0 << 8) | UInt16($1) }
+        let at = try advance(2)
+        return UInt16(bytes[at]) << 8 | UInt16(bytes[at + 1])
     }
     mutating func u32() throws -> UInt32 {
-        try take(4).reduce(UInt32(0)) { ($0 << 8) | UInt32($1) }
+        let at = try advance(4)
+        return UInt32(bytes[at]) << 24 | UInt32(bytes[at + 1]) << 16 | UInt32(bytes[at + 2]) << 8 | UInt32(bytes[at + 3])
     }
     mutating func u64() throws -> UInt64 {
-        try take(8).reduce(UInt64(0)) { ($0 << 8) | UInt64($1) }
+        let at = try advance(8)
+        var value: UInt64 = 0
+        for index in at..<(at + 8) { value = value << 8 | UInt64(bytes[index]) }
+        return value
     }
     mutating func i16() throws -> Int16 { Int16(bitPattern: try u16()) }
     mutating func i32() throws -> Int32 { Int32(bitPattern: try u32()) }

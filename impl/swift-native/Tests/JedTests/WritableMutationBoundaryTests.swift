@@ -56,8 +56,8 @@ final class WritableMutationBoundaryTests: XCTestCase {
         }
         try apply(replacement(9)); try apply(replacement(10))
         let final = try XCTUnwrap(working.tables[name]?.get(key))
-        if case .integer(let value) = try ScanRecord(final, pager: nil).value(1) { XCTAssertEqual(value, 10) } else { XCTFail("expected integer") }
-        if case .integer(let value) = try ScanRecord(original, pager: nil).value(1) { XCTAssertEqual(value, 7) } else { XCTFail("expected integer") }
+        if case .integer(let value) = try ScanRecord(final, types: working.tables[name]!.tree.types, pager: nil).value(1) { XCTAssertEqual(value, 10) } else { XCTFail("expected integer") }
+        if case .integer(let value) = try ScanRecord(original, types: working.tables[name]!.tree.types, pager: nil).value(1) { XCTAssertEqual(value, 7) } else { XCTFail("expected integer") }
         XCTAssertEqual(try entries(), [try KeyEncoding.encodeSlot(.integer(10), type: relation.types[1]) + key])
         XCTAssertEqual(working.catalog.tables.first?.rowCount, 1)
         try apply(nil)
