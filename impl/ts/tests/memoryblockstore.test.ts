@@ -24,3 +24,28 @@ test("MemoryBlockStore short read fails closed", () => {
   const store = new MemoryBlockStore(Uint8Array.of(1, 2, 3));
   assert.throws(() => store.readAt(2, 2), /short read/);
 });
+
+test("MemoryBlockStore shares aligned page reads and never edits a stored block", () => {
+  // A 256-byte page size, named at the meta header's offset 8.
+  const image = new Uint8Array(512);
+  new DataView(image.buffer).setUint32(8, 256, false);
+  image[300] = 7;
+  const store = MemoryBlockStore.owning(image);
+
+  const page = store.readAt(256, 256);
+  assert.equal(page, store.readAt(256, 256)); // the stored block itself, not a copy
+  assert.equal(page[44], 7);
+
+  // A rewrite installs a fresh block: the page a reader holds keeps the bytes it read.
+  store.writeAt(300, Uint8Array.of(9));
+  assert.equal(page[44], 7);
+  assert.equal(store.readAt(256, 256)[44], 9);
+
+  // Growth appends zero blocks; a shrink into a block zeroes its cut tail for a later growth.
+  store.setSize(1024);
+  assert.deepEqual([...store.readAt(512, 4)], [0, 0, 0, 0]);
+  store.setSize(300);
+  store.setSize(512);
+  assert.equal(store.readAt(256, 256)[44], 0);
+  assert.equal(store.readAt(0, 12)[10], 1);
+});

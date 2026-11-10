@@ -1816,7 +1816,7 @@ function* compactStorageSteps(st: Engine, snap: Snapshot, txid: bigint): Steps<S
     );
   } else {
     const image = toImageBytes(snap, st.pageSize, txid);
-    paging = new SharedPaging(Pager.fromStore(new MemoryBlockStore(image)), capacity);
+    paging = new SharedPaging(Pager.fromStore(MemoryBlockStore.owning(image)), capacity);
   }
   return yield* adoptRewrittenSteps(st, paging);
 }

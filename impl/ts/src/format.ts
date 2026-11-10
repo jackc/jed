@@ -4076,7 +4076,7 @@ export function newScratchStorage(
   environment: Environment,
 ): Engine {
   const image = toImage(new Snapshot(environment, 0n), pageSize, 0n, codec);
-  const pager = Pager.fromStore(new MemoryBlockStore(image));
+  const pager = Pager.fromStore(MemoryBlockStore.owning(image));
   const st = loadEnginePaged(new SharedPaging(pager, Number.MAX_SAFE_INTEGER, codec), environment);
   st.reclaimWithinSession = true;
   return st;
