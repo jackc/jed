@@ -1807,8 +1807,9 @@ fn merge_at(
         |sep_len: usize| interior_payload(cap, &node.keys) - node.keys[j].len() + sep_len;
 
     let merged = if left_is_leaf {
-        // The pre-check: a leaf merge takes a dirty operand's vectors, so decide before any move.
-        {
+        // The pre-check: a leaf merge takes a dirty operand's vectors, so decide before any move. Its
+        // merged weights and split point are the ones the merged leaf is built from.
+        let (weights, split) = {
             let operand = |slot: &Child, loaded: &Option<Arc<Node>>| -> Arc<Node> {
                 match (slot, loaded) {
                     (Child::Resident(n), _) => Arc::clone(n),
@@ -1827,7 +1828,8 @@ fn merge_at(
             for i in 0..rnode.len() {
                 weights.push(rnode.weight_at(i));
             }
-            if let Some(m) = leaf_split_point(&weights, cap, shape, None) {
+            let split = leaf_split_point(&weights, cap, shape, None);
+            if let Some(m) = split {
                 let sep_len = if m < lnode.len() {
                     lnode.key_at(m).len()
                 } else {
@@ -1839,17 +1841,15 @@ fn merge_at(
                     return Ok(());
                 }
             }
-        }
+            (weights, split)
+        };
         let (lslot, rslot) = node.children.split_at_mut(j + 1);
         let (lslot, rslot) = (&mut lslot[j], &mut rslot[0]);
         let lparts = leaf_parts(lslot, lloaded.as_ref())?;
         let rparts = leaf_parts(rslot, rloaded.as_ref())?;
-        let (mut mkeys, mut mvals, mut mweights) = into_parts(lslot, lparts);
-        let (rkeys, rvals, rweights) = into_parts(rslot, rparts);
-        mkeys.extend(rkeys);
-        mvals.extend(rvals);
-        mweights.extend(rweights);
-        build_leaf(mkeys, mvals, mweights, cap, shape, None)
+        let (lkeys, lvals, _) = into_parts(lslot, lparts);
+        let (rkeys, rvals, _) = into_parts(rslot, rparts);
+        merged_leaf(lkeys, lvals, rkeys, rvals, weights, split)
     } else {
         // Interior operands are always resident. Their separator/child lists are copied (cheap
         // `Arc` bumps): an abandoned merge must leave both exactly as they were.
@@ -1885,6 +1885,48 @@ fn merge_at(
         }
     }
     Ok(())
+}
+
+/// The leaf (or, split at `split`, the two leaves) holding the left operand's records then the
+/// right's — [`build_leaf`] over their concatenation, with `weights` already concatenated and its
+/// split point already found. Each half is assembled once from the two operands' vectors rather than
+/// concatenated and then split, so a record's slot is moved once.
+fn merged_leaf(
+    mut lkeys: Vec<Vec<u8>>,
+    mut lvals: Vec<Row>,
+    mut rkeys: Vec<Vec<u8>>,
+    mut rvals: Vec<Row>,
+    mut weights: Vec<u32>,
+    split: Option<usize>,
+) -> Ins {
+    let Some(m) = split else {
+        lkeys.append(&mut rkeys);
+        lvals.append(&mut rvals);
+        return Ins::Whole(Node::new_leaf(lkeys, lvals, weights));
+    };
+    let rweights = weights.split_off(m);
+    let (left, right) = if m < lkeys.len() {
+        // The right half is the left operand's tail, then the whole right operand.
+        let mut hkeys = Vec::with_capacity(lkeys.len() - m + rkeys.len());
+        let mut hvals = Vec::with_capacity(hkeys.capacity());
+        hkeys.extend(lkeys.drain(m..));
+        hkeys.append(&mut rkeys);
+        hvals.extend(lvals.drain(m..));
+        hvals.append(&mut rvals);
+        ((lkeys, lvals), (hkeys, hvals))
+    } else {
+        // The left half is the whole left operand, then the right operand's head.
+        let at = m - lkeys.len();
+        lkeys.extend(rkeys.drain(..at));
+        lvals.extend(rvals.drain(..at));
+        ((lkeys, lvals), (rkeys, rvals))
+    };
+    let sep = right.0[0].clone();
+    Ins::Split {
+        left: Node::new_leaf(left.0, left.1, weights),
+        sep,
+        right: Node::new_leaf(right.0, right.1, rweights),
+    }
 }
 
 /// In-order walk — a leaf walk in key order (records are leaf-only, v24). Clones each
