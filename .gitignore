@@ -57,6 +57,8 @@
 !/bench/aead/results/*.md
 /bench/go/bin/
 /bench/rust/target/
+/bench/prepared-join/rust/target/
+/bench/ruby-native/compare/rust/target/
 /bench/ts/node_modules
 
 # Per-worktree runtime state: this checkout's allocated TCP ports (port-tamer.toml -> ports.env,
