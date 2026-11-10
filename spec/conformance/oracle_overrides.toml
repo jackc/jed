@@ -943,7 +943,13 @@ reason = "create_type.test poisoned-prefix tail: this no-constraint CREATE TYPE 
 [[override]]
 file = "dml/insert_column_list.test"
 sql = "INSERT INTO t VALUES (5, 1)"
-reason = "jed: the positional VALUES form (no column list) requires a value for every column, so too few values is 42601 (grammar.md §32). PostgreSQL fills the omitted trailing column(s) with their declared default (here NULL) and accepts the insert. A documented surface narrowing."
+reason = "jed: the positional VALUES form (no column list) requires a value for every column, so too few values is 42601 (grammar.md §12). PostgreSQL fills the omitted trailing column(s) with their declared default (here NULL) and accepts the insert. A documented surface narrowing."
+
+# --- dml/insert_select.test: INSERT ... SELECT with no column list requires a value for EVERY column.
+[[override]]
+file = "dml/insert_select.test"
+sql = "INSERT INTO log_dst SELECT a FROM src_c WHERE id < 0"
+reason = "jed: with no column list the SELECT must project one column per table column, so too few is 42601 (grammar.md §24, the §12 VALUES rule). PostgreSQL fills the omitted trailing column(s) with their declared default (here NULL) and accepts the insert. A documented surface narrowing."
 
 # --- expr/is_distinct_from.test: `IS [NOT] DISTINCT FROM` inherits `=`'s strict-typing divergences.
 [[override]]

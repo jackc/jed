@@ -311,6 +311,12 @@ INSERT INTO i_dst SELECT id, id FROM t_src WHERE id > 100
 statement ok
 CREATE TABLE log_dst (a i16, b i64)
 
+# with no column list the SELECT must cover every column: one projected column for a two-column
+# table is 42601, a deliberate divergence (PostgreSQL fills b with its default; grammar.md §12/§24).
+# The source is empty so the PostgreSQL replay inserts nothing either.
+statement error 42601
+INSERT INTO log_dst SELECT a FROM src_c WHERE id < 0
+
 statement ok
 INSERT INTO log_dst SELECT a, b FROM src_c WHERE id < 100 ORDER BY id
 

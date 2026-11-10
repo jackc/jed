@@ -774,7 +774,11 @@ list** and the **`DEFAULT` keyword** are covered in §16; inserting the rows a q
 row whose arity differs from the column count (or, with a column list, the list length) is a
 syntax error (`42601`), the same code the single-row form already raised for a count mismatch.
 The column list (if any) is shared by all rows, so all rows necessarily map to the same column
-set.
+set. **A deliberate divergence from PostgreSQL:** with no column list, PostgreSQL accepts a row
+*shorter* than the table and fills the omitted trailing columns with their defaults; jed requires
+a value for every column. A positional row that silently stops short is usually a column-order
+mistake, and the column list (§16) is the explicit way to omit columns. A view is held to the
+same rule ([views.md](views.md) §15).
 
 **Two-phase / all-or-nothing — the UPDATE precedent.** A multi-row `INSERT` is atomic per
 statement, mirroring `UPDATE`'s two-phase pass (CLAUDE.md §11 step 6) and PostgreSQL: the
@@ -1882,7 +1886,9 @@ own and rewinding when a set operator or trailing clause follows.
 **Arity — the query's output column count must match the target**, exactly as a `VALUES`
 row's arity must (§12): the number of projected columns must equal the column-list length, or
 the table's column count with no list, else `42601`. This is checked **once, before any row is
-produced** — so it fires even when the `SELECT` returns **zero rows**.
+produced** — so it fires even when the `SELECT` returns **zero rows**. As for `VALUES`, PostgreSQL
+accepts *fewer* projected columns than the table with no list (the trailing columns take their
+defaults); jed's exact-arity rule is the same deliberate divergence (§12).
 
 **Type-assignability — checked up front, PostgreSQL-faithful.** Beyond the per-value checks the
 `VALUES` path already does, `INSERT ... SELECT` validates each projected column's **type** is
