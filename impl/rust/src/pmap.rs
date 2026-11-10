@@ -347,7 +347,10 @@ impl Node {
     }
 
     fn total_weight(&self) -> usize {
-        (0..self.len()).map(|i| self.weight_at(i) as usize).sum()
+        match &self.packed {
+            None => self.weights.iter().map(|&w| w as usize).sum(),
+            Some(p) => (0..self.len()).map(|i| p.record_weight(i) as usize).sum(),
+        }
     }
 
     /// This node's serialized payload size (format.md): a leaf is `Σ weights +
@@ -527,6 +530,8 @@ enum Ins {
     /// The uniquely owned dirty node passed to `node_insert` was edited in place. Its parent/root
     /// already points at the result, so no replacement `Arc` is needed.
     Kept,
+    /// The key is already present and the caller asked to keep it: nothing was changed.
+    Exists,
     Whole(Arc<Node>),
     Split {
         left: Arc<Node>,
@@ -892,10 +897,53 @@ impl PMap {
         shape: LeafShape,
         src: Option<&dyn LeafSource>,
     ) -> Result<Option<Row>> {
+        let (_, old) = self.insert_mode(key, val, weight, cap, shape, src, false)?;
+        Ok(old)
+    }
+
+    /// Insert `key` only if it is absent, in one descent. Returns whether it was inserted; a
+    /// present key leaves the map untouched.
+    pub(crate) fn insert_absent(
+        &mut self,
+        key: Vec<u8>,
+        val: Row,
+        weight: u32,
+        cap: Cap,
+        shape: LeafShape,
+        src: Option<&dyn LeafSource>,
+    ) -> Result<bool> {
+        let (inserted, _) = self.insert_mode(key, val, weight, cap, shape, src, true)?;
+        Ok(inserted)
+    }
+
+    /// [`Self::insert`], or [`Self::insert_absent`] when `keep_existing`: whether a new key was
+    /// inserted, and the row an overwrite replaced.
+    #[allow(clippy::too_many_arguments)]
+    fn insert_mode(
+        &mut self,
+        key: Vec<u8>,
+        val: Row,
+        weight: u32,
+        cap: Cap,
+        shape: LeafShape,
+        src: Option<&dyn LeafSource>,
+        keep_existing: bool,
+    ) -> Result<(bool, Option<Row>)> {
         let mut old = None;
         match self.root.as_mut() {
             None => self.root = Some(Node::new_leaf(vec![key], vec![val], vec![weight])),
-            Some(root) => match node_insert(root, key, val, weight, &mut old, src, cap, shape)? {
+            Some(root) => match node_insert(
+                root,
+                key,
+                val,
+                weight,
+                &mut old,
+                src,
+                cap,
+                shape,
+                keep_existing,
+            )? {
+                Ins::Exists => return Ok((false, None)),
                 Ins::Kept => {}
                 Ins::Whole(n) => self.root = Some(n),
                 Ins::Split { left, sep, right } => {
@@ -914,7 +962,7 @@ impl PMap {
                     .expect("row count remains within nonnegative i64")
             });
         }
-        Ok(old)
+        Ok((old.is_none(), old))
     }
 
     /// Remove `key`. Returns the removed row, or `None` if absent (then `self` is unchanged). `src`
@@ -1365,7 +1413,8 @@ impl RangeCursor {
 /// Recursive insert. Descends to the holding leaf (interior nodes route via
 /// [`Node::child_slot`]); on overwrite, sets `*old` and rebuilds with the value+weight replaced
 /// (which may now overflow). Splits propagate back up: a leaf split copies its boundary key up, an
-/// interior receiving a separator may push-split in turn.
+/// interior receiving a separator may push-split in turn. With `keep_existing`, a key already
+/// present returns [`Ins::Exists`] and nothing on the path is changed.
 #[allow(clippy::too_many_arguments)]
 fn node_insert(
     node: &mut Arc<Node>,
@@ -1376,9 +1425,13 @@ fn node_insert(
     src: Option<&dyn LeafSource>,
     cap: Cap,
     shape: LeafShape,
+    keep_existing: bool,
 ) -> Result<Ins> {
     if node.is_leaf() {
         let found = node.search(&key);
+        if keep_existing && found.is_ok() {
+            return Ok(Ins::Exists);
+        }
         // A dirty node has never been published. When this Arc is also unique, editing its vectors
         // cannot affect a snapshot/cursor/read pin. Clean nodes stay immutable even if unique so
         // incremental serialization and the publication invariant remain obvious.
@@ -1433,7 +1486,9 @@ fn node_insert(
         && let Some(node) = Arc::get_mut(node)
     {
         let sub = match &mut node.children[i] {
-            Child::Resident(c) => node_insert(c, key, val, weight, old, src, cap, shape)?,
+            Child::Resident(c) => {
+                node_insert(c, key, val, weight, old, src, cap, shape, keep_existing)?
+            }
             Child::OnDisk(page) => {
                 let mut c = match src {
                     Some(s) => s.load_leaf(*page)?,
@@ -1444,7 +1499,17 @@ fn node_insert(
                         )
                     }
                 };
-                match node_insert(&mut c, key, val, weight, old, src, cap, shape)? {
+                match node_insert(
+                    &mut c,
+                    key,
+                    val,
+                    weight,
+                    old,
+                    src,
+                    cap,
+                    shape,
+                    keep_existing,
+                )? {
                     // A loaded leaf is clean (and the pool also retains it), so this is defensive.
                     Ins::Kept => Ins::Whole(c),
                     out => out,
@@ -1453,6 +1518,7 @@ fn node_insert(
         };
         return match sub {
             Ins::Kept => Ok(Ins::Kept),
+            Ins::Exists => Ok(Ins::Exists),
             Ins::Whole(c) => {
                 node.children[i] = Child::Resident(c);
                 Ok(Ins::Kept)
@@ -1474,9 +1540,20 @@ fn node_insert(
         };
     }
     let mut c = child(node, i, src)?;
-    match node_insert(&mut c, key, val, weight, old, src, cap, shape)? {
+    match node_insert(
+        &mut c,
+        key,
+        val,
+        weight,
+        old,
+        src,
+        cap,
+        shape,
+        keep_existing,
+    )? {
         // The local Arc clone means a resident child cannot be unique here. Keep this arm
         // defensive for a future child representation: rebuilding the parent preserves its link.
+        Ins::Exists => Ok(Ins::Exists),
         Ins::Kept => {
             let mut children = node.children.clone();
             children[i] = Child::Resident(c);
@@ -1795,7 +1872,7 @@ fn merge_at(
     };
 
     match merged {
-        Ins::Kept => unreachable!("fresh merge builders never edit an existing node"),
+        Ins::Kept | Ins::Exists => unreachable!("fresh merge builders never edit an existing node"),
         Ins::Whole(m) => {
             node.keys.remove(j);
             node.children[j] = Child::Resident(m);

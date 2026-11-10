@@ -242,18 +242,19 @@ impl TableStore {
     /// through the buffer pool (an I/O error then propagates).
     pub fn insert(&mut self, key: Vec<u8>, row: Row) -> Result<bool> {
         let (w, stored) = self.weight(&key, &row); // full `&self` borrow — before the leaf source
-        {
-            let src = make_src(&self.paging, &self.col_types);
-            let src_ref = src.as_ref().map(|s| s as &dyn LeafSource);
-            if self.rows.get(&key, src_ref)?.is_some() {
-                return Ok(false);
-            }
-        }
-        self.stage(&key, stored)?;
+        // The tree takes the key; staging names it only while staged keys are recorded.
+        let staged_key = if self.net { key.clone() } else { Vec::new() };
         let src = make_src(&self.paging, &self.col_types);
         let src_ref = src.as_ref().map(|s| s as &dyn LeafSource);
-        self.rows
-            .insert(key, row, w, self.cap, self.shape, src_ref)?;
+        // One descent both finds an existing key and inserts an absent one.
+        if !self
+            .rows
+            .insert_absent(key, row, w, self.cap, self.shape, src_ref)?
+        {
+            return Ok(false);
+        }
+        drop(src);
+        self.stage(&staged_key, stored)?;
         Ok(true)
     }
 
