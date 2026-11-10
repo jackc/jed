@@ -108,8 +108,9 @@ import {
   readGistLeafKeysSteps,
   serializeGistTreeTo,
 } from "./gist.ts";
-import { lz4Compress, lz4Decompress } from "./lz4.ts";
+import { lz4CompressScratch, lz4Decompress } from "./lz4.ts";
 import { MemoryBlockStore } from "./memoryblockstore.ts";
+import { utf8Length } from "./memsize.ts";
 import { Pager } from "./pager.ts";
 import { compareBytes, decodedRows, keyViews, nodeLen, onDiskRef, residentRef } from "./pmap.ts";
 import { rangeElemCmp, rangeForElement } from "./range.ts";
@@ -1200,7 +1201,15 @@ function valueFacts(ty: ColType, v: Value): [number, number] {
     else payload = u.rawLen;
     return [payload + inlineHeaderLen(ty), payload];
   }
-  return [encodeValue(ty, v).length, isSpillable(ty) ? valuePayload(ty, v).length : 0];
+  if (!isSpillable(ty)) return [encodeValue(ty, v).length, 0];
+  // A spillable value's inline-plain encoding is its header then its payload P(v), so neither is
+  // built just to be measured: a text / json body's length is its string's UTF-8 byte count (not
+  // its UTF-16 length), a bytea body's its byte length.
+  let payload: number;
+  if (v.kind === "text" || v.kind === "json") payload = utf8Length(v.text);
+  else if (v.kind === "bytea") payload = v.bytes.length;
+  else payload = valuePayload(ty, v).length;
+  return [inlineHeaderLen(ty) + payload, payload];
 }
 
 // planningPayload is the content payload P(v) of a value the planner compresses: a resident value's,
@@ -1285,8 +1294,11 @@ function planDispositions(colTypes: ColType[], key: Uint8Array, row: Row, cap: C
         compLen = v.ref.storedLen; // the block stays on the value's chain
       }
     } else {
-      comp = lz4Compress(planningPayload(colTypes[i]!, v));
-      compLen = comp.length;
+      // The attempt's block is a view of the encoder's worst-case buffer; it is copied out only if
+      // adopted.
+      const block = lz4CompressScratch(planningPayload(colTypes[i]!, v));
+      compLen = block.length;
+      if (INLINE_COMP_OVERHEAD + compLen < inline[i]!) comp = block.slice();
     }
     if (compLen >= 0 && INLINE_COMP_OVERHEAD + compLen < inline[i]!) {
       size = size - cur[i]! + INLINE_COMP_OVERHEAD + compLen;

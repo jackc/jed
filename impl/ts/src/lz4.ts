@@ -25,44 +25,64 @@ function hash(v: number): number {
   return Math.imul(v, HASH_MUL) >>> (32 - HASH_LOG);
 }
 
+// The encoder writes into one block of the worst-case output size (every byte a literal: the input,
+// one token, and its length-extension bytes), tracking its write position.
+function maxCompressedLength(n: number): number {
+  return n + Math.floor(n / 255) + 16;
+}
+
 // Length-extension bytes for a token nibble that hit 15: 255* then the remainder (lz4.md §1).
-function emitLength(out: number[], n: number): void {
+// Returns the next write position.
+function emitLength(out: Uint8Array, o: number, n: number): number {
   while (n >= 255) {
-    out.push(255);
+    out[o++] = 255;
     n -= 255;
   }
-  out.push(n);
+  out[o++] = n;
+  return o;
 }
 
 function emitSequence(
-  out: number[],
+  out: Uint8Array,
+  o: number,
   src: Uint8Array,
   litFrom: number,
   litTo: number,
   offset: number,
   mlen: number,
-): void {
+): number {
   const lit = litTo - litFrom;
   const ml = mlen - MIN_MATCH;
-  out.push((Math.min(lit, 15) << 4) | Math.min(ml, 15));
-  if (lit >= 15) emitLength(out, lit - 15);
-  for (let i = litFrom; i < litTo; i++) out.push(src[i]!);
+  out[o++] = (Math.min(lit, 15) << 4) | Math.min(ml, 15);
+  if (lit >= 15) o = emitLength(out, o, lit - 15);
+  out.set(src.subarray(litFrom, litTo), o);
+  o += lit;
   // The u16 offset is LITTLE-endian — the one deliberate exception to the big-endian house
   // rule, so the blob stays readable by any conformant LZ4 decoder (lz4.md §1).
-  out.push(offset & 0xff, (offset >> 8) & 0xff);
-  if (ml >= 15) emitLength(out, ml - 15);
+  out[o++] = offset & 0xff;
+  out[o++] = (offset >> 8) & 0xff;
+  if (ml >= 15) o = emitLength(out, o, ml - 15);
+  return o;
 }
 
-function emitLastLiterals(out: number[], src: Uint8Array, litFrom: number): void {
+function emitLastLiterals(out: Uint8Array, o: number, src: Uint8Array, litFrom: number): number {
   const lit = src.length - litFrom;
-  out.push(Math.min(lit, 15) << 4);
-  if (lit >= 15) emitLength(out, lit - 15);
-  for (let i = litFrom; i < src.length; i++) out.push(src[i]!);
+  out[o++] = Math.min(lit, 15) << 4;
+  if (lit >= 15) o = emitLength(out, o, lit - 15);
+  out.set(src.subarray(litFrom), o);
+  return o + lit;
 }
 
 // lz4Compress is the pinned encoder (lz4.md §2): one input → one output, in every core.
 export function lz4Compress(src: Uint8Array): Uint8Array {
-  const out: number[] = [];
+  return lz4CompressScratch(src).slice();
+}
+
+// lz4CompressScratch is lz4Compress without the final copy: the block is a view of the worst-case
+// output buffer, so a caller that keeps it copies it (the planner copies only a block it adopts).
+export function lz4CompressScratch(src: Uint8Array): Uint8Array {
+  const out = new Uint8Array(maxCompressedLength(src.length));
+  let o = 0;
   const table = new Int32Array(1 << HASH_LOG).fill(-1);
   let anchor = 0;
   let p = 0;
@@ -75,15 +95,15 @@ export function lz4Compress(src: Uint8Array): Uint8Array {
       const maxend = src.length - LAST_LITERALS;
       let mlen = MIN_MATCH;
       while (p + mlen < maxend && src[cand + mlen] === src[p + mlen]) mlen++;
-      emitSequence(out, src, anchor, p, p - cand, mlen);
+      o = emitSequence(out, o, src, anchor, p, p - cand, mlen);
       p += mlen; // positions inside the match are NOT hashed
       anchor = p;
     } else {
       p++; // step is always 1 (no acceleration)
     }
   }
-  emitLastLiterals(out, src, anchor);
-  return Uint8Array.from(out);
+  o = emitLastLiterals(out, o, src, anchor);
+  return out.subarray(0, o);
 }
 
 function corrupt(msg: string): Error {
