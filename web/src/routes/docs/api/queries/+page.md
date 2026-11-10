@@ -294,8 +294,8 @@ also interrupts engine work inside a long `Rows.Next()` after `Query` has return
 and terminal errors release the cursor automatically.
 
 Rust's `query_cancelable` and `execute_cancelable` accept a clonable `CancellationToken`; another
-thread can call `cancel()` while the query runs. After manually draining Rust rows, call `error()`
-to check for an execution error.
+thread can call `cancel()` while the query runs. A Rust `Rows` cursor yields each row as a `Result`,
+so an execution error (including `57014`) arrives as an `Err` item while you iterate.
 
 TypeScript's `query` and `execute` accept `{ signal }` after their typed parameter array, including
 on prepared statements. Keep the signal alive while consuming rows: it also applies to later

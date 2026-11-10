@@ -357,8 +357,11 @@ mod tests {
         };
         db.execute(&sql, &[]).unwrap();
         // Drain the total `query` seam (a statement is a no-column cursor; a SELECT carries rows).
-        let counted: Vec<Vec<jed::Value>> =
-            db.query("SELECT count(*) FROM t", &[]).unwrap().collect();
+        let counted: Vec<Vec<jed::Value>> = db
+            .query("SELECT count(*) FROM t", &[])
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
         assert_eq!(counted[0][0], jed::Value::Int(2));
     }
 }

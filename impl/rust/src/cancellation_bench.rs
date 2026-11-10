@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 #[test]
 #[ignore]
 fn cancellation_benchmark() {
-    let mut db = Database::create(CreateOptions::default()).unwrap();
+    let db = Database::create(CreateOptions::default()).unwrap();
     for sql in [
         "CREATE TABLE t (id i32 PRIMARY KEY, v i32)",
         "INSERT INTO t SELECT i, i % 100 FROM generate_series(1, 10000) AS g(i)",
@@ -41,9 +41,8 @@ fn cancellation_benchmark() {
                     }
                     .unwrap();
                     for row in rows.by_ref() {
-                        black_box(row);
+                        black_box(row.unwrap());
                     }
-                    rows.error().unwrap();
                     black_box(rows.cost());
                     n += 1;
                 }
@@ -68,7 +67,7 @@ fn cancellation_benchmark() {
 #[test]
 #[ignore]
 fn cancellation_latency_measurement() {
-    let mut db = Database::create(CreateOptions::default()).unwrap();
+    let db = Database::create(CreateOptions::default()).unwrap();
     for sql in [
         "CREATE TABLE t (id i32 PRIMARY KEY, v i32)",
         "INSERT INTO t SELECT i, i % 100 FROM generate_series(1, 1000000) AS g(i)",
@@ -90,11 +89,17 @@ fn cancellation_latency_measurement() {
                 token.cancel();
                 start
             });
+            let mut err = None;
             for row in rows.by_ref() {
-                black_box(row);
+                match row {
+                    Ok(row) => {
+                        black_box(row);
+                    }
+                    Err(e) => err = Some(e),
+                }
             }
             let end = Instant::now();
-            assert_eq!(rows.error().unwrap_err().code(), "57014");
+            assert_eq!(err.expect("the cancellation").code(), "57014");
             samples.push(end.duration_since(worker.join().unwrap()).as_nanos());
         }
         samples.sort();

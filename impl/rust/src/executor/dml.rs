@@ -68,7 +68,7 @@ const MAX_FK_ACTION_DEPTH: usize = 256;
 /// ACTION/RESTRICT probe saved until every generated write in the recursive closure has finished
 /// (constraints.md §6.6). Inside a data-modifying `WITH`, every check — child-side existence and
 /// MATCH FULL included — waits for the end of the whole statement (writable-cte.md §7).
-pub(super) enum FkDeferredCheck {
+pub(crate) enum FkDeferredCheck {
     /// `update` means the old parent key must first be re-probed in the final state.
     Parent {
         parent: Table,

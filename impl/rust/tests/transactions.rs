@@ -36,7 +36,12 @@ fn begin_execute_commit_is_visible() {
     db.query_outcome("INSERT INTO t VALUES (1)", &[]).unwrap();
     db.query_outcome("INSERT INTO t VALUES (2)", &[]).unwrap();
     // read-your-writes within the transaction
-    match db.query("SELECT id FROM t", &[]).unwrap().count() {
+    match db
+        .query("SELECT id FROM t", &[])
+        .unwrap()
+        .map(|r| r.unwrap())
+        .count()
+    {
         2 => {}
         n => panic!("expected 2 rows visible inside the tx, got {n}"),
     }

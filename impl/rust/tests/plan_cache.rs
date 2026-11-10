@@ -52,9 +52,8 @@ fn drain(
     let mut rows = s.query_prepared(stmt, params).unwrap();
     let mut out = Vec::new();
     for r in &mut rows {
-        out.push(r);
+        out.push(r.unwrap());
     }
-    rows.error().unwrap();
     let cost = rows.cost();
     (out, cost)
 }
@@ -891,9 +890,8 @@ fn transaction_runs_prepared() {
             1
         );
         let mut rows = tx.query_prepared(&select, &[Value::Int(2)])?;
-        let row = rows.next().expect("in-tx prepared read");
+        let row = rows.next().expect("in-tx prepared read")?;
         assert_eq!(row, vec![Value::Int(200)]);
-        rows.error()?;
         Ok(())
     })
     .unwrap();

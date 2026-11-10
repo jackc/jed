@@ -47,6 +47,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut hash = 14_695_981_039_346_656_037_u64;
         let mut count = 0_u64;
         for row in rows.by_ref() {
+            let row = row?;
             count += 1;
             for value in row {
                 let s = value.render();
@@ -56,7 +57,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             hash = (hash ^ u64::from(b'\n')).wrapping_mul(1_099_511_628_211);
         }
-        rows.error()?;
         if name != "-" {
             println!(
                 "{{\"name\":\"{name}\",\"rows\":{count},\"cost\":{},\"checksum\":\"{hash:016x}\",\"ms\":{}}}",

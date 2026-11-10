@@ -102,9 +102,8 @@ fn streamed_sorted(db: &mut Session, sql: &str) -> (Vec<Vec<String>>, i64) {
         .unwrap_or_else(|e| panic!("{sql}: {e:?}"));
     let mut out: Vec<Vec<String>> = Vec::new();
     for r in &mut rows {
-        out.push(r.iter().map(|v| v.render()).collect());
+        out.push(r.unwrap().iter().map(|v| v.render()).collect());
     }
-    rows.error().unwrap();
     let c = rows.cost();
     out.sort();
     (out, c)

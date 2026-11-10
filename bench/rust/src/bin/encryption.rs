@@ -61,7 +61,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if phase == "cold" {
             let start = Instant::now();
             let mut q = s.query("SELECT count(*), sum(length(v)) FROM t", &[])?;
-            let row = q.next().expect("one row");
+            let row = q.next().expect("one row")?;
             let sum = match &row[1] {
                 Value::Int(n) => *n,
                 other => panic!("{other:?}"),
@@ -70,7 +70,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             report("full_scan_cold", start, sum);
         } else {
             // Warm the cache so every lookup is a hit.
-            s.query("SELECT count(*) FROM t", &[])?.for_each(drop);
+            for row in s.query("SELECT count(*) FROM t", &[])? {
+                row?;
+            }
         }
         let stmt = s.prepare("SELECT length(v) FROM t WHERE id = $1")?;
         let start = Instant::now();
@@ -82,7 +84,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             x ^= x << 17;
             let id = (x % rows as u64) as i64 + 1;
             for row in s.query_prepared(&stmt, &[Value::Int(id)])? {
-                if let Value::Int(n) = row[0] {
+                if let Value::Int(n) = row?[0] {
                     checksum += n + id;
                 }
             }

@@ -61,6 +61,7 @@ impl PreparedStatement {
 /// corpus, byte-unchanged) and `Streaming` (S3, streaming.md §4) for a single-table no-blocking-op
 /// `query()` — a lazy pull pipeline that yields one row at a time over a pinned snapshot. The seam
 /// is the same either way, so callers are unchanged.
+#[must_use = "a cursor does nothing until it is iterated"]
 pub struct Rows {
     column_names: std::rc::Rc<[String]>,
     /// The canonical type name of each output column (parallel to `column_names`), carried on the
@@ -74,11 +75,8 @@ pub struct Rows {
     /// SELECT / DDL / transaction control, which carry no count. This is how the exec-side path (`run`)
     /// reads the tag off a drained `Rows` — "run is throw away the rows, keep the count."
     rows_affected: Option<i64>,
-    /// A mid-drain error from a streaming cursor (a `54P01` cost abort, `57014` cancellation, or an
-    /// arithmetic trap). The `Iterator` yields `Option`, so an error mid-drain stops iteration and is
-    /// stashed here; [`Rows::error`] / the ergonomic collectors surface it after draining
-    /// (streaming.md §6). Always `None` for the buffered cursor (its work is already done).
-    error: Option<EngineError>,
+    /// Set once iteration has yielded an error; the cursor then yields nothing more.
+    failed: bool,
     /// Fired **once** when iteration first hits a terminal error (a drain-time streaming/deferred
     /// fault). Set by the shared-core query path ([`Engine::attach_block_poison`]) for a read inside an
     /// open block, to abort the block — the open-time lane errors are poisoned at the `query` return,
@@ -115,7 +113,7 @@ impl Rows {
                 column_types: std::rc::Rc::from(column_types),
                 cursor: Cursor::buffered(rows, cost, account, cost_ceiling),
                 rows_affected: None,
-                error: None,
+                failed: false,
                 on_error: None,
                 _pin: None,
             },
@@ -127,7 +125,7 @@ impl Rows {
                 column_types: std::rc::Rc::from(Vec::new()),
                 cursor: Cursor::buffered(Vec::new(), cost, account, cost_ceiling),
                 rows_affected,
-                error: None,
+                failed: false,
                 on_error: None,
                 _pin: None,
             },
@@ -146,7 +144,7 @@ impl Rows {
             column_types: column_types.into(),
             cursor: Cursor::streaming(source),
             rows_affected: None,
-            error: None,
+            failed: false,
             on_error: None,
             _pin: None,
         }
@@ -197,16 +195,6 @@ impl Rows {
         self.cursor.cost()
     }
 
-    /// Surface a mid-drain streaming error (streaming.md §6): `Err` if iteration stopped on an error,
-    /// else `Ok`. The `Iterator` impl yields `Option`, so a streaming consumer that needs the error
-    /// (the ergonomic collectors do) calls this after draining. Always `Ok` for a buffered cursor.
-    pub fn error(&mut self) -> Result<()> {
-        match self.error.take() {
-            Some(e) => Err(e),
-            None => Ok(()),
-        }
-    }
-
     /// Admit a row an engine-owned collector appends while draining this cursor (spec/design/memory.md
     /// §5.1), against the statement's query-memory budget. A `54P05` here is a statement failure: it
     /// fires the block-poison hook like a mid-drain error.
@@ -243,29 +231,33 @@ impl Rows {
 /// surfaces a mid-drain streaming error (a `54P01` cost abort, `57014` cancellation, or an arithmetic
 /// trap — streaming.md §6) rather than silently dropping it.
 pub(crate) fn drain_affected(mut rows: Rows) -> Result<u64> {
-    while rows.next().is_some() {}
-    rows.error()?;
+    for row in rows.by_ref() {
+        row?;
+    }
     Ok(rows.rows_affected().map(|n| n.max(0) as u64).unwrap_or(0))
 }
 
+/// Iterating a cursor yields each row as a `Result`: a streaming read can fail part-way through
+/// (a `54P01` cost abort, `57014` cancellation, an arithmetic trap, a read fault — streaming.md §6),
+/// and that failure is an `Err` item rather than a silently shortened result. After an `Err` the
+/// cursor yields nothing more. Collect with `rows.collect::<Result<Vec<_>>>()`.
 impl Iterator for Rows {
-    type Item = Vec<Value>;
+    type Item = Result<Vec<Value>>;
 
-    fn next(&mut self) -> Option<Vec<Value>> {
-        if self.error.is_some() {
+    fn next(&mut self) -> Option<Result<Vec<Value>>> {
+        if self.failed {
             return None;
         }
         match self.cursor.next_row() {
-            Ok(row) => row,
+            Ok(row) => row.map(Ok),
             Err(e) => {
-                // Stash the mid-drain error (streaming.md §6) and end iteration; `error()` surfaces it.
-                self.error = Some(e);
+                self.failed = true;
                 // Fire the block-poison hook once (transactions.md §6): a drain-time read fault inside
                 // an open block aborts it, so the next statement is `25P02` rather than wrongly running.
                 if let Some(hook) = self.on_error.take() {
                     hook();
                 }
-                None
+                Some(Err(e))
             }
         }
     }
@@ -688,9 +680,9 @@ pub(crate) fn drain_to_outcome(mut rows: Rows) -> Result<Outcome> {
     let column_types = rows.column_types().to_vec();
     let mut out_rows = Vec::new();
     for row in rows.by_ref() {
+        let row = row?;
         out_rows.push(row);
     }
-    rows.error()?;
     let cost = rows.cost();
     if column_names.is_empty() {
         Ok(Outcome::Statement {

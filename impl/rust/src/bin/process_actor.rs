@@ -389,18 +389,18 @@ fn timed(database: &mut Database, command: &str, argument: &str) -> Result<Strin
                 let mut rows_out =
                     database.query_prepared(&stmt, &[Value::Int(k * 7919 % rows + 1)])?;
                 for row in rows_out.by_ref() {
+                    let row = row?;
                     checksum += int(&row[0]);
                 }
-                rows_out.error()?;
             }
         }
         "TIME_SCAN" => {
             for _ in 0..n {
                 let mut rows_out = database.query("SELECT sum(v)::i64 FROM bench_ps", &[])?;
                 for row in rows_out.by_ref() {
+                    let row = row?;
                     checksum = int(&row[0]);
                 }
-                rows_out.error()?;
             }
         }
         _ => {
@@ -445,6 +445,7 @@ fn query_i64(handle: &mut impl QueryHandle, sql: &str) -> Result<String, EngineE
     let mut rows = handle.query_actor(sql)?;
     let mut rendered = Vec::new();
     for row in rows.by_ref() {
+        let row = row?;
         let fields = row
             .into_iter()
             .map(|value| match value {
@@ -456,7 +457,6 @@ fn query_i64(handle: &mut impl QueryHandle, sql: &str) -> Result<String, EngineE
             .join(":");
         rendered.push(fields);
     }
-    rows.error()?;
     Ok(rendered.join(","))
 }
 

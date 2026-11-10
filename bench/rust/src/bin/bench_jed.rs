@@ -193,12 +193,14 @@ impl Engine for JedEngine {
         let mut n = 0;
         match sum {
             None => {
-                for _ in rows {
+                for row in rows {
+                    row.map_err(|e| e.to_string())?;
                     n += 1;
                 }
             }
             Some(sum) => {
                 for row in rows {
+                    let row = row.map_err(|e| e.to_string())?;
                     n += 1;
                     for v in row {
                         match v {
@@ -228,7 +230,8 @@ impl Engine for JedEngine {
 
     fn query_int(&mut self, sql: &str) -> BoxResult<i64> {
         let mut rows = self.sess.query(sql, &[]).map_err(|e| e.to_string())?;
-        match rows.next().and_then(|r| r.into_iter().next()) {
+        let first = rows.next().transpose().map_err(|e| e.to_string())?;
+        match first.and_then(|r| r.into_iter().next()) {
             Some(Value::Int(n)) => Ok(n),
             other => Err(format!("expected one integer from {sql:?}, got {other:?}").into()),
         }
@@ -336,12 +339,14 @@ fn reader_query(
     let mut n = 0;
     match sum {
         None => {
-            for _ in rows {
+            for row in rows {
+                row.map_err(|e| e.to_string())?;
                 n += 1;
             }
         }
         Some(sum) => {
             for row in rows {
+                let row = row.map_err(|e| e.to_string())?;
                 n += 1;
                 for v in row {
                     match v {

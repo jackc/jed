@@ -69,9 +69,15 @@ fn blocking_spill_cursor_cleanup_and_failure_paths() {
             session.set_work_mem(work_mem);
             session.set_max_cost(ceiling);
             let mut cursor = session.query(sql, &[]).unwrap();
-            let rows: Vec<_> = cursor.by_ref().collect();
+            let mut rows = Vec::new();
+            let mut error = None;
+            for row in cursor.by_ref() {
+                match row {
+                    Ok(row) => rows.push(row),
+                    Err(e) => error = Some(e.code().to_string()),
+                }
+            }
             let cost = cursor.cost();
-            let error = cursor.error().err().map(|e| e.code().to_string());
             cursor.close();
             outcomes.push((rows, cost, error));
         }

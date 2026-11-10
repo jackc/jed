@@ -5677,19 +5677,19 @@ impl Database {
 
     /// Run a (possibly mutating) statement, binding `$N` params, on a fresh autocommit session,
     /// returning the affected-row count (exec-side sugar over the total `query` seam).
-    pub fn execute(&mut self, sql: &str, params: &[Value]) -> Result<u64> {
+    pub fn execute(&self, sql: &str, params: &[Value]) -> Result<u64> {
         self.session(SessionOptions::default()).execute(sql, params)
     }
 
     /// Run a query on a fresh autocommit session, returning a row cursor.
-    pub fn query(&mut self, sql: &str, params: &[Value]) -> Result<Rows> {
+    pub fn query(&self, sql: &str, params: &[Value]) -> Result<Rows> {
         self.session(SessionOptions::default()).query(sql, params)
     }
 
     /// Run a statement on a fresh autocommit session under a [`CancellationToken`] (spec/design/api.md
     /// §11.4): a flipped token (from any thread) aborts it `57014` at the next execution checkpoint.
     pub fn execute_cancelable(
-        &mut self,
+        &self,
         sql: &str,
         params: &[Value],
         cancel: &CancellationToken,
@@ -5701,7 +5701,7 @@ impl Database {
     /// Run a query on a fresh autocommit session under a [`CancellationToken`] (spec/design/api.md
     /// §11.4) — the query sibling of [`execute_cancelable`](Database::execute_cancelable).
     pub fn query_cancelable(
-        &mut self,
+        &self,
         sql: &str,
         params: &[Value],
         cancel: &CancellationToken,
@@ -5712,24 +5712,24 @@ impl Database {
 
     /// Run a multi-statement script on a fresh autocommit session (spec/design/session.md §4.2): the
     /// whole run is one implicit transaction (all-or-nothing).
-    pub fn execute_script(&mut self, sql: &str) -> Result<ScriptSummary> {
+    pub fn execute_script(&self, sql: &str) -> Result<ScriptSummary> {
         self.session(SessionOptions::default()).execute_script(sql)
     }
 
     /// Run `f` in a READ ONLY transaction on a fresh session (scoped, panic-safe sugar, §2.2).
-    pub fn view<R>(&mut self, f: impl FnOnce(&mut Transaction) -> Result<R>) -> Result<R> {
+    pub fn view<R>(&self, f: impl FnOnce(&mut Transaction) -> Result<R>) -> Result<R> {
         self.session(SessionOptions::default()).view(f)
     }
 
     /// Run `f` in a READ WRITE transaction on a fresh session (scoped, panic-safe sugar, §2.2): the
     /// closure's statements commit together, or roll back together on error/panic.
-    pub fn update<R>(&mut self, f: impl FnOnce(&mut Transaction) -> Result<R>) -> Result<R> {
+    pub fn update<R>(&self, f: impl FnOnce(&mut Transaction) -> Result<R>) -> Result<R> {
         self.session(SessionOptions::default()).update(f)
     }
 
     /// Run the COLLATION UPGRADE migration on the live database (collation.md §12), returning the
     /// number of re-pinned collations. Mints a fresh write session for the migration.
-    pub fn upgrade_collations(&mut self) -> Result<usize> {
+    pub fn upgrade_collations(&self) -> Result<usize> {
         self.session(SessionOptions::default()).upgrade_collations()
     }
 
@@ -5742,13 +5742,13 @@ impl Database {
 
     /// Run a [`PreparedStatement`] on a fresh autocommit session, binding `$N` params (the prepared
     /// analogue of [`execute`](Database::execute)).
-    pub fn execute_prepared(&mut self, stmt: &PreparedStatement, params: &[Value]) -> Result<u64> {
+    pub fn execute_prepared(&self, stmt: &PreparedStatement, params: &[Value]) -> Result<u64> {
         self.session(SessionOptions::default())
             .execute_prepared(stmt, params)
     }
 
     /// Run a prepared **query** on a fresh autocommit session, returning a row cursor.
-    pub fn query_prepared(&mut self, stmt: &PreparedStatement, params: &[Value]) -> Result<Rows> {
+    pub fn query_prepared(&self, stmt: &PreparedStatement, params: &[Value]) -> Result<Rows> {
         self.session(SessionOptions::default())
             .query_prepared(stmt, params)
     }
@@ -5821,10 +5821,10 @@ mod cancel_internal_tests {
         session.engine.session.cancel = Some(token);
         // Building the lazy cursor is fine; the meter checkpoint aborts during the drain (streaming.md §6).
         let mut rows = session.query("SELECT id FROM t", &[]).unwrap();
-        for _ in &mut rows {}
         let err = rows
-            .error()
-            .expect_err("the meter checkpoint must abort the running scan");
+            .by_ref()
+            .find_map(|r| r.err())
+            .expect("the meter checkpoint must abort the running scan");
         assert_eq!(
             err.code(),
             "57014",
@@ -5834,7 +5834,7 @@ mod cancel_internal_tests {
         // Cleared: the same query completes and returns every row (the poll was the only difference).
         session.engine.session.cancel = None;
         let rows = session.query("SELECT id FROM t", &[]).unwrap();
-        assert_eq!(rows.count(), 20);
+        assert_eq!(rows.map(|r| r.unwrap()).count(), 20);
     }
 }
 
@@ -6315,7 +6315,13 @@ mod temp_reclaim_internal_tests {
             .unwrap();
         sess.query_outcome("INSERT INTO y VALUES (7)", &[]).unwrap();
         let sel = sess.prepare("SELECT a FROM y").unwrap();
-        assert_eq!(sess.query_prepared(&sel, &[]).unwrap().count(), 1);
+        assert_eq!(
+            sess.query_prepared(&sel, &[])
+                .unwrap()
+                .map(|r| r.unwrap())
+                .count(),
+            1
+        );
         sess.query_outcome("COMMIT", &[]).unwrap();
         match sess.query_prepared(&sel, &[]) {
             Err(e) => assert_eq!(e.code(), "42P01"),
@@ -6479,7 +6485,7 @@ mod residency_flip_tests {
         );
         // Reads fault the demoted leaves back through the pool and still see every row.
         let mut rows = db.query("SELECT count(*), sum(v) FROM t", &[]).unwrap();
-        let row = rows.next().expect("one row");
+        let row = rows.next().expect("one row").unwrap();
         assert_eq!(row[0], Value::Int(200));
         assert_eq!(row[1], Value::Int(39800));
     }
@@ -6528,7 +6534,11 @@ mod reclaim_watermark_tests {
     use std::sync::mpsc;
 
     fn count(s: &mut Session) -> i64 {
-        let rows: Vec<_> = s.query("SELECT count(*) FROM t", &[]).unwrap().collect();
+        let rows: Vec<_> = s
+            .query("SELECT count(*) FROM t", &[])
+            .unwrap()
+            .collect::<Result<_>>()
+            .unwrap();
         match &rows[0][0] {
             Value::Int(n) => *n,
             v => panic!("expected an int count, got {v:?}"),
@@ -6657,12 +6667,14 @@ mod multi_root_failure_tests {
     fn attachment_rows(db: &Database) -> Result<Vec<(i64, i64)>> {
         let mut s = db.session(SessionOptions::default());
         let rows = s.query("SELECT id, v FROM a.t ORDER BY id", &[])?;
-        Ok(rows
-            .map(|row| match (&row[0], &row[1]) {
+        rows.map(|row| {
+            let row = row?;
+            Ok(match (&row[0], &row[1]) {
                 (Value::Int(id), Value::Int(v)) => (*id, *v),
                 other => panic!("expected two integers, got {other:?}"),
             })
-            .collect())
+        })
+        .collect()
     }
 
     fn expected(v: impl Fn(i64) -> i64) -> Vec<(i64, i64)> {
@@ -6808,7 +6820,8 @@ mod multi_root_failure_tests {
         let n: Vec<_> = fresh
             .query("SELECT count(*) FROM t", &[])
             .unwrap()
-            .collect();
+            .collect::<Result<_>>()
+            .unwrap();
         assert_eq!(n[0][0], Value::Int(6));
     }
 }

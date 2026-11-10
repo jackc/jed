@@ -36,7 +36,13 @@ fn query_rows_collector_is_admitted() {
     // memory.md §6.5), held until its emission completes.
     s.set_max_query_memory_bytes(3200);
     // Draining by hand: the lane is the engine's, the rows are the host's own memory.
-    assert_eq!(s.query("SELECT id FROM t", &[]).unwrap().count(), 100);
+    assert_eq!(
+        s.query("SELECT id FROM t", &[])
+            .unwrap()
+            .map(|r| r.unwrap())
+            .count(),
+        100
+    );
     // The engine-owned collector also charges each collected row (32 + 32 bytes): 3200 + 6400.
     s.set_max_query_memory_bytes(3200 + 64 * 100);
     assert_eq!(s.query_rows("SELECT id FROM t", ()).unwrap().len(), 100);
@@ -63,10 +69,9 @@ fn query_memory_budget_stays_with_cursor() {
         .err()
         .expect("54P05");
     assert_eq!(err.code(), "54P05");
-    assert!(old.next().is_some());
-    assert!(old.next().is_some());
+    assert!(matches!(old.next(), Some(Ok(_))));
+    assert!(matches!(old.next(), Some(Ok(_))));
     assert!(old.next().is_none());
-    old.error().unwrap();
 }
 
 #[test]

@@ -27,7 +27,7 @@ fn mem() -> Session {
 fn ids(db: &mut Session, stmt: &jed::PreparedStatement, params: &[Value]) -> Vec<Value> {
     db.query_prepared(stmt, params)
         .unwrap()
-        .map(|row| row[0].clone())
+        .map(|row| row.unwrap()[0].clone())
         .collect()
 }
 

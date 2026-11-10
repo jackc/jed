@@ -7,7 +7,7 @@
 use jed::{CreateOptions, Database, SessionOptions, Value};
 
 fn seeded() -> Database {
-    let mut db = Database::create(CreateOptions::default()).unwrap();
+    let db = Database::create(CreateOptions::default()).unwrap();
     db.run(
         "CREATE TABLE t (id i32 PRIMARY KEY, name text, score f64)",
         (),
@@ -29,7 +29,7 @@ fn seeded() -> Database {
 /// `run` binds a heterogeneous tuple and returns the affected-row count; DDL carries no count (0).
 #[test]
 fn run_binds_tuple_and_returns_affected() {
-    let mut db = Database::create(CreateOptions::default()).unwrap();
+    let db = Database::create(CreateOptions::default()).unwrap();
     assert_eq!(
         db.run("CREATE TABLE t (id i32 PRIMARY KEY, name text)", ())
             .unwrap(),
@@ -56,7 +56,7 @@ fn run_binds_tuple_and_returns_affected() {
 /// narrowing/float/text targets all read correctly.
 #[test]
 fn query_rows_typed_get() {
-    let mut db = seeded();
+    let db = seeded();
     let rows = db
         .query_rows("SELECT id, name, score FROM t ORDER BY id", ())
         .unwrap();
@@ -83,7 +83,7 @@ fn query_rows_typed_get() {
 /// `query_map` maps each row into a native tuple; `query_row` returns the first row as `Option`.
 #[test]
 fn query_map_and_query_row() {
-    let mut db = seeded();
+    let db = seeded();
     let pairs: Vec<(i32, String)> = db
         .query_map("SELECT id, name FROM t ORDER BY id", (), |r| {
             Ok((r.get(0)?, r.get(1)?))
@@ -107,7 +107,7 @@ fn query_map_and_query_row() {
 /// scalar target rejects NULL with `22004`.
 #[test]
 fn null_scanning() {
-    let mut db = Database::create(CreateOptions::default()).unwrap();
+    let db = Database::create(CreateOptions::default()).unwrap();
     db.run("CREATE TABLE t (id i32 PRIMARY KEY, name text)", ())
         .unwrap();
     db.run(
@@ -129,7 +129,7 @@ fn null_scanning() {
 /// index/name `42703`.
 #[test]
 fn scan_error_codes() {
-    let mut db = Database::create(CreateOptions::default()).unwrap();
+    let db = Database::create(CreateOptions::default()).unwrap();
     db.run("CREATE TABLE t (big i64 PRIMARY KEY, label text)", ())
         .unwrap();
     db.run("INSERT INTO t VALUES ($1, $2)", (5_000_000_000_i64, "x"))
@@ -152,7 +152,7 @@ fn scan_error_codes() {
 /// raw `[Value]` (via `Value: ToValue`) — all reach the same `$N` binder.
 #[test]
 fn params_shapes() {
-    let mut db = seeded();
+    let db = seeded();
 
     // array params
     let two: Vec<i32> = db

@@ -228,7 +228,7 @@ fn file_storage_limit_counts_every_live_structure() {
 
 #[test]
 fn file_attachment_storage_limit() {
-    let (mut file, path) = file_db("attach", 0);
+    let (file, path) = file_db("attach", 0);
     file.execute("CREATE TABLE a (id i32 PRIMARY KEY, v text)", &[])
         .unwrap();
     drop(file);

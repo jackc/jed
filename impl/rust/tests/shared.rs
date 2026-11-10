@@ -8,7 +8,11 @@
 use jed::{CreateOptions, Database, Session};
 
 fn count(r: &mut Session) -> i64 {
-    let rows: Vec<_> = r.query("SELECT count(*) FROM t", &[]).unwrap().collect();
+    let rows: Vec<_> = r
+        .query("SELECT count(*) FROM t", &[])
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
     match &rows[0][0] {
         jed::Value::Int(n) => *n,
         other => panic!("expected an i64 count, got {other:?}"),

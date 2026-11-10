@@ -65,12 +65,12 @@ impl Session {
     /// Run one statement through the one total `query` seam (spec/design/api.md §11) and materialize
     /// the cursor into the CLI's render shape: a cursor with output columns is a query; a no-column
     /// cursor IS a bare statement carrying its command tag. A **mid-drain** streaming error (a `54P01`
-    /// cost abort, `57014` cancellation, or arithmetic trap) surfaces here via [`jed::Rows::error`].
+    /// cost abort, `57014` cancellation, or arithmetic trap) is the cursor's `Err` item and fails the
+    /// statement here.
     fn exec_output(&mut self, sql: &str) -> Result<ExecOutput, EngineError> {
         let mut rows = self.db.query(sql, &[])?;
         let columns = rows.column_names().to_vec();
-        let drained: Vec<Vec<Value>> = rows.by_ref().collect();
-        rows.error()?;
+        let drained: Vec<Vec<Value>> = rows.by_ref().collect::<Result<_, _>>()?;
         let cost = rows.cost();
         if columns.is_empty() {
             Ok(ExecOutput::Statement {

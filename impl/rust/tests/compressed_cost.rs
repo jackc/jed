@@ -39,8 +39,9 @@ fn cost(db: &mut Session, sql: &str) -> i64 {
 
 fn stream_cost(db: &mut Session, sql: &str) -> i64 {
     let mut rows = db.query(sql, &[]).unwrap();
-    for _ in &mut rows {}
-    rows.error().unwrap();
+    for r in &mut rows {
+        r.unwrap();
+    }
     rows.cost()
 }
 

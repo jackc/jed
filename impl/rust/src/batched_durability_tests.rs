@@ -372,8 +372,10 @@ fn relaxed_background_flush_with_concurrent_readers() {
                     let mut rows = s
                         .query("SELECT count(*), min(v), max(v) FROM t", &[])
                         .map_err(|e| e.message.clone())?;
-                    let row = rows.next().ok_or("no row")?;
-                    rows.error().map_err(|e| e.message.clone())?;
+                    let row = rows
+                        .next()
+                        .ok_or("no row")?
+                        .map_err(|e| e.message.clone())?;
                     let ints: Vec<i64> = row
                         .iter()
                         .map(|v| match v {
@@ -548,7 +550,7 @@ fn relaxed_trailing_truncation_waits_for_the_flush() {
     assert_eq!(state(&re).0, pc, "reopened page count");
     let mut s = re.session(SessionOptions::default());
     let mut rows = s.query("SELECT count(*) FROM t", &[]).unwrap();
-    let row = rows.next().expect("a count row");
+    let row = rows.next().expect("a count row").unwrap();
     assert!(matches!(row[0], Value::Int(100)), "reopened count");
     drop(rows);
     drop(s);

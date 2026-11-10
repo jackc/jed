@@ -167,7 +167,7 @@ fn commit_and_rollback_are_noops_under_autocommit() {
     db.commit().unwrap();
     db.rollback().unwrap(); // does NOT undo the autocommitted insert
     match db.query("SELECT id FROM t", &[]).unwrap().next() {
-        Some(row) => assert_eq!(row, vec![Value::Int(1)]),
+        Some(row) => assert_eq!(row.unwrap(), vec![Value::Int(1)]),
         None => panic!("autocommitted row must remain"),
     }
 }
@@ -188,7 +188,7 @@ fn prepare_execute_and_query_with_params() {
     let select = db.prepare("SELECT id, v FROM t WHERE v = $1").unwrap();
     let mut rows = db.query_prepared(&select, &[Value::Int(200)]).unwrap();
     assert_eq!(rows.column_names(), &["id".to_string(), "v".to_string()]);
-    let collected: Vec<Vec<Value>> = rows.by_ref().collect();
+    let collected: Vec<Vec<Value>> = rows.by_ref().collect::<Result<_, _>>().unwrap();
     assert_eq!(collected, vec![vec![Value::Int(2), Value::Int(200)]]);
     assert!(rows.cost() >= 0);
 }
@@ -205,7 +205,7 @@ fn one_shot_query_iterates_rows() {
     let ids: Vec<Value> = db
         .query("SELECT id FROM t", &[])
         .unwrap()
-        .map(|r| r[0].clone())
+        .map(|r| r.unwrap()[0].clone())
         .collect();
     assert_eq!(ids, vec![Value::Int(1), Value::Int(2), Value::Int(3)]);
 }

@@ -30,6 +30,8 @@ pub fn dump(db: &mut jed::Session, out: &mut dyn Write) -> io::Result<()> {
             .query(&format!("SELECT * FROM {}{order_by}", q(name)), &[])
             .expect("a full-table scan of a cataloged table cannot fail");
         for row in rows {
+            // A read that fails part-way must fail the dump, never shorten it.
+            let row = row.map_err(io::Error::other)?;
             let values: Vec<String> = row.iter().map(Value::sql_literal).collect();
             writeln!(
                 out,
@@ -449,7 +451,7 @@ mod tests {
         let rows = replayed
             .query("SELECT id FROM ids WHERE b = 3", &[])
             .unwrap();
-        let ids: Vec<Vec<jed::Value>> = rows.collect();
+        let ids: Vec<Vec<jed::Value>> = rows.collect::<Result<_, _>>().unwrap();
         assert_eq!(ids, vec![vec![jed::Value::Int(15)]]);
     }
 }

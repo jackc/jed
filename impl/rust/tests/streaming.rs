@@ -43,9 +43,8 @@ fn streamed(sess: &mut Session, sql: &str) -> (Vec<Vec<Value>>, i64) {
     let mut rows = sess.query(sql, &[]).unwrap();
     let mut out = Vec::new();
     for r in &mut rows {
-        out.push(r);
+        out.push(r.unwrap());
     }
-    rows.error().unwrap();
     (out, rows.cost())
 }
 
@@ -112,7 +111,7 @@ fn early_exit_reads_and_charges_less() {
 
     // Pull only the first 3 rows, then drop the cursor — far fewer rows scanned, so far less cost.
     let mut rows = s.query("SELECT id FROM t ORDER BY id", &[]).unwrap();
-    let prefix: Vec<Value> = (&mut rows).take(3).map(|r| r[0].clone()).collect();
+    let prefix: Vec<Value> = (&mut rows).take(3).map(|r| r.unwrap()[0].clone()).collect();
     let partial_cost = rows.cost();
     drop(rows);
 
@@ -138,7 +137,7 @@ fn streaming_cursor_pins_its_snapshot_and_watermark() {
     let mut reader = db.session(SessionOptions::default());
     // Open a streaming cursor over the v1 snapshot but pull only ONE row (cursor stays live).
     let mut rows = reader.query("SELECT id FROM t ORDER BY id", &[]).unwrap();
-    let first = rows.next().unwrap();
+    let first = rows.next().unwrap().unwrap();
     assert_eq!(first, vec![Value::Int(1)]);
     // The live cursor pins v1 in the watermark.
     assert_eq!(db.oldest_live_txid(), 1, "open cursor pins its version");
@@ -162,13 +161,12 @@ fn streaming_cursor_pins_its_snapshot_and_watermark() {
     );
 
     // Draining the rest of the cursor sees ONLY the v1 snapshot (ids 2, 3) — not the writer's rows.
-    let rest: Vec<Value> = (&mut rows).map(|r| r[0].clone()).collect();
+    let rest: Vec<Value> = (&mut rows).map(|r| r.unwrap()[0].clone()).collect();
     assert_eq!(
         rest,
         vec![Value::Int(2), Value::Int(3)],
         "frozen at open-time root"
     );
-    rows.error().unwrap();
 
     // Closing the cursor releases the pin; the watermark advances.
     rows.close();
@@ -194,7 +192,10 @@ fn write_transaction_cursor_is_stable_across_later_inserts() {
         .unwrap();
 
     let mut pinned = writer.query("SELECT id FROM t ORDER BY id", &[]).unwrap();
-    assert_eq!(pinned.next(), Some(vec![Value::Int(1)]));
+    assert_eq!(
+        pinned.next().transpose().unwrap(),
+        Some(vec![Value::Int(1)])
+    );
     for id in 5..=67 {
         writer
             .query_outcome(&format!("INSERT INTO t VALUES ({id}, {})", id * 10), &[])
@@ -207,9 +208,8 @@ fn write_transaction_cursor_is_stable_across_later_inserts() {
         vec![vec![Value::Int(67)]]
     );
     // The older cursor remains frozen at its open-time working root (ids 1..=4).
-    let rest: Vec<Value> = (&mut pinned).map(|row| row[0].clone()).collect();
+    let rest: Vec<Value> = (&mut pinned).map(|row| row.unwrap()[0].clone()).collect();
     assert_eq!(rest, vec![Value::Int(2), Value::Int(3), Value::Int(4)]);
-    pinned.error().unwrap();
     pinned.close();
     drop(pinned);
 
@@ -232,15 +232,17 @@ fn mid_drain_cost_abort_surfaces() {
     let mut rows = s.query("SELECT id FROM t ORDER BY id", &[]).unwrap();
     // Iterate until the cursor stops (the meter guard aborts mid-drain).
     let mut n = 0;
-    for _ in &mut rows {
+    let mut err = None;
+    for r in &mut rows {
+        if let Err(e) = r {
+            err = Some(e);
+        }
         n += 1;
         if n > 10_000 {
             panic!("the cost ceiling should have aborted the drain");
         }
     }
-    let err = rows
-        .error()
-        .expect_err("a mid-drain cost abort must surface");
+    let err = err.expect("a mid-drain cost abort must surface");
     assert_eq!(err.code(), "54P01", "the abort is a cost-limit error");
 }
 
@@ -248,12 +250,11 @@ fn mid_drain_cost_abort_surfaces() {
 /// the cursor (it owns its snapshot), and the result matches a fresh session's eager path.
 #[test]
 fn database_query_convenience_streams() {
-    let mut db = seeded(50);
+    let db = seeded(50);
     let mut rows = db
         .query("SELECT id, v FROM t ORDER BY id LIMIT 4", &[])
         .unwrap();
-    let out: Vec<Vec<Value>> = (&mut rows).collect();
-    rows.error().unwrap();
+    let out: Vec<Vec<Value>> = (&mut rows).collect::<Result<_, _>>().unwrap();
     assert_eq!(
         out,
         vec![
@@ -278,7 +279,7 @@ fn bare_handle_query_pins_watermark_under_reclamation() {
     let path =
         std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("bare_handle_watermark.jed");
     let _ = std::fs::remove_file(&path);
-    let mut db = Database::create(CreateOptions {
+    let db = Database::create(CreateOptions {
         path: Some(path.clone()),
         page_size: 256,
         skip_fsync: true,
@@ -299,7 +300,7 @@ fn bare_handle_query_pins_watermark_under_reclamation() {
     // Open a bare-handle streaming cursor (the transient session closes before `query` returns; the
     // pin rides the `Rows`) and pull ONE row so the scan is live mid-tree.
     let mut rows = db.query("SELECT id, v FROM t ORDER BY id", &[]).unwrap();
-    let first = rows.next().unwrap();
+    let first = rows.next().unwrap().unwrap();
     assert_eq!(first, vec![Value::Int(1), Value::Int(10)]);
     assert_eq!(
         db.oldest_live_txid(),
@@ -322,13 +323,12 @@ fn bare_handle_query_pins_watermark_under_reclamation() {
     let mut want = 2i64;
     for r in &mut rows {
         assert_eq!(
-            r,
+            r.unwrap(),
             vec![Value::Int(want), Value::Int(want * 10)],
             "SNAPSHOT ISOLATION VIOLATED: the cursor's pages were reclaimed and overwritten"
         );
         want += 1;
     }
-    rows.error().unwrap();
     assert_eq!(want, 121, "drained the full pinned snapshot 2..=120");
     rows.close();
     drop(rows);
@@ -382,7 +382,7 @@ fn buffered_early_exit_charges_less() {
     assert_eq!(full_rows.len(), 1000);
 
     let mut rows = s.query(sql, &[]).unwrap();
-    let prefix: Vec<Vec<Value>> = (&mut rows).take(3).collect();
+    let prefix: Vec<Vec<Value>> = (&mut rows).take(3).collect::<Result<_, _>>().unwrap();
     let partial_cost = rows.cost();
     drop(rows);
 
@@ -413,7 +413,7 @@ fn buffered_cursor_pins_its_snapshot_and_watermark() {
     // A blocking query (ORDER BY v — not PK order) → the buffered cursor. Pull one row (this runs the
     // blocking part over the v1 snapshot), keep the cursor live.
     let mut rows = reader.query("SELECT v FROM t ORDER BY v", &[]).unwrap();
-    let first = rows.next().unwrap();
+    let first = rows.next().unwrap().unwrap();
     assert_eq!(first, vec![Value::Int(10)]);
     assert_eq!(
         db.oldest_live_txid(),
@@ -436,13 +436,12 @@ fn buffered_cursor_pins_its_snapshot_and_watermark() {
     );
 
     // Draining the rest sees ONLY the v1 snapshot (v = 20, 30) — not the writer's rows.
-    let rest: Vec<Value> = (&mut rows).map(|r| r[0].clone()).collect();
+    let rest: Vec<Value> = (&mut rows).map(|r| r.unwrap()[0].clone()).collect();
     assert_eq!(
         rest,
         vec![Value::Int(20), Value::Int(30)],
         "frozen at open-time root"
     );
-    rows.error().unwrap();
 
     rows.close();
     drop(rows);
@@ -464,15 +463,17 @@ fn buffered_mid_drain_cost_abort_surfaces() {
     // Building the buffered cursor must not throw (the blocking scan runs on first pull).
     let mut rows = s.query("SELECT v FROM t ORDER BY v", &[]).unwrap();
     let mut n = 0;
-    for _ in &mut rows {
+    let mut err = None;
+    for r in &mut rows {
+        if let Err(e) = r {
+            err = Some(e);
+        }
         n += 1;
         if n > 10_000 {
             panic!("the cost ceiling should have aborted the drain");
         }
     }
-    let err = rows
-        .error()
-        .expect_err("a mid-drain cost abort must surface");
+    let err = err.expect("a mid-drain cost abort must surface");
     assert_eq!(err.code(), "54P01", "the abort is a cost-limit error");
 }
 
@@ -519,7 +520,7 @@ fn sorted_early_exit_charges_less() {
     assert_eq!(full_rows.len(), 1000);
 
     let mut rows = s.query(sql, &[]).unwrap();
-    let prefix: Vec<Value> = (&mut rows).take(3).map(|r| r[0].clone()).collect();
+    let prefix: Vec<Value> = (&mut rows).take(3).map(|r| r.unwrap()[0].clone()).collect();
     let partial_cost = rows.cost();
     drop(rows);
 
@@ -618,7 +619,7 @@ fn sorted_spill_merge_streams_lazily() {
         let mut s = db.session(SessionOptions::default());
         s.set_work_mem(128);
         let mut rows = s.query(sql, &[]).unwrap();
-        let prefix: Vec<Vec<Value>> = (&mut rows).take(5).collect();
+        let prefix: Vec<Vec<Value>> = (&mut rows).take(5).collect::<Result<_, _>>().unwrap();
         assert_eq!(
             prefix,
             er[..5].to_vec(),
@@ -681,9 +682,8 @@ fn deferred_runs_fully_on_first_pull() {
 
     // Pull just one row, then read the cost: the whole run already happened on that first pull.
     let mut rows = s.query(sql, &[]).unwrap();
-    let _first = rows.next().unwrap();
+    let _first = rows.next().unwrap().unwrap();
     let after_one = rows.cost();
-    rows.error().unwrap();
     assert_eq!(
         after_one, full_cost,
         "a deferred set-op/WITH accrues its full cost on the first pull (lazy-yield only, §7)"
@@ -707,7 +707,7 @@ fn deferred_cursor_pins_its_snapshot_and_watermark() {
             &[],
         )
         .unwrap();
-    let first = rows.next().unwrap();
+    let first = rows.next().unwrap().unwrap();
     assert_eq!(first, vec![Value::Int(10)]);
     assert_eq!(
         db.oldest_live_txid(),
@@ -730,13 +730,12 @@ fn deferred_cursor_pins_its_snapshot_and_watermark() {
     );
 
     // Draining the rest sees ONLY the v1 snapshot (v = 20, 30) — not the writer's rows.
-    let rest: Vec<Value> = (&mut rows).map(|r| r[0].clone()).collect();
+    let rest: Vec<Value> = (&mut rows).map(|r| r.unwrap()[0].clone()).collect();
     assert_eq!(
         rest,
         vec![Value::Int(20), Value::Int(30)],
         "frozen at open-time root"
     );
-    rows.error().unwrap();
 
     rows.close();
     drop(rows);
@@ -763,15 +762,17 @@ fn deferred_mid_drain_cost_abort_surfaces() {
         )
         .unwrap();
     let mut n = 0;
-    for _ in &mut rows {
+    let mut err = None;
+    for r in &mut rows {
+        if let Err(e) = r {
+            err = Some(e);
+        }
         n += 1;
         if n > 10_000 {
             panic!("the cost ceiling should have aborted the drain");
         }
     }
-    let err = rows
-        .error()
-        .expect_err("a mid-drain cost abort must surface");
+    let err = err.expect("a mid-drain cost abort must surface");
     assert_eq!(err.code(), "54P01", "the abort is a cost-limit error");
 }
 
@@ -790,8 +791,7 @@ fn deferred_skips_data_modifying_with() {
             &[],
         )
         .unwrap();
-    let out: Vec<Value> = (&mut rows).map(|r| r[0].clone()).collect();
-    rows.error().unwrap();
+    let out: Vec<Value> = (&mut rows).map(|r| r.unwrap()[0].clone()).collect();
     assert_eq!(out, vec![Value::Int(6), Value::Int(7)]);
     drop(rows);
     // The write committed: the rows are now visible.
@@ -826,9 +826,8 @@ fn prepared_query_matches_streamed() {
         let mut rows = s.query_prepared(&stmt, &[]).unwrap();
         let mut pr = Vec::new();
         for r in &mut rows {
-            pr.push(r);
+            pr.push(r.unwrap());
         }
-        rows.error().unwrap();
         let pc = rows.cost();
         assert_eq!(pr, er, "prepared rows mismatch: {sql}");
         assert_eq!(pc, ec, "prepared cost mismatch: {sql}");
@@ -844,14 +843,12 @@ fn prepared_query_binds_params_and_streams() {
     let sql = "SELECT id, v FROM t WHERE id >= $1 ORDER BY id LIMIT 4";
 
     let mut ad_hoc = s.query(sql, &[Value::Int(90)]).unwrap();
-    let ar: Vec<Vec<Value>> = (&mut ad_hoc).collect();
-    ad_hoc.error().unwrap();
+    let ar: Vec<Vec<Value>> = (&mut ad_hoc).collect::<Result<_, _>>().unwrap();
     let ac = ad_hoc.cost();
 
     let stmt = s.prepare(sql).unwrap();
     let mut rows = s.query_prepared(&stmt, &[Value::Int(90)]).unwrap();
-    let pr: Vec<Vec<Value>> = (&mut rows).collect();
-    rows.error().unwrap();
+    let pr: Vec<Vec<Value>> = (&mut rows).collect::<Result<_, _>>().unwrap();
     let pc = rows.cost();
 
     assert_eq!(
@@ -867,7 +864,7 @@ fn prepared_query_binds_params_and_streams() {
     assert_eq!(pc, ac, "prepared bound cost matches ad-hoc");
     // A prepared statement is reusable: a second run with a different param re-streams.
     let mut rows2 = s.query_prepared(&stmt, &[Value::Int(1)]).unwrap();
-    let pr2: Vec<Vec<Value>> = (&mut rows2).take(2).collect();
+    let pr2: Vec<Vec<Value>> = (&mut rows2).take(2).collect::<Result<_, _>>().unwrap();
     drop(rows2);
     assert_eq!(
         pr2,
@@ -887,13 +884,12 @@ fn prepared_query_early_exit_charges_less() {
     let stmt = s.prepare("SELECT id FROM t ORDER BY id").unwrap();
 
     let mut full = s.query_prepared(&stmt, &[]).unwrap();
-    let full_rows: Vec<Vec<Value>> = (&mut full).collect();
-    full.error().unwrap();
+    let full_rows: Vec<Vec<Value>> = (&mut full).collect::<Result<_, _>>().unwrap();
     let full_cost = full.cost();
     assert_eq!(full_rows.len(), 1000);
 
     let mut rows = s.query_prepared(&stmt, &[]).unwrap();
-    let prefix: Vec<Value> = (&mut rows).take(3).map(|r| r[0].clone()).collect();
+    let prefix: Vec<Value> = (&mut rows).take(3).map(|r| r.unwrap()[0].clone()).collect();
     let partial_cost = rows.cost();
     drop(rows);
 
@@ -914,7 +910,7 @@ fn prepared_query_pins_its_snapshot_and_watermark() {
     let mut reader = db.session(SessionOptions::default());
     let stmt = reader.prepare("SELECT id FROM t ORDER BY id").unwrap();
     let mut rows = reader.query_prepared(&stmt, &[]).unwrap();
-    let first = rows.next().unwrap();
+    let first = rows.next().unwrap().unwrap();
     assert_eq!(first, vec![Value::Int(1)]);
     assert_eq!(db.oldest_live_txid(), 1, "open prepared cursor pins v1");
 
@@ -926,9 +922,8 @@ fn prepared_query_pins_its_snapshot_and_watermark() {
     }
     assert_eq!(db.oldest_live_txid(), 1, "watermark held at the pin");
 
-    let rest: Vec<Value> = (&mut rows).map(|r| r[0].clone()).collect();
+    let rest: Vec<Value> = (&mut rows).map(|r| r.unwrap()[0].clone()).collect();
     assert_eq!(rest, vec![Value::Int(2), Value::Int(3)], "frozen at open");
-    rows.error().unwrap();
     rows.close();
     drop(rows);
     assert_eq!(db.oldest_live_txid(), 2, "closed cursor releases its pin");
@@ -945,15 +940,17 @@ fn prepared_query_mid_drain_cost_abort_surfaces() {
     // Building the cursor is fine; the per-row meter guard aborts during the drain.
     let mut rows = s.query_prepared(&stmt, &[]).unwrap();
     let mut n = 0;
-    for _ in &mut rows {
+    let mut err = None;
+    for r in &mut rows {
+        if let Err(e) = r {
+            err = Some(e);
+        }
         n += 1;
         if n > 10_000 {
             panic!("the cost ceiling should have aborted the drain");
         }
     }
-    let err = rows
-        .error()
-        .expect_err("a mid-drain cost abort must surface");
+    let err = err.expect("a mid-drain cost abort must surface");
     assert_eq!(err.code(), "54P01");
 }
 
@@ -961,13 +958,12 @@ fn prepared_query_mid_drain_cost_abort_surfaces() {
 /// cursor owns its snapshot, so it is not stranded).
 #[test]
 fn database_query_prepared_convenience_streams() {
-    let mut db = seeded(50);
+    let db = seeded(50);
     let stmt = db
         .prepare("SELECT id, v FROM t ORDER BY id LIMIT 4")
         .unwrap();
     let mut rows = db.query_prepared(&stmt, &[]).unwrap();
-    let out: Vec<Vec<Value>> = (&mut rows).collect();
-    rows.error().unwrap();
+    let out: Vec<Vec<Value>> = (&mut rows).collect::<Result<_, _>>().unwrap();
     assert_eq!(
         out,
         vec![

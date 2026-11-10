@@ -55,9 +55,8 @@ fn main() {
                             let mut rows = session.query_prepared(&q, &[param]).unwrap();
                             let values: Vec<Vec<String>> = rows
                                 .by_ref()
-                                .map(|row| row.iter().map(Value::render).collect())
+                                .map(|row| row.unwrap().iter().map(Value::render).collect())
                                 .collect();
-                            rows.error().unwrap();
                             println!(
                                 "{{\"workload\":{:?},\"binding\":{},\"explain\":{},\"types\":{:?},\"rows\":{:?},\"cost\":{}}}",
                                 name,
@@ -76,6 +75,7 @@ fn main() {
                     let mut rows = session.query_prepared(&stmt, &parameters[i]).unwrap();
                     let mut count = 0;
                     for row in rows.by_ref() {
+                        let row = row.unwrap();
                         count += 1;
                         if checksum {
                             for value in row {
@@ -92,7 +92,6 @@ fn main() {
                             hash = (hash ^ 0x1e).wrapping_mul(0x100000001b3);
                         }
                     }
-                    rows.error().unwrap();
                     count
                 };
                 let validation_rows: usize = (0..validation).map(|i| run(i, true)).sum();

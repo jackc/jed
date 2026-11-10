@@ -1,7 +1,7 @@
 use jed::Database;
 
 fn main() -> jed::Result<()> {
-    let mut db = Database::open("bank.jed")?;
+    let db = Database::open("bank.jed")?;
 
     // Empty or SELECT-only writable transactions commit without database writes or fsync.
     // update() runs a read-write transaction: it mints a session, runs the closure, commits on

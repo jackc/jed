@@ -21,7 +21,7 @@ fn tmp(name: &str) -> PathBuf {
 }
 
 fn create(path: &Path) {
-    let mut db = Database::create(CreateOptions {
+    let db = Database::create(CreateOptions {
         path: Some(path.to_path_buf()),
         ..CreateOptions::default()
     })
@@ -61,7 +61,11 @@ fn open_after_server_exits(path: &Path) -> Database {
 }
 
 fn scalar(db: &mut Database, sql: &str) -> i64 {
-    let rows: Vec<_> = db.query(sql, &[]).unwrap().collect();
+    let rows: Vec<_> = db
+        .query(sql, &[])
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
     match &rows[0][0] {
         Value::Int(n) => *n,
         other => panic!("expected an i64, got {other:?}"),
@@ -141,7 +145,7 @@ fn read_only_transport_refuses_writes() {
 const KEY: [u8; 32] = [0x5a; 32];
 
 fn create_encrypted(path: &Path) {
-    let mut db = Database::create(CreateOptions {
+    let db = Database::create(CreateOptions {
         path: Some(path.to_path_buf()),
         credential: Some(Credential::Key(KEY)),
         ..CreateOptions::default()
@@ -304,7 +308,7 @@ fn scans_read_ahead_without_changing_cost() {
     let full = "SELECT sum(length(v))::i64 FROM t";
     let first = "SELECT id FROM t ORDER BY id LIMIT 1";
     let (full_cost, first_cost) = {
-        let mut local = Database::open(&path).unwrap();
+        let local = Database::open(&path).unwrap();
         let mut rows = local.query(full, &[]).unwrap();
         rows.by_ref().for_each(drop);
         let full_cost = rows.cost();
@@ -315,7 +319,7 @@ fn scans_read_ahead_without_changing_cost() {
         (full_cost, first_cost)
     };
 
-    let mut remote = open_remote("pages", &path).unwrap();
+    let remote = open_remote("pages", &path).unwrap();
     let before = read_requests();
     let mut rows = remote.query(first, &[]).unwrap();
     rows.by_ref().for_each(drop);
@@ -325,7 +329,7 @@ fn scans_read_ahead_without_changing_cost() {
 
     let before = read_requests();
     let mut rows = remote.query(full, &[]).unwrap();
-    let total: Vec<_> = rows.by_ref().collect();
+    let total: Vec<_> = rows.by_ref().collect::<Result<_, _>>().unwrap();
     assert_eq!(rows.cost(), full_cost);
     drop(rows);
     assert_eq!(total[0][0], Value::Int(2000 * 200));
@@ -362,7 +366,7 @@ fn remote_backup_matches_the_local_backup() {
     create(&path);
     {
         // Dead pages, so the free-list chain and the zeroed pages are exercised too.
-        let mut db = Database::open(&path).unwrap();
+        let db = Database::open(&path).unwrap();
         db.execute("DELETE FROM t WHERE id % 3 = 0", &[]).unwrap();
         db.execute("UPDATE t SET v = 'short' WHERE id < 500", &[])
             .unwrap();

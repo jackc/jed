@@ -21,9 +21,8 @@ fn rows(s: &mut Session, sql: &str, params: &[Value]) -> Vec<Vec<Value>> {
     let mut r = s.query(sql, params).unwrap();
     let mut out = Vec::new();
     for row in &mut r {
-        out.push(row);
+        out.push(row.unwrap());
     }
-    r.error().unwrap();
     out
 }
 
@@ -36,9 +35,8 @@ fn drain(
     let mut r = s.query_prepared(stmt, params).unwrap();
     let mut out = Vec::new();
     for row in &mut r {
-        out.push(row);
+        out.push(row.unwrap());
     }
-    r.error().unwrap();
     let cost = r.cost();
     (out, cost)
 }
@@ -48,9 +46,8 @@ fn drain_sql(s: &mut Session, sql: &str, params: &[Value]) -> (Vec<Vec<Value>>, 
     let mut r = s.query(sql, params).unwrap();
     let mut out = Vec::new();
     for row in &mut r {
-        out.push(row);
+        out.push(row.unwrap());
     }
-    r.error().unwrap();
     let cost = r.cost();
     (out, cost)
 }

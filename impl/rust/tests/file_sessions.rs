@@ -16,7 +16,11 @@ fn tmp(name: &str) -> PathBuf {
 }
 
 fn count_via(db: &mut Database) -> i64 {
-    let rows: Vec<_> = db.query("SELECT count(*) FROM t", &[]).unwrap().collect();
+    let rows: Vec<_> = db
+        .query("SELECT count(*) FROM t", &[])
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
     match &rows[0][0] {
         Value::Int(n) => *n,
         other => panic!("expected an i64 count, got {other:?}"),
@@ -24,7 +28,11 @@ fn count_via(db: &mut Database) -> i64 {
 }
 
 fn count_session(s: &mut Session) -> i64 {
-    let rows: Vec<_> = s.query("SELECT count(*) FROM t", &[]).unwrap().collect();
+    let rows: Vec<_> = s
+        .query("SELECT count(*) FROM t", &[])
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
     match &rows[0][0] {
         Value::Int(n) => *n,
         other => panic!("expected an i64 count, got {other:?}"),
@@ -234,16 +242,22 @@ fn file_backed_readers_run_concurrently_with_a_committing_writer() {
                 for _ in 0..40 {
                     let mut r = core.read_session();
                     let first: i64 = {
-                        let rows: Vec<_> =
-                            r.query("SELECT count(*) FROM t", &[]).unwrap().collect();
+                        let rows: Vec<_> = r
+                            .query("SELECT count(*) FROM t", &[])
+                            .unwrap()
+                            .collect::<Result<_, _>>()
+                            .unwrap();
                         match &rows[0][0] {
                             Value::Int(n) => *n,
                             v => panic!("expected count, got {v:?}"),
                         }
                     };
                     let second: i64 = {
-                        let rows: Vec<_> =
-                            r.query("SELECT count(*) FROM t", &[]).unwrap().collect();
+                        let rows: Vec<_> = r
+                            .query("SELECT count(*) FROM t", &[])
+                            .unwrap()
+                            .collect::<Result<_, _>>()
+                            .unwrap();
                         match &rows[0][0] {
                             Value::Int(n) => *n,
                             v => panic!("expected count, got {v:?}"),

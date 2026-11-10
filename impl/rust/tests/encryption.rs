@@ -68,8 +68,7 @@ fn exec(db: &Database, sql: &str) {
 fn try_rows(db: &Database, sql: &str) -> jed::Result<Vec<Vec<Value>>> {
     let mut s = db.session(SessionOptions::default());
     let mut rows = s.query(sql, &[])?;
-    let out: Vec<Vec<Value>> = rows.by_ref().collect();
-    rows.error()?;
+    let out: Vec<Vec<Value>> = rows.by_ref().collect::<jed::Result<_>>()?;
     Ok(out)
 }
 
@@ -618,7 +617,7 @@ fn an_encrypted_database_spills_to_sealed_scratch() {
     let mut q = session
         .query("SELECT count(*), max(s) FROM tt", &[])
         .unwrap();
-    let row = q.next().unwrap();
+    let row = q.next().unwrap().unwrap();
     assert_eq!(row[0], Value::Int(3000));
     drop(q);
     drop(session);

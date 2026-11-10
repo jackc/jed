@@ -42,8 +42,7 @@ fn db_in(env: &Environment) -> Database {
 fn scalar(db: &Database, sql: &str) -> jed::Result<String> {
     let mut s = db.session(SessionOptions::default());
     let mut rows = s.query(sql, &[])?;
-    let first = rows.next();
-    rows.error()?;
+    let first = rows.next().transpose()?;
     Ok(first.expect("one row")[0].render())
 }
 
@@ -108,7 +107,7 @@ fn a_file_resolves_its_collations_against_the_open_environment() {
         .load_unicode_data(&unicode_bytes())
         .unwrap()
         .build();
-    let mut db = db_in(&unicode);
+    let db = db_in(&unicode);
     db.execute(
         "CREATE TABLE t (id i32 PRIMARY KEY, name text COLLATE \"unicode\")",
         &[],
@@ -209,7 +208,7 @@ fn to_builder_shares_contents_and_changes_only_what_it_is_told() {
 #[test]
 fn a_database_outlives_the_callers_environment() {
     // The handle keeps its environment alive: dropping every caller reference changes nothing.
-    let mut db = {
+    let db = {
         let env = Environment::builder()
             .load_unicode_data(&unicode_bytes())
             .unwrap()

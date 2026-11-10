@@ -53,8 +53,7 @@ fn grow_and_shrink(db: &Database) {
 fn rows_and_cost(db: &Database, sql: &str) -> (Vec<Vec<Value>>, i64) {
     let mut s = db.session(SessionOptions::default());
     let mut rows = s.query(sql, &[]).unwrap();
-    let collected: Vec<Vec<Value>> = rows.by_ref().collect();
-    rows.error().unwrap();
+    let collected: Vec<Vec<Value>> = rows.by_ref().collect::<Result<_, _>>().unwrap();
     (collected, rows.cost())
 }
 

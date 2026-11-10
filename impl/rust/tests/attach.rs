@@ -44,7 +44,8 @@ fn make_file_db(path: PathBuf, page_size: u32, stmts: &[&str]) -> PathBuf {
 fn query_strs(s: &mut Session, sql: &str) -> Vec<String> {
     s.query(sql, &[])
         .unwrap_or_else(|e| panic!("{sql:?}: {}", e.message))
-        .collect::<Vec<Vec<Value>>>()
+        .collect::<Result<Vec<Vec<Value>>, _>>()
+        .unwrap()
         .iter()
         .map(|r| match &r[0] {
             Value::Text(t) => t.clone(),
@@ -73,7 +74,8 @@ fn query_ints(s: &mut Session, sql: &str) -> Vec<i64> {
     let rows: Vec<Vec<Value>> = s
         .query(sql, &[])
         .unwrap_or_else(|e| panic!("{sql:?}: {}", e.message))
-        .collect();
+        .collect::<Result<_, _>>()
+        .unwrap();
     rows.iter()
         .map(|r| match &r[0] {
             Value::Int(n) => *n,
@@ -138,8 +140,14 @@ fn attachment_working_roots_and_cursors_do_not_alias() {
     let mut work_pin = s
         .query("SELECT id, v FROM work.t ORDER BY id", &[])
         .unwrap();
-    assert_eq!(main_pin.next(), Some(vec![Value::Int(1), Value::Int(10)]));
-    assert_eq!(work_pin.next(), Some(vec![Value::Int(1), Value::Int(100)]));
+    assert_eq!(
+        main_pin.next().transpose().unwrap(),
+        Some(vec![Value::Int(1), Value::Int(10)])
+    );
+    assert_eq!(
+        work_pin.next().transpose().unwrap(),
+        Some(vec![Value::Int(1), Value::Int(100)])
+    );
 
     for id in 4..=40 {
         exec(&mut s, &format!("INSERT INTO t VALUES ({id}, {})", id * 10));
@@ -152,21 +160,19 @@ fn attachment_working_roots_and_cursors_do_not_alias() {
     assert_eq!(query_ints(&mut s, "SELECT count(*) FROM work.t"), vec![40]);
 
     assert_eq!(
-        (&mut main_pin).collect::<Vec<_>>(),
+        (&mut main_pin).collect::<Result<Vec<_>, _>>().unwrap(),
         vec![
             vec![Value::Int(2), Value::Int(20)],
             vec![Value::Int(3), Value::Int(30)]
         ]
     );
     assert_eq!(
-        (&mut work_pin).collect::<Vec<_>>(),
+        (&mut work_pin).collect::<Result<Vec<_>, _>>().unwrap(),
         vec![
             vec![Value::Int(2), Value::Int(200)],
             vec![Value::Int(3), Value::Int(300)]
         ]
     );
-    main_pin.error().unwrap();
-    work_pin.error().unwrap();
     main_pin.close();
     work_pin.close();
     drop(main_pin);

@@ -53,8 +53,7 @@ fn query(db: &Database, sql: &str) -> Vec<Vec<Value>> {
     let mut rows = s
         .query(sql, &[])
         .unwrap_or_else(|e| panic!("{sql:?}: {}", e.message));
-    let out: Vec<Vec<Value>> = rows.by_ref().collect();
-    rows.error().unwrap();
+    let out: Vec<Vec<Value>> = rows.by_ref().collect::<Result<_, _>>().unwrap();
     out
 }
 

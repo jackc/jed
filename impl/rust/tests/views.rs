@@ -40,9 +40,8 @@ fn drain(s: &mut Session, stmt: &jed::PreparedStatement) -> Vec<Vec<Value>> {
     let mut out = Vec::new();
     let mut r = s.query_prepared(stmt, &[]).unwrap();
     for row in &mut r {
-        out.push(row);
+        out.push(row.unwrap());
     }
-    r.error().unwrap();
     out
 }
 
@@ -125,10 +124,18 @@ fn query_lane_sees_a_nextval_view_as_a_write() {
     let mut s = mem();
     exec(&mut s, "CREATE SEQUENCE s");
     exec(&mut s, "CREATE VIEW vs AS SELECT nextval('s') AS n");
-    let first: Vec<Vec<Value>> = s.query("SELECT n FROM vs", &[]).unwrap().collect();
+    let first: Vec<Vec<Value>> = s
+        .query("SELECT n FROM vs", &[])
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
     assert_eq!(first, vec![vec![Value::Int(1)]]);
     exec(&mut s, "CREATE VIEW vvs AS SELECT n FROM vs");
-    let second: Vec<Vec<Value>> = s.query("SELECT n FROM vvs", &[]).unwrap().collect();
+    let second: Vec<Vec<Value>> = s
+        .query("SELECT n FROM vvs", &[])
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
     assert_eq!(second, vec![vec![Value::Int(2)]]);
 
     exec(&mut s, "BEGIN READ ONLY");

@@ -144,9 +144,10 @@ fn ok_result(mut rows: Rows) -> *mut u8 {
     if !rows.column_names().is_empty() {
         return ok_rows(rows);
     }
-    for _ in &mut rows {}
-    if let Err(e) = rows.error() {
-        return err_buf(e.code(), &e.message);
+    for row in &mut rows {
+        if let Err(e) = row {
+            return err_buf(e.code(), &e.message);
+        }
     }
     let mut b = Buf::new(TAG_STATEMENT);
     match rows.rows_affected() {
@@ -175,6 +176,11 @@ fn ok_rows(mut rows: Rows) -> *mut u8 {
     b.u32(0); // back-filled with the actual row count
     let mut nrows: u32 = 0;
     for row in &mut rows {
+        // A mid-drain error ends the result; report it (discarding the partial buffer `b`).
+        let row = match row {
+            Ok(row) => row,
+            Err(e) => return err_buf(e.code(), &e.message),
+        };
         nrows += 1;
         for v in row {
             match v {
@@ -186,10 +192,6 @@ fn ok_rows(mut rows: Rows) -> *mut u8 {
                 }
             }
         }
-    }
-    // A mid-drain error stops the iterator; surface it (discarding the partial buffer `b`).
-    if let Err(e) = rows.error() {
-        return err_buf(e.code(), &e.message);
     }
     b.0[nrows_pos..nrows_pos + 4].copy_from_slice(&nrows.to_le_bytes());
     b.finish()

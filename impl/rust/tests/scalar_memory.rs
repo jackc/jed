@@ -13,11 +13,12 @@ fn scalar_budget_stays_with_cursor() {
     let mut old = s
         .query("SELECT repeat('x', 3) FROM t ORDER BY id", &[])
         .unwrap();
-    assert!(old.next().is_some());
+    assert!(matches!(old.next(), Some(Ok(_))));
     s.set_max_scalar_bytes(100);
     s.query_outcome("SELECT repeat('y', 9)", &[]).unwrap();
+    let err = old.next().expect("the 54P04").unwrap_err();
+    assert_eq!(err.code(), "54P04");
     assert!(old.next().is_none());
-    assert_eq!(old.error().unwrap_err().code(), "54P04");
     s.set_max_scalar_bytes(0);
     assert_eq!(s.max_scalar_bytes(), 67108864);
 }

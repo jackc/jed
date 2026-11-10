@@ -51,7 +51,7 @@ fn main() -> jed::Result<()> {
     )?
         .build();
 
-    let mut db = Database::create(CreateOptions { environment: env, ..Default::default() })?;
+    let db = Database::create(CreateOptions { environment: env, ..Default::default() })?;
 
     db.execute("CREATE TABLE product (id i32 PRIMARY KEY, name text, price_cents i64)", &[])?;
     db.execute("INSERT INTO product VALUES (1, 'Mug', 1250), (2, 'Notebook', 400)", &[])?;
@@ -65,6 +65,7 @@ fn main() -> jed::Result<()> {
     let sql = "SELECT name, discount(price_cents, 15) AS sale, with_tax(price_cents) AS total \
                FROM product ORDER BY id";
     for row in db.query(sql, &[])? {
+        let row = row?; // a read can fail part-way; each row is a Result
         // Mug -> 1063 / 1350, Notebook -> 340 / 432
         println!("{} -> {} / {}", row[0].render(), row[1].render(), row[2].render());
     }

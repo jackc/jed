@@ -169,28 +169,32 @@ fn action_preserves_main_scope_across_temp_overlap() {
         persistent
             .query("SELECT id FROM c", &[])
             .unwrap()
-            .collect::<Vec<_>>()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
             .is_empty()
     );
     assert_eq!(
         shadowed
             .query("SELECT temp_id, scratch FROM c", &[])
             .unwrap()
-            .collect::<Vec<_>>(),
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap(),
         vec![vec![Value::Int(99), Value::Text("keep".to_string())]]
     );
     assert!(
         persistent
             .query("SELECT id FROM ci", &[])
             .unwrap()
-            .collect::<Vec<_>>()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
             .is_empty()
     );
     assert_eq!(
         shadowed
             .query("SELECT temp_id FROM ci", &[])
             .unwrap()
-            .collect::<Vec<_>>(),
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap(),
         vec![vec![Value::Int(98)]]
     );
 }

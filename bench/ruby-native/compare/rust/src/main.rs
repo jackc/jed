@@ -46,6 +46,7 @@ fn main() {
                     let rows = session.query_prepared(&stmt, &parameters[i]).unwrap();
                     let mut count = 0;
                     for row in rows {
+                        let row = row.unwrap();
                         count += 1;
                         if checksum {
                             for value in row {
@@ -78,7 +79,10 @@ fn main() {
                         total_rows += rows;
                     }
                 }
-                println!("{{\"workload\":\"{}\",\"checksum\":\"{:016x}\",\"validation_rows\":{},\"samples_ns\":{:?},\"rows_total\":{},\"iterations\":{},\"warmup\":{},\"runtime\":\"rust-release\"}}", name, hash, validation_rows, samples, total_rows, iterations, warmup);
+                println!(
+                    "{{\"workload\":\"{}\",\"checksum\":\"{:016x}\",\"validation_rows\":{},\"samples_ns\":{:?},\"rows_total\":{},\"iterations\":{},\"warmup\":{},\"runtime\":\"rust-release\"}}",
+                    name, hash, validation_rows, samples, total_rows, iterations, warmup
+                );
                 io::stdout().flush().unwrap();
             }
             _ => panic!("unknown plan entry"),

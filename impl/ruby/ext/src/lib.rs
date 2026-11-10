@@ -189,10 +189,10 @@ fn ok_handle(db: Database) -> *mut u8 {
 fn ok_result(mut rows: Rows) -> *mut u8 {
     let column_names: Vec<String> = rows.column_names().to_vec();
     let column_types: Vec<String> = rows.column_types().to_vec();
-    let drained: Vec<Vec<Value>> = rows.by_ref().collect();
-    if let Err(e) = rows.error() {
-        return err_buf(e.code(), &e.message);
-    }
+    let drained: Vec<Vec<Value>> = match rows.by_ref().collect() {
+        Ok(drained) => drained,
+        Err(e) => return err_buf(e.code(), &e.message),
+    };
     let cost = rows.cost();
     if column_names.is_empty() {
         let mut b = Buf::new(TAG_STATEMENT);

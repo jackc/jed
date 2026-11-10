@@ -61,7 +61,7 @@ fn transaction_render_uses_the_owning_session_zone() {
             let v = tx
                 .query("SELECT timestamptz '2024-01-15 12:00:00+00'", &[])?
                 .next()
-                .unwrap()[0]
+                .unwrap()?[0]
                 .clone();
             tx.render(&v)
         })

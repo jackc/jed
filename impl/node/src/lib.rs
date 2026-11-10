@@ -169,6 +169,7 @@ fn encode_rows(mut rows: jed::Rows) -> Result<Buffer> {
     let mut body = Writer::new();
     let mut row_count = 0u32;
     for row in &mut rows {
+        let row = row.map_err(node_error)?;
         row_count = row_count
             .checked_add(1)
             .ok_or_else(|| Error::new(Status::GenericFailure, "too many result rows"))?;
@@ -190,7 +191,6 @@ fn encode_rows(mut rows: jed::Rows) -> Result<Buffer> {
             }
         }
     }
-    rows.error().map_err(node_error)?;
 
     let mut out = Writer::new();
     out.u32(column_count);
@@ -366,6 +366,7 @@ fn reader_query(
     let mut rows = session.query(sql, params).map_err(|e| e.to_string())?;
     let mut count = 0usize;
     for row in &mut rows {
+        let row = row.map_err(|e| e.to_string())?;
         count += 1;
         if let Some(sum) = checksum.as_deref_mut() {
             for value in &row {
@@ -374,7 +375,6 @@ fn reader_query(
             sum.end_row();
         }
     }
-    rows.error().map_err(|e| e.to_string())?;
     Ok(count)
 }
 

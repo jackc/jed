@@ -1689,9 +1689,9 @@ fn drain_query(sess: &mut JedSession, sql: &str, params: &[jed::Value]) -> jed::
     let column_types = rows.column_types().to_vec();
     let mut values = Vec::new();
     for row in rows.by_ref() {
+        let row = row?;
         values.push(row);
     }
-    rows.error()?;
     let cost = rows.cost();
     drop(rows);
     // Render while the record's session zone is still in effect; a render failure (22008, only at

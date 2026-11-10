@@ -190,7 +190,7 @@ fn parse_op(op: &str) -> Vec<String> {
 /// identically across cores). The invariant is a string compare, not folded into the checksum.
 fn query_scalar(rh: &mut Session, sql: &str) -> Result<String, String> {
     let mut rows = rh.query(sql, &[]).map_err(|e| e.to_string())?;
-    match rows.next() {
+    match rows.next().transpose().map_err(|e| e.to_string())? {
         Some(row) => row
             .into_iter()
             .next()
@@ -225,6 +225,7 @@ fn check_final(db: &Database, f: &StressFile) -> Result<(String, bool), String> 
     let mut sum = Checksum::new();
     let mut got: Vec<Vec<i64>> = Vec::new();
     for row in rows {
+        let row = row.map_err(|e| e.to_string())?;
         let mut ints = Vec::with_capacity(row.len());
         for v in row {
             match v {

@@ -172,11 +172,11 @@ fn run_case(image: &[u8], stmts: &[String], env: &jed::Environment) {
     for sql in stmts {
         if let Ok(mut rows) = s.query(sql, &[]) {
             for row in rows.by_ref() {
+                let Ok(row) = row else { break };
                 for v in &row {
                     let _ = v.render();
                 }
             }
-            let _ = rows.error();
         }
     }
 }

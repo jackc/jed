@@ -824,13 +824,13 @@ fn sim_query(s: &mut Session, sql: &str) -> Result<(usize, i64, u64, i64), Engin
     let mut rows = s.query(sql, &[])?;
     let mut rendered: Vec<String> = Vec::new();
     for row in &mut rows {
+        let row = row?;
         let mut cells = Vec::with_capacity(row.len());
         for v in &row {
             cells.push(s.render(v)?);
         }
         rendered.push(cells.join("\x1f"));
     }
-    rows.error()?;
     rendered.sort();
     let affected = rows.rows_affected().unwrap_or(-1);
     Ok((
@@ -856,6 +856,10 @@ fn digest_fold(
     };
     let mut rendered: Vec<String> = Vec::new();
     for row in &mut rows {
+        let row = match row {
+            Ok(row) => row,
+            Err(e) => return Err((format!("{b}{sql}\nERROR: {e}\n"), e)),
+        };
         let mut cells = Vec::with_capacity(row.len());
         for v in &row {
             match s.render(v) {
@@ -867,9 +871,6 @@ fn digest_fold(
             tables.push(cells[0].clone());
         }
         rendered.push(cells.join("\x1f"));
-    }
-    if let Err(e) = rows.error() {
-        return Err((format!("{b}{sql}\nERROR: {e}\n"), e));
     }
     rendered.sort();
     b.push_str(sql);

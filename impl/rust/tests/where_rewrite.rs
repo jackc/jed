@@ -66,9 +66,8 @@ fn where_pushdown_bound_parameters() {
         let mut cursor = s.query_prepared(&stmt, &params).unwrap();
         let mut prepared = Vec::new();
         for r in &mut cursor {
-            prepared.push(r);
+            prepared.push(r.unwrap());
         }
-        cursor.error().unwrap();
         assert_eq!(pairs(&prepared), want, "prepared v={v} w={w}");
         assert_eq!(cursor.cost(), literal_cost, "prepared v={v} w={w}");
     }
@@ -160,9 +159,8 @@ fn derived_and_on_pushdown_bound_parameters() {
             let mut cursor = s.query_prepared(&stmt, &params).unwrap();
             let mut prepared = Vec::new();
             for r in &mut cursor {
-                prepared.push(r);
+                prepared.push(r.unwrap());
             }
-            cursor.error().unwrap();
             assert_eq!(ids(&prepared), want, "prepared {param}");
             assert_eq!(cursor.cost(), literal_cost, "prepared {param}");
         }

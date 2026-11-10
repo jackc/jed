@@ -407,7 +407,7 @@ fn open_file(path: &std::path::Path, ext: Environment) -> Database {
 fn ids(db: &mut Database, sql: &str) -> Vec<Value> {
     db.query(sql, &[])
         .unwrap()
-        .map(|r| r.into_iter().next().unwrap())
+        .map(|r| r.unwrap().into_iter().next().unwrap())
         .collect()
 }
 
@@ -932,7 +932,8 @@ fn batch_through_streaming_cursor_matches() {
     let rows: Vec<Vec<Value>> = db
         .query("SELECT host_twice(a) FROM t", &[])
         .unwrap()
-        .collect();
+        .collect::<Result<_, _>>()
+        .unwrap();
     assert_eq!(rows.len(), 1100);
     assert_eq!(rows[0], vec![Value::Int(2)]);
     assert_eq!(rows[9], vec![Value::Null]);

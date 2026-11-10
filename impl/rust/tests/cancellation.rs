@@ -58,7 +58,11 @@ fn cancel_before_run_aborts_at_boundary() {
 
     // The aborted INSERT rolled back like any error — the table is untouched.
     let rows = db.query("SELECT id FROM t", &[]).unwrap();
-    assert_eq!(rows.count(), 0, "the cancelled INSERT wrote nothing");
+    assert_eq!(
+        rows.map(|r| r.unwrap()).count(),
+        0,
+        "the cancelled INSERT wrote nothing"
+    );
 }
 
 /// An armed-but-never-flipped token is zero-effect: the statement runs to completion and returns all
@@ -77,7 +81,11 @@ fn armed_but_not_cancelled_completes() {
     let rows = db
         .query_cancelable("SELECT id FROM t", &[], &token)
         .unwrap();
-    assert_eq!(rows.count(), 20, "an un-cancelled query returns every row");
+    assert_eq!(
+        rows.map(|r| r.unwrap()).count(),
+        20,
+        "an un-cancelled query returns every row"
+    );
 }
 
 /// Inside an explicit transaction (the `Transaction::execute_cancelable` path), a cancelled token
@@ -107,7 +115,7 @@ fn cancel_in_transaction_rolls_back() {
     // The whole block rolled back — nothing committed.
     let rows = db.query("SELECT id FROM t", &[]).unwrap();
     assert_eq!(
-        rows.count(),
+        rows.map(|r| r.unwrap()).count(),
         0,
         "the cancelled transaction committed nothing"
     );
@@ -115,7 +123,7 @@ fn cancel_in_transaction_rolls_back() {
 
 #[test]
 fn cancellation_batches_and_cost_limits() {
-    let mut db = Database::create(CreateOptions::default()).unwrap();
+    let db = Database::create(CreateOptions::default()).unwrap();
     for sql in [
         "CREATE TABLE t (id i32 PRIMARY KEY, v i32)",
         "INSERT INTO t SELECT i, i % 7 FROM generate_series(1, 2000) AS g(i)",
@@ -131,8 +139,9 @@ fn cancellation_batches_and_cost_limits() {
         let mut session = db.session(SessionOptions::default());
         let mut rows = session.query_cancelable(sql, &[], &token).unwrap();
         token.cancel(); // Query returned; cancellation must reach the batch scan before it does work.
+        let err = rows.next().expect("the cancellation").unwrap_err();
+        assert_eq!(err.code(), "57014");
         assert!(rows.next().is_none());
-        assert_eq!(rows.error().unwrap_err().code(), "57014");
         assert!(
             rows.cost() > 0 && rows.cost() < 2000,
             "cancellation should account only the accessed tree prefix"
@@ -155,12 +164,15 @@ fn cancellation_batches_and_cost_limits() {
                     s.query(sql, &[])
                 }
                 .unwrap();
-                let n = rows.by_ref().count();
-                let got = (
-                    n,
-                    rows.cost(),
-                    rows.error().err().map(|e| e.code().to_owned()),
-                );
+                let mut n = 0;
+                let mut code = None;
+                for row in rows.by_ref() {
+                    match row {
+                        Ok(_) => n += 1,
+                        Err(e) => code = Some(e.code().to_owned()),
+                    }
+                }
+                let got = (n, rows.cost(), code);
                 if let Some(want) = &expected {
                     assert_eq!(&got, want);
                 } else {
@@ -194,7 +206,7 @@ fn cancel_during_next_with_executor_barrier() {
         ))
         .unwrap()
         .build();
-    let mut db = Database::create(CreateOptions {
+    let db = Database::create(CreateOptions {
         environment: env,
         ..Default::default()
     })
@@ -215,10 +227,17 @@ fn cancel_during_next_with_executor_barrier() {
         token.cancel();
         gate.wait();
     });
+    let err = rows.next().expect("the cancellation").unwrap_err();
+    assert_eq!(err.code(), "57014");
     assert!(rows.next().is_none());
-    assert_eq!(rows.error().unwrap_err().code(), "57014");
     worker.join().unwrap();
-    assert_eq!(db.query("SELECT id FROM t", &[]).unwrap().count(), 3);
+    assert_eq!(
+        db.query("SELECT id FROM t", &[])
+            .unwrap()
+            .map(|r| r.unwrap())
+            .count(),
+        3
+    );
 }
 
 #[test]

@@ -523,13 +523,13 @@ fn rows_with(q: impl FnOnce(&[Value]) -> Result<Rows>, params: impl Params) -> R
     let names = rows.column_names_rc();
     let mut out = Vec::new();
     while let Some(values) = rows.next() {
+        let values = values?; // an error raised mid-drain (streaming.md §6)
         rows.admit_collected(&values)?;
         out.push(Row {
             names: names.clone(),
             values,
         });
     }
-    rows.error()?; // surface any error raised mid-drain (streaming.md §6)
     Ok(out)
 }
 
@@ -543,26 +543,28 @@ fn map_rows<T>(rows: Vec<Row>, mut f: impl FnMut(&Row) -> Result<T>) -> Result<V
 /// is untouched — including `run`, which drains the rows and reads the command tag off the cursor (the
 /// one internal exec/query seam). Inherent methods cannot be shared by a trait without shadowing the
 /// raw `query`, so a small macro keeps the three copies identical rather than hand-drifting
-/// (CLAUDE.md §5 — data over divergence).
+/// (CLAUDE.md §5 — data over divergence). A `Database` is a shared handle whose methods mint a
+/// fresh session each, so its copies take `&self`; a `Session` and a `Transaction` carry state and
+/// take `&mut self` (the `mut` argument).
 macro_rules! ergonomic_methods {
-    ($query:ident) => {
+    ($query:ident $(, $mutability:tt)?) => {
         /// Run a statement, binding native `params`, and return the affected-row count (`0` for a
         /// SELECT / DDL / transaction control). The ergonomic sibling of rusqlite's `execute` — sugar
         /// over the total `query` seam: run, drain-and-discard the rows, return the tag.
-        pub fn run<P: Params>(&mut self, sql: &str, params: P) -> Result<u64> {
+        pub fn run<P: Params>(& $($mutability)? self, sql: &str, params: P) -> Result<u64> {
             run_with(|v| self.$query(sql, v), params)
         }
 
         /// Run a query, binding native `params`, and return every row as a typed [`Row`]
         /// (call `row.get::<T>(..)`). The materialized analog of rusqlite's `query`.
-        pub fn query_rows<P: Params>(&mut self, sql: &str, params: P) -> Result<Vec<Row>> {
+        pub fn query_rows<P: Params>(& $($mutability)? self, sql: &str, params: P) -> Result<Vec<Row>> {
             rows_with(|v| self.$query(sql, v), params)
         }
 
         /// Run a query, binding native `params`, and map each row through `f` (rusqlite's
         /// `query_map`, materialized). The first mapping error short-circuits.
         pub fn query_map<P: Params, T>(
-            &mut self,
+            & $($mutability)? self,
             sql: &str,
             params: P,
             f: impl FnMut(&Row) -> Result<T>,
@@ -574,7 +576,7 @@ macro_rules! ergonomic_methods {
         /// `None` when the query produced no rows (rusqlite's `query_row`, but `Option` rather than
         /// a no-rows error — the idiomatic-Rust "maybe a row"). Extra rows are ignored.
         pub fn query_row<P: Params, T>(
-            &mut self,
+            & $($mutability)? self,
             sql: &str,
             params: P,
             f: impl FnOnce(&Row) -> Result<T>,
@@ -592,9 +594,9 @@ impl Database {
 }
 
 impl Session {
-    ergonomic_methods!(query);
+    ergonomic_methods!(query, mut);
 }
 
 impl Transaction<'_> {
-    ergonomic_methods!(query);
+    ergonomic_methods!(query, mut);
 }

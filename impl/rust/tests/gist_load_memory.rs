@@ -66,9 +66,11 @@ fn check_gist_load(mode: &str) {
     let mut rows = s
         .query(&format!("SELECT count(*) FROM {name}"), &[])
         .unwrap();
-    assert_eq!(rows.next(), Some(vec![jed::Value::Int(2)]));
+    assert_eq!(
+        rows.next().transpose().unwrap(),
+        Some(vec![jed::Value::Int(2)])
+    );
     assert!(rows.next().is_none());
-    rows.error().unwrap();
     drop(rows);
     s.close();
     db.close().unwrap();

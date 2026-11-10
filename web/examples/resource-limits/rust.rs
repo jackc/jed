@@ -1,7 +1,7 @@
 use jed::{CreateOptions, Database, SessionOptions};
 
 fn main() -> jed::Result<()> {
-    let mut db = Database::create(CreateOptions { path: Some("app.jed".into()), ..Default::default() })?;
+    let db = Database::create(CreateOptions { path: Some("app.jed".into()), ..Default::default() })?;
 
     // Serve untrusted queries through a session with independent work and memory limits:
     //   max_cost          — a per-STATEMENT ceiling: one runaway query aborts 54P01.

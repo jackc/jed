@@ -325,7 +325,7 @@ independently — the P6.4 precedent):
   green by construction); the index-order scan, streaming sort, and streaming join stay buffered (S4),
   and a write-classified statement (incl. a `nextval`/`setval` SELECT, `stmt_is_write`) never streams. A
   mid-drain error (a `54P01` cost abort, a `57014` cancellation, an arithmetic trap) surfaces during
-  iteration (Rust stashes it for `Rows::error()`; Go sets `Rows.Err()`; TS throws out of the iterator).
+  iteration (Rust yields it as the cursor's `Err` item; Go sets `Rows.Err()`; TS throws out of the iterator).
   Verified per core by unit tests: `query()` == `execute()` rows + total cost under full drain, early
   exit charges less, the snapshot pin + watermark, and the mid-drain abort. Prepared-statement streaming
   later landed as S8; generalized bounded scans now use the buffered-first-pull lane and dispatch the

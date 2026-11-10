@@ -24,7 +24,8 @@ fn memory_size_vectors_match_spec() {
         let rows: Vec<Vec<jed::Value>> = s
             .query(sql, &[])
             .unwrap_or_else(|e| panic!("{sql}: {e:?}"))
-            .collect();
+            .collect::<Result<_, _>>()
+            .unwrap();
         assert_eq!(rows.len(), 1, "{sql}: one row");
         let got = match v["measure"].as_str().unwrap() {
             "value" => {

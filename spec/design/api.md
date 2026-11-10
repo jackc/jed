@@ -752,9 +752,9 @@ contract notes that come with them: the cursor **pins its read snapshot for its 
 (PG-faithful — [streaming.md §5](streaming.md), [transactions.md §5/§8](transactions.md)), so it
 must be drained or `close`d to release; and `cost` is **final only after the cursor is fully
 drained** (it accrues as rows are pulled — [streaming.md §6](streaming.md)). A mid-drain error (a
-`54P01` cost abort, a `57014` cancellation, an arithmetic trap) surfaces during iteration — Rust
-stashes it for [`Rows::error()`](streaming.md), Go sets `Rows.Err()`, TS throws out of the
-iterator; this is so even for the `Buffered` cursor, whose blocking part runs on the first pull
+`54P01` cost abort, a `57014` cancellation, an arithmetic trap) surfaces during iteration — Rust's
+`Rows` yields each row as a `Result` and the error is its `Err` item ([streaming.md](streaming.md)),
+Go sets `Rows.Err()`, TS throws out of the iterator; this is so even for the `Buffered` cursor, whose blocking part runs on the first pull
 (not at `query()`). The exec-side `execute` / `run` / `Exec` **drains this same lazy cursor** for its
 command tag (so a mid-drain streaming error surfaces to the exec caller too, and every `# cost:` value
 is unchanged — the lazy cursor's only contract is identical rows + total cost under full drain). A

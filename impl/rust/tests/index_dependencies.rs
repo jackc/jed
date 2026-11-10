@@ -216,9 +216,8 @@ fn dynamic_zone_cache() {
     for _ in 0..2 {
         let mut q = s.query_prepared(&stmt, &[]).unwrap();
         for row in &mut q {
-            assert!(!row.is_empty());
+            assert!(!row.unwrap().is_empty());
         }
-        q.error().unwrap();
     }
     assert!(stmt.cache().borrow().is_none());
     let ins = s
@@ -227,9 +226,8 @@ fn dynamic_zone_cache() {
     for id in [90, 91] {
         let mut q = s.query_prepared(&ins, &[Value::Int(id)]).unwrap();
         for row in &mut q {
-            assert!(!row.is_empty());
+            assert!(!row.unwrap().is_empty());
         }
-        q.error().unwrap();
     }
     assert!(ins.insert_cache().borrow().is_none());
     // A new zone changes the dynamic dependency: the host derives an environment that adds it and
@@ -253,15 +251,14 @@ fn dynamic_zone_cache() {
     {
         let mut q = s.query_prepared(&stmt, &[]).unwrap();
         for row in &mut q {
-            assert!(!row.is_empty());
+            assert!(!row.unwrap().is_empty());
         }
-        q.error().unwrap();
     }
     match s.query_prepared(&ins, &[Value::Int(92)]) {
         Err(e) => assert_eq!(e.code(), "XX002"),
         Ok(mut q) => {
-            for _ in &mut q {}
-            assert_eq!(q.error().unwrap_err().code(), "XX002");
+            let err = q.by_ref().find_map(|r| r.err()).expect("XX002");
+            assert_eq!(err.code(), "XX002");
         }
     }
     assert_eq!(

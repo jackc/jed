@@ -1,7 +1,7 @@
 use jed::Database;
 
 fn main() -> jed::Result<()> {
-    let mut db = Database::open("app.jed")?;
+    let db = Database::open("app.jed")?;
 
     // run() binds native params — a tuple here — to $1, $2, … and returns the affected-row count.
     // No hand-built Value::Int / Value::Text: the rusqlite-style ToValue/Params traits do the
