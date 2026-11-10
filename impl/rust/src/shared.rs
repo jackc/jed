@@ -1542,6 +1542,17 @@ impl Storage {
 /// The thread-safe core shared by every [`Database`] clone (CLAUDE.md §3). Holds the published
 /// committed root, the single-writer gate, the live-reader registry, and (file-backed) the
 /// storage identity.
+/// What a new session's engine copies from the storage identity: fixed when the database is
+/// opened (the spill host is replaced only by a test hook). Kept beside `storage` so minting a
+/// session never waits for a commit, which holds the storage lock across its page writes and its
+/// durability barrier.
+struct EngineFacts {
+    page_size: u32,
+    path: Option<std::path::PathBuf>,
+    spill: Option<Arc<dyn crate::spillhost::SpillHost>>,
+    read_only: bool,
+}
+
 pub(crate) struct Shared {
     /// The published committed root (the file snapshot). A reader pins it by cloning the `Arc` under a
     /// momentary read lock; a writer publishes a new one under a momentary write lock — the §3 short
@@ -1556,6 +1567,8 @@ pub(crate) struct Shared {
     /// The storage identity (§2.4) — since B3 every core has one (file- or memory-backed). Mutated
     /// only under the writer gate, so the `Mutex` never contends with the publish path.
     storage: Mutex<Storage>,
+    /// The storage facts a session reads, outside the storage lock (see [`EngineFacts`]).
+    facts: RwLock<EngineFacts>,
     /// The registry of host-attached DATABASE-scoped databases (attached-databases.md §2/§5), keyed by
     /// exact name. Each attachment's MUTABLE storage identity lives here; its immutable published
     /// root lives in [`Roots::attached`] under the same key. Populated by [`Database::attach`] / cleared
@@ -2718,19 +2731,19 @@ impl Shared {
     /// The published snapshot's stores already own the shared paging context; installing it as this
     /// session's write pager would bypass the core's page-accounting owner.
     fn configure_engine(&self, engine: &mut Engine) {
-        let storage = self.storage.lock().expect("storage lock not poisoned");
-        engine.page_size = storage.page_size;
-        engine.path = storage.path.clone();
-        engine.spill = storage.spill.clone();
-        engine.read_only = storage.read_only;
+        let facts = self.facts.read().expect("facts lock not poisoned");
+        engine.page_size = facts.page_size;
+        engine.path = facts.path.clone();
+        engine.spill = facts.spill.clone();
+        engine.read_only = facts.read_only;
     }
 
     /// Whether this core is a read-only file-backed database (a write is `25006`). In-memory cores
     /// are always writable.
     fn read_only(&self) -> bool {
-        self.storage
-            .lock()
-            .expect("storage lock not poisoned")
+        self.facts
+            .read()
+            .expect("facts lock not poisoned")
             .read_only
     }
 
@@ -3052,6 +3065,12 @@ impl Database {
             writer_active: Mutex::new(false),
             writer_free: Condvar::new(),
             live: Mutex::new(LiveRegistry::default()),
+            facts: RwLock::new(EngineFacts {
+                page_size: storage.page_size,
+                path: storage.path.clone(),
+                spill: storage.spill.clone(),
+                read_only: storage.read_only,
+            }),
             storage: Mutex::new(storage),
             attachments: Mutex::new(HashMap::new()),
             attachment_count: AtomicUsize::new(0),
@@ -3733,6 +3752,7 @@ impl Database {
             encrypt,
             &self.0.env,
         ));
+        self.0.facts.write().expect("facts lock not poisoned").spill = storage.spill.clone();
     }
 
     /// Whether this database was opened read-only (a write is `25006`). In-memory databases are
