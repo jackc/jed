@@ -2981,7 +2981,7 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 				seenKeys[string(key)] = true
 				rows[i].Key = key
 			}
-			compressUnits += int64(recordCompressUnits(rewriteColTypes, rows[i].Key, row, rewriteCap))
+			compressUnits += int64(recordCompressUnits(rewriteColTypes, rows[i].Key, row, rewriteCap, nil))
 		}
 		meter.Charge(costs.ValueCompress * compressUnits)
 		if err := meter.Step(); err != nil {

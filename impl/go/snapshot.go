@@ -219,6 +219,8 @@ func storesChanged(stores, base map[string]*tableStore) bool {
 func (s *snapshot) freezeMutationGenerations() {
 	for _, store := range s.stores {
 		store.freezeMutationGeneration()
+		// The published stores are past their last plan; their writer's compression memo goes too.
+		store.memo = nil
 	}
 	for _, store := range s.indexStores {
 		store.freezeMutationGeneration()

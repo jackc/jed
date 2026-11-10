@@ -42,6 +42,9 @@ type tableStore struct {
 	// bytes. It travels with the store, so discarding a working snapshot discards it too; a commit
 	// clears it before publishing.
 	staged int64
+	// memo is the writer's compression memo (compressMemo): created on the first write that plans a
+	// spillable column, never copied by clone, and dropped when the snapshot is published.
+	memo *compressMemo
 	// stagedKeys is the stored bytes of each version written since publication that the store still
 	// holds, by key (a one-value [Int] row): what a replace or remove of that key returns (memory.md
 	// §7.1). A persistent map, so a snapshot clone stays O(1). Kept only while net is set.
@@ -76,6 +79,15 @@ func (s *tableStore) clone() *tableStore {
 }
 
 func (s *tableStore) freezeMutationGeneration() { s.rows.freezeMutationGeneration() }
+
+// compressMemo returns the store's compression memo, creating it on first use (writer only). A store
+// without a spillable column needs none.
+func (s *tableStore) compressMemo() *compressMemo {
+	if s.memo == nil && anySpillable(s.colTypes) {
+		s.memo = &compressMemo{}
+	}
+	return s.memo
+}
 
 // truncated returns an empty store with this store's shape and paging — the commit-time emptying of
 // an ON COMMIT DELETE ROWS temp table (spec/design/temp-tables.md §5.1). The synthetic rowid counter
@@ -180,7 +192,7 @@ func (s *pointStoreScan) resolveColumns(row storedRow, mask []bool) (storedRow, 
 // large-values.md §12), so split points match the serialized pages.
 // It also returns the record's stored bytes, the pending-write measure (memory.md §7).
 func (s *tableStore) weight(key []byte, row storedRow) (uint32, int64) {
-	size, stored := recordFootprint(s.colTypes, key, row, s.cap)
+	size, stored := recordFootprint(s.colTypes, key, row, s.cap, s.compressMemo())
 	return uint32(size), int64(stored)
 }
 
@@ -475,7 +487,7 @@ func (s *tableStore) WriteCompressUnits(key []byte, row storedRow) int {
 	if !anySpillable(s.colTypes) {
 		return 0
 	}
-	return recordCompressUnits(s.colTypes, key, row, s.cap)
+	return recordCompressUnits(s.colTypes, key, row, s.cap, s.compressMemo())
 }
 
 // resolveColumns returns row with the unfetched values in the columns mask selects

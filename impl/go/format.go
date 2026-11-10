@@ -17,6 +17,7 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"unicode/utf8"
 )
@@ -1244,7 +1245,7 @@ func (s *snapshot) incrementalImageAllowed(pageSize, startPage uint32, free []ui
 	var indexColTypes []colType
 	for ti, k := range keys {
 		if root := s.stores[k].treeRoot(); root != nil {
-			rp, err := serializeDirty(root, s.stores[k].colTypes, seal, alloc, &pages, kept, shared, paging)
+			rp, err := serializeDirty(root, s.stores[k].colTypes, s.stores[k].memo, seal, alloc, &pages, kept, shared, paging)
 			if err != nil {
 				return incrementalWrite{}, err
 			}
@@ -1272,7 +1273,7 @@ func (s *snapshot) incrementalImageAllowed(pageSize, startPage uint32, free []ui
 				}
 				r = root
 			} else if root := s.indexStores[idx.Name].treeRoot(); root != nil {
-				rp, err := serializeDirty(root, indexColTypes, seal, alloc, &pages, kept, shared, paging)
+				rp, err := serializeDirty(root, indexColTypes, nil, seal, alloc, &pages, kept, shared, paging)
 				if err != nil {
 					return incrementalWrite{}, err
 				}
@@ -1334,7 +1335,7 @@ func (s *snapshot) incrementalImageAllowed(pageSize, startPage uint32, free []ui
 // Page indices come from the allocator (free-list first, then the high-water). Mirrors serializeNode
 // for the byte layout. Every clean node and OnDisk child it reaches is recorded in kept — the shared
 // boundary the live-page delta skips (spec/design/memory.md §8.7).
-func serializeDirty(n *pnode, colTypes []colType, seal sealer, alloc *pageAlloc, pages *[]dirtyPage, kept, shared map[uint32]bool, paging *sharedPaging) (pageRef, error) {
+func serializeDirty(n *pnode, colTypes []colType, memo *compressMemo, seal sealer, alloc *pageAlloc, pages *[]dirtyPage, kept, shared map[uint32]bool, paging *sharedPaging) (pageRef, error) {
 	if n.page != 0 {
 		kept[n.page] = true
 		return n.ref(), nil
@@ -1348,7 +1349,7 @@ func serializeDirty(n *pnode, colTypes []colType, seal sealer, alloc *pageAlloc,
 			childPages[i] = c.ref()
 			continue
 		}
-		cp, err := serializeDirty(c.node, colTypes, seal, alloc, pages, kept, shared, paging)
+		cp, err := serializeDirty(c.node, colTypes, memo, seal, alloc, pages, kept, shared, paging)
 		if err != nil {
 			return pageRef{}, err
 		}
@@ -1370,7 +1371,7 @@ func serializeDirty(n *pnode, colTypes []colType, seal sealer, alloc *pageAlloc,
 	} else {
 		src := &chainSource{paging: paging, share: true}
 		var err error
-		payload, err = encodeLeafPAX(colTypes, n.keys, n.vals, seal, alloc.take, pages, src)
+		payload, err = encodeLeafPAXMemo(colTypes, n.keys, n.vals, seal, alloc.take, pages, src, memo)
 		if err != nil {
 			return pageRef{}, err
 		}
@@ -2894,6 +2895,12 @@ func planningCompress(scratch *lz4Scratch, ty colType, v Value) []byte {
 // adopted with the block it stores. Only an inline-deferred value, whose stored form records no
 // outcome, is compressed when an attempt reaches it — from the bytes it holds.
 func planDispositions(colTypes []colType, key []byte, row storedRow, pcap pageCap) recordPlan {
+	return planDispositionsMemo(colTypes, key, row, pcap, nil)
+}
+
+// planDispositionsMemo is planDispositions reusing (and recording) the compression outcomes memo
+// holds for resident string payloads; a nil memo compresses every attempt.
+func planDispositionsMemo(colTypes []colType, key []byte, row storedRow, pcap pageCap, memo *compressMemo) recordPlan {
 	capacity := pcap.c
 	// Each column's inline-plain contribution to recordSize (the v24 basis — format.md "Record"):
 	// a fixed-width column always its width (a NULL occupies a zero-filled slot); a variable-width
@@ -2951,6 +2958,8 @@ func planDispositions(colTypes []colType, key []byte, row storedRow, pcap pageCa
 			case tagExternalComp:
 				compLen = int(u.StoredLen) // the block stays on the value's chain
 			}
+		} else if block, n, ok := memo.lookup(colTypes[i], v); ok {
+			comp, compLen = block, n
 		} else {
 			// The attempt's block is built in a recycled buffer and copied out only if adopted.
 			scratch := lz4ScratchPool.Get().(*lz4Scratch)
@@ -2958,8 +2967,11 @@ func planDispositions(colTypes []colType, key []byte, row storedRow, pcap pageCa
 			compLen = len(comp)
 			if inlineCompOverhead+compLen < inline[i] {
 				comp = bytes.Clone(comp)
+			} else {
+				comp = nil
 			}
 			lz4ScratchPool.Put(scratch)
+			memo.record(colTypes[i], v, comp, compLen)
 		}
 		if compLen >= 0 && inlineCompOverhead+compLen < inline[i] {
 			size = size - cur[i] + inlineCompOverhead + compLen
@@ -3045,8 +3057,8 @@ func recordSize(colTypes []colType, key []byte, row storedRow, capacity pageCap)
 // recordFootprint returns a record's on-disk record size (the split weight) and its stored bytes —
 // that size plus the overflow-chain payload of its externalized values (memory.md §7, the
 // pending-write measure).
-func recordFootprint(colTypes []colType, key []byte, row storedRow, capacity pageCap) (size, stored int) {
-	plan := planDispositions(colTypes, key, row, capacity)
+func recordFootprint(colTypes []colType, key []byte, row storedRow, capacity pageCap, memo *compressMemo) (size, stored int) {
+	plan := planDispositionsMemo(colTypes, key, row, capacity, memo)
 	return plan.size, plan.size + plan.external
 }
 
@@ -3162,8 +3174,50 @@ func recordScanUnits(colTypes []colType, key []byte, row storedRow, pcap pageCap
 // ceil(raw/capacity) block per pass-1 compression attempt, adopted or not (cost.md §3;
 // large-values.md §13). Charged once per stored row version at the statement's write site,
 // never for B-tree re-encodes.
-func recordCompressUnits(colTypes []colType, key []byte, row storedRow, capacity pageCap) int {
-	return planDispositions(colTypes, key, row, capacity).compressUnits
+func recordCompressUnits(colTypes []colType, key []byte, row storedRow, capacity pageCap, memo *compressMemo) int {
+	return planDispositionsMemo(colTypes, key, row, capacity, memo).compressUnits
+}
+
+// compressMemo holds, for one writing transaction's table store, the outcome of each pass-1
+// compression attempt on a resident text / bytea / json payload: the block's length and, when
+// store-smaller adopts it, the block. The same value is planned for its value_compress charge, its
+// B-tree weight, and its commit encoding; with the memo it is compressed once. The outcome depends
+// only on the payload bytes, which key the map, so a hit is exact and plans, bytes, and costs are
+// unchanged. A key shares the value's string, so the memo retains no copy. The store's writer owns
+// it; a clone starts without one, and publication drops it (snapshot.freezeMutationGenerations).
+type compressMemo struct {
+	mu      sync.Mutex
+	entries map[string]compressOutcome
+}
+
+type compressOutcome struct {
+	block   []byte // nil when the attempt is rejected
+	compLen int
+}
+
+// lookup returns a recorded outcome for v's payload. A nil memo, or a payload that is not a resident
+// string body, never hits.
+func (m *compressMemo) lookup(ty colType, v Value) ([]byte, int, bool) {
+	if m == nil || v.Kind == ValUnfetched || !stringPayload(ty) {
+		return nil, 0, false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	o, ok := m.entries[v.str()]
+	return o.block, o.compLen, ok
+}
+
+// record remembers the outcome of compressing v's payload.
+func (m *compressMemo) record(ty colType, v Value, block []byte, compLen int) {
+	if m == nil || v.Kind == ValUnfetched || !stringPayload(ty) {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.entries == nil {
+		m.entries = make(map[string]compressOutcome)
+	}
+	m.entries[v.str()] = compressOutcome{block: block, compLen: compLen}
 }
 
 // valuePayload is a value's content payload P(v) — the bytes stored in the overflow chain when it is
@@ -3438,6 +3492,11 @@ func planBlock(plan *recordPlan, c int, u *Unfetched, src *chainSource) ([]byte,
 //	          an N-entry u32 end-offset value directory + the tagged value bodies (NULL = a
 //	          zero-length span)
 func encodeLeafPAX(colTypes []colType, keys [][]byte, rows []storedRow, seal sealer, take func() uint32, ovf *[]dirtyPage, src *chainSource) ([]byte, error) {
+	return encodeLeafPAXMemo(colTypes, keys, rows, seal, take, ovf, src, nil)
+}
+
+// encodeLeafPAXMemo is encodeLeafPAX planning each record with the table store's compression memo.
+func encodeLeafPAXMemo(colTypes []colType, keys [][]byte, rows []storedRow, seal sealer, take func() uint32, ovf *[]dirtyPage, src *chainSource, memo *compressMemo) ([]byte, error) {
 	n := len(keys)
 	k := len(colTypes)
 	// Encode each value in (record, column) order; overflow chains allocate here. A fixed-width
@@ -3450,7 +3509,7 @@ func encodeLeafPAX(colTypes []colType, keys [][]byte, rows []storedRow, seal sea
 		nulls[c] = make([]bool, n)
 	}
 	for i := 0; i < n; i++ {
-		plan := planDispositions(colTypes, keys[i], rows[i], seal.cap)
+		plan := planDispositionsMemo(colTypes, keys[i], rows[i], seal.cap, memo)
 		for c, ty := range colTypes {
 			isNull := rows[i][c].IsNull()
 			nulls[c][i] = isNull
