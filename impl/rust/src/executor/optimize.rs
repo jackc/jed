@@ -9,6 +9,7 @@
 //! so they are machinery, not rules. Mirrors impl/go optimize.go.
 
 use super::*;
+use std::rc::Rc;
 
 pub(crate) fn physical_rel_ordinal(plan: &SelectPlan, position: usize) -> usize {
     if plan.phys.relation_order.len() == plan.rels.len() {
@@ -23,6 +24,81 @@ fn relation_columns(plan: &SelectPlan, ordinal: usize) -> (usize, usize) {
     (rel.offset, rel.offset + rel.col_count)
 }
 
+/// One relation's inventoried access paths, owned: each identity and the bound the executor
+/// would run for it.
+type OwnedCandidates = Rc<Vec<(ScanCandidateIdentity, Option<ScanBound>)>>;
+
+/// The N-way search installs and estimates thousands of candidate states, each naming its access
+/// paths by identity. An inventory is a pure function of the query, the relation and (for an
+/// index-nested-loop probe) the relations joined before it, none of which the search changes, so
+/// each is built once per search and its bounds cloned out.
+#[derive(Default)]
+struct NwayInventoryMemo {
+    scan: HashMap<usize, OwnedCandidates>,
+    inl: HashMap<(usize, Option<usize>, Vec<usize>), OwnedCandidates>,
+    /// One read of a relation through an access path: keyed by the relation, the path, and (for an
+    /// index-nested-loop probe, whose bound names the relations before it) that prefix.
+    relation: HashMap<(usize, JoinSearchAccess, Vec<usize>), Rc<crate::estimator::EstimatedPlan>>,
+}
+
+impl NwayInventoryMemo {
+    /// The ordinary scan candidates of relation `ordinal`, in inventory order.
+    fn scan(&mut self, plan: &SelectPlan, scope: &Scope<'_>, ordinal: usize) -> OwnedCandidates {
+        self.scan
+            .entry(ordinal)
+            .or_insert_with(|| {
+                Rc::new(
+                    inventory_scan_candidates(
+                        plan.filter.access(),
+                        &scope.rels[ordinal],
+                        scope.catalog,
+                    )
+                    .into_iter()
+                    .map(|candidate| (candidate.identity, candidate.bound))
+                    .collect(),
+                )
+            })
+            .clone()
+    }
+
+    /// The index-nested-loop candidates of relation `ordinal` probed from the relations in
+    /// `prefix`, bounded by join `on_index`'s ON, or by the WHERE when it is `None`.
+    fn inl(
+        &mut self,
+        plan: &SelectPlan,
+        scope: &Scope<'_>,
+        ordinal: usize,
+        on_index: Option<usize>,
+        prefix: &[usize],
+    ) -> OwnedCandidates {
+        self.inl
+            .entry((ordinal, on_index, prefix.to_vec()))
+            .or_insert_with(|| {
+                let sibling_columns: Vec<_> = prefix
+                    .iter()
+                    .map(|&source| relation_columns(plan, source))
+                    .collect();
+                let (on, filter) = match on_index {
+                    Some(index) => (plan.joins[index].on.as_ref(), None),
+                    None => (None, plan.filter.get()),
+                };
+                Rc::new(
+                    inventory_inl_candidates(
+                        on,
+                        filter,
+                        &scope.rels[ordinal],
+                        &sibling_columns,
+                        scope.catalog,
+                    )
+                    .into_iter()
+                    .map(|candidate| (candidate.identity, candidate.bound))
+                    .collect(),
+                )
+            })
+            .clone()
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum JoinSearchAlgorithm {
     Inl,
@@ -30,7 +106,7 @@ enum JoinSearchAlgorithm {
     Nested,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 enum JoinSearchAccess {
     Ordinary(ScanCandidateIdentity),
     Inl {
@@ -316,15 +392,17 @@ impl Engine {
             })
             .collect();
 
+        let memo = &mut NwayInventoryMemo::default();
         let mut state = None;
         for segment in segments {
             state = match segment {
                 JoinSearchSegment::Island(island) => {
-                    self.search_nway_island(plan, scope, state, &island)
+                    self.search_nway_island(plan, scope, memo, state, &island)
                 }
                 JoinSearchSegment::Fixed(ordinal) => Some(self.append_fixed_nway_relation(
                     plan,
                     scope,
+                    memo,
                     state,
                     ordinal,
                     legacy_access[ordinal].clone(),
@@ -335,7 +413,7 @@ impl Engine {
             }
         }
         let Some(winner) = state else { return };
-        self.install_nway_state(plan, scope, &winner);
+        self.install_nway_state(plan, scope, memo, &winner);
         plan.phys.join_pk_ordered =
             winner.satisfies_query_order && self.join_pk_ordered_for_candidate(plan, scope);
     }
@@ -344,13 +422,14 @@ impl Engine {
         &self,
         plan: &mut SelectPlan,
         scope: &Scope<'_>,
+        memo: &mut NwayInventoryMemo,
         prefix: Option<JoinSearchState>,
         island: &[usize],
     ) -> Option<JoinSearchState> {
         if island.len() <= crate::estimator_constants::JOIN_DP_LIMIT {
-            self.search_nway_dp(plan, scope, prefix, island)
+            self.search_nway_dp(plan, scope, memo, prefix, island)
         } else {
-            self.search_nway_greedy(plan, scope, prefix, island)
+            self.search_nway_greedy(plan, scope, memo, prefix, island)
         }
     }
 
@@ -358,6 +437,7 @@ impl Engine {
         &self,
         plan: &mut SelectPlan,
         scope: &Scope<'_>,
+        memo: &mut NwayInventoryMemo,
         ordinal: usize,
         identity: ScanCandidateIdentity,
     ) -> JoinSearchState {
@@ -368,7 +448,7 @@ impl Engine {
             estimate: crate::estimator::PlanEstimate::empty(0),
             satisfies_query_order: false,
         };
-        self.refresh_nway_state(plan, scope, &mut state);
+        self.refresh_nway_state(plan, scope, memo, &mut state);
         state.satisfies_query_order = self.nway_driver_satisfies_order(plan, scope, ordinal);
         state
     }
@@ -377,6 +457,7 @@ impl Engine {
         &self,
         plan: &mut SelectPlan,
         scope: &Scope<'_>,
+        memo: &mut NwayInventoryMemo,
         prefix: Option<JoinSearchState>,
         island: &[usize],
     ) -> Option<JoinSearchState> {
@@ -388,16 +469,9 @@ impl Engine {
             0
         } else {
             for &ordinal in island {
-                let identities: Vec<_> = inventory_scan_candidates(
-                    plan.filter.access(),
-                    &scope.rels[ordinal],
-                    scope.catalog,
-                )
-                .into_iter()
-                .map(|candidate| candidate.identity)
-                .collect();
-                for identity in identities {
-                    let state = self.initial_nway_state(plan, scope, ordinal, identity);
+                let identities = memo.scan(plan, scope, ordinal);
+                for (identity, _) in identities.iter().cloned() {
+                    let state = self.initial_nway_state(plan, scope, memo, ordinal, identity);
                     let index = frontier_index(
                         nway_island_mask(&state, island),
                         state.satisfies_query_order,
@@ -416,7 +490,7 @@ impl Engine {
                 for ordered in [false, true] {
                     let states = frontiers[frontier_index(mask, ordered)].clone();
                     for state in states {
-                        for candidate in self.expand_nway_state(plan, scope, &state, island) {
+                        for candidate in self.expand_nway_state(plan, scope, memo, &state, island) {
                             let next_mask = nway_island_mask(&candidate, island);
                             let index = frontier_index(next_mask, candidate.satisfies_query_order);
                             insert_nway_frontier(&mut frontiers[index], candidate);
@@ -435,7 +509,7 @@ impl Engine {
         let mut winner: Option<(i64, JoinSearchState)> = None;
         for state in completed {
             let cost = if state.order.len() == plan.rels.len() {
-                self.install_nway_state(plan, scope, &state);
+                self.install_nway_state(plan, scope, memo, &state);
                 plan.phys.join_pk_ordered =
                     state.satisfies_query_order && self.join_pk_ordered_for_candidate(plan, scope);
                 self.estimate_select_plan_cost(plan)
@@ -453,6 +527,7 @@ impl Engine {
         &self,
         plan: &mut SelectPlan,
         scope: &Scope<'_>,
+        memo: &mut NwayInventoryMemo,
         prefix: Option<JoinSearchState>,
         island: &[usize],
     ) -> Option<JoinSearchState> {
@@ -462,16 +537,9 @@ impl Engine {
         } else {
             let mut drivers = Vec::new();
             for &ordinal in island {
-                let identities: Vec<_> = inventory_scan_candidates(
-                    plan.filter.access(),
-                    &scope.rels[ordinal],
-                    scope.catalog,
-                )
-                .into_iter()
-                .map(|candidate| candidate.identity)
-                .collect();
-                for identity in identities {
-                    drivers.push(self.initial_nway_state(plan, scope, ordinal, identity));
+                let identities = memo.scan(plan, scope, ordinal);
+                for (identity, _) in identities.iter().cloned() {
+                    drivers.push(self.initial_nway_state(plan, scope, memo, ordinal, identity));
                 }
             }
             drivers.sort_by(compare_nway_state);
@@ -483,7 +551,7 @@ impl Engine {
             })?
         };
         while state.order.len() < prefix_len + island.len() {
-            let mut next = self.expand_nway_state(plan, scope, &state, island);
+            let mut next = self.expand_nway_state(plan, scope, memo, &state, island);
             next.sort_by(compare_nway_state);
             state = next.into_iter().min_by(|a, b| {
                 a.estimate
@@ -499,6 +567,7 @@ impl Engine {
         &self,
         plan: &mut SelectPlan,
         scope: &Scope<'_>,
+        memo: &mut NwayInventoryMemo,
         state: Option<JoinSearchState>,
         ordinal: usize,
         access: JoinSearchAccess,
@@ -525,7 +594,7 @@ impl Engine {
             }
         };
         next.satisfies_query_order = false;
-        self.refresh_nway_state(plan, scope, &mut next);
+        self.refresh_nway_state(plan, scope, memo, &mut next);
         next
     }
 
@@ -533,6 +602,7 @@ impl Engine {
         &self,
         plan: &mut SelectPlan,
         scope: &Scope<'_>,
+        memo: &mut NwayInventoryMemo,
         state: &JoinSearchState,
         allowed: &[usize],
     ) -> Vec<JoinSearchState> {
@@ -541,11 +611,6 @@ impl Engine {
         for &ordinal in &state.order {
             present[ordinal] = true;
         }
-        let sibling_columns: Vec<_> = state
-            .order
-            .iter()
-            .map(|&ordinal| relation_columns(plan, ordinal))
-            .collect();
         let mut out = Vec::new();
         for &inner in allowed {
             if present[inner] {
@@ -557,24 +622,15 @@ impl Engine {
 
             let mut inl_choices = Vec::new();
             for &on_index in &on_indices {
-                for candidate in inventory_inl_candidates(
-                    plan.joins[on_index].on.as_ref(),
-                    None,
-                    &scope.rels[inner],
-                    &sibling_columns,
-                    scope.catalog,
-                ) {
-                    inl_choices.push((candidate.identity, Some(on_index)));
+                for (identity, _) in memo
+                    .inl(plan, scope, inner, Some(on_index), &state.order)
+                    .iter()
+                {
+                    inl_choices.push((identity.clone(), Some(on_index)));
                 }
             }
-            for candidate in inventory_inl_candidates(
-                None,
-                plan.filter.get(),
-                &scope.rels[inner],
-                &sibling_columns,
-                scope.catalog,
-            ) {
-                inl_choices.push((candidate.identity, None));
+            for (identity, _) in memo.inl(plan, scope, inner, None, &state.order).iter() {
+                inl_choices.push((identity.clone(), None));
             }
             inl_choices.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
             inl_choices.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
@@ -588,19 +644,15 @@ impl Engine {
                     algorithm: JoinSearchAlgorithm::Inl,
                     on_indices: on_indices.clone(),
                 });
-                self.refresh_nway_state(plan, scope, &mut candidate);
+                self.refresh_nway_state(plan, scope, memo, &mut candidate);
                 out.push(candidate);
             }
 
-            let identities: Vec<_> =
-                inventory_scan_candidates(plan.filter.access(), &scope.rels[inner], scope.catalog)
-                    .into_iter()
-                    .map(|candidate| candidate.identity)
-                    .collect();
+            let identities = memo.scan(plan, scope, inner);
             let has_hash = self
                 .hash_join_plan_for_ons(plan, scope, &state.order, inner, &on_indices)
                 .is_some();
-            for identity in identities {
+            for (identity, _) in identities.iter().cloned() {
                 if has_hash {
                     let mut candidate = state.clone();
                     candidate.order.push(inner);
@@ -611,7 +663,7 @@ impl Engine {
                         algorithm: JoinSearchAlgorithm::Hash,
                         on_indices: on_indices.clone(),
                     });
-                    self.refresh_nway_state(plan, scope, &mut candidate);
+                    self.refresh_nway_state(plan, scope, memo, &mut candidate);
                     out.push(candidate);
                 }
                 let mut candidate = state.clone();
@@ -621,7 +673,7 @@ impl Engine {
                     algorithm: JoinSearchAlgorithm::Nested,
                     on_indices: on_indices.clone(),
                 });
-                self.refresh_nway_state(plan, scope, &mut candidate);
+                self.refresh_nway_state(plan, scope, memo, &mut candidate);
                 out.push(candidate);
             }
         }
@@ -629,21 +681,44 @@ impl Engine {
         out
     }
 
+    /// Install `state` and estimate it. A state is always built by appending one relation to a
+    /// refreshed state, so on entry `state.estimate` is the estimate of all but its last relation and
+    /// only the last join step is estimated here.
     fn refresh_nway_state(
         &self,
         plan: &mut SelectPlan,
         scope: &Scope<'_>,
+        memo: &mut NwayInventoryMemo,
         state: &mut JoinSearchState,
     ) {
-        self.install_nway_state(plan, scope, state);
+        self.install_nway_state(plan, scope, memo, state);
         plan.phys.join_pk_ordered = false;
-        state.estimate = self.estimate_join_search_prefix(plan, state.order.len());
+        let relations = state.order.len();
+        state.estimate = if relations == 1 {
+            self.estimate_join_search_prefix(plan, 1)
+        } else {
+            let last = relations - 1;
+            let access = state.access[last].clone();
+            let prefix = match access {
+                JoinSearchAccess::Ordinary(_) => Vec::new(),
+                JoinSearchAccess::Inl { .. } => state.order[..last].to_vec(),
+            };
+            let inner = memo
+                .relation
+                .entry((state.order[last], access, prefix))
+                .or_insert_with(|| {
+                    Rc::new(self.estimate_join_search_relation(plan, state.order[last]))
+                })
+                .clone();
+            self.estimate_join_search_step(plan, relations, &state.estimate, &inner)
+        };
     }
 
     fn install_nway_state(
         &self,
         plan: &mut SelectPlan,
         scope: &Scope<'_>,
+        memo: &mut NwayInventoryMemo,
         state: &JoinSearchState,
     ) {
         let n = plan.rels.len();
@@ -660,34 +735,18 @@ impl Engine {
             let ordinal = state.order[position];
             match access {
                 JoinSearchAccess::Ordinary(identity) => {
-                    plan.phys.rel_bounds[ordinal] = inventory_scan_candidates(
-                        plan.filter.access(),
-                        &scope.rels[ordinal],
-                        scope.catalog,
-                    )
-                    .into_iter()
-                    .find(|candidate| candidate.identity == *identity)
-                    .and_then(|candidate| candidate.bound);
+                    plan.phys.rel_bounds[ordinal] = memo
+                        .scan(plan, scope, ordinal)
+                        .iter()
+                        .find(|(candidate, _)| candidate == identity)
+                        .and_then(|(_, bound)| bound.clone());
                 }
                 JoinSearchAccess::Inl { identity, on_index } => {
-                    let sibling_columns: Vec<_> = state.order[..position]
+                    plan.phys.rel_inl_bounds[ordinal] = memo
+                        .inl(plan, scope, ordinal, *on_index, &state.order[..position])
                         .iter()
-                        .map(|&source| relation_columns(plan, source))
-                        .collect();
-                    let (on, filter) = match on_index {
-                        Some(index) => (plan.joins[*index].on.as_ref(), None),
-                        None => (None, plan.filter.get()),
-                    };
-                    plan.phys.rel_inl_bounds[ordinal] = inventory_inl_candidates(
-                        on,
-                        filter,
-                        &scope.rels[ordinal],
-                        &sibling_columns,
-                        scope.catalog,
-                    )
-                    .into_iter()
-                    .find(|candidate| candidate.identity == *identity)
-                    .and_then(|candidate| candidate.bound);
+                        .find(|(candidate, _)| candidate == identity)
+                        .and_then(|(_, bound)| bound.clone());
                 }
             }
         }

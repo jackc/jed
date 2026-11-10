@@ -710,6 +710,7 @@ pub(crate) struct BoundTerm {
     pub(crate) src: BoundSrc,
 }
 
+#[derive(Clone)]
 pub(crate) struct PkEqCol {
     pub(crate) name: String,
     pub(crate) col_type: ScalarType,
@@ -718,6 +719,7 @@ pub(crate) struct PkEqCol {
     pub(crate) coll: Option<std::sync::Arc<Collation>>,
 }
 
+#[derive(Clone)]
 pub(crate) struct PkRange {
     pub(crate) name: String,
     pub(crate) col_type: ScalarType,
@@ -727,6 +729,7 @@ pub(crate) struct PkRange {
 
 /// The plan-time result of PK tuple analysis: a maximal equality prefix plus an optional range on
 /// the next member. The concrete key range is built per execution by `build_key_bound`.
+#[derive(Clone)]
 pub(crate) struct PkBound {
     pub(crate) eq_cols: Vec<PkEqCol>,
     pub(crate) range: Option<PkRange>,
@@ -737,6 +740,7 @@ pub(crate) struct PkBound {
 /// interval at execution, after params/outer sources are known. An array spec (`array` set, no
 /// terms) is a `key = ANY(array)` disjunct: at execution it becomes one point per non-NULL element
 /// of the array's value.
+#[derive(Clone)]
 pub(crate) struct IntervalSpec {
     pub(crate) terms: Vec<BoundTerm>,
     pub(crate) array: Option<ArrayPointSource>,
@@ -755,6 +759,7 @@ pub(crate) struct FoldedPoints {
 /// The array operand of a `key = ANY(array)` interval-set disjunct (cost.md §3 "OR / IN-list") —
 /// constant for the whole scan and readable without evaluation — in the owned form the plan keeps
 /// (the `BoundSrc` precedent).
+#[derive(Clone)]
 pub(crate) enum ArrayPointSource {
     /// A one-dimensional `ARRAY[...]` constructor: each element a constant source of the key.
     Elements(Vec<BoundSrc>),
@@ -781,6 +786,7 @@ pub(crate) enum ArrayPointSource {
 /// A composite PK instead carries `tuple` (cost.md §3 "Composite primary keys"): the consumed
 /// members in key order, every one but possibly the last a point member. `pk_type`/`coll`/`specs`/
 /// `clip` are then unused.
+#[derive(Clone)]
 pub(crate) struct PkKeySet {
     pub(crate) pk_type: ScalarType,
     pub(crate) coll: Option<std::sync::Arc<Collation>>,
@@ -795,6 +801,7 @@ pub(crate) struct PkKeySet {
 /// OR/IN/ANY conjunct (`None` when it has none); `clip` is every direct comparison on it. `point`
 /// marks a point member (a direct equality, or a set of pure equalities/arrays); a non-point member
 /// is the final member, whose canonical intervals map under each prefix.
+#[derive(Clone)]
 pub(crate) struct TupleMember {
     pub(crate) name: String,
     pub(crate) column: usize,
@@ -810,6 +817,7 @@ pub(crate) struct TupleMember {
 /// order, walked as a composite-PK tuple set's members, and `col_types` is every key column's type —
 /// the per-entry key-suffix skip. A tuple of one member is the leading-column interval set.
 /// `all_fixed` reports that every key column is fixed-width, so the probes merge as the PK's do.
+#[derive(Clone)]
 pub(crate) struct IndexKeySet {
     pub(crate) name_key: String,
     pub(crate) tuple: Vec<TupleMember>,
@@ -833,6 +841,7 @@ pub(crate) struct IndexProbe {
 /// (spec/design/gin.md §6), a GiST-bounded scan, or a canonical interval set. Candidate inventory
 /// and consumer selection are deliberately separate; this remains the executor-facing shape of
 /// the selected candidate.
+#[derive(Clone)]
 pub(crate) enum ScanBound {
     Pk(PkBound),
     Index(IndexBound),

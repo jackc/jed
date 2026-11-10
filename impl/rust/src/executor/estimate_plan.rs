@@ -757,8 +757,22 @@ impl Engine {
             return self.estimate_relation(sp, sp.phys.relation_order[0], ctx);
         }
         let outer = self.estimate_nway_join_tree(sp, n - 1, ctx);
+        let inner = self.estimate_relation(sp, sp.phys.relation_order[n - 1], ctx);
+        self.estimate_nway_join_step(sp, n, &outer, &inner, ctx)
+    }
+
+    /// The estimate of the first `n` (≥ 2) relations in physical order, given the estimate `outer`
+    /// of the first `n - 1` and the estimate `inner_per_call` of one read of the last: the last join
+    /// step alone. It reads only that step's and that relation's physical choices.
+    fn estimate_nway_join_step(
+        &self,
+        sp: &SelectPlan,
+        n: usize,
+        outer: &EstimatedPlan,
+        inner_per_call: &EstimatedPlan,
+        ctx: Option<&EstimateCteCtx>,
+    ) -> EstimatedPlan {
         let inner_ordinal = sp.phys.relation_order[n - 1];
-        let inner_per_call = self.estimate_relation(sp, inner_ordinal, ctx);
         let bound_by_outer = sp.phys.rel_inl_bounds[inner_ordinal].is_some();
         let lateral = sp.rels[inner_ordinal].lateral;
         let full_pairs = sat_mul(outer.root.rows, inner_per_call.root.rows);
@@ -887,7 +901,7 @@ impl Engine {
                 );
             }
         }
-        EstimatedPlan::parent(root, &[&outer, &inner])
+        EstimatedPlan::parent(root, &[outer, &inner])
     }
 
     pub(crate) fn estimate_join_search_prefix(
@@ -896,6 +910,32 @@ impl Engine {
         relations: usize,
     ) -> PlanEstimate {
         self.estimate_nway_join_tree(sp, relations, None).root
+    }
+
+    /// [`Self::estimate_join_search_prefix`] for `relations` ≥ 2, from the estimate `outer` of the
+    /// prefix one relation shorter and the estimate `inner` of one read of the last relation
+    /// ([`Self::estimate_join_search_relation`]), so a search that grows a prefix one relation at a
+    /// time does not estimate the whole tree again at every step.
+    pub(crate) fn estimate_join_search_step(
+        &self,
+        sp: &SelectPlan,
+        relations: usize,
+        outer: &PlanEstimate,
+        inner: &EstimatedPlan,
+    ) -> PlanEstimate {
+        let outer = EstimatedPlan::leaf(outer.clone());
+        self.estimate_nway_join_step(sp, relations, &outer, inner, None)
+            .root
+    }
+
+    /// One read of relation `ordinal` through its installed access path. It depends only on that
+    /// relation's own physical choices.
+    pub(crate) fn estimate_join_search_relation(
+        &self,
+        sp: &SelectPlan,
+        ordinal: usize,
+    ) -> EstimatedPlan {
+        self.estimate_relation(sp, ordinal, None)
     }
 
     fn estimate_two_relation_join(

@@ -203,7 +203,7 @@ impl EstimatedPlan {
 /// Canonical access-path rank from estimator.toml. Keep declaration order byte-identical to the
 /// shared fact: P4 compares estimated cost first, then this rank. P3 uses it only to sort inventory.
 /// `ACCESS_PATH_ORDER[kind as usize]` is the kind's shared name.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum ScanCandidateKind {
     Pk,
     Btree,

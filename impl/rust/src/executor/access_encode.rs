@@ -31,6 +31,7 @@ impl ScanBound {
 /// chooses among them. Like [`GinBound`], the constant query operand is NOT stored (re-found in
 /// `plan.filter` at exec time by `gist_match`). No element type is carried: the gather descends the
 /// resident R-tree (gist.md §4.1), whose bounds are already decoded.
+#[derive(Clone)]
 pub(crate) struct GistBound {
     /// The index store's key — the exact index name (its resident R-tree lives under this key).
     pub(crate) name_key: String,
@@ -125,6 +126,7 @@ impl GinOpclass {
 /// The inventory owns one plan per eligible index; the selector chooses among them. The constant
 /// query `Q` is NOT stored (`RExpr` is not `Clone`); it is re-found in `plan.filter` at exec time by
 /// `gin_match` and evaluated there.
+#[derive(Clone)]
 pub(crate) struct GinBound {
     /// The index store's key — the exact index name.
     pub(crate) name_key: String,
@@ -166,6 +168,7 @@ impl GinBound {
 /// equality const-source bound to it. At exec time the sources must agree on one value (else the
 /// bound is provably empty). A collated column encodes its probe via the UCA sort key
 /// (encoding.md §2.12) to match the index's stored key form (collation.md §8).
+#[derive(Clone)]
 pub(crate) struct IndexEqCol {
     pub(crate) col_type: ScalarType,
     pub(crate) coll: Option<std::sync::Arc<Collation>>,
@@ -177,6 +180,7 @@ pub(crate) struct IndexEqCol {
 /// The optional trailing range of an index access predicate (indexes.md §5.1): a range on the key
 /// column immediately after the equality prefix. A collated text column (`coll = Some`) encodes its
 /// endpoints as the column collation's UCA sort key, the stored key form (encoding.md §2.12).
+#[derive(Clone)]
 pub(crate) struct IndexRange {
     pub(crate) col_type: ScalarType,
     pub(crate) coll: Option<std::sync::Arc<Collation>>,
@@ -394,6 +398,7 @@ pub(crate) fn index_entry_row_key<'a>(
 /// (`keys[eq..]`) — the range element (if any) plus every trailing element — each skipped by its
 /// self-delimiting encoding so an admitted entry's row-key suffix is recovered past P. An empty
 /// `eq_cols` with no `range` is a FULL partial-index scan (indexes.md §9.2).
+#[derive(Clone)]
 pub(crate) struct IndexBound {
     /// The index store's key — the exact index name.
     pub(crate) name_key: String,
@@ -628,7 +633,7 @@ pub(crate) use crate::estimator::ScanCandidateKind;
 /// exact catalog name for index-bearing paths and empty for PK/PK-interval/full paths. The derived
 /// `Ord` IS the canonical tie order (estimator.md): access-path rank, then index-name bytes — so
 /// the field order here is load-bearing.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct ScanCandidateIdentity {
     pub(crate) kind: ScanCandidateKind,
     pub(crate) index_name: String,
