@@ -709,17 +709,18 @@ fn utf8_len(lead: u8) -> usize {
 /// occurrence (PG jsonb last-wins), then sort the survivors length-then-bytewise. Done before
 /// sorting so the stored object has unique keys in canonical order — a pure function of input.
 fn canonicalize_object(members: Vec<(String, JsonNode)>) -> Vec<(String, JsonNode)> {
-    // Last-wins dedup, preserving the value of the last occurrence. Walk in order, recording the
-    // final value per key and the order of first appearance is irrelevant (we re-sort anyway).
+    // The sort is stable, so occurrences of one key stay in input order and the last of each run
+    // is the last-wins survivor. Sorting first keeps this O(n log n) in the member count, which a
+    // caller (an aggregate, a cast of long text) can make arbitrarily large.
+    let mut members = members;
+    members.sort_by(|(ka, _), (kb, _)| key_cmp(ka, kb));
     let mut out: Vec<(String, JsonNode)> = Vec::with_capacity(members.len());
-    for (k, v) in members {
-        if let Some(slot) = out.iter_mut().find(|(ek, _)| *ek == k) {
-            slot.1 = v;
-        } else {
-            out.push((k, v));
+    for member in members {
+        match out.last_mut() {
+            Some(last) if last.0 == member.0 => *last = member,
+            _ => out.push(member),
         }
     }
-    out.sort_by(|(ka, _), (kb, _)| key_cmp(ka, kb));
     out
 }
 
@@ -735,14 +736,11 @@ pub fn make_object(members: Vec<(String, JsonNode)>) -> JsonNode {
 pub fn has_duplicate_keys(node: &JsonNode) -> bool {
     match node {
         JsonNode::Object(members) => {
-            for i in 0..members.len() {
-                for j in (i + 1)..members.len() {
-                    if members[i].0 == members[j].0 {
-                        return true;
-                    }
-                }
-            }
-            members.iter().any(|(_, v)| has_duplicate_keys(v))
+            // Sorted, a duplicate key sits beside its twin.
+            let mut keys: Vec<&str> = members.iter().map(|(k, _)| k.as_str()).collect();
+            keys.sort_unstable();
+            keys.windows(2).any(|pair| pair[0] == pair[1])
+                || members.iter().any(|(_, v)| has_duplicate_keys(v))
         }
         JsonNode::Array(elems) => elems.iter().any(has_duplicate_keys),
         _ => false,
@@ -1925,4 +1923,49 @@ pub fn write_json_string(s: &str, out: &mut String) {
         }
     }
     out.push('"');
+}
+
+#[cfg(test)]
+mod canonical_tests {
+    use super::*;
+
+    /// Duplicate keys keep their LAST value, and the survivors come out length-then-bytewise.
+    #[test]
+    fn canonicalize_object_is_last_wins_in_key_order() {
+        let member =
+            |key: &str, value: &str| (key.to_string(), JsonNode::String(value.to_string()));
+        let node = make_object(vec![
+            member("b", "1"),
+            member("aa", "2"),
+            member("a", "3"),
+            member("b", "4"),
+            member("a", "5"),
+            member("aa", "6"),
+            member("b", "7"),
+        ]);
+        let JsonNode::Object(members) = node else {
+            panic!("an object");
+        };
+        let got: Vec<(&str, &JsonNode)> = members.iter().map(|(k, v)| (k.as_str(), v)).collect();
+        let (a, b, aa) = (
+            JsonNode::String("5".to_string()),
+            JsonNode::String("7".to_string()),
+            JsonNode::String("6".to_string()),
+        );
+        assert_eq!(got, vec![("a", &a), ("b", &b), ("aa", &aa)]);
+    }
+
+    #[test]
+    fn duplicate_keys_are_found_at_any_depth() {
+        let leaf = |key: &str| (key.to_string(), JsonNode::Null);
+        let unique = JsonNode::Object(vec![leaf("a"), leaf("b"), leaf("c")]);
+        assert!(!has_duplicate_keys(&unique));
+        let apart = JsonNode::Object(vec![leaf("a"), leaf("b"), leaf("a")]);
+        assert!(has_duplicate_keys(&apart));
+        let nested = JsonNode::Array(vec![
+            unique.clone(),
+            JsonNode::Object(vec![("k".to_string(), apart)]),
+        ]);
+        assert!(has_duplicate_keys(&nested));
+    }
 }
