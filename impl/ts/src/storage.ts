@@ -23,6 +23,7 @@ import {
   deferredInStoredForm,
   anySpillable,
   anySpillableMasked,
+  CompressMemo,
   fixedValueWidth,
   leafShape,
   recordCompressUnits,
@@ -128,6 +129,9 @@ export class TableStore {
   // the session's budget (memory.md §7.1). A version written without it is counted but not recorded,
   // so a later rewrite of it is counted again.
   private net = false;
+  // memo is the writer's compression memo (CompressMemo): created on the first write that plans a
+  // spillable column, never copied by clone, and dropped by the commit encoder.
+  private memo: CompressMemo | null = null;
 
   constructor(
     cap: Cap,
@@ -230,6 +234,24 @@ export class TableStore {
     this.rows.freezeMutationGeneration();
   }
 
+  // compressMemo returns the store's compression memo, creating it on first use (writer only). A
+  // store without a spillable column needs none.
+  private compressMemo(): CompressMemo | null {
+    if (this.memo === null && anySpillable(this.colTypes)) this.memo = new CompressMemo();
+    return this.memo;
+  }
+
+  // writerCompressMemo is the memo the commit encoder plans this store's dirty leaves with, or null.
+  writerCompressMemo(): CompressMemo | null {
+    return this.memo;
+  }
+
+  // dropCompressMemo forgets the writer's compression outcomes: the commit has encoded the store, its
+  // rows' last plan.
+  dropCompressMemo(): void {
+    this.memo = null;
+  }
+
   // attachPaging attaches this database's shared paging context (the demand-paged file load,
   // format.ts): the store's OnDisk leaves now fault through the pool. One pool per database.
   attachPaging(paging: SharedPaging): void {
@@ -246,7 +268,7 @@ export class TableStore {
   // large-values.md §12), so split points match the serialized pages.
   // It also returns the record's stored bytes, the pending-write measure (memory.md §7).
   private weight(key: Uint8Array, row: Row): [number, number] {
-    return recordFootprint(this.colTypes, key, row, this.cap);
+    return recordFootprint(this.colTypes, key, row, this.cap, this.compressMemo());
   }
 
   // insert adds a row under its encoded key. Returns false if the key already exists
@@ -584,7 +606,7 @@ export class TableStore {
   // record fits inline-plain (no attempt runs), so existing costs do not move.
   writeCompressUnits(key: Uint8Array, row: Row): number {
     if (!anySpillable(this.colTypes)) return 0;
-    return recordCompressUnits(this.colTypes, key, row, this.cap);
+    return recordCompressUnits(this.colTypes, key, row, this.cap, this.compressMemo());
   }
 
   // resolveColumns returns `row` with the unfetched values in the columns `mask` selects

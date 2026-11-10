@@ -1242,7 +1242,13 @@ function planningPayload(ty: ColType, v: Value): Uint8Array {
 // ran, so pass 1 visited every candidate first), and an inline- or external-compressed one was
 // adopted with the block it stores. Only an inline-deferred value, whose stored form records no
 // outcome, is compressed when an attempt reaches it — from the bytes it holds.
-function planDispositions(colTypes: ColType[], key: Uint8Array, row: Row, cap: Cap): RecordPlan {
+function planDispositions(
+  colTypes: ColType[],
+  key: Uint8Array,
+  row: Row,
+  cap: Cap,
+  memo: CompressMemo | null = null,
+): RecordPlan {
   const capacity = cap.c;
   const plan: RecordPlan = {
     disp: new Array<ValueDisp>(colTypes.length).fill("inline"),
@@ -1294,11 +1300,18 @@ function planDispositions(colTypes: ColType[], key: Uint8Array, row: Row, cap: C
         compLen = v.ref.storedLen; // the block stays on the value's chain
       }
     } else {
-      // The attempt's block is a view of the encoder's worst-case buffer; it is copied out only if
-      // adopted.
-      const block = lz4CompressScratch(planningPayload(colTypes[i]!, v));
-      compLen = block.length;
-      if (INLINE_COMP_OVERHEAD + compLen < inline[i]!) comp = block.slice();
+      const known = memo?.lookup(v);
+      if (known !== undefined) {
+        comp = known.block;
+        compLen = known.compLen;
+      } else {
+        // The attempt's block is a view of the encoder's worst-case buffer; it is copied out only if
+        // adopted.
+        const block = lz4CompressScratch(planningPayload(colTypes[i]!, v));
+        compLen = block.length;
+        if (INLINE_COMP_OVERHEAD + compLen < inline[i]!) comp = block.slice();
+        memo?.record(v, comp, compLen);
+      }
     }
     if (compLen >= 0 && INLINE_COMP_OVERHEAD + compLen < inline[i]!) {
       size = size - cur[i]! + INLINE_COMP_OVERHEAD + compLen;
@@ -1333,6 +1346,36 @@ function planDispositions(colTypes: ColType[], key: Uint8Array, row: Row, cap: C
   }
   plan.size = size;
   return plan;
+}
+
+// CompressMemo holds, for one writing transaction's table store, the outcome of each pass-1
+// compression attempt on a resident text / bytea / json value: the block's length and, when
+// store-smaller adopts it, the block. The same value is planned for its value_compress charge, its
+// B-tree weight, and its commit encoding; with the memo it is compressed once. The outcome depends
+// only on the value's payload bytes, and values are immutable, so keying by the value object is exact
+// and plans, bytes, and costs are unchanged. (A string key would be no better: V8 hashes a string
+// longer than 16383 code units by its length alone, so equal-length payloads would share one
+// bucket.) A WeakMap, so the memo keeps no value the transaction has dropped. The store's writer owns
+// it; a clone starts without one, and the commit encoder drops it once it has planned the store's dirty
+// leaves (serializeIncremental), so a published or rolled-back store keeps nothing.
+export class CompressMemo {
+  private entries = new WeakMap<Value, { block: Uint8Array | null; compLen: number }>();
+
+  // lookup returns the recorded outcome for v (block null when the attempt was rejected), or
+  // undefined. A value that is not a resident text / bytea / json body never hits.
+  lookup(v: Value): { block: Uint8Array | null; compLen: number } | undefined {
+    if (!memoizable(v)) return undefined;
+    return this.entries.get(v);
+  }
+
+  // record remembers the outcome of compressing v's payload.
+  record(v: Value, block: Uint8Array | null, compLen: number): void {
+    if (memoizable(v)) this.entries.set(v, { block, compLen });
+  }
+}
+
+function memoizable(v: Value): boolean {
+  return v.kind === "text" || v.kind === "bytea" || v.kind === "json";
 }
 
 // deferredInStoredForm reports, per column, whether the value is deferred AND the record's plan
@@ -1377,8 +1420,9 @@ export function recordFootprint(
   key: Uint8Array,
   row: Row,
   cap: Cap,
+  memo: CompressMemo | null = null,
 ): [number, number] {
-  const plan = planDispositions(colTypes, key, row, cap);
+  const plan = planDispositions(colTypes, key, row, cap, memo);
   return [plan.size, plan.size + plan.external];
 }
 
@@ -1497,8 +1541,9 @@ export function recordCompressUnits(
   key: Uint8Array,
   row: Row,
   cap: Cap,
+  memo: CompressMemo | null = null,
 ): number {
-  return planDispositions(colTypes, key, row, cap).compressUnits;
+  return planDispositions(colTypes, key, row, cap, memo).compressUnits;
 }
 
 // valuePayload is a value's content payload P(v) — the bytes stored in the overflow chain when it is
@@ -1814,6 +1859,7 @@ export function encodeLeafPax(
   take: () => number,
   ovf: OverflowPageOut[],
   src: ChainSource = new ChainSource(null, false),
+  memo: CompressMemo | null = null,
 ): Uint8Array {
   const n = keys.length;
   const k = colTypes.length;
@@ -1823,7 +1869,7 @@ export function encodeLeafPax(
   const valBytes: Uint8Array[][] = Array.from({ length: k }, () => new Array<Uint8Array>(n));
   const nulls: boolean[][] = Array.from({ length: k }, () => new Array<boolean>(n).fill(false));
   for (let i = 0; i < n; i++) {
-    const plan = planDispositions(colTypes, keys[i]!, rows[i]!, seal.cap);
+    const plan = planDispositions(colTypes, keys[i]!, rows[i]!, seal.cap, memo);
     for (let c = 0; c < k; c++) {
       const v = rows[i]![c]!;
       const isNull = v.kind === "null";
@@ -3710,6 +3756,7 @@ function serializeIncremental(
       rootDataPage[ti] = serializeDirty(
         root,
         store.columnTypes(),
+        store.writerCompressMemo(),
         seal,
         alloc,
         pages,
@@ -3719,6 +3766,8 @@ function serializeIncremental(
         chains,
       );
     }
+    // The commit encoding is the last plan of the writer's rows, so its compression memo goes.
+    store.dropCompressMemo();
     // The table's index trees follow its data tree, in catalog (name) order — only their
     // dirty nodes are written, like any tree (spec/fileformat/format.md "Allocation &
     // incremental commit").
@@ -3763,6 +3812,7 @@ function serializeIncremental(
           ir = serializeDirty(
             iroot,
             indexColTypes,
+            null,
             seal,
             alloc,
             pages,
@@ -3819,6 +3869,7 @@ function serializeIncremental(
 function serializeDirty(
   n: PNode,
   colTypes: ColType[],
+  memo: CompressMemo | null,
   seal: Sealer,
   alloc: PageAlloc,
   pages: { index: number; bytes: Uint8Array }[],
@@ -3840,7 +3891,7 @@ function serializeDirty(
       childPages.push({ page: c.page, tag: c.tag ?? NO_TAG });
     } else {
       childPages.push(
-        serializeDirty(c.node, colTypes, seal, alloc, pages, kept, shared, paging, chains),
+        serializeDirty(c.node, colTypes, memo, seal, alloc, pages, kept, shared, paging, chains),
       );
     }
   }
@@ -3859,7 +3910,7 @@ function serializeDirty(
     payload = encodeInterior(n.keys, childPages, seal.cap);
   } else {
     const src = new ChainSource(paging, true, chains);
-    payload = encodeLeafPax(colTypes, n.keys, n.vals, seal, take, pages, src);
+    payload = encodeLeafPax(colTypes, n.keys, n.vals, seal, take, pages, src, memo);
     for (const p of src.shared) shared.add(p);
   }
   if (payload.length > seal.cap.c) {
