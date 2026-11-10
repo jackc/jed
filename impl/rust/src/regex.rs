@@ -1064,7 +1064,6 @@ trait CapRep {
     type Caps: Clone;
     /// The version of `caps` (`None` = every slot unset) with slot `i` set to `v`.
     fn with(prog: &Program, caps: Option<&Self::Caps>, i: usize, v: i64) -> Self::Caps;
-    fn result(caps: Self::Caps) -> Captures;
 }
 
 /// The slots as one array, copied whole on a Save: at most `CAP_FAN` slots.
@@ -1081,10 +1080,6 @@ impl CapRep for FlatCaps {
         flat[i] = v;
         Rc::new(flat)
     }
-
-    fn result(caps: Rc<Vec<i64>>) -> Captures {
-        Captures::Flat(caps)
-    }
 }
 
 /// The slots as a capture-slot tree; a Save copies the path to the slot it sets.
@@ -1096,10 +1091,17 @@ impl CapRep for TreeCaps {
     fn with(prog: &Program, caps: Option<&CapNode>, i: usize, v: i64) -> CapNode {
         prog.with_slot(caps, i, v)
     }
+}
 
-    fn result(caps: CapNode) -> Captures {
-        Captures::Tree(caps)
-    }
+/// No slots at all, for a search that only asks whether the pattern matches. The VM explores the
+/// same states in the same order whatever the representation, so the answer and the `regex_step`
+/// charge are those of a capturing search.
+struct NoCaps;
+
+impl CapRep for NoCaps {
+    type Caps = ();
+
+    fn with(_: &Program, _: Option<&()>, _: usize, _: i64) {}
 }
 
 struct Thread<C> {
@@ -1173,7 +1175,10 @@ impl Program {
 
     /// Boolean match — TRUE iff the pattern matches somewhere in `input` (the `~` operator).
     pub fn is_match(&self, input: &[char], m: &mut Meter) -> Result<bool> {
-        Ok(self.run(input, m)?.is_some())
+        let matched = self.with_seen(|seen| {
+            self.pike_search::<NoCaps>(seen, input, 0, &mut Gating::default(), m)
+        })?;
+        Ok(matched.is_some())
     }
 
     /// Run the Pike VM from the start of the input (regex.md §4). Returns the winning thread's
@@ -1207,11 +1212,13 @@ impl Program {
         gating: &mut Gating,
         m: &mut Meter,
     ) -> Result<Option<Captures>> {
-        if self.cap_depth == 1 {
-            self.pike_search::<FlatCaps>(seen, input, start, gating, m)
+        Ok(if self.cap_depth == 1 {
+            self.pike_search::<FlatCaps>(seen, input, start, gating, m)?
+                .map(Captures::Flat)
         } else {
-            self.pike_search::<TreeCaps>(seen, input, start, gating, m)
-        }
+            self.pike_search::<TreeCaps>(seen, input, start, gating, m)?
+                .map(Captures::Tree)
+        })
     }
 
     /// The start of the match of a gated program (regex.md §8f) whose start is in `gate` (one flag per
@@ -1243,7 +1250,7 @@ impl Program {
         Ok(ends)
     }
 
-    /// [`Program::search`] over the capture representation `R`.
+    /// [`Program::search`] over the capture representation `R`, returning the winning thread's slots.
     #[allow(clippy::needless_range_loop)]
     fn pike_search<R: CapRep>(
         &self,
@@ -1252,15 +1259,19 @@ impl Program {
         start: usize,
         gating: &mut Gating,
         m: &mut Meter,
-    ) -> Result<Option<Captures>> {
+    ) -> Result<Option<R::Caps>> {
         let gate = gating.gate;
         let len = input.len();
         let mut clist: Vec<Thread<R::Caps>> = Vec::new();
         let mut nlist: Vec<Thread<R::Caps>> = Vec::new();
+        // add_thread's work stack, kept across its calls so each does not allocate one.
+        let mut stack: Vec<Thread<R::Caps>> = Vec::new();
         let mut matched: Option<R::Caps> = None;
 
         let generation = seen.next();
-        self.add_thread::<R>(&mut clist, seen, generation, 0, None, start, input, gate, m)?;
+        self.add_thread::<R>(
+            &mut stack, &mut clist, seen, generation, 0, None, start, input, gate, m,
+        )?;
 
         for sp in start..=len {
             let generation = seen.next();
@@ -1288,6 +1299,7 @@ impl Program {
                 if advances {
                     let caps = clist[i].caps.clone();
                     self.add_thread::<R>(
+                        &mut stack,
                         &mut nlist,
                         seen,
                         generation,
@@ -1307,16 +1319,18 @@ impl Program {
                 break;
             }
         }
-        Ok(matched.map(R::result))
+        Ok(matched)
     }
 
     /// Epsilon-closure: follow Jmp/Split/Save/Assert from `pc`, appending consuming/Match threads to
     /// `list`, deduping by pc within this generation. Iterative (explicit stack) so a long
     /// Jmp/Split chain cannot overflow the native stack; the `y` arm of a Split is pushed before
     /// `x` so `x` is processed first (higher priority). Charges `regex_step` per explored state.
+    /// `stack` is the caller's reusable scratch; its contents on entry are discarded.
     #[allow(clippy::too_many_arguments)]
     fn add_thread<R: CapRep>(
         &self,
+        stack: &mut Vec<Thread<R::Caps>>,
         list: &mut Vec<Thread<R::Caps>>,
         seen: &mut Seen,
         generation: u32,
@@ -1328,10 +1342,11 @@ impl Program {
         m: &mut Meter,
     ) -> Result<()> {
         let len = input.len();
-        let mut stack: Vec<Thread<R::Caps>> = vec![Thread {
+        stack.clear();
+        stack.push(Thread {
             pc: pc0,
             caps: caps0,
-        }];
+        });
         while let Some(Thread { pc, caps }) = stack.pop() {
             if seen.marks[pc] == generation {
                 continue;
