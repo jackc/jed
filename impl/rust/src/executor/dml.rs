@@ -4199,6 +4199,8 @@ impl Engine {
         for plan in &plans {
             collect_touched(&plan.source, 0, &mut mask);
         }
+        // The columns RETURNING reads from the old side, which the retained old row keeps resolved.
+        let mut old_returned: Option<Vec<bool>> = None;
         if let Some((nodes, _, _)) = &ret {
             let mut ret_mask = vec![false; 2 * ncols];
             for node in nodes {
@@ -4208,6 +4210,7 @@ impl Engine {
                 *m |= ret_mask[i] && !plans.iter().any(|p| p.idx == i); // new side
                 *m |= ret_mask[ncols + i]; // old side — always a storage read
             }
+            old_returned = Some(ret_mask[ncols..].to_vec());
         }
         // A generated action's keyed target reads the FK columns for its membership test (§6.11).
         if let Some(target) = &upd.fk_target {
@@ -4291,7 +4294,20 @@ impl Engine {
             // directly below); resolve its inline-deferred values (lazy-record.md §5b — a key
             // column is always inline, so cost-free) so that maintenance sees resident values.
             store.resolve_inline_columns(&mut row)?;
-            let mut new_row = row.clone();
+            // The new row starts as the old one, except that an assigned column (always written
+            // below) holds a placeholder and a carried large value its stored form, so neither is
+            // copied from its resolved old value only to be replaced.
+            let mut new_row: Row = row
+                .iter()
+                .enumerate()
+                .map(|(i, v)| match stored.as_ref().map(|s| &s[i]) {
+                    _ if assigned[i] => Value::Null,
+                    Some(Value::Unfetched(u)) if !pk_members.contains(&i) && u.is_large_form() => {
+                        Value::Unfetched(u.clone())
+                    }
+                    _ => v.clone(),
+                })
+                .collect();
             let mut null_col: Option<&str> = None;
             for plan in &plans {
                 let mut raw = plan.source.eval(&row, &env, &mut meter)?;
@@ -4360,7 +4376,14 @@ impl Engine {
             // stored form; the rest are resolved, so the stored row plans exactly as a resident
             // one would (large-values.md §15).
             store.settle_carried(&new_key, &mut new_row)?;
-            updates.push((key, new_key, new_row, row));
+            // The old row is kept only for maintenance; its large values return to their stored
+            // forms unless RETURNING reads them from the old side.
+            let old_row = crate::storage::TableStore::retained_old_row(
+                row,
+                stored.as_ref(),
+                old_returned.as_deref(),
+            );
+            updates.push((key, new_key, new_row, old_row));
         }
         if let Some(profile) = self.explain_actual.borrow_mut().as_mut() {
             profile.record(format!("Scan {}", upd.table), scan_actual);
@@ -4575,14 +4598,26 @@ impl Engine {
         // removals across rows, then all insertions), since a moved row's new entry can equal
         // another moved row's not-yet-removed old entry.
         let updated = updates.len() as i64;
+        // After the writes only the generated foreign-key actions read a new row (its referenced
+        // columns); with no foreign key referencing this table, each new row moves into the store.
+        let fk_reads_new_rows = self
+            .fk_domain(upd.db.as_deref(), &upd.table)
+            .is_some_and(|temp| !self.fk_referencers(&fk_parent.name, temp).is_empty());
+        let take_row = |row: &mut Row| {
+            if fk_reads_new_rows {
+                row.clone()
+            } else {
+                std::mem::take(row)
+            }
+        };
         let store = self.store_mut_scoped(upd.db.as_deref(), &upd.table);
         if pk_changed {
             let relation_lc = relation.to_string();
             for (old_key, _, _, _) in &updates {
                 store.remove(old_key)?;
             }
-            for (_, new_key, row, _) in &updates {
-                if !store.insert(new_key.clone(), row.clone())? {
+            for (_, new_key, row, _) in &mut updates {
+                if !store.insert(new_key.clone(), take_row(row))? {
                     // Reachable only under the writable-CTE read pin (writable-cte.md §7): an
                     // earlier sub-statement staged this key, unseen by phase 1. Aborts
                     // all-or-nothing, matching INSERT. For a single statement, phase 1's
@@ -4610,8 +4645,8 @@ impl Engine {
                 }
             }
         } else {
-            for (key, _, row, _) in &updates {
-                store.replace(key, row.clone())?;
+            for (key, _, row, _) in &mut updates {
+                store.replace(key, take_row(row))?;
             }
             for (k, def) in indexes.iter().enumerate() {
                 let istore = self.index_store_mut_scoped(upd.db.as_deref(), &def.name.to_string());

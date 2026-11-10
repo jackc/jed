@@ -703,6 +703,34 @@ impl TableStore {
         Ok(())
     }
 
+    /// The old row a rewrite keeps until its maintenance runs (index entries, foreign-key actions,
+    /// RETURNING old.*): `resolved`, except that each column whose `stored` value is a large form
+    /// (out of line or compressed) returns to that stored, deferred form unless `keep` marks it.
+    /// That is the picture the maintenance paths already handle (a DELETE's matched rows, a key
+    /// column always inline — [`resolve_inline_columns`](TableStore::resolve_inline_columns)), so
+    /// the statement holds each large value decoded only while it builds the row's new version.
+    /// `stored` is the row as scanned, before the touched set resolved it (`None` when it held no
+    /// large form); `keep` is `None` to keep nothing resolved.
+    pub(crate) fn retained_old_row(
+        mut resolved: Row,
+        stored: Option<&Row>,
+        keep: Option<&[bool]>,
+    ) -> Row {
+        let Some(stored) = stored else {
+            return resolved;
+        };
+        for (i, sv) in stored.iter().enumerate() {
+            if let Value::Unfetched(u) = sv
+                && u.is_large_form()
+                && !matches!(resolved[i], Value::Unfetched(_))
+                && !keep.is_some_and(|k| k[i])
+            {
+                resolved[i] = sv.clone();
+            }
+        }
+        resolved
+    }
+
     /// Materialize **every** unfetched value in `row` (all columns). The mutation path uses this
     /// on a row it is about to re-store (UPDATE), so the stored row is fully resident and its
     /// weight/disposition re-plan exactly like an eager writer's (large-values.md §14).

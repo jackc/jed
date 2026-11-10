@@ -884,6 +884,8 @@ impl Engine {
         let mw = plan.m;
 
         let mask = merge_touched(&plan, n);
+        // A retained old row keeps every column resolved when RETURNING may read it.
+        let keep_all = vec![true; n];
 
         let stmt_rng = std::cell::Cell::new(crate::seam::StmtRng::new());
         let env = EvalEnv {
@@ -934,17 +936,40 @@ impl Engine {
                     "MERGE command cannot affect row a second time",
                 ));
             }
+            // The old row is kept only for maintenance (index entries, foreign-key actions,
+            // RETURNING); its large values return to their stored forms unless RETURNING may
+            // read them.
+            let keep_old = plan.returning.as_ref().map(|_| keep_all.as_slice());
             match action {
                 MergeActionPlan::Delete => {
                     affected.insert(key.clone());
                     actions.push(Planned::Delete {
                         key,
-                        old_row: row,
+                        old_row: crate::storage::TableStore::retained_old_row(
+                            row,
+                            stored.as_ref(),
+                            keep_old,
+                        ),
                         src,
                     });
                 }
                 MergeActionPlan::Update(assigns) => {
-                    let mut new_row = row.clone();
+                    // The new row starts as the old one, except that an assigned column (always
+                    // written below) holds a placeholder and a carried large value its stored form,
+                    // so neither is copied from its resolved old value only to be replaced.
+                    let mut new_row: Row = row
+                        .iter()
+                        .enumerate()
+                        .map(|(i, v)| match stored.as_ref().map(|s| &s[i]) {
+                            _ if assigns.iter().any(|a| a.idx == i) => Value::Null,
+                            Some(Value::Unfetched(u))
+                                if !pk_members.contains(&i) && u.is_large_form() =>
+                            {
+                                Value::Unfetched(u.clone())
+                            }
+                            _ => v.clone(),
+                        })
+                        .collect();
                     let mut null_col: Option<&str> = None;
                     for a in assigns {
                         let raw = a.source.eval(eval_row, &env, meter)?;
@@ -990,7 +1015,11 @@ impl Engine {
                         old_key: key,
                         new_key,
                         new_row,
-                        old_row: row,
+                        old_row: crate::storage::TableStore::retained_old_row(
+                            row,
+                            stored.as_ref(),
+                            keep_old,
+                        ),
                         src,
                         clause: ci,
                     });
@@ -1551,6 +1580,12 @@ impl Engine {
                 Planned::Update { .. } | Planned::Insert { .. } => {}
             }
         }
+        // After the writes only the generated foreign-key actions read a new row (its referenced
+        // columns); with no foreign key referencing this table, each new row moves into the store.
+        let fk_reads_new_rows = self
+            .fk_domain(db.as_deref(), &table_name)
+            .is_some_and(|temp| !self.fk_referencers(&fk_parent.name, temp).is_empty());
+        let store = self.store_mut_scoped(db.as_deref(), &table_name);
         let mut adds: Vec<Vec<(Vec<u8>, usize)>> = vec![Vec::new(); indexes.len()];
         for (ai, a) in actions.into_iter().enumerate() {
             match a {
@@ -1577,7 +1612,7 @@ impl Engine {
                 Planned::Update {
                     old_key,
                     new_key,
-                    new_row,
+                    mut new_row,
                     old_row,
                     ..
                 } => {
@@ -1586,15 +1621,20 @@ impl Engine {
                             adds[k].push((e.clone(), new_key.len()));
                         }
                     }
+                    let stored_row = if fk_reads_new_rows {
+                        new_row.clone()
+                    } else {
+                        std::mem::take(&mut new_row)
+                    };
                     if old_key != new_key {
-                        if !store.insert(new_key.clone(), new_row.clone())? {
+                        if !store.insert(new_key.clone(), stored_row)? {
                             return Err(EngineError::unique_violation(
                                 &relation,
                                 pkey_name(&relation),
                             ));
                         }
                     } else {
-                        store.replace(&old_key, new_row.clone())?;
+                        store.replace(&old_key, stored_row)?;
                     }
                     fk_updates.push((old_key, new_key, new_row, old_row));
                 }
