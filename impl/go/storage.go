@@ -580,6 +580,34 @@ func (s *tableStore) settleCarried(key []byte, row storedRow) (storedRow, error)
 // page and decompresses nothing. Used in place of resolveAll, which would instead read an untouched
 // spilled column's chain (unmetered I/O the §14 contract forbids on these paths).
 func (s *tableStore) resolveInlineColumns(row storedRow) (storedRow, error) {
+	return resolveInlineColumnsOf(s.colTypes, row)
+}
+
+// retainedOldRow is the old row a rewrite keeps until its maintenance runs (index entries, foreign-key
+// actions, RETURNING old.*): resolved, except that each column whose stored value is a large form
+// (out of line or compressed) returns to that stored, deferred form unless keep marks it. That is the
+// picture the maintenance paths expect (resolveInlineColumns: a key column is always inline), so the
+// statement holds each large value decoded only while it builds the row's new version. keep may be
+// nil (keep nothing resolved).
+func retainedOldRow(resolved, stored storedRow, keep []bool) storedRow {
+	out := resolved
+	copied := false
+	for i, sv := range stored {
+		if sv.Kind != ValUnfetched || sv.unfetched().Form == 0x00 || resolved[i].Kind == ValUnfetched ||
+			(keep != nil && keep[i]) {
+			continue
+		}
+		if !copied {
+			out = append(storedRow(nil), resolved...)
+			copied = true
+		}
+		out[i] = sv
+	}
+	return out
+}
+
+// resolveInlineColumnsOf is resolveInlineColumns over explicit column types.
+func resolveInlineColumnsOf(colTypes []colType, row storedRow) (storedRow, error) {
 	needs := false
 	for _, v := range row {
 		if v.Kind == ValUnfetched && v.unfetched().Form == 0x00 {
@@ -595,7 +623,7 @@ func (s *tableStore) resolveInlineColumns(row storedRow) (storedRow, error) {
 	for i := range out {
 		if out[i].Kind == ValUnfetched && out[i].unfetched().Form == 0x00 {
 			// An inline form reads no overflow pages — fetch is never invoked.
-			v, err := resolveUnfetched(s.colTypes[i], out[i].unfetched(), nil, pageCap{})
+			v, err := resolveUnfetched(colTypes[i], out[i].unfetched(), nil, pageCap{})
 			if err != nil {
 				return nil, err
 			}

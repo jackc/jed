@@ -727,6 +727,14 @@ func (db *engine) executeMergeTarget(written *mergeStmt, params []Value, ctx cte
 	mw := plan.m
 
 	mask := mergeTouched(plan, n)
+	// A retained old row (retainedOldRow) keeps every column resolved when RETURNING may read it.
+	var keepOld []bool
+	if plan.returning != nil {
+		keepOld = make([]bool, n)
+		for i := range keepOld {
+			keepOld[i] = true
+		}
+	}
 
 	env := &evalEnv{exec: db, params: bound, rng: newStmtRng(), ctes: ctx}
 	pkChanged := make([]bool, len(plan.clauses))
@@ -753,7 +761,7 @@ func (db *engine) executeMergeTarget(written *mergeStmt, params []Value, ctx cte
 		switch c.action {
 		case mergeDelete:
 			affected[string(key)] = struct{}{}
-			actions = append(actions, mergeAction{kind: mergeDelete, key: key, oldRow: row, src: src, clause: ci})
+			actions = append(actions, mergeAction{kind: mergeDelete, key: key, oldRow: retainedOldRow(row, stored, keepOld), src: src, clause: ci})
 		case mergeUpdate:
 			newRow := make(storedRow, len(row))
 			copy(newRow, row)
@@ -810,7 +818,7 @@ func (db *engine) executeMergeTarget(written *mergeStmt, params []Value, ctx cte
 				return err
 			}
 			affected[string(key)] = struct{}{}
-			actions = append(actions, mergeAction{kind: mergeUpdate, key: key, newKey: newKey, newRow: newRow, oldRow: row, src: src, clause: ci})
+			actions = append(actions, mergeAction{kind: mergeUpdate, key: key, newKey: newKey, newRow: newRow, oldRow: retainedOldRow(row, stored, keepOld), src: src, clause: ci})
 		default:
 			panic("a target row takes UPDATE, DELETE, or DO NOTHING")
 		}

@@ -4554,6 +4554,17 @@ func (db *engine) executeUpdateTarget(upd *update, params []Value, ctx cteCtx) (
 			}
 		}
 	}
+	// oldReturned marks the columns RETURNING reads from the old side, which the retained old row
+	// keeps resolved.
+	var oldReturned []bool
+	if retNodes != nil {
+		ncols := len(table.Columns)
+		retMask := make([]bool, 2*ncols)
+		for _, node := range retNodes {
+			collectTouched(node, 0, retMask)
+		}
+		oldReturned = retMask[ncols:]
+	}
 	// Plan and execute the target scan through the shared mutation access-path seam. The keyed batch
 	// is over the pre-update state and feeds the unchanged two-phase rewrite below.
 	scanBefore := meter.Accrued
@@ -4697,7 +4708,9 @@ func (db *engine) executeUpdateTarget(upd *update, params []Value, ctx cteCtx) (
 		if newRow, err = store.settleCarried(newKey, newRow); err != nil {
 			return outcome{}, err
 		}
-		updates = append(updates, pending{key: e.Key, newKey: newKey, row: newRow, oldRow: row})
+		// The old row is kept only for maintenance; its large values return to their stored forms
+		// unless RETURNING reads them from the old side.
+		updates = append(updates, pending{key: e.Key, newKey: newKey, row: newRow, oldRow: retainedOldRow(row, e.Row, oldReturned)})
 	}
 	db.explainActual.record("Scan "+upd.Table, scanActual)
 	if filter != nil {
