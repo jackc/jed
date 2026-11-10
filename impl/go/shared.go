@@ -1062,7 +1062,7 @@ func (st *storage) compact(snap *snapshot, txid uint64) (*snapshot, error) {
 		if err != nil {
 			return nil, err
 		}
-		p, err := pagerFromStore(&memoryBlockStore{buf: image}) // image is fresh: no defensive copy
+		p, err := pagerFromStore(newMemoryBlockStoreOwning(image)) // image is fresh: no defensive copy
 		if err != nil {
 			return nil, err
 		}

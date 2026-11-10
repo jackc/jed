@@ -79,11 +79,11 @@ func TestIncompleteEqualTxidSiblingCannotBecomeDurabilityFloor(t *testing.T) {
 			if metaWrites != 1 {
 				t.Fatalf("meta writes = %d, want one", metaWrites)
 			}
-			if string(base.buf[goodSlot*pageSize:(goodSlot+1)*pageSize]) != string(good) {
+			if string(base.image()[goodSlot*pageSize:(goodSlot+1)*pageSize]) != string(good) {
 				t.Fatal("complete fallback changed")
 			}
 			// All body writes survive, but the successor meta is torn beyond its header.
-			crashed := append([]byte(nil), base.buf...)
+			crashed := base.image()
 			clear(crashed[badSlot*pageSize+32 : (badSlot+1)*pageSize])
 			recovered, err := loadEngine(crashed, NewEnvironment())
 			if err != nil || recovered.committed.txid != txid {
@@ -111,7 +111,7 @@ func TestValidatedCommitUsesOneBarrierAndPoisonsFailedWriter(t *testing.T) {
 	if syncs != 1 {
 		t.Fatalf("steady commit barriers = %d, want one", syncs)
 	}
-	m, err := selectMeta(base.buf, 256)
+	m, err := selectMeta(base.image(), 256)
 	if err != nil || m.dirtyCount == 0 || m.manifestPages != 0 {
 		t.Fatalf("small commit should use inline manifest: %+v %v", m, err)
 	}
@@ -126,7 +126,7 @@ func TestValidatedCommitUsesOneBarrierAndPoisonsFailedWriter(t *testing.T) {
 	if len(rec.ops) != n {
 		t.Fatal("poisoned writer issued more storage operations")
 	}
-	recovered, recoveryLog, _ := recordedCommitEngine(t, base.buf)
+	recovered, recoveryLog, _ := recordedCommitEngine(t, base.image())
 	mustExec(t, recovered, "INSERT INTO t VALUES (4)")
 	if len(recoveryLog.ops) == 0 || recoveryLog.ops[0].kind != opSync {
 		t.Fatal("adopted manifest must sync before first new write")
@@ -148,7 +148,7 @@ func TestSerializationErrorLeavesWriterUsable(t *testing.T) {
 			db, rec, base := recordedCommitEngine(t, image)
 			mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY)")
 			if recovered {
-				db, rec, _ = recordedCommitEngine(t, base.buf)
+				db, rec, _ = recordedCommitEngine(t, base.image())
 			}
 			rec.ops = nil
 			// A CHECK text longer than its u16 length field cannot be serialized (0A000).
@@ -220,14 +220,14 @@ func TestValidatedManifestDependenciesAreNotReusedUntilNextGeneration(t *testing
 	}
 	mustExec(t, db, sql.String())
 	for round := 0; round < 40; round++ {
-		prior := append([]byte(nil), base.buf...)
+		prior := base.image()
 		previous, err := selectMeta(prior, 256)
 		if err != nil {
 			t.Fatal(err)
 		}
 		rec.ops = nil
 		mustExec(t, db, fmt.Sprintf("UPDATE t SET pad='round %d with many dirty leaves and overflow manifest pages'", round))
-		current, err := selectMeta(base.buf, 256)
+		current, err := selectMeta(base.image(), 256)
 		if err != nil {
 			t.Fatalf("round %d: %v", round, err)
 		}
@@ -238,7 +238,7 @@ func TestValidatedManifestDependenciesAreNotReusedUntilNextGeneration(t *testing
 		for _, id := range db.freePages {
 			free[id] = true
 		}
-		raw := base.buf[int(current.txid&1)*256:][:256]
+		raw := base.image()[int(current.txid&1)*256:][:256]
 		check := func(entries []byte, n uint32) {
 			for i := uint32(0); i < n; i++ {
 				if id := binary.BigEndian.Uint32(entries[int(i)*12:]); free[id] {
@@ -251,7 +251,7 @@ func TestValidatedManifestDependenciesAreNotReusedUntilNextGeneration(t *testing
 			if free[id] {
 				t.Fatalf("manifest page %d is reusable", id)
 			}
-			b := base.buf[int(id)*256:][:256]
+			b := base.image()[int(id)*256:][:256]
 			check(b[32:], binary.BigEndian.Uint32(b[4:]))
 			id = binary.BigEndian.Uint32(b[8:])
 		}

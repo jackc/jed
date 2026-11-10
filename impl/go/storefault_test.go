@@ -29,6 +29,15 @@ type sliceStore = memoryBlockStore
 // newSliceStore copies image so the caller's buffer stays pristine across a replay sweep.
 func newSliceStore(image []byte) *sliceStore { return newMemoryBlockStore(image) }
 
+// image returns a copy of the store's bytes.
+func (s *memoryBlockStore) image() []byte {
+	out, err := s.readAt(0, int(s.n))
+	if err != nil {
+		panic(err)
+	}
+	return append([]byte(nil), out...)
+}
+
 // storeOpKind tags the three mutating operations a commit issues at the blockStore seam.
 type storeOpKind int
 

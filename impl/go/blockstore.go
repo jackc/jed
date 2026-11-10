@@ -13,6 +13,7 @@ package jed
 // fault-injection seam — stays in the host-independent pager (hosts.md §3).
 
 import (
+	"encoding/binary"
 	"errors"
 	"io"
 	"os"
@@ -164,29 +165,85 @@ func (closedBlockStore) setSize(n int64) error { return errStorageReplaced() }
 
 func (closedBlockStore) close() error { return nil }
 
-// memoryBlockStore is the pure in-memory storage host (bplus-reshape.md B3): a growable byte slice
+// memoryBlockStore is the pure in-memory storage host (bplus-reshape.md B3): a growable byte device
 // with the same positioned-read/write and zero-fill growth semantics as a file host, but with no
 // durability work to do. It is the block-device building block for both in-memory databases (B3) and,
 // since the temp-blockstore slice, per-domain session-local TEMP-table stores (newTempStorage,
 // spec/design/temp-tables.md §6) — each rides the same pager + packed-leaf read path, with
 // within-session compaction reclaiming its copy-on-write orphans (a temp store is never reopened).
+//
+// The bytes are kept as blocks of the database's page size, and a stored block is never modified:
+// writeAt installs a fresh block, so readAt returns a whole aligned block itself rather than a copy.
+// A page read through the pager is therefore resident once, in the store, however many readers and
+// cached leaves hold it, and a reader that still holds a page after its block is rewritten keeps
+// the bytes it read. Growth appends block references; it never copies the image.
 type memoryBlockStore struct {
-	buf []byte
+	blockSize int
+	// blocks holds each block, nil for one never written (it reads as zeros).
+	blocks [][]byte
+	n      int64
 }
+
+// memoryDefaultBlockSize is the block size of a store whose image names no valid page size; reads
+// of another size are then assembled into a copy.
+const memoryDefaultBlockSize = 4096
 
 // newMemoryBlockStore copies image so the caller's buffer cannot observe later writes.
 func newMemoryBlockStore(image []byte) *memoryBlockStore {
-	buf := make([]byte, len(image))
-	copy(buf, image)
-	return &memoryBlockStore{buf: buf}
+	s := &memoryBlockStore{blockSize: imageBlockSize(image)}
+	if err := s.writeAt(0, image); err != nil {
+		panic(err) // offset 0 is valid
+	}
+	return s
+}
+
+// newMemoryBlockStoreOwning builds a store over a fresh image the caller hands over and never
+// touches again: its blocks are the image's own sub-slices.
+func newMemoryBlockStoreOwning(image []byte) *memoryBlockStore {
+	bs := imageBlockSize(image)
+	s := &memoryBlockStore{blockSize: bs, n: int64(len(image))}
+	for off := 0; off < len(image); off += bs {
+		if off+bs <= len(image) {
+			s.blocks = append(s.blocks, image[off:off+bs:off+bs])
+		} else {
+			last := make([]byte, bs)
+			copy(last, image[off:])
+			s.blocks = append(s.blocks, last)
+		}
+	}
+	return s
+}
+
+// imageBlockSize is the page size an image's meta header names, else memoryDefaultBlockSize.
+func imageBlockSize(image []byte) int {
+	if len(image) >= 12 {
+		if ps := int(binary.BigEndian.Uint32(image[8:12])); pageSizeValid(ps) {
+			return ps
+		}
+	}
+	return memoryDefaultBlockSize
 }
 
 func (s *memoryBlockStore) readAt(off int64, length int) ([]byte, error) {
-	if off < 0 || length < 0 || off+int64(length) > int64(len(s.buf)) {
+	if off < 0 || length < 0 || off+int64(length) > s.n {
 		return nil, ioError(io.ErrUnexpectedEOF)
 	}
+	bs := int64(s.blockSize)
+	if length == s.blockSize && off%bs == 0 {
+		if b := s.blocks[off/bs]; b != nil {
+			return b, nil
+		}
+	}
 	out := make([]byte, length)
-	copy(out, s.buf[off:off+int64(length)])
+	for done := 0; done < length; {
+		at := off + int64(done)
+		i, lo := at/bs, int(at%bs)
+		n := min(s.blockSize-lo, length-done)
+		if b := s.blocks[i]; b != nil {
+			copy(out[done:done+n], b[lo:lo+n])
+		}
+		done += n
+	}
 	return out, nil
 }
 
@@ -194,27 +251,57 @@ func (s *memoryBlockStore) writeAt(off int64, p []byte) error {
 	if off < 0 {
 		return ioError(errors.New("negative offset"))
 	}
-	end := off + int64(len(p))
-	if end > int64(len(s.buf)) {
-		s.buf = append(s.buf, make([]byte, end-int64(len(s.buf)))...)
+	if end := off + int64(len(p)); end > s.n {
+		s.grow(end)
 	}
-	copy(s.buf[off:end], p)
+	bs := int64(s.blockSize)
+	for done := 0; done < len(p); {
+		at := off + int64(done)
+		i, lo := at/bs, int(at%bs)
+		n := min(s.blockSize-lo, len(p)-done)
+		// Never edit a stored block in place: a reader may hold it.
+		b := make([]byte, s.blockSize)
+		if n < s.blockSize && s.blocks[i] != nil {
+			copy(b, s.blocks[i])
+		}
+		copy(b[lo:lo+n], p[done:done+n])
+		s.blocks[i] = b
+		done += n
+	}
 	return nil
+}
+
+// grow extends the store to n bytes of zeros.
+func (s *memoryBlockStore) grow(n int64) {
+	need := int((n + int64(s.blockSize) - 1) / int64(s.blockSize))
+	for len(s.blocks) < need {
+		s.blocks = append(s.blocks, nil)
+	}
+	s.n = n
 }
 
 func (s *memoryBlockStore) sync() error { return nil }
 
-func (s *memoryBlockStore) size() (int64, error) { return int64(len(s.buf)), nil }
+func (s *memoryBlockStore) size() (int64, error) { return s.n, nil }
 
 func (s *memoryBlockStore) setSize(n int64) error {
 	if n < 0 {
 		return ioError(errors.New("negative size"))
 	}
-	if n > int64(len(s.buf)) {
-		s.buf = append(s.buf, make([]byte, n-int64(len(s.buf)))...)
-	} else if n < int64(len(s.buf)) {
-		s.buf = s.buf[:n]
+	if n >= s.n {
+		s.grow(n)
+		return nil
 	}
+	keep := int((n + int64(s.blockSize) - 1) / int64(s.blockSize))
+	clear(s.blocks[keep:])
+	s.blocks = s.blocks[:keep]
+	// Bytes past the new end of a kept partial block must read as zeros after a later growth.
+	if tail := int(n % int64(s.blockSize)); tail != 0 && s.blocks[keep-1] != nil {
+		b := make([]byte, s.blockSize)
+		copy(b, s.blocks[keep-1][:tail])
+		s.blocks[keep-1] = b
+	}
+	s.n = n
 	return nil
 }
 

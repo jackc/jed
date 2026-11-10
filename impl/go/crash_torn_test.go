@@ -85,7 +85,7 @@ func recordFatCommit(tb testing.TB) (prior []byte, ops []storeOp, priorIDs, post
 	if _, err := execute(rdb, b.String()); err != nil {
 		tb.Fatalf("fat commit: %v", err)
 	}
-	postBytes := append([]byte(nil), base.buf...)
+	postBytes := base.image()
 	if err := rdb.Close(); err != nil {
 		tb.Fatal(err)
 	}
