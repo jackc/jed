@@ -191,6 +191,20 @@ function decodedParts(n: PNode): { keys: Uint8Array[]; vals: Row[]; weights: num
 // plaintext file).
 export type Child = { node: PNode | null; page: number; tag?: Uint8Array };
 
+// leafParts returns a leaf's keys, rows, and weights for reading only: a Decoded leaf's own arrays,
+// which the caller must not modify, or a Packed leaf's freshly decoded parts.
+function leafParts(n: PNode): { keys: Uint8Array[]; vals: Row[]; weights: number[] } {
+  if (!n.packed) return { keys: n.keys, vals: n.vals, weights: n.weights };
+  return decodedParts(n);
+}
+
+// concatRange returns a fresh array of elements [lo, hi) of the concatenation a ++ b.
+function concatRange<T>(a: T[], b: T[], lo: number, hi: number): T[] {
+  const out = new Array<T>(hi - lo);
+  for (let i = lo; i < hi; i++) out[i - lo] = i < a.length ? a[i]! : b[i - a.length]!;
+  return out;
+}
+
 export function residentRef(n: PNode): Child {
   return { node: n, page: 0, tag: undefined };
 }
@@ -1060,28 +1074,38 @@ function buildLeaf(
   edited: number | null,
   owner?: MutationGeneration,
 ): InsOut {
-  const n = keys.length;
-  let total = 0;
-  for (const w of weights) total += w;
-  const pay = total + leafOverhead(n, shape);
-  if (pay <= cap.c || n < 2) return { whole: newLeaf(keys, vals, weights, owner) };
-
-  const prefix = new Array<number>(n + 1);
-  prefix[0] = 0;
-  for (let i = 0; i < n; i++) prefix[i + 1] = prefix[i]! + weights[i]!;
-  const leftpayload = (m: number): number => prefix[m]! + leafOverhead(m, shape);
-  const rightpayload = (m: number): number => total - prefix[m]! + leafOverhead(n - m, shape);
-  const m = splitPoint(1, n - 1, pay, cap.c, edited === n - 1, leftpayload, rightpayload);
-  // Unreachable under the RECORD_MAX cap (a two-record leaf always fits — format.md "Why the
-  // record cap"); defensively leave the node whole (0A000 at serialize).
+  const m = leafSplit(weights, cap, shape, edited);
   if (m === null) return { whole: newLeaf(keys, vals, weights, owner) };
-
   return {
     whole: null,
     left: newLeaf(keys.slice(0, m), vals.slice(0, m), weights.slice(0, m), owner),
     sep: keys[m]!,
     right: newLeaf(keys.slice(m), vals.slice(m), weights.slice(m), owner),
   };
+}
+
+// leafSplit is buildLeaf's split decision over a leaf's record weights: null when the leaf stays
+// whole, else the index of the first record of the right half.
+function leafSplit(
+  weights: number[],
+  cap: Cap,
+  shape: LeafShape,
+  edited: number | null,
+): number | null {
+  const n = weights.length;
+  let total = 0;
+  for (const w of weights) total += w;
+  const pay = total + leafOverhead(n, shape);
+  if (pay <= cap.c || n < 2) return null;
+
+  const prefix = new Array<number>(n + 1);
+  prefix[0] = 0;
+  for (let i = 0; i < n; i++) prefix[i + 1] = prefix[i]! + weights[i]!;
+  const leftpayload = (m: number): number => prefix[m]! + leafOverhead(m, shape);
+  const rightpayload = (m: number): number => total - prefix[m]! + leafOverhead(n - m, shape);
+  // null is unreachable under the RECORD_MAX cap (a two-record leaf always fits — format.md "Why the
+  // record cap"); defensively leave the node whole (0A000 at serialize).
+  return splitPoint(1, n - 1, pay, cap.c, edited === n - 1, leftpayload, rightpayload);
 }
 
 // buildInterior builds an interior node from its parts; if its payload overflows cap, it splits
@@ -1362,13 +1386,43 @@ function* mergeAtSteps(
 
   let merged: InsOut;
   if (isLeaf(left)) {
-    // Materialize both leaves (either may be Packed) before merging — the merged node is Decoded.
-    const l = decodedParts(left);
-    const r = decodedParts(right);
-    const mkeys = [...l.keys, ...r.keys];
-    const mvals = [...l.vals, ...r.vals];
-    const mweights = [...l.weights, ...r.weights];
-    merged = buildLeaf(mkeys, mvals, mweights, cap, shape, null, generation);
+    // Read both leaves (either may be Packed) and copy each record once, straight into the merged
+    // node or its two halves (buildLeaf's split rule; merge-overflow splits balanced). The two
+    // inputs are left untouched, so an abandoned merge below keeps them exactly as they were.
+    const l = leafParts(left);
+    const r = leafParts(right);
+    const mweights = l.weights.concat(r.weights);
+    const total = mweights.length;
+    const m = leafSplit(mweights, cap, shape, null);
+    if (m === null) {
+      merged = {
+        whole: newLeaf(
+          concatRange(l.keys, r.keys, 0, total),
+          concatRange(l.vals, r.vals, 0, total),
+          mweights,
+          generation,
+        ),
+      };
+    } else {
+      const rightWeights = mweights.slice(m);
+      mweights.length = m;
+      merged = {
+        whole: null,
+        left: newLeaf(
+          concatRange(l.keys, r.keys, 0, m),
+          concatRange(l.vals, r.vals, 0, m),
+          mweights,
+          generation,
+        ),
+        sep: m < l.keys.length ? l.keys[m]! : r.keys[m - l.keys.length]!,
+        right: newLeaf(
+          concatRange(l.keys, r.keys, m, total),
+          concatRange(l.vals, r.vals, m, total),
+          rightWeights,
+          generation,
+        ),
+      };
+    }
   } else {
     const mkeys = [...left.keys, n.keys[j]!, ...right.keys];
     const mchildren = [...left.children, ...right.children];
