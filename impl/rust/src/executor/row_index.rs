@@ -1,7 +1,8 @@
-//! A membership index over rows its caller already owns (eager DISTINCT and GROUP BY). It stores
-//! only each row's position, so a dedup set or group table holds one copy of a row instead of
-//! two, and a probe reads the candidate values in place. Never iterated: output order comes from
-//! the caller's insertion-ordered rows (no hashmap-order leak — CLAUDE.md §8/§10).
+//! A membership index over rows its caller already owns (eager DISTINCT and GROUP BY, set
+//! operations, recursive UNION, window partitions). It stores only each row's position, so a dedup
+//! set or group table holds one copy of a row instead of two, and a probe reads the candidate values
+//! in place. Never iterated: output order comes from the caller's insertion-ordered rows (no
+//! hashmap-order leak — CLAUDE.md §8/§10).
 use std::collections::HashMap;
 use std::hash::{BuildHasher, Hash, Hasher, RandomState};
 
@@ -52,6 +53,28 @@ impl RowIndex {
     }
 }
 
+/// A set of single values (a DISTINCT aggregate's per-group set) under `Value`'s own equality: each
+/// distinct value is stored once, and a probe compares the candidate in place, so a repeated value
+/// is never copied.
+#[derive(Default)]
+pub(crate) struct ValueSet {
+    index: RowIndex,
+    values: Vec<Value>,
+}
+
+impl ValueSet {
+    /// Whether `v` is new; a new value is copied into the set.
+    pub(crate) fn insert(&mut self, v: &Value) -> bool {
+        let hash = self.index.hash(std::iter::once(v));
+        if self.index.find(hash, |at| self.values[at] == *v).is_some() {
+            return false;
+        }
+        self.index.insert(hash, self.values.len());
+        self.values.push(v.clone());
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -74,6 +97,18 @@ mod tests {
         }
         assert_eq!(index.find(7, |i| rows[i] == vec![Value::Int(4)]), None);
         assert_eq!(index.find(8, |_| true), None);
+    }
+
+    // A value set admits each distinct value once.
+    #[test]
+    fn value_set_admits_each_value_once() {
+        let mut set = ValueSet::default();
+        assert!(set.insert(&Value::Text("x".into())));
+        assert!(set.insert(&Value::Int(1)));
+        assert!(!set.insert(&Value::Text("x".into())));
+        assert!(!set.insert(&Value::Int(1)));
+        assert!(set.insert(&Value::Null));
+        assert_eq!(set.values.len(), 3);
     }
 
     // The hash follows `Value`'s equality: equal keys hash alike.

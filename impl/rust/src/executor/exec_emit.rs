@@ -1064,10 +1064,10 @@ impl Engine {
                         .map(|s| Acc::from_spec(s, &self.session.time_zone))
                         .collect()
                 };
-                let new_seen = || -> Vec<Option<HashSet<Value>>> {
+                let new_seen = || -> Vec<Option<ValueSet>> {
                     plan.agg_specs
                         .iter()
-                        .map(|s| s.distinct.then(HashSet::new))
+                        .map(|s| s.distinct.then(ValueSet::default))
                         .collect()
                 };
                 // One grouping set per `plan.group_sets` (spec/design/aggregates.md §12): a plain GROUP BY
@@ -1114,7 +1114,7 @@ impl Engine {
                     let mut groups: Vec<(
                         Vec<Value>,
                         Vec<Acc>,
-                        Vec<Option<HashSet<Value>>>,
+                        Vec<Option<ValueSet>>,
                         i64,
                     )> = Vec::new();
                     // An empty grouping set (the `()` / whole-table grand total) is one pre-created group,
@@ -1220,7 +1220,7 @@ impl Engine {
                                     continue;
                                 }
                                 charge_hash_key(meter, &v)?;
-                                if !seen.insert(v.clone()) {
+                                if !seen.insert(&v) {
                                     continue;
                                 }
                                 if meter.query_memory_active() {

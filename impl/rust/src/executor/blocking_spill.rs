@@ -407,7 +407,7 @@ impl Engine {
                     .map(|p| p.eval(&row, env, meter))
                     .collect::<Result<Row>>()?;
                 charge_hash_keys(meter, &out)?;
-                if seen.insert(out.clone())? {
+                if seen.insert(&out.iter().collect::<Vec<_>>())? {
                     distinct.push(out)?;
                 }
             }
@@ -740,7 +740,7 @@ impl Engine {
                         next.push(combined)?;
                         matched = true;
                         if emit_right {
-                            right_matches.insert(vec![Value::Int(ordinal)])?;
+                            right_matches.insert(&[&Value::Int(ordinal)])?;
                         }
                     }
                     ordinal += 1;
@@ -753,7 +753,7 @@ impl Engine {
                 let mut right = inputs[inner].reader()?;
                 let mut ordinal = 0i64;
                 while let Some(row) = right.next()? {
-                    if right_matches.get(&vec![Value::Int(ordinal)])?.is_none() {
+                    if right_matches.get(&[&Value::Int(ordinal)])?.is_none() {
                         next.push(super::exec_emit::place_physical_relation_row(
                             plan, inner, &row,
                         ))?;
@@ -817,19 +817,21 @@ impl Engine {
                 state
             };
             if gset.key_cols.is_empty() {
-                groups.put(Vec::new(), fresh(0))?;
+                groups.put(&[], fresh(0))?;
                 keys.push(Vec::new())?;
             }
             let mut scan = rows.reader()?;
             while let Some(row) = scan.next()? {
                 meter.checkpoint()?;
-                let key: Row = gset.key_cols.iter().map(|&k| row[k].clone()).collect();
-                charge_hash_keys(meter, &key)?;
+                // The group key is the row's own key slots: an existing group is found without
+                // copying them, and only a new group's key is copied (into the key spool and the map).
+                let key: Vec<&Value> = gset.key_cols.iter().map(|&k| &row[k]).collect();
+                charge_hash_keys(meter, key.iter().copied())?;
                 let mut state = match groups.get(&key)? {
                     Some(state) => state,
                     None => {
                         let state = fresh(keys.len());
-                        keys.push(key.clone())?;
+                        keys.push(key.iter().map(|v| (*v).clone()).collect())?;
                         state
                     }
                 };
@@ -868,7 +870,7 @@ impl Engine {
                             continue;
                         }
                         charge_hash_key(meter, &v)?;
-                        if !seen.insert(vec![state[0].clone(), Value::Int(si as i64), v.clone()])? {
+                        if !seen.insert(&[&state[0], &Value::Int(si as i64), &v])? {
                             continue;
                         }
                     }
@@ -894,12 +896,12 @@ impl Engine {
                     )?;
                     state[si + 1] = Value::Composite(pack_acc(acc));
                 }
-                groups.put(key, state)?;
+                groups.put(&key, state)?;
             }
             drop(scan);
             let mut key_scan = keys.into_reader()?;
             while let Some(key) = key_scan.next()? {
-                let state = groups.get(&key)?.unwrap();
+                let state = groups.get(&key.iter().collect::<Vec<_>>())?.unwrap();
                 let Value::Int(group) = state[0] else {
                     unreachable!()
                 };
@@ -1100,7 +1102,9 @@ impl Engine {
                         std::cmp::Ordering::Less => {
                             before += 1;
                             le += 1;
-                            if matches!(kind, AggPlan::HypoDenseRank) && distinct.insert(row)? {
+                            if matches!(kind, AggPlan::HypoDenseRank)
+                                && distinct.insert(&row.iter().collect::<Vec<_>>())?
+                            {
                                 unique += 1;
                             }
                         }
@@ -1250,9 +1254,10 @@ fn fold_spilled_value(
     } = &acc
         && let Some((key, _)) = pairs.first()
     {
-        let mut entry = prefix.to_vec();
-        entry.push(Value::Text(key.clone()));
-        if !unique.insert(entry)? {
+        let key = Value::Text(key.clone());
+        let mut entry: Vec<&Value> = prefix.iter().collect();
+        entry.push(&key);
+        if !unique.insert(&entry)? {
             return Err(EngineError::new(
                 SqlState::DuplicateJsonObjectKeyValue,
                 "duplicate JSON object key value",

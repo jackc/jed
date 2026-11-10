@@ -550,21 +550,29 @@ pub(crate) fn apply_window_stage(
         for &si in group {
             spec_group[si] = gi;
         }
-        // Partition the row indices by the partition-key values. The map is an index only (never
-        // iterated); output comes from the insertion-ordered `partitions` (no hash-order leak).
-        let mut index: HashMap<Vec<Value>, usize> = HashMap::new();
+        // Partition the row indices by the partition-key values. The index holds partition
+        // positions and compares a row's key slots in place against the partition's first row; it
+        // is never iterated, so output comes from the insertion-ordered `partitions` (no hash-order
+        // leak).
+        let mut index = RowIndex::default();
         let mut partitions: Vec<Vec<usize>> = Vec::new();
         for (i, row) in rows.iter().enumerate() {
-            let key: Vec<Value> = rep.partition.iter().map(|&p| row[p].clone()).collect();
-            charge_hash_keys(meter, &key)?;
-            let pi = match index.get(&key) {
-                Some(&p) => p,
+            let key = || rep.partition.iter().map(|&p| &row[p]);
+            charge_hash_keys(meter, key())?;
+            let hash = index.hash(key());
+            let found = index.find(hash, |at| {
+                let first = &rows[partitions[at][0]];
+                rep.partition.iter().all(|&p| first[p] == row[p])
+            });
+            let pi = match found {
+                Some(p) => p,
                 None => {
                     if part_charge.active() {
-                        part_charge.reserve(meter, crate::memsize::entry_bytes(&key))?;
+                        part_charge
+                            .reserve(meter, crate::memsize::entry_bytes_at(row, &rep.partition))?;
                     }
                     let p = partitions.len();
-                    index.insert(key, p);
+                    index.insert(hash, p);
                     partitions.push(Vec::new());
                     p
                 }

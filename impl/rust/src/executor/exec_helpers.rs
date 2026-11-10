@@ -378,7 +378,7 @@ impl crate::cursor::RowStream for StreamingScan {
                     projected.push(p.eval(row, &project_env, &mut self.meter)?);
                 }
                 charge_hash_keys(&mut self.meter, &projected)?;
-                let inserted = self.seen.insert(projected.clone());
+                let inserted = self.seen.insert(&projected);
                 if !self.meter.cost_first(inserted)? {
                     continue;
                 }

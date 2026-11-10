@@ -651,8 +651,9 @@ impl Engine {
             anchor_rows = rows;
         }
 
-        // For UNION (distinct) a `seen` set drops rows duplicating any already-emitted row.
-        let mut seen: HashSet<Row> = HashSet::new();
+        // For UNION (distinct) a `seen` index over `result` positions drops rows duplicating any
+        // already-emitted row; a kept row is compared in place, never copied into it.
+        let mut seen = RowIndex::default();
         // The UNION dedup set is operator state (memory.md §6.2): an entry per kept row, reserved
         // before its result copy, returned when the recursive CTE completes.
         let mut seen_charge = crate::cost::StateCharge::new(acct.clone());
@@ -680,7 +681,7 @@ impl Engine {
         };
         for row in anchor_rows {
             charge_keys(&row, total_cost)?;
-            if rt.union_all || seen.insert(row.clone()) {
+            if rt.union_all || union_keeps(&mut seen, &result, &row) {
                 if !rt.union_all && seen_charge.active() {
                     seen_charge.reserve_direct(crate::memsize::entry_bytes(&row))?;
                 }
@@ -741,7 +742,7 @@ impl Engine {
             }
             for row in new_rows {
                 charge_keys(&row, total_cost)?;
-                if rt.union_all || seen.insert(row.clone()) {
+                if rt.union_all || union_keeps(&mut seen, &result, &row) {
                     if !rt.union_all && seen_charge.active() {
                         seen_charge.reserve_direct(crate::memsize::entry_bytes(&row))?;
                     }
@@ -1569,4 +1570,15 @@ pub(crate) fn output_column_location(q: &QueryExpr, i: usize) -> SrcPos {
         },
         QueryExpr::SetOp(_) | QueryExpr::With(_) => SrcPos::NONE,
     }
+}
+
+/// Whether a recursive UNION keeps `row` — no row of `result` equals it — indexing the position it
+/// will take in `result` when it is kept (its caller pushes it next).
+fn union_keeps(seen: &mut RowIndex, result: &[Row], row: &Row) -> bool {
+    let hash = seen.hash(row.iter());
+    if seen.find(hash, |at| result[at] == *row).is_some() {
+        return false;
+    }
+    seen.insert(hash, result.len());
+    true
 }

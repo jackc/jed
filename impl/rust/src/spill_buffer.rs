@@ -8,10 +8,12 @@ use std::sync::Arc;
 
 use crate::cost::StateCharge;
 use crate::error::{EngineError, Result, SqlState};
+use crate::executor::RowIndex;
 use crate::memsize::{hash_row_bytes, key_bytes, map_entry_bytes};
 use crate::spill::{read_row, row_bytes, write_row};
 use crate::spillhost::{SpillAppender, SpillFile, SpillHost, SpillReader, read_exact_at};
 use crate::storage::Row;
+use crate::value::Value;
 
 fn io_error(e: std::io::Error) -> EngineError {
     EngineError::new(SqlState::IoError, format!("blocking operator scratch: {e}"))
@@ -175,11 +177,17 @@ impl SpoolReader {
 /// A keyed state map: resident until its entries exceed `work_mem`, then a disk [`SpillTable`]. A
 /// lookup loads one state at a time, so collisions and skew cannot force a resident partition.
 /// Iteration is deliberately absent: a separate source-order spool owns group emission order.
+///
+/// A key is passed as references to its values, so a caller probes with a row's own key slots: a
+/// resident lookup compares them in place, and only a new resident entry (or a spilled lookup, which
+/// encodes the key) copies them.
 pub(crate) struct StateMap {
     budget: usize,
     spill: Arc<dyn SpillHost>,
     bytes: usize,
-    memory: HashMap<Row, Row>,
+    /// The resident entries in insertion order, found through `index` by key.
+    memory: Vec<(Row, Row)>,
+    index: RowIndex,
     /// The disk table once spilled.
     disk: Option<StateDisk>,
     /// The resident entries' query-memory charge (memory.md §6.6), returned on spill or discard.
@@ -194,9 +202,10 @@ struct StateDisk {
 }
 /// A DISTINCT dedup set: an in-memory set (an in-memory database or unlimited `work_mem`), or a
 /// spill-capable [`StateMap`]. Either way each first occurrence reserves `entry_bytes(row)` while
-/// resident (memory.md §6.2/§6.6).
+/// resident (memory.md §6.2/§6.6). The in-memory set holds each distinct row once, indexed by
+/// position, so a repeated row is compared in place and never copied.
 pub(crate) enum SeenRows {
-    Memory(std::collections::HashSet<Row>, StateCharge),
+    Memory(RowIndex, Vec<Row>, StateCharge),
     Spill(StateMap),
 }
 impl SeenRows {
@@ -207,33 +216,33 @@ impl SeenRows {
     ) -> Self {
         match spill {
             Some(spill) if budget > 0 => Self::Spill(StateMap::new(budget, spill, charge)),
-            _ => Self::Memory(std::collections::HashSet::new(), charge),
+            _ => Self::Memory(RowIndex::default(), Vec::new(), charge),
         }
     }
-    /// Whether `row` is new; a new row reserves its entry. A rejected reservation spills a
-    /// spill-capable set (memory.md §6.6) and returns `54P05` from an in-memory one, for the caller's
-    /// [`crate::cost::Meter::cost_first`].
-    pub(crate) fn insert(&mut self, row: Row) -> Result<bool> {
+    /// Whether `row` is new; a new row is copied in and reserves its entry. A rejected reservation
+    /// spills a spill-capable set (memory.md §6.6) and returns `54P05` from an in-memory one, for the
+    /// caller's [`crate::cost::Meter::cost_first`].
+    pub(crate) fn insert(&mut self, row: &Row) -> Result<bool> {
         match self {
-            Self::Memory(seen, charge) => {
-                let bytes = if charge.active() {
-                    map_entry_bytes(&row, &[])
-                } else {
-                    0
-                };
-                if !seen.insert(row) {
+            Self::Memory(index, rows, charge) => {
+                let hash = index.hash(row.iter());
+                if index.find(hash, |at| rows[at] == *row).is_some() {
                     return Ok(false);
                 }
-                charge.reserve_direct(bytes)?;
+                index.insert(hash, rows.len());
+                rows.push(row.clone());
+                if charge.active() {
+                    charge.reserve_direct(map_entry_bytes(row, &[]))?;
+                }
                 Ok(true)
             }
-            Self::Spill(seen) => seen.insert(row),
+            Self::Spill(seen) => seen.insert(&row.iter().collect::<Vec<_>>()),
         }
     }
     /// Return the set's charge — the DISTINCT pass completed (memory.md §6.2).
     pub(crate) fn release(&mut self) {
         match self {
-            Self::Memory(_, charge) => charge.release_all(),
+            Self::Memory(_, _, charge) => charge.release_all(),
             Self::Spill(map) => map.charge.release_all(),
         }
     }
@@ -244,10 +253,26 @@ impl StateMap {
             budget,
             spill,
             bytes: 0,
-            memory: HashMap::new(),
+            memory: Vec::new(),
+            index: RowIndex::default(),
             disk: None,
             charge,
         }
+    }
+
+    /// `key` as an owned row — a new resident entry's key, or a spilled lookup's.
+    fn owned(key: &[&Value]) -> Row {
+        key.iter().map(|v| (*v).clone()).collect()
+    }
+
+    /// `key`'s hash in the resident index and the position of its resident entry, if any.
+    fn resident(&self, key: &[&Value]) -> (u64, Option<usize>) {
+        let hash = self.index.hash(key.iter().copied());
+        let at = self.index.find(hash, |at| {
+            let stored = &self.memory[at].0;
+            stored.len() == key.len() && stored.iter().zip(key).all(|(a, b)| a == *b)
+        });
+        (hash, at)
     }
 
     fn hash(key: &Row) -> u64 {
@@ -274,11 +299,12 @@ impl StateMap {
         }
         Ok(disk.last.as_mut().unwrap())
     }
-    pub(crate) fn get(&mut self, key: &Row) -> Result<Option<Row>> {
+    pub(crate) fn get(&mut self, key: &[&Value]) -> Result<Option<Row>> {
         let Some(disk) = &mut self.disk else {
-            return Ok(self.memory.get(key).cloned());
+            return Ok(self.resident(key).1.map(|at| self.memory[at].1.clone()));
         };
-        let (_, _, loc) = Self::locate(disk, key)?;
+        let key = Self::owned(key);
+        let (_, _, loc) = Self::locate(disk, &key)?;
         if loc.node == 0 {
             return Ok(None);
         }
@@ -289,15 +315,23 @@ impl StateMap {
         }
         Ok(Some(value?.map_err(io_error)?))
     }
-    pub(crate) fn put(&mut self, key: Row, value: Row) -> Result<()> {
+    pub(crate) fn put(&mut self, key: &[&Value], value: Row) -> Result<()> {
         if self.disk.is_none() {
             // Residency is the logical schedule, and the same number is charged (memory.md §6.6): a new
             // entry `ENTRY + key + value`, a replaced value its growth (or shrinkage).
-            let key_len = key_bytes(&key);
             let value_len = key_bytes(&value);
-            let delta = match self.memory.insert(key, value) {
-                Some(old) => value_len - key_bytes(&old),
-                None => crate::costs::MEMORY_ENTRY + key_len + value_len,
+            let delta = match self.resident(key) {
+                (_, Some(at)) => {
+                    let old = std::mem::replace(&mut self.memory[at].1, value);
+                    value_len - key_bytes(&old)
+                }
+                (hash, None) => {
+                    let key = Self::owned(key);
+                    let key_len = key_bytes(&key);
+                    self.index.insert(hash, self.memory.len());
+                    self.memory.push((key, value));
+                    crate::costs::MEMORY_ENTRY + key_len + value_len
+                }
             };
             // A growth the account rejects spills the map, the new entry with it, uncharged.
             let mut rejected = false;
@@ -317,12 +351,13 @@ impl StateMap {
             });
             // The entries left memory: the map's whole resident charge goes with them.
             self.charge.release_all();
+            self.index = RowIndex::default();
             for (key, value) in std::mem::take(&mut self.memory) {
                 self.put_disk(&key, &value)?;
             }
             return Ok(());
         }
-        self.put_disk(&key, &value)
+        self.put_disk(&Self::owned(key), &value)
     }
     fn put_disk(&mut self, key: &Row, value: &Row) -> Result<()> {
         let disk = self.disk.as_mut().unwrap();
@@ -335,8 +370,9 @@ impl StateMap {
         disk.last = Some((key, bytes, loc));
         Ok(())
     }
-    pub(crate) fn insert(&mut self, key: Row) -> Result<bool> {
-        if self.get(&key)?.is_some() {
+    /// Whether `key` is new; a new key is stored with an empty state.
+    pub(crate) fn insert(&mut self, key: &[&Value]) -> Result<bool> {
+        if self.get(key)?.is_some() {
             return Ok(false);
         }
         self.put(key, Vec::new())?;
@@ -936,25 +972,25 @@ mod tests {
         );
         for i in 0..4096 {
             state
-                .put(vec![Value::Int(i)], vec![Value::Int(i * 3)])
+                .put(&[&Value::Int(i)], vec![Value::Int(i * 3)])
                 .unwrap();
         }
         assert!(state.memory.is_empty());
         let path = state.scratch_path().unwrap();
         for i in 0..4096 {
             assert_eq!(
-                state.get(&vec![Value::Int(i)]).unwrap(),
+                state.get(&[&Value::Int(i)]).unwrap(),
                 Some(vec![Value::Int(i * 3)])
             );
         }
         for i in 0..1024 {
-            state.put(vec![Value::Int(1)], vec![Value::Int(i)]).unwrap();
+            state.put(&[&Value::Int(1)], vec![Value::Int(i)]).unwrap();
         }
         assert_eq!(
-            state.get(&vec![Value::Int(1)]).unwrap(),
+            state.get(&[&Value::Int(1)]).unwrap(),
             Some(vec![Value::Int(1023)])
         );
-        assert_eq!(state.get(&vec![Value::Int(99999)]).unwrap(), None);
+        assert_eq!(state.get(&[&Value::Int(99999)]).unwrap(), None);
         drop(state);
         assert!(!path.exists());
     }
@@ -1030,11 +1066,11 @@ mod tests {
             StateCharge::new(acct.clone()),
         );
         for i in 0..100 {
-            state.put(vec![Value::Int(i)], row(i)).unwrap();
+            state.put(&[&Value::Int(i)], row(i)).unwrap();
         }
         assert!(state.disk.is_some() && state.memory.is_empty());
         assert_eq!(acct.used.get(), 0);
-        assert_eq!(state.get(&vec![Value::Int(42)]).unwrap(), Some(row(42)));
+        assert_eq!(state.get(&[&Value::Int(42)]).unwrap(), Some(row(42)));
 
         let acct = account();
         let mut rows = HashRows::new(

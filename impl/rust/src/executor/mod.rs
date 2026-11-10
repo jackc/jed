@@ -149,7 +149,7 @@ pub(crate) use implication::{
 mod span_filter;
 pub(crate) use span_filter::{LaneFilter, ScratchRow};
 mod row_index;
-pub(crate) use row_index::RowIndex;
+pub(crate) use row_index::{RowIndex, ValueSet};
 mod session_state;
 pub use session_state::*;
 mod scope;

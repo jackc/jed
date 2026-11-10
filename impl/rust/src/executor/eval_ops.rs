@@ -986,13 +986,16 @@ pub(crate) fn combine_setop(
             rows.extend(right);
             rows
         }
-        // UNION: one copy per key present in either, first occurrence (left scanned first).
+        // UNION: one copy per key present in either, first occurrence (left scanned first). The
+        // dedup index holds output positions, so a kept row is not copied into it.
         (SetOpKind::Union, false) => {
-            let mut seen: HashSet<Vec<Value>> = HashSet::new();
-            let mut out = Vec::new();
+            let mut seen = RowIndex::default();
+            let mut out: Vec<Vec<Value>> = Vec::new();
             for row in left.into_iter().chain(right) {
-                if seen.insert(row.clone()) {
+                let hash = seen.hash(row.iter());
+                if seen.find(hash, |at| out[at] == row).is_none() {
                     entry(&mut charge, &row)?;
+                    seen.insert(hash, out.len());
                     out.push(row);
                 }
             }
@@ -1027,11 +1030,16 @@ pub(crate) fn combine_setop(
                     right_set.insert(row);
                 }
             }
-            let mut emitted: HashSet<Vec<Value>> = HashSet::new();
-            let mut out = Vec::new();
+            let mut emitted = RowIndex::default();
+            let mut out: Vec<Vec<Value>> = Vec::new();
             for row in left {
-                if right_set.contains(&row) && emitted.insert(row.clone()) {
+                if !right_set.contains(&row) {
+                    continue;
+                }
+                let hash = emitted.hash(row.iter());
+                if emitted.find(hash, |at| out[at] == row).is_none() {
                     entry(&mut charge, &row)?;
+                    emitted.insert(hash, out.len());
                     out.push(row);
                 }
             }
@@ -1064,11 +1072,16 @@ pub(crate) fn combine_setop(
                     right_set.insert(row);
                 }
             }
-            let mut emitted: HashSet<Vec<Value>> = HashSet::new();
-            let mut out = Vec::new();
+            let mut emitted = RowIndex::default();
+            let mut out: Vec<Vec<Value>> = Vec::new();
             for row in left {
-                if !right_set.contains(&row) && emitted.insert(row.clone()) {
+                if right_set.contains(&row) {
+                    continue;
+                }
+                let hash = emitted.hash(row.iter());
+                if emitted.find(hash, |at| out[at] == row).is_none() {
                     entry(&mut charge, &row)?;
+                    emitted.insert(hash, out.len());
                     out.push(row);
                 }
             }

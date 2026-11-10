@@ -111,7 +111,7 @@ fn process_streaming_row(
         let charged = charge_hash_keys(meter, &projected);
         actual.distinct += meter.accrued - before;
         charged?;
-        let inserted = seen.insert(projected.clone());
+        let inserted = seen.insert(&projected);
         if !meter.cost_first(inserted)? {
             return Ok(true);
         }
