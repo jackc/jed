@@ -9,29 +9,60 @@ const ENTRY: usize = 12;
 const OVERFLOW_HEADER: usize = 32;
 pub(super) const PAGE_MANIFEST: u8 = 8;
 
-const fn crc64_table() -> [u64; 256] {
-    let mut table = [0; 256];
+const CRC64_POLYNOMIAL: u64 = 0x42F0_E1EB_A9EA_3693;
+
+/// The eight slicing tables of the format's CRC-64/ECMA-182 (unreflected, so the first byte of a
+/// word is its most significant): `tables[0]` is the byte table, and `tables[k]` advances a byte
+/// past `k` further zero bytes. Implementation machinery; the checksum's parameters stay canonical
+/// in spec/design/validated-cow.md.
+const fn crc64_tables() -> [[u64; 256]; 8] {
+    let mut tables = [[0u64; 256]; 8];
     let mut i = 0;
     while i < 256 {
         let mut crc = (i as u64) << 56;
         let mut bit = 0;
         while bit < 8 {
             crc = if crc & (1 << 63) != 0 {
-                (crc << 1) ^ 0x42F0_E1EB_A9EA_3693
+                (crc << 1) ^ CRC64_POLYNOMIAL
             } else {
                 crc << 1
             };
             bit += 1;
         }
-        table[i] = crc;
+        tables[0][i] = crc;
         i += 1;
     }
-    table
+    let mut slice = 1;
+    while slice < 8 {
+        i = 0;
+        while i < 256 {
+            let crc = tables[slice - 1][i];
+            tables[slice][i] = (crc << 8) ^ tables[0][(crc >> 56) as usize];
+            i += 1;
+        }
+        slice += 1;
+    }
+    tables
 }
-const CRC64: [u64; 256] = crc64_table();
+const CRC64: [[u64; 256]; 8] = crc64_tables();
+
+/// Fold `bytes` into a running CRC-64 register, eight bytes at a time (slicing-by-8) and the tail
+/// byte by byte.
 pub(super) fn extend(mut crc: u64, bytes: &[u8]) -> u64 {
-    for &byte in bytes {
-        crc = (crc << 8) ^ CRC64[((crc >> 56) as u8 ^ byte) as usize];
+    let mut words = bytes.chunks_exact(8);
+    for word in &mut words {
+        crc ^= u64::from_be_bytes(word.try_into().unwrap());
+        crc = CRC64[7][(crc >> 56) as usize]
+            ^ CRC64[6][(crc >> 48) as usize & 0xFF]
+            ^ CRC64[5][(crc >> 40) as usize & 0xFF]
+            ^ CRC64[4][(crc >> 32) as usize & 0xFF]
+            ^ CRC64[3][(crc >> 24) as usize & 0xFF]
+            ^ CRC64[2][(crc >> 16) as usize & 0xFF]
+            ^ CRC64[1][(crc >> 8) as usize & 0xFF]
+            ^ CRC64[0][crc as usize & 0xFF];
+    }
+    for &byte in words.remainder() {
+        crc = (crc << 8) ^ CRC64[0][((crc >> 56) as u8 ^ byte) as usize];
     }
     crc
 }
@@ -347,5 +378,36 @@ mod tests {
     #[test]
     fn crc64_vector() {
         assert_eq!(extend(0, b"123456789"), 0x6C40_DF5F_0B49_7347);
+    }
+
+    /// The sliced fold equals the one-byte-at-a-time definition at every length and split.
+    #[test]
+    fn crc64_slicing_matches_bytewise() {
+        let bytewise = |mut crc: u64, bytes: &[u8]| {
+            for &byte in bytes {
+                crc = (crc << 8) ^ CRC64[0][((crc >> 56) as u8 ^ byte) as usize];
+            }
+            crc
+        };
+        let data: Vec<u8> = (0..300u32)
+            .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
+            .collect();
+        for len in 0..data.len() {
+            assert_eq!(
+                extend(0, &data[..len]),
+                bytewise(0, &data[..len]),
+                "len {len}"
+            );
+            let split = len / 3;
+            let chained = extend(
+                extend(0x0123_4567_89AB_CDEF, &data[..split]),
+                &data[split..len],
+            );
+            assert_eq!(
+                chained,
+                bytewise(0x0123_4567_89AB_CDEF, &data[..len]),
+                "split {len}"
+            );
+        }
     }
 }
