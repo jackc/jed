@@ -537,6 +537,7 @@ import {
   nullValue,
   decodeHexPairs,
   decodeHexString,
+  filledPrefix,
   renderByteaHex,
   renderUuid,
   textValue,
@@ -1798,14 +1799,19 @@ export function decodeHex(bytes: Uint8Array): Uint8Array {
 // `invalid symbol "<c>"` (22023, quoting the whole code point); an input that ends mid-group
 // ('YQ', 'YWJ', 'YQ=') is `invalid base64 end sequence` (22023).
 export function decodeBase64(s: string): Uint8Array {
-  const out: number[] = [];
+  // Each complete group of four symbols (each at least one UTF-16 unit) emits at most three bytes.
+  const out = new Uint8Array((s.length >> 2) * 3);
+  let j = 0;
   let buf = 0;
   let pos = 0;
   let end = 0;
-  for (const c of s) {
+  // Index the UTF-16 units directly: the for-of code-point iterator allocates per symbol.
+  for (let i = 0; i < s.length; i++) {
+    const code = s.charCodeAt(i);
     let b: number;
-    if (c === " " || c === "\t" || c === "\n" || c === "\r") continue;
-    if (c === "=") {
+    if (code === 32 || code === 9 || code === 10 || code === 13) continue; // ' ' \t \n \r
+    if (code === 61) {
+      // '='
       if (end === 0) {
         if (pos === 2) end = 1;
         else if (pos === 3) end = 2;
@@ -1816,30 +1822,30 @@ export function decodeBase64(s: string): Uint8Array {
           );
       }
       b = 0;
-    } else {
-      const code = c.length === 1 ? c.charCodeAt(0) : -1;
-      if (code >= 65 && code <= 90)
-        b = code - 65; // A-Z
-      else if (code >= 97 && code <= 122)
-        b = code - 97 + 26; // a-z
-      else if (code >= 48 && code <= 57)
-        b = code - 48 + 52; // 0-9
-      else if (code === 43)
-        b = 62; // +
-      else if (code === 47)
-        b = 63; // /
-      else
-        throw engineError(
-          "invalid_parameter_value",
-          `invalid symbol "${c}" found while decoding base64 sequence`,
-        );
+    } else if (code >= 65 && code <= 90)
+      b = code - 65; // A-Z
+    else if (code >= 97 && code <= 122)
+      b = code - 97 + 26; // a-z
+    else if (code >= 48 && code <= 57)
+      b = code - 48 + 52; // 0-9
+    else if (code === 43)
+      b = 62; // +
+    else if (code === 47)
+      b = 63; // /
+    else {
+      // The whole code point, as the iterator yields it (a surrogate pair, or a lone surrogate).
+      const c = String.fromCodePoint(s.codePointAt(i)!);
+      throw engineError(
+        "invalid_parameter_value",
+        `invalid symbol "${c}" found while decoding base64 sequence`,
+      );
     }
     buf = (buf << 6) | b;
     pos++;
     if (pos === 4) {
-      out.push((buf >> 16) & 0xff);
-      if (end === 0 || end > 1) out.push((buf >> 8) & 0xff);
-      if (end === 0 || end > 2) out.push(buf & 0xff);
+      out[j++] = (buf >> 16) & 0xff;
+      if (end === 0 || end > 1) out[j++] = (buf >> 8) & 0xff;
+      if (end === 0 || end > 2) out[j++] = buf & 0xff;
       buf = 0;
       pos = 0;
     }
@@ -1848,7 +1854,7 @@ export function decodeBase64(s: string): Uint8Array {
     throw engineError("invalid_parameter_value", "invalid base64 end sequence").withHint(
       "Input data is missing padding, is truncated, or is otherwise corrupted.",
     );
-  return Uint8Array.from(out);
+  return filledPrefix(out, j);
 }
 
 // decodeEscape: \\ → backslash, \nnn (exactly 3 octal digits ≤ 255) → that byte, any other byte →
@@ -1857,16 +1863,17 @@ export function decodeEscape(bytes: Uint8Array): Uint8Array {
   const bad = () =>
     engineError("invalid_text_representation", "invalid input syntax for type bytea");
   const oct = (c: number): number | null => (c >= 48 && c <= 55 ? c - 48 : null);
-  const out: number[] = [];
+  const out = new Uint8Array(bytes.length);
+  let j = 0;
   let i = 0;
   while (i < bytes.length) {
     if (bytes[i] !== 0x5c) {
-      out.push(bytes[i]!);
+      out[j++] = bytes[i]!;
       i++;
       continue;
     }
     if (i + 1 < bytes.length && bytes[i + 1] === 0x5c) {
-      out.push(0x5c);
+      out[j++] = 0x5c;
       i += 2;
     } else if (i + 3 < bytes.length) {
       const a = oct(bytes[i + 1]!);
@@ -1875,13 +1882,13 @@ export function decodeEscape(bytes: Uint8Array): Uint8Array {
       if (a === null || b === null || c === null) throw bad();
       const v = a * 64 + b * 8 + c;
       if (v > 255) throw bad();
-      out.push(v);
+      out[j++] = v;
       i += 4;
     } else {
       throw bad();
     }
   }
-  return Uint8Array.from(out);
+  return filledPrefix(out, j);
 }
 
 // initcapAscii is initcap(s) (string-functions.md §3): uppercase the first character of each word

@@ -505,7 +505,8 @@ const HEX_ERROR_DECODER = new TextDecoder();
 // buffer. Malformed input uses the byte decoder below: this keeps its first-error ordering and
 // full UTF-8 error character, including TextEncoder's replacement of unpaired UTF-16 surrogates.
 export function decodeHexString(s: string): { bytes: Uint8Array } | { error: string } {
-  const out: number[] = [];
+  const out = new Uint8Array(s.length >> 1);
+  let j = 0;
   let i = 0;
   while (i < s.length) {
     const c = s.charCodeAt(i);
@@ -518,9 +519,9 @@ export function decodeHexString(s: string): { bytes: Uint8Array } | { error: str
     const lo = hexVal(s.charCodeAt(i + 1));
     if (lo < 0) return decodeHexPairs(HEX_INPUT_ENCODER.encode(s));
     i += 2;
-    out.push((hi << 4) | lo);
+    out[j++] = (hi << 4) | lo;
   }
-  return { bytes: Uint8Array.from(out) };
+  return { bytes: filledPrefix(out, j) };
 }
 
 // decodeHexPairs is PostgreSQL's hex_decode_safe (encode.c), shared by bytea hex input and
@@ -531,7 +532,8 @@ export function decodeHexString(s: string): { bytes: Uint8Array } | { error: str
 // and a final lone digit is `invalid hexadecimal data: odd number of digits`. Returns the bytes, or
 // { error } carrying PostgreSQL's message; each caller picks the SQLSTATE.
 export function decodeHexPairs(bytes: Uint8Array): { bytes: Uint8Array } | { error: string } {
-  const out: number[] = [];
+  const out = new Uint8Array(bytes.length >> 1);
+  let j = 0;
   let i = 0;
   while (i < bytes.length) {
     const c = bytes[i]!;
@@ -546,9 +548,15 @@ export function decodeHexPairs(bytes: Uint8Array): { bytes: Uint8Array } | { err
     const lo = hexVal(bytes[i]!);
     if (lo < 0) return { error: invalidHexDigit(bytes, i) };
     i++;
-    out.push((hi << 4) | lo);
+    out[j++] = (hi << 4) | lo;
   }
-  return { bytes: Uint8Array.from(out) };
+  return { bytes: filledPrefix(out, j) };
+}
+
+// filledPrefix is the first n bytes a decoder wrote into out, sized for its longest possible output:
+// out itself when it is full, else a copy, so the result never holds the unused tail.
+export function filledPrefix(out: Uint8Array, n: number): Uint8Array {
+  return n === out.length ? out : out.slice(0, n);
 }
 
 // invalidHexDigit is PostgreSQL's `invalid hexadecimal digit: "<c>"` message for the character
