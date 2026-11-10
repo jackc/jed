@@ -3,6 +3,7 @@
 // integer into a decimal column widens (int→decimal) then coerces to the typmod; a decimal into
 // a decimal column coerces to the typmod (rounds, precision-checks → 22003); a boolean into a
 // boolean column is accepted as-is; a cross-family value (decimal→int, text→int, etc.) is 42804.
+import { codePointCount } from "./memsize.ts";
 import type { ArrayInResult, Value } from "./value.ts";
 import { arrayInError } from "./value.ts";
 import type { DecimalTypmod, ScalarType, TemporalTypmod } from "./types.ts";
@@ -260,8 +261,8 @@ export function coerceDecimal(d: Decimal, typmod: DecimalTypmod | null): Decimal
 // rule — spec/design/types.md §15). JS strings are UTF-16, so the [...s] code-point iterator is
 // used, NOT s.slice, which would split astral characters mid-surrogate.
 export function truncateToChars(s: string, n: number): string {
-  const cps = [...s];
-  return cps.length <= n ? s : cps.slice(0, n).join("");
+  if (codePointCount(s) <= n) return s;
+  return [...s].slice(0, n).join("");
 }
 
 // coerceVarcharStore coerces a text value into a varchar(n) column/field for STORAGE (the
@@ -270,9 +271,8 @@ export function truncateToChars(s: string, n: number): string {
 // (the SQL-standard trailing-space exception PostgreSQL implements). A null varcharLen (an
 // unbounded text column) passes the value through unchanged.
 export function coerceVarcharStore(s: string, varcharLen: number | null, colName: string): string {
-  if (varcharLen === null) return s;
+  if (varcharLen === null || codePointCount(s) <= varcharLen) return s;
   const cps = [...s];
-  if (cps.length <= varcharLen) return s;
   for (let i = varcharLen; i < cps.length; i++) {
     if (cps[i] !== " ") {
       throw engineError(

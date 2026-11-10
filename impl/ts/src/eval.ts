@@ -12,6 +12,7 @@ import type {
 import type { Row } from "./storage.ts";
 import type { Meter } from "./cost.ts";
 import type { ThreeValued, Value } from "./value.ts";
+import { codePointCount } from "./memsize.ts";
 import { resolveUnfetchedSelfSteps } from "./format.ts";
 import { md5Hex, sha2Digest } from "./digest.ts";
 import {
@@ -1127,10 +1128,10 @@ function applyCompare(e: Of<"compare">, a: Value, b: Value, _env: EvalEnv, m: Me
   // collation's UCA sort key (spec/design/collation.md §7), charging the collate unit per code
   // point of each operand (cost.md "collate"). =/<> are byte-equality even under a deterministic
   // collation (§7), so they take the plain path and charge no collate. A NULL operand ⇒ Unknown
-  // (no sort key). [...s] counts code points (NOT s.length — the UTF-16 trap, §8).
+  // (no sort key). codePointCount counts code points (NOT s.length — the UTF-16 trap, §8).
   if (e.collation !== null && (e.op === "lt" || e.op === "gt" || e.op === "le" || e.op === "ge")) {
     if (a.kind === "text" && b.kind === "text") {
-      m.charge(COSTS.collate * BigInt([...a.text].length + [...b.text].length));
+      m.charge(COSTS.collate * BigInt(codePointCount(a.text) + codePointCount(b.text)));
       m.guard();
       const c = collatedCmp(e.collation, a.text, b.text);
       let res: boolean;
@@ -2379,17 +2380,17 @@ function applyScalarFunc(e: Of<"scalarFunc">, vals: Value[], env: EvalEnv, m: Me
   }
   if (e.func === "length") {
     // length(text) → i32 — the number of characters (Unicode code points). TS strings are
-    // UTF-16, so [...s] (the code-point iterator) counts code points, NOT s.length, which
-    // would over-count astral characters as surrogate pairs (string-functions.md §2/§3).
+    // UTF-16, so codePointCount counts code points, NOT s.length, which would over-count
+    // astral characters as surrogate pairs (string-functions.md §2/§3).
     // Over bytea, length is the byte count (string-functions.md §4).
     const v0 = vals[0]!;
     if (v0.kind === "bytea") return intValue(BigInt(v0.bytes.length));
     const s = (v0 as { text: string }).text;
-    return intValue(BigInt([...s].length));
+    return intValue(BigInt(codePointCount(s)));
   }
   if (e.func === "octet_length") {
     // octet_length(text) → i32 — the UTF-8 byte count, distinct from length's code-point
-    // count (string-functions.md §3). utf8ByteLength encodes via TextEncoder. Over bytea, the
+    // count (string-functions.md §3). utf8ByteLength measures without encoding. Over bytea, the
     // byte count (§4).
     const v0 = vals[0]!;
     if (v0.kind === "bytea") return intValue(BigInt(v0.bytes.length));
@@ -2630,7 +2631,7 @@ function applyScalarFunc(e: Of<"scalarFunc">, vals: Value[], env: EvalEnv, m: Me
     }
     const s = (v0 as { text: string }).text;
     const r = (v1 as { text: string }).text;
-    const count = vals.length > 3 ? (vals[3] as { int: bigint }).int : BigInt([...r].length);
+    const count = vals.length > 3 ? (vals[3] as { int: bigint }).int : BigInt(codePointCount(r));
     return growthResult(m, e.args, textValue(overlayChars(s, r, start, count)));
   }
   if (e.func === "bytea_concat") {
@@ -3499,7 +3500,7 @@ export function widthBucketArray(
     m.charge(COSTS.operatorEval);
     let c: number;
     if (collation !== null && operand.kind === "text" && t.kind === "text") {
-      m.charge(COSTS.collate * BigInt([...operand.text].length + [...t.text].length));
+      m.charge(COSTS.collate * BigInt(codePointCount(operand.text) + codePointCount(t.text)));
       m.guard();
       c = collatedCmp(collation, operand.text, t.text);
     } else {
@@ -3573,7 +3574,7 @@ export function quantifiedMembership(
       lv.kind === "text" &&
       e.kind === "text"
     ) {
-      m.charge(COSTS.collate * BigInt([...lv.text].length + [...e.text].length));
+      m.charge(COSTS.collate * BigInt(codePointCount(lv.text) + codePointCount(e.text)));
       m.guard();
       const c = collatedCmp(collation, lv.text, e.text);
       let res: boolean;
@@ -4288,12 +4289,12 @@ export function decimalCmpWork(a: Value, b: Value): number {
 // the SHORTER operand's length (code points for text, bytes for bytea), clamped to >= 1. A byte /
 // code-point comparison stops at the first differing position or the end of the shorter operand,
 // so min is a true upper bound on the work (spec/design/cost.md §3 "varlen_compare"). Any other
-// pair — including a NULL side or a non-varlen type — returns 1 (no charge). [...s] counts code
-// points (NOT s.length — the UTF-16 trap, CLAUDE.md §8).
+// pair — including a NULL side or a non-varlen type — returns 1 (no charge). codePointCount counts
+// code points (NOT s.length — the UTF-16 trap, CLAUDE.md §8).
 export function varlenCompareWork(a: Value, b: Value): number {
   let n: number;
   if (a.kind === "text" && b.kind === "text") {
-    n = Math.min([...a.text].length, [...b.text].length);
+    n = Math.min(codePointCount(a.text), codePointCount(b.text));
   } else if (a.kind === "bytea" && b.kind === "bytea") {
     n = Math.min(a.bytes.length, b.bytes.length);
   } else {

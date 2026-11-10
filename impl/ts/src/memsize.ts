@@ -17,6 +17,24 @@ import {
 import type { JsonNode } from "./json.ts";
 import { type Value, bufferedPayloadLen } from "./value.ts";
 
+// codePointCount counts a JS (UTF-16) string's Unicode code points without allocating: a surrogate
+// pair is one, a lone surrogate one, as the [...s] code-point iterator counts. A string with no high
+// surrogate (always a one-byte string, which V8 rejects without scanning) is its UTF-16 length.
+export function codePointCount(s: string): number {
+  if (!HIGH_SURROGATE.test(s)) return s.length;
+  const len = s.length;
+  let pairs = 0;
+  for (let i = 0; i + 1 < len; i++) {
+    if ((s.charCodeAt(i) & 0xfc00) === 0xd800 && (s.charCodeAt(i + 1) & 0xfc00) === 0xdc00) {
+      pairs++;
+      i++;
+    }
+  }
+  return len - pairs;
+}
+
+const HIGH_SURROGATE = /[\uD800-\uDBFF]/;
+
 // utf8Length is the UTF-8 byte length of a JS (UTF-16) string, measured without allocating an encoded
 // copy. A surrogate pair is one 4-byte code point; a lone surrogate encodes as U+FFFD (3 bytes), the
 // TextEncoder behavior. A long string is measured by TextEncoder.encodeInto in chunks that never split

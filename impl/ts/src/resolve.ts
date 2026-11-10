@@ -1,5 +1,6 @@
 import { cancellationCheckpoint } from "./cancel.ts";
 import { float32FromText } from "./float_input.ts";
+import { codePointCount } from "./memsize.ts";
 // resolveProjections resolves SELECT items into evaluable projections (any result type is
 // allowed in the select list, including boolean — SELECT a = b), each paired with its output
 // column name (spec/design/grammar.md §8). `*` expands across ALL relations in FROM order,
@@ -3346,7 +3347,7 @@ export function collatedCmp(coll: Collation, a: string, b: string): number {
 // coll (spec/design/collation.md §1, array.md §5). Each walked pair of present elements charges
 // collate per code point of both (collation.md §11) when m is non-null — the comparison operators and
 // GREATEST/LEAST; the unmetered sort/min/max paths pass null. A NULL element or the array shape
-// decides without a charge. [...s] counts code points (NOT s.length — the UTF-16 trap).
+// decides without a charge. codePointCount counts code points (NOT s.length — the UTF-16 trap).
 export function collatedArrayCmp(
   coll: Collation,
   a: ArrayShape,
@@ -3366,7 +3367,7 @@ export function collatedArrayCmp(
       throw new Error("BUG: a collated array comparison walks only text elements");
     }
     if (m !== null) {
-      m.charge(COSTS.collate * BigInt([...x.text].length + [...y.text].length));
+      m.charge(COSTS.collate * BigInt(codePointCount(x.text) + codePointCount(y.text)));
       m.guard();
     }
     const c = collatedCmp(coll, x.text, y.text);

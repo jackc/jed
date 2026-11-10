@@ -6,23 +6,8 @@
 import type { Collation } from "./collation.ts";
 import type { Meter } from "./cost.ts";
 import { COSTS } from "./costs.ts";
-import { payloadBytes } from "./memsize.ts";
+import { codePointCount, payloadBytes } from "./memsize.ts";
 import type { Value } from "./value.ts";
-
-// codePointCount counts a JS (UTF-16) string's Unicode code points: a surrogate pair is one.
-function codePointCount(s: string): number {
-  let n = 0;
-  const len = s.length;
-  for (let i = 0; i < len; i++) {
-    const c = s.charCodeAt(i);
-    if (c >= 0xd800 && c <= 0xdbff && i + 1 < len) {
-      const d = s.charCodeAt(i + 1);
-      if (d >= 0xdc00 && d <= 0xdfff) i++;
-    }
-    n++;
-  }
-  return n;
-}
 
 // collatedCodePoints is the code points a collated key's UCA sort key is built from: a text's, or a
 // text[]'s non-NULL elements'.

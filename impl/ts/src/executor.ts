@@ -1387,7 +1387,7 @@ export function nextvalDefaultText(seqName: string): string {
 }
 
 export function utf8ByteLength(s: string): number {
-  return SQL_BYTE_ENCODER.encode(s).length;
+  return utf8Length(s);
 }
 
 // === string / text function kernels (spec/design/string-functions.md) ===============
