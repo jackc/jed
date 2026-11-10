@@ -2044,7 +2044,12 @@ func (r *simRunner) checkGrowth(i int, d *simDB, quiet bool) {
 	reclaimed := false
 	if quiet && d.high-d.free > max(compactMinPages, uint32(compactGrowth)*d.lacBound) {
 		reclaimed = true
-		if leaked := pc - 2 - live - free; pc < 2+live+free || leaked > written {
+		// PROTOTYPE (remap.go): page ids that key a remap entry stay off the free list until a fold.
+		held := uint32(0)
+		if deferOn(int(r.pageSize)) {
+			held = uint32(remapCapFor(int(r.pageSize)))
+		}
+		if leaked := pc - 2 - live - free; pc < 2+live+free || leaked > written+held {
 			r.fail(i, "bounded growth: %s has %d pages, %d live and %d free, after a commit that wrote %d "+
 				"must have reclaimed every dead page", d.name, pc, live, free, written)
 			return

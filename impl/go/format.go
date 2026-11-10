@@ -1194,6 +1194,12 @@ type incrementalWrite struct {
 	// are rewritten whole every commit.
 	catalogPages uint32
 	gistPages    uint32
+	// PROTOTYPE (remap.go): retained is the pages that kept their place though the live-page delta
+	// counts them as replaced; remap the remap list this commit publishes (nil: the meta carries
+	// none); cat the catalog chain it leaves committed.
+	retained uint32
+	remap    *remapState
+	cat      *catState
 }
 
 // pageAlloc hands out page indices for an incremental commit: the free-list first (lowest index, the
@@ -1252,6 +1258,13 @@ func (s *snapshot) incrementalImage(pageSize, startPage uint32, free []uint32, r
 
 // incrementalImageAllowed is incrementalImage with reuse restricted to allowed (nil: every free page).
 func (s *snapshot) incrementalImageAllowed(pageSize, startPage uint32, free []uint32, reuse bool, allowed map[uint32]bool, paging *sharedPaging) (incrementalWrite, error) {
+	return s.incrementalImageDeferred(pageSize, startPage, free, reuse, allowed, paging, nil, nil)
+}
+
+// incrementalImageDeferred is incrementalImageAllowed under the deferred-interior prototype (remap.go):
+// with d set, interiors whose only change is a child's page keep their page; with prevCat set, a
+// catalog chain whose bytes are unchanged is not rewritten.
+func (s *snapshot) incrementalImageDeferred(pageSize, startPage uint32, free []uint32, reuse bool, allowed map[uint32]bool, paging *sharedPaging, d *deferCtx, prevCat *catState) (incrementalWrite, error) {
 	ps := int(pageSize)
 	seal := sealerOf(ps, paging)
 	pcap := seal.cap
@@ -1281,7 +1294,7 @@ func (s *snapshot) incrementalImageAllowed(pageSize, startPage uint32, free []ui
 	var indexColTypes []colType
 	for ti, k := range keys {
 		if root := s.stores[k].treeRoot(); root != nil {
-			rp, err := serializeDirty(root, s.stores[k].colTypes, s.stores[k].memo, seal, alloc, &pages, kept, shared, paging)
+			rp, err := serializeDirty(root, s.stores[k].colTypes, s.stores[k].memo, seal, alloc, &pages, kept, shared, paging, d)
 			if err != nil {
 				return incrementalWrite{}, err
 			}
@@ -1309,7 +1322,7 @@ func (s *snapshot) incrementalImageAllowed(pageSize, startPage uint32, free []ui
 				}
 				r = root
 			} else if root := s.indexStores[idx.Name].treeRoot(); root != nil {
-				rp, err := serializeDirty(root, indexColTypes, nil, seal, alloc, &pages, kept, shared, paging)
+				rp, err := serializeDirty(root, indexColTypes, nil, seal, alloc, &pages, kept, shared, paging, d)
 				if err != nil {
 					return incrementalWrite{}, err
 				}
@@ -1330,6 +1343,40 @@ func (s *snapshot) incrementalImageAllowed(pageSize, startPage uint32, free []ui
 		return incrementalWrite{}, err
 	}
 	catLayout := catalogLayout(catEntries, pcap.chain())
+	newCat := &catState{payloads: make([][]byte, len(catLayout))}
+	for i := range catLayout {
+		newCat.payloads[i] = catLayout[i].payload
+	}
+	var retained uint32
+	var remap *remapState
+	if d != nil {
+		retained, remap = d.retained, d.remap
+	}
+	if prevCat != nil && len(prevCat.payloads) == len(newCat.payloads) {
+		same := true
+		for i := range newCat.payloads {
+			same = same && bytes.Equal(prevCat.payloads[i], newCat.payloads[i])
+		}
+		if same {
+			// The catalog chain is byte-identical (no root moved, no count changed): keep it.
+			if alloc.exhausted {
+				return incrementalWrite{}, newError(ProgramLimitExceeded, "database page limit exceeded")
+			}
+			return incrementalWrite{
+				pages:         pages,
+				root:          prevCat.root,
+				pageCount:     alloc.next,
+				freeRemaining: append(alloc.skipped, alloc.free[alloc.cursor:]...),
+				kept:          kept,
+				sharedChains:  shared,
+				catalogPages:  uint32(len(prevCat.payloads)),
+				gistPages:     gistPages,
+				retained:      retained + uint32(len(prevCat.payloads)),
+				remap:         remap,
+				cat:           prevCat,
+			}, nil
+		}
+	}
 	catPages := make([]uint32, len(catLayout))
 	for i := range catPages {
 		catPages[i] = alloc.take()
@@ -1360,6 +1407,9 @@ func (s *snapshot) incrementalImageAllowed(pageSize, startPage uint32, free []ui
 		sharedChains:  shared,
 		catalogPages:  uint32(len(catPages)),
 		gistPages:     gistPages,
+		retained:      retained,
+		remap:         remap,
+		cat:           &catState{payloads: newCat.payloads, root: next},
 	}, nil
 }
 
@@ -1371,12 +1421,13 @@ func (s *snapshot) incrementalImageAllowed(pageSize, startPage uint32, free []ui
 // Page indices come from the allocator (free-list first, then the high-water). Mirrors serializeNode
 // for the byte layout. Every clean node and OnDisk child it reaches is recorded in kept — the shared
 // boundary the live-page delta skips (spec/design/memory.md §8.7).
-func serializeDirty(n *pnode, colTypes []colType, memo *compressMemo, seal sealer, alloc *pageAlloc, pages *[]dirtyPage, kept, shared map[uint32]bool, paging *sharedPaging) (pageRef, error) {
+func serializeDirty(n *pnode, colTypes []colType, memo *compressMemo, seal sealer, alloc *pageAlloc, pages *[]dirtyPage, kept, shared map[uint32]bool, paging *sharedPaging, d *deferCtx) (pageRef, error) {
 	if n.page != 0 {
 		kept[n.page] = true
 		return n.ref(), nil
 	}
 	childPages := make([]pageRef, len(n.children))
+	var moved []int
 	for i, c := range n.children {
 		// A resident child recurses (dirty descendants get pages); an OnDisk child is a clean leaf
 		// already durable at its page — keep it, write nothing (the incremental-commit win).
@@ -1385,11 +1436,43 @@ func serializeDirty(n *pnode, colTypes []colType, memo *compressMemo, seal seale
 			childPages[i] = c.ref()
 			continue
 		}
-		cp, err := serializeDirty(c.node, colTypes, memo, seal, alloc, pages, kept, shared, paging)
+		wasDirty := c.node.page == 0
+		cp, err := serializeDirty(c.node, colTypes, memo, seal, alloc, pages, kept, shared, paging, d)
 		if err != nil {
 			return pageRef{}, err
 		}
 		childPages[i] = cp
+		if d != nil && wasDirty {
+			moved = append(moved, i)
+		}
+	}
+	if d != nil && len(n.children) > 0 {
+		// PROTOTYPE (remap.go): an interior whose separators are its persisted page's, and whose
+		// rewritten children each replace a persisted node one for one, keeps its page. The remap
+		// list records where those children went.
+		deferrable := n.origin != 0 && n.sameKeys
+		for _, i := range moved {
+			c := n.children[i].node
+			deferrable = deferrable && (c.origin != 0)
+		}
+		if deferrable {
+			for _, i := range moved {
+				if c := n.children[i].node; childPages[i].page != c.origin {
+					d.remap.replace(c.origin, childPages[i].page)
+				}
+			}
+			n.setRef(pageRef{page: n.origin})
+			n.stale = true
+			d.retained++
+			return n.ref(), nil
+		}
+		// Written fresh: it names its children directly, so their entries go.
+		for i, c := range n.children {
+			d.remap.drop(childPages[i].page)
+			if c.node != nil && c.node.origin != 0 {
+				d.remap.drop(c.node.origin)
+			}
+		}
 	}
 	// Encode a leaf's records, spilling over-large values to overflow pages drawn from the same
 	// allocator (free-list first, then high-water — large-values.md §12). A dirty leaf may carry
@@ -1657,7 +1740,16 @@ func loadEngineSharedPagingAt(paging *sharedPaging, env *Environment, at loadAt)
 			return nil, err
 		}
 		mt = selected
+		// PROTOTYPE (remap.go): the selected meta's remap list redirects child pointers as the
+		// skeleton is read.
+		paging.remap = mt.remap
+		if mt.remap.len() > 0 {
+			remapStat('o')
+		} else {
+			remapStat('n')
+		}
 	}
+	remap := mt.remap
 
 	pcap := paging.cap()
 	snap := newSnapshot(env)
@@ -1839,7 +1931,7 @@ func loadEngineSharedPagingAt(paging *sharedPaging, env *Environment, at loadAt)
 			if tableRoot.page != 0 {
 				// Reads only the interior spine — leaves stay OnDisk; the exact row count was restored
 				// from the v28 catalog entry (spec/design/storage.md §6).
-				root, err := readSkeleton(paging, tableRoot, colTypes)
+				root, err := readSkeleton(paging, tableRoot, colTypes, remap)
 				if err != nil {
 					return nil, err
 				}
@@ -1898,7 +1990,7 @@ func loadEngineSharedPagingAt(paging *sharedPaging, env *Environment, at loadAt)
 				} else {
 					istore.attachPaging(paging)
 					if indexRoots[k].page != 0 {
-						root, err := readSkeleton(paging, indexRoots[k], nil)
+						root, err := readSkeleton(paging, indexRoots[k], nil, remap)
 						if err != nil {
 							return nil, err
 						}
@@ -2006,12 +2098,12 @@ func anySpillable(colTypes []colType) bool {
 // (chainPages — large-values.md §14), so opening a file never materializes or decompresses a large
 // value.
 func collectLeafOverflow(paging *sharedPaging, pageIdx pageRef, colTypes []colType, reached, seen map[uint32]bool, depth int) error {
-	return collectLeafOverflowWith(paging.readBodyUnlocked, paging.cap(), pageIdx, colTypes, reached, seen, depth)
+	return collectLeafOverflowWith(paging.readBodyUnlocked, paging.cap(), pageIdx, colTypes, reached, seen, depth, paging.remap)
 }
 
 // collectLeafOverflowWith is collectLeafOverflow over a page reader: the commit path's reads go
 // straight to the pager it already holds, a backup's take the pager lock per page.
-func collectLeafOverflowWith(read func(pageRef) ([]byte, error), pcap pageCap, pageIdx pageRef, colTypes []colType, reached, seen map[uint32]bool, depth int) error {
+func collectLeafOverflowWith(read func(pageRef) ([]byte, error), pcap pageCap, pageIdx pageRef, colTypes []colType, reached, seen map[uint32]bool, depth int, remap *remapState) error {
 	if depth > maxTreeDepth {
 		return newError(DataCorrupted, "B-tree deeper than any valid tree")
 	}
@@ -2074,10 +2166,13 @@ func collectLeafOverflowWith(read func(pageRef) ([]byte, error), pcap pageCap, p
 			if err != nil {
 				return err
 			}
+			if to, ok := remap.lookup(cp.page); ok { // PROTOTYPE (remap.go)
+				cp.page = to
+			}
 			cps = append(cps, cp)
 		}
 		for _, cp := range cps {
-			if err := collectLeafOverflowWith(read, pcap, cp, colTypes, reached, seen, depth+1); err != nil {
+			if err := collectLeafOverflowWith(read, pcap, cp, colTypes, reached, seen, depth+1, remap); err != nil {
 				return err
 			}
 		}
@@ -2160,7 +2255,7 @@ func (lc liveCount) after(write incrementalWrite, prev *snapshot, paging *shared
 	if err != nil {
 		return liveCount{}, err
 	}
-	live := int64(lc.live) + int64(len(write.pages)) - int64(lc.catalog) - int64(lc.gist) - int64(orphaned)
+	live := int64(lc.live) + int64(len(write.pages)) + int64(write.retained) - int64(lc.catalog) - int64(lc.gist) - int64(orphaned)
 	if live < 0 || live > math.MaxUint32 {
 		return liveCount{}, newError(DataCorrupted, "live page count out of range")
 	}
@@ -2590,7 +2685,7 @@ func reclaimDue(pageCount uint32, free int, liveAtCompaction uint32) bool {
 // orphans and remain protected even when they are unreachable from the new root.
 // pending is a relaxed batch's pending set (validated-cow.md §4): manifest dependencies the rebuilt
 // list must exclude, though they are not live.
-func freeListCandidates(snap *snapshot, paging *sharedPaging, catRoot pageRef, written []dirtyPage, freeRemaining []uint32, pageCount, liveAtCompaction uint32, genTxid uint64, canReclaim bool, pending []manifestEntry) ([]uint32, uint32, uint64, bool, error) {
+func freeListCandidates(snap *snapshot, paging *sharedPaging, catRoot pageRef, written []dirtyPage, freeRemaining []uint32, pageCount, liveAtCompaction uint32, genTxid uint64, canReclaim bool, pending []manifestEntry, remap *remapState) ([]uint32, uint32, uint64, bool, error) {
 	// liveAtCompaction==0 is the shared-file handoff sentinel: reconstruct on the first proven-alone
 	// commit even when the file is still below the ordinary amortization threshold.
 	compact := canReclaim && (liveAtCompaction == 0 || reclaimDue(pageCount, len(freeRemaining), liveAtCompaction))
@@ -2608,6 +2703,19 @@ func freeListCandidates(snap *snapshot, paging *sharedPaging, catRoot pageRef, w
 		newLive = uint32(len(reached))
 		for _, e := range pending {
 			reached[e.index] = true
+		}
+		// PROTOTYPE (remap.go): an entry whose node is gone (merged away) goes now, before its page
+		// can be listed free and reused; the ids the surviving entries are keyed by stay off the list.
+		if remap != nil {
+			for disk, cur := range remap.fwd {
+				if !reached[cur] {
+					delete(remap.fwd, disk)
+					delete(remap.rev, cur)
+				}
+			}
+			for _, p := range remap.held() {
+				reached[p] = true
+			}
 		}
 		var free []uint32
 		for p := paging.cap().firstBody(); p < pageCount; p++ {
@@ -2627,8 +2735,8 @@ func freeListCandidates(snap *snapshot, paging *sharedPaging, catRoot pageRef, w
 // alongside the skeleton (spec/design/storage.md §6). A table whose root is itself a single leaf
 // has no interior parent to hold an OnDisk reference, so the root leaf is faulted resident
 // (spec/design/pager.md §1/§4).
-func readSkeleton(paging *sharedPaging, root pageRef, colTypes []colType) (*pnode, error) {
-	c, _, err := readSkeletonNode(paging, root, colTypes, map[uint32]bool{}, 1)
+func readSkeleton(paging *sharedPaging, root pageRef, colTypes []colType, remap *remapState) (*pnode, error) {
+	c, _, err := readSkeletonNode(paging, root, colTypes, map[uint32]bool{}, 1, remap)
 	if err != nil {
 		return nil, err
 	}
@@ -2657,7 +2765,7 @@ func readSkeleton(paging *sharedPaging, root pageRef, colTypes []colType) (*pnod
 // (data_corrupted) rather than a reason to recurse without bound. The returned height (1 for a leaf)
 // lets each interior check that its resolved children sit at one depth, the invariant the scan and
 // rebalance code relies on.
-func readSkeletonNode(paging *sharedPaging, pageIdx pageRef, colTypes []colType, seen map[uint32]bool, depth int) (childRef, int, error) {
+func readSkeletonNode(paging *sharedPaging, pageIdx pageRef, colTypes []colType, seen map[uint32]bool, depth int, remap *remapState) (childRef, int, error) {
 	if depth > maxTreeDepth {
 		return childRef{}, 0, newError(DataCorrupted, "B-tree deeper than any valid tree")
 	}
@@ -2685,12 +2793,16 @@ func readSkeletonNode(paging *sharedPaging, pageIdx pageRef, colTypes []colType,
 			return childRef{}, 0, newError(DataCorrupted, "B-tree interior item count overruns page")
 		}
 		pos := 0
+		stale := false
 		// Child pointers precede the separator directory (format.md "Interior node").
 		childPtrs := make([]pageRef, 0, n+1)
 		for i := 0; i < n+1; i++ {
 			cp, err := readPageRef(pg.payload, &pos, pcap)
 			if err != nil {
 				return childRef{}, 0, err
+			}
+			if to, ok := remap.lookup(cp.page); ok { // PROTOTYPE (remap.go)
+				cp.page, stale = to, true
 			}
 			childPtrs = append(childPtrs, cp)
 		}
@@ -2703,7 +2815,7 @@ func readSkeletonNode(paging *sharedPaging, pageIdx pageRef, colTypes []colType,
 		// Resolve the first child to classify the level, then avoid reading leaf siblings. A leaf
 		// sibling that is not a leaf is caught when it faults (decodeLeafNode).
 		children := make([]childRef, 0, n+1)
-		first, height, err := readSkeletonNode(paging, childPtrs[0], colTypes, seen, depth+1)
+		first, height, err := readSkeletonNode(paging, childPtrs[0], colTypes, seen, depth+1, remap)
 		if err != nil {
 			return childRef{}, 0, err
 		}
@@ -2714,7 +2826,7 @@ func readSkeletonNode(paging *sharedPaging, pageIdx pageRef, colTypes []colType,
 				children = append(children, onDiskRef(cp)) // a leaf sibling — not read at open
 				continue
 			}
-			child, h, err := readSkeletonNode(paging, cp, colTypes, seen, depth+1)
+			child, h, err := readSkeletonNode(paging, cp, colTypes, seen, depth+1, remap)
 			if err != nil {
 				return childRef{}, 0, err
 			}
@@ -2723,7 +2835,7 @@ func readSkeletonNode(paging *sharedPaging, pageIdx pageRef, colTypes []colType,
 			}
 			children = append(children, child)
 		}
-		return residentRef(&pnode{keys: keys, children: children, page: pageIdx.page, tag: pageIdx.tag}), height + 1, nil
+		return residentRef(&pnode{keys: keys, children: children, page: pageIdx.page, tag: pageIdx.tag, stale: stale}), height + 1, nil
 	default:
 		return childRef{}, 0, newError(DataCorrupted, "expected a B-tree node page")
 	}
@@ -5361,6 +5473,8 @@ type meta struct {
 	dirtyCount    uint32
 	manifestPages uint32
 	manifestCRC   uint64
+	// remap is the meta's remap list (PROTOTYPE, remap.go); nil when it carries none.
+	remap *remapState
 }
 
 // parseMeta validates a standalone meta block; ok=false if it is not a valid meta. Shared by readMeta
@@ -5404,8 +5518,12 @@ func parseMeta(m []byte) (meta, bool) {
 		(pages == 0 && chainCRC != 0) || (count == 0 && pages != 0) {
 		return meta{}, false
 	}
-	lo, hi := manifestInlineArea(len(m), pcap)
-	inline := min(int(count), manifestInlineCapacity(len(m), pcap))
+	lo, hi := manifestInlineAreaOf(m, pcap)
+	inline := min(int(count), (hi-lo)/12)
+	remap, ok := decodeRemap(m)
+	if !ok {
+		return meta{}, false
+	}
 	if !zeroBytes(m[lo+12*inline:hi]) || uint64(count) > uint64(inline)+uint64(pages)*uint64(manifestOverflowCapacity(len(m))) {
 		return meta{}, false
 	}
@@ -5446,6 +5564,7 @@ func parseMeta(m []byte) (meta, bool) {
 		dirtyCount:    count,
 		manifestPages: pages,
 		manifestCRC:   chainCRC,
+		remap:         remap,
 	}, true
 }
 

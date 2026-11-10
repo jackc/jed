@@ -58,7 +58,19 @@ func manifestInlineArea(ps int, pcap pageCap) (int, int) {
 	if pcap.encrypted() {
 		return 96, ps - cryptoReserve
 	}
+	if deferOn(ps) { // PROTOTYPE (remap.go): the remap list takes the end of the page
+		return 64, ps - remapReserveFor(ps)
+	}
 	return 64, ps
+}
+
+// manifestInlineAreaOf is the inline manifest area of the meta page m as m itself declares it: a
+// meta carrying a remap list (remap.go) ends its manifest before the list.
+func manifestInlineAreaOf(m []byte, pcap pageCap) (int, int) {
+	if pcap.encrypted() {
+		return 96, len(m) - cryptoReserve
+	}
+	return 64, len(m) - metaRemapReserve(m)
 }
 
 func manifestInlineCapacity(ps int, pcap pageCap) int {
@@ -282,7 +294,8 @@ func commitManifestDependencies(m meta, raw []byte, pageSize uint32, read func(u
 	last := first - 1
 	seen := uint32(0)
 	// PROTOTYPE: a kept chain's head (low != 0) was written by an earlier commit and is not listed.
-	rootSeen, freeHeadSeen := false, m.freeListHead == 0 || m.freeLow != 0
+	// PROTOTYPE (remap.go): a meta with a remap list may keep its catalog chain from an earlier commit.
+	rootSeen, freeHeadSeen := metaRemapReserve(raw) != 0, m.freeListHead == 0 || m.freeLow != 0
 	validate := func(entries []byte, count uint32) (uint32, bool, error) {
 		for i := uint32(0); i < count; i++ {
 			e := entries[int(i)*12:]
@@ -308,8 +321,8 @@ func commitManifestDependencies(m meta, raw []byte, pageSize uint32, read func(u
 		}
 		return 0, true, nil
 	}
-	lo, _ := manifestInlineArea(len(raw), pcap)
-	inline := min(m.dirtyCount, uint32(manifestInlineCapacity(len(raw), pcap)))
+	lo, hi := manifestInlineAreaOf(raw, pcap)
+	inline := min(m.dirtyCount, uint32((hi-lo)/12))
 	if bad, ok, err := validate(raw[lo:], inline); !ok || err != nil {
 		return protected, bad, ok, err
 	}
@@ -394,7 +407,7 @@ func manifestEntriesOf(pages []dirtyPage) []manifestEntry {
 // commitManifest encodes the fixed meta inline region and the reserved overflow
 // chain. The entries include free-list pages, but not the manifest itself; under
 // batched durability they also include the pending set (validated-cow.md §4).
-func commitManifest(pcap pageCap, ps uint32, txid uint64, root pageRef, pageCount uint32, head pageRef, freeLow uint32, livePages uint32, entries []manifestEntry, manifestIDs []uint32) ([]byte, []dirtyPage) {
+func commitManifest(pcap pageCap, ps uint32, txid uint64, root pageRef, pageCount uint32, head pageRef, freeLow uint32, livePages uint32, entries []manifestEntry, manifestIDs []uint32, remap *remapState) ([]byte, []dirtyPage) {
 	ordered := append([]manifestEntry(nil), entries...)
 	sort.Slice(ordered, func(i, j int) bool { return ordered[i].index < ordered[j].index })
 	meta := metaPage(pcap, ps, txid, root, pageCount, head, freeLow, livePages)
@@ -434,6 +447,9 @@ func commitManifest(pcap pageCap, ps uint32, txid uint64, root pageRef, pageCoun
 		pages = append(pages, dirtyPage{index: id, bytes: block})
 	}
 	binary.BigEndian.PutUint64(meta[48:], chainCRC)
+	if deferOn(int(ps)) && !pcap.encrypted() { // PROTOTYPE (remap.go)
+		encodeRemap(meta, remap)
+	}
 	binary.BigEndian.PutUint32(meta[32:], metaCRC(meta))
 	return meta, pages
 }
@@ -473,7 +489,7 @@ type validatedCommitPlan struct {
 // free pages (format.md *Trailing truncation*): only an owner's (or an alone process's) own commit that
 // plans against a durable floor — nothing pending — sets it, never a page client's planned delta.
 func planValidatedCommit(snap *snapshot, paging *sharedPaging, write incrementalWrite, pageSize, liveAtCompaction uint32, generation uint64, canReclaim, canReuse, truncate bool, livePages uint32, pending []manifestEntry, allowed map[uint32]bool, prevFree []uint32, prevChain *freeChain) (validatedCommitPlan, error) {
-	candidates, live, gen, rebuilt, err := freeListCandidates(snap, paging, write.root, write.pages, write.freeRemaining, write.pageCount, liveAtCompaction, generation, canReclaim, pending)
+	candidates, live, gen, rebuilt, err := freeListCandidates(snap, paging, write.root, write.pages, write.freeRemaining, write.pageCount, liveAtCompaction, generation, canReclaim, pending, write.remap)
 	if err != nil {
 		return validatedCommitPlan{}, err
 	}
@@ -570,7 +586,7 @@ func planValidatedCommit(snap *snapshot, paging *sharedPaging, write incremental
 		dirty = append(dirty, manifestEntriesOf(write.pages)...)
 		dirty = append(dirty, manifestEntriesOf(fl)...)
 		entries := append(append(make([]manifestEntry, 0, len(pending)+len(dirty)), pending...), dirty...)
-		meta, overflow := commitManifest(seal.cap, pageSize, snap.txid, write.root, pc, head, low, livePages, entries, ids)
+		meta, overflow := commitManifest(seal.cap, pageSize, snap.txid, write.root, pc, head, low, livePages, entries, ids, write.remap)
 		if expCommitHook != nil { // EXPERIMENT
 			expCommitHook(write.pages, fl, overflow, len(persist)+len(free))
 		}

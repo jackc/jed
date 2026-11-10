@@ -194,7 +194,7 @@ func (c *sharedCore) backupPages(paging *sharedPaging, mt meta) ([]uint32, error
 		root := store.treeRoot()
 		collectTreePages(root, reached)
 		if root != nil && root.page != 0 && anySpillable(store.colTypes) {
-			if err := collectLeafOverflowWith(readRef, paging.cap(), root.ref(), store.colTypes, reached, map[uint32]bool{}, 1); err != nil {
+			if err := collectLeafOverflowWith(readRef, paging.cap(), root.ref(), store.colTypes, reached, map[uint32]bool{}, 1, mt.remap); err != nil {
 				return nil, err
 			}
 		}
@@ -302,6 +302,10 @@ func (c *sharedCore) writePageIdentical(paging *sharedPaging, mt meta, pages []u
 		}
 	}
 	bootstrap := metaPage(paging.cap(), uint32(ps), mt.txid, pageRef{page: mt.rootPage, tag: mt.rootTag}, mt.pageCount, pageRef{page: mt.freeListHead, tag: mt.freeListTag}, mt.freeLow, mt.livePages)
+	if mt.remap != nil { // PROTOTYPE (remap.go): the copy's interiors are as stale as the source's
+		encodeRemap(bootstrap, mt.remap)
+		resealRemapMeta(bootstrap)
+	}
 	// Each slot is sealed for its own index in an encrypted copy (encrypted.md §6).
 	for slot := uint32(0); slot < 2; slot++ {
 		m := append([]byte(nil), bootstrap...)

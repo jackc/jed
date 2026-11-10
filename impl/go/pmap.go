@@ -76,6 +76,13 @@ type pnode struct {
 	// written later binds it.
 	tag   pageTag
 	owner *mutationGeneration
+	// PROTOTYPE (remap.go): origin is the persisted page this dirty node replaces one for one in its
+	// parent's slot (0: none — a split or merge product). sameKeys says a dirty interior's separators
+	// are still that page's, so only its child pointers differ. stale marks a persisted interior whose
+	// on-disk child pointers are behind the resident ones (the remap list covers the difference).
+	origin   uint32
+	sameKeys bool
+	stale    bool
 }
 
 // ref is this node's page and tag (the zero pageRef while dirty).
@@ -707,30 +714,37 @@ func (m *pMap) demoteCleanLeaves() {
 		if n.isLeaf() {
 			return nil // handled by the parent (a root leaf stays resident)
 		}
-		changed := false
-		children := make([]childRef, 0, len(n.children))
-		for _, c := range n.children {
-			nc := c
-			if c.node != nil {
-				if c.node.isLeaf() {
-					if c.node.page != 0 {
-						changed = true
-						nc = onDiskRef(c.node.ref())
-					}
-				} else if rebuilt := demote(c.node); rebuilt != nil {
-					changed = true
-					nc = residentRef(rebuilt)
-				}
+		// Copy the child slice only once a child actually changes: this walk visits every resident
+		// interior node on every commit, and almost all of them are untouched.
+		var children []childRef
+		for i, c := range n.children {
+			if c.node == nil {
+				continue
 			}
-			children = append(children, nc)
+			nc := c
+			if c.node.isLeaf() {
+				if c.node.page == 0 {
+					continue
+				}
+				nc = onDiskRef(c.node.ref())
+			} else if rebuilt := demote(c.node); rebuilt != nil {
+				nc = residentRef(rebuilt)
+			} else {
+				continue
+			}
+			if children == nil {
+				children = append(make([]childRef, 0, len(n.children)), n.children...)
+			}
+			children[i] = nc
 		}
+		changed := children != nil
 		if !changed {
 			return nil
 		}
 		// The rebuilt interior keeps its keys AND its page id — its serialized bytes are unchanged
 		// (children reference the same pages), so it must stay clean or the next incremental commit
 		// would rewrite the whole spine every time.
-		return &pnode{keys: n.keys, children: children, page: n.page, tag: n.tag}
+		return &pnode{keys: n.keys, children: children, page: n.page, tag: n.tag, stale: n.stale}
 	}
 	if m.root != nil {
 		if rebuilt := demote(m.root); rebuilt != nil {
@@ -1471,7 +1485,11 @@ func nodeInsert(n *pnode, key []byte, val storedRow, weight uint32, old *storedR
 			vals = insertValAt(vals, i, val)
 			weights = insertWeightAt(weights, i, weight)
 		}
-		return buildLeaf(keys, vals, weights, cap, shape, i, generation), nil
+		out := buildLeaf(keys, vals, weights, cap, shape, i, generation)
+		if out.whole != nil {
+			out.whole.origin, _ = originOf(n)
+		}
+		return out, nil
 	}
 	// Fault the target child (a resident interior, or an OnDisk leaf brought in for mutation — it
 	// becomes a dirty resident node on the rebuilt path).
@@ -1490,6 +1508,7 @@ func nodeInsert(n *pnode, key []byte, val storedRow, weight uint32, old *storedR
 			return insOut{whole: n}, nil
 		}
 		n.keys = insertKeyAtMutable(n.keys, i, sub.sep)
+		n.sameKeys = false
 		n.children[i] = residentRef(sub.left)
 		n.children = insertChildAtMutable(n.children, i+1, residentRef(sub.right))
 		if n.payload(cap, shape) <= cap.c || len(n.keys) < 2 {
@@ -1505,7 +1524,8 @@ func nodeInsert(n *pnode, key []byte, val storedRow, weight uint32, old *storedR
 		// This node's separators are unchanged, so it cannot overflow — rebuild whole.
 		children := cloneChildren(n.children)
 		children[i] = residentRef(sub.whole)
-		return insOut{whole: &pnode{keys: cloneKeys(n.keys), children: children, owner: generation}}, nil
+		origin, same := originOf(n)
+		return insOut{whole: &pnode{keys: cloneKeys(n.keys), children: children, owner: generation, origin: origin, sameKeys: same}}, nil
 	}
 	keys := insertKeyAt(n.keys, i, sub.sep)
 	children := cloneChildren(n.children)
@@ -1514,6 +1534,9 @@ func nodeInsert(n *pnode, key []byte, val storedRow, weight uint32, old *storedR
 	out, ok := buildInterior(keys, children, cap, i, generation)
 	if !ok {
 		panic("insert-path interior split always has a valid split point")
+	}
+	if out.whole != nil {
+		out.whole.origin, _ = originOf(n)
 	}
 	return out, nil
 }
@@ -1548,7 +1571,8 @@ func nodeRemove(n *pnode, key []byte, generation *mutationGeneration, src leafSo
 			return nil, nil, false, err
 		}
 		vals, removed := removeValAtMutable(rows, i)
-		return &pnode{keys: removeKeyAtMutable(keys, i), vals: vals, weights: removeWeightAtMutable(weights, i), owner: generation}, removed, true, nil
+		origin, _ := originOf(n)
+		return &pnode{keys: removeKeyAtMutable(keys, i), vals: vals, weights: removeWeightAtMutable(weights, i), owner: generation, origin: origin}, removed, true, nil
 	}
 	i := n.childSlot(key)
 	childNode, err := resolveChild(n.children[i], src)
@@ -1568,7 +1592,8 @@ func nodeRemove(n *pnode, key []byte, generation *mutationGeneration, src leafSo
 	} else {
 		children := cloneChildren(n.children)
 		children[i] = residentRef(newChild)
-		rebuilt = &pnode{keys: cloneKeys(n.keys), children: children, owner: generation}
+		origin, same := originOf(n)
+		rebuilt = &pnode{keys: cloneKeys(n.keys), children: children, owner: generation, origin: origin, sameKeys: same}
 	}
 	out, err := rebalanceChild(rebuilt, i, generation, src, cap, shape)
 	if err != nil {
@@ -1599,7 +1624,9 @@ func rebalanceChild(n *pnode, i int, generation *mutationGeneration, src leafSou
 		parent := n
 		if !ownedBy(n, generation) {
 			parent = &pnode{keys: cloneKeys(n.keys), children: cloneChildren(n.children), owner: generation}
+			parent.origin, _ = originOf(n)
 		}
+		parent.sameKeys = false
 		parent.keys = removeKeyAtMutable(parent.keys, min(i, len(parent.keys)-1))
 		parent.children = removeChildAtMutable(parent.children, i)
 		return parent, nil
@@ -1707,7 +1734,9 @@ func mergeAt(n *pnode, j int, generation *mutationGeneration, src leafSource, ca
 	parent := n
 	if !ownedBy(n, generation) {
 		parent = &pnode{keys: cloneKeys(n.keys), children: cloneChildren(n.children), owner: generation}
+		parent.origin, _ = originOf(n)
 	}
+	parent.sameKeys = false
 	if merged.whole != nil {
 		parent.keys = removeKeyAtMutable(parent.keys, j)
 		parent.children[j] = residentRef(merged.whole)

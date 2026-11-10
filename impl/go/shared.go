@@ -730,9 +730,26 @@ func (st *storage) commitDurable(snap *snapshot, canReclaim, canReuse bool, budg
 			}
 		}
 		allowed := st.reuseAllowed(pending)
-		write, err := snap.incrementalImageAllowed(st.pageSize, st.pageCount, st.freePages, canReuse, allowed, st.paging)
+		// PROTOTYPE (remap.go): defer interior pages when this commit can; otherwise, if any interior
+		// is stale, fold — write every stale interior fresh and empty the remap list.
+		var d *deferCtx
+		var prevCat *catState
+		if st.paging.codec() == nil {
+			canDefer := deferOn(int(st.pageSize)) && !st.serviceClient && !pending && !st.relaxedFile() &&
+				st.paging.remap.len()+snap.dirtyNodeCount() <= remapCapFor(int(st.pageSize))
+			if canDefer {
+				d = &deferCtx{remap: st.paging.remap.clone()}
+				prevCat = st.paging.cat
+			} else {
+				snap.unstale()
+			}
+		}
+		write, err := snap.incrementalImageDeferred(st.pageSize, st.pageCount, st.freePages, canReuse, allowed, st.paging, d, prevCat)
 		if err != nil {
 			return err
+		}
+		if deferOn(int(st.pageSize)) && st.paging.codec() == nil && write.remap == nil {
+			write.remap = newRemapState() // a folded commit publishes an empty list
 		}
 		live, err := st.admitFile(write, budget)
 		if err != nil {
@@ -786,8 +803,12 @@ func (st *storage) commitFile(snap *snapshot, write incrementalWrite, live liveC
 	// delta never shrinks it, and a commit inside a relaxed batch may not cut pages the floor's batch
 	// has yet to make durable (format.md *Trailing truncation*, validated-cow.md §4).
 	truncate := !st.serviceClient && len(pending) == 0
+	// PROTOTYPE (remap.go): the walks below read interiors from disk, so they need this commit's list.
+	prevRemap := st.paging.remap
+	st.paging.remap = write.remap
 	plan, err := planValidatedCommit(snap, st.paging, write, st.pageSize, st.liveAtCompaction, st.freeGenTxid, canReclaim, canReuse, truncate, live.live, pending, allowed, st.freePages, st.freeChain)
 	if err != nil {
+		st.paging.remap = prevRemap
 		return false, err
 	}
 	if expFreeCheck != nil { // EXPERIMENT
@@ -844,6 +865,15 @@ func (st *storage) commitFile(snap *snapshot, write incrementalWrite, live liveC
 	st.pageCount, st.freePages, st.freeChain = plan.pageCount, plan.free, plan.chain
 	st.liveAtCompaction, st.freeGenTxid = plan.live, plan.generation
 	st.live = live
+	st.paging.remap, st.paging.cat = write.remap, write.cat // PROTOTYPE (remap.go)
+	switch {
+	case write.retained == 0 && prevRemap.len() > 0 && write.remap.len() == 0:
+		remapStat('f')
+	case write.remap.len() > 0:
+		remapStat('d')
+	default:
+		remapStat('e')
+	}
 	if capReached {
 		st.startCapFlush()
 	}

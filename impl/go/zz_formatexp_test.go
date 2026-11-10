@@ -16,6 +16,7 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"runtime/pprof"
 	"sort"
 	"strings"
 	"sync/atomic"
@@ -1041,7 +1042,15 @@ func TestCommitWriteExperiment(t *testing.T) {
 	if err := db.Compact("main"); err != nil {
 		t.Fatal(err)
 	}
-	run("after compact")
+	if pf := os.Getenv("JED_FORMAT_EXP_PROF"); pf != "" {
+		f, _ := os.Create(pf)
+		pprof.StartCPUProfile(f)
+		run("after compact")
+		pprof.StopCPUProfile()
+		f.Close()
+	} else {
+		run("after compact")
+	}
 	// The file must check clean and reopen with the same rows.
 	rep, err := db.IntegrityCheck(context.Background(), "main", IntegrityCheckOptions{Level: IntegrityFull})
 	if err != nil || !rep.OK() {
@@ -1139,4 +1148,133 @@ func TestZZFreeCheckSummary(t *testing.T) {
 	fmt.Fprintf(f, "SUMMARY commits=%d rebuilds=%d unchanged=%d prefix-only=%d prefix+tail=%d gated=%d violations=%d free-list pages today=%d kept-chain rule=%d\n", expFC.commits.Load(), expFC.rebuilds.Load(),
 		expFC.unchanged.Load(), expFC.prefix.Load(), expFC.contiguous.Load(), expFC.gated.Load(), expFC.violations.Load(), expFC.flNow.Load(), expFC.flNew.Load())
 	f.Close()
+}
+
+// TestDeferInteriorStress (PROTOTYPE, remap.go): random single- and multi-row commits against a file
+// database with deferred interiors, checked against an in-memory database running the same
+// statements. Every so often: a full integrity check, and a close and reopen (which must apply the
+// remap list). Every commit recounts live pages by reachability.
+//
+//	JED_DEFER_INTERIOR=on go test -run TestDeferInteriorStress -count=1 .
+func TestDeferInteriorStress(t *testing.T) {
+	if !deferInterior {
+		t.Skip("set JED_DEFER_INTERIOR=on")
+	}
+	SetVerifyLivePages(true)
+	defer SetVerifyLivePages(false)
+	path := filepath.Join(t.TempDir(), "defer.jed")
+	db, err := CreateDatabase(CreateOptions{Path: path, SkipFsync: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mem, err := CreateDatabase(CreateOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mem.Close()
+	both := func(sql string) {
+		t.Helper()
+		for _, d := range []*Database{db, mem} {
+			s := d.Session(SessionOptions{})
+			expExec(t, s, sql)
+			s.Close()
+		}
+	}
+	dump := func(d *Database) string {
+		s := d.Session(SessionOptions{})
+		defer s.Close()
+		var b strings.Builder
+		for _, q := range []string{
+			"SELECT id, k, v, pad FROM t ORDER BY id",
+			"SELECT id FROM t WHERE k BETWEEN 10 AND 40 ORDER BY k, id",
+			"SELECT count(*), sum(k) FROM t",
+			"SELECT id, n FROM u ORDER BY id",
+		} {
+			rows, err := s.Query(context.Background(), q)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for rows.Next() {
+				vals, err := rows.Values()
+				if err != nil {
+					t.Fatal(err)
+				}
+				fmt.Fprintln(&b, vals...)
+			}
+			if err := rows.Err(); err != nil {
+				t.Fatal(err)
+			}
+			rows.Close()
+		}
+		return b.String()
+	}
+	both("CREATE TABLE t (id i64 PRIMARY KEY, k i32 NOT NULL, v text NOT NULL, pad text)")
+	both("CREATE INDEX t_k ON t (k)")
+	both("CREATE INDEX t_v ON t (v)")
+	both("CREATE TABLE u (id i32 PRIMARY KEY, n i64 NOT NULL)")
+	r := rand.New(rand.NewSource(42))
+	next := int64(0)
+	var rows []string
+	for i := 0; i < 20000; i++ {
+		next++
+		rows = append(rows, fmt.Sprintf("(%d, %d, 'v%06d', '%s')", next, r.Intn(100), r.Intn(1000000), strings.Repeat("x", r.Intn(120))))
+		if len(rows) == 500 {
+			both("INSERT INTO t VALUES " + strings.Join(rows, ","))
+			rows = rows[:0]
+		}
+	}
+	both("INSERT INTO u VALUES (1, 0), (2, 0), (3, 0)")
+	reopens, folds := 0, 0
+	for i := 0; i < 6000; i++ {
+		id := 1 + r.Int63n(next)
+		switch x := r.Intn(100); {
+		case x < 35:
+			both(fmt.Sprintf("UPDATE t SET pad = '%s' WHERE id = %d", strings.Repeat("y", r.Intn(120)), id))
+		case x < 55:
+			both(fmt.Sprintf("UPDATE t SET k = %d, v = 'w%06d' WHERE id = %d", r.Intn(100), r.Intn(1000000), id))
+		case x < 75:
+			next++
+			both(fmt.Sprintf("INSERT INTO t VALUES (%d, %d, 'n%06d', NULL)", next, r.Intn(100), r.Intn(1000000)))
+		case x < 85:
+			both(fmt.Sprintf("DELETE FROM t WHERE id = %d", id))
+		case x < 90:
+			both(fmt.Sprintf("DELETE FROM t WHERE id BETWEEN %d AND %d", id, id+int64(r.Intn(400))))
+		case x < 95:
+			both(fmt.Sprintf("UPDATE t SET k = k + 1 WHERE id BETWEEN %d AND %d", id, id+int64(r.Intn(300))))
+		default:
+			both(fmt.Sprintf("UPDATE u SET n = n + 1 WHERE id = %d", 1+r.Intn(3)))
+		}
+		if db.core.storage.paging.remap.len() == 0 {
+			folds++
+		}
+		if i%250 == 249 {
+			rep, err := db.IntegrityCheck(context.Background(), "main", IntegrityCheckOptions{Level: IntegrityFull})
+			if err != nil || !rep.OK() {
+				t.Fatalf("commit %d: integrity: %v %+v", i, err, rep.Findings)
+			}
+		}
+		if i%400 == 399 {
+			pendingEntries := db.core.storage.paging.remap.len()
+			db.Close()
+			if db, err = OpenDatabase(path); err != nil {
+				t.Fatalf("commit %d: reopen: %v", i, err)
+			}
+			if got := db.core.storage.paging.remap.len(); got != pendingEntries {
+				t.Fatalf("commit %d: reopened with %d remap entries, closed with %d", i, got, pendingEntries)
+			}
+			reopens++
+			if a, b := dump(db), dump(mem); a != b {
+				t.Fatalf("commit %d: contents differ after reopen", i)
+			}
+		}
+	}
+	if a, b := dump(db), dump(mem); a != b {
+		t.Fatal("contents differ")
+	}
+	rep, err := db.IntegrityCheck(context.Background(), "main", IntegrityCheckOptions{Level: IntegrityFull})
+	if err != nil || !rep.OK() {
+		t.Fatalf("integrity: %v %+v", err, rep.Findings)
+	}
+	t.Logf("%d reopens; %d commits left an empty remap list; final list %d entries", reopens, folds, db.core.storage.paging.remap.len())
+	db.Close()
 }

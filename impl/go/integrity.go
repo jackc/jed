@@ -323,6 +323,9 @@ func (k *integrityChecker) checkLiveGeneration(pin *integrityPin) error {
 			return err
 		}
 	}
+	if k.paging.codec() == nil {
+		k.remap, _ = decodeRemap(pin.metaRaw)
+	}
 	protected, bad, valid, err := commitManifestDependencies(k.gen.meta, pin.metaRaw, k.paging.pgr.pageSize, k.paging.readBlock)
 	if err != nil {
 		return err
@@ -356,9 +359,11 @@ type integrityChecker struct {
 	max    int // 0 = no limit
 	snap   *snapshot
 	paging *sharedPaging
-	gen    integrityGeneration
-	pcap   pageCap
-	first  uint32
+	// remap is the checked generation's remap list (PROTOTYPE, remap.go).
+	remap *remapState
+	gen   integrityGeneration
+	pcap  pageCap
+	first uint32
 	// reached is the reachability bitmap over [0, page_count); reachedN its population.
 	reached  []uint64
 	reachedN uint64
@@ -397,6 +402,7 @@ func newIntegrityChecker(ctx context.Context, db string, opts IntegrityCheckOpti
 		full:    opts.Level != IntegrityQuick,
 		max:     max,
 		snap:    snap,
+		remap:   paging.remap, // PROTOTYPE (remap.go); a pinned generation replaces it with its own
 		paging:  paging,
 		gen:     gen,
 		pcap:    pcap,
@@ -1083,6 +1089,7 @@ func (w *integrityTree) visit(ref pageRef, depth int, lo, hi []byte) error {
 	switch pg.pageType {
 	case pageInterior:
 		children, seps, err := parseIntegrityInterior(pg, w.k.pcap)
+		w.k.remapChildren(children)
 		if err != nil {
 			return w.corrupt(ref.page, err.Error())
 		}
@@ -1370,6 +1377,7 @@ func (k *integrityChecker) scanRows(ref pageRef, colTypes []colType, depth int, 
 	switch pg.pageType {
 	case pageInterior:
 		children, _, err := parseIntegrityInterior(pg, k.pcap)
+		k.remapChildren(children)
 		if err != nil {
 			return err
 		}
@@ -1675,4 +1683,14 @@ func (k *integrityChecker) checkFreeList() error {
 		}
 	}
 	return nil
+}
+
+// remapChildren redirects an interior's child pointers through the generation's remap list
+// (PROTOTYPE, remap.go).
+func (k *integrityChecker) remapChildren(children []pageRef) {
+	for i := range children {
+		if to, ok := k.remap.lookup(children[i].page); ok {
+			children[i].page = to
+		}
+	}
 }

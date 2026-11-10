@@ -141,7 +141,7 @@ func testDelta(t *testing.T, ps, committedPages uint32, indices []uint32) (psCom
 		ids[i] = pageCount
 		pageCount++
 	}
-	meta, chain := commitManifest(plainCap(ps), ps, 6, plainRef(indices[0]), pageCount, pageRef{}, 0, uint32(len(indices)), manifestEntriesOf(dirty), ids)
+	meta, chain := commitManifest(plainCap(ps), ps, 6, plainRef(indices[0]), pageCount, pageRef{}, 0, uint32(len(indices)), manifestEntriesOf(dirty), ids, nil)
 	cb := psCommitBegin{txid: 6, meta: meta}
 	for _, pg := range chain {
 		cb.manifestPages = append(cb.manifestPages, psIndexedPage{index: pg.index, page: pg.bytes})
