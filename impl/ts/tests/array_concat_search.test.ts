@@ -21,7 +21,9 @@ test("|| — the three concatenation forms", () => {
     ["SELECT ARRAY[1,2] || ARRAY[3,4]", "{1,2,3,4}"],
     ["SELECT ARRAY[1,2] || 3", "{1,2,3}"],
     ["SELECT 0 || ARRAY[1,2]", "{0,1,2}"],
-    ["SELECT ARRAY['a','b'] || 'c'", "{a,b,c}"],
+    // The element is typed: a bare string literal beside an array adapts to the array type
+    // (types.md §5), as in PostgreSQL.
+    ["SELECT ARRAY['a','b'] || 'c'::text", "{a,b,c}"],
     ["SELECT '{1,2}'::i32[] || 3", "{1,2,3}"],
     ["SELECT '{1,2}'::i32[] || ARRAY[7,8]", "{1,2,7,8}"],
     ["SELECT ARRAY[ARRAY[1,2],ARRAY[3,4]] || ARRAY[5,6]", "{{1,2},{3,4},{5,6}}"],

@@ -171,5 +171,10 @@ SELECT id FROM t WHERE x = '{a}'
 statement error 22P02
 SELECT id FROM t WHERE r && '[1'
 
+# `||` adapts the literal to the ARRAY, never to its element: a bare element string is a malformed
+# array literal. Appending a text element needs a typed operand (`'c'::text`, expr/text_concat.test).
+statement error 22P02
+SELECT ARRAY['a','b'] || 'c'
+
 statement error 22P02
 SELECT id FROM t WHERE n = ANY('{1,x}')
