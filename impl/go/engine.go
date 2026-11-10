@@ -58,6 +58,8 @@ type engine struct {
 	// new committed version, so it is reachable from no live snapshot and reuse is torn-write-safe. nil
 	// for a freshly-created file (a from-scratch image leaks nothing).
 	freePages []uint32
+	// freeChain is the persisted chain freePages is a window of, or nil (PROTOTYPE, free-list-kept-chain.md).
+	freeChain *freeChain
 	// liveAtCompaction is the live (reachable) page count recorded at this handle's last within-session
 	// compaction — the cheap periodic trigger basis (v25): a bare-engine file commit re-runs the
 	// reclamation walk only once the pages off the free list pass ~2× it, mirroring storage (shared.go). 0 for an

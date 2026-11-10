@@ -192,7 +192,7 @@ func (c *sharedCore) installRole(next *serviceRole, e *engine) {
 		st.deadline.clear()
 		st.paging = e.paging
 		st.pageCount = e.pageCount
-		st.freePages = e.freePages
+		st.freePages, st.freeChain = e.freePages, e.freeChain
 		st.liveAtCompaction = e.liveAtCompaction
 		st.freeGenTxid = e.freeGenTxid
 		st.live = e.live

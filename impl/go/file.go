@@ -355,7 +355,7 @@ func (db *engine) persist(snap *snapshot) error {
 		return err
 	}
 	st := storage{
-		pageSize: db.pageSize, pageCount: db.pageCount, freePages: db.freePages,
+		pageSize: db.pageSize, pageCount: db.pageCount, freePages: db.freePages, freeChain: db.freeChain,
 		paging: db.paging, liveAtCompaction: db.liveAtCompaction, freeGenTxid: db.freeGenTxid,
 		path: db.path, dirSynced: db.dirSynced,
 	}
@@ -364,7 +364,7 @@ func (db *engine) persist(snap *snapshot) error {
 	if err != nil {
 		return err
 	}
-	db.pageCount, db.freePages = st.pageCount, st.freePages
+	db.pageCount, db.freePages, db.freeChain = st.pageCount, st.freePages, st.freeChain
 	db.liveAtCompaction, db.freeGenTxid = st.liveAtCompaction, st.freeGenTxid
 	db.live = st.live
 	return nil

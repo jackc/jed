@@ -99,7 +99,7 @@ func beginDelta(base psDeltaBase, cb psCommitBegin) (*psDelta, error) {
 		return nil, errDelta("commit_begin carries the wrong number of manifest pages")
 	}
 	last := uint32(1)
-	rootSeen, freeHeadSeen := false, m.freeListHead == 0
+	rootSeen := false
 	listed, carried := uint32(0), 0
 	list := func(entries []byte, count uint32) error {
 		for i := uint32(0); i < count; i++ {
@@ -116,7 +116,6 @@ func beginDelta(base psDeltaBase, cb psCommitBegin) (*psDelta, error) {
 				last = index
 				d.protected[index] = true
 				rootSeen = rootSeen || index == m.rootPage
-				freeHeadSeen = freeHeadSeen || index == m.freeListHead
 				listed++
 				carried++
 				continue
@@ -128,7 +127,6 @@ func beginDelta(base psDeltaBase, cb psCommitBegin) (*psDelta, error) {
 			d.expected[index] = binary.BigEndian.Uint64(e[4:])
 			d.protected[index] = true
 			rootSeen = rootSeen || index == m.rootPage
-			freeHeadSeen = freeHeadSeen || index == m.freeListHead
 			listed++
 		}
 		return nil
@@ -166,7 +164,7 @@ func beginDelta(base psDeltaBase, cb psCommitBegin) (*psDelta, error) {
 	if id != 0 || chainCRC != m.manifestCRC {
 		return nil, errDelta("the manifest chain does not match the meta")
 	}
-	if listed != m.dirtyCount || !rootSeen || !freeHeadSeen {
+	if listed != m.dirtyCount || !rootSeen {
 		return nil, errDelta("the manifest does not cover the catalog root and free-list head")
 	}
 	if carried != len(base.pending) {

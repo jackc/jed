@@ -1878,7 +1878,7 @@ func simFreeList(image []byte, ps uint32, v uint64) ([]uint32, bool) {
 		if err != nil {
 			return nil, false
 		}
-		free, err := readFreeList(newSharedPaging(p, 1), pageRef{page: m.freeListHead, tag: m.freeListTag}, m.pageCount)
+		free, _, err := readFreeList(newSharedPaging(p, 1), pageRef{page: m.freeListHead, tag: m.freeListTag}, m.freeLow, m.pageCount)
 		return free, err == nil
 	}
 	return nil, false

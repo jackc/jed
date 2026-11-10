@@ -1285,8 +1285,9 @@ func (sc *psServerConn) finishClientCommit(requestID uint32, w *psWriteTxn) erro
 		return nil
 	})
 	var free []uint32
+	var fc *freeChain
 	if err == nil {
-		free, err = readFreeList(st.paging, pageRef{page: d.m.freeListHead, tag: d.m.freeListTag}, d.m.pageCount)
+		free, fc, err = readFreeList(st.paging, pageRef{page: d.m.freeListHead, tag: d.m.freeListTag}, d.m.freeLow, d.m.pageCount)
 	}
 	if err != nil {
 		st.mu.Unlock()
@@ -1304,7 +1305,7 @@ func (sc *psServerConn) finishClientCommit(requestID uint32, w *psWriteTxn) erro
 		_ = sc.conn.Close()
 		return nil
 	}
-	st.pageCount, st.freePages = d.m.pageCount, free
+	st.pageCount, st.freePages, st.freeChain = d.m.pageCount, free, fc
 	if w.relaxed {
 		st.afterClientCommit(beganEmpty, capReached)
 	}

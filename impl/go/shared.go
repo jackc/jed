@@ -293,6 +293,7 @@ type storage struct {
 	mu        sync.Mutex // guards pageCount/freePages (the writer-gate-serialized page accounting)
 	pageSize  uint32     // fixed into the file at creation
 	pageCount uint32     // on-disk high-water; persisted in the meta slot
+	freeChain *freeChain // PROTOTYPE: the persisted chain freePages is a window of, or nil (free-list-kept-chain.md)
 	freePages []uint32   // free-list — reused lowest-first: reconstruct-on-open (P6.2) plus, for a reclaim
 	//                      domain, within-session compaction (maybeCompact); watermark-gated safe.
 	paging *sharedPaging
@@ -785,9 +786,12 @@ func (st *storage) commitFile(snap *snapshot, write incrementalWrite, live liveC
 	// delta never shrinks it, and a commit inside a relaxed batch may not cut pages the floor's batch
 	// has yet to make durable (format.md *Trailing truncation*, validated-cow.md §4).
 	truncate := !st.serviceClient && len(pending) == 0
-	plan, err := planValidatedCommit(snap, st.paging, write, st.pageSize, st.liveAtCompaction, st.freeGenTxid, canReclaim, canReuse, truncate, live.live, pending, allowed)
+	plan, err := planValidatedCommit(snap, st.paging, write, st.pageSize, st.liveAtCompaction, st.freeGenTxid, canReclaim, canReuse, truncate, live.live, pending, allowed, st.freePages, st.freeChain)
 	if err != nil {
 		return false, err
+	}
+	if expFreeCheck != nil { // EXPERIMENT
+		expFreeCheck(st.freePages, plan.free, canReclaim && (st.liveAtCompaction == 0 || reclaimDue(write.pageCount, len(write.freeRemaining), st.liveAtCompaction)), len(pending) > 0, st.serviceClient, canReuse)
 	}
 	if err := verifyLiveCount(snap, st.paging, write, live); err != nil {
 		return false, err
@@ -837,7 +841,7 @@ func (st *storage) commitFile(snap *snapshot, write incrementalWrite, live liveC
 			st.lastWritten = append(st.lastWritten, pg.index)
 		}
 	}
-	st.pageCount, st.freePages = plan.pageCount, plan.free
+	st.pageCount, st.freePages, st.freeChain = plan.pageCount, plan.free, plan.chain
 	st.liveAtCompaction, st.freeGenTxid = plan.live, plan.generation
 	st.live = live
 	if capReached {
@@ -852,7 +856,7 @@ func (st *storage) commitFile(snap *snapshot, write incrementalWrite, live liveC
 // (maybeCompact) — there is no reopen to worry about, so it need not be in-commit. Caller holds st.mu.
 func (st *storage) commitInMemory(snap *snapshot, write incrementalWrite, canReclaim bool) error {
 	// A memory store is never reopened, so its meta carries no live-page count (memory.md §8.7).
-	meta := metaPage(plainCap(st.pageSize), st.pageSize, snap.txid, write.root, write.pageCount, pageRef{}, 0)
+	meta := metaPage(plainCap(st.pageSize), st.pageSize, snap.txid, write.root, write.pageCount, pageRef{}, 0, 0)
 	if err := st.paging.withPager(func(p *pager) error {
 		if err := p.reserve(write.pageCount); err != nil {
 			return err
@@ -973,7 +977,7 @@ func (st *storage) forceCompact(prev *snapshot) (bool, error) {
 	if len(free) <= len(st.freePages) {
 		return false, nil
 	}
-	st.freePages = free
+	st.freePages, st.freeChain = free, nil
 	st.liveAtCompaction = uint32(len(reached))
 	st.freeGenTxid = prev.txid
 	return true, nil
@@ -1077,7 +1081,7 @@ func (st *storage) compact(snap *snapshot, txid uint64) (*snapshot, error) {
 	st.paging = paging
 	st.deadline.clear() // the new image is durable: no batch is pending (validated-cow.md §4.1)
 	st.pageCount = loaded.pageCount
-	st.freePages = loaded.freePages
+	st.freePages, st.freeChain = loaded.freePages, loaded.freeChain
 	st.liveAtCompaction = loaded.liveAtCompaction
 	st.freeGenTxid = loaded.freeGenTxid
 	st.live = loaded.live
@@ -1151,7 +1155,7 @@ func (st *storage) rekey(snap *snapshot, txid uint64, target *pageCodec, spill s
 	st.paging = paging
 	st.deadline.clear() // the new image is durable: no batch is pending (validated-cow.md §4.1)
 	st.pageCount = loaded.pageCount
-	st.freePages = loaded.freePages
+	st.freePages, st.freeChain = loaded.freePages, loaded.freeChain
 	st.liveAtCompaction = loaded.liveAtCompaction
 	st.freeGenTxid = loaded.freeGenTxid
 	st.live = loaded.live
@@ -1344,7 +1348,7 @@ func (st *storage) maybeCompact(snap *snapshot, catRoot pageRef, written []uint3
 			free = append(free, p)
 		}
 	}
-	st.freePages = free
+	st.freePages, st.freeChain = free, nil
 	st.liveAtCompaction = uint32(len(reached))
 	st.freeGenTxid = snap.txid // the recomputed list is proven dead at snap.txid (the reuse generation gate, §8)
 	return nil
@@ -1459,7 +1463,7 @@ func (st *storage) adoptStagedLocked(snap *snapshot, staged stagedCommit, canRec
 	st.pageCount = staged.pageCount
 	st.budget.record(staged)
 	st.stagedTxid = snap.txid
-	st.freePages = staged.freeRemaining
+	st.freePages, st.freeChain = staged.freeRemaining, nil
 	return st.maybeCompact(snap, staged.root, staged.written, canReclaim)
 }
 
@@ -1618,6 +1622,7 @@ func sharedCoreFromEngineCoordinated(e *engine, coordinator *fileCoordinator) *s
 		pageSize:  e.pageSize,
 		pageCount: e.pageCount,
 		freePages: e.freePages,
+		freeChain: e.freeChain,
 		paging:    e.paging,
 		readOnly:  e.readOnly,
 		path:      e.path,
@@ -2023,6 +2028,7 @@ func (db *Database) Attach(name string, source AttachSource, readOnly bool) erro
 			pageSize:  e.pageSize,
 			pageCount: e.pageCount,
 			freePages: e.freePages,
+			freeChain: e.freeChain,
 			paging:    e.paging,
 			readOnly:  e.readOnly,
 			path:      e.path,

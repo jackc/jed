@@ -1641,7 +1641,11 @@ func (k *integrityChecker) checkFreeList() error {
 			k.freeChain++
 			for i := uint32(0); i < pg.itemCount; i++ {
 				at := int(i) * 4
-				entries = append(entries, uint32(content[at])<<24|uint32(content[at+1])<<16|uint32(content[at+2])<<8|uint32(content[at+3]))
+				e := uint32(content[at])<<24 | uint32(content[at+1])<<16 | uint32(content[at+2])<<8 | uint32(content[at+3])
+				if e < k.gen.meta.freeLow {
+					continue // consumed since the chain was written (PROTOTYPE, free-list-kept-chain.md)
+				}
+				entries = append(entries, e)
 			}
 			p = next
 		}

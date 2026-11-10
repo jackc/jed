@@ -156,6 +156,9 @@ func TestRelaxedBatchReusesOnlyTheFloorsFreePages(t *testing.T) {
 				t.Fatalf("update %d: the free list holds pending page %d", i, f)
 			}
 		}
+		if i == 200 {
+			midway = st.pageCount
+		}
 		if len(before) == 0 || len(after) == 0 {
 			continue // the batch's first commit plans as under synchronous = on; or a cap flush followed
 		}
@@ -167,11 +170,9 @@ func TestRelaxedBatchReusesOnlyTheFloorsFreePages(t *testing.T) {
 				t.Fatalf("update %d reused page %d, which was not free at the floor", i, pg)
 			}
 		}
-		if i == 200 {
-			midway = st.pageCount
-		}
 	}
 	if st.pageCount > midway+uint32(manifestInlineCapacity(256, plainCap(256)))*2 {
+		t.Logf("pages at 200: %d, at 400: %d", midway, st.pageCount)
 		t.Fatalf("the file kept growing under relaxed churn: %d pages at update 200, %d at 400", midway, st.pageCount)
 	}
 }

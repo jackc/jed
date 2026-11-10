@@ -301,7 +301,7 @@ func (c *sharedCore) writePageIdentical(paging *sharedPaging, mt meta, pages []u
 			return err
 		}
 	}
-	bootstrap := metaPage(paging.cap(), uint32(ps), mt.txid, pageRef{page: mt.rootPage, tag: mt.rootTag}, mt.pageCount, pageRef{page: mt.freeListHead, tag: mt.freeListTag}, mt.livePages)
+	bootstrap := metaPage(paging.cap(), uint32(ps), mt.txid, pageRef{page: mt.rootPage, tag: mt.rootTag}, mt.pageCount, pageRef{page: mt.freeListHead, tag: mt.freeListTag}, mt.freeLow, mt.livePages)
 	// Each slot is sealed for its own index in an encrypted copy (encrypted.md §6).
 	for slot := uint32(0); slot < 2; slot++ {
 		m := append([]byte(nil), bootstrap...)

@@ -742,7 +742,7 @@ func (c *sharedCore) clientAdopt(r *serviceRole, incarnation id16, txid uint64, 
 	}
 	c.liveMu.Lock()
 	st.pageCount = loaded.pageCount
-	st.freePages = loaded.freePages
+	st.freePages, st.freeChain = loaded.freePages, loaded.freeChain
 	st.live = loaded.live
 	cl.incarnation, cl.adopted = incarnation, txid
 	rt := c.roots.Load()
