@@ -1776,48 +1776,47 @@ fn payload_bytes<'v>(ty: &ColType, v: &'v Value) -> Cow<'v, [u8]> {
     }
 }
 
-/// Reconstruct a value from the `P(v)` content payload gathered from its overflow chain (inverse of
-/// [`value_payload`]) — spec/design/large-values.md §12.
-fn value_from_payload(ty: &ColType, payload: &[u8]) -> Result<Value> {
+/// Reconstruct a value from the `P(v)` content payload gathered from its overflow chain or
+/// decompressed from its block (inverse of [`value_payload`]) — spec/design/large-values.md §12. A
+/// `text` / `bytea` / `json` value takes the buffer itself rather than a copy of it.
+fn value_from_payload(ty: &ColType, payload: Vec<u8>) -> Result<Value> {
     match ty {
         ColType::Scalar(s) if s.is_text() => {
-            let str =
-                String::from_utf8(payload.to_vec()).map_err(|_| corrupt("non-UTF-8 text value"))?;
+            let str = String::from_utf8(payload).map_err(|_| corrupt("non-UTF-8 text value"))?;
             Ok(Value::Text(str))
         }
-        ColType::Scalar(s) if s.is_bytea() => Ok(Value::Bytea(payload.to_vec())),
+        ColType::Scalar(s) if s.is_bytea() => Ok(Value::Bytea(payload)),
         ColType::Scalar(s) if s.is_json() => {
-            let str =
-                String::from_utf8(payload.to_vec()).map_err(|_| corrupt("non-UTF-8 json value"))?;
+            let str = String::from_utf8(payload).map_err(|_| corrupt("non-UTF-8 json value"))?;
             Ok(Value::Json(str))
         }
         ColType::Scalar(s) if s.is_jsonb() => {
             let mut pos = 0usize;
             Ok(Value::Jsonb(decode_jsonb_body(
-                payload,
+                &payload,
                 &mut pos,
                 DecodeMode::Construct,
             )?))
         }
         ColType::Scalar(s) if s.is_decimal() => {
             let mut pos = 0usize;
-            decode_decimal_body(payload, &mut pos, DecodeMode::Construct)
+            decode_decimal_body(&payload, &mut pos, DecodeMode::Construct)
         }
         // A composite's payload is its body (bitmap + present-field bodies); decode it with a
         // fresh cursor (spec/design/composite.md §4).
         ColType::Composite { .. } => {
             let mut pos = 0usize;
-            read_composite_body(ty, payload, &mut pos, DecodeMode::Construct)
+            read_composite_body(ty, &payload, &mut pos, DecodeMode::Construct)
         }
         // An array's payload is its body; decode it with a fresh cursor (spec/design/array.md §4).
         ColType::Array(elem) => {
             let mut pos = 0usize;
-            read_array_body(elem, payload, &mut pos, DecodeMode::Construct)
+            read_array_body(elem, &payload, &mut pos, DecodeMode::Construct)
         }
         // A range's payload is its body; decode it with a fresh cursor (spec/design/ranges.md §4).
         ColType::Range(elem) => {
             let mut pos = 0usize;
-            read_range_body(elem, payload, &mut pos, DecodeMode::Construct)
+            read_range_body(elem, &payload, &mut pos, DecodeMode::Construct)
         }
         _ => Err(corrupt("a non-spillable type was stored external")),
     }
@@ -4146,15 +4145,15 @@ impl ChainSource<'_> {
 
     /// The LZ4 block a compressed disposition stores: the plan's own block, or the one already on
     /// the deferred value's chain.
-    fn comp_bytes(&self, c: &CompBlock, v: &Value) -> Result<Vec<u8>> {
+    fn comp_bytes<'c>(&self, c: &'c CompBlock, v: &Value) -> Result<Cow<'c, [u8]>> {
         match (c, v) {
-            (CompBlock::Owned(b), _) => Ok(b.clone()),
+            (CompBlock::Owned(b), _) => Ok(Cow::Borrowed(b)),
             (
                 CompBlock::OnChain(_),
                 Value::Unfetched(Unfetched::ExternalComp {
                     first, stored_len, ..
                 }),
-            ) => self.read_chain(*first, *stored_len as usize),
+            ) => Ok(Cow::Owned(self.read_chain(*first, *stored_len as usize)?)),
             (CompBlock::OnChain(_), _) => Err(corrupt("a chained LZ4 block with no chain")),
         }
     }
@@ -4216,7 +4215,9 @@ fn encode_disposed_value(
             out.extend_from_slice(&first.tag[..cap.tag]);
         }
         (Disp::External, v) => {
-            let payload = value_payload(ty, &*src.resident_value(ty, v)?);
+            // A resident text / bytea / json body is written to its chain from the value itself.
+            let resident = src.resident_value(ty, v)?;
+            let payload = payload_bytes(ty, &resident);
             let first = write_overflow_chain(&payload, seal, take, ovf)?;
             out.push(TAG_EXTERNAL);
             out.extend_from_slice(&first.page.to_be_bytes());
@@ -7388,14 +7389,14 @@ fn read_value(
             let len = read_u32(buf, pos)? as usize;
             let fetch = fetch.ok_or_else(|| corrupt("external value with no overflow reader"))?;
             let payload = read_overflow_chain(first, len, fetch, plain, ovf_out)?;
-            value_from_payload(ty, &payload)
+            value_from_payload(ty, payload)
         }
         TAG_INLINE_COMP => {
             let raw_len = read_u32(buf, pos)? as usize;
             let comp_len = read_u16(buf, pos)? as usize;
             let comp = take(buf, pos, comp_len)?;
             let payload = crate::lz4::decompress(comp, raw_len)?;
-            value_from_payload(ty, &payload)
+            value_from_payload(ty, payload)
         }
         TAG_EXTERNAL_COMP => {
             let first = PageRef::plain(read_u32(buf, pos)?);
@@ -7404,7 +7405,7 @@ fn read_value(
             let fetch = fetch.ok_or_else(|| corrupt("external value with no overflow reader"))?;
             let comp = read_overflow_chain(first, stored, fetch, plain, ovf_out)?;
             let payload = crate::lz4::decompress(&comp, raw_len)?;
-            value_from_payload(ty, &payload)
+            value_from_payload(ty, payload)
         }
         _ => Err(corrupt("invalid value presence tag")),
     }
@@ -7915,11 +7916,11 @@ pub(crate) fn resolve_unfetched(
         }
         Unfetched::External { first, len, .. } => {
             let payload = read_overflow_chain(*first, *len as usize, fetch, cap, &mut sink)?;
-            value_from_payload(ty, &payload)
+            value_from_payload(ty, payload)
         }
         Unfetched::InlineComp { comp, raw_len, .. } => {
             let payload = crate::lz4::decompress(comp, *raw_len as usize)?;
-            value_from_payload(ty, &payload)
+            value_from_payload(ty, payload)
         }
         Unfetched::ExternalComp {
             first,
@@ -7929,7 +7930,7 @@ pub(crate) fn resolve_unfetched(
         } => {
             let comp = read_overflow_chain(*first, *stored_len as usize, fetch, cap, &mut sink)?;
             let payload = crate::lz4::decompress(&comp, *raw_len as usize)?;
-            value_from_payload(ty, &payload)
+            value_from_payload(ty, payload)
         }
     }
 }
