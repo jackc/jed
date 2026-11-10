@@ -2289,6 +2289,91 @@ gen = "int_uniform"
 min = 1
 max = 5000
 
+# Dedup and grouping keyed by a long text column: each of the 5k distinct 1,000–16,000-character
+# bodies is a hash key, so the work is dominated by hashing, comparing, and holding the keys.
+[[bench]]
+name = "text_distinct"
+description = "SELECT DISTINCT over 5k long-text bodies (each body a dedup key)"
+dataset = "text"
+kind = "query"
+sql = "SELECT count(*) FROM (SELECT DISTINCT body FROM docs) s"
+warmup = 2
+iterations = 10
+seed = 4818
+expect_rows_per_iter = 1
+
+[[bench]]
+name = "text_group_by"
+description = "GROUP BY a long-text body over 5k rows (each body a grouping key)"
+dataset = "text"
+kind = "query"
+sql = "SELECT count(*) FROM (SELECT body, count(*) AS n FROM docs GROUP BY body) s"
+warmup = 2
+iterations = 10
+seed = 4819
+expect_rows_per_iter = 1
+
+[[bench]]
+name = "text_union"
+description = "UNION of 5k long-text bodies with themselves (both inputs deduplicated by body)"
+dataset = "text"
+kind = "query"
+sql = "SELECT count(*) FROM (SELECT body FROM docs UNION SELECT body FROM docs) s"
+warmup = 2
+iterations = 10
+seed = 4820
+expect_rows_per_iter = 1
+
+# Large-value writes (large-values.md §12/§13): 64 rows of 256 KiB each per statement, so every value
+# is compressed or externalized by the record's disposition plan. The compressible lane stores each
+# value inline-compressed; the copy lane reads md5-concatenation bodies (compressible only about 2:1,
+# so their compressed blocks still overflow to chains) from a source table and writes them again.
+# SQLite has no repeat/md5/generate_series, so it sits these out.
+[[bench]]
+name = "large_value_insert_rollback"
+description = "INSERT of 64 compressible 256 KiB text values in one statement, rolled back each iteration"
+dataset = "scratch"
+kind = "write_rollback"
+sql = "INSERT INTO lv_dst SELECT g + $1, repeat('x', 262144) FROM generate_series(1, 64) g"
+batch = 1
+warmup = 2
+iterations = 10
+seed = 4821
+engines = ["jed", "postgres"]
+setup_sql = [
+  "DROP TABLE IF EXISTS lv_dst",
+  "CREATE TABLE lv_dst (id bigint PRIMARY KEY, body text)"
+]
+
+[[bench.param]]
+gen = "int_uniform"
+min = 0
+max = 1000
+
+[[bench]]
+name = "large_value_copy_rollback"
+description = "INSERT ... SELECT copying 64 out-of-line 256 KiB text values into another table, rolled back each iteration"
+dataset = "scratch"
+kind = "write_rollback"
+sql = "INSERT INTO lv_dst SELECT id + $1, body FROM lv_src"
+batch = 1
+warmup = 2
+iterations = 10
+seed = 4822
+engines = ["jed", "postgres"]
+setup_sql = [
+  "DROP TABLE IF EXISTS lv_src",
+  "DROP TABLE IF EXISTS lv_dst",
+  "CREATE TABLE lv_src (id bigint PRIMARY KEY, body text)",
+  "CREATE TABLE lv_dst (id bigint PRIMARY KEY, body text)",
+  "INSERT INTO lv_src SELECT g, (SELECT string_agg(md5(CAST(g * 10000 + i AS text)), '' ORDER BY i) FROM generate_series(1, 8192) i) FROM generate_series(1, 64) g"
+]
+
+[[bench.param]]
+gen = "int_uniform"
+min = 0
+max = 1000
+
 [[bench]]
 name = "cte_materialized"
 description = "Multi-reference materialized CTE: a per-customer order-count aggregate (~100k rows) buffered once and scanned by two references (spec/design/cte.md, cost.md §3 cte_scan_row)"
