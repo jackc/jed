@@ -1404,7 +1404,7 @@ func finalizeHypothetical(plan aggPlan, rows [][]Value, hyp []Value, sorts []key
 	var le int64 // rows that sort ≤ hyp (for cume_dist's rank with flag +1)
 	// The distinct strictly-before key tuples (for dense_rank), value-canonical (the group-key
 	// distinctRowKey, the same form the GROUP BY bucketing uses — collapses 1.5/1.50, NULL with NULL).
-	distinct := make(map[string]bool)
+	distinct := newKeyMap[struct{}]()
 	for _, r := range rows {
 		ord, err := hypoCmp(r, hyp, sorts)
 		if err != nil {
@@ -1414,7 +1414,7 @@ func finalizeHypothetical(plan aggPlan, rows [][]Value, hyp []Value, sorts []key
 		case ord < 0:
 			strictlyBefore++
 			le++
-			distinct[distinctRowKey(r)] = true
+			distinct.add(makeRowKey(r), struct{}{})
 		case ord == 0:
 			le++
 		}
@@ -1423,7 +1423,7 @@ func finalizeHypothetical(plan aggPlan, rows [][]Value, hyp []Value, sorts []key
 	case planHypoRank:
 		return IntValue(strictlyBefore + 1), nil
 	case planHypoDenseRank:
-		return IntValue(int64(len(distinct)) + 1), nil
+		return IntValue(int64(distinct.len()) + 1), nil
 	case planHypoPercentRank:
 		return Float64Value(float64(strictlyBefore) / float64(n)), nil
 	case planHypoCumeDist:

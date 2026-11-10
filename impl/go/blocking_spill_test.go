@@ -96,7 +96,7 @@ func TestBlockingSpoolAndHashStateStayBounded(t *testing.T) {
 	if spool.file == nil || state.disk == nil {
 		t.Fatal("did not spill")
 	}
-	if len(spool.rows) != 0 || len(state.entries) != 0 {
+	if len(spool.rows) != 0 || state.entries != nil {
 		t.Fatal("spilled owners retained resident input")
 	}
 	for i := 0; i < 500; i++ {

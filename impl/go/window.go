@@ -551,7 +551,7 @@ func applyWindowStage(rows []storedRow, specs []windowSpec, windowKeys []*rExpr,
 		// Partition the row indices by the partition-key values. The map is an index only (never
 		// iterated); output comes from the insertion-ordered `partitions` (no map-order leak). The
 		// key is the value-canonical distinctRowKey (collapses 1.5/1.50, groups NULL with NULL).
-		index := make(map[string]int)
+		index := newKeyMap[int]()
 		var partitions [][]int
 		for i := range rows {
 			key := make([]Value, len(rep.partition))
@@ -561,8 +561,8 @@ func applyWindowStage(rows []storedRow, specs []windowSpec, windowKeys []*rExpr,
 			if err := chargeHashKeys(meter, key); err != nil {
 				return err
 			}
-			k := distinctRowKey(key)
-			pi, ok := index[k]
+			k := makeRowKey(key)
+			pi, ok := index.get(k)
 			if !ok {
 				if partCharge.active() {
 					if err := partCharge.reserve(meter, memEntryBytes(key)); err != nil {
@@ -570,7 +570,7 @@ func applyWindowStage(rows []storedRow, specs []windowSpec, windowKeys []*rExpr,
 					}
 				}
 				pi = len(partitions)
-				index[k] = pi
+				index.set(k, pi)
 				partitions = append(partitions, nil)
 			}
 			partitions[pi] = append(partitions[pi], i)

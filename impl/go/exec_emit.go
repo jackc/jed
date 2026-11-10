@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"math"
 	"strconv"
-	"strings"
 	"unicode/utf8"
 )
 
@@ -1055,16 +1054,16 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 		type group struct {
 			keys []Value
 			accs []*acc
-			seen []map[string]bool
+			seen []*keyMap[struct{}]
 			// charge is the group's query-memory charge — its entry plus everything its accumulators
 			// retain (memory.md §6.2/§6.3), released when the group is finalized.
 			charge int64
 		}
-		newSeen := func() []map[string]bool {
-			s := make([]map[string]bool, len(plan.aggSpecs))
+		newSeen := func() []*keyMap[struct{}] {
+			s := make([]*keyMap[struct{}], len(plan.aggSpecs))
 			for i, spec := range plan.aggSpecs {
 				if spec.distinct {
-					s[i] = make(map[string]bool)
+					s[i] = newKeyMap[struct{}]()
 				}
 			}
 			return s
@@ -1109,7 +1108,7 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 		var groupRows []storedRow
 		for gsi := range plan.groupSets {
 			gset := &plan.groupSets[gsi]
-			index := make(map[string]int)
+			index := newKeyMap[int]()
 			var groups []group
 			// An empty grouping set (the () / whole-table grand total) is one pre-created group, so it
 			// emits ONE row even over zero input; a non-empty set over empty input emits nothing.
@@ -1122,7 +1121,7 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 					return emitter{}, err
 				}
 				groups = append(groups, group{keys: nil, accs: newAccs(), seen: newSeen(), charge: entry})
-				index[""] = 0
+				index.set(rowKey{}, 0)
 			}
 			for _, row := range rows {
 				if err := meter.Step(); err != nil { // enforce the cost ceiling per folded row (CLAUDE.md §13)
@@ -1135,8 +1134,8 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 				if err := chargeHashKeys(meter, keys); err != nil {
 					return emitter{}, err
 				}
-				k := distinctRowKey(keys)
-				gi, ok := index[k]
+				k := makeRowKey(keys)
+				gi, ok := index.get(k)
 				if !ok {
 					var entry int64
 					if meter.queryMemoryActive() {
@@ -1146,7 +1145,7 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 						return emitter{}, err
 					}
 					gi = len(groups)
-					index[k] = gi
+					index.set(k, gi)
 					groups = append(groups, group{keys: keys, accs: newAccs(), seen: newSeen(), charge: entry})
 				}
 				for i, spec := range plan.aggSpecs {
@@ -1220,11 +1219,9 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 						if err := chargeHashKey(meter, v); err != nil {
 							return emitter{}, err
 						}
-						dk := distinctRowKey([]Value{v})
-						if seen[dk] {
+						if !seen.add(makeRowKey([]Value{v}), struct{}{}) {
 							continue
 						}
-						seen[dk] = true
 						if meter.queryMemoryActive() {
 							bytes := memEntryBytes([]Value{v})
 							if err := meter.reserveQuery(bytes); err != nil {
@@ -1400,7 +1397,7 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 			// keeping the first occurrence in the (already ORDER-BY-sorted) order, then LIMIT/OFFSET.
 			// `seen` is membership-only; output order comes from the deterministic group iteration /
 			// sort, never map iteration (no map-order leak — CLAUDE.md §8/§10).
-			seen := make(map[string]bool)
+			seen := newKeyMap[struct{}]()
 			var distinctRows [][]Value
 			var seenCharge int64 // the dedup set's entries (memory.md §6.2)
 			for _, srow := range groupRows {
@@ -1415,8 +1412,7 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 				if err := chargeHashKeys(meter, projected); err != nil {
 					return emitter{}, err
 				}
-				if key := distinctRowKey(projected); !seen[key] {
-					seen[key] = true
+				if seen.add(makeRowKey(projected), struct{}{}) {
 					if meter.queryMemoryActive() {
 						bytes := memEntryBytes(projected)
 						if err := meter.reserveQuery(bytes); err != nil {
@@ -1450,7 +1446,7 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 		// keeping first occurrences. `seen` is membership-only: output order comes from the
 		// deterministic source iteration, never from map iteration (no map-order leak —
 		// CLAUDE.md §8/§10).
-		seen := make(map[string]bool)
+		seen := newKeyMap[struct{}]()
 		var distinctRows [][]Value
 		var seenCharge int64 // the dedup set's entries (memory.md §6.2)
 		for _, row := range rows {
@@ -1465,8 +1461,7 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 			if err := chargeHashKeys(meter, projected); err != nil {
 				return emitter{}, err
 			}
-			if key := distinctRowKey(projected); !seen[key] {
-				seen[key] = true
+			if seen.add(makeRowKey(projected), struct{}{}) {
 				if meter.queryMemoryActive() {
 					bytes := memEntryBytes(projected)
 					if err := meter.reserveQuery(bytes); err != nil {
@@ -2771,8 +2766,14 @@ func valueToRExpr(v Value) *rExpr {
 // dedup. Each field carries a type tag (n/i/b) and a payload, joined by a separator that
 // no field can contain, so e.g. (1,23) and (12,3) do not collide (spec/design/grammar.md
 // §11). NULL == NULL falls out (both encode to "n"), matching the NULL-safe DISTINCT rule.
+// In-memory dedup and grouping use the same encoding as a rowKey (makeRowKey), which does not copy
+// long string values; this flat form is for a spilled state map's scratch table.
 func distinctRowKey(row []Value) string {
-	var b strings.Builder
+	return makeRowKey(row).String()
+}
+
+// writeRowKey appends row's distinctRowKey encoding to b.
+func writeRowKey(b *rowKeyBuilder, row []Value) {
 	for i, v := range row {
 		if i > 0 {
 			b.WriteByte('|')
@@ -2796,7 +2797,7 @@ func distinctRowKey(row []Value) string {
 			b.WriteByte('t')
 			b.WriteString(strconv.Itoa(len(v.str())))
 			b.WriteByte(':')
-			b.WriteString(v.str())
+			b.writeBody(v.str())
 		case ValDecimal:
 			// Value-canonical key so 1.5 and 1.50 collapse to one DISTINCT bucket
 			// (spec/design/decimal.md §5).
@@ -2808,14 +2809,14 @@ func distinctRowKey(row []Value) string {
 			b.WriteByte('y')
 			b.WriteString(strconv.Itoa(len(v.str())))
 			b.WriteByte(':')
-			b.WriteString(v.str())
+			b.writeBody(v.str())
 		case ValUuid:
 			// The 16 raw bytes (held in Str), under a distinct 'u' tag so a uuid never collides
 			// with a bytea/text of the same bytes. Fixed-width, but length-prefixed for symmetry.
 			b.WriteByte('u')
 			b.WriteString(strconv.Itoa(len(v.str())))
 			b.WriteByte(':')
-			b.WriteString(v.str())
+			b.writeBody(v.str())
 		case ValTimestamp:
 			// The i64 microsecond instant (held in Int), under a distinct 's' tag. Two literals
 			// for the same instant (e.g. 12:00:00 and 12:00:00.0) share the int, so they bucket
@@ -2852,7 +2853,7 @@ func distinctRowKey(row []Value) string {
 			b.WriteByte('c')
 			b.WriteString(strconv.Itoa(len(*v.composite())))
 			b.WriteByte(':')
-			b.WriteString(distinctRowKey(*v.composite()))
+			writeRowKey(b, *v.composite())
 		case ValArray:
 			// An array keys structurally INCLUDING its shape (spec/design/array.md §5): the
 			// dims and lower bounds (so [2:4]={1,2,3} and {1,2,3} bucket apart — array_eq considers
@@ -2870,7 +2871,7 @@ func distinctRowKey(row []Value) string {
 				b.WriteString(strconv.FormatInt(int64(lb), 10))
 			}
 			b.WriteByte('=')
-			b.WriteString(distinctRowKey(a.Elements))
+			writeRowKey(b, a.Elements)
 		case ValRange:
 			// A range keys structurally over its CANONICAL form (PG range btree — spec/design/ranges.md
 			// §6), under a distinct 'r' tag: the empty flag, then each bound's presence (infinite = '_'),
@@ -2884,8 +2885,8 @@ func distinctRowKey(row []Value) string {
 				break
 			}
 			b.WriteByte('n') // non-empty marker
-			writeRangeBoundKey(&b, rv.Lower, rv.LowerInc)
-			writeRangeBoundKey(&b, rv.Upper, rv.UpperInc)
+			writeRangeBoundKey(b, rv.Lower, rv.LowerInc)
+			writeRangeBoundKey(b, rv.Upper, rv.UpperInc)
 		case ValJson:
 			// json keys on its verbatim text under a distinct 'J' tag (the value-level equality,
 			// consistent with the structural derive). Length-prefixed (arbitrary UTF-8 content).
@@ -2893,22 +2894,21 @@ func distinctRowKey(row []Value) string {
 			b.WriteByte('J')
 			b.WriteString(strconv.Itoa(len(v.str())))
 			b.WriteByte(':')
-			b.WriteString(v.str())
+			b.writeBody(v.str())
 		case ValJsonb:
 			// jsonb keys STRUCTURALLY under a distinct 'B' tag (json.go writeJsonbDistinctKey): the
 			// walk emits each number's value-canonical decimal string, so Cmp-equal documents share
 			// one DISTINCT/GROUP BY bucket (`{"a":1}` and `{"a":1.0}` are equal — json.md §5; the
 			// canonical text render keeps the scale and would split them).
 			b.WriteByte('B')
-			writeJsonbDistinctKey(&b, v.jsonb())
+			writeJsonbDistinctKey(&b.b, v.jsonb())
 		}
 	}
-	return b.String()
 }
 
 // writeRangeBoundKey appends one canonical range bound to a distinctRowKey buffer: '_' for an
 // infinite (nil) bound, else the inclusivity flag ('[' / '(') and the bound value's own recursive key.
-func writeRangeBoundKey(b *strings.Builder, bound *Value, inc bool) {
+func writeRangeBoundKey(b *rowKeyBuilder, bound *Value, inc bool) {
 	if bound == nil {
 		b.WriteByte('_')
 		return
@@ -2918,7 +2918,7 @@ func writeRangeBoundKey(b *strings.Builder, bound *Value, inc bool) {
 	} else {
 		b.WriteByte('(')
 	}
-	b.WriteString(distinctRowKey([]Value{*bound}))
+	writeRowKey(b, []Value{*bound})
 }
 
 // floatCanonicalKey is a collision-free string of a float's total-order equivalence class

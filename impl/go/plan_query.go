@@ -546,7 +546,7 @@ func (db *engine) materializeRecursive(ci int, rt *recursiveTerm,
 
 	// For UNION (distinct) a seen set drops rows duplicating any already-emitted row, keyed by the
 	// NULL-safe distinctRowKey the set operators use.
-	seen := map[string]bool{}
+	seen := newKeyMap[struct{}]()
 	// chargeKeys charges a UNION row's columns as hash_key before its duplicate check (cost.md §3
 	// "sort_key / hash_key"); UNION ALL builds no table. The charge lands on its own meter, which
 	// feeds the session's lifetime total, and in totalCost, which the statement ceiling guards.
@@ -573,12 +573,7 @@ func (db *engine) materializeRecursive(ci int, rt *recursiveTerm,
 		if rt.unionAll {
 			return true
 		}
-		k := distinctRowKey(row)
-		if seen[k] {
-			return false
-		}
-		seen[k] = true
-		return true
+		return seen.add(makeRowKey(row), struct{}{})
 	}
 	// Query-memory row accounting (memory.md §5): each term's result is charged by its own execution;
 	// a kept row's result copy is admitted, a duplicate is released, and a consumed working table is
@@ -2452,11 +2447,10 @@ func combineSetop(op setOpKind, all bool, left, right [][]Value, acct queryAccou
 		out = append(out, right...)
 		return out, nil
 	case op == setOpUnion:
-		seen := make(map[string]bool)
+		seen := newKeyMap[struct{}]()
 		out := make([][]Value, 0)
 		for _, row := range left {
-			if k := distinctRowKey(row); !seen[k] {
-				seen[k] = true
+			if seen.add(makeRowKey(row), struct{}{}) {
 				if err := entry(row); err != nil {
 					return nil, err
 				}
@@ -2464,8 +2458,7 @@ func combineSetop(op setOpKind, all bool, left, right [][]Value, acct queryAccou
 			}
 		}
 		for _, row := range right {
-			if k := distinctRowKey(row); !seen[k] {
-				seen[k] = true
+			if seen.add(makeRowKey(row), struct{}{}) {
 				if err := entry(row); err != nil {
 					return nil, err
 				}
@@ -2474,42 +2467,42 @@ func combineSetop(op setOpKind, all bool, left, right [][]Value, acct queryAccou
 		}
 		return out, nil
 	case op == setOpIntersect && all:
-		counts := make(map[string]int)
+		counts := newKeyMap[int]()
 		for _, row := range right {
-			k := distinctRowKey(row)
-			if _, ok := counts[k]; !ok {
+			k := makeRowKey(row)
+			if !counts.has(k) {
 				if err := entry(row); err != nil {
 					return nil, err
 				}
 			}
-			counts[k]++
+			n, _ := counts.get(k)
+			counts.set(k, n+1)
 		}
 		out := make([][]Value, 0)
 		for _, row := range left {
-			k := distinctRowKey(row)
-			if counts[k] > 0 {
-				counts[k]--
+			k := makeRowKey(row)
+			if n, _ := counts.get(k); n > 0 {
+				counts.set(k, n-1)
 				out = append(out, row)
 			}
 		}
 		return out, nil
 	case op == setOpIntersect:
-		rightSet := make(map[string]bool)
+		rightSet := newKeyMap[struct{}]()
 		for _, row := range right {
-			k := distinctRowKey(row)
-			if !rightSet[k] {
+			k := makeRowKey(row)
+			if !rightSet.has(k) {
 				if err := entry(row); err != nil {
 					return nil, err
 				}
-				rightSet[k] = true
+				rightSet.set(k, struct{}{})
 			}
 		}
-		emitted := make(map[string]bool)
+		emitted := newKeyMap[struct{}]()
 		out := make([][]Value, 0)
 		for _, row := range left {
-			k := distinctRowKey(row)
-			if rightSet[k] && !emitted[k] {
-				emitted[k] = true
+			k := makeRowKey(row)
+			if rightSet.has(k) && emitted.add(k, struct{}{}) {
 				if err := entry(row); err != nil {
 					return nil, err
 				}
@@ -2518,43 +2511,43 @@ func combineSetop(op setOpKind, all bool, left, right [][]Value, acct queryAccou
 		}
 		return out, nil
 	case op == setOpExcept && all:
-		counts := make(map[string]int)
+		counts := newKeyMap[int]()
 		for _, row := range right {
-			k := distinctRowKey(row)
-			if _, ok := counts[k]; !ok {
+			k := makeRowKey(row)
+			if !counts.has(k) {
 				if err := entry(row); err != nil {
 					return nil, err
 				}
 			}
-			counts[k]++
+			n, _ := counts.get(k)
+			counts.set(k, n+1)
 		}
 		out := make([][]Value, 0)
 		for _, row := range left {
-			k := distinctRowKey(row)
-			if counts[k] > 0 {
-				counts[k]--
+			k := makeRowKey(row)
+			if n, _ := counts.get(k); n > 0 {
+				counts.set(k, n-1)
 			} else {
 				out = append(out, row)
 			}
 		}
 		return out, nil
 	default: // EXCEPT, distinct
-		rightSet := make(map[string]bool)
+		rightSet := newKeyMap[struct{}]()
 		for _, row := range right {
-			k := distinctRowKey(row)
-			if !rightSet[k] {
+			k := makeRowKey(row)
+			if !rightSet.has(k) {
 				if err := entry(row); err != nil {
 					return nil, err
 				}
-				rightSet[k] = true
+				rightSet.set(k, struct{}{})
 			}
 		}
-		emitted := make(map[string]bool)
+		emitted := newKeyMap[struct{}]()
 		out := make([][]Value, 0)
 		for _, row := range left {
-			k := distinctRowKey(row)
-			if !rightSet[k] && !emitted[k] {
-				emitted[k] = true
+			k := makeRowKey(row)
+			if !rightSet.has(k) && emitted.add(k, struct{}{}) {
 				if err := entry(row); err != nil {
 					return nil, err
 				}

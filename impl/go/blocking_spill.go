@@ -169,7 +169,7 @@ type stateMap struct {
 	spill   spillHost
 	budget  int
 	bytes   int64
-	entries map[string]storedRow
+	entries *keyMap[storedRow]
 	disk    *spillTable
 	codec   spillCodec
 	charge  *stateCharge
@@ -180,7 +180,7 @@ func newStateMap(db *engine) *stateMap {
 }
 
 func newStateMapCharged(db *engine, charge *stateCharge) *stateMap {
-	return &stateMap{spill: db.spill, budget: db.session.workMem, entries: make(map[string]storedRow), charge: charge}
+	return &stateMap{spill: db.spill, budget: db.session.workMem, entries: newKeyMap[storedRow](), charge: charge}
 }
 
 func (m *stateMap) canSpill() bool { return m.budget > 0 && m.spill != nil }
@@ -206,30 +206,30 @@ func (m *stateMap) close() {
 }
 
 func (m *stateMap) get(key []Value) (storedRow, bool, error) {
-	k := distinctRowKey(key)
+	k := makeRowKey(key)
 	if m.disk != nil {
-		b, ok, err := m.disk.get(k)
+		b, ok, err := m.disk.get(k.String())
 		if err != nil || !ok {
 			return nil, false, err
 		}
 		r, err := m.codec.decode(b)
 		return r, err == nil, err
 	}
-	r, ok := m.entries[k]
+	r, ok := m.entries.get(k)
 	return r, ok, nil
 }
 
 func (m *stateMap) put(key []Value, value storedRow) error {
-	k := distinctRowKey(key)
+	k := makeRowKey(key)
 	if m.disk != nil {
-		return m.disk.set(k, m.codec.encode(value, 0))
+		return m.disk.set(k.String(), m.codec.encode(value, 0))
 	}
 	if !m.canSpill() && !m.charge.active() {
-		m.entries[k] = value
+		m.entries.set(k, value)
 		return nil
 	}
-	old, had := m.entries[k]
-	m.entries[k] = value
+	old, had := m.entries.get(k)
+	m.entries.set(k, value)
 	var delta int64
 	if had {
 		delta = memKeyBytes(value) - memKeyBytes(old)
@@ -261,10 +261,10 @@ func (m *stateMap) put(key []Value, value storedRow) error {
 	m.charge.releaseAll()
 	// Map iteration affects private disk placement only; lookup compares full keys and output
 	// order is carried by a separate first-occurrence spool.
-	for ek, v := range m.entries {
-		if err = d.set(ek, m.codec.encode(v, 0)); err != nil {
-			return err
-		}
+	if err = m.entries.each(func(ek rowKey, v storedRow) error {
+		return d.set(ek.String(), m.codec.encode(v, 0))
+	}); err != nil {
+		return err
 	}
 	m.entries = nil
 	m.bytes = 0
