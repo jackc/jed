@@ -14,6 +14,7 @@
 
 use std::fs::File;
 use std::io::{Seek, SeekFrom, Write};
+use std::sync::Arc;
 
 #[cfg(not(any(unix, windows)))]
 use std::io::Read;
@@ -28,6 +29,12 @@ pub(crate) trait BlockStore: Send {
     /// Read `len` bytes at byte `offset`. A short read past [`size`](BlockStore::size) is the host's
     /// error, surfaced as `58030 io_error` (hosts.md §2.1).
     fn read_at(&mut self, offset: u64, len: usize) -> Result<Vec<u8>>;
+    /// [`read_at`](BlockStore::read_at) as a shared, immutable buffer. A host that already holds the
+    /// bytes in that form (the in-memory host's whole-page blocks) returns them without a copy, so a
+    /// cached page shares the host's bytes; every other host reads a fresh buffer.
+    fn read_shared(&mut self, offset: u64, len: usize) -> Result<Arc<Vec<u8>>> {
+        Ok(Arc::new(self.read_at(offset, len)?))
+    }
     /// Stage a write of `bytes` at byte `offset`. **Staged, not durable** — only
     /// [`sync`](BlockStore::sync) (or the grow in [`set_size`](BlockStore::set_size)) makes a prior
     /// `write_at` durable (hosts.md §2.1). Positioned: it must not move a shared cursor.
@@ -274,40 +281,119 @@ impl BlockStore for RevokedBlockStore {
     }
 }
 
-/// The pure in-memory storage host (bplus-reshape.md B3): a growable byte vector with the same
+/// The pure in-memory storage host (bplus-reshape.md B3): a growable byte image with the same
 /// positioned-read/write and zero-fill growth semantics as a file host, but with no durability work
 /// to do. It is the block-device building block for both in-memory databases (B3) and, since the
 /// temp-blockstore slice, per-domain session-local TEMP-table stores (`Storage::new_temp`,
 /// spec/design/temp-tables.md §6) — each rides the same pager + packed-leaf read path, with
 /// within-session compaction reclaiming its copy-on-write orphans (a temp store is never reopened).
+///
+/// The image is kept in blocks of the database's page size (named by the image's meta header), so
+/// growth appends blocks instead of copying the image, and a whole-page read
+/// ([`read_shared`](BlockStore::read_shared)) returns the stored block itself: a cached leaf shares
+/// the store's bytes rather than holding a second copy. A block another holder still shares is
+/// never written in place — a write to it installs a fresh copy — so a reader keeps exactly what it
+/// read.
 pub(crate) struct MemoryBlockStore {
-    bytes: Vec<u8>,
+    /// The block size in bytes.
+    block: usize,
+    /// The image, `block` bytes per block. Bytes of the last block past `len` are zero.
+    blocks: Vec<Arc<Vec<u8>>>,
+    /// The image length in bytes.
+    len: usize,
+    /// One zero block, shared by every grown block until it is written.
+    zero: Arc<Vec<u8>>,
 }
 
+/// The block size of an image too short to name its page size (no database image yet).
+const MEMORY_DEFAULT_BLOCK: usize = 4096;
+
 impl MemoryBlockStore {
-    /// Adopt `bytes` as the initial image. The caller owns any cloning needed before construction.
+    /// Adopt `bytes` as the initial image, split into page-size blocks.
     pub(crate) fn new(bytes: Vec<u8>) -> MemoryBlockStore {
-        MemoryBlockStore { bytes }
+        // The page size is the u32 at offset 8 of the meta header (format.md), as the pager reads it.
+        let block = match bytes.get(8..12) {
+            Some(b) => {
+                let size = u32::from_be_bytes([b[0], b[1], b[2], b[3]]) as usize;
+                if (256..=65536).contains(&size) && size.is_power_of_two() {
+                    size
+                } else {
+                    MEMORY_DEFAULT_BLOCK
+                }
+            }
+            None => MEMORY_DEFAULT_BLOCK,
+        };
+        let blocks = bytes
+            .chunks(block)
+            .map(|chunk| {
+                let mut b = chunk.to_vec();
+                b.resize(block, 0);
+                Arc::new(b)
+            })
+            .collect();
+        MemoryBlockStore {
+            block,
+            blocks,
+            len: bytes.len(),
+            zero: Arc::new(vec![0; block]),
+        }
+    }
+
+    /// Grow the image to `end` bytes with zeros.
+    fn grow(&mut self, end: usize) {
+        let need = end.div_ceil(self.block);
+        while self.blocks.len() < need {
+            self.blocks.push(Arc::clone(&self.zero));
+        }
+        self.len = end;
     }
 }
 
 impl BlockStore for MemoryBlockStore {
     fn read_at(&mut self, offset: u64, len: usize) -> Result<Vec<u8>> {
         let end = checked_end(offset, len)?;
-        if end > self.bytes.len() {
+        if end > self.len {
             return Err(io_error(std::io::Error::from(
                 std::io::ErrorKind::UnexpectedEof,
             )));
         }
-        Ok(self.bytes[offset as usize..end].to_vec())
+        let mut out = Vec::with_capacity(len);
+        let mut at = offset as usize;
+        while at < end {
+            let (i, lo) = (at / self.block, at % self.block);
+            let hi = (lo + (end - at)).min(self.block);
+            out.extend_from_slice(&self.blocks[i][lo..hi]);
+            at += hi - lo;
+        }
+        Ok(out)
+    }
+
+    fn read_shared(&mut self, offset: u64, len: usize) -> Result<Arc<Vec<u8>>> {
+        let end = checked_end(offset, len)?;
+        if len == self.block && offset as usize % self.block == 0 && end <= self.len {
+            return Ok(Arc::clone(&self.blocks[offset as usize / self.block]));
+        }
+        Ok(Arc::new(self.read_at(offset, len)?))
     }
 
     fn write_at(&mut self, offset: u64, bytes: &[u8]) -> Result<()> {
         let end = checked_end(offset, bytes.len())?;
-        if end > self.bytes.len() {
-            self.bytes.resize(end, 0);
+        if end > self.len {
+            self.grow(end);
         }
-        self.bytes[offset as usize..end].copy_from_slice(bytes);
+        let mut at = offset as usize;
+        while at < end {
+            let (i, lo) = (at / self.block, at % self.block);
+            let hi = (lo + (end - at)).min(self.block);
+            let src = &bytes[at - offset as usize..at - offset as usize + (hi - lo)];
+            if hi - lo == self.block {
+                self.blocks[i] = Arc::new(src.to_vec());
+            } else {
+                // A block another holder shares is copied first (`make_mut`), so it keeps its bytes.
+                Arc::make_mut(&mut self.blocks[i])[lo..hi].copy_from_slice(src);
+            }
+            at += hi - lo;
+        }
         Ok(())
     }
 
@@ -316,7 +402,7 @@ impl BlockStore for MemoryBlockStore {
     }
 
     fn size(&mut self) -> Result<u64> {
-        Ok(self.bytes.len() as u64)
+        Ok(self.len as u64)
     }
 
     fn set_size(&mut self, bytes: u64) -> Result<()> {
@@ -326,7 +412,20 @@ impl BlockStore for MemoryBlockStore {
                 "I/O error: memory block store size overflow",
             )
         })?;
-        self.bytes.resize(bytes, 0);
+        if bytes >= self.len {
+            self.grow(bytes);
+            return Ok(());
+        }
+        self.blocks.truncate(bytes.div_ceil(self.block));
+        // Zero the cut-off tail of the last block, so a later growth reads it back as zero.
+        let tail = bytes % self.block;
+        if tail != 0
+            && let Some(last) = self.blocks.last_mut()
+            && last[tail..].iter().any(|&b| b != 0)
+        {
+            Arc::make_mut(last)[tail..].fill(0);
+        }
+        self.len = bytes;
         Ok(())
     }
 }
@@ -397,6 +496,8 @@ mod tests {
     use std::fs::OpenOptions;
     use std::io::{Seek, SeekFrom, Write};
 
+    use std::sync::Arc;
+
     use super::{BlockStore, FileBlockStore, MemoryBlockStore};
 
     #[cfg(any(unix, windows))]
@@ -447,6 +548,32 @@ mod tests {
         store.set_size(4).unwrap();
         assert_eq!(store.size().unwrap(), 4);
         assert_eq!(store.read_at(0, 4).unwrap(), vec![1, 2, 9, 8]);
+    }
+
+    // A whole-page read shares the stored block; a later write installs a fresh one, so the reader
+    // keeps what it read, and growth past a page reads back zero.
+    #[test]
+    fn memory_block_store_shares_whole_pages_and_copies_on_write() {
+        let mut image = vec![0u8; 2 * 256];
+        image[8..12].copy_from_slice(&256u32.to_be_bytes());
+        image[256] = 7;
+        let mut store = MemoryBlockStore::new(image);
+        let page = store.read_shared(256, 256).unwrap();
+        assert_eq!(page[0], 7);
+        assert!(Arc::ptr_eq(&page, &store.read_shared(256, 256).unwrap()));
+        store.write_at(257, &[9]).unwrap();
+        assert_eq!((page[0], page[1]), (7, 0));
+        assert_eq!(store.read_at(256, 2).unwrap(), vec![7, 9]);
+        store.write_at(256, &[5; 256]).unwrap();
+        assert_eq!(page[0], 7);
+        assert_eq!(store.read_shared(256, 256).unwrap()[255], 5);
+        store.set_size(300).unwrap();
+        store.set_size(1024).unwrap();
+        assert_eq!(store.read_at(296, 8).unwrap(), vec![5, 5, 5, 5, 0, 0, 0, 0]);
+        assert_eq!(store.read_at(512, 512).unwrap(), vec![0; 512]);
+        store.write_at(1000, &[1; 48]).unwrap();
+        assert_eq!(store.size().unwrap(), 1048);
+        assert_eq!(store.read_at(1020, 4).unwrap(), vec![1; 4]);
     }
 
     #[test]

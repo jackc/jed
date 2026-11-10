@@ -6134,7 +6134,7 @@ pub(crate) fn same_leaf_shape(a: &Arc<Vec<ColType>>, b: &Arc<Vec<ColType>>) -> b
 /// chain read, no decompression — resolved later only for the columns a query touches. Each
 /// weight is the bytes the record occupies on the page (exactly the writer's `record_size`).
 pub(crate) fn decode_leaf_node(
-    block: Vec<u8>,
+    block: Arc<Vec<u8>>,
     page: PageRef,
     col_types: Arc<Vec<ColType>>,
     paging: std::sync::Weak<SharedPaging>,
@@ -6152,7 +6152,7 @@ pub(crate) fn decode_leaf_node(
     // directories alone (§3) — the weight is `key_len + Σ_c value_len(c, i)` (the v24 record_size),
     // exactly what the writer split on — so the resident leaf is `≈ page_size` (§9), never an
     // inflated row vector.
-    let shared = Arc::new(block);
+    let shared = block;
     let payload = &shared[PAGE_HEADER..];
     let dirs = parse_pax_leaf(payload, n, col_types.as_slice())?;
     let packed = PackedLeaf {
@@ -9285,7 +9285,7 @@ mod tests {
         // demand by `row_at`. Reconstruction produces the same Unfetched::Inline block-slices the
         // eager fault used to, so the form-(a) sharing property still holds.
         let node = decode_leaf_node(
-            block,
+            Arc::new(block),
             PageRef::plain(2),
             Arc::new(col_types.clone()),
             std::sync::Weak::new(),
@@ -9408,7 +9408,7 @@ mod tests {
         let assert_fault_corrupt = |payload: Vec<u8>| {
             let block = make_page(8192, PAGE_LEAF, rows.len() as u32, 0, &payload);
             let err = match decode_leaf_node(
-                block,
+                Arc::new(block),
                 PageRef::plain(2),
                 Arc::new(col_types.clone()),
                 std::sync::Weak::new(),
@@ -9481,7 +9481,7 @@ mod tests {
         assert!(ovf.is_empty());
         let block = make_page(ps, PAGE_LEAF, rows.len() as u32, 0, &payload);
         let node = decode_leaf_node(
-            block,
+            Arc::new(block),
             PageRef::plain(2),
             Arc::new(col_types.clone()),
             std::sync::Weak::new(),

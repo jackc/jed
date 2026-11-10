@@ -100,6 +100,20 @@ impl SharedPaging {
         self.open_block(page, block)
     }
 
+    /// [`read_body`](Self::read_body) as a shared buffer: a plaintext page is the host's own block
+    /// when the host keeps one (the in-memory host), so a cached leaf shares it.
+    pub(crate) fn read_body_shared(&self, page: PageRef) -> Result<Arc<Vec<u8>>> {
+        let block = self
+            .pager
+            .lock()
+            .expect("pager mutex poisoned")
+            .read_block_shared(page.page)?;
+        match &self.codec {
+            None => Ok(block),
+            Some(codec) => Ok(Arc::new(codec.open_body(page.page, &block, &page.tag)?)),
+        }
+    }
+
     fn open_block(&self, page: PageRef, block: Vec<u8>) -> Result<Vec<u8>> {
         match &self.codec {
             None => Ok(block),
@@ -117,7 +131,7 @@ impl SharedPaging {
         col_types: &Arc<Vec<ColType>>,
     ) -> Result<Arc<Node>> {
         let node = self.pool.get_or_load(page.page, || {
-            let block = self.read_body(page)?;
+            let block = self.read_body_shared(page)?;
             // Packed decode (packed-leaf.md §5): retain the page block + PAX directories, decode no
             // values — a spillable value is reconstructed as an unfetched reference only when a
             // column the query touches is read. The shared `col_types` `Arc` is cloned into the leaf
@@ -161,7 +175,7 @@ impl SharedPaging {
     ) -> Result<Arc<Node>> {
         let node = self.pool.get_or_load(page.page, move || {
             crate::format::decode_leaf_node(
-                block,
+                Arc::new(block),
                 page,
                 Arc::clone(col_types),
                 Arc::downgrade(self),
@@ -218,7 +232,7 @@ impl SharedPaging {
         for (page, block) in missing.into_iter().zip(blocks) {
             let _ = self.pool.get_or_load(page.page, || {
                 crate::format::decode_leaf_node(
-                    self.open_block(page, block)?,
+                    Arc::new(self.open_block(page, block)?),
                     page,
                     Arc::clone(col_types),
                     Arc::downgrade(self),

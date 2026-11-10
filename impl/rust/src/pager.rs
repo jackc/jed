@@ -451,6 +451,15 @@ impl Pager {
         )
     }
 
+    /// [`read_block`](Pager::read_block) as a shared buffer — the in-memory host's stored block
+    /// itself, so a cached leaf does not hold a second copy of its page.
+    pub(crate) fn read_block_shared(&mut self, index: u32) -> Result<std::sync::Arc<Vec<u8>>> {
+        self.store.read_shared(
+            index as u64 * self.page_size as u64,
+            self.page_size as usize,
+        )
+    }
+
     /// Read several pages in one store request when the store batches reads (a page client,
     /// spec/design/page-service.md §5.3), page by page otherwise.
     pub(crate) fn read_blocks(&mut self, indices: &[u32]) -> Result<Vec<Vec<u8>>> {
