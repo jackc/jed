@@ -304,14 +304,14 @@ impl Parser {
             Some("commit") | Some("end") => self.parse_commit(),
             Some("rollback") => self.parse_rollback(),
             Some("savepoint") => {
-                self.advance(); // SAVEPOINT
+                self.bump(); // SAVEPOINT
                 Ok(Statement::Savepoint {
                     op: SavepointOp::Define,
                     name: self.expect_identifier()?,
                 })
             }
             Some("release") => {
-                self.advance(); // RELEASE
+                self.bump(); // RELEASE
                 Ok(Statement::Savepoint {
                     op: SavepointOp::Release,
                     name: self.parse_savepoint_name()?,
@@ -378,7 +378,7 @@ impl Parser {
     /// here* — and in a `CREATE VIEW` body 0A000, as in PostgreSQL. `TEMP`, `TEMPORARY`, `UNLOGGED`,
     /// and `TABLE` are words of the clause unless a `.` follows (a database qualifier).
     fn parse_select_into(&mut self, owner: bool) -> Result<()> {
-        self.advance(); // INTO
+        self.bump(); // INTO
         if !owner {
             let msg = if self.into_top && self.into_nest == 1 {
                 "INTO is only allowed on first SELECT of UNION/INTERSECT/EXCEPT"
@@ -398,12 +398,12 @@ impl Parser {
         };
         let temp = word(self, "temp") || word(self, "temporary");
         if temp {
-            self.advance();
+            self.bump();
         } else if word(self, "unlogged") {
             return Err(unlogged_not_supported());
         }
         if word(self, "table") {
-            self.advance();
+            self.bump();
         }
         let (db, name) = self.parse_qualified_table_name()?;
         self.select_into = Some(SelectInto { temp, db, name });
@@ -444,7 +444,7 @@ impl Parser {
         self.expect_keyword("create")?;
         let or_replace = self.peek_keyword().as_deref() == Some("or");
         if or_replace {
-            self.advance(); // OR
+            self.bump(); // OR
             self.expect_keyword("replace")?;
         }
         let temporary = matches!(
@@ -452,11 +452,11 @@ impl Parser {
             Some("temp") | Some("temporary")
         );
         if temporary {
-            self.advance();
+            self.bump();
         }
         let recursive = self.peek_keyword().as_deref() == Some("recursive");
         if recursive {
-            self.advance();
+            self.bump();
         }
         self.expect_keyword("view")?;
         // A two-token lookahead keeps a lone `if` an ordinary view name (`CREATE VIEW if AS …`).
@@ -474,10 +474,10 @@ impl Parser {
         }
         let (db, name) = self.parse_qualified_table_name()?;
         let columns = if matches!(self.peek(), Token::LParen) {
-            self.advance();
+            self.bump();
             let mut cols = vec![self.expect_identifier()?];
             while matches!(self.peek(), Token::Comma) {
-                self.advance();
+                self.bump();
                 cols.push(self.expect_identifier()?);
             }
             self.expect(&Token::RParen)?;
@@ -491,7 +491,7 @@ impl Parser {
         let options = if self.peek_keyword().as_deref() == Some("with")
             && matches!(self.peek_at(1), Token::LParen)
         {
-            self.advance(); // WITH
+            self.bump(); // WITH
             self.parse_view_options()?
         } else {
             Vec::new()
@@ -573,14 +573,14 @@ impl Parser {
         loop {
             let name = self.expect_identifier()?;
             let value = if matches!(self.peek(), Token::Eq) {
-                self.advance();
+                self.bump();
                 Some(self.parse_view_option_value()?)
             } else {
                 None
             };
             out.push(ViewOption { name, value });
             if matches!(self.peek(), Token::Comma) {
-                self.advance();
+                self.bump();
                 continue;
             }
             self.expect(&Token::RParen)?;
@@ -593,7 +593,7 @@ impl Parser {
     fn parse_view_option_value(&mut self) -> Result<String> {
         let negative = matches!(self.peek(), Token::Minus);
         if negative {
-            self.advance();
+            self.bump();
         }
         let value = match self.peek().clone() {
             Token::Word(w) | Token::QuotedIdent(w) | Token::Str(w) if !negative => w,
@@ -603,7 +603,7 @@ impl Parser {
                 return Err(syntax(format!("expected an option value, found {other:?}")));
             }
         };
-        self.advance();
+        self.bump();
         Ok(value)
     }
 
@@ -642,14 +642,14 @@ impl Parser {
         self.expect_keyword("view")?;
         let if_exists = self.peek_keyword().as_deref() == Some("if");
         if if_exists {
-            self.advance();
+            self.bump();
             self.expect_keyword("exists")?;
         }
         let (db, name) = self.parse_qualified_table_name()?;
         if self.peek_keyword().as_deref() != Some("rename") {
             let mut edits = vec![self.parse_view_edit()?];
             while matches!(self.peek(), Token::Comma) {
-                self.advance();
+                self.bump();
                 edits.push(self.parse_view_edit()?);
             }
             return Ok(AlterView {
@@ -659,13 +659,13 @@ impl Parser {
                 action: AlterViewAction::Edits(edits),
             });
         }
-        self.advance(); // RENAME
+        self.bump(); // RENAME
         let action = if self.peek_keyword().as_deref() == Some("to") {
-            self.advance();
+            self.bump();
             AlterViewAction::RenameTo(self.expect_identifier()?)
         } else {
             if self.peek_keyword().as_deref() == Some("column") {
-                self.advance();
+                self.bump();
             }
             let old = self.expect_identifier()?;
             self.expect_keyword("to")?;
@@ -684,14 +684,14 @@ impl Parser {
     fn parse_view_edit(&mut self) -> Result<ViewEdit> {
         match self.peek_keyword().as_deref() {
             Some("alter") => {
-                self.advance();
+                self.bump();
                 if self.peek_keyword().as_deref() == Some("column") {
-                    self.advance();
+                    self.bump();
                 }
                 let column = self.expect_identifier()?;
                 match self.peek_keyword().as_deref() {
                     Some("set") => {
-                        self.advance();
+                        self.bump();
                         self.expect_keyword("default")?;
                         let start = self.pos;
                         let expr = self.parse_expr()?;
@@ -702,7 +702,7 @@ impl Parser {
                         })
                     }
                     Some("drop") => {
-                        self.advance();
+                        self.bump();
                         self.expect_keyword("default")?;
                         Ok(ViewEdit::DropDefault { column })
                     }
@@ -710,11 +710,11 @@ impl Parser {
                 }
             }
             Some("set") if matches!(self.peek_at(1), Token::LParen) => {
-                self.advance();
+                self.bump();
                 Ok(ViewEdit::SetOptions(self.parse_view_options()?))
             }
             Some("reset") => {
-                self.advance();
+                self.bump();
                 let options = self.parse_view_options()?;
                 if options.iter().any(|o| o.value.is_some()) {
                     return Err(syntax("RESET must not include values for parameters"));
@@ -741,21 +741,21 @@ impl Parser {
         let if_exists = self.peek_keyword().as_deref() == Some("if")
             && self.peek_keyword_at(1).as_deref() == Some("exists");
         if if_exists {
-            self.advance(); // IF
-            self.advance(); // EXISTS
+            self.bump(); // IF
+            self.bump(); // EXISTS
         }
         let mut names = vec![self.parse_qualified_table_name()?];
         while matches!(self.peek(), Token::Comma) {
-            self.advance();
+            self.bump();
             names.push(self.parse_qualified_table_name()?);
         }
         let cascade = match self.peek_keyword().as_deref() {
             Some("cascade") => {
-                self.advance();
+                self.bump();
                 true
             }
             Some("restrict") => {
-                self.advance();
+                self.bump();
                 false
             }
             _ => false,
@@ -773,13 +773,13 @@ impl Parser {
         let (db, name) = self.parse_qualified_table_name()?;
         let mut columns = Vec::new();
         if matches!(self.peek(), Token::LParen) {
-            self.advance();
+            self.bump();
             loop {
                 columns.push(self.expect_identifier()?);
                 if !matches!(self.peek(), Token::Comma) {
                     break;
                 }
-                self.advance();
+                self.bump();
             }
             self.expect(&Token::RParen)?;
         }
@@ -796,12 +796,13 @@ impl Parser {
         self.expect_keyword("reindex")?;
         let (mut concurrently, mut verbose) = (false, false);
         if matches!(self.peek(), Token::LParen) {
-            self.advance();
+            self.bump();
             loop {
                 let name = self
                     .peek_keyword()
+                    .map(str::to_owned)
                     .ok_or_else(|| syntax("expected a REINDEX option"))?;
-                self.advance();
+                self.bump();
                 match name.as_str() {
                     "verbose" => verbose = self.parse_reindex_boolean(&name)?,
                     "concurrently" => concurrently = self.parse_reindex_boolean(&name)?,
@@ -814,13 +815,13 @@ impl Parser {
                     _ => return Err(syntax(format!("unrecognized REINDEX option \"{name}\""))),
                 }
                 if matches!(self.peek(), Token::RParen) {
-                    self.advance();
+                    self.bump();
                     break;
                 }
                 if !matches!(self.peek(), Token::Comma) {
                     return Err(syntax("expected ',' or ')' in REINDEX option list"));
                 }
-                self.advance();
+                self.bump();
             }
         }
         let kind = match self.peek_keyword().as_deref() {
@@ -840,12 +841,12 @@ impl Parser {
                 ));
             }
         };
-        self.advance();
+        self.bump();
         let relation = matches!(kind, ReindexKind::Index | ReindexKind::Table);
         if self.peek_keyword().as_deref() == Some("concurrently")
             && (!relation || is_ident(self.peek_at(1)))
         {
-            self.advance();
+            self.bump();
             concurrently = true;
         }
         let (db, name) = if relation {
@@ -884,7 +885,7 @@ impl Parser {
         };
         match value {
             Some(v) => {
-                self.advance();
+                self.bump();
                 Ok(v)
             }
             None => Err(syntax(format!("{option} requires a Boolean value"))),
@@ -897,17 +898,17 @@ impl Parser {
     fn parse_begin(&mut self) -> Result<Statement> {
         match self.peek_keyword().as_deref() {
             Some("start") => {
-                self.advance();
+                self.bump();
                 self.expect_keyword("transaction")?;
             }
             // plain BEGIN, with the optional noise word TRANSACTION | WORK
             _ => {
-                self.advance(); // BEGIN
+                self.bump(); // BEGIN
                 if matches!(
                     self.peek_keyword().as_deref(),
                     Some("transaction") | Some("work")
                 ) {
-                    self.advance();
+                    self.bump();
                 }
             }
         }
@@ -924,14 +925,14 @@ impl Parser {
         if self.peek_keyword().as_deref() != Some("read") {
             return Ok(None);
         }
-        self.advance(); // READ
+        self.bump(); // READ
         match self.peek_keyword().as_deref() {
             Some("only") => {
-                self.advance();
+                self.bump();
                 Ok(Some(false))
             }
             Some("write") => {
-                self.advance();
+                self.bump();
                 Ok(Some(true))
             }
             other => Err(syntax(format!(
@@ -942,7 +943,7 @@ impl Parser {
 
     /// `COMMIT [TRANSACTION|WORK]` / `END [TRANSACTION|WORK]` (spec/design/grammar.md §27).
     fn parse_commit(&mut self) -> Result<Statement> {
-        self.advance(); // COMMIT or END
+        self.bump(); // COMMIT or END
         self.consume_transaction_or_work();
         Ok(Statement::Commit)
     }
@@ -953,7 +954,7 @@ impl Parser {
         self.consume_transaction_or_work();
         // `ROLLBACK [TRANSACTION|WORK] TO [SAVEPOINT] name` (transactions.md §11).
         if self.peek_keyword().as_deref() == Some("to") {
-            self.advance(); // TO
+            self.bump(); // TO
             return Ok(Statement::Savepoint {
                 op: SavepointOp::RollbackTo,
                 name: self.parse_savepoint_name()?,
@@ -969,7 +970,7 @@ impl Parser {
         if self.peek_keyword().as_deref() == Some("savepoint")
             && matches!(self.peek_at(1), Token::Word(_) | Token::QuotedIdent(_))
         {
-            self.advance(); // SAVEPOINT
+            self.bump(); // SAVEPOINT
         }
         self.expect_identifier()
     }
@@ -980,7 +981,7 @@ impl Parser {
             self.peek_keyword().as_deref(),
             Some("transaction") | Some("work")
         ) {
-            self.advance();
+            self.bump();
         }
     }
 
@@ -989,7 +990,7 @@ impl Parser {
     /// restricted inner statement (a query or DML). ANALYZE is consumed positionally: no inner
     /// statement begins with the word ANALYZE, so there is no ambiguity.
     fn parse_explain(&mut self) -> Result<Statement> {
-        self.advance(); // EXPLAIN
+        self.bump(); // EXPLAIN
         let (mut analyze, mut verbose, mut costs, mut lane) = (false, false, true, false);
         let mut seen = std::collections::HashSet::new();
         let mut option_list = false;
@@ -1002,15 +1003,16 @@ impl Parser {
             || self.is_with_clause_at(self.pos + 1);
         if matches!(self.peek(), Token::LParen) && !paren_query {
             option_list = true;
-            self.advance();
+            self.bump();
             loop {
                 let name = self
                     .peek_keyword()
+                    .map(str::to_owned)
                     .ok_or_else(|| syntax("expected an EXPLAIN option"))?;
                 if !matches!(name.as_str(), "analyze" | "verbose" | "costs" | "lane") {
                     return Err(syntax(format!("unrecognized EXPLAIN option: {name}")));
                 }
-                self.advance();
+                self.bump();
                 if !seen.insert(name.clone()) {
                     return Err(syntax(format!(
                         "EXPLAIN option specified more than once: {name}"
@@ -1018,11 +1020,11 @@ impl Parser {
                 }
                 let value = match self.peek_keyword().as_deref() {
                     Some("true") | Some("on") => {
-                        self.advance();
+                        self.bump();
                         true
                     }
                     Some("false") | Some("off") => {
-                        self.advance();
+                        self.bump();
                         false
                     }
                     _ => true,
@@ -1035,13 +1037,13 @@ impl Parser {
                     _ => unreachable!(),
                 }
                 if matches!(self.peek(), Token::RParen) {
-                    self.advance();
+                    self.bump();
                     break;
                 }
                 if !matches!(self.peek(), Token::Comma) {
                     return Err(syntax("expected ',' or ')' in EXPLAIN option list"));
                 }
-                self.advance();
+                self.bump();
             }
         }
         if self.peek_keyword().as_deref() == Some("analyze") {
@@ -1050,7 +1052,7 @@ impl Parser {
                     "cannot mix EXPLAIN option list with positional ANALYZE",
                 ));
             }
-            self.advance();
+            self.bump();
             analyze = true;
         }
         let inner = self.parse_explain_inner()?;
@@ -1109,7 +1111,7 @@ impl Parser {
             Some("temp") | Some("temporary")
         );
         if temp {
-            self.advance();
+            self.bump();
         } else if self.peek_keyword().as_deref() == Some("unlogged") {
             return Err(unlogged_not_supported());
         }
@@ -1143,8 +1145,8 @@ impl Parser {
             if self.peek_keyword().as_deref() == Some("primary")
                 && self.peek_keyword_at(1).as_deref() == Some("key")
             {
-                self.advance();
-                self.advance();
+                self.bump();
+                self.bump();
                 table_pks.push(self.parse_pk_column_list()?);
             } else if self.at_check_constraint() {
                 checks.push(self.parse_check_constraint()?);
@@ -1195,8 +1197,8 @@ impl Parser {
     #[inline(never)]
     fn parse_json_query_function(&mut self, kw: &str) -> Result<Expr> {
         let pos = self.here();
-        self.advance(); // the function keyword
-        self.advance(); // (
+        self.bump(); // the function keyword
+        self.bump(); // (
         let ctx = self.parse_expr()?;
         // `FORMAT JSON` after the context item is accepted (and ignored — a text/json/jsonb
         // context is coerced to jsonb regardless).
@@ -1287,10 +1289,10 @@ impl Parser {
         if_not_exists: bool,
     ) -> Result<CreateTable> {
         let column_names = if matches!(self.peek(), Token::LParen) {
-            self.advance();
+            self.bump();
             let mut cols = vec![self.expect_identifier()?];
             while matches!(self.peek(), Token::Comma) {
-                self.advance();
+                self.bump();
                 cols.push(self.expect_identifier()?);
             }
             self.expect(&Token::RParen)?;
@@ -1361,13 +1363,13 @@ impl Parser {
         if self.peek_keyword().as_deref() != Some("on") {
             return Ok(None);
         }
-        self.advance();
+        self.bump();
         self.expect_keyword("commit")?;
         let action = match self.peek_keyword().as_deref() {
             Some("preserve") => OnCommit::PreserveRows,
             Some("delete") => OnCommit::DeleteRows,
             Some("drop") => {
-                self.advance();
+                self.bump();
                 return Ok(Some(OnCommit::Drop));
             }
             _ => {
@@ -1376,7 +1378,7 @@ impl Parser {
                 ));
             }
         };
-        self.advance();
+        self.bump();
         self.expect_keyword("rows")?;
         Ok(Some(action))
     }
@@ -1401,14 +1403,14 @@ impl Parser {
     /// (the partial form, §7.1).
     fn parse_exclusion_table_constraint(&mut self) -> Result<ExcludeDef> {
         let name = if self.peek_keyword().as_deref() == Some("constraint") {
-            self.advance();
+            self.bump();
             Some(self.expect_identifier()?)
         } else {
             None
         };
         self.expect_keyword("exclude")?;
         let using = if self.peek_keyword().as_deref() == Some("using") {
-            self.advance();
+            self.bump();
             Some(self.expect_identifier()?)
         } else {
             None
@@ -1420,7 +1422,7 @@ impl Parser {
             self.expect_keyword("with")?;
             // The operator is a single token (`=` / `&&`); render it to source text for execution.
             let start = self.pos;
-            self.advance();
+            self.bump();
             let op = render_tokens(&self.tokens[start..self.pos]);
             elements.push((col, op));
             match self.advance() {
@@ -1433,7 +1435,7 @@ impl Parser {
         // requires the parentheses. The text captured is the inner expression's (the partial-index
         // predicate's canonical form, indexes.md §9).
         let predicate = if self.peek_keyword().as_deref() == Some("where") {
-            self.advance();
+            self.bump();
             self.expect(&Token::LParen)?;
             let start = self.pos;
             let expr = self.parse_expr()?;
@@ -1468,7 +1470,7 @@ impl Parser {
     /// reuses the PRIMARY KEY list shape (spec/design/grammar.md §43).
     fn parse_foreign_key_table_constraint(&mut self) -> Result<ForeignKeyDef> {
         let name = if self.peek_keyword().as_deref() == Some("constraint") {
-            self.advance();
+            self.bump();
             Some(self.expect_identifier()?)
         } else {
             None
@@ -1502,7 +1504,7 @@ impl Parser {
         };
         let mut match_full = false;
         if self.peek_keyword().as_deref() == Some("match") {
-            self.advance();
+            self.bump();
             match self.peek_keyword().as_deref() {
                 Some("full") => match_full = true,
                 Some("simple") => {}
@@ -1514,17 +1516,17 @@ impl Parser {
                 }
                 _ => return Err(syntax("expected FULL, PARTIAL, or SIMPLE after MATCH")),
             }
-            self.advance();
+            self.bump();
         }
         let mut on_delete = RefAction::NoAction;
         let mut on_update = RefAction::NoAction;
         let mut seen_delete = false;
         let mut seen_update = false;
         while self.peek_keyword().as_deref() == Some("on") {
-            self.advance();
+            self.bump();
             match self.peek_keyword().as_deref() {
                 Some("delete") => {
-                    self.advance();
+                    self.bump();
                     if seen_delete {
                         return Err(syntax("ON DELETE specified more than once"));
                     }
@@ -1532,7 +1534,7 @@ impl Parser {
                     on_delete = self.parse_referential_action()?;
                 }
                 Some("update") => {
-                    self.advance();
+                    self.bump();
                     if seen_update {
                         return Err(syntax("ON UPDATE specified more than once"));
                     }
@@ -1559,27 +1561,27 @@ impl Parser {
     fn parse_referential_action(&mut self) -> Result<RefAction> {
         match self.peek_keyword().as_deref() {
             Some("no") => {
-                self.advance();
+                self.bump();
                 self.expect_keyword("action")?;
                 Ok(RefAction::NoAction)
             }
             Some("restrict") => {
-                self.advance();
+                self.bump();
                 Ok(RefAction::Restrict)
             }
             Some("cascade") => {
-                self.advance();
+                self.bump();
                 Ok(RefAction::Cascade)
             }
             Some("set") => {
-                self.advance();
+                self.bump();
                 match self.peek_keyword().as_deref() {
                     Some("null") => {
-                        self.advance();
+                        self.bump();
                         Ok(RefAction::SetNull)
                     }
                     Some("default") => {
-                        self.advance();
+                        self.bump();
                         Ok(RefAction::SetDefault)
                     }
                     _ => Err(syntax("expected NULL or DEFAULT after SET")),
@@ -1608,7 +1610,7 @@ impl Parser {
     /// constraint's persisted text (spec/fileformat/format.md "Check-expression text").
     fn parse_check_constraint(&mut self) -> Result<CheckDef> {
         let name = if self.peek_keyword().as_deref() == Some("constraint") {
-            self.advance();
+            self.bump();
             Some(self.expect_identifier()?)
         } else {
             None
@@ -1649,7 +1651,7 @@ impl Parser {
     /// list shape (spec/design/grammar.md §31).
     fn parse_unique_table_constraint(&mut self) -> Result<UniqueDef> {
         let name = if self.peek_keyword().as_deref() == Some("constraint") {
-            self.advance();
+            self.bump();
             Some(self.expect_identifier()?)
         } else {
             None
@@ -1716,7 +1718,7 @@ impl Parser {
             if self.peek_keyword().as_deref() == Some("constraint")
                 && self.peek_keyword_at(2).as_deref() == Some("unique")
             {
-                self.advance();
+                self.bump();
                 let cname = self.expect_identifier()?;
                 self.expect_keyword("unique")?;
                 uniques.push(UniqueDef {
@@ -1729,7 +1731,7 @@ impl Parser {
             if self.peek_keyword().as_deref() == Some("constraint")
                 && self.peek_keyword_at(2).as_deref() == Some("references")
             {
-                self.advance();
+                self.bump();
                 let cname = self.expect_identifier()?;
                 foreign_keys.push(ForeignKeyDef {
                     name: Some(cname),
@@ -1740,17 +1742,17 @@ impl Parser {
             }
             match self.peek_keyword().as_deref() {
                 Some("primary") => {
-                    self.advance();
+                    self.bump();
                     self.expect_keyword("key")?;
                     primary_key = true;
                 }
                 Some("not") => {
-                    self.advance();
+                    self.bump();
                     self.expect_keyword("null")?;
                     not_null = true;
                 }
                 Some("default") => {
-                    self.advance();
+                    self.bump();
                     // A `DEFAULT` takes any scalar expression (constraints.md §2). Capture the
                     // re-rendered token span as the persisted text (format.md
                     // "Check-expression text"), as a `CHECK` does — the executor classifies a
@@ -1765,14 +1767,14 @@ impl Parser {
                 // ("multiple identity specifications"). The desugaring (owned sequence + nextval
                 // default + NOT NULL + the type gate) is at execution.
                 Some("generated") => {
-                    self.advance();
+                    self.bump();
                     let always = match self.peek_keyword().as_deref() {
                         Some("always") => {
-                            self.advance();
+                            self.bump();
                             true
                         }
                         Some("by") => {
-                            self.advance();
+                            self.bump();
                             self.expect_keyword("default")?;
                             false
                         }
@@ -1803,11 +1805,11 @@ impl Parser {
                 // case-sensitive collation name. Validity (text-only 42804, loaded name 42704) is
                 // checked at execution against the catalog. A repeat keeps the last (like DEFAULT).
                 Some("collate") => {
-                    self.advance();
+                    self.bump();
                     collation = Some(self.expect_collation_name()?);
                 }
                 Some("unique") => {
-                    self.advance();
+                    self.bump();
                     uniques.push(UniqueDef {
                         name: None,
                         columns: vec![name.clone()],
@@ -1850,7 +1852,7 @@ impl Parser {
     fn consume_array_brackets(&mut self) -> Result<bool> {
         let mut is_array = false;
         while matches!(self.peek(), Token::LBracket) {
-            self.advance(); // [
+            self.bump(); // [
             self.expect(&Token::RBracket)?;
             is_array = true;
         }
@@ -1861,10 +1863,10 @@ impl Parser {
         if !matches!(self.peek(), Token::LParen) {
             return Ok(None);
         }
-        self.advance(); // '('
+        self.bump(); // '('
         let precision = self.expect_typmod_int()?;
         let scale = if matches!(self.peek(), Token::Comma) {
-            self.advance();
+            self.bump();
             Some(self.expect_typmod_int()?)
         } else {
             None
@@ -1900,10 +1902,10 @@ impl Parser {
             Token::Word(w) if FIELDS.contains(&w.as_str()) => w.clone(),
             _ => return Ok(None),
         };
-        self.advance();
+        self.bump();
         let mut name = first;
         if name != "second" && self.peek_keyword().as_deref() == Some("to") {
-            self.advance(); // TO
+            self.bump(); // TO
             let last = match self.advance() {
                 Token::Word(w) if FIELDS.contains(&w.as_str()) => w,
                 other => {
@@ -1918,7 +1920,7 @@ impl Parser {
             return Err(syntax(format!("invalid interval qualifier: {name}")));
         };
         let precision = if q.least == "second" && matches!(self.peek(), Token::LParen) {
-            self.advance(); // '('
+            self.bump(); // '('
             let p = self.expect_typmod_int()?;
             self.expect(&Token::RParen)?;
             Some(p)
@@ -1955,12 +1957,12 @@ impl Parser {
         let if_exists = self.peek_keyword().as_deref() == Some("if")
             && self.peek_keyword_at(1).as_deref() == Some("exists");
         if if_exists {
-            self.advance(); // IF
-            self.advance(); // EXISTS
+            self.bump(); // IF
+            self.bump(); // EXISTS
         }
         let mut names = vec![self.expect_identifier()?];
         while matches!(self.peek(), Token::Comma) {
-            self.advance();
+            self.bump();
             names.push(self.expect_identifier()?);
         }
         // The trailing dependency mode is optional; `RESTRICT` is the default (and the only
@@ -1968,11 +1970,11 @@ impl Parser {
         // (the dispatch's end-of-statement check raises 42601).
         let cascade = match self.peek_keyword().as_deref() {
             Some("cascade") => {
-                self.advance();
+                self.bump();
                 true
             }
             Some("restrict") => {
-                self.advance();
+                self.bump();
                 false
             }
             _ => false,
@@ -1993,7 +1995,7 @@ impl Parser {
         self.expect_keyword("create")?;
         let unique = self.peek_keyword().as_deref() == Some("unique");
         if unique {
-            self.advance();
+            self.bump();
         }
         self.expect_keyword("index")?;
         // `IF NOT EXISTS` (grammar.md §30) is recognized by a two-token lookahead, so a lone `if`
@@ -2029,7 +2031,7 @@ impl Parser {
         // grammar.md §30). Not reserved (recognized positionally); the method name is resolved —
         // and an unknown one rejected 42704 — at execution, not here.
         let using = if self.peek_keyword().as_deref() == Some("using") {
-            self.advance();
+            self.bump();
             Some(self.expect_identifier()?)
         } else {
             None
@@ -2050,7 +2052,7 @@ impl Parser {
         // is recognized positionally after the closing `)` (non-reserved — a column may be named
         // `where`); its text is captured for the canonical persisted form (like CHECK/DEFAULT).
         let predicate = if self.peek_keyword().as_deref() == Some("where") {
-            self.advance();
+            self.bump();
             let start = self.pos;
             let expr = self.parse_expr()?;
             let text = render_tokens(&self.tokens[start..self.pos]);
@@ -2077,24 +2079,24 @@ impl Parser {
     fn parse_index_key_order(&mut self) -> Result<IndexKeyOrderSpec> {
         let desc = match self.peek_keyword().as_deref() {
             Some("asc") => {
-                self.advance();
+                self.bump();
                 Some(false)
             }
             Some("desc") => {
-                self.advance();
+                self.bump();
                 Some(true)
             }
             _ => None,
         };
         let nulls_first = if self.peek_keyword().as_deref() == Some("nulls") {
-            self.advance();
+            self.bump();
             match self.peek_keyword().as_deref() {
                 Some("first") => {
-                    self.advance();
+                    self.bump();
                     Some(true)
                 }
                 Some("last") => {
-                    self.advance();
+                    self.bump();
                     Some(false)
                 }
                 other => {
@@ -2117,7 +2119,7 @@ impl Parser {
     fn parse_index_element(&mut self) -> Result<IndexKeyElem> {
         if matches!(self.peek(), Token::LParen) {
             // `( expr )` — any parenthesized expression.
-            self.advance();
+            self.bump();
             let start = self.pos;
             let expr = self.parse_expr()?;
             let end = self.pos;
@@ -2180,8 +2182,8 @@ impl Parser {
         if self.peek_keyword().as_deref() == Some("format")
             && self.peek_keyword_at(1).as_deref() == Some("json")
         {
-            self.advance(); // FORMAT
-            self.advance(); // JSON
+            self.bump(); // FORMAT
+            self.bump(); // JSON
             return true;
         }
         false
@@ -2195,12 +2197,12 @@ impl Parser {
         if self.peek_keyword().as_deref() != Some("passing") {
             return Ok(passing);
         }
-        self.advance(); // PASSING
+        self.bump(); // PASSING
         loop {
             let expr = self.parse_expr()?;
             let format_json = self.skip_format_json();
             let encoding = if format_json && self.peek_keyword().as_deref() == Some("encoding") {
-                self.advance(); // ENCODING
+                self.bump(); // ENCODING
                 Some(json_encoding_name(&self.expect_identifier()?)?)
             } else {
                 None
@@ -2216,7 +2218,7 @@ impl Parser {
             if !matches!(self.peek(), Token::Comma) {
                 return Ok(passing);
             }
-            self.advance();
+            self.bump();
         }
     }
 
@@ -2225,7 +2227,7 @@ impl Parser {
         if self.peek_keyword().as_deref() != Some("returning") {
             return Ok(None);
         }
-        self.advance(); // RETURNING
+        self.bump(); // RETURNING
         let ty = self.expect_type_name()?;
         self.skip_format_json();
         Ok(Some(ty))
@@ -2236,34 +2238,34 @@ impl Parser {
     fn parse_json_behavior(&mut self) -> Result<JsonOnBehavior> {
         match self.peek_keyword().as_deref() {
             Some("error") => {
-                self.advance();
+                self.bump();
                 Ok(JsonOnBehavior::Error)
             }
             Some("null") => {
-                self.advance();
+                self.bump();
                 Ok(JsonOnBehavior::Null)
             }
             Some("true") => {
-                self.advance();
+                self.bump();
                 Ok(JsonOnBehavior::True)
             }
             Some("false") => {
-                self.advance();
+                self.bump();
                 Ok(JsonOnBehavior::False)
             }
             Some("unknown") => {
-                self.advance();
+                self.bump();
                 Ok(JsonOnBehavior::Unknown)
             }
             Some("empty") => {
-                self.advance();
+                self.bump();
                 match self.peek_keyword().as_deref() {
                     Some("object") => {
-                        self.advance();
+                        self.bump();
                         Ok(JsonOnBehavior::EmptyObject)
                     }
                     Some("array") => {
-                        self.advance();
+                        self.bump();
                         Ok(JsonOnBehavior::EmptyArray)
                     }
                     // bare `EMPTY` defaults to `EMPTY ARRAY` (PostgreSQL).
@@ -2282,8 +2284,8 @@ impl Parser {
         // A behavior word followed by `ON ERROR`.
         if self.is_json_behavior_start() && self.peek_on_clause_is("error") {
             let b = self.parse_json_behavior()?;
-            self.advance(); // ON
-            self.advance(); // ERROR
+            self.bump(); // ON
+            self.bump(); // ERROR
             Ok(Some(b))
         } else {
             Ok(None)
@@ -2305,8 +2307,8 @@ impl Parser {
             }
         } else if self.is_json_behavior_start() && self.peek_on_clause_is("empty") {
             let kind = self.parse_json_behavior()?;
-            self.advance(); // ON
-            self.advance(); // EMPTY
+            self.bump(); // ON
+            self.bump(); // EMPTY
             on_empty = Some(JsonBehavior {
                 kind,
                 default: None,
@@ -2320,8 +2322,8 @@ impl Parser {
             on_error = Some(b);
         } else if self.is_json_behavior_start() && self.peek_on_clause_is("error") {
             let kind = self.parse_json_behavior()?;
-            self.advance(); // ON
-            self.advance(); // ERROR
+            self.bump(); // ON
+            self.bump(); // ERROR
             on_error = Some(JsonBehavior {
                 kind,
                 default: None,
@@ -2332,7 +2334,7 @@ impl Parser {
 
     /// Parse `DEFAULT expr` of an `ON EMPTY` / `ON ERROR` clause (the cursor at `DEFAULT`).
     fn parse_json_default_behavior(&mut self) -> Result<JsonBehavior> {
-        self.advance(); // DEFAULT
+        self.bump(); // DEFAULT
         let expr = self.parse_expr()?;
         Ok(JsonBehavior {
             kind: JsonOnBehavior::Default,
@@ -2345,11 +2347,11 @@ impl Parser {
         self.expect_keyword("on")?;
         match self.peek_keyword().as_deref() {
             Some("empty") => {
-                self.advance();
+                self.bump();
                 Ok("empty")
             }
             Some("error") => {
-                self.advance();
+                self.bump();
                 Ok("error")
             }
             _ => Err(syntax("expected EMPTY or ERROR after ON")),
@@ -2362,27 +2364,27 @@ impl Parser {
         let mut wrapper = JsonWrapper::Without;
         match self.peek_keyword().as_deref() {
             Some("with") => {
-                self.advance(); // WITH
+                self.bump(); // WITH
                 wrapper = match self.peek_keyword().as_deref() {
                     Some("conditional") => {
-                        self.advance();
+                        self.bump();
                         JsonWrapper::Conditional
                     }
                     Some("unconditional") => {
-                        self.advance();
+                        self.bump();
                         JsonWrapper::Unconditional
                     }
                     _ => JsonWrapper::Unconditional,
                 };
                 if self.peek_keyword().as_deref() == Some("array") {
-                    self.advance();
+                    self.bump();
                 }
                 self.expect_keyword("wrapper")?;
             }
             Some("without") => {
-                self.advance(); // WITHOUT
+                self.bump(); // WITHOUT
                 if self.peek_keyword().as_deref() == Some("array") {
-                    self.advance();
+                    self.bump();
                 }
                 self.expect_keyword("wrapper")?;
             }
@@ -2391,12 +2393,12 @@ impl Parser {
         let mut keep_quotes = true;
         match self.peek_keyword().as_deref() {
             Some("keep") => {
-                self.advance();
+                self.bump();
                 self.expect_keyword("quotes")?;
                 self.skip_on_scalar_string();
             }
             Some("omit") => {
-                self.advance();
+                self.bump();
                 self.expect_keyword("quotes")?;
                 self.skip_on_scalar_string();
                 keep_quotes = false;
@@ -2411,10 +2413,10 @@ impl Parser {
         if self.peek_keyword().as_deref() == Some("on")
             && self.peek_keyword_at(1).as_deref() == Some("scalar")
         {
-            self.advance(); // ON
-            self.advance(); // SCALAR
+            self.bump(); // ON
+            self.bump(); // SCALAR
             if self.peek_keyword().as_deref() == Some("string") {
-                self.advance();
+                self.bump();
             }
         }
     }
@@ -2455,7 +2457,7 @@ impl Parser {
             };
             let mut not_null = false;
             if self.peek_keyword().as_deref() == Some("not") {
-                self.advance();
+                self.bump();
                 self.expect_keyword("null")?;
                 not_null = true;
             }
@@ -2482,18 +2484,18 @@ impl Parser {
         self.expect_keyword("type")?;
         let if_exists = self.peek_keyword().as_deref() == Some("if");
         if if_exists {
-            self.advance();
+            self.bump();
             self.expect_keyword("exists")?;
         }
         let name = self.expect_identifier()?;
         // Optional trailing RESTRICT / CASCADE: CASCADE drops the dependent views (views.md §6.1).
         let cascade = match self.peek_keyword().as_deref() {
             Some("restrict") => {
-                self.advance();
+                self.bump();
                 false
             }
             Some("cascade") => {
-                self.advance();
+                self.bump();
                 true
             }
             _ => false,
@@ -2552,7 +2554,7 @@ impl Parser {
                 // `RESTART [[WITH] n]` — only on ALTER; resets the counter (sequences.md §15).
                 Some("restart") if allow_restart => {
                     self.dup_check(restart.is_some(), "RESTART")?;
-                    self.advance();
+                    self.bump();
                     let v = if matches!(self.peek(), Token::Int(_) | Token::Minus)
                         || self.peek_keyword().as_deref() == Some("with")
                     {
@@ -2586,58 +2588,58 @@ impl Parser {
             // execution. Inside an IDENTITY column's `( … )` a set `data_type` is 42601.
             Some("as") => {
                 self.dup_check(seq.data_type.is_some(), "AS")?;
-                self.advance();
+                self.bump();
                 seq.data_type = Some(self.expect_type_name()?);
             }
             Some("increment") => {
                 self.dup_check(seq.increment.is_some(), "INCREMENT")?;
-                self.advance();
+                self.bump();
                 self.consume_keyword("by");
                 seq.increment = Some(self.parse_signed_int_literal()?);
             }
             Some("minvalue") => {
                 self.dup_check(seq.min_value.is_some(), "MINVALUE")?;
-                self.advance();
+                self.bump();
                 seq.min_value = Some(Some(self.parse_signed_int_literal()?));
             }
             Some("maxvalue") => {
                 self.dup_check(seq.max_value.is_some(), "MAXVALUE")?;
-                self.advance();
+                self.bump();
                 seq.max_value = Some(Some(self.parse_signed_int_literal()?));
             }
             Some("start") => {
                 self.dup_check(seq.start.is_some(), "START")?;
-                self.advance();
+                self.bump();
                 self.consume_keyword("with");
                 seq.start = Some(self.parse_signed_int_literal()?);
             }
             Some("cache") => {
                 self.dup_check(seq.cache.is_some(), "CACHE")?;
-                self.advance();
+                self.bump();
                 seq.cache = Some(self.parse_signed_int_literal()?);
             }
             Some("cycle") => {
                 self.dup_check(seq.cycle.is_some(), "CYCLE")?;
-                self.advance();
+                self.bump();
                 seq.cycle = Some(true);
             }
             // `NO MINVALUE` / `NO MAXVALUE` / `NO CYCLE`.
             Some("no") => {
-                self.advance();
+                self.bump();
                 match self.peek_keyword().as_deref() {
                     Some("minvalue") => {
                         self.dup_check(seq.min_value.is_some(), "MINVALUE")?;
-                        self.advance();
+                        self.bump();
                         seq.min_value = Some(None);
                     }
                     Some("maxvalue") => {
                         self.dup_check(seq.max_value.is_some(), "MAXVALUE")?;
-                        self.advance();
+                        self.bump();
                         seq.max_value = Some(None);
                     }
                     Some("cycle") => {
                         self.dup_check(seq.cycle.is_some(), "CYCLE")?;
-                        self.advance();
+                        self.bump();
                         seq.cycle = Some(false);
                     }
                     other => {
@@ -2651,8 +2653,8 @@ impl Parser {
             // (42601, sequences.md §13.1).
             Some("sequence") if self.peek_keyword_at(1).as_deref() == Some("name") => {
                 self.dup_check(seq.sequence_name.is_some(), "SEQUENCE NAME")?;
-                self.advance();
-                self.advance();
+                self.bump();
+                self.bump();
                 seq.sequence_name = Some(self.expect_identifier()?);
             }
             _ => return Ok(false),
@@ -2667,21 +2669,21 @@ impl Parser {
         self.expect_keyword("sequence")?;
         let if_exists = self.peek_keyword().as_deref() == Some("if");
         if if_exists {
-            self.advance();
+            self.bump();
             self.expect_keyword("exists")?;
         }
         let mut names = vec![self.expect_identifier()?];
         while matches!(self.peek(), Token::Comma) {
-            self.advance();
+            self.bump();
             names.push(self.expect_identifier()?);
         }
         let cascade = match self.peek_keyword().as_deref() {
             Some("restrict") => {
-                self.advance();
+                self.bump();
                 false
             }
             Some("cascade") => {
-                self.advance();
+                self.bump();
                 true
             }
             _ => false,
@@ -2703,13 +2705,13 @@ impl Parser {
         self.expect_keyword("sequence")?;
         let if_exists = self.peek_keyword().as_deref() == Some("if");
         if if_exists {
-            self.advance();
+            self.bump();
             self.expect_keyword("exists")?;
         }
         let name = self.expect_identifier()?;
         let action = match self.peek_keyword().as_deref() {
             Some("rename") => {
-                self.advance();
+                self.bump();
                 self.expect_keyword("to")?;
                 AlterSeqAction::Rename(self.expect_identifier()?)
             }
@@ -2746,19 +2748,19 @@ impl Parser {
         self.expect_keyword("table")?;
         let if_exists = self.peek_keyword().as_deref() == Some("if");
         if if_exists {
-            self.advance();
+            self.bump();
             self.expect_keyword("exists")?;
         }
         let (db, name) = self.parse_qualified_table_name()?;
         let action = if self.peek_keyword().as_deref() == Some("rename") {
-            self.advance();
+            self.bump();
             match self.peek_keyword().as_deref() {
                 Some("to") => {
-                    self.advance();
+                    self.bump();
                     AlterTableAction::RenameTable(self.expect_identifier()?)
                 }
                 Some("constraint") => {
-                    self.advance();
+                    self.bump();
                     let old = self.expect_identifier()?;
                     self.expect_keyword("to")?;
                     let new = self.expect_identifier()?;
@@ -2766,7 +2768,7 @@ impl Parser {
                 }
                 _ => {
                     if self.peek_keyword().as_deref() == Some("column") {
-                        self.advance();
+                        self.bump();
                     }
                     let old = self.expect_identifier()?;
                     self.expect_keyword("to")?;
@@ -2779,13 +2781,13 @@ impl Parser {
             loop {
                 match self.peek_keyword().as_deref() {
                     Some("add") => {
-                        self.advance();
+                        self.bump();
                         let column_noise = self.peek_keyword().as_deref() == Some("column");
                         if column_noise {
-                            self.advance();
+                            self.bump();
                         }
                         let if_not_exists = if self.peek_keyword().as_deref() == Some("if") {
-                            self.advance();
+                            self.bump();
                             self.expect_keyword("not")?;
                             self.expect_keyword("exists")?;
                             true
@@ -2819,12 +2821,12 @@ impl Parser {
                             if !matches!(self.peek(), Token::Comma) {
                                 break;
                             }
-                            self.advance();
+                            self.bump();
                             continue;
                         }
                         if self.at_primary_key_table_constraint() {
                             if self.peek_keyword().as_deref() == Some("constraint") {
-                                self.advance();
+                                self.bump();
                                 self.expect_identifier()?; // jed derives the PK handle.
                             }
                             self.expect_keyword("primary")?;
@@ -2834,7 +2836,7 @@ impl Parser {
                             if !matches!(self.peek(), Token::Comma) {
                                 break;
                             }
-                            self.advance();
+                            self.bump();
                             continue;
                         }
                         let def = if self.at_check_constraint() {
@@ -2853,16 +2855,16 @@ impl Parser {
                         actions.push(AlterTableEdit::AddConstraint(def));
                     }
                     Some("drop") => {
-                        self.advance();
+                        self.bump();
                         if self.peek_keyword().as_deref() == Some("primary") {
-                            self.advance();
+                            self.bump();
                             self.expect_keyword("key")?;
                             let cascade = if self.peek_keyword().as_deref() == Some("cascade") {
-                                self.advance();
+                                self.bump();
                                 true
                             } else {
                                 if self.peek_keyword().as_deref() == Some("restrict") {
-                                    self.advance();
+                                    self.bump();
                                 }
                                 false
                             };
@@ -2870,15 +2872,15 @@ impl Parser {
                             if !matches!(self.peek(), Token::Comma) {
                                 break;
                             }
-                            self.advance();
+                            self.bump();
                             continue;
                         }
                         let constraint = self.peek_keyword().as_deref() == Some("constraint");
                         if constraint || self.peek_keyword().as_deref() == Some("column") {
-                            self.advance();
+                            self.bump();
                         }
                         let if_exists = if self.peek_keyword().as_deref() == Some("if") {
-                            self.advance();
+                            self.bump();
                             self.expect_keyword("exists")?;
                             true
                         } else {
@@ -2886,11 +2888,11 @@ impl Parser {
                         };
                         let name = self.expect_identifier()?;
                         let cascade = if self.peek_keyword().as_deref() == Some("cascade") {
-                            self.advance();
+                            self.bump();
                             true
                         } else {
                             if self.peek_keyword().as_deref() == Some("restrict") {
-                                self.advance();
+                                self.bump();
                             }
                             false
                         };
@@ -2911,7 +2913,7 @@ impl Parser {
                     _ => {
                         self.expect_keyword("alter")?;
                         if self.peek_keyword().as_deref() == Some("column") {
-                            self.advance();
+                            self.bump();
                         }
                         let column = self.expect_identifier()?;
                         let set_target = self.peek_keyword_at(1);
@@ -2928,7 +2930,7 @@ impl Parser {
                                 self.parse_alter_identity_options()?
                             }
                             Some("add") => {
-                                self.advance();
+                                self.bump();
                                 self.expect_keyword("generated")?;
                                 let always = self.parse_generated_when()?;
                                 self.expect_keyword("as")?;
@@ -2941,15 +2943,15 @@ impl Parser {
                                 AlterColumnKind::AddIdentity(IdentitySpec { always, options })
                             }
                             Some("set") => {
-                                self.advance();
+                                self.bump();
                                 if self.peek_keyword().as_deref() == Some("default") {
-                                    self.advance();
+                                    self.bump();
                                     let start = self.pos;
                                     let expr = self.parse_expr()?;
                                     let text = render_tokens(&self.tokens[start..self.pos]);
                                     AlterColumnKind::SetDefault(DefaultDef { expr, text })
                                 } else if self.peek_keyword().as_deref() == Some("data") {
-                                    self.advance();
+                                    self.bump();
                                     self.expect_keyword("type")?;
                                     self.parse_alter_column_type()?
                                 } else {
@@ -2959,15 +2961,15 @@ impl Parser {
                                 }
                             }
                             Some("drop") => {
-                                self.advance();
+                                self.bump();
                                 if self.peek_keyword().as_deref() == Some("default") {
-                                    self.advance();
+                                    self.bump();
                                     AlterColumnKind::DropDefault
                                 } else if self.peek_keyword().as_deref() == Some("identity") {
-                                    self.advance();
+                                    self.bump();
                                     let if_exists = if self.peek_keyword().as_deref() == Some("if")
                                     {
-                                        self.advance();
+                                        self.bump();
                                         self.expect_keyword("exists")?;
                                         true
                                     } else {
@@ -2981,7 +2983,7 @@ impl Parser {
                                 }
                             }
                             Some("type") => {
-                                self.advance();
+                                self.bump();
                                 self.parse_alter_column_type()?
                             }
                             other => {
@@ -2999,7 +3001,7 @@ impl Parser {
                 if !matches!(self.peek(), Token::Comma) {
                     break;
                 }
-                self.advance();
+                self.bump();
             }
             AlterTableAction::Actions(actions)
         };
@@ -3015,11 +3017,11 @@ impl Parser {
     fn parse_generated_when(&mut self) -> Result<bool> {
         match self.peek_keyword().as_deref() {
             Some("always") => {
-                self.advance();
+                self.bump();
                 Ok(true)
             }
             Some("by") => {
-                self.advance();
+                self.bump();
                 self.expect_keyword("default")?;
                 Ok(false)
             }
@@ -3041,7 +3043,7 @@ impl Parser {
             match self.peek_keyword().as_deref() {
                 Some("restart") => {
                     self.dup_check(restart.is_some(), "RESTART")?;
-                    self.advance();
+                    self.bump();
                     let v = if matches!(self.peek(), Token::Int(_) | Token::Minus)
                         || self.peek_keyword().as_deref() == Some("with")
                     {
@@ -3058,11 +3060,11 @@ impl Parser {
                         Some("default" | "data" | "not")
                     ) =>
                 {
-                    self.advance();
-                    match self.peek_keyword().as_deref() {
+                    self.bump();
+                    match self.peek_keyword().map(str::to_owned).as_deref() {
                         Some("generated") => {
                             self.dup_check(generated.is_some(), "SET GENERATED")?;
-                            self.advance();
+                            self.bump();
                             generated = Some(self.parse_generated_when()?);
                         }
                         Some(opt @ ("as" | "restart")) => {
@@ -3101,7 +3103,7 @@ impl Parser {
             base
         };
         let using = if self.peek_keyword().as_deref() == Some("using") {
-            self.advance();
+            self.bump();
             Some(self.parse_expr()?)
         } else {
             None
@@ -3116,7 +3118,7 @@ impl Parser {
     /// `IF NOT EXISTS` prefix (optional) — consumed when present.
     fn parse_if_not_exists(&mut self) -> Result<bool> {
         if self.peek_keyword().as_deref() == Some("if") {
-            self.advance();
+            self.bump();
             self.expect_keyword("not")?;
             self.expect_keyword("exists")?;
             Ok(true)
@@ -3129,7 +3131,7 @@ impl Parser {
     /// `START WITH`) when present.
     fn consume_keyword(&mut self, kw: &str) {
         if self.peek_keyword().as_deref() == Some(kw) {
-            self.advance();
+            self.bump();
         }
     }
 
@@ -3148,7 +3150,7 @@ impl Parser {
     fn parse_signed_int_literal(&mut self) -> Result<i64> {
         let neg = matches!(self.peek(), Token::Minus);
         if neg {
-            self.advance();
+            self.bump();
         }
         let m = match self.advance() {
             Token::Int(m) => m,
@@ -3177,7 +3179,7 @@ impl Parser {
         // Optional target alias `AS alias` (spec/design/upsert.md §5). PostgreSQL requires the `AS`
         // here (no implicit alias), which also keeps a column list / source keyword unambiguous.
         let alias = if self.peek_keyword().as_deref() == Some("as") {
-            self.advance();
+            self.bump();
             Some(self.expect_identifier()?)
         } else {
             None
@@ -3188,7 +3190,7 @@ impl Parser {
         // query source (`INSERT INTO t (SELECT …) UNION …` — grammar.md §24) is not a column list.
         let mut column_pos = Vec::new();
         let mut columns = if matches!(self.peek(), Token::LParen) && !self.at_insert_paren_query() {
-            self.advance(); // '('
+            self.bump(); // '('
             let mut names = Vec::new();
             loop {
                 column_pos.push(self.here());
@@ -3208,7 +3210,7 @@ impl Parser {
         // after the column list and before the source. `OVERRIDING` / `SYSTEM` / `USER` / `VALUE`
         // are non-reserved; the clause is unambiguous against a `VALUES`/`SELECT` source.
         let overriding = if self.peek_keyword().as_deref() == Some("overriding") {
-            self.advance();
+            self.bump();
             let mode = match self.peek_keyword().as_deref() {
                 Some("system") => Overriding::System,
                 Some("user") => Overriding::User,
@@ -3218,7 +3220,7 @@ impl Parser {
                     )));
                 }
             };
-            self.advance();
+            self.bump();
             self.expect_keyword("value")?;
             Some(mode)
         } else {
@@ -3235,7 +3237,7 @@ impl Parser {
                     "DEFAULT VALUES cannot be combined with a column list or OVERRIDING",
                 ));
             }
-            self.advance();
+            self.bump();
             self.expect_keyword("values")?;
             columns = Some(Vec::new());
             InsertSource::Values(vec![Vec::new()])
@@ -3288,7 +3290,7 @@ impl Parser {
             return Ok(None);
         }
         for _ in 0..parens {
-            self.advance(); // '('
+            self.bump(); // '('
             self.deepen()?;
         }
         self.expect_keyword("values")?;
@@ -3296,7 +3298,7 @@ impl Parser {
         loop {
             rows.push(self.parse_insert_row()?);
             if matches!(self.peek(), Token::Comma) {
-                self.advance();
+                self.bump();
                 continue;
             }
             break;
@@ -3362,7 +3364,7 @@ impl Parser {
     fn parse_conflict_column(&mut self) -> Result<ConflictColumn> {
         let name = self.expect_identifier()?;
         let collation = if self.peek_keyword().as_deref() == Some("collate") {
-            self.advance();
+            self.bump();
             Some(self.expect_collation_name()?)
         } else {
             None
@@ -3376,14 +3378,14 @@ impl Parser {
         };
         let ordering = matches!(self.peek_keyword().as_deref(), Some("asc" | "desc"));
         if ordering {
-            self.advance();
+            self.bump();
         }
         let nulls = self.peek_keyword().as_deref() == Some("nulls");
         if nulls {
-            self.advance();
+            self.bump();
             match self.peek_keyword().as_deref() {
                 Some("first" | "last") => {
-                    self.advance();
+                    self.bump();
                 }
                 other => {
                     return Err(syntax(format!(
@@ -3410,14 +3412,14 @@ impl Parser {
         {
             return Ok(None);
         }
-        self.advance(); // ON
-        self.advance(); // CONFLICT
+        self.bump(); // ON
+        self.bump(); // CONFLICT
 
         // Optional conflict target: a `( col, … )` column list (with an optional `WHERE
         // index_predicate`) or `ON CONSTRAINT name`.
         let mut index_predicate = None;
         let target = if matches!(self.peek(), Token::LParen) {
-            self.advance(); // '('
+            self.bump(); // '('
             let mut cols = Vec::new();
             loop {
                 cols.push(self.parse_conflict_column()?);
@@ -3430,7 +3432,7 @@ impl Parser {
             index_predicate = self.parse_optional_where()?;
             Some(ConflictTarget::Columns(cols))
         } else if self.peek_keyword().as_deref() == Some("on") {
-            self.advance(); // ON
+            self.bump(); // ON
             self.expect_keyword("constraint")?;
             Some(ConflictTarget::Constraint(self.expect_identifier()?))
         } else {
@@ -3441,11 +3443,11 @@ impl Parser {
         self.expect_keyword("do")?;
         let action = match self.peek_keyword().as_deref() {
             Some("nothing") => {
-                self.advance();
+                self.bump();
                 ConflictAction::DoNothing
             }
             Some("update") => {
-                self.advance();
+                self.bump();
                 self.expect_keyword("set")?;
                 let mut assignments = Vec::new();
                 loop {
@@ -3460,7 +3462,7 @@ impl Parser {
                         value,
                     });
                     if matches!(self.peek(), Token::Comma) {
-                        self.advance();
+                        self.bump();
                         continue;
                     }
                     break;
@@ -3525,7 +3527,7 @@ impl Parser {
     /// spec/design/api.md §5), else a literal.
     fn parse_insert_value(&mut self) -> Result<InsertValue> {
         if self.peek_keyword().as_deref() == Some("default") {
-            self.advance();
+            self.bump();
             Ok(InsertValue::Default)
         } else if self.peek_keyword().as_deref() == Some("row")
             && matches!(self.peek_at(1), Token::LParen)
@@ -3533,7 +3535,7 @@ impl Parser {
             // ROW(field, field, …) — recurse on each field (a literal, a `$N`, or a nested ROW).
             // Each constructor level is one nesting level (MAX_EXPR_DEPTH, cost.md §7).
             self.deepen()?;
-            self.advance(); // ROW
+            self.bump(); // ROW
             self.expect(&Token::LParen)?;
             let mut fields = Vec::new();
             if !matches!(self.peek(), Token::RParen) {
@@ -3548,7 +3550,7 @@ impl Parser {
                     }
                 }
             } else {
-                self.advance(); // the empty ROW() — consume ')'
+                self.bump(); // the empty ROW() — consume ')'
             }
             self.undeepen();
             Ok(InsertValue::Row(fields))
@@ -3557,7 +3559,7 @@ impl Parser {
         {
             // ARRAY[elem, …] — recurse on each element (a literal or a `$N`).
             self.deepen()?;
-            self.advance(); // ARRAY
+            self.bump(); // ARRAY
             self.expect(&Token::LBracket)?;
             let mut elems = Vec::new();
             if !matches!(self.peek(), Token::RBracket) {
@@ -3572,13 +3574,13 @@ impl Parser {
                     }
                 }
             } else {
-                self.advance(); // the empty ARRAY[] — consume ']'
+                self.bump(); // the empty ARRAY[] — consume ']'
             }
             self.undeepen();
             Ok(InsertValue::Array(elems))
         } else if let Token::Param(n) = self.peek() {
             let n = *n;
-            self.advance();
+            self.bump();
             Ok(InsertValue::Param(n))
         } else {
             let pos = self.here();
@@ -3592,7 +3594,7 @@ impl Parser {
     /// general expression (`parse_insert_slot`).
     fn parse_literal(&mut self) -> Result<Literal> {
         let negate = if matches!(self.peek(), Token::Minus) {
-            self.advance();
+            self.bump();
             true
         } else {
             false
@@ -3676,7 +3678,7 @@ impl Parser {
         // narrowing. The flag governs the whole list; whether a given CTE is *actually* recursive
         // is decided at planning by whether its body references its own name.
         let recursive = if self.peek_keyword().as_deref() == Some("recursive") {
-            self.advance();
+            self.bump();
             true
         } else {
             false
@@ -3685,7 +3687,7 @@ impl Parser {
         loop {
             ctes.push(self.parse_cte()?);
             if matches!(self.peek(), Token::Comma) {
-                self.advance();
+                self.bump();
             } else {
                 break;
             }
@@ -3714,7 +3716,10 @@ impl Parser {
     /// statement). A parenthesized query body uses `subquery_expr` and may carry a nested `WITH`;
     /// the top-level primary uses an unprefixed `query_expr`.
     fn parse_cte_body(&mut self, parenthesized: bool) -> Result<CteBody> {
-        let kw = self.peek_keyword();
+        let kw = self
+            .peek_keyword()
+            .filter(|kw| matches!(*kw, "insert" | "update" | "delete" | "merge"))
+            .map(str::to_owned);
         if matches!(
             kw.as_deref(),
             Some("insert") | Some("update") | Some("delete") | Some("merge")
@@ -3751,10 +3756,10 @@ impl Parser {
     fn parse_cte(&mut self) -> Result<Cte> {
         let name = self.expect_identifier()?;
         let columns = if matches!(self.peek(), Token::LParen) {
-            self.advance();
+            self.bump();
             let mut cols = vec![self.expect_identifier()?];
             while matches!(self.peek(), Token::Comma) {
-                self.advance();
+                self.bump();
                 cols.push(self.expect_identifier()?);
             }
             self.expect(&Token::RParen)?;
@@ -3765,12 +3770,12 @@ impl Parser {
         self.expect_keyword("as")?;
         let materialized = match self.peek_keyword().as_deref() {
             Some("materialized") => {
-                self.advance();
+                self.bump();
                 Some(true)
             }
             Some("not") if self.peek_keyword_at(1).as_deref() == Some("materialized") => {
-                self.advance();
-                self.advance();
+                self.bump();
+                self.bump();
                 Some(false)
             }
             _ => None,
@@ -3812,7 +3817,7 @@ impl Parser {
             Some("breadth") => true,
             _ => return Err(syntax("expected DEPTH or BREADTH after SEARCH".to_string())),
         };
-        self.advance();
+        self.bump();
         self.expect_keyword("first")?;
         self.expect_keyword("by")?;
         let columns = self.parse_identifier_list()?;
@@ -3835,7 +3840,7 @@ impl Parser {
         self.expect_keyword("set")?;
         let mark_column = self.expect_identifier()?;
         let (mark_value, mark_default) = if self.peek_keyword().as_deref() == Some("to") {
-            self.advance();
+            self.bump();
             let value = self.parse_cycle_mark_constant()?;
             self.expect_keyword("default")?;
             let default = self.parse_cycle_mark_constant()?;
@@ -3876,7 +3881,7 @@ impl Parser {
     fn parse_identifier_list(&mut self) -> Result<Vec<String>> {
         let mut names = vec![self.expect_identifier()?];
         while matches!(self.peek(), Token::Comma) {
-            self.advance();
+            self.bump();
             names.push(self.expect_identifier()?);
         }
         Ok(names)
@@ -3990,7 +3995,7 @@ impl Parser {
     fn parse_with_query_expr(&mut self) -> Result<QueryExpr> {
         self.expect_keyword("with")?;
         let recursive = if self.peek_keyword().as_deref() == Some("recursive") {
-            self.advance();
+            self.bump();
             true
         } else {
             false
@@ -3999,7 +4004,7 @@ impl Parser {
         loop {
             ctes.push(self.parse_cte()?);
             if matches!(self.peek(), Token::Comma) {
-                self.advance();
+                self.bump();
             } else {
                 break;
             }
@@ -4026,7 +4031,7 @@ impl Parser {
                 _ => break,
             };
             self.deepen()?; // each chained UNION/EXCEPT is one more set-op nesting level
-            self.advance(); // UNION | EXCEPT
+            self.bump(); // UNION | EXCEPT
             let all = self.parse_setop_quantifier();
             let right = self.parse_intersect_expr()?;
             left = QueryExpr::SetOp(Box::new(SetOp {
@@ -4050,7 +4055,7 @@ impl Parser {
         let mut left = self.parse_set_operand()?;
         while self.peek_keyword().as_deref() == Some("intersect") {
             self.deepen()?; // each chained INTERSECT is one more set-op nesting level
-            self.advance(); // INTERSECT
+            self.bump(); // INTERSECT
             let all = self.parse_setop_quantifier();
             let right = self.parse_set_operand()?;
             left = QueryExpr::SetOp(Box::new(SetOp {
@@ -4075,7 +4080,7 @@ impl Parser {
     /// columns are `column1`, `column2`, … and a trailing `ORDER BY` folds onto it like a `SELECT`'s.
     fn parse_set_operand(&mut self) -> Result<QueryExpr> {
         if matches!(self.peek(), Token::LParen) {
-            self.advance();
+            self.bump();
             let q = self.parse_subquery()?;
             self.expect(&Token::RParen)?;
             return Ok(q);
@@ -4094,11 +4099,11 @@ impl Parser {
     fn parse_setop_quantifier(&mut self) -> bool {
         match self.peek_keyword().as_deref() {
             Some("all") => {
-                self.advance();
+                self.bump();
                 true
             }
             Some("distinct") => {
-                self.advance();
+                self.bump();
                 false
             }
             _ => false,
@@ -4121,7 +4126,7 @@ impl Parser {
                 Some(_) => true,
             };
             if modifier {
-                self.advance();
+                self.bump();
             }
             modifier
         } else {
@@ -4141,14 +4146,14 @@ impl Parser {
             && self.peek_keyword().as_deref() == Some("on")
             && matches!(self.tokens.get(self.pos + 1), Some(Token::LParen))
         {
-            self.advance();
-            self.advance();
+            self.bump();
+            self.bump();
             loop {
                 let expr = self.parse_expr()?;
                 sel.distinct_on
                     .push(Self::classify_order_key(expr, None, false, false, true));
                 if matches!(self.peek(), Token::Comma) {
-                    self.advance();
+                    self.bump();
                     continue;
                 }
                 break;
@@ -4163,7 +4168,7 @@ impl Parser {
             self.parse_select_into(owner)?;
         }
         if self.peek_keyword().as_deref() == Some("from") {
-            self.advance(); // FROM
+            self.bump(); // FROM
             let (f, j) = self.parse_from_clause()?;
             sel.from = Some(f);
             sel.joins = j;
@@ -4191,7 +4196,7 @@ impl Parser {
         if self.peek_keyword().as_deref() != Some("window") {
             return Ok(Vec::new());
         }
-        self.advance();
+        self.bump();
         let mut windows = Vec::new();
         loop {
             let name = self.expect_identifier()?;
@@ -4201,7 +4206,7 @@ impl Parser {
             self.expect(&Token::RParen)?;
             windows.push((name, def));
             if matches!(self.peek(), Token::Comma) {
-                self.advance();
+                self.bump();
             } else {
                 break;
             }
@@ -4218,7 +4223,7 @@ impl Parser {
         let base = self.parse_opt_base_window_name();
         let mut partition = Vec::new();
         if self.peek_keyword().as_deref() == Some("partition") {
-            self.advance();
+            self.bump();
             self.expect_keyword("by")?;
             // A PARTITION BY key is a general expression (`PARTITION BY a + b`), not just a column
             // (spec/design/window.md §5.1). A bare column resolves to its slot directly; a compound
@@ -4226,7 +4231,7 @@ impl Parser {
             loop {
                 partition.push(self.parse_expr()?);
                 if matches!(self.peek(), Token::Comma) {
-                    self.advance();
+                    self.bump();
                 } else {
                     break;
                 }
@@ -4271,7 +4276,7 @@ impl Parser {
         if self.peek_keyword().as_deref() != Some("having") {
             return Ok(None);
         }
-        self.advance(); // HAVING
+        self.bump(); // HAVING
         Ok(Some(self.parse_expr()?))
     }
 
@@ -4286,13 +4291,13 @@ impl Parser {
         if self.peek_keyword().as_deref() != Some("group") {
             return Ok(Vec::new());
         }
-        self.advance(); // GROUP
+        self.bump(); // GROUP
         self.expect_keyword("by")?;
         let mut items = Vec::new();
         loop {
             items.push(self.parse_group_item()?);
             if matches!(self.peek(), Token::Comma) {
-                self.advance();
+                self.bump();
                 continue;
             }
             break;
@@ -4308,22 +4313,22 @@ impl Parser {
     fn parse_group_item(&mut self) -> Result<GroupItem> {
         match self.peek_keyword().as_deref() {
             Some("rollup") => {
-                self.advance();
+                self.bump();
                 Ok(GroupItem::Rollup(self.parse_group_set_list()?))
             }
             Some("cube") => {
-                self.advance();
+                self.bump();
                 Ok(GroupItem::Cube(self.parse_group_set_list()?))
             }
             Some("grouping") if self.peek_keyword_at(1).as_deref() == Some("sets") => {
-                self.advance(); // GROUPING
-                self.advance(); // SETS
+                self.bump(); // GROUPING
+                self.bump(); // SETS
                 self.expect(&Token::LParen)?;
                 let mut elems = Vec::new();
                 loop {
                     elems.push(self.parse_group_item()?);
                     if matches!(self.peek(), Token::Comma) {
-                        self.advance();
+                        self.bump();
                         continue;
                     }
                     break;
@@ -4343,7 +4348,7 @@ impl Parser {
         loop {
             sets.push(self.parse_group_set()?);
             if matches!(self.peek(), Token::Comma) {
-                self.advance();
+                self.bump();
                 continue;
             }
             break;
@@ -4359,13 +4364,13 @@ impl Parser {
     /// expression `(a + b)` is one term — both fall out of parsing a comma-list of expressions.
     fn parse_group_set(&mut self) -> Result<Vec<Expr>> {
         if matches!(self.peek(), Token::LParen) {
-            self.advance();
+            self.bump();
             let mut cols = Vec::new();
             if !matches!(self.peek(), Token::RParen) {
                 loop {
                     cols.push(self.parse_expr()?);
                     if matches!(self.peek(), Token::Comma) {
-                        self.advance();
+                        self.bump();
                         continue;
                     }
                     break;
@@ -4413,7 +4418,7 @@ impl Parser {
             // by `comma: true`). After the comma's table_ref, the inner loop picks up any joins of
             // the new item (`a, b JOIN c ON …`) before the next comma is considered.
             if matches!(self.peek(), Token::Comma) {
-                self.advance();
+                self.bump();
                 let item = self.parse_table_ref()?;
                 // An unaliased parenthesized join after a comma starts the new segment the same way.
                 let (table, group_joins) = splice_leading_group(item, Vec::new());
@@ -4479,7 +4484,7 @@ impl Parser {
             && (matches!(self.peek_at(1), Token::LParen)
                 || (is_ident(self.peek_at(1)) && matches!(self.peek_at(2), Token::LParen)));
         if lateral {
-            self.advance();
+            self.bump();
         }
         if matches!(self.peek(), Token::LParen) {
             let mut tr = self.parse_derived_table(lateral);
@@ -4511,7 +4516,7 @@ impl Parser {
         // — so the function `(` branch below is guarded off when a qualifier is present. Mirrors
         // `parse_column_ref`'s one-`.`-lookahead, the only dotted-name precedent.
         let db = if matches!(self.peek(), Token::Dot) {
-            self.advance(); // .
+            self.bump(); // .
             name_pos = self.pos;
             let table = self.expect_identifier()?;
             let qualifier = name;
@@ -4531,7 +4536,7 @@ impl Parser {
                     "a database-qualified name cannot be a function call",
                 ));
             }
-            self.advance();
+            self.bump();
             let mut a = Vec::new();
             let mut names: Vec<Option<String>> = Vec::new();
             loop {
@@ -4551,7 +4556,7 @@ impl Parser {
                 if !matches!(self.peek(), Token::Comma) {
                     break;
                 }
-                self.advance();
+                self.bump();
             }
             self.expect(&Token::RParen)?;
             if names.iter().any(Option::is_some) {
@@ -4566,9 +4571,9 @@ impl Parser {
         // (PostgreSQL's `func_alias_clause`); the relation keeps the function's name.
         let mut bare_defs = None;
         let alias = if self.peek_keyword().as_deref() == Some("as") {
-            self.advance();
+            self.bump();
             if args.is_some() && matches!(self.peek(), Token::LParen) {
-                self.advance(); // (
+                self.bump(); // (
                 bare_defs = Some(self.parse_field_def_list()?);
                 None
             } else {
@@ -4580,13 +4585,13 @@ impl Parser {
                 Token::QuotedIdent(w) => {
                     let alias = w.clone();
                     alias_pos = Some(self.pos);
-                    self.advance();
+                    self.bump();
                     Some(alias)
                 }
                 Token::Word(w) if !is_table_ref_stop_keyword(w) => {
                     let alias = w.clone();
                     alias_pos = Some(self.pos);
-                    self.advance();
+                    self.bump();
                     Some(alias)
                 }
                 _ => None,
@@ -4600,17 +4605,17 @@ impl Parser {
         let (column_aliases, column_defs) =
             if alias.is_some() && matches!(self.peek(), Token::LParen) && args.is_none() {
                 let open = self.pos;
-                self.advance(); // (
+                self.bump(); // (
                 let mut aliases = vec![self.expect_identifier()?];
                 while matches!(self.peek(), Token::Comma) {
-                    self.advance();
+                    self.bump();
                     aliases.push(self.expect_identifier()?);
                 }
                 list_pos = Some((open, self.pos));
                 self.expect(&Token::RParen)?;
                 (Some(aliases), None)
             } else if alias.is_some() && matches!(self.peek(), Token::LParen) {
-                self.advance(); // (
+                self.bump(); // (
                 // Disambiguate: a col-def list has `name type`; a rename list has `name ,`/`name )`.
                 // After the opening `(`, the current token is the first column name, so a `Word` in the
                 // NEXT slot means a type follows (col-def list).
@@ -4620,7 +4625,7 @@ impl Parser {
                 } else {
                     let mut aliases = vec![self.expect_identifier()?];
                     while matches!(self.peek(), Token::Comma) {
-                        self.advance();
+                        self.bump();
                         aliases.push(self.expect_identifier()?);
                     }
                     self.expect(&Token::RParen)?;
@@ -4667,7 +4672,7 @@ impl Parser {
         // Consume the opening `(`. A leading `SELECT`/`WITH` is a query-expr body; a leading `VALUES`
         // is a VALUES-body relation; any other leading `(` is a parenthesized join. The body, the
         // nesting recursion, and the alias tail each take their own frame (cost.md §7.1).
-        self.advance();
+        self.bump();
         let body = self.parse_derived_body(lateral);
         self.finish_derived_table(body)
     }
@@ -4740,18 +4745,18 @@ impl Parser {
         // The alias is optional, parsed exactly like a base table's: an explicit `AS` takes the
         // next identifier; an implicit alias is a word that is not a clause/join stop keyword.
         let alias = if self.peek_keyword().as_deref() == Some("as") {
-            self.advance();
+            self.bump();
             Some(self.expect_identifier()?)
         } else {
             match self.peek() {
                 Token::QuotedIdent(w) => {
                     let a = w.clone();
-                    self.advance();
+                    self.bump();
                     Some(a)
                 }
                 Token::Word(w) if !is_table_ref_stop_keyword(w) => {
                     let a = w.clone();
-                    self.advance();
+                    self.bump();
                     Some(a)
                 }
                 _ => None,
@@ -4761,10 +4766,10 @@ impl Parser {
         // column list with no preceding alias name, `(SELECT …) (a)`, is a syntax error: the bare
         // `(` falls through here and a later token check rejects it).
         let column_aliases = if alias.is_some() && matches!(self.peek(), Token::LParen) {
-            self.advance();
+            self.bump();
             let mut cols = vec![self.expect_identifier()?];
             while matches!(self.peek(), Token::Comma) {
-                self.advance();
+                self.bump();
                 cols.push(self.expect_identifier()?);
             }
             self.expect(&Token::RParen)?;
@@ -4801,8 +4806,8 @@ impl Parser {
     /// caller has verified the `JSON_TABLE` keyword + `(`.
     #[inline(never)]
     fn parse_json_table(&mut self) -> Result<TableRef> {
-        self.advance(); // JSON_TABLE
-        self.advance(); // (
+        self.bump(); // JSON_TABLE
+        self.bump(); // (
         let ctx = self.parse_expr()?;
         self.skip_format_json();
         self.expect(&Token::Comma)?;
@@ -4810,7 +4815,7 @@ impl Parser {
         // An optional `AS name` for the root path (the path-name) is accepted and ignored (it only
         // matters with an explicit PLAN clause, the deferred T2).
         if self.peek_keyword().as_deref() == Some("as") {
-            self.advance();
+            self.bump();
             self.expect_identifier()?;
         }
         let passing = self.parse_json_passing()?;
@@ -4825,18 +4830,18 @@ impl Parser {
         }
         self.expect(&Token::RParen)?;
         let alias = if self.peek_keyword().as_deref() == Some("as") {
-            self.advance();
+            self.bump();
             Some(self.expect_identifier()?)
         } else {
             match self.peek() {
                 Token::QuotedIdent(w) => {
                     let a = w.clone();
-                    self.advance();
+                    self.bump();
                     Some(a)
                 }
                 Token::Word(w) if !is_table_ref_stop_keyword(w) => {
                     let a = w.clone();
-                    self.advance();
+                    self.bump();
                     Some(a)
                 }
                 _ => None,
@@ -4869,7 +4874,7 @@ impl Parser {
         self.expect(&Token::LParen)?;
         let mut cols = vec![self.parse_jt_column()?];
         while matches!(self.peek(), Token::Comma) {
-            self.advance();
+            self.bump();
             cols.push(self.parse_jt_column()?);
         }
         self.expect(&Token::RParen)?;
@@ -4881,16 +4886,16 @@ impl Parser {
     /// [ON …]` column (json-table.md §3.3).
     fn parse_jt_column(&mut self) -> Result<JtColumn> {
         if self.peek_keyword().as_deref() == Some("nested") {
-            self.advance(); // NESTED
+            self.bump(); // NESTED
             if self.peek_keyword().as_deref() == Some("path") {
-                self.advance();
+                self.bump();
             }
             let path = match self.advance() {
                 Token::Str(s) => s,
                 _ => return Err(syntax("expected a string path after NESTED PATH")),
             };
             if self.peek_keyword().as_deref() == Some("as") {
-                self.advance();
+                self.bump();
                 self.expect_identifier()?;
             }
             self.expect_keyword("columns")?;
@@ -4904,14 +4909,14 @@ impl Parser {
         let name = self.expect_identifier()?;
         // `name FOR ORDINALITY`.
         if self.peek_keyword().as_deref() == Some("for") {
-            self.advance();
+            self.bump();
             self.expect_keyword("ordinality")?;
             return Ok(JtColumn::Ordinality { name });
         }
         // `name type …` — parse the type name + optional `[]`.
         let type_name = self.expect_type_name()?;
         let array = if matches!(self.peek(), Token::LBracket) {
-            self.advance();
+            self.bump();
             self.expect(&Token::RBracket)?;
             true
         } else {
@@ -4919,7 +4924,7 @@ impl Parser {
         };
         // `EXISTS` column.
         if self.peek_keyword().as_deref() == Some("exists") {
-            self.advance();
+            self.bump();
             let path = self.parse_jt_path_clause()?;
             let on_error = self.parse_json_on_error_only()?;
             return Ok(JtColumn::Exists {
@@ -4949,7 +4954,7 @@ impl Parser {
     /// Parse an optional `PATH '<string>'` clause on a JSON_TABLE column.
     fn parse_jt_path_clause(&mut self) -> Result<Option<String>> {
         if self.peek_keyword().as_deref() == Some("path") {
-            self.advance();
+            self.bump();
             match self.advance() {
                 Token::Str(s) => Ok(Some(s)),
                 _ => Err(syntax("expected a string after PATH")),
@@ -4974,13 +4979,13 @@ impl Parser {
             self.expect(&Token::LParen)?;
             let mut row = vec![self.parse_values_value()?];
             while matches!(self.peek(), Token::Comma) {
-                self.advance();
+                self.bump();
                 row.push(self.parse_values_value()?);
             }
             self.expect(&Token::RParen)?;
             rows.push(row);
             if matches!(self.peek(), Token::Comma) {
-                self.advance();
+                self.bump();
                 continue;
             }
             break;
@@ -5011,10 +5016,10 @@ impl Parser {
         // join (a `NATURAL CROSS JOIN` / bare `NATURAL <non-join>` is 42601), and takes no ON/USING.
         let natural = self.peek_keyword().as_deref() == Some("natural");
         if natural {
-            self.advance();
+            self.bump();
         }
         let kw = match self.peek_keyword() {
-            Some(k) => k,
+            Some(k) => k.to_owned(),
             None if natural => {
                 return Err(syntax("NATURAL must be followed by a join".to_string()));
             }
@@ -5023,11 +5028,11 @@ impl Parser {
         let (kind, is_cross) = match kw.as_str() {
             // A bare JOIN is INNER.
             "join" => {
-                self.advance();
+                self.bump();
                 (JoinKind::Inner, false)
             }
             "inner" => {
-                self.advance();
+                self.bump();
                 self.expect_keyword("join")?;
                 (JoinKind::Inner, false)
             }
@@ -5036,15 +5041,15 @@ impl Parser {
                 if natural {
                     return Err(syntax("NATURAL CROSS JOIN is not allowed".to_string()));
                 }
-                self.advance();
+                self.bump();
                 self.expect_keyword("join")?;
                 (JoinKind::Cross, true)
             }
             "left" | "right" | "full" => {
-                self.advance();
+                self.bump();
                 // Optional OUTER.
                 if self.peek_keyword().as_deref() == Some("outer") {
-                    self.advance();
+                    self.bump();
                 }
                 self.expect_keyword("join")?;
                 let kind = match kw.as_str() {
@@ -5066,11 +5071,11 @@ impl Parser {
         let (on, using) = if is_cross || natural {
             (None, None)
         } else if self.peek_keyword().as_deref() == Some("using") {
-            self.advance();
+            self.bump();
             self.expect(&Token::LParen)?;
             let mut cols = vec![self.expect_identifier()?];
             while matches!(self.peek(), Token::Comma) {
-                self.advance();
+                self.bump();
                 cols.push(self.expect_identifier()?);
             }
             self.expect(&Token::RParen)?;
@@ -5107,7 +5112,7 @@ impl Parser {
         if self.peek_keyword().as_deref() != Some("order") {
             return Ok(keys);
         }
-        self.advance();
+        self.bump();
         self.expect_keyword("by")?;
         loop {
             let expr = self.parse_expr()?;
@@ -5116,7 +5121,7 @@ impl Parser {
                 Self::classify_order_key(expr, collation, descending, nulls_first, allow_ordinal);
             keys.push(key);
             if matches!(self.peek(), Token::Comma) {
-                self.advance();
+                self.bump();
                 continue;
             }
             break;
@@ -5206,31 +5211,31 @@ impl Parser {
         // Optional `COLLATE "name"` on the sort key (spec/design/collation.md §1), between the key
         // and the ASC/DESC direction (PG order).
         let collation = if self.peek_keyword().as_deref() == Some("collate") {
-            self.advance();
+            self.bump();
             Some(self.expect_collation_name()?)
         } else {
             None
         };
         let descending = match self.peek_keyword().as_deref() {
             Some("asc") => {
-                self.advance();
+                self.bump();
                 false
             }
             Some("desc") => {
-                self.advance();
+                self.bump();
                 true
             }
             _ => false,
         };
         let nulls_first = if self.peek_keyword().as_deref() == Some("nulls") {
-            self.advance();
+            self.bump();
             match self.peek_keyword().as_deref() {
                 Some("first") => {
-                    self.advance();
+                    self.bump();
                     true
                 }
                 Some("last") => {
-                    self.advance();
+                    self.bump();
                     false
                 }
                 other => {
@@ -5256,7 +5261,7 @@ impl Parser {
         if self.peek_keyword().as_deref() != Some("order") {
             return Ok(keys);
         }
-        self.advance();
+        self.bump();
         self.expect_keyword("by")?;
         loop {
             let expr = self.parse_expr()?;
@@ -5268,7 +5273,7 @@ impl Parser {
                 nulls_first,
             });
             if matches!(self.peek(), Token::Comma) {
-                self.advance();
+                self.bump();
                 continue;
             }
             break;
@@ -5286,11 +5291,11 @@ impl Parser {
         loop {
             match self.peek_keyword().as_deref() {
                 Some("limit") if limit.is_none() => {
-                    self.advance();
+                    self.bump();
                     limit = Some(self.parse_count(true)?);
                 }
                 Some("offset") if offset.is_none() => {
-                    self.advance();
+                    self.bump();
                     offset = Some(self.parse_count(false)?);
                 }
                 Some("limit") => return Err(syntax("duplicate LIMIT clause")),
@@ -5307,7 +5312,7 @@ impl Parser {
     /// folds to 0 and is accepted). `is_limit` selects which structured error to raise.
     fn parse_count(&mut self, is_limit: bool) -> Result<i64> {
         let negate = if matches!(self.peek(), Token::Minus) {
-            self.advance();
+            self.bump();
             true
         } else {
             false
@@ -5351,7 +5356,7 @@ impl Parser {
                     Some("where" | "returning" | "when")
                 );
         if self.peek_keyword().as_deref() == Some("default") && next_is_terminator {
-            self.advance();
+            self.bump();
             return Ok((true, Expr::Literal(Literal::Null, SrcPos::NONE)));
         }
         Ok((false, self.parse_expr()?))
@@ -5377,7 +5382,7 @@ impl Parser {
                 value,
             });
             if matches!(self.peek(), Token::Comma) {
-                self.advance();
+                self.bump();
                 continue;
             }
             break;
@@ -5411,18 +5416,18 @@ impl Parser {
         let (db, table) = self.parse_qualified_table_name()?;
         // The target alias; `AS` is optional (PostgreSQL), so any word but USING is an alias.
         let alias = if self.peek_keyword().as_deref() == Some("as") {
-            self.advance();
+            self.bump();
             Some(self.expect_identifier()?)
         } else {
             match self.peek() {
                 Token::QuotedIdent(w) => {
                     let w = w.clone();
-                    self.advance();
+                    self.bump();
                     Some(w)
                 }
                 Token::Word(w) if !w.eq_ignore_ascii_case("using") => {
                     let w = w.clone();
-                    self.advance();
+                    self.bump();
                     Some(w)
                 }
                 _ => None,
@@ -5518,17 +5523,17 @@ impl Parser {
     fn parse_merge_clause(&mut self) -> Result<MergeClause> {
         self.expect_keyword("when")?;
         let kind = if self.peek_keyword().as_deref() == Some("not") {
-            self.advance();
+            self.bump();
             self.expect_keyword("matched")?;
             if self.peek_keyword().as_deref() == Some("by") {
-                self.advance();
+                self.bump();
                 match self.peek_keyword().as_deref() {
                     Some("source") => {
-                        self.advance();
+                        self.bump();
                         MergeMatch::NotMatchedBySource
                     }
                     Some("target") => {
-                        self.advance();
+                        self.bump();
                         MergeMatch::NotMatchedByTarget
                     }
                     _ => return Err(syntax("expected SOURCE or TARGET after NOT MATCHED BY")),
@@ -5541,7 +5546,7 @@ impl Parser {
             MergeMatch::Matched
         };
         let condition = if self.peek_keyword().as_deref() == Some("and") {
-            self.advance();
+            self.bump();
             Some(self.parse_expr()?)
         } else {
             None
@@ -5549,12 +5554,12 @@ impl Parser {
         self.expect_keyword("then")?;
         let action = match self.peek_keyword().as_deref() {
             Some("do") => {
-                self.advance();
+                self.bump();
                 self.expect_keyword("nothing")?;
                 MergeAction::DoNothing
             }
             Some("update") if kind != MergeMatch::NotMatchedByTarget => {
-                self.advance();
+                self.bump();
                 self.expect_keyword("set")?;
                 let mut assignments = Vec::new();
                 loop {
@@ -5569,7 +5574,7 @@ impl Parser {
                         value,
                     });
                     if matches!(self.peek(), Token::Comma) {
-                        self.advance();
+                        self.bump();
                         continue;
                     }
                     break;
@@ -5577,11 +5582,11 @@ impl Parser {
                 MergeAction::Update(assignments)
             }
             Some("delete") if kind != MergeMatch::NotMatchedByTarget => {
-                self.advance();
+                self.bump();
                 MergeAction::Delete
             }
             Some("insert") if kind == MergeMatch::NotMatchedByTarget => {
-                self.advance();
+                self.bump();
                 self.parse_merge_insert()?
             }
             other => {
@@ -5604,7 +5609,7 @@ impl Parser {
     fn parse_merge_insert(&mut self) -> Result<MergeAction> {
         let mut column_pos = Vec::new();
         let mut columns = if matches!(self.peek(), Token::LParen) {
-            self.advance();
+            self.bump();
             let mut names = Vec::new();
             loop {
                 column_pos.push(self.here());
@@ -5620,7 +5625,7 @@ impl Parser {
             None
         };
         let overriding = if self.peek_keyword().as_deref() == Some("overriding") {
-            self.advance();
+            self.bump();
             let mode = match self.peek_keyword().as_deref() {
                 Some("system") => Overriding::System,
                 Some("user") => Overriding::User,
@@ -5630,7 +5635,7 @@ impl Parser {
                     )));
                 }
             };
-            self.advance();
+            self.bump();
             self.expect_keyword("value")?;
             Some(mode)
         } else {
@@ -5643,7 +5648,7 @@ impl Parser {
                     "DEFAULT VALUES cannot be combined with a column list or OVERRIDING",
                 ));
             }
-            self.advance();
+            self.bump();
             self.expect_keyword("values")?;
             columns = Some(Vec::new());
         } else {
@@ -5653,7 +5658,7 @@ impl Parser {
                 let is_default = self.peek_keyword().as_deref() == Some("default")
                     && matches!(self.peek_at(1), Token::Comma | Token::RParen);
                 if is_default {
-                    self.advance();
+                    self.bump();
                     values.push(MergeValue::Default);
                 } else {
                     values.push(MergeValue::Expr(self.parse_expr()?));
@@ -5703,7 +5708,7 @@ impl Parser {
         if self.peek_keyword().as_deref() != Some("returning") {
             return Ok(None);
         }
-        self.advance(); // RETURNING
+        self.bump(); // RETURNING
         let mut old_alias = None;
         let mut new_alias = None;
         if self.peek_keyword().as_deref() == Some("with")
@@ -5714,10 +5719,10 @@ impl Parser {
             )
             && self.peek_keyword_at(3).as_deref() == Some("as")
         {
-            self.advance(); // WITH
+            self.bump(); // WITH
             self.expect(&Token::LParen)?;
             loop {
-                let version = self.peek_keyword().ok_or_else(|| {
+                let version = self.peek_keyword().map(str::to_owned).ok_or_else(|| {
                     EngineError::new(
                         SqlState::SyntaxError,
                         "expected OLD or NEW in RETURNING WITH",
@@ -5729,7 +5734,7 @@ impl Parser {
                         "expected OLD or NEW in RETURNING WITH",
                     ));
                 }
-                self.advance();
+                self.bump();
                 self.expect_keyword("as")?;
                 let alias = self.expect_identifier()?;
                 let slot = if version == "old" {
@@ -5748,7 +5753,7 @@ impl Parser {
                 }
                 *slot = Some(alias);
                 if matches!(self.peek(), Token::Comma) {
-                    self.advance();
+                    self.bump();
                     continue;
                 }
                 self.expect(&Token::RParen)?;
@@ -5767,7 +5772,7 @@ impl Parser {
     #[inline(never)]
     fn parse_optional_where(&mut self) -> Result<Option<Expr>> {
         if self.peek_keyword().as_deref() == Some("where") {
-            self.advance();
+            self.bump();
             Ok(Some(self.parse_expr()?))
         } else {
             Ok(None)
@@ -5778,7 +5783,7 @@ impl Parser {
     fn parse_select_items(&mut self) -> Result<SelectItems> {
         if matches!(self.peek(), Token::Star) {
             let pos = self.pos;
-            self.advance();
+            self.bump();
             return Ok(SelectItems::All(StarPos(Some(pos))));
         }
         let mut items = Vec::new();
@@ -5794,8 +5799,8 @@ impl Parser {
             {
                 let pos = self.pos;
                 let qualifier = self.expect_identifier()?;
-                self.advance(); // .
-                self.advance(); // *
+                self.bump(); // .
+                self.bump(); // *
                 items.push(SelectItem {
                     expr: Expr::QualifiedStar {
                         qualifier,
@@ -5804,7 +5809,7 @@ impl Parser {
                     alias: None,
                 });
                 if matches!(self.peek(), Token::Comma) {
-                    self.advance();
+                    self.bump();
                     continue;
                 }
                 break;
@@ -5816,7 +5821,7 @@ impl Parser {
             // no-bare-label set, is the label (grammar.md §8). The alias never enters resolution.
             let alias = match self.peek() {
                 Token::Word(w) if w == "as" => {
-                    self.advance();
+                    self.bump();
                     Some(self.expect_identifier()?)
                 }
                 Token::QuotedIdent(_) => Some(self.expect_identifier()?),
@@ -5825,7 +5830,7 @@ impl Parser {
             };
             items.push(SelectItem { expr, alias });
             if matches!(self.peek(), Token::Comma) {
-                self.advance();
+                self.bump();
                 continue;
             }
             break;
@@ -5867,7 +5872,7 @@ impl Parser {
         while self.peek_keyword().as_deref() == Some("or") {
             self.deepen()?; // each chained OR is one more AST level
             let pos = self.here();
-            self.advance();
+            self.bump();
             let rhs = self.parse_and()?;
             lhs = binary(BinaryOp::Or, lhs, rhs, pos);
         }
@@ -5892,7 +5897,7 @@ impl Parser {
         while self.peek_keyword().as_deref() == Some("and") {
             self.deepen()?; // each chained AND is one more AST level
             let pos = self.here();
-            self.advance();
+            self.bump();
             let rhs = self.parse_not()?;
             lhs = binary(BinaryOp::And, lhs, rhs, pos);
         }
@@ -5914,7 +5919,7 @@ impl Parser {
     #[inline(never)]
     fn parse_not_operand(&mut self) -> Result<Expr> {
         let not = self.here();
-        self.advance();
+        self.bump();
         // right-associative: NOT NOT x — each NOT is one more AST level (recursion here, so
         // the depth guard also protects the parser's own stack).
         self.deepen()?;
@@ -5976,16 +5981,16 @@ impl Parser {
         if self.peek_keyword().as_deref() == Some("is") {
             return outline(|| {
                 let is_pos = self.here();
-                self.advance();
+                self.bump();
                 let negated = if self.peek_keyword().as_deref() == Some("not") {
-                    self.advance();
+                    self.bump();
                     true
                 } else {
                     false
                 };
                 // IS [NOT] DISTINCT FROM <concat> — NULL-safe equality; else IS [NOT] NULL.
                 if self.peek_keyword().as_deref() == Some("distinct") {
-                    self.advance();
+                    self.bump();
                     self.expect_keyword("from")?;
                     let rhs = self.parse_concat()?;
                     return Ok(Expr::IsDistinctFrom {
@@ -5998,22 +6003,22 @@ impl Parser {
                 // IS [NOT] JSON [VALUE|SCALAR|ARRAY|OBJECT] [(WITH|WITHOUT) UNIQUE [KEYS]] — the SQL/JSON
                 // well-formedness predicate (json-sql-functions.md §5).
                 if self.peek_keyword().as_deref() == Some("json") {
-                    self.advance();
+                    self.bump();
                     let kind = match self.peek_keyword().as_deref() {
                         Some("value") => {
-                            self.advance();
+                            self.bump();
                             JsonPredicateKind::Value
                         }
                         Some("scalar") => {
-                            self.advance();
+                            self.bump();
                             JsonPredicateKind::Scalar
                         }
                         Some("array") => {
-                            self.advance();
+                            self.bump();
                             JsonPredicateKind::Array
                         }
                         Some("object") => {
-                            self.advance();
+                            self.bump();
                             JsonPredicateKind::Object
                         }
                         _ => JsonPredicateKind::Value,
@@ -6021,14 +6026,14 @@ impl Parser {
                     // The unique-keys clause: `(WITH|WITHOUT) UNIQUE [KEYS]`. Consume `WITH`/`WITHOUT`
                     // only when `UNIQUE` follows (a two-token lookahead — `WITH` otherwise starts no
                     // expression-level clause here). `KEYS` is optional.
-                    let unique_keys = match self.peek_keyword().as_deref() {
+                    let unique_keys = match self.peek_keyword().map(str::to_owned).as_deref() {
                         Some(w @ ("with" | "without"))
                             if self.peek_keyword_at(1).as_deref() == Some("unique") =>
                         {
-                            self.advance(); // WITH / WITHOUT
-                            self.advance(); // UNIQUE
+                            self.bump(); // WITH / WITHOUT
+                            self.bump(); // UNIQUE
                             if self.peek_keyword().as_deref() == Some("keys") {
-                                self.advance();
+                                self.bump();
                             }
                             w == "with"
                         }
@@ -6061,11 +6066,11 @@ impl Parser {
         // The operator's position: the `NOT` of a negated form, else the keyword (PostgreSQL's).
         let op_pos = self.here();
         if negated {
-            self.advance(); // NOT
+            self.bump(); // NOT
         }
         if self.peek_keyword().as_deref() == Some("in") {
             return outline(|| {
-                self.advance();
+                self.bump();
                 self.expect(&Token::LParen)?;
                 // `IN (SELECT ...)` is the uncorrelated IN-subquery (grammar.md §26), disambiguated by
                 // a leading `SELECT` (or a nested `WITH` — cte.md §7); otherwise a non-empty value list
@@ -6082,7 +6087,7 @@ impl Parser {
                 }
                 let mut list = vec![self.parse_concat()?];
                 while matches!(self.peek(), Token::Comma) {
-                    self.advance();
+                    self.bump();
                     list.push(self.parse_concat()?);
                     // The list is parsed flat, so the nesting counter never sees it — but it
                     // resolves to an OR chain as deep as the list is long (grammar.md §20), which
@@ -6109,7 +6114,7 @@ impl Parser {
         }
         if self.peek_keyword().as_deref() == Some("between") {
             return outline(|| {
-                self.advance();
+                self.bump();
                 // Both bounds parse at the CONCAT level (one tighter than comparison), which never
                 // consumes `AND` (a looser level owned by parse_and). So the BETWEEN's structural `AND`
                 // is matched here and `x BETWEEN a AND b AND c` parses as `(x BETWEEN a AND b) AND c`
@@ -6134,10 +6139,10 @@ impl Parser {
             return outline(|| {
                 let insensitive = self.peek_keyword().as_deref() == Some("ilike");
                 let like_pos = self.here();
-                self.advance();
+                self.bump();
                 let mut rhs = self.parse_concat()?;
                 if self.peek_keyword().as_deref() == Some("escape") {
-                    self.advance();
+                    self.bump();
                     let escape = self.parse_concat()?;
                     rhs = Expr::FuncCall {
                         name: "like_escape".to_string(),
@@ -6171,11 +6176,11 @@ impl Parser {
         {
             return outline(|| {
                 let similar_pos = self.here();
-                self.advance(); // SIMILAR
-                self.advance(); // TO
+                self.bump(); // SIMILAR
+                self.bump(); // TO
                 let mut args = vec![self.parse_concat()?];
                 if self.peek_keyword().as_deref() == Some("escape") {
-                    self.advance();
+                    self.bump();
                     args.push(self.parse_concat()?);
                 }
                 let rhs = Expr::FuncCall {
@@ -6215,7 +6220,7 @@ impl Parser {
         };
         if let Some((rx_negated, rx_insensitive)) = regex {
             return outline(|| {
-                self.advance();
+                self.bump();
                 let rhs = self.parse_concat()?;
                 Ok(Expr::Regex {
                     lhs: Box::new(lhs),
@@ -6238,7 +6243,7 @@ impl Parser {
         };
         match op {
             Some(op) => outline(|| {
-                self.advance();
+                self.bump();
                 let pos = op_pos;
                 // `op ANY/SOME/ALL ( array )` — a quantified array comparison (grammar.md §41):
                 // a quantifier may stand in for the ordinary right operand. SOME folds to ANY.
@@ -6248,7 +6253,7 @@ impl Parser {
                     _ => None,
                 };
                 if let Some(all) = quant {
-                    self.advance(); // ANY / SOME / ALL
+                    self.bump(); // ANY / SOME / ALL
                     self.expect(&Token::LParen)?;
                     // A leading `SELECT` (or a nested `WITH` — cte.md §7) is the SUBQUERY form
                     // `op ANY/ALL(SELECT …)` — the subquery spelling of IN (array-functions.md
@@ -6337,7 +6342,7 @@ impl Parser {
         while let Some(op) = Self::concat_op(self.peek()) {
             self.deepen()?; // each chained operator is one more AST level
             let pos = self.here();
-            self.advance();
+            self.bump();
             let rhs = self.parse_additive()?;
             lhs = binary(op, lhs, rhs, pos);
         }
@@ -6366,7 +6371,7 @@ impl Parser {
             };
             self.deepen()?; // each chained +/- is one more AST level (the `1+1+…` vector)
             let pos = self.here();
-            self.advance();
+            self.bump();
             let rhs = self.parse_multiplicative()?;
             lhs = binary(op, lhs, rhs, pos);
         }
@@ -6397,7 +6402,7 @@ impl Parser {
             };
             self.deepen()?; // each chained * / % is one more AST level
             let pos = self.here();
-            self.advance();
+            self.bump();
             let rhs = self.parse_at_time_zone()?;
             lhs = binary(op, lhs, rhs, pos);
         }
@@ -6429,9 +6434,9 @@ impl Parser {
         while self.peek_at_time_zone() {
             self.deepen()?; // each chained AT TIME ZONE is one more AST level
             let at = self.here();
-            self.advance(); // AT
-            self.advance(); // TIME
-            self.advance(); // ZONE
+            self.bump(); // AT
+            self.bump(); // TIME
+            self.bump(); // ZONE
             let zone = self.parse_unary()?;
             lhs = Expr::FuncCall {
                 name: "timezone".to_string(),
@@ -6470,7 +6475,7 @@ impl Parser {
     #[inline(never)]
     fn parse_negation(&mut self) -> Result<Expr> {
         let minus = self.here();
-        self.advance();
+        self.bump();
         // Fold unary-minus-of-an-integer-literal into one negative literal: this
         // makes i64::MIN representable (`-(2^63)`) and lets the negative value
         // range-check against its context like any literal (spec/design/types.md §6).
@@ -6482,7 +6487,7 @@ impl Parser {
             && self.tokens.get(self.pos + 1) != Some(&Token::DoubleColon)
         {
             let m = *m;
-            self.advance();
+            self.bump();
             let folded = -(m as i128); // m <= 2^63 ⇒ folded ∈ [-2^63, 0] ⊆ i64
             return Ok(Expr::Literal(Literal::Int(folded as i64), minus));
         }
@@ -6569,7 +6574,7 @@ impl Parser {
             self.deepen()?;
             match self.peek() {
                 _ if is_collate => {
-                    self.advance(); // COLLATE
+                    self.bump(); // COLLATE
                     let collation = self.expect_collation_name()?;
                     expr = Expr::Collate {
                         inner: Box::new(expr),
@@ -6579,7 +6584,7 @@ impl Parser {
                 }
                 Token::DoubleColon => {
                     let cast_pos = self.here();
-                    self.advance();
+                    self.bump();
                     let type_pos = self.here();
                     let base_type = self.expect_type_name()?;
                     let type_mod = self.parse_type_mod_for(&base_type)?;
@@ -6607,7 +6612,7 @@ impl Parser {
                 Token::LBracket => {
                     let mut subscripts = Vec::new();
                     while matches!(self.peek(), Token::LBracket) {
-                        self.advance(); // [
+                        self.bump(); // [
                         // The lower bound / index is absent only before a `:` or `]` (`[:n]`, `[]`).
                         let lower = if matches!(self.peek(), Token::Colon | Token::RBracket) {
                             None
@@ -6615,7 +6620,7 @@ impl Parser {
                             Some(self.parse_expr()?)
                         };
                         if matches!(self.peek(), Token::Colon) {
-                            self.advance(); // :
+                            self.bump(); // :
                             let upper = if matches!(self.peek(), Token::RBracket) {
                                 None
                             } else {
@@ -6641,9 +6646,9 @@ impl Parser {
                 // `.field` / `.*` — composite field selection (spec/design/composite.md §S4),
                 // parens-required: only on a parenthesized / chained-field base.
                 Token::Dot if field_accessible => {
-                    self.advance();
+                    self.bump();
                     if matches!(self.peek(), Token::Star) {
-                        self.advance();
+                        self.bump();
                         expr = Expr::FieldStar {
                             base: Box::new(expr),
                         };
@@ -6686,7 +6691,7 @@ impl Parser {
         if matches!(self.peek(), Token::LParen) {
             return outline(|| {
                 let paren_pos = self.here();
-                self.advance();
+                self.bump();
                 // `(SELECT ...)` is a scalar subquery (grammar.md §26), disambiguated by a leading
                 // `SELECT` (or a nested `WITH` — cte.md §7) after the `(`; otherwise this is a
                 // parenthesized expression.
@@ -6702,7 +6707,7 @@ impl Parser {
                 if matches!(self.peek(), Token::Comma) {
                     let mut fields = vec![e];
                     while matches!(self.peek(), Token::Comma) {
-                        self.advance();
+                        self.bump();
                         fields.push(self.parse_expr()?);
                     }
                     self.expect(&Token::RParen)?;
@@ -6722,7 +6727,7 @@ impl Parser {
         {
             return outline(|| {
                 let pos = self.here();
-                self.advance(); // EXISTS
+                self.bump(); // EXISTS
                 self.expect(&Token::LParen)?;
                 let q = self.parse_subquery()?;
                 self.expect(&Token::RParen)?;
@@ -6732,7 +6737,7 @@ impl Parser {
         if self.peek_keyword().as_deref() == Some("cast") {
             return outline(|| {
                 let cast_pos = self.here();
-                self.advance();
+                self.bump();
                 self.expect(&Token::LParen)?;
                 let inner = self.parse_expr()?;
                 self.expect_keyword("as")?;
@@ -6766,7 +6771,7 @@ impl Parser {
         {
             return outline(|| {
                 let pos = self.here();
-                self.advance(); // EXTRACT
+                self.bump(); // EXTRACT
                 self.expect(&Token::LParen)?;
                 let field = match self.peek() {
                     Token::Str(_) => {
@@ -6800,7 +6805,7 @@ impl Parser {
         {
             return outline(|| {
                 let pos = self.here();
-                self.advance(); // ROW
+                self.bump(); // ROW
                 self.expect(&Token::LParen)?;
                 let mut fields = Vec::new();
                 if !matches!(self.peek(), Token::RParen) {
@@ -6817,7 +6822,7 @@ impl Parser {
                         }
                     }
                 } else {
-                    self.advance(); // the empty ROW() — consume ')'
+                    self.bump(); // the empty ROW() — consume ')'
                 }
                 Ok(Expr::Row(fields, pos))
             });
@@ -6830,7 +6835,7 @@ impl Parser {
         {
             return outline(|| {
                 let pos = self.here();
-                self.advance(); // ARRAY
+                self.bump(); // ARRAY
                 self.expect(&Token::LBracket)?;
                 let mut elems = Vec::new();
                 if !matches!(self.peek(), Token::RBracket) {
@@ -6847,7 +6852,7 @@ impl Parser {
                         }
                     }
                 } else {
-                    self.advance(); // the empty ARRAY[] — consume ']'
+                    self.bump(); // the empty ARRAY[] — consume ']'
                 }
                 Ok(Expr::Array(elems, pos))
             });
@@ -6924,17 +6929,17 @@ impl Parser {
         {
             return outline(|| {
                 let pos = self.here();
-                self.advance(); // JSON
-                self.advance(); // (
+                self.bump(); // JSON
+                self.bump(); // (
                 let operand = self.parse_expr()?;
-                let unique_keys = match self.peek_keyword().as_deref() {
+                let unique_keys = match self.peek_keyword().map(str::to_owned).as_deref() {
                     Some(w @ ("with" | "without"))
                         if self.peek_keyword_at(1).as_deref() == Some("unique") =>
                     {
-                        self.advance(); // WITH / WITHOUT
-                        self.advance(); // UNIQUE
+                        self.bump(); // WITH / WITHOUT
+                        self.bump(); // UNIQUE
                         if self.peek_keyword().as_deref() == Some("keys") {
-                            self.advance();
+                            self.bump();
                         }
                         w == "with"
                     }
@@ -6966,8 +6971,8 @@ impl Parser {
         {
             return outline(|| {
                 let pos = self.here();
-                self.advance(); // COALESCE
-                self.advance(); // (
+                self.bump(); // COALESCE
+                self.bump(); // (
                 if matches!(self.peek(), Token::RParen) {
                     return Err(syntax("COALESCE requires at least one argument"));
                 }
@@ -6977,7 +6982,7 @@ impl Parser {
                     if !matches!(self.peek(), Token::Comma) {
                         break;
                     }
-                    self.advance(); // ,
+                    self.bump(); // ,
                 }
                 self.expect(&Token::RParen)?;
                 Ok(Expr::Coalesce(args, pos))
@@ -6987,15 +6992,17 @@ impl Parser {
         // Recognized only when the keyword is immediately followed by `(` (the same one-token
         // lookahead), so the words stay usable as column names. At least one argument (an empty
         // list is 42601 — PostgreSQL's grammar has no empty form).
-        let gl_kw = self.peek_keyword();
-        if matches!(gl_kw.as_deref(), Some("greatest") | Some("least"))
-            && matches!(self.tokens.get(self.pos + 1), Some(Token::LParen))
-        {
+        let gl_kw = match self.peek_keyword() {
+            Some("greatest") => Some(true),
+            Some("least") => Some(false),
+            _ => None,
+        };
+        if gl_kw.is_some() && matches!(self.tokens.get(self.pos + 1), Some(Token::LParen)) {
             return outline(|| {
-                let greatest = gl_kw.as_deref() == Some("greatest");
+                let greatest = gl_kw == Some(true);
                 let pos = self.here();
-                self.advance(); // GREATEST / LEAST
-                self.advance(); // (
+                self.bump(); // GREATEST / LEAST
+                self.bump(); // (
                 if matches!(self.peek(), Token::RParen) {
                     return Err(syntax(if greatest {
                         "GREATEST requires at least one argument"
@@ -7009,7 +7016,7 @@ impl Parser {
                     if !matches!(self.peek(), Token::Comma) {
                         break;
                     }
-                    self.advance(); // ,
+                    self.bump(); // ,
                 }
                 self.expect(&Token::RParen)?;
                 Ok(Expr::GreatestLeast {
@@ -7028,8 +7035,8 @@ impl Parser {
         {
             return outline(|| {
                 let pos = self.here();
-                self.advance(); // NULLIF
-                self.advance(); // (
+                self.bump(); // NULLIF
+                self.bump(); // (
                 let a = self.parse_expr()?;
                 self.expect(&Token::Comma)?;
                 let b = self.parse_expr()?;
@@ -7043,7 +7050,7 @@ impl Parser {
         if self.peek_keyword().as_deref() == Some("case") {
             return outline(|| {
                 let case_pos = self.here();
-                self.advance();
+                self.bump();
                 // Simple form has an operand between CASE and the first WHEN; the searched form
                 // starts directly with WHEN (grammar.md §23).
                 let operand = if self.peek_keyword().as_deref() == Some("when") {
@@ -7055,7 +7062,7 @@ impl Parser {
                 let mut when_pos = Vec::new();
                 while self.peek_keyword().as_deref() == Some("when") {
                     when_pos.push(self.here());
-                    self.advance();
+                    self.bump();
                     let cond = self.parse_expr()?;
                     self.expect_keyword("then")?;
                     let res = self.parse_expr()?;
@@ -7065,7 +7072,7 @@ impl Parser {
                     return Err(syntax("CASE requires at least one WHEN clause"));
                 }
                 let els = if self.peek_keyword().as_deref() == Some("else") {
-                    self.advance();
+                    self.bump();
                     Some(Box::new(self.parse_expr()?))
                 } else {
                     None
@@ -7085,12 +7092,12 @@ impl Parser {
         match self.peek() {
             Token::Param(n) => {
                 let n = *n;
-                self.advance();
+                self.bump();
                 Ok(Expr::Param(n, here))
             }
             Token::Int(m) => {
                 let m = *m;
-                self.advance();
+                self.bump();
                 if m <= i64::MAX as u64 {
                     Ok(Expr::Literal(Literal::Int(m as i64), here))
                 } else {
@@ -7103,15 +7110,15 @@ impl Parser {
                 }
             }
             Token::Word(w) if w.eq_ignore_ascii_case("null") => {
-                self.advance();
+                self.bump();
                 Ok(Expr::Literal(Literal::Null, here))
             }
             Token::Word(w) if w.eq_ignore_ascii_case("true") => {
-                self.advance();
+                self.bump();
                 Ok(Expr::Literal(Literal::Bool(true), here))
             }
             Token::Word(w) if w.eq_ignore_ascii_case("false") => {
-                self.advance();
+                self.bump();
                 Ok(Expr::Literal(Literal::Bool(false), here))
             }
             // `current_timestamp` — the SQL-standard bare keyword (no parens), reserved like the
@@ -7122,7 +7129,7 @@ impl Parser {
                 if w.eq_ignore_ascii_case("current_timestamp")
                     && !matches!(self.tokens.get(self.pos + 1), Some(Token::LParen)) =>
             {
-                self.advance();
+                self.bump();
                 Ok(Expr::FuncCall {
                     name: "now".to_string(),
                     args: Vec::new(),
@@ -7146,7 +7153,7 @@ impl Parser {
                 if w.eq_ignore_ascii_case("current_date")
                     && !matches!(self.tokens.get(self.pos + 1), Some(Token::LParen)) =>
             {
-                self.advance();
+                self.bump();
                 Ok(Expr::FuncCall {
                     name: "current_date".to_string(),
                     args: Vec::new(),
@@ -7229,7 +7236,7 @@ impl Parser {
         // both 42601 syntax errors (PG); the resolver rejects DISTINCT on a non-aggregate (42809)
         // or a window function (0A000).
         let distinct = if self.peek_keyword().as_deref() == Some("distinct") {
-            self.advance();
+            self.bump();
             if matches!(self.peek(), Token::Star) {
                 return Err(syntax("DISTINCT cannot be used with *"));
             }
@@ -7250,7 +7257,7 @@ impl Parser {
         // (42809) or a window call (0A000).
         let mut agg_order: Option<Box<Vec<OrderKey>>> = None;
         let star = if matches!(self.peek(), Token::Star) {
-            self.advance();
+            self.bump();
             true
         } else if matches!(self.peek(), Token::RParen) {
             // Empty argument list (make_interval()) — leave args/arg_names empty.
@@ -7262,7 +7269,7 @@ impl Parser {
                 // keyword (not reserved) recognized only at the start of an argument; once seen, no
                 // further argument may follow (42601) and it does not combine with a name.
                 if self.peek_keyword().as_deref() == Some("variadic") {
-                    self.advance();
+                    self.bump();
                     variadic = true;
                     args.push(self.parse_expr()?);
                     arg_names.push(None);
@@ -7326,7 +7333,7 @@ impl Parser {
                     break;
                 }
                 if matches!(self.peek(), Token::Comma) {
-                    self.advance();
+                    self.bump();
                 } else {
                     break;
                 }
@@ -7355,7 +7362,7 @@ impl Parser {
                     "cannot use multiple ORDER BY clauses with WITHIN GROUP",
                 ));
             }
-            self.advance();
+            self.bump();
             self.expect_keyword("group")?;
             self.expect(&Token::LParen)?;
             if self.peek_keyword().as_deref() != Some("order") {
@@ -7375,12 +7382,12 @@ impl Parser {
         // on a non-aggregate (42809) or a window function (0A000), an aggregate inside cond (42803),
         // and a non-boolean cond (42804).
         let filter = if self.peek_keyword().as_deref() == Some("filter") {
-            self.advance();
+            self.bump();
             self.expect(&Token::LParen)?;
             if self.peek_keyword().as_deref() != Some("where") {
                 return Err(syntax("FILTER requires a WHERE clause"));
             }
-            self.advance();
+            self.bump();
             let cond = self.parse_expr()?;
             self.expect(&Token::RParen)?;
             Some(Box::new(cond))
@@ -7392,7 +7399,7 @@ impl Parser {
         // [ORDER BY ...] )` form; a named window `OVER name` (the WINDOW clause) is deferred to S5.
         let mut over_name: Option<String> = None;
         let over = if self.peek_keyword().as_deref() == Some("over") {
-            self.advance();
+            self.bump();
             // `OVER name` references a named window (the WINDOW clause — window.md §5); `OVER (...)`
             // is an inline definition. A named reference is desugared to its definition at resolve.
             if !matches!(self.peek(), Token::LParen) {
@@ -7447,22 +7454,22 @@ impl Parser {
         // `SUBSTRING(x SIMILAR p ESCAPE e)` is `substring(x, p, e)` (regex.md §8f); ESCAPE is
         // required, as in PostgreSQL.
         if self.peek_keyword().as_deref() == Some("similar") {
-            self.advance();
+            self.bump();
             start = Some(self.parse_expr()?);
             self.expect_keyword("escape")?;
             count = Some(self.parse_expr()?);
         } else if self.peek_keyword().as_deref() == Some("from") {
-            self.advance();
+            self.bump();
             start = Some(self.parse_expr()?);
             if self.peek_keyword().as_deref() == Some("for") {
-                self.advance();
+                self.bump();
                 count = Some(self.parse_expr()?);
             }
         } else {
             self.expect_keyword("for")?;
             count = Some(self.parse_expr()?);
             if self.peek_keyword().as_deref() == Some("from") {
-                self.advance();
+                self.bump();
                 start = Some(self.parse_expr()?);
             }
         }
@@ -7530,7 +7537,7 @@ impl Parser {
         let start = self.parse_expr()?;
         let mut args = vec![source, replacement, start];
         if self.peek_keyword().as_deref() == Some("for") {
-            self.advance();
+            self.bump();
             args.push(self.parse_expr()?);
         }
         self.expect(&Token::RParen)?;
@@ -7561,9 +7568,9 @@ impl Parser {
             Some("groups") => FrameMode::Groups,
             _ => return Ok(None),
         };
-        self.advance();
+        self.bump();
         let (start, end) = if self.peek_keyword().as_deref() == Some("between") {
-            self.advance();
+            self.bump();
             let s = self.parse_frame_bound()?;
             self.expect_keyword("and")?;
             let e = self.parse_frame_bound()?;
@@ -7602,23 +7609,23 @@ impl Parser {
         if self.peek_keyword().as_deref() != Some("exclude") {
             return Ok(FrameExclusion::NoOthers);
         }
-        self.advance();
+        self.bump();
         match self.peek_keyword().as_deref() {
             Some("current") => {
-                self.advance();
+                self.bump();
                 self.expect_keyword("row")?;
                 Ok(FrameExclusion::CurrentRow)
             }
             Some("group") => {
-                self.advance();
+                self.bump();
                 Ok(FrameExclusion::Group)
             }
             Some("ties") => {
-                self.advance();
+                self.bump();
                 Ok(FrameExclusion::Ties)
             }
             Some("no") => {
-                self.advance();
+                self.bump();
                 self.expect_keyword("others")?;
                 Ok(FrameExclusion::NoOthers)
             }
@@ -7633,21 +7640,21 @@ impl Parser {
     fn parse_frame_bound(&mut self) -> Result<FrameBound> {
         match self.peek_keyword().as_deref() {
             Some("unbounded") => {
-                self.advance();
+                self.bump();
                 match self.peek_keyword().as_deref() {
                     Some("preceding") => {
-                        self.advance();
+                        self.bump();
                         Ok(FrameBound::UnboundedPreceding)
                     }
                     Some("following") => {
-                        self.advance();
+                        self.bump();
                         Ok(FrameBound::UnboundedFollowing)
                     }
                     _ => Err(syntax("expected PRECEDING or FOLLOWING after UNBOUNDED")),
                 }
             }
             Some("current") => {
-                self.advance();
+                self.bump();
                 self.expect_keyword("row")?;
                 Ok(FrameBound::CurrentRow)
             }
@@ -7655,11 +7662,11 @@ impl Parser {
                 let e = self.parse_expr()?;
                 match self.peek_keyword().as_deref() {
                     Some("preceding") => {
-                        self.advance();
+                        self.bump();
                         Ok(FrameBound::Preceding(Box::new(e)))
                     }
                     Some("following") => {
-                        self.advance();
+                        self.bump();
                         Ok(FrameBound::Following(Box::new(e)))
                     }
                     _ => Err(syntax("expected PRECEDING or FOLLOWING in frame bound")),
@@ -7674,7 +7681,7 @@ impl Parser {
     fn parse_column_ref(&mut self) -> Result<(Option<String>, String)> {
         let first = self.expect_identifier()?;
         if matches!(self.peek(), Token::Dot) {
-            self.advance();
+            self.bump();
             let second = self.expect_identifier()?;
             Ok((Some(first), second))
         } else {
@@ -7700,7 +7707,7 @@ impl Parser {
     fn parse_qualified_table_name(&mut self) -> Result<(Option<String>, String)> {
         let name = self.expect_identifier()?;
         if matches!(self.peek(), Token::Dot) {
-            self.advance(); // .
+            self.bump(); // .
             let table = self.expect_identifier()?;
             Ok((Some(name), table))
         } else {
@@ -7724,9 +7731,9 @@ impl Parser {
 
     /// The current token if it is a bare word (already folded to lowercase by the lexer), else
     /// None. A quoted identifier is never a keyword (grammar.md §3).
-    pub fn peek_keyword(&self) -> Option<String> {
+    pub fn peek_keyword(&self) -> Option<&str> {
         match self.peek() {
-            Token::Word(w) => Some(w.clone()),
+            Token::Word(w) => Some(w.as_str()),
             _ => None,
         }
     }
@@ -7734,40 +7741,47 @@ impl Parser {
     /// The keyword (lowercased) `offset` tokens ahead of the cursor, if that token is a word.
     /// Used for the two-token `NOT IN`/`NOT BETWEEN`/`NOT LIKE` lookahead (a CLAUDE.md §8
     /// determinism surface — byte-identical across the three parsers).
-    pub fn peek_keyword_at(&self, offset: usize) -> Option<String> {
+    pub fn peek_keyword_at(&self, offset: usize) -> Option<&str> {
         match self.tokens.get(self.pos + offset) {
-            Some(Token::Word(w)) => Some(w.clone()),
+            Some(Token::Word(w)) => Some(w.as_str()),
             _ => None,
         }
     }
 
     /// Consume and return the current token.
     pub fn advance(&mut self) -> Token {
-        self.note(self.pos);
         let t = self.tokens[self.pos].clone();
+        self.bump();
+        t
+    }
+
+    /// Consume the current token without returning it (so without cloning it).
+    pub fn bump(&mut self) {
+        self.note(self.pos);
         if self.pos + 1 < self.tokens.len() {
             self.pos += 1;
         }
-        t
     }
 
     /// Consume the current token, requiring it to equal `want`.
     pub fn expect(&mut self, want: &Token) -> Result<()> {
-        let got = self.advance();
-        if &got == want {
-            Ok(())
-        } else {
-            Err(syntax(format!("expected {want:?}, found {got:?}")))
+        if &self.tokens[self.pos] == want {
+            self.bump();
+            return Ok(());
         }
+        let got = self.advance();
+        Err(syntax(format!("expected {want:?}, found {got:?}")))
     }
 
     /// Consume the current token, requiring it to be the given keyword: a bare word (already
     /// folded by the lexer; `kw` is lowercase) — never a quoted identifier.
     pub fn expect_keyword(&mut self, kw: &str) -> Result<()> {
-        match self.advance() {
-            Token::Word(w) if w.eq_ignore_ascii_case(kw) => Ok(()),
-            other => Err(syntax(format!("expected keyword '{kw}', found {other:?}"))),
+        if matches!(&self.tokens[self.pos], Token::Word(w) if w.eq_ignore_ascii_case(kw)) {
+            self.bump();
+            return Ok(());
         }
+        let other = self.advance();
+        Err(syntax(format!("expected keyword '{kw}', found {other:?}")))
     }
 
     /// Consume a type name in any type position (column/field definition, `ALTER … TYPE`, `CAST`,
@@ -7783,15 +7797,15 @@ impl Parser {
         if self.peek_keyword().as_deref() == Some("double")
             && self.peek_keyword_at(1).as_deref() == Some("precision")
         {
-            self.advance(); // DOUBLE
-            self.advance(); // PRECISION
+            self.bump(); // DOUBLE
+            self.bump(); // PRECISION
             return Ok("double precision".to_string());
         }
         if self.peek_keyword().as_deref() == Some("character")
             && self.peek_keyword_at(1).as_deref() == Some("varying")
         {
-            self.advance(); // CHARACTER
-            self.advance(); // VARYING
+            self.bump(); // CHARACTER
+            self.bump(); // VARYING
             return Ok("character varying".to_string());
         }
         self.expect_identifier()
