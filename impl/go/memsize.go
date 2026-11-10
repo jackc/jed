@@ -46,9 +46,15 @@ func memValueBytes(v Value) int64 {
 		return n
 	case ValJsonb:
 		return memJsonbBytes(v.jsonb())
+	case ValUnfetched:
+		// A buffered touched value counts as the string it resolves to; any other reference is an
+		// untouched slot, a bare node.
+		if u := v.unfetched(); u.buffered {
+			return memoryValue + u.bufferedPayloadLen()
+		}
+		return memoryValue
 	default:
-		// NULL, fixed-width scalars, and an unfetched reference (only ever an untouched slot) are a
-		// bare node.
+		// NULL and fixed-width scalars are a bare node.
 		return memoryValue
 	}
 }

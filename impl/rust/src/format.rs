@@ -7842,6 +7842,7 @@ fn read_value_lazy(
                 len,
                 ty: tyref.clone(),
                 paging: crate::value::PagerRef(paging.clone()),
+                buffered: false,
             }))
         }
         TAG_INLINE_COMP => {
@@ -7852,6 +7853,7 @@ fn read_value_lazy(
                 comp,
                 raw_len,
                 ty: tyref.clone(),
+                buffered: false,
             }))
         }
         TAG_EXTERNAL_COMP => {
@@ -7865,6 +7867,7 @@ fn read_value_lazy(
                 raw_len,
                 ty: tyref.clone(),
                 paging: crate::value::PagerRef(paging.clone()),
+                buffered: false,
             }))
         }
         _ => Err(corrupt("invalid value presence tag")),

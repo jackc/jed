@@ -2088,15 +2088,36 @@ impl Engine {
         ctes: CteCtx,
         meter: &mut Meter,
     ) -> Result<Vec<Row>> {
+        self.materialize_rel_buffering(plan, ri, params, outer, left, rng, ctes, meter, None)
+    }
+
+    /// [`materialize_rel`](Self::materialize_rel) keeping a base table's `buffer` columns by
+    /// reference (`TableStore::resolve_columns_buffering`, spec/design/large-values.md §16);
+    /// `buffer` is `None` for every caller but the eager lane.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn materialize_rel_buffering(
+        &self,
+        plan: &SelectPlan,
+        ri: usize,
+        params: &[Value],
+        outer: &[&[Value]],
+        left: &[Value],
+        rng: &std::cell::Cell<crate::seam::StmtRng>,
+        ctes: CteCtx,
+        meter: &mut Meter,
+        buffer: Option<&[bool]>,
+    ) -> Result<Vec<Row>> {
         let rel = &plan.rels[ri];
         let pushed = plan.pushed_local_filter(ri);
         let computed = rel.srf.is_some() || rel.cte.is_some() || rel.derived.is_some();
         let (Some(pushed), true) = (pushed, computed) else {
-            return self.materialize_rel_rows(plan, ri, params, outer, left, rng, ctes, meter);
+            return self
+                .materialize_rel_rows(plan, ri, params, outer, left, rng, ctes, meter, buffer);
         };
         // A computed relation's scan-pushed filter (planner.md §3.2) runs over its produced rows in
         // production order; each rejected row's reservation is released before the join reads them.
-        let rows = self.materialize_rel_rows(plan, ri, params, outer, left, rng, ctes, meter)?;
+        let rows =
+            self.materialize_rel_rows(plan, ri, params, outer, left, rng, ctes, meter, buffer)?;
         // The filter runs in its own frame, off the relation recursion above (cost.md §7.1).
         outline(|| {
             let env = EvalEnv {
@@ -2132,6 +2153,7 @@ impl Engine {
         rng: &std::cell::Cell<crate::seam::StmtRng>,
         ctes: CteCtx,
         meter: &mut Meter,
+        buffer: Option<&[bool]>,
     ) -> Result<Vec<Row>> {
         let rel = &plan.rels[ri];
         // A WHERE contradiction (planner.md §3.1) reads no relation: nothing is scanned, generated,
@@ -2404,9 +2426,10 @@ impl Engine {
                 }
             };
             // Materialize this relation's touched columns where the lazy load left unfetched references
-            // (large-values.md §14) — exactly the static set the cost block charges.
+            // (large-values.md §14) — exactly the static set the cost block charges — except the large
+            // values an eager-lane buffer keeps by reference (§16).
             for row in &mut rows {
-                store.resolve_columns(row, &plan.rel_masks[ri])?;
+                store.resolve_columns_buffering(row, &plan.rel_masks[ri], buffer)?;
             }
             meter.charge(COSTS.value_decompress * slabs as i64);
             let mut src = ScanSource::new(rows, node_count as i64);

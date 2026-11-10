@@ -655,3 +655,58 @@ and the live and image checkers pass. The simulation generator's
 `update_narrow` step (the `large-values` profile) assigns only a fixed-width column, sometimes with a
 `WHERE` that reads a variable-width one, and the image checkers (each core and `verify.rb
 --check-image`) check chain exclusivity: no overflow page is named by two stored values.
+
+---
+
+## 16. Large values held by reference in eager-lane buffers — BUILT
+
+§14 resolves a relation's touched columns as its rows are scanned, so an operator that buffers its
+input holds every touched large value decoded: `SELECT sum(length(v)) FROM t` over 1,000 rows of a
+1 MiB text held 1 GiB to return one number. The eager lane (memory.md §5.4) now keeps such values as
+references in the relation buffer and resolves one only when an expression reads it.
+
+### 16.1 The rule
+
+When the eager lane materializes a **base table** relation into its buffer (not a derived table, CTE,
+or set-returning function, and not a lateral or index-nested-loop relation, which are materialized
+per left row), a touched column's value stays an **unfetched reference** when all of these hold:
+
+- the column is `text`, `bytea`, or `json` (types whose resolved size is the stored payload length);
+- the value is stored out of line or compressed (an inline-plain value is resolved as before);
+- the column is not a **key column** of the plan. Key columns are the ones the lane reads without
+  evaluating an expression: a bare-column `GROUP BY` key (of any grouping set), and, in a plan without
+  aggregation, a bare-column `ORDER BY` key or window `PARTITION BY` / `ORDER BY` key. In a plan over
+  more than one relation, every column an `ON` clause or the `WHERE` references is also a key column,
+  which covers hash and index-nested-loop join keys. So is every column a nested subquery or a
+  `LATERAL` derived table's body reads: such a plan reads the outer value into its own scan bounds
+  without evaluating it.
+
+Every other lane resolves as §14 says: the streaming, columnar, and vectorized lanes, and the
+bounded-spill lane, whose spools and spilled hash tables write rows to scratch files. The eager lane
+never spills.
+
+A buffered reference resolves (unmetered, as §14's demand fault does) each time an expression reads it,
+and the value it yields is the value §14 would have resolved. Grouping, dedup, and sort keys are built
+from evaluated values or from key columns, so a reference never reaches a key; a core fails loudly if
+one does.
+
+### 16.2 What it changes and what it does not
+
+- **Rows, plans, and costs** do not change. The scan's `page_read` / `value_decompress` block is the
+  static touched set (§14), charged up front whether or not a value is resolved.
+- **Query memory** does not change. A buffered reference is charged at the size of the string it
+  resolves to (`VALUE + payload`, memory.md §3), so every `54P05` trip point is the same. Only the
+  physical resident size falls, which the guardrail model allows.
+- **Where corruption surfaces** changes. A corrupt buffered value raises `XX001` when an expression
+  first reads it, not when the relation is scanned, and a value no expression reads (a `CASE` branch
+  never taken, an aggregate `FILTER` that rejects the row) raises nothing. Because every core applies
+  the same rule, every core raises the same error at the same point.
+- **CPU** may rise slightly: a value two expressions read is decompressed twice.
+
+### 16.3 Tests
+
+Mirrored per-core tests (`buffered_large_values`) pin the rule: aggregate, join, and window queries
+over a table whose large values are all corrupt on disk raise `XX001` exactly when an expression reads
+a value and succeed when none does, a correlated subquery whose bound reads the column raises it at
+the scan, and the same queries return identical rows and costs on resident
+and on disk-read rows. The query-memory corpus pins the charge.

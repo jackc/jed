@@ -8,6 +8,8 @@ package jed
 // transaction model (spec/design/transactions.md §2): a TableStore clone is the committed version a
 // reader holds while a writer mutates its own copy.
 
+import "slices"
+
 // Row is a stored row: one value per column, in column order.
 type storedRow []Value
 
@@ -514,6 +516,39 @@ func (s *tableStore) resolveColumns(row storedRow, mask []bool) (storedRow, erro
 	out := make(storedRow, len(row))
 	copy(out, row)
 	return s.resolveColumnsInPlace(out, mask)
+}
+
+// resolveColumnsBuffering is resolveColumns for an eager-lane relation buffer (large-values.md §16):
+// a column buffer marks keeps a large text, bytea, or json value (stored out of line or compressed)
+// by reference, marked buffered, instead of resolving it. buffer is nil, or marks columns of mask.
+func (s *tableStore) resolveColumnsBuffering(row storedRow, mask, buffer []bool) (storedRow, error) {
+	if buffer == nil {
+		return s.resolveColumns(row, mask)
+	}
+	var kept []int
+	resolve := mask
+	for i, v := range row {
+		if buffer[i] && v.Kind == ValUnfetched && v.unfetched().Form != 0x00 && stringPayload(s.colTypes[i]) {
+			if kept == nil {
+				resolve = slices.Clone(mask)
+			}
+			resolve[i] = false
+			kept = append(kept, i)
+		}
+	}
+	out, err := s.resolveColumns(row, resolve)
+	if err != nil || kept == nil {
+		return out, err
+	}
+	if &out[0] == &row[0] {
+		out = slices.Clone(row)
+	}
+	for _, i := range kept {
+		u := *out[i].unfetched()
+		u.buffered = true
+		out[i] = Value{Kind: ValUnfetched, ref: &u}
+	}
+	return out, nil
 }
 
 // resolveColumnsInPlace requires a private row slice. Values are replaced, never

@@ -126,6 +126,20 @@ impl PointStoreScan {
     }
 }
 
+/// Whether a column's resolved size is its stored payload length — a scalar `text`, `bytea`, or
+/// `json` (never a composite, array, or range): the types an eager-lane buffer may hold by
+/// reference (spec/design/large-values.md §16).
+fn string_payload(ty: &ColType) -> bool {
+    matches!(
+        ty,
+        ColType::Scalar(
+            crate::types::ScalarType::Text
+                | crate::types::ScalarType::Bytea
+                | crate::types::ScalarType::Json
+        )
+    )
+}
+
 /// Build the leaf source from a store's paging context + column types (disjoint from `rows`). Free
 /// function (not a `&self` method) so the borrow is of `paging`/`col_types` only — `rows` stays free
 /// to be mutated alongside it.
@@ -611,6 +625,41 @@ impl TableStore {
                 continue;
             }
             if let Value::Unfetched(u) = v {
+                let paging = self
+                    .paging
+                    .as_ref()
+                    .expect("an unfetched value implies a paged store");
+                let fetch = |p: crate::format::PageRef| paging.read_body(p);
+                *v = crate::format::resolve_unfetched(&self.col_types[i], u, &fetch, self.cap)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// [`resolve_columns`](TableStore::resolve_columns) for an eager-lane relation buffer
+    /// (spec/design/large-values.md §16): a column `buffer` marks keeps a large `text`, `bytea`, or
+    /// `json` value (stored out of line or compressed) by reference, marked buffered, instead of
+    /// resolving it. `buffer` is `None`, or marks columns of `mask`. The other touched columns
+    /// resolve in the same order as `resolve_columns`. `row` is the scan's own copy, so marking it
+    /// never touches the shared leaf's reference.
+    pub(crate) fn resolve_columns_buffering(
+        &self,
+        row: &mut Row,
+        mask: &[bool],
+        buffer: Option<&[bool]>,
+    ) -> Result<()> {
+        let Some(buffer) = buffer else {
+            return self.resolve_columns(row, mask);
+        };
+        for (i, v) in row.iter_mut().enumerate() {
+            if !mask[i] {
+                continue;
+            }
+            if let Value::Unfetched(u) = v {
+                if buffer[i] && u.is_large_form() && string_payload(&self.col_types[i]) {
+                    u.mark_buffered();
+                    continue;
+                }
                 let paging = self
                     .paging
                     .as_ref()

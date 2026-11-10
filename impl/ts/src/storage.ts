@@ -30,7 +30,13 @@ import {
   recordScanUnits,
   spanScanUnits,
 } from "./format.ts";
-import { isInteger } from "./types.ts";
+import { isBytea, isInteger, isJson, isText } from "./types.ts";
+
+// stringPayload reports whether a column's resolved value size is its stored payload length — a scalar
+// text, bytea, or json column (large-values.md §16; mirrors Go stringPayload).
+function stringPayload(ty: ColType): boolean {
+  return ty.kind === "scalar" && (isText(ty.scalar) || isBytea(ty.scalar) || isJson(ty.scalar));
+}
 
 // The reusable span scratch for laneScanUnits (single-threaded).
 const LANE_SPAN: Span = { start: 0, end: 0 };
@@ -610,6 +616,41 @@ export class TableStore {
         );
     }
     return resolved;
+  }
+
+  // resolveColumnsBufferingSteps is resolveColumnsSteps for an eager-lane relation buffer
+  // (large-values.md §16): a column `buffer` marks keeps a large text, bytea, or json value (stored
+  // out of line or compressed) by reference, as a fresh copy marked buffered, instead of resolving
+  // it. `buffer` is null, or marks columns of `mask`.
+  *resolveColumnsBufferingSteps(row: Row, mask: boolean[], buffer: boolean[] | null): Steps<Row> {
+    if (buffer === null) return yield* this.resolveColumnsSteps(row, mask);
+    let kept: number[] | null = null;
+    let resolve = mask;
+    for (let i = 0; i < row.length; i++) {
+      const v = row[i]!;
+      if (
+        buffer[i] === true &&
+        v.kind === "unfetched" &&
+        v.ref.form !== 0x00 &&
+        stringPayload(this.colTypes[i]!)
+      ) {
+        if (kept === null) {
+          kept = [];
+          resolve = mask.slice();
+        }
+        resolve[i] = false;
+        kept.push(i);
+      }
+    }
+    let out = yield* this.resolveColumnsSteps(row, resolve);
+    if (kept === null) return out;
+    if (out === row) out = row.slice();
+    for (const i of kept) {
+      const v = out[i]!;
+      if (v.kind !== "unfetched") throw new Error("BUG: a buffered column was resolved");
+      out[i] = { kind: "unfetched", ref: { ...v.ref, buffered: true } };
+    }
+    return out;
   }
 
   // resolveInlineColumns returns `row` with only its inline-deferred values — the form 0x00

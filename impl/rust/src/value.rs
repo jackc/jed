@@ -146,6 +146,8 @@ pub enum Unfetched {
         len: u32,
         ty: TypeRef,
         paging: PagerRef,
+        /// Held by an eager-lane relation buffer instead of resolved (see [`Unfetched::is_buffered`]).
+        buffered: bool,
     },
     /// `0x03` inline-compressed: the LZ4 block is resident (it lives in the record), but
     /// decompression is deferred until the column is touched.
@@ -153,6 +155,8 @@ pub enum Unfetched {
         comp: Vec<u8>,
         raw_len: u32,
         ty: TypeRef,
+        /// Held by an eager-lane relation buffer instead of resolved (see [`Unfetched::is_buffered`]).
+        buffered: bool,
     },
     /// `0x04` external-compressed: the chain carries the `stored_len`-byte LZ4 block.
     ExternalComp {
@@ -161,6 +165,8 @@ pub enum Unfetched {
         raw_len: u32,
         ty: TypeRef,
         paging: PagerRef,
+        /// Held by an eager-lane relation buffer instead of resolved (see [`Unfetched::is_buffered`]).
+        buffered: bool,
     },
 }
 
@@ -170,6 +176,45 @@ impl Unfetched {
     /// UPDATE's new row carries over unread (spec/design/large-values.md §15).
     pub(crate) fn is_large_form(&self) -> bool {
         !matches!(self, Unfetched::Inline { .. })
+    }
+
+    /// Whether an eager-lane relation buffer holds this touched value by reference instead of
+    /// resolved (spec/design/large-values.md §16): every read is an expression's, which resolves it
+    /// (the evaluator's column access), and query memory charges it at its resolved size
+    /// ([`crate::memsize::value_bytes`]). Only ever a `text`, `bytea`, or `json` value stored out of
+    /// line or compressed. The flag rides the buffer's own copy, never the shared leaf's reference.
+    pub(crate) fn is_buffered(&self) -> bool {
+        match self {
+            Unfetched::Inline { .. } => false,
+            Unfetched::External { buffered, .. }
+            | Unfetched::InlineComp { buffered, .. }
+            | Unfetched::ExternalComp { buffered, .. } => *buffered,
+        }
+    }
+
+    /// Mark a large-form reference as held by an eager-lane buffer (§16). Never called on the
+    /// inline-plain form.
+    pub(crate) fn mark_buffered(&mut self) {
+        match self {
+            Unfetched::Inline { .. } => {
+                unreachable!("an inline-plain deferred value is never buffered by reference")
+            }
+            Unfetched::External { buffered, .. }
+            | Unfetched::InlineComp { buffered, .. }
+            | Unfetched::ExternalComp { buffered, .. } => *buffered = true,
+        }
+    }
+
+    /// A buffered value's resolved payload length — the length of the string it resolves to: the
+    /// stored length of an external-plain value, the raw (decompressed) length of a compressed one.
+    pub(crate) fn buffered_payload_len(&self) -> i64 {
+        match self {
+            Unfetched::External { len, .. } => *len as i64,
+            Unfetched::InlineComp { raw_len, .. } | Unfetched::ExternalComp { raw_len, .. } => {
+                *raw_len as i64
+            }
+            Unfetched::Inline { len, .. } => *len as i64,
+        }
     }
 }
 
@@ -602,7 +647,11 @@ impl std::hash::Hash for Value {
             Value::Jsonb(n) => n.hash(state),
             Value::Json(s) => s.hash(state),
             Value::JsonPath(s) => s.hash(state),
-            Value::Unfetched(u) => u.hash(state),
+            // A dedup, grouping, or hash key is always built from resolved values: an evaluated
+            // value or a key column the scan resolved (spec/design/large-values.md §16).
+            Value::Unfetched(_) => {
+                panic!("BUG: an unfetched value reached a dedup or grouping key")
+            }
         }
     }
 }

@@ -5,6 +5,134 @@
 use super::explain_exec::{select_actual_rel_node, select_actual_root_node};
 use super::*;
 
+/// Per relation, the touched columns whose large `text`, `bytea`, or `json` values the eager lane's
+/// relation buffer keeps by reference (spec/design/large-values.md §16): every touched column but
+/// the key columns the lane reads without evaluating — a bare grouping slot (of any grouping set)
+/// when the plan aggregates, otherwise a bare ORDER BY or window PARTITION BY / ORDER BY slot — and,
+/// over more than one relation, every column an ON clause or the WHERE references, which covers the
+/// join keys. A `None` entry keeps nothing by reference. Mirrors impl/go `bufferedColumns`.
+fn buffered_columns(plan: &SelectPlan) -> Vec<Option<Vec<bool>>> {
+    let total: usize = plan.rels.iter().map(|r| r.col_count).sum();
+    let mut key = vec![false; total];
+    // A slot at or past `total` is synthetic (a materialized expression key), never an input column.
+    let mut mark = |slot: usize| {
+        if slot < total {
+            key[slot] = true;
+        }
+    };
+    if plan.is_agg {
+        for &gk in &plan.group_keys {
+            mark(gk);
+        }
+        for set in &plan.group_sets {
+            for &gk in &set.key_cols {
+                mark(gk);
+            }
+        }
+    } else {
+        for key in &plan.order {
+            mark(key.col);
+        }
+        for spec in &plan.window_specs {
+            for &pk in &spec.partition {
+                mark(pk);
+            }
+            for key in &spec.order {
+                mark(key.col);
+            }
+        }
+    }
+    if plan.rels.len() > 1 {
+        if let Some(f) = plan.filter.get() {
+            collect_touched(f, 0, &mut key);
+        }
+        for j in &plan.joins {
+            if let Some(on) = &j.on {
+                collect_touched(on, 0, &mut key);
+            }
+        }
+    }
+    mark_nested_reads(plan, &mut key);
+    plan.rels
+        .iter()
+        .zip(&plan.rel_masks)
+        .map(|(rel, touched)| {
+            let buffer: Vec<bool> = touched
+                .iter()
+                .enumerate()
+                .map(|(c, &t)| t && !key[rel.offset + c])
+                .collect();
+            buffer.contains(&true).then_some(buffer)
+        })
+        .collect()
+}
+
+/// Mark the columns of `plan`'s frame that a nested subquery or a LATERAL derived body reads. Those
+/// plans read an outer value into their own scan bounds without evaluating it, so such a column is a
+/// key column (spec/design/large-values.md §16). The expressions walked are `collect_touched_plan`'s.
+/// Mirrors impl/go `markNestedReads`.
+fn mark_nested_reads(plan: &SelectPlan, key: &mut [bool]) {
+    for j in &plan.joins {
+        if let Some(on) = &j.on {
+            collect_nested_reads(on, key);
+        }
+    }
+    if let Some(f) = plan.filter.get() {
+        collect_nested_reads(f, key);
+    }
+    if let Some(h) = &plan.having {
+        collect_nested_reads(h, key);
+    }
+    for s in &plan.agg_specs {
+        if let Some(op) = &s.operand {
+            collect_nested_reads(op, key);
+        }
+        if let Some(f) = &s.filter {
+            collect_nested_reads(f, key);
+        }
+        if let Some(f) = s.osa.as_ref().and_then(|o| o.frac.as_ref()) {
+            collect_nested_reads(f, key);
+        }
+        if let Some(order) = &s.order {
+            for k in &order.keys {
+                collect_nested_reads(k, key);
+            }
+        }
+        if let Some(h) = &s.hypo {
+            for e in h.args.iter().chain(h.keys.iter()) {
+                collect_nested_reads(e, key);
+            }
+        }
+    }
+    for w in &plan.window_specs {
+        for a in &w.args {
+            collect_nested_reads(a, key);
+        }
+        if let Some(f) = &w.filter {
+            collect_nested_reads(f, key);
+        }
+    }
+    for p in &plan.projections {
+        collect_nested_reads(p, key);
+    }
+    for oe in &plan.order_exprs {
+        collect_nested_reads(oe, key);
+    }
+    for ge in &plan.group_exprs {
+        collect_nested_reads(ge, key);
+    }
+    for r in &plan.rels {
+        if let Some(srf) = &r.srf {
+            for a in &srf.args {
+                collect_nested_reads(a, key);
+            }
+        }
+        if let Some(derived) = r.derived.as_ref().filter(|_| r.lateral) {
+            collect_touched_plan(derived, 1, key);
+        }
+    }
+}
+
 fn logical_join_row_width(plan: &SelectPlan) -> usize {
     plan.rels.last().map_or(0, |rel| rel.offset + rel.col_count)
 }
@@ -568,13 +696,14 @@ impl Engine {
         let mem_mask = plan.memory_mask(meter);
         let mut materialized: Vec<Vec<Row>> = Vec::with_capacity(plan.rels.len());
         let mut rel_work = vec![0i64; plan.rels.len()];
+        let buffered = buffered_columns(plan);
         for (ri, rel) in plan.rels.iter().enumerate() {
             if rel.lateral || plan.phys.rel_inl_bounds[ri].is_some() {
                 materialized.push(Vec::new());
                 continue;
             }
             let before = meter.accrued;
-            materialized.push(self.materialize_rel(
+            materialized.push(self.materialize_rel_buffering(
                 plan,
                 ri,
                 params,
@@ -583,6 +712,7 @@ impl Engine {
                 stmt_rng,
                 env.ctes,
                 meter,
+                buffered[ri].as_deref(),
             )?);
             rel_work[ri] = meter.accrued - before;
         }

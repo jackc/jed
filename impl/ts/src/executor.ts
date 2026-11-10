@@ -25744,6 +25744,7 @@ export class Engine {
     baseEnv: EvalEnv,
     params: Value[],
     meter: Meter,
+    buffer: boolean[] | null = null,
   ): Steps<Row[]> {
     // A WHERE contradiction (planner.md §3.1) reads no relation: nothing is scanned, generated, or
     // run, and nothing is charged.
@@ -25774,7 +25775,16 @@ export class Engine {
       rebaseRowsMasked(meter, r.rows, plan.relMasks[ri]!);
       rows = r.rows;
     } else {
-      return yield* this.materializeBaseRowsSteps(plan, ri, outer, left, baseEnv, params, meter);
+      return yield* this.materializeBaseRowsSteps(
+        plan,
+        ri,
+        outer,
+        left,
+        baseEnv,
+        params,
+        meter,
+        buffer,
+      );
     }
     const pushed = pushedFilter(plan, ri).local;
     if (pushed === null) return rows;
@@ -25960,6 +25970,8 @@ export class Engine {
     return runSync(this.materializeBaseRowsSteps(plan, ri, outer, left, baseEnv, params, meter));
   }
 
+  // buffer marks the touched columns whose large values the eager lane's relation buffer keeps by
+  // reference (large-values.md §16, bufferedColumns); null for every caller but the eager lane.
   private *materializeBaseRowsSteps(
     plan: SelectPlan,
     ri: number,
@@ -25968,6 +25980,7 @@ export class Engine {
     baseEnv: EvalEnv,
     params: Value[],
     meter: Meter,
+    buffer: boolean[] | null = null,
   ): Steps<Row[]> {
     const rel = plan.rels[ri]!;
     const env: EvalEnv = { ...baseEnv, outer };
@@ -26131,10 +26144,11 @@ export class Engine {
       slabs = u.slabs;
     }
     // Materialize this relation's touched columns where the lazy load left unfetched references
-    // (large-values.md §14) — exactly the static set the cost block charges.
+    // (large-values.md §14) — exactly the static set the cost block charges — except the large values
+    // an eager-lane buffer keeps by reference (§16).
     for (let i = 0; i < rows.length; i++) {
       if (shouldCooperate()) yield COOPERATE;
-      rows[i] = yield* store.resolveColumnsSteps(rows[i]!, plan.relMasks[ri]!);
+      rows[i] = yield* store.resolveColumnsBufferingSteps(rows[i]!, plan.relMasks[ri]!, buffer);
     }
     meter.charge(COSTS.valueDecompress * BigInt(slabs));
     // The relation's pushed WHERE conjuncts (planner.md §3.2) run on each admitted row, after its
@@ -27790,6 +27804,7 @@ export class Engine {
     const memMask = memoryMask(plan, meter);
     const materialized: Row[][] = [];
     const relWork = new Array<bigint>(plan.rels.length).fill(0n);
+    const buffered = bufferedColumns(plan);
     for (let ri = 0; ri < plan.rels.length; ri++) {
       if (shouldCooperate()) yield COOPERATE;
       const rel = plan.rels[ri]!;
@@ -27799,7 +27814,7 @@ export class Engine {
       }
       const before = meter.accrued;
       materialized.push(
-        yield* this.materializeRelSteps(plan, ri, env.outer, [], env, params, meter),
+        yield* this.materializeRelSteps(plan, ri, env.outer, [], env, params, meter, buffered[ri]!),
       );
       relWork[ri] = meter.accrued - before;
     }
@@ -37252,6 +37267,89 @@ function computeRelMasks(plan: SelectPlan): boolean[][] {
   return plan.rels.map((r) => touched.slice(r.offset, r.offset + r.colCount));
 }
 
+// bufferedColumns returns, per relation, the touched columns whose large text, bytea, or json values
+// the eager lane's relation buffer keeps by reference (large-values.md §16): every touched column but
+// the key columns the lane reads without evaluating — a bare grouping, ORDER BY, or window PARTITION
+// BY / ORDER BY slot; over more than one relation, every column an ON clause or the WHERE references,
+// which covers the join keys; and every column a nested subquery or a LATERAL derived body reads
+// (markNestedReads). A null entry keeps nothing by reference. Mirrors Go
+// bufferedColumns; the slot sets are computeRelMasks' (a synthetic expression-key slot lies beyond
+// the real columns and marks nothing).
+export function bufferedColumns(plan: SelectPlan): (boolean[] | null)[] {
+  const total = plan.rels.reduce((a, r) => a + r.colCount, 0);
+  const key: boolean[] = new Array(total).fill(false);
+  const mark = (slot: number): void => {
+    if (slot < total) key[slot] = true;
+  };
+  if (plan.isAgg) {
+    for (const gk of plan.groupKeys) mark(gk);
+    for (const set of plan.groupSets) for (const gk of set.keyCols) mark(gk);
+  } else {
+    for (const o of plan.order) mark(o.idx);
+    for (const spec of plan.windowSpecs) {
+      for (const pk of spec.partition) mark(pk);
+      for (const o of spec.order) mark(o.idx);
+    }
+  }
+  if (plan.rels.length > 1) {
+    if (plan.filter !== null) collectTouched(plan.filter, 0, key);
+    for (const j of plan.joins) if (j.on !== null) collectTouched(j.on, 0, key);
+  }
+  markNestedReads(plan, key);
+  return plan.rels.map((rel, ri) => {
+    const touched = plan.relMasks[ri]!;
+    let buffer: boolean[] | null = null;
+    for (let c = 0; c < touched.length; c++) {
+      if (touched[c] === true && !key[rel.offset + c]) {
+        if (buffer === null) buffer = new Array<boolean>(touched.length).fill(false);
+        buffer[c] = true;
+      }
+    }
+    return buffer;
+  });
+}
+
+// markNestedReads marks the columns of plan's frame that a nested subquery or a LATERAL derived body
+// reads. Those plans read an outer value into their own scan bounds without evaluating it, so such a
+// column is a key column (large-values.md §16). The expressions walked are collectTouchedPlan's.
+// Mirrors Go markNestedReads.
+function markNestedReads(plan: SelectPlan, key: boolean[]): void {
+  const walk = (e: RExpr | null | undefined): void => {
+    if (e == null) return;
+    if (e.kind === "subquery") {
+      walk(e.lhs);
+      collectTouchedPlan(e.plan, 1, key);
+      return;
+    }
+    for (const c of estimatorExpressionChildren(e)) walk(c);
+  };
+  for (const j of plan.joins) walk(j.on);
+  walk(plan.filter);
+  walk(plan.having);
+  for (const s of plan.aggSpecs) {
+    walk(s.operand);
+    walk(s.filter);
+    walk(s.osaFrac);
+    if (s.order != null) for (const k of s.order.keys) walk(k);
+    if (s.hypo != null) {
+      for (const e of s.hypo.args) walk(e);
+      for (const e of s.hypo.keys) walk(e);
+    }
+  }
+  for (const w of plan.windowSpecs) {
+    for (const a of w.args) walk(a);
+    walk(w.filter);
+  }
+  for (const p of plan.projections) walk(p);
+  for (const oe of plan.orderExprs) walk(oe);
+  for (const ge of plan.groupExprs) walk(ge);
+  for (const rel of plan.rels) {
+    if (rel.srf !== undefined) for (const a of rel.srf.args) walk(a);
+    if (rel.derived !== undefined && rel.lateral === true)
+      collectTouchedPlan(rel.derived, 1, key);
+  }
+}
+
 // JoinGroupLayout is the output shape of an unaliased parenthesized join's body
 // (spec/design/grammar.md §15): columns are the body outputs (the star columns, then the hidden
 // USING/NATURAL copies), each keeping its source column's name, type, and collation; hidden is the
@@ -38543,9 +38641,9 @@ export function distinctValueKey(v: Value): string {
         (v.kind === "f32" ? "f" : "g") +
         (Number.isNaN(v.value) ? "NaN" : canonFloat(v.value).toString())
       );
-    default:
-      // unfetched never reaches a projected dedup row (the scan layer resolves touched columns).
-      throw new Error("BUG: unfetched large value escaped the storage layer");
+    case "unfetched":
+      // A key is always built from resolved values (large-values.md §16).
+      throw new Error("BUG: an unfetched value reached a dedup or grouping key");
   }
 }
 

@@ -1217,12 +1217,25 @@ pub(crate) fn subscript_bounds(s: &RSubscript) -> Vec<&RExpr> {
 /// (touches). Purely syntactic — a never-taken CASE branch still touches — so the set is
 /// deterministic and cross-core identical (a §8 contract).
 pub(crate) fn collect_touched(e: &RExpr, depth: usize, touched: &mut [bool]) {
+    collect_touched_mode(e, depth, touched, true);
+}
+
+/// The columns of the target scope (depth 0) that a nested subquery reads: [`collect_touched`]
+/// without the scope's own direct column references. A correlated subquery reads such an outer
+/// value into its own scan bounds without evaluating it, so an eager-lane buffer treats it as a key
+/// column (spec/design/large-values.md §16; impl/go `markNestedReads`).
+pub(crate) fn collect_nested_reads(e: &RExpr, touched: &mut [bool]) {
+    collect_touched_mode(e, 0, touched, false);
+}
+
+/// [`collect_touched`], marking a depth-0 `Column` only when `direct` is set.
+fn collect_touched_mode(e: &RExpr, depth: usize, touched: &mut [bool], direct: bool) {
     match e {
         RExpr::Column(i) => {
             // A `Column` index beyond the real columns is a SYNTHETIC slot (an aggregate or window
             // result, spec/design/window.md §5.1), not a table column — it touches no stored data,
             // so the bound check skips it rather than panicking.
-            if depth == 0 && *i < touched.len() {
+            if direct && depth == 0 && *i < touched.len() {
                 touched[*i] = true;
             }
         }
@@ -1237,70 +1250,70 @@ pub(crate) fn collect_touched(e: &RExpr, depth: usize, touched: &mut [bool]) {
         }
         RExpr::Subquery { plan, lhs, .. } => {
             if let Some(l) = lhs {
-                collect_touched(l, depth, touched);
+                collect_touched_mode(l, depth, touched, direct);
             }
             collect_touched_plan(plan, depth + 1, touched);
         }
-        RExpr::InValues { lhs, .. } => collect_touched(lhs, depth, touched),
+        RExpr::InValues { lhs, .. } => collect_touched_mode(lhs, depth, touched, direct),
         RExpr::Quantified { lhs, array, .. }
         | RExpr::WidthBucketArray {
             operand: lhs,
             thresholds: array,
             ..
         } => {
-            collect_touched(lhs, depth, touched);
-            collect_touched(array, depth, touched);
+            collect_touched_mode(lhs, depth, touched, direct);
+            collect_touched_mode(array, depth, touched, direct);
         }
         RExpr::Cast { inner, .. } | RExpr::ArrayCast { inner, .. } | RExpr::CompositeCast { inner, .. } => {
-            collect_touched(inner, depth, touched)
+            collect_touched_mode(inner, depth, touched, direct)
         }
-        RExpr::Neg { operand, .. } => collect_touched(operand, depth, touched),
-        RExpr::Not(x) => collect_touched(x, depth, touched),
-        RExpr::Casing { arg, .. } => collect_touched(arg, depth, touched),
+        RExpr::Neg { operand, .. } => collect_touched_mode(operand, depth, touched, direct),
+        RExpr::Not(x) => collect_touched_mode(x, depth, touched, direct),
+        RExpr::Casing { arg, .. } => collect_touched_mode(arg, depth, touched, direct),
         RExpr::AtTimeZone { zone, value, .. } => {
-            collect_touched(zone, depth, touched);
-            collect_touched(value, depth, touched);
+            collect_touched_mode(zone, depth, touched, direct);
+            collect_touched_mode(value, depth, touched, direct);
         }
         RExpr::DateTrunc { unit, value, zone } => {
-            collect_touched(unit, depth, touched);
-            collect_touched(value, depth, touched);
+            collect_touched_mode(unit, depth, touched, direct);
+            collect_touched_mode(value, depth, touched, direct);
             if let Some(z) = zone {
-                collect_touched(z, depth, touched);
+                collect_touched_mode(z, depth, touched, direct);
             }
         }
-        RExpr::Extract { value, .. } => collect_touched(value, depth, touched),
-        RExpr::DateConvert { inner, .. } => collect_touched(inner, depth, touched),
+        RExpr::Extract { value, .. } => collect_touched_mode(value, depth, touched, direct),
+        RExpr::DateConvert { inner, .. } => collect_touched_mode(inner, depth, touched, direct),
         RExpr::Arith { lhs, rhs, .. }
         | RExpr::Compare { lhs, rhs, .. }
         | RExpr::Distinct { lhs, rhs, .. }
         | RExpr::Like { lhs, rhs, .. }
         | RExpr::Regex { lhs, rhs, .. } => {
-            collect_touched(lhs, depth, touched);
-            collect_touched(rhs, depth, touched);
+            collect_touched_mode(lhs, depth, touched, direct);
+            collect_touched_mode(rhs, depth, touched, direct);
         }
         RExpr::JsonGet { base, arg, .. }
         | RExpr::JsonHasKey { base, arg, .. }
         | RExpr::JsonDelete { base, arg, .. } => {
-            collect_touched(base, depth, touched);
-            collect_touched(arg, depth, touched);
+            collect_touched_mode(base, depth, touched, direct);
+            collect_touched_mode(arg, depth, touched, direct);
         }
         RExpr::JsonContains { a, b } | RExpr::JsonConcat { a, b } => {
-            collect_touched(a, depth, touched);
-            collect_touched(b, depth, touched);
+            collect_touched_mode(a, depth, touched, direct);
+            collect_touched_mode(b, depth, touched, direct);
         }
         RExpr::And(l, r) | RExpr::Or(l, r) => {
-            collect_touched(l, depth, touched);
-            collect_touched(r, depth, touched);
+            collect_touched_mode(l, depth, touched, direct);
+            collect_touched_mode(r, depth, touched, direct);
         }
         RExpr::IsNull { operand, .. }
         | RExpr::IsJson { operand, .. }
-        | RExpr::JsonCtor { operand, .. } => collect_touched(operand, depth, touched),
+        | RExpr::JsonCtor { operand, .. } => collect_touched_mode(operand, depth, touched, direct),
         RExpr::Case { arms, els, .. } => {
             for (c, r) in arms {
-                collect_touched(c, depth, touched);
-                collect_touched(r, depth, touched);
+                collect_touched_mode(c, depth, touched, direct);
+                collect_touched_mode(r, depth, touched, direct);
             }
-            collect_touched(els, depth, touched);
+            collect_touched_mode(els, depth, touched, direct);
         }
         RExpr::Coalesce { args, .. }
         | RExpr::GreatestLeast { args, .. }
@@ -1320,7 +1333,7 @@ pub(crate) fn collect_touched(e: &RExpr, depth: usize, touched: &mut [bool]) {
         | RExpr::JsonImage { args, .. }
         | RExpr::JsonPathFn { args, .. } => {
             for a in args {
-                collect_touched(a, depth, touched);
+                collect_touched_mode(a, depth, touched, direct);
             }
         }
         RExpr::JsonSqlFn {
@@ -1331,28 +1344,28 @@ pub(crate) fn collect_touched(e: &RExpr, depth: usize, touched: &mut [bool]) {
             on_error_default,
             ..
         } => {
-            collect_touched(ctx, depth, touched);
-            collect_touched(path, depth, touched);
+            collect_touched_mode(ctx, depth, touched, direct);
+            collect_touched_mode(path, depth, touched, direct);
             for p in passing
                 .iter()
                 .chain(on_empty_default.as_deref())
                 .chain(on_error_default.as_deref())
             {
-                collect_touched(p, depth, touched);
+                collect_touched_mode(p, depth, touched, direct);
             }
         }
         RExpr::Row(fields) | RExpr::Array { elems: fields, .. } => {
             for f in fields {
-                collect_touched(f, depth, touched);
+                collect_touched_mode(f, depth, touched, direct);
             }
         }
-        RExpr::Field { base, .. } => collect_touched(base, depth, touched),
+        RExpr::Field { base, .. } => collect_touched_mode(base, depth, touched, direct),
         RExpr::Subscript {
             base, subscripts, ..
         } => {
-            collect_touched(base, depth, touched);
+            collect_touched_mode(base, depth, touched, direct);
             for e in subscripts.iter().flat_map(subscript_bounds) {
-                collect_touched(e, depth, touched);
+                collect_touched_mode(e, depth, touched, direct);
             }
         }
         RExpr::Param(_)

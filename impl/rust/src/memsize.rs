@@ -30,8 +30,10 @@ pub(crate) fn value_bytes(v: &Value) -> i64 {
                 + r.upper.as_deref().map_or(0, value_bytes)
         }
         Value::Jsonb(node) => jsonb_bytes(node),
-        // NULL, fixed-width scalars, and an unfetched reference (only ever an untouched slot) are a
-        // bare node.
+        // A buffered touched value counts as the string it resolves to (large-values.md §16); any
+        // other reference is an untouched slot, a bare node.
+        Value::Unfetched(u) if u.is_buffered() => MEMORY_VALUE + u.buffered_payload_len(),
+        // NULL and fixed-width scalars are a bare node.
         _ => MEMORY_VALUE,
     }
 }

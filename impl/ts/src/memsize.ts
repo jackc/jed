@@ -15,7 +15,7 @@ import {
   MEMORY_VALUE,
 } from "./costs.ts";
 import type { JsonNode } from "./json.ts";
-import type { Value } from "./value.ts";
+import { type Value, bufferedPayloadLen } from "./value.ts";
 
 // utf8Length is the UTF-8 byte length of a JS (UTF-16) string, measured without allocating an encoded
 // copy. A surrogate pair is one 4-byte code point; a lone surrogate encodes as U+FFFD (3 bytes), the
@@ -101,9 +101,12 @@ export function valueBytes(v: Value | undefined): number {
     }
     case "jsonb":
       return jsonbBytes(v.node);
+    case "unfetched":
+      // A buffered touched value counts as the string it resolves to (large-values.md §16); any
+      // other reference is an untouched slot, a bare node.
+      return v.ref.buffered === true ? MEMORY_VALUE + bufferedPayloadLen(v.ref) : MEMORY_VALUE;
     default:
-      // NULL, fixed-width scalars, and an unfetched reference (only ever an untouched slot) are a
-      // bare node.
+      // NULL and fixed-width scalars are a bare node.
       return MEMORY_VALUE;
   }
 }

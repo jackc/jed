@@ -134,6 +134,19 @@ type Unfetched struct {
 	// Rust-style weak ref is needed); nil for the inline forms (they own their bytes) and for a
 	// handle that must never resolve (the open-time reachability walk, the spill sentinel).
 	paging *sharedPaging
+	// buffered marks a touched value an eager-lane relation buffer holds by reference instead of
+	// resolved (large-values.md §16): every read is an expression's, which resolves it, and query
+	// memory charges it at its resolved size (memValueBytes). Always a text, bytea, or json value
+	// stored out of line or compressed.
+	buffered bool
+}
+
+// bufferedPayloadLen is a buffered value's resolved payload length — the length of its string.
+func (u *Unfetched) bufferedPayloadLen() int64 {
+	if u.Form == tagExternal {
+		return int64(u.StoredLen)
+	}
+	return int64(u.RawLen)
 }
 
 // Value is a runtime value: SQL NULL, an integer, a boolean, or a text string. Integers

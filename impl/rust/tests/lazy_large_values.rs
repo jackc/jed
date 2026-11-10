@@ -10,7 +10,7 @@
 
 use jed::{CreateOptions, Database, OpenOptions, Outcome, Session, SessionOptions};
 
-const PAGE_SIZE: u32 = 256;
+pub(crate) const PAGE_SIZE: u32 = 256;
 
 /// SQL results belong in foreign_key_*child.test. This physical check proves a reverse FK
 /// scan never fetches an unrelated overflow payload, even when that payload is corrupt.
@@ -83,13 +83,13 @@ fn filler_text(n: usize) -> String {
         .collect()
 }
 
-fn tmp(name: &str) -> std::path::PathBuf {
+pub(crate) fn tmp(name: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(name)
 }
 
 /// Remove a closed test database and the `<path>.lock/` coordination bundle opening it created
 /// beside it (spec/design/locking.md).
-fn remove_db(path: &std::path::Path) {
+pub(crate) fn remove_db(path: &std::path::Path) {
     let _ = std::fs::remove_file(path);
     let _ = std::fs::remove_dir_all(path.with_extension("jed.lock"));
 }
@@ -112,7 +112,7 @@ fn query_rows(db: &mut Session, sql: &str) -> Vec<Vec<jed::Value>> {
 /// (incompressible 600-char filler → a 3-page chain), id 2 external-compressed (half
 /// filler / half run → the ~212-byte block spills to a 1-page chain), id 3
 /// inline-compressed (a 600-char run), id 4 plain inline.
-fn seed(db: &mut Session) {
+pub(crate) fn seed(db: &mut Session) {
     db.query_outcome("CREATE TABLE t (id i32 PRIMARY KEY, body text)", &[])
         .unwrap();
     let plain = filler_text(600);
@@ -146,7 +146,7 @@ fn page_crc(page: &[u8]) -> u32 {
 /// decode-time failure (non-UTF-8 for a plain text payload, a malformed LZ4 block for a compressed
 /// one) from the per-page checksum: a checksum-*inconsistent* corruption is instead caught at open
 /// (the dedicated test in checksum.rs). Any read of the chain's bytes still yields garbage.
-fn corrupt_overflow_payloads(path: &std::path::Path) {
+pub(crate) fn corrupt_overflow_payloads(path: &std::path::Path) {
     // A checkpoint has no incremental dirty-page descriptor: isolate inherited lazy decoding.
     let db = Database::open_with_options(
         path,

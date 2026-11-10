@@ -782,6 +782,7 @@ fn read_value<R: Read>(r: &mut R) -> io::Result<Value> {
             len: read_u32(r)?,
             ty: crate::value::TypeRef::sentinel(),
             paging: crate::value::PagerRef::default(),
+            buffered: false,
         }),
         10 => {
             let raw_len = read_u32(r)?;
@@ -790,6 +791,7 @@ fn read_value<R: Read>(r: &mut R) -> io::Result<Value> {
                 comp,
                 raw_len,
                 ty: crate::value::TypeRef::sentinel(),
+                buffered: false,
             })
         }
         11 => Value::Unfetched(Unfetched::ExternalComp {
@@ -798,6 +800,7 @@ fn read_value<R: Read>(r: &mut R) -> io::Result<Value> {
             raw_len: read_u32(r)?,
             ty: crate::value::TypeRef::sentinel(),
             paging: crate::value::PagerRef::default(),
+            buffered: false,
         }),
         12 => {
             let mut mb = [0u8; 4];

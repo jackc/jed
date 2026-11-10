@@ -146,7 +146,19 @@ export type Unfetched = {
   comp: Uint8Array | undefined;
   ty: TypeRef;
   paging: UnfetchedPager | null;
+  // buffered marks a touched value an eager-lane relation buffer holds by reference instead of
+  // resolved (large-values.md §16): every read is an expression's, which resolves it, and query
+  // memory charges it at its resolved size (memsize.ts valueBytes). Always a text, bytea, or json
+  // value stored out of line or compressed, set on a fresh copy — never on a leaf's shared reference.
+  buffered?: boolean;
 };
+
+// bufferedPayloadLen is a buffered value's resolved payload length — the UTF-8 / byte length of the
+// string it resolves to: the stored length of an external-plain value, the raw (decompressed) length
+// of a compressed one.
+export function bufferedPayloadLen(u: Unfetched): number {
+  return u.form === 0x02 ? u.storedLen : u.rawLen;
+}
 
 // TypeRef is a cheap shared reference to a deferred value's column type (bplus-reshape.md B4): the
 // store's shared column-type array plus this value's column ordinal — one reference per deferred

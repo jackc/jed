@@ -2198,14 +2198,20 @@ func rowsFromValues(in [][]Value) []storedRow {
 // query's own outer, which is exactly the frame its body was planned against (the enclosing query's
 // scope, §42).
 func (db *engine) materializeRel(plan *selectPlan, ri int, params []Value, outer []storedRow, left storedRow, rng *stmtRng, ctes cteCtx, meter *costMeter) ([]storedRow, error) {
+	return db.materializeRelBuffering(plan, ri, params, outer, left, rng, ctes, meter, nil)
+}
+
+// materializeRelBuffering is materializeRel keeping a base table's buffer columns by reference
+// (resolveColumnsBuffering); buffer is nil for every caller but the eager lane.
+func (db *engine) materializeRelBuffering(plan *selectPlan, ri int, params []Value, outer []storedRow, left storedRow, rng *stmtRng, ctes cteCtx, meter *costMeter, buffer []bool) ([]storedRow, error) {
 	rel := plan.rels[ri]
 	_, pushed := plan.pushedFilter(ri)
 	if pushed == nil || rel.srf == nil && rel.cte == nil && rel.derived == nil {
-		return db.materializeRelRows(plan, ri, params, outer, left, rng, ctes, meter)
+		return db.materializeRelRows(plan, ri, params, outer, left, rng, ctes, meter, buffer)
 	}
 	// A computed relation's scan-pushed filter (planner.md §3.2) runs over its produced rows in
 	// production order; each rejected row's reservation is released before the join reads them.
-	rows, err := db.materializeRelRows(plan, ri, params, outer, left, rng, ctes, meter)
+	rows, err := db.materializeRelRows(plan, ri, params, outer, left, rng, ctes, meter, buffer)
 	if err != nil {
 		return nil, err
 	}
@@ -2227,7 +2233,7 @@ func (db *engine) materializeRel(plan *selectPlan, ri int, params []Value, outer
 
 // materializeRelRows produces relation ri's rows; a base table applies its pushed filter as its
 // access path admits each row.
-func (db *engine) materializeRelRows(plan *selectPlan, ri int, params []Value, outer []storedRow, left storedRow, rng *stmtRng, ctes cteCtx, meter *costMeter) ([]storedRow, error) {
+func (db *engine) materializeRelRows(plan *selectPlan, ri int, params []Value, outer []storedRow, left storedRow, rng *stmtRng, ctes cteCtx, meter *costMeter, buffer []bool) ([]storedRow, error) {
 	rel := plan.rels[ri]
 	// A WHERE contradiction (planner.md §3.1) reads no relation: nothing is scanned, generated, or
 	// run, and nothing is charged.
@@ -2489,10 +2495,11 @@ func (db *engine) materializeRelRows(plan *selectPlan, ri int, params []Value, o
 		nodeCount, slabs = pages, sl
 	}
 	// Materialize this relation's touched columns where the lazy load left unfetched references
-	// (large-values.md §14) — exactly the static set the cost block charges.
+	// (large-values.md §14) — exactly the static set the cost block charges — except the large values
+	// an eager-lane buffer keeps by reference (§16).
 	for i := range rows {
 		var err error
-		if rows[i], err = store.resolveColumns(rows[i], plan.relMasks[ri]); err != nil {
+		if rows[i], err = store.resolveColumnsBuffering(rows[i], plan.relMasks[ri], buffer); err != nil {
 			return nil, err
 		}
 	}

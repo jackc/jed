@@ -605,12 +605,13 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 	memMask := plan.memoryMask(meter)
 	materialized := make([][]storedRow, len(plan.rels))
 	relWork := make([]int64, len(plan.rels))
+	buffered := bufferedColumns(plan)
 	for ri, rel := range plan.rels {
 		if rel.lateral || plan.phys.relINLBounds[ri] != nil {
 			continue
 		}
 		before := meter.Accrued
-		rows, err := db.materializeRel(plan, ri, params, outer, nil, env.rng, env.ctes, meter)
+		rows, err := db.materializeRelBuffering(plan, ri, params, outer, nil, env.rng, env.ctes, meter, buffered[ri])
 		if err != nil {
 			return emitter{}, err
 		}
@@ -2762,6 +2763,138 @@ func valueToRExpr(v Value) *rExpr {
 	}
 }
 
+// bufferedColumns returns, per relation, the touched columns whose large text, bytea, or json values
+// the eager lane's relation buffer keeps by reference (large-values.md §16): every touched column but
+// the key columns the lane reads without evaluating — a bare grouping, ORDER BY, or window PARTITION
+// BY / ORDER BY slot; over more than one relation, every column an ON clause or the WHERE references,
+// which covers the join keys; and every column a nested subquery or LATERAL derived body reads
+// (markNestedReads). A nil entry keeps nothing by reference.
+func bufferedColumns(plan *selectPlan) [][]bool {
+	total := 0
+	for _, rel := range plan.rels {
+		total += rel.colCount
+	}
+	key := make([]bool, total)
+	mark := func(slot int) {
+		if slot < total {
+			key[slot] = true
+		}
+	}
+	if plan.isAgg {
+		for _, gk := range plan.groupKeys {
+			mark(gk)
+		}
+		for _, set := range plan.groupSets {
+			for _, gk := range set.keyCols {
+				mark(gk)
+			}
+		}
+	} else {
+		for _, o := range plan.order {
+			mark(o.idx)
+		}
+		for _, spec := range plan.windowSpecs {
+			for _, pk := range spec.partition {
+				mark(pk)
+			}
+			for _, o := range spec.order {
+				mark(o.idx)
+			}
+		}
+	}
+	if len(plan.rels) > 1 {
+		collectTouched(plan.filter, 0, key)
+		for k := range plan.joins {
+			collectTouched(plan.joins[k].on, 0, key)
+		}
+	}
+	markNestedReads(plan, key)
+	out := make([][]bool, len(plan.rels))
+	for ri, rel := range plan.rels {
+		touched := plan.relMasks[ri]
+		var buffer []bool
+		for c := range touched {
+			if touched[c] && !key[rel.offset+c] {
+				if buffer == nil {
+					buffer = make([]bool, len(touched))
+				}
+				buffer[c] = true
+			}
+		}
+		out[ri] = buffer
+	}
+	return out
+}
+
+// markNestedReads marks the columns of plan's frame that a nested subquery or a LATERAL derived
+// body reads. Those plans read an outer value into their own scan bounds without evaluating it, so
+// such a column is a key column (large-values.md §16). The expressions walked are collectTouchedPlan's.
+func markNestedReads(sp *selectPlan, key []bool) {
+	var walk func(e *rExpr)
+	walk = func(e *rExpr) {
+		if e == nil {
+			return
+		}
+		if e.kind == reSubquery {
+			walk(e.lhs)
+			collectTouchedPlan(e.subPlan, 1, key)
+			return
+		}
+		for _, c := range rexprChildren(e) {
+			walk(c)
+		}
+	}
+	for k := range sp.joins {
+		walk(sp.joins[k].on)
+	}
+	walk(sp.filter)
+	walk(sp.having)
+	for i := range sp.aggSpecs {
+		s := &sp.aggSpecs[i]
+		walk(s.operand)
+		walk(s.filter)
+		walk(s.osaFrac)
+		if o := s.order; o != nil {
+			for _, k := range o.keys {
+				walk(k)
+			}
+		}
+		if h := s.hypo; h != nil {
+			for _, e := range h.args {
+				walk(e)
+			}
+			for _, e := range h.keys {
+				walk(e)
+			}
+		}
+	}
+	for i := range sp.windowSpecs {
+		for _, a := range sp.windowSpecs[i].args {
+			walk(a)
+		}
+		walk(sp.windowSpecs[i].filter)
+	}
+	for _, p := range sp.projections {
+		walk(p)
+	}
+	for _, oe := range sp.orderExprs {
+		walk(oe)
+	}
+	for _, ge := range sp.groupExprs {
+		walk(ge)
+	}
+	for i := range sp.rels {
+		if sp.rels[i].srf != nil {
+			for _, a := range sp.rels[i].srf.args {
+				walk(a)
+			}
+		}
+		if sp.rels[i].derived != nil && sp.rels[i].lateral {
+			collectTouchedPlan(sp.rels[i].derived, 1, key)
+		}
+	}
+}
+
 // distinctRowKey encodes a projected row into a collision-free string key for DISTINCT
 // dedup. Each field carries a type tag (n/i/b) and a payload, joined by a separator that
 // no field can contain, so e.g. (1,23) and (12,3) do not collide (spec/design/grammar.md
@@ -2902,6 +3035,9 @@ func writeRowKey(b *rowKeyBuilder, row []Value) {
 			// canonical text render keeps the scale and would split them).
 			b.WriteByte('B')
 			writeJsonbDistinctKey(&b.b, v.jsonb())
+		case ValUnfetched:
+			// A key is always built from resolved values (large-values.md §16).
+			panic("BUG: an unfetched value reached a dedup or grouping key")
 		}
 	}
 }

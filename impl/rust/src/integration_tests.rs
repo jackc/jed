@@ -31,6 +31,8 @@ mod attach;
 mod backup;
 #[path = "../tests/boolean_key.rs"]
 mod boolean_key;
+#[path = "../tests/buffered_large_values.rs"]
+mod buffered_large_values;
 #[path = "../tests/cancellation.rs"]
 mod cancellation;
 #[path = "../tests/cast_array_runtime.rs"]
