@@ -361,6 +361,74 @@ What remains, by expected value:
 - The operator-enum and exclusivity items of the second follow-up are
   unchanged.
 
+## Fifth follow-up: direct key reads and cached access inventories (2026-11-10)
+
+The fourth follow-up left a point lookup at four times Rust. A profile showed
+the tree descent itself was about a ninth of the statement; the rest was the
+general prepared path rebinding a plan, re-deriving the key bound, compiling
+the WHERE and building a one-row columnar lane.
+
+**What changed**
+
+- **Cached single-row key read** (`PreparedPointRead`). A prepared SELECT of
+  bare columns whose WHERE is exactly one `=` against a parameter for every
+  integer primary-key column records, once, what the general path would
+  decide. Later executions encode the key, descend once and replay the same
+  charges in the same order: the point preflight, one unit for the row, one
+  per AND and per comparison, the result reservation and the production
+  unit. It runs only where the general path would take the packed columnar
+  lane and the privilege check would return at once: no statement or lifetime
+  cost ceiling, an unrestricted session, non-NULL parameters, and a cache
+  whose schema and estimator signature still holds. Every other case takes
+  the general path unchanged.
+- **One descent per point access.** `BPlusTree.probe` returns the row and the
+  number of nodes on its path, which is the page count the one-key interval
+  overlaps. The general point path uses it too, in place of a count walk
+  followed by a lookup.
+- **Prepared signature check without rebuilding it**
+  (`PreparedQuerySignature.holds`), and leaf bounds checked against the page
+  in place.
+- **Statement admission.** The read-pin bundle keeps one ordered list instead
+  of a dictionary plus a list. The per-statement fork check compares a fork
+  counter maintained by a `pthread_atfork` child handler instead of calling
+  `getpid`; it falls back to `getpid` if the handler cannot be installed.
+- **Cached UPDATE/DELETE access inventory** (`PreparedMutationAccess`). The
+  list of legal access paths depends on the table definition, the predicate
+  and the environment, so a cached plan keeps it. Each execution still binds
+  every candidate to its own snapshot, estimates each and selects again.
+
+**Result.** Same method as the fourth follow-up; "before" is `ec1968ab`.
+[Per-workload results](../../impl/swift-native/BENCHMARK_FOLLOWUP_20261110C.csv).
+
+| Group | Before / Rust | After / Rust | After / Go |
+|---|---:|---:|---:|
+| Scans and aggregates (12) | 0.80× | 0.74× | 0.72× |
+| Per-statement lookups and writes (8) | 3.76× | 2.58× | 2.24× |
+| All 22 | 1.53× | 1.28× | 1.22× |
+
+A point lookup is 2.96 µs (was 10.5; Rust 2.50, Go 2.42) and a miss 1.95 µs
+(was 7.7; Rust 2.00, Go 1.32). A single-row DELETE is 19.6 µs (was 22.8).
+
+**Verification.** 551 native tests and all 749 frozen SQL files (2,271 cost
+assertions), the Swift stress run with the frozen checksum, 897/897 Swift–Go
+interchange phases, the 18 saved simulation regressions and the Swift-only
+encrypted corpus. New `PreparedPointReadTests` compare the cached read with
+the unprepared statement for rows, cost and errors: hits, misses, large and
+compressed values, compound keys, NULL parameters, cost ceilings, memory
+budgets and rows a transaction has written.
+
+**What remains**
+
+- **Single-row INSERT and DELETE are still 6–7 times Rust** (19 µs against
+  3). DELETE spends about a sixth of its time estimating candidates and the
+  rest in the write statement frame: settings and context construction,
+  domain map updates, sequence and privilege setup, each a few percent.
+  INSERT's time is index entry, record encoding and tree insertion. Closing
+  this needs the write frame redesigned as the read frame was here.
+- The cached key read covers integer keys only, and no session with a cost
+  ceiling. Other key types and limited sessions get only the shared savings.
+- General grouping is unchanged at 1.4–1.6 times Rust.
+
 ## Investigation and controlled changes
 
 1. Inspect captured compiler commands, flags, libraries, host controls and

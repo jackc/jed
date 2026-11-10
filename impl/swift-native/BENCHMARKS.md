@@ -26,6 +26,16 @@ before). [Per-workload results](BENCHMARK_FOLLOWUP_20261109.csv). It ran on a
 tmpfs data directory with one round, so it supplements the tables below and
 does not replace them.
 
+## Fifth follow-up (2026-11-10)
+
+A cached direct key read and cached write access inventories; see
+[the design record](../../spec/design/swift-native-performance.md#fifth-follow-up-direct-key-reads-and-cached-access-inventories-2026-11-10).
+On the same 22 workloads Swift/Rust geometric means are 0.74× on the scan and
+aggregate workloads (0.80× for the fourth follow-up's source in the same run),
+2.58× on the eight per-statement workloads (3.76×) and 1.28× overall (1.53×).
+A point lookup is 1.19× Rust (was 4.2×).
+[Per-workload results](BENCHMARK_FOLLOWUP_20261110C.csv), same method.
+
 ## Fourth follow-up (2026-11-10)
 
 A further pass on scans, grouping and lookup setup; see

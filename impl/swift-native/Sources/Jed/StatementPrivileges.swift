@@ -15,9 +15,13 @@ internal final class StatementPrivileges {
     var observeWrite: ((CatalogTable, SQLStatement, SQLText) -> Void)?
     init(domains: QueryDomains) { self.domains = domains }
 
+    /// A session that may do anything: `check` has nothing to visit.
+    static func unrestricted(_ settings: SessionSettings) -> Bool {
+        settings.options.allowDDL && (settings.options.allowTemporaryDDL ?? settings.options.allowDDL)
+            && settings.privileges.isUnrestricted
+    }
     static func check(_ statement: SQLStatement, snapshot: DomainSnapshot, settings: SessionSettings) throws {
-        if settings.options.allowDDL && (settings.options.allowTemporaryDDL ?? settings.options.allowDDL)
-            && settings.privileges.isUnrestricted { return }
+        if unrestricted(settings) { return }
         let domains = QueryDomains.statement(snapshot: snapshot, settings: settings)
         let requirements = StatementPrivileges(domains: domains)
         requirements.collect(statement)

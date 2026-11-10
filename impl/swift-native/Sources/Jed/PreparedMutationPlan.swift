@@ -15,6 +15,7 @@ internal struct PreparedMutationPlan {
     let returning: MutationExecutor.Returning
     let readsColumns: Bool
     let parameters: [TypeDescriptor]
+    let access = PreparedMutationAccess()
 
     struct Syntax {
         let table: SQLName
@@ -62,7 +63,8 @@ internal struct PreparedMutationPlan {
             return MutationExecutor.MutationPreparation(read: snapshot, settings: settings, inputSettings: settings,
                 relation: relation, deleting: deleting, predicate: predicate, changes: changes, assigned: assigned,
                 touched: touched, checks: checks, indexes: indexes.map { $0.bind(context: context) },
-                returning: returning, filters: [], target: nil, parameterTypes: parameters, readsColumns: readsColumns)
+                returning: returning, filters: [], target: nil, parameterTypes: parameters, readsColumns: readsColumns,
+                accessCache: access)
         } catch let error as JedError { throw error.inDatabase(settings.targetDomain) }
     }
 }

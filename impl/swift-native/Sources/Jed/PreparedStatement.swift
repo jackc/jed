@@ -9,6 +9,8 @@ public final class PreparedStatement {
     internal var mutationCache: PreparedMutationPlan?
     internal var selectCache: PreparedSelectCache?
     internal var selectCacheHits = 0
+    /// Executions served by the cached single-row key read.
+    internal var pointReads = 0
     internal var selectCacheMisses = 0
     internal var probePlans = 0
     internal var customPlans = 0

@@ -75,7 +75,7 @@ internal final class NodePool: Sendable {
             let lookup = try state.withLock { state -> Lookup in
                 if var entry = state.entries[identity] {
                     guard entry.leaf.types == types else { throw JedError.corruption("leaf reused under a different row type") }
-                    entry.referenced = true; state.entries[identity] = entry
+                    if !entry.referenced { entry.referenced = true; state.entries[identity] = entry }
                     return .hit(entry.leaf)
                 }
                 if let loading = state.loading[identity] { return .wait(loading) }

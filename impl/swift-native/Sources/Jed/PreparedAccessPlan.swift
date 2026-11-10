@@ -76,6 +76,12 @@ internal struct PreparedAccessPlan {
         let snapshot = try domains.snapshot(domain)
         guard let table = snapshot.catalog.tables.first(where: { $0.name == table }),
               let store = snapshot.tables[table.name] else { throw JedError("XX000", "prepared access signature was not checked") }
+        return try bind(table: table, store: store, snapshot: snapshot, context: context)
+    }
+    /// The same candidate over an already resolved table of `snapshot`.
+    /// `check` is the inventory's shared unkeyed contradiction plan.
+    func bind(table: CatalogTable, store: TableStore, snapshot: DomainSnapshot, context: ExpressionContext,
+              check: BaseScanPlan? = nil) throws -> ScanCandidate {
         func index(_ name: SQLText) throws -> TableStore {
             guard let value = snapshot.indexes[name] else { throw JedError("XX000", "prepared index signature was not checked") }
             return value
@@ -95,6 +101,6 @@ internal struct PreparedAccessPlan {
         case .gin(let definition, let column, let ordinal, let arms):
             current = .gin(GinScanPlan(index: definition, store: try index(definition.name), column: column, keyOrdinal: ordinal, arms: arms))
         }
-        return ScanCandidate(path: current, table: table, store: store, snapshot: snapshot, predicate: predicate)
+        return ScanCandidate(path: current, table: table, store: store, snapshot: snapshot, predicate: predicate, check: check)
     }
 }

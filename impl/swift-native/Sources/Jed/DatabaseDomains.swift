@@ -119,12 +119,17 @@ internal final class DatabaseDomains: @unchecked Sendable {
     func read(main: Database) throws -> DomainReadBundle {
         try withPublication {
             try checkOpen()
-            var pins: [SQLText: SnapshotPin] = [:]
+            var pins: [(name: SQLText, pin: SnapshotPin)] = []
+            pins.reserveCapacity(attachments.count + 2)
             do {
-                pins[DomainNames.main] = try main.core.beginRead()
-                for name in attachments.keys.sorted() { pins[name] = try attachments[name]!.database.core.beginRead() }
-                return DomainReadBundle(pins: pins, database: main)
-            } catch { for pin in pins.values { pin.close() }; throw error }
+                // Main is pinned first; the bundle wants name order.
+                pins.append((DomainNames.main, try main.core.beginRead()))
+                if !attachments.isEmpty {
+                    for name in attachments.keys.sorted() { pins.append((name, try attachments[name]!.database.core.beginRead())) }
+                    pins.sort { $0.name < $1.name }
+                }
+                return DomainReadBundle(ordered: pins, database: main)
+            } catch { for entry in pins { entry.pin.close() }; throw error }
         }
     }
     /// Export captures one committed target while attachment identity remains

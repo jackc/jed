@@ -53,8 +53,13 @@ extension MutationExecutor {
             } else { result = predicate }
             return result
         }
+        /// Set only by a cached plan: schema-derived access facts to reuse.
+        var accessCache: PreparedMutationAccess? = nil
         var scan: BaseScanPlan {
-            BaseScanPlan(predicate: accessPredicate, keys: relation.table.primaryKey, types: relation.types)
+            if let known = accessCache?.scan { return known }
+            let built = BaseScanPlan(predicate: accessPredicate, keys: relation.table.primaryKey, types: relation.types)
+            accessCache?.scan = built
+            return built
         }
     }
     enum Preparation {

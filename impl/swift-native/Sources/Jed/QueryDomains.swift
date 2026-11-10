@@ -65,32 +65,42 @@ internal struct QueryDomains {
 /// Independent retention is essential: closing a read session must not release
 /// a cursor's roots, and closing one cursor must not release a sibling's roots.
 internal final class DomainReadBundle {
-    private(set) var pins: [SQLText: SnapshotPin]
+    /// Pins in name order: role checks and release visit them deterministically.
     private var orderedPins: [(name: SQLText, pin: SnapshotPin)]
     private(set) var domains: QueryDomains
     // A core pin protects page addresses, while the database owns the file or
     // service host. An escaped cursor must keep both until its final close.
     private var database: Database?
-    init(pins: [SQLText: SnapshotPin], database: Database? = nil) {
-        self.pins = pins; self.database = database
-        orderedPins = pins.keys.sorted().map { (name: $0, pin: pins[$0]!) }
-        domains = QueryDomains(snapshots: pins.mapValues(\.snapshot))
+    convenience init(pins: [SQLText: SnapshotPin], database: Database? = nil) {
+        self.init(ordered: pins.keys.sorted().map { (name: $0, pin: pins[$0]!) }, database: database)
+    }
+    /// `ordered` is already in name order.
+    init(ordered: [(name: SQLText, pin: SnapshotPin)], database: Database? = nil) {
+        orderedPins = ordered; self.database = database
+        var snapshots: [SQLText: DomainSnapshot] = [:]
+        snapshots.reserveCapacity(ordered.count + 1)
+        for entry in ordered { snapshots[entry.name] = entry.pin.snapshot }
+        domains = QueryDomains(snapshots: snapshots)
     }
     func install(_ pin: SnapshotPin, for name: SQLText) {
-        let previous = pins.updateValue(pin, forKey: name)
         domains.snapshots[name] = pin.snapshot
         // Keep name order by placing the one changed entry.
-        if let index = orderedPins.firstIndex(where: { $0.name == name }) { orderedPins[index] = (name, pin) }
-        else { orderedPins.insert((name, pin), at: orderedPins.firstIndex(where: { name < $0.name }) ?? orderedPins.count) }
-        previous?.close()
+        if let index = orderedPins.firstIndex(where: { $0.name == name }) {
+            let previous = orderedPins[index].pin
+            orderedPins[index] = (name, pin)
+            previous.close()
+        } else {
+            orderedPins.insert((name, pin), at: orderedPins.firstIndex(where: { name < $0.name }) ?? orderedPins.count)
+        }
     }
     func checkRole() throws { for entry in orderedPins { try entry.pin.checkRole() } }
     func retain() throws -> DomainReadBundle {
-        var retained: [SQLText: SnapshotPin] = [:]
+        var retained: [(name: SQLText, pin: SnapshotPin)] = []
+        retained.reserveCapacity(orderedPins.count + 1)
         do {
-            for entry in orderedPins { retained[entry.name] = try entry.pin.retain() }
-            return DomainReadBundle(pins: retained, database: database)
-        } catch { for pin in retained.values { pin.close() }; throw error }
+            for entry in orderedPins { retained.append((entry.name, try entry.pin.retain())) }
+            return DomainReadBundle(ordered: retained, database: database)
+        } catch { for entry in retained { entry.pin.close() }; throw error }
     }
     func close() {
         for entry in orderedPins { entry.pin.close() }

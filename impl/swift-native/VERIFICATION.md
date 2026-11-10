@@ -22,6 +22,26 @@ simulation images. Its SHA-256 is
 The ignored archive supplements this committed report; the original `/tmp`
 paths below remain useful provenance references.
 
+## Fifth follow-up revalidation (2026-11-10)
+
+The direct key read and cached access inventory recorded in
+[swift-native-performance.md](../../spec/design/swift-native-performance.md#fifth-follow-up-direct-key-reads-and-cached-access-inventories-2026-11-10)
+were checked with the same gates, on top of `ec1968ab`.
+
+| Gate | Result |
+|---|---|
+| Release native/API and all frozen SQL | **551 tests**, zero failures; **749/749 files**, 21,597 records, 39,148 cells, 2,271 cost / 1,154 name / 100 type assertions. |
+| New unit tests (`PreparedPointReadTests`) | The cached key read gives the rows, cost and errors of the unprepared statement; other shapes and cost-limited sessions never take it. |
+| Concurrent stress, Swift only | Two core/storage runs, 8,000 snapshot checks, zero failures; final checksum `f3e75496a3111181`. |
+| File interchange, Go peer only | **897/897 phases**, zero failures (diagnostic subset matrix). |
+| Saved fault-simulation regressions, Swift only (debug) | All **18** frozen traces pass. |
+| Encrypted SQL corpus, Swift only (debug) | **19,403/19,403** frozen record measurements, zero failures (diagnostic subset matrix). |
+
+Not re-run: exact cross-core resource accounting, the cross-core encrypted
+matrix, Rust and TypeScript interchange, generated fault-simulation sweeps,
+mixed processes and the page service. The fork check in `FilePathClaim` has
+no test that forks.
+
 ## Fourth follow-up revalidation (2026-11-10)
 
 The scan, grouping and lookup changes recorded in

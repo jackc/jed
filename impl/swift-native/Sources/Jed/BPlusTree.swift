@@ -292,20 +292,30 @@ internal struct BPlusTree: Sendable {
         case .onDisk(let reference, let lower, let upper):
             guard let pool else { throw JedError.corruption("tree leaf has no paging source") }
             let leaf = try pool.load(reference, types: types)
-            try Self.checkBounds(Array(leaf.key(at: 0)), Array(leaf.key(at: leaf.count - 1)), lower: lower, upper: upper)
+            // The same two checks as `checkBounds`, against the page in place.
+            if let lower, leaf.compareKey(at: 0, with: lower) < 0 {
+                throw JedError.corruption("tree key precedes its parent bound")
+            }
+            if let upper, leaf.compareKey(at: leaf.count - 1, with: upper) >= 0 {
+                throw JedError.corruption("tree key exceeds its parent bound")
+            }
             return TreeNode(leaf: leaf, reference: reference)
         }
     }
 
-    /// Where `key` is stored, by the same descent as `get`, without building
-    /// its record.
-    func position(of key: [UInt8]) throws -> TreePosition? {
-        guard var child = root else { return nil }
+    /// Where `key` is stored, by the same descent as `get` without building
+    /// its record, together with the number of nodes on the path. That
+    /// count is `overlapNodeCount` for the one-key interval `[key, key]`:
+    /// equality routes right at a separator in both walks.
+    func probe(_ key: [UInt8]) throws -> (nodes: Int, position: TreePosition?) {
+        guard var child = root else { return (0, nil) }
+        var nodes = 0
         while true {
             let node = try resolve(child)
+            nodes += 1
             if node.isLeaf {
                 let slot = node.leafSlot(key)
-                return slot.found ? TreePosition(node: node, row: slot.index) : nil
+                return (nodes, slot.found ? TreePosition(node: node, row: slot.index) : nil)
             }
             child = node.children[node.childSlot(key)]
         }

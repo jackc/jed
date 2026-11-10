@@ -95,7 +95,7 @@ internal final class PackedLaneInput {
     let row: PackedLaneRow
     private let meter: CostMeter
     private var cursor: ScanCursor
-    private struct Point { let tree: BPlusTree; let key: [UInt8]; var resolved: Bool; var position: TreePosition? }
+    private struct Point { var position: TreePosition? }
     private var point: Point?
 
     init(plan: SelectPlan, context: ExpressionContext) throws {
@@ -109,8 +109,9 @@ internal final class PackedLaneInput {
         meter = context.meter
         if let key = access.pointKey {
             // One key: the cost preflight's lookup also serves the scan.
-            let probe = try ScanCost.chargePoint(store, key: key, touched: plan.touched, meter: context.meter, access: access)
-            point = Point(tree: store.tree, key: key, resolved: probe.visited, position: probe.position)
+            let found = try ScanCost.chargePoint(store, key: key,
+                variable: ScanCost.variableColumns(plan.touched, types: store.tree.types), meter: context.meter)
+            point = Point(position: found)
             cursor = ScanAccess.empty.cursor(store)
         } else {
             try ScanCost.charge(store, touched: plan.touched, meter: context.meter, access: access)
@@ -119,13 +120,11 @@ internal final class PackedLaneInput {
         row = PackedLaneRow(width: store.tree.types.count, touched: plan.touched, pager: store.tree.pool?.pager)
     }
 
-    /// The row of a single-key access, looked up at most once.
+    /// The row of a single-key access, yielded once.
     private func takePoint() throws -> TreePosition? {
-        guard var held = point else { return nil }
-        if !held.resolved { held.position = try held.tree.position(of: held.key); held.resolved = true }
-        let found = held.position
-        held.position = nil; point = held
-        return found
+        guard let held = point else { return nil }
+        point = Point(position: nil)
+        return held.position
     }
 
     func nextPosition() throws -> TreePosition? {

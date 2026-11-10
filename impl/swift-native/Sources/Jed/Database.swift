@@ -404,6 +404,21 @@ public final class Session {
                 }
                 let pin = try readBundle()
                 do {
+                    // A cached single-row key read needs no plan, context or
+                    // lane. It stands in only where the general path would
+                    // admit nothing more: an unrestricted session (the
+                    // privilege check returns at once) and no cost ceiling.
+                    if meter.limit == 0, meter.lifetimeLimit == 0, StatementPrivileges.unrestricted(settings),
+                       let (point, bound) = try prepared.pointRead(core: database.core.planIdentity, domains: pin.domains,
+                           supplied: parameters, timeZone: settings.timeZone),
+                       let cursor = try point.open(domains: pin.domains, bound: bound, meter: meter) {
+                        prepared.selectCacheHits += 1; prepared.pointReads += 1
+                        let active = transaction
+                        let rows = Rows(columns: point.columns, meter: meter, guardCostOnPull: false,
+                                        pull: { try pin.checkRole(); return try cursor.next() },
+                                        release: { cursor.close(); pin.close() }, failure: { _ in active?.failed = true })
+                        return active?.own(rows) ?? rows
+                    }
                     var planning = settings; planning.domains = pin.domains; planning.planningParameters = parameters
                     let snapshot = try pin.domains.snapshot(DomainNames.main)
                     try StatementPrivileges.check(statement, snapshot: snapshot, settings: planning)

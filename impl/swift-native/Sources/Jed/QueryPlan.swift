@@ -809,25 +809,24 @@ internal enum ScanCost {
         return units
     }
     /// `charge` for an access that names one key (`ScanAccess.pointKey`): the
-    /// same units, charged at the same moment. When a variable-width column
-    /// makes the preflight visit the row, its position is returned so the scan
-    /// need not descend again; otherwise the row has not been looked up yet.
-    static func chargePoint(_ store: TableStore, key: [UInt8], touched: [Int], meter: CostMeter,
-                            access: ScanAccess) throws -> (visited: Bool, position: TreePosition?) {
+    /// same units, charged at the same moment. One descent finds the row and
+    /// counts the nodes the interval overlaps, so the scan need not descend
+    /// again.
+    static func chargePoint(_ store: TableStore, key: [UInt8], variable: [Int], meter: CostMeter) throws -> TreePosition? {
         let tree = store.tree
-        var units = access.pages(tree)
-        let variable = touched.filter { ValueCodec.fixedWidth(tree.types[$0].type) == nil }
-        var position: TreePosition?
-        if !variable.isEmpty {
-            position = try tree.position(of: key)
-            if let position {
-                try meter.pollStep()
-                units = saturatingAdd(units, try payload(position, slab: tree.codec.capacity,
-                    encrypted: tree.codec.reservedBytes != 0, touched: variable))
-            }
+        let probe = try tree.probe(key)
+        var units = Int64(probe.nodes)
+        if !variable.isEmpty, let position = probe.position {
+            try meter.pollStep()
+            units = saturatingAdd(units, try payload(position, slab: tree.codec.capacity,
+                encrypted: tree.codec.reservedBytes != 0, touched: variable))
         }
         meter.charge(units); try meter.guardCost()
-        return (!variable.isEmpty, position)
+        return probe.position
+    }
+    /// The touched columns whose cells can hold large-value facts.
+    static func variableColumns(_ touched: [Int], types: [TypeDescriptor]) -> [Int] {
+        touched.filter { ValueCodec.fixedWidth(types[$0].type) == nil }
     }
     /// Decode the point's packed record once; accounting consumes its retained
     /// large-value facts without walking the same table interval again.

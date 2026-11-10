@@ -8,6 +8,21 @@ internal struct PreparedQuerySignature: Equatable {
     }
     let core: StorageRevision
     let relations: [Relation]
+    /// The source names in order, for `holds`; not part of equality.
+    private let names: [SQLName]
+    /// Whether building this signature against `domains` would give an equal
+    /// one, decided without building it. Equal schema tokens mean the same
+    /// catalog object, so the table and its index list need no second look.
+    func holds(core: StorageRevision, domains: QueryDomains) -> Bool {
+        guard core === self.core else { return false }
+        for (name, relation) in zip(names, relations) {
+            guard let owner = try? domains.relation(name), owner.name != DomainNames.temporary,
+                  owner.snapshot.identity === relation.schema.domain,
+                  owner.snapshot.catalogRevision === relation.schema.catalog,
+                  owner.snapshot.estimatorRevision(name.name) === relation.estimator else { return false }
+        }
+        return true
+    }
     init?(query: SQLQuery, core: StorageRevision, domains: QueryDomains) {
         var names: [SQLName] = [], admitted = true
         func source(_ from: SQLFrom) {
@@ -38,7 +53,7 @@ internal struct PreparedQuerySignature: Equatable {
                   let estimator = owner.snapshot.estimatorRevision(name.name) else { return nil }
             relations.append(Relation(schema: PreparedSchemaSignature(core: core, snapshot: owner.snapshot, name: name.name), estimator: estimator))
         }
-        self.core = core; self.relations = relations
+        self.core = core; self.relations = relations; self.names = names
     }
     static func == (a: Self, b: Self) -> Bool { a.core === b.core && a.relations == b.relations }
 }
@@ -50,11 +65,12 @@ internal final class PreparedSelectCache {
     let sensitive: Bool
     let nullRead: Bool
     let generic: PreparedSelectPlan?
+    let point: PreparedPointRead?
     private(set) var memo: [Memo] = []
     init(signature: PreparedQuerySignature, parameters: [TypeDescriptor], sensitive: Bool,
-         nullRead: Bool, generic: PreparedSelectPlan?) {
+         nullRead: Bool, generic: PreparedSelectPlan?, point: PreparedPointRead? = nil) {
         self.signature = signature; self.parameters = parameters; self.sensitive = sensitive
-        self.nullRead = nullRead; self.generic = generic
+        self.nullRead = nullRead; self.generic = generic; self.point = point
     }
     func key(_ values: [SQLValue]) -> [UInt8]? {
         guard values.count == parameters.count else { return nil }
@@ -78,18 +94,31 @@ internal typealias PreparedSelectBinding = (plan: SelectPlan, admittedParameters
                                            requirements: PreparedSelectRequirements?)
 
 extension PreparedStatement {
+    /// The cached single-row read for this statement, with its bound
+    /// parameters, when the cache still describes `domains`. Nil sends the
+    /// caller down the general path, which reports everything else.
+    internal func pointRead(core: StorageRevision, domains: QueryDomains, supplied: [SQLValue],
+                            timeZone: SQLTimeZone) throws -> (PreparedPointRead, [SQLValue])? {
+        guard let cached = selectCache, !cached.sensitive, let point = cached.point,
+              cached.signature.holds(core: core, domains: domains) else { return nil }
+        let bound = try ParameterBinding.bind(supplied, types: cached.parameters, timezone: timeZone)
+        guard !bound.contains(where: \.isNull) else { return nil }
+        return (point, bound)
+    }
     internal func select(_ query: SQLQuery, snapshot: DomainSnapshot, settings: SessionSettings,
                          context: ExpressionContext, supplied: [SQLValue], core: StorageRevision,
                          committed: QueryDomains) throws -> PreparedSelectBinding {
         guard let domains = settings.domains else { throw JedError("XX000", "prepared query has no domain map") }
-        let signature = PreparedQuerySignature(query: query, core: core, domains: domains)
+        // A cache that still holds needs no freshly built signature.
+        let holds = selectCache?.signature.holds(core: core, domains: domains) ?? false
+        let signature = holds ? selectCache?.signature : PreparedQuerySignature(query: query, core: core, domains: domains)
         func resolve(_ probe: PlanningProbe) throws -> SelectPlan {
             var planning = settings; planning.planningParameters = nil; planning.planningProbe = probe
             var context = context; context.planningProbe = probe
             let plan = try SelectPlan.resolve(query, snapshot: snapshot, settings: planning, scalar: context.scalar)
             return try plan.prepareAccess(parameters: nil, context: context)
         }
-        if let signature, let cached = selectCache, cached.signature == signature {
+        if let signature, let cached = selectCache, holds || cached.signature == signature {
             let bound = try ParameterBinding.bind(supplied, types: cached.parameters, timezone: settings.timeZone)
             if !cached.sensitive, !(cached.nullRead && bound.contains(where: \.isNull)), let generic = cached.generic {
                 selectCacheHits += 1
@@ -122,7 +151,8 @@ extension PreparedStatement {
         if let signature, signature == PreparedQuerySignature(query: query, core: core, domains: committed),
            let detached = PreparedSelectPlan(result) {
             let entry = PreparedSelectCache(signature: signature, parameters: generic.parameters,
-                sensitive: sensitive, nullRead: nullRead, generic: sensitive ? nil : PreparedSelectPlan(generic))
+                sensitive: sensitive, nullRead: nullRead, generic: sensitive ? nil : PreparedSelectPlan(generic),
+                point: sensitive ? nil : PreparedPointRead(generic, parameters: generic.parameters))
             if sensitive, let key = entry.key(bound) { entry.retain(detached, key: key) }
             selectCache = entry
         }
