@@ -30,8 +30,9 @@ were checked with the same gates, on top of `ec1968ab`.
 
 | Gate | Result |
 |---|---|
-| Release native/API and all frozen SQL | **551 tests**, zero failures; **749/749 files**, 21,597 records, 39,148 cells, 2,271 cost / 1,154 name / 100 type assertions. |
-| New unit tests (`PreparedPointReadTests`) | The cached key read gives the rows, cost and errors of the unprepared statement; other shapes and cost-limited sessions never take it. |
+| Release native/API and all frozen SQL | **555 tests**, zero failures; **749/749 files**, 21,597 records, 39,148 cells, 2,271 cost / 1,154 name / 100 type assertions. |
+| New unit tests (`PreparedPointReadTests`) | The cached key read gives the rows, cost, error text and lifetime cost of the unprepared statement, including under statement and lifetime cost ceilings, memory budgets and restricted privileges, for integer and UUID keys; other shapes never take it. |
+| New unit tests (`ForkedHandleTests`) | After a real `fork`, under exclusive and automatic locking, the child's resident read succeeds and its write and writable BEGIN fail `55006`; the parent is unaffected. |
 | Concurrent stress, Swift only | Two core/storage runs, 8,000 snapshot checks, zero failures; final checksum `f3e75496a3111181`. |
 | File interchange, Go peer only | **897/897 phases**, zero failures (diagnostic subset matrix). |
 | Saved fault-simulation regressions, Swift only (debug) | All **18** frozen traces pass. |
@@ -39,8 +40,7 @@ were checked with the same gates, on top of `ec1968ab`.
 
 Not re-run: exact cross-core resource accounting, the cross-core encrypted
 matrix, Rust and TypeScript interchange, generated fault-simulation sweeps,
-mixed processes and the page service. The fork check in `FilePathClaim` has
-no test that forks.
+mixed processes and the page service.
 
 ## Fourth follow-up revalidation (2026-11-10)
 

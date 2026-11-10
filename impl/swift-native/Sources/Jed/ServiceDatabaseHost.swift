@@ -122,6 +122,12 @@ internal final class ServiceDatabaseHost: CoordinatedDatabaseClose, DatabaseRole
         guard !closed, !closing else { throw JedError("55000", "database is closed") }
         if let failure { throw failure }
     }
+    func checkAdmitted() throws {
+        try claim.checkAdmitted()
+        condition.lock(); defer { condition.unlock() }
+        guard !closed, !closing else { throw JedError("55000", "database is closed") }
+        if let failure { throw failure }
+    }
     private func entropy(_ count: Int) throws -> [UInt8] {
         condition.lock(); let source = database?.currentKeySource ?? random; condition.unlock()
         return try source.bytes(count: count)

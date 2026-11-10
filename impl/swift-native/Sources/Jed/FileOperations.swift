@@ -1,7 +1,12 @@
 /// Ownership lifetime retained by a file host until its byte handle closes.
 internal protocol FileOwnership: AnyObject, Sendable {
     func checkOpen() throws
+    /// `checkOpen` without the opener-process check.
+    func checkAdmitted() throws
     func close()
+}
+extension FileOwnership {
+    func checkAdmitted() throws { try checkOpen() }
 }
 
 /// Byte handles may be closed independently of their inode. A failed native

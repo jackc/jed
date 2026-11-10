@@ -7,7 +7,12 @@ import Glibc
 internal protocol ServicePathClaim: AnyObject, Sendable {
     var path: String { get }
     func checkOpen() throws
+    /// `checkOpen` without the opener-process check.
+    func checkAdmitted() throws
     func close()
+}
+extension ServicePathClaim {
+    func checkAdmitted() throws { try checkOpen() }
 }
 internal protocol ServiceOwnership: FileOwnership {
     func tryOwnership() throws -> Bool

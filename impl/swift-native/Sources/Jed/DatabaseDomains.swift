@@ -183,6 +183,10 @@ internal final class DatabaseDomains: @unchecked Sendable {
             let parts = duration.components
             return max(1, UInt64(clamping: parts.seconds) * 1000 + UInt64(clamping: parts.attoseconds / 1_000_000_000_000_000))
         }
+        // A writer must be the process that opened every file it may commit
+        // to; a forked child reopens instead (locking.md §3).
+        try main.checkOpen()
+        for attachment in withPublication({ attachments.values.map(\.database) }) { try attachment.checkOpen() }
         let token = try writer.acquire(cancellation: cancellation, timeoutMilliseconds: timeoutMilliseconds)
         var leases: [SQLText: WriterLease] = [:], reads: [SQLText: SnapshotPin] = [:]
         do {

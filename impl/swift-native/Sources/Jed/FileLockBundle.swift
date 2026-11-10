@@ -201,6 +201,11 @@ internal final class FileLockBundle: FileOwnership, Sendable {
             guard getpid() == opener else { throw JedError("55006", "database handle was inherited across fork; reopen it") }
         }
     }
+    func checkAdmitted() throws {
+        try state.withLock { state in
+            guard !state.closed else { throw JedError("55000", "database file ownership is closed") }
+        }
+    }
     /// Caller must stop service and close the database descriptor first. Never
     /// explicitly unlock an inherited flock: it shares the parent's description.
     func close() {

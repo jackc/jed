@@ -184,9 +184,9 @@ A fourth pass the same day added encoded integer predicates, in-place page
 reads, a leaf-at-a-time fold for statements with no cost ceiling or
 cancellation token, and cheaper general grouping. Swift/Rust is 1.52× overall
 (scans 0.79×; per-statement paths 3.69×), with the same gates re-run.
-A fifth pass added a cached direct read for prepared integer-key lookups (no
-cost ceiling, unrestricted session) and cached UPDATE/DELETE access
-inventories. A point lookup is 1.19× Rust and Swift/Rust is 1.28× overall
+A fifth pass added a cached direct read for prepared integer- and UUID-key
+lookups, which reproduces the general path's charge order with or without a
+cost ceiling, and cached UPDATE/DELETE access inventories. A point lookup is 1.19× Rust and Swift/Rust is 1.28× overall
 (per-statement paths 2.58×; single-row writes remain 6–7×), same gates re-run.
 
 The maintainer approved Ruby's OpenSSL binding for vetted cryptographic digest

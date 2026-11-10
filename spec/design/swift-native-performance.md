@@ -372,15 +372,16 @@ the WHERE and building a one-row columnar lane.
 
 - **Cached single-row key read** (`PreparedPointRead`). A prepared SELECT of
   bare columns whose WHERE is exactly one `=` against a parameter for every
-  integer primary-key column records, once, what the general path would
-  decide. Later executions encode the key, descend once and replay the same
-  charges in the same order: the point preflight, one unit for the row, one
-  per AND and per comparison, the result reservation and the production
-  unit. It runs only where the general path would take the packed columnar
-  lane and the privilege check would return at once: no statement or lifetime
-  cost ceiling, an unrestricted session, non-NULL parameters, and a cache
-  whose schema and estimator signature still holds. Every other case takes
-  the general path unchanged.
+  primary-key column, each an integer or a UUID, records once what the
+  general path would decide. Later executions encode the key, descend once
+  and replay the general path's charges, guards and reservations in order.
+  That order depends on the lane the general path would take, and a
+  ceiling's abort names the accrued cost, so both are reproduced: the packed
+  columnar lane without a cost ceiling, and the materializing scalar lane
+  (whole row decoded and reserved before WHERE, a checkpoint before the
+  production unit) with a statement or lifetime ceiling. Authorization runs
+  first, as in the general path. NULL parameters, a stale cache and every
+  other statement shape take the general path unchanged.
 - **One descent per point access.** `BPlusTree.probe` returns the row and the
   number of nodes on its path, which is the page count the one-key interval
   overlaps. The general point path uses it too, in place of a count walk
@@ -389,9 +390,7 @@ the WHERE and building a one-row columnar lane.
   (`PreparedQuerySignature.holds`), and leaf bounds checked against the page
   in place.
 - **Statement admission.** The read-pin bundle keeps one ordered list instead
-  of a dictionary plus a list. The per-statement fork check compares a fork
-  counter maintained by a `pthread_atfork` child handler instead of calling
-  `getpid`; it falls back to `getpid` if the handler cannot be installed.
+  of a dictionary plus a list.
 - **Cached UPDATE/DELETE access inventory** (`PreparedMutationAccess`). The
   list of legal access paths depends on the table definition, the predicate
   and the environment, so a cached plan keeps it. Each execution still binds
@@ -407,15 +406,30 @@ the WHERE and building a one-row columnar lane.
 | All 22 | 1.53× | 1.28× | 1.22× |
 
 A point lookup is 2.96 µs (was 10.5; Rust 2.50, Go 2.42) and a miss 1.95 µs
-(was 7.7; Rust 2.00, Go 1.32). A single-row DELETE is 19.6 µs (was 22.8).
+(was 7.7; Rust 2.00, Go 1.32); these were measured before the ceiling and UUID
+support, which a spot check shows within 3%. A single-row DELETE is 19.6 µs (was 22.8).
 
-**Verification.** 551 native tests and all 749 frozen SQL files (2,271 cost
+**Fork check at writer admission.** [locking.md](locking.md) §3 requires
+the opener-PID check on every operation that can write. Swift made it on
+every statement, a `getpid` call of about 80 ns. Statement admission now
+checks only that the handle is open (`checkAdmitted`); taking the writer
+gate checks the opener process for main and every attachment, as Rust and
+Go do, and every file and lock operation still checks it as before. A
+forked child can therefore read rows that are resident, which touches
+nothing shared, and is refused (`55006`) when it writes, begins a
+writable transaction or faults a page.
+
+**Verification.** 555 native tests and all 749 frozen SQL files (2,271 cost
 assertions), the Swift stress run with the frozen checksum, 897/897 Swift–Go
 interchange phases, the 18 saved simulation regressions and the Swift-only
 encrypted corpus. New `PreparedPointReadTests` compare the cached read with
-the unprepared statement for rows, cost and errors: hits, misses, large and
-compressed values, compound keys, NULL parameters, cost ceilings, memory
-budgets and rows a transaction has written.
+the unprepared statement for rows, cost, error text and session lifetime
+cost: hits, misses, large and compressed values, integer, UUID and mixed
+compound keys, NULL parameters, every statement ceiling from 1 to 14,
+lifetime budgets that run out part-way, memory budgets, restricted and
+revoked privileges, and rows a transaction has written. `ForkedHandleTests`
+forks under exclusive and automatic locking: the child's resident read
+succeeds, its write and writable BEGIN are refused, and the parent carries on.
 
 **What remains**
 
@@ -425,8 +439,9 @@ budgets and rows a transaction has written.
   domain map updates, sequence and privilege setup, each a few percent.
   INSERT's time is index entry, record encoding and tree insertion. Closing
   this needs the write frame redesigned as the read frame was here.
-- The cached key read covers integer keys only, and no session with a cost
-  ceiling. Other key types and limited sessions get only the shared savings.
+- The cached key read covers integer and UUID keys. Text, decimal and other
+  key types, whose comparison cost depends on the value, get only the shared
+  savings.
 - General grouping is unchanged at 1.4–1.6 times Rust.
 
 ## Investigation and controlled changes

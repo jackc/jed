@@ -35,6 +35,13 @@ internal final class FileDatabaseHost: DatabaseHostLifetime, DatabaseFilesystemP
         guard getpid() == opener else { throw JedError("55006", "database handle was inherited across fork; reopen it") }
         try bundle?.checkOpen()
     }
+    func checkAdmitted() throws {
+        try state.withLock { state in
+            guard !state.closed else { throw JedError("55000", "database is closed") }
+            guard !state.poisoned else { throw JedError("58030", "database requires reopen after failed maintenance") }
+        }
+        try bundle?.checkAdmitted()
+    }
     func close() throws {
         let worker = flusher.withLock { value in let previous = value; value = nil; return previous }; worker?.stop()
         try state.withLock { state in

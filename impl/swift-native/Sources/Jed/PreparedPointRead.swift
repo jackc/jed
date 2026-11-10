@@ -1,14 +1,15 @@
 /// A cached plan for the commonest statement there is: read some bare columns
-/// of the one row whose integer primary key equals the bound parameters.
+/// of the one row whose primary key equals the bound parameters.
 ///
-/// The general prepared path rebinds a SelectPlan, re-derives the key bound,
-/// compiles the WHERE into an encoded predicate and builds a columnar lane for
-/// that one row. This object records, once, what those steps would decide,
-/// and replays their charges in the same order: the point preflight, one unit
-/// for the scanned row, one unit per AND and per integer comparison, the
-/// result reservation and the production unit. It is admitted only where the
-/// general path would take the packed columnar lane (no cost ceiling), so no
-/// abort schedule can observe a difference.
+/// The general prepared path rebinds a SelectPlan, re-derives the key bound
+/// and builds a lane for that one row. This object records, once, what those
+/// steps would decide, and replays their charges, guards and reservations in
+/// the order of whichever lane the general path would take: the packed
+/// columnar lane without a cost ceiling, the materializing scalar lane with
+/// one. A ceiling's abort names the accrued cost, so the order is contract.
+///
+/// Key columns are integers and UUIDs: fixed-width types whose equality
+/// costs one unit in every lane and whose parameter is its own key value.
 internal final class PreparedPointRead {
     struct Part { let parameter: Int; let type: TypeDescriptor }
     let columns: [ResultColumn]
@@ -16,6 +17,10 @@ internal final class PreparedPointRead {
     private let table: SQLText
     private let parts: [Part]
     private let variable: [Int]
+    private let touched: [Int]
+    private let width: Int
+    /// Each projection's table column.
+    private let projected: [Int]
     /// Distinct projected table columns, and each projection's index in them.
     private let lanes: [Int]
     private let output: [Int]
@@ -38,20 +43,21 @@ internal final class PreparedPointRead {
         let types = store.tree.types
         guard !scan.keys.isEmpty, !scan.contradiction, scan.pointSets.isEmpty,
               plan.scan.pointSets.isEmpty, !plan.scan.contradiction else { return nil }
-        func integer(_ type: TypeDescriptor) -> Bool {
-            if case .scalar(let scalar) = type.type { return scalar.integerWidth != nil }
-            return false
+        func keyed(_ column: TypeDescriptor, by parameter: TypeDescriptor) -> Bool {
+            guard case .scalar(let stored) = column.type, case .scalar(let supplied) = parameter.type else { return false }
+            if stored == .uuid { return supplied == .uuid }
+            return stored.integerWidth != nil && supplied.integerWidth != nil
         }
         // The key: one `=` against a parameter for every primary-key column.
         var parts: [Part] = []
         for column in scan.keys {
             guard let terms = scan.terms[column], terms.count == 1, terms[0].operation == "=",
                   case .parameter(let index) = terms[0].source.node, index > 0, index <= parameters.count,
-                  types.indices.contains(column), integer(types[column]), integer(parameters[index - 1]) else { return nil }
+                  types.indices.contains(column), keyed(types[column], by: parameters[index - 1]) else { return nil }
             parts.append(Part(parameter: index - 1, type: types[column]))
         }
         // The WHERE: exactly those comparisons, joined by AND, so the encoded
-        // predicate is integer atoms throughout and every atom holds.
+        // predicate is one-unit comparisons throughout and each one holds.
         var compared: Set<Int> = [], atoms = 0, conjunctions = 0, admitted = true
         let touched = Set(plan.touched)
         func visit(_ expression: ResolvedExpression) {
@@ -79,6 +85,7 @@ internal final class PreparedPointRead {
         lanes = distinct
         output = projected.map { distinct.firstIndex(of: $0)! }
         variable = ScanCost.variableColumns(plan.touched, types: types)
+        self.touched = plan.touched; width = types.count; self.projected = projected
         filterUnits = atoms + conjunctions
         productionCharge = plan.productionCharge
         columns = plan.columns
@@ -92,8 +99,12 @@ internal final class PreparedPointRead {
         var key: [UInt8] = []
         key.reserveCapacity(parts.count * 8)
         for part in parts {
-            guard bound.indices.contains(part.parameter), case .integer = bound[part.parameter],
-                  let value = IntervalPlan.pointValue(bound[part.parameter], type: part.type) else { return nil }
+            guard bound.indices.contains(part.parameter) else { return nil }
+            switch bound[part.parameter] {
+            case .integer, .uuid: break
+            default: return nil
+            }
+            guard let value = IntervalPlan.pointValue(bound[part.parameter], type: part.type) else { return nil }
             key += try KeyEncoding.encode(value, type: part.type)
         }
         return key
@@ -120,9 +131,25 @@ internal final class PreparedPointRead {
             guard !finished else { return nil }
             finished = true
             guard let position = try ScanCost.chargePoint(store, key: key, variable: plan.variable, meter: meter) else { return nil }
+            let pager = store.tree.pool?.pager
+            if meter.limit != 0 || meter.lifetimeLimit != 0 {
+                // The scalar lane (`SelectInput`, materialized source): the
+                // row is decoded whole and reserved before WHERE runs over
+                // it, and a checkpoint precedes the production unit.
+                try meter.step(); meter.charge(1)
+                var row = Array(repeating: SQLValue.null, count: plan.width)
+                for column in plan.touched { row[column] = try position.materialize(column, pager: pager) }
+                let bytes = MemorySizes.row(row)
+                try meter.reserveQuery(bytes); reserved = bytes
+                for _ in 0..<plan.filterUnits { meter.charge(1); try meter.step() }
+                try meter.checkpoint()
+                if plan.productionCharge { meter.charge(1); try meter.guardCost() }
+                return plan.projected.map { row[$0] }
+            }
+            // The packed columnar lane: WHERE reads the page in place, then
+            // only the projected values are gathered and reserved.
             try meter.step(); meter.charge(1)
             for _ in 0..<plan.filterUnits { meter.charge(1); try meter.step() }
-            let pager = store.tree.pool?.pager
             var values: [SQLValue] = [], bytes: Int64 = 0
             values.reserveCapacity(plan.lanes.count)
             for column in plan.lanes {

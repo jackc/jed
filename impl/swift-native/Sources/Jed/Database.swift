@@ -50,6 +50,11 @@ public final class Database: Sendable {
         guard !isClosed else { throw JedError("55000", "database is closed") }
         try host?.checkOpen()
     }
+    /// Statement admission: open, without asking the system who we are.
+    internal func checkAdmitted() throws {
+        guard !isClosed else { throw JedError("55000", "database is closed") }
+        try host?.checkAdmitted()
+    }
     public func session(options: SessionOptions = SessionOptions()) throws -> Session {
         try checkOpen(); return try Session(database: self, options: options, readOnly: isReadOnly)
     }
@@ -220,7 +225,7 @@ public final class Session {
     public func render(_ value: SQLValue, type: TypeDescriptor) throws -> SQLText { try settings.render(value, type: type) }
     internal func checkOpen() throws {
         guard !closed else { throw JedError("55000", "session is closed") }
-        try database.checkOpen()
+        try database.checkAdmitted()
     }
     private func checkStatementRole() throws { try readPin?.checkRole(); try transaction?.checkRole() }
     private func requireClean() throws {
@@ -405,11 +410,12 @@ public final class Session {
                 let pin = try readBundle()
                 do {
                     // A cached single-row key read needs no plan, context or
-                    // lane. It stands in only where the general path would
-                    // admit nothing more: an unrestricted session (the
-                    // privilege check returns at once) and no cost ceiling.
-                    if meter.limit == 0, meter.lifetimeLimit == 0, StatementPrivileges.unrestricted(settings),
-                       let (point, bound) = try prepared.pointRead(core: database.core.planIdentity, domains: pin.domains,
+                    // lane. Authorization still comes first, as it does below.
+                    if prepared.selectCache?.point != nil, !StatementPrivileges.unrestricted(settings) {
+                        var admission = settings; admission.domains = pin.domains; admission.planningParameters = parameters
+                        try StatementPrivileges.check(statement, snapshot: try pin.domains.snapshot(DomainNames.main), settings: admission)
+                    }
+                    if let (point, bound) = try prepared.pointRead(core: database.core.planIdentity, domains: pin.domains,
                            supplied: parameters, timeZone: settings.timeZone),
                        let cursor = try point.open(domains: pin.domains, bound: bound, meter: meter) {
                         prepared.selectCacheHits += 1; prepared.pointReads += 1
