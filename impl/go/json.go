@@ -13,6 +13,7 @@ package jed
 import (
 	"fmt"
 	"math"
+	"slices"
 	"strconv"
 	"strings"
 	"unicode/utf8"
@@ -860,27 +861,17 @@ func utf8Len(lead byte) int {
 // Done before sorting so the stored object has unique keys in canonical order — a pure function of
 // input.
 func canonicalizeObject(members []JsonMember) []JsonMember {
-	// Last-wins dedup, preserving the value of the last occurrence (re-sort follows so first-
-	// appearance order is irrelevant).
-	out := make([]JsonMember, 0, len(members))
-	for _, m := range members {
-		found := false
-		for i := range out {
-			if out[i].Key == m.Key {
-				out[i].Val = m.Val
-				found = true
-				break
-			}
-		}
-		if !found {
+	// The sort is stable, so occurrences of one key stay in input order and the last of each run is
+	// the last-wins survivor. Sorting first keeps this O(n log n) in the member count, which a caller
+	// (an aggregate, a cast of long text) can make arbitrarily large.
+	sorted := append([]JsonMember(nil), members...)
+	slices.SortStableFunc(sorted, func(a, b JsonMember) int { return jsonKeyCmp(a.Key, b.Key) })
+	out := make([]JsonMember, 0, len(sorted))
+	for _, m := range sorted {
+		if n := len(out); n > 0 && out[n-1].Key == m.Key {
+			out[n-1] = m
+		} else {
 			out = append(out, m)
-		}
-	}
-	// Insertion sort by canonical key order (small objects; a stable, dependency-free sort that is
-	// byte-identical across cores).
-	for i := 1; i < len(out); i++ {
-		for j := i; j > 0 && jsonKeyCmp(out[j].Key, out[j-1].Key) < 0; j-- {
-			out[j], out[j-1] = out[j-1], out[j]
 		}
 	}
 	return out
@@ -898,12 +889,13 @@ func makeObject(members []JsonMember) JsonNode {
 func hasDuplicateKeys(node *JsonNode) bool {
 	switch node.Kind {
 	case JObject:
+		// Membership only: the set is never iterated, so no map order leaks.
+		seen := make(map[string]struct{}, len(node.Obj))
 		for i := range node.Obj {
-			for j := i + 1; j < len(node.Obj); j++ {
-				if node.Obj[i].Key == node.Obj[j].Key {
-					return true
-				}
+			if _, dup := seen[node.Obj[i].Key]; dup {
+				return true
 			}
+			seen[node.Obj[i].Key] = struct{}{}
 		}
 		for i := range node.Obj {
 			if hasDuplicateKeys(&node.Obj[i].Val) {

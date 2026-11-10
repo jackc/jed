@@ -738,10 +738,10 @@ export function hasDuplicateKeys(node: JsonNode): boolean {
   switch (node.kind) {
     case "object": {
       const members = node.members;
-      for (let i = 0; i < members.length; i++) {
-        for (let j = i + 1; j < members.length; j++) {
-          if (members[i]!.key === members[j]!.key) return true;
-        }
+      const seen = new Set<string>();
+      for (const m of members) {
+        if (seen.has(m.key)) return true;
+        seen.add(m.key);
       }
       return members.some((m) => hasDuplicateKeys(m.value));
     }
@@ -757,28 +757,15 @@ export function hasDuplicateKeys(node: JsonNode): boolean {
 // Done before sorting so the stored object has unique keys in canonical order — a pure function of
 // input.
 function canonicalizeObject(members: JsonMember[]): JsonMember[] {
-  // Last-wins dedup, preserving the value of the last occurrence (re-sort follows so first-
-  // appearance order is irrelevant).
+  // Array.prototype.sort is stable, so occurrences of one key stay in input order and the last of
+  // each run is the last-wins survivor. Sorting first keeps this O(n log n) in the member count,
+  // which a caller (an aggregate, a cast of long text) can make arbitrarily large.
+  const sorted = members.slice().sort((a, b) => keyCmp(a.key, b.key));
   const out: JsonMember[] = [];
-  for (const m of members) {
-    let found = false;
-    for (let i = 0; i < out.length; i++) {
-      if (out[i]!.key === m.key) {
-        out[i]!.value = m.value;
-        found = true;
-        break;
-      }
-    }
-    if (!found) out.push(m);
-  }
-  // Insertion sort by canonical key order (small objects; a stable, dependency-free sort that is
-  // byte-identical across cores).
-  for (let i = 1; i < out.length; i++) {
-    for (let j = i; j > 0 && keyCmp(out[j]!.key, out[j - 1]!.key) < 0; j--) {
-      const tmp = out[j]!;
-      out[j] = out[j - 1]!;
-      out[j - 1] = tmp;
-    }
+  for (const m of sorted) {
+    const last = out.length - 1;
+    if (last >= 0 && out[last]!.key === m.key) out[last] = m;
+    else out.push(m);
   }
   return out;
 }
