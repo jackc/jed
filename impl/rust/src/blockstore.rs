@@ -103,8 +103,7 @@ impl BlockStore for FileBlockStore {
     }
 
     fn write_at(&mut self, offset: u64, bytes: &[u8]) -> Result<()> {
-        self.file.seek(SeekFrom::Start(offset)).map_err(io_error)?;
-        self.file.write_all(bytes).map_err(io_error)
+        file_write_all_at(&mut self.file, bytes, offset).map_err(io_error)
     }
 
     fn sync(&mut self) -> Result<()> {
@@ -176,6 +175,41 @@ fn file_read_exact_at(file: &mut File, buf: &mut [u8], offset: u64) -> std::io::
 fn file_read_exact_at(file: &mut File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
     file.seek(SeekFrom::Start(offset))?;
     file.read_exact(buf)
+}
+
+/// The write half of [`file_read_exact_at`]: one positioned `pwrite` per page instead of a seek and
+/// a write.
+#[cfg(unix)]
+fn file_write_all_at(file: &mut File, buf: &[u8], offset: u64) -> std::io::Result<()> {
+    use std::os::unix::fs::FileExt;
+
+    file.write_all_at(buf, offset)
+}
+
+/// Windows' positioned write may be short, so loop to keep `write_all` semantics.
+#[cfg(windows)]
+fn file_write_all_at(file: &mut File, buf: &[u8], offset: u64) -> std::io::Result<()> {
+    use std::os::windows::fs::FileExt;
+
+    let mut written = 0usize;
+    while written < buf.len() {
+        let at = offset.checked_add(written as u64).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "offset overflow")
+        })?;
+        let n = file.seek_write(&buf[written..], at)?;
+        if n == 0 {
+            return Err(std::io::Error::from(std::io::ErrorKind::WriteZero));
+        }
+        written += n;
+    }
+    Ok(())
+}
+
+/// The portable form, for a target without a positioned-write trait.
+#[cfg(not(any(unix, windows)))]
+fn file_write_all_at(file: &mut File, buf: &[u8], offset: u64) -> std::io::Result<()> {
+    file.seek(SeekFrom::Start(offset))?;
+    file.write_all(buf)
 }
 
 /// The store a pager holds after compaction closed its file (spec/design/api.md §2.6): the database
