@@ -441,6 +441,9 @@ func TestLazyInlineFaultedLeafSharesPageBlock(t *testing.T) {
 // representation: retaining raw directory bytes removes allocations, but every entry is still
 // scanned for ascending/bounds validity before the leaf enters the pool.
 func TestPackedLeafValidatesPageBackedDirectoriesAtFault(t *testing.T) {
+	if leafNarrow {
+		t.Skip("pins the v50 leaf layout's 4-byte directory offsets")
+	}
 	t.Parallel()
 	colTypes := []colType{scalarColType(scalarText)}
 	rows := []storedRow{

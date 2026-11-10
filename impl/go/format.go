@@ -2961,15 +2961,21 @@ func fixedValueWidth(ty colType) (int, bool) {
 type leafShape struct {
 	fixed    int
 	variable int
+	// elided is the columns a leaf stores no region for (leaf_narrow.go); they keep their column
+	// directory entry.
+	elided int
 }
 
-func (s leafShape) k() int { return s.fixed + s.variable }
+func (s leafShape) k() int { return s.fixed + s.variable + s.elided }
 
 // leafShapeFor is the shape of a leaf for a table with these value-column types (an index tree —
 // empty colTypes — is {0, 0}).
 func leafShapeFor(colTypes []colType) leafShape {
 	fixed := 0
 	for _, ty := range colTypes {
+		if leafElideKey && ty.keyAt != 0 {
+			continue
+		}
 		if _, ok := fixedValueWidth(ty); ok {
 			fixed++
 		}
@@ -2984,7 +2990,16 @@ func leafShapeFor(colTypes []colType) leafShape {
 //
 //	leafOverhead(N, cols) = 4·N + 4·(K+1) + F·(1 + ceil(N/8)) + V·(1 + 4·N)
 func leafOverhead(n int, shape leafShape) int {
-	return 4*n + 4*(shape.k()+1) + shape.fixed*(1+(n+7)/8) + shape.variable*(1+4*n)
+	// PROTOTYPE (leaf_narrow.go): a layout byte when any layout switch is on, and 16-bit directory
+	// entries in the narrow layout.
+	dw, lead := 4, 0
+	if leafLayoutFlags() != 0 {
+		lead = 1
+	}
+	if leafNarrow {
+		dw = 2
+	}
+	return lead + dw*n + dw*(shape.k()+1) + shape.fixed*(1+(n+7)/8) + shape.variable*(1+dw*n)
 }
 
 // valueDisp is a value's planned on-disk disposition (large-values.md §2/§12/§13).
@@ -3129,7 +3144,9 @@ func planDispositionsMemo(colTypes []colType, key []byte, row storedRow, pcap pa
 	}
 	size := len(key)
 	for i, ty := range colTypes {
-		if w, ok := fixedValueWidth(ty); ok {
+		if leafElideKey && ty.keyAt != 0 {
+			inline[i] = 0 // rebuilt from the key (leaf_narrow.go)
+		} else if w, ok := fixedValueWidth(ty); ok {
 			inline[i] = w
 		} else {
 			var payload int
@@ -3758,6 +3775,12 @@ func encodeLeafPAXMemo(colTypes []colType, keys [][]byte, rows []storedRow, seal
 			nulls[c][i] = isNull
 			w, fixed := fixedValueWidth(ty)
 			switch {
+			case leafElideKey && ty.keyAt != 0:
+				// Not stored. The key must reproduce the value exactly, or readers would see another.
+				if isNull || !bytes.Equal(keyColumnSlot(ty, keys[i]), encodeValue(ty, rows[i][c])[1:]) {
+					return nil, newError(DataCorrupted, "a key column's value is not recoverable from its key")
+				}
+				valBytes[c][i] = nil
 			case fixed && isNull:
 				valBytes[c][i] = make([]byte, w) // a zero-filled slot, never read
 			case fixed:
@@ -3773,18 +3796,34 @@ func encodeLeafPAXMemo(colTypes []colType, keys [][]byte, rows []storedRow, seal
 			}
 		}
 	}
-	// key directory (N end offsets) + key blob.
+	// PROTOTYPE (leaf_narrow.go): the narrow layout leads with a layout byte and writes every
+	// directory entry as a u16.
+	dw := 4
 	out := []byte{}
+	if flags := leafLayoutFlags(); flags != 0 {
+		out = append(out, flags)
+	}
+	if leafNarrow {
+		dw = 2
+	}
+	stored := func(c int) bool { return !(leafElideKey && colTypes[c].keyAt != 0) }
+	appendDir := func(b []byte, v int) []byte {
+		if dw == 2 {
+			return append(b, byte(v>>8), byte(v))
+		}
+		return appendU32(b, uint32(v))
+	}
+	// key directory (N end offsets) + key blob.
 	off := 0
 	for i := 0; i < n; i++ {
 		off += len(keys[i])
-		out = appendU32(out, uint32(off))
+		out = appendDir(out, off)
 	}
 	for i := 0; i < n; i++ {
 		out = append(out, keys[i]...)
 	}
 	// column directory: absolute payload offset of each column region.
-	baseAfterColDir := len(out) + 4*(k+1)
+	baseAfterColDir := len(out) + dw*(k+1)
 	colStart := make([]int, k+1)
 	cur := baseAfterColDir
 	for c := 0; c < k; c++ {
@@ -3793,19 +3832,25 @@ func encodeLeafPAXMemo(colTypes []colType, keys [][]byte, rows []storedRow, seal
 		for i := 0; i < n; i++ {
 			bodies += len(valBytes[c][i])
 		}
+		if !stored(c) {
+			continue // an empty region: its directory entry equals the next column's
+		}
 		if _, fixed := fixedValueWidth(colTypes[c]); fixed {
 			cur += 1 + (n+7)/8 + bodies
 		} else {
-			cur += 1 + 4*n + bodies
+			cur += 1 + dw*n + bodies
 		}
 	}
 	colStart[k] = cur // payload end
 	for c := 0; c <= k; c++ {
-		out = appendU32(out, uint32(colStart[c]))
+		out = appendDir(out, colStart[c])
 	}
 	// each column region: flags byte, then bitmap + dense slots (fixed) or value directory +
 	// tagged bodies (variable).
 	for c := 0; c < k; c++ {
+		if !stored(c) {
+			continue
+		}
 		out = append(out, 0) // region flags — reserved (the dictionary door)
 		if _, fixed := fixedValueWidth(colTypes[c]); fixed {
 			bitmap := make([]byte, (n+7)/8)
@@ -3819,7 +3864,7 @@ func encodeLeafPAXMemo(colTypes []colType, keys [][]byte, rows []storedRow, seal
 			voff := 0
 			for i := 0; i < n; i++ {
 				voff += len(valBytes[c][i])
-				out = appendU32(out, uint32(voff))
+				out = appendDir(out, voff)
 			}
 		}
 		for i := 0; i < n; i++ {
@@ -5658,18 +5703,28 @@ type paxRegion struct {
 	bitmap []byte // fixed: the ceil(N/8) null bitmap span (MSB-first, set = NULL)
 	ends   []byte // variable: zero-copy N×u32 big-endian end-offset directory in the page
 	body   []byte // the value bodies: N×width dense slots (fixed) or the value blob (variable)
+	// elided marks a region the page does not store: its slots were rebuilt from the keys
+	// (leaf_narrow.go) and it contributes nothing to recordSize.
+	elided bool
 }
 
 type paxLeaf struct {
 	keyBlob []byte // the shared key bytes in the retained page payload
 	keyEnd  []byte // zero-copy N×u32 big-endian end-offset directory in the retained page
 	regions []paxRegion
+	// dw is the byte width of a directory entry: 4, or 2 in the narrow layout (leaf_narrow.go).
+	dw int
 }
 
 // paxDirEnd reads entry i from a directory that parsePaxLeaf already validated in full. Keeping
 // directories as page views removes their per-leaf integer-array allocations while retaining O(1)
 // access to keys and variable-width values.
-func paxDirEnd(directory []byte, i int) uint32 {
+func paxDirEnd(directory []byte, i, dw int) uint32 {
+	if dw == 2 {
+		at := i * 2
+		_ = directory[at+1]
+		return uint32(directory[at])<<8 | uint32(directory[at+1])
+	}
 	at := i * 4
 	_ = directory[at+3] // one bounds check for the four direct byte reads below
 	return uint32(directory[at])<<24 |
@@ -5686,10 +5741,31 @@ func paxDirEnd(directory []byte, i int) uint32 {
 func parsePaxLeaf(payload []byte, n int, colTypes []colType) (*paxLeaf, error) {
 	k := len(colTypes)
 	pos := 0
+	// PROTOTYPE (leaf_narrow.go): a v50 leaf starts with the high byte of a u32 offset, always 0; a
+	// nonzero first byte names another layout.
+	dw := 4
+	elide := false
+	if n > 0 && len(payload) > 0 && payload[0] != 0 {
+		if payload[0]&^(leafLayoutNarrow|leafLayoutElideKey) != 0 {
+			return nil, newError(DataCorrupted, "unknown leaf layout")
+		}
+		pos = 1
+		if payload[0]&leafLayoutNarrow != 0 {
+			dw = 2
+		}
+		elide = payload[0]&leafLayoutElideKey != 0
+	}
+	readDir := func(pos *int) (uint32, error) {
+		if dw == 2 {
+			v, err := readU16(payload, pos)
+			return uint32(v), err
+		}
+		return readU32(payload, pos)
+	}
 	keyDir := pos
 	prev := uint32(0)
 	for i := 0; i < n; i++ {
-		e, err := readU32(payload, &pos)
+		e, err := readDir(&pos)
 		if err != nil {
 			return nil, err
 		}
@@ -5706,9 +5782,9 @@ func parsePaxLeaf(payload []byte, n int, colTypes []colType) (*paxLeaf, error) {
 	keyBytes := payload[keyBlob : keyBlob+int(prev)]
 	pos = keyBlob + int(prev)
 	colDir := pos
-	colRegions := colDir + (k+1)*4
+	colRegions := colDir + (k+1)*dw
 	colPos := colDir
-	start32, err := readU32(payload, &colPos)
+	start32, err := readDir(&colPos)
 	if err != nil {
 		return nil, err
 	}
@@ -5718,13 +5794,33 @@ func parsePaxLeaf(payload []byte, n int, colTypes []colType) (*paxLeaf, error) {
 	regions := make([]paxRegion, k)
 	start := int(start32)
 	for c, ty := range colTypes {
-		end32, err := readU32(payload, &colPos)
+		end32, err := readDir(&colPos)
 		if err != nil {
 			return nil, err
 		}
 		end := int(end32)
 		if start > end || end > len(payload) {
 			return nil, newError(DataCorrupted, "PAX leaf column region out of range")
+		}
+		if elide && ty.keyAt != 0 {
+			// No stored region: rebuild the column's dense slots from the keys (leaf_narrow.go).
+			if start != end {
+				return nil, newError(DataCorrupted, "PAX leaf key column has a stored region")
+			}
+			w, _ := fixedValueWidth(ty)
+			body := make([]byte, n*w)
+			at := int(ty.keyAt) - 1
+			lo := 0
+			for i := 0; i < n; i++ {
+				hi := int(paxDirEnd(keyEnd, i, dw))
+				if lo+at+w > hi {
+					return nil, newError(DataCorrupted, "PAX leaf key too short for its key column")
+				}
+				putKeySlot(body[i*w:(i+1)*w], ty, keyBytes[lo+at:lo+at+w])
+				lo = hi
+			}
+			regions[c] = paxRegion{width: w, bitmap: make([]byte, (n+7)/8), body: body, elided: true}
+			continue
 		}
 		p := start
 		flags, err := readU8(payload, &p)
@@ -5744,7 +5840,7 @@ func parsePaxLeaf(payload []byte, n int, colTypes []colType) (*paxLeaf, error) {
 			endsStart := p
 			vprev := uint32(0)
 			for i := 0; i < n; i++ {
-				e, err := readU32(payload, &p)
+				e, err := readDir(&p)
 				if err != nil {
 					return nil, err
 				}
@@ -5760,16 +5856,16 @@ func parsePaxLeaf(payload []byte, n int, colTypes []colType) (*paxLeaf, error) {
 		}
 		start = end
 	}
-	return &paxLeaf{keyBlob: keyBytes, keyEnd: keyEnd, regions: regions}, nil
+	return &paxLeaf{keyBlob: keyBytes, keyEnd: keyEnd, regions: regions, dw: dw}, nil
 }
 
 // key returns record i's key as a borrowed span of the retained page block.
 func (l *paxLeaf) key(i int) []byte {
 	lo := uint32(0)
 	if i > 0 {
-		lo = paxDirEnd(l.keyEnd, i-1)
+		lo = paxDirEnd(l.keyEnd, i-1, l.dw)
 	}
-	return l.keyBlob[lo:paxDirEnd(l.keyEnd, i)]
+	return l.keyBlob[lo:paxDirEnd(l.keyEnd, i, l.dw)]
 }
 
 // isNull reports whether value (record i, column c) is NULL — the region bitmap (fixed-width) or
@@ -5781,9 +5877,9 @@ func (l *paxLeaf) isNull(c, i int) bool {
 	}
 	lo := uint32(0)
 	if i > 0 {
-		lo = paxDirEnd(r.ends, i-1)
+		lo = paxDirEnd(r.ends, i-1, l.dw)
 	}
-	return paxDirEnd(r.ends, i) == lo
+	return paxDirEnd(r.ends, i, l.dw) == lo
 }
 
 // value returns the bytes of value (record i, column c), a view into the page payload: a
@@ -5796,9 +5892,9 @@ func (l *paxLeaf) value(c, i int) ([]byte, error) {
 	}
 	lo := uint32(0)
 	if i > 0 {
-		lo = paxDirEnd(r.ends, i-1)
+		lo = paxDirEnd(r.ends, i-1, l.dw)
 	}
-	hi := paxDirEnd(r.ends, i)
+	hi := paxDirEnd(r.ends, i, l.dw)
 	if int(hi) > len(r.body) {
 		return nil, newError(DataCorrupted, "PAX leaf value offset out of range")
 	}
@@ -5810,14 +5906,17 @@ func (l *paxLeaf) value(c, i int) ([]byte, error) {
 // directories alone, with no value decode (packed-leaf.md §3/§5).
 func (l *paxLeaf) valueLen(c, i int) int {
 	r := &l.regions[c]
+	if r.elided {
+		return 0
+	}
 	if r.width > 0 {
 		return r.width
 	}
 	lo := uint32(0)
 	if i > 0 {
-		lo = paxDirEnd(r.ends, i-1)
+		lo = paxDirEnd(r.ends, i-1, l.dw)
 	}
-	return int(paxDirEnd(r.ends, i) - lo)
+	return int(paxDirEnd(r.ends, i, l.dw) - lo)
 }
 
 // packedLeaf is a faulted leaf's block-backed resident form (packed-leaf.md §5): the validated PAX

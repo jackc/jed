@@ -167,7 +167,7 @@ func BenchmarkFormatExpEqTextPlain(b *testing.B) {
 			pg := &pages[p]
 			lo := uint32(0)
 			for i := 0; i < fxN; i++ {
-				hi := paxDirEnd(pg.ends, i)
+				hi := paxDirEnd(pg.ends, i, 4)
 				sp := pg.body[lo:hi]
 				lo = hi
 				if len(sp) > 3 && sp[0] == 0 && bytes.Equal(sp[3:], want) {
@@ -223,9 +223,9 @@ func BenchmarkFormatExpKeySearchPlain(b *testing.B) {
 				m := (lo + hi) / 2
 				s := uint32(0)
 				if m > 0 {
-					s = paxDirEnd(keyEnd, m-1)
+					s = paxDirEnd(keyEnd, m-1, 4)
 				}
-				if bytes.Compare(blob[s:paxDirEnd(keyEnd, m)], probe) < 0 {
+				if bytes.Compare(blob[s:paxDirEnd(keyEnd, m, 4)], probe) < 0 {
 					lo = m + 1
 				} else {
 					hi = m

@@ -1135,7 +1135,7 @@ func (s *snapshot) putTable(t *catTable, pageSize uint32) {
 func (s *snapshot) putTableResolved(t *catTable, colTypes []colType, pageSize uint32) {
 	s.bumpCatGen()
 	key := t.Name
-	st := newTableStore(s.capFor(pageSize), colTypes)
+	st := newTableStore(s.capFor(pageSize), markKeyColumns(colTypes, t.PK))
 	// Bind the domain's pager (snapshot.storePaging) so the new store demand-pages like a loaded one:
 	// its committed leaves demote at each commit (demoteCleanLeaves) and fault back through the pool,
 	// instead of staying fully-resident decoded for the handle's lifetime. nil only on a bare scratch

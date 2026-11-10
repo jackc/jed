@@ -406,7 +406,7 @@ func expVariable(r *paxRegion, n int, ty colType) expSizes {
 	nulls, allPlain, content := 0, true, 0
 	lo := uint32(0)
 	for i := 0; i < n; i++ {
-		hi := paxDirEnd(r.ends, i)
+		hi := paxDirEnd(r.ends, i, expDW)
 		sp := r.body[lo:hi]
 		lo = hi
 		if len(sp) == 0 {
@@ -432,6 +432,15 @@ func expVariable(r *paxRegion, n int, ty colType) expSizes {
 		}
 	}
 	out.t1 = 1 + 2*n + content
+	expA["value directories: u32 -> u16"] += 2 * n
+	if allPlain {
+		expA["variable values: presence tag (pages with only plain values)"] += n - nulls
+		if lenPrefixed {
+			expA["text/bytea: u16 length prefix"] += 2 * (n - nulls)
+		}
+	} else if lenPrefixed {
+		expA["text/bytea: u16 length prefix (pages with a non-plain value, not counted in the 23%)"] += 2 * (n - nulls)
+	}
 	out.t2 = out.t1
 	how := "plain"
 	bm := 0
@@ -515,6 +524,12 @@ func expKeys(l *paxLeaf, n int, fixedKey bool) expSizes {
 		dir = 0
 	}
 	out.t1 = dir + len(l.keyBlob)
+	if fixedKey {
+		expA["key directory: elided, fixed-length keys"] += len(l.keyEnd)
+	} else {
+		expA["key directory: u32 -> u16"] += len(l.keyEnd) - dir
+	}
+	expA["(leaf bytes today: keys)"] += out.cur
 	p := 0
 	if n > 1 {
 		p = expLCP(l.key(0), l.key(n-1))
@@ -641,24 +656,31 @@ func (w *expWalker) tree(name, kind string, root *pnode, colTypes []colType, col
 	})
 	var zbuf bytes.Buffer
 	w.eachLeaf(root.ref(), colTypes, tr, func(n int, payload []byte, leaf *paxLeaf) {
+		expDW = leaf.dw
 		tr.leaves++
 		tr.rows += n
 		tr.capBytes += len(payload)
 		tr.keys.add(expKeys(leaf, n, fixedKey))
 		k := len(colTypes)
-		cd := 4 * (k + 1)
+		cd := leaf.dw * (k + 1)
 		tr.colDir.add(expSizes{cur: cd, t1: cd / 2, t2: cd / 2, t3: cd / 2})
+		expA["column directory: u32 -> u16"] += cd / 2
+		expA["(leaf bytes today: all)"] += len(leaf.keyEnd) + len(leaf.keyBlob) + cd
 		used := len(leaf.keyEnd) + len(leaf.keyBlob) + cd
 		for c := range colTypes {
 			r := &leaf.regions[c]
 			var s expSizes
-			if r.width > 0 {
+			if r.elided {
+				// not stored: rebuilt from the keys
+			} else if r.width > 0 {
 				s = expFixed(r, n)
 			} else {
 				s = expVariable(r, n, colTypes[c])
 			}
 			used += s.cur
+			expA["(leaf bytes today: all)"] += s.cur
 			if pkCols[c] && r.width > 0 {
+				expA["primary-key columns also stored as values"] += s.cur
 				s.t1, s.t2, s.t3 = 0, 0, 0 // derivable from the key
 				s.how = map[string]int{"=key": 1}
 			}
@@ -833,7 +855,10 @@ func expOne(t *testing.T, dir string, pageSize uint32, detail bool) expRun {
 		defer func() { null.Close(); devnull.Close() }()
 		defer func() { os.Stdout = old }()
 	}
+	expA = map[string]int{}
 	trees := expReport(t, db, path)
+	fmt.Println("structural savings by component (compacted file):")
+	expAPrint()
 	capTot := 0
 	for _, tr := range trees {
 		run.sz.add(tr.total())
@@ -1291,4 +1316,71 @@ func expCredential() *Credential {
 		return nil
 	}
 	return KeyCredential([32]byte{7})
+}
+
+// expA accumulates the structural tier's savings by component (bytes).
+var expA = map[string]int{}
+
+func expAPrint() {
+	total := expA["(leaf bytes today: all)"]
+	var names []string
+	for k := range expA {
+		names = append(names, k)
+	}
+	sort.Slice(names, func(i, j int) bool { return expA[names[i]] > expA[names[j]] })
+	for _, k := range names {
+		fmt.Printf("  %-90s %12d  %5.1f%%\n", k, expA[k], 100*float64(expA[k])/float64(total))
+	}
+}
+
+// expDW is the directory entry width of the leaf being sized (4, or 2 for a narrow leaf).
+var expDW = 4
+
+// TestLookupExperiment: repeated point-lookup timings on the compacted test database, to compare leaf
+// layouts across processes.
+//
+//	JED_FORMAT_EXP=1 go test -run TestLookupExperiment -v -timeout 30m .
+func TestLookupExperiment(t *testing.T) {
+	if os.Getenv("JED_FORMAT_EXP") == "" {
+		t.Skip("set JED_FORMAT_EXP=1")
+	}
+	dir := os.Getenv("JED_FORMAT_EXP_DIR")
+	if dir == "" {
+		dir = t.TempDir()
+	}
+	path := filepath.Join(dir, "lookup.jed")
+	os.Remove(path)
+	os.RemoveAll(path + ".lock")
+	db := expBuild(t, path, DefaultPageSize)
+	defer func() { db.Close(); os.Remove(path) }()
+	if err := db.Compact("main"); err != nil {
+		t.Fatal(err)
+	}
+	s := db.Session(SessionOptions{})
+	defer s.Close()
+	nOrders := int64(expScale(300000))
+	run := func(label, sql string, n int, arg func(r *rand.Rand) int64) {
+		p, err := s.Prepare(sql)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var ds []time.Duration
+		for pass := 0; pass < 9; pass++ {
+			r := rand.New(rand.NewSource(9))
+			st := time.Now()
+			for i := 0; i < n; i++ {
+				if _, err := prepOutcome(s, p, []Value{IntValue(arg(r))}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			ds = append(ds, time.Since(st)/time.Duration(n))
+		}
+		first := ds[0]
+		rest := append([]time.Duration(nil), ds[1:]...)
+		sort.Slice(rest, func(i, j int) bool { return rest[i] < rest[j] })
+		fmt.Printf("%-36s first pass %8v   later passes: min %8v median %8v max %8v\n", label, first, rest[0], rest[len(rest)/2], rest[len(rest)-1])
+	}
+	run("pk lookup (orders)", "SELECT amount FROM orders WHERE id = $1", 20000, func(r *rand.Rand) int64 { return 1 + r.Int63n(nOrders) })
+	run("pk lookup, key column only", "SELECT id FROM orders WHERE id = $1", 20000, func(r *rand.Rand) int64 { return 1 + r.Int63n(nOrders) })
+	run("index lookup (orders by customer)", "SELECT count(*) FROM orders WHERE customer_id = $1", 5000, func(r *rand.Rand) int64 { return 1000 + r.Int63n(40000) })
 }

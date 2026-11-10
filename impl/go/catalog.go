@@ -642,6 +642,10 @@ type colType struct {
 	DecSlot uint8
 	// DecScale is the display scale a DecSlot column's slot is read at (meaningful only then).
 	DecScale uint16
+	// keyAt, when nonzero, says this table column is a primary-key member whose value is recoverable
+	// from the row's storage key: its key bytes start at offset keyAt−1 (PROTOTYPE, leaf_narrow.go).
+	// Set only on a table store's column types (markKeyColumns); it is not part of the type.
+	keyAt uint16
 }
 
 // valueType is this stored type as a SINGLE VALUE's codec type (format.md "Value codec"): the same
