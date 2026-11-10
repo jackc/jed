@@ -1354,6 +1354,8 @@ fn value_facts(ty: &ColType, v: &Value) -> (usize, usize) {
         // payload is the bytes: no encoding is needed to size them.
         Value::Text(s) => (3 + s.len(), if is_spillable(ty) { s.len() } else { 0 }),
         Value::Bytea(b) => (3 + b.len(), if is_spillable(ty) { b.len() } else { 0 }),
+        // json is the same tag + u16 length + verbatim UTF-8 (its payload) — measured, not encoded.
+        Value::Json(s) if is_spillable(ty) => (3 + s.len(), s.len()),
         v => {
             let inline = encode_value(ty, v).len();
             let payload = if is_spillable(ty) {
@@ -1557,16 +1559,18 @@ pub(crate) fn deferred_in_stored_form(
 /// inline-deferred value's, read straight from the inline body it holds — the body after a
 /// `text`/`bytea`/`json` value's `u16` length, every other spillable body whole (format.md "Value
 /// codec"). No decode, so a corrupt span cannot fail planning; resolving it later reports it.
-fn planning_payload(ty: &ColType, v: &Value) -> Vec<u8> {
+/// Borrowed wherever the bytes already exist — a span of the inline body, a resident string body —
+/// so a compression attempt reads them in place rather than from a copy.
+fn planning_payload<'v>(ty: &ColType, v: &'v Value) -> Cow<'v, [u8]> {
     match v {
         Value::Unfetched(Unfetched::Inline {
             block, off, len, ..
         }) => {
             let body = &block[*off as usize..*off as usize + *len as usize];
-            body[(inline_header_len(ty) - 1).min(body.len())..].to_vec()
+            Cow::Borrowed(&body[(inline_header_len(ty) - 1).min(body.len())..])
         }
         Value::Unfetched(_) => unreachable!("a stored large form's compression outcome is known"),
-        v => value_payload(ty, v),
+        v => payload_bytes(ty, v),
     }
 }
 
@@ -1759,6 +1763,16 @@ fn value_payload(ty: &ColType, v: &Value) -> Vec<u8> {
         // A range's payload is its body (the flags byte + present bound bodies, spec/design/ranges.md §4).
         (ColType::Range(elem), Value::Range(rv)) => encode_range_body(elem, rv),
         _ => unreachable!("only spillable values are externalized"),
+    }
+}
+
+/// [`value_payload`] borrowed where `P(v)` is the value's own bytes — a resident `text` / `bytea` /
+/// `json` body — and built otherwise, so a large string is read in place rather than copied.
+fn payload_bytes<'v>(ty: &ColType, v: &'v Value) -> Cow<'v, [u8]> {
+    match (ty, v) {
+        (ColType::Scalar(_), Value::Text(s) | Value::Json(s)) => Cow::Borrowed(s.as_bytes()),
+        (ColType::Scalar(_), Value::Bytea(b)) => Cow::Borrowed(b),
+        _ => Cow::Owned(value_payload(ty, v)),
     }
 }
 
