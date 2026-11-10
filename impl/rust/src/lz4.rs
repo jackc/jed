@@ -158,11 +158,16 @@ pub fn decompress(comp: &[u8], raw_len: usize) -> Result<Vec<u8>> {
         if out.len() + ml > raw_len {
             return Err(corrupt("decompressed length overflow"));
         }
+        // An overlapping match (offset < length) replicates the run byte by byte ascending (lz4.md
+        // §3), which is the bytes from `from` repeated with period `offset`. Copying everything
+        // already written from `from` keeps that distance a whole number of periods, so each block
+        // copy continues the run exactly; a non-overlapping match is one copy.
         let from = out.len() - offset;
-        for k in 0..ml {
-            // Byte-by-byte ascending: an overlapping match replicates the run (lz4.md §3).
-            let b = out[from + k];
-            out.push(b);
+        let mut remaining = ml;
+        while remaining > 0 {
+            let chunk = remaining.min(out.len() - from);
+            out.extend_from_within(from..from + chunk);
+            remaining -= chunk;
         }
     }
     if out.len() != raw_len {
