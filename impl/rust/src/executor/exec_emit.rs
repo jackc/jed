@@ -67,9 +67,11 @@ impl NestedLoopStep<'_> {
         meter: &mut Meter,
     ) -> Result<()> {
         let mut left_matched = false;
+        // The candidate pair is assembled in one scratch row, so a pair ON rejects allocates nothing.
+        let mut combined = left.clone();
         for (ri, right) in candidates {
             meter.poll()?;
-            let mut combined = left.clone();
+            combined.truncate(left.len());
             combined.extend_from_slice(right);
             let keep = match self.on {
                 None => true,
@@ -77,7 +79,7 @@ impl NestedLoopStep<'_> {
             };
             if keep {
                 meter.admit_row_masked(&combined, self.mem_mask)?;
-                next.push(combined);
+                next.push(combined.clone());
                 left_matched = true;
                 if let Some(matched) = right_matched.as_deref_mut() {
                     matched[ri] = true;
@@ -85,8 +87,8 @@ impl NestedLoopStep<'_> {
             }
         }
         if self.emit_left && !left_matched {
-            let mut combined = left.clone();
-            combined.resize(combined.len() + self.right_pad, Value::Null);
+            combined.truncate(left.len());
+            combined.resize(left.len() + self.right_pad, Value::Null);
             meter.admit_row_masked(&combined, self.mem_mask)?;
             next.push(combined);
         }
@@ -180,10 +182,12 @@ impl Engine {
                     inner_rows
                 };
                 let mut left_matched = false;
+                // The candidate pair is assembled in one scratch row, so a pair ON rejects
+                // allocates nothing.
+                let mut combined = left.clone();
+                let offset = plan.rels[inner].offset;
                 for (candidate_index, right) in candidates.iter().enumerate() {
                     meter.poll()?;
-                    let mut combined = left.clone();
-                    let offset = plan.rels[inner].offset;
                     combined[offset..offset + right.len()].clone_from_slice(right);
                     let mut keep = true;
                     for &on_index in &step.on_indices {
@@ -197,7 +201,7 @@ impl Engine {
                     }
                     if keep {
                         meter.admit_row_masked(&combined, &mask)?;
-                        next.push(combined);
+                        next.push(combined.clone());
                         left_matched = true;
                         if emit_right {
                             right_matched[candidate_index] = true;
@@ -276,56 +280,61 @@ impl Engine {
 
         let mask = plan.memory_mask(meter);
         let mut out = Vec::new();
+        let inner_offset = plan.rels[inner_ordinal].offset;
         for outer_row in outer_rows {
-            let candidates: Vec<Row> = if inner_inl {
-                let outer_logical = place_physical_relation_row(plan, outer_ordinal, outer_row);
+            // The outer row in its logical slots: the INL probe's sibling row, and the scratch row
+            // each candidate pair is assembled in, so a pair ON rejects allocates nothing.
+            let mut combined = place_physical_relation_row(plan, outer_ordinal, outer_row);
+            let inl_rows = if inner_inl {
                 let before = meter.accrued;
                 let rows = self.materialize_rel(
                     plan,
                     inner_ordinal,
                     params,
                     outer_stack,
-                    &outer_logical,
+                    &combined,
                     stmt_rng,
                     env.ctes,
                     meter,
                 )?;
                 rel_work[inner_ordinal] += meter.accrued - before;
                 rows
+            } else {
+                Vec::new()
+            };
+            let hash_rows: Vec<&Row>;
+            // The inner relation is read in place; only a kept pair copies its values.
+            let candidates: &mut dyn Iterator<Item = &Row> = if inner_inl {
+                &mut inl_rows.iter()
             } else if let Some(table) = &hash_table {
-                table
+                hash_rows = table
                     .probe(
                         plan.phys.hash_join.as_ref().expect("hash plan"),
                         outer_row,
                         meter,
                     )?
                     .into_iter()
-                    .map(|i| inner_rows[i].clone())
-                    .collect()
+                    .map(|i| &inner_rows[i])
+                    .collect();
+                &mut hash_rows.into_iter()
             } else {
-                inner_rows.clone()
+                &mut inner_rows.iter()
             };
-            for inner_row in &candidates {
+            for inner_row in candidates {
                 meter.poll()?;
-                let combined = combine_physical_relation_rows(
-                    plan,
-                    outer_ordinal,
-                    outer_row,
-                    inner_ordinal,
-                    inner_row,
-                );
+                combined[inner_offset..inner_offset + inner_row.len()].clone_from_slice(inner_row);
                 let keep = match &on {
                     None => true,
                     Some(pred) => pred.eval_filter(&combined, env, meter)?,
                 };
                 if keep {
                     meter.admit_row_masked(&combined, &mask)?;
-                    out.push(combined);
+                    out.push(combined.clone());
                 }
             }
             // A per-outer-row INL re-materialization is consumed (memory.md §5.3).
             if inner_inl {
-                meter.release_rows_masked(&candidates, &plan.rel_masks[inner_ordinal]);
+                meter.release_rows_masked(&inl_rows, &plan.rel_masks[inner_ordinal]);
             }
         }
         Ok(out)
