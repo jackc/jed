@@ -12,11 +12,11 @@ use super::*;
 /// a rejected reservation is returned for the caller's cost-first check.
 pub(crate) fn sort_rows(
     rows: &mut Vec<Row>,
-    order: &[crate::spill::SortKey],
+    order: &[SortKey],
     acct: &crate::cost::QueryAccount,
     meter: &mut Meter,
 ) -> Result<()> {
-    if order.iter().any(|(_, _, _, c)| c.is_some()) {
+    if order.iter().any(|SortKey { collation: c, .. }| c.is_some()) {
         return sort_rows_collated(rows, order, acct, meter);
     }
     // Every row the sort receives charges its keys (cost.md §3 "sort_key / hash_key").
@@ -123,7 +123,7 @@ pub(crate) fn range_v_vs_bound(
 struct FrameCtx<'a> {
     ordered: &'a [usize],
     rows: &'a [Row],
-    order: &'a [crate::spill::SortKey],
+    order: &'a [SortKey],
     np: usize,
     peer_start: Vec<usize>,
     peer_end: Vec<usize>,
@@ -135,7 +135,7 @@ impl<'a> FrameCtx<'a> {
     pub(crate) fn new(
         ordered: &'a [usize],
         rows: &'a [Row],
-        order: &'a [crate::spill::SortKey],
+        order: &'a [SortKey],
         coll_keys: &'a [Vec<Option<Vec<u8>>>],
     ) -> Self {
         let np = ordered.len();
@@ -303,7 +303,12 @@ impl<'a> FrameCtx<'a> {
             return Ok((lo, hi.max(lo)));
         }
         // Offset present ⇒ exactly one ORDER BY key (validated at resolve).
-        let (col, desc, nulls_first, _) = self.order[0];
+        let SortKey {
+            col,
+            descending: desc,
+            nulls_first,
+            ..
+        } = self.order[0];
         let cur = &self.rows[self.ordered[pos]][col];
         if matches!(cur, Value::Null) {
             let lo = match &f.start {
@@ -453,11 +458,11 @@ pub(crate) fn group_window_specs(specs: &[WindowSpec]) -> Vec<Vec<usize>> {
 /// built and held until the window stage completes.
 pub(crate) fn window_coll_keys(
     rows: &[Row],
-    order: &[crate::spill::SortKey],
+    order: &[SortKey],
     charge: &mut crate::cost::StateCharge,
     meter: &mut Meter,
 ) -> Result<Vec<Vec<Option<Vec<u8>>>>> {
-    if !order.iter().any(|(_, _, _, c)| c.is_some()) {
+    if !order.iter().any(|SortKey { collation: c, .. }| c.is_some()) {
         for row in rows.iter() {
             charge_sort_keys(meter, row, order)?;
         }
@@ -466,7 +471,12 @@ pub(crate) fn window_coll_keys(
     let mut all = Vec::with_capacity(rows.len());
     for row in rows.iter() {
         let mut keys = Vec::new();
-        for (idx, _, _, coll) in order {
+        for SortKey {
+            col: idx,
+            collation: coll,
+            ..
+        } in order
+        {
             // Each key is charged as the sort receives the row, just before its decoration.
             charge_sort_key(meter, &row[*idx], coll.as_deref())?;
             if let Some(c) = coll {
@@ -1016,7 +1026,7 @@ pub(crate) fn apply_window_stage(
 /// sort it follows. `dropped` sees each discarded row, so its query-memory charge can be released.
 pub(crate) fn dedup_sorted_runs(
     rows: Vec<Row>,
-    keys: &[crate::spill::SortKey],
+    keys: &[SortKey],
     mut dropped: impl FnMut(&Row),
 ) -> Vec<Row> {
     let mut out: Vec<Row> = Vec::with_capacity(rows.len());
@@ -1032,12 +1042,14 @@ pub(crate) fn dedup_sorted_runs(
     out
 }
 
-pub(crate) fn cmp_rows_by_order(
-    a: &Row,
-    b: &Row,
-    order: &[crate::spill::SortKey],
-) -> std::cmp::Ordering {
-    for (idx, descending, nulls_first, _coll) in order {
+pub(crate) fn cmp_rows_by_order(a: &Row, b: &Row, order: &[SortKey]) -> std::cmp::Ordering {
+    for SortKey {
+        col: idx,
+        descending,
+        nulls_first,
+        ..
+    } in order
+    {
         let ord = key_cmp(&a[*idx], &b[*idx], *descending, *nulls_first);
         if ord != std::cmp::Ordering::Equal {
             return ord;
@@ -1058,12 +1070,18 @@ pub(crate) fn cmp_window_rows(
     a: usize,
     b: usize,
     rows: &[Row],
-    order: &[crate::spill::SortKey],
+    order: &[SortKey],
     coll_keys: &[Vec<Option<Vec<u8>>>],
 ) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     let mut ci = 0usize; // advances once per collated slot (keys stored in slot order)
-    for (idx, descending, nulls_first, coll) in order {
+    for SortKey {
+        col: idx,
+        descending,
+        nulls_first,
+        collation: coll,
+    } in order
+    {
         let ord = if coll.is_some() {
             let ak = &coll_keys[a][ci];
             let bk = &coll_keys[b][ci];
@@ -1110,7 +1128,7 @@ pub(crate) fn cmp_window_rows(
 /// released once the rows are undecorated (memory.md §6.8).
 pub(crate) fn sort_rows_collated(
     rows: &mut Vec<Row>,
-    order: &[crate::spill::SortKey],
+    order: &[SortKey],
     acct: &crate::cost::QueryAccount,
     meter: &mut Meter,
 ) -> Result<()> {
@@ -1135,7 +1153,7 @@ pub(crate) fn sort_rows_collated(
 pub(crate) fn cmp_decorated(
     a: &(Vec<Option<Vec<u8>>>, Row),
     b: &(Vec<Option<Vec<u8>>>, Row),
-    order: &[crate::spill::SortKey],
+    order: &[SortKey],
 ) -> std::cmp::Ordering {
     cmp_decorated_parts(&a.0, &a.1, &b.0, &b.1, order)
 }
@@ -1145,11 +1163,17 @@ fn cmp_decorated_parts(
     arow: &Row,
     bkeys: &[Option<Vec<u8>>],
     brow: &Row,
-    order: &[crate::spill::SortKey],
+    order: &[SortKey],
 ) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     let mut ci = 0usize; // advances once per collated slot (keys stored in slot order)
-    for (idx, descending, nulls_first, coll) in order {
+    for SortKey {
+        col: idx,
+        descending,
+        nulls_first,
+        collation: coll,
+    } in order
+    {
         let ord = if coll.is_some() {
             let ak = &akeys[ci];
             let bk = &bkeys[ci];
@@ -1187,11 +1211,16 @@ fn cmp_decorated_parts(
 
 fn collation_keys_for_row(
     row: &Row,
-    order: &[crate::spill::SortKey],
+    order: &[SortKey],
     meter: &mut Meter,
 ) -> Result<Vec<Option<Vec<u8>>>> {
     let mut keys = Vec::new();
-    for (idx, _, _, coll) in order {
+    for SortKey {
+        col: idx,
+        collation: coll,
+        ..
+    } in order
+    {
         // Every key of the row is charged as the sort receives it, each just before its decoration
         // (cost.md §3 "sort_key / hash_key").
         charge_sort_key(meter, &row[*idx], coll.as_deref())?;
@@ -1214,7 +1243,7 @@ pub(crate) struct TopKKeeper {
     k: usize,
     next_pos: usize,
     collated: bool,
-    order: Vec<crate::spill::SortKey>,
+    order: Vec<SortKey>,
     items: Vec<TopKItem>,
     /// The retained rows' query-memory charge when the heap is sort state (the streaming-sort lane,
     /// memory.md §6.4); inert for the eager top-k selection, whose rows are Q1 buffer rows.
@@ -1226,7 +1255,7 @@ pub(crate) struct TopKKeeper {
 }
 
 impl TopKKeeper {
-    pub(crate) fn new(k: i64, order: &[crate::spill::SortKey], collated: bool) -> Self {
+    pub(crate) fn new(k: i64, order: &[SortKey], collated: bool) -> Self {
         Self {
             k: usize::try_from(k).unwrap_or(usize::MAX),
             next_pos: 0,
@@ -1371,12 +1400,12 @@ impl TopKKeeper {
 
 pub(crate) fn top_k_rows(
     rows: Vec<Row>,
-    order: &[crate::spill::SortKey],
+    order: &[SortKey],
     k: i64,
     acct: &crate::cost::QueryAccount,
     meter: &mut Meter,
 ) -> Result<Vec<Row>> {
-    let collated = order.iter().any(|key| key.3.is_some());
+    let collated = order.iter().any(|key| key.collation.is_some());
     let mut keeper = TopKKeeper::new(k, order, collated).with_decorations(acct);
     for row in rows {
         keeper.push(row, meter)?;

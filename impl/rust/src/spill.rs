@@ -33,12 +33,31 @@ use crate::value::{ArrayVal, RangeVal, Unfetched, Value};
 /// lowering it. A handle setting, never stored in the file.
 pub const DEFAULT_WORK_MEM: usize = 256 * 1024 * 1024;
 
-/// One `ORDER BY` key: a flat row index + its direction + NULL placement + an optional collation —
-/// mirrors `plan.order`. The collation (`Some` ⇒ a non-`C` UCA order) is handled OUTSIDE the spill
+/// One `ORDER BY` key — mirrors `plan.order`. The collation (`Some` ⇒ a non-`C` UCA order) is handled OUTSIDE the spill
 /// sorter: a collated ORDER BY never reaches the `Sorter` (collation is in-memory only this slice
 /// and the executor routes a collated sort to its decorate sorter, spec/design/collation.md §8), so
 /// `cmp_rows` only ever sees `None` here and ignores the field.
-pub(crate) type SortKey = (usize, bool, bool, Option<Arc<Collation>>);
+#[derive(Clone, PartialEq)]
+pub(crate) struct SortKey {
+    /// The row slot holding the key.
+    pub(crate) col: usize,
+    pub(crate) descending: bool,
+    pub(crate) nulls_first: bool,
+    /// The linguistic collation of a collated text key; `None` orders by value (`C`).
+    pub(crate) collation: Option<Arc<Collation>>,
+}
+
+impl SortKey {
+    /// An ascending, NULLS LAST, uncollated key on `col`.
+    pub(crate) fn asc(col: usize) -> SortKey {
+        SortKey {
+            col,
+            descending: false,
+            nulls_first: false,
+            collation: None,
+        }
+    }
+}
 
 /// A row's resident bytes for the `work_mem` spill decision: the shared logical size schedule of
 /// spec/design/memory.md §3 — the same number the query-memory account charges for sort and spill
@@ -131,7 +150,13 @@ impl Sorter {
     fn cmp_rows(keys: &[SortKey], a: &Row, b: &Row) -> Ordering {
         // The collation field is always `None` here (a collated sort never uses this sorter — see
         // the SortKey doc), so it is ignored: the C/value comparator orders every key.
-        for (idx, descending, nulls_first, _collation) in keys {
+        for SortKey {
+            col: idx,
+            descending,
+            nulls_first,
+            ..
+        } in keys
+        {
             let ord = key_cmp(&a[*idx], &b[*idx], *descending, *nulls_first);
             if ord != Ordering::Equal {
                 return ord;
@@ -145,7 +170,7 @@ impl Sorter {
         let keys = self.keys.clone();
         self.buf.sort_by(|a, b| Sorter::cmp_rows(&keys, a, b));
         let spill = self.spill.clone().expect("spill_run requires a spill host");
-        let file: Arc<dyn SpillFile> = Arc::from(spill.create("sort")?);
+        let file: Arc<dyn SpillFile> = Arc::from(spill.create(crate::spillhost::SpillKind::Sort)?);
         let mut w = BufWriter::new(SpillAppender::new(file.clone(), 0));
         let write_result = (|| -> io::Result<()> {
             write_u64(&mut w, self.buf.len() as u64)?;
@@ -244,7 +269,7 @@ fn merge_pair_to_file(
         heads,
     };
     merger.prime(&keys)?;
-    let file: Arc<dyn SpillFile> = Arc::from(spill.create("merge")?);
+    let file: Arc<dyn SpillFile> = Arc::from(spill.create(crate::spillhost::SpillKind::Merge)?);
     let mut writer = BufWriter::new(SpillAppender::new(file.clone(), 0));
     let result = (|| -> Result<()> {
         write_u64(&mut writer, count).map_err(io_error)?;
@@ -880,7 +905,7 @@ mod bounded_run_tests {
     #[test]
     fn spilling_sort_bounds_run_metadata_and_merge_descriptors() {
         let mut sort = Sorter::new(
-            vec![(0, false, false, None)],
+            vec![SortKey::asc(0)],
             1,
             Some(crate::spillhost::os_spill_host(std::env::temp_dir())),
             StateCharge::default(),
@@ -920,7 +945,7 @@ mod bounded_run_tests {
         };
         let row_size = crate::memsize::row_bytes(&[Value::Int(0), Value::Int(0)]);
         let mut sort = Sorter::new(
-            vec![(0, false, false, None)],
+            vec![SortKey::asc(0)],
             (row_size * 3) as usize,
             Some(crate::spillhost::os_spill_host(std::env::temp_dir())),
             StateCharge::new(acct.clone()),
@@ -948,7 +973,7 @@ mod bounded_run_tests {
             floor: std::rc::Rc::new(std::cell::Cell::new(0)),
         };
         let mut sort = Sorter::new(
-            vec![(0, false, false, None)],
+            vec![SortKey::asc(0)],
             (row_size * 3) as usize,
             Some(crate::spillhost::os_spill_host(std::env::temp_dir())),
             StateCharge::new(tight.clone()),
@@ -974,7 +999,7 @@ mod bounded_run_tests {
             floor: std::rc::Rc::new(std::cell::Cell::new(0)),
         };
         let mut sort = Sorter::new(
-            vec![(0, false, false, None)],
+            vec![SortKey::asc(0)],
             1 << 30,
             Some(crate::spillhost::os_spill_host(std::env::temp_dir())),
             StateCharge::new(acct.clone()),

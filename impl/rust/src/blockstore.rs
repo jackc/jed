@@ -310,7 +310,7 @@ impl ScratchBlockStore {
     /// Create an empty scratch file through `spill` (the `"temp"` kind).
     pub(crate) fn create(spill: &dyn crate::spillhost::SpillHost) -> Result<ScratchBlockStore> {
         Ok(ScratchBlockStore {
-            file: spill.create("temp")?,
+            file: spill.create(crate::spillhost::SpillKind::Temp)?,
         })
     }
 }

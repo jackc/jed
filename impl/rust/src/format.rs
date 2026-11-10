@@ -3556,6 +3556,18 @@ pub(crate) fn reclaim_due(page_count: u32, free: usize, live_at_compaction: u32)
     unlisted > COMPACT_MIN_PAGES as u64 && unlisted > COMPACT_GROWTH * live_at_compaction as u64
 }
 
+/// What a commit may do with dead pages (format.md *Reclamation*, *Trailing truncation*).
+#[derive(Clone, Copy)]
+pub(crate) struct FreeListPolicy {
+    /// Rebuild the reclaimable set this commit (no reader pins an older version).
+    pub(crate) reclaim: bool,
+    /// Reuse pages already on the free list.
+    pub(crate) reuse: bool,
+    /// Cut free pages off the top of the file. Only the file's owner does, and only against a
+    /// durable floor.
+    pub(crate) truncate: bool,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn plan_free_list(
     snap: &Snapshot,
@@ -3567,9 +3579,7 @@ pub(crate) fn plan_free_list(
     live_at_compaction: u32,
     gen_txid: u64,
     ps: usize,
-    can_reclaim: bool,
-    can_reuse: bool,
-    truncate: bool,
+    policy: FreeListPolicy,
     live_pages: u32,
     pending: &[(u32, u64)],
     allowed: Option<&HashSet<u32>>,
@@ -3577,7 +3587,7 @@ pub(crate) fn plan_free_list(
     // `live_at_compaction == 0` marks a store whose reclaimable set is unknown, so a commit that may
     // reclaim reconstructs it immediately even for a small file. Ordinary stores retain the amortized
     // periodic trigger.
-    let compact = can_reclaim
+    let compact = policy.reclaim
         && (live_at_compaction == 0
             || reclaim_due(page_count, free_remaining.len(), live_at_compaction));
     let (mut persist_list, new_live, new_gen) = if compact {
@@ -3605,7 +3615,7 @@ pub(crate) fn plan_free_list(
     // the same hazard as data-page reuse. When the watermark defers reuse the chain must grow the
     // high-water instead (empty `safe`), exactly as the data allocator does.
     let filtered: Vec<u32>;
-    let mut safe: &[u32] = match (can_reuse, allowed) {
+    let mut safe: &[u32] = match (policy.reuse, allowed) {
         (false, _) => &[],
         (true, None) => free_remaining,
         // A pending batch reuses only pages free at its floor (validated-cow.md §4 rule 3).
@@ -3623,7 +3633,7 @@ pub(crate) fn plan_free_list(
     // alone process) truncates, and only against a durable floor (nothing pending, validated-cow.md
     // §4); a page client's delta never shrinks the high-water.
     let mut base = page_count;
-    if truncate {
+    if policy.truncate {
         let (below, k) = trailing_run(safe, page_count);
         if k < page_count {
             safe = below;
@@ -7574,109 +7584,120 @@ fn read_inline_scalar(
     pos: &mut usize,
     mode: DecodeMode,
 ) -> Result<Value> {
-    // `jsonpath` reserves a type code but has no value codec; a catalog naming it for a column,
-    // field, or element must not reach the fixed-width decoder below.
-    if ty == ScalarType::JsonPath {
-        return Err(corrupt("a stored body holds a jsonpath value"));
-    }
-    if ty.is_text() {
-        let len = read_u16(buf, pos)? as usize;
-        let bytes = take(buf, pos, len)?;
-        if !mode.constructs() {
-            return Ok(Value::Null); // skip: no alloc, no UTF-8 validation (lazy-record.md §6)
+    match ty {
+        // `jsonpath` reserves a type code but has no value codec; a catalog naming it for a column,
+        // field, or element is corrupt.
+        ScalarType::JsonPath => Err(corrupt("a stored body holds a jsonpath value")),
+        ScalarType::Text => {
+            let len = read_u16(buf, pos)? as usize;
+            let bytes = take(buf, pos, len)?;
+            if !mode.constructs() {
+                return Ok(Value::Null); // skip: no alloc, no UTF-8 validation (lazy-record.md §6)
+            }
+            let s =
+                String::from_utf8(bytes.to_vec()).map_err(|_| corrupt("non-UTF-8 text value"))?;
+            Ok(Value::Text(s))
         }
-        let s = String::from_utf8(bytes.to_vec()).map_err(|_| corrupt("non-UTF-8 text value"))?;
-        Ok(Value::Text(s))
-    } else if ty.is_bool() {
-        // Fixed-width (1 byte) — decoded eagerly even on the lazy path (§6); the validity check is
-        // cheap and harmless in either mode.
-        match read_u8(buf, pos)? {
-            0x00 => Ok(Value::Bool(false)),
-            0x01 => Ok(Value::Bool(true)),
-            _ => Err(corrupt("invalid boolean value byte")),
+        ScalarType::Bool => {
+            // Fixed-width (1 byte) — decoded eagerly even on the lazy path (§6); the validity check is
+            // cheap and harmless in either mode.
+            match read_u8(buf, pos)? {
+                0x00 => Ok(Value::Bool(false)),
+                0x01 => Ok(Value::Bool(true)),
+                _ => Err(corrupt("invalid boolean value byte")),
+            }
         }
-    } else if ty.is_decimal() {
-        decode_decimal_body(buf, pos, mode)
-    } else if ty.is_bytea() {
-        let len = read_u16(buf, pos)? as usize;
-        let bytes = take(buf, pos, len)?;
-        if !mode.constructs() {
-            return Ok(Value::Null); // skip: no alloc
+        ScalarType::Decimal => decode_decimal_body(buf, pos, mode),
+        ScalarType::Bytea => {
+            let len = read_u16(buf, pos)? as usize;
+            let bytes = take(buf, pos, len)?;
+            if !mode.constructs() {
+                return Ok(Value::Null); // skip: no alloc
+            }
+            Ok(Value::Bytea(bytes.to_vec()))
         }
-        Ok(Value::Bytea(bytes.to_vec()))
-    } else if ty.is_json() {
-        // json: verbatim text, length-prefixed exactly like text (spec/design/json.md §4).
-        let len = read_u16(buf, pos)? as usize;
-        let bytes = take(buf, pos, len)?;
-        if !mode.constructs() {
-            return Ok(Value::Null); // skip: no alloc, no UTF-8 validation
+        ScalarType::Json => {
+            // json: verbatim text, length-prefixed exactly like text (spec/design/json.md §4).
+            let len = read_u16(buf, pos)? as usize;
+            let bytes = take(buf, pos, len)?;
+            if !mode.constructs() {
+                return Ok(Value::Null); // skip: no alloc, no UTF-8 validation
+            }
+            let s =
+                String::from_utf8(bytes.to_vec()).map_err(|_| corrupt("non-UTF-8 json value"))?;
+            Ok(Value::Json(s))
         }
-        let s = String::from_utf8(bytes.to_vec()).map_err(|_| corrupt("non-UTF-8 json value"))?;
-        Ok(Value::Json(s))
-    } else if ty.is_jsonb() {
-        // jsonb: the self-delimiting tagged-node tree (spec/design/json.md §2).
-        let node = decode_jsonb_body(buf, pos, mode)?;
-        if !mode.constructs() {
-            return Ok(Value::Null); // skip: tree walked, not built
+        ScalarType::Jsonb => {
+            // jsonb: the self-delimiting tagged-node tree (spec/design/json.md §2).
+            let node = decode_jsonb_body(buf, pos, mode)?;
+            if !mode.constructs() {
+                return Ok(Value::Null); // skip: tree walked, not built
+            }
+            Ok(Value::Jsonb(node))
         }
-        Ok(Value::Jsonb(node))
-    } else if ty.is_uuid() {
-        // Fixed 16 raw bytes, no length prefix (must branch before the integer path —
-        // decode_int would sign-flip and width_bytes is 16 there too).
-        let b: [u8; 16] = take(buf, pos, 16)?
-            .try_into()
-            .map_err(|_| corrupt("invalid uuid length"))?;
-        Ok(Value::Uuid(b))
-    } else if ty.is_float64() {
-        // 8 IEEE bytes, big-endian; the stored bits are preserved verbatim (spec/design/float.md
-        // §10). Must branch before the integer path (width_bytes is 8 there too).
-        let b: [u8; 8] = take(buf, pos, 8)?
-            .try_into()
-            .map_err(|_| corrupt("invalid f64 length"))?;
-        Ok(Value::Float64(f64::from_bits(u64::from_be_bytes(b))))
-    } else if ty.is_float32() {
-        // 4 IEEE bytes, big-endian. Must branch before the integer path (width_bytes is 4, which
-        // would otherwise match i32 and sign-flip).
-        let b: [u8; 4] = take(buf, pos, 4)?
-            .try_into()
-            .map_err(|_| corrupt("invalid f32 length"))?;
-        Ok(Value::Float32(f32::from_bits(u32::from_be_bytes(b))))
-    } else if ty.is_timestamp() {
-        let vb = take(buf, pos, ty.width_bytes())?;
-        Ok(Value::Timestamp(decode_int(ty, vb)))
-    } else if ty.is_timestamptz() {
-        let vb = take(buf, pos, ty.width_bytes())?;
-        Ok(Value::Timestamptz(decode_int(ty, vb)))
-    } else if ty.is_date() {
-        // 4-byte i32 day count, same order-preserving codec as i32 (spec/design/date.md).
-        let vb = take(buf, pos, ty.width_bytes())?;
-        Ok(Value::Date(decode_int(ty, vb) as i32))
-    } else if ty.is_interval() {
-        // Fixed 16-byte body: i32 months + i32 days + i64 micros, big-endian (no sign-flip).
-        let months = i32::from_be_bytes(
-            take(buf, pos, 4)?
+        ScalarType::Uuid => {
+            // Fixed 16 raw bytes, no length prefix.
+            let b: [u8; 16] = take(buf, pos, 16)?
                 .try_into()
-                .map_err(|_| corrupt("invalid interval months"))?,
-        );
-        let days = i32::from_be_bytes(
-            take(buf, pos, 4)?
+                .map_err(|_| corrupt("invalid uuid length"))?;
+            Ok(Value::Uuid(b))
+        }
+        ScalarType::Float64 => {
+            // 8 IEEE bytes, big-endian; the stored bits are preserved verbatim (spec/design/float.md
+            // §10).
+            let b: [u8; 8] = take(buf, pos, 8)?
                 .try_into()
-                .map_err(|_| corrupt("invalid interval days"))?,
-        );
-        let micros = i64::from_be_bytes(
-            take(buf, pos, 8)?
+                .map_err(|_| corrupt("invalid f64 length"))?;
+            Ok(Value::Float64(f64::from_bits(u64::from_be_bytes(b))))
+        }
+        ScalarType::Float32 => {
+            // 4 IEEE bytes, big-endian.
+            let b: [u8; 4] = take(buf, pos, 4)?
                 .try_into()
-                .map_err(|_| corrupt("invalid interval micros"))?,
-        );
-        Ok(Value::Interval(Interval {
-            months,
-            days,
-            micros,
-        }))
-    } else {
-        let w = ty.width_bytes();
-        let vb = take(buf, pos, w)?;
-        Ok(Value::Int(decode_int(ty, vb)))
+                .map_err(|_| corrupt("invalid f32 length"))?;
+            Ok(Value::Float32(f32::from_bits(u32::from_be_bytes(b))))
+        }
+        ScalarType::Timestamp => {
+            let vb = take(buf, pos, ty.width_bytes())?;
+            Ok(Value::Timestamp(decode_int(ty, vb)))
+        }
+        ScalarType::Timestamptz => {
+            let vb = take(buf, pos, ty.width_bytes())?;
+            Ok(Value::Timestamptz(decode_int(ty, vb)))
+        }
+        ScalarType::Date => {
+            // 4-byte i32 day count, same order-preserving codec as i32 (spec/design/date.md).
+            let vb = take(buf, pos, ty.width_bytes())?;
+            Ok(Value::Date(decode_int(ty, vb) as i32))
+        }
+        ScalarType::Interval => {
+            // Fixed 16-byte body: i32 months + i32 days + i64 micros, big-endian (no sign-flip).
+            let months = i32::from_be_bytes(
+                take(buf, pos, 4)?
+                    .try_into()
+                    .map_err(|_| corrupt("invalid interval months"))?,
+            );
+            let days = i32::from_be_bytes(
+                take(buf, pos, 4)?
+                    .try_into()
+                    .map_err(|_| corrupt("invalid interval days"))?,
+            );
+            let micros = i64::from_be_bytes(
+                take(buf, pos, 8)?
+                    .try_into()
+                    .map_err(|_| corrupt("invalid interval micros"))?,
+            );
+            Ok(Value::Interval(Interval {
+                months,
+                days,
+                micros,
+            }))
+        }
+        ScalarType::Int16 | ScalarType::Int32 | ScalarType::Int64 => {
+            let w = ty.width_bytes();
+            let vb = take(buf, pos, w)?;
+            Ok(Value::Int(decode_int(ty, vb)))
+        }
     }
 }
 

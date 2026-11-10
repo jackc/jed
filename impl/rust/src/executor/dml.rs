@@ -3794,8 +3794,7 @@ impl Engine {
             }
         };
         let mut scan_actual = meter.accrued - scan_before;
-        let block_cost =
-            COSTS.page_read * batch.pages as i64 + COSTS.value_decompress * batch.slabs as i64;
+        let block_cost = crate::cost::block_cost(batch.pages, batch.slabs);
         meter.charge(block_cost);
         scan_actual += block_cost;
         let mut filter_actual = scan_actual;
@@ -4241,8 +4240,7 @@ impl Engine {
             }
         };
         let mut scan_actual = meter.accrued - scan_before;
-        let block_cost =
-            COSTS.page_read * batch.pages as i64 + COSTS.value_decompress * batch.slabs as i64;
+        let block_cost = crate::cost::block_cost(batch.pages, batch.slabs);
         meter.charge(block_cost);
         scan_actual += block_cost;
         let mut filter_actual = scan_actual;

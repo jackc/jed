@@ -1201,9 +1201,17 @@ impl Engine {
             let input_width: usize = sp.rels.iter().map(|r| r.col_count).sum();
             let input = plan.root.rows;
             let default = || input.min(estimate_pow(DEFAULT_DISTINCT_VALUES, keys.len()));
-            let rows = if !sp.is_agg && keys.iter().all(|(slot, ..)| *slot < input_width) {
-                self.estimate_simple_distinct_rows(sp, keys.iter().map(|(slot, ..)| slot), input)
-                    .unwrap_or_else(default)
+            let rows = if !sp.is_agg
+                && keys
+                    .iter()
+                    .all(|SortKey { col: slot, .. }| *slot < input_width)
+            {
+                self.estimate_simple_distinct_rows(
+                    sp,
+                    keys.iter().map(|SortKey { col: slot, .. }| slot),
+                    input,
+                )
+                .unwrap_or_else(default)
             } else {
                 default()
             };

@@ -240,6 +240,14 @@ impl Drop for StateCharge {
     }
 }
 
+/// The cost of one storage read block: `pages` logical page reads plus `slabs` decompressed
+/// large-value slabs (cost.md §3).
+#[inline]
+pub(crate) fn block_cost(pages: usize, slabs: usize) -> i64 {
+    crate::costs::COSTS.page_read * pages as i64
+        + crate::costs::COSTS.value_decompress * slabs as i64
+}
+
 /// Which cost ceiling a charge crossed first (see `Meter::charge`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum CeilingHit {
@@ -444,6 +452,13 @@ impl Meter {
             cancel,
             ..Meter::with_limit(limit)
         }
+    }
+
+    /// Charge one storage read block: `pages` logical page reads plus `slabs` decompressed
+    /// large-value slabs (cost.md §3), as a single accrual.
+    #[inline]
+    pub(crate) fn charge_block(&mut self, pages: usize, slabs: usize) {
+        self.charge(block_cost(pages, slabs));
     }
 
     /// Charge `units` of cost. The single accrual chokepoint. Accrues into both the per-statement

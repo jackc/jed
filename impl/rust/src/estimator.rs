@@ -101,7 +101,6 @@ pub(crate) struct CandidateEstimate {
     pub(crate) rows: i64,
     pub(crate) units: [i64; ESTIMATOR_UNIT_COUNT],
     pub(crate) cost: i64,
-    pub(crate) tie_key: String,
 }
 
 /// P5's cumulative estimate for one rendered plan node. `logical_rows` carries the unbounded
@@ -201,10 +200,23 @@ impl EstimatedPlan {
     }
 }
 
+/// Canonical access-path rank from estimator.toml. Keep declaration order byte-identical to the
+/// shared fact: P4 compares estimated cost first, then this rank. P3 uses it only to sort inventory.
+/// `ACCESS_PATH_ORDER[kind as usize]` is the kind's shared name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum ScanCandidateKind {
+    Pk,
+    Btree,
+    Gist,
+    Gin,
+    PkInterval,
+    IndexInterval,
+    Full,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct CandidateInputs<'a> {
-    pub(crate) kind: &'a str,
-    pub(crate) index_name: &'a str,
+pub(crate) struct CandidateInputs {
+    pub(crate) kind: ScanCandidateKind,
     pub(crate) scan_rows: i64,
     pub(crate) output_rows: i64,
     pub(crate) access_pages: i64,
@@ -214,24 +226,26 @@ pub(crate) struct CandidateInputs<'a> {
     pub(crate) produces_rows: bool,
 }
 
-fn access_rank(kind: &str) -> usize {
-    ACCESS_PATH_ORDER
-        .iter()
-        .position(|candidate| *candidate == kind)
-        .unwrap_or(ACCESS_PATH_ORDER.len())
+/// The textual tie key the shared fixtures pin: `<access-path rank>:<index name>`. The planner
+/// itself orders candidates by `ScanCandidateIdentity`, which compares the same two facts.
+#[cfg(test)]
+fn candidate_tie_key(kind: ScanCandidateKind, index_name: &str) -> String {
+    format!("{}:{}", kind as usize, index_name)
 }
 
-pub(crate) fn candidate_tie_key(kind: &str, index_name: &str) -> String {
-    format!("{}:{}", access_rank(kind), index_name)
-}
-
-pub(crate) fn estimate_candidate(input: CandidateInputs<'_>) -> CandidateEstimate {
+pub(crate) fn estimate_candidate(input: CandidateInputs) -> CandidateEstimate {
     let scan_rows = input.scan_rows.clamp(0, MAX_ESTIMATE);
     let output_rows = input.output_rows.clamp(0, MAX_ESTIMATE);
     let mut units = [0; ESTIMATOR_UNIT_COUNT];
     units[UNIT_STORAGE_ROW_READ] = scan_rows;
     units[UNIT_PAGE_READ] = input.access_pages.clamp(0, MAX_ESTIMATE);
-    if matches!(input.kind, "btree" | "gist" | "gin" | "index_interval") {
+    if matches!(
+        input.kind,
+        ScanCandidateKind::Btree
+            | ScanCandidateKind::Gist
+            | ScanCandidateKind::Gin
+            | ScanCandidateKind::IndexInterval
+    ) {
         units[UNIT_PAGE_READ] = sat_add(
             units[UNIT_PAGE_READ],
             sat_mul(scan_rows, input.table_height.clamp(0, MAX_ESTIMATE)),
@@ -241,10 +255,10 @@ pub(crate) fn estimate_candidate(input: CandidateInputs<'_>) -> CandidateEstimat
     if input.produces_rows {
         units[UNIT_ROW_PRODUCED] = output_rows;
     }
-    if input.kind == "gin" {
+    if input.kind == ScanCandidateKind::Gin {
         units[UNIT_GIN_ENTRY] = input.access_work.clamp(0, MAX_ESTIMATE);
     }
-    if input.kind == "gist" {
+    if input.kind == ScanCandidateKind::Gist {
         units[UNIT_GIST_DESCENT] = input.access_work.clamp(0, MAX_ESTIMATE);
     }
     let cost = units
@@ -257,13 +271,50 @@ pub(crate) fn estimate_candidate(input: CandidateInputs<'_>) -> CandidateEstimat
         rows: output_rows,
         units,
         cost,
-        tie_key: candidate_tie_key(input.kind, input.index_name),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const KINDS: [ScanCandidateKind; 7] = [
+        ScanCandidateKind::Pk,
+        ScanCandidateKind::Btree,
+        ScanCandidateKind::Gist,
+        ScanCandidateKind::Gin,
+        ScanCandidateKind::PkInterval,
+        ScanCandidateKind::IndexInterval,
+        ScanCandidateKind::Full,
+    ];
+
+    /// The kind a shared fixture names. `KINDS` is in `ACCESS_PATH_ORDER` order, which
+    /// `access_kind_order_matches_shared_fact` pins.
+    fn kind_named(name: &str) -> ScanCandidateKind {
+        let rank = ACCESS_PATH_ORDER
+            .iter()
+            .position(|kind| *kind == name)
+            .unwrap_or_else(|| panic!("unknown access path {name}"));
+        KINDS[rank]
+    }
+
+    #[test]
+    fn access_kind_order_matches_shared_fact() {
+        assert_eq!(KINDS.len(), ACCESS_PATH_ORDER.len());
+        for (rank, kind) in KINDS.iter().enumerate() {
+            assert_eq!(*kind as usize, rank, "{kind:?}");
+        }
+        let names = [
+            "pk",
+            "btree",
+            "gist",
+            "gin",
+            "pk_interval",
+            "index_interval",
+            "full",
+        ];
+        assert_eq!(ACCESS_PATH_ORDER, names);
+    }
 
     fn named_selectivity(token: &str) -> Selectivity {
         match token {
@@ -347,9 +398,9 @@ mod tests {
             );
         }
         for row in root["candidate"].as_array().unwrap() {
+            let kind = kind_named(row["kind"].as_str().unwrap());
             let estimate = estimate_candidate(CandidateInputs {
-                kind: row["kind"].as_str().unwrap(),
-                index_name: row["index_name"].as_str().unwrap(),
+                kind,
                 scan_rows: row["scan_rows"].as_integer().unwrap(),
                 output_rows: row["output_rows"].as_integer().unwrap(),
                 access_pages: row["access_pages"].as_integer().unwrap(),
@@ -371,7 +422,7 @@ mod tests {
                 row["id"]
             );
             assert_eq!(
-                estimate.tie_key,
+                candidate_tie_key(kind, row["index_name"].as_str().unwrap()),
                 row["tie_key"].as_str().unwrap(),
                 "{}",
                 row["id"]

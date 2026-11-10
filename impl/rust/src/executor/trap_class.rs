@@ -91,11 +91,12 @@ fn function_traps() -> &'static HashMap<&'static str, TrapClass> {
 fn function_trap_class(e: &RExpr) -> TrapClass {
     let name = match e {
         RExpr::ScalarFunc { func, .. } => explain_scalar_func(*func),
-        RExpr::Casing { upper, .. } => (if *upper { "upper" } else { "lower" }).to_string(),
+        RExpr::Casing { upper: true, .. } => "upper",
+        RExpr::Casing { upper: false, .. } => "lower",
         _ => return TrapClass::May,
     };
     function_traps()
-        .get(name.as_str())
+        .get(name)
         .copied()
         .unwrap_or(TrapClass::May)
 }

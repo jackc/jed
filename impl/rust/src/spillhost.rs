@@ -16,11 +16,25 @@ use std::sync::{Arc, Mutex};
 
 use crate::error::{EngineError, Result, SqlState};
 
+/// What a scratch file is for. Only [`SpillKind::Temp`] changes behavior: the OS host unlinks a
+/// temp domain's scratch store at once, since it lives as long as its session.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SpillKind {
+    /// A spooled row buffer.
+    Rows,
+    /// A disk hash partition.
+    Hash,
+    /// A sorted run.
+    Sort,
+    /// The output of merging sorted runs.
+    Merge,
+    /// A session temp domain's block store.
+    Temp,
+}
+
 pub(crate) trait SpillHost: Send + Sync {
-    /// Make an empty private scratch file. `kind` names its use (`"rows"`, `"hash"`, `"sort"`,
-    /// `"merge"`, `"temp"`); it never changes behavior, except that the OS host unlinks a `"temp"`
-    /// file at once (a temp domain's scratch store lives as long as its session).
-    fn create(&self, kind: &str) -> Result<Box<dyn SpillFile>>;
+    /// Make an empty private scratch file for `kind`.
+    fn create(&self, kind: SpillKind) -> Result<Box<dyn SpillFile>>;
 
     /// Whether every file this host makes is sealed (scratch encryption, encryption.md §6).
     fn encrypts(&self) -> bool {
@@ -66,7 +80,7 @@ impl SpillHost for OsSpillHost {
     /// private; a predictable pid/counter name is then only an identifier, never an overwrite
     /// primitive. A temp domain's scratch store is unlinked as soon as it is created where the OS
     /// allows an open file to be unlinked (so a crash leaves nothing behind), and otherwise on close.
-    fn create(&self, kind: &str) -> Result<Box<dyn SpillFile>> {
+    fn create(&self, kind: SpillKind) -> Result<Box<dyn SpillFile>> {
         loop {
             let seq = SPILL_SEQ.fetch_add(1, Ordering::Relaxed);
             let path = self
@@ -81,7 +95,7 @@ impl SpillHost for OsSpillHost {
             }
             match opts.open(&path) {
                 Ok(file) => {
-                    let path = if kind == "temp" && fs::remove_file(&path).is_ok() {
+                    let path = if kind == SpillKind::Temp && fs::remove_file(&path).is_ok() {
                         None
                     } else {
                         Some(path)

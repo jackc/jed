@@ -1495,7 +1495,7 @@ impl Engine {
                 distinct_on_effective = effective;
                 &distinct_on_effective
             };
-            let mut order: Vec<crate::spill::SortKey> = Vec::with_capacity(order_by_ref.len());
+            let mut order: Vec<SortKey> = Vec::with_capacity(order_by_ref.len());
             let mut order_exprs: Vec<RExpr> = Vec::new();
             for (key_index, key) in order_by_ref.iter().enumerate() {
                 // A key with no ordering operator is reported where it was written (error-fields.md
@@ -1597,12 +1597,12 @@ impl Engine {
                             };
                             let k = order_exprs.len();
                             order_exprs.push(node);
-                            order.push((
-                                ORDER_EXPR_BASE + k,
-                                key.descending,
-                                key.nulls_first,
-                                coll,
-                            ));
+                            order.push(SortKey {
+                                col: ORDER_EXPR_BASE + k,
+                                descending: key.descending,
+                                nulls_first: key.nulls_first,
+                                collation: coll,
+                            });
                         }
                         Target::Slot(r) => {
                             let idx = match r {
@@ -1643,7 +1643,12 @@ impl Engine {
                             } else {
                                 idx
                             };
-                            order.push((slot, key.descending, key.nulls_first, coll));
+                            order.push(SortKey {
+                                col: slot,
+                                descending: key.descending,
+                                nulls_first: key.nulls_first,
+                                collation: coll,
+                            });
                         }
                         Target::Expr(e) => {
                             // Resolve the key expression in the SAME context the projection used, so a window
@@ -1750,12 +1755,12 @@ impl Engine {
                             };
                             let k = order_exprs.len();
                             order_exprs.push(rexpr);
-                            order.push((
-                                ORDER_EXPR_BASE + k,
-                                key.descending,
-                                key.nulls_first,
-                                coll,
-                            ));
+                            order.push(SortKey {
+                                col: ORDER_EXPR_BASE + k,
+                                descending: key.descending,
+                                nulls_first: key.nulls_first,
+                                collation: coll,
+                            });
                         }
                     }
                     Ok(())
@@ -1805,7 +1810,7 @@ impl Engine {
                             *pk = key_base + (*pk - WINDOW_KEY_BASE);
                         }
                     }
-                    for (slot, ..) in &mut spec.order {
+                    for SortKey { col: slot, .. } in &mut spec.order {
                         if *slot >= WINDOW_KEY_BASE && *slot < WINDOW_KEY_BASE * 2 {
                             *slot = key_base + (*slot - WINDOW_KEY_BASE);
                         }
@@ -1856,7 +1861,7 @@ impl Engine {
                     scope.width()
                 })
             })?;
-            for (slot, ..) in &mut order {
+            for SortKey { col: slot, .. } in &mut order {
                 if *slot >= ORDER_EXPR_BASE {
                     *slot = order_value_base + (*slot - ORDER_EXPR_BASE);
                 }
@@ -2309,7 +2314,7 @@ fn compute_rel_masks(plan: &SelectPlan) -> Vec<Vec<bool>> {
         // A column-key ORDER BY slot is a real input column (`< total_cols`) — mark it; a
         // materialized expression-key slot is synthetic (`>= total_cols`, after rebase) whose input
         // columns are reached through its `order_exprs` expression instead (collected below).
-        for (slot, ..) in &plan.order {
+        for SortKey { col: slot, .. } in &plan.order {
             if *slot < total_cols {
                 touched[*slot] = true;
             }
@@ -2331,7 +2336,7 @@ fn compute_rel_masks(plan: &SelectPlan) -> Vec<Vec<bool>> {
                     touched[pk] = true;
                 }
             }
-            for (slot, ..) in &spec.order {
+            for SortKey { col: slot, .. } in &spec.order {
                 if *slot < total_cols {
                     touched[*slot] = true;
                 }

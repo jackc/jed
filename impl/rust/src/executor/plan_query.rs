@@ -1225,7 +1225,7 @@ impl Engine {
 
         // Trailing ORDER BY resolves keys by OUTPUT column name (no relation scope after a set
         // operation): a qualified key is 42P01, an unknown name is 42703.
-        let mut order: Vec<crate::spill::SortKey> = Vec::with_capacity(so.order_by.len());
+        let mut order: Vec<SortKey> = Vec::with_capacity(so.order_by.len());
         for key in &so.order_by {
             let slot = resolve_setop_order_key(key, &column_names)?;
             // An explicit `COLLATE` on a set-operation ORDER BY key (spec/design/collation.md §1):
@@ -1245,7 +1245,12 @@ impl Engine {
                     resolve_collation_name(self, name)?
                 }
             };
-            order.push((slot, key.descending, key.nulls_first, coll));
+            order.push(SortKey {
+                col: slot,
+                descending: key.descending,
+                nulls_first: key.nulls_first,
+                collation: coll,
+            });
         }
 
         Ok(SetOpPlan {

@@ -622,18 +622,7 @@ fn sort_scan_candidates(candidates: &mut [ScanCandidate<'_>]) {
     candidates.sort_by(|a, b| a.identity.cmp(&b.identity));
 }
 
-/// Canonical access-path rank from estimator.toml. Keep declaration order byte-identical to the
-/// shared fact: P4 compares estimated cost first, then this rank. P3 uses it only to sort inventory.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) enum ScanCandidateKind {
-    Pk,
-    Btree,
-    Gist,
-    Gin,
-    PkInterval,
-    IndexInterval,
-    Full,
-}
+pub(crate) use crate::estimator::ScanCandidateKind;
 
 /// Collision-free physical identity of one base-relation access candidate. `index_name` is the
 /// exact catalog name for index-bearing paths and empty for PK/PK-interval/full paths. The derived
@@ -2559,8 +2548,7 @@ pub(crate) fn estimate_scan_candidates(
         .iter()
         .zip(selectivities)
         .map(|(candidate, selectivity)| {
-            let kind =
-                crate::estimator_constants::ACCESS_PATH_ORDER[candidate.identity.kind as usize];
+            let kind = candidate.identity.kind;
             let scan_rows = estimate_rows(&selectivity, row_count);
             let (access_nodes, access_height) = match candidate.identity.kind {
                 ScanCandidateKind::Btree
@@ -2595,7 +2583,6 @@ pub(crate) fn estimate_scan_candidates(
             .unwrap_or((scan_rows, access_work, access_pages));
             estimate_candidate(CandidateInputs {
                 kind,
-                index_name: &candidate.identity.index_name,
                 scan_rows,
                 output_rows,
                 access_pages,
@@ -2742,8 +2729,7 @@ pub(crate) fn estimate_selected_scan(
     )
     .unwrap_or((scan_rows, access_work, access_pages));
     let mut candidate = estimate_candidate(CandidateInputs {
-        kind: crate::estimator_constants::ACCESS_PATH_ORDER[kind as usize],
-        index_name,
+        kind,
         scan_rows,
         output_rows,
         access_pages,
@@ -3894,19 +3880,28 @@ pub(crate) fn key_collation_ctx(
 pub(crate) fn order_satisfied_by_pk(
     table: &Table,
     offset: usize,
-    order: &[crate::spill::SortKey],
+    order: &[SortKey],
     catalog: &Engine,
 ) -> Option<bool> {
     let pk = table.pk_indices();
     if pk.is_empty() {
         return None; // no PK (synthetic rowid order is not a user-visible column)
     }
-    let reverse = order[0].1; // direction comes from the first ORDER BY key's `descending` flag
+    let reverse = order[0].descending; // direction comes from the first ORDER BY key's `descending` flag
     if reverse && order.len() < pk.len() {
         return None; // a reverse scan needs the full (unique) PK so no ties remain (see above)
     }
     let m = order.len().min(pk.len());
-    for (i, (slot, descending, _nulls_first, coll)) in order.iter().take(m).enumerate() {
+    for (
+        i,
+        SortKey {
+            col: slot,
+            descending,
+            collation: coll,
+            ..
+        },
+    ) in order.iter().take(m).enumerate()
+    {
         if *descending != reverse {
             return None; // every PK-prefix key must share the scan direction (no mixed ASC/DESC)
         }
@@ -4005,7 +4000,7 @@ pub(crate) struct IndexOrder {
 pub(crate) fn order_satisfied_by_indexes(
     table: &Table,
     offset: usize,
-    order: &[crate::spill::SortKey],
+    order: &[SortKey],
     filter: Option<&RExpr>,
     catalog: &Engine,
 ) -> Vec<IndexOrder> {
@@ -4035,26 +4030,32 @@ pub(crate) fn order_satisfied_by_indexes(
         if order.len() != cols.len() {
             continue; // the ORDER BY must be EXACTLY the index columns (see the doc — tie-break)
         }
-        let matches_order =
-            order
-                .iter()
-                .enumerate()
-                .all(|(i, (slot, descending, nulls_first, coll))| {
-                    // A forward walk realizes each key element's declared order (indexes.md §11):
-                    // the ORDER BY key's direction and effective NULL placement must both match.
-                    let order = idx.key_order(i);
-                    if *descending != order.desc || *nulls_first != order.nulls_first {
-                        return false;
-                    }
-                    if *slot != offset + cols[i] {
-                        return false; // the i-th index column, in key order
-                    }
-                    match key_collation_ctx(catalog, &table.columns[cols[i]]) {
-                        None => false, // Skewed / unresolvable — never walked for order (§12)
-                        Some(None) => coll.is_none(),
-                        Some(Some(c)) => matches!(coll, Some(c2) if c2.name == c.name),
-                    }
-                });
+        let matches_order = order.iter().enumerate().all(
+            |(
+                i,
+                SortKey {
+                    col: slot,
+                    descending,
+                    nulls_first,
+                    collation: coll,
+                },
+            )| {
+                // A forward walk realizes each key element's declared order (indexes.md §11):
+                // the ORDER BY key's direction and effective NULL placement must both match.
+                let order = idx.key_order(i);
+                if *descending != order.desc || *nulls_first != order.nulls_first {
+                    return false;
+                }
+                if *slot != offset + cols[i] {
+                    return false; // the i-th index column, in key order
+                }
+                match key_collation_ctx(catalog, &table.columns[cols[i]]) {
+                    None => false, // Skewed / unresolvable — never walked for order (§12)
+                    Some(None) => coll.is_none(),
+                    Some(Some(c)) => matches!(coll, Some(c2) if c2.name == c.name),
+                }
+            },
+        );
         if matches_order {
             matching_indexes.push(IndexOrder {
                 name_key: idx.name.to_string(),
@@ -4069,7 +4070,7 @@ pub(crate) fn order_satisfied_by_indexes(
 pub(crate) fn order_satisfied_by_index(
     table: &Table,
     offset: usize,
-    order: &[crate::spill::SortKey],
+    order: &[SortKey],
     filter: Option<&RExpr>,
     catalog: &Engine,
 ) -> Option<IndexOrder> {
@@ -7201,7 +7202,7 @@ pub(crate) struct SetOpPlan {
     /// Each output column's typmod: the inputs' common typmod (create-table-as.md §2).
     pub(crate) column_typmods: Vec<Typmod>,
     /// (output slot, descending, nulls_first) — the trailing ORDER BY resolved by output name.
-    pub(crate) order: Vec<crate::spill::SortKey>,
+    pub(crate) order: Vec<SortKey>,
     pub(crate) limit: Option<i64>,
     pub(crate) offset: Option<i64>,
 }
@@ -7377,7 +7378,7 @@ pub(crate) const MAX_GROUPING_SETS: usize = 4096;
 pub(crate) struct WindowSpec {
     pub(crate) plan: WindowPlan,
     pub(crate) partition: Vec<usize>,
-    pub(crate) order: Vec<crate::spill::SortKey>,
+    pub(crate) order: Vec<SortKey>,
     /// Resolved function arguments (empty for the no-argument ranking functions; `ntile`'s bucket
     /// count; lag/lead's value/offset/default; the aggregate operand; first/last/nth_value's value
     /// + nth_value's position).
@@ -9544,13 +9545,6 @@ mod candidate_inventory_tests {
                 estimate.rows, logical_rows,
                 "{} logical rows",
                 candidate.identity
-            );
-            assert_eq!(
-                estimate.tie_key,
-                crate::estimator::candidate_tie_key(
-                    crate::estimator_constants::ACCESS_PATH_ORDER[candidate.identity.kind as usize],
-                    &candidate.identity.index_name,
-                )
             );
             assert!(estimate.cost >= 0);
         }

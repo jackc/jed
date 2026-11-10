@@ -21,12 +21,13 @@ pub(crate) fn charge_sort_key(m: &mut Meter, v: &Value, coll: Option<&Collation>
 }
 
 /// Charge every sort key of one row a sort receives, in key order.
-pub(crate) fn charge_sort_keys(
-    m: &mut Meter,
-    row: &[Value],
-    order: &[crate::spill::SortKey],
-) -> Result<()> {
-    for (idx, _, _, coll) in order {
+pub(crate) fn charge_sort_keys(m: &mut Meter, row: &[Value], order: &[SortKey]) -> Result<()> {
+    for SortKey {
+        col: idx,
+        collation: coll,
+        ..
+    } in order
+    {
         charge_sort_key(m, &row[*idx], coll.as_deref())?;
     }
     Ok(())

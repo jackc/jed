@@ -1435,9 +1435,7 @@ impl Engine {
                 meter.checkpoint()?;
                 let units = store.statistics_scan_units(&storage_key, &row, column);
                 meter.charge(
-                    COSTS.page_read * units.pages as i64
-                        + COSTS.value_decompress * units.decompress as i64
-                        + COSTS.storage_row_read,
+                    crate::cost::block_cost(units.pages, units.decompress) + COSTS.storage_row_read,
                 );
                 scan.resolve_columns(&mut row, &mask)?;
                 let value = &row[column];

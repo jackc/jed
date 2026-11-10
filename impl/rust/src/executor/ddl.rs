@@ -3893,7 +3893,7 @@ impl Engine {
             if pk_rekeyed && table.pk.is_empty() {
                 rewrite_next_rowid = 0;
             }
-            meter.charge(COSTS.page_read * pages as i64 + COSTS.value_decompress * slabs as i64);
+            meter.charge_block(pages, slabs);
             let rng = std::cell::Cell::new(crate::seam::StmtRng::new());
             let env = EvalEnv {
                 exec: self,
@@ -4003,7 +4003,7 @@ impl Engine {
         if mask.iter().any(|x| *x) {
             let store = self.store_scoped(at.db.as_deref(), &original.name);
             let (entries, pages, slabs) = store.scan_with_units(&mask)?;
-            meter.charge(COSTS.page_read * pages as i64 + COSTS.value_decompress * slabs as i64);
+            meter.charge_block(pages, slabs);
             for (_, mut row) in entries {
                 meter.checkpoint()?;
                 meter.charge(COSTS.storage_row_read);
@@ -4035,8 +4035,7 @@ impl Engine {
             } else {
                 let all_mask = vec![true; table.columns.len()];
                 let (rows, pages, slabs) = store.scan_with_units(&all_mask)?;
-                meter
-                    .charge(COSTS.page_read * pages as i64 + COSTS.value_decompress * slabs as i64);
+                meter.charge_block(pages, slabs);
                 rows
             };
             // Only the checks this statement validates (an ADD CONSTRAINT, or every check after ALTER
@@ -6007,7 +6006,7 @@ impl Engine {
             // Resolved column types (composite index key vehicle, §2.15).
             let col_types: Vec<ColType> = store.col_types().to_vec();
             let (table_entries, nodes, slabs) = store.scan_with_units(&mask)?;
-            meter.charge(COSTS.page_read * nodes as i64 + COSTS.value_decompress * slabs as i64);
+            meter.charge_block(nodes, slabs);
             entries.reserve(table_entries.len());
             for (key, mut row) in table_entries {
                 meter.checkpoint()?; // enforce the cost ceiling per scanned row (CLAUDE.md §13)

@@ -1100,7 +1100,7 @@ fn spill_io(msg: String) -> std::io::Error {
 }
 
 impl SpillHost for SimSpill {
-    fn create(&self, _kind: &str) -> Result<Box<dyn SpillFile>> {
+    fn create(&self, _kind: crate::spillhost::SpillKind) -> Result<Box<dyn SpillFile>> {
         lock(&self.0)
             .spill_fault()
             .map_err(|msg| EngineError::new(SqlState::IoError, msg))?;

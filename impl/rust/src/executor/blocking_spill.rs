@@ -304,9 +304,28 @@ impl Engine {
                     .order
                     .iter()
                     .enumerate()
-                    .map(|(i, (_, d, n, _))| (base + i, *d, *n, None))
+                    .map(
+                        |(
+                            i,
+                            SortKey {
+                                descending: d,
+                                nulls_first: n,
+                                ..
+                            },
+                        )| SortKey {
+                            col: base + i,
+                            descending: *d,
+                            nulls_first: *n,
+                            collation: None,
+                        },
+                    )
                     .collect();
-                for (column, _, _, coll) in &plan.order {
+                for SortKey {
+                    col: column,
+                    collation: coll,
+                    ..
+                } in &plan.order
+                {
                     charge_sort_key(meter, &row[*column], coll.as_deref())?;
                     let key = match (coll, &row[*column]) {
                         (Some(coll), v @ (Value::Text(_) | Value::Array(_))) => {
@@ -345,14 +364,28 @@ impl Engine {
             while let Some(row) = scan.next()? {
                 meter.poll()?;
                 let same = prev.as_ref().is_some_and(|p| {
-                    keys.iter().zip(p).all(|((idx, d, n, _), v)| {
-                        key_cmp(v, &row[*idx], *d, *n) == std::cmp::Ordering::Equal
-                    })
+                    keys.iter().zip(p).all(
+                        |(
+                            SortKey {
+                                col: idx,
+                                descending: d,
+                                nulls_first: n,
+                                ..
+                            },
+                            v,
+                        )| {
+                            key_cmp(v, &row[*idx], *d, *n) == std::cmp::Ordering::Equal
+                        },
+                    )
                 });
                 if same {
                     continue;
                 }
-                prev = Some(keys.iter().map(|(idx, ..)| row[*idx].clone()).collect());
+                prev = Some(
+                    keys.iter()
+                        .map(|SortKey { col: idx, .. }| row[*idx].clone())
+                        .collect(),
+                );
                 kept.push(row)?;
             }
             rows = kept;
@@ -598,11 +631,7 @@ impl Engine {
         for row in materialized {
             out.push(row)?;
         }
-        if super::explain_exec::select_actual_root_node(plan) != "Window"
-            && let Some(profile) = self.explain_actual.borrow_mut().as_mut()
-        {
-            profile.record_parent("Window".to_string(), meter.accrued);
-        }
+        self.record_actual_parent(plan, "Window", meter.accrued);
         Ok(out)
     }
 
@@ -926,11 +955,16 @@ impl Engine {
             // into a fresh collection exactly as the unordered fold does — and finalize that.
             Acc::Ordered { .. } => {
                 let order = spec.order.as_ref().expect("an ordered acc has its order");
-                let keys: Vec<crate::spill::SortKey> = order
+                let keys: Vec<SortKey> = order
                     .sorts
                     .iter()
                     .enumerate()
-                    .map(|(i, s)| (i, s.desc, s.nulls_first, None))
+                    .map(|(i, s)| SortKey {
+                        col: i,
+                        descending: s.desc,
+                        nulls_first: s.nulls_first,
+                        collation: None,
+                    })
                     .collect();
                 let mut sorter = self.new_sorter(&keys);
                 while let Some(row) = values.next()? {
@@ -965,7 +999,12 @@ impl Engine {
                     .map(|expr| expr.eval(srow, env, &mut env.exec.session.scratch_meter()))
                     .transpose()?;
                 let key_slot = usize::from(collation.is_some());
-                let mut sorter = self.new_sorter(&[(key_slot, desc, false, None)]);
+                let mut sorter = self.new_sorter(&[SortKey {
+                    col: key_slot,
+                    descending: desc,
+                    nulls_first: false,
+                    collation: None,
+                }]);
                 while let Some(mut row) = values.next()? {
                     if let Some(c) = &collation {
                         let key = collation_sort_key(c, &row[0])?
@@ -1157,8 +1196,7 @@ impl Engine {
                 } else {
                     // The values were converted as they were folded, in input order; sort by key
                     // (length, then bytes — the canonical order) and keep the last of equal keys.
-                    let mut sorter =
-                        self.new_sorter(&[(0, false, false, None), (1, false, false, None)]);
+                    let mut sorter = self.new_sorter(&[SortKey::asc(0), SortKey::asc(1)]);
                     while let Some(mut row) = values.next()? {
                         let value = row.pop().unwrap();
                         let Value::Text(key) = row.pop().unwrap() else {

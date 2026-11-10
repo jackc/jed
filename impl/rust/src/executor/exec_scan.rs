@@ -159,7 +159,7 @@ fn scan_stream_table_interval(
     ahead: &mut Option<ReadAhead>,
 ) -> Result<bool> {
     let (overlap, slabs) = store.overlap_scan_units(bound, &plan.rel_masks[0])?;
-    meter.charge(COSTS.page_read * overlap as i64 + COSTS.value_decompress * slabs as i64);
+    meter.charge_block(overlap, slabs);
     if !can_pull {
         return Ok(false);
     }
@@ -327,9 +327,7 @@ impl Engine {
                 if let Some((bound, prefix_len)) = build_index_bound(ib, params, env.outer, &[]) {
                     let istore = self.index_store(&ib.name_key);
                     let (overlap, slabs) = istore.overlap_scan_units(&bound, &[])?;
-                    meter.charge(
-                        COSTS.page_read * overlap as i64 + COSTS.value_decompress * slabs as i64,
-                    );
+                    meter.charge_block(overlap, slabs);
                     if can_pull {
                         let mut visit = |entry_key: &[u8], _row: &Row| -> Result<bool> {
                             meter.checkpoint()?;
@@ -341,10 +339,7 @@ impl Engine {
                                     "an index entry references a stored row",
                                 )
                             })?;
-                            meter.charge(
-                                COSTS.page_read * pages as i64
-                                    + COSTS.value_decompress * slabs as i64,
-                            );
+                            meter.charge_block(pages, slabs);
                             process_streaming_row(
                                 store,
                                 &row,
@@ -371,10 +366,7 @@ impl Engine {
                             (probe.bound, probe.prefix_len, probe.suffix);
                         let istore = self.index_store(&ks.name_key);
                         let (overlap, slabs) = istore.overlap_scan_units(&physical, &[])?;
-                        meter.charge(
-                            COSTS.page_read * overlap as i64
-                                + COSTS.value_decompress * slabs as i64,
-                        );
+                        meter.charge_block(overlap, slabs);
                         let mut more = true;
                         let mut visit = |entry_key: &[u8], _row: &Row| -> Result<bool> {
                             meter.checkpoint()?;
@@ -386,10 +378,7 @@ impl Engine {
                                     "an index entry references a stored row",
                                 )
                             })?;
-                            meter.charge(
-                                COSTS.page_read * pages as i64
-                                    + COSTS.value_decompress * slabs as i64,
-                            );
+                            meter.charge_block(pages, slabs);
                             more = process_streaming_row(
                                 store,
                                 &row,
@@ -428,8 +417,7 @@ impl Engine {
                     &plan.rel_masks[0],
                     true,
                 )?;
-                meter
-                    .charge(COSTS.page_read * pages as i64 + COSTS.value_decompress * slabs as i64);
+                meter.charge_block(pages, slabs);
                 if can_pull {
                     if plan.phys.pk_reverse {
                         candidates.reverse();
@@ -439,10 +427,7 @@ impl Engine {
                         let row = if candidate.is_empty() {
                             let (row, pages, slabs) =
                                 store.get_with_units(&key, &plan.rel_masks[0])?;
-                            meter.charge(
-                                COSTS.page_read * pages as i64
-                                    + COSTS.value_decompress * slabs as i64,
-                            );
+                            meter.charge_block(pages, slabs);
                             row.ok_or_else(|| {
                                 crate::error::EngineError::data_corrupted(
                                     "a GIN entry references a stored row",
@@ -485,8 +470,7 @@ impl Engine {
                     &plan.rel_masks[0],
                     true,
                 )?;
-                meter
-                    .charge(COSTS.page_read * pages as i64 + COSTS.value_decompress * slabs as i64);
+                meter.charge_block(pages, slabs);
                 if can_pull {
                     if plan.phys.pk_reverse {
                         candidates.reverse();
@@ -496,10 +480,7 @@ impl Engine {
                         let row = if candidate.is_empty() {
                             let (row, pages, slabs) =
                                 store.get_with_units(&key, &plan.rel_masks[0])?;
-                            meter.charge(
-                                COSTS.page_read * pages as i64
-                                    + COSTS.value_decompress * slabs as i64,
-                            );
+                            meter.charge_block(pages, slabs);
                             row.ok_or_else(|| {
                                 crate::error::EngineError::data_corrupted(
                                     "a GiST entry references a stored row",
@@ -692,7 +673,7 @@ impl Engine {
         } else {
             store.overlap_scan_units(&bound, &plan.rel_masks[0])?
         };
-        meter.charge(COSTS.page_read * overlap as i64 + COSTS.value_decompress * slabs as i64);
+        meter.charge_block(overlap, slabs);
 
         let limit = plan.limit.expect("window_top_n_eligible requires a LIMIT");
         let offset = plan.offset.unwrap_or(0);
@@ -1097,7 +1078,7 @@ impl Engine {
             };
             let mut meter = snap.session.new_meter();
             meter.accrued = subquery_cost; // the folded constant cost (lifetime already charged)
-            meter.charge(COSTS.page_read * overlap as i64 + COSTS.value_decompress * slabs as i64);
+            meter.charge_block(overlap, slabs);
 
             let limit = plan.limit;
             let offset = plan.offset.unwrap_or(0);
@@ -1389,11 +1370,7 @@ impl Engine {
                         "an index entry references a stored row",
                     )
                 })?;
-                meter.charge(
-                    COSTS.page_read * pages as i64
-                        + COSTS.value_decompress * slabs as i64
-                        + COSTS.storage_row_read,
-                );
+                meter.charge(crate::cost::block_cost(pages, slabs) + COSTS.storage_row_read);
                 if TableStore::needs_resolution(&row, &plan.rel_masks[0]) {
                     store.resolve_columns(&mut row, &plan.rel_masks[0])?;
                 }
@@ -1497,7 +1474,7 @@ impl Engine {
         } else {
             store.overlap_scan_units(&bound, &plan.rel_masks[0])?
         };
-        meter.charge(COSTS.page_read * overlap as i64 + COSTS.value_decompress * slabs as i64);
+        meter.charge_block(overlap, slabs);
 
         // Build the sorted source in `ORDER BY` order, deferring the window's row_produced +
         // projection to the lazy emitter drive (the caller). Two ways to sort, both yielding a
@@ -1509,7 +1486,11 @@ impl Engine {
         // sorted `Vec` as an in-memory `SortedRows`. The metered costs (storage_row_read per scanned
         // row, row_produced per windowed output) are identical to the Sorter path; the sort itself is
         // unmetered like every sort (cost.md §3).
-        let (total, mut sorted) = if plan.order.iter().any(|(_, _, _, c)| c.is_some()) {
+        let (total, mut sorted) = if plan
+            .order
+            .iter()
+            .any(|SortKey { collation: c, .. }| c.is_some())
+        {
             let mut rows: Vec<Row> = Vec::new();
             // The collated survivor buffer is sort state (memory.md §6.4).
             let mut charge = meter.state_charge();
@@ -2080,7 +2061,7 @@ impl Engine {
     /// Spilling is enabled only when the host supplied scratch backing. The Node/file host uses the
     /// OS temp directory, independently of the database path, so read-only filesystems remain
     /// readable; in-memory hosts have no scratch backing and never spill (spill.md §2/§4).
-    pub(crate) fn new_sorter(&self, order: &[crate::spill::SortKey]) -> crate::spill::Sorter {
+    pub(crate) fn new_sorter(&self, order: &[SortKey]) -> crate::spill::Sorter {
         crate::spill::Sorter::new(
             order.to_vec(),
             self.session.work_mem,

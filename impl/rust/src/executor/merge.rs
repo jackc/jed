@@ -1048,10 +1048,7 @@ impl Engine {
                     &mut meter,
                     &mask,
                 )?;
-                meter.charge(
-                    COSTS.page_read * batch.pages as i64
-                        + COSTS.value_decompress * batch.slabs as i64,
-                );
+                meter.charge_block(batch.pages, batch.slabs);
                 let mut targets: Vec<Candidate> = Vec::with_capacity(batch.entries.len());
                 for (key, mut row) in batch.entries {
                     meter.checkpoint()?;
@@ -1101,10 +1098,7 @@ impl Engine {
                         &mut meter,
                         &mask,
                     )?;
-                    meter.charge(
-                        COSTS.page_read * batch.pages as i64
-                            + COSTS.value_decompress * batch.slabs as i64,
-                    );
+                    meter.charge_block(batch.pages, batch.slabs);
                     probe_actual += meter.accrued - probe_before;
                     loop_actual += meter.accrued - probe_before;
                     (
@@ -1226,9 +1220,7 @@ impl Engine {
                 &mut meter,
                 &mask,
             )?;
-            meter.charge(
-                COSTS.page_read * batch.pages as i64 + COSTS.value_decompress * batch.slabs as i64,
-            );
+            meter.charge_block(batch.pages, batch.slabs);
             let mut scan_actual = meter.accrued - scan_before;
             for (key, mut row) in batch.entries {
                 meter.checkpoint()?;

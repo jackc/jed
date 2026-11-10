@@ -609,7 +609,10 @@ struct EncryptingSpillHost {
 }
 
 impl crate::spillhost::SpillHost for EncryptingSpillHost {
-    fn create(&self, kind: &str) -> Result<Box<dyn crate::spillhost::SpillFile>> {
+    fn create(
+        &self,
+        kind: crate::spillhost::SpillKind,
+    ) -> Result<Box<dyn crate::spillhost::SpillFile>> {
         let mut key = [0u8; 32];
         self.rng.fill(&mut key)?;
         let mut id = [0u8; 16];
@@ -1001,7 +1004,10 @@ mod tests {
     struct MemFile(Arc<Mutex<Vec<u8>>>);
 
     impl crate::spillhost::SpillHost for Arc<MemSpill> {
-        fn create(&self, _kind: &str) -> Result<Box<dyn crate::spillhost::SpillFile>> {
+        fn create(
+            &self,
+            _kind: crate::spillhost::SpillKind,
+        ) -> Result<Box<dyn crate::spillhost::SpillFile>> {
             let bytes = Arc::new(Mutex::new(Vec::new()));
             self.0.lock().unwrap().push(Arc::clone(&bytes));
             Ok(Box::new(MemFile(bytes)))
@@ -1043,7 +1049,7 @@ mod tests {
             crate::seam::seeded_random_source(5),
         );
         assert!(host.encrypts());
-        let file = host.create("hash").unwrap();
+        let file = host.create(crate::spillhost::SpillKind::Hash).unwrap();
         let mut model = vec![0u8; 0];
         let mut write = |file: &Box<dyn crate::spillhost::SpillFile>, at: usize, bytes: &[u8]| {
             file.write_at(at as u64, bytes).unwrap();
@@ -1085,7 +1091,7 @@ mod tests {
         );
 
         // A block sealed before a truncation does not authenticate after the block is rewritten.
-        let file = host.create("rows").unwrap();
+        let file = host.create(crate::spillhost::SpillKind::Rows).unwrap();
         let mem_file = mem.0.lock().unwrap().last().unwrap().clone();
         file.write_at(0, &[1u8; 4096]).unwrap();
         file.write_at(4096, &[2u8; 4096]).unwrap();
@@ -1101,7 +1107,7 @@ mod tests {
         );
 
         // Truncation zeroes the cut tail.
-        let file = host.create("rows").unwrap();
+        let file = host.create(crate::spillhost::SpillKind::Rows).unwrap();
         file.write_at(0, &[7u8; 9000]).unwrap();
         file.truncate(4500).unwrap();
         file.write_at(8999, &[1]).unwrap();

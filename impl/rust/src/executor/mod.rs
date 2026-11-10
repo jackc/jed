@@ -41,6 +41,7 @@ pub(crate) use crate::operators::{
 };
 pub(crate) use crate::pmap::KeyBound;
 pub(crate) use crate::privileges::{Privilege, PrivilegeSet};
+pub(crate) use crate::spill::SortKey;
 pub(crate) use crate::stack::outline;
 pub(crate) use crate::storage::{Row, TableStore};
 pub(crate) use crate::timestamp::{InputZone, parse_timestamp};
@@ -7106,7 +7107,7 @@ pub(crate) struct SelectPlan {
     /// (flat slot, descending, nulls_first, collation) per ORDER BY key. A column / ordinal key's slot
     /// is its real input / grouped-row slot; a general-**expression** key's slot is `final_row_width +
     /// k`, indexing the k-th materialized order value appended to the pre-sort row (grammar.md §10).
-    order: Vec<crate::spill::SortKey>,
+    order: Vec<SortKey>,
     /// The materialized `ORDER BY` expression-key expressions (`ORDER BY a + 1`, `ORDER BY abs(b)`), in
     /// the order their sort slots reference them. Just before the sort each row evaluates these and
     /// appends the values at `final_row_width + k` (after any window / grouped columns), so the

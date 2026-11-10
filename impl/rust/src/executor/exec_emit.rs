@@ -43,6 +43,57 @@ fn physical_step_kind(plan: &SelectPlan, step: &PhysicalJoinStep) -> JoinKind {
     )
 }
 
+/// One authored-order nested-loop join step (cost.md §3 "JOIN"): the join's residual ON, the pad
+/// width of its right relation, and whether it preserves unmatched left rows.
+struct NestedLoopStep<'a> {
+    on: Option<&'a FilterChain<'a>>,
+    env: &'a EvalEnv<'a>,
+    mem_mask: &'a [bool],
+    emit_left: bool,
+    right_pad: usize,
+}
+
+impl NestedLoopStep<'_> {
+    /// Join one left row against its candidate right rows, in candidate order: each pair that
+    /// passes ON is admitted and appended to `next`, and a left row no pair kept is NULL-extended
+    /// when the join preserves the left side. A candidate carries its index in the right relation,
+    /// marked in `right_matched` when the join also preserves the right side.
+    fn join_left_row<'r>(
+        &self,
+        left: &Row,
+        candidates: impl Iterator<Item = (usize, &'r Row)>,
+        mut right_matched: Option<&mut [bool]>,
+        next: &mut Vec<Row>,
+        meter: &mut Meter,
+    ) -> Result<()> {
+        let mut left_matched = false;
+        for (ri, right) in candidates {
+            meter.poll()?;
+            let mut combined = left.clone();
+            combined.extend_from_slice(right);
+            let keep = match self.on {
+                None => true,
+                Some(pred) => pred.eval_filter(&combined, self.env, meter)?,
+            };
+            if keep {
+                meter.admit_row_masked(&combined, self.mem_mask)?;
+                next.push(combined);
+                left_matched = true;
+                if let Some(matched) = right_matched.as_deref_mut() {
+                    matched[ri] = true;
+                }
+            }
+        }
+        if self.emit_left && !left_matched {
+            let mut combined = left.clone();
+            combined.resize(combined.len() + self.right_pad, Value::Null);
+            meter.admit_row_masked(&combined, self.mem_mask)?;
+            next.push(combined);
+        }
+        Ok(())
+    }
+}
+
 impl Engine {
     pub(crate) fn exec_costed_nway_join(
         &self,
@@ -278,6 +329,64 @@ impl Engine {
             }
         }
         Ok(out)
+    }
+
+    /// Record `label` as a parent node of the running EXPLAIN ANALYZE profile, unless it is the
+    /// plan root (whose cost the statement total already reports). A no-op when no profile is open.
+    pub(crate) fn record_actual_parent(&self, plan: &SelectPlan, label: &'static str, cost: i64) {
+        if let Some(profile) = self.explain_actual.borrow_mut().as_mut()
+            && select_actual_root_node(plan) != label
+        {
+            profile.record_parent(label.to_string(), cost);
+        }
+    }
+
+    /// SELECT DISTINCT over materialized rows: project every input row (charging its projection
+    /// cost — the cost.md §3 asymmetry) and keep the first occurrence of each projected row. The
+    /// dedup index is membership-only, so the output order is the input order and no hash-map
+    /// iteration order leaks (CLAUDE.md §8/§10). Each input row is freed once projected; its
+    /// memory charge (measured through `input_mask` when the plan masks unread columns) and the
+    /// dedup set's are returned after the pass (memory.md §5.3, §6.2).
+    fn distinct_project(
+        &self,
+        plan: &SelectPlan,
+        rows: Vec<Row>,
+        input_mask: Option<&[bool]>,
+        env: &EvalEnv,
+        meter: &mut Meter,
+    ) -> Result<Vec<Vec<Value>>> {
+        let mut seen = RowIndex::default();
+        let mut distinct_rows: Vec<Vec<Value>> = Vec::new();
+        let mut seen_charge = 0i64;
+        let mut input_charge = 0i64;
+        for row in rows {
+            if meter.query_memory_active() {
+                input_charge += match input_mask {
+                    Some(mask) => crate::memsize::row_bytes_masked(&row, mask),
+                    None => crate::memsize::row_bytes(&row),
+                };
+            }
+            let mut out = Vec::with_capacity(plan.projections.len());
+            for p in &plan.projections {
+                out.push(p.eval(&row, env, meter)?);
+            }
+            drop(row);
+            charge_hash_keys(meter, &out)?;
+            let hash = seen.hash(out.iter());
+            if seen.find(hash, |at| distinct_rows[at] == out).is_none() {
+                if meter.query_memory_active() {
+                    let bytes = crate::memsize::entry_bytes(&out);
+                    meter.reserve_query(bytes)?;
+                    seen_charge += bytes;
+                }
+                meter.admit_row(&out)?;
+                seen.insert(hash, distinct_rows.len());
+                distinct_rows.push(out);
+            }
+        }
+        meter.release_query(seen_charge);
+        meter.release_query(input_charge);
+        Ok(distinct_rows)
     }
 
     /// Run a [`SelectPlan`]'s **blocking part** and return an [`Emitter`] describing how to emit its
@@ -535,96 +644,59 @@ impl Engine {
                     let left_pad = plan.rels[k + 1].offset;
                     let right_pad = plan.rels[k + 1].col_count;
                     let mut next: Vec<Row> = Vec::new();
-                    // A CORRELATED LATERAL relation (§44): re-materialize it ONCE PER combined left-hand row,
-                    // with that row pushed onto the outer-row stack as the body's immediate outer (the
-                    // correlated-subquery mechanism). The plan guarantees INNER/CROSS/LEFT here (RIGHT/FULL
-                    // to a correlated lateral is 42P10), so there is no unmatched-right emission.
-                    if plan.rels[k + 1].lateral {
+                    let step = NestedLoopStep {
+                        on: on.as_ref(),
+                        env: &env,
+                        mem_mask: &mem_mask,
+                        emit_left,
+                        right_pad,
+                    };
+                    // Two shapes re-materialize the right relation ONCE PER combined left-hand row:
+                    // - a CORRELATED LATERAL relation (§44), with that row pushed onto the outer-row
+                    //   stack as the body's immediate outer (the correlated-subquery mechanism). The
+                    //   plan guarantees INNER/CROSS/LEFT here (RIGHT/FULL to a correlated lateral is
+                    //   42P10);
+                    // - an INDEX-NESTED-LOOP inner relation (cost.md §3 "JOIN"), its scan bounded per
+                    //   outer row by the `Sibling` columns of that row (a per-outer-row seek instead of
+                    //   a full scan). Detection restricts this to the RIGHT/nullable side of an
+                    //   INNER/CROSS/LEFT join (a preserved side cannot be bounded per outer row).
+                    // Neither has an unmatched-RIGHT emission. The whole ON/WHERE stays applied (the
+                    // ON here, the WHERE below), so rows are unchanged.
+                    let lateral = plan.rels[k + 1].lateral;
+                    if lateral || plan.phys.rel_inl_bounds[k + 1].is_some() {
+                        debug_assert!(
+                            lateral || !emit_right,
+                            "index-nested-loop excludes RIGHT/FULL joins"
+                        );
                         for left in &running {
-                            let mut lat_outer: Vec<&[Value]> = outer.to_vec();
-                            lat_outer.push(left);
+                            let lat_outer: Vec<&[Value]>;
+                            let (rel_outer, sibling): (&[&[Value]], &[Value]) = if lateral {
+                                let mut stack = outer.to_vec();
+                                stack.push(left);
+                                lat_outer = stack;
+                                (&lat_outer, &[])
+                            } else {
+                                (outer, left)
+                            };
                             let before = meter.accrued;
                             let right_rows = self.materialize_rel(
                                 plan,
                                 k + 1,
                                 params,
-                                &lat_outer,
-                                &[],
+                                rel_outer,
+                                sibling,
                                 stmt_rng,
                                 env.ctes,
                                 meter,
                             )?;
                             rel_work[k + 1] += meter.accrued - before;
-                            let mut left_matched = false;
-                            for right in &right_rows {
-                                meter.poll()?;
-                                let mut combined = left.clone();
-                                combined.extend_from_slice(right);
-                                let keep = match &on {
-                                    None => true,
-                                    Some(pred) => pred.eval_filter(&combined, &env, meter)?,
-                                };
-                                if keep {
-                                    meter.admit_row_masked(&combined, &mem_mask)?;
-                                    next.push(combined);
-                                    left_matched = true;
-                                }
-                            }
-                            if emit_left && !left_matched {
-                                let mut combined = left.clone();
-                                combined.resize(combined.len() + right_pad, Value::Null);
-                                meter.admit_row_masked(&combined, &mem_mask)?;
-                                next.push(combined);
-                            }
-                            // The per-left-row re-materialization is consumed (memory.md §5.3).
-                            meter.release_rows_masked(&right_rows, &plan.rel_masks[k + 1]);
-                        }
-                        meter.release_rows_masked(&running, &mem_mask);
-                        running = next;
-                        continue;
-                    }
-                    // An INDEX-NESTED-LOOP inner relation (cost.md §3 "JOIN"): re-materialize it ONCE PER
-                    // combined left-hand row, its scan bounded per outer row by the `Sibling` columns of that
-                    // row (a per-outer-row seek instead of a full scan). Detection restricts this to the
-                    // RIGHT/nullable side of an INNER/CROSS/LEFT join, so there is never an unmatched-RIGHT
-                    // emission (RIGHT/FULL are excluded — a preserved side cannot be bounded per outer row).
-                    // The whole ON/WHERE stays applied (the ON here, the WHERE below), so rows are unchanged.
-                    if plan.phys.rel_inl_bounds[k + 1].is_some() {
-                        debug_assert!(!emit_right, "index-nested-loop excludes RIGHT/FULL joins");
-                        for left in &running {
-                            let before = meter.accrued;
-                            let right_rows = self.materialize_rel(
-                                plan,
-                                k + 1,
-                                params,
-                                outer,
+                            step.join_left_row(
                                 left,
-                                stmt_rng,
-                                env.ctes,
+                                right_rows.iter().enumerate(),
+                                None,
+                                &mut next,
                                 meter,
                             )?;
-                            rel_work[k + 1] += meter.accrued - before;
-                            let mut left_matched = false;
-                            for right in &right_rows {
-                                meter.poll()?;
-                                let mut combined = left.clone();
-                                combined.extend_from_slice(right);
-                                let keep = match &on {
-                                    None => true,
-                                    Some(pred) => pred.eval_filter(&combined, &env, meter)?,
-                                };
-                                if keep {
-                                    meter.admit_row_masked(&combined, &mem_mask)?;
-                                    next.push(combined);
-                                    left_matched = true;
-                                }
-                            }
-                            if emit_left && !left_matched {
-                                let mut combined = left.clone();
-                                combined.resize(combined.len() + right_pad, Value::Null);
-                                meter.admit_row_masked(&combined, &mem_mask)?;
-                                next.push(combined);
-                            }
                             // The per-left-row re-materialization is consumed (memory.md §5.3).
                             meter.release_rows_masked(&right_rows, &plan.rel_masks[k + 1]);
                         }
@@ -646,26 +718,16 @@ impl Engine {
                             right_rows,
                             meter,
                         )?;
-                        let pred = on.as_ref().expect("a hash join always has an ON predicate");
+                        debug_assert!(on.is_some(), "a hash join always has an ON predicate");
                         for left in &running {
                             let candidates = table.probe(hash_plan, left, meter)?;
-                            let mut left_matched = false;
-                            for ri in candidates {
-                                meter.poll()?;
-                                let mut combined = left.clone();
-                                combined.extend_from_slice(&right_rows[ri]);
-                                if pred.eval_filter(&combined, &env, meter)? {
-                                    meter.admit_row_masked(&combined, &mem_mask)?;
-                                    next.push(combined);
-                                    left_matched = true;
-                                }
-                            }
-                            if emit_left && !left_matched {
-                                let mut combined = left.clone();
-                                combined.resize(combined.len() + right_pad, Value::Null);
-                                meter.admit_row_masked(&combined, &mem_mask)?;
-                                next.push(combined);
-                            }
+                            step.join_left_row(
+                                left,
+                                candidates.into_iter().map(|ri| (ri, &right_rows[ri])),
+                                None,
+                                &mut next,
+                                meter,
+                            )?;
                         }
                         meter.release_rows_masked(&running, &mem_mask);
                         running = next;
@@ -673,28 +735,13 @@ impl Engine {
                     }
                     let mut right_matched = vec![false; right_rows.len()];
                     for left in &running {
-                        let mut left_matched = false;
-                        for (ri, right) in right_rows.iter().enumerate() {
-                            meter.poll()?;
-                            let mut combined = left.clone();
-                            combined.extend_from_slice(right);
-                            let keep = match &on {
-                                None => true,
-                                Some(pred) => pred.eval_filter(&combined, &env, meter)?,
-                            };
-                            if keep {
-                                meter.admit_row_masked(&combined, &mem_mask)?;
-                                next.push(combined);
-                                left_matched = true;
-                                right_matched[ri] = true;
-                            }
-                        }
-                        if emit_left && !left_matched {
-                            let mut combined = left.clone();
-                            combined.resize(combined.len() + right_pad, Value::Null);
-                            meter.admit_row_masked(&combined, &mem_mask)?;
-                            next.push(combined);
-                        }
+                        step.join_left_row(
+                            left,
+                            right_rows.iter().enumerate(),
+                            Some(&mut right_matched),
+                            &mut next,
+                            meter,
+                        )?;
                     }
                     if emit_right {
                         for (ri, right) in right_rows.iter().enumerate() {
@@ -796,11 +843,7 @@ impl Engine {
                     &env,
                     meter,
                 )?;
-                if select_actual_root_node(plan) != "Window"
-                    && let Some(profile) = self.explain_actual.borrow_mut().as_mut()
-                {
-                    profile.record_parent("Window".to_string(), meter.accrued);
-                }
+                self.record_actual_parent(plan, "Window", meter.accrued);
             }
 
             // ORDER BY: a stable sort applying each key left to right — the first non-equal key
@@ -830,22 +873,14 @@ impl Engine {
                     let r = sort_rows(&mut rows, &plan.order, &acct, meter);
                     meter.cost_first(r)?;
                 }
-                if select_actual_root_node(plan) != "Sort"
-                    && let Some(profile) = self.explain_actual.borrow_mut().as_mut()
-                {
-                    profile.record_parent("Sort".to_string(), meter.accrued);
-                }
+                self.record_actual_parent(plan, "Sort", meter.accrued);
                 if plan.distinct_on > 0 {
                     // DISTINCT ON (grammar.md §11.1): keep the first row of each key run; only the
                     // survivors are windowed and projected below.
                     rows = dedup_sorted_runs(rows, &plan.order[..plan.distinct_on], |row| {
                         meter.release_row_masked(row, &mem_mask)
                     });
-                    if select_actual_root_node(plan) != "Distinct"
-                        && let Some(profile) = self.explain_actual.borrow_mut().as_mut()
-                    {
-                        profile.record_parent("Distinct".to_string(), meter.accrued);
-                    }
+                    self.record_actual_parent(plan, "Distinct", meter.accrued);
                 }
             }
 
@@ -1167,11 +1202,7 @@ impl Engine {
                     }
                     group_rows = kept;
                 }
-                if select_actual_root_node(plan) != "Aggregate"
-                    && let Some(profile) = self.explain_actual.borrow_mut().as_mut()
-                {
-                    profile.record_parent("Aggregate".to_string(), meter.accrued);
-                }
+                self.record_actual_parent(plan, "Aggregate", meter.accrued);
                 // WINDOW stage over the grouped rows (spec/design/window.md §2): runs AFTER GROUP
                 // BY/HAVING and BEFORE the query ORDER BY. It appends each window result to the grouped
                 // row [group_keys…, agg_results…], so the projection reads window result `w` at slot
@@ -1185,11 +1216,7 @@ impl Engine {
                         &env,
                         meter,
                     )?;
-                    if select_actual_root_node(plan) != "Window"
-                        && let Some(profile) = self.explain_actual.borrow_mut().as_mut()
-                    {
-                        profile.record_parent("Window".to_string(), meter.accrued);
-                    }
+                    self.record_actual_parent(plan, "Window", meter.accrued);
                 }
                 // ORDER BY over the grouped output (a column/ordinal key is a synthetic group-key slot; an
                 // expression key is materialized against the grouped row and appended — grammar.md §10).
@@ -1198,22 +1225,14 @@ impl Engine {
                     let acct = meter.query.clone();
                     let r = sort_rows(&mut group_rows, &plan.order, &acct, meter);
                     meter.cost_first(r)?;
-                    if select_actual_root_node(plan) != "Sort"
-                        && let Some(profile) = self.explain_actual.borrow_mut().as_mut()
-                    {
-                        profile.record_parent("Sort".to_string(), meter.accrued);
-                    }
+                    self.record_actual_parent(plan, "Sort", meter.accrued);
                     if plan.distinct_on > 0 {
                         // DISTINCT ON over the sorted group rows (grammar.md §11.1).
                         group_rows =
                             dedup_sorted_runs(group_rows, &plan.order[..plan.distinct_on], |row| {
                                 meter.release_row(row)
                             });
-                        if select_actual_root_node(plan) != "Distinct"
-                            && let Some(profile) = self.explain_actual.borrow_mut().as_mut()
-                        {
-                            profile.record_parent("Distinct".to_string(), meter.accrued);
-                        }
+                        self.record_actual_parent(plan, "Distinct", meter.accrued);
                     }
                 }
                 if plan.distinct {
@@ -1222,39 +1241,9 @@ impl Engine {
                     // keeping the first occurrence in the (already ORDER-BY-sorted) order, then apply
                     // LIMIT/OFFSET. `seen` is membership-only; output order comes from the deterministic
                     // group iteration / sort, never set iteration (no hashmap-order leak — CLAUDE.md §8/§10).
-                    let mut seen = RowIndex::default();
-                    let mut distinct_rows: Vec<Vec<Value>> = Vec::new();
-                    let mut seen_charge = 0i64; // the dedup set's entries (memory.md §6.2)
-                    let mut group_charge = 0i64;
-                    for srow in group_rows {
-                        if meter.query_memory_active() {
-                            group_charge += crate::memsize::row_bytes(&srow);
-                        }
-                        let mut out = Vec::with_capacity(plan.projections.len());
-                        for p in &plan.projections {
-                            out.push(p.eval(&srow, &env, meter)?);
-                        }
-                        drop(srow);
-                        charge_hash_keys(meter, &out)?;
-                        let hash = seen.hash(out.iter());
-                        if seen.find(hash, |at| distinct_rows[at] == out).is_none() {
-                            if meter.query_memory_active() {
-                                let bytes = crate::memsize::entry_bytes(&out);
-                                meter.reserve_query(bytes)?;
-                                seen_charge += bytes;
-                            }
-                            meter.admit_row(&out)?;
-                            seen.insert(hash, distinct_rows.len());
-                            distinct_rows.push(out);
-                        }
-                    }
-                    meter.release_query(seen_charge);
-                    meter.release_query(group_charge);
-                    if select_actual_root_node(plan) != "Distinct"
-                        && let Some(profile) = self.explain_actual.borrow_mut().as_mut()
-                    {
-                        profile.record_parent("Distinct".to_string(), meter.accrued);
-                    }
+                    let distinct_rows =
+                        self.distinct_project(plan, group_rows, None, &env, meter)?;
+                    self.record_actual_parent(plan, "Distinct", meter.accrued);
                     // The dedup already projected every grouped row (the §3 asymmetry, charged above), so
                     // emission is Identity — window + charge row_produced, deferred to the drive (streaming.md §4).
                     let (start, end) = window_bounds(distinct_rows.len());
@@ -1282,39 +1271,9 @@ impl Engine {
                 // iteration (no hashmap-order leak — CLAUDE.md §8/§10). The set indexes the kept
                 // rows in place, and each input row is freed once projected; the input's charge is
                 // still returned only after the pass (memory.md §5.3).
-                let mut seen = RowIndex::default();
-                let mut distinct_rows: Vec<Vec<Value>> = Vec::new();
-                let mut seen_charge = 0i64; // the dedup set's entries (memory.md §6.2)
-                let mut input_charge = 0i64;
-                for row in rows {
-                    if meter.query_memory_active() {
-                        input_charge += crate::memsize::row_bytes_masked(&row, &mem_mask);
-                    }
-                    let mut out = Vec::with_capacity(plan.projections.len());
-                    for p in &plan.projections {
-                        out.push(p.eval(&row, &env, meter)?);
-                    }
-                    drop(row);
-                    charge_hash_keys(meter, &out)?;
-                    let hash = seen.hash(out.iter());
-                    if seen.find(hash, |at| distinct_rows[at] == out).is_none() {
-                        if meter.query_memory_active() {
-                            let bytes = crate::memsize::entry_bytes(&out);
-                            meter.reserve_query(bytes)?;
-                            seen_charge += bytes;
-                        }
-                        meter.admit_row(&out)?;
-                        seen.insert(hash, distinct_rows.len());
-                        distinct_rows.push(out);
-                    }
-                }
-                meter.release_query(seen_charge);
-                meter.release_query(input_charge);
-                if select_actual_root_node(plan) != "Distinct"
-                    && let Some(profile) = self.explain_actual.borrow_mut().as_mut()
-                {
-                    profile.record_parent("Distinct".to_string(), meter.accrued);
-                }
+                let distinct_rows =
+                    self.distinct_project(plan, rows, Some(&mem_mask), &env, meter)?;
+                self.record_actual_parent(plan, "Distinct", meter.accrued);
                 // LIMIT / OFFSET applies to the DISTINCT rows; only the emitted rows charge row_produced
                 // (spec/design/cost.md §3). The rows were already projected for their dedup key (the §3
                 // asymmetry, charged above), so emission is Identity — deferred to the drive (streaming.md §4).
@@ -1942,7 +1901,7 @@ impl Engine {
             mask[column] = true;
         }
         let (pages, slabs) = store.scan_units(&mask)?;
-        meter.charge(COSTS.page_read * pages as i64 + COSTS.value_decompress * slabs as i64);
+        meter.charge_block(pages, slabs);
         meter.checkpoint()?;
         // `target` is in the parent's stored-key byte space, so the child probe encodes a collated
         // parent key column with the PARENT's collation (§2.12).

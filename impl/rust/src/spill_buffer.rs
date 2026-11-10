@@ -69,7 +69,7 @@ impl RowSpool {
             self.bytes = self.bytes.saturating_add(bytes);
         }
         if self.file.is_none() && (rejected || self.bytes > self.budget) {
-            let scratch: Scratch = Arc::from(self.spill.create("rows")?);
+            let scratch: Scratch = Arc::from(self.spill.create(crate::spillhost::SpillKind::Rows)?);
             let mut file = BufWriter::new(SpillAppender::new(scratch.clone(), 0));
             self.scratch = Some(scratch);
             for old in self.rows.iter() {
@@ -310,7 +310,7 @@ impl StateMap {
             if !rejected && self.bytes <= self.budget {
                 return Ok(());
             }
-            let scratch: Scratch = Arc::from(self.spill.create("hash")?);
+            let scratch: Scratch = Arc::from(self.spill.create(crate::spillhost::SpillKind::Hash)?);
             self.disk = Some(StateDisk {
                 table: SpillTable::new(scratch)?,
                 last: None,
@@ -466,7 +466,7 @@ impl HashRows {
         if !rejected && self.bytes <= self.budget {
             return Ok(());
         }
-        let scratch: Scratch = Arc::from(self.spill.create("hash")?);
+        let scratch: Scratch = Arc::from(self.spill.create(crate::spillhost::SpillKind::Hash)?);
         let disk = Rc::new(RefCell::new(HashDisk {
             table: SpillTable::new(scratch)?,
             last: None,
@@ -1057,8 +1057,11 @@ mod tests {
     /// that outgrow their blocks and keys too long to read inline, with bounded directory segments.
     #[test]
     fn spill_table_matches_a_map() {
-        let scratch: Scratch =
-            Arc::from(os_spill_host(std::env::temp_dir()).create("hash").unwrap());
+        let scratch: Scratch = Arc::from(
+            os_spill_host(std::env::temp_dir())
+                .create(crate::spillhost::SpillKind::Hash)
+                .unwrap(),
+        );
         let mut table = SpillTable::new(scratch).unwrap();
         let mut want: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
         let keys = 40_000u64;

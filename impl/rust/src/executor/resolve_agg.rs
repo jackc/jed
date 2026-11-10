@@ -3030,11 +3030,7 @@ pub(crate) fn resolve_window_def(
     key_ctx: &mut AggCtx,
     window_keys: &mut Vec<RExpr>,
     params: &mut ParamTypes,
-) -> Result<(
-    Vec<usize>,
-    Vec<crate::spill::SortKey>,
-    Option<ResolvedFrame>,
-)> {
+) -> Result<(Vec<usize>, Vec<SortKey>, Option<ResolvedFrame>)> {
     let mut partition = Vec::with_capacity(wd.partition.len());
     for key in &wd.partition {
         let (rexpr, ty) = resolve(scope, key, None, key_ctx, params)?;
@@ -3045,7 +3041,7 @@ pub(crate) fn resolve_window_def(
         }
         partition.push(window_key_slot(rexpr, "PARTITION BY", window_keys)?);
     }
-    let mut order: Vec<crate::spill::SortKey> = Vec::with_capacity(wd.order.len());
+    let mut order: Vec<SortKey> = Vec::with_capacity(wd.order.len());
     // The ORDER BY key types, captured in lockstep with `order` — a `RANGE` value-offset frame folds
     // `key ± offset` over the single ordering key, so it needs the key's type (§6).
     let mut order_types: Vec<Type> = Vec::with_capacity(wd.order.len());
@@ -3070,7 +3066,12 @@ pub(crate) fn resolve_window_def(
             None => sort_target_collation(scope.catalog, derive_collation(scope, &key.expr)?)?,
         };
         let slot = window_key_slot(rexpr, "window ORDER BY", window_keys)?;
-        order.push((slot, key.descending, key.nulls_first, coll));
+        order.push(SortKey {
+            col: slot,
+            descending: key.descending,
+            nulls_first: key.nulls_first,
+            collation: coll,
+        });
         order_types.push(type_from_resolved(&ty)?);
     }
     // The explicit frame (window.md §6): ROWS / GROUPS integer-count offsets, RANGE value offsets.
@@ -3187,7 +3188,7 @@ pub(crate) fn window_key_slot(
 /// `0A000`). A negative offset is `22013`; `EXCLUDE` was already rejected at parse.
 pub(crate) fn resolve_frame(
     f: &crate::ast::WindowFrame,
-    order: &[crate::spill::SortKey],
+    order: &[SortKey],
     order_types: &[Type],
 ) -> Result<ResolvedFrame> {
     use crate::ast::{FrameBound, FrameMode};

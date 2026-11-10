@@ -2651,27 +2651,124 @@ fn explain_call(name: &str, args: &[RExpr]) -> String {
     )
 }
 
-fn debug_snake(value: impl std::fmt::Debug) -> String {
-    let source = format!("{value:?}");
-    let mut out = String::with_capacity(source.len() + 4);
-    for (i, ch) in source.chars().enumerate() {
-        if ch.is_ascii_uppercase() {
-            if i != 0 {
-                out.push('_');
-            }
-            out.push(ch.to_ascii_lowercase());
-        } else {
-            out.push(ch);
-        }
+/// A scalar function's name in EXPLAIN VERBOSE text and in the trap-class table. Contract text,
+/// so it is spelled out rather than derived from the variant name.
+pub(crate) fn explain_scalar_func(func: ScalarFunc) -> &'static str {
+    match func {
+        ScalarFunc::Abs => "abs",
+        ScalarFunc::Round => "round",
+        ScalarFunc::Ceil => "ceil",
+        ScalarFunc::Floor => "floor",
+        ScalarFunc::Trunc => "trunc",
+        ScalarFunc::Sqrt => "sqrt",
+        ScalarFunc::Exp => "exp",
+        ScalarFunc::Ln => "ln",
+        ScalarFunc::Log10 => "log10",
+        ScalarFunc::Pow => "pow",
+        ScalarFunc::Log => "log",
+        ScalarFunc::Sin => "sin",
+        ScalarFunc::Cos => "cos",
+        ScalarFunc::Tan => "tan",
+        ScalarFunc::Cbrt => "cbrt",
+        ScalarFunc::Pi => "pi",
+        ScalarFunc::Radians => "radians",
+        ScalarFunc::Degrees => "degrees",
+        ScalarFunc::Asin => "asin",
+        ScalarFunc::Acos => "acos",
+        ScalarFunc::Atan => "atan",
+        ScalarFunc::Atan2 => "atan2",
+        ScalarFunc::Cot => "cot",
+        ScalarFunc::Sinh => "sinh",
+        ScalarFunc::Cosh => "cosh",
+        ScalarFunc::Tanh => "tanh",
+        ScalarFunc::Asinh => "asinh",
+        ScalarFunc::Acosh => "acosh",
+        ScalarFunc::Atanh => "atanh",
+        ScalarFunc::Sign => "sign",
+        ScalarFunc::Div => "div",
+        ScalarFunc::Gcd => "gcd",
+        ScalarFunc::Lcm => "lcm",
+        ScalarFunc::Factorial => "factorial",
+        ScalarFunc::WidthBucket => "width_bucket",
+        ScalarFunc::Scale => "scale",
+        ScalarFunc::MinScale => "min_scale",
+        ScalarFunc::TrimScale => "trim_scale",
+        ScalarFunc::MakeInterval => "make_interval",
+        ScalarFunc::MakeTimestamp => "make_timestamp",
+        ScalarFunc::MakeTimestamptz => "make_timestamptz",
+        ScalarFunc::MakeDate => "make_date",
+        ScalarFunc::CurrentDate => "current_date",
+        ScalarFunc::DatePart => "date_part",
+        ScalarFunc::ToChar => "to_char",
+        ScalarFunc::ToCharInt8 => "to_char",
+        ScalarFunc::ToTimestamp => "to_timestamp",
+        ScalarFunc::ToDate => "to_date",
+        ScalarFunc::ToNumber => "to_number",
+        ScalarFunc::JustifyHours => "justify_hours",
+        ScalarFunc::JustifyDays => "justify_days",
+        ScalarFunc::JustifyInterval => "justify_interval",
+        ScalarFunc::Age => "age",
+        ScalarFunc::UuidExtractVersion => "uuid_extract_version",
+        ScalarFunc::UuidExtractTimestamp => "uuid_extract_timestamp",
+        ScalarFunc::Uuidv4 => "uuidv4",
+        ScalarFunc::Uuidv7 => "uuidv7",
+        ScalarFunc::Now => "now",
+        ScalarFunc::ClockTimestamp => "clock_timestamp",
+        ScalarFunc::Nextval => "nextval",
+        ScalarFunc::Currval => "currval",
+        ScalarFunc::Setval => "setval",
+        ScalarFunc::Lastval => "lastval",
+        ScalarFunc::CurrentSetting => "current_setting",
+        ScalarFunc::JsonbTypeof => "jsonb_typeof",
+        ScalarFunc::JsonTypeof => "json_typeof",
+        ScalarFunc::JsonbArrayLength => "jsonb_array_length",
+        ScalarFunc::JsonArrayLength => "json_array_length",
+        ScalarFunc::JsonbStripNulls => "jsonb_strip_nulls",
+        ScalarFunc::JsonStripNulls => "json_strip_nulls",
+        ScalarFunc::JsonbPretty => "jsonb_pretty",
+        ScalarFunc::JsonSerialize => "json_serialize",
+        ScalarFunc::Length => "length",
+        ScalarFunc::OctetLength => "octet_length",
+        ScalarFunc::BitLength => "bit_length",
+        ScalarFunc::Substr => "substr",
+        ScalarFunc::Left => "left",
+        ScalarFunc::Right => "right",
+        ScalarFunc::Lpad => "lpad",
+        ScalarFunc::Rpad => "rpad",
+        ScalarFunc::Btrim => "btrim",
+        ScalarFunc::Ltrim => "ltrim",
+        ScalarFunc::Rtrim => "rtrim",
+        ScalarFunc::Replace => "replace",
+        ScalarFunc::Translate => "translate",
+        ScalarFunc::Repeat => "repeat",
+        ScalarFunc::Reverse => "reverse",
+        ScalarFunc::Strpos => "strpos",
+        ScalarFunc::SplitPart => "split_part",
+        ScalarFunc::StartsWith => "starts_with",
+        ScalarFunc::Ascii => "ascii",
+        ScalarFunc::Chr => "chr",
+        ScalarFunc::Initcap => "initcap",
+        ScalarFunc::ToHex => "to_hex",
+        ScalarFunc::Encode => "encode",
+        ScalarFunc::Decode => "decode",
+        ScalarFunc::GetByte => "get_byte",
+        ScalarFunc::SetByte => "set_byte",
+        ScalarFunc::GetBit => "get_bit",
+        ScalarFunc::SetBit => "set_bit",
+        ScalarFunc::Md5 => "md5",
+        ScalarFunc::Sha224 => "sha224",
+        ScalarFunc::Sha256 => "sha256",
+        ScalarFunc::Sha384 => "sha384",
+        ScalarFunc::Sha512 => "sha512",
+        ScalarFunc::Overlay => "overlay",
+        ScalarFunc::ByteaConcat => "bytea_concat",
+        ScalarFunc::TextConcat => "text_concat",
+        ScalarFunc::QuoteLiteral => "quote_literal",
+        ScalarFunc::QuoteIdent => "quote_ident",
+        ScalarFunc::QuoteNullable => "quote_nullable",
+        ScalarFunc::LikeEscape => "like_escape",
+        ScalarFunc::SimilarToEscape => "similar_to_escape",
     }
-    out
-}
-
-pub(crate) fn explain_scalar_func(func: ScalarFunc) -> String {
-    if func == ScalarFunc::ToCharInt8 {
-        return "to_char".to_string();
-    }
-    debug_snake(func)
 }
 
 fn explain_array_func(func: &ArrayFunc) -> &str {
@@ -2724,12 +2821,28 @@ pub(crate) fn explain_regex_func(func: RegexFunc) -> &'static str {
     }
 }
 
-fn explain_range_op(op: RangeOp) -> String {
-    debug_snake(op)
+fn explain_range_op(op: RangeOp) -> &'static str {
+    match op {
+        RangeOp::Contains => "contains",
+        RangeOp::ContainsElem => "contains_elem",
+        RangeOp::ContainedBy => "contained_by",
+        RangeOp::ElemContainedBy => "elem_contained_by",
+        RangeOp::Overlaps => "overlaps",
+        RangeOp::Before => "before",
+        RangeOp::After => "after",
+        RangeOp::Overleft => "overleft",
+        RangeOp::Overright => "overright",
+        RangeOp::Adjacent => "adjacent",
+    }
 }
 
-fn explain_range_set_op(op: RangeSetOp) -> String {
-    debug_snake(op)
+fn explain_range_set_op(op: RangeSetOp) -> &'static str {
+    match op {
+        RangeSetOp::Union => "union",
+        RangeSetOp::Intersect => "intersect",
+        RangeSetOp::Difference => "difference",
+        RangeSetOp::Merge => "merge",
+    }
 }
 
 fn explain_variadic_func(func: &VariadicFunc) -> &'static str {
@@ -3161,7 +3274,7 @@ pub(crate) fn render_rexpr(e: &RExpr) -> String {
             args,
             ..
         } => binary(&args[0], "||", &args[1]),
-        RExpr::ScalarFunc { func, args, .. } => explain_call(&explain_scalar_func(*func), args),
+        RExpr::ScalarFunc { func, args, .. } => explain_call(explain_scalar_func(*func), args),
         RExpr::HostFunc { name, args, .. } => explain_call(name, args),
         RExpr::ArrayFunc { func, args } => explain_call(explain_array_func(func), args),
         RExpr::RangeFunc { func, args } => explain_call(explain_range_func(*func), args),

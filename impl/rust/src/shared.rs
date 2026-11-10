@@ -1240,12 +1240,15 @@ impl Storage {
             self.live_at_compaction,
             self.free_gen_txid,
             ps,
-            can_reclaim,
-            can_reuse,
-            // Only the file's owner lowers the high-water, and only against a durable floor: a page
-            // client's delta never shrinks it, and a commit inside a relaxed batch may not cut pages the
-            // batch has yet to make durable (format.md *Trailing truncation*, validated-cow.md §4).
-            !self.service_client && pending.is_empty(),
+            crate::format::FreeListPolicy {
+                reclaim: can_reclaim,
+                reuse: can_reuse,
+                // Only the file's owner lowers the high-water, and only against a durable floor: a
+                // page client's delta never shrinks it, and a commit inside a relaxed batch may not cut
+                // pages the batch has yet to make durable (format.md *Trailing truncation*,
+                // validated-cow.md §4).
+                truncate: !self.service_client && pending.is_empty(),
+            },
             live.live,
             &pending,
             allowed,
