@@ -608,6 +608,7 @@ from the runs before the FSST-style table was added:
 | one-row update commit | 221 µs | 381 to 399 µs | 381, 401 µs | 450, 462 µs |
 | bytes written per update commit | 74,037 | 74,033 | 71,653 | 69,849 |
 | one-row append commit | 343 µs | 504 to 533 µs | 575, 593 µs | 547, 555 µs |
+| the same, coding skipped where the dictionary wins | | 503, 526 µs | | 436, 446 µs |
 
 The per-leaf commit times are the range over this session's four runs; one further run was three
 times slower in every timing and is left out as machine noise.
@@ -617,14 +618,28 @@ times slower in every timing and is left out as machine noise.
   FSST-style table (§8.8). The literal-preserving table alone saves 44 MB.
 - **The FSST-style table costs commits about 60 µs on this table** (450 to 462 µs against 381 to
   401 µs for an update): `activity` holds a 184-byte `jsonb` column that is now coded with 255
-  symbols. Appends did not get slower.
+  symbols.
 - **Loading text costs about 0.4 s over the baseline** where per-leaf tables cost 3.1 s.
 - **Update commits cost the same as with per-leaf tables and write less** (denser leaves, and the
-  chain is not rewritten). **Append commits are about 12% slower than per-leaf**; not explained.
+  chain is not rewritten). **Append commits were about 12% slower than per-leaf, and are now faster** (next paragraph).
 - Scans and point lookups were within noise of the per-leaf runs. The ten aggregate queries return
   the same values in all three configurations.
 - **The sample hardly matters:** training at 8, 32 and 128 leaves gave 116.3, 116.2 and 117.9 MB
   (the last leaves more leaves plain); at 512 leaves 124.7 MB.
+
+**Why appends were slower.** The test appends short, identical rows, so the dictionary wins their
+three string columns. A per-column table exists for every column, and both the size measurement and
+the encoder coded every inline value of every column before comparing with the dictionary: 24.6 KB
+coded to measure and 24.6 KB to write per commit, against 5.5 KB with per-leaf tables (whose
+training finds little in a leaf of identical strings). A value of `n` payload bytes keeps at least
+`ceil(n/8)` bytes coded, which bounds a region's gain without coding it; when the bound cannot beat
+the dictionary's saving, coding is skipped (`symCanBeat`). That leaves 3.9 KB coded per commit and
+takes the append from about 550 µs to about 440 µs. The encoder's output is unchanged: it skips only
+where the dictionary would have been chosen.
+
+The same measurement shows drift at small scale. The appended rows are unlike the rows the tables
+were trained from, and a tail leaf holds 292 of them with per-column tables against 416 with
+per-leaf tables, which train on the leaf itself.
 
 **With the tables in the catalog entry** (the first version) every commit rewrote them with the
 catalog: 88,078 bytes per update commit and 458 to 477 µs. Moving them to their own chain is what

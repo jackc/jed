@@ -76,6 +76,9 @@ const symMaxLen = 8
 // symStats counts training work, for the experiment harness.
 var symStats struct {
 	trains, trainNanos, trainBytes atomic.Int64
+	// leaf encodes: leaves, their rows, those written with a symbol-table region, and the payload
+	// bytes coded for writing (enc) and for measuring (len).
+	leaves, rows, codedLeaves, encBytes, lenBytes atomic.Int64
 }
 
 // symTable is one column's symbol table. Immutable once built.
@@ -248,6 +251,7 @@ func (tb *symTable) unitBytes(u int) []byte {
 
 // encLen is the coded length of payload p.
 func (tb *symTable) encLen(p []byte) int {
+	symStats.lenBytes.Add(int64(len(p)))
 	total := 0
 	m := tb.matcher()
 	for at := 0; at < len(p); {
@@ -262,6 +266,7 @@ func (tb *symTable) encLen(p []byte) int {
 }
 
 func (tb *symTable) appendEnc(out, p []byte) []byte {
+	symStats.encBytes.Add(int64(len(p)))
 	m := tb.matcher()
 	for at := 0; at < len(p); {
 		u, n := m.match(p, at)
@@ -678,6 +683,22 @@ type colFacts struct {
 	d, dup int
 	gain   int
 	arr    arrAcc
+}
+
+// symGainMax bounds what coding an inline value of n payload bytes can save: a code stands for at
+// most symMaxLen bytes, so the value keeps at least ceil(n/8) bytes.
+func symGainMax(header, n int) int { return header + n - (n+symMaxLen-1)/symMaxLen }
+
+// symCanBeat reports whether a symbol-table region could save more than other bytes, given the bound
+// over its inline values: the leaf's raw bitmap and, for a per-leaf table, the table come off first.
+// Coding a region is most of the cost of measuring or writing a leaf, so it is skipped when the
+// dictionary is already known to win (short repeated strings).
+func symCanBeat(n, bound, other int, tb *symTable, colTab bool) bool {
+	bound -= (n + 7) / 8
+	if !colTab {
+		bound -= tb.size
+	}
+	return bound > other
 }
 
 func (a *colAcc) add(shape leafShape, j int, it dictItem, tb *symTable) {

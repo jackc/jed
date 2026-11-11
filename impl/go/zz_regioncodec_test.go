@@ -1362,11 +1362,24 @@ func TestRegionEngineExperiment(t *testing.T) {
 			pprof.StartCPUProfile(f)
 			defer func() { pprof.StopCPUProfile(); f.Close() }()
 		}
+		phase := func(label string, ops int, f func()) {
+			l0, r0, c0, e0, n0 := symStats.leaves.Load(), symStats.rows.Load(), symStats.codedLeaves.Load(), symStats.encBytes.Load(), symStats.lenBytes.Load()
+			f()
+			o := float64(ops)
+			fmt.Printf("  %-96s per op: %.2f leaves encoded (%.2f coded), %.0f rows, %.0f B coded to write, %.0f B coded to measure\n", "  "+label,
+				float64(symStats.leaves.Load()-l0)/o, float64(symStats.codedLeaves.Load()-c0)/o, float64(symStats.rows.Load()-r0)/o,
+				float64(symStats.encBytes.Load()-e0)/o, float64(symStats.lenBytes.Load()-n0)/o)
+		}
+		_ = phase
 		w0 := expWchar()
 		point("update 1 row/commit: activity.title", "UPDATE activity SET title = 'changed title text' WHERE id = $1", 2000, func() int64 { return 1 + r.Int63n(nAct) })
 		fmt.Printf("  %-96s %9d\n", "  bytes written per update commit", (expWchar()-w0)/4000)
 		next := nAct
-		point("insert 1 row/commit: activity (append)", "INSERT INTO activity VALUES ($1, 'a new title', '/srv/new/path.txt', 'a new message of ordinary length for the log', '{\"k\": 1}')", 2000, func() int64 { next++; return next })
+		w0 = expWchar()
+		phase("append", 4000, func() {
+			point("insert 1 row/commit: activity (append)", "INSERT INTO activity VALUES ($1, 'a new title', '/srv/new/path.txt', 'a new message of ordinary length for the log', '{\"k\": 1}')", 2000, func() int64 { next++; return next })
+		})
+		fmt.Printf("  %-96s %9d\n", "  bytes written per append commit", (expWchar()-w0)/4000)
 		s.Close()
 		db.Close()
 		os.Remove(path)

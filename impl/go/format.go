@@ -4112,18 +4112,7 @@ func encodeLeafPAXMemo(colTypes []colType, keyLen int, keys [][]byte, rows []sto
 						cur -= s
 					}
 				} else {
-					// Code every inline value once: the gain decides, and the bytes are what is written.
-					gain, header := 0, inlineHeaderLen(colTypes[c])
-					var coded []byte
-					codedEnd := make([]int, n)
-					for i, it := range items[c] {
-						if it.kind == dictShared {
-							at := len(coded)
-							coded = tb.appendEnc(coded, it.payload)
-							gain += header + len(it.payload) - (len(coded) - at)
-						}
-						codedEnd[i] = len(coded)
-					}
+					header := inlineHeaderLen(colTypes[c])
 					dictS := 0
 					if dicts[c] != nil {
 						var acc dictAcc
@@ -4131,6 +4120,28 @@ func encodeLeafPAXMemo(colTypes []colType, keyLen int, keys [][]byte, rows []sto
 							acc.add(it, header)
 						}
 						dictS = dictSaving(n, acc.d, acc.dup)
+					}
+					// Code every inline value once: the gain decides, and the bytes are what is written.
+					// Not at all when coding cannot save more than the dictionary does (symCanBeat).
+					bound := 0
+					for _, it := range items[c] {
+						if it.kind == dictShared {
+							bound += symGainMax(header, len(it.payload))
+						}
+					}
+					gain := 0
+					var coded []byte
+					var codedEnd []int
+					if symCanBeat(n, bound, dictS, tb, colTab) {
+						codedEnd = make([]int, n)
+						for i, it := range items[c] {
+							if it.kind == dictShared {
+								at := len(coded)
+								coded = tb.appendEnc(coded, it.payload)
+								gain += header + len(it.payload) - (len(coded) - at)
+							}
+							codedEnd[i] = len(coded)
+						}
 					}
 					s := symSaving(n, gain, tb)
 					if colTab {
@@ -4145,6 +4156,14 @@ func encodeLeafPAXMemo(colTypes []colType, keyLen int, keys [][]byte, rows []sto
 					}
 				}
 			}
+		}
+	}
+	symStats.leaves.Add(1)
+	symStats.rows.Add(int64(n))
+	for c := 0; c < k; c++ {
+		if syms[c] != nil {
+			symStats.codedLeaves.Add(1)
+			break
 		}
 	}
 	colStart[k] = cur // payload end

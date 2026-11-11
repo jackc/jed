@@ -522,9 +522,38 @@ func leafSizesOf(shape leafShape, rows []storedRow, items [][]dictItem, tabs []*
 			}
 		}
 	}
+	// Dictionary and array facts first; then a column's coded gain, which is the expensive part,
+	// only where coding could save more than the dictionary does (symCanBeat). A gain left at zero
+	// understates the saving at worst, and rows added later add theirs.
 	for i := range items {
-		for j, c := range shape.itemCols {
-			sz.accs[j].add(shape, j, items[i][j], sz.tab(shape, j, c))
+		for j := range shape.itemCols {
+			sz.accs[j].add(shape, j, items[i][j], nil)
+		}
+	}
+	for j, c := range shape.itemCols {
+		tb := sz.tab(shape, j, c)
+		if tb == nil {
+			continue
+		}
+		header := inlineHeaderLen(shape.colTypes[c])
+		bound := 0
+		for i := range items {
+			if it := items[i][j]; it.kind == dictShared {
+				bound += symGainMax(header, len(it.payload))
+			}
+		}
+		f := &sz.accs[j].f
+		dictS := 0
+		if shape.itemDict[j] {
+			dictS = dictSaving(sz.n, f.d, f.dup)
+		}
+		if !symCanBeat(sz.n, bound, dictS, tb, tabFor(sz.tabs, c) == nil) {
+			continue
+		}
+		for i := range items {
+			if it := items[i][j]; it.kind == dictShared {
+				f.gain += header + len(it.payload) - tb.encLen(it.payload)
+			}
 		}
 	}
 	return sz
