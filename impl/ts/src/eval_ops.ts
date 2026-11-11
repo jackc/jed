@@ -29,13 +29,13 @@ import {
   zoneRenderCount,
 } from "./value.ts";
 import { type QueryAccount, StateCharge } from "./cost.ts";
-import { KeyMap, KeySet } from "./keyset.ts";
+import { KeyMap, KeySet, type RowKey } from "./keyset.ts";
 import { entryBytes, payloadBytes, utf8Length, valueBytes } from "./memsize.ts";
 import { COSTS } from "./costs.ts";
 import {
   arraySubscriptErr,
   MAX_RESULT_CHARS,
-  distinctRowKey,
+  rowKey,
   promote,
   resolvedTypeEqual,
   rtName,
@@ -986,9 +986,9 @@ export function combineSetop(
   };
   const out: Value[][] = [];
   if (op === "union") {
-    const seen = new KeySet();
+    const seen = new KeySet<RowKey>();
     for (const row of left.concat(right)) {
-      const k = distinctRowKey(row);
+      const k = rowKey(row);
       if (!seen.has(k)) {
         seen.add(k);
         entry(row);
@@ -997,15 +997,15 @@ export function combineSetop(
     }
   } else if (all) {
     // INTERSECT ALL / EXCEPT ALL: a count per distinct right-arm row.
-    const counts = new KeyMap<number>();
+    const counts = new KeyMap<number, RowKey>();
     for (const row of right) {
-      const k = distinctRowKey(row);
+      const k = rowKey(row);
       const c = counts.get(k);
       if (c === undefined) entry(row);
       counts.set(k, (c ?? 0) + 1);
     }
     for (const row of left) {
-      const k = distinctRowKey(row);
+      const k = rowKey(row);
       const c = counts.get(k) ?? 0;
       if (c > 0) {
         counts.set(k, c - 1);
@@ -1014,17 +1014,17 @@ export function combineSetop(
     }
   } else {
     // INTERSECT / EXCEPT (distinct): one copy per distinct left key present in (absent from) the right.
-    const rightSet = new KeySet();
+    const rightSet = new KeySet<RowKey>();
     for (const row of right) {
-      const k = distinctRowKey(row);
+      const k = rowKey(row);
       if (!rightSet.has(k)) {
         entry(row);
         rightSet.add(k);
       }
     }
-    const emitted = new KeySet();
+    const emitted = new KeySet<RowKey>();
     for (const row of left) {
-      const k = distinctRowKey(row);
+      const k = rowKey(row);
       if (rightSet.has(k) === (op === "intersect") && !emitted.has(k)) {
         emitted.add(k);
         entry(row);

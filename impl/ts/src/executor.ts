@@ -433,7 +433,7 @@ import {
   SpillSet,
   SpoolSorter,
 } from "./blocking.ts";
-import { KeyMap, KeySet } from "./keyset.ts";
+import { KeyMap, KeySet, type RowKey, SegKey } from "./keyset.ts";
 import { type Entry, type Row, retainedOldRow, TableStore } from "./storage.ts";
 import {
   type DecimalTypmod,
@@ -28358,8 +28358,8 @@ export class Engine {
       // One DISTINCT dedup set per DISTINCT aggregate (null for a plain aggregate — COUNT(DISTINCT
       // x), aggregates.md §5). Keyed on distinctRowKey, the same value-canonical form as the
       // group-key bucketing (so 1.5 == 1.50 and -0.0 == 0.0).
-      const newSeen = (): (KeySet | null)[] =>
-        plan.aggSpecs.map((s) => (s.distinct ? new KeySet() : null));
+      const newSeen = (): (KeySet<RowKey> | null)[] =>
+        plan.aggSpecs.map((s) => (s.distinct ? new KeySet<RowKey>() : null));
       // One grouping set per plan.groupSets (spec/design/aggregates.md §12): a plain GROUP BY /
       // whole-table aggregate has exactly one; ROLLUP / CUBE / GROUPING SETS have several. Each set is
       // bucketed independently over the SAME post-WHERE rows and its groups projected into the shared
@@ -28393,13 +28393,13 @@ export class Engine {
       let groupRows: Value[][] = [];
       for (const gset of plan.groupSets) {
         if (shouldCooperate()) yield COOPERATE;
-        const index = new KeyMap<number>();
+        const index = new KeyMap<number, RowKey>();
         // Per group: key, accumulators, DISTINCT sets, and the group's query-memory charge — its
         // entry plus everything its accumulators retain (memory.md §6.2/§6.3).
         const groups: {
           keys: Value[];
           accs: Acc[];
-          seen: (KeySet | null)[];
+          seen: (KeySet<RowKey> | null)[];
           charge: number;
         }[] = [];
         // An empty grouping set (the () / whole-table grand total) is one pre-created group, so it
@@ -28415,7 +28415,7 @@ export class Engine {
           meter.guard(); // enforce the cost ceiling per folded row (CLAUDE.md §13)
           const keys = gset.keyCols.map((gk) => row[gk]!);
           chargeHashKeys(meter, keys); // the group table receives the row (cost.md §3)
-          const k = distinctRowKey(keys);
+          const k = rowKey(keys);
           let gi = index.get(k);
           if (gi === undefined) {
             const entry = meter.queryMemoryActive() ? entryBytes(keys) : 0;
@@ -28471,7 +28471,7 @@ export class Engine {
             if (dedup) {
               if (v.kind === "null" && !aggDistinctKeepsNull(spec.plan)) continue;
               chargeHashKey(meter, v); // the value set receives it (cost.md §3)
-              const dk = distinctRowKey([v]);
+              const dk = rowKey([v]);
               if (dedup.has(dk)) continue;
               dedup.add(dk);
               if (meter.queryMemoryActive()) {
@@ -28646,14 +28646,14 @@ export class Engine {
       // Project every filtered row (charging projection cost per row, the §3 asymmetry),
       // keeping first occurrences. `seen` is membership-only: output order comes from the
       // deterministic source iteration, never from Set iteration (no order leak — §8/§10).
-      const seen = new KeySet();
+      const seen = new KeySet<RowKey>();
       const distinctRows: Value[][] = [];
       let seenCharge = 0; // the dedup set's entries (memory.md §6.2)
       for (const row of rows) {
         if (shouldCooperate()) yield COOPERATE;
         const tuple = yield* evalExpressionsSteps(plan.projections, row, env, meter);
         chargeHashKeys(meter, tuple); // the dedup table receives the row (cost.md §3)
-        const key = distinctRowKey(tuple);
+        const key = rowKey(tuple);
         if (!seen.has(key)) {
           seen.add(key);
           if (meter.queryMemoryActive()) {
@@ -38551,6 +38551,35 @@ export function valueToRExpr(v: Value): RExpr {
 // bigint.toString() — exact, never the lossy `number` path (CLAUDE.md §8).
 export function distinctRowKey(row: Value[]): string {
   return row.map(distinctValueKey).join("|");
+}
+
+// ROW_KEY_SEGMENT_MIN is the shortest top-level text or json body rowKey shares instead of copying.
+const ROW_KEY_SEGMENT_MIN = 1024;
+
+// rowKey is distinctRowKey's key for a KeySet / KeyMap, built without copying long strings: a row with
+// no top-level text or json value of ROW_KEY_SEGMENT_MIN units or more is the flat string itself; any
+// other row is a SegKey whose segments concatenate to that string, each such body a segment of its own
+// that shares the value's string. A hashed key would otherwise be flattened into one copy of every long
+// value it holds, kept for as long as the set keeps the key.
+export function rowKey(row: Value[]): RowKey {
+  let segs: string[] | null = null;
+  let pending = "";
+  for (let i = 0; i < row.length; i++) {
+    const v = row[i]!;
+    const sep = i > 0 ? "|" : "";
+    if ((v.kind === "text" || v.kind === "json") && v.text.length >= ROW_KEY_SEGMENT_MIN) {
+      // distinctValueKey's "t<len>:" / "j<len>:" header, then the body by reference.
+      segs ??= [];
+      segs.push(`${pending}${sep}${v.kind === "text" ? "t" : "j"}${v.text.length}:`);
+      segs.push(v.text);
+      pending = "";
+    } else {
+      pending += sep + distinctValueKey(v);
+    }
+  }
+  if (segs === null) return pending;
+  if (pending !== "") segs.push(pending);
+  return new SegKey(segs);
 }
 
 // distinctValueKey encodes one value into a collision-free string key for DISTINCT/GROUP BY dedup

@@ -29,7 +29,7 @@ import {
   cmpBytes,
   coerceForStore,
   collatedSortKey,
-  distinctRowKey,
+  rowKey,
   finalizeAcc,
   foldAccCharged,
   newAcc,
@@ -38,7 +38,7 @@ import {
 } from "./executor.ts";
 import { COSTS } from "./costs.ts";
 import { chargeHashKeys, chargeSortKey, chargeSortKeys } from "./key_meter.ts";
-import { KeyMap } from "./keyset.ts";
+import { KeyMap, type RowKey } from "./keyset.ts";
 import { entryBytes, rowBytes, sortKeyBytes, valueBytes } from "./memsize.ts";
 import { engineError } from "./errors.ts";
 import { intervalCmp } from "./interval.ts";
@@ -520,12 +520,12 @@ export function* applyWindowStageSteps(
     for (const si of group) specGroup[si] = gi;
     // Partition the row indices by the partition-key values. The Map is an index only (never
     // iterated); output comes from the insertion-ordered `partitions` (no hash-order leak).
-    const index = new KeyMap<number>();
+    const index = new KeyMap<number, RowKey>();
     const partitions: number[][] = [];
     for (let i = 0; i < n; i++) {
       const keyVals = rep.partition.map((p) => rows[i]![p]!);
       chargeHashKeys(meter, keyVals);
-      const k = distinctRowKey(keyVals);
+      const k = rowKey(keyVals);
       let pi = index.get(k);
       if (pi === undefined) {
         if (meter.queryMemoryActive()) {

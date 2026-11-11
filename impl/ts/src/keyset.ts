@@ -54,29 +54,79 @@ function isLong(key: string): boolean {
   return key.length > LONG_KEY || key.charCodeAt(0) === 0;
 }
 
+// SegKey is a row key held as consecutive segments whose concatenation is its flat encoding
+// (distinctRowKey's string), each long string body a segment of its own that shares the value's
+// string instead of copying it into one key (executor.ts rowKey). Whether a key is segmented depends
+// only on the values, so two equal keys always have the same form and the same segment boundaries, and
+// a flat key never equals a segmented one: segment-wise equality is exactly key equality.
+export class SegKey {
+  readonly segs: string[];
+  private hashed: number | null = null;
+  constructor(segs: string[]) {
+    this.segs = segs;
+  }
+  hash(): number {
+    if (this.hashed === null) {
+      let h = this.segs.length | 0;
+      for (const seg of this.segs) h = Math.imul(h ^ keyHash(seg), 0x9e3779b1);
+      this.hashed = h;
+    }
+    return this.hashed;
+  }
+  equals(o: SegKey): boolean {
+    if (o === this) return true;
+    const a = this.segs;
+    const b = o.segs;
+    if (a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+    return true;
+  }
+  // flat is the key's flat encoding (a copy of every segment).
+  flat(): string {
+    return this.segs.join("");
+  }
+}
+
+// RowKey is a dedup / grouping key: a flat string, or a SegKey holding long values by reference.
+export type RowKey = string | SegKey;
+
+function sameKey(a: RowKey, b: RowKey): boolean {
+  if (typeof a === "string") return a === b;
+  return typeof b !== "string" && a.equals(b);
+}
+
+function longHash(key: RowKey): number {
+  return typeof key === "string" ? keyHash(key) : key.hash();
+}
+
+// isLongKey: a segmented key always takes the hashed path.
+function isLongKey(key: RowKey): boolean {
+  return typeof key !== "string" || isLong(key);
+}
+
 // KeySet is a Set<string> of has/add/size/clear.
-export class KeySet {
+export class KeySet<K extends RowKey = string> {
   private short = new Set<string>();
-  private long = new Map<number, string[]>();
+  private long = new Map<number, K[]>();
   private longCount = 0;
 
   get size(): number {
     return this.short.size + this.longCount;
   }
-  has(key: string): boolean {
-    if (!isLong(key)) return this.short.has(key);
-    const bucket = this.long.get(keyHash(key));
-    return bucket?.includes(key) === true;
+  has(key: K): boolean {
+    if (!isLongKey(key)) return this.short.has(key as string);
+    const bucket = this.long.get(longHash(key));
+    return bucket?.some((k) => sameKey(k, key)) === true;
   }
-  add(key: string): this {
-    if (!isLong(key)) {
-      this.short.add(key);
+  add(key: K): this {
+    if (!isLongKey(key)) {
+      this.short.add(key as string);
       return this;
     }
-    const hash = keyHash(key);
+    const hash = longHash(key);
     const bucket = this.long.get(hash);
     if (bucket === undefined) this.long.set(hash, [key]);
-    else if (!bucket.includes(key)) bucket.push(key);
+    else if (!bucket.some((k) => sameKey(k, key))) bucket.push(key);
     else return this;
     this.longCount++;
     return this;
@@ -91,35 +141,35 @@ export class KeySet {
 // KeyMap is a Map<string, V> of get/has/set/size/clear and insertion-ordered entries. A long key is
 // stored in the native map under a short surrogate ("\0" + serial), resolved through its hash bucket,
 // so iteration keeps one insertion order across short and long keys.
-export class KeyMap<V> {
+export class KeyMap<V, K extends RowKey = string> {
   private map = new Map<string, V>();
-  private long = new Map<number, { key: string; surrogate: string }[]>();
-  private raw = new Map<string, string>(); // surrogate → long key
+  private long = new Map<number, { key: K; surrogate: string }[]>();
+  private raw = new Map<string, K>(); // surrogate → long key
   private serial = 0;
 
   get size(): number {
     return this.map.size;
   }
-  private surrogate(key: string, hash: number): string | undefined {
+  private surrogate(key: K, hash: number): string | undefined {
     const bucket = this.long.get(hash);
-    if (bucket !== undefined) for (const e of bucket) if (e.key === key) return e.surrogate;
+    if (bucket !== undefined) for (const e of bucket) if (sameKey(e.key, key)) return e.surrogate;
     return undefined;
   }
-  get(key: string): V | undefined {
-    if (!isLong(key)) return this.map.get(key);
-    const s = this.surrogate(key, keyHash(key));
+  get(key: K): V | undefined {
+    if (!isLongKey(key)) return this.map.get(key as string);
+    const s = this.surrogate(key, longHash(key));
     return s === undefined ? undefined : this.map.get(s);
   }
-  has(key: string): boolean {
-    if (!isLong(key)) return this.map.has(key);
-    return this.surrogate(key, keyHash(key)) !== undefined;
+  has(key: K): boolean {
+    if (!isLongKey(key)) return this.map.has(key as string);
+    return this.surrogate(key, longHash(key)) !== undefined;
   }
-  set(key: string, value: V): this {
-    if (!isLong(key)) {
-      this.map.set(key, value);
+  set(key: K, value: V): this {
+    if (!isLongKey(key)) {
+      this.map.set(key as string, value);
       return this;
     }
-    const hash = keyHash(key);
+    const hash = longHash(key);
     let s = this.surrogate(key, hash);
     if (s === undefined) {
       s = "\0" + (this.serial++).toString();
@@ -136,10 +186,10 @@ export class KeyMap<V> {
     this.long.clear();
     this.raw.clear();
   }
-  *entries(): Generator<[string, V]> {
-    for (const [k, v] of this.map) yield [k.charCodeAt(0) === 0 ? this.raw.get(k)! : k, v];
+  *entries(): Generator<[K, V]> {
+    for (const [k, v] of this.map) yield [k.charCodeAt(0) === 0 ? this.raw.get(k)! : (k as K), v];
   }
-  [Symbol.iterator](): Generator<[string, V]> {
+  [Symbol.iterator](): Generator<[K, V]> {
     return this.entries();
   }
 }

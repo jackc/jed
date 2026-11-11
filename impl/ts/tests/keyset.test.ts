@@ -50,3 +50,44 @@ test("KeyMap get/set/has and insertion-ordered entries", () => {
     keys.map((k, i) => [k, i === 1 ? 100 : i]),
   );
 });
+
+// rowKey shares long top-level text/json bodies as SegKey segments; its encoding must stay
+// distinctRowKey's, and a KeySet/KeyMap must treat equal rows as one key and unequal ones apart.
+test("rowKey encodes as distinctRowKey and dedups by value", async () => {
+  const { distinctRowKey, rowKey } = await import("../src/executor.ts");
+  const { SegKey } = await import("../src/keyset.ts");
+  const { textValue, intValue, nullValue } = await import("../src/value.ts");
+  const big = "y".repeat(5000);
+  const rows = [
+    [textValue(big + "a")],
+    [textValue(big + "b")],
+    [intValue(1n), textValue(big + "a"), nullValue()],
+    [intValue(1n), textValue(big + "a"), textValue(big + "a")],
+    [{ kind: "json" as const, text: big + "a" }],
+    [textValue("short"), intValue(2n)],
+    [textValue("")],
+  ];
+  for (const row of rows) {
+    const k = rowKey(row);
+    const flat = typeof k === "string" ? k : k.flat();
+    assert.equal(flat, distinctRowKey(row));
+  }
+  assert.ok(rowKey(rows[0]!) instanceof SegKey);
+  assert.equal(typeof rowKey(rows[5]!), "string");
+  const set = new KeySet<string | InstanceType<typeof SegKey>>();
+  const map = new KeyMap<number, string | InstanceType<typeof SegKey>>();
+  for (const [i, row] of rows.entries()) {
+    set.add(rowKey(row));
+    map.set(rowKey(row), i);
+  }
+  // Equal content in separate strings is one key; text and json of the same body are not.
+  for (const [i, row] of rows.entries()) {
+    const copy = row.map((v) =>
+      "text" in v ? { ...v, text: v.text.split("").join("") } : v,
+    ) as typeof row;
+    assert.equal(set.has(rowKey(copy)), true);
+    assert.equal(map.get(rowKey(copy)), i);
+  }
+  assert.equal(set.size, rows.length);
+  assert.equal(set.has(rowKey([textValue(big + "c")])), false);
+});
