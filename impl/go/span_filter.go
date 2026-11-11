@@ -284,12 +284,8 @@ func (a *spanAtom) evalSpan(n *pnode, i int, m *costMeter) (keep, ok bool, err e
 		m.Charge(a.base)
 		return false, true, nil
 	}
-	body, inline := inlinePlainBody(span)
-	if !inline {
-		return false, false, nil
-	}
 	if a.kind == atomBytesEq {
-		payload, ok := len16Payload(body)
+		payload, ok := inlineStringPayload(span)
 		if !ok {
 			return false, false, nil
 		}
@@ -313,6 +309,10 @@ func (a *spanAtom) evalSpan(n *pnode, i int, m *costMeter) (keep, ok bool, err e
 			return false, false, err
 		}
 		return bytes.Equal(payload, a.k) != a.negated, true, nil
+	}
+	body, inline := inlinePlainBody(span)
+	if !inline {
+		return false, false, nil
 	}
 	colHasNull, ok := arrayElementSpans(body, a.elem, &a.spans)
 	if !ok {

@@ -1,7 +1,7 @@
 # Leaf pages: structural size reductions (proposal)
 
-**Status: proposal. Steps 1 and 2 are prototyped in the Go core only**, behind `JED_LEAF_NARROW=on`
-and `JED_LEAF_ELIDE_KEY=on`. Nothing here is in `format.md`, the Ruby reference, or the Rust and TS cores, and the prototype does not bump
+**Status: proposal. Steps 1 to 4 are prototyped in the Go core only**, behind `JED_LEAF_NARROW=on`,
+`JED_LEAF_ELIDE_KEY=on`, `JED_LEAF_FIXED_KEY=on` and `JED_LEAF_BARE_STRING=on`. Nothing here is in `format.md`, the Ruby reference, or the Rust and TS cores, and the prototype does not bump
 the format version.
 
 ## 1. Where the bytes are
@@ -124,18 +124,74 @@ fails 15 of 752 files, all pins: twelve costs or `EXPLAIN` estimates that count 
 resource trip points (`storage_memory`, and two query-memory tests whose limit is no longer reached
 because staged records are smaller). No file returned wrong rows. The disk-mode pass was not reached.
 
-## 5. Remaining steps
+## 5. Step 3: no key directory for fixed-length table keys (prototyped)
 
-1. **Key directory for fixed-length keys (3.0%).** No directory at all; key `i` is at
-   `i · key_len`. Needs the key length from the schema, for index trees as well as tables.
-2. **Length prefix (2.1%).** A leaf-only form of the inline `text`/`bytea` body without its `u16`
-   length.
-3. **Presence tag (under 1.6%).** See §2.
-4. **Resident size.** Rebuild an elided column lazily, on first touch, so a leaf whose key columns
+A table's storage keys all have one length when every primary-key member is a scalar with a
+fixed-width key encoding (the integers, `boolean`, `uuid`, the date/time types, floats, `interval`),
+and when the table has no primary key (the 8-byte synthetic rowid). Such a table's leaves set layout
+bit 2, follow the layout byte with the key length as a `u16`, and carry no key directory: key `i` is
+at `i · key_len` in the key blob.
+
+- The page names its own key length, so a reader needs no schema. The writer takes the length from
+  the schema and refuses a page holding a key of another length.
+- `leafOverhead` replaces the key directory's `2·N` with 2. `record_size` is unchanged.
+- **Index trees keep their directory.** An index entry's key is a nullable slot per element, and a
+  NULL slot is one byte, so the length is fixed only while every key column is `NOT NULL`, which
+  `ALTER TABLE … DROP NOT NULL` can end. Taking this for indexes needs that statement to rebuild the
+  index (its leaves were planned with the smaller overhead). On the test database the index trees
+  whose keys happen to share one length hold 2.2 MB of key directory.
+
+## 6. Step 4: inline strings without a length (prototyped)
+
+An inline `text`, `bytea` or `json` value in a leaf is `0x00`, a `u16` length, and the bytes. The
+value directory already gives the span, so the length is redundant. The new form is the presence
+tag `0x05` followed by the bytes; the rest of the span is the payload.
+
+- Each value names its own form, so both read, and no layout bit is needed.
+- `record_size` counts such a value as `1 + len` instead of `3 + len`; the disposition plan
+  (compress, then externalize) uses the same number. `RECORD_MAX` is unchanged.
+- An inline value read from a page stays a view of the page in either form. The reader records which
+  form it came from, and the writer emits whichever form the process writes.
+- The compressed and external forms are unchanged. The inline-compressed form's `u16` block length
+  is redundant in the same way and was left alone.
+- The filter that compares stored bytes in place (`col = 'literal'`) reads both forms.
+
+**Result**, all four switches on:
+
+| | v50 | steps 1–2 | steps 1–4 |
+|---|---|---|---|
+| compacted file | 187.7 MB | 157.3 MB | 151.2 MB |
+| leaf pages | 23,910 | 20,039 | 19,259 |
+| leaf payload | 150.8 MB | 125.7 MB | 120.0 MB |
+| bytes written during the bulk load | 6,444 MB | 6,215 MB | 6,180 MB |
+
+Scans, single-row commits and the bulk load did not move outside noise (two alternating runs of each
+configuration). Point lookups: five alternating rounds of nine passes each gave a best-pass
+primary-key lookup of 1.37 to 1.55 µs with steps 1–4 against 1.39 to 1.51 µs with steps 1–2. One
+round of the new layout ran at half speed on every query, index lookups included, and is excluded as
+a whole-process effect.
+
+**What was run**, Go core, all four switches on: the unit tests (the same layout-pinned failures as
+steps 1 and 2, no others); `mise run sim:sweep 1..100 all go` (2,200 traces), and 1,320 more together
+with the deferred-interior and CRC-32-manifest switches; the randomized comparison test with every
+switch on. The memory-mode corpus fails 16 of 752 files, all pins: thirteen costs or `EXPLAIN`
+estimates and the three resource trip points. No file returned wrong rows. The disk-mode pass was not
+reached. With the switches off the unit tests pass.
+
+## 7. Remaining steps
+
+1. **Key directory of index trees (1.7% of the remaining leaf bytes).** See §5.
+2. **Presence tag (under 1%).** See §2.
+3. **Resident size.** Rebuild an elided column lazily, on first touch, so a leaf whose key columns
    are never read stays the size of its page.
 
-## 6. Work if adopted
+After these the structural list is spent. What is left in a leaf is content: keys are 40% of the
+leaf bytes, and the experiment's encoding estimates (a shared key prefix, frame-of-reference
+integers, dictionaries), taken before steps 3 and 4, put the leaf payload at 47 to 71 MB against
+125.7 MB. (The estimator does not yet read the string form of step 4.)
 
-`format.md` (*Leaf node*, *Record*, `leafOverhead`), `bplus-reshape.md` §4, `packed-leaf.md`,
+## 8. Work if adopted
+
+`format.md` (*Leaf node*, *Record*, *Value codec*, `leafOverhead`), `bplus-reshape.md` §4, `packed-leaf.md`,
 `lazy-record.md`; every golden; the cost and storage-limit pins above; the Ruby reference and
 `verify.rb`; the three cores; the bench dataset `generator_version`.

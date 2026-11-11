@@ -125,6 +125,9 @@ type Unfetched struct {
 	StoredLen uint32
 	RawLen    uint32
 	Comp      []byte
+	// bare marks an inline-deferred (Form 0x00) string whose Comp is the content payload alone, read
+	// from a value stored without its u16 length (leaf_narrow.go).
+	bare bool
 	// types is the store's shared resolved column-type slice and typeIdx this value's column
 	// ordinal (one slice-header copy per deferred value, no per-value colType clone);
 	// resolveUnfetchedSelf reads types[typeIdx]. nil types is the spill-run-file sentinel.

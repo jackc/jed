@@ -26,11 +26,80 @@ var leafNarrow = os.Getenv("JED_LEAF_NARROW") == "on"
 // contributes nothing to record_size, and leafOverhead counts it only in the column directory.
 var leafElideKey = os.Getenv("JED_LEAF_ELIDE_KEY") == "on"
 
+// leafFixedKey makes this process write a table leaf whose keys all have one length, fixed by the
+// primary key's column types, without a key directory (JED_LEAF_FIXED_KEY=on): the layout byte is
+// followed by the key length as a u16, and key i is at i·key_len in the key blob. The page names its
+// own key length, so a reader needs no schema. Index trees keep their directory: an index key's
+// length depends on whether a key column is NULL.
+var leafFixedKey = os.Getenv("JED_LEAF_FIXED_KEY") == "on"
+
+// leafBareString makes this process write an inline text / bytea / json value in a leaf without its
+// u16 length (JED_LEAF_BARE_STRING=on): the value directory's span already gives the length. Such a
+// value carries the presence tag tagInlineBare instead of 0x00, so each value names its own form and
+// both read. Its record_size contribution is 1 + len instead of 3 + len.
+var leafBareString = os.Getenv("JED_LEAF_BARE_STRING") == "on"
+
+// tagInlineBare is the presence tag of an inline-plain string body stored without its length: the
+// rest of the value's span is the content payload.
+const tagInlineBare byte = 0x05
+
+// bareString reports whether a column's inline values are written bare.
+func bareString(ty colType) bool { return leafBareString && stringPayload(ty) }
+
+// inlinePayload is the content payload of an inline-deferred string value, whichever form it was
+// read from.
+func (u *Unfetched) inlinePayload() []byte {
+	if u.bare {
+		return u.Comp
+	}
+	return u.Comp[min(2, len(u.Comp)):]
+}
+
 // The layout byte is a set of flags. A v50 leaf has no layout byte (its first payload byte is 0).
 const (
 	leafLayoutNarrow   = 1 // every directory entry is a u16
 	leafLayoutElideKey = 2 // key-derivable columns have no region
+	leafLayoutFixedKey = 4 // a u16 key length follows; no key directory
 )
+
+// leafFlagsFor is the layout byte of a leaf in a tree whose keys have the fixed length keyLen (0 when
+// they vary).
+func leafFlagsFor(keyLen int) byte {
+	f := leafLayoutFlags()
+	if leafFixedKey && keyLen > 0 {
+		f |= leafLayoutFixedKey
+	}
+	return f
+}
+
+// tableKeyLen is the length of every storage key of a table with these column types and primary key
+// (member ordinals in key order), or 0 when keys vary in length. A table without a primary key is
+// keyed by its 8-byte synthetic rowid; a primary key is fixed-length when every member is a scalar
+// with a fixed-width key encoding.
+func tableKeyLen(colTypes []colType, pk []int) int {
+	if len(pk) == 0 {
+		return 8
+	}
+	total := 0
+	for _, c := range pk {
+		if c < 0 || c >= len(colTypes) {
+			return 0
+		}
+		ty := colTypes[c]
+		if ty.Composite || ty.Elem != nil || ty.RangeElem != nil {
+			return 0
+		}
+		slot, ok := keySlotForScalar(ty.Scalar, false)
+		if !ok || slot.kind != keySlotFixed || slot.width <= 0 {
+			return 0
+		}
+		total += slot.width
+	}
+	if total > 0xFFFF {
+		return 0
+	}
+	return total
+}
 
 // leafLayoutFlags is the layout byte this process writes; 0 writes the v50 layout.
 func leafLayoutFlags() byte {

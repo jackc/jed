@@ -1142,7 +1142,7 @@ func serializeNode(n *pnode, store *tableStore, nextIndex uint32, body *pageSink
 		if err != nil {
 			return pageRef{}, 0, err
 		}
-		payload, err = encodeLeafPAX(colTypes, n.keyViews(), rows, body.seal, take, &ovf, &chainSource{paging: store.paging})
+		payload, err = encodeLeafPAX(colTypes, store.shape.keyLen, n.keyViews(), rows, body.seal, take, &ovf, &chainSource{paging: store.paging})
 		if err != nil {
 			return pageRef{}, 0, err
 		}
@@ -1294,7 +1294,7 @@ func (s *snapshot) incrementalImageDeferred(pageSize, startPage uint32, free []u
 	var indexColTypes []colType
 	for ti, k := range keys {
 		if root := s.stores[k].treeRoot(); root != nil {
-			rp, err := serializeDirty(root, s.stores[k].colTypes, s.stores[k].memo, seal, alloc, &pages, kept, shared, paging, d)
+			rp, err := serializeDirty(root, s.stores[k].colTypes, s.stores[k].shape.keyLen, s.stores[k].memo, seal, alloc, &pages, kept, shared, paging, d)
 			if err != nil {
 				return incrementalWrite{}, err
 			}
@@ -1322,7 +1322,7 @@ func (s *snapshot) incrementalImageDeferred(pageSize, startPage uint32, free []u
 				}
 				r = root
 			} else if root := s.indexStores[idx.Name].treeRoot(); root != nil {
-				rp, err := serializeDirty(root, indexColTypes, nil, seal, alloc, &pages, kept, shared, paging, d)
+				rp, err := serializeDirty(root, indexColTypes, 0, nil, seal, alloc, &pages, kept, shared, paging, d)
 				if err != nil {
 					return incrementalWrite{}, err
 				}
@@ -1421,7 +1421,7 @@ func (s *snapshot) incrementalImageDeferred(pageSize, startPage uint32, free []u
 // Page indices come from the allocator (free-list first, then the high-water). Mirrors serializeNode
 // for the byte layout. Every clean node and OnDisk child it reaches is recorded in kept — the shared
 // boundary the live-page delta skips (spec/design/memory.md §8.7).
-func serializeDirty(n *pnode, colTypes []colType, memo *compressMemo, seal sealer, alloc *pageAlloc, pages *[]dirtyPage, kept, shared map[uint32]bool, paging *sharedPaging, d *deferCtx) (pageRef, error) {
+func serializeDirty(n *pnode, colTypes []colType, keyLen int, memo *compressMemo, seal sealer, alloc *pageAlloc, pages *[]dirtyPage, kept, shared map[uint32]bool, paging *sharedPaging, d *deferCtx) (pageRef, error) {
 	if n.page != 0 {
 		kept[n.page] = true
 		return n.ref(), nil
@@ -1437,7 +1437,7 @@ func serializeDirty(n *pnode, colTypes []colType, memo *compressMemo, seal seale
 			continue
 		}
 		wasDirty := c.node.page == 0
-		cp, err := serializeDirty(c.node, colTypes, memo, seal, alloc, pages, kept, shared, paging, d)
+		cp, err := serializeDirty(c.node, colTypes, keyLen, memo, seal, alloc, pages, kept, shared, paging, d)
 		if err != nil {
 			return pageRef{}, err
 		}
@@ -1490,7 +1490,7 @@ func serializeDirty(n *pnode, colTypes []colType, memo *compressMemo, seal seale
 	} else {
 		src := &chainSource{paging: paging, share: true}
 		var err error
-		payload, err = encodeLeafPAXMemo(colTypes, n.keys, n.vals, seal, alloc.take, pages, src, memo)
+		payload, err = encodeLeafPAXMemo(colTypes, keyLen, n.keys, n.vals, seal, alloc.take, pages, src, memo)
 		if err != nil {
 			return pageRef{}, err
 		}
@@ -2964,6 +2964,8 @@ type leafShape struct {
 	// elided is the columns a leaf stores no region for (leaf_narrow.go); they keep their column
 	// directory entry.
 	elided int
+	// keyLen is the one length of every key of the tree, or 0 when keys vary (leaf_narrow.go).
+	keyLen int
 }
 
 func (s leafShape) k() int { return s.fixed + s.variable + s.elided }
@@ -2993,13 +2995,18 @@ func leafOverhead(n int, shape leafShape) int {
 	// PROTOTYPE (leaf_narrow.go): a layout byte when any layout switch is on, and 16-bit directory
 	// entries in the narrow layout.
 	dw, lead := 4, 0
-	if leafLayoutFlags() != 0 {
+	flags := leafFlagsFor(shape.keyLen)
+	if flags != 0 {
 		lead = 1
 	}
 	if leafNarrow {
 		dw = 2
 	}
-	return lead + dw*n + dw*(shape.k()+1) + shape.fixed*(1+(n+7)/8) + shape.variable*(1+dw*n)
+	keyDir := dw * n
+	if flags&leafLayoutFixedKey != 0 {
+		keyDir = 2 // the key length, once
+	}
+	return lead + keyDir + dw*(shape.k()+1) + shape.fixed*(1+(n+7)/8) + shape.variable*(1+dw*n)
 }
 
 // valueDisp is a value's planned on-disk disposition (large-values.md §2/§12/§13).
@@ -3036,7 +3043,7 @@ type recordPlan struct {
 // "Value codec"): the present tag plus, for the length-prefixed text / bytea / json bodies, the u16
 // length; just the tag for every other spillable body (whose payload is the body itself).
 func inlineHeaderLen(ty colType) int {
-	if stringPayload(ty) {
+	if stringPayload(ty) && !leafBareString {
 		return 3
 	}
 	return 1
@@ -3053,7 +3060,13 @@ func valueFacts(ty colType, v Value) (inline, payload int) {
 		u := v.unfetched()
 		switch u.Form {
 		case 0x00:
-			payload = 1 + len(u.Comp) - inlineHeaderLen(ty)
+			// What it was read from fixes how much of Comp is payload; inlineHeaderLen is what this
+			// process writes.
+			if stringPayload(ty) {
+				payload = len(u.inlinePayload())
+			} else {
+				payload = len(u.Comp)
+			}
 		case tagExternal:
 			payload = int(u.StoredLen)
 		default:
@@ -3091,8 +3104,10 @@ func planningPayload(ty colType, v Value) []byte {
 		if u.Form != 0x00 {
 			panic("BUG: a stored large form's compression outcome is known")
 		}
-		skip := min(inlineHeaderLen(ty)-1, len(u.Comp))
-		return u.Comp[skip:]
+		if stringPayload(ty) {
+			return u.inlinePayload()
+		}
+		return u.Comp
 	}
 	return valuePayload(ty, v)
 }
@@ -3344,6 +3359,19 @@ func inlinePlainBody(span []byte) ([]byte, bool) {
 		return nil, false
 	}
 	return span[1:], true
+}
+
+// inlineStringPayload returns the content payload of an inline-plain string span, in either stored
+// form: 0x00 + u16 length + payload, or tagInlineBare + payload (leaf_narrow.go).
+func inlineStringPayload(span []byte) ([]byte, bool) {
+	if len(span) > 0 && span[0] == tagInlineBare {
+		return span[1:], true
+	}
+	body, ok := inlinePlainBody(span)
+	if !ok || len(body) < 2 || len(body)-2 != int(binary.BigEndian.Uint16(body)) {
+		return nil, false
+	}
+	return body[2:], true
 }
 
 func recordScanUnits(colTypes []colType, key []byte, row storedRow, pcap pageCap, mask []bool) (pages, decompress int) {
@@ -3715,11 +3743,21 @@ func encodeDisposedValue(ty colType, v Value, plan *recordPlan, c int, seal seal
 		return append(out, first.tag[:pcap.tag]...), nil
 	default:
 		if u != nil && u.Form == 0x00 {
+			switch {
+			case bareString(ty):
+				return append([]byte{tagInlineBare}, u.inlinePayload()...), nil
+			case u.bare:
+				out := appendU16([]byte{0x00}, uint16(len(u.Comp)))
+				return append(out, u.Comp...), nil
+			}
 			return append([]byte{0x00}, u.Comp...), nil
 		}
 		r, err := src.resident(ty, v)
 		if err != nil {
 			return nil, err
+		}
+		if bareString(ty) {
+			return append([]byte{tagInlineBare}, encodeValue(ty, r)[3:]...), nil
 		}
 		return encodeValue(ty, r), nil
 	}
@@ -3751,12 +3789,12 @@ func planBlock(plan *recordPlan, c int, u *Unfetched, src *chainSource) ([]byte,
 //	          NULL) + N×width dense UNTAGGED slots (a NULL slot zero-filled), or — variable-width —
 //	          an N-entry u32 end-offset value directory + the tagged value bodies (NULL = a
 //	          zero-length span)
-func encodeLeafPAX(colTypes []colType, keys [][]byte, rows []storedRow, seal sealer, take func() uint32, ovf *[]dirtyPage, src *chainSource) ([]byte, error) {
-	return encodeLeafPAXMemo(colTypes, keys, rows, seal, take, ovf, src, nil)
+func encodeLeafPAX(colTypes []colType, keyLen int, keys [][]byte, rows []storedRow, seal sealer, take func() uint32, ovf *[]dirtyPage, src *chainSource) ([]byte, error) {
+	return encodeLeafPAXMemo(colTypes, keyLen, keys, rows, seal, take, ovf, src, nil)
 }
 
 // encodeLeafPAXMemo is encodeLeafPAX planning each record with the table store's compression memo.
-func encodeLeafPAXMemo(colTypes []colType, keys [][]byte, rows []storedRow, seal sealer, take func() uint32, ovf *[]dirtyPage, src *chainSource, memo *compressMemo) ([]byte, error) {
+func encodeLeafPAXMemo(colTypes []colType, keyLen int, keys [][]byte, rows []storedRow, seal sealer, take func() uint32, ovf *[]dirtyPage, src *chainSource, memo *compressMemo) ([]byte, error) {
 	n := len(keys)
 	k := len(colTypes)
 	// Encode each value in (record, column) order; overflow chains allocate here. A fixed-width
@@ -3800,7 +3838,8 @@ func encodeLeafPAXMemo(colTypes []colType, keys [][]byte, rows []storedRow, seal
 	// directory entry as a u16.
 	dw := 4
 	out := []byte{}
-	if flags := leafLayoutFlags(); flags != 0 {
+	flags := leafFlagsFor(keyLen)
+	if flags != 0 {
 		out = append(out, flags)
 	}
 	if leafNarrow {
@@ -3814,10 +3853,19 @@ func encodeLeafPAXMemo(colTypes []colType, keys [][]byte, rows []storedRow, seal
 		return appendU32(b, uint32(v))
 	}
 	// key directory (N end offsets) + key blob.
-	off := 0
-	for i := 0; i < n; i++ {
-		off += len(keys[i])
-		out = appendDir(out, off)
+	if flags&leafLayoutFixedKey != 0 {
+		out = append(out, byte(keyLen>>8), byte(keyLen))
+		for i := 0; i < n; i++ {
+			if len(keys[i]) != keyLen {
+				return nil, newError(DataCorrupted, "a key's length is not its tree's fixed key length")
+			}
+		}
+	} else {
+		off := 0
+		for i := 0; i < n; i++ {
+			off += len(keys[i])
+			out = appendDir(out, off)
+		}
 	}
 	for i := 0; i < n; i++ {
 		out = append(out, keys[i]...)
@@ -5714,6 +5762,8 @@ type paxLeaf struct {
 	regions []paxRegion
 	// dw is the byte width of a directory entry: 4, or 2 in the narrow layout (leaf_narrow.go).
 	dw int
+	// keyLen, when nonzero, is the one length of every key: the page has no key directory.
+	keyLen int
 }
 
 // paxDirEnd reads entry i from a directory that parsePaxLeaf already validated in full. Keeping
@@ -5745,8 +5795,9 @@ func parsePaxLeaf(payload []byte, n int, colTypes []colType) (*paxLeaf, error) {
 	// nonzero first byte names another layout.
 	dw := 4
 	elide := false
+	keyLen := 0
 	if n > 0 && len(payload) > 0 && payload[0] != 0 {
-		if payload[0]&^(leafLayoutNarrow|leafLayoutElideKey) != 0 {
+		if payload[0]&^(leafLayoutNarrow|leafLayoutElideKey|leafLayoutFixedKey) != 0 {
 			return nil, newError(DataCorrupted, "unknown leaf layout")
 		}
 		pos = 1
@@ -5754,6 +5805,16 @@ func parsePaxLeaf(payload []byte, n int, colTypes []colType) (*paxLeaf, error) {
 			dw = 2
 		}
 		elide = payload[0]&leafLayoutElideKey != 0
+		if payload[0]&leafLayoutFixedKey != 0 {
+			kl, err := readU16(payload, &pos)
+			if err != nil {
+				return nil, err
+			}
+			if kl == 0 {
+				return nil, newError(DataCorrupted, "PAX leaf fixed key length is zero")
+			}
+			keyLen = int(kl)
+		}
 	}
 	readDir := func(pos *int) (uint32, error) {
 		if dw == 2 {
@@ -5764,7 +5825,10 @@ func parsePaxLeaf(payload []byte, n int, colTypes []colType) (*paxLeaf, error) {
 	}
 	keyDir := pos
 	prev := uint32(0)
-	for i := 0; i < n; i++ {
+	if keyLen > 0 {
+		prev = uint32(n * keyLen)
+	}
+	for i := 0; i < n && keyLen == 0; i++ {
 		e, err := readDir(&pos)
 		if err != nil {
 			return nil, err
@@ -5812,7 +5876,10 @@ func parsePaxLeaf(payload []byte, n int, colTypes []colType) (*paxLeaf, error) {
 			at := int(ty.keyAt) - 1
 			lo := 0
 			for i := 0; i < n; i++ {
-				hi := int(paxDirEnd(keyEnd, i, dw))
+				hi := lo + keyLen
+				if keyLen == 0 {
+					hi = int(paxDirEnd(keyEnd, i, dw))
+				}
 				if lo+at+w > hi {
 					return nil, newError(DataCorrupted, "PAX leaf key too short for its key column")
 				}
@@ -5856,11 +5923,14 @@ func parsePaxLeaf(payload []byte, n int, colTypes []colType) (*paxLeaf, error) {
 		}
 		start = end
 	}
-	return &paxLeaf{keyBlob: keyBytes, keyEnd: keyEnd, regions: regions, dw: dw}, nil
+	return &paxLeaf{keyBlob: keyBytes, keyEnd: keyEnd, regions: regions, dw: dw, keyLen: keyLen}, nil
 }
 
 // key returns record i's key as a borrowed span of the retained page block.
 func (l *paxLeaf) key(i int) []byte {
+	if l.keyLen > 0 {
+		return l.keyBlob[i*l.keyLen : (i+1)*l.keyLen]
+	}
 	lo := uint32(0)
 	if i > 0 {
 		lo = paxDirEnd(l.keyEnd, i-1, l.dw)
@@ -6720,6 +6790,15 @@ func readValueLazy(types []colType, c int, buf []byte, pos *int, pcap pageCap, p
 			return Value{Kind: ValUnfetched, ref: &Unfetched{Form: 0x00, Comp: span, types: types, typeIdx: c}}, nil
 		}
 		return readInlineBody(ty, buf, pos, decodeConstruct)
+	case tagInlineBare:
+		// An inline string stored without its length: the rest of the span is the payload
+		// (leaf_narrow.go). Deferred like the 0x00 form, as a view of the page.
+		if !stringPayload(ty) {
+			return Value{}, newError(DataCorrupted, "bare inline form on a non-string column")
+		}
+		span := buf[*pos:]
+		*pos = len(buf)
+		return Value{Kind: ValUnfetched, ref: &Unfetched{Form: 0x00, Comp: span, bare: true, types: types, typeIdx: c}}, nil
 	case 0x01:
 		return NullValue(), nil
 	case tagExternal:
@@ -6785,6 +6864,9 @@ func resolveUnfetched(ty colType, u *Unfetched, fetch func(pageRef) ([]byte, err
 	case 0x00:
 		// Inline-deferred (lazy-record.md §5b, L2): the bytes are already owned — no chain read, no
 		// decompression. Re-run the decoder over the captured span in construct mode.
+		if u.bare {
+			return valueFromPayload(ty, u.Comp)
+		}
 		p := 0
 		return readInlineBody(ty, u.Comp, &p, decodeConstruct)
 	case tagExternal:
@@ -6926,6 +7008,13 @@ func readValue(ty colType, buf []byte, pos *int, fetch func(uint32) ([]byte, err
 	switch tag {
 	case 0x00:
 		return readInlineBody(ty, buf, pos, decodeConstruct)
+	case tagInlineBare:
+		if !stringPayload(ty) {
+			return Value{}, newError(DataCorrupted, "bare inline form on a non-string column")
+		}
+		payload := buf[*pos:]
+		*pos = len(buf)
+		return valueFromPayload(ty, payload)
 	case 0x01:
 		return NullValue(), nil
 	case tagExternal:

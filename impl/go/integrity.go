@@ -1274,6 +1274,11 @@ func decodeIntegrityValue(ty colType, raw []byte, fetch func(pageRef) ([]byte, e
 	switch tag {
 	case 0x00:
 		return readInlineBody(ty, raw, &pos, decodeConstruct)
+	case tagInlineBare:
+		if !stringPayload(ty) {
+			return Value{}, newError(DataCorrupted, "bare inline form on a non-string column")
+		}
+		return valueFromPayload(ty, raw[pos:])
 	case 0x01:
 		return NullValue(), nil
 	case tagExternal, tagExternalComp:

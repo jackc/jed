@@ -1136,6 +1136,7 @@ func (s *snapshot) putTableResolved(t *catTable, colTypes []colType, pageSize ui
 	s.bumpCatGen()
 	key := t.Name
 	st := newTableStore(s.capFor(pageSize), markKeyColumns(colTypes, t.PK))
+	st.shape.keyLen = tableKeyLen(colTypes, t.PK)
 	// Bind the domain's pager (snapshot.storePaging) so the new store demand-pages like a loaded one:
 	// its committed leaves demote at each commit (demoteCleanLeaves) and fault back through the pool,
 	// instead of staying fully-resident decoded for the handle's lifetime. nil only on a bare scratch
@@ -1581,6 +1582,7 @@ func (s *snapshot) gistTreeFor(nameKey string) *gistTree { return s.gistTrees[na
 func (s *snapshot) emptied(cap pageCap, paging *sharedPaging) *snapshot {
 	empty := func(store *tableStore) *tableStore {
 		fresh := newTableStore(cap, store.colTypes)
+		fresh.shape.keyLen = store.shape.keyLen
 		fresh.BumpRowidTo(store.nextRowid)
 		fresh.attachPaging(paging)
 		return fresh
