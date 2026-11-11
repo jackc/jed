@@ -32243,7 +32243,7 @@ export function orderFilterConjuncts(e: RExpr): RExpr {
 
 // hasCorrelatedSubquery reports whether e contains a subquery that is re-run per row (one that
 // references this query level or an enclosing one, so the uncorrelated fold leaves it in place).
-function hasCorrelatedSubquery(e: RExpr): boolean {
+export function hasCorrelatedSubquery(e: RExpr): boolean {
   if (e.kind === "subquery" && queryPlanReferencesOuter(e.plan, 0)) return true;
   if (e.kind === "and" || e.kind === "or") {
     // A left-deep AND / OR chain (an IN list's desugar, grammar.md §20) is walked along its left

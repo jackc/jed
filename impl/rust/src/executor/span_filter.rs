@@ -83,7 +83,16 @@ impl ScratchRow {
 /// predicate the span compiler cannot help with.
 pub(crate) enum LaneFilter<'a> {
     Span(SpanPred<'a>),
-    Plain { expr: &'a RExpr, cols: Vec<usize> },
+    /// `resolve`: the filter holds a correlated subquery, which reads the scratch row as its outer
+    /// row — and an outer row's values reach consumers that bypass the evaluator's resolve-on-touch
+    /// backstop (a correlated key/index bound encodes the outer value directly). So the fill resolves
+    /// deferred values, as the row path's touched-set resolve does (an unmetered fetch, so cost is
+    /// unchanged).
+    Plain {
+        expr: &'a RExpr,
+        cols: Vec<usize>,
+        resolve: bool,
+    },
 }
 
 impl<'a> LaneFilter<'a> {
@@ -100,6 +109,7 @@ impl<'a> LaneFilter<'a> {
         LaneFilter::Plain {
             expr: filter,
             cols: (0..mask.len()).filter(|&c| mask[c]).collect(),
+            resolve: has_correlated_subquery(filter),
         }
     }
 
@@ -115,9 +125,18 @@ impl<'a> LaneFilter<'a> {
         scratch.next_record();
         match self {
             LaneFilter::Span(p) => p.eval_filter(node, i, scratch, env, m),
-            LaneFilter::Plain { expr, cols } => {
+            LaneFilter::Plain {
+                expr,
+                cols,
+                resolve,
+            } => {
                 for &c in cols {
-                    scratch.vals[c] = node.col_at(i, c)?;
+                    scratch.vals[c] = match node.col_at(i, c)? {
+                        Value::Unfetched(u) if *resolve => {
+                            crate::format::resolve_unfetched_self(&u)?
+                        }
+                        v => v,
+                    };
                 }
                 scratch.all_filled = scratch.generation;
                 expr.eval_filter(&scratch.vals, env, m)

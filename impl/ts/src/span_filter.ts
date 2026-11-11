@@ -21,7 +21,7 @@ import {
   operatorCost,
   synchronousEvalEnv,
 } from "./eval.ts";
-import { collectTouched, type EvalEnv, type RExpr } from "./executor.ts";
+import { collectTouched, type EvalEnv, hasCorrelatedSubquery, type RExpr } from "./executor.ts";
 import { encodeValue, fixedValueWidth, resolveUnfetchedSelfSteps } from "./format.ts";
 import { colAt, type PNode, type Span } from "./pmap.ts";
 import type { Row } from "./storage.ts";
@@ -105,10 +105,14 @@ export function laneReuse(colTypes: ColType[], filtered: boolean): boolean[] {
 // LaneFilter is a lane's compiled WHERE: the span evaluator when the predicate has at least one span
 // atom, else the original lane filter — every touched column read into the scratch row (a deferred
 // value resolves when the evaluator touches it), then evalFilter — which is cheaper for a predicate
-// the span compiler cannot help with.
+// the span compiler cannot help with. A plain filter's `resolve`: it holds a correlated subquery,
+// which reads the scratch row as its outer row — and an outer row's values reach consumers that
+// bypass the evaluator's resolve-on-touch backstop (a correlated key/index bound encodes the outer
+// value directly). So the fill resolves deferred values, as the row path's resolveColumns does for
+// the same touched set (an unmetered fetch, so cost is unchanged).
 export type LaneFilter =
   | { kind: "span"; pred: SpanPred }
-  | { kind: "plain"; expr: RExpr; cols: number[] };
+  | { kind: "plain"; expr: RExpr; cols: number[]; resolve: boolean };
 
 export function compileLaneFilter(
   filter: RExpr,
@@ -120,7 +124,7 @@ export function compileLaneFilter(
   if (hasAtom(pred)) return { kind: "span", pred };
   const cols: number[] = [];
   for (let c = 0; c < mask.length; c++) if (mask[c]) cols.push(c);
-  return { kind: "plain", expr: filter, cols };
+  return { kind: "plain", expr: filter, cols, resolve: hasCorrelatedSubquery(filter) };
 }
 
 // laneKeep reports whether record i of n passes, starting a new scratch record.
@@ -135,6 +139,12 @@ export function* laneKeepSteps(
   scratch.nextRecord();
   if (f.kind === "span") return yield* spanEvalFilterSteps(f.pred, n, i, scratch, env, m);
   scratch.fillAll(n, i, f.cols);
+  if (f.resolve) {
+    for (const c of f.cols) {
+      const v = scratch.vals[c];
+      if (v.kind === "unfetched") scratch.vals[c] = yield* resolveUnfetchedSelfSteps(v.ref);
+    }
+  }
   return yield* evalFilterSteps(f.expr, scratch.vals, env, m);
 }
 

@@ -1984,7 +1984,7 @@ fn flatten_and_owned(e: RExpr, out: &mut Vec<RExpr>) {
 
 /// Whether `e` contains a subquery that is re-run per row (one that references this query level or
 /// an enclosing one, so the uncorrelated fold leaves it in place).
-fn has_correlated_subquery(e: &RExpr) -> bool {
+pub(crate) fn has_correlated_subquery(e: &RExpr) -> bool {
     if let RExpr::Subquery { plan, .. } = e
         && query_plan_references_outer(plan, 0)
     {

@@ -103,13 +103,19 @@ type laneFilter struct {
 	span  *spanPred
 	plain *rExpr
 	cols  []int
+	// resolve: the plain filter holds a correlated subquery, which reads the scratch row as its
+	// outer row — and an outer row's values reach consumers that bypass the evaluator's
+	// resolve-on-touch backstop (a correlated key/index bound encodes the outer value directly). So
+	// the fill resolves deferred values, as the row path's resolveColumns does for the same touched
+	// set (an unmetered fetch, so cost is unchanged).
+	resolve bool
 }
 
 func compileLaneFilter(filter *rExpr, colTypes []colType, mask []bool, env *evalEnv) *laneFilter {
 	if p := compileSpanPred(filter, colTypes, mask, env); p.hasAtom() {
 		return &laneFilter{span: p}
 	}
-	f := &laneFilter{plain: filter}
+	f := &laneFilter{plain: filter, resolve: hasCorrelatedSubquery(filter)}
 	for c := range mask {
 		if mask[c] {
 			f.cols = append(f.cols, c)
@@ -128,6 +134,11 @@ func (f *laneFilter) keep(n *pnode, i int, scratch *scratchRow, env *evalEnv, m 
 		v, err := n.colAt(i, c)
 		if err != nil {
 			return false, err
+		}
+		if f.resolve && v.Kind == ValUnfetched {
+			if v, err = resolveUnfetchedSelf(v.unfetched()); err != nil {
+				return false, err
+			}
 		}
 		scratch.vals[c] = v
 	}
