@@ -1504,7 +1504,10 @@ impl Engine {
             _ => len,
         };
         acct.release(acct.measure_rows(&rows[..start]) + acct.measure_rows(&rows[end..]));
-        let rows = rows[start..end].to_vec();
+        // The window moves out of the combined rows in place (no copy beside them).
+        let mut rows = rows;
+        rows.truncate(end);
+        rows.drain(..start);
         if let Some(profile) = self.explain_actual.borrow_mut().as_mut() {
             profile.record_parent(root_node.to_string(), cost);
         }

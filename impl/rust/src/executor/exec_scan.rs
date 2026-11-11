@@ -2702,7 +2702,7 @@ impl Engine {
                 // row, exactly the Project drive over a bare-column projection (whose eval is a zero-cost slot
                 // read).
                 Emitter::Columnar {
-                    cols,
+                    mut cols,
                     proj_cols,
                     start,
                     end,
@@ -2712,10 +2712,7 @@ impl Engine {
                     for j in start..end {
                         meter.checkpoint()?; // enforce the cost ceiling per produced row (CLAUDE.md §13)
                         meter.charge(COSTS.row_produced);
-                        let mut o = Vec::with_capacity(proj_cols.len());
-                        for &c in &proj_cols {
-                            o.push(cols[c][j].clone());
-                        }
+                        let o = take_columnar_row(&mut cols, &proj_cols, j);
                         meter.admit_row(&o)?; // the buffered result collector (memory.md §5.1)
                         out.push(o);
                     }

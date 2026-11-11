@@ -793,11 +793,7 @@ impl crate::cursor::RowStream for BufferedScan {
                 *idx += 1;
                 self.meter.checkpoint()?; // enforce the cost ceiling / cancellation per produced row
                 self.meter.charge(COSTS.row_produced);
-                let mut out = Vec::with_capacity(proj_cols.len());
-                for &c in proj_cols.iter() {
-                    out.push(cols[c][j].clone());
-                }
-                Ok(Some(out))
+                Ok(Some(take_columnar_row(cols, proj_cols, j)))
             }
         }
     }
@@ -1477,4 +1473,20 @@ pub(crate) fn expand_group_by(items: &[GroupItem]) -> Result<Vec<Vec<&Expr>>> {
 pub(crate) enum GroupKeyResolved {
     Column(usize),
     Expr(RExpr, ResolvedType, Expr),
+}
+
+/// Output row `j` of a columnar emission (packed-leaf.md §11 Tracks A2–A4), gathered from the dense
+/// lanes. Each emission reads row `j` once, so a lane value moves out on its last use in `proj_cols`
+/// rather than being cloned beside the lane; only a column projected more than once is cloned. The
+/// lanes' query-memory charge is a held total, so moving values out changes no charge.
+pub(crate) fn take_columnar_row(cols: &mut [Vec<Value>], proj_cols: &[usize], j: usize) -> Row {
+    let mut out = Vec::with_capacity(proj_cols.len());
+    for (k, &c) in proj_cols.iter().enumerate() {
+        if proj_cols[k + 1..].contains(&c) {
+            out.push(cols[c][j].clone());
+        } else {
+            out.push(std::mem::replace(&mut cols[c][j], Value::Null));
+        }
+    }
+    out
 }
