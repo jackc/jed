@@ -1371,3 +1371,248 @@ func TestRegionEngineExperiment(t *testing.T) {
 		os.Remove(path)
 	}
 }
+
+// TestTableSymExperiment compares a symbol table per leaf region with one per column of a table,
+// trained from all of the column's values, from an even sample, or from its first tenth (in key
+// order) only. It collects plain regions, so run it with the leaf switches off. Sizes are a region's
+// bytes after its flags byte; a per-column table's own bytes are counted once.
+//
+//	JED_FORMAT_EXP=1 JED_REGION_PAGES=4096,8192,16384,32768,65536 go test -run TestTableSymExperiment -v -timeout 60m .
+func TestTableSymExperiment(t *testing.T) {
+	if os.Getenv("JED_FORMAT_EXP") == "" {
+		t.Skip("set JED_FORMAT_EXP=1")
+	}
+	if leafNarrow {
+		t.Fatal("run with the leaf switches off")
+	}
+	dir := os.Getenv("JED_FORMAT_EXP_DIR")
+	if dir == "" {
+		dir = t.TempDir()
+	}
+	sizes := []uint32{DefaultPageSize}
+	if v := os.Getenv("JED_REGION_PAGES"); v != "" {
+		sizes = nil
+		for _, f := range strings.Split(v, ",") {
+			var n uint32
+			fmt.Sscanf(f, "%d", &n)
+			sizes = append(sizes, n)
+		}
+	}
+	var dict ccBytes
+	for _, c := range ccBytesCodecs {
+		if c.name == "dict8" {
+			dict = c
+		}
+	}
+	spans := func(lf *ccLeaf) [][]byte {
+		out := make([][]byte, 0, lf.n)
+		lo := 0
+		for _, e := range lf.ends {
+			out = append(out, lf.body[lo:e])
+			lo = int(e)
+		}
+		return out
+	}
+	const (
+		sPlain = iota
+		sDict
+		sLeaf
+		sAll
+		s256
+		s64
+		sFirst
+		sFsst
+		sEither
+		sBoth
+		nStrat
+	)
+	names := [nStrat]string{"plain", "+ dictionary", "+ per-leaf table", "+ per-column table, all values", "+ per-column table, 256 KiB sample",
+		"+ per-column table, 64 KiB sample", "+ per-column table, first tenth", "+ per-column FSST table, 256 KiB sample",
+		"+ either per-column table (256 KiB)", "+ per-column (256 KiB) or per-leaf"}
+	totals := map[uint32]*[nStrat]int{}
+	type colRow struct {
+		name string
+		bv   map[uint32][6]float64 // plain, dict, leaf, all, 256K: bytes per value where each applies alone
+		syms map[uint32][2]int     // symbols and table bytes of the all-values table
+	}
+	var colOrder []string
+	rows := map[string]*colRow{}
+	for _, ps := range sizes {
+		path := filepath.Join(dir, fmt.Sprintf("tsym%d.jed", ps))
+		os.Remove(path)
+		os.RemoveAll(path + ".lock")
+		db := expBuild(t, path, ps)
+		expExtra(t, db)
+		if err := db.Compact("main"); err != nil {
+			t.Fatal(err)
+		}
+		cols, _ := ccCollect(t, db)
+		db.Close()
+		os.Remove(path)
+		tot := &[nStrat]int{}
+		totals[ps] = tot
+		for _, col := range cols {
+			if col.kind != ccKindBytes || col.w > 0 || col.elemWidth != 0 || col.rows == 0 {
+				continue
+			}
+			name := col.tree + "." + col.name
+			if rows[name] == nil {
+				rows[name] = &colRow{name: name, bv: map[uint32][6]float64{}, syms: map[uint32][2]int{}}
+				colOrder = append(colOrder, name)
+			}
+			leafSpans := make([][][]byte, len(col.leaves))
+			bytesAll := 0
+			for i := range col.leaves {
+				leafSpans[i] = spans(&col.leaves[i])
+				bytesAll += len(col.leaves[i].body)
+			}
+			sample := func(target int) [][]byte {
+				stride := max(1, bytesAll/target)
+				var out [][]byte
+				for i := 0; i < len(leafSpans); i += stride {
+					out = append(out, leafSpans[i]...)
+				}
+				return out
+			}
+			var all [][]byte
+			for _, sp := range leafSpans {
+				all = append(all, sp...)
+			}
+			var first [][]byte
+			for i := 0; i < max(1, len(leafSpans)/10); i++ {
+				first = append(first, leafSpans[i]...)
+			}
+			// FSST as published, trained on the 256 KiB sample: every code a symbol, a literal escaped.
+			var fs *stTable
+			{
+				var ends []uint16
+				var body []byte
+				for _, sp := range sample(256 << 10) {
+					if len(body)+len(sp) > 0xffff {
+						break // stBuild takes u16 ends: train on the first 64 KiB of the sample
+					}
+					body = append(body, sp...)
+					ends = append(ends, uint16(len(body)))
+				}
+				fs = stBuild(ends, body, true, 255)
+			}
+			fsSize := 1 + len(fs.syms)
+			for _, sy := range fs.syms {
+				fsSize += len(sy)
+			}
+			tabs := [4]*symTable{trainSym(all), trainSym(sample(256 << 10)), trainSym(sample(64 << 10)), trainSym(first)}
+			var alone [6]int
+			var perStrat [nStrat]int
+			for i := range col.leaves {
+				lf := &col.leaves[i]
+				n := lf.n
+				plain := 2*n + len(lf.body)
+				best := func(a ...int) int {
+					m := plain
+					for _, x := range a {
+						if x > 0 && x < m {
+							m = x
+						}
+					}
+					return m
+				}
+				d := 0
+				if _, size, ok := dict.enc(lf.ends, lf.body); ok {
+					d = size
+				}
+				coded := func(tb *symTable, own bool) int {
+					if tb == nil || len(tb.syms) == 0 {
+						return 0
+					}
+					size := (n+7)/8 + 2*n
+					if own {
+						size += tb.size
+					}
+					for _, sp := range leafSpans[i] {
+						size += tb.encLen(sp)
+					}
+					return size
+				}
+				leafT := coded(trainSym(leafSpans[i]), true)
+				var tb [4]int
+				for k := range tabs {
+					tb[k] = coded(tabs[k], false)
+				}
+				fsst := 0
+				if len(fs.syms) > 0 {
+					fsst = (n+7)/8 + 2*n
+					for _, sp := range leafSpans[i] {
+						for at := 0; at < len(sp); {
+							u, l := fs.match(sp, at, len(sp))
+							fsst++
+							if u < 256 {
+								fsst++
+							}
+							at += l
+						}
+					}
+				}
+				alone[5] += best(fsst)
+				perStrat[sFsst] += best(d, fsst)
+				perStrat[sEither] += best(d, fsst, tb[1])
+				alone[0] += plain
+				alone[1] += best(d)
+				alone[2] += best(leafT)
+				alone[3] += best(tb[0])
+				alone[4] += best(tb[1])
+				perStrat[sPlain] += plain
+				perStrat[sDict] += best(d)
+				perStrat[sLeaf] += best(d, leafT)
+				perStrat[sAll] += best(d, tb[0])
+				perStrat[s256] += best(d, tb[1])
+				perStrat[s64] += best(d, tb[2])
+				perStrat[sFirst] += best(d, tb[3])
+				perStrat[sBoth] += best(d, tb[1], leafT)
+			}
+			for k, s := range []int{sAll, s256, s64, sFirst} {
+				if tabs[k] != nil {
+					perStrat[s] += tabs[k].size
+				}
+			}
+			if tabs[1] != nil {
+				perStrat[sBoth] += tabs[1].size
+				perStrat[sEither] += tabs[1].size
+			}
+			perStrat[sFsst] += fsSize
+			perStrat[sEither] += fsSize
+			for s := range perStrat {
+				tot[s] += perStrat[s]
+			}
+			var bv [6]float64
+			for k := range alone {
+				bv[k] = float64(alone[k]) / float64(col.rows)
+			}
+			rows[name].bv[ps] = bv
+			if tabs[0] != nil {
+				rows[name].syms[ps] = [2]int{len(tabs[0].syms), tabs[0].size}
+			}
+		}
+	}
+	fmt.Printf("\nbytes per value: plain | dictionary | per-leaf table | per-column table (all values) | per-column table (256 KiB sample) | per-column FSST table\n")
+	for _, name := range colOrder {
+		fmt.Printf("%-28s", name)
+		for _, ps := range sizes {
+			b := rows[name].bv[ps]
+			fmt.Printf(" | %2dK: %6.1f %6.1f %6.1f %6.1f %6.1f %6.1f", ps/1024, b[0], b[1], b[2], b[3], b[4], b[5])
+		}
+		sy := rows[name].syms[sizes[0]]
+		fmt.Printf("   (%d symbols, %d B)\n", sy[0], sy[1])
+	}
+	fmt.Printf("\nall such columns, MB, each region on the smallest encoding the strategy allows\n%-42s", "")
+	for _, ps := range sizes {
+		fmt.Printf(" %7dK", ps/1024)
+	}
+	fmt.Println()
+	for s := 0; s < nStrat; s++ {
+		fmt.Printf("%-42s", names[s])
+		for _, ps := range sizes {
+			fmt.Printf(" %8.1f", float64(totals[ps][s])/(1<<20))
+		}
+		fmt.Println()
+	}
+}

@@ -269,7 +269,7 @@ type symTrain struct {
 	seenN  [512]uint8
 }
 
-const symPairSlots = 1 << 14
+const symPairSlots = 1 << 16
 
 // symGain is a candidate symbol: its bytes big-endian and left-aligned (so integer order is byte
 // order), its length, and the bytes it would save.
@@ -353,7 +353,7 @@ func trainSym(payloads [][]byte) *symTable {
 				t.c1[u]++
 				if prev >= 0 && !full {
 					k := uint32(prev)<<16 | uint32(u) | 1<<31 // never 0
-					h := (k * 2654435761) >> 18
+					h := (k * 2654435761) >> 16
 					for t.keys[h] != 0 && t.keys[h] != k {
 						h = (h + 1) & (symPairSlots - 1)
 					}

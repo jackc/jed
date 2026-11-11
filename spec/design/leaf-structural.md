@@ -534,9 +534,9 @@ commit before this step. The disk-mode corpus and the randomized comparison test
   The paths that only measure or copy its bytes (planning a record's size, spilling a sort run) see
   an empty body first.
 - The commit path codes a touched leaf twice, once to measure it and once to write it.
-- The table is per leaf. A table per column in the catalog would remove the per-page table and train
-  on more data ([leaf-encodings-experiment.md](leaf-encodings-experiment.md) §8.2: the per-page table
-  is why 64 KiB pages compress 30% better); not measured.
+- The table is per leaf. One table per column, stored once, measures a third smaller at 8 KiB and
+  makes page size irrelevant to the ratio ([leaf-encodings-experiment.md](leaf-encodings-experiment.md)
+  §8.8); it is not built, and how a table is replaced as data drifts is undecided.
 - A rebuilt region is extra resident memory outside the page-cache budget.
 - A decoded leaf measures a value as inline-plain from the process's own header form. A page written
   under other switches is read correctly but could be measured differently.

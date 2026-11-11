@@ -327,3 +327,66 @@ engine measurements.
   documents will differ. The jsonb key share in finding 7 is an estimate from the generator.
 - The huf size charges a packed code-length table and a one-byte value length that the test buffer
   holds in a wider form.
+
+### 8.8 A symbol table per column, not per leaf
+
+`TestTableSymExperiment`, same database, leaf switches off. For every variable-width column other
+than the integer arrays it compares the engine's per-leaf table (§8.6, [leaf-structural.md](leaf-structural.md)
+§10) with one table per column of a table, shared by all its leaves and counted once. A region is
+its bytes after the flags byte; each region takes the smallest encoding the strategy allows. The
+total differs from §8.2's because the integer arrays are left out.
+
+| MB | 4 KiB | 8 KiB | 16 KiB | 32 KiB | 64 KiB |
+|---|---|---|---|---|---|
+| plain | 94.6 | 94.6 | 94.6 | 94.6 | 94.6 |
+| dictionary | 85.0 | 82.1 | 78.9 | 77.5 | 75.2 |
+| dictionary + per-leaf table | 68.1 | 59.6 | 52.0 | 47.7 | 45.3 |
+| dictionary + per-column table, trained on all values | 41.4 | 41.0 | 40.7 | 40.6 | 40.3 |
+| the same, trained on a 256 KiB sample | 41.1 | 40.7 | 40.3 | 40.3 | 39.9 |
+| the same, trained on a 64 KiB sample | 41.1 | 40.6 | 40.7 | 40.3 | 40.1 |
+| the same, trained on the first tenth of the leaves | 41.3 | 40.9 | 40.6 | 40.5 | 40.1 |
+| dictionary + per-column FSST table (64 KiB of the sample) | 33.7 | 33.5 | 33.0 | 33.2 | 32.8 |
+
+Bytes per value at 8 KiB:
+
+| column | plain | dictionary | per-leaf | per-column | per-column FSST |
+|---|---|---|---|---|---|
+| `activity.message` (prose) | 90.2 | 90.2 | 79.6 | 58.9 | 55.9 |
+| `activity.path` | 54.7 | 54.7 | 47.3 | 21.1 | 20.3 |
+| `activity.attrs` (`jsonb`, varied keys) | 184.2 | 184.2 | 133.5 | 143.5 | 86.6 |
+| `users.email` | 34.5 | 34.5 | 26.8 | 11.0 | 10.5 |
+| `users.settings` (`jsonb`, one template) | 90.0 | 85.1 | 30.8 | 13.7 | 13.5 |
+| `sessions.user_agent` | 117.8 | 53.8 | 37.1 | 17.0 | 17.0 |
+| `line_items.sku` | 20.0 | 19.3 | 11.0 | 6.0 | 5.9 |
+| `sessions.ip` | 18.3 | 18.3 | 15.8 | 8.1 | 8.8 |
+| `orders.status` | 13.1 | 1.8 | 5.0 | 4.0 | 4.0 |
+
+Findings:
+
+1. **A per-column table is a third smaller than per-leaf tables at 8 KiB** (40.7 against 59.6 MB),
+   and smaller than per-leaf tables at 64 KiB (45.3 MB). It is what larger pages were buying.
+2. **Page size stops mattering.** The per-column rows move 3% from 4 to 64 KiB.
+3. **A 64 KiB sample is enough.** Training on all values is no better; it is slightly worse here
+   because the trainer stops counting new pairs when its pair table fills.
+4. **With the table stored once, FSST as published is better again** (33.5 MB). Its 255 symbols
+   include single bytes, which a per-leaf table cannot afford. The gain is nearly all the
+   varied-key `jsonb` column: binary `jsonb` uses most byte values, so the literal-preserving table
+   finds 15 free codes and saves 22%, and FSST saves 53%. The other columns differ by a few percent.
+5. **The dictionary still wins low-cardinality columns** (`status`, `currency`, `country`) and
+   stays.
+6. **Short strings gain the most**: names, emails, SKUs and paths drop to 26% to 39% of plain,
+   where a per-leaf table left them at 55% to 88%.
+
+Not measured, and what decides this:
+
+- **Drift.** The generator's values have the same distribution from first row to last, so the
+  first-tenth row shows only that a small early sample suffices on stationary data. Real columns
+  change; a table trained once can go stale, and the remedy (a new table version, old pages keeping
+  the old one, or a rewrite) is the design work.
+- **The generated data flatters a shared table**: most columns are drawn from pools the whole table
+  shares.
+- **Encode and decode time, and the engine.** A shared table removes per-leaf training and the
+  table load on a point read, and makes a leaf's size a function of its rows again (the per-leaf
+  open point of [leaf-structural.md](leaf-structural.md) §10). It adds a catalog object per column
+  that every page of the table depends on.
+
