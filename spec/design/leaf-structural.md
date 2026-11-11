@@ -534,12 +534,93 @@ commit before this step. The disk-mode corpus and the randomized comparison test
   The paths that only measure or copy its bytes (planning a record's size, spilling a sort run) see
   an empty body first.
 - The commit path codes a touched leaf twice, once to measure it and once to write it.
-- The table is per leaf. One table per column, stored once, measures a third smaller at 8 KiB and
-  makes page size irrelevant to the ratio ([leaf-encodings-experiment.md](leaf-encodings-experiment.md)
-  §8.8); it is not built, and how a table is replaced as data drifts is undecided.
+- The table is per leaf. §10.1 prototypes one table per column.
 - A rebuilt region is extra resident memory outside the page-cache budget.
 - A decoded leaf measures a value as inline-plain from the process's own header form. A page written
   under other switches is read correctly but could be measured differently.
+
+### 10.1 One table per column (prototyped)
+
+`JED_LEAF_SYM=column` keeps one symbol table per column of a table in place of one per leaf, after
+the measurement of [leaf-encodings-experiment.md](leaf-encodings-experiment.md) §8.8.
+
+**Page.** The region's flags byte is `5`: the layout of §10 without the table (raw bitmap, end
+offsets, stored bodies). The coding is the same.
+
+**Catalog.** A table's entry ends with a `u16` count and, per column that has a table, its `u16`
+ordinal and the table in the §10 layout (an empty table is two bytes). At run time the table hangs
+on the store's column type, beside the key-column mark of §4, so the encoder, the decoder and the
+size arithmetic all find it without new parameters.
+
+**Training.** Once per table, when an insert leaves its tree with 32 leaves (or a third level):
+from its rows in key order, up to 512 KiB of payload over the eligible columns. Tables are never
+replaced. A column where training finds no symbol gets an empty table, so training is not repeated.
+Leaves written before training stay plain until they are next written. A training in a transaction
+that rolls back leaves nothing: the tables belong to the writer's copy of the store, like its rows.
+
+**Size.** The saving is a sum over the leaf's inline values with no table term:
+
+```
+saving = Σ (header + payload − coded length) − ceil(N/8)
+```
+
+It is a function of the leaf's rows and the column's table, so the per-leaf rule's dependence on
+when a table was trained (§10, open points) does not arise, and a leaf is written coded whenever
+that is smaller, not only when it would not fit plain. A string column still takes the larger of
+this and the dictionary saving.
+
+**Result**, same database and method as §10, two alternating runs each; the baseline is steps 1–7
+plus typed arrays (step 9), one run:
+
+| | steps 1–7, 9 | per leaf | per column |
+|---|---|---|---|
+| compacted file | 160.4 MB | 126.9 MB | 116.2 MB |
+| file after the load | 191.6 MB | 152.1 MB | 139.2 MB |
+| tables trained | | 34,491 (4.1 s) | 17 (under 0.1 s) |
+| bulk load, earlier tables | 55.0 s | 55.4, 55.9 s | 55.0, 55.1 s |
+| bulk load, the two new tables | 7.1 s | 10.6, 10.8 s | 8.0, 8.1 s |
+| one-row update commit | 215 µs | 397, 425 µs | 458, 477 µs |
+| bytes written per update commit | 74,024 | 74,033 | 88,078 |
+| one-row append commit | 338 µs | 532, 543 µs | 626, 649 µs |
+
+- **The file is 8% smaller than with per-leaf tables**, 28% smaller than without symbol tables.
+  The symbol tables save 44 MB against the 41.5 MB the offline measurement predicted.
+- **Loading text costs 1 s over the baseline** where per-leaf tables cost 3.6 s. Training is gone
+  from the profile; what remains is coding.
+- **One-row commits are slower than with per-leaf tables, and write 14 KB more.** The tables are in
+  the catalog, and every commit rewrites the catalog. They belong in pages of their own that are
+  written once (open point).
+- Scans and point lookups were within noise of the per-leaf runs. The ten aggregate queries return
+  the same values.
+- **The sample hardly matters:** training at 8, 32 and 128 leaves gave 116.3, 116.2 and 117.9 MB
+  (the last leaves more leaves plain); at 512 leaves 124.7 MB.
+
+**What was run**, Go core, steps 1–7 and 9 on with `JED_LEAF_SYM=column`:
+`mise run sim:sweep 1..100 all go` (2,200 traces pass); `TestColumnSymbolTablesSurviveChange`
+(a rolled-back training, deletes, updates, `ADD COLUMN`, two renames, an index, compaction and
+reopen, with an integrity check after each stage). The corpus in memory mode fails 24 of 752 files
+against 21: one `EXPLAIN` estimate, and two that open fixture files written without the catalog
+trailer. The unit tests fail 36 against 30: five read goldens or fixtures without the trailer, one
+asserts a leaf count. With the switches off only `TestConcatThreeForms` fails, as before. The
+per-leaf mode's unit failures are unchanged. The disk-mode corpus was not run.
+
+**Open points.**
+
+- **Tables in the catalog are rewritten by every commit.** They need their own pages, referenced
+  from the entry, which the reachability, live-count, compaction and encryption walks must then
+  know.
+- **Drift.** A table is trained once from the first rows and never replaced. Nothing here measures
+  data that changes, and replacing a table means versions (old pages keep the old table) or a
+  rewrite.
+- **A reader of the working store holding column types from before the training** cannot decode a
+  leaf written after it. A committed snapshot never reaches such a leaf; a cursor opened in the
+  training transaction before the training and read after a commit could. Not constructed or
+  tested.
+- **`jsonb` with varied keys does worse than per leaf** (few byte values are free, so the table
+  gets 15 symbols); FSST-style coding measured 40% smaller on that column (§8.8) and is not built.
+- **Tables are the first rows' in key order.** Compaction and rekey keep them; they do not retrain.
+- The trigger is stated as a leaf count, which a core reaches at the same insert only if the trees
+  are identical; they are, by the split rule, but the sample bound should be restated in rows.
 
 ## 11. Step 9: typed integer arrays (prototyped)
 

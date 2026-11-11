@@ -106,6 +106,9 @@ type defaultExprDef struct {
 type catTable struct {
 	Name    string
 	Columns []catColumn
+	// symTabs carries the per-column symbol tables a catalog entry held from decodeTableEntry to the
+	// store being loaded (PROTOTYPE, leaf_sym.go); nil otherwise.
+	symTabs []*symTable
 	// PK is the primary-key member column ordinals in KEY order (which may differ from
 	// declaration order — constraints.md §3; the v5 catalog persists this list). Empty =
 	// no primary key (synthetic rowid keys). The per-column PrimaryKey flag is derived
@@ -646,6 +649,10 @@ type colType struct {
 	// from the row's storage key: its key bytes start at offset keyAt−1 (PROTOTYPE, leaf_narrow.go).
 	// Set only on a table store's column types (markKeyColumns); it is not part of the type.
 	keyAt uint16
+	// sym, when set, is this table column's symbol table (PROTOTYPE, leaf_sym.go: JED_LEAF_SYM=column):
+	// one table for every leaf of the table, trained once and persisted in the table's catalog entry.
+	// Like keyAt it is set only on a table store's column types and is not part of the type.
+	sym *symTable
 }
 
 // valueType is this stored type as a SINGLE VALUE's codec type (format.md "Value codec"): the same

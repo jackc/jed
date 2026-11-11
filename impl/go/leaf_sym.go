@@ -34,6 +34,28 @@ import (
 // without the table is written without it.
 var leafSym = os.Getenv("JED_LEAF_SYM") == "on" && leafNarrow
 
+// leafSymCol (JED_LEAF_SYM=column, with JED_LEAF_NARROW=on) keeps one symbol table per column of a
+// table instead of one per leaf. The table is trained once, when the table's tree first has
+// symColLeaves leaves (or a third level), from its rows in key order up to symColSample bytes of
+// payload over the eligible columns; it is persisted in the table's catalog entry and never
+// replaced. A region written with it has the flags byte regionSymCol and the layout of regionSym
+// without the table. The saving is a sum over the leaf's values less the raw bitmap, so a leaf's
+// size is a function of its rows and its table's tables, and every leaf that is smaller coded is
+// written coded (the per-leaf rule that a leaf fitting as plain stays plain does not apply).
+var leafSymCol = os.Getenv("JED_LEAF_SYM") == "column" && leafNarrow
+
+var (
+	symColLeaves = envInt("JED_LEAF_SYM_COL_LEAVES", 32)
+	symColSample = envInt("JED_LEAF_SYM_COL_SAMPLE", 512<<10)
+)
+
+func envInt(name string, def int) int {
+	if n, err := strconv.Atoi(os.Getenv(name)); err == nil && n > 0 {
+		return n
+	}
+	return def
+}
+
 // leafArr (JED_LEAF_ARR=on, with JED_LEAF_NARROW=on) lets a leaf write a column of i16/i32/i64 arrays
 // as counts plus bit-packed offsets from the region's smallest element. The region's flags byte is
 // regionArr; then N count bytes (255 = NULL, 0 = the empty array), the smallest element at the
@@ -43,8 +65,9 @@ var leafSym = os.Getenv("JED_LEAF_SYM") == "on" && leafNarrow
 var leafArr = os.Getenv("JED_LEAF_ARR") == "on" && leafNarrow
 
 const (
-	regionSym byte = 3
-	regionArr byte = 4
+	regionSym    byte = 3
+	regionArr    byte = 4
+	regionSymCol byte = 5
 )
 
 const symMaxLen = 8
@@ -449,7 +472,7 @@ func trainSym(payloads [][]byte) *symTable {
 // column whose inline-plain value is a header then its content payload. Integer arrays take the
 // typed encoding instead.
 func symEligible(ty colType) bool {
-	if !leafSym || !isSpillable(ty) || arrElemWidth(ty) != 0 {
+	if !(leafSym || leafSymCol) || !isSpillable(ty) || arrElemWidth(ty) != 0 {
 		return false
 	}
 	_, fixed := fixedValueWidth(ty)
@@ -605,6 +628,9 @@ func (a *colAcc) add(shape leafShape, j int, it dictItem, tb *symTable) {
 		a.dict.add(it, header)
 		a.f.d, a.f.dup = a.dict.d, a.dict.dup
 	}
+	if tb == nil {
+		tb = shape.itemTab[j]
+	}
 	if tb != nil && it.kind == dictShared {
 		a.f.gain += header + len(it.payload) - tb.encLen(it.payload)
 	}
@@ -622,6 +648,13 @@ func itemSaving(shape leafShape, j, n int, f colFacts, tb *symTable) int {
 	s := 0
 	if shape.itemDict[j] {
 		s = dictSaving(n, f.d, f.dup)
+	}
+	if shape.itemTab[j] != nil {
+		// A per-column table: no table bytes in the leaf.
+		if t := f.gain - (n+7)/8; t > s {
+			s = t
+		}
+		return s
 	}
 	if t := symSaving(n, f.gain, tb); t > s {
 		s = t
@@ -698,7 +731,10 @@ type lazyRegion struct {
 	// regionSym: the table's bytes on the page, and the table once something needs it.
 	tabSize int
 	tab     atomic.Pointer[symTable]
-	mat     atomic.Pointer[plainRegion]
+	// col marks a region coded with its column's table (regionSymCol): tab is that table and the
+	// region holds none.
+	col bool
+	mat atomic.Pointer[plainRegion]
 }
 
 // plainRegion is a rebuilt region: N u32 end offsets and the spans.
@@ -761,7 +797,7 @@ func (r *lazyRegion) decodeSym() (ends, body []byte, err error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	b := r.raw[tb.size:]
+	b := r.raw[r.tabSize:]
 	bm := (r.n + 7) / 8
 	if len(b) < bm+r.dw*r.n {
 		return nil, nil, bad
@@ -941,7 +977,7 @@ func packedItemSaving(shape leafShape, l *paxLeaf, n int) int {
 func packedTabs(l *paxLeaf) []*symTable {
 	var tabs []*symTable
 	for c := range l.regions {
-		if lz := l.regions[c].lazy; lz != nil && lz.kind == regionSym {
+		if lz := l.regions[c].lazy; lz != nil && lz.kind == regionSym && !lz.col {
 			tb, err := lz.table()
 			if err != nil {
 				continue
@@ -1024,4 +1060,122 @@ func (u *Unfetched) bodyErr() ([]byte, error) {
 func (u *Unfetched) body() []byte {
 	b, _ := u.bodyErr()
 	return b
+}
+
+// usable is t when it has symbols, else nil.
+func (tb *symTable) usable() *symTable {
+	if tb == nil || len(tb.syms) == 0 {
+		return nil
+	}
+	return tb
+}
+
+// maybeTrainColumns trains this table's per-column symbol tables once, when its tree first has
+// symColLeaves leaves or a third level: from its rows in key order, up to symColSample bytes of
+// payload over the eligible columns. The store gets new column types carrying the tables; leaves
+// written from then on are coded with them, and leaves already written stay as they are. A column
+// whose training finds no symbol gets an empty table, so training is not repeated.
+func (s *tableStore) maybeTrainColumns() error {
+	if !leafSymCol || s.symTrained || !s.shape.hasSymCol {
+		return nil
+	}
+	root := s.rows.root
+	if root == nil || root.isLeaf() {
+		return nil
+	}
+	if len(root.keys)+1 < symColLeaves && (root.children[0].node == nil || root.children[0].node.isLeaf()) {
+		return nil
+	}
+	payloads := make([][][]byte, len(s.shape.itemCols))
+	items := make([]dictItem, len(s.shape.itemCols))
+	total := 0
+	err := s.rows.scanRange(unboundedBound(), s.leafSrc(), func(key []byte, row storedRow) (bool, error) {
+		rowItems(s.shape, s.cap, key, row, items)
+		for j := range s.shape.itemCols {
+			if s.shape.itemSym[j] && items[j].kind == dictShared {
+				// A deferred value's bytes are a view of its page; the trainer only reads them.
+				payloads[j] = append(payloads[j], items[j].payload)
+				total += len(items[j].payload)
+			}
+		}
+		return total < symColSample, nil
+	})
+	if err != nil {
+		return err
+	}
+	colTypes := append([]colType(nil), s.colTypes...)
+	for j, c := range s.shape.itemCols {
+		if s.shape.itemSym[j] {
+			colTypes[c].sym = trainSym(payloads[j])
+		}
+	}
+	s.setColTypes(colTypes)
+	return nil
+}
+
+// setColTypes replaces the store's column types (to attach per-column symbol tables) and rederives
+// its leaf shape.
+func (s *tableStore) setColTypes(colTypes []colType) {
+	keyLen := s.shape.keyLen
+	s.colTypes = colTypes
+	s.shape = leafShapeFor(colTypes)
+	s.shape.keyLen = keyLen
+	s.symTrained = false
+	for _, ty := range colTypes {
+		if ty.sym != nil {
+			s.symTrained = true
+		}
+	}
+}
+
+// appendColTables appends a table entry's per-column symbol tables (leafSymCol): a u16 count, then
+// per column with a table its u16 ordinal and the table (appendTable; an empty table is two bytes).
+func appendColTables(out []byte, colTypes []colType) []byte {
+	n := 0
+	for _, ty := range colTypes {
+		if ty.sym != nil {
+			n++
+		}
+	}
+	out = appendU16(out, uint16(n))
+	for c, ty := range colTypes {
+		if ty.sym == nil {
+			continue
+		}
+		out = appendU16(out, uint16(c))
+		if len(ty.sym.syms) == 0 {
+			out = append(out, 0, 0)
+		} else {
+			out = ty.sym.appendTable(out)
+		}
+	}
+	return out
+}
+
+// readColTables reads what appendColTables wrote, into a slice by column ordinal (nil: none).
+func readColTables(buf []byte, pos *int, ncols int) ([]*symTable, error) {
+	n, err := readU16(buf, pos)
+	if err != nil {
+		return nil, err
+	}
+	var tabs []*symTable
+	for i := 0; i < int(n); i++ {
+		c, err := readU16(buf, pos)
+		if err != nil {
+			return nil, err
+		}
+		if int(c) >= ncols {
+			return nil, newError(DataCorrupted, "symbol table for a column the table does not have")
+		}
+		tb, rest, err := parseSymTable(buf[*pos:])
+		if err != nil {
+			return nil, err
+		}
+		*pos = len(buf) - len(rest)
+		if tabs == nil {
+			tabs = make([]*symTable, ncols)
+		}
+		tabs[c] = tb
+	}
+	return tabs, nil
 }

@@ -390,3 +390,4 @@ Not measured, and what decides this:
   open point of [leaf-structural.md](leaf-structural.md) §10). It adds a catalog object per column
   that every page of the table depends on.
 
+The per-column table is prototyped in the Go core: [leaf-structural.md](leaf-structural.md) §10.1.

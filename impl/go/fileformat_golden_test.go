@@ -1878,7 +1878,7 @@ func TestPersistedRowCountTracksDMLAndRollback(t *testing.T) {
 }
 
 func TestTableRowCountInvariantsAreRejected(t *testing.T) {
-	valid := tableEntryBytes(&catTable{Name: "t"}, plainRef(2), nil, 3, plainCap(8192))
+	valid := tableEntryBytes(&catTable{Name: "t"}, plainRef(2), nil, 3, plainCap(8192), nil)
 
 	rootWithZeroCount := append([]byte(nil), valid...)
 	binary.BigEndian.PutUint64(rootWithZeroCount[len(rootWithZeroCount)-8:], 0)

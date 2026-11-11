@@ -19,6 +19,7 @@ package jed
 //	JED_FORMAT_EXP=1 JED_REGION_PAGES=4096,8192,16384,32768 go test -run TestRegionCodecExperiment -v .
 
 import (
+	"context"
 	"encoding/binary"
 	"fmt"
 	"math/rand"
@@ -1615,4 +1616,103 @@ func TestTableSymExperiment(t *testing.T) {
 		}
 		fmt.Println()
 	}
+}
+
+// TestColumnSymbolTablesSurviveChange exercises per-column symbol tables (JED_LEAF_SYM=column) through
+// what the load experiment does not: a rolled-back training, schema changes on a trained table,
+// deletes and updates, compaction and reopen. Skipped unless the switch is on.
+func TestColumnSymbolTablesSurviveChange(t *testing.T) {
+	if !leafSymCol {
+		t.Skip("set JED_LEAF_SYM=column (with JED_LEAF_NARROW=on)")
+	}
+	path := filepath.Join(t.TempDir(), "coltab.jed")
+	db, err := CreateDatabase(CreateOptions{Path: path, SkipFsync: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := db.Session(SessionOptions{})
+	expExec(t, s, "CREATE TABLE t (id i64 PRIMARY KEY, name text, note text, doc jsonb)")
+	fill := func(lo, hi int) string {
+		return fmt.Sprintf("INSERT INTO t SELECT g, 'customer-name-' || (g %% 97), 'a note about order number ' || g || ' for the warehouse', "+
+			"('{\"kind\": \"order\", \"n\": ' || g || ', \"tag\": \"t' || (g %% 13) || '\"}')::jsonb FROM generate_series(%d, %d) g", lo, hi)
+	}
+	trained := func() bool {
+		pin, err := db.core.integrityPin(context.Background(), "main", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer pin.release()
+		st := pin.snap.stores["t"]
+		return st != nil && st.symTrained
+	}
+	summary := func(s *Session) string {
+		o, err := queryOutcome(s, "SELECT count(*), sum(length(name)), sum(length(note)), sum(length(doc::text)), min(note), max(name) FROM t", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return fmt.Sprint(o.Rows)
+	}
+	check := func(label string) {
+		t.Helper()
+		rep, err := db.IntegrityCheck(context.Background(), "main", IntegrityCheckOptions{})
+		if err != nil {
+			t.Fatalf("%s: integrity: %v", label, err)
+		}
+		if !rep.OK() {
+			t.Fatalf("%s: integrity: %+v", label, rep)
+		}
+	}
+	// A training rolled back leaves no tables.
+	expExec(t, s, "BEGIN")
+	expExec(t, s, fill(1, 20000))
+	expExec(t, s, "ROLLBACK")
+	if trained() {
+		t.Fatal("a rolled-back load left symbol tables")
+	}
+	expExec(t, s, fill(1, 20000))
+	if !trained() {
+		t.Fatal("the load trained no symbol tables")
+	}
+	want := summary(s)
+	check("after load")
+	// Changes to a trained table.
+	expExec(t, s, "DELETE FROM t WHERE id % 7 = 0")
+	expExec(t, s, "UPDATE t SET note = note || ' (amended)' WHERE id % 11 = 0")
+	expExec(t, s, "ALTER TABLE t ADD COLUMN extra text")
+	expExec(t, s, "UPDATE t SET extra = 'extra-' || (id % 5) WHERE id % 3 = 0")
+	expExec(t, s, "ALTER TABLE t RENAME COLUMN note TO remark")
+	expExec(t, s, "ALTER TABLE t RENAME TO u")
+	expExec(t, s, "CREATE INDEX u_name ON u (name)")
+	expExec(t, s, "INSERT INTO u SELECT g, 'late-' || g, 'late note ' || g, '{}'::jsonb, NULL FROM generate_series(20001, 30000) g")
+	q := "SELECT count(*), sum(length(name)), sum(length(remark)), sum(length(doc::text)), count(extra), min(remark), max(name) FROM u"
+	o, err := queryOutcome(s, q, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	changed := fmt.Sprint(o.Rows)
+	check("after changes")
+	if err := db.Compact("main"); err != nil {
+		t.Fatal(err)
+	}
+	check("after compaction")
+	s.Close()
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err = OpenDatabase(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	s = db.Session(SessionOptions{})
+	defer s.Close()
+	o, err = queryOutcome(s, q, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := fmt.Sprint(o.Rows); got != changed {
+		t.Fatalf("after reopen: %s, want %s", got, changed)
+	}
+	check("after reopen")
+	_ = want
 }

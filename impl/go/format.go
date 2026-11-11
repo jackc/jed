@@ -1011,7 +1011,7 @@ func (s *snapshot) catalogEntries(keys []string, rootDataPage []pageRef, indexRo
 		if err := checkTableRowCount(rootDataPage[ti].page, rowCount); err != nil {
 			return nil, err
 		}
-		catEntries = append(catEntries, append([]byte{0}, tableEntryBytes(s.tables[k], rootDataPage[ti], indexRoots[ti], rowCount, pcap)...))
+		catEntries = append(catEntries, append([]byte{0}, tableEntryBytes(s.tables[k], rootDataPage[ti], indexRoots[ti], rowCount, pcap, s.stores[k].colTypes)...))
 	}
 	catEntries = append(catEntries, statisticsCatalogEntries(s)...)
 	catEntries = append(catEntries, viewCatalogEntries(s)...)
@@ -1932,6 +1932,15 @@ func loadEngineSharedPagingAt(paging *sharedPaging, env *Environment, at loadAt)
 			snap.putTable(table, uint32(pageSize))
 			store := snap.stores[name]
 			store.attachPaging(paging)
+			if table.symTabs != nil {
+				// PROTOTYPE (leaf_sym.go): the per-column symbol tables the entry carries.
+				withTabs := append([]colType(nil), store.colTypes...)
+				for c, tb := range table.symTabs {
+					withTabs[c].sym = tb
+				}
+				store.setColTypes(withTabs)
+				table.symTabs = nil
+			}
 			// The store resolved each column's ColType from the (types-first) catalog at putTable
 			// (spec/design/composite.md §3).
 			colTypes := store.colTypes
@@ -2989,6 +2998,10 @@ type leafShape struct {
 	itemSym  []bool
 	itemArr  []int
 	hasSym   bool
+	// itemTab is each item column's per-column symbol table (leafSymCol), nil when it has none;
+	// hasSymCol says the shape has a column that may get one.
+	itemTab   []*symTable
+	hasSymCol bool
 }
 
 func (s leafShape) k() int { return s.fixed + s.variable + s.elided }
@@ -3000,6 +3013,8 @@ func leafShapeFor(colTypes []colType) leafShape {
 	var forCols []forCol
 	var dictCols, varCols, itemCols, itemArr []int
 	var itemDict, itemSym []bool
+	var itemTab []*symTable
+	hasSymCol := false
 	hasSym := false
 	for c, ty := range colTypes {
 		if leafElideKey && ty.keyAt != 0 {
@@ -3024,12 +3039,14 @@ func leafShapeFor(colTypes []colType) leafShape {
 			itemDict = append(itemDict, isDict)
 			itemSym = append(itemSym, isSym)
 			itemArr = append(itemArr, w)
-			hasSym = hasSym || isSym
+			itemTab = append(itemTab, ty.sym.usable())
+			hasSym = hasSym || (isSym && leafSym)
+			hasSymCol = hasSymCol || (isSym && leafSymCol)
 		}
 	}
 	return leafShape{fixed: fixed, variable: len(colTypes) - fixed - elided, elided: elided, forCols: forCols,
 		dictCols: dictCols, varCols: varCols, fixedBytes: fixedBytes, colTypes: colTypes,
-		itemCols: itemCols, itemDict: itemDict, itemSym: itemSym, itemArr: itemArr, hasSym: hasSym}
+		itemCols: itemCols, itemDict: itemDict, itemSym: itemSym, itemArr: itemArr, hasSym: hasSym, itemTab: itemTab, hasSymCol: hasSymCol}
 }
 
 // leafOverhead is the bytes a v24 leaf's payload carries BEYOND Σ recordSize (format.md "Leaf
@@ -3959,6 +3976,7 @@ func encodeLeafPAXMemo(colTypes []colType, keyLen int, keys [][]byte, rows []sto
 	syms := make([]*symTable, k)
 	arrs := make([]*arrAcc, k)
 	items := make([][]dictItem, k)
+	symCol := make([]bool, k)
 	symCoded := make([][]byte, k)
 	symEnds := make([][]int, k)
 	for c := 0; c < k; c++ {
@@ -4022,7 +4040,11 @@ func encodeLeafPAXMemo(colTypes []colType, keyLen int, keys [][]byte, rows []sto
 					cur -= s
 				}
 			}
-			if w, tb := arrElemWidth(colTypes[c]), tabFor(tabs, c); w != 0 || (tb != nil && symEligible(colTypes[c])) {
+			tb, colTab := tabFor(tabs, c), false
+			if tb == nil {
+				tb, colTab = colTypes[c].sym.usable(), true
+			}
+			if w := arrElemWidth(colTypes[c]); w != 0 || (tb != nil && symEligible(colTypes[c])) {
 				items[c] = make([]dictItem, n)
 				for i := 0; i < n; i++ {
 					items[c][i] = spanItem(colTypes[c], valBytes[c][i])
@@ -4057,7 +4079,12 @@ func encodeLeafPAXMemo(colTypes []colType, keyLen int, keys [][]byte, rows []sto
 						}
 						dictS = dictSaving(n, acc.d, acc.dup)
 					}
-					if s := symSaving(n, gain, tb); s > dictS {
+					s := symSaving(n, gain, tb)
+					if colTab {
+						s = gain - (n+7)/8 // the table is the column's, not the leaf's
+					}
+					if s > dictS {
+						symCol[c] = colTab
 						syms[c] = tb
 						symCoded[c], symEnds[c] = coded, codedEnd
 						dicts[c] = nil
@@ -4078,8 +4105,12 @@ func encodeLeafPAXMemo(colTypes []colType, keyLen int, keys [][]byte, rows []sto
 			continue
 		}
 		if tb := syms[c]; tb != nil {
-			out = append(out, regionSym)
-			out = tb.appendTable(out)
+			if symCol[c] {
+				out = append(out, regionSymCol)
+			} else {
+				out = append(out, regionSym)
+				out = tb.appendTable(out)
+			}
 			bm := len(out)
 			out = append(out, make([]byte, (n+7)/8)...)
 			dir := len(out)
@@ -5339,7 +5370,7 @@ func checkTableRowCount(rootDataPage uint32, rowCount int64) error {
 	return nil
 }
 
-func tableEntryBytes(table *catTable, rootDataPage pageRef, indexRoots []pageRef, rowCount int64, pcap pageCap) []byte {
+func tableEntryBytes(table *catTable, rootDataPage pageRef, indexRoots []pageRef, rowCount int64, pcap pageCap, colTypes []colType) []byte {
 	if rowCount < 0 {
 		panic("table row count is nonnegative")
 	}
@@ -5628,6 +5659,9 @@ func tableEntryBytes(table *catTable, rootDataPage pageRef, indexRoots []pageRef
 	}
 	out = rootDataPage.appendTo(out, pcap)
 	out = appendI64(out, rowCount)
+	if leafSymCol {
+		out = appendColTables(out, colTypes) // PROTOTYPE (leaf_sym.go)
+	}
 	return out
 }
 
@@ -6269,10 +6303,17 @@ func parsePaxLeaf(payload []byte, n int, colTypes []colType) (*paxLeaf, error) {
 			start = end
 			continue
 		}
-		if _, fixed := fixedValueWidth(ty); !fixed && (flags == regionSym || flags == regionArr) {
+		if _, fixed := fixedValueWidth(ty); !fixed && (flags == regionSym || flags == regionArr || flags == regionSymCol) {
 			// A symbol-table or typed-array region (leaf_sym.go): kept as its bytes, rebuilt on first use.
 			lz := &lazyRegion{kind: flags, ty: ty, raw: payload[p:end], n: n, dw: dw}
-			if flags == regionSym {
+			if flags == regionSymCol {
+				// Coded with the column's table, which the table's catalog entry holds.
+				if ty.sym.usable() == nil {
+					return nil, newError(DataCorrupted, "PAX leaf region is coded with a column table the table does not have")
+				}
+				lz.kind, lz.col = regionSym, true
+				lz.tab.Store(ty.sym)
+			} else if flags == regionSym {
 				size, err := symTableSize(lz.raw)
 				if err != nil {
 					return nil, err
@@ -7266,7 +7307,13 @@ func decodeTableEntry(buf []byte, pos *int, rowCountOut *int64, pcap pageCap) (*
 		return nil, pageRef{}, nil, newError(DataCorrupted, "table root and row count disagree")
 	}
 	*rowCountOut = rowCount
-	return &catTable{Name: name, Columns: columns, PK: pk, Checks: checks, Indexes: indexes, ForeignKeys: foreignKeys, Exclusions: exclusions}, root, indexRoots, nil
+	var symTabs []*symTable
+	if leafSymCol {
+		if symTabs, err = readColTables(buf, pos, len(columns)); err != nil {
+			return nil, pageRef{}, nil, err
+		}
+	}
+	return &catTable{Name: name, Columns: columns, PK: pk, Checks: checks, Indexes: indexes, ForeignKeys: foreignKeys, Exclusions: exclusions, symTabs: symTabs}, root, indexRoots, nil
 }
 
 // readValueLazy reads one value (column c of a table with the shared resolved types) lazily

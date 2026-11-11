@@ -55,6 +55,8 @@ type tableStore struct {
 	// from the session's budget (memory.md §7.1). A version written without it is counted but not
 	// recorded, so a later rewrite of it is counted again.
 	net bool
+	// PROTOTYPE (leaf_sym.go): symTrained says the store's column types carry per-column symbol tables.
+	symTrained bool
 }
 
 // stagedKeysCap is the node capacity of a store's staged-key map. Small nodes keep the copy-on-write
@@ -65,7 +67,13 @@ const stagedKeysCap = 512
 // NewTableStore builds an empty store for a table whose columns have the given resolved types,
 // serializing at the page capacities cap (snapshot.capFor). In-memory (no paging) until attachPaging.
 func newTableStore(cap pageCap, colTypes []colType) *tableStore {
-	return &tableStore{cap: cap, colTypes: colTypes, shape: leafShapeFor(colTypes)}
+	s := &tableStore{cap: cap, colTypes: colTypes, shape: leafShapeFor(colTypes)}
+	for _, ty := range colTypes {
+		if ty.sym != nil {
+			s.symTrained = true // PROTOTYPE (leaf_sym.go): tables are trained once and never replaced
+		}
+	}
+	return s
 }
 
 // clone returns an independent O(1) snapshot of the store. pMap.clone shares the root while
@@ -77,7 +85,7 @@ func (s *tableStore) clone() *tableStore {
 	if !s.stagedKeys.IsEmpty() {
 		stagedKeys = s.stagedKeys.clone()
 	}
-	return &tableStore{rows: s.rows.clone(), nextRowid: s.nextRowid, cap: s.cap, colTypes: s.colTypes, shape: s.shape, paging: s.paging, staged: s.staged, stagedKeys: stagedKeys, net: s.net}
+	return &tableStore{rows: s.rows.clone(), nextRowid: s.nextRowid, cap: s.cap, colTypes: s.colTypes, shape: s.shape, paging: s.paging, staged: s.staged, stagedKeys: stagedKeys, net: s.net, symTrained: s.symTrained}
 }
 
 func (s *tableStore) freezeMutationGeneration() { s.rows.freezeMutationGeneration() }
@@ -95,7 +103,7 @@ func (s *tableStore) compressMemo() *compressMemo {
 // an ON COMMIT DELETE ROWS temp table (spec/design/temp-tables.md §5.1). The synthetic rowid counter
 // carries over (it is monotonic, never reused); nothing is staged, since nothing is written.
 func (s *tableStore) truncated() *tableStore {
-	return &tableStore{nextRowid: s.nextRowid, cap: s.cap, colTypes: s.colTypes, shape: s.shape, paging: s.paging, net: s.net}
+	return &tableStore{nextRowid: s.nextRowid, cap: s.cap, colTypes: s.colTypes, shape: s.shape, paging: s.paging, net: s.net, symTrained: s.symTrained}
 }
 
 // attachPaging attaches this database's shared paging context (the demand-paged file load, format.go):
@@ -277,6 +285,9 @@ func (s *tableStore) Insert(key []byte, row storedRow) (bool, error) {
 		return false, err
 	}
 	if _, _, err := s.rows.Insert(key, row, weight, s.cap, s.shape, src); err != nil {
+		return false, err
+	}
+	if err := s.maybeTrainColumns(); err != nil {
 		return false, err
 	}
 	return true, nil
