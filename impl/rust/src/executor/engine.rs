@@ -51,6 +51,7 @@ impl Engine {
             commit_stages_rows: false,
             dir_synced: false,
             staged_attachments: Vec::new(),
+            commit_memo: None,
             core: None,
             attached_committed: HashMap::new(),
             estimator_touched: HashSet::new(),
@@ -93,6 +94,7 @@ impl Engine {
             commit_stages_rows: false,
             dir_synced: false,
             staged_attachments: Vec::new(),
+            commit_memo: None,
             core: None,
             attached_committed: HashMap::new(),
             estimator_touched: HashSet::new(),
@@ -611,6 +613,7 @@ impl Engine {
     /// (main / temp / the attachment); a `None` scope keeps the bare temp-first funnel.
     pub(crate) fn store_mut_scoped(&mut self, scope: Option<&str>, name: &str) -> &mut TableStore {
         let net = self.session.net_staging();
+        let memo = self.compress_memo_handle();
         let store = match scope {
             None => self.store_mut(name),
             Some("temp") => self.temp_working_mut().store_mut(name),
@@ -618,7 +621,27 @@ impl Engine {
             Some(other) => self.attach_write_snap(other).store_mut(name),
         };
         store.set_net_staging(net);
+        store.set_compress_memo(memo);
         store
+    }
+
+    /// The open writable transaction's compression memo ([`crate::compress_memo`]), for a
+    /// write-site plan. `None` outside a writable block — the plan then compresses as usual.
+    pub(crate) fn compress_memo(&self) -> Option<&crate::compress_memo::CompressMemo> {
+        self.session.tx.as_ref()?.compress_memo.as_deref()
+    }
+
+    /// A non-owning handle on the open transaction's compression memo, lent to each store a
+    /// write takes ([`TableStore::set_compress_memo`]); dead outside a writable block.
+    pub(crate) fn compress_memo_handle(
+        &self,
+    ) -> std::sync::Weak<crate::compress_memo::CompressMemo> {
+        self.session
+            .tx
+            .as_ref()
+            .and_then(|tx| tx.compress_memo.as_ref())
+            .map(std::sync::Arc::downgrade)
+            .unwrap_or_default()
     }
 
     /// A secondary index's READ store honoring an explicit database qualifier (an index belongs to the

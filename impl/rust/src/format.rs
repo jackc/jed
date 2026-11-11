@@ -23,6 +23,7 @@ use crate::catalog::{
     TimeZoneDep, TimeZoneDeps,
 };
 use crate::collation::Collation;
+use crate::compress_memo::CompressMemo;
 use crate::decimal::Decimal;
 use crate::encoding::{decode_int, encode_nullable};
 use crate::error::{EngineError, Result, SqlState};
@@ -1298,6 +1299,8 @@ enum Disp {
 /// one names it by length — its bytes stay on the chain the rewritten record shares.
 enum CompBlock {
     Owned(Vec<u8>),
+    /// A block this transaction's compression memo keeps ([`CompressMemo`]), shared with it.
+    Memo(Arc<Vec<u8>>),
     OnChain(usize),
 }
 
@@ -1305,6 +1308,7 @@ impl CompBlock {
     fn len(&self) -> usize {
         match self {
             CompBlock::Owned(c) => c.len(),
+            CompBlock::Memo(c) => c.len(),
             CompBlock::OnChain(n) => *n,
         }
     }
@@ -1401,7 +1405,16 @@ fn all_inline_size(col_types: &[ColType], key: &[u8], row: &[Value], cap: Cap) -
     (size <= record_max(cap.c, col_types.len())).then_some(size)
 }
 
-fn plan_dispositions(col_types: &[ColType], key: &[u8], row: &[Value], cap: Cap) -> RecordPlan {
+/// `memo` is the writing transaction's compression memo, when the caller plans on its behalf: an
+/// attempt then takes the block an earlier plan of the same payload produced, verified exactly, so
+/// the plan is the one a fresh compression gives ([`crate::compress_memo`]).
+fn plan_dispositions(
+    col_types: &[ColType],
+    key: &[u8],
+    row: &[Value],
+    cap: Cap,
+    memo: Option<&CompressMemo>,
+) -> RecordPlan {
     // Each column's inline-plain contribution to `record_size` (the v24 basis — format.md
     // "Record"): a fixed-width column always its width (a NULL occupies a zero-filled slot); a
     // variable-width column 0 when NULL (a zero-length span) else its tagged inline encoding.
@@ -1462,10 +1475,13 @@ fn plan_dispositions(col_types: &[ColType], key: &[u8], row: &[Value], cap: Cap)
             Value::Unfetched(Unfetched::ExternalComp { stored_len, .. }) => {
                 Some(CompBlock::OnChain(*stored_len as usize))
             }
-            v => Some(CompBlock::Owned(crate::lz4::compress(&planning_payload(
-                &col_types[i],
-                v,
-            )))),
+            v => {
+                let payload = planning_payload(&col_types[i], v);
+                Some(match memo {
+                    Some(memo) => CompBlock::Memo(memo.compress(&payload)),
+                    None => CompBlock::Owned(crate::lz4::compress(&payload)),
+                })
+            }
         };
         if let Some(comp) = comp
             && INLINE_COMP_OVERHEAD + comp.len() < inline[i]
@@ -1533,8 +1549,9 @@ pub(crate) fn deferred_in_stored_form(
     key: &[u8],
     row: &[Value],
     cap: Cap,
+    memo: Option<&CompressMemo>,
 ) -> Vec<bool> {
-    let plan = plan_dispositions(col_types, key, row, cap);
+    let plan = plan_dispositions(col_types, key, row, cap, memo);
     row.iter()
         .zip(plan.disp.iter())
         .map(|(v, d)| {
@@ -1580,7 +1597,7 @@ fn planning_payload<'v>(ty: &ColType, v: &'v Value) -> Cow<'v, [u8]> {
 /// (spec/design/large-values.md §12/§13). Must equal the length the serializer produces, so
 /// in-memory node boundaries match the serialized pages.
 pub(crate) fn record_size(col_types: &[ColType], key: &[u8], row: &Row, cap: Cap) -> usize {
-    plan_dispositions(col_types, key, row, cap).size
+    plan_dispositions(col_types, key, row, cap, None).size
 }
 
 /// A record's on-disk record size (the split weight) and its **stored bytes** — that size plus the
@@ -1590,11 +1607,12 @@ pub(crate) fn record_footprint(
     key: &[u8],
     row: &Row,
     cap: Cap,
+    memo: Option<&CompressMemo>,
 ) -> (usize, usize) {
     if let Some(size) = all_inline_size(col_types, key, row, cap) {
         return (size, size);
     }
-    let plan = plan_dispositions(col_types, key, row, cap);
+    let plan = plan_dispositions(col_types, key, row, cap, memo);
     (plan.size, plan.size + plan.external)
 }
 
@@ -1660,7 +1678,7 @@ pub(crate) fn record_scan_units(
         }
         return units;
     }
-    let plan = plan_dispositions(col_types, key, row, cap);
+    let plan = plan_dispositions(col_types, key, row, cap, None);
     for (i, d) in plan.disp.iter().enumerate() {
         if !mask[i] {
             continue; // an untouched column's chain/slabs are never read (cost.md §3)
@@ -1731,8 +1749,9 @@ pub(crate) fn record_compress_units(
     key: &[u8],
     row: &Row,
     cap: Cap,
+    memo: Option<&CompressMemo>,
 ) -> usize {
-    plan_dispositions(col_types, key, row, cap).compress_units
+    plan_dispositions(col_types, key, row, cap, memo).compress_units
 }
 
 /// A value's **content payload** `P(v)` — the bytes stored in the overflow chain when the value is
@@ -2183,7 +2202,9 @@ fn serialize_node(
         let seal = body.seal;
         (
             PAGE_LEAF,
-            encode_leaf_pax(col_types, &keys, &rows, seal, &mut take, &mut ovf, &mut src)?,
+            encode_leaf_pax(
+                col_types, &keys, &rows, seal, &mut take, &mut ovf, &mut src, None,
+            )?,
         )
     } else {
         (
@@ -2530,9 +2551,13 @@ impl Snapshot {
         let mut index_roots: Vec<Vec<PageRef>> = vec![Vec::new(); tables.len()];
         for (ti, (_, table, store)) in tables.iter().enumerate() {
             if let Some(root) = store.tree_root() {
+                // The store's writer lends it its compression memo while the transaction lives,
+                // so the leaves it wrote encode without compressing their values again.
+                let memo = store.compress_memo();
                 root_data_page[ti] = serialize_dirty(
                     root,
                     store.col_types(),
+                    memo.as_deref(),
                     seal,
                     &mut alloc,
                     &mut pages,
@@ -2574,6 +2599,7 @@ impl Snapshot {
                         Some(root) => serialize_dirty(
                             root,
                             &[],
+                            None,
                             seal,
                             &mut alloc,
                             &mut pages,
@@ -2776,6 +2802,7 @@ pub(crate) fn read_free_list(
 fn serialize_dirty(
     node: &Arc<Node>,
     col_types: &[ColType],
+    memo: Option<&CompressMemo>,
     seal: Sealer<'_>,
     alloc: &mut PageAlloc,
     pages: &mut Vec<(u32, Vec<u8>)>,
@@ -2794,7 +2821,7 @@ fn serialize_dirty(
         // leaf already durable at its page — keep it, write nothing (the incremental-commit win).
         let cp = match child {
             Child::Resident(n) => {
-                serialize_dirty(n, col_types, seal, alloc, pages, kept, shared, paging)?
+                serialize_dirty(n, col_types, memo, seal, alloc, pages, kept, shared, paging)?
             }
             Child::OnDisk(p) => {
                 kept.insert(p.page);
@@ -2822,7 +2849,7 @@ fn serialize_dirty(
                 shared: Vec::new(),
             };
             let payload = encode_leaf_pax(
-                col_types, &node.keys, &rows, seal, &mut take, pages, &mut src,
+                col_types, &node.keys, &rows, seal, &mut take, pages, &mut src, memo,
             )?;
             shared.extend(src.shared);
             (PAGE_LEAF, payload)
@@ -4148,6 +4175,7 @@ impl ChainSource<'_> {
     fn comp_bytes<'c>(&self, c: &'c CompBlock, v: &Value) -> Result<Cow<'c, [u8]>> {
         match (c, v) {
             (CompBlock::Owned(b), _) => Ok(Cow::Borrowed(b)),
+            (CompBlock::Memo(b), _) => Ok(Cow::Borrowed(b.as_slice())),
             (
                 CompBlock::OnChain(_),
                 Value::Unfetched(Unfetched::ExternalComp {
@@ -4269,7 +4297,9 @@ fn encode_disposed_value(
 /// region: a flags byte (0), then — fixed-width — the null bitmap + `N × width` dense untagged
 /// slots (a NULL slot zero-filled), or — variable-width — an `N`-entry end-offset value directory
 /// + the tagged value bodies (NULL = a zero-length span). A kept chain (`src`, large-values.md §15)
-/// allocates nothing.
+/// allocates nothing. `memo` is the committing transaction's compression memo, when it wrote these
+/// records ([`crate::compress_memo`]).
+#[allow(clippy::too_many_arguments)]
 fn encode_leaf_pax<K: AsRef<[u8]>>(
     col_types: &[ColType],
     keys: &[K],
@@ -4278,6 +4308,7 @@ fn encode_leaf_pax<K: AsRef<[u8]>>(
     take: &mut dyn FnMut() -> u32,
     ovf: &mut Vec<(u32, Vec<u8>)>,
     src: &mut ChainSource<'_>,
+    memo: Option<&CompressMemo>,
 ) -> Result<Vec<u8>> {
     let cap = seal.cap;
     let n = keys.len();
@@ -4294,7 +4325,13 @@ fn encode_leaf_pax<K: AsRef<[u8]>>(
         // A record that fits inline needs no plan: every disposition is inline.
         let plan = match all_inline_size(col_types, keys[i].as_ref(), row, cap) {
             Some(_) => None,
-            None => Some(plan_dispositions(col_types, keys[i].as_ref(), row, cap)),
+            None => Some(plan_dispositions(
+                col_types,
+                keys[i].as_ref(),
+                row,
+                cap,
+                memo,
+            )),
         };
         for (c, (ty, val)) in col_types.iter().zip(row.iter()).enumerate() {
             let is_null = matches!(val, Value::Null);
@@ -9272,6 +9309,7 @@ mod tests {
             &mut take,
             &mut ovf,
             &mut ChainSource::resident(),
+            None,
         )
         .unwrap();
         assert!(
@@ -9401,6 +9439,7 @@ mod tests {
             &mut take,
             &mut overflow,
             &mut ChainSource::resident(),
+            None,
         )
         .unwrap();
         assert!(overflow.is_empty());
@@ -9476,6 +9515,7 @@ mod tests {
             &mut take,
             &mut ovf,
             &mut ChainSource::resident(),
+            None,
         )
         .unwrap();
         assert!(ovf.is_empty());

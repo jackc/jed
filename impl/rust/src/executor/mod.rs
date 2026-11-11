@@ -606,6 +606,11 @@ pub struct Engine {
     /// are adopted only after main persists and the roots publish. Taken by the shared core's publish;
     /// dropped (publishing nothing) on any failure before it.
     pub(crate) staged_attachments: Vec<crate::shared::StagedCommit>,
+    /// The compression memo of the transaction the last `commit_tx` committed
+    /// ([`crate::compress_memo`]), kept alive so the shared core's publish encodes main's leaves
+    /// with it — main persists after `commit_tx` there. Taken by that publish; dropped, like
+    /// `staged_attachments`, on any failure before it and by the next `commit_tx`.
+    pub(crate) commit_memo: Option<std::sync::Arc<crate::compress_memo::CompressMemo>>,
     /// The shared core this engine's session belongs to (attached-databases.md §5), or `None` for a
     /// bare/transient engine (a test [`Engine::new`], a `snapshot_engine`, a `from_snapshot` read view —
     /// none of which commit attachments). It is the engine's route to the core-owned attachment registry

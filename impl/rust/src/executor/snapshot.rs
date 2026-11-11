@@ -1165,10 +1165,12 @@ impl Snapshot {
         entries: &[(Vec<u8>, Row)],
         next_rowid: i64,
         page_size: u32,
+        memo: std::sync::Weak<crate::compress_memo::CompressMemo>,
     ) -> Result<()> {
         let key = table.name.to_string();
         self.put_table_resolved(table, col_types, page_size);
         let store = self.store_mut(&key);
+        store.set_compress_memo(memo);
         store.bump_rowid_to(next_rowid);
         for (k, row) in entries {
             if !store.insert(k.clone(), row.clone())? {

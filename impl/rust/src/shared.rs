@@ -4856,6 +4856,7 @@ impl Session {
                 Ok(outcome) if !failed && self.gate_held => self.publish().map(|()| outcome),
                 other => {
                     self.engine.staged_attachments.clear();
+                    self.engine.commit_memo = None;
                     other
                 }
             }
@@ -4953,6 +4954,9 @@ impl Session {
     fn publish(&mut self) -> Result<()> {
         // Taken first, so any failure below drops the staged attachment commits unadopted.
         let staged = std::mem::take(&mut self.engine.staged_attachments);
+        // The committed transaction's compression memo lives until main's persist below has
+        // encoded its leaves, and drops when this returns (crate::compress_memo).
+        let _compress_memo = self.engine.commit_memo.take();
         // Only changed domains publish (transactions.md §2.1). Consume the changes the preceding commit
         // reported, so no later publish can reuse them; an unchanged commit writes nothing and keeps
         // main's version.
@@ -5803,6 +5807,46 @@ impl Database {
         // A relaxed domain's pending commits become durable before the handle is released
         // (validated-cow.md §4); a failed flush is what close reports.
         self.0.flush_all()
+    }
+}
+
+#[cfg(test)]
+mod compress_memo_tests {
+    use super::*;
+
+    /// A shared core persists main in its publish, after `commit_tx`: the committing transaction's
+    /// compression memo lives until then and no longer (crate::compress_memo).
+    #[test]
+    fn the_publish_drops_the_committed_transactions_memo() {
+        let large = "INSERT INTO t SELECT g, repeat(CAST(g AS text) || 'ab', 50000) \
+                     FROM generate_series(1, 3) g";
+        let db = Database::create(CreateOptions::default()).unwrap();
+        let mut s = db.session(SessionOptions::default());
+        s.execute("CREATE TABLE t (id bigint PRIMARY KEY, body text)", &[])
+            .unwrap();
+        s.execute("BEGIN", &[]).unwrap();
+        s.execute(large, &[]).unwrap();
+        let tx = s.engine.session.tx.as_ref().unwrap();
+        // Downgraded at once: the test must not hold the memo itself.
+        let lent = Arc::downgrade(
+            &tx.working
+                .store("t")
+                .compress_memo()
+                .expect("a lent handle"),
+        );
+        s.execute("COMMIT", &[]).unwrap();
+        assert!(lent.upgrade().is_none(), "the publish drops the memo");
+        assert!(s.engine.commit_memo.is_none());
+        s.execute(
+            "INSERT INTO t SELECT g, repeat('cd', 90000) FROM generate_series(4, 5) g",
+            &[],
+        )
+        .unwrap();
+        assert!(
+            s.engine.commit_memo.is_none(),
+            "an autocommit publish drops it too"
+        );
+        assert!(s.engine.committed.store("t").compress_memo().is_none());
     }
 }
 

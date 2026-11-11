@@ -13,9 +13,10 @@
 //! govern when a node splits (spec/fileformat/format.md). The store holds the column types and
 //! `cap` so it can compute weights ([`crate::format::record_size`]) the map itself never needs.
 
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use crate::catalog::ColType;
+use crate::compress_memo::CompressMemo;
 use crate::error::Result;
 use crate::paging::SharedPaging;
 use crate::pmap::{KeyBound, LeafSource, Node, PMap};
@@ -193,6 +194,11 @@ pub struct TableStore {
     /// from the session's budget (memory.md §7.1). A version written without it is counted but not
     /// recorded, so a later rewrite of it is counted again.
     net: bool,
+    /// The writing transaction's compression memo ([`crate::compress_memo`]), lent by the executor
+    /// with each write like `net`: the B-tree weight and the commit encoder plan this store's
+    /// records with it. A `Weak` handle, so the store never keeps the memo alive — once the
+    /// transaction ends it is dead, and a published or discarded store holds nothing.
+    memo: Weak<CompressMemo>,
 }
 
 impl TableStore {
@@ -210,6 +216,7 @@ impl TableStore {
             staged: 0,
             staged_keys: PMap::new(),
             net: false,
+            memo: Weak::new(),
         }
     }
 
@@ -227,6 +234,7 @@ impl TableStore {
             staged: 0,
             staged_keys: PMap::new(),
             net: self.net,
+            memo: self.memo.clone(),
         }
     }
 
@@ -247,7 +255,9 @@ impl TableStore {
     /// spec/design/large-values.md §12), so split points match the serialized pages.
     /// Also returns the record's stored bytes, the pending-write measure (memory.md §7).
     fn weight(&self, key: &[u8], row: &Row) -> (u32, i64) {
-        let (size, stored) = crate::format::record_footprint(&self.col_types, key, row, self.cap);
+        let memo = self.memo.upgrade();
+        let (size, stored) =
+            crate::format::record_footprint(&self.col_types, key, row, self.cap, memo.as_deref());
         (size as u32, stored as i64)
     }
 
@@ -281,6 +291,17 @@ impl TableStore {
     /// Record (or stop recording) staged keys for the writes that follow (memory.md §7.1).
     pub(crate) fn set_net_staging(&mut self, net: bool) {
         self.net = net;
+    }
+
+    /// Lend the writing transaction's compression memo to the writes that follow, and to the
+    /// commit that encodes them ([`crate::compress_memo`]).
+    pub(crate) fn set_compress_memo(&mut self, memo: Weak<CompressMemo>) {
+        self.memo = memo;
+    }
+
+    /// The compression memo the store's writer lent it, while that transaction lives.
+    pub(crate) fn compress_memo(&self) -> Option<Arc<CompressMemo>> {
+        self.memo.upgrade()
     }
 
     /// Whether the store changed since publication (it holds staging state to clear).
@@ -598,11 +619,18 @@ impl TableStore {
     /// disposition-plan compression attempt (cost.md §3; large-values.md §13). Charged by the
     /// executor once per stored row version at the INSERT/UPDATE write site. Zero whenever the
     /// record fits inline-plain (no attempt runs), so existing costs do not move.
-    pub(crate) fn write_compress_units(&self, key: &[u8], row: &Row) -> usize {
+    /// `memo` is the writing transaction's compression memo: the store may be the committed one a
+    /// transaction's first statement reads, which holds no memo of its own.
+    pub(crate) fn write_compress_units(
+        &self,
+        key: &[u8],
+        row: &Row,
+        memo: Option<&CompressMemo>,
+    ) -> usize {
         if !crate::format::any_spillable(&self.col_types) {
             return 0;
         }
-        crate::format::record_compress_units(&self.col_types, key, row, self.cap)
+        crate::format::record_compress_units(&self.col_types, key, row, self.cap, memo)
     }
 
     /// Whether `row` holds an unfetched large-value reference in any column `mask` selects —
@@ -687,11 +715,19 @@ impl TableStore {
     /// chain. Any other is resolved (unmetered, part of the rewrite), so a stored row's deferred
     /// values always equal its own plan's output — the invariant the scan cost walk and the
     /// commit encoder rely on.
-    pub(crate) fn settle_carried(&self, key: &[u8], row: &mut Row) -> Result<()> {
+    /// `memo` is the writing transaction's compression memo, as for
+    /// [`write_compress_units`](TableStore::write_compress_units).
+    pub(crate) fn settle_carried(
+        &self,
+        key: &[u8],
+        row: &mut Row,
+        memo: Option<&CompressMemo>,
+    ) -> Result<()> {
         if !row.iter().any(|v| matches!(v, Value::Unfetched(_))) {
             return Ok(());
         }
-        let kept = crate::format::deferred_in_stored_form(&self.col_types, key, row, self.cap);
+        let kept =
+            crate::format::deferred_in_stored_form(&self.col_types, key, row, self.cap, memo);
         for (i, v) in row.iter_mut().enumerate() {
             if let Value::Unfetched(u) = v
                 && !kept[i]

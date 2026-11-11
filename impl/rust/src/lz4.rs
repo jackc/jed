@@ -176,9 +176,113 @@ pub fn decompress(comp: &[u8], raw_len: usize) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// Whether `comp` is a valid block that decodes ([`decompress`]) to exactly `expected` — checked
+/// against `expected` in place, without building the output. A literal run must equal the bytes it
+/// covers, and a match of length `ml` at offset `d` must leave `expected[p..p + ml]` equal to
+/// `expected[p - d..p - d + ml]`: the decoder's overlapping copy repeats the run with period `d`,
+/// which is exactly that slice equality. By induction over the sequences, a block passing every
+/// check decodes to `expected`, and any other block fails one (or a bound) — the exact test the
+/// compression memo verifies a hit with ([`crate::compress_memo`]).
+pub fn decodes_to(comp: &[u8], expected: &[u8]) -> bool {
+    let n = comp.len();
+    let raw_len = expected.len();
+    let mut i = 0usize;
+    let mut pos = 0usize;
+    // A length nibble of 15 continues in `255`* + a final byte (lz4.md §1); `None` when truncated.
+    let extend = |i: &mut usize, mut len: usize| -> Option<usize> {
+        loop {
+            let b = *comp.get(*i)?;
+            *i += 1;
+            len += b as usize;
+            if b != 255 {
+                return Some(len);
+            }
+        }
+    };
+    loop {
+        let Some(&token) = comp.get(i) else {
+            return false;
+        };
+        i += 1;
+        let mut lit = (token >> 4) as usize;
+        if lit == 15 {
+            match extend(&mut i, lit) {
+                Some(l) => lit = l,
+                None => return false,
+            }
+        }
+        if i + lit > n || pos + lit > raw_len || comp[i..i + lit] != expected[pos..pos + lit] {
+            return false;
+        }
+        i += lit;
+        pos += lit;
+        if i == n {
+            return pos == raw_len; // a literals-only tail ends the block
+        }
+        if i + 2 > n {
+            return false;
+        }
+        let offset = u16::from_le_bytes([comp[i], comp[i + 1]]) as usize;
+        i += 2;
+        if offset == 0 || offset > pos {
+            return false;
+        }
+        let mut ml = (token & 0x0F) as usize;
+        if ml == 15 {
+            match extend(&mut i, ml) {
+                Some(l) => ml = l,
+                None => return false,
+            }
+        }
+        ml += MIN_MATCH;
+        if pos + ml > raw_len
+            || expected[pos..pos + ml] != expected[pos - offset..pos - offset + ml]
+        {
+            return false;
+        }
+        pos += ml;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decodes_to_matches_decompress() {
+        let cases: Vec<Vec<u8>> = vec![
+            Vec::new(),
+            b"a".to_vec(),
+            vec![b'a'; 32],
+            b"abc".repeat(400),
+            vec![b'y'; 70_000],
+            b"the quick brown fox jumps over the lazy dog ".repeat(60),
+            (0..5000u32)
+                .flat_map(|i| (i * 2_654_435_761).to_le_bytes())
+                .collect(),
+        ];
+        for src in &cases {
+            let comp = compress(src);
+            assert!(decodes_to(&comp, src));
+            // Any other expected output is refused: one byte changed, one byte more or less.
+            if !src.is_empty() {
+                let mut flipped = src.clone();
+                let mid = flipped.len() / 2;
+                flipped[mid] ^= 1;
+                assert!(!decodes_to(&comp, &flipped));
+                assert!(!decodes_to(&comp, &src[..src.len() - 1]));
+            }
+            let mut longer = src.clone();
+            longer.push(b'z');
+            assert!(!decodes_to(&comp, &longer));
+            // Truncated or corrupt blocks are refused, never a panic.
+            for cut in 0..comp.len() {
+                assert!(
+                    !decodes_to(&comp[..cut], src) || decompress(&comp[..cut], src.len()).is_ok()
+                );
+            }
+        }
+    }
 
     #[test]
     fn empty_input_is_the_lone_zero_token() {

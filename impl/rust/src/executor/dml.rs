@@ -1469,7 +1469,7 @@ impl Engine {
                 let store = self.store_scoped(db_scope, table);
                 let placeholder = [0u8; 8];
                 let kb: &[u8] = key.as_deref().unwrap_or(&placeholder);
-                cunits += store.write_compress_units(kb, &row) as i64;
+                cunits += store.write_compress_units(kb, &row, self.compress_memo()) as i64;
             }
             // Compute this row's per-index entry keys WITHOUT the suffix (phase 1 — evaluates every
             // expression key, so an eval error aborts here before any write; unmetered). Phase 2
@@ -1694,9 +1694,9 @@ impl Engine {
 
         let placeholder = [0u8; 8];
         let kb = key.as_deref().unwrap_or(&placeholder);
-        let cunits = self
-            .store_scoped(db_scope, table)
-            .write_compress_units(kb, &row) as i64;
+        let cunits =
+            self.store_scoped(db_scope, table)
+                .write_compress_units(kb, &row, self.compress_memo()) as i64;
 
         // One group per index is still required because a GIN entry can have several keys, but the
         // batch-only outer row dimension and the later per-index drain buffers are absent.
@@ -2425,6 +2425,7 @@ impl Engine {
         // allocated rowid deterministically (as in `insert_rows`).
         {
             let store = self.store(table);
+            let memo = self.compress_memo();
             let mut cunits: i64 = 0;
             let placeholder = [0u8; 8];
             for row in &inserts {
@@ -2433,10 +2434,10 @@ impl Engine {
                 } else {
                     encode_pk_key(pk, &col_types, &colls, row)?
                 };
-                cunits += store.write_compress_units(&kb, row) as i64;
+                cunits += store.write_compress_units(&kb, row, memo) as i64;
             }
             for (_, key, row, _) in &updates {
-                cunits += store.write_compress_units(key, row) as i64;
+                cunits += store.write_compress_units(key, row, memo) as i64;
             }
             meter.charge(COSTS.value_compress * cunits);
             meter.checkpoint()?;
@@ -4375,7 +4376,7 @@ impl Engine {
             // A carried value stays deferred only where the new row's plan stores it in its
             // stored form; the rest are resolved, so the stored row plans exactly as a resident
             // one would (large-values.md §15).
-            store.settle_carried(&new_key, &mut new_row)?;
+            store.settle_carried(&new_key, &mut new_row, self.compress_memo())?;
             // The old row is kept only for maintenance; its large values return to their stored
             // forms unless RETURNING reads them from the old side.
             let old_row = crate::storage::TableStore::retained_old_row(
@@ -4537,7 +4538,7 @@ impl Engine {
         let store = self.store_scoped(upd.db.as_deref(), &upd.table);
         let mut cunits: i64 = 0;
         for (_, new_key, row, _) in &updates {
-            cunits += store.write_compress_units(new_key, row) as i64;
+            cunits += store.write_compress_units(new_key, row, self.compress_memo()) as i64;
         }
         meter.charge(COSTS.value_compress * cunits);
         meter.checkpoint()?;

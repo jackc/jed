@@ -1009,7 +1009,7 @@ impl Engine {
                     } else {
                         key.clone()
                     };
-                    store.settle_carried(&new_key, &mut new_row)?;
+                    store.settle_carried(&new_key, &mut new_row, self.compress_memo())?;
                     affected.insert(key.clone());
                     actions.push(Planned::Update {
                         old_key: key,
@@ -1442,10 +1442,11 @@ impl Engine {
                     Planned::Insert { row, .. } => store.write_compress_units(
                         insert_keys[ai].as_deref().unwrap_or(&placeholder),
                         row,
+                        self.compress_memo(),
                     ) as i64,
                     Planned::Update {
                         new_key, new_row, ..
-                    } => store.write_compress_units(new_key, new_row) as i64,
+                    } => store.write_compress_units(new_key, new_row, self.compress_memo()) as i64,
                     Planned::Delete { .. } => 0,
                 };
             }

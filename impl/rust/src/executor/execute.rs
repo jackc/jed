@@ -853,6 +853,7 @@ impl Engine {
     /// propagates (the commit failed; the working set is discarded). Returns to autocommit.
     pub(crate) fn commit_tx(&mut self) -> Result<Outcome> {
         self.staged_attachments.clear();
+        self.commit_memo = None;
         self.commit_changes = CommitChanges::default();
         let mut tx = match self.session.tx.take() {
             None => {
@@ -873,6 +874,10 @@ impl Engine {
                 rows_affected: None,
             });
         }
+        // The transaction's compression memo outlives it until its pages are written: here for the
+        // temp, attachment, and bare-engine main persists, and through the shared core's publish for
+        // main (`commit_memo`). Each store it wrote holds only a `Weak` handle on it.
+        let compress_memo = tx.compress_memo.take();
         // The temp tables' ON COMMIT actions (temp-tables.md §5.1) — DELETE ROWS empties, DROP drops —
         // apply to the working temp snapshot first, so they commit (or are discarded) atomically with
         // the rest of the transaction and the refinement, budget precheck, and staging below all see
@@ -1038,6 +1043,9 @@ impl Engine {
             main: main_dirty,
             attached: !attach_dirty.is_empty(),
         };
+        if main_dirty && self.core.is_some() {
+            self.commit_memo = compress_memo;
+        }
         Ok(Outcome::Statement {
             cost: 0,
             rows_affected: None,
@@ -1051,6 +1059,7 @@ impl Engine {
     /// `currval`/`lastval` session state, however, was updated in place by in-block `nextval`/
     /// `setval`, so it is restored from the block's captured copy (sequences.md §5/§6).
     pub(crate) fn rollback_tx(&mut self) -> Result<Outcome> {
+        self.commit_memo = None;
         if let Some(tx) = self.session.tx.take() {
             self.restore_session_state(tx);
         }

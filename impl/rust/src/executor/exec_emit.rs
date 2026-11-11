@@ -1902,12 +1902,14 @@ impl Engine {
     /// untouched.
     pub(crate) fn store_mut(&mut self, name: &str) -> &mut TableStore {
         let net = self.session.net_staging();
+        let memo = self.compress_memo_handle();
         let store = if self.is_temp_table(name) {
             self.temp_working_mut().store_mut(name)
         } else {
             self.working_mut().store_mut(name)
         };
         store.set_net_staging(net);
+        store.set_compress_memo(memo);
         store
     }
 

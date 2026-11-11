@@ -3982,6 +3982,7 @@ impl Engine {
                     key,
                     row,
                     rewrite_cap,
+                    self.compress_memo(),
                 ) as i64;
             }
             meter.charge(COSTS.value_compress * compress_units);
@@ -4268,6 +4269,7 @@ impl Engine {
             }
         }
         let ir = index_rename.as_ref().map(|(a, b)| (a.as_str(), b.as_str()));
+        let memo = self.compress_memo_handle();
         let ws = match at.db.as_deref().map(str::to_string) {
             None if self.is_temp_table(&original.name) => self.temp_working_mut(),
             None => self.working_mut(),
@@ -4282,6 +4284,7 @@ impl Engine {
                 entries,
                 rewrite_next_rowid,
                 page_size,
+                memo,
             )?;
         } else {
             ws.alter_table_catalog(&old_key, table.clone(), rename_table, ir);

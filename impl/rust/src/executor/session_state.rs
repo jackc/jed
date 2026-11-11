@@ -638,6 +638,12 @@ pub(crate) struct ActiveTx {
     /// frame, `RELEASE` truncates to below the newest frame of that name, `ROLLBACK TO` restores the
     /// newest frame of that name and truncates to just above it. Empty outside any savepoint.
     pub(crate) savepoints: Vec<SavepointFrame>,
+    /// The transaction's compression memo ([`crate::compress_memo`]) — `Some` for a writable block.
+    /// The write-site plan takes it explicitly; each store written lends it a `Weak` handle for its
+    /// B-tree weight and commit encoding. It drops with the transaction (ROLLBACK, a failed commit),
+    /// or after COMMIT has written its pages ([`Engine::commit_memo`](crate::executor::Engine)).
+    /// Savepoints share it: a hit is verified exactly, so what it holds never matters.
+    pub(crate) compress_memo: Option<std::sync::Arc<crate::compress_memo::CompressMemo>>,
 }
 
 /// One savepoint's marked state (spec/design/transactions.md §11): every piece of the open
@@ -678,6 +684,7 @@ impl ActiveTx {
             attach_working: HashMap::new(),
             attach_dirty: HashSet::new(),
             savepoints: Vec::new(),
+            compress_memo: writable.then(Default::default),
         }
     }
 
