@@ -2968,6 +2968,13 @@ type leafShape struct {
 	keyLen int
 	// forCols is the columns a leaf may write as base plus offsets (leaf_narrow.go).
 	forCols []forCol
+	// dictCols is the string columns a leaf may write as a dictionary (leaf_narrow.go), with what
+	// classifying a decoded row needs: the column types, the variable columns, and the bytes the
+	// stored fixed-width columns add to every record.
+	dictCols   []int
+	varCols    []int
+	fixedBytes int
+	colTypes   []colType
 }
 
 func (s leafShape) k() int { return s.fixed + s.variable + s.elided }
@@ -2975,8 +2982,9 @@ func (s leafShape) k() int { return s.fixed + s.variable + s.elided }
 // leafShapeFor is the shape of a leaf for a table with these value-column types (an index tree —
 // empty colTypes — is {0, 0}).
 func leafShapeFor(colTypes []colType) leafShape {
-	fixed, elided := 0, 0
+	fixed, elided, fixedBytes := 0, 0, 0
 	var forCols []forCol
+	var dictCols, varCols []int
 	for c, ty := range colTypes {
 		if leafElideKey && ty.keyAt != 0 {
 			elided++
@@ -2984,12 +2992,19 @@ func leafShapeFor(colTypes []colType) leafShape {
 		}
 		if w, ok := fixedValueWidth(ty); ok {
 			fixed++
+			fixedBytes += w
 			if forEligible(ty) {
 				forCols = append(forCols, forCol{col: c, w: w})
 			}
+			continue
+		}
+		varCols = append(varCols, c)
+		if leafDict && stringPayload(ty) {
+			dictCols = append(dictCols, c)
 		}
 	}
-	return leafShape{fixed: fixed, variable: len(colTypes) - fixed - elided, elided: elided, forCols: forCols}
+	return leafShape{fixed: fixed, variable: len(colTypes) - fixed - elided, elided: elided, forCols: forCols,
+		dictCols: dictCols, varCols: varCols, fixedBytes: fixedBytes, colTypes: colTypes}
 }
 
 // leafOverhead is the bytes a v24 leaf's payload carries BEYOND Σ recordSize (format.md "Leaf
@@ -3904,6 +3919,12 @@ func encodeLeafPAXMemo(colTypes []colType, keyLen int, keys [][]byte, rows []sto
 		bw   int
 	}
 	fors := make([]*forEnc, k)
+	// dicts[c] is set for a column written as a dictionary.
+	type dictEnc struct {
+		entries [][]byte
+		codes   []byte
+	}
+	dicts := make([]*dictEnc, k)
 	for c := 0; c < k; c++ {
 		colStart[c] = cur
 		bodies := 0
@@ -3929,6 +3950,42 @@ func encodeLeafPAXMemo(colTypes []colType, keyLen int, keys [][]byte, rows []sto
 			}
 		} else {
 			cur += 1 + dw*n + bodies
+			if leafDict && stringPayload(colTypes[c]) {
+				// A dictionary (leaf_narrow.go): entries in order of first use.
+				var acc dictAcc
+				enc := &dictEnc{codes: make([]byte, n)}
+				index := map[string]int{}
+				nullAt := -1
+				for i := 0; i < n && len(enc.entries) <= 256; i++ {
+					span := valBytes[c][i]
+					it := spanDictItem(span)
+					acc.add(it, inlineHeaderLen(colTypes[c]))
+					at := -1
+					switch it.kind {
+					case dictNull:
+						at = nullAt
+					case dictShared:
+						if j, ok := index[string(it.payload)]; ok {
+							at = j
+						}
+					}
+					if at < 0 {
+						at = len(enc.entries)
+						enc.entries = append(enc.entries, span)
+						switch it.kind {
+						case dictNull:
+							nullAt = at
+						case dictShared:
+							index[string(it.payload)] = at
+						}
+					}
+					enc.codes[i] = byte(at)
+				}
+				if s := dictSaving(n, acc.d, acc.dup); s > 0 && len(enc.entries) <= 256 {
+					dicts[c] = enc
+					cur -= s
+				}
+			}
 		}
 	}
 	colStart[k] = cur // payload end
@@ -3939,6 +3996,19 @@ func encodeLeafPAXMemo(colTypes []colType, keyLen int, keys [][]byte, rows []sto
 	// tagged bodies (variable).
 	for c := 0; c < k; c++ {
 		if !stored(c) {
+			continue
+		}
+		if d := dicts[c]; d != nil {
+			out = append(out, regionDict, byte(len(d.entries)>>8), byte(len(d.entries)))
+			off := 0
+			for _, e := range d.entries {
+				off += len(e)
+				out = appendDir(out, off)
+			}
+			for _, e := range d.entries {
+				out = append(out, e...)
+			}
+			out = append(out, d.codes...)
 			continue
 		}
 		if fors[c] != nil {
@@ -5814,8 +5884,11 @@ type paxRegion struct {
 	// (leaf_narrow.go) and it contributes nothing to recordSize.
 	elided bool
 	// stored, when nonzero, is the region's bytes on the page: its slots were rebuilt from a base and
-	// narrow offsets (leaf_narrow.go).
+	// narrow offsets, or it is a dictionary (leaf_narrow.go).
 	stored int
+	// codes, when set, makes this variable region a dictionary: ends and body describe the entries,
+	// and value i is entry codes[i].
+	codes []byte
 }
 
 type paxLeaf struct {
@@ -6014,6 +6087,40 @@ func parsePaxLeaf(payload []byte, n int, colTypes []colType) (*paxLeaf, error) {
 			start = end
 			continue
 		}
+		if _, fixed := fixedValueWidth(ty); !fixed && flags == regionDict {
+			// A dictionary (leaf_narrow.go): the region's directory and blob are the entries', and a
+			// value's span is its code's entry.
+			d16, err := readU16(payload, &p)
+			if err != nil {
+				return nil, err
+			}
+			d := int(d16)
+			endsStart := p
+			vprev := uint32(0)
+			for j := 0; j < d; j++ {
+				e, err := readDir(&p)
+				if err != nil {
+					return nil, err
+				}
+				if e < vprev {
+					return nil, newError(DataCorrupted, "PAX leaf dictionary directory not ascending")
+				}
+				vprev = e
+			}
+			blob := p
+			if d == 0 || d > 256 || blob+int(vprev)+n != end {
+				return nil, newError(DataCorrupted, "PAX leaf dictionary region extent mismatch")
+			}
+			codes := payload[blob+int(vprev) : end]
+			for _, code := range codes {
+				if int(code) >= d {
+					return nil, newError(DataCorrupted, "PAX leaf dictionary code out of range")
+				}
+			}
+			regions[c] = paxRegion{ends: payload[endsStart:blob], body: payload[blob : blob+int(vprev)], codes: codes, stored: end - start}
+			start = end
+			continue
+		}
 		if flags != 0 {
 			return nil, newError(DataCorrupted, "PAX leaf region flags has a reserved bit set")
 		}
@@ -6157,6 +6264,9 @@ func (l *paxLeaf) isNull(c, i int) bool {
 	if r.width > 0 {
 		return r.bitmap[i/8]&(0x80>>(i%8)) != 0
 	}
+	if r.codes != nil {
+		i = int(r.codes[i])
+	}
 	lo := uint32(0)
 	if i > 0 {
 		lo = paxDirEnd(r.ends, i-1, l.dw)
@@ -6171,6 +6281,9 @@ func (l *paxLeaf) value(c, i int) ([]byte, error) {
 	r := &l.regions[c]
 	if r.width > 0 {
 		return r.body[i*r.width : (i+1)*r.width], nil
+	}
+	if r.codes != nil {
+		i = int(r.codes[i])
 	}
 	lo := uint32(0)
 	if i > 0 {
@@ -6193,6 +6306,9 @@ func (l *paxLeaf) valueLen(c, i int) int {
 	}
 	if r.width > 0 {
 		return r.width
+	}
+	if r.codes != nil {
+		i = int(r.codes[i])
 	}
 	lo := uint32(0)
 	if i > 0 {

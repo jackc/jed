@@ -403,15 +403,30 @@ func expDecimalInt(body []byte) (scale int, v int64, ok bool) {
 
 func expVariable(r *paxRegion, n int, ty colType) expSizes {
 	out := expSizes{cur: 1 + len(r.ends) + len(r.body)}
+	if r.codes != nil {
+		out.cur = r.stored // a dictionary region
+	}
+	entry := func(j int) []byte {
+		lo := uint32(0)
+		if j > 0 {
+			lo = paxDirEnd(r.ends, j-1, expDW)
+		}
+		return r.body[lo:paxDirEnd(r.ends, j, expDW)]
+	}
 	lenPrefixed := !ty.Composite && ty.Elem == nil && ty.RangeElem == nil && (ty.Scalar == scalarText || ty.Scalar == scalarBytea)
 	isDecimal := !ty.Composite && ty.Elem == nil && ty.RangeElem == nil && ty.Scalar == scalarDecimal
 	spans := make([][]byte, n)
 	nulls, allPlain, content := 0, true, 0
 	lo := uint32(0)
 	for i := 0; i < n; i++ {
-		hi := paxDirEnd(r.ends, i, expDW)
-		sp := r.body[lo:hi]
-		lo = hi
+		var sp []byte
+		if r.codes != nil {
+			sp = entry(int(r.codes[i]))
+		} else {
+			hi := paxDirEnd(r.ends, i, expDW)
+			sp = r.body[lo:hi]
+			lo = hi
+		}
 		if len(sp) == 0 {
 			nulls++
 			continue

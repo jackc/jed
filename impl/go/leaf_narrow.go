@@ -349,3 +349,204 @@ func putBEUint(b []byte, v uint64) {
 		v >>= 8
 	}
 }
+
+// leafDict makes this process write a string column of a leaf as a dictionary (JED_LEAF_DICT=on,
+// with JED_LEAF_NARROW=on) when the region is smaller that way. The region's flags byte is
+// regionDict; then a u16 entry count D (at most 256), D u16 end offsets, the entries, and N one-byte
+// codes. An entry is a value's whole span (tag and body; the empty span for NULL), so a reader
+// returns it as it returns a plain region's span. Two values share an entry only when both are
+// inline-plain strings with equal content, or both NULL; a compressed or external value always has
+// its own entry. Entries are in order of first use. The saving is
+//
+//	N − 2 − 2·D + (bytes of the spans that repeat an earlier one), when positive and D ≤ 256
+//
+// and joins the content-dependent leaf size of the key prefix and base-plus-offsets columns.
+var leafDict = os.Getenv("JED_LEAF_DICT") == "on" && leafNarrow
+
+// regionDict is the region flags byte of a dictionary region.
+const regionDict byte = 2
+
+const (
+	dictNull   = iota // a NULL: every NULL of the region shares the empty entry
+	dictShared        // an inline-plain string: shares an entry with equal content
+	dictOwn           // any other form: its own entry
+)
+
+// dictItem is one value as the dictionary sees it.
+type dictItem struct {
+	kind    uint8
+	payload []byte // dictShared: the string's content
+}
+
+// dictAcc accumulates a region's dictionary facts.
+type dictAcc struct {
+	seen    map[string]struct{}
+	d, dup  int
+	hasNull bool
+}
+
+func (a *dictAcc) add(it dictItem, header int) {
+	switch it.kind {
+	case dictNull:
+		if !a.hasNull {
+			a.hasNull = true
+			a.d++
+		}
+	case dictOwn:
+		a.d++
+	default:
+		if a.seen == nil {
+			a.seen = map[string]struct{}{}
+		}
+		if _, ok := a.seen[string(it.payload)]; ok {
+			a.dup += header + len(it.payload)
+		} else {
+			a.seen[string(it.payload)] = struct{}{}
+			a.d++
+		}
+	}
+}
+
+// dictSaving is the bytes a dictionary saves in a region of n values with d entries and dup bytes
+// of repeated spans; 0 when the plain region is no larger or the entries exceed a one-byte code.
+func dictSaving(n, d, dup int) int {
+	if d > 256 {
+		return 0
+	}
+	if s := n - 2 - 2*d + dup; s > 0 {
+		return s
+	}
+	return 0
+}
+
+// spanDictItem classifies a stored span.
+func spanDictItem(span []byte) dictItem {
+	if len(span) == 0 {
+		return dictItem{kind: dictNull}
+	}
+	if span[0] == 0x00 || span[0] == tagInlineBare {
+		if p, ok := inlineStringPayload(span); ok {
+			return dictItem{kind: dictShared, payload: p}
+		}
+	}
+	return dictItem{kind: dictOwn}
+}
+
+// rowDictItems classifies a decoded row's dictionary-column values into out (one per shape.dictCols).
+// A value is inline-plain when the record's disposition plan leaves it so; the plan is consulted only
+// when the all-inline record does not fit RECORD_MAX.
+func rowDictItems(shape leafShape, pcap pageCap, key []byte, row storedRow, out []dictItem) {
+	size := len(key) + shape.fixedBytes
+	for _, c := range shape.varCols {
+		inline, _ := valueFacts(shape.colTypes[c], row[c])
+		size += inline
+	}
+	var plan *recordPlan
+	if size > recordMaxFor(pcap.c, len(shape.colTypes)) {
+		p := planDispositions(shape.colTypes, key, row, pcap)
+		plan = &p
+	}
+	for j, c := range shape.dictCols {
+		v := row[c]
+		switch {
+		case v.IsNull():
+			out[j] = dictItem{kind: dictNull}
+		case plan != nil && plan.disp[c] != dispInline:
+			out[j] = dictItem{kind: dictOwn}
+		case v.Kind == ValUnfetched && v.unfetched().Form != 0x00:
+			// A stored large form whose record now fits: its content is not at hand. Counted as its
+			// own entry (see leaf-structural.md, open point).
+			out[j] = dictItem{kind: dictOwn}
+		default:
+			out[j] = dictItem{kind: dictShared, payload: planningPayload(shape.colTypes[c], v)}
+		}
+	}
+}
+
+// rowsDictSaving is the bytes dictionaries save in a leaf holding these decoded rows.
+func rowsDictSaving(shape leafShape, pcap pageCap, keys [][]byte, rows []storedRow) int {
+	if len(shape.dictCols) == 0 {
+		return 0
+	}
+	accs := make([]dictAcc, len(shape.dictCols))
+	items := make([]dictItem, len(shape.dictCols))
+	for i, row := range rows {
+		rowDictItems(shape, pcap, keys[i], row, items)
+		for j, c := range shape.dictCols {
+			accs[j].add(items[j], inlineHeaderLen(shape.colTypes[c]))
+		}
+	}
+	total := 0
+	for j := range accs {
+		total += dictSaving(len(rows), accs[j].d, accs[j].dup)
+	}
+	return total
+}
+
+// packedDictSaving is rowsDictSaving for a packed leaf, read from its stored spans.
+func packedDictSaving(shape leafShape, l *paxLeaf, n int) int {
+	total := 0
+	for _, c := range shape.dictCols {
+		var acc dictAcc
+		header := inlineHeaderLen(shape.colTypes[c])
+		for i := 0; i < n; i++ {
+			span, err := l.value(c, i)
+			if err != nil {
+				return 0
+			}
+			acc.add(spanDictItem(span), header)
+		}
+		total += dictSaving(n, acc.d, acc.dup)
+	}
+	return total
+}
+
+// leafSizes is the content-dependent size facts of a dirty decoded leaf, kept with the node so an
+// insert updates them for one row instead of recomputing them for the leaf: each dictionary column's
+// entry set and each base-plus-offsets column's value span. Both only ever grow under inserts; any
+// other change to the node's rows drops the cache.
+type leafSizes struct {
+	n     int
+	dicts []dictAcc
+	fors  []forRange
+	items []dictItem // scratch
+}
+
+func newLeafSizes(shape leafShape, pcap pageCap, keys [][]byte, rows []storedRow) *leafSizes {
+	sz := &leafSizes{
+		dicts: make([]dictAcc, len(shape.dictCols)),
+		fors:  make([]forRange, len(shape.forCols)),
+		items: make([]dictItem, len(shape.dictCols)),
+	}
+	for i, row := range rows {
+		sz.addRow(shape, pcap, keys[i], row)
+	}
+	return sz
+}
+
+func (sz *leafSizes) addRow(shape leafShape, pcap pageCap, key []byte, row storedRow) {
+	sz.n++
+	for j, fc := range shape.forCols {
+		if v := row[fc.col]; !v.IsNull() {
+			sz.fors[j].add(forSlot(fc.w, v))
+		}
+	}
+	if len(shape.dictCols) == 0 {
+		return
+	}
+	rowDictItems(shape, pcap, key, row, sz.items)
+	for j, c := range shape.dictCols {
+		sz.dicts[j].add(sz.items[j], inlineHeaderLen(shape.colTypes[c]))
+	}
+}
+
+func (sz *leafSizes) saving(shape leafShape) int {
+	total := 0
+	for j, fc := range shape.forCols {
+		total += forSaving(sz.n, fc.w, sz.fors[j].lo, sz.fors[j].hi, sz.fors[j].any)
+	}
+	for j := range shape.dictCols {
+		total += dictSaving(sz.n, sz.dicts[j].d, sz.dicts[j].dup)
+	}
+	return total
+}

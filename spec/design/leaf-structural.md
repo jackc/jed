@@ -1,9 +1,9 @@
 # Leaf pages: structural size reductions (proposal)
 
-**Status: proposal. Steps 1 to 6 are prototyped in the Go core only**, behind `JED_LEAF_NARROW=on`,
+**Status: proposal. Steps 1 to 7 are prototyped in the Go core only**, behind `JED_LEAF_NARROW=on`,
 `JED_LEAF_ELIDE_KEY=on`, `JED_LEAF_FIXED_KEY=on`, `JED_LEAF_BARE_STRING=on`,
-`JED_LEAF_KEY_PREFIX=on` and `JED_LEAF_FOR=on`. Steps 5 and 6 are encoding steps: they make a leaf's
-size depend on its contents (§7, §8).
+`JED_LEAF_KEY_PREFIX=on`, `JED_LEAF_FOR=on` and `JED_LEAF_DICT=on`. Steps 5 to 7 are encoding steps:
+they make a leaf's size depend on its contents (§7 to §9).
 
 **Correction to §4 to §7.** Until step 6 the prototype's `leafOverhead` charged each elided key
 column a value directory (`1 + 2·N` bytes) it does not have, so table leaves filled 1% to 4% short.
@@ -327,7 +327,87 @@ the randomized comparison test with every switch on. The corpus fails 20 of 752 
 and 19 in disk mode, all pins; the one new failure is an `EXPLAIN` estimate. With the switches off the
 unit tests pass.
 
-## 9. Remaining steps
+## 9. Step 7: string dictionaries (prototyped)
+
+A `text`, `bytea` or `json` column of a leaf may be written as a dictionary.
+
+**Page.** The region's flags byte is `2`. Then a `u16` entry count `D` (1 to 256), `D` `u16` end
+offsets, the entries, and `N` one-byte codes. An entry is a value's whole span, tag included; the
+empty span is NULL. Entries are in order of first use.
+
+**Which values share an entry.** Two NULLs, or two inline-plain strings with equal content. A
+compressed or external value always has its own entry, even if its bytes equal another's. This keeps
+the rule a function of each value's stored form and content, which both a decoded leaf and a page
+can supply.
+
+**Size.** One more saving term per such column, where `dup` is the total bytes of the spans that
+repeat an earlier one:
+
+```
+saving = N − 2 − 2·D + dup when positive and D ≤ 256, else 0
+```
+
+- A page supplies each value's form and content from its span. A decoded row supplies them from its
+  values and its disposition plan; the plan is computed only when the all-inline record exceeds
+  `RECORD_MAX`, since otherwise every value is inline-plain.
+- The split-point scan makes one forward and one backward pass per column, each with a set of the
+  contents seen, to get `D` and `dup` for every prefix and suffix. A half's payload stays monotone:
+  it is the smaller of two nondecreasing sizes, and passing 256 entries only raises it.
+- One insert can add the 257th entry and return the whole region to its plain size.
+
+**Read.** In place, with no rebuild: the region's directory and blob are the entries', and value `i`
+is entry `codes[i]`. The three accessors that read a variable region (null test, span, span length)
+take that one indirection; nothing above them changed, and an inline value is still a view of the
+page.
+
+**Result**, all seven switches on:
+
+| | steps 1–6 | steps 1–7 |
+|---|---|---|
+| compacted file | 114.3 MB | 95.8 MB |
+| leaf pages | 14,562 | 12,202 |
+| leaf payload | 93.8 MB | 80.0 MB |
+| bytes written during the bulk load | 5,753 MB | 5,568 MB |
+
+Per row: `sessions.user_agent` 115.8 → 27.5 bytes, `orders.status` 11.1 → 1.3, `orders.currency`
+6.0 → 1.1, `users.country` 5.0 → 2.0. Columns of distinct values (`email`, `sku`, `ip`) do not
+change. Over half the saving is `user_agent`, which the generator draws from a short list; real
+data decides this number more than any other in this document.
+
+Timings, two alternating runs each, and three alternating rounds of the lookup test:
+
+- **The bulk load is about 8% slower**: 52.7 to 54.5 s against 47.3 to 50.5 s. A first version was
+  25% slower (61.4 and 61.8 s): it recomputed a whole leaf's dictionary saving on every insert once
+  the leaf was past its plain capacity, 8.7 s of the load's CPU. A dirty decoded leaf now keeps its
+  size facts (each dictionary column's entry set, each narrow-integer column's value span) and an
+  insert adds one row to them; a replaced row drops them. The file is byte-for-byte the same size
+  with the same leaf counts either way. What remains, by profile: about 2 s of dictionary sizing
+  (the first change to a clean leaf in each commit still measures it whole), about 2 s building
+  dictionaries in the encoder, and the denser leaves of §7.
+- Scans and single-row commits did not move outside noise.
+- Point lookups: best pass 1.36 µs in two rounds against 1.38 to 1.50 µs. In one round the
+  dictionary configuration ran at 2.9 µs for the primary-key lookup with the index lookup near
+  normal; not reproduced in the other two rounds and not explained.
+
+**What was run**, Go core, all seven switches on: `mise run sim:sweep 1..100 all go` (2,200 traces),
+and 1,320 more with the deferred-interior and CRC-32-manifest switches; the randomized comparison
+test with every switch on; the corpus, which fails 21 of 752 files in memory mode and 19 in disk mode,
+all pins (against step 6: one storage-limit test more, and another whose trip point moved the other
+way). The unit tests fail 29 layout-pinned tests, against 14 at step 6. The 15 new ones read as pins from their
+messages: tests that pad rows with a repeated string to fill pages and then assert a page count, a
+storage limit, a manifest overflow or a file size. They were not examined beyond their messages.
+With the switches off the unit tests pass.
+
+**Open points.**
+
+- A value stored in a large form whose record now fits inline is counted as its own entry by a
+  decoded leaf, because its content is not at hand, but would share an entry once written inline and
+  read back. The two sizes then differ for the same leaf. Whether such a value is in fact rewritten
+  inline was not checked.
+- Only strings are eligible. `decimal` and the other variable-width types are not.
+- A scan comparing a column with a literal could compare entries once instead of every value.
+
+## 10. Remaining steps
 
 Structural:
 
@@ -339,12 +419,10 @@ Structural:
 4. **Commit cost per touched leaf.** A commit re-encodes every record of a leaf it changes, so denser
    leaves make random-insert loads slower (§7). Each further density gain adds to this.
 
-Encodings still to do, each one more saving term in the size rule of §7: string dictionaries (about
-12 MB of the 120.0 MB payload before step 5, inferred) and decimals as scaled integers (6.5 MB). A
-dictionary's saving depends on the distinct values of a region, so the split-point scan cannot use
-running minima as §8 does; it needs a distinct count per candidate half.
+Encodings still to do: decimals as scaled integers (estimated 6.5 MB of the 120.0 MB payload
+before step 5).
 
-## 10. Work if adopted
+## 11. Work if adopted
 
 `format.md` (*Leaf node*, *Record*, *Value codec*, `leafOverhead`), `bplus-reshape.md` §4, `packed-leaf.md`,
 `lazy-record.md`; every golden; the cost and storage-limit pins above; the Ruby reference and

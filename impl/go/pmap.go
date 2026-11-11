@@ -83,6 +83,8 @@ type pnode struct {
 	origin   pageRef
 	sameKeys bool
 	stale    bool
+	// PROTOTYPE (leaf_narrow.go): sizes caches a dirty decoded leaf's content-dependent size facts.
+	sizes *leafSizes
 }
 
 // ref is this node's page and tag (the zero pageRef while dirty).
@@ -489,7 +491,7 @@ func (n *pnode) isLeaf() bool { return len(n.children) == 0 }
 func (n *pnode) payload(pcap pageCap, shape leafShape) int {
 	if n.isLeaf() {
 		size := n.totalWeight() + leafOverhead(n.keyLen(), shape)
-		size -= n.contentSaving(shape)
+		size -= n.contentSaving(pcap, shape)
 		return size
 	}
 	return interiorPayload(pcap, n.keys)
@@ -497,7 +499,7 @@ func (n *pnode) payload(pcap pageCap, shape leafShape) int {
 
 // contentSaving is the bytes a leaf's content-dependent encodings save (leaf_narrow.go): the shared
 // key prefix and base-plus-offsets columns.
-func (n *pnode) contentSaving(shape leafShape) int {
+func (n *pnode) contentSaving(pcap pageCap, shape leafShape) int {
 	c := n.keyLen()
 	saving := 0
 	if leafKeyPrefix && c >= 2 {
@@ -508,11 +510,19 @@ func (n *pnode) contentSaving(shape leafShape) int {
 			saving += leafPrefixSaving(c, n.keyAt(0), n.keyAt(c-1))
 		}
 	}
-	if len(shape.forCols) > 0 && c > 0 {
+	if (len(shape.forCols) > 0 || len(shape.dictCols) > 0) && c > 0 {
 		if n.packed != nil {
 			saving += packedFORSaving(shape.forCols, n.packed.dirs, c)
+			saving += packedDictSaving(shape, n.packed.dirs, c)
 		} else {
-			saving += rowsFORSaving(shape.forCols, n.vals)
+			sz := n.sizes
+			if sz == nil || sz.n != len(n.vals) {
+				sz = newLeafSizes(shape, pcap, n.keys, n.vals)
+				if n.page == 0 && n.owner != nil {
+					n.sizes = sz // a dirty node is its writer's alone
+				}
+			}
+			saving += sz.saving(shape)
 		}
 	}
 	return saving
@@ -520,12 +530,12 @@ func (n *pnode) contentSaving(shape leafShape) int {
 
 // payloadAtMost reports whether a leaf's payload is at most limit. The content-dependent saving is
 // computed only when the size without it does not already decide.
-func (n *pnode) payloadAtMost(limit int, shape leafShape) bool {
+func (n *pnode) payloadAtMost(limit int, pcap pageCap, shape leafShape) bool {
 	plain := n.totalWeight() + leafOverhead(n.keyLen(), shape)
 	if plain <= limit {
 		return true
 	}
-	return plain-n.contentSaving(shape) <= limit
+	return plain-n.contentSaving(pcap, shape) <= limit
 }
 
 // interiorPayload is an interior node's payload for these separators (format.md "Interior node";
@@ -1417,6 +1427,7 @@ func buildLeaf(keys [][]byte, vals []storedRow, weights []uint32, cap pageCap, s
 	if payload > cap.c && n >= 2 {
 		payload -= leafPrefixSaving(n, keys[0], keys[n-1])
 		payload -= rowsFORSaving(shape.forCols, vals)
+		payload -= rowsDictSaving(shape, cap, keys, vals)
 	}
 	if payload <= cap.c || n < 2 {
 		return insOut{whole: &pnode{keys: keys, vals: vals, weights: weights, owner: owner}}
@@ -1448,19 +1459,46 @@ func buildLeaf(keys [][]byte, vals []storedRow, weights []uint32, cap pageCap, s
 			}
 		}
 	}
-	forSaved := func(count int, at int, spans [][]forRange) int {
+	// Dictionary columns: each column's entry count and repeated bytes over every prefix and suffix.
+	type dictFacts struct{ d, dup int }
+	dpre := make([][]dictFacts, len(shape.dictCols))
+	dsuf := make([][]dictFacts, len(shape.dictCols))
+	if len(shape.dictCols) > 0 {
+		items := make([][]dictItem, n)
+		for i := range items {
+			items[i] = make([]dictItem, len(shape.dictCols))
+			rowDictItems(shape, cap, keys[i], vals[i], items[i])
+		}
+		for j, c := range shape.dictCols {
+			header := inlineHeaderLen(shape.colTypes[c])
+			dpre[j], dsuf[j] = make([]dictFacts, n+1), make([]dictFacts, n+1)
+			var fwd, back dictAcc
+			for i := 0; i < n; i++ {
+				fwd.add(items[i][j], header)
+				dpre[j][i+1] = dictFacts{fwd.d, fwd.dup}
+			}
+			for i := n - 1; i >= 0; i-- {
+				back.add(items[i][j], header)
+				dsuf[j][i] = dictFacts{back.d, back.dup}
+			}
+		}
+	}
+	forSaved := func(count int, at int, spans [][]forRange, facts [][]dictFacts) int {
 		total := 0
 		for j, fc := range shape.forCols {
 			r := spans[j][at]
 			total += forSaving(count, fc.w, r.lo, r.hi, r.any)
 		}
+		for j := range shape.dictCols {
+			total += dictSaving(count, facts[j][at].d, facts[j][at].dup)
+		}
 		return total
 	}
 	leftpayload := func(m int) int {
-		return prefix[m] + leafOverhead(m, shape) - leafPrefixSaving(m, keys[0], keys[m-1]) - forSaved(m, m, pre)
+		return prefix[m] + leafOverhead(m, shape) - leafPrefixSaving(m, keys[0], keys[m-1]) - forSaved(m, m, pre, dpre)
 	}
 	rightpayload := func(m int) int {
-		return total - prefix[m] + leafOverhead(n-m, shape) - leafPrefixSaving(n-m, keys[m], keys[n-1]) - forSaved(n-m, m, suf)
+		return total - prefix[m] + leafOverhead(n-m, shape) - leafPrefixSaving(n-m, keys[m], keys[n-1]) - forSaved(n-m, m, suf, dsuf)
 	}
 	m, ok := splitPoint(1, n-1, payload, cap.c, edited == n-1, leftpayload, rightpayload)
 	if !ok {
@@ -1529,12 +1567,16 @@ func nodeInsert(n *pnode, key []byte, val storedRow, weight uint32, old *storedR
 				*replaced = true
 				n.vals[i] = val
 				n.weights[i] = weight
+				n.sizes = nil // a replaced row can shrink the facts: recompute
 			} else {
 				n.keys = insertKeyAtMutable(n.keys, i, key)
 				n.vals = insertValAtMutable(n.vals, i, val)
 				n.weights = insertWeightAtMutable(n.weights, i, weight)
+				if n.sizes != nil {
+					n.sizes.addRow(shape, cap, key, val)
+				}
 			}
-			if n.payloadAtMost(cap.c, shape) || n.keyLen() < 2 {
+			if n.payloadAtMost(cap.c, cap, shape) || n.keyLen() < 2 {
 				return insOut{whole: n}, nil
 			}
 			// The unchanged builder selects the exact split point/separator. The edited node is
@@ -1615,7 +1657,7 @@ func nodeInsert(n *pnode, key []byte, val storedRow, weight uint32, old *storedR
 // threshold at which delete rebalances it (format.md "Delete"). The root is exempt.
 func underfull(n *pnode, cap pageCap, shape leafShape) bool {
 	if n.isLeaf() {
-		return n.payloadAtMost(cap.c/2-1, shape)
+		return n.payloadAtMost(cap.c/2-1, cap, shape)
 	}
 	return n.payload(cap, shape) < cap.c/2
 }
