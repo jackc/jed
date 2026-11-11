@@ -1,7 +1,14 @@
 # Leaf pages: structural size reductions (proposal)
 
-**Status: proposal. Steps 1 to 4 are prototyped in the Go core only**, behind `JED_LEAF_NARROW=on`,
-`JED_LEAF_ELIDE_KEY=on`, `JED_LEAF_FIXED_KEY=on` and `JED_LEAF_BARE_STRING=on`. Nothing here is in `format.md`, the Ruby reference, or the Rust and TS cores, and the prototype does not bump
+**Status: proposal. Steps 1 to 6 are prototyped in the Go core only**, behind `JED_LEAF_NARROW=on`,
+`JED_LEAF_ELIDE_KEY=on`, `JED_LEAF_FIXED_KEY=on`, `JED_LEAF_BARE_STRING=on`,
+`JED_LEAF_KEY_PREFIX=on` and `JED_LEAF_FOR=on`. Steps 5 and 6 are encoding steps: they make a leaf's
+size depend on its contents (§7, §8).
+
+**Correction to §4 to §7.** Until step 6 the prototype's `leafOverhead` charged each elided key
+column a value directory (`1 + 2·N` bytes) it does not have, so table leaves filled 1% to 4% short.
+The results in §4 to §7 were measured with that error. With it fixed, steps 1 to 5 give a 122.4 MB
+file (15,596 leaves), not 126.1 MB; §8 compares against the corrected figure. Nothing here is in `format.md`, the Ruby reference, or the Rust and TS cores, and the prototype does not bump
 the format version.
 
 ## 1. Where the bytes are
@@ -178,19 +185,166 @@ switch on. The memory-mode corpus fails 16 of 752 files, all pins: thirteen cost
 estimates and the three resource trip points. No file returned wrong rows. The disk-mode pass was not
 reached. With the switches off the unit tests pass.
 
-## 7. Remaining steps
+## 7. Step 5: shared key prefix (prototyped)
 
-1. **Key directory of index trees (1.7% of the remaining leaf bytes).** See §5.
+The first step whose saving depends on a page's contents, and so the first to change the split rule.
+
+**Page.** Layout bit 3. After the layout byte (and the fixed key length, when present) come a `u16`
+prefix length `p` and the prefix; the key directory and key blob then hold each key without its
+first `p` bytes (a fixed-length tree's keys are `key_len − p` bytes each, still with no directory).
+The prefix is the common prefix of the leaf's first and last key, which every key between them
+shares because keys are sorted. A leaf stores it only when that saves bytes (`N·p > p + 2`);
+otherwise the bit is clear and the leaf is as in steps 1 to 4.
+
+**Size.** `record_size` and `leafOverhead` are unchanged. A leaf's payload is
+
+```
+Σ record_size + leafOverhead(N, shape) − saving(N, first key, last key)
+saving = N·p − p − 2 when the prefix is stored, else 0
+```
+
+Every place that measures a leaf uses this: the overflow test, the split-point scan (each candidate
+half is measured with its own prefix), and the underfull test that triggers a merge. Consequences:
+
+- The size is a function of the weights and of two keys, so a split is still planned without
+  encoding anything. The split-point scan's requirement holds: a half's payload is monotone in the
+  split position, since a key added to a half adds at least its suffix and the half's prefix can
+  only shorten.
+- A two-record leaf still fits (the saving is never negative), so `RECORD_MAX` is unchanged.
+- An insert at either end of a leaf can shorten the prefix, growing the page by more than the new
+  record. A delete can only shrink it.
+- Two underfull leaves can merge into a leaf that overflows, because the merged prefix is shorter
+  than either's. The existing merge path already splits an overflowing merge result.
+- The choice is deterministic: the prefix is the longest common one, stored exactly when it saves
+  bytes.
+
+**Read.** The parser keeps the prefix and the suffixes as views of the page. A leaf search compares
+the probe with the prefix once and then with suffixes, a key copied out for a mutation is assembled
+from the two parts, and a record's weight adds the two lengths, so point lookups and inserts never
+materialize the keys. Any other reader of a key (range bounds, scans that return keys, serialization
+of a clean leaf) rebuilds all of the leaf's keys into one allocation on first use, and the leaf keeps
+them; such a leaf is larger than its page by the bytes the prefix saved.
+
+**Result**, all five switches on:
+
+| | v50 | steps 1–4 | steps 1–5 |
+|---|---|---|---|
+| compacted file | 187.7 MB | 151.2 MB | 126.1 MB |
+| leaf pages | 23,910 | 19,259 | 16,066 |
+| interior pages | | 95 | 69 |
+| leaf payload | 150.8 MB | 120.0 MB | 101.5 MB |
+| bytes written during the bulk load | 6,444 MB | 6,180 MB | 5,794 MB |
+| bytes written per single-row update commit | | 107,151 | 100,765 |
+
+The 18.5 MB of payload saved is less than the 21.7 MB estimated, because index leaves are filled by
+random inserts and stay about 60% full: the estimate counted bytes, and the file shrinks only by
+whole pages. Index trees gain the most (`orders_status_created` 1,364 → 645 leaves,
+`orders_customer` 939 → 540); a table keyed by a random token (`sessions`) gains nothing.
+
+Timings, two alternating runs of each configuration, plus four alternating rounds of the lookup test:
+
+- Scans (resident and first-touch) and single-row commits did not move outside noise.
+- Primary-key lookup, best pass over four rounds: 1.39 to 1.54 µs against 1.41 to 1.49 µs. Index
+  lookup: 3.47 to 4.06 µs against 3.54 to 4.02 µs.
+- **The bulk load is about 12% slower**: 46.9 to 48.7 s against 42.4 to 42.8 s, in every run. The
+  cause is the density itself. The load inserts 500 rows per commit, and index inserts land on random
+  leaves; a commit decodes, re-encodes and walks for overflow pointers every record of every leaf it
+  touches. With the prefix, 6% fewer leaves were encoded during the load (687,580 against 729,373) but
+  they held 20% more records (226.1M against 188.9M), and those three per-record passes are about
+  19 s of the load's 53 s of CPU time. Materializing keys at parse cost a further 2 s in a first version and was removed
+  (see *Read*); removing it did not change the load time measurably. Any change that puts more
+  records in a leaf has this cost on a random-insert load, as a larger page size would. Steps 1 to 4 did not show it measurably;
+  why not was not investigated.
+
+**What was run**, Go core, all five switches on: the unit tests (the layout-pinned failures of steps 1
+to 4, plus three tests that require a tree to span several pages and no longer get one);
+`mise run sim:sweep 1..100 all go` (2,200 traces), and 1,320 more together with the deferred-interior
+and CRC-32-manifest switches; the randomized comparison test with every switch on. The corpus fails
+19 of 752 files in memory mode and 18 in disk mode, all pins: costs, `EXPLAIN` estimates and resource
+trip points. Against steps 1 to 4 the new failures are two costs and one `EXPLAIN` estimate. With the
+switches off the unit tests pass.
+
+**Not done.** Interior pages keep whole separators. Range-bound searches and scans still rebuild a
+leaf's keys. The integrity check does not verify that a stored prefix is the longest one.
+
+## 8. Step 6: narrow integers (prototyped)
+
+A fixed-width column whose value body is the big-endian image of its order (the integers, `date`,
+`timestamp`, `timestamptz`; not floats, `boolean`, `uuid` or `interval`, and not an elided key
+column) may be written as a base plus narrow offsets.
+
+**Page.** The region's flags byte is `1`. After the null bitmap come the base (the smallest present
+value, at the column's width `w`), a `u8` offset width `bw` (0, 1, 2 or 4, below `w`: the narrowest
+that holds largest − smallest), and `N` offsets of `bw` bytes; a NULL's offset is 0. `bw = 0` is a
+column with one value. The region is written this way only when smaller: `N·(w − bw) > w + 1`.
+
+**Size.** As in §7, with one more term per such column:
+
+```
+saving = N·(w − bw) − (w + 1) when positive, else 0
+```
+
+- The split-point scan needs each column's smallest and largest present value over every prefix and
+  every suffix of the leaf's rows: two passes over the rows per column, done only when a leaf
+  overflows. Each candidate half is then measured in O(columns). A half's payload stays monotone in
+  the split position: a row added to a half adds at least its offsets, and `bw` can only widen.
+- The overflow and underfull tests first compare the size without any content-dependent saving,
+  and compute the savings only when that does not decide.
+- One insert can widen `bw` for every row of a column, growing the page by up to `N·(w − 1)` bytes.
+  The leaf then splits, as for any overflow.
+
+**Read.** The parser rebuilds the dense full-width slots into one allocation per column, so every
+reader (row decode, lazy decode, columnar scans, in-place filters) is unchanged. A resident leaf is
+larger than its page by the bytes saved. Not done: reading the narrow slots in place, and comparing a
+scan's literal against `literal − base`.
+
+**Result**, all six switches on, against steps 1 to 5 with the overhead correction:
+
+| | steps 1–5 (corrected) | steps 1–6 |
+|---|---|---|
+| compacted file | 122.4 MB | 114.3 MB |
+| leaf pages | 15,596 | 14,562 |
+| leaf payload | 101.5 MB | 93.8 MB |
+| bytes written during the bulk load | 5,779 MB | 5,753 MB |
+
+The 7.7 MB of payload saved compares with 8.6 MB estimated. Per row: `events.seq` 8.1 → 1.2 bytes,
+`events.ts` and `orders.created_at` 8.1 → 4.2, the 4-byte foreign keys 4.1 → 2.2. These widths
+reflect the generator's value ranges.
+
+Timings, two alternating runs each, and three alternating rounds of the lookup test:
+
+- Bulk load: 48.2 and 49.5 s against 46.5 and 48.4 s. Not separable from noise.
+- Resident scans, single-row commits and point lookups (best pass 1.39 to 1.46 µs against 1.38 to
+  1.53 µs for the primary key) did not move.
+- One first-touch scan, of `line_items`, took 40 ms in both runs against 25 and 27 ms. Earlier
+  baseline runs of the same scan ranged from 25 to 49 ms, so this is not established; if real it is
+  the slot rebuild at parse. The other two first-touch scans did not move.
+
+**What was run**, Go core, all six switches on: the unit tests (layout pins only; two more than
+step 5, a page-count pin and a corruption test whose table now fits in one leaf); `mise run sim:sweep
+1..100 all go` (2,200 traces), and 1,320 more with the deferred-interior and CRC-32-manifest switches;
+the randomized comparison test with every switch on. The corpus fails 20 of 752 files in memory mode
+and 19 in disk mode, all pins; the one new failure is an `EXPLAIN` estimate. With the switches off the
+unit tests pass.
+
+## 9. Remaining steps
+
+Structural:
+
+1. **Key directory of index trees.** See §5. Worth less after step 5, which already removed the
+   shared bytes of those keys.
 2. **Presence tag (under 1%).** See §2.
-3. **Resident size.** Rebuild an elided column lazily, on first touch, so a leaf whose key columns
-   are never read stays the size of its page.
+3. **Resident size.** Rebuild an elided column lazily, and give range scans the prefix-aware
+   comparison point lookups have, so a resident leaf stays the size of its page.
+4. **Commit cost per touched leaf.** A commit re-encodes every record of a leaf it changes, so denser
+   leaves make random-insert loads slower (§7). Each further density gain adds to this.
 
-After these the structural list is spent. What is left in a leaf is content: keys are 40% of the
-leaf bytes, and the experiment's encoding estimates (a shared key prefix, frame-of-reference
-integers, dictionaries), taken before steps 3 and 4, put the leaf payload at 47 to 71 MB against
-125.7 MB. (The estimator does not yet read the string form of step 4.)
+Encodings still to do, each one more saving term in the size rule of §7: string dictionaries (about
+12 MB of the 120.0 MB payload before step 5, inferred) and decimals as scaled integers (6.5 MB). A
+dictionary's saving depends on the distinct values of a region, so the split-point scan cannot use
+running minima as §8 does; it needs a distinct count per candidate half.
 
-## 8. Work if adopted
+## 10. Work if adopted
 
 `format.md` (*Leaf node*, *Record*, *Value codec*, `leafOverhead`), `bplus-reshape.md` §4, `packed-leaf.md`,
 `lazy-record.md`; every golden; the cost and storage-limit pins above; the Ruby reference and

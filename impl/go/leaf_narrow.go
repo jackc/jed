@@ -60,7 +60,48 @@ const (
 	leafLayoutNarrow   = 1 // every directory entry is a u16
 	leafLayoutElideKey = 2 // key-derivable columns have no region
 	leafLayoutFixedKey = 4 // a u16 key length follows; no key directory
+	leafLayoutPrefix   = 8 // a u16 prefix length and the prefix follow; the key blob holds suffixes
 )
+
+// leafKeyPrefix makes this process write a leaf's shared key prefix once (JED_LEAF_KEY_PREFIX=on,
+// with JED_LEAF_NARROW=on): the bytes common to the leaf's first and last key, which every key
+// between them shares because keys are sorted. The key directory and blob then hold suffixes. This is
+// the first content-dependent layout: a leaf's size is
+//
+//	Σ record_size + leafOverhead(N, shape) − leafPrefixSaving(N, first key, last key)
+//
+// so the split and merge rules measure the keys as well as the weights. record_size is unchanged.
+// A reader rebuilds the full keys into one allocation when it parses the page.
+var leafKeyPrefix = os.Getenv("JED_LEAF_KEY_PREFIX") == "on" && leafNarrow
+
+// leafPrefixLen is the length of the prefix a leaf of n keys stores once: the common prefix of its
+// first and last key when storing it saves bytes (n·p > p + 2), else 0.
+func leafPrefixLen(n int, first, last []byte) int {
+	if !leafKeyPrefix || n < 2 {
+		return 0
+	}
+	p := 0
+	for p < len(first) && p < len(last) && first[p] == last[p] {
+		p++
+	}
+	if p > 0xFFFF {
+		p = 0xFFFF
+	}
+	if n*p <= p+2 {
+		return 0
+	}
+	return p
+}
+
+// leafPrefixSaving is the bytes the shared prefix removes from a leaf of n keys: each key loses p
+// bytes, and the page gains the u16 prefix length and the prefix.
+func leafPrefixSaving(n int, first, last []byte) int {
+	p := leafPrefixLen(n, first, last)
+	if p == 0 {
+		return 0
+	}
+	return n*p - p - 2
+}
 
 // leafFlagsFor is the layout byte of a leaf in a tree whose keys have the fixed length keyLen (0 when
 // they vary).
@@ -162,4 +203,149 @@ func keyColumnSlot(ty colType, key []byte) []byte {
 	slot := make([]byte, w)
 	putKeySlot(slot, ty, key[at:at+w])
 	return slot
+}
+
+// leafFOR makes this process write an integer-like fixed-width column of a leaf as a base plus narrow
+// offsets (JED_LEAF_FOR=on, with JED_LEAF_NARROW=on): the region's flags byte is regionFOR, and after
+// the null bitmap come the base (the smallest present value, at the column's width), a u8 offset
+// width bw (0, 1, 2 or 4, below the column's width) and N offsets of bw bytes (a NULL's is 0). The
+// region is written this way only when it is smaller: N·(w − bw) > w + 1. Like the key prefix, this
+// makes a leaf's size depend on its contents:
+//
+//	leaf size = Σ record_size + leafOverhead − prefix saving − Σ over such columns of forSaving
+//
+// record_size is unchanged. A reader rebuilds the dense full-width slots when it parses the page.
+var leafFOR = os.Getenv("JED_LEAF_FOR") == "on" && leafNarrow
+
+// regionFOR is the region flags byte of a base-plus-offsets fixed-width region.
+const regionFOR byte = 1
+
+// forCol is one column a leaf may write as base plus offsets.
+type forCol struct {
+	col, w int
+}
+
+// forEligible reports whether a column's value body is a big-endian unsigned image of its order (the
+// sign-flipped integers and date/time instants), so that a range of nearby values has a small
+// difference.
+func forEligible(ty colType) bool {
+	if !leafFOR || ty.Composite || ty.Elem != nil || ty.RangeElem != nil || (leafElideKey && ty.keyAt != 0) {
+		return false
+	}
+	switch ty.Scalar {
+	case scalarInt16, scalarInt32, scalarInt64, scalarTimestamp, scalarTimestamptz, scalarDate:
+		return true
+	}
+	return false
+}
+
+// forSlot is the unsigned image of an eligible column's present value: its value body read as a
+// big-endian integer (format.md *Value codec*: the sign bit flipped at the column's width).
+func forSlot(w int, v Value) uint64 {
+	switch w {
+	case 2:
+		return uint64(uint16(v.Int) ^ 0x8000)
+	case 4:
+		return uint64(uint32(v.Int) ^ 0x80000000)
+	}
+	return uint64(v.Int) ^ (1 << 63)
+}
+
+// forWidth is the offset width for present values spanning [lo, hi] in a column of width w, or w when
+// no narrower width holds them.
+func forWidth(w int, lo, hi uint64) int {
+	bw := 8
+	switch d := hi - lo; {
+	case d == 0:
+		bw = 0
+	case d < 1<<8:
+		bw = 1
+	case d < 1<<16:
+		bw = 2
+	case d < 1<<32:
+		bw = 4
+	}
+	if bw >= w {
+		return w
+	}
+	return bw
+}
+
+// forSaving is the bytes a column of width w saves in a leaf of n records whose present values span
+// [lo, hi] (any reports whether one is present): 0 when the plain region is no larger.
+func forSaving(n, w int, lo, hi uint64, any bool) int {
+	if !any {
+		lo, hi = 0, 0
+	}
+	bw := forWidth(w, lo, hi)
+	if s := n*(w-bw) - (w + 1); s > 0 {
+		return s
+	}
+	return 0
+}
+
+// forRange accumulates the span of a column's present values.
+type forRange struct {
+	lo, hi uint64
+	any    bool
+}
+
+func (r *forRange) add(v uint64) {
+	if !r.any {
+		r.lo, r.hi, r.any = v, v, true
+		return
+	}
+	if v < r.lo {
+		r.lo = v
+	}
+	if v > r.hi {
+		r.hi = v
+	}
+}
+
+// rowsFORSaving is the bytes base-plus-offsets regions save in a leaf holding rows.
+func rowsFORSaving(cols []forCol, rows []storedRow) int {
+	total := 0
+	for _, fc := range cols {
+		var r forRange
+		for _, row := range rows {
+			if v := row[fc.col]; !v.IsNull() {
+				r.add(forSlot(fc.w, v))
+			}
+		}
+		total += forSaving(len(rows), fc.w, r.lo, r.hi, r.any)
+	}
+	return total
+}
+
+// packedFORSaving is rowsFORSaving for a packed leaf, read from its dense slots.
+func packedFORSaving(cols []forCol, l *paxLeaf, n int) int {
+	total := 0
+	for _, fc := range cols {
+		reg := &l.regions[fc.col]
+		var r forRange
+		for i := 0; i < n; i++ {
+			if reg.bitmap[i/8]&(0x80>>(i%8)) != 0 {
+				continue
+			}
+			r.add(beUint(reg.body[i*fc.w : (i+1)*fc.w]))
+		}
+		total += forSaving(n, fc.w, r.lo, r.hi, r.any)
+	}
+	return total
+}
+
+func beUint(b []byte) uint64 {
+	var v uint64
+	for _, x := range b {
+		v = v<<8 | uint64(x)
+	}
+	return v
+}
+
+func putBEUint(b []byte, v uint64) {
+	for i := len(b) - 1; i >= 0; i-- {
+		b[i] = byte(v)
+		v >>= 8
+	}
 }

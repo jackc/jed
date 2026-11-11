@@ -2966,6 +2966,8 @@ type leafShape struct {
 	elided int
 	// keyLen is the one length of every key of the tree, or 0 when keys vary (leaf_narrow.go).
 	keyLen int
+	// forCols is the columns a leaf may write as base plus offsets (leaf_narrow.go).
+	forCols []forCol
 }
 
 func (s leafShape) k() int { return s.fixed + s.variable + s.elided }
@@ -2973,16 +2975,21 @@ func (s leafShape) k() int { return s.fixed + s.variable + s.elided }
 // leafShapeFor is the shape of a leaf for a table with these value-column types (an index tree —
 // empty colTypes — is {0, 0}).
 func leafShapeFor(colTypes []colType) leafShape {
-	fixed := 0
-	for _, ty := range colTypes {
+	fixed, elided := 0, 0
+	var forCols []forCol
+	for c, ty := range colTypes {
 		if leafElideKey && ty.keyAt != 0 {
+			elided++
 			continue
 		}
-		if _, ok := fixedValueWidth(ty); ok {
+		if w, ok := fixedValueWidth(ty); ok {
 			fixed++
+			if forEligible(ty) {
+				forCols = append(forCols, forCol{col: c, w: w})
+			}
 		}
 	}
-	return leafShape{fixed: fixed, variable: len(colTypes) - fixed}
+	return leafShape{fixed: fixed, variable: len(colTypes) - fixed - elided, elided: elided, forCols: forCols}
 }
 
 // leafOverhead is the bytes a v24 leaf's payload carries BEYOND Σ recordSize (format.md "Leaf
@@ -3852,7 +3859,14 @@ func encodeLeafPAXMemo(colTypes []colType, keyLen int, keys [][]byte, rows []sto
 		}
 		return appendU32(b, uint32(v))
 	}
-	// key directory (N end offsets) + key blob.
+	// key directory (N end offsets) + key blob. With a shared prefix, both hold suffixes.
+	kp := 0
+	if n >= 2 {
+		kp = leafPrefixLen(n, keys[0], keys[n-1])
+	}
+	if kp > 0 {
+		out[0] |= leafLayoutPrefix
+	}
 	if flags&leafLayoutFixedKey != 0 {
 		out = append(out, byte(keyLen>>8), byte(keyLen))
 		for i := 0; i < n; i++ {
@@ -3860,20 +3874,36 @@ func encodeLeafPAXMemo(colTypes []colType, keyLen int, keys [][]byte, rows []sto
 				return nil, newError(DataCorrupted, "a key's length is not its tree's fixed key length")
 			}
 		}
-	} else {
+	}
+	if kp > 0 {
+		out = append(out, byte(kp>>8), byte(kp))
+		out = append(out, keys[0][:kp]...)
+		for i := 0; i < n; i++ {
+			if len(keys[i]) < kp || !bytes.Equal(keys[i][:kp], keys[0][:kp]) {
+				return nil, newError(DataCorrupted, "a leaf key does not share its leaf's key prefix")
+			}
+		}
+	}
+	if flags&leafLayoutFixedKey == 0 {
 		off := 0
 		for i := 0; i < n; i++ {
-			off += len(keys[i])
+			off += len(keys[i]) - kp
 			out = appendDir(out, off)
 		}
 	}
 	for i := 0; i < n; i++ {
-		out = append(out, keys[i]...)
+		out = append(out, keys[i][kp:]...)
 	}
 	// column directory: absolute payload offset of each column region.
 	baseAfterColDir := len(out) + dw*(k+1)
 	colStart := make([]int, k+1)
 	cur := baseAfterColDir
+	// fors[c] is set for a column written as base plus offsets (leaf_narrow.go).
+	type forEnc struct {
+		base uint64
+		bw   int
+	}
+	fors := make([]*forEnc, k)
 	for c := 0; c < k; c++ {
 		colStart[c] = cur
 		bodies := 0
@@ -3883,8 +3913,20 @@ func encodeLeafPAXMemo(colTypes []colType, keyLen int, keys [][]byte, rows []sto
 		if !stored(c) {
 			continue // an empty region: its directory entry equals the next column's
 		}
-		if _, fixed := fixedValueWidth(colTypes[c]); fixed {
+		if w, fixed := fixedValueWidth(colTypes[c]); fixed {
 			cur += 1 + (n+7)/8 + bodies
+			if forEligible(colTypes[c]) {
+				var r forRange
+				for i := 0; i < n; i++ {
+					if !nulls[c][i] {
+						r.add(beUint(valBytes[c][i]))
+					}
+				}
+				if s := forSaving(n, w, r.lo, r.hi, r.any); s > 0 {
+					fors[c] = &forEnc{base: r.lo, bw: forWidth(w, r.lo, r.hi)}
+					cur -= s
+				}
+			}
 		} else {
 			cur += 1 + dw*n + bodies
 		}
@@ -3899,8 +3941,12 @@ func encodeLeafPAXMemo(colTypes []colType, keyLen int, keys [][]byte, rows []sto
 		if !stored(c) {
 			continue
 		}
-		out = append(out, 0) // region flags — reserved (the dictionary door)
-		if _, fixed := fixedValueWidth(colTypes[c]); fixed {
+		if fors[c] != nil {
+			out = append(out, regionFOR)
+		} else {
+			out = append(out, 0) // region flags — reserved (the dictionary door)
+		}
+		if w, fixed := fixedValueWidth(colTypes[c]); fixed {
 			bitmap := make([]byte, (n+7)/8)
 			for i, isNull := range nulls[c] {
 				if isNull {
@@ -3908,6 +3954,19 @@ func encodeLeafPAXMemo(colTypes []colType, keyLen int, keys [][]byte, rows []sto
 				}
 			}
 			out = append(out, bitmap...)
+			if f := fors[c]; f != nil {
+				at := len(out)
+				out = append(out, make([]byte, w+1+n*f.bw)...)
+				putBEUint(out[at:at+w], f.base)
+				out[at+w] = byte(f.bw)
+				at += w + 1
+				for i := 0; i < n; i++ {
+					if !nulls[c][i] {
+						putBEUint(out[at+i*f.bw:at+(i+1)*f.bw], beUint(valBytes[c][i])-f.base)
+					}
+				}
+				continue
+			}
 		} else {
 			voff := 0
 			for i := 0; i < n; i++ {
@@ -5754,16 +5813,27 @@ type paxRegion struct {
 	// elided marks a region the page does not store: its slots were rebuilt from the keys
 	// (leaf_narrow.go) and it contributes nothing to recordSize.
 	elided bool
+	// stored, when nonzero, is the region's bytes on the page: its slots were rebuilt from a base and
+	// narrow offsets (leaf_narrow.go).
+	stored int
 }
 
 type paxLeaf struct {
-	keyBlob []byte // the shared key bytes in the retained page payload
+	keyBlob []byte // the key bytes in the retained page payload (suffixes, under keyPrefix)
 	keyEnd  []byte // zero-copy N×u32 big-endian end-offset directory in the retained page
 	regions []paxRegion
 	// dw is the byte width of a directory entry: 4, or 2 in the narrow layout (leaf_narrow.go).
 	dw int
 	// keyLen, when nonzero, is the one length of every key: the page has no key directory.
 	keyLen int
+	// keyPrefix, when set, is the prefix every key shares: keyBlob and keyEnd hold the keys without
+	// it, and full holds them rebuilt, on first use.
+	keyPrefix []byte
+	full      atomic.Pointer[paxFullKeys]
+	n         int
+	// keyStored is the bytes the page spends on keys, layout byte included: key length, prefix,
+	// directory and blob.
+	keyStored int
 }
 
 // paxDirEnd reads entry i from a directory that parsePaxLeaf already validated in full. Keeping
@@ -5796,8 +5866,9 @@ func parsePaxLeaf(payload []byte, n int, colTypes []colType) (*paxLeaf, error) {
 	dw := 4
 	elide := false
 	keyLen := 0
+	var keyPrefix []byte
 	if n > 0 && len(payload) > 0 && payload[0] != 0 {
-		if payload[0]&^(leafLayoutNarrow|leafLayoutElideKey|leafLayoutFixedKey) != 0 {
+		if payload[0]&^(leafLayoutNarrow|leafLayoutElideKey|leafLayoutFixedKey|leafLayoutPrefix) != 0 {
 			return nil, newError(DataCorrupted, "unknown leaf layout")
 		}
 		pos = 1
@@ -5815,7 +5886,19 @@ func parsePaxLeaf(payload []byte, n int, colTypes []colType) (*paxLeaf, error) {
 			}
 			keyLen = int(kl)
 		}
+		if payload[0]&leafLayoutPrefix != 0 {
+			pl, err := readU16(payload, &pos)
+			if err != nil {
+				return nil, err
+			}
+			if pl == 0 || pos+int(pl) > len(payload) || (keyLen > 0 && int(pl) >= keyLen) {
+				return nil, newError(DataCorrupted, "PAX leaf key prefix length is invalid")
+			}
+			keyPrefix = payload[pos : pos+int(pl)]
+			pos += int(pl)
+		}
 	}
+	sufLen := keyLen - len(keyPrefix) // the stored length of each key, when fixed
 	readDir := func(pos *int) (uint32, error) {
 		if dw == 2 {
 			v, err := readU16(payload, pos)
@@ -5826,7 +5909,7 @@ func parsePaxLeaf(payload []byte, n int, colTypes []colType) (*paxLeaf, error) {
 	keyDir := pos
 	prev := uint32(0)
 	if keyLen > 0 {
-		prev = uint32(n * keyLen)
+		prev = uint32(n * sufLen)
 	}
 	for i := 0; i < n && keyLen == 0; i++ {
 		e, err := readDir(&pos)
@@ -5845,6 +5928,7 @@ func parsePaxLeaf(payload []byte, n int, colTypes []colType) (*paxLeaf, error) {
 	}
 	keyBytes := payload[keyBlob : keyBlob+int(prev)]
 	pos = keyBlob + int(prev)
+	keyStored := pos
 	colDir := pos
 	colRegions := colDir + (k+1)*dw
 	colPos := colDir
@@ -5874,16 +5958,27 @@ func parsePaxLeaf(payload []byte, n int, colTypes []colType) (*paxLeaf, error) {
 			w, _ := fixedValueWidth(ty)
 			body := make([]byte, n*w)
 			at := int(ty.keyAt) - 1
+			// keyBytes holds each key without the leaf's shared prefix: bytes below kp come from it.
+			kp := len(keyPrefix)
 			lo := 0
 			for i := 0; i < n; i++ {
-				hi := lo + keyLen
+				hi := lo + sufLen
 				if keyLen == 0 {
 					hi = int(paxDirEnd(keyEnd, i, dw))
 				}
-				if lo+at+w > hi {
+				if at+w > kp+hi-lo {
 					return nil, newError(DataCorrupted, "PAX leaf key too short for its key column")
 				}
-				putKeySlot(body[i*w:(i+1)*w], ty, keyBytes[lo+at:lo+at+w])
+				slot := body[i*w : (i+1)*w]
+				switch {
+				case at+w <= kp:
+					putKeySlot(slot, ty, keyPrefix[at:at+w])
+				case at >= kp:
+					putKeySlot(slot, ty, keyBytes[lo+at-kp:lo+at-kp+w])
+				default:
+					copy(slot, keyPrefix[at:])
+					copy(slot[kp-at:], keyBytes[lo:lo+at+w-kp])
+				}
 				lo = hi
 			}
 			regions[c] = paxRegion{width: w, bitmap: make([]byte, (n+7)/8), body: body, elided: true}
@@ -5893,6 +5988,31 @@ func parsePaxLeaf(payload []byte, n int, colTypes []colType) (*paxLeaf, error) {
 		flags, err := readU8(payload, &p)
 		if err != nil {
 			return nil, err
+		}
+		if w, fixed := fixedValueWidth(ty); fixed && flags == regionFOR && w >= 2 && w <= 8 {
+			// Base plus offsets (leaf_narrow.go): rebuild the dense full-width slots.
+			bm := p
+			p += (n + 7) / 8
+			if p+w+1 > end {
+				return nil, newError(DataCorrupted, "PAX leaf narrow region overruns its extent")
+			}
+			bitmap := payload[bm:p]
+			base := beUint(payload[p : p+w])
+			bw := int(payload[p+w])
+			p += w + 1
+			if (bw != 0 && bw != 1 && bw != 2 && bw != 4) || bw >= w || p+n*bw != end {
+				return nil, newError(DataCorrupted, "PAX leaf narrow region extent mismatch")
+			}
+			body := make([]byte, n*w)
+			for i := 0; i < n; i++ {
+				if bitmap[i/8]&(0x80>>(i%8)) != 0 {
+					continue
+				}
+				putBEUint(body[i*w:(i+1)*w], base+beUint(payload[p+i*bw:p+(i+1)*bw]))
+			}
+			regions[c] = paxRegion{width: w, bitmap: bitmap, body: body, stored: end - start}
+			start = end
+			continue
 		}
 		if flags != 0 {
 			return nil, newError(DataCorrupted, "PAX leaf region flags has a reserved bit set")
@@ -5923,19 +6043,111 @@ func parsePaxLeaf(payload []byte, n int, colTypes []colType) (*paxLeaf, error) {
 		}
 		start = end
 	}
-	return &paxLeaf{keyBlob: keyBytes, keyEnd: keyEnd, regions: regions, dw: dw, keyLen: keyLen}, nil
+	return &paxLeaf{keyBlob: keyBytes, keyEnd: keyEnd, regions: regions, dw: dw, keyLen: keyLen, keyPrefix: keyPrefix, n: n, keyStored: keyStored}, nil
 }
 
-// key returns record i's key as a borrowed span of the retained page block.
+// key returns record i's key as a borrowed span: of the retained page block, or of the leaf's rebuilt
+// keys when the page stores a shared prefix.
 func (l *paxLeaf) key(i int) []byte {
+	blob, ends, dw := l.keyBlob, l.keyEnd, l.dw
+	if l.keyPrefix != nil {
+		fk := l.fullKeys()
+		blob, ends, dw = fk.blob, fk.ends, 4
+	}
 	if l.keyLen > 0 {
-		return l.keyBlob[i*l.keyLen : (i+1)*l.keyLen]
+		return blob[i*l.keyLen : (i+1)*l.keyLen]
+	}
+	lo := uint32(0)
+	if i > 0 {
+		lo = paxDirEnd(ends, i-1, dw)
+	}
+	return blob[lo:paxDirEnd(ends, i, dw)]
+}
+
+// suffix returns record i's stored key bytes: the key, or the key without the leaf's shared prefix.
+func (l *paxLeaf) suffix(i int) []byte {
+	if l.keyLen > 0 {
+		w := l.keyLen - len(l.keyPrefix)
+		return l.keyBlob[i*w : (i+1)*w]
 	}
 	lo := uint32(0)
 	if i > 0 {
 		lo = paxDirEnd(l.keyEnd, i-1, l.dw)
 	}
 	return l.keyBlob[lo:paxDirEnd(l.keyEnd, i, l.dw)]
+}
+
+// cloneKey returns an owned copy of record i's key, without rebuilding the leaf's other keys.
+func (l *paxLeaf) cloneKey(i int) []byte {
+	suf := l.suffix(i)
+	out := make([]byte, len(l.keyPrefix)+len(suf))
+	copy(out, l.keyPrefix)
+	copy(out[len(l.keyPrefix):], suf)
+	return out
+}
+
+// searchPrefixed is pnode.search for a leaf with a shared key prefix: the probe is compared with the
+// prefix once, then with the stored suffixes, so a lookup does not rebuild the keys.
+func (l *paxLeaf) searchPrefixed(key []byte) (int, bool) {
+	kp := len(l.keyPrefix)
+	if len(key) < kp || !bytes.Equal(key[:kp], l.keyPrefix) {
+		// The probe differs from every key within the prefix: it sorts before all of them or after.
+		if bytes.Compare(key, l.keyPrefix) < 0 {
+			return 0, false
+		}
+		return l.n, false
+	}
+	rest := key[kp:]
+	lo, hi := 0, l.n
+	for lo < hi {
+		mid := int(uint(lo+hi) >> 1)
+		switch bytes.Compare(l.suffix(mid), rest) {
+		case 0:
+			return mid, true
+		case -1:
+			lo = mid + 1
+		default:
+			hi = mid
+		}
+	}
+	return lo, false
+}
+
+// paxFullKeys is a prefixed leaf's keys rebuilt in full: one blob, and a u32 end-offset directory
+// when keys vary in length (full keys can outgrow a u16 offset).
+type paxFullKeys struct {
+	blob, ends []byte
+}
+
+// fullKeys rebuilds a prefixed leaf's keys on first use (leaf_narrow.go). A walk that never reads a
+// key (overflow collection, a column scan) does not pay for it. Concurrent first uses build equal
+// copies and one wins.
+func (l *paxLeaf) fullKeys() *paxFullKeys {
+	if fk := l.full.Load(); fk != nil {
+		return fk
+	}
+	kp := len(l.keyPrefix)
+	fk := &paxFullKeys{blob: make([]byte, 0, len(l.keyBlob)+l.n*kp)}
+	if l.keyLen == 0 {
+		fk.ends = make([]byte, 0, 4*l.n)
+	}
+	lo := 0
+	for i := 0; i < l.n; i++ {
+		hi := lo + l.keyLen - kp
+		if l.keyLen == 0 {
+			hi = int(paxDirEnd(l.keyEnd, i, l.dw))
+		}
+		fk.blob = append(fk.blob, l.keyPrefix...)
+		fk.blob = append(fk.blob, l.keyBlob[lo:hi]...)
+		if l.keyLen == 0 {
+			fk.ends = appendU32(fk.ends, uint32(len(fk.blob)))
+		}
+		lo = hi
+	}
+	if l.full.CompareAndSwap(nil, fk) {
+		return fk
+	}
+	return l.full.Load()
 }
 
 // isNull reports whether value (record i, column c) is NULL — the region bitmap (fixed-width) or
@@ -6013,7 +6225,7 @@ func (p *packedLeaf) key(i int) []byte { return p.dirs.key(i) }
 
 // recordWeight derives the exact serialized record size only when mutation/rebalance needs it.
 func (p *packedLeaf) recordWeight(i int) uint32 {
-	w := len(p.key(i))
+	w := len(p.dirs.keyPrefix) + len(p.dirs.suffix(i))
 	for c := range p.colTypes {
 		w += p.dirs.valueLen(c, i)
 	}

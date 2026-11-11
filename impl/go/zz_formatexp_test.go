@@ -322,6 +322,9 @@ func expFixed(r *paxRegion, n int) expSizes {
 	w := r.width
 	out := expSizes{cur: 1 + len(r.bitmap) + len(r.body)}
 	out.t1 = out.cur
+	if r.stored != 0 {
+		out.cur = r.stored // written as base plus offsets
+	}
 	bm := 0
 	for _, b := range r.bitmap {
 		if b != 0 {
@@ -518,16 +521,17 @@ func expVariable(r *paxRegion, n int, ty colType) expSizes {
 // expKeys sizes the key directory + blob. fixedKey: every key in the tree has one length (a
 // fixed-width key schema needs no directory).
 func expKeys(l *paxLeaf, n int, fixedKey bool) expSizes {
-	out := expSizes{cur: len(l.keyEnd) + len(l.keyBlob)}
+	out := expSizes{cur: l.keyStored}
 	dir := 2 * n
 	if fixedKey {
 		dir = 0
 	}
-	out.t1 = dir + len(l.keyBlob)
+	full := len(l.keyBlob) + n*len(l.keyPrefix) // the keys in full
+	out.t1 = dir + full
 	if fixedKey {
-		expA["key directory: elided, fixed-length keys"] += len(l.keyEnd)
+		expA["key directory: elided, fixed-length keys"] += l.dw * n * min(1, len(l.keyEnd))
 	} else {
-		expA["key directory: u32 -> u16"] += len(l.keyEnd) - dir
+		expA["key directory: u32 -> u16"] += l.dw*n - dir
 	}
 	expA["(leaf bytes today: keys)"] += out.cur
 	p := 0
@@ -536,7 +540,7 @@ func expKeys(l *paxLeaf, n int, fixedKey bool) expSizes {
 	} else if n == 1 {
 		p = 0
 	}
-	out.t2 = dir + 2 + p + len(l.keyBlob) - n*p
+	out.t2 = dir + 2 + p + full - n*p
 	if out.t2 > out.t1 {
 		out.t2 = out.t1
 	}
@@ -665,8 +669,8 @@ func (w *expWalker) tree(name, kind string, root *pnode, colTypes []colType, col
 		cd := leaf.dw * (k + 1)
 		tr.colDir.add(expSizes{cur: cd, t1: cd / 2, t2: cd / 2, t3: cd / 2})
 		expA["column directory: u32 -> u16"] += cd / 2
-		expA["(leaf bytes today: all)"] += len(leaf.keyEnd) + len(leaf.keyBlob) + cd
-		used := len(leaf.keyEnd) + len(leaf.keyBlob) + cd
+		expA["(leaf bytes today: all)"] += leaf.keyStored + cd
+		used := leaf.keyStored + cd
 		for c := range colTypes {
 			r := &leaf.regions[c]
 			var s expSizes
@@ -834,8 +838,21 @@ func expOne(t *testing.T, dir string, pageSize uint32, detail bool) expRun {
 	os.RemoveAll(path + ".lock")
 	run := expRun{pageSize: int(pageSize)}
 	start, w0 := time.Now(), expWchar()
+	if pf := os.Getenv("JED_FORMAT_EXP_BUILDPROF"); pf != "" {
+		f, _ := os.Create(pf)
+		pprof.StartCPUProfile(f)
+		defer f.Close()
+	}
 	db := expBuild(t, path, pageSize)
 	run.build, run.loadWritten = time.Since(start), expWchar()-w0
+	if os.Getenv("JED_FORMAT_EXP_BUILDPROF") != "" {
+		pprof.StopCPUProfile()
+	}
+	if os.Getenv("JED_FORMAT_EXP_BUILDONLY") != "" {
+		fmt.Printf("build %.1fs\n", run.build.Seconds())
+		db.Close()
+		return run
+	}
 	st, _ := os.Stat(path)
 	run.fileLoaded = st.Size()
 	if detail {

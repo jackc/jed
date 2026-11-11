@@ -342,7 +342,7 @@ func (n *pnode) decodedParts() ([][]byte, []storedRow, []uint32, error) {
 	vals := make([]storedRow, count)
 	weights := make([]uint32, count)
 	for i := 0; i < count; i++ {
-		keys[i] = bytes.Clone(n.keyAt(i))
+		keys[i] = n.packed.dirs.cloneKey(i)
 		row, err := n.rowAt(i)
 		if err != nil {
 			return nil, nil, nil, err
@@ -488,9 +488,44 @@ func (n *pnode) isLeaf() bool { return len(n.children) == 0 }
 // encrypted.md §2).
 func (n *pnode) payload(pcap pageCap, shape leafShape) int {
 	if n.isLeaf() {
-		return n.totalWeight() + leafOverhead(n.keyLen(), shape)
+		size := n.totalWeight() + leafOverhead(n.keyLen(), shape)
+		size -= n.contentSaving(shape)
+		return size
 	}
 	return interiorPayload(pcap, n.keys)
+}
+
+// contentSaving is the bytes a leaf's content-dependent encodings save (leaf_narrow.go): the shared
+// key prefix and base-plus-offsets columns.
+func (n *pnode) contentSaving(shape leafShape) int {
+	c := n.keyLen()
+	saving := 0
+	if leafKeyPrefix && c >= 2 {
+		if n.packed != nil && n.packed.dirs.keyPrefix != nil {
+			// The stored prefix is the longest one: no need to rebuild the keys to find it.
+			saving += c*len(n.packed.dirs.keyPrefix) - len(n.packed.dirs.keyPrefix) - 2
+		} else {
+			saving += leafPrefixSaving(c, n.keyAt(0), n.keyAt(c-1))
+		}
+	}
+	if len(shape.forCols) > 0 && c > 0 {
+		if n.packed != nil {
+			saving += packedFORSaving(shape.forCols, n.packed.dirs, c)
+		} else {
+			saving += rowsFORSaving(shape.forCols, n.vals)
+		}
+	}
+	return saving
+}
+
+// payloadAtMost reports whether a leaf's payload is at most limit. The content-dependent saving is
+// computed only when the size without it does not already decide.
+func (n *pnode) payloadAtMost(limit int, shape leafShape) bool {
+	plain := n.totalWeight() + leafOverhead(n.keyLen(), shape)
+	if plain <= limit {
+		return true
+	}
+	return plain-n.contentSaving(shape) <= limit
 }
 
 // interiorPayload is an interior node's payload for these separators (format.md "Interior node";
@@ -506,6 +541,9 @@ func interiorPayload(pcap pageCap, keys [][]byte) int {
 // search binary-searches a LEAF's keys, returning (index, found): found ⇒ key is at keys[index];
 // else index is the insertion slot.
 func (n *pnode) search(key []byte) (int, bool) {
+	if n.packed != nil && n.packed.dirs.keyPrefix != nil {
+		return n.packed.dirs.searchPrefixed(key)
+	}
 	lo, hi := 0, n.keyLen()
 	for lo < hi {
 		mid := int(uint(lo+hi) >> 1)
@@ -1370,8 +1408,64 @@ func splitPoint(mLo, mHi, payload, cap int, rightEdge bool, leftpayload, rightpa
 // leaf with a single over-cap record is left whole (defensive — the oversize surfaces as 0A000 when
 // serialized).
 func buildLeaf(keys [][]byte, vals []storedRow, weights []uint32, cap pageCap, shape leafShape, edited int, owner *mutationGeneration) insOut {
-	m, split := leafSplit(weights, cap, shape, edited)
-	if !split {
+	n := len(keys)
+	payload := 0
+	for _, w := range weights {
+		payload += int(w)
+	}
+	payload += leafOverhead(n, shape)
+	if payload > cap.c && n >= 2 {
+		payload -= leafPrefixSaving(n, keys[0], keys[n-1])
+		payload -= rowsFORSaving(shape.forCols, vals)
+	}
+	if payload <= cap.c || n < 2 {
+		return insOut{whole: &pnode{keys: keys, vals: vals, weights: weights, owner: owner}}
+	}
+	prefix := make([]int, n+1)
+	for i, w := range weights {
+		prefix[i+1] = prefix[i] + int(w)
+	}
+	total := prefix[n]
+	// PROTOTYPE (leaf_narrow.go): each half stores its own shared key prefix. Both stay monotone in m:
+	// a key added to a half adds at least its suffix, and the half's prefix can only shorten.
+	// Base-plus-offsets columns: the span of each column's present values over every prefix and
+	// suffix of the rows, so each candidate half is measured in O(columns). Still monotone: a row
+	// added to a half adds at least its offsets, and a column's offset width can only widen.
+	pre := make([][]forRange, len(shape.forCols))
+	suf := make([][]forRange, len(shape.forCols))
+	for j, fc := range shape.forCols {
+		pre[j], suf[j] = make([]forRange, n+1), make([]forRange, n+1)
+		for i := 0; i < n; i++ {
+			pre[j][i+1] = pre[j][i]
+			if v := vals[i][fc.col]; !v.IsNull() {
+				pre[j][i+1].add(forSlot(fc.w, v))
+			}
+		}
+		for i := n - 1; i >= 0; i-- {
+			suf[j][i] = suf[j][i+1]
+			if v := vals[i][fc.col]; !v.IsNull() {
+				suf[j][i].add(forSlot(fc.w, v))
+			}
+		}
+	}
+	forSaved := func(count int, at int, spans [][]forRange) int {
+		total := 0
+		for j, fc := range shape.forCols {
+			r := spans[j][at]
+			total += forSaving(count, fc.w, r.lo, r.hi, r.any)
+		}
+		return total
+	}
+	leftpayload := func(m int) int {
+		return prefix[m] + leafOverhead(m, shape) - leafPrefixSaving(m, keys[0], keys[m-1]) - forSaved(m, m, pre)
+	}
+	rightpayload := func(m int) int {
+		return total - prefix[m] + leafOverhead(n-m, shape) - leafPrefixSaving(n-m, keys[m], keys[n-1]) - forSaved(n-m, m, suf)
+	}
+	m, ok := splitPoint(1, n-1, payload, cap.c, edited == n-1, leftpayload, rightpayload)
+	if !ok {
+		// Unreachable under the RECORD_MAX cap (a two-record leaf always fits — format.md "Why the
+		// record cap"); defensively leave the node whole (0A000 at serialize).
 		return insOut{whole: &pnode{keys: keys, vals: vals, weights: weights, owner: owner}}
 	}
 	return insOut{
@@ -1379,30 +1473,6 @@ func buildLeaf(keys [][]byte, vals []storedRow, weights []uint32, cap pageCap, s
 		sep:   keys[m],
 		right: &pnode{keys: cloneKeys(keys[m:]), vals: cloneVals(vals[m:]), weights: cloneWeights(weights[m:]), owner: owner},
 	}
-}
-
-// leafSplit is buildLeaf's split decision over a leaf's record weights: split is false when the leaf
-// stays whole, else m is the first record of the right half.
-func leafSplit(weights []uint32, cap pageCap, shape leafShape, edited int) (m int, split bool) {
-	n := len(weights)
-	payload := 0
-	for _, w := range weights {
-		payload += int(w)
-	}
-	payload += leafOverhead(n, shape)
-	if payload <= cap.c || n < 2 {
-		return 0, false
-	}
-	prefix := make([]int, n+1)
-	for i, w := range weights {
-		prefix[i+1] = prefix[i] + int(w)
-	}
-	total := prefix[n]
-	leftpayload := func(m int) int { return prefix[m] + leafOverhead(m, shape) }
-	rightpayload := func(m int) int { return total - prefix[m] + leafOverhead(n-m, shape) }
-	// !ok is unreachable under the RECORD_MAX cap (a two-record leaf always fits — format.md "Why the
-	// record cap"); defensively leave the node whole (0A000 at serialize).
-	return splitPoint(1, n-1, payload, cap.c, edited == n-1, leftpayload, rightpayload)
 }
 
 // buildInterior builds an interior node from its parts; if its payload overflows cap, it splits
@@ -1464,7 +1534,7 @@ func nodeInsert(n *pnode, key []byte, val storedRow, weight uint32, old *storedR
 				n.vals = insertValAtMutable(n.vals, i, val)
 				n.weights = insertWeightAtMutable(n.weights, i, weight)
 			}
-			if n.payload(cap, shape) <= cap.c || n.keyLen() < 2 {
+			if n.payloadAtMost(cap.c, shape) || n.keyLen() < 2 {
 				return insOut{whole: n}, nil
 			}
 			// The unchanged builder selects the exact split point/separator. The edited node is
@@ -1544,6 +1614,9 @@ func nodeInsert(n *pnode, key []byte, val storedRow, weight uint32, old *storedR
 // underfull: a non-root node is underfull when its payload is below half a page (cap/2), the
 // threshold at which delete rebalances it (format.md "Delete"). The root is exempt.
 func underfull(n *pnode, cap pageCap, shape leafShape) bool {
+	if n.isLeaf() {
+		return n.payloadAtMost(cap.c/2-1, shape)
+	}
 	return n.payload(cap, shape) < cap.c/2
 }
 
@@ -1687,27 +1760,11 @@ func mergeAt(n *pnode, j int, generation *mutationGeneration, src leafSource, ca
 		if err != nil {
 			return nil, err
 		}
-		mweights := concatRange(leftWeights, rightWeights, 0, len(leftWeights)+len(rightWeights))
-		if m, split := leafSplit(mweights, cap, shape, -1); split {
-			n := len(mweights)
-			merged = insOut{
-				left: &pnode{
-					keys: concatRange(leftKeys, rightKeys, 0, m), vals: concatRange(leftRows, rightRows, 0, m),
-					weights: mweights[:m:m], owner: generation,
-				},
-				sep: concatAt(leftKeys, rightKeys, m),
-				right: &pnode{
-					keys: concatRange(leftKeys, rightKeys, m, n), vals: concatRange(leftRows, rightRows, m, n),
-					weights: concatRange(mweights, nil, m, n), owner: generation,
-				},
-			}
-		} else {
-			n := len(mweights)
-			merged = insOut{whole: &pnode{
-				keys: concatRange(leftKeys, rightKeys, 0, n),
-				vals: concatRange(leftRows, rightRows, 0, n), weights: mweights, owner: generation,
-			}}
-		}
+		// PROTOTYPE (leaf_narrow.go): a leaf's size depends on its keys and rows, so the split decision
+		// needs the merged lists; buildLeaf decides it (merge-overflow splits balanced).
+		mn := len(leftWeights) + len(rightWeights)
+		merged = buildLeaf(concatRange(leftKeys, rightKeys, 0, mn), concatRange(leftRows, rightRows, 0, mn),
+			concatRange(leftWeights, rightWeights, 0, mn), cap, shape, -1, generation)
 	} else {
 		mkeys := make([][]byte, 0, len(left.keys)+1+len(right.keys))
 		mkeys = append(mkeys, left.keys...)
