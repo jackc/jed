@@ -1,9 +1,10 @@
 # Leaf pages: structural size reductions (proposal)
 
-**Status: proposal. Steps 1 to 7 are prototyped in the Go core only**, behind `JED_LEAF_NARROW=on`,
-`JED_LEAF_ELIDE_KEY=on`, `JED_LEAF_FIXED_KEY=on`, `JED_LEAF_BARE_STRING=on`,
-`JED_LEAF_KEY_PREFIX=on`, `JED_LEAF_FOR=on` and `JED_LEAF_DICT=on`. Steps 5 to 7 are encoding steps:
-they make a leaf's size depend on its contents (§7 to §9).
+**Status: proposal. Steps 1 to 9 are prototyped in the Go core only**, each behind an environment
+switch (`JED_LEAF_NARROW`, `_ELIDE_KEY`, `_FIXED_KEY`, `_BARE_STRING`, `_KEY_PREFIX`, `_FOR`,
+`_DICT`, `_SYM`, `_ARR`). Steps 5 to 9 are encoding steps: they make a leaf's size depend on its
+contents (§7 to §11). **§13 summarizes every step and records the adoption decision:
+steps 1 to 7 and 9 go forward as one format version; step 8 is held.**
 
 **Correction to §4 to §7.** Until step 6 the prototype's `leafOverhead` charged each elided key
 column a value directory (`1 + 2·N` bytes) it does not have, so table leaves filled 1% to 4% short.
@@ -796,10 +797,97 @@ Structural:
 4. **Commit cost per touched leaf.** A commit re-encodes every record of a leaf it changes, so denser
    leaves make random-insert loads slower (§7). Each further density gain adds to this.
 
-Encodings still to do: decimals as scaled integers (estimated 6.5 MB of the 120.0 MB payload
-before step 5).
+Decimals as scaled integers (estimated 6.5 MB of the 120.0 MB payload before step 5) are being
+done separately and do not depend on this proposal.
 
-## 13. Work if adopted
+## 13. Adoption summary
+
+Every number is from the sections above: Go core, 8 KiB pages, compacted file. Steps 1 to 7 were
+measured on the five-table database (187.7 MB in v50); steps 8 and 9 on that database plus a prose
+table and an arrays table (177.0 MB with steps 1 to 7).
+
+| step | file after | saved by the step | measured cost | size is a function of |
+|---|---|---|---|---|
+| 1. 16-bit directories (§3) | 168.8 MB | 18.9 MB | none | schema |
+| 2. primary-key columns not stored twice (§4) | 157.3 MB | 11.5 MB | none; a resident leaf is larger than its page | schema |
+| 3. no key directory for fixed-length keys (§5) | | | none | schema |
+| 4. inline strings without a length (§6) | 151.2 MB | 6.1 MB with step 3 | none | schema |
+| 5. shared key prefix (§7) | 122.4 MB | about 25 MB | bulk load 12% slower | rows |
+| 6. narrow integers (§8) | 114.3 MB | 8.1 MB | none separable from noise | rows |
+| 7. string dictionaries (§9) | 95.8 MB | 18.5 MB | bulk load 8% slower | rows |
+| *second database, steps 1 to 7* | *177.0 MB* | | | |
+| 9. typed integer arrays (§11) | 160.4 MB | 16.6 MB | none | rows |
+| 8. symbol tables, per leaf (§10) | 126.9 MB | 33.5 MB | one-row commits 40% to 65% slower; text loads 3 s slower | rows and when each table was trained |
+| 8. symbol tables, per column (§10.1) | 109.3 MB | 51.1 MB | one-row commits about twice as slow; text loads 0.4 s slower | rows and the column's table |
+| 8. per column with per-leaf fallback (§10.2) | 109.3 MB | 51.1 MB | as per column, plus 1 ms per fallback training | as per column; a fallback table as per leaf |
+
+Steps 1 to 7 together halve the first database (187.7 to 95.8 MB). Steps 8 and 9 take a further
+38% off the second.
+
+**The steps fall into three groups by what adopting them asks of the specification.**
+
+- **Steps 1 to 4: layout only.** A leaf's size stays a function of its records and the schema, so
+  the split rule, `RECORD_MAX` and every size argument in `format.md` keep their form with new
+  constants. 36.5 MB (19%) for no measured cost. The one debt is resident size: an elided key
+  column is rebuilt at parse (§12 item 3).
+- **Steps 5, 6, 7 and 9: content-dependent regions.** A leaf's size gains saving terms computed
+  from its rows, and the split scan measures each candidate half. Each rule is a closed formula
+  over the rows (a common prefix, a value span, a count of distinct strings, element counts), so
+  two cores that hold the same rows write the same bytes. The cost is in writes: denser leaves
+  mean more records re-encoded per touched leaf (§12 item 4), about a quarter on the bulk load across
+  steps 5 and 7 (42.6 to about 53 s). The dictionary's saving depends on the data more than any other number here.
+- **Step 8: symbol tables.** The largest saving on text, `jsonb` and other variable-width values,
+  and the only step that needs more than a formula:
+  - **A trainer every core must reproduce exactly.** Tables are the output of a five-pass greedy
+    algorithm with tie rules. It would be pinned as LZ4 is (`lz4.md` and vectors), in three cores
+    and the Ruby reference.
+  - **Training points must become a rule about rows and pages.** A per-leaf table's bytes depend
+    on when the leaf first overflowed, which is stated today in terms of the Go insert path (§10
+    open points). Per-column tables avoid this for the column table; the fallback of §10.2 brings
+    it back for the leaves that use it, and the column trigger is a leaf count (§10.1).
+  - **A new kind of page** (the table chain) that every live-page walk, backup, the integrity
+    check, the Ruby reference and `verify.rb` must know.
+  - **Commit cost.** A one-row commit on a table with coded columns takes about 450 µs against
+    230 µs. Most of that is density, not coding.
+  - **Decoding is not cost-metered** (decided earlier in this work); it is real CPU on first use of
+    a column in a leaf.
+  - **Drift** is answered by the fallback (§10.2), at the price of the training-point problem
+    above.
+
+**Recommendation.**
+
+1. **Adopt steps 1 to 7 and 9 as one format version.** They are closed rules, verified by the
+   simulation sweep at every step, and take the first database from 187.7 to 95.8 MB. Step 3 could
+   be dropped without loss of much (it shares 6.1 MB with step 4), but it is also the simplest.
+2. **Hold step 8 for a later version**, and decide it after the training points are restated over
+   rows and pages. If adopted, take per-column tables with the per-leaf fallback: per-column alone
+   saves nothing on rows unlike its training sample, and per-leaf alone is 14% larger.
+3. **Before either**, close the verification gaps below.
+
+**Decision (maintainer, 2026-11-11).** Points 1 and 2 are accepted: steps 1 to 7 and 9 go forward as
+one format version, and step 8 is held.
+
+**Run after the decision**, Go core, the switches for steps 1 to 7 and 9 on: the randomized
+comparison test passes, plaintext and encrypted. The disk-mode corpus fails 20 of 754 files (648
+pass, 86 are skipped in disk mode). Nineteen of the 20 also fail in memory mode with the same
+switches; the other is `resource/storage_file.test`, whose `54P06` trip point moves because the
+file is smaller. It is the disk-mode counterpart of `resource/storage_memory.test`, which fails in
+memory mode.
+
+**Not yet verified.**
+
+- The disk-mode corpus and the randomized comparison test were not run with step 8 on, in any table
+  mode.
+- Nothing confirms that the simulation's tables grow large enough to train a column table.
+- Every failing unit test and corpus file was classified as a pin (a cost, an `EXPLAIN` estimate,
+  a page count, a golden, a storage trip point) from its message; the 15 that appeared with step 7
+  were not examined further (§9).
+- Timings are single-machine, two alternating runs each, and several had unexplained outliers,
+  noted where they occur.
+- The integrity check does not verify that a stored key prefix is the longest one (§7).
+- Open points listed under §9, §10, §10.1, §10.2 and §11.
+
+## 14. Work if adopted
 
 `format.md` (*Leaf node*, *Record*, *Value codec*, `leafOverhead`), `bplus-reshape.md` §4, `packed-leaf.md`,
 `lazy-record.md`; every golden; the cost and storage-limit pins above; the Ruby reference and
