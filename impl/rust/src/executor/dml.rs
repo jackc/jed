@@ -1391,13 +1391,13 @@ impl Engine {
             ctes: CteCtx::empty(),
             host_batch: None,
         };
-        for (r, values) in rows.iter().enumerate() {
+        for (r, mut values) in rows.into_iter().enumerate() {
             let row = self
-                .build_insert_row(
+                .build_insert_row_owned(
                     columns,
                     col_types,
                     provided,
-                    values,
+                    &mut values,
                     default_exprs,
                     rng,
                     meter,
@@ -2083,15 +2083,15 @@ impl Engine {
             eval_view_checks(view_checks, row, &env, meter)
         };
 
-        for (r, values) in rows.iter().enumerate() {
+        for (r, mut values) in rows.into_iter().enumerate() {
             // Build + coerce the candidate row, then CHECK — the INSERT per-row order
             // (NOT NULL before CHECK before conflict; constraints.md §4.4).
             let row = self
-                .build_insert_row(
+                .build_insert_row_owned(
                     columns,
                     &col_types,
                     provided,
-                    values,
+                    &mut values,
                     default_exprs,
                     rng,
                     meter,
@@ -2840,11 +2840,61 @@ impl Engine {
         meter: &mut Meter,
         relation: &str,
     ) -> Result<Row> {
+        self.build_insert_row_from(
+            columns,
+            col_types,
+            provided,
+            |p| values[p].clone(),
+            default_exprs,
+            rng,
+            meter,
+            relation,
+        )
+    }
+
+    /// [`Self::build_insert_row`] over a source row the caller no longer needs: each provided value
+    /// moves out of `values` instead of being cloned (a column list names each source slot once).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn build_insert_row_owned(
+        &self,
+        columns: &[Column],
+        col_types: &[ColType],
+        provided: &[Option<usize>],
+        values: &mut [Value],
+        default_exprs: &[Option<RExpr>],
+        rng: &std::cell::Cell<crate::seam::StmtRng>,
+        meter: &mut Meter,
+        relation: &str,
+    ) -> Result<Row> {
+        self.build_insert_row_from(
+            columns,
+            col_types,
+            provided,
+            |p| std::mem::replace(&mut values[p], Value::Null),
+            default_exprs,
+            rng,
+            meter,
+            relation,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_insert_row_from(
+        &self,
+        columns: &[Column],
+        col_types: &[ColType],
+        provided: &[Option<usize>],
+        mut value: impl FnMut(usize) -> Value,
+        default_exprs: &[Option<RExpr>],
+        rng: &std::cell::Cell<crate::seam::StmtRng>,
+        meter: &mut Meter,
+        relation: &str,
+    ) -> Result<Row> {
         let mut row = Vec::with_capacity(columns.len());
         let mut null_col: Option<usize> = None;
         for (i, col) in columns.iter().enumerate() {
             let candidate = match provided[i] {
-                Some(p) => values[p].clone(),
+                Some(p) => value(p),
                 None => self.eval_default(col, default_exprs[i].as_ref(), rng, meter)?,
             };
             if col.not_null && matches!(candidate, Value::Null) {
