@@ -3112,7 +3112,7 @@ func valueFacts(ty colType, v Value) (inline, payload int) {
 			if stringPayload(ty) {
 				payload = len(u.inlinePayload())
 			} else {
-				payload = len(u.Comp)
+				payload = len(u.body())
 			}
 		case tagExternal:
 			payload = int(u.StoredLen)
@@ -3154,7 +3154,7 @@ func planningPayload(ty colType, v Value) []byte {
 		if stringPayload(ty) {
 			return u.inlinePayload()
 		}
-		return u.Comp
+		return u.body()
 	}
 	return valuePayload(ty, v)
 }
@@ -3790,14 +3790,18 @@ func encodeDisposedValue(ty colType, v Value, plan *recordPlan, c int, seal seal
 		return append(out, first.tag[:pcap.tag]...), nil
 	default:
 		if u != nil && u.Form == 0x00 {
+			body, err := u.bodyErr()
+			if err != nil {
+				return nil, err
+			}
 			switch {
 			case bareString(ty):
 				return append([]byte{tagInlineBare}, u.inlinePayload()...), nil
 			case u.bare:
-				out := appendU16([]byte{0x00}, uint16(len(u.Comp)))
-				return append(out, u.Comp...), nil
+				out := appendU16([]byte{0x00}, uint16(len(body)))
+				return append(out, body...), nil
 			}
-			return append([]byte{0x00}, u.Comp...), nil
+			return append([]byte{0x00}, body...), nil
 		}
 		r, err := src.resident(ty, v)
 		if err != nil {
@@ -6532,6 +6536,15 @@ func (p *packedLeaf) value(c, i int) (Value, error) {
 	if p.dirs.isNull(c, i) {
 		return NullValue(), nil
 	}
+	if lz := p.dirs.regions[c].lazy; lz != nil {
+		// A symbol-table or typed-array region (leaf_sym.go): a value stored raw is read from the
+		// page; an inline one is deferred with its region, which is rebuilt only if the value is used.
+		if _, raw, ok := lz.peek(i); ok {
+			pos := 0
+			return readValueLazy(p.colTypes, c, raw, &pos, p.cap, p.paging)
+		}
+		return Value{Kind: ValUnfetched, ref: &Unfetched{Form: 0x00, lazy: lz, lazyIdx: i, bare: stringPayload(p.colTypes[c]), types: p.colTypes, typeIdx: c}}, nil
+	}
 	vb, err := p.dirs.value(c, i)
 	if err != nil {
 		return Value{}, err
@@ -7366,11 +7379,15 @@ func resolveUnfetched(ty colType, u *Unfetched, fetch func(pageRef) ([]byte, err
 	case 0x00:
 		// Inline-deferred (lazy-record.md §5b, L2): the bytes are already owned — no chain read, no
 		// decompression. Re-run the decoder over the captured span in construct mode.
+		body, err := u.bodyErr()
+		if err != nil {
+			return Value{}, err
+		}
 		if u.bare {
-			return valueFromPayload(ty, u.Comp)
+			return valueFromPayload(ty, body)
 		}
 		p := 0
-		return readInlineBody(ty, u.Comp, &p, decodeConstruct)
+		return readInlineBody(ty, body, &p, decodeConstruct)
 	case tagExternal:
 		if stringPayload(ty) {
 			// Gather a text / bytea / json chain straight into the value's string.

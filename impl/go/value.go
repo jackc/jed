@@ -142,6 +142,12 @@ type Unfetched struct {
 	// memory charges it at its resolved size (memValueBytes). Always a text, bytea, or json value
 	// stored out of line or compressed.
 	buffered bool
+	// lazy, when set, makes this an inline-deferred (Form 0x00) value of a symbol-table or typed-array
+	// leaf region (leaf_sym.go): Comp is unset and the body is value lazyIdx of the region, which is
+	// rebuilt the first time any of its values is read. The value itself is never written to, so it
+	// may be shared.
+	lazy    *lazyRegion
+	lazyIdx int
 }
 
 // bufferedPayloadLen is a buffered value's resolved payload length — the length of its string.

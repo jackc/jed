@@ -50,7 +50,7 @@ func bareString(ty colType) bool { return leafBareString && stringPayload(ty) }
 // read from.
 func (u *Unfetched) inlinePayload() []byte {
 	if u.bare {
-		return u.Comp
+		return u.body()
 	}
 	return u.Comp[min(2, len(u.Comp)):]
 }

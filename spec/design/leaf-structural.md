@@ -461,10 +461,11 @@ insert path. That has to become a rule about rows and pages before adoption (ope
 
 **Read.** The region is kept as its page bytes and rebuilt into the plain form (end offsets and
 spans) the first time a value of the column is read; the rebuilt form stays with the resident leaf.
-The walk for overflow chains reads the raw bitmap and never rebuilds. A scan that reads whole rows
-asks for every column's span, so it rebuilds every such region of each leaf the first time it visits
-it, whether or not the query uses the column (see the result). Reading one value in place, and
-deferring the rebuild until a value is used, are both possible in this format and not built.
+The walk for overflow chains reads the raw bitmap and never rebuilds. An inline value of such a
+region is handed to the executor as a deferred value naming its region and index, with no bytes; the
+region is rebuilt when a deferred value of it is first resolved, measured or written. A scan
+therefore rebuilds only the columns the query uses. A value stored raw is read from the page.
+Reading one value in place, without rebuilding its region, is possible in this format and not built.
 
 **Result.** The database of the earlier steps plus the two tables of
 [leaf-encodings-experiment.md](leaf-encodings-experiment.md) §8.1 (prose, varied-key `jsonb`, arrays),
@@ -480,19 +481,27 @@ below.
 | bulk load, the two new tables | 5.7, 5.7 s | 26.5 s | 7.6 s | 10.6, 10.8 s |
 | one-row update commit (`activity.title`) | 229, 231 µs | 425 µs | 227 µs | 375, 384 µs |
 | one-row append commit (`activity`) | 328, 339 µs | 476 µs | 316 µs | 504, 510 µs |
-| first scan of `activity` after open, `count(*), sum(id)` | 152, 166 ms | | | 294, 298 ms |
+| first scan of `activity` after open, `count(*), sum(id)` | 159, 178 ms | | | 158, 161 ms |
+| the same scan, resident | 135, 138 ms | | | 95, 96 ms |
+| resident `sum(length(message))` over `activity` | 183, 193 ms | | | 106, 110 ms |
+| resident `sum(cardinality(tags))` over `samples` | 315, 336 ms | | | 131, 154 ms |
+
+The last column's size and load rows are from the runs before the deferred rebuild (which changes
+neither) and its commit and scan rows from the runs after it; commits were the same in both.
 
 - **Size:** both steps take 28% off the file; the symbol table alone 24%, typed arrays alone 9%.
 - **Loading text is about twice as slow:** the two new tables load in 10.7 s against 5.7 s. The
   earlier tables did not move. Training is 3.9 s of the difference: 34,511 tables over 86 MB of
   payload, about 45 ns a byte.
-- **A one-row commit is 50% to 65% slower.** By profile the coding itself (measuring the leaf under
+- **A one-row commit is 40% to 65% slower.** By profile the coding itself (measuring the leaf under
   its tables, then coding it when written, and rebuilding its regions) is about 15% of the commit;
   the rest is that the leaf holds more rows to decode and encode (§12, item 4).
-- **The first scan of a table after open is up to twice as slow** when it reads whole rows: every
-  symbol-table region of every leaf is rebuilt, about 45 µs a leaf here. Later scans are resident
-  and did not move: text and `jsonb` scans ran within 10% either way, point lookups 1.1 to 2.5 µs in
-  both configurations. The ten aggregate queries return the same values in all runs.
+- **Scans are as fast on first visit and faster once resident,** 20% to 55% on the two new tables.
+  A deferred value of these regions is made without reading its span, a column the query does not
+  use is never rebuilt, and there are fewer leaves. Before the rebuild was deferred, the first scan
+  of `activity` took 294 and 298 ms: it rebuilt every region of every leaf.
+- Point lookups ran 1.2 to 2.5 µs in both configurations. The ten aggregate queries return the same
+  values in all runs.
 
 **Training cost.** The first version took 26.5 s to load the two new tables. Three changes:
 
@@ -521,8 +530,9 @@ commit before this step. The disk-mode corpus and the randomized comparison test
 
 - The training points above are stated in terms of the insert path. Bytes must be a function of
   rows and pages for two cores to agree.
-- The first scan after open rebuilds regions the query does not use. A value that defers its
-  rebuild until read would remove that.
+- A deferred value of a malformed region reports the corruption when it is resolved or written.
+  The paths that only measure or copy its bytes (planning a record's size, spilling a sort run) see
+  an empty body first.
 - The commit path codes a touched leaf twice, once to measure it and once to write it.
 - The table is per leaf. A table per column in the catalog would remove the per-page table and train
   on more data ([leaf-encodings-experiment.md](leaf-encodings-experiment.md) §8.2: the per-page table

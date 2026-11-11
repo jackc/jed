@@ -625,9 +625,10 @@ func spillWriteValue(w *bufio.Writer, v Value) {
 			_ = w.WriteByte(21)
 			if u := v.unfetched(); u.bare {
 				// The run file holds the 0x00 form's body: the length, then the payload.
-				spillWriteBytes(w, append(appendU16(nil, uint16(len(u.Comp))), u.Comp...))
+				body := u.body()
+				spillWriteBytes(w, append(appendU16(nil, uint16(len(body))), body...))
 			} else {
-				spillWriteBytes(w, u.Comp)
+				spillWriteBytes(w, u.body())
 			}
 		case tagExternal:
 			_ = w.WriteByte(9)
