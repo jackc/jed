@@ -67,12 +67,13 @@ func readLeafColumn(n *pnode, i, c int) (Value, error) {
 
 // laneReuse reports, per column, whether a lane should reuse the value its filter resolved (a
 // variable-width column beside a filter) rather than read the leaf again (a fixed-width slot decodes
-// cheaper than the reuse costs).
+// cheaper than the reuse costs). A fixed-width decimal slot (format.md v51) is reused like a
+// variable-width value: decoding it builds a decimal, which costs more than the reuse.
 func laneReuse(colTypes []colType, filtered bool) []bool {
 	reuse := make([]bool, len(colTypes))
 	for c, ty := range colTypes {
 		_, fixed := fixedValueWidth(ty)
-		reuse[c] = filtered && !fixed
+		reuse[c] = filtered && (!fixed || ty.DecSlot != 0)
 	}
 	return reuse
 }

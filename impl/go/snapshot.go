@@ -1120,8 +1120,8 @@ func (s *snapshot) putTable(t *catTable, pageSize uint32) {
 	// catalog order / CREATE TYPE-before-CREATE TABLE rule), so the lookup inside ResolveColType
 	// always resolves.
 	colTypes := make([]colType, len(t.Columns))
-	for i, c := range t.Columns {
-		colTypes[i] = resolveColType(c.Type, s.types)
+	for i := range t.Columns {
+		colTypes[i] = storeColType(&t.Columns[i], s.types)
 	}
 	s.putTableResolved(t, colTypes, pageSize)
 }

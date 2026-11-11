@@ -28,7 +28,9 @@ schema_version = 1
 #    only the exact current version, so invalidate the v48 datasets.
 # 14: the on-disk format bumped 49 → 50 (index_flags bit5 is_constraint); invalidate the v49
 #    datasets.
-generator_version = 14
+# 15: the on-disk format bumped 50 → 51 (fixed-width stored numeric(p,s)); invalidate the v50
+#    datasets.
+generator_version = 15
 
 [[dataset]]
 name = "small"

@@ -587,6 +587,12 @@ expanded row vectors.
   10. **A failed statement accrues what the row path accrues** (cost.md §6.2): a lane that stops on a
      filter error settles its scan charges for the whole bound and gives back its fold charges.
 
+  **Fixed-width decimals (format v51).** A `numeric(p,s)` column with `p ≤ 18` is now a
+  fixed-width slot ([decimal.md](decimal.md) §6a), so every lane above reads it as it reads an
+  integer column — no value directory, tag, or group fold — and item 1's direct decode applies only
+  to wider and unconstrained decimal columns. Lane choices, charges, and the logical sizes of items
+  3 and 7 are unchanged: they are defined on the value, not on its stored form.
+
   **Budgets.** The lane choice decides which buffers a statement reserves, so under a query-memory
   budget it decides where `54P05` trips; memory.md §5.4 and §6.6.1 specify the choice and the
   bounded group table's charges, and `mise run conformance:query_memory` holds the three cores to the

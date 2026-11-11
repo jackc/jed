@@ -683,6 +683,45 @@ pub enum ColType {
     /// reads the element scalar for the bound bodies; the descriptor (discreteness) is re-derived
     /// from the element via `range::range_for_element`.
     Range(Box<ColType>),
+    /// A **table column** declared `numeric(p,s)` with `p ≤ 18` (spec/fileformat/format.md v51,
+    /// spec/design/decimal.md §6a): a `decimal` whose leaf slot is the value's unscaled integer in
+    /// `width` (2, 4, or 8) bytes at the fixed display scale `scale`, instead of the variable-width
+    /// decimal codec. It is a `decimal` everywhere but the leaf slot — [`ColType::scalar`] answers
+    /// `Decimal`, and keys, comparison, coercion, and rendering are the scalar's. Built only by
+    /// [`store_col_type`] for a top-level column; a decimal field, element, or range bound is
+    /// always `Scalar(Decimal)`.
+    FixedDecimal {
+        width: u8,
+        scale: u16,
+    },
+}
+
+/// The slot width of a `numeric(p,s)` column's fixed-width stored form, or `None` when the column
+/// keeps the variable-width codec (`p ≥ 19`): 2 bytes for `p ≤ 4`, 4 for `p ≤ 9`, 8 for `p ≤ 18`
+/// (spec/fileformat/format.md "Fixed-width column slot").
+pub fn fixed_decimal_width(precision: u16) -> Option<u8> {
+    match precision {
+        1..=4 => Some(2),
+        5..=9 => Some(4),
+        10..=18 => Some(8),
+        _ => None,
+    }
+}
+
+/// The resolved **stored** type of a table column: [`resolve_col_type`] of its declared type,
+/// except that a `numeric(p,s)` column with `p ≤ 18` is [`ColType::FixedDecimal`]. This is the type
+/// a table's store and leaf codec hold; a type resolved for a cast, an element, or a field goes
+/// through [`resolve_col_type`], which never yields the fixed form.
+pub fn store_col_type(col: &Column, types: &HashMap<String, CompositeType>) -> ColType {
+    if let (Type::Scalar(ScalarType::Decimal), Some(tm)) = (&col.ty, col.decimal)
+        && let Some(width) = fixed_decimal_width(tm.precision)
+    {
+        return ColType::FixedDecimal {
+            width,
+            scale: tm.scale,
+        };
+    }
+    resolve_col_type(&col.ty, types)
 }
 
 /// One resolved field of a [`ColType::Composite`] — its name, recursively-resolved type, the
@@ -753,12 +792,28 @@ pub fn resolve_col_type(ty: &Type, types: &HashMap<String, CompositeType>) -> Co
     }
 }
 
+/// The self-describing value type of every decimal ([`ColType::value_type`]).
+static DECIMAL_VALUE: ColType = ColType::Scalar(ScalarType::Decimal);
+
 impl ColType {
+    /// The type of this column's values **outside a leaf slot** — the self-describing value codec
+    /// a statistics entry, a catalog constant, or an overflow payload uses
+    /// (spec/fileformat/format.md "Fixed-width column slot": the fixed form is the leaf slot only).
+    /// A [`ColType::FixedDecimal`] column's values are plain decimals there; every other type is
+    /// itself.
+    pub fn value_type(&self) -> &ColType {
+        match self {
+            ColType::FixedDecimal { .. } => &DECIMAL_VALUE,
+            other => other,
+        }
+    }
+
     /// The inner scalar type (the `Scalar` arm). A container/composite reaches a scalar-only path
     /// only after the caller branches on the arm — the resolved-type mirror of [`Type::scalar`].
     pub fn scalar(&self) -> ScalarType {
         match self {
             ColType::Scalar(s) => *s,
+            ColType::FixedDecimal { .. } => ScalarType::Decimal,
             ColType::Composite { name, .. } => unreachable!(
                 "composite type {name} used where a scalar was expected (spec/design/composite.md)"
             ),
@@ -783,6 +838,7 @@ impl ColType {
         match self {
             // A scalar is keyable unless it is `json`/`jsonb`/`jsonpath` (non-keyable, §2.13).
             ColType::Scalar(s) => s.is_keyable(),
+            ColType::FixedDecimal { .. } => true,
             // A range's element is always a keyable scalar subtype (spec/design/ranges.md §2).
             ColType::Range(_) => true,
             // A scalar-element array is keyable (`float` included); an array-of-composite is not

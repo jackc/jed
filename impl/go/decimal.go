@@ -1994,6 +1994,64 @@ func decimalValueU64(neg bool, scale uint32, v uint64) Value {
 	return Value{Kind: ValDecimal, ref: &b.d}
 }
 
+// decimalValueInt64 is DecimalValue of the decimal whose unscaled integer at display scale `scale`
+// is u — the load path for a fixed-width numeric(p,s) slot (spec/fileformat/format.md "Fixed-width
+// column slot"), the inverse of Decimal.unscaledInt64.
+func decimalValueInt64(u int64, scale uint32) Value {
+	neg := u < 0
+	m := uint64(u)
+	if neg {
+		m = -m // unsigned negation = |u| (handles MinInt64)
+	}
+	if m < smallBoxMax {
+		return decimalValueU64(neg, scale, m)
+	}
+	// A magnitude of 10^18 or more is outside every fixed-width column's typmod; any bit pattern is
+	// still a value.
+	d := decimalFromInt64(u)
+	d.Scale = scale
+	return DecimalValue(d)
+}
+
+// unscaledInt64 is the value's unscaled integer at display scale `scale` — d × 10^scale — for a
+// fixed-width numeric(p,s) leaf slot. ok is false when the value has more than `scale` fractional
+// digits or the integer is outside int64: a value store-coercion has not brought to the column's
+// typmod.
+func (d Decimal) unscaledInt64(scale uint32) (int64, bool) {
+	if d.Scale > scale || len(d.Limbs) > 3 {
+		return 0, false
+	}
+	var m uint64
+	for i := len(d.Limbs) - 1; i >= 0; i-- {
+		hi, lo := bits.Mul64(m, decBase)
+		if hi != 0 {
+			return 0, false
+		}
+		var carry uint64
+		m, carry = bits.Add64(lo, uint64(d.Limbs[i]), 0)
+		if carry != 0 {
+			return 0, false
+		}
+	}
+	for up := scale - d.Scale; up > 0 && m != 0; up-- {
+		hi, lo := bits.Mul64(m, 10)
+		if hi != 0 {
+			return 0, false
+		}
+		m = lo
+	}
+	if d.Neg {
+		if m > 1<<63 {
+			return 0, false
+		}
+		return -int64(m), true // m == 1<<63 wraps to MinInt64, the value meant
+	}
+	if m > math.MaxInt64 {
+		return 0, false
+	}
+	return int64(m), true
+}
+
 // decimalFromInt64Buf is decimalFromInt64 with the limbs in buf, for a caller whose operand does not
 // outlive the call it is passed to (an accumulator's fold): no allocation when buf stays on its stack.
 func decimalFromInt64Buf(v int64, buf *[3]uint32) Decimal {

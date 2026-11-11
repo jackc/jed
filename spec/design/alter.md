@@ -338,6 +338,9 @@ index/constraint that touches it. The hardest form: a failed cast is the cast's 
 expression over the row's columns. If the column is a key member, its key encoding changes, so
 the table (and dependent indexes) re-key — a full rebuild with final-key uniqueness validation.
 The target type must be key-encodable before PRIMARY KEY metadata is retained (`0A000` otherwise).
+A `numeric(p,s)` column's stored class follows `p` ([decimal.md](decimal.md) §6a), so a change of
+precision can move it between slot widths or between the fixed-width and variable-width classes;
+the re-pack writes the new class like any other new type.
 Every surviving index that keys the column re-applies its `CREATE INDEX` column gate under the new
 type: an ordered index needs a key-encodable type (`0A000`), a GIN index a GIN operator class
 ([gin.md §3](gin.md) — `42704` for none, `0A000` for a deferred array element), a GiST index a GiST
@@ -445,5 +448,7 @@ Ordered lowest-risk → highest, each a vertical slice (CLAUDE.md §10):
 
 **None expected.** Tier A is catalog-field edits within the current entry layout; Tier B
 rewrites produce ordinary current-format tables. A bump is required only if a slice needs a
-*new* catalog field or leaf encoding — not anticipated for any form above. (Contrast the
+*new* catalog field or leaf encoding — not anticipated for any form above. (Format v51's
+fixed-width `numeric(p,s)` slot changed a leaf encoding for its own reasons; ALTER needed nothing
+beyond the existing re-pack.) (Contrast the
 tombstone alternative rejected in §3.2, which *would* have forced a format change.)

@@ -91,6 +91,8 @@ mod date_clock;
 mod datetime_conversions;
 #[path = "../tests/decimal.rs"]
 mod decimal;
+#[path = "../tests/decimal_fixed_width.rs"]
+mod decimal_fixed_width;
 #[path = "../tests/delete.rs"]
 mod delete;
 #[path = "../tests/depth_limit.rs"]

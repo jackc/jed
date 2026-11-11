@@ -1458,7 +1458,9 @@ impl Engine {
                     continue;
                 }
 
-                let encoded = crate::format::encode_value(store.column_type(column), value);
+                // The value-codec length, not a fixed-width column's slot width (statistics.md §4).
+                let encoded =
+                    crate::format::encode_value(store.column_type(column).value_type(), value);
                 let body_len = encoded.len().saturating_sub(1);
                 let key = if eligible {
                     Some(encode_typed_key(

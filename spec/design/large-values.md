@@ -379,7 +379,7 @@ compression is Slice B). They were chosen with the maintainer; the byte details 
   for `text`, the raw bytes for `bytea`, the decimal body (`flags ++ scale ++ ndigits ++ groups`)
   for `decimal`. The `u32` length supersedes the inline `u16` (lifting the 64 KiB ceiling); the
   inline `u16` is never the binding limit because `RECORD_MAX ≤ 32762 < 65535`, so a value spills
-  long before it would overflow `u16`. Only variable-length types (`text`/`bytea`/`decimal`) ever
+  long before it would overflow `u16`. Only variable-length types (`text`/`bytea`/`decimal` — not a fixed-width `numeric(p,s)` column, [decimal.md](decimal.md) §6a) ever
   spill; fixed-width types are always inline.
 
 - **Overflow page = `page_type 4`.** `P(v)` is split into `C`-byte slabs (`C = page_size − 16`),

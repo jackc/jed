@@ -632,6 +632,53 @@ type colType struct {
 	// The codec reads the element scalar for the bound bodies; the range descriptor (discreteness) is
 	// re-derived from the element via rangeForElement.
 	RangeElem *colType
+	// DecSlot is the slot width in bytes (2, 4, or 8) when this is a TABLE COLUMN declared
+	// numeric(p,s) with p <= 18 (spec/fileformat/format.md v51, spec/design/decimal.md §6a), else 0:
+	// the column's leaf slot is the value's unscaled integer at the fixed display scale DecScale,
+	// instead of the variable-width decimal codec. Scalar stays scalarDecimal, so it is a decimal
+	// everywhere but the leaf slot — keys, comparison, coercion, and rendering are the scalar's. Set
+	// only by storeColType for a top-level column; a decimal field, element, or range bound never
+	// carries it.
+	DecSlot uint8
+	// DecScale is the display scale a DecSlot column's slot is read at (meaningful only then).
+	DecScale uint16
+}
+
+// valueType is this stored type as a SINGLE VALUE's codec type (format.md "Value codec"): the same
+// type without the fixed-width decimal slot, which is the leaf's form only. A value persisted
+// outside a leaf region — a statistics MCV or histogram bound — is encoded with it.
+func (t colType) valueType() colType {
+	t.DecSlot, t.DecScale = 0, 0
+	return t
+}
+
+// fixedDecimalWidth is the slot width of a numeric(p,s) column's fixed-width stored form, or 0 when
+// the column keeps the variable-width codec (p >= 19): 2 bytes for p <= 4, 4 for p <= 9, 8 for
+// p <= 18 (spec/fileformat/format.md "Fixed-width column slot").
+func fixedDecimalWidth(precision uint16) uint8 {
+	switch {
+	case precision >= 1 && precision <= 4:
+		return 2
+	case precision >= 5 && precision <= 9:
+		return 4
+	case precision >= 10 && precision <= 18:
+		return 8
+	}
+	return 0
+}
+
+// storeColType is the resolved STORED type of a table column: resolveColType of its declared type,
+// except that a numeric(p,s) column with p <= 18 carries its fixed-width slot (DecSlot/DecScale).
+// This is the type a table's store and leaf codec hold; a type resolved for a cast, an element, or a
+// field goes through resolveColType, which never yields the fixed form.
+func storeColType(c *catColumn, types map[string]*compositeType) colType {
+	ct := resolveColType(c.Type, types)
+	if c.Decimal != nil && c.Type.IsDecimal() {
+		if w := fixedDecimalWidth(c.Decimal.Precision); w != 0 {
+			ct.DecSlot, ct.DecScale = w, c.Decimal.Scale
+		}
+	}
+	return ct
 }
 
 // ColField is one resolved field of a composite ColType — its name, recursively-resolved type, the

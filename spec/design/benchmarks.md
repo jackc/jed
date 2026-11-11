@@ -1785,6 +1785,29 @@ harnesses.
 The lanes run under a cost ceiling and a query-memory budget (cost.md §6.1, memory.md §5.4): with
 both set, the Rust core's times for these lanes are unchanged, where each used to take 80–125 ms.
 
+**Format v51** then made the ledger's two `numeric(12,2)` columns fixed-width 8-byte slots
+([decimal.md](decimal.md) §6a). The scratch file went from 13.1 MB to 11.0 MB in every core (the
+three files are byte-identical). Alternating base (`ff0b11cf`) and v51 builds — base, v51, base,
+v51 — of each core's own jed harness, p50 in ms; a range is the two runs where they differed by
+more than about 5%. The machine was shared, and Go's grouped and top-N lanes were noisy on both
+sides:
+
+| lane | Rust base → v51 | Go base → v51 | TS base → v51 | PostgreSQL |
+|---|---|---|---|---|
+| `decimal_sum_scan` | 9.6 → 7.5 | 6.9 → 5.3 | 30.0 → 19.8 | 12.4 |
+| `decimal_sum_bigint` | 5.7 → 5.6 | 5.9 → 6.2 | 21.3–29.1 → 20.9 | 4.0 |
+| `decimal_avg_scan` | 8.7 → 6.5 | 6.3–7.2 → 4.7–7.0 | 30.1–31.2 → 17.9–18.5 | 12.3 |
+| `decimal_filter_scan` | 17.1–18.0 → 15.3 | 16.2–21.5 → 16.6–17.7 | 66.0–68.8 → 52.8 | 17.3 |
+| `decimal_arith_scan` | 38.2 → 34.7 | 43.2–50.6 → 41.3–43.0 | 130.0–131.7 → 104.0–106.1 | 17.6 |
+| `decimal_group_by` | 21.3 → 17.2 | 20.3–30.8 → 18.0–26.0 | 70.9–71.9 → 48.9 | 13.4 |
+| `decimal_group_by_high_card` | 18.9 → 15.5 | 16.9–23.6 → 18.5–21.2 | 67.0–67.7 → 59.9–63.9 | 17.4 |
+| `decimal_group_by_ordered` | 14.6–15.3 → 11.6 | 10.7 → 9.6 | 49.1–50.1 → 37.4–39.7 | 12.2 |
+| `decimal_order_by_limit` | 9.7 → 7.2 | 16.6–21.5 → 15.3–17.9 | 44.5–45.2 → 33.6 | 22.8 |
+
+`decimal_sum_bigint` reads no decimal column and is the control. Every run of every core, base and
+v51, and PostgreSQL returned the same checksum on every lane. The wrapped Node/Rust, Ruby and WASM
+harnesses were not re-run for this change.
+
 ### GIN follow-ons (format_version 47)
 
 The GIN disjunction, multi-column, jsonpath, and posting-run slices (gin.md §2.2/§4.4/§4.5/§6.3) add

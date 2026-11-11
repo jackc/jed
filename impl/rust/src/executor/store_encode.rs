@@ -318,6 +318,10 @@ pub(crate) fn coerce_for_store(
 ) -> Result<Value> {
     match ty {
         ColType::Scalar(s) => store_value(v, *s, tm, not_null, col_name, iz),
+        // The fixed-width stored form is a decimal column; `tm` carries its `numeric(p,s)`.
+        ColType::FixedDecimal { .. } => {
+            store_value(v, ScalarType::Decimal, tm, not_null, col_name, iz)
+        }
         ColType::Composite { name, fields } => {
             store_composite(v, name, fields, not_null, col_name, iz)
         }
@@ -578,23 +582,23 @@ pub(crate) fn materialize_insert_value(
     iz: &InputZone,
 ) -> Result<Value> {
     match ty {
-        ColType::Scalar(s) => match iv {
-            InsertValue::Lit(lit, _) => literal_to_value_for(lit, *s),
-            InsertValue::Param(nn) => Ok(bound[(*nn as usize) - 1].clone()),
-            InsertValue::Row(_) => Err(type_error(format!(
+        ColType::Scalar(_) | ColType::FixedDecimal { .. } => match (ty.scalar(), iv) {
+            (s, InsertValue::Lit(lit, _)) => literal_to_value_for(lit, s),
+            (_, InsertValue::Param(nn)) => Ok(bound[(*nn as usize) - 1].clone()),
+            (s, InsertValue::Row(_)) => Err(type_error(format!(
                 "cannot assign a record value to a {} field",
                 s.canonical_name()
             ))),
-            InsertValue::Array(_) => Err(type_error(format!(
+            (s, InsertValue::Array(_)) => Err(type_error(format!(
                 "cannot assign an array value to a {} field",
                 s.canonical_name()
             ))),
-            InsertValue::Default => Err(EngineError::new(
+            (_, InsertValue::Default) => Err(EngineError::new(
                 SqlState::SyntaxError,
                 "DEFAULT is not allowed inside ROW(...)",
             )),
             // Only a top-level slot is a general expression; the caller evaluates it.
-            InsertValue::Expr(_) => {
+            (_, InsertValue::Expr(_)) => {
                 unreachable!("a VALUES expression slot is evaluated by the caller")
             }
         },
@@ -889,6 +893,9 @@ pub(crate) fn coerce_array_element_text(
         ColType::Range(_) => {
             unreachable!("array-of-range is not a storable type (ranges.md §2)")
         }
+        ColType::FixedDecimal { .. } => {
+            unreachable!("the fixed-width decimal form is a table column's, never an element's")
+        }
     }
 }
 
@@ -926,6 +933,11 @@ pub(crate) fn coerce_record_text(
                     fields: f2,
                 } => coerce_record_text(&s, n2, f2, iz)?,
                 ColType::Array(inner) => coerce_string_to_array(&s, inner, iz)?,
+                ColType::FixedDecimal { .. } => {
+                    unreachable!(
+                        "the fixed-width decimal form is a table column's, never a field's"
+                    )
+                }
                 // A range-typed field: the token is a range text literal (`range_in`).
                 ColType::Range(elem) => {
                     let ColType::Scalar(es) = elem.as_ref() else {

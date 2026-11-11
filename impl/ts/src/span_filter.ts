@@ -119,9 +119,15 @@ export function* readLeafColumnSteps(n: PNode, i: number, c: number): Steps<Valu
 
 // laneReuse reports, per column, whether a lane should reuse the value its filter resolved (a
 // variable-width column beside a filter) rather than read the leaf again (a fixed-width slot decodes
-// cheaper than the reuse costs).
+// cheaper than the reuse costs). A fixed-width decimal slot is the exception among the slots: reading
+// it builds a decimal, so the value the filter already built is reused. Either read yields the same
+// value, so the choice changes no result and no cost.
 export function laneReuse(colTypes: ColType[], filtered: boolean): boolean[] {
-  return colTypes.map((ty) => filtered && fixedValueWidth(ty) === null);
+  return colTypes.map(
+    (ty) =>
+      filtered &&
+      (fixedValueWidth(ty) === null || (ty.kind === "scalar" && ty.fixedDec !== undefined)),
+  );
 }
 
 // LaneFilter is a lane's compiled WHERE: the span evaluator when the predicate has at least one span

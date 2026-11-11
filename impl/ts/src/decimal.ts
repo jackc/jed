@@ -915,6 +915,53 @@ export class Decimal {
     return Decimal.powerVar(base, exp, m);
   }
 
+  // fromUnscaledNumber is the value whose unscaled integer at display scale `scale` is `m` — a safe
+  // integer (|m| < 2^53). The load path for a fixed-width numeric(p,s) slot (format.md "Fixed-width
+  // column slot"), which builds the limbs with number arithmetic alone.
+  static fromUnscaledNumber(m: number, scale: number): Decimal {
+    const neg = m < 0;
+    if (neg) m = -m;
+    return new Decimal(m === 0 ? false : neg, scale, safeLimbs(m));
+  }
+
+  // fromUnscaledWords is fromUnscaledNumber for a magnitude hi·2^32 + lo given as two unsigned
+  // 32-bit words below 2^64 — an 8-byte slot whose value is outside the safe integers. One long
+  // division by the limb base takes the low limb (the partial dividend r·2^32 + lo stays below
+  // 10^4·2^32 < 2^53); the quotient is below 2^64 / 10^4 < 2^53, a safe integer.
+  static fromUnscaledWords(neg: boolean, hi: number, lo: number, scale: number): Decimal {
+    const qh = Math.floor(hi / BASE);
+    const t = (hi - qh * BASE) * 4294967296 + lo;
+    const ql = Math.floor(t / BASE);
+    const limbs = safeLimbs(qh * 4294967296 + ql);
+    limbs.unshift(t - ql * BASE);
+    return Decimal.fromParts(neg, scale, limbs);
+  }
+
+  // unscaledWords writes the value's unscaled integer magnitude at display scale `scale` — |this| ×
+  // 10^scale — into out as two unsigned 32-bit words (magnitude = hi·2^32 + lo), for a fixed-width
+  // numeric(p,s) slot. False when the value has more than `scale` fractional digits or the magnitude
+  // is 2^64 or more: a value store-coercion has not brought to the column's typmod.
+  unscaledWords(scale: number, out: { hi: number; lo: number }): boolean {
+    let limbs = this.limbs;
+    if (this.scale !== scale) {
+      if (this.scale > scale) return false;
+      limbs = this.roundToScale(scale).limbs; // raising the scale only appends zeros (exact)
+    }
+    if (limbs.length > 5) return false; // 10^20 > 2^64
+    let hi = 0;
+    let lo = 0;
+    for (let i = limbs.length - 1; i >= 0; i--) {
+      const t = lo * BASE + limbs[i]!; // < 2^32·10^4 + 10^4, exact
+      const carry = Math.floor(t / 4294967296);
+      lo = t - carry * 4294967296;
+      hi = hi * BASE + carry;
+      if (hi >= 4294967296) return false;
+    }
+    out.hi = hi;
+    out.lo = lo;
+    return true;
+  }
+
   // toCodec returns [neg, scale, base-10^4 coefficient groups MS-first] for the value codec.
   // Zero → no groups (spec/fileformat/format.md). The limbs ARE base-10^4, so the groups are
   // the limbs reversed (MS-first).
@@ -1036,6 +1083,20 @@ export function workLinear(a: Decimal, b: Decimal): number {
   const a1 = a.precision() + (s - a.scale);
   const a2 = b.precision() + (s - b.scale);
   return decGroups(a1 > a2 ? a1 : a2);
+}
+
+// safeLimbs is the base-10^4 limbs (least-significant first, no high zero limb) of a non-negative
+// safe integer — at most four, since 2^53 < 10^16. Each array is built at its exact length.
+function safeLimbs(m: number): number[] {
+  if (m < BASE) return m === 0 ? [] : [m];
+  const q1 = Math.floor(m / BASE);
+  const l0 = m - q1 * BASE;
+  if (q1 < BASE) return [l0, q1];
+  const q2 = Math.floor(q1 / BASE);
+  const l1 = q1 - q2 * BASE;
+  if (q2 < BASE) return [l0, l1, q2];
+  const q3 = Math.floor(q2 / BASE);
+  return [l0, l1, q2 - q3 * BASE, q3];
 }
 
 // W for mul: the product of the (unaligned) operand group counts — schoolbook-quadratic.

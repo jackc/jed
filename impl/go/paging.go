@@ -184,7 +184,8 @@ func sameLeafShape(a, b []colType) bool {
 
 // sameValueCodec compares two column types by their stored value codec: the scalar, array element,
 // range element, or composite fields, recursively. Names, typmods, and nullability do not change the
-// stored bytes, so they are ignored.
+// stored bytes, so they are ignored — except a numeric(p,s) column's fixed-width slot (format.md v51),
+// which the stored type carries as DecSlot/DecScale.
 func sameValueCodec(a, b colType) bool {
 	if a.Composite != b.Composite || (a.Elem == nil) != (b.Elem == nil) || (a.RangeElem == nil) != (b.RangeElem == nil) {
 		return false
@@ -205,7 +206,8 @@ func sameValueCodec(a, b colType) bool {
 	case a.RangeElem != nil:
 		return sameValueCodec(*a.RangeElem, *b.RangeElem)
 	default:
-		return a.Scalar == b.Scalar
+		// A fixed-width decimal slot's width and the scale it is read at are both part of the codec.
+		return a.Scalar == b.Scalar && a.DecSlot == b.DecSlot && a.DecScale == b.DecScale
 	}
 }
 

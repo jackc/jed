@@ -27,7 +27,10 @@ require "zlib"
 # Exit 0 = all fixtures conform; nonzero = mismatch (prints the offending case).
 
 MAGIC = "JEDB".b
-VERSION = 50 # v50: index_flags bit5 is_constraint — set on the unique index that backs a UNIQUE
+VERSION = 51 # v51: a `numeric(p,s)` table column with p <= 18 is a fixed-width leaf column — a null
+# bitmap and 2/4/8-byte slots holding the unscaled integer — instead of the variable-width decimal
+# codec; the catalog is unchanged (format.md "Fixed-width column slot", decimal.md §6a).
+# v50: index_flags bit5 is_constraint — set on the unique index that backs a UNIQUE
 # constraint, clear on a bare CREATE UNIQUE INDEX (legal only with bit0 unique; constraints.md §5.5).
 # v49: batched durability — a commit writes the meta slot not holding the newest durable
 # meta, and a pending commit's manifest lists every page written since that floor; no byte layout
@@ -540,6 +543,25 @@ PK_TABLE = {
   rows: (1..20).map { |i| [i, i == 3 ? nil : i * 10] }
 }.freeze
 
+# Statistics over a fixed-width `numeric(p,s)` column (format.md v51): the leaf holds `amt` as 4-byte
+# slots, while the statistics entries — a single-value context — hold each MCV value in the
+# self-describing decimal codec. The cores build this via
+#   CREATE TABLE t (id i32 PRIMARY KEY, amt numeric(6,2));
+#   INSERT INTO t VALUES (1, 1.50), (2, 1.50), (3, 2.25), (4, NULL); ANALYZE t
+STATISTICS_DECIMAL_TABLE = {
+  name: "t",
+  columns: [col("id", "i32", pk: true), col("amt", "decimal", precision: 6, scale: 2)],
+  rows: [[1, "1.50"], [2, "1.50"], [3, "2.25"], [4, nil]],
+  statistics: [
+    { column: 0, stale: false, analyzed_rows: 4, null_count: 0, width_sum: 16,
+      distinct_count: 4, sample_rows: 4, sample_nonnull_rows: 4,
+      mcv: [[1, 1], [2, 1], [3, 1], [4, 1]], histogram: [] },
+    { column: 1, stale: false, analyzed_rows: 4, null_count: 1, width_sum: 24,
+      distinct_count: 2, sample_rows: 4, sample_nonnull_rows: 3,
+      mcv: [["1.50", 2], ["2.25", 1]], histogram: [] }
+  ]
+}.freeze
+
 # The v28 catalog-tail fixture: three rows keep the tree to one small leaf while pinning a nonzero
 # `root_data_page` followed by `row_count = 3`. `one_table_empty.jed` pins the zero/zero pair.
 ROW_COUNT_TABLE = {
@@ -662,6 +684,27 @@ DECIMAL_TABLE = {
   columns: [col("id", "i32", pk: true), col("d", "decimal"), col("m", "decimal", precision: 10, scale: 2)],
   rows: [[1, "1.50", "1.50"], [2, "-12345.6789", "-12.34"], [3, "0.00", "0.00"],
          [4, "100000000.000001", "100.00"], [5, nil, nil]]
+}.freeze
+
+# Fixed-width stored `numeric(p,s)` (format.md v51): one column per slot width — numeric(4,2) is a
+# 2-byte slot, numeric(9,0) 4 bytes, numeric(18,6) 8 bytes — beside a numeric(19,2) column, which
+# keeps the variable-width decimal codec. Rows hold each column's largest and smallest value, zero,
+# a value below the declared scale's digits, and a NULL (bitmap bit + zero-filled slot); 12 more
+# rows force a second leaf. The cores build this via
+#   CREATE TABLE t (id i32 PRIMARY KEY, a numeric(4,2), b numeric(9,0), c numeric(18,6), w numeric(19,2))
+# and INSERT the rows in order.
+DECIMAL_FIXED_TABLE = {
+  name: "t",
+  columns: [col("id", "i32", pk: true), col("a", "decimal", precision: 4, scale: 2),
+            col("b", "decimal", precision: 9, scale: 0), col("c", "decimal", precision: 18, scale: 6),
+            col("w", "decimal", precision: 19, scale: 2)],
+  rows: [[1, "99.99", "999999999", "999999999999.999999", "99999999999999999.99"],
+         [2, "-99.99", "-999999999", "-999999999999.999999", "-99999999999999999.99"],
+         [3, "0.00", "0", "0.000000", "0.00"],
+         [4, "0.01", "1", "0.000001", "0.01"],
+         [5, nil, nil, nil, nil],
+         [6, "-0.50", "-42", "-1.500000", nil]] +
+        (7..18).map { |i| [i, format("%d.25", i), (i * 1000).to_s, format("%d.000%03d", i * 7, i), format("%d.00", i)] }
 }.freeze
 
 # A table with a bytea column: exercises the value codec's bytea branch (u16 byte-length +
@@ -2011,12 +2054,14 @@ FIXTURES = ([
   { file: "row_count_table.jed", page_size: 256, tables: [ROW_COUNT_TABLE] },
   { file: "statistics_table.jed", page_size: 256, tables: STATISTICS_TABLES },
   { file: "statistics_terms_table.jed", page_size: 256, tables: [STATISTICS_TERMS_TABLE] },
+  { file: "statistics_decimal_table.jed", page_size: 256, tables: [STATISTICS_DECIMAL_TABLE] },
   { file: "pk_table.jed",        page_size: 256, tables: [PK_TABLE] },
   { file: "text_table.jed",      page_size: 256, tables: [TEXT_TABLE] },
   { file: "varchar_table.jed",   page_size: 256, tables: [VARCHAR_TABLE] },
   { file: "bool_table.jed",      page_size: 256, tables: [BOOL_TABLE] },
   { file: "bool_pk_table.jed",   page_size: 256, tables: [BOOL_PK_TABLE] },
   { file: "decimal_table.jed",   page_size: 256, tables: [DECIMAL_TABLE] },
+  { file: "decimal_fixed_table.jed", page_size: 256, tables: [DECIMAL_FIXED_TABLE] },
   { file: "bytea_table.jed",     page_size: 256, tables: [BYTEA_TABLE] },
   { file: "text_pk_table.jed",   page_size: 256, tables: [TEXT_PK_TABLE] },
   { file: "bytea_pk_table.jed",  page_size: 256, tables: [BYTEA_PK_TABLE] },
@@ -3646,28 +3691,65 @@ end
 
 # --- out-of-line large values (large-values.md §12) -------------------------
 
-def spillable?(type) = %w[text bytea decimal].include?(type)
+# A fixed-width `numeric(p,s)` column (v51) is not spillable: its value is a slot, not a codec body.
+def spillable?(col) = %w[text bytea].include?(col[:type]) || (col[:type] == "decimal" && !fixed_decimal_width(col))
 # RECORD_MAX(K) = (C − max(12, 12+16K))/2 (format.md "Why the record cap"): the value is KEPT from
 # v23 (bplus-reshape.md §4.2), re-derived leaf-only — the v24 worst-case two-record leaf overhead
 # (all-variable, 12+13K) stays under the reserve. K=0 (index trees) is exact: 2·(C−12)/2 + 12 = C.
 def record_max(cap, k) = [(cap - [12, 12 + 16 * k].max) / 2, 0].max
 
 # The dense-slot width of a FIXED-WIDTH column's value body (format.md v24 "Leaf node"), or nil for
-# a VARIABLE-WIDTH column (text/bytea/decimal/json/jsonb/composite/array/range — the spillable set).
+# a VARIABLE-WIDTH column (text/bytea/json/jsonb/composite/array/range and any decimal column that
+# is not `numeric(p,s)` with p <= 18 — the spillable set).
 # The class decides the column's leaf region shape: fixed regions are flags + null bitmap + dense
 # untagged slots; variable regions are flags + an end-offset value directory + tagged codec bytes
 # (NULL = a zero-length span).
 STORAGE_WIDTH = { "i16" => 2, "i32" => 4, "i64" => 8, "boolean" => 1, "uuid" => 16,
                   "timestamp" => 8, "timestamptz" => 8, "date" => 4, "interval" => 16,
                   "f64" => 8, "f32" => 4 }.freeze
-def fixed_width(type) = type.is_a?(String) ? STORAGE_WIDTH[type] : nil
+def fixed_width(col) = col[:type].is_a?(String) ? (STORAGE_WIDTH[col[:type]] || fixed_decimal_width(col)) : nil
+
+# The slot width of a `numeric(p,s)` column with p <= 18 (format.md v51 "Fixed-width column slot"):
+# 2 bytes for p <= 4, 4 for p <= 9, 8 for p <= 18. nil for every other column — an unconstrained
+# `numeric`, or p >= 19, keeps the variable-width decimal codec.
+def fixed_decimal_width(col)
+  p = col[:precision]
+  return nil unless col[:type] == "decimal" && p && p.between?(1, 18)
+
+  p <= 4 ? 2 : (p <= 9 ? 4 : 8)
+end
+
+# A fixed-width decimal slot: the value's unscaled integer `value * 10^s` in the integer body of
+# the slot's width (big-endian, sign bit flipped). The value must already be at the column's scale
+# or a lower one (a constrained column stores only coerced values).
+def encode_fixed_decimal(col, s)
+  d = parse_decimal(s)
+  scale = col[:scale] || 0
+  raise "decimal #{s} has more than #{scale} fractional digits" if d[:scale] > scale
+
+  u = d[:coeff] * 10**(scale - d[:scale])
+  w = fixed_decimal_width(col)
+  # A magnitude of 10^p or more still fits the slot's integer range: a typmod violation, which the
+  # integrity fixtures build on purpose, never a different byte form.
+  raise "decimal #{s} does not fit a #{w}-byte slot" if u >= (1 << (8 * w - 1))
+
+  u = -u if d[:neg]
+  [u + (1 << (8 * w - 1))].pack(w == 8 ? "Q>" : (w == 4 ? "N" : "n"))
+end
+
+# Inverse of encode_fixed_decimal: the slot's unscaled integer rendered at the column's scale.
+def decode_fixed_decimal(col, bytes)
+  w = fixed_decimal_width(col)
+  u = bytes.unpack1(w == 8 ? "Q>" : (w == 4 ? "N" : "n")) - (1 << (8 * w - 1))
+  render_decimal(u.negative?, col[:scale] || 0, u.abs)
+end
 
 # leaf_overhead(N, cols): a v24 leaf's payload beyond Σ record_size (format.md "Leaf node") — the
 # key directory (4N), the column directory (4(K+1)), and per region a flags byte plus the null
 # bitmap (fixed-width, ceil(N/8)) or the value directory (variable, 4N).
 def leaf_overhead(n, cols)
   cols.sum(4 * n + 4 * (cols.size + 1)) do |c|
-    1 + (fixed_width(c[:type]) ? (n + 7) / 8 : 4 * n)
+    1 + (fixed_width(c) ? (n + 7) / 8 : 4 * n)
   end
 end
 
@@ -3697,7 +3779,7 @@ def plan_record(table, key, row, cap)
   # a fixed-width column always its width (NULL occupies a zero-filled slot); a variable column 0
   # when NULL (a zero-length span) else its tagged inline encoding.
   inline = cols.each_with_index.map do |c, i|
-    if (w = fixed_width(c[:type]))
+    if (w = fixed_width(c))
       w
     else
       row[i].nil? ? 0 : encode_value(c[:type], row[i]).bytesize
@@ -3713,7 +3795,7 @@ def plan_record(table, key, row, cap)
   # Pass 1 — compress (lz4.md): payload >= S_COMPRESS, largest inline-plain encoded size first,
   # ties by ascending index; adopt iff the encoded compressed form is strictly smaller.
   cand = (0...cols.size).select do |i|
-    spillable?(cols[i][:type]) && !row[i].nil? && value_payload(cols[i][:type], row[i]).bytesize >= S_COMPRESS
+    spillable?(cols[i]) && !row[i].nil? && value_payload(cols[i][:type], row[i]).bytesize >= S_COMPRESS
   end
   cand.sort_by! { |i| [-inline[i], i] }
   cand.each do |i|
@@ -3731,7 +3813,7 @@ def plan_record(table, key, row, cap)
 
   # Pass 2 — externalize: anything whose current encoded size beats its pointer, largest first.
   cand = (0...cols.size).select do |i|
-    spillable?(cols[i][:type]) &&
+    spillable?(cols[i]) &&
       cur[i] > (forms[i] == :inline_comp ? EXTERNAL_COMP_PTR_LEN : EXTERNAL_PTR_LEN) + tag_len
   end
   cand.sort_by! { |i| [-cur[i], i] }
@@ -3811,8 +3893,14 @@ def emit_leaf_pax(recs, cap, alloc, pages)
     cols.each_with_index do |c, ci|
       v = rec[:row][ci]
       val_bytes[ci][i] =
-        if (w = fixed_width(c[:type]))
-          v.nil? ? ("\x00".b * w) : encode_value(c[:type], v).byteslice(1..) # untagged body; NULL slot zero-filled
+        if (w = fixed_width(c))
+          if v.nil?
+            "\x00".b * w                                 # a NULL slot is zero-filled
+          elsif fixed_decimal_width(c)
+            encode_fixed_decimal(c, v)                    # the unscaled integer (v51)
+          else
+            encode_value(c[:type], v).byteslice(1..)     # the untagged body
+          end
         elsif v.nil?
           "".b # a zero-length span
         else
@@ -3829,13 +3917,13 @@ def emit_leaf_pax(recs, cap, alloc, pages)
   cur = base_after_col_dir
   (0...k).each do |c|
     col_start[c] = cur
-    cur += 1 + (fixed_width(cols[c][:type]) ? (n + 7) / 8 : 4 * n) + val_bytes[c].sum(&:bytesize)
+    cur += 1 + (fixed_width(cols[c]) ? (n + 7) / 8 : 4 * n) + val_bytes[c].sum(&:bytesize)
   end
   col_start[k] = cur
   (0..k).each { |c| out << u32(col_start[c]) }                          # column directory
   (0...k).each do |c|
     out << "\x00".b                                                    # region flags (reserved)
-    if fixed_width(cols[c][:type])
+    if fixed_width(cols[c])
       bitmap = Array.new((n + 7) / 8, 0)
       recs.each_with_index { |rec, i| bitmap[i / 8] |= (0x80 >> (i % 8)) if rec[:row][c].nil? }
       out << bitmap.pack("C*")
@@ -5337,7 +5425,7 @@ def parse_pax_leaf(payload, n, cols)
     flags = payload.getbyte(start)
     raise "PAX leaf region flags has a reserved bit set" unless flags.zero?
 
-    if (w = fixed_width(c[:type]))
+    if (w = fixed_width(c))
       bitmap = payload.byteslice(start + 1, (n + 7) / 8)
       body = start + 1 + (n + 7) / 8
       raise "fixed region extent mismatch" unless body + n * w == col_start[ci + 1]
@@ -5357,10 +5445,12 @@ end
 # Decode value (record i, column c) from a parsed v24 leaf region: nil from the bitmap (fixed) or
 # the zero-length span (variable); a fixed slot is the untagged body (re-tagged for decode_value);
 # a variable span is the tagged codec bytes as-is.
-def leaf_value(region, type, i, fetch)
+def leaf_value(region, col, i, fetch)
+  type = col[:type]
   if region[:width]
     w = region[:width]
     return nil if (region[:bitmap].getbyte(i / 8) & (0x80 >> (i % 8))) != 0
+    return decode_fixed_decimal(col, region[:body].byteslice(i * w, w)) if fixed_decimal_width(col)
 
     v, = decode_value(type, "\x00".b + region[:body].byteslice(i * w, w), 0, fetch)
     v
@@ -5391,7 +5481,7 @@ def read_tree_rows(image, ps, root_page, columns)
       n = pg[:item_count]
       _keys, regions = parse_pax_leaf(pg[:payload], n, columns)
       (0...n).each do |i|
-        rows << columns.each_with_index.map { |c, ci| leaf_value(regions[ci], c[:type], i, fetch) }
+        rows << columns.each_with_index.map { |c, ci| leaf_value(regions[ci], c, i, fetch) }
       end
     when PAGE_INTERIOR
       n = pg[:item_count]

@@ -1579,8 +1579,8 @@ func (db *engine) createTableWithColumns(ct *createTable, prebuilt []catColumn) 
 		ws.storePaging = db.core.attachment(attachName).storage.paging
 		mainTypes := db.readSnap().types
 		colTypes := make([]colType, len(table.Columns))
-		for i, c := range table.Columns {
-			colTypes[i] = resolveColType(c.Type, mainTypes)
+		for i := range table.Columns {
+			colTypes[i] = storeColType(&table.Columns[i], mainTypes)
 		}
 		// Build the attachment's new stores at ITS OWN page size (§2) — a file attachment may serialize at
 		// a different page size than main, and its records must split to match its physical pages.
@@ -1610,8 +1610,8 @@ func (db *engine) createTableWithColumns(ct *createTable, prebuilt []catColumn) 
 		// the catalog after this (composite.md §4).
 		mainTypes := db.readSnap().types
 		colTypes := make([]colType, len(table.Columns))
-		for i, c := range table.Columns {
-			colTypes[i] = resolveColType(c.Type, mainTypes)
+		for i := range table.Columns {
+			colTypes[i] = storeColType(&table.Columns[i], mainTypes)
 		}
 		// Register into the session-local temp snapshot — never the main image, so the table makes zero
 		// file writes (§2). Flag tempDirty so the commit can skip persisting the main image.
@@ -2866,8 +2866,8 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 	var rewriteColTypes []colType
 	if tableRewriteNeeded {
 		rewriteColTypes = make([]colType, len(table.Columns))
-		for i, c := range table.Columns {
-			rewriteColTypes[i] = resolveColType(c.Type, db.readSnap().types)
+		for i := range table.Columns {
+			rewriteColTypes[i] = storeColType(&table.Columns[i], db.readSnap().types)
 		}
 	}
 	meter := db.session.newMeter()

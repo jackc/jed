@@ -65,10 +65,12 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   - [ ] _follow-on:_ `char(n)`/`character(n)` (blank-padded); `varchar(n)[]` element typmod (the `numeric(p,s)[]` narrowing).
 - [x] **Exact `decimal`.** → [decimal.md](spec/design/decimal.md)
   - [ ] _follow-on:_ negative / `s>p` scale typmods.
-  - [ ] _decide (maintainer):_ a **fixed-width stored form for `numeric(p,s)`**, `p ≤ 18` — the
-    unscaled integer in a 2/4/8-byte slot, about 13 → 8 bytes per `numeric(12,2)` value. An on-disk
-    format change (Ruby reference, goldens, all cores, the `# cost:` of scans over such tables).
-    Measured proposal: [decimal.md §6a](spec/design/decimal.md).
+  - [x] **Fixed-width stored `numeric(p,s)`**, `p ≤ 18` (format v51) — the unscaled integer in a
+    2/4/8-byte leaf slot: about 13 → 8 bytes per `numeric(12,2)` value and faster decimal
+    scans. → [decimal.md §6a](spec/design/decimal.md)
+    - [ ] _follow-on:_ a 16-byte slot for `19 ≤ p ≤ 38` (needs 128-bit slot arithmetic in every
+      core; about today's size for typical values). The negative / `s>p` typmod follow-on above must
+      keep the slot rule `|value × 10^s| < 10^p`.
   - [ ] _follow-on (TS, per-core):_ the TS core's decimal lanes are still several times slower than
     Rust's and Go's; what remains is per-value directory reads, bigint cost arithmetic, and the fold
     dispatch ([benchmarks.md §11](spec/design/benchmarks.md)).

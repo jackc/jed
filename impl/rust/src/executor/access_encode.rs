@@ -303,7 +303,11 @@ impl KeySlotKind {
 /// spec/design/integrity-check.md §3.4). `None` for a malformed body or a type with no key.
 pub(crate) fn key_body_len(ct: &ColType, collated: bool, body: &[u8], m: u8) -> Option<usize> {
     match ct {
-        ColType::Scalar(s) => KeySlot::for_scalar(*s, collated)?.kind.body_len(body, m),
+        ColType::Scalar(_) | ColType::FixedDecimal { .. } => {
+            KeySlot::for_scalar(ct.scalar(), collated)?
+                .kind
+                .body_len(body, m)
+        }
         // `0x00` the empty range; else `0x01`, then each bound: an infinite marker (`0x00` lower,
         // `0x02` upper) or `0x01` ‖ the element key ‖ an inclusivity byte.
         ColType::Range(elem) => {
@@ -5486,7 +5490,9 @@ pub(crate) fn encode_key_ct(
             ColType::Scalar(s) => encode_array_key(*s, a, coll),
             _ => Err(key_kind_mismatch()),
         },
-        (ColType::Scalar(s), _) => encode_key_value(*s, value, coll),
+        (ColType::Scalar(_) | ColType::FixedDecimal { .. }, _) => {
+            encode_key_value(ct.scalar(), value, coll)
+        }
         _ => Err(key_kind_mismatch()),
     }
 }

@@ -99,6 +99,17 @@ function statisticsTableDB(): Engine {
   return db;
 }
 
+// statisticsDecimalTableDB is statistics over a fixed-width numeric(6,2) column (format.md v51): the
+// leaf holds 4-byte slots, the statistics entries the self-describing decimal codec. Must match
+// verify.rb's STATISTICS_DECIMAL_TABLE.
+function statisticsDecimalTableDB(): Engine {
+  const db = goldenDb();
+  run(db, "CREATE TABLE t (id i32 PRIMARY KEY, amt numeric(6,2))");
+  run(db, "INSERT INTO t VALUES (1, 1.50), (2, 1.50), (3, 2.25), (4, NULL)");
+  run(db, "ANALYZE t");
+  return db;
+}
+
 // statisticsTermsTableDB is the v42 GIN term statistics golden (statistics.md §4.5): ANALYZE t (tags,
 // doc) over 105 rows whose tags truncate to the 100-term list and whose four documents give key and
 // value terms. Must match verify.rb's STATISTICS_TERMS_TABLE.
@@ -735,6 +746,31 @@ function decimalTableDB(): Engine {
   return db;
 }
 
+// decimalFixedTableDB is fixed-width stored numeric(p,s) (format.md v51): a 2-byte numeric(4,2), a
+// 4-byte numeric(9,0), and an 8-byte numeric(18,6) slot column beside a numeric(19,2) column, which
+// keeps the variable-width codec. Each column's extremes, zero, a NULL, and a second leaf.
+function decimalFixedTableDB(): Engine {
+  const db = goldenDb();
+  run(
+    db,
+    "CREATE TABLE t (id i32 PRIMARY KEY, a numeric(4,2), b numeric(9,0), c numeric(18,6), " +
+      "w numeric(19,2))",
+  );
+  run(
+    db,
+    "INSERT INTO t VALUES " +
+      "(1, 99.99, 999999999, 999999999999.999999, 99999999999999999.99), " +
+      "(2, -99.99, -999999999, -999999999999.999999, -99999999999999999.99), " +
+      "(3, 0.00, 0, 0.000000, 0.00), (4, 0.01, 1, 0.000001, 0.01), " +
+      "(5, NULL, NULL, NULL, NULL), (6, -0.50, -42, -1.500000, NULL)",
+  );
+  for (let i = 7; i <= 18; i++) {
+    const frac = String(i).padStart(3, "0");
+    run(db, `INSERT INTO t VALUES (${i}, ${i}.25, ${i * 1000}, ${i * 7}.000${frac}, ${i}.00)`);
+  }
+  return db;
+}
+
 // byteaTableDB exercises the value codec's bytea branch (u16 length + raw bytes): a multi-
 // byte value (a-f hex), the empty byte string, embedded 0x00 bytes, a high byte (0xFF), a
 // NULL, and a lone 0x00. The PK stays i32 (no bytea key this slice). Literals are the `\x`
@@ -1255,6 +1291,7 @@ test("write matches goldens (byte-identical to Rust/Go/Ruby)", () => {
     { name: "one_table_empty.jed", build: oneTableEmptyDB },
     { name: "row_count_table.jed", build: rowCountTableDB },
     { name: "statistics_table.jed", build: statisticsTableDB },
+    { name: "statistics_decimal_table.jed", build: statisticsDecimalTableDB },
     { name: "statistics_terms_table.jed", build: statisticsTermsTableDB },
     { name: "pk_table.jed", build: pkTableDB },
     { name: "text_table.jed", build: textTableDB },
@@ -1262,6 +1299,7 @@ test("write matches goldens (byte-identical to Rust/Go/Ruby)", () => {
     { name: "bool_table.jed", build: boolTableDB },
     { name: "bool_pk_table.jed", build: boolPkTableDB },
     { name: "decimal_table.jed", build: decimalTableDB },
+    { name: "decimal_fixed_table.jed", build: decimalFixedTableDB },
     { name: "bytea_table.jed", build: byteaTableDB },
     { name: "text_pk_table.jed", build: textPkTableDB },
     { name: "bytea_pk_table.jed", build: byteaPkTableDB },
@@ -1350,6 +1388,7 @@ test("read goldens reproduces rows", () => {
     { name: "bool_table.jed", build: boolTableDB, table: "t" },
     { name: "bool_pk_table.jed", build: boolPkTableDB, table: "t" },
     { name: "decimal_table.jed", build: decimalTableDB, table: "t" },
+    { name: "decimal_fixed_table.jed", build: decimalFixedTableDB, table: "t" },
     { name: "bytea_table.jed", build: byteaTableDB, table: "t" },
     { name: "text_pk_table.jed", build: textPkTableDB, table: "t" },
     { name: "bytea_pk_table.jed", build: byteaPkTableDB, table: "t" },
@@ -1604,6 +1643,16 @@ test("table row-count root invariant is rejected", () => {
     () => loadEngine(image, GOLDEN_ENV),
     (e: unknown) => e instanceof Error && e.message.startsWith("XX001"),
   );
+});
+
+test("fixed-width decimal goldens load and re-serialize byte-identically", () => {
+  // The read side of format v51: a leaf's 2/4/8-byte decimal slots, and statistics values of such a
+  // column in the self-describing decimal codec (a single-value context, never the slot).
+  for (const name of ["decimal_fixed_table.jed", "statistics_decimal_table.jed"]) {
+    const image = fixture(name);
+    const loaded = loadEngine(image, GOLDEN_ENV);
+    assert.ok(bytesEqual(toImage(loaded, GOLDEN_PAGE_SIZE, 1n), image), `${name}: bytes differ`);
+  }
 });
 
 test("statistics semantic corruption is rejected", () => {

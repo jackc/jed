@@ -123,9 +123,10 @@ func (n *pnode) colAtResolved(i, c int) (Value, error) {
 }
 
 // smallDecimalAt reads decimal column c of record i straight from a Packed leaf's page into buf —
-// no Value and no allocation — when the stored value is an inline body of at most four digit groups
-// (below 10^16). ok is false for anything else (a Decoded leaf, a longer, out-of-line, compressed,
-// or malformed value), which the caller reads the ordinary way, so errors are reported as before.
+// no Value and no allocation — when the stored value is a fixed-width slot below 10^18 (format.md
+// v51) or an inline variable-width body of at most four digit groups (below 10^16). ok is false for
+// anything else (a Decoded leaf, a longer, out-of-line, compressed, or malformed value), which the
+// caller reads the ordinary way, so errors are reported as before.
 // The returned Decimal's limbs are buf: it is valid until buf is reused.
 func (n *pnode) smallDecimalAt(i, c int, buf *[2]uint32) (d Decimal, null, ok bool) {
 	p := n.packed
@@ -136,7 +137,35 @@ func (n *pnode) smallDecimalAt(i, c int, buf *[2]uint32) (d Decimal, null, ok bo
 		return d, true, true
 	}
 	vb, err := p.dirs.value(c, i)
-	if err != nil || len(vb) < 6 || vb[0] != 0x00 {
+	if err != nil {
+		return d, false, false
+	}
+	if ty := p.colTypes[c]; ty.DecSlot != 0 {
+		// A fixed-width slot (format.md v51): the unscaled integer at the column's scale.
+		if len(vb) != int(ty.DecSlot) {
+			return d, false, false
+		}
+		u := decodeFixedDecimalSlot(vb)
+		m := uint64(u)
+		if u < 0 {
+			m = -m
+		}
+		if m >= smallBoxMax {
+			return d, false, false // three limbs: outside any fixed column's typmod, read the long way
+		}
+		d.Scale = uint32(ty.DecScale)
+		switch {
+		case m == 0:
+		case m < decBase:
+			buf[0] = uint32(m)
+			d.Neg, d.Limbs = u < 0, buf[:1:1]
+		default:
+			buf[0], buf[1] = uint32(m%decBase), uint32(m/decBase)
+			d.Neg, d.Limbs = u < 0, buf[:2:2]
+		}
+		return d, false, true
+	}
+	if len(vb) < 6 || vb[0] != 0x00 {
 		return d, false, false
 	}
 	groups := int(binary.BigEndian.Uint16(vb[4:]))

@@ -142,6 +142,29 @@ fn statistics_table_db() -> Session {
     db
 }
 
+/// Statistics over a fixed-width `numeric(6,2)` column (format.md v51): the leaf holds 4-byte slots,
+/// the statistics entries the self-describing decimal codec. Must match verify.rb's
+/// STATISTICS_DECIMAL_TABLE.
+fn statistics_decimal_table_db() -> Session {
+    let mut db = Database::create(CreateOptions {
+        environment: golden_env(),
+        page_size: GOLDEN_PAGE_SIZE,
+        ..Default::default()
+    })
+    .unwrap()
+    .session(SessionOptions::default());
+    run(
+        &mut db,
+        "CREATE TABLE t (id i32 PRIMARY KEY, amt numeric(6,2))",
+    );
+    run(
+        &mut db,
+        "INSERT INTO t VALUES (1, 1.50), (2, 1.50), (3, 2.25), (4, NULL)",
+    );
+    run(&mut db, "ANALYZE t");
+    db
+}
+
 /// v42 GIN term statistics (statistics.md §4.5): `ANALYZE t (tags, doc)` over 105 rows whose tags
 /// truncate to the 100-term list and whose four documents give key and value terms. Must match
 /// verify.rb's STATISTICS_TERMS_TABLE.
@@ -1180,6 +1203,43 @@ fn decimal_table_db() -> Session {
     db
 }
 
+/// Fixed-width stored `numeric(p,s)` (format.md v51): a 2-byte `numeric(4,2)`, a 4-byte
+/// `numeric(9,0)`, and an 8-byte `numeric(18,6)` slot column beside a `numeric(19,2)` column, which
+/// keeps the variable-width codec. Each column's extremes, zero, a NULL, and a second leaf.
+fn decimal_fixed_table_db() -> Session {
+    let mut db = Database::create(CreateOptions {
+        environment: golden_env(),
+        page_size: GOLDEN_PAGE_SIZE,
+        ..Default::default()
+    })
+    .unwrap()
+    .session(SessionOptions::default());
+    run(
+        &mut db,
+        "CREATE TABLE t (id i32 PRIMARY KEY, a numeric(4,2), b numeric(9,0), c numeric(18,6), \
+         w numeric(19,2))",
+    );
+    run(
+        &mut db,
+        "INSERT INTO t VALUES \
+         (1, 99.99, 999999999, 999999999999.999999, 99999999999999999.99), \
+         (2, -99.99, -999999999, -999999999999.999999, -99999999999999999.99), \
+         (3, 0.00, 0, 0.000000, 0.00), (4, 0.01, 1, 0.000001, 0.01), \
+         (5, NULL, NULL, NULL, NULL), (6, -0.50, -42, -1.500000, NULL)",
+    );
+    for i in 7..=18 {
+        run(
+            &mut db,
+            &format!(
+                "INSERT INTO t VALUES ({i}, {i}.25, {}, {}.000{i:03}, {i}.00)",
+                i * 1000,
+                i * 7
+            ),
+        );
+    }
+    db
+}
+
 /// A table with a bytea column — exercises the value codec's bytea branch (u16 length + raw
 /// bytes): a multi-byte value (a-f hex), the empty byte string, embedded 0x00 bytes, a high
 /// byte (0xFF), a NULL, and a lone 0x00. The PK stays i32 (no bytea key this slice).
@@ -2158,12 +2218,14 @@ fn write_matches_goldens() {
         ("row_count_table.jed", row_count_table_db),
         ("statistics_table.jed", statistics_table_db),
         ("statistics_terms_table.jed", statistics_terms_table_db),
+        ("statistics_decimal_table.jed", statistics_decimal_table_db),
         ("pk_table.jed", pk_table_db),
         ("text_table.jed", text_table_db),
         ("varchar_table.jed", varchar_table_db),
         ("bool_table.jed", bool_table_db),
         ("bool_pk_table.jed", bool_pk_table_db),
         ("decimal_table.jed", decimal_table_db),
+        ("decimal_fixed_table.jed", decimal_fixed_table_db),
         ("bytea_table.jed", bytea_table_db),
         ("text_pk_table.jed", text_pk_table_db),
         ("bytea_pk_table.jed", bytea_pk_table_db),
@@ -2277,6 +2339,7 @@ fn read_goldens_reproduces_rows() {
         ("bool_table.jed", bool_table_db, "t"),
         ("bool_pk_table.jed", bool_pk_table_db, "t"),
         ("decimal_table.jed", decimal_table_db, "t"),
+        ("decimal_fixed_table.jed", decimal_fixed_table_db, "t"),
         ("bytea_table.jed", bytea_table_db, "t"),
         ("text_pk_table.jed", text_pk_table_db, "t"),
         ("bytea_pk_table.jed", bytea_pk_table_db, "t"),

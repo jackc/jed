@@ -821,6 +821,12 @@ session/clock/state dependencies, and pin named timezone data until an explicit 
   entries use the ordered slot (tag by NULL placement, body inverted for `DESC` — encoding.md §2.16),
   valid for every keyable type because every key body is prefix-free
   ([spec/design/indexes.md](spec/design/indexes.md) §11).
+- **Fixed-width stored `numeric(p,s)` (format v51).** A table column declared `numeric(p,s)` with
+  `p ≤ 18` is a fixed-width leaf column: a null bitmap and 2/4/8-byte slots holding each value's
+  unscaled integer, in place of the variable-width decimal codec. `decimal` is the one type whose
+  column class depends on its typmod. Wider and unconstrained columns, decimals inside containers,
+  catalog defaults, and keys are unchanged, and the form is invisible to SQL
+  ([spec/design/decimal.md](spec/design/decimal.md) §6a).
 - **Stored SQL this binary cannot parse.** A view body, expression DEFAULT, CHECK, or expression /
   partial-index text that the parser rejects (a newer jed's syntax, which needs no format bump) is not
   corruption: the load keeps the object unparsed and byte-for-byte, and only statements that need it

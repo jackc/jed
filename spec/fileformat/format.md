@@ -17,12 +17,21 @@ reader/fallback outcomes and production histories' cross-core byte equality are 
 A fourth independent encoder/decoder (the Ruby reference in
 [verify.rb](verify.rb)) pins the goldens so they are not merely self-certified.
 
-## Version scope (`format_version` 50)
+## Version scope (`format_version` 51)
 
 > **The encrypted variant** ([encrypted.md](encrypted.md)) is the same `format_version` with a
 > nonzero `suite` byte at meta offset 6; it amends this layout only where encrypted.md says (page
 > capacity, bound pointers, the key block at pages 2–3, the authenticated meta). A reader that
 > predates it rejects that byte as a nonzero reserved field.
+
+`format_version` **51** — **fixed-width stored `numeric(p,s)`** ([../design/decimal.md §6a](../design/decimal.md)).
+A table column declared `numeric(p,s)` with `p ≤ 18` joins the **fixed-width** column class (*Record*
+below): its leaf region is a null bitmap and dense slots of 2, 4, or 8 bytes holding each value's
+unscaled integer, in place of the variable-width decimal codec. The class follows from the type code
+and typmod the catalog already stores, so the catalog is unchanged. A wider or unconstrained `numeric`
+column, a decimal inside a composite, array, range, or `jsonb` value, a catalog `DEFAULT`, and every
+key keep their forms. A file with no such column changes only by its version byte + meta CRC. Readers
+accept only the exact current version.
 
 `format_version` **50** — **UNIQUE constraint ownership** ([../design/constraints.md §5.5](../design/constraints.md)).
 The per-index `index_flags` byte gains **bit5 `is_constraint`**: set on the unique index that backs a
@@ -1329,9 +1338,12 @@ the bytes the record contributes to its leaf beyond `leafOverhead`.
 
 **Column classes.** Every column type is either **fixed-width** — `i16` (2), `i32` (4), `i64` (8),
 `boolean` (1), `uuid` (16), `timestamp`/`timestamptz` (8), `date` (4), `interval` (16), `f64` (8),
-`f32` (4) — or **variable-width**: `text`, `bytea`, `decimal`, `json`, `jsonb`, composite, array,
-range (exactly the spillable set of *Large values*). The class decides the column's leaf region
-shape (*Leaf node* below).
+`f32` (4), and (v51) a **`numeric(p,s)` column with `p ≤ 18`** (2 for `p ≤ 4`, 4 for `p ≤ 9`, 8 for
+`p ≤ 18`) — or **variable-width**: `text`, `bytea`, any other `decimal` column (unconstrained, or
+`p ≥ 19`), `json`, `jsonb`, composite, array, range (exactly the spillable set of *Large values*). The
+class decides the column's leaf region shape (*Leaf node* below). `decimal` is the one type whose
+class depends on its typmod; the typmod is in the column's catalog entry, so the class is known
+before any leaf is read.
 
 **Index trees (v5).** A secondary index ([../design/indexes.md](../design/indexes.md)) is a
 B+tree of exactly this shape, rooted at the catalog's `index_root_page`, whose records have
@@ -1594,6 +1606,22 @@ The present-**inline-plain** body depends on the type:
   **`u16` `ndigits`** (number of base-10⁴ groups); then `ndigits` × **`u16`** (big-endian)
   groups, **most-significant first**, each `0 … 9999`. **Canonical zero** is
   `flags=0, scale=s, ndigits=0`.
+
+  **Fixed-width column slot (v51).** A table column declared `numeric(p,s)` with `p ≤ 18` does not
+  use that codec in its leaf region. Its slot is the value's **unscaled integer** `u = value × 10^s`
+  (so `|u| < 10^p`) in the **integer body** of the slot's width — 2 bytes for `p ≤ 4`, 4 for
+  `p ≤ 9`, 8 for `p ≤ 18` — big-endian, sign-bit flipped, exactly the `i16`/`i32`/`i64` bytes. The
+  value read back is `u` at display scale `s`. This is lossless because a constrained column stores
+  only values already rounded to scale `s` and checked against `p`
+  ([../design/decimal.md §2](../design/decimal.md)). Every bit pattern is a valid slot, as for an
+  integer column: a magnitude of `10^p` or more is a value outside the column's typmod, which the
+  integrity check reports as `typmod_violation`
+  ([../design/integrity-check.md §3](../design/integrity-check.md)), not `data_corrupted`. The form
+  is the **leaf slot only**: the column's MCV and histogram values in its statistics entries, the
+  column's constant `DEFAULT` in the
+  catalog, a decimal field or element inside a composite, array, range, or `jsonb` value, and a
+  column whose `p ≥ 19` all use the self-describing codec above, and keys use
+  `decimal-order-preserving` ([encoding.md §2.5](../design/encoding.md)).
 
 - **`bytea`** — a **`u16` byte-length** then that many **raw bytes** (no UTF-8 validation; any
   byte allowed). The empty value is `00`(tag)`00 00`(len).
@@ -1929,7 +1957,9 @@ the interior-node format and the split contract.
 | `varchar_table.jed` | a `varchar(n)` column — the v22 text-column `u32 varchar_max_len` typmod slot (a bounded `varchar(5)` beside an unbounded `text` column, in one catalog); stored values are within-limit text |
 | `bool_table.jed` | a boolean column — the `bool-byte` value branch (single leaf) |
 | `bool_pk_table.jed` | a **boolean PRIMARY KEY** (the second non-integer stored key — the `bool-byte` key, `00`/`01`, no presence tag) + a nullable boolean column; rows in key order (false then true) |
-| `decimal_table.jed` | a `decimal` column — the decimal branch + per-column `numeric(p,s)` typmod; positive/negative/zero/multi-group/NULL |
+| `decimal_table.jed` | an unconstrained `decimal` column — the variable-width decimal branch — beside a `numeric(10,2)` column, whose values are 8-byte fixed-width slots (v51); positive/negative/zero/multi-group/NULL |
+| `statistics_decimal_table.jed` | **statistics over a fixed-width `numeric(p,s)` column** (v51) — a `numeric(6,2)` column analyzed: its leaf values are 4-byte slots, while its MCV values in the statistics entries use the self-describing decimal codec |
+| `decimal_fixed_table.jed` | **fixed-width stored `numeric(p,s)`** (v51) — a `numeric(4,2)` (2-byte slot), `numeric(9,0)` (4-byte), and `numeric(18,6)` (8-byte) column beside a `numeric(19,2)` column, which keeps the variable-width codec; each column's largest and smallest value, zero, a NULL (bitmap bit + zero-filled slot), and enough rows for a two-leaf tree |
 | `bytea_table.jed` | a bytea column — the bytea branch; empty value, embedded `0x00`, a high byte, a NULL |
 | `uuid_table.jed` | a **uuid PRIMARY KEY** (the first non-integer stored key — the §8 cross-core key-path proof) + a nullable uuid column |
 | `default_table.jed` | columns with a **constant** `DEFAULT` — the `has_default` flag (bit2) + default value codec written after the typmod |

@@ -227,7 +227,8 @@ foreign key knows whether the table it references was readable. Per table, in th
    `not_null_violation`; otherwise a non-NULL value of a column with a typmod is `typmod_violation`
    when the column's write-time typmod coercion would raise or change its stored bytes. The typmods
    are `varchar(n)` (more than `n` characters, trailing spaces past `n` included, since the coercion
-   would cut them), `decimal(p, s)` (a scale other than `s`, or more than `p − s` integer digits),
+   would cut them), `decimal(p, s)` (a scale other than `s`, or more than `p − s` integer digits; a fixed-width slot,
+   [decimal.md](decimal.md) §6a, always reads at scale `s`, so only the digit count can fail),
    `timestamp(p)` / `timestamptz(p)` (microseconds not already rounded to `p` digits, half away from
    zero; infinities are unchanged), and an `interval` field qualifier or precision. Typmods inside
    arrays and composite fields are a follow-on (§8).

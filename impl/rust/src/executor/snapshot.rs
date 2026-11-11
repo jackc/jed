@@ -843,7 +843,7 @@ impl Snapshot {
         let col_types: Vec<ColType> = table
             .columns
             .iter()
-            .map(|c| resolve_col_type(&c.ty, &self.types))
+            .map(|c| crate::catalog::store_col_type(c, &self.types))
             .collect();
         self.put_table_resolved(table, col_types, page_size);
     }

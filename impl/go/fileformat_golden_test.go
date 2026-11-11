@@ -86,6 +86,17 @@ func statisticsTableDB(t *testing.T) *Session {
 	return db
 }
 
+// statisticsDecimalTableDB is statistics over a fixed-width numeric(6,2) column (format.md v51): the
+// leaf holds 4-byte slots, the statistics entries the self-describing decimal codec. Must match
+// verify.rb's STATISTICS_DECIMAL_TABLE.
+func statisticsDecimalTableDB(t *testing.T) *Session {
+	db := newInMemoryWithPageSize(goldenPageSize, goldenEnv()).Session(SessionOptions{})
+	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, amt numeric(6,2))")
+	run(t, db, "INSERT INTO t VALUES (1, 1.50), (2, 1.50), (3, 2.25), (4, NULL)")
+	run(t, db, "ANALYZE t")
+	return db
+}
+
 // statisticsTermsTableDB is v42 GIN term statistics (statistics.md §4.5): `ANALYZE t (tags, doc)`
 // over 105 rows whose tags truncate to the 100-term list and whose four documents give key and value
 // terms. Must match verify.rb's STATISTICS_TERMS_TABLE.
@@ -683,6 +694,24 @@ func decimalTableDB(t *testing.T) *Session {
 	return db
 }
 
+// decimalFixedTableDB is fixed-width stored numeric(p,s) (format.md v51): a 2-byte numeric(4,2), a
+// 4-byte numeric(9,0), and an 8-byte numeric(18,6) slot column beside a numeric(19,2) column, which
+// keeps the variable-width codec. Each column's extremes, zero, a NULL, and a second leaf.
+func decimalFixedTableDB(t *testing.T) *Session {
+	db := newInMemoryWithPageSize(goldenPageSize, goldenEnv()).Session(SessionOptions{})
+	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, a numeric(4,2), b numeric(9,0), c numeric(18,6), "+
+		"w numeric(19,2))")
+	run(t, db, "INSERT INTO t VALUES "+
+		"(1, 99.99, 999999999, 999999999999.999999, 99999999999999999.99), "+
+		"(2, -99.99, -999999999, -999999999999.999999, -99999999999999999.99), "+
+		"(3, 0.00, 0, 0.000000, 0.00), (4, 0.01, 1, 0.000001, 0.01), "+
+		"(5, NULL, NULL, NULL, NULL), (6, -0.50, -42, -1.500000, NULL)")
+	for i := 7; i <= 18; i++ {
+		run(t, db, fmt.Sprintf("INSERT INTO t VALUES (%d, %d.25, %d, %d.000%03d, %d.00)", i, i, i*1000, i*7, i, i))
+	}
+	return db
+}
+
 // byteaTableDB exercises the value codec's bytea branch (u16 length + raw bytes): a multi-
 // byte value (a-f hex), the empty byte string, embedded 0x00 bytes, a high byte (0xFF), a
 // NULL, and a lone 0x00. The PK stays i32 (no bytea key this slice). Literals are the `\x`
@@ -1194,12 +1223,14 @@ func TestWriteMatchesGoldens(t *testing.T) {
 		{"row_count_table.jed", rowCountTableDB},
 		{"statistics_table.jed", statisticsTableDB},
 		{"statistics_terms_table.jed", statisticsTermsTableDB},
+		{"statistics_decimal_table.jed", statisticsDecimalTableDB},
 		{"pk_table.jed", pkTableDB},
 		{"text_table.jed", textTableDB},
 		{"varchar_table.jed", varcharTableDB},
 		{"bool_table.jed", boolTableDB},
 		{"bool_pk_table.jed", boolPKTableDB},
 		{"decimal_table.jed", decimalTableDB},
+		{"decimal_fixed_table.jed", decimalFixedTableDB},
 		{"bytea_table.jed", byteaTableDB},
 		{"text_pk_table.jed", textPKTableDB},
 		{"bytea_pk_table.jed", byteaPKTableDB},
@@ -1293,6 +1324,7 @@ func TestReadGoldensReproducesRows(t *testing.T) {
 		{"bool_table.jed", boolTableDB, "t"},
 		{"bool_pk_table.jed", boolPKTableDB, "t"},
 		{"decimal_table.jed", decimalTableDB, "t"},
+		{"decimal_fixed_table.jed", decimalFixedTableDB, "t"},
 		{"bytea_table.jed", byteaTableDB, "t"},
 		{"text_pk_table.jed", textPKTableDB, "t"},
 		{"bytea_pk_table.jed", byteaPKTableDB, "t"},

@@ -880,6 +880,27 @@ impl Decimal {
         Decimal::from_small(neg, scale, m)
     }
 
+    /// The value's **unscaled integer** at display scale `scale` — `self × 10^scale` — for a
+    /// fixed-width `numeric(p,s)` leaf slot (spec/fileformat/format.md "Fixed-width column slot").
+    /// `None` when the value has more than `scale` fractional digits or the integer is outside
+    /// `i64`: a value store-coercion has not brought to the column's typmod.
+    pub(crate) fn unscaled_i64(&self, scale: u32) -> Option<i64> {
+        let m = self.small()?;
+        let m = match scale.checked_sub(self.scale)? {
+            0 => m,
+            up => small_scale_up(m, up)?,
+        };
+        let v = i128::try_from(m).ok()?;
+        i64::try_from(if self.neg { -v } else { v }).ok()
+    }
+
+    /// The value whose unscaled integer at display scale `scale` is `u` — the inverse of
+    /// [`unscaled_i64`](Self::unscaled_i64), the load path for a fixed-width `numeric(p,s)` slot.
+    #[inline]
+    pub(crate) fn from_unscaled_i64(u: i64, scale: u32) -> Decimal {
+        Decimal::from_small(u < 0, scale, u.unsigned_abs() as u128)
+    }
+
     /// The order-preserving KEY body for a decimal (method `decimal-order-preserving`,
     /// spec/design/encoding.md §2.5). Self-delimiting; sorts byte-for-byte under `memcmp`
     /// identically to numeric value, **independent of display scale** — `1.5` and `1.50`
@@ -2216,6 +2237,43 @@ fn mag_from_nbase4(groups: &[u16]) -> Vec<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The fixed-width slot's integer (format.md v51): exact at the value's own scale or a lower
+    /// one, `None` for a value with more fractional digits or outside `i64`.
+    #[test]
+    fn unscaled_i64_is_the_value_times_ten_to_the_scale() {
+        let d =
+            |digits: &str, scale: u32, neg: bool| Decimal::from_digits_scale(neg, digits, scale);
+        assert_eq!(d("12345", 2, false).unscaled_i64(2), Some(12345));
+        assert_eq!(d("12345", 2, true).unscaled_i64(2), Some(-12345));
+        assert_eq!(d("15", 1, false).unscaled_i64(3), Some(1500));
+        assert_eq!(Decimal::zero(2).unscaled_i64(2), Some(0));
+        assert_eq!(d("15", 1, false).unscaled_i64(0), None);
+        assert_eq!(
+            d("9223372036854775807", 0, false).unscaled_i64(0),
+            Some(i64::MAX)
+        );
+        assert_eq!(
+            d("9223372036854775808", 0, true).unscaled_i64(0),
+            Some(i64::MIN)
+        );
+        assert_eq!(d("9223372036854775808", 0, false).unscaled_i64(0), None);
+        assert_eq!(d("9223372036854775807", 0, false).unscaled_i64(1), None);
+        for u in [
+            0,
+            1,
+            -1,
+            999_999_999_999_999_999,
+            -999_999_999_999_999_999,
+            i64::MIN,
+        ] {
+            let back = Decimal::from_unscaled_i64(u, 6);
+            assert_eq!(back.scale(), 6);
+            assert_eq!(back.unscaled_i64(6), Some(u));
+        }
+        assert_eq!(Decimal::from_unscaled_i64(-150, 2).render(), "-1.50");
+        assert!(!Decimal::from_unscaled_i64(0, 2).is_negative());
+    }
 
     /// A deterministic stream of magnitudes of 0..=`max_limbs` limbs, biased toward the limb
     /// values where carries and quotient estimates are tightest.

@@ -1,6 +1,6 @@
 // P9 deterministic column statistics collection and snapshot state.
 
-import type { Table } from "./catalog.ts";
+import { singleValueColType, type Table } from "./catalog.ts";
 import type { Collation } from "./collation.ts";
 import type { Meter } from "./cost.ts";
 import type { Steps } from "./execution.ts";
@@ -282,6 +282,7 @@ export function* collectColumnStatisticsSteps(
 ): Steps<ColumnStatistics> {
   meter.charge(COSTS.pageRead * BigInt(store.nodeCount()));
   const columnType = table.columns[column]!.type;
+  const valueType = singleValueColType(store.columnTypes()[column]!);
   const eligible = distributionEligible(columnType);
   const termCounter = termEligible(columnType) ? new TermCounter() : null;
   const sample: SampleRow[] = [];
@@ -326,7 +327,9 @@ export function* collectColumnStatisticsSteps(
         });
         continue;
       }
-      const bodyLength = encodeValue(store.columnTypes()[column]!, value).length - 1;
+      // The single-value codec body (statistics.md §4): a fixed-width decimal column's slot form is
+      // the leaf's alone.
+      const bodyLength = encodeValue(valueType, value).length - 1;
       const key = eligible
         ? encodeTypedKey(table.columns[column]!.type, value, collations[column]!)
         : null;

@@ -2016,7 +2016,7 @@ impl Engine {
                 table
                     .columns
                     .iter()
-                    .map(|c| resolve_col_type(&c.ty, &main.types))
+                    .map(|c| crate::catalog::store_col_type(c, &main.types))
                     .collect()
             };
             // Build the attachment's new stores at ITS OWN page size (§2) — a file attachment may
@@ -2065,7 +2065,7 @@ impl Engine {
                 table
                     .columns
                     .iter()
-                    .map(|c| resolve_col_type(&c.ty, &main.types))
+                    .map(|c| crate::catalog::store_col_type(c, &main.types))
                     .collect()
             };
             // Register into the session-local temp snapshot — never the main image, so the table makes
@@ -3864,7 +3864,7 @@ impl Engine {
             table
                 .columns
                 .iter()
-                .map(|c| resolve_col_type(&c.ty, &main.types))
+                .map(|c| crate::catalog::store_col_type(c, &main.types))
                 .collect()
         });
         let mut meter = self.session.new_meter();

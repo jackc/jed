@@ -279,6 +279,11 @@ Every example below is a **live database in your browser**. Edit the SQL and run
 
 <LiveSql demo="decimalDemo" query={decimalDemo} rows={5} />
 
+Declaring a precision makes a column smaller and faster to scan. A `numeric(p,s)` column with
+`p` of 18 or less is stored as a fixed-width integer — 2 bytes for `p ≤ 4`, 4 for `p ≤ 9`, 8 for
+`p ≤ 18` — while a wider or unconstrained `numeric` column uses a variable-length form. The values
+and their behavior are the same either way.
+
 Numeric `width_bucket(value, low, high, count)` also works at the numeric digit limit:
 intermediate calculations can exceed that limit when the final bucket index fits `i32`.
 

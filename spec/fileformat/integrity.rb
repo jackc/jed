@@ -201,6 +201,10 @@ class IntegrityCheck
 
       column = "column #{t[:columns][ci][:name]}"
       begin
+        col = t[:columns][ci]
+        # A fixed-width decimal slot (format.md v51) is an unscaled integer, not the decimal codec.
+        next decode_fixed_decimal(col, raw.byteslice(1..)) if fixed_decimal_width(col)
+
         v, = decode_value(type, raw, 0, overflow_fetch)
         v
       rescue ReachedTwice, OutOfRange => e
@@ -907,13 +911,14 @@ INTEGRITY_U_TABLE = {
   end
 }.freeze
 
-# The I4 tables: a parent `p` with NOT NULL, varchar, decimal and timestamp typmods, two CHECKs and two
+# The I4 tables: a parent `p` with NOT NULL, varchar, decimal (a fixed-width `amt numeric(6,2)` and a
+# variable-width `wide numeric(20,2)`) and timestamp typmods, two CHECKs and two
 # UNIQUE constraints, and a child `c` with foreign keys to p's primary key, to its unique code, and
 # (MATCH FULL) to its unique (pid, code). A file the engine would never write: `bad` lists rows that
 # break constraints (integrity_constraint_tables), with every index built from the stored rows.
 def integrity_constraint_tables(bad: {}, child_bad: {})
   p_rows = (1..30).map do |i|
-    [i, "c#{i}", "n#{i}", format("%d.25", i), i * 1_000_000, i]
+    [i, "c#{i}", "n#{i}", format("%d.25", i), i * 1_000_000, i, format("%d.50", i)]
   end
   bad.each { |i, changes| changes.each { |ci, v| p_rows[i - 1][ci] = v } }
   c_rows = (1..30).map do |i|
@@ -931,7 +936,7 @@ def integrity_constraint_tables(bad: {}, child_bad: {})
    { name: "p",
      columns: [col("pid", "i32", pk: true), col("code", "text"), col("name", "text", not_null: true, varchar_len: 5),
                col("amt", "decimal", precision: 6, scale: 2), col("ts", "timestamp", temporal: temporal(precision: 0)),
-               col("qty", "i32")],
+               col("qty", "i32"), col("wide", "decimal", precision: 20, scale: 2)],
      checks: [{ name: "p_qty_check", expr: "qty >= 0" }, { name: "p_qty_next_check", expr: "qty + 1 > 0" }],
      indexes: [{ name: "p_code_key", cols: [1], unique: true, constraint: true },
                { name: "p_pid_code_key", cols: [0, 1], unique: true, constraint: true }],
@@ -968,9 +973,10 @@ INTEGRITY_FIXTURES = [
   { name: "constraints_clean", damage: nil, tables: integrity_constraint_tables, runs: INTEGRITY_CONSTRAINT_RUNS },
   { name: "constraints_broken", damage: nil, runs: INTEGRITY_CONSTRAINT_RUNS + [{ level: "quick", max_findings: 3, constraints: true }],
     tables: integrity_constraint_tables(
-      # 3: NULL name; 4: name over varchar(5); 5: amt scale 1; 6: amt over decimal(6,2);
+      # 3: NULL name; 4: name over varchar(5); 5: wide at scale 1 (a variable-width decimal; a fixed
+      # slot cannot hold another scale); 6: amt's slot over decimal(6,2);
       # 7: ts not whole seconds; 8: qty fails p_qty_check; 9: qty + 1 overflows; 10: code repeats 11's.
-      bad: { 3 => { 2 => nil }, 4 => { 2 => "toolong" }, 5 => { 3 => "5.5" }, 6 => { 3 => "12345.25" },
+      bad: { 3 => { 2 => nil }, 4 => { 2 => "toolong" }, 5 => { 6 => "5.5" }, 6 => { 3 => "12345.25" },
              7 => { 4 => 7_500_000 }, 8 => { 5 => -1 }, 9 => { 5 => 2**31 - 1 }, 10 => { 1 => "c11" } },
       # 2: no parent 99; 3: no code zz; 4: MATCH FULL with b NULL; 6: (6, c7) is no parent's pair.
       child_bad: { 2 => { 1 => 99 }, 3 => { 2 => "zz" }, 4 => { 4 => nil }, 6 => { 4 => "c7" } }

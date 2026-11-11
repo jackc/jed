@@ -158,7 +158,10 @@ const MAGIC: [u8; 4] = *b"JEDB";
 // v50: the per-index `index_flags` byte gains bit5 `is_constraint`: set on the unique index that
 // backs a UNIQUE constraint, clear on a bare CREATE UNIQUE INDEX (legal only with bit0 unique;
 // spec/design/constraints.md §5.5).
-pub(crate) const FORMAT_VERSION: u16 = 50;
+// v51: a `numeric(p,s)` table column with `p ≤ 18` is a fixed-width leaf column — a null bitmap and
+// 2/4/8-byte slots holding the value's unscaled integer — instead of the variable-width decimal
+// codec ([`ColType::FixedDecimal`]; spec/design/decimal.md §6a). The catalog is unchanged.
+pub(crate) const FORMAT_VERSION: u16 = 51;
 #[path = "commit_manifest.rs"]
 mod commit_manifest;
 /// Bytes of the page header on catalog / B-tree / overflow pages (v7): the 12-byte v6 header
@@ -707,6 +710,7 @@ pub(crate) fn page_crc(page: &[u8]) -> u32 {
 pub(crate) fn encode_value(ty: &ColType, v: &Value) -> Vec<u8> {
     match ty {
         ColType::Scalar(s) => encode_scalar(*s, v),
+        ColType::FixedDecimal { width, scale } => encode_fixed_decimal(*width, *scale, v),
         ColType::Composite { fields, .. } => match v {
             Value::Null => vec![0x01],
             Value::Composite(vals) => {
@@ -1045,6 +1049,36 @@ fn decode_jsonb_string(buf: &[u8], pos: &mut usize, mode: DecodeMode) -> Result<
     Ok(Some(s))
 }
 
+/// The integer type whose body a `width`-byte fixed-width decimal slot shares (format.md v51).
+fn fixed_decimal_int(width: u8) -> ScalarType {
+    match width {
+        2 => ScalarType::Int16,
+        4 => ScalarType::Int32,
+        _ => ScalarType::Int64,
+    }
+}
+
+/// A fixed-width `numeric(p,s)` column's value (spec/fileformat/format.md "Fixed-width column
+/// slot"): the presence tag, then the value's unscaled integer at the column's scale in the integer
+/// body of the slot's width. The leaf writes the body alone; the tag keeps the [`encode_value`]
+/// shape. Store-coercion has already rounded the value to the scale and checked it against the
+/// precision, so it always fits — a value that does not reached the codec uncoerced.
+fn encode_fixed_decimal(width: u8, scale: u16, v: &Value) -> Vec<u8> {
+    let int = fixed_decimal_int(width);
+    match v {
+        Value::Null => encode_nullable(int, None),
+        Value::Decimal(d) => {
+            let u = d
+                .unscaled_i64(scale as u32)
+                .filter(|&u| int.in_range(u))
+                .expect("BUG: a decimal outside its column's typmod reached the leaf codec");
+            encode_nullable(int, Some(u))
+        }
+        Value::Unfetched(_) => panic!("BUG: unfetched large value in a fixed-width decimal column"),
+        other => panic!("BUG: {other:?} stored in a fixed-width decimal column"),
+    }
+}
+
 /// The scalar value codec (the body of [`encode_value`] for a `ColType::Scalar`).
 fn encode_scalar(ty: ScalarType, v: &Value) -> Vec<u8> {
     match v {
@@ -1177,6 +1211,8 @@ fn is_spillable(ty: &ColType) -> bool {
         ColType::Scalar(s) => {
             s.is_text() || s.is_bytea() || s.is_decimal() || s.is_json() || s.is_jsonb()
         }
+        // A fixed-width decimal slot never leaves its leaf (format.md v51).
+        ColType::FixedDecimal { .. } => false,
         ColType::Composite { .. } => true,
         // An array's opaque inline body spills via the same overflow + LZ4 path
         // (spec/design/array.md §4); a small array is never actually chosen by the plan.
@@ -1216,7 +1252,8 @@ fn record_max(cap: usize, k: usize) -> usize {
 
 /// The storage width of a **fixed-width** column's value body (the dense leaf slot stride —
 /// spec/fileformat/format.md v24 "Leaf node"), or `None` for a **variable-width** column (text /
-/// bytea / decimal / json / jsonb / composite / array / range — exactly the spillable set). The
+/// bytea / json / jsonb / composite / array / range, and a decimal column that is not
+/// `numeric(p,s)` with `p ≤ 18` — exactly the spillable set). The
 /// class decides the column's leaf region shape: fixed-width regions are bitmap + dense untagged
 /// slots; variable regions are a value directory + tagged codec bytes (NULL = a zero-length span).
 pub(crate) fn fixed_value_width(ty: &ColType) -> Option<usize> {
@@ -1241,6 +1278,7 @@ pub(crate) fn fixed_value_width(ty: &ColType) -> Option<usize> {
             | ScalarType::Jsonb
             | ScalarType::JsonPath => None,
         },
+        ColType::FixedDecimal { width, .. } => Some(*width as usize),
         ColType::Composite { .. } | ColType::Array(_) | ColType::Range(_) => None,
     }
 }
@@ -4469,7 +4507,8 @@ fn statistics_catalog_entries(snapshot: &Snapshot) -> Vec<Vec<u8>> {
         }
         entries.push(summary);
 
-        let col_type = snapshot.store(table_key).column_type(column);
+        // A statistics value is a single value, not a leaf slot: the self-describing codec.
+        let col_type = snapshot.store(table_key).column_type(column).value_type();
         for (ordinal, mcv) in statistics.mcv.iter().enumerate() {
             let mut entry = vec![4u8, 1u8];
             push_string(&mut entry, &table.name);
@@ -4525,7 +4564,11 @@ fn decode_statistics_value(
         .collation
         .as_deref()
         .is_some_and(|name| snapshot.collation_skew(name).is_some());
-    let ty = snapshot.store(table_key).column_type(column).clone();
+    let ty = snapshot
+        .store(table_key)
+        .column_type(column)
+        .value_type()
+        .clone();
     let coll = declared
         .collation
         .as_deref()
@@ -6177,6 +6220,8 @@ pub(crate) fn same_leaf_shape(a: &Arc<Vec<ColType>>, b: &Arc<Vec<ColType>>) -> b
     fn same_codec(x: &ColType, y: &ColType) -> bool {
         match (x, y) {
             (ColType::Scalar(s), ColType::Scalar(t)) => s == t,
+            // The slot's width and the scale it is read at are both part of the codec.
+            (ColType::FixedDecimal { .. }, ColType::FixedDecimal { .. }) => x == y,
             (ColType::Array(e), ColType::Array(f)) | (ColType::Range(e), ColType::Range(f)) => {
                 same_codec(e, f)
             }
@@ -7480,6 +7525,13 @@ fn read_value(
 fn read_inline_body(ty: &ColType, buf: &[u8], pos: &mut usize, mode: DecodeMode) -> Result<Value> {
     match ty {
         ColType::Scalar(s) => read_inline_scalar(*s, buf, pos, mode),
+        // A fixed-width decimal slot: the unscaled integer, read at the column's scale
+        // (format.md v51). Every bit pattern is a value, as for an integer column.
+        ColType::FixedDecimal { width, scale } => {
+            let int = fixed_decimal_int(*width);
+            let u = decode_int(int, take(buf, pos, *width as usize)?);
+            Ok(Value::Decimal(Decimal::from_unscaled_i64(u, *scale as u32)))
+        }
         ColType::Composite { .. } => read_composite_body(ty, buf, pos, mode),
         ColType::Array(elem) => read_array_body(elem, buf, pos, mode),
         ColType::Range(elem) => read_range_body(elem, buf, pos, mode),
@@ -8761,6 +8813,62 @@ mod tests {
         assert_eq!(scalar_for_type_code(12), Some(ScalarType::Float64));
         assert_eq!(scalar_for_type_code(13), Some(ScalarType::Float32));
         assert_eq!(scalar_for_type_code(14), None);
+    }
+
+    /// A fixed-width `numeric(p,s)` slot (format.md v51) is the unscaled integer's own integer
+    /// body, read back at the column's scale; the column is fixed-width and never spills.
+    #[test]
+    fn fixed_decimal_slot_is_the_unscaled_integer_body() {
+        let dec = |digits: &str, scale: u32, neg: bool| {
+            Value::Decimal(Decimal::from_digits_scale(neg, digits, scale))
+        };
+        for (precision, scale, int, digits, neg, u) in [
+            (4u16, 2u16, ScalarType::Int16, "9999", false, 9999i64),
+            (4, 2, ScalarType::Int16, "9999", true, -9999),
+            (9, 0, ScalarType::Int32, "999999999", true, -999_999_999),
+            (
+                18,
+                6,
+                ScalarType::Int64,
+                "999999999999999999",
+                false,
+                999_999_999_999_999_999,
+            ),
+            (10, 2, ScalarType::Int64, "0", false, 0),
+        ] {
+            let width = crate::catalog::fixed_decimal_width(precision).unwrap();
+            let ct = ColType::FixedDecimal { width, scale };
+            assert_eq!(fixed_value_width(&ct), Some(int.width_bytes()));
+            assert!(!is_spillable(&ct));
+            let v = dec(digits, scale as u32, neg);
+            let enc = encode_value(&ct, &v);
+            assert_eq!(enc, encode_value(&ColType::Scalar(int), &Value::Int(u)));
+            let mut pos = 1;
+            let back = read_inline_body(&ct, &enc, &mut pos, DecodeMode::Construct).unwrap();
+            assert_eq!(pos, enc.len());
+            match (&back, &v) {
+                (Value::Decimal(a), Value::Decimal(b)) => {
+                    assert_eq!(a.scale(), scale as u32);
+                    assert_eq!(a.render(), b.render());
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        // A value at a lower scale is the same slot: 1.5 in numeric(4,2) is 150.
+        let ct = ColType::FixedDecimal { width: 2, scale: 2 };
+        assert_eq!(
+            encode_value(&ct, &dec("15", 1, false)),
+            encode_value(&ColType::Scalar(ScalarType::Int16), &Value::Int(150))
+        );
+        assert_eq!(crate::catalog::fixed_decimal_width(19), None);
+        assert_eq!(crate::catalog::fixed_decimal_width(0), None);
+        // The codec is the slot's width and scale, so a leaf of one does not serve another.
+        let a = Arc::new(vec![ColType::FixedDecimal { width: 8, scale: 2 }]);
+        let b = Arc::new(vec![ColType::FixedDecimal { width: 8, scale: 4 }]);
+        let c = Arc::new(vec![ColType::Scalar(ScalarType::Decimal)]);
+        assert!(same_leaf_shape(&a, &Arc::new(a.to_vec())));
+        assert!(!same_leaf_shape(&a, &b));
+        assert!(!same_leaf_shape(&a, &c));
     }
 
     /// The float value codec preserves the IEEE BITS verbatim for every value EXCEPT NaN — the sign

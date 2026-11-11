@@ -511,7 +511,13 @@ export function seqDataTypeForScalar(s: ScalarType): SeqDataType | undefined {
 // discriminated union (keyed on `kind`, like Type/Value), with free-function helpers — never
 // methods on the union (CLAUDE.md §10).
 export type ColType =
-  | { kind: "scalar"; scalar: ScalarType }
+  // `fixedDec` marks a TABLE COLUMN declared numeric(p,s) with p <= 18 (spec/fileformat/format.md
+  // v51, spec/design/decimal.md §6a): a decimal whose leaf slot is the value's unscaled integer in
+  // `width` bytes at the fixed display scale `scale`, instead of the variable-width decimal codec.
+  // The type is a decimal everywhere but the leaf slot — `scalar` stays "decimal", so keys,
+  // comparison, coercion, and rendering are the scalar's. Set only by storeColType for a top-level
+  // column; a decimal field, element, or range bound never carries it.
+  | { kind: "scalar"; scalar: ScalarType; fixedDec?: FixedDec }
   // A composite type's resolved fields, in declaration order. `name` is the (original-case) type
   // name, used in store-coercion error messages.
   | { kind: "composite"; name: string; fields: ColField[] }
@@ -524,6 +530,45 @@ export type ColType =
   // the bound bodies; the descriptor (discreteness) is re-derived from the element via
   // rangeForElement.
   | { kind: "range"; elem: ColType };
+
+// FixedDec is the fixed-width stored form of a numeric(p,s) column (format.md "Fixed-width column
+// slot"): the slot width in bytes and the scale the slot's unscaled integer is read at.
+export type FixedDec = { width: 2 | 4 | 8; scale: number };
+
+// fixedDecimalWidth is the slot width of a numeric(p,s) column's fixed-width stored form, or null
+// when the column keeps the variable-width codec (p >= 19): 2 bytes for p <= 4, 4 for p <= 9, 8 for
+// p <= 18.
+export function fixedDecimalWidth(precision: number): 2 | 4 | 8 | null {
+  if (precision < 1 || precision > 18) return null;
+  return precision <= 4 ? 2 : precision <= 9 ? 4 : 8;
+}
+
+// storeColType is the resolved STORED type of a table column: resolveColType of its declared type,
+// except that a numeric(p,s) column with p <= 18 carries the fixed-width marker. This is the type a
+// table's store and leaf codec hold; a type resolved for a cast, an element, or a field goes through
+// resolveColType, which never yields the fixed form.
+export function storeColType(
+  col: { type: Type; decimal: DecimalTypmod | null },
+  types: Map<string, CompositeType>,
+): ColType {
+  if (col.type.kind === "scalar" && col.type.scalar === "decimal" && col.decimal !== null) {
+    const width = fixedDecimalWidth(col.decimal.precision);
+    if (width !== null) {
+      return { kind: "scalar", scalar: "decimal", fixedDec: { width, scale: col.decimal.scale } };
+    }
+  }
+  return resolveColType(col.type, types);
+}
+
+// singleValueColType is the type a SINGLE-VALUE context encodes a column's value under — a persisted
+// statistics value, like a catalog DEFAULT (format.md "Value codec"): the column's stored type
+// without the fixed-width marker, since the slot form is the leaf's alone (format.md "Fixed-width
+// column slot").
+export function singleValueColType(ct: ColType): ColType {
+  return ct.kind === "scalar" && ct.fixedDec !== undefined
+    ? { kind: "scalar", scalar: ct.scalar, fixedDec: undefined }
+    : ct;
+}
 
 // ColField is one resolved field of a composite ColType — its name, recursively-resolved type, the
 // decimal typmod (when the field is decimal), and declared nullability (mirrors CompositeField, but
@@ -575,7 +620,9 @@ export function colTypeKeyable(ct: ColType): boolean {
 // because validateCompositeTypes (the two-pass load / CREATE TYPE gate) proved every reference
 // exists and the graph is acyclic before any store is built (spec/design/composite.md §3).
 export function resolveColType(ty: Type, types: Map<string, CompositeType>): ColType {
-  if (ty.kind === "scalar") return { kind: "scalar", scalar: ty.scalar };
+  // fixedDec is always present on a resolved scalar (undefined here) so that every scalar ColType a
+  // store holds has one object shape — the leaf codec reads these on its hot path.
+  if (ty.kind === "scalar") return { kind: "scalar", scalar: ty.scalar, fixedDec: undefined };
   if (ty.kind === "array") return { kind: "array", elem: resolveColType(ty.elem, types) };
   if (ty.kind === "range") {
     // A range column (spec/design/ranges.md §3): structural like array, the element resolved inline.

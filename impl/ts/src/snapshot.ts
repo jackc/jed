@@ -39,7 +39,7 @@ import { type Cap, plainCap } from "./cap.ts";
 import { compositeRefName } from "./types.ts";
 import type { FkDependent } from "./executor.ts";
 import type { Type } from "./types.ts";
-import { resolveColType } from "./catalog.ts";
+import { storeColType } from "./catalog.ts";
 import type { PrivilegeSet } from "./privileges.ts";
 import type { TreeRef } from "./format.ts";
 import type { ColumnStatistics } from "./statistics.ts";
@@ -867,7 +867,7 @@ export class Snapshot {
     // self-contained codec/coercion trees the store carries, so the value codec never re-walks the
     // type catalog per row (spec/design/composite.md §4). Composite types are registered before any
     // table (the types-first catalog emission order), so resolveColType always resolves.
-    const colTypes = t.columns.map((c) => resolveColType(c.type, this.types));
+    const colTypes = t.columns.map((c) => storeColType(c, this.types));
     this.putTableResolved(t, colTypes, pageSize);
   }
 

@@ -1413,7 +1413,7 @@ func (db *engine) executeAnalyze(analyze *analyzeStmt) (outcome, error) {
 				retainStatisticsSample(sample, statisticsSample{priority: priority, ordinal: ordinal})
 				continue
 			}
-			encoded := encodeValue(store.columnType(column), value)
+			encoded := encodeValue(store.columnType(column).valueType(), value)
 			bodyLen := len(encoded) - 1
 			var key []byte
 			if eligible {

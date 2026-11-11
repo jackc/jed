@@ -167,6 +167,7 @@ import {
   colTypeKeyable,
   colTypeScalar,
   resolveColType,
+  storeColType,
 } from "./catalog.ts";
 import {
   assertTableParsed,
@@ -8443,7 +8444,7 @@ export class Engine {
       const ws = this.attachWriteSnap(attachName)!;
       ws.storePaging = this.core!.attachments.get(attachName)!.storage.paging;
       const mainTypes = this.readSnap().types;
-      const colTypes = table.columns.map((c) => resolveColType(c.type, mainTypes));
+      const colTypes = table.columns.map((c) => storeColType(c, mainTypes));
       // Build the attachment's new stores at ITS OWN page size (§2) — a file attachment may serialize at
       // a different page size than main, and its records must split to match.
       const aps = this.attachPageSize(attachName);
@@ -8474,7 +8475,7 @@ export class Engine {
       // reference. The resulting ColType tree is self-contained, so the temp store needs nothing from
       // the catalog after this (composite.md §4).
       const mainTypes = this.readSnap().types;
-      const colTypes = table.columns.map((c) => resolveColType(c.type, mainTypes));
+      const colTypes = table.columns.map((c) => storeColType(c, mainTypes));
       // Register into the session-local temp snapshot — never the main image, so the table makes zero
       // file writes (§2). Flag tempDirty so the commit can skip persisting the main image.
       this.session.tx!.tempDirty = true;
@@ -10343,7 +10344,7 @@ export class Engine {
     const tableRewriteNeeded = rewriteNeeded || rowSteps.length > 0 || pkRekeyed;
     const rewriteColTypes = !tableRewriteNeeded
       ? null
-      : table.columns.map((c) => resolveColType(c.type, this.readSnap().types));
+      : table.columns.map((c) => storeColType(c, this.readSnap().types));
     const meter = this.session.newMeter();
     meter.charge(prepCost);
     meter.guard();

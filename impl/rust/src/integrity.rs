@@ -1213,14 +1213,16 @@ impl Checker<'_> {
     /// bytes unchanged (and does not fail). Top-level scalar columns only (§8).
     fn typmod_holds(&self, col: &crate::catalog::Column, ct: &ColType, v: &Value) -> bool {
         let tm = Typmod::of_column(col);
-        let ColType::Scalar(s) = ct else {
+        // A fixed-width decimal slot always reads at the column's scale, so its only violation is a
+        // magnitude of 10^p or more (format.md v51).
+        if !matches!(ct, ColType::Scalar(_) | ColType::FixedDecimal { .. }) {
             return true;
-        };
+        }
         if tm == Typmod::NONE {
             return true;
         }
         let iz = self.engine.input_zone();
-        match store_value(v.clone(), *s, tm, false, &col.name, &iz) {
+        match store_value(v.clone(), ct.scalar(), tm, false, &col.name, &iz) {
             Ok(stored) => {
                 crate::format::encode_value(ct, v) == crate::format::encode_value(ct, &stored)
             }
