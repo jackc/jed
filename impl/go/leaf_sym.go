@@ -113,7 +113,10 @@ type symMatcher struct {
 	lo    [symMatchSlots]uint8
 	hi    [symMatchSlots]uint8 // 0: an empty slot (a run ends past its start, so never at 0)
 	cands [255]symCand
-	order [255]symOrder // build scratch
+	// single[c] is one more than the index of the one-byte symbol c, 0 when there is none (only a
+	// table trained FSST-style has them).
+	single [256]uint16
+	order  [255]symOrder // build scratch
 }
 
 const symMatchSlots = 1024
@@ -126,12 +129,17 @@ type symOrder struct {
 
 func symMatchHash(key uint16) uint32 { return (uint32(key) * 2654435761) >> 22 }
 
-// build fills the matcher from symbols given as little-endian bytes and lengths (each at least 2).
+// build fills the matcher from symbols given as little-endian bytes and lengths.
 func (m *symMatcher) build(le []uint64, n []uint8) {
 	m.hi = [symMatchSlots]uint8{}
-	order := m.order[:len(le)]
+	m.single = [256]uint16{}
+	order := m.order[:0]
 	for k, v := range le {
-		order[k] = symOrder{key: uint16(v), n: n[k], k: uint16(k)}
+		if n[k] == 1 {
+			m.single[byte(v)] = uint16(k) + 1
+			continue
+		}
+		order = append(order, symOrder{key: uint16(v), n: n[k], k: uint16(k)})
 	}
 	slices.SortFunc(order, func(a, b symOrder) int {
 		if a.key != b.key {
@@ -197,7 +205,7 @@ func (m *symMatcher) match(p []byte, at int) (unit, n int) {
 	c := p[at]
 	left := len(p) - at
 	if left < 2 {
-		return int(c), 1
+		return m.one(c), 1
 	}
 	key := uint16(c) | uint16(p[at+1])<<8
 	for h := symMatchHash(key); m.hi[h] != 0; h = (h + 1) & (symMatchSlots - 1) {
@@ -220,7 +228,15 @@ func (m *symMatcher) match(p []byte, at int) (unit, n int) {
 		}
 		break
 	}
-	return int(c), 1
+	return m.one(c), 1
+}
+
+// one is the unit for the single byte c: its one-byte symbol, else the literal.
+func (m *symMatcher) one(c byte) int {
+	if k := m.single[c]; k != 0 {
+		return 255 + int(k)
+	}
+	return int(c)
 }
 
 func (tb *symTable) unitBytes(u int) []byte {
@@ -292,7 +308,7 @@ func parseSymTable(b []byte) (*symTable, []byte, error) {
 	at := 2 + 2*k
 	for i := 0; i < k; i++ {
 		c, l := b[2+2*i], int(b[3+2*i])
-		if used[c] || l < 2 || l > symMaxLen || at+l > len(b) {
+		if used[c] || l < 1 || l > symMaxLen || at+l > len(b) {
 			return bad()
 		}
 		used[c] = true
@@ -343,7 +359,7 @@ var symPasses = func() int {
 // Each pass parses the payloads with the current table, counts symbols and adjacent pairs, and keeps
 // the candidates (pair concatenations and existing symbols) that save the most bytes. Ties break by
 // the symbol's bytes, so the table is a function of the payloads in order.
-func trainSym(payloads [][]byte) *symTable {
+func trainSym(payloads [][]byte, classic bool) *symTable {
 	start := time.Now()
 	defer func() {
 		symStats.trains.Add(1)
@@ -376,6 +392,11 @@ func trainSym(payloads [][]byte) *symTable {
 		ncodes = 16
 	}
 	maxSyms := min(ncodes-1, 255)
+	if classic {
+		// FSST as published: every code may be a symbol, single bytes included, and a literal no
+		// symbol covers is escaped. A candidate is ranked by the bytes it covers.
+		maxSyms = 255
+	}
 
 	t := symTrainPool.Get().(*symTrain)
 	defer symTrainPool.Put(t)
@@ -420,6 +441,12 @@ func trainSym(payloads [][]byte) *symTable {
 		}
 		t.cands = t.cands[:0]
 		add := func(le uint64, n int, count int32) {
+			if classic {
+				if count > 0 {
+					t.cands = append(t.cands, symGain{be: bits.ReverseBytes64(le), gain: count * int32(n), n: uint8(n)})
+				}
+				return
+			}
 			if n < 2 {
 				return
 			}
@@ -429,6 +456,11 @@ func trainSym(payloads [][]byte) *symTable {
 		}
 		for k := 0; k < t.k; k++ {
 			add(t.le[k], int(t.n[k]), t.c1[256+k])
+		}
+		if classic {
+			for u := 0; u < 256; u++ {
+				add(uint64(u), 1, t.c1[u])
+			}
 		}
 		for _, h := range t.used {
 			k := t.keys[h] &^ (1 << 31)
@@ -730,7 +762,7 @@ func trainTabs(shape leafShape, items [][]dictItem, prior []*symTable) (tabs []*
 				continue
 			}
 		}
-		tabs[c] = trainSym(payloads)
+		tabs[c] = trainSym(payloads, false)
 		changed = true
 	}
 	return tabs, changed
@@ -1131,7 +1163,19 @@ func (s *tableStore) maybeTrainColumns() error {
 	colTypes := append([]colType(nil), s.colTypes...)
 	for j, c := range s.shape.itemCols {
 		if s.shape.itemSym[j] {
-			colTypes[c].sym = trainSym(payloads[j])
+			colTypes[c].sym = trainColumnTable(payloads[j])
+			if os.Getenv("JED_LEAF_SYM_LOG") != "" {
+				tb, singles, bytes := colTypes[c].sym, 0, 0
+				for _, sy := range tb.syms {
+					if len(sy) == 1 {
+						singles++
+					}
+				}
+				for _, p := range payloads[j] {
+					bytes += len(p)
+				}
+				println("symbol table: column", c, "of", len(colTypes), "sample bytes", bytes, "symbols", len(tb.syms), "one-byte", singles)
+			}
 		}
 	}
 	s.setColTypes(colTypes)
@@ -1281,4 +1325,31 @@ func leafOrColTab(shape leafShape, tabs []*symTable, j, c int) *symTable {
 		return tb
 	}
 	return shape.itemTab[j]
+}
+
+// trainColumnTable trains a per-column table both ways — literals standing for themselves (trainSym)
+// and FSST-style — and keeps the one that codes the sample smaller (the first on a tie). Binary
+// values such as jsonb use most byte values, which leaves the first kind few codes; text does better
+// with it. The page format is the same either way: an FSST-style table is one whose codes take
+// every byte value, with one-byte symbols among them.
+func trainColumnTable(payloads [][]byte) *symTable {
+	plain := trainSym(payloads, false)
+	fsst := trainSym(payloads, true)
+	size := func(tb *symTable) int {
+		total := 0
+		if tb.usable() == nil {
+			for _, p := range payloads {
+				total += len(p)
+			}
+			return total
+		}
+		for _, p := range payloads {
+			total += tb.encLen(p)
+		}
+		return total
+	}
+	if size(fsst) < size(plain) {
+		return fsst
+	}
+	return plain
 }

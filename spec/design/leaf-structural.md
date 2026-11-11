@@ -581,25 +581,43 @@ of this and the dictionary saving.
 matcher that scanned every symbol sharing a first byte made coding 2.5 times slower. It now finds
 the symbols sharing the first two bytes through a small hash table. The output is the same.
 
-**Result**, same database and method as §10, two alternating runs each; the baseline is steps 1–7
-plus typed arrays (step 9), one run:
+**Two kinds of table, one format.** A column's table is trained both ways and the one that codes
+the sample smaller is kept (the first on a tie):
 
-| | steps 1–7, 9 | per leaf | per column |
-|---|---|---|---|
-| compacted file | 160.4 MB | 126.9 MB | 116.3 MB |
-| file after the load | 191.6 MB | 152.1 MB | 139.2 MB |
-| tables trained | | 34,523 (4.2 s) | 17 (under 0.1 s) |
-| bulk load, earlier tables | 55.2 s | 56.0, 56.0 s | 53.9, 55.5 s |
-| bulk load, the two new tables | 7.3 s | 10.4, 10.4 s | 7.6, 7.8 s |
-| one-row update commit | 221 µs | 381 to 399 µs | 381, 401 µs |
-| bytes written per update commit | 74,037 | 74,033 | 71,653 |
-| one-row append commit | 343 µs | 504 to 533 µs | 575, 593 µs |
+- **Literals stand for themselves** (§10): symbols are two bytes or more and take the byte values
+  the data uses least as codes.
+- **FSST-style:** up to 255 symbols, one-byte symbols included, ranked by the bytes they cover; a
+  byte no symbol covers is escaped. Binary values such as `jsonb` use most byte values, which
+  leaves the first kind few codes.
+
+The page format does not distinguish them. An FSST-style table is a table whose codes take every
+byte value and whose symbols include single bytes; the coder and decoder are the same. In the test
+database 10 of the 17 columns keep an FSST-style table.
+
+**Result**, same database and method as §10, two alternating runs each; the baseline is steps 1–7
+plus typed arrays (step 9), one run. The "per column" column is the literal-preserving table alone,
+from the runs before the FSST-style table was added:
+
+| | steps 1–7, 9 | per leaf | per column | per column, either kind |
+|---|---|---|---|---|
+| compacted file | 160.4 MB | 126.9 MB | 116.3 MB | 109.3 MB |
+| file after the load | 191.6 MB | 152.1 MB | 139.2 MB | 138.8 MB |
+| tables trained | | 34,523 (4.2 s) | 17 (under 0.1 s) | 34 (0.1 s) |
+| bulk load, earlier tables | 55.2 s | 56.0, 56.0 s | 53.9, 55.5 s | 54.7, 58.5 s |
+| bulk load, the two new tables | 7.3 s | 10.4, 10.4 s | 7.6, 7.8 s | 7.9, 8.0 s |
+| one-row update commit | 221 µs | 381 to 399 µs | 381, 401 µs | 450, 462 µs |
+| bytes written per update commit | 74,037 | 74,033 | 71,653 | 69,849 |
+| one-row append commit | 343 µs | 504 to 533 µs | 575, 593 µs | 547, 555 µs |
 
 The per-leaf commit times are the range over this session's four runs; one further run was three
 times slower in every timing and is left out as machine noise.
 
-- **The file is 8% smaller than with per-leaf tables**, 28% smaller than without symbol tables.
-  The symbol tables save 44 MB against the 41.5 MB the offline measurement predicted.
+- **With either kind of table the file is 14% smaller than with per-leaf tables** and 32% smaller
+  than without symbol tables: 51 MB saved, against 48.6 MB the offline measurement predicted for an
+  FSST-style table (§8.8). The literal-preserving table alone saves 44 MB.
+- **The FSST-style table costs commits about 60 µs on this table** (450 to 462 µs against 381 to
+  401 µs for an update): `activity` holds a 184-byte `jsonb` column that is now coded with 255
+  symbols. Appends did not get slower.
 - **Loading text costs about 0.4 s over the baseline** where per-leaf tables cost 3.1 s.
 - **Update commits cost the same as with per-leaf tables and write less** (denser leaves, and the
   chain is not rewritten). **Append commits are about 12% slower than per-leaf**; not explained.
@@ -618,8 +636,8 @@ change); `TestColumnSymbolTablesSurviveChange`, which runs with the live-page re
 commit (a rolled-back training, deletes, updates, `ADD COLUMN`, two renames, an index, a second
 trained table dropped, compaction and reopen, with an integrity check after each stage). The corpus
 in memory mode fails 24 of 752 files against 21: one `EXPLAIN` estimate, and two that open fixture
-files written without the catalog trailer. The unit tests fail 37 against 30: six read or patch
-goldens and fixtures without the trailer, one asserts a leaf count. With the switches off only
+files written without the catalog trailer. The unit tests fail 36 against 30, all six reading or
+patching goldens and fixtures without the trailer. With the switches off only
 `TestConcatThreeForms` fails, as before. The per-leaf mode's unit failures are unchanged. The
 disk-mode corpus was not run, and nothing checks that the simulation's tables grow large enough to
 train.
@@ -633,8 +651,8 @@ train.
   leaf written after it. A committed snapshot never reaches such a leaf; a cursor opened in the
   training transaction before the training and read after a commit could. Not constructed or
   tested.
-- **`jsonb` with varied keys does worse than per leaf** (few byte values are free, so the table
-  gets 15 symbols); FSST-style coding measured 40% smaller on that column (§8.8) and is not built.
+- The choice between the two kinds of table is made on the training sample. An intermediate table
+  (more codes than the unused byte values, fewer than all) is not tried.
 - **Tables are the first rows' in key order.** Compaction and rekey keep them; they do not retrain.
 - The trigger is stated as a leaf count, which a core reaches at the same insert only if the trees
   are identical; they are, by the split rule, but the sample bound should be restated in rows.

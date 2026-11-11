@@ -1501,7 +1501,7 @@ func TestTableSymExperiment(t *testing.T) {
 			for _, sy := range fs.syms {
 				fsSize += len(sy)
 			}
-			tabs := [4]*symTable{trainSym(all), trainSym(sample(256 << 10)), trainSym(sample(64 << 10)), trainSym(first)}
+			tabs := [4]*symTable{trainSym(all, false), trainSym(sample(256<<10), false), trainSym(sample(64<<10), false), trainSym(first, false)}
 			var alone [6]int
 			var perStrat [nStrat]int
 			for i := range col.leaves {
@@ -1534,7 +1534,7 @@ func TestTableSymExperiment(t *testing.T) {
 					}
 					return size
 				}
-				leafT := coded(trainSym(leafSpans[i]), true)
+				leafT := coded(trainSym(leafSpans[i], false), true)
 				var tb [4]int
 				for k := range tabs {
 					tb[k] = coded(tabs[k], false)
