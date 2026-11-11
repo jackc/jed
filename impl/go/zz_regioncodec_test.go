@@ -24,6 +24,7 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"runtime/pprof"
 	"sort"
 	"strings"
 	"testing"
@@ -1287,6 +1288,8 @@ func TestRegionEngineExperiment(t *testing.T) {
 		start = time.Now()
 		expExtra(t, db)
 		extra := time.Since(start)
+		fmt.Printf("training: %d tables, %.1f s, %.1f MB of payload\n", symStats.trains.Load(),
+			float64(symStats.trainNanos.Load())/1e9, float64(symStats.trainBytes.Load())/(1<<20))
 		st, _ := os.Stat(path)
 		loaded := st.Size()
 		if err := db.Compact("main"); err != nil {
@@ -1353,6 +1356,11 @@ func TestRegionEngineExperiment(t *testing.T) {
 		point("point: SELECT message FROM activity WHERE id = $1", "SELECT message FROM activity WHERE id = $1", 20000, func() int64 { return 1 + r.Int63n(nAct) })
 		point("point: SELECT id FROM activity WHERE id = $1", "SELECT id FROM activity WHERE id = $1", 20000, func() int64 { return 1 + r.Int63n(nAct) })
 		point("point: SELECT scores FROM samples WHERE id = $1", "SELECT scores FROM samples WHERE id = $1", 20000, func() int64 { return 1 + r.Int63n(nSam) })
+		if pf := os.Getenv("JED_REGION_PROF"); pf != "" {
+			f, _ := os.Create(pf)
+			pprof.StartCPUProfile(f)
+			defer func() { pprof.StopCPUProfile(); f.Close() }()
+		}
 		w0 := expWchar()
 		point("update 1 row/commit: activity.title", "UPDATE activity SET title = 'changed title text' WHERE id = $1", 2000, func() int64 { return 1 + r.Int63n(nAct) })
 		fmt.Printf("  %-96s %9d\n", "  bytes written per update commit", (expWchar()-w0)/4000)

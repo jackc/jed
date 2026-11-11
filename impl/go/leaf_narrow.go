@@ -478,25 +478,50 @@ type leafSizes struct {
 	items []dictItem // scratch
 }
 
+// allRowItems classifies every row (items[i][j] is row i's item for shape.itemCols[j]); nil when the
+// shape has no item column.
+func allRowItems(shape leafShape, pcap pageCap, keys [][]byte, rows []storedRow) [][]dictItem {
+	if len(shape.itemCols) == 0 {
+		return nil
+	}
+	flat := make([]dictItem, len(rows)*len(shape.itemCols))
+	items := make([][]dictItem, len(rows))
+	for i, row := range rows {
+		items[i] = flat[i*len(shape.itemCols) : (i+1)*len(shape.itemCols)]
+		rowItems(shape, pcap, keys[i], row, items[i])
+	}
+	return items
+}
+
 // newLeafSizes measures rows. tabs is the symbol tables the leaf carries; when it carries none and
 // train is set, they are trained from the rows.
 func newLeafSizes(shape leafShape, pcap pageCap, keys [][]byte, rows []storedRow, tabs []*symTable, train bool) *leafSizes {
+	return leafSizesOf(shape, rows, allRowItems(shape, pcap, keys, rows), tabs, train)
+}
+
+// leafSizesOf is newLeafSizes over rows already classified.
+func leafSizesOf(shape leafShape, rows []storedRow, items [][]dictItem, tabs []*symTable, train bool) *leafSizes {
 	sz := &leafSizes{
+		n:     len(rows),
 		accs:  make([]colAcc, len(shape.itemCols)),
 		fors:  make([]forRange, len(shape.forCols)),
 		items: make([]dictItem, len(shape.itemCols)),
 		tabs:  tabs,
 	}
-	if tabs == nil && train && shape.hasSym {
-		items := make([][]dictItem, len(rows))
-		for i, row := range rows {
-			items[i] = make([]dictItem, len(shape.itemCols))
-			rowItems(shape, pcap, keys[i], row, items[i])
-		}
-		sz.tabs = trainTabs(shape, items)
+	if tabs == nil && train {
+		sz.tabs, _ = trainTabs(shape, items, nil)
 	}
-	for i, row := range rows {
-		sz.addRow(shape, pcap, keys[i], row)
+	for j, fc := range shape.forCols {
+		for _, row := range rows {
+			if v := row[fc.col]; !v.IsNull() {
+				sz.fors[j].add(forSlot(fc.w, v))
+			}
+		}
+	}
+	for i := range items {
+		for j, c := range shape.itemCols {
+			sz.accs[j].add(shape, j, items[i][j], tabFor(sz.tabs, c))
+		}
 	}
 	return sz
 }

@@ -448,10 +448,11 @@ saving = Σ over inline values (header + payload − coded length) − table byt
 - A leaf that fits the page as plain regions is written without tables, and measured without them.
 - When a decoded leaf first does not fit, tables are trained from its rows and stay with the node.
   Later inserts are measured, and the leaf written, under those tables.
-- When the leaf overflows under its tables, they are trained again from all its rows. If it still
-  overflows it splits, both halves measured under the new tables. A half keeps them only if it does
-  not fit without them.
-- A leaf read from a page and then changed keeps the page's tables while it fits under them.
+- When the leaf overflows under its tables it splits, both halves measured under them. A half keeps
+  them only if it does not fit without them, so the small right half of an append trains its own
+  when it fills.
+- A leaf read from a page and then changed keeps the page's tables while it fits under them, and
+  trains again when it overflows (a page does not record how much its table was trained from).
 - A string column takes the larger of the dictionary saving (§9) and this one.
 
 A leaf's bytes therefore depend on when its tables were trained, not only on its rows. Two cores
@@ -460,36 +461,59 @@ insert path. That has to become a rule about rows and pages before adoption (ope
 
 **Read.** The region is kept as its page bytes and rebuilt into the plain form (end offsets and
 spans) the first time a value of the column is read; the rebuilt form stays with the resident leaf.
-A column the query does not touch is not rebuilt. The walk for overflow chains reads the raw bitmap
-and never rebuilds. Reading one value in place, without rebuilding the region, is possible in this
-format and not built.
+The walk for overflow chains reads the raw bitmap and never rebuilds. A scan that reads whole rows
+asks for every column's span, so it rebuilds every such region of each leaf the first time it visits
+it, whether or not the query uses the column (see the result). Reading one value in place, and
+deferring the rebuild until a value is used, are both possible in this format and not built.
 
 **Result.** The database of the earlier steps plus the two tables of
 [leaf-encodings-experiment.md](leaf-encodings-experiment.md) §8.1 (prose, varied-key `jsonb`, arrays),
-8 KiB pages, one run of each configuration (`TestRegionEngineExperiment`):
+8 KiB pages (`TestRegionEngineExperiment`). The first and last columns are two alternating runs
+each; the middle two are one run each of the first version of this step, before the training changes
+below.
 
-| | steps 1–7 | + step 8 | + step 9 | + both |
+| | steps 1–7 | + step 8, first version | + step 9 only | + both |
 |---|---|---|---|---|
-| compacted file | 177.0 MB | 134.2 MB | 160.4 MB | 127.6 MB |
-| file after the load | 191.6 MB | 147.0 MB | 191.6 MB | 147.0 MB |
-| bulk load, earlier tables | 54.1 s | 60.1 s | 54.1 s | 59.6 s |
-| bulk load, the two new tables | 5.6 s | 26.5 s | 7.6 s | 20.6 s |
-| one-row update commit (`activity.title`) | 230 µs | 425 µs | 227 µs | 422 µs |
-| one-row append commit (`activity`) | 361 µs | 476 µs | 316 µs | 501 µs |
+| compacted file | 177.0 MB | 134.2 MB | 160.4 MB | 126.9 MB |
+| file after the load | 191.6 MB | 147.0 MB | 191.6 MB | 152.1 MB |
+| bulk load, earlier tables | 52.7, 55.3 s | 60.1 s | 54.1 s | 54.5, 55.3 s |
+| bulk load, the two new tables | 5.7, 5.7 s | 26.5 s | 7.6 s | 10.6, 10.8 s |
+| one-row update commit (`activity.title`) | 229, 231 µs | 425 µs | 227 µs | 375, 384 µs |
+| one-row append commit (`activity`) | 328, 339 µs | 476 µs | 316 µs | 504, 510 µs |
+| first scan of `activity` after open, `count(*), sum(id)` | 152, 166 ms | | | 294, 298 ms |
 
-- **Size:** the symbol table takes 24% off the file, and 28% with typed arrays.
-- **Loading is slower where the data is text:** the two new tables load in 21 to 27 s against 5.6 s.
-  Training is most of it: a filling leaf trains when it first outgrows its plain size and again at
-  each overflow under its tables.
-- **A one-row commit is 40% to 85% slower.** The leaf it touches is rebuilt from the page, measured
-  under the page's tables, and coded again when written.
-- **Reads did not move outside the noise of single runs:** resident scans of the text and `jsonb`
-  columns ran 0% to 15% faster, point lookups 1.1 to 2.7 µs in every configuration. The ten
-  aggregate queries return the same values in all four.
+- **Size:** both steps take 28% off the file; the symbol table alone 24%, typed arrays alone 9%.
+- **Loading text is about twice as slow:** the two new tables load in 10.7 s against 5.7 s. The
+  earlier tables did not move. Training is 3.9 s of the difference: 34,511 tables over 86 MB of
+  payload, about 45 ns a byte.
+- **A one-row commit is 50% to 65% slower.** By profile the coding itself (measuring the leaf under
+  its tables, then coding it when written, and rebuilding its regions) is about 15% of the commit;
+  the rest is that the leaf holds more rows to decode and encode (§12, item 4).
+- **The first scan of a table after open is up to twice as slow** when it reads whole rows: every
+  symbol-table region of every leaf is rebuilt, about 45 µs a leaf here. Later scans are resident
+  and did not move: text and `jsonb` scans ran within 10% either way, point lookups 1.1 to 2.5 µs in
+  both configurations. The ten aggregate queries return the same values in all runs.
+
+**Training cost.** The first version took 26.5 s to load the two new tables. Three changes:
+
+- **The trainer** keeps candidates as integers and reuses its working memory; it sorted strings and
+  allocated per candidate. Same tables, 2.2 times faster.
+- **No retraining at overflow.** The first version trained a leaf's tables again every time it
+  overflowed under them, about two trainings per column per leaf. Keeping the first table for the
+  leaf's life halves the trainings, and the file came out 0.5% smaller, not larger
+  (`JED_LEAF_SYM_RETRAIN` sets a growth percentage at which to train again; 25 and 50 were no
+  smaller).
+- **Rows are classified once per rebuild**, not once for sizing and again for the split scan.
+
+Fewer passes were tried and rejected: three passes in place of five made the file 4% larger for 0.3 s
+of the load at 0.3 scale (`JED_LEAF_SYM_PASSES`).
 
 **What was run**, Go core, all nine switches on: `mise run sim:sweep 1..100 all go` (2,200 traces
 pass). The corpus in memory mode fails 22 of 752 files against 21 at step 7; the new one is an
-`EXPLAIN` estimate. The unit tests fail 32 against 30; the two new ones assert a leaf or page count.
+`EXPLAIN` estimate. The unit tests fail 33 against 30. Two of the new ones assert a leaf or page count. The third,
+`TestEncryptedTamperingAndReplayAreDetected`, replays onto every seventh page and requires one to be
+live; with this layout none of the sampled pages is, and replaying onto every page is detected at
+each of the 6 live ones.
 With the switches off the unit tests fail one, `TestConcatThreeForms`, which also fails at the
 commit before this step. The disk-mode corpus and the randomized comparison test were not run.
 
@@ -497,8 +521,9 @@ commit before this step. The disk-mode corpus and the randomized comparison test
 
 - The training points above are stated in terms of the insert path. Bytes must be a function of
   rows and pages for two cores to agree.
-- Training cost. A sample of the leaf, fewer passes, or training once per leaf would cut it; none
-  was tried.
+- The first scan after open rebuilds regions the query does not use. A value that defers its
+  rebuild until read would remove that.
+- The commit path codes a touched leaf twice, once to measure it and once to write it.
 - The table is per leaf. A table per column in the catalog would remove the per-page table and train
   on more data ([leaf-encodings-experiment.md](leaf-encodings-experiment.md) §8.2: the per-page table
   is why 64 KiB pages compress 30% better); not measured.

@@ -4,9 +4,11 @@ import (
 	"encoding/binary"
 	"math/bits"
 	"os"
-	"sort"
+	"slices"
+	"strconv"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // PROTOTYPE: two more variable-width region encodings, measured in
@@ -47,6 +49,11 @@ const (
 
 const symMaxLen = 8
 
+// symStats counts training work, for the experiment harness.
+var symStats struct {
+	trains, trainNanos, trainBytes atomic.Int64
+}
+
 // symTable is one column's symbol table. Immutable once built.
 type symTable struct {
 	syms  [][]byte
@@ -62,6 +69,9 @@ type symTable struct {
 	dlen [256]uint8
 	dsym [256]uint64
 	size int // the table's bytes on the page
+	// trained is the payload bytes the table was trained from (0: read from a page, unknown). A table
+	// with no symbols is kept to carry it; tabFor hides such a table.
+	trained int
 }
 
 // symCand is one symbol as the matcher tests it: its bytes little-endian and a mask of its length.
@@ -71,9 +81,37 @@ type symCand struct {
 	n         uint8
 }
 
-// symMatcher is a table's symbols by first byte, longest first.
+// symMatcher is a set of symbols by first byte, longest first: the symbols starting with byte c are
+// cands[off[c]:off[c+1]].
 type symMatcher struct {
-	first [256][]symCand
+	off   [257]uint16
+	cands [255]symCand
+}
+
+// build fills the matcher from symbols given as little-endian bytes and lengths.
+func (m *symMatcher) build(le []uint64, n []uint8) {
+	var count [256]uint16
+	for _, v := range le {
+		count[byte(v)]++
+	}
+	at := uint16(0)
+	for c := 0; c < 256; c++ {
+		m.off[c] = at
+		at += count[c]
+	}
+	m.off[256] = at
+	var next [256]uint16
+	copy(next[:], m.off[:256])
+	for l := symMaxLen; l >= 1; l-- {
+		for k, v := range le {
+			if int(n[k]) != l {
+				continue
+			}
+			c := byte(v)
+			m.cands[next[c]] = symCand{val: v, mask: ^uint64(0) >> (64 - 8*l), k: uint16(k), n: uint8(l)}
+			next[c]++
+		}
+	}
 }
 
 func (tb *symTable) matcher() *symMatcher {
@@ -83,19 +121,15 @@ func (tb *symTable) matcher() *symMatcher {
 
 func (tb *symTable) index() {
 	m := &symMatcher{}
-	tb.m = m
-	order := make([]int, len(tb.syms))
-	for i := range order {
-		order[i] = i
-	}
-	sort.SliceStable(order, func(a, b int) bool { return len(tb.syms[order[a]]) > len(tb.syms[order[b]]) })
-	for _, k := range order {
-		sym := tb.syms[k]
+	le := make([]uint64, len(tb.syms))
+	n := make([]uint8, len(tb.syms))
+	for k, sym := range tb.syms {
 		var v [8]byte
 		copy(v[:], sym)
-		c := symCand{val: binary.LittleEndian.Uint64(v[:]), mask: ^uint64(0) >> (64 - 8*len(sym)), k: uint16(k), n: uint8(len(sym))}
-		m.first[sym[0]] = append(m.first[sym[0]], c)
+		le[k], n[k] = binary.LittleEndian.Uint64(v[:]), uint8(len(sym))
 	}
+	m.build(le, n)
+	tb.m = m
 }
 
 // seal assigns the codes and fills the derived fields.
@@ -116,9 +150,10 @@ func (tb *symTable) seal(esc byte, codes []byte) {
 
 // match returns the unit at p (256+k for symbol k, else the literal byte) and its length.
 func (m *symMatcher) match(p []byte, at int) (unit, n int) {
-	cands := m.first[p[at]]
-	if len(cands) == 0 {
-		return int(p[at]), 1
+	c := p[at]
+	lo, hi := m.off[c], m.off[int(c)+1]
+	if lo == hi {
+		return int(c), 1
 	}
 	var w uint64
 	left := len(p) - at
@@ -129,13 +164,13 @@ func (m *symMatcher) match(p []byte, at int) (unit, n int) {
 		copy(v[:], p[at:])
 		w = binary.LittleEndian.Uint64(v[:])
 	}
-	for i := range cands {
-		c := &cands[i]
-		if w&c.mask == c.val && int(c.n) <= left {
-			return 256 + int(c.k), int(c.n)
+	for i := lo; i < hi; i++ {
+		cd := &m.cands[i]
+		if w&cd.mask == cd.val && int(cd.n) <= left {
+			return 256 + int(cd.k), int(cd.n)
 		}
 	}
-	return int(p[at]), 1
+	return int(c), 1
 }
 
 func (tb *symTable) unitBytes(u int) []byte {
@@ -219,11 +254,51 @@ func parseSymTable(b []byte) (*symTable, []byte, error) {
 	return tb, b[at:], nil
 }
 
+// symTrain is the trainer's working memory, reused across trainings.
+type symTrain struct {
+	keys   [symPairSlots]uint32 // pair counts: an open-addressed table keyed by (unit, unit)
+	counts [symPairSlots]int32
+	used   []uint32
+	c1     [256 + 255]int32
+	cands  []symGain
+	le     [255]uint64 // the current symbols, little-endian, and their lengths
+	n      [255]uint8
+	k      int
+	m      symMatcher
+	seen   [512]uint64 // the symbols chosen this pass (bytes and length), for duplicates
+	seenN  [512]uint8
+}
+
+const symPairSlots = 1 << 14
+
+// symGain is a candidate symbol: its bytes big-endian and left-aligned (so integer order is byte
+// order), its length, and the bytes it would save.
+type symGain struct {
+	be   uint64
+	gain int32
+	n    uint8
+}
+
+var symTrainPool = sync.Pool{New: func() any { return &symTrain{} }}
+
+// symPasses is the number of training passes.
+var symPasses = func() int {
+	if n, _ := strconv.Atoi(os.Getenv("JED_LEAF_SYM_PASSES")); n > 0 {
+		return n
+	}
+	return 5
+}()
+
 // trainSym builds a table from a column's inline payloads, or nil when no symbol repays its entry.
-// Five passes: parse with the current table, count units and adjacent pairs, and keep the candidates
-// (pair concatenations and existing symbols) that save the most bytes. Ties break by the symbol's
-// bytes, so the table is a function of the payloads in order.
+// Each pass parses the payloads with the current table, counts symbols and adjacent pairs, and keeps
+// the candidates (pair concatenations and existing symbols) that save the most bytes. Ties break by
+// the symbol's bytes, so the table is a function of the payloads in order.
 func trainSym(payloads [][]byte) *symTable {
+	start := time.Now()
+	defer func() {
+		symStats.trains.Add(1)
+		symStats.trainNanos.Add(int64(time.Since(start)))
+	}()
 	var freq [256]int
 	total := 0
 	for _, p := range payloads {
@@ -232,16 +307,17 @@ func trainSym(payloads [][]byte) *symTable {
 			freq[c]++
 		}
 	}
+	symStats.trainBytes.Add(int64(total))
 	if total < 16 {
-		return nil
+		return &symTable{trained: total}
 	}
 	// Code bytes: the values the payloads never use, rarest first; at least 16, taking the rarest
 	// used values when fewer are free. The first is the escape.
-	order := make([]int, 256)
+	var order [256]uint8
 	for i := range order {
-		order[i] = i
+		order[i] = uint8(i)
 	}
-	sort.SliceStable(order, func(a, b int) bool { return freq[order[a]] < freq[order[b]] })
+	slices.SortStableFunc(order[:], func(a, b uint8) int { return freq[a] - freq[b] })
 	ncodes := 0
 	for ncodes < 256 && freq[order[ncodes]] == 0 {
 		ncodes++
@@ -251,111 +327,121 @@ func trainSym(payloads [][]byte) *symTable {
 	}
 	maxSyms := min(ncodes-1, 255)
 
-	tb := &symTable{}
-	type cand struct {
-		s    string
-		gain int
+	t := symTrainPool.Get().(*symTrain)
+	defer symTrainPool.Put(t)
+	t.k = 0
+	unit := func(u uint32) (uint64, int) {
+		if u < 256 {
+			return uint64(u), 1
+		}
+		return t.le[u-256], int(t.n[u-256])
 	}
-	c1 := make([]int, 256+255)
-	// Pair counts: an open-addressed table keyed by (unit, unit), cleared each pass.
-	const slots = 1 << 14
-	keys := make([]uint32, slots)
-	counts := make([]int32, slots)
-	var used []uint32
-	var cs []cand
-	for gen := 0; gen < 5; gen++ {
-		tb.index()
-		m := tb.m
-		for i := range c1 {
-			c1[i] = 0
+	for gen := 0; gen < symPasses; gen++ {
+		t.m.build(t.le[:t.k], t.n[:t.k])
+		for i := range t.c1 {
+			t.c1[i] = 0
 		}
-		for _, h := range used {
-			keys[h], counts[h] = 0, 0
+		for _, h := range t.used {
+			t.keys[h], t.counts[h] = 0, 0
 		}
-		used = used[:0]
+		t.used = t.used[:0]
 		full := false
 		for _, p := range payloads {
 			prev := -1
 			for at := 0; at < len(p); {
-				u, n := m.match(p, at)
-				c1[u]++
+				u, n := t.m.match(p, at)
+				t.c1[u]++
 				if prev >= 0 && !full {
 					k := uint32(prev)<<16 | uint32(u) | 1<<31 // never 0
 					h := (k * 2654435761) >> 18
-					for keys[h] != 0 && keys[h] != k {
-						h = (h + 1) & (slots - 1)
+					for t.keys[h] != 0 && t.keys[h] != k {
+						h = (h + 1) & (symPairSlots - 1)
 					}
-					if keys[h] == 0 {
-						keys[h] = k
-						used = append(used, h)
-						full = len(used) >= slots*3/4 // later pairs are not counted
+					if t.keys[h] == 0 {
+						t.keys[h] = k
+						t.used = append(t.used, h)
+						full = len(t.used) >= symPairSlots*3/4 // later pairs are not counted
 					}
-					counts[h]++
+					t.counts[h]++
 				}
 				prev = u
 				at += n
 			}
 		}
-		cs = cs[:0]
-		add := func(s []byte, count int) {
-			if len(s) < 2 {
+		t.cands = t.cands[:0]
+		add := func(le uint64, n int, count int32) {
+			if n < 2 {
 				return
 			}
-			if g := count*(len(s)-1) - (len(s) + 2); g > 0 {
-				cs = append(cs, cand{string(s), g})
+			if g := int(count)*(n-1) - (n + 2); g > 0 {
+				t.cands = append(t.cands, symGain{be: bits.ReverseBytes64(le), gain: int32(g), n: uint8(n)})
 			}
 		}
-		for u := 256; u < 256+len(tb.syms); u++ {
-			add(tb.syms[u-256], c1[u])
+		for k := 0; k < t.k; k++ {
+			add(t.le[k], int(t.n[k]), t.c1[256+k])
 		}
-		var cat [2 * symMaxLen]byte
-		for _, h := range used {
-			k := keys[h] &^ (1 << 31)
-			a, b := tb.unitBytes(int(k>>16)), tb.unitBytes(int(k&0xffff))
-			if len(a)+len(b) > symMaxLen {
+		for _, h := range t.used {
+			k := t.keys[h] &^ (1 << 31)
+			a, an := unit(k >> 16)
+			b, bn := unit(k & 0xffff)
+			if an+bn > symMaxLen {
 				continue
 			}
-			n := copy(cat[:], a)
-			n += copy(cat[n:], b)
-			add(cat[:n], int(counts[h]))
+			add(a|b<<(8*an), an+bn, t.counts[h])
 		}
-		// One candidate per distinct string (its largest gain), then the best maxSyms.
-		sort.Slice(cs, func(a, b int) bool {
-			if cs[a].s != cs[b].s {
-				return cs[a].s < cs[b].s
+		// Largest gain first, ties by the symbol's bytes; a string seen twice keeps its larger gain.
+		slices.SortFunc(t.cands, func(a, b symGain) int {
+			if a.gain != b.gain {
+				return int(b.gain) - int(a.gain)
 			}
-			return cs[a].gain > cs[b].gain
+			if a.be != b.be {
+				if a.be < b.be {
+					return -1
+				}
+				return 1
+			}
+			return int(a.n) - int(b.n)
 		})
-		w := 0
-		for i, c := range cs {
-			if i == 0 || c.s != cs[w-1].s {
-				cs[w] = c
-				w++
+		for i := range t.seenN {
+			t.seenN[i] = 0
+		}
+		t.k = 0
+		for _, c := range t.cands {
+			if t.k == maxSyms {
+				break
 			}
-		}
-		cs = cs[:w]
-		sort.Slice(cs, func(a, b int) bool {
-			if cs[a].gain != cs[b].gain {
-				return cs[a].gain > cs[b].gain
+			h := (c.be*0x9e3779b97f4a7c15 + uint64(c.n)) >> 55
+			dup := false
+			for t.seenN[h] != 0 {
+				if t.seen[h] == c.be && t.seenN[h] == c.n {
+					dup = true
+					break
+				}
+				h = (h + 1) & 511
 			}
-			return cs[a].s < cs[b].s
-		})
-		if len(cs) > maxSyms {
-			cs = cs[:maxSyms]
-		}
-		tb.syms = tb.syms[:0]
-		for _, c := range cs {
-			tb.syms = append(tb.syms, []byte(c.s))
+			if dup {
+				continue
+			}
+			t.seen[h], t.seenN[h] = c.be, c.n
+			t.le[t.k], t.n[t.k] = bits.ReverseBytes64(c.be), c.n
+			t.k++
 		}
 	}
-	if len(tb.syms) == 0 {
-		return nil
+	if t.k == 0 {
+		return &symTable{trained: total}
 	}
-	codes := make([]byte, len(tb.syms))
-	for k := range codes {
-		codes[k] = byte(order[1+k])
+	tb := &symTable{trained: total}
+	buf := make([]byte, 0, t.k*symMaxLen)
+	codes := make([]byte, t.k)
+	for k := 0; k < t.k; k++ {
+		var v [8]byte
+		binary.LittleEndian.PutUint64(v[:], t.le[k])
+		at := len(buf)
+		buf = append(buf, v[:t.n[k]]...)
+		tb.syms = append(tb.syms, buf[at:len(buf):len(buf)])
+		codes[k] = order[1+k]
 	}
-	tb.seal(byte(order[0]), codes)
+	tb.seal(order[0], codes)
 	return tb
 }
 
@@ -543,31 +629,58 @@ func itemSaving(shape leafShape, j, n int, f colFacts, tb *symTable) int {
 	return s
 }
 
-// trainTabs trains a table for every symbol-table column from the rows' items (items[i][j] is row i's
-// item for shape.itemCols[j]). The result is indexed by column; nil when the shape has no such column.
-func trainTabs(shape leafShape, items [][]dictItem) []*symTable {
-	if !shape.hasSym {
-		return nil
+// symRetrainPct is how much a column's payload must have grown since its table was trained, in
+// percent, before an overflowing leaf trains it again (JED_LEAF_SYM_RETRAIN). The default never
+// does: a table lasts the leaf's life, which measured no larger than retraining at every overflow
+// (leaf-structural.md §10). A table read from a page has no recorded size and is trained again.
+var symRetrainPct = func() int {
+	switch v := os.Getenv("JED_LEAF_SYM_RETRAIN"); v {
+	case "", "never":
+		return 1 << 30
+	default:
+		n, _ := strconv.Atoi(v)
+		return n
 	}
-	tabs := make([]*symTable, len(shape.colTypes))
+}()
+
+// trainTabs trains tables for the symbol-table columns from the rows' items (items[i][j] is row i's
+// item for shape.itemCols[j]). With no prior tables every column is trained. With prior tables (an
+// overflowing leaf's) a column is trained again only when its payload has grown by symRetrainPct
+// since its table was trained, and keeps its table otherwise; changed reports whether any was. The
+// result is indexed by column; nil when the shape has no such column.
+func trainTabs(shape leafShape, items [][]dictItem, prior []*symTable) (tabs []*symTable, changed bool) {
+	if !shape.hasSym {
+		return nil, false
+	}
+	tabs = make([]*symTable, len(shape.colTypes))
 	payloads := make([][]byte, 0, len(items))
 	for j, c := range shape.itemCols {
 		if !shape.itemSym[j] {
 			continue
 		}
 		payloads = payloads[:0]
+		total := 0
 		for i := range items {
 			if it := items[i][j]; it.kind == dictShared {
 				payloads = append(payloads, it.payload)
+				total += len(it.payload)
+			}
+		}
+		if prior != nil && prior[c] != nil {
+			if t := prior[c].trained; t != 0 && total*100 < t*(100+symRetrainPct) {
+				tabs[c] = prior[c]
+				continue
 			}
 		}
 		tabs[c] = trainSym(payloads)
+		changed = true
 	}
-	return tabs
+	return tabs, changed
 }
 
+// tabFor is column c's table, or nil when the leaf has none or training found no symbol.
 func tabFor(tabs []*symTable, c int) *symTable {
-	if tabs == nil {
+	if tabs == nil || tabs[c] == nil || len(tabs[c].syms) == 0 {
 		return nil
 	}
 	return tabs[c]

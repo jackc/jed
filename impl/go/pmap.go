@@ -1477,19 +1477,29 @@ func buildLeaf(keys [][]byte, vals []storedRow, weights []uint32, cap pageCap, s
 	}
 	payload += leafOverhead(n, shape)
 	var tabs []*symTable
+	var items [][]dictItem
+	var sz *leafSizes
 	if payload > cap.c && n >= 2 {
 		payload -= leafPrefixSaving(n, keys[0], keys[n-1])
-		// The tables the leaf had (prior) are kept while it fits under them; an overflow is where a
-		// stale table is replaced by one trained from the rows.
-		sz := newLeafSizes(shape, cap, keys, vals, prior, prior == nil)
+		// The tables the leaf had (prior) are kept while it fits under them. When it overflows under
+		// them, a column whose payload has grown enough since its table was trained is trained again
+		// (trainTabs); the others keep their tables into the split.
+		items = allRowItems(shape, cap, keys, vals)
+		sz = leafSizesOf(shape, vals, items, prior, prior == nil)
 		if prior != nil && shape.hasSym && payload-sz.saving(shape, true) > cap.c {
-			sz = newLeafSizes(shape, cap, keys, vals, nil, true)
+			if fresh, changed := trainTabs(shape, items, prior); changed {
+				sz = leafSizesOf(shape, vals, items, fresh, false)
+			}
 		}
 		tabs = sz.tabs
 		payload -= sz.saving(shape, true)
 	}
 	if payload <= cap.c || n < 2 {
-		return insOut{whole: &pnode{keys: keys, vals: vals, weights: weights, owner: owner, symTabs: tabs}}
+		whole := &pnode{keys: keys, vals: vals, weights: weights, owner: owner, symTabs: tabs}
+		if owner != nil {
+			whole.sizes = sz // a dirty node is its writer's alone
+		}
+		return insOut{whole: whole}
 	}
 	prefix := make([]int, n+1)
 	for i, w := range weights {
@@ -1522,11 +1532,6 @@ func buildLeaf(keys [][]byte, vals []storedRow, weights []uint32, cap pageCap, s
 	dpre := make([][]colFacts, len(shape.itemCols))
 	dsuf := make([][]colFacts, len(shape.itemCols))
 	if len(shape.itemCols) > 0 {
-		items := make([][]dictItem, n)
-		for i := range items {
-			items[i] = make([]dictItem, len(shape.itemCols))
-			rowItems(shape, cap, keys[i], vals[i], items[i])
-		}
 		for j, c := range shape.itemCols {
 			dpre[j], dsuf[j] = make([]colFacts, n+1), make([]colFacts, n+1)
 			var fwd, back colAcc
@@ -1645,7 +1650,7 @@ func nodeInsert(n *pnode, key []byte, val storedRow, weight uint32, old *storedR
 			}
 			// The unchanged builder selects the exact split point/separator. The edited node is
 			// abandoned when the returned halves replace it, so handing it the vectors is safe.
-			return buildLeaf(n.keys, n.vals, n.weights, cap, shape, i, generation, nil), nil
+			return buildLeaf(n.keys, n.vals, n.weights, cap, shape, i, generation, n.symTabs), nil
 		}
 		keys, vals, weights, err := n.decodedParts()
 		if err != nil {
