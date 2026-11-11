@@ -1,12 +1,15 @@
-// The columnar aggregate lane under a cost ceiling (spec/design/cost.md §6.1): with a max_cost or a
-// lifetime budget set the lane runs as an attempt, accepted only if it finishes cleanly with every
+// The columnar lanes under a cost ceiling (spec/design/cost.md §6.1): with a max_cost or a
+// lifetime budget set a lane runs as an attempt, accepted only if it finishes cleanly with every
 // ceiling unreached and otherwise discarded for the row path. So with the attempt on and off a
 // statement must have the same outcome — rows and cost, or error code and text — and add the same
-// amount to the session's cumulative cost, at every ceiling. Mirrors Rust (tests/varwidth_lanes.rs)
-// and Go (varwidth_lanes_test.go).
+// amount to the session's cumulative cost, at every ceiling. And with no ceiling (§6.2) a statement
+// that fails on a lane leaves the cumulative cost the row path leaves. Mirrors Rust
+// (tests/varwidth_lanes.rs) and Go (varwidth_lanes_test.go).
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { VOLATILE_SCALAR_FUNCS } from "../src/executor.ts";
+import { OPERATORS } from "../src/operators.ts";
 import { DEFAULT_WORK_MEM } from "../src/spill.ts";
 import { EngineError, laneCeiling, type Session } from "../src/tooling.ts";
 import { render } from "../src/value.ts";
@@ -118,7 +121,8 @@ const CT_SEED = [
 
 // Lane-shaped statements whose filters are safe to discard: whole-table and grouped folds, ordered
 // groups, a window, no survivors, and filters that raise part-way through the scan. The first three
-// are swept at every ceiling on a file; the rest at every twenty-ninth.
+// are swept at every ceiling on a file; the rest at every twenty-ninth, always with the boundary
+// ceilings (cost − 1 … cost + 2).
 const CEILING_QUERIES = [
   "SELECT count(*), sum(d), min(s) FROM ct",
   "SELECT n, count(*), sum(d) FROM ct GROUP BY n",
@@ -132,7 +136,64 @@ const CEILING_QUERIES = [
   "SELECT * FROM (SELECT n, sum(d) AS t FROM ct GROUP BY n) g WHERE t IS NOT NULL",
   // An uncorrelated scalar subquery is folded to a constant before the lane runs.
   "SELECT count(*), sum(d) FROM ct WHERE n > (SELECT 1)",
+  // Built-in function calls the catalog does not mark volatile.
+  "SELECT n, sum(d) FROM ct WHERE abs(n) > 1 GROUP BY n",
+  "SELECT count(*), sum(d) FROM ct WHERE abs(n) > 1 AND lower(s) <> 'v' AND length(s) < 40",
+  // Expression operands: a run that folds one is always an attempt.
+  "SELECT sum(d * 2), count(big + 1), max(big % 7) FROM ct",
+  "SELECT n, sum(d + id), min(abs(d)) FROM ct WHERE n > 0 GROUP BY n ORDER BY n",
+  // An operand that raises at row 100 and a filter that raises at row 250: the row path filters
+  // every row before it folds any, so the filter's error is the one it reports.
+  "SELECT sum(1000 / (id - 100)) FROM ct WHERE 1000 / (id - 250) <> 7",
+  "SELECT n, sum(1000 / (id - 100)) FROM ct GROUP BY n",
 ];
+
+// Bare-column projections: the columnar projection lane, an attempt under a ceiling.
+const PROJECTION_QUERIES = [
+  "SELECT id, d, s FROM ct",
+  "SELECT id, s FROM ct WHERE n > 1 AND d <> 0",
+  "SELECT d, big FROM ct WHERE id BETWEEN 40 AND 200 AND abs(n) < 3",
+  "SELECT id, d FROM ct WHERE 1000 / (id - 200) > 0",
+];
+
+// Statements whose filter is outside the allowlist, so they run on the plain lane with no ceiling and
+// keep the row path under one — each failing part-way through its scan.
+const PLAIN_LANE_FAILURES = [
+  "SELECT count(*), sum(d) FROM ct WHERE s ~ '^v' AND 1000 / (id - 200) > 0",
+  "SELECT n, max(s), sum(d) FROM ct WHERE uuidv4() IS NOT NULL AND 1000 / (id - 77) > 0 GROUP BY n",
+  "SELECT id, s FROM ct WHERE s ~ '^v' AND 1000 / (id - 200) > 0",
+];
+
+// unmeteredMatchesRowPath: with no ceiling, the lane (plain, or an attempt for an expression operand)
+// against the row path — the same statement under a ceiling it never reaches with the attempt off,
+// which accrues exactly what the unmetered row path does. Rows and cost, or the error and what it
+// left accrued.
+function unmeteredMatchesRowPath(s: Session, sql: string): void {
+  s.setMaxCost(0n);
+  const lane = meteredOutcome(s, sql);
+  const row = rowPath(s, () => meteredOutcome(s, sql));
+  assert.deepEqual(lane, row, `unmetered lane vs row path: ${sql}`);
+}
+
+// cost.md §6.2: a statement that fails on a lane leaves the cumulative cost the row path leaves, and
+// an expression-operand lane reports the error the row path reports.
+function unmeteredLane(file: boolean): void {
+  withDb(file, CT_SEED, (s) => {
+    for (const workMem of file ? [1, 400, DEFAULT_WORK_MEM] : [DEFAULT_WORK_MEM]) {
+      s.setWorkMem(workMem);
+      for (const q of [...CEILING_QUERIES, ...PROJECTION_QUERIES, ...PLAIN_LANE_FAILURES])
+        unmeteredMatchesRowPath(s, q);
+    }
+  });
+}
+
+test("the unmetered lane matches the row path on a file", () => {
+  unmeteredLane(true);
+});
+
+test("the unmetered lane matches the row path in memory", () => {
+  unmeteredLane(false);
+});
 
 function laneUnderACeiling(file: boolean): void {
   withDb(file, CT_SEED, (s) => {
@@ -141,17 +202,26 @@ function laneUnderACeiling(file: boolean): void {
       sweepMaxCost(s, q, file ? (qi < 3 ? 1n : 29n) : 11n);
       const tried = laneCeiling.attempts - before.attempts;
       const fellBack = laneCeiling.fallbacks - before.fallbacks;
-      // In memory an ordered grouping does not take the lane at all (memory.md §5.4).
-      if (!file && q.includes("ORDER BY")) {
-        assert.equal(tried, 0, `attempted in memory: ${q}`);
-        return;
-      }
       assert.ok(tried > 0, `the lane was never attempted: ${q}`);
       // A statement that completes was accepted at its high ceilings and rejected at its low ones.
       assert.ok(fellBack > 0, `the lane never fell back: ${q}`);
       if (!q.includes("1000 /")) assert.ok(tried > fellBack, `the lane was never accepted: ${q}`);
       sweepLifetime(s, q, 397n);
     });
+    // The projection lane under a ceiling.
+    for (const q of PROJECTION_QUERIES) {
+      const before = { ...laneCeiling };
+      sweepMaxCost(s, q, file ? 29n : 11n);
+      assert.ok(
+        laneCeiling.attempts > before.attempts,
+        `the projection lane was never attempted: ${q}`,
+      );
+      assert.ok(
+        laneCeiling.fallbacks > before.fallbacks,
+        `the projection lane never fell back: ${q}`,
+      );
+      sweepLifetime(s, q, 397n);
+    }
     // The grouped fold handing over to the spill structures part-way (file only).
     if (file) {
       for (const workMem of [1, 400, 3_000]) {
@@ -161,11 +231,13 @@ function laneUnderACeiling(file: boolean): void {
       }
       s.setWorkMem(DEFAULT_WORK_MEM);
     }
-    // Not safe to discard — entropy, a function call, a correlated subquery, a regex — so never
+    // Not safe to discard — entropy, the per-call clock, a correlated subquery, a regex — so never
     // attempted.
     for (const q of [
       "SELECT count(*), sum(d) FROM ct WHERE uuidv4() IS NOT NULL",
-      "SELECT n, sum(d) FROM ct WHERE abs(n) > 1 GROUP BY n",
+      "SELECT n, sum(d) FROM ct WHERE clock_timestamp() IS NOT NULL GROUP BY n",
+      "SELECT sum(d * 2) FROM ct WHERE s ~ '^v'",
+      "SELECT id, d FROM ct WHERE s ~ '^v'",
       "SELECT count(*) FROM ct WHERE n > (SELECT count(*) FROM ct c WHERE c.id = ct.id)",
       "SELECT count(*) FROM ct WHERE s ~ '^vx+1'",
     ]) {
@@ -218,4 +290,18 @@ test("the lane under a ceiling matches the row path on a larger table", () => {
         sweepMaxCost(s, q, -8n);
     }
   });
+});
+
+// The lane's "volatile" list is the function catalog's (spec/functions/catalog.toml): every function
+// it marks volatile, and nothing else. `gen_random_uuid` is uuidv4's other name.
+test("the volatile scalar functions are the catalog's", () => {
+  const listed = [...VOLATILE_SCALAR_FUNCS].sort();
+  const catalog = [
+    ...new Set(
+      OPERATORS.filter((d) => d.volatility === "volatile" && d.name !== "gen_random_uuid").map(
+        (d) => d.name,
+      ),
+    ),
+  ].sort();
+  assert.deepEqual(listed, catalog);
 });

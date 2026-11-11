@@ -136,6 +136,37 @@ func (t *topKKeeper) push(row storedRow) error {
 	return nil
 }
 
+// offer is push for a caller that reuses its row: it reports whether the heap kept row, and a row it
+// did not keep stays the caller's to overwrite. Charges and the retained set are exactly push's.
+func (t *topKKeeper) offer(row storedRow) (kept bool, err error) {
+	if t.k == 0 {
+		return false, t.push(row)
+	}
+	if t.collated || int64(t.selection.Len()) < t.k {
+		return true, t.push(row)
+	}
+	if err := chargeSortKeys(t.meter, row, t.selection.order); err != nil {
+		return false, err
+	}
+	item := topKItem{row: row, pos: t.nextPos}
+	t.nextPos++
+	// A full heap keeps the newcomer only when it sorts strictly before the root; an equal key loses
+	// to the root's earlier input position.
+	if compareTopKItems(item, t.selection.items[0], t.selection.order, false) >= 0 {
+		return false, nil
+	}
+	if t.charge.active() {
+		// The newcomer is reserved before the evicted row is released (memory.md §6.4).
+		if err := t.charge.reserveDirect(memRowBytes(item.row)); err != nil {
+			return false, err
+		}
+		t.charge.release(memRowBytes(t.selection.items[0].row))
+	}
+	t.selection.items[0] = item
+	heap.Fix(&t.selection, 0)
+	return true, nil
+}
+
 func (t *topKKeeper) finish() []storedRow {
 	items := t.selection.items
 	// compareTopKItems is a total order (pos breaks every tie), so an unstable sort is exact.

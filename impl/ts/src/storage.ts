@@ -444,19 +444,20 @@ export class TableStore {
   ): Steps<{ pages: number; slabs: number }> {
     let slabs = 0;
     if (anySpillableMasked(this.colTypes, mask)) {
-      const iterator = this.scanStepsIter(b, false);
-      try {
-        for (;;) {
-          const item = yield* iterator.nextSteps();
-          if (item.done) break;
-          const [key, row] = item.value;
-          const u = recordScanUnits(this.colTypes, key, row, this.cap, mask);
-          pages += u.pages;
-          slabs += u.decompress;
-        }
-      } finally {
-        if (iterator.returnSteps !== undefined) yield* iterator.returnSteps();
-      }
+      // Each admitted record's large-value units, read off its stored tags by the lanes' walk
+      // (laneScanUnits) rather than off a reconstructed row — the same units.
+      const units = { pages: 0, decompress: 0 };
+      const store = this;
+      yield* this.rows.foldLeavesSteps(
+        b,
+        this.leafSrc(),
+        // biome-ignore lint/correctness/useYield: Reading stored tags needs no effect.
+        function* (n: PNode, first: number, last: number): Steps<void> {
+          for (let i = first; i <= last; i++) store.laneScanUnits(n, i, mask, units);
+        },
+      );
+      pages += units.pages;
+      slabs = units.decompress;
     }
     return { pages, slabs };
   }
@@ -506,6 +507,12 @@ export class TableStore {
     return this.rangeScanWithUnitsSteps(unboundedBound(), mask);
   }
 
+  // laneScanUnits' touched variable-width columns for the mask and column types it last saw (both
+  // are arrays replaced, never edited, so identity is the cache key).
+  private laneUnitMask: boolean[] | null = null;
+  private laneUnitTypes: ColType[] | null = null;
+  private laneUnitCols: number[] = [];
+
   // laneScanUnits adds the large-value scan units (chain pages, decompress slabs) record i of leaf n
   // contributes for the touched columns mask (packed-leaf.md §11 Track A4; cost.md §3): on a Packed leaf
   // read off each touched variable column's stored tag (spanScanUnits), on a Decoded leaf the row path's
@@ -524,8 +531,18 @@ export class TableStore {
       return;
     }
     const span = LANE_SPAN;
-    for (let c = 0; c < this.colTypes.length; c++) {
-      if (!mask[c] || fixedValueWidth(this.colTypes[c]!) !== null) continue;
+    // The touched variable-width columns of this mask, decided once per mask rather than per record.
+    let cols = this.laneUnitCols;
+    if (this.laneUnitMask !== mask || this.laneUnitTypes !== this.colTypes) {
+      cols = [];
+      for (let c = 0; c < this.colTypes.length; c++) {
+        if (mask[c] && fixedValueWidth(this.colTypes[c]!) === null) cols.push(c);
+      }
+      this.laneUnitCols = cols;
+      this.laneUnitMask = mask;
+      this.laneUnitTypes = this.colTypes;
+    }
+    for (const c of cols) {
       if (p.span(i, c, span)) spanScanUnits(p.payload, span.start, span.end, this.cap, units);
     }
   }
@@ -545,8 +562,18 @@ export class TableStore {
   foldScanMaskedSteps(
     b: KeyBound,
     visit: (n: PNode, i: number) => Steps<void>,
+    progress?: { nodes: number },
   ): Steps<{ rowCount: number; nodes: number }> {
-    return this.rows.foldScanSteps(b, this.leafSrc(), visit);
+    return this.rows.foldScanSteps(b, this.leafSrc(), visit, progress);
+  }
+
+  // foldLeavesMaskedSteps is foldScanMaskedSteps a leaf at a time (PMap.foldLeavesSteps).
+  foldLeavesMaskedSteps(
+    b: KeyBound,
+    visitLeaf: (n: PNode, first: number, last: number) => Steps<void>,
+    progress?: { nodes: number },
+  ): Steps<{ rowCount: number; nodes: number }> {
+    return this.rows.foldLeavesSteps(b, this.leafSrc(), visitLeaf, progress);
   }
 
   // isFileBacked reports whether this store has a demand-paging pool — the gate for the Track A2/A3

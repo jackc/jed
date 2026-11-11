@@ -333,26 +333,32 @@ contract, because it decides what a statement reserves:
 - *Shape.* One base table under a full or primary-key-bounded scan; one grouping
   set that is either `()` (whole-table) or a single bare integer column, with no
   expression keys and no `GROUPING()`; every aggregate one of `count(*)`, `count`,
-  `sum`, `avg`, `min`, `max` over a bare column (`sum`/`avg` over an integer, decimal,
-  or float), with no `DISTINCT`, `FILTER`, or in-aggregate `ORDER BY`; no `HAVING`,
-  window, or `DISTINCT`.
-- *Unbounded form* (§6.2): the shape above with no `ORDER BY`, when the statement is
-  not eligible for the bounded-spill lane (an in-memory database, `work_mem = 0`),
-  or is whole-table on a file-backed table.
+  `sum`, `avg`, `min`, `max` (`sum`/`avg` over an integer, decimal, or float) over a
+  bare column or over an expression on the safe-to-discard allowlist
+  ([cost.md](cost.md) §6.1), with no `DISTINCT`, `FILTER`, or in-aggregate `ORDER BY`;
+  no `HAVING`, window, or `DISTINCT`. An `ORDER BY` over the result is part of the
+  shape in every form.
+- *Unbounded form* (§6.2): the shape above when the statement is not eligible for the
+  bounded-spill lane (an in-memory database, `work_mem = 0`), or is whole-table on a
+  file-backed table. An `ORDER BY` sorts its group rows as the eager aggregate lane
+  does: each order-expression value is appended to its group row and admitted, then
+  the buffer is sorted in place.
 - *Bounded form* (§6.6.1): the grouped shape over a file-backed table when the
   statement is eligible for the bounded-spill lane, with or without an `ORDER BY`.
 - Anything else, and every shape while `EXPLAIN ANALYZE` profiles it, takes the eager
   or bounded-spill lane.
-- Under a cost ceiling or lifetime budget the lane is an attempt that the row path
-  may replace ([cost.md](cost.md) §6.1): an accepted attempt keeps the lane's
-  reservations; a rejected one returns them all before the row path makes its own.
+- Under a cost ceiling or lifetime budget — and, for a run that folds an expression
+  operand, always — the lane is an attempt that the row path may replace
+  ([cost.md](cost.md) §6.1): an accepted attempt keeps the lane's reservations; a
+  rejected one returns them all before the row path makes its own. An attempt also
+  requires its `WHERE` and `ORDER BY` expressions to be on the allowlist; a statement
+  that is not keeps the row path.
+- The **columnar projection lane** (§6.5) runs under a cost ceiling by the same
+  attempt rule; with no ceiling it runs as before.
 
-**Open: cancellation in the TS core.** The TS core keeps the row path for every
-columnar lane whenever a cancellation check is installed, so that a worker's flag is
-observed at the row checkpoints; the Rust and Go cores poll inside the lanes instead.
-That is a lane choice the cores do not share, so with a query-memory budget and a
-cancellation check both present the TS core's thresholds differ. It predates the
-rules above and is not covered by the conformance harness, which installs no check.
+A cancellation check does not change the lane: every core takes the same lanes with one
+installed and polls it inside them, at least every 256 records (the TS core used to keep
+the row path instead).
 
 Q1 bounds row-buffer amplification — cross joins, set-returning functions,
 recursive CTE output, wide projections of large values, and materialized

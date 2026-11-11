@@ -5754,13 +5754,26 @@ export function decodeLeafNode(
   // value the static touched set missed self-resolves at the evaluator's column access — the B4
   // demand-fault backstop (bplus-reshape.md §5).
   const tyrefs: TypeRef[] = colTypes.map((_, c) => ({ cols: colTypes, idx: c }));
+  const fixed: boolean[] = colTypes.map((ty) => fixedValueWidth(ty) !== null);
   const col = (i: number, c: number): Value => {
     if (paxIsNull(payload, dirs, c, i)) return nullValue();
     const ty = colTypes[c]!;
     const cur = { pos: paxValueOff(payload, dirs, c, i) };
-    return fixedValueWidth(ty) !== null
+    return fixed[c]
       ? readInlineBody(ty, payload, cur, "construct")
       : readValueLazy(tyrefs[c]!, payload, cur, paging, tagLen);
+  };
+  // The same value col + resolve produce for an inline body (readValueLazy defers the body's span
+  // and resolveUnfetched re-runs this very decoder over it), without the deferred handle.
+  const colNow = (i: number, c: number): Value | undefined => {
+    if (paxIsNull(payload, dirs, c, i)) return nullValue();
+    const ty = colTypes[c]!;
+    const cur = { pos: paxValueOff(payload, dirs, c, i) };
+    if (!fixed[c]) {
+      if (payload[cur.pos] !== 0x00) return undefined;
+      cur.pos++;
+    }
+    return readInlineBody(ty, payload, cur, "construct");
   };
   const packed: PackedLeaf = {
     n,
@@ -5787,6 +5800,7 @@ export function decodeLeafNode(
       return size;
     },
     col,
+    colNow,
     row(i: number): Row {
       const row: Row = new Array(colTypes.length);
       for (let c = 0; c < colTypes.length; c++) row[c] = col(i, c);
@@ -6755,14 +6769,16 @@ function decodeDecimalBody(buf: Uint8Array, cur: Cursor, mode: DecodeMode): Valu
   const flags = readU8(buf, cur);
   const scale = readU16(buf, cur);
   const ndigits = readU16(buf, cur);
-  const groups: number[] | null = mode === "construct" ? new Array(ndigits) : null;
+  // The stored groups are most-significant first and the limbs least-significant first: read each
+  // group straight into its limb slot (Decimal.fromCodec's result, without the reversed copy).
+  const limbs: number[] | null = mode === "construct" ? new Array(ndigits) : null;
   for (let i = 0; i < ndigits; i++) {
     const g = readU16(buf, cur); // advance in both modes
     if (g > 9999) throw engineError("data_corrupted", "decimal digit group out of range");
-    if (groups) groups[i] = g;
+    if (limbs) limbs[ndigits - 1 - i] = g;
   }
-  if (!groups) return nullValue(); // skip-mode placeholder (no Decimal built)
-  return decimalValue(Decimal.fromCodec((flags & 1) !== 0, scale, groups));
+  if (!limbs) return nullValue(); // skip-mode placeholder (no Decimal built)
+  return decimalValue(Decimal.fromLimbs((flags & 1) !== 0, scale, limbs));
 }
 
 // readOverflowChain gathers `length` bytes of an external value's payload by following its overflow

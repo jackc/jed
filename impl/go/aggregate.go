@@ -558,28 +558,13 @@ func (a *acc) fold(v Value, m *costMeter) error {
 		}
 	case planSumDecimal:
 		if !v.IsNull() {
-			in := toDecimal(v)
-			m.Charge(costs.DecimalWork * (workLinear(a.sumDec, in) - 1))
-			if err := m.Step(); err != nil {
-				return err
-			}
-			// Uncapped: the running sum may exceed the §2 format cap mid-fold; only the FINAL
-			// result is cap-checked (in finalize), matching PG and making the trap
-			// order-independent (spec/design/decimal.md §2, determinism.md §7).
-			a.sumDec = a.sumDec.AddUncapped(in)
-			a.seen = true
+			var buf [3]uint32
+			return a.addDecimal(foldDecimal(v, &buf), m)
 		}
 	case planAvg:
 		if !v.IsNull() {
-			in := toDecimal(v)
-			m.Charge(costs.DecimalWork * (workLinear(a.sumDec, in) - 1))
-			if err := m.Step(); err != nil {
-				return err
-			}
-			// Uncapped (as planSumDecimal): the average's final divide brings the value back in
-			// range, so AVG never traps on an over-cap intermediate sum the way PG does not.
-			a.sumDec = a.sumDec.AddUncapped(in)
-			a.count++
+			var buf [3]uint32
+			return a.addDecimal(foldDecimal(v, &buf), m)
 		}
 	case planSumFloat32, planSumFloat64, planAvgFloat32, planAvgFloat64:
 		// Float SUM/AVG fold into the streaming running total in scan order; NULLs are skipped. The
@@ -2516,4 +2501,31 @@ func writeJSONObjectAggPair(b *strings.Builder, i int, key string, v Value) {
 // isJSONAggPlan reports whether plan is a json[b]_agg[_strict] array aggregate.
 func isJSONAggPlan(plan aggPlan) bool {
 	return plan == planJsonbAgg || plan == planJsonAgg || plan == planJsonbAggStrict || plan == planJsonAggStrict
+}
+
+// foldDecimal is toDecimal for a fold's operand: an integer widens into buf rather than a fresh
+// allocation, since the accumulator reads the operand and keeps only its own new sum.
+func foldDecimal(v Value, buf *[3]uint32) Decimal {
+	if v.Kind == ValDecimal {
+		return *v.decimal()
+	}
+	return decimalFromInt64Buf(v.Int, buf)
+}
+
+// addDecimal folds one non-NULL input into a decimal SUM or AVG accumulator. The sum is uncapped:
+// it may exceed the §2 format cap mid-fold, and only the FINAL result is cap-checked (in finalize) —
+// matching PG and making the trap order-independent (spec/design/decimal.md §2, determinism.md §7);
+// an average's final divide brings the value back in range. in is read, never kept.
+func (a *acc) addDecimal(in Decimal, m *costMeter) error {
+	m.Charge(costs.DecimalWork * (workLinear(a.sumDec, in) - 1))
+	if err := m.Step(); err != nil {
+		return err
+	}
+	a.sumDec = a.sumDec.AddUncapped(in)
+	if a.plan == planAvg {
+		a.count++
+	} else {
+		a.seen = true
+	}
+	return nil
 }

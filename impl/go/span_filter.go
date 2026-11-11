@@ -26,9 +26,6 @@ type scratchRow struct {
 	vals       storedRow
 	stamp      []uint64
 	generation uint64
-	// allFilled is the record generation whose every touched column a plain filter filled (the
-	// columns may still hold deferred values — the evaluator resolves those on touch).
-	allFilled uint64
 }
 
 func newScratchRow(width int) *scratchRow {
@@ -44,14 +41,9 @@ func (s *scratchRow) ensure(n *pnode, i, c int) error {
 	if s.stamp[c] == s.generation {
 		return nil
 	}
-	v, err := n.colAt(i, c)
+	v, err := n.colAtResolved(i, c)
 	if err != nil {
 		return err
-	}
-	if v.Kind == ValUnfetched {
-		if v, err = resolveUnfetchedSelf(v.unfetched()); err != nil {
-			return err
-		}
 	}
 	s.vals[c] = v
 	s.stamp[c] = s.generation
@@ -62,12 +54,6 @@ func (s *scratchRow) ensure(n *pnode, i, c int) error {
 // else read straight from the leaf (not stored). Callers use it only for a variable-width column read
 // beside a predicate — where reusing the predicate's decode pays — and readLeafColumn otherwise.
 func (s *scratchRow) read(n *pnode, i, c int) (Value, error) {
-	if s.allFilled == s.generation {
-		if v := s.vals[c]; v.Kind == ValUnfetched {
-			return resolveUnfetchedSelf(v.unfetched())
-		}
-		return s.vals[c], nil
-	}
 	if s.stamp[c] == s.generation {
 		return s.vals[c], nil
 	}
@@ -76,11 +62,7 @@ func (s *scratchRow) read(n *pnode, i, c int) (Value, error) {
 
 // readLeafColumn returns record i's column c read straight from the leaf, a deferred value resolved.
 func readLeafColumn(n *pnode, i, c int) (Value, error) {
-	v, err := n.colAt(i, c)
-	if err != nil || v.Kind != ValUnfetched {
-		return v, err
-	}
-	return resolveUnfetchedSelf(v.unfetched())
+	return n.colAtResolved(i, c)
 }
 
 // laneReuse reports, per column, whether a lane should reuse the value its filter resolved (a
@@ -96,28 +78,29 @@ func laneReuse(colTypes []colType, filtered bool) []bool {
 }
 
 // laneFilter is a lane's compiled WHERE: the span evaluator when the predicate has at least one span
-// atom, else the original lane filter — every touched column read into the scratch row (a deferred
-// value resolves when the evaluator touches it), then rExpr.evalFilter — which is cheaper for a
-// predicate the span compiler cannot help with.
+// atom, else the original lane filter — the predicate's own columns resolved into the scratch row,
+// then rExpr.evalFilter — which is cheaper for a predicate the span compiler cannot help with. cols is
+// the predicate's own collectTouched set: a touched column only something else reads (an aggregate
+// operand, a projected column) is left to that reader, which reads it for survivors alone. The fill
+// resolves every value it reads, as the row path's resolveColumns does for the touched set (an
+// unmetered fetch, so cost is unchanged) — so a correlated subquery, which takes the scratch row as
+// its outer row and whose key/index bound encodes an outer value directly, never sees a deferred one
+// (its outer reads are in cols: collectTouched follows correlated references).
 type laneFilter struct {
 	span  *spanPred
 	plain *rExpr
 	cols  []int
-	// resolve: the plain filter holds a correlated subquery, which reads the scratch row as its
-	// outer row — and an outer row's values reach consumers that bypass the evaluator's
-	// resolve-on-touch backstop (a correlated key/index bound encodes the outer value directly). So
-	// the fill resolves deferred values, as the row path's resolveColumns does for the same touched
-	// set (an unmetered fetch, so cost is unchanged).
-	resolve bool
 }
 
 func compileLaneFilter(filter *rExpr, colTypes []colType, mask []bool, env *evalEnv) *laneFilter {
 	if p := compileSpanPred(filter, colTypes, mask, env); p.hasAtom() {
 		return &laneFilter{span: p}
 	}
-	f := &laneFilter{plain: filter, resolve: hasCorrelatedSubquery(filter)}
+	f := &laneFilter{plain: filter}
+	reads := make([]bool, len(mask))
+	collectTouched(filter, 0, reads)
 	for c := range mask {
-		if mask[c] {
+		if mask[c] && reads[c] {
 			f.cols = append(f.cols, c)
 		}
 	}
@@ -131,18 +114,10 @@ func (f *laneFilter) keep(n *pnode, i int, scratch *scratchRow, env *evalEnv, m 
 		return f.span.evalFilter(n, i, scratch, env, m)
 	}
 	for _, c := range f.cols {
-		v, err := n.colAt(i, c)
-		if err != nil {
+		if err := scratch.ensure(n, i, c); err != nil {
 			return false, err
 		}
-		if f.resolve && v.Kind == ValUnfetched {
-			if v, err = resolveUnfetchedSelf(v.unfetched()); err != nil {
-				return false, err
-			}
-		}
-		scratch.vals[c] = v
 	}
-	scratch.allFilled = scratch.generation
 	return f.plain.evalFilter(scratch.vals, env, m)
 }
 

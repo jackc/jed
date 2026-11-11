@@ -750,6 +750,79 @@ var ceilingQueries = []string{
 	"SELECT * FROM (SELECT n, sum(d) AS t FROM ct GROUP BY n) g WHERE t IS NOT NULL",
 	// An uncorrelated scalar subquery is folded to a constant before the lane runs.
 	"SELECT count(*), sum(d) FROM ct WHERE n > (SELECT 1)",
+	// Built-in function calls the catalog does not mark volatile.
+	"SELECT n, sum(d) FROM ct WHERE abs(n) > 1 GROUP BY n",
+	"SELECT count(*), sum(d) FROM ct WHERE abs(n) > 1 AND lower(s) <> 'v' AND length(s) < 40",
+	// Expression operands: a run that folds one is always an attempt.
+	"SELECT sum(d * 2), count(big + 1), max(big % 7) FROM ct",
+	"SELECT n, sum(d + id), min(abs(d)) FROM ct WHERE n > 0 GROUP BY n ORDER BY n",
+	// An operand that raises at row 100 and a filter that raises at row 250: the row path filters
+	// every row before it folds any, so the filter's error is the one it reports.
+	"SELECT sum(1000 / (id - 100)) FROM ct WHERE 1000 / (id - 250) <> 7",
+	"SELECT n, sum(1000 / (id - 100)) FROM ct GROUP BY n",
+}
+
+// Bare-column projections: the columnar projection lane, an attempt under a ceiling.
+var projectionQueries = []string{
+	"SELECT id, d, s FROM ct",
+	"SELECT id, s FROM ct WHERE n > 1 AND d <> 0",
+	"SELECT d, big FROM ct WHERE id BETWEEN 40 AND 200 AND abs(n) < 3",
+	"SELECT id, d FROM ct WHERE 1000 / (id - 200) > 0",
+}
+
+// Statements whose filter is outside the allowlist, so they run on the plain lane with no ceiling
+// and keep the row path under one — each failing part-way through its scan.
+var plainLaneFailures = []string{
+	"SELECT count(*), sum(d) FROM ct WHERE s ~ '^v' AND 1000 / (id - 200) > 0",
+	"SELECT n, max(s), sum(d) FROM ct WHERE uuidv4() IS NOT NULL AND 1000 / (id - 77) > 0 GROUP BY n",
+	"SELECT id, s FROM ct WHERE s ~ '^v' AND 1000 / (id - 200) > 0",
+}
+
+// laneUnmeteredMatchesRowPath: with no ceiling, the lane (plain, or an attempt for an expression
+// operand) against the row path — the same statement under a ceiling it never reaches with the
+// attempt off, which accrues exactly what the unmetered row path does. Rows and cost, or the error
+// and what it left accrued.
+func laneUnmeteredMatchesRowPath(t *testing.T, s *Session, sql string) {
+	t.Helper()
+	tools := s.engine.session.lane
+	s.SetMaxCost(0)
+	lane, laneSpent := laneMeteredOutcome(s, sql)
+	s.SetMaxCost(1 << 60)
+	tools.ceilingOff = true
+	row, rowSpent := laneMeteredOutcome(s, sql)
+	tools.ceilingOff = false
+	s.SetMaxCost(0)
+	if lane != row || laneSpent != rowSpent {
+		t.Fatalf("unmetered lane vs row path: %q:\n lane     (spent %d) %s\n row path (spent %d) %s", sql, laneSpent, lane, rowSpent, row)
+	}
+}
+
+// cost.md §6.2: a statement that fails on a lane leaves the cumulative cost the row path leaves, and
+// an expression-operand lane reports the error the row path reports.
+func unmeteredLaneMatchesRowPath(t *testing.T, file string) {
+	s := laneSession(t, file, ctSeed)
+	workMems := []int{defaultWorkMem}
+	if file != "" {
+		workMems = []int{1, 400, defaultWorkMem}
+	}
+	for _, workMem := range workMems {
+		s.SetWorkMem(workMem)
+		for _, list := range [][]string{ceilingQueries, projectionQueries, plainLaneFailures} {
+			for _, q := range list {
+				laneUnmeteredMatchesRowPath(t, s, q)
+			}
+		}
+	}
+}
+
+func TestUnmeteredLaneMatchesRowPathOnAFile(t *testing.T) {
+	t.Parallel()
+	unmeteredLaneMatchesRowPath(t, "unmetered_lanes.jed")
+}
+
+func TestUnmeteredLaneMatchesRowPathInMemory(t *testing.T) {
+	t.Parallel()
+	unmeteredLaneMatchesRowPath(t, "")
 }
 
 func laneUnderACeilingMatchesRowPath(t *testing.T, file string) {
@@ -768,13 +841,6 @@ func laneUnderACeilingMatchesRowPath(t *testing.T, file string) {
 		before := attempts()
 		laneSweepMaxCost(t, s, q, step)
 		after := attempts()
-		// In memory an ordered grouping does not take the lane at all (packed-leaf.md §11 Track A5).
-		if file == "" && strings.Contains(q, "ORDER BY") {
-			if after != before {
-				t.Fatalf("attempted in memory: %q", q)
-			}
-			continue
-		}
 		if after[0] == before[0] {
 			t.Fatalf("the lane was never attempted: %q", q)
 		}
@@ -784,6 +850,24 @@ func laneUnderACeilingMatchesRowPath(t *testing.T, file string) {
 		}
 		if !strings.Contains(q, "1000 /") && after[0]-before[0] <= after[1]-before[1] {
 			t.Fatalf("the lane was never accepted: %q", q)
+		}
+		laneSweepLifetime(t, s, q, 41)
+	}
+	// The projection lane under a ceiling: every ceiling for the first on a file, every eleventh for
+	// the rest (the boundary always included — the emission guard matters only there).
+	for qi, q := range projectionQueries {
+		step := int64(11)
+		if file != "" && qi == 0 {
+			step = 1
+		}
+		before := attempts()
+		laneSweepMaxCost(t, s, q, step)
+		after := attempts()
+		if after[0] == before[0] {
+			t.Fatalf("the projection lane was never attempted: %q", q)
+		}
+		if after[1] == before[1] {
+			t.Fatalf("the projection lane never fell back: %q", q)
 		}
 		laneSweepLifetime(t, s, q, 41)
 	}
@@ -799,13 +883,15 @@ func laneUnderACeilingMatchesRowPath(t *testing.T, file string) {
 		}
 		s.SetWorkMem(defaultWorkMem)
 	}
-	// Not safe to discard — entropy, a function call, a correlated subquery, a regex — so never
+	// Not safe to discard — entropy, the per-call clock, a correlated subquery, a regex — so never
 	// attempted.
 	for _, q := range []string{
 		"SELECT count(*), sum(d) FROM ct WHERE uuidv4() IS NOT NULL",
-		"SELECT n, sum(d) FROM ct WHERE abs(n) > 1 GROUP BY n",
+		"SELECT n, sum(d) FROM ct WHERE clock_timestamp() IS NOT NULL GROUP BY n",
 		"SELECT count(*) FROM ct WHERE n > (SELECT count(*) FROM ct c WHERE c.id = ct.id)",
 		"SELECT count(*) FROM ct WHERE s ~ '^vx+1'",
+		"SELECT sum(d * 2) FROM ct WHERE s ~ '^v'",
+		"SELECT id, d FROM ct WHERE s ~ '^v'",
 	} {
 		before := attempts()
 		laneSweepMaxCost(t, s, q, 97)
@@ -889,7 +975,13 @@ func TestDecimalFoldsOnTheRowBasedKernelMatchRowPath(t *testing.T) {
 		}
 		return fmt.Sprintf("cost %d\n%s", out.Cost, laneRows(out, sql))
 	}
-	for _, q := range decimalFoldQueries {
+	// Expression operands and an ORDER BY over the groups, on the same kernel.
+	rowKernelQueries := append(append([]string(nil), decimalFoldQueries...),
+		"SELECT sum(d * 2), count(id + 1), max(id % 7) FROM dt",
+		"SELECT n, sum(d + id), min(abs(d)) FROM dt GROUP BY n",
+		"SELECT n, sum(d + id), count(*) FROM dt WHERE id > 0 GROUP BY n ORDER BY sum(d) DESC NULLS LAST, n",
+		"SELECT n, count(*) FROM dt GROUP BY n ORDER BY n LIMIT 3 OFFSET 1")
+	for _, q := range rowKernelQueries {
 		db.SetMaxCost(0)
 		lane := run(q)
 		db.SetMaxCost(1 << 60)

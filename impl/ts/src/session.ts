@@ -11,6 +11,7 @@ import {
   DEFAULT_MAX_TEMP_STORAGE_BYTES,
   DEFAULT_TEMP_BUFFERS,
   type Engine,
+  discardSafe,
   distinctRowKey,
   exprCallsHostFunction,
   finalizeAcc,
@@ -26,7 +27,12 @@ import type { Acc, AggSpec, EvalEnv, ResolvedFrame, SelectPlan } from "./executo
 import type { Value } from "./value.ts";
 import type { Row } from "./storage.ts";
 import { nullValue } from "./value.ts";
-import { evalExpressionsMaybeSteps, evalFilterMaybeSteps, isPendingEval } from "./eval.ts";
+import {
+  evalExpressionsMaybeSteps,
+  evalExprMaybeSteps,
+  evalFilterMaybeSteps,
+  isPendingEval,
+} from "./eval.ts";
 import {
   COOPERATE,
   runSync,
@@ -535,15 +541,17 @@ export function vectorizedSpecEligible(spec: AggSpec): boolean {
     case "avgFloat":
     case "min":
     case "max":
-      return spec.operand !== null && spec.operand.kind === "column";
+      // A bare column, or an expression operand (memory.md §5.4): evaluated per survivor, and safe
+      // to discard so a run that raises can be replaced by the row path (cost.md §6.1).
+      return spec.operand !== null && (spec.operand.kind === "column" || discardSafe(spec.operand));
     default:
       return false;
   }
 }
 
 // operandCol is the bare-column ordinal an eligible aggregate reads (its operand `{kind:"column"}`), or
-// null for COUNT(*) (which folds no value). Eligibility (vectorizedSpecEligible) guarantees the operand
-// is either absent or a bare column, so this is total over an eligible spec.
+// null for COUNT(*) (which folds no value) and for an expression operand, which its reader
+// evaluates instead.
 export function operandCol(spec: AggSpec): number | null {
   return spec.operand !== null && spec.operand.kind === "column" ? spec.operand.index : null;
 }
@@ -553,6 +561,8 @@ export function operandCol(spec: AggSpec): number | null {
 // selection vector). `at(j, col)` reads survivor j's value in column col, so the fold kernels below are
 // written once and run either way. Cost is unaffected: both feed the same values in scan order.
 export type LaneAt = (j: number, col: number) => Value;
+// LaneRowAt is survivor j's whole row — what an expression operand is evaluated over.
+export type LaneRowAt = (j: number) => Row;
 
 // foldAggWhole folds one WHOLE-TABLE grand-total group over `nsurv` survivors from `at`, returning the
 // finalized aggregate results [agg0, …] (the synthetic row for a () group — no key columns). It builds
@@ -567,8 +577,10 @@ export function foldAggWhole(...args: Parameters<typeof foldAggWholeSteps>): Val
 export function* foldAggWholeSteps(
   specs: AggSpec[],
   at: LaneAt,
+  rowAt: LaneRowAt,
   nsurv: number,
   zone: ZoneRef,
+  env: EvalEnv,
   meter: Meter,
 ): Steps<Value[]> {
   const accs = specs.map((s) => newAccFromSpec(s, zone));
@@ -580,9 +592,22 @@ export function* foldAggWholeSteps(
       const spec = specs[si]!;
       meter.charge(COSTS.aggregateAccumulate * BigInt(nsurv));
       const oc = operandCol(spec);
+      // An expression operand is evaluated over the survivor's row (charging its operators, as the
+      // row path does per survivor).
+      const expr = oc === null ? spec.operand : null;
       for (let j = 0; j < nsurv; j++) {
+        // Cancellation and the ceilings, at most every 256 records (the Rust core's cadence).
+        if ((j & 255) === 0) meter.guard();
         if (shouldCooperate()) yield COOPERATE;
-        foldAcc(accs[si]!, oc === null ? nullValue() : at(j, oc), meter);
+        let v: Value;
+        if (oc !== null) v = at(j, oc);
+        else if (expr === null)
+          v = nullValue(); // COUNT(*) folds no value
+        else {
+          const r = evalExprMaybeSteps(expr, rowAt(j), env, meter);
+          v = isPendingEval(r) ? yield* r : r;
+        }
+        foldAcc(accs[si]!, v, meter);
       }
     }
     return accs.map((a) => finalizeAcc(a));
@@ -607,13 +632,16 @@ export function* groupByIntKeySteps(
   specs: AggSpec[],
   keyCol: number,
   at: LaneAt,
+  rowAt: LaneRowAt,
   nsurv: number,
   zone: ZoneRef,
+  env: EvalEnv,
   meter: Meter,
 ): Steps<Value[][]> {
   const groups: { key: Value; accs: Acc[] }[] = [];
   const index = new Map<bigint, number>();
   let nullGi = -1;
+  const opCols = specs.map((spec) => operandCol(spec));
   // The group table's entries (memory.md §6.2): all groups are finalized before any group row is
   // admitted, so the whole table is returned after the last finalize.
   const charge = meter.stateCharge();
@@ -621,6 +649,7 @@ export function* groupByIntKeySteps(
   try {
     meter.charge(COSTS.aggregateAccumulate * BigInt(nsurv) * BigInt(specs.length));
     for (let j = 0; j < nsurv; j++) {
+      if ((j & 255) === 0) meter.guard();
       if (shouldCooperate()) yield COOPERATE;
       const kv = at(j, keyCol);
       let gi: number;
@@ -645,10 +674,21 @@ export function* groupByIntKeySteps(
         gi = nullGi;
       }
       const accs = groups[gi]!.accs;
-      specs.forEach((spec, si) => {
-        const oc = operandCol(spec);
-        foldAcc(accs[si]!, oc === null ? nullValue() : at(j, oc), meter);
-      });
+      for (let si = 0; si < specs.length; si++) {
+        const oc = opCols[si]!;
+        let v: Value;
+        if (oc !== null) v = at(j, oc);
+        else {
+          const expr = specs[si]!.operand;
+          if (expr === null)
+            v = nullValue(); // COUNT(*) folds no value
+          else {
+            const r = evalExprMaybeSteps(expr, rowAt(j), env, meter);
+            v = isPendingEval(r) ? yield* r : r;
+          }
+        }
+        foldAcc(accs[si]!, v, meter);
+      }
     }
 
     const out: Value[][] = [];
@@ -882,6 +922,10 @@ function* bufferedRowsSequence(
         if (shouldCooperate()) yield COOPERATE;
         meter.guard(); // enforce the cost ceiling / cancellation per produced row (CLAUDE.md §13)
         meter.charge(COSTS.rowProduced);
+        // The row path evaluates each bare-column projection here, whose evaluator entry guards the
+        // ceiling after the row's charge; this emission must stop at the same row (cost.md §6.1). A
+        // no-op with no ceiling.
+        meter.guard();
         yield { kind: "item", value: projCols.map((c) => cols[c]![j]!) };
       }
     } finally {

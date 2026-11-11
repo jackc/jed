@@ -20,7 +20,7 @@
 //     partial cost counts automatically and the cumulative is session state that survives a
 //     transaction rollback.
 
-import { cancellationCheckpoint, hasCancellation } from "./cancel.ts";
+import { cancellationCheckpoint } from "./cancel.ts";
 import { DEFAULT_SCALAR_BYTES } from "./costs.ts";
 import { EngineError, engineError } from "./errors.ts";
 import { rowBytes, rowBytesMasked, valueBytes } from "./memsize.ts";
@@ -400,6 +400,14 @@ export class Meter {
     }
   }
 
+  // refund takes back `units` a lane charged for work the row path would not yet have done when it
+  // raised the same error (cost.md §6.2): the statement and session totals both give them up. Only
+  // for an unmetered statement, where no ceiling has been crossed.
+  refund(units: bigint): void {
+    this.accrued -= units;
+    if (this.lifetime !== undefined) this.lifetime.total -= units;
+  }
+
   // pendingTrips reports whether `pending` cost a lane has earned but not yet charged would trip a
   // ceiling (cost.md §6.1): the lane stops its attempt there, within one batch of the ceiling.
   pendingTrips(pending: bigint): boolean {
@@ -429,14 +437,10 @@ export class Meter {
   // reproduces the row path's exact total only when there is nothing to abort against. Under a
   // ceiling the projection lane keeps the row path, and the aggregate lane runs as an attempt the row
   // path may replace (cost.md §6.1), so the deterministic 54P01/54P02 abort is unchanged.
-  // Cancellation also keeps the row path so a worker flag is observed at the existing row
-  // checkpoints; polling never adds logical cost.
+  // A cancellation check does not change the lane (memory.md §5.4 — the choice is the other cores'):
+  // the lanes poll it themselves at least every 256 records, and polling never adds logical cost.
   isUnmetered(): boolean {
-    return (
-      !hasCancellation() &&
-      this.limit <= 0n &&
-      (this.lifetime === undefined || this.lifetime.limit <= 0n)
-    );
+    return this.limit <= 0n && (this.lifetime === undefined || this.lifetime.limit <= 0n);
   }
 
   // guard enforces the ceilings: it throws if the per-statement maxCost (54P01) OR the session

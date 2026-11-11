@@ -26,6 +26,7 @@ package jed
 
 import (
 	"bytes"
+	"encoding/binary"
 	"sort"
 	"sync/atomic"
 )
@@ -107,6 +108,62 @@ func (n *pnode) colAt(i, c int) (Value, error) {
 	return n.packed.value(c, i)
 }
 
+// colAtResolved is colAt with a deferred value resolved — for a reader that uses the value now. A
+// Packed leaf decodes an inline body straight from its page (packedLeaf.valueResolved); a Decoded
+// leaf resolves a held deferred value.
+func (n *pnode) colAtResolved(i, c int) (Value, error) {
+	if n.packed != nil {
+		return n.packed.valueResolved(c, i)
+	}
+	v := n.vals[i][c]
+	if v.Kind == ValUnfetched {
+		return resolveUnfetchedSelf(v.unfetched())
+	}
+	return v, nil
+}
+
+// smallDecimalAt reads decimal column c of record i straight from a Packed leaf's page into buf —
+// no Value and no allocation — when the stored value is an inline body of at most four digit groups
+// (below 10^16). ok is false for anything else (a Decoded leaf, a longer, out-of-line, compressed,
+// or malformed value), which the caller reads the ordinary way, so errors are reported as before.
+// The returned Decimal's limbs are buf: it is valid until buf is reused.
+func (n *pnode) smallDecimalAt(i, c int, buf *[2]uint32) (d Decimal, null, ok bool) {
+	p := n.packed
+	if p == nil {
+		return d, false, false
+	}
+	if p.dirs.isNull(c, i) {
+		return d, true, true
+	}
+	vb, err := p.dirs.value(c, i)
+	if err != nil || len(vb) < 6 || vb[0] != 0x00 {
+		return d, false, false
+	}
+	groups := int(binary.BigEndian.Uint16(vb[4:]))
+	if groups > 4 || len(vb) < 6+2*groups {
+		return d, false, false
+	}
+	var v uint64
+	for k := 0; k < groups; k++ {
+		g := binary.BigEndian.Uint16(vb[6+2*k:])
+		if g > 9999 {
+			return d, false, false
+		}
+		v = v*10_000 + uint64(g)
+	}
+	d.Scale = uint32(binary.BigEndian.Uint16(vb[2:]))
+	switch {
+	case v == 0:
+	case v < decBase:
+		buf[0] = uint32(v)
+		d.Neg, d.Limbs = vb[1]&1 != 0, buf[:1:1]
+	default:
+		buf[0], buf[1] = uint32(v%decBase), uint32(v/decBase)
+		d.Neg, d.Limbs = vb[1]&1 != 0, buf[:2:2]
+	}
+	return d, false, true
+}
+
 // colIsNull reports whether column c of row i is NULL without reconstructing the value
 // (packed-leaf.md §11 Track A4): the PAX null bitmap / zero-length span on a Packed leaf. A deferred
 // large value is never NULL.
@@ -144,6 +201,34 @@ func (n *pnode) recordScanUnits(i int, colTypes []colType, capacity pageCap, mas
 			continue
 		}
 		if span, present := n.packed.valueSpan(c, i); present {
+			spanScanUnits(span, capacity, &pages, &decompress)
+		}
+	}
+	return pages, decompress
+}
+
+// spillUnitCols is the columns recordScanUnits visits for mask — the touched variable-width ones —
+// decided once per scan for recordScanUnitsCols.
+func spillUnitCols(colTypes []colType, mask []bool) []int {
+	var cols []int
+	for c, ty := range colTypes {
+		if !mask[c] {
+			continue
+		}
+		if _, fixed := fixedValueWidth(ty); !fixed {
+			cols = append(cols, c)
+		}
+	}
+	return cols
+}
+
+// recordScanUnitsCols is recordScanUnits over cols, the scan's spillUnitCols(colTypes, mask).
+func (n *pnode) recordScanUnitsCols(i int, cols []int, colTypes []colType, capacity pageCap, mask []bool) (pages, decompress int) {
+	if n.packed == nil {
+		return recordScanUnits(colTypes, n.keyAt(i), n.vals[i], capacity, mask)
+	}
+	for _, c := range cols {
+		if span, present := n.packed.valueSpan(c, i); present && len(span) > 0 && span[0] != 0x00 {
 			spanScanUnits(span, capacity, &pages, &decompress)
 		}
 	}
@@ -883,6 +968,9 @@ func (m *pMap) rangeEntriesCounted(b keyBound, src leafSource) ([][]byte, []stor
 // does and returns (rowCount, nodeCount), so the caller charges the identical page_read /
 // storage_row_read. Errors preserve the partial counts for cancellation accounting.
 func (m *pMap) foldScan(b keyBound, src leafSource, visit func(n *pnode, i int) error) (rowCount, nodes int, err error) {
+	// The same read-ahead hints as scanRange, so a page client fetches a lane's leaves in batches
+	// (page-service.md §5.3).
+	ahead := &leafReadAhead{window: 1}
 	var walk func(n *pnode) error
 	walk = func(n *pnode) error {
 		nodes++
@@ -897,7 +985,13 @@ func (m *pMap) foldScan(b keyBound, src leafSource, visit func(n *pnode, i int) 
 			return nil
 		}
 		cf, cl := b.childWindow(n)
+		hinted := 0
 		for i := cf; i <= cl; i++ {
+			if hinted == 0 {
+				from := i
+				hinted = ahead.hint(n, func(k int) (int, bool) { return from + k, from+k <= cl }, src)
+			}
+			hinted--
 			child, e := resolveChild(n.children[i], src)
 			if e != nil {
 				return e

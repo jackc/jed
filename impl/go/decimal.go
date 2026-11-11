@@ -2,6 +2,7 @@ package jed
 
 import (
 	"math"
+	"math/bits"
 	"strconv"
 	"strings"
 )
@@ -205,17 +206,25 @@ func (d Decimal) CmpValue(o Decimal) int {
 		}
 		return 1
 	}
+	m, ok := cmpSmall(d, o)
+	if !ok {
+		m = d.cmpMagLimbs(o)
+	}
+	if d.Neg {
+		return -m
+	}
+	return m
+}
+
+// cmpMagLimbs compares the two magnitudes at their common scale — the limb path of CmpValue.
+func (d Decimal) cmpMagLimbs(o Decimal) int {
 	s := d.Scale
 	if o.Scale > s {
 		s = o.Scale
 	}
 	a := magMulPow10(d.Limbs, s-d.Scale)
 	b := magMulPow10(o.Limbs, s-o.Scale)
-	m := magCmp(a, b)
-	if d.Neg {
-		return -m
-	}
-	return m
+	return magCmp(a, b)
 }
 
 // Render is the canonical decimal string (spec/design/decimal.md §6): optional '-', the integer
@@ -253,6 +262,14 @@ func (d Decimal) Negate() Decimal {
 // makes the trap order-independent: whether a fold overflows no longer depends on the order
 // rows are summed. Standalone arithmetic uses Add (capped).
 func (d Decimal) AddUncapped(o Decimal) Decimal {
+	if r, ok := addSmall(d, o); ok {
+		return r
+	}
+	return d.addLimbs(o)
+}
+
+// addLimbs is the limb path of AddUncapped.
+func (d Decimal) addLimbs(o Decimal) Decimal {
 	s := d.Scale
 	if o.Scale > s {
 		s = o.Scale
@@ -285,7 +302,11 @@ func (d Decimal) Sub(o Decimal) (Decimal, error) { return d.Add(o.Negate()) }
 // exact product — spec/design/decimal.md §2).
 func (d Decimal) Mul(o Decimal) (Decimal, error) {
 	scale := d.Scale + o.Scale
-	exact := newDecimal(d.Neg != o.Neg, scale, magMul(d.Limbs, o.Limbs))
+	product, ok := mulSmall(d, o)
+	if !ok {
+		product = magMul(d.Limbs, o.Limbs)
+	}
+	exact := newDecimal(d.Neg != o.Neg, scale, product)
 	if scale > maxScale {
 		exact = exact.RoundToScale(maxScale)
 	}
@@ -1364,12 +1385,7 @@ func magTrim(limbs []uint32) []uint32 {
 }
 
 func magFromUint64(v uint64) []uint32 {
-	var out []uint32
-	for v != 0 {
-		out = append(out, uint32(v%decBase))
-		v /= decBase
-	}
-	return out
+	return u128ToMag(u128{0, v})
 }
 
 // magFromDecimalStr parses a decimal-digit string (leading zeros allowed) into LSB-first
@@ -1418,8 +1434,7 @@ func magDigitCount(limbs []uint32) uint32 {
 	if len(limbs) == 0 {
 		return 0
 	}
-	high := len(strconv.FormatUint(uint64(limbs[len(limbs)-1]), 10))
-	return uint32(high) + uint32(len(limbs)-1)*decBaseDigits
+	return limbDigits(limbs[len(limbs)-1]) + uint32(len(limbs)-1)*decBaseDigits
 }
 
 func magCmp(a, b []uint32) int {
@@ -1587,13 +1602,7 @@ func (d *Decimal) codecGroupCount() int {
 	if len(d.Limbs) == 0 {
 		return 0
 	}
-	top := d.Limbs[len(d.Limbs)-1]
-	topDigits := 1
-	for top >= 10 {
-		top /= 10
-		topDigits++
-	}
-	return (9*(len(d.Limbs)-1) + topDigits + 3) / 4
+	return (9*(len(d.Limbs)-1) + int(limbDigits(d.Limbs[len(d.Limbs)-1])) + 3) / 4
 }
 
 // magToNbase4 converts LSB-first base-10^9 limbs to MS-first base-10^4 groups. Zero → empty.
@@ -1601,6 +1610,14 @@ func magToNbase4(limbs []uint32) []uint16 {
 	if len(limbs) == 0 {
 		return nil
 	}
+	if out, ok := magToNbase4Small(limbs); ok {
+		return out
+	}
+	return magToNbase4Limbs(limbs)
+}
+
+// magToNbase4Limbs is the general path of magToNbase4, through the decimal digit string.
+func magToNbase4Limbs(limbs []uint32) []uint16 {
 	s := magToDecimalStr(limbs)
 	pad := (4 - len(s)%4) % 4
 	padded := strings.Repeat("0", pad) + s
@@ -1620,6 +1637,14 @@ func magFromNbase4(groups []uint16) []uint32 {
 	if len(groups) == 0 {
 		return nil
 	}
+	if len(groups) <= smallNbase4Groups {
+		return magFromNbase4Small(groups)
+	}
+	return magFromNbase4Limbs(groups)
+}
+
+// magFromNbase4Limbs is the general path of magFromNbase4, through the decimal digit string.
+func magFromNbase4Limbs(groups []uint16) []uint32 {
 	var b strings.Builder
 	b.WriteString(strconv.FormatUint(uint64(groups[0]), 10))
 	for _, g := range groups[1:] {
@@ -1664,3 +1689,327 @@ func (d Decimal) DecLn() (Decimal, error)         { return d.decLnMetered(nil) }
 func (d Decimal) DecLog10() (Decimal, error)      { return d.decLog10Metered(nil) }
 func decLog(base, num Decimal) (Decimal, error)   { return decLogMetered(base, num, nil) }
 func decPower(base, exp Decimal) (Decimal, error) { return decPowerMetered(base, exp, nil) }
+
+// ============================================================================
+// Small-coefficient fast paths for Decimal (spec/design/decimal.md §1 "Inline small coefficients").
+//
+// A Decimal's coefficient is base-10^9 limbs. Almost every decimal a query meets — a numeric(12,2)
+// column, a running sum, a product of two such values — has a coefficient far below 2^128, where the
+// limb routines pay for slices they do not need. The operations a scan runs per row (decode, add,
+// multiply, compare) first try these paths: lift both coefficients into a 128-bit integer, compute
+// with math/bits, and lower the result back to limbs. Any step that does not fit reports false and
+// the caller runs the limb routine, so results are bit-identical on either path (decimal_small_test.go
+// holds the two to each other); decimal_work is computed from logical digit counts and is unaffected.
+
+// u128 is an unsigned 128-bit integer.
+type u128 struct{ hi, lo uint64 }
+
+// smallMaxLimbs is the limb count that always fits a u128: four base-10^9 limbs are below 10^36.
+const smallMaxLimbs = 4
+
+// pow10U128[e] is 10^e for every e that fits a u128 (10^38 < 2^128 < 10^39).
+var pow10U128 = func() [39]u128 {
+	var t [39]u128
+	t[0] = u128{0, 1}
+	for e := 1; e < len(t); e++ {
+		v, ok := mulU128(t[e-1], u128{0, 10})
+		if !ok {
+			panic("pow10U128: 10^38 must fit a u128")
+		}
+		t[e] = v
+	}
+	return t
+}()
+
+func (a u128) isZero() bool { return a.hi == 0 && a.lo == 0 }
+
+func cmpU128(a, b u128) int {
+	switch {
+	case a.hi != b.hi:
+		if a.hi < b.hi {
+			return -1
+		}
+		return 1
+	case a.lo != b.lo:
+		if a.lo < b.lo {
+			return -1
+		}
+		return 1
+	}
+	return 0
+}
+
+// addU128 is a + b; ok is false on overflow.
+func addU128(a, b u128) (u128, bool) {
+	lo, c := bits.Add64(a.lo, b.lo, 0)
+	hi, c := bits.Add64(a.hi, b.hi, c)
+	return u128{hi, lo}, c == 0
+}
+
+// subU128 is a - b for a >= b.
+func subU128(a, b u128) u128 {
+	lo, bw := bits.Sub64(a.lo, b.lo, 0)
+	hi, _ := bits.Sub64(a.hi, b.hi, bw)
+	return u128{hi, lo}
+}
+
+// mulU128 is a * b; ok is false on overflow.
+func mulU128(a, b u128) (u128, bool) {
+	if a.hi != 0 && b.hi != 0 {
+		return u128{}, false
+	}
+	hi, lo := bits.Mul64(a.lo, b.lo)
+	// At most one cross term is nonzero; its own high half must be zero.
+	ch, cl := bits.Mul64(a.hi, b.lo)
+	if a.hi == 0 {
+		ch, cl = bits.Mul64(a.lo, b.hi)
+	}
+	if ch != 0 {
+		return u128{}, false
+	}
+	hi, c := bits.Add64(hi, cl, 0)
+	return u128{hi, lo}, c == 0
+}
+
+// magToU128 lifts base-10^9 limbs (at most smallMaxLimbs of them) into a u128.
+func magToU128(l []uint32) (u128, bool) {
+	switch len(l) {
+	case 0:
+		return u128{}, true
+	case 1:
+		return u128{0, uint64(l[0])}, true
+	case 2:
+		return u128{0, uint64(l[1])*decBase + uint64(l[0])}, true
+	case 3, 4:
+		// The top two limbs fit a uint64 (below 10^18); each further limb is one ×10^9 + limb step,
+		// which cannot overflow below 10^36.
+		v := u128{0, uint64(l[len(l)-1])*decBase + uint64(l[len(l)-2])}
+		for i := len(l) - 3; i >= 0; i-- {
+			hi, lo := bits.Mul64(v.lo, decBase)
+			hi += v.hi * decBase
+			lo, c := bits.Add64(lo, uint64(l[i]), 0)
+			v = u128{hi + c, lo}
+		}
+		return v, true
+	}
+	return u128{}, false
+}
+
+// u128ToMag lowers v to canonical limbs: least-significant first, no high zero limb, nil for zero.
+func u128ToMag(v u128) []uint32 {
+	if v.hi == 0 {
+		switch {
+		case v.lo == 0:
+			return nil
+		case v.lo < decBase:
+			return []uint32{uint32(v.lo)}
+		case v.lo < decBase*decBase:
+			return []uint32{uint32(v.lo % decBase), uint32(v.lo / decBase)}
+		}
+		return []uint32{uint32(v.lo % decBase), uint32(v.lo / decBase % decBase), uint32(v.lo / (decBase * decBase))}
+	}
+	out := make([]uint32, 0, 5)
+	for !v.isZero() {
+		qhi, r := v.hi/decBase, v.hi%decBase
+		qlo, rem := bits.Div64(r, v.lo, decBase)
+		out = append(out, uint32(rem))
+		v = u128{qhi, qlo}
+	}
+	return out
+}
+
+// smallDecimal builds a Decimal from a u128 coefficient, normalized as newDecimal does (zero is never
+// negative).
+func smallDecimal(neg bool, scale uint32, v u128) Decimal {
+	limbs := u128ToMag(v)
+	if limbs == nil {
+		neg = false
+	}
+	return Decimal{Neg: neg, Scale: scale, Limbs: limbs}
+}
+
+// smallAligned lifts d's and o's coefficients to their common scale max(d.Scale, o.Scale).
+func smallAligned(d, o Decimal) (a, b u128, s uint32, ok bool) {
+	if len(d.Limbs) > smallMaxLimbs || len(o.Limbs) > smallMaxLimbs {
+		return a, b, 0, false
+	}
+	s = d.Scale
+	if o.Scale > s {
+		s = o.Scale
+	}
+	if s-d.Scale >= uint32(len(pow10U128)) || s-o.Scale >= uint32(len(pow10U128)) {
+		return a, b, 0, false
+	}
+	a, _ = magToU128(d.Limbs)
+	b, _ = magToU128(o.Limbs)
+	if a, ok = mulU128(a, pow10U128[s-d.Scale]); !ok {
+		return a, b, 0, false
+	}
+	b, ok = mulU128(b, pow10U128[s-o.Scale])
+	return a, b, s, ok
+}
+
+// addSmall is AddUncapped when both aligned coefficients and their sum fit a u128.
+func addSmall(d, o Decimal) (Decimal, bool) {
+	a, b, s, ok := smallAligned(d, o)
+	if !ok {
+		return Decimal{}, false
+	}
+	if d.Neg == o.Neg {
+		sum, ok := addU128(a, b)
+		if !ok {
+			return Decimal{}, false
+		}
+		return smallDecimal(d.Neg, s, sum), true
+	}
+	switch cmpU128(a, b) {
+	case 0:
+		return decimalZero(s), true
+	case 1:
+		return smallDecimal(d.Neg, s, subU128(a, b)), true
+	}
+	return smallDecimal(o.Neg, s, subU128(b, a)), true
+}
+
+// cmpSmall is the magnitude comparison of d and o at their common scale, when both fit a u128.
+func cmpSmall(d, o Decimal) (int, bool) {
+	a, b, _, ok := smallAligned(d, o)
+	if !ok {
+		return 0, false
+	}
+	return cmpU128(a, b), true
+}
+
+// mulSmall is the exact coefficient product when it fits a u128.
+func mulSmall(d, o Decimal) ([]uint32, bool) {
+	if len(d.Limbs) > smallMaxLimbs || len(o.Limbs) > smallMaxLimbs {
+		return nil, false
+	}
+	a, _ := magToU128(d.Limbs)
+	b, _ := magToU128(o.Limbs)
+	p, ok := mulU128(a, b)
+	if !ok {
+		return nil, false
+	}
+	return u128ToMag(p), true
+}
+
+// smallNbase4Groups is the group count whose value always fits a u128: nine base-10^4 groups are
+// below 10^36.
+const smallNbase4Groups = 9
+
+// magFromNbase4Small converts at most smallNbase4Groups MS-first base-10^4 groups to limbs.
+func magFromNbase4Small(groups []uint16) []uint32 {
+	if len(groups) <= 4 { // below 10^16: one uint64
+		var v uint64
+		for _, g := range groups {
+			v = v*10_000 + uint64(g)
+		}
+		return u128ToMag(u128{0, v})
+	}
+	var v u128
+	for _, g := range groups {
+		hi, lo := bits.Mul64(v.lo, 10_000)
+		hi += v.hi * 10_000
+		lo, c := bits.Add64(lo, uint64(g), 0)
+		v = u128{hi + c, lo}
+	}
+	return u128ToMag(v)
+}
+
+// magToNbase4Small converts limbs that fit a u128 to MS-first base-10^4 groups (none for zero, and
+// no leading zero group — the form magToNbase4 emits).
+func magToNbase4Small(limbs []uint32) ([]uint16, bool) {
+	v, ok := magToU128(limbs)
+	if !ok {
+		return nil, false
+	}
+	if v.isZero() {
+		return nil, true
+	}
+	var rev [10]uint16 // a u128 has at most ten base-10^4 groups
+	n := 0
+	for !v.isZero() {
+		qhi, r := v.hi/10_000, v.hi%10_000
+		qlo, rem := bits.Div64(r, v.lo, 10_000)
+		rev[n] = uint16(rem)
+		n++
+		v = u128{qhi, qlo}
+	}
+	out := make([]uint16, n)
+	for i := range out {
+		out[i] = rev[n-1-i]
+	}
+	return out, true
+}
+
+// limbDigits is the decimal digit count of a nonzero limb (below 10^9).
+func limbDigits(v uint32) uint32 {
+	switch {
+	case v < 10:
+		return 1
+	case v < 100:
+		return 2
+	case v < 1_000:
+		return 3
+	case v < 10_000:
+		return 4
+	case v < 100_000:
+		return 5
+	case v < 1_000_000:
+		return 6
+	case v < 10_000_000:
+		return 7
+	case v < 100_000_000:
+		return 8
+	}
+	return 9
+}
+
+// decimalBox co-allocates a short decimal's limbs with the value, so a decoded numeric of at most 18
+// digits is one allocation rather than two.
+type decimalBox struct {
+	d     Decimal
+	limbs [2]uint32
+}
+
+// smallBoxMax is the first coefficient that needs a third limb.
+const smallBoxMax = decBase * decBase
+
+// decimalValueU64 is DecimalValue of the decimal (neg, scale, v) for v below smallBoxMax, normalized
+// as newDecimal does.
+func decimalValueU64(neg bool, scale uint32, v uint64) Value {
+	b := &decimalBox{}
+	switch {
+	case v == 0:
+		neg = false
+	case v < decBase:
+		b.limbs[0] = uint32(v)
+		b.d.Limbs = b.limbs[:1:1]
+	default:
+		b.limbs[0], b.limbs[1] = uint32(v%decBase), uint32(v/decBase)
+		b.d.Limbs = b.limbs[:2:2]
+	}
+	b.d.Neg, b.d.Scale = neg, scale
+	return Value{Kind: ValDecimal, ref: &b.d}
+}
+
+// decimalFromInt64Buf is decimalFromInt64 with the limbs in buf, for a caller whose operand does not
+// outlive the call it is passed to (an accumulator's fold): no allocation when buf stays on its stack.
+func decimalFromInt64Buf(v int64, buf *[3]uint32) Decimal {
+	neg := v < 0
+	u := uint64(v)
+	if neg {
+		u = -u // unsigned negation = |v| (handles MinInt64)
+	}
+	n := 0
+	for u != 0 {
+		buf[n] = uint32(u % decBase)
+		u /= decBase
+		n++
+	}
+	if n == 0 {
+		return Decimal{}
+	}
+	return Decimal{Neg: neg, Limbs: buf[:n:n]}
+}

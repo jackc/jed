@@ -1757,48 +1757,33 @@ two rounds each, jed harnesses only, p50; the machine was shared with another be
 
 Every core and both variants returned the same checksums.
 
-The `decimal_*` lanes landed with the Rust core's inline decimal coefficients (decimal.md §1) and
-the columnar read-path and lane changes of packed-leaf.md §11 Track A5. Alternating base/after runs
-(base `f076eec6`, two rounds each, the Rust jed harness, p50 in ms; the scratch database is
-file-backed; PostgreSQL 18 on the same machine, one run):
+The `decimal_*` lanes landed with the decimal and columnar-lane work of packed-leaf.md §11 Track A5
+(the lane choices are contract in every core — memory.md §5.4, cost.md §6.1 — and each core did its
+own read-path and decimal-arithmetic work). Base `f076eec6` against the branch, each core's own jed
+harness, p50 in ms over 200k rows, the scratch database file-backed; PostgreSQL 18 on the same
+machine:
 
-| lane | Rust base → after | PostgreSQL |
-|---|---|---|
-| `decimal_sum_scan` | 166–187 → 8.5 | 11.5 |
-| `decimal_sum_bigint` | 129 → 5.1 | 3.8 |
-| `decimal_avg_scan` | 167–168 → 8.1 | 11.0 |
-| `decimal_filter_scan` | 30.8–31.1 → 16.3–17.0 | 15.3 |
-| `decimal_arith_scan` | 211–253 → 111 | 16.4 |
-| `decimal_group_by` | 239–242 → 20.2 | 12.5 |
-| `decimal_group_by_high_card` | 193 → 17.8 | 16.3 |
-| `decimal_group_by_ordered` | 186–188 → 14.0 | 11.5 |
-| `decimal_order_by_limit` | 119–130 → 9.8 | 21.6 |
+| lane | Rust base → now | Go base → now | TS base → now | PostgreSQL |
+|---|---|---|---|---|
+| `decimal_sum_scan` | 166–187 → 9.5–10 | 268 → 7.0–7.2 | 446 → 31 | 12.6 |
+| `decimal_sum_bigint` | 129 → 5.6 | 147 → 6.2–6.5 | 249 → 23–25 | 4.4 |
+| `decimal_avg_scan` | 167 → 8.8 | 236 → 6.5 | 347 → 30 | 12.4 |
+| `decimal_filter_scan` | 31 → 17.5 | 69 → 18 | 186 → 67 | 16.7 |
+| `decimal_arith_scan` | 211–253 → 39–41 | 345 → 46–49 | 649 → 132 | 17.6 |
+| `decimal_group_by` | 240 → 21.7 | 344 → 22–31 | 637 → 73 | 13.3 |
+| `decimal_group_by_high_card` | 193 → 19.2 | 304 → 24 | 651 → 73–75 | 17.3 |
+| `decimal_group_by_ordered` | 187 → 15 | 283 → 11 | 512 → 50 | 12.2 |
+| `decimal_order_by_limit` | 119–130 → 9.9 | 303 → 19–25 | 302 → 46 | 22.8 |
 
-The lane still far from PostgreSQL is the shape the columnar lanes do not take: an expression
-operand, which runs on the bounded-spill lane. PostgreSQL ran most of these lanes on two processes;
-on one, it takes 12.1, 4.0, 28.0, 20.3, 18.1 and 41.5 ms for `decimal_sum_scan`, `decimal_sum_bigint`,
-`decimal_arith_scan`, `decimal_group_by`, `decimal_group_by_ordered` and `decimal_order_by_limit`.
-The aggregate lanes also run under a cost ceiling (cost.md §6.1) and a query-memory budget
-(memory.md §5.4): with both set, the Rust core's times for these lanes are unchanged.
+PostgreSQL ran most of these lanes on two processes; on one it takes 12.1, 4.0, 28.0, 20.3, 18.1 and
+41.5 ms for `decimal_sum_scan`, `decimal_sum_bigint`, `decimal_arith_scan`, `decimal_group_by`,
+`decimal_group_by_ordered` and `decimal_order_by_limit`. The base numbers are single runs taken at
+different points of the work; the "now" numbers are two runs each, taken together. Rust, Go, TS and
+PostgreSQL returned the same checksum on every lane, as did the wrapped Node/Rust, Ruby and WASM
+harnesses.
 
-The lane choice, the bounded group table, the top-k rule and the ceiling rule were then ported to
-the Go and TS cores (their read-path and decimal-representation changes were not). Base `f076eec6`
-against the port, each core's own jed harness, p50 in ms, one run each for Go and two for TS:
-
-| lane | Go base → port | TS base → port |
-|---|---|---|
-| `decimal_sum_scan` | 268 → 46 | 446 → 96–114 |
-| `decimal_sum_bigint` | 147 → 20 | 249 → 59–75 |
-| `decimal_avg_scan` | 236 → 39 | 347 → 86–100 |
-| `decimal_filter_scan` | 69 → 66 | 186 → 187–240 |
-| `decimal_arith_scan` | 345 → 336 | 649 → 595–673 |
-| `decimal_group_by` | 344 → 84 | 637 → 149–195 |
-| `decimal_group_by_high_card` | 304 → 54 | 651 → 118–176 |
-| `decimal_group_by_ordered` | 283 → 46 | 512 → 91–143 |
-| `decimal_order_by_limit` | 303 → 124 | 302 → 197–301 |
-
-The machine was loaded during the TS runs. Rust, Go, TS, and PostgreSQL returned the same checksum on
-every lane.
+The lanes run under a cost ceiling and a query-memory budget (cost.md §6.1, memory.md §5.4): with
+both set, the Rust core's times for these lanes are unchanged, where each used to take 80–125 ms.
 
 ### GIN follow-ons (format_version 47)
 

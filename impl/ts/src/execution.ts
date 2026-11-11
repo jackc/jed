@@ -215,8 +215,9 @@ function advanceSync<T>(steps: Steps<T>, cancellation?: { delivered: boolean }):
 export type AsyncExecutionOptions = {
   // Checked before each continuation segment and after awaited I/O/task yields.
   check?: () => boolean;
-  // Atomic polling while a synchronous segment runs. A message-only cancellation changes only
-  // between segments, so it need not disable the core's unmetered fast paths inside a segment.
+  // Atomic polling while a synchronous segment runs (the meter checkpoints, and the columnar lanes
+  // at least every 256 records). A message-only cancellation changes only between segments, so it
+  // installs no in-segment poll.
   poll?: () => boolean;
   schedule?: (callback: () => void) => void;
   quantum?: number;

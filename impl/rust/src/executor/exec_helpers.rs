@@ -12,6 +12,33 @@ impl LaneSrc<'_> {
             LaneSrc::Rows(rows) => &rows[j][col],
         }
     }
+
+    /// Survivor `j`'s whole row.
+    #[inline]
+    pub(crate) fn row(&self, j: usize) -> &[Value] {
+        match self {
+            LaneSrc::Rows(rows) => &rows[j],
+        }
+    }
+}
+
+/// Survivor `j`'s operand for `spec` on the row-fed vectorized fold: its bare column (`oc`), nothing
+/// for `COUNT(*)`, or its expression evaluated over the survivor's row (charging its operators, as
+/// the row path does per survivor).
+#[inline]
+fn lane_operand(
+    spec: &AggSpec,
+    oc: Option<usize>,
+    src: &LaneSrc,
+    j: usize,
+    env: &EvalEnv,
+    meter: &mut Meter,
+) -> Result<Value> {
+    match (oc, &spec.operand) {
+        (Some(c), _) => Ok(src.at(j, c).clone()),
+        (None, Some(e)) => e.eval(src.row(j), env, meter),
+        (None, None) => Ok(Value::Null), // COUNT(*) folds no value
+    }
 }
 
 /// Fold one WHOLE-TABLE grand-total group over `nsurv` survivors from `src`, returning the finalized
@@ -25,6 +52,7 @@ pub(crate) fn fold_agg_whole(
     src: &LaneSrc,
     nsurv: usize,
     zone: &crate::timezone::ZoneRef,
+    env: &EvalEnv,
     meter: &mut Meter,
 ) -> Result<Vec<Value>> {
     let mut accs: Vec<Acc> = specs.iter().map(|s| Acc::from_spec(s, zone)).collect();
@@ -40,10 +68,7 @@ pub(crate) fn fold_agg_whole(
             if j & 255 == 0 {
                 meter.checkpoint()?;
             }
-            let v = match oc {
-                Some(c) => src.at(j, c).clone(),
-                None => Value::Null, // COUNT(*) folds no value
-            };
+            let v = lane_operand(spec, oc, src, j, env, meter)?;
             accs[si].fold(v, meter)?;
         }
     }
@@ -66,6 +91,7 @@ pub(crate) fn group_by_int_key(
     src: &LaneSrc,
     nsurv: usize,
     zone: &crate::timezone::ZoneRef,
+    env: &EvalEnv,
     meter: &mut Meter,
 ) -> Result<Vec<Vec<Value>>> {
     let mut groups: Vec<(Value, Vec<Acc>)> = Vec::new();
@@ -120,10 +146,7 @@ pub(crate) fn group_by_int_key(
         };
         let accs = &mut groups[gi].1;
         for (si, spec) in specs.iter().enumerate() {
-            let v = match operand_col(spec) {
-                Some(c) => src.at(j, c).clone(),
-                None => Value::Null,
-            };
+            let v = lane_operand(spec, operand_col(spec), src, j, env, meter)?;
             accs[si].fold(v, meter)?;
         }
     }
@@ -793,6 +816,10 @@ impl crate::cursor::RowStream for BufferedScan {
                 *idx += 1;
                 self.meter.checkpoint()?; // enforce the cost ceiling / cancellation per produced row
                 self.meter.charge(COSTS.row_produced);
+                // The row path evaluates each bare-column projection here, whose evaluator entry
+                // guards the ceiling after the row's charge; this emission must stop at the same row
+                // (cost.md §6.1). A no-op with no ceiling.
+                self.meter.guard()?;
                 Ok(Some(take_columnar_row(cols, proj_cols, j)))
             }
         }

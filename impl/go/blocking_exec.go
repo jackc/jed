@@ -130,27 +130,34 @@ func (db *engine) scanBlockingRel(p *selectPlan, i int, env *evalEnv, m *costMet
 	}
 	m.Charge(costs.PageRead*int64(pages) + costs.ValueDecompress*int64(slabs))
 	_, pushed := p.pushedFilter(i)
-	err = store.ScanRange(b, func(_ []byte, row storedRow) (bool, error) {
+	// Walk the bound reading only the touched columns, each resolved straight from its leaf (the
+	// columnar lanes' walk, packed-leaf.md §11 Track A5): an untouched column is not a SQL input to
+	// this plan, so it is never reconstructed and enters the spool as NULL. The scan block was charged
+	// above from the same bound and mask.
+	mask := p.relMasks[i]
+	var scratch storedRow
+	_, _, err = store.rows.foldScan(b, store.leafSrc(), func(n *pnode, ri int) error {
 		if err := m.Step(); err != nil {
-			return false, err
+			return err
 		}
 		m.Charge(costs.StorageRowRead)
-		row, err := store.resolveColumns(row, p.relMasks[i])
+		row, err := store.readMasked(n, ri, mask, scratch)
 		if err != nil {
-			return false, err
+			return err
 		}
+		scratch = row
 		// The relation's pushed WHERE conjuncts (planner.md §3.2), exactly as materializeRel runs them.
 		if pushed != nil {
 			v, err := pushed.evalFilter(row, env, m)
 			if err != nil {
-				return false, err
+				return err
 			}
 			if !v {
-				return true, nil
+				return nil
 			}
 		}
-		// Untouched lazy values must not pin source-page payloads in the spool.
-		return true, out.push(topKPruneUntouched(row, p.relMasks[i]))
+		scratch = nil // the spool keeps the row
+		return out.push(row)
 	})
 	if err != nil {
 		return nil, err

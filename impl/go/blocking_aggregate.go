@@ -57,6 +57,44 @@ func blockingAccRow(a *acc) storedRow {
 	}
 }
 
+// scratchAccPlan reports whether spec's unpacked accumulator is plain values — a count, an integer
+// or decimal sum, an average, a MIN/MAX — so the per-row fold can refill one scratch accumulator
+// (blockingAccInto) instead of allocating a fresh one for every row.
+func scratchAccPlan(spec aggSpec) bool {
+	if spec.order != nil {
+		return false
+	}
+	switch spec.plan {
+	case planCountStar, planCount, planSumInt, planSumDecimal, planAvg, planMin, planMax:
+		return true
+	}
+	return false
+}
+
+// blockingAccInto is blockingAccFromRow for a scratchAccPlan spec, into caller-owned a: the same
+// accumulator newAccFromSpec builds and blockingAccFromRow fills, without the allocation.
+func blockingAccInto(a *acc, spec aggSpec, r storedRow, zone ZoneRef) {
+	*a = acc{plan: spec.plan, jsonTypes: spec.jsonTypes, jsonZone: zone}
+	switch spec.plan {
+	case planCountStar, planCount:
+		a.count = r[0].Int
+	case planSumInt:
+		a.sumInt = r[0].Int
+		a.seen = r[1].boolVal()
+	case planSumDecimal:
+		a.sumDec = *r[0].decimal()
+		a.seen = r[1].boolVal()
+	case planAvg:
+		a.sumDec = *r[0].decimal()
+		a.count = r[1].Int
+	case planMin, planMax:
+		a.collation = spec.collation
+		if !r[0].IsNull() {
+			a.cur, a.hasCur = r[0], true
+		}
+	}
+}
+
 func blockingAccFromRow(spec aggSpec, r storedRow, zone ZoneRef) *acc {
 	a := newAccFromSpec(spec, zone)
 	if a.ordered {
@@ -165,6 +203,7 @@ func (db *engine) blockingAggregate(p *selectPlan, rows *rowSpool, env *evalEnv,
 					return err
 				}
 			}
+			var scratch acc // refilled per row for the plain-valued aggregates (scratchAccPlan)
 			if err := rows.each(func(row storedRow) error {
 				if err := m.Step(); err != nil {
 					return err
@@ -252,6 +291,15 @@ func (db *engine) blockingAggregate(p *selectPlan, rows *rowSpool, env *evalEnv,
 						if err := collections.push(owner, tuple); err != nil {
 							return err
 						}
+						continue
+					}
+					if scratchAccPlan(spec) {
+						// Nothing for blockingFold to retain or check: fold and repack.
+						blockingAccInto(&scratch, spec, *state[si+1].composite(), env.exec.session.timeZone)
+						if err := scratch.fold(v, m); err != nil {
+							return err
+						}
+						state[si+1] = CompositeValue(blockingAccRow(&scratch))
 						continue
 					}
 					a := blockingAccFromRow(spec, *state[si+1].composite(), env.exec.session.timeZone)

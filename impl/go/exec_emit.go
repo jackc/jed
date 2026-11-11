@@ -409,6 +409,12 @@ func (em emitter) drainEager(db *engine, plan *selectPlan, outer []storedRow, pa
 				return nil, err
 			}
 			meter.Charge(costs.RowProduced)
+			// The row path evaluates each bare-column projection here, whose evaluator entry guards
+			// the ceiling after the row's charge; this emission must stop at the same row (cost.md
+			// §6.1). A no-op with no ceiling.
+			if err := meter.Guard(); err != nil {
+				return nil, err
+			}
 			projected := make([]Value, len(em.projCols))
 			for k, c := range em.projCols {
 				projected[k] = em.cols[c][j]
@@ -478,7 +484,10 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 	// proves both). Which statements take it is contract (memory.md §5.4): it decides what a statement
 	// reserves. Ineligible ⇒ this is skipped and the general aggregate branch runs unchanged.
 	lane := fast && db.aggregateLaneEligible(plan)
-	if lane && meter.canBatchCosts() {
+	// A run that folds an expression is always an attempt (below): it interleaves filter and operand
+	// evaluation where the row path filters every row first.
+	exprOps := lane && hasExpressionOperand(plan)
+	if lane && !exprOps && meter.canBatchCosts() {
 		return db.execVectorizedAgg(plan, outer, params, ctes, rng, meter)
 	}
 	// Under a cost ceiling or lifetime budget (cost.md §6.1) the lane is an attempt: its result stands
@@ -515,9 +524,9 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 	// gathers only its touched columns into dense lanes and emits from them — never the full-width
 	// storedRow the materialize path below allocates per record (the allocation dividend on a wide table).
 	// A WHERE predicate (A3) is applied over the lanes into a selection vector rather than forcing the row
-	// path. Gated to the unmetered lane (so a metered query's per-eval Guards stay the row path's) and to
-	// file-backed stores with no spillable touched column (projectColumnar declines otherwise, falling
-	// through to the identical-cost row path). Cost-neutral by construction.
+	// path. Under a cost ceiling it runs as an attempt (below). Gated to file-backed stores
+	// (projectColumnar declines otherwise, falling through to the identical-cost row path).
+	// Cost-neutral by construction.
 	if fast && meter.canBatchCosts() && db.explainActual == nil && db.vectorizedProjectEligible(plan) {
 		em, ok, err := db.projectColumnar(plan, env, meter)
 		if err != nil {
@@ -526,6 +535,30 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 		if ok {
 			return em, nil
 		}
+	}
+	// Under a cost ceiling the gather is an attempt, exactly as the aggregate lane's is (cost.md
+	// §6.1): the row path here is the eager materialize below, which also scans and filters everything
+	// before it emits, so the two differ only in how they accrue on the way.
+	if fast && !meter.canBatchCosts() && db.explainActual == nil && db.vectorizedProjectEligible(plan) &&
+		!db.laneTools().ceilingOff && meter.Guard() == nil && discardSafe(plan.filter) {
+		mark := meter.mark()
+		em, ok, err := db.projectColumnar(plan, env, meter)
+		// Cancellation is best effort and reported at once, as on every path.
+		if e, isEngine := err.(*EngineError); isEngine && e.State == QueryCanceled {
+			return emitter{}, err
+		}
+		accepted := err == nil && ok && meter.Guard() == nil
+		if err != nil || ok { // a declined gather (no error, not ok) is no attempt
+			db.laneTools().attempts++
+			if !accepted {
+				db.laneTools().fallbacks++
+			}
+		}
+		if accepted {
+			return em, nil
+		}
+		// A rejected gather's lanes are dropped here; the rewind returns what they reserved.
+		meter.rewind(mark)
 	}
 
 	// Bounded streaming scan (spec/design/cost.md §3): a single-table query whose chosen access path

@@ -15,6 +15,8 @@ import { encodeInt } from "./encoding.ts";
 import { engineError, type EngineError } from "./errors.ts";
 
 const BASE = 10000; // 10^4: a limb holds 4 digits; products fit JS safe integers
+const MAX_SAFE_BIG = BigInt(Number.MAX_SAFE_INTEGER);
+const MIN_SAFE_BIG = -MAX_SAFE_BIG;
 const BASE_DIGITS = 4;
 // Max DECLARABLE precision of numeric(p,s), and the division display-scale clamp —
 // spec/types/scalars.toml max_precision (PG NUMERIC_MAX_PRECISION, which is also its
@@ -106,6 +108,19 @@ export class Decimal {
 
   // fromBigInt is the exact decimal of an integer (the lossless int→decimal cast, scale 0).
   static fromBigInt(v: bigint): Decimal {
+    if (v >= MIN_SAFE_BIG && v <= MAX_SAFE_BIG) {
+      // The same limbs the bigint loop below produces, without a bigint operation per limb.
+      let m = Number(v);
+      const negative = m < 0;
+      if (negative) m = -m;
+      const small: number[] = [];
+      while (m !== 0) {
+        const q = Math.floor(m / BASE);
+        small.push(m - q * BASE);
+        m = q;
+      }
+      return new Decimal(small.length === 0 ? false : negative, 0, small);
+    }
     const neg = v < 0n;
     let mag = neg ? -v : v;
     const limbs: number[] = [];
@@ -265,10 +280,34 @@ export class Decimal {
   // cmpValue is the total order over finite decimals by value: <0, 0, >0.
   cmpValue(o: Decimal): number {
     if (this.neg !== o.neg) return this.neg ? -1 : 1; // neg < non-neg; zero is non-neg
-    const s = Math.max(this.scale, o.scale);
-    const a = magMulPow10(this.limbs, s - this.scale);
-    const b = magMulPow10(o.limbs, s - o.scale);
-    const m = magCmp(a, b);
+    let m: number;
+    if (this.scale === o.scale) {
+      m = magCmp(this.limbs, o.limbs);
+    } else {
+      const az = this.limbs.length === 0;
+      const bz = o.limbs.length === 0;
+      if (az || bz) {
+        // A zero stays zero at any scale.
+        m = az ? (bz ? 0 : -1) : 1;
+      } else {
+        // Aligned to the common scale, the coefficient with more digits is the larger: the digit
+        // counts settle most comparisons without building the scaled coefficients.
+        const s = Math.max(this.scale, o.scale);
+        const da = magDigitCount(this.limbs) + (s - this.scale);
+        const db = magDigitCount(o.limbs) + (s - o.scale);
+        if (da !== db) {
+          m = da < db ? -1 : 1;
+        } else if (da <= 15) {
+          // Both aligned coefficients are below 10^15 < 2^53 (and each shift below 15 digits):
+          // exact as JS numbers.
+          const x = magToNumber(this.limbs) * 10 ** (s - this.scale);
+          const y = magToNumber(o.limbs) * 10 ** (s - o.scale);
+          m = x < y ? -1 : x > y ? 1 : 0;
+        } else {
+          m = magCmp(magMulPow10(this.limbs, s - this.scale), magMulPow10(o.limbs, s - o.scale));
+        }
+      }
+    }
     return this.neg ? -m : m;
   }
 
@@ -296,8 +335,10 @@ export class Decimal {
   // rows are summed. Standalone arithmetic uses add (capped).
   addUncapped(o: Decimal): Decimal {
     const s = Math.max(this.scale, o.scale);
-    const a = magMulPow10(this.limbs, s - this.scale);
-    const b = magMulPow10(o.limbs, s - o.scale);
+    // magAdd / magSub / magCmp only read their operands, so an operand already at the common scale
+    // is used as is.
+    const a = s === this.scale ? this.limbs : magMulPow10(this.limbs, s - this.scale);
+    const b = s === o.scale ? o.limbs : magMulPow10(o.limbs, s - o.scale);
     if (this.neg === o.neg) return Decimal.fromParts(this.neg, s, magAdd(a, b));
     const c = magCmp(a, b);
     if (c === 0) return Decimal.zero(s);
@@ -881,6 +922,13 @@ export class Decimal {
     return [this.neg, this.scale, this.limbs.slice().reverse()];
   }
 
+  // fromLimbs is fromParts for limbs the caller built and will not touch again (LSB-first; high
+  // zero limbs are trimmed here) — the value codec's load path, which reads the stored groups
+  // straight into limb order.
+  static fromLimbs(neg: boolean, scale: number, limbs: number[]): Decimal {
+    return Decimal.fromParts(neg, scale, limbs);
+  }
+
   // fromCodec is the inverse of toCodec (used on load).
   static fromCodec(neg: boolean, scale: number, groups: number[]): Decimal {
     return Decimal.fromParts(neg, scale, magTrim(groups.slice().reverse()));
@@ -984,8 +1032,10 @@ function alignedDigits(a: Decimal, b: Decimal): [number, number] {
 
 // W for add/sub/compare: the larger aligned operand.
 export function workLinear(a: Decimal, b: Decimal): number {
-  const [a1, a2] = alignedDigits(a, b);
-  return Math.max(decGroups(a1), decGroups(a2));
+  const s = a.scale > b.scale ? a.scale : b.scale;
+  const a1 = a.precision() + (s - a.scale);
+  const a2 = b.precision() + (s - b.scale);
+  return decGroups(a1 > a2 ? a1 : a2);
 }
 
 // W for mul: the product of the (unaligned) operand group counts — schoolbook-quadratic.
@@ -1107,9 +1157,19 @@ function magToDecimalStr(limbs: number[]): string {
   return out;
 }
 
+// magToNumber is the magnitude as a JS number — exact only for a magnitude below 2^53 (the caller
+// bounds the digit count).
+function magToNumber(limbs: number[]): number {
+  let n = 0;
+  for (let i = limbs.length - 1; i >= 0; i--) n = n * BASE + limbs[i]!;
+  return n;
+}
+
 function magDigitCount(limbs: number[]): number {
   if (limbs.length === 0) return 0;
-  return String(limbs[limbs.length - 1]).length + (limbs.length - 1) * BASE_DIGITS;
+  const top = limbs[limbs.length - 1]!;
+  const digits = top < 10 ? 1 : top < 100 ? 2 : top < 1000 ? 3 : 4;
+  return digits + (limbs.length - 1) * BASE_DIGITS;
 }
 
 function magCmp(a: number[], b: number[]): number {
@@ -1121,13 +1181,31 @@ function magCmp(a: number[], b: number[]): number {
 }
 
 function magAdd(a: number[], b: number[]): number[] {
-  const n = Math.max(a.length, b.length);
-  const out: number[] = [];
+  const long = a.length >= b.length ? a : b;
+  const short = long === a ? b : a;
+  const out: number[] = new Array(long.length);
   let carry = 0;
-  for (let i = 0; i < n; i++) {
-    const sum = (a[i] ?? 0) + (b[i] ?? 0) + carry;
-    out.push(sum % BASE);
-    carry = Math.floor(sum / BASE);
+  let i = 0;
+  // Two limbs and a carry sum below 2 × BASE, so the carry is 0 or 1.
+  for (; i < short.length; i++) {
+    const sum = long[i]! + short[i]! + carry;
+    if (sum >= BASE) {
+      out[i] = sum - BASE;
+      carry = 1;
+    } else {
+      out[i] = sum;
+      carry = 0;
+    }
+  }
+  for (; i < long.length; i++) {
+    const sum = long[i]! + carry;
+    if (sum >= BASE) {
+      out[i] = sum - BASE;
+      carry = 1;
+    } else {
+      out[i] = sum;
+      carry = 0;
+    }
   }
   if (carry !== 0) out.push(carry);
   return magTrim(out);

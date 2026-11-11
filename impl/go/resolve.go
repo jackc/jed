@@ -1470,6 +1470,11 @@ func outputName(s *scope, e exprNode) string {
 		// A subscript takes the base array's name (PG names `a[1]` after `a`); `a[1][2]` recurses to
 		// the same base. A non-column base falls through to `?column?`.
 		return outputName(s, *e.Base)
+	case exprCast:
+		// A cast takes its operand's name when the operand has one (PG: `amount::text` is named
+		// `amount`, so a trailing `ORDER BY amount` sorts the cast's output). A cast of an unnamed
+		// operand keeps `?column?`, where PG uses the type's name (grammar.md §8).
+		return outputName(s, e.Cast.Inner)
 	default:
 		return "?column?"
 	}

@@ -504,6 +504,16 @@ impl Meter {
         }
     }
 
+    /// Take back `units` a lane charged for work the row path would not yet have done when it
+    /// raised the same error (cost.md §6.2): the statement and session totals both give them up.
+    /// Only for an unmetered statement, where no ceiling has been crossed.
+    pub(crate) fn refund(&mut self, units: i64) {
+        self.accrued -= units;
+        if let Some(l) = &self.lifetime {
+            l.total.set(l.total.get() - units);
+        }
+    }
+
     /// The cost still payable before a ceiling trips — the smaller remaining per-statement /
     /// lifetime budget — or `None` when neither is armed. Bounds how far a host-function batch
     /// prefetch may run ahead of replay (extensibility.md §4.2.1); never consulted by enforcement.

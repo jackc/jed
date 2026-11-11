@@ -62,6 +62,11 @@ export interface PackedLeaf {
   row(i: number): Row;
   // Reconstruct only column c of row i — the touched-column path (the A2/A3 columnar gather).
   col(i: number, c: number): Value;
+  // Column c of row i RESOLVED, for a reader that uses the value now (packed-leaf.md §11 Track A5):
+  // an inline body is decoded straight from the page rather than deferred and then resolved.
+  // undefined for an out-of-line or compressed value, whose resolve may need a page read (the
+  // caller takes the stepping path).
+  colNow(i: number, c: number): Value | undefined;
   // The retained page payload the stored spans below index (packed-leaf.md §11 Track A4).
   readonly payload: Uint8Array;
   // Whether column c of row i is NULL — the null bitmap / zero-length span, no value decode.
@@ -121,6 +126,16 @@ export function rowAt(n: PNode, i: number): Row {
 // OP_Column model).
 export function colAt(n: PNode, i: number, c: number): Value {
   return n.packed ? n.packed.col(i, c) : n.vals[i]![c]!;
+}
+
+// colAtNow is colAt with a deferred value resolved, when that needs no stepping: a Packed leaf's
+// inline body decodes straight from its page, a Decoded leaf's resolved value is returned as is.
+// undefined when the value is out of line, compressed, or a held deferred handle — the caller then
+// resolves through the stepping path (readLeafColumnSteps).
+export function colAtNow(n: PNode, i: number, c: number): Value | undefined {
+  if (n.packed) return n.packed.colNow(i, c);
+  const v = n.vals[i]![c]!;
+  return v.kind === "unfetched" ? undefined : v;
 }
 
 // colIsNull reports whether column c of row i is NULL without reconstructing the value (packed-leaf.md
@@ -727,10 +742,13 @@ export class PMap {
     );
   }
 
+  // `progress`, when given, receives the nodes visited even if the walk is interrupted (a canceled
+  // lane charges the work it consumed).
   *foldScanSteps(
     b: KeyBound,
     src: LeafSource | null,
     visit: (n: PNode, i: number) => Steps<void>,
+    progress?: { nodes: number },
   ): Steps<{ rowCount: number; nodes: number }> {
     let rowCount = 0;
     const iterator = new TreeStepIterator(
@@ -749,6 +767,34 @@ export class PMap {
       }
       return { rowCount, nodes: iterator.nodesVisited };
     } finally {
+      if (progress !== undefined) progress.nodes = iterator.nodesVisited;
+      yield* iterator.returnSteps();
+    }
+  }
+
+  // foldLeavesSteps is foldScanSteps a leaf at a time: visitLeaf(node, first, last) folds records
+  // first..last of one leaf (in key order; the same records, in the same order, foldScanSteps visits
+  // one by one), so a lane's per-record work is one loop iteration rather than a continuation.
+  // rowCount counts the records of every leaf visitLeaf returned from.
+  *foldLeavesSteps(
+    b: KeyBound,
+    src: LeafSource | null,
+    visitLeaf: (n: PNode, first: number, last: number) => Steps<void>,
+    progress?: { nodes: number },
+  ): Steps<{ rowCount: number; nodes: number }> {
+    let rowCount = 0;
+    const iterator = new TreeStepIterator(this.root, b, src, false, () => undefined);
+    try {
+      for (;;) {
+        const leaf = yield* iterator.nextLeafSteps();
+        if (leaf === null) break;
+        if (leaf.last < leaf.first) continue;
+        yield* visitLeaf(leaf.node, leaf.first, leaf.last);
+        rowCount += leaf.last - leaf.first + 1;
+      }
+      return { rowCount, nodes: iterator.nodesVisited };
+    } finally {
+      if (progress !== undefined) progress.nodes = iterator.nodesVisited;
       yield* iterator.returnSteps();
     }
   }
@@ -989,6 +1035,40 @@ class TreeStepIterator<T> implements StepIterator<T> {
       }
       this.closed = true;
       return { done: true, value: undefined };
+    } catch (error) {
+      this.closed = true;
+      this.frames.length = 0;
+      throw error;
+    }
+  }
+
+  // nextLeafSteps returns the next leaf of an ascending traversal with the window of its records the
+  // bound admits ([first, last], possibly empty), or null at the end — nextSteps a leaf at a time, for
+  // a fold that visits a leaf's records in one loop rather than through one continuation each.
+  *nextLeafSteps(): Steps<{ node: PNode; first: number; last: number } | null> {
+    if (this.closed) return null;
+    try {
+      while (this.frames.length > 0) {
+        const frame = this.frames[this.frames.length - 1]!;
+        if (frame.next > frame.last) {
+          this.frames.pop();
+          continue;
+        }
+        if (isLeaf(frame.node)) {
+          const first = frame.next;
+          const last = frame.last;
+          frame.next = last + 1;
+          if (shouldCooperate(last - first + 1)) yield COOPERATE;
+          return { node: frame.node, first, last };
+        }
+        const index = frame.next;
+        frame.next += 1;
+        if (frame.hinted === 0) frame.hinted = this.hint(frame, index);
+        frame.hinted--;
+        this.enter(yield* resolveChildSteps(frame.node.children[index]!, this.source));
+      }
+      this.closed = true;
+      return null;
     } catch (error) {
       this.closed = true;
       this.frames.length = 0;

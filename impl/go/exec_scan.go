@@ -871,6 +871,12 @@ func (c *bufferedScanCursor) nextRow() ([]Value, bool, error) {
 			return nil, false, err
 		}
 		c.meter.Charge(costs.RowProduced)
+		// The row path evaluates each bare-column projection here, whose evaluator entry guards the
+		// ceiling after the row's charge; this emission must stop at the same row (cost.md §6.1). A
+		// no-op with no ceiling.
+		if err := c.meter.Guard(); err != nil {
+			return nil, false, err
+		}
 		projected := make([]Value, len(c.em.projCols))
 		for k, cc := range c.em.projCols {
 			projected[k] = c.em.cols[cc][j]
@@ -1663,36 +1669,40 @@ func (db *engine) execStreamingSort(plan *selectPlan, env *evalEnv, meter *costM
 		// The collated survivor buffer is sort state (memory.md §6.4).
 		charge := meter.stateCharge()
 		if !empty {
-			err := store.ScanRange(b, func(_ []byte, row storedRow) (bool, error) {
+			// Read-only SELECT feed: only the touched columns are read, each resolved straight from
+			// its leaf into a row whose untouched slots stay NULL — the form sort state holds
+			// (memory.md §6.1; packed-leaf.md §11 Track A5). A row the filter rejects is reused.
+			var scratch storedRow
+			_, _, err := store.rows.foldScan(b, store.leafSrc(), func(n *pnode, ri int) error {
 				if err := meter.Step(); err != nil {
-					return false, err
+					return err
 				}
 				meter.Charge(costs.StorageRowRead)
-				row, err := store.resolveColumns(row, plan.relMasks[0])
+				row, err := store.readMasked(n, ri, plan.relMasks[0], scratch)
 				if err != nil {
-					return false, err
+					return err
 				}
+				scratch = row
 				keep := true
 				if plan.filter != nil {
 					before := meter.Accrued
 					v, err := plan.filter.evalFilter(row, env, meter)
 					filterWork += meter.Accrued - before
 					if err != nil {
-						return false, err
+						return err
 					}
 					keep = v
 				}
 				if keep {
-					// Sort state holds only the touched columns (memory.md §6.1).
-					row = topKPruneUntouched(row, plan.relMasks[0])
 					if charge.active() {
 						if err := charge.reserve(meter, memRowBytes(row)); err != nil {
-							return false, err
+							return err
 						}
 					}
 					rows = append(rows, row)
+					scratch = nil // the buffer keeps the row
 				}
-				return true, nil
+				return nil
 			})
 			if err != nil {
 				return emitter{}, err
@@ -1735,40 +1745,48 @@ func (db *engine) execStreamingSort(plan *selectPlan, env *evalEnv, meter *costM
 		}
 		var survivorCount int64
 		if !empty {
-			err := store.ScanRange(b, func(_ []byte, row storedRow) (bool, error) {
+			// Read-only SELECT feed: only the touched columns are read, each resolved straight from
+			// its leaf into one reused row whose untouched slots stay NULL — the form sort state
+			// holds (memory.md §6.1; packed-leaf.md §11 Track A5). The sort takes the row only when
+			// it keeps it: the sorter always, the top-k heap when the row enters it.
+			var scratch storedRow
+			_, _, err := store.rows.foldScan(b, store.leafSrc(), func(n *pnode, ri int) error {
 				if err := meter.Step(); err != nil { // enforce the cost ceiling per scanned row (CLAUDE.md §13)
-					return false, err
+					return err
 				}
 				meter.Charge(costs.StorageRowRead)
-				row, err := store.resolveColumns(row, plan.relMasks[0])
+				row, err := store.readMasked(n, ri, plan.relMasks[0], scratch)
 				if err != nil {
-					return false, err
+					return err
 				}
+				scratch = row
 				keep := true
 				if plan.filter != nil {
 					before := meter.Accrued
 					v, err := plan.filter.evalFilter(row, env, meter)
 					filterWork += meter.Accrued - before
 					if err != nil {
-						return false, err
+						return err
 					}
 					keep = v
 				}
 				if keep {
 					survivorCount++
-					// Sort state holds only the touched columns (memory.md §6.1).
-					row = topKPruneUntouched(row, plan.relMasks[0])
 					var pushed error
 					if useTopK {
-						pushed = t.push(row)
+						var kept bool
+						if kept, pushed = t.offer(row); kept {
+							scratch = nil
+						}
 					} else if pushed = chargeSortKeys(meter, row, plan.order); pushed == nil {
 						pushed = s.push(row)
+						scratch = nil // the sorter keeps the row
 					}
 					if err := meter.costFirst(pushed); err != nil {
-						return false, err
+						return err
 					}
 				}
-				return true, nil // never stop early — the sort must see every row
+				return nil // never stop early — the sort must see every row
 			})
 			if err != nil {
 				return emitter{}, err

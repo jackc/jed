@@ -5633,6 +5633,34 @@ func (p *packedLeaf) value(c, i int) (Value, error) {
 	return readValueLazy(p.colTypes, c, vb, &pos, p.cap, p.paging)
 }
 
+// valueResolved is value for a reader that uses the value at once (packed-leaf.md §11 Track A5): a
+// present inline body is decoded straight from its stored span, skipping the deferred handle and the
+// span walk that builds it; an out-of-line or compressed value keeps the deferred route and is
+// resolved here. The result is the value resolving value's handle would give.
+func (p *packedLeaf) valueResolved(c, i int) (Value, error) {
+	if p.dirs.isNull(c, i) {
+		return NullValue(), nil
+	}
+	vb, err := p.dirs.value(c, i)
+	if err != nil {
+		return Value{}, err
+	}
+	ty := p.colTypes[c]
+	pos := 0
+	if _, fixed := fixedValueWidth(ty); fixed {
+		return readInlineBody(ty, vb, &pos, decodeConstruct)
+	}
+	if len(vb) > 0 && vb[0] == 0x00 {
+		pos = 1
+		return readInlineBody(ty, vb, &pos, decodeConstruct)
+	}
+	v, err := readValueLazy(p.colTypes, c, vb, &pos, p.cap, p.paging)
+	if err != nil || v.Kind != ValUnfetched {
+		return v, err
+	}
+	return resolveUnfetchedSelf(v.unfetched())
+}
+
 // valueSpan returns the stored bytes of value (record i, column c), borrowed from the page — a
 // variable column's tagged codec bytes (presence tag + inline body or out-of-line pointer), a
 // fixed-width column's untagged slot — and false for NULL (packed-leaf.md §11 Track A4). A span the
@@ -7031,9 +7059,32 @@ func decodeDecimalBody(buf []byte, pos *int, mode decodeMode) (Value, error) {
 	if err != nil {
 		return Value{}, err
 	}
+	// At most four groups (below 10^16): fold them into one integer straight from the buffer. A
+	// short buffer or a bad group falls through to the loop below, which reports it exactly as before.
+	if n := int(ndigits); mode.constructs() && n <= 4 && *pos+2*n <= len(buf) {
+		var v uint64
+		ok := true
+		for i := 0; i < n; i++ {
+			g := binary.BigEndian.Uint16(buf[*pos+2*i:])
+			if g > 9999 {
+				ok = false
+				break
+			}
+			v = v*10_000 + uint64(g)
+		}
+		if ok {
+			*pos += 2 * n
+			return decimalValueU64(flags&1 != 0, uint32(scale), v), nil
+		}
+	}
 	var groups []uint16
+	var small [smallNbase4Groups]uint16 // a coefficient this short never leaves the stack
 	if mode.constructs() {
-		groups = make([]uint16, ndigits)
+		if int(ndigits) <= len(small) {
+			groups = small[:ndigits]
+		} else {
+			groups = make([]uint16, ndigits)
+		}
 	}
 	for i := 0; i < int(ndigits); i++ {
 		g, err := readU16(buf, pos) // advance in both modes

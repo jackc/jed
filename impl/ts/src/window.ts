@@ -1175,6 +1175,28 @@ export class TopKKeeper {
     }
   }
 
+  // offer is push for a caller that reuses its row: the heap takes `row` (returning true) only when
+  // it retains it, and a row it rejects stays the caller's to overwrite. Charges and the retained
+  // set are exactly push's.
+  offer(row: Row): boolean {
+    if (this.collated || this.k === 0n || BigInt(this.items.length) < this.k) {
+      this.push(row);
+      return true;
+    }
+    const pos = this.nextPos++;
+    chargeSortKeys(this.meter, row, this.order);
+    // A full heap keeps the newcomer only when it sorts strictly before the root; an equal key loses
+    // to the root's earlier input position.
+    if (cmpRowsByOrder(row, this.items[0]!.row, this.order) >= 0) return false;
+    if (this.charge.active()) {
+      this.charge.reserveDirect(rowBytes(row));
+      this.charge.release(rowBytes(this.items[0]!.row));
+    }
+    this.items[0] = { keys: [], row, pos };
+    this.siftDown(0);
+    return true;
+  }
+
   private siftUp(child: number): void {
     while (child > 0) {
       const parent = Math.floor((child - 1) / 2);

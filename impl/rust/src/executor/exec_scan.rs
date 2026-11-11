@@ -2832,11 +2832,24 @@ impl Engine {
             decompress: 0,
         };
         let mut n_emit = 0usize;
+        // Whether the scan stopped on a filter error (for the exact accounting below).
+        let mut filter_failed = false;
         let (row_count, pages) = if do_scan {
             let mut visited = 0usize;
             let mut visit = |node: &crate::pmap::Node, i: usize| -> Result<()> {
                 if visited & 255 == 0 {
                     meter.checkpoint()?;
+                    // Under a ceiling this gather is an attempt (cost.md §6.1): stop within a batch of
+                    // the cost it has earned but not yet charged reaching the ceiling.
+                    let pending = COSTS.storage_row_read * visited as i64
+                        + COSTS.page_read * units.pages as i64
+                        + COSTS.value_decompress * units.decompress as i64;
+                    if meter.pending_trips(pending) {
+                        return Err(EngineError::new(
+                            SqlState::CostLimitExceeded,
+                            "the columnar gather reached the cost limit",
+                        ));
+                    }
                 }
                 visited += 1;
                 if spillable {
@@ -2844,10 +2857,15 @@ impl Engine {
                     units.pages += u.pages;
                     units.decompress += u.decompress;
                 }
-                if let Some(filter) = &span
-                    && !filter.keep(node, i, &mut scratch, env, meter)?
-                {
-                    return Ok(());
+                if let Some(filter) = &span {
+                    match filter.keep(node, i, &mut scratch, env, meter) {
+                        Ok(true) => {}
+                        Ok(false) => return Ok(()),
+                        Err(e) => {
+                            filter_failed = true;
+                            return Err(e);
+                        }
+                    }
                 }
                 for (g, &c) in gather_cols.iter().enumerate() {
                     cols[c].push(if reuse[g] {
@@ -2868,6 +2886,17 @@ impl Engine {
                         COSTS.page_read * (pages + units.pages) as i64
                             + COSTS.value_decompress * units.decompress as i64
                             + COSTS.storage_row_read * visited as i64,
+                    );
+                } else if filter_failed && meter.can_batch_costs() {
+                    // A filter error leaves what the row path would have accrued at the same error
+                    // (cost.md §6.2): it scans the whole bound before it filters.
+                    let (all_pages, slabs) = store.overlap_scan_units(&b, mask)?;
+                    let (all_rows, _, counted) = store.fold_scan_masked(&b, &mut |_, _| Ok(()));
+                    counted?;
+                    meter.charge(
+                        COSTS.value_decompress * slabs as i64
+                            + COSTS.page_read * all_pages as i64
+                            + COSTS.storage_row_read * all_rows as i64,
                     );
                 }
                 return Err(e);
@@ -3082,6 +3111,7 @@ impl Engine {
                         &src,
                         survivors.len(),
                         &self.session.time_zone,
+                        env,
                         meter,
                     )?]
                 } else {
@@ -3091,6 +3121,7 @@ impl Engine {
                         &src,
                         survivors.len(),
                         &self.session.time_zone,
+                        env,
                         meter,
                     )?
                 };
@@ -3102,6 +3133,16 @@ impl Engine {
             }
         };
 
+        // An ORDER BY over the groups of the unbounded form: the eager aggregate branch's own stage —
+        // each order-expression value appended to its group row and admitted, then the in-place sort
+        // (memory.md §5.4).
+        let mut srows = srows;
+        if !plan.order.is_empty() {
+            materialize_order_exprs(&mut srows, &plan.order_exprs, env, meter)?;
+            let acct = meter.query.clone();
+            let r = sort_rows(&mut srows, &plan.order, &acct, meter);
+            meter.cost_first(r)?;
+        }
         // LIMIT/OFFSET window over the synthetic rows, mirroring the scalar branch's window_bounds
         // (clamped in the i64 domain before indexing). Emit as Buffer{Project} — the drive charges
         // row_produced + the projection over each windowed synthetic row exactly as for a scalar
@@ -3234,7 +3275,9 @@ impl Engine {
         let operands: Vec<OperandRead> = plan
             .agg_specs
             .iter()
-            .map(|spec| match operand_col(spec) {
+            .enumerate()
+            .map(|(si, spec)| match operand_col(spec) {
+                None if spec.operand.is_some() => OperandRead::Expr(si),
                 None => OperandRead::None,
                 Some(c) if matches!(spec.plan, AggPlan::Count) => OperandRead::Nullness(c),
                 Some(c) if crate::format::fixed_value_width(&col_types[c]).is_some() => {
@@ -3244,11 +3287,30 @@ impl Engine {
                 Some(c) => OperandRead::Variable(c),
             })
             .collect();
+        // An expression operand is evaluated over the scratch row: the columns it reads, resolved
+        // once per record (shared with a filter that read them).
+        let operand_cols: Vec<Vec<usize>> = plan
+            .agg_specs
+            .iter()
+            .map(|spec| match &spec.operand {
+                Some(e) if !matches!(e, RExpr::Column(_)) => {
+                    let mut reads = vec![false; mask.len()];
+                    collect_touched(e, 0, &mut reads);
+                    (0..mask.len()).filter(|&c| reads[c] && mask[c]).collect()
+                }
+                _ => Vec::new(),
+            })
+            .collect();
+        let expr_ops = has_expression_operand(plan);
         let mut units = crate::format::ScanUnits {
             pages: 0,
             decompress: 0,
         };
         let mut nsurv = 0usize;
+        // What the folds themselves have charged (decimal work, long comparisons), and whether the
+        // scan stopped on a filter error — for the exact accounting of a failed statement below.
+        let mut fold_live = 0i64;
+        let mut filter_failed = false;
         // The group table (memory.md §6.2): the whole-table group's entry up front, a grouped entry as
         // each group is created; returned after the last group is finalized.
         let mut charge = meter.state_charge();
@@ -3281,15 +3343,34 @@ impl Engine {
                     units.pages += u.pages;
                     units.decompress += u.decompress;
                 }
-                if let Some(filter) = &span
-                    && !filter.keep(node, i, &mut scratch, env, meter)?
-                {
-                    return Ok(());
+                match &span {
+                    Some(filter) => match filter.keep(node, i, &mut scratch, env, meter) {
+                        Ok(true) => {}
+                        Ok(false) => return Ok(()),
+                        Err(e) => {
+                            filter_failed = true;
+                            return Err(e);
+                        }
+                    },
+                    // No filter started a scratch record; an expression operand fills one.
+                    None if expr_ops => scratch.next_record(),
+                    None => {}
                 }
                 nsurv += 1;
+                let fold_start = meter.accrued;
                 // Aggregate `si`'s operand for this record.
-                let operand = |read: OperandRead, scratch: &ScratchRow| -> Result<Value> {
+                let operand = |read: OperandRead,
+                               scratch: &mut ScratchRow,
+                               meter: &mut Meter|
+                 -> Result<Value> {
                     Ok(match read {
+                        OperandRead::Expr(si) => {
+                            for &c in &operand_cols[si] {
+                                scratch.ensure(node, i, c)?;
+                            }
+                            let expr = plan.agg_specs[si].operand.as_ref().expect("an operand");
+                            expr.eval(&scratch.vals, env, meter)?
+                        }
                         OperandRead::None => Value::Null, // COUNT(*) folds no value
                         OperandRead::Nullness(c) => {
                             if node.col_is_null(i, c) {
@@ -3305,8 +3386,10 @@ impl Engine {
                 };
                 if !grouped {
                     for (si, read) in operands.iter().enumerate() {
-                        whole[si].fold(operand(*read, &scratch)?, meter)?;
+                        let v = operand(*read, &mut scratch, meter)?;
+                        whole[si].fold(v, meter)?;
                     }
+                    fold_live += meter.accrued - fold_start;
                     return Ok(());
                 }
                 // A NULL integer key buckets into one sentinel group (the value-canonical key groups
@@ -3321,7 +3404,7 @@ impl Engine {
                     let key = key.map_or(Value::Null, Value::Int);
                     let mut state = spill.state(&key, &plan.agg_specs, zone)?;
                     for (si, read) in operands.iter().enumerate() {
-                        let v = operand(*read, &scratch)?;
+                        let v = operand(*read, &mut scratch, meter)?;
                         super::blocking_spill::LaneGroupSpill::fold(
                             &mut state,
                             si,
@@ -3331,6 +3414,7 @@ impl Engine {
                             meter,
                         )?;
                     }
+                    fold_live += meter.accrued - fold_start;
                     return spill.put(&key, state);
                 }
                 let found = match key {
@@ -3370,7 +3454,7 @@ impl Engine {
                 };
                 let accs = &mut groups[gi].1;
                 for (si, read) in operands.iter().enumerate() {
-                    let v = operand(*read, &scratch)?;
+                    let v = operand(*read, &mut scratch, meter)?;
                     if variable[si] {
                         let before = super::blocking_spill::acc_variable_bytes(&accs[si]);
                         accs[si].fold(v, meter)?;
@@ -3385,6 +3469,7 @@ impl Engine {
                         accs[si].fold(v, meter)?;
                     }
                 }
+                fold_live += meter.accrued - fold_start;
                 // Past `work_mem`, or once the account turns a reservation away, the table hands
                 // over like any spill structure: its whole charge is returned first.
                 if bounded && (resident > budget || rejected) {
@@ -3406,6 +3491,21 @@ impl Engine {
                     );
                     meter.charge(
                         COSTS.aggregate_accumulate * nsurv as i64 * plan.agg_specs.len() as i64,
+                    );
+                } else if filter_failed && meter.can_batch_costs() && !expr_ops {
+                    // A filter error leaves what the row path would have accrued at the same error
+                    // (cost.md §6.2). The row path scans the whole bound, then filters, then folds:
+                    // so the whole scan block and every row read are owed, and nothing the folds
+                    // charged. (Under a ceiling, or with an expression operand, this run is an
+                    // attempt the caller discards.)
+                    meter.refund(fold_live);
+                    let (all_pages, slabs) = store.overlap_scan_units(&b, mask)?;
+                    let (all_rows, _, counted) = store.fold_scan_masked(&b, &mut |_, _| Ok(()));
+                    counted?;
+                    meter.charge(
+                        COSTS.value_decompress * slabs as i64
+                            + COSTS.page_read * all_pages as i64
+                            + COSTS.storage_row_read * all_rows as i64,
                     );
                 }
                 return Err(e);
@@ -3478,6 +3578,8 @@ pub(crate) enum LaneGroups {
 enum OperandRead {
     /// `COUNT(*)`: no operand.
     None,
+    /// An expression: aggregate `si`'s operand, evaluated over the scratch row.
+    Expr(usize),
     /// `COUNT(col)`: only the column's nullness.
     Nullness(usize),
     /// A fixed-width column: its slot, decoded in place (never deferred).

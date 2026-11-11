@@ -142,6 +142,16 @@ func (m *costMeter) rewind(mk meterMark) {
 	}
 }
 
+// refund takes back units a lane charged for work the row path would not yet have done when it
+// raised the same error (cost.md §6.2): the statement and session totals both give them up. Only
+// for an unmetered statement, where no ceiling has been crossed.
+func (m *costMeter) refund(units int64) {
+	m.Accrued -= units
+	if m.lifetimeTotal != nil {
+		*m.lifetimeTotal -= units
+	}
+}
+
 // pendingTrips reports whether pending cost a lane has earned but not yet charged would trip a
 // ceiling (cost.md §6.1): the lane stops its attempt there, within one batch of the ceiling.
 func (m *costMeter) pendingTrips(pending int64) bool {

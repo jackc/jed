@@ -763,7 +763,82 @@ const CEILING_QUERIES: &[&str] = &[
     "SELECT * FROM (SELECT n, sum(d) AS t FROM ct GROUP BY n) g WHERE t IS NOT NULL",
     // An uncorrelated scalar subquery is folded to a constant before the lane runs.
     "SELECT count(*), sum(d) FROM ct WHERE n > (SELECT 1)",
+    // Built-in function calls the catalog does not mark volatile.
+    "SELECT n, sum(d) FROM ct WHERE abs(n) > 1 GROUP BY n",
+    "SELECT count(*), sum(d) FROM ct WHERE abs(n) > 1 AND lower(s) <> 'v' AND length(s) < 40",
+    // Expression operands: a run that folds one is always an attempt.
+    "SELECT sum(d * 2), count(big + 1), max(big % 7) FROM ct",
+    "SELECT n, sum(d + id), min(abs(d)) FROM ct WHERE n > 0 GROUP BY n ORDER BY n",
+    // An operand that raises at row 100 and a filter that raises at row 250: the row path filters
+    // every row before it folds any, so the filter's error is the one it reports.
+    "SELECT sum(1000 / (id - 100)) FROM ct WHERE 1000 / (id - 250) <> 7",
+    "SELECT n, sum(1000 / (id - 100)) FROM ct GROUP BY n",
 ];
+
+/// Bare-column projections: the columnar projection lane, an attempt under a ceiling.
+const PROJECTION_QUERIES: &[&str] = &[
+    "SELECT id, d, s FROM ct",
+    "SELECT id, s FROM ct WHERE n > 1 AND d <> 0",
+    "SELECT d, big FROM ct WHERE id BETWEEN 40 AND 200 AND abs(n) < 3",
+    "SELECT id, d FROM ct WHERE 1000 / (id - 200) > 0",
+];
+
+/// Statements whose filter is outside the allowlist, so they run on the plain lane with no ceiling
+/// and keep the row path under one — each failing part-way through its scan.
+const PLAIN_LANE_FAILURES: &[&str] = &[
+    "SELECT count(*), sum(d) FROM ct WHERE s ~ '^v' AND 1000 / (id - 200) > 0",
+    "SELECT n, max(s), sum(d) FROM ct WHERE uuidv4() IS NOT NULL AND 1000 / (id - 77) > 0 GROUP BY n",
+    "SELECT id, s FROM ct WHERE s ~ '^v' AND 1000 / (id - 200) > 0",
+];
+
+/// With no ceiling: the lane (plain, or an attempt for an expression operand) against the row path —
+/// the same statement under a ceiling it never reaches with the attempt off, which accrues exactly
+/// what the unmetered row path does. Rows and cost, or the error and what it left accrued.
+fn unmetered_matches_row_path(db: &mut Session, sql: &str) {
+    db.set_max_cost(0);
+    let lane = metered_outcome(db, sql);
+    db.set_max_cost(i64::MAX / 4);
+    jed::tooling::LANE_CEILING_OFF.set(true);
+    let row = metered_outcome(db, sql);
+    jed::tooling::LANE_CEILING_OFF.set(false);
+    db.set_max_cost(0);
+    assert_eq!(lane, row, "unmetered lane vs row path: {sql}");
+}
+
+fn unmetered_lane_matches_row_path(file: Option<&str>) {
+    let (path, mut db) = ct_session(file);
+    let work_mems: &[usize] = if path.is_some() {
+        &[1, 400, jed::DEFAULT_WORK_MEM]
+    } else {
+        &[jed::DEFAULT_WORK_MEM]
+    };
+    for &work_mem in work_mems {
+        db.set_work_mem(work_mem);
+        for q in CEILING_QUERIES
+            .iter()
+            .chain(PROJECTION_QUERIES)
+            .chain(PLAIN_LANE_FAILURES)
+        {
+            unmetered_matches_row_path(&mut db, q);
+        }
+    }
+    drop(db);
+    if let Some(p) = path {
+        remove_db(&p);
+    }
+}
+
+/// cost.md §6.2: a statement that fails on a lane leaves the cumulative cost the row path leaves, and
+/// an expression-operand lane reports the error the row path reports.
+#[test]
+fn unmetered_lane_matches_row_path_on_a_file() {
+    unmetered_lane_matches_row_path(Some("jed_unmetered_lanes.jed"));
+}
+
+#[test]
+fn unmetered_lane_matches_row_path_in_memory() {
+    unmetered_lane_matches_row_path(None);
+}
 
 fn lane_under_a_ceiling_matches_row_path(file: Option<&str>) {
     let (path, mut db) = ct_session(file);
@@ -774,11 +849,6 @@ fn lane_under_a_ceiling_matches_row_path(file: Option<&str>) {
         let before = attempts();
         sweep_max_cost(&mut db, q, step);
         let (tried, fell_back) = attempts();
-        // In memory an ordered grouping does not take the lane at all (packed-leaf.md §11 Track A5).
-        if path.is_none() && q.contains("ORDER BY") {
-            assert_eq!((tried, fell_back), before, "attempted in memory: {q}");
-            continue;
-        }
         assert!(tried > before.0, "the lane was never attempted: {q}");
         // A statement that completes was accepted at its high ceilings and rejected at its low ones.
         assert!(fell_back > before.1, "the lane never fell back: {q}");
@@ -788,6 +858,21 @@ fn lane_under_a_ceiling_matches_row_path(file: Option<&str>) {
                 "the lane was never accepted: {q}"
             );
         }
+        sweep_lifetime(&mut db, q, 41);
+    }
+    // The projection lane under a ceiling.
+    for q in PROJECTION_QUERIES {
+        let before = attempts();
+        sweep_max_cost(&mut db, q, step);
+        let (tried, fell_back) = attempts();
+        assert!(
+            tried > before.0,
+            "the projection lane was never attempted: {q}"
+        );
+        assert!(
+            fell_back > before.1,
+            "the projection lane never fell back: {q}"
+        );
         sweep_lifetime(&mut db, q, 41);
     }
     // The grouped fold handing over to the spill structures part-way (file only).
@@ -800,11 +885,13 @@ fn lane_under_a_ceiling_matches_row_path(file: Option<&str>) {
         }
         db.set_work_mem(jed::DEFAULT_WORK_MEM);
     }
-    // Not safe to discard — entropy, a function call, a correlated subquery, a regex — so never
+    // Not safe to discard — entropy, the per-call clock, a correlated subquery, a regex — so never
     // attempted.
     for q in [
         "SELECT count(*), sum(d) FROM ct WHERE uuidv4() IS NOT NULL",
-        "SELECT n, sum(d) FROM ct WHERE abs(n) > 1 GROUP BY n",
+        "SELECT n, sum(d) FROM ct WHERE clock_timestamp() IS NOT NULL GROUP BY n",
+        "SELECT sum(d * 2) FROM ct WHERE s ~ '^v'",
+        "SELECT id, d FROM ct WHERE s ~ '^v'",
         "SELECT count(*) FROM ct WHERE n > (SELECT count(*) FROM ct c WHERE c.id = ct.id)",
         "SELECT count(*) FROM ct WHERE s ~ '^vx+1'",
     ] {

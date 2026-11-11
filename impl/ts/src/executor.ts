@@ -1,4 +1,4 @@
-import { cancellationCheckpoint, hasCancellation } from "./cancel.ts";
+import { cancellationCheckpoint } from "./cancel.ts";
 import {
   callSteps,
   uncancelableSteps,
@@ -8,7 +8,14 @@ import {
   type Steps,
   type StepIterator,
 } from "./execution.ts";
-import { evalExprSteps, evalFilterSteps, evalExpressionsSteps } from "./eval.ts";
+import {
+  evalExprMaybeSteps,
+  evalExprSteps,
+  evalFilterMaybeSteps,
+  evalFilterSteps,
+  evalExpressionsSteps,
+  isPendingEval,
+} from "./eval.ts";
 // Statement executor (CLAUDE.md §10). Mirrors executor.go / executor.rs: dispatch a
 // parsed statement; analyze (resolve types, predicates, projections against the
 // catalog); run. Errors throw EngineError. Results are produced deterministically
@@ -414,13 +421,14 @@ import {
   type KeyBound,
   type PNode,
   colAt,
+  colAtNow,
   colIsNull,
   compareBytes,
   unboundedBound,
 } from "./pmap.ts";
 import {
   compileLaneFilter,
-  laneKeepSteps,
+  laneKeepMaybe,
   laneReuse,
   readLeafColumnSteps,
   ScratchRow,
@@ -25332,33 +25340,46 @@ export class Engine {
       let survivorCount = 0n;
       try {
         if (!empty) {
-          // Read-only SELECT feed: reconstruct only the touched columns (Track A1).
-          yield* store.scanRangeSteps(
+          // Read-only SELECT feed: only the touched columns are read, each resolved straight from
+          // its leaf (the columnar lanes' walk, packed-leaf.md §11 Track A5) into one reused row
+          // whose untouched slots stay NULL — the form sort state holds (memory.md §6.1). The
+          // sort takes the row only when it keeps it: the sorter always, the top-k heap when the
+          // row enters it. The sort never stops early — it must see every row.
+          const width = store.columnTypes().length;
+          let scratch: Row | null = null;
+          yield* store.foldLeavesMaskedSteps(
             bound,
-            function* (this: Engine, _key: Uint8Array, rawRow: Row): Steps<boolean> {
-              meter.guard(); // enforce the cost ceiling per scanned row (CLAUDE.md §13)
-              meter.charge(COSTS.storageRowRead);
-              const row = yield* store.resolveColumnsSteps(rawRow, mask);
-              if (plan.filter !== null) {
-                const before = meter.accrued;
-                const keep = yield* evalFilterSteps(plan.filter, row, env, meter);
-                filterWork += meter.accrued - before;
-                if (!keep) return true;
-              }
-              survivorCount++;
-              // Sort state holds only the touched columns (memory.md §6.1); a structure reserving
-              // without the meter reports a reached cost ceiling first (§6.7).
-              const owned = nullUntouched(row, mask);
-              // A survivor's sort keys are charged as the sorter receives it (cost.md §3
-              // "sort_key / hash_key"); the keeper charges its own.
-              meter.costFirst(() => {
-                if (keeper !== null) keeper.push(owned);
-                else {
-                  chargeSortKeys(meter, owned, plan.order);
-                  sorter!.push(owned);
+            function* (this: Engine, node: PNode, first: number, last: number): Steps<void> {
+              for (let i = first; i <= last; i++) {
+                meter.guard(); // enforce the cost ceiling per scanned row (CLAUDE.md §13)
+                meter.charge(COSTS.storageRowRead);
+                if (scratch === null) scratch = new Array(width).fill(nullValue());
+                const row: Row = scratch;
+                for (let c = 0; c < width; c++) {
+                  if (c >= mask.length || mask[c])
+                    row[c] = colAtNow(node, i, c) ?? (yield* readLeafColumnSteps(node, i, c));
                 }
-              });
-              return true; // never stop early — the sort must see every row
+                if (plan.filter !== null) {
+                  const before = meter.accrued;
+                  const pending = evalFilterMaybeSteps(plan.filter, row, env, meter);
+                  const keep = isPendingEval(pending) ? yield* pending : pending;
+                  filterWork += meter.accrued - before;
+                  if (!keep) continue;
+                }
+                survivorCount++;
+                // A survivor's sort keys are charged as the sorter receives it (cost.md §3
+                // "sort_key / hash_key"); the keeper charges its own. A structure reserving without
+                // the meter reports a reached cost ceiling first (§6.7).
+                meter.costFirst(() => {
+                  if (keeper !== null) {
+                    if (keeper.offer(row)) scratch = null;
+                  } else {
+                    chargeSortKeys(meter, row, plan.order);
+                    sorter!.push(row);
+                    scratch = null;
+                  }
+                });
+              }
             }.bind(this),
           );
         }
@@ -26443,20 +26464,81 @@ export class Engine {
     let pages = 0;
     if (doScan) {
       const reuse = laneReuse(store.columnTypes(), span !== null);
-      const visit = function* (this: Engine, n: PNode, i: number): Steps<void> {
-        if (spillable) store.laneScanUnits(n, i, mask, units);
-        if (span !== null && !(yield* laneKeepSteps(span, n, i, scratch, env, meter))) return;
-        for (const c of gatherCols) {
-          if (shouldCooperate()) yield COOPERATE;
-          cols[c]!.push(
-            reuse[c] ? yield* scratch.readSteps(n, i, c) : yield* readLeafColumnSteps(n, i, c),
+      const metered = meter.hasCeiling();
+      let inFilter = false;
+      let visited = 0;
+      // One loop per leaf (packed-leaf.md §11 Track A5): a record whose filter and values need no
+      // page read builds no continuation of its own.
+      const visitLeaf = function* (
+        this: Engine,
+        n: PNode,
+        first: number,
+        last: number,
+      ): Steps<void> {
+        for (let i = first; i <= last; i++) {
+          if ((visited & 255) === 0) {
+            // Cancellation and the ceilings, at most every 256 records (the Rust core's cadence).
+            meter.guard();
+            // Under a ceiling this gather is an attempt (cost.md §6.1): stop within a batch of the
+            // cost it has earned but not yet charged reaching the ceiling.
+            if (metered) {
+              const pending =
+                COSTS.storageRowRead * BigInt(visited) +
+                COSTS.pageRead * BigInt(units.pages) +
+                COSTS.valueDecompress * BigInt(units.decompress);
+              if (meter.pendingTrips(pending))
+                throw engineError(
+                  "cost_limit_exceeded",
+                  "the columnar gather reached the cost limit",
+                );
+            }
+          }
+          visited++;
+          if (spillable) store.laneScanUnits(n, i, mask, units);
+          if (span !== null) {
+            inFilter = true;
+            const keep = laneKeepMaybe(span, n, i, scratch, env, meter);
+            const kept = isPendingEval(keep) ? yield* keep : keep;
+            inFilter = false;
+            if (!kept) continue;
+          }
+          for (const c of gatherCols) {
+            if (shouldCooperate()) yield COOPERATE;
+            cols[c]!.push(
+              reuse[c]
+                ? (scratch.readNow(n, i, c) ?? (yield* scratch.readSteps(n, i, c)))
+                : (colAtNow(n, i, c) ?? (yield* readLeafColumnSteps(n, i, c))),
+            );
+          }
+          nEmit++;
+        }
+      }.bind(this);
+      const progress = { nodes: 0 };
+      try {
+        const r = yield* store.foldLeavesMaskedSteps(b, visitLeaf, progress);
+        rowCount = r.rowCount;
+        pages = r.nodes;
+      } catch (error) {
+        if (error instanceof EngineError && error.state === "query_canceled") {
+          // Preserve consumed work even though successful scans charge in bulk.
+          meter.charge(
+            COSTS.pageRead * BigInt(progress.nodes + units.pages) +
+              COSTS.valueDecompress * BigInt(units.decompress) +
+              COSTS.storageRowRead * BigInt(visited),
+          );
+        } else if (inFilter && !metered) {
+          // A filter error leaves what the row path would have accrued at the same error
+          // (cost.md §6.2): it scans the whole bound before it filters.
+          const block = yield* store.overlapScanUnitsSteps(b, mask);
+          const all = yield* store.foldLeavesMaskedSteps(b, countOnlyLeaf);
+          meter.charge(
+            COSTS.valueDecompress * BigInt(block.slabs) +
+              COSTS.pageRead * BigInt(block.pages) +
+              COSTS.storageRowRead * BigInt(all.rowCount),
           );
         }
-        nEmit++;
-      }.bind(this);
-      const r = yield* store.foldScanMaskedSteps(b, visit);
-      rowCount = r.rowCount;
-      pages = r.nodes;
+        throw error;
+      }
     }
     // Charge the scan cost block identically to materializeRel + scanSource: page_read × (nodes + chain
     // pages), value_decompress × slabs, storage_row_read × rowCount. On the unmetered lane (the caller
@@ -26609,14 +26691,17 @@ export class Engine {
         }
       }
       const at: LaneAt = (j, col) => survivors[j]![col]!;
+      const rowAt = (j: number): Row => survivors[j]!;
       srows =
         gset.keyCols.length === 0
           ? [
               yield* foldAggWholeSteps(
                 plan.aggSpecs,
                 at,
+                rowAt,
                 survivors.length,
                 this.session.timeZone,
+                env,
                 meter,
               ),
             ]
@@ -26624,8 +26709,10 @@ export class Engine {
               plan.aggSpecs,
               gset.keyCols[0]!,
               at,
+              rowAt,
               survivors.length,
               this.session.timeZone,
+              env,
               meter,
             );
       for (const r of srows) {
@@ -26635,6 +26722,14 @@ export class Engine {
       meter.releaseRowsMasked(survivors, mask);
     }
 
+    // An ORDER BY over the groups of the unbounded form: the eager aggregate branch's own stage —
+    // each order-expression value appended to its group row and admitted, then the in-place sort
+    // (memory.md §5.4).
+    if (plan.order.length > 0) {
+      const ordered = srows;
+      yield* materializeOrderExprsSteps(ordered, plan.orderExprs, env, meter);
+      meter.costFirst(() => sortRows(ordered, plan.order, meter.query, meter));
+    }
     // LIMIT/OFFSET window over the synthetic rows, mirroring the scalar branch's windowBounds (clamped in
     // the bigint domain before indexing). Emit as "project" — the drive charges rowProduced + the
     // projection over each windowed synthetic row exactly as for a scalar aggregate result.
@@ -26752,141 +26847,257 @@ export class Engine {
         const reuse = laneReuse(store.columnTypes(), span !== null);
         // How each aggregate reads its operand, decided once so the per-record loop allocates nothing
         // for it: 0 none (COUNT(*)), 1 nullness only (COUNT(col), Track A4), 2 the value the filter
-        // resolved, 3 straight from the leaf.
+        // resolved, 3 straight from the leaf, 4 an expression evaluated over the scratch row.
         const opCol = plan.aggSpecs.map((spec) => operandCol(spec) ?? 0);
         const opKind = plan.aggSpecs.map((spec) => {
           const oc = operandCol(spec);
-          return oc === null ? 0 : spec.plan === "count" ? 1 : reuse[oc] ? 2 : 3;
+          if (oc === null) return spec.operand === null ? 0 : 4;
+          return spec.plan === "count" ? 1 : reuse[oc] ? 2 : 3;
         });
+        // An expression operand reads these columns off the scratch row, each resolved once per
+        // record (shared with a filter that read them).
+        const opReads: number[][] = plan.aggSpecs.map((spec) => {
+          const e = spec.operand;
+          if (e === null || e.kind === "column") return [];
+          const reads: boolean[] = new Array(mask.length).fill(false);
+          collectTouched(e, 0, reads);
+          const cols: number[] = [];
+          for (let c = 0; c < mask.length; c++) if (reads[c] && mask[c]) cols.push(c);
+          return cols;
+        });
+        const exprOps = hasExpressionOperand(plan);
         const metered = meter.hasCeiling();
+        // An unmetered run with no expression operand is not an attempt, so a filter error settles
+        // to the row path's accrual (cost.md §6.2): what the folds themselves charged (decimal
+        // work, long comparisons) is tracked to be given back.
+        const settle = !metered && !exprOps;
+        let foldLive = 0n;
+        let inFilter = false;
         let visited = 0;
-        const visit = function* (this: Engine, n: PNode, i: number): Steps<void> {
-          if (metered && (visited & 255) === 0) {
-            meter.guard();
-            // Under a ceiling this fold is an attempt (cost.md §6.1): once the cost it has earned but
-            // not yet charged would trip, the statement cannot complete, so stop within this batch.
-            // The caller discards the attempt and its error.
-            const pending =
-              COSTS.storageRowRead * BigInt(visited) +
-              COSTS.pageRead * BigInt(units.pages) +
-              COSTS.valueDecompress * BigInt(units.decompress) +
-              COSTS.aggregateAccumulate * BigInt(nsurv) * BigInt(plan.aggSpecs.length);
-            if (meter.pendingTrips(pending))
-              throw engineError("cost_limit_exceeded", "the columnar fold reached the cost limit");
-          }
-          visited++;
-          if (spillable) store.laneScanUnits(n, i, mask, units);
-          if (span !== null && !(yield* laneKeepSteps(span, n, i, scratch, env, meter))) return;
-          nsurv++;
-          if (!grouped) {
-            for (let s = 0; s < plan.aggSpecs.length; s++) {
-              if (shouldCooperate()) yield COOPERATE;
-              const k = opKind[s]!;
-              const v: Value =
-                k === 0
-                  ? nullValue() // COUNT(*) folds no value
-                  : k === 1
-                    ? colIsNull(n, i, opCol[s]!)
-                      ? nullValue()
-                      : { kind: "bool", value: true }
-                    : k === 2
-                      ? yield* scratch.readSteps(n, i, opCol[s]!)
-                      : yield* readLeafColumnSteps(n, i, opCol[s]!);
-              foldAcc(whole[s]!, v, meter);
-            }
-            return;
-          }
-          // A NULL integer key buckets into one sentinel group (matching the scalar/lane path).
-          const kv = colAt(n, i, keyCol);
-          const key: Value = kv.kind === "int" ? kv : nullValue();
-          if (spilled !== null) {
-            // Handed over: the per-row step the bounded-spill aggregate runs — load the group's state,
-            // fold each aggregate, store it back. An integer key charges no hash work.
-            const k = distinctRowKey([key]);
-            const previous = spilled.states.get(k);
-            const accs =
-              previous === undefined
-                ? fresh()
-                : decodeBlockingAccs(previous, plan.aggSpecs, zone).accs;
-            if (previous === undefined) spilled.order.push([key]);
-            for (let s = 0; s < plan.aggSpecs.length; s++) {
-              if (shouldCooperate()) yield COOPERATE;
-              const k = opKind[s]!;
-              const v: Value =
-                k === 0
-                  ? nullValue() // COUNT(*) folds no value
-                  : k === 1
-                    ? colIsNull(n, i, opCol[s]!)
-                      ? nullValue()
-                      : { kind: "bool", value: true }
-                    : k === 2
-                      ? yield* scratch.readSteps(n, i, opCol[s]!)
-                      : yield* readLeafColumnSteps(n, i, opCol[s]!);
-              foldAcc(accs[s]!, v, meter);
-            }
-            spilled.states.set(
-              k,
-              encodeBlockingAccs([], accs),
-              previous === undefined ? keyBytes([key]) : 0,
-              packedStateBytes(accs),
-            );
-            return;
-          }
-          let gi = key.kind === "int" ? (index.get(key.int) ?? -1) : nullGi;
-          if (gi < 0) {
-            if (bounded) {
-              // The bounded table reserves what it measures (memory.md §6.6.1).
-              if (!charge.tryReserveDirect(groupBase)) rejected = true;
-            } else if (charge.active()) {
-              charge.reserve(meter, entryBytes([key]));
-            }
-            gi = groups.length;
-            if (key.kind === "int") index.set(key.int, gi);
-            else nullGi = gi;
-            groups.push({ key, accs: fresh() });
-            resident += groupBase;
-          }
-          const accs = groups[gi]!.accs;
-          for (let s = 0; s < plan.aggSpecs.length; s++) {
-            if (shouldCooperate()) yield COOPERATE;
-            const k = opKind[s]!;
-            const v: Value =
-              k === 0
-                ? nullValue() // COUNT(*) folds no value
-                : k === 1
-                  ? colIsNull(n, i, opCol[s]!)
-                    ? nullValue()
-                    : { kind: "bool", value: true }
-                  : k === 2
-                    ? yield* scratch.readSteps(n, i, opCol[s]!)
-                    : yield* readLeafColumnSteps(n, i, opCol[s]!);
-            if (variable[s]) {
-              const before = accVariableBytes(accs[s]!);
-              foldAcc(accs[s]!, v, meter);
-              const delta = accVariableBytes(accs[s]!) - before;
-              resident += delta;
-              if (delta > 0) {
-                if (!charge.tryReserveDirect(delta)) rejected = true;
-              } else if (delta < 0) {
-                charge.release(-delta);
+        // One loop per leaf (packed-leaf.md §11 Track A5): a record whose filter and operands need
+        // no page read builds no continuation of its own.
+        const visitLeaf = function* (
+          this: Engine,
+          n: PNode,
+          first: number,
+          last: number,
+        ): Steps<void> {
+          for (let i = first; i <= last; i++) {
+            if ((visited & 255) === 0) {
+              // Cancellation and the ceilings, at most every 256 records (the Rust core's cadence).
+              meter.guard();
+              // Under a ceiling this fold is an attempt (cost.md §6.1): once the cost it has
+              // earned but not yet charged would trip, the statement cannot complete, so stop
+              // within this batch. The caller discards the attempt and its error.
+              if (metered) {
+                const pending =
+                  COSTS.storageRowRead * BigInt(visited) +
+                  COSTS.pageRead * BigInt(units.pages) +
+                  COSTS.valueDecompress * BigInt(units.decompress) +
+                  COSTS.aggregateAccumulate * BigInt(nsurv) * BigInt(plan.aggSpecs.length);
+                if (meter.pendingTrips(pending))
+                  throw engineError(
+                    "cost_limit_exceeded",
+                    "the columnar fold reached the cost limit",
+                  );
               }
-            } else {
-              foldAcc(accs[s]!, v, meter);
             }
-          }
-          // Past work_mem, or once the account turns a reservation away, the table hands over like any
-          // spill structure: its whole charge is returned first.
-          if (bounded && (resident > budget || rejected)) {
-            charge.releaseAll();
-            spilled = this.laneGroupHandover(groups, resources);
-            groups = [];
-            index = new Map<bigint, number>();
-            nullGi = -1;
+            visited++;
+            if (spillable) store.laneScanUnits(n, i, mask, units);
+            if (span !== null) {
+              inFilter = true;
+              const keep = laneKeepMaybe(span, n, i, scratch, env, meter);
+              const kept = isPendingEval(keep) ? yield* keep : keep;
+              inFilter = false;
+              if (!kept) continue;
+            } else if (exprOps) {
+              // No filter started a scratch record; an expression operand fills one.
+              scratch.nextRecord();
+            }
+            nsurv++;
+            const foldStart = meter.accrued;
+            if (!grouped) {
+              for (let s = 0; s < plan.aggSpecs.length; s++) {
+                if (shouldCooperate()) yield COOPERATE;
+                const k = opKind[s]!;
+                const oc = opCol[s]!;
+                let v: Value;
+                if (k === 4) {
+                  const reads = opReads[s]!;
+                  for (let x = 0; x < reads.length; x++) {
+                    const c = reads[x]!;
+                    if (!scratch.ensureNow(n, i, c)) yield* scratch.ensureSteps(n, i, c);
+                  }
+                  const e = plan.aggSpecs[s]!.operand!;
+                  const r = evalExprMaybeSteps(e, scratch.vals, env, meter);
+                  v = isPendingEval(r) ? yield* r : r;
+                } else {
+                  v =
+                    k === 0
+                      ? nullValue() // COUNT(*) folds no value
+                      : k === 1
+                        ? colIsNull(n, i, oc)
+                          ? nullValue()
+                          : { kind: "bool", value: true }
+                        : k === 2
+                          ? (scratch.readNow(n, i, oc) ?? (yield* scratch.readSteps(n, i, oc)))
+                          : (colAtNow(n, i, oc) ?? (yield* readLeafColumnSteps(n, i, oc)));
+                }
+                foldAcc(whole[s]!, v, meter);
+              }
+              if (settle && meter.accrued !== foldStart) foldLive += meter.accrued - foldStart;
+              continue;
+            }
+            // A NULL integer key buckets into one sentinel group (matching the scalar/lane path).
+            const kv = colAt(n, i, keyCol);
+            const key: Value = kv.kind === "int" ? kv : nullValue();
+            if (spilled !== null) {
+              // Handed over: the per-row step the bounded-spill aggregate runs — load the group's
+              // state, fold each aggregate, store it back. An integer key charges no hash work.
+              const k = distinctRowKey([key]);
+              const previous = spilled.states.get(k);
+              const accs =
+                previous === undefined
+                  ? fresh()
+                  : decodeBlockingAccs(previous, plan.aggSpecs, zone).accs;
+              if (previous === undefined) spilled.order.push([key]);
+              for (let s = 0; s < plan.aggSpecs.length; s++) {
+                if (shouldCooperate()) yield COOPERATE;
+                const k = opKind[s]!;
+                const oc = opCol[s]!;
+                let v: Value;
+                if (k === 4) {
+                  const reads = opReads[s]!;
+                  for (let x = 0; x < reads.length; x++) {
+                    const c = reads[x]!;
+                    if (!scratch.ensureNow(n, i, c)) yield* scratch.ensureSteps(n, i, c);
+                  }
+                  const e = plan.aggSpecs[s]!.operand!;
+                  const r = evalExprMaybeSteps(e, scratch.vals, env, meter);
+                  v = isPendingEval(r) ? yield* r : r;
+                } else {
+                  v =
+                    k === 0
+                      ? nullValue() // COUNT(*) folds no value
+                      : k === 1
+                        ? colIsNull(n, i, oc)
+                          ? nullValue()
+                          : { kind: "bool", value: true }
+                        : k === 2
+                          ? (scratch.readNow(n, i, oc) ?? (yield* scratch.readSteps(n, i, oc)))
+                          : (colAtNow(n, i, oc) ?? (yield* readLeafColumnSteps(n, i, oc)));
+                }
+                foldAcc(accs[s]!, v, meter);
+              }
+              spilled.states.set(
+                k,
+                encodeBlockingAccs([], accs),
+                previous === undefined ? keyBytes([key]) : 0,
+                packedStateBytes(accs),
+              );
+              if (settle && meter.accrued !== foldStart) foldLive += meter.accrued - foldStart;
+              continue;
+            }
+            let gi = key.kind === "int" ? (index.get(key.int) ?? -1) : nullGi;
+            if (gi < 0) {
+              if (bounded) {
+                // The bounded table reserves what it measures (memory.md §6.6.1).
+                if (!charge.tryReserveDirect(groupBase)) rejected = true;
+              } else if (charge.active()) {
+                charge.reserve(meter, entryBytes([key]));
+              }
+              gi = groups.length;
+              if (key.kind === "int") index.set(key.int, gi);
+              else nullGi = gi;
+              groups.push({ key, accs: fresh() });
+              resident += groupBase;
+            }
+            const accs = groups[gi]!.accs;
+            for (let s = 0; s < plan.aggSpecs.length; s++) {
+              if (shouldCooperate()) yield COOPERATE;
+              const k = opKind[s]!;
+              const oc = opCol[s]!;
+              let v: Value;
+              if (k === 4) {
+                const reads = opReads[s]!;
+                for (let x = 0; x < reads.length; x++) {
+                  const c = reads[x]!;
+                  if (!scratch.ensureNow(n, i, c)) yield* scratch.ensureSteps(n, i, c);
+                }
+                const e = plan.aggSpecs[s]!.operand!;
+                const r = evalExprMaybeSteps(e, scratch.vals, env, meter);
+                v = isPendingEval(r) ? yield* r : r;
+              } else {
+                v =
+                  k === 0
+                    ? nullValue() // COUNT(*) folds no value
+                    : k === 1
+                      ? colIsNull(n, i, oc)
+                        ? nullValue()
+                        : { kind: "bool", value: true }
+                      : k === 2
+                        ? (scratch.readNow(n, i, oc) ?? (yield* scratch.readSteps(n, i, oc)))
+                        : (colAtNow(n, i, oc) ?? (yield* readLeafColumnSteps(n, i, oc)));
+              }
+              if (variable[s]) {
+                const before = accVariableBytes(accs[s]!);
+                foldAcc(accs[s]!, v, meter);
+                const delta = accVariableBytes(accs[s]!) - before;
+                resident += delta;
+                if (delta > 0) {
+                  if (!charge.tryReserveDirect(delta)) rejected = true;
+                } else if (delta < 0) {
+                  charge.release(-delta);
+                }
+              } else {
+                foldAcc(accs[s]!, v, meter);
+              }
+            }
+            if (settle && meter.accrued !== foldStart) foldLive += meter.accrued - foldStart;
+            // Past work_mem, or once the account turns a reservation away, the table hands over
+            // like any spill structure: its whole charge is returned first.
+            if (bounded && (resident > budget || rejected)) {
+              charge.releaseAll();
+              spilled = this.laneGroupHandover(groups, resources);
+              groups = [];
+              index = new Map<bigint, number>();
+              nullGi = -1;
+            }
           }
         }.bind(this);
-        const r = yield* store.foldScanMaskedSteps(b, visit);
-        rowCount = r.rowCount;
-        pages = r.nodes;
+        const progress = { nodes: 0 };
+        try {
+          const r = yield* store.foldLeavesMaskedSteps(b, visitLeaf, progress);
+          rowCount = r.rowCount;
+          pages = r.nodes;
+        } catch (error) {
+          // Preserve consumed work even though successful scans charge in bulk.
+          if (error instanceof EngineError && error.state === "query_canceled") {
+            meter.charge(
+              COSTS.pageRead * BigInt(progress.nodes + units.pages) +
+                COSTS.valueDecompress * BigInt(units.decompress) +
+                COSTS.storageRowRead * BigInt(visited),
+            );
+            meter.charge(
+              COSTS.aggregateAccumulate * BigInt(nsurv) * BigInt(plan.aggSpecs.length),
+            );
+          } else if (inFilter && settle) {
+            // A filter error leaves what the row path would have accrued at the same error
+            // (cost.md §6.2). The row path scans the whole bound, then filters, then folds: so the
+            // whole scan block and every row read are owed, and nothing the folds charged. (Under
+            // a ceiling, or with an expression operand, this run is an attempt the caller
+            // discards.)
+            meter.refund(foldLive);
+            const block = yield* store.overlapScanUnitsSteps(b, mask);
+            const all = yield* store.foldLeavesMaskedSteps(b, countOnlyLeaf);
+            meter.charge(
+              COSTS.valueDecompress * BigInt(block.slabs) +
+                COSTS.pageRead * BigInt(block.pages) +
+                COSTS.storageRowRead * BigInt(all.rowCount),
+            );
+          }
+          throw error;
+        }
       }
 
       // Charge the identical cost totals (unmetered lane — charge order is invisible): the scan block
@@ -27456,16 +27667,31 @@ export class Engine {
           meter.charge(
             COSTS.valueDecompress * BigInt(units.slabs) + COSTS.pageRead * BigInt(units.pages),
           );
-          yield* store.scanRangeSteps(
+          // Walk the bound a leaf at a time reading only the touched columns, each resolved
+          // straight from its leaf (the columnar lanes' walk, packed-leaf.md §11 Track A5): an
+          // untouched column is not a SQL input to this plan, so it is never reconstructed and
+          // enters the spool as NULL — the row nullUntouched(resolveColumns(row)) built. The scan
+          // block was charged above from the same bound and mask.
+          const width = store.columnTypes().length;
+          yield* store.foldLeavesMaskedSteps(
             bound,
-            function* (this: Engine, _key: Uint8Array, raw: Row): Steps<boolean> {
-              meter.guard();
-              meter.charge(COSTS.storageRowRead);
-              const row = yield* store.resolveColumnsSteps(raw, mask);
-              if (pushed !== null && !(yield* evalFilterSteps(pushed, row, env, meter)))
-                return true;
-              out.push(nullUntouched(row, mask));
-              return true;
+            function* (this: Engine, node: PNode, first: number, last: number): Steps<void> {
+              for (let i = first; i <= last; i++) {
+                meter.guard();
+                meter.charge(COSTS.storageRowRead);
+                const row: Row = new Array(width);
+                for (let c = 0; c < width; c++) {
+                  row[c] =
+                    c >= mask.length || mask[c]
+                      ? (colAtNow(node, i, c) ?? (yield* readLeafColumnSteps(node, i, c)))
+                      : nullValue();
+                }
+                if (pushed !== null) {
+                  const keep = evalFilterMaybeSteps(pushed, row, env, meter);
+                  if (!(isPendingEval(keep) ? yield* keep : keep)) continue;
+                }
+                out.push(row);
+              }
             }.bind(this),
           );
         }
@@ -28185,7 +28411,7 @@ export class Engine {
     // machinery below (memory.md §5.4). The lane is taken where the statement is not bounded-spill
     // eligible, for a whole-table fold over a file-backed table (one finite accumulator, no retained
     // input), and for a grouped fold over a file-backed table, which hands its group table over to
-    // the spill structures (§6.6.1) — the only form that admits an ORDER BY. Results and accrued cost
+    // the spill structures (§6.6.1). Results and accrued cost
     // are byte-identical either way (the conformance corpus proves both). (An aggregate plan skips
     // every streaming fast-path below — they all require !isAgg — so this front-position placement is
     // only for clarity, mirroring the Go/Rust cores' ordering.)
@@ -28195,12 +28421,11 @@ export class Engine {
       this.vectorizedAggEligible(plan) &&
       (!this.boundedBlockingEligible(plan) ||
         this.boundedWholeAggregate(plan) ||
-        this.handoverGroupedAggregate(plan)) &&
-      // Only the bounded grouped lane sorts its groups; every other shape with an ORDER BY keeps the
-      // general branch.
-      (plan.order.length === 0 ||
-        (this.boundedBlockingEligible(plan) && this.handoverGroupedAggregate(plan)));
-    if (lane && meter.isUnmetered())
+        this.handoverGroupedAggregate(plan));
+    // A run that folds an expression is always an attempt (below): it interleaves filter and
+    // operand evaluation where the row path filters every row first.
+    const exprOps = lane && hasExpressionOperand(plan);
+    if (lane && !exprOps && meter.isUnmetered())
       return yield* this.execVectorizedAggSteps(plan, env, meter, params);
     // Under a cost ceiling or lifetime budget (cost.md §6.1) the lane is an attempt: its result
     // stands only if it finished cleanly with every ceiling still unreached, which is exactly when
@@ -28208,11 +28433,9 @@ export class Engine {
     // tripped guard — is discarded and the general branch below runs from the start, so which error
     // is raised, its text, and the cost it leaves accrued are the row path's. The attempt must be
     // safe to discard. Its reservations are the lane's; a rejected attempt returns them, and the row
-    // path makes its own (memory.md §5.4). Cancellation keeps the row path, as on the unmetered lane.
+    // path makes its own (memory.md §5.4).
     if (
       lane &&
-      meter.hasCeiling() &&
-      !hasCancellation() &&
       !laneCeiling.off &&
       guardPasses(meter) &&
       (plan.filter === null || discardSafe(plan.filter)) &&
@@ -28322,6 +28545,39 @@ export class Engine {
     ) {
       const em = yield* this.projectColumnarSteps(plan, env, meter, params);
       if (em !== null) return em;
+    }
+    // Under a cost ceiling the gather is an attempt, exactly as the aggregate lane's is (cost.md
+    // §6.1): the row path here is the eager materialize, which also scans and filters everything
+    // before it emits, so the two differ only in how they accrue on the way.
+    if (
+      fast &&
+      !meter.isUnmetered() &&
+      this.explainActualProfile === null &&
+      vectorizedProjectEligible(plan) &&
+      !laneCeiling.off &&
+      guardPasses(meter) &&
+      (plan.filter === null || discardSafe(plan.filter))
+    ) {
+      const mark = meter.mark();
+      let accepted: Emitter | null = null;
+      let declined = false;
+      try {
+        const attempt = yield* this.projectColumnarSteps(plan, env, meter, params);
+        if (attempt === null) declined = true;
+        else if (guardPasses(meter)) accepted = attempt;
+        // Released here, before the rewind, so the attempt's own releases run first.
+        else attempt.columnarCharge?.releaseAll();
+      } catch (error) {
+        // Cancellation is best effort and reported at once, as on every path; a failure that is not
+        // a SQL error is an engine fault, never an outcome to replace.
+        if (!(error instanceof EngineError) || error.state === "query_canceled") throw error;
+      }
+      if (!declined) {
+        laneCeiling.attempts++;
+        if (accepted === null) laneCeiling.fallbacks++;
+      }
+      if (accepted !== null) return accepted;
+      meter.rewind(mark);
     }
     return null;
   }
@@ -42479,7 +42735,9 @@ export function foldAcc(a: Acc, v: Value, m: Meter): void {
     case "sumDecimal":
       if (v.kind !== "null") {
         const inc = toDecimal(v);
-        m.charge(COSTS.decimalWork * BigInt(workLinear(a.sumDec, inc) - 1));
+        // A zero charge accrues nothing and crosses no ceiling, so it is skipped.
+        const w = workLinear(a.sumDec, inc);
+        if (w > 1) m.charge(COSTS.decimalWork * BigInt(w - 1));
         m.guard();
         // Uncapped: the running sum may exceed the §2 format cap mid-fold; only the FINAL
         // result is cap-checked (in finalizeAcc), matching PG and making the trap
@@ -42491,7 +42749,9 @@ export function foldAcc(a: Acc, v: Value, m: Meter): void {
     case "avg":
       if (v.kind !== "null") {
         const inc = toDecimal(v);
-        m.charge(COSTS.decimalWork * BigInt(workLinear(a.sumDec, inc) - 1));
+        // A zero charge accrues nothing and crosses no ceiling, so it is skipped.
+        const w = workLinear(a.sumDec, inc);
+        if (w > 1) m.charge(COSTS.decimalWork * BigInt(w - 1));
         m.guard();
         // Uncapped (as sumDecimal): the average's final divide brings the value back in range,
         // so AVG never traps on an over-cap intermediate sum the way PG does not.
@@ -47871,10 +48131,12 @@ function accVariableBytes(a: Acc): number {
 
 // discardSafe reports whether evaluating `e` leaves nothing behind, so a lane attempt that evaluated
 // it can be discarded and the statement run again on the row path (cost.md §6.1). A deliberate
-// allowlist, identical in every core: columns, constants, parameters, and the operators over them
-// that read no entropy, clock, sequence, host code or subquery and keep no per-node state. Anything
-// else — every function call, a regex (its compile is charged once per node) — is not safe, and such
-// a statement keeps the row path under a ceiling.
+// allowlist, identical in every core: columns, constants, parameters, the operators over them,
+// built-in scalar functions the catalog does not mark volatile, and the datetime nodes — none of
+// which reads entropy, a per-call clock, a sequence, host code or a subquery, or keeps per-node
+// state. Anything else — a regex (its compile is charged once per node), a host function,
+// JSON/array/range operators — is not safe, and such a statement keeps the row path wherever the
+// lane would be an attempt.
 export function discardSafe(e: RExpr): boolean {
   switch (e.kind) {
     case "column":
@@ -47913,13 +48175,59 @@ export function discardSafe(e: RExpr): boolean {
     case "greatestLeast":
     case "nullIf":
       return e.args.every((arg) => discardSafe(arg));
-    // A literal list only: a folded subquery's list carries that subquery's cost bookkeeping.
+    // An uncorrelated `IN (subquery)`, folded to its value list before the lane runs — unless the
+    // list is also a key's point source, whose bound is planned around the fold. (A literal `IN`
+    // list resolves to comparisons.)
     case "inValues":
       return e.points === undefined && discardSafe(e.lhs);
+    // A built-in call, unless the catalog marks it volatile: entropy, the per-call clock, the
+    // sequence functions (VOLATILE_SCALAR_FUNCS). now() and the other statement-clock reads are
+    // stable: the clock is resolved once per statement and survives a discarded attempt.
+    case "scalarFunc":
+      return !VOLATILE_SCALAR_FUNCS.has(e.func) && e.args.every((arg) => discardSafe(arg));
+    case "dateClock":
+      return true;
+    case "extract":
+      return discardSafe(e.value);
+    case "dateConvert":
+      return discardSafe(e.inner);
+    case "casing":
+      return discardSafe(e.arg);
+    case "atTimeZone":
+      return discardSafe(e.zone) && discardSafe(e.value);
+    case "dateTrunc":
+      return (
+        discardSafe(e.unit) && discardSafe(e.value) && (e.zone === null || discardSafe(e.zone))
+      );
     default:
       return false;
   }
 }
+
+// VOLATILE_SCALAR_FUNCS is the built-in scalar functions the catalog marks `volatile`
+// (spec/functions/catalog.toml), which a discarded attempt cannot take back: entropy, the per-call
+// clock, and the sequence functions.
+export const VOLATILE_SCALAR_FUNCS: ReadonlySet<ScalarFuncName> = new Set<ScalarFuncName>([
+  "uuidv4",
+  "uuidv7",
+  "clock_timestamp",
+  "nextval",
+  "currval",
+  "setval",
+  "lastval",
+]);
+
+// hasExpressionOperand reports whether any of plan's aggregates folds an expression rather than a
+// bare column. Such a lane run interleaves filter and operand evaluation where the row path filters
+// every row first, so it is always an attempt the row path replaces on any error (cost.md §6.1).
+export function hasExpressionOperand(plan: SelectPlan): boolean {
+  return plan.aggSpecs.some((s) => s.operand !== null && s.operand.kind !== "column");
+}
+
+// countOnlyLeaf visits a leaf without reading it: a fold over it counts the rows in a bound (the
+// row path's storage_row_read for the whole bound, cost.md §6.2).
+// biome-ignore lint/correctness/useYield: Counting needs no effect.
+function* countOnlyLeaf(_n: PNode, _first: number, _last: number): Steps<void> {}
 
 // guardPasses reports whether no cost ceiling has been reached; a cancellation still propagates.
 function guardPasses(meter: Meter): boolean {

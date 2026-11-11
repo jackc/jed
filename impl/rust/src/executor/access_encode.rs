@@ -7443,17 +7443,24 @@ pub(crate) fn vectorized_spec_eligible(spec: &AggSpec) -> bool {
         | AggPlan::SumFloat(_)
         | AggPlan::AvgFloat(_)
         | AggPlan::Min
-        | AggPlan::Max => matches!(spec.operand, Some(RExpr::Column(_))),
+        | AggPlan::Max => match &spec.operand {
+            Some(RExpr::Column(_)) => true,
+            // An expression operand (memory.md §5.4): evaluated per survivor, and safe to discard
+            // so a run that raises can be replaced by the row path (cost.md §6.1).
+            Some(e) => discard_safe(e),
+            None => false,
+        },
         _ => false,
     }
 }
 
 /// Whether evaluating `e` leaves nothing behind, so a lane attempt that evaluated it can be discarded
 /// and the statement run again on the row path (cost.md §6.1). A deliberate allowlist: columns,
-/// constants, parameters, and the operators over them that read no entropy, clock, sequence, host
-/// code or subquery and keep no per-node state. Anything else — every function call, a regex (its
-/// compile is charged once per node) — is not safe, and such a statement keeps the row path under a
-/// ceiling.
+/// constants, parameters, the operators over them, built-in scalar functions the catalog does not
+/// mark volatile, and the datetime nodes — none of which reads entropy, a per-call clock, a
+/// sequence, host code or a subquery, or keeps per-node state. Anything else — a regex (its compile
+/// is charged once per node), a host function, JSON/array/range operators — is not safe, and such a
+/// statement keeps the row path wherever the lane would be an attempt.
 pub(crate) fn discard_safe(e: &RExpr) -> bool {
     match e {
         RExpr::Column(_)
@@ -7485,12 +7492,47 @@ pub(crate) fn discard_safe(e: &RExpr) -> bool {
         RExpr::Coalesce { args, .. }
         | RExpr::GreatestLeast { args, .. }
         | RExpr::NullIf { args, .. } => args.iter().all(discard_safe),
+        // A built-in call, unless the catalog marks it volatile: entropy, the per-call clock, the
+        // sequence functions (`VOLATILE_SCALAR_FUNCS`). `now()` and the other statement-clock reads
+        // are stable: the clock is resolved once per statement and survives a discarded attempt.
+        RExpr::ScalarFunc { func, args, .. } => {
+            !VOLATILE_SCALAR_FUNCS.contains(func) && args.iter().all(discard_safe)
+        }
+        RExpr::DateClock { .. } => true,
+        RExpr::Extract { value, .. } => discard_safe(value),
+        RExpr::DateConvert { inner, .. } => discard_safe(inner),
+        RExpr::Casing { arg, .. } => discard_safe(arg),
+        RExpr::AtTimeZone { zone, value, .. } => discard_safe(zone) && discard_safe(value),
+        RExpr::DateTrunc { unit, value, zone } => {
+            discard_safe(unit) && discard_safe(value) && zone.as_deref().is_none_or(discard_safe)
+        }
         // An uncorrelated `IN (subquery)`, folded to its value list before the lane runs — unless
         // the list is also a key's point source, whose bound is planned around the fold. (A literal
         // `IN` list resolves to comparisons.)
         RExpr::InValues { lhs, points, .. } => points.is_none() && discard_safe(lhs),
         _ => false,
     }
+}
+
+/// The built-in scalar functions the catalog marks `volatile` (spec/functions/catalog.toml), which a
+/// discarded attempt cannot take back: entropy, the per-call clock, and the sequence functions.
+pub(crate) const VOLATILE_SCALAR_FUNCS: &[ScalarFunc] = &[
+    ScalarFunc::Uuidv4,
+    ScalarFunc::Uuidv7,
+    ScalarFunc::ClockTimestamp,
+    ScalarFunc::Nextval,
+    ScalarFunc::Currval,
+    ScalarFunc::Setval,
+    ScalarFunc::Lastval,
+];
+
+/// Whether any of `plan`'s aggregates folds an expression rather than a bare column. Such a lane run
+/// interleaves filter and operand evaluation where the row path filters every row first, so it is
+/// always an attempt the row path replaces on any error (cost.md §6.1).
+pub(crate) fn has_expression_operand(plan: &SelectPlan) -> bool {
+    plan.agg_specs
+        .iter()
+        .any(|s| matches!(&s.operand, Some(e) if !matches!(e, RExpr::Column(_))))
 }
 
 thread_local! {
@@ -7503,8 +7545,8 @@ thread_local! {
 }
 
 /// The bare-column ordinal an eligible aggregate reads (its operand `RExpr::Column(idx)`), or `None`
-/// for `COUNT(*)` (which folds no value). Eligibility ([`vectorized_spec_eligible`]) guarantees the
-/// operand is either absent or a bare column, so this is total over an eligible spec.
+/// for `COUNT(*)` (which folds no value) and for an expression operand, which its reader
+/// evaluates instead.
 pub(crate) fn operand_col(spec: &AggSpec) -> Option<usize> {
     match &spec.operand {
         Some(RExpr::Column(i)) => Some(*i),
@@ -7517,6 +7559,28 @@ pub(crate) fn operand_col(spec: &AggSpec) -> Option<usize> {
 /// instead — `agg_columnar`.)
 pub(crate) enum LaneSrc<'a> {
     Rows(&'a [Row]),
+}
+
+#[cfg(test)]
+mod discard_safe_tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    /// The lane's "volatile" list is the function catalog's (spec/functions/catalog.toml): every
+    /// function it marks volatile, and nothing else. `gen_random_uuid` is `uuidv4`'s other name.
+    #[test]
+    fn volatile_scalar_funcs_are_the_catalogs() {
+        let listed: BTreeSet<&str> = VOLATILE_SCALAR_FUNCS
+            .iter()
+            .map(|f| explain_scalar_func(*f))
+            .collect();
+        let catalog: BTreeSet<&str> = crate::operators::OPERATORS
+            .iter()
+            .filter(|d| d.volatility == "volatile" && d.name != "gen_random_uuid")
+            .map(|d| d.name)
+            .collect();
+        assert_eq!(listed, catalog);
+    }
 }
 
 #[cfg(test)]

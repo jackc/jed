@@ -256,6 +256,48 @@ comparison with NULL treated as a comparable value (always definite).
   real limb work, charged *before* the work runs so a cost ceiling (cost.md §6) aborts ahead
   of it (CLAUDE.md §13).
 
+## 6a. A fixed-width stored form for `numeric(p,s)` (proposed, not built)
+
+A stored decimal is a variable-width value: `flags ‖ scale ‖ ndigits ‖ base-10⁴ groups` behind a
+directory entry and a tag ([../fileformat/format.md](../fileformat/format.md) *Value codec*). For a
+column declared `numeric(p,s)` most of that is redundant — every stored value already has scale `s`
+and at most `p` digits (§2) — and the variable region costs a directory lookup per read.
+
+**Measured** (200,000 rows, two `numeric(12,2)` columns beside two `bigint` and two `integer`): the
+two decimal columns occupy about 13 bytes per value; the same data as `bigint` occupies about 8. The
+file is 13.1 MB with the decimals, 11.0 MB with them as `bigint`, and 7.9 MB without the columns.
+PostgreSQL stores the same two columns in about 9 and 7 bytes per value.
+
+**Proposal.** A column declared `numeric(p,s)` with `p ≤ 18` stores each value as its **unscaled
+integer** in a fixed-width slot of the leaf's fixed-width region — 2 bytes for `p ≤ 4`, 4 for
+`p ≤ 9`, 8 for `p ≤ 18` — with NULL in the column's null bitmap, exactly as an integer column. The
+value is `slot / 10^s`. A wider or unconstrained `numeric` keeps today's form (a value near 10³⁸ is
+smaller in the variable form than in a 16-byte slot only when it is short, and an unconstrained
+column has no fixed scale).
+
+- *Lossless:* a constrained column coerces every stored value to `(p,s)` before it is written, so
+  the unscaled integer and the declared scale are the whole value.
+- *Size:* about 13 → 8 bytes per value for `numeric(12,2)` (the table above shrinks by a sixth), and
+  to 4 bytes for `p ≤ 9`.
+- *Speed:* a fixed-width slot decodes with no directory or tag, and the column joins the
+  fixed-width read paths (the lanes read it as they read an integer).
+
+**What it changes.** The leaf value codec for those columns and the column class in
+[../fileformat/format.md](../fileformat/format.md), behind a `format_version` bump; the Ruby reference
+and every golden that holds such a column (the encrypted variant included); the three cores' leaf
+codec; `ALTER COLUMN … TYPE`, which must rewrite the table when the width class changes
+([alter.md](alter.md) §3); and, because rows get smaller and leaves hold more of them, the
+`page_read` count of any scan over such a table — so every corpus `# cost:` pinned over one, the
+simulator's regression traces, and the benchmark data are regenerated.
+
+**What it does not change.** Key encoding (§6), the element codecs inside arrays, composites, ranges
+and `jsonb`, statistics, the spill scratch codec, the query-memory size schedule, and `decimal_work`:
+all are defined on the logical value, not on the stored column form.
+
+**A smaller alternative.** Keep the variable form but drop `scale` and `ndigits` for a constrained
+column (both are implied by the type and the span length): 4 bytes per value saved, with none of the
+fixed-width benefits and the same `format_version` bump.
+
 ## 7. Determinism traps (the cross-core checklist)
 
 1. **Display-scale preservation** — `1.50 ≠ 1.5` in display; carry scale in the value, render

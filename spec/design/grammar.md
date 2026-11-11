@@ -390,7 +390,14 @@ this order:
    matching PostgreSQL (CLAUDE.md §1). This is the one expression form that gets a
    meaningful default name rather than `?column?`, because the name is the catalog
    surface lowercased — no expression printer is needed (§17, [aggregates.md](aggregates.md)).
-5. **Any other un-aliased expression** (arithmetic, comparison, `CAST`, a literal, `IS NULL`,
+5. **An un-aliased cast** (`expr::type`, `CAST(expr AS type)`) → **its operand's name**, when
+   one of the rules above names the operand: `amount::text` is `amount`, `sum(x)::text` is `sum`,
+   and a cast of a cast keeps the innermost name (PostgreSQL). Because a trailing `ORDER BY`
+   resolves a bare name against the output columns first (§10), `SELECT amount::text FROM t
+   ORDER BY amount` sorts the cast's text, as PostgreSQL does. A cast of an operand with no name
+   keeps `?column?`; PostgreSQL names that one after the target type (`int4`), whose names jed
+   does not share — a deliberate divergence.
+6. **Any other un-aliased expression** (arithmetic, comparison, a literal, `IS NULL`,
    a unary/logical expression, …) → the fixed literal **`?column?`**.
 
 Case 4 is deliberately a constant placeholder rather than a re-rendering of the expression

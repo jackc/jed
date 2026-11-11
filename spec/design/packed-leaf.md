@@ -528,8 +528,8 @@ expanded row vectors.
 
 - **Track A5 — the lanes widened (2026-11).** *Rows, cost, and bytes are unchanged. Items 2, 3, 5 and
   7 change which lane a statement takes, and so what it reserves under a query-memory budget; that
-  choice is contract (memory.md §5.4, §6.6.1; spill.md §4.1) and every core makes it. Items 1, 4 and
-  6 are per-core internals, done in the Rust core.*
+  choice is contract (memory.md §5.4, §6.6.1; spill.md §4.1) and every core makes it, as are items
+  8–10. Items 1, 4 and 6 are per-core internals.*
   1. **Inline values decode straight from the page.** A reader that uses a value at once
      (`PackedLeaf::value_resolved`: an aggregate operand, a projected column, a predicate's own
      column) runs `read_inline_body` on the stored span rather than building a deferred handle and
@@ -578,12 +578,21 @@ expanded row vectors.
      `numeric(p,s)` column now counts too, at its largest logical size (`4 × ⌈p/4⌉` bytes more per
      row). Otherwise the statement sorted every survivor externally to return `k` rows.
 
+  8. **Expression operands fold on the lane.** `sum(a * b)`, `count(a + 1)`, `min(abs(a))`: an operand
+     on the safe-to-discard allowlist (cost.md §6.1) is evaluated per survivor over the scratch row
+     (file-backed) or the materialized row (in memory). Such a run is always an attempt, so the row
+     path's error order is kept.
+  9. **An ordered grouping takes the unbounded lane too** (in memory, `work_mem = 0`), sorting its
+     group rows as the eager aggregate lane does.
+  10. **A failed statement accrues what the row path accrues** (cost.md §6.2): a lane that stops on a
+     filter error settles its scan charges for the whole bound and gives back its fold charges.
+
   **Budgets.** The lane choice decides which buffers a statement reserves, so under a query-memory
   budget it decides where `54P05` trips; memory.md §5.4 and §6.6.1 specify the choice and the
   bounded group table's charges, and `mise run conformance:query_memory` holds the three cores to the
   same peak on every corpus record. Under a cost ceiling or lifetime budget the aggregate lane runs
-  as an attempt that the row path may replace (cost.md §6.1). The columnar projection lane still runs
-  only with no ceiling.
+  as an attempt that the row path may replace (cost.md §6.1), and so does the columnar projection
+  lane.
   Verified by the `varwidth_lanes` battery
   (lane against row path on rows **and** cost: the decimal folds over sums that grow past 2⁶⁴ and
   2¹²⁸; grouped folds at `work_mem` settings that place the hand-over after the first row, after a few

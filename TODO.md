@@ -65,6 +65,19 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   - [ ] _follow-on:_ `char(n)`/`character(n)` (blank-padded); `varchar(n)[]` element typmod (the `numeric(p,s)[]` narrowing).
 - [x] **Exact `decimal`.** → [decimal.md](spec/design/decimal.md)
   - [ ] _follow-on:_ negative / `s>p` scale typmods.
+  - [ ] _decide (maintainer):_ a **fixed-width stored form for `numeric(p,s)`**, `p ≤ 18` — the
+    unscaled integer in a 2/4/8-byte slot, about 13 → 8 bytes per `numeric(12,2)` value. An on-disk
+    format change (Ruby reference, goldens, all cores, the `# cost:` of scans over such tables).
+    Measured proposal: [decimal.md §6a](spec/design/decimal.md).
+  - [ ] _follow-on (TS, per-core):_ the TS core's decimal lanes are still several times slower than
+    Rust's and Go's; what remains is per-value directory reads, bigint cost arithmetic, and the fold
+    dispatch ([benchmarks.md §11](spec/design/benchmarks.md)).
+  - [ ] _follow-on:_ the columnar aggregate lane takes one base table, one integer grouping key and
+    `count`/`sum`/`avg`/`min`/`max`; a non-integer or multi-column key, `GROUP BY` on the primary
+    key, and a top-N by an expression still run on the row path
+    ([memory.md §5.4](spec/design/memory.md)). The safe-to-discard allowlist ([cost.md §6.1](spec/design/cost.md))
+    still excludes regex, array, range and JSON operators, so such filters keep the row path under
+    a cost ceiling.
   - [ ] _follow-on:_ `generate_series(numeric, numeric[, numeric])` — PostgreSQL has a numeric series (`generate_series(1, 3.5)`); jed's SRF is integer-only (`42883`).
 - [x] **`timestamp` / `timestamptz`.** → [timestamp.md](spec/design/timestamp.md), [timezones.md](spec/design/timezones.md), [formatting.md](spec/design/formatting.md)
   - [ ] _follow-on:_ a separate `time` type; `current_timestamp(p)` / `localtimestamp(p)`; the multi-word `timestamp [(p)] with[out] time zone` spelling; `timestamp(p)[]` element typmods (the `varchar(n)[]` narrowing); zone abbreviations in `to_timestamp` input (`'… EST'` under `TZ` is `0A000` until the abbreviation-table decision, [timezones.md §15](spec/design/timezones.md), [formatting.md §5](spec/design/formatting.md)).

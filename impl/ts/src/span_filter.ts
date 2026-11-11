@@ -15,15 +15,19 @@ import type { ColType } from "./catalog.ts";
 import { Meter } from "./cost.ts";
 import { COSTS } from "./costs.ts";
 import {
+  type EvalResult,
   evalExpr,
+  evalExprMaybeSteps,
   evalExprSteps,
+  evalFilterMaybeSteps,
   evalFilterSteps,
+  isPendingEval,
   operatorCost,
   synchronousEvalEnv,
 } from "./eval.ts";
 import { collectTouched, type EvalEnv, hasCorrelatedSubquery, type RExpr } from "./executor.ts";
 import { encodeValue, fixedValueWidth, resolveUnfetchedSelfSteps } from "./format.ts";
-import { colAt, type PNode, type Span } from "./pmap.ts";
+import { colAt, colAtNow, type PNode, type Span } from "./pmap.ts";
 import type { Row } from "./storage.ts";
 import { inRange, isBytea, isInteger, isText, widthBytes } from "./types.ts";
 import { isTrue, nullValue, type Value } from "./value.ts";
@@ -38,9 +42,6 @@ export class ScratchRow {
   readonly vals: Row;
   private readonly stamp: number[];
   private generation = 1;
-  // The record generation whose every touched column a plain filter filled (the columns may still
-  // hold deferred values — the evaluator resolves those on touch).
-  private allFilled = 0;
 
   constructor(width: number) {
     this.vals = new Array(width).fill(nullValue());
@@ -52,11 +53,14 @@ export class ScratchRow {
     this.generation++;
   }
 
-  // fillAll reads every column in cols straight from the leaf (deferred values stay deferred — the
-  // evaluator resolves those on touch), marking the record fully filled.
-  fillAll(n: PNode, i: number, cols: number[]): void {
-    for (const c of cols) this.vals[c] = colAt(n, i, c);
-    this.allFilled = this.generation;
+  // fill reads every column in cols into the scratch row for the current record. An inline value is
+  // decoded straight from its page (packed-leaf.md §11 Track A5); an out-of-line or compressed one
+  // stays deferred — the evaluator resolves it on touch.
+  fill(n: PNode, i: number, cols: number[]): void {
+    for (const c of cols) {
+      this.vals[c] = colAtNow(n, i, c) ?? colAt(n, i, c);
+      this.stamp[c] = this.generation;
+    }
   }
 
   // ensure resolves column c of record i into the scratch row, once per record — the inline decode,
@@ -67,12 +71,22 @@ export class ScratchRow {
 
   *ensureSteps(n: PNode, i: number, c: number): Steps<void> {
     if (this.stamp[c] === this.generation) return;
-    const v = colAt(n, i, c);
-    this.vals[c] = v.kind === "unfetched" ? yield* resolveUnfetchedSelfSteps(v.ref) : v;
+    this.vals[c] = colAtNow(n, i, c) ?? (yield* readLeafColumnSteps(n, i, c));
     this.stamp[c] = this.generation;
   }
 
-  // read returns record i's resolved column c: the value a predicate already resolved for this record,
+  // ensureNow is ensure when it needs no stepping: false for an out-of-line or compressed value,
+  // which the caller resolves through ensureSteps.
+  ensureNow(n: PNode, i: number, c: number): boolean {
+    if (this.stamp[c] === this.generation) return true;
+    const v = colAtNow(n, i, c);
+    if (v === undefined) return false;
+    this.vals[c] = v;
+    this.stamp[c] = this.generation;
+    return true;
+  }
+
+  // read returns record i's resolved column c: the value a predicate already filled for this record,
   // else read straight from the leaf (not stored). Callers use it only for a variable-width column read
   // beside a predicate — where reusing the predicate's decode pays — and readLeafColumn otherwise.
   read(n: PNode, i: number, c: number): Value {
@@ -80,12 +94,20 @@ export class ScratchRow {
   }
 
   *readSteps(n: PNode, i: number, c: number): Steps<Value> {
-    if (this.allFilled === this.generation) {
+    if (this.stamp[c] === this.generation) {
       const v = this.vals[c]!;
       return v.kind === "unfetched" ? yield* resolveUnfetchedSelfSteps(v.ref) : v;
     }
-    if (this.stamp[c] === this.generation) return this.vals[c]!;
-    return yield* readLeafColumnSteps(n, i, c);
+    return colAtNow(n, i, c) ?? (yield* readLeafColumnSteps(n, i, c));
+  }
+
+  // readNow is read when it needs no stepping (undefined otherwise).
+  readNow(n: PNode, i: number, c: number): Value | undefined {
+    if (this.stamp[c] === this.generation) {
+      const v = this.vals[c]!;
+      return v.kind === "unfetched" ? undefined : v;
+    }
+    return colAtNow(n, i, c);
   }
 }
 
@@ -122,8 +144,12 @@ export function compileLaneFilter(
 ): LaneFilter {
   const pred = compileSpanPred(filter, colTypes, mask, env);
   if (hasAtom(pred)) return { kind: "span", pred };
+  // The predicate's own reads (a correlated subquery's outer references included): a touched
+  // column only an aggregate or a projection reads is left to that reader, for survivors alone.
+  const reads: boolean[] = new Array(mask.length).fill(false);
+  collectTouched(filter, 0, reads);
   const cols: number[] = [];
-  for (let c = 0; c < mask.length; c++) if (mask[c]) cols.push(c);
+  for (let c = 0; c < mask.length; c++) if (reads[c] && mask[c]) cols.push(c);
   return { kind: "plain", expr: filter, cols, resolve: hasCorrelatedSubquery(filter) };
 }
 
@@ -136,14 +162,42 @@ export function* laneKeepSteps(
   env: EvalEnv,
   m: Meter,
 ): Steps<boolean> {
+  const keep = laneKeepMaybe(f, n, i, scratch, env, m);
+  return isPendingEval(keep) ? yield* keep : keep;
+}
+
+// laneKeepMaybe is laneKeep in the evaluator's immediate-or-pending form (eval.ts EvalResult): the
+// answer itself when nothing needed a page read or a suspended operand — the common case, with no
+// continuation built — else the continuation that finishes this record. Charges, order, and errors
+// are laneKeepSteps's.
+export function laneKeepMaybe(
+  f: LaneFilter,
+  n: PNode,
+  i: number,
+  scratch: ScratchRow,
+  env: EvalEnv,
+  m: Meter,
+): EvalResult<boolean> {
   scratch.nextRecord();
-  if (f.kind === "span") return yield* spanEvalFilterSteps(f.pred, n, i, scratch, env, m);
-  scratch.fillAll(n, i, f.cols);
+  if (f.kind === "span") return spanEvalFilterMaybe(f.pred, n, i, scratch, env, m);
+  scratch.fill(n, i, f.cols);
   if (f.resolve) {
     for (const c of f.cols) {
-      const v = scratch.vals[c];
-      if (v.kind === "unfetched") scratch.vals[c] = yield* resolveUnfetchedSelfSteps(v.ref);
+      if (scratch.vals[c]!.kind === "unfetched") return plainResolveSteps(f, scratch, env, m);
     }
+  }
+  return evalFilterMaybeSteps(f.expr, scratch.vals, env, m);
+}
+
+function* plainResolveSteps(
+  f: Extract<LaneFilter, { kind: "plain" }>,
+  scratch: ScratchRow,
+  env: EvalEnv,
+  m: Meter,
+): Steps<boolean> {
+  for (const c of f.cols) {
+    const v = scratch.vals[c]!;
+    if (v.kind === "unfetched") scratch.vals[c] = yield* resolveUnfetchedSelfSteps(v.ref);
   }
   return yield* evalFilterSteps(f.expr, scratch.vals, env, m);
 }
@@ -230,24 +284,79 @@ export function* spanEvalFilterSteps(
   env: EvalEnv,
   m: Meter,
 ): Steps<boolean> {
+  const keep = spanEvalFilterMaybe(p, n, i, scratch, env, m);
+  return isPendingEval(keep) ? yield* keep : keep;
+}
+
+// spanEvalFilterMaybe is spanEvalFilter in the immediate-or-pending form (see laneKeepMaybe).
+function spanEvalFilterMaybe(
+  p: SpanPred,
+  n: PNode,
+  i: number,
+  scratch: ScratchRow,
+  env: EvalEnv,
+  m: Meter,
+): EvalResult<boolean> {
   switch (p.kind) {
-    case "and":
+    case "and": {
       m.guard();
       m.charge(operatorCost("and"));
-      return (
-        (yield* spanEvalFilterSteps(p.lhs, n, i, scratch, env, m)) &&
-        (yield* spanEvalFilterSteps(p.rhs, n, i, scratch, env, m))
-      );
+      const left = spanEvalFilterMaybe(p.lhs, n, i, scratch, env, m);
+      if (isPendingEval(left)) return resumeSpanAnd(left, p.rhs, n, i, scratch, env, m);
+      return left && spanEvalFilterMaybe(p.rhs, n, i, scratch, env, m);
+    }
     case "atom": {
       const keep = evalSpan(p.atom, n, i, m);
       if (keep !== null) return keep;
-      yield* scratch.ensureSteps(n, i, p.atom.col);
-      return isTrue(yield* evalExprSteps(p.atom.expr, scratch.vals, env, m));
+      if (!scratch.ensureNow(n, i, p.atom.col)) return spanLeafSteps(p, n, i, scratch, env, m);
+      const v = evalExprMaybeSteps(p.atom.expr, scratch.vals, env, m);
+      return isPendingEval(v) ? resumeTrue(v) : isTrue(v);
     }
-    default:
-      for (const c of p.cols) yield* scratch.ensureSteps(n, i, c);
-      return isTrue(yield* evalExprSteps(p.expr, scratch.vals, env, m));
+    default: {
+      for (const c of p.cols) {
+        if (!scratch.ensureNow(n, i, c)) return spanLeafSteps(p, n, i, scratch, env, m);
+      }
+      const v = evalExprMaybeSteps(p.expr, scratch.vals, env, m);
+      return isPendingEval(v) ? resumeTrue(v) : isTrue(v);
+    }
   }
+}
+
+function* resumeTrue(value: Steps<Value>): Steps<boolean> {
+  return isTrue(yield* value);
+}
+
+function* resumeSpanAnd(
+  left: Steps<boolean>,
+  rhs: SpanPred,
+  n: PNode,
+  i: number,
+  scratch: ScratchRow,
+  env: EvalEnv,
+  m: Meter,
+): Steps<boolean> {
+  if (!(yield* left)) return false;
+  const right = spanEvalFilterMaybe(rhs, n, i, scratch, env, m);
+  return isPendingEval(right) ? yield* right : right;
+}
+
+// spanLeafSteps finishes an atom or generic leaf whose column needs a stepping resolve (an
+// out-of-line or compressed value): the ensure, then the evaluator. An atom reaches here only after
+// evalSpan declined, charging nothing.
+function* spanLeafSteps(
+  p: Exclude<SpanPred, { kind: "and" }>,
+  n: PNode,
+  i: number,
+  scratch: ScratchRow,
+  env: EvalEnv,
+  m: Meter,
+): Steps<boolean> {
+  if (p.kind === "atom") {
+    yield* scratch.ensureSteps(n, i, p.atom.col);
+    return isTrue(yield* evalExprSteps(p.atom.expr, scratch.vals, env, m));
+  }
+  for (const c of p.cols) yield* scratch.ensureSteps(n, i, c);
+  return isTrue(yield* evalExprSteps(p.expr, scratch.vals, env, m));
 }
 
 // evalSpan evaluates an atom on the stored bytes, charging exactly what the evaluator charges for the

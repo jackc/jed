@@ -385,17 +385,66 @@ func (s *tableStore) OverlapNodeCount(b keyBound) int { return s.rows.overlapNod
 func (s *tableStore) ScanUnits(mask []bool) (pages, slabs int, err error) {
 	pages = s.NodeCount()
 	if anySpillableMasked(s.colTypes, mask) {
-		err := s.ScanRange(unboundedBound(), func(key []byte, row storedRow) (bool, error) {
-			p, d := recordScanUnits(s.colTypes, key, row, s.cap, mask)
-			pages += p
-			slabs += d
-			return true, nil
-		})
+		p, d, err := s.largeValueUnits(unboundedBound(), mask)
 		if err != nil {
 			return 0, 0, err
 		}
+		pages += p
+		slabs += d
 	}
 	return pages, slabs, nil
+}
+
+// largeValueUnits is the chain pages and decompress slabs of the records b admits, over the columns
+// mask selects — read off each record's stored tags by the lanes' walk (packed-leaf.md §11 Track A5),
+// never off a reconstructed row. The same units recordScanUnits counts for the row.
+func (s *tableStore) largeValueUnits(b keyBound, mask []bool) (pages, slabs int, err error) {
+	cols := spillUnitCols(s.colTypes, mask)
+	_, _, err = s.rows.foldScan(b, s.leafSrc(), func(n *pnode, i int) error {
+		p, d := n.recordScanUnitsCols(i, cols, s.colTypes, s.cap, mask)
+		pages += p
+		slabs += d
+		return nil
+	})
+	return pages, slabs, err
+}
+
+// chargeWholeBound charges what the row path owes for scanning all of b before it filters any row:
+// the bound's scan block (page_read, value_decompress over the columns mask selects) and one
+// storage_row_read per row in the bound, counted by a walk that reads no value (cost.md §6.2).
+func (s *tableStore) chargeWholeBound(b keyBound, mask []bool, m *costMeter) error {
+	pages, slabs, err := s.OverlapScanUnits(b, mask)
+	if err != nil {
+		return err
+	}
+	rows, _, err := s.rows.foldScan(b, s.leafSrc(), func(*pnode, int) error { return nil })
+	if err != nil {
+		return err
+	}
+	m.Charge(costs.ValueDecompress*int64(slabs) + costs.PageRead*int64(pages) + costs.StorageRowRead*int64(rows))
+	return nil
+}
+
+// readMasked reads record i of n into row (allocated at the table's width when nil) and returns it:
+// each column mask selects is resolved straight from its leaf, and every other slot stays NULL — the
+// form sort and spool state hold (memory.md §6.1), which the row scans used to reach by
+// reconstructing every column, resolving the touched ones, and pruning the rest. A caller that keeps
+// the row passes nil next time; one that does not reuses it.
+func (s *tableStore) readMasked(n *pnode, i int, mask []bool, row storedRow) (storedRow, error) {
+	if row == nil {
+		row = make(storedRow, len(s.colTypes))
+	}
+	for c := range row {
+		if c < len(mask) && !mask[c] {
+			continue
+		}
+		v, err := n.colAtResolved(i, c)
+		if err != nil {
+			return nil, err
+		}
+		row[c] = v
+	}
+	return row, nil
 }
 
 // OverlapScanUnits is the up-front cost block a BOUNDED scan over b charges, as
@@ -406,15 +455,12 @@ func (s *tableStore) ScanUnits(mask []bool) (pages, slabs int, err error) {
 func (s *tableStore) OverlapScanUnits(b keyBound, mask []bool) (pages, slabs int, err error) {
 	pages = s.OverlapNodeCount(b)
 	if anySpillableMasked(s.colTypes, mask) {
-		err := s.ScanRange(b, func(key []byte, row storedRow) (bool, error) {
-			p, d := recordScanUnits(s.colTypes, key, row, s.cap, mask)
-			pages += p
-			slabs += d
-			return true, nil
-		})
+		p, d, err := s.largeValueUnits(b, mask)
 		if err != nil {
 			return 0, 0, err
 		}
+		pages += p
+		slabs += d
 	}
 	return pages, slabs, nil
 }

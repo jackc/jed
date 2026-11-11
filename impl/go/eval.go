@@ -5157,9 +5157,11 @@ func decimalCmpWork(a, b Value) int64 {
 	case a.Kind == ValDecimal && b.Kind == ValDecimal:
 		return workLinear(*a.decimal(), *b.decimal())
 	case a.Kind == ValDecimal && b.Kind == ValInt:
-		return workLinear(*a.decimal(), decimalFromInt64(b.Int))
+		var buf [3]uint32
+		return workLinear(*a.decimal(), decimalFromInt64Buf(b.Int, &buf))
 	case a.Kind == ValInt && b.Kind == ValDecimal:
-		return workLinear(decimalFromInt64(a.Int), *b.decimal())
+		var buf [3]uint32
+		return workLinear(decimalFromInt64Buf(a.Int, &buf), *b.decimal())
 	default:
 		return 1
 	}

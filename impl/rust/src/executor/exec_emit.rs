@@ -571,13 +571,11 @@ impl Engine {
                 || self.bounded_whole_aggregate(plan)
                 || self.handover_grouped_aggregate(plan))
             && self.explain_actual.borrow().is_none()
-            && self.vectorized_agg_eligible(plan)
-            // Only the handed-over grouped lane sorts its groups; every other shape with an
-            // `ORDER BY` keeps the general branch.
-            && (plan.order.is_empty()
-                || (self.blocking_spill_eligible(plan)
-                    && self.handover_grouped_aggregate(plan)));
-        if lane && meter.can_batch_costs() {
+            && self.vectorized_agg_eligible(plan);
+        // A run that folds an expression is always an attempt (below): it interleaves filter and
+        // operand evaluation where the row path filters every row first.
+        let expr_ops = lane && has_expression_operand(plan);
+        if lane && !expr_ops && meter.can_batch_costs() {
             return self.exec_vectorized_agg(plan, &env, meter);
         }
         // Under a cost ceiling or lifetime budget (cost.md §6.1) the lane is an attempt: its result
@@ -704,8 +702,8 @@ impl Engine {
         // over a single-table full/PK-bounded scan with no ORDER BY / LIMIT / OFFSET / blocking operator
         // gathers only its projected columns of the surviving records into dense lanes and emits from them
         // — never the full-width row the materialize path below allocates per record. A WHERE predicate is
-        // evaluated during the walk, on the stored bytes where it can (A4). Gated to the unmetered lane (so
-        // a metered query's per-eval guards stay the row path's) and to file-backed stores
+        // evaluated during the walk, on the stored bytes where it can (A4). Under a cost ceiling it runs as
+        // an attempt (below). Gated to file-backed stores
         // (project_columnar declines otherwise, falling through to the identical-cost row path).
         // Cost-neutral by construction.
         if fast
@@ -715,6 +713,37 @@ impl Engine {
             && let Some(em) = self.project_columnar(plan, &env, params, outer, meter)?
         {
             return Ok(em);
+        }
+        // Under a cost ceiling the gather is an attempt, exactly as the aggregate lane's is (cost.md
+        // §6.1): the row path here is the eager materialize below, which also scans and filters
+        // everything before it emits, so the two differ only in how they accrue on the way.
+        if fast
+            && !meter.can_batch_costs()
+            && self.explain_actual.borrow().is_none()
+            && vectorized_project_eligible(plan)
+            && !LANE_CEILING_OFF.get()
+            && meter.guard().is_ok()
+            && plan.filter.get().is_none_or(discard_safe)
+        {
+            let mark = meter.mark();
+            let attempt = self.project_columnar(plan, &env, params, outer, meter);
+            let declined = matches!(attempt, Ok(None));
+            let accepted = match attempt {
+                Ok(Some(em)) if meter.guard().is_ok() => Some(em),
+                Err(e) if e.state == SqlState::QueryCanceled => return Err(e),
+                other => {
+                    drop(other);
+                    None
+                }
+            };
+            if !declined {
+                let (attempts, fallbacks) = LANE_CEILING_ATTEMPTS.get();
+                LANE_CEILING_ATTEMPTS.set((attempts + 1, fallbacks + accepted.is_none() as u64));
+            }
+            if let Some(em) = accepted {
+                return Ok(em);
+            }
+            meter.rewind(mark);
         }
 
         if fast && self.blocking_spill_eligible(plan) {

@@ -753,9 +753,11 @@ func numericCmp(a, b Value) (int, bool) {
 	case a.Kind == ValDecimal && b.Kind == ValDecimal:
 		return a.decimal().CmpValue(*b.decimal()), true
 	case a.Kind == ValInt && b.Kind == ValDecimal:
-		return decimalFromInt64(a.Int).CmpValue(*b.decimal()), true
+		var buf [3]uint32 // the widened integer is read by the compare and dropped
+		return decimalFromInt64Buf(a.Int, &buf).CmpValue(*b.decimal()), true
 	case a.Kind == ValDecimal && b.Kind == ValInt:
-		return a.decimal().CmpValue(decimalFromInt64(b.Int)), true
+		var buf [3]uint32
+		return a.decimal().CmpValue(decimalFromInt64Buf(b.Int, &buf)), true
 	default:
 		return 0, false
 	}

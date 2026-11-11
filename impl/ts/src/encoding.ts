@@ -59,6 +59,10 @@ export function decodeIntAt(t: ScalarType, b: Uint8Array, off: number): bigint {
   if (width === 8) {
     const hi = ((b[off]! << 24) | (b[off + 1]! << 16) | (b[off + 2]! << 8) | b[off + 3]!) >>> 0;
     const lo = ((b[off + 4]! << 24) | (b[off + 5]! << 16) | (b[off + 6]! << 8) | b[off + 7]!) >>> 0;
+    // The sign-flipped high word as a signed 32-bit value: within ±2^21 the whole value is below
+    // 2^53 in magnitude, exact in a JS number, so one bigint conversion replaces three bigint ops.
+    const top = hi - 0x80000000;
+    if (top >= -0x200000 && top < 0x200000) return BigInt(top * 4294967296 + lo);
     return ((BigInt(hi) << 32n) | BigInt(lo)) - 9223372036854775808n;
   }
   let u = 0;
