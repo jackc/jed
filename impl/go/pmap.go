@@ -85,6 +85,9 @@ type pnode struct {
 	stale    bool
 	// PROTOTYPE (leaf_narrow.go): sizes caches a dirty decoded leaf's content-dependent size facts.
 	sizes *leafSizes
+	// PROTOTYPE (leaf_sym.go): symTabs is the symbol tables this leaf was sized under, by column. It
+	// is written with them while it does not fit without them.
+	symTabs []*symTable
 }
 
 // ref is this node's page and tag (the zero pageRef while dirty).
@@ -510,22 +513,71 @@ func (n *pnode) contentSaving(pcap pageCap, shape leafShape) int {
 			saving += leafPrefixSaving(c, n.keyAt(0), n.keyAt(c-1))
 		}
 	}
-	if (len(shape.forCols) > 0 || len(shape.dictCols) > 0) && c > 0 {
+	if (len(shape.forCols) > 0 || len(shape.itemCols) > 0) && c > 0 {
 		if n.packed != nil {
 			saving += packedFORSaving(shape.forCols, n.packed.dirs, c)
-			saving += packedDictSaving(shape, n.packed.dirs, c)
+			saving += packedItemSaving(shape, n.packed.dirs, c)
 		} else {
+			sym := n.needsSym(pcap, shape)
 			sz := n.sizes
-			if sz == nil || sz.n != len(n.vals) {
-				sz = newLeafSizes(shape, pcap, n.keys, n.vals)
+			if sz == nil || sz.n != len(n.vals) || (sym && sz.tabs == nil) {
+				var tabs []*symTable
+				if sym {
+					tabs = n.symTabs
+				}
+				sz = newLeafSizes(shape, pcap, n.keys, n.vals, tabs, sym)
 				if n.page == 0 && n.owner != nil {
-					n.sizes = sz // a dirty node is its writer's alone
+					// A dirty node is its writer's alone. Rows added later are measured under these
+					// tables, so the node keeps them.
+					n.sizes = sz
+					if sym {
+						n.symTabs = sz.tabs
+					}
 				}
 			}
-			saving += sz.saving(shape)
+			saving += sz.saving(shape, sym)
 		}
 	}
 	return saving
+}
+
+// needsSym reports whether a decoded leaf is written with symbol tables: it has such columns and
+// does not fit the page as plain regions.
+func (n *pnode) needsSym(pcap pageCap, shape leafShape) bool {
+	return shape.hasSym && n.totalWeight()+leafOverhead(n.keyLen(), shape) > pcap.c
+}
+
+// leafTabs is the symbol tables a leaf is serialized with, by column (nil: none): a packed leaf's
+// are its page's; a decoded leaf's are the ones it was sized under.
+func (n *pnode) leafTabs(pcap pageCap, shape leafShape) []*symTable {
+	if !shape.hasSym || !n.isLeaf() {
+		return nil
+	}
+	if n.packed != nil {
+		return packedTabs(n.packed.dirs)
+	}
+	if !n.needsSym(pcap, shape) {
+		return nil
+	}
+	if n.sizes != nil && n.sizes.n == len(n.vals) && n.sizes.tabs != nil {
+		return n.sizes.tabs
+	}
+	if n.symTabs != nil {
+		return n.symTabs
+	}
+	return newLeafSizes(shape, pcap, n.keys, n.vals, nil, true).tabs
+}
+
+// leafTabsPrior is the symbol tables a leaf about to be rebuilt already has: its page's, or the ones
+// it was sized under.
+func (n *pnode) leafTabsPrior() []*symTable {
+	if !leafSym {
+		return nil
+	}
+	if n.packed != nil {
+		return packedTabs(n.packed.dirs)
+	}
+	return n.symTabs
 }
 
 // payloadAtMost reports whether a leaf's payload is at most limit. The content-dependent saving is
@@ -1417,20 +1469,27 @@ func splitPoint(mLo, mHi, payload, cap int, rightEdge bool, leftpayload, rightpa
 // just-inserted/replaced record (-1 for the delete path's merge-overflow, which splits balanced). A
 // leaf with a single over-cap record is left whole (defensive — the oversize surfaces as 0A000 when
 // serialized).
-func buildLeaf(keys [][]byte, vals []storedRow, weights []uint32, cap pageCap, shape leafShape, edited int, owner *mutationGeneration) insOut {
+func buildLeaf(keys [][]byte, vals []storedRow, weights []uint32, cap pageCap, shape leafShape, edited int, owner *mutationGeneration, prior []*symTable) insOut {
 	n := len(keys)
 	payload := 0
 	for _, w := range weights {
 		payload += int(w)
 	}
 	payload += leafOverhead(n, shape)
+	var tabs []*symTable
 	if payload > cap.c && n >= 2 {
 		payload -= leafPrefixSaving(n, keys[0], keys[n-1])
-		payload -= rowsFORSaving(shape.forCols, vals)
-		payload -= rowsDictSaving(shape, cap, keys, vals)
+		// The tables the leaf had (prior) are kept while it fits under them; an overflow is where a
+		// stale table is replaced by one trained from the rows.
+		sz := newLeafSizes(shape, cap, keys, vals, prior, prior == nil)
+		if prior != nil && shape.hasSym && payload-sz.saving(shape, true) > cap.c {
+			sz = newLeafSizes(shape, cap, keys, vals, nil, true)
+		}
+		tabs = sz.tabs
+		payload -= sz.saving(shape, true)
 	}
 	if payload <= cap.c || n < 2 {
-		return insOut{whole: &pnode{keys: keys, vals: vals, weights: weights, owner: owner}}
+		return insOut{whole: &pnode{keys: keys, vals: vals, weights: weights, owner: owner, symTabs: tabs}}
 	}
 	prefix := make([]int, n+1)
 	for i, w := range weights {
@@ -1459,38 +1518,36 @@ func buildLeaf(keys [][]byte, vals []storedRow, weights []uint32, cap pageCap, s
 			}
 		}
 	}
-	// Dictionary columns: each column's entry count and repeated bytes over every prefix and suffix.
-	type dictFacts struct{ d, dup int }
-	dpre := make([][]dictFacts, len(shape.dictCols))
-	dsuf := make([][]dictFacts, len(shape.dictCols))
-	if len(shape.dictCols) > 0 {
+	// Item columns: each column's facts over every prefix and suffix, under the tables trained above.
+	dpre := make([][]colFacts, len(shape.itemCols))
+	dsuf := make([][]colFacts, len(shape.itemCols))
+	if len(shape.itemCols) > 0 {
 		items := make([][]dictItem, n)
 		for i := range items {
-			items[i] = make([]dictItem, len(shape.dictCols))
-			rowDictItems(shape, cap, keys[i], vals[i], items[i])
+			items[i] = make([]dictItem, len(shape.itemCols))
+			rowItems(shape, cap, keys[i], vals[i], items[i])
 		}
-		for j, c := range shape.dictCols {
-			header := inlineHeaderLen(shape.colTypes[c])
-			dpre[j], dsuf[j] = make([]dictFacts, n+1), make([]dictFacts, n+1)
-			var fwd, back dictAcc
+		for j, c := range shape.itemCols {
+			dpre[j], dsuf[j] = make([]colFacts, n+1), make([]colFacts, n+1)
+			var fwd, back colAcc
 			for i := 0; i < n; i++ {
-				fwd.add(items[i][j], header)
-				dpre[j][i+1] = dictFacts{fwd.d, fwd.dup}
+				fwd.add(shape, j, items[i][j], tabFor(tabs, c))
+				dpre[j][i+1] = fwd.f
 			}
 			for i := n - 1; i >= 0; i-- {
-				back.add(items[i][j], header)
-				dsuf[j][i] = dictFacts{back.d, back.dup}
+				back.add(shape, j, items[i][j], tabFor(tabs, c))
+				dsuf[j][i] = back.f
 			}
 		}
 	}
-	forSaved := func(count int, at int, spans [][]forRange, facts [][]dictFacts) int {
+	forSaved := func(count int, at int, spans [][]forRange, facts [][]colFacts) int {
 		total := 0
 		for j, fc := range shape.forCols {
 			r := spans[j][at]
 			total += forSaving(count, fc.w, r.lo, r.hi, r.any)
 		}
-		for j := range shape.dictCols {
-			total += dictSaving(count, facts[j][at].d, facts[j][at].dup)
+		for j, c := range shape.itemCols {
+			total += itemSaving(shape, j, count, facts[j][at], tabFor(tabs, c))
 		}
 		return total
 	}
@@ -1506,10 +1563,17 @@ func buildLeaf(keys [][]byte, vals []storedRow, weights []uint32, cap pageCap, s
 		// record cap"); defensively leave the node whole (0A000 at serialize).
 		return insOut{whole: &pnode{keys: keys, vals: vals, weights: weights, owner: owner}}
 	}
+	// A half keeps the tables only when it does not fit without them (it was measured under them).
+	halfTabs := func(lo, hi int) []*symTable {
+		if tabs == nil || prefix[hi]-prefix[lo]+leafOverhead(hi-lo, shape) <= cap.c {
+			return nil
+		}
+		return tabs
+	}
 	return insOut{
-		left:  &pnode{keys: cloneKeys(keys[:m]), vals: cloneVals(vals[:m]), weights: cloneWeights(weights[:m]), owner: owner},
+		left:  &pnode{keys: cloneKeys(keys[:m]), vals: cloneVals(vals[:m]), weights: cloneWeights(weights[:m]), owner: owner, symTabs: halfTabs(0, m)},
 		sep:   keys[m],
-		right: &pnode{keys: cloneKeys(keys[m:]), vals: cloneVals(vals[m:]), weights: cloneWeights(weights[m:]), owner: owner},
+		right: &pnode{keys: cloneKeys(keys[m:]), vals: cloneVals(vals[m:]), weights: cloneWeights(weights[m:]), owner: owner, symTabs: halfTabs(m, n)},
 	}
 }
 
@@ -1581,7 +1645,7 @@ func nodeInsert(n *pnode, key []byte, val storedRow, weight uint32, old *storedR
 			}
 			// The unchanged builder selects the exact split point/separator. The edited node is
 			// abandoned when the returned halves replace it, so handing it the vectors is safe.
-			return buildLeaf(n.keys, n.vals, n.weights, cap, shape, i, generation), nil
+			return buildLeaf(n.keys, n.vals, n.weights, cap, shape, i, generation, nil), nil
 		}
 		keys, vals, weights, err := n.decodedParts()
 		if err != nil {
@@ -1597,7 +1661,7 @@ func nodeInsert(n *pnode, key []byte, val storedRow, weight uint32, old *storedR
 			vals = insertValAt(vals, i, val)
 			weights = insertWeightAt(weights, i, weight)
 		}
-		out := buildLeaf(keys, vals, weights, cap, shape, i, generation)
+		out := buildLeaf(keys, vals, weights, cap, shape, i, generation, n.leafTabsPrior())
 		if out.whole != nil {
 			out.whole.origin, _ = originOf(n)
 		}
@@ -1806,7 +1870,7 @@ func mergeAt(n *pnode, j int, generation *mutationGeneration, src leafSource, ca
 		// needs the merged lists; buildLeaf decides it (merge-overflow splits balanced).
 		mn := len(leftWeights) + len(rightWeights)
 		merged = buildLeaf(concatRange(leftKeys, rightKeys, 0, mn), concatRange(leftRows, rightRows, 0, mn),
-			concatRange(leftWeights, rightWeights, 0, mn), cap, shape, -1, generation)
+			concatRange(leftWeights, rightWeights, 0, mn), cap, shape, -1, generation, nil)
 	} else {
 		mkeys := make([][]byte, 0, len(left.keys)+1+len(right.keys))
 		mkeys = append(mkeys, left.keys...)

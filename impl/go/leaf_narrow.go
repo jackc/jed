@@ -432,10 +432,10 @@ func spanDictItem(span []byte) dictItem {
 	return dictItem{kind: dictOwn}
 }
 
-// rowDictItems classifies a decoded row's dictionary-column values into out (one per shape.dictCols).
-// A value is inline-plain when the record's disposition plan leaves it so; the plan is consulted only
-// when the all-inline record does not fit RECORD_MAX.
-func rowDictItems(shape leafShape, pcap pageCap, key []byte, row storedRow, out []dictItem) {
+// rowItems classifies a decoded row's item-column values into out (one per shape.itemCols). A value
+// is inline-plain when the record's disposition plan leaves it so; the plan is consulted only when the
+// all-inline record does not fit RECORD_MAX.
+func rowItems(shape leafShape, pcap pageCap, key []byte, row storedRow, out []dictItem) {
 	size := len(key) + shape.fixedBytes
 	for _, c := range shape.varCols {
 		inline, _ := valueFacts(shape.colTypes[c], row[c])
@@ -446,7 +446,7 @@ func rowDictItems(shape leafShape, pcap pageCap, key []byte, row storedRow, out 
 		p := planDispositions(shape.colTypes, key, row, pcap)
 		plan = &p
 	}
-	for j, c := range shape.dictCols {
+	for j, c := range shape.itemCols {
 		v := row[c]
 		switch {
 		case v.IsNull():
@@ -457,66 +457,43 @@ func rowDictItems(shape leafShape, pcap pageCap, key []byte, row storedRow, out 
 			// A stored large form whose record now fits: its content is not at hand. Counted as its
 			// own entry (see leaf-structural.md, open point).
 			out[j] = dictItem{kind: dictOwn}
+		case !isSpillable(shape.colTypes[c]):
+			out[j] = dictItem{kind: dictOwn}
 		default:
 			out[j] = dictItem{kind: dictShared, payload: planningPayload(shape.colTypes[c], v)}
 		}
 	}
 }
 
-// rowsDictSaving is the bytes dictionaries save in a leaf holding these decoded rows.
-func rowsDictSaving(shape leafShape, pcap pageCap, keys [][]byte, rows []storedRow) int {
-	if len(shape.dictCols) == 0 {
-		return 0
-	}
-	accs := make([]dictAcc, len(shape.dictCols))
-	items := make([]dictItem, len(shape.dictCols))
-	for i, row := range rows {
-		rowDictItems(shape, pcap, keys[i], row, items)
-		for j, c := range shape.dictCols {
-			accs[j].add(items[j], inlineHeaderLen(shape.colTypes[c]))
-		}
-	}
-	total := 0
-	for j := range accs {
-		total += dictSaving(len(rows), accs[j].d, accs[j].dup)
-	}
-	return total
-}
-
-// packedDictSaving is rowsDictSaving for a packed leaf, read from its stored spans.
-func packedDictSaving(shape leafShape, l *paxLeaf, n int) int {
-	total := 0
-	for _, c := range shape.dictCols {
-		var acc dictAcc
-		header := inlineHeaderLen(shape.colTypes[c])
-		for i := 0; i < n; i++ {
-			span, err := l.value(c, i)
-			if err != nil {
-				return 0
-			}
-			acc.add(spanDictItem(span), header)
-		}
-		total += dictSaving(n, acc.d, acc.dup)
-	}
-	return total
-}
-
 // leafSizes is the content-dependent size facts of a dirty decoded leaf, kept with the node so an
-// insert updates them for one row instead of recomputing them for the leaf: each dictionary column's
-// entry set and each base-plus-offsets column's value span. Both only ever grow under inserts; any
-// other change to the node's rows drops the cache.
+// insert updates them for one row instead of recomputing them for the leaf: each item column's
+// dictionary, symbol-table gain and typed-array facts, and each base-plus-offsets column's value
+// span. All only ever grow under inserts; any other change to the node's rows drops the cache.
 type leafSizes struct {
-	n     int
-	dicts []dictAcc
-	fors  []forRange
+	n    int
+	accs []colAcc
+	fors []forRange
+	// tabs is the leaf's symbol tables by column (leaf_sym.go); nil until the leaf needs them.
+	tabs  []*symTable
 	items []dictItem // scratch
 }
 
-func newLeafSizes(shape leafShape, pcap pageCap, keys [][]byte, rows []storedRow) *leafSizes {
+// newLeafSizes measures rows. tabs is the symbol tables the leaf carries; when it carries none and
+// train is set, they are trained from the rows.
+func newLeafSizes(shape leafShape, pcap pageCap, keys [][]byte, rows []storedRow, tabs []*symTable, train bool) *leafSizes {
 	sz := &leafSizes{
-		dicts: make([]dictAcc, len(shape.dictCols)),
+		accs:  make([]colAcc, len(shape.itemCols)),
 		fors:  make([]forRange, len(shape.forCols)),
-		items: make([]dictItem, len(shape.dictCols)),
+		items: make([]dictItem, len(shape.itemCols)),
+		tabs:  tabs,
+	}
+	if tabs == nil && train && shape.hasSym {
+		items := make([][]dictItem, len(rows))
+		for i, row := range rows {
+			items[i] = make([]dictItem, len(shape.itemCols))
+			rowItems(shape, pcap, keys[i], row, items[i])
+		}
+		sz.tabs = trainTabs(shape, items)
 	}
 	for i, row := range rows {
 		sz.addRow(shape, pcap, keys[i], row)
@@ -531,22 +508,28 @@ func (sz *leafSizes) addRow(shape leafShape, pcap pageCap, key []byte, row store
 			sz.fors[j].add(forSlot(fc.w, v))
 		}
 	}
-	if len(shape.dictCols) == 0 {
+	if len(shape.itemCols) == 0 {
 		return
 	}
-	rowDictItems(shape, pcap, key, row, sz.items)
-	for j, c := range shape.dictCols {
-		sz.dicts[j].add(sz.items[j], inlineHeaderLen(shape.colTypes[c]))
+	rowItems(shape, pcap, key, row, sz.items)
+	for j, c := range shape.itemCols {
+		sz.accs[j].add(shape, j, sz.items[j], tabFor(sz.tabs, c))
 	}
 }
 
-func (sz *leafSizes) saving(shape leafShape) int {
+// saving is the bytes the leaf's content-dependent regions save. sym says whether the leaf is
+// written with its symbol tables: only a leaf that does not fit without them is.
+func (sz *leafSizes) saving(shape leafShape, sym bool) int {
 	total := 0
 	for j, fc := range shape.forCols {
 		total += forSaving(sz.n, fc.w, sz.fors[j].lo, sz.fors[j].hi, sz.fors[j].any)
 	}
-	for j := range shape.dictCols {
-		total += dictSaving(sz.n, sz.dicts[j].d, sz.dicts[j].dup)
+	for j, c := range shape.itemCols {
+		var tb *symTable
+		if sym {
+			tb = tabFor(sz.tabs, c)
+		}
+		total += itemSaving(shape, j, sz.n, sz.accs[j].f, tb)
 	}
 	return total
 }

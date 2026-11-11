@@ -312,6 +312,10 @@ Lookup times vary between runs by about as much as they vary across the row.
 - Page size: keep 8 KiB as the default. Larger pages suit cold, read-mostly data and are already a
   per-database choice.
 
+The symbol table and the typed integer arrays were then built into the Go core's leaf format:
+[leaf-structural.md](leaf-structural.md) §10 and §11 give the page layout, the sizing rule and the
+engine measurements.
+
 ### 8.7 Limits
 
 - Codec timings are isolated, as in section 7. Encode cost is not reported: the symbol-table builder

@@ -407,7 +407,136 @@ With the switches off the unit tests pass.
 - Only strings are eligible. `decimal` and the other variable-width types are not.
 - A scan comparing a column with a literal could compare entries once instead of every value.
 
-## 10. Remaining steps
+## 10. Step 8: symbol-table regions (prototyped)
+
+A variable-width column of a leaf may be written with a symbol table: `text`, `bytea`, `json`,
+`jsonb`, `decimal`, and arrays, ranges and composites other than the integer arrays of §11. The
+measurements that led here are in [leaf-encodings-experiment.md](leaf-encodings-experiment.md) §8.
+
+**Page.** The region's flags byte is `3`. Then:
+
+```
+esc u8, K u8, K × (code u8, length u8), the K symbols
+raw bitmap, ceil(N/8) bytes, MSB-first
+N u16 end offsets of the stored bodies
+the stored bodies
+```
+
+- A symbol is 2 to 8 bytes and stands for one code byte. `K` is at most 255. Codes and `esc` are
+  distinct byte values.
+- A value whose raw bit is clear is inline-plain. Its body is its content payload in codes: a code
+  byte is its symbol, `esc` is followed by one literal byte, and any other byte is itself. A literal
+  equal to `esc` or to a code is written escaped. A reader rebuilds the value's header (the tag and,
+  without step 4, the `u16` length) from the column type.
+- A value whose raw bit is set stores its span unchanged: a compressed or external form, or nothing
+  for NULL.
+
+**Training.** Five passes over the column's inline payloads. Each pass parses them with the current
+table, counts symbols and adjacent pairs, and keeps the candidates that save the most bytes after
+paying for their table entry; ties break by the symbol's bytes. Codes are the byte values the
+payloads use least, unused ones first, at least 16; the first is `esc`. The table is a function of
+the payloads in key order.
+
+**Size, and why the table travels with the leaf.** A table's size is known only by building it, and
+a split needs the size of every prefix and suffix of a leaf. Under a fixed table the size is a sum
+over the values, so the table is fixed per leaf:
+
+```
+saving = Σ over inline values (header + payload − coded length) − table bytes − ceil(N/8)
+```
+
+- A leaf that fits the page as plain regions is written without tables, and measured without them.
+- When a decoded leaf first does not fit, tables are trained from its rows and stay with the node.
+  Later inserts are measured, and the leaf written, under those tables.
+- When the leaf overflows under its tables, they are trained again from all its rows. If it still
+  overflows it splits, both halves measured under the new tables. A half keeps them only if it does
+  not fit without them.
+- A leaf read from a page and then changed keeps the page's tables while it fits under them.
+- A string column takes the larger of the dictionary saving (§9) and this one.
+
+A leaf's bytes therefore depend on when its tables were trained, not only on its rows. Two cores
+agree only if they train at the same points, which this rule states in terms of the implementation's
+insert path. That has to become a rule about rows and pages before adoption (open point).
+
+**Read.** The region is kept as its page bytes and rebuilt into the plain form (end offsets and
+spans) the first time a value of the column is read; the rebuilt form stays with the resident leaf.
+A column the query does not touch is not rebuilt. The walk for overflow chains reads the raw bitmap
+and never rebuilds. Reading one value in place, without rebuilding the region, is possible in this
+format and not built.
+
+**Result.** The database of the earlier steps plus the two tables of
+[leaf-encodings-experiment.md](leaf-encodings-experiment.md) §8.1 (prose, varied-key `jsonb`, arrays),
+8 KiB pages, one run of each configuration (`TestRegionEngineExperiment`):
+
+| | steps 1–7 | + step 8 | + step 9 | + both |
+|---|---|---|---|---|
+| compacted file | 177.0 MB | 134.2 MB | 160.4 MB | 127.6 MB |
+| file after the load | 191.6 MB | 147.0 MB | 191.6 MB | 147.0 MB |
+| bulk load, earlier tables | 54.1 s | 60.1 s | 54.1 s | 59.6 s |
+| bulk load, the two new tables | 5.6 s | 26.5 s | 7.6 s | 20.6 s |
+| one-row update commit (`activity.title`) | 230 µs | 425 µs | 227 µs | 422 µs |
+| one-row append commit (`activity`) | 361 µs | 476 µs | 316 µs | 501 µs |
+
+- **Size:** the symbol table takes 24% off the file, and 28% with typed arrays.
+- **Loading is slower where the data is text:** the two new tables load in 21 to 27 s against 5.6 s.
+  Training is most of it: a filling leaf trains when it first outgrows its plain size and again at
+  each overflow under its tables.
+- **A one-row commit is 40% to 85% slower.** The leaf it touches is rebuilt from the page, measured
+  under the page's tables, and coded again when written.
+- **Reads did not move outside the noise of single runs:** resident scans of the text and `jsonb`
+  columns ran 0% to 15% faster, point lookups 1.1 to 2.7 µs in every configuration. The ten
+  aggregate queries return the same values in all four.
+
+**What was run**, Go core, all nine switches on: `mise run sim:sweep 1..100 all go` (2,200 traces
+pass). The corpus in memory mode fails 22 of 752 files against 21 at step 7; the new one is an
+`EXPLAIN` estimate. The unit tests fail 32 against 30; the two new ones assert a leaf or page count.
+With the switches off the unit tests fail one, `TestConcatThreeForms`, which also fails at the
+commit before this step. The disk-mode corpus and the randomized comparison test were not run.
+
+**Open points.**
+
+- The training points above are stated in terms of the insert path. Bytes must be a function of
+  rows and pages for two cores to agree.
+- Training cost. A sample of the leaf, fewer passes, or training once per leaf would cut it; none
+  was tried.
+- The table is per leaf. A table per column in the catalog would remove the per-page table and train
+  on more data ([leaf-encodings-experiment.md](leaf-encodings-experiment.md) §8.2: the per-page table
+  is why 64 KiB pages compress 30% better); not measured.
+- A rebuilt region is extra resident memory outside the page-cache budget.
+- A decoded leaf measures a value as inline-plain from the process's own header form. A page written
+  under other switches is read correctly but could be measured differently.
+
+## 11. Step 9: typed integer arrays (prototyped)
+
+A column of `i16[]`, `i32[]` or `i64[]` may be written as counts and bit-packed offsets.
+
+**Page.** The region's flags byte is `4`. Then `N` count bytes (255 is NULL, 0 the empty array), the
+smallest element at the element width, a `u8` bit width `b` (0 to the element's bits), and every
+element of every array in order as `element − smallest` in `b` bits, MSB-first, padded to a byte.
+
+**When.** Every value is NULL, the empty array, or an inline-plain array with one dimension, lower
+bound 1, no NULL element and at most 254 elements; and the region is smaller this way. One other
+value returns the whole region to its plain form.
+
+**Size.** With `e` empty arrays, `a` other arrays holding `M` elements of width `w`:
+
+```
+saving = (2·N + 3·e + 11·a + M·w) − (N + w + 1 + ceil(M·b/8)) when positive, else 0
+```
+
+These are sums and a value span, kept per leaf like the narrow-integer facts of §8 and recorded at
+every boundary by the split scan. No table is involved, so the size is a function of the rows.
+
+**Read.** Rebuilt on first use, as in §10.
+
+**Result.** In the table above. Per value in the measurement of
+[leaf-encodings-experiment.md](leaf-encodings-experiment.md) §8.2: small values 63.0 → 12.1 bytes,
+sorted ids 73.0 → 23.8, full-range values 93.0 → 81.2. Load and commit times did not move.
+
+**Open points.** Delta coding within an array (sorted ids), a per-array minimum, a wider count, and a
+per-value fallback in place of abandoning the region were not tried. `text[]` takes the symbol table.
+
+## 12. Remaining steps
 
 Structural:
 
@@ -422,7 +551,7 @@ Structural:
 Encodings still to do: decimals as scaled integers (estimated 6.5 MB of the 120.0 MB payload
 before step 5).
 
-## 11. Work if adopted
+## 13. Work if adopted
 
 `format.md` (*Leaf node*, *Record*, *Value codec*, `leafOverhead`), `bplus-reshape.md` §4, `packed-leaf.md`,
 `lazy-record.md`; every golden; the cost and storage-limit pins above; the Ruby reference and

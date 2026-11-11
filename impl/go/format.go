@@ -1142,7 +1142,7 @@ func serializeNode(n *pnode, store *tableStore, nextIndex uint32, body *pageSink
 		if err != nil {
 			return pageRef{}, 0, err
 		}
-		payload, err = encodeLeafPAX(colTypes, store.shape.keyLen, n.keyViews(), rows, body.seal, take, &ovf, &chainSource{paging: store.paging})
+		payload, err = encodeLeafPAX(colTypes, store.shape.keyLen, n.keyViews(), rows, body.seal, take, &ovf, &chainSource{paging: store.paging}, n.leafTabs(pcap, store.shape))
 		if err != nil {
 			return pageRef{}, 0, err
 		}
@@ -1490,7 +1490,13 @@ func serializeDirty(n *pnode, colTypes []colType, keyLen int, memo *compressMemo
 	} else {
 		src := &chainSource{paging: paging, share: true}
 		var err error
-		payload, err = encodeLeafPAXMemo(colTypes, keyLen, n.keys, n.vals, seal, alloc.take, pages, src, memo)
+		var tabs []*symTable
+		if leafSym {
+			shape := leafShapeFor(colTypes)
+			shape.keyLen = keyLen
+			tabs = n.leafTabs(seal.cap, shape)
+		}
+		payload, err = encodeLeafPAXMemo(colTypes, keyLen, n.keys, n.vals, seal, alloc.take, pages, src, tabs, memo)
 		if err != nil {
 			return pageRef{}, err
 		}
@@ -2135,10 +2141,10 @@ func collectLeafOverflowWith(read func(pageRef) ([]byte, error), pcap pageCap, p
 				continue
 			}
 			for i := 0; i < n; i++ {
-				if leaf.isNull(c, i) {
+				vb, skip, err := leaf.chainSpan(c, i)
+				if skip {
 					continue
 				}
-				vb, err := leaf.value(c, i)
 				if err != nil {
 					return err
 				}
@@ -2351,10 +2357,10 @@ func orphanedLeafPages(pageIdx pageRef, shared map[uint32]bool, paging *sharedPa
 			continue
 		}
 		for i := 0; i < n; i++ {
-			if leaf.isNull(c, i) {
+			vb, skip, err := leaf.chainSpan(c, i)
+			if skip {
 				continue
 			}
-			vb, err := leaf.value(c, i)
 			if err != nil {
 				return 0, err
 			}
@@ -2975,6 +2981,14 @@ type leafShape struct {
 	varCols    []int
 	fixedBytes int
 	colTypes   []colType
+	// itemCols is the variable columns whose content decides a leaf's size: dictionary, symbol-table
+	// and typed-array columns (leaf_sym.go). itemDict / itemSym / itemArr give each one's roles (itemArr
+	// the element width, 0 when not a typed-array column).
+	itemCols []int
+	itemDict []bool
+	itemSym  []bool
+	itemArr  []int
+	hasSym   bool
 }
 
 func (s leafShape) k() int { return s.fixed + s.variable + s.elided }
@@ -2984,7 +2998,9 @@ func (s leafShape) k() int { return s.fixed + s.variable + s.elided }
 func leafShapeFor(colTypes []colType) leafShape {
 	fixed, elided, fixedBytes := 0, 0, 0
 	var forCols []forCol
-	var dictCols, varCols []int
+	var dictCols, varCols, itemCols, itemArr []int
+	var itemDict, itemSym []bool
+	hasSym := false
 	for c, ty := range colTypes {
 		if leafElideKey && ty.keyAt != 0 {
 			elided++
@@ -2999,12 +3015,21 @@ func leafShapeFor(colTypes []colType) leafShape {
 			continue
 		}
 		varCols = append(varCols, c)
-		if leafDict && stringPayload(ty) {
+		isDict := leafDict && stringPayload(ty)
+		if isDict {
 			dictCols = append(dictCols, c)
+		}
+		if isSym, w := symEligible(ty), arrElemWidth(ty); isDict || isSym || w != 0 {
+			itemCols = append(itemCols, c)
+			itemDict = append(itemDict, isDict)
+			itemSym = append(itemSym, isSym)
+			itemArr = append(itemArr, w)
+			hasSym = hasSym || isSym
 		}
 	}
 	return leafShape{fixed: fixed, variable: len(colTypes) - fixed - elided, elided: elided, forCols: forCols,
-		dictCols: dictCols, varCols: varCols, fixedBytes: fixedBytes, colTypes: colTypes}
+		dictCols: dictCols, varCols: varCols, fixedBytes: fixedBytes, colTypes: colTypes,
+		itemCols: itemCols, itemDict: itemDict, itemSym: itemSym, itemArr: itemArr, hasSym: hasSym}
 }
 
 // leafOverhead is the bytes a v24 leaf's payload carries BEYOND Σ recordSize (format.md "Leaf
@@ -3811,12 +3836,12 @@ func planBlock(plan *recordPlan, c int, u *Unfetched, src *chainSource) ([]byte,
 //	          NULL) + N×width dense UNTAGGED slots (a NULL slot zero-filled), or — variable-width —
 //	          an N-entry u32 end-offset value directory + the tagged value bodies (NULL = a
 //	          zero-length span)
-func encodeLeafPAX(colTypes []colType, keyLen int, keys [][]byte, rows []storedRow, seal sealer, take func() uint32, ovf *[]dirtyPage, src *chainSource) ([]byte, error) {
-	return encodeLeafPAXMemo(colTypes, keyLen, keys, rows, seal, take, ovf, src, nil)
+func encodeLeafPAX(colTypes []colType, keyLen int, keys [][]byte, rows []storedRow, seal sealer, take func() uint32, ovf *[]dirtyPage, src *chainSource, tabs []*symTable) ([]byte, error) {
+	return encodeLeafPAXMemo(colTypes, keyLen, keys, rows, seal, take, ovf, src, tabs, nil)
 }
 
 // encodeLeafPAXMemo is encodeLeafPAX planning each record with the table store's compression memo.
-func encodeLeafPAXMemo(colTypes []colType, keyLen int, keys [][]byte, rows []storedRow, seal sealer, take func() uint32, ovf *[]dirtyPage, src *chainSource, memo *compressMemo) ([]byte, error) {
+func encodeLeafPAXMemo(colTypes []colType, keyLen int, keys [][]byte, rows []storedRow, seal sealer, take func() uint32, ovf *[]dirtyPage, src *chainSource, tabs []*symTable, memo *compressMemo) ([]byte, error) {
 	n := len(keys)
 	k := len(colTypes)
 	// Encode each value in (record, column) order; overflow chains allocate here. A fixed-width
@@ -3925,6 +3950,13 @@ func encodeLeafPAXMemo(colTypes []colType, keyLen int, keys [][]byte, rows []sto
 		codes   []byte
 	}
 	dicts := make([]*dictEnc, k)
+	// syms[c] is set for a column written as a symbol-table region, arrs[c] for a typed-array region
+	// (leaf_sym.go). items[c] is the column's classified spans.
+	syms := make([]*symTable, k)
+	arrs := make([]*arrAcc, k)
+	items := make([][]dictItem, k)
+	symCoded := make([][]byte, k)
+	symEnds := make([][]int, k)
 	for c := 0; c < k; c++ {
 		colStart[c] = cur
 		bodies := 0
@@ -3986,6 +4018,49 @@ func encodeLeafPAXMemo(colTypes []colType, keyLen int, keys [][]byte, rows []sto
 					cur -= s
 				}
 			}
+			if w, tb := arrElemWidth(colTypes[c]), tabFor(tabs, c); w != 0 || (tb != nil && symEligible(colTypes[c])) {
+				items[c] = make([]dictItem, n)
+				for i := 0; i < n; i++ {
+					items[c][i] = spanItem(colTypes[c], valBytes[c][i])
+				}
+				if w != 0 {
+					acc := &arrAcc{}
+					for _, it := range items[c] {
+						acc.add(it, w)
+					}
+					if s := arrSaving(n, w, dw, *acc); s > 0 {
+						arrs[c] = acc
+						cur -= s
+					}
+				} else {
+					// Code every inline value once: the gain decides, and the bytes are what is written.
+					gain, header := 0, inlineHeaderLen(colTypes[c])
+					var coded []byte
+					codedEnd := make([]int, n)
+					for i, it := range items[c] {
+						if it.kind == dictShared {
+							at := len(coded)
+							coded = tb.appendEnc(coded, it.payload)
+							gain += header + len(it.payload) - (len(coded) - at)
+						}
+						codedEnd[i] = len(coded)
+					}
+					dictS := 0
+					if dicts[c] != nil {
+						var acc dictAcc
+						for _, it := range items[c] {
+							acc.add(it, header)
+						}
+						dictS = dictSaving(n, acc.d, acc.dup)
+					}
+					if s := symSaving(n, gain, tb); s > dictS {
+						syms[c] = tb
+						symCoded[c], symEnds[c] = coded, codedEnd
+						dicts[c] = nil
+						cur += dictS - s
+					}
+				}
+			}
 		}
 	}
 	colStart[k] = cur // payload end
@@ -3996,6 +4071,63 @@ func encodeLeafPAXMemo(colTypes []colType, keyLen int, keys [][]byte, rows []sto
 	// tagged bodies (variable).
 	for c := 0; c < k; c++ {
 		if !stored(c) {
+			continue
+		}
+		if tb := syms[c]; tb != nil {
+			out = append(out, regionSym)
+			out = tb.appendTable(out)
+			bm := len(out)
+			out = append(out, make([]byte, (n+7)/8)...)
+			dir := len(out)
+			out = append(out, make([]byte, dw*n)...)
+			base := len(out)
+			for i, it := range items[c] {
+				if it.kind == dictShared {
+					lo := 0
+					if i > 0 {
+						lo = symEnds[c][i-1]
+					}
+					out = append(out, symCoded[c][lo:symEnds[c][i]]...)
+				} else {
+					out[bm+i/8] |= 0x80 >> (i % 8)
+					out = append(out, valBytes[c][i]...)
+				}
+				off := len(out) - base
+				if dw == 2 {
+					out[dir+2*i], out[dir+2*i+1] = byte(off>>8), byte(off)
+				} else {
+					binary.BigEndian.PutUint32(out[dir+4*i:], uint32(off))
+				}
+			}
+			continue
+		}
+		if a := arrs[c]; a != nil {
+			w := arrElemWidth(colTypes[c])
+			out = append(out, regionArr)
+			for _, it := range items[c] {
+				if it.kind == dictNull {
+					out = append(out, 255)
+					continue
+				}
+				elems, _ := arrElems(it.payload, w)
+				out = append(out, byte(len(elems)/w))
+			}
+			at := len(out)
+			bw := arrBits(a.r)
+			out = append(out, make([]byte, w+1+(a.elems*bw+7)/8)...)
+			putBEUint(out[at:at+w], a.r.lo)
+			out[at+w] = byte(bw)
+			data, bit := out[at+w+1:], 0
+			for _, it := range items[c] {
+				if it.kind != dictShared {
+					continue
+				}
+				elems, _ := arrElems(it.payload, w)
+				for e := 0; e < len(elems); e += w {
+					putBits(data, bit, bw, beUint(elems[e:e+w])-a.r.lo)
+					bit += bw
+				}
+			}
 			continue
 		}
 		if d := dicts[c]; d != nil {
@@ -5889,6 +6021,18 @@ type paxRegion struct {
 	// codes, when set, makes this variable region a dictionary: ends and body describe the entries,
 	// and value i is entry codes[i].
 	codes []byte
+	// lazy, when set, makes this variable region a symbol-table or typed-array region (leaf_sym.go):
+	// ends and body are unset, and the plain form is rebuilt on first use.
+	lazy *lazyRegion
+}
+
+// variable returns a variable region's end-offset directory, its body, and the directory entry width.
+func (l *paxLeaf) variable(r *paxRegion) (ends, body []byte, dw int, err error) {
+	if r.lazy != nil {
+		m := r.lazy.plain()
+		return m.ends, m.body, 4, m.err
+	}
+	return r.ends, r.body, l.dw, nil
 }
 
 type paxLeaf struct {
@@ -6121,6 +6265,20 @@ func parsePaxLeaf(payload []byte, n int, colTypes []colType) (*paxLeaf, error) {
 			start = end
 			continue
 		}
+		if _, fixed := fixedValueWidth(ty); !fixed && (flags == regionSym || flags == regionArr) {
+			// A symbol-table or typed-array region (leaf_sym.go): kept as its bytes, rebuilt on first use.
+			lz := &lazyRegion{kind: flags, ty: ty, raw: payload[p:end], n: n, dw: dw}
+			if flags == regionSym {
+				size, err := symTableSize(lz.raw)
+				if err != nil {
+					return nil, err
+				}
+				lz.tabSize = size
+			}
+			regions[c] = paxRegion{lazy: lz, stored: end - start}
+			start = end
+			continue
+		}
 		if flags != 0 {
 			return nil, newError(DataCorrupted, "PAX leaf region flags has a reserved bit set")
 		}
@@ -6264,14 +6422,22 @@ func (l *paxLeaf) isNull(c, i int) bool {
 	if r.width > 0 {
 		return r.bitmap[i/8]&(0x80>>(i%8)) != 0
 	}
+	if r.lazy != nil {
+		null, _, _ := r.lazy.peek(i)
+		return null
+	}
 	if r.codes != nil {
 		i = int(r.codes[i])
 	}
+	ends, _, dw, err := l.variable(r)
+	if err != nil {
+		return false // value reports it
+	}
 	lo := uint32(0)
 	if i > 0 {
-		lo = paxDirEnd(r.ends, i-1, l.dw)
+		lo = paxDirEnd(ends, i-1, dw)
 	}
-	return paxDirEnd(r.ends, i, l.dw) == lo
+	return paxDirEnd(ends, i, dw) == lo
 }
 
 // value returns the bytes of value (record i, column c), a view into the page payload: a
@@ -6285,15 +6451,19 @@ func (l *paxLeaf) value(c, i int) ([]byte, error) {
 	if r.codes != nil {
 		i = int(r.codes[i])
 	}
+	ends, body, dw, err := l.variable(r)
+	if err != nil {
+		return nil, err
+	}
 	lo := uint32(0)
 	if i > 0 {
-		lo = paxDirEnd(r.ends, i-1, l.dw)
+		lo = paxDirEnd(ends, i-1, dw)
 	}
-	hi := paxDirEnd(r.ends, i, l.dw)
-	if int(hi) > len(r.body) {
+	hi := paxDirEnd(ends, i, dw)
+	if int(hi) > len(body) {
 		return nil, newError(DataCorrupted, "PAX leaf value offset out of range")
 	}
-	return r.body[lo:hi], nil
+	return body[lo:hi], nil
 }
 
 // valueLen is the bytes value (record i, column c) contributes to recordSize — the slot width
@@ -6310,11 +6480,15 @@ func (l *paxLeaf) valueLen(c, i int) int {
 	if r.codes != nil {
 		i = int(r.codes[i])
 	}
+	ends, _, dw, err := l.variable(r)
+	if err != nil {
+		return 0
+	}
 	lo := uint32(0)
 	if i > 0 {
-		lo = paxDirEnd(r.ends, i-1, l.dw)
+		lo = paxDirEnd(ends, i-1, dw)
 	}
-	return int(paxDirEnd(r.ends, i, l.dw) - lo)
+	return int(paxDirEnd(ends, i, dw) - lo)
 }
 
 // packedLeaf is a faulted leaf's block-backed resident form (packed-leaf.md §5): the validated PAX

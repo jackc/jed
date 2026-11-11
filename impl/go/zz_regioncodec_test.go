@@ -27,6 +27,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 )
 
 // ---- harder test data ------------------------------------------------------------------------------------
@@ -1252,4 +1253,113 @@ func TestRegionCodecExperiment(t *testing.T) {
 		fmt.Printf(" %9d", leafPages[ps])
 	}
 	fmt.Println()
+}
+
+// TestRegionEngineExperiment builds the experiment database with whatever leaf switches the process
+// has, and reports load time, compacted size and read/write timings, with result checksums so two
+// configurations can be compared. Gated by JED_FORMAT_EXP=1; page sizes from JED_REGION_PAGES.
+//
+//	JED_FORMAT_EXP=1 go test -run TestRegionEngineExperiment -v -timeout 60m .
+func TestRegionEngineExperiment(t *testing.T) {
+	if os.Getenv("JED_FORMAT_EXP") == "" {
+		t.Skip("set JED_FORMAT_EXP=1")
+	}
+	dir := os.Getenv("JED_FORMAT_EXP_DIR")
+	if dir == "" {
+		dir = t.TempDir()
+	}
+	sizes := []uint32{DefaultPageSize}
+	if v := os.Getenv("JED_REGION_PAGES"); v != "" {
+		sizes = nil
+		for _, f := range strings.Split(v, ",") {
+			var n uint32
+			fmt.Sscanf(f, "%d", &n)
+			sizes = append(sizes, n)
+		}
+	}
+	for _, ps := range sizes {
+		path := filepath.Join(dir, fmt.Sprintf("engine%d.jed", ps))
+		os.Remove(path)
+		os.RemoveAll(path + ".lock")
+		start := time.Now()
+		db := expBuild(t, path, ps)
+		core := time.Since(start)
+		start = time.Now()
+		expExtra(t, db)
+		extra := time.Since(start)
+		st, _ := os.Stat(path)
+		loaded := st.Size()
+		if err := db.Compact("main"); err != nil {
+			t.Fatal(err)
+		}
+		st, _ = os.Stat(path)
+		db.Close()
+		fmt.Printf("\npage %d: load %.1fs + %.1fs, loaded %.1f MB, compacted %.1f MB\n", ps, core.Seconds(), extra.Seconds(),
+			float64(loaded)/(1<<20), float64(st.Size())/(1<<20))
+		db, err := OpenDatabase(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		s := db.Session(SessionOptions{})
+		for _, q := range []string{
+			"SELECT count(*), sum(id)::text FROM activity",
+			"SELECT sum(length(title)), sum(length(path)) FROM activity",
+			"SELECT sum(length(message)) FROM activity",
+			"SELECT count(*) FROM activity WHERE message LIKE '%storage%'",
+			"SELECT sum(length(attrs::text)) FROM activity",
+			"SELECT sum(cardinality(scores)), sum(cardinality(refs)), sum(cardinality(readings)) FROM samples",
+			"SELECT sum(scores[1]), sum(refs[2])::text, sum(readings[3]) FROM samples",
+			"SELECT sum(cardinality(tags)) FROM samples",
+			"SELECT count(*) FROM sessions WHERE user_agent LIKE '%Linux%'",
+			"SELECT count(*) FROM orders WHERE status = 'shipped'",
+		} {
+			var best, first time.Duration
+			var out outcome
+			for i := 0; i < 5; i++ {
+				st := time.Now()
+				o, err := queryOutcome(s, q, nil)
+				if err != nil {
+					t.Fatalf("%s: %v", q, err)
+				}
+				d := time.Since(st)
+				if i == 0 {
+					first = d
+				} else if i == 1 || d < best {
+					best = d
+				}
+				out = o
+			}
+			fmt.Printf("  %-96s first %9v resident %9v  = %v\n", q, first.Round(time.Microsecond), best.Round(time.Microsecond), out.Rows)
+		}
+		r := rand.New(rand.NewSource(9))
+		point := func(label, sql string, n int, arg func() int64) {
+			p, err := s.Prepare(sql)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for pass := 0; pass < 2; pass++ {
+				st := time.Now()
+				for i := 0; i < n; i++ {
+					if _, err := prepOutcome(s, p, []Value{IntValue(arg())}); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if pass == 1 {
+					fmt.Printf("  %-96s %9v per op\n", label, (time.Since(st) / time.Duration(n)).Round(10*time.Nanosecond))
+				}
+			}
+		}
+		nAct, nSam := int64(expScale(120000)), int64(expScale(150000))
+		point("point: SELECT message FROM activity WHERE id = $1", "SELECT message FROM activity WHERE id = $1", 20000, func() int64 { return 1 + r.Int63n(nAct) })
+		point("point: SELECT id FROM activity WHERE id = $1", "SELECT id FROM activity WHERE id = $1", 20000, func() int64 { return 1 + r.Int63n(nAct) })
+		point("point: SELECT scores FROM samples WHERE id = $1", "SELECT scores FROM samples WHERE id = $1", 20000, func() int64 { return 1 + r.Int63n(nSam) })
+		w0 := expWchar()
+		point("update 1 row/commit: activity.title", "UPDATE activity SET title = 'changed title text' WHERE id = $1", 2000, func() int64 { return 1 + r.Int63n(nAct) })
+		fmt.Printf("  %-96s %9d\n", "  bytes written per update commit", (expWchar()-w0)/4000)
+		next := nAct
+		point("insert 1 row/commit: activity (append)", "INSERT INTO activity VALUES ($1, 'a new title', '/srv/new/path.txt', 'a new message of ordinary length for the log', '{\"k\": 1}')", 2000, func() int64 { next++; return next })
+		s.Close()
+		db.Close()
+		os.Remove(path)
+	}
 }

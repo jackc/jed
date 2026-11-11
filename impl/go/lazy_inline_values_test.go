@@ -354,7 +354,7 @@ func TestLazyInlineFaultedLeafSharesPageBlock(t *testing.T) {
 		binary.BigEndian.PutUint32(key, uint32(i))
 		keys[i] = key
 	}
-	payload, err := encodeLeafPAX(colTypes, 0, keys, rows, plainSealer(ps), take, &ovf, &chainSource{})
+	payload, err := encodeLeafPAX(colTypes, 0, keys, rows, plainSealer(ps), take, &ovf, &chainSource{}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -458,7 +458,7 @@ func TestPackedLeafValidatesPageBackedDirectoriesAtFault(t *testing.T) {
 	takeSeq := uint32(100)
 	take := func() uint32 { takeSeq++; return takeSeq }
 	var overflow []dirtyPage
-	payload, err := encodeLeafPAX(colTypes, 0, keys, rows, plainSealer(8192), take, &overflow, &chainSource{})
+	payload, err := encodeLeafPAX(colTypes, 0, keys, rows, plainSealer(8192), take, &overflow, &chainSource{}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -518,7 +518,7 @@ func TestPackedLeafTouchedColumnsAndSelfResolution(t *testing.T) {
 		binary.BigEndian.PutUint32(key, uint32(i))
 		keys[i] = key
 	}
-	payload, err := encodeLeafPAX(colTypes, 0, keys, rows, plainSealer(ps), take, &ovf, &chainSource{})
+	payload, err := encodeLeafPAX(colTypes, 0, keys, rows, plainSealer(ps), take, &ovf, &chainSource{}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
