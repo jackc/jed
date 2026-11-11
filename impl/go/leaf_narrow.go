@@ -474,7 +474,10 @@ type leafSizes struct {
 	accs []colAcc
 	fors []forRange
 	// tabs is the leaf's symbol tables by column (leaf_sym.go); nil until the leaf needs them.
-	tabs  []*symTable
+	tabs []*symTable
+	// coded says the gains were measured (under tabs, or the shape's per-column tables): the leaf did
+	// not fit as plain regions when these facts were built.
+	coded bool
 	items []dictItem // scratch
 }
 
@@ -507,6 +510,7 @@ func leafSizesOf(shape leafShape, rows []storedRow, items [][]dictItem, tabs []*
 		fors:  make([]forRange, len(shape.forCols)),
 		items: make([]dictItem, len(shape.itemCols)),
 		tabs:  tabs,
+		coded: train || tabs != nil,
 	}
 	if tabs == nil && train {
 		sz.tabs, _ = trainTabs(shape, items, nil)
@@ -520,7 +524,7 @@ func leafSizesOf(shape leafShape, rows []storedRow, items [][]dictItem, tabs []*
 	}
 	for i := range items {
 		for j, c := range shape.itemCols {
-			sz.accs[j].add(shape, j, items[i][j], tabFor(sz.tabs, c))
+			sz.accs[j].add(shape, j, items[i][j], sz.tab(shape, j, c))
 		}
 	}
 	return sz
@@ -538,8 +542,16 @@ func (sz *leafSizes) addRow(shape leafShape, pcap pageCap, key []byte, row store
 	}
 	rowItems(shape, pcap, key, row, sz.items)
 	for j, c := range shape.itemCols {
-		sz.accs[j].add(shape, j, sz.items[j], tabFor(sz.tabs, c))
+		sz.accs[j].add(shape, j, sz.items[j], sz.tab(shape, j, c))
 	}
+}
+
+// tab is the table item column j's gain is measured under, nil while the leaf is not coded.
+func (sz *leafSizes) tab(shape leafShape, j, c int) *symTable {
+	if !sz.coded {
+		return nil
+	}
+	return leafOrColTab(shape, sz.tabs, j, c)
 }
 
 // saving is the bytes the leaf's content-dependent regions save. sym says whether the leaf is
@@ -554,7 +566,7 @@ func (sz *leafSizes) saving(shape leafShape, sym bool) int {
 		if sym {
 			tb = tabFor(sz.tabs, c)
 		}
-		total += itemSaving(shape, j, sz.n, sz.accs[j].f, tb)
+		total += itemSaving(shape, j, sz.n, sz.accs[j].f, tb, sym && sz.coded)
 	}
 	return total
 }

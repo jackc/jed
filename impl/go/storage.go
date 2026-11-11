@@ -57,6 +57,10 @@ type tableStore struct {
 	net bool
 	// PROTOTYPE (leaf_sym.go): symTrained says the store's column types carry per-column symbol tables.
 	symTrained bool
+	// symChain is the overflow chain holding those tables in the file and symChainLen its payload
+	// length; the zero pageRef until a commit writes it. Written once: later commits keep the chain.
+	symChain    pageRef
+	symChainLen uint32
 }
 
 // stagedKeysCap is the node capacity of a store's staged-key map. Small nodes keep the copy-on-write
@@ -85,7 +89,7 @@ func (s *tableStore) clone() *tableStore {
 	if !s.stagedKeys.IsEmpty() {
 		stagedKeys = s.stagedKeys.clone()
 	}
-	return &tableStore{rows: s.rows.clone(), nextRowid: s.nextRowid, cap: s.cap, colTypes: s.colTypes, shape: s.shape, paging: s.paging, staged: s.staged, stagedKeys: stagedKeys, net: s.net, symTrained: s.symTrained}
+	return &tableStore{rows: s.rows.clone(), nextRowid: s.nextRowid, cap: s.cap, colTypes: s.colTypes, shape: s.shape, paging: s.paging, staged: s.staged, stagedKeys: stagedKeys, net: s.net, symTrained: s.symTrained, symChain: s.symChain, symChainLen: s.symChainLen}
 }
 
 func (s *tableStore) freezeMutationGeneration() { s.rows.freezeMutationGeneration() }
@@ -103,7 +107,7 @@ func (s *tableStore) compressMemo() *compressMemo {
 // an ON COMMIT DELETE ROWS temp table (spec/design/temp-tables.md §5.1). The synthetic rowid counter
 // carries over (it is monotonic, never reused); nothing is staged, since nothing is written.
 func (s *tableStore) truncated() *tableStore {
-	return &tableStore{nextRowid: s.nextRowid, cap: s.cap, colTypes: s.colTypes, shape: s.shape, paging: s.paging, net: s.net, symTrained: s.symTrained}
+	return &tableStore{nextRowid: s.nextRowid, cap: s.cap, colTypes: s.colTypes, shape: s.shape, paging: s.paging, net: s.net, symTrained: s.symTrained, symChain: s.symChain, symChainLen: s.symChainLen}
 }
 
 // attachPaging attaches this database's shared paging context (the demand-paged file load, format.go):

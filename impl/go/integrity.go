@@ -691,7 +691,7 @@ func (k *integrityChecker) compareCatalog(stored []integrityCatalogPage) error {
 			indexRoots[ti] = append(indexRoots[ti], r)
 		}
 	}
-	entries, err := k.snap.catalogEntries(keys, rootDataPage, indexRoots, k.pcap)
+	entries, err := k.snap.catalogEntries(keys, rootDataPage, indexRoots, k.snap.symRefs(keys), k.pcap)
 	if err != nil {
 		if isCorruption(err) {
 			return k.add(IntegrityCatalogMismatch, "", integrityPage(k.gen.meta.rootPage), nil, err.Error())
@@ -735,6 +735,19 @@ func (k *integrityChecker) checkTable(name string) error {
 	var root pageRef
 	if r := store.treeRoot(); r != nil {
 		root = r.ref()
+	}
+	// PROTOTYPE (leaf_sym.go): the table's symbol-table chain is reachable. Its content was checked
+	// when the store loaded it.
+	if store.symChain.page != 0 {
+		pages, err := chainPages(store.symChain, int(store.symChainLen), k.paging.readBody, k.pcap)
+		if err != nil && !isCorruption(err) {
+			return err
+		}
+		for _, p := range pages {
+			if k.inRange(p) {
+				k.mark(p)
+			}
+		}
 	}
 	walk := &integrityTree{k: k, object: name, colTypes: store.colTypes, table: table, colls: colls, leafDepth: -1, readable: true}
 	if root.page != 0 {

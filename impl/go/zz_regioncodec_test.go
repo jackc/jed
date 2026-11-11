@@ -1625,6 +1625,10 @@ func TestColumnSymbolTablesSurviveChange(t *testing.T) {
 	if !leafSymCol {
 		t.Skip("set JED_LEAF_SYM=column (with JED_LEAF_NARROW=on)")
 	}
+	// Every file commit recounts its live pages by a reachability walk and panics on a difference, so
+	// the symbol-table chains are checked against the incremental count at each step.
+	SetVerifyLivePages(true)
+	t.Cleanup(func() { SetVerifyLivePages(false) })
 	path := filepath.Join(t.TempDir(), "coltab.jed")
 	db, err := CreateDatabase(CreateOptions{Path: path, SkipFsync: true})
 	if err != nil {
@@ -1684,6 +1688,13 @@ func TestColumnSymbolTablesSurviveChange(t *testing.T) {
 	expExec(t, s, "ALTER TABLE t RENAME TO u")
 	expExec(t, s, "CREATE INDEX u_name ON u (name)")
 	expExec(t, s, "INSERT INTO u SELECT g, 'late-' || g, 'late note ' || g, '{}'::jsonb, NULL FROM generate_series(20001, 30000) g")
+	// A second trained table, dropped: its chain is orphaned and its pages are returned.
+	expExec(t, s, "CREATE TABLE gone (id i64 PRIMARY KEY, body text)")
+	expExec(t, s, "INSERT INTO gone SELECT g, 'a body of text for row number ' || g || ' that will be dropped' FROM generate_series(1, 20000) g")
+	expExec(t, s, "DROP TABLE gone")
+	for i := 0; i < 40; i++ {
+		expExec(t, s, fmt.Sprintf("UPDATE u SET extra = 'pass-%d' WHERE id = %d", i, 100+i))
+	}
 	q := "SELECT count(*), sum(length(name)), sum(length(remark)), sum(length(doc::text)), count(extra), min(remark), max(name) FROM u"
 	o, err := queryOutcome(s, q, nil)
 	if err != nil {

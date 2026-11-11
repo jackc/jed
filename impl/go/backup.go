@@ -198,6 +198,9 @@ func (c *sharedCore) backupPages(paging *sharedPaging, mt meta) ([]uint32, error
 				return nil, err
 			}
 		}
+		if err := markSymChain(store, readRef, paging.cap(), reached); err != nil {
+			return nil, err
+		}
 	}
 	for _, istore := range snap.indexStores {
 		collectTreePages(istore.treeRoot(), reached)

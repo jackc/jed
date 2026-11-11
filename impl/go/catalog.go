@@ -106,9 +106,9 @@ type defaultExprDef struct {
 type catTable struct {
 	Name    string
 	Columns []catColumn
-	// symTabs carries the per-column symbol tables a catalog entry held from decodeTableEntry to the
-	// store being loaded (PROTOTYPE, leaf_sym.go); nil otherwise.
-	symTabs []*symTable
+	// symChain carries the table's symbol-table chain reference from decodeTableEntry to the store
+	// being loaded (PROTOTYPE, leaf_sym.go); the zero reference otherwise.
+	symChain symChainRef
 	// PK is the primary-key member column ordinals in KEY order (which may differ from
 	// declaration order — constraints.md §3; the v5 catalog persists this list). Empty =
 	// no primary key (synthetic rowid keys). The per-column PrimaryKey flag is derived

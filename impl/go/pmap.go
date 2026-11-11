@@ -520,7 +520,7 @@ func (n *pnode) contentSaving(pcap pageCap, shape leafShape) int {
 		} else {
 			sym := n.needsSym(pcap, shape)
 			sz := n.sizes
-			if sz == nil || sz.n != len(n.vals) || (sym && sz.tabs == nil) {
+			if sz == nil || sz.n != len(n.vals) || (sym && !sz.coded) {
 				var tabs []*symTable
 				if sym {
 					tabs = n.symTabs
@@ -544,7 +544,7 @@ func (n *pnode) contentSaving(pcap pageCap, shape leafShape) int {
 // needsSym reports whether a decoded leaf is written with symbol tables: it has such columns and
 // does not fit the page as plain regions.
 func (n *pnode) needsSym(pcap pageCap, shape leafShape) bool {
-	return shape.hasSym && n.totalWeight()+leafOverhead(n.keyLen(), shape) > pcap.c
+	return (shape.hasSym || shape.hasSymCol) && n.totalWeight()+leafOverhead(n.keyLen(), shape) > pcap.c
 }
 
 // leafTabs is the symbol tables a leaf is serialized with, by column (nil: none): a packed leaf's
@@ -1536,11 +1536,11 @@ func buildLeaf(keys [][]byte, vals []storedRow, weights []uint32, cap pageCap, s
 			dpre[j], dsuf[j] = make([]colFacts, n+1), make([]colFacts, n+1)
 			var fwd, back colAcc
 			for i := 0; i < n; i++ {
-				fwd.add(shape, j, items[i][j], tabFor(tabs, c))
+				fwd.add(shape, j, items[i][j], leafOrColTab(shape, tabs, j, c))
 				dpre[j][i+1] = fwd.f
 			}
 			for i := n - 1; i >= 0; i-- {
-				back.add(shape, j, items[i][j], tabFor(tabs, c))
+				back.add(shape, j, items[i][j], leafOrColTab(shape, tabs, j, c))
 				dsuf[j][i] = back.f
 			}
 		}
@@ -1552,7 +1552,7 @@ func buildLeaf(keys [][]byte, vals []storedRow, weights []uint32, cap pageCap, s
 			total += forSaving(count, fc.w, r.lo, r.hi, r.any)
 		}
 		for j, c := range shape.itemCols {
-			total += itemSaving(shape, j, count, facts[j][at], tabFor(tabs, c))
+			total += itemSaving(shape, j, count, facts[j][at], tabFor(tabs, c), true)
 		}
 		return total
 	}

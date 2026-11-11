@@ -37,11 +37,12 @@ var leafSym = os.Getenv("JED_LEAF_SYM") == "on" && leafNarrow
 // leafSymCol (JED_LEAF_SYM=column, with JED_LEAF_NARROW=on) keeps one symbol table per column of a
 // table instead of one per leaf. The table is trained once, when the table's tree first has
 // symColLeaves leaves (or a third level), from its rows in key order up to symColSample bytes of
-// payload over the eligible columns; it is persisted in the table's catalog entry and never
-// replaced. A region written with it has the flags byte regionSymCol and the layout of regionSym
+// payload over the eligible columns; it is written once to an overflow chain of its own, which the
+// table's catalog entry names (symChainRef), and never replaced. A region written with it has the flags byte regionSymCol and the layout of regionSym
 // without the table. The saving is a sum over the leaf's values less the raw bitmap, so a leaf's
-// size is a function of its rows and its table's tables, and every leaf that is smaller coded is
-// written coded (the per-leaf rule that a leaf fitting as plain stays plain does not apply).
+// size is a function of its rows and its table's tables. As with per-leaf tables, a leaf that fits
+// as plain regions is written plain: an append rewrites its half-empty last leaf at every commit,
+// and coding it then buys no page.
 var leafSymCol = os.Getenv("JED_LEAF_SYM") == "column" && leafNarrow
 
 var (
@@ -104,36 +105,56 @@ type symCand struct {
 	n         uint8
 }
 
-// symMatcher is a set of symbols by first byte, longest first: the symbols starting with byte c are
-// cands[off[c]:off[c+1]].
+// symMatcher finds the longest symbol at a position. Symbols are at least two bytes, so they are
+// grouped by their first two: an open-addressed table maps those two bytes to a run of cands, longest
+// first. (A table of some two hundred symbols has many per first byte and few per pair.)
 type symMatcher struct {
-	off   [257]uint16
+	keys  [symMatchSlots]uint16
+	lo    [symMatchSlots]uint8
+	hi    [symMatchSlots]uint8 // 0: an empty slot (a run ends past its start, so never at 0)
 	cands [255]symCand
+	order [255]symOrder // build scratch
 }
 
-// build fills the matcher from symbols given as little-endian bytes and lengths.
+const symMatchSlots = 1024
+
+type symOrder struct {
+	key uint16 // the first two bytes, little-endian
+	n   uint8
+	k   uint16
+}
+
+func symMatchHash(key uint16) uint32 { return (uint32(key) * 2654435761) >> 22 }
+
+// build fills the matcher from symbols given as little-endian bytes and lengths (each at least 2).
 func (m *symMatcher) build(le []uint64, n []uint8) {
-	var count [256]uint16
-	for _, v := range le {
-		count[byte(v)]++
+	m.hi = [symMatchSlots]uint8{}
+	order := m.order[:len(le)]
+	for k, v := range le {
+		order[k] = symOrder{key: uint16(v), n: n[k], k: uint16(k)}
 	}
-	at := uint16(0)
-	for c := 0; c < 256; c++ {
-		m.off[c] = at
-		at += count[c]
-	}
-	m.off[256] = at
-	var next [256]uint16
-	copy(next[:], m.off[:256])
-	for l := symMaxLen; l >= 1; l-- {
-		for k, v := range le {
-			if int(n[k]) != l {
-				continue
-			}
-			c := byte(v)
-			m.cands[next[c]] = symCand{val: v, mask: ^uint64(0) >> (64 - 8*l), k: uint16(k), n: uint8(l)}
-			next[c]++
+	slices.SortFunc(order, func(a, b symOrder) int {
+		if a.key != b.key {
+			return int(a.key) - int(b.key)
 		}
+		if a.n != b.n {
+			return int(b.n) - int(a.n)
+		}
+		return int(a.k) - int(b.k)
+	})
+	for i := 0; i < len(order); {
+		j := i
+		for j < len(order) && order[j].key == order[i].key {
+			o := order[j]
+			m.cands[j] = symCand{val: le[o.k], mask: ^uint64(0) >> (64 - 8*int(o.n)), k: o.k, n: o.n}
+			j++
+		}
+		h := symMatchHash(order[i].key)
+		for m.hi[h] != 0 {
+			h = (h + 1) & (symMatchSlots - 1)
+		}
+		m.keys[h], m.lo[h], m.hi[h] = order[i].key, uint8(i), uint8(j)
+		i = j
 	}
 }
 
@@ -174,24 +195,30 @@ func (tb *symTable) seal(esc byte, codes []byte) {
 // match returns the unit at p (256+k for symbol k, else the literal byte) and its length.
 func (m *symMatcher) match(p []byte, at int) (unit, n int) {
 	c := p[at]
-	lo, hi := m.off[c], m.off[int(c)+1]
-	if lo == hi {
+	left := len(p) - at
+	if left < 2 {
 		return int(c), 1
 	}
-	var w uint64
-	left := len(p) - at
-	if left >= 8 {
-		w = binary.LittleEndian.Uint64(p[at:])
-	} else {
-		var v [8]byte
-		copy(v[:], p[at:])
-		w = binary.LittleEndian.Uint64(v[:])
-	}
-	for i := lo; i < hi; i++ {
-		cd := &m.cands[i]
-		if w&cd.mask == cd.val && int(cd.n) <= left {
-			return 256 + int(cd.k), int(cd.n)
+	key := uint16(c) | uint16(p[at+1])<<8
+	for h := symMatchHash(key); m.hi[h] != 0; h = (h + 1) & (symMatchSlots - 1) {
+		if m.keys[h] != key {
+			continue
 		}
+		var w uint64
+		if left >= 8 {
+			w = binary.LittleEndian.Uint64(p[at:])
+		} else {
+			var v [8]byte
+			copy(v[:], p[at:])
+			w = binary.LittleEndian.Uint64(v[:])
+		}
+		for i := int(m.lo[h]); i < int(m.hi[h]); i++ {
+			cd := &m.cands[i]
+			if w&cd.mask == cd.val && int(cd.n) <= left {
+				return 256 + int(cd.k), int(cd.n)
+			}
+		}
+		break
 	}
 	return int(c), 1
 }
@@ -265,7 +292,7 @@ func parseSymTable(b []byte) (*symTable, []byte, error) {
 	at := 2 + 2*k
 	for i := 0; i < k; i++ {
 		c, l := b[2+2*i], int(b[3+2*i])
-		if used[c] || l < 1 || l > symMaxLen || at+l > len(b) {
+		if used[c] || l < 2 || l > symMaxLen || at+l > len(b) {
 			return bad()
 		}
 		used[c] = true
@@ -628,9 +655,6 @@ func (a *colAcc) add(shape leafShape, j int, it dictItem, tb *symTable) {
 		a.dict.add(it, header)
 		a.f.d, a.f.dup = a.dict.d, a.dict.dup
 	}
-	if tb == nil {
-		tb = shape.itemTab[j]
-	}
 	if tb != nil && it.kind == dictShared {
 		a.f.gain += header + len(it.payload) - tb.encLen(it.payload)
 	}
@@ -640,8 +664,9 @@ func (a *colAcc) add(shape leafShape, j int, it dictItem, tb *symTable) {
 }
 
 // itemSaving is the bytes item column j saves in a leaf of n records with these facts. tb is the
-// column's symbol table, nil when the leaf is written without one.
-func itemSaving(shape leafShape, j, n int, f colFacts, tb *symTable) int {
+// column's per-leaf symbol table, nil when the leaf is written without one; coded says whether the
+// leaf is written with its per-column tables (it does not fit as plain regions).
+func itemSaving(shape leafShape, j, n int, f colFacts, tb *symTable, coded bool) int {
 	if w := shape.itemArr[j]; w != 0 {
 		return arrSaving(n, w, 2, f.arr)
 	}
@@ -649,7 +674,7 @@ func itemSaving(shape leafShape, j, n int, f colFacts, tb *symTable) int {
 	if shape.itemDict[j] {
 		s = dictSaving(n, f.d, f.dup)
 	}
-	if shape.itemTab[j] != nil {
+	if coded && shape.itemTab[j] != nil {
 		// A per-column table: no table bytes in the leaf.
 		if t := f.gain - (n+7)/8; t > s {
 			s = t
@@ -1073,7 +1098,7 @@ func (tb *symTable) usable() *symTable {
 // maybeTrainColumns trains this table's per-column symbol tables once, when its tree first has
 // symColLeaves leaves or a third level: from its rows in key order, up to symColSample bytes of
 // payload over the eligible columns. The store gets new column types carrying the tables; leaves
-// written from then on are coded with them, and leaves already written stay as they are. A column
+// written from then on that do not fit as plain regions are coded with them, and leaves already written stay as they are. A column
 // whose training finds no symbol gets an empty table, so training is not repeated.
 func (s *tableStore) maybeTrainColumns() error {
 	if !leafSymCol || s.symTrained || !s.shape.hasSymCol {
@@ -1128,8 +1153,9 @@ func (s *tableStore) setColTypes(colTypes []colType) {
 	}
 }
 
-// appendColTables appends a table entry's per-column symbol tables (leafSymCol): a u16 count, then
-// per column with a table its u16 ordinal and the table (appendTable; an empty table is two bytes).
+// appendColTables appends a table's per-column symbol tables (leafSymCol), the payload of its
+// symbol-table chain: a u16 count, then per column with a table its u16 ordinal and the table
+// (appendTable; an empty table is two bytes).
 func appendColTables(out []byte, colTypes []colType) []byte {
 	n := 0
 	for _, ty := range colTypes {
@@ -1178,4 +1204,81 @@ func readColTables(buf []byte, pos *int, ncols int) ([]*symTable, error) {
 		tabs[c] = tb
 	}
 	return tabs, nil
+}
+
+// symChainRef names the overflow chain that holds a table's per-column symbol tables (leafSymCol): its
+// first page and its payload length. The payload is appendColTables. The zero value is no chain.
+type symChainRef struct {
+	first  pageRef
+	length uint32
+}
+
+// pages is the chain's page count.
+func (r symChainRef) pages(pcap pageCap) uint64 {
+	if r.first.page == 0 {
+		return 0
+	}
+	slab := uint64(pcap.chain())
+	return (uint64(r.length) + slab - 1) / slab
+}
+
+func (s *tableStore) symRef() symChainRef {
+	return symChainRef{first: s.symChain, length: s.symChainLen}
+}
+
+// symRefs is each table's chain reference, in keys order.
+func (s *snapshot) symRefs(keys []string) []symChainRef {
+	refs := make([]symChainRef, len(keys))
+	for i, k := range keys {
+		refs[i] = s.stores[k].symRef()
+	}
+	return refs
+}
+
+// markSymChain adds a store's symbol-table chain pages to reached.
+func markSymChain(st *tableStore, read func(pageRef) ([]byte, error), pcap pageCap, reached map[uint32]bool) error {
+	if st.symChain.page == 0 {
+		return nil
+	}
+	pages, err := chainPages(st.symChain, int(st.symChainLen), read, pcap)
+	if err != nil {
+		return err
+	}
+	for _, p := range pages {
+		reached[p] = true
+	}
+	return nil
+}
+
+// loadSymChain reads a table's symbol tables from its chain and attaches them to the store.
+func (s *tableStore) loadSymChain(ref symChainRef, read func(pageRef) ([]byte, error), pcap pageCap) error {
+	var visited []uint32
+	payload, err := readOverflowChain(ref.first, int(ref.length), read, pcap, &visited)
+	if err != nil {
+		return err
+	}
+	pos := 0
+	tabs, err := readColTables(payload, &pos, len(s.colTypes))
+	if err != nil {
+		return err
+	}
+	if pos != len(payload) || tabs == nil {
+		return newError(DataCorrupted, "symbol-table chain is malformed")
+	}
+	withTabs := append([]colType(nil), s.colTypes...)
+	for c, tb := range tabs {
+		withTabs[c].sym = tb
+	}
+	s.setColTypes(withTabs)
+	s.symChain, s.symChainLen = ref.first, ref.length
+	return nil
+}
+
+// leafOrColTab is the table item column j (column c) is measured under in a leaf written coded: its
+// per-leaf table, else its per-column one.
+func leafOrColTab(shape leafShape, tabs []*symTable, j, c int) *symTable {
+	if tb := tabFor(tabs, c); tb != nil {
+		return tb
+	}
+	return shape.itemTab[j]
 }

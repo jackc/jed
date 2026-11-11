@@ -944,7 +944,27 @@ func (s *snapshot) writeImage(pageSize uint32, txid uint64, codec *pageCodec, si
 	// The catalog chain follows the data; its head is the relocatable root_page. Each entry is
 	// kind-tagged (v9): composite-type entries (kind 1) first in name byte order, then table
 	// entries (kind 0) — spec/fileformat/format.md.
-	catEntries, err := s.catalogEntries(keys, rootDataPage, indexRoots, pcap)
+	// PROTOTYPE (leaf_sym.go): each table's symbol-table chain, renumbered like every page of the image.
+	symRefs := make([]symChainRef, len(keys))
+	for ti, k := range keys {
+		st := s.stores[k]
+		if !leafSymCol || !st.symTrained {
+			continue
+		}
+		payload := appendColTables(nil, st.colTypes)
+		var chain []dirtyPage
+		first, err := writeOverflowChain(payload, seal, func() uint32 { p := nextIndex; nextIndex++; return p }, &chain)
+		if err != nil {
+			return 0, err
+		}
+		for _, o := range chain {
+			if err := body.sink(o.index, o.bytes); err != nil {
+				return 0, err
+			}
+		}
+		symRefs[ti] = symChainRef{first: first, length: uint32(len(payload))}
+	}
+	catEntries, err := s.catalogEntries(keys, rootDataPage, indexRoots, symRefs, pcap)
 	if err != nil {
 		return 0, err
 	}
@@ -984,7 +1004,7 @@ func (s *snapshot) writeImage(pageSize uint32, txid uint64, codec *pageCodec, si
 // catalogEntries is the catalog chain's entries, kind-tagged in stream order (format.md *Catalog*):
 // composite types, sequences, collation references, tables (with each tree root in pcap's pointer
 // layout), statistics, views. keys is the table names in ascending order.
-func (s *snapshot) catalogEntries(keys []string, rootDataPage []pageRef, indexRoots [][]pageRef, pcap pageCap) ([][]byte, error) {
+func (s *snapshot) catalogEntries(keys []string, rootDataPage []pageRef, indexRoots [][]pageRef, symRefs []symChainRef, pcap pageCap) ([][]byte, error) {
 	var catEntries [][]byte
 	for _, ct := range s.compositeTypesSorted() {
 		catEntries = append(catEntries, append([]byte{1}, compositeTypeEntryBytes(ct)...))
@@ -1011,7 +1031,7 @@ func (s *snapshot) catalogEntries(keys []string, rootDataPage []pageRef, indexRo
 		if err := checkTableRowCount(rootDataPage[ti].page, rowCount); err != nil {
 			return nil, err
 		}
-		catEntries = append(catEntries, append([]byte{0}, tableEntryBytes(s.tables[k], rootDataPage[ti], indexRoots[ti], rowCount, pcap, s.stores[k].colTypes)...))
+		catEntries = append(catEntries, append([]byte{0}, tableEntryBytes(s.tables[k], rootDataPage[ti], indexRoots[ti], rowCount, pcap, symRefs[ti])...))
 	}
 	catEntries = append(catEntries, statisticsCatalogEntries(s)...)
 	catEntries = append(catEntries, viewCatalogEntries(s)...)
@@ -1142,7 +1162,7 @@ func serializeNode(n *pnode, store *tableStore, nextIndex uint32, body *pageSink
 		if err != nil {
 			return pageRef{}, 0, err
 		}
-		payload, err = encodeLeafPAX(colTypes, store.shape.keyLen, n.keyViews(), rows, body.seal, take, &ovf, &chainSource{paging: store.paging}, n.leafTabs(pcap, store.shape))
+		payload, err = encodeLeafPAX(colTypes, store.shape.keyLen, n.keyViews(), rows, body.seal, take, &ovf, &chainSource{paging: store.paging}, n.leafTabs(pcap, store.shape), leafSymCol && n.needsSym(pcap, store.shape))
 		if err != nil {
 			return pageRef{}, 0, err
 		}
@@ -1338,7 +1358,27 @@ func (s *snapshot) incrementalImageDeferred(pageSize, startPage uint32, free []u
 	// kind-tagged (v9): composite-type entries (kind 1, name order) then table entries (kind 0) —
 	// spec/fileformat/format.md. The chain is sealed last page first, so each page binds its
 	// successor's tag (encrypted.md §7).
-	catEntries, err := s.catalogEntries(keys, rootDataPage, indexRoots, pcap)
+	// PROTOTYPE (leaf_sym.go): a table's symbol tables are written once, to an overflow chain of their
+	// own, by the first commit after they are trained; later commits keep the chain (its first page
+	// joins kept, so the live count does not orphan it).
+	if leafSymCol {
+		for _, k := range keys {
+			st := s.stores[k]
+			switch {
+			case !st.symTrained:
+			case st.symChain.page != 0:
+				kept[st.symChain.page] = true
+			default:
+				payload := appendColTables(nil, st.colTypes)
+				first, err := writeOverflowChain(payload, seal, alloc.take, &pages)
+				if err != nil {
+					return incrementalWrite{}, err
+				}
+				st.symChain, st.symChainLen = first, uint32(len(payload))
+			}
+		}
+	}
+	catEntries, err := s.catalogEntries(keys, rootDataPage, indexRoots, s.symRefs(keys), pcap)
 	if err != nil {
 		return incrementalWrite{}, err
 	}
@@ -1491,12 +1531,14 @@ func serializeDirty(n *pnode, colTypes []colType, keyLen int, memo *compressMemo
 		src := &chainSource{paging: paging, share: true}
 		var err error
 		var tabs []*symTable
-		if leafSym {
+		colCoded := false
+		if leafSym || leafSymCol {
 			shape := leafShapeFor(colTypes)
 			shape.keyLen = keyLen
 			tabs = n.leafTabs(seal.cap, shape)
+			colCoded = leafSymCol && n.needsSym(seal.cap, shape)
 		}
-		payload, err = encodeLeafPAXMemo(colTypes, keyLen, n.keys, n.vals, seal, alloc.take, pages, src, tabs, memo)
+		payload, err = encodeLeafPAXMemo(colTypes, keyLen, n.keys, n.vals, seal, alloc.take, pages, src, tabs, colCoded, memo)
 		if err != nil {
 			return pageRef{}, err
 		}
@@ -1932,14 +1974,15 @@ func loadEngineSharedPagingAt(paging *sharedPaging, env *Environment, at loadAt)
 			snap.putTable(table, uint32(pageSize))
 			store := snap.stores[name]
 			store.attachPaging(paging)
-			if table.symTabs != nil {
-				// PROTOTYPE (leaf_sym.go): the per-column symbol tables the entry carries.
-				withTabs := append([]colType(nil), store.colTypes...)
-				for c, tb := range table.symTabs {
-					withTabs[c].sym = tb
+			if table.symChain.first.page != 0 {
+				// PROTOTYPE (leaf_sym.go): the per-column symbol tables, from their chain.
+				if table.symChain.first.page < pcap.firstBody() || table.symChain.first.page >= mt.pageCount {
+					return nil, newError(DataCorrupted, "symbol-table chain is outside the file")
 				}
-				store.setColTypes(withTabs)
-				table.symTabs = nil
+				if err := store.loadSymChain(table.symChain, paging.readBody, pcap); err != nil {
+					return nil, err
+				}
+				table.symChain = symChainRef{}
 			}
 			// The store resolved each column's ColType from the (types-first) catalog at putTable
 			// (spec/design/composite.md §3).
@@ -2243,6 +2286,9 @@ func (s *snapshot) reachablePages(paging *sharedPaging, catRoot pageRef) (map[ui
 				return nil, err
 			}
 		}
+		if err := markSymChain(st, paging.readBodyUnlocked, pcap, reached); err != nil {
+			return nil, err
+		}
 	}
 	// Secondary/unique index trees (empty-payload, never spillable).
 	for _, ist := range s.indexStores {
@@ -2298,6 +2344,10 @@ func orphanedTreePages(prev *snapshot, kept, shared map[uint32]bool, paging *sha
 			return 0, err
 		}
 		count += n
+		// PROTOTYPE (leaf_sym.go): a symbol-table chain the new snapshot does not keep.
+		if st.symChain.page != 0 && !kept[st.symChain.page] {
+			count += st.symRef().pages(capacity)
+		}
 	}
 	// A GiST leaf-key store is never serialized (its nodes keep page 0); its R-tree pages are counted
 	// wholesale through liveCount.gist.
@@ -2442,6 +2492,9 @@ func (s *snapshot) unassignPages(pages []dirtyPage) {
 	}
 	for _, st := range s.stores {
 		unassignTreePages(st.treeRoot(), assigned)
+		if st.symChain.page != 0 && assigned[st.symChain.page] {
+			st.symChain, st.symChainLen = pageRef{}, 0 // the plan's chain was never written
+		}
 	}
 	for _, ist := range s.indexStores {
 		unassignTreePages(ist.treeRoot(), assigned)
@@ -3857,12 +3910,12 @@ func planBlock(plan *recordPlan, c int, u *Unfetched, src *chainSource) ([]byte,
 //	          NULL) + N×width dense UNTAGGED slots (a NULL slot zero-filled), or — variable-width —
 //	          an N-entry u32 end-offset value directory + the tagged value bodies (NULL = a
 //	          zero-length span)
-func encodeLeafPAX(colTypes []colType, keyLen int, keys [][]byte, rows []storedRow, seal sealer, take func() uint32, ovf *[]dirtyPage, src *chainSource, tabs []*symTable) ([]byte, error) {
-	return encodeLeafPAXMemo(colTypes, keyLen, keys, rows, seal, take, ovf, src, tabs, nil)
+func encodeLeafPAX(colTypes []colType, keyLen int, keys [][]byte, rows []storedRow, seal sealer, take func() uint32, ovf *[]dirtyPage, src *chainSource, tabs []*symTable, colCoded bool) ([]byte, error) {
+	return encodeLeafPAXMemo(colTypes, keyLen, keys, rows, seal, take, ovf, src, tabs, colCoded, nil)
 }
 
 // encodeLeafPAXMemo is encodeLeafPAX planning each record with the table store's compression memo.
-func encodeLeafPAXMemo(colTypes []colType, keyLen int, keys [][]byte, rows []storedRow, seal sealer, take func() uint32, ovf *[]dirtyPage, src *chainSource, tabs []*symTable, memo *compressMemo) ([]byte, error) {
+func encodeLeafPAXMemo(colTypes []colType, keyLen int, keys [][]byte, rows []storedRow, seal sealer, take func() uint32, ovf *[]dirtyPage, src *chainSource, tabs []*symTable, colCoded bool, memo *compressMemo) ([]byte, error) {
 	n := len(keys)
 	k := len(colTypes)
 	// Encode each value in (record, column) order; overflow chains allocate here. A fixed-width
@@ -4041,7 +4094,7 @@ func encodeLeafPAXMemo(colTypes []colType, keyLen int, keys [][]byte, rows []sto
 				}
 			}
 			tb, colTab := tabFor(tabs, c), false
-			if tb == nil {
+			if tb == nil && colCoded {
 				tb, colTab = colTypes[c].sym.usable(), true
 			}
 			if w := arrElemWidth(colTypes[c]); w != 0 || (tb != nil && symEligible(colTypes[c])) {
@@ -5370,7 +5423,7 @@ func checkTableRowCount(rootDataPage uint32, rowCount int64) error {
 	return nil
 }
 
-func tableEntryBytes(table *catTable, rootDataPage pageRef, indexRoots []pageRef, rowCount int64, pcap pageCap, colTypes []colType) []byte {
+func tableEntryBytes(table *catTable, rootDataPage pageRef, indexRoots []pageRef, rowCount int64, pcap pageCap, sym symChainRef) []byte {
 	if rowCount < 0 {
 		panic("table row count is nonnegative")
 	}
@@ -5660,7 +5713,9 @@ func tableEntryBytes(table *catTable, rootDataPage pageRef, indexRoots []pageRef
 	out = rootDataPage.appendTo(out, pcap)
 	out = appendI64(out, rowCount)
 	if leafSymCol {
-		out = appendColTables(out, colTypes) // PROTOTYPE (leaf_sym.go)
+		// PROTOTYPE (leaf_sym.go): the table's symbol-table chain, a pointer and its payload length.
+		out = sym.first.appendTo(out, pcap)
+		out = appendU32(out, sym.length)
 	}
 	return out
 }
@@ -7307,13 +7362,19 @@ func decodeTableEntry(buf []byte, pos *int, rowCountOut *int64, pcap pageCap) (*
 		return nil, pageRef{}, nil, newError(DataCorrupted, "table root and row count disagree")
 	}
 	*rowCountOut = rowCount
-	var symTabs []*symTable
+	var sym symChainRef
 	if leafSymCol {
-		if symTabs, err = readColTables(buf, pos, len(columns)); err != nil {
+		if sym.first, err = readPageRef(buf, pos, pcap); err != nil {
 			return nil, pageRef{}, nil, err
 		}
+		if sym.length, err = readU32(buf, pos); err != nil {
+			return nil, pageRef{}, nil, err
+		}
+		if (sym.first.page == 0) != (sym.length == 0) {
+			return nil, pageRef{}, nil, newError(DataCorrupted, "symbol-table chain and its length disagree")
+		}
 	}
-	return &catTable{Name: name, Columns: columns, PK: pk, Checks: checks, Indexes: indexes, ForeignKeys: foreignKeys, Exclusions: exclusions, symTabs: symTabs}, root, indexRoots, nil
+	return &catTable{Name: name, Columns: columns, PK: pk, Checks: checks, Indexes: indexes, ForeignKeys: foreignKeys, Exclusions: exclusions, symChain: sym}, root, indexRoots, nil
 }
 
 // readValueLazy reads one value (column c of a table with the shared resolved types) lazily
