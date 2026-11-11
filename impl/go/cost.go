@@ -94,6 +94,61 @@ func (m *costMeter) headroom() (int64, bool) {
 	return h, ok
 }
 
+// meterMark is a meter's state at the start of a lane attempt that may be discarded (cost.md §6.1).
+type meterMark struct {
+	accrued     int64
+	lifetime    int64
+	ceilingHit  uint8
+	scalarBytes int64
+	queryUsed   int64
+	queryPeak   int64
+}
+
+// mark records what a discarded lane attempt must give back (cost.md §6.1): the accrued cost, the
+// session cumulative total, the first-ceiling-crossed mark, the scalar-byte allowance, and the
+// query-memory balance (with the tooling peak).
+func (m *costMeter) mark() meterMark {
+	mk := meterMark{accrued: m.Accrued, ceilingHit: m.ceilingHit, queryPeak: queryMemoryPeak.Load()}
+	if m.lifetimeTotal != nil {
+		mk.lifetime = *m.lifetimeTotal
+	}
+	if m.scalarBytes != nil {
+		mk.scalarBytes = *m.scalarBytes
+	}
+	if m.query.used != nil {
+		mk.queryUsed = *m.query.used
+	}
+	return mk
+}
+
+// rewind restores a mark: the attempt made between the two leaves no trace on the meter. The caller
+// has discarded everything the attempt produced, so its own releases ran first.
+func (m *costMeter) rewind(mk meterMark) {
+	m.Accrued = mk.accrued
+	if m.lifetimeTotal != nil {
+		*m.lifetimeTotal = mk.lifetime
+	}
+	m.ceilingHit = mk.ceilingHit
+	if m.scalarBytes != nil {
+		*m.scalarBytes = mk.scalarBytes
+	}
+	if m.query.used != nil {
+		*m.query.used = mk.queryUsed
+	}
+	// A discarded attempt's reservations are no part of what the statement needed (the tooling peak
+	// is the minimal passing budget).
+	if m.query.active() {
+		queryMemoryPeak.Store(mk.queryPeak)
+	}
+}
+
+// pendingTrips reports whether pending cost a lane has earned but not yet charged would trip a
+// ceiling (cost.md §6.1): the lane stops its attempt there, within one batch of the ceiling.
+func (m *costMeter) pendingTrips(pending int64) bool {
+	h, ok := m.headroom()
+	return ok && pending >= h
+}
+
 // NewMeterWithLimit returns a fresh meter that aborts once accrued cost reaches limit
 // (limit <= 0 ⇒ unlimited), with no session lifetime budget. The ceiling is the session's
 // max_cost (spec/design/api.md §8). Used where there is no session cumulative to thread.

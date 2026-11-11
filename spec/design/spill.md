@@ -105,9 +105,11 @@ The heap comparator is the exact ORDER BY comparator plus the row's monotonicall
 position, so a full key tie retains precisely the stable full-sort order.
 
 The all-C, column-key single-table feed can push directly into this heap. On a file-backed database,
-the direct lane is admitted only when every **touched** column is a fixed scalar; untouched slots
+the direct lane is admitted only when every **touched** column is a fixed scalar or a decimal
+with a declared precision (`numeric(p,s)`, whose size is bounded); untouched slots
 are replaced by NULL in a private retained-row copy so their variable payloads are released, and the
-cross-core logical estimate `K × (8 + 40 × column_count)` must fit `work_mem`. Touched variable/open
+cross-core logical estimate `K × (8 + 40 × column_count + Σ 4 × ⌈p / 4⌉)` — the sum over the touched
+decimal columns' precisions — must fit `work_mem`. Any other touched variable/open
 rows and an oversized K
 fall back to the existing external `Sorter`. In-memory and runtime-unlimited (`work_mem = 0`) handles
 always use top-k. This conservative pre-check is necessary: after a heap has discarded a row, it

@@ -179,6 +179,12 @@ pub mod tooling {
     pub use crate::cost::{QUERY_MEMORY_PEAK, QUERY_MEMORY_UNDERFLOWS};
     /// An index key element's sort order (spec/design/indexes.md §11) — the dump renders it.
     pub use crate::encoding::KeyOrder;
+    /// Grouped columnar folds that handed their group table over to the spill structures
+    /// (spec/design/packed-leaf.md §11).
+    pub use crate::executor::LANE_GROUP_HANDOVERS;
+    /// The columnar aggregate lane's attempts under a cost ceiling, and the switch that turns them
+    /// off (spec/design/cost.md §6.1); both per thread.
+    pub use crate::executor::{LANE_CEILING_ATTEMPTS, LANE_CEILING_OFF};
     /// Recount every file commit's live pages by reachability (spec/design/memory.md §8.7).
     pub use crate::format::VERIFY_LIVE_PAGES;
     /// Session-local temp domains spilled to a scratch file (spec/design/temp-tables.md §6).

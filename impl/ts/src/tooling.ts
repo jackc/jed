@@ -33,6 +33,9 @@ export { loadEngine, toImage } from "./format.ts";
 export { create, open, openWithTransformSteps, commit, rollback, close } from "./file.ts";
 // Query-memory accounting underflows (spec/design/memory.md) — the conformance harness's check.
 export { queryMemoryPeak, queryMemoryUnderflows } from "./cost.ts";
+// The columnar aggregate lane's attempts under a cost ceiling and its group-table hand-overs
+// (spec/design/cost.md §6.1, memory.md §6.6.1) — the lane tests' switches and counters.
+export { laneCeiling, laneGroupHandovers } from "./executor.ts";
 // Recount every file commit's live pages by reachability (spec/design/memory.md §8.7).
 export { verifyLivePages } from "./format.ts";
 // Session-local temp domains spilled to a scratch file (spec/design/temp-tables.md §6).

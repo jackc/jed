@@ -216,6 +216,16 @@ export class LifetimeBudget {
   }
 }
 
+// MeterMark is a Meter's state at the start of a lane attempt that may be discarded (cost.md §6.1).
+export type MeterMark = {
+  accrued: bigint;
+  lifetime: bigint | undefined;
+  ceilingHit: number;
+  scalarBytes: bigint;
+  queryUsed: number;
+  queryPeak: number;
+};
+
 // Meter accrues deterministic execution cost and enforces an optional per-statement ceiling AND an
 // optional per-session budget (CLAUDE.md §13; spec/design/session.md §5.4). Threaded through the
 // executor and the recursive expression evaluator; the accrued (per-statement) total is reported on
@@ -360,6 +370,48 @@ export class Meter {
       this.lifetime.total = saturatingCostAdd(this.lifetime.total, units);
   }
 
+  // mark records what a discarded lane attempt must give back (cost.md §6.1): the accrued cost, the
+  // session cumulative total, the first-ceiling-crossed mark, the scalar-byte allowance, and the
+  // query-memory balance (with the tooling peak).
+  mark(): MeterMark {
+    return {
+      accrued: this.accrued,
+      lifetime: this.lifetime?.total,
+      ceilingHit: this.ceilingHit,
+      scalarBytes: this.scalarBytes.used,
+      queryUsed: this.query.used,
+      queryPeak: queryMemoryPeak.value,
+    };
+  }
+
+  // rewind restores a mark: the attempt made between the two leaves no trace on the meter. The caller
+  // has closed everything the attempt produced, so its own releases ran first.
+  rewind(mark: MeterMark): void {
+    this.accrued = mark.accrued;
+    if (this.lifetime !== undefined && mark.lifetime !== undefined)
+      this.lifetime.total = mark.lifetime;
+    this.ceilingHit = mark.ceilingHit;
+    this.scalarBytes.used = mark.scalarBytes;
+    if (this.query.limit > 0) {
+      this.query.used = mark.queryUsed;
+      // A discarded attempt's reservations are no part of what the statement needed (the tooling
+      // peak is the minimal passing budget).
+      queryMemoryPeak.value = mark.queryPeak;
+    }
+  }
+
+  // pendingTrips reports whether `pending` cost a lane has earned but not yet charged would trip a
+  // ceiling (cost.md §6.1): the lane stops its attempt there, within one batch of the ceiling.
+  pendingTrips(pending: bigint): boolean {
+    const h = this.headroom();
+    return h !== undefined && pending >= h;
+  }
+
+  // hasCeiling reports whether a per-statement maxCost or a session lifetime budget is armed.
+  hasCeiling(): boolean {
+    return this.limit > 0n || (this.lifetime !== undefined && this.lifetime.limit > 0n);
+  }
+
   // headroom is the cost still payable before a ceiling trips — the smaller remaining per-statement /
   // lifetime budget — or undefined when neither is armed. Bounds how far a host-function batch
   // prefetch may run ahead of replay (extensibility.md §4.2.1); never consulted by enforcement.
@@ -372,12 +424,13 @@ export class Meter {
   }
 
   // isUnmetered reports whether NO cost ceiling is armed — no per-statement maxCost and no session
-  // lifetime budget — so guard() is a no-op. The gate for the Track A2/A3 columnar fast path
-  // (packed-leaf.md §11): it charges the scan block in bulk (not per row with an intervening guard),
-  // which reproduces the row path's exact total only when there is nothing to abort against; a metered
-  // query keeps the row path so its deterministic 54P01/54P02 abort row is unchanged. Cancellation
-  // also keeps the row path so a worker flag is
-  // observed at the existing row checkpoints; polling never adds logical cost.
+  // lifetime budget — so guard() is a no-op. The gate for the columnar fast paths (packed-leaf.md
+  // §11): they charge the scan block in bulk (not per row with an intervening guard), which
+  // reproduces the row path's exact total only when there is nothing to abort against. Under a
+  // ceiling the projection lane keeps the row path, and the aggregate lane runs as an attempt the row
+  // path may replace (cost.md §6.1), so the deterministic 54P01/54P02 abort is unchanged.
+  // Cancellation also keeps the row path so a worker flag is observed at the existing row
+  // checkpoints; polling never adds logical cost.
   isUnmetered(): boolean {
     return (
       !hasCancellation() &&

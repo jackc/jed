@@ -7412,11 +7412,19 @@ pub(crate) fn vectorized_project_eligible(plan: &SelectPlan) -> bool {
 
 /// Whether one aggregate is a specialized numeric kernel the vectorized aggregate path folds: a plain
 /// (non-DISTINCT, non-FILTER, non-ordered-set, non-hypothetical) `COUNT(*)` / `COUNT(col)` /
-/// `SUM(i16|i32)` / `SUM`|`AVG(f32|f64)` / `MIN(col)` / `MAX(col)` whose operand (where it has one) is
-/// a bare column reference. `SUM(i64|decimal)` and `AVG(decimal)` are deferred (their fold charges
-/// running-sum-dependent decimal_work); `MIN`/`MAX` fold ANY type through `value_cmp`. Reusing the
-/// shared [`Acc::fold`] keeps the fold byte-identical to the scalar path (the scalar grouped path folds
-/// through the same `Acc::fold`), so only the group/scan machinery differs.
+/// `SUM(col)` / `AVG(col)` over an integer, decimal, or float column / `MIN(col)` / `MAX(col)` whose
+/// operand (where it has one) is a bare column reference; `MIN`/`MAX` fold ANY type through
+/// `value_cmp`. Reusing the shared [`Acc::fold`] keeps the fold byte-identical to the scalar path
+/// (the scalar grouped path folds through the same `Acc::fold`), so only the group/scan machinery
+/// differs.
+///
+/// The decimal folds (`SUM(i64|decimal)`, `AVG` over an integer or decimal) charge `decimal_work`
+/// that depends on the running sum (cost.md §3). That charge is made inside `Acc::fold`, and each
+/// accumulator here sees its group's survivors in scan order exactly as on the scalar path, so every
+/// fold meets the same running sum and charges the same amount; only the interleaving with the other
+/// charges differs, which no total observes (the caller gates to the unmetered lane). The fold
+/// raises no data error — the running sum is uncapped and the cap is checked at finalize
+/// (decimal.md §2) — so there is no error whose position among the rows could differ either.
 pub(crate) fn vectorized_spec_eligible(spec: &AggSpec) -> bool {
     if spec.distinct
         || spec.filter.is_some()
@@ -7430,12 +7438,68 @@ pub(crate) fn vectorized_spec_eligible(spec: &AggSpec) -> bool {
         AggPlan::CountStar => spec.operand.is_none(),
         AggPlan::Count
         | AggPlan::SumInt
+        | AggPlan::SumDecimal
+        | AggPlan::Avg
         | AggPlan::SumFloat(_)
         | AggPlan::AvgFloat(_)
         | AggPlan::Min
         | AggPlan::Max => matches!(spec.operand, Some(RExpr::Column(_))),
         _ => false,
     }
+}
+
+/// Whether evaluating `e` leaves nothing behind, so a lane attempt that evaluated it can be discarded
+/// and the statement run again on the row path (cost.md §6.1). A deliberate allowlist: columns,
+/// constants, parameters, and the operators over them that read no entropy, clock, sequence, host
+/// code or subquery and keep no per-node state. Anything else — every function call, a regex (its
+/// compile is charged once per node) — is not safe, and such a statement keeps the row path under a
+/// ceiling.
+pub(crate) fn discard_safe(e: &RExpr) -> bool {
+    match e {
+        RExpr::Column(_)
+        | RExpr::Param(_)
+        | RExpr::ConstInt(_)
+        | RExpr::ConstBool(_)
+        | RExpr::ConstText(_)
+        | RExpr::ConstDecimal(_)
+        | RExpr::ConstFloat32(_)
+        | RExpr::ConstFloat64(_)
+        | RExpr::ConstBytea(_)
+        | RExpr::ConstUuid(_)
+        | RExpr::ConstTimestamp(_)
+        | RExpr::ConstTimestamptz(_)
+        | RExpr::ConstDate(_)
+        | RExpr::ConstInterval(_)
+        | RExpr::ConstNull => true,
+        RExpr::Not(inner) => discard_safe(inner),
+        RExpr::Cast { inner, .. } => discard_safe(inner),
+        RExpr::Neg { operand, .. } | RExpr::IsNull { operand, .. } => discard_safe(operand),
+        RExpr::And(lhs, rhs) | RExpr::Or(lhs, rhs) => discard_safe(lhs) && discard_safe(rhs),
+        RExpr::Arith { lhs, rhs, .. }
+        | RExpr::Compare { lhs, rhs, .. }
+        | RExpr::Distinct { lhs, rhs, .. }
+        | RExpr::Like { lhs, rhs, .. } => discard_safe(lhs) && discard_safe(rhs),
+        RExpr::Case { arms, els, .. } => {
+            arms.iter().all(|(c, r)| discard_safe(c) && discard_safe(r)) && discard_safe(els)
+        }
+        RExpr::Coalesce { args, .. }
+        | RExpr::GreatestLeast { args, .. }
+        | RExpr::NullIf { args, .. } => args.iter().all(discard_safe),
+        // An uncorrelated `IN (subquery)`, folded to its value list before the lane runs — unless
+        // the list is also a key's point source, whose bound is planned around the fold. (A literal
+        // `IN` list resolves to comparisons.)
+        RExpr::InValues { lhs, points, .. } => points.is_none() && discard_safe(lhs),
+        _ => false,
+    }
+}
+
+thread_local! {
+    /// Tooling: the columnar aggregate lane's attempts under a cost ceiling on this thread, and how
+    /// many of them fell back to the row path (cost.md §6.1).
+    pub static LANE_CEILING_ATTEMPTS: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
+    /// Tooling: turns the lane's attempt under a cost ceiling off on this thread, so a test can
+    /// compare it against the row path alone.
+    pub static LANE_CEILING_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// The bare-column ordinal an eligible aggregate reads (its operand `RExpr::Column(idx)`), or `None`

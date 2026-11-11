@@ -1827,7 +1827,8 @@ func (db *engine) execStreamingSort(plan *selectPlan, env *evalEnv, meter *costM
 // contract, so it always uses top-k. File-backed variable/open-type rows have no static upper bound
 // and conservatively keep the existing external sorter. Untouched slots are nulled in a private
 // retained-row copy; fixed touched scalars use one shared logical
-// estimate across cores: 8 bytes per row plus 40 bytes per value (including UUID's payload).
+// estimate across cores: 8 bytes per row plus 40 bytes per value (including UUID's payload), and a
+// touched numeric(p,s) adds its largest digit-group payload, 4 × ⌈p/4⌉ (spill.md §4.1).
 func (db *engine) streamingTopKFits(plan *selectPlan, k int64) bool {
 	if k == 0 || db.path == "" || db.session.workMem == 0 {
 		return true
@@ -1836,16 +1837,23 @@ func (db *engine) streamingTopKFits(plan *selectPlan, k int64) bool {
 	if !ok {
 		return false
 	}
+	// A decimal with a declared precision has a bounded size too, so its rows are budgeted like the
+	// fixed-width ones, plus its largest digit-group payload (spill.md §4.1).
+	var decimalBytes int64
 	for i, col := range table.Columns {
 		if !plan.relMasks[0][i] {
 			continue
 		}
 		ty, scalar := col.Type.AsScalar()
+		if scalar && ty == scalarDecimal && col.Decimal != nil {
+			decimalBytes += memoryDecimalGroup * int64((int(col.Decimal.Precision)+3)/4)
+			continue
+		}
 		if !scalar || !topKFixedScalar(ty) {
 			return false
 		}
 	}
-	rowBudget := int64(8 + 40*len(table.Columns))
+	rowBudget := int64(8+40*len(table.Columns)) + decimalBytes
 	return k <= int64(db.session.workMem)/rowBudget
 }
 

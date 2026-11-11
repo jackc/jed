@@ -471,35 +471,43 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 	// A WHERE contradiction (planner.md §3.1) skips every scan lane: the eager pipeline below runs
 	// over an empty FROM (materializeRel reads nothing), so aggregates still see their empty input.
 	fast := !plan.whereContradiction()
-	// The whole-table packed-leaf fold owns only running scalar accumulators.
-	// Keep it ahead of spilling when it accepts the plan; grouped and declined
-	// row/gather paths continue through the bounded operator pipeline below.
-	if fast && meter.canBatchCosts() && db.explainActual == nil && db.vectorizedAggEligible(plan) && len(plan.groupSets) == 1 && len(plan.groupSets[0].keyCols) == 0 {
-		rows, ok, err := db.aggColumnar(plan, &plan.groupSets[0], env, meter)
-		if err != nil {
+	// Vectorized single-table aggregate (batch.go, the PAX/vectorization program's executor track): a
+	// SUM/COUNT/MIN/MAX/AVG with no DISTINCT / FILTER / HAVING / window, either whole-table or grouped
+	// by a single integer column, folds columnar / int64-bucketed instead of the row-at-a-time group
+	// machinery below. Results and accrued cost are byte-identical either way (the conformance corpus
+	// proves both). Which statements take it is contract (memory.md §5.4): it decides what a statement
+	// reserves. Ineligible ⇒ this is skipped and the general aggregate branch runs unchanged.
+	lane := fast && db.aggregateLaneEligible(plan)
+	if lane && meter.canBatchCosts() {
+		return db.execVectorizedAgg(plan, outer, params, ctes, rng, meter)
+	}
+	// Under a cost ceiling or lifetime budget (cost.md §6.1) the lane is an attempt: its result stands
+	// only if it finished cleanly with every ceiling still unreached, which is exactly when the row
+	// path would have completed with the same rows and cost. Anything else — an error, a tripped guard
+	// — is discarded and the general branch below runs from the start, so which error is raised, its
+	// text, and the cost it leaves accrued are the row path's. The attempt must be safe to discard.
+	// Its reservations are the lane's; a rejected attempt returns them, and the row path makes its own
+	// (memory.md §5.4).
+	if lane && !db.laneTools().ceilingOff && meter.Guard() == nil && laneDiscardSafe(plan) {
+		mark := meter.mark()
+		em, err := db.execVectorizedAgg(plan, outer, params, ctes, rng, meter)
+		// Cancellation is best effort and reported at once, as on every path.
+		if e, ok := err.(*EngineError); ok && e.State == QueryCanceled {
 			return emitter{}, err
 		}
-		if ok {
-			// Dense lanes are operator state; the group rows are a row buffer (memory.md §5.4).
-			if err := admitAggRows(rows, meter); err != nil {
-				return emitter{}, err
-			}
-			return emitAggSyntheticRows(plan, rows), nil
+		db.laneTools().attempts++
+		if err == nil && meter.Guard() == nil {
+			return em, nil
 		}
+		db.laneTools().fallbacks++
+		// Discard what the attempt produced (its scratch file and charges) before the rewind.
+		if em.sorted != nil {
+			em.sorted.close()
+		}
+		meter.rewind(mark)
 	}
 	if fast && db.boundedBlockingEligible(plan) {
 		return db.execBoundedBlocking(plan, env, meter)
-	}
-
-	// Vectorized single-table aggregate (batch.go, the PAX/vectorization program's executor track): a
-	// SUM/COUNT/MIN/MAX/AVG with no DISTINCT / FILTER / HAVING / window / ORDER BY, either whole-table
-	// or grouped by a single integer column, folds columnar / int64-bucketed instead of the
-	// row-at-a-time group machinery below. Gated to the unmetered lane so a metered query's
-	// deterministic abort row stays the scalar path's; results and accrued cost are byte-identical
-	// either way (the conformance corpus proves both). Ineligible / metered ⇒ this is skipped and the
-	// general aggregate branch runs unchanged.
-	if fast && meter.canBatchCosts() && db.explainActual == nil && db.vectorizedAggEligible(plan) {
-		return db.execVectorizedAgg(plan, outer, params, ctes, rng, meter)
 	}
 
 	// Columnar projection fast path (batch.go, packed-leaf.md §11 Track A2/A3): a bare-column projection

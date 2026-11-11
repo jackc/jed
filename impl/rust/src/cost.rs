@@ -248,6 +248,16 @@ pub(crate) fn block_cost(pages: usize, slabs: usize) -> i64 {
         + crate::costs::COSTS.value_decompress * slabs as i64
 }
 
+/// A [`Meter`]'s state at the start of a lane attempt that may be discarded (cost.md §6.1).
+pub(crate) struct MeterMark {
+    accrued: i64,
+    lifetime: Option<i64>,
+    ceiling_hit: CeilingHit,
+    scalar_bytes: i64,
+    query_used: i64,
+    query_peak: i64,
+}
+
 /// Which cost ceiling a charge crossed first (see `Meter::charge`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum CeilingHit {
@@ -508,6 +518,44 @@ impl Meter {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
         }
+    }
+
+    /// Record what a discarded lane attempt must give back (cost.md §6.1): the accrued cost, the
+    /// session cumulative total, the first-ceiling-crossed mark, the scalar-byte allowance, and the
+    /// query-memory balance (with the tooling peak).
+    pub(crate) fn mark(&self) -> MeterMark {
+        MeterMark {
+            accrued: self.accrued,
+            lifetime: self.lifetime.as_ref().map(|l| l.total.get()),
+            ceiling_hit: self.ceiling_hit,
+            scalar_bytes: self.scalar_bytes.get(),
+            query_used: self.query.used.get(),
+            query_peak: QUERY_MEMORY_PEAK.load(std::sync::atomic::Ordering::Relaxed),
+        }
+    }
+
+    /// Restore a [`mark`](Self::mark): the attempt made between the two leaves no trace on the meter.
+    /// The caller has dropped everything the attempt produced, so its own releases ran first.
+    pub(crate) fn rewind(&mut self, mark: MeterMark) {
+        self.accrued = mark.accrued;
+        if let (Some(l), Some(total)) = (&self.lifetime, mark.lifetime) {
+            l.total.set(total);
+        }
+        self.ceiling_hit = mark.ceiling_hit;
+        self.scalar_bytes.set(mark.scalar_bytes);
+        self.query.used.set(mark.query_used);
+        // A discarded attempt's reservations are no part of what the statement needed (the tooling
+        // peak is the minimal passing budget).
+        if self.query.active() {
+            QUERY_MEMORY_PEAK.store(mark.query_peak, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Whether `pending` cost a lane has earned but not yet charged would trip a ceiling
+    /// (cost.md §6.1): the lane stops its attempt here, within one batch of the ceiling.
+    #[inline]
+    pub(crate) fn pending_trips(&self, pending: i64) -> bool {
+        self.headroom().is_some_and(|h| pending >= h)
     }
 
     /// Bulk accrual is safe without deterministic cost ceilings. Cancellation remains

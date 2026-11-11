@@ -3,8 +3,9 @@
 // variable-width columns in place: IS [NOT] NULL from the leaf's null directory, text/bytea =/<> as a
 // byte compare against the stored span, array @>/<@/&& against the stored element bodies, and
 // COUNT(col) from nullness alone; every other predicate (and every value a consumer needs) goes through
-// the ordinary evaluator over resolved values. The lanes run only on the unmetered lane, so the same
-// session with a (never-reached) max_cost runs the row path — the oracle. For every query shape both
+// the ordinary evaluator over resolved values. The oracle is the row path: the same session with a
+// (never-reached) max_cost, which keeps the projection lane off, and the aggregate lane's attempt
+// under a ceiling (cost.md §6.1) switched off. For every query shape both
 // must agree on rows AND cost, over NULLs, empty values, embedded 0x00 bytes, multibyte text, NULL
 // array elements, compressed and out-of-line values (which fall back to the evaluator), and a writer's
 // uncommitted (Decoded) leaves. Mirrors Rust (tests/varwidth_lanes.rs) and Go
@@ -18,7 +19,7 @@ import { test } from "node:test";
 import type { ColType } from "../src/catalog.ts";
 import { encodeValue } from "../src/format.ts";
 import { arrayElementSpans, utf8CodePoints } from "../src/span_filter.ts";
-import { createDatabase, openDatabase, type Session } from "../src/tooling.ts";
+import { createDatabase, laneCeiling, openDatabase, type Session } from "../src/tooling.ts";
 import { render, textValue, type Value } from "../src/value.ts";
 import { queryOutcome } from "./util.ts";
 
@@ -110,8 +111,14 @@ function check(s: Session, sql: string, params: Value[] = []): void {
   s.setMaxCost(0n);
   const lane = run(s, sql, params);
   s.setMaxCost(1n << 60n);
-  const row = run(s, sql, params);
-  s.setMaxCost(0n);
+  laneCeiling.off = true;
+  let row: { rows: string; cost: bigint };
+  try {
+    row = run(s, sql, params);
+  } finally {
+    laneCeiling.off = false;
+    s.setMaxCost(0n);
+  }
   assert.deepEqual(lane, row, `lane vs row path: ${sql}`);
 }
 

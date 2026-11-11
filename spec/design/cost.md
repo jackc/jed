@@ -1984,6 +1984,164 @@ It is now built:
   function — `generate_series` over a giant range — is pinned mid-generation in
   [../conformance/suites/query/generate_series.test](../conformance/suites/query/generate_series.test).)
 
+### 6.1 The columnar aggregate lane under a ceiling
+
+The vectorized / columnar aggregate lane ([packed-leaf.md](packed-leaf.md) §11) accrues most of its
+cost in bulk when its scan ends, so it used to run only with no `max_cost` and no lifetime budget,
+and a session that set either ran every aggregate on the row path — several times slower
+([benchmarks.md](benchmarks.md) §11). This section specifies how the lane runs under a ceiling
+without changing anything a statement can observe. It is part of the cross-core contract, because with a query-memory budget also set the lane choice
+is observable (below).
+
+**What a ceiling makes observable.** Three things, all measured on the row path by sweeping every
+ceiling from 1 to a statement's cost + 2 over lane-shaped queries (whole-table and grouped folds,
+ordered groups, filters that raise `22012`):
+
+1. *Whether the statement completes.* It completes exactly when its total cost is below the ceiling:
+   every ceiling up to and including the cost aborts, every one above completes (§6 "the first
+   disallowed value").
+2. *Which error it raises.* A data error wins only if the row path reaches it before a guard trips.
+   The row path scans, then filters, then folds, so a filter error at row 400 of 600 surfaces only
+   once the ceiling exceeds the cost of scanning all 600 rows plus filtering 399.
+3. *What an abort or error has accrued.* The error text carries the accrued cost, and a session's
+   cumulative total keeps a failed statement's partial cost (session.md §5.4). The value depends on
+   where the row path's guards sit: it overshoots the ceiling by 0–8 units in the sweeps.
+
+The eager (in-memory) and bounded-spill (file-backed) row paths agree on all three at every ceiling,
+so the row path's sequence is one canonical sequence. The lane's is not that sequence: it interleaves
+filter and fold work and settles its scan charges at the end.
+
+**The rule: attempt the lane, accept only a clean success, otherwise run the row path.** With a
+ceiling or lifetime budget set, an eligible statement's blocking part runs as follows.
+
+1. Record the meter's accrued cost, the session cumulative total, the first-ceiling-crossed mark,
+   the statement's scalar-byte allowance (§8), and the query-memory balance.
+2. Run the lane. Its charges are the ones it always made. At every batch boundary (at most 256
+   records, where it already polls for cancellation) it also compares the cost it has earned but
+   not yet charged with the budget remaining, and stops there if a ceiling would trip.
+3. **Accept** the lane's groups if it finished without error and `guard()` passes on the accrued
+   total. Emission then proceeds as it does today.
+4. **Otherwise** discard everything the lane produced, restore the five values recorded in step 1,
+   and run the row path from the start. Whatever the row path does is the statement's outcome. A
+   cancellation (`57014`) is the one exception: it is reported at once, as today.
+
+**Why this is exact.** The lane and the row path charge the same blocking total `T` for a statement
+that completes; that is the lane's existing contract, and the corpus holds both to one `# cost:`.
+Every charge is non-negative, so each value the row path's guards see is at most `T`.
+
+- If the lane is accepted, `T` is below every active ceiling, so no row-path guard would have
+  tripped; the row path would have completed with the same groups and the same accrued cost, and the
+  two then emit identically.
+- If the lane is not accepted, the row path decides. By (1) it cannot complete when `T` has reached a
+  ceiling, and it raises the same data error the lane did unless a guard trips first, so a statement
+  that succeeds is never run twice (bar a lane-only `54P05`, below).
+
+So the lane changes no rows, no cost, no error, no error text, and no cumulative total.
+
+**Work stays bounded.** The lane stops within one batch of the guard tripping, and the row path that
+follows stops at the ceiling as it does today. A statement that exceeds its ceiling therefore does at
+most the lane's work up to the ceiling, one batch, and the row path's work up to the ceiling — about
+twice today's bound, and only for statements that fail.
+
+**The trade-off: rerun on failure rather than redefine the abort.** The rerun is not a stopgap for
+cores that lack the lane; it would remain if every core had it, because what an abort reports is
+defined by the row path's order of work, which the lane does not follow. Two alternatives would
+remove it, and both change the contract:
+
+- *Define the abort by the lane's order.* Every core would then have to match the lane's charge
+  order and batch boundaries exactly, making the lane's internals part of this spec, and a statement
+  would abort differently according to whether its shape takes the lane.
+- *Make the abort coarser* — drop the accrued cost from the error text and charge a failed statement
+  exactly its ceiling — so the lane could report an abort itself once its total reaches the ceiling.
+  Which error wins, cost or data, would still need a rule the lane can evaluate.
+
+The rerun is chosen because it leaves the abort contract of §6 untouched and the lane free to change
+internally. Its price falls only on statements that fail: they do the lane's work up to the ceiling
+and then the row path's, where today they do the row path's alone. A statement that completes runs
+once, on the lane. If failing statements under a ceiling ever dominate a workload, the coarser abort
+is the alternative to revisit.
+
+**Eligibility: the lane's work must be safe to discard.** A discarded attempt must leave nothing
+behind, so under a ceiling the lane additionally requires that the expressions it evaluates (its
+`WHERE` and any `ORDER BY` expression over its groups; its operands are bare columns) contain:
+
+- no volatile call — entropy (`uuidv4`, `uuidv7`), `clock_timestamp()`, a sequence
+  function, or a volatile host function — by the function catalog's volatility, the data index
+  admission already reads ([index-dependencies.md](index-dependencies.md)). Entropy and the clock live
+  in the environment and cannot be rewound; a stable call (`now()`, a session setting) is fine,
+  because the statement clock is resolved once and kept;
+- no subquery (its result cache and nested meter would have to be rewound too).
+
+Everything else the attempt touches is restored in step 4 or is unobservable (page cache, read-ahead,
+scratch files).
+
+The contract applies this as an **allowlist** of resolved expression nodes, narrower than the rule
+and identical in every core. An expression is safe to discard exactly when it is built only from:
+
+- a column reference, a bind parameter, or a constant of type integer, boolean, text, decimal,
+  float, `bytea`, `uuid`, `timestamp`, `timestamptz`, `date`, `interval`, or `NULL`;
+- `NOT`, `AND`, `OR`; unary minus and binary arithmetic; a comparison; `IS [NOT] NULL`;
+  `IS [NOT] DISTINCT FROM`; `[NOT] LIKE` / `ILIKE`;
+- a scalar cast (the plain scalar-to-scalar cast node — not an array, composite, or datetime-family
+  conversion node);
+- `CASE`, `COALESCE`, `NULLIF`, `GREATEST`, `LEAST`;
+- `[NOT] IN` over an uncorrelated subquery that the planner folded to a value list before
+  execution, unless that list is also a key's point source (cost.md §3 "OR / IN-list"). A literal
+  `IN` list resolves to comparisons and is covered by them.
+
+Every function call is outside it for now, as are a regex match (its compile is charged once per
+node, so a second run would charge differently), JSON, array, and range constants and operators, a
+correlated reference, and any subquery still present at execution. An uncorrelated scalar or
+`EXISTS` subquery that the planner folds to a constant before execution qualifies, since the lane
+sees only the constant. A statement outside the
+allowlist keeps the row path under a ceiling.
+
+The remaining preconditions: the lane's shape rules hold ([memory.md](memory.md) §5.4), and the
+guard passes when the attempt starts.
+
+**With a query-memory budget.** The lane choice decides which buffers a statement reserves
+([memory.md](memory.md) §5.4), so every core applies this rule identically: the attempt reserves
+what the lane reserves; an accepted attempt keeps those reservations; a rejected one returns them
+all — the account's balance goes back to its value when the attempt started — and the row path
+reserves its own. A `54P05` raised inside the attempt is a rejection like any other. One consequence
+is deliberate: a statement the lane fails `54P05` with no ceiling may complete with one, through the
+row path, which spills on a file. Treating the lane's `54P05` as final instead would make the
+outcome depend on what the lane had accrued when the reservation was rejected, and so on its
+internal charge order. For the same reason the early stop in step 2 is not contract: whether an
+attempt is accepted depends only on its total and its reservations, never on where it gave up. The
+conformance harness's per-record memory peak excludes a rejected attempt.
+
+**Not covered.**
+
+- *The columnar projection lane* stays gated. Its row path is the streaming scan, which interleaves
+  scan and emission charges and hands rows to the host before an abort; the lane scans everything
+  first. Accepting it needs the whole statement's cost, emission included, known before the first
+  row is handed over, and a cursor that is closed early accrues less on the streaming path.
+- *Expression operands and other shapes the lane does not take* still run on the row path.
+
+**Verification.** Each core's `varwidth_lanes` battery runs each statement with the attempt on and off
+(a per-thread tooling switch) and requires the same outcome — rows and cost, or error code and text —
+and the same addition to the session's cumulative cost: at **every** `max_cost` from 1 to past the
+statement's cost over a 300-row file-backed table (whole-table and grouped folds, ordered groups, a
+`LIMIT` window, no survivors, filters that raise `22012` part-way, a folded subquery); at every third
+in memory; under a lifetime budget alone and beside a `max_cost` one unit either side of it (which
+ceiling's error wins); at `work_mem` settings that hand the grouped fold over mid-scan; sampled over a
+3,000-row table; and at a fitting ceiling over a writer's uncommitted leaves. It also asserts that
+the lane was attempted, accepted, and rejected where expected, and never attempted for entropy, a
+function call, a correlated subquery, a regex, or under a query-memory budget. Removing the rewind,
+the acceptance guard, or the safe-to-discard check each fails it. The corpus's `# max_cost:` records
+now run through the attempt as well.
+
+**Measured** (200k rows, file-backed, a ceiling that is never reached, ms): `count(*), sum(numeric)`
+95 → 8.8; `sum(bigint)` 81 → 5.3; a 50-group `sum(numeric)` 106 → 14.3, and the same ordered 100 →
+14.4 — each now equal to its time with no ceiling.
+
+**An existing gap this exposes.** With no ceiling, a statement that fails on the lane leaves a
+different cumulative total than the row path does (`SELECT count(*) FROM t WHERE 1000 / (id - 400) >
+0` over 600 rows: 1200 on the lane, 1806 on the row path), because the lane has not yet settled its
+scan charges when the error is raised. The total is readable and feeds a lifetime budget set later
+on the same session. This design does not change that: with no ceiling the lane still runs alone.
+
 Other items recorded against the seam:
 
 - **A real `page_read` unit — ✅ landed (P6.3).** The store is now a page-backed B-tree

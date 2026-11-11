@@ -2384,7 +2384,6 @@ fn orphaned_leaf_pages(
         if fixed_value_width(ty).is_some() {
             continue;
         }
-        let tyref = crate::value::TypeRef::new(Arc::clone(col_types), c);
         for i in 0..n {
             if dirs.is_null(payload, c, i) {
                 continue;
@@ -2392,7 +2391,8 @@ fn orphaned_leaf_pages(
             let mut pos = dirs.value_off(payload, c, i);
             // Only the pointer's stored length matters; the resolution handle is deliberately dead.
             let v = read_value_lazy(
-                &tyref,
+                col_types,
+                c,
                 &shared,
                 payload,
                 &mut pos,
@@ -3488,7 +3488,6 @@ pub(crate) fn collect_leaf_overflow_with(
                 if fixed_value_width(ty).is_some() {
                     continue;
                 }
-                let tyref = crate::value::TypeRef::new(Arc::clone(col_types), c);
                 for i in 0..n {
                     if dirs.is_null(payload, c, i) {
                         continue;
@@ -3497,7 +3496,8 @@ pub(crate) fn collect_leaf_overflow_with(
                     // The value is discarded right after `mark_chains` (only its chain pages
                     // matter), so the resolution handle is deliberately dead.
                     let v = read_value_lazy(
-                        &tyref,
+                        col_types,
+                        c,
                         &shared,
                         payload,
                         &mut pos,
@@ -6000,13 +6000,39 @@ impl PackedLeaf {
             Some(_) => read_inline_body(ty, payload, &mut pos, DecodeMode::Construct),
             // A variable value's span is its tagged codec bytes — the lazy tag path.
             None => read_value_lazy(
-                &crate::value::TypeRef::new(Arc::clone(&self.col_types), c),
+                &self.col_types,
+                c,
                 &self.block,
                 payload,
                 &mut pos,
                 self.cap,
                 &self.paging,
             ),
+        }
+    }
+
+    /// [`value`](Self::value) with a deferred value resolved — for a reader that uses the value
+    /// now. An inline-plain variable-width body decodes straight from the page: the same
+    /// [`read_inline_body`] a deferred handle runs when it resolves, without building and dropping
+    /// the handle, which costs three `Arc` bumps each way (the block, and the column types twice).
+    /// Any other stored form (out of line, compressed) takes the deferred route.
+    pub(crate) fn value_resolved(&self, c: usize, i: usize) -> Result<Value> {
+        let payload = &self.block[self.payload_off..];
+        if self.dirs.is_null(payload, c, i) {
+            return Ok(Value::Null);
+        }
+        let ty = &self.col_types[c];
+        let mut pos = self.dirs.value_off(payload, c, i);
+        if fixed_value_width(ty).is_some() {
+            return read_inline_body(ty, payload, &mut pos, DecodeMode::Construct);
+        }
+        if payload.get(pos) == Some(&0x00) {
+            pos += 1; // the present-inline-plain tag
+            return read_inline_body(ty, payload, &mut pos, DecodeMode::Construct);
+        }
+        match self.value(c, i)? {
+            Value::Unfetched(u) => resolve_unfetched_self(&u),
+            v => Ok(v),
         }
     }
 
@@ -7785,6 +7811,21 @@ fn decode_decimal_body(buf: &[u8], pos: &mut usize, mode: DecodeMode) -> Result<
     let neg = flags & 1 != 0;
     let scale = read_u16(buf, pos)? as u32;
     let ndigits = read_u16(buf, pos)? as usize;
+    if ndigits <= crate::decimal::SMALL_CODEC_GROUPS {
+        // The usual case: fold the groups straight into the inline magnitude, with no list.
+        let mut m: u128 = 0;
+        for _ in 0..ndigits {
+            let g = read_u16(buf, pos)?;
+            if g > 9999 {
+                return Err(corrupt("decimal digit group out of range"));
+            }
+            m = m * 10_000 + g as u128;
+        }
+        if !mode.constructs() {
+            return Ok(Value::Null); // skip-mode placeholder (no Decimal built)
+        }
+        return Ok(Value::Decimal(Decimal::from_codec_small(neg, scale, m)));
+    }
     let mut groups = if mode.constructs() {
         Vec::with_capacity(ndigits)
     } else {
@@ -7849,14 +7890,18 @@ fn read_overflow_chain(
 /// references for the columns a query touches ([`resolve_unfetched`]); a commit writes the rest from
 /// their stored bytes, keeping their chains (large-values.md §15).
 fn read_value_lazy(
-    tyref: &crate::value::TypeRef,
+    cols: &Arc<Vec<ColType>>,
+    idx: usize,
     block: &Arc<Vec<u8>>,
     buf: &[u8],
     pos: &mut usize,
     cap: Cap,
     paging: &std::sync::Weak<SharedPaging>,
 ) -> Result<Value> {
-    let ty = tyref.ty();
+    let ty = &cols[idx];
+    // The deferred value's type handle, built only by an arm that defers: one `Arc` bump per
+    // deferred value, none for a value that decodes here.
+    let tyref = || crate::value::TypeRef::new(Arc::clone(cols), idx);
     match read_u8(buf, pos)? {
         // A present inline value (lazy-record.md §12, L3): a variable-length / structured body
         // (the `is_spillable` set — §6) is **deferred** as an `Unfetched::Inline` referencing the
@@ -7878,7 +7923,7 @@ fn read_value_lazy(
                     block: Arc::clone(block),
                     off,
                     len,
-                    ty: tyref.clone(),
+                    ty: tyref(),
                 }))
             } else {
                 read_inline_body(ty, buf, pos, DecodeMode::Construct)
@@ -7892,7 +7937,7 @@ fn read_value_lazy(
             Ok(Value::Unfetched(Unfetched::External {
                 first,
                 len,
-                ty: tyref.clone(),
+                ty: tyref(),
                 paging: crate::value::PagerRef(paging.clone()),
                 buffered: false,
             }))
@@ -7904,7 +7949,7 @@ fn read_value_lazy(
             Ok(Value::Unfetched(Unfetched::InlineComp {
                 comp,
                 raw_len,
-                ty: tyref.clone(),
+                ty: tyref(),
                 buffered: false,
             }))
         }
@@ -7917,7 +7962,7 @@ fn read_value_lazy(
                 first,
                 stored_len,
                 raw_len,
-                ty: tyref.clone(),
+                ty: tyref(),
                 paging: crate::value::PagerRef(paging.clone()),
                 buffered: false,
             }))

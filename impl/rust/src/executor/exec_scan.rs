@@ -1565,22 +1565,29 @@ impl Engine {
             let mut sorter = (!use_top_k).then(|| self.new_sorter(&plan.order));
             let mut total = 0i64;
             if !empty {
-                // Read-only SELECT feed: reconstruct only the touched columns (Track A1).
-                store.scan_range(&bound, &mut |_key, row| {
+                // Read-only SELECT feed: only the touched columns are read, each resolved straight
+                // from its leaf (the columnar lanes' walk, packed-leaf.md §11 Track A5) into one
+                // reused row whose untouched slots stay NULL — the form sort state holds (memory.md
+                // §6.1). The sort takes the row only when it keeps it: the sorter always, the top-k
+                // heap when the row enters it.
+                let mask = &plan.rel_masks[0];
+                let width = store.col_types().len();
+                let mut scratch: Row = Vec::new();
+                let mut visit = |node: &crate::pmap::Node, i: usize| -> Result<()> {
                     meter.checkpoint()?; // enforce the cost ceiling per scanned row (CLAUDE.md §13)
                     meter.charge(COSTS.storage_row_read);
-                    let resolved = if TableStore::needs_resolution(row, &plan.rel_masks[0]) {
-                        let mut r = row.clone();
-                        store.resolve_columns(&mut r, &plan.rel_masks[0])?;
-                        Some(r)
-                    } else {
-                        None
-                    };
-                    let row_ref = resolved.as_ref().unwrap_or(row);
+                    if scratch.len() != width {
+                        scratch = vec![Value::Null; width];
+                    }
+                    for (c, slot) in scratch.iter_mut().enumerate() {
+                        if mask.get(c) != Some(&false) {
+                            *slot = node.col_at_resolved(i, c)?;
+                        }
+                    }
                     let keep = match plan.filter.get() {
                         Some(f) => {
                             let before = meter.accrued;
-                            let keep = f.eval_filter(row_ref, env, meter)?;
+                            let keep = f.eval_filter(&scratch, env, meter)?;
                             filter_work += meter.accrued - before;
                             keep
                         }
@@ -1588,21 +1595,21 @@ impl Engine {
                     };
                     if keep {
                         total += 1;
-                        let mut owned = resolved.unwrap_or_else(|| row.clone());
-                        // Sort state holds only the touched columns (memory.md §6.1).
-                        null_untouched(&mut owned, &plan.rel_masks[0]);
                         let pushed = if let Some(k) = &mut keeper {
-                            k.push(owned, meter)
+                            k.offer(&mut scratch, meter)
                         } else {
                             // Each survivor charges its sort keys as the sorter receives it
                             // (cost.md §3 "sort_key / hash_key").
-                            charge_sort_keys(meter, &owned, &plan.order)
-                                .and_then(|()| sorter.as_mut().unwrap().push(owned))
+                            charge_sort_keys(meter, &scratch, &plan.order).and_then(|()| {
+                                sorter.as_mut().unwrap().push(std::mem::take(&mut scratch))
+                            })
                         };
                         meter.cost_first(pushed)?;
                     }
-                    Ok(true) // never stop early — the sort must see every row
-                })?;
+                    Ok(()) // never stop early — the sort must see every row
+                };
+                let (_, _, scanned) = store.fold_scan_masked(&bound, &mut visit);
+                scanned?;
             }
             let sorted = if let Some(k) = keeper {
                 let (rows, charge) = k.finish_charged();
@@ -1659,8 +1666,16 @@ impl Engine {
         else {
             return false;
         };
+        // A decimal with a declared precision has a bounded size too, so its rows are budgeted like
+        // the fixed-width ones, plus its largest digit-group payload (memory.md §6.4).
+        let mut decimal_bytes = 0usize;
         if table.columns.iter().enumerate().any(|(i, col)| {
             if !plan.rel_masks[0][i] {
+                return false;
+            }
+            if let (Type::Scalar(ScalarType::Decimal), Some(typmod)) = (&col.ty, &col.decimal) {
+                decimal_bytes += crate::costs::MEMORY_DECIMAL_GROUP as usize
+                    * (typmod.precision as usize).div_ceil(4);
                 return false;
             }
             !matches!(
@@ -1681,7 +1696,9 @@ impl Engine {
         }) {
             return false;
         }
-        let row_budget = 8usize.saturating_add(40usize.saturating_mul(table.columns.len()));
+        let row_budget = 8usize
+            .saturating_add(40usize.saturating_mul(table.columns.len()))
+            .saturating_add(decimal_bytes);
         usize::try_from(k).is_ok_and(|count| count <= self.session.work_mem / row_budget)
     }
 
@@ -2837,10 +2854,7 @@ impl Engine {
                         scratch.read(node, i, c)?
                     } else {
                         // A fixed-width slot never defers; a variable value resolves here.
-                        match node.col_at(i, c)? {
-                            Value::Unfetched(u) => crate::format::resolve_unfetched_self(&u)?,
-                            v => v,
-                        }
+                        node.col_at_resolved(i, c)?
                     });
                 }
                 n_emit += 1;
@@ -2958,13 +2972,9 @@ impl Engine {
             _ => return false,
         }
         // No blocking / re-shaping operator beyond the fold. LIMIT/OFFSET is honored via the window
-        // bounds below, so it need not bail.
-        if plan.distinct
-            || plan.distinct_on > 0
-            || plan.having.is_some()
-            || plan.has_window
-            || !plan.order.is_empty()
-        {
+        // bounds below, so it need not bail. An `ORDER BY` is the caller's to admit: only the
+        // handed-over grouped lane sorts its groups (packed-leaf.md §11 Track A5).
+        if plan.distinct || plan.distinct_on > 0 || plan.having.is_some() || plan.has_window {
             return false;
         }
         if plan.agg_specs.is_empty() {
@@ -2997,12 +3007,41 @@ impl Engine {
         // the row path. Declines (None) to the row path below for an in-memory store or a spillable
         // touched column. Cost-neutral by construction (agg_columnar charges the identical scan block).
         let srows = match self.agg_columnar(plan, gset, env, meter)? {
-            Some(srows) => {
+            Some(LaneGroups::Rows(srows)) => {
                 // The fold's group table is operator state (memory.md §6.2); the group rows are a row buffer.
                 for r in &srows {
                     meter.admit_row(r)?;
                 }
                 srows
+            }
+            // A grouped fold on a spill-capable host: its groups are a spool, handed over or not —
+            // sorted by the bounded-spill lane's own `ORDER BY` stage and emitted under the
+            // LIMIT/OFFSET window exactly as that lane emits its own.
+            Some(LaneGroups::Spool(mut rows)) => {
+                if !plan.order.is_empty() {
+                    let sorted = self.blocking_order(plan, rows, env, meter);
+                    rows = meter.cost_first(sorted)?;
+                }
+                let len = rows.len();
+                let start = plan.offset.unwrap_or(0).min(len as i64) as usize;
+                let remaining = plan
+                    .limit
+                    .map_or(len - start, |n| n.min((len - start) as i64) as usize);
+                let mut rows = rows.into_reader()?;
+                for _ in 0..start {
+                    rows.next()?;
+                }
+                return Ok(Emitter::Spool {
+                    rows,
+                    remaining,
+                    mode: EmitMode::Project,
+                    charged: false,
+                });
+            }
+            // The lane declined a grouped fold on a spill-capable host: the bounded-spill lane, never
+            // the unbounded row path below.
+            None if !gset.key_cols.is_empty() && self.blocking_spill_eligible(plan) => {
+                return self.exec_blocking_spill(plan, env, meter);
             }
             None => {
                 // Row path: scan the single base relation through the same path the eager executor
@@ -3092,13 +3131,17 @@ impl Engine {
     /// expected for an eligible plan). Cost-neutral by construction: same page_read (plus each admitted
     /// record's chain pages) / value_decompress / storage_row_read / operator_eval (the filter) /
     /// aggregate_accumulate / row_produced as the row path.
+    ///
+    /// On a spill-capable host a grouped fold is bounded by `work_mem` (Track A5): past it the group
+    /// table is handed over to the spill structures, the rest of the scan folds into those, and the
+    /// result comes back as a spool ([`LaneGroups::Spool`]).
     pub(crate) fn agg_columnar(
         &self,
         plan: &SelectPlan,
         gset: &GroupSetPlan,
         env: &EvalEnv,
         meter: &mut Meter,
-    ) -> Result<Option<Vec<Vec<Value>>>> {
+    ) -> Result<Option<LaneGroups>> {
         let rel = &plan.rels[0];
         let store = self.store_scoped(rel.db.as_deref(), &rel.table_name);
         // File-backed only: an in-memory store's row path is already zero-copy.
@@ -3156,6 +3199,27 @@ impl Engine {
         let mut groups: Vec<(Value, Vec<Acc>)> = Vec::new();
         let mut index: HashMap<i64, usize> = HashMap::new();
         let mut null_gi: Option<usize> = None;
+        // On a spill-capable host a grouped fold is bounded by `work_mem` (packed-leaf.md §11): the
+        // group table's size is tracked on the state map's schedule (memory.md §6.6) — a fixed part
+        // per group, plus each decimal sum's and MIN/MAX value's own bytes as they change — and past
+        // the budget the table is handed over to the spill structures, into which the rest of the
+        // scan folds.
+        let zone = &self.session.time_zone;
+        let bounded = grouped && self.blocking_spill_eligible(plan);
+        let budget = i64::try_from(self.session.work_mem).unwrap_or(i64::MAX);
+        let group_base = if bounded {
+            super::blocking_spill::lane_group_base_bytes(&plan.agg_specs, zone)
+        } else {
+            0
+        };
+        let variable: Vec<bool> = plan
+            .agg_specs
+            .iter()
+            .map(|s| bounded && super::blocking_spill::acc_is_variable(s))
+            .collect();
+        let mut resident = 0i64;
+        let mut rejected = false;
+        let mut spilled: Option<super::blocking_spill::LaneGroupSpill> = None;
         // The WHERE compiles once into span atoms over the stored bytes plus generic predicates over a
         // reusable masked scratch row (Track A4) — byte-identical survivors + operator_eval to the row
         // path's eval_filter over a masked row.
@@ -3197,6 +3261,19 @@ impl Engine {
             let mut visit = |node: &crate::pmap::Node, i: usize| -> Result<()> {
                 if visited & 255 == 0 {
                     meter.checkpoint()?;
+                    // Under a ceiling this fold is an attempt (cost.md §6.1): once the cost it has
+                    // earned but not yet charged would trip, the statement cannot complete, so stop
+                    // within this batch. The caller discards the attempt and its error.
+                    let pending = COSTS.storage_row_read * visited as i64
+                        + COSTS.page_read * units.pages as i64
+                        + COSTS.value_decompress * units.decompress as i64
+                        + COSTS.aggregate_accumulate * nsurv as i64 * plan.agg_specs.len() as i64;
+                    if meter.pending_trips(pending) {
+                        return Err(EngineError::new(
+                            SqlState::CostLimitExceeded,
+                            "the columnar fold reached the cost limit",
+                        ));
+                    }
                 }
                 visited += 1;
                 if spillable {
@@ -3210,59 +3287,9 @@ impl Engine {
                     return Ok(());
                 }
                 nsurv += 1;
-                let accs: &mut Vec<Acc> = if grouped {
-                    let gi = match node.col_at(i, key_col)? {
-                        Value::Int(k) => match index.get(&k) {
-                            Some(&g) => g,
-                            None => {
-                                if charge.active() {
-                                    charge.reserve(
-                                        meter,
-                                        crate::memsize::entry_bytes(&[Value::Int(k)]),
-                                    )?;
-                                }
-                                let g = groups.len();
-                                index.insert(k, g);
-                                groups.push((
-                                    Value::Int(k),
-                                    plan.agg_specs
-                                        .iter()
-                                        .map(|s| Acc::from_spec(s, &self.session.time_zone))
-                                        .collect(),
-                                ));
-                                g
-                            }
-                        },
-                        // A NULL integer key buckets into one sentinel group (the value-canonical key
-                        // groups all NULLs together — matching the scalar/lane path).
-                        _ => match null_gi {
-                            Some(g) => g,
-                            None => {
-                                if charge.active() {
-                                    charge.reserve(
-                                        meter,
-                                        crate::memsize::entry_bytes(&[Value::Null]),
-                                    )?;
-                                }
-                                let g = groups.len();
-                                null_gi = Some(g);
-                                groups.push((
-                                    Value::Null,
-                                    plan.agg_specs
-                                        .iter()
-                                        .map(|s| Acc::from_spec(s, &self.session.time_zone))
-                                        .collect(),
-                                ));
-                                g
-                            }
-                        },
-                    };
-                    &mut groups[gi].1
-                } else {
-                    &mut whole
-                };
-                for (si, read) in operands.iter().enumerate() {
-                    let v = match *read {
+                // Aggregate `si`'s operand for this record.
+                let operand = |read: OperandRead, scratch: &ScratchRow| -> Result<Value> {
+                    Ok(match read {
                         OperandRead::None => Value::Null, // COUNT(*) folds no value
                         OperandRead::Nullness(c) => {
                             if node.col_is_null(i, c) {
@@ -3273,12 +3300,98 @@ impl Engine {
                         }
                         OperandRead::Fixed(c) => node.col_at(i, c)?,
                         OperandRead::Reuse(c) => scratch.read(node, i, c)?,
-                        OperandRead::Variable(c) => match node.col_at(i, c)? {
-                            Value::Unfetched(u) => crate::format::resolve_unfetched_self(&u)?,
-                            v => v,
-                        },
-                    };
-                    accs[si].fold(v, meter)?;
+                        OperandRead::Variable(c) => node.col_at_resolved(i, c)?,
+                    })
+                };
+                if !grouped {
+                    for (si, read) in operands.iter().enumerate() {
+                        whole[si].fold(operand(*read, &scratch)?, meter)?;
+                    }
+                    return Ok(());
+                }
+                // A NULL integer key buckets into one sentinel group (the value-canonical key groups
+                // all NULLs together — matching the scalar/lane path).
+                let key = match node.col_at(i, key_col)? {
+                    Value::Int(k) => Some(k),
+                    _ => None,
+                };
+                if let Some(spill) = spilled.as_mut() {
+                    // Handed over: the per-row step `blocking_aggregate` runs — load the group's
+                    // state, fold each aggregate, store it back. An integer key charges no hash work.
+                    let key = key.map_or(Value::Null, Value::Int);
+                    let mut state = spill.state(&key, &plan.agg_specs, zone)?;
+                    for (si, read) in operands.iter().enumerate() {
+                        let v = operand(*read, &scratch)?;
+                        super::blocking_spill::LaneGroupSpill::fold(
+                            &mut state,
+                            si,
+                            &plan.agg_specs[si],
+                            v,
+                            zone,
+                            meter,
+                        )?;
+                    }
+                    return spill.put(&key, state);
+                }
+                let found = match key {
+                    Some(k) => index.get(&k).copied(),
+                    None => null_gi,
+                };
+                let gi = match found {
+                    Some(g) => g,
+                    None => {
+                        let key_value = key.map_or(Value::Null, Value::Int);
+                        if bounded {
+                            // The bounded table reserves what it measures (memory.md §6.6).
+                            rejected |= !charge.try_reserve_direct(group_base);
+                        } else if charge.active() {
+                            charge.reserve(
+                                meter,
+                                crate::memsize::entry_bytes(std::slice::from_ref(&key_value)),
+                            )?;
+                        }
+                        let g = groups.len();
+                        match key {
+                            Some(k) => {
+                                index.insert(k, g);
+                            }
+                            None => null_gi = Some(g),
+                        }
+                        groups.push((
+                            key_value,
+                            plan.agg_specs
+                                .iter()
+                                .map(|s| Acc::from_spec(s, zone))
+                                .collect(),
+                        ));
+                        resident += group_base;
+                        g
+                    }
+                };
+                let accs = &mut groups[gi].1;
+                for (si, read) in operands.iter().enumerate() {
+                    let v = operand(*read, &scratch)?;
+                    if variable[si] {
+                        let before = super::blocking_spill::acc_variable_bytes(&accs[si]);
+                        accs[si].fold(v, meter)?;
+                        let delta = super::blocking_spill::acc_variable_bytes(&accs[si]) - before;
+                        resident += delta;
+                        if delta > 0 {
+                            rejected |= !charge.try_reserve_direct(delta);
+                        } else if delta < 0 {
+                            charge.release(-delta);
+                        }
+                    } else {
+                        accs[si].fold(v, meter)?;
+                    }
+                }
+                // Past `work_mem`, or once the account turns a reservation away, the table hands
+                // over like any spill structure: its whole charge is returned first.
+                if bounded && (resident > budget || rejected) {
+                    charge.release_all();
+                    spilled = Some(self.lane_group_handover(std::mem::take(&mut groups))?);
+                    index = HashMap::new();
+                    null_gi = None;
                 }
                 Ok(())
             };
@@ -3313,6 +3426,11 @@ impl Engine {
         );
         meter.charge(COSTS.aggregate_accumulate * nsurv as i64 * plan.agg_specs.len() as i64);
 
+        if let Some(spill) = spilled {
+            return Ok(Some(LaneGroups::Spool(
+                self.lane_group_finish(spill, &plan.agg_specs)?,
+            )));
+        }
         let srows = if grouped {
             groups
                 .into_iter()
@@ -3334,8 +3452,24 @@ impl Engine {
             ]
         };
         charge.release_all();
-        Ok(Some(srows))
+        if bounded {
+            // On a spill-capable host the groups leave as a spool, like the bounded-spill lane's own
+            // (memory.md §5.4): it spills where a row buffer would fail.
+            let mut spool = self.blocking_group_spool();
+            for r in srows {
+                spool.push(r)?;
+            }
+            return Ok(Some(LaneGroups::Spool(spool)));
+        }
+        Ok(Some(LaneGroups::Rows(srows)))
     }
+}
+
+/// What the columnar aggregate lane produced: its finalized synthetic rows — or, when a grouped fold
+/// outgrew `work_mem` and handed its group table over to the spill structures, a spool of them.
+pub(crate) enum LaneGroups {
+    Rows(Vec<Vec<Value>>),
+    Spool(crate::spill_buffer::RowSpool),
 }
 
 /// How the columnar aggregate lane reads one aggregate's operand per record (packed-leaf.md §11

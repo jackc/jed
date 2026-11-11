@@ -80,6 +80,8 @@ mod merge;
 pub(crate) use dml::CachedInsert;
 pub(crate) use error_detail::{DUPLICATED, EXISTS};
 mod blocking_spill;
+pub use access_encode::{LANE_CEILING_ATTEMPTS, LANE_CEILING_OFF};
+pub use blocking_spill::LANE_GROUP_HANDOVERS;
 mod eval;
 mod exec_emit;
 pub(crate) use exec_emit::FkKeyedTarget;

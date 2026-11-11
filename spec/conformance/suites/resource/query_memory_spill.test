@@ -126,13 +126,13 @@ statement error 54P05
 SELECT count(*) FROM (SELECT DISTINCT id % 10, pad FROM t) d
 
 # work_mem: 268435456
-# max_query_memory_bytes: 1130
+# max_query_memory_bytes: 1066
 query I nosort
 SELECT count(*) FROM (SELECT g, max(pad) FROM t GROUP BY g) s
 ----
 7
 
 # work_mem: 268435456
-# max_query_memory_bytes: 1129
+# max_query_memory_bytes: 1065
 statement error 54P05
 SELECT count(*) FROM (SELECT g, max(pad) FROM t GROUP BY g) s

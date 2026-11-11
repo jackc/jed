@@ -510,13 +510,16 @@ export function vectorizedProjectEligible(plan: SelectPlan): boolean {
   return plan.projections.every((p) => p.kind === "column");
 }
 
-// vectorizedSpecEligible reports whether one aggregate is a specialized numeric kernel the vectorized
-// aggregate path folds: a plain (non-DISTINCT, non-FILTER, non-ordered-set, non-hypothetical) COUNT(*)
-// / COUNT(col) / SUM(i16|i32) / SUM|AVG(f32|f64) / MIN(col) / MAX(col) whose operand (where it has one)
-// is a bare column reference. SUM(i64|decimal) → "sumDecimal" and AVG(decimal) → "avg" are deferred
-// (their fold charges running-sum-dependent decimalWork); MIN/MAX fold ANY type through valueCmp. The
-// ordered-set / hypothetical / json plans are excluded by the switch's default; reusing the shared
-// foldAcc keeps the fold byte-identical to the scalar path (the scalar grouped path folds through it).
+// vectorizedSpecEligible reports whether one aggregate is a kernel the vectorized aggregate path
+// folds: a plain (non-DISTINCT, non-FILTER, non-ordered-set, non-hypothetical) COUNT(*) / COUNT(col) /
+// SUM / AVG over an integer, decimal, or float / MIN(col) / MAX(col) whose operand (where it has one)
+// is a bare column reference (memory.md §5.4). The decimal folds — SUM(i64|decimal) → "sumDecimal",
+// AVG over an integer or decimal → "avg" — charge a decimalWork that depends on the running sum
+// (cost.md §3), but inside the shared foldAcc, and each accumulator meets its group's survivors in scan
+// order on either path, so every fold charges the same amount; the fold raises no data error (the cap
+// is checked at finalize, decimal.md §2). MIN/MAX fold ANY type through valueCmp. The ordered-set /
+// hypothetical / json plans are excluded by the switch's default; reusing the shared foldAcc keeps the
+// fold byte-identical to the scalar path (the scalar grouped path folds through it).
 export function vectorizedSpecEligible(spec: AggSpec): boolean {
   if (spec.distinct === true) return false;
   if (spec.filter !== undefined && spec.filter !== null) return false;
@@ -526,6 +529,8 @@ export function vectorizedSpecEligible(spec: AggSpec): boolean {
       return spec.operand === null;
     case "count":
     case "sumInt":
+    case "sumDecimal":
+    case "avg":
     case "sumFloat":
     case "avgFloat":
     case "min":

@@ -561,19 +561,56 @@ impl Engine {
         // Vectorized single-table aggregate (batch, the PAX/vectorization program's executor track): a
         // SUM/COUNT/MIN/MAX/AVG with no DISTINCT / FILTER / HAVING / window / ORDER BY, either
         // whole-table or grouped by a single integer column, folds columnar / int64-bucketed instead
-        // of the row-at-a-time group machinery below. Gated to the unmetered lane so a metered query's
-        // deterministic abort row stays the scalar path's; results and accrued cost are byte-identical
-        // either way (the conformance corpus proves both). Ineligible / metered ⇒ this is skipped and
-        // the general aggregate branch runs unchanged. (An aggregate plan skips every streaming
-        // fast-path below — they all require `!is_agg` — so this front-position placement is only for
-        // clarity, mirroring the Go core's ordering.)
-        if fast
-            && meter.can_batch_costs()
-            && (!self.blocking_spill_eligible(plan) || self.bounded_whole_aggregate(plan))
+        // of the row-at-a-time group machinery below. Results and accrued cost are byte-identical
+        // either way (the conformance corpus proves both). Ineligible ⇒ this is skipped and the general
+        // aggregate branch runs unchanged. (An aggregate plan skips every streaming fast-path below —
+        // they all require `!is_agg` — so this front-position placement is only for clarity, mirroring
+        // the Go core's ordering.)
+        let lane = fast
+            && (!self.blocking_spill_eligible(plan)
+                || self.bounded_whole_aggregate(plan)
+                || self.handover_grouped_aggregate(plan))
             && self.explain_actual.borrow().is_none()
             && self.vectorized_agg_eligible(plan)
-        {
+            // Only the handed-over grouped lane sorts its groups; every other shape with an
+            // `ORDER BY` keeps the general branch.
+            && (plan.order.is_empty()
+                || (self.blocking_spill_eligible(plan)
+                    && self.handover_grouped_aggregate(plan)));
+        if lane && meter.can_batch_costs() {
             return self.exec_vectorized_agg(plan, &env, meter);
+        }
+        // Under a cost ceiling or lifetime budget (cost.md §6.1) the lane is an attempt: its result
+        // stands only if it finished cleanly with every ceiling still unreached, which is exactly
+        // when the row path would have completed with the same rows and cost. Anything else — an
+        // error, a tripped guard — is discarded and the general branch below runs from the start, so
+        // which error is raised, its text, and the cost it leaves accrued are the row path's. The
+        // attempt must be safe to discard. Its reservations are the lane's; a rejected attempt
+        // returns them, and the row path makes its own (memory.md §5.4).
+        if lane
+            && !LANE_CEILING_OFF.get()
+            && meter.guard().is_ok()
+            && plan.filter.get().is_none_or(discard_safe)
+            && plan.order_exprs.iter().all(discard_safe)
+        {
+            let mark = meter.mark();
+            let attempt = self.exec_vectorized_agg(plan, &env, meter);
+            let accepted = match attempt {
+                Ok(em) if meter.guard().is_ok() => Some(em),
+                // Cancellation is best effort and reported at once, as on every path.
+                Err(e) if e.state == SqlState::QueryCanceled => return Err(e),
+                // Dropped here, before the rewind, so the attempt's own releases run first.
+                other => {
+                    drop(other);
+                    None
+                }
+            };
+            let (attempts, fallbacks) = LANE_CEILING_ATTEMPTS.get();
+            LANE_CEILING_ATTEMPTS.set((attempts + 1, fallbacks + accepted.is_none() as u64));
+            if let Some(em) = accepted {
+                return Ok(em);
+            }
+            meter.rewind(mark);
         }
 
         // Bounded streaming scan (spec/design/cost.md §3): a single-table query whose chosen access

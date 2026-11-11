@@ -69,7 +69,20 @@ pub fn decimal_from_parts(int_part: &str, frac: &str, exp: Option<i64>) -> (Stri
 pub struct Decimal {
     neg: bool,
     scale: u32,
-    limbs: Vec<u32>,
+    mag: Mag,
+}
+
+/// The coefficient magnitude (spec/design/decimal.md §1). **Canonical**: a magnitude below 2^128
+/// is always `Small`, so a `Big` magnitude is at least 2^128 and two equal magnitudes have the
+/// same variant. Every constructor goes through [`Decimal::from_small`] or
+/// [`Decimal::from_parts`], which keep that.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Mag {
+    /// `lo + hi·2^64`, held inline: no allocation to build, copy, or drop. Two `u64`s rather than
+    /// one `u128` so the type aligns to 8 bytes and a `Decimal` stays 32.
+    Small(u64, u64),
+    /// Base-10^9 limbs, least-significant first, no high zero limbs.
+    Big(Vec<u32>),
 }
 
 fn overflow() -> EngineError {
@@ -89,8 +102,45 @@ impl Decimal {
     /// zero). The single choke-point every constructor ends with.
     fn from_parts(neg: bool, scale: u32, mut limbs: Vec<u32>) -> Decimal {
         mag_trim(&mut limbs);
-        let neg = neg && !limbs.is_empty();
-        Decimal { neg, scale, limbs }
+        match limbs_to_small(&limbs) {
+            Some(m) => Decimal::from_small(neg, scale, m),
+            None => Decimal {
+                neg,
+                scale,
+                mag: Mag::Big(limbs),
+            },
+        }
+    }
+
+    /// Construct from a magnitude below 2^128 (`neg` is forced `false` for zero).
+    #[inline]
+    fn from_small(neg: bool, scale: u32, m: u128) -> Decimal {
+        Decimal {
+            neg: neg && m != 0,
+            scale,
+            mag: Mag::Small(m as u64, (m >> 64) as u64),
+        }
+    }
+
+    /// The magnitude when it is held inline (below 2^128), else `None`.
+    #[inline]
+    fn small(&self) -> Option<u128> {
+        match self.mag {
+            Mag::Small(lo, hi) => Some((hi as u128) << 64 | lo as u128),
+            Mag::Big(_) => None,
+        }
+    }
+
+    /// The magnitude as base-10^9 limbs, whichever way it is held — what the limb algorithms
+    /// (the path for anything the inline arithmetic declines) read.
+    fn limbs(&self) -> LimbView<'_> {
+        match &self.mag {
+            Mag::Small(lo, hi) => {
+                let (buf, len) = small_to_limbs((*hi as u128) << 64 | *lo as u128);
+                LimbView::Inline(buf, len)
+            }
+            Mag::Big(limbs) => LimbView::Borrowed(limbs),
+        }
     }
 
     /// The integer whose radix-`base` (2, 8, or 16) digits are `digits` (ASCII, no separators), at
@@ -131,24 +181,26 @@ impl Decimal {
 
     /// Zero at the given display scale.
     pub fn zero(scale: u32) -> Decimal {
-        Decimal {
-            neg: false,
-            scale,
-            limbs: Vec::new(),
-        }
+        Decimal::from_small(false, scale, 0)
     }
 
     /// Exact decimal from an integer (the lossless `int → decimal` cast, scale 0).
     pub fn from_i64(v: i64) -> Decimal {
-        let neg = v < 0;
-        let mag = v.unsigned_abs(); // i64::MIN handled (|MIN| = 2^63 fits u64)
-        Decimal::from_parts(neg, 0, mag_from_u64(mag))
+        // i64::MIN handled (|MIN| = 2^63 fits u64)
+        Decimal::from_small(v < 0, 0, v.unsigned_abs() as u128)
     }
 
     /// Build from a sign, an unscaled coefficient as a decimal-digit string (leading zeros
     /// allowed), and a scale. The literal/parse entry point — does NOT enforce the
     /// precision/scale caps (the caller checks them at resolve, trapping 22003).
     pub fn from_digits_scale(neg: bool, digits: &str, scale: u32) -> Decimal {
+        // 38 digits are below 10^38 < 2^128.
+        if digits.len() <= 38 && digits.bytes().all(|b| b.is_ascii_digit()) {
+            let m = digits
+                .bytes()
+                .fold(0u128, |m, b| m * 10 + (b - b'0') as u128);
+            return Decimal::from_small(neg, scale, m);
+        }
         Decimal::from_parts(neg, scale, mag_from_decimal_str(digits))
     }
 
@@ -222,7 +274,7 @@ impl Decimal {
         }
         let drop = digits - sig;
         let pow = mag_pow10(drop);
-        let (mut q, r) = mag_divmod(&exact.limbs, &pow);
+        let (mut q, r) = mag_divmod(&exact.limbs(), &pow);
         let round_up = match mag_cmp(&mag_add(&r, &r), &pow) {
             std::cmp::Ordering::Greater => true,
             std::cmp::Ordering::Equal => q.first().is_some_and(|l| l % 2 == 1),
@@ -270,7 +322,8 @@ impl Decimal {
     }
 
     pub fn is_zero(&self) -> bool {
-        self.limbs.is_empty()
+        // A limb magnitude is at least 2^128.
+        matches!(self.mag, Mag::Small(0, 0))
     }
 
     pub fn is_negative(&self) -> bool {
@@ -283,14 +336,23 @@ impl Decimal {
 
     /// Number of significant digits in the coefficient (0 for zero).
     pub fn precision(&self) -> u32 {
-        mag_digit_count(&self.limbs)
+        match &self.mag {
+            Mag::Small(lo, hi) => small_digits((*hi as u128) << 64 | *lo as u128),
+            Mag::Big(limbs) => mag_digit_count(limbs),
+        }
     }
 
     /// Trap 22003 if this (unconstrained) value exceeds the numeric-format caps
     /// (spec/design/decimal.md §2): more than `MAX_INT_DIGITS` integer-part digits or a
     /// scale over `MAX_SCALE` — PG's `make_result` / `numeric_in` checks.
     pub fn check_cap(self) -> Result<Decimal> {
-        if self.precision().saturating_sub(self.scale) > MAX_INT_DIGITS || self.scale > MAX_SCALE {
+        if self.scale > MAX_SCALE {
+            return Err(overflow());
+        }
+        // An inline magnitude has at most 39 digits, far below the integer-digit cap.
+        if let Mag::Big(limbs) = &self.mag
+            && mag_digit_count(limbs).saturating_sub(self.scale) > MAX_INT_DIGITS
+        {
             return Err(overflow());
         }
         Ok(self)
@@ -298,18 +360,37 @@ impl Decimal {
 
     /// The value-canonical form `(neg, coeff, scale)` with trailing *fractional* zeros
     /// stripped (scale reduced): `1.50 → (false,15,1)`, `10.0 → (false,10,0)`, `100` stays
-    /// `(false,100,0)`. Two values equal in value share this form — the key for equality,
-    /// hashing, and DISTINCT/GROUP BY (spec/design/decimal.md §5).
+    /// `(false,100,0)`. Two values equal in value share this form (spec/design/decimal.md §5).
+    /// The coefficient comes back as limbs: this is the form the float conversions and the
+    /// number formatter use. Equality and hashing use [`Decimal::reduced`].
     fn canonical(&self) -> (bool, Vec<u32>, u32) {
-        if self.limbs.is_empty() {
+        let limbs = self.limbs();
+        if limbs.is_empty() {
             return (false, Vec::new(), 0);
         }
-        let strip = mag_trailing_zeros(&self.limbs).min(self.scale);
+        let strip = mag_trailing_zeros(&limbs).min(self.scale);
         (
             self.neg,
-            mag_div_pow10_exact(&self.limbs, strip),
+            mag_div_pow10_exact(&limbs, strip),
             self.scale - strip,
         )
+    }
+
+    /// The value-canonical decimal: trailing fractional zeros stripped, zero at scale 0. Two
+    /// values equal in value reduce to the same `(neg, scale, magnitude)` — the key for hashing
+    /// and DISTINCT/GROUP BY (spec/design/decimal.md §5).
+    fn reduced(&self) -> Decimal {
+        match self.small() {
+            Some(0) => Decimal::zero(0),
+            Some(m) => {
+                let (m, stripped) = small_strip_zeros(m, self.scale);
+                Decimal::from_small(self.neg, self.scale - stripped, m)
+            }
+            None => {
+                let (neg, limbs, scale) = self.canonical();
+                Decimal::from_parts(neg, scale, limbs)
+            }
+        }
     }
 
     /// The value-canonical form as `(neg, coefficient digits, scale)` — the coefficient as a decimal
@@ -331,51 +412,48 @@ impl Decimal {
                 Ordering::Greater
             };
         }
-        // Only the operand of smaller scale is rescaled; equal scales compare in place.
-        let m = match self.scale.cmp(&other.scale) {
-            Ordering::Equal => mag_cmp(&self.limbs, &other.limbs),
-            Ordering::Less => mag_cmp(
-                &mag_mul_pow10(&self.limbs, other.scale - self.scale),
-                &other.limbs,
-            ),
-            Ordering::Greater => mag_cmp(
-                &self.limbs,
-                &mag_mul_pow10(&other.limbs, self.scale - other.scale),
-            ),
+        let m = match (self.small(), other.small()) {
+            (Some(a), Some(b)) => small_cmp_scaled(a, self.scale, b, other.scale),
+            _ => self.cmp_mag_limbs(other),
         };
         if self.neg { m.reverse() } else { m }
+    }
+
+    /// Compare the two magnitudes by value, over limbs.
+    fn cmp_mag_limbs(&self, other: &Decimal) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+        let (a, b) = (self.limbs(), other.limbs());
+        // Only the operand of smaller scale is rescaled; equal scales compare in place.
+        match self.scale.cmp(&other.scale) {
+            Ordering::Equal => mag_cmp(&a, &b),
+            Ordering::Less => mag_cmp(&mag_mul_pow10(&a, other.scale - self.scale), &b),
+            Ordering::Greater => mag_cmp(&a, &mag_mul_pow10(&b, self.scale - other.scale)),
+        }
     }
 
     /// Render to the canonical decimal string (spec/design/decimal.md §6): optional `-`, the
     /// integer digits, and — iff `scale > 0` — `.` and exactly `scale` fractional digits.
     pub fn render(&self) -> String {
-        let digits = mag_to_decimal_str(&self.limbs); // "0" for zero
-        let mut out = String::new();
-        if self.neg {
-            out.push('-');
-        }
-        if self.scale == 0 {
-            out.push_str(&digits);
-            return out;
-        }
-        let scale = self.scale as usize;
-        // Left-pad so there is at least one integer digit and `scale` fractional digits.
-        let want = scale + 1;
-        let padded = if digits.len() < want {
-            format!("{}{}", "0".repeat(want - digits.len()), digits)
-        } else {
-            digits
+        let mut buf = [0u8; SMALL_MAX_DIGITS];
+        let owned;
+        let digits: &[u8] = match self.small() {
+            Some(0) => b"0",
+            Some(m) => small_digit_bytes(m, &mut buf),
+            None => {
+                owned = mag_to_decimal_str(&self.limbs());
+                owned.as_bytes()
+            }
         };
-        let point = padded.len() - scale;
-        out.push_str(&padded[..point]);
-        out.push('.');
-        out.push_str(&padded[point..]);
-        out
+        render_digits(self.neg, self.scale as usize, digits)
     }
 
     /// Arithmetic negation (sign flip; zero stays `+0`).
     pub fn neg(&self) -> Decimal {
-        Decimal::from_parts(!self.neg, self.scale, self.limbs.clone())
+        Decimal {
+            neg: !self.neg && !self.is_zero(),
+            scale: self.scale,
+            mag: self.mag.clone(),
+        }
     }
 
     /// `self + other`, exact, result scale `max(s1,s2)`, **without** the §2 format-cap check —
@@ -384,9 +462,32 @@ impl Decimal {
     /// makes the trap order-independent: whether a fold overflows no longer depends on the order
     /// rows are summed. Standalone arithmetic uses `add` (capped).
     pub fn add_uncapped(&self, other: &Decimal) -> Decimal {
+        match self.add_small(other) {
+            Some(sum) => sum,
+            None => self.add_limbs(other),
+        }
+    }
+
+    /// The sum when both magnitudes are inline and so are both aligned operands and the result.
+    #[inline]
+    fn add_small(&self, other: &Decimal) -> Option<Decimal> {
         let s = self.scale.max(other.scale);
-        let a = mag_mul_pow10(&self.limbs, s - self.scale);
-        let b = mag_mul_pow10(&other.limbs, s - other.scale);
+        let a = small_scale_up(self.small()?, s - self.scale)?;
+        let b = small_scale_up(other.small()?, s - other.scale)?;
+        Some(if self.neg == other.neg {
+            Decimal::from_small(self.neg, s, a.checked_add(b)?)
+        } else if a >= b {
+            Decimal::from_small(self.neg, s, a - b)
+        } else {
+            Decimal::from_small(other.neg, s, b - a)
+        })
+    }
+
+    /// The sum over limbs, for any operands.
+    fn add_limbs(&self, other: &Decimal) -> Decimal {
+        let s = self.scale.max(other.scale);
+        let a = mag_mul_pow10(&self.limbs(), s - self.scale);
+        let b = mag_mul_pow10(&other.limbs(), s - other.scale);
         if self.neg == other.neg {
             Decimal::from_parts(self.neg, s, mag_add(&a, &b))
         } else {
@@ -418,15 +519,85 @@ impl Decimal {
     /// A product scale over `MAX_SCALE` ROUNDS to it instead of trapping (PG `numeric_mul`
     /// rounds the exact product — spec/design/decimal.md §2).
     pub fn mul(&self, other: &Decimal) -> Result<Decimal> {
-        let scale = self.scale + other.scale;
-        let neg = self.neg ^ other.neg;
-        let exact = Decimal::from_parts(neg, scale, mag_mul(&self.limbs, &other.limbs));
-        let r = if scale > MAX_SCALE {
+        let exact = self.mul_exact(other);
+        let r = if exact.scale > MAX_SCALE {
             exact.round_to_scale(MAX_SCALE)
         } else {
             exact
         };
         r.check_cap()
+    }
+
+    /// Exact product (scale s1+s2), NO cap check — the running form of `*` for the kernels
+    /// (PG `mul_var` does not cap; only `make_result` does).
+    pub(crate) fn mul_exact(&self, other: &Decimal) -> Decimal {
+        match self.mul_small(other) {
+            Some(product) => product,
+            None => self.mul_limbs(other),
+        }
+    }
+
+    /// The exact product when both magnitudes and the product are inline.
+    #[inline]
+    fn mul_small(&self, other: &Decimal) -> Option<Decimal> {
+        let m = self.small()?.checked_mul(other.small()?)?;
+        Some(Decimal::from_small(
+            self.neg ^ other.neg,
+            self.scale + other.scale,
+            m,
+        ))
+    }
+
+    /// The exact product over limbs, for any operands.
+    fn mul_limbs(&self, other: &Decimal) -> Decimal {
+        Decimal::from_parts(
+            self.neg ^ other.neg,
+            self.scale + other.scale,
+            mag_mul(&self.limbs(), &other.limbs()),
+        )
+    }
+
+    /// `round_half_away(|self.coeff|·10^e / |other.coeff|)` with the quotient's sign, at scale
+    /// `rscale` — the division step shared by `/` and the kernels' `div_var`. `e` is negative
+    /// when the shift moves to the divisor (spec/design/decimal.md §4). `other` is not zero.
+    fn div_at(&self, other: &Decimal, e: i64, rscale: u32) -> Decimal {
+        match self.div_at_small(other, e, rscale) {
+            Some(q) => q,
+            None => self.div_at_limbs(other, e, rscale),
+        }
+    }
+
+    /// The quotient when both magnitudes and the shifted operand are inline.
+    fn div_at_small(&self, other: &Decimal, e: i64, rscale: u32) -> Option<Decimal> {
+        let (a, b) = (self.small()?, other.small()?);
+        let shift = u32::try_from(e.unsigned_abs()).ok()?;
+        let (n, d) = if e >= 0 {
+            (small_scale_up(a, shift)?, b)
+        } else {
+            (a, small_scale_up(b, shift)?)
+        };
+        let (mut q, r) = small_divmod(n, d);
+        // Round half away from zero: 2·r >= d, written so it cannot overflow (r < d).
+        if r >= d - r {
+            q += 1;
+        }
+        Some(Decimal::from_small(self.neg ^ other.neg, rscale, q))
+    }
+
+    /// The quotient over limbs, for any operands.
+    fn div_at_limbs(&self, other: &Decimal, e: i64, rscale: u32) -> Decimal {
+        let (a, b) = (self.limbs(), other.limbs());
+        let (numer, denom) = if e >= 0 {
+            (mag_mul_pow10(&a, e as u32), b.to_vec())
+        } else {
+            (a.to_vec(), mag_mul_pow10(&b, (-e) as u32))
+        };
+        let (mut q, r) = mag_divmod(&numer, &denom);
+        // Round half away from zero: if 2*r >= |divisor|, round the magnitude up.
+        if mag_cmp(&mag_add(&r, &r), &denom) != std::cmp::Ordering::Less {
+            q = mag_add(&q, &[1]);
+        }
+        Decimal::from_parts(self.neg ^ other.neg, rscale, q)
     }
 
     /// `self / other` with PostgreSQL's `select_div_scale` result scale, rounded half away
@@ -446,17 +617,7 @@ impl Decimal {
         // fractional digits than the dividend, so the shift moves to the divisor instead
         // (N = |C1|, D = |C2|·10^−E) — never a wrapped `as u32` shift (decimal.md §4).
         let e = rscale as i64 + other.scale as i64 - self.scale as i64;
-        let (numer, denom) = if e >= 0 {
-            (mag_mul_pow10(&self.limbs, e as u32), other.limbs.clone())
-        } else {
-            (self.limbs.clone(), mag_mul_pow10(&other.limbs, (-e) as u32))
-        };
-        let (mut q, r) = mag_divmod(&numer, &denom);
-        // Round half away from zero: if 2*r >= |divisor|, round the magnitude up.
-        if mag_cmp(&mag_add(&r, &r), &denom) != std::cmp::Ordering::Less {
-            q = mag_add(&q, &[1]);
-        }
-        Decimal::from_parts(self.neg ^ other.neg, rscale, q).check_cap()
+        self.div_at(other, e, rscale).check_cap()
     }
 
     /// `self % other` — remainder of truncated division; result scale `max(s1,s2)`, sign of
@@ -465,24 +626,55 @@ impl Decimal {
         if other.is_zero() {
             return Err(div_by_zero());
         }
+        Ok(match self.rem_small(other) {
+            Some(r) => r,
+            None => self.rem_limbs(other),
+        })
+    }
+
+    /// The remainder when both magnitudes and both aligned operands are inline.
+    fn rem_small(&self, other: &Decimal) -> Option<Decimal> {
         let s = self.scale.max(other.scale);
-        let a = mag_mul_pow10(&self.limbs, s - self.scale);
-        let b = mag_mul_pow10(&other.limbs, s - other.scale);
+        let a = small_scale_up(self.small()?, s - self.scale)?;
+        let b = small_scale_up(other.small()?, s - other.scale)?;
+        Some(Decimal::from_small(self.neg, s, small_divmod(a, b).1))
+    }
+
+    /// The remainder over limbs, for any operands (`other` is not zero).
+    fn rem_limbs(&self, other: &Decimal) -> Decimal {
+        let s = self.scale.max(other.scale);
+        let a = mag_mul_pow10(&self.limbs(), s - self.scale);
+        let b = mag_mul_pow10(&other.limbs(), s - other.scale);
         let (_q, r) = mag_divmod(&a, &b);
         // Remainder takes the dividend's sign; zero normalizes to +0.
-        Ok(Decimal::from_parts(self.neg, s, r))
+        Decimal::from_parts(self.neg, s, r)
     }
 
     /// Round to `target` scale, half away from zero (spec/design/decimal.md §3). Increasing
     /// the scale only appends zeros (exact).
     pub fn round_to_scale(&self, target: u32) -> Decimal {
+        if let Some(m) = self.small() {
+            if target < self.scale {
+                let q = small_round_drop(m, self.scale - target);
+                return Decimal::from_small(self.neg, target, q);
+            }
+            if let Some(up) = small_scale_up(m, target - self.scale) {
+                return Decimal::from_small(self.neg, target, up);
+            }
+        }
+        self.round_to_scale_limbs(target)
+    }
+
+    /// `round_to_scale` over limbs, for any value.
+    fn round_to_scale_limbs(&self, target: u32) -> Decimal {
+        let limbs = self.limbs();
         if target >= self.scale {
-            let limbs = mag_mul_pow10(&self.limbs, target - self.scale);
+            let limbs = mag_mul_pow10(&limbs, target - self.scale);
             return Decimal::from_parts(self.neg, target, limbs);
         }
         let d = self.scale - target;
         let pow = mag_pow10(d);
-        let (mut q, r) = mag_divmod(&self.limbs, &pow);
+        let (mut q, r) = mag_divmod(&limbs, &pow);
         // Half away: if 2*r >= 10^d, round the magnitude up.
         if mag_cmp(&mag_add(&r, &r), &pow) != std::cmp::Ordering::Less {
             q = mag_add(&q, &[1]);
@@ -493,7 +685,11 @@ impl Decimal {
     /// The magnitude (`abs`), preserving scale — the `abs(numeric)` scalar function
     /// (spec/design/functions.md §9). Cannot overflow.
     pub fn abs(&self) -> Decimal {
-        Decimal::from_parts(false, self.scale, self.limbs.clone())
+        Decimal {
+            neg: false,
+            scale: self.scale,
+            mag: self.mag.clone(),
+        }
     }
 
     /// PG `round(numeric, n)` (spec/design/functions.md §9): round half away from zero to `n`
@@ -513,25 +709,50 @@ impl Decimal {
         // rounds to 0 (or a single carried `1`), so the clamp changes no result but bounds work.
         let k = n.unsigned_abs().min((self.precision() + 1) as u64) as u32;
         let drop = self.scale + k;
+        if let Some(m) = self.small()
+            && let Some(scaled) = small_scale_up(small_round_drop(m, drop), k)
+        {
+            return Decimal::from_small(self.neg, 0, scaled).check_cap();
+        }
+        self.round_left_limbs(drop, k).check_cap()
+    }
+
+    /// Over limbs: drop `drop` digits rounding half away, then append `k` zeros, at scale 0.
+    fn round_left_limbs(&self, drop: u32, k: u32) -> Decimal {
         let pow = mag_pow10(drop);
-        let (mut q, r) = mag_divmod(&self.limbs, &pow);
+        let (mut q, r) = mag_divmod(&self.limbs(), &pow);
         if mag_cmp(&mag_add(&r, &r), &pow) != std::cmp::Ordering::Less {
             q = mag_add(&q, &[1]);
         }
         let scaled = mag_mul_pow10(&q, k);
-        Decimal::from_parts(self.neg, 0, scaled).check_cap()
+        Decimal::from_parts(self.neg, 0, scaled)
     }
 
     /// Truncate toward zero to `target` scale — drop the dropped fractional digits, no rounding.
     /// Increasing the scale only appends zeros (exact). Truncation never grows the magnitude, so
     /// it cannot overflow. The toward-zero core of `trunc` (spec/design/functions.md §9).
     pub fn trunc_to_scale(&self, target: u32) -> Decimal {
+        if let Some(m) = self.small() {
+            if target < self.scale {
+                let q = small_trunc_drop(m, self.scale - target);
+                return Decimal::from_small(self.neg, target, q);
+            }
+            if let Some(up) = small_scale_up(m, target - self.scale) {
+                return Decimal::from_small(self.neg, target, up);
+            }
+        }
+        self.trunc_to_scale_limbs(target)
+    }
+
+    /// `trunc_to_scale` over limbs, for any value.
+    fn trunc_to_scale_limbs(&self, target: u32) -> Decimal {
+        let limbs = self.limbs();
         if target >= self.scale {
-            let limbs = mag_mul_pow10(&self.limbs, target - self.scale);
+            let limbs = mag_mul_pow10(&limbs, target - self.scale);
             return Decimal::from_parts(self.neg, target, limbs);
         }
         let pow = mag_pow10(self.scale - target);
-        let (q, _r) = mag_divmod(&self.limbs, &pow);
+        let (q, _r) = mag_divmod(&limbs, &pow);
         Decimal::from_parts(self.neg, target, q)
     }
 
@@ -545,8 +766,18 @@ impl Decimal {
             return self.trunc_to_scale(n.min(MAX_SCALE as i64) as u32);
         }
         let k = n.unsigned_abs().min((self.precision() + 1) as u64) as u32;
+        if let Some(m) = self.small()
+            && let Some(scaled) = small_scale_up(small_trunc_drop(m, self.scale + k), k)
+        {
+            return Decimal::from_small(self.neg, 0, scaled);
+        }
+        self.trunc_left_limbs(k)
+    }
+
+    /// Over limbs: drop the fraction and `k` integer digits, then append `k` zeros, at scale 0.
+    fn trunc_left_limbs(&self, k: u32) -> Decimal {
         let pow = mag_pow10(self.scale + k);
-        let (q, _r) = mag_divmod(&self.limbs, &pow);
+        let (q, _r) = mag_divmod(&self.limbs(), &pow);
         let scaled = mag_mul_pow10(&q, k);
         Decimal::from_parts(self.neg, 0, scaled)
     }
@@ -570,13 +801,25 @@ impl Decimal {
         if self.scale == 0 {
             return Ok(self.clone());
         }
+        if let Some(m) = self.small() {
+            let q = small_trunc_drop(m, self.scale);
+            // A fraction was dropped unless the kept part, scaled back, is the whole magnitude.
+            let has_frac = small_scale_up(q, self.scale) != Some(m);
+            let q = q + u128::from(has_frac && self.neg == toward_neg);
+            return Decimal::from_small(self.neg, 0, q).check_cap();
+        }
+        self.round_to_bound_limbs(toward_neg).check_cap()
+    }
+
+    /// `round_to_bound` over limbs, for any value, without the cap check.
+    fn round_to_bound_limbs(&self, toward_neg: bool) -> Decimal {
         let pow = mag_pow10(self.scale);
-        let (mut q, r) = mag_divmod(&self.limbs, &pow);
+        let (mut q, r) = mag_divmod(&self.limbs(), &pow);
         let has_frac = r.iter().any(|&x| x != 0);
         if has_frac && self.neg == toward_neg {
             q = mag_add(&q, &[1]);
         }
-        Decimal::from_parts(self.neg, 0, q).check_cap()
+        Decimal::from_parts(self.neg, 0, q)
     }
 
     /// Coerce into `numeric(precision, scale)`: round to `scale` (half away), then trap 22003
@@ -596,13 +839,8 @@ impl Decimal {
     /// `None` (the `decimal → int` cast; the caller range-checks against the target int type).
     pub fn to_i64_round(&self) -> Option<i64> {
         let r = self.round_to_scale(0);
-        let mut v: i128 = 0;
-        for &limb in r.limbs.iter().rev() {
-            v = v.checked_mul(BASE as i128)?.checked_add(limb as i128)?;
-            if v > (i64::MAX as i128) + 1 {
-                return None;
-            }
-        }
+        // A limb magnitude is at least 2^128, far outside i64.
+        let v = i128::try_from(r.small()?).ok()?;
         let signed = if r.neg { -v } else { v };
         i64::try_from(signed).ok()
     }
@@ -612,27 +850,34 @@ impl Decimal {
     /// `(neg, scale, base-10^4 coefficient groups MS-first)` for the value codec. Zero → no
     /// groups.
     pub fn to_codec(&self) -> (bool, u32, Vec<u16>) {
-        (self.neg, self.scale, mag_to_nbase4(&self.limbs))
+        let groups = match &self.mag {
+            Mag::Small(lo, hi) => small_to_nbase4((*hi as u128) << 64 | *lo as u128),
+            Mag::Big(limbs) => mag_to_nbase4(limbs),
+        };
+        (self.neg, self.scale, groups)
     }
 
     /// The number of base-10^4 groups `to_codec` would emit — `ceil(digits / 4)` of the unscaled
     /// magnitude, `0` for zero — without allocating them (the query-memory size schedule,
     /// spec/design/memory.md §3).
     pub fn codec_group_count(&self) -> usize {
-        let Some(&top) = self.limbs.last() else {
-            return 0;
-        };
-        let top_digits = if top == 0 {
-            1
-        } else {
-            top.ilog10() as usize + 1
-        };
-        (9 * (self.limbs.len() - 1) + top_digits).div_ceil(4)
+        (self.precision() as usize).div_ceil(4)
     }
 
     /// Inverse of `to_codec` (used on load). `neg` is forced false for zero by normalize.
     pub fn from_codec(neg: bool, scale: u32, groups: &[u16]) -> Decimal {
+        if groups.len() <= SMALL_CODEC_GROUPS {
+            let m = groups.iter().fold(0u128, |m, &g| m * 10_000 + g as u128);
+            return Decimal::from_small(neg, scale, m);
+        }
         Decimal::from_parts(neg, scale, mag_from_nbase4(groups))
+    }
+
+    /// The value whose codec groups, most-significant first, fold to `m` — the load path for a
+    /// value of at most [`SMALL_CODEC_GROUPS`] groups, which builds no group list
+    /// (spec/fileformat/format.md).
+    pub(crate) fn from_codec_small(neg: bool, scale: u32, m: u128) -> Decimal {
+        Decimal::from_small(neg, scale, m)
     }
 
     /// The order-preserving KEY body for a decimal (method `decimal-order-preserving`,
@@ -654,48 +899,89 @@ impl Decimal {
         if self.is_zero() {
             return vec![0x04];
         }
-        // Significant digits (no leading zeros) and the base-10 decimal-point exponent:
-        // value = 0.<digits> × 10^decpt, with decpt = precision − scale.
-        let mut digits = mag_to_decimal_str(&self.limbs).into_bytes();
-        let decpt = self.precision() as i32 - self.scale as i32;
-        // Drop trailing zero digits (the least-significant ones): the mantissa keeps only its
-        // significant part and decpt is unchanged, so `1.50` ("150") collapses onto `1.5` ("15").
-        while digits.last() == Some(&b'0') {
-            digits.pop();
-        }
-        // Base-100 exponent E (value = 0.<pairs> × 100^E) and pair alignment: prepend a '0' when
-        // decpt is odd so the leading base-100 pair is "0 d1", then pad right to an even length.
-        let e = (decpt + 1).div_euclid(2);
-        let mut grouped: Vec<u8> = Vec::with_capacity(digits.len() + 2);
-        if decpt.rem_euclid(2) == 1 {
-            grouped.push(b'0');
-        }
-        grouped.extend_from_slice(&digits);
-        if grouped.len() % 2 == 1 {
-            grouped.push(b'0');
-        }
-        // Body: 4-byte order-preserving exponent ‖ mantissa pairs (pair+1) ‖ 0x00 terminator.
-        let mut body: Vec<u8> = Vec::with_capacity(4 + grouped.len() / 2 + 1);
-        body.extend_from_slice(&crate::encoding::encode_int(
-            crate::types::ScalarType::Int32,
-            e as i64,
-        ));
-        for pair in grouped.chunks(2) {
-            let v = (pair[0] - b'0') * 10 + (pair[1] - b'0');
-            body.push(v + 1);
-        }
-        body.push(0x00);
-        // Assemble with the sign/class byte; negatives complement the body (E+mantissa+terminator).
-        let mut out = Vec::with_capacity(1 + body.len());
-        if self.neg {
-            out.push(0x03);
-            out.extend(body.iter().map(|b| !b));
-        } else {
-            out.push(0x05);
-            out.extend_from_slice(&body);
-        }
-        out
+        let mut buf = [0u8; SMALL_MAX_DIGITS];
+        let owned;
+        let digits: &[u8] = match self.small() {
+            Some(m) => small_digit_bytes(m, &mut buf),
+            None => {
+                owned = mag_to_decimal_str(&self.limbs());
+                owned.as_bytes()
+            }
+        };
+        key_from_digits(self.neg, self.scale, digits)
     }
+
+    /// Whether the coefficient is odd.
+    fn coefficient_is_odd(&self) -> bool {
+        match &self.mag {
+            Mag::Small(lo, _) => lo & 1 == 1,
+            // Limbs are little-endian base 10^9 (even), so the parity is limb 0's.
+            Mag::Big(limbs) => limbs.first().is_some_and(|l| l % 2 == 1),
+        }
+    }
+}
+
+/// The canonical text of the coefficient `digits` (ASCII, no leading zeros, `"0"` for zero) at
+/// display scale `scale` (spec/design/decimal.md §6).
+fn render_digits(neg: bool, scale: usize, digits: &[u8]) -> String {
+    let mut out = Vec::with_capacity(digits.len().max(scale + 1) + 2);
+    if neg {
+        out.push(b'-');
+    }
+    if scale == 0 {
+        out.extend_from_slice(digits);
+    } else if digits.len() <= scale {
+        // No integer digits: a single `0`, then zeros up to the coefficient's first digit.
+        out.extend_from_slice(b"0.");
+        out.resize(out.len() + (scale - digits.len()), b'0');
+        out.extend_from_slice(digits);
+    } else {
+        let point = digits.len() - scale;
+        out.extend_from_slice(&digits[..point]);
+        out.push(b'.');
+        out.extend_from_slice(&digits[point..]);
+    }
+    String::from_utf8(out).expect("ASCII digits")
+}
+
+/// The `decimal-order-preserving` key body (spec/design/encoding.md §2.5) of the nonzero value
+/// whose coefficient is `digits` (ASCII, no leading zeros) at scale `scale`.
+fn key_from_digits(neg: bool, scale: u32, digits: &[u8]) -> Vec<u8> {
+    // The base-10 decimal-point exponent: value = 0.<digits> × 10^decpt, decpt = precision − scale.
+    let decpt = digits.len() as i32 - scale as i32;
+    // Drop trailing zero digits (the least-significant ones): the mantissa keeps only its
+    // significant part and decpt is unchanged, so `1.50` ("150") collapses onto `1.5` ("15").
+    let trailing = digits.iter().rev().take_while(|&&d| d == b'0').count();
+    let digits = &digits[..digits.len() - trailing];
+    // Base-100 exponent E (value = 0.<pairs> × 100^E) and pair alignment: a leading zero digit
+    // when decpt is odd, so the leading base-100 pair is "0 d1", and a zero past the last digit
+    // to fill the last pair.
+    let e = (decpt + 1).div_euclid(2);
+    let lead = usize::from(decpt.rem_euclid(2) == 1);
+    let digit = |i: usize| -> u8 {
+        if i < lead {
+            0
+        } else {
+            digits.get(i - lead).map_or(0, |d| d - b'0')
+        }
+    };
+    let pairs = (lead + digits.len()).div_ceil(2);
+    // Class byte ‖ 4-byte order-preserving exponent (`int-be-signflip`, §2.1) ‖ mantissa pairs
+    // (pair+1) ‖ 0x00 terminator.
+    let mut out = Vec::with_capacity(1 + 4 + pairs + 1);
+    out.push(if neg { 0x03 } else { 0x05 });
+    out.extend_from_slice(&((e as u32) ^ 0x8000_0000).to_be_bytes());
+    for p in 0..pairs {
+        out.push(digit(2 * p) * 10 + digit(2 * p + 1) + 1);
+    }
+    out.push(0x00);
+    // Negatives complement the body (exponent, mantissa, terminator) but not the class byte.
+    if neg {
+        for b in &mut out[1..] {
+            *b = !*b;
+        }
+    }
+    out
 }
 
 // ============================================================================
@@ -774,16 +1060,6 @@ impl Decimal {
         self.render().parse::<f64>().unwrap_or(0.0)
     }
 
-    /// Exact product (scale s1+s2), NO cap check — the running form of `*` for the kernels
-    /// (PG `mul_var` does not cap; only `make_result` does).
-    pub(crate) fn mul_exact(&self, other: &Decimal) -> Decimal {
-        Decimal::from_parts(
-            self.neg ^ other.neg,
-            self.scale + other.scale,
-            mag_mul(&self.limbs, &other.limbs),
-        )
-    }
-
     /// PG `mul_var(a, b, result, rscale)`: exact product rounded half-away to `rscale`
     /// fractional digits; the result carries scale exactly `rscale` (so its dscale tracks PG).
     /// `rscale >= 0` in every kernel use.
@@ -803,7 +1079,7 @@ impl Decimal {
         let k = (-rscale) as u32;
         let drop = self.scale + k;
         let pow = mag_pow10(drop);
-        let (mut q, r) = mag_divmod(&self.limbs, &pow);
+        let (mut q, r) = mag_divmod(&self.limbs(), &pow);
         if mag_cmp(&mag_add(&r, &r), &pow) != std::cmp::Ordering::Less {
             q = mag_add(&q, &[1]);
         }
@@ -822,20 +1098,7 @@ impl Decimal {
         }
         // q = round_half_away(|C1|·10^E / |C2|), E = rscale + s2 − s1 (sign handled).
         let e = rscale + other.scale as i64 - self.scale as i64;
-        let (numer, denom) = if e >= 0 {
-            (mag_mul_pow10(&self.limbs, e as u32), other.limbs.clone())
-        } else {
-            (self.limbs.clone(), mag_mul_pow10(&other.limbs, (-e) as u32))
-        };
-        let (mut q, r) = mag_divmod(&numer, &denom);
-        if mag_cmp(&mag_add(&r, &r), &denom) != std::cmp::Ordering::Less {
-            q = mag_add(&q, &[1]);
-        }
-        Ok(Decimal::from_parts(
-            self.neg ^ other.neg,
-            rscale.max(0) as u32,
-            q,
-        ))
+        Ok(self.div_at(other, e, rscale.max(0) as u32))
     }
 
     /// PG `div_var_int(a, ival, 0, result, rscale, round=true)` — `a / ival` to `rscale` digits.
@@ -877,7 +1140,7 @@ impl Decimal {
             kc = (s + 1) / 2 + 1; // bumps kc so E ≥ 0; extra guard never changes the rounded result
         }
         let e = 2 * kc - s; // ≥ 0
-        let n = mag_mul_pow10(&self.limbs, e as u32);
+        let n = mag_mul_pow10(&self.limbs(), e as u32);
         let g = mag_isqrt(&n);
         let at_guard = Decimal::from_parts(false, kc as u32, g);
         Ok(at_guard.round_var(rscale))
@@ -1210,8 +1473,8 @@ impl Decimal {
                     "a negative number raised to a non-integer power yields a complex result",
                 ));
             }
-            // Limbs are little-endian base 10^9 (even), so the units digit's parity is limb 0's.
-            res_neg = int_exp.limbs.first().is_some_and(|l| l % 2 == 1);
+            // At scale 0 the coefficient is the integer, so its parity is the exponent's.
+            res_neg = int_exp.coefficient_is_odd();
             abs_base = base.abs();
             &abs_base
         } else {
@@ -1325,17 +1588,28 @@ fn mag_isqrt(n: &[u32]) -> Vec<u32> {
 // Value-canonical equality / hashing (1.5 == 1.50; spec/design/decimal.md §5).
 impl PartialEq for Decimal {
     fn eq(&self, other: &Decimal) -> bool {
-        // At one scale the canonical forms agree exactly when the coefficients do (zero has no sign).
+        // At one scale the values agree exactly when the coefficients and signs do: a magnitude
+        // has one representation, and zero is never negative.
         if self.scale == other.scale {
-            return self.limbs == other.limbs && (self.neg == other.neg || self.limbs.is_empty());
+            return self.neg == other.neg && self.mag == other.mag;
         }
-        self.canonical() == other.canonical()
+        self.cmp_value(other) == std::cmp::Ordering::Equal
     }
 }
 impl Eq for Decimal {}
 impl std::hash::Hash for Decimal {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.canonical().hash(state);
+        // Equal values reduce to the same sign, scale, and magnitude representation.
+        let reduced = self.reduced();
+        reduced.neg.hash(state);
+        reduced.scale.hash(state);
+        match &reduced.mag {
+            Mag::Small(lo, hi) => {
+                lo.hash(state);
+                hi.hash(state);
+            }
+            Mag::Big(limbs) => limbs.hash(state),
+        }
     }
 }
 
@@ -1366,7 +1640,17 @@ fn nbase4_weight_lead(d: &Decimal) -> (i64, i64) {
     let e = digits - 1 - d.scale as i64; // exponent of the leading significant digit
     let w = e.div_euclid(4); // floor(e / 4)
     let g = (e - 4 * w + 1) as usize; // 1..=4 leading-group decimal digits
-    let s = mag_to_decimal_str(&d.limbs);
+    if let Some(m) = d.small() {
+        // The top `g` digits, zero-filled on the right when the coefficient has fewer.
+        let (digits, g) = (digits as u32, g as u32);
+        let f = if digits >= g {
+            small_trunc_drop(m, digits - g)
+        } else {
+            m * POW10_U128[(g - digits) as usize]
+        };
+        return (w, f as i64);
+    }
+    let s = mag_to_decimal_str(&d.limbs());
     let bytes = s.as_bytes();
     let mut f: i64 = 0;
     for i in 0..g {
@@ -1434,6 +1718,195 @@ pub fn work_mod(a: &Decimal, b: &Decimal) -> u64 {
     }
     let (a1, a2) = aligned_digits(a, b);
     groups(a1) * groups(a2)
+}
+
+// ============================================================================
+// Inline magnitudes — a coefficient below 2^128 as one `u128` (decimal.md §1).
+// Each helper is exact integer arithmetic; where a result would not fit 128 bits
+// it returns `None` and the caller takes the limb path below, which is also the
+// reference these are tested against.
+// ============================================================================
+
+/// The most decimal digits a `u128` has (`u128::MAX` is about 3.4 × 10^38).
+const SMALL_MAX_DIGITS: usize = 39;
+
+/// The most base-10^4 codec groups that always fit a `u128`: 9 groups are below 10^36.
+pub(crate) const SMALL_CODEC_GROUPS: usize = 9;
+
+/// 10^0 ..= 10^38 — every power of ten a `u128` holds.
+const POW10_U128: [u128; 39] = {
+    let mut table = [1u128; 39];
+    let mut i = 1;
+    while i < table.len() {
+        table[i] = table[i - 1] * 10;
+        i += 1;
+    }
+    table
+};
+
+/// Number of significant decimal digits (0 for zero).
+#[inline]
+fn small_digits(m: u128) -> u32 {
+    if m == 0 {
+        0
+    } else if let Ok(m) = u64::try_from(m) {
+        m.ilog10() + 1
+    } else {
+        m.ilog10() + 1
+    }
+}
+
+/// `m · 10^d`, or `None` when that does not fit 128 bits.
+#[inline]
+fn small_scale_up(m: u128, d: u32) -> Option<u128> {
+    if d == 0 || m == 0 {
+        return Some(m);
+    }
+    m.checked_mul(*POW10_U128.get(d as usize)?)
+}
+
+/// `(n div d, n mod d)` for `d != 0`, in 64-bit arithmetic when both fit.
+#[inline]
+fn small_divmod(n: u128, d: u128) -> (u128, u128) {
+    if let (Ok(n), Ok(d)) = (u64::try_from(n), u64::try_from(d)) {
+        return ((n / d) as u128, (n % d) as u128);
+    }
+    (n / d, n % d)
+}
+
+/// `m` without its low `d` decimal digits (truncated toward zero).
+#[inline]
+fn small_trunc_drop(m: u128, d: u32) -> u128 {
+    match POW10_U128.get(d as usize) {
+        Some(&pow) => small_divmod(m, pow).0,
+        None => 0, // 10^39 exceeds every u128
+    }
+}
+
+/// `m` without its low `d` decimal digits, rounded half away from zero in magnitude
+/// (spec/design/decimal.md §3: up exactly when `2·r >= 10^d`).
+#[inline]
+fn small_round_drop(m: u128, d: u32) -> u128 {
+    let Some(&pow) = POW10_U128.get(d as usize) else {
+        return 0; // 10^39 exceeds 2·u128::MAX, so the magnitude is below half
+    };
+    let (q, r) = small_divmod(m, pow);
+    // r < 10^38, so 2·r fits; q + 1 fits because q <= m.
+    if d > 0 && 2 * r >= pow { q + 1 } else { q }
+}
+
+/// `m` with up to `max` trailing decimal zeros removed, and how many were (`m != 0`).
+fn small_strip_zeros(m: u128, max: u32) -> (u128, u32) {
+    let mut stripped = 0;
+    if let Ok(mut low) = u64::try_from(m) {
+        while stripped < max && low % 10 == 0 {
+            low /= 10;
+            stripped += 1;
+        }
+        return (low as u128, stripped);
+    }
+    let mut m = m;
+    while stripped < max && m % 10 == 0 {
+        m /= 10;
+        stripped += 1;
+    }
+    (m, stripped)
+}
+
+/// Compare `a·10^-sa` with `b·10^-sb`.
+#[inline]
+fn small_cmp_scaled(a: u128, sa: u32, b: u128, sb: u32) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    // Only the operand of smaller scale is rescaled. A rescaled operand that no longer fits
+    // 128 bits exceeds the other, which does.
+    match sa.cmp(&sb) {
+        Ordering::Equal => a.cmp(&b),
+        Ordering::Less => small_scale_up(a, sb - sa).map_or(Ordering::Greater, |a| a.cmp(&b)),
+        Ordering::Greater => small_scale_up(b, sa - sb).map_or(Ordering::Less, |b| a.cmp(&b)),
+    }
+}
+
+/// The decimal digits of `m` (ASCII, most-significant first, no leading zeros; empty for
+/// zero), written at the end of `buf`.
+fn small_digit_bytes(m: u128, buf: &mut [u8; SMALL_MAX_DIGITS]) -> &[u8] {
+    let mut at = buf.len();
+    let mut high = m;
+    // Peel 18 digits at a time so the digit loop runs in 64-bit arithmetic.
+    while high > u64::MAX as u128 {
+        let mut low = (high % 1_000_000_000_000_000_000) as u64;
+        high /= 1_000_000_000_000_000_000;
+        for _ in 0..18 {
+            at -= 1;
+            buf[at] = b'0' + (low % 10) as u8;
+            low /= 10;
+        }
+    }
+    let mut low = high as u64;
+    while low != 0 {
+        at -= 1;
+        buf[at] = b'0' + (low % 10) as u8;
+        low /= 10;
+    }
+    &buf[at..]
+}
+
+/// The base-10^4 codec groups of `m`, most-significant first (zero → empty).
+fn small_to_nbase4(m: u128) -> Vec<u16> {
+    let mut out = Vec::with_capacity(SMALL_MAX_DIGITS.div_ceil(4));
+    let mut high = m;
+    while high > u64::MAX as u128 {
+        out.push((high % 10_000) as u16);
+        high /= 10_000;
+    }
+    let mut low = high as u64;
+    while low != 0 {
+        out.push((low % 10_000) as u16);
+        low /= 10_000;
+    }
+    out.reverse();
+    out
+}
+
+/// `m` as base-10^9 limbs, least-significant first, and how many of the five are used.
+fn small_to_limbs(m: u128) -> ([u32; 5], usize) {
+    let mut buf = [0u32; 5];
+    let mut len = 0;
+    let mut m = m;
+    while m != 0 {
+        let (q, r) = small_divmod(m, BASE as u128);
+        buf[len] = r as u32;
+        len += 1;
+        m = q;
+    }
+    (buf, len)
+}
+
+/// The value of trimmed limbs when it is below 2^128, else `None`.
+fn limbs_to_small(limbs: &[u32]) -> Option<u128> {
+    if limbs.len() > 5 {
+        return None; // at least 10^45
+    }
+    limbs.iter().rev().try_fold(0u128, |m, &limb| {
+        m.checked_mul(BASE as u128)?.checked_add(limb as u128)
+    })
+}
+
+/// A magnitude as base-10^9 limbs (least-significant first, no high zero limbs): an inline
+/// magnitude expanded into a local buffer, or a limb magnitude borrowed.
+enum LimbView<'a> {
+    Inline([u32; 5], usize),
+    Borrowed(&'a [u32]),
+}
+
+impl std::ops::Deref for LimbView<'_> {
+    type Target = [u32];
+
+    fn deref(&self) -> &[u32] {
+        match self {
+            LimbView::Inline(buf, len) => &buf[..*len],
+            LimbView::Borrowed(limbs) => limbs,
+        }
+    }
 }
 
 // ============================================================================
@@ -1818,11 +2291,7 @@ mod tests {
     fn canonical_strips_trailing_fractional_zeros() {
         for mag in sample_mags(4, 2000, 6) {
             for scale in [0u32, 1, 8, 9, 10, 27, 40] {
-                let value = Decimal {
-                    neg: false,
-                    scale,
-                    limbs: mag.clone(),
-                };
+                let value = Decimal::from_parts(false, scale, mag.clone());
                 let (_, coeff, canon_scale) = value.canonical();
                 let mut digits = mag_to_decimal_str(&mag);
                 let mut want_scale = scale;
@@ -2170,6 +2639,299 @@ mod tests {
 
         // A final result genuinely over the cap still traps 22003 (PG's make_result).
         assert_eq!(over.check_cap().unwrap_err().code(), "22003");
+    }
+
+    // ---- inline magnitudes: every inline path against the limb path (decimal.md §1) ----
+
+    /// Same sign, scale, and magnitude representation — stricter than value equality, so a
+    /// result held the wrong way (a small magnitude left as limbs) fails too.
+    fn identical(a: &Decimal, b: &Decimal) -> bool {
+        a.neg == b.neg && a.scale == b.scale && a.mag == b.mag
+    }
+
+    /// The representation invariants: a limb magnitude is trimmed and at least 2^128; zero is
+    /// not negative.
+    fn assert_canonical(d: &Decimal) {
+        match &d.mag {
+            Mag::Small(0, 0) => assert!(!d.neg, "negative zero"),
+            Mag::Small(..) => {}
+            Mag::Big(limbs) => {
+                assert_ne!(limbs.last(), Some(&0), "untrimmed limbs");
+                assert_eq!(
+                    limbs_to_small(limbs),
+                    None,
+                    "a small magnitude held as limbs"
+                );
+            }
+        }
+    }
+
+    /// Magnitudes at every boundary the inline arithmetic branches on — each power of ten and
+    /// its half (the rounding tie), the 64- and 128-bit edges — plus a pseudo-random spread of
+    /// every bit width.
+    fn inline_mags() -> Vec<u128> {
+        let mut out = vec![
+            0,
+            2,
+            3,
+            7,
+            u128::MAX,
+            u128::MAX - 1,
+            u128::MAX / 2,
+            u128::MAX / 10,
+        ];
+        for edge in [u32::MAX as u128, u64::MAX as u128, BASE as u128] {
+            out.extend([edge - 1, edge, edge + 1]);
+        }
+        for pow in POW10_U128 {
+            out.extend([pow.saturating_sub(1), pow, pow + 1]);
+            let half = pow / 2; // 5 × the power below: the tie when that many digits drop
+            out.extend([half.saturating_sub(1), half, half + 1]);
+        }
+        let mut state = 0x243F_6A88_85A3_08D3u64;
+        let mut next = move || {
+            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        };
+        for bits in 1..=128u32 {
+            let wide = (next() as u128) << 64 | next() as u128;
+            out.push(wide >> (128 - bits));
+        }
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    /// Values over [`inline_mags`] at scales on both sides of the 38-digit shift limit, both
+    /// signs, plus a few magnitudes past 2^128 so the limb representation takes part.
+    fn inline_values() -> Vec<Decimal> {
+        let mut out = Vec::new();
+        for (i, &m) in inline_mags().iter().enumerate() {
+            for (j, scale) in [0u32, 1, 2, 4, 9, 18, 19, 20, 37, 38, 39, 40, 77]
+                .into_iter()
+                .enumerate()
+            {
+                // A third of the combinations, spread over every magnitude and every scale.
+                if (i + j) % 3 == 0 {
+                    out.push(Decimal::from_small((i + j) % 2 == 1, scale, m));
+                }
+            }
+        }
+        let past = mag_add(&small_to_limbs(u128::MAX).0, &[1]); // 2^128
+        for (extra, scale) in [(0u32, 0u32), (0, 3), (1, 40), (9, 2), (20, 0)] {
+            out.push(Decimal::from_parts(
+                extra % 2 == 1,
+                scale,
+                mag_mul_pow10(&past, extra),
+            ));
+        }
+        out
+    }
+
+    fn hash_of(d: &Decimal) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        d.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    #[test]
+    fn decimal_stays_32_bytes() {
+        assert_eq!(std::mem::size_of::<Decimal>(), 32);
+    }
+
+    #[test]
+    fn inline_helpers_match_their_definitions() {
+        for m in inline_mags() {
+            let text = m.to_string();
+            let mut buf = [0u8; SMALL_MAX_DIGITS];
+            let digits = small_digit_bytes(m, &mut buf);
+            assert_eq!(digits, if m == 0 { "" } else { text.as_str() }.as_bytes());
+            assert_eq!(small_digits(m) as usize, digits.len());
+            let (buf, len) = small_to_limbs(m);
+            assert_eq!(mag_to_decimal_str(&buf[..len]), text);
+            assert_eq!(limbs_to_small(&buf[..len]), Some(m));
+            assert_eq!(small_to_nbase4(m), mag_to_nbase4(&buf[..len]));
+        }
+        // One past the largest inline magnitude is a limb magnitude, and one back is inline again.
+        let top = Decimal::from_small(false, 0, u128::MAX);
+        let one = Decimal::from_i64(1);
+        let past = top.add_uncapped(&one);
+        assert!(matches!(past.mag, Mag::Big(_)));
+        assert_canonical(&past);
+        assert!(identical(&past.add_uncapped(&one.neg()), &top));
+    }
+
+    #[test]
+    fn inline_unary_paths_match_the_limb_paths() {
+        for d in inline_values() {
+            assert_canonical(&d);
+            let limbs = d.limbs().to_vec();
+            let digits = mag_to_decimal_str(&limbs);
+            assert_eq!(d.precision(), mag_digit_count(&limbs));
+            assert_eq!(
+                d.render(),
+                render_digits(d.neg, d.scale as usize, digits.as_bytes())
+            );
+            assert_eq!(
+                d.to_i64_round(),
+                d.round_to_scale_limbs(0)
+                    .render()
+                    .parse::<i128>()
+                    .ok()
+                    .and_then(|v| i64::try_from(v).ok())
+            );
+            if !d.is_zero() {
+                assert_eq!(
+                    d.encode_key(),
+                    key_from_digits(d.neg, d.scale, digits.as_bytes())
+                );
+            }
+
+            // Codec: the groups, their count, and both ways back.
+            let (neg, scale, groups) = d.to_codec();
+            assert_eq!(groups, mag_to_nbase4(&limbs));
+            assert_eq!(d.codec_group_count(), groups.len());
+            assert!(identical(&Decimal::from_codec(neg, scale, &groups), &d));
+            assert!(identical(
+                &Decimal::from_parts(neg, scale, mag_from_nbase4(&groups)),
+                &d
+            ));
+            assert!(identical(
+                &Decimal::from_digits_scale(d.neg, &digits, d.scale),
+                &d
+            ));
+
+            // The value-canonical form, by both routes.
+            let (cneg, climbs, cscale) = d.canonical();
+            assert!(identical(
+                &d.reduced(),
+                &Decimal::from_parts(cneg, cscale, climbs)
+            ));
+
+            for target in [0u32, 1, 2, 5, 17, 18, 19, 36, 38, 39, 41, 80] {
+                let rounded = d.round_to_scale(target);
+                assert!(
+                    identical(&rounded, &d.round_to_scale_limbs(target)),
+                    "{d:?} round {target}"
+                );
+                assert_canonical(&rounded);
+                let truncated = d.trunc_to_scale(target);
+                assert!(
+                    identical(&truncated, &d.trunc_to_scale_limbs(target)),
+                    "{d:?} trunc {target}"
+                );
+                assert_canonical(&truncated);
+            }
+            for n in [-1i64, -2, -9, -19, -38, -39, -45] {
+                let k = n.unsigned_abs().min((d.precision() + 1) as u64) as u32;
+                let rounded = d.round_places(n).unwrap();
+                assert!(
+                    identical(&rounded, &d.round_left_limbs(d.scale + k, k)),
+                    "{d:?} round {n}"
+                );
+                let truncated = d.trunc_places(n);
+                assert!(
+                    identical(&truncated, &d.trunc_left_limbs(k)),
+                    "{d:?} trunc {n}"
+                );
+            }
+            if d.scale > 0 {
+                for toward_neg in [false, true] {
+                    assert!(
+                        identical(
+                            &d.round_to_bound(toward_neg).unwrap(),
+                            &d.round_to_bound_limbs(toward_neg)
+                        ),
+                        "{d:?} bound {toward_neg}"
+                    );
+                }
+            }
+
+            // select_div_scale's leading group, against the digit string it is defined on.
+            if !d.is_zero() {
+                let e = digits.len() as i64 - 1 - d.scale as i64;
+                let g = (e - 4 * e.div_euclid(4) + 1) as usize;
+                let lead: i64 = (0..g).fold(0, |f, i| {
+                    f * 10 + digits.as_bytes().get(i).map_or(0, |b| (b - b'0') as i64)
+                });
+                assert_eq!(nbase4_weight_lead(&d), (e.div_euclid(4), lead));
+            }
+        }
+    }
+
+    #[test]
+    fn inline_binary_paths_match_the_limb_paths() {
+        let values = inline_values();
+        let count = values.len() as u64;
+        let mut state = 0x1319_8A2E_0370_7344u64;
+        let mut pick = move || {
+            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            ((z ^ (z >> 31)) % count) as usize
+        };
+        for round in 0..40_000 {
+            // Every value meets itself and its neighbour once; the rest are random pairs.
+            let (a, b) = match round {
+                r if r < values.len() => (&values[r], &values[r]),
+                r if r < 2 * values.len() => {
+                    (&values[r - values.len()], &values[(r + 1) % values.len()])
+                }
+                _ => (&values[pick()], &values[pick()]),
+            };
+
+            let sum = a.add_uncapped(b);
+            assert!(identical(&sum, &a.add_limbs(b)), "{a:?} + {b:?}");
+            assert_canonical(&sum);
+            let difference = a.add_uncapped(&b.neg());
+            assert!(
+                identical(&difference, &a.add_limbs(&b.neg())),
+                "{a:?} - {b:?}"
+            );
+            assert_canonical(&difference);
+            let product = a.mul_exact(b);
+            assert!(identical(&product, &a.mul_limbs(b)), "{a:?} * {b:?}");
+            assert_canonical(&product);
+
+            // Ordering, equality, and hashing agree with the limb comparison.
+            let by_limbs = if a.neg != b.neg {
+                b.neg.cmp(&a.neg)
+            } else if a.neg {
+                a.cmp_mag_limbs(b).reverse()
+            } else {
+                a.cmp_mag_limbs(b)
+            };
+            assert_eq!(a.cmp_value(b), by_limbs, "{a:?} <=> {b:?}");
+            let equal = by_limbs == std::cmp::Ordering::Equal;
+            assert_eq!(a == b, equal, "{a:?} == {b:?}");
+            if equal {
+                assert_eq!(hash_of(a), hash_of(b), "{a:?} hash {b:?}");
+            }
+
+            if b.is_zero() {
+                continue;
+            }
+            let remainder = a.rem(b).unwrap();
+            assert!(identical(&remainder, &a.rem_limbs(b)), "{a:?} % {b:?}");
+            assert_canonical(&remainder);
+            // Division at the scale `/` selects, and at shifts on both sides of it — a negative
+            // shift moves to the divisor.
+            let rscale = select_div_scale(a, b);
+            let e = rscale as i64 + b.scale as i64 - a.scale as i64;
+            for e in [e, e - 3, 0, 1, 19, 38, 39, -1, -19, -40] {
+                let quotient = a.div_at(b, e, rscale);
+                assert!(
+                    identical(&quotient, &a.div_at_limbs(b, e, rscale)),
+                    "{a:?} / {b:?} e={e}"
+                );
+                assert_canonical(&quotient);
+            }
+        }
     }
 }
 

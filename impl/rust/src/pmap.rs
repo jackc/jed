@@ -423,6 +423,20 @@ impl Node {
         }
     }
 
+    /// [`col_at`](Self::col_at) with a deferred value resolved — for a reader that uses the value
+    /// now. A Packed leaf decodes an inline body straight from its page
+    /// ([`PackedLeaf::value_resolved`](crate::format::PackedLeaf::value_resolved)); a Decoded leaf
+    /// resolves a held deferred value without cloning its handle.
+    pub(crate) fn col_at_resolved(&self, i: usize, c: usize) -> Result<Value> {
+        match &self.packed {
+            None => match &self.vals[i][c] {
+                Value::Unfetched(u) => crate::format::resolve_unfetched_self(u),
+                v => Ok(v.clone()),
+            },
+            Some(p) => p.value_resolved(c, i),
+        }
+    }
+
     /// Whether column `c` of row `i` is NULL, without reconstructing the value (packed-leaf.md §11
     /// Track A4): the PAX null bitmap / zero-length span on a Packed leaf. A deferred large value is
     /// never NULL.
@@ -1197,7 +1211,8 @@ impl PMap {
         let mut row_count = 0usize;
         let mut nodes = 0usize;
         let result = if let Some(root) = &self.root {
-            fold_walk(root, b, src, visit, &mut row_count, &mut nodes)
+            let mut ahead = ReadAhead::new();
+            fold_walk(root, b, src, &mut ahead, visit, &mut row_count, &mut nodes)
         } else {
             Ok(())
         };
@@ -1985,6 +2000,7 @@ fn fold_walk(
     node: &Node,
     b: &KeyBound,
     src: Option<&dyn LeafSource>,
+    ahead: &mut ReadAhead,
     visit: &mut dyn FnMut(&Node, usize) -> Result<()>,
     row_count: &mut usize,
     nodes: &mut usize,
@@ -1999,9 +2015,16 @@ fn fold_walk(
         return Ok(());
     }
     let (cf, cl) = b.child_window(node);
+    // Read ahead exactly as the row walk does ([`walk_range_visit`]): a page client fetches the
+    // leaves this walk is about to visit in batches rather than one request each.
+    let mut hinted = 0;
     for i in cf..=cl {
+        if hinted == 0 {
+            hinted = ahead.hint(node, i..=cl, src);
+        }
+        hinted -= 1;
         let ch = child(node, i, src)?;
-        fold_walk(&ch, b, src, visit, row_count, nodes)?;
+        fold_walk(&ch, b, src, ahead, visit, row_count, nodes)?;
     }
     Ok(())
 }

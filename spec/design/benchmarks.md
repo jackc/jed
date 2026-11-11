@@ -1722,6 +1722,11 @@ datasets (10k / 1M rows). Known gaps, tracked in TODO.md Phase 8:
   and a cross-*engine* comparison (PG/SQLite connection pools);
 - ✅ **cold-open time** — `cold_open_pk_small` / `cold_open_pk`, the `cold_open` kind (§8.3),
   jed and SQLite;
+- ✅ **exact-decimal scans and aggregates** — the `decimal_*` lanes over a 200k-row scratch ledger
+  with two `numeric(12,2)` columns: whole-table `SUM` / `AVG`, `SUM(bigint)` (a numeric result), a
+  filter on a decimal, decimal arithmetic per row, `GROUP BY` into 50 and 5000 groups, the same
+  grouping returned in order, and a top-N by a decimal — jed and PostgreSQL (SQLite has no exact
+  decimal; a decimal result is cast to text for the checksum);
 - durable-commit batch-size sweep (1 vs 100 vs 1000 rows per commit).
 
 **Standing obligation** (CLAUDE.md §10): a perf-relevant feature lands with a benchmark
@@ -1751,6 +1756,49 @@ two rounds each, jed harnesses only, p50; the machine was shared with another be
 | `partial_index_live_topn` | 6.7 → 0.005 ms | 8.6–9.0 → 0.004–0.021 ms | 25.5–28.3 → 0.027 ms |
 
 Every core and both variants returned the same checksums.
+
+The `decimal_*` lanes landed with the Rust core's inline decimal coefficients (decimal.md §1) and
+the columnar read-path and lane changes of packed-leaf.md §11 Track A5. Alternating base/after runs
+(base `f076eec6`, two rounds each, the Rust jed harness, p50 in ms; the scratch database is
+file-backed; PostgreSQL 18 on the same machine, one run):
+
+| lane | Rust base → after | PostgreSQL |
+|---|---|---|
+| `decimal_sum_scan` | 166–187 → 8.5 | 11.5 |
+| `decimal_sum_bigint` | 129 → 5.1 | 3.8 |
+| `decimal_avg_scan` | 167–168 → 8.1 | 11.0 |
+| `decimal_filter_scan` | 30.8–31.1 → 16.3–17.0 | 15.3 |
+| `decimal_arith_scan` | 211–253 → 111 | 16.4 |
+| `decimal_group_by` | 239–242 → 20.2 | 12.5 |
+| `decimal_group_by_high_card` | 193 → 17.8 | 16.3 |
+| `decimal_group_by_ordered` | 186–188 → 14.0 | 11.5 |
+| `decimal_order_by_limit` | 119–130 → 9.8 | 21.6 |
+
+The lane still far from PostgreSQL is the shape the columnar lanes do not take: an expression
+operand, which runs on the bounded-spill lane. PostgreSQL ran most of these lanes on two processes;
+on one, it takes 12.1, 4.0, 28.0, 20.3, 18.1 and 41.5 ms for `decimal_sum_scan`, `decimal_sum_bigint`,
+`decimal_arith_scan`, `decimal_group_by`, `decimal_group_by_ordered` and `decimal_order_by_limit`.
+The aggregate lanes also run under a cost ceiling (cost.md §6.1) and a query-memory budget
+(memory.md §5.4): with both set, the Rust core's times for these lanes are unchanged.
+
+The lane choice, the bounded group table, the top-k rule and the ceiling rule were then ported to
+the Go and TS cores (their read-path and decimal-representation changes were not). Base `f076eec6`
+against the port, each core's own jed harness, p50 in ms, one run each for Go and two for TS:
+
+| lane | Go base → port | TS base → port |
+|---|---|---|
+| `decimal_sum_scan` | 268 → 46 | 446 → 96–114 |
+| `decimal_sum_bigint` | 147 → 20 | 249 → 59–75 |
+| `decimal_avg_scan` | 236 → 39 | 347 → 86–100 |
+| `decimal_filter_scan` | 69 → 66 | 186 → 187–240 |
+| `decimal_arith_scan` | 345 → 336 | 649 → 595–673 |
+| `decimal_group_by` | 344 → 84 | 637 → 149–195 |
+| `decimal_group_by_high_card` | 304 → 54 | 651 → 118–176 |
+| `decimal_group_by_ordered` | 283 → 46 | 512 → 91–143 |
+| `decimal_order_by_limit` | 303 → 124 | 302 → 197–301 |
+
+The machine was loaded during the TS runs. Rust, Go, TS, and PostgreSQL returned the same checksum on
+every lane.
 
 ### GIN follow-ons (format_version 47)
 

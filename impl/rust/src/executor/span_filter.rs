@@ -21,9 +21,6 @@ pub(crate) struct ScratchRow {
     pub(crate) vals: Vec<Value>,
     stamp: Vec<u64>,
     generation: u64,
-    /// The record generation whose every touched column a plain filter filled (the columns may still
-    /// hold deferred values — the evaluator resolves those on touch).
-    all_filled: u64,
 }
 
 impl ScratchRow {
@@ -32,7 +29,6 @@ impl ScratchRow {
             vals: vec![Value::Null; width],
             stamp: vec![0; width],
             generation: 1,
-            all_filled: 0,
         }
     }
 
@@ -47,10 +43,7 @@ impl ScratchRow {
     #[inline]
     pub(crate) fn ensure(&mut self, node: &Node, i: usize, c: usize) -> Result<()> {
         if self.stamp[c] != self.generation {
-            self.vals[c] = match node.col_at(i, c)? {
-                Value::Unfetched(u) => crate::format::resolve_unfetched_self(&u)?,
-                v => v,
-            };
+            self.vals[c] = node.col_at_resolved(i, c)?;
             self.stamp[c] = self.generation;
         }
         Ok(())
@@ -61,37 +54,28 @@ impl ScratchRow {
     /// beside a predicate — where reusing the predicate's decode pays — and read the leaf directly
     /// otherwise.
     pub(crate) fn read(&self, node: &Node, i: usize, c: usize) -> Result<Value> {
-        if self.all_filled == self.generation {
-            return match &self.vals[c] {
-                Value::Unfetched(u) => crate::format::resolve_unfetched_self(u),
-                v => Ok(v.clone()),
-            };
-        }
         if self.stamp[c] == self.generation {
             return Ok(self.vals[c].clone());
         }
-        match node.col_at(i, c)? {
-            Value::Unfetched(u) => crate::format::resolve_unfetched_self(&u),
-            v => Ok(v),
-        }
+        node.col_at_resolved(i, c)
     }
 }
 
 /// A lane's compiled `WHERE`: the span evaluator when the predicate has at least one span atom, else
-/// the original lane filter — every touched column read into the scratch row (a deferred value
-/// resolves when the evaluator touches it), then [`RExpr::eval_filter`] — which is cheaper for a
-/// predicate the span compiler cannot help with.
+/// the plain filter — the columns the predicate reads resolved into the scratch row, then
+/// [`RExpr::eval_filter`] — which is cheaper for a predicate the span compiler cannot help with.
+/// `cols` is the predicate's own `collect_touched` set: a touched column only something else reads
+/// (an aggregate operand, a projected column) is left to that reader, which reads it for survivors
+/// alone.
 pub(crate) enum LaneFilter<'a> {
     Span(SpanPred<'a>),
-    /// `resolve`: the filter holds a correlated subquery, which reads the scratch row as its outer
-    /// row — and an outer row's values reach consumers that bypass the evaluator's resolve-on-touch
-    /// backstop (a correlated key/index bound encodes the outer value directly). So the fill resolves
-    /// deferred values, as the row path's touched-set resolve does (an unmetered fetch, so cost is
-    /// unchanged).
+    /// The fill resolves every value it reads, so a correlated subquery — which takes the scratch row
+    /// as its outer row, and whose key/index bound encodes an outer value directly, bypassing the
+    /// evaluator's resolve-on-touch — never sees a deferred one. Its outer reads are in `cols`
+    /// (`collect_touched` follows correlated references).
     Plain {
         expr: &'a RExpr,
         cols: Vec<usize>,
-        resolve: bool,
     },
 }
 
@@ -106,10 +90,11 @@ impl<'a> LaneFilter<'a> {
         if pred.has_atom() {
             return LaneFilter::Span(pred);
         }
+        let mut reads = vec![false; mask.len()];
+        collect_touched(filter, 0, &mut reads);
         LaneFilter::Plain {
             expr: filter,
-            cols: (0..mask.len()).filter(|&c| mask[c]).collect(),
-            resolve: has_correlated_subquery(filter),
+            cols: (0..mask.len()).filter(|&c| reads[c] && mask[c]).collect(),
         }
     }
 
@@ -125,20 +110,10 @@ impl<'a> LaneFilter<'a> {
         scratch.next_record();
         match self {
             LaneFilter::Span(p) => p.eval_filter(node, i, scratch, env, m),
-            LaneFilter::Plain {
-                expr,
-                cols,
-                resolve,
-            } => {
+            LaneFilter::Plain { expr, cols } => {
                 for &c in cols {
-                    scratch.vals[c] = match node.col_at(i, c)? {
-                        Value::Unfetched(u) if *resolve => {
-                            crate::format::resolve_unfetched_self(&u)?
-                        }
-                        v => v,
-                    };
+                    scratch.ensure(node, i, c)?;
                 }
-                scratch.all_filled = scratch.generation;
                 expr.eval_filter(&scratch.vals, env, m)
             }
         }

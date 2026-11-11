@@ -43,6 +43,20 @@ byte-exact golden [../fileformat/fixtures/decimal_table.jed](../fileformat/fixtu
 three cores must produce identical results; `math/big`/`bigint` are permitted only as a
 per-core *test oracle*, never on the value path.
 
+**Inline small coefficients (an internal representation).** A core may hold a coefficient
+below a fixed bound as a machine integer instead of limbs and compute on it directly, taking
+the limb path whenever an operand, an aligned operand, or a result would not fit. The Rust core
+does this below 2¹²⁸ (`Mag::Small`, two `u64`s; a `Decimal` stays 32 bytes and a small value
+allocates nothing); Go and TS hold limbs only. It changes no result, byte, or cost: each inline
+operation is exact integer arithmetic with one correct answer, rounding is the same `2·r ≥ D`
+test (§3, §4), and both `decimal_work` (§6) and the memory payload
+([memory.md](memory.md) §3) are functions of the logical digit count, never of how the
+coefficient is held. The representation is canonical — a coefficient below the bound is always
+inline — so equal coefficients compare and hash alike. The limb algorithm stays the
+definition: the core's unit tests run every inline path against the limb path on operands at
+each power of ten, its half (the rounding tie), and the 64- and 128-bit edges, and require the
+identical value in the identical representation.
+
 **Normalization invariants** (a single `normalize` step every constructor ends with):
 
 - No leading-zero limbs; the empty coefficient is the integer zero.

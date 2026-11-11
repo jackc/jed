@@ -29,6 +29,10 @@ impl Engine {
             crate::cost::StateCharge::new(self.session.query_account()),
         )
     }
+    /// A spool for the columnar lane's finished groups, which then take this lane's `ORDER BY` stage.
+    pub(crate) fn blocking_group_spool(&self) -> RowSpool {
+        self.blocking_spool()
+    }
     fn blocking_map(&self) -> StateMap {
         StateMap::new(
             self.session.work_mem,
@@ -119,36 +123,121 @@ impl Engine {
         meter.checkpoint()?;
         meter.charge(COSTS.page_read * pages as i64);
         let pushed = plan.pushed_local_filter(ri);
+        let width = store.col_types().len();
         let mut first = true;
-        store.scan_range(&bound, &mut |_, row| {
+        // Walk the bound reading only the touched columns, each resolved straight from its leaf
+        // (the columnar lanes' walk, packed-leaf.md §11): an untouched column is not a SQL input to
+        // this plan, so it is never reconstructed and enters the spool as NULL. The scan block was
+        // charged above from the same bound and mask, so the charges are those of a full-row walk.
+        let mut visit = |node: &crate::pmap::Node, i: usize| -> Result<()> {
             if !first {
                 meter.checkpoint()?;
             }
             first = false;
             meter.charge(COSTS.storage_row_read);
-            let mut row = row.clone();
-            store.resolve_columns(&mut row, mask)?;
+            let mut row: Row = Vec::with_capacity(width);
+            for c in 0..width {
+                row.push(if mask.get(c) == Some(&true) {
+                    node.col_at_resolved(i, c)?
+                } else {
+                    Value::Null
+                });
+            }
             // The relation's pushed WHERE conjuncts (planner.md §3.2), exactly as materialize_rel
             // runs them.
             if let Some(f) = pushed
                 && !f.eval_filter(&row, env, meter)?
             {
-                return Ok(true);
-            }
-            // Untouched lazy values can retain an entire leaf block through an Arc. They are not
-            // SQL inputs to this plan, so release them before the row enters operator residency.
-            for (value, touched) in row.iter_mut().zip(mask) {
-                if !*touched {
-                    *value = Value::Null;
-                }
+                return Ok(());
             }
             out.push(row)?;
-            Ok(true)
-        })?;
+            Ok(())
+        };
+        let (_, _, scanned) = store.fold_scan_masked(&bound, &mut visit);
+        scanned?;
         if !first {
             meter.checkpoint()?;
         }
         Ok(out)
+    }
+
+    /// The bounded-spill lane's `ORDER BY` stage: decorate every row with its order-expression values
+    /// and order keys (memory.md §6.6 element shapes), sort, and return the sorted rows as a spool.
+    pub(crate) fn blocking_order(
+        &self,
+        plan: &SelectPlan,
+        mut rows: RowSpool,
+        env: &EvalEnv,
+        meter: &mut Meter,
+    ) -> Result<RowSpool> {
+        // Finish expression evaluation for every row before collation decoration can fail.
+        let mut decorated = self.blocking_spool();
+        let mut scan = rows.into_reader()?;
+        while let Some(mut row) = scan.next()? {
+            meter.poll()?;
+            let values = plan
+                .order_exprs
+                .iter()
+                .map(|expr| expr.eval(&row, env, meter))
+                .collect::<Result<Row>>()?;
+            row.extend(values);
+            decorated.push(row)?;
+        }
+        drop(scan);
+        let mut scan = decorated.into_reader()?;
+        let mut sorter = None;
+        while let Some(mut row) = scan.next()? {
+            meter.poll()?;
+            let base = row.len();
+            let order: Vec<_> = plan
+                .order
+                .iter()
+                .enumerate()
+                .map(
+                    |(
+                        i,
+                        SortKey {
+                            descending: d,
+                            nulls_first: n,
+                            ..
+                        },
+                    )| SortKey {
+                        col: base + i,
+                        descending: *d,
+                        nulls_first: *n,
+                        collation: None,
+                    },
+                )
+                .collect();
+            for SortKey {
+                col: column,
+                collation: coll,
+                ..
+            } in &plan.order
+            {
+                charge_sort_key(meter, &row[*column], coll.as_deref())?;
+                let key = match (coll, &row[*column]) {
+                    (Some(coll), v @ (Value::Text(_) | Value::Array(_))) => {
+                        Value::Bytea(collation_sort_key(coll, v)?.expect("a non-NULL key"))
+                    }
+                    _ => row[*column].clone(),
+                };
+                row.push(key);
+            }
+            if sorter.is_none() {
+                sorter = Some(self.new_sorter(&order));
+            }
+            sorter.as_mut().unwrap().push(row)?;
+        }
+        drop(scan);
+        let sorter = sorter.unwrap_or_else(|| self.new_sorter(&[]));
+        let mut sorted = sorter.finish()?;
+        rows = self.blocking_spool();
+        while let Some(row) = sorted.next()? {
+            meter.poll()?;
+            rows.push(row)?;
+        }
+        Ok(rows)
     }
 
     /// The bounded-spill lane. Its spill structures reserve without the meter in reach, so a rejected
@@ -281,73 +370,7 @@ impl Engine {
             }
         }
         if !plan.order.is_empty() {
-            // Finish expression evaluation for every row before collation decoration can fail.
-            let mut decorated = self.blocking_spool();
-            let mut scan = rows.into_reader()?;
-            while let Some(mut row) = scan.next()? {
-                meter.poll()?;
-                let values = plan
-                    .order_exprs
-                    .iter()
-                    .map(|expr| expr.eval(&row, env, meter))
-                    .collect::<Result<Row>>()?;
-                row.extend(values);
-                decorated.push(row)?;
-            }
-            drop(scan);
-            let mut scan = decorated.into_reader()?;
-            let mut sorter = None;
-            while let Some(mut row) = scan.next()? {
-                meter.poll()?;
-                let base = row.len();
-                let order: Vec<_> = plan
-                    .order
-                    .iter()
-                    .enumerate()
-                    .map(
-                        |(
-                            i,
-                            SortKey {
-                                descending: d,
-                                nulls_first: n,
-                                ..
-                            },
-                        )| SortKey {
-                            col: base + i,
-                            descending: *d,
-                            nulls_first: *n,
-                            collation: None,
-                        },
-                    )
-                    .collect();
-                for SortKey {
-                    col: column,
-                    collation: coll,
-                    ..
-                } in &plan.order
-                {
-                    charge_sort_key(meter, &row[*column], coll.as_deref())?;
-                    let key = match (coll, &row[*column]) {
-                        (Some(coll), v @ (Value::Text(_) | Value::Array(_))) => {
-                            Value::Bytea(collation_sort_key(coll, v)?.expect("a non-NULL key"))
-                        }
-                        _ => row[*column].clone(),
-                    };
-                    row.push(key);
-                }
-                if sorter.is_none() {
-                    sorter = Some(self.new_sorter(&order));
-                }
-                sorter.as_mut().unwrap().push(row)?;
-            }
-            drop(scan);
-            let sorter = sorter.unwrap_or_else(|| self.new_sorter(&[]));
-            let mut sorted = sorter.finish()?;
-            rows = self.blocking_spool();
-            while let Some(row) = sorted.next()? {
-                meter.poll()?;
-                rows.push(row)?;
-            }
+            rows = self.blocking_order(plan, rows, env, meter)?;
             if root != "Sort"
                 && let Some(profile) = self.explain_actual.borrow_mut().as_mut()
             {
@@ -1298,6 +1321,179 @@ fn fold_spilled_value(
     Ok(())
 }
 
+// ---- the columnar grouped lane's hand-over (packed-leaf.md §11) ----------------------------------
+//
+// On a spill-capable host the columnar aggregate lane folds a grouped aggregate into an in-memory
+// group table only while that table fits `work_mem`. Past it, the table moves into the structures
+// `blocking_aggregate` keeps — a key spool in group-creation order and a state map of packed
+// accumulators — and the same scan carries on folding into those, one state at a time. Each group
+// still folds its survivors in scan order through `Acc::fold`, so rows, their order, and every
+// charge are those of the lane and of `blocking_aggregate` alike.
+
+/// How many grouped lane folds have handed their group table over in this process — for tests, so
+/// one that means to exercise the hand-over cannot pass without it.
+pub static LANE_GROUP_HANDOVERS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// A new group's state-map value, as `blocking_aggregate` builds it: its creation ordinal, then
+/// each aggregate's packed fresh accumulator.
+fn fresh_group_state(specs: &[AggSpec], ordinal: usize, zone: &crate::timezone::ZoneRef) -> Row {
+    let mut state = vec![Value::Int(ordinal as i64)];
+    state.extend(
+        specs
+            .iter()
+            .map(|s| Value::Composite(pack_acc(Acc::from_spec(s, zone)))),
+    );
+    state
+}
+
+/// What one group with an integer (or NULL) key holds in a resident state map before any fold
+/// (memory.md §6.6): `ENTRY + key + state`.
+pub(crate) fn lane_group_base_bytes(specs: &[AggSpec], zone: &crate::timezone::ZoneRef) -> i64 {
+    crate::memsize::map_entry_bytes(&[Value::Null], &fresh_group_state(specs, 0, zone))
+}
+
+/// The part of an accumulator's packed size that changes as it folds: a decimal sum's digit groups,
+/// a MIN/MAX's held value. Every other accumulator the lane folds packs to a fixed size.
+pub(crate) fn acc_variable_bytes(acc: &Acc) -> i64 {
+    match acc {
+        Acc::SumDecimal { sum, .. } | Acc::Avg { sum, .. } => {
+            crate::costs::MEMORY_DECIMAL_GROUP * sum.codec_group_count() as i64
+        }
+        Acc::MinMax { cur, .. } => cur.as_ref().map_or(0, crate::memsize::payload_bytes),
+        _ => 0,
+    }
+}
+
+/// Whether `spec`'s accumulator has a [`acc_variable_bytes`] part.
+pub(crate) fn acc_is_variable(spec: &AggSpec) -> bool {
+    matches!(
+        spec.plan,
+        AggPlan::SumDecimal | AggPlan::Avg | AggPlan::Min | AggPlan::Max
+    )
+}
+
+/// The columnar grouped lane's group table once it has outgrown `work_mem`: the spill executor's
+/// own structures, which spill by their own rule.
+pub(crate) struct LaneGroupSpill {
+    /// Group key → `[creation ordinal, packed accumulator…]`.
+    groups: StateMap,
+    /// The group keys in creation order — the emission order.
+    keys: RowSpool,
+}
+
+impl LaneGroupSpill {
+    /// `key`'s state, creating the group (and recording its key for emission) when it is new.
+    pub(crate) fn state(
+        &mut self,
+        key: &Value,
+        specs: &[AggSpec],
+        zone: &crate::timezone::ZoneRef,
+    ) -> Result<Row> {
+        match self.groups.get(&[key])? {
+            Some(state) => Ok(state),
+            None => {
+                let state = fresh_group_state(specs, self.keys.len(), zone);
+                self.keys.push(vec![key.clone()])?;
+                Ok(state)
+            }
+        }
+    }
+
+    /// Fold `v` into aggregate `si` of a loaded `state`.
+    pub(crate) fn fold(
+        state: &mut Row,
+        si: usize,
+        spec: &AggSpec,
+        v: Value,
+        zone: &crate::timezone::ZoneRef,
+        meter: &mut Meter,
+    ) -> Result<()> {
+        let packed = std::mem::replace(&mut state[si + 1], Value::Null);
+        let Value::Composite(packed) = packed else {
+            unreachable!("a group state holds packed accumulators")
+        };
+        let mut acc = unpack_acc(spec, packed, zone);
+        acc.fold(v, meter)?;
+        state[si + 1] = Value::Composite(pack_acc(acc));
+        Ok(())
+    }
+
+    /// Store `key`'s folded `state` back.
+    pub(crate) fn put(&mut self, key: &Value, state: Row) -> Result<()> {
+        self.groups.put(&[key], state)
+    }
+}
+
+impl Engine {
+    /// Whether the columnar lane may run grouped `plan` on a spill-capable host, handing its group
+    /// table over to the spill structures when it outgrows `work_mem` or the query-memory account
+    /// turns a reservation away (memory.md §5.4): one grouping set with one key over one file-backed
+    /// base table.
+    pub(crate) fn handover_grouped_aggregate(&self, plan: &SelectPlan) -> bool {
+        if plan.rels.len() != 1
+            || plan.group_sets.len() != 1
+            || plan.group_sets[0].key_cols.len() != 1
+        {
+            return false;
+        }
+        let rel = &plan.rels[0];
+        if rel.srf.is_some() || rel.derived.is_some() || rel.cte.is_some() {
+            return false;
+        }
+        self.store_scoped(rel.db.as_deref(), &rel.table_name)
+            .is_file_backed()
+    }
+
+    /// Move the lane's in-memory `groups` (in creation order) into the spill structures — exactly
+    /// what `blocking_aggregate` would hold after folding the same rows.
+    pub(crate) fn lane_group_handover(
+        &self,
+        groups: Vec<(Value, Vec<Acc>)>,
+    ) -> Result<LaneGroupSpill> {
+        LANE_GROUP_HANDOVERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut spill = LaneGroupSpill {
+            groups: self.blocking_map(),
+            keys: self.blocking_spool(),
+        };
+        for (ordinal, (key, accs)) in groups.into_iter().enumerate() {
+            let mut state = vec![Value::Int(ordinal as i64)];
+            state.extend(accs.into_iter().map(|acc| Value::Composite(pack_acc(acc))));
+            spill.groups.put(&[&key], state)?;
+            spill.keys.push(vec![key])?;
+        }
+        Ok(spill)
+    }
+
+    /// Finalize a handed-over group table into its synthetic rows `[key, agg…]`, in group-creation
+    /// order, as a spool.
+    pub(crate) fn lane_group_finish(
+        &self,
+        spill: LaneGroupSpill,
+        specs: &[AggSpec],
+    ) -> Result<RowSpool> {
+        let LaneGroupSpill { mut groups, keys } = spill;
+        let zone = &self.session.time_zone;
+        let mut output = self.blocking_spool();
+        let mut key_scan = keys.into_reader()?;
+        while let Some(mut key) = key_scan.next()? {
+            let state = groups
+                .get(&[&key[0]])?
+                .expect("a spooled group key has its state");
+            let mut out: Row = Vec::with_capacity(state.len());
+            out.push(key.swap_remove(0));
+            for (spec, packed) in specs.iter().zip(state.into_iter().skip(1)) {
+                let Value::Composite(packed) = packed else {
+                    unreachable!("a group state holds packed accumulators")
+                };
+                out.push(unpack_acc(spec, packed, zone).finalize()?);
+            }
+            output.push(out)?;
+        }
+        Ok(output)
+    }
+}
+
 fn pack_acc(acc: Acc) -> Row {
     match acc {
         Acc::CountStar(n) | Acc::Count(n) | Acc::RegrCount(n) => vec![Value::Int(n)],
@@ -1674,5 +1870,70 @@ mod tests {
         );
         assert!(matches.next().unwrap().is_none());
         assert!(meter.accrued > 0);
+    }
+
+    /// The lane tracks a group's size without packing it: what `acc_variable_bytes` adds for an
+    /// accumulator is exactly how much its packed form grew over a fresh one.
+    #[test]
+    fn lane_group_size_tracks_the_packed_state() {
+        let packed_bytes = |acc: Acc| crate::memsize::value_bytes(&Value::Composite(pack_acc(acc)));
+        let min = |cur: Option<Value>| Acc::MinMax {
+            cur,
+            is_min: true,
+            collation: None,
+        };
+        let wide = Decimal::from_digits_scale(true, &"7".repeat(61), 9);
+        // (fresh, folded) pairs: decimal sums over one and many digit groups, a MIN over fixed-width,
+        // text, and decimal values, and the fixed-size accumulators.
+        let cases: Vec<(Acc, Acc)> = vec![
+            (
+                Acc::SumDecimal {
+                    sum: Decimal::from_i64(0),
+                    seen: false,
+                },
+                Acc::SumDecimal {
+                    sum: Decimal::from_i64(12345),
+                    seen: true,
+                },
+            ),
+            (
+                Acc::SumDecimal {
+                    sum: Decimal::from_i64(0),
+                    seen: false,
+                },
+                Acc::SumDecimal {
+                    sum: wide.clone(),
+                    seen: true,
+                },
+            ),
+            (
+                Acc::Avg {
+                    sum: Decimal::from_i64(0),
+                    count: 0,
+                },
+                Acc::Avg {
+                    sum: wide.clone(),
+                    count: 9,
+                },
+            ),
+            (min(None), min(Some(Value::Int(7)))),
+            (min(None), min(Some(Value::Text("ñandú and more".into())))),
+            (min(None), min(Some(Value::Decimal(wide)))),
+            (Acc::Count(0), Acc::Count(41)),
+            (
+                Acc::SumInt {
+                    sum: 0,
+                    seen: false,
+                },
+                Acc::SumInt {
+                    sum: i64::MAX,
+                    seen: true,
+                },
+            ),
+        ];
+        for (fresh, folded) in cases {
+            let tracked = acc_variable_bytes(&folded) - acc_variable_bytes(&fresh);
+            assert_eq!(tracked, packed_bytes(folded) - packed_bytes(fresh));
+        }
     }
 }

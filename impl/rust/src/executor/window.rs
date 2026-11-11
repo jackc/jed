@@ -1350,6 +1350,34 @@ impl TopKKeeper {
         Ok(())
     }
 
+    /// [`push`](Self::push) for a caller that reuses its row: the heap takes `row` (leaving it empty)
+    /// only when it retains it, and a row it rejects stays with the caller. Charges and the retained
+    /// set are exactly `push`'s.
+    pub(crate) fn offer(&mut self, row: &mut Row, meter: &mut Meter) -> Result<()> {
+        if self.collated || self.k == 0 || self.items.len() < self.k {
+            return self.push(std::mem::take(row), meter);
+        }
+        charge_sort_keys(meter, row, &self.order)?;
+        self.next_pos += 1;
+        // A full heap keeps the newcomer only when it sorts strictly before the root; an equal key
+        // loses to the root's earlier input position.
+        if !cmp_rows_by_order(row, &self.items[0].row, &self.order).is_lt() {
+            return Ok(());
+        }
+        if self.charge.active() {
+            self.charge.reserve_direct(crate::memsize::row_bytes(row))?;
+            let evicted = crate::memsize::row_bytes(&self.items[0].row);
+            self.charge.release(evicted);
+        }
+        self.items[0] = TopKItem {
+            keys: Vec::new(),
+            row: std::mem::take(row),
+            pos: self.next_pos - 1,
+        };
+        self.sift_down(0);
+        Ok(())
+    }
+
     fn sift_up(&mut self, mut child: usize) {
         while child > 0 {
             let parent = (child - 1) / 2;

@@ -59,10 +59,17 @@ package jed
 //     order (both bucket the same post-WHERE rows in scan order) — so even a LIMIT without ORDER BY
 //     keeps the same rows, not merely the same multiset.
 //
-// The path requires no cost ceiling / lifetime budget (costMeter.canBatchCosts). Bulk charges
-// preserve the scalar total. Cancellation is polled
-// at batch boundaries (at most 256 scan/fold records).
-// A metered query keeps the scalar path, so its deterministic abort row is unchanged.
+// Bulk charges preserve the scalar total. Cancellation is polled at batch boundaries (at most 256
+// scan/fold records). Under a cost ceiling or lifetime budget the aggregate lane runs as an attempt
+// that the row path replaces unless it finishes cleanly under every ceiling (cost.md §6.1,
+// execSelectEmit), so a metered query's deterministic abort is still the scalar path's; the
+// projection lane still requires no ceiling (costMeter.canBatchCosts).
+//
+// A5 — THE LANES WIDENED (packed-leaf.md §11 Track A5; memory.md §5.4, §6.6.1): SUM/AVG over an
+// integer or decimal fold on the lane through the shared acc.fold (so their running-sum
+// decimal_work is the row path's); a grouped fold on a spill-capable host keeps a bounded group
+// table that hands over to the spill structures (the end of this file) and leaves as a spool, which an
+// ORDER BY then sorts through the bounded-spill lane's own stage.
 
 // colBatch is a decoded integer column pulled from a set of rows for a vectorized fold. Its int lane
 // is filled by striding the inline scalar of each Value (Value.Int, i16/i32/i64 all live there) plus
@@ -155,8 +162,10 @@ func (db *engine) vectorizedAggEligible(plan *selectPlan) bool {
 		return false
 	}
 	// No blocking / re-shaping operator beyond the fold (each would add cost the fast path would have
-	// to mirror; deferred). LIMIT/OFFSET is honored below via windowBounds, so it need not bail.
-	if plan.distinct || plan.distinctOn > 0 || plan.having != nil || plan.hasWindow || len(plan.order) != 0 {
+	// to mirror; deferred). LIMIT/OFFSET is honored below via windowBounds, so it need not bail. An
+	// ORDER BY is the dispatch gate's to admit (aggregateLaneEligible): only the bounded grouped lane
+	// sorts its groups.
+	if plan.distinct || plan.distinctOn > 0 || plan.having != nil || plan.hasWindow {
 		return false
 	}
 	if len(plan.aggSpecs) == 0 {
@@ -171,10 +180,12 @@ func (db *engine) vectorizedAggEligible(plan *selectPlan) bool {
 }
 
 // vectorizedSpecEligible reports whether one aggregate is a specialized numeric kernel: a plain
-// (non-DISTINCT, non-FILTER, non-ordered-set, non-hypothetical) COUNT(*) / COUNT(col) / SUM(i16|i32)
-// / SUM|AVG(f32|f64) / MIN(col) / MAX(col) whose operand (where it has one) is a bare column
-// reference. SUM(i64|decimal) → planSumDecimal and AVG(decimal) → planAvg are deferred (their fold
-// charges running-sum-dependent decimal_work); MIN/MAX fold ANY type through valueCmp.
+// (non-DISTINCT, non-FILTER, non-ordered-set, non-hypothetical) COUNT(*) / COUNT(col) / SUM / AVG /
+// MIN(col) / MAX(col) whose operand (where it has one) is a bare column reference. The decimal folds
+// — SUM(i64|decimal) → planSumDecimal and AVG over an integer or decimal → planAvg — charge a
+// running-sum-dependent decimal_work, but inside the shared acc.fold, and each accumulator meets its
+// group's survivors in scan order on either path, so every fold charges the same amount; MIN/MAX
+// fold ANY type through valueCmp.
 func vectorizedSpecEligible(spec *aggSpec) bool {
 	if spec.distinct || spec.filter != nil || spec.osaFrac != nil || spec.hypo != nil || spec.order != nil {
 		return false
@@ -182,7 +193,7 @@ func vectorizedSpecEligible(spec *aggSpec) bool {
 	switch spec.plan {
 	case planCountStar:
 		return spec.operand == nil
-	case planCount, planSumInt, planSumFloat32, planSumFloat64,
+	case planCount, planSumInt, planSumDecimal, planAvg, planSumFloat32, planSumFloat64,
 		planAvgFloat32, planAvgFloat64, planMin, planMax:
 		return spec.operand != nil && spec.operand.kind == reColumn
 	default:
@@ -190,34 +201,73 @@ func vectorizedSpecEligible(spec *aggSpec) bool {
 	}
 }
 
-// execVectorizedAgg runs a vectorizedAggEligible plan and returns its synthetic group rows as an
+// execVectorizedAgg runs an aggregateLaneEligible plan and returns its synthetic group rows as an
 // emitProject buffer (emitAggSyntheticRows): one row for a whole-table grand total, or one per group
 // for a single-key GROUP BY. It reuses the scalar scan + WHERE for exact cost + survivor
 // determination, folds each aggregate over the survivors with a columnar kernel (whole-table) or
 // per-group through acc.fold (grouped); the emitter drive then produces the output rows (Guard,
 // row_produced, projection eval) under the query's LIMIT/OFFSET window, exactly as for a scalar
-// aggregate result. Only runs on the unmetered lane (the caller gates).
+// aggregate result. A grouped fold on a spill-capable host instead returns its groups as a spool
+// (memory.md §6.6.1), sorted by the bounded-spill lane's ORDER BY stage and emitted as that lane
+// emits its own.
 func (db *engine) execVectorizedAgg(plan *selectPlan, outer []storedRow, params []Value, ctes cteCtx, rng *stmtRng, meter *costMeter) (emitter, error) {
 	env := &evalEnv{exec: db, params: params, outer: outer, rng: rng, ctes: ctes}
 	gset := &plan.groupSets[0]
 
-	// A2/A3 columnar fast path (packed-leaf.md §11 Track A2/A3): a file-backed aggregate gathers only its
-	// touched columns into dense lanes and folds columnar — never a full-width storedRow, the allocation
-	// dividend A1 leaves on the table. A WHERE predicate (A3) is applied over the lanes into a selection
-	// vector rather than forcing the row path. Declines (ok=false) to the row path below for an in-memory
-	// store or a spillable touched column. Cost-neutral by construction (aggColumnar charges the identical
-	// scan + filter block).
+	// A2/A3 columnar fast path (packed-leaf.md §11 Track A2/A3): a page-backed aggregate folds only its
+	// touched columns during one walk — never a full-width storedRow. A WHERE predicate is evaluated
+	// per record during the walk. Declines (ok=false) to the row path below for an unpacked store.
+	// Cost-neutral by construction (aggColumnar charges the identical scan + filter block).
 	{
-		srows, ok, err := db.aggColumnar(plan, gset, env, meter)
+		own := &blockingOwner{db: db}
+		var escaped *rowSpool
+		defer func() { own.closeAll(escaped) }()
+		srows, spool, ok, err := db.aggColumnar(plan, gset, env, meter, own)
 		if err != nil {
 			return emitter{}, err
 		}
+		if ok && spool != nil {
+			// A grouped fold on a spill-capable host: its groups are a spool, handed over or not —
+			// sorted by the bounded-spill lane's own ORDER BY stage and emitted under the LIMIT/OFFSET
+			// window exactly as that lane emits its own.
+			if len(plan.order) > 0 {
+				if spool, err = db.blockingOrder(plan, spool, env, meter, own); err != nil {
+					return emitter{}, meter.costFirst(err)
+				}
+			}
+			total := spool.count
+			start := int64(0)
+			if plan.offset != nil {
+				start = min(*plan.offset, total)
+			}
+			count := total - start
+			if plan.limit != nil {
+				count = min(count, *plan.limit)
+			}
+			sorted, err := spool.output()
+			if err != nil {
+				return emitter{}, err
+			}
+			escaped = spool
+			for i := int64(0); i < start; i++ {
+				if _, _, err := sorted.next(); err != nil {
+					sorted.close()
+					return emitter{}, err
+				}
+			}
+			return emitter{sorted: sorted, mode: emitSorted, end: count}, nil
+		}
 		if ok {
-			// Dense lanes are operator state; the group rows are a row buffer (memory.md §5.4).
+			// The fold's group table is operator state; the group rows are a row buffer (memory.md §5.4).
 			if err := admitAggRows(srows, meter); err != nil {
 				return emitter{}, err
 			}
 			return emitAggSyntheticRows(plan, srows), nil
+		}
+		// The lane declined a grouped fold on a spill-capable host: the bounded-spill lane, never the
+		// unbounded row path below.
+		if len(gset.keyCols) != 0 && db.boundedBlockingEligible(plan) {
+			return db.execBoundedBlocking(plan, env, meter)
 		}
 	}
 
@@ -327,15 +377,20 @@ func emitAggSyntheticRows(plan *selectPlan, srows []storedRow) emitter {
 // plus each admitted record's chain pages), value_decompress, storage_row_read (× rowCount),
 // operator_eval (the filter over each scanned row), aggregate_accumulate (× survivors), and
 // row_produced as the row path.
-func (db *engine) aggColumnar(plan *selectPlan, gset *groupSetPlan, env *evalEnv, meter *costMeter) ([]storedRow, bool, error) {
+//
+// On a spill-capable host a grouped fold is bounded (memory.md §6.6.1): its group table is measured
+// and charged as a resident keyed state map would be, hands over to the spill structures (owned by
+// own) past work_mem or when the account turns a reservation away, and its groups come back as a
+// spool (the second result) instead of rows.
+func (db *engine) aggColumnar(plan *selectPlan, gset *groupSetPlan, env *evalEnv, meter *costMeter, own *blockingOwner) ([]storedRow, *rowSpool, bool, error) {
 	rel := &plan.rels[0]
 	store := db.lkpStoreScoped(rel.db, rel.tableName)
 	if store == nil {
-		return nil, false, nil
+		return nil, nil, false, nil
 	}
 	// Packed-page stores include committed memory databases. Unpacked working stores decline.
 	if store.paging == nil {
-		return nil, false, nil
+		return nil, nil, false, nil
 	}
 	mask := plan.relMasks[0]
 	// A touched variable-width column adds each admitted record's large-value units (chain pages,
@@ -347,11 +402,11 @@ func (db *engine) aggColumnar(plan *selectPlan, gset *groupSetPlan, env *evalEnv
 	need := func(idx int) bool { return idx >= 0 && idx < len(mask) && mask[idx] }
 	for i := range plan.aggSpecs {
 		if op := plan.aggSpecs[i].operand; op != nil && !need(op.index) {
-			return nil, false, nil
+			return nil, nil, false, nil
 		}
 	}
 	if len(gset.keyCols) == 1 && !need(gset.keyCols[0]) {
-		return nil, false, nil
+		return nil, nil, false, nil
 	}
 
 	// Determine the scan bound exactly as materializeRel does: a PK-range bound, or the full scan. An
@@ -367,6 +422,7 @@ func (db *engine) aggColumnar(plan *selectPlan, gset *groupSetPlan, env *evalEnv
 	}
 
 	grouped := len(gset.keyCols) == 1
+	zone := db.session.timeZone
 
 	// Fold each scanned row's touched columns straight into its accumulator during ONE tree walk — no
 	// per-column lane is materialized, so a whole-table / single-int-key aggregate is O(1) memory
@@ -375,19 +431,33 @@ func (db *engine) aggColumnar(plan *selectPlan, gset *groupSetPlan, env *evalEnv
 	// operator_eval to the row path's evalFilter.
 	var accs []*acc // whole-table grand-total accumulators (grouped == false)
 	if !grouped {
-		accs = newAccsForSpecs(plan.aggSpecs, db.session.timeZone)
+		accs = newAccsForSpecs(plan.aggSpecs, zone)
 	}
-	type vgroup struct {
-		key  Value
-		accs []*acc
-	}
-	var groups []vgroup // grouped == true: one per group, in scan-order-of-first-appearance
+	var groups []laneGroup // grouped == true: one per group, in scan-order-of-first-appearance
 	groupIdx := make(map[int64]int)
 	nullGI := -1
 	keyIdx := 0
 	if grouped {
 		keyIdx = gset.keyCols[0]
 	}
+	// On a spill-capable host a grouped fold is bounded (memory.md §6.6.1): the group table's size is
+	// tracked — and charged — on the state map's schedule (a fixed part per group, plus each decimal
+	// sum's and MIN/MAX value's own bytes as they change), and past work_mem, or once the account
+	// turns a reservation away, the table is handed over to the spill structures, into which the rest
+	// of the scan folds.
+	bounded := grouped && db.boundedBlockingEligible(plan)
+	budget := int64(db.session.workMem)
+	var groupBase int64
+	variable := make([]bool, len(plan.aggSpecs))
+	if bounded {
+		groupBase = laneGroupBaseBytes(plan.aggSpecs, zone)
+		for s := range plan.aggSpecs {
+			variable[s] = accIsVariable(&plan.aggSpecs[s])
+		}
+	}
+	var resident int64
+	rejected := false
+	var spilled *laneGroupSpill
 	var span *laneFilter
 	if plan.filter != nil {
 		span = compileLaneFilter(plan.filter, store.colTypes, mask, env)
@@ -413,13 +483,14 @@ func (db *engine) aggColumnar(plan *selectPlan, gset *groupSetPlan, env *evalEnv
 		}
 	}
 	unitPages, unitSlabs := 0, 0
-	// The group table (memory.md §6.2): the whole-table group's entry up front, a grouped entry as
-	// each group is created; returned after the last group is finalized.
+	// The group table: the whole-table group's entry up front and an unbounded grouped entry as each
+	// group is created (memory.md §6.2), returned after the last group is finalized; the bounded
+	// table's state-map measure (§6.6.1), returned at its hand-over or after its last finalize.
 	charge := meter.stateCharge()
 	defer charge.releaseAll()
 	if !grouped && charge.active() {
 		if err := charge.reserve(meter, memEntryBytes(nil)); err != nil {
-			return nil, false, err
+			return nil, nil, false, err
 		}
 	}
 
@@ -427,11 +498,42 @@ func (db *engine) aggColumnar(plan *selectPlan, gset *groupSetPlan, env *evalEnv
 	rowCount, nodes := 0, 0
 	visited := 0
 	if scan {
+		// operand reads aggregate s's operand for record i of n.
+		operand := func(n *pnode, i, s int) (Value, error) {
+			v := NullValue()
+			switch opRead[s] {
+			case operandNullness:
+				if !n.colIsNull(i, opCol[s]) {
+					v = BoolValue(true)
+				}
+			case operandLeaf:
+				var e error
+				if v, e = n.colAt(i, opCol[s]); e != nil {
+					return v, e
+				}
+				if v.Kind == ValUnfetched {
+					if v, e = resolveUnfetchedSelf(v.unfetched()); e != nil {
+						return v, e
+					}
+				}
+			case operandReuse:
+				return scratch.read(n, i, opCol[s])
+			}
+			return v, nil
+		}
 		var werr error
 		rowCount, nodes, werr = store.rows.foldScan(b, store.leafSrc(), func(n *pnode, i int) error {
 			if visited&255 == 0 {
 				if err := meter.Checkpoint(); err != nil {
 					return err
+				}
+				// Under a ceiling this fold is an attempt (cost.md §6.1): once the cost it has earned
+				// but not yet charged would trip, the statement cannot complete, so stop within this
+				// batch. The caller discards the attempt and its error.
+				pending := costs.StorageRowRead*int64(visited) + costs.PageRead*int64(unitPages) +
+					costs.ValueDecompress*int64(unitSlabs) + costs.AggregateAccumulate*int64(nsurv)*int64(len(plan.aggSpecs))
+				if meter.pendingTrips(pending) {
+					return newError(CostLimitExceeded, "the columnar fold reached the cost limit")
 				}
 			}
 			visited++
@@ -450,64 +552,102 @@ func (db *engine) aggColumnar(plan *selectPlan, gset *groupSetPlan, env *evalEnv
 				}
 			}
 			nsurv++
-			a := accs
-			if grouped {
-				kv, e := n.colAt(i, keyIdx)
+			if !grouped {
+				for s := range opRead {
+					v, e := operand(n, i, s)
+					if e != nil {
+						return e
+					}
+					if e := accs[s].fold(v, meter); e != nil {
+						return e
+					}
+				}
+				return nil
+			}
+			// A NULL integer key buckets into one sentinel group (the value-canonical key groups all
+			// NULLs together — matching the scalar path).
+			kv, e := n.colAt(i, keyIdx)
+			if e != nil {
+				return e
+			}
+			if spilled != nil {
+				// Handed over: the per-row step blockingAggregate runs — load the group's state, fold
+				// each aggregate, store it back. An integer key charges no hash work.
+				state, e := spilled.state(kv, plan.aggSpecs, zone)
 				if e != nil {
 					return e
 				}
-				var gi int
-				if kv.Kind == ValNull {
-					if nullGI < 0 {
-						if charge.active() {
-							if err := charge.reserve(meter, memEntryBytes([]Value{NullValue()})); err != nil {
-								return err
-							}
-						}
-						nullGI = len(groups)
-						groups = append(groups, vgroup{key: kv, accs: newAccsForSpecs(plan.aggSpecs, db.session.timeZone)})
+				for s := range opRead {
+					v, e := operand(n, i, s)
+					if e != nil {
+						return e
 					}
-					gi = nullGI
-				} else if g, ok := groupIdx[kv.Int]; ok {
-					gi = g
-				} else {
-					if charge.active() {
-						if err := charge.reserve(meter, memEntryBytes([]Value{IntValue(kv.Int)})); err != nil {
-							return err
-						}
+					if e := laneGroupSpillFold(state, s, plan.aggSpecs[s], v, zone, meter); e != nil {
+						return e
 					}
-					gi = len(groups)
-					groupIdx[kv.Int] = gi
-					groups = append(groups, vgroup{key: kv, accs: newAccsForSpecs(plan.aggSpecs, db.session.timeZone)})
 				}
-				a = groups[gi].accs
+				return spilled.put(kv, state)
 			}
-			for s := range opRead {
-				v := NullValue()
-				switch opRead[s] {
-				case operandNullness:
-					if !n.colIsNull(i, opCol[s]) {
-						v = BoolValue(true)
+			gi, found := nullGI, nullGI >= 0
+			if kv.Kind != ValNull {
+				gi, found = groupIdx[kv.Int]
+			}
+			if !found {
+				if bounded {
+					// The bounded table reserves what it measures (memory.md §6.6.1).
+					if !charge.tryReserveDirect(groupBase) {
+						rejected = true
 					}
-				case operandLeaf:
-					var e error
-					if v, e = n.colAt(i, opCol[s]); e != nil {
-						return e
-					}
-					if v.Kind == ValUnfetched {
-						if v, e = resolveUnfetchedSelf(v.unfetched()); e != nil {
-							return e
-						}
-					}
-				case operandReuse:
-					var e error
-					if v, e = scratch.read(n, i, opCol[s]); e != nil {
-						return e
+				} else if charge.active() {
+					if err := charge.reserve(meter, memEntryBytes([]Value{kv})); err != nil {
+						return err
 					}
 				}
+				gi = len(groups)
+				if kv.Kind == ValNull {
+					nullGI = gi
+				} else {
+					groupIdx[kv.Int] = gi
+				}
+				groups = append(groups, laneGroup{key: kv, accs: newAccsForSpecs(plan.aggSpecs, zone)})
+				resident += groupBase
+			}
+			a := groups[gi].accs
+			for s := range opRead {
+				v, e := operand(n, i, s)
+				if e != nil {
+					return e
+				}
+				if !variable[s] {
+					if e := a[s].fold(v, meter); e != nil {
+						return e
+					}
+					continue
+				}
+				before := accVariableBytes(a[s])
 				if e := a[s].fold(v, meter); e != nil {
 					return e
 				}
+				delta := accVariableBytes(a[s]) - before
+				resident += delta
+				if delta > 0 {
+					if !charge.tryReserveDirect(delta) {
+						rejected = true
+					}
+				} else if delta < 0 {
+					charge.release(-delta)
+				}
+			}
+			// Past work_mem, or once the account turns a reservation away, the table hands over like
+			// any spill structure: its whole charge is returned first.
+			if bounded && (resident > budget || rejected) {
+				charge.releaseAll()
+				sp, e := db.laneGroupHandover(groups, own)
+				if e != nil {
+					return e
+				}
+				spilled = sp
+				groups, groupIdx, nullGI = nil, nil, -1
 			}
 			return nil
 		})
@@ -517,35 +657,54 @@ func (db *engine) aggColumnar(plan *selectPlan, gset *groupSetPlan, env *evalEnv
 				meter.Charge(costs.PageRead*int64(nodes+unitPages) + costs.ValueDecompress*int64(unitSlabs) + costs.StorageRowRead*int64(visited))
 				meter.Charge(costs.AggregateAccumulate * int64(nsurv) * int64(len(plan.aggSpecs)))
 			}
-			return nil, false, werr
+			return nil, nil, false, werr
 		}
 	}
 
 	// Charge the identical cost totals: the scan block (page_read × (nodes + chain pages) — the same
 	// node visits; value_decompress × slabs; storage_row_read × rowCount) and aggregate_accumulate once
-	// per (survivor × spec), all bulk without cost ceilings (the caller gates). The filter's operator_eval was charged per scanned row inside
-	// foldScan.
+	// per (survivor × spec), in bulk (charge order is invisible: the caller accepts the lane's result
+	// only where the totals decide — cost.md §6.1). The filter's operator_eval was charged per scanned
+	// row inside foldScan.
 	meter.Charge(costs.PageRead*int64(nodes+unitPages) + costs.ValueDecompress*int64(unitSlabs) + costs.StorageRowRead*int64(rowCount))
 	meter.Charge(costs.AggregateAccumulate * int64(nsurv) * int64(len(plan.aggSpecs)))
 
+	if spilled != nil {
+		out, e := db.laneGroupFinish(spilled, plan.aggSpecs, own)
+		if e != nil {
+			return nil, nil, false, e
+		}
+		return nil, out, true, nil
+	}
 	if grouped {
 		out := make([]storedRow, 0, len(groups))
 		for i := range groups {
 			srow, e := finalizeGroup([]Value{groups[i].key}, groups[i].accs)
 			if e != nil {
-				return nil, false, e
+				return nil, nil, false, e
 			}
 			out = append(out, srow)
 		}
 		charge.releaseAll()
-		return out, true, nil
+		if bounded {
+			// On a spill-capable host the groups leave as a spool, like the bounded-spill lane's own
+			// (memory.md §5.4): it spills where a row buffer would fail.
+			spool := own.spool()
+			for _, r := range out {
+				if e := spool.push(r); e != nil {
+					return nil, nil, false, e
+				}
+			}
+			return nil, spool, true, nil
+		}
+		return out, nil, true, nil
 	}
 	srow, e := finalizeGroup(nil, accs)
 	if e != nil {
-		return nil, false, e
+		return nil, nil, false, e
 	}
 	charge.releaseAll()
-	return []storedRow{srow}, true, nil
+	return []storedRow{srow}, nil, true, nil
 }
 
 // operandRead is how the columnar aggregate lane reads one aggregate's operand per record
@@ -960,8 +1119,289 @@ func foldAggBatch(a *acc, spec *aggSpec, survivors []storedRow, meter *costMeter
 				a.cur = v
 			}
 		}
+	case planSumDecimal, planAvg:
+		// The decimal folds run through the shared acc.fold, in scan order, so their running-sum
+		// decimal_work is charged exactly as the scalar fold charges it (cost.md §3).
+		idx := spec.operand.index
+		for i := range survivors {
+			if i&255 == 0 {
+				if err := meter.Checkpoint(); err != nil {
+					return err
+				}
+			}
+			if err := a.fold(survivors[i][idx], meter); err != nil {
+				return err
+			}
+		}
 	default:
 		panic("foldAggBatch: ineligible aggregate plan")
 	}
 	return nil
+}
+
+// ---- The bounded group table, its hand-over, and the lane's ceiling attempt ----
+
+// The columnar aggregate lane's bounded group table and its hand-over to the spill structures
+// (spec/design/memory.md §5.4, §6.6.1; packed-leaf.md §11 Track A5), and the lane's attempt under a
+// cost ceiling (spec/design/cost.md §6.1). Mirrors the Rust core's blocking_spill.rs /
+// access_encode.rs / exec_emit.rs: which lane a statement takes decides what it reserves under a
+// query-memory budget, so the choice and every reservation here are cross-core contract.
+
+// laneTooling is a session's aggregate-lane tooling, read by the tests: how many grouped columnar
+// folds handed their group table over to the spill structures, how many attempts the lane made under
+// a cost ceiling and how many of those fell back to the row path, and the switch that turns the
+// attempt off so a test can compare it against the row path alone (cost.md §6.1). Per session, so
+// parallel tests do not see each other's.
+type laneTooling struct {
+	handovers  uint64
+	attempts   uint64
+	fallbacks  uint64
+	ceilingOff bool
+}
+
+// laneTools returns the session's lane tooling (a throwaway for an engine built without a session).
+func (db *engine) laneTools() *laneTooling {
+	if db.session.lane == nil {
+		return &laneTooling{}
+	}
+	return db.session.lane
+}
+
+// discardSafe reports whether evaluating e leaves nothing behind, so a lane attempt that evaluated it
+// can be discarded and the statement run again on the row path (cost.md §6.1). A deliberate
+// allowlist, identical in every core: columns, constants, parameters, and the operators over them
+// that read no entropy, clock, sequence, host code or subquery and keep no per-node state. Anything
+// else — every function call, a regex (its compile is charged once per node) — is not safe, and such
+// a statement keeps the row path under a ceiling.
+func discardSafe(e *rExpr) bool {
+	if e == nil {
+		return true
+	}
+	switch e.kind {
+	case reColumn, reParam, reConstInt, reConstBool, reConstText, reConstDecimal, reConstFloat32,
+		reConstFloat64, reConstBytea, reConstUuid, reConstTimestamp, reConstTimestamptz, reConstDate,
+		reConstInterval, reConstNull:
+		return true
+	case reNot, reCast, reNeg, reIsNull:
+		return discardSafe(e.operand)
+	case reAnd, reOr, reArith, reCompare, reDistinct, reLike:
+		return discardSafe(e.lhs) && discardSafe(e.rhs)
+	case reCase:
+		for i := range e.caseArms {
+			if !discardSafe(e.caseArms[i].cond) || !discardSafe(e.caseArms[i].result) {
+				return false
+			}
+		}
+		return discardSafe(e.caseEls)
+	case reCoalesce, reGreatestLeast, reNullIf:
+		for _, a := range e.sargs {
+			if !discardSafe(a) {
+				return false
+			}
+		}
+		return true
+	case reInValues:
+		// A list whose values are key points of the left operand carries its subquery's bookkeeping
+		// (the Rust core's FoldedPoints); any other folded list is plain values.
+		return !e.elemExact && !e.elemPromoted && discardSafe(e.lhs)
+	default:
+		return false
+	}
+}
+
+// laneDiscardSafe reports whether every expression the aggregate lane evaluates for plan — its WHERE
+// and each ORDER BY expression over its groups — is safe to discard.
+func laneDiscardSafe(plan *selectPlan) bool {
+	if !discardSafe(plan.filter) {
+		return false
+	}
+	for _, e := range plan.orderExprs {
+		if !discardSafe(e) {
+			return false
+		}
+	}
+	return true
+}
+
+// boundedWholeAggregate reports whether plan is a whole-table aggregate over one page-backed base
+// table: the columnar lane's whole-table fold holds constant state, so it keeps the lane where the
+// bounded-spill lane would otherwise take the statement (memory.md §5.4).
+func (db *engine) boundedWholeAggregate(plan *selectPlan) bool {
+	if len(plan.rels) != 1 || len(plan.groupSets) != 1 || len(plan.groupSets[0].keyCols) != 0 {
+		return false
+	}
+	return db.laneBaseRelPaged(plan)
+}
+
+// handoverGroupedAggregate reports whether the columnar lane may run grouped plan on a spill-capable
+// host, handing its group table over to the spill structures when it outgrows work_mem or the
+// query-memory account turns a reservation away (memory.md §5.4): one grouping set with one key over
+// one page-backed base table.
+func (db *engine) handoverGroupedAggregate(plan *selectPlan) bool {
+	if len(plan.rels) != 1 || len(plan.groupSets) != 1 || len(plan.groupSets[0].keyCols) != 1 {
+		return false
+	}
+	return db.laneBaseRelPaged(plan)
+}
+
+func (db *engine) laneBaseRelPaged(plan *selectPlan) bool {
+	rel := &plan.rels[0]
+	if rel.srf != nil || rel.derived != nil || rel.cte != nil {
+		return false
+	}
+	store := db.lkpStoreScoped(rel.db, rel.tableName)
+	return store != nil && store.paging != nil
+}
+
+// aggregateLaneEligible is the dispatch gate of the vectorized / columnar aggregate lane (memory.md
+// §5.4): the shape rules, no EXPLAIN ANALYZE profile, a statement the bounded-spill lane would not
+// take (or a whole-table / single-key grouped fold over a page-backed table), and an ORDER BY only on
+// the bounded grouped form, which sorts its groups.
+func (db *engine) aggregateLaneEligible(plan *selectPlan) bool {
+	if db.explainActual != nil || !db.vectorizedAggEligible(plan) {
+		return false
+	}
+	bounded := db.boundedBlockingEligible(plan)
+	handover := db.handoverGroupedAggregate(plan)
+	if bounded && !db.boundedWholeAggregate(plan) && !handover {
+		return false
+	}
+	return len(plan.order) == 0 || (bounded && handover)
+}
+
+// freshGroupState is a new group's state-map value, as blockingAggregate builds it: its creation
+// ordinal, then each aggregate's packed fresh accumulator.
+func freshGroupState(specs []aggSpec, ordinal int64, zone ZoneRef) storedRow {
+	state := make(storedRow, 0, 1+len(specs))
+	state = append(state, IntValue(ordinal))
+	for _, spec := range specs {
+		state = append(state, CompositeValue(blockingAccRow(newAccFromSpec(spec, zone))))
+	}
+	return state
+}
+
+// laneGroupBaseBytes is what one group with an integer (or NULL) key holds in a resident state map
+// before any fold (memory.md §6.6): ENTRY + key + state.
+func laneGroupBaseBytes(specs []aggSpec, zone ZoneRef) int64 {
+	return memMapEntryBytes([]Value{NullValue()}, freshGroupState(specs, 0, zone))
+}
+
+// accVariableBytes is the part of an accumulator's packed size that changes as it folds: a decimal
+// sum's digit groups, a MIN/MAX's held value. Every other accumulator the lane folds packs to a fixed
+// size.
+func accVariableBytes(a *acc) int64 {
+	switch a.plan {
+	case planSumDecimal, planAvg:
+		return memoryDecimalGroup * int64(a.sumDec.codecGroupCount())
+	case planMin, planMax:
+		if a.hasCur {
+			return memPayloadBytes(a.cur)
+		}
+	}
+	return 0
+}
+
+// accIsVariable reports whether spec's accumulator has an accVariableBytes part.
+func accIsVariable(spec *aggSpec) bool {
+	switch spec.plan {
+	case planSumDecimal, planAvg, planMin, planMax:
+		return true
+	}
+	return false
+}
+
+// laneGroupSpill is the columnar grouped lane's group table once it has handed over: the spill
+// executor's own structures, which spill by their own rule.
+type laneGroupSpill struct {
+	groups *stateMap // group key → [creation ordinal, packed accumulator…]
+	keys   *rowSpool // the group keys in creation order — the emission order
+}
+
+// state returns key's state, creating the group (and recording its key for emission) when it is new.
+func (s *laneGroupSpill) state(key Value, specs []aggSpec, zone ZoneRef) (storedRow, error) {
+	state, ok, err := s.groups.get([]Value{key})
+	if err != nil {
+		return nil, err
+	}
+	if ok {
+		return append(storedRow(nil), state...), nil
+	}
+	state = freshGroupState(specs, s.keys.count, zone)
+	if err := s.keys.push(storedRow{key}); err != nil {
+		return nil, err
+	}
+	return state, nil
+}
+
+// laneGroupSpillFold folds v into aggregate si of a loaded state.
+func laneGroupSpillFold(state storedRow, si int, spec aggSpec, v Value, zone ZoneRef, m *costMeter) error {
+	a := blockingAccFromRow(spec, *state[si+1].composite(), zone)
+	if err := a.fold(v, m); err != nil {
+		return err
+	}
+	state[si+1] = CompositeValue(blockingAccRow(a))
+	return nil
+}
+
+// put stores key's folded state back.
+func (s *laneGroupSpill) put(key Value, state storedRow) error {
+	return s.groups.put([]Value{key}, state)
+}
+
+// laneGroup is one group of the columnar lane's in-memory table.
+type laneGroup struct {
+	key  Value
+	accs []*acc
+}
+
+// laneGroupHandover moves the lane's in-memory groups (in creation order) into the spill structures —
+// exactly what blockingAggregate would hold after folding the same rows: each group's state is put in
+// the map, then its key row is pushed to the key spool (memory.md §6.6.1).
+func (db *engine) laneGroupHandover(groups []laneGroup, own *blockingOwner) (*laneGroupSpill, error) {
+	db.laneTools().handovers++
+	spill := &laneGroupSpill{groups: own.stateMap(), keys: own.spool()}
+	for ordinal := range groups {
+		g := &groups[ordinal]
+		state := make(storedRow, 0, 1+len(g.accs))
+		state = append(state, IntValue(int64(ordinal)))
+		for _, a := range g.accs {
+			state = append(state, CompositeValue(blockingAccRow(a)))
+		}
+		if err := spill.groups.put([]Value{g.key}, state); err != nil {
+			return nil, err
+		}
+		if err := spill.keys.push(storedRow{g.key}); err != nil {
+			return nil, err
+		}
+	}
+	return spill, nil
+}
+
+// laneGroupFinish finalizes a handed-over group table into its synthetic rows [key, agg…], in
+// group-creation order, as a spool; the map and the key spool are discarded once it is filled.
+func (db *engine) laneGroupFinish(spill *laneGroupSpill, specs []aggSpec, own *blockingOwner) (*rowSpool, error) {
+	zone := db.session.timeZone
+	output := own.spool()
+	err := spill.keys.each(func(key storedRow) error {
+		state, _, err := spill.groups.get(key)
+		if err != nil {
+			return err
+		}
+		out := make(storedRow, 0, len(state))
+		out = append(out, key[0])
+		for si := range specs {
+			v, err := blockingAccFromRow(specs[si], *state[si+1].composite(), zone).finalize()
+			if err != nil {
+				return err
+			}
+			out = append(out, v)
+		}
+		return output.push(out)
+	})
+	if err != nil {
+		return nil, err
+	}
+	spill.keys.close()
+	spill.groups.close()
+	return output, nil
 }

@@ -291,6 +291,9 @@ type sessionState struct {
 	// counts; a pointer so the activate() VALUE swap of the session keeps the same counter. SESSION
 	// state, not snapshot state: it does NOT roll back when a transaction rolls back.
 	lifetimeTotal *int64
+	// lane is the session's aggregate-lane tooling (batch.go): the counters the tests read and
+	// the switch that turns the ceiling attempt off. Shared by pointer like lifetimeTotal.
+	lane *laneTooling
 	// cancel is the per-statement cancellation channel the ergonomic API arms for one statement
 	// (spec/design/api.md §11.4): nil unless a host cancellation handle (Go context.Context, …) is
 	// active. newMeter copies it into the statement's meter, whose execution loops sample it at bounded
@@ -407,6 +410,7 @@ func newSessionWithOptions(opts SessionOptions, env *Environment) sessionState {
 		maxQueryMemoryBytes: opts.MaxQueryMemoryBytes,
 		lifetimeMaxCost:     opts.LifetimeMaxCost,
 		lifetimeTotal:       new(int64),
+		lane:                new(laneTooling),
 		maxSQLLength:        opts.MaxSQLLength,
 		lockTimeoutMs:       opts.LockTimeoutMs,
 		workMem:             opts.WorkMem,

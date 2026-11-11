@@ -497,13 +497,29 @@ impl TableStore {
         let mut pages = self.node_count();
         let mut slabs = 0usize;
         if crate::format::any_spillable_masked(&self.col_types, mask) {
-            self.scan_range(&KeyBound::unbounded(), &mut |k, row| {
-                let u = crate::format::record_scan_units(&self.col_types, k, row, self.cap, mask);
-                pages += u.pages;
-                slabs += u.decompress;
-                Ok(true)
-            })?;
+            let (chain, decompress) = self.large_value_units(&KeyBound::unbounded(), mask)?;
+            pages += chain;
+            slabs += decompress;
         }
+        Ok((pages, slabs))
+    }
+
+    /// The large-value units — `(chain pages, decompress slabs)` — of the records within `b`, for
+    /// the touched columns `mask`. Walks the bound reading each record's units off its leaf
+    /// ([`crate::pmap::Node::record_scan_units`]: a Packed leaf's stored tags, a Decoded leaf's row)
+    /// without reconstructing a row: the numbers the row walk reads off the same records' deferred
+    /// references (cost.md §3).
+    fn large_value_units(&self, b: &KeyBound, mask: &[bool]) -> Result<(usize, usize)> {
+        let mut pages = 0usize;
+        let mut slabs = 0usize;
+        let mut visit = |node: &crate::pmap::Node, i: usize| -> Result<()> {
+            let u = node.record_scan_units(i, &self.col_types, self.cap, mask);
+            pages += u.pages;
+            slabs += u.decompress;
+            Ok(())
+        };
+        let (_, _, walked) = self.fold_scan_masked(b, &mut visit);
+        walked?;
         Ok((pages, slabs))
     }
 
@@ -516,12 +532,9 @@ impl TableStore {
         let mut pages = self.overlap_node_count(b);
         let mut slabs = 0usize;
         if crate::format::any_spillable_masked(&self.col_types, mask) {
-            self.scan_range(b, &mut |k, row| {
-                let u = crate::format::record_scan_units(&self.col_types, k, row, self.cap, mask);
-                pages += u.pages;
-                slabs += u.decompress;
-                Ok(true)
-            })?;
+            let (chain, decompress) = self.large_value_units(b, mask)?;
+            pages += chain;
+            slabs += decompress;
         }
         Ok((pages, slabs))
     }

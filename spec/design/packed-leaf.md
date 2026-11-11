@@ -526,6 +526,75 @@ expanded row vectors.
   GIN-relevant `jsonb` operators as atoms; a fixed-width comparison atom (an integer filter is still a
   generic predicate).
 
+- **Track A5 — the lanes widened (2026-11).** *Rows, cost, and bytes are unchanged. Items 2, 3, 5 and
+  7 change which lane a statement takes, and so what it reserves under a query-memory budget; that
+  choice is contract (memory.md §5.4, §6.6.1; spill.md §4.1) and every core makes it. Items 1, 4 and
+  6 are per-core internals, done in the Rust core.*
+  1. **Inline values decode straight from the page.** A reader that uses a value at once
+     (`PackedLeaf::value_resolved`: an aggregate operand, a projected column, a predicate's own
+     column) runs `read_inline_body` on the stored span rather than building a deferred handle and
+     resolving it — the handle cost three `Arc` bumps each way per value. An out-of-line or compressed
+     value keeps the deferred route. The plain lane filter resolves only the columns its predicate
+     reads (its `collect_touched` set, as the span filter's generic leaf already did); a touched
+     column only the aggregate or projection reads is read for survivors alone.
+  2. **The decimal folds take the aggregate lane**: `SUM(i64)`, `SUM(decimal)`, and `AVG` over an
+     integer or decimal. Their `decimal_work` depends on the running sum (cost.md §3), but it is
+     charged inside the shared `Acc::fold`, and each accumulator meets its group's survivors in scan
+     order on either path, so every fold charges the same amount; the fold raises no data error (the
+     cap is checked at finalize, decimal.md §2).
+  3. **A grouped aggregate on a spill-capable host takes the lane and hands over.** The lane's group
+     table cannot spill, which is why a file-backed grouped aggregate went to the bounded-spill lane.
+     Now the lane tracks the table's size on the state map's schedule (memory.md §6.6:
+     `ENTRY + key + packed state` per group — a fixed part, plus each decimal sum's digit groups and
+     each MIN/MAX value's bytes as they change), and past `work_mem` it **hands the table over**: every
+     group, in creation order, moves into the structures `blocking_aggregate` keeps (a key spool for
+     emission order, a state map of packed accumulators), and the *same scan* carries on with
+     `blocking_aggregate`'s per-row step — load the state, fold, store it back — with no relation or
+     `WHERE` spool. The result is then a spool, emitted like the bounded-spill lane's. Nothing is
+     evaluated twice (a restart would re-run the filter, visible through sequences, entropy, and the
+     scalar allowance). Each group folds the same values in the same order through the same `Acc::fold`
+     either side of the hand-over, so rows, emission order, and every charge are unchanged.
+  4. **The bounded-spill lane's scan reads less.** `scan_blocking_relation` reads only the touched
+     columns, each resolved straight from its leaf (it used to reconstruct every column, then NULL the
+     untouched ones); a scan's large-value units (`scan_units` / `overlap_scan_units`) are read off
+     the stored tags by the lanes' walk rather than off reconstructed rows; and that walk
+     (`fold_walk`) issues the same read-ahead hints as the row walk, so a page client fetches a
+     lane's leaves in batches (page-service.md §5.3).
+  5. **An ordered grouped aggregate takes the lane.** A single-key grouped fold whose groups are
+     then sorted (`GROUP BY k ORDER BY …`) used to go to the bounded-spill lane for the `ORDER BY`
+     alone. Now the lane's groups — handed over or not — enter a spool and take the bounded-spill
+     lane's own `ORDER BY` stage (`blocking_order`: decorate, charge the sort keys, sort), so the row
+     order, ties, and every charge are that stage's.
+  6. **The streaming sort reads only what it sorts.** The single-table `ORDER BY` scan
+     (`exec_streaming_sort`) walks the bound with the lanes' walk, reading each touched column
+     straight from its leaf into one reused row whose untouched slots stay NULL — the form sort state
+     already held (memory.md §6.1). It used to reconstruct every column of every row, copy the row,
+     and NULL the untouched slots. The top-k heap takes the row only when it retains it
+     (`TopKKeeper::offer`); a row it rejects stays with the scan and is overwritten by the next one.
+     Charges are unchanged: the sort-key charge is per survivor, and the heap reserves only what it
+     retains (memory.md §6.4), so this item applies under a query-memory budget too.
+  7. **A bounded decimal fits the file-backed top-k heap.** On a file-backed database the heap is
+     used only when `k` rows fit `work_mem`, which needed every touched column to be fixed-width; a
+     `numeric(p,s)` column now counts too, at its largest logical size (`4 × ⌈p/4⌉` bytes more per
+     row). Otherwise the statement sorted every survivor externally to return `k` rows.
+
+  **Budgets.** The lane choice decides which buffers a statement reserves, so under a query-memory
+  budget it decides where `54P05` trips; memory.md §5.4 and §6.6.1 specify the choice and the
+  bounded group table's charges, and `mise run conformance:query_memory` holds the three cores to the
+  same peak on every corpus record. Under a cost ceiling or lifetime budget the aggregate lane runs
+  as an attempt that the row path may replace (cost.md §6.1). The columnar projection lane still runs
+  only with no ceiling.
+  Verified by the `varwidth_lanes` battery
+  (lane against row path on rows **and** cost: the decimal folds over sums that grow past 2⁶⁴ and
+  2¹²⁸; grouped folds at `work_mem` settings that place the hand-over after the first row, after a few
+  groups, part-way through a many-group scan, and never, each with the hand-over itself asserted; and
+  equal outcomes at several query-memory budgets) and by the forced-spill corpus run, which hands
+  over in every grouped query the lane takes; ordered groups are checked the same way with the row
+  sequence compared, and every top-N window against the same slice of the full sort, on a file and in
+  memory. Measured on 1M rows, file-backed: `sum(numeric)` 739 →
+  44 ns/row, a 10,000-group `sum(numeric)` 770 → 72, `max(numeric)` 70 → 33; after a hand-over the
+  fold costs slightly less than the bounded-spill lane at the same `work_mem`.
+
 The columnar read-path work is now **complete across all three cores** (2026-07): A1 (touched-column scan
 wiring), the A2 projection feed + aggregate gather, and A3 filter vectorization for both projections and
 aggregates — including the **vectorized aggregate executor** (single-base-table SUM/COUNT/MIN/MAX/AVG,

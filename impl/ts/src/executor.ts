@@ -1,4 +1,4 @@
-import { cancellationCheckpoint } from "./cancel.ts";
+import { cancellationCheckpoint, hasCancellation } from "./cancel.ts";
 import {
   callSteps,
   uncancelableSteps,
@@ -204,7 +204,13 @@ import {
 import { type Collation, serializeTable, sortKey as collationSortKey } from "./collation.ts";
 import { Environment } from "./environment.ts";
 import { BatchDeadline } from "./idle_flush.ts";
-import { COSTS, MEMORY_ENTRY, MEMORY_ROW, MEMORY_VALUE } from "./costs.ts";
+import {
+  COSTS,
+  MEMORY_DECIMAL_GROUP,
+  MEMORY_ENTRY,
+  MEMORY_ROW,
+  MEMORY_VALUE,
+} from "./costs.ts";
 import { chargeHashKey, chargeHashKeys, chargeSortKey, chargeSortKeys, hashKeyUnits } from "./key_meter.ts";
 import {
   entryBytes,
@@ -944,6 +950,22 @@ export type Emitter = {
   // The gathered lanes' query-memory charge (memory.md §6.5), returned when the emission completes.
   columnarCharge?: StateCharge;
 };
+
+// laneCeiling is tooling for the columnar aggregate lane's attempts under a cost ceiling (cost.md
+// §6.1): how many were made and how many fell back to the row path, and a switch that turns the
+// attempt off so a test can compare it against the row path alone.
+export const laneCeiling = { off: false, attempts: 0, fallbacks: 0 };
+
+// laneGroupHandovers counts grouped columnar folds that handed their group table over to the spill
+// structures (memory.md §6.6.1) — tooling for the tests.
+export const laneGroupHandovers = { count: 0 };
+
+// LaneGroups is what the columnar aggregate lane produced: its finalized synthetic rows — or, for a
+// grouped fold on a spill-capable host (memory.md §6.6.1), a spool of them with the structures that
+// stay open until its emission completes.
+type LaneGroups =
+  | { kind: "rows"; rows: Value[][] }
+  | { kind: "spool"; rows: RowSpool; resources: { close(): void }[] };
 
 // nullUntouched is a copy of `row` with each untouched slot (!mask[i]) replaced by NULL, so a row
 // entering sort or spill state holds only what the plan reads and measures in full
@@ -25687,10 +25709,11 @@ export class Engine {
     };
   }
 
-  // Whether a file-backed all-C scan's K fixed-width rows fit the cross-core logical top-k
-  // work_mem estimate (8 bytes per row + 40 per value). In-memory / unlimited handles always use
-  // top-k. Untouched slots are nulled in the retained copy; a touched variable/open type has no
-  // static maximum and keeps the external sorter.
+  // Whether a file-backed all-C scan's K bounded-width rows fit the cross-core logical top-k
+  // work_mem estimate (8 bytes per row + 40 per value, plus each touched numeric(p,s) column's
+  // largest digit-group payload, 4 × ⌈p / 4⌉ — spill.md §4.1). In-memory / unlimited handles always
+  // use top-k. Untouched slots are nulled in the retained copy; any other touched variable/open type
+  // has no static maximum and keeps the external sorter.
   private streamingTopKFits(plan: SelectPlan, k: bigint): boolean {
     if (k === 0n || this.spillSink === null || this.session.workMem === 0) return true;
     const table = this.lkpTableScoped(plan.rels[0]!.db, plan.rels[0]!.tableName);
@@ -25707,9 +25730,19 @@ export class Engine {
       "f64",
       "date",
     ]);
-    if (table.columns.some((col, i) => plan.relMasks[0]![i] && !fixed.has(typeAsScalar(col.type)!)))
-      return false;
-    const rowBudget = 8 + 40 * table.columns.length;
+    let decimalBytes = 0;
+    for (let i = 0; i < table.columns.length; i++) {
+      if (!plan.relMasks[0]![i]) continue;
+      const col = table.columns[i]!;
+      const scalar = typeAsScalar(col.type);
+      // A decimal with a declared precision has a bounded size too.
+      if (scalar === "decimal" && col.decimal !== null) {
+        decimalBytes += MEMORY_DECIMAL_GROUP * Math.ceil(col.decimal.precision / 4);
+        continue;
+      }
+      if (!fixed.has(scalar!)) return false;
+    }
+    const rowBudget = 8 + 40 * table.columns.length + decimalBytes;
     return k <= BigInt(Math.floor(this.session.workMem / rowBudget));
   }
 
@@ -26503,15 +26536,9 @@ export class Engine {
       return false;
     }
     // No blocking / re-shaping operator beyond the fold. LIMIT/OFFSET is honored via the window bounds
-    // below, so it need not bail.
-    if (
-      plan.distinct ||
-      plan.distinctOn > 0 ||
-      plan.having !== null ||
-      plan.hasWindow ||
-      plan.order.length !== 0
-    )
-      return false;
+    // below, so it need not bail. An ORDER BY is the caller's to admit: only the bounded grouped lane
+    // sorts its groups (memory.md §5.4, §6.6.1).
+    if (plan.distinct || plan.distinctOn > 0 || plan.having !== null || plan.hasWindow) return false;
     if (plan.aggSpecs.length === 0) return false;
     return plan.aggSpecs.every((s) => vectorizedSpecEligible(s));
   }
@@ -26522,8 +26549,8 @@ export class Engine {
   // (materializeRel) + WHERE for exact cost + survivor determination, then folds each aggregate over the
   // survivors with the shared Acc (byte-identical acc state, hence finalize). A file-backed store gathers
   // only its touched columns columnar (aggColumnar — never a full-width row, the allocation dividend); an
-  // in-memory store (or a columnar decline) folds over the materialized rows. Only runs on the unmetered
-  // lane (the caller gates).
+  // in-memory store (or a columnar decline) folds over the materialized rows. The caller gates it to
+  // the unmetered lane, or runs it as an attempt under a cost ceiling (cost.md §6.1).
   private execVectorizedAgg(
     plan: SelectPlan,
     env: EvalEnv,
@@ -26545,7 +26572,17 @@ export class Engine {
     // touched columns during the tree walk — never a full-width row — evaluating any WHERE per record on
     // the stored bytes where it can. Declines (null) to the row path below for an in-memory store.
     // Cost-neutral by construction (aggColumnar charges the identical scan block).
-    let srows = yield* this.aggColumnarSteps(plan, gset, env, params, meter);
+    const lane = yield* this.aggColumnarSteps(plan, gset, env, params, meter);
+    // A grouped fold on a spill-capable host: its groups are a spool, handed over or not — sorted by
+    // the bounded-spill lane's own ORDER BY stage and emitted under the LIMIT/OFFSET window exactly
+    // as that lane emits its own (memory.md §6.6.1).
+    if (lane !== null && lane.kind === "spool")
+      return yield* this.laneSpoolEmitterSteps(plan, lane.rows, lane.resources, env, meter);
+    // The lane declined a grouped fold on a spill-capable host: the bounded-spill lane, never the
+    // unbounded row path below.
+    if (lane === null && gset.keyCols.length !== 0 && this.boundedBlockingEligible(plan))
+      return yield* this.execBoundedBlockingSteps(plan, env, meter, params);
+    let srows = lane === null ? null : lane.rows;
     if (srows !== null) {
       // Dense lanes are operator state; the group rows are a row buffer (memory.md §5.4).
       for (const r of srows) {
@@ -26623,7 +26660,7 @@ export class Engine {
     env: EvalEnv,
     params: Value[],
     meter: Meter,
-  ): Value[][] | null {
+  ): LaneGroups | null {
     return runSync(this.aggColumnarSteps(plan, gset, env, params, meter));
   }
 
@@ -26633,7 +26670,7 @@ export class Engine {
     env: EvalEnv,
     params: Value[],
     meter: Meter,
-  ): Steps<Value[][] | null> {
+  ): Steps<LaneGroups | null> {
     const rel = plan.rels[0]!;
     const store = this.lkpStoreScoped(rel.db, rel.tableName);
     // File-backed only: an in-memory store's row path is already zero-copy.
@@ -26672,12 +26709,32 @@ export class Engine {
     // (float.md §7, packed-leaf.md §11). The WHERE compiles once into span atoms over the stored bytes
     // plus generic predicates over a reusable scratch row (Track A4) — byte-identical survivors +
     // operator_eval to the row path's evalFilter.
-    const whole: Acc[] = grouped
-      ? []
-      : plan.aggSpecs.map((s) => newAccFromSpec(s, this.session.timeZone));
-    const groups: { key: Value; accs: Acc[] }[] = [];
-    const index = new Map<bigint, number>();
+    const zone = this.session.timeZone;
+    const fresh = (): Acc[] => plan.aggSpecs.map((s) => newAccFromSpec(s, zone));
+    const whole: Acc[] = grouped ? [] : fresh();
+    let groups: { key: Value; accs: Acc[] }[] = [];
+    let index = new Map<bigint, number>();
     let nullGi = -1;
+    // On a spill-capable host a grouped fold is bounded (memory.md §6.6.1): the group table is measured
+    // and charged as a resident keyed state map would be — a fixed part per group, plus each decimal
+    // sum's and MIN/MAX value's own bytes as they change — and past work_mem, or once the account
+    // turns a reservation away, it is handed over to the spill structures, into which the rest of the
+    // scan folds.
+    const bounded = grouped && this.boundedBlockingEligible(plan);
+    const budget = this.session.workMem;
+    const groupBase = bounded
+      ? MEMORY_ENTRY + keyBytes([nullValue()]) + packedStateBytes(fresh())
+      : 0;
+    const variable = plan.aggSpecs.map((spec) => bounded && accIsVariable(spec));
+    let resident = 0;
+    let rejected = false;
+    let spilled: { states: SpillMap; order: RowSpool } | null = null;
+    const resources: { close(): void }[] = [];
+    const laneSpool = (): RowSpool => {
+      const out = new RowSpool(budget, this.spillSink!, new StateCharge(this.session.queryAccount));
+      resources.push(out);
+      return out;
+    };
     const span =
       plan.filter === null ? null : compileLaneFilter(plan.filter, store.columnTypes(), mask, env);
     const scratch = new ScratchRow(mask.length);
@@ -26690,83 +26747,319 @@ export class Engine {
     const charge = meter.stateCharge();
     if (!grouped && charge.active()) charge.reserve(meter, entryBytes([]));
 
-    if (doScan) {
-      const reuse = laneReuse(store.columnTypes(), span !== null);
-      const visit = function* (this: Engine, n: PNode, i: number): Steps<void> {
-        if (spillable) store.laneScanUnits(n, i, mask, units);
-        if (span !== null && !(yield* laneKeepSteps(span, n, i, scratch, env, meter))) return;
-        nsurv++;
-        let accs: Acc[];
-        if (grouped) {
-          const kv = colAt(n, i, keyCol);
-          let gi: number;
-          if (kv.kind === "int") {
-            const g = index.get(kv.int);
-            if (g === undefined) {
-              if (charge.active()) charge.reserve(meter, entryBytes([kv]));
-              gi = groups.length;
-              index.set(kv.int, gi);
-              groups.push({
-                key: kv,
-                accs: plan.aggSpecs.map((s) => newAccFromSpec(s, this.session.timeZone)),
-              });
-            } else {
-              gi = g;
-            }
-          } else {
-            // A NULL integer key buckets into one sentinel group (matching the scalar/lane path).
-            if (nullGi < 0) {
-              if (charge.active()) charge.reserve(meter, entryBytes([nullValue()]));
-              nullGi = groups.length;
-              groups.push({
-                key: nullValue(),
-                accs: plan.aggSpecs.map((s) => newAccFromSpec(s, this.session.timeZone)),
-              });
-            }
-            gi = nullGi;
-          }
-          accs = groups[gi]!.accs;
-        } else {
-          accs = whole;
-        }
-        for (let s = 0; s < plan.aggSpecs.length; s++) {
-          if (shouldCooperate()) yield COOPERATE;
-          const spec = plan.aggSpecs[s]!;
+    try {
+      if (doScan) {
+        const reuse = laneReuse(store.columnTypes(), span !== null);
+        // How each aggregate reads its operand, decided once so the per-record loop allocates nothing
+        // for it: 0 none (COUNT(*)), 1 nullness only (COUNT(col), Track A4), 2 the value the filter
+        // resolved, 3 straight from the leaf.
+        const opCol = plan.aggSpecs.map((spec) => operandCol(spec) ?? 0);
+        const opKind = plan.aggSpecs.map((spec) => {
           const oc = operandCol(spec);
-          let v: Value;
-          if (oc === null)
-            v = nullValue(); // COUNT(*) folds no value
-          else if (spec.plan === "count")
-            // COUNT(col) folds only nullness — the value is never decoded (Track A4).
-            v = colIsNull(n, i, oc) ? nullValue() : { kind: "bool", value: true };
-          else
-            v = reuse[oc]
-              ? yield* scratch.readSteps(n, i, oc)
-              : yield* readLeafColumnSteps(n, i, oc);
-          foldAcc(accs[s]!, v, meter);
+          return oc === null ? 0 : spec.plan === "count" ? 1 : reuse[oc] ? 2 : 3;
+        });
+        const metered = meter.hasCeiling();
+        let visited = 0;
+        const visit = function* (this: Engine, n: PNode, i: number): Steps<void> {
+          if (metered && (visited & 255) === 0) {
+            meter.guard();
+            // Under a ceiling this fold is an attempt (cost.md §6.1): once the cost it has earned but
+            // not yet charged would trip, the statement cannot complete, so stop within this batch.
+            // The caller discards the attempt and its error.
+            const pending =
+              COSTS.storageRowRead * BigInt(visited) +
+              COSTS.pageRead * BigInt(units.pages) +
+              COSTS.valueDecompress * BigInt(units.decompress) +
+              COSTS.aggregateAccumulate * BigInt(nsurv) * BigInt(plan.aggSpecs.length);
+            if (meter.pendingTrips(pending))
+              throw engineError("cost_limit_exceeded", "the columnar fold reached the cost limit");
+          }
+          visited++;
+          if (spillable) store.laneScanUnits(n, i, mask, units);
+          if (span !== null && !(yield* laneKeepSteps(span, n, i, scratch, env, meter))) return;
+          nsurv++;
+          if (!grouped) {
+            for (let s = 0; s < plan.aggSpecs.length; s++) {
+              if (shouldCooperate()) yield COOPERATE;
+              const k = opKind[s]!;
+              const v: Value =
+                k === 0
+                  ? nullValue() // COUNT(*) folds no value
+                  : k === 1
+                    ? colIsNull(n, i, opCol[s]!)
+                      ? nullValue()
+                      : { kind: "bool", value: true }
+                    : k === 2
+                      ? yield* scratch.readSteps(n, i, opCol[s]!)
+                      : yield* readLeafColumnSteps(n, i, opCol[s]!);
+              foldAcc(whole[s]!, v, meter);
+            }
+            return;
+          }
+          // A NULL integer key buckets into one sentinel group (matching the scalar/lane path).
+          const kv = colAt(n, i, keyCol);
+          const key: Value = kv.kind === "int" ? kv : nullValue();
+          if (spilled !== null) {
+            // Handed over: the per-row step the bounded-spill aggregate runs — load the group's state,
+            // fold each aggregate, store it back. An integer key charges no hash work.
+            const k = distinctRowKey([key]);
+            const previous = spilled.states.get(k);
+            const accs =
+              previous === undefined
+                ? fresh()
+                : decodeBlockingAccs(previous, plan.aggSpecs, zone).accs;
+            if (previous === undefined) spilled.order.push([key]);
+            for (let s = 0; s < plan.aggSpecs.length; s++) {
+              if (shouldCooperate()) yield COOPERATE;
+              const k = opKind[s]!;
+              const v: Value =
+                k === 0
+                  ? nullValue() // COUNT(*) folds no value
+                  : k === 1
+                    ? colIsNull(n, i, opCol[s]!)
+                      ? nullValue()
+                      : { kind: "bool", value: true }
+                    : k === 2
+                      ? yield* scratch.readSteps(n, i, opCol[s]!)
+                      : yield* readLeafColumnSteps(n, i, opCol[s]!);
+              foldAcc(accs[s]!, v, meter);
+            }
+            spilled.states.set(
+              k,
+              encodeBlockingAccs([], accs),
+              previous === undefined ? keyBytes([key]) : 0,
+              packedStateBytes(accs),
+            );
+            return;
+          }
+          let gi = key.kind === "int" ? (index.get(key.int) ?? -1) : nullGi;
+          if (gi < 0) {
+            if (bounded) {
+              // The bounded table reserves what it measures (memory.md §6.6.1).
+              if (!charge.tryReserveDirect(groupBase)) rejected = true;
+            } else if (charge.active()) {
+              charge.reserve(meter, entryBytes([key]));
+            }
+            gi = groups.length;
+            if (key.kind === "int") index.set(key.int, gi);
+            else nullGi = gi;
+            groups.push({ key, accs: fresh() });
+            resident += groupBase;
+          }
+          const accs = groups[gi]!.accs;
+          for (let s = 0; s < plan.aggSpecs.length; s++) {
+            if (shouldCooperate()) yield COOPERATE;
+            const k = opKind[s]!;
+            const v: Value =
+              k === 0
+                ? nullValue() // COUNT(*) folds no value
+                : k === 1
+                  ? colIsNull(n, i, opCol[s]!)
+                    ? nullValue()
+                    : { kind: "bool", value: true }
+                  : k === 2
+                    ? yield* scratch.readSteps(n, i, opCol[s]!)
+                    : yield* readLeafColumnSteps(n, i, opCol[s]!);
+            if (variable[s]) {
+              const before = accVariableBytes(accs[s]!);
+              foldAcc(accs[s]!, v, meter);
+              const delta = accVariableBytes(accs[s]!) - before;
+              resident += delta;
+              if (delta > 0) {
+                if (!charge.tryReserveDirect(delta)) rejected = true;
+              } else if (delta < 0) {
+                charge.release(-delta);
+              }
+            } else {
+              foldAcc(accs[s]!, v, meter);
+            }
+          }
+          // Past work_mem, or once the account turns a reservation away, the table hands over like any
+          // spill structure: its whole charge is returned first.
+          if (bounded && (resident > budget || rejected)) {
+            charge.releaseAll();
+            spilled = this.laneGroupHandover(groups, resources);
+            groups = [];
+            index = new Map<bigint, number>();
+            nullGi = -1;
+          }
+        }.bind(this);
+        const r = yield* store.foldScanMaskedSteps(b, visit);
+        rowCount = r.rowCount;
+        pages = r.nodes;
+      }
+
+      // Charge the identical cost totals (unmetered lane — charge order is invisible): the scan block
+      // (pageRead × (nodes + chain pages); valueDecompress × slabs; storageRowRead × rowCount) and
+      // aggregateAccumulate once per (survivor × spec). The filter's operator_eval was charged per scanned
+      // row inside the walk.
+      meter.charge(
+        COSTS.pageRead * BigInt(pages + units.pages) +
+          COSTS.valueDecompress * BigInt(units.decompress) +
+          COSTS.storageRowRead * BigInt(rowCount),
+      );
+      meter.charge(COSTS.aggregateAccumulate * BigInt(nsurv) * BigInt(plan.aggSpecs.length));
+
+      // The compiler cannot see the walk's closure assign `spilled`.
+      const handed = spilled as { states: SpillMap; order: RowSpool } | null;
+      if (handed !== null) {
+        // Finalize the handed-over group table into its synthetic rows [key, agg…], in group-creation
+        // order — the bounded-spill aggregate's own emission, with the map and key spool still held.
+        const output = laneSpool();
+        for (const keys of handed.order) {
+          if (shouldCooperate()) yield COOPERATE;
+          const state = decodeBlockingAccs(
+            handed.states.get(distinctRowKey(keys))!,
+            plan.aggSpecs,
+            zone,
+          );
+          output.push([keys[0]!, ...state.accs.map((a) => finalizeAcc(a))]);
         }
-      }.bind(this);
-      const r = yield* store.foldScanMaskedSteps(b, visit);
-      rowCount = r.rowCount;
-      pages = r.nodes;
+        handed.states.close();
+        handed.order.close();
+        return { kind: "spool", rows: output, resources };
+      }
+      const srows = grouped
+        ? groups.map(({ key, accs }) => [key, ...accs.map((a) => finalizeAcc(a))])
+        : [whole.map((a) => finalizeAcc(a))];
+      charge.releaseAll();
+      if (bounded) {
+        // On a spill-capable host the groups leave as a spool, like the bounded-spill lane's own
+        // (memory.md §6.6.1): it spills where a row buffer would fail.
+        const output = laneSpool();
+        for (const r of srows) {
+          if (shouldCooperate()) yield COOPERATE;
+          output.push(r);
+        }
+        return { kind: "spool", rows: output, resources };
+      }
+      return { kind: "rows", rows: srows };
+    } catch (error) {
+      for (const resource of resources) resource.close();
+      throw error;
     }
+  }
 
-    // Charge the identical cost totals (unmetered lane — charge order is invisible): the scan block
-    // (pageRead × (nodes + chain pages); valueDecompress × slabs; storageRowRead × rowCount) and
-    // aggregateAccumulate once per (survivor × spec). The filter's operator_eval was charged per scanned
-    // row inside the walk.
-    meter.charge(
-      COSTS.pageRead * BigInt(pages + units.pages) +
-        COSTS.valueDecompress * BigInt(units.decompress) +
-        COSTS.storageRowRead * BigInt(rowCount),
-    );
-    meter.charge(COSTS.aggregateAccumulate * BigInt(nsurv) * BigInt(plan.aggSpecs.length));
+  // laneGroupHandover moves the lane's in-memory groups (in creation order) into the spill structures
+  // — exactly what the bounded-spill aggregate would hold after folding the same rows (memory.md
+  // §6.6.1): each group's state is put in the keyed state map, then its key row is pushed to the key
+  // spool.
+  private laneGroupHandover(
+    groups: { key: Value; accs: Acc[] }[],
+    resources: { close(): void }[],
+  ): { states: SpillMap; order: RowSpool } {
+    laneGroupHandovers.count++;
+    const budget = this.session.workMem;
+    const sink = this.spillSink!;
+    const states = new SpillMap(budget, sink, new StateCharge(this.session.queryAccount));
+    resources.push(states);
+    const order = new RowSpool(budget, sink, new StateCharge(this.session.queryAccount));
+    resources.push(order);
+    for (const g of groups) {
+      states.set(
+        distinctRowKey([g.key]),
+        encodeBlockingAccs([], g.accs),
+        keyBytes([g.key]),
+        packedStateBytes(g.accs),
+      );
+      order.push([g.key]);
+    }
+    return { states, order };
+  }
 
-    const srows = grouped
-      ? groups.map(({ key, accs }) => [key, ...accs.map((a) => finalizeAcc(a))])
-      : [whole.map((a) => finalizeAcc(a))];
-    charge.releaseAll();
-    return srows;
+  // laneSpoolEmitterSteps emits the bounded grouped lane's groups (memory.md §6.6.1): an ORDER BY
+  // runs the bounded-spill lane's own stage over them, and the output spool is emitted under the
+  // LIMIT/OFFSET window and stays charged until its emission completes, as that lane's is.
+  private *laneSpoolEmitterSteps(
+    plan: SelectPlan,
+    groups: RowSpool,
+    resources: { close(): void }[],
+    env: EvalEnv,
+    meter: Meter,
+  ): Steps<Emitter> {
+    let transferred = false;
+    try {
+      let rows = groups;
+      if (plan.order.length > 0) {
+        const spool = (): RowSpool => {
+          const out = new RowSpool(
+            this.session.workMem,
+            this.spillSink!,
+            new StateCharge(this.session.queryAccount),
+          );
+          resources.push(out);
+          return out;
+        };
+        rows = yield* this.blockingOrderSteps(plan, rows, env, meter, spool, resources);
+      }
+      const total = BigInt(rows.length);
+      const start = (plan.offset ?? 0n) < total ? (plan.offset ?? 0n) : total;
+      const remaining =
+        plan.limit !== null && plan.limit < total - start ? plan.limit : total - start;
+      const iterator = rows[Symbol.iterator]();
+      for (let i = 0n; i < start; i++) {
+        if (shouldCooperate()) yield COOPERATE;
+        iterator.next();
+      }
+      const sorted = {
+        next: (): Row | null => {
+          const next = iterator.next();
+          return next.done ? null : next.value;
+        },
+        close: (): void => {
+          iterator.return?.(undefined);
+          for (const resource of resources) resource.close();
+        },
+      };
+      transferred = true;
+      return {
+        rows: [],
+        start: 0,
+        end: Number(remaining),
+        mode: "sorted",
+        sorted,
+        sortedIdentity: false,
+        sortedFinal: false,
+      };
+    } catch (error) {
+      // The spill structures reserve without the meter in reach (memory.md §6.7).
+      if (error instanceof EngineError && error.state === "query_memory_limit_exceeded")
+        meter.guard();
+      throw error;
+    } finally {
+      if (!transferred) for (const resource of resources) resource.close();
+    }
+  }
+
+  // boundedWholeAggregate reports a whole-table aggregate over one file-backed base table — the shape
+  // the columnar lane keeps even where the statement is bounded-spill eligible (memory.md §5.4): its
+  // fold holds constant state.
+  private boundedWholeAggregate(plan: SelectPlan): boolean {
+    if (
+      plan.rels.length !== 1 ||
+      plan.groupSets.length !== 1 ||
+      plan.groupSets[0]!.keyCols.length !== 0
+    )
+      return false;
+    const rel = plan.rels[0]!;
+    if (rel.srf !== undefined || rel.derived !== undefined || rel.cte !== undefined) return false;
+    return this.lkpStoreScoped(rel.db, rel.tableName).isFileBacked();
+  }
+
+  // handoverGroupedAggregate reports whether the columnar lane may run a grouped plan on a
+  // spill-capable host, handing its group table over to the spill structures when it outgrows
+  // work_mem or the query-memory account turns a reservation away (memory.md §5.4): one grouping set
+  // with one key over one file-backed base table.
+  private handoverGroupedAggregate(plan: SelectPlan): boolean {
+    if (
+      plan.rels.length !== 1 ||
+      plan.groupSets.length !== 1 ||
+      plan.groupSets[0]!.keyCols.length !== 1
+    )
+      return false;
+    const rel = plan.rels[0]!;
+    if (rel.srf !== undefined || rel.derived !== undefined || rel.cte !== undefined) return false;
+    return this.lkpStoreScoped(rel.db, rel.tableName).isFileBacked();
   }
 
   private execCostedTwoRelationJoin(
@@ -27645,62 +27938,7 @@ export class Engine {
         if (plan.hasWindow) rows = yield* applyWindow(rows);
       }
       if (!plan.phys.joinPkOrdered && plan.order.length > 0) {
-        // Finish expression evaluation for every row before collation decoration can fail.
-        const extended = spool();
-        for (const original of rows) {
-          if (shouldCooperate()) yield COOPERATE;
-          const row = original.slice();
-          for (const expr of plan.orderExprs) {
-            if (shouldCooperate()) yield COOPERATE;
-            row.push(yield* evalExprSteps(expr, row, env, meter));
-          }
-          extended.push(row);
-        }
-        rows.close();
-        // Each sorter row carries every ORDER BY key appended: a collated text key as its sort-key
-        // bytes, any other key as a copy of its value.
-        const keyCount = plan.order.length;
-        const sorter = new SpoolSorter(
-          (a, b) => {
-            const base = a.length - keyCount;
-            for (let i = 0; i < keyCount; i++) {
-              const order = plan.order[i]!;
-              const cmp = keyCmp(a[base + i]!, b[base + i]!, order.descending, order.nullsFirst);
-              if (cmp !== 0) return cmp;
-            }
-            return 0;
-          },
-          budget,
-          sink,
-          new StateCharge(acct),
-        );
-        resources.push(sorter);
-        for (const row of extended) {
-          if (shouldCooperate()) yield COOPERATE;
-          const decorated = row.slice();
-          for (const order of plan.order) {
-            if (shouldCooperate()) yield COOPERATE;
-            const value = row[order.idx]!;
-            // Each key is charged as the sort receives the row, before its decoration (cost.md §3
-            // "sort_key / hash_key").
-            chargeSortKey(meter, value, order.collation);
-            decorated.push(
-              order.collation !== null && (value.kind === "text" || value.kind === "array")
-                ? byteaValue(collatedSortKey(order.collation, value)!)
-                : value,
-            );
-          }
-          sorter.push(decorated);
-        }
-        extended.close();
-        const sorted = sorter.finishSpool();
-        rows = spool();
-        for (const row of sorted) {
-          if (shouldCooperate()) yield COOPERATE;
-          rows.push(row);
-        }
-        sorted.close();
-        sorter.close(); // the sorted output was consumed (memory.md §6.4)
+        rows = yield* this.blockingOrderSteps(plan, rows, env, meter, spool, resources);
         if (selectActualRootNode(plan) !== "Sort")
           this.recordExplainActualParent("Sort", meter.accrued);
       }
@@ -27785,6 +28023,80 @@ export class Engine {
     }
   }
 
+  // blockingOrderSteps is the bounded-spill lane's ORDER BY stage: decorate every row with its
+  // order-expression values and order keys (memory.md §6.6 element shapes), sort, and return the
+  // sorted rows as a spool. `rows` is closed once it is read; the sorter and every spool it makes
+  // join `resources`. The bounded grouped columnar lane runs it over its groups (memory.md §6.6.1).
+  private *blockingOrderSteps(
+    plan: SelectPlan,
+    rows: RowSpool,
+    env: EvalEnv,
+    meter: Meter,
+    spool: () => RowSpool,
+    resources: { close(): void }[],
+  ): Steps<RowSpool> {
+    // Finish expression evaluation for every row before collation decoration can fail.
+    const budget = this.session.workMem;
+    const sink = this.spillSink!;
+    const acct = this.session.queryAccount;
+    const extended = spool();
+    for (const original of rows) {
+      if (shouldCooperate()) yield COOPERATE;
+      const row = original.slice();
+      for (const expr of plan.orderExprs) {
+        if (shouldCooperate()) yield COOPERATE;
+        row.push(yield* evalExprSteps(expr, row, env, meter));
+      }
+      extended.push(row);
+    }
+    rows.close();
+    // Each sorter row carries every ORDER BY key appended: a collated text key as its sort-key
+    // bytes, any other key as a copy of its value.
+    const keyCount = plan.order.length;
+    const sorter = new SpoolSorter(
+      (a, b) => {
+        const base = a.length - keyCount;
+        for (let i = 0; i < keyCount; i++) {
+          const order = plan.order[i]!;
+          const cmp = keyCmp(a[base + i]!, b[base + i]!, order.descending, order.nullsFirst);
+          if (cmp !== 0) return cmp;
+        }
+        return 0;
+      },
+      budget,
+      sink,
+      new StateCharge(acct),
+    );
+    resources.push(sorter);
+    for (const row of extended) {
+      if (shouldCooperate()) yield COOPERATE;
+      const decorated = row.slice();
+      for (const order of plan.order) {
+        if (shouldCooperate()) yield COOPERATE;
+        const value = row[order.idx]!;
+        // Each key is charged as the sort receives the row, before its decoration (cost.md §3
+        // "sort_key / hash_key").
+        chargeSortKey(meter, value, order.collation);
+        decorated.push(
+          order.collation !== null && (value.kind === "text" || value.kind === "array")
+            ? byteaValue(collatedSortKey(order.collation, value)!)
+            : value,
+        );
+      }
+      sorter.push(decorated);
+    }
+    extended.close();
+    const sorted = sorter.finishSpool();
+    rows = spool();
+    for (const row of sorted) {
+      if (shouldCooperate()) yield COOPERATE;
+      rows.push(row);
+    }
+    sorted.close();
+    sorter.close(); // the sorted output was consumed (memory.md §6.4)
+    return rows;
+  }
+
   // execSelectEmit runs a SelectPlan's blocking part and returns an Emitter describing how to emit its
   // output rows (spec/design/streaming.md §4, S4): the scan / join / WHERE / window / ORDER BY / GROUP
   // BY / DISTINCT all run here (charging their cost into meter), producing either a windowed buffer
@@ -27867,36 +28179,64 @@ export class Engine {
     params: Value[],
     fast: boolean,
   ): Steps<Emitter | null> {
-    // The packed whole-table fold already has one finite accumulator and no retained input.
-    // Keep that fast path when its touched-column gate proves it will not gather rows.
-    if (
+    // Vectorized single-table aggregate (the PAX/vectorization program's executor track): a
+    // SUM/COUNT/MIN/MAX/AVG with no DISTINCT / FILTER / HAVING / window, either whole-table or grouped
+    // by a single integer column, folds columnar / int64-bucketed instead of the row-at-a-time group
+    // machinery below (memory.md §5.4). The lane is taken where the statement is not bounded-spill
+    // eligible, for a whole-table fold over a file-backed table (one finite accumulator, no retained
+    // input), and for a grouped fold over a file-backed table, which hands its group table over to
+    // the spill structures (§6.6.1) — the only form that admits an ORDER BY. Results and accrued cost
+    // are byte-identical either way (the conformance corpus proves both). (An aggregate plan skips
+    // every streaming fast-path below — they all require !isAgg — so this front-position placement is
+    // only for clarity, mirroring the Go/Rust cores' ordering.)
+    const lane =
       fast &&
-      meter.isUnmetered() &&
       this.explainActualProfile === null &&
-      plan.groupKeys.length === 0 &&
-      this.vectorizedAggEligible(plan)
+      this.vectorizedAggEligible(plan) &&
+      (!this.boundedBlockingEligible(plan) ||
+        this.boundedWholeAggregate(plan) ||
+        this.handoverGroupedAggregate(plan)) &&
+      // Only the bounded grouped lane sorts its groups; every other shape with an ORDER BY keeps the
+      // general branch.
+      (plan.order.length === 0 ||
+        (this.boundedBlockingEligible(plan) && this.handoverGroupedAggregate(plan)));
+    if (lane && meter.isUnmetered())
+      return yield* this.execVectorizedAggSteps(plan, env, meter, params);
+    // Under a cost ceiling or lifetime budget (cost.md §6.1) the lane is an attempt: its result
+    // stands only if it finished cleanly with every ceiling still unreached, which is exactly when
+    // the row path would have completed with the same rows and cost. Anything else — an error, a
+    // tripped guard — is discarded and the general branch below runs from the start, so which error
+    // is raised, its text, and the cost it leaves accrued are the row path's. The attempt must be
+    // safe to discard. Its reservations are the lane's; a rejected attempt returns them, and the row
+    // path makes its own (memory.md §5.4). Cancellation keeps the row path, as on the unmetered lane.
+    if (
+      lane &&
+      meter.hasCeiling() &&
+      !hasCancellation() &&
+      !laneCeiling.off &&
+      guardPasses(meter) &&
+      (plan.filter === null || discardSafe(plan.filter)) &&
+      plan.orderExprs.every((e) => discardSafe(e))
     ) {
-      const store = this.lkpStoreScoped(plan.rels[0]!.db, plan.rels[0]!.tableName);
-      if (store.isFileBacked()) return yield* this.execVectorizedAggSteps(plan, env, meter, params);
+      const mark = meter.mark();
+      let accepted: Emitter | null = null;
+      try {
+        const attempt = yield* this.execVectorizedAggSteps(plan, env, meter, params);
+        if (guardPasses(meter)) accepted = attempt;
+        // Closed here, before the rewind, so the attempt's own releases run first.
+        else attempt.sorted?.close();
+      } catch (error) {
+        // Cancellation is best effort and reported at once, as on every path; a failure that is not
+        // a SQL error is an engine fault, never an outcome to replace.
+        if (!(error instanceof EngineError) || error.state === "query_canceled") throw error;
+      }
+      laneCeiling.attempts++;
+      if (accepted !== null) return accepted;
+      laneCeiling.fallbacks++;
+      meter.rewind(mark);
     }
     if (fast && this.boundedBlockingEligible(plan))
       return yield* this.execBoundedBlockingSteps(plan, env, meter, params);
-    // Vectorized single-table aggregate (the PAX/vectorization program's executor track): a
-    // SUM/COUNT/MIN/MAX/AVG with no DISTINCT / FILTER / HAVING / window / ORDER BY, either whole-table or
-    // grouped by a single integer column, folds columnar / int64-bucketed instead of the row-at-a-time
-    // group machinery below. Gated to the unmetered lane so a metered query's deterministic abort row
-    // stays the scalar path's; results and accrued cost are byte-identical either way (the conformance
-    // corpus proves both). Ineligible / metered ⇒ skipped and the general aggregate branch runs
-    // unchanged. (An aggregate plan skips every streaming fast-path below — they all require !isAgg — so
-    // this front-position placement is only for clarity, mirroring the Go/Rust cores' ordering.)
-    if (
-      fast &&
-      meter.isUnmetered() &&
-      this.explainActualProfile === null &&
-      this.vectorizedAggEligible(plan)
-    ) {
-      return yield* this.execVectorizedAggSteps(plan, env, meter, params);
-    }
 
     // Bounded streaming scan (spec/design/cost.md §3): a single-table query whose chosen access path
     // supplies its observable order stops row fetch/filter/project work at the LIMIT window. GIN/GiST
@@ -47511,6 +47851,92 @@ function packedStateBytes(accs: Acc[]): number {
     }
   }
   return n;
+}
+
+// accVariableBytes is the part of an accumulator's packed size that changes as it folds: a decimal
+// sum's digit groups, a MIN/MAX's held value. Every other accumulator the columnar lane folds packs
+// to a fixed size (memory.md §6.6.1).
+function accVariableBytes(a: Acc): number {
+  switch (a.plan) {
+    case "sumDecimal":
+    case "avg":
+      return valueBytes(decimalValue(a.sumDec)) - MEMORY_VALUE;
+    case "min":
+    case "max":
+      return a.cur === null || a.cur === undefined ? 0 : valueBytes(a.cur) - MEMORY_VALUE;
+    default:
+      return 0;
+  }
+}
+
+// discardSafe reports whether evaluating `e` leaves nothing behind, so a lane attempt that evaluated
+// it can be discarded and the statement run again on the row path (cost.md §6.1). A deliberate
+// allowlist, identical in every core: columns, constants, parameters, and the operators over them
+// that read no entropy, clock, sequence, host code or subquery and keep no per-node state. Anything
+// else — every function call, a regex (its compile is charged once per node) — is not safe, and such
+// a statement keeps the row path under a ceiling.
+export function discardSafe(e: RExpr): boolean {
+  switch (e.kind) {
+    case "column":
+    case "param":
+    case "constInt":
+    case "constBool":
+    case "constText":
+    case "constDecimal":
+    case "constFloat":
+    case "constBytea":
+    case "constUuid":
+    case "constTimestamp":
+    case "constTimestamptz":
+    case "constDate":
+    case "constInterval":
+    case "constNull":
+      return true;
+    case "not":
+    case "cast":
+    case "neg":
+    case "isNull":
+      return discardSafe(e.operand);
+    case "and":
+    case "or":
+    case "arith":
+    case "compare":
+    case "distinct":
+    case "like":
+      return discardSafe(e.lhs) && discardSafe(e.rhs);
+    case "case":
+      return (
+        e.arms.every((arm) => discardSafe(arm.cond) && discardSafe(arm.result)) &&
+        discardSafe(e.els)
+      );
+    case "coalesce":
+    case "greatestLeast":
+    case "nullIf":
+      return e.args.every((arg) => discardSafe(arg));
+    // A literal list only: a folded subquery's list carries that subquery's cost bookkeeping.
+    case "inValues":
+      return e.points === undefined && discardSafe(e.lhs);
+    default:
+      return false;
+  }
+}
+
+// guardPasses reports whether no cost ceiling has been reached; a cancellation still propagates.
+function guardPasses(meter: Meter): boolean {
+  try {
+    meter.guard();
+    return true;
+  } catch (error) {
+    if (!(error instanceof EngineError) || error.state === "query_canceled") throw error;
+    return false;
+  }
+}
+
+// accIsVariable reports whether spec's accumulator has an accVariableBytes part.
+function accIsVariable(spec: AggSpec): boolean {
+  return (
+    spec.plan === "sumDecimal" || spec.plan === "avg" || spec.plan === "min" || spec.plan === "max"
+  );
 }
 
 function blockingCollectionKey(group: string, ordinal: number): string {

@@ -303,7 +303,8 @@ EXPLAIN result construction.
 Every execution lane follows the same rules for the buffers it actually holds,
 and the lane choice is itself deterministic and mirrored across cores — so a
 threshold can depend on the lane (and thus on settings such as `max_cost`, which
-gates the vectorized lanes, or file versus in-memory backing, which gates the
+gates the columnar projection lane and makes the aggregate lane an attempt
+([cost.md](cost.md) §6.1), or file versus in-memory backing, which gates the
 bounded-spill lane) but never on the core.
 
 - A **streaming lane** that hands each row to the host as it is produced (the pull
@@ -318,12 +319,40 @@ bounded-spill lane) but never on the core.
   through the internal materialized path — each mirrored across cores.
 - The **columnar and vectorized lanes** charge their group rows and collected
   output as Q1 buffers; their gathered lanes and group tables are operator state
-  (§6.2, §6.5).
+  (§6.2, §6.5). The exception is a grouped aggregate on a spill-capable host, whose
+  group table is bounded and whose groups leave as a spool (§6.6.1).
 - The **streaming external sort** lane's input (the sorter's buffer or the
   collated survivor buffer) is sort state (§6.4).
 - The **bounded-spill lane** (file-backed aggregation, DISTINCT, and multi-way or
   hash joins) holds its rows in spools (§6.6); its window stage materializes its
   rows as a Q1 buffer while the window runs.
+
+**Which aggregates take the columnar aggregate lane.** The choice is part of this
+contract, because it decides what a statement reserves:
+
+- *Shape.* One base table under a full or primary-key-bounded scan; one grouping
+  set that is either `()` (whole-table) or a single bare integer column, with no
+  expression keys and no `GROUPING()`; every aggregate one of `count(*)`, `count`,
+  `sum`, `avg`, `min`, `max` over a bare column (`sum`/`avg` over an integer, decimal,
+  or float), with no `DISTINCT`, `FILTER`, or in-aggregate `ORDER BY`; no `HAVING`,
+  window, or `DISTINCT`.
+- *Unbounded form* (§6.2): the shape above with no `ORDER BY`, when the statement is
+  not eligible for the bounded-spill lane (an in-memory database, `work_mem = 0`),
+  or is whole-table on a file-backed table.
+- *Bounded form* (§6.6.1): the grouped shape over a file-backed table when the
+  statement is eligible for the bounded-spill lane, with or without an `ORDER BY`.
+- Anything else, and every shape while `EXPLAIN ANALYZE` profiles it, takes the eager
+  or bounded-spill lane.
+- Under a cost ceiling or lifetime budget the lane is an attempt that the row path
+  may replace ([cost.md](cost.md) §6.1): an accepted attempt keeps the lane's
+  reservations; a rejected one returns them all before the row path makes its own.
+
+**Open: cancellation in the TS core.** The TS core keeps the row path for every
+columnar lane whenever a cancellation check is installed, so that a worker's flag is
+observed at the row checkpoints; the Rust and Go cores poll inside the lanes instead.
+That is a lane choice the cores do not share, so with a query-memory budget and a
+cancellation check both present the TS core's thresholds differ. It predates the
+rules above and is not covered by the conformance harness, which installs no check.
 
 Q1 bounds row-buffer amplification — cross joins, set-returning functions,
 recursive CTE output, wide projections of large values, and materialized
@@ -478,6 +507,44 @@ positive `work_mem`. `work_mem = 0` (never spill) and every in-memory database k
 their structures resident, which charge everything they hold. A deliberately small
 budget can therefore turn a query into a long sequence of tiny spills; that costs
 scratch I/O and time, but no metered cost (spill.md §6) and no change in results.
+
+### 6.6.1 The bounded group table
+
+The columnar aggregate lane's grouped fold on a spill-capable host (§5.4) keeps its
+groups in an in-memory table that is **measured and charged as a resident keyed
+state map would be**, and that **hands over** to the real spill structures instead
+of failing.
+
+- *Measure.* Each group holds `ENTRY + key_bytes([key]) + key_bytes(state)`, where
+  `state` is the group state map's value shape of §6.6: `[int ordinal, composite(packed)
+  per aggregate]`. A new group reserves this for its fresh accumulators when it is
+  created, before its first fold. A fold that changes a packed size — a decimal
+  `sum`/`avg` gaining or losing digit groups, a `min`/`max` replacing its value —
+  reserves the growth or releases the shrinkage, after that fold.
+- *Hand-over.* After a surviving row has been folded into all of its aggregates, the
+  table hands over if its resident bytes **exceed `work_mem`** or **any reservation
+  made for that row was rejected** (a rejected reservation is not charged). It returns
+  its whole charge, then moves every group, in creation order, into a new keyed state
+  map and a new key spool: the group's `[ordinal, packed…]` state is put in the map,
+  then its key row `[key]` is pushed to the spool. Both follow §6.6 from their first
+  element, so either may spill at once.
+- *After a hand-over* the same scan continues with the bounded-spill aggregate's
+  per-row step: get the group's state from the map (a new group takes a fresh state
+  whose ordinal is the key spool's length, and pushes its key row then), fold each
+  aggregate, put the state back. There is no relation spool and no `WHERE` spool.
+- *Finish, no hand-over.* Every group is finalized into its group row; the table's
+  charge is returned; then the rows are pushed, in creation order, into an output
+  spool.
+- *Finish, after a hand-over.* The key spool is read in order; each group's state is
+  fetched and finalized and its row pushed to an output spool, while the map and the
+  key spool are still held — the bounded-spill aggregate's own emission.
+- *`ORDER BY`.* The output spool then takes the bounded-spill lane's `ORDER BY`
+  stage unchanged (decorated rows, sorter, sorted spool — §6.4, §6.6).
+
+The output spool (sorted or not) is the lane's final output spool: it is emitted
+under the `LIMIT`/`OFFSET` window and released when emission completes, as the
+bounded-spill lane's is. No group row is a Q1 buffer row, so nothing in this form
+fails `54P05`.
 
 ### 6.7 Cost wins
 

@@ -3633,3 +3633,174 @@ setup_sql = [
   "INSERT INTO tdesc SELECT g, CASE WHEN g % 1000 = 0 THEN NULL ELSE (g * 7919) % 100003 END FROM generate_series(1, 100000) AS g",
   "CREATE INDEX tdesc_score ON tdesc (score DESC)"
 ]
+
+# Exact-decimal scans and aggregates (spec/design/decimal.md; packed-leaf.md §11 Track A5). A
+# 200k-row scratch ledger: two numeric(12,2) money columns (amount up to 999999.99, fee up to 99.99),
+# a bigint quantity, and two integer grouping columns (50 regions, 5000 accounts). The lanes cover
+# what a money column is asked for: a whole-table SUM and AVG, SUM over bigint (whose result is
+# numeric), a filter on a decimal, arithmetic between decimals, grouping into few and many groups,
+# and a top-N by a decimal. A decimal result is cast to text, since the harness checksum renders
+# only NULL, integers, and text (benchmarks.md §6) and jed and PostgreSQL print a numeric alike.
+# The grouped lanes fold their groups under an outer aggregate so the inner GROUP BY needs no
+# ORDER BY — the shape jed's columnar grouped lane takes; `decimal_group_by_ordered` is the same
+# grouping returned in order. The top-N aliases its cast output: PostgreSQL names `amount::text`
+# after the column, so an unaliased `ORDER BY amount` would sort the text there and the number in
+# jed (grammar.md §8). jed and PostgreSQL only: SQLite has no exact decimal.
+
+[[bench]]
+name = "decimal_sum_scan"
+description = "Whole-table count + SUM over a numeric(12,2) column, 200k rows"
+dataset = "scratch"
+kind = "query"
+engines = ["jed", "postgres"]
+sql = "SELECT count(*), sum(amount)::text FROM ledger"
+warmup = 5
+iterations = 50
+seed = 4310
+expect_rows_per_iter = 1
+setup_sql = [
+  "DROP TABLE IF EXISTS ledger",
+  "CREATE TABLE ledger (id bigint PRIMARY KEY, account integer, region integer, qty bigint, amount numeric(12,2), fee numeric(12,2))",
+  "INSERT INTO ledger SELECT g, ((g::bigint * 7919) % 5000)::integer, (g % 50)::integer, (g::bigint * 104729) % 1000000, ((g::bigint * 7919) % 100000000)::numeric / 100, ((g::bigint * 104729) % 10000)::numeric / 100 FROM generate_series(1, 200000) AS g"
+]
+
+[[bench]]
+name = "decimal_sum_bigint"
+description = "Whole-table SUM over a bigint column, 200k rows — the result is numeric, so the fold is a decimal accumulator"
+dataset = "scratch"
+kind = "query"
+engines = ["jed", "postgres"]
+sql = "SELECT sum(qty)::text FROM ledger"
+warmup = 5
+iterations = 50
+seed = 4311
+expect_rows_per_iter = 1
+setup_sql = [
+  "DROP TABLE IF EXISTS ledger",
+  "CREATE TABLE ledger (id bigint PRIMARY KEY, account integer, region integer, qty bigint, amount numeric(12,2), fee numeric(12,2))",
+  "INSERT INTO ledger SELECT g, ((g::bigint * 7919) % 5000)::integer, (g % 50)::integer, (g::bigint * 104729) % 1000000, ((g::bigint * 7919) % 100000000)::numeric / 100, ((g::bigint * 104729) % 10000)::numeric / 100 FROM generate_series(1, 200000) AS g"
+]
+
+[[bench]]
+name = "decimal_avg_scan"
+description = "Whole-table AVG over a numeric(12,2) column, 200k rows"
+dataset = "scratch"
+kind = "query"
+engines = ["jed", "postgres"]
+sql = "SELECT avg(amount)::text FROM ledger"
+warmup = 5
+iterations = 50
+seed = 4312
+expect_rows_per_iter = 1
+setup_sql = [
+  "DROP TABLE IF EXISTS ledger",
+  "CREATE TABLE ledger (id bigint PRIMARY KEY, account integer, region integer, qty bigint, amount numeric(12,2), fee numeric(12,2))",
+  "INSERT INTO ledger SELECT g, ((g::bigint * 7919) % 5000)::integer, (g % 50)::integer, (g::bigint * 104729) % 1000000, ((g::bigint * 7919) % 100000000)::numeric / 100, ((g::bigint * 104729) % 10000)::numeric / 100 FROM generate_series(1, 200000) AS g"
+]
+
+[[bench]]
+name = "decimal_filter_scan"
+description = "Count + MAX over a numeric(12,2) column behind a filter on it (amount > $1), 200k rows"
+dataset = "scratch"
+kind = "query"
+engines = ["jed", "postgres"]
+sql = "SELECT count(*), max(amount)::text FROM ledger WHERE amount > $1::bigint"
+warmup = 5
+iterations = 50
+seed = 4313
+expect_rows_per_iter = 1
+setup_sql = [
+  "DROP TABLE IF EXISTS ledger",
+  "CREATE TABLE ledger (id bigint PRIMARY KEY, account integer, region integer, qty bigint, amount numeric(12,2), fee numeric(12,2))",
+  "INSERT INTO ledger SELECT g, ((g::bigint * 7919) % 5000)::integer, (g % 50)::integer, (g::bigint * 104729) % 1000000, ((g::bigint * 7919) % 100000000)::numeric / 100, ((g::bigint * 104729) % 10000)::numeric / 100 FROM generate_series(1, 200000) AS g"
+]
+
+[[bench.param]]
+gen = "int_uniform"
+min = 0
+max = 999999
+
+[[bench]]
+name = "decimal_arith_scan"
+description = "SUM of a decimal product and a decimal sum per row (amount * fee, amount + fee), 200k rows"
+dataset = "scratch"
+kind = "query"
+engines = ["jed", "postgres"]
+sql = "SELECT sum(amount * fee)::text, sum(amount + fee)::text FROM ledger"
+warmup = 5
+iterations = 50
+seed = 4314
+expect_rows_per_iter = 1
+setup_sql = [
+  "DROP TABLE IF EXISTS ledger",
+  "CREATE TABLE ledger (id bigint PRIMARY KEY, account integer, region integer, qty bigint, amount numeric(12,2), fee numeric(12,2))",
+  "INSERT INTO ledger SELECT g, ((g::bigint * 7919) % 5000)::integer, (g % 50)::integer, (g::bigint * 104729) % 1000000, ((g::bigint * 7919) % 100000000)::numeric / 100, ((g::bigint * 104729) % 10000)::numeric / 100 FROM generate_series(1, 200000) AS g"
+]
+
+[[bench]]
+name = "decimal_group_by"
+description = "GROUP BY an integer column into 50 groups with count, SUM and MAX over numeric columns, 200k rows; the groups folded by an outer aggregate"
+dataset = "scratch"
+kind = "query"
+engines = ["jed", "postgres"]
+sql = "SELECT count(*), sum(g.n)::bigint, sum(g.t)::text, sum(g.m)::text FROM (SELECT region, count(*) AS n, sum(amount) AS t, max(fee) AS m FROM ledger GROUP BY region) g"
+warmup = 5
+iterations = 50
+seed = 4315
+expect_rows_per_iter = 1
+setup_sql = [
+  "DROP TABLE IF EXISTS ledger",
+  "CREATE TABLE ledger (id bigint PRIMARY KEY, account integer, region integer, qty bigint, amount numeric(12,2), fee numeric(12,2))",
+  "INSERT INTO ledger SELECT g, ((g::bigint * 7919) % 5000)::integer, (g % 50)::integer, (g::bigint * 104729) % 1000000, ((g::bigint * 7919) % 100000000)::numeric / 100, ((g::bigint * 104729) % 10000)::numeric / 100 FROM generate_series(1, 200000) AS g"
+]
+
+[[bench]]
+name = "decimal_group_by_high_card"
+description = "GROUP BY an integer column into 5000 groups with count and SUM over a numeric column, 200k rows; the groups folded by an outer aggregate"
+dataset = "scratch"
+kind = "query"
+engines = ["jed", "postgres"]
+sql = "SELECT count(*), sum(g.n)::bigint, sum(g.t)::text FROM (SELECT account, count(*) AS n, sum(amount) AS t FROM ledger GROUP BY account) g"
+warmup = 5
+iterations = 50
+seed = 4316
+expect_rows_per_iter = 1
+setup_sql = [
+  "DROP TABLE IF EXISTS ledger",
+  "CREATE TABLE ledger (id bigint PRIMARY KEY, account integer, region integer, qty bigint, amount numeric(12,2), fee numeric(12,2))",
+  "INSERT INTO ledger SELECT g, ((g::bigint * 7919) % 5000)::integer, (g % 50)::integer, (g::bigint * 104729) % 1000000, ((g::bigint * 7919) % 100000000)::numeric / 100, ((g::bigint * 104729) % 10000)::numeric / 100 FROM generate_series(1, 200000) AS g"
+]
+
+[[bench]]
+name = "decimal_group_by_ordered"
+description = "GROUP BY an integer column into 50 groups with count and SUM over a numeric column, returned in key order, 200k rows"
+dataset = "scratch"
+kind = "query"
+engines = ["jed", "postgres"]
+sql = "SELECT region, count(*), sum(amount)::text FROM ledger GROUP BY region ORDER BY region"
+warmup = 5
+iterations = 50
+seed = 4317
+expect_rows_per_iter = 50
+setup_sql = [
+  "DROP TABLE IF EXISTS ledger",
+  "CREATE TABLE ledger (id bigint PRIMARY KEY, account integer, region integer, qty bigint, amount numeric(12,2), fee numeric(12,2))",
+  "INSERT INTO ledger SELECT g, ((g::bigint * 7919) % 5000)::integer, (g % 50)::integer, (g::bigint * 104729) % 1000000, ((g::bigint * 7919) % 100000000)::numeric / 100, ((g::bigint * 104729) % 10000)::numeric / 100 FROM generate_series(1, 200000) AS g"
+]
+
+[[bench]]
+name = "decimal_order_by_limit"
+description = "Top-100 by a numeric(12,2) column over 200k rows"
+dataset = "scratch"
+kind = "query"
+engines = ["jed", "postgres"]
+sql = "SELECT id, amount::text AS amount_text FROM ledger ORDER BY amount DESC, id ASC LIMIT 100"
+warmup = 5
+iterations = 50
+seed = 4318
+expect_rows_per_iter = 100
+setup_sql = [
+  "DROP TABLE IF EXISTS ledger",
+  "CREATE TABLE ledger (id bigint PRIMARY KEY, account integer, region integer, qty bigint, amount numeric(12,2), fee numeric(12,2))",
+  "INSERT INTO ledger SELECT g, ((g::bigint * 7919) % 5000)::integer, (g % 50)::integer, (g::bigint * 104729) % 1000000, ((g::bigint * 7919) % 100000000)::numeric / 100, ((g::bigint * 104729) % 10000)::numeric / 100 FROM generate_series(1, 200000) AS g"
+]
