@@ -512,7 +512,8 @@ func leafSizesOf(shape leafShape, rows []storedRow, items [][]dictItem, tabs []*
 		tabs:  tabs,
 		coded: train || tabs != nil,
 	}
-	if tabs == nil && train {
+	// With per-column tables a leaf trains its own only when it overflows under those (buildLeaf).
+	if tabs == nil && train && !leafSymCol {
 		sz.tabs, _ = trainTabs(shape, items, nil)
 	}
 	for j, fc := range shape.forCols {

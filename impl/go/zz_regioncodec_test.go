@@ -1364,15 +1364,21 @@ func TestRegionEngineExperiment(t *testing.T) {
 		}
 		phase := func(label string, ops int, f func()) {
 			l0, r0, c0, e0, n0 := symStats.leaves.Load(), symStats.rows.Load(), symStats.codedLeaves.Load(), symStats.encBytes.Load(), symStats.lenBytes.Load()
+			t0, fw, fk, fs := symStats.trains.Load(), symStats.fallbackWon.Load(), symStats.fallbackKept.Load(), symStats.fallbackSkipped.Load()
+			defer func() {
+				fmt.Printf("  %-96s tables trained %d, fallback %d won / %d kept / %d skipped\n", "  "+label, symStats.trains.Load()-t0,
+					symStats.fallbackWon.Load()-fw, symStats.fallbackKept.Load()-fk, symStats.fallbackSkipped.Load()-fs)
+			}()
 			f()
 			o := float64(ops)
 			fmt.Printf("  %-96s per op: %.2f leaves encoded (%.2f coded), %.0f rows, %.0f B coded to write, %.0f B coded to measure\n", "  "+label,
 				float64(symStats.leaves.Load()-l0)/o, float64(symStats.codedLeaves.Load()-c0)/o, float64(symStats.rows.Load()-r0)/o,
 				float64(symStats.encBytes.Load()-e0)/o, float64(symStats.lenBytes.Load()-n0)/o)
 		}
-		_ = phase
 		w0 := expWchar()
-		point("update 1 row/commit: activity.title", "UPDATE activity SET title = 'changed title text' WHERE id = $1", 2000, func() int64 { return 1 + r.Int63n(nAct) })
+		phase("update", 4000, func() {
+			point("update 1 row/commit: activity.title", "UPDATE activity SET title = 'changed title text' WHERE id = $1", 2000, func() int64 { return 1 + r.Int63n(nAct) })
+		})
 		fmt.Printf("  %-96s %9d\n", "  bytes written per update commit", (expWchar()-w0)/4000)
 		next := nAct
 		w0 = expWchar()
@@ -1739,4 +1745,114 @@ func TestColumnSymbolTablesSurviveChange(t *testing.T) {
 	}
 	check("after reopen")
 	_ = want
+}
+
+// TestSymDriftExperiment measures symbol tables on a column whose content changes after the
+// per-column table was trained. One table, one text column: design-document prose first (the column
+// table is trained on it), then lines of Go source, then synthetic access-log lines, each appended
+// in key order, and last a tenth of the prose rows rewritten in place as log lines. It reports the
+// compacted file after each phase and the time each took.
+//
+//	JED_FORMAT_EXP=1 JED_LEAF_NARROW=on ... JED_LEAF_SYM=on|column|hybrid go test -count=1 -run TestSymDriftExperiment -v .
+func TestSymDriftExperiment(t *testing.T) {
+	if os.Getenv("JED_FORMAT_EXP") == "" {
+		t.Skip("set JED_FORMAT_EXP=1")
+	}
+	dir := os.Getenv("JED_FORMAT_EXP_DIR")
+	if dir == "" {
+		dir = t.TempDir()
+	}
+	path := filepath.Join(dir, "drift.jed")
+	os.Remove(path)
+	os.RemoveAll(path + ".lock")
+	db, err := CreateDatabase(CreateOptions{Path: path, SkipFsync: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	s := db.Session(SessionOptions{})
+	defer s.Close()
+	expExec(t, s, "CREATE TABLE log (id i64 PRIMARY KEY, body text NOT NULL)")
+
+	prose, _ := expProse(t)
+	var code []string
+	files, _ := filepath.Glob("*.go")
+	sort.Strings(files)
+	for _, f := range files {
+		b, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, ln := range strings.Split(string(b), "\n") {
+			ln = strings.TrimSpace(ln)
+			if len(ln) < 24 || len(ln) > 160 || strings.HasPrefix(ln, "//") || strings.ContainsAny(ln, "'\\\x00") {
+				continue
+			}
+			code = append(code, ln)
+		}
+	}
+	r := rand.New(rand.NewSource(11))
+	logLine := func() string {
+		return fmt.Sprintf("2026-11-%02dT%02d:%02d:%02d.%03dZ level=%s req=%016x method=%s path=/api/v%d/%s/%d status=%d bytes=%d dur_ms=%d",
+			1+r.Intn(28), r.Intn(24), r.Intn(60), r.Intn(60), r.Intn(1000),
+			[]string{"info", "info", "info", "warn", "error"}[r.Intn(5)], r.Uint64(),
+			[]string{"GET", "GET", "POST", "PUT", "DELETE"}[r.Intn(5)], 1+r.Intn(3),
+			[]string{"orders", "customers", "sessions", "invoices", "items"}[r.Intn(5)], r.Intn(1000000),
+			[]int{200, 200, 200, 201, 204, 400, 404, 500}[r.Intn(8)], r.Intn(200000), r.Intn(5000))
+	}
+	rows := expScale(120000)
+	next := 0
+	compacted := func() float64 {
+		if err := db.Compact("main"); err != nil {
+			t.Fatal(err)
+		}
+		st, _ := os.Stat(path)
+		return float64(st.Size()) / (1 << 20)
+	}
+	var last float64
+	phase := func(label string, raw *int, f func()) {
+		*raw = 0
+		t0, w0, k0, tr0, sk0 := time.Now(), symStats.fallbackWon.Load(), symStats.fallbackKept.Load(), symStats.trains.Load(), symStats.fallbackSkipped.Load()
+		f()
+		d := time.Since(t0)
+		size := compacted()
+		fmt.Printf("  %-28s %6.1f MB of text, file +%6.2f MB = %6.2f MB, %5.1f s, %d tables trained, fallback %d won / %d kept / %d skipped\n", label,
+			float64(*raw)/(1<<20), size-last, size, d.Seconds(), symStats.trains.Load()-tr0, symStats.fallbackWon.Load()-w0, symStats.fallbackKept.Load()-k0, symStats.fallbackSkipped.Load()-sk0)
+		last = size
+	}
+	raw := 0
+	appendRows := func(src func() string) func() {
+		return func() {
+			expInsert(t, s, "log", rows, 200, func(_ int, b *strings.Builder) {
+				next++
+				v := src()
+				raw += len(v)
+				fmt.Fprintf(b, "%d, '%s'", next, v)
+			})
+		}
+	}
+	phase("append prose", &raw, appendRows(func() string { return prose[r.Intn(len(prose))] }))
+	phase("append Go source", &raw, appendRows(func() string { return code[r.Intn(len(code))] }))
+	phase("append access log", &raw, appendRows(logLine))
+	phase("rewrite 10% of prose as log", &raw, func() {
+		p, err := s.Prepare("UPDATE log SET body = $2 WHERE id = $1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i := 0; i < rows/10; i++ {
+			v := logLine()
+			raw += len(v)
+			if _, err := prepOutcome(s, p, []Value{IntValue(1 + r.Int63n(int64(rows))), TextValue(v)}); err != nil {
+				t.Fatal(err)
+			}
+		}
+	})
+	o, err := queryOutcome(s, "SELECT count(*), sum(length(body)), count(*) FILTER (WHERE body LIKE '%status=200%') FROM log", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fmt.Printf("  check: %v\n", o.Rows)
+	if rep, err := db.IntegrityCheck(context.Background(), "main", IntegrityCheckOptions{}); err != nil || !rep.OK() {
+		t.Fatalf("integrity: %v %v", err, rep.Findings)
+	}
 }

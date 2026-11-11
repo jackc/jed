@@ -32,7 +32,7 @@ import (
 // and written under that same table, and a split hands it to the halves. Under a fixed table the
 // region's size is a sum over its values, which is what split planning needs. A leaf that fits
 // without the table is written without it.
-var leafSym = os.Getenv("JED_LEAF_SYM") == "on" && leafNarrow
+var leafSym = (os.Getenv("JED_LEAF_SYM") == "on" || os.Getenv("JED_LEAF_SYM") == "hybrid") && leafNarrow
 
 // leafSymCol (JED_LEAF_SYM=column, with JED_LEAF_NARROW=on) keeps one symbol table per column of a
 // table instead of one per leaf. The table is trained once, when the table's tree first has
@@ -43,7 +43,16 @@ var leafSym = os.Getenv("JED_LEAF_SYM") == "on" && leafNarrow
 // size is a function of its rows and its table's tables. As with per-leaf tables, a leaf that fits
 // as plain regions is written plain: an append rewrites its half-empty last leaf at every commit,
 // and coding it then buys no page.
-var leafSymCol = os.Getenv("JED_LEAF_SYM") == "column" && leafNarrow
+var leafSymCol = (os.Getenv("JED_LEAF_SYM") == "column" || os.Getenv("JED_LEAF_SYM") == "hybrid") && leafNarrow
+
+// leafSymHybrid (JED_LEAF_SYM=hybrid) is per-column tables with a per-leaf fallback. A leaf that does
+// not fit as plain regions is coded with the column tables, as in column mode. When it does not fit
+// under those either, a table is trained from the leaf's own rows for each column, and a column
+// keeps it (in the leaf, as a regionSym region) only where it saves more than the column's table
+// does, table bytes included. So rows unlike the ones the column tables were trained on cost a
+// training at the leaf's overflow instead of an early split. Before the column tables exist every
+// column falls back, which is per-leaf mode.
+var leafSymHybrid = leafSym && leafSymCol
 
 var (
 	symColLeaves = envInt("JED_LEAF_SYM_COL_LEAVES", 32)
@@ -79,6 +88,9 @@ var symStats struct {
 	// leaf encodes: leaves, their rows, those written with a symbol-table region, and the payload
 	// bytes coded for writing (enc) and for measuring (len).
 	leaves, rows, codedLeaves, encBytes, lenBytes atomic.Int64
+	// hybrid mode: columns of an overflowing leaf where the leaf's own table won, and where the
+	// column's table stayed.
+	fallbackWon, fallbackKept, fallbackSkipped atomic.Int64
 }
 
 // symTable is one column's symbol table. Immutable once built.
@@ -727,7 +739,7 @@ func itemSaving(shape leafShape, j, n int, f colFacts, tb *symTable, coded bool)
 	if shape.itemDict[j] {
 		s = dictSaving(n, f.d, f.dup)
 	}
-	if coded && shape.itemTab[j] != nil {
+	if tb == nil && coded && shape.itemTab[j] != nil {
 		// A per-column table: no table bytes in the leaf.
 		if t := f.gain - (n+7)/8; t > s {
 			s = t
@@ -783,10 +795,50 @@ func trainTabs(shape leafShape, items [][]dictItem, prior []*symTable) (tabs []*
 				continue
 			}
 		}
-		tabs[c] = trainSym(payloads, false)
+		header, col, colGain := inlineHeaderLen(shape.colTypes[c]), shape.itemTab[j], 0
+		if leafSymHybrid && col != nil {
+			for _, p := range payloads {
+				colGain += header + len(p) - col.encLen(p)
+			}
+			if colGain*100 >= total*symFallbackPct {
+				symStats.fallbackSkipped.Add(1)
+				continue // the column's table still fits these rows: no training
+			}
+		}
+		tb := trainSym(payloads, false)
+		if leafSymHybrid {
+			if !leafTabWins(len(items), header, payloads, tb, col, colGain) {
+				symStats.fallbackKept.Add(1)
+				continue // the column's table stays
+			}
+			symStats.fallbackWon.Add(1)
+		}
+		tabs[c] = tb
 		changed = true
 	}
 	return tabs, changed
+}
+
+// symFallbackPct (JED_LEAF_SYM_FALLBACK_PCT) is the share of a column's payload, in percent, that
+// its per-column table must save in an overflowing leaf for the leaf not to train its own (hybrid
+// mode). 0 never trains; above 100 always does.
+var symFallbackPct = envInt("JED_LEAF_SYM_FALLBACK_PCT", 30)
+
+// leafTabWins reports whether a table trained on a leaf's own values (leaf) saves more over them than
+// the column's table (col, whose gain over them is colGain) does: the leaf's carries its bytes in
+// the region, the column's does not.
+func leafTabWins(n, header int, payloads [][]byte, leaf, col *symTable, colGain int) bool {
+	if len(leaf.syms) == 0 {
+		return false
+	}
+	if col == nil {
+		return true
+	}
+	leafGain := 0
+	for _, p := range payloads {
+		leafGain += header + len(p) - leaf.encLen(p)
+	}
+	return symSaving(n, leafGain, leaf) > colGain-(n+7)/8
 }
 
 // tabFor is column c's table, or nil when the leaf has none or training found no symbol.

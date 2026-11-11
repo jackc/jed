@@ -659,9 +659,9 @@ train.
 
 **Open points.**
 
-- **Drift.** A table is trained once from the first rows and never replaced. Nothing here measures
-  data that changes, and replacing a table means versions (old pages keep the old table) or a
-  rewrite.
+- **Drift.** A table is trained once from the first rows and never replaced. On rows unlike those
+  it can save nothing; §10.2 measures this and adds a per-leaf fallback. Replacing a table would
+  mean versions (old pages keep the old table) or a rewrite, and is not tried.
 - **A reader of the working store holding column types from before the training** cannot decode a
   leaf written after it. A committed snapshot never reaches such a leaf; a cursor opened in the
   training transaction before the training and read after a commit could. Not constructed or
@@ -674,6 +674,85 @@ train.
 - The Ruby reference and `verify.rb` do not know the chain. The simulation's image checks passed,
   which may only mean its tables did not train.
 - A chain is one more read at open per trained table.
+
+### 10.2 Per-leaf fallback for rows the column table does not fit (prototyped)
+
+`JED_LEAF_SYM=hybrid` is §10.1 with one addition. A leaf that does not fit as plain regions is
+coded with the column tables, as before. When it does not fit under those either, each
+symbol-table column whose column table saves less than 30% of the column's payload in that leaf
+(`JED_LEAF_SYM_FALLBACK_PCT`) trains a table from the leaf's own rows, and keeps it where it saves
+more than the column table does, its own bytes included. That column is then a §10 region
+(`regionSym`, table in the leaf); the leaf's other columns stay `regionSymCol`. Both region kinds
+already existed, so the page format is unchanged. A split hands the leaf's tables to the halves,
+and a leaf that loses a row keeps them. Before the column tables exist every column falls back,
+which is per-leaf mode.
+
+**Drift, measured** (`TestSymDriftExperiment`): one table with one `text` column. 120,000 lines of
+design-document prose are appended first, which trains the column table; then 120,000 lines of Go
+source; then 120,000 synthetic access-log lines; then 12,000 random prose rows are rewritten as log
+lines, one per commit. Compacted file growth per phase, 8 KiB pages, steps 1–7 and 9 on:
+
+| phase (text added) | no symbol tables | per leaf | per column | hybrid |
+|---|---|---|---|---|
+| prose (9.8 MB) | 10.41 MB | 7.04 MB | 6.47 MB | 6.38 MB |
+| Go source (5.5 MB) | 6.10 MB | 4.27 MB | 4.90 MB | 4.25 MB |
+| access log (15.0 MB) | 15.71 MB | 6.68 MB | 15.71 MB | 6.68 MB |
+| 10% of prose rewritten as log (1.5 MB) | 10.45 MB | 7.07 MB | 6.24 MB | 6.44 MB |
+| file at the end | 42.68 MB | 25.06 MB | 33.32 MB | 23.75 MB |
+| time: prose / source / log / rewrite | 0.5 / 0.4 / 0.5 / 2.5 s | 1.5 / 1.1 / 1.4 / 4.3 s | 0.8 / 0.6 / 0.9 / 2.7 s | 0.9 / 1.3 / 1.6 / 2.6 s |
+| tables trained | | 4,751 | 2 (one of each kind) | 1,866 |
+
+- **A column table trained on prose saves nothing on the log lines** (15.71 MB, the same as with no
+  symbol tables) and a fifth on Go source, where a per-leaf table saves 30%. This is the drift
+  cost: 8.3 MB of the 33.3 MB file.
+- **The fallback recovers all of it**: each phase is as small as the better of the two pure modes,
+  and the file is 5% smaller than per-leaf and 29% smaller than per-column.
+- **The cost is one training per overflowing leaf whose rows the column table fits badly**, about
+  1 ms each: 0.6 to 0.7 s over column mode on each drifted phase, and nothing on the prose phase
+  (778 of 817 overflows skipped by the 30% rule, 39 trained before the column table existed).
+  Without the rule every overflow trains, which doubled the prose phase for the same file.
+- The rewrite phase grows the file by several times the text added in every configuration: the
+  rewritten rows are longer, so full leaves split, and compaction keeps tree nodes as they are.
+
+**On the load experiment** (§10.1's data, where rows match the tables) hybrid changes little:
+
+| | per column | hybrid |
+|---|---|---|
+| compacted file | 109.3 MB | 109.3 MB |
+| tables trained | 34 | 627 (0.1 to 0.2 s) |
+| bulk load | 53.8 + 7.9, 54.8 + 7.8 s | 53.7 + 8.0, 54.2 + 8.0 s |
+| one-row update commit | 448, 453 µs | 426, 466 µs |
+| one-row append commit | 476, 471 µs | 464, 416 µs |
+
+The ten aggregate queries return the same values. The runs alternate column, hybrid.
+
+**The 30% rule misses one case.** The append test's tail leaf still holds 295 rows against 415
+with the rule off (and 406 in per-leaf mode): its identical rows are coded tolerably by the column
+table and far better by a table of their own. With the rule off that append costs 516 µs against
+431 µs, because the denser leaf re-encodes more rows per commit. The rule trades that density for
+not training where the column table is adequate; a rule that estimates a leaf table's gain without
+training it is not tried.
+
+**A bug found on the way.** A delete from a leaf read from a page built a new node without the
+leaf's own tables. Per-leaf mode trains again when it measures such a leaf; hybrid trains only at an
+overflow, so the leaf was measured as fitting and then failed to serialize (`0A000`). A leaf that
+shrinks now keeps its tables (in hybrid mode only, so per-leaf mode is unchanged).
+
+**What was run**, Go core, steps 1–7 and 9 on with `JED_LEAF_SYM=hybrid`: the unit tests, which fail
+39, every one also failing in per-leaf mode (33) or per-column mode (36), all shape, cost or golden
+pins; `TestColumnSymbolTablesSurviveChange`; `mise run sim:sweep 1..100 all go` (2,200 traces pass); the
+corpus in memory mode, which fails 24 of 752 files, the count in per-column mode (the file lists
+were not compared). The disk-mode corpus was not reached.
+
+**Open points.**
+
+- The threshold is a fixed share, chosen from one sweep (15% leaves Go source to the column table;
+  45% trains everywhere).
+- A leaf's own table is never retrained by default, as in §10, and a merge of two leaves drops
+  them: the merged leaf trains again only if it overflows.
+- A column that falls back in most leaves is a sign the column table should be replaced; nothing
+  counts that.
+- Everything open in §10 and §10.1 still applies.
 
 ## 11. Step 9: typed integer arrays (prototyped)
 

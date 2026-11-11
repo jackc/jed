@@ -562,7 +562,8 @@ func (n *pnode) leafTabs(pcap pageCap, shape leafShape) []*symTable {
 	if n.sizes != nil && n.sizes.n == len(n.vals) && n.sizes.tabs != nil {
 		return n.sizes.tabs
 	}
-	if n.symTabs != nil {
+	if n.symTabs != nil || leafSymCol {
+		// With per-column tables a leaf has its own only from an overflow (buildLeaf).
 		return n.symTabs
 	}
 	return newLeafSizes(shape, pcap, n.keys, n.vals, nil, true).tabs
@@ -1486,7 +1487,7 @@ func buildLeaf(keys [][]byte, vals []storedRow, weights []uint32, cap pageCap, s
 		// (trainTabs); the others keep their tables into the split.
 		items = allRowItems(shape, cap, keys, vals)
 		sz = leafSizesOf(shape, vals, items, prior, prior == nil)
-		if prior != nil && shape.hasSym && payload-sz.saving(shape, true) > cap.c {
+		if (prior != nil || leafSymHybrid) && shape.hasSym && payload-sz.saving(shape, true) > cap.c {
 			if fresh, changed := trainTabs(shape, items, prior); changed {
 				sz = leafSizesOf(shape, vals, items, fresh, false)
 			}
@@ -1756,7 +1757,13 @@ func nodeRemove(n *pnode, key []byte, generation *mutationGeneration, src leafSo
 		}
 		vals, removed := removeValAtMutable(rows, i)
 		origin, _ := originOf(n)
-		return &pnode{keys: removeKeyAtMutable(keys, i), vals: vals, weights: removeWeightAtMutable(weights, i), owner: generation, origin: origin}, removed, true, nil
+		out := &pnode{keys: removeKeyAtMutable(keys, i), vals: vals, weights: removeWeightAtMutable(weights, i), owner: generation, origin: origin}
+		if leafSymHybrid {
+			// Nothing trains a table for a leaf that only shrinks, so it keeps the ones it had: it
+			// fit under them, and a row removed takes at least its own saving with it.
+			out.symTabs = n.leafTabsPrior()
+		}
+		return out, removed, true, nil
 	}
 	i := n.childSlot(key)
 	childNode, err := resolveChild(n.children[i], src)
