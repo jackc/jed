@@ -83,6 +83,7 @@ import {
   type KeyOrder,
   decodeInt,
   decodeIntAt,
+  encodeIntInto,
   encodeNullable,
   keyOrderFromByte,
   keyOrderIsDefault,
@@ -899,30 +900,49 @@ function encodeScalar(ty: ScalarType, v: Value): Uint8Array {
   return encodeNullable(ty, v.int);
 }
 
-// ByteWriter accumulates big-endian bytes for a variable-length item.
+// ByteWriter accumulates big-endian bytes for a variable-length item, in a byte buffer that doubles
+// as it fills.
 class ByteWriter {
-  private buf: number[] = [];
+  private buf = new Uint8Array(64);
+  private len = 0;
+  private room(n: number): void {
+    if (this.len + n <= this.buf.length) return;
+    let cap = this.buf.length * 2;
+    while (cap < this.len + n) cap *= 2;
+    const nb = new Uint8Array(cap);
+    nb.set(this.buf.subarray(0, this.len));
+    this.buf = nb;
+  }
   u8(v: number): void {
-    this.buf.push(v & 0xff);
+    this.room(1);
+    this.buf[this.len++] = v & 0xff;
   }
   u16(v: number): void {
-    this.buf.push((v >>> 8) & 0xff, v & 0xff);
+    this.room(2);
+    this.buf[this.len++] = (v >>> 8) & 0xff;
+    this.buf[this.len++] = v & 0xff;
   }
   u32(v: number): void {
-    this.buf.push((v >>> 24) & 0xff, (v >>> 16) & 0xff, (v >>> 8) & 0xff, v & 0xff);
+    this.room(4);
+    this.buf[this.len++] = (v >>> 24) & 0xff;
+    this.buf[this.len++] = (v >>> 16) & 0xff;
+    this.buf[this.len++] = (v >>> 8) & 0xff;
+    this.buf[this.len++] = v & 0xff;
   }
   // i64 writes an 8-byte big-endian two's-complement i64 (a value-codec context, not a key —
-  // the interval-micros / sequence-field encoding). Big-endian via DataView.
+  // the interval-micros / sequence-field encoding).
   i64(v: bigint): void {
-    const dv = new DataView(new ArrayBuffer(8));
-    dv.setBigInt64(0, v, false);
-    for (let i = 0; i < 8; i++) this.buf.push(dv.getUint8(i));
+    const u = BigInt.asUintN(64, v);
+    this.u32(Number(u >> 32n));
+    this.u32(Number(u & 0xffffffffn));
   }
   bytes(b: Uint8Array): void {
-    for (const x of b) this.buf.push(x);
+    this.room(b.length);
+    this.buf.set(b, this.len);
+    this.len += b.length;
   }
   toBytes(): Uint8Array {
-    return Uint8Array.from(this.buf);
+    return this.buf.slice(0, this.len);
   }
 }
 
@@ -1226,6 +1246,30 @@ function planningPayload(ty: ColType, v: Value): Uint8Array {
   return valuePayload(ty, v);
 }
 
+// inlinePlanArrays is the shared, read-only per-column arrays of an all-inline-plain plan with k
+// columns: every disposition inline, no compressed block, zero lengths. An inline plan's payloadLen is
+// never read (only the compressed and external dispositions read it).
+const INLINE_PLAN_ARRAYS = new Map<
+  number,
+  { disp: ValueDisp[]; comp: (Uint8Array | null)[]; zeros: number[] }
+>();
+function inlinePlanArrays(k: number): {
+  disp: ValueDisp[];
+  comp: (Uint8Array | null)[];
+  zeros: number[];
+} {
+  let a = INLINE_PLAN_ARRAYS.get(k);
+  if (a === undefined) {
+    a = {
+      disp: Object.freeze(new Array<ValueDisp>(k).fill("inline")) as ValueDisp[],
+      comp: Object.freeze(new Array<Uint8Array | null>(k).fill(null)) as (Uint8Array | null)[],
+      zeros: Object.freeze(new Array<number>(k).fill(0)) as number[],
+    };
+    INLINE_PLAN_ARRAYS.set(k, a);
+  }
+  return a;
+}
+
 // planDispositions decides each column's on-disk disposition (large-values.md §3/§12/§13;
 // format.md "Large values"). Spill only when forced: if the all-inline-plain record already fits
 // RECORD_MAX, nothing is compressed or spilled. Otherwise two passes, each visiting largest
@@ -1250,6 +1294,30 @@ function planDispositions(
   memo: CompressMemo | null = null,
 ): RecordPlan {
   const capacity = cap.c;
+  const max = recordMaxFor(capacity, colTypes.length);
+  // The common case: the all-inline-plain record fits, so nothing is compressed or spilled and the
+  // per-column arrays are the all-inline constants (never mutated). Measures exactly as the inline
+  // pass below.
+  {
+    let size = key.length;
+    for (let i = 0; i < colTypes.length; i++) {
+      const ty = colTypes[i]!;
+      const w = fixedValueWidth(ty);
+      size += w !== null ? w : valueFacts(ty, row[i]!)[0];
+    }
+    if (size <= max) {
+      const k = inlinePlanArrays(colTypes.length);
+      return {
+        disp: k.disp,
+        comp: k.comp,
+        compLen: k.zeros,
+        size,
+        compressUnits: 0,
+        external: 0,
+        payloadLen: k.zeros,
+      };
+    }
+  }
   const plan: RecordPlan = {
     disp: new Array<ValueDisp>(colTypes.length).fill("inline"),
     comp: new Array<Uint8Array | null>(colTypes.length).fill(null),
@@ -1271,11 +1339,6 @@ function planDispositions(
   });
   const cur = inline.slice();
   let size = key.length + inline.reduce((a, b) => a + b, 0);
-  const max = recordMaxFor(capacity, colTypes.length);
-  if (size <= max) {
-    plan.size = size;
-    return plan;
-  }
   // Pass 1 — compress (lz4.md): spillable, non-NULL, payload ≥ S_COMPRESS; largest inline-plain
   // encoded size first, ties by ascending index (Array.prototype.sort is stable, ES2019+).
   // Every attempt is metered (ceil(raw/capacity) value_compress slabs) whether or not
@@ -1863,69 +1926,106 @@ export function encodeLeafPax(
 ): Uint8Array {
   const n = keys.length;
   const k = colTypes.length;
-  // Encode each value in (record, column) order; overflow chains allocate here. A fixed-width
-  // column's slot is the untagged inline body (encodeValue minus its 0x00 tag; zeros for NULL); a
-  // variable column's bytes are the tagged disposed form (empty for NULL).
-  const valBytes: Uint8Array[][] = Array.from({ length: k }, () => new Array<Uint8Array>(n));
-  const nulls: boolean[][] = Array.from({ length: k }, () => new Array<boolean>(n).fill(false));
+  const widths = colTypes.map(fixedValueWidth);
+  // Encode each variable column's values in (record, column) order — overflow chains allocate here
+  // — as their tagged disposed form (empty for NULL). A fixed-width column's slot (the untagged
+  // inline body, zeros for NULL) is written straight into the payload below.
+  const valBytes: (Uint8Array[] | null)[] = widths.map((w) =>
+    w === null ? new Array<Uint8Array>(n) : null,
+  );
   for (let i = 0; i < n; i++) {
     const plan = planDispositions(colTypes, keys[i]!, rows[i]!, seal.cap, memo);
     for (let c = 0; c < k; c++) {
+      const vb = valBytes[c];
+      if (vb === null) continue;
       const v = rows[i]![c]!;
-      const isNull = v.kind === "null";
-      nulls[c]![i] = isNull;
-      const width = fixedValueWidth(colTypes[c]!);
-      if (width !== null) {
-        valBytes[c]![i] = isNull ? new Uint8Array(width) : encodeValue(colTypes[c]!, v).subarray(1);
-      } else if (isNull) {
-        valBytes[c]![i] = new Uint8Array(0);
-      } else {
-        valBytes[c]![i] = encodeDisposedValue(colTypes[c]!, v, plan, c, seal, take, ovf, src);
-      }
+      vb![i] =
+        v.kind === "null"
+          ? EMPTY_BYTES
+          : encodeDisposedValue(colTypes[c]!, v, plan, c, seal, take, ovf, src);
     }
   }
-  const w = new ByteWriter();
-  // key directory (N end offsets) + key blob.
-  let off = 0;
-  for (let i = 0; i < n; i++) {
-    off += keys[i]!.length;
-    w.u32(off);
-  }
-  for (let i = 0; i < n; i++) w.bytes(keys[i]!);
-  const totalKeyBytes = off;
-  // column directory: absolute payload offset of each region (computed analytically).
+  // key directory (N end offsets) + key blob, then the column directory: the absolute payload offset
+  // of each region (computed analytically), which ends at the payload's length.
+  let totalKeyBytes = 0;
+  for (let i = 0; i < n; i++) totalKeyBytes += keys[i]!.length;
   const baseAfterColDir = 4 * n + totalKeyBytes + 4 * (k + 1);
   const colStart = new Array<number>(k + 1);
   let cur = baseAfterColDir;
   for (let c = 0; c < k; c++) {
     colStart[c] = cur;
-    let bodies = 0;
-    for (let i = 0; i < n; i++) bodies += valBytes[c]![i]!.length;
-    cur +=
-      1 + (fixedValueWidth(colTypes[c]!) !== null ? Math.ceil(n / 8) + bodies : 4 * n + bodies);
+    const w = widths[c]!;
+    if (w !== null) {
+      cur += 1 + Math.ceil(n / 8) + w * n;
+    } else {
+      let bodies = 0;
+      for (let i = 0; i < n; i++) bodies += valBytes[c]![i]!.length;
+      cur += 1 + 4 * n + bodies;
+    }
   }
   colStart[k] = cur;
-  for (let c = 0; c <= k; c++) w.u32(colStart[c]!);
+  const out = new Uint8Array(cur);
+  let o = 0;
+  const u32 = (x: number): void => {
+    out[o] = (x >>> 24) & 0xff;
+    out[o + 1] = (x >>> 16) & 0xff;
+    out[o + 2] = (x >>> 8) & 0xff;
+    out[o + 3] = x & 0xff;
+    o += 4;
+  };
+  let off = 0;
+  for (let i = 0; i < n; i++) {
+    off += keys[i]!.length;
+    u32(off);
+  }
+  for (let i = 0; i < n; i++) {
+    out.set(keys[i]!, o);
+    o += keys[i]!.length;
+  }
+  for (let c = 0; c <= k; c++) u32(colStart[c]!);
   // each column region: flags byte, then bitmap + dense slots (fixed) or value directory + tagged
   // bodies (variable).
   for (let c = 0; c < k; c++) {
-    w.u8(0); // region flags — reserved (the dictionary door)
-    if (fixedValueWidth(colTypes[c]!) !== null) {
-      const bitmap = new Uint8Array(Math.ceil(n / 8));
+    o++; // region flags — reserved (the dictionary door), zero
+    const w = widths[c]!;
+    if (w !== null) {
+      const bitmap = o;
+      o += Math.ceil(n / 8);
+      const ty = colTypes[c]!;
       for (let i = 0; i < n; i++) {
-        if (nulls[c]![i]) bitmap[i >> 3] |= 0x80 >> (i % 8);
+        const v = rows[i]![c]!;
+        if (v.kind === "null") out[bitmap + (i >> 3)] |= 0x80 >> (i % 8);
+        else writeFixedBody(out, o, ty, v);
+        o += w;
       }
-      w.bytes(bitmap);
     } else {
+      const vb = valBytes[c]!;
       let voff = 0;
       for (let i = 0; i < n; i++) {
-        voff += valBytes[c]![i]!.length;
-        w.u32(voff);
+        voff += vb[i]!.length;
+        u32(voff);
+      }
+      for (let i = 0; i < n; i++) {
+        out.set(vb[i]!, o);
+        o += vb[i]!.length;
       }
     }
-    for (let i = 0; i < n; i++) w.bytes(valBytes[c]![i]!);
   }
-  return w.toBytes();
+  return out;
+}
+
+const EMPTY_BYTES = new Uint8Array(0);
+
+// writeFixedBody writes a present fixed-width value's slot — encodeValue minus its 0x00 presence tag —
+// into out at off. The integer-coded types encode in place; the rest copy their encoding.
+function writeFixedBody(out: Uint8Array, off: number, ty: ColType, v: Value): void {
+  if (ty.kind === "scalar") {
+    if (v.kind === "int") return encodeIntInto(out, off, ty.scalar, v.int);
+    if (v.kind === "date") return encodeIntInto(out, off, ty.scalar, v.days);
+    if (v.kind === "timestamp" || v.kind === "timestamptz")
+      return encodeIntInto(out, off, ty.scalar, v.micros);
+  }
+  out.set(encodeValue(ty, v).subarray(1), off);
 }
 
 // writeOverflowChain writes payload across a chain of overflow pages (C − tag byte slabs, in order),

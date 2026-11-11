@@ -13830,7 +13830,7 @@ export class Engine {
         key = encodePkKey(colTypes, pk, colls, row);
         // The PK's 23505 reports PostgreSQL's derived auto-name for the PK index,
         // `<table>_pkey` — jed persists/reserves no such relation (constraints.md §5.4).
-        const seen = key.join(",");
+        const seen = byteKey(key);
         if (seenKeys.has(seen) || (yield* readStore.getSteps(key)) !== undefined) {
           throw uniqueViolation(table.name, pkeyName(table.name)).withDetail(
             yield* pkDetailSteps(this.session, table.name, table.columns, pk, row, DETAIL_EXISTS),
@@ -13851,7 +13851,7 @@ export class Engine {
         if (prefix === null) continue;
         const istore = this.lkpIndexStoreScoped(dbScope, def.name);
         const stored = yield* istore.rangeEntriesSteps(uniqueProbeBound(prefix));
-        const k = prefix.join(",");
+        const k = byteKey(prefix);
         if (stored.length > 0 || seenPrefixes[u]!.has(k)) {
           throw uniqueViolation(table.name, def.name).withDetail(
             yield* indexDetailByNameSteps(this.session, table, def, row, env, DETAIL_EXISTS),
@@ -13866,7 +13866,7 @@ export class Engine {
       // Compute this row's per-index entry keys WITHOUT the suffix (phase 1 — evaluates every
       // expression key, so an eval error aborts here before any write; unmetered). Phase 2 appends the
       // final storage key.
-      const prefixes: Uint8Array[][] = [];
+      const prefixes: Uint8Array[][] = rindexes.length === 0 ? NO_INDEX_PREFIXES : [];
       for (const rindex of rindexes) {
         if (shouldCooperate()) yield COOPERATE;
         prefixes.push(
@@ -13884,7 +13884,7 @@ export class Engine {
       entryPrefixes.push(prefixes);
       // The check option (views.md §15.6), after the row's own NOT NULL / CHECK / PK / UNIQUE
       // checks and its index keys, before the batch EXCLUDE and FOREIGN KEY passes.
-      yield* evalViewChecksSteps(viewChecks, row, env, meter);
+      if (viewChecks.length > 0) yield* evalViewChecksSteps(viewChecks, row, env, meter);
       prepared.push({ key, row });
     }
 
@@ -34645,6 +34645,10 @@ export function cmpBytes(a: Uint8Array, b: Uint8Array): number {
   }
   return a.length - b.length;
 }
+
+// NO_INDEX_PREFIXES is a row's (empty, never mutated) per-index entry prefixes when its table has no
+// secondary index.
+const NO_INDEX_PREFIXES: Uint8Array[][] = Object.freeze([]) as unknown as Uint8Array[][];
 
 // byteKey is a stable string key for a (small) byte string — used to dedup / count storage keys in
 // the GIN posting combine. Storage keys are short (an encoded PK or rowid), so per-char is fine.

@@ -18,27 +18,32 @@ import { type ScalarType, widthBytes } from "./types.ts";
 // domain entirely — per-byte bigint arithmetic is allocation-heavy in V8 and this sits on
 // the key-encode/leaf-decode hot path.
 export function encodeInt(t: ScalarType, value: bigint): Uint8Array {
+  const out = new Uint8Array(widthBytes(t));
+  encodeIntInto(out, 0, t, value);
+  return out;
+}
+
+// encodeIntInto writes encodeInt(t, value)'s bytes into out at offset off.
+export function encodeIntInto(out: Uint8Array, off: number, t: ScalarType, value: bigint): void {
   const width = widthBytes(t);
-  const out = new Uint8Array(width);
   if (width === 8) {
     const u = BigInt.asUintN(64, value + 9223372036854775808n);
     let hi = Number(u >> 32n);
     let lo = Number(u & 0xffffffffn);
     for (let i = 3; i >= 0; i--) {
-      out[i] = hi & 0xff;
+      out[off + i] = hi & 0xff;
       hi >>>= 8;
-      out[i + 4] = lo & 0xff;
+      out[off + i + 4] = lo & 0xff;
       lo >>>= 8;
     }
-    return out;
+    return;
   }
   // width ≤ 4: the biased value is in [0, 2^32), exact in a JS number.
   let u = Number(value) + 2 ** (width * 8 - 1);
   for (let i = width - 1; i >= 0; i--) {
-    out[i] = u & 0xff;
+    out[off + i] = u & 0xff;
     u = Math.floor(u / 256);
   }
-  return out;
 }
 
 // decodeInt is the inverse of encodeInt. b.length must equal the type's width.
