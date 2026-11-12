@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use super::{
     Cap, ColType, Disp, ScalarType, Unfetched, Value, all_inline_size, fixed_value_width,
-    plan_dispositions, planning_payload,
+    never_inline, plan_dispositions, planning_payload,
 };
 
 /// Leaf flags bit 0: every key of the tree has one length, stored once; no key directory.
@@ -614,6 +614,24 @@ fn row_items<'a>(
 ) {
     let plan = match all_inline_size(shape, key, row, cap) {
         Some(_) => None,
+        // Every item value is NULL or too large to stay inline-plain under any plan: the
+        // classification is known without planning — no compression, no memo lookup.
+        None if shape.item_cols.iter().all(|ic| {
+            matches!(row[ic.col], Value::Null) || never_inline(shape, row, cap, ic.col)
+        }) =>
+        {
+            debug_assert!({
+                let plan = plan_dispositions(shape, key, row, cap, None);
+                shape.item_cols.iter().all(|ic| {
+                    matches!(row[ic.col], Value::Null) || !matches!(plan.disp[ic.col], Disp::Inline)
+                })
+            });
+            out.extend(shape.item_cols.iter().map(|ic| match row[ic.col] {
+                Value::Null => Item::Null,
+                _ => Item::Own,
+            }));
+            return;
+        }
         // Large values: the plan compresses them, from the writing store's memo when it lent one.
         None => Some(crate::compress_memo::plan_with_lent(|memo| {
             plan_dispositions(shape, key, row, cap, memo)

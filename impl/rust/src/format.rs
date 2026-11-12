@@ -1412,6 +1412,20 @@ fn all_inline_size(shape: &LeafShape, key: &[u8], row: &[Value], cap: Cap) -> Op
     (size <= record_max(cap.c, col_types.len())).then_some(size)
 }
 
+/// Whether [`plan_dispositions`] is certain to move column `c`'s value out of its inline-plain
+/// form, decided without running the plan: a spillable value whose inline-plain size alone
+/// exceeds `RECORD_MAX` (and its pointer). While such a value stays inline-plain the record size
+/// exceeds `RECORD_MAX`, so neither pass returns or stops early: pass 1 adopts its compressed
+/// form, or pass 2 — where it is a candidate — reaches and externalizes it.
+fn never_inline(shape: &LeafShape, row: &[Value], cap: Cap, c: usize) -> bool {
+    let ty = &shape.col_types[c];
+    if !is_spillable(ty) || fixed_value_width(ty).is_some() {
+        return false;
+    }
+    let inline = value_facts(ty, &row[c]).0;
+    inline > record_max(cap.c, shape.col_types.len()) && inline > EXTERNAL_PTR_LEN + cap.tag
+}
+
 /// `memo` is the writing transaction's compression memo, when the caller plans on its behalf: an
 /// attempt then takes the block an earlier plan of the same payload produced, verified exactly, so
 /// the plan is the one a fresh compression gives ([`crate::compress_memo`]).
