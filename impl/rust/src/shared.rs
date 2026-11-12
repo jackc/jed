@@ -7059,6 +7059,10 @@ mod temp_spill_internal_tests {
 }
 
 #[cfg(test)]
+#[path = "leaf_lazy_tests.rs"]
+mod leaf_lazy_tests;
+
+#[cfg(test)]
 #[path = "unchanged_commit_tests.rs"]
 mod unchanged_commit_tests;
 

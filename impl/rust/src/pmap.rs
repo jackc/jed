@@ -40,8 +40,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use crate::catalog::ColType;
 use crate::error::Result;
 use crate::format::{
-    Cap, LeafShape, LeafSizes, PackedLeaf, PageRef, SplitFacts, leaf_overhead, leaf_prefix_saving,
-    leaf_saving,
+    Cap, LazyView, LeafScan, LeafShape, LeafSizes, PackedLeaf, PageRef, SplitFacts, leaf_overhead,
+    leaf_prefix_saving,
 };
 use crate::storage::Row;
 use crate::value::Value;
@@ -60,8 +60,63 @@ pub(crate) mod leaf_sizes_check {
         ON.with(|c| c.set(on));
     }
 
-    pub(super) fn on() -> bool {
+    pub(crate) fn on() -> bool {
         ON.with(Cell::get)
+    }
+}
+
+/// Whether a write to a packed leaf makes a lazy leaf ([`LazyLeaf`]) rather than decoding every
+/// row. Always on outside tests; a test turns it off (per thread) to run the eager paths.
+pub(crate) mod leaf_lazy {
+    #[cfg(test)]
+    use std::cell::Cell;
+
+    #[cfg(test)]
+    thread_local! {
+        static ON: Cell<bool> = const { Cell::new(true) };
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set(on: bool) {
+        ON.with(|c| c.set(on));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn on() -> bool {
+        ON.with(Cell::get)
+    }
+
+    #[cfg(not(test))]
+    pub(crate) fn on() -> bool {
+        true
+    }
+}
+
+/// The undecoded part of a **lazy leaf**: a dirty leaf made by editing a packed leaf, which keeps
+/// the rows it has not replaced as that leaf's page stores them (leaf_lazy.rs).
+#[derive(Clone)]
+pub(crate) struct LazyLeaf {
+    /// The packed leaf the rows come from. It pins the page block, which is never written again.
+    pub(crate) base: Arc<Node>,
+    /// Parallel to the node's `vals`: `at[i] ≥ 0` says row `i` is still record `at[i]` of `base`
+    /// (and `keys[i]` / `vals[i]` are empty placeholders); `-1` that `keys[i]` / `vals[i]` hold it.
+    pub(crate) at: Vec<i32>,
+    /// The leaf's keys are exactly `base`'s, in order: rows were only replaced, so row `i` is
+    /// record `i` of the page or replaces it.
+    pub(crate) same_rows: bool,
+    /// Every record of the page and every row written since is stored all-inline.
+    pub(crate) patch_ok: bool,
+    /// While `same_rows`: per column, whether some replaced row stores a value that differs from
+    /// the page's. Empty once a row was inserted or removed.
+    pub(crate) col_dirty: Vec<bool>,
+}
+
+impl LazyLeaf {
+    fn packed(&self) -> &PackedLeaf {
+        self.base
+            .packed
+            .as_ref()
+            .expect("a lazy leaf's base is a packed leaf")
     }
 }
 
@@ -182,14 +237,17 @@ fn child(node: &Node, i: usize, src: Option<&dyn LeafSource>) -> Result<Arc<Node
 
 /// One B+tree node. A **decoded leaf** has no children and
 /// `keys.len() == vals.len() == weights.len()`; a **packed leaf** keeps all three in its page-backed
-/// `packed` representation and leaves those vectors empty. An **interior** node has `children.len() ==
-/// keys.len() + 1` and **empty** `vals`/`weights` — its keys are the routing separators, its
+/// `packed` representation and leaves those vectors empty; a **lazy leaf** (`lazy`) is a dirty
+/// leaf that still reads the rows it has not replaced from the packed leaf it was copied from. An
+/// **interior** node has `children.len() == keys.len() + 1` and **empty** `vals`/`weights` — its keys are the routing separators, its
 /// payload is derived from the separator bytes themselves (v24, record-free). Nodes are shared
 /// behind `Arc`; a mutation clones the shared/published portion of the root→leaf path, may edit a
 /// unique dirty suffix in place, and shares every untouched subtree.
 pub(crate) struct Node {
     pub(crate) keys: Vec<Vec<u8>>,
-    /// The decoded value rows, one per key — populated for a **Decoded leaf** (a writer's
+    /// The decoded value rows, one per key (a lazy leaf holds an empty placeholder, here and in
+    /// `keys`, for each row it still reads from its page — [`LazyLeaf`]) — populated for a
+    /// **Decoded leaf** (a writer's
     /// transient materialize-mutate-repack buffer; the post-commit residency flip demotes it once
     /// persisted, so Decoded survives a commit only in a root leaf, a GiST leaf-key store, or a
     /// bare scratch engine), **empty** for a **Packed** leaf (which reconstructs on demand from
@@ -218,6 +276,10 @@ pub(crate) struct Node {
     /// because reading the saving may first rescan a column whose range a removal left stale
     /// ([`LeafSizes::refresh`]) — a change to the cache only, never to the facts' meaning.
     sizes: Mutex<Option<Box<LeafSizes>>>,
+    /// Set on a lazy leaf: the rows it still reads from the page it was copied from.
+    pub(crate) lazy: Option<Box<LazyLeaf>>,
+    /// `Σ weights` of a decoded or lazy leaf, kept by the in-place edits (0 otherwise).
+    wsum: usize,
     /// The tag of the page at `page` (spec/fileformat/encrypted.md §2), stored as two words; zero in
     /// a plaintext file and while the node is dirty. Set with the page id by the commit that seals
     /// the node, so a parent written later binds it.
@@ -237,13 +299,36 @@ impl Node {
         Arc::new(Node {
             keys,
             vals,
+            wsum: weights.iter().map(|&w| w as usize).sum(),
             weights,
             children: Vec::new(),
             packed: None,
+            lazy: None,
             sizes: Mutex::new(None),
             page: AtomicU32::new(0),
             tag: tag_words(&crate::crypto::NO_TAG),
         })
+    }
+
+    /// [`new_leaf`](Node::new_leaf) for a leaf whose content-dependent size facts were measured
+    /// while it was built (`sizes` covers exactly these rows).
+    fn new_leaf_sized(
+        keys: Vec<Vec<u8>>,
+        vals: Vec<Row>,
+        weights: Vec<u32>,
+        sizes: Option<LeafSizes>,
+    ) -> Arc<Node> {
+        let mut leaf = Node::new_leaf(keys, vals, weights);
+        if let Some(sz) = sizes {
+            debug_assert_eq!(
+                sz.len(),
+                leaf.keys.len(),
+                "size facts cover the leaf's rows"
+            );
+            let node = Arc::get_mut(&mut leaf).expect("a fresh leaf is unshared");
+            *node.sizes_mut() = Some(Box::new(sz));
+        }
+        leaf
     }
 
     /// A fresh **dirty interior** node (page `0`) — separators + children, no records (v24).
@@ -261,6 +346,8 @@ impl Node {
             weights: Vec::new(),
             children,
             packed: None,
+            lazy: None,
+            wsum: 0,
             sizes: Mutex::new(None),
             page: AtomicU32::new(0),
             tag: tag_words(&crate::crypto::NO_TAG),
@@ -279,9 +366,11 @@ impl Node {
         Arc::new(Node {
             keys,
             vals,
+            wsum: weights.iter().map(|&w| w as usize).sum(),
             weights,
             children,
             packed: None,
+            lazy: None,
             sizes: Mutex::new(None),
             page: AtomicU32::new(page.page),
             tag: tag_words(&page.tag),
@@ -303,6 +392,8 @@ impl Node {
             weights: Vec::new(),
             children,
             packed: None,
+            lazy: None,
+            wsum: 0,
             sizes: Mutex::new(None),
             page: AtomicU32::new(page.page),
             tag: tag_words(&page.tag),
@@ -320,6 +411,8 @@ impl Node {
             weights: Vec::new(),
             children: Vec::new(),
             packed: Some(packed),
+            lazy: None,
+            wsum: 0,
             sizes: Mutex::new(None),
             page: AtomicU32::new(page.page),
             tag: tag_words(&page.tag),
@@ -367,11 +460,25 @@ impl Node {
             .map_or(self.keys.len(), PackedLeaf::len)
     }
 
+    /// The packed leaf holding row `i`'s stored bytes and the row's index there: the node's own
+    /// page, or a lazy leaf's base page for a row it has not replaced. `None` when `vals[i]` holds
+    /// the row.
+    #[inline]
+    fn stored(&self, i: usize) -> Option<(&PackedLeaf, usize)> {
+        if let Some(p) = &self.packed {
+            return Some((p, i));
+        }
+        match &self.lazy {
+            Some(lz) if lz.at[i] >= 0 => Some((lz.packed(), lz.at[i] as usize)),
+            _ => None,
+        }
+    }
+
     /// Key `i` as a borrowed span. Packed leaves return a view into the retained page block.
     pub(crate) fn key_at(&self, i: usize) -> &[u8] {
-        match &self.packed {
+        match self.stored(i) {
             None => &self.keys[i],
-            Some(p) => p.key(i),
+            Some((p, at)) => p.key(at),
         }
     }
 
@@ -385,8 +492,29 @@ impl Node {
 
     fn total_weight(&self) -> usize {
         match &self.packed {
-            None => self.weights.iter().map(|&w| w as usize).sum(),
+            None => {
+                #[cfg(test)]
+                if leaf_sizes_check::on() {
+                    assert_eq!(
+                        self.wsum,
+                        self.weights.iter().map(|&w| w as usize).sum::<usize>(),
+                        "BUG: a leaf's running weight and its weights disagree"
+                    );
+                }
+                self.wsum
+            }
             Some(p) => (0..self.len()).map(|i| p.record_weight(i) as usize).sum(),
+        }
+    }
+
+    /// A lazy leaf's rows, for the page-reading size and encode paths (leaf_lazy.rs).
+    fn lazy_view<'a>(&'a self, lz: &'a LazyLeaf) -> LazyView<'a> {
+        LazyView {
+            base: lz.packed(),
+            at: &lz.at,
+            keys: &self.keys,
+            vals: &self.vals,
+            col_dirty: lz.same_rows.then_some(lz.col_dirty.as_slice()),
         }
     }
 
@@ -418,9 +546,12 @@ impl Node {
         if n == 0 {
             return 0;
         }
-        let prefix = leaf_prefix_saving(n, &self.keys[0], &self.keys[n - 1]);
+        let prefix = leaf_prefix_saving(n, self.key_at(0), self.key_at(n - 1));
         if !shape.content_cols() {
             return prefix;
+        }
+        if let Some(lz) = &self.lazy {
+            return prefix + self.lazy_saving(lz, cap, shape);
         }
         let mut sizes = self.sizes_lock();
         if sizes.as_ref().is_none_or(|sz| sz.len() != n) {
@@ -446,6 +577,40 @@ impl Node {
             );
         }
         prefix + regions
+    }
+
+    /// [`content_saving`](Self::content_saving)'s region part for a lazy leaf: its facts come from
+    /// the page (frozen columns) and from stored spans, with no value decoded.
+    fn lazy_saving(&self, lz: &LazyLeaf, cap: Cap, shape: &LeafShape) -> usize {
+        let view = self.lazy_view(lz);
+        let n = self.keys.len();
+        let mut sizes = self.sizes_lock();
+        let regions = if sizes.as_ref().is_some_and(|sz| sz.len() == n)
+            || self.page.load(Ordering::Relaxed) == 0
+        {
+            if sizes.as_ref().is_none_or(|sz| sz.len() != n) {
+                // A dirty leaf's rows change only with its facts, so it keeps them.
+                *sizes = Some(Box::new(LeafSizes::measure_lazy(shape, cap, &view)));
+            }
+            let sz = sizes.as_mut().expect("measured above");
+            sz.refresh_lazy(shape, &view);
+            sz.saving(shape)
+        } else {
+            LeafSizes::measure_lazy(shape, cap, &view).saving(shape)
+        };
+        #[cfg(test)]
+        if leaf_sizes_check::on() {
+            let rows = self.decoded_rows().expect("a lazy leaf's rows decode");
+            let fresh =
+                LeafSizes::measure(shape, cap, n, &|i| self.key_at(i), &|i| &rows[i]).saving(shape);
+            assert_eq!(
+                regions,
+                fresh,
+                "BUG: a lazy leaf's size facts ({} columns frozen) and a fresh measurement disagree",
+                sizes.as_ref().map_or(0, |sz| sz.frozen()),
+            );
+        }
+        regions
     }
 
     /// The kept size facts. A panic while they were held leaves nothing half-written that a later
@@ -474,7 +639,8 @@ impl Node {
                 let n = self.keys.len();
                 let upper = match self.sizes_lock().as_deref() {
                     Some(sz) if sz.stale() && sz.len() == n && n > 0 => Some(
-                        sz.saving(shape) + leaf_prefix_saving(n, &self.keys[0], &self.keys[n - 1]),
+                        sz.saving(shape)
+                            + leaf_prefix_saving(n, self.key_at(0), self.key_at(n - 1)),
                     ),
                     _ => None,
                 };
@@ -492,6 +658,9 @@ impl Node {
     fn search(&self, key: &[u8]) -> std::result::Result<usize, usize> {
         if let Some(p) = &self.packed {
             return p.search(key);
+        }
+        if let Some(lz) = self.lazy.as_deref().filter(|lz| lz.same_rows) {
+            return lz.packed().search(key); // the page's keys, in order
         }
         let mut lo = 0usize;
         let mut hi = self.len();
@@ -519,9 +688,9 @@ impl Node {
     /// surface a corrupt *touched* inline body (`XX001`, packed-leaf.md §8); the Decoded path never
     /// errors.
     pub(crate) fn row_at(&self, i: usize) -> Result<Row> {
-        match &self.packed {
+        match self.stored(i) {
             None => Ok(self.vals[i].clone()),
-            Some(p) => p.row(i),
+            Some((p, at)) => p.row(at),
         }
     }
 
@@ -529,12 +698,12 @@ impl Node {
     /// window's recycled rows, extensibility.md §4.2.1). On error `out` holds a partial row the caller
     /// must discard.
     pub(crate) fn row_at_into(&self, i: usize, out: &mut Row) -> Result<()> {
-        match &self.packed {
+        match self.stored(i) {
             None => {
                 out.clone_from(&self.vals[i]);
                 Ok(())
             }
-            Some(p) => p.row_into(i, out),
+            Some((p, at)) => p.row_into(at, out),
         }
     }
 
@@ -542,9 +711,9 @@ impl Node {
     /// the `OP_Column`/`slot_getsomeattrs` model PAX's column regions make O(1)). A **Decoded** leaf
     /// clones `vals[i][c]`; a **Packed** leaf decodes the single column span and reads no other column.
     pub(crate) fn col_at(&self, i: usize, c: usize) -> Result<Value> {
-        match &self.packed {
+        match self.stored(i) {
             None => Ok(self.vals[i][c].clone()),
-            Some(p) => p.value(c, i),
+            Some((p, at)) => p.value(c, at),
         }
     }
 
@@ -553,12 +722,12 @@ impl Node {
     /// ([`PackedLeaf::value_resolved`](crate::format::PackedLeaf::value_resolved)); a Decoded leaf
     /// resolves a held deferred value without cloning its handle.
     pub(crate) fn col_at_resolved(&self, i: usize, c: usize) -> Result<Value> {
-        match &self.packed {
+        match self.stored(i) {
             None => match &self.vals[i][c] {
                 Value::Unfetched(u) => crate::format::resolve_unfetched_self(u),
                 v => Ok(v.clone()),
             },
-            Some(p) => p.value_resolved(c, i),
+            Some((p, at)) => p.value_resolved(c, at),
         }
     }
 
@@ -566,9 +735,9 @@ impl Node {
     /// Track A4): the PAX null bitmap / zero-length span on a Packed leaf. A deferred large value is
     /// never NULL.
     pub(crate) fn col_is_null(&self, i: usize, c: usize) -> bool {
-        match &self.packed {
+        match self.stored(i) {
             None => matches!(self.vals[i][c], Value::Null),
-            Some(p) => p.is_null(c, i),
+            Some((p, at)) => p.is_null(c, at),
         }
     }
 
@@ -576,7 +745,7 @@ impl Node {
     /// `Some(None)` for NULL, `Some(Some(span))` for the tagged codec bytes. `None` on a Decoded leaf,
     /// which holds values rather than stored bytes.
     pub(crate) fn col_span(&self, i: usize, c: usize) -> Option<Option<&[u8]>> {
-        self.packed.as_ref().map(|p| p.value_span(c, i))
+        self.stored(i).map(|(p, at)| p.value_span(c, at))
     }
 
     /// The large-value scan units (chain pages, decompress slabs) record `i` adds for the touched
@@ -591,11 +760,11 @@ impl Node {
         mask: &[bool],
     ) -> crate::format::ScanUnits {
         let col_types: &[ColType] = &shape.col_types;
-        match &self.packed {
+        match self.stored(i) {
             None => {
                 crate::format::record_scan_units(shape, self.key_at(i), &self.vals[i], cap, mask)
             }
-            Some(p) => {
+            Some((p, i)) => {
                 let mut units = crate::format::ScanUnits {
                     pages: 0,
                     decompress: 0,
@@ -622,9 +791,9 @@ impl Node {
     /// basis + the scan layer's resolve prefetch, and a missed value resolves on touch (the
     /// demand-fault backstop).
     fn with_row<R>(&self, i: usize, f: impl FnOnce(&Row) -> Result<R>) -> Result<R> {
-        match &self.packed {
+        match self.stored(i) {
             None => f(&self.vals[i]),
-            Some(p) => f(&p.row(i)?),
+            Some((p, at)) => f(&p.row(at)?),
         }
     }
 
@@ -633,16 +802,16 @@ impl Node {
     /// row so the rebuilt node is Decoded (`build_leaf`/`node_insert`/`node_remove`/`merge_at` then
     /// run unchanged).
     pub(crate) fn decoded_rows(&self) -> Result<Vec<Row>> {
-        match &self.packed {
-            None => Ok(self.vals.clone()),
-            Some(p) => (0..p.len()).map(|i| p.row(i)).collect(),
+        if self.packed.is_none() && self.lazy.is_none() {
+            return Ok(self.vals.clone());
         }
+        (0..self.len()).map(|i| self.row_at(i)).collect()
     }
 
     /// Materialize a leaf's keys, rows, and weights together at the Packed→Decoded mutation
     /// boundary. This is the only place a clean leaf creates owned per-record keys/weights.
     fn decoded_parts(&self) -> Result<(Vec<Vec<u8>>, Vec<Row>, Vec<u32>)> {
-        if self.packed.is_none() {
+        if self.packed.is_none() && self.lazy.is_none() {
             return Ok((self.keys.clone(), self.vals.clone(), self.weights.clone()));
         }
         let n = self.len();
@@ -652,8 +821,8 @@ impl Node {
         for i in 0..n {
             // Each key is assembled from the leaf's shared prefix and its stored suffix, without
             // rebuilding the leaf's keys as one buffer first.
-            keys.push(match &self.packed {
-                Some(p) => p.key_owned(i),
+            keys.push(match self.stored(i) {
+                Some((p, at)) => p.key_owned(at),
                 None => self.keys[i].clone(),
             });
             vals.push(self.row_at(i)?);
@@ -661,6 +830,369 @@ impl Node {
         }
         Ok((keys, vals, weights))
     }
+    /// This leaf as an ordinary decoded leaf with the same page: every row decoded, its keys
+    /// copied. For a persisted lazy root that is not re-faulted (storage.rs
+    /// `demote_clean_leaves`).
+    pub(crate) fn decoded_leaf_copy(&self) -> Result<Node> {
+        let (keys, vals, weights) = self.decoded_parts()?;
+        let wsum = weights.iter().map(|&w| w as usize).sum();
+        let out = Node {
+            keys,
+            vals,
+            weights,
+            children: Vec::new(),
+            packed: None,
+            lazy: None,
+            wsum,
+            sizes: Mutex::new(None),
+            page: AtomicU32::new(0),
+            tag: tag_words(&crate::crypto::NO_TAG),
+        };
+        out.set_page_ref(self.page_ref());
+        Ok(out)
+    }
+
+    /// A dirty copy of leaf `node` with no row decoded: `node` is a packed leaf, or a dirty lazy
+    /// leaf another holder still shares.
+    ///
+    /// The copy of a packed leaf holds no keys or rows of its own: `keys[i]` and `vals[i]` are
+    /// empty placeholders until row `i` is replaced, and every read goes to the page through
+    /// [`stored`](Self::stored). A split or merge copies the keys and rows out first
+    /// ([`materialize`](Self::materialize), [`decoded_parts`](Self::decoded_parts)).
+    fn lazy_copy(node: &Arc<Node>) -> Node {
+        let mut out = Node {
+            keys: Vec::new(),
+            vals: Vec::new(),
+            weights: Vec::new(),
+            children: Vec::new(),
+            packed: None,
+            lazy: None,
+            wsum: 0,
+            sizes: Mutex::new(None),
+            page: AtomicU32::new(0),
+            tag: tag_words(&crate::crypto::NO_TAG),
+        };
+        if let Some(p) = &node.packed {
+            let n = p.len();
+            let (weights, wsum) = p.record_weights();
+            let patch_ok = p.inline_only();
+            out.keys = vec![Vec::new(); n];
+            out.vals = vec![Vec::new(); n];
+            out.weights = weights;
+            out.wsum = wsum;
+            out.lazy = Some(Box::new(LazyLeaf {
+                base: Arc::clone(node),
+                at: (0..n as i32).collect(),
+                same_rows: true,
+                patch_ok,
+                // A record of the page with a large-value form has a plan that can change with
+                // any column, so every column then counts as changed from the first replacement.
+                col_dirty: vec![!patch_ok; p.shape().k()],
+            }));
+            return out;
+        }
+        out.keys = node.keys.clone();
+        out.vals = node.vals.clone();
+        out.weights = node.weights.clone();
+        out.wsum = node.wsum;
+        out.lazy = node.lazy.clone();
+        *out.sizes_mut() = node.sizes_lock().clone();
+        out
+    }
+
+    /// Decode every row a lazy leaf still reads from its page and copy its keys, making it an
+    /// ordinary decoded leaf. Nothing is changed when a row fails to decode.
+    fn materialize(&mut self) -> Result<()> {
+        let Some(lz) = self.lazy.as_deref() else {
+            return Ok(());
+        };
+        let base = lz.packed();
+        let mut decoded = Vec::new();
+        for (i, &at) in lz.at.iter().enumerate() {
+            if at >= 0 {
+                decoded.push((i, base.key_owned(at as usize), base.row(at as usize)?));
+            }
+        }
+        for (i, key, row) in decoded {
+            self.keys[i] = key;
+            self.vals[i] = row;
+        }
+        self.lazy = None;
+        *self.sizes_mut() = None; // the builder measures the rows
+        Ok(())
+    }
+
+    /// Insert or replace a row in a dirty leaf the caller owns, then split it if it no longer
+    /// fits. `found` is [`search`](Self::search)'s answer for `key`.
+    #[allow(clippy::too_many_arguments)]
+    fn leaf_put(
+        &mut self,
+        found: std::result::Result<usize, usize>,
+        key: Vec<u8>,
+        val: Row,
+        weight: u32,
+        old: &mut OldRow,
+        cap: Cap,
+        shape: &LeafShape,
+    ) -> Result<Ins> {
+        debug_assert!(self.packed.is_none(), "a dirty leaf is not packed");
+        let i = match found {
+            Ok(i) => {
+                if self.lazy.is_some() {
+                    if old.want {
+                        old.row = Some(self.row_at(i)?);
+                    }
+                    self.replace_lazy_row(i, key, val, weight, cap, shape);
+                } else {
+                    // The facts follow the row: the old one out, the new one in.
+                    let n = self.keys.len();
+                    let sizes = self.sizes.get_mut().unwrap_or_else(|e| e.into_inner());
+                    if let Some(sz) = sizes {
+                        // Facts with a dictionary kept as distinct cannot take a row: they are
+                        // dropped, and the leaf is measured again only if its plain size no
+                        // longer decides.
+                        if !sz.distinct()
+                            && sz.len() == n
+                            && sz.remove_row(shape, cap, &key, &self.vals[i])
+                        {
+                            sz.add_row(shape, cap, &key, &val);
+                        } else {
+                            *sizes = None;
+                        }
+                    }
+                    let prev = std::mem::replace(&mut self.vals[i], val);
+                    if old.want {
+                        old.row = Some(prev);
+                    }
+                    self.wsum = self.wsum + weight as usize - self.weights[i] as usize;
+                    self.weights[i] = weight;
+                }
+                old.replaced = true;
+                i
+            }
+            Err(i) => {
+                if let Some(lz) = self.lazy.as_deref_mut() {
+                    lz.at.insert(i, -1);
+                    lz.row_set_changed();
+                    if lz.patch_ok && !crate::format::row_all_inline(shape, cap, &key, &val) {
+                        lz.patch_ok = false;
+                    }
+                    // Frozen facts hold only for the page's rows.
+                    let sizes = self.sizes.get_mut().unwrap_or_else(|e| e.into_inner());
+                    if sizes.as_ref().is_some_and(|sz| sz.frozen() > 0) {
+                        *sizes = None;
+                    }
+                }
+                let sizes = self.sizes.get_mut().unwrap_or_else(|e| e.into_inner());
+                if let Some(sz) = sizes {
+                    // Facts with a dictionary kept as distinct cannot take a row.
+                    if sz.distinct() {
+                        *sizes = None;
+                    } else {
+                        sz.add_row(shape, cap, &key, &val);
+                    }
+                }
+                self.keys.insert(i, key);
+                self.vals.insert(i, val);
+                self.weights.insert(i, weight);
+                self.wsum += weight as usize;
+                i
+            }
+        };
+        let plain = self.plain_payload(shape);
+        if plain <= cap.c || self.len() < 2 {
+            return Ok(Ins::Kept);
+        }
+        // Past its plain capacity the leaf fits only by its content-dependent savings. Keep
+        // their facts with the node, so the inserts that follow add one row to them. (A lazy
+        // leaf measures itself from its page.)
+        let n = self.keys.len();
+        if self.lazy.is_none() && self.sizes_mut().as_ref().is_none_or(|sz| sz.len() != n) {
+            let measured =
+                LeafSizes::measure(shape, cap, n, &|i| &self.keys[i], &|i| &self.vals[i]);
+            *self.sizes_mut() = Some(Box::new(measured));
+        }
+        if plain - self.content_saving(cap, shape) <= cap.c {
+            return Ok(Ins::Kept);
+        }
+        // A split needs every row.
+        self.materialize()?;
+        // The same builder chooses the exact split point and separator bytes. Move the edited
+        // vectors out rather than cloning them; the returned nodes replace this emptied one.
+        let keys = std::mem::take(&mut self.keys);
+        let vals = std::mem::take(&mut self.vals);
+        let weights = std::mem::take(&mut self.weights);
+        self.wsum = 0;
+        Ok(build_leaf(keys, vals, weights, cap, shape, Some(i)))
+    }
+
+    /// Replace row `i` of a lazy leaf the caller owns.
+    fn replace_lazy_row(
+        &mut self,
+        i: usize,
+        key: Vec<u8>,
+        val: Row,
+        weight: u32,
+        cap: Cap,
+        shape: &LeafShape,
+    ) {
+        let Node {
+            keys,
+            vals,
+            weights,
+            lazy,
+            sizes,
+            wsum,
+            ..
+        } = self;
+        let lz = lazy.as_deref_mut().expect("a lazy leaf");
+        let base = lz
+            .base
+            .packed
+            .as_ref()
+            .expect("a lazy leaf's base is a packed leaf");
+        let was_lazy = lz.at[i] >= 0;
+        let mut changed = Vec::new();
+        if lz.same_rows {
+            // Row `i` is the page's record `i`. Which columns does the new row store differently?
+            changed.reserve(shape.k());
+            let inline =
+                crate::format::replaced_columns(base, shape, cap, i, &key, &val, &mut changed);
+            // Past RECORD_MAX the record's disposition plan decides each value's form, so no
+            // column is known unchanged and the leaf is not built from its page.
+            if !inline {
+                lz.patch_ok = false;
+            }
+            for (c, changed) in changed.iter_mut().enumerate() {
+                *changed |= !lz.patch_ok;
+                lz.col_dirty[c] |= *changed;
+            }
+        } else if lz.patch_ok && !crate::format::row_all_inline(shape, cap, &key, &val) {
+            lz.patch_ok = false;
+        }
+        let sizes = sizes.get_mut().unwrap_or_else(|e| e.into_inner());
+        let mut redo = None;
+        if let Some(sz) = sizes.as_deref_mut() {
+            let view = LazyView {
+                base,
+                at: &lz.at,
+                keys: &keys[..],
+                vals: &vals[..],
+                col_dirty: None,
+            };
+            let kept = if sz.len() != vals.len() {
+                false
+            } else if lz.same_rows {
+                redo = sz.replace_cols(shape, cap, &view, i, &key, &val, &changed, was_lazy);
+                redo.is_some()
+            } else {
+                // No column is frozen once a row was inserted or removed: the old row out, the
+                // new one in.
+                match view.row(i) {
+                    Ok(old) if sz.remove_row(shape, cap, &key, &old) => {
+                        sz.add_row(shape, cap, &key, &val);
+                        true
+                    }
+                    _ => false,
+                }
+            };
+            if !kept {
+                *sizes = None;
+            }
+        }
+        keys[i] = key;
+        vals[i] = val;
+        lz.at[i] = -1;
+        *wsum = *wsum + weight as usize - weights[i] as usize;
+        weights[i] = weight;
+        if let (Some(redo), Some(sz)) = (redo, sizes.as_deref_mut()) {
+            let view = LazyView {
+                base,
+                at: &lz.at,
+                keys: &keys[..],
+                vals: &vals[..],
+                col_dirty: None,
+            };
+            sz.remeasure(shape, cap, &view, redo);
+        }
+    }
+
+    /// Remove row `i` of a dirty leaf the caller owns; the removed row goes to `out` when the
+    /// caller wants it.
+    fn leaf_delete(
+        &mut self,
+        i: usize,
+        key: &[u8],
+        out: Option<&mut Option<Row>>,
+        cap: Cap,
+        shape: &LeafShape,
+    ) -> Result<()> {
+        debug_assert!(self.packed.is_none(), "a dirty leaf is not packed");
+        let n = self.keys.len();
+        if self.lazy.is_some() {
+            // Kept facts follow the row out; frozen ones hold only for the page's rows.
+            let exact = self
+                .sizes_mut()
+                .as_ref()
+                .is_some_and(|sz| sz.frozen() == 0 && sz.len() == n);
+            let removed = if out.is_some() || exact {
+                Some(self.row_at(i)?)
+            } else {
+                None
+            };
+            let sizes = self.sizes.get_mut().unwrap_or_else(|e| e.into_inner());
+            if let Some(sz) = sizes
+                && !(exact
+                    && sz.remove_row(shape, cap, key, removed.as_ref().expect("read when exact")))
+            {
+                *sizes = None;
+            }
+            let lz = self.lazy.as_deref_mut().expect("a lazy leaf");
+            lz.at.remove(i);
+            lz.row_set_changed();
+            self.wsum -= self.weights[i] as usize;
+            self.keys.remove(i);
+            self.vals.remove(i);
+            self.weights.remove(i);
+            if let Some(out) = out {
+                *out = removed;
+            }
+            return Ok(());
+        }
+        let sizes = self.sizes.get_mut().unwrap_or_else(|e| e.into_inner());
+        if let Some(sz) = sizes
+            && !(sz.len() == n && sz.remove_row(shape, cap, key, &self.vals[i]))
+        {
+            *sizes = None;
+        }
+        self.wsum -= self.weights[i] as usize;
+        self.keys.remove(i);
+        self.weights.remove(i);
+        let removed = self.vals.remove(i);
+        if let Some(out) = out {
+            *out = Some(removed);
+        }
+        Ok(())
+    }
+}
+
+impl LazyLeaf {
+    /// A row was inserted into or removed from the leaf: its rows are no longer its page's, so no
+    /// region can be copied and no column's facts taken from the page.
+    fn row_set_changed(&mut self) {
+        self.same_rows = false;
+        self.col_dirty.clear();
+    }
+}
+
+/// What a write reports about the row it replaced.
+#[derive(Default)]
+struct OldRow {
+    /// The caller uses the previous row: without it, a row a lazy leaf has not decoded stays
+    /// undecoded.
+    want: bool,
+    replaced: bool,
+    row: Option<Row>,
 }
 
 /// The result of inserting into a subtree: either the rebuilt subtree, or a node that overflowed
@@ -800,12 +1332,44 @@ fn split_point(
     Some(m_balanced.min(m_max).max(m_min))
 }
 
+/// Whether a leaf split compares its running split point and scanned size facts with the tabled
+/// split point and a fresh measurement: with debug assertions, and under the test switch.
+fn leaf_split_check() -> bool {
+    #[cfg(test)]
+    if leaf_sizes_check::on() {
+        return true;
+    }
+    cfg!(debug_assertions)
+}
+
+/// [`leaf_split_point`]'s decision, with the size facts it measured on the way: the whole leaf's
+/// when it stays whole, each half's when it splits two-way and no dictionary payload repeats.
+struct LeafPlan {
+    split: LeafSplit,
+    whole: Option<LeafSizes>,
+    halves: Option<(LeafSizes, LeafSizes)>,
+}
+
+impl LeafPlan {
+    fn whole(sizes: Option<LeafSizes>) -> LeafPlan {
+        LeafPlan {
+            split: LeafSplit::Whole,
+            whole: sizes,
+            halves: None,
+        }
+    }
+}
+
 /// The leaf split decision (format.md "Leaf payload", "Leaf split", "Multi-way split"): whether a
 /// leaf of these records fits `cap` (or has a single record — left whole, the oversize surfacing as
 /// `0A000` at serialize), splits two-way at `m`, or has no two fitting halves. A leaf's size depends on
 /// its keys and rows, so each candidate half is measured with its own key prefix, value spans and
 /// dictionaries. Shared by [`build_leaf`] and the delete path's merge pre-check, so both see the
 /// same separator.
+///
+/// The rows are classified and their dictionary columns hashed once ([`LeafScan`]): the whole
+/// leaf's facts, the two-way split point and the halves' facts follow from that scan. Only a leaf
+/// with no two fitting halves builds the per-boundary tables ([`SplitFacts`]).
 fn leaf_split_point<'a>(
     weights: &[u32],
     key: &dyn Fn(usize) -> &'a [u8],
@@ -813,18 +1377,32 @@ fn leaf_split_point<'a>(
     cap: Cap,
     shape: &LeafShape,
     edited: Option<usize>,
-) -> LeafSplit {
+) -> LeafPlan {
     let n = weights.len();
     let plain: usize = weights.iter().map(|&w| w as usize).sum::<usize>() + leaf_overhead(n, shape);
     if plain <= cap.c || n < 2 {
-        return LeafSplit::Whole;
+        return LeafPlan::whole(None);
     }
-    // Measured whole first: the per-boundary facts are built only for a leaf that does split.
-    let payload = plain - leaf_saving(shape, cap, n, key, row);
+    let check = leaf_split_check();
+    let fresh = |lo: usize, hi: usize| {
+        LeafSizes::measure(shape, cap, hi - lo, &|i| key(lo + i), &|i| row(lo + i)).saving(shape)
+    };
+    // Measured whole first: a half is measured only for a leaf that does split.
+    let scan = LeafScan::new(shape, cap, n, key, row);
+    let sizes = scan.sizes(shape, row, 0, n);
+    if check {
+        assert_eq!(
+            sizes.saving(shape),
+            fresh(0, n),
+            "BUG: a leaf's scanned size facts and a fresh measurement disagree"
+        );
+    }
+    let payload = plain - leaf_prefix_saving(n, key(0), key(n - 1)) - sizes.saving(shape);
+    // A leaf with no content-dependent column has no facts worth keeping.
+    let keep = shape.content_cols();
     if payload <= cap.c {
-        return LeafSplit::Whole;
+        return LeafPlan::whole(keep.then_some(sizes));
     }
-    let facts = SplitFacts::new(shape, cap, n, key, row);
     let prefix: Vec<usize> = std::iter::once(0)
         .chain(weights.iter().scan(0usize, |acc, &w| {
             *acc += w as usize;
@@ -832,14 +1410,23 @@ fn leaf_split_point<'a>(
         }))
         .collect();
     let total = prefix[n];
+    let right_edge = edited == Some(n - 1);
+    let running = scan.split_point(shape, cap.c, key, row, &prefix, payload, right_edge);
+    if let (Some(m), false) = (running, check) {
+        return LeafPlan {
+            split: LeafSplit::Two(m),
+            whole: None,
+            halves: leaf_half_sizes(&scan, shape, row, m, n, keep),
+        };
+    }
+    let facts = SplitFacts::new(shape, cap, n, key, row);
     // Both stay monotone in `m`: a record added to a half adds at least its stored bytes, the
     // half's key prefix can only shorten, an offset width only widen, and a region's size is the
     // smaller of nondecreasing sizes.
     let leftpayload = |m: usize| prefix[m] + leaf_overhead(m, shape) - facts.left(shape, m);
     let rightpayload =
         |m: usize| (total - prefix[m]) + leaf_overhead(n - m, shape) - facts.right(shape, m);
-    let right_edge = edited == Some(n - 1);
-    if let Some(m) = split_point(
+    let tabled = split_point(
         1,
         n - 1,
         payload,
@@ -847,17 +1434,52 @@ fn leaf_split_point<'a>(
         right_edge,
         leftpayload,
         rightpayload,
-    ) {
-        return LeafSplit::Two(m);
+    );
+    assert_eq!(
+        running, tabled,
+        "BUG: the running split point and the tabled one disagree"
+    );
+    if let Some(m) = tabled {
+        let halves = leaf_half_sizes(&scan, shape, row, m, n, keep);
+        if let Some((left, right)) = &halves {
+            assert_eq!(
+                (left.saving(shape), right.saving(shape)),
+                (fresh(0, m), fresh(m, n)),
+                "BUG: a split half's scanned size facts and a fresh measurement disagree"
+            );
+        }
+        return LeafPlan {
+            split: LeafSplit::Two(m),
+            whole: None,
+            halves,
+        };
     }
     // No two fitting halves: one changed record can widen a whole leaf's encodings. The left leaf
     // takes the largest fitting run and the rest splits again.
     let m_max = (1..n).take_while(|&m| leftpayload(m) <= cap.c).last();
-    match m_max {
-        Some(m) => LeafSplit::Multi(m),
-        // A single record that does not fit: leave the node whole (0A000 at serialize).
-        None => LeafSplit::Whole,
+    LeafPlan {
+        split: match m_max {
+            Some(m) => LeafSplit::Multi(m),
+            // A single record that does not fit: leave the node whole (0A000 at serialize).
+            None => LeafSplit::Whole,
+        },
+        whole: None,
+        halves: None,
     }
+}
+
+/// The size facts of the halves `[0, m)` and `[m, n)` of a scanned leaf. With no payload repeated
+/// in the leaf none is in a half, so each half's facts are counted without a lookup; otherwise
+/// (or when the shape has nothing to keep) the halves are measured when first needed.
+fn leaf_half_sizes<'a>(
+    scan: &LeafScan<'a>,
+    shape: &LeafShape,
+    row: &dyn Fn(usize) -> &'a [Value],
+    m: usize,
+    n: usize,
+    keep: bool,
+) -> Option<(LeafSizes, LeafSizes)> {
+    (keep && !scan.dups()).then(|| (scan.sizes(shape, row, 0, m), scan.sizes(shape, row, m, n)))
 }
 
 /// Build a leaf from its parts; if its payload overflows `cap`, split it 2-way **copy-up**
@@ -876,9 +1498,11 @@ fn build_leaf(
     shape: &LeafShape,
     edited: Option<usize>,
 ) -> Ins {
-    let split = leaf_split_point(&weights, &|i| &keys[i], &|i| &vals[i], cap, shape, edited);
-    let (m, multi) = match split {
-        LeafSplit::Whole => return Ins::Whole(Node::new_leaf(keys, vals, weights)),
+    let plan = leaf_split_point(&weights, &|i| &keys[i], &|i| &vals[i], cap, shape, edited);
+    let (m, multi) = match plan.split {
+        LeafSplit::Whole => {
+            return Ins::Whole(Node::new_leaf_sized(keys, vals, weights, plan.whole));
+        }
         LeafSplit::Two(m) => (m, false),
         LeafSplit::Multi(m) => (m, true),
     };
@@ -890,16 +1514,17 @@ fn build_leaf(
     let rvals = vals.split_off(m);
     let rweights = weights.split_off(m);
     let sep = rkeys[0].clone();
-    let left = Node::new_leaf(keys, vals, weights);
     if multi {
+        let left = Node::new_leaf(keys, vals, weights);
         let edited = edited.and_then(|e| e.checked_sub(m));
         let rest = build_leaf(rkeys, rvals, rweights, cap, shape, edited);
         return join_split(left, sep, rest);
     }
+    let (lsizes, rsizes) = plan.halves.unzip();
     Ins::Split {
-        left,
+        left: Node::new_leaf_sized(keys, vals, weights, lsizes),
         sep,
-        right: Node::new_leaf(rkeys, rvals, rweights),
+        right: Node::new_leaf_sized(rkeys, rvals, rweights, rsizes),
         more: Vec::new(),
     }
 }
@@ -1164,8 +1789,23 @@ impl PMap {
         shape: &LeafShape,
         src: Option<&dyn LeafSource>,
     ) -> Result<Option<Row>> {
-        let (_, old) = self.insert_mode(key, val, weight, cap, shape, src, false)?;
+        let (_, old) = self.insert_mode(key, val, weight, cap, shape, src, false, true)?;
         Ok(old)
+    }
+
+    /// [`Self::insert`] for a caller that does not use the previous row: a row a lazy leaf has
+    /// not decoded stays undecoded. Returns whether `key` was present.
+    pub(crate) fn put(
+        &mut self,
+        key: Vec<u8>,
+        val: Row,
+        weight: u32,
+        cap: Cap,
+        shape: &LeafShape,
+        src: Option<&dyn LeafSource>,
+    ) -> Result<bool> {
+        let (inserted, _) = self.insert_mode(key, val, weight, cap, shape, src, false, false)?;
+        Ok(!inserted)
     }
 
     /// Insert `key` only if it is absent, in one descent. Returns whether it was inserted; a
@@ -1179,12 +1819,12 @@ impl PMap {
         shape: &LeafShape,
         src: Option<&dyn LeafSource>,
     ) -> Result<bool> {
-        let (inserted, _) = self.insert_mode(key, val, weight, cap, shape, src, true)?;
+        let (inserted, _) = self.insert_mode(key, val, weight, cap, shape, src, true, false)?;
         Ok(inserted)
     }
 
     /// [`Self::insert`], or [`Self::insert_absent`] when `keep_existing`: whether a new key was
-    /// inserted, and the row an overwrite replaced.
+    /// inserted, and the row an overwrite replaced (when `want_old`).
     #[allow(clippy::too_many_arguments)]
     fn insert_mode(
         &mut self,
@@ -1195,8 +1835,12 @@ impl PMap {
         shape: &LeafShape,
         src: Option<&dyn LeafSource>,
         keep_existing: bool,
+        want_old: bool,
     ) -> Result<(bool, Option<Row>)> {
-        let mut old = None;
+        let mut old = OldRow {
+            want: want_old,
+            ..OldRow::default()
+        };
         match self.root.as_mut() {
             None => self.root = Some(Node::new_leaf(vec![key], vec![val], vec![weight])),
             Some(root) => {
@@ -1243,7 +1887,7 @@ impl PMap {
                 }
             }
         }
-        if old.is_none() {
+        if !old.replaced {
             // Maintain the count only when it is known (`Some`). A disk-loaded index skeleton stays
             // `None`; table skeletons receive the exact v28 base count.
             self.count = self.count.map(|n| {
@@ -1251,7 +1895,7 @@ impl PMap {
                     .expect("row count remains within nonnegative i64")
             });
         }
-        Ok((old.is_none(), old))
+        Ok((!old.replaced, old.row))
     }
 
     /// Remove `key`. Returns the removed row, or `None` if absent (then `self` is unchanged). `src`
@@ -1263,13 +1907,40 @@ impl PMap {
         shape: &LeafShape,
         src: Option<&dyn LeafSource>,
     ) -> Result<Option<Row>> {
+        let mut row = None;
+        self.remove_mode(key, Some(&mut row), cap, shape, src)?;
+        Ok(row)
+    }
+
+    /// [`Self::remove`] for a caller that does not use the removed row (see [`Self::put`]).
+    /// Returns whether `key` was present.
+    pub(crate) fn delete(
+        &mut self,
+        key: &[u8],
+        cap: Cap,
+        shape: &LeafShape,
+        src: Option<&dyn LeafSource>,
+    ) -> Result<bool> {
+        self.remove_mode(key, None, cap, shape, src)
+    }
+
+    /// Remove `key`, handing the removed row to `out` when the caller wants it. Returns whether
+    /// `key` was present.
+    fn remove_mode(
+        &mut self,
+        key: &[u8],
+        out: Option<&mut Option<Row>>,
+        cap: Cap,
+        shape: &LeafShape,
+        src: Option<&dyn LeafSource>,
+    ) -> Result<bool> {
         let Some(root) = self.root.as_mut() else {
-            return Ok(None);
+            return Ok(false);
         };
         // `node_remove` leaves `root` untouched when the key is absent, else points it at the
         // post-delete subtree (edited in place when uniquely owned and dirty, else path-copied).
-        let removed = node_remove(root, key, src, cap, shape)?;
-        if removed.is_some() {
+        let removed = node_remove(root, key, out, src, cap, shape)?;
+        if removed {
             // The root may have drained: an empty leaf becomes the empty map; a 0-key interior
             // root hands the root down a level (height shrinks). The root is exempt from the
             // underfull rule, so no rebalance here. A root reached by a removal is decoded (a
@@ -1574,6 +2245,55 @@ impl PMap {
     }
 }
 
+#[cfg(test)]
+impl PMap {
+    /// Test: for every packed leaf of the tree, the size facts read from its page — measured in
+    /// full from stored spans, and as the page shows them — equal a measurement of the decoded
+    /// rows. Returns the leaves checked.
+    pub(crate) fn check_packed_leaves(
+        &self,
+        src: Option<&dyn LeafSource>,
+        shape: &LeafShape,
+        cap: Cap,
+    ) -> usize {
+        fn walk(
+            node: &Node,
+            src: Option<&dyn LeafSource>,
+            shape: &LeafShape,
+            cap: Cap,
+            leaves: &mut usize,
+        ) {
+            if !node.is_leaf() {
+                for i in 0..node.children.len() {
+                    walk(&child(node, i, src).unwrap(), src, shape, cap, leaves);
+                }
+                return;
+            }
+            let Some(p) = &node.packed else {
+                return;
+            };
+            *leaves += 1;
+            let (keys, rows, _) = node.decoded_parts().unwrap();
+            let want = LeafSizes::measure(shape, cap, keys.len(), &|i| &keys[i], &|i| &rows[i])
+                .saving(shape);
+            let got = LeafSizes::measure_packed(shape, cap, p).saving(shape);
+            assert_eq!(got, want, "a leaf measured from its page and from its rows");
+            let cols = shape.for_cols.iter().map(|fc| fc.col);
+            let cols = cols.chain(shape.item_cols.iter().map(|ic| ic.col));
+            let shown: usize = cols.map(|c| p.region_saving(c)).sum();
+            assert_eq!(
+                shown, want,
+                "the saving a leaf's page shows and its rows measure"
+            );
+        }
+        let mut leaves = 0;
+        if let Some(root) = &self.root {
+            walk(root, src, shape, cap, &mut leaves);
+        }
+        leaves
+    }
+}
+
 /// One node on a [`RangeCursor`]'s explicit traversal stack: the node and the half-open span
 /// `[lo, hi)` of positions still to process. A **leaf**'s positions are its in-bound record
 /// indices (its entry window). An **interior** node's positions are its overlapping child indices
@@ -1711,7 +2431,7 @@ fn node_insert(
     key: Vec<u8>,
     val: Row,
     weight: u32,
-    old: &mut Option<Row>,
+    old: &mut OldRow,
     src: Option<&dyn LeafSource>,
     cap: Cap,
     shape: &LeafShape,
@@ -1725,62 +2445,29 @@ fn node_insert(
         // A dirty node has never been published. When this Arc is also unique, editing its vectors
         // cannot affect a snapshot/cursor/read pin. Clean nodes stay immutable even if unique so
         // incremental serialization and the publication invariant remain obvious.
-        if node.page.load(Ordering::Relaxed) == 0
-            && let Some(node) = Arc::get_mut(node)
-        {
-            debug_assert!(node.packed.is_none(), "a dirty leaf is decoded");
-            let i = match found {
-                Ok(i) => {
-                    // The facts follow the row: the old one out, the new one in.
-                    let n = node.keys.len();
-                    let sizes = node.sizes.get_mut().unwrap_or_else(|e| e.into_inner());
-                    if let Some(sz) = sizes {
-                        if sz.len() == n && sz.remove_row(shape, cap, &key, &node.vals[i]) {
-                            sz.add_row(shape, cap, &key, &val);
-                        } else {
-                            *sizes = None;
-                        }
-                    }
-                    *old = Some(std::mem::replace(&mut node.vals[i], val));
-                    node.weights[i] = weight;
-                    i
-                }
-                Err(i) => {
-                    if let Some(sz) = node.sizes_mut() {
-                        sz.add_row(shape, cap, &key, &val);
-                    }
-                    node.keys.insert(i, key);
-                    node.vals.insert(i, val);
-                    node.weights.insert(i, weight);
-                    i
-                }
-            };
-            let plain = node.plain_payload(shape);
-            if plain <= cap.c || node.len() < 2 {
-                return Ok(Ins::Kept);
-            }
-            // Past its plain capacity the leaf fits only by its content-dependent savings. Keep
-            // their facts with the node, so the inserts that follow add one row to them.
-            let n = node.keys.len();
-            if node.sizes_mut().as_ref().is_none_or(|sz| sz.len() != n) {
-                let measured =
-                    LeafSizes::measure(shape, cap, n, &|i| &node.keys[i], &|i| &node.vals[i]);
-                *node.sizes_mut() = Some(Box::new(measured));
-            }
-            if plain - node.content_saving(cap, shape) <= cap.c {
-                return Ok(Ins::Kept);
-            }
-            // The same builder chooses the exact split point and separator bytes. Move the edited
-            // vectors out rather than cloning them; the returned nodes replace this emptied one.
-            let keys = std::mem::take(&mut node.keys);
-            let vals = std::mem::take(&mut node.vals);
-            let weights = std::mem::take(&mut node.weights);
-            return Ok(build_leaf(keys, vals, weights, cap, shape, Some(i)));
+        let dirty = node.page.load(Ordering::Relaxed) == 0;
+        if dirty && let Some(leaf) = Arc::get_mut(node) {
+            return leaf.leaf_put(found, key, val, weight, old, cap, shape);
+        }
+        // A packed leaf, or a dirty lazy leaf something else still holds, is copied without
+        // decoding its rows, and the copy is edited as an owned dirty leaf is (leaf_lazy.rs).
+        if leaf_lazy::on() && (node.packed.is_some() || (dirty && node.lazy.is_some())) {
+            let mut copy = Node::lazy_copy(node);
+            return Ok(
+                match copy.leaf_put(found, key, val, weight, old, cap, shape)? {
+                    Ins::Kept => Ins::Whole(Arc::new(copy)),
+                    out => out,
+                },
+            );
         }
         let (mut keys, mut vals, mut weights) = node.decoded_parts()?;
         let i = match found {
             Ok(i) => {
-                *old = Some(std::mem::replace(&mut vals[i], val));
+                let prev = std::mem::replace(&mut vals[i], val);
+                if old.want {
+                    old.row = Some(prev);
+                }
+                old.replaced = true;
                 weights[i] = weight;
                 i
             }
@@ -1916,9 +2603,10 @@ fn underfull(node: &Node, cap: Cap, shape: &LeafShape) -> bool {
 
 /// Recursive delete. Descends to the holding **leaf** (a separator equal to the key routes right and
 /// is never itself deleted — separators may go stale, format.md "Delete"). When the key is absent,
-/// `node` is left untouched and `None` is returned. Otherwise `node` ends up pointing at the
+/// `node` is left untouched and `false` is returned. Otherwise `node` ends up pointing at the
 /// post-delete subtree (possibly underfull — the caller rebalances it) and the removed row is
-/// returned; the touched child is rebalanced via [`rebalance_child`].
+/// handed to `out`, when the caller wants it; the touched child is rebalanced via
+/// [`rebalance_child`].
 ///
 /// A node that is dirty (`page == 0`) **and** uniquely owned ([`Arc::get_mut`]) is edited in place;
 /// any other node is path-copied, exactly as the INSERT path does ([`node_insert`]). Both forms run
@@ -1928,42 +2616,42 @@ fn underfull(node: &Node, cap: Cap, shape: &LeafShape) -> bool {
 fn node_remove(
     node: &mut Arc<Node>,
     key: &[u8],
+    mut out: Option<&mut Option<Row>>,
     src: Option<&dyn LeafSource>,
     cap: Cap,
     shape: &LeafShape,
-) -> Result<Option<Row>> {
+) -> Result<bool> {
     if node.is_leaf() {
         let Ok(i) = node.search(key) else {
-            return Ok(None);
+            return Ok(false);
         };
-        if node.page.load(Ordering::Relaxed) == 0
-            && let Some(leaf) = Arc::get_mut(node)
-        {
-            debug_assert!(leaf.packed.is_none(), "a dirty leaf is decoded");
-            let n = leaf.keys.len();
-            let sizes = leaf.sizes.get_mut().unwrap_or_else(|e| e.into_inner());
-            if let Some(sz) = sizes
-                && !(sz.len() == n && sz.remove_row(shape, cap, key, &leaf.vals[i]))
-            {
-                *sizes = None;
-            }
-            leaf.keys.remove(i);
-            leaf.weights.remove(i);
-            return Ok(Some(leaf.vals.remove(i)));
+        let dirty = node.page.load(Ordering::Relaxed) == 0;
+        if dirty && let Some(leaf) = Arc::get_mut(node) {
+            leaf.leaf_delete(i, key, out, cap, shape)?;
+            return Ok(true);
+        }
+        if leaf_lazy::on() && (node.packed.is_some() || (dirty && node.lazy.is_some())) {
+            let mut copy = Node::lazy_copy(node); // see `node_insert`
+            copy.leaf_delete(i, key, out, cap, shape)?;
+            *node = Arc::new(copy);
+            return Ok(true);
         }
         let (mut keys, mut vals, mut weights) = node.decoded_parts()?;
         keys.remove(i);
         let removed = vals.remove(i);
         weights.remove(i);
         *node = Node::new_leaf(keys, vals, weights);
-        return Ok(Some(removed));
+        if let Some(out) = out.as_deref_mut() {
+            *out = Some(removed);
+        }
+        return Ok(true);
     }
     let i = node.child_slot(key);
     if node.page.load(Ordering::Relaxed) == 0
         && let Some(parent) = Arc::get_mut(node)
     {
         let removed = match &mut parent.children[i] {
-            Child::Resident(c) => node_remove(c, key, src, cap, shape)?,
+            Child::Resident(c) => node_remove(c, key, out, src, cap, shape)?,
             Child::OnDisk(page) => {
                 // Fault the untouched leaf; it becomes a resident (rebuilt, dirty) child only when
                 // the key was actually there.
@@ -1976,14 +2664,14 @@ fn node_remove(
                         )
                     }
                 };
-                let removed = node_remove(&mut c, key, src, cap, shape)?;
-                if removed.is_some() {
+                let removed = node_remove(&mut c, key, out, src, cap, shape)?;
+                if removed {
                     parent.children[i] = Child::Resident(c);
                 }
                 removed
             }
         };
-        if removed.is_some() {
+        if removed {
             rebalance_child(parent, i, src, cap, shape)?;
         }
         return Ok(removed);
@@ -1991,9 +2679,9 @@ fn node_remove(
     // Shared or published: path-copy. The local `Arc` clone keeps a resident child from looking
     // unique, so the whole remaining path below a shared node is copied too.
     let mut c = child(node, i, src)?;
-    let removed = node_remove(&mut c, key, src, cap, shape)?;
-    if removed.is_none() {
-        return Ok(None);
+    let removed = node_remove(&mut c, key, out, src, cap, shape)?;
+    if !removed {
+        return Ok(false);
     }
     let mut children = node.children.clone();
     children[i] = Child::Resident(c);
@@ -2085,6 +2773,7 @@ fn into_parts(slot: &mut Child, parts: LeafParts) -> (Vec<Vec<u8>>, Vec<Row>, Ve
                 unreachable!("a Take operand is resident")
             };
             let n = Arc::get_mut(n).expect("a Take operand stays uniquely owned");
+            n.wsum = 0;
             (
                 std::mem::take(&mut n.keys),
                 std::mem::take(&mut n.vals),
@@ -2150,7 +2839,7 @@ fn merge_at(
         // decoded here, once, and that copy then becomes its part of the merged leaf.
         let mut ldec = None;
         let mut rdec = None;
-        let (weights, split) = {
+        let (weights, plan) = {
             let operand = |slot: &Child, loaded: &Option<Arc<Node>>| -> Arc<Node> {
                 match (slot, loaded) {
                     (Child::Resident(n), _) => Arc::clone(n),
@@ -2162,10 +2851,11 @@ fn merge_at(
             };
             let lnode = operand(&node.children[j], &lloaded);
             let rnode = operand(&node.children[j + 1], &rloaded);
-            if lnode.packed.is_some() {
+            // A lazy operand is decoded like a packed one: a merge needs every row.
+            if lnode.packed.is_some() || lnode.lazy.is_some() {
                 ldec = Some(lnode.decoded_parts()?);
             }
-            if rnode.packed.is_some() {
+            if rnode.packed.is_some() || rnode.lazy.is_some() {
                 rdec = Some(rnode.decoded_parts()?);
             }
             type View<'v> = (&'v [Vec<u8>], &'v [Row], &'v [u32]);
@@ -2186,21 +2876,18 @@ fn merge_at(
             weights.extend_from_slice(rw);
             let key = |i: usize| -> &[u8] { if i < ln { &lk[i] } else { &rk[i - ln] } };
             let row = |i: usize| -> &[Value] { if i < ln { &lv[i] } else { &rv[i - ln] } };
-            let split = match leaf_split_point(&weights, &key, &row, cap, shape, None) {
-                LeafSplit::Whole => None,
-                LeafSplit::Two(m) => Some(m),
+            let plan = leaf_split_point(&weights, &key, &row, cap, shape, None);
+            match plan.split {
+                LeafSplit::Whole => {}
+                // The replacement separator would overflow the parent: abandon the merge — the
+                // two children and the parent separator stay exactly as they were.
+                LeafSplit::Two(m) if parent_with(key(m).len()) > cap.c => return Ok(()),
+                LeafSplit::Two(_) => {}
                 // Unreachable: splitting between the two leaves gives two fitting halves. Abandon
                 // the merge rather than hand the parent more than two nodes.
                 LeafSplit::Multi(_) => return Ok(()),
-            };
-            if let Some(m) = split
-                && parent_with(key(m).len()) > cap.c
-            {
-                // The replacement separator would overflow the parent: abandon the merge — the
-                // two children and the parent separator stay exactly as they were.
-                return Ok(());
             }
-            (weights, split)
+            (weights, plan)
         };
         let (lslot, rslot) = node.children.split_at_mut(j + 1);
         let (lslot, rslot) = (&mut lslot[j], &mut rslot[0]);
@@ -2214,7 +2901,7 @@ fn merge_at(
         };
         let (lkeys, lvals, _) = into_parts(lslot, lparts);
         let (rkeys, rvals, _) = into_parts(rslot, rparts);
-        merged_leaf(lkeys, lvals, rkeys, rvals, weights, split)
+        merged_leaf(lkeys, lvals, rkeys, rvals, weights, plan)
     } else {
         // Interior operands are always resident. Their separator/child lists are copied (cheap
         // `Arc` bumps): an abandoned merge must leave both exactly as they were.
@@ -2260,7 +2947,7 @@ fn merge_at(
 
 /// The leaf (or, split at `split`, the two leaves) holding the left operand's records then the
 /// right's — [`build_leaf`] over their concatenation, with `weights` already concatenated and its
-/// split point already found. Each half is assembled once from the two operands' vectors rather than
+/// split point (`plan`, never multi-way) already found. Each half is assembled once from the two operands' vectors rather than
 /// concatenated and then split, so a record's slot is moved once.
 fn merged_leaf(
     mut lkeys: Vec<Vec<u8>>,
@@ -2268,13 +2955,14 @@ fn merged_leaf(
     mut rkeys: Vec<Vec<u8>>,
     mut rvals: Vec<Row>,
     mut weights: Vec<u32>,
-    split: Option<usize>,
+    plan: LeafPlan,
 ) -> Ins {
-    let Some(m) = split else {
+    let LeafSplit::Two(m) = plan.split else {
         lkeys.append(&mut rkeys);
         lvals.append(&mut rvals);
-        return Ins::Whole(Node::new_leaf(lkeys, lvals, weights));
+        return Ins::Whole(Node::new_leaf_sized(lkeys, lvals, weights, plan.whole));
     };
+    let (lsizes, rsizes) = plan.halves.unzip();
     let rweights = weights.split_off(m);
     let (left, right) = if m < lkeys.len() {
         // The right half is the left operand's tail, then the whole right operand.
@@ -2294,9 +2982,9 @@ fn merged_leaf(
     };
     let sep = right.0[0].clone();
     Ins::Split {
-        left: Node::new_leaf(left.0, left.1, weights),
+        left: Node::new_leaf_sized(left.0, left.1, weights, lsizes),
         sep,
-        right: Node::new_leaf(right.0, right.1, rweights),
+        right: Node::new_leaf_sized(right.0, right.1, rweights, rsizes),
         more: Vec::new(),
     }
 }
@@ -3115,6 +3803,46 @@ mod leaf_sizes_tests {
             s.execute(sql, &[])
                 .unwrap_or_else(|e| panic!("{sql}: {e:?}"));
         }
+        leaf_sizes_check::set(false);
+    }
+
+    /// A split or merge classifies its rows once (`LeafScan`): the running split point must equal
+    /// the tabled one, and the facts it hands the whole leaf or the halves a fresh measurement.
+    /// Text with no repeated value keeps a dictionary as distinct (the facts are dropped when a row is added);
+    /// text with repeats is counted into a set.
+    #[test]
+    fn scanned_leaf_facts_and_running_split_match_the_tables() {
+        leaf_sizes_check::set(true);
+        for lazy in [true, false] {
+            super::leaf_lazy::set(lazy);
+            let db = Database::create(CreateOptions::default()).unwrap();
+            let mut s = db.session(SessionOptions::default());
+            let steps = [
+                "CREATE TABLE u (id bigint PRIMARY KEY, name text, tag text, n bigint, \
+                 a bigint[])",
+                "INSERT INTO u SELECT x, 'name-' || x, 'tag-' || (x % 7), x % 50, ARRAY[x % 4] \
+                 FROM generate_series(1, 8000) AS g(x)",
+                // Merges of leaves whose `name` never repeats, then inserts back into them.
+                "DELETE FROM u WHERE id % 4 <> 0",
+                "INSERT INTO u SELECT x, 'again-' || x, NULL, NULL, NULL \
+                 FROM generate_series(1, 8000) AS g(x) WHERE x % 8 = 1",
+                // Replacements in leaves a split or merge just built; some make `name` repeat.
+                "UPDATE u SET name = 'same' WHERE id % 16 = 0",
+                "UPDATE u SET name = repeat('long-', 40) || id WHERE id % 12 = 0",
+                "DELETE FROM u WHERE id % 3 = 0",
+                "UPDATE u SET name = 'n' || id, tag = 't' || id, n = id, a = ARRAY[id, 1]",
+                "DELETE FROM u WHERE id % 5 <> 0",
+                "INSERT INTO u SELECT x, 'k', 'k', 1, '{}'::bigint[] \
+                 FROM generate_series(8001, 12000) AS g(x)",
+                "DELETE FROM u WHERE id % 2 = 0",
+                "DELETE FROM u",
+            ];
+            for sql in steps {
+                s.execute(sql, &[])
+                    .unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+            }
+        }
+        super::leaf_lazy::set(true);
         leaf_sizes_check::set(false);
     }
 }

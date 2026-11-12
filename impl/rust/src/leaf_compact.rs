@@ -124,7 +124,7 @@ fn fixed_key_width(ty: &ColType) -> Option<usize> {
 }
 
 /// Whether a stored fixed-width column's value body is the sign-flipped big-endian integer body.
-fn for_eligible(ty: &ColType) -> bool {
+pub(super) fn for_eligible(ty: &ColType) -> bool {
     matches!(
         ty,
         ColType::Scalar(
@@ -326,7 +326,7 @@ pub(crate) fn put_be_uint(b: &mut [u8], mut v: u64) {
 
 /// The unsigned image of a present value of a base-plus-offsets column: its value body read as a
 /// big-endian integer (the sign bit flipped at the column's width).
-fn for_slot(ty: &ColType, w: usize, v: &Value) -> u64 {
+pub(super) fn for_slot(ty: &ColType, w: usize, v: &Value) -> u64 {
     let x = match (ty, v) {
         (_, Value::Int(n)) => *n,
         (_, Value::Timestamp(m) | Value::Timestamptz(m)) => *m,
@@ -364,7 +364,7 @@ pub(crate) fn span_item<'a>(ty: &ColType, span: &'a [u8]) -> Item<'a> {
 }
 
 /// A dictionary region's facts: `d` entries, and `dup` bytes of spans that repeat an earlier entry.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct DictAcc<'a> {
     /// The rows holding each shared payload.
     seen: HashMap<Cow<'a, [u8]>, usize>,
@@ -374,6 +374,10 @@ pub(crate) struct DictAcc<'a> {
     /// No value is ever removed. More than 256 entries then rule the dictionary out for good
     /// ([`dict_saving`]), so the rest are not counted.
     add_only: bool,
+    /// Every shared payload counted occurs once and `seen` is not kept (a leaf measured by
+    /// [`LeafScan`]). Removing a value then needs no lookup; a shared value cannot be added (the
+    /// writer drops the facts first).
+    distinct: bool,
 }
 
 impl<'a> DictAcc<'a> {
@@ -391,12 +395,43 @@ impl<'a> DictAcc<'a> {
             }
             Item::Own => self.d += 1,
             Item::Shared(p) => {
+                assert!(
+                    !self.distinct,
+                    "BUG: a value added to a dictionary kept as distinct"
+                );
                 if let Some(rows) = self.seen.get_mut(p.as_ref()) {
                     *rows += 1;
                     self.dup += 1 + p.len(); // the span: its tag and content
                 } else {
                     self.seen.insert(keep(p), 1);
                     self.d += 1;
+                }
+            }
+        }
+    }
+
+    /// [`add`](Self::add) for `k` values with the same item (`k ≥ 1`).
+    pub(super) fn add_n(&mut self, it: &Item<'_>, k: usize) {
+        match it {
+            Item::Null => {
+                if self.nulls == 0 {
+                    self.d += 1;
+                }
+                self.nulls += k;
+            }
+            Item::Own => self.d += k,
+            Item::Shared(p) => {
+                assert!(
+                    !self.distinct,
+                    "BUG: a value added to a dictionary kept as distinct"
+                );
+                if let Some(rows) = self.seen.get_mut(p.as_ref()) {
+                    *rows += k;
+                    self.dup += k * (1 + p.len());
+                } else {
+                    self.seen.insert(Cow::Owned(p.to_vec()), k);
+                    self.d += 1;
+                    self.dup += (k - 1) * (1 + p.len());
                 }
             }
         }
@@ -413,6 +448,7 @@ impl<'a> DictAcc<'a> {
                 }
             }
             Item::Own => self.d -= 1,
+            Item::Shared(_) if self.distinct => self.d -= 1,
             Item::Shared(p) => match self.seen.get_mut(p.as_ref()) {
                 Some(rows) if *rows > 1 => {
                     *rows -= 1;
@@ -551,10 +587,10 @@ pub(crate) fn put_bits(b: &mut [u8], at: usize, bw: usize, v: u64) {
 
 /// The copyable facts of one item column, which split planning records at every boundary.
 #[derive(Clone, Copy, Default, Debug)]
-struct ColFacts {
-    d: usize,
-    dup: usize,
-    arr: ArrAcc,
+pub(super) struct ColFacts {
+    pub(super) d: usize,
+    pub(super) dup: usize,
+    pub(super) arr: ArrAcc,
 }
 
 fn item_saving(ic: &ItemCol, n: usize, f: &ColFacts) -> usize {
@@ -566,14 +602,19 @@ fn item_saving(ic: &ItemCol, n: usize, f: &ColFacts) -> usize {
 }
 
 /// One item column's accumulator: its dictionary set, and its facts so far.
-#[derive(Default)]
-struct ColAcc<'a> {
-    dict: DictAcc<'a>,
-    f: ColFacts,
+#[derive(Clone, Default)]
+pub(super) struct ColAcc<'a> {
+    pub(super) dict: DictAcc<'a>,
+    pub(super) f: ColFacts,
 }
 
 impl<'a> ColAcc<'a> {
-    fn add(&mut self, ic: &ItemCol, it: &Item<'_>, keep: impl FnOnce(&[u8]) -> Cow<'a, [u8]>) {
+    pub(super) fn add(
+        &mut self,
+        ic: &ItemCol,
+        it: &Item<'_>,
+        keep: impl FnOnce(&[u8]) -> Cow<'a, [u8]>,
+    ) {
         if ic.arr_w != 0 {
             self.f.arr.add(it, ic.arr_w);
         } else {
@@ -584,7 +625,7 @@ impl<'a> ColAcc<'a> {
     }
 
     /// Take out one value [`add`](Self::add) was given; `false` when the facts cannot be kept exact.
-    fn remove(&mut self, ic: &ItemCol, it: &Item<'_>) -> bool {
+    pub(super) fn remove(&mut self, ic: &ItemCol, it: &Item<'_>) -> bool {
         if ic.arr_w != 0 {
             return self.f.arr.remove(it, ic.arr_w);
         }
@@ -605,7 +646,7 @@ impl<'a> ColAcc<'a> {
 /// Classify a decoded row's item-column values into `out` (one per `shape.item_cols`). A value is
 /// inline-plain when the record's disposition plan leaves it so; the plan is computed only when the
 /// all-inline record does not fit `RECORD_MAX`.
-fn row_items<'a>(
+pub(super) fn row_items<'a>(
     shape: &LeafShape,
     cap: Cap,
     key: &[u8],
@@ -653,24 +694,66 @@ fn row_items<'a>(
     }
 }
 
-/// The content-dependent size facts of a dirty decoded leaf, kept with the node so an insert,
+/// The content-dependent size facts of a dirty leaf, kept with the node so an insert,
 /// delete or row replacement updates them for one row instead of measuring the leaf again: each
 /// base-plus-offsets column's value span and each item column's dictionary or packed-array facts.
 /// [`add_row`](Self::add_row) and [`remove_row`](Self::remove_row) keep them equal to a fresh
 /// measurement of the node's rows.
+#[derive(Clone)]
 pub(crate) struct LeafSizes {
-    n: usize,
-    fors: Vec<ForRange>,
+    pub(super) n: usize,
+    pub(super) fors: Vec<ForRange>,
     /// Each base-plus-offsets column's present values.
-    for_cnt: Vec<usize>,
+    pub(super) for_cnt: Vec<usize>,
     /// A column whose range lost a value at one of its ends: `fors` then only contains the true
     /// range, until [`refresh`](Self::refresh) rescans the column. `stale` says any column is.
-    for_stale: Vec<bool>,
-    stale: bool,
-    accs: Vec<ColAcc<'static>>,
+    pub(super) for_stale: Vec<bool>,
+    pub(super) stale: bool,
+    pub(super) accs: Vec<ColAcc<'static>>,
+    /// A frozen column (leaf_lazy.rs): its saving is the one its leaf's page shows (`for_save` /
+    /// `item_save`), and its other facts are unset. `frozen` counts them. Only a lazy leaf whose
+    /// rows are its page's has any.
+    pub(super) for_frozen: Vec<bool>,
+    pub(super) for_save: Vec<usize>,
+    pub(super) item_frozen: Vec<bool>,
+    pub(super) item_save: Vec<usize>,
+    pub(super) frozen: usize,
+    /// Some column's dictionary is kept as distinct ([`LeafScan::sizes`]): the facts are dropped
+    /// before a row is added.
+    distinct: bool,
 }
 
 impl LeafSizes {
+    /// The facts of a leaf of no records.
+    pub(super) fn empty(shape: &LeafShape) -> LeafSizes {
+        let (fors, items) = (shape.for_cols.len(), shape.item_cols.len());
+        LeafSizes {
+            n: 0,
+            fors: vec![ForRange::default(); fors],
+            for_cnt: vec![0; fors],
+            for_stale: vec![false; fors],
+            stale: false,
+            accs: shape.item_cols.iter().map(|_| ColAcc::default()).collect(),
+            for_frozen: vec![false; fors],
+            for_save: vec![0; fors],
+            item_frozen: vec![false; items],
+            item_save: vec![0; items],
+            frozen: 0,
+            distinct: false,
+        }
+    }
+
+    /// Whether some dictionary is kept as distinct: such facts cannot take a row, so the writer
+    /// drops them before an insert or replacement.
+    pub(crate) fn distinct(&self) -> bool {
+        self.distinct
+    }
+
+    /// How many columns are frozen at their page's saving.
+    pub(crate) fn frozen(&self) -> usize {
+        self.frozen
+    }
+
     /// Measure a leaf of `n` records.
     pub(crate) fn measure<'a>(
         shape: &LeafShape,
@@ -679,14 +762,7 @@ impl LeafSizes {
         key: &dyn Fn(usize) -> &'a [u8],
         row: &dyn Fn(usize) -> &'a [Value],
     ) -> LeafSizes {
-        let mut sz = LeafSizes {
-            n: 0,
-            fors: vec![ForRange::default(); shape.for_cols.len()],
-            for_cnt: vec![0; shape.for_cols.len()],
-            for_stale: vec![false; shape.for_cols.len()],
-            stale: false,
-            accs: shape.item_cols.iter().map(|_| ColAcc::default()).collect(),
-        };
+        let mut sz = LeafSizes::empty(shape);
         for i in 0..n {
             sz.add_row(shape, cap, key(i), row(i));
         }
@@ -694,6 +770,7 @@ impl LeafSizes {
     }
 
     pub(crate) fn add_row(&mut self, shape: &LeafShape, cap: Cap, key: &[u8], row: &[Value]) {
+        debug_assert_eq!(self.frozen, 0, "a frozen column takes no row");
         self.n += 1;
         for (j, fc) in shape.for_cols.iter().enumerate() {
             let v = &row[fc.col];
@@ -722,6 +799,7 @@ impl LeafSizes {
         key: &[u8],
         row: &[Value],
     ) -> bool {
+        debug_assert_eq!(self.frozen, 0, "a frozen column gives up no row");
         if !shape.item_cols.is_empty() {
             let mut items = Vec::with_capacity(shape.item_cols.len());
             row_items(shape, cap, key, row, &mut items);
@@ -798,6 +876,9 @@ impl LeafSizes {
             .iter()
             .enumerate()
             .map(|(j, fc)| {
+                if self.for_frozen[j] {
+                    return self.for_save[j];
+                }
                 let r = if self.for_stale[j] {
                     NARROWEST
                 } else {
@@ -810,14 +891,22 @@ impl LeafSizes {
             .accs
             .iter()
             .zip(&shape.item_cols)
-            .map(|(acc, ic)| item_saving(ic, self.n, &acc.f))
+            .enumerate()
+            .map(|(j, (acc, ic))| {
+                if self.item_frozen[j] {
+                    self.item_save[j]
+                } else {
+                    item_saving(ic, self.n, &acc.f)
+                }
+            })
             .sum();
         fors + items
     }
 }
 
 /// The bytes a decoded leaf's content-dependent encodings save: the shared key prefix and its
-/// regions' base-plus-offsets, dictionary and packed-array forms.
+/// regions' base-plus-offsets, dictionary and packed-array forms, measured afresh.
+#[cfg(test)]
 pub(crate) fn leaf_saving<'a>(
     shape: &LeafShape,
     cap: Cap,
@@ -952,6 +1041,273 @@ impl<'a, 'k> SplitFacts<'a, 'k> {
     pub(crate) fn right(&self, shape: &LeafShape, m: usize) -> usize {
         leaf_prefix_saving(self.n - m, (self.key)(m), (self.key)(self.n - 1))
             + Self::regions(shape, self.n - m, m, &self.for_suf, &self.item_suf)
+    }
+}
+
+/// One dictionary column's values by row, from one pass over a leaf: whether each shared value is
+/// the first, and the last, of its payload. `dups` says some payload repeats.
+struct DictScan {
+    first: Vec<bool>,
+    last: Vec<bool>,
+    dups: bool,
+}
+
+/// A leaf's rows classified once, with every dictionary column scanned: the whole leaf's size
+/// facts, the two-way split point and each half's facts all come from it with no further hashing.
+pub(crate) struct LeafScan<'a> {
+    n: usize,
+    /// `items[i·J + j]` is record `i`'s item for item column `j`.
+    items: Vec<Item<'a>>,
+    /// Per item column; `None` for a packed-array column.
+    dicts: Vec<Option<DictScan>>,
+    dups: bool,
+}
+
+impl<'a> LeafScan<'a> {
+    pub(crate) fn new(
+        shape: &LeafShape,
+        cap: Cap,
+        n: usize,
+        key: &dyn Fn(usize) -> &'a [u8],
+        row: &dyn Fn(usize) -> &'a [Value],
+    ) -> LeafScan<'a> {
+        let cols = shape.item_cols.len();
+        let mut items: Vec<Item<'a>> = Vec::with_capacity(n * cols);
+        if cols != 0 {
+            for i in 0..n {
+                row_items(shape, cap, key(i), row(i), &mut items);
+            }
+        }
+        let mut dicts = Vec::with_capacity(cols);
+        let mut dups = false;
+        for (j, ic) in shape.item_cols.iter().enumerate() {
+            if ic.arr_w != 0 {
+                dicts.push(None);
+                continue;
+            }
+            let mut sc = DictScan {
+                first: vec![false; n],
+                last: vec![false; n],
+                dups: false,
+            };
+            // payload -> its latest row
+            let mut at: HashMap<&[u8], usize> = HashMap::with_capacity(n);
+            for i in 0..n {
+                let Item::Shared(p) = &items[i * cols + j] else {
+                    continue;
+                };
+                match at.insert(p.as_ref(), i) {
+                    Some(prev) => {
+                        sc.last[prev] = false;
+                        sc.dups = true;
+                    }
+                    None => sc.first[i] = true,
+                }
+                sc.last[i] = true;
+            }
+            dups |= sc.dups;
+            dicts.push(Some(sc));
+        }
+        LeafScan {
+            n,
+            items,
+            dicts,
+            dups,
+        }
+    }
+
+    /// Whether any dictionary column repeats a payload.
+    pub(crate) fn dups(&self) -> bool {
+        self.dups
+    }
+
+    /// The size facts of records `[lo, hi)`. A dictionary column with no repeated payload is kept
+    /// as distinct, with no set; one with repeats is counted into a set, which needs the whole
+    /// leaf (`lo = 0`, `hi = N`).
+    pub(crate) fn sizes(
+        &self,
+        shape: &LeafShape,
+        row: &dyn Fn(usize) -> &'a [Value],
+        lo: usize,
+        hi: usize,
+    ) -> LeafSizes {
+        let cols = shape.item_cols.len();
+        let mut sz = LeafSizes::empty(shape);
+        sz.n = hi - lo;
+        for (j, fc) in shape.for_cols.iter().enumerate() {
+            let ty = &shape.col_types[fc.col];
+            for i in lo..hi {
+                let v = &row(i)[fc.col];
+                if !matches!(v, Value::Null) {
+                    sz.fors[j].add(for_slot(ty, fc.w, v));
+                    sz.for_cnt[j] += 1;
+                }
+            }
+        }
+        let mut distinct = false;
+        for (j, ic) in shape.item_cols.iter().enumerate() {
+            let acc = &mut sz.accs[j];
+            let col = (lo..hi).map(|i| &self.items[i * cols + j]);
+            match &self.dicts[j] {
+                None => col.for_each(|it| acc.f.arr.add(it, ic.arr_w)),
+                Some(sc) if !sc.dups => {
+                    let d = &mut acc.dict;
+                    d.distinct = true;
+                    distinct = true;
+                    for it in col {
+                        match it {
+                            Item::Null => d.nulls += 1,
+                            _ => d.d += 1,
+                        }
+                    }
+                    if d.nulls > 0 {
+                        d.d += 1;
+                    }
+                    acc.f.d = d.d;
+                }
+                Some(_) => {
+                    assert!(
+                        lo == 0 && hi == self.n,
+                        "BUG: part of a leaf whose dictionary repeats a payload"
+                    );
+                    col.for_each(|it| acc.add(ic, it, |p| Cow::Owned(p.to_vec())));
+                }
+            }
+        }
+        sz.distinct = distinct;
+        sz
+    }
+
+    /// The two-way split point of a leaf that does not fit (format.md "Split point"), over running
+    /// facts instead of per-boundary tables: one pass up from the first record while the left half
+    /// fits, one pass down from the last while the right half does. Both half sizes are monotone in
+    /// `m`, so the passes stop at the first boundary that does not fit; the balanced boundary, when
+    /// it lies past the last fitting one, is clamped to it either way. `prefix[m]` is the records'
+    /// summed weight over `[0, m)` and `payload` the whole leaf's. `None` when no two halves fit.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn split_point(
+        &self,
+        shape: &LeafShape,
+        cap_bytes: usize,
+        key: &dyn Fn(usize) -> &'a [u8],
+        row: &dyn Fn(usize) -> &'a [Value],
+        prefix: &[usize],
+        payload: usize,
+        right_edge: bool,
+    ) -> Option<usize> {
+        let n = self.n;
+        let total = prefix[n];
+        let mut run = RunningFacts::new(shape);
+        let (mut m_max, mut m_balanced) = (None, None);
+        for m in 1..n {
+            run.add(self, shape, row(m - 1), m - 1, true);
+            let left = prefix[m] + leaf_overhead(m, shape)
+                - leaf_prefix_saving(m, key(0), key(m - 1))
+                - run.saving(shape, m);
+            if left > cap_bytes {
+                break;
+            }
+            m_max = Some(m);
+            if m_balanced.is_none() && 2 * left >= payload {
+                m_balanced = Some(m);
+            }
+        }
+        let m_max = m_max?;
+        let mut run = RunningFacts::new(shape);
+        let mut m_min = None;
+        for m in (1..n).rev() {
+            run.add(self, shape, row(m), m, false);
+            let right = total - prefix[m] + leaf_overhead(n - m, shape)
+                - leaf_prefix_saving(n - m, key(m), key(n - 1))
+                - run.saving(shape, n - m);
+            if right > cap_bytes {
+                break;
+            }
+            m_min = Some(m);
+        }
+        let m_min = m_min?;
+        if m_min > m_max {
+            return None;
+        }
+        let m = match m_balanced {
+            Some(m) if !right_edge => m,
+            _ => m_max,
+        };
+        Some(m.max(m_min))
+    }
+}
+
+/// The content facts of a half that grows by one record at a time ([`LeafScan::split_point`]).
+struct RunningFacts {
+    fors: Vec<ForRange>,
+    facts: Vec<ColFacts>,
+    /// Per item column: the half holds a NULL.
+    nulls: Vec<bool>,
+}
+
+impl RunningFacts {
+    fn new(shape: &LeafShape) -> RunningFacts {
+        RunningFacts {
+            fors: vec![ForRange::default(); shape.for_cols.len()],
+            facts: vec![ColFacts::default(); shape.item_cols.len()],
+            nulls: vec![false; shape.item_cols.len()],
+        }
+    }
+
+    /// Take record `i` (whose row is `row`) into the half; `up` says the half grows from the
+    /// first record.
+    fn add(&mut self, scan: &LeafScan<'_>, shape: &LeafShape, row: &[Value], i: usize, up: bool) {
+        for (r, fc) in self.fors.iter_mut().zip(&shape.for_cols) {
+            let v = &row[fc.col];
+            if !matches!(v, Value::Null) {
+                r.add(for_slot(&shape.col_types[fc.col], fc.w, v));
+            }
+        }
+        let cols = shape.item_cols.len();
+        for (j, ic) in shape.item_cols.iter().enumerate() {
+            let it = &scan.items[i * cols + j];
+            let f = &mut self.facts[j];
+            let Some(sc) = &scan.dicts[j] else {
+                f.arr.add(it, ic.arr_w);
+                continue;
+            };
+            match it {
+                Item::Null => {
+                    if !self.nulls[j] {
+                        self.nulls[j] = true;
+                        f.d += 1;
+                    }
+                }
+                Item::Own => f.d += 1,
+                Item::Shared(p) => {
+                    // A value repeats one already in the half exactly when it is not the first of
+                    // its payload (growing up) or not the last (growing down).
+                    let fresh = if up { sc.first[i] } else { sc.last[i] };
+                    if fresh {
+                        f.d += 1;
+                    } else {
+                        f.dup += 1 + p.len(); // the span: its tag and content
+                    }
+                }
+            }
+        }
+    }
+
+    /// The bytes the half's regions save, at `count` records.
+    fn saving(&self, shape: &LeafShape, count: usize) -> usize {
+        let fors: usize = shape
+            .for_cols
+            .iter()
+            .zip(&self.fors)
+            .map(|(fc, &r)| for_saving(count, fc.w, r))
+            .sum();
+        let items: usize = shape
+            .item_cols
+            .iter()
+            .zip(&self.facts)
+            .map(|(ic, f)| item_saving(ic, count, f))
+            .sum();
+        fors + items
     }
 }
 

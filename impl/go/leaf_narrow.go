@@ -380,6 +380,10 @@ type dictAcc struct {
 	// addOnly says no value is ever removed. More than 256 entries then rule the dictionary out for
 	// good (dictSaving), so the rest are not counted.
 	addOnly bool
+	// distinct says every shared payload counted occurs once and seen is not kept (a leaf measured by
+	// scanDicts). Removing a value then needs no lookup; a shared value cannot be added (the writer
+	// drops the facts first).
+	distinct bool
 }
 
 func (a *dictAcc) add(it dictItem, header int) {
@@ -420,7 +424,9 @@ func (a *dictAcc) remove(it dictItem, header int) {
 	case dictOwn:
 		a.d--
 	default:
-		if k := a.seen[string(it.payload)]; k > 1 {
+		if a.distinct {
+			a.d--
+		} else if k := a.seen[string(it.payload)]; k > 1 {
 			a.seen[string(it.payload)] = k - 1
 			a.dup -= header + len(it.payload)
 		} else {
@@ -455,6 +461,30 @@ func spanDictItem(span []byte) dictItem {
 	return dictItem{kind: dictOwn}
 }
 
+// neverInline reports whether the disposition plan is certain to move column c's value out of its
+// inline-plain form, decided without running the plan: a spillable value whose inline-plain size
+// alone exceeds RECORD_MAX (and its pointer). While such a value stays inline-plain the record
+// exceeds RECORD_MAX, so neither pass stops early: pass 1 adopts its compressed form, or pass 2,
+// where it is a candidate, reaches and externalizes it.
+func neverInline(shape leafShape, pcap pageCap, row storedRow, c int) bool {
+	ty := shape.colTypes[c]
+	if _, fixed := fixedValueWidth(ty); fixed || !isSpillable(ty) {
+		return false
+	}
+	inline, _ := valueFacts(ty, row[c])
+	return inline > recordMaxFor(pcap.c, len(shape.colTypes)) && inline > externalPtrLen+pcap.tag
+}
+
+// itemsNeverInline reports whether every item column of row is NULL or neverInline.
+func itemsNeverInline(shape leafShape, pcap pageCap, row storedRow) bool {
+	for _, c := range shape.itemCols {
+		if !row[c].IsNull() && !neverInline(shape, pcap, row, c) {
+			return false
+		}
+	}
+	return true
+}
+
 // rowItems classifies a decoded row's item-column values into out (one per shape.itemCols). A value
 // is inline-plain when the record's disposition plan leaves it so; the plan is consulted only when the
 // all-inline record does not fit RECORD_MAX.
@@ -466,6 +496,26 @@ func rowItems(shape leafShape, pcap pageCap, key []byte, row storedRow, out []di
 	}
 	var plan *recordPlan
 	if size > recordMaxFor(pcap.c, len(shape.colTypes)) {
+		if itemsNeverInline(shape, pcap, row) {
+			// Every item value is NULL or too large to stay inline-plain under any plan: the
+			// classification is known without planning.
+			if leafSizesCheck.Load() {
+				plan := planDispositionsMemo(shape.colTypes, key, row, pcap, shape.memo)
+				for _, c := range shape.itemCols {
+					if !row[c].IsNull() && plan.disp[c] == dispInline {
+						panic("BUG: a never-inline value the plan leaves inline")
+					}
+				}
+			}
+			for j, c := range shape.itemCols {
+				if row[c].IsNull() {
+					out[j] = dictItem{kind: dictNull}
+				} else {
+					out[j] = dictItem{kind: dictOwn}
+				}
+			}
+			return
+		}
 		p := planDispositionsMemo(shape.colTypes, key, row, pcap, shape.memo)
 		plan = &p
 	}
@@ -508,6 +558,17 @@ type leafSizes struct {
 	// not fit as plain regions when these facts were built.
 	coded bool
 	items []dictItem // scratch
+	// PROTOTYPE (leaf_lazy.go): a frozen column's saving is the one its page shows (forSave /
+	// itemSave), and its other facts are unset. frozen counts them; the slices are nil when none ever
+	// was.
+	forFrozen, itemFrozen []bool
+	forSave, itemSave     []int
+	frozen                int
+	items2                []dictItem // scratch
+	// distinct says some column's dictionary is kept as distinct (dictAcc.distinct): the facts are
+	// dropped before a row is added.
+	distinct          bool
+	redoFor, redoItem []int // columns replaceCols leaves for remeasure
 }
 
 // allRowItems classifies every row (items[i][j] is row i's item for shape.itemCols[j]); nil when the
@@ -609,9 +670,106 @@ func (sz *leafSizes) addRow(shape leafShape, pcap pageCap, key []byte, row store
 		return
 	}
 	rowItems(shape, pcap, key, row, sz.items)
+	for j := range shape.itemCols {
+		if sz.accs[j].dict.distinct && sz.items[j].kind == dictShared {
+			panic("BUG: a value added to a dictionary kept as distinct")
+		}
+	}
 	for j, c := range shape.itemCols {
 		sz.accs[j].add(shape, j, sz.items[j], sz.tab(shape, j, c))
 	}
+}
+
+// dictScan is one dictionary column's values by row, from one pass over a leaf: whether each shared
+// value is the first, and the last, of its payload. dups says some payload repeats.
+type dictScan struct {
+	first, last []bool
+	dups        bool
+}
+
+// scanDicts scans every dictionary column of a leaf's classified rows (indexed like shape.itemCols;
+// a column with no dictionary has no flags).
+func scanDicts(shape leafShape, items [][]dictItem) []dictScan {
+	scans := make([]dictScan, len(shape.itemCols))
+	n := len(items)
+	for j := range shape.itemCols {
+		if !shape.itemDict[j] {
+			continue
+		}
+		flags := make([]bool, 2*n)
+		sc := dictScan{first: flags[:n], last: flags[n:]}
+		at := make(map[string]int32, n) // payload -> 1 + its latest row
+		for i := range items {
+			it := items[i][j]
+			if it.kind != dictShared {
+				continue
+			}
+			if prev := at[string(it.payload)]; prev > 0 {
+				sc.last[prev-1] = false
+				sc.dups = true
+			} else {
+				sc.first[i] = true
+			}
+			sc.last[i] = true
+			at[string(it.payload)] = int32(i + 1)
+		}
+		scans[j] = sc
+	}
+	return scans
+}
+
+// leafSizesScanned is the size facts of rows [lo, hi) of a leaf with no symbol table, whose
+// dictionary columns scanDicts scanned. A column with no repeated payload is kept as distinct, with
+// no map; one with repeats is counted into a map, which needs the whole leaf (lo = 0, hi = len).
+func leafSizesScanned(shape leafShape, rows []storedRow, items [][]dictItem, scans []dictScan, lo, hi int) *leafSizes {
+	sz := &leafSizes{
+		n:        hi - lo,
+		accs:     make([]colAcc, len(shape.itemCols)),
+		fors:     make([]forRange, len(shape.forCols)),
+		forCnt:   make([]int, len(shape.forCols)),
+		forStale: make([]bool, len(shape.forCols)),
+		items:    make([]dictItem, len(shape.itemCols)),
+	}
+	for j, fc := range shape.forCols {
+		for _, row := range rows[lo:hi] {
+			if v := row[fc.col]; !v.IsNull() {
+				sz.fors[j].add(forSlot(fc, v))
+				sz.forCnt[j]++
+			}
+		}
+	}
+	for j, c := range shape.itemCols {
+		acc := &sz.accs[j]
+		if shape.itemDict[j] {
+			d := &acc.dict
+			if !scans[j].dups {
+				d.distinct, sz.distinct = true, true
+				for i := lo; i < hi; i++ {
+					if items[i][j].kind == dictNull {
+						d.nulls++
+					} else {
+						d.d++
+					}
+				}
+				if d.nulls > 0 {
+					d.d++
+				}
+			} else {
+				header := inlineHeaderLen(shape.colTypes[c])
+				d.seen = make(map[string]int, hi-lo)
+				for i := lo; i < hi; i++ {
+					d.add(items[i][j], header)
+				}
+			}
+			acc.f.d, acc.f.dup = d.d, d.dup
+		}
+		if w := shape.itemArr[j]; w != 0 {
+			for i := lo; i < hi; i++ {
+				acc.f.arr.add(items[i][j], w)
+			}
+		}
+	}
+	return sz
 }
 
 // removeRow takes one of the measured rows out. It reports false when the facts cannot be kept
@@ -683,6 +841,10 @@ func (sz *leafSizes) tab(shape leafShape, j, c int) *symTable {
 func (sz *leafSizes) saving(shape leafShape, sym bool) int {
 	total := 0
 	for j, fc := range shape.forCols {
+		if sz.forFrozen != nil && sz.forFrozen[j] {
+			total += sz.forSave[j]
+			continue
+		}
 		if sz.forStale[j] {
 			total += forSaving(sz.n, fc.w, 0, 0, true)
 			continue
@@ -690,6 +852,10 @@ func (sz *leafSizes) saving(shape leafShape, sym bool) int {
 		total += forSaving(sz.n, fc.w, sz.fors[j].lo, sz.fors[j].hi, sz.fors[j].any)
 	}
 	for j, c := range shape.itemCols {
+		if sz.itemFrozen != nil && sz.itemFrozen[j] {
+			total += sz.itemSave[j]
+			continue
+		}
 		var tb *symTable
 		if sym {
 			tb = tabFor(sz.tabs, c)

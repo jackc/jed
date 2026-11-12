@@ -1538,7 +1538,11 @@ func serializeDirty(n *pnode, colTypes []colType, keyLen int, memo *compressMemo
 			tabs = n.leafTabs(seal.cap, shape)
 			colCoded = leafSymCol && n.needsSym(seal.cap, shape)
 		}
-		payload, err = encodeLeafPAXMemo(colTypes, keyLen, n.keys, n.vals, seal, alloc.take, pages, src, tabs, colCoded, memo)
+		if n.lazyBase != nil {
+			payload, err = encodeLazyLeaf(n, colTypes, keyLen, seal, alloc.take, pages, src, memo)
+		} else {
+			payload, err = encodeLeafPAXMemo(colTypes, keyLen, n.keys, n.vals, seal, alloc.take, pages, src, tabs, colCoded, memo)
+		}
 		if err != nil {
 			return pageRef{}, err
 		}
@@ -3959,9 +3963,126 @@ func encodeLeafPAXMemo(colTypes []colType, keyLen int, keys [][]byte, rows []sto
 	// PROTOTYPE (leaf_narrow.go): the narrow layout leads with a layout byte and writes every
 	// directory entry as a u16.
 	const dw = 2
+	out, err := encodeLeafKeys(keyLen, keys)
+	if err != nil {
+		return nil, err
+	}
+	// Each stored column's region: encodeRegion's (leaf_lazy.go — the one place a region's form and
+	// bytes are decided, shared with the patch encoder), or a symbol-table region (leaf_sym.go) when
+	// that is smaller. A column that is not stored has an empty region: its directory entry equals the
+	// next column's.
+	regions := make([][]byte, k)
+	symCoded := false
+	for c, ty := range colTypes {
+		if leafElideKey && ty.keyAt != 0 {
+			continue
+		}
+		regions[c] = encodeRegion(ty, n, valBytes[c], nulls[c])
+		tb, colTab := tabFor(tabs, c), false
+		if tb == nil && colCoded {
+			tb, colTab = ty.sym.usable(), true
+		}
+		if tb == nil || !symEligible(ty) || arrElemWidth(ty) != 0 {
+			continue
+		}
+		items := make([]dictItem, n)
+		for i := 0; i < n; i++ {
+			items[i] = spanItem(ty, valBytes[c][i])
+		}
+		header := inlineHeaderLen(ty)
+		dictS := 0
+		if regions[c][0] == regionDict {
+			var acc dictAcc
+			for _, it := range items {
+				acc.add(it, header)
+			}
+			dictS = dictSaving(n, acc.d, acc.dup)
+		}
+		// Code every inline value once: the gain decides, and the bytes are what is written.
+		// Not at all when coding cannot save more than the dictionary does (symCanBeat).
+		bound := 0
+		for _, it := range items {
+			if it.kind == dictShared {
+				bound += symGainMax(header, len(it.payload))
+			}
+		}
+		gain := 0
+		var coded []byte
+		var codedEnd []int
+		if symCanBeat(n, bound, dictS, tb, colTab) {
+			codedEnd = make([]int, n)
+			for i, it := range items {
+				if it.kind == dictShared {
+					at := len(coded)
+					coded = tb.appendEnc(coded, it.payload)
+					gain += header + len(it.payload) - (len(coded) - at)
+				}
+				codedEnd[i] = len(coded)
+			}
+		}
+		s := symSaving(n, gain, tb)
+		if colTab {
+			s = gain - (n+7)/8 // the table is the column's, not the leaf's
+		}
+		if s <= dictS {
+			continue
+		}
+		symCoded = true
+		var reg []byte
+		if colTab {
+			reg = append(reg, regionSymCol)
+		} else {
+			reg = append(reg, regionSym)
+			reg = tb.appendTable(reg)
+		}
+		bm := len(reg)
+		reg = append(reg, make([]byte, (n+7)/8)...)
+		dir := len(reg)
+		reg = append(reg, make([]byte, dw*n)...)
+		base := len(reg)
+		for i, it := range items {
+			if it.kind == dictShared {
+				lo := 0
+				if i > 0 {
+					lo = codedEnd[i-1]
+				}
+				reg = append(reg, coded[lo:codedEnd[i]]...)
+			} else {
+				reg[bm+i/8] |= 0x80 >> (i % 8)
+				reg = append(reg, valBytes[c][i]...)
+			}
+			off := len(reg) - base
+			reg[dir+2*i], reg[dir+2*i+1] = byte(off>>8), byte(off)
+		}
+		regions[c] = reg
+	}
+	symStats.leaves.Add(1)
+	symStats.rows.Add(int64(n))
+	if symCoded {
+		symStats.codedLeaves.Add(1)
+	}
+	// The column directory — the absolute payload offset of each column region, then the payload's
+	// end — and the regions.
+	cur := len(out) + dw*(k+1)
+	for c := 0; c <= k; c++ {
+		out = append(out, byte(cur>>8), byte(cur))
+		if c < k {
+			cur += len(regions[c])
+		}
+	}
+	for _, reg := range regions {
+		out = append(out, reg...)
+	}
+	return out, nil
+}
+
+// encodeLeafKeys is the head of a leaf payload (format.md "Leaf node"): the flags byte, the fixed key
+// length and the shared key prefix when the leaf has them, the key directory, and the key blob.
+func encodeLeafKeys(keyLen int, keys [][]byte) ([]byte, error) {
+	const dw = 2
+	n := len(keys)
 	flags := leafFlagsFor(keyLen)
 	out := []byte{flags}
-	stored := func(c int) bool { return !(leafElideKey && colTypes[c].keyAt != 0) }
 	appendDir := func(b []byte, v int) []byte {
 		if dw == 2 {
 			return append(b, byte(v>>8), byte(v))
@@ -4002,285 +4123,6 @@ func encodeLeafPAXMemo(colTypes []colType, keyLen int, keys [][]byte, rows []sto
 	}
 	for i := 0; i < n; i++ {
 		out = append(out, keys[i][kp:]...)
-	}
-	// column directory: absolute payload offset of each column region.
-	baseAfterColDir := len(out) + dw*(k+1)
-	colStart := make([]int, k+1)
-	cur := baseAfterColDir
-	// fors[c] is set for a column written as base plus offsets (leaf_narrow.go).
-	type forEnc struct {
-		base uint64
-		bw   int
-	}
-	fors := make([]*forEnc, k)
-	// dicts[c] is set for a column written as a dictionary.
-	type dictEnc struct {
-		entries [][]byte
-		codes   []byte
-	}
-	dicts := make([]*dictEnc, k)
-	// syms[c] is set for a column written as a symbol-table region, arrs[c] for a typed-array region
-	// (leaf_sym.go). items[c] is the column's classified spans.
-	syms := make([]*symTable, k)
-	arrs := make([]*arrAcc, k)
-	items := make([][]dictItem, k)
-	symCol := make([]bool, k)
-	symCoded := make([][]byte, k)
-	symEnds := make([][]int, k)
-	for c := 0; c < k; c++ {
-		colStart[c] = cur
-		bodies := 0
-		for i := 0; i < n; i++ {
-			bodies += len(valBytes[c][i])
-		}
-		if !stored(c) {
-			continue // an empty region: its directory entry equals the next column's
-		}
-		if w, fixed := fixedValueWidth(colTypes[c]); fixed {
-			cur += 1 + (n+7)/8 + bodies
-			if forEligible(colTypes[c]) {
-				var r forRange
-				for i := 0; i < n; i++ {
-					if !nulls[c][i] {
-						r.add(beUint(valBytes[c][i]))
-					}
-				}
-				if s := forSaving(n, w, r.lo, r.hi, r.any); s > 0 {
-					fors[c] = &forEnc{base: r.lo, bw: forWidth(w, r.lo, r.hi)}
-					cur -= s
-				}
-			}
-		} else {
-			cur += 1 + dw*n + bodies
-			if leafDict && stringPayload(colTypes[c]) {
-				// A dictionary (leaf_narrow.go): entries in order of first use.
-				var acc dictAcc
-				enc := &dictEnc{codes: make([]byte, n)}
-				index := map[string]int{}
-				nullAt := -1
-				for i := 0; i < n && len(enc.entries) <= 256; i++ {
-					span := valBytes[c][i]
-					it := spanDictItem(span)
-					acc.add(it, inlineHeaderLen(colTypes[c]))
-					at := -1
-					switch it.kind {
-					case dictNull:
-						at = nullAt
-					case dictShared:
-						if j, ok := index[string(it.payload)]; ok {
-							at = j
-						}
-					}
-					if at < 0 {
-						at = len(enc.entries)
-						enc.entries = append(enc.entries, span)
-						switch it.kind {
-						case dictNull:
-							nullAt = at
-						case dictShared:
-							index[string(it.payload)] = at
-						}
-					}
-					enc.codes[i] = byte(at)
-				}
-				if s := dictSaving(n, acc.d, acc.dup); s > 0 && len(enc.entries) <= 256 {
-					dicts[c] = enc
-					cur -= s
-				}
-			}
-			tb, colTab := tabFor(tabs, c), false
-			if tb == nil && colCoded {
-				tb, colTab = colTypes[c].sym.usable(), true
-			}
-			if w := arrElemWidth(colTypes[c]); w != 0 || (tb != nil && symEligible(colTypes[c])) {
-				items[c] = make([]dictItem, n)
-				for i := 0; i < n; i++ {
-					items[c][i] = spanItem(colTypes[c], valBytes[c][i])
-				}
-				if w != 0 {
-					acc := &arrAcc{}
-					for _, it := range items[c] {
-						acc.add(it, w)
-					}
-					if s := arrSaving(n, w, dw, *acc); s > 0 {
-						arrs[c] = acc
-						cur -= s
-					}
-				} else {
-					header := inlineHeaderLen(colTypes[c])
-					dictS := 0
-					if dicts[c] != nil {
-						var acc dictAcc
-						for _, it := range items[c] {
-							acc.add(it, header)
-						}
-						dictS = dictSaving(n, acc.d, acc.dup)
-					}
-					// Code every inline value once: the gain decides, and the bytes are what is written.
-					// Not at all when coding cannot save more than the dictionary does (symCanBeat).
-					bound := 0
-					for _, it := range items[c] {
-						if it.kind == dictShared {
-							bound += symGainMax(header, len(it.payload))
-						}
-					}
-					gain := 0
-					var coded []byte
-					var codedEnd []int
-					if symCanBeat(n, bound, dictS, tb, colTab) {
-						codedEnd = make([]int, n)
-						for i, it := range items[c] {
-							if it.kind == dictShared {
-								at := len(coded)
-								coded = tb.appendEnc(coded, it.payload)
-								gain += header + len(it.payload) - (len(coded) - at)
-							}
-							codedEnd[i] = len(coded)
-						}
-					}
-					s := symSaving(n, gain, tb)
-					if colTab {
-						s = gain - (n+7)/8 // the table is the column's, not the leaf's
-					}
-					if s > dictS {
-						symCol[c] = colTab
-						syms[c] = tb
-						symCoded[c], symEnds[c] = coded, codedEnd
-						dicts[c] = nil
-						cur += dictS - s
-					}
-				}
-			}
-		}
-	}
-	symStats.leaves.Add(1)
-	symStats.rows.Add(int64(n))
-	for c := 0; c < k; c++ {
-		if syms[c] != nil {
-			symStats.codedLeaves.Add(1)
-			break
-		}
-	}
-	colStart[k] = cur // payload end
-	for c := 0; c <= k; c++ {
-		out = appendDir(out, colStart[c])
-	}
-	// each column region: flags byte, then bitmap + dense slots (fixed) or value directory +
-	// tagged bodies (variable).
-	for c := 0; c < k; c++ {
-		if !stored(c) {
-			continue
-		}
-		if tb := syms[c]; tb != nil {
-			if symCol[c] {
-				out = append(out, regionSymCol)
-			} else {
-				out = append(out, regionSym)
-				out = tb.appendTable(out)
-			}
-			bm := len(out)
-			out = append(out, make([]byte, (n+7)/8)...)
-			dir := len(out)
-			out = append(out, make([]byte, dw*n)...)
-			base := len(out)
-			for i, it := range items[c] {
-				if it.kind == dictShared {
-					lo := 0
-					if i > 0 {
-						lo = symEnds[c][i-1]
-					}
-					out = append(out, symCoded[c][lo:symEnds[c][i]]...)
-				} else {
-					out[bm+i/8] |= 0x80 >> (i % 8)
-					out = append(out, valBytes[c][i]...)
-				}
-				off := len(out) - base
-				if dw == 2 {
-					out[dir+2*i], out[dir+2*i+1] = byte(off>>8), byte(off)
-				} else {
-					binary.BigEndian.PutUint32(out[dir+4*i:], uint32(off))
-				}
-			}
-			continue
-		}
-		if a := arrs[c]; a != nil {
-			w := arrElemWidth(colTypes[c])
-			out = append(out, regionArr)
-			for _, it := range items[c] {
-				if it.kind == dictNull {
-					out = append(out, 255)
-					continue
-				}
-				elems, _ := arrElems(it.payload, w)
-				out = append(out, byte(len(elems)/w))
-			}
-			at := len(out)
-			bw := arrBits(a.r)
-			out = append(out, make([]byte, w+1+(a.elems*bw+7)/8)...)
-			putBEUint(out[at:at+w], a.r.lo)
-			out[at+w] = byte(bw)
-			data, bit := out[at+w+1:], 0
-			for _, it := range items[c] {
-				if it.kind != dictShared {
-					continue
-				}
-				elems, _ := arrElems(it.payload, w)
-				for e := 0; e < len(elems); e += w {
-					putBits(data, bit, bw, beUint(elems[e:e+w])-a.r.lo)
-					bit += bw
-				}
-			}
-			continue
-		}
-		if d := dicts[c]; d != nil {
-			out = append(out, regionDict, byte(len(d.entries)>>8), byte(len(d.entries)))
-			off := 0
-			for _, e := range d.entries {
-				off += len(e)
-				out = appendDir(out, off)
-			}
-			for _, e := range d.entries {
-				out = append(out, e...)
-			}
-			out = append(out, d.codes...)
-			continue
-		}
-		if fors[c] != nil {
-			out = append(out, regionFOR)
-		} else {
-			out = append(out, 0) // region flags — reserved (the dictionary door)
-		}
-		if w, fixed := fixedValueWidth(colTypes[c]); fixed {
-			bitmap := make([]byte, (n+7)/8)
-			for i, isNull := range nulls[c] {
-				if isNull {
-					bitmap[i/8] |= 0x80 >> (i % 8)
-				}
-			}
-			out = append(out, bitmap...)
-			if f := fors[c]; f != nil {
-				at := len(out)
-				out = append(out, make([]byte, w+1+n*f.bw)...)
-				putBEUint(out[at:at+w], f.base)
-				out[at+w] = byte(f.bw)
-				at += w + 1
-				for i := 0; i < n; i++ {
-					if !nulls[c][i] {
-						putBEUint(out[at+i*f.bw:at+(i+1)*f.bw], beUint(valBytes[c][i])-f.base)
-					}
-				}
-				continue
-			}
-		} else {
-			voff := 0
-			for i := 0; i < n; i++ {
-				voff += len(valBytes[c][i])
-				out = appendDir(out, voff)
-			}
-		}
-		for i := 0; i < n; i++ {
-			out = append(out, valBytes[c][i]...)
-		}
 	}
 	return out, nil
 }
@@ -6161,6 +6003,8 @@ type paxLeaf struct {
 	// keyStored is the bytes the page spends on keys, layout byte included: key length, prefix,
 	// directory and blob.
 	keyStored int
+	// payload is the page payload the views above are slices of (leaf_lazy.go).
+	payload []byte
 }
 
 // paxDirEnd reads entry i from a directory that parsePaxLeaf already validated in full. Keeping
@@ -6427,7 +6271,7 @@ func parsePaxLeaf(payload []byte, n int, colTypes []colType) (*paxLeaf, error) {
 		}
 		start = end
 	}
-	return &paxLeaf{keyBlob: keyBytes, keyEnd: keyEnd, regions: regions, dw: dw, keyLen: keyLen, keyPrefix: keyPrefix, n: n, keyStored: keyStored}, nil
+	return &paxLeaf{keyBlob: keyBytes, keyEnd: keyEnd, regions: regions, dw: dw, keyLen: keyLen, keyPrefix: keyPrefix, n: n, keyStored: keyStored, payload: payload}, nil
 }
 
 // key returns record i's key as a borrowed span: of the retained page block, or of the leaf's rebuilt
@@ -6596,6 +6440,10 @@ func (l *paxLeaf) valueLen(c, i int) int {
 	if r.width > 0 {
 		return r.width
 	}
+	if r.lazy != nil && r.lazy.kind == regionArr {
+		// The count byte gives the plain span's length (decodeArr), without rebuilding the region.
+		return arrSpanLen(r.lazy.raw[i], arrElemWidthOf(r.lazy.ty))
+	}
 	if r.codes != nil {
 		i = int(r.codes[i])
 	}
@@ -6628,6 +6476,8 @@ type packedLeaf struct {
 	// file.
 	cap pageCap
 	n   int
+	// inline caches inlineOnly (leaf_lazy.go): 0 not yet known, 1 yes, 2 no.
+	inline atomic.Uint32
 }
 
 func (p *packedLeaf) key(i int) []byte { return p.dirs.key(i) }

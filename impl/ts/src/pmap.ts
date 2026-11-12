@@ -84,6 +84,15 @@ export interface PackedLeaf {
   // buffer a region the page stores in another form was rebuilt into (an elided key column, a
   // base-plus-offsets or packed-array region — format.md "Leaf node"). False for NULL.
   span(i: number, c: number, out: Span): boolean;
+  // recordWeights is weight(i) for every record, read column by column from the directories.
+  recordWeights(): number[];
+  // inlineOnly reports whether every variable-width value of the page is NULL or stored in the
+  // inline form a writer gives an all-inline record (format.ts paxInlineOnly). Cached.
+  inlineOnly(): boolean;
+  // hasChains reports whether any value of the page is stored in an overflow chain.
+  hasChains(): boolean;
+  // dirs is the format layer's parsed directories of the page (opaque here; format.ts PaxDirs).
+  readonly dirs: unknown;
 }
 
 // A stored value's bytes: buf[start, end).
@@ -108,21 +117,66 @@ export type PNode = {
   weights: number[];
   children: Child[];
   // The block-backed resident form of a demand-paged clean leaf (packed-leaf.md §5); undefined for a
-  // Decoded node (in-memory/loaded leaves, any dirty leaf — mutation materializes Packed→Decoded
-  // first, §7 — and every interior node). A Packed leaf is always clean (page != 0), so it is never
-  // serialized.
+  // Decoded node (in-memory/loaded leaves, any dirty leaf — a mutation copies a Packed leaf into a
+  // dirty one, lazily (lazyBase) or decoded, §7 — and every interior node). A Packed leaf is always
+  // clean (page != 0), so it is never serialized.
   packed?: PackedLeaf;
   page: number;
   // tag is the AEAD tag of the page at `page` in an encrypted file (spec/fileformat/encrypted.md §2):
   // set with the page id by the commit that seals the node, so a parent written later binds it.
   // Absent in a plaintext file and while the node is dirty.
   tag?: Uint8Array;
-  // sizes caches a dirty Decoded leaf's content-dependent size facts (LeafSizer) for its n rows, so
-  // an insert, delete or row replacement measures one row instead of the leaf. Kept only on a node
-  // its writer owns.
+  // sizes caches a dirty leaf's content-dependent size facts (LeafSizer) for its n rows, so an
+  // insert, delete or row replacement measures one row instead of the leaf. Kept only on a node its
+  // writer owns; a lazy leaf's are read from its page (LeafSizer.measureLazy).
   sizes?: { n: number; facts: unknown };
+  // Lazy dirty leaf (setLeafLazy): a dirty leaf copied from a Packed leaf keeps the rows it has not
+  // replaced undecoded. lazyBase is that leaf; lazy is parallel to vals: lazy[i] >= 0 says row i is
+  // still row lazy[i] of lazyBase and vals[i] is NO_ROW, -1 that vals[i] holds it. Its keys are views
+  // of the page (or of the keys the Packed leaf rebuilt from its prefix) until a split or merge
+  // copies them. lazyBase undefined: every row is in vals.
+  lazyBase?: PackedLeaf;
+  lazy?: number[];
+  // wsum is the sum of weights once the writer starts editing the leaf in place, kept by those edits.
+  wsum?: number;
+  // sameRows says the leaf's keys are exactly lazyBase's, in order: rows were only replaced. Then
+  // colDirty[c] says some replaced row's stored value in column c differs from the page's.
+  // patchOK says every record of the page and every row written since is stored all-inline.
+  sameRows?: boolean;
+  patchOK?: boolean;
+  colDirty?: boolean[];
   [mutationOwner]?: MutationGeneration;
 };
+
+// NO_ROW stands in vals for a row a lazy leaf still reads from its page.
+const NO_ROW: Row = Object.freeze([]) as unknown as Row;
+
+// leafLazy turns the lazy dirty-leaf paths on: a leaf edited in place of a Packed leaf keeps its
+// untouched rows undecoded, sizes itself from its page, and is encoded as a patch of the page
+// (format.ts encodeLazyLeaf). File bytes, results and costs are the same either way.
+let leafLazy = true;
+
+// setLeafLazy turns the lazy dirty-leaf paths on or off (tests run a workload under each).
+export function setLeafLazy(on: boolean): void {
+  leafLazy = on;
+}
+
+export function leafLazyOn(): boolean {
+  return leafLazy;
+}
+
+// storedLeaf returns the Packed leaf holding row i's stored bytes — the node's own page, or a lazy
+// node's base page for a row it has not replaced — and storedIndex the row's index there. undefined
+// when vals[i] holds the row.
+export function storedLeaf(n: PNode, i: number): PackedLeaf | undefined {
+  if (n.packed) return n.packed;
+  if (n.lazyBase !== undefined && n.lazy![i]! >= 0) return n.lazyBase;
+  return undefined;
+}
+
+export function storedIndex(n: PNode, i: number): number {
+  return n.packed ? i : n.lazy![i]!;
+}
 
 // rowAt reconstructs value row i — the value-read seam (packed-leaf.md §4), on a LEAF. A Decoded
 // leaf returns the stored row (read-only by convention); a Packed leaf reconstructs it from the
@@ -133,13 +187,24 @@ export type PNode = {
 // mask no longer exists — the query's touched set survives as the cost basis + the scan layer's
 // resolve prefetch, and a missed value resolves on touch (the demand-fault backstop).
 export function rowAt(n: PNode, i: number): Row {
-  return n.packed ? n.packed.row(i) : n.vals[i]!;
+  if (n.packed) return n.packed.row(i);
+  if (n.lazyBase !== undefined) {
+    // A lazy row is decoded from the page each time: nothing is cached on a read path.
+    const at = n.lazy![i]!;
+    if (at >= 0) return n.lazyBase.row(at);
+  }
+  return n.vals[i]!;
 }
 
 // colAt reconstructs ONLY column c of row i — the touched-column path (packed-leaf.md §4/§6, the
 // OP_Column model).
 export function colAt(n: PNode, i: number, c: number): Value {
-  return n.packed ? n.packed.col(i, c) : n.vals[i]![c]!;
+  if (n.packed) return n.packed.col(i, c);
+  if (n.lazyBase !== undefined) {
+    const at = n.lazy![i]!;
+    if (at >= 0) return n.lazyBase.col(at, c);
+  }
+  return n.vals[i]![c]!;
 }
 
 // colAtNow is colAt with a deferred value resolved, when that needs no stepping: a Packed leaf's
@@ -148,6 +213,10 @@ export function colAt(n: PNode, i: number, c: number): Value {
 // resolves through the stepping path (readLeafColumnSteps).
 export function colAtNow(n: PNode, i: number, c: number): Value | undefined {
   if (n.packed) return n.packed.colNow(i, c);
+  if (n.lazyBase !== undefined) {
+    const at = n.lazy![i]!;
+    if (at >= 0) return n.lazyBase.colNow(at, c);
+  }
   const v = n.vals[i]![c]!;
   return v.kind === "unfetched" ? undefined : v;
 }
@@ -156,16 +225,22 @@ export function colAtNow(n: PNode, i: number, c: number): Value | undefined {
 // §11 Track A4): the PAX null bitmap / zero-length span on a Packed leaf. A deferred large value is never
 // NULL.
 export function colIsNull(n: PNode, i: number, c: number): boolean {
-  return n.packed ? n.packed.isNull(i, c) : n.vals[i]![c]!.kind === "null";
+  if (n.packed) return n.packed.isNull(i, c);
+  if (n.lazyBase !== undefined) {
+    const at = n.lazy![i]!;
+    if (at >= 0) return n.lazyBase.isNull(at, c);
+  }
+  return n.vals[i]![c]!.kind === "null";
 }
 
 // decodedRows returns every value row of a LEAF — the mutation-descent materialization
 // (packed-leaf.md §7). A Decoded leaf clones vals; a Packed leaf reconstructs every row so the
 // rebuilt node is Decoded (buildLeaf / nodeInsert / nodeRemove / mergeAt then run unchanged).
 export function decodedRows(n: PNode): Row[] {
-  if (!n.packed) return n.vals.slice();
-  const rows: Row[] = new Array(n.packed.n);
-  for (let i = 0; i < n.packed.n; i++) rows[i] = n.packed.row(i);
+  if (!n.packed && n.lazyBase === undefined) return n.vals.slice();
+  const count = nodeLen(n);
+  const rows: Row[] = new Array(count);
+  for (let i = 0; i < count; i++) rows[i] = rowAt(n, i);
   return rows;
 }
 
@@ -182,6 +257,16 @@ function weightAt(n: PNode, i: number): number {
 }
 
 function totalWeight(n: PNode): number {
+  if (n.wsum !== undefined) {
+    if (leafSizesCheck) {
+      let sum = 0;
+      for (const w of n.weights) sum += w;
+      if (sum !== n.wsum) {
+        throw new Error(`BUG: a leaf's running weight is ${n.wsum}, its weights sum to ${sum}`);
+      }
+    }
+    return n.wsum;
+  }
   let total = 0;
   for (let i = 0; i < nodeLen(n); i++) total += weightAt(n, i);
   return total;
@@ -197,6 +282,9 @@ export function keyViews(n: PNode): Uint8Array[] {
 }
 
 function decodedParts(n: PNode): { keys: Uint8Array[]; vals: Row[]; weights: number[] } {
+  if (n.lazyBase !== undefined) {
+    return { keys: n.keys.map((k) => k.slice()), vals: decodedRows(n), weights: n.weights.slice() };
+  }
   if (!n.packed) return { keys: n.keys.slice(), vals: n.vals.slice(), weights: n.weights.slice() };
   const count = n.packed.n;
   const keys = new Array<Uint8Array>(count);
@@ -223,7 +311,9 @@ export type Child = { node: PNode | null; page: number; tag?: Uint8Array };
 // leafParts returns a leaf's keys, rows, and weights for reading only: a Decoded leaf's own arrays,
 // which the caller must not modify, or a Packed leaf's freshly decoded parts.
 function leafParts(n: PNode): { keys: Uint8Array[]; vals: Row[]; weights: number[] } {
-  if (!n.packed) return { keys: n.keys, vals: n.vals, weights: n.weights };
+  if (!n.packed && n.lazyBase === undefined) {
+    return { keys: n.keys, vals: n.vals, weights: n.weights };
+  }
   return decodedParts(n);
 }
 
@@ -294,7 +384,28 @@ export type LeafShape = {
   // insert or delete: classifying a row whose record needs a disposition plan then reuses the
   // outcomes the write already paid for. Absent compresses again, to the same result.
   memo?: CompressMemo | null;
+  // edits is the format layer's part of a lazy leaf's row edits (LeafEdits). A tree without it
+  // never builds a lazy leaf.
+  edits?: LeafEdits;
 };
+
+// LeafEdits compares a row written into a lazy leaf with the page the leaf was copied from.
+// Implemented by the format layer over the tree's column types (format.ts).
+export interface LeafEdits {
+  // changedCols sets changed[c] to whether the encoder, writing row as record at of base's page,
+  // would store column c differently from the page. It returns whether the record is stored
+  // all-inline (no disposition plan runs).
+  changedCols(
+    base: PackedLeaf,
+    at: number,
+    key: Uint8Array,
+    row: Row,
+    cap: Cap,
+    changed: boolean[],
+  ): boolean;
+  // rowAllInline reports whether a record is stored all-inline.
+  rowAllInline(key: Uint8Array, row: Row, cap: Cap): boolean;
+}
 
 // LeafSizer measures the bytes a leaf's content-dependent column regions save — base plus offsets,
 // dictionaries, packed arrays (format.md "Leaf node") — from decoded rows. Implemented by the format
@@ -317,14 +428,54 @@ export interface LeafSizer {
   // columns from the leaf's rows.
   stale(facts: unknown): boolean;
   refresh(facts: unknown, rows: Row[]): void;
+  // The lazy-leaf forms (format.ts, "size facts from the page"). measureLazy builds a lazy leaf's
+  // facts from its page and its replaced rows, freezing the columns no replacement changed while the
+  // leaf's rows are its page's. refreshLazy is refresh for such a leaf. frozen counts the frozen
+  // columns: addRow and removeRow apply only when it is 0. replaceCols follows the replacement of row
+  // i (not yet applied to n) in a leaf whose rows are its page's: changed is LeafEdits.changedCols'
+  // answer and wasLazy says the replaced row is still the page's; remeasure then runs once the row
+  // is in place. cloneFacts copies facts for a new generation's copy of the leaf.
+  measureLazy(n: PNode, cap: Cap, memo?: CompressMemo | null): unknown;
+  refreshLazy(facts: unknown, n: PNode): void;
+  frozen(facts: unknown): number;
+  replaceCols(
+    facts: unknown,
+    n: PNode,
+    i: number,
+    key: Uint8Array,
+    row: Row,
+    cap: Cap,
+    changed: boolean[],
+    wasLazy: boolean,
+    memo?: CompressMemo | null,
+  ): void;
+  remeasure(facts: unknown, n: PNode, cap: Cap, memo?: CompressMemo | null): void;
+  cloneFacts(facts: unknown): unknown;
+  // One pass over a leaf that does not fit as plain regions (buildLeaf). scan classifies every row
+  // and scans the dictionary columns, hashing each value once; scanDups says some dictionary payload
+  // repeats. scanFacts is the facts of rows [lo, hi) from the scan: a dictionary column with no
+  // repeated payload is kept as distinct, with no map, so removeRow needs no lookup there;
+  // factsDistinct says so, and the writer drops such facts before addRow. The scan also carries the facts of one
+  // running half of a candidate split: scanReset empties it, scanAdd takes row i in (up: the half
+  // grows from the first row; false: from the last) and scanSaving is its region savings at count
+  // rows.
+  scan(keys: Uint8Array[], rows: Row[], cap: Cap, memo?: CompressMemo | null): unknown;
+  scanDups(scan: unknown): boolean;
+  scanFacts(scan: unknown, rows: Row[], lo: number, hi: number): unknown;
+  scanReset(scan: unknown): void;
+  scanAdd(scan: unknown, rows: Row[], i: number, up: boolean): void;
+  scanSaving(scan: unknown, count: number): number;
+  factsDistinct(facts: unknown): boolean;
   // The region savings of a leaf of n rows with these facts; an upper bound while they are stale.
   saving(facts: unknown, n: number): number;
   // pre[m] is the region savings of rows [0, m) and suf[m] that of rows [m, n), for m in [0, n].
+  // scan is the leaf's scan when it has one.
   boundarySavings(
     keys: Uint8Array[],
     rows: Row[],
     cap: Cap,
     memo?: CompressMemo | null,
+    scan?: unknown,
   ): { pre: number[]; suf: number[] };
 }
 
@@ -355,13 +506,21 @@ function payload(n: PNode, cap: Cap, shape: LeafShape): number {
   return interiorPayload(cap, n.keys);
 }
 
-// leafSizesCheck makes contentSaving compare a leaf's kept size facts with a fresh measurement
-// (tests).
+// leafSizesCheck makes contentSaving compare a leaf's kept size facts — a lazy leaf's frozen and
+// page-measured ones included — with a fresh measurement of its decoded rows, and totalWeight compare
+// a leaf's running weight with the sum of its weights. buildLeaf then also finds its split point by
+// the tabled rule and compares it with the running one, and the format layer compares a row
+// classified without its disposition plan with the plan (tests).
 let leafSizesCheck = false;
 
 // setLeafSizesCheck turns the kept-size-facts cross-check on or off (tests only).
 export function setLeafSizesCheck(on: boolean): void {
   leafSizesCheck = on;
+}
+
+// leafSizesCheckOn reports whether the cross-check is on, for the format layer's part of it.
+export function leafSizesCheckOn(): boolean {
+  return leafSizesCheck;
 }
 
 // measureLeaf is the size facts of a Decoded leaf's rows, measured from scratch.
@@ -379,7 +538,9 @@ function contentSaving(n: PNode, cap: Cap, shape: LeafShape): number {
   let saving = 0;
   if (count >= 2) saving += leafPrefixSaving(count, n.keys[0]!, n.keys[count - 1]!);
   const sizer = shape.sizer;
-  if (sizer !== null && count > 0) {
+  if (sizer !== null && count > 0 && n.lazyBase !== undefined) {
+    saving += lazySaving(n, cap, sizer, shape.memo ?? null);
+  } else if (sizer !== null && count > 0) {
     const memo = shape.memo ?? null;
     let sz = n.sizes;
     if (sz === undefined || sz.n !== count) {
@@ -401,6 +562,187 @@ function contentSaving(n: PNode, cap: Cap, shape: LeafShape): number {
     saving += sizer.saving(sz.facts, count);
   }
   return saving;
+}
+
+// lazySaving is contentSaving's column-region part for a lazy leaf: its facts come from its page
+// (LeafSizer.measureLazy), not from decoded rows.
+function lazySaving(n: PNode, cap: Cap, sizer: LeafSizer, memo: CompressMemo | null): number {
+  const count = n.keys.length;
+  let sz = n.sizes;
+  if (sz === undefined || sz.n !== count) {
+    sz = { n: count, facts: sizer.measureLazy(n, cap, memo) };
+    // A dirty node is its writer's alone, so it may keep the facts.
+    if (n.page === 0 && n[mutationOwner] !== undefined) n.sizes = sz;
+  }
+  sizer.refreshLazy(sz.facts, n);
+  const got = sizer.saving(sz.facts, count);
+  if (leafSizesCheck) {
+    const rows = decodedRows(n);
+    const fresh = sizer.newFacts();
+    for (let i = 0; i < count; i++) sizer.addRow(fresh, n.keys[i]!, rows[i]!, cap, null);
+    const want = sizer.saving(fresh, count);
+    if (want !== got) {
+      throw new Error(
+        `BUG: a lazy leaf's size facts save ${got} bytes (${sizer.frozen(sz.facts)} columns frozen), a fresh measurement ${want}`,
+      );
+    }
+  }
+  return got;
+}
+
+// lazyCopy returns a dirty copy of leaf n that generation owns, with no row decoded: n is a Packed
+// leaf, or a lazy leaf an earlier generation built.
+//
+// The copy's keys are views of the page. The copy already holds the page through lazyBase, and a
+// page block is never written again. A split or merge copies the keys out first (materialize,
+// decodedParts), so no separator keeps a page alive.
+function lazyCopy(n: PNode, generation: MutationGeneration, sizer: LeafSizer | null): PNode {
+  const p = n.packed;
+  if (p !== undefined) {
+    const count = p.n;
+    const keys = new Array<Uint8Array>(count);
+    const vals = new Array<Row>(count);
+    const lazy = new Array<number>(count);
+    for (let i = 0; i < count; i++) {
+      keys[i] = p.key(i);
+      vals[i] = NO_ROW;
+      lazy[i] = i;
+    }
+    const weights = p.recordWeights();
+    let wsum = 0;
+    for (const w of weights) wsum += w;
+    if (leafSizesCheck) {
+      for (let i = 0; i < count; i++) {
+        if (weights[i] !== p.weight(i)) {
+          throw new Error(
+            `BUG: record ${i} weighs ${weights[i]} by columns, ${p.weight(i)} by record`,
+          );
+        }
+      }
+    }
+    const patchOK = p.inlineOnly();
+    return {
+      keys,
+      vals,
+      weights,
+      children: [],
+      page: 0,
+      lazyBase: p,
+      lazy,
+      wsum,
+      sameRows: true,
+      patchOK,
+      // A record of the page with a large-value form has a plan any column can change, so every
+      // column counts as changed from the first replacement.
+      colDirty: new Array<boolean>(p.colTypes.length).fill(!patchOK),
+      [mutationOwner]: generation,
+    };
+  }
+  return {
+    keys: n.keys.slice(),
+    vals: n.vals.slice(),
+    weights: n.weights.slice(),
+    children: [],
+    page: 0,
+    lazyBase: n.lazyBase,
+    lazy: n.lazy!.slice(),
+    wsum: totalWeight(n),
+    sameRows: n.sameRows,
+    patchOK: n.patchOK,
+    colDirty: n.colDirty?.slice(),
+    sizes:
+      n.sizes !== undefined && sizer !== null
+        ? { n: n.sizes.n, facts: sizer.cloneFacts(n.sizes.facts) }
+        : undefined,
+    [mutationOwner]: generation,
+  };
+}
+
+// trackWeight starts the running weight total of a leaf its writer is about to edit in place.
+function trackWeight(n: PNode): void {
+  if (n.wsum !== undefined || !leafLazy) return;
+  let sum = 0;
+  for (const w of n.weights) sum += w;
+  n.wsum = sum;
+}
+
+// rowSetChanged records that a row was inserted into or removed from a lazy leaf: its rows are no
+// longer its page's, so no region can be copied and frozen facts no longer hold.
+function rowSetChanged(n: PNode, sizer: LeafSizer | null): void {
+  n.sameRows = false;
+  n.colDirty = undefined;
+  const sz = n.sizes;
+  if (sz !== undefined && (sizer === null || sizer.frozen(sz.facts) > 0)) n.sizes = undefined;
+}
+
+// materialize decodes every row a lazy leaf still reads from its page and copies its keys, making it
+// an ordinary Decoded leaf. Only the owning writer calls it.
+function materialize(n: PNode): void {
+  n.vals = decodedRows(n);
+  n.keys = n.keys.map((k) => k.slice());
+  n.lazyBase = undefined;
+  n.lazy = undefined;
+  n.sameRows = undefined;
+  n.patchOK = undefined;
+  n.colDirty = undefined;
+  n.sizes = undefined; // buildLeaf measures the rows
+}
+
+// decodedLeafCopy returns leaf n as an ordinary Decoded leaf with the same page: every row decoded,
+// its keys copied. For a persisted lazy root that is not re-faulted (storage.ts refaultRootSteps).
+export function decodedLeafCopy(n: PNode): PNode {
+  const { keys, vals, weights } = decodedParts(n);
+  return { keys, vals, weights, children: [], page: n.page, tag: n.tag };
+}
+
+// replaceRow replaces row i of a lazy leaf its writer owns.
+function replaceRow(
+  n: PNode,
+  i: number,
+  key: Uint8Array,
+  val: Row,
+  weight: number,
+  cap: Cap,
+  shape: LeafShape,
+): void {
+  const edits = shape.edits!;
+  const sizer = shape.sizer;
+  const memo = shape.memo ?? null;
+  const wasLazy = n.lazy![i]! >= 0;
+  let changed: boolean[] | null = null;
+  if (n.sameRows) {
+    // Row i is the page's record i. Which columns does the new row store differently?
+    const dirty = n.colDirty!;
+    changed = new Array<boolean>(dirty.length).fill(false);
+    // Past RECORD_MAX the record's disposition plan decides each value's form, so no column is known
+    // unchanged and the leaf is not patched.
+    if (!edits.changedCols(n.lazyBase!, i, key, val, cap, changed)) n.patchOK = false;
+    for (let c = 0; c < changed.length; c++) {
+      if (!n.patchOK) changed[c] = true;
+      if (changed[c]) dirty[c] = true;
+    }
+  } else if (n.patchOK && !edits.rowAllInline(key, val, cap)) {
+    n.patchOK = false;
+  }
+  let redo = false;
+  const sz = n.sizes;
+  if (sz !== undefined) {
+    if (sizer === null || sz.n !== n.vals.length) {
+      n.sizes = undefined;
+    } else if (changed !== null) {
+      sizer.replaceCols(sz.facts, n, i, key, val, cap, changed, wasLazy, memo);
+      redo = true;
+    } else if (sizer.removeRow(sz.facts, key, rowAt(n, i), cap, memo)) {
+      sizer.addRow(sz.facts, key, val, cap, memo);
+    } else {
+      n.sizes = undefined;
+    }
+  }
+  n.vals[i] = val;
+  n.lazy![i] = -1;
+  n.wsum! += weight - n.weights[i]!;
+  n.weights[i] = weight;
+  if (redo) sizer!.remeasure(sz!.facts, n, cap, memo);
 }
 
 // payloadAtMost reports whether a leaf's payload is at most limit. The content-dependent saving is
@@ -676,13 +1018,41 @@ export class PMap {
     shape: LeafShape,
     src: LeafSource | null,
   ): Steps<Row | undefined> {
+    const ctx: InsCtx = { old: undefined, replaced: false, want: true };
+    yield* this.insertCtxSteps(key, val, weight, cap, shape, src, ctx);
+    return ctx.old;
+  }
+
+  // putSteps is insertSteps for a caller that does not use the previous row: a row a lazy leaf has
+  // not decoded stays undecoded. It returns whether key was present.
+  *putSteps(
+    key: Uint8Array,
+    val: Row,
+    weight: number,
+    cap: Cap,
+    shape: LeafShape,
+    src: LeafSource | null,
+  ): Steps<boolean> {
+    const ctx: InsCtx = { old: undefined, replaced: false, want: false };
+    yield* this.insertCtxSteps(key, val, weight, cap, shape, src, ctx);
+    return ctx.replaced;
+  }
+
+  private *insertCtxSteps(
+    key: Uint8Array,
+    val: Row,
+    weight: number,
+    cap: Cap,
+    shape: LeafShape,
+    src: LeafSource | null,
+    ctx: InsCtx,
+  ): Steps<void> {
     const generation = this.currentMutationGeneration();
     if (this.root === null) {
       this.root = newLeaf([key], [val], [weight], generation);
       if (this.rowCount !== null) this.rowCount += 1n;
-      return undefined;
+      return;
     }
-    const ctx: InsCtx = { old: undefined, replaced: false };
     const out = yield* nodeInsertSteps(
       this.root,
       key,
@@ -711,7 +1081,6 @@ export class PMap {
     }
     this.root = top.whole;
     if (!ctx.replaced && this.rowCount !== null) this.rowCount += 1n;
-    return ctx.old;
   }
 
   // remove deletes key. Returns the removed row, or undefined if absent (then the map is unchanged).
@@ -728,16 +1097,38 @@ export class PMap {
     shape: LeafShape,
     src: LeafSource | null,
   ): Steps<Row | undefined> {
-    if (this.root === null) return undefined;
+    return (yield* this.removeWantSteps(key, true, cap, shape, src)).removed;
+  }
+
+  // deleteSteps is removeSteps for a caller that does not use the removed row (see putSteps). It
+  // returns whether key was present.
+  *deleteSteps(
+    key: Uint8Array,
+    cap: Cap,
+    shape: LeafShape,
+    src: LeafSource | null,
+  ): Steps<boolean> {
+    return (yield* this.removeWantSteps(key, false, cap, shape, src)).ok;
+  }
+
+  private *removeWantSteps(
+    key: Uint8Array,
+    want: boolean,
+    cap: Cap,
+    shape: LeafShape,
+    src: LeafSource | null,
+  ): Steps<{ ok: boolean; removed: Row | undefined }> {
+    if (this.root === null) return { ok: false, removed: undefined };
     const res = yield* nodeRemoveSteps(
       this.root,
       key,
+      want,
       this.currentMutationGeneration(),
       src,
       cap,
       shape,
     );
-    if (!res.ok) return undefined;
+    if (!res.ok) return { ok: false, removed: undefined };
     let newRoot: PNode | null = res.node;
     // The root may have drained: an empty leaf becomes the empty map; a 0-key interior root hands
     // the root down a level (height shrinks). The root is exempt from the underfull rule, so no
@@ -749,7 +1140,7 @@ export class PMap {
     }
     this.root = newRoot;
     if (this.rowCount !== null) this.rowCount -= 1n;
-    return res.removed;
+    return { ok: true, removed: res.removed };
   }
 
   // inorder returns all (key, row) pairs in ascending key order — a leaf walk (records are
@@ -1235,7 +1626,8 @@ export function pmapFromSkeleton(root: PNode | null, rowCount: bigint | null): P
   return new PMap(root, rowCount);
 }
 
-type InsCtx = { old: Row | undefined; replaced: boolean };
+// want says the caller uses the previous row (old).
+type InsCtx = { old: Row | undefined; replaced: boolean; want: boolean };
 // The result of inserting into a subtree: the rebuilt subtree, or a node that overflowed and split
 // into left, a SEPARATOR KEY for the parent, and right. A leaf split COPIES the right leaf's first
 // key up (no record leaves the leaf level); an interior split PUSHES its median separator up
@@ -1321,6 +1713,58 @@ function splitPoint(
   return Math.max(Math.min(mBalanced, mMax), mMin);
 }
 
+// splitPointRunning is splitPoint for a leaf with a sizer, over the scan's running facts instead of
+// per-boundary tables: one pass up from the first row while the left half fits, one pass down from
+// the last while the right half does. Both half sizes are monotone in m, so the passes stop at the
+// first boundary that does not fit; the balanced boundary, when it lies past the last fitting one, is
+// clamped to it either way. pay is the whole leaf's payload. Null when no two halves fit.
+function splitPointRunning(
+  keys: Uint8Array[],
+  vals: Row[],
+  scan: unknown,
+  prefix: number[],
+  pay: number,
+  cap: Cap,
+  shape: LeafShape,
+  sizer: LeafSizer,
+  rightEdge: boolean,
+): number | null {
+  const n = keys.length;
+  const total = prefix[n]!;
+  sizer.scanReset(scan);
+  let mMax = 0;
+  let mBalanced = 0;
+  for (let m = 1; m <= n - 1; m++) {
+    sizer.scanAdd(scan, vals, m - 1, true);
+    const left =
+      prefix[m]! +
+      leafOverhead(m, shape) -
+      leafPrefixSaving(m, keys[0]!, keys[m - 1]!) -
+      sizer.scanSaving(scan, m);
+    if (left > cap.c) break;
+    mMax = m;
+    if (mBalanced === 0 && 2 * left >= pay) mBalanced = m;
+  }
+  if (mMax === 0) return null;
+  sizer.scanReset(scan);
+  let mMin = 0;
+  for (let m = n - 1; m >= 1; m--) {
+    sizer.scanAdd(scan, vals, m, false);
+    const right =
+      total -
+      prefix[m]! +
+      leafOverhead(n - m, shape) -
+      leafPrefixSaving(n - m, keys[m]!, keys[n - 1]!) -
+      sizer.scanSaving(scan, n - m);
+    if (right > cap.c) break;
+    mMin = m;
+  }
+  if (mMin === 0 || mMin > mMax) return null;
+  let m = mMax;
+  if (!rightEdge && mBalanced !== 0) m = mBalanced;
+  return m < mMin ? mMin : m;
+}
+
 // buildLeaf builds a leaf from its parts; if its payload overflows cap, it splits 2-way COPY-UP
 // (format.md "Leaf split"): the left leaf keeps records [0, m), the right leaf [m, N), and the
 // separator handed up is a COPY of keys[m] (the right leaf's first key). edited is the index of
@@ -1340,21 +1784,55 @@ function buildLeaf(
   let total = 0;
   for (const w of weights) total += w;
   let pay = total + leafOverhead(n, shape);
-  // The content-dependent savings are measured only when the leaf does not fit without them. Each
-  // candidate half is measured with its own key prefix, bases, widths and dictionaries.
-  let bounds: { pre: number[]; suf: number[] } | null = null;
+  // The content-dependent savings are measured only when the leaf does not fit without them: one
+  // scan of the rows gives the leaf's facts and, below, each candidate half's.
+  const sizer = shape.sizer;
+  const memo = shape.memo ?? null;
+  let scan: unknown = null;
+  let facts: unknown;
   if (pay > cap.c && n >= 2) {
     pay -= leafPrefixSaving(n, keys[0]!, keys[n - 1]!);
-    if (shape.sizer !== null) {
-      bounds = shape.sizer.boundarySavings(keys, vals, cap, shape.memo ?? null);
-      pay -= bounds.pre[n]!;
+    if (sizer !== null) {
+      scan = sizer.scan(keys, vals, cap, memo);
+      facts = sizer.scanFacts(scan, vals, 0, n);
+      pay -= sizer.saving(facts, n);
     }
   }
-  if (pay <= cap.c || n < 2) return { whole: newLeaf(keys, vals, weights, owner) };
+  if (pay <= cap.c || n < 2) {
+    const whole = newLeaf(keys, vals, weights, owner);
+    // A dirty node is its writer's alone, so it may keep the facts.
+    if (facts !== undefined && owner !== undefined) whole.sizes = { n, facts };
+    return { whole };
+  }
 
   const prefix = new Array<number>(n + 1);
   prefix[0] = 0;
   for (let i = 0; i < n; i++) prefix[i + 1] = prefix[i]! + weights[i]!;
+  let fast: number | null | undefined;
+  let fastOut: InsOut | null = null;
+  if (sizer !== null) {
+    // The split point is found with running facts, visiting only the rows the rule looks at. When
+    // no two halves fit, the tables below serve the multi-way split.
+    fast = splitPointRunning(keys, vals, scan, prefix, pay, cap, shape, sizer, edited === n - 1);
+    if (fast !== null) {
+      const left = newLeaf(keys.slice(0, fast), vals.slice(0, fast), weights.slice(0, fast), owner);
+      const right = newLeaf(keys.slice(fast), vals.slice(fast), weights.slice(fast), owner);
+      if (owner !== undefined && !sizer.scanDups(scan)) {
+        // No payload repeats in the leaf, so none does in a half: each half's facts are counted
+        // without a lookup, and its writer keeps them.
+        left.sizes = { n: fast, facts: sizer.scanFacts(scan, vals, 0, fast) };
+        right.sizes = { n: n - fast, facts: sizer.scanFacts(scan, vals, fast, n) };
+      }
+      fastOut = { whole: null, left, sep: keys[fast]!, right, more: [] };
+      if (!leafSizesCheck) return fastOut;
+      // Under the check, returned once the tabled rule below agrees.
+    }
+  }
+  // Each candidate half is measured with its own key prefix, bases, widths and dictionaries.
+  const bounds = sizer === null ? null : sizer.boundarySavings(keys, vals, cap, memo, scan);
+  if (sizer !== null && bounds !== null && sizer.saving(facts, n) !== bounds.pre[n]) {
+    throw new Error("BUG: a scanned leaf's facts do not save what its tabled ones do");
+  }
   // Both stay monotone in m: a record added to a half adds at least its stored bytes, the half's
   // key prefix can only shorten, an offset width only widen, and a region's size is the smaller of
   // nondecreasing sizes (format.md "Leaf split").
@@ -1370,6 +1848,10 @@ function buildLeaf(
     leafPrefixSaving(n - m, keys[m]!, keys[n - 1]!) -
     (bounds === null ? 0 : bounds.suf[m]!);
   const m = splitPoint(1, n - 1, pay, cap.c, edited === n - 1, leftpayload, rightpayload);
+  if (fast !== undefined && fast !== m) {
+    throw new Error(`BUG: the running split point is ${fast}, the tabled one ${m}`);
+  }
+  if (fastOut !== null) return fastOut;
   if (m === null) {
     // No two fitting halves (format.md "Multi-way split"): one changed record can widen a whole
     // leaf's encodings. The left leaf takes the largest fitting run and the rest splits again.
@@ -1470,7 +1952,7 @@ function buildInterior(
 // now overflow). Splits propagate back up: a leaf split copies its boundary key up, an interior
 // receiving a separator may push-split in turn.
 function* nodeInsertSteps(
-  n: PNode,
+  node: PNode,
   key: Uint8Array,
   val: Row,
   weight: number,
@@ -1480,35 +1962,68 @@ function* nodeInsertSteps(
   cap: Cap,
   shape: LeafShape,
 ): Steps<InsOut> {
+  let n = node;
   if (isLeaf(n)) {
     const { index, found } = search(n, key);
+    if (lazyCopies(n, generation, shape)) {
+      // A Packed leaf, or a lazy one an earlier generation built, is copied without decoding its
+      // rows, and the copy is edited in place below.
+      n = lazyCopy(n, generation, shape.sizer);
+    }
     // Only this active generation may own a dirty node. Clone/cursor/publication invalidates the
     // token before exposing an alias; clean and old-generation nodes retain the path-copy fallback.
     if (n.page === 0 && n[mutationOwner] === generation && generation.active) {
+      trackWeight(n);
       if (found) {
-        ctx.old = n.vals[index];
         ctx.replaced = true;
-        const sz = n.sizes;
-        if (sz !== undefined) {
-          // The facts follow the row: the old one out, the new one in.
-          const sizer = shape.sizer;
-          const memo = shape.memo ?? null;
-          if (
-            sizer !== null &&
-            sz.n === n.keys.length &&
-            sizer.removeRow(sz.facts, key, n.vals[index]!, cap, memo)
-          ) {
-            sizer.addRow(sz.facts, key, val, cap, memo);
-          } else {
-            n.sizes = undefined;
+        if (n.lazyBase !== undefined) {
+          if (ctx.want) ctx.old = rowAt(n, index);
+          replaceRow(n, index, key, val, weight, cap, shape);
+        } else {
+          ctx.old = n.vals[index];
+          const sz = n.sizes;
+          if (sz !== undefined) {
+            // The facts follow the row: the old one out, the new one in.
+            const sizer = shape.sizer;
+            const memo = shape.memo ?? null;
+            const exact = sizer !== null && sz.n === n.keys.length;
+            // Facts with a dictionary kept as distinct cannot take a row: they are dropped, and the
+            // leaf is measured again only if its plain size no longer decides.
+            if (
+              exact &&
+              !sizer.factsDistinct(sz.facts) &&
+              sizer.removeRow(sz.facts, key, n.vals[index]!, cap, memo)
+            ) {
+              sizer.addRow(sz.facts, key, val, cap, memo);
+            } else {
+              n.sizes = undefined;
+            }
           }
+          n.vals[index] = val;
+          if (n.wsum !== undefined) n.wsum += weight - n.weights[index]!;
+          n.weights[index] = weight;
         }
-        n.vals[index] = val;
-        n.weights[index] = weight;
       } else {
+        const kept = n.sizes;
+        if (
+          kept !== undefined &&
+          shape.sizer !== null &&
+          kept.n === n.keys.length &&
+          n.lazyBase === undefined
+        ) {
+          // Facts with a dictionary kept as distinct cannot take a row. (A lazy leaf's facts come
+          // from its page and never hold one.)
+          if (shape.sizer.factsDistinct(kept.facts)) n.sizes = undefined;
+        }
         n.keys.splice(index, 0, key);
         n.vals.splice(index, 0, val);
         n.weights.splice(index, 0, weight);
+        if (n.wsum !== undefined) n.wsum += weight;
+        if (n.lazyBase !== undefined) {
+          n.lazy!.splice(index, 0, -1);
+          rowSetChanged(n, shape.sizer);
+          if (n.patchOK && !shape.edits!.rowAllInline(key, val, cap)) n.patchOK = false;
+        }
         const sz = n.sizes;
         if (sz !== undefined && shape.sizer !== null && sz.n === n.keys.length - 1) {
           shape.sizer.addRow(sz.facts, key, val, cap, shape.memo ?? null);
@@ -1518,6 +2033,8 @@ function* nodeInsertSteps(
         }
       }
       if (payloadAtMost(n, cap.c, cap, shape) || nodeLen(n) < 2) return { whole: n };
+      // A split needs every row.
+      if (n.lazyBase !== undefined) materialize(n);
       // The unchanged builder selects the exact split point/separator. This edited node is
       // abandoned when its returned halves replace it.
       return buildLeaf(n.keys, n.vals, n.weights, cap, shape, index, generation);
@@ -1592,18 +2109,45 @@ type RemOut = { ok: boolean; node: PNode; removed: Row | undefined };
 // generation owns is edited in place, as nodeInsert does; any other node is path-copied into a new
 // one the generation owns, so a later remove in the same statement reuses it.
 function* nodeRemoveSteps(
-  n: PNode,
+  node: PNode,
   key: Uint8Array,
+  want: boolean,
   generation: MutationGeneration,
   src: LeafSource | null,
   cap: Cap,
   shape: LeafShape,
 ): Steps<RemOut> {
+  let n = node;
   if (isLeaf(n)) {
     const { index, found } = search(n, key);
     if (!found) return { ok: false, node: n, removed: undefined };
+    if (lazyCopies(n, generation, shape)) n = lazyCopy(n, generation, shape.sizer); // see nodeInsertSteps
     if (ownedBy(n, generation)) {
+      trackWeight(n);
+      if (n.lazyBase !== undefined) {
+        const sizer = shape.sizer;
+        const sz = n.sizes;
+        // Kept facts follow the row out; frozen ones hold only for the page's rows.
+        const exact =
+          sz !== undefined &&
+          sizer !== null &&
+          sz.n === n.keys.length &&
+          sizer.frozen(sz.facts) === 0;
+        const removed = want || exact ? rowAt(n, index) : undefined;
+        if (sz !== undefined) {
+          if (exact && sizer!.removeRow(sz.facts, key, removed!, cap, shape.memo ?? null)) sz.n--;
+          else n.sizes = undefined;
+        }
+        n.lazy!.splice(index, 1);
+        rowSetChanged(n, sizer);
+        n.wsum! -= n.weights[index]!;
+        n.keys.splice(index, 1);
+        n.vals.splice(index, 1);
+        n.weights.splice(index, 1);
+        return { ok: true, node: n, removed };
+      }
       const removed = n.vals[index];
+      if (n.wsum !== undefined) n.wsum -= n.weights[index]!;
       const sz = n.sizes;
       if (sz !== undefined) {
         const sizer = shape.sizer;
@@ -1634,6 +2178,7 @@ function* nodeRemoveSteps(
   const res = yield* nodeRemoveSteps(
     yield* resolveChildSteps(n.children[i], src),
     key,
+    want,
     generation,
     src,
     cap,
@@ -1653,6 +2198,17 @@ function* nodeRemoveSteps(
     node: yield* rebalanceChildSteps(rebuilt, i, generation, src, cap, shape),
     removed: res.removed,
   };
+}
+
+// lazyCopies reports whether an edit of leaf n starts from a lazy copy: the lazy paths are on, the
+// tree has the format layer's part, and n is a Packed leaf or a lazy leaf this generation does not own.
+function lazyCopies(n: PNode, generation: MutationGeneration, shape: LeafShape): boolean {
+  return (
+    leafLazy &&
+    shape.edits !== undefined &&
+    (n.packed !== undefined || n.lazyBase !== undefined) &&
+    !ownedBy(n, generation)
+  );
 }
 
 // ownedBy reports whether n is a dirty node generation may edit in place: only the active generation

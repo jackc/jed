@@ -13,7 +13,16 @@
 import type { Unfetched, Value } from "./value.ts";
 import { type Cap, NO_TAG } from "./cap.ts";
 import type { ColType } from "./catalog.ts";
-import { PMap, pmapFromSkeleton, unboundedBound } from "./pmap.ts";
+import {
+  decodedLeafCopy,
+  decodedRows,
+  leafLazyOn,
+  PMap,
+  pmapFromSkeleton,
+  storedIndex,
+  storedLeaf,
+  unboundedBound,
+} from "./pmap.ts";
 import type { KeyBound, LeafShape, LeafSource, PNode, Span } from "./pmap.ts";
 import type { SharedPaging } from "./paging.ts";
 import { runSync, type StepIterator, type Steps } from "./execution.ts";
@@ -26,6 +35,7 @@ import {
   CompressMemo,
   fixedValueWidth,
   leafShape,
+  packedLeafSavings,
   recordCompressUnits,
   recordFootprint,
   recordScanUnits,
@@ -315,7 +325,7 @@ export class TableStore {
     const src = this.leafSrc();
     if ((yield* this.rows.getSteps(key, src)) !== undefined) return false;
     const [weight, stored] = this.weight(key, row);
-    yield* this.rows.insertSteps(key, row, weight, this.cap, this.writeShape(), src);
+    yield* this.rows.putSteps(key, row, weight, this.cap, this.writeShape(), src);
     this.stage(key, stored);
     return true;
   }
@@ -346,7 +356,7 @@ export class TableStore {
 
   *replaceSteps(key: Uint8Array, row: Row): Steps<void> {
     const [weight, stored] = this.weight(key, row);
-    yield* this.rows.insertSteps(key, row, weight, this.cap, this.writeShape(), this.leafSrc());
+    yield* this.rows.putSteps(key, row, weight, this.cap, this.writeShape(), this.leafSrc());
     this.stage(key, stored);
   }
 
@@ -357,9 +367,7 @@ export class TableStore {
   }
 
   *removeSteps(key: Uint8Array): Steps<boolean> {
-    const removed =
-      (yield* this.rows.removeSteps(key, this.cap, this.writeShape(), this.leafSrc())) !==
-      undefined;
+    const removed = yield* this.rows.deleteSteps(key, this.cap, this.writeShape(), this.leafSrc());
     if (removed) this.unstage(key);
     return removed;
   }
@@ -557,7 +565,7 @@ export class TableStore {
     mask: boolean[],
     units: { pages: number; decompress: number },
   ): void {
-    const p = n.packed;
+    const p = storedLeaf(n, i);
     if (p === undefined) {
       const u = recordScanUnits(this.colTypes, n.keys[i]!, n.vals[i]!, this.cap, mask);
       units.pages += u.pages;
@@ -576,8 +584,9 @@ export class TableStore {
       this.laneUnitMask = mask;
       this.laneUnitTypes = this.colTypes;
     }
+    const at = storedIndex(n, i);
     for (const c of cols) {
-      if (p.span(i, c, span)) spanScanUnits(span.buf, span.start, span.end, this.cap, units);
+      if (p.span(at, c, span)) spanScanUnits(span.buf, span.start, span.end, this.cap, units);
     }
   }
 
@@ -893,6 +902,38 @@ export class TableStore {
     return this.rows.scanRowsStepsIter(b, this.leafSrc(), reverse);
   }
 
+  // checkPackedSizes compares, for every Packed leaf of the store's tree, the size facts read from
+  // its page — measured in full from stored spans, and as the page shows them — with a measurement of
+  // its decoded rows, throwing on a difference. It returns the leaves checked (tests).
+  checkPackedSizes(): number {
+    let leaves = 0;
+    const shape = this.shape;
+    const cap = this.cap;
+    runSync(
+      this.rows.foldLeavesSteps(
+        unboundedBound(),
+        this.leafSrc(),
+        // biome-ignore lint/correctness/useYield: Measuring a resident leaf needs no effect.
+        function* (n: PNode): Steps<void> {
+          const got = packedLeafSavings(shape, cap, n);
+          if (got === null) return;
+          leaves++;
+          if (got.spans !== got.rows) {
+            throw new Error(
+              `a leaf measured from its page saves ${got.spans} bytes, from its rows ${got.rows}`,
+            );
+          }
+          if (got.shown !== got.rows) {
+            throw new Error(
+              `a leaf's page shows ${got.shown} bytes saved, its rows measure ${got.rows}`,
+            );
+          }
+        },
+      ),
+    );
+    return leaves;
+  }
+
   // treeRoot is the root B-tree node of this store, for the page-backed serializer
   // (spec/fileformat/format.md). null for an empty table.
   treeRoot(): PNode | null {
@@ -913,6 +954,12 @@ export class TableStore {
   // is re-faulted from the page just written, so its references are the ones on disk. If that read
   // fails the pager is poisoned: no later commit can reuse the old chains, which stay intact until
   // reopen.
+  //
+  // With lazy leaves on (pmap.ts setLeafLazy) any other persisted root leaf is re-faulted too, so the
+  // next write finds it Packed and edits it lazily — but only when its page holds no overflow
+  // pointer. A resident value is written to a fresh chain by the next commit that rewrites its leaf,
+  // and a re-faulted one would keep its chain instead: different page numbers. Such a root stays
+  // Decoded, as without lazy leaves, so file bytes do not depend on the setting.
   demoteCleanLeaves(): void {
     const page = this.demoteForRefault();
     if (page !== 0) runSync(this.refaultRootSteps(page));
@@ -928,16 +975,31 @@ export class TableStore {
     const root = this.rows.rootNode();
     if (root === null || root.children.length > 0 || root.page === 0 || root.packed !== undefined)
       return 0;
-    return rowsReferenceChains(root.vals) ? root.page : 0;
+    if (leafLazyOn() || root.lazyBase !== undefined) return root.page;
+    return rootReferencesChains(root) ? root.page : 0;
   }
 
   *refaultRootSteps(page: number): Steps<void> {
     const paging = this.paging!;
-    const tag = this.rows.rootNode()?.tag ?? NO_TAG;
+    const root = this.rows.rootNode()!;
+    const tag = root.tag ?? NO_TAG;
+    // must: the root's rows hold references the commit may have invalidated.
+    const must = rootReferencesChains(root);
+    let fresh: PNode | null = null;
     try {
-      this.rows.replaceRoot(yield* paging.faultLeafSteps(page, this.colTypes, tag));
+      fresh = yield* paging.faultLeafSteps(page, this.colTypes, tag);
     } catch {
-      paging.poison();
+      if (must) {
+        paging.poison();
+        return;
+      }
+    }
+    if (fresh !== null && (must || !fresh.packed!.hasChains())) {
+      this.rows.replaceRoot(fresh);
+    } else if (root.lazyBase !== undefined) {
+      // A lazy root that keeps resident values becomes the Decoded root it would be without lazy
+      // leaves: its untouched rows decoded from its old page, which it holds.
+      this.rows.replaceRoot(decodedLeafCopy(root));
     }
   }
 
@@ -986,6 +1048,14 @@ export class TableStore {
 // plain or LZ4-compressed.
 const FORM_EXTERNAL = 0x02;
 const FORM_EXTERNAL_COMP = 0x04;
+
+// rootReferencesChains reports whether a persisted root leaf's rows hold an unfetched reference to an
+// overflow chain: the rows in vals, and a lazy root's untouched rows on its base page.
+function rootReferencesChains(root: PNode): boolean {
+  const base = root.lazyBase;
+  if (base === undefined || !base.hasChains()) return rowsReferenceChains(root.vals);
+  return rowsReferenceChains(decodedRows(root));
+}
 
 // rowsReferenceChains reports whether any value is an unfetched reference to an overflow chain.
 function rowsReferenceChains(rows: Row[]): boolean {

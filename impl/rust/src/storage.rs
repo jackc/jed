@@ -425,8 +425,9 @@ impl TableStore {
         let src = make_src(&self.paging, &self.shape);
         let src_ref = src.as_ref().map(|s| s as &dyn LeafSource);
         let _memo = self.lend_memo();
+        // The replaced row is not used, so the leaf need not decode it.
         self.rows
-            .insert(key.to_vec(), row, w, self.cap, &self.shape, src_ref)?;
+            .put(key.to_vec(), row, w, self.cap, &self.shape, src_ref)?;
         Ok(())
     }
 
@@ -436,10 +437,7 @@ impl TableStore {
         let src = make_src(&self.paging, &self.shape);
         let src_ref = src.as_ref().map(|s| s as &dyn LeafSource);
         let _memo = self.lend_memo();
-        let removed = self
-            .rows
-            .remove(key, self.cap, &self.shape, src_ref)?
-            .is_some();
+        let removed = self.rows.delete(key, self.cap, &self.shape, src_ref)?;
         if removed {
             self.unstage(key)?;
         }
@@ -918,6 +916,13 @@ impl TableStore {
     /// commit may reuse. Such a root is re-faulted from the page just written, so its references are
     /// the ones on disk. If that read fails the pager is poisoned: no later commit can reuse the old
     /// chains, which stay intact until reopen.
+    ///
+    /// With lazy leaf edits on (leaf_lazy.rs) any other persisted root leaf is re-faulted too, so
+    /// the next write finds it packed and edits it lazily — but only when its page holds no
+    /// overflow pointer. A resident value is written to a fresh chain by the next commit that
+    /// rewrites its leaf, and a re-faulted one would keep its chain instead: different page
+    /// numbers. Such a root stays decoded, as without lazy leaf edits, so file bytes do not
+    /// depend on the switch.
     pub(crate) fn demote_clean_leaves(&mut self) {
         let Some(paging) = self.paging.clone() else {
             return;
@@ -927,17 +932,46 @@ impl TableStore {
             return;
         };
         let page = root.page_ref();
-        if !root.is_leaf()
-            || page.page == 0
-            || root.packed.is_some()
-            || !rows_reference_chains(&root.vals)
-        {
+        if !root.is_leaf() || page.page == 0 || root.packed.is_some() {
+            return;
+        }
+        let lazy_root = root.lazy.is_some();
+        // must: the root's rows hold references the commit may have invalidated.
+        let must = root_references_chains(root);
+        if !must && !lazy_root && !crate::pmap::leaf_lazy::on() {
             return;
         }
         match paging.fault_leaf(page, &self.shape) {
-            Ok(fresh) => self.rows.replace_root(fresh),
-            Err(_) => paging.pager().poison(),
+            Ok(fresh) if must || !fresh.packed.as_ref().is_some_and(|p| p.has_chains()) => {
+                self.rows.replace_root(fresh);
+                return;
+            }
+            Ok(_) => {}
+            Err(_) if must => {
+                paging.pager().poison();
+                return;
+            }
+            // An optional re-fault that fails changes nothing: the root is kept.
+            Err(_) => {}
         }
+        if lazy_root {
+            // A lazy root that keeps resident values becomes the decoded root it would be without
+            // lazy leaf edits: its untouched rows decoded from its old page, which it holds.
+            let root = self.rows.root().expect("the root checked above");
+            match root.decoded_leaf_copy() {
+                Ok(copy) => self.rows.replace_root(Arc::new(copy)),
+                Err(_) => paging.pager().poison(),
+            }
+        }
+    }
+
+    /// Test: [`PMap::check_packed_leaves`] over this store's tree.
+    #[cfg(test)]
+    pub(crate) fn check_packed_leaves(&self) -> usize {
+        let src = make_src(&self.paging, &self.shape);
+        let src_ref = src.as_ref().map(|s| s as &dyn LeafSource);
+        self.rows
+            .check_packed_leaves(src_ref, &self.shape, self.cap)
     }
 
     /// Fault the clean leaf at `page` through this store's pool — the whole-image serializer's
@@ -1009,6 +1043,24 @@ fn staged_of(entry: Option<Row>) -> i64 {
     match entry.as_deref() {
         Some([Value::Int(n)]) => *n,
         _ => 0,
+    }
+}
+
+/// Whether a persisted root leaf's rows hold an unfetched reference to an overflow chain: the
+/// rows it holds, and a lazy root's untouched rows on its base page. A lazy root whose rows cannot
+/// be decoded counts as holding one, so it is re-faulted.
+fn root_references_chains(root: &crate::pmap::Node) -> bool {
+    let base_chains = root
+        .lazy
+        .as_deref()
+        .and_then(|lz| lz.base.packed.as_ref())
+        .is_some_and(|p| p.has_chains());
+    if !base_chains {
+        return rows_reference_chains(&root.vals);
+    }
+    match root.decoded_rows() {
+        Ok(rows) => rows_reference_chains(&rows),
+        Err(_) => true,
     }
 }
 

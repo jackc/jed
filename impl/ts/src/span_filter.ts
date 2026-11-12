@@ -27,7 +27,7 @@ import {
 } from "./eval.ts";
 import { collectTouched, type EvalEnv, hasCorrelatedSubquery, type RExpr } from "./executor.ts";
 import { encodeValue, fixedValueWidth, resolveUnfetchedSelfSteps } from "./format.ts";
-import { colAt, colAtNow, type PNode, type Span } from "./pmap.ts";
+import { colAt, colAtNow, type PNode, type Span, storedIndex, storedLeaf } from "./pmap.ts";
 import type { Row } from "./storage.ts";
 import { inRange, isBytea, isInteger, isText, widthBytes } from "./types.ts";
 import { isTrue, nullValue, type Value } from "./value.ts";
@@ -369,15 +369,17 @@ function* spanLeafSteps(
 // leaf; null (charging nothing) when the bytes are not available in place, so the caller evaluates the
 // leaf through the evaluator.
 function evalSpan(a: SpanAtom, n: PNode, i: number, m: Meter): boolean | null {
-  const p = n.packed;
+  // A lazy leaf's untouched row is read from its base page, at its index there.
+  const p = storedLeaf(n, i);
   if (a.kind === "nullTest") {
     m.guard();
     m.charge(COSTS.operatorEval);
-    const isNull = p === undefined ? n.vals[i]![a.col]!.kind === "null" : p.isNull(i, a.col);
+    const isNull =
+      p === undefined ? n.vals[i]![a.col]!.kind === "null" : p.isNull(storedIndex(n, i), a.col);
     return isNull !== a.negated;
   }
   if (p === undefined) return null;
-  if (!p.span(i, a.col, SPAN)) {
+  if (!p.span(storedIndex(n, i), a.col, SPAN)) {
     // A NULL operand: the operator is NULL (not TRUE) and charges no length work.
     m.guard();
     m.charge(a.base);

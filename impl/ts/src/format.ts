@@ -115,9 +115,19 @@ import { lz4CompressScratch, lz4Decompress } from "./lz4.ts";
 import { MemoryBlockStore } from "./memoryblockstore.ts";
 import { utf8Length } from "./memsize.ts";
 import { Pager } from "./pager.ts";
-import { compareBytes, decodedRows, keyViews, nodeLen, onDiskRef, residentRef } from "./pmap.ts";
+import {
+  colAt,
+  compareBytes,
+  decodedRows,
+  keyViews,
+  leafSizesCheckOn,
+  nodeLen,
+  onDiskRef,
+  residentRef,
+  rowAt,
+} from "./pmap.ts";
 import { rangeElemCmp, rangeForElement } from "./range.ts";
-import type { Child, LeafShape, LeafSizer, PackedLeaf, PNode, Span } from "./pmap.ts";
+import type { Child, LeafEdits, LeafShape, LeafSizer, PackedLeaf, PNode, Span } from "./pmap.ts";
 import {
   arrElems,
   arrSaving,
@@ -1499,6 +1509,10 @@ type ItemAcc = {
   // addOnly says no value is ever removed. More than 256 entries then rule the dictionary out for
   // good (dictSaving), so the rest are not counted.
   addOnly: boolean;
+  // distinct says every shared payload counted occurs once and seen is not kept (a leaf measured by
+  // scanFacts). Removing a value then needs no lookup; a shared value cannot be added (the writer
+  // drops the facts first).
+  distinct: boolean;
   empties: number;
   arrays: number;
   elems: number;
@@ -1512,13 +1526,105 @@ type ItemAcc = {
 // forCnt is each base-plus-offsets column's present values. forStale marks a column whose range lost
 // a value at one of its ends: fors then only contains the true range, until refresh rescans the
 // column. stale says any column may be.
+//
+// A lazy leaf's facts (measureLazy) may hold frozen columns: forFrozen[j] / itemFrozen[j] says the
+// column's saving is the one its page shows (forSave[j] / itemSave[j]) and its other facts are unset.
+// frozen counts them; the flag arrays are null when none ever was. redoFor / redoItem are the columns
+// replaceCols leaves for remeasure.
+// distinct says some column's dictionary is kept as distinct (ItemAcc.distinct): the facts are
+// dropped before a row is added.
 type LeafFacts = {
   fors: ForRange[];
   forCnt: number[];
   forStale: boolean[];
   stale: boolean;
   items: ItemAcc[];
+  forFrozen: boolean[] | null;
+  forSave: number[];
+  itemFrozen: boolean[] | null;
+  itemSave: number[];
+  frozen: number;
+  redoFor: number[];
+  redoItem: number[];
+  distinct: boolean;
 };
+
+// LeafScan is one pass over a leaf's rows (TableLeafSizer.scan; the Go core's allRowItems and
+// scanDicts): every row's items, and for each dictionary column whether each shared value is the
+// first, and the last, of its payload in the leaf (first[j] / last[j], one byte per row; null for a
+// packed-array column). dups[j] says some payload of column j repeats.
+//
+// It also holds the running facts of one half of a candidate split (scanReset / scanAdd /
+// scanSaving): each base-plus-offsets column's span, each dictionary's entry count and repeated bytes
+// (runD / runDup; runNull says a NULL is counted), and each packed-array column's facts.
+type LeafScan = {
+  items: LeafItem[][];
+  first: (Uint8Array | null)[];
+  last: (Uint8Array | null)[];
+  dups: boolean[];
+  anyDups: boolean;
+  runFors: ForRange[];
+  runD: number[];
+  runDup: number[];
+  runNull: boolean[];
+  runArr: ItemAcc[];
+};
+
+function newItemAcc(addOnly: boolean): ItemAcc {
+  return {
+    seen: null,
+    d: 0,
+    dup: 0,
+    nulls: 0,
+    addOnly,
+    distinct: false,
+    empties: 0,
+    arrays: 0,
+    elems: 0,
+    r: newForRange(),
+    bad: false,
+  };
+}
+
+function newLeafItem(): LeafItem {
+  return { kind: ITEM_NULL, key: "", len: 0, body: null };
+}
+
+// sameItem reports whether two items of one column are the same for the size facts.
+function sameItem(a: LeafItem, b: LeafItem): boolean {
+  if (a.kind !== b.kind || a.key !== b.key || a.len !== b.len) return false;
+  const x = a.body;
+  const y = b.body;
+  if (x === null || y === null) return x === y;
+  if (x.length !== y.length) return false;
+  for (let i = 0; i < x.length; i++) if (x[i] !== y[i]) return false;
+  return true;
+}
+
+// spanItem classifies a stored span buf[start, end) of an item column (arrW its packed-array element
+// width, 0 for a text / bytea / json column) as classify does the value it decodes to: empty is
+// NULL, the inline-plain form is shared with its content, any other form is its own.
+function spanItem(it: LeafItem, arrW: number, buf: Uint8Array, start: number, end: number): void {
+  it.key = "";
+  it.len = 0;
+  it.body = null;
+  if (end <= start) {
+    it.kind = ITEM_NULL;
+    return;
+  }
+  if (buf[start] !== (arrW !== 0 ? 0x00 : TAG_INLINE_BARE)) {
+    it.kind = ITEM_OWN;
+    return;
+  }
+  it.kind = ITEM_SHARED;
+  const content = buf.subarray(start + 1, end);
+  if (arrW !== 0) {
+    it.body = content;
+  } else {
+    it.key = binaryString(content);
+    it.len = content.length;
+  }
+}
 
 function forRangeAdd(r: ForRange, v: bigint): void {
   if (!r.any) {
@@ -1575,12 +1681,14 @@ class TableLeafSizer implements LeafSizer {
   private readonly forCols: ForCol[];
   private readonly itemCols: ItemCol[];
   private readonly scratch: LeafItem[];
+  private readonly scratch2: LeafItem[];
 
   constructor(colTypes: ColType[], forCols: ForCol[], itemCols: ItemCol[]) {
     this.colTypes = colTypes;
     this.forCols = forCols;
     this.itemCols = itemCols;
-    this.scratch = itemCols.map(() => ({ kind: ITEM_NULL, key: "", len: 0, body: null }));
+    this.scratch = itemCols.map(newLeafItem);
+    this.scratch2 = itemCols.map(newLeafItem);
   }
 
   newFacts(addOnly = false): LeafFacts {
@@ -1589,19 +1697,57 @@ class TableLeafSizer implements LeafSizer {
       forCnt: this.forCols.map(() => 0),
       forStale: this.forCols.map(() => false),
       stale: false,
-      items: this.itemCols.map(() => ({
-        seen: null,
-        d: 0,
-        dup: 0,
-        nulls: 0,
-        addOnly,
-        empties: 0,
-        arrays: 0,
-        elems: 0,
-        r: newForRange(),
-        bad: false,
-      })),
+      items: this.itemCols.map(() => newItemAcc(addOnly)),
+      forFrozen: null,
+      forSave: [],
+      itemFrozen: null,
+      itemSave: [],
+      frozen: 0,
+      redoFor: [],
+      redoItem: [],
+      distinct: false,
     };
+  }
+
+  // neverInline reports whether the disposition plan is certain to move column c's value v out of
+  // its inline-plain form, decided without running the plan: a spillable value whose inline-plain
+  // size alone exceeds floor, the larger of RECORD_MAX and the external pointer. While such a value
+  // stays inline-plain the record exceeds RECORD_MAX, so neither pass stops early: pass 1 adopts its
+  // compressed form, or pass 2, where it is a candidate, reaches and externalizes it.
+  private neverInline(c: number, v: Value, floor: number): boolean {
+    const ty = this.colTypes[c]!;
+    if (!isSpillable(ty)) return false;
+    // The common small value is ruled out from an upper bound of its size, without measuring it.
+    const header = inlineHeaderLen(ty);
+    if (v.kind === "text" || v.kind === "json") {
+      if (header + 3 * v.text.length <= floor) return false;
+    } else if (v.kind === "bytea") {
+      return header + v.bytes.length > floor;
+    } else if (v.kind === "array" && ty.kind === "array") {
+      const w = fixedValueWidth(ty.elem);
+      const count = v.elements.length;
+      if (
+        w !== null &&
+        header + 2 + 8 * v.dims.length + Math.ceil(count / 8) + count * w <= floor
+      ) {
+        return false;
+      }
+    }
+    return valueFacts(ty, v)[0] > floor;
+  }
+
+  // itemsNeverInline reports whether every item column of row is NULL or neverInline. The record of
+  // such a row with a non-NULL item value does not fit all-inline, and one whose item values are all
+  // NULL classifies the same under any plan.
+  private itemsNeverInline(row: Row, cap: Cap): boolean {
+    const max = recordMaxFor(cap.c, this.colTypes.length);
+    const ptr = EXTERNAL_PTR_LEN + cap.tag;
+    const floor = max > ptr ? max : ptr;
+    for (const ic of this.itemCols) {
+      const v = row[ic.col]!;
+      if (v.kind !== "null" && !this.neverInline(ic.col, v, floor)) return false;
+    }
+    return true;
   }
 
   // classify fills out (one item per item column) for a decoded row. A value is inline-plain when the
@@ -1613,6 +1759,26 @@ class TableLeafSizer implements LeafSizer {
     out: LeafItem[],
     memo: CompressMemo | null,
   ): void {
+    if (this.itemsNeverInline(row, cap)) {
+      // Every item value is NULL or too large to stay inline-plain under any plan: the
+      // classification is known without planning.
+      if (leafSizesCheckOn()) {
+        const plan = planDispositions(this.colTypes, key, row, cap, memo);
+        for (const ic of this.itemCols) {
+          if (row[ic.col]!.kind !== "null" && plan.disp[ic.col] === "inline") {
+            throw new Error("BUG: a never-inline value the plan leaves inline");
+          }
+        }
+      }
+      for (let j = 0; j < this.itemCols.length; j++) {
+        const it = out[j]!;
+        it.key = "";
+        it.len = 0;
+        it.body = null;
+        it.kind = row[this.itemCols[j]!.col]!.kind === "null" ? ITEM_NULL : ITEM_OWN;
+      }
+      return;
+    }
     const plan = planDispositions(this.colTypes, key, row, cap, memo);
     for (let j = 0; j < this.itemCols.length; j++) {
       const ic = this.itemCols[j]!;
@@ -1665,42 +1831,66 @@ class TableLeafSizer implements LeafSizer {
 
   private addItems(f: LeafFacts, items: LeafItem[]): void {
     for (let j = 0; j < this.itemCols.length; j++) {
-      const a = f.items[j]!;
-      const it = items[j]!;
-      const w = this.itemCols[j]!.arrW;
-      if (w !== 0) {
-        if (it.kind === ITEM_NULL) continue;
-        if (it.kind === ITEM_OWN) {
-          a.bad = true;
-          continue;
-        }
-        const body = it.body!;
-        const at = arrElems(body, 0, body.length, w);
-        if (at < 0) a.bad = true;
-        else if (at === 0) a.empties++;
-        else {
-          a.arrays++;
-          a.elems += (body.length - at) / w;
-          forRangeAddElems(a.r, body, at, body.length, w);
-        }
-        continue;
+      this.addItem(f.items[j]!, this.itemCols[j]!.arrW, items[j]!);
+    }
+  }
+
+  // addItem adds one value of an item column (w its packed-array element width, or 0).
+  private addItem(a: ItemAcc, w: number, it: LeafItem): void {
+    if (w !== 0) {
+      if (it.kind === ITEM_NULL) return;
+      if (it.kind === ITEM_OWN) {
+        a.bad = true;
+        return;
       }
-      if (a.addOnly && a.d > 256) continue;
-      if (it.kind === ITEM_NULL) {
-        if (a.nulls === 0) a.d++;
-        a.nulls++;
-      } else if (it.kind === ITEM_OWN) {
-        a.d++;
+      const body = it.body!;
+      const at = arrElems(body, 0, body.length, w);
+      if (at < 0) a.bad = true;
+      else if (at === 0) a.empties++;
+      else {
+        a.arrays++;
+        a.elems += (body.length - at) / w;
+        forRangeAddElems(a.r, body, at, body.length, w);
+      }
+      return;
+    }
+    if (a.addOnly && a.d > 256) return;
+    if (it.kind === ITEM_NULL) {
+      if (a.nulls === 0) a.d++;
+      a.nulls++;
+    } else if (it.kind === ITEM_OWN) {
+      a.d++;
+    } else {
+      if (a.distinct) throw new Error("BUG: a value added to a dictionary kept as distinct");
+      if (a.seen === null) a.seen = new Map();
+      const k = a.seen.get(it.key);
+      if (k !== undefined) {
+        a.seen.set(it.key, k + 1);
+        a.dup += 1 + it.len;
       } else {
-        if (a.seen === null) a.seen = new Map();
-        const k = a.seen.get(it.key);
-        if (k !== undefined) {
-          a.seen.set(it.key, k + 1);
-          a.dup += 1 + it.len;
-        } else {
-          a.seen.set(it.key, 1);
-          a.d++;
-        }
+        a.seen.set(it.key, 1);
+        a.d++;
+      }
+    }
+  }
+
+  // addDictItems is addItem for k values of a dictionary column with the same item.
+  private addDictItems(a: ItemAcc, it: LeafItem, k: number): void {
+    if (it.kind === ITEM_NULL) {
+      if (a.nulls === 0) a.d++;
+      a.nulls += k;
+    } else if (it.kind === ITEM_OWN) {
+      a.d += k;
+    } else {
+      if (a.seen === null) a.seen = new Map();
+      const have = a.seen.get(it.key);
+      if (have !== undefined) {
+        a.seen.set(it.key, have + k);
+        a.dup += k * (1 + it.len);
+      } else {
+        a.seen.set(it.key, k);
+        a.d++;
+        a.dup += (k - 1) * (1 + it.len);
       }
     }
   }
@@ -1711,49 +1901,54 @@ class TableLeafSizer implements LeafSizer {
   // end of the element range.
   private removeItems(f: LeafFacts, items: LeafItem[]): boolean {
     for (let j = 0; j < this.itemCols.length; j++) {
-      const a = f.items[j]!;
-      const it = items[j]!;
-      const w = this.itemCols[j]!.arrW;
-      if (w !== 0) {
-        if (it.kind === ITEM_NULL) continue;
-        if (it.kind === ITEM_OWN) return false;
-        const body = it.body!;
-        const at = arrElems(body, 0, body.length, w);
-        if (at < 0) return false;
-        if (at === 0) {
-          a.empties--;
-          continue;
-        }
-        if (w <= 4) {
-          for (let p = at; p < body.length; p += w) {
-            const v = beUintN(body, p, w);
-            if (v === a.r.nlo || v === a.r.nhi) return false;
-          }
-        } else {
-          for (let p = at; p < body.length; p += w) {
-            const v = beUint(body, p, w);
-            if (v === a.r.lo || v === a.r.hi) return false;
-          }
-        }
-        a.arrays--;
-        a.elems -= (body.length - at) / w;
-        continue;
+      if (!this.removeItem(f.items[j]!, this.itemCols[j]!.arrW, items[j]!)) return false;
+    }
+    return true;
+  }
+
+  // removeItem takes out one value of an item column; on false the column's facts are untouched.
+  private removeItem(a: ItemAcc, w: number, it: LeafItem): boolean {
+    if (w !== 0) {
+      if (it.kind === ITEM_NULL) return true;
+      if (it.kind === ITEM_OWN) return false;
+      const body = it.body!;
+      const at = arrElems(body, 0, body.length, w);
+      if (at < 0) return false;
+      if (at === 0) {
+        a.empties--;
+        return true;
       }
-      if (it.kind === ITEM_NULL) {
-        a.nulls--;
-        if (a.nulls === 0) a.d--;
-      } else if (it.kind === ITEM_OWN) {
-        a.d--;
-      } else {
-        const k = a.seen?.get(it.key);
-        if (k === undefined) throw new Error("BUG: a leaf's size facts lack a removed value");
-        if (k > 1) {
-          a.seen!.set(it.key, k - 1);
-          a.dup -= 1 + it.len;
-        } else {
-          a.seen!.delete(it.key);
-          a.d--;
+      if (w <= 4) {
+        for (let p = at; p < body.length; p += w) {
+          const v = beUintN(body, p, w);
+          if (v === a.r.nlo || v === a.r.nhi) return false;
         }
+      } else {
+        for (let p = at; p < body.length; p += w) {
+          const v = beUint(body, p, w);
+          if (v === a.r.lo || v === a.r.hi) return false;
+        }
+      }
+      a.arrays--;
+      a.elems -= (body.length - at) / w;
+      return true;
+    }
+    if (it.kind === ITEM_NULL) {
+      a.nulls--;
+      if (a.nulls === 0) a.d--;
+    } else if (it.kind === ITEM_OWN) {
+      a.d--;
+    } else if (a.distinct) {
+      a.d--;
+    } else {
+      const k = a.seen?.get(it.key);
+      if (k === undefined) throw new Error("BUG: a leaf's size facts lack a removed value");
+      if (k > 1) {
+        a.seen!.set(it.key, k - 1);
+        a.dup -= 1 + it.len;
+      } else {
+        a.seen!.delete(it.key);
+        a.d--;
       }
     }
     return true;
@@ -1796,31 +1991,34 @@ class TableLeafSizer implements LeafSizer {
       this.classify(key, row, cap, this.scratch, memo);
       if (!this.removeItems(f, this.scratch)) return false;
     }
-    for (let j = 0; j < this.forCols.length; j++) {
-      const fc = this.forCols[j]!;
-      const v = row[fc.col]!;
-      if (v.kind === "null") continue;
-      const r = f.fors[j]!;
-      if (--f.forCnt[j]! === 0) {
-        f.fors[j] = newForRange();
-        f.forStale[j] = false;
-        continue;
-      }
-      const ty = this.colTypes[fc.col]!;
-      let end: boolean;
-      if (fc.w <= 4) {
-        const s = forSlotNum(ty, v);
-        end = s === r.nlo || s === r.nhi;
-      } else {
-        const s = forSlotValue(ty, v);
-        end = s === r.lo || s === r.hi;
-      }
-      if (end) {
-        f.forStale[j] = true;
-        f.stale = true;
-      }
-    }
+    for (let j = 0; j < this.forCols.length; j++) this.removeFor(f, j, row[this.forCols[j]!.col]!);
     return true;
+  }
+
+  // removeFor takes one value out of base-plus-offsets column j: a value at an end of the range
+  // leaves the range stale.
+  private removeFor(f: LeafFacts, j: number, v: Value): void {
+    if (v.kind === "null") return;
+    const fc = this.forCols[j]!;
+    const r = f.fors[j]!;
+    if (--f.forCnt[j]! === 0) {
+      f.fors[j] = newForRange();
+      f.forStale[j] = false;
+      return;
+    }
+    const ty = this.colTypes[fc.col]!;
+    let end: boolean;
+    if (fc.w <= 4) {
+      const s = forSlotNum(ty, v);
+      end = s === r.nlo || s === r.nhi;
+    } else {
+      const s = forSlotValue(ty, v);
+      end = s === r.lo || s === r.hi;
+    }
+    if (end) {
+      f.forStale[j] = true;
+      f.stale = true;
+    }
   }
 
   stale(facts: unknown): boolean {
@@ -1849,11 +2047,19 @@ class TableLeafSizer implements LeafSizer {
     const f = facts as LeafFacts;
     let total = 0;
     for (let j = 0; j < this.forCols.length; j++) {
+      if (f.forFrozen?.[j]) {
+        total += f.forSave[j]!;
+        continue;
+      }
       const w = this.forCols[j]!.w;
       // A stale range is taken at its narrowest offsets: an upper bound.
       total += forSaving(n, w, f.forStale[j] ? forWidthN(w, 0) : forRangeBw(f.fors[j]!, w));
     }
     for (let j = 0; j < this.itemCols.length; j++) {
+      if (f.itemFrozen?.[j]) {
+        total += f.itemSave[j]!;
+        continue;
+      }
       const a = f.items[j]!;
       const w = this.itemCols[j]!.arrW;
       if (w !== 0) {
@@ -1867,6 +2073,459 @@ class TableLeafSizer implements LeafSizer {
     return total;
   }
 
+  // --- a lazy leaf's size facts, from its page ---
+  //
+  // While a lazy leaf's rows are its page's (sameRows), a column no replacement changed is frozen: its
+  // saving is taken to be what the page shows (regionSaving). That rests on one assumption: a jed
+  // writer stores a region in a compact form exactly when the size rule says that form is smaller,
+  // and the form's stored size is the plain size less the rule's saving (fixedRegion and varRegion
+  // choose and size their forms that way). A page that breaks it — only a hand-corrupted, re-sealed
+  // page — would be measured differently here than from its decoded rows, and may be copied as it is.
+
+  // forRangeOf measures base-plus-offsets column j over a lazy leaf's rows: dense slots for the rows
+  // still on the page, values for the others.
+  private forRangeOf(f: LeafFacts, j: number, n: PNode): void {
+    const fc = this.forCols[j]!;
+    const ty = this.colTypes[fc.col]!;
+    const w = fc.w;
+    const base = n.lazyBase!;
+    const payload = base.payload;
+    const d = base.dirs as PaxDirs;
+    const reg = d.regions[fc.col] as FixedRegion;
+    const slots = paxFixedSlots(payload, d, reg);
+    const lazy = n.lazy!;
+    const r = newForRange();
+    let count = 0;
+    // A slot is the value plus the sign-bit flip.
+    const nbias = w <= 4 ? 2 ** (8 * w - 1) : 0;
+    const bias = 1n << BigInt(8 * w - 1);
+    for (let i = 0; i < lazy.length; i++) {
+      const at = lazy[i]!;
+      if (at < 0) {
+        const v = n.vals[i]![fc.col]!;
+        if (v.kind !== "null") {
+          forRangeAddValue(r, ty, w, v);
+          count++;
+        }
+        continue;
+      }
+      if ((payload[reg.bitmap + (at >> 3)]! & (0x80 >> (at % 8))) !== 0) continue;
+      const off = reg.body + at * w;
+      if (w <= 4) forRangeAddN(r, beUintN(slots, off, w) - nbias);
+      else forRangeAdd(r, beUint(slots, off, w) - bias);
+      count++;
+    }
+    f.fors[j] = r;
+    f.forCnt[j] = count;
+    f.forStale[j] = false;
+  }
+
+  // itemAccOf measures item column j over a lazy leaf's rows. A row still on the page is classified
+  // from its stored span, with no value decoded; where the page stores the column as a dictionary,
+  // the rows are counted by code and each entry is added once.
+  private itemAccOf(n: PNode, j: number, cap: Cap, memo: CompressMemo | null): ItemAcc {
+    const ic = this.itemCols[j]!;
+    const c = ic.col;
+    const base = n.lazyBase!;
+    const payload = base.payload;
+    const d = base.dirs as PaxDirs;
+    const reg = d.regions[c]!;
+    const lazy = n.lazy!;
+    const acc = newItemAcc(false);
+    const it = this.scratch2[j]!;
+    const byCode = reg.kind === "var" && reg.codes >= 0 && ic.arrW === 0;
+    const counts = byCode ? new Array<number>(256).fill(0) : null;
+    const sp: Span = { buf: payload, start: 0, end: 0 };
+    for (let i = 0; i < lazy.length; i++) {
+      const at = lazy[i]!;
+      if (at < 0) {
+        this.classify(n.keys[i]!, n.vals[i]!, cap, this.scratch, memo);
+        this.addItem(acc, ic.arrW, this.scratch[j]!);
+      } else if (counts !== null) {
+        counts[payload[(reg as VarRegion).codes + at]!]!++;
+      } else {
+        paxSpan(payload, d, c, at, sp);
+        // A span the directories place outside its buffer is no inline value.
+        if (sp.end > sp.buf.length) {
+          it.kind = ITEM_OWN;
+          it.key = "";
+          it.len = 0;
+          it.body = null;
+        } else {
+          spanItem(it, ic.arrW, sp.buf, sp.start, sp.end);
+        }
+        this.addItem(acc, ic.arrW, it);
+      }
+    }
+    if (counts !== null) {
+      const vr = reg as VarRegion;
+      const entries = (vr.body - vr.ends) / 2;
+      let lo = 0;
+      for (let e = 0; e < entries; e++) {
+        const hi = paxDirEnd(payload, vr.ends, e);
+        const k = counts[e]!;
+        if (k > 0) {
+          spanItem(it, 0, payload, vr.body + lo, vr.body + hi);
+          this.addDictItems(acc, it, k);
+        }
+        lo = hi;
+      }
+    }
+    return acc;
+  }
+
+  measureLazy(n: PNode, cap: Cap, memo: CompressMemo | null = null): LeafFacts {
+    const f = this.newFacts();
+    const base = n.lazyBase!;
+    const same = n.sameRows === true;
+    const dirty = n.colDirty;
+    if (same) {
+      f.forFrozen = this.forCols.map(() => false);
+      f.forSave = this.forCols.map(() => 0);
+      f.itemFrozen = this.itemCols.map(() => false);
+      f.itemSave = this.itemCols.map(() => 0);
+    }
+    for (let j = 0; j < this.forCols.length; j++) {
+      const c = this.forCols[j]!.col;
+      if (same && !dirty![c]) {
+        f.forFrozen![j] = true;
+        f.forSave[j] = regionSaving(base, c);
+        f.frozen++;
+      } else {
+        this.forRangeOf(f, j, n);
+      }
+    }
+    for (let j = 0; j < this.itemCols.length; j++) {
+      const c = this.itemCols[j]!.col;
+      if (same && !dirty![c]) {
+        f.itemFrozen![j] = true;
+        f.itemSave[j] = regionSaving(base, c);
+        f.frozen++;
+      } else {
+        f.items[j] = this.itemAccOf(n, j, cap, memo);
+      }
+    }
+    return f;
+  }
+
+  refreshLazy(facts: unknown, n: PNode): void {
+    const f = facts as LeafFacts;
+    if (!f.stale) return;
+    for (let j = 0; j < this.forCols.length; j++) {
+      if (f.forStale[j]) this.forRangeOf(f, j, n);
+    }
+    f.stale = false;
+  }
+
+  frozen(facts: unknown): number {
+    return (facts as LeafFacts).frozen;
+  }
+
+  // replaceCols follows the replacement of row i (not yet applied to n) in a leaf whose rows are its
+  // page's. A measured column is untouched only when the old row is the page's and the new one
+  // stores the same bytes there; otherwise it takes the old value out and the new one in. A frozen
+  // column the replacement changes is thawed. Columns to measure again are left in redoFor /
+  // redoItem for remeasure, which runs once the row is in place.
+  replaceCols(
+    facts: unknown,
+    n: PNode,
+    i: number,
+    key: Uint8Array,
+    row: Row,
+    cap: Cap,
+    changed: boolean[],
+    wasLazy: boolean,
+    memo: CompressMemo | null = null,
+  ): void {
+    const f = facts as LeafFacts;
+    const forFrozen = f.forFrozen!;
+    const itemFrozen = f.itemFrozen!;
+    f.redoFor.length = 0;
+    f.redoItem.length = 0;
+    const touched = (c: number): boolean => changed[c]! || !wasLazy;
+    let needFors = false;
+    for (let j = 0; j < this.forCols.length; j++) {
+      needFors = needFors || (!forFrozen[j] && touched(this.forCols[j]!.col));
+    }
+    let needItems = false;
+    for (let j = 0; j < this.itemCols.length; j++) {
+      needItems = needItems || (!itemFrozen[j] && touched(this.itemCols[j]!.col));
+    }
+    if (needFors || needItems) {
+      // The whole old row is decoded only for the items, whose classification needs its plan.
+      const old = needItems ? rowAt(n, i) : null;
+      for (let j = 0; j < this.forCols.length; j++) {
+        const fc = this.forCols[j]!;
+        if (forFrozen[j] || !touched(fc.col)) continue;
+        this.removeFor(f, j, old !== null ? old[fc.col]! : colAt(n, i, fc.col));
+        const nv = row[fc.col]!;
+        if (nv.kind !== "null") {
+          forRangeAddValue(f.fors[j]!, this.colTypes[fc.col]!, fc.w, nv);
+          f.forCnt[j]!++;
+        }
+      }
+      if (old !== null) {
+        this.classify(key, old, cap, this.scratch, memo);
+        this.classify(key, row, cap, this.scratch2, memo);
+        for (let j = 0; j < this.itemCols.length; j++) {
+          const ic = this.itemCols[j]!;
+          if (itemFrozen[j] || !touched(ic.col)) continue;
+          const a = this.scratch[j]!;
+          const b = this.scratch2[j]!;
+          if (sameItem(a, b)) continue;
+          if (this.removeItem(f.items[j]!, ic.arrW, a)) this.addItem(f.items[j]!, ic.arrW, b);
+          else f.redoItem.push(j);
+        }
+      }
+    }
+    for (let j = 0; j < this.forCols.length; j++) {
+      if (forFrozen[j] && changed[this.forCols[j]!.col]) {
+        forFrozen[j] = false;
+        f.frozen--;
+        f.redoFor.push(j);
+      }
+    }
+    for (let j = 0; j < this.itemCols.length; j++) {
+      if (itemFrozen[j] && changed[this.itemCols[j]!.col]) {
+        itemFrozen[j] = false;
+        f.frozen--;
+        f.redoItem.push(j);
+      }
+    }
+  }
+
+  // remeasure measures the columns replaceCols left for it, over the leaf's rows as they now are.
+  remeasure(facts: unknown, n: PNode, cap: Cap, memo: CompressMemo | null = null): void {
+    const f = facts as LeafFacts;
+    for (const j of f.redoFor) this.forRangeOf(f, j, n);
+    for (const j of f.redoItem) f.items[j] = this.itemAccOf(n, j, cap, memo);
+    f.redoFor.length = 0;
+    f.redoItem.length = 0;
+  }
+
+  cloneFacts(facts: unknown): LeafFacts {
+    const f = facts as LeafFacts;
+    return {
+      fors: f.fors.map((r) => ({ ...r })),
+      forCnt: f.forCnt.slice(),
+      forStale: f.forStale.slice(),
+      stale: f.stale,
+      items: f.items.map((a) => ({
+        ...a,
+        seen: a.seen === null ? null : new Map(a.seen),
+        r: { ...a.r },
+      })),
+      forFrozen: f.forFrozen === null ? null : f.forFrozen.slice(),
+      forSave: f.forSave.slice(),
+      itemFrozen: f.itemFrozen === null ? null : f.itemFrozen.slice(),
+      itemSave: f.itemSave.slice(),
+      frozen: f.frozen,
+      redoFor: [],
+      redoItem: [],
+      distinct: f.distinct,
+    };
+  }
+
+  // --- one pass over a leaf that does not fit as plain regions: its facts and its split point ---
+
+  // classifyAll classifies every row (items[i][j] is row i's item for item column j); empty when
+  // the tree has no item column.
+  private classifyAll(
+    keys: Uint8Array[],
+    rows: Row[],
+    cap: Cap,
+    memo: CompressMemo | null,
+  ): LeafItem[][] {
+    const k = this.itemCols.length;
+    const items: LeafItem[][] = new Array(k === 0 ? 0 : rows.length);
+    for (let i = 0; i < items.length; i++) {
+      const out: LeafItem[] = new Array(k);
+      for (let j = 0; j < k; j++) out[j] = newLeafItem();
+      this.classify(keys[i]!, rows[i]!, cap, out, memo);
+      items[i] = out;
+    }
+    return items;
+  }
+
+  // scan classifies every row and scans each dictionary column once: the only pass that hashes the
+  // column's values.
+  scan(keys: Uint8Array[], rows: Row[], cap: Cap, memo: CompressMemo | null = null): LeafScan {
+    const n = rows.length;
+    const k = this.itemCols.length;
+    const items = this.classifyAll(keys, rows, cap, memo);
+    const first = new Array<Uint8Array | null>(k).fill(null);
+    const last = new Array<Uint8Array | null>(k).fill(null);
+    const dups = new Array<boolean>(k).fill(false);
+    let anyDups = false;
+    for (let j = 0; j < k; j++) {
+      if (this.itemCols[j]!.arrW !== 0) continue;
+      const fst = new Uint8Array(n);
+      const lst = new Uint8Array(n);
+      const at = new Map<string, number>(); // payload -> its latest row
+      for (let i = 0; i < n; i++) {
+        const it = items[i]![j]!;
+        if (it.kind !== ITEM_SHARED) continue;
+        const prev = at.get(it.key);
+        if (prev !== undefined) {
+          lst[prev] = 0;
+          dups[j] = true;
+          anyDups = true;
+        } else {
+          fst[i] = 1;
+        }
+        lst[i] = 1;
+        at.set(it.key, i);
+      }
+      first[j] = fst;
+      last[j] = lst;
+    }
+    return {
+      items,
+      first,
+      last,
+      dups,
+      anyDups,
+      runFors: this.forCols.map(newForRange),
+      runD: new Array<number>(k).fill(0),
+      runDup: new Array<number>(k).fill(0),
+      runNull: new Array<boolean>(k).fill(false),
+      runArr: this.itemCols.map(() => newItemAcc(false)),
+    };
+  }
+
+  scanDups(scan: unknown): boolean {
+    return (scan as LeafScan).anyDups;
+  }
+
+  // scanFacts is the size facts of rows [lo, hi) of a scanned leaf. A dictionary column with no
+  // repeated payload is kept as distinct, with no map; one with repeats is counted into a map.
+  scanFacts(scan: unknown, rows: Row[], lo: number, hi: number): LeafFacts {
+    const sc = scan as LeafScan;
+    const f = this.newFacts();
+    for (let i = lo; i < hi; i++) this.addFors(f, rows[i]!);
+    for (let j = 0; j < this.itemCols.length; j++) {
+      const a = f.items[j]!;
+      const w = this.itemCols[j]!.arrW;
+      if (w !== 0 || sc.dups[j]) {
+        for (let i = lo; i < hi; i++) this.addItem(a, w, sc.items[i]![j]!);
+        continue;
+      }
+      for (let i = lo; i < hi; i++) {
+        if (sc.items[i]![j]!.kind === ITEM_NULL) a.nulls++;
+        else a.d++;
+      }
+      if (a.nulls > 0) a.d++;
+      a.distinct = true;
+      f.distinct = true;
+    }
+    return f;
+  }
+
+  // scanReset empties the scan's running half.
+  scanReset(scan: unknown): void {
+    const sc = scan as LeafScan;
+    for (let j = 0; j < this.forCols.length; j++) sc.runFors[j] = newForRange();
+    for (let j = 0; j < this.itemCols.length; j++) {
+      sc.runD[j] = 0;
+      sc.runDup[j] = 0;
+      sc.runNull[j] = false;
+      if (this.itemCols[j]!.arrW !== 0) sc.runArr[j] = newItemAcc(false);
+    }
+  }
+
+  // scanAdd takes row i into the running half; up says the half grows from the first row. Nothing
+  // is hashed: a shared value repeats one already in the half exactly when it is not the first of
+  // its payload (growing up) or not the last (growing down).
+  scanAdd(scan: unknown, rows: Row[], i: number, up: boolean): void {
+    const sc = scan as LeafScan;
+    const row = rows[i]!;
+    for (let j = 0; j < this.forCols.length; j++) {
+      const fc = this.forCols[j]!;
+      const v = row[fc.col]!;
+      if (v.kind !== "null") forRangeAddValue(sc.runFors[j]!, this.colTypes[fc.col]!, fc.w, v);
+    }
+    if (this.itemCols.length === 0) return;
+    const items = sc.items[i]!;
+    for (let j = 0; j < this.itemCols.length; j++) {
+      const it = items[j]!;
+      const w = this.itemCols[j]!.arrW;
+      if (w !== 0) {
+        this.addItem(sc.runArr[j]!, w, it);
+      } else if (it.kind === ITEM_NULL) {
+        if (!sc.runNull[j]) {
+          sc.runNull[j] = true;
+          sc.runD[j]!++;
+        }
+      } else if (it.kind === ITEM_OWN) {
+        sc.runD[j]!++;
+      } else if ((up ? sc.first[j]! : sc.last[j]!)[i] !== 0) {
+        sc.runD[j]!++;
+      } else {
+        sc.runDup[j]! += 1 + it.len;
+      }
+    }
+  }
+
+  // scanSaving is the region savings of the running half, which holds count rows.
+  scanSaving(scan: unknown, count: number): number {
+    const sc = scan as LeafScan;
+    let total = 0;
+    for (let j = 0; j < this.forCols.length; j++) {
+      const w = this.forCols[j]!.w;
+      total += forSaving(count, w, forRangeBw(sc.runFors[j]!, w));
+    }
+    for (let j = 0; j < this.itemCols.length; j++) {
+      const w = this.itemCols[j]!.arrW;
+      if (w !== 0) {
+        const a = sc.runArr[j]!;
+        if (!a.bad) {
+          total += arrSaving(count, w, a.empties, a.arrays, a.elems, forRangeBits(a.r, w));
+        }
+      } else {
+        total += dictSaving(count, sc.runD[j]!, sc.runDup[j]!);
+      }
+    }
+    return total;
+  }
+
+  // factsDistinct reports whether some dictionary of the facts is kept as distinct: such facts
+  // cannot take a row, so the writer drops them before an insert or replacement.
+  factsDistinct(facts: unknown): boolean {
+    return (facts as LeafFacts).distinct;
+  }
+
+  // packedSavings is a Packed leaf's region savings three ways (tests): measured from its decoded
+  // rows, measured in full from its stored spans, and as its page shows them. All three must agree.
+  packedSavings(p: PackedLeaf, cap: Cap): { rows: number; spans: number; shown: number } {
+    const count = p.n;
+    const keys = new Array<Uint8Array>(count);
+    const lazy = new Array<number>(count);
+    const fresh = this.newFacts();
+    for (let i = 0; i < count; i++) {
+      keys[i] = p.key(i);
+      lazy[i] = i;
+      this.addRow(fresh, keys[i]!, p.row(i), cap, null);
+    }
+    const view: PNode = {
+      keys,
+      vals: [],
+      weights: [],
+      children: [],
+      page: 0,
+      lazyBase: p,
+      lazy,
+      sameRows: false,
+    };
+    let shown = 0;
+    for (const fc of this.forCols) shown += regionSaving(p, fc.col);
+    for (const ic of this.itemCols) shown += regionSaving(p, ic.col);
+    return {
+      rows: this.saving(fresh, count),
+      spans: this.saving(this.measureLazy(view, cap, null), count),
+      shown,
+    };
+  }
+
   // boundarySavings measures every candidate half of a split (format.md "Leaf split"): pre[m] is the
   // saving of rows [0, m) and suf[m] that of rows [m, n), each half with its own bases, widths and
   // dictionaries.
@@ -1875,16 +2534,13 @@ class TableLeafSizer implements LeafSizer {
     rows: Row[],
     cap: Cap,
     memo: CompressMemo | null = null,
+    scan: unknown = null,
   ): { pre: number[]; suf: number[] } {
     const n = rows.length;
     const k = this.itemCols.length;
-    const items: LeafItem[][] = new Array(k === 0 ? 0 : n);
-    for (let i = 0; i < items.length; i++) {
-      const out: LeafItem[] = new Array(k);
-      for (let j = 0; j < k; j++) out[j] = { kind: ITEM_NULL, key: "", len: 0, body: null };
-      this.classify(keys[i]!, rows[i]!, cap, out, memo);
-      items[i] = out;
-    }
+    // The rows' items: the scan's when the leaf was scanned.
+    const items =
+      scan !== null ? (scan as LeafScan).items : this.classifyAll(keys, rows, cap, memo);
     const pre = new Array<number>(n + 1);
     const suf = new Array<number>(n + 1);
     // These only ever add, so their dictionaries stop counting past 256 entries.
@@ -1939,6 +2595,143 @@ export function leafShape(colTypes: ColType[], keyLen = 0): LeafShape {
       forCols.length === 0 && itemCols.length === 0
         ? null
         : new TableLeafSizer(colTypes, forCols, itemCols),
+    edits: newLeafEdits(colTypes),
+  };
+}
+
+// packedLeafSavings is TableLeafSizer.packedSavings for a Packed leaf of a tree with this shape, or
+// null when the leaf is not Packed or no column has a content-dependent saving (tests).
+export function packedLeafSavings(
+  shape: LeafShape,
+  cap: Cap,
+  n: PNode,
+): { rows: number; spans: number; shown: number } | null {
+  const sizer = shape.sizer;
+  if (n.packed === undefined || !(sizer instanceof TableLeafSizer)) return null;
+  return sizer.packedSavings(n.packed, cap);
+}
+
+// regionSaving is the bytes column c's region saves on this page: its plain size less its stored
+// size, 0 for a plain region.
+function regionSaving(p: PackedLeaf, c: number): number {
+  const payload = p.payload;
+  const d = p.dirs as PaxDirs;
+  const r = d.regions[c]!;
+  const n = d.n;
+  let plain: number;
+  if (r.kind === "fixed") {
+    if (r.lazy !== 2) return 0;
+    plain = 1 + Math.ceil(n / 8) + n * r.width;
+  } else if (r.kind === "arr") {
+    plain = 1 + 2 * n;
+    for (let i = 0; i < n; i++) plain += arrSpanLen(payload[r.counts + i]!, r.w);
+  } else {
+    if (r.codes < 0) return 0;
+    plain = 1 + 2 * n;
+    for (let i = 0; i < n; i++) {
+      const e = payload[r.codes + i]!;
+      plain += paxDirEnd(payload, r.ends, e) - (e === 0 ? 0 : paxDirEnd(payload, r.ends, e - 1));
+    }
+  }
+  const at = d.colDir + 2 * c;
+  const stored =
+    ((payload[at + 2]! << 8) | payload[at + 3]!) - ((payload[at]! << 8) | payload[at + 1]!);
+  return plain - stored;
+}
+
+// storedSame reports whether the leaf encoder, writing v as column c of an all-inline record, would
+// write exactly the bytes page p stores for record i of that column. It answers false whenever that
+// is not certain.
+//
+// An UPDATE's unassigned variable-width value reaches the write as the deferred handle the scan read
+// from this page, so the first test is identity: a body that is the same bytes of the same buffer.
+// Otherwise the bodies are compared, which also covers a page re-read since the scan and a value
+// assigned its old content. A fixed-width value is compared with the dense slot.
+function storedSame(ty: ColType, v: Value, p: PackedLeaf, c: number, i: number, sp: Span): boolean {
+  const payload = p.payload;
+  const d = p.dirs as PaxDirs;
+  const r = d.regions[c]!;
+  if (r.kind === "fixed" && r.lazy === 1) return true; // rebuilt from the key, which is the same
+  const isNull = paxIsNull(payload, d, c, i);
+  if (v.kind === "null" || isNull) return v.kind === "null" && isNull;
+  if (r.kind === "fixed") {
+    if (v.kind === "unfetched") return false;
+    const w = r.width;
+    const slots = paxFixedSlots(payload, d, r);
+    const at = r.body + i * w;
+    const body = FIXED_SCRATCH;
+    writeFixedBody(body, 0, ty, v);
+    for (let b = 0; b < w; b++) if (body[b] !== slots[at + b]) return false;
+    return true;
+  }
+  const str = stringPayload(ty);
+  let body: Uint8Array;
+  if (v.kind === "unfetched") {
+    if (v.ref.form !== 0x00) return false;
+    body = v.ref.comp!;
+  } else {
+    body = EMPTY_BYTES; // encoded below, once the page's span is known to be inline
+  }
+  paxSpan(payload, d, c, i, sp);
+  const buf = sp.buf;
+  if (sp.end > buf.length || sp.end <= sp.start) return false;
+  // The inline form a writer gives this value: the bare tag and a string's bytes, or 0x00 and the body.
+  if (buf[sp.start] !== (str ? TAG_INLINE_BARE : 0x00)) return false;
+  const start = sp.start + 1;
+  const len = sp.end - start;
+  if (v.kind !== "unfetched") {
+    body = str ? valuePayload(ty, v) : encodeValue(ty, v).subarray(1);
+  }
+  if (body.length !== len) return false;
+  if (body.buffer === buf.buffer && body.byteOffset === buf.byteOffset + start) return true;
+  for (let b = 0; b < len; b++) if (body[b] !== buf[start + b]) return false;
+  return true;
+}
+
+// FIXED_SCRATCH holds one fixed-width slot (the widest is a 16-byte uuid or interval).
+const FIXED_SCRATCH = new Uint8Array(32);
+
+// newLeafEdits is the format layer's part of a lazy leaf's row edits (pmap.ts LeafEdits), over a
+// tree's column types. A function, not a class: leafShape runs while this module is still loading
+// (storage.ts builds a shape at its top level), before a class declaration here is initialized.
+//
+// The size summed by both methods is the record's all-inline size, exactly as planDispositions
+// measures it; at most RECORD_MAX means no disposition plan runs and every value is written inline.
+function newLeafEdits(colTypes: ColType[]): LeafEdits {
+  const span: Span = { buf: new Uint8Array(0), start: 0, end: 0 };
+  return {
+    changedCols(
+      base: PackedLeaf,
+      at: number,
+      key: Uint8Array,
+      row: Row,
+      cap: Cap,
+      changed: boolean[],
+    ): boolean {
+      const d = base.dirs as PaxDirs;
+      let size = key.length;
+      for (let c = 0; c < colTypes.length; c++) {
+        const ty = colTypes[c]!;
+        const same = storedSame(ty, row[c]!, base, c, at, span);
+        changed[c] = !same;
+        if (isElided(ty)) continue; // rebuilt from the key: no stored bytes
+        const w = fixedValueWidth(ty);
+        if (w !== null) size += w;
+        else if (same) size += paxValueLen(base.payload, d, c, at);
+        else size += valueFacts(ty, row[c]!)[0];
+      }
+      return size <= recordMaxFor(cap.c, colTypes.length);
+    },
+    rowAllInline(key: Uint8Array, row: Row, cap: Cap): boolean {
+      let size = key.length;
+      for (let c = 0; c < colTypes.length; c++) {
+        const ty = colTypes[c]!;
+        if (isElided(ty)) continue;
+        const w = fixedValueWidth(ty);
+        size += w !== null ? w : valueFacts(ty, row[c]!)[0];
+      }
+      return size <= recordMaxFor(cap.c, colTypes.length);
+    },
   };
 }
 
@@ -2758,8 +3551,41 @@ export function encodeLeafPax(
       }
     }
   }
-  // The keys: a fixed-key tree's every key has the tree's length; the shared prefix is the longest
-  // one, stored exactly when it saves bytes.
+  const head = encodeLeafKeys(keyLen, keys);
+  // Each stored column region, the smallest of its kinds (kind 0 on a tie).
+  const regions = new Array<Uint8Array>(k);
+  const bm = Math.ceil(n / 8);
+  for (let c = 0; c < k; c++) {
+    if (elided[c]) {
+      regions[c] = EMPTY_BYTES; // an empty region: its directory entry equals the next column's
+      continue;
+    }
+    const ty = colTypes[c]!;
+    const w = widths[c]!;
+    if (w === null) {
+      regions[c] = varRegion(ty, n, valBytes[c]!);
+      continue;
+    }
+    // The plain form: kind 0, the null bitmap, the dense slots (a NULL's zero-filled).
+    const plain = new Uint8Array(1 + bm + n * w);
+    let o = 1 + bm;
+    for (let i = 0; i < n; i++) {
+      const v = rows[i]![c]!;
+      if (v.kind === "null") plain[1 + (i >> 3)] |= 0x80 >> (i % 8);
+      else writeFixedBody(plain, o, ty, v);
+      o += w;
+    }
+    regions[c] = fixedRegion(ty, w, n, plain);
+  }
+  return assembleLeaf(head, regions);
+}
+
+// encodeLeafKeys is the head of a leaf payload (format.md "Leaf node"): the flags byte, the fixed key
+// length and the shared key prefix when the leaf has them, the key directory, and the stored keys.
+function encodeLeafKeys(keyLen: number, keys: Uint8Array[]): Uint8Array {
+  const n = keys.length;
+  // A fixed-key tree's every key has the tree's length; the shared prefix is the longest one, stored
+  // exactly when it saves bytes.
   const fixedKey = keyLen > 0;
   if (fixedKey) {
     for (let i = 0; i < n; i++) {
@@ -2782,120 +3608,7 @@ export function encodeLeafPax(
   }
   let storedKeyBytes = 0;
   for (let i = 0; i < n; i++) storedKeyBytes += keys[i]!.length - kp;
-  const keysEnd = 1 + (fixedKey ? 2 : 2 * n) + (kp > 0 ? 2 + kp : 0) + storedKeyBytes;
-  // The column directory: the absolute payload offset of each region, each region the smallest of
-  // its kinds (kind 0 on a tie).
-  const fors: ({ r: ForRange; bw: number } | null)[] = new Array(k).fill(null);
-  const dicts: ({ entries: Uint8Array[]; codes: Uint8Array } | null)[] = new Array(k).fill(null);
-  const arrs: ({ r: ForRange; bits: number; elems: number } | null)[] = new Array(k).fill(null);
-  const colStart = new Array<number>(k + 1);
-  let cur = keysEnd + 2 * (k + 1);
-  for (let c = 0; c < k; c++) {
-    colStart[c] = cur;
-    if (elided[c]) continue; // an empty region: its directory entry equals the next column's
-    const ty = colTypes[c]!;
-    const w = widths[c]!;
-    if (w !== null) {
-      cur += 1 + Math.ceil(n / 8) + w * n;
-      if (forEligible(ty)) {
-        const r = newForRange();
-        for (let i = 0; i < n; i++) {
-          const v = rows[i]![c]!;
-          if (v.kind !== "null") forRangeAddValue(r, ty, w, v);
-        }
-        const bw = forRangeBw(r, w);
-        const saved = forSaving(n, w, bw);
-        if (saved > 0) {
-          fors[c] = { r, bw };
-          cur -= saved;
-        }
-      }
-      continue;
-    }
-    const vb = valBytes[c]!;
-    let bodies = 0;
-    for (let i = 0; i < n; i++) bodies += vb[i]!.length;
-    cur += 1 + 2 * n + bodies;
-    if (stringPayload(ty)) {
-      // A dictionary: entries in order of first use. Two values share an entry only when both are
-      // NULL or both are inline-plain with equal content.
-      const entries: Uint8Array[] = [];
-      const codes = new Uint8Array(n);
-      const index = new Map<string, number>();
-      let nullAt = -1;
-      let dup = 0;
-      for (let i = 0; i < n && entries.length <= 256; i++) {
-        const span = vb[i]!;
-        let at = -1;
-        let key: string | null = null;
-        if (span.length === 0) at = nullAt;
-        else if (span[0] === TAG_INLINE_BARE) {
-          key = binaryString(span);
-          at = index.get(key) ?? -1;
-          if (at >= 0) dup += span.length;
-        }
-        if (at < 0) {
-          at = entries.length;
-          entries.push(span);
-          if (span.length === 0) nullAt = at;
-          else if (key !== null) index.set(key, at);
-        }
-        codes[i] = at;
-      }
-      if (entries.length <= 256) {
-        const saved = dictSaving(n, entries.length, dup);
-        if (saved > 0) {
-          dicts[c] = { entries, codes };
-          cur -= saved;
-        }
-      }
-      continue;
-    }
-    const aw = arrElemWidth(ty);
-    if (aw !== 0) {
-      // Packed integer arrays: every value NULL, the empty array, or a one-dimensional inline-plain
-      // array with lower bound 1, no NULL element and at most 254 elements.
-      const r = newForRange();
-      let empties = 0;
-      let arrays = 0;
-      let elems = 0;
-      let bad = false;
-      for (let i = 0; i < n && !bad; i++) {
-        const span = vb[i]!;
-        if (span.length === 0) continue;
-        if (span[0] !== 0x00) {
-          bad = true;
-          break;
-        }
-        const at = arrElems(span, 1, span.length, aw);
-        if (at < 0) bad = true;
-        else if (at === 0) empties++;
-        else {
-          arrays++;
-          elems += (span.length - at) / aw;
-          forRangeAddElems(r, span, at, span.length, aw);
-        }
-      }
-      if (!bad) {
-        const bits = forRangeBits(r, aw);
-        const saved = arrSaving(n, aw, empties, arrays, elems, bits);
-        if (saved > 0) {
-          arrs[c] = { r, bits, elems };
-          cur -= saved;
-        }
-      }
-    }
-  }
-  colStart[k] = cur;
-  // Every directory entry is a u16: a payload that cannot be a page's is refused here, before an
-  // offset would wrap (the caller reports any payload over the page capacity the same way).
-  if (cur > 0xffff) {
-    throw engineError(
-      "feature_not_supported",
-      "a record larger than the per-row limit is not supported",
-    );
-  }
-  const out = new Uint8Array(cur);
+  const out = new Uint8Array(1 + (fixedKey ? 2 : 2 * n) + (kp > 0 ? 2 + kp : 0) + storedKeyBytes);
   let o = 0;
   const u16 = (x: number): void => {
     out[o] = (x >>> 8) & 0xff;
@@ -2921,108 +3634,433 @@ export function encodeLeafPax(
     const key = keys[i]!;
     for (let b = kp; b < key.length; b++) out[o++] = key[b]!;
   }
-  for (let c = 0; c <= k; c++) u16(colStart[c]!);
-  // each stored column region: its kind byte, then its body.
-  for (let c = 0; c < k; c++) {
-    if (elided[c]) continue;
-    const w = widths[c]!;
-    const ty = colTypes[c]!;
-    if (w !== null) {
-      const f = fors[c] ?? null;
-      out[o++] = f !== null ? REGION_FOR : 0;
-      const bitmap = o;
-      o += Math.ceil(n / 8);
-      if (f !== null) {
-        // Base plus offsets: the smallest present value body as an unsigned integer (the signed
-        // value plus the sign-bit flip; zero when no value is present), the offset width, and each
-        // value's distance from the base (a NULL's is zero). An offset fits 4 bytes.
-        const r = f.r;
-        const bw = f.bw;
-        if (r.any) {
-          if (w <= 4) putBEUintN(out, o, w, r.nlo + 2 ** (8 * w - 1));
-          else putBEUint(out, o, w, r.lo + (1n << BigInt(8 * w - 1)));
-        }
-        o += w;
-        out[o++] = bw;
-        for (let i = 0; i < n; i++) {
-          const v = rows[i]![c]!;
-          if (v.kind === "null") out[bitmap + (i >> 3)] |= 0x80 >> (i % 8);
-          else if (bw !== 0) {
-            const x = w <= 4 ? forSlotNum(ty, v) - r.nlo : Number(forSlotValue(ty, v) - r.lo);
-            putBEUintN(out, o, bw, x);
-          }
-          o += bw;
-        }
-        continue;
-      }
-      for (let i = 0; i < n; i++) {
-        const v = rows[i]![c]!;
-        if (v.kind === "null") out[bitmap + (i >> 3)] |= 0x80 >> (i % 8);
-        else writeFixedBody(out, o, ty, v);
-        o += w;
-      }
+  return out;
+}
+
+// assembleLeaf joins a leaf payload: the head (encodeLeafKeys), the column directory (K+1 u16
+// absolute offsets, the last the payload's end), and the column regions (empty for a column with no
+// stored region).
+function assembleLeaf(head: Uint8Array, regions: Uint8Array[]): Uint8Array {
+  const k = regions.length;
+  let total = head.length + 2 * (k + 1);
+  for (const r of regions) total += r.length;
+  // Every directory entry is a u16: a payload that cannot be a page's is refused here, before an
+  // offset would wrap (the caller reports any payload over the page capacity the same way).
+  if (total > 0xffff) {
+    throw engineError(
+      "feature_not_supported",
+      "a record larger than the per-row limit is not supported",
+    );
+  }
+  const out = new Uint8Array(total);
+  out.set(head, 0);
+  let o = head.length;
+  let cur = head.length + 2 * (k + 1);
+  for (let c = 0; c <= k; c++) {
+    out[o] = (cur >>> 8) & 0xff;
+    out[o + 1] = cur & 0xff;
+    o += 2;
+    if (c < k) cur += regions[c]!.length;
+  }
+  for (const r of regions) {
+    out.set(r, o);
+    o += r.length;
+  }
+  return out;
+}
+
+// fixedRegion is a fixed-width column's region of n values of width w, given its plain form — kind
+// 0, the null bitmap, the dense slots (zeros for NULL). A base-plus-offsets column is rewritten as
+// kind 1 exactly when that is smaller; any other region is the plain form itself. The one region
+// encoder of both the full leaf encoder and the patch encoder (patchLeaf): the form depends only on
+// the slots.
+function fixedRegion(ty: ColType, w: number, n: number, plain: Uint8Array): Uint8Array {
+  if (!forEligible(ty)) return plain;
+  const bm = Math.ceil(n / 8);
+  const slots = 1 + bm;
+  // The present slots' range, as unsigned integers held in two halves (a 64-bit slot does not fit a
+  // number): hi is the bytes above the low four.
+  const hw = w > 4 ? w - 4 : 0;
+  const lw = w - hw;
+  let any = false;
+  let minHi = 0;
+  let minLo = 0;
+  let maxHi = 0;
+  let maxLo = 0;
+  for (let i = 0; i < n; i++) {
+    if ((plain[1 + (i >> 3)]! & (0x80 >> (i % 8))) !== 0) continue;
+    const at = slots + i * w;
+    const hi = hw === 0 ? 0 : beUintN(plain, at, hw);
+    const lo = beUintN(plain, at + hw, lw);
+    if (!any) {
+      any = true;
+      minHi = hi;
+      minLo = lo;
+      maxHi = hi;
+      maxLo = lo;
       continue;
     }
-    const vb = valBytes[c]!;
-    const d = dicts[c] ?? null;
-    if (d !== null) {
-      out[o++] = REGION_DICT;
-      u16(d.entries.length);
-      let off = 0;
-      for (const e of d.entries) {
-        off += e.length;
-        u16(off);
+    if (hi < minHi || (hi === minHi && lo < minLo)) {
+      minHi = hi;
+      minLo = lo;
+    }
+    if (hi > maxHi || (hi === maxHi && lo > maxLo)) {
+      maxHi = hi;
+      maxLo = lo;
+    }
+  }
+  let bw: number;
+  if (!any) bw = forWidthN(w, 0);
+  else if (hw === 0) bw = forWidthN(w, maxLo - minLo);
+  else {
+    const max = (BigInt(maxHi) << 32n) | BigInt(maxLo);
+    const min = (BigInt(minHi) << 32n) | BigInt(minLo);
+    bw = forWidth(w, max - min);
+  }
+  if (forSaving(n, w, bw) <= 0) return plain;
+  // Base plus offsets: the bitmap, the smallest present slot (zero when no value is present), the
+  // offset width, and each value's distance from the base (a NULL's is zero). An offset fits 4 bytes.
+  const out = new Uint8Array(1 + bm + w + 1 + n * bw);
+  out[0] = REGION_FOR;
+  out.set(plain.subarray(1, 1 + bm), 1);
+  let o = 1 + bm;
+  if (hw !== 0) putBEUintN(out, o, hw, minHi);
+  putBEUintN(out, o + hw, lw, minLo);
+  o += w;
+  out[o++] = bw;
+  if (bw !== 0) {
+    for (let i = 0; i < n; i++) {
+      if ((plain[1 + (i >> 3)]! & (0x80 >> (i % 8))) === 0) {
+        const at = slots + i * w;
+        const hi = hw === 0 ? 0 : beUintN(plain, at, hw);
+        const lo = beUintN(plain, at + hw, lw);
+        putBEUintN(out, o, bw, (hi - minHi) * 0x1_0000_0000 + (lo - minLo));
       }
-      for (const e of d.entries) {
+      o += bw;
+    }
+  }
+  return out;
+}
+
+// varRegion is a variable-width column's region of n values: vb[i] is value i's tagged span (empty
+// for NULL). A text / bytea / json column is written as a dictionary (kind 2) and an integer-array
+// column as packed arrays (kind 4), each exactly when that is smaller; otherwise the region is plain
+// (kind 0: the value directory and the spans). The one region encoder of both the full leaf encoder
+// and the patch encoder (patchLeaf): the form depends only on the spans.
+function varRegion(ty: ColType, n: number, vb: Uint8Array[]): Uint8Array {
+  let bodies = 0;
+  for (let i = 0; i < n; i++) bodies += vb[i]!.length;
+  const plainLen = 1 + 2 * n + bodies;
+  if (stringPayload(ty)) {
+    // A dictionary: entries in order of first use. Two values share an entry only when both are
+    // NULL or both are inline-plain with equal content.
+    const entries: Uint8Array[] = [];
+    const codes = new Uint8Array(n);
+    const index = new Map<string, number>();
+    let nullAt = -1;
+    let dup = 0;
+    for (let i = 0; i < n && entries.length <= 256; i++) {
+      const span = vb[i]!;
+      let at = -1;
+      let key: string | null = null;
+      if (span.length === 0) at = nullAt;
+      else if (span[0] === TAG_INLINE_BARE) {
+        key = binaryString(span);
+        at = index.get(key) ?? -1;
+        if (at >= 0) dup += span.length;
+      }
+      if (at < 0) {
+        at = entries.length;
+        entries.push(span);
+        if (span.length === 0) nullAt = at;
+        else if (key !== null) index.set(key, at);
+      }
+      codes[i] = at;
+    }
+    const saved = entries.length <= 256 ? dictSaving(n, entries.length, dup) : 0;
+    if (saved > 0) {
+      // The entry count, the entries' end offsets and bytes, then the N one-byte codes.
+      const out = new Uint8Array(plainLen - saved);
+      let o = 0;
+      out[o++] = REGION_DICT;
+      out[o++] = (entries.length >>> 8) & 0xff;
+      out[o++] = entries.length & 0xff;
+      let off = 0;
+      for (const e of entries) {
+        off += e.length;
+        out[o++] = (off >>> 8) & 0xff;
+        out[o++] = off & 0xff;
+      }
+      for (const e of entries) {
         out.set(e, o);
         o += e.length;
       }
-      out.set(d.codes, o);
+      out.set(codes, o);
       o += n;
-      continue;
+      if (o !== out.length)
+        throw new Error("BUG: a dictionary region's size disagrees with its saving");
+      return out;
     }
-    const a = arrs[c] ?? null;
-    if (a !== null) {
-      const aw = arrElemWidth(ty);
-      out[o++] = REGION_ARR;
-      for (let i = 0; i < n; i++) {
+  } else {
+    const aw = arrElemWidth(ty);
+    if (aw !== 0) {
+      // Packed integer arrays: every value NULL, the empty array, or a one-dimensional inline-plain
+      // array with lower bound 1, no NULL element and at most 254 elements.
+      const r = newForRange();
+      let empties = 0;
+      let arrays = 0;
+      let elems = 0;
+      let bad = false;
+      for (let i = 0; i < n && !bad; i++) {
         const span = vb[i]!;
-        // 255 = NULL, 0 = the empty array (a 3-byte span), else the element count.
-        out[o++] = span.length === 0 ? 255 : span.length === 3 ? 0 : (span.length - 11) / aw;
-      }
-      // The base is the smallest element body, which is already the unsigned image.
-      if (aw <= 4) putBEUintN(out, o, aw, a.r.nlo);
-      else putBEUint(out, o, aw, a.r.lo);
-      o += aw;
-      out[o++] = a.bits;
-      let bit = o * 8;
-      for (let i = 0; i < n; i++) {
-        const span = vb[i]!;
-        for (let p = 11; p < span.length; p += aw) {
-          if (aw <= 4) putBitsN(out, bit, a.bits, beUintN(span, p, aw) - a.r.nlo);
-          else putBits(out, bit, a.bits, beUint(span, p, aw) - a.r.lo);
-          bit += a.bits;
+        if (span.length === 0) continue;
+        if (span[0] !== 0x00) {
+          bad = true;
+          break;
+        }
+        const at = arrElems(span, 1, span.length, aw);
+        if (at < 0) bad = true;
+        else if (at === 0) empties++;
+        else {
+          arrays++;
+          elems += (span.length - at) / aw;
+          forRangeAddElems(r, span, at, span.length, aw);
         }
       }
-      o += Math.ceil((a.elems * a.bits) / 8);
-      continue;
-    }
-    out[o++] = 0;
-    let voff = 0;
-    for (let i = 0; i < n; i++) {
-      voff += vb[i]!.length;
-      u16(voff);
-    }
-    for (let i = 0; i < n; i++) {
-      out.set(vb[i]!, o);
-      o += vb[i]!.length;
+      const bits = bad ? 0 : forRangeBits(r, aw);
+      const saved = bad ? 0 : arrSaving(n, aw, empties, arrays, elems, bits);
+      if (saved > 0) {
+        const out = new Uint8Array(plainLen - saved);
+        let o = 0;
+        out[o++] = REGION_ARR;
+        for (let i = 0; i < n; i++) {
+          const span = vb[i]!;
+          // 255 = NULL, 0 = the empty array (a 3-byte span), else the element count.
+          out[o++] = span.length === 0 ? 255 : span.length === 3 ? 0 : (span.length - 11) / aw;
+        }
+        // The base is the smallest element body, which is already the unsigned image.
+        if (aw <= 4) putBEUintN(out, o, aw, r.nlo);
+        else putBEUint(out, o, aw, r.lo);
+        o += aw;
+        out[o++] = bits;
+        let bit = o * 8;
+        for (let i = 0; i < n; i++) {
+          const span = vb[i]!;
+          for (let p = 11; p < span.length; p += aw) {
+            if (aw <= 4) putBitsN(out, bit, bits, beUintN(span, p, aw) - r.nlo);
+            else putBits(out, bit, bits, beUint(span, p, aw) - r.lo);
+            bit += bits;
+          }
+        }
+        o += Math.ceil((elems * bits) / 8);
+        if (o !== out.length)
+          throw new Error("BUG: a packed-array region's size disagrees with its saving");
+        return out;
+      }
     }
   }
-  if (o !== cur) throw new Error("BUG: a leaf payload's size disagrees with its column directory");
+  const out = new Uint8Array(plainLen);
+  let o = 1; // kind 0
+  let voff = 0;
+  for (let i = 0; i < n; i++) {
+    voff += vb[i]!.length;
+    out[o++] = (voff >>> 8) & 0xff;
+    out[o++] = voff & 0xff;
+  }
+  for (let i = 0; i < n; i++) {
+    out.set(vb[i]!, o);
+    o += vb[i]!.length;
+  }
   return out;
 }
 
 const EMPTY_BYTES = new Uint8Array(0);
+
+// leafPatchCheck makes the commit encode a patched lazy leaf both ways and compare the bytes (tests).
+let leafPatchCheck = false;
+
+// setLeafPatchCheck turns the patch-encoder cross-check on or off (tests only).
+export function setLeafPatchCheck(on: boolean): void {
+  leafPatchCheck = on;
+}
+
+// encodeLazyLeaf is a dirty lazy leaf's payload (pmap.ts PNode.lazyBase): patched from its page when
+// it can be, else the full encoder's over its rows. Synchronous and free of side effects on the node,
+// like encodeLeafPax, so a serialization pass that is undone and repeated encodes it again.
+function encodeLazyLeaf(
+  n: PNode,
+  colTypes: ColType[],
+  keyLen: number,
+  seal: Sealer,
+  take: () => number,
+  ovf: OverflowPageOut[],
+  src: ChainSource,
+  memo: CompressMemo | null,
+): Uint8Array {
+  const patch = patchLeaf(n, colTypes, keyLen, seal, src);
+  if (patch !== null && !leafPatchCheck) return patch;
+  // A patched leaf's records are all inline, so encoding it again takes no page and keeps no chain.
+  const full = encodeLeafPax(colTypes, keyLen, n.keys, decodedRows(n), seal, take, ovf, src, memo);
+  if (patch !== null) {
+    let at = 0;
+    while (at < patch.length && at < full.length && patch[at] === full[at]) at++;
+    if (patch.length !== full.length || at < full.length) {
+      throw new Error(
+        `BUG: a patched leaf of ${n.keys.length} records differs from the full encoder's (${patch.length} and ${full.length} bytes) at byte ${at}`,
+      );
+    }
+  }
+  return full;
+}
+
+// patchTake is the page allocator of a patched leaf: an all-inline record writes no overflow chain.
+function patchTake(): number {
+  throw new Error("BUG: a patched leaf allocated an overflow page");
+}
+
+// patchLeaf encodes a lazy leaf from its page, or returns null when the full encoder must run.
+//
+// It applies when every record of the page and every row written since is stored all-inline (so no
+// overflow chain is kept, shared or written, and no disposition plan is consulted) and the column
+// codecs and key length are the page's. A row still on the page then contributes its stored spans
+// and slots, undecoded, and a row written since its newly encoded values. While the leaf's keys are
+// the page's (rows were only replaced) the key section is the page's and a column no replacement
+// changed keeps the page's region; otherwise the key section and every region are built again.
+//
+// This is the full encoder's output because that encoder, given a page's own rows, writes the page
+// again: an inline value read from a page is written from its stored bytes, and a region's form
+// depends only on its values (fixedRegion, varRegion — the same functions here). A copied region
+// rests on the assumption stated at TableLeafSizer's lazy facts: a jed writer stores a region
+// compactly exactly when the size rule says that is smaller, so the page's region is the one the
+// rule gives its values. A page that breaks it (only a hand-corrupted, re-sealed page) is copied as
+// it is.
+function patchLeaf(
+  n: PNode,
+  colTypes: ColType[],
+  keyLen: number,
+  seal: Sealer,
+  src: ChainSource,
+): Uint8Array | null {
+  const p = n.lazyBase!;
+  const lazy = n.lazy!;
+  const rows = n.vals.length;
+  const same = n.sameRows === true;
+  if (
+    !n.patchOK ||
+    (same && rows !== p.n) ||
+    !sameLeafShape(p.colTypes, colTypes) ||
+    !p.inlineOnly()
+  ) {
+    return null;
+  }
+  const payload = p.payload;
+  const d = p.dirs as PaxDirs;
+  if (d.keyLen !== keyLen) return null;
+  const k = colTypes.length;
+  const inlinePlan = inlinePlanArrays(k);
+  const plan: RecordPlan = {
+    disp: inlinePlan.disp,
+    comp: inlinePlan.comp,
+    compLen: inlinePlan.zeros,
+    size: 0,
+    compressUnits: 0,
+    external: 0,
+    payloadLen: inlinePlan.zeros,
+  };
+  const regions = new Array<Uint8Array>(k);
+  const bm = Math.ceil(rows / 8);
+  const sp: Span = { buf: payload, start: 0, end: 0 };
+  for (let c = 0; c < k; c++) {
+    const ty = colTypes[c]!;
+    const r = d.regions[c]!;
+    const w = fixedValueWidth(ty);
+    if (isElided(ty)) {
+      // Not stored. A replaced row's value must still be the one its key gives.
+      const at = (ty.kind === "scalar" ? ty.keyAt! : 1) - 1;
+      const slot = FIXED_SCRATCH;
+      for (let i = 0; i < rows; i++) {
+        if (lazy[i]! >= 0) continue;
+        const v = n.vals[i]![c]!;
+        const key = n.keys[i]!;
+        if (v.kind === "null" || at + w! > key.length) return null; // the full encoder reports it
+        writeFixedBody(slot, 0, ty, v);
+        for (let b = 0; b < w!; b++) if (slot[b] !== key[at + b]) return null;
+      }
+      regions[c] = EMPTY_BYTES;
+      continue;
+    }
+    if (same && !n.colDirty![c]) {
+      // No replacement changed the column: the page's region, as it is.
+      const at = d.colDir + 2 * c;
+      regions[c] = payload.subarray(
+        (payload[at]! << 8) | payload[at + 1]!,
+        (payload[at + 2]! << 8) | payload[at + 3]!,
+      );
+      continue;
+    }
+    if (w !== null) {
+      const fr = r as FixedRegion;
+      const slots = paxFixedSlots(payload, d, fr);
+      const plain = new Uint8Array(1 + bm + rows * w);
+      let o = 1 + bm;
+      for (let i = 0; i < rows; i++) {
+        const at = lazy[i]!;
+        if (at >= 0) {
+          // Still the page's record: its slot, or its NULL.
+          if ((payload[fr.bitmap + (at >> 3)]! & (0x80 >> (at % 8))) !== 0) {
+            plain[1 + (i >> 3)] |= 0x80 >> (i % 8);
+          } else {
+            const from = fr.body + at * w;
+            for (let b = 0; b < w; b++) plain[o + b] = slots[from + b]!;
+          }
+        } else {
+          const v = n.vals[i]![c]!;
+          if (v.kind === "null") plain[1 + (i >> 3)] |= 0x80 >> (i % 8);
+          else writeFixedBody(plain, o, ty, v);
+        }
+        o += w;
+      }
+      regions[c] = fixedRegion(ty, w, rows, plain);
+      continue;
+    }
+    const vb = new Array<Uint8Array>(rows);
+    for (let i = 0; i < rows; i++) {
+      const at = lazy[i]!;
+      if (at >= 0) {
+        // Still the page's record: its stored span.
+        if (paxIsNull(payload, d, c, at)) {
+          vb[i] = EMPTY_BYTES;
+        } else {
+          paxSpan(payload, d, c, at, sp);
+          if (sp.end > sp.buf.length) return null;
+          vb[i] = sp.buf.subarray(sp.start, sp.end);
+        }
+        continue;
+      }
+      const v = n.vals[i]![c]!;
+      vb[i] =
+        v.kind === "null"
+          ? EMPTY_BYTES
+          : encodeDisposedValue(ty, v, plan, c, seal, patchTake, NO_OVERFLOW, src);
+    }
+    regions[c] = varRegion(ty, rows, vb);
+  }
+  // The key section: the page's while the keys are, else built from the keys.
+  let head: Uint8Array;
+  if (same) {
+    head = payload.subarray(0, d.colDir);
+  } else {
+    try {
+      head = encodeLeafKeys(keyLen, n.keys);
+    } catch {
+      return null; // the full encoder reports it
+    }
+  }
+  return assembleLeaf(head, regions);
+}
+
+// NO_OVERFLOW is the overflow-page list of a patched leaf, which writes none.
+const NO_OVERFLOW: OverflowPageOut[] = [];
 
 // writeFixedBody writes a present fixed-width value's slot — encodeValue minus its 0x00 presence tag —
 // into out at off. The integer-coded types encode in place; the rest copy their encoding.
@@ -5039,7 +6077,10 @@ function serializeDirty(
     payload = encodeInterior(n.keys, childPages, seal.cap);
   } else {
     const src = new ChainSource(paging, true, chains);
-    payload = encodeLeafPax(colTypes, keyLen, n.keys, n.vals, seal, take, pages, src, memo);
+    payload =
+      n.lazyBase !== undefined
+        ? encodeLazyLeaf(n, colTypes, keyLen, seal, take, pages, src, memo)
+        : encodeLeafPax(colTypes, keyLen, n.keys, n.vals, seal, take, pages, src, memo);
     for (const p of src.shared) shared.add(p);
   }
   if (payload.length > seal.cap.c) {
@@ -6639,6 +7680,7 @@ type PaxDirs = {
   prefix: Uint8Array | null;
   full: { blob: Uint8Array; ends: Uint32Array | null } | null;
   regions: RegionDir[]; // K regions, in declaration order
+  colDir: number; // payload offset of the column directory: the key section is payload[0, colDir)
   end: number; // colStart[K]: the payload's content length
 };
 
@@ -6837,7 +7879,7 @@ function parsePaxLeaf(payload: Uint8Array, n: number, colTypes: ColType[]): PaxD
     }
     start = end;
   }
-  return { n, keyBlob, keyEnd, keyLen, prefix, full: null, regions, end: start };
+  return { n, keyBlob, keyEnd, keyLen, prefix, full: null, regions, colDir, end: start };
 }
 
 // paxSuffixLo / paxSuffixHi bound stored key i within the payload: the key, or the key without the
@@ -7083,6 +8125,86 @@ function paxValueLen(payload: Uint8Array, d: PaxDirs, c: number, i: number): num
   return paxDirEnd(payload, r.ends, j) - (j === 0 ? 0 : paxDirEnd(payload, r.ends, j - 1));
 }
 
+// paxRecordWeights is the record weight (key length + Σ paxValueLen) of every record, read column by
+// column from the directories.
+function paxRecordWeights(payload: Uint8Array, d: PaxDirs): number[] {
+  const n = d.n;
+  const w = new Array<number>(n).fill(0);
+  let fixed = 0;
+  if (d.keyLen > 0) {
+    fixed = d.keyLen;
+  } else {
+    const kp = d.prefix === null ? 0 : d.prefix.length;
+    let lo = 0;
+    for (let i = 0; i < n; i++) {
+      const hi = paxDirEnd(payload, d.keyEnd, i);
+      w[i] = kp + hi - lo;
+      lo = hi;
+    }
+  }
+  for (const r of d.regions) {
+    if (r.kind === "fixed") {
+      if (r.lazy !== 1) fixed += r.width;
+    } else if (r.kind === "arr") {
+      for (let i = 0; i < n; i++) w[i]! += arrSpanLen(payload[r.counts + i]!, r.w);
+    } else if (r.codes >= 0) {
+      for (let i = 0; i < n; i++) {
+        const e = payload[r.codes + i]!;
+        w[i]! += paxDirEnd(payload, r.ends, e) - (e === 0 ? 0 : paxDirEnd(payload, r.ends, e - 1));
+      }
+    } else {
+      let lo = 0;
+      for (let i = 0; i < n; i++) {
+        const hi = paxDirEnd(payload, r.ends, i);
+        w[i]! += hi - lo;
+        lo = hi;
+      }
+    }
+  }
+  if (fixed !== 0) for (let i = 0; i < n; i++) w[i]! += fixed;
+  return w;
+}
+
+// paxInlineOnly reports whether every variable-width value of the page is NULL or stored in the
+// inline form a writer gives an all-inline record: tag 0x05 and the bytes for a string, tag 0x00 and
+// the body for any other type, or an element of a packed-array region. Such a page holds no pointer
+// to an overflow chain and no compressed block, and its records all fit RECORD_MAX all-inline.
+function paxInlineOnly(payload: Uint8Array, d: PaxDirs, colTypes: ColType[]): boolean {
+  for (let c = 0; c < colTypes.length; c++) {
+    const r = d.regions[c]!;
+    if (r.kind !== "var") continue;
+    const want = stringPayload(colTypes[c]!) ? TAG_INLINE_BARE : 0x00;
+    // A dictionary's directory and blob are its entries'; a plain region's are its values'.
+    const entries = (r.body - r.ends) / 2;
+    let lo = 0;
+    for (let e = 0; e < entries; e++) {
+      const hi = paxDirEnd(payload, r.ends, e);
+      if (hi > lo && payload[r.body + lo] !== want) return false;
+      lo = hi;
+    }
+  }
+  return true;
+}
+
+// paxHasChains reports whether any value of the page is an external pointer: its bytes are on an
+// overflow chain.
+function paxHasChains(payload: Uint8Array, d: PaxDirs): boolean {
+  for (const r of d.regions) {
+    if (r.kind !== "var") continue;
+    const entries = (r.body - r.ends) / 2;
+    let lo = 0;
+    for (let e = 0; e < entries; e++) {
+      const hi = paxDirEnd(payload, r.ends, e);
+      if (hi > lo) {
+        const tag = payload[r.body + lo];
+        if (tag === TAG_EXTERNAL || tag === TAG_EXTERNAL_COMP) return true;
+      }
+      lo = hi;
+    }
+  }
+  return false;
+}
+
 // sameLeafShape reports whether a leaf decoded for columns a can serve columns b: the same column
 // count and, per column, the same value codec (sameValueCodec). The directories were validated and
 // the values are decoded against a's types, so any other pairing indexes regions or reads bodies as a
@@ -7183,6 +8305,7 @@ export function decodeLeafNode(
     }
     return readInlineBody(ty, sp.buf, cur, "construct");
   };
+  let inline = 0; // inlineOnly's cached answer: 0 not yet known, 1 yes, 2 no
   const packed: PackedLeaf = {
     n,
     colTypes,
@@ -7212,6 +8335,17 @@ export function decodeLeafNode(
       for (let c = 0; c < colTypes.length; c++) size += paxValueLen(payload, dirs, c, i);
       return size;
     },
+    recordWeights(): number[] {
+      return paxRecordWeights(payload, dirs);
+    },
+    inlineOnly(): boolean {
+      if (inline === 0) inline = paxInlineOnly(payload, dirs, colTypes) ? 1 : 2;
+      return inline === 1;
+    },
+    hasChains(): boolean {
+      return paxHasChains(payload, dirs);
+    },
+    dirs,
     col,
     colNow,
     row(i: number): Row {

@@ -297,7 +297,7 @@ func (s *tableStore) Insert(key []byte, row storedRow) (bool, error) {
 	if err := s.stage(key, stored); err != nil {
 		return false, err
 	}
-	if _, _, err := s.rows.Insert(key, row, weight, s.cap, s.writeShape(), src); err != nil {
+	if _, err := s.rows.Put(key, row, weight, s.cap, s.writeShape(), src); err != nil {
 		return false, err
 	}
 	if err := s.maybeTrainColumns(); err != nil {
@@ -329,7 +329,7 @@ func (s *tableStore) Replace(key []byte, row storedRow) error {
 	if err := s.stage(key, stored); err != nil {
 		return err
 	}
-	if _, _, err := s.rows.Insert(key, row, weight, s.cap, s.writeShape(), s.leafSrc()); err != nil {
+	if _, err := s.rows.Put(key, row, weight, s.cap, s.writeShape(), s.leafSrc()); err != nil {
 		return err
 	}
 	return nil
@@ -338,7 +338,7 @@ func (s *tableStore) Replace(key []byte, row storedRow) error {
 // Remove deletes the row at key (DELETE). Returns whether a row was present. May fault leaves the
 // delete descends into / rebalances against.
 func (s *tableStore) Remove(key []byte) (bool, error) {
-	_, ok, err := s.rows.Remove(key, s.cap, s.writeShape(), s.leafSrc())
+	ok, err := s.rows.Delete(key, s.cap, s.writeShape(), s.leafSrc())
 	if err != nil || !ok {
 		return ok, err
 	}
@@ -802,21 +802,61 @@ func (s *tableStore) treeRoot() *pnode { return s.rows.rootNode() }
 // resident rows' references would then point at pages the next commit may reuse. Such a root is
 // re-faulted from the page just written, so its references are the ones on disk. If that read fails
 // the pager is poisoned: no later commit can reuse the old chains, which stay intact until reopen.
+//
+// With lazy leaves on (leaf_lazy.go) any other persisted root leaf is re-faulted too, so the next
+// write finds it packed and edits it lazily — but only when its page holds no overflow pointer. A
+// resident value is written to a fresh chain by the next commit that rewrites its leaf, and a
+// re-faulted one would keep its chain instead: different page numbers. Such a root stays decoded, as
+// without lazy leaves, so file bytes do not depend on the setting.
 func (s *tableStore) demoteCleanLeaves() {
 	if s.paging == nil {
 		return
 	}
 	s.rows.demoteCleanLeaves()
 	root := s.rows.root
-	if root == nil || !root.isLeaf() || root.page == 0 || root.packed != nil || !rowsReferenceChains(root.vals) {
+	if root == nil || !root.isLeaf() || root.page == 0 || root.packed != nil {
+		return
+	}
+	// must: the root's rows hold references the commit may have invalidated.
+	must := rootReferencesChains(root)
+	if !must && !leafLazy.Load() && root.lazyBase == nil {
 		return
 	}
 	fresh, err := s.paging.faultLeaf(root.ref(), s.colTypes)
 	if err != nil {
-		_ = s.paging.withPager(func(p *pager) error { p.poison(); return nil })
+		if must {
+			_ = s.paging.withPager(func(p *pager) error { p.poison(); return nil })
+			return
+		}
+		fresh = nil // an optional re-fault: the root is kept, and a later read reports the page
+	}
+	if fresh != nil && (must || !fresh.packed.hasChains()) {
+		s.rows.root = fresh
 		return
 	}
-	s.rows.root = fresh
+	if root.lazyBase == nil {
+		return
+	}
+	// A lazy root that keeps resident values becomes the decoded root it would be without lazy
+	// leaves: its untouched rows decoded from its old page, which it holds.
+	if decoded, err := decodedLeafCopy(root); err == nil {
+		s.rows.root = decoded
+	} else if fresh != nil {
+		s.rows.root = fresh // the old page no longer decodes; the page just written is the root
+	} else {
+		_ = s.paging.withPager(func(p *pager) error { p.poison(); return nil })
+	}
+}
+
+// rootReferencesChains reports whether a persisted root leaf's rows hold an unfetched reference to an
+// overflow chain: the rows in vals, and a lazy root's untouched rows on its base page. A lazy root
+// whose base rows do not decode counts as holding one, so it is re-faulted from the page just written.
+func rootReferencesChains(root *pnode) bool {
+	if root.lazyBase == nil || !root.lazyBase.hasChains() {
+		return rowsReferenceChains(root.vals)
+	}
+	rows, err := root.decodedRows()
+	return err != nil || rowsReferenceChains(rows)
 }
 
 // rowsReferenceChains reports whether any value is an unfetched reference to an overflow chain.

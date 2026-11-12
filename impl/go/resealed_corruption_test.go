@@ -172,6 +172,12 @@ func runResealed(image []byte, stmts []string) error {
 }
 
 func TestResealedPageCorruptionFailsClosed(t *testing.T) {
+	// A resealed page may be valid and yet not the bytes the encoder writes for its rows (a NULL
+	// slot that is not zero, say). The patch encoder keeps such a page's untouched regions and the
+	// full encoder writes them again, so the two legitimately differ; the cross-check
+	// (JED_LEAF_LAZY=check) holds only for pages this engine wrote.
+	defer leafPatchCheck.Store(leafPatchCheck.Load())
+	leafPatchCheck.Store(false)
 	dir := specPath(t, "fileformat/fixtures")
 	paths, err := filepath.Glob(filepath.Join(dir, "*.jed"))
 	if err != nil || len(paths) == 0 {

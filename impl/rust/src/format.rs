@@ -174,6 +174,10 @@ pub(crate) const FORMAT_VERSION: u16 = 52;
 mod commit_manifest;
 #[path = "leaf_compact.rs"]
 mod leaf_compact;
+#[path = "leaf_lazy.rs"]
+mod leaf_lazy;
+#[cfg(test)]
+use leaf_compact::leaf_saving;
 use leaf_compact::{
     ArrAcc, DictAcc, ForRange, Item, LEAF_FLAG_FIXED_KEY, LEAF_FLAG_PREFIX, REGION_ARR,
     REGION_DICT, REGION_FOR, TAG_INLINE_BARE, arr_bits, arr_elem_width, arr_elems, arr_saving,
@@ -181,8 +185,11 @@ use leaf_compact::{
     span_item, string_payload,
 };
 pub(crate) use leaf_compact::{
-    LeafShape, LeafSizes, SplitFacts, index_shape, leaf_overhead, leaf_prefix_saving, leaf_saving,
+    LeafScan, LeafShape, LeafSizes, SplitFacts, index_shape, leaf_overhead, leaf_prefix_saving,
 };
+#[cfg(test)]
+pub(crate) use leaf_lazy::leaf_patch_check;
+pub(crate) use leaf_lazy::{LazyView, replaced_columns, row_all_inline};
 /// Bytes of the page header on catalog / B-tree / overflow pages (v7): the 12-byte v6 header
 /// (`page_type`, `item_count`, `next_page`) plus a 4-byte per-page `crc32` (offset 12).
 pub(crate) const PAGE_HEADER: usize = 16;
@@ -2886,7 +2893,7 @@ fn serialize_dirty(
         };
         child_pages.push(cp);
     }
-    let n = node.keys.len() as u32;
+    let n = node.len() as u32;
     // Encode a leaf's records, spilling over-large values to overflow pages drawn from the same
     // allocator (free-list first, then high-water — large-values.md §12). A dirty leaf may carry
     // rows the lazy load left deferred (a sibling row's mutation dirtied them), and an UPDATE's new
@@ -2898,15 +2905,20 @@ fn serialize_dirty(
     let (page_type, payload) = {
         let mut take = || alloc.take();
         if node.children.is_empty() {
-            let rows: Vec<&[Value]> = node.vals.iter().map(Vec::as_slice).collect();
             let mut src = ChainSource {
                 paging,
                 share: true,
                 shared: Vec::new(),
             };
-            let payload = encode_leaf_pax(
-                shape, &node.keys, &rows, seal, &mut take, pages, &mut src, memo,
-            )?;
+            let payload = if node.lazy.is_some() {
+                // A leaf that keeps rows of its page undecoded (leaf_lazy.rs).
+                leaf_lazy::encode_lazy_leaf(node, shape, seal, &mut take, pages, &mut src, memo)?
+            } else {
+                let rows: Vec<&[Value]> = node.vals.iter().map(Vec::as_slice).collect();
+                encode_leaf_pax(
+                    shape, &node.keys, &rows, seal, &mut take, pages, &mut src, memo,
+                )?
+            };
             shared.extend(src.shared);
             (PAGE_LEAF, payload)
         } else {
@@ -4405,8 +4417,37 @@ fn encode_leaf_pax<K: AsRef<[u8]>>(
             }
         }
     }
-    let push16 = |out: &mut Vec<u8>, v: usize| out.extend_from_slice(&(v as u16).to_be_bytes());
     let mut out = Vec::new();
+    encode_leaf_keys(shape, keys, &mut out)?;
+    // The column directory, filled in as each region is written, then the regions.
+    let dir = out.len();
+    out.resize(dir + 2 * (k + 1), 0);
+    for c in 0..k {
+        let end = out.len();
+        put16(&mut out, dir + 2 * c, end);
+        if shape.stored(c) {
+            encode_region(shape, c, n, &bodies[c], &ends[c], &nulls[c], &mut out);
+        }
+    }
+    let end = out.len();
+    put16(&mut out, dir + 2 * k, end); // payload end
+    Ok(out)
+}
+
+/// Write `v` as a big-endian `u16` at `at`.
+fn put16(out: &mut [u8], at: usize, v: usize) {
+    out[at..at + 2].copy_from_slice(&(v as u16).to_be_bytes());
+}
+
+/// Append the head of a leaf payload (format.md "Leaf node"): the flags byte, the fixed key length
+/// and the shared key prefix when the leaf has them, the key directory, and the key blob.
+fn encode_leaf_keys<K: AsRef<[u8]>>(
+    shape: &LeafShape,
+    keys: &[K],
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    let push16 = |out: &mut Vec<u8>, v: usize| out.extend_from_slice(&(v as u16).to_be_bytes());
+    let n = keys.len();
     // The leaf flags, the fixed key length, and the shared prefix.
     let fixed_key = shape.key_len > 0;
     let kp = if n >= 2 {
@@ -4418,14 +4459,14 @@ fn encode_leaf_pax<K: AsRef<[u8]>>(
         if fixed_key { LEAF_FLAG_FIXED_KEY } else { 0 } | if kp > 0 { LEAF_FLAG_PREFIX } else { 0 },
     );
     if fixed_key {
-        push16(&mut out, shape.key_len);
+        push16(out, shape.key_len);
         if keys.iter().any(|key| key.as_ref().len() != shape.key_len) {
             return Err(corrupt("a key's length is not its tree's fixed key length"));
         }
     }
     if kp > 0 {
         let prefix = &keys[0].as_ref()[..kp];
-        push16(&mut out, kp);
+        push16(out, kp);
         out.extend_from_slice(prefix);
         if keys
             .iter()
@@ -4439,204 +4480,190 @@ fn encode_leaf_pax<K: AsRef<[u8]>>(
         let mut off = 0usize;
         for key in keys {
             off += key.as_ref().len() - kp;
-            push16(&mut out, off);
+            push16(out, off);
         }
     }
     for key in keys {
         out.extend_from_slice(&key.as_ref()[kp..]);
     }
-    // Each stored column's region kind, and with it the column directory.
-    enum Kind {
-        Elided,
-        Plain,
-        For {
-            base: u64,
-            bw: usize,
-        },
-        Dict {
-            entries: Vec<(usize, usize)>,
-            codes: Vec<u8>,
-        },
-        Arr(ArrAcc),
-    }
-    let span = |c: usize, i: usize| -> &[u8] {
-        let lo = if i == 0 { 0 } else { ends[c][i - 1] as usize };
-        &bodies[c][lo..ends[c][i] as usize]
-    };
-    let mut kinds: Vec<Kind> = Vec::with_capacity(k);
-    let mut col_start = vec![0usize; k + 1];
-    let mut cur = out.len() + 2 * (k + 1);
-    for c in 0..k {
-        col_start[c] = cur;
-        let ty = &col_types[c];
-        if !shape.stored(c) {
-            kinds.push(Kind::Elided); // an empty region: its entry equals the next column's
-            continue;
-        }
-        let mut kind = Kind::Plain;
-        if let Some(w) = fixed_value_width(ty) {
-            cur += 1 + n.div_ceil(8) + bodies[c].len();
-            if shape.for_cols.iter().any(|fc| fc.col == c) {
-                let mut r = ForRange::default();
-                for i in (0..n).filter(|&i| !nulls[c][i]) {
-                    r.add(be_uint(&bodies[c][i * w..(i + 1) * w]));
-                }
-                let saving = for_saving(n, w, r);
-                if saving > 0 {
-                    cur -= saving;
-                    kind = Kind::For {
-                        base: r.lo,
-                        bw: for_width(w, r),
-                    };
-                }
+    Ok(())
+}
+
+/// Append stored column `c`'s region for `n` values (format.md "Leaf node"), led by its kind byte:
+/// the plain region of the column's class (kind 0), or base plus offsets (1), a dictionary (2) or
+/// packed integer arrays (4), each taken exactly when the size rule says it is smaller.
+///
+/// A fixed-width column gives `body` as `n` dense slots (zeros for NULL) and no `ends`; a
+/// variable-width column gives its tagged spans laid end to end in `body` (nothing for NULL) and
+/// each value's end offset in `ends`. The region is a function of these bytes and `nulls` alone,
+/// so the full encoder and the patch encoder (leaf_lazy.rs) both write it through here.
+fn encode_region(
+    shape: &LeafShape,
+    c: usize,
+    n: usize,
+    body: &[u8],
+    ends: &[u32],
+    nulls: &[bool],
+    out: &mut Vec<u8>,
+) {
+    let ty = &shape.col_types[c];
+    let start = out.len();
+    let push16 = |out: &mut Vec<u8>, v: usize| out.extend_from_slice(&(v as u16).to_be_bytes());
+    if let Some(w) = fixed_value_width(ty) {
+        let plain = 1 + n.div_ceil(8) + body.len();
+        let mut narrow = None;
+        let mut saving = 0;
+        if shape.for_cols.iter().any(|fc| fc.col == c) {
+            let mut r = ForRange::default();
+            for i in (0..n).filter(|&i| !nulls[i]) {
+                r.add(be_uint(&body[i * w..(i + 1) * w]));
             }
-        } else {
-            cur += 1 + 2 * n + bodies[c].len();
-            if string_payload(ty) {
-                // A dictionary: entries in order of first use. Two values share an entry only when
-                // both are NULL or both are inline-plain with equal content.
-                let items: Vec<Item<'_>> = (0..n).map(|i| span_item(ty, span(c, i))).collect();
-                let mut acc = DictAcc::default();
-                let mut index: HashMap<&[u8], usize> = HashMap::new();
-                let mut null_at = None;
-                let mut entries: Vec<(usize, usize)> = Vec::new();
-                let mut codes = vec![0u8; n];
-                for (i, it) in items.iter().enumerate() {
-                    if entries.len() > 256 {
-                        break;
-                    }
-                    acc.add(it, |_| match it {
-                        Item::Shared(p) => Cow::Borrowed(p.as_ref()),
-                        _ => unreachable!(),
-                    });
-                    let found = match it {
-                        Item::Null => null_at,
-                        Item::Shared(p) => index.get(p.as_ref()).copied(),
-                        Item::Own => None,
-                    };
-                    let at = found.unwrap_or_else(|| {
-                        let at = entries.len();
-                        let lo = if i == 0 { 0 } else { ends[c][i - 1] as usize };
-                        entries.push((lo, ends[c][i] as usize));
-                        match it {
-                            Item::Null => null_at = Some(at),
-                            Item::Shared(p) => {
-                                index.insert(p.as_ref(), at);
-                            }
-                            Item::Own => {}
-                        }
-                        at
-                    });
-                    codes[i] = at as u8;
-                }
-                let saving = dict_saving(n, acc.d, acc.dup);
-                if saving > 0 && entries.len() <= 256 {
-                    cur -= saving;
-                    kind = Kind::Dict { entries, codes };
-                }
-            } else if arr_elem_width(ty) != 0 {
-                let w = arr_elem_width(ty);
-                let mut acc = ArrAcc::default();
-                for i in 0..n {
-                    acc.add(&span_item(ty, span(c, i)), w);
-                }
-                let saving = arr_saving(n, w, &acc);
-                if saving > 0 {
-                    cur -= saving;
-                    kind = Kind::Arr(acc);
-                }
+            saving = for_saving(n, w, r);
+            if saving > 0 {
+                narrow = Some((r.lo, for_width(w, r)));
             }
         }
-        kinds.push(kind);
-    }
-    col_start[k] = cur; // payload end
-    for &cs in &col_start {
-        push16(&mut out, cs);
-    }
-    for (c, kind) in kinds.iter().enumerate() {
-        let ty = &col_types[c];
-        let bitmap = || {
-            let mut bitmap = vec![0u8; n.div_ceil(8)];
-            for (i, &is_null) in nulls[c].iter().enumerate() {
-                if is_null {
-                    bitmap[i / 8] |= 0x80 >> (i % 8);
-                }
+        out.push(if narrow.is_some() { REGION_FOR } else { 0 });
+        let bitmap = out.len();
+        out.resize(bitmap + n.div_ceil(8), 0);
+        for (i, &is_null) in nulls.iter().enumerate() {
+            if is_null {
+                out[bitmap + i / 8] |= 0x80 >> (i % 8);
             }
-            bitmap
-        };
-        match kind {
-            Kind::Elided => {}
-            Kind::Plain => {
-                out.push(0u8);
-                if fixed_value_width(ty).is_some() {
-                    out.extend_from_slice(&bitmap());
-                } else {
-                    for &end in &ends[c] {
-                        push16(&mut out, end as usize);
-                    }
-                }
-                out.extend_from_slice(&bodies[c]);
-            }
-            Kind::For { base, bw } => {
-                let w = fixed_value_width(ty).expect("a base-plus-offsets column is fixed-width");
-                out.push(REGION_FOR);
-                out.extend_from_slice(&bitmap());
+        }
+        match narrow {
+            None => out.extend_from_slice(body),
+            Some((base, bw)) => {
                 let at = out.len();
                 out.resize(at + w + 1 + n * bw, 0);
-                put_be_uint(&mut out[at..at + w], *base);
-                out[at + w] = *bw as u8;
+                put_be_uint(&mut out[at..at + w], base);
+                out[at + w] = bw as u8;
                 let at = at + w + 1;
-                for i in (0..n).filter(|&i| !nulls[c][i]) {
-                    let v = be_uint(&bodies[c][i * w..(i + 1) * w]);
+                for i in (0..n).filter(|&i| !nulls[i]) {
+                    let v = be_uint(&body[i * w..(i + 1) * w]);
                     put_be_uint(&mut out[at + i * bw..at + (i + 1) * bw], v - base);
                 }
             }
-            Kind::Dict { entries, codes } => {
-                out.push(REGION_DICT);
-                push16(&mut out, entries.len());
-                let mut off = 0usize;
-                for (lo, hi) in entries {
-                    off += hi - lo;
-                    push16(&mut out, off);
-                }
-                for &(lo, hi) in entries {
-                    out.extend_from_slice(&bodies[c][lo..hi]);
-                }
-                out.extend_from_slice(codes);
+        }
+        debug_assert_eq!(
+            out.len() - start,
+            plain - saving,
+            "a region's measured size"
+        );
+        return;
+    }
+    let plain = 1 + 2 * n + body.len();
+    let bounds = |i: usize| -> (usize, usize) {
+        let lo = if i == 0 { 0 } else { ends[i - 1] as usize };
+        (lo, ends[i] as usize)
+    };
+    let span = |i: usize| -> &[u8] {
+        let (lo, hi) = bounds(i);
+        &body[lo..hi]
+    };
+    if string_payload(ty) {
+        // A dictionary: entries in order of first use. Two values share an entry only when both
+        // are NULL or both are inline-plain with equal content.
+        let items: Vec<Item<'_>> = (0..n).map(|i| span_item(ty, span(i))).collect();
+        let mut acc = DictAcc::default();
+        let mut index: HashMap<&[u8], usize> = HashMap::new();
+        let mut null_at = None;
+        let mut entries: Vec<(usize, usize)> = Vec::new();
+        let mut codes = vec![0u8; n];
+        for (i, it) in items.iter().enumerate() {
+            if entries.len() > 256 {
+                break;
             }
-            Kind::Arr(acc) => {
-                let w = arr_elem_width(ty);
-                out.push(REGION_ARR);
-                let elems_of = |i: usize| -> Option<&[u8]> {
-                    match span(c, i).split_first() {
-                        None => None,
-                        Some((_, body)) => Some(arr_elems(body, w).expect("measured as packable")),
+            acc.add(it, |_| match it {
+                Item::Shared(p) => Cow::Borrowed(p.as_ref()),
+                _ => unreachable!(),
+            });
+            let found = match it {
+                Item::Null => null_at,
+                Item::Shared(p) => index.get(p.as_ref()).copied(),
+                Item::Own => None,
+            };
+            let at = found.unwrap_or_else(|| {
+                let at = entries.len();
+                entries.push(bounds(i));
+                match it {
+                    Item::Null => null_at = Some(at),
+                    Item::Shared(p) => {
+                        index.insert(p.as_ref(), at);
                     }
-                };
-                for i in 0..n {
-                    out.push(match elems_of(i) {
-                        None => 255,
-                        Some(elems) => (elems.len() / w) as u8,
-                    });
+                    Item::Own => {}
                 }
-                let bits = arr_bits(acc.r);
-                let at = out.len();
-                out.resize(at + w + 1 + (acc.elems * bits).div_ceil(8), 0);
-                put_be_uint(&mut out[at..at + w], acc.r.lo);
-                out[at + w] = bits as u8;
-                let data = &mut out[at + w + 1..];
-                let mut bit = 0usize;
-                for i in 0..n {
-                    for e in elems_of(i).unwrap_or(&[]).chunks_exact(w) {
-                        put_bits(data, bit, bits, be_uint(e) - acc.r.lo);
-                        bit += bits;
-                    }
+                at
+            });
+            codes[i] = at as u8;
+        }
+        let saving = dict_saving(n, acc.d, acc.dup);
+        if saving > 0 && entries.len() <= 256 {
+            out.push(REGION_DICT);
+            push16(out, entries.len());
+            let mut off = 0usize;
+            for (lo, hi) in &entries {
+                off += hi - lo;
+                push16(out, off);
+            }
+            for &(lo, hi) in &entries {
+                out.extend_from_slice(&body[lo..hi]);
+            }
+            out.extend_from_slice(&codes);
+            debug_assert_eq!(
+                out.len() - start,
+                plain - saving,
+                "a region's measured size"
+            );
+            return;
+        }
+    } else if arr_elem_width(ty) != 0 {
+        let w = arr_elem_width(ty);
+        let mut acc = ArrAcc::default();
+        for i in 0..n {
+            acc.add(&span_item(ty, span(i)), w);
+        }
+        let saving = arr_saving(n, w, &acc);
+        if saving > 0 {
+            out.push(REGION_ARR);
+            let elems_of = |i: usize| -> Option<&[u8]> {
+                match span(i).split_first() {
+                    None => None,
+                    Some((_, body)) => Some(arr_elems(body, w).expect("measured as packable")),
+                }
+            };
+            for i in 0..n {
+                out.push(match elems_of(i) {
+                    None => 255,
+                    Some(elems) => (elems.len() / w) as u8,
+                });
+            }
+            let bits = arr_bits(acc.r);
+            let at = out.len();
+            out.resize(at + w + 1 + (acc.elems * bits).div_ceil(8), 0);
+            put_be_uint(&mut out[at..at + w], acc.r.lo);
+            out[at + w] = bits as u8;
+            let data = &mut out[at + w + 1..];
+            let mut bit = 0usize;
+            for i in 0..n {
+                for e in elems_of(i).unwrap_or(&[]).chunks_exact(w) {
+                    put_bits(data, bit, bits, be_uint(e) - acc.r.lo);
+                    bit += bits;
                 }
             }
+            debug_assert_eq!(
+                out.len() - start,
+                plain - saving,
+                "a region's measured size"
+            );
+            return;
         }
     }
-    debug_assert_eq!(out.len(), cur, "a leaf's measured size is its encoded size");
-    Ok(out)
+    out.push(0u8);
+    for &end in ends {
+        push16(out, end as usize);
+    }
+    out.extend_from_slice(body);
 }
 
 /// Write `payload` across a chain of overflow pages (`C − tag`-byte slabs, in order), allocating
@@ -6154,6 +6181,8 @@ struct PaxDirs {
     prefix_len: usize,
     key_dir: usize, // payload offset of the N-entry key end-offset directory (absent: fixed key)
     key_blob: usize, // payload offset where the stored keys (suffixes, under a prefix) start
+    /// Payload offset of the column directory: the bytes before it are the leaf's key section.
+    col_dir: usize,
     /// The payload's content length, `colStart[K]`: the leaf's size.
     end: usize,
     regions: Vec<RegionDir>, // K regions, in declaration order
@@ -6471,6 +6500,9 @@ pub(crate) struct PackedLeaf {
     cap: Cap,
     /// Record count (`= keys.len()`), for the value-directory index arithmetic.
     n: usize,
+    /// Whether every variable-width value is NULL or inline-plain, found on first use
+    /// (leaf_lazy.rs `inline_only`).
+    inline: OnceLock<bool>,
 }
 
 impl PackedLeaf {
@@ -6850,6 +6882,7 @@ fn parse_pax_leaf(payload: &[u8], n: usize, shape: &LeafShape) -> Result<PaxDirs
         prefix_len,
         key_dir,
         key_blob,
+        col_dir,
         end: start,
         regions,
         full_keys: OnceLock::new(),
@@ -6924,6 +6957,7 @@ pub(crate) fn decode_leaf_node(
         paging,
         cap,
         n,
+        inline: OnceLock::new(),
     };
     Ok(Node::leaf_loaded_packed(packed, page))
 }

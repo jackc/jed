@@ -1517,6 +1517,15 @@ contract — the prefix is the longest one, stored exactly when it saves bytes; 
 that is smallest, kind 0 on a tie. A reader does not re-derive them: a leaf that parses but was not
 written by these rules reads as the rows it holds.
 
+**Rewriting a leaf from its page.** Each region is a function of its own column's stored values and
+`N`, and the key section of the keys alone. A writer that changes some rows of a leaf it read may
+therefore take the leaf's size from the page (a column none of whose values changed saves what its
+stored region saves) and write the new page by copying the key section and every such region, and
+by building the others from the stored value bytes, without decoding the rows. The result is the
+page a full encode of the leaf's rows produces, given a page written by the rules above. A leaf that
+parses but was not written by them carries its non-canonical regions forward until those columns
+change; its rows are unaffected, and no writer produces one.
+
 ### Interior node (`page_type = 3`)
 
 Header (`item_count = N`, `next_page = 0`) followed by the **record-free** payload (v24):
