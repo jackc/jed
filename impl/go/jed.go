@@ -393,6 +393,7 @@ var SupportedCapabilities = []string{
 	// LIMIT / OFFSET row windowing, applied after ORDER BY, before projection (grammar.md §9).
 	"query.limit",
 	"query.offset",
+	"query.limit_param",
 	// SELECT DISTINCT: deduplicate projected output rows, NULL-safe (grammar.md §11).
 	"query.distinct",
 	// SELECT DISTINCT ON: keep the first row of each key group in ORDER BY order (grammar.md §11.1).

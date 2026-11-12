@@ -276,7 +276,7 @@ tracked in [../../TODO.md](../../TODO.md), not an oversight:
   expression (`ORDER BY a + 1`) or an output alias; those stay deferred. The richer surface that
   *did* land — multiple keys, per-key `ASC` / `DESC`, per-key `NULLS FIRST | LAST`, and the
   ordinal form — is described in §10.
-- **`LIMIT` / `OFFSET` take a non-negative integer literal**, not a general expression. The two clauses may appear in either
+- **`LIMIT` / `OFFSET` take a non-negative integer literal or a bind parameter (`$N`)**, not a general expression. The two clauses may appear in either
   order, each at most once (§9). There is **no `LIMIT ALL`**, **no `OFFSET … ROWS` /
   `FETCH NEXT … ROWS ONLY`**, and **no SQLite `LIMIT off, cnt` comma form**.
 - **ASCII-only bare identifiers**; a non-ASCII name is written quoted (`"café"`, or with Unicode
@@ -306,8 +306,8 @@ tracked in [../../TODO.md](../../TODO.md), not an oversight:
   the largest index named, [cost.md §7g](cost.md)) are `42601`. A
   `$N` is a primary expression usable anywhere an expression is (WHERE / HAVING / ON /
   select list / UPDATE SET RHS / arithmetic / `CAST` inner / `IN` / `BETWEEN` / `LIKE` /
-  `CASE`) and as an `INSERT` value slot — but **not** in LIMIT/OFFSET, GROUP BY, or a type
-  modifier this slice. A parameter's type is **inferred from context** (its sibling operand,
+  `CASE`), as an `INSERT` value slot, and as a `LIMIT` / `OFFSET` count (§9) — but **not** in
+  GROUP BY or a type modifier this slice. A parameter's type is **inferred from context** (its sibling operand,
   target column, or `CAST` target); a parameter with no derivable type is `42P18`. Binding a
   value to `$N` is each implementation's own host-API surface ([api.md](api.md)) — the
   conformance corpus still uses **literal SQL only** (see [conformance.md](conformance.md));
@@ -460,7 +460,7 @@ straight out of the existing `row_produced`-at-projection rule
 ([cost.md](cost.md) §3), with the slice itself unmetered like the sort. Output column names
 are derived from the select list and are unaffected by the window (§8).
 
-**The count is a non-negative integer literal**, not a general expression (§5). This is a
+**A literal count is a non-negative integer literal**, not a general expression (§5). This is a
 determinism surface (CLAUDE.md §8): the sign is known at parse time, so a negative count is
 rejected **before any row is scanned** with a precise structured error — `2201W`
 (`invalid_row_count_in_limit_clause`) for `LIMIT`, `2201X`
@@ -469,6 +469,14 @@ the PostgreSQL SQLSTATEs. The value `-0` folds to `0` and is accepted. The share
 lexer's magnitude rules still hold: a magnitude `> 2^63` is a `42601` syntax error, and a
 positive magnitude of `2^63` (over `i64`'s max) traps `22003` (§4). `LIMIT 0` is valid and
 yields the empty result; an `OFFSET` past the end yields the empty result.
+
+**A count may instead be a bind parameter** (`LIMIT $1 OFFSET $2`). The parameter is typed
+`i64` (PostgreSQL types it `bigint`), and its bound value is read when the statement is planned —
+every execution takes its custom plan ([estimator.md](estimator.md) §6.1), so the plan, estimates,
+early-out and cost are exactly the literal twin's, and a prepared statement re-plans when the count
+changes. A bound value of NULL means no limit / no offset (PostgreSQL's `LIMIT ALL` / `OFFSET 0`),
+and a negative bound value is `2201W` / `2201X`, raised at planning, before any row is read. A view
+body has no parameters (`42P02`, [views.md](views.md)).
 
 Without `ORDER BY`, **which rows a `LIMIT` returns is unspecified** — `LIMIT` windows an
 unordered result, so it selects an arbitrary subset (SQL-standard and PostgreSQL behavior —

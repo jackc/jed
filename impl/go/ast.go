@@ -1223,8 +1223,8 @@ type selectStmt struct {
 	// Limit caps the result at Limit rows; Offset skips the first Offset rows. Both are
 	// non-negative counts, applied after ORDER BY, before projection (grammar.md §9). A
 	// nil pointer means the clause is absent.
-	Limit  *int64
-	Offset *int64
+	Limit  *rowCount
+	Offset *rowCount
 	// Windows holds the named windows from a `WINDOW name AS (definition)` clause
 	// (spec/design/window.md §5, grammar.ebnf window_clause), referenced by `OVER name`. Empty when
 	// absent. Resolved by a desugaring pass that rewrites each `OVER name` to its definition (into
@@ -1345,8 +1345,16 @@ type setOp struct {
 	Lhs     queryExpr
 	Rhs     queryExpr
 	OrderBy []orderKey
-	Limit   *int64
-	Offset  *int64
+	Limit   *rowCount
+	Offset  *rowCount
+}
+
+// rowCount is a LIMIT / OFFSET count (spec/design/grammar.md §9): a non-negative integer literal
+// (Param == 0), or the bind parameter $Param (1-based), typed i64 and read at plan time from the
+// bound value — NULL is no limit / offset 0, a negative value is 2201W / 2201X.
+type rowCount struct {
+	Value int64
+	Param int
 }
 
 // CteBody is the body of a CTE, or the WITH-prefixed primary statement

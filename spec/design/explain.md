@@ -165,7 +165,8 @@ Attributes are separated by `; `. A node with no attributes is `-`.
   contradiction renders the same way: its target `Scan` still names the selected path, and the
   `Filter`, `Scan`, and DML root estimate zero rows and zero cost (plus any uncorrelated WHERE
   subquery).
-- Sort details are `keys=N` and optionally `top-k=K`. Limit details are `limit=N` / `offset=N`.
+- Sort details are `keys=N` and optionally `top-k=K`. Limit details are `limit=N` / `offset=N`; a
+  parameter count shows its bound value (the custom plan's count), and a NULL count has no Limit node.
   Aggregate, Window, Values, set-op, CTE, and DML counts retain their established compact grammar.
 - Without VERBOSE, residual filters, HAVING, and join predicates retain compact `conjuncts=N`
   counts for compatibility.

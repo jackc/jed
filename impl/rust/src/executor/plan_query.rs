@@ -1264,8 +1264,8 @@ impl Engine {
             column_derivs,
             column_typmods,
             order,
-            limit: so.limit,
-            offset: so.offset,
+            limit: resolve_row_count(self, so.limit, true, ptypes)?,
+            offset: resolve_row_count(self, so.offset, false, ptypes)?,
         })
     }
 

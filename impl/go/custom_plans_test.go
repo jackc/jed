@@ -216,3 +216,47 @@ func TestCustomPlanSensitiveConcurrent(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+// A LIMIT / OFFSET count parameter is read at plan time (grammar.md §9), so it makes the statement
+// parameter-sensitive: a prepared statement run with different counts never reuses a plan planned for
+// another count, and a memo hit returns the rows of its own binding.
+func TestCustomPlanLimitOffsetParameterIsSensitive(t *testing.T) {
+	t.Parallel()
+	s := memDB().Session(SessionOptions{})
+	seedItems(t, s)
+	stmt, err := s.Prepare("SELECT id FROM items ORDER BY id LIMIT $1 OFFSET $2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := func(rows [][]Value) []int64 {
+		out := []int64{}
+		for _, r := range rows {
+			out = append(out, r[0].Int)
+		}
+		return out
+	}
+	for range 2 {
+		if r, _ := drainValues(t, s, stmt, &stmt.sc, IntValue(2), IntValue(0)); !reflect.DeepEqual(ids(r), []int64{1, 2}) {
+			t.Fatalf("LIMIT 2: %v", ids(r))
+		}
+		if r, _ := drainValues(t, s, stmt, &stmt.sc, IntValue(3), IntValue(10)); !reflect.DeepEqual(ids(r), []int64{11, 12, 13}) {
+			t.Fatalf("LIMIT 3 OFFSET 10: %v", ids(r))
+		}
+		if r, _ := drainValues(t, s, stmt, &stmt.sc, NullValue(), IntValue(998)); !reflect.DeepEqual(ids(r), []int64{999, 1000}) {
+			t.Fatalf("LIMIT NULL OFFSET 998: %v", ids(r))
+		}
+	}
+	if entry := stmt.sc.p.Load(); entry == nil || !entry.sensitive {
+		t.Fatal("a count parameter makes the statement sensitive")
+	}
+	rows, err := s.queryStmt(stmt.ast, []Value{IntValue(-1), IntValue(0)}, &stmt.sc, nil)
+	if err == nil {
+		for rows.Next() {
+		}
+		err = rows.Err()
+		rows.Close()
+	}
+	if ee, ok := err.(*EngineError); !ok || ee.Code() != "2201W" {
+		t.Fatalf("negative LIMIT: %v", err)
+	}
+}

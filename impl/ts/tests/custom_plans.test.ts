@@ -140,3 +140,22 @@ test("custom plans: the value-blind classification is sound", () => {
     }
   }
 });
+
+// A LIMIT / OFFSET count parameter is read at plan time (grammar.md §9), so it makes the statement
+// parameter-sensitive: a prepared statement run with different counts never reuses a plan planned for
+// another count, and a memo hit returns the rows of its own binding.
+test("custom plans: a LIMIT / OFFSET parameter is sensitive", () => {
+  const db = seed();
+  const stmt = prepare(db, "SELECT id FROM items ORDER BY id LIMIT $1 OFFSET $2");
+  const ids = (params: Value[]): string[] => drain(db, stmt, params).rows.map((r) => render(r[0]!));
+  for (let i = 0; i < 2; i++) {
+    assert.deepEqual(ids([intValue(2n), intValue(0n)]), ["1", "2"]);
+    assert.deepEqual(ids([intValue(3n), intValue(10n)]), ["11", "12", "13"]);
+    assert.deepEqual(ids([nullValue(), intValue(998n)]), ["999", "1000"]);
+  }
+  assert.equal(cacheOf(stmt)?.sensitive, true);
+  assert.throws(
+    () => drain(db, stmt, [intValue(-1n), intValue(0n)]),
+    (e: unknown) => (e as { state?: string }).state === "invalid_row_count_in_limit_clause",
+  );
+});

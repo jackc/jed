@@ -2024,10 +2024,14 @@ func (db *engine) planSetOp(so *setOp, parent *scope, ctes []*cteBinding, ptypes
 		order = append(order, orderSlot{idx: idx, descending: key.Descending, nullsFirst: key.NullsFirst, collation: coll})
 	}
 
+	limit, offset, err := db.resolveRowCounts(so.Limit, so.Offset, ptypes)
+	if err != nil {
+		return nil, err
+	}
 	return &setOpPlan{
 		op: so.Op, all: so.All, lhs: lhs, rhs: rhs,
 		columnNames: columnNames, columnTypes: columnTypes, columnDerivs: columnDerivs, columnTypmods: columnTypmods,
-		order: order, limit: so.Limit, offset: so.Offset,
+		order: order, limit: limit, offset: offset,
 	}, nil
 }
 

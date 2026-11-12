@@ -6007,11 +6007,20 @@ func (p *parser) parseLimitOffset(sel *selectStmt) error {
 	}
 }
 
-// parseCount parses a LIMIT/OFFSET count: a non-negative integer literal. The sign is
-// folded as in parseLiteral; a negative value is rejected with 2201W (LIMIT) / 2201X
-// (OFFSET), and a magnitude over i64's max traps 22003 (the value -0 folds to 0 and is
-// accepted). isLimit selects which structured error to raise.
-func (p *parser) parseCount(isLimit bool) (int64, error) {
+// parseCount parses a LIMIT/OFFSET count: a non-negative integer literal or a bind parameter
+// $n. A literal's sign is folded as in parseLiteral; a negative value is rejected with 2201W
+// (LIMIT) / 2201X (OFFSET), and a magnitude over i64's max traps 22003 (the value -0 folds to 0
+// and is accepted). isLimit selects which structured error to raise. A parameter's value is
+// checked when the statement is planned.
+func (p *parser) parseCount(isLimit bool) (rowCount, error) {
+	if p.peek().Kind == tokParam {
+		return rowCount{Param: int(p.advance().Int)}, nil
+	}
+	v, err := p.parseCountLiteral(isLimit)
+	return rowCount{Value: v}, err
+}
+
+func (p *parser) parseCountLiteral(isLimit bool) (int64, error) {
 	negate := false
 	if p.peek().Kind == tokMinus {
 		p.advance()
@@ -8929,7 +8938,7 @@ func valuesQuery(rows [][]*exprNode, trailing *selectStmt) queryExpr {
 // contents lack is simply added. A parenthesized nested WITH folds onto its main query.
 func foldTrailing(node queryExpr, trailing *selectStmt) error {
 	var order *[]orderKey
-	var limit, offset **int64
+	var limit, offset **rowCount
 	switch {
 	case node.Select != nil:
 		order, limit, offset = &node.Select.OrderBy, &node.Select.Limit, &node.Select.Offset

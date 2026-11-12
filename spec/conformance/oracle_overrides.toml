@@ -1820,6 +1820,17 @@ sql = "SELECT id FROM c WHERE p = $1"
 params = "'(3,4)'"
 reason = "jed types a parameter compared with a named composite as that composite (api.md §5), so a text value is read by its record input. PostgreSQL types the parameter as the anonymous record (record_eq's argument type) and cannot read text into it (0A000, input of anonymous composite types is not implemented)."
 
+[[override]]
+file = "params/limit_offset.test"
+sql = "SELECT id FROM t LIMIT $1"
+params = "'two'"
+reason = "jed binds typed host values: a text value for the i64 LIMIT count parameter is the wrong family, 42804 (api.md §5). PostgreSQL's EXECUTE argument 'two' is an untyped literal, so it attempts bigint input and raises 22P02."
+
+[[override]]
+file = "params/limit_offset.test"
+sql = "SELECT id FROM t LIMIT $1"
+reason = "jed: the LIMIT count types $1 as i64, so the statement expects one parameter; the record binds none -> 42601 (wrong parameter count). PostgreSQL reports 42P02 (no parameter $1). Both reject; the codes differ."
+
 # --- unnest(record[]) AS u(c type, …) (spec/design/composite.md §13): jed's anonymous record has a
 # static field list, so the column-definition list is checked against it at plan time and matched
 # with integer widths interchangeable; PostgreSQL's `record` is dynamic, checked at the first

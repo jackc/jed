@@ -1168,13 +1168,16 @@ limit_clause   ::= "LIMIT" count
 
 offset_clause  ::= "OFFSET" count
 
-/* A non-negative integer literal — NOT a general expression (the same literal-only
- * narrowing INSERT makes). A leading "-" is well-formed grammar but the negative
- * VALUE is rejected deterministically at parse time — 2201W for LIMIT, 2201X for
+/* A non-negative integer literal or a bind parameter — NOT a general expression (the
+ * same literal-only narrowing INSERT makes). A leading "-" is well-formed grammar but the
+ * negative VALUE is rejected deterministically at parse time — 2201W for LIMIT, 2201X for
  * OFFSET — analogous to the bare-2^63 -> 22003 case for `integer` (the value -0
  * folds to 0 and is accepted). The magnitude bound (42601) and the i64-range trap
- * (22003, a positive magnitude of 2^63) still apply via the shared integer lexer. */
+ * (22003, a positive magnitude of 2^63) still apply via the shared integer lexer. A
+ * `parameter` is typed i64 and read from its bound value when the statement is planned:
+ * NULL is no limit / no offset, a negative value is 2201W / 2201X (../design/grammar.md §9). */
 count          ::= "-"? integer
+                 | parameter
 
 /* A WHERE clause is a general expression that must resolve to `boolean`; a row
  * is kept iff it evaluates to TRUE (FALSE and NULL/unknown both exclude). */
@@ -1399,8 +1402,8 @@ typed_literal  ::= type_word string
  * directive, ../design/conformance.md §1.2), and its type is inferred from
  * context (sibling operand, target column, or CAST target; 42P18 if indeterminate). The
  * lexer rejects "$0", a leading zero ("$01"), and "$" with no following digit (42601).
- * Allowed anywhere `primary` is and as an `insert_value`; NOT in LIMIT/OFFSET, GROUP BY,
- * or a type modifier this slice (../design/grammar.md §5). */
+ * Allowed anywhere `primary` is, as an `insert_value`, and as a LIMIT/OFFSET `count`; NOT in
+ * GROUP BY or a type modifier this slice (../design/grammar.md §5). */
 parameter      ::= "$" digit+
 
 /* A CASE expression (../design/grammar.md §23), a primary like CAST. Two forms: the SEARCHED

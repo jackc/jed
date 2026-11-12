@@ -661,6 +661,10 @@ id = "query.offset"
 description = "OFFSET clause: skip leading rows of the result (non-negative integer literal)"
 
 [[capability]]
+id = "query.limit_param"
+description = "A bind parameter as the LIMIT / OFFSET count (`LIMIT $1 OFFSET $2`, spec/design/grammar.md §9): the parameter is typed i64 and read from its bound value when the statement is planned (estimator.md §6.1), so the plan, estimates and cost equal the literal twin's; a NULL binding is no limit / offset 0 and a negative one 2201W / 2201X, as in PostgreSQL"
+
+[[capability]]
 id = "query.distinct"
 description = "SELECT DISTINCT: deduplicate projected output rows (NULL-safe), with the PostgreSQL ORDER-BY-in-select-list restriction"
 

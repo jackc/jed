@@ -1422,6 +1422,10 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 	for i, rel := range s.rels {
 		planRels[i] = planRel{tableName: rel.table.Name, db: rel.db, offset: rel.offset, colCount: len(rel.table.Columns), srf: srfPlans[i], cte: rel.cte, derived: derivedPlans[i], lateral: lateralFlags[i]}
 	}
+	planLimit, planOffset, err := db.resolveRowCounts(sel.Limit, sel.Offset, ptypes)
+	if err != nil {
+		return nil, err
+	}
 	plan := &selectPlan{
 		rels: planRels, joins: joins, filter: filter, isAgg: isAgg, groupKeys: groupKeys,
 		groupExprs: groupExprs,
@@ -1429,7 +1433,7 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 		aggSpecs: aggSpecs, hasWindow: hasWindow, windowSpecs: windowSpecs, windowKeys: windowKeys, having: having,
 		order: order, orderExprs: orderExprs, projections: projections,
 		columnNames: columnNames, columnTypes: columnTypes, columnDerivs: columnDerivs, columnTypmods: columnTypmods, distinct: sel.Distinct && distinctOn == 0, distinctOn: distinctOn,
-		limit: sel.Limit, offset: sel.Offset, group: group,
+		limit: planLimit, offset: planOffset, group: group,
 	}
 	plan.relMasks = computeRelMasks(plan)
 	// ——— Stage 2: logical rewrite rules (spec/design/planner.md §3) ———

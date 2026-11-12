@@ -1298,9 +1298,9 @@ pub struct Select {
     pub order_by: Vec<OrderKey>,
     /// `LIMIT n` — cap the result at `n` rows (a non-negative count). Applied after
     /// ORDER BY, before projection (spec/design/grammar.md §9).
-    pub limit: Option<i64>,
+    pub limit: Option<RowCount>,
     /// `OFFSET m` — skip the first `m` rows of the result (a non-negative count).
-    pub offset: Option<i64>,
+    pub offset: Option<RowCount>,
     /// Named windows from a `WINDOW name AS (definition)` clause (spec/design/window.md §5,
     /// grammar.ebnf `window_clause`), referenced by `OVER name`. Empty when absent. Resolved by a
     /// desugaring pass that rewrites each `OVER name` to its definition before resolution.
@@ -1375,8 +1375,17 @@ pub struct SetOp {
     pub rhs: QueryExpr,
     /// Trailing ORDER BY over the combined result (empty = none); keys resolve by output name.
     pub order_by: Vec<OrderKey>,
-    pub limit: Option<i64>,
-    pub offset: Option<i64>,
+    pub limit: Option<RowCount>,
+    pub offset: Option<RowCount>,
+}
+
+/// A `LIMIT` / `OFFSET` count (spec/design/grammar.md §9): a non-negative integer literal, or a
+/// bind parameter `$n` (1-based) typed `i64` and read at plan time from the bound value — NULL is no
+/// limit / offset 0, a negative value is 2201W / 2201X.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RowCount {
+    Value(i64),
+    Param(u32),
 }
 
 /// The body of a CTE, or the `WITH`-prefixed primary statement (spec/design/writable-cte.md): an

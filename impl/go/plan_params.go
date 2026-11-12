@@ -1,5 +1,7 @@
 package jed
 
+import "fmt"
+
 // Parameter-sensitive ("custom") planning (spec/design/estimator.md §6.1).
 //
 // Planning runs inside a frame that says what the estimator may know about each $N:
@@ -237,4 +239,70 @@ func appendMemoString(b []byte, s string) []byte {
 		b = append(b, byte(n>>(8*i)))
 	}
 	return append(b, s...)
+}
+
+// resolveRowCounts resolves a query's LIMIT / OFFSET counts to the plan's row counts
+// (spec/design/grammar.md §9). A literal was checked by the parser. A parameter $n is typed i64 and
+// read from its bound value at plan time (estimator.md §6.1: every execution takes its custom plan):
+// NULL is no limit / no offset (PostgreSQL's LIMIT ALL / OFFSET 0), a negative value is 2201W /
+// 2201X. A probe plan, which has no values, plans without the count; reading it makes the statement
+// parameter-sensitive, so the plan that runs is always planned with the value.
+func (db *engine) resolveRowCounts(limit, offset *rowCount, ptypes *paramTypes) (*int64, *int64, error) {
+	l, err := db.resolveRowCount(limit, true, ptypes)
+	if err != nil {
+		return nil, nil, err
+	}
+	o, err := db.resolveRowCount(offset, false, ptypes)
+	if err != nil {
+		return nil, nil, err
+	}
+	return l, o, nil
+}
+
+func (db *engine) resolveRowCount(c *rowCount, isLimit bool, ptypes *paramTypes) (*int64, error) {
+	if c == nil {
+		return nil, nil
+	}
+	if c.Param == 0 {
+		v := c.Value
+		return &v, nil
+	}
+	if db.viewTracing() {
+		return nil, newError(UndefinedParameter, fmt.Sprintf("there is no parameter $%d", c.Param))
+	}
+	idx0 := c.Param - 1
+	i64 := scalarInt64
+	if err := ptypes.note(idx0, &i64); err != nil {
+		return nil, err
+	}
+	what := "OFFSET"
+	if isLimit {
+		what = "LIMIT"
+	}
+	f := db.currentPlanFrame()
+	if f == nil || f.ended {
+		return nil, nil
+	}
+	if !f.custom {
+		f.sensitive = true
+		return nil, nil
+	}
+	if idx0 >= len(f.values) {
+		return nil, nil
+	}
+	v := f.values[idx0]
+	switch v.Kind {
+	case ValNull:
+		return nil, nil
+	case ValInt:
+		n := v.Int
+		if n < 0 {
+			if isLimit {
+				return nil, newError(InvalidRowCountInLimitClause, "LIMIT must not be negative")
+			}
+			return nil, newError(InvalidRowCountInOffsetClause, "OFFSET must not be negative")
+		}
+		return &n, nil
+	}
+	return nil, newError(DatatypeMismatch, fmt.Sprintf("argument of %s must be type bigint", what))
 }

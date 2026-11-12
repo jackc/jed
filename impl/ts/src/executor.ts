@@ -94,6 +94,7 @@ import type {
   WithQuery,
   Overriding,
   ViewEdit,
+  RowCount,
 } from "./ast.ts";
 import {
   paramIsNull,
@@ -20856,6 +20857,34 @@ export class Engine {
   // planSetOp plans a set operation (spec/design/grammar.md §25): plan both operands with the same
   // parent scope, check arity + unify column types up front (so the 42601/42804 fire even over
   // empty operands), and resolve the trailing ORDER BY by output column name.
+  // resolveRowCount resolves a LIMIT / OFFSET count to the plan's row count (spec/design/grammar.md
+  // §9). A literal was checked by the parser. A parameter $n is typed i64 and read from its bound
+  // value at plan time (estimator.md §6.1: every execution takes its custom plan): NULL is no limit /
+  // no offset (PostgreSQL's LIMIT ALL / OFFSET 0), a negative value is 2201W / 2201X. A probe plan,
+  // which has no values, plans without the count; reading it makes the statement
+  // parameter-sensitive, so the plan that runs is always planned with the value.
+  private resolveRowCount(c: RowCount | null, isLimit: boolean, ptypes: ParamTypes): bigint | null {
+    if (c === null) return null;
+    if (c.param === 0) return c.value;
+    if (this.viewTrace !== null) {
+      throw engineError("undefined_parameter", "there is no parameter $" + c.param.toString());
+    }
+    const idx0 = c.param - 1;
+    ptypes.note(idx0, "i64");
+    const v = paramValue(idx0);
+    if (v === null || v.kind === "null") return null;
+    const what = isLimit ? "LIMIT" : "OFFSET";
+    if (v.kind !== "int") {
+      throw engineError("datatype_mismatch", `argument of ${what} must be type bigint`);
+    }
+    if (v.int < 0n) {
+      throw isLimit
+        ? engineError("invalid_row_count_in_limit_clause", "LIMIT must not be negative")
+        : engineError("invalid_row_count_in_offset_clause", "OFFSET must not be negative");
+    }
+    return v.int;
+  }
+
   private planSetOp(
     so: SetOp,
     parent: Scope | null,
@@ -20939,8 +20968,8 @@ export class Engine {
       columnDerivs,
       columnTypmods,
       order,
-      limit: so.limit,
-      offset: so.offset,
+      limit: this.resolveRowCount(so.limit, true, ptypes),
+      offset: this.resolveRowCount(so.offset, false, ptypes),
     };
   }
 
@@ -21949,8 +21978,8 @@ export class Engine {
       columnTypmods,
       distinct: sel.distinct && distinctOn === 0,
       distinctOn,
-      limit: sel.limit,
-      offset: sel.offset,
+      limit: this.resolveRowCount(sel.limit, true, ptypes),
+      offset: this.resolveRowCount(sel.offset, false, ptypes),
       group,
       relMasks: [],
       pushdown: null,

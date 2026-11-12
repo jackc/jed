@@ -3347,6 +3347,50 @@ pub(crate) fn conjunct_count(e: &RExpr) -> i64 {
 }
 
 /// Render a Limit node's `limit=N` / `offset=M` attributes (an absent side is omitted).
+/// Resolve a `LIMIT` / `OFFSET` count to the plan's row count (spec/design/grammar.md §9). A literal
+/// was checked by the parser. A parameter `$n` is typed `i64` and read from its bound value at plan
+/// time (estimator.md §6.1: every execution takes its custom plan): NULL is no limit / no offset
+/// (PostgreSQL's `LIMIT ALL` / `OFFSET 0`), a negative value is 2201W / 2201X. A probe plan, which
+/// has no values, plans without the count; reading it makes the statement parameter-sensitive, so
+/// the plan that runs is always planned with the value.
+pub(crate) fn resolve_row_count(
+    engine: &Engine,
+    count: Option<crate::ast::RowCount>,
+    is_limit: bool,
+    ptypes: &mut ParamTypes,
+) -> Result<Option<i64>> {
+    let n1 = match count {
+        None => return Ok(None),
+        Some(crate::ast::RowCount::Value(v)) => return Ok(Some(v)),
+        Some(crate::ast::RowCount::Param(n1)) => n1,
+    };
+    if engine.view_tracing() {
+        return Err(EngineError::new(
+            SqlState::UndefinedParameter,
+            format!("there is no parameter ${n1}"),
+        ));
+    }
+    let idx0 = (n1 as usize) - 1;
+    ptypes.note(idx0, Some(ScalarType::Int64))?;
+    let what = if is_limit { "LIMIT" } else { "OFFSET" };
+    match plan_params::param_bound_value(idx0) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Int(n)) if n < 0 => Err(EngineError::new(
+            if is_limit {
+                SqlState::InvalidRowCountInLimitClause
+            } else {
+                SqlState::InvalidRowCountInOffsetClause
+            },
+            format!("{what} must not be negative"),
+        )),
+        Some(Value::Int(n)) => Ok(Some(n)),
+        Some(_) => Err(EngineError::new(
+            SqlState::DatatypeMismatch,
+            format!("argument of {what} must be type bigint"),
+        )),
+    }
+}
+
 pub(crate) fn limit_detail(limit: Option<i64>, offset: Option<i64>) -> String {
     let mut parts = Vec::new();
     if let Some(l) = limit {

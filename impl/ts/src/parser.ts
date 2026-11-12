@@ -57,6 +57,7 @@ import type {
   SelectItem,
   SelectItems,
   SeqOptions,
+  RowCount,
   SeqRestart,
   SetOpKind,
   Statement,
@@ -3556,11 +3557,11 @@ class Parser {
   // parseLimitOffsetClauses parses an optional `LIMIT <count>` / `OFFSET <count>` pair, in either
   // order, each at most once (§9). Returns nulls when absent.
   private parseLimitOffsetClauses(): {
-    limit: bigint | null;
-    offset: bigint | null;
+    limit: RowCount | null;
+    offset: RowCount | null;
   } {
-    let limit: bigint | null = null;
-    let offset: bigint | null = null;
+    let limit: RowCount | null = null;
+    let offset: RowCount | null = null;
     for (;;) {
       const kw = this.peekKeyword();
       if (kw === "limit") {
@@ -4586,11 +4587,19 @@ class Parser {
     return keys;
   }
 
-  // parseCount parses a LIMIT/OFFSET count: a non-negative integer literal. The sign is
-  // folded as in parseLiteral; a negative value is rejected with 2201W (LIMIT) / 2201X
-  // (OFFSET), and a magnitude over i64's max throws 22003 (the value -0 folds to 0 and
-  // is accepted). isLimit selects which structured error to raise.
-  private parseCount(isLimit: boolean): bigint {
+  // parseCount parses a LIMIT/OFFSET count: a non-negative integer literal or a bind parameter
+  // $n. A literal's sign is folded as in parseLiteral; a negative value is rejected with 2201W
+  // (LIMIT) / 2201X (OFFSET), and a magnitude over i64's max throws 22003 (the value -0 folds to
+  // 0 and is accepted). isLimit selects which structured error to raise. A parameter's value is
+  // checked when the statement is planned.
+  private parseCount(isLimit: boolean): RowCount {
+    if (this.peek().kind === "param") {
+      return { value: 0n, param: this.advance().paramIndex! };
+    }
+    return { value: this.parseCountLiteral(isLimit), param: 0 };
+  }
+
+  private parseCountLiteral(isLimit: boolean): bigint {
     let negate = false;
     if (this.peek().kind === "minus") {
       this.advance();
@@ -7228,8 +7237,8 @@ const VALUES_LABEL = "*VALUES*";
 function valuesQuery(
   rows: Expr[][],
   orderBy: OrderKey[],
-  limit: bigint | null,
-  offset: bigint | null,
+  limit: RowCount | null,
+  offset: RowCount | null,
 ): Select {
   const inner: TableRef = { name: VALUES_LABEL, alias: VALUES_LABEL, args: null, values: rows };
   return {
@@ -7257,8 +7266,8 @@ function valuesQuery(
 function foldTrailing(
   node: QueryExpr,
   orderBy: OrderKey[],
-  limit: bigint | null,
-  offset: bigint | null,
+  limit: RowCount | null,
+  offset: RowCount | null,
 ): QueryExpr {
   if (node.kind === "withExpr") {
     return { ...node, body: foldTrailing(node.body, orderBy, limit, offset) };

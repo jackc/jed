@@ -231,3 +231,40 @@ fn value_blind_classification_is_sound() {
         }
     }
 }
+
+/// A LIMIT / OFFSET count parameter is read at plan time (grammar.md §9), so it makes the statement
+/// parameter-sensitive: a prepared statement run with different counts never reuses a plan planned
+/// for another count, and a memo hit returns the rows of its own binding.
+#[test]
+fn limit_offset_parameter_is_sensitive() {
+    let mut s = mem();
+    seed(&mut s);
+    let stmt = s
+        .prepare("SELECT id FROM items ORDER BY id LIMIT $1 OFFSET $2")
+        .unwrap();
+    let ids = |r: Vec<Vec<Value>>| -> Vec<i64> {
+        r.into_iter()
+            .map(|row| match row[0] {
+                Value::Int(n) => n,
+                ref v => panic!("unexpected {v:?}"),
+            })
+            .collect()
+    };
+    for _ in 0..2 {
+        let (r, _) = drain(&mut s, &stmt, &[Value::Int(2), Value::Int(0)]);
+        assert_eq!(ids(r), vec![1, 2]);
+        let (r, _) = drain(&mut s, &stmt, &[Value::Int(3), Value::Int(10)]);
+        assert_eq!(ids(r), vec![11, 12, 13]);
+        let (r, _) = drain(&mut s, &stmt, &[Value::Null, Value::Int(998)]);
+        assert_eq!(ids(r), vec![999, 1000]);
+    }
+    assert!(
+        cached(&stmt).0,
+        "a count parameter makes the statement sensitive"
+    );
+    let err = s
+        .query_prepared(&stmt, &[Value::Int(-1), Value::Int(0)])
+        .map(|_| ())
+        .unwrap_err();
+    assert_eq!(err.code(), "2201W");
+}

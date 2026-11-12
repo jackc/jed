@@ -19,7 +19,7 @@ use crate::ast::{
     WindowDef, WithExpr, WithQuery,
 };
 use crate::ast::{CheckOption, FrameBound, FrameExclusion, FrameMode, WindowFrame, WindowOrderKey};
-use crate::ast::{CycleClause, SearchClause, ViewEdit, ViewOption};
+use crate::ast::{CycleClause, RowCount, SearchClause, ViewEdit, ViewOption};
 use crate::ast::{Merge, MergeAction, MergeClause, MergeMatch, MergeValue};
 use crate::decimal::Decimal;
 use crate::error::{EngineError, Result, SqlState};
@@ -5285,7 +5285,7 @@ impl Parser {
     /// order, each at most once (a repeat is a syntax error, 42601). Returns the
     /// resolved non-negative counts (spec/grammar/grammar.ebnf `limit_offset`).
     #[inline(never)]
-    fn parse_limit_offset(&mut self) -> Result<(Option<i64>, Option<i64>)> {
+    fn parse_limit_offset(&mut self) -> Result<(Option<RowCount>, Option<RowCount>)> {
         let mut limit = None;
         let mut offset = None;
         loop {
@@ -5306,11 +5306,21 @@ impl Parser {
         Ok((limit, offset))
     }
 
-    /// A LIMIT/OFFSET count: a non-negative integer literal. The sign is folded as in
-    /// `parse_literal`; a negative value is rejected at parse time with 2201W (LIMIT) /
-    /// 2201X (OFFSET), and a positive magnitude over i64::MAX traps 22003 (the value -0
-    /// folds to 0 and is accepted). `is_limit` selects which structured error to raise.
-    fn parse_count(&mut self, is_limit: bool) -> Result<i64> {
+    /// A LIMIT/OFFSET count: a non-negative integer literal or a bind parameter `$n`. A
+    /// literal's sign is folded as in `parse_literal`; a negative value is rejected at parse
+    /// time with 2201W (LIMIT) / 2201X (OFFSET), and a positive magnitude over i64::MAX traps
+    /// 22003 (the value -0 folds to 0 and is accepted). `is_limit` selects which structured
+    /// error to raise. A parameter's value is checked when the statement is planned.
+    fn parse_count(&mut self, is_limit: bool) -> Result<RowCount> {
+        if let Token::Param(n) = self.peek() {
+            let n = *n;
+            self.bump();
+            return Ok(RowCount::Param(n));
+        }
+        self.parse_count_literal(is_limit).map(RowCount::Value)
+    }
+
+    fn parse_count_literal(&mut self, is_limit: bool) -> Result<i64> {
         let negate = if matches!(self.peek(), Token::Minus) {
             self.bump();
             true
@@ -8203,8 +8213,8 @@ fn empty_select(distinct: bool) -> Box<Select> {
 fn values_query(
     rows: Vec<Vec<Expr>>,
     order_by: Vec<OrderKey>,
-    limit: Option<i64>,
-    offset: Option<i64>,
+    limit: Option<RowCount>,
+    offset: Option<RowCount>,
 ) -> QueryExpr {
     let inner = TableRef {
         name: VALUES_LABEL.to_string(),
@@ -8247,16 +8257,16 @@ fn values_query(
 fn fold_trailing(
     node: QueryExpr,
     order_by: Vec<OrderKey>,
-    limit: Option<i64>,
-    offset: Option<i64>,
+    limit: Option<RowCount>,
+    offset: Option<RowCount>,
 ) -> Result<QueryExpr> {
     fn fold(
         cur_order: &mut Vec<OrderKey>,
-        cur_limit: &mut Option<i64>,
-        cur_offset: &mut Option<i64>,
+        cur_limit: &mut Option<RowCount>,
+        cur_offset: &mut Option<RowCount>,
         order_by: Vec<OrderKey>,
-        limit: Option<i64>,
-        offset: Option<i64>,
+        limit: Option<RowCount>,
+        offset: Option<RowCount>,
     ) -> Result<()> {
         if !order_by.is_empty() {
             if !cur_order.is_empty() {

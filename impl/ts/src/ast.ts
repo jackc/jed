@@ -1317,8 +1317,8 @@ export type Select = {
   having: Expr | null;
   // ORDER BY sort keys, applied left to right; empty means no ORDER BY (grammar.md §10).
   orderBy: OrderKey[];
-  limit: bigint | null;
-  offset: bigint | null;
+  limit: RowCount | null;
+  offset: RowCount | null;
   // Named windows from a `WINDOW name AS (definition)` clause (spec/design/window.md §5,
   // grammar.ebnf `window_clause`), referenced by `OVER name`. Empty when absent. Resolved by a
   // desugaring pass that rewrites each `OVER name` to its definition before resolution.
@@ -1511,8 +1511,8 @@ export type SetOp = {
   lhs: QueryExpr;
   rhs: QueryExpr;
   orderBy: OrderKey[];
-  limit: bigint | null;
-  offset: bigint | null;
+  limit: RowCount | null;
+  offset: RowCount | null;
 };
 
 // CteBody is the body of a CTE, or the WITH-prefixed primary statement (spec/design/writable-cte.md):
@@ -1700,3 +1700,11 @@ export type Statement =
   | Rollback
   | Savepoint
   | Explain;
+
+// A LIMIT / OFFSET count (spec/design/grammar.md §9): a non-negative integer literal (param === 0),
+// or the bind parameter $param (1-based), typed i64 and read at plan time from the bound value —
+// NULL is no limit / offset 0, a negative value is 2201W / 2201X.
+export interface RowCount {
+  value: bigint;
+  param: number;
+}

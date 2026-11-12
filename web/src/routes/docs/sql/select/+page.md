@@ -237,6 +237,9 @@ in a grouped query — a column name is its simplest form), an **output-column a
 (`SELECT a + b AS s … ORDER BY s` sorts by the aliased value — a bare name binds an output column
 before an input column, matching PostgreSQL), or an **output-column position** (`ORDER BY 1` sorts by
 the first select-list item), each with optional `ASC` / `DESC` and `NULLS FIRST` / `NULLS LAST`.
+A `LIMIT` / `OFFSET` count is an integer literal or a bound parameter (`LIMIT $1 OFFSET $2`); a
+NULL count means no limit / no offset, and a negative one is an error (`2201W` / `2201X`), as in
+PostgreSQL.
 Aggregates use PostgreSQL-style widening
 (for example, `sum` over `numeric` returns `numeric`, exact), and accept a leading `DISTINCT`
 (`count(DISTINCT x)`) and a trailing `FILTER (WHERE …)` (`count(*) FILTER (WHERE x > 0)`).

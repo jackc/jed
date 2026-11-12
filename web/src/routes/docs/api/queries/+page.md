@@ -48,7 +48,7 @@ an `INSERT`/`UPDATE` target, a cast, the common result type of `CASE`, `COALESCE
 parameter, `translate($1, 'a', 'b')` a text one, and `s LIKE $1` or `'x%' LIKE $1` a text pattern. A
 bare `SELECT $1` has no type context and reports `42P18`, and a function whose overloads leave the type
 open (`abs($1)`, `round($1, 2)`) reports `42725`; write an explicit cast when the surrounding expression
-cannot supply one.
+cannot supply one. A `LIMIT $1` / `OFFSET $1` count binds as a 64-bit integer.
 
 If one placeholder is used in several integer contexts, its bound value uses the widest
 required integer type. Each expression still uses its own local type. Incompatible

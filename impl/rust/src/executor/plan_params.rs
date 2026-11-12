@@ -49,6 +49,20 @@ pub(crate) fn param_value(i: usize) -> Option<RExpr> {
     })
 }
 
+/// The bound value of parameter `i` itself, for a plan-time read that needs the value rather than
+/// its literal constant (a `LIMIT $n` / `OFFSET $n` count). `None` when it is unavailable — a probe
+/// frame, which records the statement as parameter-sensitive so the custom plan reads it, or no frame.
+pub(crate) fn param_bound_value(i: usize) -> Option<Value> {
+    FRAMES.with(|frames| match frames.borrow_mut().last_mut() {
+        Some(Frame::Probe { sensitive, .. }) => {
+            *sensitive = true;
+            None
+        }
+        Some(Frame::Custom { values, .. }) => values.get(i).cloned(),
+        None => None,
+    })
+}
+
 /// Whether bound parameter `i` is NULL. An unbound parameter is assumed non-NULL; a probe frame
 /// records the assumption so a NULL binding is planned again with its value.
 pub(crate) fn param_is_null(i: usize) -> bool {
