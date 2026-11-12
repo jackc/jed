@@ -1533,6 +1533,9 @@ type ItemAcc = {
 // replaceCols leaves for remeasure.
 // distinct says some column's dictionary is kept as distinct (ItemAcc.distinct): the facts are
 // dropped before a row is added.
+// group, when set, says no dictionary payload repeats among the rows of the leaves that share it:
+// the halves of one split, or a merge of those. Rows only leave such a leaf (facts with a distinct
+// dictionary are dropped before one is added), so the claim holds while the facts do.
 type LeafFacts = {
   fors: ForRange[];
   forCnt: number[];
@@ -1547,6 +1550,7 @@ type LeafFacts = {
   redoFor: number[];
   redoItem: number[];
   distinct: boolean;
+  group: object | null;
 };
 
 // LeafScan is one pass over a leaf's rows (TableLeafSizer.scan; the Go core's allRowItems and
@@ -1554,11 +1558,15 @@ type LeafFacts = {
 // first, and the last, of its payload in the leaf (first[j] / last[j], one byte per row; null for a
 // packed-array column). dups[j] says some payload of column j repeats.
 //
+// A scan of rows known to repeat no payload (scanDistinct) has no flags: first[j] and last[j] are
+// null for every column. Its items are null when the tree has no packed-array column: a dictionary
+// value is then NULL or its own entry, which the row's value says.
+//
 // It also holds the running facts of one half of a candidate split (scanReset / scanAdd /
 // scanSaving): each base-plus-offsets column's span, each dictionary's entry count and repeated bytes
 // (runD / runDup; runNull says a NULL is counted), and each packed-array column's facts.
 type LeafScan = {
-  items: LeafItem[][];
+  items: LeafItem[][] | null;
   first: (Uint8Array | null)[];
   last: (Uint8Array | null)[];
   dups: boolean[];
@@ -1706,6 +1714,7 @@ class TableLeafSizer implements LeafSizer {
       redoFor: [],
       redoItem: [],
       distinct: false,
+      group: null,
     };
   }
 
@@ -2323,6 +2332,7 @@ class TableLeafSizer implements LeafSizer {
       redoFor: [],
       redoItem: [],
       distinct: f.distinct,
+      group: f.group,
     };
   }
 
@@ -2393,26 +2403,71 @@ class TableLeafSizer implements LeafSizer {
     };
   }
 
+  // scanDistinct is the scan of rows known to repeat no dictionary payload (the rows of leaves of
+  // one distinct group): nothing is hashed, and with no packed-array column no row is classified.
+  scanDistinct(
+    keys: Uint8Array[],
+    rows: Row[],
+    cap: Cap,
+    memo: CompressMemo | null = null,
+  ): LeafScan {
+    if (leafSizesCheckOn() && this.scan(keys, rows, cap, memo).anyDups) {
+      throw new Error("BUG: a repeated payload in a distinct group");
+    }
+    const k = this.itemCols.length;
+    return {
+      items: this.itemCols.some((ic) => ic.arrW !== 0)
+        ? this.classifyAll(keys, rows, cap, memo)
+        : null,
+      first: new Array<Uint8Array | null>(k).fill(null),
+      last: new Array<Uint8Array | null>(k).fill(null),
+      dups: new Array<boolean>(k).fill(false),
+      anyDups: false,
+      runFors: this.forCols.map(newForRange),
+      runD: new Array<number>(k).fill(0),
+      runDup: new Array<number>(k).fill(0),
+      runNull: new Array<boolean>(k).fill(false),
+      runArr: this.itemCols.map(() => newItemAcc(false)),
+    };
+  }
+
   scanDups(scan: unknown): boolean {
     return (scan as LeafScan).anyDups;
   }
 
   // scanFacts is the size facts of rows [lo, hi) of a scanned leaf. A dictionary column with no
   // repeated payload is kept as distinct, with no map; one with repeats is counted into a map.
-  scanFacts(scan: unknown, rows: Row[], lo: number, hi: number): LeafFacts {
+  // group is the facts' distinct group, or null.
+  scanFacts(
+    scan: unknown,
+    rows: Row[],
+    lo: number,
+    hi: number,
+    group: object | null = null,
+  ): LeafFacts {
     const sc = scan as LeafScan;
     const f = this.newFacts();
+    f.group = group;
+    const items = sc.items;
     for (let i = lo; i < hi; i++) this.addFors(f, rows[i]!);
     for (let j = 0; j < this.itemCols.length; j++) {
       const a = f.items[j]!;
       const w = this.itemCols[j]!.arrW;
-      if (w !== 0 || sc.dups[j]) {
-        for (let i = lo; i < hi; i++) this.addItem(a, w, sc.items[i]![j]!);
+      if (items !== null && (w !== 0 || sc.dups[j])) {
+        for (let i = lo; i < hi; i++) this.addItem(a, w, items[i]![j]!);
         continue;
       }
-      for (let i = lo; i < hi; i++) {
-        if (sc.items[i]![j]!.kind === ITEM_NULL) a.nulls++;
-        else a.d++;
+      if (items !== null) {
+        for (let i = lo; i < hi; i++) {
+          if (items[i]![j]!.kind === ITEM_NULL) a.nulls++;
+          else a.d++;
+        }
+      } else {
+        const c = this.itemCols[j]!.col;
+        for (let i = lo; i < hi; i++) {
+          if (rows[i]![c]!.kind === "null") a.nulls++;
+          else a.d++;
+        }
       }
       if (a.nulls > 0) a.d++;
       a.distinct = true;
@@ -2435,7 +2490,8 @@ class TableLeafSizer implements LeafSizer {
 
   // scanAdd takes row i into the running half; up says the half grows from the first row. Nothing
   // is hashed: a shared value repeats one already in the half exactly when it is not the first of
-  // its payload (growing up) or not the last (growing down).
+  // its payload (growing up) or not the last (growing down). A scan of distinct rows has no flags:
+  // nothing repeats.
   scanAdd(scan: unknown, rows: Row[], i: number, up: boolean): void {
     const sc = scan as LeafScan;
     const row = rows[i]!;
@@ -2445,7 +2501,20 @@ class TableLeafSizer implements LeafSizer {
       if (v.kind !== "null") forRangeAddValue(sc.runFors[j]!, this.colTypes[fc.col]!, fc.w, v);
     }
     if (this.itemCols.length === 0) return;
+    if (sc.items === null) {
+      // Distinct rows with no array column: a value is NULL or its own entry.
+      for (let j = 0; j < this.itemCols.length; j++) {
+        if (row[this.itemCols[j]!.col]!.kind !== "null") {
+          sc.runD[j]!++;
+        } else if (!sc.runNull[j]) {
+          sc.runNull[j] = true;
+          sc.runD[j]!++;
+        }
+      }
+      return;
+    }
     const items = sc.items[i]!;
+    const flags = up ? sc.first : sc.last;
     for (let j = 0; j < this.itemCols.length; j++) {
       const it = items[j]!;
       const w = this.itemCols[j]!.arrW;
@@ -2458,7 +2527,7 @@ class TableLeafSizer implements LeafSizer {
         }
       } else if (it.kind === ITEM_OWN) {
         sc.runD[j]!++;
-      } else if ((up ? sc.first[j]! : sc.last[j]!)[i] !== 0) {
+      } else if (flags[j] === null || flags[j]![i] !== 0) {
         sc.runD[j]!++;
       } else {
         sc.runDup[j]! += 1 + it.len;
@@ -2492,6 +2561,11 @@ class TableLeafSizer implements LeafSizer {
   // cannot take a row, so the writer drops them before an insert or replacement.
   factsDistinct(facts: unknown): boolean {
     return (facts as LeafFacts).distinct;
+  }
+
+  // factsGroup is the distinct group of the facts, or null.
+  factsGroup(facts: unknown): object | null {
+    return (facts as LeafFacts).group;
   }
 
   // packedSavings is a Packed leaf's region savings three ways (tests): measured from its decoded
@@ -2540,7 +2614,7 @@ class TableLeafSizer implements LeafSizer {
     const k = this.itemCols.length;
     // The rows' items: the scan's when the leaf was scanned.
     const items =
-      scan !== null ? (scan as LeafScan).items : this.classifyAll(keys, rows, cap, memo);
+      (scan !== null ? (scan as LeafScan).items : null) ?? this.classifyAll(keys, rows, cap, memo);
     const pre = new Array<number>(n + 1);
     const suf = new Array<number>(n + 1);
     // These only ever add, so their dictionaries stop counting past 256 entries.

@@ -1595,8 +1595,10 @@ func splitPoint(mLo, mHi, payload, cap int, rightEdge bool, leftpayload, rightpa
 // per-boundary tables: one pass up from the first row while the left half fits, one pass down from
 // the last while the right half does. Both half sizes are monotone in m, so the passes stop at the
 // first boundary that does not fit; the balanced boundary, when it lies past the last fitting one, is
-// clamped to it either way.
-func splitPointRunning(keys [][]byte, vals []storedRow, items [][]dictItem, scans []dictScan, prefix []int, payload int, cap pageCap, shape leafShape, rightEdge bool) (int, bool) {
+// clamped to it either way. Unless full is set, the passes are cut short: the left one stops at the
+// balanced boundary and the right half is measured there alone, which gives the same boundary
+// whenever that half fits (it is then at or past the lowest fitting boundary).
+func splitPointRunning(keys [][]byte, vals []storedRow, items [][]dictItem, scans []dictScan, prefix []int, payload int, cap pageCap, shape leafShape, rightEdge, full bool) (int, bool) {
 	n := len(keys)
 	total := prefix[n]
 	fors := make([]forRange, len(shape.forCols))
@@ -1618,9 +1620,19 @@ func splitPointRunning(keys [][]byte, vals []storedRow, items [][]dictItem, scan
 				fors[j].add(forSlot(fc, v))
 			}
 		}
-		for j := range shape.itemCols {
-			it := items[i][j]
+		for j, c := range shape.itemCols {
 			f := &facts[j]
+			if items == nil {
+				// A distinct group with no array column: a value is NULL or its own entry.
+				if !vals[i][c].IsNull() {
+					f.d++
+				} else if !nulls[j] {
+					nulls[j] = true
+					f.d++
+				}
+				continue
+			}
+			it := items[i][j]
 			if shape.itemDict[j] {
 				switch it.kind {
 				case dictNull:
@@ -1632,10 +1644,14 @@ func splitPointRunning(keys [][]byte, vals []storedRow, items [][]dictItem, scan
 					f.d++
 				default:
 					// A value repeats one already in the half exactly when it is not the first of
-					// its payload (growing up) or not the last (growing down).
-					fresh := scans[j].first[i]
-					if !up {
-						fresh = scans[j].last[i]
+					// its payload (growing up) or not the last (growing down). A distinct group has
+					// no flags: nothing repeats.
+					fresh := true
+					if sc := scans[j]; sc.first != nil {
+						fresh = sc.first[i]
+						if !up {
+							fresh = sc.last[i]
+						}
 					}
 					if fresh {
 						f.d++
@@ -1655,13 +1671,23 @@ func splitPointRunning(keys [][]byte, vals []storedRow, items [][]dictItem, scan
 			s += forSaving(count, fc.w, fors[j].lo, fors[j].hi, fors[j].any)
 		}
 		for j := range shape.itemCols {
-			s += itemSaving(shape, j, count, facts[j], nil, true)
+			if shape.itemArr[j] != 0 || shape.itemTab[j] != nil {
+				s += itemSaving(shape, j, count, facts[j], nil, true)
+			} else if shape.itemDict[j] {
+				s += dictSaving(count, facts[j].d, facts[j].dup)
+			}
 		}
 		return s
 	}
 	mMax, mBalanced := 0, 0
 	for m := 1; m <= n-1; m++ {
 		add(m-1, true)
+		// A half is no larger than its records and overhead (a one-key prefix costs up to two
+		// bytes), so a boundary whose bound decides neither test is not measured.
+		if bound := prefix[m] + leafOverhead(m, shape) + 2; bound <= cap.c && (mBalanced != 0 || 2*bound < payload) {
+			mMax = m
+			continue
+		}
 		left := prefix[m] + leafOverhead(m, shape) - leafPrefixSaving(m, keys[0], keys[m-1]) - saved(m)
 		if left > cap.c {
 			break
@@ -1669,12 +1695,31 @@ func splitPointRunning(keys [][]byte, vals []storedRow, items [][]dictItem, scan
 		mMax = m
 		if mBalanced == 0 && 2*left >= payload {
 			mBalanced = m
+			if !rightEdge && !full {
+				break // the balanced boundary is the answer when the right half fits there
+			}
 		}
 	}
 	if mMax == 0 {
 		return 0, false
 	}
 	reset()
+	if !full {
+		// The right half is measured once, at the boundary the left pass chose. It fits there in
+		// all but rare leaves; the full passes serve those.
+		m := mMax
+		if !rightEdge && mBalanced != 0 {
+			m = mBalanced
+		}
+		for i := n - 1; i >= m; i-- {
+			add(i, false)
+		}
+		right := total - prefix[m] + leafOverhead(n-m, shape) - leafPrefixSaving(n-m, keys[m], keys[n-1]) - saved(n-m)
+		if right <= cap.c {
+			return m, true
+		}
+		return splitPointRunning(keys, vals, items, scans, prefix, payload, cap, shape, rightEdge, true)
+	}
 	mMin := 0
 	for m := n - 1; m >= 1; m-- {
 		add(m, false)
@@ -1697,6 +1742,18 @@ func splitPointRunning(keys [][]byte, vals []storedRow, items [][]dictItem, scan
 	return m, true
 }
 
+// sharedGroup is the distinct group two leaves both belong to with exact facts, or nil.
+func sharedGroup(left, right *pnode) *distinctGroup {
+	ls, rs := left.sizes, right.sizes
+	if ls == nil || rs == nil || ls.group == nil || ls.group != rs.group {
+		return nil
+	}
+	if ls.n != left.keyLen() || rs.n != right.keyLen() || ls.frozen != 0 || rs.frozen != 0 {
+		return nil
+	}
+	return ls.group
+}
+
 // anyDups reports whether any scanned dictionary column repeats a payload.
 func anyDups(scans []dictScan) bool {
 	for _, sc := range scans {
@@ -1713,7 +1770,7 @@ func anyDups(scans []dictScan) bool {
 // just-inserted/replaced record (-1 for the delete path's merge-overflow, which splits balanced). A
 // leaf with a single over-cap record is left whole (defensive — the oversize surfaces as 0A000 when
 // serialized).
-func buildLeaf(keys [][]byte, vals []storedRow, weights []uint32, cap pageCap, shape leafShape, edited int, owner *mutationGeneration, prior []*symTable) insOut {
+func buildLeaf(keys [][]byte, vals []storedRow, weights []uint32, cap pageCap, shape leafShape, edited int, owner *mutationGeneration, prior []*symTable, group *distinctGroup) insOut {
 	n := len(keys)
 	payload := 0
 	for _, w := range weights {
@@ -1730,11 +1787,26 @@ func buildLeaf(keys [][]byte, vals []storedRow, weights []uint32, cap pageCap, s
 		// The tables the leaf had (prior) are kept while it fits under them. When it overflows under
 		// them, a column whose payload has grown enough since its table was trained is trained again
 		// (trainTabs); the others keep their tables into the split.
-		items = allRowItems(shape, cap, keys, vals)
-		if !shape.hasSym && !shape.hasSymCol {
+		if group != nil && !shape.hasSym && !shape.hasSymCol {
+			// The rows come from leaves of one distinct group (mergeAt): no dictionary payload
+			// repeats, so nothing is hashed, and with no array column no row is classified.
+			if leafSizesCheck.Load() && anyDups(scanDicts(shape, allRowItems(shape, cap, keys, vals))) {
+				panic("BUG: a repeated payload in a distinct group")
+			}
+			if shape.hasItemArr() {
+				items = allRowItems(shape, cap, keys, vals)
+			}
+			scans = make([]dictScan, len(shape.itemCols))
+			sz = leafSizesScanned(shape, vals, items, scans, 0, n)
+		} else if items = allRowItems(shape, cap, keys, vals); !shape.hasSym && !shape.hasSymCol {
+			group = nil
 			scans = scanDicts(shape, items)
 			sz = leafSizesScanned(shape, vals, items, scans, 0, n)
+			if !anyDups(scans) {
+				group = new(distinctGroup)
+			}
 		} else {
+			group = nil
 			sz = leafSizesOf(shape, vals, items, prior, prior == nil)
 		}
 		if (prior != nil || leafSymHybrid) && shape.hasSym && payload-sz.saving(shape, true) > cap.c {
@@ -1744,6 +1816,7 @@ func buildLeaf(keys [][]byte, vals []storedRow, weights []uint32, cap pageCap, s
 		}
 		tabs = sz.tabs
 		payload -= sz.saving(shape, true)
+		sz.group = group
 	}
 	if payload <= cap.c || n < 2 {
 		whole := &pnode{keys: keys, vals: vals, weights: weights, owner: owner, symTabs: tabs}
@@ -1765,7 +1838,7 @@ func buildLeaf(keys [][]byte, vals []storedRow, weights []uint32, cap pageCap, s
 	if scans != nil {
 		// No symbol table: the split point is found with running facts, visiting only the rows the
 		// rule looks at. When no two halves fit, the tables below serve the multi-way split.
-		m, ok := splitPointRunning(keys, vals, items, scans, prefix, payload, cap, shape, edited == n-1)
+		m, ok := splitPointRunning(keys, vals, items, scans, prefix, payload, cap, shape, edited == n-1, false)
 		fastM, fastOK = m, ok
 		if ok {
 			out := insOut{
@@ -1776,13 +1849,18 @@ func buildLeaf(keys [][]byte, vals []storedRow, weights []uint32, cap pageCap, s
 			if owner != nil && !anyDups(scans) {
 				// No payload repeats in the leaf, so none does in a half: each half's facts are
 				// counted without a lookup, and its writer keeps them.
+				// The halves are one distinct group: a later merge of the two hashes nothing.
 				out.left.sizes = leafSizesScanned(shape, vals, items, scans, 0, m)
 				out.right.sizes = leafSizesScanned(shape, vals, items, scans, m, n)
+				out.left.sizes.group, out.right.sizes.group = group, group
 			}
 			if !leafSizesCheck.Load() {
 				return out
 			}
 			fastOut = &out // returned once the tabled rule below agrees
+		}
+		if items == nil {
+			items = allRowItems(shape, cap, keys, vals) // the tabled rule below classifies rows
 		}
 	}
 	// PROTOTYPE (leaf_narrow.go): each half stores its own shared key prefix. Both stay monotone in m:
@@ -1868,7 +1946,7 @@ func buildLeaf(keys [][]byte, vals []storedRow, weights []uint32, cap pageCap, s
 			return insOut{whole: &pnode{keys: keys, vals: vals, weights: weights, owner: owner}}
 		}
 		left := &pnode{keys: cloneKeys(keys[:mMax]), vals: cloneVals(vals[:mMax]), weights: cloneWeights(weights[:mMax]), owner: owner, symTabs: halfTabs(0, mMax)}
-		rest := buildLeaf(cloneKeys(keys[mMax:]), cloneVals(vals[mMax:]), cloneWeights(weights[mMax:]), cap, shape, edited-mMax, owner, prior)
+		rest := buildLeaf(cloneKeys(keys[mMax:]), cloneVals(vals[mMax:]), cloneWeights(weights[mMax:]), cap, shape, edited-mMax, owner, prior, nil)
 		return joinSplit(left, keys[mMax], rest)
 	}
 	return insOut{
@@ -2012,7 +2090,7 @@ func nodeInsert(n *pnode, key []byte, val storedRow, weight uint32, old *storedR
 			}
 			// The unchanged builder selects the exact split point/separator. The edited node is
 			// abandoned when the returned halves replace it, so handing it the vectors is safe.
-			return buildLeaf(n.keys, n.vals, n.weights, cap, shape, i, generation, n.symTabs), nil
+			return buildLeaf(n.keys, n.vals, n.weights, cap, shape, i, generation, n.symTabs, nil), nil
 		}
 		keys, vals, weights, err := n.decodedParts()
 		if err != nil {
@@ -2030,7 +2108,7 @@ func nodeInsert(n *pnode, key []byte, val storedRow, weight uint32, old *storedR
 			vals = insertValAt(vals, i, val)
 			weights = insertWeightAt(weights, i, weight)
 		}
-		out := buildLeaf(keys, vals, weights, cap, shape, i, generation, n.leafTabsPrior())
+		out := buildLeaf(keys, vals, weights, cap, shape, i, generation, n.leafTabsPrior(), nil)
 		if out.whole != nil {
 			out.whole.origin, _ = originOf(n)
 		}
@@ -2272,7 +2350,7 @@ func mergeAt(n *pnode, j int, generation *mutationGeneration, src leafSource, ca
 		// needs the merged lists; buildLeaf decides it (merge-overflow splits balanced).
 		mn := len(leftWeights) + len(rightWeights)
 		merged = buildLeaf(concatRange(leftKeys, rightKeys, 0, mn), concatRange(leftRows, rightRows, 0, mn),
-			concatRange(leftWeights, rightWeights, 0, mn), cap, shape, -1, generation, nil)
+			concatRange(leftWeights, rightWeights, 0, mn), cap, shape, -1, generation, nil, sharedGroup(left, right))
 		if len(merged.more) > 0 {
 			// Unreachable: splitting between the two leaves gives two fitting halves. Abandon.
 			return n, nil

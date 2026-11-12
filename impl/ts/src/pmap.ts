@@ -459,13 +459,20 @@ export interface LeafSizer {
   // running half of a candidate split: scanReset empties it, scanAdd takes row i in (up: the half
   // grows from the first row; false: from the last) and scanSaving is its region savings at count
   // rows.
+  //
+  // A leaf scanned with no repeated payload starts a distinct group, a token its facts and those of
+  // its split halves carry (scanFacts' group; factsGroup reads it). Rows only leave such leaves, so
+  // while two of them hold exact facts of one group their rows repeat no payload: scanDistinct is
+  // the scan of such rows, which hashes nothing.
   scan(keys: Uint8Array[], rows: Row[], cap: Cap, memo?: CompressMemo | null): unknown;
+  scanDistinct(keys: Uint8Array[], rows: Row[], cap: Cap, memo?: CompressMemo | null): unknown;
   scanDups(scan: unknown): boolean;
-  scanFacts(scan: unknown, rows: Row[], lo: number, hi: number): unknown;
+  scanFacts(scan: unknown, rows: Row[], lo: number, hi: number, group?: object | null): unknown;
   scanReset(scan: unknown): void;
   scanAdd(scan: unknown, rows: Row[], i: number, up: boolean): void;
   scanSaving(scan: unknown, count: number): number;
   factsDistinct(facts: unknown): boolean;
+  factsGroup(facts: unknown): object | null;
   // The region savings of a leaf of n rows with these facts; an upper bound while they are stale.
   saving(facts: unknown, n: number): number;
   // pre[m] is the region savings of rows [0, m) and suf[m] that of rows [m, n), for m in [0, n].
@@ -1717,7 +1724,10 @@ function splitPoint(
 // per-boundary tables: one pass up from the first row while the left half fits, one pass down from
 // the last while the right half does. Both half sizes are monotone in m, so the passes stop at the
 // first boundary that does not fit; the balanced boundary, when it lies past the last fitting one, is
-// clamped to it either way. pay is the whole leaf's payload. Null when no two halves fit.
+// clamped to it either way. pay is the whole leaf's payload. Null when no two halves fit. Unless full
+// is set, the passes are cut short: the left one stops at the balanced boundary and the right half is
+// measured there alone, which gives the same boundary whenever that half fits (it is then at or past
+// the lowest fitting boundary).
 function splitPointRunning(
   keys: Uint8Array[],
   vals: Row[],
@@ -1728,6 +1738,7 @@ function splitPointRunning(
   shape: LeafShape,
   sizer: LeafSizer,
   rightEdge: boolean,
+  full: boolean,
 ): number | null {
   const n = keys.length;
   const total = prefix[n]!;
@@ -1736,6 +1747,13 @@ function splitPointRunning(
   let mBalanced = 0;
   for (let m = 1; m <= n - 1; m++) {
     sizer.scanAdd(scan, vals, m - 1, true);
+    // A half is no larger than its records and overhead (a one-key prefix costs up to two bytes),
+    // so a boundary whose bound decides neither test is not measured.
+    const bound = prefix[m]! + leafOverhead(m, shape) + 2;
+    if (bound <= cap.c && (mBalanced !== 0 || 2 * bound < pay)) {
+      mMax = m;
+      continue;
+    }
     const left =
       prefix[m]! +
       leafOverhead(m, shape) -
@@ -1743,10 +1761,28 @@ function splitPointRunning(
       sizer.scanSaving(scan, m);
     if (left > cap.c) break;
     mMax = m;
-    if (mBalanced === 0 && 2 * left >= pay) mBalanced = m;
+    if (mBalanced === 0 && 2 * left >= pay) {
+      mBalanced = m;
+      // The balanced boundary is the answer when the right half fits there.
+      if (!rightEdge && !full) break;
+    }
   }
   if (mMax === 0) return null;
   sizer.scanReset(scan);
+  if (!full) {
+    // The right half is measured once, at the boundary the left pass chose. It fits there in all
+    // but rare leaves; the full passes serve those.
+    const m = !rightEdge && mBalanced !== 0 ? mBalanced : mMax;
+    for (let i = n - 1; i >= m; i--) sizer.scanAdd(scan, vals, i, false);
+    const right =
+      total -
+      prefix[m]! +
+      leafOverhead(n - m, shape) -
+      leafPrefixSaving(n - m, keys[m]!, keys[n - 1]!) -
+      sizer.scanSaving(scan, n - m);
+    if (right <= cap.c) return m;
+    return splitPointRunning(keys, vals, scan, prefix, pay, cap, shape, sizer, rightEdge, true);
+  }
   let mMin = 0;
   for (let m = n - 1; m >= 1; m--) {
     sizer.scanAdd(scan, vals, m, false);
@@ -1770,7 +1806,8 @@ function splitPointRunning(
 // separator handed up is a COPY of keys[m] (the right leaf's first key). edited is the index of
 // the just-inserted/replaced record (null for the delete path's merge-overflow, which splits
 // balanced). A leaf with a single over-cap record is left whole (defensive — the oversize surfaces
-// as 0A000 when serialized).
+// as 0A000 when serialized). group, when set, says the rows come from leaves of one distinct group
+// (sharedGroup): no dictionary payload repeats among them.
 function buildLeaf(
   keys: Uint8Array[],
   vals: Row[],
@@ -1779,6 +1816,7 @@ function buildLeaf(
   shape: LeafShape,
   edited: number | null,
   owner?: MutationGeneration,
+  group: object | null = null,
 ): InsOut {
   const n = keys.length;
   let total = 0;
@@ -1793,8 +1831,14 @@ function buildLeaf(
   if (pay > cap.c && n >= 2) {
     pay -= leafPrefixSaving(n, keys[0]!, keys[n - 1]!);
     if (sizer !== null) {
-      scan = sizer.scan(keys, vals, cap, memo);
-      facts = sizer.scanFacts(scan, vals, 0, n);
+      if (group !== null) {
+        scan = sizer.scanDistinct(keys, vals, cap, memo);
+      } else {
+        scan = sizer.scan(keys, vals, cap, memo);
+        // A leaf with no repeated payload starts a group.
+        if (!sizer.scanDups(scan)) group = {};
+      }
+      facts = sizer.scanFacts(scan, vals, 0, n, group);
       pay -= sizer.saving(facts, n);
     }
   }
@@ -1813,15 +1857,27 @@ function buildLeaf(
   if (sizer !== null) {
     // The split point is found with running facts, visiting only the rows the rule looks at. When
     // no two halves fit, the tables below serve the multi-way split.
-    fast = splitPointRunning(keys, vals, scan, prefix, pay, cap, shape, sizer, edited === n - 1);
+    fast = splitPointRunning(
+      keys,
+      vals,
+      scan,
+      prefix,
+      pay,
+      cap,
+      shape,
+      sizer,
+      edited === n - 1,
+      false,
+    );
     if (fast !== null) {
       const left = newLeaf(keys.slice(0, fast), vals.slice(0, fast), weights.slice(0, fast), owner);
       const right = newLeaf(keys.slice(fast), vals.slice(fast), weights.slice(fast), owner);
       if (owner !== undefined && !sizer.scanDups(scan)) {
         // No payload repeats in the leaf, so none does in a half: each half's facts are counted
-        // without a lookup, and its writer keeps them.
-        left.sizes = { n: fast, facts: sizer.scanFacts(scan, vals, 0, fast) };
-        right.sizes = { n: n - fast, facts: sizer.scanFacts(scan, vals, fast, n) };
+        // without a lookup, and its writer keeps them. The halves are one distinct group: a later
+        // merge of the two hashes nothing.
+        left.sizes = { n: fast, facts: sizer.scanFacts(scan, vals, 0, fast, group) };
+        right.sizes = { n: n - fast, facts: sizer.scanFacts(scan, vals, fast, n, group) };
       }
       fastOut = { whole: null, left, sep: keys[fast]!, right, more: [] };
       if (!leafSizesCheck) return fastOut;
@@ -2266,6 +2322,18 @@ function emptyUnarySubtree(node: PNode): boolean {
   return isLeaf(node) && nodeLen(node) === 0;
 }
 
+// sharedGroup is the distinct group two leaves both belong to with exact facts, or null.
+function sharedGroup(left: PNode, right: PNode, sizer: LeafSizer | null): object | null {
+  const ls = left.sizes;
+  const rs = right.sizes;
+  if (sizer === null || ls === undefined || rs === undefined) return null;
+  const group = sizer.factsGroup(ls.facts);
+  if (group === null || group !== sizer.factsGroup(rs.facts)) return null;
+  if (ls.n !== nodeLen(left) || rs.n !== nodeLen(right)) return null;
+  if (sizer.frozen(ls.facts) !== 0 || sizer.frozen(rs.facts) !== 0) return null;
+  return group;
+}
+
 // mergeAt merges children[j] and children[j+1] into one node M (format.md "Delete"): a LEAF merge
 // concatenates the two record lists and the parent separator j is REMOVED (it was a routing copy —
 // nothing comes down); an INTERIOR merge PULLS the separator DOWN between the two key lists (the
@@ -2308,6 +2376,7 @@ function* mergeAtSteps(
       shape,
       null,
       generation,
+      sharedGroup(left, right, shape.sizer),
     );
     // Unreachable: splitting between the two leaves gives two fitting halves. Abandon.
     if (merged.whole === null && merged.more.length > 0) return n;

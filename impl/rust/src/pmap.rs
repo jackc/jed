@@ -40,8 +40,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use crate::catalog::ColType;
 use crate::error::Result;
 use crate::format::{
-    Cap, LazyView, LeafScan, LeafShape, LeafSizes, PackedLeaf, PageRef, SplitFacts, leaf_overhead,
-    leaf_prefix_saving,
+    Cap, DistinctGroup, LazyView, LeafScan, LeafShape, LeafSizes, PackedLeaf, PageRef, SplitFacts,
+    leaf_overhead, leaf_prefix_saving,
 };
 use crate::storage::Row;
 use crate::value::Value;
@@ -1370,6 +1370,10 @@ impl LeafPlan {
 /// The rows are classified and their dictionary columns hashed once ([`LeafScan`]): the whole
 /// leaf's facts, the two-way split point and the halves' facts follow from that scan. Only a leaf
 /// with no two fitting halves builds the per-boundary tables ([`SplitFacts`]).
+///
+/// `group` is set when the rows come from leaves of one distinct group ([`shared_group`]): no
+/// dictionary payload repeats among them, so the scan hashes nothing. The facts handed back carry
+/// the group, or a new one when a full scan found no repeat.
 fn leaf_split_point<'a>(
     weights: &[u32],
     key: &dyn Fn(usize) -> &'a [u8],
@@ -1377,6 +1381,7 @@ fn leaf_split_point<'a>(
     cap: Cap,
     shape: &LeafShape,
     edited: Option<usize>,
+    group: Option<DistinctGroup>,
 ) -> LeafPlan {
     let n = weights.len();
     let plain: usize = weights.iter().map(|&w| w as usize).sum::<usize>() + leaf_overhead(n, shape);
@@ -1388,8 +1393,24 @@ fn leaf_split_point<'a>(
         LeafSizes::measure(shape, cap, hi - lo, &|i| key(lo + i), &|i| row(lo + i)).saving(shape)
     };
     // Measured whole first: a half is measured only for a leaf that does split.
-    let scan = LeafScan::new(shape, cap, n, key, row);
-    let sizes = scan.sizes(shape, row, 0, n);
+    let scan = match group {
+        Some(_) => {
+            if check {
+                assert!(
+                    !LeafScan::new(shape, cap, n, key, row).dups(),
+                    "BUG: a repeated payload in a distinct group"
+                );
+            }
+            LeafScan::distinct(shape, cap, n, key, row)
+        }
+        None => LeafScan::new(shape, cap, n, key, row),
+    };
+    let group = match group {
+        None if !scan.dups() => Some(DistinctGroup::new()),
+        g => g,
+    };
+    let mut sizes = scan.sizes(shape, row, 0, n);
+    sizes.set_group(group);
     if check {
         assert_eq!(
             sizes.saving(shape),
@@ -1416,7 +1437,7 @@ fn leaf_split_point<'a>(
         return LeafPlan {
             split: LeafSplit::Two(m),
             whole: None,
-            halves: leaf_half_sizes(&scan, shape, row, m, n, keep),
+            halves: leaf_half_sizes(&scan, shape, row, m, n, keep, group),
         };
     }
     let facts = SplitFacts::new(shape, cap, n, key, row);
@@ -1440,7 +1461,7 @@ fn leaf_split_point<'a>(
         "BUG: the running split point and the tabled one disagree"
     );
     if let Some(m) = tabled {
-        let halves = leaf_half_sizes(&scan, shape, row, m, n, keep);
+        let halves = leaf_half_sizes(&scan, shape, row, m, n, keep, group);
         if let Some((left, right)) = &halves {
             assert_eq!(
                 (left.saving(shape), right.saving(shape)),
@@ -1470,7 +1491,8 @@ fn leaf_split_point<'a>(
 
 /// The size facts of the halves `[0, m)` and `[m, n)` of a scanned leaf. With no payload repeated
 /// in the leaf none is in a half, so each half's facts are counted without a lookup; otherwise
-/// (or when the shape has nothing to keep) the halves are measured when first needed.
+/// (or when the shape has nothing to keep) the halves are measured when first needed. The halves
+/// are one distinct group (`group`): a later merge of the two hashes nothing.
 fn leaf_half_sizes<'a>(
     scan: &LeafScan<'a>,
     shape: &LeafShape,
@@ -1478,8 +1500,28 @@ fn leaf_half_sizes<'a>(
     m: usize,
     n: usize,
     keep: bool,
+    group: Option<DistinctGroup>,
 ) -> Option<(LeafSizes, LeafSizes)> {
-    (keep && !scan.dups()).then(|| (scan.sizes(shape, row, 0, m), scan.sizes(shape, row, m, n)))
+    (keep && !scan.dups()).then(|| {
+        let mut left = scan.sizes(shape, row, 0, m);
+        let mut right = scan.sizes(shape, row, m, n);
+        left.set_group(group);
+        right.set_group(group);
+        (left, right)
+    })
+}
+
+/// The distinct group two leaves both belong to with exact facts, if any.
+fn shared_group(left: &Node, right: &Node) -> Option<DistinctGroup> {
+    let exact = |node: &Node| {
+        let sizes = node.sizes_lock();
+        let sz = sizes.as_ref()?;
+        (sz.len() == node.len() && sz.frozen() == 0)
+            .then(|| sz.group())
+            .flatten()
+    };
+    let group = exact(left)?;
+    (exact(right)? == group).then_some(group)
 }
 
 /// Build a leaf from its parts; if its payload overflows `cap`, split it 2-way **copy-up**
@@ -1498,7 +1540,15 @@ fn build_leaf(
     shape: &LeafShape,
     edited: Option<usize>,
 ) -> Ins {
-    let plan = leaf_split_point(&weights, &|i| &keys[i], &|i| &vals[i], cap, shape, edited);
+    let plan = leaf_split_point(
+        &weights,
+        &|i| &keys[i],
+        &|i| &vals[i],
+        cap,
+        shape,
+        edited,
+        None,
+    );
     let (m, multi) = match plan.split {
         LeafSplit::Whole => {
             return Ins::Whole(Node::new_leaf_sized(keys, vals, weights, plan.whole));
@@ -2876,7 +2926,8 @@ fn merge_at(
             weights.extend_from_slice(rw);
             let key = |i: usize| -> &[u8] { if i < ln { &lk[i] } else { &rk[i - ln] } };
             let row = |i: usize| -> &[Value] { if i < ln { &lv[i] } else { &rv[i - ln] } };
-            let plan = leaf_split_point(&weights, &key, &row, cap, shape, None);
+            let group = shared_group(&lnode, &rnode);
+            let plan = leaf_split_point(&weights, &key, &row, cap, shape, None, group);
             match plan.split {
                 LeafSplit::Whole => {}
                 // The replacement separator would overflow the parent: abandon the merge — the
@@ -3808,8 +3859,8 @@ mod leaf_sizes_tests {
 
     /// A split or merge classifies its rows once (`LeafScan`): the running split point must equal
     /// the tabled one, and the facts it hands the whole leaf or the halves a fresh measurement.
-    /// Text with no repeated value keeps a dictionary as distinct (the facts are dropped when a row is added);
-    /// text with repeats is counted into a set.
+    /// Text with no repeated value keeps a dictionary as distinct (the facts are dropped when a row
+    /// is added); text with repeats is counted into a set.
     #[test]
     fn scanned_leaf_facts_and_running_split_match_the_tables() {
         leaf_sizes_check::set(true);
@@ -3836,6 +3887,17 @@ mod leaf_sizes_tests {
                  FROM generate_series(8001, 12000) AS g(x)",
                 "DELETE FROM u WHERE id % 2 = 0",
                 "DELETE FROM u",
+                // Range deletes merge a leaf with its sibling again and again. With no repeated
+                // text the leaves of each merge are one distinct group: with a packed array the
+                // rows are classified but not hashed, without one they are not classified.
+                "INSERT INTO u SELECT x, 'name-' || x, 'tag-' || x, x % 50, ARRAY[x % 4] \
+                 FROM generate_series(1, 8000) AS g(x)",
+                "DELETE FROM u WHERE id BETWEEN 500 AND 6500",
+                "CREATE TABLE v (id bigint PRIMARY KEY, name text, tag text, n bigint)",
+                "INSERT INTO v SELECT x, 'name-' || x, CASE WHEN x % 9 = 0 THEN NULL \
+                 ELSE 'tag-' || x END, x % 50 FROM generate_series(1, 8000) AS g(x)",
+                "DELETE FROM v WHERE id BETWEEN 500 AND 6500",
+                "DELETE FROM v WHERE id > 7000",
             ];
             for sql in steps {
                 s.execute(sql, &[])

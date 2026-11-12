@@ -567,8 +567,26 @@ type leafSizes struct {
 	items2                []dictItem // scratch
 	// distinct says some column's dictionary is kept as distinct (dictAcc.distinct): the facts are
 	// dropped before a row is added.
-	distinct          bool
+	distinct bool
+	// group, when set, says no dictionary payload repeats among the rows of the leaves that share
+	// it: the halves of one split, or a merge of those. Rows only leave such a leaf (facts with a
+	// distinct dictionary are dropped before one is added), so the claim holds while the facts do.
+	group             *distinctGroup
 	redoFor, redoItem []int // columns replaceCols leaves for remeasure
+}
+
+// distinctGroup identifies a set of leaves with no repeated dictionary payload among them
+// (leafSizes.group). It has a size so that two groups never share an address.
+type distinctGroup struct{ _ byte }
+
+// hasItemArr reports whether any item column is a typed array.
+func (shape leafShape) hasItemArr() bool {
+	for _, w := range shape.itemArr {
+		if w != 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // allRowItems classifies every row (items[i][j] is row i's item for shape.itemCols[j]); nil when the
@@ -745,7 +763,7 @@ func leafSizesScanned(shape leafShape, rows []storedRow, items [][]dictItem, sca
 			if !scans[j].dups {
 				d.distinct, sz.distinct = true, true
 				for i := lo; i < hi; i++ {
-					if items[i][j].kind == dictNull {
+					if (items == nil && rows[i][c].IsNull()) || (items != nil && items[i][j].kind == dictNull) {
 						d.nulls++
 					} else {
 						d.d++

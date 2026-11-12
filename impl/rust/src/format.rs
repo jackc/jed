@@ -185,7 +185,8 @@ use leaf_compact::{
     span_item, string_payload,
 };
 pub(crate) use leaf_compact::{
-    LeafScan, LeafShape, LeafSizes, SplitFacts, index_shape, leaf_overhead, leaf_prefix_saving,
+    DistinctGroup, LeafScan, LeafShape, LeafSizes, SplitFacts, index_shape, leaf_overhead,
+    leaf_prefix_saving,
 };
 #[cfg(test)]
 pub(crate) use leaf_lazy::leaf_patch_check;

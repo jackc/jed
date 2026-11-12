@@ -12,6 +12,7 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::{
     Cap, ColType, Disp, ScalarType, Unfetched, Value, all_inline_size, fixed_value_width,
@@ -721,6 +722,23 @@ pub(crate) struct LeafSizes {
     /// Some column's dictionary is kept as distinct ([`LeafScan::sizes`]): the facts are dropped
     /// before a row is added.
     distinct: bool,
+    /// When set, no dictionary payload repeats among the rows of the leaves that share it: the
+    /// halves of one split, or a merge of those. Rows only leave such a leaf (facts with a distinct
+    /// dictionary are dropped before one is added), so the claim holds while the facts do.
+    group: Option<DistinctGroup>,
+}
+
+/// Identifies a set of leaves with no repeated dictionary payload among them
+/// ([`LeafSizes::group`]). Never stored: it only says which kept facts were measured together.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct DistinctGroup(u64);
+
+impl DistinctGroup {
+    /// A group no other leaf belongs to.
+    pub(crate) fn new() -> DistinctGroup {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        DistinctGroup(NEXT.fetch_add(1, Ordering::Relaxed))
+    }
 }
 
 impl LeafSizes {
@@ -740,7 +758,17 @@ impl LeafSizes {
             item_save: vec![0; items],
             frozen: 0,
             distinct: false,
+            group: None,
         }
+    }
+
+    /// The distinct group the leaf belongs to, if any.
+    pub(crate) fn group(&self) -> Option<DistinctGroup> {
+        self.group
+    }
+
+    pub(crate) fn set_group(&mut self, group: Option<DistinctGroup>) {
+        self.group = group;
     }
 
     /// Whether some dictionary is kept as distinct: such facts cannot take a row, so the writer
@@ -1045,19 +1073,33 @@ impl<'a, 'k> SplitFacts<'a, 'k> {
 }
 
 /// One dictionary column's values by row, from one pass over a leaf: whether each shared value is
-/// the first, and the last, of its payload. `dups` says some payload repeats.
+/// the first, and the last, of its payload. `dups` says some payload repeats. A scan of a distinct
+/// group has no flags: nothing repeats.
 struct DictScan {
     first: Vec<bool>,
     last: Vec<bool>,
     dups: bool,
 }
 
+impl DictScan {
+    /// Whether row `i`'s shared value repeats none already in a half growing up from the first
+    /// record (`up`) or down from the last: it is the first of its payload, or the last.
+    fn fresh(&self, i: usize, up: bool) -> bool {
+        if self.first.is_empty() {
+            return true;
+        }
+        if up { self.first[i] } else { self.last[i] }
+    }
+}
+
 /// A leaf's rows classified once, with every dictionary column scanned: the whole leaf's size
 /// facts, the two-way split point and each half's facts all come from it with no further hashing.
 pub(crate) struct LeafScan<'a> {
     n: usize,
-    /// `items[i·J + j]` is record `i`'s item for item column `j`.
+    /// `items[i·J + j]` is record `i`'s item for item column `j`. Empty when the rows were not
+    /// classified ([`distinct`](Self::distinct)).
     items: Vec<Item<'a>>,
+    classified: bool,
     /// Per item column; `None` for a packed-array column.
     dicts: Vec<Option<DictScan>>,
     dups: bool,
@@ -1111,8 +1153,48 @@ impl<'a> LeafScan<'a> {
         LeafScan {
             n,
             items,
+            classified: true,
             dicts,
             dups,
+        }
+    }
+
+    /// The scan of rows that come from leaves of one distinct group: no dictionary payload
+    /// repeats, so nothing is hashed, and with no packed-array column no row is classified (a
+    /// dictionary value is NULL or its own entry).
+    pub(crate) fn distinct(
+        shape: &LeafShape,
+        cap: Cap,
+        n: usize,
+        key: &dyn Fn(usize) -> &'a [u8],
+        row: &dyn Fn(usize) -> &'a [Value],
+    ) -> LeafScan<'a> {
+        let cols = shape.item_cols.len();
+        let classified = shape.item_cols.iter().any(|ic| ic.arr_w != 0);
+        let mut items: Vec<Item<'a>> = Vec::new();
+        if classified {
+            items.reserve(n * cols);
+            for i in 0..n {
+                row_items(shape, cap, key(i), row(i), &mut items);
+            }
+        }
+        let dicts = shape
+            .item_cols
+            .iter()
+            .map(|ic| {
+                (ic.arr_w == 0).then(|| DictScan {
+                    first: Vec::new(),
+                    last: Vec::new(),
+                    dups: false,
+                })
+            })
+            .collect();
+        LeafScan {
+            n,
+            items,
+            classified,
+            dicts,
+            dups: false,
         }
     }
 
@@ -1147,6 +1229,7 @@ impl<'a> LeafScan<'a> {
         let mut distinct = false;
         for (j, ic) in shape.item_cols.iter().enumerate() {
             let acc = &mut sz.accs[j];
+            // Read only for classified rows.
             let col = (lo..hi).map(|i| &self.items[i * cols + j]);
             match &self.dicts[j] {
                 None => col.for_each(|it| acc.f.arr.add(it, ic.arr_w)),
@@ -1154,12 +1237,14 @@ impl<'a> LeafScan<'a> {
                     let d = &mut acc.dict;
                     d.distinct = true;
                     distinct = true;
-                    for it in col {
-                        match it {
-                            Item::Null => d.nulls += 1,
-                            _ => d.d += 1,
-                        }
+                    if self.classified {
+                        d.nulls = col.filter(|it| matches!(it, Item::Null)).count();
+                    } else {
+                        d.nulls = (lo..hi)
+                            .filter(|&i| matches!(row(i)[ic.col], Value::Null))
+                            .count();
                     }
+                    d.d = hi - lo - d.nulls;
                     if d.nulls > 0 {
                         d.d += 1;
                     }
@@ -1184,6 +1269,10 @@ impl<'a> LeafScan<'a> {
     /// `m`, so the passes stop at the first boundary that does not fit; the balanced boundary, when
     /// it lies past the last fitting one, is clamped to it either way. `prefix[m]` is the records'
     /// summed weight over `[0, m)` and `payload` the whole leaf's. `None` when no two halves fit.
+    ///
+    /// The passes are first cut short: the left one stops at the balanced boundary and the right
+    /// half is measured there alone, which gives the same boundary whenever that half fits (it is
+    /// then at or past the lowest fitting boundary). Otherwise the full passes run.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn split_point(
         &self,
@@ -1195,46 +1284,108 @@ impl<'a> LeafScan<'a> {
         payload: usize,
         right_edge: bool,
     ) -> Option<usize> {
+        let passes = |full: bool| {
+            self.split_passes(
+                shape, cap_bytes, key, row, prefix, payload, right_edge, full,
+            )
+        };
+        match passes(false) {
+            SplitPass::Found(m) => m,
+            SplitPass::Full => match passes(true) {
+                SplitPass::Found(m) => m,
+                SplitPass::Full => unreachable!("the full passes decide"),
+            },
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn split_passes(
+        &self,
+        shape: &LeafShape,
+        cap_bytes: usize,
+        key: &dyn Fn(usize) -> &'a [u8],
+        row: &dyn Fn(usize) -> &'a [Value],
+        prefix: &[usize],
+        payload: usize,
+        right_edge: bool,
+        full: bool,
+    ) -> SplitPass {
         let n = self.n;
         let total = prefix[n];
         let mut run = RunningFacts::new(shape);
         let (mut m_max, mut m_balanced) = (None, None);
         for m in 1..n {
             run.add(self, shape, row(m - 1), m - 1, true);
-            let left = prefix[m] + leaf_overhead(m, shape)
-                - leaf_prefix_saving(m, key(0), key(m - 1))
-                - run.saving(shape, m);
+            // A half is no larger than its records and overhead, so a boundary whose bound decides
+            // neither test is not measured.
+            let bound = prefix[m] + leaf_overhead(m, shape);
+            if bound <= cap_bytes && (m_balanced.is_some() || 2 * bound < payload) {
+                m_max = Some(m);
+                continue;
+            }
+            let left = bound - leaf_prefix_saving(m, key(0), key(m - 1)) - run.saving(shape, m);
             if left > cap_bytes {
                 break;
             }
             m_max = Some(m);
             if m_balanced.is_none() && 2 * left >= payload {
                 m_balanced = Some(m);
+                if !right_edge && !full {
+                    break; // the balanced boundary is the answer when the right half fits there
+                }
             }
         }
-        let m_max = m_max?;
+        let Some(m_max) = m_max else {
+            return SplitPass::Found(None);
+        };
         let mut run = RunningFacts::new(shape);
+        let right = |run: &RunningFacts, m: usize| {
+            total - prefix[m] + leaf_overhead(n - m, shape)
+                - leaf_prefix_saving(n - m, key(m), key(n - 1))
+                - run.saving(shape, n - m)
+        };
+        if !full {
+            // The right half is measured once, at the boundary the left pass chose. It fits there
+            // in all but rare leaves; the full passes serve those.
+            let m = match m_balanced {
+                Some(m) if !right_edge => m,
+                _ => m_max,
+            };
+            for i in (m..n).rev() {
+                run.add(self, shape, row(i), i, false);
+            }
+            if right(&run, m) <= cap_bytes {
+                return SplitPass::Found(Some(m));
+            }
+            return SplitPass::Full;
+        }
         let mut m_min = None;
         for m in (1..n).rev() {
             run.add(self, shape, row(m), m, false);
-            let right = total - prefix[m] + leaf_overhead(n - m, shape)
-                - leaf_prefix_saving(n - m, key(m), key(n - 1))
-                - run.saving(shape, n - m);
-            if right > cap_bytes {
+            if right(&run, m) > cap_bytes {
                 break;
             }
             m_min = Some(m);
         }
-        let m_min = m_min?;
+        let Some(m_min) = m_min else {
+            return SplitPass::Found(None);
+        };
         if m_min > m_max {
-            return None;
+            return SplitPass::Found(None);
         }
         let m = match m_balanced {
             Some(m) if !right_edge => m,
             _ => m_max,
         };
-        Some(m.max(m_min))
+        SplitPass::Found(Some(m.max(m_min)))
     }
+}
+
+/// What one run of [`LeafScan::split_point`]'s passes says: the answer, or (from the short passes)
+/// that the full ones must decide.
+enum SplitPass {
+    Found(Option<usize>),
+    Full,
 }
 
 /// The content facts of a half that grows by one record at a time ([`LeafScan::split_point`]).
@@ -1265,8 +1416,18 @@ impl RunningFacts {
         }
         let cols = shape.item_cols.len();
         for (j, ic) in shape.item_cols.iter().enumerate() {
-            let it = &scan.items[i * cols + j];
             let f = &mut self.facts[j];
+            if !scan.classified {
+                // A distinct group with no array column: a value is NULL or its own entry.
+                if !matches!(row[ic.col], Value::Null) {
+                    f.d += 1;
+                } else if !self.nulls[j] {
+                    self.nulls[j] = true;
+                    f.d += 1;
+                }
+                continue;
+            }
+            let it = &scan.items[i * cols + j];
             let Some(sc) = &scan.dicts[j] else {
                 f.arr.add(it, ic.arr_w);
                 continue;
@@ -1282,8 +1443,7 @@ impl RunningFacts {
                 Item::Shared(p) => {
                     // A value repeats one already in the half exactly when it is not the first of
                     // its payload (growing up) or not the last (growing down).
-                    let fresh = if up { sc.first[i] } else { sc.last[i] };
-                    if fresh {
+                    if sc.fresh(i, up) {
                         f.d += 1;
                     } else {
                         f.dup += 1 + p.len(); // the span: its tag and content

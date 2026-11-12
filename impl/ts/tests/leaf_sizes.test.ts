@@ -61,6 +61,10 @@ test("leaf size facts follow merges and splits", () => {
       `INSERT INTO d SELECT x, 0,
         CASE WHEN x % 10 = 0 THEN repeat('long-', 20) || x ELSE 'note-' || x END,
         CASE WHEN x % 4 = 0 THEN 'opt-' || x END FROM generate_series(1, 8000) AS g(x)`,
+      // da is d with a packed-array column: its merged leaves hash nothing but classify their rows.
+      "CREATE TABLE da (id bigint PRIMARY KEY, note text, arr bigint[])",
+      `INSERT INTO da SELECT x, 'note-' || x, ARRAY[x, x + 1, x % 7]
+        FROM generate_series(1, 6000) AS g(x)`,
     ]);
     const steps = [
       "DELETE FROM u WHERE id BETWEEN 2000 AND 9000", // merges, then splits of the merged leaves
@@ -92,12 +96,19 @@ test("leaf size facts follow merges and splits", () => {
       "UPDATE d SET note = 'same' WHERE id BETWEEN 6000 AND 6200",
       "DELETE FROM d WHERE id BETWEEN 5500 AND 7000",
       "COMMIT",
+      "BEGIN",
+      "DELETE FROM da WHERE id BETWEEN 1000 AND 4000", // merges within one distinct group
+      "DELETE FROM da WHERE id % 3 = 0",
+      "COMMIT",
     ];
     for (const sql of steps) db.execute(sql);
     assert.deepEqual(
       query(db, "SELECT count(*), sum(n), count(DISTINCT note), count(DISTINCT opt) FROM d"),
       [["2601", "1803", "2601", "734"]],
     );
+    assert.deepEqual(query(db, "SELECT count(*), count(DISTINCT note) FROM da"), [
+      ["1999", "1999"],
+    ]);
     assert.deepEqual(
       query(db, "SELECT count(*), sum(n), count(DISTINCT note), count(DISTINCT tag) FROM u"),
       [["2966", "1439", "2966", "5"]],
