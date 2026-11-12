@@ -619,6 +619,23 @@ type colType struct {
 	// Composite discriminates: false ⇒ a scalar (Scalar is meaningful); true ⇒ a composite
 	// (Name/Fields are meaningful).
 	Composite bool
+	// The small fields below share Composite's word, which keeps the struct at 80 bytes. At 88 a
+	// by-value copy of a copy ends in an overlapping 16-byte move that the processor cannot forward
+	// from the store before it, and every per-value type check in a scan paid for it.
+	// DecSlot is the slot width in bytes (2, 4, or 8) when this is a TABLE COLUMN declared
+	// numeric(p,s) with p <= 18 (spec/fileformat/format.md v51, spec/design/decimal.md §6a), else 0:
+	// the column's leaf slot is the value's unscaled integer at the fixed display scale DecScale,
+	// instead of the variable-width decimal codec. Scalar stays scalarDecimal, so it is a decimal
+	// everywhere but the leaf slot — keys, comparison, coercion, and rendering are the scalar's. Set
+	// only by storeColType for a top-level column; a decimal field, element, or range bound never
+	// carries it.
+	DecSlot uint8
+	// DecScale is the display scale a DecSlot column's slot is read at (meaningful only then).
+	DecScale uint16
+	// keyAt, when nonzero, says this table column is a primary-key member whose value is recoverable
+	// from the row's storage key: its key bytes start at offset keyAt−1 (PROTOTYPE, leaf_narrow.go).
+	// Set only on a table store's column types (markKeyColumns); it is not part of the type.
+	keyAt uint16
 	// Scalar is the inner scalar type when Composite == false && Elem == nil.
 	Scalar scalarType
 	// Name is the (original-case) composite type name when Composite == true, used in
@@ -635,20 +652,6 @@ type colType struct {
 	// The codec reads the element scalar for the bound bodies; the range descriptor (discreteness) is
 	// re-derived from the element via rangeForElement.
 	RangeElem *colType
-	// DecSlot is the slot width in bytes (2, 4, or 8) when this is a TABLE COLUMN declared
-	// numeric(p,s) with p <= 18 (spec/fileformat/format.md v51, spec/design/decimal.md §6a), else 0:
-	// the column's leaf slot is the value's unscaled integer at the fixed display scale DecScale,
-	// instead of the variable-width decimal codec. Scalar stays scalarDecimal, so it is a decimal
-	// everywhere but the leaf slot — keys, comparison, coercion, and rendering are the scalar's. Set
-	// only by storeColType for a top-level column; a decimal field, element, or range bound never
-	// carries it.
-	DecSlot uint8
-	// DecScale is the display scale a DecSlot column's slot is read at (meaningful only then).
-	DecScale uint16
-	// keyAt, when nonzero, says this table column is a primary-key member whose value is recoverable
-	// from the row's storage key: its key bytes start at offset keyAt−1 (PROTOTYPE, leaf_narrow.go).
-	// Set only on a table store's column types (markKeyColumns); it is not part of the type.
-	keyAt uint16
 	// sym, when set, is this table column's symbol table (PROTOTYPE, leaf_sym.go: JED_LEAF_SYM=column):
 	// one table for every leaf of the table, trained once and persisted in the table's catalog entry.
 	// Like keyAt it is set only on a table store's column types and is not part of the type.

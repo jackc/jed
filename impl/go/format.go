@@ -6542,6 +6542,10 @@ func (p *packedLeaf) valueResolved(c, i int) (Value, error) {
 		pos = 1
 		return readInlineBody(ty, vb, &pos, decodeConstruct)
 	}
+	if len(vb) > 0 && vb[0] == tagInlineBare && stringPayload(ty) {
+		// An inline string stored without its length: the rest of the span is its payload.
+		return valueFromPayload(ty, vb[1:])
+	}
 	v, err := readValueLazy(p.colTypes, c, vb, &pos, p.cap, p.paging)
 	if err != nil || v.Kind != ValUnfetched {
 		return v, err
