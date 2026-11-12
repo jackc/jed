@@ -363,7 +363,7 @@ impl Engine {
     /// The view a relation reference that is not a CTE names, if any (§4): a built-in catalog
     /// relation, then a table (session-local temp first for a bare name), then a view. Only bare and
     /// `main.` names reach a view; another qualifier never does (§10).
-    fn relation_view(&self, db: Option<&str>, name: &str) -> Option<&ViewDef> {
+    pub(crate) fn relation_view(&self, db: Option<&str>, name: &str) -> Option<&ViewDef> {
         let (view, shadowed) = match db {
             None => (self.visible_view(name)?, self.table(name).is_some()),
             Some("main") => (

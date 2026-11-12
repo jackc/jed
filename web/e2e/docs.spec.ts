@@ -263,6 +263,14 @@ test('the types page autoruns the row_to_json demo', async ({ page }) => {
   await expect(rows).toContainText('{"f1":"2024-01-15T10:30:00"}');
 });
 
+test('the types page autoruns the whole-row demo', async ({ page }) => {
+  await page.goto('/docs/sql/types/');
+  // A derived table's alias is its whole row, keyed by its column names.
+  const rows = livePanel(page, 'wholeRowDemo').getByTestId('result-rows');
+  await expect(rows).toContainText('{"id":1,"name":"pen"}');
+  await expect(rows).toContainText('{"id":2,"name":"ink"}');
+});
+
 test('the types page autoruns the to_json demo', async ({ page }) => {
   await page.goto('/docs/sql/types/');
   // A jsonb object sorts its keys; arrays nest; a date key and value take the ISO 8601 form.

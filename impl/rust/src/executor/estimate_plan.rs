@@ -258,6 +258,8 @@ impl Engine {
             cte: None,
             db: rel.db.clone(),
             layer: None,
+            nullable: false,
+            row_names: None,
         })
     }
 
@@ -1417,6 +1419,8 @@ impl Engine {
             cte: None,
             db: db.map(str::to_owned),
             layer: None,
+            nullable: false,
+            row_names: None,
         };
         let contradiction = where_contradicts(filter);
         let mutation = self.plan_mutation_scan(db, table, filter, contradiction);
@@ -1531,6 +1535,8 @@ impl Engine {
                 cte: None,
                 db: db.map(str::to_owned),
                 layer: None,
+                nullable: false,
+                row_names: None,
             };
             // Each key's width is its target column's: the type's fixed width, else the column's
             // analyzed average width, else the default variable-width key (§8.4).

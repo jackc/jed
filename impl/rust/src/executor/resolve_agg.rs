@@ -60,6 +60,10 @@ pub(crate) fn resolve_group_named(
             Err(e) if e.state == SqlState::UndefinedColumn => {
                 match order_alias_match(items, name, scope)? {
                     Some(aexpr) => resolve_group_expr(scope, aexpr, params),
+                    // A whole-row reference groups by the record value (grammar.md §15).
+                    None if scope.is_record_whole_row(name) => {
+                        resolve_group_expr(scope, term, params)
+                    }
                     None => Err(e),
                 }
             }
@@ -89,11 +93,14 @@ pub(crate) fn resolve_group_expr(
     params: &mut ParamTypes,
 ) -> Result<GroupKeyResolved> {
     match e {
-        Expr::Column(name, pos) => {
-            if let Resolved::Local(idx) = scope.resolve_bare_at(name, *pos)? {
-                return Ok(GroupKeyResolved::Column(idx));
+        Expr::Column(name, pos) => match scope.resolve_bare_at(name, *pos) {
+            Ok(Resolved::Local(idx)) => return Ok(GroupKeyResolved::Column(idx)),
+            // A whole-row reference resolves as a general expression below.
+            Err(e) if e.state != SqlState::UndefinedColumn || !scope.is_record_whole_row(name) => {
+                return Err(e);
             }
-        }
+            _ => {}
+        },
         Expr::QualifiedColumn {
             qualifier,
             name,

@@ -252,11 +252,11 @@ null`.
 duplicate keys kept. The `jsonb` builders build the `jsonb` images; `jsonb_build_object` keeps the last of
 duplicate keys. In the `VARIADIC`-array form, each element is converted by the array's element type.
 
-**Whole-row references are not expressible.** PostgreSQL's common `row_to_json(t)` passes a table
-alias as its row. jed has no implicit per-table row type ([composite.md](composite.md) §10.4) and
-no row-valued table reference ([grammar.md](grammar.md) §15). There, `t` resolves as a missing
-column (`42703`). Use a composite column or `ROW(t.a, t.b, …)` instead. This divergence is
-recorded in the override ledger.
+**Whole-row references.** PostgreSQL's common `row_to_json(t)` passes a relation's whole row, and so
+does jed. The bare label `t` is an anonymous record of `t`'s columns, whose fields carry the column
+names, so each member is keyed by its column ([grammar.md](grammar.md) §15 "Whole-row
+references"). On a row an outer join NULL-extends, the reference is NULL, so `row_to_json` is
+NULL.
 
 **Floats take PostgreSQL's exact text.** A float source, element, field, key, or aggregate input is
 written as PostgreSQL's `float8out` (`float4out` for an `f32`) text at `extra_float_digits = 1`:

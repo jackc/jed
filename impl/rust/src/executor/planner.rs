@@ -132,6 +132,8 @@ impl Engine {
         let shares_parent_level = parent.is_some_and(|p| p.lateral_view.is_some());
         for (i, tref) in from_items.iter().enumerate() {
             outline(|| -> Result<()> {
+                // A renamed base table's catalog column names (its whole-row field names).
+                let mut base_row_names: Option<Vec<String>> = None;
                 let is_derived = tref.subquery.is_some() || tref.values.is_some();
                 // A FROM item is lateral-ELIGIBLE when it can see earlier siblings: a derived table /
                 // VALUES body explicitly marked `LATERAL`, or ANY table function (implicitly lateral —
@@ -343,6 +345,13 @@ impl Engine {
                             shaped[i] = shape_bodies && tref.subquery.is_some() && !lateral;
                             lateral_flags.push(lateral);
                             let label = tref.alias.clone().unwrap_or_default().to_string();
+                            // A view keeps its stored column names as its whole-row field names,
+                            // under a column alias list on the reference too.
+                            if let Some((_, view_name, _)) = &view_items[i] {
+                                base_row_names = self
+                                    .relation_view(written_items[i].db.as_deref(), view_name)
+                                    .map(|v| v.columns.clone());
+                            }
                             let mut table =
                                 cte_synthetic_table(&label, &plan, tref.column_aliases.as_deref())?;
                             // An unaliased parenthesized join's columns are its inner columns, collation included.
@@ -571,6 +580,9 @@ impl Engine {
                             self.trace_table_item(tref, table)?;
                             src = match &tref.column_aliases {
                                 Some(list) => {
+                                    base_row_names = Some(
+                                        table.columns.iter().map(|c| c.name.clone()).collect(),
+                                    );
                                     synthetic.push(renamed_base_table(table, tref, list)?);
                                     RelSrc::BaseRenamed(synthetic.len() - 1)
                                 }
@@ -675,6 +687,13 @@ impl Engine {
                                     self.trace_table_item(tref, table)?;
                                     match &tref.column_aliases {
                                         Some(list) => {
+                                            base_row_names = Some(
+                                                table
+                                                    .columns
+                                                    .iter()
+                                                    .map(|c| c.name.clone())
+                                                    .collect(),
+                                            );
                                             synthetic.push(renamed_base_table(table, tref, list)?);
                                             RelSrc::BaseRenamed(synthetic.len() - 1)
                                         }
@@ -731,13 +750,32 @@ impl Engine {
                             ));
                         }
                     }
+                    // A base table or view keeps its catalog names as its whole-row field names
+                    // under a column alias list (grammar.md §15 "Whole-row references").
+                    let row_names = base_row_names.take();
                     finalized.push(FinalRel {
                         label,
                         offset,
                         src,
                         db: tref.db.clone(),
                         view: view_items[i].as_ref().map(|(_, name, _)| name.clone()),
+                        nullable: false,
+                        row_names,
                     });
+                    // The join attaching this item NULL-extends the relations it names (the left-deep
+                    // rule rewrite.rs's pushdown uses): its own item for LEFT/FULL, every earlier one
+                    // for RIGHT/FULL.
+                    if i > 0 {
+                        let kind = sel.joins[i - 1].kind;
+                        if matches!(kind, JoinKind::Left | JoinKind::Full) {
+                            finalized[i].nullable = true;
+                        }
+                        if matches!(kind, JoinKind::Right | JoinKind::Full) {
+                            for fr in finalized.iter_mut().take(i) {
+                                fr.nullable = true;
+                            }
+                        }
+                    }
                     offset += col_count;
                     Ok(())
                 })
@@ -760,6 +798,8 @@ impl Engine {
                     cte: fr.src.cte(),
                     db: fr.db.clone(),
                     layer: None,
+                    nullable: fr.nullable,
+                    row_names: fr.row_names.clone(),
                 })
                 .collect();
 
@@ -971,6 +1011,8 @@ impl Engine {
                                     cte: None,
                                     db: None,
                                     layer: None,
+                                    nullable: false,
+                                    row_names: None,
                                 })
                                 .collect(),
                             parent: None,
@@ -1495,6 +1537,16 @@ impl Engine {
                 distinct_on_effective = effective;
                 &distinct_on_effective
             };
+            // A key naming a whole-row reference sorts by that record's value (grammar.md §15).
+            let whole_row_effective;
+            let order_by_ref: &[OrderKey] =
+                match whole_row_order_keys(order_by_ref, items_ref, &scope)? {
+                    Some(keys) => {
+                        whole_row_effective = keys;
+                        &whole_row_effective
+                    }
+                    None => order_by_ref,
+                };
             let mut order: Vec<SortKey> = Vec::with_capacity(order_by_ref.len());
             let mut order_exprs: Vec<RExpr> = Vec::new();
             for (key_index, key) in order_by_ref.iter().enumerate() {
@@ -2814,4 +2866,44 @@ pub(crate) fn distinct_on_order(
         prefix += 1;
     }
     Ok((effective, prefix))
+}
+
+/// The ORDER BY keys with each whole-row reference key rewritten as an expression key, or `None`
+/// when there is none: a bare key that names no output column and no input column but a relation
+/// (`ORDER BY t`), or an ordinal at a whole-row select item (`SELECT t … ORDER BY 1`). Such a key
+/// sorts by the record value, as in PostgreSQL.
+fn whole_row_order_keys(
+    keys: &[OrderKey],
+    items: &SelectItems,
+    scope: &Scope,
+) -> Result<Option<Vec<OrderKey>>> {
+    let mut out: Option<Vec<OrderKey>> = None;
+    for (k, key) in keys.iter().enumerate() {
+        let name = if let Some(ord) = key.ordinal {
+            match items {
+                SelectItems::Items(its) if ord >= 1 && (ord as usize) <= its.len() => {
+                    match &its[ord as usize - 1].expr {
+                        Expr::Column(name, _) => name.clone(),
+                        _ => continue,
+                    }
+                }
+                _ => continue,
+            }
+        } else if key.expr.is_none() && key.qualifier.is_none() {
+            match order_alias_match(items, &key.column, scope)? {
+                Some(Expr::Column(name, _)) => name.clone(),
+                Some(_) => continue,
+                None => key.column.clone(),
+            }
+        } else {
+            continue;
+        };
+        if !scope.is_record_whole_row(&name) {
+            continue;
+        }
+        let keys = out.get_or_insert_with(|| keys.to_vec());
+        keys[k].ordinal = None;
+        keys[k].expr = Some(Expr::Column(name, key.pos));
+    }
+    Ok(out)
 }

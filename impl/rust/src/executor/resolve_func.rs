@@ -4628,6 +4628,54 @@ pub(crate) fn resolved_type_of(ty: ScalarType) -> ResolvedType {
     }
 }
 
+/// A record whole-row reference (spec/design/grammar.md §15 "Whole-row references"): `ROW(…)` over
+/// the relation's columns, typed as an anonymous record whose fields carry the column names — so
+/// `row_to_json(t)` keys its members by them — and NULL where `presence` (a NOT NULL column) is NULL,
+/// a NULL-extended row. `e` is the whole expression: a `GROUP BY t` key it matches reads that slot.
+pub(crate) fn resolve_whole_row_record(
+    scope: &Scope,
+    agg: &AggCtx,
+    e: &Expr,
+    fields: Vec<(String, Resolved)>,
+    presence: Option<Resolved>,
+) -> Result<(RExpr, ResolvedType)> {
+    if let Some((slot, ty)) = match_group_expr(agg, e) {
+        return Ok((RExpr::Column(slot), ty));
+    }
+    let mut nodes = Vec::with_capacity(fields.len());
+    let mut types = Vec::with_capacity(fields.len());
+    for (field, r) in fields {
+        let column = scope.column_of(r).name.clone();
+        let (node, ty) = resolve_column_ref(scope, agg, r, &column)?;
+        nodes.push(node);
+        types.push((field, ty));
+    }
+    let ty = ResolvedType::Composite(Box::new(CompositeRType {
+        name: None,
+        fields: types,
+    }));
+    let row = RExpr::Row(nodes);
+    let Some(p) = presence else {
+        return Ok((row, ty));
+    };
+    let column = scope.column_of(p).name.clone();
+    let (test, _) = resolve_column_ref(scope, agg, p, &column)?;
+    Ok((
+        RExpr::Case {
+            arms: vec![(
+                RExpr::IsNull {
+                    operand: Box::new(test),
+                    negated: false,
+                },
+                RExpr::ConstNull,
+            )],
+            els: Box::new(row),
+            coerce_decimal: false,
+        },
+        ty,
+    ))
+}
+
 /// Resolve one `Expr` into an `RExpr` plus its static type, against the FROM `scope`. `ctx`
 /// is the type an untyped integer literal should adapt to (spec/design/types.md §6); `None`
 /// defaults a bare literal to i64. A column reference resolves to a flat row index via the
@@ -5324,7 +5372,19 @@ fn resolve_node(
             // Resolve against the scope CHAIN (§26). Existence first (42703/42702 take priority,
             // matching PostgreSQL); a Local match then obeys the grouping rule, an Outer
             // (correlated) match is a per-outer-row constant exempt from it (see helper).
-            let r = scope.resolve_bare_at(name, *pos)?;
+            let r = match scope.resolve_bare_at(name, *pos) {
+                Err(missing) if missing.state == SqlState::UndefinedColumn => {
+                    return match scope.resolve_whole_row(name) {
+                        Some(Ok(WholeRow::Record { fields, presence })) => {
+                            resolve_whole_row_record(scope, agg, e, fields, presence)
+                        }
+                        Some(Ok(WholeRow::Scalar(r))) => resolve_column_ref(scope, agg, r, name),
+                        Some(Err(err)) => Err(err),
+                        None => Err(missing),
+                    };
+                }
+                r => r?,
+            };
             resolve_column_ref(scope, agg, r, name)
         }),
         Expr::QualifiedColumn {

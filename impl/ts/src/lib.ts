@@ -207,6 +207,7 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   "func.json_builders",
   // row_to_json(record [, pretty]) — a composite as a json object (json-sql-functions.md §2.2).
   "func.row_to_json",
+  "query.whole_row",
   // jsonb_set / jsonb_insert (json-sql-functions.md §2) — the jsonb path-mutation builders, resolved
   // by name (not in the catalog): a text[] path of object keys / array indices, STRICT.
   "func.json_set",

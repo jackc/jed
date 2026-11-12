@@ -176,6 +176,8 @@ fn source_rel<'a>(table: &'a Table, label: &str, offset: usize) -> ScopeRel<'a> 
         cte: None,
         db: None,
         layer: None,
+        nullable: false,
+        row_names: None,
     }
 }
 
@@ -197,6 +199,8 @@ fn version_rel<'a>(
         cte: None,
         db: None,
         layer: vw.map(|vw| &vw.top),
+        nullable: false,
+        row_names: None,
     }
 }
 

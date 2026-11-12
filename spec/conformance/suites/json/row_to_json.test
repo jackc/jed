@@ -5,10 +5,10 @@
 # number stays exact, text → an escaped string, a json field verbatim, a jsonb field its canonical
 # text, an array → a JSON array of any dimensionality, a nested composite → a nested object, a datetime
 # → its ISO 8601 string, every other type → the string of its text output). pretty = true puts each
-# TOP-LEVEL member after the first on its own line (",\n "); nested values never break. STRICT. jed has
-# no whole-row table reference, so PostgreSQL's common row_to_json(t) is not expressible (ledgered).
+# TOP-LEVEL member after the first on its own line (",\n "); nested values never break. STRICT. A
+# table alias passes its whole row (query/whole_row.test).
 # Output matches the postgres:18 oracle. Format: ../../../design/conformance.md.
-# requires: ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.index_expr, dml.insert, dml.insert_multi_row, query.select, query.select_no_from, query.order_by, types.composite, types.array, types.json, types.jsonb, types.jsonpath, types.i32, types.i64, types.text, types.boolean, types.decimal, types.f64, types.date, types.timestamp, types.timestamptz, types.interval, types.uuid, types.bytea, types.range, func.range_constructors, cast.explicit, cast.operator, session.timezone, func.row_to_json
+# requires: ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.index_expr, dml.insert, dml.insert_multi_row, query.select, query.select_no_from, query.order_by, types.composite, types.array, types.json, types.jsonb, types.jsonpath, types.i32, types.i64, types.text, types.boolean, types.decimal, types.f64, types.date, types.timestamp, types.timestamptz, types.interval, types.uuid, types.bytea, types.range, func.range_constructors, cast.explicit, cast.operator, session.timezone, func.row_to_json, query.whole_row
 
 # load-timezone: Asia/Kolkata
 # load-timezone: America/New_York
@@ -224,9 +224,10 @@ CREATE TABLE stamps (id i32 PRIMARY KEY, s stamp)
 statement error 42P17
 CREATE INDEX stamps_json ON stamps ((row_to_json(s)::text))
 
-# --- Deliberate divergences (ledgered in oracle_overrides.toml) ---
-
-# jed has no implicit per-table row type and no whole-row table reference (composite.md §10.4,
-# grammar.md §15), so a table alias is not a value: 42703. PostgreSQL passes the whole row.
-statement error 42703
-SELECT row_to_json(p) FROM person p
+# A whole-row reference: the table alias is its row, keyed by the column names (grammar.md §15).
+query T nosort
+SELECT row_to_json(p) FROM person p ORDER BY id
+----
+{"id":1,"home":{"street":"Main","zip":90210}}
+{"id":2,"home":{"street":null,"zip":null}}
+{"id":3,"home":null}

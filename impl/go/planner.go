@@ -118,6 +118,9 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 		// base is whether this relation is a catalog base table (possibly under a column alias list);
 		// a traced view body records the columns resolved against it (views.md §6).
 		base := false
+		// rowNames are a renamed base table's catalog column names, or a view's own column names (its
+		// whole-row field names — grammar.md §15 "Whole-row references"); nil = the exposed names.
+		var rowNames []string
 		isDerived := tref.Subquery != nil || tref.Values != nil
 		// A FROM item is lateral-ELIGIBLE when it can see earlier siblings: a derived table / VALUES
 		// body explicitly marked LATERAL, or ANY table function (implicitly lateral — §44). The first
@@ -285,6 +288,13 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 			if tref.Alias != nil {
 				label = *tref.Alias
 			}
+			// A view keeps its own column names as its whole-row field names: its definition's, under a
+			// column alias list on the reference too.
+			if viewNames[i] != "" {
+				if v := db.relationView(writtenRefs[i].DB, viewNames[i]); v != nil {
+					rowNames = append([]string(nil), v.Columns...)
+				}
+			}
 			tbl, terr := cteSyntheticTable(label, &plan, tref.ColumnAliases)
 			if terr != nil {
 				return nil, terr
@@ -419,6 +429,7 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 				}
 				base = true
 				if tref.ColumnAliases != nil {
+					rowNames = catalogColumnNames(tbl)
 					var rerr error
 					if tbl, rerr = renamedBaseTable(tbl, &tref, tref.ColumnAliases); rerr != nil {
 						return nil, rerr
@@ -503,6 +514,7 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 				// A column alias list relabels the table's columns (grammar.md §15): a copy read
 				// from the table's own store.
 				if tref.ColumnAliases != nil {
+					rowNames = catalogColumnNames(tbl)
 					var rerr error
 					if tbl, rerr = renamedBaseTable(tbl, &tref, tref.ColumnAliases); rerr != nil {
 						return nil, rerr
@@ -549,7 +561,20 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 			}
 			seenLabels[label] = true
 		}
-		rels = append(rels, scopeRel{label: label, table: t, offset: offset, cte: cteIdx, db: tref.DB, base: base, view: viewNames[i]})
+		rels = append(rels, scopeRel{label: label, table: t, offset: offset, cte: cteIdx, db: tref.DB, base: base, view: viewNames[i], rowNames: rowNames})
+		// The join attaching this item NULL-extends the relations it names (the left-deep rule
+		// rewrite.go's pushdown uses): its own item for LEFT/FULL, every earlier one for RIGHT/FULL.
+		if i > 0 {
+			kind := sel.Joins[i-1].Kind
+			if kind == joinLeft || kind == joinFull {
+				rels[i].nullable = true
+			}
+			if kind == joinRight || kind == joinFull {
+				for k := range i {
+					rels[k].nullable = true
+				}
+			}
+		}
 		offset += len(t.Columns)
 	}
 
@@ -1065,6 +1090,12 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 		if err != nil {
 			return nil, err
 		}
+	}
+	// A key naming a whole-row reference sorts by that record's value (grammar.md §15).
+	if keys, rerr := wholeRowOrderKeys(orderBy, items, s); rerr != nil {
+		return nil, rerr
+	} else if keys != nil {
+		orderBy = keys
 	}
 	order := make([]orderSlot, 0, len(orderBy))
 	var orderExprs []*rExpr
@@ -2098,4 +2129,60 @@ func orderJSONError(key orderKey, appendedOn bool) error {
 	}
 	return newError(UndefinedFunction, "could not identify an ordering operator for type json").
 		hinted(hintNoOrderingOperator).withPosition(int32(key.location()))
+}
+
+// catalogColumnNames is a table's column names, in order.
+func catalogColumnNames(t *catTable) []string {
+	names := make([]string, len(t.Columns))
+	for i, c := range t.Columns {
+		names[i] = c.Name
+	}
+	return names
+}
+
+// wholeRowOrderKeys is the ORDER BY keys with each whole-row reference key rewritten as an
+// expression key, or nil when there is none: a bare key that names no output column and no input
+// column but a relation (`ORDER BY t`), or an ordinal at a whole-row select item (`SELECT t … ORDER
+// BY 1`). Such a key sorts by the record value, as in PostgreSQL.
+func wholeRowOrderKeys(keys []orderKey, items selectItems, s *scope) ([]orderKey, error) {
+	var out []orderKey
+	for k, key := range keys {
+		var name string
+		switch {
+		case key.Ordinal != nil:
+			ord := *key.Ordinal
+			if items.All || ord < 1 || ord > int64(len(items.Items)) {
+				continue
+			}
+			e := items.Items[ord-1].Expr
+			if e.Kind != exprColumn {
+				continue
+			}
+			name = e.Column
+		case key.Expr == nil && key.Qualifier == "":
+			matched, err := orderAliasMatch(items, key.Column, s)
+			if err != nil {
+				return nil, err
+			}
+			switch {
+			case matched == nil:
+				name = key.Column
+			case matched.Kind == exprColumn:
+				name = matched.Column
+			default:
+				continue
+			}
+		default:
+			continue
+		}
+		if !s.isRecordWholeRow(name) {
+			continue
+		}
+		if out == nil {
+			out = append([]orderKey(nil), keys...)
+		}
+		out[k].Ordinal = nil
+		out[k].Expr = &exprNode{Kind: exprColumn, Column: name, Pos: key.Pos}
+	}
+	return out, nil
 }

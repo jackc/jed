@@ -52,6 +52,14 @@ pub(crate) struct ScopeRel<'a> {
     /// base column or a read-only select item. `table` stays the base table, so flat indices keep
     /// the base row's layout. `None` for every other relation.
     pub(crate) layer: Option<&'a WriteLayer>,
+    /// Whether an outer join of this relation's FROM may NULL-extend it (spec/design/grammar.md
+    /// §15 "Whole-row references"). A whole-row reference to a NULL-extendable relation is NULL on a
+    /// NULL-extended row, read off one of its NOT NULL columns.
+    pub(crate) nullable: bool,
+    /// The field names of this relation's whole-row value when they differ from the columns it
+    /// exposes: a base table or view under a column alias list keeps its catalog names, as in
+    /// PostgreSQL (its row type is the table's). `None` = the exposed column names.
+    pub(crate) row_names: Option<Vec<String>>,
 }
 
 impl ScopeRel<'_> {
@@ -147,6 +155,10 @@ pub(crate) struct FinalRel<'a> {
     pub(crate) db: Option<String>,
     /// The view this FROM item references, carried into the `ScopeRel` (views.md §8).
     pub(crate) view: Option<String>,
+    /// Set once a later outer join NULL-extends this relation (`ScopeRel::nullable`).
+    pub(crate) nullable: bool,
+    /// The whole-row field names when they differ from the exposed columns (`ScopeRel::row_names`).
+    pub(crate) row_names: Option<Vec<String>>,
 }
 
 impl<'a> FinalRel<'a> {
@@ -197,6 +209,8 @@ pub(crate) fn build_prefix_scope<'s>(
                 cte: None,
                 db: fr.db.clone(),
                 layer: None,
+                nullable: fr.nullable,
+                row_names: fr.row_names.clone(),
             })
             .collect(),
         parent,
@@ -715,6 +729,8 @@ impl<'a> Scope<'a> {
                 cte: None,
                 db: None,
                 layer: None,
+                nullable: false,
+                row_names: None,
             }],
             parent: None,
             catalog,
@@ -784,6 +800,8 @@ impl<'a> Scope<'a> {
             cte: None,
             db: None,
             layer: Some(layer),
+            nullable: false,
+            row_names: None,
         });
         scope
     }
@@ -869,6 +887,8 @@ impl<'a> Scope<'a> {
                     cte: None,
                     db: None,
                     layer,
+                    nullable: false,
+                    row_names: None,
                 });
             }
         }
@@ -887,6 +907,8 @@ impl<'a> Scope<'a> {
                     cte: None,
                     db: None,
                     layer,
+                    nullable: false,
+                    row_names: None,
                 });
             }
         }
@@ -936,6 +958,8 @@ impl<'a> Scope<'a> {
             cte: None,
             db: None,
             layer: vw.map(|vw| &vw.top),
+            nullable: false,
+            row_names: None,
         }
     }
 
@@ -966,6 +990,8 @@ impl<'a> Scope<'a> {
                 cte: None,
                 db: None,
                 layer: vw.map(|vw| &vw.top),
+                nullable: false,
+                row_names: None,
             },
         ];
         Scope {
@@ -1091,26 +1117,79 @@ impl<'a> Scope<'a> {
     /// Resolve a bare name that labels a scalar set-returning function's relation as a whole-row
     /// reference to it (spec/design/functions.md §10): a scalar function's row IS its one column,
     /// so `SELECT e FROM jsonb_array_elements(…) AS e` reads the element (PostgreSQL's
-    /// `makeWholeRowVar` for a scalar function). Searched THIS scope, then outward (nearest wins).
-    /// No other relation kind has a whole-row value in jed (no implicit per-table row types).
+    /// `makeWholeRowVar` for a scalar function). The nearest relation of that label wins; a
+    /// nearer relation of any other kind (a record whole-row reference) is `None` here.
     pub(crate) fn resolve_scalar_func_row(&self, name: &str) -> Option<Result<Resolved>> {
+        match self.resolve_whole_row(name)? {
+            Ok(WholeRow::Scalar(r)) => Some(Ok(r)),
+            Ok(WholeRow::Record { .. }) => None,
+            // A record reference's own refusal (no NOT NULL column) is the record path's to raise.
+            Err(e) if e.state == SqlState::FeatureNotSupported => None,
+            Err(e) => Some(Err(e)),
+        }
+    }
+
+    /// Whether a bare name is a RECORD whole-row reference here rather than a column: no column of
+    /// the name is in scope, and it labels a FROM relation (spec/design/grammar.md §15 "Whole-row
+    /// references"). A scalar function relation's whole-row reference is its column, so not this.
+    pub(crate) fn is_record_whole_row(&self, name: &str) -> bool {
+        matches!(self.resolve_bare_column(name), Err(e) if e.state == SqlState::UndefinedColumn)
+            && matches!(
+                self.resolve_whole_row(name),
+                Some(Ok(WholeRow::Record { .. }))
+            )
+    }
+
+    /// Resolve a bare name that labels a FROM relation as a WHOLE-ROW reference to it
+    /// (spec/design/grammar.md §15 "Whole-row references", PostgreSQL's `makeWholeRowVar`): a scalar
+    /// function's row is its one column; any other relation's is a record of the columns `rel.*`
+    /// would expand to, named by `ScopeRel::row_names` (else the exposed names). Searched THIS scope,
+    /// then outward (nearest wins). A relation an outer join may NULL-extend reads its NULL-extended
+    /// rows off a NOT NULL column; one with no such column is `0A000`. A RETURNING pseudo-relation
+    /// and a write-through-view target have no whole-row value here.
+    pub(crate) fn resolve_whole_row(&self, name: &str) -> Option<Result<WholeRow>> {
+        if name.is_empty() {
+            return None;
+        }
         for r in &self.rels {
-            if r.qualifier_only || r.layer.is_some() || r.label != name || !r.table.scalar_func {
+            if r.qualifier_only || r.layer.is_some() || r.label != name {
                 continue;
             }
-            return Some(self.hit(name).map(|()| Resolved::Local(r.offset)));
+            if let Err(e) = self.hit(name) {
+                return Some(Err(e));
+            }
+            if r.table.scalar_func {
+                return Some(Ok(WholeRow::Scalar(Resolved::Local(r.offset))));
+            }
+            // A persisted index expression's dependencies are the columns it names
+            // (index-dependencies.md), which a reference to every column would outgrow on ADD COLUMN.
+            if self.storage_collation {
+                return Some(Err(EngineError::new(
+                    SqlState::FeatureNotSupported,
+                    format!(
+                        "a whole-row reference to {name} is not supported in an index expression or predicate"
+                    ),
+                )));
+            }
+            let shown = r.table.columns.len() - star_hidden_count(r, self.ctes);
+            let slots: Vec<usize> = (r.offset..r.offset + shown).collect();
+            let names = r.row_names.as_deref();
+            return Some(whole_row_record(name, r.table, &slots, names, r.nullable));
         }
-        // An unaliased parenthesized join keeps its inner function relation's label visible.
-        if let Some(sr) = self
-            .sub_rels
-            .iter()
-            .find(|sr| sr.label == name && sr.table.scalar_func)
-        {
-            return Some(self.hit(name).map(|()| Resolved::Local(sr.slots[0])));
+        // An unaliased parenthesized join keeps its inner relations' labels visible. Whether an
+        // inner relation was NULL-extended inside the join is not recorded, so it is presumed so.
+        if let Some(sr) = self.sub_rels.iter().find(|sr| sr.label == name) {
+            if let Err(e) = self.hit(name) {
+                return Some(Err(e));
+            }
+            if sr.table.scalar_func {
+                return Some(Ok(WholeRow::Scalar(Resolved::Local(sr.slots[0]))));
+            }
+            return Some(whole_row_record(name, sr.table, &sr.slots, None, true));
         }
         self.parent
-            .and_then(|p| p.resolve_scalar_func_row(name))
-            .map(|r| r.map(outer_of))
+            .and_then(|p| p.resolve_whole_row(name))
+            .map(|r| r.map(WholeRow::outer))
     }
 
     /// Resolve a bare column name against THIS scope, then OUTWARD through the parent chain.
@@ -1553,6 +1632,68 @@ impl<'a> Scope<'a> {
             }
         }
     }
+}
+
+/// A whole-row reference resolved against the scope chain ([`Scope::resolve_whole_row`]).
+pub(crate) enum WholeRow {
+    /// A scalar function relation's row: its one column.
+    Scalar(Resolved),
+    /// A record of `fields` (field name, column), in column order. When `presence` is set the
+    /// relation may be NULL-extended: the reference is NULL on a row where that NOT NULL column is
+    /// NULL, as PostgreSQL's whole-row value of a NULL-extended relation is.
+    Record {
+        fields: Vec<(String, Resolved)>,
+        presence: Option<Resolved>,
+    },
+}
+
+impl WholeRow {
+    /// Lift a parent-scope resolution into the child's frame ([`outer_of`]).
+    fn outer(self) -> WholeRow {
+        match self {
+            WholeRow::Scalar(r) => WholeRow::Scalar(outer_of(r)),
+            WholeRow::Record { fields, presence } => WholeRow::Record {
+                fields: fields.into_iter().map(|(n, r)| (n, outer_of(r))).collect(),
+                presence: presence.map(outer_of),
+            },
+        }
+    }
+}
+
+/// The record whole-row reference to `table`, whose columns sit at the flat `slots`.
+fn whole_row_record(
+    label: &str,
+    table: &Table,
+    slots: &[usize],
+    names: Option<&[String]>,
+    nullable: bool,
+) -> Result<WholeRow> {
+    let fields = slots
+        .iter()
+        .enumerate()
+        .map(|(j, &slot)| {
+            let name = names
+                .and_then(|n| n.get(j))
+                .unwrap_or(&table.columns[j].name);
+            (name.clone(), Resolved::Local(slot))
+        })
+        .collect();
+    let presence = if nullable {
+        match (0..slots.len()).find(|&j| table.columns[j].not_null) {
+            Some(j) => Some(Resolved::Local(slots[j])),
+            None => {
+                return Err(EngineError::new(
+                    SqlState::FeatureNotSupported,
+                    format!(
+                        "a whole-row reference to {label}, which an outer join may NULL-extend, needs a NOT NULL column of {label}"
+                    ),
+                ));
+            }
+        }
+    } else {
+        None
+    };
+    Ok(WholeRow::Record { fields, presence })
 }
 
 /// Lift a parent-scope resolution into the child's frame: a `Local` in the parent is one hop

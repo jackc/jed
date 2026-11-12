@@ -1035,6 +1035,50 @@ duplicate name in the list follows PostgreSQL: it is accepted, and a later bare 
 duplicated name is `42702`. Views use this list to keep seeing a column under its old name after
 `RENAME COLUMN` ([views.md](views.md) §7).
 
+**Whole-row references.** A bare name in expression position that names no column at any scope
+level, but labels a FROM relation, is a **whole-row reference** to that relation: PostgreSQL's
+`makeWholeRowVar`, the `t` of `row_to_json(t)` and `json_agg(t)`. Resolution is PostgreSQL's
+`transformColumnRef` order. Every level is searched for a column first, then the name is tried as a
+relation label, nearest level first, so a reference may be correlated or LATERAL like a column.
+A one-column table function's reference is its column (§35). Every other relation's reference is
+`ROW(…)` over the columns `label.*` expands to, typed as an anonymous record (composite.md §13)
+whose fields carry names:
+
+- a base table or view keeps its **catalog** column names, even under a column alias list, because
+  in PostgreSQL its row type is the table's (`FROM t AS x(k)` still yields `{"id":…}`);
+- a derived table, CTE, `VALUES` list, or multi-column table function takes the names it
+  **exposes**, alias list included (`(SELECT 1 AS a) AS s(c)` yields `{"c":1}`).
+
+So `row_to_json`, `to_json`, `to_jsonb`, and the JSON aggregates key each member by its column
+name, and `SELECT t` renders the record text `(1,a)`. The record composes like any record value:
+field selection `(t).name`, comparison, `IS NULL`, `ORDER BY t` (also by an ordinal at a `t`
+item), `GROUP BY t`, and `DISTINCT`. It is resolved in UPDATE, DELETE, and RETURNING scopes too.
+The RETURNING `old` / `new` and ON CONFLICT `excluded` pseudo-relations, and the target of a write
+through a view, have no whole-row value (`42703`, as before).
+
+On a row that an outer join **NULL-extends**, the reference is NULL, not a record of NULLs, as in
+PostgreSQL. jed's join executors build a NULL-extended row as NULL columns, so a relation that an
+outer join of its FROM may NULL-extend (the right side of `LEFT`, the left side of `RIGHT`, both
+sides of `FULL`) resolves to `CASE WHEN c IS NULL THEN NULL ELSE ROW(…) END`. Here `c` is its first
+NOT NULL column, which a real row never leaves NULL. An inner relation of an unaliased parenthesized
+join is presumed NULL-extendable. A NULL-extendable relation with no NOT NULL column (a derived
+table's columns never are) is **`0A000`**, a ledgered divergence. Carrying the row through the join
+is the deferred alternative.
+
+Three further narrowings, each ledgered:
+
+- **Index expressions and predicates.** A whole-row reference in a persisted index expression or
+  partial-index predicate is `0A000`. Their dependencies are the columns they name
+  ([index-dependencies.md](index-dependencies.md)), and `ADD COLUMN` would silently change a
+  whole-row value. A CHECK constraint may hold one, as in PostgreSQL.
+- **No stored record.** The record cannot be stored: a `CREATE TABLE … AS` or view column of it is
+  `42P16`, since jed has no per-table row type ([composite.md](composite.md) §10.4).
+- **No `t.*` argument.** `row_to_json(t.*)` remains `42601` (below).
+
+Cost: one `operator_eval` for the `ROW` node, plus the `CASE` and `IS NULL` on a NULL-extendable
+relation. The scan's touched set is every column. The resolved form is ordinary column references,
+so pushdown, column pruning, and view dependency tracing see exactly those columns.
+
 **The database qualifier (`qualified_table`).** `qualified_table ::= (identifier ".")? identifier`
 — an OPTIONAL leading `db "."` names the **attached database** a table lives in (`reports.sales`),
 jed's first multi-part name in **table** position ([attached-databases.md](attached-databases.md)
@@ -2854,9 +2898,9 @@ A bare name that labels a one-column function relation but names no column in sc
 `makeWholeRowVar`): `SELECT e FROM jsonb_array_elements(doc) AS e` and `SELECT g FROM
 generate_series(1, 3) AS g(n)` read the produced value, and the output column is named by the
 reference (`e`, `g`). Columns win: every scope level is searched for a column before the name is
-tried as a relation label (nearest level first). A `USING` column, a qualified `g.g`, and any other
-relation kind (a table, derived table, CTE, multi-column or record function) never take this
-reading — jed has no implicit per-table row types.
+tried as a relation label (nearest level first). A `USING` column and a qualified `g.g` never take
+this reading. Every other relation kind's whole-row reference is a record (§15 "Whole-row
+references").
 
 An explicit list overrides output names left-to-right: `generate_series(1, 5) AS g(n)` exposes
 the column as `g.n`, and `jsonb_each(doc) AS e(k, v)` exposes `e.k` / `e.v`. It applies to every

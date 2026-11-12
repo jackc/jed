@@ -1184,6 +1184,7 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     "func.json_builders",
     // row_to_json(record [, pretty]) — a composite as a json object (json-sql-functions.md §2.2).
     "func.row_to_json",
+    "query.whole_row",
     // jsonb path-mutation builders (B1) — jsonb_set / jsonb_insert (json-sql-functions.md §2).
     "func.json_set",
     // jsonb_set_lax — jsonb_set with a null_value_treatment for a SQL NULL value (§2).

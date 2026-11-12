@@ -81,6 +81,7 @@ import {
   scalarT,
 } from "./types.ts";
 import { rangeNameForElement } from "./range.ts";
+import { starHiddenCount } from "./search_cycle.ts";
 import type {
   BinaryOp,
   Cte,
@@ -197,6 +198,51 @@ export function scopeDepth(scope: Scope | null): number {
   let depth = 0;
   for (let s = scope; s !== null; s = s.parent) depth++;
   return depth;
+}
+
+// WholeRow is a whole-row reference resolved against the scope chain (Scope.resolveWholeRow): a
+// scalar function relation's row is its one column (scalar); any other relation's is a record of
+// `fields` (field name, column) in column order. When `presence` is set the relation may be
+// NULL-extended: the reference is NULL on a row where that NOT NULL column is NULL, as PostgreSQL's
+// whole-row value of a NULL-extended relation is.
+export type WholeRow =
+  | { kind: "scalar"; r: Resolved }
+  | { kind: "record"; fields: { name: string; r: Resolved }[]; presence: Resolved | null };
+
+// wholeRowOuter lifts a parent-scope resolution into the child's frame (outerOf).
+function wholeRowOuter(w: WholeRow): WholeRow {
+  if (w.kind === "scalar") return { kind: "scalar", r: outerOf(w.r) };
+  return {
+    kind: "record",
+    fields: w.fields.map((f) => ({ name: f.name, r: outerOf(f.r) })),
+    presence: w.presence === null ? null : outerOf(w.presence),
+  };
+}
+
+// wholeRowRecord is the record whole-row reference to table, whose columns sit at the flat slots.
+function wholeRowRecord(
+  label: string,
+  table: Table,
+  slots: number[],
+  names: string[] | null,
+  nullable: boolean,
+): WholeRow {
+  const fields = slots.map((slot, j) => ({
+    name: names?.[j] ?? table.columns[j]!.name,
+    r: { level: 0, index: slot },
+  }));
+  let presence: Resolved | null = null;
+  if (nullable) {
+    const j = slots.findIndex((_slot, k) => table.columns[k]!.notNull);
+    if (j < 0) {
+      throw engineError(
+        "feature_not_supported",
+        `a whole-row reference to ${label}, which an outer join may NULL-extend, needs a NOT NULL column of ${label}`,
+      );
+    }
+    presence = { level: 0, index: slots[j]! };
+  }
+  return { kind: "record", fields, presence };
 }
 
 export class Scope {
@@ -538,31 +584,79 @@ export class Scope {
   // resolveScalarFuncRow resolves a bare name that labels a scalar set-returning function's relation
   // as a whole-row reference to it (spec/design/functions.md §10): a scalar function's row IS its
   // one column, so `SELECT e FROM jsonb_array_elements(…) AS e` reads the element (PostgreSQL's
-  // makeWholeRowVar for a scalar function). Searched THIS scope, then outward (nearest wins). No
-  // other relation kind has a whole-row value in jed (no implicit per-table row types).
+  // makeWholeRowVar for a scalar function). The nearest relation of that label wins; a nearer
+  // relation of any other kind (a record whole-row reference) is null here.
   resolveScalarFuncRow(name: string): Resolved | null {
-    for (const r of this.rels) {
-      if (
-        r.qualifierOnly ||
-        r.layer !== undefined ||
-        r.label !== name ||
-        r.table.scalarFunc !== true
-      ) {
-        continue;
-      }
-      this.hit(name);
-      return { level: 0, index: r.offset };
+    let w: WholeRow | null;
+    try {
+      w = this.resolveWholeRow(name);
+    } catch (e) {
+      // A record reference's own refusal (no NOT NULL column) is the record path's to raise.
+      if (e instanceof EngineError && e.state === "feature_not_supported") return null;
+      throw e;
     }
-    // An unaliased parenthesized join keeps its inner function relation's label visible.
-    for (const sr of this.subRels) {
-      if (sr.label === name && sr.table.scalarFunc === true) {
-        this.hit(name);
-        return { level: 0, index: sr.slots[0]! };
+    if (w === null || w.kind !== "scalar") return null;
+    return w.r;
+  }
+
+  // isRecordWholeRow reports whether a bare name is a RECORD whole-row reference here rather than a
+  // column: no column of the name is in scope, and it labels a FROM relation (spec/design/grammar.md
+  // §15 "Whole-row references"). A scalar function relation's whole-row reference is its column, so
+  // not this.
+  isRecordWholeRow(name: string): boolean {
+    try {
+      this.resolveBareColumn(name);
+      return false;
+    } catch (e) {
+      if (!(e instanceof EngineError) || e.state !== "undefined_column") return false;
+    }
+    try {
+      const w = this.resolveWholeRow(name);
+      return w !== null && w.kind === "record";
+    } catch {
+      return false;
+    }
+  }
+
+  // resolveWholeRow resolves a bare name that labels a FROM relation as a WHOLE-ROW reference to it
+  // (spec/design/grammar.md §15 "Whole-row references", PostgreSQL's makeWholeRowVar): a scalar
+  // function's row is its one column; any other relation's is a record of the columns `rel.*` would
+  // expand to, named by ScopeRel.rowNames (else the exposed names). Searched THIS scope, then outward
+  // (nearest wins); null when no relation has the label. A relation an outer join may NULL-extend
+  // reads its NULL-extended rows off a NOT NULL column; one with no such column is 0A000. A
+  // RETURNING pseudo-relation and a write-through-view target have no whole-row value here.
+  resolveWholeRow(name: string): WholeRow | null {
+    if (name === "") return null;
+    for (const r of this.rels) {
+      if (r.qualifierOnly === true || r.layer !== undefined || r.label !== name) continue;
+      this.hit(name);
+      if (r.table.scalarFunc === true) return { kind: "scalar", r: { level: 0, index: r.offset } };
+      // A persisted index expression's dependencies are the columns it names
+      // (index-dependencies.md), which a reference to every column would outgrow on ADD COLUMN.
+      if (this.storageCollation) {
+        throw engineError(
+          "feature_not_supported",
+          `a whole-row reference to ${name} is not supported in an index expression or predicate`,
+        );
       }
+      const shown = r.table.columns.length - starHiddenCount(r, this.ctes);
+      const slots: number[] = [];
+      for (let k = r.offset; k < r.offset + shown; k++) slots.push(k);
+      return wholeRowRecord(name, r.table, slots, r.rowNames ?? null, r.nullable === true);
+    }
+    // An unaliased parenthesized join keeps its inner relations' labels visible. Whether an inner
+    // relation was NULL-extended inside the join is not recorded, so it is presumed so.
+    for (const sr of this.subRels) {
+      if (sr.label !== name) continue;
+      this.hit(name);
+      if (sr.table.scalarFunc === true) {
+        return { kind: "scalar", r: { level: 0, index: sr.slots[0]! } };
+      }
+      return wholeRowRecord(name, sr.table, sr.slots, null, true);
     }
     if (this.parent === null) return null;
-    const r = this.parent.resolveScalarFuncRow(name);
-    return r === null ? null : outerOf(r);
+    const w = this.parent.resolveWholeRow(name);
+    return w === null ? null : wholeRowOuter(w);
   }
 
   // resolveBareColumn resolves a bare column name against THIS scope, then OUTWARD through the

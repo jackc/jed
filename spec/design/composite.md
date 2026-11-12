@@ -317,7 +317,10 @@ and are recorded in [../conformance/oracle_overrides.toml](../conformance/oracle
    an **array-of-composite** key and a composite **FK** pairing remain deferred `0A000` follow-ons.
 4. **No implicit per-table row types** (divergence) — PG auto-creates a composite type per table
    (`tablename` usable as a type); jed does not. We own our surface (CLAUDE.md §1), and coupling
-   the table and type catalogs would complicate `DROP` dependency tracking.
+   the table and type catalogs would complicate `DROP` dependency tracking. A whole-row reference
+   (`row_to_json(t)`, [grammar.md](grammar.md) §15) needs no such type. It is an anonymous record
+   (§13) whose fields carry the column names, so the value is PostgreSQL's. What is lost is only
+   the type's name (`pg_typeof` would say `record`) and storing it (`42P16`).
 5. **`ROW(…)` only**, bare `(a,b)` deferred `0A000` (§1).
 6. **Array vs. composite sequencing** — composite ships first; the open-`Type` plumbing here is
    the shared "containers" foundation the future `array` axis reuses ([TODO.md](../../TODO.md)).

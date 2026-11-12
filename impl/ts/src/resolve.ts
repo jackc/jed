@@ -444,6 +444,46 @@ export function resolveBooleanFilter(scope: Scope, e: Expr, params: ParamTypes):
   return node;
 }
 
+// resolveWholeRowRecord resolves a record whole-row reference (spec/design/grammar.md §15
+// "Whole-row references"): ROW(…) over the relation's columns, typed as an anonymous record whose
+// fields carry the column names — so row_to_json(t) keys its members by them — and NULL where
+// `presence` (a NOT NULL column) is NULL, a NULL-extended row. e is the whole expression: a GROUP BY
+// t key it matches reads that slot.
+export function resolveWholeRowRecord(
+  scope: Scope,
+  ag: AggCtx,
+  e: Expr,
+  fields: { name: string; r: Resolved }[],
+  presence: Resolved | null,
+): { node: RExpr; type: ResolvedType } {
+  const m = matchGroupExpr(ag, e);
+  if (m !== null) return { node: { kind: "column", index: m.slot }, type: m.ty };
+  const nodes: RExpr[] = [];
+  const types: { name: string; type: ResolvedType }[] = [];
+  for (const f of fields) {
+    const column = scope.columnOf(f.r).name;
+    const { node, type } = resolveColumnRef(scope, ag, f.r, column);
+    nodes.push(node);
+    types.push({ name: f.name, type });
+  }
+  const type: ResolvedType = { kind: "composite", name: null, fields: types };
+  const row: RExpr = { kind: "row", fields: nodes };
+  if (presence === null) return { node: row, type };
+  const column = scope.columnOf(presence).name;
+  const test = resolveColumnRef(scope, ag, presence, column).node;
+  return {
+    node: {
+      kind: "case",
+      arms: [
+        { cond: { kind: "isNull", operand: test, negated: false }, result: { kind: "constNull" } },
+      ],
+      els: row,
+      coerceDecimal: false,
+    },
+    type,
+  };
+}
+
 // resolveColumnRef turns a chain resolution into a resolved node + type (§26). A Local column
 // obeys the grouping rule (collectColumn); an Outer (correlated) reference is a per-outer-row
 // CONSTANT, so it bypasses that rule and resolves to an outerColumn reading the enclosing row at
@@ -1037,8 +1077,20 @@ function resolveNode(
       return resolveArrayExpr(scope, e, ctx, ag, params);
     case "column": {
       // Resolve against the scope CHAIN (§26). A Local match obeys the grouping rule; an Outer
-      // (correlated) match is a per-outer-row constant exempt from it (resolveColumnRef).
-      return resolveColumnRef(scope, ag, scope.resolveBareAt(e.name, e.loc), e.name);
+      // (correlated) match is a per-outer-row constant exempt from it (resolveColumnRef). A name that
+      // is no column but labels a FROM relation is a whole-row reference (grammar.md §15).
+      let r: Resolved;
+      try {
+        r = scope.resolveBareAt(e.name, e.loc);
+      } catch (missing) {
+        if (!(missing instanceof EngineError) || missing.state !== "undefined_column")
+          throw missing;
+        const w = scope.resolveWholeRow(e.name);
+        if (w === null) throw missing;
+        if (w.kind === "record") return resolveWholeRowRecord(scope, ag, e, w.fields, w.presence);
+        return resolveColumnRef(scope, ag, w.r, e.name);
+      }
+      return resolveColumnRef(scope, ag, r, e.name);
     }
     case "qualifiedColumn":
       return resolveQualifiedColumnExpr(scope, e, ag);

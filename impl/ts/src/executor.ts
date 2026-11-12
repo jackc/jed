@@ -1157,6 +1157,37 @@ function sortKeyIdentityOf(
   return { kind: "column", col: scope.resolveBareAt(key.column, key.loc), collation };
 }
 
+// wholeRowOrderKeys returns the ORDER BY keys with each whole-row reference key rewritten as an
+// expression key, or null when there is none: a bare key that names no output column and no input
+// column but a relation (`ORDER BY t`), or an ordinal at a whole-row select item (`SELECT t … ORDER BY
+// 1`). Such a key sorts by the record value, as in PostgreSQL (grammar.md §15).
+function wholeRowOrderKeys(keys: OrderKey[], items: SelectItems, scope: Scope): OrderKey[] | null {
+  let out: OrderKey[] | null = null;
+  for (let k = 0; k < keys.length; k++) {
+    const key = keys[k]!;
+    let name: string;
+    if (key.ordinal !== null) {
+      const ord = key.ordinal;
+      if (items.kind !== "list" || ord < 1 || ord > items.items.length) continue;
+      const e = items.items[ord - 1]!.expr;
+      if (e.kind !== "column") continue;
+      name = e.name;
+    } else if (key.expr === null && key.qualifier === null) {
+      const matched = orderAliasMatch(items, key.column, scope);
+      if (matched === null) name = key.column;
+      else if (matched.kind === "column") name = matched.name;
+      else continue;
+    } else {
+      continue;
+    }
+    if (!scope.isRecordWholeRow(name)) continue;
+    if (out === null) out = keys.slice();
+    const expr: Expr = key.loc === undefined ? { kind: "column", name } : { kind: "column", name, loc: key.loc };
+    out[k] = { ...key, ordinal: null, expr };
+  }
+  return out;
+}
+
 // distinctOnOrder returns the effective sort of a DISTINCT ON query and its dedup-key count
 // (grammar.md §11.1). The ORDER BY keys are checked left to right: a leading run that matches ON keys
 // forms the dedup key, and an ON key matched after a non-matching ORDER BY key, or matched by none
@@ -1277,14 +1308,20 @@ function finishSelectSlots(plan: SelectPlan, sel: Select, scope: Scope): void {
     const projected = new Set<number>();
     for (const it of items.items) {
       if (it.expr.kind === "column") {
-        const r = scope.resolveBare(it.expr.name);
+        // A whole-row reference item projects no single input column.
+        let r: Resolved;
+        try {
+          r = scope.resolveBare(it.expr.name);
+        } catch {
+          continue;
+        }
         if (r.level === 0) projected.add(r.index);
       } else if (it.expr.kind === "qualifiedColumn") {
         const r = scope.resolveQualified(it.expr.qualifier, it.expr.name);
         if (r.level === 0) projected.add(r.index);
       }
     }
-    for (const key of sel.orderBy) {
+    for (const key of wholeRowOrderKeys(sel.orderBy, items, scope) ?? sel.orderBy) {
       let inList: boolean;
       if (key.ordinal !== null) {
         inList = true;
@@ -21301,6 +21338,8 @@ export class Engine {
       // Whether the relation is a catalog BASE table (possibly under a column alias list): a view
       // body's planning trace records the columns resolved against it (views.md §6).
       let base = false;
+      // A renamed base table's or view's own column names (its whole-row field names).
+      let rowNames: string[] | undefined;
       const isDerived = tref.subquery !== undefined || tref.values !== undefined;
       // A FROM item is lateral-ELIGIBLE when it can see earlier siblings: a derived table / VALUES
       // body explicitly marked LATERAL, or ANY table function (implicitly lateral — §44). The first
@@ -21421,6 +21460,11 @@ export class Engine {
           joinLateral || (lateralEligible && !detached && queryPlanReferencesOuter(plan, 0));
         shaped[i] = shapeBodies && tref.subquery !== undefined && !lateral;
         const label = tref.alias === null ? "" : tref.alias;
+        // A view keeps its stored column names as its whole-row field names, under a column alias
+        // list on the reference too.
+        if (viewItem != null) {
+          rowNames = this.relationView(writtenItems[i]!.db, viewItem.viewName)?.columns.slice();
+        }
         t = cteSyntheticTable(label, plan, tref.columnAliases ?? null);
         // An unaliased parenthesized join's columns are its inner columns, collation included.
         const group = derivedJoinGroup(plan);
@@ -21538,6 +21582,7 @@ export class Engine {
             ).withPosition(tref.loc);
           }
           this.traceTableItem(tref, tbl);
+          if (tref.columnAliases !== undefined) rowNames = tbl.columns.map((c) => c.name);
           t =
             tref.columnAliases !== undefined
               ? renamedBaseTable(tbl, tref, tref.columnAliases)
@@ -21607,6 +21652,7 @@ export class Engine {
               ).withPosition(tref.loc);
             }
             this.traceTableItem(tref, tbl);
+            if (tref.columnAliases !== undefined) rowNames = tbl.columns.map((c) => c.name);
             t =
               tref.columnAliases !== undefined
                 ? renamedBaseTable(tbl, tref, tref.columnAliases)
@@ -21651,7 +21697,20 @@ export class Engine {
         db: tref.db,
         base,
         view: viewItems[i]?.viewName,
+        // A base table or view keeps its catalog names as its whole-row field names under a column
+        // alias list (grammar.md §15 "Whole-row references").
+        rowNames,
       });
+      // The join attaching this item NULL-extends the relations it names (the left-deep rule
+      // rewrite.ts's pushdown uses): its own item for LEFT/FULL, every earlier one for RIGHT/FULL.
+      // An earlier relation is replaced, not mutated, so a prefix scope already built keeps its view.
+      if (i > 0) {
+        const kind = sel.joins[i - 1]!.kind;
+        if (kind === "left" || kind === "full") rels[i] = { ...rels[i]!, nullable: true };
+        if (kind === "right" || kind === "full") {
+          for (let k = 0; k < i; k++) rels[k] = { ...rels[k]!, nullable: true };
+        }
+      }
       srfPlans.push(srf);
       derivedPlans.push(derived);
       lateralFlags.push(lateral);
@@ -22047,7 +22106,9 @@ export class Engine {
     const order: OrderSlot[] = [];
     const orderExprs: RExpr[] = [];
     const items = sel.items;
-    for (const [keyIndex, key] of sel.orderBy.entries()) {
+    // A key naming a whole-row reference sorts by that record's value (grammar.md §15).
+    const orderBy = wholeRowOrderKeys(sel.orderBy, items, scope) ?? sel.orderBy;
+    for (const [keyIndex, key] of orderBy.entries()) {
       // A key with no ordering operator is reported where it was written (error-fields.md §10.2).
       try {
         // Classify the key into a row slot (a column / ordinal-to-column) or a source expression (a
@@ -38918,6 +38979,8 @@ export function resolveGroupNamed(
       if (e instanceof EngineError && e.state === "undefined_column") {
         const aexpr = orderAliasMatch(items, term.name, scope);
         if (aexpr !== null) return resolveGroupExpr(scope, aexpr, params);
+        // A whole-row reference groups by the record value (grammar.md §15).
+        if (scope.isRecordWholeRow(term.name)) return resolveGroupExpr(scope, term, params);
       }
       throw e;
     }
@@ -38941,8 +39004,20 @@ export function resolveGroupNamed(
 // (aggregates.md §15).
 export function resolveGroupExpr(scope: Scope, e: Expr, params: ParamTypes): GroupKeyResolved {
   if (e.kind === "column") {
-    const r = scope.resolveBareAt(e.name, e.loc);
-    if (r.level === 0) return { kind: "column", index: r.index };
+    let r: Resolved | null = null;
+    try {
+      r = scope.resolveBareAt(e.name, e.loc);
+    } catch (err) {
+      // A whole-row reference resolves as a general expression below.
+      if (
+        !(err instanceof EngineError) ||
+        err.state !== "undefined_column" ||
+        !scope.isRecordWholeRow(e.name)
+      ) {
+        throw err;
+      }
+    }
+    if (r !== null && r.level === 0) return { kind: "column", index: r.index };
   } else if (e.kind === "qualifiedColumn") {
     const r = scope.resolveQualifiedAt(e.qualifier, e.name, e.loc);
     if (r.level === 0) return { kind: "column", index: r.index };
@@ -47978,6 +48053,14 @@ export type ScopeRel = {
   // base column or a read-only select item. table stays the base table, so flat indices keep the
   // base row's layout. Undefined for every other relation.
   layer?: WriteLayer;
+  // nullable is whether an outer join of this relation's FROM may NULL-extend it
+  // (spec/design/grammar.md §15 "Whole-row references"). A whole-row reference to a NULL-extendable
+  // relation is NULL on a NULL-extended row, read off one of its NOT NULL columns.
+  nullable?: boolean;
+  // rowNames is the field names of this relation's whole-row value when they differ from the columns
+  // it exposes: a base table or view under a column alias list keeps its catalog names, as in
+  // PostgreSQL (its row type is the table's). Undefined = the exposed column names.
+  rowNames?: string[];
 };
 
 // Resolved is how a column reference resolved against the scope CHAIN (spec/design/grammar.md

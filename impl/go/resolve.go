@@ -67,6 +67,14 @@ type scopeRel struct {
 	// base column or a read-only select item. table stays the base table, so flat indices keep the
 	// base row's layout. Nil for every other relation.
 	layer *writeLayer
+	// nullable is whether an outer join of this relation's FROM may NULL-extend it
+	// (spec/design/grammar.md §15 "Whole-row references"). A whole-row reference to a NULL-extendable
+	// relation is NULL on a NULL-extended row, read off one of its NOT NULL columns.
+	nullable bool
+	// rowNames are the field names of this relation's whole-row value when they differ from the
+	// columns it exposes: a base table or view under a column alias list keeps its catalog names, as
+	// in PostgreSQL (its row type is the table's). Nil = the exposed column names.
+	rowNames []string
 }
 
 // resolved is how a column reference resolved against the scope CHAIN (spec/design/grammar.md
@@ -452,35 +460,159 @@ func (s *scope) refusedLabel(r *scopeRel, idx int) string {
 // resolveScalarFuncRow resolves a bare name that labels a scalar set-returning function's relation
 // as a whole-row reference to it (spec/design/functions.md §10): a scalar function's row IS its one
 // column, so `SELECT e FROM jsonb_array_elements(…) AS e` reads the element (PostgreSQL's
-// makeWholeRowVar for a scalar function). Searched THIS scope, then outward (nearest wins). No other
-// relation kind has a whole-row value in jed (no implicit per-table row types).
+// makeWholeRowVar for a scalar function). The nearest relation of that label wins; a nearer relation
+// of any other kind (a record whole-row reference) is not a match here.
 func (s *scope) resolveScalarFuncRow(name string) (resolved, bool, error) {
-	for _, r := range s.rels {
-		if r.qualifierOnly || r.layer != nil || r.label != name || !r.table.ScalarFunc {
+	w, ok, err := s.resolveWholeRow(name)
+	if err != nil {
+		// A record reference's own refusal (no NOT NULL column) is the record path's to raise.
+		if e, isEngine := err.(*EngineError); isEngine && e.State == FeatureNotSupported {
+			return resolved{}, false, nil
+		}
+		return resolved{}, false, err
+	}
+	if !ok || !w.scalar {
+		return resolved{}, false, nil
+	}
+	return w.col, true, nil
+}
+
+// isRecordWholeRow reports whether a bare name is a RECORD whole-row reference here rather than a
+// column: no column of the name is in scope, and it labels a FROM relation (spec/design/grammar.md
+// §15 "Whole-row references"). A scalar function relation's whole-row reference is its column, so
+// not this.
+func (s *scope) isRecordWholeRow(name string) bool {
+	_, err := s.resolveBareColumn(name)
+	if e, ok := err.(*EngineError); !ok || e.State != UndefinedColumn {
+		return false
+	}
+	w, ok, werr := s.resolveWholeRow(name)
+	return werr == nil && ok && !w.scalar
+}
+
+// wholeRow is a whole-row reference resolved against the scope chain (resolveWholeRow). A scalar one
+// is a scalar function relation's row: its one column, col. Otherwise it is a record of fields, in
+// column order; when presence is set the relation may be NULL-extended: the reference is NULL on a
+// row where that NOT NULL column is NULL, as PostgreSQL's whole-row value of a NULL-extended
+// relation is.
+type wholeRow struct {
+	scalar   bool
+	col      resolved
+	fields   []wholeRowField
+	presence *resolved
+}
+
+// wholeRowField is one field of a record whole-row reference: its name and its column.
+type wholeRowField struct {
+	name string
+	col  resolved
+}
+
+// outer lifts a parent-scope resolution into the child's frame (outerOf).
+func (w wholeRow) outer() wholeRow {
+	if w.scalar {
+		return wholeRow{scalar: true, col: outerOf(w.col)}
+	}
+	fields := make([]wholeRowField, len(w.fields))
+	for i, f := range w.fields {
+		fields[i] = wholeRowField{name: f.name, col: outerOf(f.col)}
+	}
+	out := wholeRow{fields: fields}
+	if w.presence != nil {
+		p := outerOf(*w.presence)
+		out.presence = &p
+	}
+	return out
+}
+
+// resolveWholeRow resolves a bare name that labels a FROM relation as a WHOLE-ROW reference to it
+// (spec/design/grammar.md §15 "Whole-row references", PostgreSQL's makeWholeRowVar): a scalar
+// function's row is its one column; any other relation's is a record of the columns `rel.*` would
+// expand to, named by scopeRel.rowNames (else the exposed names). Searched THIS scope, then outward
+// (nearest wins). A relation an outer join may NULL-extend reads its NULL-extended rows off a NOT
+// NULL column; one with no such column is 0A000. A RETURNING pseudo-relation and a
+// write-through-view target have no whole-row value here. ok is false when no relation has the label.
+func (s *scope) resolveWholeRow(name string) (wholeRow, bool, error) {
+	if name == "" {
+		return wholeRow{}, false, nil
+	}
+	for i := range s.rels {
+		r := &s.rels[i]
+		if r.qualifierOnly || r.layer != nil || r.label != name {
 			continue
 		}
 		if err := s.hit(name); err != nil {
-			return resolved{}, false, err
+			return wholeRow{}, true, err
 		}
-		return resolved{level: 0, index: r.offset}, true, nil
+		if r.table.ScalarFunc {
+			return wholeRow{scalar: true, col: resolved{level: 0, index: r.offset}}, true, nil
+		}
+		// A persisted index expression's dependencies are the columns it names
+		// (index-dependencies.md), which a reference to every column would outgrow on ADD COLUMN.
+		if s.storageCollation {
+			return wholeRow{}, true, newError(FeatureNotSupported,
+				"a whole-row reference to "+name+" is not supported in an index expression or predicate")
+		}
+		shown := len(r.table.Columns) - starHiddenCount(r, s.ctes)
+		slots := make([]int, shown)
+		for c := range shown {
+			slots[c] = r.offset + c
+		}
+		w, err := wholeRowRecord(name, r.table, slots, r.rowNames, r.nullable)
+		return w, true, err
 	}
-	// An unaliased parenthesized join keeps its inner function relation's label visible.
+	// An unaliased parenthesized join keeps its inner relations' labels visible. Whether an inner
+	// relation was NULL-extended inside the join is not recorded, so it is presumed so.
 	for _, sr := range s.subRels {
-		if sr.label == name && sr.table.ScalarFunc {
-			if err := s.hit(name); err != nil {
-				return resolved{}, false, err
-			}
-			return resolved{level: 0, index: sr.slots[0]}, true, nil
+		if sr.label != name {
+			continue
 		}
+		if err := s.hit(name); err != nil {
+			return wholeRow{}, true, err
+		}
+		if sr.table.ScalarFunc {
+			return wholeRow{scalar: true, col: resolved{level: 0, index: sr.slots[0]}}, true, nil
+		}
+		w, err := wholeRowRecord(name, sr.table, sr.slots, nil, true)
+		return w, true, err
 	}
 	if s.parent != nil {
-		r, ok, err := s.parent.resolveScalarFuncRow(name)
+		w, ok, err := s.parent.resolveWholeRow(name)
 		if err != nil || !ok {
-			return resolved{}, ok, err
+			return wholeRow{}, ok, err
 		}
-		return outerOf(r), true, nil
+		return w.outer(), true, nil
 	}
-	return resolved{}, false, nil
+	return wholeRow{}, false, nil
+}
+
+// wholeRowRecord is the record whole-row reference to table, whose columns sit at the flat slots.
+func wholeRowRecord(label string, table *catTable, slots []int, names []string, nullable bool) (wholeRow, error) {
+	fields := make([]wholeRowField, len(slots))
+	for j, slot := range slots {
+		name := table.Columns[j].Name
+		if j < len(names) {
+			name = names[j]
+		}
+		fields[j] = wholeRowField{name: name, col: resolved{level: 0, index: slot}}
+	}
+	w := wholeRow{fields: fields}
+	if nullable {
+		found := false
+		for j := range slots {
+			if table.Columns[j].NotNull {
+				p := resolved{level: 0, index: slots[j]}
+				w.presence = &p
+				found = true
+				break
+			}
+		}
+		if !found {
+			return wholeRow{}, newError(FeatureNotSupported,
+				"a whole-row reference to "+label+", which an outer join may NULL-extend, needs a NOT NULL column of "+label)
+		}
+	}
+	return w, nil
 }
 
 // resolveBareColumn resolves a bare column name against THIS scope, then OUTWARD through the parent
@@ -1613,6 +1745,38 @@ func hasCorrelatedSubquery(e *rExpr) bool {
 	return false
 }
 
+// resolveWholeRowRecord resolves a record whole-row reference (spec/design/grammar.md §15
+// "Whole-row references"): ROW(…) over the relation's columns, typed as an anonymous record whose
+// fields carry the column names — so row_to_json(t) keys its members by them — and NULL where
+// presence (a NOT NULL column) is NULL, a NULL-extended row. e is the whole expression: a GROUP BY t
+// key it matches reads that slot.
+func resolveWholeRowRecord(s *scope, ag *aggCtx, e exprNode, w wholeRow) (*rExpr, resolvedType, error) {
+	if slot, ty, ok := matchGroupExpr(ag, e); ok {
+		return &rExpr{kind: reColumn, index: slot}, ty, nil
+	}
+	nodes := make([]*rExpr, len(w.fields))
+	fields := make([]compositeRField, len(w.fields))
+	for i, f := range w.fields {
+		node, ty, err := resolveColumnRef(s, ag, f.col, s.columnOf(f.col).Name)
+		if err != nil {
+			return nil, resolvedType{}, err
+		}
+		nodes[i] = node
+		fields[i] = compositeRField{name: f.name, ty: ty}
+	}
+	ty := resolvedType{kind: rtComposite, comp: &compositeRType{fields: fields}}
+	row := &rExpr{kind: reRow, sargs: nodes}
+	if w.presence == nil {
+		return row, ty, nil
+	}
+	test, _, err := resolveColumnRef(s, ag, *w.presence, s.columnOf(*w.presence).Name)
+	if err != nil {
+		return nil, resolvedType{}, err
+	}
+	isNull := &rExpr{kind: reIsNull, operand: test}
+	return &rExpr{kind: reCase, caseArms: []rCaseArm{{cond: isNull, result: &rExpr{kind: reConstNull}}}, caseEls: row}, ty, nil
+}
+
 // resolveColumnRef turns a chain resolution into a resolved node + type (§26). A Local column
 // obeys the grouping rule (collectColumn); an Outer (correlated) reference is a per-outer-row
 // CONSTANT, so it bypasses that rule and resolves to an reOuterColumn reading the enclosing row at
@@ -2267,6 +2431,21 @@ func resolveNode(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *para
 		// (correlated) match is a per-outer-row constant exempt from it (resolveColumnRef).
 		r, err := s.resolveBareAt(e.Column, e.Pos)
 		if err != nil {
+			// No column of the name at any level: a whole-row reference to a relation of that label
+			// (grammar.md §15 "Whole-row references"), else the original 42703.
+			if missing, ok := err.(*EngineError); ok && missing.State == UndefinedColumn {
+				w, found, werr := s.resolveWholeRow(e.Column)
+				switch {
+				case werr != nil:
+					return nil, resolvedType{}, werr
+				case !found:
+					return nil, resolvedType{}, err
+				case w.scalar:
+					return resolveColumnRef(s, ag, w.col, e.Column)
+				default:
+					return resolveWholeRowRecord(s, ag, e, w)
+				}
+			}
 			return nil, resolvedType{}, err
 		}
 		return resolveColumnRef(s, ag, r, e.Column)

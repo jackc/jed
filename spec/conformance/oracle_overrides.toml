@@ -1609,11 +1609,28 @@ file = "expr/width_bucket_array.test"
 sql = "SELECT width_bucket(5::i64, ARRAY[1.5, 2.5]::f64[])"
 reason = "jed: a typed integer operand and f64 thresholds are not comparable (no implicit int→float promotion — the float strict island, float.md §6), so width_bucket(anycompatible, anycompatiblearray) finds no common type and is 42883. PostgreSQL unifies bigint with double precision and returns 2. A bare integer literal adapts to the element type and resolves in both engines."
 
-# --- row_to_json(record): jed has no whole-row table reference.
+# --- Whole-row references (grammar.md §15): the anonymous record cannot be stored.
 [[override]]
-file = "json/row_to_json.test"
-sql = "SELECT row_to_json(p) FROM person p"
-reason = "jed: no implicit per-table row type (composite.md §10.4) and no row-valued table reference (grammar.md §15), so the alias `p` is not a value and resolves as a missing column, 42703. PostgreSQL reads `p` as a whole-row reference of the table's row type and returns one object per row. A composite column, a named composite value, or ROW(col, …) is the jed spelling."
+file = "query/whole_row.test"
+sql = "CREATE TABLE pc AS SELECT t FROM p t"
+reason = "jed: no implicit per-table row type (composite.md §10.4), so a whole-row reference is an anonymous record, and a record column cannot be stored (42P16, composite.md §13). PostgreSQL's whole-row value of a table has the table's row type, so CREATE TABLE AS makes a column of that type."
+
+# --- Whole-row references: a NULL-extendable relation needs a NOT NULL column.
+[[override]]
+file = "query/whole_row.test"
+sql = "SELECT row_to_json(s) FROM p LEFT JOIN (SELECT id FROM q) s ON p.id = s.id"
+reason = "jed tells a NULL-extended row from a row of NULLs by reading a NOT NULL column of the relation (grammar.md §15 \"Whole-row references\"); a relation an outer join may NULL-extend that has no NOT NULL column, as a derived table's columns never are, is a deferred 0A000. PostgreSQL carries the whole-row value through the join, NULL on a NULL-extended row."
+
+# --- Whole-row references: not in a persisted index expression or predicate.
+[[override]]
+file = "query/whole_row.test"
+sql = "CREATE INDEX p_whole ON p ((p IS NOT NULL))"
+reason = "jed: a persisted index expression's dependencies are the columns it names (index-dependencies.md); a whole-row reference names every column, current and future, so ADD COLUMN would silently change its stored keys. jed refuses it (0A000) rather than add an all-columns dependency and rebuild. PostgreSQL admits a whole-row variable in an index expression."
+
+[[override]]
+file = "query/whole_row.test"
+sql = "CREATE INDEX p_whole ON p (id) WHERE p IS NOT NULL"
+reason = "jed: as for an index expression, a partial-index predicate may not hold a whole-row reference (0A000), since its dependencies are the columns it names (index-dependencies.md). PostgreSQL admits it."
 
 # --- jsonpath render: an operator followed by accessors keeps its parentheses as an operand.
 [[override]]

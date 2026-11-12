@@ -2241,6 +2241,10 @@ func resolveGroupNamed(s *scope, term exprNode, items selectItems, params *param
 				if aexpr != nil {
 					return resolveGroupExpr(s, *aexpr, params)
 				}
+				// A whole-row reference groups by the record value (grammar.md §15).
+				if s.isRecordWholeRow(term.Column) {
+					return resolveGroupExpr(s, term, params)
+				}
 			}
 			return groupKeyResolved{}, err
 		}

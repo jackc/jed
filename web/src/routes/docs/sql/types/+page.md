@@ -151,6 +151,11 @@ SELECT
   row_to_json(ROW(1, NULL, ARRAY[1, 2], '{"b":2}'::jsonb)) AS anonymous,
   row_to_json(ROW(timestamp '2024-01-15 10:30:00'))     AS stamp;`;
 
+	const wholeRowDemo = `CREATE TABLE item (id i32 PRIMARY KEY, name text, price decimal);
+INSERT INTO item VALUES (1, 'pen', 1.50), (2, 'ink', 4.25);
+SELECT coalesce(json_agg(row_to_json(t) ORDER BY t.id), '[]'::json) AS items
+FROM (SELECT id, name FROM item) t;`;
+
 	const toJsonDemo = `SELECT
   to_jsonb(ROW('b', 1))                                   AS jsonb_row,
   to_json('{{1,2},{3,4}}'::i32[])                         AS nested,
@@ -682,10 +687,18 @@ named composite type keys the members by its field names, and an anonymous `ROW(
 `f1`, `f2`, …. Each field takes its JSON form: numbers stay exact, a `jsonb` field embeds its
 canonical text, arrays and nested composites nest, and dates and timestamps become ISO 8601 strings
 (a `timestamptz` in the session time zone). With `pretty` set to `true`, each top-level member goes
-on its own line. jed has no implicit row type per table, so PostgreSQL's `row_to_json(t)` over a
-table alias is not available: build the row with `ROW(t.a, t.b)` or use a composite column:
+on its own line:
 
 <LiveSql demo="rowToJsonDemo" query={rowToJsonDemo} rows={1} />
+
+A bare relation name is its **whole row**, as in PostgreSQL. `row_to_json(t)`, `to_json(t)`, and
+`json_agg(t)` over a table, view, derived table, or CTE key each member by its column name. A table
+or view keeps its own column names even under an alias list (`FROM item AS i(k)`). On a row that an
+outer join fills with NULLs, the whole row is NULL. Two limits: on the NULL side of an outer join,
+the relation needs a `NOT NULL` column (a primary key does), and the whole row cannot be stored in a
+table or used in an index expression:
+
+<LiveSql demo="wholeRowDemo" query={wholeRowDemo} rows={1} />
 
 Every other conversion to JSON uses the same rule: `to_json`, `to_jsonb`, `array_to_json(array [,
 pretty])`, `JSON_SCALAR(value)` (the same `json` result as `to_json`), `json_build_array`,
