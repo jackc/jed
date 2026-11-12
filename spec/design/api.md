@@ -794,7 +794,12 @@ query of a `CREATE TABLE … AS`, which binds them as the query would
 **Typing is by context, statically, before execution.** The engine has a strict static type
 system (CLAUDE.md §4); a parameter has no intrinsic type, so it adopts one from its context
 — the other operand of a comparison/arithmetic, the target column of an `INSERT`/`UPDATE
-SET`, or a `CAST` target. The cast-target case covers **both** spellings — `CAST($1 AS int)`
+SET`, or a `CAST` target. In `INSERT … SELECT`, a bare `$N` select item takes its target column's
+type wherever a string literal there would ([grammar.md](grammar.md) §24), so `INSERT INTO s (u)
+SELECT $1 FROM t` types `$1` as `u`'s type; noted before the query is planned, a use elsewhere
+(`WHERE k = $1`) unifies with it. Inference spans every part of a statement: in a `WITH` whose parts are
+data-modifying, every part is typed before any runs, then bound once ([writable-cte.md](writable-cte.md)
+§3). The cast-target case covers **both** spellings — `CAST($1 AS int)`
 and the postfix `$1 :: int` ([grammar.md](grammar.md) §37) — so `$1 :: int` types `$1` as int
 and `$1 :: numeric(10,2)` types it decimal and re-scales the bound value to `(10,2)`. A bare
 parameter in a `CASE` result arm or a `COALESCE`/`GREATEST`/`LEAST` argument adopts the
@@ -829,8 +834,8 @@ takes the container's own type. So:
 - `x op ANY ($N)` / `ALL ($N)` types `$N` as the array of `x`'s type, so `id = ANY($1)` binds a
   list of ids. (`$N = ANY(arr)` already takes the element type.)
 - A cast to a container type, `CAST($1 AS i32[])` or `$1::i32range`, types `$1` as that type.
-- An `INSERT … VALUES` slot, an `UPDATE … SET`, or an `ON CONFLICT … DO UPDATE SET` assigned to a
-  container column types the parameter as the column's type.
+- An `INSERT … VALUES` slot, a bare `INSERT … SELECT` item, an `UPDATE … SET`, or an `ON CONFLICT …
+  DO UPDATE SET` assigned to a container column types the parameter as the column's type.
 
 An anonymous record (a `ROW(…)` expression) does not type a parameter (`42P18`; PostgreSQL types it
 `record` and then cannot read a text value into it), and neither does a polymorphic function slot

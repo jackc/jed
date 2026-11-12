@@ -1991,6 +1991,9 @@ a text column, `||`, `CAST(… AS text)`, a scalar subquery, `CASE` / `COALESCE`
 `42804` into any non-text column, as in PostgreSQL (`spec/conformance/suites/dml/text_storage_assign.test`).
 A numeric or boolean target does not take the literal (`42804`, where PostgreSQL parses it —
 [types.md](types.md) §5's "a bare string never becomes a number").
+A bare bind parameter in the same positions is typed as its target column, as in a `VALUES`
+slot ([api.md](api.md) §5); elsewhere (DISTINCT, a set operation, a sort/grouping key on the item)
+it has no context and is `42P18`, where PostgreSQL resolves it to `text` and then reports `42804`.
 
 **A container column** — an array, a range, or a composite — takes a projection of **exactly its
 own type** or a NULL-typed one, the container rule `UPDATE` and an `INSERT … VALUES` expression

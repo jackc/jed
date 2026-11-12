@@ -834,7 +834,7 @@ impl Engine {
         let colls = self.column_collations(&table.columns);
         let mut ptypes = ParamTypes::default();
         let mut plan = self.plan_merge(&m, table, mv.as_ref(), ctx.bindings, &mut ptypes)?;
-        let bound = bind_params(params, &ptypes.finalize()?, &self.input_zone())?;
+        let bound = plan_params::bind_part_params(params, ptypes, &self.input_zone())?;
         if planning.bind(&bound) {
             let retry = retry.expect("a probing boundary keeps its statement");
             return plan_params::restart(&bound, || self.execute_merge(retry, params, ctx));

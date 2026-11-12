@@ -830,13 +830,20 @@ impl Engine {
         if body.is_data_modifying() {
             add_dml_cte_refs(&bindings, &body);
         }
+        let modes = cte_modes(&bindings);
+        // (2c) Type the parameters of every data-modifying part into the statement's collection:
+        //      each part resolves as it will run and stops at its bind point (`plan_params`
+        //      statement-wide state), so a `$N` is typed, and unifies, statement-wide (api.md §5)
+        //      before anything executes.
+        let ptypes = self.type_dml_parts(&body, &modes, &bindings, ptypes)?;
         let bound = bind_params(params, &ptypes.finalize()?, &self.input_zone())?;
         if planning.bind(&bound) {
             let retry = retry.expect("a probing boundary keeps its statement");
             drop(bindings);
             return plan_params::restart(&bound, || self.run_with_dml(retry, params));
         }
-        let modes = cte_modes(&bindings);
+        // Every data-modifying part takes the statement's bound values.
+        let _part_binding = plan_params::begin_part_binding(bound.clone());
 
         // (3) Run each CTE in list order, filling its buffer. A data-modifying CTE executes for its
         //     effect + RETURNING buffer; the query/recursive CTEs use the shared materialize loop.
@@ -953,6 +960,57 @@ impl Engine {
             profile.record_parent("WITH".to_string(), outcome.cost());
         }
         Ok(outcome)
+    }
+
+    /// The typing pass of a WITH's data-modifying parts (`plan_params` statement-wide state): each
+    /// data-modifying CTE, then a data-modifying primary, resolved against the bindings before it,
+    /// merges its parameter types into `ptypes` and stops at its bind point, before executing.
+    fn type_dml_parts(
+        &mut self,
+        body: &CteBody,
+        modes: &[CteMode],
+        bindings: &[CteBinding],
+        ptypes: ParamTypes,
+    ) -> Result<ParamTypes> {
+        let guard = plan_params::begin_part_typing(ptypes);
+        let buffers: Vec<Vec<Row>> = vec![Vec::new(); bindings.len()];
+        // Every part stops at its bind point; one that returned without reaching it would have run.
+        let typed = |r: Result<Outcome>| -> Result<()> {
+            let reached = plan_params::take_part_reached();
+            match r {
+                Ok(_) => unreachable!("a data-modifying part ran during parameter typing"),
+                Err(_) if reached => Ok(()),
+                Err(e) => Err(e),
+            }
+        };
+        for i in 0..bindings.len() {
+            let CteSource::Dml(dm) = &bindings[i].source else {
+                continue;
+            };
+            let view =
+                CteCtxView::extend(CteCtx::empty(), &modes[..i], &bindings[..i], &buffers[..i]);
+            let ctx = view.ctx();
+            let r = match &dm.stmt {
+                DmStmt::Insert(ins) => self.execute_insert((**ins).clone(), &[], ctx),
+                DmStmt::Update(upd) => self.execute_update((**upd).clone(), &[], ctx),
+                DmStmt::Delete(del) => self.execute_delete((**del).clone(), &[], ctx),
+                DmStmt::Merge(m) => self.execute_merge((**m).clone(), &[], ctx),
+            };
+            typed(r)?;
+        }
+        if body.is_data_modifying() {
+            let view = CteCtxView::extend(CteCtx::empty(), modes, bindings, &buffers);
+            let ctx = view.ctx();
+            let r = match body {
+                CteBody::Insert(ins) => self.execute_insert((**ins).clone(), &[], ctx),
+                CteBody::Update(upd) => self.execute_update((**upd).clone(), &[], ctx),
+                CteBody::Delete(del) => self.execute_delete((**del).clone(), &[], ctx),
+                CteBody::Merge(m) => self.execute_merge((**m).clone(), &[], ctx),
+                CteBody::Query(_) => unreachable!("a query primary is not data-modifying"),
+            };
+            typed(r)?;
+        }
+        Ok(plan_params::end_part_typing(guard))
     }
 
     /// Execute a data-modifying CTE (spec/design/writable-cte.md §3): run the `INSERT`/`UPDATE`/
@@ -1521,26 +1579,36 @@ impl Engine {
     }
 }
 
-/// The location of a query's output column `i` — a set-operation operand, an `INSERT … SELECT`
-/// source (spec/design/error-fields.md §10.2):
-/// the select-list expression of a plain `SELECT`; unknown for a `*` list or any other operand.
 /// Whether output column `i` of an `INSERT ... SELECT` source is a bare string literal that
-/// PostgreSQL leaves `unknown` for the target column to type: an item of a plain SELECT's list (also
-/// under a nested WITH) that no ORDER BY or GROUP BY key names by ordinal or alias. A set operation,
-/// a `VALUES` query, `SELECT DISTINCT`, or a sort/grouping key on the item resolves it to text first
-/// (spec/design/grammar.md §24).
+/// PostgreSQL leaves `unknown` for the target column to type (see [`output_column_unknown_item`];
+/// spec/design/grammar.md §24).
 pub(crate) fn output_column_is_string_literal(q: &QueryExpr, i: usize) -> bool {
+    output_column_unknown_item(q, i)
+        .is_some_and(|item| matches!(item.expr, Expr::Literal(Literal::Text(_), _)))
+}
+
+/// The bare parameter (its 1-based number) of output column `i` of an `INSERT ... SELECT` source
+/// that the target column types (spec/design/api.md §5) — the same positions where a string literal
+/// adapts ([`output_column_unknown_item`]).
+pub(crate) fn output_column_param(q: &QueryExpr, i: usize) -> Option<u32> {
+    match output_column_unknown_item(q, i)?.expr {
+        Expr::Param(n, _) => Some(n),
+        _ => None,
+    }
+}
+
+/// The select item of output column `i` of an `INSERT ... SELECT` source where PostgreSQL leaves an
+/// untyped item (a string literal or a bare parameter) `unknown` for the target column to type: an
+/// item of a plain SELECT's list (also under a nested WITH) that no ORDER BY or GROUP BY key names by
+/// ordinal or alias. A set operation, a `VALUES` query, `SELECT DISTINCT`, or a sort/grouping key on
+/// the item resolves it to text first (spec/design/grammar.md §24).
+fn output_column_unknown_item(q: &QueryExpr, i: usize) -> Option<&crate::ast::SelectItem> {
     match q {
         QueryExpr::Select(s) if !s.distinct => {
             let SelectItems::Items(items) = &s.items else {
-                return false;
+                return None;
             };
-            let Some(item) = items.get(i) else {
-                return false;
-            };
-            if !matches!(item.expr, Expr::Literal(Literal::Text(_), _)) {
-                return false;
-            }
+            let item = items.get(i)?;
             let ordinal = i as i64 + 1;
             let names_item = |e: &Expr| match e {
                 Expr::Literal(Literal::Int(n), _) => *n == ordinal,
@@ -1558,13 +1626,16 @@ pub(crate) fn output_column_is_string_literal(q: &QueryExpr, i: usize) -> bool {
             for g in &s.group_by {
                 g.for_each_expr(&mut |e| grouped |= names_item(e));
             }
-            !sorted && !grouped
+            (!sorted && !grouped).then_some(item)
         }
-        QueryExpr::With(w) => output_column_is_string_literal(&w.body, i),
-        QueryExpr::Select(_) | QueryExpr::SetOp(_) => false,
+        QueryExpr::With(w) => output_column_unknown_item(&w.body, i),
+        QueryExpr::Select(_) | QueryExpr::SetOp(_) => None,
     }
 }
 
+/// The location of a query's output column `i` — a set-operation operand, an `INSERT … SELECT`
+/// source (spec/design/error-fields.md §10.2):
+/// the select-list expression of a plain `SELECT`; unknown for a `*` list or any other operand.
 pub(crate) fn output_column_location(q: &QueryExpr, i: usize) -> SrcPos {
     match q {
         QueryExpr::Select(s) => match &s.items {

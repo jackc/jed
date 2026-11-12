@@ -54,6 +54,10 @@ pub(crate) struct InsertValuesPlan {
     value_exprs: ValueExprs,
     returning: Option<(Vec<RExpr>, Vec<String>, Vec<String>)>,
     param_types: Vec<ColType>,
+    /// The unfinalized types of a plan resolved as a part of a WITH with data-modifying parts,
+    /// whose binding the statement owns (`plan_params::take_part_params`); `param_types` is then
+    /// empty.
+    part_types: Option<Vec<Option<ColType>>>,
     cacheable: bool,
 }
 
@@ -467,7 +471,7 @@ impl Engine {
                     )?),
                     None => None,
                 };
-                let bound = bind_params(params, &ptypes.finalize()?, &self.input_zone())?;
+                let bound = plan_params::bind_part_params(params, ptypes, &self.input_zone())?;
                 if planning.as_mut().is_some_and(|p| p.bind(&bound)) {
                     let retry = retry.expect("a probing boundary keeps its statement");
                     return plan_params::restart(&bound, || {
@@ -660,6 +664,17 @@ impl Engine {
                 // A set-operation source is planned by the same set-op planner as a top-level query
                 // (grammar.md §24/§25); its unified column types are what the assignability gate
                 // below sees.
+                // A bare `$N` select item that PostgreSQL leaves unknown is typed by its target
+                // column, as a VALUES slot is (api.md §5). Noted before planning, so a use
+                // elsewhere in the query unifies with it.
+                for (i, col) in columns.iter().enumerate() {
+                    if let Some(nn) =
+                        provided[i].and_then(|p| super::plan_query::output_column_param(&source, p))
+                    {
+                        let ct = self.read_snap().resolve_col_type(&col.ty);
+                        ptypes.note_col((nn as usize) - 1, Some(ct))?;
+                    }
+                }
                 let mut plan = self.plan_query(&source, None, ctx.bindings, &mut ptypes)?;
                 let ret = match &returning {
                     Some(items) => Some(self.resolve_returning(
@@ -684,7 +699,7 @@ impl Engine {
                     )?),
                     None => None,
                 };
-                let bound = bind_params(params, &ptypes.finalize()?, &self.input_zone())?;
+                let bound = plan_params::bind_part_params(params, ptypes, &self.input_zone())?;
                 if planning.as_mut().is_some_and(|p| p.bind(&bound)) {
                     let retry = retry.expect("a probing boundary keeps its statement");
                     return plan_params::restart(&bound, || {
@@ -1128,7 +1143,11 @@ impl Engine {
             None => None,
         };
         let cacheable = !ptypes.uncacheable;
-        let param_types = ptypes.finalize()?;
+        let (param_types, part_types) = if plan_params::part_params_active() {
+            (Vec::new(), Some(std::mem::take(&mut ptypes.types)))
+        } else {
+            (ptypes.finalize()?, None)
+        };
         Ok(InsertValuesPlan {
             table,
             col_types,
@@ -1142,8 +1161,28 @@ impl Engine {
             value_exprs,
             returning,
             param_types,
+            part_types,
             cacheable,
         })
+    }
+
+    /// Binds a VALUES plan's parameters — through the statement-wide state for a WITH part.
+    fn bind_insert_values_params(
+        &self,
+        params: &[Value],
+        plan: &InsertValuesPlan,
+    ) -> Result<Vec<Value>> {
+        if let Some(types) = &plan.part_types {
+            let ptypes = ParamTypes {
+                types: types.clone(),
+                uncacheable: !plan.cacheable,
+                ..ParamTypes::default()
+            };
+            if let Some(r) = plan_params::take_part_params(&ptypes) {
+                return r;
+            }
+        }
+        bind_params(params, &plan.param_types, &self.input_zone())
     }
 
     fn execute_insert_values_uncached(
@@ -1153,7 +1192,7 @@ impl Engine {
         ctx: CteCtx,
         mut plan: InsertValuesPlan,
     ) -> Result<Outcome> {
-        let bound = bind_params(params, &plan.param_types, &self.input_zone())?;
+        let bound = self.bind_insert_values_params(params, &plan)?;
         let mut meter = self.session.new_meter();
         self.fold_value_exprs(&mut plan.value_exprs, &bound, ctx, &mut meter)?;
         // The RETURNING sublinks fold after the rows materialize (below), so a VALUES evaluation
@@ -1172,7 +1211,7 @@ impl Engine {
         ctx: CteCtx,
         plan: &InsertValuesPlan,
     ) -> Result<Outcome> {
-        let bound = bind_params(params, &plan.param_types, &self.input_zone())?;
+        let bound = self.bind_insert_values_params(params, &plan)?;
         let meter = self.session.new_meter();
         self.execute_insert_values_plan_with_bound(ins, &bound, ctx, plan, meter, None)
     }
@@ -3752,7 +3791,7 @@ impl Engine {
             }
             None => None,
         };
-        let bound = bind_params(params, &ptypes.finalize()?, &self.input_zone())?;
+        let bound = plan_params::bind_part_params(params, ptypes, &self.input_zone())?;
         // From here the target scan is planned with the bound values (the custom plan).
         if planning.bind(&bound) {
             let retry = retry.expect("a probing boundary keeps its statement");
@@ -4190,7 +4229,7 @@ impl Engine {
         let relation = table.name.clone();
         // All assignment RHSs + the WHERE + the RETURNING are resolved: finalize + bind
         // before any scan.
-        let bound = bind_params(params, &ptypes.finalize()?, &self.input_zone())?;
+        let bound = plan_params::bind_part_params(params, ptypes, &self.input_zone())?;
         if planning.bind(&bound) {
             let retry = retry.expect("a probing boundary keeps its statement");
             return plan_params::restart(&bound, || self.execute_update(retry, params, ctx));

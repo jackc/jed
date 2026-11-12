@@ -86,7 +86,7 @@ import {
   scalarTypeFromName,
 } from "./types.ts";
 import { Decimal, MAX_PRECISION, MAX_SCALE } from "./decimal.ts";
-import type { Expr, OrderKey, QueryExpr, SetOpKind, TypeMod } from "./ast.ts";
+import type { Expr, OrderKey, QueryExpr, SelectItem, SetOpKind, TypeMod } from "./ast.ts";
 import { forEachGroupExpr } from "./ast.ts";
 export function evalArrayFunc(func: ArrayFuncName, vals: Value[], m: Meter): Value {
   switch (func) {
@@ -1151,17 +1151,31 @@ export function exprLocation(e: Expr): number | undefined {
 // INSERT … SELECT source (spec/design/error-fields.md §10.2): the select-list expression of a plain
 // SELECT; undefined for a `*` list or any other operand.
 // outputColumnIsStringLiteral reports whether output column i of an INSERT ... SELECT source is a
-// bare string literal that PostgreSQL leaves `unknown` for the target column to type: an item of a
-// plain SELECT's list (also under a nested WITH) that no ORDER BY or GROUP BY key names by ordinal or
-// alias. A set operation, a VALUES query, SELECT DISTINCT, or a sort/grouping key on the item
-// resolves it to text first (spec/design/grammar.md §24).
+// bare string literal that PostgreSQL leaves `unknown` for the target column to type (see
+// outputColumnUnknownItem; spec/design/grammar.md §24).
 export function outputColumnIsStringLiteral(q: QueryExpr, i: number): boolean {
-  if (q.kind === "withExpr") return outputColumnIsStringLiteral(q.body, i);
-  if (q.kind !== "select" || q.distinct || q.items.kind !== "list") return false;
+  const item = outputColumnUnknownItem(q, i);
+  return item !== undefined && item.expr.kind === "literal" && item.expr.literal.kind === "text";
+}
+
+// outputColumnParam returns the 1-based number of the bare parameter of output column i of an
+// INSERT ... SELECT source that the target column types (spec/design/api.md §5), or undefined — the
+// same positions where a string literal adapts (outputColumnUnknownItem).
+export function outputColumnParam(q: QueryExpr, i: number): number | undefined {
+  const item = outputColumnUnknownItem(q, i);
+  return item !== undefined && item.expr.kind === "param" ? item.expr.index : undefined;
+}
+
+// outputColumnUnknownItem returns the select item of output column i of an INSERT ... SELECT source
+// where PostgreSQL leaves an untyped item (a string literal or a bare parameter) `unknown` for the
+// target column to type: an item of a plain SELECT's list (also under a nested WITH) that no ORDER BY
+// or GROUP BY key names by ordinal or alias. A set operation, a VALUES query, SELECT DISTINCT, or a
+// sort/grouping key on the item resolves it to text first (spec/design/grammar.md §24).
+function outputColumnUnknownItem(q: QueryExpr, i: number): SelectItem | undefined {
+  if (q.kind === "withExpr") return outputColumnUnknownItem(q.body, i);
+  if (q.kind !== "select" || q.distinct || q.items.kind !== "list") return undefined;
   const item = q.items.items[i];
-  if (item === undefined || item.expr.kind !== "literal" || item.expr.literal.kind !== "text") {
-    return false;
-  }
+  if (item === undefined) return undefined;
   const ordinal = i + 1;
   const isAlias = (name: string) => item.alias !== null && item.alias === name;
   for (const k of q.orderBy) {
@@ -1169,7 +1183,7 @@ export function outputColumnIsStringLiteral(q: QueryExpr, i: number): boolean {
       k.ordinal === ordinal ||
       (k.ordinal === null && k.expr === null && k.qualifier === null && isAlias(k.column))
     ) {
-      return false;
+      return undefined;
     }
   }
   let grouped = false;
@@ -1182,7 +1196,7 @@ export function outputColumnIsStringLiteral(q: QueryExpr, i: number): boolean {
       }
     });
   }
-  return !grouped;
+  return grouped ? undefined : item;
 }
 
 // orderKeyLocation is where an ORDER BY key was written (spec/design/error-fields.md §10.2): an

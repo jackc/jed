@@ -263,3 +263,103 @@ pub(crate) const MEMO_CAPACITY: usize = 8;
 pub(crate) fn memo_key(bound: &[Value]) -> String {
     format!("{bound:?}")
 }
+
+/// The statement-wide parameter state of a WITH whose parts are data-modifying (writable-cte.md,
+/// api.md §5). Each part (a data-modifying CTE or the primary) resolves and binds on its own, so the
+/// WITH runs them twice: a typing pass, in which a part merges the types it inferred into `typing`
+/// and stops at its bind point, then — once the whole statement is bound — the execution, in which
+/// each part takes the statement's values instead of binding its own.
+enum StmtParams {
+    Typing { types: ParamTypes, reached: bool },
+    Bound(Vec<Value>),
+}
+
+thread_local! {
+    static STMT_PARAMS: RefCell<Vec<StmtParams>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Pops the state [`begin_part_typing`] / [`begin_part_binding`] pushed.
+pub(crate) struct StmtParamsGuard(());
+
+impl Drop for StmtParamsGuard {
+    fn drop(&mut self) {
+        STMT_PARAMS.with(|s| s.borrow_mut().pop());
+    }
+}
+
+/// Starts a WITH's typing pass, collecting into `types` (the statement's collection so far).
+pub(crate) fn begin_part_typing(types: ParamTypes) -> StmtParamsGuard {
+    STMT_PARAMS.with(|s| {
+        s.borrow_mut().push(StmtParams::Typing {
+            types,
+            reached: false,
+        })
+    });
+    StmtParamsGuard(())
+}
+
+/// Whether the part just typed reached its bind point (and so stopped there); resets the flag.
+pub(crate) fn take_part_reached() -> bool {
+    STMT_PARAMS.with(|s| match s.borrow_mut().last_mut() {
+        Some(StmtParams::Typing { reached, .. }) => std::mem::take(reached),
+        _ => false,
+    })
+}
+
+/// Ends a typing pass, returning the statement's collection.
+pub(crate) fn end_part_typing(guard: StmtParamsGuard) -> ParamTypes {
+    let types = STMT_PARAMS.with(|s| match s.borrow_mut().last_mut() {
+        Some(StmtParams::Typing { types, .. }) => std::mem::take(types),
+        _ => unreachable!("a typing pass is open"),
+    });
+    drop(guard);
+    types
+}
+
+/// Makes every data-modifying part of the WITH take the statement's bound values.
+pub(crate) fn begin_part_binding(bound: Vec<Value>) -> StmtParamsGuard {
+    STMT_PARAMS.with(|s| s.borrow_mut().push(StmtParams::Bound(bound)));
+    StmtParamsGuard(())
+}
+
+/// A part's bind point under a statement-wide state: in the typing pass it merges `ptypes` and
+/// returns an error that stops the part (the pass reads [`take_part_reached`], not the error); in
+/// the execution it returns the statement's bound values. `None` outside any such state.
+pub(crate) fn take_part_params(ptypes: &ParamTypes) -> Option<Result<Vec<Value>>> {
+    STMT_PARAMS.with(|s| match s.borrow_mut().last_mut() {
+        None => None,
+        Some(StmtParams::Bound(bound)) => Some(Ok(bound.clone())),
+        Some(StmtParams::Typing { types, reached }) => {
+            for (i, t) in ptypes.types.iter().enumerate() {
+                if let Err(e) = types.note_col(i, t.clone()) {
+                    return Some(Err(e));
+                }
+            }
+            types.uncacheable |= ptypes.uncacheable;
+            *reached = true;
+            // Never leaves the typing pass, which reads `reached`.
+            Some(Err(EngineError::new(
+                SqlState::FeatureNotSupported,
+                "statement part typed",
+            )))
+        }
+    })
+}
+
+/// Whether a statement-wide parameter state is open (a part's plan then leaves binding to it).
+pub(crate) fn part_params_active() -> bool {
+    STMT_PARAMS.with(|s| !s.borrow().is_empty())
+}
+
+/// Finalizes and binds the parameters a statement resolved into `ptypes` — or, for a part of a WITH
+/// with data-modifying parts, defers to the statement-wide state ([`take_part_params`]).
+pub(crate) fn bind_part_params(
+    params: &[Value],
+    ptypes: ParamTypes,
+    iz: &InputZone,
+) -> Result<Vec<Value>> {
+    if let Some(r) = take_part_params(&ptypes) {
+        return r;
+    }
+    bind_params(params, &ptypes.finalize()?, iz)
+}

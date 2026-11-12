@@ -1,6 +1,9 @@
 package jed
 
-import "fmt"
+import (
+	"errors"
+	"fmt"
+)
 
 // Parameter-sensitive ("custom") planning (spec/design/estimator.md §6.1).
 //
@@ -305,4 +308,51 @@ func (db *engine) resolveRowCount(c *rowCount, isLimit bool, ptypes *paramTypes)
 		return &n, nil
 	}
 	return nil, newError(DatatypeMismatch, fmt.Sprintf("argument of %s must be type bigint", what))
+}
+
+// stmtParams is the statement-wide parameter state of a WITH whose parts are data-modifying
+// (writable-cte.md, api.md §5). Each part (a data-modifying CTE or the primary) resolves and binds on
+// its own, so the WITH runs them twice: a typing pass, in which a part merges the types it inferred
+// into typing and stops before executing, then — once the whole statement is bound — the execution,
+// in which each part takes the statement's values instead of binding its own.
+type stmtParams struct {
+	typing *paramTypes
+	bound  []Value
+}
+
+// errParamsTyped ends a part's typing pass at its bind point. It never leaves runWithDml.
+var errParamsTyped = errors.New("statement part typed")
+
+// take is a part's bind point under a statement-wide parameter state: in the typing pass it merges
+// ptypes and returns errParamsTyped; in the execution it returns the statement's bound values. ok is
+// false outside any such state.
+func (sp *stmtParams) take(ptypes *paramTypes) (bound []Value, ok bool, err error) {
+	if sp == nil {
+		return nil, false, nil
+	}
+	if sp.typing == nil {
+		return sp.bound, true, nil
+	}
+	for i, t := range ptypes.types {
+		if err := sp.typing.noteCol(i, t); err != nil {
+			return nil, true, err
+		}
+	}
+	if ptypes.uncacheable {
+		sp.typing.uncacheable = true
+	}
+	return nil, true, errParamsTyped
+}
+
+// bindPartParams finalizes and binds the parameters a statement resolved into ptypes — or, for a
+// part of a WITH with data-modifying parts, defers to the statement-wide state (stmtParams.take).
+func (db *engine) bindPartParams(params []Value, ptypes *paramTypes) ([]Value, error) {
+	if bound, ok, err := db.stmtParams.take(ptypes); ok {
+		return bound, err
+	}
+	ptys, err := ptypes.finalize()
+	if err != nil {
+		return nil, err
+	}
+	return bindParams(params, ptys, db.inputZone())
 }

@@ -155,6 +155,18 @@ reference only earlier ones, which have already run when it executes. This deter
 **documented divergence** from PostgreSQL's unspecified order; it is observable only when two
 sub-statements write to overlapping keys/rows (§7), which PostgreSQL itself declares unsupported.
 
+### Bind parameters — typed and bound before any part runs
+
+A `$N` may appear in any part. Parameters are typed and bound **statement-wide** ([api.md](api.md)
+§5), as in PostgreSQL, which analyzes the whole statement before running any of it: before the
+first part executes, a typing pass resolves every data-modifying part, in the order above, against
+the bindings before it, adding the types its `$N`s take to the types the query parts gave, and then
+stops that part at its bind point. The statement binds the values once, and every part reads those
+values. So a part may use any subset of the parameters, a `$N` used in two parts unifies to one type
+and one value, and a type conflict or an untyped `$N` (`42804` / `42P18`) is reported before any part
+runs. Because a data-modifying part is resolved in the typing pass, its resolution errors also come
+before any part's execution errors.
+
 ## 4. The statement result (command tag)
 
 The `WITH` statement's result is the **primary's** result; the data-modifying CTEs' row counts are

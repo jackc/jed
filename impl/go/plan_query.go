@@ -1,6 +1,7 @@
 package jed
 
 import (
+	"errors"
 	"fmt"
 )
 
@@ -751,6 +752,13 @@ func (db *engine) runWithDml(wq *withQuery, params []Value) (outcome, error) {
 	if wq.Body.IsDataModifying() {
 		addDmlCteRefs(byName, &wq.Body)
 	}
+	modes := cteModes(bindings)
+	// (2c) Type the parameters of every data-modifying part into the statement's collection: each part
+	//      resolves as it will run and stops at its bind point (stmtParams), so a $N is typed, and
+	//      unifies, statement-wide (api.md §5) before anything executes.
+	if err := db.typeDmlParts(wq, modes, bindings, ptypes); err != nil {
+		return outcome{}, err
+	}
 	ptys, err := ptypes.finalize()
 	if err != nil {
 		return outcome{}, err
@@ -767,7 +775,10 @@ func (db *engine) runWithDml(wq *withQuery, params []Value) (outcome, error) {
 		})
 		return out, err
 	}
-	modes := cteModes(bindings)
+	// Every data-modifying part takes the statement's bound values.
+	prevParams := db.stmtParams
+	db.stmtParams = &stmtParams{bound: bound}
+	defer func() { db.stmtParams = prevParams }()
 
 	// (3) Run each CTE in list order, filling its buffer. A data-modifying CTE executes for its effect
 	//     + RETURNING buffer; the query/recursive CTEs use the shared materialize loop's logic.
@@ -865,6 +876,63 @@ func (db *engine) runWithDml(wq *withQuery, params []Value) (outcome, error) {
 	out = addOutcomeCost(out, totalCost+fkMeter.Accrued)
 	db.explainActual.recordParent("WITH", out.Cost)
 	return out, nil
+}
+
+// typeDmlParts runs the typing pass of a WITH's data-modifying parts (stmtParams): each data-modifying
+// CTE, then a data-modifying primary, resolved against the bindings before it, merges its parameter
+// types into ptypes and stops before executing.
+func (db *engine) typeDmlParts(wq *withQuery, modes []cteMode, bindings []*cteBinding, ptypes *paramTypes) error {
+	prev := db.stmtParams
+	db.stmtParams = &stmtParams{typing: ptypes}
+	defer func() { db.stmtParams = prev }()
+	buffers := make([][]storedRow, len(bindings))
+	// Every part stops at its bind point; one that returned without reaching it would have run.
+	typed := func(err error) error {
+		if err == nil {
+			panic("a data-modifying part ran during parameter typing")
+		}
+		if errors.Is(err, errParamsTyped) {
+			return nil
+		}
+		return err
+	}
+	for i := range bindings {
+		if !bindings[i].isDml() {
+			continue
+		}
+		dm := bindings[i].dm
+		ctx := topLevelCteCtx(modes[:i], bindings[:i], buffers[:i])
+		var err error
+		switch {
+		case dm.insert != nil:
+			_, err = db.executeInsert(dm.insert, nil, ctx)
+		case dm.update != nil:
+			_, err = db.executeUpdate(dm.update, nil, ctx)
+		case dm.merge != nil:
+			_, err = db.executeMerge(dm.merge, nil, ctx)
+		default:
+			_, err = db.executeDelete(dm.delete, nil, ctx)
+		}
+		if err := typed(err); err != nil {
+			return err
+		}
+	}
+	if !wq.Body.IsDataModifying() {
+		return nil // a query primary was planned into ptypes already
+	}
+	ctx := topLevelCteCtx(modes, bindings, buffers)
+	var err error
+	switch {
+	case wq.Body.Insert != nil:
+		_, err = db.executeInsert(wq.Body.Insert, nil, ctx)
+	case wq.Body.Update != nil:
+		_, err = db.executeUpdate(wq.Body.Update, nil, ctx)
+	case wq.Body.Merge != nil:
+		_, err = db.executeMerge(wq.Body.Merge, nil, ctx)
+	case wq.Body.Delete != nil:
+		_, err = db.executeDelete(wq.Body.Delete, nil, ctx)
+	}
+	return typed(err)
 }
 
 // execDmCte executes a data-modifying CTE (spec/design/writable-cte.md §3): run the INSERT/UPDATE/
@@ -2263,28 +2331,45 @@ func setopName(op setOpKind) string {
 // INSERT … SELECT source (spec/design/error-fields.md §10.2): the select-list expression of a plain
 // SELECT; unknown (0) for a `*` list or any other operand.
 // outputColumnIsStringLiteral reports whether output column i of an INSERT ... SELECT source is a
-// bare string literal that PostgreSQL leaves `unknown` for the target column to type: an item of a
-// plain SELECT's list (also under a nested WITH) that no ORDER BY or GROUP BY key names by ordinal or
-// alias. A set operation, a VALUES query, SELECT DISTINCT, or a sort/grouping key on the item
-// resolves it to text first (spec/design/grammar.md §24).
+// bare string literal that PostgreSQL leaves `unknown` for the target column to type (see
+// outputColumnUnknownItem; spec/design/grammar.md §24).
 func outputColumnIsStringLiteral(q queryExpr, i int) bool {
+	item := outputColumnUnknownItem(q, i)
+	return item != nil && item.Expr.Kind == exprLiteral && item.Expr.Literal.Kind == literalText
+}
+
+// outputColumnParam returns the bare parameter of output column i of an INSERT ... SELECT source
+// that the target column types (spec/design/api.md §5), or nil — the same positions where a string
+// literal adapts (outputColumnUnknownItem).
+func outputColumnParam(q queryExpr, i int) *exprNode {
+	item := outputColumnUnknownItem(q, i)
+	if item == nil || item.Expr.Kind != exprParam {
+		return nil
+	}
+	return &item.Expr
+}
+
+// outputColumnUnknownItem returns the select item of output column i of an INSERT ... SELECT source
+// where PostgreSQL leaves an untyped item (a string literal or a bare parameter) `unknown` for the
+// target column to type: an item of a plain SELECT's list (also under a nested WITH) that no ORDER
+// BY or GROUP BY key names by ordinal or alias. A set operation, a VALUES query, SELECT DISTINCT, or a
+// sort/grouping key on the item resolves it to text first (spec/design/grammar.md §24). nil
+// otherwise.
+func outputColumnUnknownItem(q queryExpr, i int) *selectItem {
 	if q.With != nil {
-		return outputColumnIsStringLiteral(*q.With.Body, i)
+		return outputColumnUnknownItem(*q.With.Body, i)
 	}
 	s := q.Select
 	if s == nil || s.Distinct || s.Items.All || i >= len(s.Items.Items) {
-		return false
+		return nil
 	}
-	item := s.Items.Items[i]
-	if item.Expr.Kind != exprLiteral || item.Expr.Literal.Kind != literalText {
-		return false
-	}
+	item := &s.Items.Items[i]
 	ordinal := int64(i + 1)
 	isAlias := func(name string) bool { return item.Alias != nil && *item.Alias == name }
 	for _, k := range s.OrderBy {
 		if (k.Ordinal != nil && *k.Ordinal == ordinal) ||
 			(k.Ordinal == nil && k.Expr == nil && k.Qualifier == "" && isAlias(k.Column)) {
-			return false
+			return nil
 		}
 	}
 	grouped := false
@@ -2298,7 +2383,10 @@ func outputColumnIsStringLiteral(q queryExpr, i int) bool {
 			}
 		})
 	}
-	return !grouped
+	if grouped {
+		return nil
+	}
+	return item
 }
 
 func outputColumnLocation(q queryExpr, i int) srcPos {

@@ -21,6 +21,9 @@ import (
 type engine struct {
 	// planFrames is the parameter-planning frame stack (plan_params.go, estimator.md §6.1).
 	planFrames []*planFrame
+	// stmtParams, while a WITH runs its data-modifying parts, holds the statement-wide parameter
+	// state those parts type into and bind from (plan_params.go, api.md §5).
+	stmtParams *stmtParams
 	// commitChanges reports the changed domains of the last commit (or host catalog op) to the shared
 	// session, whose publish consumes and clears it so it persists only changed domains.
 	commitChanges struct{ main, attached bool }

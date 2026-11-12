@@ -653,11 +653,7 @@ func (db *engine) executeMergeTarget(written *mergeStmt, params []Value, ctx cte
 	if err != nil {
 		return outcome{}, err
 	}
-	ptys, err := ptypes.finalize()
-	if err != nil {
-		return outcome{}, err
-	}
-	bound, err := bindParams(params, ptys, db.inputZone())
+	bound, err := db.bindPartParams(params, ptypes)
 	if err != nil {
 		return outcome{}, err
 	}

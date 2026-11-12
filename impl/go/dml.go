@@ -61,21 +61,24 @@ type insertAlwaysTarget struct{ col, pos int }
 // no session, transaction, store, pager, parameter value, meter, or statement seam. A cache hit
 // reuses this structure while all dynamic gates/evaluation remain in executeInsertValuesPlan.
 type insertValuesPlan struct {
-	table          *catTable
-	colTypes       []colType
-	pk             []int
-	checks         []namedCheck
-	viewChecks     []viewCheck
-	defaultExprs   []*rExpr
-	rindexes       []resolvedIndex
-	colls          []*Collation
-	provided       []int
-	arity          int
-	valueExprs     valueExprs
-	retNodes       []*rExpr
-	retNames       []string
-	retTypes       []string
-	ptys           []colType
+	table        *catTable
+	colTypes     []colType
+	pk           []int
+	checks       []namedCheck
+	viewChecks   []viewCheck
+	defaultExprs []*rExpr
+	rindexes     []resolvedIndex
+	colls        []*Collation
+	provided     []int
+	arity        int
+	valueExprs   valueExprs
+	retNodes     []*rExpr
+	retNames     []string
+	retTypes     []string
+	ptys         []colType
+	// partTypes is the unfinalized collection of a plan resolved as a part of a WITH with
+	// data-modifying parts (stmtParams), whose binding the statement owns; ptys is then unset.
+	partTypes      *paramTypes
 	cacheable      bool
 	alwaysTargeted []insertAlwaysTarget
 }
@@ -1357,6 +1360,19 @@ func (db *engine) executeInsertCached(ins *insert, params []Value, ctx cteCtx, i
 		// A set-operation source is planned by the same set-op planner as a top-level query
 		// (grammar.md §24/§25); its unified column types are what the assignability gate below sees.
 		ptypes := &paramTypes{}
+		// A bare $N select item that PostgreSQL leaves unknown is typed by its target column, as a
+		// VALUES slot is (spec/design/api.md §5). Noted before planning, so a use elsewhere in the
+		// query unifies with it.
+		for i, col := range table.Columns {
+			if p := provided[i]; p >= 0 {
+				if e := outputColumnParam(*ins.Query, p); e != nil {
+					ct := resolveColType(col.Type, db.readSnap().types)
+					if err := ptypes.noteCol(int(e.Param)-1, &ct); err != nil {
+						return outcome{}, err
+					}
+				}
+			}
+		}
 		plan, err := db.planQuery(*ins.Query, nil, ctx.bindings, ptypes)
 		if err != nil {
 			return outcome{}, err
@@ -1375,11 +1391,7 @@ func (db *engine) executeInsertCached(ins *insert, params []Value, ctx cteCtx, i
 				return outcome{}, err
 			}
 		}
-		ptys, err := ptypes.finalize()
-		if err != nil {
-			return outcome{}, err
-		}
-		bound, err := bindParams(params, ptys, db.inputZone())
+		bound, err := db.bindPartParams(params, ptypes)
 		if err != nil {
 			return outcome{}, err
 		}
@@ -1538,11 +1550,7 @@ func (db *engine) executeInsertCached(ins *insert, params []Value, ctx cteCtx, i
 			return outcome{}, cerr
 		}
 	}
-	ptys, err := ptypes.finalize()
-	if err != nil {
-		return outcome{}, err
-	}
-	bound, err := bindParams(params, ptys, db.inputZone())
+	bound, err := db.bindPartParams(params, ptypes)
 	if err != nil {
 		return outcome{}, err
 	}
@@ -1913,11 +1921,15 @@ func (db *engine) resolveInsertValuesPlan(ins *insert, ctx cteCtx, vw *viewWrite
 			return nil, err
 		}
 	}
-	ptys, err := ptypes.finalize()
-	if err != nil {
+	var ptys []colType
+	var partTypes *paramTypes
+	if db.stmtParams != nil {
+		partTypes = ptypes
+	} else if ptys, err = ptypes.finalize(); err != nil {
 		return nil, err
 	}
 	return &insertValuesPlan{
+		partTypes:      partTypes,
 		table:          table,
 		colTypes:       append([]colType(nil), store.colTypes...),
 		pk:             table.PKIndices(),
@@ -1942,7 +1954,10 @@ func (db *engine) resolveInsertValuesPlan(ins *insert, ctx cteCtx, vw *viewWrite
 // (before materialization) and RETURNING list (after it) fold their uncorrelated subqueries in place
 // against this execution's params (a cacheable plan has no subquery to fold).
 func (db *engine) executeInsertValuesPlan(ins *insert, params []Value, ctx cteCtx, plan *insertValuesPlan, fold bool) (outcome, error) {
-	bound, err := bindParams(params, plan.ptys, db.inputZone())
+	bound, ok, err := db.stmtParams.take(plan.partTypes)
+	if !ok {
+		bound, err = bindParams(params, plan.ptys, db.inputZone())
+	}
 	if err != nil {
 		return outcome{}, err
 	}
@@ -4059,11 +4074,7 @@ func (db *engine) executeDeleteTarget(del *deleteStmt, params []Value, ctx cteCt
 			return outcome{}, rerr
 		}
 	}
-	ptys, err := ptypes.finalize()
-	if err != nil {
-		return outcome{}, err
-	}
-	bound, err := bindParams(params, ptys, db.inputZone())
+	bound, err := db.bindPartParams(params, ptypes)
 	if err != nil {
 		return outcome{}, err
 	}
@@ -4460,11 +4471,7 @@ func (db *engine) executeUpdateTarget(upd *update, params []Value, ctx cteCtx) (
 	}
 	// All assignment RHSs + the WHERE + the RETURNING are resolved: finalize + bind before
 	// any scan.
-	ptys, err := ptypes.finalize()
-	if err != nil {
-		return outcome{}, err
-	}
-	bound, err := bindParams(params, ptys, db.inputZone())
+	bound, err := db.bindPartParams(params, ptypes)
 	if err != nil {
 		return outcome{}, err
 	}

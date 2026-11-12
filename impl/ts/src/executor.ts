@@ -671,6 +671,7 @@ import {
   orderKeyLocation,
   outputColumnIsStringLiteral,
   outputColumnLocation,
+  outputColumnParam,
   requireAssignable,
   resolveSetopOrderKey,
   resolveTypeAndTypmod,
@@ -2294,6 +2295,9 @@ export class Engine {
   // Non-null only while EXPLAIN ANALYZE executes its inner statement. Execution records exact
   // operator sub-meter snapshots here; ordinary statements pay only this null check.
   private explainActualProfile: Map<string, bigint[]> | null = null;
+  // stmtParams, while a WITH runs its data-modifying parts, holds the statement-wide parameter state
+  // those parts type into and bind from (bindPartParams, api.md §5).
+  private stmtParams: StmtParams | null = null;
   private explainActualFrames: { byNode: Map<string, bigint[]>; inclusive: bigint }[] = [];
   private explainActualFolded: Map<string, bigint[]> = new Map();
   private explainActualFoldSuppress = 0;
@@ -13124,8 +13128,11 @@ export class Engine {
       ins.returning !== null
         ? this.resolveReturning(table, ins.returning, false, ctx.bindings, ptypes, null, ins.alias)
         : null;
-    const ptys = ptypes.finalize();
+    // A part of a WITH with data-modifying parts leaves its binding to the statement (stmtParams).
+    const partTypes = this.stmtParams !== null ? ptypes : null;
+    const ptys = partTypes !== null ? [] : ptypes.finalize();
     return {
+      partTypes,
       table,
       colTypes,
       pk,
@@ -13157,7 +13164,10 @@ export class Engine {
     params: Value[],
     ctx: CteCtx,
   ): Steps<Outcome> {
-    const bound = bindParams(params, plan.ptys, this.inputZone());
+    const bound =
+      plan.partTypes !== null
+        ? this.bindPartParams(params, plan.partTypes)
+        : bindParams(params, plan.ptys, this.inputZone());
     const meter = this.session.newMeter();
     const rng = new StmtRng();
     const store = this.writeStoreScoped(ins.db, ins.table);
@@ -13438,6 +13448,14 @@ export class Engine {
       // (writable-cte.md) — the move-rows idiom INSERTs a SELECT over a CTE buffer.
       // A set-operation source is planned by the same set-op planner as a top-level query
       // (grammar.md §24/§25); its unified column types are what the assignability gate below sees.
+      // A bare $N select item that PostgreSQL leaves unknown is typed by its target column, as a
+      // VALUES slot is (api.md §5). Noted before planning, so a use elsewhere in the query unifies
+      // with it.
+      for (let i = 0; i < n; i++) {
+        const p = provided[i]!;
+        const nn = p >= 0 ? outputColumnParam(ins.source.query, p) : undefined;
+        if (nn !== undefined) ptypes.noteCol(nn - 1, this.colTypeOf(table.columns[i]!.type));
+      }
       const plan = this.planQuery(ins.source.query, null, ctx.bindings, ptypes);
       const ret =
         ins.returning !== null
@@ -13447,7 +13465,7 @@ export class Engine {
         ins.onConflict !== null
           ? this.resolveOnConflict(table, ins.onConflict, ins.alias, vw, ptypes)
           : null;
-      const bound = bindParams(params, ptypes.finalize(), this.inputZone());
+      const bound = this.bindPartParams(params, ptypes);
       if (planning.bind(bound))
         return yield* restartPlanningSteps(bound, () =>
           this.executeInsertSteps(written, params, ctx),
@@ -13606,7 +13624,7 @@ export class Engine {
       ins.onConflict !== null
         ? this.resolveOnConflict(table, ins.onConflict, ins.alias, vw, ptypes)
         : null;
-    const bound = bindParams(params, ptypes.finalize(), this.inputZone());
+    const bound = this.bindPartParams(params, ptypes);
     if (planning.bind(bound))
       return yield* restartPlanningSteps(bound, () =>
         this.executeInsertSteps(written, params, ctx),
@@ -16182,7 +16200,7 @@ export class Engine {
       del.returning !== null
         ? this.resolveReturning(table, del.returning, true, ctx.bindings, ptypes, vw)
         : null;
-    const bound = bindParams(params, ptypes.finalize(), this.inputZone());
+    const bound = this.bindPartParams(params, ptypes);
     if (planning.bind(bound))
       return yield* restartPlanningSteps(bound, () =>
         this.executeDeleteSteps(written, params, ctx),
@@ -16595,7 +16613,7 @@ export class Engine {
     const viewChecks = this.resolveViewChecks(table, vw);
     // All assignment RHSs + the WHERE + the RETURNING are resolved: finalize + bind before
     // any scan.
-    const bound = bindParams(params, ptypes.finalize(), this.inputZone());
+    const bound = this.bindPartParams(params, ptypes);
     if (planning.bind(bound))
       return yield* restartPlanningSteps(bound, () =>
         this.executeUpdateSteps(written, params, ctx),
@@ -17562,7 +17580,7 @@ export class Engine {
     const colls = this.columnCollations(table.columns);
     const ptypes = new ParamTypes();
     const plan = this.planMerge(target, table, mv, ctx.bindings, ptypes);
-    const bound = bindParams(params, ptypes.finalize(), this.inputZone());
+    const bound = this.bindPartParams(params, ptypes);
     if (planning.bind(bound))
       return yield* restartPlanningSteps(bound, () => this.executeMergeSteps(m, params, ctx));
 
@@ -18953,10 +18971,88 @@ export class Engine {
       if (cteBodyIsDataModifying(cte.body)) addDmlCteRefs(byName, cte.body);
     }
     if (cteBodyIsDataModifying(body)) addDmlCteRefs(byName, body);
+    const modes = cteModes(bindings);
+    // (2c) Type the parameters of every data-modifying part into the statement's collection: each
+    //      part resolves as it will run and stops at its bind point (stmtParams), so a $N is typed,
+    //      and unifies, statement-wide (api.md §5) before anything executes.
+    yield* this.typeDmlPartsSteps(body, modes, bindings, ptypes);
     const bound = bindParams(params, ptypes.finalize(), this.inputZone());
     if (planning.bind(bound))
       return yield* restartPlanningSteps(bound, () => this.runWithDmlSteps(wq, params));
-    const modes = cteModes(bindings);
+    // Every data-modifying part takes the statement's bound values.
+    const prevParams = this.stmtParams;
+    this.stmtParams = { typing: null, bound };
+    try {
+      return yield* this.runWithDmlPartsSteps(body, primaryPlan, modes, bindings, bound, params);
+    } finally {
+      this.stmtParams = prevParams;
+    }
+  }
+
+  // typeDmlParts runs the typing pass of a WITH's data-modifying parts (stmtParams): each
+  // data-modifying CTE, then a data-modifying primary, resolved against the bindings before it,
+  // merges its parameter types into ptypes and stops at its bind point, before executing.
+  private *typeDmlPartsSteps(
+    body: CteBody,
+    modes: CteMode[],
+    bindings: CteBinding[],
+    ptypes: ParamTypes,
+  ): Steps<void> {
+    const prev = this.stmtParams;
+    this.stmtParams = { typing: ptypes, bound: [] };
+    try {
+      const buffers: Row[][] = bindings.map(() => []);
+      const typePart = function* (
+        this: Engine,
+        stmt: CteBody,
+        ctx: CteCtx,
+      ): Steps<void> {
+        try {
+          if (stmt.kind === "insert") yield* this.executeInsertSteps(stmt, [], ctx);
+          else if (stmt.kind === "update") yield* this.executeUpdateSteps(stmt, [], ctx);
+          else if (stmt.kind === "merge") yield* this.executeMergeSteps(stmt, [], ctx);
+          else if (stmt.kind === "delete") yield* this.executeDeleteSteps(stmt, [], ctx);
+          else return;
+        } catch (e) {
+          if (e === PARAMS_TYPED) return;
+          throw e;
+        }
+        // Every part stops at its bind point; one that returned without reaching it would have run.
+        throw new Error("a data-modifying part ran during parameter typing");
+      };
+      for (let i = 0; i < bindings.length; i++) {
+        const src = bindings[i]!.source;
+        if (src.kind !== "dml") continue;
+        const ctx = topLevelCteCtx(modes.slice(0, i), bindings.slice(0, i), buffers.slice(0, i));
+        yield* typePart.call(this, src.dm.stmt, ctx);
+      }
+      yield* typePart.call(this, body, topLevelCteCtx(modes, bindings, buffers));
+    } finally {
+      this.stmtParams = prev;
+    }
+  }
+
+  // bindPartParams finalizes and binds the parameters a statement resolved into ptypes — or, for a
+  // part of a WITH with data-modifying parts, defers to the statement-wide state: in its typing pass
+  // the part merges ptypes there and stops (PARAMS_TYPED); in its execution the part takes the
+  // statement's bound values.
+  private bindPartParams(params: Value[], ptypes: ParamTypes): Value[] {
+    const sp = this.stmtParams;
+    if (sp === null) return bindParams(params, ptypes.finalize(), this.inputZone());
+    if (sp.typing === null) return sp.bound;
+    for (let i = 0; i < ptypes.types.length; i++) sp.typing.noteCol(i, ptypes.types[i] ?? null);
+    if (ptypes.uncacheable) sp.typing.uncacheable = true;
+    throw PARAMS_TYPED;
+  }
+
+  private *runWithDmlPartsSteps(
+    body: CteBody,
+    primaryPlan: QueryPlan | null,
+    modes: CteMode[],
+    bindings: CteBinding[],
+    bound: Value[],
+    params: Value[],
+  ): Steps<Outcome> {
 
     // (3) Run each CTE in list order, filling its buffer. A data-modifying CTE executes for its
     //     effect + RETURNING buffer; the query/recursive CTEs use the shared materialize loop.
@@ -41822,6 +41918,9 @@ export type InsertValuesPlan = {
   valueExprs: (RExpr | null)[][];
   returning: { nodes: RExpr[]; names: string[]; types: string[] } | null;
   ptys: ColType[];
+  // The unfinalized collection of a plan resolved as a part of a WITH with data-modifying parts,
+  // whose binding the statement owns (stmtParams); ptys is then empty.
+  partTypes: ParamTypes | null;
   cacheable: boolean;
 };
 export type InsertCache = {
@@ -41839,6 +41938,16 @@ export type InsertCacheHolder = { cache: InsertCache | null };
 //   "materialize": run the body once, buffer the rows; each reference scans the buffer, charging
 //                  cte_scan_row per buffered row.
 export type CteMode = "inline" | "materialize";
+
+// StmtParams is the statement-wide parameter state of a WITH whose parts are data-modifying
+// (writable-cte.md, api.md §5). Each part (a data-modifying CTE or the primary) resolves and binds on
+// its own, so the WITH runs them twice: a typing pass (typing set), in which a part merges the types
+// it inferred and stops at its bind point, then — once the whole statement is bound — the execution,
+// in which each part takes the statement's values instead of binding its own.
+type StmtParams = { typing: ParamTypes | null; bound: Value[] };
+
+// PARAMS_TYPED ends a part's typing pass at its bind point. It never leaves typeDmlPartsSteps.
+const PARAMS_TYPED = new Error("statement part typed");
 
 // CteBinding is a planned common table expression (spec/design/cte.md), built by planCteBindings for
 // the whole statement so the scopes that reference its synthetic `table` can see it. `name` is
