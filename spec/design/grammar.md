@@ -981,8 +981,9 @@ are the type system's, detailed in [decimal.md](decimal.md) §2–3; the grammar
 the *syntax* is `type_word "(" integer ("," integer)? ")"`.
 
 **The two-word `character varying`** ([grammar.ebnf](../grammar/grammar.ebnf) `type_word`). A type
-name is one identifier, with exactly one exception: PostgreSQL's `character varying`, the alias of
-`text` ([types.md](types.md) §15), so `character varying(n)` is `varchar(n)`. Every type position
+name is one identifier, with a few multi-word exceptions. The first is PostgreSQL's `character
+varying`, the alias of `text` ([types.md](types.md) §15), so `character varying(n)` is
+`varchar(n)`. Every type position
 — a column or composite-field definition, `ALTER COLUMN … TYPE`, `CAST(… AS …)`, `::`, a typed
 literal (`character varying 'x'`, recognized by a two-token lookahead to the string), a SQL/JSON
 `RETURNING`, a `JSON_TABLE` column, and `CREATE SEQUENCE … AS` — reads it the same way: the bare
@@ -991,6 +992,16 @@ word `character` immediately followed by the bare word `varying` (either case) i
 leaves `varying` as stray input (`42601`). A `character` not followed by `varying` stays a one-word
 name, which no type has (`42704` at resolve; the blank-padded `char(n)` / `character(n)` is out of
 scope). This two-token lookahead is a §8 determinism surface the three parsers match exactly.
+
+**The other multi-word type names.** `double precision` (the `f64` alias, [types.md](types.md) §2)
+follows the same two-bare-word rule. The SQL-standard `timestamp with time zone` and `timestamp
+without time zone` (the `timestamptz` and `timestamp` aliases) are four bare words — `timestamp`,
+`with` or `without`, `time`, `zone`, any case — recognized in every type position above; a typed
+literal (`timestamp with time zone '…'`) is recognized by a four-token lookahead to the string. As
+in PostgreSQL (`TIMESTAMP '(' Iconst ')' opt_timezone`), a precision goes between `timestamp` and the
+zone words: `timestamp(3) with time zone` is `timestamptz(3)`. Fewer than all four words, or a quoted
+one, leaves the rest as stray input (`42601`). (A typed literal with a precision,
+`timestamp(3) with time zone '…'`, is not recognized, as for every other `type(p) '…'` literal.)
 
 ## 15. Multi-table `FROM` and `JOIN`
 

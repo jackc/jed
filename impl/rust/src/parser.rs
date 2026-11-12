@@ -1686,8 +1686,8 @@ impl Parser {
     ) -> Result<ColumnDef> {
         let name = self.expect_identifier()?;
         let type_pos = self.here();
-        let base_type = self.expect_type_name()?;
-        let type_mod = self.parse_type_mod_for(&base_type)?;
+        let mut base_type = self.expect_type_name()?;
+        let type_mod = self.parse_type_mod_for(&mut base_type)?;
         let is_array = self.consume_array_brackets()?;
         let type_name = if is_array {
             format!("{base_type}[]")
@@ -1882,14 +1882,48 @@ impl Parser {
     /// The type modifier after `base_type`: for `interval`, a field qualifier
     /// (`interval DAY TO SECOND(3)`) or a precision `interval(3)` — PostgreSQL's `opt_interval` /
     /// `INTERVAL '(' Iconst ')'`, never both (spec/design/grammar.md §6, interval.md §6.1); for every
-    /// other type the parenthesized modifier.
-    fn parse_type_mod_for(&mut self, base_type: &str) -> Result<Option<TypeMod>> {
+    /// other type the parenthesized modifier. After `timestamp(p)` a trailing `WITH|WITHOUT TIME
+    /// ZONE` (PostgreSQL's `TIMESTAMP '(' Iconst ')' opt_timezone`) renames `base_type` to the
+    /// two-word alias (spec/design/grammar.md §14).
+    fn parse_type_mod_for(&mut self, base_type: &mut String) -> Result<Option<TypeMod>> {
         if base_type == "interval"
             && let Some(tm) = self.parse_interval_qualifier()?
         {
             return Ok(Some(tm));
         }
-        self.parse_type_mod()
+        let tm = self.parse_type_mod()?;
+        if tm.is_some()
+            && base_type == "timestamp"
+            && let Some(with) = self.consume_time_zone_suffix()
+        {
+            *base_type = timestamp_alias(with).to_string();
+        }
+        Ok(tm)
+    }
+
+    /// Whether the next three tokens are the bare words `WITH TIME ZONE` (`Some(true)`) or
+    /// `WITHOUT TIME ZONE` (`Some(false)`); if so they are consumed (spec/design/grammar.md §14).
+    fn consume_time_zone_suffix(&mut self) -> Option<bool> {
+        let with = match self.peek_keyword() {
+            Some("with") => true,
+            Some("without") => false,
+            _ => return None,
+        };
+        if self.peek_keyword_at(1) != Some("time") || self.peek_keyword_at(2) != Some("zone") {
+            return None;
+        }
+        self.bump(); // WITH | WITHOUT
+        self.bump(); // TIME
+        self.bump(); // ZONE
+        Some(with)
+    }
+
+    /// Whether the cursor is at `TIMESTAMP WITH|WITHOUT TIME ZONE` (four bare words).
+    fn at_timestamp_time_zone(&self) -> bool {
+        self.peek_keyword() == Some("timestamp")
+            && matches!(self.peek_keyword_at(1), Some("with" | "without"))
+            && self.peek_keyword_at(2) == Some("time")
+            && self.peek_keyword_at(3) == Some("zone")
     }
 
     /// An interval field qualifier, if the next word starts one: a field (`YEAR`, `MONTH`, `DAY`,
@@ -2446,8 +2480,8 @@ impl Parser {
         let mut fields = Vec::new();
         loop {
             let fname = self.expect_identifier()?;
-            let base_type = self.expect_type_name()?;
-            let type_mod = self.parse_type_mod_for(&base_type)?;
+            let mut base_type = self.expect_type_name()?;
+            let type_mod = self.parse_type_mod_for(&mut base_type)?;
             // An array-typed field (`xs i32[]`) — the same `[]` suffix a column type takes
             // (spec/design/array.md §1); the canonical spelling carries the brackets.
             let type_name = if self.consume_array_brackets()? {
@@ -3095,8 +3129,8 @@ impl Parser {
     }
 
     fn parse_alter_column_type(&mut self) -> Result<AlterColumnKind> {
-        let base = self.expect_type_name()?;
-        let type_mod = self.parse_type_mod_for(&base)?;
+        let mut base = self.expect_type_name()?;
+        let type_mod = self.parse_type_mod_for(&mut base)?;
         let type_name = if self.consume_array_brackets()? {
             format!("{base}[]")
         } else {
@@ -6596,8 +6630,8 @@ impl Parser {
                     let cast_pos = self.here();
                     self.bump();
                     let type_pos = self.here();
-                    let base_type = self.expect_type_name()?;
-                    let type_mod = self.parse_type_mod_for(&base_type)?;
+                    let mut base_type = self.expect_type_name()?;
+                    let type_mod = self.parse_type_mod_for(&mut base_type)?;
                     let is_array = self.consume_array_brackets()?;
                     let type_name = if is_array {
                         format!("{base_type}[]")
@@ -6752,8 +6786,8 @@ impl Parser {
                 let inner = self.parse_expr()?;
                 self.expect_keyword("as")?;
                 let type_pos = self.here();
-                let base_type = self.expect_type_name()?;
-                let type_mod = self.parse_type_mod_for(&base_type)?;
+                let mut base_type = self.expect_type_name()?;
+                let type_mod = self.parse_type_mod_for(&mut base_type)?;
                 let is_array = self.consume_array_brackets()?;
                 let type_name = if is_array {
                     format!("{base_type}[]")
@@ -6909,12 +6943,14 @@ impl Parser {
                 unreachable!("peeked a string literal after the type name");
             });
         }
-        // Two-word typed literals (types.md §2/§15).
-        if ((self.peek_keyword().as_deref() == Some("character")
+        // Multi-word typed literals (types.md §2/§15, grammar.md §14).
+        if (((self.peek_keyword().as_deref() == Some("character")
             && self.peek_keyword_at(1).as_deref() == Some("varying"))
             || (self.peek_keyword().as_deref() == Some("double")
                 && self.peek_keyword_at(1).as_deref() == Some("precision")))
-            && matches!(self.tokens.get(self.pos + 2), Some(Token::Str(_)))
+            && matches!(self.tokens.get(self.pos + 2), Some(Token::Str(_))))
+            || (self.at_timestamp_time_zone()
+                && matches!(self.tokens.get(self.pos + 4), Some(Token::Str(_))))
         {
             return outline(|| {
                 let type_pos = self.here();
@@ -7802,7 +7838,8 @@ impl Parser {
     /// resolves to `text` exactly like `varchar`. Any other `character` stays a one-word name
     /// (unknown type → 42704 at resolve). A CLAUDE.md §8 cross-core determinism surface
     /// (spec/design/grammar.md §14).
-    /// Also accepts the bare keyword pair DOUBLE PRECISION as the f64 alias (types.md §2).
+    /// Also accepts the bare keyword pair DOUBLE PRECISION as the f64 alias (types.md §2), and
+    /// `TIMESTAMP WITH|WITHOUT TIME ZONE` as the timestamptz / timestamp aliases (four bare words).
     fn expect_type_name(&mut self) -> Result<String> {
         if self.peek_keyword().as_deref() == Some("double")
             && self.peek_keyword_at(1).as_deref() == Some("precision")
@@ -7817,6 +7854,13 @@ impl Parser {
             self.bump(); // CHARACTER
             self.bump(); // VARYING
             return Ok("character varying".to_string());
+        }
+        if self.at_timestamp_time_zone() {
+            self.bump(); // TIMESTAMP
+            let with = self
+                .consume_time_zone_suffix()
+                .expect("peeked WITH|WITHOUT TIME ZONE");
+            return Ok(timestamp_alias(with).to_string());
         }
         self.expect_identifier()
     }
@@ -8513,4 +8557,13 @@ pub(crate) fn recursive_view_wrapper(name: &str, cols: &[String]) -> (Vec<Token>
     list(&mut suffix);
     suffix.extend([Token::Word("from".into()), quoted(name)]);
     (prefix, suffix)
+}
+
+/// The catalog alias `TIMESTAMP WITH|WITHOUT TIME ZONE` names (spec/types/scalars.toml).
+fn timestamp_alias(with: bool) -> &'static str {
+    if with {
+        "timestamp with time zone"
+    } else {
+        "timestamp without time zone"
+    }
 }

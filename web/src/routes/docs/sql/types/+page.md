@@ -74,6 +74,7 @@
 	const precisionDemo = `SELECT
   '2024-01-15 10:30:45.678'::timestamp(1)   AS rounded,
   '2024-01-15 10:30:45.5'::timestamp(0)     AS half_rounds_up,
+  '2024-01-15 10:30:45.5+00'::timestamp(0) with time zone AS standard_spelling,
   interval '1 day 02:03:04.5' hour          AS cut_to_hours,
   interval '2:03' minute to second          AS min_sec,
   interval '5' day                          AS unitless_days,
@@ -456,6 +457,9 @@ A `timestamp` or `timestamptz` may declare a **precision**, the number of fracti
 it keeps: `timestamp(3)`, `timestamptz(0)` (0 through 6; a larger precision means 6). A value stored
 in such a column or cast to such a type is **rounded**, not truncated, exactly as in PostgreSQL —
 including PostgreSQL's quirk that a half second rounds *up* after 2000-01-01 and *down* before it.
+The SQL-standard spellings `timestamp with time zone` (= `timestamptz`) and `timestamp without time
+zone` (= `timestamp`) work in every type position, with the precision before the zone words:
+`timestamp(3) with time zone`.
 
 An `interval` may declare **fields** — `YEAR`, `MONTH`, `DAY`, `HOUR`, `MINUTE`, `SECOND`, or a range
 such as `YEAR TO MONTH`, `DAY TO SECOND`, `MINUTE TO SECOND` — and a precision, `interval(3)` or

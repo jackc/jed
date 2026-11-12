@@ -509,6 +509,7 @@ alter_sequence_option ::= sequence_option | "RESTART" ("WITH"? signed_integer)?
  * after a trailing SECOND — or a bare precision, never both (interval_typmod;
  * ../design/interval.md §6.1). type_name appears in a column_def and in CAST(expr AS type_name). */
 type_name      ::= type_word ("(" integer ("," integer)? ")")?
+                 | "timestamp" "(" integer ")" time_zone_words
                  | "interval" interval_typmod?
 /* The thirteen SQL interval qualifiers (../types/datetime_units.toml interval_qualifier), bare
  * words only; any other TO pairing, or a precision after a field other than a trailing SECOND, is
@@ -522,12 +523,17 @@ interval_field_q ::= "year" ("to" "month")?
                    | "minute" ("to" interval_second)?
                    | interval_second
 interval_second ::= "second" ("(" integer ")")?
-/* The one two-word type name: PostgreSQL's "character varying" (two BARE words — a quoted
- * "character" is an ordinary identifier), the alias of text/varchar, so `character varying(n)` is
- * varchar(n) (../design/types.md §15). Every type position (column/field definition, ALTER … TYPE,
- * CAST, `::`, a typed literal, JSON RETURNING, a JSON_TABLE column, CREATE SEQUENCE … AS) reads
- * type_word. ../design/grammar.md §14. */
-type_word      ::= "character" "varying" | identifier
+/* The multi-word type names, all BARE words (a quoted word is an ordinary identifier):
+ * PostgreSQL's "character varying", the alias of text/varchar, so `character varying(n)` is
+ * varchar(n) (../design/types.md §15); "double precision", the f64 alias; and the SQL-standard
+ * "timestamp with time zone" / "timestamp without time zone", the timestamptz / timestamp
+ * aliases. Every type position (column/field definition, ALTER … TYPE, CAST, `::`, a typed
+ * literal, JSON RETURNING, a JSON_TABLE column, CREATE SEQUENCE … AS) reads type_word. A
+ * precision typmod sits between "timestamp" and the zone words, PostgreSQL's
+ * TIMESTAMP '(' Iconst ')' opt_timezone. ../design/grammar.md §14. */
+type_word      ::= "character" "varying" | "double" "precision"
+                 | "timestamp" time_zone_words | identifier
+time_zone_words ::= ("with" | "without") "time" "zone"
 
 /* --- DML ----------------------------------------------------------------- */
 

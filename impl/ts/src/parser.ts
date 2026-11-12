@@ -1736,8 +1736,7 @@ class Parser {
   ): ColumnDef {
     const name = this.expectIdentifier();
     const typeLoc = this.here();
-    const baseType = this.expectTypeName();
-    const typeMod = this.parseTypeModFor(baseType);
+    const { baseType, typeMod } = this.parseTypeModFor(this.expectTypeName());
     const typeName = this.consumeArrayBrackets() ? baseType + "[]" : baseType;
     // Zero or more order-free column constraints: PRIMARY KEY, NOT NULL, DEFAULT <literal>,
     // [CONSTRAINT name] CHECK ( expr ), and [CONSTRAINT name] UNIQUE. A boolean constraint
@@ -1888,12 +1887,44 @@ class Parser {
   // (`interval DAY TO SECOND(3)`) or a precision `interval(3)` — PostgreSQL's opt_interval /
   // `INTERVAL '(' Iconst ')'`, never both (spec/design/grammar.md §6, interval.md §6.1); for every
   // other type the parenthesized modifier.
-  private parseTypeModFor(baseType: string): TypeMod | null {
+  // After `timestamp(p)` a trailing `WITH|WITHOUT TIME ZONE` (PostgreSQL's `TIMESTAMP '(' Iconst ')'
+  // opt_timezone`) renames the base type to the two-word alias (spec/design/grammar.md §14), so the
+  // possibly-renamed base type is returned with the modifier.
+  private parseTypeModFor(baseType: string): { baseType: string; typeMod: TypeMod | null } {
     if (baseType === "interval") {
       const tm = this.parseIntervalQualifier();
-      if (tm !== null) return tm;
+      if (tm !== null) return { baseType, typeMod: tm };
     }
-    return this.parseTypeMod();
+    const typeMod = this.parseTypeMod();
+    if (typeMod !== null && baseType === "timestamp") {
+      const withZone = this.consumeTimeZoneSuffix();
+      if (withZone !== null) return { baseType: timestampAlias(withZone), typeMod };
+    }
+    return { baseType, typeMod };
+  }
+
+  // consumeTimeZoneSuffix consumes the bare words `WITH TIME ZONE` (true) or `WITHOUT TIME ZONE`
+  // (false) if they are next; null when they are not (spec/design/grammar.md §14).
+  private consumeTimeZoneSuffix(): boolean | null {
+    const kw = this.peekKeyword();
+    if (kw !== "with" && kw !== "without") return null;
+    if (this.peekKeywordAt(1) !== "time" || this.peekKeywordAt(2) !== "zone") return null;
+    this.advance(); // WITH | WITHOUT
+    this.advance(); // TIME
+    this.advance(); // ZONE
+    return kw === "with";
+  }
+
+  // atTimestampTimeZone reports whether the cursor is at `TIMESTAMP WITH|WITHOUT TIME ZONE` (four
+  // bare words).
+  private atTimestampTimeZone(): boolean {
+    const kw1 = this.peekKeywordAt(1);
+    return (
+      this.peekKeyword() === "timestamp" &&
+      (kw1 === "with" || kw1 === "without") &&
+      this.peekKeywordAt(2) === "time" &&
+      this.peekKeywordAt(3) === "zone"
+    );
   }
 
   // parseIntervalQualifier parses an interval field qualifier, if the next word starts one: a field
@@ -2130,8 +2161,7 @@ class Parser {
     const fields: TypeFieldDef[] = [];
     for (;;) {
       const fname = this.expectIdentifier();
-      const baseType = this.expectTypeName();
-      const typeMod = this.parseTypeModFor(baseType);
+      const { baseType, typeMod } = this.parseTypeModFor(this.expectTypeName());
       // An array-typed field (`xs i32[]`) — the same `[]` suffix a column type takes
       // (spec/design/array.md §12); the canonical spelling carries the brackets.
       const typeName = this.consumeArrayBrackets() ? baseType + "[]" : baseType;
@@ -2653,8 +2683,9 @@ class Parser {
   }
 
   private parseAlterColumnType(): Extract<AlterColumnAction["action"], { kind: "setType" }> {
-    let typeName = this.expectTypeName();
-    const typeMod = this.parseTypeModFor(typeName);
+    const parsed = this.parseTypeModFor(this.expectTypeName());
+    const typeMod = parsed.typeMod;
+    let typeName = parsed.baseType;
     if (this.consumeArrayBrackets()) typeName += "[]";
     let using: Expr | null = null;
     if (this.peekKeyword() === "using") {
@@ -5599,8 +5630,7 @@ class Parser {
     const castLoc = this.here();
     this.advance();
     const typeLoc = this.here();
-    const baseType = this.expectTypeName();
-    const typeMod = this.parseTypeModFor(baseType);
+    const { baseType, typeMod } = this.parseTypeModFor(this.expectTypeName());
     const typeName = this.consumeArrayBrackets() ? baseType + "[]" : baseType;
     return { kind: "cast", inner: expr, typeName, typeMod, castLoc, typeLoc };
   }
@@ -5680,11 +5710,12 @@ class Parser {
       this.tokens[this.pos + 1]?.kind === "str"
     )
       return this.parseTypedLiteral();
-    // Two-word typed literals (types.md §2/§15).
+    // Multi-word typed literals (types.md §2/§15, grammar.md §14).
     if (
-      ((tlKw === "character" && this.peekKeywordAt(1) === "varying") ||
+      (((tlKw === "character" && this.peekKeywordAt(1) === "varying") ||
         (tlKw === "double" && this.peekKeywordAt(1) === "precision")) &&
-      this.tokens[this.pos + 2]?.kind === "str"
+        this.tokens[this.pos + 2]?.kind === "str") ||
+      (this.atTimestampTimeZone() && this.tokens[this.pos + 4]?.kind === "str")
     )
       return this.parseMultiwordTypedLiteral();
     // The SQL/JSON query functions `JSON_EXISTS` / `JSON_VALUE` / `JSON_QUERY`
@@ -5947,8 +5978,7 @@ class Parser {
     const inner = this.parseExpr();
     this.expectKeyword("as");
     const typeLoc = this.here();
-    const baseType = this.expectTypeName();
-    const typeMod = this.parseTypeModFor(baseType);
+    const { baseType, typeMod } = this.parseTypeModFor(this.expectTypeName());
     const typeName = this.consumeArrayBrackets() ? baseType + "[]" : baseType;
     this.expect("rparen");
     return { kind: "cast", inner, typeName, typeMod, loc, castLoc: loc, typeLoc };
@@ -6891,7 +6921,8 @@ class Parser {
   // identifier) — and returns the alias "character varying", which the catalog resolves to text
   // exactly like varchar. Any other `character` stays a one-word name (unknown type → 42704 at
   // resolve). A CLAUDE.md §8 cross-core determinism surface (spec/design/grammar.md §14).
-  // Also accepts the bare keyword pair DOUBLE PRECISION as the f64 alias (types.md §2).
+  // Also accepts the bare keyword pair DOUBLE PRECISION as the f64 alias (types.md §2), and
+  // `TIMESTAMP WITH|WITHOUT TIME ZONE` as the timestamptz / timestamp aliases (four bare words).
   private expectTypeName(): string {
     if (this.peekKeyword() === "double" && this.peekKeywordAt(1) === "precision") {
       this.advance(); // DOUBLE
@@ -6902,6 +6933,10 @@ class Parser {
       this.advance(); // CHARACTER
       this.advance(); // VARYING
       return "character varying";
+    }
+    if (this.atTimestampTimeZone()) {
+      this.advance(); // TIMESTAMP
+      return timestampAlias(this.consumeTimeZoneSuffix()!);
     }
     return this.expectIdentifier();
   }
@@ -7337,4 +7372,10 @@ export function recursiveViewWrapper(name: string, cols: string[]): [Token[], To
   list(suffix);
   suffix.push({ kind: "word", word: "from" }, quotedTok(name));
   return [prefix, suffix];
+}
+
+// timestampAlias is the catalog alias `TIMESTAMP WITH|WITHOUT TIME ZONE` names
+// (spec/types/scalars.toml).
+function timestampAlias(withZone: boolean): string {
+  return withZone ? "timestamp with time zone" : "timestamp without time zone";
 }

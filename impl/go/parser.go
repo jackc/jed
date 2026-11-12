@@ -1886,7 +1886,7 @@ func (p *parser) parseColumnDef(tableName string, checks *[]checkDef, uniques *[
 	if err != nil {
 		return columnDef{}, err
 	}
-	typeMod, err := p.parseTypeModFor(typeName)
+	typeMod, err := p.parseTypeModFor(&typeName)
 	if err != nil {
 		return columnDef{}, err
 	}
@@ -2088,9 +2088,11 @@ func (p *parser) parseTypeMod() (*typeMod, error) {
 // parseTypeModFor parses the type modifier after baseType: for `interval`, a field qualifier
 // (`interval DAY TO SECOND(3)`) or a precision `interval(3)` — PostgreSQL's opt_interval /
 // `INTERVAL '(' Iconst ')'`, never both (spec/design/grammar.md §6, interval.md §6.1); for every
-// other type the parenthesized modifier.
-func (p *parser) parseTypeModFor(baseType string) (*typeMod, error) {
-	if baseType == "interval" {
+// other type the parenthesized modifier. After `timestamp(p)` a trailing `WITH|WITHOUT TIME ZONE`
+// (PostgreSQL's `TIMESTAMP '(' Iconst ')' opt_timezone`) renames *baseType to the two-word alias
+// (spec/design/grammar.md §14).
+func (p *parser) parseTypeModFor(baseType *string) (*typeMod, error) {
+	if *baseType == "interval" {
 		tm, err := p.parseIntervalQualifier()
 		if err != nil {
 			return nil, err
@@ -2099,7 +2101,53 @@ func (p *parser) parseTypeModFor(baseType string) (*typeMod, error) {
 			return tm, nil
 		}
 	}
-	return p.parseTypeMod()
+	tm, err := p.parseTypeMod()
+	if err != nil {
+		return nil, err
+	}
+	if tm != nil && *baseType == "timestamp" {
+		if with, ok := p.consumeTimeZoneSuffix(); ok {
+			*baseType = timestampAlias(with)
+		}
+	}
+	return tm, nil
+}
+
+// consumeTimeZoneSuffix consumes the bare words `WITH TIME ZONE` (with = true) or `WITHOUT TIME
+// ZONE` (with = false) if they are next; ok reports whether it did (spec/design/grammar.md §14).
+func (p *parser) consumeTimeZoneSuffix() (with bool, ok bool) {
+	switch p.peekKeyword() {
+	case "with":
+		with = true
+	case "without":
+		with = false
+	default:
+		return false, false
+	}
+	if p.peekKeywordAt(1) != "time" || p.peekKeywordAt(2) != "zone" {
+		return false, false
+	}
+	p.advance() // WITH | WITHOUT
+	p.advance() // TIME
+	p.advance() // ZONE
+	return with, true
+}
+
+// atTimestampTimeZone reports whether the cursor is at `TIMESTAMP WITH|WITHOUT TIME ZONE` (four
+// bare words).
+func (p *parser) atTimestampTimeZone() bool {
+	kw1 := p.peekKeywordAt(1)
+	return p.peekKeyword() == "timestamp" && (kw1 == "with" || kw1 == "without") &&
+		p.peekKeywordAt(2) == "time" && p.peekKeywordAt(3) == "zone"
+}
+
+// timestampAlias is the catalog alias `TIMESTAMP WITH|WITHOUT TIME ZONE` names
+// (spec/types/scalars.toml).
+func timestampAlias(with bool) string {
+	if with {
+		return "timestamp with time zone"
+	}
+	return "timestamp without time zone"
 }
 
 // intervalFieldWord reports whether w is one of the six interval field words.
@@ -2729,7 +2777,7 @@ func (p *parser) parseFieldDefList() ([]typeFieldDef, error) {
 		if err != nil {
 			return nil, err
 		}
-		typeMod, err := p.parseTypeModFor(typeName)
+		typeMod, err := p.parseTypeModFor(&typeName)
 		if err != nil {
 			return nil, err
 		}
@@ -3443,7 +3491,7 @@ func (p *parser) parseAlterColumnType(a *alterColumnAction) error {
 	if err != nil {
 		return err
 	}
-	tm, err := p.parseTypeModFor(base)
+	tm, err := p.parseTypeModFor(&base)
 	if err != nil {
 		return err
 	}
@@ -7172,7 +7220,7 @@ func (p *parser) parsePostfix() (exprNode, error) {
 			if err != nil {
 				return exprNode{}, err
 			}
-			typeMod, err := p.parseTypeModFor(typeName)
+			typeMod, err := p.parseTypeModFor(&typeName)
 			if err != nil {
 				return exprNode{}, err
 			}
@@ -7416,7 +7464,7 @@ func (p *parser) parsePrimary() (exprNode, error) {
 		if err != nil {
 			return exprNode{}, err
 		}
-		typeMod, err := p.parseTypeModFor(typeName)
+		typeMod, err := p.parseTypeModFor(&typeName)
 		if err != nil {
 			return exprNode{}, err
 		}
@@ -7492,9 +7540,10 @@ func (p *parser) parsePrimary() (exprNode, error) {
 		}
 		return exprNode{Kind: exprTypedLiteral, TypeLitName: name, TypeLitText: t.Word, TypeLitPos: typePos, Pos: pos}, nil
 	}
-	// Two-word typed literals (types.md §2/§15).
-	if ((p.peekKeyword() == "character" && p.peekKeywordAt(1) == "varying") ||
-		(p.peekKeyword() == "double" && p.peekKeywordAt(1) == "precision")) && p.peekKindAt(2) == tokStr {
+	// Multi-word typed literals (types.md §2/§15, grammar.md §14).
+	if (((p.peekKeyword() == "character" && p.peekKeywordAt(1) == "varying") ||
+		(p.peekKeyword() == "double" && p.peekKeywordAt(1) == "precision")) && p.peekKindAt(2) == tokStr) ||
+		(p.atTimestampTimeZone() && p.peekKindAt(4) == tokStr) {
 		typePos := p.here()
 		name, err := p.expectTypeName()
 		if err != nil {
@@ -8523,7 +8572,8 @@ func (p *parser) expectKeyword(kw string) error {
 // returns the alias "character varying", which the catalog resolves to text exactly like varchar.
 // Any other `character` stays a one-word name (unknown type → 42704 at resolve). A CLAUDE.md §8
 // cross-core determinism surface (spec/design/grammar.md §14).
-// Also accepts the bare keyword pair DOUBLE PRECISION as the f64 alias (types.md §2).
+// Also accepts the bare keyword pair DOUBLE PRECISION as the f64 alias (types.md §2), and
+// `TIMESTAMP WITH|WITHOUT TIME ZONE` as the timestamptz / timestamp aliases (four bare words).
 func (p *parser) expectTypeName() (string, error) {
 	if p.peekKeyword() == "double" && p.peekKeywordAt(1) == "precision" {
 		p.advance() // DOUBLE
@@ -8534,6 +8584,11 @@ func (p *parser) expectTypeName() (string, error) {
 		p.advance() // CHARACTER
 		p.advance() // VARYING
 		return "character varying", nil
+	}
+	if p.atTimestampTimeZone() {
+		p.advance() // TIMESTAMP
+		with, _ := p.consumeTimeZoneSuffix()
+		return timestampAlias(with), nil
 	}
 	return p.expectIdentifier()
 }
