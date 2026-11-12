@@ -746,6 +746,31 @@ func compactLeafTableDB(t *testing.T) *Session {
 	return db
 }
 
+// multiwaySplitDB is a tree shaped by single-row edits that take the multi-way leaf split
+// (format.md "Multi-way split"). Table a: a dense leaf whose v column stores no offsets; one
+// replaced row and one inserted row each widen their leaf, which splits in three. Table b: keys
+// outside a shared prefix land at a leaf's edge and split two-way.
+func multiwaySplitDB(t *testing.T) *Session {
+	db := newInMemoryWithPageSize(goldenPageSize, goldenEnv()).Session(SessionOptions{})
+	run(t, db, "CREATE TABLE a (id i32 PRIMARY KEY, v i64)")
+	for i := 1; i <= 600; i++ {
+		if i != 400 {
+			run(t, db, fmt.Sprintf("INSERT INTO a VALUES (%d, 7)", i))
+		}
+	}
+	run(t, db, "UPDATE a SET v = 4000000000000 WHERE id = 60")
+	run(t, db, "INSERT INTO a VALUES (400, -4000000000000)")
+	run(t, db, "CREATE TABLE b (k text PRIMARY KEY, n i32)")
+	for i := 0; i < 64; i++ {
+		run(t, db, fmt.Sprintf("INSERT INTO b VALUES ('customer/acct/%03d', 1)", i))
+	}
+	run(t, db, "INSERT INTO b VALUES ('a', 2)")
+	run(t, db, "INSERT INTO b VALUES ('z', 3)")
+	run(t, db, "INSERT INTO b VALUES ('customer/b', 5)")
+	run(t, db, "INSERT INTO b VALUES ('customer/a', 4)")
+	return db
+}
+
 // byteaTableDB exercises the value codec's bytea branch (u16 length + raw bytes): a multi-
 // byte value (a-f hex), the empty byte string, embedded 0x00 bytes, a high byte (0xFF), a
 // NULL, and a lone 0x00. The PK stays i32 (no bytea key this slice). Literals are the `\x`
@@ -1266,6 +1291,7 @@ func TestWriteMatchesGoldens(t *testing.T) {
 		{"decimal_table.jed", decimalTableDB},
 		{"decimal_fixed_table.jed", decimalFixedTableDB},
 		{"compact_leaf_table.jed", compactLeafTableDB},
+		{"multiway_split.jed", multiwaySplitDB},
 		{"bytea_table.jed", byteaTableDB},
 		{"text_pk_table.jed", textPKTableDB},
 		{"bytea_pk_table.jed", byteaPKTableDB},

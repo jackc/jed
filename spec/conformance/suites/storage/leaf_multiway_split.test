@@ -1,0 +1,158 @@
+# Multi-way leaf split (format.md "Multi-way split"). A v52 leaf's size depends on its content: a
+# column whose values are all close together, a column with few distinct strings, and keys sharing a
+# prefix each store far less than their plain size, so one leaf can hold several pages' worth of
+# plain rows. Changing one record can then widen the whole leaf (a wider offset, a lost prefix), and
+# no division in two fits: the half holding the changed record is still too large. The leaf splits
+# into up to three. Before that rule the oversized leaf reached the commit, which refused it with
+# 0A000. Each block builds a dense tree, changes single records in it, and checks the rows; the
+# deletes at the end run the merge path over the result. Runs in memory and on disk.
+# requires: query.select, query.aggregates, query.where_eq, query.set_returning, ddl.create_table, ddl.primary_key, ddl.secondary_index, dml.insert, dml.insert_select, dml.update, dml.delete, types.i32, types.i64, types.text, types.array
+
+# Base-plus-offsets: every v is 0, so the column stores no offsets; one large v needs four bytes a row.
+statement ok
+CREATE TABLE a (id bigint PRIMARY KEY, v integer)
+
+statement ok
+INSERT INTO a SELECT g, 0 FROM generate_series(1, 20000) AS g
+
+statement ok
+UPDATE a SET v = 2000000000 WHERE id = 10000
+
+query II nosort
+SELECT count(*), sum(v) FROM a
+----
+20000
+2000000000
+
+statement ok
+UPDATE a SET v = -2000000000 WHERE id = 3
+
+statement ok
+UPDATE a SET v = 7 WHERE id = 19999
+
+statement ok
+UPDATE a SET v = 5 WHERE id % 100 = 0
+
+query IIII nosort
+SELECT count(*), sum(v), min(v), max(v) FROM a
+----
+20000
+-1999998993
+-2000000000
+7
+
+query I nosort
+SELECT v FROM a WHERE id = 10000
+----
+5
+
+statement ok
+DELETE FROM a WHERE id % 2 = 1
+
+query II nosort
+SELECT count(*), sum(v) FROM a
+----
+10000
+1000
+
+# Shared key prefix: 5000 keys share 200 bytes; a key outside the prefix lands at either end, and
+# one sharing half of it at either end.
+statement ok
+CREATE TABLE b (k text PRIMARY KEY, n integer)
+
+statement ok
+INSERT INTO b SELECT repeat('p', 200) || lpad(g::text, 6, '0'), 1 FROM generate_series(1, 5000) AS g
+
+statement ok
+INSERT INTO b VALUES ('a', 2)
+
+statement ok
+INSERT INTO b VALUES ('z', 3)
+
+statement ok
+INSERT INTO b VALUES (repeat('p', 100) || 'a', 4)
+
+statement ok
+INSERT INTO b VALUES (repeat('p', 100) || 'q', 5)
+
+query IITT nosort
+SELECT count(*), sum(n), min(k), max(k) FROM b
+----
+5004
+5014
+a
+z
+
+query I nosort
+SELECT n FROM b WHERE k = repeat('p', 100) || 'q'
+----
+5
+
+statement ok
+DELETE FROM b WHERE n = 1 AND k < repeat('p', 200) || '004000'
+
+query II nosort
+SELECT count(*), sum(n) FROM b
+----
+1005
+1015
+
+# Dictionary and an index whose keys share a prefix: one string in every row, then distinct ones.
+statement ok
+CREATE TABLE c (id integer PRIMARY KEY, s text, t integer)
+
+statement ok
+CREATE INDEX c_s_idx ON c (s)
+
+statement ok
+INSERT INTO c SELECT g, 'same', 0 FROM generate_series(1, 20000) AS g
+
+statement ok
+UPDATE c SET s = 'aaa' WHERE id = 10001
+
+statement ok
+UPDATE c SET s = 'row' || id::text WHERE id % 7 = 0
+
+query II nosort
+SELECT count(*), count(DISTINCT s) FROM c
+----
+20000
+2859
+
+query I nosort
+SELECT count(*) FROM c WHERE s = 'same'
+----
+17142
+
+query I nosort
+SELECT id FROM c WHERE s = 'aaa'
+----
+10001
+
+statement ok
+DELETE FROM c WHERE s = 'same'
+
+query I nosort
+SELECT count(*) FROM c
+----
+2858
+
+# Packed integer arrays: small elements pack into a few bits; one array of large elements widens them.
+statement ok
+CREATE TABLE d (id integer PRIMARY KEY, xs bigint[])
+
+statement ok
+INSERT INTO d SELECT g, ARRAY[g % 4, 1, 2] FROM generate_series(1, 5000) AS g
+
+statement ok
+UPDATE d SET xs = ARRAY[9000000000000000000, -9000000000000000000] WHERE id = 2500
+
+query I nosort
+SELECT count(*) FROM d WHERE xs = ARRAY[1, 1, 2]::bigint[]
+----
+1250
+
+query T nosort
+SELECT xs::text FROM d WHERE id = 2500
+----
+{9000000000000000000,-9000000000000000000}

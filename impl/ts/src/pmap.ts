@@ -633,10 +633,22 @@ export class PMap {
       cap,
       shape,
     );
-    this.root =
-      out.whole !== null
-        ? out.whole
-        : newInterior([out.sep], [residentRef(out.left), residentRef(out.right)], generation);
+    // A split root grows the tree by one level. A multi-way split hands up several separators, and
+    // the new root is built like any interior (it may split in turn).
+    let top = out;
+    while (top.whole === null) {
+      const keys = [top.sep];
+      const children = [residentRef(top.left), residentRef(top.right)];
+      for (const p of top.more) {
+        keys.push(p.sep);
+        children.push(residentRef(p.node));
+      }
+      // No fitting root (near-cap separators): leave it whole (0A000 at serialize).
+      top = buildInterior(keys, children, cap, null, generation, true) ?? {
+        whole: newInterior(keys, children, generation),
+      };
+    }
+    this.root = top.whole;
     if (!ctx.replaced && this.rowCount !== null) this.rowCount += 1n;
     return ctx.old;
   }
@@ -1167,7 +1179,44 @@ type InsCtx = { old: Row | undefined; replaced: boolean };
 // into left, a SEPARATOR KEY for the parent, and right. A leaf split COPIES the right leaf's first
 // key up (no record leaves the leaf level); an interior split PUSHES its median separator up
 // (format.md "Fan-out").
-type InsOut = { whole: PNode } | { whole: null; left: PNode; sep: Uint8Array; right: PNode };
+// more is the further nodes of a multi-way split (format.md "Multi-way split"), each with the
+// separator before it; empty for a two-way split.
+type SplitPiece = { sep: Uint8Array; node: PNode };
+type InsOut =
+  | { whole: PNode }
+  | { whole: null; left: PNode; sep: Uint8Array; right: PNode; more: SplitPiece[] };
+
+// joinSplit prepends left and sep to a split of the remaining entries.
+function joinSplit(left: PNode, sep: Uint8Array, rest: InsOut): InsOut {
+  if (rest.whole !== null) return { whole: null, left, sep, right: rest.whole, more: [] };
+  return {
+    whole: null,
+    left,
+    sep,
+    right: rest.left,
+    more: [{ sep: rest.sep, node: rest.right }, ...rest.more],
+  };
+}
+
+// absorbSplit replaces child i of an interior's vectors (mutated in place) with the nodes of sub's
+// split and inserts its separators. It returns the index of the last separator inserted — the
+// edited position the interior's own split uses.
+function absorbSplit(
+  keys: Uint8Array[],
+  children: Child[],
+  i: number,
+  sub: Extract<InsOut, { whole: null }>,
+): number {
+  keys.splice(i, 0, sub.sep, ...sub.more.map((p) => p.sep));
+  children.splice(
+    i,
+    1,
+    residentRef(sub.left),
+    residentRef(sub.right),
+    ...sub.more.map((p) => residentRef(p.node)),
+  );
+  return i + sub.more.length;
+}
 
 // splitPoint is the kind-shared split decision (format.md "Split point"): given the per-boundary
 // leftpayload/rightpayload functions over m in [mLo, mHi], pick
@@ -1259,15 +1308,32 @@ function buildLeaf(
     leafOverhead(n - m, shape) -
     leafPrefixSaving(n - m, keys[m]!, keys[n - 1]!) -
     (bounds === null ? 0 : bounds.suf[m]!);
-  // null is unreachable under the RECORD_MAX cap (a two-record leaf always fits — format.md "Why the
-  // record cap"); defensively leave the node whole (0A000 at serialize).
   const m = splitPoint(1, n - 1, pay, cap.c, edited === n - 1, leftpayload, rightpayload);
-  if (m === null) return { whole: newLeaf(keys, vals, weights, owner) };
+  if (m === null) {
+    // No two fitting halves (format.md "Multi-way split"): one changed record can widen a whole
+    // leaf's encodings. The left leaf takes the largest fitting run and the rest splits again.
+    let mMax = 0;
+    for (let mm = 1; mm <= n - 1 && leftpayload(mm) <= cap.c; mm++) mMax = mm;
+    // A single record that does not fit: leave the node whole (0A000 at serialize).
+    if (mMax === 0) return { whole: newLeaf(keys, vals, weights, owner) };
+    const left = newLeaf(keys.slice(0, mMax), vals.slice(0, mMax), weights.slice(0, mMax), owner);
+    const rest = buildLeaf(
+      keys.slice(mMax),
+      vals.slice(mMax),
+      weights.slice(mMax),
+      cap,
+      shape,
+      edited === null ? null : edited - mMax,
+      owner,
+    );
+    return joinSplit(left, keys[mMax]!, rest);
+  }
   return {
     whole: null,
     left: newLeaf(keys.slice(0, m), vals.slice(0, m), weights.slice(0, m), owner),
     sep: keys[m]!,
     right: newLeaf(keys.slice(m), vals.slice(m), weights.slice(m), owner),
+    more: [],
   };
 }
 
@@ -1276,13 +1342,16 @@ function buildLeaf(
 // [0, m], separator m moves up, the right node keeps [m+1, N) + children [m+1, N]. With N = 2
 // (only reachable with near-cap separators) the split is pinned to m = 1, producing a legal N = 0
 // right interior (the degenerate fan-out contract). Returns null when the node overflows and no
-// valid split point exists — the caller (only the interior MERGE path can hit it) abandons the merge.
+// valid two-way split point exists and multi is false — the caller (the interior MERGE path)
+// abandons the merge. With multi (the insert path) it splits multi-way instead (format.md
+// "Multi-way split") and never returns null.
 function buildInterior(
   keys: Uint8Array[],
   children: Child[],
   cap: Cap,
   edited: number | null,
-  owner?: MutationGeneration,
+  owner: MutationGeneration | undefined,
+  multi: boolean,
 ): InsOut | null {
   const n = keys.length;
   const pay = interiorPayload(cap, keys);
@@ -1303,7 +1372,26 @@ function buildInterior(
     const rightpayload = (mm: number): number =>
       (ptr + 4) * (n - 1 - mm) + ptr + (total - prefix[mm + 1]!);
     const got = splitPoint(1, n - 2, pay, cap.c, edited === n - 1, leftpayload, rightpayload);
-    if (got === null) return null;
+    if (got === null) {
+      if (!multi) return null;
+      // Multi-way: the left node takes the largest fitting run, its next separator moves up, and
+      // the rest splits again.
+      let mMax = 0;
+      for (let mm = 1; mm <= n - 2 && leftpayload(mm) <= cap.c; mm++) mMax = mm;
+      // One separator that does not fit: leave the node whole (0A000 at serialize).
+      if (mMax === 0) return { whole: newInterior(keys, children, owner) };
+      const left = newInterior(keys.slice(0, mMax), children.slice(0, mMax + 1), owner);
+      const rest = buildInterior(
+        keys.slice(mMax + 1),
+        children.slice(mMax + 1),
+        cap,
+        edited === null ? null : edited - mMax - 1,
+        owner,
+        true,
+      );
+      if (rest === null) return null;
+      return joinSplit(left, keys[mMax]!, rest);
+    }
     m = got;
   }
 
@@ -1312,6 +1400,7 @@ function buildInterior(
     left: newInterior(keys.slice(0, m), children.slice(0, m + 1), owner),
     sep: keys[m]!,
     right: newInterior(keys.slice(m + 1), children.slice(m + 1), owner),
+    more: [],
   };
 }
 
@@ -1393,11 +1482,9 @@ function* nodeInsertSteps(
       n.children[i] = residentRef(sub.whole);
       return { whole: n };
     }
-    n.keys.splice(i, 0, sub.sep);
-    n.children[i] = residentRef(sub.left);
-    n.children.splice(i + 1, 0, residentRef(sub.right));
+    const edited = absorbSplit(n.keys, n.children, i, sub);
     if (payload(n, cap, shape) <= cap.c || n.keys.length < 2) return { whole: n };
-    const out = buildInterior(n.keys, n.children, cap, i, generation);
+    const out = buildInterior(n.keys, n.children, cap, edited, generation, true);
     if (out === null) throw new Error("insert-path interior split always has a valid split point");
     return out;
   }
@@ -1407,11 +1494,10 @@ function* nodeInsertSteps(
     children[i] = residentRef(sub.whole);
     return { whole: newInterior(n.keys.slice(), children, generation) };
   }
-  const keys = insertAt(n.keys, i, sub.sep);
-  let children = n.children.slice();
-  children[i] = residentRef(sub.left);
-  children = insertAt(children, i + 1, residentRef(sub.right));
-  const out = buildInterior(keys, children, cap, i, generation);
+  const keys = n.keys.slice();
+  const children = n.children.slice();
+  const edited = absorbSplit(keys, children, i, sub);
+  const out = buildInterior(keys, children, cap, edited, generation, true);
   if (out === null) {
     // The cap arithmetic guarantees a valid split point on the insert path (format.md "Why the
     // record cap") — reaching here would be an internal invariant break, not a data condition.
@@ -1578,10 +1664,12 @@ function* mergeAtSteps(
       null,
       generation,
     );
+    // Unreachable: splitting between the two leaves gives two fitting halves. Abandon.
+    if (merged.whole === null && merged.more.length > 0) return n;
   } else {
     const mkeys = [...left.keys, n.keys[j]!, ...right.keys];
     const mchildren = [...left.children, ...right.children];
-    const out = buildInterior(mkeys, mchildren, cap, null, generation);
+    const out = buildInterior(mkeys, mchildren, cap, null, generation, false);
     // No valid 2-way split point (near-cap separators): abandon the merge — the two children and
     // the parent separator stay exactly as they were (underfull tolerated).
     if (out === null) return n;

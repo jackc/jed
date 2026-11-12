@@ -585,6 +585,44 @@ COMPACT_LEAF_TABLES = [
     rows: (0...30).map { |i| [format("user/alpha/%02d", i), 5, nil, nil] } }
 ].freeze
 
+# `multiway_split`: the multi-way leaf split (format.md "Multi-way split", v52) — a tree whose shape
+# is the result of single-row edits, not of an ascending load. Each `ops` entry is one statement, in
+# order; the third element asserts what the edit did to its leaf (build_ops_tree), so this fixture
+# cannot silently stop taking the paths it exists for. The cores build it at page size 256 via
+#   CREATE TABLE a (id i32 PRIMARY KEY, v i64);
+#   INSERT INTO a VALUES (i, 7)                       for i in 1..600 except 400, ascending, one each;
+#   UPDATE a SET v = 4000000000000 WHERE id = 60;     -- replace: leaf 1..192 -> 1..59 | 60..83 | 84..192
+#   INSERT INTO a VALUES (400, -4000000000000);       -- insert:  leaf 295..487 -> 295..399 | 400..423 | 424..487
+#   CREATE TABLE b (k text PRIMARY KEY, n i32);
+#   INSERT INTO b VALUES ('customer/acct/NNN', 1)     for NNN in 000..063, ascending, one each;
+#   INSERT INTO b VALUES ('a', 2);                    -- first leaf loses its 16-byte key prefix: two-way, balanced
+#   INSERT INTO b VALUES ('z', 3);                    -- right edge of the full last leaf: [8 rows | z]
+#   INSERT INTO b VALUES ('customer/b', 5);           -- end of the full leaf 056..063: prefix 15 -> 9, [8 rows | b]; the root splits
+#   INSERT INTO b VALUES ('customer/a', 4);           -- into the prefix-less first leaf
+# In table a every v is 7, so the base-plus-offsets region stores no offsets and a leaf holds up to
+# 192 rows; one row with a distant v gives every row of its leaf an 8-byte offset, and neither half
+# holding that row fits however the leaf is divided. A key that shortens a leaf's shared prefix
+# can only arrive at an end of the leaf (a key between two keys shares their common prefix), where
+# the edited record alone is a fitting side, so those edits split two-way; table b pins that.
+def ops_final_rows(ops)
+  ops.each_with_object({}) { |(_, row), h| h[row[0]] = row }.values
+end
+
+MULTIWAY_A_OPS = (((1..600).to_a - [400]).map { |i| [:insert, [i, 7]] } +
+  [[:update, [60, 4_000_000_000_000], { ways: 3 }],
+   [:insert, [400, -4_000_000_000_000], { ways: 3 }]]).freeze
+MULTIWAY_B_OPS = ((0...64).map { |i| [:insert, [format("customer/acct/%03d", i), 1]] } +
+  [[:insert, ["a", 2], { ways: 2, prefix_shrinks: true }],
+   [:insert, ["z", 3], { ways: 2, prefix_shrinks: true }],
+   [:insert, ["customer/b", 5], { ways: 2, prefix_shrinks: true }],
+   [:insert, ["customer/a", 4], { ways: 1 }]]).freeze
+MULTIWAY_SPLIT_TABLES = [
+  { name: "a", columns: [col("id", "i32", pk: true), col("v", "i64")],
+    ops: MULTIWAY_A_OPS, rows: ops_final_rows(MULTIWAY_A_OPS) },
+  { name: "b", columns: [col("k", "text", pk: true), col("n", "i32")],
+    ops: MULTIWAY_B_OPS, rows: ops_final_rows(MULTIWAY_B_OPS) }
+].freeze
+
 # Statistics over a fixed-width `numeric(p,s)` column (format.md v51): the leaf holds `amt` as 4-byte
 # slots, while the statistics entries — a single-value context — hold each MCV value in the
 # self-describing decimal codec. The cores build this via
@@ -2116,6 +2154,7 @@ FIXTURES = ([
   { file: "decimal_table.jed",   page_size: 256, tables: [DECIMAL_TABLE] },
   { file: "decimal_fixed_table.jed", page_size: 256, tables: [DECIMAL_FIXED_TABLE] },
   { file: "compact_leaf_table.jed", page_size: 256, tables: COMPACT_LEAF_TABLES },
+  { file: "multiway_split.jed", page_size: 256, tables: MULTIWAY_SPLIT_TABLES },
   { file: "bytea_table.jed",     page_size: 256, tables: [BYTEA_TABLE] },
   { file: "text_pk_table.jed",   page_size: 256, tables: [TEXT_PK_TABLE] },
   { file: "bytea_pk_table.jed",  page_size: 256, tables: [BYTEA_PK_TABLE] },
@@ -4379,15 +4418,23 @@ def node_payload(node)
   end
 end
 
-# The kind-shared split-point rule (format.md "Split point"): over the kind's range, m_max = the
-# largest m whose left side fits, m_min = the smallest whose right side fits, m_balanced = the
-# smallest m with 2·leftpayload(m) >= payload; a right-edge edit takes m_max, anything else
-# clamp(min(m_balanced, m_max), m_min, m_max). nil when no m keeps both sides fitting.
-def pick_split_m(range, payload, cap, right_edge, leftp, rightp)
+# The kind-shared split-point bounds (format.md "Split point"): over the kind's range, m_max = the
+# largest m whose left side fits and m_min = the smallest whose right side fits (nil when none
+# does). Both payloads are nondecreasing in the size of their side, so each scan stops at its first
+# misfit.
+def split_bounds(range, cap, leftp, rightp)
   m_max = nil
   range.each { |m| leftp.call(m) <= cap ? m_max = m : break }
   m_min = nil
   range.reverse_each { |m| rightp.call(m) <= cap ? m_min = m : break }
+  [m_max, m_min]
+end
+
+# The two-way split point: a right-edge edit takes m_max, anything else
+# clamp(min(m_balanced, m_max), m_min, m_max), m_balanced the smallest m with
+# 2·leftpayload(m) >= payload. nil when no m keeps both sides fitting.
+def pick_split_m(range, payload, cap, right_edge, leftp, rightp)
+  m_max, m_min = split_bounds(range, cap, leftp, rightp)
   return nil if m_max.nil? || m_min.nil? || m_min > m_max
   return m_max if right_edge
 
@@ -4395,97 +4442,191 @@ def pick_split_m(range, payload, cap, right_edge, leftp, rightp)
   m_bal.clamp(m_min, m_max)
 end
 
-# Split an overflowing node 2-way (format.md "Fan-out", v24): a LEAF splits COPY-UP — the left
-# leaf keeps records [0, m), the right leaf [m, N), and the separator handed up is a COPY of
-# keys[m] (no record leaves the leaf level) — [:split, left, sep_key, right]. An INTERIOR node
-# splits PUSH-UP — the median separator moves up, left keeps [0, m) + children [0, m], right
-# keeps [m+1, N) + children [m+1, N]; with N == 2 the split is pinned to m = 1, producing the
-# legal N = 0 right interior (the degenerate max-separator contract). A table tree and most index trees are built in ascending
-# key order (right_edge always true); an `insert_order` index (compact_leaf_table) inserts out of key
-# order and so takes the balanced arm.
-def split_node(node, cap, right_edge)
-  payload = node_payload(node)
-  return [:whole, node] if payload <= cap
+# The reference's stand-in for the 0A000 a core reports when a single entry or separator fits no node.
+class Unsplittable < RuntimeError; end
 
-  n = node[:keys].size
-  if node_leaf?(node)
-    return [:whole, node] if n < 2 # a single over-cap record: unsupported, surfaces upstream
+# Split an overflowing node (format.md "Fan-out"): [:whole, node] when it fits, else
+# [:split, nodes, seps] — nodes.size == seps.size + 1, seps[i] the separator between nodes[i] and
+# nodes[i + 1]. `edited` is the index of the entry whose insert / replace triggered the rebuild (for
+# an interior node, the last separator a child split handed up), or nil when there is none (a new
+# root). A right-edge edit is `edited == N - 1`.
+#
+# A LEAF splits COPY-UP — the left leaf keeps records [0, m), the right leaf [m, N), and the
+# separator handed up is a COPY of keys[m] (no record leaves the leaf level). An INTERIOR node splits
+# PUSH-UP — sep[m] moves up, left keeps [0, m) + children [0, m], right keeps (m, N) + children
+# (m, N]; with N == 2 the split is pinned to m = 1, producing the legal N = 0 right interior (the
+# degenerate max-separator contract).
+#
+# The split is two-way wherever some m leaves two fitting nodes. Otherwise it is MULTI-WAY (v52):
+# the left node is entries [0, m_max), the separator is key[m_max], and the remainder ([m_max, N)
+# of a leaf, the separators after m_max of an interior) is built by this same procedure with the
+# edited index carried along. No m_max at all — a single entry or separator that fits no node — is
+# the mutation's 0A000.
+#
+# A table tree and most index trees are built in ascending key order (always a right-edge edit); an
+# `insert_order` index (compact_leaf_table) and an `ops` table (multiway_split) edit out of key order.
+def split_node(node, cap, edited)
+  return [:whole, node] if node_payload(node) <= cap
 
-    # Each half is measured with its own prefix, bases, widths and dictionaries (v52).
-    leftp = ->(m) { recs_payload_size(node[:recs][0, m]) }
-    rightp = ->(m) { recs_payload_size(node[:recs][m..]) }
-    m = pick_split_m(1..(n - 1), payload, cap, right_edge, leftp, rightp)
-    raise "unsplittable leaf (record over RECORD_MAX?)" if m.nil?
+  nodes = []
+  seps = []
+  loop do
+    payload = node_payload(node)
+    if payload <= cap
+      nodes << node
+      break
+    end
+    n = node[:keys].size
+    right_edge = !edited.nil? && edited == n - 1
+    if node_leaf?(node)
+      # Each side is measured with its own prefix, bases, widths and dictionaries (v52).
+      leftp = ->(m) { recs_payload_size(node[:recs][0, m]) }
+      rightp = ->(m) { recs_payload_size(node[:recs][m..]) }
+      range = 1..(n - 1)
+      m = pick_split_m(range, payload, cap, right_edge, leftp, rightp)
+      two_way = !m.nil?
+      m ||= split_bounds(range, cap, leftp, rightp)[0]
+      raise Unsplittable, "a leaf entry that fits no leaf (0A000)" if m.nil?
 
-    left = { keys: node[:keys][0, m], recs: node[:recs][0, m], children: [] }
-    right = { keys: node[:keys][m..], recs: node[:recs][m..], children: [] }
-    [:split, left, right[:keys][0].dup, right]
-  else
-    m = if n == 2
-          1 # the degenerate pin: sep[1] moves up, the right side is a legal N = 0 interior
-        else
-          prefix = [0]
-          node[:keys].each { |k| prefix << prefix.last + k.bytesize }
-          pw = 4 + tag_len # a child pointer's width (encrypted.md §2)
-          leftp = ->(mm) { (pw + 4) * mm + pw + prefix[mm] }
-          rightp = ->(mm) { (pw + 4) * (n - 1 - mm) + pw + (prefix[n] - prefix[mm + 1]) }
-          mm = pick_split_m(1..(n - 2), payload, cap, right_edge, leftp, rightp)
-          raise "unsplittable interior on the insert path" if mm.nil?
+      nodes << { keys: node[:keys][0, m], recs: node[:recs][0, m], children: [] }
+      seps << node[:keys][m].dup
+      node = { keys: node[:keys][m..], recs: node[:recs][m..], children: [] }
+      edited = edited && edited >= m ? edited - m : nil
+    else
+      raise Unsplittable, "a separator that fits no interior node (0A000)" if n < 2
 
-          mm
-        end
-    left = { keys: node[:keys][0, m], recs: [], children: node[:children][0, m + 1] }
-    right = { keys: node[:keys][(m + 1)..], recs: [], children: node[:children][(m + 1)..] }
-    [:split, left, node[:keys][m], right]
+      if n == 2
+        m = 1 # the degenerate pin: sep[1] moves up, the right side is a legal N = 0 interior
+        two_way = true
+      else
+        prefix = [0]
+        node[:keys].each { |k| prefix << prefix.last + k.bytesize }
+        pw = 4 + tag_len # a child pointer's width (encrypted.md §2)
+        leftp = ->(mm) { (pw + 4) * mm + pw + prefix[mm] }
+        rightp = ->(mm) { (pw + 4) * (n - 1 - mm) + pw + (prefix[n] - prefix[mm + 1]) }
+        range = 1..(n - 2)
+        m = pick_split_m(range, payload, cap, right_edge, leftp, rightp)
+        two_way = !m.nil?
+        m ||= split_bounds(range, cap, leftp, rightp)[0]
+        raise Unsplittable, "a separator that fits no interior node (0A000)" if m.nil?
+      end
+      left = { keys: node[:keys][0, m], recs: [], children: node[:children][0, m + 1] }
+      raise Unsplittable, "a separator that fits no interior node (0A000)" if node_payload(left) > cap
+
+      nodes << left
+      seps << node[:keys][m]
+      node = { keys: node[:keys][(m + 1)..], recs: [], children: node[:children][(m + 1)..] }
+      edited = edited && edited > m ? edited - m - 1 : nil
+    end
+    next unless two_way
+
+    raise Unsplittable, "a split side that fits no node (0A000)" if node_payload(node) > cap
+
+    nodes << node
+    break
   end
+  [:split, nodes, seps]
 end
 
-# Insert (key, rec) into the subtree, rebuilding (copy-on-write) and splitting up the path. An
-# interior descent routes by partition_point(sep <= key) — a key equal to a separator lies RIGHT
-# (format.md "Interior node"); leaves hold the records.
-def tree_insert(node, key, rec, cap)
+# What the last leaf edit did, for a fixture's assertions (`ops` tables): { ways:, prefix_before:,
+# prefix_after: } — the number of leaves the edited leaf became, and the byte length of its stored
+# key prefix before the edit and of the edited (pre-split) leaf's key set after it.
+$leaf_edit = nil
+
+# Insert (key, rec) into the subtree — or, with `replace`, put rec in place of the record already
+# under key — rebuilding (copy-on-write) and splitting up the path. An interior descent routes by
+# partition_point(sep <= key) — a key equal to a separator lies RIGHT (format.md "Interior node");
+# leaves hold the records. A parent absorbs every separator a child split hands up, in order, and
+# its own edited position is the last of them.
+def tree_insert(node, key, rec, cap, replace: false)
   if node_leaf?(node)
     i = node[:keys].bsearch_index { |k| k >= key } || node[:keys].size
-    raise "duplicate key in fixture" if i < node[:keys].size && node[:keys][i] == key
+    present = i < node[:keys].size && node[:keys][i] == key
+    raise "duplicate key in fixture" if present && !replace
+    raise "replace of a missing key in fixture" if replace && !present
 
-    return split_node({ keys: node[:keys].dup.insert(i, key),
-                        recs: node[:recs].dup.insert(i, rec), children: [] }, cap,
-                      i == node[:keys].size)
+    keys = node[:keys].dup
+    recs = node[:recs].dup
+    if replace
+      recs[i] = rec
+    else
+      keys.insert(i, key)
+      recs.insert(i, rec)
+    end
+    res = split_node({ keys: keys, recs: recs, children: [] }, cap, i)
+    $leaf_edit = { ways: res[0] == :split ? res[1].size : 1,
+                   prefix_before: leaf_key_prefix(node[:keys]).bytesize,
+                   prefix_after: leaf_key_prefix(keys).bytesize }
+    return res
   end
   i = node[:keys].bsearch_index { |k| k > key } || node[:keys].size
-  res = tree_insert(node[:children][i], key, rec, cap)
+  res = tree_insert(node[:children][i], key, rec, cap, replace: replace)
+  children = node[:children].dup
   if res[0] == :split
-    _, left, sk, right = res
-    children = node[:children].dup
-    children[i] = left
-    children.insert(i + 1, right)
-    split_node({ keys: node[:keys].dup.insert(i, sk), recs: [], children: children }, cap,
-               i == node[:keys].size)
+    _, nodes, seps = res
+    children[i, 1] = nodes
+    split_node({ keys: node[:keys].dup.insert(i, *seps), recs: [], children: children }, cap,
+               i + seps.size - 1)
   else
-    children = node[:children].dup
     children[i] = res[1]
     [:whole, { keys: node[:keys], recs: [], children: children }]
   end
 end
 
+# A root split grows the height by one: the new root is an interior node over the split's nodes,
+# built with no edited position and split in turn if it overflows (format.md "Insert").
+def grow_root(res, cap)
+  while res[0] == :split
+    _, nodes, seps = res
+    res = split_node({ keys: seps, recs: [], children: nodes }, cap, nil)
+  end
+  res[1]
+end
+
+# One edit of a tree: an insert of (key, rec), or a replace of the record under key.
+def tree_apply(root, key, rec, cap, replace: false)
+  # rec is a record plan; rec[:size] is the post-spill on-disk size. A record still over
+  # RECORD_MAX after externalizing every spillable value is genuinely unsupported (0A000).
+  max = record_max(cap, rec[:table][:columns].size)
+  raise "record of #{rec[:size]}B exceeds RECORD_MAX #{max} after spilling" if rec[:size] > max
+
+  if root.nil?
+    raise "replace in an empty tree" if replace
+
+    return { keys: [key], recs: [rec], children: [] }
+  end
+  grow_root(tree_insert(root, key, rec, cap, replace: replace), cap)
+end
+
 # Build a table's B-tree from its (key, record) pairs in key order. nil for an empty table.
 def build_tree(pairs, cap)
-  root = nil
-  k = pairs.empty? ? 0 : pairs[0][1][:table][:columns].size
-  max = record_max(cap, k)
-  pairs.each do |key, rec|
-    # rec is a record plan; rec[:size] is the post-spill on-disk size. A record still over
-    # RECORD_MAX after externalizing every spillable value is genuinely unsupported (0A000).
-    raise "record of #{rec[:size]}B exceeds RECORD_MAX #{max} after spilling" if rec[:size] > max
+  pairs.inject(nil) { |root, (key, rec)| tree_apply(root, key, rec, cap) }
+end
 
-    if root.nil?
-      root = { keys: [key], recs: [rec], children: [] }
-      next
+# Build an `ops` table's tree by its ordered edits (the tree shape is order-sensitive — format.md
+# "Fan-out"): each op is [:insert | :update, row, expect], an :update replacing the record under
+# the row's (unchanged) primary key. `expect` (optional) asserts what the edit did to its leaf:
+# `ways:` the number of leaves it became (3 = the multi-way split), `prefix_shrinks: true` that
+# the edit shortened the leaf's shared key prefix.
+def build_ops_tree(table, cap)
+  pk_idxs = pk_order(table)
+  raise "an ops table needs a primary key" if pk_idxs.empty?
+
+  table[:ops].each_with_index.inject(nil) do |root, ((kind, row, expect), oi)|
+    key = pk_idxs.map { |pi| key_body(table[:columns][pi][:type], row[pi], table[:columns][pi][:collation]) }.join.b
+    forms, comps, size = plan_record(table, key, row, cap)
+    rec = { key: key, row: row, table: table, forms: forms, comps: comps, size: size }
+    root = tree_apply(root, key, rec, cap, replace: kind == :update)
+    if expect
+      ev = $leaf_edit
+      what = "#{table[:name]} op #{oi} (#{kind} #{row.inspect[0, 40]})"
+      raise "#{what}: leaf became #{ev[:ways]} leaves, expected #{expect[:ways]}" if expect[:ways] && ev[:ways] != expect[:ways]
+      if expect[:prefix_shrinks] && ev[:prefix_after] >= ev[:prefix_before]
+        raise "#{what}: key prefix #{ev[:prefix_before]} -> #{ev[:prefix_after]}, expected it to shrink"
+      end
     end
-    res = tree_insert(root, key, rec, cap)
-    root = res[0] == :split ? { keys: [res[2]], recs: [], children: [res[1], res[3]] } : res[1]
+    root
   end
-  root
 end
 
 # Post-order page allocation: children before their parent (so a parent's child pointers
@@ -4541,7 +4682,8 @@ def build_image(types, sequences, tables, page_size, collations = [], start_page
       forms, comps, size = plan_record(t, key, row, cap)
       [key, { key: key, row: row, table: t, forms: forms, comps: comps, size: size }]
     end
-    root_data[ti], next_index = serialize_tree(build_tree(pairs, cap), next_index, cap, data_pages)
+    tree = t[:ops] ? build_ops_tree(t, cap) : build_tree(pairs, cap)
+    root_data[ti], next_index = serialize_tree(tree, next_index, cap, data_pages)
     # The table's index trees follow its data tree, in catalog (name) order (format.md
     # "Allocation & incremental commit" / "From-scratch image").
     (t[:indexes] || []).each do |ix|

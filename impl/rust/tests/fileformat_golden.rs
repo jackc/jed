@@ -1209,6 +1209,40 @@ fn decimal_table_db() -> Session {
 /// NULLs and empty arrays), a mostly-NULL text column, and an index over `status`. Table `u`:
 /// variable-length text keys with a shared prefix and a key directory, a column of one value
 /// (offset width 0), and all-NULL columns. Rows are inserted in key order, one statement each.
+/// multiway_split_db is a tree shaped by single-row edits that take the multi-way leaf split
+/// (format.md "Multi-way split"). Table a: a dense leaf whose v column stores no offsets; one
+/// replaced row and one inserted row each widen their leaf, which splits in three. Table b: keys
+/// outside a shared prefix land at a leaf's edge and split two-way.
+fn multiway_split_db() -> Session {
+    let mut db = Database::create(CreateOptions {
+        environment: golden_env(),
+        page_size: GOLDEN_PAGE_SIZE,
+        ..Default::default()
+    })
+    .unwrap()
+    .session(SessionOptions::default());
+    run(&mut db, "CREATE TABLE a (id i32 PRIMARY KEY, v i64)");
+    for i in 1..=600 {
+        if i != 400 {
+            run(&mut db, &format!("INSERT INTO a VALUES ({i}, 7)"));
+        }
+    }
+    run(&mut db, "UPDATE a SET v = 4000000000000 WHERE id = 60");
+    run(&mut db, "INSERT INTO a VALUES (400, -4000000000000)");
+    run(&mut db, "CREATE TABLE b (k text PRIMARY KEY, n i32)");
+    for i in 0..64 {
+        run(
+            &mut db,
+            &format!("INSERT INTO b VALUES ('customer/acct/{i:03}', 1)"),
+        );
+    }
+    run(&mut db, "INSERT INTO b VALUES ('a', 2)");
+    run(&mut db, "INSERT INTO b VALUES ('z', 3)");
+    run(&mut db, "INSERT INTO b VALUES ('customer/b', 5)");
+    run(&mut db, "INSERT INTO b VALUES ('customer/a', 4)");
+    db
+}
+
 fn compact_leaf_table_db() -> Session {
     let mut db = Database::create(CreateOptions {
         environment: golden_env(),
@@ -2283,6 +2317,7 @@ fn write_matches_goldens() {
         ("decimal_table.jed", decimal_table_db),
         ("decimal_fixed_table.jed", decimal_fixed_table_db),
         ("compact_leaf_table.jed", compact_leaf_table_db),
+        ("multiway_split.jed", multiway_split_db),
         ("bytea_table.jed", bytea_table_db),
         ("text_pk_table.jed", text_pk_table_db),
         ("bytea_pk_table.jed", bytea_pk_table_db),
@@ -2399,6 +2434,8 @@ fn read_goldens_reproduces_rows() {
         ("decimal_fixed_table.jed", decimal_fixed_table_db, "t"),
         ("compact_leaf_table.jed", compact_leaf_table_db, "t"),
         ("compact_leaf_table.jed", compact_leaf_table_db, "u"),
+        ("multiway_split.jed", multiway_split_db, "a"),
+        ("multiway_split.jed", multiway_split_db, "b"),
         ("bytea_table.jed", bytea_table_db, "t"),
         ("text_pk_table.jed", text_pk_table_db, "t"),
         ("bytea_pk_table.jed", bytea_pk_table_db, "t"),

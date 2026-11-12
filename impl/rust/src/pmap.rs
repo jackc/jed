@@ -593,7 +593,8 @@ impl Node {
 /// The result of inserting into a subtree: either the rebuilt subtree, or a node that overflowed
 /// and split into `left`, a **separator key** for the parent, and `right`. A leaf split **copies**
 /// the right leaf's first key up (no record leaves the leaf level); an interior split **pushes**
-/// its median separator up (format.md "Fan-out").
+/// its median separator up (format.md "Fan-out"). A multi-way split (format.md "Multi-way split")
+/// carries its further nodes in `more`, each with the separator before it.
 enum Ins {
     /// The uniquely owned dirty node passed to `node_insert` was edited in place. Its parent/root
     /// already points at the result, so no replacement `Arc` is needed.
@@ -605,7 +606,74 @@ enum Ins {
         left: Arc<Node>,
         sep: Vec<u8>,
         right: Arc<Node>,
+        /// The further nodes of a multi-way split, each with the separator that precedes it. Empty
+        /// for a two-way split.
+        more: Vec<(Vec<u8>, Arc<Node>)>,
     },
+}
+
+/// Prepend `left` and `sep` to a build of the remaining entries (format.md "Multi-way split").
+fn join_split(left: Arc<Node>, sep: Vec<u8>, rest: Ins) -> Ins {
+    match rest {
+        Ins::Whole(right) => Ins::Split {
+            left,
+            sep,
+            right,
+            more: Vec::new(),
+        },
+        Ins::Split {
+            left: rleft,
+            sep: rsep,
+            right: rright,
+            more: rmore,
+        } => {
+            let mut more = Vec::with_capacity(1 + rmore.len());
+            more.push((rsep, rright));
+            more.extend(rmore);
+            Ins::Split {
+                left,
+                sep,
+                right: rleft,
+                more,
+            }
+        }
+        Ins::Kept | Ins::Exists => unreachable!("fresh builders never edit an existing node"),
+    }
+}
+
+/// Replace child `i` of an interior's vectors with the nodes of a child's split and insert its
+/// separators, in order. Returns the index of the last separator inserted — the edited position
+/// the interior's own split uses (format.md "Multi-way split").
+fn absorb_split(
+    keys: &mut Vec<Vec<u8>>,
+    children: &mut Vec<Child>,
+    i: usize,
+    left: Arc<Node>,
+    sep: Vec<u8>,
+    right: Arc<Node>,
+    more: Vec<(Vec<u8>, Arc<Node>)>,
+) -> usize {
+    let edited = i + more.len();
+    keys.insert(i, sep);
+    children[i] = Child::Resident(left);
+    children.insert(i + 1, Child::Resident(right));
+    for (j, (s, n)) in more.into_iter().enumerate() {
+        keys.insert(i + 1 + j, s);
+        children.insert(i + 2 + j, Child::Resident(n));
+    }
+    edited
+}
+
+/// What a leaf of some records does under a page capacity ([`leaf_split_point`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LeafSplit {
+    /// It fits, or no left run of it fits (a single over-cap record): one leaf.
+    Whole,
+    /// It overflows and splits two-way at this index.
+    Two(usize),
+    /// It overflows with no two fitting halves: the left leaf takes `[0, m_max)` and the remainder
+    /// is built again (format.md "Multi-way split").
+    Multi(usize),
 }
 
 /// The kind-shared split decision (format.md "Split point"): given the per-boundary
@@ -659,9 +727,9 @@ fn split_point(
     Some(m_balanced.min(m_max).max(m_min))
 }
 
-/// The leaf split decision (format.md "Leaf payload", "Leaf split"): `Some(m)` when a leaf of these
-/// records overflows `cap` and splits at `m`, `None` when it fits (or has a single record —
-/// defensively left whole, the oversize surfacing as `0A000` at serialize). A leaf's size depends on
+/// The leaf split decision (format.md "Leaf payload", "Leaf split", "Multi-way split"): whether a
+/// leaf of these records fits `cap` (or has a single record — left whole, the oversize surfacing as
+/// `0A000` at serialize), splits two-way at `m`, or has no two fitting halves. A leaf's size depends on
 /// its keys and rows, so each candidate half is measured with its own key prefix, value spans and
 /// dictionaries. Shared by [`build_leaf`] and the delete path's merge pre-check, so both see the
 /// same separator.
@@ -672,16 +740,16 @@ fn leaf_split_point<'a>(
     cap: Cap,
     shape: &LeafShape,
     edited: Option<usize>,
-) -> Option<usize> {
+) -> LeafSplit {
     let n = weights.len();
     let plain: usize = weights.iter().map(|&w| w as usize).sum::<usize>() + leaf_overhead(n, shape);
     if plain <= cap.c || n < 2 {
-        return None;
+        return LeafSplit::Whole;
     }
     // Measured whole first: the per-boundary facts are built only for a leaf that does split.
     let payload = plain - leaf_saving(shape, cap, n, key, row);
     if payload <= cap.c {
-        return None;
+        return LeafSplit::Whole;
     }
     let facts = SplitFacts::new(shape, cap, n, key, row);
     let prefix: Vec<usize> = std::iter::once(0)
@@ -698,9 +766,7 @@ fn leaf_split_point<'a>(
     let rightpayload =
         |m: usize| (total - prefix[m]) + leaf_overhead(n - m, shape) - facts.right(shape, m);
     let right_edge = edited == Some(n - 1);
-    // `None` is unreachable under the RECORD_MAX cap (a two-record leaf always fits — format.md
-    // "Why the record cap").
-    split_point(
+    if let Some(m) = split_point(
         1,
         n - 1,
         payload,
@@ -708,15 +774,27 @@ fn leaf_split_point<'a>(
         right_edge,
         leftpayload,
         rightpayload,
-    )
+    ) {
+        return LeafSplit::Two(m);
+    }
+    // No two fitting halves: one changed record can widen a whole leaf's encodings. The left leaf
+    // takes the largest fitting run and the rest splits again.
+    let m_max = (1..n).take_while(|&m| leftpayload(m) <= cap.c).last();
+    match m_max {
+        Some(m) => LeafSplit::Multi(m),
+        // A single record that does not fit: leave the node whole (0A000 at serialize).
+        None => LeafSplit::Whole,
+    }
 }
 
 /// Build a leaf from its parts; if its payload overflows `cap`, split it 2-way **copy-up**
 /// (format.md "Leaf split"): the left leaf keeps records `[0, m)`, the right leaf `[m, N)`, and
 /// the separator handed up is a **copy of `keys[m]`** (the right leaf's first key). `edited` is
 /// the index of the just-inserted/replaced record (`None` for the delete path's merge-overflow,
-/// which splits balanced). A leaf with a single over-cap record is left whole (defensive — the
-/// oversize surfaces as `0A000` when serialized).
+/// which splits balanced). With no two fitting halves the split is multi-way (format.md "Multi-way
+/// split"): the left leaf takes the largest fitting run and the remainder is built the same way. A
+/// leaf with a single over-cap record is left whole (the oversize surfaces as `0A000` when
+/// serialized).
 fn build_leaf(
     keys: Vec<Vec<u8>>,
     vals: Vec<Row>,
@@ -726,8 +804,10 @@ fn build_leaf(
     edited: Option<usize>,
 ) -> Ins {
     let split = leaf_split_point(&weights, &|i| &keys[i], &|i| &vals[i], cap, shape, edited);
-    let Some(m) = split else {
-        return Ins::Whole(Node::new_leaf(keys, vals, weights));
+    let (m, multi) = match split {
+        LeafSplit::Whole => return Ins::Whole(Node::new_leaf(keys, vals, weights)),
+        LeafSplit::Two(m) => (m, false),
+        LeafSplit::Multi(m) => (m, true),
     };
 
     let mut keys = keys;
@@ -737,10 +817,17 @@ fn build_leaf(
     let rvals = vals.split_off(m);
     let rweights = weights.split_off(m);
     let sep = rkeys[0].clone();
+    let left = Node::new_leaf(keys, vals, weights);
+    if multi {
+        let edited = edited.and_then(|e| e.checked_sub(m));
+        let rest = build_leaf(rkeys, rvals, rweights, cap, shape, edited);
+        return join_split(left, sep, rest);
+    }
     Ins::Split {
-        left: Node::new_leaf(keys, vals, weights),
+        left,
         sep,
         right: Node::new_leaf(rkeys, rvals, rweights),
+        more: Vec::new(),
     }
 }
 
@@ -754,13 +841,15 @@ fn interior_payload(cap: Cap, keys: &[Vec<u8>]) -> usize {
 /// `[0, m]`, separator `m` moves up, the right node keeps `[m+1, N)` + children `[m+1, N]`. With
 /// `N = 2` (only reachable with near-cap separators) the split is pinned to `m = 1`, producing a
 /// legal `N = 0` right interior (the degenerate fan-out contract). Returns `None` when the node
-/// overflows and no valid split point exists — the caller (only the interior **merge** path can
-/// hit it) abandons the merge.
+/// overflows, no valid two-way split point exists and `multi` is false — the caller (the interior
+/// **merge** path) abandons the merge. With `multi` (the insert path) such a node splits multi-way
+/// (format.md "Multi-way split") and the result is always `Some`.
 fn build_interior(
     keys: Vec<Vec<u8>>,
     children: Vec<Child>,
     cap: Cap,
     edited: Option<usize>,
+    multi: bool,
 ) -> Option<Ins> {
     let n = keys.len();
     let payload = interior_payload(cap, &keys);
@@ -783,7 +872,7 @@ fn build_interior(
         let leftpayload = |m: usize| (ptr + 4) * m + ptr + prefix[m];
         let rightpayload = |m: usize| (ptr + 4) * (n - 1 - m) + ptr + (total - prefix[m + 1]);
         let right_edge = edited == Some(n - 1);
-        split_point(
+        let two = split_point(
             1,
             n - 2,
             payload,
@@ -791,7 +880,29 @@ fn build_interior(
             right_edge,
             leftpayload,
             rightpayload,
-        )?
+        );
+        match two {
+            Some(m) => m,
+            None if !multi => return None,
+            None => {
+                // Multi-way: the left node takes the largest fitting run, its next separator moves
+                // up, and the rest splits again.
+                let m_max = (1..=n - 2).take_while(|&m| leftpayload(m) <= cap.c).last();
+                let Some(m) = m_max else {
+                    // One separator that does not fit: leave the node whole (0A000 at serialize).
+                    return Some(Ins::Whole(Node::new_interior(keys, children)));
+                };
+                let mut keys = keys;
+                let mut children = children;
+                let rkeys = keys.split_off(m + 1);
+                let sep = keys.pop().expect("split point m ≥ 1 leaves a separator");
+                let rchildren = children.split_off(m + 1);
+                let left = Node::new_interior(keys, children);
+                let edited = edited.and_then(|e| e.checked_sub(m + 1));
+                let rest = build_interior(rkeys, rchildren, cap, edited, true)?;
+                return Some(join_split(left, sep, rest));
+            }
+        }
     };
 
     let mut keys = keys;
@@ -803,6 +914,7 @@ fn build_interior(
         left: Node::new_interior(keys, children),
         sep,
         right: Node::new_interior(rkeys, rchildren),
+        more: Vec::new(),
     })
 }
 
@@ -1014,27 +1126,49 @@ impl PMap {
         let mut old = None;
         match self.root.as_mut() {
             None => self.root = Some(Node::new_leaf(vec![key], vec![val], vec![weight])),
-            Some(root) => match node_insert(
-                root,
-                key,
-                val,
-                weight,
-                &mut old,
-                src,
-                cap,
-                shape,
-                keep_existing,
-            )? {
-                Ins::Exists => return Ok((false, None)),
-                Ins::Kept => {}
-                Ins::Whole(n) => self.root = Some(n),
-                Ins::Split { left, sep, right } => {
-                    self.root = Some(Node::new_interior(
-                        vec![sep],
-                        vec![Child::Resident(left), Child::Resident(right)],
-                    ));
+            Some(root) => {
+                let mut out = node_insert(
+                    root,
+                    key,
+                    val,
+                    weight,
+                    &mut old,
+                    src,
+                    cap,
+                    shape,
+                    keep_existing,
+                )?;
+                // A split root grows the tree by one level. A multi-way split hands up several
+                // separators, and the new root is built like any interior (it may split in turn).
+                loop {
+                    match out {
+                        Ins::Exists => return Ok((false, None)),
+                        Ins::Kept => break,
+                        Ins::Whole(n) => {
+                            self.root = Some(n);
+                            break;
+                        }
+                        Ins::Split {
+                            left,
+                            sep,
+                            right,
+                            more,
+                        } => {
+                            let mut keys = Vec::with_capacity(1 + more.len());
+                            let mut children = Vec::with_capacity(2 + more.len());
+                            keys.push(sep);
+                            children.push(Child::Resident(left));
+                            children.push(Child::Resident(right));
+                            for (s, n) in more {
+                                keys.push(s);
+                                children.push(Child::Resident(n));
+                            }
+                            out = build_interior(keys, children, cap, None, true)
+                                .expect("a multi-way interior build always yields nodes");
+                        }
+                    }
                 }
-            },
+            }
         }
         if old.is_none() {
             // Maintain the count only when it is known (`Some`). A disk-loaded index skeleton stays
@@ -1628,17 +1762,28 @@ fn node_insert(
                 node.children[i] = Child::Resident(c);
                 Ok(Ins::Kept)
             }
-            Ins::Split { left, sep, right } => {
-                node.keys.insert(i, sep);
-                node.children[i] = Child::Resident(left);
-                node.children.insert(i + 1, Child::Resident(right));
+            Ins::Split {
+                left,
+                sep,
+                right,
+                more,
+            } => {
+                let edited = absorb_split(
+                    &mut node.keys,
+                    &mut node.children,
+                    i,
+                    left,
+                    sep,
+                    right,
+                    more,
+                );
                 let payload = interior_payload(cap, &node.keys);
                 if payload <= cap.c || node.keys.len() < 2 {
                     Ok(Ins::Kept)
                 } else {
                     let keys = std::mem::take(&mut node.keys);
                     let children = std::mem::take(&mut node.children);
-                    Ok(build_interior(keys, children, cap, Some(i))
+                    Ok(build_interior(keys, children, cap, Some(edited), true)
                         .expect("insert-path interior split always has a valid split point"))
                 }
             }
@@ -1670,14 +1815,16 @@ fn node_insert(
             children[i] = Child::Resident(c);
             Ok(Ins::Whole(Node::new_interior(node.keys.clone(), children)))
         }
-        Ins::Split { left, sep, right } => {
+        Ins::Split {
+            left,
+            sep,
+            right,
+            more,
+        } => {
             let mut keys = node.keys.clone();
             let mut children = node.children.clone();
-            keys.insert(i, sep);
-            children[i] = Child::Resident(left);
-            children.insert(i + 1, Child::Resident(right));
-            let edited = Some(i);
-            Ok(build_interior(keys, children, cap, edited)
+            let edited = absorb_split(&mut keys, &mut children, i, left, sep, right, more);
+            Ok(build_interior(keys, children, cap, Some(edited), true)
                 .expect("insert-path interior split always has a valid split point"))
         }
     }
@@ -1958,7 +2105,13 @@ fn merge_at(
             weights.extend_from_slice(rw);
             let key = |i: usize| -> &[u8] { if i < ln { &lk[i] } else { &rk[i - ln] } };
             let row = |i: usize| -> &[Value] { if i < ln { &lv[i] } else { &rv[i - ln] } };
-            let split = leaf_split_point(&weights, &key, &row, cap, shape, None);
+            let split = match leaf_split_point(&weights, &key, &row, cap, shape, None) {
+                LeafSplit::Whole => None,
+                LeafSplit::Two(m) => Some(m),
+                // Unreachable: splitting between the two leaves gives two fitting halves. Abandon
+                // the merge rather than hand the parent more than two nodes.
+                LeafSplit::Multi(_) => return Ok(()),
+            };
             if let Some(m) = split
                 && parent_with(key(m).len()) > cap.c
             {
@@ -1991,7 +2144,7 @@ fn merge_at(
         mkeys.extend(right.keys.iter().cloned());
         let mut mchildren = left.children.clone();
         mchildren.extend(right.children.iter().cloned());
-        match build_interior(mkeys, mchildren, cap, None) {
+        match build_interior(mkeys, mchildren, cap, None, false) {
             // The pushed-up median would overflow the parent: abandon the merge (the interior
             // operands were only copied, so nothing is left to restore).
             Some(Ins::Split { ref sep, .. }) if parent_with(sep.len()) > cap.c => return Ok(()),
@@ -2009,7 +2162,13 @@ fn merge_at(
             node.children[j] = Child::Resident(m);
             node.children.remove(j + 1);
         }
-        Ins::Split { left, sep, right } => {
+        Ins::Split {
+            left,
+            sep,
+            right,
+            more,
+        } => {
+            debug_assert!(more.is_empty(), "a merge splits two-way or is abandoned");
             node.keys[j] = sep;
             node.children[j] = Child::Resident(left);
             node.children[j + 1] = Child::Resident(right);
@@ -2057,6 +2216,7 @@ fn merged_leaf(
         left: Node::new_leaf(left.0, left.1, weights),
         sep,
         right: Node::new_leaf(right.0, right.1, rweights),
+        more: Vec::new(),
     }
 }
 

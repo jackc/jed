@@ -1581,11 +1581,12 @@ an underfull node, which is correct, just not compact.
 
 **Insert.** Descend to the target leaf (interior nodes only route — `partition_point(sep ≤ key)`),
 insert the record in key order, then walk back up: whenever a node overflows (`payload > C`),
-**split it 2-way** and hand one separator to the parent (which may then overflow and split, etc.;
-a root split grows the height by one, the new root an interior node with one separator).
-For a key-only index, a candidate node may have no fitting two-way split, or the new root may
-not fit its copied separator. The mutation then fails `0A000` before storage work; it does not
-change the split rule, invent an empty leaf, or emit an oversized page.
+**split it** and hand the separators to the parent (which may then overflow and split, etc.;
+a root split grows the height by one, the new root an interior node over the split's nodes, built
+with no edited position and split in turn if it overflows). A split is two-way wherever two fitting
+halves exist and **multi-way** otherwise (below). For a key-only index, a single entry may not fit
+a leaf, or a node may not fit one separator. The mutation then fails `0A000`; it does not invent an
+empty leaf or emit an oversized page.
 
 **Split point (shared machinery).** For an overflowing node with entries `e[0 … N)`, define
 `leftpayload(m)` / `rightpayload(m)` as the payload of the would-be left / right node under the
@@ -1602,9 +1603,40 @@ A **right-edge edit** means the entry whose insert/replace triggered the rebuild
 last (`index N−1`; for an interior node, the separator the child split just handed up landed at
 the right edge) — sequential ascending loads land here every time and keep packing left nodes
 ~full. The delete path's **merge-overflow** split (below) has no edited position and always takes
-the balanced arm. `m_min ≤ m_max` always holds for capped table-record insertion (the cap
-arithmetic below). A key-only index insertion without a fitting split fails `0A000`. An
-interior **merge**-overflow with no fitting split instead **abandons the merge** (below).
+the balanced arm. An insertion with no fitting two-way split (no `m_min ≤ m_max`, including no
+`m_min` at all) splits multi-way (next). An interior **merge**-overflow with no fitting split instead **abandons
+the merge** (below).
+
+**Multi-way split (v52, insert path only).** Through v51 a table leaf's payload was the sum of its
+capped records, so a leaf that overflowed by one record always had two fitting halves. A v52 leaf's
+saving depends on its content: one inserted or replaced record can widen a column's offsets, or
+cost it its dictionary or its packed array form, for every record in the leaf, and the half that
+holds that record may not fit however the leaf is divided. (A shortened key prefix cannot do this:
+a key that shortens it is the leaf's first or last, and splitting it off alone fits.) A key-only
+index leaf with a large entry between two others has the same shape, and through v51 failed
+`0A000`. When no `m` in the range gives two fitting nodes:
+
+```
+left node  = entries [0, m_max)          (the largest fitting left node)
+separator  = leaf: a copy of key[m_max]; interior: sep[m_max], which moves up
+remainder  = leaf: entries [m_max, N);   interior: separators (m_max, N) and their children
+```
+
+`m_max` is taken over the kind's two-way range (a leaf: `[1, N−1]`; an interior: `[1, N−2]`). The
+remainder is built by this same procedure: whole if it fits, a two-way split if one fits
+(right-edge iff the edited entry is the remainder's last; an edited entry that is not in the
+remainder gives it no edited position, so the balanced arm), an interior remainder of two
+separators by the pinned `m = 1` split, otherwise another left node and remainder. The parent
+receives every separator, in order, and the edited position it uses for its own split is the last
+separator received. If any node this produces does not fit — no `m_max` exists, or a remainder or
+pinned side holds a single entry or separator longer than a node — the mutation fails `0A000` and
+nothing of the split is kept, at any level including root growth.
+
+For a table leaf this yields **at most three** leaves. Payload is nondecreasing in a leaf's set of
+records, so the records before the edited one fit (they were in the leaf before), as do the
+records after it and the edited record alone; with no fitting two-way split `m_max` is therefore
+the edited index, and the remainder splits two-way by the balanced arm. An interior node's payload
+is a sum, so it splits multi-way only when it received separators too long for two nodes to hold.
 
 > Why two rules: largest-left-fit alone is optimal for ascending appends but degenerates to
 > a `[N-2 | 1]` splinter for **any other** insert position — under random-order inserts
@@ -1621,9 +1653,10 @@ half with its own prefix, bases, widths and dictionaries; `rightpayload(m)` symm
 `[m, N)`. Both are nondecreasing in the number of records in the half (a record adds at least its
 stored bytes, a prefix can only shorten, an offset width only widen, and a region's size is the
 smaller of nondecreasing sizes), which is what the `m_min` / `m_max` / `m_balanced` scan relies on.
-Both sides are non-empty by the range; both must fit. Records that reach the disposition target have the two-record-fit
-guarantee below. Every insertion, including irreducible records above that target, must
-produce fitting halves or fail `0A000` (*Why the record cap*).
+Both sides are non-empty by the range; both must fit, or the split is multi-way (above). Records
+that reach the disposition target have the two-record-fit guarantee below. Every insertion,
+including irreducible records above that target, must produce fitting leaves or fail `0A000`
+(*Why the record cap*).
 
 **Interior split (push-up).** The median separator **moves up** (it is a pure routing key —
 nothing below owns it): the left node gets separators `[0, m)` + children `[0, m]`, separator
@@ -1660,7 +1693,8 @@ rebalancing by **merge-then-maybe-split** (no borrow rotation — merge subsumes
   - If `M` overflows: **split `M` 2-way** by the balanced rule above; the two halves and the new
     separator replace the pair, so the **parent's key count is unchanged**. A **leaf** `M` can
     overflow even when both leaves were small, because its key prefix is no longer than either's
-    and its offset widths no narrower; it splits by the same rule. An **interior**
+    and its offset widths no narrower; it splits by the same rule, and always two-way (dividing `M`
+between the two original leaves gives two fitting halves, so a fitting `m` exists). An **interior**
     `M` (which absorbed a pulled-down separator, `payload(M) < 2·C`) can, with near-cap
     separators, admit **no** valid 2-way split (`m_min > m_max`): then the merge is **abandoned** —
     the two children and the parent separator stay exactly as they were (an underfull interior is
@@ -1694,8 +1728,8 @@ value.
 This is a conditional fit guarantee, not a separate row-admission rule. Fixed slots,
 external pointers, and keys cannot always be reduced to the target; wide rows can have
 a zero target and still fit a page. Those rows and full key-only index entries use the
-same two-way split algorithm with explicit page-fit checks. No empty sibling or multi-way
-spill is introduced: an insertion without a fitting split fails `0A000` before storage.
+same split algorithm with explicit page-fit checks. No empty sibling is introduced: an insertion
+whose single entry does not fit a node fails `0A000`.
 Interiors carry no records and independently check all resulting payloads, including the
 new root. The pinned `N = 2` degenerate interior split and both merge-abandon guards remain
 unchanged.
@@ -2087,6 +2121,7 @@ the interior-node format and the split contract.
 | `statistics_decimal_table.jed` | **statistics over a fixed-width `numeric(p,s)` column** (v51) — a `numeric(6,2)` column analyzed: its leaf values are 4-byte slots, while its MCV values in the statistics entries use the self-describing decimal codec |
 | `decimal_fixed_table.jed` | **fixed-width stored `numeric(p,s)`** (v51) — a `numeric(4,2)` (2-byte slot), `numeric(9,0)` (4-byte), and `numeric(18,6)` (8-byte) column beside a `numeric(19,2)` column, which keeps the variable-width codec; each column's largest and smallest value, zero, a NULL (bitmap bit + zero-filled slot), and enough rows for a two-leaf tree |
 | `compact_leaf_table.jed` | **the compact leaf** (v52) — table `t(tenant i32, id i64, status text, amount numeric(10,2), ts timestamp, tags i32[], note text, PRIMARY KEY (tenant, id))` with an index on `status`, 60 rows inserted in key order (`tenant = 7`, `id = 1000 + i`, `status` cycling `open`/`closed`/`void`, `amount = (100 + i).(i as two digits)`, `ts = 2024-01-01 00:00:00 + i minutes`, `tags` NULL when `i mod 10 = 0`, `'{}'` when `1`, else `ARRAY[i mod 5, i mod 7]`, `note = 'n'` when `i mod 20 = 3` else NULL): a fixed-key tree (`leaf flags` `03`, key length 12, an 11-byte prefix, 10 bytes in the leaf that spans ids 1023–1024), both key columns elided, dictionary regions (`status`, and `note` with its NULL entry), base-plus-offsets regions over a `numeric` slot and a timestamp, and packed integer arrays with NULLs and empty arrays; `t_status_idx` is filled in row order, so its leaves split by the balanced rule with each half measured under its own prefix; then table `u(name text PRIMARY KEY, n i16, flag boolean, z i32)` with 30 rows `('user/alpha/NN', 5, NULL, NULL)`, `NN = 00 … 29`: variable-length keys with a shared prefix and a key directory, a plain variable region (`name`, distinct values), an offset width of 0 over equal values, and all-NULL columns (`z` is base-plus-offsets with base 0; `flag` is plain) |
+| `multiway_split.jed` | **the multi-way leaf split** (v52, *Fan-out*) — a tree shaped by single-row edits, one statement each, in this order. Table `a(id i32 PRIMARY KEY, v i64)`: `INSERT (i, 7)` for `i = 1 … 600` except 400, ascending (leaves `1–192`, `193–294`, `295–487`, `488–589`, `590–600`; `v` stores no offsets); `UPDATE a SET v = 4000000000000 WHERE id = 60` — a **replace** in the middle of the dense first leaf gives every row an 8-byte offset, no two-way split fits, and the leaf becomes `1–59 \| 60–83 \| 84–192`; `INSERT INTO a VALUES (400, -4000000000000)` — the same on the **insert** path, `295–487` becoming `295–399 \| 400–423 \| 424–487`; the root absorbs two separators each time. Table `b(k text PRIMARY KEY, n i32)`: `INSERT ('customer/acct/NNN', 1)` for `NNN = 000 … 063`, ascending (eight leaves of eight rows); then `('a', 2)` (the first leaf loses its 16-byte key prefix and splits two-way by the balanced arm, `a,000–003 \| 004–007`), `('z', 3)` (right edge of the full last leaf: `056–063 \| z`), `('customer/b', 5)` (the end of leaf `056–063`, whose prefix would fall from 15 bytes to 9: `056–063 \| customer/b`, and the root interior splits, growing the tree to height 3), `('customer/a', 4)` (into the first leaf, no split). A key that shortens a leaf's prefix arrives only at an end of the leaf, so those splits are two-way; the reference asserts each edit's split arity |
 | `bytea_table.jed` | a bytea column — the bytea branch; empty value, embedded `0x00`, a high byte, a NULL |
 | `uuid_table.jed` | a **uuid PRIMARY KEY** (the first non-integer stored key — the §8 cross-core key-path proof) + a nullable uuid column |
 | `default_table.jed` | columns with a **constant** `DEFAULT` — the `has_default` flag (bit2) + default value codec written after the typmod |

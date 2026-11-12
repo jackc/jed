@@ -748,15 +748,23 @@ func (m *pMap) Insert(key []byte, val storedRow, weight uint32, cap pageCap, sha
 	if err != nil {
 		return nil, false, err
 	}
-	if out.whole != nil {
-		m.root = out.whole
-	} else {
-		m.root = &pnode{
-			keys:     [][]byte{out.sep},
-			children: []childRef{residentRef(out.left), residentRef(out.right)},
-			owner:    generation,
+	// A split root grows the tree by one level. A multi-way split hands up several separators, and
+	// the new root is built like any interior (it may split in turn).
+	for out.whole == nil {
+		keys := [][]byte{out.sep}
+		children := []childRef{residentRef(out.left), residentRef(out.right)}
+		for _, p := range out.more {
+			keys = append(keys, p.sep)
+			children = append(children, residentRef(p.node))
 		}
+		next, ok := buildInterior(keys, children, cap, -1, generation, true)
+		if !ok {
+			// No fitting root (near-cap separators): leave it whole (0A000 at serialize).
+			next = insOut{whole: &pnode{keys: keys, children: children, owner: generation}}
+		}
+		out = next
 	}
+	m.root = out.whole
 	if !replaced && !m.lengthUnknown {
 		m.length++
 	}
@@ -1413,6 +1421,39 @@ type insOut struct {
 	left  *pnode
 	sep   []byte
 	right *pnode
+	// more is the further nodes of a multi-way split (format.md "Multi-way split"), each with the
+	// separator before it. Empty for a two-way split.
+	more []splitPiece
+}
+
+// splitPiece is one further node of a multi-way split and the separator that precedes it.
+type splitPiece struct {
+	sep  []byte
+	node *pnode
+}
+
+// joinSplit prepends left and sep to a split of the remaining entries.
+func joinSplit(left *pnode, sep []byte, rest insOut) insOut {
+	if rest.whole != nil {
+		return insOut{left: left, sep: sep, right: rest.whole}
+	}
+	more := make([]splitPiece, 0, 1+len(rest.more))
+	more = append(more, splitPiece{sep: rest.sep, node: rest.right})
+	more = append(more, rest.more...)
+	return insOut{left: left, sep: sep, right: rest.left, more: more}
+}
+
+// absorbSplit replaces child i of an interior's vectors with the nodes of sub's split and inserts
+// its separators. It returns the new vectors and the index of the last separator inserted.
+func absorbSplit(keys [][]byte, children []childRef, i int, sub insOut) ([][]byte, []childRef, int) {
+	keys = insertKeyAtMutable(keys, i, sub.sep)
+	children[i] = residentRef(sub.left)
+	children = insertChildAtMutable(children, i+1, residentRef(sub.right))
+	for j, p := range sub.more {
+		keys = insertKeyAtMutable(keys, i+1+j, p.sep)
+		children = insertChildAtMutable(children, i+2+j, residentRef(p.node))
+	}
+	return keys, children, i + len(sub.more)
 }
 
 // splitPoint is the kind-shared split decision (format.md "Split point"): given the per-boundary
@@ -1563,18 +1604,28 @@ func buildLeaf(keys [][]byte, vals []storedRow, weights []uint32, cap pageCap, s
 	rightpayload := func(m int) int {
 		return total - prefix[m] + leafOverhead(n-m, shape) - leafPrefixSaving(n-m, keys[m], keys[n-1]) - forSaved(n-m, m, suf, dsuf)
 	}
-	m, ok := splitPoint(1, n-1, payload, cap.c, edited == n-1, leftpayload, rightpayload)
-	if !ok {
-		// Unreachable under the RECORD_MAX cap (a two-record leaf always fits — format.md "Why the
-		// record cap"); defensively leave the node whole (0A000 at serialize).
-		return insOut{whole: &pnode{keys: keys, vals: vals, weights: weights, owner: owner}}
-	}
 	// A half keeps the tables only when it does not fit without them (it was measured under them).
 	halfTabs := func(lo, hi int) []*symTable {
 		if tabs == nil || prefix[hi]-prefix[lo]+leafOverhead(hi-lo, shape) <= cap.c {
 			return nil
 		}
 		return tabs
+	}
+	m, ok := splitPoint(1, n-1, payload, cap.c, edited == n-1, leftpayload, rightpayload)
+	if !ok {
+		// No two fitting halves (format.md "Multi-way split"): one changed record can widen a whole
+		// leaf's encodings. The left leaf takes the largest fitting run and the rest splits again.
+		mMax := 0
+		for m := 1; m <= n-1 && leftpayload(m) <= cap.c; m++ {
+			mMax = m
+		}
+		if mMax == 0 {
+			// A single record that does not fit: leave the node whole (0A000 at serialize).
+			return insOut{whole: &pnode{keys: keys, vals: vals, weights: weights, owner: owner}}
+		}
+		left := &pnode{keys: cloneKeys(keys[:mMax]), vals: cloneVals(vals[:mMax]), weights: cloneWeights(weights[:mMax]), owner: owner, symTabs: halfTabs(0, mMax)}
+		rest := buildLeaf(cloneKeys(keys[mMax:]), cloneVals(vals[mMax:]), cloneWeights(weights[mMax:]), cap, shape, edited-mMax, owner, prior)
+		return joinSplit(left, keys[mMax], rest)
 	}
 	return insOut{
 		left:  &pnode{keys: cloneKeys(keys[:m]), vals: cloneVals(vals[:m]), weights: cloneWeights(weights[:m]), owner: owner, symTabs: halfTabs(0, m)},
@@ -1589,7 +1640,7 @@ func buildLeaf(keys [][]byte, vals []storedRow, weights []uint32, cap pageCap, s
 // reachable with near-cap separators) the split is pinned to m = 1, producing a legal N = 0 right
 // interior (the degenerate fan-out contract). Returns ok=false when the node overflows and no valid
 // split point exists — the caller (only the interior MERGE path can hit it) abandons the merge.
-func buildInterior(keys [][]byte, children []childRef, cap pageCap, edited int, owner *mutationGeneration) (insOut, bool) {
+func buildInterior(keys [][]byte, children []childRef, cap pageCap, edited int, owner *mutationGeneration, multi bool) (insOut, bool) {
 	n := len(keys)
 	payload := interiorPayload(cap, keys)
 	if payload <= cap.c || n < 2 {
@@ -1612,7 +1663,25 @@ func buildInterior(keys [][]byte, children []childRef, cap pageCap, edited int, 
 		var ok bool
 		m, ok = splitPoint(1, n-2, payload, cap.c, edited == n-1, leftpayload, rightpayload)
 		if !ok {
-			return insOut{}, false
+			if !multi {
+				return insOut{}, false
+			}
+			// Multi-way (format.md "Multi-way split"): the left node takes the largest fitting run,
+			// its next separator moves up, and the rest splits again.
+			mMax := 0
+			for m := 1; m <= n-2 && leftpayload(m) <= cap.c; m++ {
+				mMax = m
+			}
+			if mMax == 0 {
+				// One separator that does not fit: leave the node whole (0A000 at serialize).
+				return insOut{whole: &pnode{keys: keys, children: children, owner: owner}}, true
+			}
+			left := &pnode{keys: cloneKeys(keys[:mMax]), children: cloneChildren(children[:mMax+1]), owner: owner}
+			rest, ok := buildInterior(cloneKeys(keys[mMax+1:]), cloneChildren(children[mMax+1:]), cap, edited-mMax-1, owner, true)
+			if !ok {
+				return insOut{}, false
+			}
+			return joinSplit(left, keys[mMax], rest), true
 		}
 	}
 	return insOut{
@@ -1689,14 +1758,13 @@ func nodeInsert(n *pnode, key []byte, val storedRow, weight uint32, old *storedR
 			n.children[i] = residentRef(sub.whole)
 			return insOut{whole: n}, nil
 		}
-		n.keys = insertKeyAtMutable(n.keys, i, sub.sep)
+		var edited int
+		n.keys, n.children, edited = absorbSplit(n.keys, n.children, i, sub)
 		n.sameKeys = false
-		n.children[i] = residentRef(sub.left)
-		n.children = insertChildAtMutable(n.children, i+1, residentRef(sub.right))
 		if n.payload(cap, shape) <= cap.c || len(n.keys) < 2 {
 			return insOut{whole: n}, nil
 		}
-		out, ok := buildInterior(n.keys, n.children, cap, i, generation)
+		out, ok := buildInterior(n.keys, n.children, cap, edited, generation, true)
 		if !ok {
 			panic("insert-path interior split always has a valid split point")
 		}
@@ -1709,11 +1777,8 @@ func nodeInsert(n *pnode, key []byte, val storedRow, weight uint32, old *storedR
 		origin, same := originOf(n)
 		return insOut{whole: &pnode{keys: cloneKeys(n.keys), children: children, owner: generation, origin: origin, sameKeys: same}}, nil
 	}
-	keys := insertKeyAt(n.keys, i, sub.sep)
-	children := cloneChildren(n.children)
-	children[i] = residentRef(sub.left)
-	children = insertChildAt(children, i+1, residentRef(sub.right))
-	out, ok := buildInterior(keys, children, cap, i, generation)
+	keys, children, edited := absorbSplit(cloneKeys(n.keys), cloneChildren(n.children), i, sub)
+	out, ok := buildInterior(keys, children, cap, edited, generation, true)
 	if !ok {
 		panic("insert-path interior split always has a valid split point")
 	}
@@ -1883,6 +1948,10 @@ func mergeAt(n *pnode, j int, generation *mutationGeneration, src leafSource, ca
 		mn := len(leftWeights) + len(rightWeights)
 		merged = buildLeaf(concatRange(leftKeys, rightKeys, 0, mn), concatRange(leftRows, rightRows, 0, mn),
 			concatRange(leftWeights, rightWeights, 0, mn), cap, shape, -1, generation, nil)
+		if len(merged.more) > 0 {
+			// Unreachable: splitting between the two leaves gives two fitting halves. Abandon.
+			return n, nil
+		}
 	} else {
 		mkeys := make([][]byte, 0, len(left.keys)+1+len(right.keys))
 		mkeys = append(mkeys, left.keys...)
@@ -1892,7 +1961,7 @@ func mergeAt(n *pnode, j int, generation *mutationGeneration, src leafSource, ca
 		mchildren = append(mchildren, left.children...)
 		mchildren = append(mchildren, right.children...)
 		var ok bool
-		merged, ok = buildInterior(mkeys, mchildren, cap, -1, generation)
+		merged, ok = buildInterior(mkeys, mchildren, cap, -1, generation, false)
 		if !ok {
 			// No valid 2-way split point (near-cap separators): abandon the merge — the two
 			// children and the parent separator stay exactly as they were (underfull tolerated).

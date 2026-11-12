@@ -777,6 +777,29 @@ function decimalFixedTableDB(): Engine {
 // (with NULLs and empty arrays), a mostly-NULL text column, and an index over status. Table u:
 // variable-length text keys with a shared prefix and a key directory, a column of one value (offset
 // width 0), and all-NULL columns. Rows are inserted in key order, one statement each.
+// multiwaySplitDB is a tree shaped by single-row edits that take the multi-way leaf split
+// (format.md "Multi-way split"). Table a: a dense leaf whose v column stores no offsets; one
+// replaced row and one inserted row each widen their leaf, which splits in three. Table b: keys
+// outside a shared prefix land at a leaf's edge and split two-way.
+function multiwaySplitDB(): Engine {
+  const db = goldenDb();
+  run(db, "CREATE TABLE a (id i32 PRIMARY KEY, v i64)");
+  for (let i = 1; i <= 600; i++) {
+    if (i !== 400) run(db, `INSERT INTO a VALUES (${i}, 7)`);
+  }
+  run(db, "UPDATE a SET v = 4000000000000 WHERE id = 60");
+  run(db, "INSERT INTO a VALUES (400, -4000000000000)");
+  run(db, "CREATE TABLE b (k text PRIMARY KEY, n i32)");
+  for (let i = 0; i < 64; i++) {
+    run(db, `INSERT INTO b VALUES ('customer/acct/${String(i).padStart(3, "0")}', 1)`);
+  }
+  run(db, "INSERT INTO b VALUES ('a', 2)");
+  run(db, "INSERT INTO b VALUES ('z', 3)");
+  run(db, "INSERT INTO b VALUES ('customer/b', 5)");
+  run(db, "INSERT INTO b VALUES ('customer/a', 4)");
+  return db;
+}
+
 function compactLeafTableDB(): Engine {
   const db = goldenDb();
   run(
@@ -1335,6 +1358,7 @@ test("write matches goldens (byte-identical to Rust/Go/Ruby)", () => {
     { name: "decimal_table.jed", build: decimalTableDB },
     { name: "decimal_fixed_table.jed", build: decimalFixedTableDB },
     { name: "compact_leaf_table.jed", build: compactLeafTableDB },
+    { name: "multiway_split.jed", build: multiwaySplitDB },
     { name: "bytea_table.jed", build: byteaTableDB },
     { name: "text_pk_table.jed", build: textPkTableDB },
     { name: "bytea_pk_table.jed", build: byteaPkTableDB },
@@ -1426,6 +1450,8 @@ test("read goldens reproduces rows", () => {
     { name: "decimal_fixed_table.jed", build: decimalFixedTableDB, table: "t" },
     { name: "compact_leaf_table.jed", build: compactLeafTableDB, table: "t" },
     { name: "compact_leaf_table.jed", build: compactLeafTableDB, table: "u" },
+    { name: "multiway_split.jed", build: multiwaySplitDB, table: "a" },
+    { name: "multiway_split.jed", build: multiwaySplitDB, table: "b" },
     { name: "bytea_table.jed", build: byteaTableDB, table: "t" },
     { name: "text_pk_table.jed", build: textPkTableDB, table: "t" },
     { name: "bytea_pk_table.jed", build: byteaPkTableDB, table: "t" },
