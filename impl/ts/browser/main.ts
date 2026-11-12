@@ -162,7 +162,9 @@ async function compactScenario(name: string): Promise<Record<string, unknown>> {
   const db = await createDatabase({ path: name });
   try {
     await db.execute("CREATE TABLE t (k i32 PRIMARY KEY, v text)");
-    await db.execute("INSERT INTO t SELECT g, repeat('x', 300) FROM generate_series(1, 3000) g");
+    await db.execute(
+      "INSERT INTO t SELECT g, rpad(g::text, 300, 'x') FROM generate_series(1, 3000) g",
+    );
     await db.execute("DELETE FROM t WHERE k > 3");
   } finally {
     await db.close();

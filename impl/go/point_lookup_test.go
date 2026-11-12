@@ -28,7 +28,7 @@ func bigTable(t *testing.T, n int) *Session {
 
 func TestPointLookupMultiLeaf(t *testing.T) {
 	t.Parallel()
-	const n = 1000
+	const n = 10000
 	db := bigTable(t, n)
 
 	store := db.engine.readSnap().store("t")

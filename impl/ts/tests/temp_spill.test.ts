@@ -139,7 +139,7 @@ test("spilling does not move the 54P03 point", () => {
         const pad = "z".repeat(40);
         for (let i = 1; i <= 1000; i++) {
           try {
-            queryOutcome(sess, `INSERT INTO lt VALUES (${i}, 'r-${pad}')`);
+            queryOutcome(sess, `INSERT INTO lt VALUES (${i}, 'r${i}-${pad}')`);
           } catch (e) {
             if (!(e instanceof EngineError) || e.code() !== "54P03") throw e;
             return { at: i, spilled: tempStorageOf(sess).spilled };

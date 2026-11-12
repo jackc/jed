@@ -314,7 +314,7 @@ func TestCancellationBatchCheckpoints(t *testing.T) {
 	db := memDB()
 	defer db.Close()
 	bg := context.Background()
-	for _, sql := range []string{"CREATE TABLE t (id i32 PRIMARY KEY, v i32)", "INSERT INTO t SELECT i, i % 7 FROM generate_series(1, 2000) AS g(i)"} {
+	for _, sql := range []string{"CREATE TABLE t (id i32 PRIMARY KEY, v i32)", "INSERT INTO t SELECT i, i % 7 FROM generate_series(1, 20000) AS g(i)"} {
 		if _, err := db.Exec(bg, sql); err != nil {
 			t.Fatal(err)
 		}
@@ -339,7 +339,7 @@ func TestCancellationBatchCheckpoints(t *testing.T) {
 			if r.Next() || cancelCode(t, r.Err()) != "57014" {
 				t.Fatal("batch did not cancel")
 			}
-			if store.reads < 2 || r.Cost() <= 0 || r.Cost() >= 2000 {
+			if store.reads < 2 || r.Cost() <= 0 || r.Cost() >= 20000 {
 				t.Fatalf("scan ran to completion before cancel: reads=%d cost=%d", store.reads, r.Cost())
 			}
 			if *s.engine.session.lifetimeTotal != r.Cost() {

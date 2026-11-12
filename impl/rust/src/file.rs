@@ -870,7 +870,7 @@ mod tests {
     fn demand_paging_scans_correctly_with_bounded_residency() {
         let path = tmp("jed_p64b_paging.jed");
         let _ = std::fs::remove_file(&path);
-        let n = 600i64;
+        let n = 6000i64; // ten times the pre-v52 count: a compact leaf holds about ten times the rows
         const CAP: usize = 3;
 
         // Build a multi-level tree at a small page size, so a few hundred rows span many pages.
@@ -936,7 +936,7 @@ mod tests {
             .unwrap();
             execute(&mut db, "DELETE FROM t WHERE k = 100").unwrap();
             execute(&mut db, "UPDATE t SET v = 999 WHERE k = 200").unwrap();
-            execute(&mut db, "INSERT INTO t VALUES (600, 1200)").unwrap();
+            execute(&mut db, "INSERT INTO t VALUES (6000, 12000)").unwrap();
             assert!(
                 db.resident_leaves() <= CAP,
                 "mutations keep residency bounded"
@@ -959,8 +959,8 @@ mod tests {
         );
         let k200 = rows.iter().find(|r| r[0] == Value::Int(200)).unwrap();
         assert_eq!(k200[1], Value::Int(999), "k=200 was updated");
-        let k600 = rows.iter().find(|r| r[0] == Value::Int(600)).unwrap();
-        assert_eq!(k600[1], Value::Int(1200), "k=600 was inserted");
+        let k6000 = rows.iter().find(|r| r[0] == Value::Int(6000)).unwrap();
+        assert_eq!(k6000[1], Value::Int(12000), "k=6000 was inserted");
         db.close().unwrap();
 
         let _ = std::fs::remove_file(&path);
@@ -974,7 +974,7 @@ mod tests {
     fn memory_budget_bounds_residency_under_lookups() {
         let path = tmp("jed_p64c_budget.jed");
         let _ = std::fs::remove_file(&path);
-        let n = 2000i64;
+        let n = 20000i64; // ten times the pre-v52 count (the compact leaf)
         const CAP: usize = 4;
 
         {
@@ -1295,7 +1295,8 @@ mod tests {
         let pad = "p".repeat(3500);
         execute(&mut db, "BEGIN").unwrap();
         for i in 0..400 {
-            execute(&mut db, &format!("INSERT INTO t VALUES ({i}, '{pad}')")).unwrap();
+            // Distinct per row: equal pads would share one dictionary entry (format.md kind 2).
+            execute(&mut db, &format!("INSERT INTO t VALUES ({i}, '{i}{pad}')")).unwrap();
         }
         execute(&mut db, "COMMIT").unwrap();
 

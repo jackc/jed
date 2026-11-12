@@ -7,6 +7,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { PMap, leafOverhead, unboundedBound } from "../src/pmap.ts";
+import { leafPrefixSaving } from "../src/leaf_compact.ts";
 import type { KeyBound, LeafShape, PNode } from "../src/pmap.ts";
 import type { Cap } from "../src/cap.ts";
 import { intValue } from "../src/lib.ts";
@@ -20,7 +21,7 @@ const CAP: Cap = { c: 240, tag: 0 };
 const W = 16;
 // row() has one fixed-width value column — the v24 leaf overhead scales with the class mix
 // (format.md "Leaf node").
-const SHAPE: LeafShape = { fixed: 1, var: 0 };
+const SHAPE: LeafShape = { fixed: 1, var: 0, elided: 0, keyLen: 0, sizer: null };
 
 function key(n: number): Uint8Array {
   const b = new Uint8Array(8);
@@ -68,12 +69,15 @@ function shuffled(n: number): number[] {
 }
 
 // nodePayload mirrors pmap's serialized-size arithmetic (format.md): a leaf is Σ weights +
-// leafOverhead(N, shape); an interior node is 8·N + 4 + Σ sep_len (record-free, v24).
+// leafOverhead(N, shape) less the bytes its shared key prefix saves (v52; these shapes have no
+// content-dependent column region); an interior node is 8·N + 4 + Σ sep_len (record-free, v24).
 function nodePayload(n: PNode, shape: LeafShape): number {
   if (n.children.length === 0) {
     let total = 0;
     for (const w of n.weights) total += w;
-    return total + leafOverhead(n.keys.length, shape);
+    const count = n.keys.length;
+    const saved = count < 2 ? 0 : leafPrefixSaving(count, n.keys[0]!, n.keys[count - 1]!);
+    return total + leafOverhead(count, shape) - saved;
   }
   let seps = 0;
   for (const k of n.keys) seps += k.length;
@@ -309,7 +313,7 @@ test("pmap: near-cap keys force degenerate interior nodes", () => {
   // Index-tree shape: zero value columns, record = key alone. RECORD_MAX(0) = (240-12)/2 = 114;
   // keys of 112 bytes keep records under the cap while two separators (2·112 + 20) overflow an
   // interior.
-  const shape: LeafShape = { fixed: 0, var: 0 };
+  const shape: LeafShape = { fixed: 0, var: 0, elided: 0, keyLen: 0, sizer: null };
   const bigKey = (n: number): Uint8Array => {
     const k = new Uint8Array(112).fill(0xab);
     new DataView(k.buffer).setBigUint64(0, BigInt(n));

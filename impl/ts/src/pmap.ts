@@ -23,6 +23,7 @@ import { type Cap, capPtr } from "./cap.ts";
 import type { ColType } from "./catalog.ts";
 import type { Row } from "./storage.ts";
 import type { Value } from "./value.ts";
+import { leafPrefixSaving } from "./leaf_compact.ts";
 import {
   COOPERATE,
   ioSteps,
@@ -67,17 +68,25 @@ export interface PackedLeaf {
   // undefined for an out-of-line or compressed value, whose resolve may need a page read (the
   // caller takes the stepping path).
   colNow(i: number, c: number): Value | undefined;
-  // The retained page payload the stored spans below index (packed-leaf.md §11 Track A4).
+  // The retained page payload (packed-leaf.md §11 Track A4).
   readonly payload: Uint8Array;
+  // The payload's content length: the leaf's serialized size, content-dependent savings included
+  // (format.md "Leaf payload").
+  readonly payloadLen: number;
+  // search binary-searches the leaf's keys without rebuilding them — set on a leaf that stores a
+  // shared key prefix (format.md "Leaf node"), whose full keys are otherwise rebuilt on first use.
+  search?(key: Uint8Array): { index: number; found: boolean };
   // Whether column c of row i is NULL — the null bitmap / zero-length span, no value decode.
   isNull(i: number, c: number): boolean;
-  // The stored bytes of a non-NULL column c of row i as payload offsets [out.start, out.end): a
-  // variable column's tagged codec bytes, a fixed-width column's untagged slot. False for NULL.
+  // The stored bytes of a non-NULL column c of row i as out.buf[out.start, out.end): a variable
+  // column's tagged bytes, a fixed-width column's untagged slot. out.buf is the page payload, or the
+  // buffer a region the page stores in another form was rebuilt into (an elided key column, a
+  // base-plus-offsets or packed-array region — format.md "Leaf node"). False for NULL.
   span(i: number, c: number, out: Span): boolean;
 }
 
-// A stored value's [start, end) byte range within a Packed leaf's payload.
-export type Span = { start: number; end: number };
+// A stored value's bytes: buf[start, end).
+export type Span = { buf: Uint8Array; start: number; end: number };
 
 // One B+tree node. `children` is empty for a leaf; otherwise children.length === keys.length+1 and
 // the node is a record-free interior (v24): its keys are the routing separators and its
@@ -107,6 +116,10 @@ export type PNode = {
   // set with the page id by the commit that seals the node, so a parent written later binds it.
   // Absent in a plaintext file and while the node is dirty.
   tag?: Uint8Array;
+  // sizes caches a dirty Decoded leaf's content-dependent size facts (LeafSizer) for its first n rows,
+  // so an insert measures one row instead of the leaf. Kept only on a node its writer owns; any change
+  // other than adding a row drops it.
+  sizes?: { n: number; facts: unknown };
   [mutationOwner]?: MutationGeneration;
 };
 
@@ -263,31 +276,89 @@ function isLeaf(n: PNode): boolean {
   return n.children.length === 0;
 }
 
-// LeafShape is a leaf's column-class shape — the two counts leafOverhead needs beyond N (the fixed
-// and variable column counts, fixed + var = K). Computed once per store from its column types
-// (format.ts leafShape) and threaded through the B+tree's size arithmetic, which never sees the
-// types themselves. An index tree (zero value columns) is { fixed: 0, var: 0 }.
-export type LeafShape = { fixed: number; var: number };
+// LeafShape is a leaf's shape — what its size arithmetic needs beyond its records (format.md "Page
+// model", "Fan-out"): the stored fixed-width and variable-width column counts, the elided key column
+// count (fixed + var + elided = K), the tree's fixed key length (0 when keys vary), and the sizer
+// measuring its content-dependent region savings (null when no column has one). Computed once per
+// store from its column types (format.ts leafShape) and threaded through the B+tree's size
+// arithmetic, which never sees the types themselves. An index tree (zero value columns, keys of
+// varying length) is { 0, 0, 0, 0, null }.
+export type LeafShape = {
+  fixed: number;
+  var: number;
+  elided: number;
+  keyLen: number;
+  sizer: LeafSizer | null;
+};
 
-// leafOverhead is the bytes a v24 leaf's payload carries beyond Σ record_size (format.md "Leaf
-// node"): the key directory (4·N), the column directory (4·(K+1)), and per region a flags byte plus
-// — fixed-width — the null bitmap (ceil(N/8)) or — variable-width — the value directory (4·N).
-// Defined here (not format.ts) to avoid a format↔pmap import cycle; the cross-core goldens catch
-// any drift. Interior nodes do not use this (their payload is 8·N + 4 + Σ sep_len).
-//   leafOverhead(N, cols) = 4·N + 4·(K+1) + F·(1 + ceil(N/8)) + V·(1 + 4·N)
-export function leafOverhead(n: number, shape: LeafShape): number {
-  const k = shape.fixed + shape.var;
-  return 4 * n + 4 * (k + 1) + shape.fixed * (1 + Math.ceil(n / 8)) + shape.var * (1 + 4 * n);
+// LeafSizer measures the bytes a leaf's content-dependent column regions save — base plus offsets,
+// dictionaries, packed arrays (format.md "Leaf node") — from decoded rows. Implemented by the format
+// layer over the table's column types (format.ts), so pmap never imports the value codec. Facts are
+// opaque here: they only grow as rows are added.
+export interface LeafSizer {
+  newFacts(): unknown;
+  addRow(facts: unknown, key: Uint8Array, row: Row, cap: Cap): void;
+  // The region savings of a leaf of n rows with these facts.
+  saving(facts: unknown, n: number): number;
+  // pre[m] is the region savings of rows [0, m) and suf[m] that of rows [m, n), for m in [0, n].
+  boundarySavings(keys: Uint8Array[], rows: Row[], cap: Cap): { pre: number[]; suf: number[] };
 }
 
-// payload is this node's serialized size (format.md): a leaf is Σ weights + leafOverhead(N, shape);
-// an interior node is ptr·(N+1) + 4·N + Σ sep_len (child pointers + separator directory + key blob —
-// record-free, v24; ptr is 4, or 20 with an encrypted file's tags — encrypted.md §2).
+// leafOverhead is the bytes a leaf's payload carries beyond Σ record_size, before the
+// content-dependent savings (format.md "Page model"): the leaf flags byte, the key directory (2·N, or
+// the 2-byte key length of a fixed-key tree), the column directory (2·(K+1)), and per stored region a
+// kind byte plus — fixed-width — the null bitmap (ceil(N/8)) or — variable-width — the value
+// directory (2·N). Defined here (not format.ts) to avoid a format↔pmap import cycle; the cross-core
+// goldens catch any drift. Interior nodes do not use this (their payload is 8·N + 4 + Σ sep_len).
+//   leafOverhead(N, cols) = 1 + keyDir(N) + 2·(K+1) + F·(1 + ceil(N/8)) + V·(1 + 2·N)
+export function leafOverhead(n: number, shape: LeafShape): number {
+  const k = shape.fixed + shape.var + shape.elided;
+  const keyDir = shape.keyLen > 0 ? 2 : 2 * n;
+  return 1 + keyDir + 2 * (k + 1) + shape.fixed * (1 + Math.ceil(n / 8)) + shape.var * (1 + 2 * n);
+}
+
+// payload is this node's serialized size (format.md "Leaf payload"): a leaf is Σ weights +
+// leafOverhead(N, shape) − saving(leaf); an interior node is ptr·(N+1) + 4·N + Σ sep_len (child
+// pointers + separator directory + key blob — record-free, v24; ptr is 4, or 20 with an encrypted
+// file's tags — encrypted.md §2).
 function payload(n: PNode, cap: Cap, shape: LeafShape): number {
   if (isLeaf(n)) {
-    return totalWeight(n) + leafOverhead(nodeLen(n), shape);
+    // A Packed leaf's size is its page's content length: the page was written by these rules.
+    if (n.packed) return n.packed.payloadLen;
+    const plain = totalWeight(n) + leafOverhead(n.keys.length, shape);
+    return plain - contentSaving(n, cap, shape);
   }
   return interiorPayload(cap, n.keys);
+}
+
+// contentSaving is the bytes a Decoded leaf's content-dependent encodings save: the shared key prefix
+// and the column regions' savings (format.md "Leaf payload").
+function contentSaving(n: PNode, cap: Cap, shape: LeafShape): number {
+  const count = n.keys.length;
+  let saving = 0;
+  if (count >= 2) saving += leafPrefixSaving(count, n.keys[0]!, n.keys[count - 1]!);
+  const sizer = shape.sizer;
+  if (sizer !== null && count > 0) {
+    let sz = n.sizes;
+    if (sz === undefined || sz.n !== count) {
+      const facts = sizer.newFacts();
+      for (let i = 0; i < count; i++) sizer.addRow(facts, n.keys[i]!, n.vals[i]!, cap);
+      sz = { n: count, facts };
+      // A dirty node is its writer's alone, so it may keep the facts.
+      if (n.page === 0 && n[mutationOwner] !== undefined) n.sizes = sz;
+    }
+    saving += sizer.saving(sz.facts, count);
+  }
+  return saving;
+}
+
+// payloadAtMost reports whether a leaf's payload is at most limit. The content-dependent saving is
+// computed only when the size without it does not already decide.
+function payloadAtMost(n: PNode, limit: number, cap: Cap, shape: LeafShape): boolean {
+  if (n.packed) return n.packed.payloadLen <= limit;
+  const plain = totalWeight(n) + leafOverhead(n.keys.length, shape);
+  if (plain <= limit) return true;
+  return plain - contentSaving(n, cap, shape) <= limit;
 }
 
 // interiorPayload is an interior node's payload for these separators (format.md "Interior node";
@@ -392,6 +463,7 @@ function entryWindow(b: KeyBound, n: PNode): [number, number] {
 
 // search binary-searches a LEAF's keys: found ⇒ keys[index] === key, else index is the insertion slot.
 function search(n: PNode, key: Uint8Array): { index: number; found: boolean } {
+  if (n.packed?.search !== undefined) return n.packed.search(key);
   let lo = 0;
   let hi = nodeLen(n);
   while (lo < hi) {
@@ -1154,7 +1226,42 @@ function buildLeaf(
   edited: number | null,
   owner?: MutationGeneration,
 ): InsOut {
-  const m = leafSplit(weights, cap, shape, edited);
+  const n = keys.length;
+  let total = 0;
+  for (const w of weights) total += w;
+  let pay = total + leafOverhead(n, shape);
+  // The content-dependent savings are measured only when the leaf does not fit without them. Each
+  // candidate half is measured with its own key prefix, bases, widths and dictionaries.
+  let bounds: { pre: number[]; suf: number[] } | null = null;
+  if (pay > cap.c && n >= 2) {
+    pay -= leafPrefixSaving(n, keys[0]!, keys[n - 1]!);
+    if (shape.sizer !== null) {
+      bounds = shape.sizer.boundarySavings(keys, vals, cap);
+      pay -= bounds.pre[n]!;
+    }
+  }
+  if (pay <= cap.c || n < 2) return { whole: newLeaf(keys, vals, weights, owner) };
+
+  const prefix = new Array<number>(n + 1);
+  prefix[0] = 0;
+  for (let i = 0; i < n; i++) prefix[i + 1] = prefix[i]! + weights[i]!;
+  // Both stay monotone in m: a record added to a half adds at least its stored bytes, the half's
+  // key prefix can only shorten, an offset width only widen, and a region's size is the smaller of
+  // nondecreasing sizes (format.md "Leaf split").
+  const leftpayload = (m: number): number =>
+    prefix[m]! +
+    leafOverhead(m, shape) -
+    leafPrefixSaving(m, keys[0]!, keys[m - 1]!) -
+    (bounds === null ? 0 : bounds.pre[m]!);
+  const rightpayload = (m: number): number =>
+    total -
+    prefix[m]! +
+    leafOverhead(n - m, shape) -
+    leafPrefixSaving(n - m, keys[m]!, keys[n - 1]!) -
+    (bounds === null ? 0 : bounds.suf[m]!);
+  // null is unreachable under the RECORD_MAX cap (a two-record leaf always fits — format.md "Why the
+  // record cap"); defensively leave the node whole (0A000 at serialize).
+  const m = splitPoint(1, n - 1, pay, cap.c, edited === n - 1, leftpayload, rightpayload);
   if (m === null) return { whole: newLeaf(keys, vals, weights, owner) };
   return {
     whole: null,
@@ -1162,30 +1269,6 @@ function buildLeaf(
     sep: keys[m]!,
     right: newLeaf(keys.slice(m), vals.slice(m), weights.slice(m), owner),
   };
-}
-
-// leafSplit is buildLeaf's split decision over a leaf's record weights: null when the leaf stays
-// whole, else the index of the first record of the right half.
-function leafSplit(
-  weights: number[],
-  cap: Cap,
-  shape: LeafShape,
-  edited: number | null,
-): number | null {
-  const n = weights.length;
-  let total = 0;
-  for (const w of weights) total += w;
-  const pay = total + leafOverhead(n, shape);
-  if (pay <= cap.c || n < 2) return null;
-
-  const prefix = new Array<number>(n + 1);
-  prefix[0] = 0;
-  for (let i = 0; i < n; i++) prefix[i + 1] = prefix[i]! + weights[i]!;
-  const leftpayload = (m: number): number => prefix[m]! + leafOverhead(m, shape);
-  const rightpayload = (m: number): number => total - prefix[m]! + leafOverhead(n - m, shape);
-  // null is unreachable under the RECORD_MAX cap (a two-record leaf always fits — format.md "Why the
-  // record cap"); defensively leave the node whole (0A000 at serialize).
-  return splitPoint(1, n - 1, pay, cap.c, edited === n - 1, leftpayload, rightpayload);
 }
 
 // buildInterior builds an interior node from its parts; if its payload overflows cap, it splits
@@ -1257,12 +1340,18 @@ function* nodeInsertSteps(
         ctx.replaced = true;
         n.vals[index] = val;
         n.weights[index] = weight;
+        n.sizes = undefined; // a replaced row can shrink the facts: recompute
       } else {
         n.keys.splice(index, 0, key);
         n.vals.splice(index, 0, val);
         n.weights.splice(index, 0, weight);
+        const sz = n.sizes;
+        if (sz !== undefined && shape.sizer !== null && sz.n === n.keys.length - 1) {
+          shape.sizer.addRow(sz.facts, key, val, cap);
+          sz.n++;
+        }
       }
-      if (payload(n, cap, shape) <= cap.c || nodeLen(n) < 2) return { whole: n };
+      if (payloadAtMost(n, cap.c, cap, shape) || nodeLen(n) < 2) return { whole: n };
       // The unchanged builder selects the exact split point/separator. This edited node is
       // abandoned when its returned halves replace it.
       return buildLeaf(n.keys, n.vals, n.weights, cap, shape, index, generation);
@@ -1355,6 +1444,7 @@ function* nodeRemoveSteps(
       n.keys.splice(index, 1);
       n.vals.splice(index, 1);
       n.weights.splice(index, 1);
+      n.sizes = undefined; // a removed row can shrink the facts: recompute
       return { ok: true, node: n, removed };
     }
     // decodedParts returns fresh arrays, so the copy is edited directly.
@@ -1410,7 +1500,12 @@ function* rebalanceChildSteps(
 ): Steps<PNode> {
   // children[i] was just rebuilt resident by nodeRemove, so inspecting it faults nothing.
   const child = yield* resolveChildSteps(n.children[i], src);
-  if (payload(child, cap, shape) >= cap.c / 2) return n;
+  // Underfull is payload < C/2 (format.md "Delete").
+  const half = Math.ceil(cap.c / 2);
+  if (
+    isLeaf(child) ? !payloadAtMost(child, half - 1, cap, shape) : payload(child, cap, shape) >= half
+  )
+    return n;
   if (n.children.length < 2) {
     // A 0-key interior (one child, the degenerate max-separator shape) has no sibling to merge
     // with — its own parent merges IT away; the root case collapses in PMap.remove.
@@ -1471,38 +1566,18 @@ function* mergeAtSteps(
     // inputs are left untouched, so an abandoned merge below keeps them exactly as they were.
     const l = leafParts(left);
     const r = leafParts(right);
-    const mweights = l.weights.concat(r.weights);
-    const total = mweights.length;
-    const m = leafSplit(mweights, cap, shape, null);
-    if (m === null) {
-      merged = {
-        whole: newLeaf(
-          concatRange(l.keys, r.keys, 0, total),
-          concatRange(l.vals, r.vals, 0, total),
-          mweights,
-          generation,
-        ),
-      };
-    } else {
-      const rightWeights = mweights.slice(m);
-      mweights.length = m;
-      merged = {
-        whole: null,
-        left: newLeaf(
-          concatRange(l.keys, r.keys, 0, m),
-          concatRange(l.vals, r.vals, 0, m),
-          mweights,
-          generation,
-        ),
-        sep: m < l.keys.length ? l.keys[m]! : r.keys[m - l.keys.length]!,
-        right: newLeaf(
-          concatRange(l.keys, r.keys, m, total),
-          concatRange(l.vals, r.vals, m, total),
-          rightWeights,
-          generation,
-        ),
-      };
-    }
+    // A leaf's size depends on its keys and rows, so the split decision needs the merged lists:
+    // buildLeaf decides it.
+    const total = l.keys.length + r.keys.length;
+    merged = buildLeaf(
+      concatRange(l.keys, r.keys, 0, total),
+      concatRange(l.vals, r.vals, 0, total),
+      l.weights.concat(r.weights),
+      cap,
+      shape,
+      null,
+      generation,
+    );
   } else {
     const mkeys = [...left.keys, n.keys[j]!, ...right.keys];
     const mchildren = [...left.children, ...right.children];

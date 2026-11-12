@@ -154,7 +154,7 @@ func TestTempSpillDoesNotMoveThe54P03Point(t *testing.T) {
 		sessExec(t, sess, "CREATE TEMP TABLE lt (id i32 PRIMARY KEY, pad text)")
 		pad := strings.Repeat("z", 40)
 		for i := 1; i <= 1000; i++ {
-			_, err := queryOutcome(sess, fmt.Sprintf("INSERT INTO lt VALUES (%d, 'r-%s')", i, pad), nil)
+			_, err := queryOutcome(sess, fmt.Sprintf("INSERT INTO lt VALUES (%d, 'r%d-%s')", i, i, pad), nil)
 			if err != nil {
 				if code := err.(*EngineError).Code(); code != "54P03" {
 					t.Fatalf("insert %d: want 54P03, got %s (%v)", i, code, err)

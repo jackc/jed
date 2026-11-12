@@ -814,7 +814,8 @@ func rcArrayCodecs(w int, tag []byte) []ccBytes {
 			}
 			emit(b[:n], elems, each)
 		}
-		c := ccBytes{name: name,
+		c := ccBytes{
+			name: name,
 			enc: func(ends []uint16, body []byte) ([]byte, int, bool) {
 				counts, elems, ok := split(ends, body)
 				if !ok {
@@ -902,7 +903,8 @@ func rcArrayCodecs(w int, tag []byte) []ccBytes {
 		}
 		emit(p[:n], elems, each)
 	}
-	shuffle := ccBytes{name: "arr-shuf-lz4",
+	shuffle := ccBytes{
+		name: "arr-shuf-lz4",
 		enc: func(ends []uint16, body []byte) ([]byte, int, bool) {
 			counts, elems, ok := split(ends, body)
 			if !ok {
@@ -1001,7 +1003,8 @@ func rcVerify(t *testing.T, col *ccColumn) {
 // ---- the general codecs, as ccBytes ------------------------------------------------------------------------
 
 var rcBytesCodecs = []ccBytes{
-	{name: "fsst", direct: true, enc: fsstEnc,
+	{
+		name: "fsst", direct: true, enc: fsstEnc,
 		visit: func(b []byte, n int) uint64 {
 			var d stDec
 			dir, enc := fsstOpen(b, n, &d)
@@ -1019,7 +1022,8 @@ var rcBytesCodecs = []ccBytes{
 			return rcSum(fsstValue(&d, rcSpan(dir, enc, i), out[:0]))
 		},
 	},
-	{name: "symtab", direct: true, enc: symtabEnc,
+	{
+		name: "symtab", direct: true, enc: symtabEnc,
 		visit: func(b []byte, n int) uint64 {
 			var d stDec
 			dir, enc, esc := symtabOpen(b, n, &d)
@@ -1037,7 +1041,8 @@ var rcBytesCodecs = []ccBytes{
 			return rcSum(symtabValue(&d, rcSpan(dir, enc, i), esc, out[:0]))
 		},
 	},
-	{name: "huf", direct: true, enc: hufEnc,
+	{
+		name: "huf", direct: true, enc: hufEnc,
 		visit: func(b []byte, n int) uint64 {
 			var tab [1 << hufMax]uint16
 			hufDecTable(b[:256], &tab)
@@ -1056,7 +1061,8 @@ var rcBytesCodecs = []ccBytes{
 		},
 	},
 	// LZ4 over the plain image, then order-0 Huffman over the LZ4 block.
-	{name: "lz4+huf",
+	{
+		name: "lz4+huf",
 		enc: func(ends []uint16, body []byte) ([]byte, int, bool) {
 			p := ccPlainImage(ends, body)
 			c := lz4Compress(p)
@@ -1195,8 +1201,10 @@ func TestRegionCodecExperiment(t *testing.T) {
 					codecOrder = append(codecOrder, r.name)
 				}
 				rows := float64(col.rows) * float64(r.leaves) / float64(len(col.leaves))
-				cells[name][r.name][ps] = rcCell{bpv: float64(r.size) / rows, all: r.allNs, point: r.getNs,
-					cover: float64(r.leaves) / float64(len(col.leaves))}
+				cells[name][r.name][ps] = rcCell{
+					bpv: float64(r.size) / rows, all: r.allNs, point: r.getNs,
+					cover: float64(r.leaves) / float64(len(col.leaves)),
+				}
 			}
 		}
 	}
@@ -1446,9 +1454,11 @@ func TestTableSymExperiment(t *testing.T) {
 		sBoth
 		nStrat
 	)
-	names := [nStrat]string{"plain", "+ dictionary", "+ per-leaf table", "+ per-column table, all values", "+ per-column table, 256 KiB sample",
+	names := [nStrat]string{
+		"plain", "+ dictionary", "+ per-leaf table", "+ per-column table, all values", "+ per-column table, 256 KiB sample",
 		"+ per-column table, 64 KiB sample", "+ per-column table, first tenth", "+ per-column FSST table, 256 KiB sample",
-		"+ either per-column table (256 KiB)", "+ per-column (256 KiB) or per-leaf"}
+		"+ either per-column table (256 KiB)", "+ per-column (256 KiB) or per-leaf",
+	}
 	totals := map[uint32]*[nStrat]int{}
 	type colRow struct {
 		name string

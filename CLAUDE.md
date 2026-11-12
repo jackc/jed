@@ -831,6 +831,15 @@ session/clock/state dependencies, and pin named timezone data until an explicit 
   partial-index text that the parser rejects (a newer jed's syntax, which needs no format bump) is not
   corruption: the load keeps the object unparsed and byte-for-byte, and only statements that need it
   fail, with `XX003`; reads skip such an index ([spec/design/unparsable-definitions.md](spec/design/unparsable-definitions.md)).
+- **The compact leaf (format v52).** A leaf page leads with a flags byte and uses 16-bit directory
+  entries; a table's leading key-recoverable primary-key columns have no stored region; a table
+  whose keys all have one length stores no key directory; an inline `text`/`bytea`/`json` value
+  carries no length; and a leaf may store its keys' shared prefix once and write a column as base
+  plus offsets (integers, date/time, fixed-width `numeric`), a dictionary (strings), or bit-packed
+  integer arrays, each only when smaller. A leaf's size is therefore `Σ record_size + leafOverhead −
+  savings`, a function of its keys and rows, which the split and merge rules measure. Invisible to
+  SQL; costs that count pages moved ([spec/design/leaf-structural.md](spec/design/leaf-structural.md)).
+  Per-column symbol tables for text and `jsonb` are prototyped and held for a later version.
 - On-disk format and key encoding are spec'd with byte fixtures (§8). **Status:** the
   single-file on-disk format is authored in `spec/fileformat/format.md` and is now the
   **page-backed copy-on-write B+tree** (`format_version` 24 — the B+tree reshape,

@@ -58,7 +58,7 @@ func remoteFixture(t *testing.T) (owner, remote *Database) {
 	t.Cleanup(func() { _ = owner.Close() })
 	for _, sql := range []string{
 		"CREATE TABLE t (id i64 PRIMARY KEY, v text)",
-		"INSERT INTO t SELECT g, repeat('x', 200) FROM generate_series(1, 2000) g",
+		"INSERT INTO t SELECT g, lpad(g::text, 200, 'x') FROM generate_series(1, 2000) g",
 	} {
 		if _, err := owner.Exec(t.Context(), sql); err != nil {
 			t.Fatal(err)

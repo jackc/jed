@@ -250,13 +250,12 @@ impl Shared {
             };
             crate::format::collect_tree_pages(root, &mut reached);
             let root_page = root.page_ref();
-            let col_types = Arc::new(store.col_types().to_vec());
-            if root_page.page != 0 && crate::format::any_spillable(&col_types) {
+            if root_page.page != 0 && crate::format::any_spillable(store.col_types()) {
                 crate::format::collect_leaf_overflow_with(
                     &read,
                     paging.cap(),
                     root_page,
-                    &col_types,
+                    store.shape(),
                     &mut reached,
                     &mut HashSet::new(),
                     1,

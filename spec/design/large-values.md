@@ -563,8 +563,9 @@ record's dispositions and bytes are the ones a fresh plan of its values would pr
 numbers differ: a kept chain keeps its pages. The plan never needs a deferred value's bytes, because
 its stored fields already supply every input:
 
-- its **inline-plain size** and **payload length** follow from the stored length: `|P(v)| + 3` for
-  `text`/`bytea`/`json` (tag + `u16` length), `|P(v)| + 1` for every other spillable type, where
+- its **inline-plain size** and **payload length** follow from the stored length: `|P(v)| + 1` (the
+  tag; since format v52 a leaf stores an inline `text`/`bytea`/`json` value without its `u16`
+  length, format.md *Leaf node*) for every spillable type, where
   `|P(v)|` is `payload_len` (`0x02`), `raw_len` (`0x03`/`0x04`), or the inline span less its header;
 - the **outcome of a compression attempt** is recorded by its form. An external-plain value was
   attempted and rejected: pass 2 ran, so pass 1 had visited every candidate. An inline- or

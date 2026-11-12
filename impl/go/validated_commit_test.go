@@ -216,7 +216,7 @@ func TestValidatedManifestDependenciesAreNotReusedUntilNextGeneration(t *testing
 		if i > 1 {
 			sql.WriteString(",")
 		}
-		fmt.Fprintf(&sql, "(%d, 'a long enough string to make several leaf pages')", i)
+		fmt.Fprintf(&sql, "(%d, 'a long enough string to make several leaf pages %d')", i, i)
 	}
 	mustExec(t, db, sql.String())
 	for round := 0; round < 40; round++ {
@@ -226,7 +226,7 @@ func TestValidatedManifestDependenciesAreNotReusedUntilNextGeneration(t *testing
 			t.Fatal(err)
 		}
 		rec.ops = nil
-		mustExec(t, db, fmt.Sprintf("UPDATE t SET pad='round %d with many dirty leaves and overflow manifest pages'", round))
+		mustExec(t, db, fmt.Sprintf("UPDATE t SET pad='round %d with many dirty leaves and overflow manifest pages ' || id::text", round))
 		current, err := selectMeta(base.image(), 256)
 		if err != nil {
 			t.Fatalf("round %d: %v", round, err)

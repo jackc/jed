@@ -11,7 +11,7 @@
             "kind": "keys_unordered",
             "database": "main",
             "object": "p_code_key",
-            "page": 21,
+            "page": 13,
             "key": null
           }
         ],
@@ -26,7 +26,7 @@
             "reason": "index_unreadable"
           }
         ],
-        "pages": 27,
+        "pages": 18,
         "rows": 60
       }
     },
@@ -40,7 +40,7 @@
             "kind": "keys_unordered",
             "database": "main",
             "object": "p_code_key",
-            "page": 21,
+            "page": 13,
             "key": null
           }
         ],
@@ -59,7 +59,7 @@
             "reason": "index_unreadable"
           }
         ],
-        "pages": 27,
+        "pages": 18,
         "rows": 60
       }
     }

@@ -17,12 +17,31 @@ reader/fallback outcomes and production histories' cross-core byte equality are 
 A fourth independent encoder/decoder (the Ruby reference in
 [verify.rb](verify.rb)) pins the goldens so they are not merely self-certified.
 
-## Version scope (`format_version` 51)
+## Version scope (`format_version` 52)
 
 > **The encrypted variant** ([encrypted.md](encrypted.md)) is the same `format_version` with a
 > nonzero `suite` byte at meta offset 6; it amends this layout only where encrypted.md says (page
 > capacity, bound pointers, the key block at pages 2–3, the authenticated meta). A reader that
 > predates it rejects that byte as a nonzero reserved field.
+
+`format_version` **52** — **the compact leaf** ([../design/leaf-structural.md](../design/leaf-structural.md)).
+Only the leaf page (`page_type 2`) of a table or index B+tree changes (*Leaf node*, *Record* and
+*Fan-out* below):
+
+- a leaf payload leads with a **leaf flags byte**, and every leaf directory entry is a `u16`;
+- a table column that is a leading primary-key member whose value its key reproduces has **no
+  region** and no weight;
+- a table whose keys all have one length stores that length once and **no key directory**;
+- an inline `text` / `bytea` / `json` value in a leaf is the tag `0x05` and its bytes, with no
+  length;
+- a leaf may store the **prefix its keys share** once;
+- a column region may be **base plus offsets** (integer-like fixed-width columns), a **dictionary**
+  (string columns), or **bit-packed** (integer arrays), each only when that is smaller.
+
+The last two make a leaf's size depend on its keys and rows, so the split and merge rules measure
+`Σ record_size + leafOverhead − savings` (*Fan-out*). Interior, catalog, overflow, free-list,
+manifest and GiST pages, every key encoding, and the single-value codec are unchanged. Every
+table or index with a row changes. Readers accept only the exact current version.
 
 `format_version` **51** — **fixed-width stored `numeric(p,s)`** ([../design/decimal.md §6a](../design/decimal.md)).
 A table column declared `numeric(p,s)` with `p ≤ 18` joins the **fixed-width** column class (*Record*
@@ -651,26 +670,30 @@ The `- 16` in `C` is the **v7 page header** (12-byte v6 header + a 4-byte per-pa
 The reserve inside `RECORD_MAX` is a separate quantity used by table-record compression and
 externalization. Its value is deliberately kept from v23
 ([../design/bplus-reshape.md §4.2](../design/bplus-reshape.md)). When `C ≥ 12 + 16·K` and
-both records reach that target, the v24 overhead bound `leafOverhead(2, cols) ≤ 12 + 13·K`
+both records reach that target, the overhead bound `leafOverhead(2, cols) ≤ 7 + 7·K`
 gives `2·RECORD_MAX(K) + leafOverhead(2, cols) ≤ C`. Such a leaf overflows only at `N ≥ 3`.
 The target is not an additional admission limit: irreducible fixed slots, pointers, or key
 bytes may leave a larger record. Its complete leaf and every resulting interior must fit.
 Key-only index entries do not run the disposition planner: they retain the full encoded entry key,
 including the storage-key suffix, and are admitted by the actual leaf and interior page-fit rules
-([../design/indexes.md §4](../design/indexes.md)). A one-entry index leaf needs `8 + key_len ≤ C`.
+([../design/indexes.md §4](../design/indexes.md)). A one-entry index leaf needs `5 + key_len ≤ C`.
 If later mutations require a separator or a split that cannot fit, that mutation fails `0A000`
 before storage work. Interior nodes have **no record cap**; the separator is a copy of a boundary
 key, and every resulting interior must fit, including a new one-separator root. No index key is
 truncated or spilled to make it fit (*Fan-out* below).
 
-`leafOverhead(N, cols)` is the bytes a v24 leaf's payload carries **beyond** `Σ record_size` — the
-key directory (`4·N`), the column directory (`4·(K+1)`), and each column region's header: a
-**fixed-width** column contributes its flags byte + null bitmap (`1 + ceil(N/8)`), a
-**variable-width** column its flags byte + value directory (`1 + 4·N`) (*Leaf node* below; `F` + `V`
-= the table's fixed/variable column counts, `F + V = K`):
+`leafOverhead(N, cols)` is the bytes a leaf's payload carries **beyond** `Σ record_size`, before
+the content-dependent savings of *Fan-out* — the leaf flags byte, the key directory (`2·N`, or the
+2-byte key length of a fixed-key tree), the column directory (`2·(K+1)`), and each stored column
+region's header: a **fixed-width** column contributes its flags byte + null bitmap
+(`1 + ceil(N/8)`), a **variable-width** column its flags byte + value directory (`1 + 2·N`), and an
+**elided** key column nothing (*Leaf node* below; `F` and `V` count the table's stored fixed and
+variable columns, `E` its elided ones, `F + V + E = K`):
 
 ```
-leafOverhead(N, cols) = 4·N + 4·(K+1) + F·(1 + ceil(N/8)) + V·(1 + 4·N)
+leafOverhead(N, cols) = 1 + keyDir(N) + 2·(K+1) + F·(1 + ceil(N/8)) + V·(1 + 2·N)
+keyDir(N)             = 2      for a fixed-key tree
+                      = 2·N    otherwise
 ```
 
 | page index | role |
@@ -945,7 +968,7 @@ columns and the index list after the checks, and retires column-flag bit0):
 | &nbsp;&nbsp;&nbsp;&nbsp;`excl_col_ordinal` | u16 — the element's column ordinal into **this** table (per element) |
 | &nbsp;&nbsp;&nbsp;&nbsp;`excl_op` | u8 — the element's operator strategy (`0` = `&&`, `1` = `=`; other values are `XX001`) (per element, immediately after its `excl_col_ordinal`) |
 | `root_data_page` | u32 — the **root B-tree node** of this table, or 0 if it has no rows |
-| `row_count` | i64 — **new in v28**: exact nonnegative table cardinality, eight-byte big-endian two's-complement; must be `0..i64::MAX`, and `(root_data_page == 0) == (row_count == 0)` or the file is `XX001` |
+| `row_count` | i64 — **new in v28**: exact nonnegative table cardinality, eight-byte big-endian two's-complement; must be `0..i64::MAX`, and `(root_data_page == 0) == (row_count == 0)` or the file is `XX001`. A loader also rejects (`XX001`) a count above `page_count × C`: every record stores at least one byte in some leaf (v52 — a key-directory entry, or a nonempty stored key in a fixed-key tree), so no table holds more rows than that. Through v51 the bound was `page_count × floor(C / 4)` |
 
 Columns are emitted in declaration order. Checks are emitted in their **evaluation order** —
 ascending byte order of the `check_name` ([../design/constraints.md
@@ -1327,14 +1350,19 @@ is its actual attributable bytes:
 
 ```
 record_size = key_len + Σ_columns value_size
-value_size  = width(type)          for a fixed-width column (NULL included — a NULL occupies a slot)
+value_size  = 0                    for an elided key column (*Leaf node*)
+            = width(type)          for any other fixed-width column (NULL included — a NULL occupies a slot)
             = 0                    for a NULL variable-width value (a zero-length span)
-            = its stored codec bytes (presence tag + body, or a pointer form — *Large values*)
+            = its stored leaf bytes (presence tag + body, or a pointer form — *Large values*)
                                    for a present variable-width value
 ```
 
-The v23 phantom `2 +` (the long-gone per-record `key_len u16`) is dropped: `record_size` is exactly
-the bytes the record contributes to its leaf beyond `leafOverhead`.
+An inline-plain `text` / `bytea` / `json` value's leaf bytes are `1 + len` (tag `0x05` and the
+content, *Leaf node*), not the single-value codec's `3 + len`. `record_size` is the record's weight
+in a plain leaf; a leaf's actual payload subtracts the savings of *Fan-out*, which belong to the
+leaf, not to a record.
+
+The v23 phantom `2 +` (the long-gone per-record `key_len u16`) is dropped.
 
 **Column classes.** Every column type is either **fixed-width** — `i16` (2), `i32` (4), `i64` (8),
 `boolean` (1), `uuid` (16), `timestamp`/`timestamptz` (8), `date` (4), `interval` (16), `f64` (8),
@@ -1373,44 +1401,121 @@ fail when later copied to an interior separator.
 
 ### Leaf node (`page_type = 2`)
 
-Header (`item_count = N`, `next_page = 0`) followed by a **column-major (PAX)** payload. The
-`N` records' keys are in **ascending key order**. The payload, in order:
+Header (`item_count = N`, `next_page = 0`, `N ≥ 1`) followed by a **column-major (PAX)** payload
+(v52). The `N` records' keys are in **ascending key order**. Every directory entry in a leaf is a
+big-endian **`u16`**: an offset within one page, and a page is at most 64 KiB. The payload, in order:
 
-1. **key directory** — `N` big-endian `u32` **end offsets**: `keyOff[i]` is the byte offset one
-   past key `i` within the key blob; key `i` is `keyBlob[keyOff[i−1] : keyOff[i]]` with
-   `keyOff[−1] = 0`. (`keyOff[N−1]` = total key bytes.)
-2. **key blob** — the `N` keys concatenated in ascending order (`Σ key_len` bytes).
-3. **column directory** — `K+1` big-endian `u32`: `colStart[c]` is the **absolute payload offset**
-   of column `c`'s region; `colStart[K]` is the payload end (the authoritative content length — the
-   page body beyond it is zero-fill). For an index tree (`K = 0`) this is the single value
-   `colStart[0]` = payload end, and there are no column regions.
-4. **column regions**, `c = 0 … K−1` in declaration order. Every region leads with a **flags byte**
-   (v24): all bits reserved, written `0`, validated `0` on read (`XX001` if set) — the door a later
-   column string dictionary will claim ([../design/json.md §3](../design/json.md)). The rest of the
-   region depends on the column's **class** (*Record* above):
-   - **Fixed-width column** — a **null bitmap** of `ceil(N/8)` bytes (**MSB-first**: record `i`'s
-     NULL bit is `0x80 >> (i mod 8)` of byte `i / 8`; a set bit = NULL — the composite/array bitmap
-     convention), then a **dense slot array** of `N × width` bytes: slot `i` is record `i`'s value
-     body (the type's fixed-width inline body, **no presence tag**) at byte offset `i·width`; a
-     NULL's slot is present but **zero-filled** (never read — the bitmap is the sole authority).
-     There is **no value directory** — the stride is the width. This is the vectorizable
-     gather/SIMD layout ([../design/bplus-reshape.md §4.1](../design/bplus-reshape.md)).
-   - **Variable-width column** — a **value directory** of `N` big-endian `u32` **end offsets**
-     (`valOff[i]` = one past value `i`'s bytes within the region's value blob; value `i` spans
-     `[valOff[i−1], valOff[i])` with `valOff[−1] = 0`), then the value blob: each **present** value's
-     stored codec bytes exactly as v23 (**presence tag `0x00`/`0x02`/`0x03`/`0x04` + body** — the
-     *Value codec* / *Large values* forms). A **NULL is a zero-length span** (`valOff[i] ==
-     valOff[i−1]`) — no bitmap, no tag byte; a present value's span is never empty (every present
-     form is ≥ 1 byte), so span-emptiness is exact. The tag `0x01` **never appears** inside a v24
-     leaf region.
+1. **leaf flags** — one byte. **Bit 0 `fixed_key`**: every key of this tree has one length. **Bit 1
+   `key_prefix`**: this leaf stores its keys' shared prefix once. Bits 2–7 are reserved, written
+   `0`, and `XX001` if set.
+2. **key length** (only with `fixed_key`) — a `u16`, the length of every key, never `0`.
+   `fixed_key` is a property of the **tree**, set on every leaf of it and fixed by the schema:
+   - a **table** tree has it when the table has no primary key (the 8-byte synthetic rowid), or
+     when every primary-key member is a scalar whose key encoding has a fixed width — `i16`,
+     `i32`, `i64`, `boolean`, `uuid`, `date`, `timestamp`, `timestamptz`, `f32`, `f64`, `interval`
+     ([encoding.md](../design/encoding.md)) — and the widths sum to at most 65535;
+   - an **index** tree (a GIN entry tree too) never has it: an index entry's key holds a nullable
+     slot per element, whose length depends on whether the element is NULL.
 
-A leaf's payload size is `Σ record_size + leafOverhead(N, cols)` (*Page model* above). A
-single-column scan reads one contiguous run (`colStart[c] … colStart[c+1]`) — the columnar-scan
-enabler, now tag-free and dense for fixed-width columns. To parse: read `N` from the header, the
-table's column classes from the catalog, then the directories in order. A reader may retain the raw
-directory byte ranges and read individual big-endian entries on demand, but it must still scan and
-validate every end offset for ascending order and bounds during the page parse/fault; zero-copy
-retention does not defer corruption detection.
+   A writer refuses a leaf holding a key of another length. The page names its own key length, so
+   a reader takes it from the page.
+3. **key prefix** (only with `key_prefix`) — a `u16` length `p ≥ 1`, then `p` bytes: the first `p`
+   bytes of every key of the leaf. Let `L` be the length of the longest common prefix of the leaf's
+   first and last key (which every key between them shares, since keys are sorted), capped at
+   65535. The prefix is stored exactly when `N ≥ 2` and `N·L > L + 2`, with `p = L`; otherwise the
+   bit is clear. With `fixed_key`, `p < key length`.
+4. **key directory** (absent with `fixed_key`) — `N` **end offsets**: `keyOff[i]` is the byte offset
+   one past stored key `i` within the key blob; stored key `i` is
+   `keyBlob[keyOff[i−1] : keyOff[i]]` with `keyOff[−1] = 0`.
+5. **key blob** — the `N` **stored keys** concatenated in ascending order. A stored key is the key
+   without its first `p` bytes (`p = 0` without `key_prefix`). With `fixed_key`, stored key `i` is
+   at `i·(key length − p)`.
+6. **column directory** — `K+1` entries: `colStart[c]` is the **absolute payload offset** of column
+   `c`'s region; `colStart[K]` is the payload end (the authoritative content length — the page body
+   beyond it is zero-fill). For an index tree (`K = 0`) this is the single value `colStart[0]` =
+   payload end, and there are no column regions.
+7. **column regions**, `c = 0 … K−1` in declaration order, contiguous.
+
+**Elided key columns.** A table column is **key-derivable** when it is a primary-key member whose
+value body is, byte for byte, its key encoding: `i16`, `i32`, `i64`, `date`, `timestamp`,
+`timestamptz`, `boolean`, `uuid`. (`f32`, `f64` and `interval` are not: their keys canonicalize.)
+The **leading run** of key-derivable members of the primary key, in key order, is **elided**; the
+run stops at the first member that is not key-derivable, since key offsets after it are not fixed.
+An elided column has an **empty region** (`colStart[c] = colStart[c+1]`, no flags byte): its value in
+record `i` is the bytes of key `i` at the column's key offset (the sum of the widths of the elided
+members before it), and it is never NULL. A writer refuses a row whose key bytes differ from the
+value body it is not storing.
+
+**A stored region** leads with a **region kind** byte. Kind `0` is the plain region of the
+column's **class** (*Record* above); the other kinds are admitted only for the column types named,
+and a region takes one **exactly when it is smaller than the plain region** (the *saving* below is
+positive). Any other kind, or a kind on a column it does not apply to, is `XX001`. Kinds `3` and
+`5` are reserved.
+
+- **Kind 0, fixed-width column** — a **null bitmap** of `ceil(N/8)` bytes (**MSB-first**: record
+  `i`'s NULL bit is `0x80 >> (i mod 8)` of byte `i / 8`; a set bit = NULL — the composite/array
+  bitmap convention), then a **dense slot array** of `N × width` bytes: slot `i` is record `i`'s
+  value body (the type's fixed-width inline body, **no presence tag**) at byte offset `i·width`; a
+  NULL's slot is present but **zero-filled** (never read — the bitmap is the sole authority). There
+  is **no value directory** — the stride is the width.
+- **Kind 0, variable-width column** — a **value directory** of `N` **end offsets** (`valOff[i]` =
+  one past value `i`'s bytes within the region's value blob; value `i` spans
+  `[valOff[i−1], valOff[i])` with `valOff[−1] = 0`), then the value blob: each **present** value's
+  **leaf bytes**. A **NULL is a zero-length span** — no bitmap, no tag byte; a present value's span
+  is never empty, so span-emptiness is exact. A present value's leaf bytes are its *Value codec* /
+  *Large values* form (**presence tag `0x00`/`0x02`/`0x03`/`0x04` + body**), with one exception: an
+  **inline-plain `text`, `bytea` or `json`** value is the tag **`0x05`** followed by its content
+  bytes, the rest of the span — the directory gives the length, so the codec's `u16` length is not
+  stored. In a `text`, `bytea` or `json` column the tag `0x00` is `XX001`; `0x05` is `XX001`
+  anywhere else. The tag `0x01` never appears inside a leaf region.
+- **Kind 1, base plus offsets** — a fixed-width column whose value body is the sign-flipped
+  big-endian integer body: `i16`, `i32`, `i64`, `date`, `timestamp`, `timestamptz`, and a
+  fixed-width `numeric(p,s)` slot (v51). After the null bitmap come the **base** — the smallest
+  present value body read as an unsigned big-endian integer, at the column's width `w` (zero when
+  no value is present) — a `u8` **offset width** `bw`, and `N` offsets of `bw` bytes: record `i`'s
+  value body is `base + offset[i]` at width `w`; a NULL's offset is zero. `bw` is the narrowest of
+  `0, 1, 2, 4` bytes that holds `largest − smallest` over the present values (`0` when they are
+  all equal or none is present), and must be below `w`.
+
+  ```
+  saving = N·(w − bw) − (w + 1)        when bw < w and this is positive, else 0
+  ```
+- **Kind 2, dictionary** — a `text`, `bytea` or `json` column. A `u16` **entry count** `D`
+  (`1 … 256`), `D` end offsets, the **entries** concatenated, then `N` one-byte **codes**: value
+  `i`'s span is entry `code[i]`. An entry is a value's whole kind-0 span, tag included; the empty
+  entry is NULL. **Two values share an entry** only when both are NULL, or both are inline-plain
+  (`0x05`) with equal content; a compressed or external value (`0x02`–`0x04`) always has its own
+  entry, even if its bytes equal another's. Entries are in order of first use. With `dup` the total
+  bytes of the spans that repeat an earlier entry:
+
+  ```
+  saving = N − 2 − 2·D + dup           when D ≤ 256 and this is positive, else 0
+  ```
+- **Kind 4, packed integer arrays** — an `i16[]`, `i32[]` or `i64[]` column (element width `w` of
+  2, 4 or 8 bytes), when **every** value is NULL, the empty array, or an inline-plain (`0x00`)
+  array with one dimension, lower bound 1, no NULL element (`HAS_NULLS` clear) and 1 to 254
+  elements. `N` **count** bytes (`255` = NULL, `0` = the empty array, else the element count), the
+  **base** — the smallest element body over the whole region as an unsigned big-endian integer at
+  width `w` (zero when there is no element) — a `u8` **bit width** `b`, and every element of every
+  array in record order as `element − base` in `b` bits, **MSB-first**, the last byte zero-padded.
+  `b` is the bit length of `largest − smallest` (`0` when they are equal or there is no element).
+  With `e` empty arrays and `a` other arrays holding `M` elements:
+
+  ```
+  saving = (2·N + 3·e + 11·a + M·w) − (N + w + 1 + ceil(M·b / 8))     when positive, else 0
+  ```
+
+A leaf's payload size is `Σ record_size + leafOverhead(N, cols) − saving(leaf)` (*Fan-out* below).
+A single-column scan reads one contiguous run (`colStart[c] … colStart[c+1]`). To parse: read `N`
+from the header and the table's column classes and primary key from the catalog, then the flags
+and directories in order. A reader may retain the raw directory byte ranges and read individual
+entries on demand, and may rebuild a kind 1 or kind 4 region, an elided column, or the full keys
+lazily, but it must still scan and validate every end offset for ascending order and bounds, every
+dictionary code for range, and every region's extent against its kind during the page parse/fault;
+zero-copy retention does not defer corruption detection. The **choices** above are part of the byte
+contract — the prefix is the longest one, stored exactly when it saves bytes; a region has the kind
+that is smallest, kind 0 on a tie. A reader does not re-derive them: a leaf that parses but was not
+written by these rules reads as the rows it holds.
 
 ### Interior node (`page_type = 3`)
 
@@ -1452,6 +1557,20 @@ boundaries — and therefore the on-disk bytes — a deterministic function of t
 the order of mutations** (not of any in-RAM tuning constant). Every core and the Ruby
 reference run the identical rules, so the trees are byte-identical. The rules (v24 — restated
 for the two node kinds; [../design/bplus-reshape.md §4.2](../design/bplus-reshape.md)):
+
+**Leaf payload (v52).** A leaf's payload is
+
+```
+payload(leaf) = Σ record_size + leafOverhead(N, cols) − saving(leaf)
+saving(leaf)  = prefix saving + Σ_columns region saving
+prefix saving = N·p − p − 2          when the key prefix is stored (*Leaf node*), else 0
+region saving = the kind 1, 2 or 4 saving of *Leaf node* for a column of that kind's types, else 0
+```
+
+`saving(leaf)` is a function of the leaf's keys and rows alone, and is never negative. Every rule
+below that measures a leaf — fit, overflow, the split point, underfull — uses this payload. A
+stored value's contribution depends only on its stored form and content, so a leaf measured from
+decoded rows and the same leaf measured from its page agree.
 
 **A node "fits"** iff its payload size ≤ `C`. The invariant the writer maintains: every
 committed node fits; every committed **leaf** is non-empty (`N ≥ 1`); an **interior** node has
@@ -1496,9 +1615,13 @@ interior **merge**-overflow with no fitting split instead **abandons the merge**
 
 **Leaf split (copy-up).** Range `m ∈ [1, N−1]`. The left leaf gets records `[0, m)`, the right
 leaf gets `[m, N)` — **no record leaves the leaf level** — and the parent gains a separator that is
-a **copy of `key[m]`** (the right leaf's first key). `leftpayload(m) = Σ_{i<m} record_size(i) +
-leafOverhead(m, cols)`; `rightpayload(m)` symmetrically over `[m, N)`. Both sides are non-empty by
-the range; both must fit. Records that reach the disposition target have the two-record-fit
+a **copy of `key[m]`** (the right leaf's first key), whole. `leftpayload(m)` is the leaf payload of
+records `[0, m)` — `Σ_{i<m} record_size(i) + leafOverhead(m, cols) − saving` of those records, each
+half with its own prefix, bases, widths and dictionaries; `rightpayload(m)` symmetrically over
+`[m, N)`. Both are nondecreasing in the number of records in the half (a record adds at least its
+stored bytes, a prefix can only shorten, an offset width only widen, and a region's size is the
+smaller of nondecreasing sizes), which is what the `m_min` / `m_max` / `m_balanced` scan relies on.
+Both sides are non-empty by the range; both must fit. Records that reach the disposition target have the two-record-fit
 guarantee below. Every insertion, including irreducible records above that target, must
 produce fitting halves or fail `0A000` (*Why the record cap*).
 
@@ -1535,8 +1658,9 @@ rebalancing by **merge-then-maybe-split** (no borrow rotation — merge subsumes
   - If `M` fits (`payload(M) ≤ C`): `M` replaces the pair; the **parent loses one key**, so
     the parent may itself become underfull — handled when it returns to *its* parent.
   - If `M` overflows: **split `M` 2-way** by the balanced rule above; the two halves and the new
-    separator replace the pair, so the **parent's key count is unchanged**. A **leaf** `M` always
-    splits cleanly (`payload(M) ≤ ~1.5·C` — an underfull leaf + a fitting leaf). An **interior**
+    separator replace the pair, so the **parent's key count is unchanged**. A **leaf** `M` can
+    overflow even when both leaves were small, because its key prefix is no longer than either's
+    and its offset widths no narrower; it splits by the same rule. An **interior**
     `M` (which absorbed a pulled-down separator, `payload(M) < 2·C`) can, with near-cap
     separators, admit **no** valid 2-way split (`m_min > m_max`): then the merge is **abandoned** —
     the two children and the parent separator stay exactly as they were (an underfull interior is
@@ -1561,11 +1685,11 @@ rebalancing by **merge-then-maybe-split** (no borrow rotation — merge subsumes
 
 **Why the record cap.** When `C ≥ 12 + 16·K` and each table record reaches the
 `RECORD_MAX(K)` disposition target, a two-record leaf never exceeds `C`, for every column
-mix: the worst case is all-variable columns (`V = K`), whose overhead is
-`12 + 13·K ≤ 12 + 16·K`. Therefore
-`2·RECORD_MAX(K) + leafOverhead(2, cols) ≤ C − 3K ≤ C`. Such a leaf overflows only at
-`N ≥ 3`; the split can leave two nonempty fitting halves. The v24 directories provide
-this bound without changing the v23 disposition target.
+mix: the worst case is all-variable columns (`V = K`) with a key directory, whose overhead is
+`1 + 4 + 2·(K+1) + 5·K = 7 + 7·K ≤ 12 + 16·K`, and savings only lower a payload. Therefore
+`2·RECORD_MAX(K) + leafOverhead(2, cols) ≤ C`. Such a leaf overflows only at
+`N ≥ 3`; the split can leave two nonempty fitting halves. The disposition target keeps its v23
+value.
 
 This is a conditional fit guarantee, not a separate row-admission rule. Fixed slots,
 external pointers, and keys cannot always be reduced to the target; wide rows can have
@@ -1583,10 +1707,12 @@ forms begin with a 1-byte **presence tag**: `0x00` **present-inline-plain**, `0x
 tag alone), `0x02` **present-external-plain** (the body is an overflow pointer), `0x03`
 **present-inline-compressed**, `0x04` **present-external-compressed** (the `0x02`–`0x04` bodies
 are in *Large values* below). Any other tag is `data_corrupted`. `0x00` and `0x01` are **unchanged
-from v1**. **Inside a v24 leaf** the tags are partly elided (*Leaf node* above): a fixed-width
+from v1**. **Inside a leaf** the tags are partly elided (*Leaf node* above): a fixed-width
 column's region stores bare bodies in dense slots (presence from the region bitmap — no tag at
 all), and a variable-width column's region stores the tagged forms for present values but encodes
-NULL as a zero-length span — so `0x01` never appears in a leaf. This full tagged codec — including
+NULL as a zero-length span — so `0x01` never appears in a leaf — and writes an inline-plain `text`
+/ `bytea` / `json` value as the leaf-only tag `0x05` and its content, without the `u16` length
+(v52). This full tagged codec — including
 `0x01` — remains normative for every **single-value context**: a catalog constant `DEFAULT`,
 overflow-chain content reconstruction, and the recursive composite/array element bodies below.
 The present-**inline-plain** body depends on the type:
@@ -1950,7 +2076,7 @@ the interior-node format and the split contract.
 | `compressed_table.jed` | large **compressible** values (v3, Slice B) — a `0x03` inline-compressed text (a long run that compresses back under `RECORD_MAX`), a `0x04` external-compressed text (compressed block still over the cap → a chain holding **compressed** bytes), an inline-compressed bytea, and an inline-plain + NULL mix ([../design/large-values.md](../design/large-values.md) §13, [lz4.md](lz4.md)) |
 | `one_table_empty.jed` | one table, zero rows (`root_data_page = 0`) |
 | `row_count_table.jed` | **v28 row-count catalog tail in isolation** — a three-row PK table with `root_data_page != 0` and `row_count = 3`; `one_table_empty.jed` supplies the paired zero/zero encoding |
-| `pk_table.jed` | an int PK table whose rows force a **3-node tree** (record-free interior root + two leaves holding **all** the records — the v24 B+tree shape) at page 256 — the load-bearing interior-node + copy-up split proof; includes a NULL value in a row (exercising the fixed-width region's null bitmap + zero-filled slot) |
+| `pk_table.jed` | a 20-row int PK table in **one leaf** (since v52; through v51 the same rows forced an interior root over two leaves — `compact_leaf_table.jed` and `tall_tree.jed` now carry the interior-node + copy-up split proof): a fixed-key leaf with its key column elided, a shared key prefix, and a base-plus-offsets `i16` region; includes a NULL value in a row (exercising the fixed-width region's null bitmap + zero-filled slot) |
 | `max_sep_table.jed` | **degenerate interior fan-out** ([../design/bplus-reshape.md §4.2](../design/bplus-reshape.md)) — a secondary index over near-`RECORD_MAX(0)` text keys, sized so two separators + pointers overflow `C` and the pinned `N = 2 → m = 1` interior split produces a legal **`N = 0` interior node**; pins the minimum-fanout invariant and the degenerate split shape |
 | `text_table.jed` | a text column — the value codec's text branch; empty string, embedded quote, multi-byte + astral chars, a NULL (single leaf) |
 | `temporal_typmod_table.jed` | the v43 temporal typmod slot: `timestamp(3)` / `timestamptz(0)` / `interval day to second(2)` columns (table `t`), `interval year` / `interval(4)` columns (table `u`), and a composite type with `timestamp(1)` / `interval minute` fields used by a column (table `v`); stored values already rounded/cut, beside an all-NULL row |
@@ -1960,6 +2086,7 @@ the interior-node format and the split contract.
 | `decimal_table.jed` | an unconstrained `decimal` column — the variable-width decimal branch — beside a `numeric(10,2)` column, whose values are 8-byte fixed-width slots (v51); positive/negative/zero/multi-group/NULL |
 | `statistics_decimal_table.jed` | **statistics over a fixed-width `numeric(p,s)` column** (v51) — a `numeric(6,2)` column analyzed: its leaf values are 4-byte slots, while its MCV values in the statistics entries use the self-describing decimal codec |
 | `decimal_fixed_table.jed` | **fixed-width stored `numeric(p,s)`** (v51) — a `numeric(4,2)` (2-byte slot), `numeric(9,0)` (4-byte), and `numeric(18,6)` (8-byte) column beside a `numeric(19,2)` column, which keeps the variable-width codec; each column's largest and smallest value, zero, a NULL (bitmap bit + zero-filled slot), and enough rows for a two-leaf tree |
+| `compact_leaf_table.jed` | **the compact leaf** (v52) — table `t(tenant i32, id i64, status text, amount numeric(10,2), ts timestamp, tags i32[], note text, PRIMARY KEY (tenant, id))` with an index on `status`, 60 rows inserted in key order (`tenant = 7`, `id = 1000 + i`, `status` cycling `open`/`closed`/`void`, `amount = (100 + i).(i as two digits)`, `ts = 2024-01-01 00:00:00 + i minutes`, `tags` NULL when `i mod 10 = 0`, `'{}'` when `1`, else `ARRAY[i mod 5, i mod 7]`, `note = 'n'` when `i mod 20 = 3` else NULL): a fixed-key tree (`leaf flags` `03`, key length 12, an 11-byte prefix, 10 bytes in the leaf that spans ids 1023–1024), both key columns elided, dictionary regions (`status`, and `note` with its NULL entry), base-plus-offsets regions over a `numeric` slot and a timestamp, and packed integer arrays with NULLs and empty arrays; `t_status_idx` is filled in row order, so its leaves split by the balanced rule with each half measured under its own prefix; then table `u(name text PRIMARY KEY, n i16, flag boolean, z i32)` with 30 rows `('user/alpha/NN', 5, NULL, NULL)`, `NN = 00 … 29`: variable-length keys with a shared prefix and a key directory, a plain variable region (`name`, distinct values), an offset width of 0 over equal values, and all-NULL columns (`z` is base-plus-offsets with base 0; `flag` is plain) |
 | `bytea_table.jed` | a bytea column — the bytea branch; empty value, embedded `0x00`, a high byte, a NULL |
 | `uuid_table.jed` | a **uuid PRIMARY KEY** (the first non-integer stored key — the §8 cross-core key-path proof) + a nullable uuid column |
 | `default_table.jed` | columns with a **constant** `DEFAULT` — the `has_default` flag (bit2) + default value codec written after the typmod |
@@ -1987,7 +2114,7 @@ the interior-node format and the split contract.
 | `view_table.jed` | **views** (v38) — a table `t(a, b)` with two rows and three views: `v` = `SELECT * FROM t WHERE a > 0` (its stored text shows the frozen `"t" . "a" , "t" . "b"` expansion; dependency on `t` columns `a`, `b`), `w (x) AS SELECT a FROM v` (a column-list rename, a view dependency with no column list), and `n AS SELECT count(*) AS c FROM t` (a table dependency with zero columns); entries emitted after the table entry in name order `n`, `v`, `w` ([../design/views.md](../design/views.md)) |
 | `check_table.jed` | **`CHECK` constraints** (v4) — the catalog check list: an auto-named single-column check, an explicitly-named multi-column check, and a check whose text exercises the token rendering (string + decimal literals, `<=`); stored in name order |
 | `hostfunc_check_table.jed` | **host-function check dependencies** (v35) — `t_a_check` with `check_flags` 0 beside `t_a_check1`, which calls the host function `geo_hash(i64) -> i64` (component `com.example/geo_hash`, semantic version 1) and so carries flags 1 + the dependency list (empty table) |
-| `tall_tree.jed` | enough small int rows to force a **two-level interior** (height-2 tree) — exercises interior-of-interior child pointers and post-order page allocation |
+| `tall_tree.jed` | 18 rows with a distinct 54-byte text each: an **interior root over six leaves** (three rows a leaf) — interior child pointers, copy-up separators, and post-order page allocation |
 | `torn_meta_slot0.jed` | slot 0 checksum corrupted → loader falls back to slot 1 |
 | `torn_meta_slot1.jed` | slot 1 checksum corrupted → loader falls back to slot 0 |
 | `encrypted_empty_db.jed` | the encrypted variant ([encrypted.md](encrypted.md)) with zero tables: the key block at pages 2–3 (host key, seeded stream), a sealed catalog page at 4, both metas authenticated |

@@ -151,7 +151,11 @@ Neither page is read. Then:
   out-of-line value's chain verifies, ends at its recorded length, and decompresses
   ([../fileformat/lz4.md](../fileformat/lz4.md)) and decodes (`overflow_chain_corrupt`). A row stops
   at its first such finding. A row that decodes, in a table with a primary key, is stored under its
-  primary-key encoding ([encoding.md](encoding.md)), else `row_key_not_primary_key`;
+  primary-key encoding ([encoding.md](encoding.md)), else `row_key_not_primary_key`. Since format
+  v52 a leaf does not store a key-derivable primary-key column (format.md *Leaf node*): its value is
+  read from the key, so the two cannot disagree, and this finding can arise only for a primary key
+  with a member the leaf stores (`text`, `decimal`, a float, …). No damaged fixture produces it at
+  present ([TODO.md](../../TODO.md));
 - after its tree, a table's persisted row count equals its leaf total (`row_count_mismatch`, format
   v28), unless the tree was unreadable (§5.2);
 - a GIN tree's records are posting runs ([gin.md](gin.md) §4.5). The walk counts each run's
@@ -417,9 +421,9 @@ The check is host API, so it is not in the SQL corpus. Its contract is tested wi
   `verify.rb --generate` and checked by `mise run verify`. Each starts from one from-scratch image (a
   40-row table and a column index, both several leaves deep) and applies one deterministic damage,
   recomputing checksums where the damage is semantic so the logical checks are what catch it: a
-  flipped leaf byte (`page_corrupt`), two rows' keys swapped (`keys_unordered`,
-  `row_key_not_primary_key`, and under `full` the index entries they no longer match), a row
-  re-keyed into a gap (`row_key_not_primary_key`; `index_entry_missing`), a dropped index entry and
+  flipped leaf byte (`page_corrupt`), two rows' keys swapped (`keys_unordered`, and under `full` the
+  index entries they no longer match), a row re-keyed into a gap (clean under `quick`;
+  `index_entry_missing` and `index_entry_count_mismatch` under `full`), a dropped index entry and
   an extra one (`full` only), a wrong row count, a wrong live count, a live page on the free list,
   and a table interior naming an index leaf (`page_corrupt`, `page_reached_twice`). I3 adds
   fixtures over a second table, `u`, carrying an expression index `(v + 1)`, a partial index `(v) WHERE

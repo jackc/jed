@@ -3867,6 +3867,11 @@ impl Engine {
                 .map(|c| crate::catalog::store_col_type(c, &main.types))
                 .collect()
         });
+        // The shape the rewrite's compression attempts are counted under: the rewritten table's
+        // stored shape, so a key column the leaf does not store has no weight (format.md "Record").
+        let rewrite_shape = rewrite_col_types
+            .as_ref()
+            .map(|cols| crate::format::LeafShape::table(cols.clone(), &table.pk));
         let mut meter = self.session.new_meter();
         meter.charge(prep_cost);
         meter.checkpoint()?;
@@ -3978,7 +3983,7 @@ impl Engine {
                     }
                 }
                 compress_units += crate::format::record_compress_units(
-                    rewrite_col_types.as_ref().expect("rewrite column types"),
+                    rewrite_shape.as_ref().expect("rewrite leaf shape"),
                     key,
                     row,
                     rewrite_cap,

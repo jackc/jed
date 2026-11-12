@@ -29,7 +29,7 @@ func bigTableAV(t *testing.T, n int) *Session {
 
 func TestOrInPointSetMultiLeaf(t *testing.T) {
 	t.Parallel()
-	const n = 1000
+	const n = 10000
 	db := bigTableAV(t, n)
 
 	store := db.engine.readSnap().store("t")

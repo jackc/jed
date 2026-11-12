@@ -39,7 +39,10 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use crate::catalog::ColType;
 use crate::error::Result;
-use crate::format::{Cap, LeafShape, PackedLeaf, PageRef, leaf_overhead};
+use crate::format::{
+    Cap, LeafShape, LeafSizes, PackedLeaf, PageRef, SplitFacts, leaf_overhead, leaf_prefix_saving,
+    leaf_saving,
+};
 use crate::storage::Row;
 use crate::value::Value;
 
@@ -190,6 +193,10 @@ pub(crate) struct Node {
     /// page 0 is a meta slot, never a node, so it doubles as the dirty sentinel. A clean node lets an
     /// incremental commit skip its whole (unchanged) subtree.
     pub(crate) page: AtomicU32,
+    /// A dirty decoded leaf's content-dependent size facts (format.md "Leaf payload"), kept so an
+    /// insert into it measures one row rather than the leaf. `None` until an insert needs them, and
+    /// again after any other change to the leaf's rows.
+    sizes: Option<Box<LeafSizes>>,
     /// The tag of the page at `page` (spec/fileformat/encrypted.md §2), stored as two words; zero in
     /// a plaintext file and while the node is dirty. Set with the page id by the commit that seals
     /// the node, so a parent written later binds it.
@@ -212,6 +219,7 @@ impl Node {
             weights,
             children: Vec::new(),
             packed: None,
+            sizes: None,
             page: AtomicU32::new(0),
             tag: tag_words(&crate::crypto::NO_TAG),
         })
@@ -232,6 +240,7 @@ impl Node {
             weights: Vec::new(),
             children,
             packed: None,
+            sizes: None,
             page: AtomicU32::new(0),
             tag: tag_words(&crate::crypto::NO_TAG),
         }
@@ -252,6 +261,7 @@ impl Node {
             weights,
             children,
             packed: None,
+            sizes: None,
             page: AtomicU32::new(page.page),
             tag: tag_words(&page.tag),
         })
@@ -272,6 +282,7 @@ impl Node {
             weights: Vec::new(),
             children,
             packed: None,
+            sizes: None,
             page: AtomicU32::new(page.page),
             tag: tag_words(&page.tag),
         })
@@ -288,6 +299,7 @@ impl Node {
             weights: Vec::new(),
             children: Vec::new(),
             packed: Some(packed),
+            sizes: None,
             page: AtomicU32::new(page.page),
             tag: tag_words(&page.tag),
         }
@@ -354,20 +366,60 @@ impl Node {
     }
 
     /// This node's serialized payload size (format.md): a leaf is `Σ weights +
-    /// leaf_overhead(N, shape)`; an interior node is `ptr·(N+1) + 4·N + Σ sep_len` (child pointers +
-    /// separator directory + key blob — record-free, v24; `ptr` is 4, or 20 with an encrypted file's
-    /// tags — encrypted.md §2).
-    fn payload(&self, cap: Cap, shape: LeafShape) -> usize {
-        if self.is_leaf() {
-            self.total_weight() + leaf_overhead(self.len(), shape)
-        } else {
-            interior_payload(cap, &self.keys)
+    /// leaf_overhead(N, shape) − saving` (v52 "Leaf payload"); an interior node is `ptr·(N+1) + 4·N +
+    /// Σ sep_len` (child pointers + separator directory + key blob — record-free, v24; `ptr` is 4,
+    /// or 20 with an encrypted file's tags — encrypted.md §2).
+    fn payload(&self, cap: Cap, shape: &LeafShape) -> usize {
+        if !self.is_leaf() {
+            return interior_payload(cap, &self.keys);
+        }
+        match &self.packed {
+            // A clean leaf's size is the content length its page records.
+            Some(p) => p.payload_len(),
+            None => self.plain_payload(shape) - self.content_saving(cap, shape),
+        }
+    }
+
+    /// A leaf's payload before its content-dependent savings.
+    fn plain_payload(&self, shape: &LeafShape) -> usize {
+        self.total_weight() + leaf_overhead(self.len(), shape)
+    }
+
+    /// The bytes a **decoded** leaf's content-dependent encodings save: the shared key prefix and
+    /// its regions' base-plus-offsets, dictionary and packed-array forms. The kept size facts are
+    /// used when they cover the leaf's rows.
+    fn content_saving(&self, cap: Cap, shape: &LeafShape) -> usize {
+        let n = self.keys.len();
+        if n == 0 {
+            return 0;
+        }
+        match &self.sizes {
+            Some(sz) if sz.len() == n => {
+                leaf_prefix_saving(n, &self.keys[0], &self.keys[n - 1]) + sz.saving(shape)
+            }
+            _ => leaf_saving(shape, cap, n, &|i| &self.keys[i], &|i| &self.vals[i]),
+        }
+    }
+
+    /// Whether a leaf's payload is below `limit`. The content-dependent saving is computed only
+    /// when the size without it does not already decide.
+    fn leaf_payload_below(&self, limit: usize, cap: Cap, shape: &LeafShape) -> bool {
+        match &self.packed {
+            Some(p) => p.payload_len() < limit,
+            None => {
+                let plain = self.plain_payload(shape);
+                plain < limit || plain - self.content_saving(cap, shape) < limit
+            }
         }
     }
 
     /// Binary-search a **leaf**'s keys: `Ok(i)` if `key` sits at index `i`, else `Err(i)` for the
-    /// insertion slot. `Vec<u8>::cmp` is lexicographic (memcmp) — the key contract.
+    /// insertion slot. `Vec<u8>::cmp` is lexicographic (memcmp) — the key contract. A Packed leaf
+    /// compares the probe with its shared key prefix once and then with the stored suffixes.
     fn search(&self, key: &[u8]) -> std::result::Result<usize, usize> {
+        if let Some(p) = &self.packed {
+            return p.search(key);
+        }
         let mut lo = 0usize;
         let mut hi = self.len();
         while lo < hi {
@@ -461,18 +513,15 @@ impl Node {
     pub(crate) fn record_scan_units(
         &self,
         i: usize,
-        col_types: &[ColType],
+        shape: &LeafShape,
         cap: Cap,
         mask: &[bool],
     ) -> crate::format::ScanUnits {
+        let col_types: &[ColType] = &shape.col_types;
         match &self.packed {
-            None => crate::format::record_scan_units(
-                col_types,
-                self.key_at(i),
-                &self.vals[i],
-                cap,
-                mask,
-            ),
+            None => {
+                crate::format::record_scan_units(shape, self.key_at(i), &self.vals[i], cap, mask)
+            }
             Some(p) => {
                 let mut units = crate::format::ScanUnits {
                     pages: 0,
@@ -481,7 +530,7 @@ impl Node {
                 for (c, ty) in col_types.iter().enumerate() {
                     if mask[c]
                         && crate::format::fixed_value_width(ty).is_none()
-                        && let Some(span) = p.value_span(c, i)
+                        && let Some(span) = p.chain_span(c, i)
                     {
                         crate::format::span_scan_units(span, cap, &mut units);
                     }
@@ -528,7 +577,12 @@ impl Node {
         let mut vals = Vec::with_capacity(n);
         let mut weights = Vec::with_capacity(n);
         for i in 0..n {
-            keys.push(self.key_at(i).to_vec());
+            // Each key is assembled from the leaf's shared prefix and its stored suffix, without
+            // rebuilding the leaf's keys as one buffer first.
+            keys.push(match &self.packed {
+                Some(p) => p.key_owned(i),
+                None => self.keys[i].clone(),
+            });
             vals.push(self.row_at(i)?);
             weights.push(self.weight_at(i));
         }
@@ -605,22 +659,31 @@ fn split_point(
     Some(m_balanced.min(m_max).max(m_min))
 }
 
-/// The leaf split decision from the record weights alone (format.md "Leaf split"): `Some(m)` when a
-/// leaf of these records overflows `cap` and splits at `m`, `None` when it fits (or has a single
-/// record — defensively left whole, the oversize surfacing as `0A000` at serialize). Shared by
-/// [`build_leaf`] and the delete path's merge pre-check, so both see the same separator.
-fn leaf_split_point(
+/// The leaf split decision (format.md "Leaf payload", "Leaf split"): `Some(m)` when a leaf of these
+/// records overflows `cap` and splits at `m`, `None` when it fits (or has a single record —
+/// defensively left whole, the oversize surfacing as `0A000` at serialize). A leaf's size depends on
+/// its keys and rows, so each candidate half is measured with its own key prefix, value spans and
+/// dictionaries. Shared by [`build_leaf`] and the delete path's merge pre-check, so both see the
+/// same separator.
+fn leaf_split_point<'a>(
     weights: &[u32],
+    key: &dyn Fn(usize) -> &'a [u8],
+    row: &dyn Fn(usize) -> &'a [Value],
     cap: Cap,
-    shape: LeafShape,
+    shape: &LeafShape,
     edited: Option<usize>,
 ) -> Option<usize> {
     let n = weights.len();
-    let payload: usize =
-        weights.iter().map(|&w| w as usize).sum::<usize>() + leaf_overhead(n, shape);
-    if payload <= cap.c || n < 2 {
+    let plain: usize = weights.iter().map(|&w| w as usize).sum::<usize>() + leaf_overhead(n, shape);
+    if plain <= cap.c || n < 2 {
         return None;
     }
+    // Measured whole first: the per-boundary facts are built only for a leaf that does split.
+    let payload = plain - leaf_saving(shape, cap, n, key, row);
+    if payload <= cap.c {
+        return None;
+    }
+    let facts = SplitFacts::new(shape, cap, n, key, row);
     let prefix: Vec<usize> = std::iter::once(0)
         .chain(weights.iter().scan(0usize, |acc, &w| {
             *acc += w as usize;
@@ -628,8 +691,12 @@ fn leaf_split_point(
         }))
         .collect();
     let total = prefix[n];
-    let leftpayload = |m: usize| prefix[m] + leaf_overhead(m, shape);
-    let rightpayload = |m: usize| (total - prefix[m]) + leaf_overhead(n - m, shape);
+    // Both stay monotone in `m`: a record added to a half adds at least its stored bytes, the
+    // half's key prefix can only shorten, an offset width only widen, and a region's size is the
+    // smaller of nondecreasing sizes.
+    let leftpayload = |m: usize| prefix[m] + leaf_overhead(m, shape) - facts.left(shape, m);
+    let rightpayload =
+        |m: usize| (total - prefix[m]) + leaf_overhead(n - m, shape) - facts.right(shape, m);
     let right_edge = edited == Some(n - 1);
     // `None` is unreachable under the RECORD_MAX cap (a two-record leaf always fits — format.md
     // "Why the record cap").
@@ -655,10 +722,11 @@ fn build_leaf(
     vals: Vec<Row>,
     weights: Vec<u32>,
     cap: Cap,
-    shape: LeafShape,
+    shape: &LeafShape,
     edited: Option<usize>,
 ) -> Ins {
-    let Some(m) = leaf_split_point(&weights, cap, shape, edited) else {
+    let split = leaf_split_point(&weights, &|i| &keys[i], &|i| &vals[i], cap, shape, edited);
+    let Some(m) = split else {
         return Ins::Whole(Node::new_leaf(keys, vals, weights));
     };
 
@@ -908,7 +976,7 @@ impl PMap {
         val: Row,
         weight: u32,
         cap: Cap,
-        shape: LeafShape,
+        shape: &LeafShape,
         src: Option<&dyn LeafSource>,
     ) -> Result<Option<Row>> {
         let (_, old) = self.insert_mode(key, val, weight, cap, shape, src, false)?;
@@ -923,7 +991,7 @@ impl PMap {
         val: Row,
         weight: u32,
         cap: Cap,
-        shape: LeafShape,
+        shape: &LeafShape,
         src: Option<&dyn LeafSource>,
     ) -> Result<bool> {
         let (inserted, _) = self.insert_mode(key, val, weight, cap, shape, src, true)?;
@@ -939,7 +1007,7 @@ impl PMap {
         val: Row,
         weight: u32,
         cap: Cap,
-        shape: LeafShape,
+        shape: &LeafShape,
         src: Option<&dyn LeafSource>,
         keep_existing: bool,
     ) -> Result<(bool, Option<Row>)> {
@@ -985,7 +1053,7 @@ impl PMap {
         &mut self,
         key: &[u8],
         cap: Cap,
-        shape: LeafShape,
+        shape: &LeafShape,
         src: Option<&dyn LeafSource>,
     ) -> Result<Option<Row>> {
         let Some(root) = self.root.as_mut() else {
@@ -1439,7 +1507,7 @@ fn node_insert(
     old: &mut Option<Row>,
     src: Option<&dyn LeafSource>,
     cap: Cap,
-    shape: LeafShape,
+    shape: &LeafShape,
     keep_existing: bool,
 ) -> Result<Ins> {
     if node.is_leaf() {
@@ -1458,17 +1526,39 @@ fn node_insert(
                 Ok(i) => {
                     *old = Some(std::mem::replace(&mut node.vals[i], val));
                     node.weights[i] = weight;
+                    node.sizes = None; // a replaced row can shrink the facts: measure again
                     i
                 }
                 Err(i) => {
+                    if let Some(sz) = &mut node.sizes {
+                        sz.add_row(shape, cap, &key, &val);
+                    }
                     node.keys.insert(i, key);
                     node.vals.insert(i, val);
                     node.weights.insert(i, weight);
                     i
                 }
             };
-            let payload = node.total_weight() + leaf_overhead(node.len(), shape);
-            if payload <= cap.c || node.len() < 2 {
+            let plain = node.plain_payload(shape);
+            if plain <= cap.c || node.len() < 2 {
+                return Ok(Ins::Kept);
+            }
+            // Past its plain capacity the leaf fits only by its content-dependent savings. Keep
+            // their facts with the node, so the inserts that follow add one row to them.
+            if node
+                .sizes
+                .as_ref()
+                .is_none_or(|sz| sz.len() != node.keys.len())
+            {
+                node.sizes = Some(Box::new(LeafSizes::measure(
+                    shape,
+                    cap,
+                    node.keys.len(),
+                    &|i| &node.keys[i],
+                    &|i| &node.vals[i],
+                )));
+            }
+            if plain - node.content_saving(cap, shape) <= cap.c {
                 return Ok(Ins::Kept);
             }
             // The same builder chooses the exact split point and separator bytes. Move the edited
@@ -1595,7 +1685,10 @@ fn node_insert(
 
 /// A non-root node is **underfull** when its payload is below half a page (`cap/2`), the threshold
 /// at which delete rebalances it (format.md "Delete"). The root is exempt.
-fn underfull(node: &Node, cap: Cap, shape: LeafShape) -> bool {
+fn underfull(node: &Node, cap: Cap, shape: &LeafShape) -> bool {
+    if node.is_leaf() {
+        return node.leaf_payload_below(cap.c / 2, cap, shape);
+    }
     node.payload(cap, shape) < cap.c / 2
 }
 
@@ -1615,7 +1708,7 @@ fn node_remove(
     key: &[u8],
     src: Option<&dyn LeafSource>,
     cap: Cap,
-    shape: LeafShape,
+    shape: &LeafShape,
 ) -> Result<Option<Row>> {
     if node.is_leaf() {
         let Ok(i) = node.search(key) else {
@@ -1625,6 +1718,7 @@ fn node_remove(
             && let Some(leaf) = Arc::get_mut(node)
         {
             debug_assert!(leaf.packed.is_none(), "a dirty leaf is decoded");
+            leaf.sizes = None;
             leaf.keys.remove(i);
             leaf.weights.remove(i);
             return Ok(Some(leaf.vals.remove(i)));
@@ -1690,7 +1784,7 @@ fn rebalance_child(
     i: usize,
     src: Option<&dyn LeafSource>,
     cap: Cap,
-    shape: LeafShape,
+    shape: &LeafShape,
 ) -> Result<()> {
     // `children[i]` was just rebuilt resident by `node_remove`, so inspecting it faults nothing.
     if !underfull(node.children[i].resident(), cap, shape) {
@@ -1793,7 +1887,7 @@ fn merge_at(
     j: usize,
     src: Option<&dyn LeafSource>,
     cap: Cap,
-    shape: LeafShape,
+    shape: &LeafShape,
 ) -> Result<()> {
     // Fault both children — the underfull child (just rebuilt resident) and its sibling, which may
     // still be an `OnDisk` leaf the delete never touched — in left-then-right order.
@@ -1822,8 +1916,12 @@ fn merge_at(
         |sep_len: usize| interior_payload(cap, &node.keys) - node.keys[j].len() + sep_len;
 
     let merged = if left_is_leaf {
-        // The pre-check: a leaf merge takes a dirty operand's vectors, so decide before any move. Its
-        // merged weights and split point are the ones the merged leaf is built from.
+        // The pre-check: a leaf merge takes a dirty operand's vectors, so decide before any move. A
+        // leaf's size depends on its keys and rows (format.md "Leaf payload"), so the decision
+        // reads both operands' records: a Decoded operand lends its vectors, a Packed one is
+        // decoded here, once, and that copy then becomes its part of the merged leaf.
+        let mut ldec = None;
+        let mut rdec = None;
         let (weights, split) = {
             let operand = |slot: &Child, loaded: &Option<Arc<Node>>| -> Arc<Node> {
                 match (slot, loaded) {
@@ -1836,32 +1934,50 @@ fn merge_at(
             };
             let lnode = operand(&node.children[j], &lloaded);
             let rnode = operand(&node.children[j + 1], &rloaded);
-            let mut weights: Vec<u32> = Vec::with_capacity(lnode.len() + rnode.len());
-            for i in 0..lnode.len() {
-                weights.push(lnode.weight_at(i));
+            if lnode.packed.is_some() {
+                ldec = Some(lnode.decoded_parts()?);
             }
-            for i in 0..rnode.len() {
-                weights.push(rnode.weight_at(i));
+            if rnode.packed.is_some() {
+                rdec = Some(rnode.decoded_parts()?);
             }
-            let split = leaf_split_point(&weights, cap, shape, None);
-            if let Some(m) = split {
-                let sep_len = if m < lnode.len() {
-                    lnode.key_at(m).len()
-                } else {
-                    rnode.key_at(m - lnode.len()).len()
-                };
-                if parent_with(sep_len) > cap.c {
-                    // The replacement separator would overflow the parent: abandon the merge — the
-                    // two children and the parent separator stay exactly as they were.
-                    return Ok(());
+            type View<'v> = (&'v [Vec<u8>], &'v [Row], &'v [u32]);
+            fn view<'v>(
+                node: &'v Node,
+                dec: &'v Option<(Vec<Vec<u8>>, Vec<Row>, Vec<u32>)>,
+            ) -> View<'v> {
+                match dec {
+                    Some((k, v, w)) => (k, v, w),
+                    None => (&node.keys, &node.vals, &node.weights),
                 }
+            }
+            let (lk, lv, lw) = view(&lnode, &ldec);
+            let (rk, rv, rw) = view(&rnode, &rdec);
+            let ln = lk.len();
+            let mut weights: Vec<u32> = Vec::with_capacity(ln + rk.len());
+            weights.extend_from_slice(lw);
+            weights.extend_from_slice(rw);
+            let key = |i: usize| -> &[u8] { if i < ln { &lk[i] } else { &rk[i - ln] } };
+            let row = |i: usize| -> &[Value] { if i < ln { &lv[i] } else { &rv[i - ln] } };
+            let split = leaf_split_point(&weights, &key, &row, cap, shape, None);
+            if let Some(m) = split
+                && parent_with(key(m).len()) > cap.c
+            {
+                // The replacement separator would overflow the parent: abandon the merge — the
+                // two children and the parent separator stay exactly as they were.
+                return Ok(());
             }
             (weights, split)
         };
         let (lslot, rslot) = node.children.split_at_mut(j + 1);
         let (lslot, rslot) = (&mut lslot[j], &mut rslot[0]);
-        let lparts = leaf_parts(lslot, lloaded.as_ref())?;
-        let rparts = leaf_parts(rslot, rloaded.as_ref())?;
+        let lparts = match ldec {
+            Some(parts) => LeafParts::Copy(parts),
+            None => leaf_parts(lslot, lloaded.as_ref())?,
+        };
+        let rparts = match rdec {
+            Some(parts) => LeafParts::Copy(parts),
+            None => leaf_parts(rslot, rloaded.as_ref())?,
+        };
         let (lkeys, lvals, _) = into_parts(lslot, lparts);
         let (rkeys, rvals, _) = into_parts(rslot, rparts);
         merged_leaf(lkeys, lvals, rkeys, rvals, weights, split)
@@ -2108,7 +2224,9 @@ mod tests {
     const CAP: Cap = Cap { c: 240, tag: 0 };
     /// `row` has one fixed-width value column — the v24 leaf overhead scales with the class mix
     /// (format.md "Leaf node").
-    const SHAPE: LeafShape = LeafShape { fixed: 1, var: 0 };
+    static SHAPE_CELL: std::sync::LazyLock<LeafShape> = std::sync::LazyLock::new(|| {
+        LeafShape::plain(vec![ColType::Scalar(crate::types::ScalarType::Int64)])
+    });
 
     fn row(n: i64) -> Row {
         vec![Value::Int(n)]
@@ -2187,9 +2305,9 @@ mod tests {
                 }
             }
             assert!(
-                node.payload(cap, SHAPE) <= cap.c,
+                node.payload(cap, &SHAPE_CELL) <= cap.c,
                 "node payload {} exceeds cap {}",
-                node.payload(cap, SHAPE),
+                node.payload(cap, &SHAPE_CELL),
                 cap.c
             );
             if node.is_leaf() {
@@ -2241,7 +2359,7 @@ mod tests {
 
         for k in shuffled(n) {
             assert_eq!(
-                pm.insert(key(k), row(k as i64), W, CAP, SHAPE, None)
+                pm.insert(key(k), row(k as i64), W, CAP, &SHAPE_CELL, None)
                     .unwrap(),
                 bt.insert(key(k), row(k as i64))
             );
@@ -2259,7 +2377,8 @@ mod tests {
         // Overwrite returns the old value and does not change the count.
         let before = pm.count();
         assert_eq!(
-            pm.insert(key(7), row(777), W, CAP, SHAPE, None).unwrap(),
+            pm.insert(key(7), row(777), W, CAP, &SHAPE_CELL, None)
+                .unwrap(),
             bt.insert(key(7), row(777))
         );
         assert_eq!(pm.count(), before);
@@ -2268,7 +2387,7 @@ mod tests {
         // Interleave removes with invariant checks so merge-then-split is exercised mid-stream.
         for (step, k) in shuffled(n).into_iter().enumerate() {
             assert_eq!(
-                pm.remove(&key(k), CAP, SHAPE, None).unwrap(),
+                pm.remove(&key(k), CAP, &SHAPE_CELL, None).unwrap(),
                 bt.remove(&key(k))
             );
             if step % 257 == 0 {
@@ -2277,14 +2396,14 @@ mod tests {
         }
         assert!(pm.is_empty());
         assert_eq!(pm.iter(None).unwrap().len(), 0);
-        assert_eq!(pm.remove(&key(123), CAP, SHAPE, None).unwrap(), None);
+        assert_eq!(pm.remove(&key(123), CAP, &SHAPE_CELL, None).unwrap(), None);
     }
 
     #[test]
     fn clone_is_an_independent_snapshot() {
         let mut base = PMap::new();
         for k in 0..2000 {
-            base.insert(key(k), row(k as i64), W, CAP, SHAPE, None)
+            base.insert(key(k), row(k as i64), W, CAP, &SHAPE_CELL, None)
                 .unwrap();
         }
         let snap = base.clone();
@@ -2296,16 +2415,16 @@ mod tests {
         let mut other = base.clone();
         for k in 0..2000 {
             other
-                .insert(key(k), row(-(k as i64)), W, CAP, SHAPE, None)
+                .insert(key(k), row(-(k as i64)), W, CAP, &SHAPE_CELL, None)
                 .unwrap(); // overwrite every value
         }
         for k in 2000..3000 {
             other
-                .insert(key(k), row(k as i64), W, CAP, SHAPE, None)
+                .insert(key(k), row(k as i64), W, CAP, &SHAPE_CELL, None)
                 .unwrap(); // and grow it
         }
         for k in 0..500 {
-            other.remove(&key(k), CAP, SHAPE, None).unwrap(); // and shrink it
+            other.remove(&key(k), CAP, &SHAPE_CELL, None).unwrap(); // and shrink it
         }
 
         // `snap` still sees the original contents, untouched.
@@ -2357,29 +2476,32 @@ mod tests {
         let mut edit = PMap::new();
         let mut copy = PMap::new();
         for k in shuffled(3000) {
-            edit.insert(key(k), row(k as i64), weight(k), CAP, SHAPE, None)
+            edit.insert(key(k), row(k as i64), weight(k), CAP, &SHAPE_CELL, None)
                 .unwrap();
-            copy.insert(key(k), row(k as i64), weight(k), CAP, SHAPE, None)
+            copy.insert(key(k), row(k as i64), weight(k), CAP, &SHAPE_CELL, None)
                 .unwrap();
         }
         assert_eq!(shape_dump(&edit), shape_dump(&copy));
         let order = shuffled(3000);
         for (step, &k) in order.iter().enumerate() {
             let pin = copy.clone();
-            let a = edit.remove(&key(k), CAP, SHAPE, None).unwrap();
-            let b = copy.remove(&key(k), CAP, SHAPE, None).unwrap();
+            let a = edit.remove(&key(k), CAP, &SHAPE_CELL, None).unwrap();
+            let b = copy.remove(&key(k), CAP, &SHAPE_CELL, None).unwrap();
             assert_eq!(a, b);
             assert_eq!(pin.get(&key(k), None).unwrap(), Some(row(k as i64)));
             drop(pin);
             // Interleave re-inserts (churn) and misses so in-place inserts and removes mix.
             if step % 7 == 0 {
                 let r = k + 10_000;
-                edit.insert(key(r), row(1), weight(r), CAP, SHAPE, None)
+                edit.insert(key(r), row(1), weight(r), CAP, &SHAPE_CELL, None)
                     .unwrap();
-                copy.insert(key(r), row(1), weight(r), CAP, SHAPE, None)
+                copy.insert(key(r), row(1), weight(r), CAP, &SHAPE_CELL, None)
                     .unwrap();
             }
-            assert_eq!(edit.remove(&key(99_999), CAP, SHAPE, None).unwrap(), None);
+            assert_eq!(
+                edit.remove(&key(99_999), CAP, &SHAPE_CELL, None).unwrap(),
+                None
+            );
             if step % 97 == 0 || step + 1 == order.len() {
                 assert_eq!(shape_dump(&edit), shape_dump(&copy), "step {step}");
                 check_invariants(&edit);
@@ -2404,7 +2526,7 @@ mod tests {
         }
         let mut pm = PMap::new();
         for k in 0..2000 {
-            pm.insert(key(k), row(k as i64), W, CAP, SHAPE, None)
+            pm.insert(key(k), row(k as i64), W, CAP, &SHAPE_CELL, None)
                 .unwrap();
         }
         assert!(pm.height() > 2, "test needs a multi-level dirty path");
@@ -2412,22 +2534,26 @@ mod tests {
         // unaliased dirty path keeps its address.
         let before = path(&pm, &key(777));
         assert_eq!(
-            pm.remove(&key(777), CAP, SHAPE, None).unwrap(),
+            pm.remove(&key(777), CAP, &SHAPE_CELL, None).unwrap(),
             Some(row(777))
         );
         assert_eq!(path(&pm, &key(778)), before);
         // A snapshot alias forces a path copy and keeps the pinned row.
         let pin = pm.clone();
         let shared_before = path(&pm, &key(778));
-        pm.remove(&key(778), CAP, SHAPE, None).unwrap();
+        pm.remove(&key(778), CAP, &SHAPE_CELL, None).unwrap();
         assert_ne!(path(&pm, &key(779)), shared_before);
         assert_eq!(pin.get(&key(778), None).unwrap(), Some(row(778)));
         assert_eq!(pm.get(&key(778), None).unwrap(), None);
         drop(pin);
         // A clean root is rebuilt even when unique.
         let mut clean = PMap::new();
-        clean.insert(key(1), row(1), W, CAP, SHAPE, None).unwrap();
-        clean.insert(key(2), row(2), W, CAP, SHAPE, None).unwrap();
+        clean
+            .insert(key(1), row(1), W, CAP, &SHAPE_CELL, None)
+            .unwrap();
+        clean
+            .insert(key(2), row(2), W, CAP, &SHAPE_CELL, None)
+            .unwrap();
         let clean_root = Arc::as_ptr(clean.root.as_ref().unwrap());
         clean
             .root
@@ -2435,7 +2561,7 @@ mod tests {
             .unwrap()
             .page
             .store(9, Ordering::Relaxed);
-        clean.remove(&key(1), CAP, SHAPE, None).unwrap();
+        clean.remove(&key(1), CAP, &SHAPE_CELL, None).unwrap();
         assert_ne!(Arc::as_ptr(clean.root.as_ref().unwrap()), clean_root);
         assert_eq!(clean.get(&key(2), None).unwrap(), Some(row(2)));
         check_invariants(&clean);
@@ -2457,35 +2583,41 @@ mod tests {
 
         let mut pm = PMap::new();
         for k in 0..2000 {
-            pm.insert(key(k), row(k as i64), W, CAP, SHAPE, None)
+            pm.insert(key(k), row(k as i64), W, CAP, &SHAPE_CELL, None)
                 .unwrap();
         }
         assert!(pm.height() > 2, "test needs a multi-level dirty path");
 
-        // An equal-weight overwrite cannot split. Every node on this unaliased dirty path stays at
-        // the same address, proving both the leaf edit and interior child replacement were in place.
+        // An equal-weight overwrite with a value inside the leaf's value span cannot split (a value
+        // outside it could widen the column's offsets — format.md "Leaf payload"). Every node on
+        // this unaliased dirty path stays at the same address, proving both the leaf edit and
+        // interior child replacement were in place.
         let before = path(&pm, &key(777));
         assert_eq!(
-            pm.insert(key(777), row(-777), W, CAP, SHAPE, None).unwrap(),
+            pm.insert(key(777), row(776), W, CAP, &SHAPE_CELL, None)
+                .unwrap(),
             Some(row(777))
         );
         assert_eq!(path(&pm, &key(777)), before);
-        assert_eq!(pm.get(&key(777), None).unwrap(), Some(row(-777)));
+        assert_eq!(pm.get(&key(777), None).unwrap(), Some(row(776)));
 
         // A snapshot alias defeats Arc::get_mut. The working map path-copies while the pin retains
         // the old path and value bytes.
         let pin = pm.clone();
         let shared_before = path(&pm, &key(777));
-        pm.insert(key(777), row(-778), W, CAP, SHAPE, None).unwrap();
+        pm.insert(key(777), row(-778), W, CAP, &SHAPE_CELL, None)
+            .unwrap();
         assert_ne!(path(&pm, &key(777)), shared_before);
-        assert_eq!(pin.get(&key(777), None).unwrap(), Some(row(-777)));
+        assert_eq!(pin.get(&key(777), None).unwrap(), Some(row(776)));
         assert_eq!(pm.get(&key(777), None).unwrap(), Some(row(-778)));
         drop(pin);
 
         // Page 0 is an independent condition. Simulate a uniquely held persisted root: even though
         // Arc::get_mut would succeed, the clean root is rebuilt and never edited in place.
         let mut clean = PMap::new();
-        clean.insert(key(1), row(1), W, CAP, SHAPE, None).unwrap();
+        clean
+            .insert(key(1), row(1), W, CAP, &SHAPE_CELL, None)
+            .unwrap();
         let clean_root = Arc::as_ptr(clean.root.as_ref().unwrap());
         clean
             .root
@@ -2493,7 +2625,9 @@ mod tests {
             .unwrap()
             .page
             .store(9, Ordering::Relaxed);
-        clean.insert(key(1), row(-1), W, CAP, SHAPE, None).unwrap();
+        clean
+            .insert(key(1), row(-1), W, CAP, &SHAPE_CELL, None)
+            .unwrap();
         assert_ne!(Arc::as_ptr(clean.root.as_ref().unwrap()), clean_root);
         assert_eq!(clean.get(&key(1), None).unwrap(), Some(row(-1)));
         check_invariants(&clean);
@@ -2504,13 +2638,17 @@ mod tests {
         let mut pm = PMap::new();
         assert!(pm.is_empty());
         assert_eq!(pm.get(&key(1), None).unwrap(), None);
-        assert_eq!(pm.remove(&key(1), CAP, SHAPE, None).unwrap(), None);
+        assert_eq!(pm.remove(&key(1), CAP, &SHAPE_CELL, None).unwrap(), None);
         assert_eq!(
-            pm.insert(key(1), row(1), W, CAP, SHAPE, None).unwrap(),
+            pm.insert(key(1), row(1), W, CAP, &SHAPE_CELL, None)
+                .unwrap(),
             None
         );
         assert_eq!(pm.get(&key(1), None).unwrap(), Some(row(1)));
-        assert_eq!(pm.remove(&key(1), CAP, SHAPE, None).unwrap(), Some(row(1)));
+        assert_eq!(
+            pm.remove(&key(1), CAP, &SHAPE_CELL, None).unwrap(),
+            Some(row(1))
+        );
         assert!(pm.is_empty());
         assert!(pm.root.is_none());
     }
@@ -2524,13 +2662,13 @@ mod tests {
         let mut pm = PMap::new();
         let mut bt: BTreeMap<Vec<u8>, Row> = BTreeMap::new();
         for k in shuffled(300) {
-            pm.insert(key(k), row(k as i64), 100, CAP, SHAPE, None)
+            pm.insert(key(k), row(k as i64), 100, CAP, &SHAPE_CELL, None)
                 .unwrap();
             bt.insert(key(k), row(k as i64));
             check_invariants(&pm);
         }
         for k in shuffled(300) {
-            pm.remove(&key(k), CAP, SHAPE, None).unwrap();
+            pm.remove(&key(k), CAP, &SHAPE_CELL, None).unwrap();
             bt.remove(&key(k));
             check_invariants(&pm);
         }
@@ -2547,7 +2685,7 @@ mod tests {
         // Index-tree shape: zero value columns, record = key alone. RECORD_MAX(0) = (240-12)/2
         // = 114; keys of 112 bytes keep records under the cap while two separators (2·112 + 20)
         // overflow an interior.
-        let shape = LeafShape { fixed: 0, var: 0 };
+        let shape = &LeafShape::plain(Vec::new());
         let big_key = |n: u64| {
             let mut k = vec![0xAB; 112];
             k[..8].copy_from_slice(&n.to_be_bytes());
@@ -2562,7 +2700,7 @@ mod tests {
         }
         assert_eq!(pm.count(), Some(bt.len() as i64));
         // Structure: fits + routing correctness (0-key interiors allowed).
-        fn walk(node: &Node, cap: Cap, shape: LeafShape) {
+        fn walk(node: &Node, cap: Cap, shape: &LeafShape) {
             assert!(node.payload(cap, shape) <= cap.c, "node overflows its page");
             if node.is_leaf() {
                 assert!(node.len() > 0, "empty non-root leaf");
@@ -2597,7 +2735,7 @@ mod tests {
     fn direct_point_get_counts_one_descent_and_reconstruction() {
         let mut pm = PMap::new();
         for k in 0..2000 {
-            pm.insert(key(k), row(k as i64), W, CAP, SHAPE, None)
+            pm.insert(key(k), row(k as i64), W, CAP, &SHAPE_CELL, None)
                 .unwrap();
         }
         assert!(pm.height() > 1, "test needs a multi-level tree");
@@ -2619,7 +2757,7 @@ mod tests {
     fn bounded_scans_and_cursor_agree() {
         let mut pm = PMap::new();
         for k in shuffled(2000) {
-            pm.insert(key(k), row(k as i64), W, CAP, SHAPE, None)
+            pm.insert(key(k), row(k as i64), W, CAP, &SHAPE_CELL, None)
                 .unwrap();
         }
         let b = KeyBound {

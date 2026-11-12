@@ -17,7 +17,7 @@ import (
 const storagePage int64 = 8192
 
 func storageBatch(lo, n int) string {
-	return fmt.Sprintf("INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(%d, %d) g", lo, lo+n-1)
+	return fmt.Sprintf("INSERT INTO t SELECT g, lpad(g::text, 1000, 'x') FROM generate_series(%d, %d) g", lo, lo+n-1)
 }
 
 // storageExec runs sql on s, failing the test on error.
@@ -263,7 +263,7 @@ func TestFileAttachmentStorageLimit(t *testing.T) {
 	// A multi-root commit rejected in the file attachment publishes neither database.
 	storageExec(t, s, "BEGIN")
 	storageExec(t, s, storageBatch(0, 10))
-	storageExec(t, s, "INSERT INTO f.a SELECT g, repeat('y', 1000) FROM generate_series(1, 100) g")
+	storageExec(t, s, "INSERT INTO f.a SELECT g, lpad(g::text, 1000, 'y') FROM generate_series(1, 100) g")
 	if code := storageExecCode(s, "COMMIT"); code != "54P06" {
 		t.Fatalf("multi-root commit: want 54P06, got %q", code)
 	}
@@ -305,7 +305,7 @@ func TestStorageLimitMultiRootRejectionPacksNoAttachment(t *testing.T) {
 		t.Fatal(err)
 	}
 	storageExec(t, s, "BEGIN")
-	storageExec(t, s, "INSERT INTO aux.a SELECT g, repeat('y', 1000) FROM generate_series(1, 50) g")
+	storageExec(t, s, "INSERT INTO aux.a SELECT g, lpad(g::text, 1000, 'y') FROM generate_series(1, 50) g")
 	storageExec(t, s, storageBatch(0, 50))
 	if code := storageExecCode(s, "COMMIT"); code != "54P06" {
 		t.Fatalf("multi-root commit: want 54P06, got %q", code)

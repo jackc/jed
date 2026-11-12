@@ -21,13 +21,13 @@ test("demand paging: scans + mutates correctly with bounded residency", () => {
   const dir = mkdtempSync(join(tmpdir(), "jed-paging-"));
   try {
     const path = join(dir, "paging.jed");
-    const n = 600;
+    const n = 6000; // 600 until format v52, whose leaves hold about ten times as many of these rows
     const CAP = 3;
 
     // Build a multi-level tree at a small page size, so a few hundred rows span many pages.
     const db = create(path, { pageSize: 256 });
     execute(db, "CREATE TABLE t (k i32 PRIMARY KEY, v i32)");
-    execute(db, "BEGIN"); // one commit, not 600
+    execute(db, "BEGIN"); // one commit, not 6000
     for (let k = 0; k < n; k++) execute(db, `INSERT INTO t VALUES (${k}, ${k * 2})`);
     execute(db, "COMMIT");
     close(db);
@@ -59,7 +59,7 @@ test("demand paging: scans + mutates correctly with bounded residency", () => {
     db2 = open(path, { cacheBytes: CAP * 256 });
     execute(db2, "DELETE FROM t WHERE k = 100");
     execute(db2, "UPDATE t SET v = 999 WHERE k = 200");
-    execute(db2, "INSERT INTO t VALUES (600, 1200)");
+    execute(db2, "INSERT INTO t VALUES (6000, 12000)");
     assert.ok(residentLeaves(db2) <= CAP, "mutations keep residency bounded");
     close(db2); // autocommit already persisted each statement
 
@@ -70,7 +70,7 @@ test("demand paging: scans + mutates correctly with bounded residency", () => {
       const k = intOf(r[0]!);
       assert.notEqual(k, 100n, "k=100 was deleted");
       if (k === 200n) assert.equal(intOf(r[1]!), 999n, "k=200 was updated");
-      if (k === 600n) assert.equal(intOf(r[1]!), 1200n, "k=600 was inserted");
+      if (k === 6000n) assert.equal(intOf(r[1]!), 12000n, "k=6000 was inserted");
     }
     close(db2);
   } finally {
@@ -86,7 +86,7 @@ test("memory budget: bounds residency under repeated lookups on a large file", (
   const dir = mkdtempSync(join(tmpdir(), "jed-budget-"));
   try {
     const path = join(dir, "budget.jed");
-    const n = 2000;
+    const n = 20000;
     const CAP = 4;
 
     const db = create(path, { pageSize: 256 });

@@ -306,6 +306,7 @@ import {
   crc32Ieee,
   type LiveCount,
   newTempStorage,
+  markKeyColumns,
   recordCompressUnits,
   resolveUnfetchedSelf,
   resolveUnfetchedSelfSteps,
@@ -10345,6 +10346,7 @@ export class Engine {
     const rewriteColTypes = !tableRewriteNeeded
       ? null
       : table.columns.map((c) => storeColType(c, this.readSnap().types));
+    let rewriteStoreTypes: ColType[] | null = null;
     const meter = this.session.newMeter();
     meter.charge(prepCost);
     meter.guard();
@@ -10415,9 +10417,9 @@ export class Engine {
             );
           seenKeys.add(hash);
         }
-        compressUnits += BigInt(
-          recordCompressUnits(rewriteColTypes!, key, row, rewriteCap),
-        );
+        // The stored shape: a key column the leaf does not store has no weight (format.md "Record").
+        rewriteStoreTypes ??= markKeyColumns(rewriteColTypes!, table.pk);
+        compressUnits += BigInt(recordCompressUnits(rewriteStoreTypes, key, row, rewriteCap));
         rewriteRows.push({ key, row });
       }
       meter.charge(COSTS.valueCompress * compressUnits);

@@ -157,13 +157,15 @@ test("one flush per steady commit; every persisted write subset recovers one com
 test("overflow descriptors reject every missing or torn dependency even with meta persisted first", () => {
   const { db, store } = setup();
   const prior = store.image();
-  const rows = Array.from({ length: 160 }, (_, i) => `(${i + 2}, '${"x".repeat(25)}')`);
+  // 400 rows (160 until format v52, whose leaves hold more of them) dirty enough pages to chain
+  // overflow descriptors.
+  const rows = Array.from({ length: 400 }, (_, i) => `(${i + 2}, '${"x".repeat(25)}${i}')`);
   execute(db, `INSERT INTO t VALUES ${rows.join(", ")}`);
   assert.equal(store.events.filter((event) => event === "sync").length, 1);
   const metaWrite = store.writes.find((write) => write.offset < 512)!;
   const meta = parseCommitMeta(metaWrite.bytes, 256, store.size() / 256)!;
   assert.ok(meta.overflowCount > 1, "large commit uses chained overflow descriptors");
-  assert.equal(count(store.image()), 161n);
+  assert.equal(count(store.image()), 401n);
   for (let missing = 0; missing < store.writes.length; missing++) {
     const kept = store.writes.filter((_, i) => i !== missing);
     assert.equal(count(apply(prior, kept)), 1n, `missing write ${missing}`);
@@ -176,7 +178,7 @@ test("overflow descriptors reject every missing or torn dependency even with met
   for (let prefix = 0; prefix <= body.length; prefix++) {
     assert.equal(
       count(apply(prior, [metaWrite, ...body.slice(0, prefix)])),
-      prefix === body.length ? 161n : 1n,
+      prefix === body.length ? 401n : 1n,
     );
   }
 });
@@ -281,14 +283,15 @@ test("meta checksum covers descriptor entries and zero padding", () => {
 
 test("overflow descriptors and free-list pages reuse safely across sustained churn", () => {
   const { db, store } = setup();
-  const rows = Array.from({ length: 100 }, (_, i) => `(${i + 2}, '${"x".repeat(30)}')`);
+  const rows = Array.from({ length: 100 }, (_, i) => `(${i + 2}, '${"x".repeat(30)}${i}')`);
   execute(db, `INSERT INTO t VALUES ${rows.join(", ")}`);
   let middleHighWater = 0;
   let prior = store.image();
   for (let generation = 0; generation < 100; generation++) {
     prior = store.image();
     store.reset();
-    execute(db, `UPDATE t SET value = '${"x".repeat(30)}-${generation}'`);
+    // Distinct per row (the id follows), so no dictionary shares the values (format v52).
+    execute(db, `UPDATE t SET value = '${"x".repeat(30)}-${generation}-' || id::text`);
     if (generation === 49) middleHighWater = db.pageCount;
   }
   assert.ok(
@@ -305,7 +308,7 @@ test("overflow descriptors and free-list pages reuse safely across sustained chu
       store.writes.filter((_, i) => i !== missing),
     );
     const loaded = loadEngine(image);
-    const out = execute(loaded, "SELECT DISTINCT value FROM t");
+    const out = execute(loaded, "SELECT DISTINCT substr(value, 1, 33) FROM t");
     assert.equal(out.kind, "query");
     if (out.kind !== "query") throw new Error("expected query");
     const omitted = store.writes[missing];
@@ -321,7 +324,7 @@ test("overflow descriptors and free-list pages reuse safely across sustained chu
 
 test("unchanged shared meta reuses a successful descriptor validation", () => {
   const { db, store } = setup();
-  const rows = Array.from({ length: 160 }, (_, i) => `(${i + 2}, '${"x".repeat(25)}')`);
+  const rows = Array.from({ length: 160 }, (_, i) => `(${i + 2}, '${"x".repeat(25)}${i}')`);
   execute(db, `INSERT INTO t VALUES ${rows.join(", ")}`);
   const metaWrite = store.writes.findLast((write) => write.offset < 512)!;
   const meta = parseCommitMeta(metaWrite.bytes, 256, store.size() / 256)!;

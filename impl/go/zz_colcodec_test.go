@@ -105,7 +105,8 @@ func ccByteWidth(rng uint64) int {
 }
 
 var ccIntCodecs = []ccInt{
-	{name: "plain", direct: true,
+	{
+		name: "plain", direct: true,
 		enc: func(vals []uint64, w int) ([]byte, int, bool) {
 			b := make([]byte, len(vals)*w)
 			for i, v := range vals {
@@ -128,7 +129,8 @@ var ccIntCodecs = []ccInt{
 		},
 	},
 	// base + fixed 1/2/4-byte offsets.
-	{name: "for-bytes", direct: true,
+	{
+		name: "for-bytes", direct: true,
 		enc: func(vals []uint64, w int) ([]byte, int, bool) {
 			lo, hi := ccMinMax(vals)
 			bw := ccByteWidth(hi - lo)
@@ -187,7 +189,8 @@ var ccIntCodecs = []ccInt{
 		},
 	},
 	// base + bit-packed offsets. Still direct: value i is at bit i·bits.
-	{name: "for-bits", direct: true,
+	{
+		name: "for-bits", direct: true,
 		enc: func(vals []uint64, w int) ([]byte, int, bool) {
 			lo, hi := ccMinMax(vals)
 			nb := bits.Len64(hi - lo)
@@ -227,7 +230,8 @@ var ccIntCodecs = []ccInt{
 		},
 	},
 	// first value, then bit-packed (delta − min delta). Value i needs the i deltas before it.
-	{name: "delta-bits",
+	{
+		name: "delta-bits",
 		enc: func(vals []uint64, w int) ([]byte, int, bool) {
 			n := len(vals)
 			if n < 2 {
@@ -289,7 +293,8 @@ var ccIntCodecs = []ccInt{
 		},
 	},
 	// first value, then zigzag LEB128 deltas: variable-size values.
-	{name: "delta-varint",
+	{
+		name: "delta-varint",
 		enc: func(vals []uint64, w int) ([]byte, int, bool) {
 			b := make([]byte, 0, len(vals)*2+10)
 			b = binary.AppendUvarint(b, vals[0])
@@ -319,7 +324,8 @@ var ccIntCodecs = []ccInt{
 		},
 	},
 	// each value as a LEB128 varint of (value − min): variable-size values, no delta.
-	{name: "for-varint",
+	{
+		name: "for-varint",
 		enc: func(vals []uint64, w int) ([]byte, int, bool) {
 			lo, _ := ccMinMax(vals)
 			b := make([]byte, 8, len(vals)*2+10)
@@ -351,7 +357,8 @@ var ccIntCodecs = []ccInt{
 		},
 	},
 	// up to 256 distinct values + one code byte per row.
-	{name: "dict8", direct: true,
+	{
+		name: "dict8", direct: true,
 		enc: func(vals []uint64, w int) ([]byte, int, bool) {
 			idx := map[uint64]int{}
 			var dict []uint64
@@ -388,7 +395,8 @@ var ccIntCodecs = []ccInt{
 		},
 	},
 	// LZ4 over the plain big-endian slots.
-	{name: "lz4",
+	{
+		name: "lz4",
 		enc: func(vals []uint64, w int) ([]byte, int, bool) {
 			p := make([]byte, len(vals)*w)
 			for i, v := range vals {
@@ -405,7 +413,8 @@ var ccIntCodecs = []ccInt{
 		},
 	},
 	// DEFLATE over the plain slots: an entropy-coder reference, not a candidate.
-	{name: "flate",
+	{
+		name: "flate",
 		enc: func(vals []uint64, w int) ([]byte, int, bool) {
 			p := make([]byte, len(vals)*w)
 			for i, v := range vals {
@@ -486,7 +495,8 @@ func ccPlainGet(b []byte, n, i int) uint64 {
 }
 
 var ccBytesCodecs = []ccBytes{
-	{name: "plain", direct: true,
+	{
+		name: "plain", direct: true,
 		enc: func(ends []uint16, body []byte) ([]byte, int, bool) {
 			b := ccPlainImage(ends, body)
 			return b, len(b), true
@@ -494,7 +504,8 @@ var ccBytesCodecs = []ccBytes{
 		visit: ccPlainVisit, get: ccPlainGet,
 	},
 	// up to 256 distinct values (a u16 directory + blob) and one code byte per row.
-	{name: "dict8", direct: true,
+	{
+		name: "dict8", direct: true,
 		enc: func(ends []uint16, body []byte) ([]byte, int, bool) {
 			idx := map[string]int{}
 			var dends []uint16
@@ -554,7 +565,8 @@ var ccBytesCodecs = []ccBytes{
 		},
 	},
 	// LZ4 over the whole plain image (directory and bodies).
-	{name: "lz4",
+	{
+		name: "lz4",
 		enc: func(ends []uint16, body []byte) ([]byte, int, bool) {
 			p := ccPlainImage(ends, body)
 			c := lz4Compress(p)
@@ -567,7 +579,8 @@ var ccBytesCodecs = []ccBytes{
 		},
 	},
 	// LZ4 over the bodies only; the directory stays plain, so lengths are direct but bytes are not.
-	{name: "lz4-body",
+	{
+		name: "lz4-body",
 		enc: func(ends []uint16, body []byte) ([]byte, int, bool) {
 			c := lz4Compress(body)
 			b := make([]byte, 0, 2*len(ends)+len(c))
@@ -592,7 +605,8 @@ var ccBytesCodecs = []ccBytes{
 			return s
 		},
 	},
-	{name: "flate",
+	{
+		name: "flate",
 		enc: func(ends []uint16, body []byte) ([]byte, int, bool) {
 			p := ccPlainImage(ends, body)
 			c := ccDeflate(p)
@@ -798,7 +812,8 @@ var ccKeyCodecs = func() []ccKey {
 	fall.name = "front-all"
 	return []ccKey{
 		// what steps 1 to 5 store: shared prefix, suffix directory (none when fixed), suffixes.
-		{name: "prefix", direct: true,
+		{
+			name: "prefix", direct: true,
 			enc: func(ends []uint32, blob []byte, fixed int) ([]byte, int, bool) {
 				img, p := ccPrefixImage(ends, blob)
 				size := len(img)
@@ -813,7 +828,8 @@ var ccKeyCodecs = func() []ccKey {
 		},
 		f16, fall,
 		// the prefix image under LZ4.
-		{name: "lz4",
+		{
+			name: "lz4",
 			enc: func(ends []uint32, blob []byte, fixed int) ([]byte, int, bool) {
 				img, _ := ccPrefixImage(ends, blob)
 				c := lz4Compress(img)
@@ -829,7 +845,8 @@ var ccKeyCodecs = func() []ccKey {
 				return ccPrefixFind(img, n, probe)
 			},
 		},
-		{name: "flate",
+		{
+			name: "flate",
 			enc: func(ends []uint32, blob []byte, fixed int) ([]byte, int, bool) {
 				img, _ := ccPrefixImage(ends, blob)
 				c := ccDeflate(img)

@@ -517,7 +517,12 @@ export type ColType =
   // The type is a decimal everywhere but the leaf slot — `scalar` stays "decimal", so keys,
   // comparison, coercion, and rendering are the scalar's. Set only by storeColType for a top-level
   // column; a decimal field, element, or range bound never carries it.
-  | { kind: "scalar"; scalar: ScalarType; fixedDec?: FixedDec }
+  //
+  // `keyAt`, when set (nonzero), says this TABLE COLUMN is a primary-key member whose value its row's
+  // storage key reproduces (format.md v52 "Elided key columns"): the column's key bytes start at
+  // offset keyAt − 1, and a leaf stores no region for it. Set only on a table store's column types
+  // (format.ts markKeyColumns); it is a fact about where the value is stored, not part of the type.
+  | { kind: "scalar"; scalar: ScalarType; fixedDec?: FixedDec; keyAt?: number }
   // A composite type's resolved fields, in declaration order. `name` is the (original-case) type
   // name, used in store-coercion error messages.
   | { kind: "composite"; name: string; fields: ColField[] }

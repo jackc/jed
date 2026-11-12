@@ -275,7 +275,7 @@ INSERT INTO mc SELECT x, x FROM generate_series(1, 2000) x
 # Unindexed, deleting 1000 parents cascades through ONE scan of mc and a hash membership test per
 # row, not a 1000-way OR per row: 1000 parent rows + 1000 filter evals + 2000 child rows, plus 8
 # pages across the two trees.
-# cost: 4008
+# cost: 4004
 statement ok
 DELETE FROM mp WHERE id <= 1000
 
@@ -292,7 +292,7 @@ CREATE INDEX mc_pid ON mc (pid)
 # former generated predicate, an OR of 1000 equalities evaluated per child row, cost about 4 million
 # here; the ceiling now admits the statement with room to spare.
 # max_cost: 20000
-# cost: 7004
+# cost: 5001
 statement ok
 DELETE FROM mp WHERE id <= 2000
 

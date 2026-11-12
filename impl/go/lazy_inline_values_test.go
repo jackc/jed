@@ -379,13 +379,13 @@ func TestLazyInlineFaultedLeafSharesPageBlock(t *testing.T) {
 	if node.keyLen() != len(keys) {
 		t.Fatalf("logical key count = %d, want %d", node.keyLen(), len(keys))
 	}
-	if got, want := len(node.packed.dirs.keyEnd), 4*len(keys); got != want {
+	if got, want := len(node.packed.dirs.keyEnd), 2*len(keys); got != want {
 		t.Fatalf("page-backed key directory bytes = %d, want %d", got, want)
 	}
 	if cap(node.packed.dirs.keyEnd) <= len(node.packed.dirs.keyEnd) {
 		t.Fatalf("key directory must remain a view into the retained page, not an owned offset array")
 	}
-	if got := node.packed.dirs.regions[1].ends; len(got) != 4*len(keys) || cap(got) <= len(got) {
+	if got := node.packed.dirs.regions[1].ends; len(got) != 2*len(keys) || cap(got) <= len(got) {
 		t.Fatalf("variable directory must remain a page view; len=%d cap=%d", len(got), cap(got))
 	}
 	for i := range keys {
@@ -414,7 +414,9 @@ func TestLazyInlineFaultedLeafSharesPageBlock(t *testing.T) {
 			comp := v.unfetched().Comp
 			// Form (a): the body is a SLICE of the page block, so its cap reaches the page's end
 			// (zero-fill tail) and exceeds its len. A form-(b) copy (make+copy) has cap == len.
-			if cap(comp) <= len(comp) {
+			// The i32[] column is a packed-array region (format.md "Leaf node", kind 4): its values
+			// are rebuilt on first use, not views of the page.
+			if v.unfetched().lazy == nil && cap(comp) <= len(comp) {
 				t.Fatalf("row %d col %d: deferred body is a copy (cap %d == len %d), not a block view (form (a))",
 					ri, ci, cap(comp), len(comp))
 			}

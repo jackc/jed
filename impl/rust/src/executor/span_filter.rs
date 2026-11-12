@@ -282,8 +282,8 @@ impl SpanAtom<'_> {
                     m.charge(*base);
                     return Ok(Some(false));
                 };
-                let Some(payload) = crate::format::inline_plain_body(span).and_then(len16_payload)
-                else {
+                // An inline string in a leaf is its tag and its content (format.md "Leaf node").
+                let Some(payload) = crate::format::inline_string_payload(span) else {
                     return Ok(None);
                 };
                 let width = if *text {
@@ -340,13 +340,6 @@ impl SpanAtom<'_> {
             }
         }
     }
-}
-
-/// The payload of a `u16`-length-prefixed body (text / bytea), only when the body is exactly the
-/// prefix plus that many bytes.
-fn len16_payload(body: &[u8]) -> Option<&[u8]> {
-    let (len, rest) = body.split_first_chunk::<2>()?;
-    (rest.len() == u16::from_be_bytes(*len) as usize).then_some(rest)
 }
 
 /// Walk an inline array body (spec/design/array.md §4) and collect its non-NULL element bodies as
@@ -572,15 +565,6 @@ mod tests {
             .collect();
         let ty = ColType::Array(Box::new(ColType::Scalar(ScalarType::Text)));
         crate::format::encode_value(&ty, &Value::Array(ArrayVal::one_dim(vals)))[1..].to_vec()
-    }
-
-    #[test]
-    fn len16_payload_requires_an_exact_body() {
-        assert_eq!(len16_payload(&[0, 0]), Some(&[][..]));
-        assert_eq!(len16_payload(&[0, 2, 0, b'a']), Some(&[0, b'a'][..]));
-        assert_eq!(len16_payload(&[0, 2, 0]), None); // short
-        assert_eq!(len16_payload(&[0, 1, b'a', b'b']), None); // trailing byte
-        assert_eq!(len16_payload(&[0]), None);
     }
 
     #[test]

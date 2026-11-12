@@ -334,7 +334,7 @@ test("a faulted leaf shares one page block across its deferred values", () => {
     new DataView(key.buffer).setUint32(0, i, false);
     return key;
   });
-  const payload = encodeLeafPax(colTypes, keys, rows, Sealer.plain(ps), take, ovf);
+  const payload = encodeLeafPax(colTypes, 0, keys, rows, Sealer.plain(ps), take, ovf);
   assert.equal(ovf.length, 0, "values must stay inline (no overflow) for the form-(a) case");
   const block = makePage(ps, 2 /* PAGE_LEAF */, rows.length, 0, payload);
 
@@ -366,15 +366,19 @@ test("a faulted leaf shares one page block across its deferred values", () => {
       // Form (a): the body is a SUBARRAY view of the page block, so it shares the block's identical
       // ArrayBuffer (one allocation, page_size bytes). A form-(b) `.slice()` copy owns a fresh
       // ArrayBuffer of exactly its own length.
-      assert.ok(
-        comp.buffer === block.buffer,
-        `row ${ri} col ${ci}: deferred body must view the shared page block (form (a))`,
-      );
-      assert.equal(
-        comp.buffer.byteLength,
-        ps,
-        `row ${ri} col ${ci}: the shared block is the whole page`,
-      );
+      // The i32[] column (4) is a packed-array region (format.md "Leaf node", kind 4): its values
+      // are rebuilt on first use into one buffer for the region, not views of the page.
+      if (ci !== 4) {
+        assert.ok(
+          comp.buffer === block.buffer,
+          `row ${ri} col ${ci}: deferred body must view the shared page block (form (a))`,
+        );
+        assert.equal(
+          comp.buffer.byteLength,
+          ps,
+          `row ${ri} col ${ci}: the shared block is the whole page`,
+        );
+      }
       // It still resolves to exactly the eager value (form (a) is decode-neutral).
       const got = resolveUnfetched(colTypes[ci]!, v.ref, () => {
         throw new Error("inline values read no overflow pages");
@@ -406,6 +410,7 @@ test("a Packed leaf validates page-backed directories at fault", () => {
   const overflow: OverflowPageOut[] = [];
   const payload = encodeLeafPax(
     colTypes,
+    0,
     keys,
     rows,
     Sealer.plain(8192),
@@ -422,19 +427,39 @@ test("a Packed leaf validates page-backed directories at fault", () => {
     );
   };
 
+  // The v52 layout of this leaf (format.md "Leaf node"): the leaf flags byte (key_prefix: the three
+  // 4-byte keys share 3 bytes), the u16 prefix length and the prefix, three u16 key end offsets, the
+  // stored keys (one byte each), the column directory, then the text column's plain region — its
+  // kind byte and three u16 value end offsets.
+  assert.equal(payload[0], 2, "leaf flags: key_prefix");
+  const keyDir = 1 + 2 + 3;
   const badKeys = payload.slice();
   const keyView = new DataView(badKeys.buffer, badKeys.byteOffset, badKeys.byteLength);
-  keyView.setUint32(4, keyView.getUint32(0, false) - 1, false);
+  keyView.setUint16(keyDir + 2, keyView.getUint16(keyDir, false) - 1, false);
   assertFaultCorrupt(badKeys);
 
   const badValues = payload.slice();
   const valueView = new DataView(badValues.buffer, badValues.byteOffset, badValues.byteLength);
-  const lastKeyEnd = valueView.getUint32((rows.length - 1) * 4, false);
-  const colDir = rows.length * 4 + lastKeyEnd;
-  const firstRegion = valueView.getUint32(colDir, false);
-  const valueDir = firstRegion + 1; // region flags byte
-  valueView.setUint32(valueDir + 4, valueView.getUint32(valueDir, false) - 1, false);
+  const lastKeyEnd = valueView.getUint16(keyDir + (rows.length - 1) * 2, false);
+  const colDir = keyDir + rows.length * 2 + lastKeyEnd;
+  const firstRegion = valueView.getUint16(colDir, false);
+  assert.equal(payload[firstRegion], 0, "a plain region");
+  const valueDir = firstRegion + 1; // region kind byte
+  valueView.setUint16(valueDir + 2, valueView.getUint16(valueDir, false) - 1, false);
   assertFaultCorrupt(badValues);
+
+  // A reserved leaf flags bit, a reserved region kind (3 and 5), and a kind on a column it does not
+  // apply to (base plus offsets on text) are corrupt.
+  for (const [at, byte] of [
+    [0, 0x06],
+    [firstRegion, 3],
+    [firstRegion, 5],
+    [firstRegion, 1],
+  ] as const) {
+    const bad = payload.slice();
+    bad[at] = byte;
+    assertFaultCorrupt(bad);
+  }
 });
 
 // The touched-column path (packed-leaf.md §4/§6, the PAX dividend): colAt reconstructs ONLY the
@@ -459,7 +484,7 @@ test("a Packed leaf reconstructs only the touched columns", () => {
     new DataView(key.buffer).setUint32(0, i, false);
     return key;
   });
-  const payload = encodeLeafPax(colTypes, keys, rows, Sealer.plain(ps), take, ovf);
+  const payload = encodeLeafPax(colTypes, 0, keys, rows, Sealer.plain(ps), take, ovf);
   assert.equal(ovf.length, 0);
   const block = makePage(ps, PAGE_LEAF, rows.length, 0, payload);
   const node = decodeLeafNode(block, 2, colTypes, null);

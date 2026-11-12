@@ -1392,7 +1392,7 @@ fn batch_streaming_scan_storage_errors_match_row_kernel() {
         db.query_outcome("CREATE TABLE t (id i64 PRIMARY KEY, a i64)", &[])
             .unwrap();
         db.query_outcome(
-            "INSERT INTO t SELECT g, CASE WHEN g % 10 = 0 THEN NULL ELSE g END \
+            "INSERT INTO t SELECT g, CASE WHEN g % 10 = 0 THEN NULL ELSE g - 150 END \
              FROM generate_series(1, 300) AS g",
             &[],
         )

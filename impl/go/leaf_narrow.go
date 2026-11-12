@@ -15,29 +15,27 @@ package jed
 //
 // Go-only, no format version bump. The same layout byte also carries the key-column flag below.
 
-import "os"
-
 // leafNarrow makes this process write narrow leaves.
-var leafNarrow = os.Getenv("JED_LEAF_NARROW") == "on"
+const leafNarrow = true
 
 // leafElideKey makes this process write leaves without the primary-key columns whose values the key
 // already holds (JED_LEAF_ELIDE_KEY=on). Such a column keeps its column-directory entry but has an
 // empty region; a reader rebuilds its dense slots from the keys when it parses the page. The column
 // contributes nothing to record_size, and leafOverhead counts it only in the column directory.
-var leafElideKey = os.Getenv("JED_LEAF_ELIDE_KEY") == "on"
+const leafElideKey = true
 
 // leafFixedKey makes this process write a table leaf whose keys all have one length, fixed by the
 // primary key's column types, without a key directory (JED_LEAF_FIXED_KEY=on): the layout byte is
 // followed by the key length as a u16, and key i is at i·key_len in the key blob. The page names its
 // own key length, so a reader needs no schema. Index trees keep their directory: an index key's
 // length depends on whether a key column is NULL.
-var leafFixedKey = os.Getenv("JED_LEAF_FIXED_KEY") == "on"
+const leafFixedKey = true
 
 // leafBareString makes this process write an inline text / bytea / json value in a leaf without its
 // u16 length (JED_LEAF_BARE_STRING=on): the value directory's span already gives the length. Such a
 // value carries the presence tag tagInlineBare instead of 0x00, so each value names its own form and
 // both read. Its record_size contribution is 1 + len instead of 3 + len.
-var leafBareString = os.Getenv("JED_LEAF_BARE_STRING") == "on"
+const leafBareString = true
 
 // tagInlineBare is the presence tag of an inline-plain string body stored without its length: the
 // rest of the value's span is the content payload.
@@ -55,12 +53,10 @@ func (u *Unfetched) inlinePayload() []byte {
 	return u.Comp[min(2, len(u.Comp)):]
 }
 
-// The layout byte is a set of flags. A v50 leaf has no layout byte (its first payload byte is 0).
+// The leaf flags byte leads every leaf payload (format.md "Leaf node"). Other bits are reserved.
 const (
-	leafLayoutNarrow   = 1 // every directory entry is a u16
-	leafLayoutElideKey = 2 // key-derivable columns have no region
-	leafLayoutFixedKey = 4 // a u16 key length follows; no key directory
-	leafLayoutPrefix   = 8 // a u16 prefix length and the prefix follow; the key blob holds suffixes
+	leafFlagFixedKey = 1 // a u16 key length follows; no key directory
+	leafFlagPrefix   = 2 // a u16 prefix length and the prefix follow; the key blob holds suffixes
 )
 
 // leafKeyPrefix makes this process write a leaf's shared key prefix once (JED_LEAF_KEY_PREFIX=on,
@@ -72,7 +68,7 @@ const (
 //
 // so the split and merge rules measure the keys as well as the weights. record_size is unchanged.
 // A reader rebuilds the full keys into one allocation when it parses the page.
-var leafKeyPrefix = os.Getenv("JED_LEAF_KEY_PREFIX") == "on" && leafNarrow
+const leafKeyPrefix = true
 
 // leafPrefixLen is the length of the prefix a leaf of n keys stores once: the common prefix of its
 // first and last key when storing it saves bytes (n·p > p + 2), else 0.
@@ -103,14 +99,13 @@ func leafPrefixSaving(n int, first, last []byte) int {
 	return n*p - p - 2
 }
 
-// leafFlagsFor is the layout byte of a leaf in a tree whose keys have the fixed length keyLen (0 when
-// they vary).
+// leafFlagsFor is the leaf flags byte of a tree whose keys have the fixed length keyLen (0 when they
+// vary), before the prefix bit, which is per leaf.
 func leafFlagsFor(keyLen int) byte {
-	f := leafLayoutFlags()
-	if leafFixedKey && keyLen > 0 {
-		f |= leafLayoutFixedKey
+	if keyLen > 0 {
+		return leafFlagFixedKey
 	}
-	return f
+	return 0
 }
 
 // tableKeyLen is the length of every storage key of a table with these column types and primary key
@@ -140,18 +135,6 @@ func tableKeyLen(colTypes []colType, pk []int) int {
 		return 0
 	}
 	return total
-}
-
-// leafLayoutFlags is the layout byte this process writes; 0 writes the v50 layout.
-func leafLayoutFlags() byte {
-	var f byte
-	if leafNarrow {
-		f |= leafLayoutNarrow
-	}
-	if leafElideKey {
-		f |= leafLayoutElideKey
-	}
-	return f
 }
 
 // keyDerivable reports whether a column of type ty, as a primary-key member, has a fixed-width key
@@ -215,7 +198,7 @@ func keyColumnSlot(ty colType, key []byte) []byte {
 //	leaf size = Σ record_size + leafOverhead − prefix saving − Σ over such columns of forSaving
 //
 // record_size is unchanged. A reader rebuilds the dense full-width slots when it parses the page.
-var leafFOR = os.Getenv("JED_LEAF_FOR") == "on" && leafNarrow
+const leafFOR = true
 
 // regionFOR is the region flags byte of a base-plus-offsets fixed-width region.
 const regionFOR byte = 1
@@ -223,32 +206,43 @@ const regionFOR byte = 1
 // forCol is one column a leaf may write as base plus offsets.
 type forCol struct {
 	col, w int
+	// dec marks a fixed-width numeric(p,s) column: its slot is the value's unscaled integer at scale.
+	dec   bool
+	scale uint16
 }
 
-// forEligible reports whether a column's value body is a big-endian unsigned image of its order (the
-// sign-flipped integers and date/time instants), so that a range of nearby values has a small
-// difference.
+// forEligible reports whether a column's value body is the sign-flipped big-endian integer body (the
+// integers, the date/time instants, and a fixed-width numeric(p,s) slot), so that a range of nearby
+// values has a small difference. A column the leaf does not store (keyAt) is not.
 func forEligible(ty colType) bool {
-	if !leafFOR || ty.Composite || ty.Elem != nil || ty.RangeElem != nil || (leafElideKey && ty.keyAt != 0) {
+	if ty.Composite || ty.Elem != nil || ty.RangeElem != nil || ty.keyAt != 0 {
 		return false
 	}
 	switch ty.Scalar {
 	case scalarInt16, scalarInt32, scalarInt64, scalarTimestamp, scalarTimestamptz, scalarDate:
 		return true
 	}
-	return false
+	return ty.DecSlot != 0
 }
 
 // forSlot is the unsigned image of an eligible column's present value: its value body read as a
-// big-endian integer (format.md *Value codec*: the sign bit flipped at the column's width).
-func forSlot(w int, v Value) uint64 {
-	switch w {
-	case 2:
-		return uint64(uint16(v.Int) ^ 0x8000)
-	case 4:
-		return uint64(uint32(v.Int) ^ 0x80000000)
+// big-endian integer (format.md "Value codec": the sign bit flipped at the column's width).
+func forSlot(fc forCol, v Value) uint64 {
+	x := v.Int
+	if fc.dec {
+		u, ok := v.decimal().unscaledInt64(uint32(fc.scale))
+		if !ok {
+			panic("BUG: a decimal outside its column's typmod reached the leaf codec")
+		}
+		x = u
 	}
-	return uint64(v.Int) ^ (1 << 63)
+	switch fc.w {
+	case 2:
+		return uint64(uint16(x) ^ 0x8000)
+	case 4:
+		return uint64(uint32(x) ^ 0x80000000)
+	}
+	return uint64(x) ^ (1 << 63)
 }
 
 // forWidth is the offset width for present values spanning [lo, hi] in a column of width w, or w when
@@ -310,7 +304,7 @@ func rowsFORSaving(cols []forCol, rows []storedRow) int {
 		var r forRange
 		for _, row := range rows {
 			if v := row[fc.col]; !v.IsNull() {
-				r.add(forSlot(fc.w, v))
+				r.add(forSlot(fc, v))
 			}
 		}
 		total += forSaving(len(rows), fc.w, r.lo, r.hi, r.any)
@@ -361,7 +355,7 @@ func putBEUint(b []byte, v uint64) {
 //	N − 2 − 2·D + (bytes of the spans that repeat an earlier one), when positive and D ≤ 256
 //
 // and joins the content-dependent leaf size of the key prefix and base-plus-offsets columns.
-var leafDict = os.Getenv("JED_LEAF_DICT") == "on" && leafNarrow
+const leafDict = true
 
 // regionDict is the region flags byte of a dictionary region.
 const regionDict byte = 2
@@ -454,9 +448,9 @@ func rowItems(shape leafShape, pcap pageCap, key []byte, row storedRow, out []di
 		case plan != nil && plan.disp[c] != dispInline:
 			out[j] = dictItem{kind: dictOwn}
 		case v.Kind == ValUnfetched && v.unfetched().Form != 0x00:
-			// A stored large form whose record now fits: its content is not at hand. Counted as its
-			// own entry (see leaf-structural.md, open point).
-			out[j] = dictItem{kind: dictOwn}
+			// A stored row's deferred values equal its own plan's output (large-values.md §15.2), so a
+			// record that fits all-inline holds no large form.
+			panic("BUG: a stored large form in a record whose plan is all-inline")
 		case !isSpillable(shape.colTypes[c]):
 			out[j] = dictItem{kind: dictOwn}
 		default:
@@ -519,7 +513,7 @@ func leafSizesOf(shape leafShape, rows []storedRow, items [][]dictItem, tabs []*
 	for j, fc := range shape.forCols {
 		for _, row := range rows {
 			if v := row[fc.col]; !v.IsNull() {
-				sz.fors[j].add(forSlot(fc.w, v))
+				sz.fors[j].add(forSlot(fc, v))
 			}
 		}
 	}
@@ -564,7 +558,7 @@ func (sz *leafSizes) addRow(shape leafShape, pcap pageCap, key []byte, row store
 	sz.n++
 	for j, fc := range shape.forCols {
 		if v := row[fc.col]; !v.IsNull() {
-			sz.fors[j].add(forSlot(fc.w, v))
+			sz.fors[j].add(forSlot(fc, v))
 		}
 	}
 	if len(shape.itemCols) == 0 {

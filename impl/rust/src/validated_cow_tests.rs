@@ -156,7 +156,9 @@ fn assert_snapshot(image: &[u8], rows: usize) {
 }
 #[test]
 fn all_small_write_subsets_and_each_large_manifest_tear_are_atomic() {
-    for rows in [2, 400] {
+    // 4000 rows: ten times the pre-v52 count, so the commit still dirties enough compact leaves to
+    // need manifest overflow pages.
+    for rows in [2, 4000] {
         let (device, mut db) = seeded(rows);
         let initial = device.lock().unwrap().durable.clone();
         execute(&mut db, "UPDATE t SET v=1").unwrap();

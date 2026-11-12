@@ -27,7 +27,15 @@ require "zlib"
 # Exit 0 = all fixtures conform; nonzero = mismatch (prints the offending case).
 
 MAGIC = "JEDB".b
-VERSION = 51 # v51: a `numeric(p,s)` table column with p <= 18 is a fixed-width leaf column — a null
+VERSION = 52 # v52: the compact leaf (format.md "Leaf node", leaf-structural.md) — a leaf payload leads with a
+# flags byte and every leaf directory entry is a u16; a table column that is a leading key-derivable
+# primary-key member has no region; a fixed-key table tree stores its key length once and no key
+# directory; an inline text / bytea / json leaf value is the tag 0x05 and its bytes; a leaf may store
+# its keys' shared prefix once; a column region may be base plus offsets (kind 1), a dictionary (kind
+# 2) or packed integer arrays (kind 4), each exactly when smaller. A leaf's size is then
+# Σ record_size + leafOverhead − saving(leaf), which overflow, the split scan and merges measure.
+# Only leaf pages change.
+# v51: a `numeric(p,s)` table column with p <= 18 is a fixed-width leaf column — a null
 # bitmap and 2/4/8-byte slots holding the unscaled integer — instead of the variable-width decimal
 # codec; the catalog is unchanged (format.md "Fixed-width column slot", decimal.md §6a).
 # v50: index_flags bit5 is_constraint — set on the unique index that backs a UNIQUE
@@ -537,11 +545,45 @@ CHECK_TABLE = {
 PK_TABLE = {
   name: "t",
   columns: [col("id", "i32", pk: true), col("v", "i16")],
-  # 20 rows: each record is 14 bytes, so a 256-byte page (cap 240, v7) overflows at 18 rows and
-  # the tree becomes interior-root + two leaves (the load-bearing interior-node + split proof).
+  # 20 rows. Through v51 they overflowed a 256-byte page and forced an interior root over two leaves;
+  # a v52 leaf holds them all (key column elided, shared key prefix, narrow offsets), so this is a
+  # one-leaf fixture and COMPACT_LEAF_TABLES / TALL_TREE carry the interior-node + split proof.
   # id 3 has a NULL value. Inserted in ascending key order (the tree shape is order-sensitive).
   rows: (1..20).map { |i| [i, i == 3 ? nil : i * 10] }
 }.freeze
+
+# `compact_leaf_table`: every v52 leaf form (format.md "Leaf node"). Table t is a fixed-key tree
+# whose two leading primary-key columns are elided, with a long shared key prefix, a dictionary
+# column (status), base-plus-offsets regions over a fixed-width numeric slot and a timestamp, packed
+# integer arrays (with NULLs and empty arrays), a mostly-NULL text column, and an index over status
+# that existed before the rows (so its tree is built by inserts in row order, not key order). Table
+# u has variable-length text keys with a shared prefix and a key directory, a column of one value
+# (offset width 0), and all-NULL columns. The cores build it via
+#   CREATE TABLE t (tenant i32, id i64, status text, amount numeric(10,2), ts timestamp,
+#                   tags i32[], note text, PRIMARY KEY (tenant, id));
+#   CREATE INDEX t_status_idx ON t (status);
+#   INSERT INTO t VALUES (7, 1000 + i, …) for i in 0...60, one statement each;
+#   CREATE TABLE u (name text PRIMARY KEY, n i16, flag boolean, z i32);
+#   INSERT INTO u VALUES ('user/alpha/NN', 5, NULL, NULL) for NN in 00...30.
+COMPACT_LEAF_TABLES = [
+  { name: "t",
+    columns: [col("tenant", "i32", pk: true), col("id", "i64", pk: true), col("status", "text"),
+              col("amount", "decimal", precision: 10, scale: 2), col("ts", "timestamp"),
+              col("tags", "i32[]"), col("note", "text")],
+    indexes: [{ name: "t_status_idx", cols: [2], insert_order: true }],
+    rows: (0...60).map do |i|
+      tags = case i % 10
+             when 0 then nil
+             when 1 then []
+             else [i % 5, i % 7]
+             end
+      [7, 1000 + i, %w[open closed void][i % 3], format("%d.%02d", 100 + i, i),
+       (1_704_067_200 + 60 * i) * 1_000_000, tags, i % 20 == 3 ? "n" : nil]
+    end },
+  { name: "u",
+    columns: [col("name", "text", pk: true), col("n", "i16"), col("flag", "boolean"), col("z", "i32")],
+    rows: (0...30).map { |i| [format("user/alpha/%02d", i), 5, nil, nil] } }
+].freeze
 
 # Statistics over a fixed-width `numeric(p,s)` column (format.md v51): the leaf holds `amt` as 4-byte
 # slots, while the statistics entries — a single-value context — hold each MCV value in the
@@ -1960,7 +2002,18 @@ end.freeze
 # the rejection is structural rather than a checksum mismatch. The cores must answer every one with
 # XX001 (suites/storage/malformed_*.test), never a crash, hang, or wrong rows; the decoder below
 # rejects the ones whose lie it can see (`reject:`). `wrong_tree_leaf` is the simulator's case: a
-# child pointer into another table's leaf, whose column layout differs.
+# child pointer into another table's leaf, whose column layout differs (its column directory has
+# five entries where t's has three, so the first no longer points past the directory).
+#
+# The structural cases need t's tree to be an interior root over several leaves. A v52 leaf holds
+# far more of these rows than a v51 one (the id is elided, the keys share a prefix), so the 20-row
+# PK_TABLE is a single leaf; this is the same table with 300 rows (ENC_PK_TABLE's content).
+MALFORMED_PK_TABLE = {
+  name: "t",
+  columns: [col("id", "i32", pk: true), col("v", "i16")],
+  rows: (1..300).map { |i| [i, i == 3 ? nil : i * 10] }
+}.freeze
+
 MALFORMED_SHAPE_TABLE = {
   name: "u",
   columns: [col("id", "i32", pk: true), col("a", "text"), col("b", "text"), col("c", "boolean")],
@@ -1974,11 +2027,11 @@ MALFORMED_FK_TYPE_TABLES = [
 ].freeze
 
 MALFORMED_FIXTURES = [
-  { file: "malformed_leaf_directory.jed", page_size: 256, tables: [PK_TABLE],
+  { file: "malformed_leaf_directory.jed", page_size: 256, tables: [MALFORMED_PK_TABLE],
     malformed: :leaf_directory, reject: true },
-  { file: "malformed_wrong_tree_leaf.jed", page_size: 256, tables: [PK_TABLE, MALFORMED_SHAPE_TABLE],
+  { file: "malformed_wrong_tree_leaf.jed", page_size: 256, tables: [MALFORMED_PK_TABLE, MALFORMED_SHAPE_TABLE],
     malformed: :wrong_tree_leaf, reject: true },
-  { file: "malformed_interior_cycle.jed", page_size: 256, tables: [PK_TABLE],
+  { file: "malformed_interior_cycle.jed", page_size: 256, tables: [MALFORMED_PK_TABLE],
     malformed: :interior_cycle, reject: true },
   { file: "malformed_decimal_group.jed", page_size: 256, tables: [DECIMAL_TABLE],
     malformed: :decimal_group, reject: true },
@@ -2062,6 +2115,7 @@ FIXTURES = ([
   { file: "bool_pk_table.jed",   page_size: 256, tables: [BOOL_PK_TABLE] },
   { file: "decimal_table.jed",   page_size: 256, tables: [DECIMAL_TABLE] },
   { file: "decimal_fixed_table.jed", page_size: 256, tables: [DECIMAL_FIXED_TABLE] },
+  { file: "compact_leaf_table.jed", page_size: 256, tables: COMPACT_LEAF_TABLES },
   { file: "bytea_table.jed",     page_size: 256, tables: [BYTEA_TABLE] },
   { file: "text_pk_table.jed",   page_size: 256, tables: [TEXT_PK_TABLE] },
   { file: "bytea_pk_table.jed",  page_size: 256, tables: [BYTEA_PK_TABLE] },
@@ -3253,10 +3307,14 @@ end
 # wrongly trusts it loses rows.
 def index_entries(table, ix)
   return [] if ix[:forged_empty]
-  table_entries(table).select { |_k, row| index_admits?(table, ix, row) }.map do |storage_key, row|
+  entries = table_entries(table).select { |_k, row| index_admits?(table, ix, row) }.map do |storage_key, row|
     key = index_entry_key(table, ix, storage_key, row)
     [key, { key: key, row: [], table: { columns: [] }, forms: [], comps: [], size: key.bytesize }]
-  end.sort_by { |key, _| key }
+  end
+  # `insert_order: true`: the index existed before its table's rows, which arrived in storage-key
+  # order, so its tree is the result of inserting the entries in that order (the tree shape is
+  # order-sensitive — format.md "Fan-out"). Otherwise the entries arrive in ascending entry-key order.
+  ix[:insert_order] ? entries : entries.sort_by { |key, _| key }
 end
 
 # A GIN index's (entry_key, record-plan) pairs in entry-key order (spec/design/gin.md §4): one
@@ -3692,18 +3750,18 @@ end
 # --- out-of-line large values (large-values.md §12) -------------------------
 
 # A fixed-width `numeric(p,s)` column (v51) is not spillable: its value is a slot, not a codec body.
-def spillable?(col) = %w[text bytea].include?(col[:type]) || (col[:type] == "decimal" && !fixed_decimal_width(col))
+def spillable?(col) = %w[text bytea json].include?(col[:type]) || (col[:type] == "decimal" && !fixed_decimal_width(col))
 # RECORD_MAX(K) = (C − max(12, 12+16K))/2 (format.md "Why the record cap"): the value is KEPT from
-# v23 (bplus-reshape.md §4.2), re-derived leaf-only — the v24 worst-case two-record leaf overhead
-# (all-variable, 12+13K) stays under the reserve. K=0 (index trees) is exact: 2·(C−12)/2 + 12 = C.
+# v23 (bplus-reshape.md §4.2), re-derived leaf-only — the v52 worst-case two-record leaf overhead
+# (all-variable with a key directory, 7+7K) stays under the reserve, and savings only lower a payload.
 def record_max(cap, k) = [(cap - [12, 12 + 16 * k].max) / 2, 0].max
 
-# The dense-slot width of a FIXED-WIDTH column's value body (format.md v24 "Leaf node"), or nil for
+# The dense-slot width of a FIXED-WIDTH column's value body (format.md "Record"), or nil for
 # a VARIABLE-WIDTH column (text/bytea/json/jsonb/composite/array/range and any decimal column that
 # is not `numeric(p,s)` with p <= 18 — the spillable set).
-# The class decides the column's leaf region shape: fixed regions are flags + null bitmap + dense
-# untagged slots; variable regions are flags + an end-offset value directory + tagged codec bytes
-# (NULL = a zero-length span).
+# The class decides the column's plain (kind 0) leaf region shape: fixed regions are kind + null
+# bitmap + dense untagged slots; variable regions are kind + a u16 end-offset value directory + the
+# values' leaf bytes (NULL = a zero-length span). v52 adds the other region kinds (encode_leaf_region).
 STORAGE_WIDTH = { "i16" => 2, "i32" => 4, "i64" => 8, "boolean" => 1, "uuid" => 16,
                   "timestamp" => 8, "timestamptz" => 8, "date" => 4, "interval" => 16,
                   "f64" => 8, "f32" => 4 }.freeze
@@ -3744,45 +3802,350 @@ def decode_fixed_decimal(col, bytes)
   render_decimal(u.negative?, col[:scale] || 0, u.abs)
 end
 
-# leaf_overhead(N, cols): a v24 leaf's payload beyond Σ record_size (format.md "Leaf node") — the
-# key directory (4N), the column directory (4(K+1)), and per region a flags byte plus the null
-# bitmap (fixed-width, ceil(N/8)) or the value directory (variable, 4N).
-def leaf_overhead(n, cols)
-  cols.sum(4 * n + 4 * (cols.size + 1)) do |c|
-    1 + (fixed_width(c) ? (n + 7) / 8 : 4 * n)
+# --- the compact leaf (format.md v52 "Leaf node" / "Fan-out") ---------------
+#
+# Column types by the leaf forms they admit. A string column's inline value is the bare tag 0x05 and
+# its bytes, and its region may be a dictionary (kind 2); a key-derivable primary-key column in the
+# leading run of its key is elided; a fixed-key table tree stores its key length once; an offset
+# column's region may be base plus offsets (kind 1); an integer-array column's may be packed (kind 4).
+STRING_TYPES = %w[text bytea json].freeze
+KEY_DERIVABLE_TYPES = %w[i16 i32 i64 date timestamp timestamptz boolean uuid].freeze
+FIXED_KEY_TYPES = (KEY_DERIVABLE_TYPES + %w[f32 f64 interval]).freeze
+OFFSET_TYPES = %w[i16 i32 i64 date timestamp timestamptz].freeze
+PACKED_ARRAY_WIDTH = { "i16[]" => 2, "i32[]" => 4, "i64[]" => 8 }.freeze
+TAG_INLINE_BARE = 0x05
+LEAF_FIXED_KEY = 1
+LEAF_KEY_PREFIX = 2
+REGION_PLAIN = 0
+REGION_OFFSETS = 1
+REGION_DICT = 2
+REGION_PACKED = 4
+
+# A table's columns as its leaves see them: copies, with `key_at` (the column's byte offset in the
+# key) on every ELIDED column — the leading run of key-derivable members of the primary key, in key
+# order (`pk` is the member ordinals in key order).
+def leaf_columns(columns, pk)
+  out = columns.map(&:dup)
+  at = 0
+  pk.each do |ci|
+    c = out[ci]
+    break unless c && KEY_DERIVABLE_TYPES.include?(c[:type])
+
+    c[:key_at] = at
+    at += STORAGE_WIDTH.fetch(c[:type])
+  end
+  out
+end
+
+LEAF_COLS_MEMO = {}.compare_by_identity
+# The leaf columns of a fixture table ([] for an index tree, whose record plans carry no columns).
+def leaf_table_cols(table)
+  return [] if table[:columns].empty?
+
+  LEAF_COLS_MEMO[table] ||= leaf_columns(table[:columns], pk_order(table))
+end
+
+# fixed_key (format.md "Leaf node"): a table tree whose keys all have one length — no primary key
+# (the 8-byte rowid) or only fixed-width scalar key members. An index tree never has it.
+def tree_fixed_key?(table)
+  return false unless table[:name]
+
+  pk_order(table).all? { |i| FIXED_KEY_TYPES.include?(table[:columns][i][:type]) }
+end
+
+def string_col?(c) = STRING_TYPES.include?(c[:type])
+def offset_col?(c) = !c[:key_at] && (OFFSET_TYPES.include?(c[:type]) || !fixed_decimal_width(c).nil?)
+def packed_width(c) = c[:type].is_a?(String) ? PACKED_ARRAY_WIDTH[c[:type]] : nil
+
+def be_uint(bytes) = bytes.each_byte.inject(0) { |a, b| (a << 8) | b }
+def be_bytes(v, w) = (0...w).map { |i| (v >> (8 * (w - 1 - i))) & 0xFF }.pack("C*")
+
+# leaf_overhead(N, cols): a leaf's payload beyond Σ record_size before the content-dependent savings
+# (format.md "Page model") — the flags byte, the key directory (2N, or the 2-byte key length of a
+# fixed-key tree), the column directory (2(K+1)), and per STORED region its kind byte plus the null
+# bitmap (fixed-width) or the value directory (variable, 2N). An elided column adds nothing.
+def leaf_overhead(n, cols, fixed_key)
+  cols.sum(1 + (fixed_key ? 2 : 2 * n) + 2 * (cols.size + 1)) do |c|
+    if c[:key_at] then 0
+    elsif fixed_width(c) then 1 + (n + 7) / 8
+    else 1 + 2 * n
+    end
   end
 end
 
-# The value columns of a leaf's records ([] for an index tree) — the leaf overhead needs their
-# classes. Derived from the record plan's table, so no extra threading.
-def leaf_cols(node) = node[:recs].empty? ? [] : node[:recs][0][:table][:columns]
+# The shared key prefix a leaf stores (format.md "Leaf node" item 3): the longest common prefix of
+# its smallest and largest key (its first and last — a forged leaf may hold them out of order),
+# capped at 65535, stored exactly when N >= 2 and N·L > L + 2. "" when not stored.
+def leaf_key_prefix(keys)
+  n = keys.size
+  return "".b if n < 2
+
+  lo, hi = keys.minmax
+  l = 0
+  l += 1 while l < lo.bytesize && l < hi.bytesize && l < 0xFFFF && lo.getbyte(l) == hi.getbyte(l)
+  n * l > l + 2 ? lo.byteslice(0, l) : "".b
+end
+
+# Kind 1 (base plus offsets) over a fixed-width region's slots (nil = NULL): [saving, base, bw].
+def offsets_plan(n, w, slots)
+  present = slots.compact.map { |s| be_uint(s) }
+  base = present.min || 0
+  d = (present.max || 0) - base
+  bw = if d.zero? then 0
+       elsif d < (1 << 8) then 1
+       elsif d < (1 << 16) then 2
+       elsif d < (1 << 32) then 4
+       else 8
+       end
+  saving = bw < w ? n * (w - bw) - (w + 1) : 0
+  [[saving, 0].max, base, bw]
+end
+
+# Kind 2 (dictionary) over a string region's spans ("" = NULL): [saving, entries, codes]. Two values
+# share an entry only when both are NULL or both inline-plain (0x05) with equal content; entries are
+# in order of first use; `dup` is the bytes of the spans that repeat an earlier entry.
+def dict_plan(n, spans)
+  entries = []
+  codes = []
+  shared = {}
+  null_at = nil
+  dup = 0
+  spans.each do |s|
+    bare = !s.empty? && s.getbyte(0) == TAG_INLINE_BARE
+    at = if s.empty? then null_at
+         elsif bare then shared[s]
+         end
+    if at.nil?
+      at = entries.size
+      entries << s
+      null_at = at if s.empty?
+      shared[s] = at if bare
+    else
+      dup += s.bytesize
+    end
+    codes << at
+  end
+  d = entries.size
+  saving = d <= 256 ? n - 2 - 2 * d + dup : 0
+  [[saving, 0].max, entries, codes]
+end
+
+# Kind 4 (packed integer arrays) over an integer-array region's spans: [saving, counts, elements,
+# base, bit width]. Saving 0 when any value is not NULL, the empty array, or an inline-plain array
+# of one dimension, lower bound 1, no NULL element and 1..254 elements.
+def packed_plan(n, w, spans)
+  counts = []
+  elems = []
+  e = 0
+  a = 0
+  spans.each do |s|
+    if s.empty?
+      counts << 255
+    elsif s == "\x00\x00\x00".b
+      counts << 0
+      e += 1
+    else
+      return [0] unless s.bytesize >= 11 && s.getbyte(0).zero? && s.getbyte(1) == 1 && s.getbyte(2).zero?
+
+      m = s.byteslice(3, 4).unpack1("N")
+      return [0] unless m.between?(1, 254) && s.byteslice(7, 4).unpack1("N") == 1 && s.bytesize == 11 + m * w
+
+      counts << m
+      a += 1
+      m.times { |j| elems << be_uint(s.byteslice(11 + j * w, w)) }
+    end
+  end
+  base = elems.min || 0
+  b = ((elems.max || 0) - base).bit_length
+  plain = 2 * n + 3 * e + 11 * a + elems.size * w
+  typed = n + w + 1 + (elems.size * b + 7) / 8
+  [[plain - typed, 0].max, counts, elems, base, b]
+end
+
+# One stored column region's bytes: the kind byte, then the kind's body. `vals[i]` is record i's
+# slot (fixed-width) or leaf span (variable), nil for NULL. A region takes kind 1, 2 or 4 exactly
+# when that kind applies to the column and its saving is positive.
+def encode_leaf_region(c, n, vals)
+  if (w = fixed_width(c))
+    bitmap = Array.new((n + 7) / 8, 0)
+    vals.each_with_index { |v, i| bitmap[i / 8] |= (0x80 >> (i % 8)) if v.nil? }
+    bitmap = bitmap.pack("C*")
+    plain = [REGION_PLAIN].pack("C") + bitmap + vals.map { |v| v || ("\x00".b * w) }.join.b
+    saving, base, bw = offset_col?(c) ? offsets_plan(n, w, vals) : [0]
+    return [plain, 0] unless saving.positive?
+
+    out = [REGION_OFFSETS].pack("C") + bitmap + be_bytes(base, w) + [bw].pack("C")
+    vals.each { |v| out << be_bytes(v.nil? ? 0 : be_uint(v) - base, bw) }
+    [out, saving]
+  else
+    spans = vals.map { |v| v || "".b }
+    off = 0
+    plain = [REGION_PLAIN].pack("C") + spans.map { |s| u16(off += s.bytesize) }.join.b + spans.join.b
+    if string_col?(c)
+      saving, entries, codes = dict_plan(n, spans)
+      return [plain, 0] unless saving.positive?
+
+      off = 0
+      out = [REGION_DICT].pack("C") + u16(entries.size) + entries.map { |s| u16(off += s.bytesize) }.join.b +
+            entries.join.b + codes.pack("C*")
+      [out, saving]
+    elsif (aw = packed_width(c))
+      saving, counts, elems, base, b = packed_plan(n, aw, spans)
+      return [plain, 0] unless saving.positive?
+
+      bits = elems.inject(0) { |acc, x| (acc << b) | (x - base) }
+      nbytes = (elems.size * b + 7) / 8
+      bits <<= nbytes * 8 - elems.size * b # MSB-first, the last byte zero-padded
+      out = [REGION_PACKED].pack("C") + counts.pack("C*") + be_bytes(base, aw) + [b].pack("C") + be_bytes(bits, nbytes)
+      [out, saving]
+    else
+      [plain, 0]
+    end
+  end
+end
+
+# A v52 leaf payload (format.md "Leaf node") from its keys and per-column values (`vals[c][i]`: the
+# slot or leaf span of record i, nil for NULL; ignored for an elided column): leaf flags | key
+# length (fixed-key) | prefix length + prefix | key directory (no fixed key) | stored keys | column
+# directory (K+1 absolute offsets) | the stored regions. Returns [payload, total saving].
+def encode_leaf(cols, keys, vals, fixed_key)
+  n = keys.size
+  k = cols.size
+  prefix = leaf_key_prefix(keys)
+  p = prefix.bytesize
+  saving = p.zero? ? 0 : n * p - p - 2
+  out = [(fixed_key ? LEAF_FIXED_KEY : 0) | (p.zero? ? 0 : LEAF_KEY_PREFIX)].pack("C")
+  if fixed_key
+    len = keys[0].bytesize
+    raise "a key's length is not its tree's fixed key length" unless len.positive? && keys.all? { |kb| kb.bytesize == len }
+    raise "a fixed-key leaf's prefix is the whole key" unless p < len
+
+    out << u16(len)
+  end
+  out << u16(p) << prefix unless p.zero?
+  unless fixed_key
+    off = 0
+    keys.each { |kb| out << u16(off += kb.bytesize - p) }
+  end
+  keys.each { |kb| out << kb.byteslice(p..) }
+  regions = cols.each_with_index.map do |c, ci|
+    next "".b if c[:key_at] # an elided key column: an empty region
+
+    bytes, s = encode_leaf_region(c, n, vals[ci])
+    saving += s
+    bytes
+  end
+  cur = out.bytesize + 2 * (k + 1)
+  starts = regions.map { |r| (cur += r.bytesize) - r.bytesize } << cur
+  raise "leaf payload exceeds a u16 offset" if cur > 0xFFFF + 1
+
+  starts.each { |s| out << u16(s) }
+  regions.each { |r| out << r }
+  [out, saving]
+end
+
+# The record_size contribution of one stored value (format.md "Record"): 0 for an elided column, the
+# width for a fixed-width one (NULL included), the span's bytes for a variable-width one (0 for NULL).
+def leaf_value_size(c, val)
+  return 0 if c[:key_at]
+
+  fixed_width(c) || (val.nil? ? 0 : val.bytesize)
+end
+
+# A leaf's payload size, measured by encoding it — and checked against the *Fan-out* formula
+# `Σ record_size + leafOverhead(N, cols) − saving(leaf)`, so the two statements of the size in
+# format.md are held to each other on every leaf this reference measures.
+def leaf_payload_size(cols, keys, vals, fixed_key)
+  payload, saving = encode_leaf(cols, keys, vals, fixed_key)
+  n = keys.size
+  records = keys.sum(&:bytesize) + cols.each_with_index.sum { |c, ci| (0...n).sum { |i| leaf_value_size(c, vals[ci][i]) } }
+  formula = records + leaf_overhead(n, cols, fixed_key) - saving
+  raise "leaf payload #{payload.bytesize} != formula #{formula}" unless payload.bytesize == formula
+
+  payload.bytesize
+end
+
+# The leaf columns of a node's records ([] for an index tree).
+def leaf_cols(node) = node[:recs].empty? ? [] : leaf_table_cols(node[:recs][0][:table])
+
+# A fixed-width column's slot for a present value: the untagged inline body, or a fixed-width
+# decimal's unscaled integer (v51).
+def fixed_slot(c, v)
+  fixed_decimal_width(c) ? encode_fixed_decimal(c, v) : encode_value(c[:type], v).byteslice(1..)
+end
+
+# An inline-plain value's leaf bytes: the bare tag 0x05 and the content for text / bytea / json (the
+# value directory gives the length), the tagged value codec for every other variable-width type.
+def leaf_inline(c, v)
+  string_col?(c) ? [TAG_INLINE_BARE].pack("C") + v.b : encode_value(c[:type], v)
+end
+
+# A record plan's values as the size rules see them, per leaf column: the slot or leaf span of each
+# stored value (nil for NULL), an external pointer standing in as zero bytes of its size (a
+# pointer's bytes never decide a leaf's size — it is always its own dictionary entry).
+def rec_measure_vals(rec)
+  rec[:mvals] ||= begin
+    cols = leaf_table_cols(rec[:table])
+    vals = cols.each_with_index.map do |c, ci|
+      v = rec[:row][ci]
+      if c[:key_at] || v.nil? then nil
+      elsif fixed_width(c) then fixed_slot(c, v)
+      else
+        case rec[:forms][ci]
+        when :external then [TAG_EXTERNAL].pack("C") + "\x00".b * (EXTERNAL_PTR_LEN - 1 + tag_len)
+        when :external_comp then [TAG_EXTERNAL_COMP].pack("C") + "\x00".b * (EXTERNAL_COMP_PTR_LEN - 1 + tag_len)
+        when :inline_comp
+          [TAG_INLINE_COMP].pack("C") + u32(value_payload(c[:type], v).bytesize) + u16(rec[:comps][ci].bytesize) + rec[:comps][ci]
+        else leaf_inline(c, v)
+        end
+      end
+    end
+    size = rec[:key].bytesize + cols.each_with_index.sum { |c, ci| leaf_value_size(c, vals[ci]) }
+    raise "record plan size #{rec[:size]} != record_size #{size}" unless size == rec[:size]
+
+    vals
+  end
+end
+
+# The payload size of a leaf holding these record plans.
+def recs_payload_size(recs)
+  table = recs[0][:table]
+  cols = leaf_table_cols(table)
+  mv = recs.map { |r| rec_measure_vals(r) }
+  vals = cols.each_index.map { |ci| mv.map { |m| m[ci] } }
+  leaf_payload_size(cols, recs.map { |r| r[:key] }, vals, tree_fixed_key?(table))
+end
 
 # A value's content payload P(v) — the bytes stored in the overflow chain when externalized: raw
 # UTF-8 / raw bytes for text/bytea, the decimal body for decimal (large-values.md §12).
 def value_payload(type, v)
   case type
-  when "text", "bytea" then v.b
+  when "text", "bytea", "json" then v.b
   when "decimal" then encode_decimal(v) # the body (no presence tag)
   else raise "only spillable values are externalized"
   end
 end
 
-# Decide each column's disposition for a record: [forms, comps, on-disk record size], where
+# Decide each column's disposition for a record of a table (its leaf columns: an elided key column
+# weighs nothing, an inline string 1 + len — v52): [forms, comps, on-disk record size], where
 # forms[i] is :inline / :inline_comp / :external / :external_comp and comps[i] holds the LZ4
 # block for a compressed form. Spill only when forced (record > RECORD_MAX); then COMPRESS the
 # largest eligible values first (store-smaller rule), then EXTERNALIZE the largest remaining —
 # both passes ties-by-column-index. Deterministic, mirrors the cores' plan_dispositions
 # (large-values.md §12/§13; format.md "Large values").
 def plan_record(table, key, row, cap)
-  cols = table[:columns]
-  # Each column's inline-plain contribution to record_size (the v24 basis — format.md "Record"):
-  # a fixed-width column always its width (NULL occupies a zero-filled slot); a variable column 0
-  # when NULL (a zero-length span) else its tagged inline encoding.
+  cols = leaf_table_cols(table)
+  # Each column's inline-plain contribution to record_size (format.md "Record"): an elided key
+  # column nothing; a fixed-width column always its width (NULL occupies a zero-filled slot); a
+  # variable column 0 when NULL (a zero-length span) else its inline leaf bytes (v52: a text /
+  # bytea / json value is the tag 0x05 and its content, 1 + len).
   inline = cols.each_with_index.map do |c, i|
-    if (w = fixed_width(c))
+    if c[:key_at]
+      0
+    elsif (w = fixed_width(c))
       w
     else
-      row[i].nil? ? 0 : encode_value(c[:type], row[i]).bytesize
+      row[i].nil? ? 0 : leaf_inline(c, row[i]).bytesize
     end
   end
   forms = Array.new(cols.size, :inline)
@@ -3846,8 +4209,8 @@ end
 # Emit one record's on-disk bytes (key_len | key | values), spilling external columns to overflow
 # pages drawn via `alloc` (large-values.md §12/§13). `rec` is a plan hash
 # { key:, row:, table:, forms:, comps: } from plan_record.
-# One value's on-disk body given its disposition (the value codec, unchanged across row-major and PAX):
-# inline-plain is encode_value; the large-value forms carry a pointer / inline block and allocate
+# One value's leaf bytes given its disposition: inline-plain is leaf_inline (v52: the bare 0x05 form
+# for text / bytea / json, else the value codec); the large-value forms carry a pointer / inline block and allocate
 # overflow chains via `alloc` (large-values.md §12/§13). `comp` is the LZ4 block for a compressed form.
 def emit_value(c, v, form, comp, cap, alloc, pages)
   case form
@@ -3863,7 +4226,7 @@ def emit_value(c, v, form, comp, cap, alloc, pages)
     first = write_overflow_chain(comp, cap, alloc, pages) # the chain carries the COMPRESSED block
     [TAG_EXTERNAL_COMP].pack("C") + u32(first) + u32(comp.bytesize) + u32(payload.bytesize) + tag_of(first)
   else
-    encode_value(c[:type], v)
+    leaf_inline(c, v)
   end
 end
 
@@ -3878,62 +4241,35 @@ def emit_interior(sep_keys, child_pages)
   out
 end
 
-# Emit a v24 leaf's payload COLUMN-MAJOR (format.md "Leaf node"): values are encoded in
-# (record, column) order (so overflow chains allocate deterministically), then assembled as
-# key dir (N end offsets) | key blob | col dir (K+1) | per region: flags byte, then null bitmap +
-# dense untagged slots (fixed-width) or an N-entry end-offset value directory + tagged bodies
-# (variable; NULL = a zero-length span). `recs` are record plans.
+# Emit a v52 leaf's payload (format.md "Leaf node"): values are produced in (record, column) order
+# (so overflow chains allocate deterministically), then assembled column-major by encode_leaf. An
+# elided key column stores nothing; the writer refuses a row whose key bytes differ from the value
+# body it is not storing. `recs` are record plans.
 def emit_leaf_pax(recs, cap, alloc, pages)
-  n = recs.size
-  cols = recs.empty? ? [] : recs[0][:table][:columns]
-  k = cols.size
-  keys = recs.map { |r| r[:key] }
-  val_bytes = Array.new(k) { Array.new(n) }
-  recs.each_with_index do |rec, i|
+  table = recs[0][:table]
+  cols = leaf_table_cols(table)
+  vals = Array.new(cols.size) { [] }
+  recs.each do |rec|
     cols.each_with_index do |c, ci|
       v = rec[:row][ci]
-      val_bytes[ci][i] =
-        if (w = fixed_width(c))
-          if v.nil?
-            "\x00".b * w                                 # a NULL slot is zero-filled
-          elsif fixed_decimal_width(c)
-            encode_fixed_decimal(c, v)                    # the unscaled integer (v51)
-          else
-            encode_value(c[:type], v).byteslice(1..)     # the untagged body
+      vals[ci] <<
+        if c[:key_at]
+          body = v.nil? ? nil : encode_value(c[:type], v).byteslice(1..)
+          unless body && rec[:key].byteslice(c[:key_at], body.bytesize) == body
+            raise "a key column's value is not recoverable from its key"
           end
-        elsif v.nil?
-          "".b # a zero-length span
-        else
-          emit_value(c, v, rec[:forms][ci], rec[:comps][ci], cap, alloc, pages)
+
+          nil
+        elsif v.nil? then nil # a zero-filled slot / a zero-length span
+        elsif fixed_width(c) then fixed_slot(c, v)
+        else emit_value(c, v, rec[:forms][ci], rec[:comps][ci], cap, alloc, pages)
         end
     end
   end
-  out = +"".b
-  off = 0
-  keys.each { |kb| off += kb.bytesize; out << u32(off) }               # key directory (end offsets)
-  keys.each { |kb| out << kb }                                          # key blob
-  base_after_col_dir = out.bytesize + 4 * (k + 1)
-  col_start = []
-  cur = base_after_col_dir
-  (0...k).each do |c|
-    col_start[c] = cur
-    cur += 1 + (fixed_width(cols[c]) ? (n + 7) / 8 : 4 * n) + val_bytes[c].sum(&:bytesize)
-  end
-  col_start[k] = cur
-  (0..k).each { |c| out << u32(col_start[c]) }                          # column directory
-  (0...k).each do |c|
-    out << "\x00".b                                                    # region flags (reserved)
-    if fixed_width(cols[c])
-      bitmap = Array.new((n + 7) / 8, 0)
-      recs.each_with_index { |rec, i| bitmap[i / 8] |= (0x80 >> (i % 8)) if rec[:row][c].nil? }
-      out << bitmap.pack("C*")
-    else
-      voff = 0
-      val_bytes[c].each { |vb| voff += vb.bytesize; out << u32(voff) } # value directory (end offsets)
-    end
-    val_bytes[c].each { |vb| out << vb }                               # value bodies / slots
-  end
-  out
+  payload, = encode_leaf(cols, recs.map { |r| r[:key] }, vals, tree_fixed_key?(table))
+  raise "emitted leaf differs in size from its measure" unless payload.bytesize == recs_payload_size(recs)
+
+  payload
 end
 
 # Lay catalog entries out on pages of capacity `cap` (format.md *Catalog*, v48): packed greedily,
@@ -4031,11 +4367,13 @@ def node_leaf?(node) = node[:children].empty?
 
 # A LEAF's `recs[i]` is the record PLAN for keys[i] — a hash { key:, row:, table:, forms:, comps:,
 # size: } whose `size` is the on-disk (post-spill) record size (large-values.md §12). The tree
-# splits on `size`; the actual pointer bytes (with allocated overflow pages) are emitted later by
+# splits on the leaf payload those plans give (v52: Σ size + overhead − the leaf's savings, measured
+# by recs_payload_size); the actual pointer bytes (with allocated overflow pages) are emitted later by
 # serialize_tree. An INTERIOR node has no recs (v24) — its payload is the separators themselves.
 def node_payload(node)
   if node_leaf?(node)
-    node[:recs].sum { |r| r[:size] } + leaf_overhead(node[:keys].size, leaf_cols(node))
+    # v52: Σ record_size + leafOverhead − saving(leaf), a function of the leaf's keys and rows.
+    recs_payload_size(node[:recs])
   else
     (4 + tag_len) * (node[:keys].size + 1) + 4 * node[:keys].size + node[:keys].sum(&:bytesize)
   end
@@ -4062,9 +4400,9 @@ end
 # keys[m] (no record leaves the leaf level) — [:split, left, sep_key, right]. An INTERIOR node
 # splits PUSH-UP — the median separator moves up, left keeps [0, m) + children [0, m], right
 # keeps [m+1, N) + children [m+1, N]; with N == 2 the split is pinned to m = 1, producing the
-# legal N = 0 right interior (the degenerate max-separator contract). This builder only inserts
-# in ascending key order (build_tree), so right_edge is always true here — the balanced arm is
-# implemented so the reference states the whole contract.
+# legal N = 0 right interior (the degenerate max-separator contract). A table tree and most index trees are built in ascending
+# key order (right_edge always true); an `insert_order` index (compact_leaf_table) inserts out of key
+# order and so takes the balanced arm.
 def split_node(node, cap, right_edge)
   payload = node_payload(node)
   return [:whole, node] if payload <= cap
@@ -4073,11 +4411,9 @@ def split_node(node, cap, right_edge)
   if node_leaf?(node)
     return [:whole, node] if n < 2 # a single over-cap record: unsupported, surfaces upstream
 
-    cols = leaf_cols(node)
-    prefix = [0]
-    node[:recs].each { |r| prefix << prefix.last + r[:size] }
-    leftp = ->(m) { prefix[m] + leaf_overhead(m, cols) }
-    rightp = ->(m) { (prefix[n] - prefix[m]) + leaf_overhead(n - m, cols) }
+    # Each half is measured with its own prefix, bases, widths and dictionaries (v52).
+    leftp = ->(m) { recs_payload_size(node[:recs][0, m]) }
+    rightp = ->(m) { recs_payload_size(node[:recs][m..]) }
     m = pick_split_m(1..(n - 1), payload, cap, right_edge, leftp, rightp)
     raise "unsplittable leaf (record over RECORD_MAX?)" if m.nil?
 
@@ -4447,11 +4783,19 @@ def malformed_fixture_image(fx)
   ps = fx[:page_size]
   image = build_image(fx[:types] || [], [], fx[:tables], ps)
   roots = table_root_pages(image, ps)
+  if %i[leaf_directory wrong_tree_leaf interior_cycle].include?(fx[:malformed])
+    raise "t's root must be an interior node" unless read_page(image, ps, roots["t"])[:type] == PAGE_INTERIOR
+  end
   case fx[:malformed]
   when :leaf_directory
-    # t's second leaf: its first key-directory end offset now runs past the page.
+    # t's second leaf: its first directory entry now runs past the page. t is a fixed-key tree
+    # (v52), whose leaves have no key directory, so the entry is the column directory's first.
     leaf = page_u32(image, ps, roots["t"], PAGE_HEADER + 4)
-    set_page_u32(image, ps, leaf, PAGE_HEADER, 0xFFFF_FFF0)
+    pg = read_page(image, ps, leaf)
+    cols = leaf_columns(MALFORMED_PK_TABLE[:columns], pk_order(MALFORMED_PK_TABLE))
+    _keys, _regions, info = parse_pax_leaf(pg[:payload], pg[:item_count], cols)
+    image[leaf * ps + PAGE_HEADER + info[:col_dir], 2] = u16(0xFFF0)
+    refresh_body_crc(image, ps, leaf)
   when :wrong_tree_leaf
     # t's second child pointer now names u's root leaf (two text columns and a boolean, not i16).
     set_page_u32(image, ps, roots["t"], PAGE_HEADER + 4, roots["u"])
@@ -5399,50 +5743,227 @@ def decode_composite_body(fields, buf, pos)
   [vals, pos]
 end
 
-# Parse a v24 PAX leaf payload (format.md "Leaf node") into [keys, regions]: keys[i] the i-th key;
-# regions[c] a class-shaped hash — { width:, bitmap:, body: } for a fixed-width column (bitmap the
-# raw null-bitmap bytes, body the dense slot bytes) or { ends:, body: } for a variable column
-# (ends the N end offsets, body the tagged value blob). `cols` are the table's column defs.
+# Parse a v52 leaf payload (format.md "Leaf node") into [keys, regions, info]: keys[i] the i-th FULL
+# key (the stored prefix restored); regions[c] a class-shaped hash in the PLAIN form whatever kind
+# the page stores — { width:, bitmap:, body: } for a fixed-width column (bitmap the null-bitmap
+# bytes, body the dense slots; an elided key column's slots rebuilt from the keys, `elided: true`)
+# or { ends:, body:, spans: } for a variable column (body the values in single-value-codec form —
+# an inline 0x05 string re-headed as 0x00 + u16 length — with their end offsets; spans the leaf
+# bytes of each value as stored or as the region's kind expands them). `cols` are the table's leaf
+# columns (leaf_columns). info = { flags:, key_len:, prefix:, col_dir: } (col_dir the payload offset
+# of the column directory). Every directory, code and extent is validated here.
 def parse_pax_leaf(payload, n, cols)
-  pos = 0
-  key_end = (0...n).map { |_| v = payload.byteslice(pos, 4).unpack1("N"); pos += 4; v }
-  raise "PAX leaf key directory not ascending" unless key_end.each_cons(2).all? { |a, b| a <= b }
+  size = payload.bytesize
+  rd16 = lambda do |at|
+    raise "PAX leaf directory overruns page" if at + 2 > size
 
-  key_blob = pos
-  raise "PAX leaf key blob overruns page" if key_blob + (key_end.last || 0) > payload.bytesize
-
-  keys = (0...n).map do |i|
-    lo = i.zero? ? 0 : key_end[i - 1]
-    payload.byteslice(key_blob + lo, key_end[i] - lo)
+    payload.byteslice(at, 2).unpack1("n")
   end
-  pos = key_blob + (n.zero? ? 0 : key_end[n - 1])
+  raise "PAX leaf has no flags byte" if size.zero?
+
+  flags = payload.getbyte(0)
+  raise "PAX leaf flags has a reserved bit set" unless (flags & ~(LEAF_FIXED_KEY | LEAF_KEY_PREFIX)).zero?
+
+  pos = 1
+  key_len = nil
+  if (flags & LEAF_FIXED_KEY) != 0
+    key_len = rd16.call(pos)
+    pos += 2
+    raise "PAX leaf fixed key length is zero" if key_len.zero?
+  end
+  prefix = "".b
+  if (flags & LEAF_KEY_PREFIX) != 0
+    p = rd16.call(pos)
+    pos += 2
+    raise "PAX leaf key prefix is empty" if p.zero?
+    raise "PAX leaf key prefix overruns page" if pos + p > size
+    raise "PAX leaf key prefix is not shorter than the fixed key" if key_len && p >= key_len
+
+    prefix = payload.byteslice(pos, p)
+    pos += p
+  end
+  if key_len
+    stride = key_len - prefix.bytesize
+    raise "PAX leaf key blob overruns page" if pos + n * stride > size
+
+    keys = (0...n).map { |i| prefix + payload.byteslice(pos + i * stride, stride) }
+    pos += n * stride
+  else
+    key_end = (0...n).map { |i| rd16.call(pos + 2 * i) }
+    pos += 2 * n
+    raise "PAX leaf key directory not ascending" unless key_end.each_cons(2).all? { |a, b| a <= b }
+    raise "PAX leaf key blob overruns page" if pos + (key_end.last || 0) > size
+
+    keys = (0...n).map do |i|
+      lo = i.zero? ? 0 : key_end[i - 1]
+      prefix + payload.byteslice(pos + lo, key_end[i] - lo)
+    end
+    pos += key_end.last || 0
+  end
   k = cols.size
-  col_start = (0..k).map { |_| v = payload.byteslice(pos, 4).unpack1("N"); pos += 4; v }
+  col_dir = pos
+  col_start = (0..k).map { |c| rd16.call(pos + 2 * c) }
+  pos += 2 * (k + 1)
   raise "PAX leaf column directory start mismatch" unless col_start[0] == pos
+  raise "PAX leaf column directory not ascending" unless col_start.each_cons(2).all? { |a, b| a <= b }
+  raise "PAX leaf column regions overrun page" if col_start[k] > size
 
   regions = cols.each_with_index.map do |c, ci|
-    start = col_start[ci]
-    flags = payload.getbyte(start)
-    raise "PAX leaf region flags has a reserved bit set" unless flags.zero?
+    region = payload.byteslice(col_start[ci], col_start[ci + 1] - col_start[ci])
+    w = fixed_width(c)
+    if c[:key_at]
+      raise "an elided key column has a region" unless region.empty?
+      raise "an elided key column lies outside its key" unless keys.all? { |kb| c[:key_at] + w <= kb.bytesize }
 
-    if (w = fixed_width(c))
-      bitmap = payload.byteslice(start + 1, (n + 7) / 8)
-      body = start + 1 + (n + 7) / 8
-      raise "fixed region extent mismatch" unless body + n * w == col_start[ci + 1]
+      next { width: w, bitmap: "\x00".b * ((n + 7) / 8), elided: true,
+             body: keys.map { |kb| kb.byteslice(c[:key_at], w) }.join.b }
+    end
+    raise "PAX leaf region has no kind byte" if region.empty?
 
-      { width: w, bitmap: bitmap, body: payload.byteslice(body, n * w) }
+    kind = region.getbyte(0)
+    if w
+      bm = (n + 7) / 8
+      raise "fixed region extent mismatch" if region.bytesize < 1 + bm
+
+      bitmap = region.byteslice(1, bm)
+      rest = region.byteslice((1 + bm)..)
+      null = ->(i) { (bitmap.getbyte(i / 8) & (0x80 >> (i % 8))) != 0 }
+      case kind
+      when REGION_PLAIN
+        raise "fixed region extent mismatch" unless rest.bytesize == n * w
+
+        { width: w, bitmap: bitmap, body: rest }
+      when REGION_OFFSETS
+        raise "base-plus-offsets region on a column it does not apply to" unless offset_col?(c)
+        raise "base-plus-offsets region extent mismatch" if rest.bytesize < w + 1
+
+        base = be_uint(rest.byteslice(0, w))
+        bw = rest.getbyte(w)
+        raise "base-plus-offsets offset width is invalid" unless [0, 1, 2, 4].include?(bw) && bw < w
+        raise "base-plus-offsets region extent mismatch" unless rest.bytesize == w + 1 + n * bw
+
+        body = (0...n).map do |i|
+          next "\x00".b * w if null.call(i)
+
+          v = base + be_uint(rest.byteslice(w + 1 + i * bw, bw))
+          raise "base-plus-offsets value overflows its width" if v >= (1 << (8 * w))
+
+          be_bytes(v, w)
+        end.join.b
+        { width: w, bitmap: bitmap, body: body }
+      else
+        raise "invalid region kind #{kind} for a fixed-width column"
+      end
     else
-      ends = (0...n).map { |i| payload.byteslice(start + 1 + i * 4, 4).unpack1("N") }
-      body = start + 1 + 4 * n
-      raise "variable region extent mismatch" unless body + (ends.last || 0) == col_start[ci + 1]
+      spans =
+        case kind
+        when REGION_PLAIN
+          raise "variable region extent mismatch" if region.bytesize < 1 + 2 * n
 
-      { ends: ends, body: payload.byteslice(body, (ends.last || 0)) }
+          ends = (0...n).map { |i| region.byteslice(1 + 2 * i, 2).unpack1("n") }
+          raise "variable region value directory not ascending" unless ends.each_cons(2).all? { |a, b| a <= b }
+          raise "variable region extent mismatch" unless 1 + 2 * n + (ends.last || 0) == region.bytesize
+
+          (0...n).map { |i| region.byteslice(1 + 2 * n + (i.zero? ? 0 : ends[i - 1]), ends[i] - (i.zero? ? 0 : ends[i - 1])) }
+        when REGION_DICT
+          raise "dictionary region on a column it does not apply to" unless string_col?(c)
+          raise "dictionary region extent mismatch" if region.bytesize < 3
+
+          d = region.byteslice(1, 2).unpack1("n")
+          raise "dictionary entry count out of range" unless d.between?(1, 256)
+          raise "dictionary region extent mismatch" if region.bytesize < 3 + 2 * d
+
+          ends = (0...d).map { |i| region.byteslice(3 + 2 * i, 2).unpack1("n") }
+          raise "dictionary directory not ascending" unless ends.each_cons(2).all? { |a, b| a <= b }
+          raise "dictionary region extent mismatch" unless 3 + 2 * d + ends.last + n == region.bytesize
+
+          entries = (0...d).map { |i| region.byteslice(3 + 2 * d + (i.zero? ? 0 : ends[i - 1]), ends[i] - (i.zero? ? 0 : ends[i - 1])) }
+          region.byteslice(3 + 2 * d + ends.last, n).each_byte.map do |code|
+            raise "dictionary code out of range" unless code < d
+
+            entries[code]
+          end
+        when REGION_PACKED
+          aw = packed_width(c)
+          raise "packed-array region on a column it does not apply to" unless aw
+          raise "packed-array region extent mismatch" if region.bytesize < 1 + n + aw + 1
+
+          counts = region.byteslice(1, n).unpack("C*")
+          base = be_uint(region.byteslice(1 + n, aw))
+          b = region.getbyte(1 + n + aw)
+          total = counts.sum { |m| m == 255 ? 0 : m }
+          raise "packed-array bit width is invalid" if b > 8 * aw
+          raise "packed-array region extent mismatch" unless region.bytesize == 1 + n + aw + 1 + (total * b + 7) / 8
+
+          bits = be_uint(region.byteslice((1 + n + aw + 1)..))
+          nbits = 8 * ((total * b + 7) / 8)
+          taken = 0
+          counts.map do |m|
+            next "".b if m == 255
+            next "\x00\x00\x00".b if m.zero?
+
+            out = "\x00\x01\x00".b + u32(m) + u32(1)
+            m.times do
+              taken += b
+              v = base + ((bits >> (nbits - taken)) & ((1 << b) - 1))
+              raise "packed-array element overflows its width" if v >= (1 << (8 * aw))
+
+              out << be_bytes(v, aw)
+            end
+            out
+          end
+        else
+          raise "invalid region kind #{kind} for a variable-width column"
+        end
+      body = +"".b
+      ends = spans.map do |s|
+        unless s.empty?
+          tag = s.getbyte(0)
+          if string_col?(c)
+            raise "a string column holds the tag 0x00" if tag.zero?
+          elsif tag == TAG_INLINE_BARE
+            raise "the tag 0x05 outside a string column"
+          end
+          raise "the tag 0x01 inside a leaf region" if tag == 0x01
+
+          body << (tag == TAG_INLINE_BARE ? "\x00".b + u16(s.bytesize - 1) + s.byteslice(1..) : s)
+        end
+        body.bytesize
+      end
+      { ends: ends, body: body, spans: spans }
     end
   end
-  [keys, regions]
+  [keys, regions, { flags: flags, key_len: key_len, prefix: prefix, col_dir: col_dir }]
 end
 
-# Decode value (record i, column c) from a parsed v24 leaf region: nil from the bitmap (fixed) or
+# The per-column values of a parsed leaf in encode_leaf's form: each record's slot or stored leaf
+# span, nil for NULL.
+def leaf_region_vals(regions, n)
+  regions.map do |r|
+    if r[:width]
+      (0...n).map { |i| (r[:bitmap].getbyte(i / 8) & (0x80 >> (i % 8))).zero? ? r[:body].byteslice(i * r[:width], r[:width]) : nil }
+    else
+      r[:spans].map { |s| s.empty? ? nil : s }
+    end
+  end
+end
+
+# Forge support: re-encode leaf `page` of a plaintext image after the block edits its keys and
+# per-column values in place (encode_leaf's forms), by the writer's own rules, resealing its
+# checksum. `cols` are the tree's leaf columns ([] for an index tree).
+def rewrite_leaf(image, ps, page, cols)
+  pg = read_page(image, ps, page)
+  keys, regions, info = parse_pax_leaf(pg[:payload], pg[:item_count], cols)
+  vals = leaf_region_vals(regions, keys.size)
+  yield keys, vals
+  payload, = encode_leaf(cols, keys, vals, (info[:flags] & LEAF_FIXED_KEY) != 0)
+  raise "rewritten leaf overflows the page" if payload.bytesize > ps - PAGE_HEADER
+
+  image[page * ps + PAGE_HEADER, ps - PAGE_HEADER] = payload + "\x00".b * (ps - PAGE_HEADER - payload.bytesize)
+  write_page(image, ps, page, PAGE_LEAF, keys.size, 0, "".b)
+end
+
+# Decode value (record i, column c) from a parsed leaf region (parse_pax_leaf's plain form): nil from the bitmap (fixed) or
 # the zero-length span (variable); a fixed slot is the untagged body (re-tagged for decode_value);
 # a variable span is the tagged codec bytes as-is.
 def leaf_value(region, col, i, fetch)
@@ -5511,8 +6032,8 @@ def read_tree_keys(image, ps, root_page)
     pg = read_page(image, ps, idx)
     case pg[:type]
     when PAGE_LEAF
-      # An index leaf is a v24 leaf with K=0 value columns: key directory + key blob + a 1-entry
-      # column directory. parse_pax_leaf returns the keys.
+      # An index leaf is a leaf with K=0 value columns: flags, optional prefix, key directory + key
+      # blob + a 1-entry column directory. parse_pax_leaf returns the keys.
       leaf_keys, = parse_pax_leaf(pg[:payload], pg[:item_count], [])
       leaf_keys.each { |kk| keys << kk }
     when PAGE_INTERIOR
@@ -5709,7 +6230,7 @@ def decode_unlocked(image, ps, meta)
       raise "unknown catalog entry kind #{kind}" unless kind.zero?
 
       entry, pos = decode_table_entry(payload, pos)
-      rows = read_tree_rows(image, ps, entry[:root_data_page], entry[:columns])
+      rows = read_tree_rows(image, ps, entry[:root_data_page], leaf_columns(entry[:columns], entry[:pk]))
       raise "persisted row_count does not match decoded rows" unless entry[:row_count] == rows.length
       indexes = entry[:indexes].map do |ix|
         raw = if ix[:kind] == "gist"
@@ -5842,7 +6363,7 @@ def expected_tables(fx)
           # The decoded key options (nil when the index writes none — every element ASC NULLS LAST).
           orders = index_orders(ix).any? { |o| o != [false, false] } ? index_orders(ix).map { |o| ORDER_SYMBOLS.key(o) } : nil
           { name: ix[:name], cols: ix[:cols], timezone_deps: ix[:timezone_deps], orders: orders,
-            entries: ent.map { |key, _| key.unpack1("H*") } }
+            entries: ent.map { |key, _| key }.sort.map { |key| key.unpack1("H*") } } # a tree walk is in key order
         end
       end,
       rows: table_entries(t).map { |_key, row| row } }

@@ -10,21 +10,21 @@
             "kind": "page_corrupt",
             "database": "main",
             "object": "t",
-            "page": 9,
+            "page": 6,
             "key": null
           },
           {
             "kind": "page_reached_twice",
             "database": "main",
             "object": "t_v_idx",
-            "page": 9,
+            "page": 6,
             "key": null
           }
         ],
         "truncated": false,
         "skipped": [],
-        "pages": 11,
-        "rows": 33
+        "pages": 7,
+        "rows": 21
       }
     },
     {
@@ -36,14 +36,14 @@
             "kind": "page_corrupt",
             "database": "main",
             "object": "t",
-            "page": 9,
+            "page": 6,
             "key": null
           },
           {
             "kind": "page_reached_twice",
             "database": "main",
             "object": "t_v_idx",
-            "page": 9,
+            "page": 6,
             "key": null
           }
         ],
@@ -54,8 +54,8 @@
             "reason": "table_unreadable"
           }
         ],
-        "pages": 11,
-        "rows": 33
+        "pages": 7,
+        "rows": 21
       }
     }
   ]

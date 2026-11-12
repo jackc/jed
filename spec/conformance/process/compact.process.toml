@@ -17,7 +17,7 @@ sql = "CREATE TABLE t (id i64 PRIMARY KEY, pad text)"
 [[step]]
 actor = "a"
 command = "exec"
-sql = "INSERT INTO t SELECT g, repeat('x', 300) FROM generate_series(1, 2000) g"
+sql = "INSERT INTO t SELECT g, rpad(g::text, 302, 'x') FROM generate_series(1, 2000) g"
 
 [[step]]
 actor = "a"
@@ -71,7 +71,7 @@ retry_ms = 2000
 [[step]]
 actor = "a"
 command = "page_count"
-expect = "9"
+expect = "8"
 
 [[step]]
 actor = "a"

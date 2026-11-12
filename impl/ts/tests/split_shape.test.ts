@@ -20,9 +20,10 @@ function cost(db: Engine, sql: string): bigint {
   return execute(db, sql).cost;
 }
 
-// A 121-row table at the fixture page size (256): id bigint pk, v integer = id % 7.
-// Ascending inserts pks 0..120 in order; shuffled inserts the permutation (i*37) mod
-// 121 — deterministic, identical in every core. Each database is a fresh file in this run's scratch
+// A 1210-row table at the fixture page size (256): id bigint pk, v integer = id % 7.
+// Ascending inserts pks 0..1209 in order; shuffled inserts the permutation (i*37) mod
+// 1210 — deterministic, identical in every core. (121 rows until format v52, whose leaves hold
+// about ten times as many of these rows.) Each database is a fresh file in this run's scratch
 // directory, removed whole after the last test.
 const scratch = mkdtempSync(join(tmpdir(), "split-shape-"));
 after(() => rmSync(scratch, { recursive: true, force: true }));
@@ -31,8 +32,8 @@ let dbSeq = 0;
 function splitShapeDb(shuffled: boolean): Engine {
   const db = create(join(scratch, `t${dbSeq++}.jed`), { pageSize: 256 });
   execute(db, "CREATE TABLE t (id bigint PRIMARY KEY, v integer)");
-  for (let i = 0; i < 121; i++) {
-    const pk = shuffled ? (i * 37) % 121 : i;
+  for (let i = 0; i < 1210; i++) {
+    const pk = shuffled ? (i * 37) % 1210 : i;
     execute(db, `INSERT INTO t VALUES (${pk}, ${pk % 7})`);
   }
   return db;
@@ -46,18 +47,18 @@ test("split shape costs are pinned", () => {
   // (268/278/156) with the v24 B+tree (format.md): interior nodes are a record-free
   // separator skeleton with far higher fan-out, so a full scan touches fewer pages.
   const asc = splitShapeDb(false);
-  assert.equal(cost(asc, "SELECT count(*) FROM t"), 258n);
+  assert.equal(cost(asc, "SELECT count(*) FROM t"), 2436n);
   const shuf = splitShapeDb(true);
-  assert.equal(cost(shuf, "SELECT count(*) FROM t"), 265n);
+  assert.equal(cost(shuf, "SELECT count(*) FROM t"), 2443n);
 
   // Sorted index build (indexes.md §1) packs the index tree like the ascending case;
   // the build charges only its table scan, and the bounded lookup's cost pins the
-  // index path's shape (pk ≡ 3 mod 7 in [0,120] ⇒ 17 admitted rows for v = 3). The
+  // index path's shape (pk ≡ 3 mod 7 in [0,1209] ⇒ 173 admitted rows for v = 3). The
   // lookup rose from v23's 100: a B+tree point lookup always descends to a leaf
   // (interior records could terminate a v23 descent early), so each of the 17 table
-  // fetches pays the full root→leaf path.
-  assert.equal(cost(shuf, "CREATE INDEX t_v_idx ON t (v)"), 143n);
-  assert.equal(cost(shuf, "SELECT id FROM t WHERE v = 3"), 105n);
+  // fetches pays the full root→leaf path. Re-pinned for format v52 (the compact leaf).
+  assert.equal(cost(shuf, "CREATE INDEX t_v_idx ON t (v)"), 1232n);
+  assert.equal(cost(shuf, "SELECT id FROM t WHERE v = 3"), 1045n);
 
   // The complete INSERT mutation guard: the committed shape above already contains table-leaf and
   // table-interior splits plus a split secondary index. In one working root, overwrite an existing
@@ -65,12 +66,12 @@ test("split shape costs are pinned", () => {
   // node counts through cost. Rollback must restore the byte-exact committed image and original costs.
   const before = toImage(shuf, 256, 1n);
   const tx = begin(shuf, true);
-  execute(shuf, "UPDATE t SET v = 42 WHERE id = 120");
-  for (let id = 121; id <= 220; id++) execute(shuf, `INSERT INTO t VALUES (${id}, ${id % 7})`);
-  assert.equal(cost(shuf, "SELECT count(*) FROM t"), 477n);
-  assert.equal(cost(shuf, "SELECT id FROM t WHERE v = 3"), 199n);
+  execute(shuf, "UPDATE t SET v = 42 WHERE id = 1209");
+  for (let id = 1210; id <= 2209; id++) execute(shuf, `INSERT INTO t VALUES (${id}, ${id % 7})`);
+  assert.equal(cost(shuf, "SELECT count(*) FROM t"), 4456n);
+  assert.equal(cost(shuf, "SELECT id FROM t WHERE v = 3"), 1909n);
   tx.rollback();
   assert.deepEqual(toImage(shuf, 256, 1n), before, "rollback changed the committed image");
-  assert.equal(cost(shuf, "SELECT count(*) FROM t"), 265n);
-  assert.equal(cost(shuf, "SELECT id FROM t WHERE v = 3"), 105n);
+  assert.equal(cost(shuf, "SELECT count(*) FROM t"), 2443n);
+  assert.equal(cost(shuf, "SELECT id FROM t WHERE v = 3"), 1045n);
 });

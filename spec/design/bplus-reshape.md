@@ -183,6 +183,12 @@ when B1 lands; this fixes the model the bytes must realize.
 
 ### 4.1 Node layouts (`format_version` 24)
 
+> **Superseded for leaves by format v52** ([leaf-structural.md](leaf-structural.md); format.md
+> *Leaf node*): 16-bit directories, a leaf flags byte, elided key columns, and content-dependent
+> regions, so a leaf's payload is `Σ record_size + leafOverhead − savings` and §4.2's split scan
+> measures each half with its own savings. The interior layout and the split/merge structure below
+> are unchanged.
+
 - **Leaf (`page_type` 2)** — holds records (key + all column values). The **v23 PAX column-major
   *shape* carries over** (key directory ‖ key blob ‖ column directory ‖ per-column regions):
   leaves are already the good part. Two changes. (a) *Which* records are here — **all of

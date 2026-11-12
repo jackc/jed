@@ -45,7 +45,7 @@ function backupFixture(path: string): Database {
     // growAndShrink (compact.test.ts): 2000 wide rows, all but 100 deleted.
     "CREATE TABLE t (id i64 PRIMARY KEY, pad text, n i64)",
     "CREATE INDEX t_n ON t (n)",
-    "INSERT INTO t SELECT g, repeat('x', 300), g % 7 FROM generate_series(1, 2000) g",
+    "INSERT INTO t SELECT g, lpad(g::text, 300, 'x'), g % 7 FROM generate_series(1, 2000) g",
     "DELETE FROM t WHERE id > 100",
     "CREATE TABLE big (id i64 PRIMARY KEY, body text)",
     "INSERT INTO big SELECT g, (SELECT string_agg(md5((g * 1000 + k)::text), '') FROM generate_series(1, 300) k) FROM generate_series(1, 20) g",

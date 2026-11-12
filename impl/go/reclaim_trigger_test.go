@@ -20,7 +20,7 @@ func triggerChurnSQL(k int) string {
 	return fmt.Sprintf("UPDATE t SET pad = 'r%d' WHERE id = 500", k)
 }
 
-const triggerSetupSQL = "INSERT INTO t SELECT g, 'pad-pad-pad-pad-pad-pad-pad-pad' FROM generate_series(1, 1000) g"
+const triggerSetupSQL = "INSERT INTO t SELECT g, 'pad-pad-pad-pad-pad-pad-pad-pad' || g::text FROM generate_series(1, 1000) g"
 
 // assertFewWalks checks that the churn walked a small fraction of its commits: one walk per commit
 // is the high-water regression.

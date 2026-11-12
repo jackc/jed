@@ -1203,6 +1203,62 @@ fn decimal_table_db() -> Session {
     db
 }
 
+/// Every v52 leaf form (format.md "Leaf node"). Table `t`: a fixed-key tree whose two leading
+/// primary-key columns are elided, a long shared key prefix, a dictionary column (`status`),
+/// base-plus-offsets over a fixed-width numeric slot and a timestamp, packed integer arrays (with
+/// NULLs and empty arrays), a mostly-NULL text column, and an index over `status`. Table `u`:
+/// variable-length text keys with a shared prefix and a key directory, a column of one value
+/// (offset width 0), and all-NULL columns. Rows are inserted in key order, one statement each.
+fn compact_leaf_table_db() -> Session {
+    let mut db = Database::create(CreateOptions {
+        environment: golden_env(),
+        page_size: GOLDEN_PAGE_SIZE,
+        ..Default::default()
+    })
+    .unwrap()
+    .session(SessionOptions::default());
+    run(
+        &mut db,
+        "CREATE TABLE t (tenant i32, id i64, status text, amount numeric(10,2), ts timestamp, \
+         tags i32[], note text, PRIMARY KEY (tenant, id))",
+    );
+    run(&mut db, "CREATE INDEX t_status_idx ON t (status)");
+    let statuses = ["open", "closed", "void"];
+    for i in 0..60 {
+        let tags = match i % 10 {
+            0 => "NULL".to_string(),
+            1 => "'{}'".to_string(),
+            _ => format!("ARRAY[{}, {}]", i % 5, i % 7),
+        };
+        let note = if i % 20 == 3 { "'n'" } else { "NULL" };
+        run(
+            &mut db,
+            &format!(
+                "INSERT INTO t VALUES (7, {}, '{}', {}.{:02}, '2024-01-01 {:02}:{:02}:00', {}, {})",
+                1000 + i,
+                statuses[i % 3],
+                100 + i,
+                i,
+                i / 60,
+                i % 60,
+                tags,
+                note
+            ),
+        );
+    }
+    run(
+        &mut db,
+        "CREATE TABLE u (name text PRIMARY KEY, n i16, flag boolean, z i32)",
+    );
+    for i in 0..30 {
+        run(
+            &mut db,
+            &format!("INSERT INTO u VALUES ('user/alpha/{i:02}', 5, NULL, NULL)"),
+        );
+    }
+    db
+}
+
 /// Fixed-width stored `numeric(p,s)` (format.md v51): a 2-byte `numeric(4,2)`, a 4-byte
 /// `numeric(9,0)`, and an 8-byte `numeric(18,6)` slot column beside a `numeric(19,2)` column, which
 /// keeps the variable-width codec. Each column's extremes, zero, a NULL, and a second leaf.
@@ -2226,6 +2282,7 @@ fn write_matches_goldens() {
         ("bool_pk_table.jed", bool_pk_table_db),
         ("decimal_table.jed", decimal_table_db),
         ("decimal_fixed_table.jed", decimal_fixed_table_db),
+        ("compact_leaf_table.jed", compact_leaf_table_db),
         ("bytea_table.jed", bytea_table_db),
         ("text_pk_table.jed", text_pk_table_db),
         ("bytea_pk_table.jed", bytea_pk_table_db),
@@ -2340,6 +2397,8 @@ fn read_goldens_reproduces_rows() {
         ("bool_pk_table.jed", bool_pk_table_db, "t"),
         ("decimal_table.jed", decimal_table_db, "t"),
         ("decimal_fixed_table.jed", decimal_fixed_table_db, "t"),
+        ("compact_leaf_table.jed", compact_leaf_table_db, "t"),
+        ("compact_leaf_table.jed", compact_leaf_table_db, "u"),
         ("bytea_table.jed", bytea_table_db, "t"),
         ("text_pk_table.jed", text_pk_table_db, "t"),
         ("bytea_pk_table.jed", bytea_pk_table_db, "t"),

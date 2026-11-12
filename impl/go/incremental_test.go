@@ -246,7 +246,7 @@ func TestCommitPreallocatesFileGrowthGeometrically(t *testing.T) {
 	pad := strings.Repeat("p", 3500)
 	mustExec(t, db, "BEGIN")
 	for i := 0; i < 400; i++ {
-		mustExec(t, db, fmt.Sprintf("INSERT INTO t VALUES (%d, '%s')", i, pad))
+		mustExec(t, db, fmt.Sprintf("INSERT INTO t VALUES (%d, '%d%s')", i, i, pad)) // distinct: no shared dictionary entry
 	}
 	mustExec(t, db, "COMMIT")
 

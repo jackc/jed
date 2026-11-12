@@ -201,6 +201,8 @@ struct Visit {
 struct TableCtx<'t> {
     table: &'t Table,
     col_types: Arc<Vec<ColType>>,
+    /// The data tree's leaf shape, which its leaf pages are decoded against.
+    shape: Arc<crate::format::LeafShape>,
     colls: Vec<Option<Arc<Collation>>>,
     pk: Vec<(usize, Type)>,
 }
@@ -468,12 +470,8 @@ impl Checker<'_> {
         let root = store.tree_root().map_or(PageRef::NONE, |n| n.page_ref());
         let rows = Cell::new(0u64);
         let stopped = Cell::new(false);
-        let readable = self.walk_btree(
-            &table.name,
-            root,
-            &ctx.col_types,
-            true,
-            &mut |c, page, node| {
+        let readable =
+            self.walk_btree(&table.name, root, &ctx.shape, true, &mut |c, page, node| {
                 for i in 0..node.len() {
                     c.poll()?;
                     c.report.rows += 1;
@@ -483,8 +481,7 @@ impl Checker<'_> {
                     }
                 }
                 Ok(())
-            },
-        )?;
+            })?;
         let table_ok = readable && !stopped.get();
         if table_ok && store.count() != Some(rows.get() as i64) {
             let detail = format!(
@@ -626,7 +623,7 @@ impl Checker<'_> {
         &mut self,
         object: &str,
         root: PageRef,
-        col_types: &Arc<Vec<ColType>>,
+        shape: &Arc<crate::format::LeafShape>,
         mark: bool,
         leaf: &mut dyn FnMut(&mut Self, u32, &Node) -> Step<()>,
     ) -> Step<bool> {
@@ -654,8 +651,7 @@ impl Checker<'_> {
                 self.add(kinds::PAGE_CORRUPT, Some(object), Some(page), None, detail)?;
                 continue;
             }
-            let read = match crate::format::integrity_read_tree_page(self.paging, v.page, col_types)
-            {
+            let read = match crate::format::integrity_read_tree_page(self.paging, v.page, shape) {
                 Ok(read) => read,
                 Err(e) if mark => {
                     let detail = corrupt_message(e)?;
@@ -899,12 +895,12 @@ impl Checker<'_> {
                     .index_store(&idx.name)
                     .tree_root()
                     .map_or(PageRef::NONE, |n| n.page_ref());
-                let no_columns = Arc::new(Vec::new());
+                let no_columns = crate::format::index_shape();
                 let gin = kind == IndexKind::Gin;
                 let mut entries = 0u64;
                 let mut runs_ok = true;
                 let walked =
-                    self.walk_btree(&idx.name, root, &no_columns, true, &mut |c, page, node| {
+                    self.walk_btree(&idx.name, root, no_columns, true, &mut |c, page, node| {
                         if !gin {
                             entries += node.len() as u64;
                             return Ok(());
@@ -988,7 +984,7 @@ impl Checker<'_> {
         self.walk_btree(
             &ctx.table.name,
             root,
-            &ctx.col_types,
+            &ctx.shape,
             false,
             &mut |c, page, node| {
                 for i in 0..node.len() {
@@ -1123,7 +1119,7 @@ impl Checker<'_> {
         self.walk_btree(
             &ctx.table.name,
             root,
-            &ctx.col_types,
+            &ctx.shape,
             false,
             &mut |c, page, node| {
                 for i in 0..node.len() {
@@ -1309,9 +1305,9 @@ impl Checker<'_> {
             .index_store(&idx.name)
             .tree_root()
             .map_or(PageRef::NONE, |n| n.page_ref());
-        let no_columns = Arc::new(Vec::new());
+        let no_columns = crate::format::index_shape();
         let mut prev: Option<Vec<u8>> = None;
-        self.walk_btree(&idx.name, root, &no_columns, false, &mut |c, _, node| {
+        self.walk_btree(&idx.name, root, no_columns, false, &mut |c, _, node| {
             for i in 0..node.len() {
                 c.poll()?;
                 let entry = node.key_at(i);
@@ -1531,6 +1527,7 @@ fn table_ctx<'t>(snap: &'t Snapshot, table: &'t Table) -> TableCtx<'t> {
     TableCtx {
         table,
         col_types: Arc::new(snap.store(&table.name).col_types().to_vec()),
+        shape: snap.store(&table.name).shape().clone(),
         colls: table
             .columns
             .iter()

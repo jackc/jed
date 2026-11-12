@@ -31,12 +31,12 @@ pub type Row = Vec<Value>;
 /// mutation of `rows`). A store with no `paging` (in-memory) builds none and never faults.
 struct PagedSource<'a> {
     paging: &'a Arc<SharedPaging>,
-    col_types: &'a Arc<Vec<ColType>>,
+    shape: &'a Arc<crate::format::LeafShape>,
 }
 
 impl LeafSource for PagedSource<'_> {
     fn load_leaf(&self, page: crate::format::PageRef) -> Result<Arc<Node>> {
-        self.paging.fault_leaf(page, self.col_types)
+        self.paging.fault_leaf(page, self.shape)
     }
 
     fn prefetches(&self) -> bool {
@@ -44,7 +44,7 @@ impl LeafSource for PagedSource<'_> {
     }
 
     fn prefetch(&self, pages: &[crate::format::PageRef]) {
-        self.paging.prefetch_leaves(pages, self.col_types);
+        self.paging.prefetch_leaves(pages, self.shape);
     }
 }
 
@@ -69,14 +69,14 @@ impl StoreScan {
     /// LIMIT short-circuit, cost.md §3). The returned row is **owned** (cloned out), eviction-safe
     /// under demand paging (pager.md §4), exactly like [`PMap::iter`].
     pub(crate) fn next(&mut self) -> Result<Option<(Vec<u8>, Row)>> {
-        let src = make_src(&self.store.paging, &self.store.col_types);
+        let src = make_src(&self.store.paging, &self.store.shape);
         let src_ref = src.as_ref().map(|s| s as &dyn LeafSource);
         self.cursor.next(src_ref)
     }
 
     /// SELECT's row-only pull: identical traversal without cloning an unused storage key.
     pub(crate) fn next_row(&mut self) -> Result<Option<Row>> {
-        let src = make_src(&self.store.paging, &self.store.col_types);
+        let src = make_src(&self.store.paging, &self.store.shape);
         let src_ref = src.as_ref().map(|s| s as &dyn LeafSource);
         self.cursor.next_row(src_ref)
     }
@@ -85,7 +85,7 @@ impl StoreScan {
     /// window's recycled rows, extensibility.md §4.2.1): `false` at the end. On error `out` holds a
     /// partial row the caller must discard.
     pub(crate) fn next_row_into(&mut self, out: &mut Row) -> Result<bool> {
-        let src = make_src(&self.store.paging, &self.store.col_types);
+        let src = make_src(&self.store.paging, &self.store.shape);
         let src_ref = src.as_ref().map(|s| s as &dyn LeafSource);
         self.cursor.next_row_into(src_ref, out)
     }
@@ -146,12 +146,9 @@ fn string_payload(ty: &ColType) -> bool {
 /// to be mutated alongside it.
 fn make_src<'a>(
     paging: &'a Option<Arc<SharedPaging>>,
-    col_types: &'a Arc<Vec<ColType>>,
+    shape: &'a Arc<crate::format::LeafShape>,
 ) -> Option<PagedSource<'a>> {
-    paging.as_ref().map(|p| PagedSource {
-        paging: p,
-        col_types,
-    })
+    paging.as_ref().map(|p| PagedSource { paging: p, shape })
 }
 
 /// A single table's rows, keyed by encoded primary key. Cloning is O(1) and yields an
@@ -174,7 +171,7 @@ pub struct TableStore {
     /// The leaf column-class shape (`{fixed, var}` counts — spec/fileformat/format.md v24 "Leaf
     /// node"), derived once from `col_types`: the B+tree's leaf-overhead arithmetic needs it on
     /// every size-driven split/merge decision without seeing the types themselves.
-    shape: crate::format::LeafShape,
+    shape: Arc<crate::format::LeafShape>,
     /// The shared pager + leaf buffer pool for a **file-backed** database (spec/design/pager.md):
     /// the read/mutation path faults `OnDisk` leaves through it. `None` for an in-memory database
     /// and for a table created in-session (fully resident until the file is reopened); attached by
@@ -205,12 +202,34 @@ impl TableStore {
     /// A new empty store for a table whose columns have the given resolved types, serializing at
     /// page payload `cap` (= `page_size − 16`). In-memory (no paging) until [`attach_paging`].
     pub(crate) fn new(cap: crate::format::Cap, col_types: Vec<ColType>) -> Self {
-        let shape = crate::format::leaf_shape(&col_types);
+        Self::with_shape(cap, Arc::new(crate::format::LeafShape::plain(col_types)))
+    }
+
+    /// A new empty store for a **table**'s data tree: `pk` is its primary key's member ordinals in
+    /// key order (empty for a table keyed by its synthetic rowid). The key decides the leaf layout
+    /// (spec/fileformat/format.md "Leaf node"): whether keys have one length, and which leading
+    /// key columns a leaf does not store.
+    pub(crate) fn new_table(
+        cap: crate::format::Cap,
+        col_types: Vec<ColType>,
+        pk: &[usize],
+    ) -> Self {
+        Self::with_shape(
+            cap,
+            Arc::new(crate::format::LeafShape::table(col_types, pk)),
+        )
+    }
+
+    /// A new empty store for a tree of this leaf shape.
+    pub(crate) fn with_shape(
+        cap: crate::format::Cap,
+        shape: Arc<crate::format::LeafShape>,
+    ) -> Self {
         TableStore {
             rows: PMap::new(),
             next_rowid: 0,
             cap,
-            col_types: Arc::new(col_types),
+            col_types: shape.col_types.clone(),
             shape,
             paging: None,
             staged: 0,
@@ -229,7 +248,7 @@ impl TableStore {
             next_rowid: self.next_rowid,
             cap: self.cap,
             col_types: self.col_types.clone(),
-            shape: self.shape,
+            shape: self.shape.clone(),
             paging: self.paging.clone(),
             staged: 0,
             staged_keys: PMap::new(),
@@ -257,7 +276,7 @@ impl TableStore {
     fn weight(&self, key: &[u8], row: &Row) -> (u32, i64) {
         let memo = self.memo.upgrade();
         let (size, stored) =
-            crate::format::record_footprint(&self.col_types, key, row, self.cap, memo.as_deref());
+            crate::format::record_footprint(&self.shape, key, row, self.cap, memo.as_deref());
         (size as u32, stored as i64)
     }
 
@@ -268,12 +287,12 @@ impl TableStore {
         let (w, stored) = self.weight(&key, &row); // full `&self` borrow — before the leaf source
         // The tree takes the key; staging names it only while staged keys are recorded.
         let staged_key = if self.net { key.clone() } else { Vec::new() };
-        let src = make_src(&self.paging, &self.col_types);
+        let src = make_src(&self.paging, &self.shape);
         let src_ref = src.as_ref().map(|s| s as &dyn LeafSource);
         // One descent both finds an existing key and inserts an absent one.
         if !self
             .rows
-            .insert_absent(key, row, w, self.cap, self.shape, src_ref)?
+            .insert_absent(key, row, w, self.cap, &self.shape, src_ref)?
         {
             return Ok(false);
         }
@@ -343,7 +362,7 @@ impl TableStore {
                 c: STAGED_KEYS_CAP,
                 tag: 0,
             },
-            crate::format::leaf_shape(&[]),
+            crate::format::index_shape(),
             None,
         )?;
         self.staged = self.staged.saturating_add(stored) - staged_of(old);
@@ -361,7 +380,7 @@ impl TableStore {
                 c: STAGED_KEYS_CAP,
                 tag: 0,
             },
-            crate::format::leaf_shape(&[]),
+            crate::format::index_shape(),
             None,
         )?;
         self.staged -= staged_of(old);
@@ -394,21 +413,21 @@ impl TableStore {
     pub fn replace(&mut self, key: &[u8], row: Row) -> Result<()> {
         let (w, stored) = self.weight(key, &row);
         self.stage(key, stored)?;
-        let src = make_src(&self.paging, &self.col_types);
+        let src = make_src(&self.paging, &self.shape);
         let src_ref = src.as_ref().map(|s| s as &dyn LeafSource);
         self.rows
-            .insert(key.to_vec(), row, w, self.cap, self.shape, src_ref)?;
+            .insert(key.to_vec(), row, w, self.cap, &self.shape, src_ref)?;
         Ok(())
     }
 
     /// Remove the row at `key` (DELETE). Returns whether a row was present. May fault leaves the
     /// delete descends into / rebalances against.
     pub fn remove(&mut self, key: &[u8]) -> Result<bool> {
-        let src = make_src(&self.paging, &self.col_types);
+        let src = make_src(&self.paging, &self.shape);
         let src_ref = src.as_ref().map(|s| s as &dyn LeafSource);
         let removed = self
             .rows
-            .remove(key, self.cap, self.shape, src_ref)?
+            .remove(key, self.cap, &self.shape, src_ref)?
             .is_some();
         if removed {
             self.unstage(key)?;
@@ -419,7 +438,7 @@ impl TableStore {
     /// Look up a row by its exact encoded key. Returns an **owned** row — under demand paging the
     /// holding leaf may live only in the buffer pool (spec/design/pager.md §4, [`PMap::get`]).
     pub fn get(&self, key: &[u8]) -> Result<Option<Row>> {
-        let src = make_src(&self.paging, &self.col_types);
+        let src = make_src(&self.paging, &self.shape);
         let src_ref = src.as_ref().map(|s| s as &dyn LeafSource);
         self.rows.get(key, src_ref)
     }
@@ -428,7 +447,7 @@ impl TableStore {
     /// [`PMap::iter`]). Eager: leaves fault through the pool during the walk and are dropped as their
     /// rows are copied out, so the resident leaf set stays bounded by the pool, not the table.
     pub fn iter_in_key_order(&self) -> Result<Vec<Row>> {
-        let src = make_src(&self.paging, &self.col_types);
+        let src = make_src(&self.paging, &self.shape);
         let src_ref = src.as_ref().map(|s| s as &dyn LeafSource);
         Ok(self
             .rows
@@ -456,7 +475,7 @@ impl TableStore {
     ) -> crate::format::ScanUnits {
         let mut mask = vec![false; self.col_types.len()];
         mask[column] = true;
-        crate::format::record_scan_units(&self.col_types, key, row, self.cap, &mask)
+        crate::format::record_scan_units(&self.shape, key, row, self.cap, &mask)
     }
 
     pub(crate) fn height(&self) -> usize {
@@ -467,7 +486,7 @@ impl TableStore {
     /// [`PMap::iter`]). Used by the executor's UPDATE/DELETE scan and the on-disk free-list rowid
     /// reconstruction (spec/fileformat/format.md). Eager; bounded resident leaves as `iter_in_key_order`.
     pub fn iter_entries(&self) -> Result<Vec<(Vec<u8>, Row)>> {
-        let src = make_src(&self.paging, &self.col_types);
+        let src = make_src(&self.paging, &self.shape);
         let src_ref = src.as_ref().map(|s| s as &dyn LeafSource);
         self.rows.iter(src_ref)
     }
@@ -475,7 +494,7 @@ impl TableStore {
     /// The `(encoded key, row)` pairs whose primary key lies within the bound, in key order (the
     /// mutation paths need the keys to remove/replace).
     pub(crate) fn range_entries(&self, b: &KeyBound) -> Result<Vec<(Vec<u8>, Row)>> {
-        let src = make_src(&self.paging, &self.col_types);
+        let src = make_src(&self.paging, &self.shape);
         let src_ref = src.as_ref().map(|s| s as &dyn LeafSource);
         self.rows.range_entries(b, src_ref)
     }
@@ -513,7 +532,7 @@ impl TableStore {
         let mut pages = 0usize;
         let mut slabs = 0usize;
         let mut visit = |node: &crate::pmap::Node, i: usize| -> Result<()> {
-            let u = node.record_scan_units(i, &self.col_types, self.cap, mask);
+            let u = node.record_scan_units(i, &self.shape, self.cap, mask);
             pages += u.pages;
             slabs += u.decompress;
             Ok(())
@@ -554,13 +573,13 @@ impl TableStore {
         b: &KeyBound,
         mask: &[bool],
     ) -> Result<(Vec<(Vec<u8>, Row)>, usize, usize)> {
-        let src = make_src(&self.paging, &self.col_types);
+        let src = make_src(&self.paging, &self.shape);
         let src_ref = src.as_ref().map(|s| s as &dyn LeafSource);
         let (entries, mut pages) = self.rows.range_entries_counted(b, src_ref)?;
         let mut slabs = 0usize;
         if crate::format::any_spillable_masked(&self.col_types, mask) {
             for (k, row) in &entries {
-                let u = crate::format::record_scan_units(&self.col_types, k, row, self.cap, mask);
+                let u = crate::format::record_scan_units(&self.shape, k, row, self.cap, mask);
                 pages += u.pages;
                 slabs += u.decompress;
             }
@@ -589,7 +608,7 @@ impl TableStore {
         b: &KeyBound,
         visit: &mut dyn FnMut(&crate::pmap::Node, usize) -> Result<()>,
     ) -> (usize, usize, Result<()>) {
-        let src = make_src(&self.paging, &self.col_types);
+        let src = make_src(&self.paging, &self.shape);
         let src_ref = src.as_ref().map(|s| s as &dyn LeafSource);
         self.rows.fold_scan(b, src_ref, visit)
     }
@@ -603,14 +622,14 @@ impl TableStore {
         key: &[u8],
         mask: &[bool],
     ) -> Result<(Option<Row>, usize, usize)> {
-        let src = make_src(&self.paging, &self.col_types);
+        let src = make_src(&self.paging, &self.shape);
         let src_ref = src.as_ref().map(|s| s as &dyn LeafSource);
         let (row, mut pages, _rows_reconstructed) = self.rows.get_counted(key, src_ref)?;
         let mut slabs = 0usize;
         if let Some(row) = &row
             && crate::format::any_spillable_masked(&self.col_types, mask)
         {
-            let units = crate::format::record_scan_units(&self.col_types, key, row, self.cap, mask);
+            let units = crate::format::record_scan_units(&self.shape, key, row, self.cap, mask);
             pages += units.pages;
             slabs = units.decompress;
         }
@@ -643,7 +662,7 @@ impl TableStore {
         if !crate::format::any_spillable(&self.col_types) {
             return 0;
         }
-        crate::format::record_compress_units(&self.col_types, key, row, self.cap, memo)
+        crate::format::record_compress_units(&self.shape, key, row, self.cap, memo)
     }
 
     /// Whether `row` holds an unfetched large-value reference in any column `mask` selects —
@@ -739,8 +758,7 @@ impl TableStore {
         if !row.iter().any(|v| matches!(v, Value::Unfetched(_))) {
             return Ok(());
         }
-        let kept =
-            crate::format::deferred_in_stored_form(&self.col_types, key, row, self.cap, memo);
+        let kept = crate::format::deferred_in_stored_form(&self.shape, key, row, self.cap, memo);
         for (i, v) in row.iter_mut().enumerate() {
             if let Value::Unfetched(u) = v
                 && !kept[i]
@@ -822,7 +840,7 @@ impl TableStore {
         b: &KeyBound,
         visit: &mut dyn FnMut(&[u8], &Row) -> Result<bool>,
     ) -> Result<()> {
-        let src = make_src(&self.paging, &self.col_types);
+        let src = make_src(&self.paging, &self.shape);
         let src_ref = src.as_ref().map(|s| s as &dyn LeafSource);
         self.rows.scan_range(b, src_ref, visit)
     }
@@ -835,7 +853,7 @@ impl TableStore {
         b: &KeyBound,
         visit: &mut dyn FnMut(&[u8], &Row) -> Result<bool>,
     ) -> Result<()> {
-        let src = make_src(&self.paging, &self.col_types);
+        let src = make_src(&self.paging, &self.shape);
         let src_ref = src.as_ref().map(|s| s as &dyn LeafSource);
         self.rows.scan_range_rev(b, src_ref, visit)
     }
@@ -905,7 +923,7 @@ impl TableStore {
         {
             return;
         }
-        match paging.fault_leaf(page, &self.col_types) {
+        match paging.fault_leaf(page, &self.shape) {
             Ok(fresh) => self.rows.replace_root(fresh),
             Err(_) => paging.pager().poison(),
         }
@@ -920,13 +938,18 @@ impl TableStore {
             .paging
             .as_ref()
             .expect("an OnDisk leaf implies a paged store");
-        paging.fault_leaf(page, &self.col_types)
+        paging.fault_leaf(page, &self.shape)
     }
 
     /// The table's resolved column types — the value codec's input on every serialize/decode path
     /// (spec/design/composite.md §4). Empty for an index store (records are the key alone).
     pub(crate) fn col_types(&self) -> &[ColType] {
         &self.col_types
+    }
+
+    /// The tree's leaf shape: its column types and the key facts the leaf layout follows.
+    pub(crate) fn shape(&self) -> &Arc<crate::format::LeafShape> {
+        &self.shape
     }
 
     /// The page payload capacity `C` — the divisor of the per-record large-value scan units

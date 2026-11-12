@@ -864,7 +864,7 @@ impl Snapshot {
         self.bump_cat_gen();
         let key = table.name.to_string();
         let cap = self.cap_for(page_size);
-        let mut st = TableStore::new(cap, col_types);
+        let mut st = TableStore::new_table(cap, col_types, table.pk_indices());
         // Bind the domain's pager (`Snapshot::store_paging`) so the new store demand-pages like a
         // loaded one: its committed leaves demote at each commit (`demote_clean_leaves`) and fault
         // back through the pool, instead of staying fully-resident decoded for the handle's lifetime.
@@ -1440,7 +1440,7 @@ impl Snapshot {
         paging: &std::sync::Arc<crate::paging::SharedPaging>,
     ) -> Snapshot {
         let empty = |store: &TableStore| {
-            let mut fresh = TableStore::new(cap, store.col_types().to_vec());
+            let mut fresh = TableStore::with_shape(cap, store.shape().clone());
             fresh.bump_rowid_to(store.next_rowid());
             fresh.attach_paging(std::sync::Arc::clone(paging));
             fresh

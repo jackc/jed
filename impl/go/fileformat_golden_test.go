@@ -712,6 +712,40 @@ func decimalFixedTableDB(t *testing.T) *Session {
 	return db
 }
 
+// compactLeafTableDB exercises every v52 leaf form (format.md "Leaf node"). Table t: a fixed-key
+// tree whose two leading primary-key columns are elided, a long shared key prefix, a dictionary
+// column (status), base-plus-offsets over a fixed-width numeric slot and a timestamp, packed integer
+// arrays (with NULLs and empty arrays), a mostly-NULL text column, and an index over status. Table u:
+// variable-length text keys with a shared prefix and a key directory, a column of one value (offset
+// width 0), and all-NULL columns. Rows are inserted in key order, one statement each.
+func compactLeafTableDB(t *testing.T) *Session {
+	db := newInMemoryWithPageSize(goldenPageSize, goldenEnv()).Session(SessionOptions{})
+	run(t, db, "CREATE TABLE t (tenant i32, id i64, status text, amount numeric(10,2), ts timestamp, "+
+		"tags i32[], note text, PRIMARY KEY (tenant, id))")
+	run(t, db, "CREATE INDEX t_status_idx ON t (status)")
+	statuses := []string{"open", "closed", "void"}
+	for i := 0; i < 60; i++ {
+		tags := fmt.Sprintf("ARRAY[%d, %d]", i%5, i%7)
+		switch i % 10 {
+		case 0:
+			tags = "NULL"
+		case 1:
+			tags = "'{}'"
+		}
+		note := "NULL"
+		if i%20 == 3 {
+			note = "'n'"
+		}
+		run(t, db, fmt.Sprintf("INSERT INTO t VALUES (7, %d, '%s', %d.%02d, '2024-01-01 %02d:%02d:00', %s, %s)",
+			1000+i, statuses[i%3], 100+i, i, i/60, i%60, tags, note))
+	}
+	run(t, db, "CREATE TABLE u (name text PRIMARY KEY, n i16, flag boolean, z i32)")
+	for i := 0; i < 30; i++ {
+		run(t, db, fmt.Sprintf("INSERT INTO u VALUES ('user/alpha/%02d', 5, NULL, NULL)", i))
+	}
+	return db
+}
+
 // byteaTableDB exercises the value codec's bytea branch (u16 length + raw bytes): a multi-
 // byte value (a-f hex), the empty byte string, embedded 0x00 bytes, a high byte (0xFF), a
 // NULL, and a lone 0x00. The PK stays i32 (no bytea key this slice). Literals are the `\x`
@@ -1231,6 +1265,7 @@ func TestWriteMatchesGoldens(t *testing.T) {
 		{"bool_pk_table.jed", boolPKTableDB},
 		{"decimal_table.jed", decimalTableDB},
 		{"decimal_fixed_table.jed", decimalFixedTableDB},
+		{"compact_leaf_table.jed", compactLeafTableDB},
 		{"bytea_table.jed", byteaTableDB},
 		{"text_pk_table.jed", textPKTableDB},
 		{"bytea_pk_table.jed", byteaPKTableDB},
@@ -1299,6 +1334,13 @@ func TestWriteMatchesGoldens(t *testing.T) {
 		image, err := c.build(t).ToImage(goldenPageSize, 1)
 		if err != nil {
 			t.Fatalf("%s: serialize: %v", c.name, err)
+		}
+		if dir := os.Getenv("JED_WRITE_GOLDENS"); dir != "" {
+			// Provisional goldens for a format change, until the Ruby reference regenerates them.
+			if err := os.WriteFile(filepath.Join(dir, c.name), image, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			continue
 		}
 		if want := fixture(t, c.name); !bytes.Equal(image, want) {
 			t.Errorf("%s: serialized bytes differ (got %d B, want %d B)", c.name, len(image), len(want))

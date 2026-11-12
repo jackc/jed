@@ -25,7 +25,7 @@ const PAGE = 8192n;
 const is = (code: string) => (e: unknown) => e instanceof EngineError && e.code() === code;
 
 function batch(lo: number, n: number): string {
-  return `INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(${lo}, ${lo + n - 1}) g`;
+  return `INSERT INTO t SELECT g, lpad(g::text, 1000, 'x') FROM generate_series(${lo}, ${lo + n - 1}) g`;
 }
 
 test("storage limit options and gauge", () => {
@@ -182,7 +182,7 @@ test("file attachment storage limit", () => {
     // A multi-root commit rejected in the file attachment publishes neither database.
     s.execute("BEGIN");
     s.execute(batch(0, 10));
-    s.execute("INSERT INTO f.a SELECT g, repeat('y', 1000) FROM generate_series(1, 100) g");
+    s.execute("INSERT INTO f.a SELECT g, lpad(g::text, 1000, 'y') FROM generate_series(1, 100) g");
     assert.throws(() => s.execute("COMMIT"), is("54P06"));
     assert.equal(host.storageBytes("main"), main);
     assert.equal(host.storageBytes("f"), aux);
@@ -212,7 +212,7 @@ test("multi-root rejection packs no attachment", () => {
   const aux = db.storageBytes("aux");
   db.setMaxStorageBytes("main", main);
   s.execute("BEGIN");
-  s.execute("INSERT INTO aux.a SELECT g, repeat('y', 1000) FROM generate_series(1, 50) g");
+  s.execute("INSERT INTO aux.a SELECT g, lpad(g::text, 1000, 'y') FROM generate_series(1, 50) g");
   s.execute(batch(0, 50));
   assert.throws(() => s.execute("COMMIT"), is("54P06"));
   // Main is rejected after the attachment's precheck, before any domain packs a page.

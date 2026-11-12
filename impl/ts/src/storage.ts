@@ -40,7 +40,7 @@ function stringPayload(ty: ColType): boolean {
 }
 
 // The reusable span scratch for laneScanUnits (single-threaded).
-const LANE_SPAN: Span = { start: 0, end: 0 };
+const LANE_SPAN: Span = { buf: new Uint8Array(0), start: 0, end: 0 };
 
 // STAGED_SHAPE is the leaf shape of a store's staged-key map: no value columns (memory.md §7.1).
 const STAGED_SHAPE: LeafShape = leafShape([]);
@@ -106,9 +106,10 @@ export class TableStore {
   // (recordSize).
   private cap: Cap;
   private colTypes: ColType[];
-  // shape is the leaf column-class shape ({fixed, var} counts — format.md v24 "Leaf node"), derived
-  // once from colTypes: the B+tree's leaf-overhead arithmetic needs it on every size-driven
-  // split/merge decision without seeing the types themselves.
+  // shape is the leaf shape (the stored column-class counts, the tree's fixed key length, and the
+  // sizer of content-dependent savings — format.md "Leaf node" / "Fan-out"), derived once from
+  // colTypes: the B+tree's size arithmetic needs it on every size-driven split/merge decision
+  // without seeing the types themselves.
   private shape: LeafShape;
   // paging is the shared pager + leaf buffer pool for a file-backed database (spec/design/pager.md):
   // the read/mutation path faults OnDisk leaves through it. null for an in-memory database and for a
@@ -139,10 +140,13 @@ export class TableStore {
     rows: PMap = new PMap(),
     nextRowid = 0n,
     paging: SharedPaging | null = null,
+    keyLen = 0,
   ) {
     this.cap = cap;
     this.colTypes = colTypes;
-    this.shape = leafShape(colTypes);
+    // keyLen is the one length of every key of the tree (a table whose primary key is fixed-length,
+    // format.ts tableKeyLen), or 0 when keys vary (an index tree).
+    this.shape = leafShape(colTypes, keyLen);
     this.rows = rows;
     this.nextRowid = nextRowid;
     this.paging = paging;
@@ -158,6 +162,7 @@ export class TableStore {
       this.rows.clone(),
       this.nextRowid,
       this.paging,
+      this.shape.keyLen,
     );
     store.staged = this.staged;
     store.stagedKeys = this.stagedKeys.clone();
@@ -169,9 +174,22 @@ export class TableStore {
   // an ON COMMIT DELETE ROWS temp table (spec/design/temp-tables.md §5.1). The synthetic rowid counter
   // carries over (it is monotonic, never reused); nothing is staged, since nothing is written.
   truncated(): TableStore {
-    const store = new TableStore(this.cap, this.colTypes, new PMap(), this.nextRowid, this.paging);
+    const store = new TableStore(
+      this.cap,
+      this.colTypes,
+      new PMap(),
+      this.nextRowid,
+      this.paging,
+      this.shape.keyLen,
+    );
     store.net = this.net;
     return store;
+  }
+
+  // leafKeyLen is the one length of every key of this store's tree, or 0 when keys vary (format.md
+  // "Leaf node", fixed_key).
+  leafKeyLen(): number {
+    return this.shape.keyLen;
   }
 
   // stagedBytes is the net stored bytes of the versions written since this store was last published
@@ -543,7 +561,7 @@ export class TableStore {
       this.laneUnitTypes = this.colTypes;
     }
     for (const c of cols) {
-      if (p.span(i, c, span)) spanScanUnits(p.payload, span.start, span.end, this.cap, units);
+      if (p.span(i, c, span)) spanScanUnits(span.buf, span.start, span.end, this.cap, units);
     }
   }
 

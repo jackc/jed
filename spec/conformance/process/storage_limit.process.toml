@@ -24,77 +24,77 @@ argument = "163840"
 [[step]]
 actor = "a"
 command = "exec"
-sql = "INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(0, 9) g"
+sql = "INSERT INTO t SELECT g, rpad(g::text, 1002, 'x') FROM generate_series(0, 9) g"
 
 [[step]]
 actor = "a"
 command = "exec"
-sql = "INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(10, 19) g"
+sql = "INSERT INTO t SELECT g, rpad(g::text, 1002, 'x') FROM generate_series(10, 19) g"
 
 [[step]]
 actor = "a"
 command = "exec"
-sql = "INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(20, 29) g"
+sql = "INSERT INTO t SELECT g, rpad(g::text, 1002, 'x') FROM generate_series(20, 29) g"
 
 [[step]]
 actor = "a"
 command = "exec"
-sql = "INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(30, 39) g"
+sql = "INSERT INTO t SELECT g, rpad(g::text, 1002, 'x') FROM generate_series(30, 39) g"
 
 [[step]]
 actor = "a"
 command = "exec"
-sql = "INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(40, 49) g"
+sql = "INSERT INTO t SELECT g, rpad(g::text, 1002, 'x') FROM generate_series(40, 49) g"
 
 [[step]]
 actor = "a"
 command = "exec"
-sql = "INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(50, 59) g"
+sql = "INSERT INTO t SELECT g, rpad(g::text, 1002, 'x') FROM generate_series(50, 59) g"
 
 [[step]]
 actor = "a"
 command = "exec"
-sql = "INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(60, 69) g"
+sql = "INSERT INTO t SELECT g, rpad(g::text, 1002, 'x') FROM generate_series(60, 69) g"
 
 [[step]]
 actor = "a"
 command = "exec"
-sql = "INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(70, 79) g"
+sql = "INSERT INTO t SELECT g, rpad(g::text, 1002, 'x') FROM generate_series(70, 79) g"
 
 [[step]]
 actor = "a"
 command = "exec"
-sql = "INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(80, 89) g"
+sql = "INSERT INTO t SELECT g, rpad(g::text, 1002, 'x') FROM generate_series(80, 89) g"
 
 [[step]]
 actor = "a"
 command = "exec"
-sql = "INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(90, 99) g"
+sql = "INSERT INTO t SELECT g, rpad(g::text, 1002, 'x') FROM generate_series(90, 99) g"
 
 [[step]]
 actor = "a"
 command = "exec"
-sql = "INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(100, 109) g"
+sql = "INSERT INTO t SELECT g, rpad(g::text, 1002, 'x') FROM generate_series(100, 109) g"
 
 [[step]]
 actor = "a"
 command = "exec"
-sql = "INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(110, 119) g"
+sql = "INSERT INTO t SELECT g, rpad(g::text, 1002, 'x') FROM generate_series(110, 119) g"
 
 [[step]]
 actor = "a"
 command = "exec"
-sql = "INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(120, 129) g"
+sql = "INSERT INTO t SELECT g, rpad(g::text, 1002, 'x') FROM generate_series(120, 129) g"
 
 [[step]]
 actor = "a"
 command = "exec"
-sql = "INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(130, 139) g"
+sql = "INSERT INTO t SELECT g, rpad(g::text, 1002, 'x') FROM generate_series(130, 139) g"
 
 [[step]]
 actor = "a"
 command = "exec"
-sql = "INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(140, 149) g"
+sql = "INSERT INTO t SELECT g, rpad(g::text, 1002, 'x') FROM generate_series(140, 149) g"
 expect_error = "54P06"
 
 [[step]]
@@ -143,83 +143,83 @@ argument = "163840"
 [[step]]
 actor = "a"
 command = "exec"
-sql = "INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(0, 9) g"
+sql = "INSERT INTO t SELECT g, rpad(g::text, 1002, 'x') FROM generate_series(0, 9) g"
 
 [[step]]
 actor = "b"
 command = "exec"
-sql = "INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(10, 19) g"
+sql = "INSERT INTO t SELECT g, rpad(g::text, 1002, 'x') FROM generate_series(10, 19) g"
 
 [[step]]
 actor = "a"
 command = "exec"
-sql = "INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(20, 29) g"
+sql = "INSERT INTO t SELECT g, rpad(g::text, 1002, 'x') FROM generate_series(20, 29) g"
 
 [[step]]
 actor = "b"
 command = "exec"
-sql = "INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(30, 39) g"
+sql = "INSERT INTO t SELECT g, rpad(g::text, 1002, 'x') FROM generate_series(30, 39) g"
 
 [[step]]
 actor = "a"
 command = "exec"
-sql = "INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(40, 49) g"
+sql = "INSERT INTO t SELECT g, rpad(g::text, 1002, 'x') FROM generate_series(40, 49) g"
 
 [[step]]
 actor = "b"
 command = "exec"
-sql = "INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(50, 59) g"
+sql = "INSERT INTO t SELECT g, rpad(g::text, 1002, 'x') FROM generate_series(50, 59) g"
 
 [[step]]
 actor = "a"
 command = "exec"
-sql = "INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(60, 69) g"
+sql = "INSERT INTO t SELECT g, rpad(g::text, 1002, 'x') FROM generate_series(60, 69) g"
 
 [[step]]
 actor = "b"
 command = "exec"
-sql = "INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(70, 79) g"
+sql = "INSERT INTO t SELECT g, rpad(g::text, 1002, 'x') FROM generate_series(70, 79) g"
 
 [[step]]
 actor = "a"
 command = "exec"
-sql = "INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(80, 89) g"
+sql = "INSERT INTO t SELECT g, rpad(g::text, 1002, 'x') FROM generate_series(80, 89) g"
 
 [[step]]
 actor = "b"
 command = "exec"
-sql = "INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(90, 99) g"
+sql = "INSERT INTO t SELECT g, rpad(g::text, 1002, 'x') FROM generate_series(90, 99) g"
 
 [[step]]
 actor = "a"
 command = "exec"
-sql = "INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(100, 109) g"
+sql = "INSERT INTO t SELECT g, rpad(g::text, 1002, 'x') FROM generate_series(100, 109) g"
 
 [[step]]
 actor = "b"
 command = "exec"
-sql = "INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(110, 119) g"
+sql = "INSERT INTO t SELECT g, rpad(g::text, 1002, 'x') FROM generate_series(110, 119) g"
 
 [[step]]
 actor = "a"
 command = "exec"
-sql = "INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(120, 129) g"
+sql = "INSERT INTO t SELECT g, rpad(g::text, 1002, 'x') FROM generate_series(120, 129) g"
 
 [[step]]
 actor = "b"
 command = "exec"
-sql = "INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(130, 139) g"
+sql = "INSERT INTO t SELECT g, rpad(g::text, 1002, 'x') FROM generate_series(130, 139) g"
 
 [[step]]
 actor = "a"
 command = "exec"
-sql = "INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(140, 149) g"
+sql = "INSERT INTO t SELECT g, rpad(g::text, 1002, 'x') FROM generate_series(140, 149) g"
 expect_error = "54P06"
 
 [[step]]
 actor = "b"
 command = "exec"
-sql = "INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(140, 149) g"
+sql = "INSERT INTO t SELECT g, rpad(g::text, 1002, 'x') FROM generate_series(140, 149) g"
 expect_error = "54P06"
 
 [[step]]
@@ -258,12 +258,12 @@ expect = "90112"
 [[step]]
 actor = "a"
 command = "exec"
-sql = "INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(70, 79) g"
+sql = "INSERT INTO t SELECT g, rpad(g::text, 1002, 'x') FROM generate_series(70, 79) g"
 
 [[step]]
 actor = "a"
 command = "exec"
-sql = "INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(80, 89) g"
+sql = "INSERT INTO t SELECT g, rpad(g::text, 1002, 'x') FROM generate_series(80, 89) g"
 
 [[step]]
 actor = "b"

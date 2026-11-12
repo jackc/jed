@@ -34,12 +34,12 @@ EXPLAIN SELECT id FROM items WHERE cat = $1
 Filter
 conjuncts=1
 900
-2906
+2905
 1
 Scan items
 Full scan; touched=2
 1000
-1006
+1005
 
 query ITTII nosort
 EXPLAIN SELECT id FROM items WHERE cat = 1
@@ -48,12 +48,12 @@ EXPLAIN SELECT id FROM items WHERE cat = 1
 Filter
 conjuncts=1
 900
-2906
+2905
 1
 Scan items
 Full scan; touched=2
 1000
-1006
+1005
 
 # params: 70
 query ITTII nosort
@@ -63,12 +63,12 @@ EXPLAIN SELECT id FROM items WHERE cat = $1
 Filter
 conjuncts=1
 1
-7
+6
 1
 Scan items
 Index bound: using items_cat; touched=2
 1
-5
+4
 
 query ITTII nosort
 EXPLAIN SELECT id FROM items WHERE cat = 70
@@ -77,34 +77,34 @@ EXPLAIN SELECT id FROM items WHERE cat = 70
 Filter
 conjuncts=1
 1
-7
+6
 1
 Scan items
 Index bound: using items_cat; touched=2
 1
-5
+4
 
 # params: 70
-# cost: 7
+# cost: 6
 query I nosort
 SELECT id FROM items WHERE cat = $1
 ----
 70
 
-# cost: 7
+# cost: 6
 query I nosort
 SELECT id FROM items WHERE cat = 70
 ----
 70
 
 # params: 1
-# cost: 2907
+# cost: 2906
 query I nosort
 SELECT count(*) FROM items WHERE cat = $1
 ----
 900
 
-# cost: 2907
+# cost: 2906
 query I nosort
 SELECT count(*) FROM items WHERE cat = 1
 ----
@@ -119,12 +119,12 @@ EXPLAIN SELECT id FROM items WHERE cat > $1
 Filter
 conjuncts=1
 49
-247
+246
 1
 Scan items
 Index bound: using items_cat; touched=2
 49
-149
+148
 
 query ITTII nosort
 EXPLAIN SELECT id FROM items WHERE cat > 500
@@ -133,12 +133,12 @@ EXPLAIN SELECT id FROM items WHERE cat > 500
 Filter
 conjuncts=1
 49
-247
+246
 1
 Scan items
 Index bound: using items_cat; touched=2
 49
-149
+148
 
 # A NULL key proves no row.
 # params: NULL
@@ -180,12 +180,12 @@ EXPLAIN SELECT id FROM items WHERE tags @> ARRAY[$1]
 Filter
 conjuncts=1
 1000
-4006
+4005
 1
 Scan items
 Full scan; touched=2
 1000
-1006
+1005
 
 query ITTII nosort
 EXPLAIN SELECT id FROM items WHERE tags @> ARRAY['a']
@@ -194,12 +194,12 @@ EXPLAIN SELECT id FROM items WHERE tags @> ARRAY['a']
 Filter
 conjuncts=1
 1000
-4006
+4005
 1
 Scan items
 Full scan; touched=2
 1000
-1006
+1005
 
 # params: 'r7'
 query ITTII nosort
@@ -238,12 +238,12 @@ EXPLAIN SELECT id FROM items WHERE $1 = ANY(tags)
 Filter
 conjuncts=1
 1000
-3006
+3005
 1
 Scan items
 Full scan; touched=2
 1000
-1006
+1005
 
 query ITTII nosort
 EXPLAIN SELECT id FROM items WHERE 'a' = ANY(tags)
@@ -252,12 +252,12 @@ EXPLAIN SELECT id FROM items WHERE 'a' = ANY(tags)
 Filter
 conjuncts=1
 1000
-3006
+3005
 1
 Scan items
 Full scan; touched=2
 1000
-1006
+1005
 
 # params: 'r7'
 query ITTII nosort
@@ -311,12 +311,12 @@ EXPLAIN SELECT id FROM items WHERE tags @> $1
 Filter
 conjuncts=1
 1000
-3006
+3005
 1
 Scan items
 Full scan; touched=2
 1000
-1006
+1005
 
 query ITTII nosort
 EXPLAIN SELECT id FROM items WHERE tags @> '{a}'::text[]
@@ -325,12 +325,12 @@ EXPLAIN SELECT id FROM items WHERE tags @> '{a}'::text[]
 Filter
 conjuncts=1
 1000
-3006
+3005
 1
 Scan items
 Full scan; touched=2
 1000
-1006
+1005
 
 # params: ARRAY['r7']
 query ITTII nosort
@@ -433,12 +433,12 @@ EXPLAIN SELECT id FROM items WHERE cat = ANY($1)
 Filter
 conjuncts=1
 900
-3906
+3905
 1
 Scan items
 Full scan; touched=2
 1000
-1006
+1005
 
 query ITTII nosort
 EXPLAIN SELECT id FROM items WHERE cat = ANY('{1}'::i32[])
@@ -447,12 +447,12 @@ EXPLAIN SELECT id FROM items WHERE cat = ANY('{1}'::i32[])
 Filter
 conjuncts=1
 900
-3906
+3905
 1
 Scan items
 Full scan; touched=2
 1000
-1006
+1005
 
 # params: ARRAY[10, 20]
 query ITTII nosort
@@ -462,12 +462,12 @@ EXPLAIN SELECT id FROM items WHERE cat = ANY($1)
 Filter
 conjuncts=1
 2
-16
+15
 1
 Scan items
 Index interval set: using items_cat; intervals=1; arrays=1; touched=2
 2
-8
+7
 
 query ITTII nosort
 EXPLAIN SELECT id FROM items WHERE cat = ANY('{10,20}'::i32[])
@@ -476,22 +476,22 @@ EXPLAIN SELECT id FROM items WHERE cat = ANY('{10,20}'::i32[])
 Filter
 conjuncts=1
 2
-16
+15
 1
 Scan items
 Index interval set: using items_cat; intervals=1; arrays=1; touched=2
 2
-8
+7
 
 # params: ARRAY[10, 20]
-# cost: 17
+# cost: 15
 query I nosort
 SELECT id FROM items WHERE cat = ANY($1) ORDER BY id
 ----
 10
 20
 
-# cost: 17
+# cost: 15
 query I nosort
 SELECT id FROM items WHERE cat = ANY('{10,20}'::i32[]) ORDER BY id
 ----
@@ -539,17 +539,17 @@ EXPLAIN UPDATE items SET tags = NULL WHERE cat = $1
 Update items
 sets=1
 1
-6
+5
 1
 Filter
 conjuncts=1
 1
-6
+5
 2
 Scan items
 Index bound: using items_cat; touched=1
 1
-5
+4
 
 query ITTII nosort
 EXPLAIN UPDATE items SET tags = NULL WHERE cat = 70
@@ -558,17 +558,17 @@ EXPLAIN UPDATE items SET tags = NULL WHERE cat = 70
 Update items
 sets=1
 1
-6
+5
 1
 Filter
 conjuncts=1
 1
-6
+5
 2
 Scan items
 Index bound: using items_cat; touched=1
 1
-5
+4
 
 # params: 70
 query ITTII nosort
@@ -578,17 +578,17 @@ EXPLAIN DELETE FROM items WHERE cat = $1
 Delete items
 -
 1
-6
+5
 1
 Filter
 conjuncts=1
 1
-6
+5
 2
 Scan items
 Index bound: using items_cat; touched=1
 1
-5
+4
 
 query ITTII nosort
 EXPLAIN DELETE FROM items WHERE cat = 70
@@ -597,17 +597,17 @@ EXPLAIN DELETE FROM items WHERE cat = 70
 Delete items
 -
 1
-6
+5
 1
 Filter
 conjuncts=1
 1
-6
+5
 2
 Scan items
 Index bound: using items_cat; touched=1
 1
-5
+4
 
 # params: 70
 query ITTII nosort
@@ -617,17 +617,17 @@ EXPLAIN DELETE FROM items WHERE id IN (SELECT id FROM items WHERE cat = $1)
 Delete items
 -
 10
-33
+31
 1
 Filter
 conjuncts=1
 10
-33
+31
 2
 Scan items
 PK interval set: id; intervals=1; arrays=1; touched=1
 10
-16
+15
 
 query ITTII nosort
 EXPLAIN DELETE FROM items WHERE id IN (SELECT id FROM items WHERE cat = 70)
@@ -636,17 +636,17 @@ EXPLAIN DELETE FROM items WHERE id IN (SELECT id FROM items WHERE cat = 70)
 Delete items
 -
 10
-33
+31
 1
 Filter
 conjuncts=1
 10
-33
+31
 2
 Scan items
 PK interval set: id; intervals=1; arrays=1; touched=1
 10
-16
+15
 
 # EXPLAIN ANALYZE executes, so each run is followed by restoring row 70.
 # params: 70
@@ -655,28 +655,28 @@ EXPLAIN ANALYZE DELETE FROM items WHERE cat = $1
 ----
 0
 Analyze
-cost=6 rows=1
+cost=5 rows=1
 1
-6
-6
+5
+5
 1
 Delete items
 -
 1
-6
-6
+5
+5
 2
 Filter
 conjuncts=1
 1
-6
-6
+5
+5
 3
 Scan items
 Index bound: using items_cat; touched=1
 1
-5
-5
+4
+4
 
 statement ok
 INSERT INTO items VALUES (70, 70, ARRAY['a', 'r70']) ON CONFLICT (id) DO UPDATE SET cat = 70, tags = ARRAY['a', 'r70']
@@ -686,28 +686,28 @@ EXPLAIN ANALYZE DELETE FROM items WHERE cat = 70
 ----
 0
 Analyze
-cost=6 rows=1
+cost=5 rows=1
 1
-6
-6
+5
+5
 1
 Delete items
 -
 1
-6
-6
+5
+5
 2
 Filter
 conjuncts=1
 1
-6
-6
+5
+5
 3
 Scan items
 Index bound: using items_cat; touched=1
 1
-5
-5
+4
+4
 
 statement ok
 INSERT INTO items VALUES (70, 70, ARRAY['a', 'r70']) ON CONFLICT (id) DO UPDATE SET cat = 70, tags = ARRAY['a', 'r70']
@@ -722,28 +722,28 @@ EXPLAIN ANALYZE INSERT INTO picked SELECT id FROM items WHERE cat = $1
 ----
 0
 Analyze
-cost=7 rows=1
+cost=6 rows=1
 1
-7
-7
+6
+6
 1
 Insert picked
 -
 1
-7
-7
+6
+6
 2
 Filter
 conjuncts=1
 1
-7
-7
+6
+6
 3
 Scan items
 Index bound: using items_cat; touched=2
 1
-5
-5
+4
+4
 
 statement ok
 DELETE FROM picked
@@ -753,25 +753,25 @@ EXPLAIN ANALYZE INSERT INTO picked SELECT id FROM items WHERE cat = 70
 ----
 0
 Analyze
-cost=7 rows=1
+cost=6 rows=1
 1
-7
-7
+6
+6
 1
 Insert picked
 -
 1
-7
-7
+6
+6
 2
 Filter
 conjuncts=1
 1
-7
-7
+6
+6
 3
 Scan items
 Index bound: using items_cat; touched=2
 1
-5
-5
+4
+4

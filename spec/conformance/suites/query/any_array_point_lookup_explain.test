@@ -226,12 +226,12 @@ EXPLAIN SELECT id FROM items WHERE cat = ANY('{1.0}'::decimal[])
 Filter
 conjuncts=1
 900
-3903
+3901
 1
 Scan items
 Full scan; touched=2
 1000
-1003
+1001
 
 # 70.0 is the rare value 70 and 1.5 equals no i32, so the elements estimate one row: the index wins.
 query ITTII nosort
@@ -241,12 +241,12 @@ EXPLAIN SELECT id FROM items WHERE cat = ANY('{70.0,1.5}'::decimal[])
 Filter
 conjuncts=1
 1
-9
+7
 1
 Scan items
 Index interval set: using items_cat; intervals=1; arrays=1; touched=2
 1
-5
+3
 
 # --- `<> ALL` (NOT IN) complements ---------------------------------------------------------------
 
@@ -259,12 +259,12 @@ EXPLAIN SELECT id FROM items WHERE cat <> ALL('{1}'::i32[])
 Filter
 conjuncts=1
 100
-3103
+3101
 1
 Scan items
 Full scan; touched=2
 1000
-1003
+1001
 
 # A NULL element proves no row true: `x <> ALL` is never TRUE once an element is NULL.
 query ITTII nosort
@@ -274,12 +274,12 @@ EXPLAIN SELECT id FROM items WHERE cat <> ALL(ARRAY[70, NULL])
 Filter
 conjuncts=1
 0
-5003
+5001
 1
 Scan items
 Full scan; touched=2
 1000
-1003
+1001
 
 # A NULL array proves no row true; an empty array keeps every row.
 query ITTII nosort

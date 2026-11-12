@@ -138,6 +138,11 @@ pub enum Unfetched {
         off: u32,
         len: u32,
         ty: TypeRef,
+        /// The body is a `text` / `bytea` / `json` value's content alone, read from a leaf, which
+        /// stores an inline string without its `u16` length (spec/fileformat/format.md "Leaf
+        /// node"). Unset, a string's body is the single-value codec's: the length, then the
+        /// content (a value read back from a spill run file).
+        bare: bool,
     },
     /// `0x02` external-plain: the chain carries `len` payload bytes from its first page `first` (with
     /// the tag that page's pointer binds in an encrypted file — spec/fileformat/encrypted.md §2).

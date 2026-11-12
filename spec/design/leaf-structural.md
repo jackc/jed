@@ -1,16 +1,30 @@
-# Leaf pages: structural size reductions (proposal)
+# Leaf pages: structural size reductions
 
-**Status: proposal. Steps 1 to 9 are prototyped in the Go core only**, each behind an environment
-switch (`JED_LEAF_NARROW`, `_ELIDE_KEY`, `_FIXED_KEY`, `_BARE_STRING`, `_KEY_PREFIX`, `_FOR`,
-`_DICT`, `_SYM`, `_ARR`). Steps 5 to 9 are encoding steps: they make a leaf's size depend on its
-contents (§7 to §11). **§13 summarizes every step and records the adoption decision:
-steps 1 to 7 and 9 go forward as one format version; step 8 is held.**
+**Status: steps 1 to 7 and 9 are format v52**, in all three cores and the Ruby reference; the
+normative text is [format.md](../fileformat/format.md) (*Leaf node*, *Record*, *Fan-out*). This
+document is the design record: what each step saves and costs, as measured on the Go prototype
+before adoption (§3 to §9, §11), and the adoption decision (§13). **Step 8, symbol tables (§10), is
+not in v52**: it remains a Go-only prototype behind `JED_LEAF_SYM`, off by default, and its region
+kinds (3 and 5) are reserved.
+
+What v52 changed from the prototype described below:
+
+- The layout byte is the **leaf flags byte**: bit 0 fixed key length, bit 1 key prefix. Narrow
+  directories and key-column elision are unconditional, so they have no bit, and a v51 leaf does not
+  read.
+- A fixed-width `numeric(p,s)` slot (format v51) is eligible for base plus offsets (§8); it was not
+  in the measurements.
+- The open point of §9 is closed: a stored row's deferred values equal its own plan's output
+  ([large-values.md](large-values.md) §15.2), so a record that fits all-inline never holds a large
+  form, and a decoded leaf and its page measure the same dictionary.
+- The catalog loader's row-count bound is `page_count × C` (a record may store one byte).
+
+The sections below keep the prototype's wording ("switch on", "layout bit 3").
 
 **Correction to §4 to §7.** Until step 6 the prototype's `leafOverhead` charged each elided key
 column a value directory (`1 + 2·N` bytes) it does not have, so table leaves filled 1% to 4% short.
 The results in §4 to §7 were measured with that error. With it fixed, steps 1 to 5 give a 122.4 MB
-file (15,596 leaves), not 126.1 MB; §8 compares against the corrected figure. Nothing here is in `format.md`, the Ruby reference, or the Rust and TS cores, and the prototype does not bump
-the format version.
+file (15,596 leaves), not 126.1 MB; §8 compares against the corrected figure.
 
 ## 1. Where the bytes are
 

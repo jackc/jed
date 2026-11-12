@@ -1151,7 +1151,8 @@ func TestHostBatchStreamingScanStorageErrorsMatchRowKernel(t *testing.T) {
 	// A corrupted page must surface exactly as under the single-row kernel — a read-ahead that meets
 	// it defers the error to the row the per-row pull would have met it at, so the kernel's own error
 	// at a = 57 still wins when it comes first, and a LIMIT that stops first never sees it. Corrupt
-	// each body page of a multi-leaf file in turn.
+	// each body page of a multi-leaf file in turn. The kernel's error value (a = 57) is at id 207, in
+	// the third leaf, so a corrupted second leaf is met first.
 	const page = 256
 	dir := t.TempDir()
 	path := filepath.Join(dir, "seed.jed")
@@ -1161,7 +1162,7 @@ func TestHostBatchStreamingScanStorageErrorsMatchRowKernel(t *testing.T) {
 	}
 	for _, s := range []string{
 		"CREATE TABLE t (id i64 PRIMARY KEY, a i64)",
-		"INSERT INTO t SELECT g, CASE WHEN g % 10 = 0 THEN NULL ELSE g END FROM generate_series(1, 300) AS g",
+		"INSERT INTO t SELECT g, CASE WHEN g % 10 = 0 THEN NULL ELSE g - 150 END FROM generate_series(1, 300) AS g",
 	} {
 		if _, err := execute(db, s); err != nil {
 			t.Fatal(err)

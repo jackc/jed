@@ -656,10 +656,23 @@ fn write_value<W: Write>(w: &mut W, v: &Value) -> io::Result<()> {
         // pass-through covers an inline-deferred value (lazy-record.md §5a) — tag 21: write just its
         // body span out of the shared page block (the block itself never reaches the run file).
         Value::Unfetched(Unfetched::Inline {
-            block, off, len, ..
+            block,
+            off,
+            len,
+            bare,
+            ..
         }) => {
             w.write_all(&[21])?;
-            write_bytes(w, &block[*off as usize..*off as usize + *len as usize])
+            let body = &block[*off as usize..*off as usize + *len as usize];
+            if *bare {
+                // The run file holds the single-value codec's body: the length, then the content.
+                let mut out = Vec::with_capacity(2 + body.len());
+                out.extend_from_slice(&(body.len() as u16).to_be_bytes());
+                out.extend_from_slice(body);
+                write_bytes(w, &out)
+            } else {
+                write_bytes(w, body)
+            }
         }
         Value::Unfetched(Unfetched::External { first, len, .. }) => {
             w.write_all(&[9])?;
@@ -775,6 +788,7 @@ fn read_value<R: Read>(r: &mut R) -> io::Result<Value> {
                 off: 0,
                 len,
                 ty: crate::value::TypeRef::sentinel(),
+                bare: false,
             })
         }
         9 => Value::Unfetched(Unfetched::External {

@@ -1175,9 +1175,9 @@ fn check_reports_findings_and_exits_by_verdict() {
     let r = run(&["check", bad.to_str().unwrap()], "");
     assert_eq!(r.code, 2, "{}", r.stderr);
     let lines: Vec<&str> = r.stdout.lines().collect();
-    assert_eq!(lines.len(), 3, "{}", r.stdout);
+    assert_eq!(lines.len(), 4, "{}", r.stdout);
     assert!(
-        lines[0].starts_with("index_entry_error u_v1_idx key 8000000a: "),
+        lines[0].starts_with("index_entry_error u_v1_idx key 80000054: "),
         "{}",
         r.stdout
     );
@@ -1186,7 +1186,12 @@ fn check_reports_findings_and_exits_by_verdict() {
         "{}",
         r.stdout
     );
-    assert_eq!(lines[2], "2 findings: 53 pages, 40 rows checked");
+    assert!(
+        lines[2].starts_with("index_entry_count_mismatch u_vp_idx: "),
+        "{}",
+        r.stdout
+    );
+    assert_eq!(lines[3], "3 findings: 43 pages, 42 rows checked");
     // --quick skips index agreement, so the same file checks clean.
     let r = run(&["check", "--quick", bad.to_str().unwrap()], "");
     assert_eq!(r.code, 0, "{}", r.stdout);
@@ -1217,7 +1222,7 @@ fn check_reports_findings_and_exits_by_verdict() {
     );
     assert!(
         r.stdout
-            .ends_with(",\"truncated\":true,\"skipped\":[],\"pages\":27,\"rows\":60}\n"),
+            .ends_with(",\"truncated\":true,\"skipped\":[],\"pages\":18,\"rows\":60}\n"),
         "{}",
         r.stdout
     );

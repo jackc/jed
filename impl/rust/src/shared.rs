@@ -6063,7 +6063,7 @@ mod temp_reclaim_internal_tests {
         sess.query_outcome("CREATE TABLE t (id i32 PRIMARY KEY, pad text)", &[])
             .unwrap();
         sess.query_outcome(
-            "INSERT INTO t SELECT g, 'pad-pad-pad-pad-pad-pad-pad-pad' FROM generate_series(1, 1000) g",
+            "INSERT INTO t SELECT g, 'pad-pad-pad-pad-pad-pad-pad-pad' || g::text FROM generate_series(1, 1000) g",
             &[],
         )
         .unwrap();
@@ -6188,7 +6188,7 @@ mod temp_reclaim_internal_tests {
         let pad = "z".repeat(40);
         let mut aborted = false;
         for i in 1..=400 {
-            match sess.query_outcome(&format!("INSERT INTO lt VALUES ({i}, 'r-{pad}')"), &[]) {
+            match sess.query_outcome(&format!("INSERT INTO lt VALUES ({i}, 'r{i}-{pad}')"), &[]) {
                 Ok(_) => {}
                 Err(e) => {
                     assert_eq!(
@@ -7026,7 +7026,7 @@ mod temp_spill_internal_tests {
             let pad = "z".repeat(40);
             for i in 1..=1000 {
                 if let Err(e) =
-                    sess.query_outcome(&format!("INSERT INTO lt VALUES ({i}, 'r-{pad}')"), &[])
+                    sess.query_outcome(&format!("INSERT INTO lt VALUES ({i}, 'r{i}-{pad}')"), &[])
                 {
                     assert_eq!(e.code(), "54P03");
                     let spilled = sess.engine.temp_storage.as_ref().unwrap().spilled();

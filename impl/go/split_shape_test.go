@@ -17,9 +17,10 @@ import (
 	"testing"
 )
 
-// splitShapeDB is a 121-row table at the fixture page size (256): id bigint pk, v
-// integer = id % 7. Ascending inserts pks 0..120 in order; shuffled inserts the
-// permutation (i*37) mod 121 — deterministic, identical in every core.
+// splitShapeDB is a 1210-row table at the fixture page size (256): id bigint pk, v
+// integer = id % 7. Ascending inserts pks 0..1209 in order; shuffled inserts the
+// permutation (i*37) mod 1210 — deterministic, identical in every core. (121 rows until
+// format v52, whose leaves hold about ten times as many of these rows.)
 func splitShapeDB(t *testing.T, shuffled bool) *engine {
 	t.Helper()
 	db, err := create(filepath.Join(t.TempDir(), "t.jed"), databaseOptions{PageSize: 256, noSync: true})
@@ -27,10 +28,10 @@ func splitShapeDB(t *testing.T, shuffled bool) *engine {
 		t.Fatal(err)
 	}
 	siRun(t, db, "CREATE TABLE t (id bigint PRIMARY KEY, v integer)")
-	for i := 0; i < 121; i++ {
+	for i := 0; i < 1210; i++ {
 		pk := i
 		if shuffled {
-			pk = (i * 37) % 121
+			pk = (i * 37) % 1210
 		}
 		siRun(t, db, fmt.Sprintf("INSERT INTO t VALUES (%d, %d)", pk, pk%7))
 	}
@@ -53,18 +54,18 @@ func TestSplitShapeCostsArePinned(t *testing.T) {
 	// (268/278/156) with the v24 B+tree (format.md): interior nodes are a record-free
 	// separator skeleton with far higher fan-out, so a full scan touches fewer pages.
 	asc := splitShapeDB(t, false)
-	pin(asc, "SELECT count(*) FROM t", 258)
+	pin(asc, "SELECT count(*) FROM t", 2436)
 	shuf := splitShapeDB(t, true)
-	pin(shuf, "SELECT count(*) FROM t", 265)
+	pin(shuf, "SELECT count(*) FROM t", 2443)
 
 	// Sorted index build (indexes.md §1) packs the index tree like the ascending case;
 	// the build charges only its table scan, and the bounded lookup's cost pins the
-	// index path's shape (pk ≡ 3 mod 7 in [0,120] ⇒ 17 admitted rows for v = 3). The
+	// index path's shape (pk ≡ 3 mod 7 in [0,1209] ⇒ 173 admitted rows for v = 3). The
 	// lookup rose from v23's 100: a B+tree point lookup always descends to a leaf
 	// (interior records could terminate a v23 descent early), so each of the 17 table
-	// fetches pays the full root→leaf path.
-	pin(shuf, "CREATE INDEX t_v_idx ON t (v)", 143)
-	pin(shuf, "SELECT id FROM t WHERE v = 3", 105)
+	// fetches pays the full root→leaf path. Re-pinned for format v52 (the compact leaf).
+	pin(shuf, "CREATE INDEX t_v_idx ON t (v)", 1232)
+	pin(shuf, "SELECT id FROM t WHERE v = 3", 1045)
 
 	// The complete INSERT mutation guard: the committed shape above already contains table-leaf and
 	// table-interior splits plus a split secondary index. In one working root, overwrite an existing
@@ -78,12 +79,12 @@ func TestSplitShapeCostsArePinned(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	siRun(t, shuf, "UPDATE t SET v = 42 WHERE id = 120")
-	for id := 121; id <= 220; id++ {
+	siRun(t, shuf, "UPDATE t SET v = 42 WHERE id = 1209")
+	for id := 1210; id <= 2209; id++ {
 		siRun(t, shuf, fmt.Sprintf("INSERT INTO t VALUES (%d, %d)", id, id%7))
 	}
-	pin(shuf, "SELECT count(*) FROM t", 477)
-	pin(shuf, "SELECT id FROM t WHERE v = 3", 199)
+	pin(shuf, "SELECT count(*) FROM t", 4456)
+	pin(shuf, "SELECT id FROM t WHERE v = 3", 1909)
 	if err := tx.Rollback(); err != nil {
 		t.Fatal(err)
 	}
@@ -94,6 +95,6 @@ func TestSplitShapeCostsArePinned(t *testing.T) {
 	if !bytes.Equal(after, before) {
 		t.Fatal("rollback changed the committed image")
 	}
-	pin(shuf, "SELECT count(*) FROM t", 265)
-	pin(shuf, "SELECT id FROM t WHERE v = 3", 105)
+	pin(shuf, "SELECT count(*) FROM t", 2443)
+	pin(shuf, "SELECT id FROM t WHERE v = 3", 1045)
 }

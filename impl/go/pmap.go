@@ -1519,13 +1519,13 @@ func buildLeaf(keys [][]byte, vals []storedRow, weights []uint32, cap pageCap, s
 		for i := 0; i < n; i++ {
 			pre[j][i+1] = pre[j][i]
 			if v := vals[i][fc.col]; !v.IsNull() {
-				pre[j][i+1].add(forSlot(fc.w, v))
+				pre[j][i+1].add(forSlot(fc, v))
 			}
 		}
 		for i := n - 1; i >= 0; i-- {
 			suf[j][i] = suf[j][i+1]
 			if v := vals[i][fc.col]; !v.IsNull() {
-				suf[j][i].add(forSlot(fc.w, v))
+				suf[j][i].add(forSlot(fc, v))
 			}
 		}
 	}

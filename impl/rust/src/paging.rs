@@ -18,7 +18,6 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::bufferpool::BufferPool;
-use crate::catalog::ColType;
 use crate::error::Result;
 use crate::format::{Cap, PageRef};
 use crate::pager::Pager;
@@ -128,7 +127,7 @@ impl SharedPaging {
     pub(crate) fn fault_leaf(
         self: &Arc<Self>,
         page: PageRef,
-        col_types: &Arc<Vec<ColType>>,
+        shape: &Arc<crate::format::LeafShape>,
     ) -> Result<Arc<Node>> {
         let node = self.pool.get_or_load(page.page, || {
             let block = self.read_body_shared(page)?;
@@ -139,7 +138,7 @@ impl SharedPaging {
             crate::format::decode_leaf_node(
                 block,
                 page,
-                Arc::clone(col_types),
+                Arc::clone(shape),
                 Arc::downgrade(self),
                 self.cap,
             )
@@ -148,7 +147,7 @@ impl SharedPaging {
         // decoded for that tree's columns. Its directories were validated against those columns,
         // not these, so serving it would index regions that do not exist (storage.md §7).
         if let Some(packed) = &node.packed
-            && !crate::format::same_leaf_shape(packed.col_types(), col_types)
+            && !crate::format::same_leaf_shape(packed.shape(), shape)
         {
             return Err(crate::error::EngineError::new(
                 crate::error::SqlState::DataCorrupted,
@@ -170,20 +169,20 @@ impl SharedPaging {
     pub(crate) fn fault_leaf_block(
         self: &Arc<Self>,
         page: PageRef,
-        col_types: &Arc<Vec<ColType>>,
+        shape: &Arc<crate::format::LeafShape>,
         block: Vec<u8>,
     ) -> Result<Arc<Node>> {
         let node = self.pool.get_or_load(page.page, move || {
             crate::format::decode_leaf_node(
                 Arc::new(block),
                 page,
-                Arc::clone(col_types),
+                Arc::clone(shape),
                 Arc::downgrade(self),
                 self.cap,
             )
         })?;
         if let Some(packed) = &node.packed
-            && !crate::format::same_leaf_shape(packed.col_types(), col_types)
+            && !crate::format::same_leaf_shape(packed.shape(), shape)
         {
             return Err(crate::error::EngineError::new(
                 crate::error::SqlState::DataCorrupted,
@@ -205,7 +204,7 @@ impl SharedPaging {
     pub(crate) fn prefetch_leaves(
         self: &Arc<Self>,
         pages: &[PageRef],
-        col_types: &Arc<Vec<ColType>>,
+        shape: &Arc<crate::format::LeafShape>,
     ) {
         if !self.batches {
             return;
@@ -234,7 +233,7 @@ impl SharedPaging {
                 crate::format::decode_leaf_node(
                     Arc::new(self.open_block(page, block)?),
                     page,
-                    Arc::clone(col_types),
+                    Arc::clone(shape),
                     Arc::downgrade(self),
                     self.cap,
                 )

@@ -10,14 +10,14 @@
             "kind": "gist_bounds_violation",
             "database": "main",
             "object": "u_span_gist",
-            "page": 28,
+            "page": 21,
             "key": null
           }
         ],
         "truncated": false,
         "skipped": [],
-        "pages": 53,
-        "rows": 40
+        "pages": 43,
+        "rows": 42
       }
     },
     {
@@ -29,7 +29,7 @@
             "kind": "gist_bounds_violation",
             "database": "main",
             "object": "u_span_gist",
-            "page": 28,
+            "page": 21,
             "key": null
           }
         ],
@@ -40,8 +40,8 @@
             "reason": "index_unreadable"
           }
         ],
-        "pages": 53,
-        "rows": 40
+        "pages": 43,
+        "rows": 42
       }
     }
   ]

@@ -12,25 +12,11 @@
             "object": "t",
             "page": 3,
             "key": null
-          },
-          {
-            "kind": "row_key_not_primary_key",
-            "database": "main",
-            "object": "t",
-            "page": 3,
-            "key": "80000012"
-          },
-          {
-            "kind": "row_key_not_primary_key",
-            "database": "main",
-            "object": "t",
-            "page": 3,
-            "key": "80000010"
           }
         ],
         "truncated": false,
         "skipped": [],
-        "pages": 12,
+        "pages": 8,
         "rows": 40
       }
     },
@@ -47,32 +33,18 @@
             "key": null
           },
           {
-            "kind": "row_key_not_primary_key",
+            "kind": "index_entry_missing",
             "database": "main",
-            "object": "t",
-            "page": 3,
-            "key": "80000012"
-          },
-          {
-            "kind": "row_key_not_primary_key",
-            "database": "main",
-            "object": "t",
-            "page": 3,
-            "key": "80000010"
+            "object": "t_v_idx",
+            "page": null,
+            "key": "8000002c"
           },
           {
             "kind": "index_entry_missing",
             "database": "main",
             "object": "t_v_idx",
             "page": null,
-            "key": "80000012"
-          },
-          {
-            "kind": "index_entry_missing",
-            "database": "main",
-            "object": "t_v_idx",
-            "page": null,
-            "key": "80000010"
+            "key": "8000002a"
           },
           {
             "kind": "index_entry_count_mismatch",
@@ -84,7 +56,7 @@
         ],
         "truncated": false,
         "skipped": [],
-        "pages": 12,
+        "pages": 8,
         "rows": 40
       }
     },
@@ -101,17 +73,17 @@
             "key": null
           },
           {
-            "kind": "row_key_not_primary_key",
+            "kind": "index_entry_missing",
             "database": "main",
-            "object": "t",
-            "page": 3,
-            "key": "80000012"
+            "object": "t_v_idx",
+            "page": null,
+            "key": "8000002c"
           }
         ],
         "truncated": true,
         "skipped": [],
-        "pages": 4,
-        "rows": 9
+        "pages": 8,
+        "rows": 40
       }
     }
   ]

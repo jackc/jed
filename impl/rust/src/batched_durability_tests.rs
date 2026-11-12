@@ -238,6 +238,9 @@ fn relaxed_batch_reuses_only_the_floors_free_pages() {
                 "update {i}: the free list holds pending page {f}"
             );
         }
+        if i == 200 {
+            midway = db.0.storage.lock().unwrap().page_count;
+        }
         if before.is_empty() || after.is_empty() {
             continue; // the batch's first commit plans as under synchronous = on; or a cap flush followed
         }
@@ -249,9 +252,6 @@ fn relaxed_batch_reuses_only_the_floors_free_pages() {
                 floor_free.as_ref().is_some_and(|f| f.contains(pg)),
                 "update {i} reused page {pg}, which was not free at the floor"
             );
-        }
-        if i == 200 {
-            midway = db.0.storage.lock().unwrap().page_count;
         }
     }
     let end = db.0.storage.lock().unwrap().page_count;
@@ -477,12 +477,12 @@ fn relaxed_trailing_truncation_waits_for_the_flush() {
     );
     exec(
         &mut db,
-        "INSERT INTO t SELECT g, repeat('x', 300), g % 7 FROM generate_series(1, 100) g",
+        "INSERT INTO t SELECT g, lpad(g::text, 300, 'x'), g % 7 FROM generate_series(1, 100) g",
     );
     exec(&mut db, "CREATE TABLE big (id i64 PRIMARY KEY, pad text)");
     exec(
         &mut db,
-        "INSERT INTO big SELECT g, repeat('z', 300) FROM generate_series(1, 20000) g",
+        "INSERT INTO big SELECT g, lpad(g::text, 300, 'z') FROM generate_series(1, 20000) g",
     );
     db.close().unwrap();
     let mut db = Database::open_with_options(

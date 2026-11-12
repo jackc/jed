@@ -253,7 +253,7 @@ type SpanAtom = { expr: RExpr; col: number } & (
 );
 
 // The reusable span scratch (single-threaded).
-const SPAN: Span = { start: 0, end: 0 };
+const SPAN: Span = { buf: new Uint8Array(0), start: 0, end: 0 };
 
 // compileSpanPred compiles filter for a lane over a single base relation whose column types are
 // colTypes and whose touched set is mask. Never fails: a leaf the span evaluator does not recognize
@@ -383,17 +383,17 @@ function evalSpan(a: SpanAtom, n: PNode, i: number, m: Meter): boolean | null {
     m.charge(a.base);
     return false;
   }
-  const buf = p.payload;
-  // The inline-plain body follows a 0x00 presence tag; any other tag is out of line or compressed.
-  if (SPAN.start >= SPAN.end || buf[SPAN.start] !== 0x00) return null;
+  const buf = SPAN.buf;
+  if (SPAN.start >= SPAN.end) return null;
   const start = SPAN.start + 1;
   const end = SPAN.end;
   if (a.kind === "bytesEq") {
-    // A u16-length-prefixed body, exactly the prefix plus that many bytes.
-    if (end - start < 2 || end - start - 2 !== ((buf[start]! << 8) | buf[start + 1]!)) return null;
-    let width = end - start - 2;
+    // An inline-plain text / bytea value in a leaf is the tag 0x05 and its content, the rest of the
+    // span (format.md "Leaf node"); any other tag is out of line or compressed.
+    if (buf[SPAN.start] !== 0x05) return null;
+    let width = end - start;
     if (a.text) {
-      width = utf8CodePoints(buf, start + 2, end);
+      width = utf8CodePoints(buf, start, end);
       if (width < 0) return null;
     }
     m.guard();
@@ -401,8 +401,10 @@ function evalSpan(a: SpanAtom, n: PNode, i: number, m: Meter): boolean | null {
     const w = Math.max(Math.min(width, a.kWidth), 1);
     m.charge(COSTS.varlenCompare * BigInt(w - 1));
     m.guard();
-    return bytesEqual(buf, start + 2, end, a.k) !== a.negated;
+    return bytesEqual(buf, start, end, a.k) !== a.negated;
   }
+  // An inline-plain array body follows a 0x00 presence tag.
+  if (buf[SPAN.start] !== 0x00) return null;
   const colHasNull = arrayElementSpans(buf, start, end, a.elem, a.spans);
   if (colHasNull === null) return null;
   m.guard();

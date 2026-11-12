@@ -2853,7 +2853,7 @@ impl Engine {
                 }
                 visited += 1;
                 if spillable {
-                    let u = node.record_scan_units(i, col_types, cap, mask);
+                    let u = node.record_scan_units(i, store.shape(), cap, mask);
                     units.pages += u.pages;
                     units.decompress += u.decompress;
                 }
@@ -3339,7 +3339,7 @@ impl Engine {
                 }
                 visited += 1;
                 if spillable {
-                    let u = node.record_scan_units(i, col_types, cap, mask);
+                    let u = node.record_scan_units(i, store.shape(), cap, mask);
                     units.pages += u.pages;
                     units.decompress += u.decompress;
                 }

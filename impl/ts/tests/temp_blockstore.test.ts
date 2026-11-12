@@ -92,7 +92,7 @@ test("a multi-leaf temp table past its page budget aborts 54P03", () => {
   let aborted = false;
   for (let i = 1; i <= 400 && !aborted; i++) {
     try {
-      sess.execute(`INSERT INTO lt VALUES (${i}, 'r-${pad}')`);
+      sess.execute(`INSERT INTO lt VALUES (${i}, 'r${i}-${pad}')`);
     } catch (e) {
       if (!(e instanceof EngineError) || e.code() !== "54P03") {
         throw new Error(`insert ${i}: want 54P03, got ${e}`);

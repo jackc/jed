@@ -593,6 +593,15 @@ expanded row vectors.
   to wider and unconstrained decimal columns. Lane choices, charges, and the logical sizes of items
   3 and 7 are unchanged: they are defined on the value, not on its stored form.
 
+  **The compact leaf (format v52).** A packed leaf's regions may now be stored in a form a lane
+  cannot read in place ([leaf-structural.md](leaf-structural.md), format.md *Leaf node*): an elided
+  key column (its slots come from the keys), a base-plus-offsets fixed-width region, a packed
+  integer-array region, and keys split into a shared prefix and suffixes. A core rebuilds such a
+  region into the dense form the lanes above read — at the page fault or on first use, its choice —
+  so a rebuilt leaf is larger than its page by the bytes the page saved. A dictionary region is read
+  in place through one indirection. Lane choices, charges and logical sizes are unchanged: they are
+  defined on the value, not on its stored form.
+
   **Budgets.** The lane choice decides which buffers a statement reserves, so under a query-memory
   budget it decides where `54P05` trips; memory.md §5.4 and §6.6.1 specify the choice and the
   bounded group table's charges, and `mise run conformance:query_memory` holds the three cores to the

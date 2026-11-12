@@ -45,11 +45,17 @@ fn a_fixed_width_decimal_column_is_the_size_of_its_integer_twin() {
         table_bytes("numeric(18,2)", "(g * 7919)::numeric / 100"),
         table_bytes("i64", "g * 7919")
     );
-    // The precision picks the width: 4 → 2 bytes, 5 → 4 bytes, 9 → 4 bytes, 10 → 8 bytes.
+    // The precision picks the width: 4 → 2 bytes, 5 → 4 bytes, 9 → 4 bytes, 10 → 8 bytes. Since
+    // format v52 a leaf stores such a column as base plus offsets when that is smaller, so the same
+    // nearby values take the same offset width whatever the slot's: a wider slot is never smaller,
+    // and no longer strictly larger.
     let two = table_bytes("numeric(4,0)", "g % 9999");
     let four = table_bytes("numeric(5,0)", "g % 9999");
     let eight = table_bytes("numeric(10,0)", "g % 9999");
-    assert!(two < four && four < eight);
+    assert!(two <= four && four <= eight);
+    // Values spread across the slot's range do not narrow: the full 8-byte slot shows.
+    let spread = table_bytes("numeric(18,0)", "(g % 2 * 2 - 1) * g * 100000000000");
+    assert!(eight < spread, "{eight} vs {spread}");
     assert_eq!(four, table_bytes("numeric(9,0)", "g % 9999"));
     assert_eq!(eight, table_bytes("numeric(18,0)", "g % 9999"));
 }

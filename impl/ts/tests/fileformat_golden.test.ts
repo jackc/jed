@@ -771,6 +771,40 @@ function decimalFixedTableDB(): Engine {
   return db;
 }
 
+// compactLeafTableDB exercises every v52 leaf form (format.md "Leaf node"). Table t: a fixed-key tree
+// whose two leading primary-key columns are elided, a long shared key prefix, a dictionary column
+// (status), base-plus-offsets over a fixed-width numeric slot and a timestamp, packed integer arrays
+// (with NULLs and empty arrays), a mostly-NULL text column, and an index over status. Table u:
+// variable-length text keys with a shared prefix and a key directory, a column of one value (offset
+// width 0), and all-NULL columns. Rows are inserted in key order, one statement each.
+function compactLeafTableDB(): Engine {
+  const db = goldenDb();
+  run(
+    db,
+    "CREATE TABLE t (tenant i32, id i64, status text, amount numeric(10,2), ts timestamp, " +
+      "tags i32[], note text, PRIMARY KEY (tenant, id))",
+  );
+  run(db, "CREATE INDEX t_status_idx ON t (status)");
+  const statuses = ["open", "closed", "void"];
+  const two = (n: number): string => String(n).padStart(2, "0");
+  for (let i = 0; i < 60; i++) {
+    let tags = `ARRAY[${i % 5}, ${i % 7}]`;
+    if (i % 10 === 0) tags = "NULL";
+    else if (i % 10 === 1) tags = "'{}'";
+    const note = i % 20 === 3 ? "'n'" : "NULL";
+    run(
+      db,
+      `INSERT INTO t VALUES (7, ${1000 + i}, '${statuses[i % 3]}', ${100 + i}.${two(i)}, ` +
+        `'2024-01-01 ${two(Math.floor(i / 60))}:${two(i % 60)}:00', ${tags}, ${note})`,
+    );
+  }
+  run(db, "CREATE TABLE u (name text PRIMARY KEY, n i16, flag boolean, z i32)");
+  for (let i = 0; i < 30; i++) {
+    run(db, `INSERT INTO u VALUES ('user/alpha/${two(i)}', 5, NULL, NULL)`);
+  }
+  return db;
+}
+
 // byteaTableDB exercises the value codec's bytea branch (u16 length + raw bytes): a multi-
 // byte value (a-f hex), the empty byte string, embedded 0x00 bytes, a high byte (0xFF), a
 // NULL, and a lone 0x00. The PK stays i32 (no bytea key this slice). Literals are the `\x`
@@ -1300,6 +1334,7 @@ test("write matches goldens (byte-identical to Rust/Go/Ruby)", () => {
     { name: "bool_pk_table.jed", build: boolPkTableDB },
     { name: "decimal_table.jed", build: decimalTableDB },
     { name: "decimal_fixed_table.jed", build: decimalFixedTableDB },
+    { name: "compact_leaf_table.jed", build: compactLeafTableDB },
     { name: "bytea_table.jed", build: byteaTableDB },
     { name: "text_pk_table.jed", build: textPkTableDB },
     { name: "bytea_pk_table.jed", build: byteaPkTableDB },
@@ -1389,6 +1424,8 @@ test("read goldens reproduces rows", () => {
     { name: "bool_pk_table.jed", build: boolPkTableDB, table: "t" },
     { name: "decimal_table.jed", build: decimalTableDB, table: "t" },
     { name: "decimal_fixed_table.jed", build: decimalFixedTableDB, table: "t" },
+    { name: "compact_leaf_table.jed", build: compactLeafTableDB, table: "t" },
+    { name: "compact_leaf_table.jed", build: compactLeafTableDB, table: "u" },
     { name: "bytea_table.jed", build: byteaTableDB, table: "t" },
     { name: "text_pk_table.jed", build: textPkTableDB, table: "t" },
     { name: "bytea_pk_table.jed", build: byteaPkTableDB, table: "t" },

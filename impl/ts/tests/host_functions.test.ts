@@ -1151,7 +1151,8 @@ test("batch streaming scan storage errors match the row kernel", () => {
   // A corrupted page must surface exactly as under the single-row kernel — a read-ahead that meets it
   // defers the error to the row the per-row pull would have met it at, so the kernel's own error at
   // a = 57 still wins when it comes first, and a LIMIT that stops first never sees it. Corrupt each
-  // body page of a multi-leaf file in turn.
+  // body page of a multi-leaf file in turn. The kernel's error value (a = 57) is at id 207, in the
+  // third leaf, so a corrupted second leaf is met first.
   const PAGE = 256;
   const dir = mkdtempSync(join(tmpdir(), "jed-host-batch-"));
   try {
@@ -1160,7 +1161,7 @@ test("batch streaming scan storage errors match the row kernel", () => {
     execute(seed, "CREATE TABLE t (id i64 PRIMARY KEY, a i64)");
     execute(
       seed,
-      "INSERT INTO t SELECT g, CASE WHEN g % 10 = 0 THEN NULL ELSE g END FROM generate_series(1, 300) AS g",
+      "INSERT INTO t SELECT g, CASE WHEN g % 10 = 0 THEN NULL ELSE g - 150 END FROM generate_series(1, 300) AS g",
     );
     // Publish the same rows once more, so a damaged newest generation cannot recover to an older,
     // different root (the checksum.test.ts seed). A metadata mutation is required: an empty writable

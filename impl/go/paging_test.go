@@ -16,7 +16,7 @@ import (
 func TestDemandPagingScansCorrectlyWithBoundedResidency(t *testing.T) {
 	t.Parallel()
 	path := filepath.Join(t.TempDir(), "paging.jed")
-	const n = 600
+	const n = 6000
 	const cap = 3
 
 	// Build a multi-level tree at a small page size, so a few hundred rows span many pages.
@@ -81,7 +81,7 @@ func TestDemandPagingScansCorrectlyWithBoundedResidency(t *testing.T) {
 	for _, sql := range []string{
 		"DELETE FROM t WHERE k = 100",
 		"UPDATE t SET v = 999 WHERE k = 200",
-		"INSERT INTO t VALUES (600, 1200)",
+		"INSERT INTO t VALUES (6000, 12000)",
 	} {
 		if _, err := execute(db, sql); err != nil {
 			t.Fatal(err)
@@ -110,9 +110,9 @@ func TestDemandPagingScansCorrectlyWithBoundedResidency(t *testing.T) {
 			if row[1].Int != 999 {
 				t.Fatalf("k=200 v = %d, want 999", row[1].Int)
 			}
-		case 600:
-			if row[1].Int != 1200 {
-				t.Fatalf("k=600 v = %d, want 1200", row[1].Int)
+		case 6000:
+			if row[1].Int != 12000 {
+				t.Fatalf("k=6000 v = %d, want 12000", row[1].Int)
 			}
 		}
 	}
@@ -128,7 +128,7 @@ func TestDemandPagingScansCorrectlyWithBoundedResidency(t *testing.T) {
 func TestMemoryBudgetBoundsResidencyUnderLookups(t *testing.T) {
 	t.Parallel()
 	path := filepath.Join(t.TempDir(), "budget.jed")
-	const n = 2000
+	const n = 20000
 	const cap = 4
 
 	db, err := create(path, databaseOptions{PageSize: 256, noSync: true})

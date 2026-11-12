@@ -41,7 +41,7 @@ import type { FkDependent } from "./executor.ts";
 import type { Type } from "./types.ts";
 import { storeColType } from "./catalog.ts";
 import type { PrivilegeSet } from "./privileges.ts";
-import type { TreeRef } from "./format.ts";
+import { markKeyColumns, tableKeyLen, type TreeRef } from "./format.ts";
 import type { ColumnStatistics } from "./statistics.ts";
 export class Snapshot {
   // txid is the snapshot's version — the commit counter (transactions.md §8; the watermark unit).
@@ -330,7 +330,14 @@ export class Snapshot {
     const empty = (stores: Map<string, TableStore>): Map<string, TableStore> => {
       const out = new Map<string, TableStore>();
       for (const [name, store] of stores) {
-        const fresh = new TableStore(cap, store.columnTypes());
+        const fresh = new TableStore(
+          cap,
+          store.columnTypes(),
+          undefined,
+          undefined,
+          undefined,
+          store.leafKeyLen(),
+        );
         fresh.bumpRowidTo(store.nextSyntheticRowid());
         fresh.attachPaging(paging);
         out.set(name, fresh);
@@ -880,7 +887,16 @@ export class Snapshot {
   putTableResolved(t: Table, colTypes: ColType[], pageSize: number): void {
     this.bumpCatGen();
     const key = t.name;
-    const st = new TableStore(this.capFor(pageSize), colTypes);
+    // A leaf stores no region for the leading key-derivable primary-key columns, and no key directory
+    // when every key has one length (format.md "Leaf node").
+    const st = new TableStore(
+      this.capFor(pageSize),
+      markKeyColumns(colTypes, t.pk),
+      undefined,
+      undefined,
+      undefined,
+      tableKeyLen(colTypes, t.pk),
+    );
     // Bind the domain's pager (Snapshot.storePaging) so the new store demand-pages like a loaded one:
     // its committed leaves demote at each commit (demoteCleanLeaves) and fault back through the pool,
     // instead of staying fully-resident decoded for the handle's lifetime. null only on a bare scratch

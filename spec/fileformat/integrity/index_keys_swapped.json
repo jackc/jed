@@ -10,13 +10,13 @@
             "kind": "keys_unordered",
             "database": "main",
             "object": "t_v_idx",
-            "page": 10,
+            "page": 7,
             "key": null
           }
         ],
         "truncated": false,
         "skipped": [],
-        "pages": 12,
+        "pages": 8,
         "rows": 40
       }
     },
@@ -29,7 +29,7 @@
             "kind": "keys_unordered",
             "database": "main",
             "object": "t_v_idx",
-            "page": 10,
+            "page": 7,
             "key": null
           }
         ],
@@ -40,7 +40,7 @@
             "reason": "index_unreadable"
           }
         ],
-        "pages": 12,
+        "pages": 8,
         "rows": 40
       }
     }

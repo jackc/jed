@@ -15,7 +15,7 @@ import { memDb } from "./mem_db.ts";
 
 const ROUNDS = 200;
 const SETUP =
-  "INSERT INTO t SELECT g, 'pad-pad-pad-pad-pad-pad-pad-pad' FROM generate_series(1, 1000) g";
+  "INSERT INTO t SELECT g, 'pad-pad-pad-pad-pad-pad-pad-pad' || g::text FROM generate_series(1, 1000) g";
 const churn = (k: number): string => `UPDATE t SET pad = 'r${k}' WHERE id = 500`;
 
 // countWalks crosses the threshold with a warm-up churn, then counts the steady commits that walked.

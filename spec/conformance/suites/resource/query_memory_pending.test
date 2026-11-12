@@ -5,7 +5,7 @@
 # A write made with no budget is counted but not remembered, so the netting writes below run under a
 # huge but active one. Each statement opens its account holding the pending bytes, takes on its own
 # staged bytes after each write phase, and after each statement the pending bytes alone must fit the
-# budget. A jed-specific resource contract, not a PostgreSQL limit. Here a t row stores 21 bytes with a 10-byte text value and 31 bytes
+# budget. A jed-specific resource contract, not a PostgreSQL limit. Here a t row stores 15 bytes with a 10-byte text value (its 4-byte key, a tag, and the text; the key column has no stored value) and 25 bytes
 # with a 20-byte one.
 # skip: disk — a transaction and the attached in-memory database cannot span the disk-mode
 # per-record reopen
@@ -29,33 +29,33 @@ INSERT INTO t VALUES (1, 'aaaaaaaaaa')
 statement ok
 INSERT INTO t VALUES (2, 'bbbbbbbbbbbbbbbbbbbb')
 
-# The block holds 21 + 31 pending bytes, so SELECT 1's virtual row (32) fits only beside them.
-# max_query_memory_bytes: 84
+# The block holds 15 + 25 pending bytes, so SELECT 1's virtual row (32) fits only beside them.
+# max_query_memory_bytes: 72
 query I nosort
 SELECT 1
 ----
 1
 
 # Rewriting a row the block staged replaces that version: the pending bytes are net, so a same-size
-# rewrite leaves them at 52.
+# rewrite leaves them at 40.
 # max_query_memory_bytes: 1099511627776
 statement ok
 UPDATE t SET v = 'cccccccccc' WHERE id = 1
 
-# max_query_memory_bytes: 84
+# max_query_memory_bytes: 72
 query I nosort
 SELECT 1
 ----
 1
 
-# max_query_memory_bytes: 83
+# max_query_memory_bytes: 71
 statement error 54P05
 SELECT 1
 
 statement ok
 ROLLBACK
 
-# A longer rewrite holds only the new version: 31 + 31.
+# A longer rewrite holds only the new version: 25 + 25.
 statement ok
 BEGIN
 
@@ -71,20 +71,20 @@ INSERT INTO t VALUES (2, 'bbbbbbbbbbbbbbbbbbbb')
 statement ok
 UPDATE t SET v = 'dddddddddddddddddddd' WHERE id = 1
 
-# max_query_memory_bytes: 94
+# max_query_memory_bytes: 82
 query I nosort
 SELECT 1
 ----
 1
 
-# max_query_memory_bytes: 93
+# max_query_memory_bytes: 81
 statement error 54P05
 SELECT 1
 
 statement ok
 ROLLBACK
 
-# Deleting a row the block staged returns its bytes: 31 remain.
+# Deleting a row the block staged returns its bytes: 25 remain.
 statement ok
 BEGIN
 
@@ -104,13 +104,13 @@ UPDATE t SET v = 'dddddddddddddddddddd' WHERE id = 1
 statement ok
 DELETE FROM t WHERE id = 2
 
-# max_query_memory_bytes: 63
+# max_query_memory_bytes: 57
 query I nosort
 SELECT 1
 ----
 1
 
-# max_query_memory_bytes: 62
+# max_query_memory_bytes: 56
 statement error 54P05
 SELECT 1
 
@@ -123,7 +123,7 @@ SELECT count(*) FROM t
 0
 
 # Without a budget (0 is unlimited) a write is not remembered, so rewriting its row counts it
-# again: 21 + 21.
+# again: 15 + 15.
 statement ok
 BEGIN
 
@@ -135,13 +135,13 @@ INSERT INTO t VALUES (1, 'aaaaaaaaaa')
 statement ok
 UPDATE t SET v = 'bbbbbbbbbb' WHERE id = 1
 
-# max_query_memory_bytes: 74
+# max_query_memory_bytes: 62
 query I nosort
 SELECT 1
 ----
 1
 
-# max_query_memory_bytes: 73
+# max_query_memory_bytes: 61
 statement error 54P05
 SELECT 1
 
@@ -164,13 +164,13 @@ UPDATE t SET v = 'bbbbbbbbbb' WHERE id = 1
 statement ok
 UPDATE t SET v = 'cccccccccc' WHERE id = 1
 
-# max_query_memory_bytes: 53
+# max_query_memory_bytes: 47
 query I nosort
 SELECT 1
 ----
 1
 
-# max_query_memory_bytes: 52
+# max_query_memory_bytes: 46
 statement error 54P05
 SELECT 1
 
@@ -215,7 +215,7 @@ INSERT INTO t VALUES (1, 'aaaaaaaaaa')
 statement ok
 INSERT INTO t VALUES (2, 'bbbbbbbbbbbbbbbbbbbb')
 
-# max_query_memory_bytes: 73
+# max_query_memory_bytes: 55
 statement ok
 INSERT INTO t VALUES (3, 'cccccccccc')
 
@@ -231,7 +231,7 @@ INSERT INTO t VALUES (1, 'aaaaaaaaaa')
 statement ok
 INSERT INTO t VALUES (2, 'bbbbbbbbbbbbbbbbbbbb')
 
-# max_query_memory_bytes: 72
+# max_query_memory_bytes: 54
 statement error 54P05
 INSERT INTO t VALUES (3, 'cccccccccc')
 
@@ -264,11 +264,11 @@ SELECT 1
 1
 
 # An autocommit write is its own transaction: its pending bytes must fit before it commits.
-# max_query_memory_bytes: 21
+# max_query_memory_bytes: 15
 statement ok
 INSERT INTO t VALUES (3, 'cccccccccc')
 
-# max_query_memory_bytes: 20
+# max_query_memory_bytes: 14
 statement error 54P05
 INSERT INTO t VALUES (4, 'dddddddddd')
 
@@ -278,13 +278,13 @@ SELECT count(*) FROM t
 3
 
 # INSERT ... SELECT keeps its source rows charged until the statement ends (memory.md §5.3), and they
-# are still held when its 52 staged bytes join the account: the statement needs both. The source scan
+# are still held when its 40 staged bytes join the account: the statement needs both. The source scan
 # computes a projection, so it streams (memory.md §5.4): its rows are the two projected rows, 222 bytes.
-# max_query_memory_bytes: 273
+# max_query_memory_bytes: 261
 statement error 54P05
 INSERT INTO t SELECT id + 10, v FROM t WHERE id <= 2
 
-# max_query_memory_bytes: 274
+# max_query_memory_bytes: 262
 statement ok
 INSERT INTO t SELECT id + 10, v FROM t WHERE id <= 2
 
@@ -298,14 +298,14 @@ BEGIN
 statement ok
 INSERT INTO a SELECT 1, json_agg(x) FROM generate_series(1, 3000) x
 
-# The 16893-byte json text compresses to an overflow chain: 12165 pending bytes in all.
-# max_query_memory_bytes: 12197
+# The 16893-byte json text compresses to an overflow chain: 12161 pending bytes in all.
+# max_query_memory_bytes: 12193
 query I nosort
 SELECT 1
 ----
 1
 
-# max_query_memory_bytes: 12196
+# max_query_memory_bytes: 12192
 statement error 54P05
 SELECT 1
 
@@ -325,14 +325,14 @@ BEGIN
 statement ok
 INSERT INTO u VALUES (1, 'aaaaaaaaaa')
 
-# The row's 21 bytes and the u_v entry's 17 (its encoded key).
-# max_query_memory_bytes: 70
+# The row's 15 bytes and the u_v entry's 17 (its encoded key).
+# max_query_memory_bytes: 64
 query I nosort
 SELECT 1
 ----
 1
 
-# max_query_memory_bytes: 69
+# max_query_memory_bytes: 63
 statement error 54P05
 SELECT 1
 
@@ -352,14 +352,14 @@ INSERT INTO t VALUES (5, 'aaaaaaaaaa')
 statement ok
 INSERT INTO aux.t VALUES (1, 'aaaaaaaaaa')
 
-# 21 pending bytes in each database.
-# max_query_memory_bytes: 74
+# 15 pending bytes in each database.
+# max_query_memory_bytes: 62
 query I nosort
 SELECT 1
 ----
 1
 
-# max_query_memory_bytes: 73
+# max_query_memory_bytes: 61
 statement error 54P05
 SELECT 1
 
@@ -379,7 +379,7 @@ INSERT INTO t VALUES (21, 'aaaaaaaaaa')
 statement ok
 SAVEPOINT s
 
-# Row 21's 21-byte version stays held by the frame: 21 + 31.
+# Row 21's 15-byte version stays held by the frame: 15 + 25.
 # max_query_memory_bytes: 1099511627776
 statement ok
 UPDATE t SET v = 'bbbbbbbbbbbbbbbbbbbb' WHERE id = 21
@@ -388,50 +388,50 @@ UPDATE t SET v = 'bbbbbbbbbbbbbbbbbbbb' WHERE id = 21
 statement ok
 INSERT INTO t VALUES (22, 'cccccccccc')
 
-# Row 22 was staged after the savepoint, so its rewrite is net: 21 + 31 + 21.
+# Row 22 was staged after the savepoint, so its rewrite is net: 15 + 25 + 15.
 # max_query_memory_bytes: 1099511627776
 statement ok
 UPDATE t SET v = 'dddddddddd' WHERE id = 22
 
-# max_query_memory_bytes: 105
+# max_query_memory_bytes: 87
 query I nosort
 SELECT 1
 ----
 1
 
-# max_query_memory_bytes: 104
+# max_query_memory_bytes: 86
 statement error 54P05
 SELECT 1
 
 statement ok
 ROLLBACK TO s
 
-# Back to row 21's 21-byte version.
-# max_query_memory_bytes: 53
+# Back to row 21's 15-byte version.
+# max_query_memory_bytes: 47
 query I nosort
 SELECT 1
 ----
 1
 
-# max_query_memory_bytes: 52
+# max_query_memory_bytes: 46
 statement error 54P05
 SELECT 1
 
 statement ok
 ROLLBACK TO s
 
-# The savepoint still holds row 21's version, so a same-size rewrite counts again: 21 + 21.
+# The savepoint still holds row 21's version, so a same-size rewrite counts again: 15 + 15.
 # max_query_memory_bytes: 1099511627776
 statement ok
 UPDATE t SET v = 'eeeeeeeeee' WHERE id = 21
 
-# max_query_memory_bytes: 74
+# max_query_memory_bytes: 62
 query I nosort
 SELECT 1
 ----
 1
 
-# max_query_memory_bytes: 73
+# max_query_memory_bytes: 61
 statement error 54P05
 SELECT 1
 
@@ -443,13 +443,13 @@ ROLLBACK TO s
 statement ok
 DELETE FROM t WHERE id = 21
 
-# max_query_memory_bytes: 53
+# max_query_memory_bytes: 47
 query I nosort
 SELECT 1
 ----
 1
 
-# max_query_memory_bytes: 52
+# max_query_memory_bytes: 46
 statement error 54P05
 SELECT 1
 

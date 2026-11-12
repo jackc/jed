@@ -316,9 +316,13 @@ test("relaxed trailing truncation waits for the flush", () => {
   const path = join(dir, "truncate.jed");
   const seed = createDatabase({ path, pageSize: PAGE, skipFsync: true, locking: "none" });
   seed.execute("CREATE TABLE t (id i64 PRIMARY KEY, pad text, n i64)");
-  seed.execute("INSERT INTO t SELECT g, repeat('x', 300), g % 7 FROM generate_series(1, 100) g");
+  seed.execute(
+    "INSERT INTO t SELECT g, lpad(g::text, 300, 'x'), g % 7 FROM generate_series(1, 100) g",
+  );
   seed.execute("CREATE TABLE big (id i64 PRIMARY KEY, pad text)");
-  seed.execute("INSERT INTO big SELECT g, repeat('z', 300) FROM generate_series(1, 20000) g");
+  seed.execute(
+    "INSERT INTO big SELECT g, lpad(g::text, 300, 'z') FROM generate_series(1, 20000) g",
+  );
   seed.close();
   const db = openDatabase(path, {
     synchronous: "off",

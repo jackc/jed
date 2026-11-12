@@ -77,6 +77,7 @@ func manifestInlineCapacity(ps int, pcap pageCap) int {
 // manifestOverflowCapacity is the entries a manifest-overflow page holds as this process writes them;
 // manifestOverflowCapacityFor as a meta of the given entry width declares them (manifest_crc32.go).
 func manifestOverflowCapacity(ps int) int { return manifestOverflowCapacityFor(ps, manifestCRC32) }
+
 func manifestOverflowCapacityFor(ps int, narrow bool) int {
 	return (ps - 32) / manifestEntrySize(narrow)
 }
@@ -581,7 +582,10 @@ func planValidatedCommit(snap *snapshot, paging *sharedPaging, write incremental
 		var head pageRef
 		low := uint32(0)
 		if chain != nil {
-			head, low = chain.refs[0], free[0]
+			head = chain.refs[0]
+			if !freeKeptChainOff {
+				low = free[0] // the prototype's meta field; reserved (0) in the format
+			}
 		}
 		left := max(0, len(pending)+len(write.pages)+len(fl)-manifestInlineCapacity(ps, seal.cap))
 		required := (left + manifestOverflowCapacity(ps) - 1) / manifestOverflowCapacity(ps)
@@ -620,5 +624,7 @@ var expCommitHook func(body, freeList, manifest []dirtyPage, freeEntries int)
 // EXPERIMENT hook: a file commit's free list before and after.
 var expFreeCheck func(before, after []uint32, rebuilt, pending, client, canReuse bool)
 
-// freeKeptChainOff restores the write-a-fresh-chain-every-commit behavior (PROTOTYPE A/B switch).
-var freeKeptChainOff = os.Getenv("JED_FREE_KEPT_CHAIN") == "off"
+// freeKeptChainOff is the format's behavior: every commit writes a fresh free-list chain and meta
+// offset 60 stays reserved. JED_FREE_KEPT_CHAIN=on enables the Go-only kept-chain prototype
+// (spec/design/free-list-kept-chain.md), whose files no other core reads.
+var freeKeptChainOff = os.Getenv("JED_FREE_KEPT_CHAIN") != "on"

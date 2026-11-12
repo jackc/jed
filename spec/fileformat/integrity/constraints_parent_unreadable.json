@@ -11,7 +11,7 @@
             "kind": "page_corrupt",
             "database": "main",
             "object": "p",
-            "page": 10,
+            "page": 7,
             "key": null
           }
         ],
@@ -50,8 +50,8 @@
             "reason": "table_unreadable"
           }
         ],
-        "pages": 27,
-        "rows": 57
+        "pages": 18,
+        "rows": 54
       }
     },
     {
@@ -64,7 +64,7 @@
             "kind": "page_corrupt",
             "database": "main",
             "object": "p",
-            "page": 10,
+            "page": 7,
             "key": null
           }
         ],
@@ -111,8 +111,8 @@
             "reason": "table_unreadable"
           }
         ],
-        "pages": 27,
-        "rows": 57
+        "pages": 18,
+        "rows": 54
       }
     }
   ]

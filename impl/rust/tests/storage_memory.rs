@@ -10,7 +10,7 @@ const PAGE: i64 = 8192;
 
 fn batch(lo: i32, n: i32) -> String {
     format!(
-        "INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series({lo}, {}) g",
+        "INSERT INTO t SELECT g, lpad(g::text, 1000, 'x') FROM generate_series({lo}, {}) g",
         lo + n - 1
     )
 }
@@ -248,7 +248,7 @@ fn file_attachment_storage_limit() {
     s.execute("BEGIN", &[]).unwrap();
     s.execute(&batch(0, 10), &[]).unwrap();
     s.execute(
-        "INSERT INTO f.a SELECT g, repeat('y', 1000) FROM generate_series(1, 100) g",
+        "INSERT INTO f.a SELECT g, lpad(g::text, 1000, 'y') FROM generate_series(1, 100) g",
         &[],
     )
     .unwrap();
@@ -286,7 +286,7 @@ fn multi_root_rejection_packs_no_attachment() {
     db.set_max_storage_bytes("main", main).unwrap();
     s.execute("BEGIN", &[]).unwrap();
     s.execute(
-        "INSERT INTO aux.a SELECT g, repeat('y', 1000) FROM generate_series(1, 50) g",
+        "INSERT INTO aux.a SELECT g, lpad(g::text, 1000, 'y') FROM generate_series(1, 50) g",
         &[],
     )
     .unwrap();

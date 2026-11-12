@@ -55,7 +55,9 @@ function growAndShrink(db: Database): void {
   const s = db.session();
   s.execute("CREATE TABLE t (id i64 PRIMARY KEY, pad text, n i64)");
   s.execute("CREATE INDEX t_n ON t (n)");
-  s.execute("INSERT INTO t SELECT g, repeat('x', 300), g % 7 FROM generate_series(1, 2000) g");
+  s.execute(
+    "INSERT INTO t SELECT g, lpad(g::text, 300, 'x'), g % 7 FROM generate_series(1, 2000) g",
+  );
   s.execute("DELETE FROM t WHERE id > 100");
   s.close();
 }

@@ -45,7 +45,7 @@ fn grow_and_shrink(db: &Database) {
         .unwrap();
     s.execute("CREATE INDEX t_n ON t (n)", &[]).unwrap();
     s.execute(
-        "INSERT INTO t SELECT g, repeat('x', 300), g % 7 FROM generate_series(1, 2000) g",
+        "INSERT INTO t SELECT g, lpad(g::text, 300, 'x'), g % 7 FROM generate_series(1, 2000) g",
         &[],
     )
     .unwrap();

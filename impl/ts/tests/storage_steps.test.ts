@@ -180,7 +180,14 @@ test("storage steps: resident traversal yields and cancels without restarting ro
   for (let i = 0; i < 1000; i++) {
     const key = new Uint8Array(8);
     new DataView(key.buffer).setBigUint64(0, BigInt(i));
-    map.insert(key, [intValue(BigInt(i))], 16, CAP, { fixed: 1, var: 0 }, null);
+    map.insert(
+      key,
+      [intValue(BigInt(i))],
+      16,
+      CAP,
+      { fixed: 1, var: 0, elided: 0, keyLen: 0, sizer: null },
+      null,
+    );
   }
   const iterator = map.scanRowsStepsIter(unboundedBound(), null, false);
   let canceled = false;
@@ -256,7 +263,7 @@ test("storage steps: mutations retain split/merge results and snapshot ownership
   const sync = mutationTree();
   const async = mutationTree();
   const original = async.map.clone();
-  const shape = { fixed: 1, var: 0 };
+  const shape = { fixed: 1, var: 0, elided: 0, keyLen: 0, sizer: null };
   for (let value = 7; value < 40; value++) {
     const row = [intValue(BigInt(value * 2))];
     assert.deepEqual(
@@ -284,7 +291,7 @@ test("storage steps: clone during a write page await freezes the captured mutati
   const tree = mutationTree(() => {
     if (capture) snapshot = tree.map.clone();
   });
-  const shape = { fixed: 1, var: 0 };
+  const shape = { fixed: 1, var: 0, elided: 0, keyLen: 0, sizer: null };
   // Make the root owned by the active generation while its right child remains on disk.
   tree.map.insert(key(0), [intValue(0n)], 16, CAP, shape, tree.source);
   capture = true;
@@ -304,9 +311,17 @@ test("storage steps: cancellation while loading a delete sibling publishes no pa
   });
   const root = tree.map.rootNode();
   await assert.rejects(
-    runAsync(tree.map.removeSteps(key(1), CAP, { fixed: 1, var: 0 }, tree.source), {
-      check: () => canceled,
-    }),
+    runAsync(
+      tree.map.removeSteps(
+        key(1),
+        CAP,
+        { fixed: 1, var: 0, elided: 0, keyLen: 0, sizer: null },
+        tree.source,
+      ),
+      {
+        check: () => canceled,
+      },
+    ),
   );
   assert.deepEqual(
     reads,
@@ -323,7 +338,10 @@ test("storage steps: table mutations preserve file bytes and cancel without stag
   engine.pageSize = 256;
   execute(engine, "CREATE TABLE t (id i32 PRIMARY KEY, body text)");
   execute(engine, "BEGIN");
-  for (let i = 0; i < 40; i++) execute(engine, `INSERT INTO t VALUES (${i}, 'old')`);
+  // Distinct bodies, so no dictionary shares them and the table spans several leaves (format v52).
+  for (let i = 0; i < 40; i++) {
+    execute(engine, `INSERT INTO t VALUES (${i}, 'old-${i}-${"p".repeat(20)}')`);
+  }
   execute(engine, "COMMIT");
   const image = toImage(engine.committed, 256, engine.committed.txid);
   const sync = paged(image);

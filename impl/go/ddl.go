@@ -2923,6 +2923,7 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 		rng := newStmtRng()
 		env := &evalEnv{exec: db, rng: rng}
 		colls := db.columnCollations(table.Columns)
+		var rewriteStoreTypes []colType
 		seenKeys := map[string]bool{}
 		compressUnits := int64(0)
 		for i := range rows {
@@ -2981,7 +2982,11 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 				seenKeys[string(key)] = true
 				rows[i].Key = key
 			}
-			compressUnits += int64(recordCompressUnits(rewriteColTypes, rows[i].Key, row, rewriteCap, nil))
+			if rewriteStoreTypes == nil {
+				// The stored shape: a key column the leaf does not store has no weight (format.md "Record").
+				rewriteStoreTypes = markKeyColumns(rewriteColTypes, table.PK)
+			}
+			compressUnits += int64(recordCompressUnits(rewriteStoreTypes, rows[i].Key, row, rewriteCap, nil))
 		}
 		meter.Charge(costs.ValueCompress * compressUnits)
 		if err := meter.Step(); err != nil {

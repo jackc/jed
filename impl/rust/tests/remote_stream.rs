@@ -29,7 +29,7 @@ fn create(path: &Path) {
     db.execute("CREATE TABLE t (id i64 PRIMARY KEY, v text)", &[])
         .unwrap();
     db.execute(
-        "INSERT INTO t SELECT g, repeat('x', 200) FROM generate_series(1, 2000) g",
+        "INSERT INTO t SELECT g, lpad(g::text, 200, 'x') FROM generate_series(1, 2000) g",
         &[],
     )
     .unwrap();
@@ -154,7 +154,7 @@ fn create_encrypted(path: &Path) {
     db.execute("CREATE TABLE t (id i64 PRIMARY KEY, v text)", &[])
         .unwrap();
     db.execute(
-        "INSERT INTO t SELECT g, repeat('x', 200) FROM generate_series(1, 2000) g",
+        "INSERT INTO t SELECT g, lpad(g::text, 200, 'x') FROM generate_series(1, 2000) g",
         &[],
     )
     .unwrap();

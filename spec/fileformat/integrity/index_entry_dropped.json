@@ -8,7 +8,7 @@
         "findings": [],
         "truncated": false,
         "skipped": [],
-        "pages": 12,
+        "pages": 8,
         "rows": 40
       }
     },
@@ -22,12 +22,12 @@
             "database": "main",
             "object": "t_v_idx",
             "page": null,
-            "key": "8000001e"
+            "key": "80000020"
           }
         ],
         "truncated": false,
         "skipped": [],
-        "pages": 12,
+        "pages": 8,
         "rows": 40
       }
     }

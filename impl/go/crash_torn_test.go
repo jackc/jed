@@ -33,7 +33,7 @@ func recordFatCommit(tb testing.TB) (prior []byte, ops []storeOp, priorIDs, post
 		pageSize = 256
 		k        = 8                                      // prior rows: 1..k
 		m        = 80                                     // committed rows: k+1..k+m
-		pad      = "padpadpadpadpadpadpadpadpadpadpadpad" // ~36 chars → ~3 rows/leaf at ps 256
+		pad      = "padpadpadpadpadpadpadpadpadpadpadpad" // each row's is distinct (a row number follows), so no dictionary shares them
 	)
 	path := filepath.Join(tb.TempDir(), "torn_seed.jed")
 	db, err := create(path, databaseOptions{PageSize: pageSize})
@@ -47,7 +47,7 @@ func recordFatCommit(tb testing.TB) (prior []byte, ops []storeOp, priorIDs, post
 	}
 	exec("CREATE TABLE t (id i32 PRIMARY KEY, pad text)")
 	for i := 1; i <= k; i++ {
-		exec(fmt.Sprintf("INSERT INTO t VALUES (%d, '%s')", i, pad))
+		exec(fmt.Sprintf("INSERT INTO t VALUES (%d, '%s%04d')", i, pad, i))
 	}
 	if err := db.Close(); err != nil {
 		tb.Fatal(err)
@@ -80,7 +80,7 @@ func recordFatCommit(tb testing.TB) (prior []byte, ops []storeOp, priorIDs, post
 		if i > 1 {
 			b.WriteString(", ")
 		}
-		fmt.Fprintf(&b, "(%d, '%s')", k+i, pad)
+		fmt.Fprintf(&b, "(%d, '%s%04d')", k+i, pad, k+i)
 	}
 	if _, err := execute(rdb, b.String()); err != nil {
 		tb.Fatalf("fat commit: %v", err)

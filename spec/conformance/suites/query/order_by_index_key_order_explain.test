@@ -38,12 +38,12 @@ EXPLAIN SELECT id, a FROM o ORDER BY a DESC LIMIT 8
 Limit
 limit=8
 8
-33
+25
 1
 Scan o
 Full scan; touched=2; ordered: index order: o_a_desc
 8
-25
+17
 
 # A mismatched NULL placement is not the index order: the blocking top-k sort.
 query ITTII nosort
@@ -53,17 +53,17 @@ EXPLAIN SELECT id, a FROM o ORDER BY a DESC NULLS LAST, id LIMIT 3
 Limit
 limit=3
 3
-607
+604
 1
 Sort
 keys=2, top-k=3
 600
-604
+601
 2
 Scan o
 Full scan; touched=2
 600
-604
+601
 
 # A backward walk is not used: ORDER BY a over the DESC index keeps the top-k sort.
 query ITTII nosort
@@ -73,17 +73,17 @@ EXPLAIN SELECT id, a FROM o ORDER BY a LIMIT 3
 Limit
 limit=3
 3
-607
+604
 1
 Sort
 keys=1, top-k=3
 600
-604
+601
 2
 Scan o
 Full scan; touched=2
 600
-604
+601
 
 # Two ordered keys (a NULLS FIRST, b DESC) match o_ab.
 query ITTII nosort
@@ -93,12 +93,12 @@ EXPLAIN SELECT id, a, b FROM o ORDER BY a NULLS FIRST, b DESC LIMIT 9
 Limit
 limit=9
 9
-39
+30
 1
 Scan o
 Full scan; touched=3; ordered: index order: o_ab
 9
-30
+21
 
 # Flipping b's NULL placement no longer matches o_ab.
 query ITTII nosort
@@ -108,17 +108,17 @@ EXPLAIN SELECT id, a, b FROM o ORDER BY a NULLS FIRST, b DESC NULLS LAST LIMIT 9
 Limit
 limit=9
 9
-613
+610
 1
 Sort
 keys=2, top-k=9
 600
-604
+601
 2
 Scan o
 Full scan; touched=3
 600
-604
+601
 
 # A range over the DESC column seeks o_a_desc.
 query ITTII nosort
@@ -128,12 +128,12 @@ EXPLAIN SELECT id FROM o WHERE a >= 48
 Filter
 conjuncts=1
 200
-1001
+801
 1
 Scan o
 Index bound: using o_a_desc; touched=2
 200
-601
+401
 
 # An equality prefix then a range on the DESC second key seeks o_ab.
 query ITTII nosort
@@ -143,12 +143,12 @@ EXPLAIN SELECT id, b FROM o WHERE a = 7 AND b > 8
 Filter
 conjuncts=2
 1
-9
+8
 1
 Scan o
 Index bound: using o_ab; touched=3
 1
-5
+4
 
 # An IN list over the DESC column is an index interval set.
 query ITTII nosort
@@ -158,12 +158,12 @@ EXPLAIN SELECT id FROM o WHERE a IN (3, 47) AND id < 200
 Filter
 conjuncts=2
 2
-51
+45
 1
 Scan o
 Index interval set: using o_a_desc; intervals=2; touched=2
 6
-19
+13
 
 # The set composes with the walk of the same DESC index.
 query ITTII nosort
@@ -193,7 +193,7 @@ EXPLAIN SELECT s.x, o.id FROM s JOIN o ON o.a = s.x WHERE o.id < 150
 Nested Loop
 inner; on:conjuncts=1
 2
-33
+27
 1
 Scan s
 Full scan; touched=1
@@ -203,4 +203,4 @@ Full scan; touched=1
 Scan o
 Index-nested-loop Index bound: using o_a_desc; touched=2; filter:conjuncts=1
 2
-26
+20

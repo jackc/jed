@@ -40,7 +40,7 @@ func growAndShrink(t *testing.T, db *Database) {
 	for _, sql := range []string{
 		"CREATE TABLE t (id i64 PRIMARY KEY, pad text, n i64)",
 		"CREATE INDEX t_n ON t (n)",
-		"INSERT INTO t SELECT g, repeat('x', 300), g % 7 FROM generate_series(1, 2000) g",
+		"INSERT INTO t SELECT g, lpad(g::text, 300, 'x'), g % 7 FROM generate_series(1, 2000) g",
 		"DELETE FROM t WHERE id > 100",
 	} {
 		if _, err := queryOutcome(s, sql, nil); err != nil {

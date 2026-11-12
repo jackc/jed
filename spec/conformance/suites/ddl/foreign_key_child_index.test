@@ -199,7 +199,7 @@ SELECT count(*) FROM big_p
 
 # Without a ceiling the DELETE completes. The parent range scan is 1 page + 100 rows + 100 filter
 # evals = 201. Each of the 100 reverse scans charges big_c's 7 pages + 3000 rows: 201 + 300700.
-# cost: 300901
+# cost: 300501
 statement ok
 DELETE FROM big_p WHERE id > 100
 

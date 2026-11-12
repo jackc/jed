@@ -421,7 +421,9 @@ test("the async API returns the same report across the worker boundary", async (
       });
       assert.ok(r.findings.every((f) => f.key === null || f.key instanceof Uint8Array));
       assert.deepEqual(contract(r), run.report);
-      assert.equal(r.ok, false);
+      // Under quick this fixture is clean since format v52: the re-keyed row's id column is elided,
+      // so the row reads as its new key and only the index (full) disagrees.
+      assert.equal(r.ok, run.report.findings.length === 0);
     }
     await assert.rejects(db.integrityCheck("nope"), sqlstate("42704"));
     const aborted = new AbortController();

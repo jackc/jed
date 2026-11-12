@@ -179,7 +179,7 @@ class IntegrityCheck
 
   def check_table(t)
     rows = []
-    walk = BtreeWalk.new(self, t[:name], t[:columns])
+    walk = BtreeWalk.new(self, t[:name], leaf_columns(t[:columns], t[:pk]))
     damaged = !walk.run(t[:root_data_page]) { |page, key, values| rows << check_row(t, page, key, values) }
     damaged ||= rows.any?(&:nil?)
     if !damaged && t[:row_count] != rows.size
@@ -902,7 +902,9 @@ INTEGRITY_U_TABLE = {
             { name: "u_tags_gin", cols: [2], kind: "gin" },
             { name: "u_v1_idx", cols: [{ expr: "v + 1" }] },
             { name: "u_vp_idx", cols: [1], predicate: "v < 50" }],
-  rows: (1..40).map do |i|
+  # 42 rows: a v52 leaf of this table is full at 13 or 14 rows, and the last two rows leave a leaf
+  # with room to re-encode a row whose v no longer fits base plus offsets (expr_overflow).
+  rows: (1..42).map do |i|
     tags = if (i % 11).zero? then nil
            elsif (i % 13).zero? then []
            else [i % 5, i % 7, i % 3]
@@ -1014,16 +1016,10 @@ def integrity_leaves(image, ps, root)
   (0..pg[:item_count]).flat_map { |i| integrity_leaves(image, ps, pg[:payload].byteslice(i * 4, 4).unpack1("N")) }
 end
 
-# Rewrite an index leaf (a v24 leaf with no value columns) to hold exactly `keys`.
+# Rewrite an index leaf (a v52 leaf with no value columns) to hold exactly `keys`, in the order
+# given, encoded by the writer's rules (the shared prefix of the smallest and largest key).
 def integrity_write_index_leaf(image, ps, page, keys)
-  ends = []
-  keys.reduce(0) { |acc, k| ends << acc + k.bytesize; acc + k.bytesize }
-  payload = ends.pack("N*") + keys.join.b
-  payload << u32(payload.bytesize + 4) # the column directory's one entry: where its (empty) regions start
-  raise "index leaf overflows the page" if payload.bytesize > ps - PAGE_HEADER
-
-  image[page * ps + PAGE_HEADER, ps - PAGE_HEADER] = payload + "\x00".b * (ps - PAGE_HEADER - payload.bytesize)
-  write_page(image, ps, page, PAGE_LEAF, keys.size, 0, "".b)
+  rewrite_leaf(image, ps, page, []) { |old, _vals| old.replace(keys.map(&:b)) }
 end
 
 def integrity_fixture_image(fx)
@@ -1033,6 +1029,7 @@ def integrity_fixture_image(fx)
   return integrity_u_damage(image, ps, roots, fx[:damage]) if roots.key?("u")
   return integrity_constraint_damage(image, ps, roots, fx[:damage]) if roots.key?("p")
 
+  table_cols = leaf_table_cols(fx[:table] || INTEGRITY_TABLE)
   table_leaves = integrity_leaves(image, ps, roots["t"])
   index_leaves = integrity_leaves(image, ps, roots["t_v_idx"])
   raise "the table needs an interior root over several leaves" unless table_leaves.size >= 3 && index_leaves.size >= 2
@@ -1045,22 +1042,17 @@ def integrity_fixture_image(fx)
     off = table_leaves[1] * ps + ps - 1
     image.setbyte(off, image.getbyte(off) ^ 0x01)
   when :leaf_keys_swapped
-    # t's second leaf stores its first two rows under each other's keys.
-    off = table_leaves[1] * ps + PAGE_HEADER
-    n = page_u32(image, ps, table_leaves[1], 4)
-    blob = off + 4 * n
-    first = image.byteslice(blob, 4)
-    image[blob, 4] = image.byteslice(blob + 4, 4)
-    image[blob + 4, 4] = first
-    refresh_body_crc(image, ps, table_leaves[1])
+    # t's second leaf stores its first two rows under each other's keys. The id column is elided
+    # (v52), so each row now reads as the other's id: the keys are out of order, and under full the
+    # index entries no longer match the rows.
+    rewrite_leaf(image, ps, table_leaves[1], table_cols) { |keys, _vals| keys[0], keys[1] = keys[1], keys[0] }
   when :row_rekeyed
     # The second row of t's second leaf moves into the gap above its id (an odd id: still in order).
-    off = table_leaves[1] * ps + PAGE_HEADER
-    n = page_u32(image, ps, table_leaves[1], 4)
-    at = off + 4 * n + 4
-    id = decode_int(4, image.byteslice(at, 4))
-    image[at, 4] = encode_int(4, id + 1)
-    refresh_body_crc(image, ps, table_leaves[1])
+    # The id column is elided (v52), so the row reads as that odd id: its key is still its primary
+    # key, and only the index, under full, no longer agrees with it.
+    rewrite_leaf(image, ps, table_leaves[1], table_cols) do |keys, _vals|
+      keys[1] = encode_int(4, decode_int(4, keys[1]) + 1)
+    end
   when :index_entry_dropped
     # The index's second leaf loses its second entry.
     pg = read_page(image, ps, index_leaves[1])
@@ -1181,16 +1173,12 @@ def integrity_u_damage(image, ps, roots, damage)
     keys[-1] = "\x00".b + encode_int(4, decode_int(4, last.byteslice(1, 4)) + 1) + last.byteslice(5..)
     integrity_write_index_leaf(image, ps, leaf, keys)
   when :expr_overflow
-    # The second row of u's second leaf holds v = 2147483647, so its v + 1 overflows.
-    page = table_leaves[1]
-    n = page_u32(image, ps, page, 4)
-    pg = read_page(image, ps, page)
-    key_end = pg[:payload].byteslice(4 * (n - 1), 4).unpack1("N")
-    dir = PAGE_HEADER + 4 * n + key_end # the column directory: u32 start per column, then the end
-    v_region = page_u32(image, ps, page, dir + 4)
-    off = page * ps + PAGE_HEADER + v_region + 1 + (n + 7) / 8 + 4 * 1
-    image[off, 4] = encode_int(4, 2**31 - 1)
-    refresh_body_crc(image, ps, page)
+    # The second row of u's last leaf holds v = 2147483647, so its v + 1 overflows. (The last leaf:
+    # the others are full, and its v region is no longer base plus offsets.)
+    # The leaf is re-encoded by the writer's rules: v's region is no longer base plus offsets.
+    rewrite_leaf(image, ps, table_leaves.last, leaf_table_cols(INTEGRITY_U_TABLE)) do |_keys, vals|
+      vals[1][1] = encode_int(4, 2**31 - 1)
+    end
   when :partial_entry_extra
     # The partial index's last leaf gains, at its end, the entry of row id 4 (v = 74, not < 50).
     leaf = integrity_leaves(image, ps, roots["u_vp_idx"]).last

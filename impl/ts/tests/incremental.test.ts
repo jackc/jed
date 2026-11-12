@@ -186,7 +186,7 @@ test("a commit preallocates file growth geometrically and reuses the slack", () 
     const pad = "p".repeat(3500);
     execute(db, "BEGIN");
     for (let i = 0; i < 400; i++) {
-      execute(db, `INSERT INTO t VALUES (${i}, '${pad}')`);
+      execute(db, `INSERT INTO t VALUES (${i}, '${i}${pad}')`); // distinct: no shared dictionary entry
     }
     execute(db, "COMMIT");
 

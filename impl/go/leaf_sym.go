@@ -72,7 +72,7 @@ func envInt(name string, def int) int {
 // element width, a u8 bit width, and every element's offset packed MSB-first. It applies only when
 // every value is NULL, empty, or an inline one-dimensional array with lower bound 1, no NULL element
 // and at most 254 elements, and only when smaller.
-var leafArr = os.Getenv("JED_LEAF_ARR") == "on" && leafNarrow
+const leafArr = true
 
 const (
 	regionSym    byte = 3
@@ -990,6 +990,25 @@ func (r *lazyRegion) decodeSym() (ends, body []byte, err error) {
 		return nil, nil, bad
 	}
 	return ends, body, nil
+}
+
+// checkArrRegion validates a packed integer-array region's extent: n count bytes, the base at
+// width w, a bit width of at most 8·w, and exactly the bits its elements need.
+func checkArrRegion(raw []byte, n, w int) error {
+	bad := newError(DataCorrupted, "PAX leaf typed-array region is malformed")
+	if w == 0 || len(raw) < n+w+1 {
+		return bad
+	}
+	total := 0
+	for _, c := range raw[:n] {
+		if c != 255 {
+			total += int(c)
+		}
+	}
+	if bw := int(raw[n+w]); bw > 8*w || len(raw)-(n+w+1) != (total*bw+7)/8 {
+		return bad
+	}
+	return nil
 }
 
 func (r *lazyRegion) decodeArr() (ends, body []byte, err error) {

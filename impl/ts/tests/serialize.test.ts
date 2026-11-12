@@ -40,7 +40,9 @@ function growAndShrink(db: Database): void {
   const s = db.session();
   s.execute("CREATE TABLE t (id i64 PRIMARY KEY, pad text, n i64)");
   s.execute("CREATE INDEX t_n ON t (n)");
-  s.execute("INSERT INTO t SELECT g, repeat('x', 300), g % 7 FROM generate_series(1, 2000) g");
+  s.execute(
+    "INSERT INTO t SELECT g, lpad(g::text, 300, 'x'), g % 7 FROM generate_series(1, 2000) g",
+  );
   s.execute("DELETE FROM t WHERE id > 100");
   s.close();
 }
@@ -240,7 +242,7 @@ test("async serialize and deserializeDatabase cross the worker boundary", async 
     try {
       await small.execute("CREATE TABLE big (id i64 PRIMARY KEY, pad text)");
       await small.execute(
-        "INSERT INTO big SELECT g, repeat('x', 500) FROM generate_series(1, 1000) g",
+        "INSERT INTO big SELECT g, lpad(g::text, 500, 'x') FROM generate_series(1, 1000) g",
       );
       await assert.rejects(small.serialize("main"), (error: unknown) => {
         assert.ok(error instanceof TransportError, String(error));
