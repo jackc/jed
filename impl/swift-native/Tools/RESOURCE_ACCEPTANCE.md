@@ -9,15 +9,15 @@ actor-specific verification and the measured comparison are recorded separately
 in [VERIFICATION.md](../VERIFICATION.md) and [BENCHMARKS.md](../BENCHMARKS.md).
 
 This audit uses **R01–R07 in `swift-native-host-matrix.md`**, not the differently
-numbered scope ledger. Baseline: `362e0798ac3a8bd04bd2da556044b6ec73bf468a`.
-Original optimized-source verification for `cec8170bfc33f087fa98949ae661b1eaa5490218`
+numbered scope ledger. Baseline: `0b76dd6e9c2675b552eb8af9e820065351ffa4b3`.
+Original optimized-source verification for `3db8fc2d2653475abc5e9d43049254ccd1e92387`
 passed 515 native tests including all 749 frozen SQL files. Its complete V04 refresh
 passed all 241,412 measurements with zero failures: all four cores in memory,
 disk and disk-spill, with exact peak/storage comparisons and complete membership.
 [VERIFICATION.md](../VERIFICATION.md) maps these gates to their captured actors;
 [BENCHMARKS.md](../BENCHMARKS.md) records measured performance separately.
 
-The structural follow-up at `43481e2047da1cee34a627b910c8a7c7c59c473f` passes
+The structural follow-up at `fb34b0e8cb3d82287fbd3401e3426f04b3b86c7a` passes
 543 native tests, all 749 frozen SQL files and a fresh complete 241,412-measurement
 V04 comparison. The [structural acceptance record](../VERIFICATION.md#structural-follow-up-acceptance)
 identifies its actors and additional resource/storage/process gates. Earlier
@@ -189,7 +189,7 @@ and 16 found Swift query-memory peaks 13,692 and 0, versus Rust/Go/TypeScript
 difference was the phase of rejection. They insert or update a doubled spilled
 text value whose full secondary-index key cannot fit in a page.
 
-Frozen baseline `362e0798ac3a8bd04bd2da556044b6ec73bf468a` explicitly retains an
+Frozen baseline `0b76dd6e9c2675b552eb8af9e820065351ffa4b3` explicitly retains an
 oversized single-record leaf or a leaf without an admissible two-way split:
 Go `pmap.go:1206` (`buildLeaf`), Rust `pmap.rs:593`/`:633`
 (`leaf_split_point`/`build_leaf`), and TypeScript `pmap.ts:1049` (`buildLeaf`).

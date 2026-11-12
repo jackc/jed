@@ -4,7 +4,7 @@
 > experiment branch. See the [archive and retrieval instructions](../../bench/ruby-native/ARCHIVE.md).
 > Reproduction commands below refer to that original checkout.
 
-This correctness pass follows `fc705ce719bfa6c829e630163b87d4cb2e5250a6`.
+This correctness pass follows `651783e0f38664f474ff21bb35f908005acd6a9b`.
 Ruby remains an explicitly selected, frozen experiment. No corpus expectation,
 memory allowance, supported core, normal task, or dependency changes.
 

@@ -16,7 +16,7 @@ for `master`.
 
 ## Setup
 
-- Harness revision `be1da62a` (clean tree), `mise run bench:aead_codec_browser`, default settings.
+- Harness revision `068d5d8f` (clean tree), `mise run bench:aead_codec_browser`, default settings.
 - Five process runs; each launches a fresh headless Chromium 149.0.7827.55 (V8 14.9.207.21) with a
   fresh profile and OPFS. Variant order is rotated per run.
 - Linux 7.0.0 x86-64, Intel Core Ultra 9 285K, 24 logical CPUs, no CPU pinning. The page is

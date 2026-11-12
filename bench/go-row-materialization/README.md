@@ -1,8 +1,8 @@
 # Go scan row allocation
 
-Production baseline: `c105eed383cae6ef98cfc8872b71aa3657f1c999`, clean detached
+Production baseline: `109aa27f79d4c6071f5755b9829eb20cde109b8c`, clean detached
 checkout before creating `codex/go-row-materialization`. Reference investigation:
-`571e3e9fd2e3de2d4eb3daa2b3dd1715781de7b1`,
+`c8101fb0c96136eafbae603791f04c51c66c365c`,
 `bench/go-specialization/results/2026-10-20/report.md` at that commit. No
 specialization implementation or build tags are used here.
 

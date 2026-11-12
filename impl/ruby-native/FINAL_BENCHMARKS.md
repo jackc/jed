@@ -1,7 +1,7 @@
 # Final Ruby experiment benchmarks
 
 These are the last measurements of the original experiment at
-`48fd21cd34b1001b23aa2b8c04c4d53dd591fbee`, library SHA-256
+`674dc97eb9d05fd0527df9c63fa1badf7c70b673`, library SHA-256
 `4d67d30ffbd9163214d1164c1c9c11dcdf5ca63e260a2b502402cc741314bf91`.
 Rebasing and removing archived results did not change the Ruby library.
 The other cores were measured at the recorded research revisions, before the

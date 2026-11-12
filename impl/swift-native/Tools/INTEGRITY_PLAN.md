@@ -4,7 +4,7 @@ The native Swift API implements the frozen I1–I5 contract in
 `spec/design/integrity-check.md`, with the 32 finding kinds and 5 skip reasons from
 `spec/integrity/findings.toml`. The registry and all 24 damaged images/JSON reports
 are mechanically copied from baseline
-`362e0798ac3a8bd04bd2da556044b6ec73bf468a`; no checker algorithm is generated.
+`0b76dd6e9c2675b552eb8af9e820065351ffa4b3`; no checker algorithm is generated.
 
 `Database.integrityCheck(_:options:cancellation:)` checks one committed main or
 named attachment. It retains the database host and an ordinary reader pin,
@@ -75,8 +75,8 @@ native/simulation acceptance is recorded separately in [VERIFICATION.md](../VERI
 The Linux interactive no-echo caveat is now closed by a separate PTY check of the
 postoptimization release `jed-check` actor (SHA-256
 `887b902725495e796643f4f19cf31406f3aeea8ce1fa1fc9c212c27c59d3588f`). The tested
-implementation source is `cec8170bfc33f087fa98949ae661b1eaa5490218`; the later
-benchmark capture HEAD `afbde4c6` is a separate provenance fact, not the CLI's
+implementation source is `3db8fc2d2653475abc5e9d43049254ccd1e92387`; the later
+benchmark capture HEAD `7c4803e9` is a separate provenance fact, not the CLI's
 actor identity. The temporary mise task uses Ruby's standard-library PTY and
 io-console support, keeps the slave terminal open for observation, checks the
 exact `stty -a` ECHO flag at each live prompt, and compares the complete `stty -g`

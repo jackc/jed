@@ -37,21 +37,21 @@ that source generation barely helps.
 Fetched and verified these remote branch tips before inspection:
 
 - Ruby: `origin/codex/ruby-native-experiment`,
-  `fc12f42798420fabc91dd6ee1274b961647071f8`.
+  `b70950c13f491453d5458222744b0a0a35c5c187`.
 - Expression VM: `origin/codex/expression-vm-experiment`,
-  `a85f2127cc64b8440cf86c3604aaac0ec10a0676`.
+  `f54586cf5f91259736f6a65ce38a931354d09e15`.
 
-The Ruby [compiler report](https://github.com/jackc/jed/blob/fc12f42798420fabc91dd6ee1274b961647071f8/impl/ruby-native/COMPILED_FOLLOWUP.md)
+The Ruby [compiler report](https://github.com/jackc/jed/blob/b70950c13f491453d5458222744b0a0a35c5c187/impl/ruby-native/COMPILED_FOLLOWUP.md)
 distinguishes isolated expression gains from whole-query gains. The initial
 YJIT kernels improved 3.4–7.1×; prepared arithmetic filter/projection and CASE
 queries improved 1.64×, 1.70×, and 2.02×. Generation also helped without a JIT.
-The later [pipeline report](https://github.com/jackc/jed/blob/fc12f42798420fabc91dd6ee1274b961647071f8/impl/ruby-native/PIPELINE_FOLLOWUP.md)
+The later [pipeline report](https://github.com/jackc/jed/blob/b70950c13f491453d5458222744b0a0a35c5c187/impl/ruby-native/PIPELINE_FOLLOWUP.md)
 found smaller incremental fusion gains: roughly 3–13% for eager scans and 1–6%
 for ordinary lazy queries in its alternating controls. That report flags
 historical correctness defects fixed by a subsequent follow-up. These are
 reported historical results, not measurements rerun here or a language ranking.
 
-The separate [VM report](https://github.com/jackc/jed/blob/a85f2127cc64b8440cf86c3604aaac0ec10a0676/spec/design/expression-vm-experiment.md)
+The separate [VM report](https://github.com/jackc/jed/blob/f54586cf5f91259736f6a65ce38a931354d09e15/spec/design/expression-vm-experiment.md)
 is directly relevant. Its median paired file-query time changes were:
 
 | Workload | Rust | Go | TypeScript |

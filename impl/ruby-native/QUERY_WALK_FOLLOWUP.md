@@ -49,7 +49,7 @@ for prepared statements, both storage modes and recovery after an error.
 
 ## Measurement method
 
-The baseline is commit `aa8783c99afd1816209f09f194745964d12fd5db`,
+The baseline is commit `eaf1886f6398cc9979c7f071547093b40926854b`,
 library SHA-256 `d21f4edda6dc0a007fce8499c2200c334e5e1e242f0d1397617910a21cda7396`,
 archived at `/tmp/jed-query-shape-before/impl/ruby-native`.
 Final library SHA-256:

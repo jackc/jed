@@ -4,9 +4,9 @@ The Go and TypeScript anomaly was unnecessary custom planning, not extra rows sc
 The fix gates a contradiction comparison on **both sources being plan-time literals before
 reading either value**. It does not change the eight-entry memo, the selected plan, or execution.
 
-Baseline: fetched master `7d179be9674fb3ddcc1e64519b978488c65df471`.
+Baseline: fetched master `23b2e40add6a19e04c59872dc5bdef5da329974b`.
 That master does not contain the frozen Ruby experiment. `plan.json` and the three supported-core
-adapters were recovered from local commit `3a8d4e6d`; the adapters here build against this checkout's
+adapters were recovered from local commit `c4633735`; the adapters here build against this checkout's
 cores. The historical numbers in the request are not current-master measurements. No Ruby core,
 FFI lane, or experimental core is built or changed here.
 

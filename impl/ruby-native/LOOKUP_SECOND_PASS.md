@@ -24,7 +24,7 @@ historical measurements and original coverage record.
 
 ## Source and measurement contract
 
-Baseline commit: `222b81aeddfd97547b042c629d7c3f4fb4617554`.
+Baseline commit: `8fbc52590ea58134325ac6dd6ef4edc6df4e1351`.
 Baseline Ruby library SHA-256:
 `b7275e0ee4b632191e078d24ee3134961b607fdad778f5575754b2b4cf7b0456`.
 Final Ruby library SHA-256:

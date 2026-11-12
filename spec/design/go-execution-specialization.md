@@ -13,7 +13,7 @@
 Can preparing a small set of ordinary typed Go kernels remove enough dispatch,
 call and value-copy overhead to improve complete queries?
 
-The [earlier expression VM](https://github.com/jackc/jed/blob/a85f2127cc64b8440cf86c3604aaac0ec10a0676/spec/design/expression-vm-experiment.md)
+The [earlier expression VM](https://github.com/jackc/jed/blob/f54586cf5f91259736f6a65ce38a931354d09e15/spec/design/expression-vm-experiment.md)
 made file arithmetic/boolean scans roughly 16–20% slower and barely changed
 their allocation counts. Its process cache also retained too much state. This
 proposal therefore starts with common multi-step operations, not another general

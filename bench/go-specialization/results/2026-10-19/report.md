@@ -39,7 +39,7 @@ file-format decision has been changed.
 
 ## Method and reproducibility
 
-- Clean source: `dfb0699f18e7c5bb120bc0f885f257791b19e2b9`, fetched and verified
+- Clean source: `277f68cedb3117457d82c9d924ba0fac9a0e9c8b`, fetched and verified
   from origin before work. Only the identical benchmark source was copied into
   its archived Go tree. The runner now pins this revision by default;
   `JED_SPECIALIZATION_BASELINE` can explicitly select another revision.

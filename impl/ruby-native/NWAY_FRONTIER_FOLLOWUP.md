@@ -12,7 +12,7 @@ Allocation counts alone do not establish a useful throughput improvement.
 **Decision: reject this candidate.** It saves candidate allocations but does not
 establish a consistent whole-query speedup. The tested implementation, its
 focused test and all evidence are archived at commit
-`c4094c6a3f205639908fd8aa7f1a3832f6e73d70`. The preceding planner is restored,
+`40d5fcaef6fae35d33412cf86a539bc6e33a11ed`. The preceding planner is restored,
 with library hash identical to the baseline below. The candidate-specific test
 lives in that archival commit. The implementation and measurements below
 describe the rejected candidate, not a retained optimization.
@@ -46,7 +46,7 @@ and whole-query measurements.
 ## Baseline opportunity
 
 The baseline is pushed commit
-`7028f9bca642d85c138d3608d565d43be115df4d`, library SHA-256
+`85c30100e6cd07609e8368c96b71586bf814802a`, library SHA-256
 `66afc525fcc2f4d0290ef70d03cc2f95e7521bd467029ecc653fe7b418f55341`,
 archived at `/tmp/jed-nway-frontier-before/impl/ruby-native`.
 New evidence belongs in
@@ -253,7 +253,7 @@ resource guard. Use at least 16 GiB of outer address space for supported-core
 comparisons. Existing page-service host tests also need local Unix-socket
 access.
 
-Check out archival commit `c4094c6a3f205639908fd8aa7f1a3832f6e73d70` to reproduce
+Check out archival commit `40d5fcaef6fae35d33412cf86a539bc6e33a11ed` to reproduce
 the rejected candidate and its focused test. The later branch restores the
 baseline library; running candidate verification against that restored source
 is intentionally rejected by the source pins.

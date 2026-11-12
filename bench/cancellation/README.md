@@ -1,13 +1,13 @@
 # Cancellation investigation — Go and Rust
 
 Measured 2026-10-18 on `codex/cursor-cancellation`, based on
-`c105eed383cae6ef98cfc8872b71aa3657f1c999`. No new dependencies. The TypeScript migration
+`109aa27f79d4c6071f5755b9829eb20cde109b8c`. No new dependencies. The TypeScript migration
 and its worktree are untouched.
 
-Before integration, the three cancellation commits were rebased onto master `d4a01ebd`, excluding
+Before integration, the three cancellation commits were rebased onto master `d980b536`, excluding
 inherited encryption and TS design commits. The Go/Rust implementation trees are byte-identical
 across that rebase. Revision references below use the rebased commits: raw logs' `46317446` maps
-to `666575e8`, and `e3bb2db8` maps to `d4c8ef54`. The comparison tasks use those reachable revisions.
+to `f47757ca`, and `e3bb2db8` maps to `154303c9`. The comparison tasks use those reachable revisions.
 
 ## Bug and implementation
 
@@ -22,7 +22,7 @@ another operation. There are no watcher goroutines to leak on query errors or ea
 failure hook. Explicit `Close` remains necessary for early exits and is terminal/idempotent.
 Cancellation after exhaustion or close cannot create a new error.
 
-The first fix (`666575e8`) distinguished **cost ceilings** from **cancellation** when admitting aggregate and
+The first fix (`f47757ca`) distinguished **cost ceilings** from **cancellation** when admitting aggregate and
 columnar projection paths. Those paths check cancellation at entry and between blocks of at most
 256 scan/fold records. That version still polled at scalar cost guards; the follow-up below separates them. Finite statement/lifetime
 cost ceilings retain the scalar path and its exact failure points. Successful cost totals are
@@ -32,7 +32,7 @@ unchanged; no storage format changes.
 
 ## Follow-up: store Go channels directly
 
-The second follow-up compares two changes independently and together, against `d4c8ef54`
+The second follow-up compares two changes independently and together, against `154303c9`
 (the sampled-checkpoint implementation described below). **Keep both**:
 
 - **Rows only:** cache `Done` in `Rows`, so each `Next` checks the channel directly instead of
@@ -105,7 +105,7 @@ one `Done()` capture per operation and restoration of prior session cancellation
 query errors, including nil/background contexts. Existing synchronized in-flight tests, transaction
 rollback/failure, cursor isolation, early close, exhaustion, and drain-error coverage remain.
 
-The historical SQL `watcher` benchmark fixture is available at `d4c8ef54`; its function-valued
+The historical SQL `watcher` benchmark fixture is available at `154303c9`; its function-valued
 atomic poll cannot be attached to the new channel-valued meter. Its recorded comparisons remain
 below. The independent `BenchmarkCancellationMechanism` watcher/channel microbenchmark remains
 runnable in this checkout. Rust is unchanged in this follow-up.
@@ -132,12 +132,12 @@ rejected for Rust. Vectorized batches retain their existing 256-record checks in
 The initial Go sampling wrapper added an extra function call on the unlimited-cost path. The final
 version keeps that path inline and leaves finite-limit comparisons in `guardLimits`; every cost
 limit still aborts at the same guard. `go-coarse-uninlined.txt` retains the intermediate experiment.
-At `d4c8ef54`, no allocations were added by sampling: enabling Go cancellation added 40 bytes / two
+At `154303c9`, no allocations were added by sampling: enabling Go cancellation added 40 bytes / two
 allocations per query, and caller context/deadline creation remains outside engine timings.
 
 ### Controlled Go comparison
 
-`mise run bench:cancellation:compare-go` archives the prior commit (`666575e8`) into a temporary
+`mise run bench:cancellation:compare-go` archives the prior commit (`f47757ca`) into a temporary
 directory, builds both test binaries before timing, and alternates identical workload selections
 in fresh processes (control/current, current/control, control/current). All runs use CPU 0,
 `GOMAXPROCS=1`, 500 ms per sample, and fully drained results. The task neither switches the active
@@ -157,7 +157,7 @@ slower, so this is not a uniform speedup in every mode. Cheap-query setup still 
 remaining overhead. Current enabled throughput is approximately 905k cheap queries/s, 1,682
 streaming queries/s, 7,450 aggregates/s, and 1,993 projections/s.
 
-The full benchmark selection at `d4c8ef54` also included watcher and forced-scalar variants (`go-coarse.txt`).
+The full benchmark selection at `154303c9` also included watcher and forced-scalar variants (`go-coarse.txt`).
 It shows smaller enabled overhead (1.0% streaming, 2.2% projection), but different absolute times;
 benchmark selection and preceding allocation/GC activity matter. Use the identical-selection,
 alternating comparison above for before/after claims, rather than comparing unrelated runs.
@@ -218,10 +218,10 @@ implementation, create a separate worktree at the pre-fix master base and apply 
 and task registrations from this branch:
 
 ```sh
-git diff d4a01ebdbf3edff0c130b1fdb4c1115df6d1c4bd codex/cursor-cancellation -- \
+git diff d980b536147ab88e13ba6f5bb30723fccf976da5 codex/cursor-cancellation -- \
   impl/go/cancellation_bench_test.go impl/rust/src/cancellation_bench.rs \
   impl/rust/src/shared.rs mise.toml > /tmp/jed-cancellation-bench.patch
-git worktree add --detach /tmp/jed-cancellation-before d4a01ebdbf3edff0c130b1fdb4c1115df6d1c4bd
+git worktree add --detach /tmp/jed-cancellation-before d980b536147ab88e13ba6f5bb30723fccf976da5
 git -C /tmp/jed-cancellation-before apply /tmp/jed-cancellation-bench.patch
 # Run the overhead tasks from that worktree. The old Go code fails cursor-lifetime cancellation;
 # its never-triggered-token measurements do not establish correctness.
@@ -246,7 +246,7 @@ at least 500 ms. `scalar-*` sets `max_cost` to the largest signed integer to for
 execution path without ever tripping the limit. This includes the small cost of ceiling comparisons;
 it is a path-penalty control, not a pure polling microbenchmark.
 
-## First-fix engine overhead (`666575e8`)
+## First-fix engine overhead (`f47757ca`)
 
 Cancellation is enabled but never triggered. Latency is per fully consumed query, not per row.
 
@@ -293,7 +293,7 @@ the no-context restore-closure allocation fix.
 
 ## First-fix watcher tradeoff and caller costs
 
-The historical `watcher` engine variant (`666575e8`) models the old atomic/goroutine mechanism **with corrected lifetime**:
+The historical `watcher` engine variant (`f47757ca`) models the old atomic/goroutine mechanism **with corrected lifetime**:
 it restores the live session after opening the cursor and stops the watcher after draining. It uses
 the same optimized eligibility as the final channel implementation.
 

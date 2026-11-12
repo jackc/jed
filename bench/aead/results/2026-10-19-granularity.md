@@ -8,7 +8,7 @@ Reproduce with `mise run bench:aead_granularity` (sources: `bench/aead/go/cmd/gr
 
 ## Setup
 
-- Harness revision `ff521c9f` plus the uncommitted probe sources whose SHA-256s are listed at the
+- Harness revision `8fdecd2b` plus the uncommitted probe sources whose SHA-256s are listed at the
   end (the committed sources are byte-identical). Default settings: five 100 ms samples after one
   discarded 100 ms warmup per case, batches of 64 operations, both workers run one after the other,
   pinned to logical CPU 0.

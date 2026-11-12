@@ -59,9 +59,9 @@ CI were not built/run for this Go-only research change.
 ## Measurement protocol
 
 G2 was measured before implementing G3. Both matrices use clean production
-`dfb0699f18e7c5bb120bc0f885f257791b19e2b9`, current untagged code, a same-source
+`277f68cedb3117457d82c9d924ba0fac9a0e9c8b`, current untagged code, a same-source
 ordinary control, and the candidate. G2 also includes pinned G1
-`90e654fe9b206a5b63d332ea170709e453f5091f` and closure composition; G3 includes
+`2aba5d4294985f8948835da4ea7aad1aad2a570b` and closure composition; G3 includes
 a same-source G2 static control. Every archive receives the identical benchmark
 source. Exact commands, tags, source hashes, environment and every sample are
 in [g2/](g2/) and [g3/](g3/).
@@ -191,7 +191,7 @@ appends `jed_specialization_scan`. Forced and ordinary controls remain separate
 build tags, not SQL settings. The [README](../../README.md) lists all commands.
 Final engine/timed-test sources match [G3's SHA-256 inventory](g3/environment.json).
 For the exact intermediate G2 build, apply [g2/source.patch](g2/source.patch) with `git apply --unidiff-zero` to
-G1 commit `90e654fe9b206a5b63d332ea170709e453f5091f`; every file in its
+G1 commit `2aba5d4294985f8948835da4ea7aad1aad2a570b`; every file in its
 [recorded inventory](g2/environment.json) was checked to match that reconstruction.
 The patch includes the then-current harness and tests. G2 was measured before
 any G3 source existed, rather than retrospectively disabling G3 in its first

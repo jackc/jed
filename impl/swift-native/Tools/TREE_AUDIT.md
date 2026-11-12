@@ -16,7 +16,7 @@ not completion of database execution or shared SQL conformance.
 ## Empty unary subtree correction
 
 The audit discovered an existing deletion defect at the frozen baseline
-`362e0798ac3a8bd04bd2da556044b6ec73bf468a`:
+`0b76dd6e9c2675b552eb8af9e820065351ffa4b3`:
 
 1. Use a 256-byte page, hence payload capacity 240, and an index tree with no
    value columns.

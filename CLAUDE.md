@@ -147,12 +147,12 @@ experiment, and promotion requires a separate decision. See
 [ruby-native-experiment.md](spec/design/ruby-native-experiment.md).
 
 The separately approved **native Swift experiment** (`impl/swift-native`, 2026-11-05)
-is frozen at `43481e2047da1cee34a627b910c8a7c7c59c473f`. Its semantic target remains
+is frozen at `fb34b0e8cb3d82287fbd3401e3426f04b3b86c7a`. Its semantic target remains
 the entire supported Rust/Go/TypeScript surface at
-`362e0798ac3a8bd04bd2da556044b6ec73bf468a`, not Ruby's frozen coverage. It is a
+`0b76dd6e9c2675b552eb8af9e820065351ffa4b3`, not Ruby's frozen coverage. It is a
 handwritten independent Swift engine. Linux conformance, host, file, crypto,
 process/simulation and optimization verification are recorded in
-[VERIFICATION.md](impl/swift-native/VERIFICATION.md). The original `cec8170` snapshot's
+[VERIFICATION.md](impl/swift-native/VERIFICATION.md). The original `3db8fc2` snapshot's
 complete release baseline and measured comparison remain preserved in
 [BENCHMARKS.md](impl/swift-native/BENCHMARKS.md). The completed structural follow-up
 adds separate diagnostic comparisons of 22 peer, eight paired Swift and three

@@ -17,7 +17,7 @@ this is a targeted improvement, not a general throughput claim.
 ## Baseline
 
 The baseline is pushed commit
-`e9c8cabc284335f9c36f581a682fdc15e3d7c38d`, library SHA-256
+`2f23527f2acea115788ae23836c018dcfd213013`, library SHA-256
 `66afc525fcc2f4d0290ef70d03cc2f95e7521bd467029ecc653fe7b418f55341`.
 Its private archive is `/tmp/jed-join-key-before/impl/ruby-native`.
 New evidence belongs in

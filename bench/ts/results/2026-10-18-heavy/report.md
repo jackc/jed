@@ -1,6 +1,6 @@
 # TypeScript heavy queries in Chromium and Node
 
-> Archive: [original report, committed data and experiment artifacts](https://github.com/jackc/jed/tree/37c8b9115850097fa4b1bd259936b197c6a296b3/bench/ts/results/2026-10-18-heavy). Artifact paths and historical reproduction commands below refer to that snapshot; measured commit IDs are unchanged. Outputs explicitly described as local or ignored were not committed.
+> Archive: [original report, committed data and experiment artifacts](https://github.com/jackc/jed/tree/9537fc9c0d836afec0e8d574d9fd8946cfd5e2f7/bench/ts/results/2026-10-18-heavy). Artifact paths and historical reproduction commands below refer to that snapshot; measured commit IDs are unchanged. Outputs explicitly described as local or ignored were not committed.
 
 These measurements compare the current synchronous internal API with the current public
 worker API. Expensive queries returning few rows show substantially less relative overhead
@@ -14,7 +14,7 @@ isolation for expensive execution while identifying substantial result delivery 
 
 ## Workloads and measurement
 
-The engine is unchanged from `7928ac81be3064e875eff39d0fef26f700d7be72`; this change adds
+The engine is unchanged from `fb61961c4dee4dd529735ae7c58cc06617afc953`; this change adds
 benchmarks and documentation. Both paths use that same semantic core, including its retained
 continuations. This is the current worker-boundary overhead, not a comparison against the
 old executor before resumability was added. Raw results identify the base commit and dirty

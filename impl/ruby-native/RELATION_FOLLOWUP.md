@@ -9,7 +9,7 @@ The cursor failures reported below are historical. The
 supersedes the mixed-routing interpretation. Original measurements are retained.
 
 Measured 2026-10-19. This explicitly requested extension follows the primitive aggregate compiler at
-`fa4cbcc18dd15ee5af577ece91a01e20d1c28e4b`. Ruby remains a frozen, opt-in experiment;
+`e888a0df4df39873a1e9da08d2b126e3529bd30a`. Ruby remains a frozen, opt-in experiment;
 normal tests, benchmarks, CI, supported cores, and public APIs are unchanged.
 
 ## Scope

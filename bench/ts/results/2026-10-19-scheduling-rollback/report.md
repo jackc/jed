@@ -1,10 +1,10 @@
 # Restore checkpoint scheduling after cancellation regression
 
-> Archive: [original report, committed data and experiment artifacts](https://github.com/jackc/jed/tree/752cd4b922673af9a107ea4b65a8ee3a6a24fd7b/bench/ts/results/2026-10-19-scheduling-rollback). Artifact paths and historical reproduction commands below refer to that snapshot; measured commit IDs are unchanged. Outputs explicitly described as local or ignored were not committed.
+> Archive: [original report, committed data and experiment artifacts](https://github.com/jackc/jed/tree/5f9ac094a911eb410b9f76d6567184bd7feef803/bench/ts/results/2026-10-19-scheduling-rollback). Artifact paths and historical reproduction commands below refer to that snapshot; measured commit IDs are unchanged. Outputs explicitly described as local or ignored were not committed.
 
 Production restores the task yield at every 256 cooperation visits from
-`2a8bdfcb264d1ef388296ee8554b485bee3e7d26`. The elapsed-time scheduler introduced in
-`14745cbd` is rejected: its aggregate throughput improvement came with slower message-only
+`e38dd60127b396c013d019e39c469038e3e0f512`. The elapsed-time scheduler introduced in
+`7a5cedde` is rejected: its aggregate throughput improvement came with slower message-only
 browser cancellation. A fresh experiment with a shorter **0.125 ms** slice did not remove
 that regression, so neither the 1 ms nor the 0.125 ms policy remains enabled.
 
@@ -31,7 +31,7 @@ Chromium without SharedArrayBuffer. The process order rotates:
 
 `baseline` is the original 256-visit scheduler; `current` is the then-current 1 ms scheduler;
 `eighth` is its 0.125 ms experimental variant. The names in raw records describe the experiment,
-not the production policy after this rollback. The [summary](https://github.com/jackc/jed/blob/752cd4b922673af9a107ea4b65a8ee3a6a24fd7b/bench/ts/results/2026-10-19-scheduling-rollback/summary.json), [manifest](https://github.com/jackc/jed/blob/752cd4b922673af9a107ea4b65a8ee3a6a24fd7b/bench/ts/results/2026-10-19-scheduling-rollback/manifest.json)
+not the production policy after this rollback. The [summary](https://github.com/jackc/jed/blob/5f9ac094a911eb410b9f76d6567184bd7feef803/bench/ts/results/2026-10-19-scheduling-rollback/summary.json), [manifest](https://github.com/jackc/jed/blob/5f9ac094a911eb410b9f76d6567184bd7feef803/bench/ts/results/2026-10-19-scheduling-rollback/manifest.json)
 and `raw/{browser-baseline,browser-current,browser-eighth}-{1,2,3}.json` retain chronology,
 individual samples and source/bundle hashes.
 
@@ -176,10 +176,10 @@ be tested independently rather than assumed to fix the measured regression.
 ## Reproduction and verification
 
 Use the existing cancellation task from this checkout, pointing `JED_PROBE_ROOT` at an isolated
-source checkout or reconstructed source snapshot. The restored baseline is `2a8bdfcb`; the
-1 ms variant is preserved by the [earlier patch](https://github.com/jackc/jed/blob/752cd4b922673af9a107ea4b65a8ee3a6a24fd7b/bench/ts/results/2026-10-19-scheduling/experiments/short.patch).
-The [0.125 ms patch](https://github.com/jackc/jed/blob/752cd4b922673af9a107ea4b65a8ee3a6a24fd7b/bench/ts/results/2026-10-19-scheduling-rollback/eighth.patch) applies to the 1 ms source at `14745cbd`, not directly to
-the restored baseline. The [manifest](https://github.com/jackc/jed/blob/752cd4b922673af9a107ea4b65a8ee3a6a24fd7b/bench/ts/results/2026-10-19-scheduling-rollback/manifest.json) identifies each source tree and artifact.
+source checkout or reconstructed source snapshot. The restored baseline is `e38dd601`; the
+1 ms variant is preserved by the [earlier patch](https://github.com/jackc/jed/blob/5f9ac094a911eb410b9f76d6567184bd7feef803/bench/ts/results/2026-10-19-scheduling/experiments/short.patch).
+The [0.125 ms patch](https://github.com/jackc/jed/blob/5f9ac094a911eb410b9f76d6567184bd7feef803/bench/ts/results/2026-10-19-scheduling-rollback/eighth.patch) applies to the 1 ms source at `7a5cedde`, not directly to
+the restored baseline. The [manifest](https://github.com/jackc/jed/blob/5f9ac094a911eb410b9f76d6567184bd7feef803/bench/ts/results/2026-10-19-scheduling-rollback/manifest.json) identifies each source tree and artifact.
 Run the same harness and fixed limits for every variant, with no concurrent performance load.
 
 ```sh
@@ -206,7 +206,7 @@ Verification of the restored production tree passes:
 - `git diff --check` passes.
 
 Every production TypeScript source and test file, plus `CLAUDE.md` and `AGENTS.md`, is
-byte-identical to `2a8bdfcb`. Benchmark tools and retained experimental evidence remain available.
+byte-identical to `e38dd601`. Benchmark tools and retained experimental evidence remain available.
 The rollback changes the scheduling implementation back to the verified earlier policy; it
 introduces no new transport implementation.
 

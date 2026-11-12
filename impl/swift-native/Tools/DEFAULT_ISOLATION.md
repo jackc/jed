@@ -1,6 +1,6 @@
 # Default-task and oracle audit
 
-Audit baseline: `362e0798ac3a8bd04bd2da556044b6ec73bf468a`.
+Audit baseline: `0b76dd6e9c2675b552eb8af9e820065351ffa4b3`.
 The original read-only integration audit on 2026-11-06 did not execute default
 CI itself. Subsequent verification passed all 17 default checks and all 18 CI
 steps; [VERIFICATION.md](../VERIFICATION.md) records those commands, logs and

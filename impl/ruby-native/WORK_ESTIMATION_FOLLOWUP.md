@@ -12,7 +12,7 @@ feature work do not include it.
 **Decision: reject this candidate.** It reduces estimator dispatch and allocations
 but does not establish a useful JIT throughput gain. The measured candidate and
 its evidence are retained in archival commit
-`d8084fb6e44bbf3f825bf7ff61d1bdcb16e3451a` for reproduction. The original
+`c0b704ab69f5a5330fd7190334c0f874909ed444` for reproduction. The original
 estimator is restored, with library hash identical to the baseline below.
 The candidate-specific test lives in that archival commit. The following
 implementation and measurements describe the candidate, not a retained optimization.
@@ -45,7 +45,7 @@ behavior, host API, physical-plan policy or dependency changes.
 ## Evidence and method
 
 The baseline is pushed commit
-`eb2c83db21bc496ea6c28be02fa3467b8e100f94`, library SHA-256
+`4261338c5a43a06220d9d230da7e83c8a68c1a99`, library SHA-256
 `62e562806cb2fca0e30792f1c90c3546f9f847c94a1af4651d9b3a376fce3705`,
 archived at `/tmp/jed-work-estimation-before/impl/ruby-native`.
 New evidence belongs in
@@ -192,7 +192,7 @@ pass, not an implemented change here.
 The evidence directory contains `check.rb` for focused, host and complete-corpus
 checks, and `run.rb` for measurements. Both use explicit
 `mise run ruby-native:*` tasks, run serially and refuse to replace existing
-reports. Check out archival commit `d8084fb6e44bbf3f825bf7ff61d1bdcb16e3451a` to reproduce this
+reports. Check out archival commit `c0b704ab69f5a5330fd7190334c0f874909ed444` to reproduce this
 rejected implementation; the later branch restores the original estimator.
 Preserve earlier artifacts before an intentional rerun.
 

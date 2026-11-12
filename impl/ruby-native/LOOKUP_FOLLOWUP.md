@@ -20,7 +20,7 @@ normal tests, benchmarks, CI, and future feature work do not include it.
 
 ## Source and measurement contract
 
-The comparison starts from commit `c3ba8e69f556af0dbd5e24876a9092a557cc8c10`, whose
+The comparison starts from commit `8c5c6df9581fa1db1ab5ffaccb5199c4deb7b42f`, whose
 Ruby library hash is
 `05b5aa0e67adf3fd2c19f99059397772d141ed0f0d3a6094eefde9702c5adbfb`.
 That is the initial report's completed optimized core, not its earlier working

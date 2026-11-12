@@ -1,6 +1,6 @@
 # Native Swift page-service integration plan
 
-Baseline: `362e0798ac3a8bd04bd2da556044b6ec73bf468a`. Canonical contracts:
+Baseline: `0b76dd6e9c2675b552eb8af9e820065351ffa4b3`. Canonical contracts:
 `spec/pageservice/README.md`, `messages.toml`, `fixtures.toml`,
 `spec/design/page-service.md`, `locking.md`, `validated-cow.md`, and
 `spec/fileformat/encrypted.md` §14. This is an implementation plan, not a claim

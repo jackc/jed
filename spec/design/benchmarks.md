@@ -881,7 +881,7 @@ abandon decisions are those of the path-copy form, so tree shape, bytes, and cos
 Four scratch lanes were added (`delete_rollback_serial`, `delete_rollback_random`,
 `delete_range_rollback`, `delete_insert_churn`). Each builds a fresh 100k-row
 `(id bigint PRIMARY KEY, v bigint, note text)` table and rolls each transaction back. The control
-is master `172e3b0a`.
+is master `e1085846`.
 
 Allocation evidence came from a temporary counting global allocator (not committed). It wrapped
 one transaction over a durable 100k-row file database (`locking=exclusive`) and took the median of
@@ -1746,7 +1746,7 @@ The secondary-index follow-ons add three scratch lanes. `index_vartail_prefix` b
 `(a, s text)` by `a = $1`, which needs the variable-width slot skip (indexes.md §5.1).
 `partial_index_implied_range` queries a partial index `WHERE amt > 0` with a literal range that
 implies the predicate (§9.1). `partial_index_live_topn` walks a soft-delete partial index for
-`ORDER BY k LIMIT 10` with no key condition (§9.2). Alternating base/after runs (base `172e3b0a`,
+`ORDER BY k LIMIT 10` with no key condition (§9.2). Alternating base/after runs (base `e1085846`,
 two rounds each, jed harnesses only, p50; the machine was shared with another benchmark run):
 
 | lane | Rust base → after | Go base → after | TS base → after |
@@ -1759,7 +1759,7 @@ Every core and both variants returned the same checksums.
 
 The `decimal_*` lanes landed with the decimal and columnar-lane work of packed-leaf.md §11 Track A5
 (the lane choices are contract in every core — memory.md §5.4, cost.md §6.1 — and each core did its
-own read-path and decimal-arithmetic work). Base `f076eec6` against the branch, each core's own jed
+own read-path and decimal-arithmetic work). Base `fcc7369a` against the branch, each core's own jed
 harness, p50 in ms over 200k rows, the scratch database file-backed; PostgreSQL 18 on the same
 machine:
 
@@ -1787,7 +1787,7 @@ both set, the Rust core's times for these lanes are unchanged, where each used t
 
 **Format v51** then made the ledger's two `numeric(12,2)` columns fixed-width 8-byte slots
 ([decimal.md](decimal.md) §6a). The scratch file went from 13.1 MB to 11.0 MB in every core (the
-three files are byte-identical). Alternating base (`ff0b11cf`) and v51 builds — base, v51, base,
+three files are byte-identical). Alternating base (`ccc07584`) and v51 builds — base, v51, base,
 v51 — of each core's own jed harness, p50 in ms; a range is the two runs where they differed by
 more than about 5%. The machine was shared, and Go's grouped and top-N lanes were noisy on both
 sides:
@@ -1813,7 +1813,7 @@ harnesses were not re-run for this change.
 The GIN disjunction, multi-column, jsonpath, and posting-run slices (gin.md §2.2/§4.4/§4.5/§6.3) add
 `gin_in` (an `IN` list of three array constants) and `gin_jsonb_path_match` (`doc @@ '$.n == 7 &&
 $.kind == "k7"'`), and treat every `gin_*` / `custom_plan_gin_*` lane as affected. Measured with the
-three jed harnesses, alternating base (`172e3b0a`) and branch builds — base, after, base, after —
+three jed harnesses, alternating base (`e1085846`) and branch builds — base, after, base, after —
 against one corpus, each variant on its own `bench/data`. **The machine was loaded** (other agents'
 builds and test runs shared it), so differences under about ±15% are noise. p50 per query:
 

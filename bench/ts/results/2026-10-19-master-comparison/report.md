@@ -1,6 +1,6 @@
 # Rebased TS runtime versus master — 2026-10-19
 
-> Archive: [original report and compact provenance](https://github.com/jackc/jed/tree/cb23e92204eb93b38869adb2088c9c4b95ca2b1d/bench/ts/results/2026-10-19-master-comparison). Measured commit IDs are unchanged; the bulk raw runs described below remain local, ignored files and were never committed.
+> Archive: [original report and compact provenance](https://github.com/jackc/jed/tree/adfa051f2b22b022c9b915b719797b54ed3d549e/bench/ts/results/2026-10-19-master-comparison). Measured commit IDs are unchanged; the bulk raw runs described below remain local, ignored files and were never committed.
 
 The production worker path takes 17–36% longer than master's direct core for these three expensive,
 small-result Node workloads, and 18–36% longer in Chromium. The 200,000-row typed drain is 64% slower
@@ -15,8 +15,8 @@ Node and 24% slower in Chromium before introducing the worker boundary.
 
 ## Revisions and method
 
-- Master: `0b1869c8e97051e7e4c88853058cf11eb942181b`.
-- Rebased engine: `f70719f03f1a6589d148481f120a0000c5bcc61a`. The rebase was clean; the subsequent comparison
+- Master: `218015fa4fbf01e03b39dca0de9aa6c72ddcceca`.
+- Rebased engine: `14be602ac233dc108328bf5e7f5a838e4c12d38f`. The rebase was clean; the subsequent comparison
   harness/report changes do not alter this measured engine.
 - Intel Core Ultra 9 285K, Linux 7.0.0-38-generic, x64; both hosts pinned to CPUs 0,2.
 - Node 26.10.0 / V8 14.6.202.34-node.34. Headless Chromium 149.0.7827.55 / V8 14.9.207.21;
@@ -115,9 +115,9 @@ not implemented by this branch. These numbers do not measure encrypted SQL or pr
 
 ## Reproduce and verification
 
-`JED_COMPARE_MASTER=0b1869c8e97051e7e4c88853058cf11eb942181b JED_COMPARE_BRANCH=f70719f03f1a6589d148481f120a0000c5bcc61a JED_COMPARE_CPUS=0,2 mise run bench:ts_compare_matrix`
+`JED_COMPARE_MASTER=218015fa4fbf01e03b39dca0de9aa6c72ddcceca JED_COMPARE_BRANCH=14be602ac233dc108328bf5e7f5a838e4c12d38f JED_COMPARE_CPUS=0,2 mise run bench:ts_compare_matrix`
 
-See [the harness](../../compare/README.md) for controls and [compact provenance](https://github.com/jackc/jed/blob/cb23e92204eb93b38869adb2088c9c4b95ca2b1d/bench/ts/results/2026-10-19-master-comparison/provenance.json)
+See [the harness](../../compare/README.md) for controls and [compact provenance](https://github.com/jackc/jed/blob/adfa051f2b22b022c9b915b719797b54ed3d549e/bench/ts/results/2026-10-19-master-comparison/provenance.json)
 for exact result/source hashes. Raw gzip results, snapshots, bundles and detailed summaries remain
 in ignored `bench/results/ts-master-comparison-final-20261019/`; no new raw benchmark outputs are committed. A reproduction should run with
 other tests/builds stopped and does not need the one-off contaminated-block replacement.

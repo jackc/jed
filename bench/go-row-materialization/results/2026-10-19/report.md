@@ -9,9 +9,9 @@ No G1/G2/G3 machinery, dependency, unsafe code, cgo, or FFI was introduced.
 
 ## Baseline and method
 
-Clean production baseline: `c105eed383cae6ef98cfc8872b71aa3657f1c999`, recorded
+Clean production baseline: `109aa27f79d4c6071f5755b9829eb20cde109b8c`, recorded
 before creating `codex/go-row-materialization`. The investigation inspected
-`571e3e9fd2e3de2d4eb3daa2b3dd1715781de7b1` and its specialization report;
+`c8101fb0c96136eafbae603791f04c51c66c365c` and its specialization report;
 only its tag-independent complete-query benchmark was adapted. The production
 change touches four Go files (48 additions, four deletions). Production source
 hashes were unchanged between timing and verification; additional ownership and
@@ -108,7 +108,7 @@ future generated output also defaults to the ignored results directory.
 
 ## Integration onto master
 
-Rebased onto `dfb0699f18e7c5bb120bc0f885f257791b19e2b9`. Its Go cancellation
+Rebased onto `277f68cedb3117457d82c9d924ba0fac9a0e9c8b`. Its Go cancellation
 implementation uses channels instead of callbacks, so the diagnostic now cancels
 through the public context API before open or a cursor pull. The production
 optimization is unchanged. Full Go unit/race, oracle, NoREC, memory/disk corpus,

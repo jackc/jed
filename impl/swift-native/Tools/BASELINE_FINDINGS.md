@@ -1,6 +1,6 @@
 # Frozen baseline findings
 
-Baseline: `362e0798ac3a8bd04bd2da556044b6ec73bf468a`. These observations do
+Baseline: `0b76dd6e9c2675b552eb8af9e820065351ffa4b3`. These observations do
 not amend shared expected results or declare Swift acceptance complete.
 
 - **ALTER rewrite pending bytes:** the frozen full-table and backing-index
@@ -50,7 +50,7 @@ not amend shared expected results or declare Swift acceptance complete.
 - **Exact KMV capacity:** all three frozen collectors entered estimation when the
   retained heap reached4,096, even if no additional distinct hash had been seen.
   A4,096-distinct population with duplicate rows therefore disagreed with
-  statistics.md§4.2. Local-only shared correction `616b3a3e` remembers overflow
+  statistics.md§4.2. Local-only shared correction `dc130ecf` remembers overflow
   explicitly; all three supported cores pass the new boundary regression and
   their statistics suites. Swift implements the canonical rule and exercises
   the new shared case separately from its frozen baseline corpus.
@@ -201,7 +201,7 @@ not amend shared expected results or declare Swift acceptance complete.
   Those three existing cases each passed (3/3); the new five-observation probe
   succeeded in each core (15 matching observations). Relevant complete source
   files were byte-identical to frozen baseline
-  `362e0798ac3a8bd04bd2da556044b6ec73bf468a`, not inferred from later changes:
+  `0b76dd6e9c2675b552eb8af9e820065351ffa4b3`, not inferred from later changes:
   Go `exec_scan.go`/`cost.go`/`streaming_test.go`; Rust
   `src/executor/exec_scan.rs`/`src/cost.rs`/`tests/streaming.rs`; TypeScript
   `src/executor.ts`/`tests/streaming.test.ts`. Construction sites are Go
@@ -273,7 +273,7 @@ not amend shared expected results or declare Swift acceptance complete.
   measurement change.
 
 - **Floating overflow `DataTypeName` omission in Go:** the frozen implementation
-  at `362e0798ac3a8bd04bd2da556044b6ec73bf468a` used an untyped
+  at `0b76dd6e9c2675b552eb8af9e820065351ffa4b3` used an untyped
   `overflowFloatErr()` in `impl/go/float.go`, whereas the corresponding Rust and
   TypeScript sites called their typed `overflow(type)` constructor. The
   canonical registry's `22003` template names `{type}`, and error-fields.md §5

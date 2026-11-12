@@ -1,6 +1,6 @@
 # Browser, WASM, and key-lifecycle probes (2026-10-17)
 
-> Archive: [original report, committed data and experiment artifacts](https://github.com/jackc/jed/tree/fb446f2f70ad48e25727a8317418b82555dc774e/bench/aead/results). Artifact paths and historical reproduction commands below refer to that snapshot; measured commit IDs are unchanged. Outputs explicitly described as local or ignored were not committed.
+> Archive: [original report, committed data and experiment artifacts](https://github.com/jackc/jed/tree/8d22ddd5d06f26331a0bc00ba14d3a2933a44891/bench/aead/results). Artifact paths and historical reproduction commands below refer to that snapshot; measured commit IDs are unchanged. Outputs explicitly described as local or ignored were not committed.
 
 Five 100 ms samples after one warmup per case; medians. Sequential timing workers pinned to CPU 0, Intel Core Ultra 9 285K. Chromium 149.0.7827.55; Node v26.10.0. Raw JSON retains samples, fixtures and source/artifact hashes.
 

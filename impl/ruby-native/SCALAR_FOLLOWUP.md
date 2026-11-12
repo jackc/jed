@@ -53,7 +53,7 @@ baseline revision.
 
 ## Measurement contract
 
-Baseline commit: `28b12a8acca84c51d1fb4c3b56c58d9c8fae5f07`.
+Baseline commit: `fa52671161d8f18881cb3476124b8474b8c5a135`.
 Baseline Ruby library SHA-256:
 `a4e732343b161afcab199bf9b5a4bde5927c657e0721caa21726bb99a14ef0a7`.
 Final Ruby library SHA-256:

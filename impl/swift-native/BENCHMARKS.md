@@ -9,7 +9,7 @@ equal weight. These are diagnostic results, not a new result for the full
 143-workload suite.
 
 Current production source: local-only
-`43481e2047da1cee34a627b910c8a7c7c59c473f`. All three final comparisons pass their
+`fb34b0e8cb3d82287fbd3401e3426f04b3b86c7a`. All three final comparisons pass their
 complete membership, result-signature and raw-sample checks. The [verification
 report](VERIFICATION.md#structural-follow-up-acceptance) separately records 543
 native tests, all 749 frozen SQL files and the refreshed resource/storage/process
@@ -97,7 +97,7 @@ descriptive median wins, not significance claims. Go rollback insertion ranges
 from 3.694 to 6.944 ms across rounds, so its median is especially variable.
 
 The original complete 143-workload comparison below measured **9.1990× Rust,
-7.5125× Go and 2.1292× TypeScript** for the earlier `cec8170` actor. Comparing
+7.5125× Go and 2.1292× TypeScript** for the earlier `3db8fc2` actor. Comparing
 those numbers directly with this selected 22-workload average would mix
 membership and measurement conditions. The paired measurements below establish
 the before/after gains instead.
@@ -267,10 +267,10 @@ The diagnostic task bodies are archived with their run artifacts. The ordinary
 full-suite task remains `mise run swift-native:bench`; this follow-up does not
 claim a second complete 143-workload run.
 
-## Historical complete 143-workload comparison (`cec8170`)
+## Historical complete 143-workload comparison (`3db8fc2`)
 
 The remainder of this document preserves the original optimization report and
-its original actors. It does not describe the later `43481e2` implementation.
+its original actors. It does not describe the later `fb34b0e` implementation.
 
 The complete Linux comparison passed **143 workloads × four cores × three rounds in each run**, with zero result-validation failures. The profile-guided Swift change improves `full_scan_agg` from **1119.919 to 217.729 ms/query (5.1436×)** and `full_scan_minmax` from **1227.483 to 284.925 ms/query (4.3081×)**. Across all 143 workloads, the equal-weight geometric-mean Swift speedup is **1.0325×**; the median workload speedup is **1.0071×**.
 
@@ -359,15 +359,15 @@ Forty of the 43 slower workloads have overlapping before/after ranges of their t
 | Item | Baseline | Optimized full run |
 |---|---|---|
 | Evidence directory | `results/benchmark-baseline-20261106` | `results/benchmark-after-20261106` |
-| Source checkpoint | `76f4c4c866ddf04f01a9b7d38f6e0b7573c592c6` | Actual capture HEAD `afbde4c6d2e87e5d3405e228ea233e7012eb209d` |
-| Engine optimization | None | `cec8170bfc33f087fa98949ae661b1eaa5490218` |
-| Difference after engine commit | Not applicable | `afbde4c6` changes only `impl/swift-native/PROGRESS.md` |
+| Source checkpoint | `6d160e505da7a92269c0a14e38b90c5351a57119` | Actual capture HEAD `7c4803e9243c7be093dab8f28553d733fbbd1cba` |
+| Engine optimization | None | `3db8fc2d2653475abc5e9d43049254ccd1e92387` |
+| Difference after engine commit | Not applicable | `7c4803e9` changes only `impl/swift-native/PROGRESS.md` |
 | Workload membership | 143 selected, zero omitted | Same 143 selected and completed, zero omitted, diagnostic=false |
 | Core-round membership | 12/12, successful | 12/12, successful |
 | Logical results | All four cores and all three rounds agree | All four cores and all rounds agree within and across both runs |
 | Swift executable SHA-256 | `44a127af9e7891bb245e846fa38edd3cb1a186c3be6c90267365407ff39d3aa7` | `e33fd8a85db9193a84e9d6a0ae7a2531bd69bb2297dabda48dbc019133325d1f` |
 
-These are local source checkpoints, not a statement that changes were pushed. The experiment's frozen shared-input revision is separately `362e0798ac3a8bd04bd2da556044b6ec73bf468a`, distinct from the measured baseline engine checkpoint.
+These are local source checkpoints, not a statement that changes were pushed. The experiment's frozen shared-input revision is separately `0b76dd6e9c2675b552eb8af9e820065351ffa4b3`, distinct from the measured baseline engine checkpoint.
 
 Both runs were freshly built by the task, not run with `--no-build`. Both source-status records contain only unrelated untracked `tasks/`. Each run retains build commands/logs, observed source files and hashes, revision/status/diff, immutable native actors, and a copied TypeScript/Node runtime tree. A source snapshot alone does not prove which source compiled an arbitrary existing binary, especially with `--no-build`; build logs and immutable actor hashes are separate provenance evidence. Both successful harness reports and the completed strict comparison establish the full membership and logical agreement above.
 
@@ -475,7 +475,7 @@ An [independent read-only audit](results/benchmark-independent-audit-20261106/RE
 
 ### Profile-guided change and earlier diagnostic
 
-Commit `cec8170bfc33f087fa98949ae661b1eaa5490218` adds a retained packed-leaf position to the tree cursor and uses it for the existing eligible, unfiltered, ungrouped whole-table fixed-cell aggregate lane. It decodes touched cells in their original order, folds the original aggregate states, and preserves cost, cancellation and memory-account schedules. Filtered, grouped and variable-width aggregation stays on its existing driver. Slice-aware value decoding also removes avoidable intermediate byte-array copies. No file format, result semantics, shared workload, or durability change is part of the optimization.
+Commit `3db8fc2d2653475abc5e9d43049254ccd1e92387` adds a retained packed-leaf position to the tree cursor and uses it for the existing eligible, unfiltered, ungrouped whole-table fixed-cell aggregate lane. It decodes touched cells in their original order, folds the original aggregate states, and preserves cost, cancellation and memory-account schedules. Filtered, grouped and variable-width aggregation stays on its existing driver. Slice-aware value decoding also removes avoidable intermediate byte-array copies. No file format, result semantics, shared workload, or durability change is part of the optimization.
 
 The completed baseline selected `full_scan_agg` for investigation. The corrected before stack capture has 91 main-thread observations at the 20-second duration limit; all include `GroupedSelectExecution`, with leaf `swift_release` 29, `swift_retain` 25, and slow decrement four. The after capture has 19 observations and exits naturally with status 0 after the same canonical three warmups plus 20 queries; 17 include `foldPackedWholeTable`. One after sample is in opening the tree skeleton, and one is a single CRC32 frame with unavailable parent context.
 

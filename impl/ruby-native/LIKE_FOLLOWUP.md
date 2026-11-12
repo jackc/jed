@@ -4,7 +4,7 @@
 > experiment branch. See the [archive and retrieval instructions](../../bench/ruby-native/ARCHIVE.md).
 > Reproduction commands below refer to that original checkout.
 
-This optimization follows the cursor correctness fixes in `96b2f163`. Ruby remains
+This optimization follows the cursor correctness fixes in `f78aa2b7`. Ruby remains
 an explicitly selected, frozen experiment. The parser, planner and matcher remain
 handwritten Ruby; no dependency or normal test/benchmark/CI task changes.
 
@@ -32,7 +32,7 @@ Both the original pattern and its decoded literal count against the existing
 
 ## Evidence
 
-The baseline archive is the pushed correctness revision `96b2f163`, library
+The baseline archive is the pushed correctness revision `f78aa2b7`, library
 SHA-256 `7724a4418421e56948d036dc04e54008df97b19d2609cf8b65a7ca0f63a2fe02`.
 The optimized library SHA-256 is
 `3e749562c6b764681d6917604cf02aa73b3194cfdbb8c5e756616588de91dc88`.

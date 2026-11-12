@@ -1,6 +1,6 @@
 # TypeScript large typed-result investigation
 
-> Archive: [original report, committed data and experiment artifacts](https://github.com/jackc/jed/tree/b4fb408c6e173e8f092e0e21d9ef2c7364fb6d18/bench/ts/results/2026-10-18-result-batching). Artifact paths and historical reproduction commands below refer to that snapshot; measured commit IDs are unchanged. Outputs explicitly described as local or ignored were not committed.
+> Archive: [original report, committed data and experiment artifacts](https://github.com/jackc/jed/tree/572d4d3b0e444e38afa5aa0b7e4d1b8d476f2b41/bench/ts/results/2026-10-18-result-batching). Artifact paths and historical reproduction commands below refer to that snapshot; measured commit IDs are unchanged. Outputs explicitly described as local or ignored were not committed.
 
 Increasing the default row cap from 128 to 512, within the existing **256 KiB batch / 2 MiB
 held-result limits**, reduces the 200,000-row query's worker time by **8.1% in Chromium** and
@@ -28,7 +28,7 @@ browser wall-clock measurements. They establish significant per-row work beyond 
 
 ## Controlled default comparison
 
-Before is engine commit `da455ecd24ede5c66c8f80bbbaa689c221cc8e3b`. After differs only in the
+Before is engine commit `377965478ed010fe7625c1f0d8fa28a66167d95e`. After differs only in the
 production `maxBatchRows` default, 128 → 512. Both variants use the same benchmark harness,
 including this change's optional batch-limit overrides; the controlled runs supply neither
 override. All source checks, actual limits and browser build hashes are retained in raw JSON.

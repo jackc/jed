@@ -14,7 +14,7 @@ require "time"
 # and transport references; no default benchmark/CI task imports this module.
 module SwiftNativeBenchmark
   ROOT = SwiftNativeTasks::ROOT
-  BASELINE = "362e0798ac3a8bd04bd2da556044b6ec73bf468a"
+  BASELINE = "0b76dd6e9c2675b552eb8af9e820065351ffa4b3"
   CORES = %w[swift rust go ts].freeze
   HASHES = {
     "benchmarks.toml" => "a7be0f426d9d4432b238eca05b73d6a29b4a114b9c8aaca6c85f71cb94fe3f96",

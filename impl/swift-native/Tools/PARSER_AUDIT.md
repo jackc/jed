@@ -2,7 +2,7 @@
 
 Run `mise run swift-native:parser-audit` from the repository. The task reads every
 `.test` blob below `spec/conformance/suites` at baseline
-`362e0798ac3a8bd04bd2da556044b6ec73bf468a`, extracts every statement/query SQL record,
+`0b76dd6e9c2675b552eb8af9e820065351ffa4b3`, extracts every statement/query SQL record,
 and passes it to the handwritten Swift lexer/parser. No record is skipped based
 on host directives, storage mode, or expected error. Concurrency commands that
 are not statement/query records are outside this syntax audit.

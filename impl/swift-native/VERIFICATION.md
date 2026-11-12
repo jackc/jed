@@ -1,10 +1,10 @@
 # Swift experiment verification
 
 Status: **Linux acceptance and structural-performance revalidation are complete.**
-Current implementation revision: `43481e2047da1cee34a627b910c8a7c7c59c473f`.
+Current implementation revision: `fb34b0e8cb3d82287fbd3401e3426f04b3b86c7a`.
 The original snapshot and its evidence below remain preserved at
-`cec8170bfc33f087fa98949ae661b1eaa5490218`. Semantic target revision:
-`362e0798ac3a8bd04bd2da556044b6ec73bf468a`.
+`3db8fc2d2653475abc5e9d43049254ccd1e92387`. Semantic target revision:
+`0b76dd6e9c2675b552eb8af9e820065351ffa4b3`.
 Platform exercised: Ubuntu Linux x86-64, Swift 6.4.2. Apple platforms are
 unverified. The package and all runners are explicitly opt-in.
 
@@ -94,14 +94,14 @@ were checked with a subset of the gates below. Committed as `3bea4580`.
 
 Not re-run: exact cross-core resource accounting, encrypted SQL, Rust and
 TypeScript interchange, saved and generated fault simulations, mixed processes
-and page-service SQL. The tables below describe `43481e20`, not this source.
+and page-service SQL. The tables below describe `fb34b0e8`, not this source.
 
 ## Structural follow-up acceptance
 
 The explicitly authorized follow-up changes value representation, scan and
 aggregate execution, immutable dirty leaves, and prepared-query ownership.
 It changes no shared fixture, logical accounting rule, file format or dependency.
-The production source checkpoint is local-only `43481e2047da1cee34a627b910c8a7c7c59c473f`.
+The production source checkpoint is local-only `fb34b0e8cb3d82287fbd3401e3426f04b3b86c7a`.
 Performance evidence and its subset limits are separate in [BENCHMARKS.md](BENCHMARKS.md).
 
 Evidence root: `results/architecture-20261106/verification-final`. Its compact
@@ -137,7 +137,7 @@ its output paths and actor identities; driver logs preserve invocation details.
 
 The first service run with `--no-build` **failed** and is retained in `service/`.
 Only Go-client/Swift-owner failed: a reused Go adapter lacked the already
-committed `01c483cc` GiST-loader staging correction. Disassembly, old/fresh
+committed `a71c0662` GiST-loader staging correction. Disassembly, old/fresh
 binary hashes and the exact record-8/25-unrun-record diagnosis are retained in
 `stale-go-audit.txt`. The rebuilt-Go probe in `service-fresh-go-probe/`, followed
 by the complete rebuilt-peer matrix, passed against the **unchanged Swift owner**.
@@ -166,7 +166,7 @@ source. Apple platforms remain unverified.
 
 ## Original postoptimization acceptance
 
-Optimized implementation: `cec8170bfc33f087fa98949ae661b1eaa5490218`.
+Optimized implementation: `3db8fc2d2653475abc5e9d43049254ccd1e92387`.
 The complete release benchmark comparison and its limits are recorded separately
 in [BENCHMARKS.md](BENCHMARKS.md). Source labels do not replace the actor identities
 below, and earlier successful actors are not credited with testing later edits.
@@ -195,7 +195,7 @@ The first encrypted attempt is deliberately preserved as a failure in `encrypted
 
 `actor-identities.json` also retains the supported interchange and simulation command/actor identities, and the saved simulation's supported-source hashes. The original V04/encrypted manifests retain every resource-file hash. The native test log itself does not embed an executable digest; the subsequent immutable XCTest captures identify the release test binary from that build. Do not invent a native-log hash attestation it did not record, or substitute a digest from a later build.
 
-`source-identity.json` identifies the optimization and docs-only checkpoint, the archive's observed HEAD, and the frozen contract revision `362e0798ac3a8bd04bd2da556044b6ec73bf468a`. Actor identity and observed source identity are distinct evidence. The archive copies small reports/logs with pre-copy/post-copy SHA equality; its manifest hashes every copied/generated evidence file. No engine, fixture expectation, or tracked documentation was changed to produce this archive.
+`source-identity.json` identifies the optimization and docs-only checkpoint, the archive's observed HEAD, and the frozen contract revision `0b76dd6e9c2675b552eb8af9e820065351ffa4b3`. Actor identity and observed source identity are distinct evidence. The archive copies small reports/logs with pre-copy/post-copy SHA equality; its manifest hashes every copied/generated evidence file. No engine, fixture expectation, or tracked documentation was changed to produce this archive.
 
 
 ### Interactive CLI verification
@@ -269,7 +269,7 @@ subsequent source edits cannot alter a running comparison.
 ## Coverage and limits
 
 All required Linux behavior in the recorded scope and host/tool matrices is
-implemented and verified. The original `cec8170` snapshot's complete 143-workload,
+implemented and verified. The original `3db8fc2` snapshot's complete 143-workload,
 four-core, three-round release baseline and after run passed their logical
 comparisons. The structural follow-up uses separate diagnostic performance
 subsets; [BENCHMARKS.md](BENCHMARKS.md) records their membership, measurements

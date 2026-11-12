@@ -10,7 +10,7 @@ mode = ARGV.shift || "build"
 root = Tasks::ROOT
 work = File.expand_path(ENV.fetch("JED_ROW_WORK", ".dev/row-materialization"), root)
 out = File.expand_path(ENV.fetch("JED_ROW_RESULTS", "bench/results/go-row-materialization/2026-10-19"), root)
-baseline = ENV.fetch("JED_ROW_BASELINE", "c105eed383cae6ef98cfc8872b71aa3657f1c999")
+baseline = ENV.fetch("JED_ROW_BASELINE", "109aa27f79d4c6071f5755b9829eb20cde109b8c")
 FileUtils.mkdir_p([work, out])
 bench = File.join(root, "impl/go/row_materialization_bench_test.go")
 case mode

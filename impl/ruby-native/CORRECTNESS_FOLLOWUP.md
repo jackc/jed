@@ -13,7 +13,7 @@ The original measurements and raw failure reports remain historical evidence.
 
 Updated 2026-10-19. This explicitly requested pass fixes defects found during the
 [pipeline audit](PIPELINE_FOLLOWUP.md) at commit
-`39f804e416fd264a315b98183ef38354e5105d15`. The Ruby core remains frozen and opt-in;
+`95401ae24343873dda3e6e5d6fb8459a28faf74a`. The Ruby core remains frozen and opt-in;
 this work does not change the shared SQL, memory, cost, or file-format contracts.
 
 ## Corrected behavior

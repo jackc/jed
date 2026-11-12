@@ -1,8 +1,8 @@
 # Profile-guided TS delivery experiments
 
-> Archive: [original report, committed data and experiment artifacts](https://github.com/jackc/jed/tree/f70719f03f1a6589d148481f120a0000c5bcc61a/bench/ts/results/2026-10-19-delivery-optimization). Artifact paths and historical reproduction commands below refer to that snapshot; measured commit IDs are unchanged. Outputs explicitly described as local or ignored were not committed.
+> Archive: [original report, committed data and experiment artifacts](https://github.com/jackc/jed/tree/14be602ac233dc108328bf5e7f5a838e4c12d38f/bench/ts/results/2026-10-19-delivery-optimization). Artifact paths and historical reproduction commands below refer to that snapshot; measured commit IDs are unchanged. Outputs explicitly described as local or ignored were not committed.
 
-Measured 2026-10-19 against `74ed390506e5443fa6793328194bd85ae441f204`.
+Measured 2026-10-19 against `90458e634cb76f4e45ac3e1d305796bdfc2d3c11`.
 **Retained: direct ASCII scanning for successful SQL hex decoding.** The codec and idle-worker
 dispatch prototypes are reverted; their patches and measurements remain as experiment artifacts.
 Production transport, batch limits and 256-checkpoint task yields are unchanged.
@@ -143,7 +143,7 @@ Final verification passes: all three TS typecheck configurations; 1,137 TS unit 
 tests, including OPFS and message-only cancellation. The PostgreSQL oracle check and filtered
 Go/Rust memory/disk checks above also pass. Repository lint passes with four existing warnings
 (the oversized executor, two unused symbols, and a type-import style warning).
-Detailed commands are in [verification.json](https://github.com/jackc/jed/blob/f70719f03f1a6589d148481f120a0000c5bcc61a/bench/ts/results/2026-10-19-delivery-optimization/verification.json).
+Detailed commands are in [verification.json](https://github.com/jackc/jed/blob/14be602ac233dc108328bf5e7f5a838e4c12d38f/bench/ts/results/2026-10-19-delivery-optimization/verification.json).
 
 ## Reproduction and scope
 
@@ -158,8 +158,8 @@ atomic cancellation; browser cancellation is message-based. Storage is warm in-m
 pages. Limits remain 512 rows / 256 KiB per batch, 2 MiB client result credit. Timed throughput
 does not pass an AbortSignal; cancellation is a separate instrumented experiment.
 
-[Reproduction instructions](https://github.com/jackc/jed/blob/f70719f03f1a6589d148481f120a0000c5bcc61a/bench/ts/results/2026-10-19-delivery-optimization/experiments/reproduce.md), source manifests and patches identify
-every variant. [Raw-result manifest](https://github.com/jackc/jed/blob/f70719f03f1a6589d148481f120a0000c5bcc61a/bench/ts/results/2026-10-19-delivery-optimization/manifest.json) and [derived summary](https://github.com/jackc/jed/blob/f70719f03f1a6589d148481f120a0000c5bcc61a/bench/ts/results/2026-10-19-delivery-optimization/summary.json) retain individual samples, validation,
+[Reproduction instructions](https://github.com/jackc/jed/blob/14be602ac233dc108328bf5e7f5a838e4c12d38f/bench/ts/results/2026-10-19-delivery-optimization/experiments/reproduce.md), source manifests and patches identify
+every variant. [Raw-result manifest](https://github.com/jackc/jed/blob/14be602ac233dc108328bf5e7f5a838e4c12d38f/bench/ts/results/2026-10-19-delivery-optimization/manifest.json) and [derived summary](https://github.com/jackc/jed/blob/14be602ac233dc108328bf5e7f5a838e4c12d38f/bench/ts/results/2026-10-19-delivery-optimization/summary.json) retain individual samples, validation,
 environment, bundle hashes and timer/frame observations. Source hashes were checked before
 and after every process, and the selected production source matches the frozen `hex` variant.
 The revision field inside raw results describes the launching checkout; variant source hashes

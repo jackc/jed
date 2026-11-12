@@ -1,7 +1,7 @@
 # Native index foundations
 
 The experimental Swift core reads the frozen baseline
-`362e0798ac3a8bd04bd2da556044b6ec73bf468a`. These checks concern native index
+`0b76dd6e9c2675b552eb8af9e820065351ffa4b3`. These checks concern native index
 storage and kernels; they do not establish complete SQL planning, execution,
 concurrency, or database lifecycle conformance.
 
@@ -69,7 +69,7 @@ and PostgreSQL 18 forced-GIN probe confirmed the defect; the direct predicate an
 forced sequential scan return the row.
 
 The shared correction was reviewed independently and committed locally as
-`2e13d1b8`. Rust, Go, and TypeScript apply the same narrow extraction rule. The
+`ebf98dcc`. Rust, Go, and TypeScript apply the same narrow extraction rule. The
 shared regression checks both `@@` and `@?` before and after index creation;
 the oracle ledger records the PostgreSQL forced-index defect without overriding
 query expectations. No page encoding or golden changed. This correction is

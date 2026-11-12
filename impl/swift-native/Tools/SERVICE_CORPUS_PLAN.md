@@ -11,7 +11,7 @@ external owner exposes the existing `owner-idle` control protocol and ordinary
 page-service transport; no SQL is delegated to the owner.
 
 The task checks every frozen corpus file against the source baseline
-`362e0798ac3a8bd04bd2da556044b6ec73bf468a` and verifies identical live inputs before
+`0b76dd6e9c2675b552eb8af9e820065351ffa4b3` and verifies identical live inputs before
 using supported runners. The original sequential disk eligibility rules apply:
 concurrency schedules and authored `#skip: disk` files are reported exclusions.
 Rows, errors, names, types and cost remain the unchanged corpus assertions.

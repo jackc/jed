@@ -78,7 +78,7 @@ only on the simplest scalar. Cold probes use the same five-batch schedule as
 the cheap repeated queries.
 
 Before measurements use the unchanged scalar-follow-up source at
-`e5dbbe514e41822793e92c996fffbba5e5419e96`, SHA-256
+`c313e1038fa1e5b2a53e763a54bfeeadb338b272`, SHA-256
 `7d1197be345d44a7c389a66ec0a18d038282d26d59fad97ab08f8bdd6f8a7a28`.
 Every report records native/wrapper/Rust source, executable, harness, extension,
 and fixture hashes as applicable, plus actual JIT state and source stability.

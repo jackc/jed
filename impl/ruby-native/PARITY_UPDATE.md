@@ -2,33 +2,33 @@
 
 The maintainer explicitly requested this update to keep the experiment alive.
 It brings the pure Ruby core level with the supported cores at source revision
-`1c5a8961` (Add jed check, the integrity check as a CLI verb). It does not change
+`56f49192` (Add jed check, the integrity check as a CLI verb). It does not change
 the core's experimental or frozen status. Later features again do not update it
 unless requested. Historical reports and benchmark results are unchanged; this
 update records no new performance measurements.
 
-The previous surface tracked `d4a01ebd`. The supported-core work since then that
+The previous surface tracked `d980b536`. The supported-core work since then that
 this update ports:
 
 | Area | Supported-core commits | Ruby work |
 |---|---|---|
-| `MERGE`, joined sources, view targets, EXPLAIN, hash form | `0c604e64`, `2023ed2e` | `merge.rb` |
-| Per-row key metering for sorts, grouping, dedup | `586c50a3`, `684effad` | `key_metering.rb` and every sort/hash site |
-| Cost-ordered filter conjuncts | `71340f7f` | `compile_filter` sorts; constraint, index, arbiter, check-option and MERGE WHEN predicates keep their written order |
-| `SELECT DISTINCT ON` | `bb012dbd` | base `select`, EXPLAIN `Distinct on=N` |
-| `SIMILAR TO`, `similar_to_escape`, SIMILAR substring | `24aeebe4` | `similar.rb`, regex VM |
-| Cheapest implicit argument coercions | `f41da319` | `arg_coercion.rb`, generated `ARG_COERCIONS` |
-| Format v50 UNIQUE constraint ownership; DROP INDEX / DROP SEQUENCE refusals; ALTER SEQUENCE RENAME rewrites defaults | `c28c6995`, `69089517` | file format, DDL |
-| Integrity-check host API | `b00efd19`, `9ad44b08`, `a9e01aa2`, `524e4597`, `0c26dfcb` | `Database#integrity_check`, `integrity.rb` |
-| Time-based flush for `synchronous = off`; attachments close in name order | `61c7a236`, `0b1869c8` | idle flusher, environment clock |
-| Page-service wire follow-ups | `a70af0f2`, `f5fe6154` | hello credential, begin_write flags, write_begun pending/reuse |
-| Encryption at rest, credential change, rekey, sealed scratch, encrypted backups and service | `d6bbf570`, `b05e5185` | `crypto.rb`, `encryption_operations.rb` |
+| `MERGE`, joined sources, view targets, EXPLAIN, hash form | `80687977`, `16d6e14d` | `merge.rb` |
+| Per-row key metering for sorts, grouping, dedup | `8e678ec0`, `c40f1255` | `key_metering.rb` and every sort/hash site |
+| Cost-ordered filter conjuncts | `42b93e5e` | `compile_filter` sorts; constraint, index, arbiter, check-option and MERGE WHEN predicates keep their written order |
+| `SELECT DISTINCT ON` | `b6c1aa55` | base `select`, EXPLAIN `Distinct on=N` |
+| `SIMILAR TO`, `similar_to_escape`, SIMILAR substring | `3eb6af94` | `similar.rb`, regex VM |
+| Cheapest implicit argument coercions | `d4dbd5fd` | `arg_coercion.rb`, generated `ARG_COERCIONS` |
+| Format v50 UNIQUE constraint ownership; DROP INDEX / DROP SEQUENCE refusals; ALTER SEQUENCE RENAME rewrites defaults | `d3519b82`, `69089517` | file format, DDL |
+| Integrity-check host API | `929a2623`, `6ddba9d5`, `f1fd2555`, `e63bc849`, `56fa800c` | `Database#integrity_check`, `integrity.rb` |
+| Time-based flush for `synchronous = off`; attachments close in name order | `6c5a9683`, `218015fa` | idle flusher, environment clock |
+| Page-service wire follow-ups | `55c96483`, `fb8cc97e` | hello credential, begin_write flags, write_begun pending/reuse |
+| Encryption at rest, credential change, rekey, sealed scratch, encrypted backups and service | `783f7eee`, `b897413a` | `crypto.rb`, `encryption_operations.rb` |
 
-`aacad872` (deferred SQL-language triggers and functions) is documentation only.
-`25bee30a` (window sort sharing) needed no Ruby change beyond key metering.
-Simulator-runner fixes (`1e81d77c`, `1b05dbe6`, `081df0cc`, `678656d5`,
-`b43fbd31`) do not apply: the Ruby core has no simulator. Cancellation changes
-(`666575e8`, `d4c8ef54`) do not apply: it has no cancellation. TypeScript-only
+`628cdf0f` (deferred SQL-language triggers and functions) is documentation only.
+`6ad1616c` (window sort sharing) needed no Ruby change beyond key metering.
+Simulator-runner fixes (`1bc20cf6`, `f16e2dca`, `fbc8bc82`, `1c485270`,
+`b3172b26`) do not apply: the Ruby core has no simulator. Cancellation changes
+(`f47757ca`, `154303c9`) do not apply: it has no cancellation. TypeScript-only
 runtime, OPFS and benchmark work does not apply.
 
 ## Dependencies
@@ -46,7 +46,7 @@ Encryption extends the approved Ruby utility dependencies:
 
 ## Verification
 
-All counts are from `1c5a8961` plus this update, interpreter Ruby 4.0.7:
+All counts are from `56f49192` plus this update, interpreter Ruby 4.0.7:
 
 | Audit | Result |
 |---|---:|
@@ -67,12 +67,12 @@ Other checks:
 
 ## Omissions and divergences
 
-- **Page-service stream client (`b65dba76`):** no stream client and no `jed pages`
+- **Page-service stream client (`bd5a84f3`):** no stream client and no `jed pages`
   server. The process scenarios run Ruby as the owner; their stream-client steps run
   on another core.
 - **Relaxed page clients:** a relaxed page client commits synchronously through the
   service. The client cumulative manifests and the owner-side relaxed batch from
-  `a70af0f2` are not ported. The bytes stay compatible.
+  `55c96483` are not ported. The bytes stay compatible.
 - **Integrity check memory:** it holds a table's decoded rows and an index's
   entries in memory, which the bounded memory of the design (§5.4) does not allow.
   Two further gaps:

@@ -31,7 +31,7 @@ source revision; it does not constitute promotion or a promise of current-featur
 parity. See [ruby-native-experiment.md](ruby-native-experiment.md).
 
 The approved [native Swift experiment](swift-native-experiment.md) is frozen at
-`cec8170bfc33f087fa98949ae661b1eaa5490218` against its recorded semantic baseline,
+`3db8fc2d2653475abc5e9d43049254ccd1e92387` against its recorded semantic baseline,
 including Linux storage, encryption and page-service behavior, independently of Ruby's
 coverage. [Linux verification](../../impl/swift-native/VERIFICATION.md) and the
 [measured release comparison](../../impl/swift-native/BENCHMARKS.md) record its evidence

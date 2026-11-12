@@ -9,7 +9,7 @@ actor-specific verification and the measured comparison are recorded separately
 in [VERIFICATION.md](../VERIFICATION.md) and [BENCHMARKS.md](../BENCHMARKS.md).
 
 This records the implemented storage architecture at
-`cec8170bfc33f087fa98949ae661b1eaa5490218` in the frozen Swift experiment, not a new
+`3db8fc2d2653475abc5e9d43049254ccd1e92387` in the frozen Swift experiment, not a new
 shared storage design. The contracts are `transactions.md` §§2–3, 6–8,
 11; `pager.md` §§2–5; `validated-cow.md` §§1–4; `memory.md` §§7–8;
 `large-values.md` §15; `gist.md` §4.1; and the v50 plain/encrypted formats.

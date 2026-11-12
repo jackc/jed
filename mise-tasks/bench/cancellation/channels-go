@@ -5,7 +5,7 @@ require "tmpdir"
 require "fileutils"
 
 root = File.expand_path("../../..", __dir__)
-revision = "d4c8ef54"
+revision = "154303c9"
 out_dir = File.join(root, "bench/cancellation")
 
 def run!(*args, **options)

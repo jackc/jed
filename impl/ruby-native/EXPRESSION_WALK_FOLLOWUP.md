@@ -34,7 +34,7 @@ No new cache, dependency, SQL behavior or host API is introduced.
 ## Evidence and method
 
 The baseline is pushed commit
-`bd29129f6cb0b6a2c80d277bba1c436b01221697`, library SHA-256
+`013e1cf55666120a39a6f55c15280ff4692cd208`, library SHA-256
 `bb56f9a0b9592def93f4e0fb24f23098439b1d657e77f2d5fdbfdd14eeafc17d`,
 archived at `/tmp/jed-expression-walk-before/impl/ruby-native`.
 Final library SHA-256:

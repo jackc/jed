@@ -5,7 +5,7 @@
 # the source explicitly to compare an archived Ruby kernel with stdlib Zlib:
 # RUBY_NATIVE_SOURCE=/path/to/impl/ruby-native mise run ruby-native:bounded -- \
 #   ruby --yjit bench/ruby-native/checksum_probe.rb /path/to/results.json
-# The original lookup-followup measurements used the library from c3ba8e69.
+# The original lookup-followup measurements used the library from 8c5c6df9.
 require 'json'
 require 'zlib'
 require_relative 'source'

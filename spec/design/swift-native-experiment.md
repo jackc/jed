@@ -1,12 +1,12 @@
 # Native Swift core experiment
 
 Approved 2026-11-05. **Frozen experimental snapshot** at
-`43481e2047da1cee34a627b910c8a7c7c59c473f`. Structural implementation and Linux
+`fb34b0e8cb3d82287fbd3401e3426f04b3b86c7a`. Structural implementation and Linux
 correctness revalidation are complete: 543 native tests and all 749 frozen SQL
 files pass. Diagnostic performance comparisons are complete; see
 [VERIFICATION.md](../../impl/swift-native/VERIFICATION.md) and
 [BENCHMARKS.md](../../impl/swift-native/BENCHMARKS.md). The semantic target remains the
-supported Rust/Go/TypeScript surface at `362e0798ac3a8bd04bd2da556044b6ec73bf468a`.
+supported Rust/Go/TypeScript surface at `0b76dd6e9c2675b552eb8af9e820065351ffa4b3`.
 Recorded shared corrections and postbaseline regressions supplement the frozen
 inventory without changing its identity.
 The language-neutral specification and shared corpus define behavior. Existing cores
@@ -48,7 +48,7 @@ they must not swap in engine-owned result collection or evade accounting checkpo
 Independent review covers durability, crypto, accounting and adapters, followed by
 integrated tests. Review alone does not establish conformance.
 
-The original `cec8170bfc33f087fa98949ae661b1eaa5490218` snapshot's completed release
+The original `3db8fc2d2653475abc5e9d43049254ccd1e92387` snapshot's completed release
 baseline and optimization comparison each cover all 143 workloads, four cores and
 three rounds, with matched checksums and row counts. Those results remain historical
 evidence. The structural follow-up's completed measurements cover separate

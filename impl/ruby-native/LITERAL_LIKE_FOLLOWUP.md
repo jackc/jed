@@ -4,7 +4,7 @@
 > experiment branch. See the [archive and retrieval instructions](../../bench/ruby-native/ARCHIVE.md).
 > Reproduction commands below refer to that original checkout.
 
-This follows method sharing in `f8fa53cd`. The pure Ruby core remains a frozen,
+This follows method sharing in `99ff18af`. The pure Ruby core remains a frozen,
 opt-in experiment; no dependency, public API or normal CI/test/benchmark changes.
 
 ## Scope
@@ -32,7 +32,7 @@ and string encodings remain part of correctness verification.
 
 ## Evidence
 
-The baseline is pushed commit `f8fa53cdee02ff400624e6e81e1c9c4cce79eb8e`,
+The baseline is pushed commit `99ff18afb7a4d925589387cde6b71154b4c84615`,
 library SHA-256 `fec686e7484eda683c1692576175671b6c11fb5accaca78b6ccb71466f0ee70a`.
 Final library SHA-256:
 `e430431f7e9264c3cc3b9a75436c46841004a707f9c9ec0b72744beeb4c27f88`.
@@ -135,7 +135,7 @@ method-sharing tests pass in both the interpreter and YJIT.
 
 ## Reproduction
 
-Restore `impl/ruby-native` from baseline commit `f8fa53cd` into a separate
+Restore `impl/ruby-native` from baseline commit `99ff18af` into a separate
 directory. The measurement runner defaults to
 `/tmp/jed-literal-like-before/impl/ruby-native` and accepts `--baseline-source`.
 Run `bench/ruby-native/results/literal-like-followup/run.rb` with

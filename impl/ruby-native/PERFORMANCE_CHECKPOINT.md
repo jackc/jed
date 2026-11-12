@@ -10,11 +10,11 @@ not promote it or add it to normal tests, benchmarks, CI or feature maintenance.
 
 ## Scope and provenance
 
-The before source is commit `fc12f42798420fabc91dd6ee1274b961647071f8`, library
+The before source is commit `b70950c13f491453d5458222744b0a0a35c5c187`, library
 SHA-256 `3e749562c6b764681d6917604cf02aa73b3194cfdbb8c5e756616588de91dc88`.
 The final library SHA-256 is
 `e430431f7e9264c3cc3b9a75436c46841004a707f9c9ec0b72744beeb4c27f88`.
-It is committed in `e914ae1127533745f2c28c1cafbeb293ba14ed79`.
+It is committed in `5874935b65f3769637020c538d45816af118c484`.
 This measures the last two changes together; earlier reports retain the history
 of the larger port and compilation experiment.
 Measurements run on Linux x86-64 with an Intel Core Ultra 9 285K on
@@ -403,7 +403,7 @@ The evidence directory is
 It retains the explicit commands, selected plans, runtime identities, source
 pins, raw samples, bounds, complete validation signatures and derived summaries.
 
-Restore the before source from `fc12f427` into
+Restore the before source from `b70950c1` into
 `/tmp/jed-method-sharing-before/impl/ruby-native`. The driver accepts
 `--baseline-source PATH`; the source-pin helper uses the recorded default path.
 Preserve the existing JSON evidence outside this directory before a new run;

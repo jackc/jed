@@ -9,7 +9,7 @@ actor-specific verification and the measured comparison are recorded separately
 in [VERIFICATION.md](../VERIFICATION.md) and [BENCHMARKS.md](../BENCHMARKS.md).
 
 The acceptance contract is `spec/design/simulation-testing.md` at frozen baseline
-`362e0798ac3a8bd04bd2da556044b6ec73bf468a`: 18 regression traces and 22 profiles.
+`0b76dd6e9c2675b552eb8af9e820065351ffa4b3`: 18 regression traces and 22 profiles.
 The later shared empty-unary-subtree correction is a separately labelled regression,
 as with the postbaseline KMV corpus case; it does not change the frozen inputs.
 
@@ -22,7 +22,7 @@ skipped operations.
 
 ## Final saved-regression verification
 
-The optimized snapshot `cec8170bfc33f087fa98949ae661b1eaa5490218` passes all 18 saved
+The optimized snapshot `3db8fc2d2653475abc5e9d43049254ccd1e92387` passes all 18 saved
 traces in each of Swift, Go, Rust and TypeScript, 54 transcript comparisons,
 153 independently checked Swift images and 612 total images, with no failures
 or comparison exemptions. The durable [summary](../results/sim-regress-postoptimization-20261106/summary.json)

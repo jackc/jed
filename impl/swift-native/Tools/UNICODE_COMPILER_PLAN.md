@@ -1,6 +1,6 @@
 # Frozen Swift Unicode tooling contract
 
-Baseline: `362e0798ac3a8bd04bd2da556044b6ec73bf468a`.
+Baseline: `0b76dd6e9c2675b552eb8af9e820065351ffa4b3`.
 
 The source and byte contracts are `spec/collation/README.md` §§1–5,
 `spec/design/collation.md` §§4, 6, 9, 14, 16, the two compiler vectors,

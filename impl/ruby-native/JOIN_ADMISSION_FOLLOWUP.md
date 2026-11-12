@@ -37,7 +37,7 @@ No SQL behavior, cost model, host API, dependency or supported-core changes.
 ## Evidence and method
 
 The baseline is pushed commit
-`7b854f1f37551b47a06c595d446a0176080fb64b`, library SHA-256
+`dadcdc2e31144d3a5c0d96aeb90a09f9d8621da5`, library SHA-256
 `f980101e855c807c25c6a7cdb5e55bd0c5b53a1ee5e3f01f918aff843dbcf13f`,
 archived at `/tmp/jed-join-admission-before/impl/ruby-native`.
 New evidence belongs in
@@ -244,7 +244,7 @@ The evidence directory contains `check.rb` for correctness and `run.rb` for
 measurements. Both use explicit `mise run ruby-native:*` tasks, run serially
 and refuse to replace existing reports. Preserve earlier artifacts before an
 intentional rerun. Reconstruct the baseline from commit
-`7b854f1f37551b47a06c595d446a0176080fb64b`; the runner verifies its library hash.
+`dadcdc2e31144d3a5c0d96aeb90a09f9d8621da5`; the runner verifies its library hash.
 
 Run `check.rb --phase PHASE --source-sha256 FINAL_HASH` for `focus`, `host`
 and `corpus`. The outer correctness driver needs 2 GiB of address space and

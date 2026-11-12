@@ -1,7 +1,7 @@
 # Native Swift experiment: cryptographic integration
 
 This is the dependency/API audit for the opt-in native Swift experiment, against
-jed revision `362e0798ac3a8bd04bd2da556044b6ec73bf468a`. It does not change the
+jed revision `0b76dd6e9c2675b552eb8af9e820065351ffa4b3`. It does not change the
 encrypted file suite or select a production Swift delivery model. The maintainer
 approved Apple's swift-crypto, CryptoExtras when needed, the reference Argon2
 implementation, and their necessary cryptographic backends on 2026-11-05. The
@@ -157,7 +157,7 @@ commits, credential repair or rotation.
 
 ### Subsequent Linux integration acceptance
 
-The original snapshot at `cec8170bfc33f087fa98949ae661b1eaa5490218` passed all 515
+The original snapshot at `3db8fc2d2653475abc5e9d43049254ccd1e92387` passed all 515
 native tests including all 749 frozen SQL files. Its postoptimization verification
 also passed the full 77,612-record four-core encrypted comparison, all 2,691
 bidirectional interchange phases, 241,412 exact-account measurements and the
@@ -167,7 +167,7 @@ process and 176-trace-per-core generated-simulation gates retain their own actor
 credential/maintenance coverage, failures and later corrections. The measured
 comparison is separate in [BENCHMARKS.md](../../impl/swift-native/BENCHMARKS.md).
 
-The structural follow-up at `43481e2047da1cee34a627b910c8a7c7c59c473f` passes 543
+The structural follow-up at `fb34b0e8cb3d82287fbd3401e3426f04b3b86c7a` passes 543
 native tests and all 749 frozen SQL files. Refreshed encrypted, interchange,
 accounting, service, process and simulation gates are mapped to current actors
 in VERIFICATION.md. Separate diagnostic comparisons of 22 peer, eight paired Swift

@@ -50,7 +50,7 @@ These bounds limit this cache; they are not a whole-engine heap guarantee.
 
 ## Evidence
 
-Baseline: commit `ef79bb7442588ec87bb67fd454c3f0f2376806dc`, library SHA-256
+Baseline: commit `ab8dd2f4e233a8324b702147850bb49ffe9217db`, library SHA-256
 `e430431f7e9264c3cc3b9a75436c46841004a707f9c9ec0b72744beeb4c27f88`.
 Final library SHA-256:
 `730a4a03496f62feec03acb2355e9c5f2fc9dda69fa055e7d9595f7457bb5edf`.

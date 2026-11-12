@@ -1,8 +1,8 @@
 # Immediate-expression prototype
 
-> Archive: [original report, committed data and experiment artifacts](https://github.com/jackc/jed/tree/d20bc1bb09199e35c1aa5f78e8d8a882c7558508/bench/ts/results/2026-10-18-immediate). Artifact paths and historical reproduction commands below refer to that snapshot; measured commit IDs are unchanged. Outputs explicitly described as local or ignored were not committed.
+> Archive: [original report, committed data and experiment artifacts](https://github.com/jackc/jed/tree/b33ab3bb687023cdb9b5d18d41f65c27ff0a81f3/bench/ts/results/2026-10-18-immediate). Artifact paths and historical reproduction commands below refer to that snapshot; measured commit IDs are unchanged. Outputs explicitly described as local or ignored were not committed.
 
-This compares the retained-generator implementation at `2ba44d3d60dfb65d14376024b59baf630940f867`
+This compares the retained-generator implementation at `6340df077304864297cbfbada6718648ce4ba3e9`
 with the immediate-expression and synchronous-driver prototype in this change. The prototype
 returns ordinary values for common resident expressions, retaining continuations for pending
 operands. It also avoids redundant synchronous cursor adapters and per-segment driver setup.
@@ -36,8 +36,8 @@ JED_ASYNC_WARMUP=200 JED_ASYNC_RESULTS=/tmp/jed-immediate-result \
 ```
 
 Raw samples, configuration, host details, startup and heartbeat observations are retained in
-[before-1.json](https://github.com/jackc/jed/blob/d20bc1bb09199e35c1aa5f78e8d8a882c7558508/bench/ts/results/2026-10-18-immediate/before-1.json), [before-2.json](https://github.com/jackc/jed/blob/d20bc1bb09199e35c1aa5f78e8d8a882c7558508/bench/ts/results/2026-10-18-immediate/before-2.json), [before-3.json](https://github.com/jackc/jed/blob/d20bc1bb09199e35c1aa5f78e8d8a882c7558508/bench/ts/results/2026-10-18-immediate/before-3.json),
-[after-1.json](https://github.com/jackc/jed/blob/d20bc1bb09199e35c1aa5f78e8d8a882c7558508/bench/ts/results/2026-10-18-immediate/after-1.json), [after-2.json](https://github.com/jackc/jed/blob/d20bc1bb09199e35c1aa5f78e8d8a882c7558508/bench/ts/results/2026-10-18-immediate/after-2.json), and [after-3.json](https://github.com/jackc/jed/blob/d20bc1bb09199e35c1aa5f78e8d8a882c7558508/bench/ts/results/2026-10-18-immediate/after-3.json).
+[before-1.json](https://github.com/jackc/jed/blob/b33ab3bb687023cdb9b5d18d41f65c27ff0a81f3/bench/ts/results/2026-10-18-immediate/before-1.json), [before-2.json](https://github.com/jackc/jed/blob/b33ab3bb687023cdb9b5d18d41f65c27ff0a81f3/bench/ts/results/2026-10-18-immediate/before-2.json), [before-3.json](https://github.com/jackc/jed/blob/b33ab3bb687023cdb9b5d18d41f65c27ff0a81f3/bench/ts/results/2026-10-18-immediate/before-3.json),
+[after-1.json](https://github.com/jackc/jed/blob/b33ab3bb687023cdb9b5d18d41f65c27ff0a81f3/bench/ts/results/2026-10-18-immediate/after-1.json), [after-2.json](https://github.com/jackc/jed/blob/b33ab3bb687023cdb9b5d18d41f65c27ff0a81f3/bench/ts/results/2026-10-18-immediate/after-2.json), and [after-3.json](https://github.com/jackc/jed/blob/b33ab3bb687023cdb9b5d18d41f65c27ff0a81f3/bench/ts/results/2026-10-18-immediate/after-3.json).
 The prototype records the base revision plus `workingTree: "modified"`; its source is the code
 committed alongside this report. Absolute numbers should not be compared directly with earlier
 reports, which used different warmup and CPU-affinity settings.

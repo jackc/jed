@@ -10,7 +10,7 @@ in [VERIFICATION.md](../VERIFICATION.md) and [BENCHMARKS.md](../BENCHMARKS.md).
 
 ## Postoptimization saved comparison
 
-For optimized source `cec8170bfc33f087fa98949ae661b1eaa5490218`, all four cores pass
+For optimized source `3db8fc2d2653475abc5e9d43049254ccd1e92387`, all four cores pass
 all 18 saved regressions. All 54 transcript comparisons pass; 612 images are
 emitted with no byte differences, and all 153 Swift images pass the independent
 checker. There are no failures or per-core-fault comparison exemptions in this saved set.
@@ -68,7 +68,7 @@ are empty. Performance was outstanding at this checkpoint; the completed compari
 ## Historical comparison and corrections
 
 The first completed four-core comparison used the baseline
-`362e0798ac3a8bd04bd2da556044b6ec73bf468a`, input fingerprint
+`0b76dd6e9c2675b552eb8af9e820065351ffa4b3`, input fingerprint
 `369ad9def9a39d16e8812714f9100f1ad86df6822910021c32cfa19e4c2e7bfc`, and native
 Swift actor `01abf2e84fbe8d376d2d09c61599999a7c3970f3553b910e73534066644a4e5b`.
 Evidence remains in `/tmp/jed-swift-sim-sweep-20261106-3794104-m1ohb2`;

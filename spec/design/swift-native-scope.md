@@ -11,7 +11,7 @@ actor-specific correctness and measured comparison are recorded in
 
 This is the acceptance inventory for the explicitly requested independent Swift
 experiment under `impl/swift-native`. The target is the supported Rust, Go, and
-TypeScript surface at **`362e0798ac3a8bd04bd2da556044b6ec73bf468a`**. It is not the
+TypeScript surface at **`0b76dd6e9c2675b552eb8af9e820065351ffa4b3`**. It is not the
 frozen Ruby experiment's coverage. Inventory date: **2026-11-05**.
 
 The language-neutral contracts and corpus are authoritative. Existing cores are
@@ -19,10 +19,10 @@ implementation-pattern evidence, not reference implementations. The inventory
 was recorded before implementation with every target marked U.
 The completed audit reconciles those rows to the handwritten implementation and
 recorded Linux gates. The experiment is frozen at
-`43481e2047da1cee34a627b910c8a7c7c59c473f`; the semantic baseline above is unchanged.
+`fb34b0e8cb3d82287fbd3401e3426f04b3b86c7a`; the semantic baseline above is unchanged.
 The final [verification report](../../impl/swift-native/VERIFICATION.md) maps each
 acceptance gate to its tested actor, and the [benchmark report](../../impl/swift-native/BENCHMARKS.md)
-preserves the original `cec8170` release baseline, optimization comparison and
+preserves the original `3db8fc2` release baseline, optimization comparison and
 measured limits. Structural-follow-up measurements are complete for separate
 22-workload peer, eight-workload paired Swift and three-workload Ruby diagnostics.
 The current release run passes all 543 native tests and all 749 frozen SQL files.
@@ -75,7 +75,7 @@ following contracts; none broadens the frozen baseline:
   Earlier debug/release runs each had 376 GiST-load differences; the integrated
   supported-core correction resolves them. Earlier stack/socket failures and
   the stale private Rust manifest incident remain historical evidence.
-- **P** — the original `cec8170` release baseline and optimization comparison
+- **P** — the original `3db8fc2` release baseline and optimization comparison
   are measured for all 143 workloads, four cores and three rounds. The current
   structural follow-up adds completed diagnostic comparisons of 22 peer, eight
   paired Swift and three Ruby workloads, each with three rounds per actor.
@@ -122,7 +122,7 @@ The shared-GiST attempt at `/tmp/jed-swift-native-default-ci-gist-load.log`
 failed 16/18 because of formatting and a cached private Rust manifest path.
 The canonical retry passes 18/18 in `/tmp/jed-swift-native-default-ci-gist-canonical-retry.log`.
 The corresponding shared Go typed-float correction is **local-only** commit
-`40d15151`; all 93 supported-core public metadata probes passed. Diagnostic logs
+`05a4e59c`; all 93 supported-core public metadata probes passed. Diagnostic logs
 are `/tmp/jed-swift-native-diagnostics-complete-first.log` and
 `/tmp/jed-swift-native-runtime-diagnostics-retry.log`; the final follow-up is
 `/tmp/jed-swift-native-diagnostics-final.log`. Refreshed process and saved-trace
@@ -418,7 +418,7 @@ passing one does not imply any other.
 | Independent review | Storage durability, approved crypto integration, resource accounting, conformance adapters | H; independent review covers authored durability/crypto/resources/adapters, corrections and the measured optimization; final gate map in VERIFICATION.md |
 | Oracle | Relevant PG-clean corpus checks under the checkout's declared oracle profile | H; relevant shared changes checked; earlier short_circuit/correlated regeneration unchanged |
 | Default gates | No implicit Swift dependency in normal CI/tests/benchmarks/codegen | H; earlier verify 17 and CI 18/18 passes retain their actors; current repository checks are mapped in VERIFICATION.md; default isolation retained |
-| Release performance | Correctness first, preserved baseline, matched workload/durability/checksums, measured optimization | P for the original `cec8170` before/after release runs: 143 workloads × four cores × three rounds with matching checksums/row counts. Current diagnostic comparisons cover 22 peer, eight paired Swift and three Ruby workloads, each with three rounds per actor; results and limits in BENCHMARKS.md. |
+| Release performance | Correctness first, preserved baseline, matched workload/durability/checksums, measured optimization | P for the original `3db8fc2` before/after release runs: 143 workloads × four cores × three rounds with matching checksums/row counts. Current diagnostic comparisons cover 22 peer, eight paired Swift and three Ruby workloads, each with three rounds per actor; results and limits in BENCHMARKS.md. |
 | Apple builds | macOS/iOS builds and tests, separately from Linux acceptance | Unverified platform; Linux scope is unaffected |
 
 
@@ -1087,7 +1087,7 @@ capability has a separate exhaustive host or resource proof.
 ### Enumeration method
 
 Counts above were computed from `git ls-tree -r --name-only` and `git show` at
-`362e0798ac3a8bd04bd2da556044b6ec73bf468a`, parsing the TOML arrays and counting
+`0b76dd6e9c2675b552eb8af9e820065351ffa4b3`, parsing the TOML arrays and counting
 line-start SQL directives in tracked `.test` files. This is a one-time baseline
 inventory; later changes to live specification files do not silently expand the
 frozen experiment. Byte fixture families include deliberately malformed/recovery

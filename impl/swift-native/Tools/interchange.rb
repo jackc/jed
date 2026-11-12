@@ -9,7 +9,7 @@ require "tmpdir"
 
 # Opt-in public-host interchange. No engine or default task imports this file.
 module SwiftInterchange
-  BASELINE = "362e0798ac3a8bd04bd2da556044b6ec73bf468a"
+  BASELINE = "0b76dd6e9c2675b552eb8af9e820065351ffa4b3"
   FIXTURES = File.join(SwiftNativeTasks::PACKAGE, "Tests/JedTests/Fixtures")
   TOOLS = File.join(SwiftNativeTasks::PACKAGE, "Tools/Interop")
   PEERS = %w[rust go ts].freeze

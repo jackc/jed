@@ -11,7 +11,7 @@
 Can Rust retain the scan improvement of the expression-VM experiment while
 removing its repeated lowering and cheap-query overhead?
 
-The [prior report](https://github.com/jackc/jed/blob/a85f2127cc64b8440cf86c3604aaac0ec10a0676/spec/design/expression-vm-experiment.md)
+The [prior report](https://github.com/jackc/jed/blob/f54586cf5f91259736f6a65ce38a931354d09e15/spec/design/expression-vm-experiment.md)
 records approximately 17% less time for arithmetic scans and 30% for boolean
 filters, but 18% more for prepared point queries. It used compact typed registers
 and lowered once per cursor, including prepared execution. That motivates

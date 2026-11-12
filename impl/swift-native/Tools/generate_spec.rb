@@ -14,7 +14,7 @@ require "fileutils"
 
 module SwiftSpecGenerator
   ROOT = File.expand_path("../../..", __dir__)
-  BASELINE = "362e0798ac3a8bd04bd2da556044b6ec73bf468a"
+  BASELINE = "0b76dd6e9c2675b552eb8af9e820065351ffa4b3"
   INPUTS = %w[
     spec/integrity/findings.toml
     spec/types/scalars.toml

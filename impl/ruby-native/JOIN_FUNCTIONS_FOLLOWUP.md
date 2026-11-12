@@ -58,7 +58,7 @@ units, host APIs, dependencies or supported cores.
 ## Evidence and method
 
 The baseline is pushed commit
-`1056d146c294dbb5f17f5c4a0eaec25bd957bcdd`, library SHA-256
+`d8353e1bcaae44a9b7a648b47a47a4784d2edc2d`, library SHA-256
 `5feb7b064f414131a1c5f5d4aba8a64be8facc0885e3b4e5299ba0b5527ef29c`,
 archived at `/tmp/jed-join-functions-before/impl/ruby-native`.
 New evidence belongs in

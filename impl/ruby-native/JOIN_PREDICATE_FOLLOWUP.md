@@ -38,7 +38,7 @@ No SQL behavior, host API, dependency or supported-core changes.
 ## Evidence and method
 
 The baseline is pushed commit
-`1657722bc9a82d990b37e1e22a3f54843f35230e`, library SHA-256
+`2972d126d16b0c1b23a78a8f2d8d232faaf987c2`, library SHA-256
 `62e562806cb2fca0e30792f1c90c3546f9f847c94a1af4651d9b3a376fce3705`,
 archived at `/tmp/jed-join-predicate-before/impl/ruby-native`.
 It restores the estimator from the preceding retained LEFT-join optimization.
@@ -235,7 +235,7 @@ This opportunity is unmeasured and is not implemented by this change.
 The evidence directory contains `check.rb` for correctness and `run.rb` for
 measurements. Both use explicit `mise run ruby-native:*` tasks, run serially
 and refuse to replace existing reports. Preserve earlier artifacts before an
-intentional rerun. Reconstruct the baseline from commit `1657722bc9a82d990b37e1e22a3f54843f35230e`;
+intentional rerun. Reconstruct the baseline from commit `2972d126d16b0c1b23a78a8f2d8d232faaf987c2`;
 the runner verifies its library hash before launching workers.
 
 Run `check.rb --phase PHASE --source-sha256 FINAL_HASH` for `focus`, `host`

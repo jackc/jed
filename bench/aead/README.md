@@ -99,7 +99,7 @@ Default-page-size results (8 KiB plaintext; median microseconds per operation):
 
 Rust/Go rows use reusable buffers **including the input copy**; JS/Node rows use allocating
 APIs. [All sizes and both native allocation modes](results/2026-10-17.md) and
-[all raw timing samples, metadata and fixture hashes](https://github.com/jackc/jed/blob/f97c2e6b8d50b07da29aeabb4f609ed78bb50045/bench/aead/results/2026-10-17.json) are retained.
+[all raw timing samples, metadata and fixture hashes](https://github.com/jackc/jed/blob/db356f01394a407ae8ec0e0a712bca959782192e/bench/aead/results/2026-10-17.json) are retained.
 The full per-worker outputs remain locally under `bench/results/aead-20261017-230702-21/` (gitignored).
 
 On this CPU, native AES-GCM wins against ChaCha20-Poly1305. Pure-JS ChaCha wins by about 3.7×
@@ -215,7 +215,7 @@ no external module; the ChaCha module archives are ~2.24 MiB for `x/crypto` and 
 with no runtime dependencies: ~535 KiB installed including source, declarations and docs, much
 larger than the selected bundle.
 
-[Exact sizes, dependency inventory, tool versions and source hashes](https://github.com/jackc/jed/blob/f97c2e6b8d50b07da29aeabb4f609ed78bb50045/bench/aead/results/2026-10-17-size.json)
+[Exact sizes, dependency inventory, tool versions and source hashes](https://github.com/jackc/jed/blob/db356f01394a407ae8ec0e0a712bca959782192e/bench/aead/results/2026-10-17-size.json)
 are retained. Generated probes and binaries remain in the report's local `raw_directory`.
 The task reuses approved dependencies offline and needs an already-installed esbuild, selected
 with `JED_ESBUILD` or discovered in the local npm execution cache; it installs no bundler.

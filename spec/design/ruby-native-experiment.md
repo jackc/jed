@@ -31,7 +31,7 @@ unless the maintainer explicitly requests that work. Promotion to a supported co
 requires a separate decision. An experiment need not pass a later expanded corpus;
 its report must identify the revision it tested and retain failures and omissions.
 The maintainer-requested [parity update](../../impl/ruby-native/PARITY_UPDATE.md)
-brought the surface level with source revision `1c5a8961` (from `d4a01ebd`),
+brought the surface level with source revision `56f49192` (from `d980b536`),
 including MERGE, DISTINCT ON, SIMILAR TO, per-row key metering, format v50, the
 integrity check and encryption at rest; it lists the remaining omissions and does not
 change the frozen status or refresh benchmark results.
@@ -143,7 +143,7 @@ parameter-sensitive physical planning keep their existing rules.
 
 The historical [`PIPELINE_FOLLOWUP.md`](../../impl/ruby-native/PIPELINE_FOLLOWUP.md)
 records a multi-page LIMIT cost defect and 71 lazy-audit failures already present
-at source revision `627cbb631e3a922999c3a0cb3bcba32136fcb345`. The explicitly
+at source revision `0912e9e2eff424eac777954c0e22040cc2075003`. The explicitly
 requested [`CORRECTNESS_FOLLOWUP.md`](../../impl/ruby-native/CORRECTNESS_FOLLOWUP.md)
 fixes the ordered scan page block, correlated output/lifetime accounting,
 resolution/metadata, and stack-depth defects without changing shared contracts.

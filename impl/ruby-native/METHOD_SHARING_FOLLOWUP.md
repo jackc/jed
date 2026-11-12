@@ -4,7 +4,7 @@
 > experiment branch. See the [archive and retrieval instructions](../../bench/ruby-native/ARCHIVE.md).
 > Reproduction commands below refer to that original checkout.
 
-This follow-up starts at `fc12f427`, after the complete cursor correctness and
+This follow-up starts at `b70950c1`, after the complete cursor correctness and
 simple literal LIKE audits. Ruby remains a frozen, explicitly selected experiment.
 No dependency, public API or normal test/benchmark/CI task changes.
 
@@ -152,7 +152,7 @@ APIs with schema, privilege and publication invalidation.
 
 ## Reproduction
 
-Restore `impl/ruby-native` from baseline commit `fc12f427` in a separate directory;
+Restore `impl/ruby-native` from baseline commit `b70950c1` in a separate directory;
 the measurement runner defaults to `/tmp/jed-method-sharing-before/impl/ruby-native`
 and accepts `--baseline-source PATH`. Select `controls` and `diagnostics` explicitly
 with `bench/ruby-native/results/method-sharing-followup/run.rb --phase PHASE

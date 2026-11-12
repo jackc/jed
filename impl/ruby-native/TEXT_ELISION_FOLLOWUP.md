@@ -9,7 +9,7 @@ The cursor failures reported below are historical. The
 supersedes the mixed-routing interpretation. Original measurements are retained.
 
 Measured 2026-10-19. This explicitly requested optimization follows the C-text compiler at
-`2f947c81012f6d1e9a29291b61dda6768409f510`. Ruby remains a frozen, opt-in
+`5ca7358167db727ca690dbef6910c05c127a8f9d`. Ruby remains a frozen, opt-in
 experiment; normal test, benchmark and CI tasks are unchanged.
 
 ## Scope

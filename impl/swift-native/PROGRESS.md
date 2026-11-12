@@ -4,7 +4,7 @@
 
 ### Final result
 
-Implementation is frozen at local-only `43481e2047da1cee34a627b910c8a7c7c59c473f`.
+Implementation is frozen at local-only `fb34b0e8cb3d82287fbd3401e3426f04b3b86c7a`.
 All affected correctness gates and final measurements are complete. The updated
 [benchmark report](BENCHMARKS.md) leads with direct peer comparisons and retains
 the original complete 143-workload evidence. [VERIFICATION.md](VERIFICATION.md)
@@ -49,7 +49,7 @@ status and actor-specific acceptance are above.
 
 The maintainer requested investigation and broad fixes for the final Swift/peer
 gap. The original completed snapshot and all evidence below remain preserved;
-the new investigation starts at local-only `56972d2f`. See
+the new investigation starts at local-only `88384fe7`. See
 [the investigation design](../../spec/design/swift-native-performance.md).
 No new production-delivery decision or default-task inclusion is implied.
 
@@ -155,7 +155,7 @@ The first final service run is preserved as **failed** under
 but Go-client/Swift-owner fails the later shared
 `resource/query_memory_gist_reopen.test` at a one-byte-budget statement and
 misses 25 expected page-client records. The reused Go test binary reports old
-source `48c0c068`; a fresh-Go diagnostic is running with the same Swift owner.
+source `5ec1ecd6`; a fresh-Go diagnostic is running with the same Swift owner.
 No expectation is changed or failed run relabeled. Interchange and generated
 simulation gates remain in progress.
 
@@ -165,12 +165,12 @@ transcripts and 7,049 independently checked Swift images, with the original
 23 per-core-fault exemptions unchanged. The fresh-Go probe passes, followed by
 the complete rebuilt-peer service matrix: 116,628 records, six pairs, zero
 failures. Disassembly confirms the old Go adapter lacked the existing
-`01c483cc` committed-GiST staging fix; the Swift binary and fixtures did not
+`a71c0662` committed-GiST staging fix; the Swift binary and fixtures did not
 change. Both failure and successful retries remain in `verification-final`.
 Production source is ready for the isolated final 22/8/3 workload comparisons.
 
 The verified source is committed locally as
-`43481e2047da1cee34a627b910c8a7c7c59c473f`. The first matrix setup failed before
+`fb34b0e8cb3d82287fbd3401e3426f04b3b86c7a`. The first matrix setup failed before
 starting an actor because the diagnostic singleton method used unqualified
 `CORES`; qualifying it as `SwiftNativeBenchmark::CORES` fixes only the harness.
 The initial directory/log remain retained. The unchanged production actor is
@@ -183,13 +183,13 @@ still pending. No new whole-suite performance claim is implied.
 
 Status: **Frozen experimental snapshot; required Linux acceptance and measured
 optimization are complete.** Semantic baseline:
-`362e0798ac3a8bd04bd2da556044b6ec73bf468a` (2026-11-05).
+`0b76dd6e9c2675b552eb8af9e820065351ffa4b3` (2026-11-05).
 Branch: `codex/swift-native-experiment`, local-only, not pushed.
 
 ## Completed experiment (2026-11-06)
 
 The frozen implementation revision is
-**cec8170bfc33f087fa98949ae661b1eaa5490218**. The [verification report](VERIFICATION.md)
+**3db8fc2d2653475abc5e9d43049254ccd1e92387**. The [verification report](VERIFICATION.md)
 maps completed Linux gates to their actual actors and source identities; the
 [benchmark report](BENCHMARKS.md) records the complete before/after comparison,
 methodology, slower workloads and measurement limits. The scope and host/tool
@@ -214,8 +214,8 @@ simulation, service and stress gates remain explicitly preoptimization evidence.
 
 Both full release benchmarks pass **143 workloads × four cores × three rounds**,
 12/12 runs each, with matching logical results and zero failures. Baseline source
-is `76f4c4c866ddf04f01a9b7d38f6e0b7573c592c6`; the after capture observes
-`afbde4c6d2e87e5d3405e228ea233e7012eb209d`, which differs from the optimized
+is `6d160e505da7a92269c0a14e38b90c5351a57119`; the after capture observes
+`7c4803e9243c7be093dab8f28553d733fbbd1cba`, which differs from the optimized
 implementation only in this progress document. Swift benchmark actors are
 `44a127af9e7891bb245e846fa38edd3cb1a186c3be6c90267365407ff39d3aa7`
 before and `e33fd8a85db9193a84e9d6a0ae7a2531bd69bb2297dabda48dbc019133325d1f`
@@ -246,7 +246,7 @@ cores × three rounds**, all 12 runs complete, zero failures. Values, row counts
 checksums, parameters and workload settings agree across all cores and rounds.
 Command: `mise run swift-native:bench --output /home/jack/dev/jed/impl/swift-native/results/benchmark-baseline-20261106`.
 The retained immutable actors and source snapshot record local-only source
-revision **76f4c4c866ddf04f01a9b7d38f6e0b7573c592c6**. The run completed at
+revision **6d160e505da7a92269c0a14e38b90c5351a57119**. The run completed at
 17:19 UTC; log: `/tmp/jed-swift-native-benchmark-baseline.log`.
 
 Strict analysis is in `results/benchmark-baseline-summary-20261106`. The median
@@ -274,7 +274,7 @@ finalization, charge and memory schedules remain in use. Four focused host tests
 cover lane equivalence, memory admission, cancellation/I/O cleanup and retained
 pending cells; decoder tests cover nonzero slice offsets, truncation, trailing
 bytes and recursive validation. Optimized source is committed locally at
-**cec8170bfc33f087fa98949ae661b1eaa5490218**. The full release gate passes **515
+**3db8fc2d2653475abc5e9d43049254ccd1e92387**. The full release gate passes **515
 native tests and all 749 SQL files**, with the same 21,597 records, 39,148 cells
 and 2,271 costs, zero failures or omissions:
 `/tmp/jed-swift-native-release-packed-all749-first.log`.
@@ -302,7 +302,7 @@ natural exit), so their counts are not CPU-percentage comparisons.
 
 File interchange, the full matched after benchmark, final reporting and freeze
 remain outstanding. The strict opt-in report task is committed locally as
-**fd70237c**; its 61 synthetic adapter checks and independent review pass.
+**6c38bca8**; its 61 synthetic adapter checks and independent review pass.
 
 ## Preoptimization correctness acceptance (2026-11-06 07:04 CST)
 
@@ -317,8 +317,8 @@ old connection before checking its pin, retaining the original invalidation,
 promotion and persisted-data assertions. This changes test ordering, not the
 engine's asynchronous transport-loss contract.
 
-Current local-only commits: view **592bb88c**, shared GiST accounting **01c483cc**,
-empty Rust corpus rejection **7bf87b13**, Swift handoff **4cf6f1fc**. Canonical Rust
+Current local-only commits: view **55fad9d6**, shared GiST accounting **a71c0662**,
+empty Rust corpus rejection **ca6278f3**, Swift handoff **0f6b9e00**. Canonical Rust
 artifacts have been repaired and checked in release/checked memory/disk modes.
 Default CI now passes **18/18** in 137.9 seconds:
 `/tmp/jed-swift-native-default-ci-gist-canonical-retry.log`. The additional
@@ -340,8 +340,8 @@ fault-comparison exemptions:
 correctness gates are green before optimization. Its subsequent baseline is
 preserved under the ignored durable ext4 path
 `impl/swift-native/results/benchmark-baseline-20261106`, not temporary tmpfs.
-Additional local-only tooling commits are **1c27c331** (Rust pages serving) and
-**41a90bb2** (strict benchmark timestamps).
+Additional local-only tooling commits are **be109bb1** (Rust pages serving) and
+**1cdb02e1** (strict benchmark timestamps).
 The successful preoptimization evidence is also retained durably in
 `impl/swift-native/results/verification-preoptimization-20261106`: 50 reports,
 logs and TSVs, 10.86 MiB, with a complete per-file hash manifest. Manifest SHA-256:
@@ -352,8 +352,8 @@ logs and TSVs, 10.86 MiB, with a complete per-file hash manifest. Manifest SHA-2
 The following checkpoints retain their original failure and pending-work wording
 as an audit trail. They do not describe the final state of the experiment.
 
-Local-only integration commit **33a0add5** records the reviewed engine, host APIs,
-fixtures and opt-in runners; **40d15151** records the shared Go float metadata
+Local-only integration commit **83b84f8c** records the reviewed engine, host APIs,
+fixtures and opt-in runners; **05a4e59c** records the shared Go float metadata
 correction. None is pushed. Unrelated `tasks/memory` remains preserved.
 
 The release build passes **505 native tests and all 749 frozen SQL files**:
@@ -495,7 +495,7 @@ public host cases** pass (31 per supported core). Swift's reviewed correction
 is published; generic operation underflow/domain diagnostics retain their
 contract. Normal CI passes **18/18** at
 `/tmp/jed-swift-native-default-ci-float-fields.log`; the six-file shared correction
-is local-only commit `40d15151`.
+is local-only commit `05a4e59c`.
 
 The third V04 run completed all **21,477 Swift memory** and **19,438 each
 Swift disk/disk-spill** measurements without SQL failures. Comparison of available memory
@@ -751,8 +751,8 @@ are being drafted. H12 executeScript remains missing and is in implementation.
 Reviewed ALTER rewrite Q3 staging now matches cumulative frozen behavior;
 new simulator build/profile acceptance remains pending.
 
-Two further **local-only** reviewable commits: `d8b23ec9` clarifies the existing
-zero-manifest bootstrap stabilization exemption; `40ac047d` adds the reviewed,
+Two further **local-only** reviewable commits: `75740983` clarifies the existing
+zero-manifest bootstrap stabilization exemption; `fdc00638` adds the reviewed,
 previously tested bounded scratch row/sort/hash primitives. Neither is pushed.
 
 ### Previous focused checkpoint
@@ -950,7 +950,7 @@ and fenced N-way join islands are published, but their broad semantic gates are
 still pending. The file-mode corpus adapter and generated simulation sweeps are
 being connected explicitly; no unsupported records are silently omitted.
 
-Shared prose clarifications are local-only commit `1ee030e4` (not pushed).
+Shared prose clarifications are local-only commit `989a3d74` (not pushed).
 Unchanged `dml/index_spilled_key`, `ddl/views_long_definition` and
 `ddl/views_owned_sequences` pass in all three supported cores in both memory and
 disk modes (18 file/mode/core checks; `/tmp/jed-index-page-fit-{go,rust,ts}.log`,
@@ -1077,7 +1077,7 @@ The preceding native filesystem/simulation foundation gate passed **44/44**
 process actor passed **31/31** after that host seam refactor
 (`/tmp/jed-swift-native-process-filesystem-seam.log`; executable SHA-256
 `0a531a19a605dd2cd82644d275c00631379e27fc1efba5634977563c7de31edc`).
-Commit `0afb7301` records that independently verified host foundation, local-only.
+Commit `3e7b0855` records that independently verified host foundation, local-only.
 Mechanical inclusion of the baseline's 18 simulation regressions and 22 profiles
 expanded the frozen input fingerprint to
 `369ad9def9a39d16e8812714f9100f1ad86df6822910021c32cfa19e4c2e7bfc`;
@@ -1238,7 +1238,7 @@ Logs: `/tmp/jed-swift-reindex-oracle.log`, `/tmp/jed-swift-analyze-oracle.log`.
 
 An independent collector review found and reproduced a shared KMV boundary
 bug: exactly 4,096 distinct hashes plus duplicate rows incorrectly entered
-estimation. Separate local-only commit `616b3a3e` corrects Rust/Go/TS and adds a
+estimation. Separate local-only commit `dc130ecf` corrects Rust/Go/TS and adds a
 shared regression, preserving the canonical exact-count rule. Focused statistics
 conformance passed all 6 memory and 4 disk files in each core (two existing disk
 exclusions); formatting and all TS typecheck configurations passed. Logs:
@@ -1321,7 +1321,7 @@ The separate user work under `tasks/memory` is not part of this experiment.
   sibling's valid header cannot make it the durable floor. Swift now validates the
   sibling manifest before parity selection. The same existing issue was found in
   supported cores; the separate correction/regression slice is committed locally
-  as `196feb8a`. Focused Go/Rust tests, all 1,276 TypeScript unit tests and default
+  as `e907fad4`. Focused Go/Rust tests, all 1,276 TypeScript unit tests and default
   spec verification pass. The pinned Swift scope baseline remains unchanged.
 - Independent codec work found reversed f32/f64 stable type codes in the initial
   Swift enum; corrected to canonical f64=12/f32=13, with a byte-boundary regression.
@@ -1338,7 +1338,7 @@ The separate user work under `tasks/memory` is not part of this experiment.
   Three frozen B+tree goldens rebuild byte-exactly. A near-capacity delete regression
   exposed an inherited empty unary subtree; Swift fixes it. The same issue has a
   confirmed Go reproduction; the separate supported-core correction is saved locally
-  as `7b4883b6`. Focused tests in all three cores, two shared simulation traces,
+  as `dc73d508`. Focused tests in all three cores, two shared simulation traces,
   TypeScript type checks, selected formatting and default spec verification pass.
 - Added datetime and exact numeric template processors, exact IEEE-to-decimal
   conversion, JSON syntax/spans/canonical values, accessors/mutations/builders and
@@ -1378,7 +1378,7 @@ The separate user work under `tasks/memory` is not part of this experiment.
   remains required; this is not a new whole-engine memory guarantee.
 - GIN integration uncovered a supported-core false negative for a strict root-string
   JSONPath equality. PostgreSQL 18's forced GIN scan has the same bug, while its direct
-  predicate/sequential scan returns the row. Separate local correction `2e13d1b8`
+  predicate/sequential scan returns the row. Separate local correction `ebf98dcc`
   widens the candidate term to KEY OR VALUE in all cores; shared regression, oracle
   check, 36 scoped memory/disk suite executions and default verification pass.
   The divergence is documented in gin.md §9; the original frozen baseline is retained.
@@ -1502,21 +1502,21 @@ fixture explicitly defers count drift until a write/integrity check. The test no
 checks that boundary and separately rejects a zero root with nonzero cardinality.
 This is catalog verification, not complete database/file conformance.
 
-Local-only commits so far: `91aef346` (approved scope/design), `f9c09043`
-(verified foundations), `d2a56c3b` (syntax/numeric), `e83ff6d1`
-(recursive codecs/temporal), `a0cb024b` (pager/packed primitives), and `196feb8a`
+Local-only commits so far: `aad31393` (approved scope/design), `0830683a`
+(verified foundations), `eb8c74b9` (syntax/numeric), `cd56281e`
+(recursive codecs/temporal), `deef5045` (pager/packed primitives), and `e907fad4`
 (shared recovery correction). The foundation commit's staged whitespace check reported two existing
 whitespace defects in pinned, unmodified Argon2 upstream LICENSE/encoding.c. Those
 vendor bytes remain unchanged to preserve the recorded provenance hashes.
 
-Additional local-only commits: `b9e99410` (frozen syntax audit/tree fixtures),
-`a645434f` (packed B+trees/disposition), `a87abe2c` (formatting/JSON foundations),
-`16569ff1` (catalog codecs and frozen images), `7b4883b6` (shared deletion correction).
-Further local-only checkpoints: `111932fa` (float/regex/type foundations),
-`2e13d1b8` (shared GIN root-string correction).
-Further experimental checkpoints: `4c14d61c` (GiST), `ba7859bd` (JSONPath and full
-frozen corpus), `35579e82` (GIN and loaded Unicode runtime), all local-only.
-`e2503626` records the initial typed expression/scalar-cast slice, also local-only.
+Additional local-only commits: `cd241931` (frozen syntax audit/tree fixtures),
+`aefae408` (packed B+trees/disposition), `7eb8cb52` (formatting/JSON foundations),
+`eccd3279` (catalog codecs and frozen images), `dc73d508` (shared deletion correction).
+Further local-only checkpoints: `cb17c829` (float/regex/type foundations),
+`ebf98dcc` (shared GIN root-string correction).
+Further experimental checkpoints: `068b9950` (GiST), `b6ac8950` (JSONPath and full
+frozen corpus), `8898adcd` (GIN and loaded Unicode runtime), all local-only.
+`0f4263c6` records the initial typed expression/scalar-cast slice, also local-only.
 
 Initial SwiftPM compile failed while SQLDecimal was not yet present, then four
 missing `try` markers in decimal test autoclosures were corrected. No expected
@@ -1529,8 +1529,8 @@ constraint, retained intentionally to pin CryptoExtras' required transitive pack
 
 ## Current integration checkpoint
 
-Checkpoint `b7324c9b` saves the 250-test integration below, local-only and unpushed.
-The Linux page-service slice is checkpointed separately at `40c9c6a4`, also local-only.
+Checkpoint `3df9cec3` saves the 250-test integration below, local-only and unpushed.
+The Linux page-service slice is checkpointed separately at `9f5cbf54`, also local-only.
 Work after it remains active. The latest complete integrated run (20:50 CST) ran
 **287 tests in 118.181 seconds**: all **286 tests outside the expanded whole-file
 SQL test passed**. That SQL test ran **187/749 files, 5,038 records (3,100 statements /
@@ -1591,7 +1591,7 @@ SRFs and a missing general statement privilege-preflight phase (a denied-source
 CTAS must reject before an invalid target name); these are outstanding corrections.
 
 
-Next integration (after local-only SQL checkpoint `f615ed6b`) adds the nine main
+Next integration (after local-only SQL checkpoint `93d80b1f`) adds the nine main
 catalog relations, ALTER ADD/DROP/TYPE/PRIMARY KEY rewrites, initial costed N-way
 base join islands, bounded-SRF admission corrections and post-ack page maintenance.
 The first 219-file attempt compiled after two Swift-only annotation/exclusivity

@@ -294,7 +294,7 @@ replacement conformance pass.
 ## Known pre-existing cost gap
 
 The three new scan shapes exposed a storage-meter defect already present in
-baseline commit `627cbb631e3a922999c3a0cb3bcba32136fcb345`. Values, column metadata,
+baseline commit `0912e9e2eff424eac777954c0e22040cc2075003`. Values, column metadata,
 and row counts match the Ruby Rust binding, but the LIMIT workloads have different
 exact costs. All native APIs agree with each other, and native before/after costs
 remain identical; fusion neither introduces nor corrects this defect.

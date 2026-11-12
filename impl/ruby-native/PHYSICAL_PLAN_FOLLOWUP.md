@@ -56,7 +56,7 @@ whole-engine heap guarantee.
 ## Evidence and method
 
 Archived starting point: commit
-`b5262268371ff5e7d93c2b61e04bcfb304665cf4`, library SHA-256
+`f49ab392421b6518f6f9e8588a75e33da823d526`, library SHA-256
 `40ceac58a86ce19bba2ed2497adfb26b5ca7eafcc31e39def71312c1a9d56382`.
 The complete Ruby port was archived from that commit at
 `/tmp/jed-physical-plan-before/impl/ruby-native` after fetching and checking the

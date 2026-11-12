@@ -1,6 +1,6 @@
 # TypeScript packed result delivery
 
-> Archive: [original report, committed data and experiment artifacts](https://github.com/jackc/jed/tree/bd80b2d66303243d3649e00f82af8f98c1378196/bench/ts/results/2026-10-18-packed). Artifact paths and historical reproduction commands below refer to that snapshot; measured commit IDs are unchanged. Outputs explicitly described as local or ignored were not committed.
+> Archive: [original report, committed data and experiment artifacts](https://github.com/jackc/jed/tree/2a09b98926801b7a6c5b2784d93d2ce890ad753f/bench/ts/results/2026-10-18-packed). Artifact paths and historical reproduction commands below refer to that snapshot; measured commit IDs are unchanged. Outputs explicitly described as local or ignored were not committed.
 
 The 4,096-row typed result takes **29.97 ms before and 9.25 ms after**, a **69.1% latency reduction
 (3.24× throughput for this sequential drain)**. The direct core stays around 5 ms. Small-call
@@ -29,7 +29,7 @@ cooperative execution. This does not establish that all remaining overhead is fi
 
 ## Method
 
-Before is frozen commit `4f7e376d422cbc7431f8d588f028bcce15ab733e`; after is this report's accompanying
+Before is frozen commit `e88a4bedf828ddaf072d39fc58494489f7c70d27`; after is this report's accompanying
 working-tree implementation based on that commit. The raw after JSON therefore identifies the
 base commit and marks the working tree modified. Three independent process runs per variant use
 `v26.10.0`, linux/x64, Intel(R) Core(TM) Ultra 9 285K, with fixed CPU affinity

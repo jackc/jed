@@ -57,7 +57,7 @@ as the index writers. This is a correctness fix, not a benchmark shortcut.
 
 ## Measurement contract
 
-Baseline commit: `81dfcbb0d0de239b62d7fa454bc8c467d24d776f`.
+Baseline commit: `9e3071e3992b761c8fe8e9d1268fc5331b552cf8`.
 Baseline Ruby library SHA-256:
 `00fa6ca66444430c9715160c1a59c6d00c6432a4f83a810fb2b8e0b3a1041ae3`.
 Final Ruby library SHA-256:

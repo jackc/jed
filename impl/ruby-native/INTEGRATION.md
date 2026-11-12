@@ -1,9 +1,9 @@
 # Ruby experiment integration review
 
 Prepared branch: `codex/ruby-native-cleanup`, based on master
-`7d179be9674fb3ddcc1e64519b978488c65df471`.
+`23b2e40add6a19e04c59872dc5bdef5da329974b`.
 The original `codex/ruby-native-experiment` remains at
-`48fd21cd34b1001b23aa2b8c04c4d53dd591fbee`, including all historical evidence.
+`674dc97eb9d05fd0527df9c63fa1badf7c70b673`, including all historical evidence.
 This preparation does not merge to master or publish either branch.
 
 ## History and retained scope

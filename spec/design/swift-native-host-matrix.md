@@ -9,8 +9,8 @@ actor-specific correctness and measured comparison are recorded in
 [VERIFICATION.md](../../impl/swift-native/VERIFICATION.md) and
 [BENCHMARKS.md](../../impl/swift-native/BENCHMARKS.md).
 
-Semantic audit target: **`362e0798ac3a8bd04bd2da556044b6ec73bf468a`**. The frozen
-Swift implementation is `43481e2047da1cee34a627b910c8a7c7c59c473f`. The companion
+Semantic audit target: **`0b76dd6e9c2675b552eb8af9e820065351ffa4b3`**. The frozen
+Swift implementation is `fb34b0e8cb3d82287fbd3401e3426f04b3b86c7a`. The companion
 [scope matrix](swift-native-scope.md) inventories SQL, shared data and storage;
 Ruby's frozen experiment is not an acceptance baseline. Linux acceptance and the
 original measured optimization comparison are recorded in VERIFICATION.md and
@@ -24,7 +24,7 @@ This matrix began with every row **missing**. It now links implementation and
 acceptance evidence for the frozen baseline. The current release passes
 543 native tests including all 749 frozen SQL files. Full exact accounting,
 encrypted SQL, interchange and saved-simulation postoptimization checks are mapped
-to their captured actors in VERIFICATION.md. The original `cec8170` before/after
+to their captured actors in VERIFICATION.md. The original `3db8fc2` before/after
 benchmark comparison covers 143 workloads, four cores and three rounds. The completed
 follow-up compares 22 peer, eight paired Swift and three Ruby workloads separately,
 each with three rounds per actor.
@@ -41,7 +41,7 @@ verification is recorded separately above and in VERIFICATION.md.
 Checkpoint (**2026-11-06**, Linux x86-64, Swift 6.4.2): all 407 shared
 diagnostic cases, 10 object-field cases and 20 runtime metadata probes pass.
 The earlier normal CI passed all 18 steps after the shared Go typed-float
-correction, **local-only** commit `40d15151`. The first shared-GiST integration
+correction, **local-only** commit `05a4e59c`. The first shared-GiST integration
 attempt passed 16/18: formatting and a Rust binary with a stale private manifest
 path failed. The canonical retry now passes 18/18. Prior process acceptance
 passes all 496 ordered pairs, and saved simulation acceptance passes 18 traces, 54 comparisons
@@ -287,8 +287,8 @@ structural revalidation is mapped separately in VERIFICATION.md.
 | V09 | `swift-native:sim:regress`, `:sweep`, `:replay` | Same `JED_SIM_IN`, `JED_SIM_OUT`, `JED_SIM_RESULTS`, optional `JED_SIM_IMAGES` protocol as `scripts/sim.rb`; complete shared regressions and profile sweep. Compare transcripts/images when required; per-core read-error/enospc/spill-error/corruption traces retain each core's invariant checks. | Refreshed saved regressions pass all 18 traces, 54 transcript comparisons and 153 independently checked images. The generated integrity-hook refresh also passes all 176 traces per core, 459 comparisons and 7,049 checked Swift images. |
 | V10 | `swift-native:fixtures`, `swift-native:interop` | Every baseline key/value/compression/crypto/page-service fixture and file golden; Swift writes and supported cores read, supported cores write and Swift reads; mutations continue after cross-core reopen. Include encrypted keys/passphrases, attachments, recovery and host-function requirements. | Refreshed full 112-image interchange passes all 2,691 phases; shared vectors pass. Separate24 integrity images pass50 exact API and CLI reports; golden integrity and remote-client checks pass. |
 | V11 | `swift-native:oracle` | Relevant baseline PostgreSQL oracle checks through checkout mise environment, with declared oracle profile and overrides unchanged. PostgreSQL-comparable behavior only; host and file invariants use shared tests/fixtures. | Relevant oracle profile/corpus probes passed and retained in DEFAULT_ISOLATION. Final shared-correction oracle refresh only where changes warrant it. |
-| V12 | `swift-native:verify-defaults` | Existing default verification remains healthy without Swift installation or dependency resolution. Inspection must show unchanged default core/dependency lists; run applicable default gates and record infrastructure blockers distinctly. | Default verify passes 17 checks; earlier CI passed 18/18 after local-only shared fix 40d15151. The first shared-GiST attempt failed 16/18 because of formatting and a stale private Rust manifest path; the canonical retry passes 18/18 (/tmp/jed-swift-native-default-ci-gist-canonical-retry.log). Default core/dependency lists remain unchanged. |
-| V13 | `swift-native:bench` and comparison task | Correctness first, then preserved release baseline and measured optimization pass with supported-core matching workload/data/durability and checksums; record CPU, OS, Swift version, flags, warmup, samples, commands and data paths. No speed claim from SQL subset or debug/release mismatch. | Original `cec8170` evidence: complete release baseline and after-optimization runs each cover 143 workloads × four cores × three rounds, with matching checksums and row counts. Current diagnostics cover 22 peer, eight paired Swift and three Ruby workloads, each with three rounds per actor. BENCHMARKS.md records provenance, raw samples, results and limitations; no universal parity claim. |
+| V12 | `swift-native:verify-defaults` | Existing default verification remains healthy without Swift installation or dependency resolution. Inspection must show unchanged default core/dependency lists; run applicable default gates and record infrastructure blockers distinctly. | Default verify passes 17 checks; earlier CI passed 18/18 after local-only shared fix 05a4e59c. The first shared-GiST attempt failed 16/18 because of formatting and a stale private Rust manifest path; the canonical retry passes 18/18 (/tmp/jed-swift-native-default-ci-gist-canonical-retry.log). Default core/dependency lists remain unchanged. |
+| V13 | `swift-native:bench` and comparison task | Correctness first, then preserved release baseline and measured optimization pass with supported-core matching workload/data/durability and checksums; record CPU, OS, Swift version, flags, warmup, samples, commands and data paths. No speed claim from SQL subset or debug/release mismatch. | Original `3db8fc2` evidence: complete release baseline and after-optimization runs each cover 143 workloads × four cores × three rounds, with matching checksums and row counts. Current diagnostics cover 22 peer, eight paired Swift and three Ruby workloads, each with three rounds per actor. BENCHMARKS.md records provenance, raw samples, results and limitations; no universal parity claim. |
 | V14 | Local package/examples/reports | Runnable in-memory and durable examples, bound parameters, explicit cursor cleanup, transactions and cancellation; internal design/progress/verification/benchmark records. No website docs or publication. Apple targets remain unverified until actually built/tested. | Linux public examples pass; the final verification and benchmark reports record the frozen snapshot. Swift remains opt-in, with no package publication or promotion; Apple platforms are unverified and production delivery is undecided. |
 
 ## 7. Adapter correctness review checklist
@@ -577,7 +577,7 @@ probes passed; default process selection remains unchanged.
 
 ## Final audit and freeze
 
-The current implementation is `43481e2047da1cee34a627b910c8a7c7c59c473f` against the
+The current implementation is `fb34b0e8cb3d82287fbd3401e3426f04b3b86c7a` against the
 unchanged semantic baseline. Exact commands, source/actor hashes and retained
 reports are mapped in [VERIFICATION.md](../../impl/swift-native/VERIFICATION.md).
 The initial missing-state inventory, failed attempts and intermediate counts remain
@@ -586,7 +586,7 @@ work, not exclusions: their fixture/API/CLI checks, all 407 shared cases,
 10 object-field cases, 20 runtime probes and four RETURNING-order checks pass.
 The view-source correction has its own passing memory/disk regression.
 
-[BENCHMARKS.md](../../impl/swift-native/BENCHMARKS.md) preserves the original `cec8170`
+[BENCHMARKS.md](../../impl/swift-native/BENCHMARKS.md) preserves the original `3db8fc2`
 complete release baseline and measured optimization comparison, alongside the
 completed 22/8/3-workload structural diagnostics. Current native/SQL, exact-account, encrypted,
 interchange, service, process, stress and simulation gates cover the affected paths.

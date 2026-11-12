@@ -44,7 +44,7 @@ API, dependency or supported-core change is introduced.
 ## Evidence and method
 
 The baseline is pushed commit
-`25a1a7cce500266ac6f665ea920496e746382102`, library SHA-256
+`1b51383303b86f95cc8ed5743ff283f96d4e5f3a`, library SHA-256
 `405f5536969b71c80fa30bd45d962bda33af642b0185039d76e6443005c35336`,
 archived at `/tmp/jed-join-bounds-before/impl/ruby-native`.
 Final library SHA-256:

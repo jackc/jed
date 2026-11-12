@@ -8,7 +8,7 @@ The cursor failures reported below are historical. The
 [cursor conformance correction](CURSOR_CONFORMANCE_FIX.md) fixes them and
 supersedes the mixed-routing interpretation. Original measurements are retained.
 
-Measured 2026-10-19, after the compiled ordering work at `8243d0bc`. This explicitly
+Measured 2026-10-19, after the compiled ordering work at `83fb482b`. This explicitly
 requested extension keeps Ruby frozen, experimental, and opt-in. It changes no
 dependency, public API, shared SQL contract, supported core, or normal task selection.
 
@@ -47,7 +47,7 @@ exceed the node limit.
 
 ## Measurement method
 
-The baseline is commit `8243d0bc660c116dc3ae77928328ea61e09037be`, with implementation
+The baseline is commit `83fb482b1e9d1a2115f7bb2900f379c325ccec08`, with implementation
 SHA-256 `ac5c78008942148b55e7f13f4a9c133d4bc1bc730741999a147e5d0dd9e4040d`.
 The measured new implementation is
 `04bfeb536b5e30381a8f5a05942afe16fdb9e3cc207f5c7a46d2344b138d2170`.

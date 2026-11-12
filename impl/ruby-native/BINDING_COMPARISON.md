@@ -4,7 +4,7 @@
 > experiment branch. See the [archive and retrieval instructions](../../bench/ruby-native/ARCHIVE.md).
 > Reproduction commands below refer to that original checkout.
 
-Measured 2026-10-19 against `e5dbbe514e41822793e92c996fffbba5e5419e96`.
+Measured 2026-10-19 against `c313e1038fa1e5b2a53e763a54bfeeadb338b272`.
 This comparison changes no engine code or experimental-support policy.
 
 **Historical baseline:** the subsequent [API follow-up](API_FOLLOWUP.md) implements

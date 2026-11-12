@@ -14,8 +14,8 @@
     "selective": "jed_specialization,jed_specialization_scan",
     "g2": "jed_specialization"
   },
-  "revision": "90e654fe9b206a5b63d332ea170709e453f5091f",
-  "baseline": "dfb0699f18e7c5bb120bc0f885f257791b19e2b9",
+  "revision": "2aba5d4294985f8948835da4ea7aad1aad2a570b",
+  "baseline": "277f68cedb3117457d82c9d924ba0fac9a0e9c8b",
   "go": "go version go1.27.1 linux/amd64",
   "cpu": "Intel(R) Core(TM) Ultra 9 285K",
   "commands": [

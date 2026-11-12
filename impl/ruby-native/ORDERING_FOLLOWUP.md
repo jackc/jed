@@ -11,7 +11,7 @@ supersedes the mixed-routing interpretation. Original measurements are retained.
 Measured 2026-10-19. This explicitly requested extension adds typed comparisons
 to the experimental runtime compiler after the
 [cursor and scan correctness fixes](CORRECTNESS_FOLLOWUP.md), committed at
-`e8ec94e5`. The Ruby core remains frozen and opt-in. No dependency or public API
+`4114e8d7`. The Ruby core remains frozen and opt-in. No dependency or public API
 changes, and no supported-core implementation changes.
 
 ## Scope
@@ -81,7 +81,7 @@ nullable integer keys plus boolean keys. The original workloads retain their exi
 warmup and iteration schedules. Every timed run retains five samples; GC stays
 enabled. All results are fully consumed.
 
-Pre-change measurements use a source snapshot from `e8ec94e5` with SHA-256
+Pre-change measurements use a source snapshot from `4114e8d7` with SHA-256
 `e717a4cc8d51ac2d139bde06ab6f58c288aaf8f5510ea112eb4317cef83ab97e`.
 The new implementation is
 `ac5c78008942148b55e7f13f4a9c133d4bc1bc730741999a147e5d0dd9e4040d`.

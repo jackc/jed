@@ -38,7 +38,7 @@ fallbacks. No SQL behavior, host API or dependency changes.
 ## Evidence
 
 The baseline is pushed commit
-`7a70c9f2543dcf459e8b7ad6dcb4c02cb02499cb`, library SHA-256
+`ac50d8834e37ee7796da4d4c74e4cd2e54fd6cb5`, library SHA-256
 `577249f5b49bd67c369ca53eb256d91db73668a072bb1051c819a9698a40fc31`,
 archived at `/tmp/jed-outer-join-before/impl/ruby-native`.
 Final library SHA-256:

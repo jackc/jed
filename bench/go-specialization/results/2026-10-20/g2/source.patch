@@ -639,7 +639,7 @@ index 6eff654..c664d63 100644
 +  stage = ENV.fetch("JED_SPECIALIZATION_STAGE", "g2")
 +  if stage == "g2"
 +    g1 = Dir.mktmpdir("g1-", out)
-+    archive, status = Open3.capture2("git", "archive", "90e654fe9b206a5b63d332ea170709e453f5091f", "impl/go")
++    archive, status = Open3.capture2("git", "archive", "2aba5d4294985f8948835da4ea7aad1aad2a570b", "impl/go")
 +    abort "G1 archive failed" unless status.success?
 +    Open3.popen3("tar", "-x", "-C", g1) do |input, output, errors, child|
 +      input.binmode; input.write(archive); input.close

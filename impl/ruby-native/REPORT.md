@@ -19,8 +19,8 @@ this as an experiment rather than promoting it on performance grounds.
 
 ## Scope and reproducibility
 
-Work began against `d4a01ebdbf3edff0c130b1fdb4c1115df6d1c4bd`. The completed engine
-is recorded in commit `7807e37d`; its measured library SHA-256 is
+Work began against `d980b536147ab88e13ba6f5bb30723fccf976da5`. The completed engine
+is recorded in commit `4caec090`; its measured library SHA-256 is
 `05b5aa0e67adf3fd2c19f99059397772d141ed0f0d3a6094eefde9702c5adbfb`.
 Parser, planner, type system, evaluator, regex VM, storage and page service are
 handwritten Ruby. SQL execution does not call another core, FFI or WASM.

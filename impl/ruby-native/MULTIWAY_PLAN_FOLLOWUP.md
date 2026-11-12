@@ -91,7 +91,7 @@ The original failing queries remain covered separately by correctness checks.
 ## Evidence and method
 
 Archived starting point: commit
-`a612935772c97075826bb98e34fa89d2ec9bce34`, library SHA-256
+`1a81035e3f697b2a62cb66f769016658690a8d4b`, library SHA-256
 `730a4a03496f62feec03acb2355e9c5f2fc9dda69fa055e7d9595f7457bb5edf`.
 Its private archive is `/tmp/jed-multiway-plan-before/impl/ruby-native`.
 

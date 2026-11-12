@@ -1,8 +1,8 @@
 # TypeScript async boundary measurements
 
-> Archive: [original report, committed data and experiment artifacts](https://github.com/jackc/jed/tree/b4ebe9c45f1b295add890f0a7d9478c6ac586c46/bench/ts/results/2026-10-18-async). Artifact paths and historical reproduction commands below refer to that snapshot; measured commit IDs are unchanged. Outputs explicitly described as local or ignored were not committed.
+> Archive: [original report, committed data and experiment artifacts](https://github.com/jackc/jed/tree/ebc27e00a1b4c40a1d6506e35f5d610a88414133/bench/ts/results/2026-10-18-async). Artifact paths and historical reproduction commands below refer to that snapshot; measured commit IDs are unchanged. Outputs explicitly described as local or ignored were not committed.
 
-Measured 2026-10-18T20:01:04.636Z, base revision c105eed383cae6ef98cfc8872b71aa3657f1c999 (modified working tree), v26.10.0, linux/x64, Intel(R) Core(TM) Ultra 9 285K.
+Measured 2026-10-18T20:01:04.636Z, base revision 109aa27f79d4c6071f5755b9829eb20cde109b8c (modified working tree), v26.10.0, linux/x64, Intel(R) Core(TM) Ultra 9 285K.
 
 The measurements include the uncommitted async implementation; the revision identifies its base commit.
 

@@ -2,9 +2,9 @@
 
 Authorized 2026-11-06 after the completed native Swift experiment. This work is
 explicitly opt-in and does not promote Swift, change its semantic baseline, or
-select production delivery. The original frozen implementation `cec8170bfc33f087fa98949ae661b1eaa5490218`
+select production delivery. The original frozen implementation `3db8fc2d2653475abc5e9d43049254ccd1e92387`
 and its complete benchmark/verification evidence remain preserved. The starting
-checkout for this investigation is local-only `56972d2f`.
+checkout for this investigation is local-only `88384fe7`.
 
 The original question was why the experimental Swift engine took geometric-mean
 times of 9.1990× Rust, 7.5125× Go and 2.1292× TypeScript on the same 143 workloads.
@@ -17,7 +17,7 @@ shortcut is authorized by this investigation.
 ## Completed result
 
 The structural implementation is complete and frozen at local-only
-`43481e2047da1cee34a627b910c8a7c7c59c473f`. It preserves the semantic target and
+`fb34b0e8cb3d82287fbd3401e3426f04b3b86c7a`. It preserves the semantic target and
 experimental status. [BENCHMARKS.md](../../impl/swift-native/BENCHMARKS.md) now
 leads with direct peer timings, followed by controlled Swift and aligned Ruby
 comparisons. All selected results pass exact validation; no slower result or

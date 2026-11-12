@@ -1,8 +1,8 @@
 # Query-stage profiling: TypeScript async runtime
 
-> Archive: [original report, committed data and experiment artifacts](https://github.com/jackc/jed/tree/8b450c4f298390fff405d2b1e6f1df63de047819/bench/ts/results/2026-10-19-query-profile). Artifact paths and historical reproduction commands below refer to that snapshot; measured commit IDs are unchanged. Outputs explicitly described as local or ignored were not committed.
+> Archive: [original report, committed data and experiment artifacts](https://github.com/jackc/jed/tree/3f441edfb01e150b606138b374787247d72ef35c/bench/ts/results/2026-10-19-query-profile). Artifact paths and historical reproduction commands below refer to that snapshot; measured commit IDs are unchanged. Outputs explicitly described as local or ignored were not committed.
 
-Measured 2026-10-19 against production engine commit `d4f74290`. Production execution,
+Measured 2026-10-19 against production engine commit `02cea783`. Production execution,
 scheduling, codecs and limits are unchanged. The new code is a reproducible profiling harness.
 
 The bulk-result penalty is spread across result encoding, message delivery/dispatch, decoding
@@ -95,9 +95,9 @@ function times or sampled CPU figures to the preceding wall-time table.
 
 **A major hotspot is SQL's repeated hex decoding.** The constant expression
 `decode('0001feff','hex')` is evaluated for every output row. In Node,
-[`decodeText`](https://github.com/jackc/jed/blob/d4f742903acbce75e7235d92b6bf433c5c92891e/impl/ts/src/executor.ts#L1602) accounts for roughly 62–66 ms/query
+[`decodeText`](https://github.com/jackc/jed/blob/02cea7838bb5a5b0b68b62e272034ad07e5272d5/impl/ts/src/executor.ts#L1602) accounts for roughly 62–66 ms/query
 inclusive: approximately 46–50 ms in native UTF-8 encoding and 15 ms in
-[`decodeHexPairs`](https://github.com/jackc/jed/blob/d4f742903acbce75e7235d92b6bf433c5c92891e/impl/ts/src/value.ts#L401). Chromium's native encoding alone
+[`decodeHexPairs`](https://github.com/jackc/jed/blob/02cea7838bb5a5b0b68b62e272034ad07e5272d5/impl/ts/src/value.ts#L401). Chromium's native encoding alone
 accounts for about 80–88 ms/query. This is expression evaluation in both direct and worker
 paths, not result serialization. The full `applyScalarFunc` branch has inlined descendants in
 Chromium, so its larger inclusive time is not a separate function-dispatch cost.
@@ -234,16 +234,16 @@ mise run bench:ts_async_profile --analyze /tmp/jed-profile-analysis \
   /tmp/jed-profile-node-coarse /tmp/jed-profile-browser-cpu
 ```
 
-The [summary](https://github.com/jackc/jed/blob/8b450c4f298390fff405d2b1e6f1df63de047819/bench/ts/results/2026-10-19-query-profile/summary.json) contains all grouped timing statistics, process medians and CPU
-bucket summaries. [analysis.json.gz](https://github.com/jackc/jed/blob/8b450c4f298390fff405d2b1e6f1df63de047819/bench/ts/results/2026-10-19-query-profile/analysis.json.gz) retains every sample's additive ledger,
-CPU overviews and analysis methodology. [runs.json](https://github.com/jackc/jed/blob/8b450c4f298390fff405d2b1e6f1df63de047819/bench/ts/results/2026-10-19-query-profile/runs.json) records chronology. Raw results
+The [summary](https://github.com/jackc/jed/blob/3f441edfb01e150b606138b374787247d72ef35c/bench/ts/results/2026-10-19-query-profile/summary.json) contains all grouped timing statistics, process medians and CPU
+bucket summaries. [analysis.json.gz](https://github.com/jackc/jed/blob/3f441edfb01e150b606138b374787247d72ef35c/bench/ts/results/2026-10-19-query-profile/analysis.json.gz) retains every sample's additive ledger,
+CPU overviews and analysis methodology. [runs.json](https://github.com/jackc/jed/blob/3f441edfb01e150b606138b374787247d72ef35c/bench/ts/results/2026-10-19-query-profile/runs.json) records chronology. Raw results
 and profiles are under `raw/<host>-<mode>-<repeat>/`; CPU runs include compressed source maps.
 Full mapped CPU summaries are under `cpu/`. Decompress each `results.json.gz` to `results.json`
 and browser `site/assets/*.map.gz` to `.map` to re-run the analyzer on an archived directory;
 compiled JavaScript is not needed for offline source mapping. Original paths may no longer
 exist, but archived hashes, maps and the measured commit identify their source.
 
-[manifest.json](https://github.com/jackc/jed/blob/8b450c4f298390fff405d2b1e6f1df63de047819/bench/ts/results/2026-10-19-query-profile/manifest.json) records archive hashes, the measured source hashes and environment.
+[manifest.json](https://github.com/jackc/jed/blob/3f441edfb01e150b606138b374787247d72ef35c/bench/ts/results/2026-10-19-query-profile/manifest.json) records archive hashes, the measured source hashes and environment.
 All 142 recorded engine/workload source files and 14 actual measurement-adapter/tool files are
 fixed across the 20 runs. Offline analyzer/classification code and documentation evolved during
 collection; full `toolSha256` maps are therefore not identical. The final classification corrects
