@@ -90,6 +90,41 @@ impl CompressMemo {
     }
 }
 
+thread_local! {
+    /// The memo of the store write running on this thread ([`lend_to_tree`]).
+    static TREE_MEMO: std::cell::RefCell<Option<Arc<CompressMemo>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Returned by [`lend_to_tree`]; dropping it ends the loan.
+pub(crate) struct TreeLoan {
+    prev: Option<Arc<CompressMemo>>,
+}
+
+/// Lend `memo` to the B-tree edit the calling store is about to run on this thread, until the
+/// returned guard drops. The tree's leaf-size arithmetic classifies rows by their disposition plan
+/// (`crate::format`'s leaf_compact `row_items`), far below the store and through signatures that
+/// carry no writer state; it takes the memo from here ([`plan_with_lent`]). A plan is the same
+/// with or without a memo, so a missing or foreign loan costs time only.
+pub(crate) fn lend_to_tree(memo: Option<Arc<CompressMemo>>) -> TreeLoan {
+    TreeLoan {
+        prev: TREE_MEMO.with(|m| m.replace(memo)),
+    }
+}
+
+impl Drop for TreeLoan {
+    fn drop(&mut self) {
+        let prev = self.prev.take();
+        TREE_MEMO.with(|m| *m.borrow_mut() = prev);
+    }
+}
+
+/// Run a disposition plan with the memo lent to this thread's tree edit, if any.
+pub(crate) fn plan_with_lent<R>(plan: impl FnOnce(Option<&CompressMemo>) -> R) -> R {
+    let memo = TREE_MEMO.with(|m| m.borrow().clone());
+    plan(memo.as_deref())
+}
+
 /// A fast 64-bit hash of `b` — four independent multiply-rotate lanes over 32-byte strides, then a
 /// splitmix64 finish. It only picks the entry to verify; exactness comes from the verification.
 fn payload_hash(b: &[u8]) -> u64 {

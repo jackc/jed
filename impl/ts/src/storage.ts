@@ -133,6 +133,8 @@ export class TableStore {
   // memo is the writer's compression memo (CompressMemo): created on the first write that plans a
   // spillable column, never copied by clone, and dropped by the commit encoder.
   private memo: CompressMemo | null = null;
+  // writeShapeMemo is shape with memo set (writeShape), kept while the memo is the same one.
+  private writeShapeMemo: LeafShape | null = null;
 
   constructor(
     cap: Cap,
@@ -259,6 +261,19 @@ export class TableStore {
     return this.memo;
   }
 
+  // writeShape is the store's leaf shape carrying its compression memo, for the tree's write paths.
+  private writeShape(): LeafShape {
+    if (this.shape.sizer === null) return this.shape;
+    const memo = this.compressMemo();
+    if (memo === null) return this.shape;
+    let ws = this.writeShapeMemo;
+    if (ws === null || ws.memo !== memo) {
+      ws = { ...this.shape, memo };
+      this.writeShapeMemo = ws;
+    }
+    return ws;
+  }
+
   // writerCompressMemo is the memo the commit encoder plans this store's dirty leaves with, or null.
   writerCompressMemo(): CompressMemo | null {
     return this.memo;
@@ -300,7 +315,7 @@ export class TableStore {
     const src = this.leafSrc();
     if ((yield* this.rows.getSteps(key, src)) !== undefined) return false;
     const [weight, stored] = this.weight(key, row);
-    yield* this.rows.insertSteps(key, row, weight, this.cap, this.shape, src);
+    yield* this.rows.insertSteps(key, row, weight, this.cap, this.writeShape(), src);
     this.stage(key, stored);
     return true;
   }
@@ -331,7 +346,7 @@ export class TableStore {
 
   *replaceSteps(key: Uint8Array, row: Row): Steps<void> {
     const [weight, stored] = this.weight(key, row);
-    yield* this.rows.insertSteps(key, row, weight, this.cap, this.shape, this.leafSrc());
+    yield* this.rows.insertSteps(key, row, weight, this.cap, this.writeShape(), this.leafSrc());
     this.stage(key, stored);
   }
 
@@ -343,7 +358,8 @@ export class TableStore {
 
   *removeSteps(key: Uint8Array): Steps<boolean> {
     const removed =
-      (yield* this.rows.removeSteps(key, this.cap, this.shape, this.leafSrc())) !== undefined;
+      (yield* this.rows.removeSteps(key, this.cap, this.writeShape(), this.leafSrc())) !==
+      undefined;
     if (removed) this.unstage(key);
     return removed;
   }

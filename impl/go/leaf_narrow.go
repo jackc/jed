@@ -374,29 +374,58 @@ type dictItem struct {
 
 // dictAcc accumulates a region's dictionary facts.
 type dictAcc struct {
-	seen    map[string]struct{}
-	d, dup  int
-	hasNull bool
+	seen   map[string]int // rows holding each shared payload
+	d, dup int
+	nulls  int
+	// addOnly says no value is ever removed. More than 256 entries then rule the dictionary out for
+	// good (dictSaving), so the rest are not counted.
+	addOnly bool
 }
 
 func (a *dictAcc) add(it dictItem, header int) {
+	if a.addOnly && a.d > 256 {
+		return
+	}
 	switch it.kind {
 	case dictNull:
-		if !a.hasNull {
-			a.hasNull = true
+		if a.nulls == 0 {
 			a.d++
 		}
+		a.nulls++
 	case dictOwn:
 		a.d++
 	default:
 		if a.seen == nil {
-			a.seen = map[string]struct{}{}
+			a.seen = map[string]int{}
 		}
-		if _, ok := a.seen[string(it.payload)]; ok {
+		if k := a.seen[string(it.payload)]; k > 0 {
+			a.seen[string(it.payload)] = k + 1
 			a.dup += header + len(it.payload)
 		} else {
-			a.seen[string(it.payload)] = struct{}{}
+			a.seen[string(it.payload)] = 1
 			a.d++
+		}
+	}
+}
+
+// remove takes out one value add was given. The facts are those of the remaining values in any
+// order: an entry is counted once however many rows share it.
+func (a *dictAcc) remove(it dictItem, header int) {
+	switch it.kind {
+	case dictNull:
+		a.nulls--
+		if a.nulls == 0 {
+			a.d--
+		}
+	case dictOwn:
+		a.d--
+	default:
+		if k := a.seen[string(it.payload)]; k > 1 {
+			a.seen[string(it.payload)] = k - 1
+			a.dup -= header + len(it.payload)
+		} else {
+			delete(a.seen, string(it.payload))
+			a.d--
 		}
 	}
 }
@@ -437,7 +466,7 @@ func rowItems(shape leafShape, pcap pageCap, key []byte, row storedRow, out []di
 	}
 	var plan *recordPlan
 	if size > recordMaxFor(pcap.c, len(shape.colTypes)) {
-		p := planDispositions(shape.colTypes, key, row, pcap)
+		p := planDispositionsMemo(shape.colTypes, key, row, pcap, shape.memo)
 		plan = &p
 	}
 	for j, c := range shape.itemCols {
@@ -462,11 +491,17 @@ func rowItems(shape leafShape, pcap pageCap, key []byte, row storedRow, out []di
 // leafSizes is the content-dependent size facts of a dirty decoded leaf, kept with the node so an
 // insert updates them for one row instead of recomputing them for the leaf: each item column's
 // dictionary, symbol-table gain and typed-array facts, and each base-plus-offsets column's value
-// span. All only ever grow under inserts; any other change to the node's rows drops the cache.
+// span. addRow and removeRow keep them equal to a fresh measurement of the node's rows.
 type leafSizes struct {
 	n    int
 	accs []colAcc
 	fors []forRange
+	// forCnt is each base-plus-offsets column's present values. forStale marks a column whose range
+	// lost a value at one of its ends: fors then only contains the true range, until refresh rescans
+	// the column. stale says any column is.
+	forCnt   []int
+	forStale []bool
+	stale    bool
 	// tabs is the leaf's symbol tables by column (leaf_sym.go); nil until the leaf needs them.
 	tabs []*symTable
 	// coded says the gains were measured (under tabs, or the shape's per-column tables): the leaf did
@@ -499,12 +534,14 @@ func newLeafSizes(shape leafShape, pcap pageCap, keys [][]byte, rows []storedRow
 // leafSizesOf is newLeafSizes over rows already classified.
 func leafSizesOf(shape leafShape, rows []storedRow, items [][]dictItem, tabs []*symTable, train bool) *leafSizes {
 	sz := &leafSizes{
-		n:     len(rows),
-		accs:  make([]colAcc, len(shape.itemCols)),
-		fors:  make([]forRange, len(shape.forCols)),
-		items: make([]dictItem, len(shape.itemCols)),
-		tabs:  tabs,
-		coded: train || tabs != nil,
+		n:        len(rows),
+		accs:     make([]colAcc, len(shape.itemCols)),
+		fors:     make([]forRange, len(shape.forCols)),
+		forCnt:   make([]int, len(shape.forCols)),
+		forStale: make([]bool, len(shape.forCols)),
+		items:    make([]dictItem, len(shape.itemCols)),
+		tabs:     tabs,
+		coded:    train || tabs != nil,
 	}
 	// With per-column tables a leaf trains its own only when it overflows under those (buildLeaf).
 	if tabs == nil && train && !leafSymCol {
@@ -514,7 +551,13 @@ func leafSizesOf(shape leafShape, rows []storedRow, items [][]dictItem, tabs []*
 		for _, row := range rows {
 			if v := row[fc.col]; !v.IsNull() {
 				sz.fors[j].add(forSlot(fc, v))
+				sz.forCnt[j]++
 			}
+		}
+	}
+	for j := range shape.itemCols {
+		if shape.itemDict[j] {
+			sz.accs[j].dict.seen = make(map[string]int, len(rows))
 		}
 	}
 	// Dictionary and array facts first; then a column's coded gain, which is the expensive part,
@@ -559,6 +602,7 @@ func (sz *leafSizes) addRow(shape leafShape, pcap pageCap, key []byte, row store
 	for j, fc := range shape.forCols {
 		if v := row[fc.col]; !v.IsNull() {
 			sz.fors[j].add(forSlot(fc, v))
+			sz.forCnt[j]++
 		}
 	}
 	if len(shape.itemCols) == 0 {
@@ -570,6 +614,61 @@ func (sz *leafSizes) addRow(shape leafShape, pcap pageCap, key []byte, row store
 	}
 }
 
+// removeRow takes one of the measured rows out. It reports false when the facts cannot be kept
+// exact this way (a coded leaf, or a packed array holding an end of its element range); the caller
+// then drops them and the leaf is measured again.
+func (sz *leafSizes) removeRow(shape leafShape, pcap pageCap, key []byte, row storedRow) bool {
+	if sz.coded {
+		return false
+	}
+	if len(shape.itemCols) > 0 {
+		rowItems(shape, pcap, key, row, sz.items)
+		for j := range shape.itemCols {
+			if !sz.accs[j].remove(shape, j, sz.items[j]) {
+				return false
+			}
+		}
+	}
+	sz.n--
+	for j, fc := range shape.forCols {
+		v := row[fc.col]
+		if v.IsNull() {
+			continue
+		}
+		sz.forCnt[j]--
+		r := &sz.fors[j]
+		if sz.forCnt[j] == 0 {
+			*r = forRange{}
+			sz.forStale[j] = false
+		} else if s := forSlot(fc, v); s == r.lo || s == r.hi {
+			sz.forStale[j] = true
+			sz.stale = true
+		}
+	}
+	return true
+}
+
+// refresh rescans the columns whose range went stale. rows are the node's.
+func (sz *leafSizes) refresh(shape leafShape, rows []storedRow) {
+	if !sz.stale {
+		return
+	}
+	for j, fc := range shape.forCols {
+		if !sz.forStale[j] {
+			continue
+		}
+		var r forRange
+		for _, row := range rows {
+			if v := row[fc.col]; !v.IsNull() {
+				r.add(forSlot(fc, v))
+			}
+		}
+		sz.fors[j] = r
+		sz.forStale[j] = false
+	}
+	sz.stale = false
+}
+
 // tab is the table item column j's gain is measured under, nil while the leaf is not coded.
 func (sz *leafSizes) tab(shape leafShape, j, c int) *symTable {
 	if !sz.coded {
@@ -579,10 +678,15 @@ func (sz *leafSizes) tab(shape leafShape, j, c int) *symTable {
 }
 
 // saving is the bytes the leaf's content-dependent regions save. sym says whether the leaf is
-// written with its symbol tables: only a leaf that does not fit without them is.
+// written with its symbol tables: only a leaf that does not fit without them is. While a column's
+// range is stale the result is an upper bound: the column is taken at its narrowest offsets.
 func (sz *leafSizes) saving(shape leafShape, sym bool) int {
 	total := 0
 	for j, fc := range shape.forCols {
+		if sz.forStale[j] {
+			total += forSaving(sz.n, fc.w, 0, 0, true)
+			continue
+		}
 		total += forSaving(sz.n, fc.w, sz.fors[j].lo, sz.fors[j].hi, sz.fors[j].any)
 	}
 	for j, c := range shape.itemCols {

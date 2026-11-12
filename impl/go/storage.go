@@ -103,6 +103,15 @@ func (s *tableStore) compressMemo() *compressMemo {
 	return s.memo
 }
 
+// writeShape is the store's leaf shape carrying its compression memo, for the tree's write paths.
+func (s *tableStore) writeShape() leafShape {
+	shape := s.shape
+	if len(shape.itemCols) > 0 {
+		shape.memo = s.compressMemo()
+	}
+	return shape
+}
+
 // truncated returns an empty store with this store's shape and paging — the commit-time emptying of
 // an ON COMMIT DELETE ROWS temp table (spec/design/temp-tables.md §5.1). The synthetic rowid counter
 // carries over (it is monotonic, never reused); nothing is staged, since nothing is written.
@@ -288,7 +297,7 @@ func (s *tableStore) Insert(key []byte, row storedRow) (bool, error) {
 	if err := s.stage(key, stored); err != nil {
 		return false, err
 	}
-	if _, _, err := s.rows.Insert(key, row, weight, s.cap, s.shape, src); err != nil {
+	if _, _, err := s.rows.Insert(key, row, weight, s.cap, s.writeShape(), src); err != nil {
 		return false, err
 	}
 	if err := s.maybeTrainColumns(); err != nil {
@@ -320,7 +329,7 @@ func (s *tableStore) Replace(key []byte, row storedRow) error {
 	if err := s.stage(key, stored); err != nil {
 		return err
 	}
-	if _, _, err := s.rows.Insert(key, row, weight, s.cap, s.shape, s.leafSrc()); err != nil {
+	if _, _, err := s.rows.Insert(key, row, weight, s.cap, s.writeShape(), s.leafSrc()); err != nil {
 		return err
 	}
 	return nil
@@ -329,7 +338,7 @@ func (s *tableStore) Replace(key []byte, row storedRow) error {
 // Remove deletes the row at key (DELETE). Returns whether a row was present. May fault leaves the
 // delete descends into / rebalances against.
 func (s *tableStore) Remove(key []byte) (bool, error) {
-	_, ok, err := s.rows.Remove(key, s.cap, s.shape, s.leafSrc())
+	_, ok, err := s.rows.Remove(key, s.cap, s.writeShape(), s.leafSrc())
 	if err != nil || !ok {
 		return ok, err
 	}

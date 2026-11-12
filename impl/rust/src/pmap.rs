@@ -34,8 +34,8 @@
 //! merge subsumes it; an interior merge whose result cannot 2-way split is **abandoned**,
 //! format.md "Delete").
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::catalog::ColType;
 use crate::error::Result;
@@ -45,6 +45,25 @@ use crate::format::{
 };
 use crate::storage::Row;
 use crate::value::Value;
+
+/// Test switch: every use of a leaf's kept size facts compares them with a fresh measurement of
+/// the same rows. Per thread, so tests running beside the one that sets it are not slowed.
+#[cfg(test)]
+pub(crate) mod leaf_sizes_check {
+    use std::cell::Cell;
+
+    thread_local! {
+        static ON: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(crate) fn set(on: bool) {
+        ON.with(|c| c.set(on));
+    }
+
+    pub(super) fn on() -> bool {
+        ON.with(Cell::get)
+    }
+}
 
 /// A B+tree node's reference to one child. Under demand paging (P6.4b, spec/design/pager.md §4) a
 /// clean leaf need not be resident: an interior node keeps `OnDisk(page_id)` for such a child and
@@ -194,9 +213,11 @@ pub(crate) struct Node {
     /// incremental commit skip its whole (unchanged) subtree.
     pub(crate) page: AtomicU32,
     /// A dirty decoded leaf's content-dependent size facts (format.md "Leaf payload"), kept so an
-    /// insert into it measures one row rather than the leaf. `None` until an insert needs them, and
-    /// again after any other change to the leaf's rows.
-    sizes: Option<Box<LeafSizes>>,
+    /// insert, delete or row replacement measures one row rather than the leaf. `None` until an
+    /// insert needs them, and again after a change they cannot follow exactly. Behind a lock
+    /// because reading the saving may first rescan a column whose range a removal left stale
+    /// ([`LeafSizes::refresh`]) — a change to the cache only, never to the facts' meaning.
+    sizes: Mutex<Option<Box<LeafSizes>>>,
     /// The tag of the page at `page` (spec/fileformat/encrypted.md §2), stored as two words; zero in
     /// a plaintext file and while the node is dirty. Set with the page id by the commit that seals
     /// the node, so a parent written later binds it.
@@ -219,7 +240,7 @@ impl Node {
             weights,
             children: Vec::new(),
             packed: None,
-            sizes: None,
+            sizes: Mutex::new(None),
             page: AtomicU32::new(0),
             tag: tag_words(&crate::crypto::NO_TAG),
         })
@@ -240,7 +261,7 @@ impl Node {
             weights: Vec::new(),
             children,
             packed: None,
-            sizes: None,
+            sizes: Mutex::new(None),
             page: AtomicU32::new(0),
             tag: tag_words(&crate::crypto::NO_TAG),
         }
@@ -261,7 +282,7 @@ impl Node {
             weights,
             children,
             packed: None,
-            sizes: None,
+            sizes: Mutex::new(None),
             page: AtomicU32::new(page.page),
             tag: tag_words(&page.tag),
         })
@@ -282,7 +303,7 @@ impl Node {
             weights: Vec::new(),
             children,
             packed: None,
-            sizes: None,
+            sizes: Mutex::new(None),
             page: AtomicU32::new(page.page),
             tag: tag_words(&page.tag),
         })
@@ -299,7 +320,7 @@ impl Node {
             weights: Vec::new(),
             children: Vec::new(),
             packed: Some(packed),
-            sizes: None,
+            sizes: Mutex::new(None),
             page: AtomicU32::new(page.page),
             tag: tag_words(&page.tag),
         }
@@ -328,6 +349,10 @@ impl Node {
             Ordering::Release,
         );
         self.page.store(page.page, Ordering::Release);
+        if page.page != 0 && self.is_leaf() {
+            // A clean leaf is never edited in place: its size facts have no further use.
+            *self.sizes_lock() = None;
+        }
     }
 
     pub(crate) fn is_leaf(&self) -> bool {
@@ -387,18 +412,51 @@ impl Node {
 
     /// The bytes a **decoded** leaf's content-dependent encodings save: the shared key prefix and
     /// its regions' base-plus-offsets, dictionary and packed-array forms. The kept size facts are
-    /// used when they cover the leaf's rows.
+    /// used when they cover the leaf's rows; a dirty leaf measured here keeps them.
     fn content_saving(&self, cap: Cap, shape: &LeafShape) -> usize {
         let n = self.keys.len();
         if n == 0 {
             return 0;
         }
-        match &self.sizes {
-            Some(sz) if sz.len() == n => {
-                leaf_prefix_saving(n, &self.keys[0], &self.keys[n - 1]) + sz.saving(shape)
-            }
-            _ => leaf_saving(shape, cap, n, &|i| &self.keys[i], &|i| &self.vals[i]),
+        let prefix = leaf_prefix_saving(n, &self.keys[0], &self.keys[n - 1]);
+        if !shape.content_cols() {
+            return prefix;
         }
+        let mut sizes = self.sizes_lock();
+        if sizes.as_ref().is_none_or(|sz| sz.len() != n) {
+            let measured =
+                LeafSizes::measure(shape, cap, n, &|i| &self.keys[i], &|i| &self.vals[i]);
+            if self.page.load(Ordering::Relaxed) != 0 {
+                return prefix + measured.saving(shape);
+            }
+            // A dirty leaf's rows change only with its facts (`node_insert`, `node_remove`), so it
+            // keeps them: the deletes and replacements that follow take one row out of them.
+            *sizes = Some(Box::new(measured));
+        }
+        let sz = sizes.as_mut().expect("measured above");
+        sz.refresh(shape, &|i| &self.vals[i]);
+        let regions = sz.saving(shape);
+        #[cfg(test)]
+        if leaf_sizes_check::on() {
+            let fresh = LeafSizes::measure(shape, cap, n, &|i| &self.keys[i], &|i| &self.vals[i])
+                .saving(shape);
+            assert_eq!(
+                regions, fresh,
+                "BUG: a leaf's kept size facts and a fresh measurement disagree"
+            );
+        }
+        prefix + regions
+    }
+
+    /// The kept size facts. A panic while they were held leaves nothing half-written that a later
+    /// reader would trust (the cross-check panics before any use), so a poisoned lock is entered.
+    fn sizes_lock(&self) -> MutexGuard<'_, Option<Box<LeafSizes>>> {
+        self.sizes.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The kept size facts of a leaf the caller owns.
+    fn sizes_mut(&mut self) -> &mut Option<Box<LeafSizes>> {
+        self.sizes.get_mut().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Whether a leaf's payload is below `limit`. The content-dependent saving is computed only
@@ -408,7 +466,22 @@ impl Node {
             Some(p) => p.payload_len() < limit,
             None => {
                 let plain = self.plain_payload(shape);
-                plain < limit || plain - self.content_saving(cap, shape) < limit
+                if plain < limit {
+                    return true;
+                }
+                // A stale range overstates the saving: when even that leaves the leaf at or above
+                // the limit, the columns need no rescan.
+                let n = self.keys.len();
+                let upper = match self.sizes_lock().as_deref() {
+                    Some(sz) if sz.stale() && sz.len() == n && n > 0 => Some(
+                        sz.saving(shape) + leaf_prefix_saving(n, &self.keys[0], &self.keys[n - 1]),
+                    ),
+                    _ => None,
+                };
+                if upper.is_some_and(|upper| plain.saturating_sub(upper) >= limit) {
+                    return false;
+                }
+                plain - self.content_saving(cap, shape) < limit
             }
         }
     }
@@ -1658,13 +1731,22 @@ fn node_insert(
             debug_assert!(node.packed.is_none(), "a dirty leaf is decoded");
             let i = match found {
                 Ok(i) => {
+                    // The facts follow the row: the old one out, the new one in.
+                    let n = node.keys.len();
+                    let sizes = node.sizes.get_mut().unwrap_or_else(|e| e.into_inner());
+                    if let Some(sz) = sizes {
+                        if sz.len() == n && sz.remove_row(shape, cap, &key, &node.vals[i]) {
+                            sz.add_row(shape, cap, &key, &val);
+                        } else {
+                            *sizes = None;
+                        }
+                    }
                     *old = Some(std::mem::replace(&mut node.vals[i], val));
                     node.weights[i] = weight;
-                    node.sizes = None; // a replaced row can shrink the facts: measure again
                     i
                 }
                 Err(i) => {
-                    if let Some(sz) = &mut node.sizes {
+                    if let Some(sz) = node.sizes_mut() {
                         sz.add_row(shape, cap, &key, &val);
                     }
                     node.keys.insert(i, key);
@@ -1679,18 +1761,11 @@ fn node_insert(
             }
             // Past its plain capacity the leaf fits only by its content-dependent savings. Keep
             // their facts with the node, so the inserts that follow add one row to them.
-            if node
-                .sizes
-                .as_ref()
-                .is_none_or(|sz| sz.len() != node.keys.len())
-            {
-                node.sizes = Some(Box::new(LeafSizes::measure(
-                    shape,
-                    cap,
-                    node.keys.len(),
-                    &|i| &node.keys[i],
-                    &|i| &node.vals[i],
-                )));
+            let n = node.keys.len();
+            if node.sizes_mut().as_ref().is_none_or(|sz| sz.len() != n) {
+                let measured =
+                    LeafSizes::measure(shape, cap, n, &|i| &node.keys[i], &|i| &node.vals[i]);
+                *node.sizes_mut() = Some(Box::new(measured));
             }
             if plain - node.content_saving(cap, shape) <= cap.c {
                 return Ok(Ins::Kept);
@@ -1865,7 +1940,13 @@ fn node_remove(
             && let Some(leaf) = Arc::get_mut(node)
         {
             debug_assert!(leaf.packed.is_none(), "a dirty leaf is decoded");
-            leaf.sizes = None;
+            let n = leaf.keys.len();
+            let sizes = leaf.sizes.get_mut().unwrap_or_else(|e| e.into_inner());
+            if let Some(sz) = sizes
+                && !(sz.len() == n && sz.remove_row(shape, cap, key, &leaf.vals[i]))
+            {
+                *sizes = None;
+            }
             leaf.keys.remove(i);
             leaf.weights.remove(i);
             return Ok(Some(leaf.vals.remove(i)));
@@ -2994,5 +3075,46 @@ mod tests {
         assert_eq!(got[0].0, key(501));
         assert_eq!(got.last().unwrap().0, key(1500));
         assert_eq!(got.len(), 1000);
+    }
+}
+
+#[cfg(test)]
+mod leaf_sizes_tests {
+    use super::leaf_sizes_check;
+    use crate::{CreateOptions, Database, SessionOptions};
+
+    /// A dirty leaf keeps its content-dependent size facts across inserts, deletes and row
+    /// replacements (`LeafSizes::add_row` / `remove_row`). They must equal a fresh measurement at
+    /// every use: the split and merge decisions, and so the file's bytes, depend on them.
+    #[test]
+    fn leaf_size_facts_follow_deletes_and_updates() {
+        leaf_sizes_check::set(true);
+        let db = Database::create(CreateOptions::default()).unwrap();
+        let mut s = db.session(SessionOptions::default());
+        let steps = [
+            "CREATE TABLE t (id bigint PRIMARY KEY, v bigint, w integer, s text, a bigint[])",
+            "CREATE INDEX t_s ON t (s)",
+            "INSERT INTO t SELECT x, x * 7, CASE WHEN x % 11 = 0 THEN NULL ELSE x % 100 END, \
+             'status-' || (x % 5), ARRAY[x, x + 1, x % 9] FROM generate_series(1, 6000) AS g(x)",
+            "DELETE FROM t WHERE id BETWEEN 100 AND 900",
+            "UPDATE t SET v = 4000000000000 WHERE id % 97 = 0",
+            "UPDATE t SET v = NULL, w = w + 100000 WHERE id % 13 = 0",
+            "DELETE FROM t WHERE id % 3 = 0",
+            "UPDATE t SET s = 'only-' || id WHERE id % 7 = 0",
+            "UPDATE t SET a = ARRAY[id * 1000000000] WHERE id % 5 = 0",
+            "UPDATE t SET a = NULL, s = NULL WHERE id % 17 = 0",
+            "DELETE FROM t WHERE id > 5000",
+            "INSERT INTO t SELECT x, 1, 1, 'status-1', '{}'::bigint[] \
+             FROM generate_series(100, 900) AS g(x)",
+            "DELETE FROM t WHERE v = 4000000000000",
+            "UPDATE t SET v = id, w = 0, s = 'x', a = '{1}'",
+            "DELETE FROM t WHERE id % 2 = 0",
+            "DELETE FROM t",
+        ];
+        for sql in steps {
+            s.execute(sql, &[])
+                .unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+        }
+        leaf_sizes_check::set(false);
     }
 }

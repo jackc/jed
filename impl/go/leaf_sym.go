@@ -646,6 +646,34 @@ func (a *arrAcc) add(it dictItem, w int) {
 	}
 }
 
+// remove takes out one value add was given; false when the facts cannot be kept exact (the value
+// made the region untypable, or held an end of the element range).
+func (a *arrAcc) remove(it dictItem, w int) bool {
+	switch it.kind {
+	case dictNull:
+		a.nulls--
+	case dictOwn:
+		return false
+	default:
+		elems, ok := arrElems(it.payload, w)
+		switch {
+		case !ok:
+			return false
+		case len(elems) == 0:
+			a.empties--
+		default:
+			for at := 0; at < len(elems); at += w {
+				if v := beUint(elems[at : at+w]); v == a.r.lo || v == a.r.hi {
+					return false
+				}
+			}
+			a.arrays--
+			a.elems -= len(elems) / w
+		}
+	}
+	return true
+}
+
 // arrElems returns the element bytes of an array body the typed encoding holds (empty for the empty
 // array): one dimension, lower bound 1, no NULL element, at most 254 elements of width w.
 func arrElems(body []byte, w int) ([]byte, bool) {
@@ -726,6 +754,19 @@ func (a *colAcc) add(shape leafShape, j int, it dictItem, tb *symTable) {
 	if w := shape.itemArr[j]; w != 0 {
 		a.f.arr.add(it, w)
 	}
+}
+
+// remove takes out one value add was given (with no symbol table); false when the facts cannot be
+// kept exact.
+func (a *colAcc) remove(shape leafShape, j int, it dictItem) bool {
+	if shape.itemDict[j] {
+		a.dict.remove(it, inlineHeaderLen(shape.colTypes[shape.itemCols[j]]))
+		a.f.d, a.f.dup = a.dict.d, a.dict.dup
+	}
+	if w := shape.itemArr[j]; w != 0 {
+		return a.f.arr.remove(it, w)
+	}
+	return true
 }
 
 // itemSaving is the bytes item column j saves in a leaf of n records with these facts. tb is the

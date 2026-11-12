@@ -10,7 +10,7 @@
 //! is written to agree.
 
 use std::borrow::Cow;
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use super::{
@@ -219,7 +219,7 @@ impl LeafShape {
     }
 
     /// Whether a leaf's size depends on its rows (beyond the key prefix).
-    fn content_cols(&self) -> bool {
+    pub(crate) fn content_cols(&self) -> bool {
         !self.for_cols.is_empty() || !self.item_cols.is_empty()
     }
 }
@@ -366,31 +366,64 @@ pub(crate) fn span_item<'a>(ty: &ColType, span: &'a [u8]) -> Item<'a> {
 /// A dictionary region's facts: `d` entries, and `dup` bytes of spans that repeat an earlier entry.
 #[derive(Default)]
 pub(crate) struct DictAcc<'a> {
-    seen: HashSet<Cow<'a, [u8]>>,
+    /// The rows holding each shared payload.
+    seen: HashMap<Cow<'a, [u8]>, usize>,
     pub(crate) d: usize,
     pub(crate) dup: usize,
-    has_null: bool,
+    nulls: usize,
+    /// No value is ever removed. More than 256 entries then rule the dictionary out for good
+    /// ([`dict_saving`]), so the rest are not counted.
+    add_only: bool,
 }
 
 impl<'a> DictAcc<'a> {
     /// Take one value; `keep` makes the set's copy of a payload not seen before.
     pub(crate) fn add(&mut self, it: &Item<'_>, keep: impl FnOnce(&[u8]) -> Cow<'a, [u8]>) {
+        if self.add_only && self.d > 256 {
+            return;
+        }
         match it {
             Item::Null => {
-                if !self.has_null {
-                    self.has_null = true;
+                if self.nulls == 0 {
                     self.d += 1;
                 }
+                self.nulls += 1;
             }
             Item::Own => self.d += 1,
             Item::Shared(p) => {
-                if self.seen.contains(p.as_ref()) {
+                if let Some(rows) = self.seen.get_mut(p.as_ref()) {
+                    *rows += 1;
                     self.dup += 1 + p.len(); // the span: its tag and content
                 } else {
-                    self.seen.insert(keep(p));
+                    self.seen.insert(keep(p), 1);
                     self.d += 1;
                 }
             }
+        }
+    }
+
+    /// Take out one value [`add`](Self::add) was given. The facts are those of the remaining
+    /// values in any order: an entry is counted once however many rows share it.
+    fn remove(&mut self, it: &Item<'_>) {
+        match it {
+            Item::Null => {
+                self.nulls -= 1;
+                if self.nulls == 0 {
+                    self.d -= 1;
+                }
+            }
+            Item::Own => self.d -= 1,
+            Item::Shared(p) => match self.seen.get_mut(p.as_ref()) {
+                Some(rows) if *rows > 1 => {
+                    *rows -= 1;
+                    self.dup -= 1 + p.len();
+                }
+                Some(_) => {
+                    self.seen.remove(p.as_ref());
+                    self.d -= 1;
+                }
+                None => panic!("BUG: a value removed from a dictionary that never took it"),
+            },
         }
     }
 }
@@ -430,6 +463,33 @@ impl ArrAcc {
                     for e in elems.chunks_exact(w) {
                         self.r.add(be_uint(e));
                     }
+                }
+            },
+        }
+    }
+
+    /// Take out one value [`add`](Self::add) was given; `false` when the facts cannot be kept
+    /// exact (the value made the region unpackable, or held an end of the element range).
+    fn remove(&mut self, it: &Item<'_>, w: usize) -> bool {
+        match it {
+            Item::Null => true,
+            Item::Own => false,
+            Item::Shared(body) => match arr_elems(body, w) {
+                None => false,
+                Some([]) => {
+                    self.empties -= 1;
+                    true
+                }
+                Some(elems) => {
+                    if elems.chunks_exact(w).any(|e| {
+                        let v = be_uint(e);
+                        v == self.r.lo || v == self.r.hi
+                    }) {
+                        return false;
+                    }
+                    self.arrays -= 1;
+                    self.elems -= elems.len() / w;
+                    true
                 }
             },
         }
@@ -522,6 +582,24 @@ impl<'a> ColAcc<'a> {
             self.f.dup = self.dict.dup;
         }
     }
+
+    /// Take out one value [`add`](Self::add) was given; `false` when the facts cannot be kept exact.
+    fn remove(&mut self, ic: &ItemCol, it: &Item<'_>) -> bool {
+        if ic.arr_w != 0 {
+            return self.f.arr.remove(it, ic.arr_w);
+        }
+        self.dict.remove(it);
+        self.f.d = self.dict.d;
+        self.f.dup = self.dict.dup;
+        true
+    }
+
+    /// An accumulator that only ever adds (split planning).
+    fn add_only() -> ColAcc<'a> {
+        let mut acc = ColAcc::default();
+        acc.dict.add_only = true;
+        acc
+    }
 }
 
 /// Classify a decoded row's item-column values into `out` (one per `shape.item_cols`). A value is
@@ -536,7 +614,10 @@ fn row_items<'a>(
 ) {
     let plan = match all_inline_size(shape, key, row, cap) {
         Some(_) => None,
-        None => Some(plan_dispositions(shape, key, row, cap, None)),
+        // Large values: the plan compresses them, from the writing store's memo when it lent one.
+        None => Some(crate::compress_memo::plan_with_lent(|memo| {
+            plan_dispositions(shape, key, row, cap, memo)
+        })),
     };
     for ic in &shape.item_cols {
         let v = &row[ic.col];
@@ -554,13 +635,20 @@ fn row_items<'a>(
     }
 }
 
-/// The content-dependent size facts of a dirty decoded leaf, kept with the node so an insert
-/// updates them for one row instead of measuring the leaf again: each base-plus-offsets column's
-/// value span and each item column's dictionary or packed-array facts. All only grow under
-/// inserts; any other change to the node's rows drops the cache.
+/// The content-dependent size facts of a dirty decoded leaf, kept with the node so an insert,
+/// delete or row replacement updates them for one row instead of measuring the leaf again: each
+/// base-plus-offsets column's value span and each item column's dictionary or packed-array facts.
+/// [`add_row`](Self::add_row) and [`remove_row`](Self::remove_row) keep them equal to a fresh
+/// measurement of the node's rows.
 pub(crate) struct LeafSizes {
     n: usize,
     fors: Vec<ForRange>,
+    /// Each base-plus-offsets column's present values.
+    for_cnt: Vec<usize>,
+    /// A column whose range lost a value at one of its ends: `fors` then only contains the true
+    /// range, until [`refresh`](Self::refresh) rescans the column. `stale` says any column is.
+    for_stale: Vec<bool>,
+    stale: bool,
     accs: Vec<ColAcc<'static>>,
 }
 
@@ -576,6 +664,9 @@ impl LeafSizes {
         let mut sz = LeafSizes {
             n: 0,
             fors: vec![ForRange::default(); shape.for_cols.len()],
+            for_cnt: vec![0; shape.for_cols.len()],
+            for_stale: vec![false; shape.for_cols.len()],
+            stale: false,
             accs: shape.item_cols.iter().map(|_| ColAcc::default()).collect(),
         };
         for i in 0..n {
@@ -586,10 +677,11 @@ impl LeafSizes {
 
     pub(crate) fn add_row(&mut self, shape: &LeafShape, cap: Cap, key: &[u8], row: &[Value]) {
         self.n += 1;
-        for (r, fc) in self.fors.iter_mut().zip(&shape.for_cols) {
+        for (j, fc) in shape.for_cols.iter().enumerate() {
             let v = &row[fc.col];
             if !matches!(v, Value::Null) {
-                r.add(for_slot(&shape.col_types[fc.col], fc.w, v));
+                self.fors[j].add(for_slot(&shape.col_types[fc.col], fc.w, v));
+                self.for_cnt[j] += 1;
             }
         }
         if shape.item_cols.is_empty() {
@@ -602,18 +694,99 @@ impl LeafSizes {
         }
     }
 
+    /// Take one of the measured rows out. `false` when the facts cannot be kept exact this way (a
+    /// packed array that is unpackable or holds an end of its element range); the facts are then
+    /// unusable, and the caller drops them so the leaf is measured again.
+    pub(crate) fn remove_row(
+        &mut self,
+        shape: &LeafShape,
+        cap: Cap,
+        key: &[u8],
+        row: &[Value],
+    ) -> bool {
+        if !shape.item_cols.is_empty() {
+            let mut items = Vec::with_capacity(shape.item_cols.len());
+            row_items(shape, cap, key, row, &mut items);
+            for ((acc, ic), it) in self.accs.iter_mut().zip(&shape.item_cols).zip(&items) {
+                if !acc.remove(ic, it) {
+                    return false;
+                }
+            }
+        }
+        self.n -= 1;
+        for (j, fc) in shape.for_cols.iter().enumerate() {
+            let v = &row[fc.col];
+            if matches!(v, Value::Null) {
+                continue;
+            }
+            self.for_cnt[j] -= 1;
+            if self.for_cnt[j] == 0 {
+                self.fors[j] = ForRange::default();
+                self.for_stale[j] = false;
+            } else {
+                let s = for_slot(&shape.col_types[fc.col], fc.w, v);
+                if s == self.fors[j].lo || s == self.fors[j].hi {
+                    self.for_stale[j] = true;
+                    self.stale = true;
+                }
+            }
+        }
+        true
+    }
+
+    /// Whether a column's range is stale: [`saving`](Self::saving) is then an upper bound.
+    pub(crate) fn stale(&self) -> bool {
+        self.stale
+    }
+
+    /// Rescan the columns whose range went stale. `row` reads the node's `len()` rows.
+    pub(crate) fn refresh<'a>(&mut self, shape: &LeafShape, row: &dyn Fn(usize) -> &'a [Value]) {
+        if !self.stale {
+            return;
+        }
+        for (j, fc) in shape.for_cols.iter().enumerate() {
+            if !self.for_stale[j] {
+                continue;
+            }
+            let ty = &shape.col_types[fc.col];
+            let mut r = ForRange::default();
+            for i in 0..self.n {
+                let v = &row(i)[fc.col];
+                if !matches!(v, Value::Null) {
+                    r.add(for_slot(ty, fc.w, v));
+                }
+            }
+            self.fors[j] = r;
+            self.for_stale[j] = false;
+        }
+        self.stale = false;
+    }
+
     /// The record count these facts cover.
     pub(crate) fn len(&self) -> usize {
         self.n
     }
 
-    /// The bytes the leaf's content-dependent regions save.
+    /// The bytes the leaf's content-dependent regions save. While a column's range is stale the
+    /// result is an upper bound: the column is taken at its narrowest offsets.
     pub(crate) fn saving(&self, shape: &LeafShape) -> usize {
-        let fors: usize = self
-            .fors
+        const NARROWEST: ForRange = ForRange {
+            lo: 0,
+            hi: 0,
+            any: true,
+        };
+        let fors: usize = shape
+            .for_cols
             .iter()
-            .zip(&shape.for_cols)
-            .map(|(r, fc)| for_saving(self.n, fc.w, *r))
+            .enumerate()
+            .map(|(j, fc)| {
+                let r = if self.for_stale[j] {
+                    NARROWEST
+                } else {
+                    self.fors[j]
+                };
+                for_saving(self.n, fc.w, r)
+            })
             .sum();
         let items: usize = self
             .accs
@@ -702,14 +875,14 @@ impl<'a, 'k> SplitFacts<'a, 'k> {
             }
             for (j, ic) in shape.item_cols.iter().enumerate() {
                 let mut pre = vec![ColFacts::default(); n + 1];
-                let mut fwd = ColAcc::default();
+                let mut fwd = ColAcc::add_only();
                 for i in 0..n {
                     let it = &items[i * cols + j];
                     fwd.add(ic, it, |_| item_payload(it));
                     pre[i + 1] = fwd.f;
                 }
                 let mut suf = vec![ColFacts::default(); n + 1];
-                let mut back = ColAcc::default();
+                let mut back = ColAcc::add_only();
                 for i in (0..n).rev() {
                     let it = &items[i * cols + j];
                     back.add(ic, it, |_| item_payload(it));

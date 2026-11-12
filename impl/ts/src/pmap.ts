@@ -21,6 +21,7 @@
 
 import { type Cap, capPtr } from "./cap.ts";
 import type { ColType } from "./catalog.ts";
+import type { CompressMemo } from "./format.ts";
 import type { Row } from "./storage.ts";
 import type { Value } from "./value.ts";
 import { leafPrefixSaving } from "./leaf_compact.ts";
@@ -116,9 +117,9 @@ export type PNode = {
   // set with the page id by the commit that seals the node, so a parent written later binds it.
   // Absent in a plaintext file and while the node is dirty.
   tag?: Uint8Array;
-  // sizes caches a dirty Decoded leaf's content-dependent size facts (LeafSizer) for its first n rows,
-  // so an insert measures one row instead of the leaf. Kept only on a node its writer owns; any change
-  // other than adding a row drops it.
+  // sizes caches a dirty Decoded leaf's content-dependent size facts (LeafSizer) for its n rows, so
+  // an insert, delete or row replacement measures one row instead of the leaf. Kept only on a node
+  // its writer owns.
   sizes?: { n: number; facts: unknown };
   [mutationOwner]?: MutationGeneration;
 };
@@ -289,19 +290,42 @@ export type LeafShape = {
   elided: number;
   keyLen: number;
   sizer: LeafSizer | null;
+  // memo is the writing store's compression memo, set on the copy a store hands its tree for an
+  // insert or delete: classifying a row whose record needs a disposition plan then reuses the
+  // outcomes the write already paid for. Absent compresses again, to the same result.
+  memo?: CompressMemo | null;
 };
 
 // LeafSizer measures the bytes a leaf's content-dependent column regions save — base plus offsets,
 // dictionaries, packed arrays (format.md "Leaf node") — from decoded rows. Implemented by the format
 // layer over the table's column types (format.ts), so pmap never imports the value codec. Facts are
-// opaque here: they only grow as rows are added.
+// opaque here; addRow and removeRow keep them equal to a fresh measurement of the rows they hold.
+// memo is the writer's compression memo, or null: it changes no result.
 export interface LeafSizer {
   newFacts(): unknown;
-  addRow(facts: unknown, key: Uint8Array, row: Row, cap: Cap): void;
-  // The region savings of a leaf of n rows with these facts.
+  addRow(facts: unknown, key: Uint8Array, row: Row, cap: Cap, memo?: CompressMemo | null): void;
+  // removeRow takes out a row addRow was given. False when the facts cannot be kept exact this way:
+  // the caller drops them and the leaf is measured again.
+  removeRow(
+    facts: unknown,
+    key: Uint8Array,
+    row: Row,
+    cap: Cap,
+    memo?: CompressMemo | null,
+  ): boolean;
+  // stale reports whether a removal left a column's value range unknown; refresh rescans those
+  // columns from the leaf's rows.
+  stale(facts: unknown): boolean;
+  refresh(facts: unknown, rows: Row[]): void;
+  // The region savings of a leaf of n rows with these facts; an upper bound while they are stale.
   saving(facts: unknown, n: number): number;
   // pre[m] is the region savings of rows [0, m) and suf[m] that of rows [m, n), for m in [0, n].
-  boundarySavings(keys: Uint8Array[], rows: Row[], cap: Cap): { pre: number[]; suf: number[] };
+  boundarySavings(
+    keys: Uint8Array[],
+    rows: Row[],
+    cap: Cap,
+    memo?: CompressMemo | null,
+  ): { pre: number[]; suf: number[] };
 }
 
 // leafOverhead is the bytes a leaf's payload carries beyond Σ record_size, before the
@@ -331,6 +355,23 @@ function payload(n: PNode, cap: Cap, shape: LeafShape): number {
   return interiorPayload(cap, n.keys);
 }
 
+// leafSizesCheck makes contentSaving compare a leaf's kept size facts with a fresh measurement
+// (tests).
+let leafSizesCheck = false;
+
+// setLeafSizesCheck turns the kept-size-facts cross-check on or off (tests only).
+export function setLeafSizesCheck(on: boolean): void {
+  leafSizesCheck = on;
+}
+
+// measureLeaf is the size facts of a Decoded leaf's rows, measured from scratch.
+function measureLeaf(n: PNode, cap: Cap, sizer: LeafSizer, memo: CompressMemo | null): unknown {
+  const facts = sizer.newFacts();
+  const count = n.keys.length;
+  for (let i = 0; i < count; i++) sizer.addRow(facts, n.keys[i]!, n.vals[i]!, cap, memo);
+  return facts;
+}
+
 // contentSaving is the bytes a Decoded leaf's content-dependent encodings save: the shared key prefix
 // and the column regions' savings (format.md "Leaf payload").
 function contentSaving(n: PNode, cap: Cap, shape: LeafShape): number {
@@ -339,13 +380,23 @@ function contentSaving(n: PNode, cap: Cap, shape: LeafShape): number {
   if (count >= 2) saving += leafPrefixSaving(count, n.keys[0]!, n.keys[count - 1]!);
   const sizer = shape.sizer;
   if (sizer !== null && count > 0) {
+    const memo = shape.memo ?? null;
     let sz = n.sizes;
     if (sz === undefined || sz.n !== count) {
-      const facts = sizer.newFacts();
-      for (let i = 0; i < count; i++) sizer.addRow(facts, n.keys[i]!, n.vals[i]!, cap);
-      sz = { n: count, facts };
+      sz = { n: count, facts: measureLeaf(n, cap, sizer, memo) };
       // A dirty node is its writer's alone, so it may keep the facts.
       if (n.page === 0 && n[mutationOwner] !== undefined) n.sizes = sz;
+    } else {
+      sizer.refresh(sz.facts, n.vals);
+      if (leafSizesCheck) {
+        const want = sizer.saving(measureLeaf(n, cap, sizer, null), count);
+        const got = sizer.saving(sz.facts, count);
+        if (want !== got) {
+          throw new Error(
+            `BUG: a leaf's kept size facts save ${got} bytes, a fresh measurement ${want}`,
+          );
+        }
+      }
     }
     saving += sizer.saving(sz.facts, count);
   }
@@ -358,6 +409,16 @@ function payloadAtMost(n: PNode, limit: number, cap: Cap, shape: LeafShape): boo
   if (n.packed) return n.packed.payloadLen <= limit;
   const plain = totalWeight(n) + leafOverhead(n.keys.length, shape);
   if (plain <= limit) return true;
+  const sz = n.sizes;
+  const sizer = shape.sizer;
+  const count = n.keys.length;
+  if (sz !== undefined && sizer !== null && sz.n === count && sizer.stale(sz.facts)) {
+    // A stale range overstates the saving: when even that leaves the leaf above the limit, the
+    // columns need no rescan.
+    let upper = sizer.saving(sz.facts, count);
+    if (count >= 2) upper += leafPrefixSaving(count, n.keys[0]!, n.keys[count - 1]!);
+    if (plain - upper > limit) return false;
+  }
   return plain - contentSaving(n, cap, shape) <= limit;
 }
 
@@ -1285,7 +1346,7 @@ function buildLeaf(
   if (pay > cap.c && n >= 2) {
     pay -= leafPrefixSaving(n, keys[0]!, keys[n - 1]!);
     if (shape.sizer !== null) {
-      bounds = shape.sizer.boundarySavings(keys, vals, cap);
+      bounds = shape.sizer.boundarySavings(keys, vals, cap, shape.memo ?? null);
       pay -= bounds.pre[n]!;
     }
   }
@@ -1427,17 +1488,33 @@ function* nodeInsertSteps(
       if (found) {
         ctx.old = n.vals[index];
         ctx.replaced = true;
+        const sz = n.sizes;
+        if (sz !== undefined) {
+          // The facts follow the row: the old one out, the new one in.
+          const sizer = shape.sizer;
+          const memo = shape.memo ?? null;
+          if (
+            sizer !== null &&
+            sz.n === n.keys.length &&
+            sizer.removeRow(sz.facts, key, n.vals[index]!, cap, memo)
+          ) {
+            sizer.addRow(sz.facts, key, val, cap, memo);
+          } else {
+            n.sizes = undefined;
+          }
+        }
         n.vals[index] = val;
         n.weights[index] = weight;
-        n.sizes = undefined; // a replaced row can shrink the facts: recompute
       } else {
         n.keys.splice(index, 0, key);
         n.vals.splice(index, 0, val);
         n.weights.splice(index, 0, weight);
         const sz = n.sizes;
         if (sz !== undefined && shape.sizer !== null && sz.n === n.keys.length - 1) {
-          shape.sizer.addRow(sz.facts, key, val, cap);
+          shape.sizer.addRow(sz.facts, key, val, cap, shape.memo ?? null);
           sz.n++;
+        } else {
+          n.sizes = undefined;
         }
       }
       if (payloadAtMost(n, cap.c, cap, shape) || nodeLen(n) < 2) return { whole: n };
@@ -1527,10 +1604,22 @@ function* nodeRemoveSteps(
     if (!found) return { ok: false, node: n, removed: undefined };
     if (ownedBy(n, generation)) {
       const removed = n.vals[index];
+      const sz = n.sizes;
+      if (sz !== undefined) {
+        const sizer = shape.sizer;
+        if (
+          sizer !== null &&
+          sz.n === n.keys.length &&
+          sizer.removeRow(sz.facts, key, n.vals[index]!, cap, shape.memo ?? null)
+        ) {
+          sz.n--;
+        } else {
+          n.sizes = undefined;
+        }
+      }
       n.keys.splice(index, 1);
       n.vals.splice(index, 1);
       n.weights.splice(index, 1);
-      n.sizes = undefined; // a removed row can shrink the facts: recompute
       return { ok: true, node: n, removed };
     }
     // decodedParts returns fresh arrays, so the copy is edited directly.

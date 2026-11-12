@@ -27,6 +27,7 @@ package jed
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"sort"
 	"sync/atomic"
 )
@@ -500,6 +501,9 @@ func (n *pnode) payload(pcap pageCap, shape leafShape) int {
 	return interiorPayload(pcap, n.keys)
 }
 
+// leafSizesCheck makes contentSaving compare a leaf's kept size facts with a fresh measurement (tests).
+var leafSizesCheck atomic.Bool
+
 // contentSaving is the bytes a leaf's content-dependent encodings save (leaf_narrow.go): the shared
 // key prefix and base-plus-offsets columns.
 func (n *pnode) contentSaving(pcap pageCap, shape leafShape) int {
@@ -533,6 +537,16 @@ func (n *pnode) contentSaving(pcap pageCap, shape leafShape) int {
 					if sym {
 						n.symTabs = sz.tabs
 					}
+				}
+			}
+			sz.refresh(shape, n.vals)
+			if leafSizesCheck.Load() {
+				var tabs []*symTable
+				if sym {
+					tabs = n.symTabs
+				}
+				if want, got := newLeafSizes(shape, pcap, n.keys, n.vals, tabs, sym).saving(shape, sym), sz.saving(shape, sym); want != got {
+					panic(fmt.Sprintf("BUG: a leaf's kept size facts save %d bytes, a fresh measurement %d", got, want))
 				}
 			}
 			saving += sz.saving(shape, sym)
@@ -587,6 +601,18 @@ func (n *pnode) payloadAtMost(limit int, pcap pageCap, shape leafShape) bool {
 	plain := n.totalWeight() + leafOverhead(n.keyLen(), shape)
 	if plain <= limit {
 		return true
+	}
+	if sz := n.sizes; sz != nil && sz.stale && n.packed == nil && sz.n == len(n.vals) && !n.needsSym(pcap, shape) {
+		// A stale range overstates the saving: when even that leaves the leaf above the limit, the
+		// columns need no rescan.
+		c := n.keyLen()
+		upper := sz.saving(shape, false)
+		if leafKeyPrefix && c >= 2 {
+			upper += leafPrefixSaving(c, n.keyAt(0), n.keyAt(c-1))
+		}
+		if plain-upper > limit {
+			return false
+		}
 	}
 	return plain-n.contentSaving(pcap, shape) <= limit
 }
@@ -1577,6 +1603,7 @@ func buildLeaf(keys [][]byte, vals []storedRow, weights []uint32, cap pageCap, s
 		for j, c := range shape.itemCols {
 			dpre[j], dsuf[j] = make([]colFacts, n+1), make([]colFacts, n+1)
 			var fwd, back colAcc
+			fwd.dict.addOnly, back.dict.addOnly = true, true
 			for i := 0; i < n; i++ {
 				fwd.add(shape, j, items[i][j], leafOrColTab(shape, tabs, j, c))
 				dpre[j][i+1] = fwd.f
@@ -1704,9 +1731,16 @@ func nodeInsert(n *pnode, key []byte, val storedRow, weight uint32, old *storedR
 			if found {
 				*old = n.vals[i]
 				*replaced = true
+				if sz := n.sizes; sz != nil {
+					// The facts follow the row: the old one out, the new one in.
+					if sz.n == len(n.vals) && sz.removeRow(shape, cap, key, n.vals[i]) {
+						sz.addRow(shape, cap, key, val)
+					} else {
+						n.sizes = nil
+					}
+				}
 				n.vals[i] = val
 				n.weights[i] = weight
-				n.sizes = nil // a replaced row can shrink the facts: recompute
 			} else {
 				n.keys = insertKeyAtMutable(n.keys, i, key)
 				n.vals = insertValAtMutable(n.vals, i, val)
@@ -1811,6 +1845,9 @@ func nodeRemove(n *pnode, key []byte, generation *mutationGeneration, src leafSo
 		// copied into a new one the generation owns.
 		if ownedBy(n, generation) {
 			var removed storedRow
+			if sz := n.sizes; sz != nil && !(sz.n == len(n.vals) && sz.removeRow(shape, cap, key, n.vals[i])) {
+				n.sizes = nil
+			}
 			n.keys = removeKeyAtMutable(n.keys, i)
 			n.vals, removed = removeValAtMutable(n.vals, i)
 			n.weights = removeWeightAtMutable(n.weights, i)

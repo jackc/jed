@@ -1491,10 +1491,14 @@ function newForRange(): ForRange {
 // One item column's accumulated facts: a dictionary's entry count and repeated bytes, or a packed
 // array's value counts and element span.
 type ItemAcc = {
-  seen: Set<string> | null;
+  // seen counts the rows holding each shared payload.
+  seen: Map<string, number> | null;
   d: number;
   dup: number;
-  hasNull: boolean;
+  nulls: number;
+  // addOnly says no value is ever removed. More than 256 entries then rule the dictionary out for
+  // good (dictSaving), so the rest are not counted.
+  addOnly: boolean;
   empties: number;
   arrays: number;
   elems: number;
@@ -1503,9 +1507,18 @@ type ItemAcc = {
 };
 
 // LeafFacts is the content-dependent size facts of a set of leaf rows (the Go core's leafSizes): each
-// base-plus-offsets column's value span and each item column's dictionary or array facts. They only
-// grow as rows are added, so a dirty leaf keeps them and an insert updates them for one row.
-type LeafFacts = { fors: ForRange[]; items: ItemAcc[] };
+// base-plus-offsets column's value span and each item column's dictionary or array facts. A dirty
+// leaf keeps them: addRow and removeRow keep them equal to a fresh measurement of the leaf's rows.
+// forCnt is each base-plus-offsets column's present values. forStale marks a column whose range lost
+// a value at one of its ends: fors then only contains the true range, until refresh rescans the
+// column. stale says any column may be.
+type LeafFacts = {
+  fors: ForRange[];
+  forCnt: number[];
+  forStale: boolean[];
+  stale: boolean;
+  items: ItemAcc[];
+};
 
 function forRangeAdd(r: ForRange, v: bigint): void {
   if (!r.any) {
@@ -1570,14 +1583,18 @@ class TableLeafSizer implements LeafSizer {
     this.scratch = itemCols.map(() => ({ kind: ITEM_NULL, key: "", len: 0, body: null }));
   }
 
-  newFacts(): LeafFacts {
+  newFacts(addOnly = false): LeafFacts {
     return {
       fors: this.forCols.map(newForRange),
+      forCnt: this.forCols.map(() => 0),
+      forStale: this.forCols.map(() => false),
+      stale: false,
       items: this.itemCols.map(() => ({
         seen: null,
         d: 0,
         dup: 0,
-        hasNull: false,
+        nulls: 0,
+        addOnly,
         empties: 0,
         arrays: 0,
         elems: 0,
@@ -1589,8 +1606,14 @@ class TableLeafSizer implements LeafSizer {
 
   // classify fills out (one item per item column) for a decoded row. A value is inline-plain when the
   // record's disposition plan leaves it so.
-  private classify(key: Uint8Array, row: Row, cap: Cap, out: LeafItem[]): void {
-    const plan = planDispositions(this.colTypes, key, row, cap);
+  private classify(
+    key: Uint8Array,
+    row: Row,
+    cap: Cap,
+    out: LeafItem[],
+    memo: CompressMemo | null,
+  ): void {
+    const plan = planDispositions(this.colTypes, key, row, cap, memo);
     for (let j = 0; j < this.itemCols.length; j++) {
       const ic = this.itemCols[j]!;
       const c = ic.col;
@@ -1662,38 +1685,164 @@ class TableLeafSizer implements LeafSizer {
         }
         continue;
       }
+      if (a.addOnly && a.d > 256) continue;
       if (it.kind === ITEM_NULL) {
-        if (!a.hasNull) {
-          a.hasNull = true;
-          a.d++;
-        }
+        if (a.nulls === 0) a.d++;
+        a.nulls++;
       } else if (it.kind === ITEM_OWN) {
         a.d++;
       } else {
-        if (a.seen === null) a.seen = new Set();
-        if (a.seen.has(it.key)) a.dup += 1 + it.len;
-        else {
-          a.seen.add(it.key);
+        if (a.seen === null) a.seen = new Map();
+        const k = a.seen.get(it.key);
+        if (k !== undefined) {
+          a.seen.set(it.key, k + 1);
+          a.dup += 1 + it.len;
+        } else {
+          a.seen.set(it.key, 1);
           a.d++;
         }
       }
     }
   }
 
+  // removeItems takes out one row's values addItems was given. The facts are those of the remaining
+  // values in any order: a dictionary entry is counted once however many rows share it. False when
+  // they cannot be kept exact: a packed-array value that made the region untypable, or one holding an
+  // end of the element range.
+  private removeItems(f: LeafFacts, items: LeafItem[]): boolean {
+    for (let j = 0; j < this.itemCols.length; j++) {
+      const a = f.items[j]!;
+      const it = items[j]!;
+      const w = this.itemCols[j]!.arrW;
+      if (w !== 0) {
+        if (it.kind === ITEM_NULL) continue;
+        if (it.kind === ITEM_OWN) return false;
+        const body = it.body!;
+        const at = arrElems(body, 0, body.length, w);
+        if (at < 0) return false;
+        if (at === 0) {
+          a.empties--;
+          continue;
+        }
+        if (w <= 4) {
+          for (let p = at; p < body.length; p += w) {
+            const v = beUintN(body, p, w);
+            if (v === a.r.nlo || v === a.r.nhi) return false;
+          }
+        } else {
+          for (let p = at; p < body.length; p += w) {
+            const v = beUint(body, p, w);
+            if (v === a.r.lo || v === a.r.hi) return false;
+          }
+        }
+        a.arrays--;
+        a.elems -= (body.length - at) / w;
+        continue;
+      }
+      if (it.kind === ITEM_NULL) {
+        a.nulls--;
+        if (a.nulls === 0) a.d--;
+      } else if (it.kind === ITEM_OWN) {
+        a.d--;
+      } else {
+        const k = a.seen?.get(it.key);
+        if (k === undefined) throw new Error("BUG: a leaf's size facts lack a removed value");
+        if (k > 1) {
+          a.seen!.set(it.key, k - 1);
+          a.dup -= 1 + it.len;
+        } else {
+          a.seen!.delete(it.key);
+          a.d--;
+        }
+      }
+    }
+    return true;
+  }
+
   private addFors(f: LeafFacts, row: Row): void {
     for (let j = 0; j < this.forCols.length; j++) {
       const fc = this.forCols[j]!;
       const v = row[fc.col]!;
-      if (v.kind !== "null") forRangeAddValue(f.fors[j]!, this.colTypes[fc.col]!, fc.w, v);
+      if (v.kind !== "null") {
+        forRangeAddValue(f.fors[j]!, this.colTypes[fc.col]!, fc.w, v);
+        f.forCnt[j]!++;
+      }
     }
   }
 
-  addRow(facts: unknown, key: Uint8Array, row: Row, cap: Cap): void {
+  addRow(
+    facts: unknown,
+    key: Uint8Array,
+    row: Row,
+    cap: Cap,
+    memo: CompressMemo | null = null,
+  ): void {
     const f = facts as LeafFacts;
     this.addFors(f, row);
     if (this.itemCols.length === 0) return;
-    this.classify(key, row, cap, this.scratch);
+    this.classify(key, row, cap, this.scratch, memo);
     this.addItems(f, this.scratch);
+  }
+
+  removeRow(
+    facts: unknown,
+    key: Uint8Array,
+    row: Row,
+    cap: Cap,
+    memo: CompressMemo | null = null,
+  ): boolean {
+    const f = facts as LeafFacts;
+    if (this.itemCols.length !== 0) {
+      this.classify(key, row, cap, this.scratch, memo);
+      if (!this.removeItems(f, this.scratch)) return false;
+    }
+    for (let j = 0; j < this.forCols.length; j++) {
+      const fc = this.forCols[j]!;
+      const v = row[fc.col]!;
+      if (v.kind === "null") continue;
+      const r = f.fors[j]!;
+      if (--f.forCnt[j]! === 0) {
+        f.fors[j] = newForRange();
+        f.forStale[j] = false;
+        continue;
+      }
+      const ty = this.colTypes[fc.col]!;
+      let end: boolean;
+      if (fc.w <= 4) {
+        const s = forSlotNum(ty, v);
+        end = s === r.nlo || s === r.nhi;
+      } else {
+        const s = forSlotValue(ty, v);
+        end = s === r.lo || s === r.hi;
+      }
+      if (end) {
+        f.forStale[j] = true;
+        f.stale = true;
+      }
+    }
+    return true;
+  }
+
+  stale(facts: unknown): boolean {
+    return (facts as LeafFacts).stale;
+  }
+
+  refresh(facts: unknown, rows: Row[]): void {
+    const f = facts as LeafFacts;
+    if (!f.stale) return;
+    for (let j = 0; j < this.forCols.length; j++) {
+      if (!f.forStale[j]) continue;
+      const fc = this.forCols[j]!;
+      const ty = this.colTypes[fc.col]!;
+      const r = newForRange();
+      for (const row of rows) {
+        const v = row[fc.col]!;
+        if (v.kind !== "null") forRangeAddValue(r, ty, fc.w, v);
+      }
+      f.fors[j] = r;
+      f.forStale[j] = false;
+    }
+    f.stale = false;
   }
 
   saving(facts: unknown, n: number): number {
@@ -1701,7 +1850,8 @@ class TableLeafSizer implements LeafSizer {
     let total = 0;
     for (let j = 0; j < this.forCols.length; j++) {
       const w = this.forCols[j]!.w;
-      total += forSaving(n, w, forRangeBw(f.fors[j]!, w));
+      // A stale range is taken at its narrowest offsets: an upper bound.
+      total += forSaving(n, w, f.forStale[j] ? forWidthN(w, 0) : forRangeBw(f.fors[j]!, w));
     }
     for (let j = 0; j < this.itemCols.length; j++) {
       const a = f.items[j]!;
@@ -1720,26 +1870,32 @@ class TableLeafSizer implements LeafSizer {
   // boundarySavings measures every candidate half of a split (format.md "Leaf split"): pre[m] is the
   // saving of rows [0, m) and suf[m] that of rows [m, n), each half with its own bases, widths and
   // dictionaries.
-  boundarySavings(keys: Uint8Array[], rows: Row[], cap: Cap): { pre: number[]; suf: number[] } {
+  boundarySavings(
+    keys: Uint8Array[],
+    rows: Row[],
+    cap: Cap,
+    memo: CompressMemo | null = null,
+  ): { pre: number[]; suf: number[] } {
     const n = rows.length;
     const k = this.itemCols.length;
     const items: LeafItem[][] = new Array(k === 0 ? 0 : n);
     for (let i = 0; i < items.length; i++) {
       const out: LeafItem[] = new Array(k);
       for (let j = 0; j < k; j++) out[j] = { kind: ITEM_NULL, key: "", len: 0, body: null };
-      this.classify(keys[i]!, rows[i]!, cap, out);
+      this.classify(keys[i]!, rows[i]!, cap, out, memo);
       items[i] = out;
     }
     const pre = new Array<number>(n + 1);
     const suf = new Array<number>(n + 1);
-    let f = this.newFacts();
+    // These only ever add, so their dictionaries stop counting past 256 entries.
+    let f = this.newFacts(true);
     pre[0] = 0;
     for (let i = 0; i < n; i++) {
       this.addFors(f, rows[i]!);
       if (k !== 0) this.addItems(f, items[i]!);
       pre[i + 1] = this.saving(f, i + 1);
     }
-    f = this.newFacts();
+    f = this.newFacts(true);
     suf[n] = 0;
     for (let i = n - 1; i >= 0; i--) {
       this.addFors(f, rows[i]!);

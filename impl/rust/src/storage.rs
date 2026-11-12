@@ -280,6 +280,14 @@ impl TableStore {
         (size as u32, stored as i64)
     }
 
+    /// Lend the writer's compression memo to the tree edit that follows, for the leaf-size
+    /// arithmetic's disposition plans ([`crate::compress_memo::lend_to_tree`]). Only a tree whose
+    /// leaf sizes depend on string or array content plans there.
+    fn lend_memo(&self) -> Option<crate::compress_memo::TreeLoan> {
+        (!self.shape.item_cols.is_empty())
+            .then(|| crate::compress_memo::lend_to_tree(self.memo.upgrade()))
+    }
+
     /// Insert a row under its encoded key. Returns `Ok(false)` if the key already exists
     /// (primary-key uniqueness); the caller decides how to surface that. May fault the target leaf
     /// through the buffer pool (an I/O error then propagates).
@@ -289,6 +297,7 @@ impl TableStore {
         let staged_key = if self.net { key.clone() } else { Vec::new() };
         let src = make_src(&self.paging, &self.shape);
         let src_ref = src.as_ref().map(|s| s as &dyn LeafSource);
+        let _memo = self.lend_memo();
         // One descent both finds an existing key and inserts an absent one.
         if !self
             .rows
@@ -415,6 +424,7 @@ impl TableStore {
         self.stage(key, stored)?;
         let src = make_src(&self.paging, &self.shape);
         let src_ref = src.as_ref().map(|s| s as &dyn LeafSource);
+        let _memo = self.lend_memo();
         self.rows
             .insert(key.to_vec(), row, w, self.cap, &self.shape, src_ref)?;
         Ok(())
@@ -425,6 +435,7 @@ impl TableStore {
     pub fn remove(&mut self, key: &[u8]) -> Result<bool> {
         let src = make_src(&self.paging, &self.shape);
         let src_ref = src.as_ref().map(|s| s as &dyn LeafSource);
+        let _memo = self.lend_memo();
         let removed = self
             .rows
             .remove(key, self.cap, &self.shape, src_ref)?

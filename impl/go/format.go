@@ -3056,6 +3056,10 @@ type leafShape struct {
 	// hasSymCol says the shape has a column that may get one.
 	itemTab   []*symTable
 	hasSymCol bool
+	// memo is the writing store's compression memo, set on the copy a store hands its tree for an
+	// insert or delete: classifying a row whose record needs a disposition plan then reuses the
+	// outcomes the write already paid for. nil compresses again, to the same result.
+	memo *compressMemo
 }
 
 func (s leafShape) k() int { return s.fixed + s.variable + s.elided }
