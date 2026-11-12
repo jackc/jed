@@ -27,6 +27,8 @@
 # Go build artifacts. NOTE: do not ignore "*.test" — the conformance corpus files
 # use that extension (spec/conformance/suites/**/*.test).
 /impl/go/bin/
+# `go test -c` / `-cpuprofile` drops the package test binary here (one was committed by mistake).
+/impl/go/*.test
 # `go build ./cmd/mutate` (the mutation-testing harness) drops a binary here.
 /impl/go/mutate
 # Real-process conformance actor (built by concurrency:process).
