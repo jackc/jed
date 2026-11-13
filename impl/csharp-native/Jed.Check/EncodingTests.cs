@@ -106,8 +106,8 @@ internal static class EncodingTests
         if (type.Kind == SqlKind.Range)
         {
             if (item.TryGetProperty("empty", out var empty) && empty.GetBoolean()) return SqlValue.Range(SqlRange.Empty(type));
-            SqlValue? lo = item.TryGetProperty("lower", out var lower) ? RangeBound(type.Element!, lower) : null;
-            SqlValue? hi = item.TryGetProperty("upper", out var upper) ? RangeBound(type.Element!, upper) : null;
+            SqlValue? lo = item.TryGetProperty("lower", out var lower) ? RangeBound(type.Element!, lower) : (SqlValue?)null;
+            SqlValue? hi = item.TryGetProperty("upper", out var upper) ? RangeBound(type.Element!, upper) : (SqlValue?)null;
             return SqlValue.Range(new(type, lo, hi, item.TryGetProperty("lower_inc", out var li) && li.GetBoolean(), item.TryGetProperty("upper_inc", out var ui) && ui.GetBoolean()));
         }
         if (type.Kind == SqlKind.Composite)

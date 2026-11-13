@@ -19,6 +19,7 @@ internal sealed class SpillRowSpool(ScratchHost host, long workMem, Meter meter)
 
     internal async ValueTask Append(SqlValue[] row, CancellationToken token, long? logicalBytes = null)
     {
+        token.ThrowIfCancellationRequested();
         ObjectDisposedException.ThrowIf(disposed, this);
         var copy = new SqlValue[row.Length];
         for (var i = 0; i < row.Length; i++) copy[i] = await row[i].ResolveAsync(token).ConfigureAwait(false);

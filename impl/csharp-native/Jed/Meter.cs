@@ -17,6 +17,38 @@ internal sealed class Meter(Session session, long limit, CancellationToken cance
     internal readonly Dictionary<RegexCall, RegexMachine> RegexMachines = new(ReferenceEqualityComparer.Instance);
     internal readonly Dictionary<SimilarCall, RegexMachine[]> SimilarMachines = new(ReferenceEqualityComparer.Instance);
     private string? firstLimit;
+    private long statementOrigin;
+    private HostBatchReplay? hostBatches;
+    internal HostBatchReplay HostBatches => hostBatches ??= new(this);
+    internal long? HostBatchHeadroom
+    {
+        get
+        {
+            long? headroom = limit > 0 ? Math.Max(0, limit - (Accrued - statementOrigin)) : null;
+            if (session.LifetimeMaxCost > 0)
+                headroom = Math.Min(headroom ?? long.MaxValue, Math.Max(0, session.LifetimeMaxCost - session.LifetimeCost));
+            return headroom;
+        }
+    }
+    internal SubqueryBudget BeginSubquery() => new(this);
+    internal readonly struct SubqueryBudget : IDisposable
+    {
+        private readonly Meter meter;
+        private readonly long origin;
+        private readonly string? previousLimit;
+        internal SubqueryBudget(Meter meter)
+        {
+            this.meter = meter; origin = meter.statementOrigin; previousLimit = meter.firstLimit;
+            meter.statementOrigin = meter.Accrued; meter.firstLimit = null;
+        }
+        public void Dispose()
+        {
+            meter.statementOrigin = origin; meter.firstLimit = previousLimit;
+            // The completed inner work accrues to its caller without a trailing
+            // guard. The next caller work boundary enforces its own ceiling.
+            meter.Charge(0);
+        }
+    }
     private long scalarBytes;
     private readonly long scalarLimit = options?.MaxScalarBytes is > 0 ? options.MaxScalarBytes : 64L * 1024 * 1024;
     private int suppressed;
@@ -44,10 +76,10 @@ internal sealed class Meter(Session session, long limit, CancellationToken cance
         if (suppressed != 0) return;
         if (firstLimit is null)
         {
-            var statementHit = limit > 0 && units >= limit - Accrued;
+            var statementHit = limit > 0 && units >= limit - (Accrued - statementOrigin);
             var lifetimeHit = session.LifetimeMaxCost > 0 && units >= session.LifetimeMaxCost - session.LifetimeCost;
             if (statementHit) firstLimit = SqlStates.CostLimitExceeded;
-            if (lifetimeHit && (!statementHit || session.LifetimeMaxCost - session.LifetimeCost < limit - Accrued))
+            if (lifetimeHit && (!statementHit || session.LifetimeMaxCost - session.LifetimeCost < limit - (Accrued - statementOrigin)))
                 firstLimit = SqlStates.SessionCostLimitExceeded;
         }
         Accrued = Add(Accrued, units);
@@ -57,7 +89,7 @@ internal sealed class Meter(Session session, long limit, CancellationToken cance
     internal void Guard()
     {
         if (firstLimit is not null) throw new SqlException(firstLimit, "cost ceiling reached");
-        if (limit > 0 && Accrued >= limit) throw new SqlException(SqlStates.CostLimitExceeded, "cost ceiling reached");
+        if (limit > 0 && Accrued - statementOrigin >= limit) throw new SqlException(SqlStates.CostLimitExceeded, "cost ceiling reached");
         if (session.LifetimeMaxCost > 0 && session.LifetimeCost >= session.LifetimeMaxCost)
             throw new SqlException(SqlStates.SessionCostLimitExceeded, "session cost ceiling reached");
     }

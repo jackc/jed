@@ -18,7 +18,7 @@ internal sealed class ProcessDuplexStream : Stream
     internal static ValueTask<Stream> Connect(string path, CancellationToken token)
     {
         token.ThrowIfCancellationRequested();
-        var executable = Environment.GetEnvironmentVariable("JED_PAGES_ACTOR") ?? throw new InvalidOperationException("missing stream actor executable");
+        var executable = System.Environment.GetEnvironmentVariable("JED_PAGES_ACTOR") ?? throw new InvalidOperationException("missing stream actor executable");
         var start = new ProcessStartInfo(executable) { UseShellExecute = false, RedirectStandardInput = true, RedirectStandardOutput = true, RedirectStandardError = true };
         start.ArgumentList.Add("pages"); start.ArgumentList.Add(path);
         var process = Process.Start(start) ?? throw new IOException("stream actor failed to start");

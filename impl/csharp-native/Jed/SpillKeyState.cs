@@ -23,6 +23,7 @@ internal sealed class SpillKeyState(ScratchHost host, long workMem, Meter meter)
 
     internal async ValueTask<Value?> Get(byte[] key, CancellationToken token)
     {
+        token.ThrowIfCancellationRequested();
         if (data is null)
             return resident.TryGetValue(Convert.ToBase64String(key), out var item) ? new(item.Bytes.ToArray(), item.Ordinal) : null;
         var found = await Find(key, token).ConfigureAwait(false);
@@ -31,6 +32,7 @@ internal sealed class SpillKeyState(ScratchHost host, long workMem, Meter meter)
 
     internal async ValueTask<long> Put(byte[] key, byte[] value, long logicalBytes, CancellationToken token)
     {
+        token.ThrowIfCancellationRequested();
         if (logicalBytes < 0) throw new ArgumentOutOfRangeException(nameof(logicalBytes));
         if (data is null)
         {

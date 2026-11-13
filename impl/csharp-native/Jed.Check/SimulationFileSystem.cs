@@ -2,7 +2,7 @@ using Jed;
 
 // Canonical simulation-testing.md §6. This is a host, not a recovery model:
 // the production database performs all writes, publication and recovery.
-internal sealed class SimulationFileSystem(ulong seed, int pageSize, int sectorSize = 64) : IFileHost, IScratchDeviceHost
+internal sealed partial class SimulationFileSystem(ulong seed, int pageSize, int sectorSize = 64) : IFileHost, IScratchDeviceHost
 {
     internal sealed record Fault(string Kind, int Probability = 0, int Tear = 0, int Nth = 1, string Operation = "");
     internal sealed class CrashException : Exception { }
@@ -25,6 +25,7 @@ internal sealed class SimulationFileSystem(ulong seed, int pageSize, int sectorS
     private int syncs;
     private long generation;
     private bool dead;
+    private bool crashAtBarrier;
     private int PageSize => pageSize;
     private ulong scratchOrdinal;
     private readonly HashSet<ScratchDevice> scratch = [];
@@ -52,11 +53,12 @@ internal sealed class SimulationFileSystem(ulong seed, int pageSize, int sectorS
     }
 
     internal void Restart()
-    { dead = false; fault = null; barriers = syncs = 0; Fired = "none"; }
+    { if (crashAtBarrier) EndFaultedStep(); dead = false; crashAtBarrier = false; fault = null; barriers = syncs = 0; Fired = "none"; }
 
     internal void EndFaultedStep()
     {
-        if (dead || fault is null) return;
+        if (fault is null || dead && !crashAtBarrier) return;
+        crashAtBarrier = false;
         Fired = Fired == "none" ? "end" : Fired;
         if (fault.Kind == "power_loss") PowerLoss(fault.Probability, fault.Tear);
         else ProcessCrash();
@@ -143,7 +145,11 @@ internal sealed class SimulationFileSystem(ulong seed, int pageSize, int sectorS
     {
         Check(token);
         if (directoryChanges.Count == 0) return ValueTask.CompletedTask;
-        Operations.Add("sync directory"); Barrier();
+        Operations.Add("sync directory");
+        // The pinned simulation file-host directory callback has no error return.
+        // A crash here ends the process after callback completion; recovery still
+        // observes the fault and its partial directory, without inventing an I/O error.
+        try { Barrier(); } catch (CrashException) { return ValueTask.CompletedTask; }
         durableDirectory = new(directory, StringComparer.Ordinal); directoryChanges.Clear();
         return ValueTask.CompletedTask;
     }
@@ -152,10 +158,13 @@ internal sealed class SimulationFileSystem(ulong seed, int pageSize, int sectorS
     {
         barriers++;
         if (fault is not { } active || Fired != "none" || barriers != active.Nth) return;
-        if (active.Kind == "power_loss")
-        { Fired = "barrier"; PowerLoss(active.Probability, active.Tear); throw new CrashException(); }
-        if (active.Kind == "process_crash")
-        { Fired = "barrier"; ProcessCrash(); throw new CrashException(); }
+        if (active.Kind is "power_loss" or "process_crash")
+        {
+            // End the process now; materialize the crash image after its outcome
+            // is recorded, as the canonical simulator does. Oracle inspection
+            // can still read the last cache image, but all host calls fail.
+            Fired = "barrier"; crashAtBarrier = true; Die(); throw new CrashException();
+        }
     }
 
     private void SyncData(Inode inode, string path)

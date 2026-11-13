@@ -18,15 +18,27 @@ public sealed partial class Database
     }
 
     /// <summary>Copies and opens a plaintext database image in memory.</summary>
-    public static async Task<Database> DeserializeAsync(ReadOnlyMemory<byte> image, CancellationToken cancellationToken = default)
+    public static Task<Database> DeserializeAsync(ReadOnlyMemory<byte> image, CancellationToken cancellationToken = default) =>
+        DeserializeCoreAsync(image, cancellationToken, null, 0);
+
+    private static async Task<Database> DeserializeCoreAsync(ReadOnlyMemory<byte> image, CancellationToken cancellationToken, DatabaseEnvironment? environment, long maxStorageBytes)
     {
         cancellationToken.ThrowIfCancellationRequested();
+        if (maxStorageBytes < 0) throw new ArgumentOutOfRangeException(nameof(maxStorageBytes));
         var store = new MemoryBlockStore(image.Span);
         try
         {
             if (await InspectVariantAsync(store, cancellationToken).ConfigureAwait(false) != 0)
                 throw new SqlException(SqlStates.ObjectNotInPrerequisiteState, "an in-memory database cannot be encrypted");
-            return await OpenStoreAsync(store, cancellationToken, ephemeral: true).ConfigureAwait(false);
+            environment ??= DatabaseEnvironment.Builder().Build();
+            var database = await OpenStoreAsync(store, cancellationToken, ephemeral: true, environment: environment).ConfigureAwait(false);
+            try
+            {
+                database.current = database.current with { Catalog = BindEnvironment(database.current.Catalog, environment) };
+                database.SetStorageLimit(maxStorageBytes);
+                return database;
+            }
+            catch { await database.DisposeAsync().ConfigureAwait(false); throw; }
         }
         catch { await store.DisposeAsync().ConfigureAwait(false); throw; }
     }

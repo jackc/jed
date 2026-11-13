@@ -16,6 +16,7 @@ internal sealed class SpillHashRows(ScratchHost host, long workMem, Meter meter)
     internal bool Spilled => rows is not null;
     internal async ValueTask Add(ulong hash, SqlValue[] row, CancellationToken token)
     {
+        token.ThrowIfCancellationRequested();
         types ??= row.Select(value => value.Type).ToArray();
         if (rows is null)
         {

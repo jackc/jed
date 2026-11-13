@@ -6,7 +6,8 @@ internal sealed partial record Catalog
     internal DatabaseDomains? Scope { get; init; }
     internal UnicodeData? BoundUnicode { get; init; }
     internal TimeZoneData? BoundTimeZones { get; init; }
-    internal Catalog BindCollations(UnicodeData? unicode, TimeZoneData? timeZones = null)
+    internal DatabaseEnvironment? BoundEnvironment { get; init; }
+    internal Catalog BindCollations(UnicodeData? unicode, TimeZoneData? timeZones = null, DatabaseEnvironment? environment = null)
     {
         var loaded = new Dictionary<string, (Collation Data, bool Skew)>(StringComparer.Ordinal);
         foreach (var reference in Collations ?? [])
@@ -18,8 +19,8 @@ internal sealed partial record Catalog
             { throw new SqlException(SqlStates.CollationVersionMismatch, "referenced collation is unavailable: " + reference.Name); }
             loaded.Add(reference.Name, (data, data.UnicodeVersion != reference.UnicodeVersion || data.CldrVersion != reference.CldrVersion));
         }
-        if (loaded.Count == 0) return this with { BoundUnicode = unicode, BoundTimeZones = timeZones };
-        var bound = this with { BoundUnicode = unicode, BoundTimeZones = timeZones, Tables = Tables.Select(table => table with { Columns = table.Columns.Select(column =>
+        if (loaded.Count == 0) return this with { BoundUnicode = unicode, BoundTimeZones = timeZones, BoundEnvironment = environment ?? BoundEnvironment };
+        var bound = this with { BoundUnicode = unicode, BoundTimeZones = timeZones, BoundEnvironment = environment ?? BoundEnvironment, Tables = Tables.Select(table => table with { Columns = table.Columns.Select(column =>
             column.Collation is { } name && name != "C" && loaded.TryGetValue(name, out var item)
                 ? column with { CollationData = item.Data, CollationSkew = item.Skew } : column).ToArray() }).ToArray() };
         CatalogValidation.Statistics(bound.Statistics ?? [], bound.Tables.ToDictionary(table => table.Name, StringComparer.Ordinal));
@@ -34,7 +35,7 @@ internal static partial class StatementExecution
     {
         if (table.Columns.Any(column => column.CollationSkew) || (table.Indexes ?? []).Any(index => index.Keys.Any(key => key.CollationSkew)))
             throw new SqlException(SqlStates.CollationVersionMismatch, "table collation version differs from the loaded data");
-        var context = new TemporalContext(static () => throw new InvalidOperationException("stored index cannot read clock"), "UTC", data: catalog.BoundTimeZones, unicode: catalog.BoundUnicode);
+        var context = new TemporalContext(static () => throw new InvalidOperationException("stored index cannot read clock"), "UTC", data: catalog.BoundTimeZones, unicode: catalog.BoundUnicode, environment: catalog.BoundEnvironment);
         void Check(Resolved expression)
         {
             if (expression.Collation?.Table is { } data && (catalog.Collations ?? []).FirstOrDefault(reference => reference.Name == data.Name) is { } reference &&

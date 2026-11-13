@@ -22,6 +22,7 @@ module CSharpNativeTasks
             Dir.glob("impl/csharp-native/{Jed,Jed.Check}/*.csproj", base: ROOT) +
             Dir.glob("impl/csharp-native/{Jed,Jed.Check}/packages*.lock.json", base: ROOT) +
             Dir.glob("impl/csharp-native/Tools/*.rb", base: ROOT) +
+            Dir.glob("impl/csharp-native/Tools/*.go", base: ROOT) +
             Dir.glob("mise-tasks/csharp-native/*", base: ROOT) +
             %w[impl/csharp-native/global.json impl/csharp-native/baseline.json
                impl/csharp-native/Directory.Build.props impl/csharp-native/NuGet.Config] +
@@ -66,7 +67,11 @@ module CSharpNativeTasks
                 "--nologo", chdir: PACKAGE)
     exit($?&.exitstatus || 1) unless ok
     abort "C# sources changed during compilation; rerun verification for a stable source digest" unless source_digest == digest
-    File.join(PACKAGE, "Jed.Check/bin", configuration, "net11.0/Jed.Check.dll")
+    directory = File.join(PACKAGE, "Jed.Check/bin", configuration, "net11.0")
+    File.write(File.join(directory, "source.sha256"), digest + "\n")
+    File.write(File.join(directory, "build.json"), JSON.pretty_generate(source_sha256: digest,
+      sdk: sdk_version, configuration: configuration, runtime_async: runtime_async, compilation: "jit") + "\n")
+    File.join(directory, "Jed.Check.dll")
   end
 
   def check(*arguments, configuration: "Release", runtime_async: false)

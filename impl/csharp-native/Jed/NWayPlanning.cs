@@ -9,20 +9,30 @@ internal static class NWayPlanning
 {
     private sealed record Edge(int Owner, Resolved? Authored, Resolved? Residual, int[] Dependencies);
     private sealed record State(int[] Sequence, int[] Slots, PreparedRelation Metadata, long Cost, long LogicalRows,
-        AccessPlan Access, State? Previous = null, Resolved? On = null, HashJoinPlan? Hash = null, IndexNestedLoop? Inl = null, string Kind = "inner");
+        AccessPlan Access, State? Previous = null, Resolved? On = null, HashJoinPlan? Hash = null, IndexNestedLoop? Inl = null, string Kind = "inner", bool Ordered = false);
 
     internal static PreparedRelation? Prepare(RelationSyntax syntax, Database database, DatabaseSnapshot snapshot,
         PendingDatabase? pending, Catalog catalog, Meter meter, CancellationToken token, QueryScope? scope)
     {
-        var names = new List<TableRelation>(); var syntaxEdges = new List<JoinedRelation>();
-        bool Flatten(RelationSyntax item)
+        var names = new List<TableRelation>(); var syntaxEdges = new List<JoinedRelation>(); var edgeStarts = new List<int>();
+        bool Flatten(RelationSyntax item, int start = 0)
         {
             if (item is TableRelation name) { names.Add(name); return true; }
-            if (item is not JoinedRelation join || join.Kind is not ("inner" or "cross") || join.Natural || join.Using is { Length: > 0 } || join.Right is not TableRelation right) return false;
-            if (!Flatten(join.Left)) return false;
-            names.Add(right); syntaxEdges.Add(join); return true;
+            if (item is not JoinedRelation join || join.Kind is not ("inner" or "cross")) return false;
+            if (!Flatten(join.Left, start)) return false;
+            if (join.Right is TableRelation right)
+            {
+                names.Add(right); syntaxEdges.Add(join); edgeStarts.Add(start); return true;
+            }
+            // Comma precedence creates a right-hand join chain, but does not
+            // fence its base sources from physical join ordering. Its ON names
+            // remain restricted to that comma item.
+            if (join.Kind != "cross" || join.On is not null || join.Natural || join.Using is { Length: > 0 } || join.Right is not JoinedRelation) return false;
+            var rightStart = names.Count;
+            syntaxEdges.Add(join); edgeStarts.Add(start);
+            return Flatten(join.Right, rightStart);
         }
-        if (!Flatten(syntax) || names.Count < 3) return null;
+        if (!Flatten(syntax) || names.Count < 2) return null;
         static bool Nested(Expression value) => value.Query is not null || value.Args.Any(Nested);
         if (syntaxEdges.Any(edge => edge.On is { } on && Nested(on))) return null;
         // Preparing a base reference has no execution effects. A CTE, view or
@@ -41,9 +51,40 @@ internal static class NWayPlanning
             throw new InvalidOperationException("join column outside island");
         }
         var edges = new List<Edge>();
+        var mergedLayout = syntaxEdges.Any(edge => edge.Natural || edge.Using is { Length: > 0 });
+        BoundColumn Project(BoundColumn column, int slot) => column with
+        { Projection = new("column", column.Type, default, [], Slot: slot, Collation: column.Collation) };
+        var outputColumns = inputs[0].Columns.Select(Project).ToArray();
         for (var i = 0; i < syntaxEdges.Count; i++)
         {
-            var authored = syntaxEdges[i].On is null ? null : Resolve.Expr(Resolve.Bind(syntaxEdges[i].On!, columns.Take(offsets[i + 2]).Concat(scope?.OuterColumns ?? []).ToArray()));
+            var edgeSyntax = syntaxEdges[i];
+            if (edgeSyntax.Natural && edgeSyntax.Kind == "cross") throw Errors.Syntax("NATURAL CROSS JOIN is not supported");
+            var rightColumns = inputs[i + 1].Columns.Select((column, slot) => Project(column, offsets[i + 1] + slot)).ToArray();
+            var startSlot = offsets[edgeStarts[i]];
+            bool InItem(BoundColumn column) => PredicatePlan.Slots(column.Projection!).All(slot => slot >= startSlot);
+            var precedingColumns = outputColumns.Where(column => !InItem(column)).ToArray();
+            var leftColumns = outputColumns.Where(InItem).ToArray();
+            var visible = leftColumns.Concat(rightColumns).ToArray();
+            var onColumns = visible;
+            var authored = edgeSyntax.On is null ? null : Resolve.Expr(Resolve.Bind(edgeSyntax.On, onColumns.Concat(scope?.OuterColumns ?? []).ToArray()));
+            var usingNames = edgeSyntax.Natural ? leftColumns.Where(column => !column.Hidden && rightColumns.Any(right => !right.Hidden && right.Name == column.Name))
+                .Select(column => column.Name).Distinct(StringComparer.Ordinal).ToArray() : edgeSyntax.Using ?? [];
+            if (usingNames.Distinct(StringComparer.Ordinal).Count() != usingNames.Length) throw new SqlException(SqlStates.DuplicateColumn, "duplicate USING column");
+            var merged = new List<BoundColumn>();
+            foreach (var name in usingNames)
+            {
+                var leftFields = leftColumns.Where(column => !column.Hidden && column.Name == name).ToArray();
+                var rightFields = rightColumns.Where(column => !column.Hidden && column.Name == name).ToArray();
+                if (leftFields.Length == 0 || rightFields.Length == 0) throw new SqlException(SqlStates.UndefinedColumn, "USING column missing from input");
+                if (leftFields.Length != 1 || rightFields.Length != 1) throw new SqlException(SqlStates.AmbiguousColumn, "ambiguous USING column");
+                var leftField = leftFields[0]; var rightField = rightFields[0];
+                var common = Resolve.Common(leftField.Type, rightField.Type);
+                var equal = new Resolved("=", SqlType.Boolean, default, [leftField.Projection!, rightField.Projection!]);
+                authored = authored is null ? equal : new("and", SqlType.Boolean, default, [authored, equal]);
+                var projection = leftField.Type == common ? leftField.Projection! : new Resolved("promote", common, default, [leftField.Projection!]);
+                merged.Add(new(name, common, Projection: projection));
+            }
+            outputColumns = precedingColumns.Concat(merged).Concat(visible.Select(column => column with { Hidden = column.Hidden || usingNames.Contains(column.Name, StringComparer.Ordinal) })).ToArray();
             if (authored is not null && authored.Type.Kind is not (SqlKind.Boolean or SqlKind.Unknown)) throw Errors.Type("JOIN ON requires boolean");
             if (authored is not null && ContainsOuter(authored)) return null;
             var dependencies = (authored is null ? Enumerable.Empty<int>() : PredicatePlan.Slots(authored).Select(Source)).Append(i + 1).Distinct().ToArray();
@@ -59,19 +100,36 @@ internal static class NWayPlanning
             }
             edges.Add(new(i + 1, authored, PredicatePlan.Combine(residual), dependencies));
         }
-        PreparedRelation Build(PreparedRelation[] relations, Resolved? residualWhere = null, HashSet<int>? touched = null)
+        PreparedRelation Build(PreparedRelation[] relations, Resolved? residualWhere = null, HashSet<int>? touched = null, SelectPlan? query = null)
         {
-            var inventories = relations.Select(relation =>
+            var orderedQuery = query is { Empty: false, Group: null, Windows: null, Distinct: false, Limit: not null, Order.Length: > 0 };
+            bool Ordered(int index, AccessPlan access)
+            {
+                if (!orderedQuery || access.Kind is not (AccessKind.Full or AccessKind.Primary or AccessKind.PrimaryIntervals)) return false;
+                var keys = relations[index].BaseAccess!.Table.PrimaryKey;
+                return query!.Order!.Length <= keys.Length && query.Order.Select((key, position) =>
+                    !key.Descending && key.Expression.Op == "column" && key.Expression.Slot == offsets[index] + keys[position] && key.Expression.Collation?.Table is null).All(value => value);
+            }
+            var inventories = relations.Select((relation, index) =>
             {
                 var source = relation.BaseAccess!;
-                return AccessPlan.Inventory(source.Table, source.Tree, source.Filter, source.Storage, meter)
-                    .Select(access => access with { Ordered = access.Kind is AccessKind.Btree or AccessKind.IndexIntervals }).ToArray();
+                var extra = residualWhere is null ? [] : PredicatePlan.Conjuncts(residualWhere).Where(term =>
+                {
+                    var slots = PredicatePlan.Slots(term);
+                    return slots.Count != 0 && slots.All(slot => Source(slot) == index);
+                }).Select(term => PredicatePlan.Shift(term, -offsets[index])).ToArray();
+                var accessPredicate = PredicatePlan.Combine(extra.Concat(source.Filter is null ? [] : [source.Filter]));
+                var unexecuted = (accessPredicate is null ? 0 : PredicatePlan.Nodes(accessPredicate)) - (source.Filter is null ? 0 : PredicatePlan.Nodes(source.Filter));
+                return AccessPlan.Inventory(source.Table, source.Tree, accessPredicate, source.Storage, meter)
+                    .Select(access => access with { EstimatedCost = Math.Max(0, access.EstimatedCost - Estimate.Multiply(access.EstimatedRows, unexecuted)) })
+                    .Select(access => query?.Empty == true ? access with { EstimatedRows = 0, EstimatedPages = 0, EstimatedEntries = 0, EstimatedCost = 0 }
+                        : access with { Ordered = access.Kind is AccessKind.Btree or AccessKind.IndexIntervals }).ToArray();
             }).ToArray();
             State Driver(int index, AccessPlan access)
             {
                 var relation = relations[index]; var rows = Math.Min(relation.EstimatedRows ?? PlannerFacts.SrfRows, access.EstimatedRows);
                 var slots = Enumerable.Range(offsets[index], relation.Columns.Length).ToArray();
-                return new([index], slots, relation with { EstimatedRows = rows }, access.EstimatedCost, relation.EstimatedRows ?? rows, access);
+                return new([index], slots, relation with { EstimatedRows = rows }, access.EstimatedCost, relation.EstimatedRows ?? rows, access, Ordered: Ordered(index, access));
             }
             IEnumerable<State> Extend(State previous, int index)
             {
@@ -91,12 +149,12 @@ internal static class NWayPlanning
                     var metadata = new PreparedRelation(combinedColumns, source.Rows, EstimatedRows: rows);
                     var product = Estimate.Multiply(previous.Metadata.EstimatedRows ?? 0, inner.EstimatedRows ?? 0);
                     var work = Estimate.Multiply(product, on is null ? 0 : PredicatePlan.Nodes(on));
-                    yield return new(sequence, slots, metadata, Estimate.Add(previous.Cost, Estimate.Add(access.EstimatedCost, work)), rows, access, previous, on, Kind: kind);
+                    yield return new(sequence, slots, metadata, Estimate.Add(previous.Cost, Estimate.Add(access.EstimatedCost, work)), rows, access, previous, on, Kind: kind, Ordered: previous.Ordered);
                     var hash = HashJoinPlan.Select(authored, previous.Slots.Length, kind, previous.Metadata.EstimatedRows, inner.EstimatedRows, on);
                     if (hash is not null)
                     {
                         work = HashJoinPlan.Work(previous.Metadata.EstimatedRows ?? 0, inner.EstimatedRows ?? 0, hash.Types, on);
-                        yield return new(sequence, slots, metadata, Estimate.Add(previous.Cost, Estimate.Add(access.EstimatedCost, work)), rows, access, previous, on, hash, Kind: kind);
+                        yield return new(sequence, slots, metadata, Estimate.Add(previous.Cost, Estimate.Add(access.EstimatedCost, work)), rows, access, previous, on, hash, Kind: kind, Ordered: previous.Ordered);
                     }
                 }
                 var inl = IndexNestedLoop.Select(source, previous.Slots.Length, kind, PredicatePlan.Combine(new[] { on, extra }.OfType<Resolved>()));
@@ -113,7 +171,7 @@ internal static class NWayPlanning
                         var nodes = (on is null ? 0 : PredicatePlan.Nodes(on)) + (inl.Source.Filter is null ? 0 : PredicatePlan.Nodes(inl.Source.Filter));
                         var work = Estimate.Multiply(outerRows, Estimate.Add(Estimate.Add(access.EstimatedPages, access.EstimatedEntries), Estimate.Multiply(access.EstimatedRows, fetch + nodes)));
                         var cost = Estimate.Add(previous.Cost, work);
-                        yield return new(sequence, slots, metadata, cost, rows, access, previous, on, Inl: inl with { PinnedAccess = access }, Kind: kind);
+                        yield return new(sequence, slots, metadata, cost, rows, access, previous, on, Inl: inl with { PinnedAccess = access }, Kind: kind, Ordered: previous.Ordered);
                     }
             }
             var states = Enumerable.Range(0, relations.Length).SelectMany(index => inventories[index].Select(access => Driver(index, access))).ToList();
@@ -121,18 +179,23 @@ internal static class NWayPlanning
             {
                 for (var size = 1; size < relations.Length; size++)
                 {
-                    var next = new Dictionary<int, List<State>>();
+                    var next = new Dictionary<(int Mask, bool Ordered), List<State>>();
                     foreach (var previous in states.OrderBy(state => state, StructuralComparer.Instance))
                         for (var index = 0; index < relations.Length; index++)
                             if (!previous.Sequence.Contains(index))
                                 foreach (var candidate in Extend(previous, index))
                                 {
                                     var mask = candidate.Sequence.Aggregate(0, (set, value) => set | 1 << value);
-                                    if (!next.TryGetValue(mask, out var frontier)) next[mask] = frontier = [];
+                                    var bucket = (mask, candidate.Ordered);
+                                    if (!next.TryGetValue(bucket, out var frontier)) next[bucket] = frontier = [];
+                                    // A completed plan is priced through its LIMIT window.
+                                    // Prefix discounts can favor a higher-cardinality join,
+                                    // so complete candidates compare their pipeline cost.
+                                    if (size == relations.Length - 1) { frontier.Add(candidate); continue; }
                                     if (frontier.Any(state => Dominates(state, candidate))) continue;
                                     frontier.RemoveAll(state => Dominates(candidate, state)); frontier.Add(candidate);
                                 }
-                    states = next.OrderBy(pair => pair.Key).SelectMany(pair => pair.Value).ToList();
+                    states = next.OrderBy(pair => pair.Key.Mask).ThenBy(pair => pair.Key.Ordered).SelectMany(pair => pair.Value).ToList();
                 }
             }
             else
@@ -143,28 +206,73 @@ internal static class NWayPlanning
                         .OrderBy(candidate => candidate.Cost).ThenBy(candidate => candidate, StructuralComparer.Instance).First();
                 states = [state];
             }
-            long FinalCost(State state)
+            (long Cost, long Rows, long Delivered, long Visits) Pipeline(State state)
             {
                 var rows = state.Metadata.EstimatedRows ?? 0;
-                return Estimate.Add(state.Cost, Estimate.Add(Estimate.Multiply(rows, residualWhere is null ? 0 : PredicatePlan.Nodes(residualWhere)), Estimate.Rows(rows, residualWhere)));
+                var matched = Estimate.Rows(rows, residualWhere);
+                var cost = state.Cost;
+                var visits = state.Previous?.Metadata.EstimatedRows ?? 0;
+                if (state.Ordered && state.Previous is { } previous)
+                {
+                    var target = query!.Limit == 0 ? 0 : Estimate.Add(query.Offset, query.Limit!.Value);
+                    var leftRows = previous.Metadata.EstimatedRows ?? 0;
+                    var visited = target == 0 ? 0 : matched > target ? Math.Min(leftRows, Estimate.Scale(leftRows, target, matched)) : leftRows;
+                    visits = visited;
+                    var inner = relations[state.Sequence[^1]];
+                    var rightRows = Math.Min(inner.EstimatedRows ?? PlannerFacts.SrfRows, state.Access.EstimatedRows);
+                    long work;
+                    if (state.Inl is not null)
+                        work = leftRows == 0 ? 0 : Estimate.Scale(state.Cost - previous.Cost, visited, leftRows);
+                    else
+                    {
+                        work = state.Hash is not null ? HashJoinPlan.Work(visited, rightRows, state.Hash.Types, state.On) :
+                            Estimate.Multiply(Estimate.Multiply(visited, rightRows), state.On is null ? 0 : PredicatePlan.Nodes(state.On));
+                        work = Estimate.Add(state.Access.EstimatedCost, work);
+                    }
+                    cost = Estimate.Add(previous.Cost, work);
+                    rows = leftRows == 0 ? 0 : Estimate.Scale(rows, visited, leftRows);
+                }
+                cost = Estimate.Add(cost, Estimate.Multiply(rows, residualWhere is null ? 0 : PredicatePlan.Nodes(residualWhere)));
+                return (cost, matched, Estimate.Rows(rows, residualWhere), visits);
+            }
+            long FinalCost(State state)
+            {
+                var estimate = Pipeline(state); var cost = estimate.Cost; var rows = estimate.Rows;
+                if (query is not { Group: null, Windows: null, Distinct: false }) return Estimate.Add(cost, rows);
+                if (!state.Ordered && query.Order is { Length: > 0 } order)
+                    cost = Estimate.Add(cost, Estimate.Multiply(rows, order.Aggregate(0L, (sum, key) => Estimate.Add(sum, PredicatePlan.Nodes(key.Expression)))));
+                rows = Math.Max(0, rows - query.Offset);
+                if (query.Limit is { } limit) rows = Math.Min(rows, limit);
+                var projection = query.Projections.Aggregate(query.ChargeRows ? 1L : 0, (sum, item) => Estimate.Add(sum, PredicatePlan.Nodes(item.Expression)));
+                return Estimate.Add(cost, Estimate.Multiply(rows, projection));
             }
             var winner = states.OrderBy(FinalCost).ThenBy(state => state, StructuralComparer.Instance).First();
             var needed = touched is null ? Enumerable.Range(0, columns.Length).ToHashSet() : new HashSet<int>(touched);
             foreach (var edge in edges) if (edge.Residual is { } on) needed.UnionWith(PredicatePlan.Slots(on));
             if (residualWhere is not null) needed.UnionWith(PredicatePlan.Slots(residualWhere));
-            var spill = database.WorkMem > 0 && database.ScratchHost is { } scratch ? new SpillPolicy(scratch, database.WorkMem, null) : null;
+            for (var index = 0; index < relations.Length; index++)
+                if (relations[index].BaseAccess?.Filter is { } filter) needed.UnionWith(PredicatePlan.Slots(filter).Select(slot => slot + offsets[index]));
+            var spill = (relations.Length > 2 || winner.Hash is not null || query?.Group is not null || query is { Distinct: true, DistinctOnCount: 0 }) && database.WorkMem > 0 && database.ScratchHost is { } scratch ? new SpillPolicy(scratch, database.WorkMem, null) : null;
+            var steps = new List<NWayStep>();
+            PreparedRelation? finalLeft = null; PreparedRelation? finalRight = null;
             PreparedRelation Materialize(State state)
             {
                 var index = state.Sequence[^1]; var source = relations[index];
                 if (state.Inl is null && source.WithAccess is { } access) source = access(state.Access);
                 if (source.WithTouched is { } mask) source = mask(needed.Where(slot => slot >= offsets[index] && slot < offsets[index + 1]).Select(slot => slot - offsets[index]).ToHashSet());
                 ExplainPlanning.ScanFilterSlots(source.Plan, source.BaseAccess?.Filter, offsets[index], meter);
-                if (state.Previous is null) return source with { EstimatedRows = state.Metadata.EstimatedRows };
+                if (state.Previous is null)
+                {
+                    steps.Add(new(source, null, null, null, source.Plan));
+                    return source with { EstimatedRows = state.Metadata.EstimatedRows };
+                }
                 var left = Materialize(state.Previous);
+                if (ReferenceEquals(state, winner)) { finalLeft = left; finalRight = source; }
                 var physicalMask = state.Slots.Select((slot, position) => (slot, position)).Where(item => needed.Contains(item.slot)).Select(item => item.position).ToHashSet();
                 var rows = RelationExecution.Join(left, source, state.On, state.Kind, [], meter, token, hashPlan: state.Hash, inl: state.Inl, touched: physicalMask, spill: spill);
                 var relation = new PreparedRelation(state.Metadata.Columns, rows, EstimatedRows: state.Metadata.EstimatedRows, MemoryOutput: spill is null, BoundedOutput: spill is not null);
                 relation = ExplainPlanning.Join(relation, left, source, state.Kind, state.On, state.Hash, state.Inl, meter);
+                steps.Add(new(source, state.On, state.Hash, state.Inl, relation.Plan));
                 if (meter.Explain?.Verbose == true && state.On is not null && relation.Plan is { } node)
                 {
                     var marker = node.Detail.IndexOf("; on=", StringComparison.Ordinal);
@@ -173,10 +281,38 @@ internal static class NWayPlanning
                 return relation;
             }
             var physical = Materialize(winner);
+            var physicalTouched = winner.Slots.Select((slot, position) => (slot, position))
+                .Where(item => needed.Contains(item.slot)).Select(item => item.position).ToHashSet();
+            if (spill is null)
+                physical = physical with { Rows = NWayExecution.Run(steps.ToArray(), physicalTouched, meter, token) };
+            PreparedRelation? Bounded(SortPlan[] order, long count, Resolved? filter)
+            {
+                if (!winner.Ordered) return null;
+                if (query!.Limit == 0) count = 0;
+                var bounded = physical with { Rows = spill is null
+                    ? NWayExecution.Run(steps.ToArray(), physicalTouched, meter, token, Remap(filter, winner.Slots), count)
+                    : SpillStreamingJoin.Run(finalLeft!, finalRight!, winner.On, Remap(filter, winner.Slots), winner.Kind, winner.Inl, count, spill, meter, token, winner.Hash),
+                    MemoryOutput = spill is null };
+                if (bounded.Plan is { } node)
+                {
+                    var estimate = Pipeline(winner); node.EstimatedCost = estimate.Cost;
+                    node.EstimatedRows = estimate.Delivered;
+                    if (winner.Inl is not null && winner.Previous!.Metadata.EstimatedRows is long outer && outer > 0)
+                    {
+                        var inner = node.Children[^1];
+                        inner.EstimatedRows = Estimate.Scale(inner.EstimatedRows, estimate.Visits, outer);
+                        inner.EstimatedCost = Estimate.Scale(inner.EstimatedCost, estimate.Visits, outer);
+                    }
+                    if (spill is not null) bounded = bounded with { Rows = ExplainObservation.Rows(bounded.Rows, node, meter, token, inclusive: true) };
+                }
+                return bounded with { Columns = columns, Rows = Restore(bounded.Rows, winner.Slots, token) };
+            }
             return physical with
             {
-                Columns = columns, Rows = Restore(physical.Rows, winner.Slots, token),
-                WithTouched = mask => Build(relations, residualWhere, mask),
+                Columns = mergedLayout ? outputColumns : columns, Rows = Restore(physical.Rows, winner.Slots, token), RawLayout = mergedLayout,
+                WithTouched = mask => Build(relations, residualWhere, mask, query),
+                WithQuery = plan => Build(relations, residualWhere, touched, plan),
+                Bounded = Bounded,
                 PushFilter = filter =>
                 {
                     var next = relations.ToArray(); var residual = new List<Resolved>();
@@ -188,7 +324,7 @@ internal static class NWayPlanning
                         else residual.Add(term);
                     }
                     var rest = PredicatePlan.Combine(residual);
-                    return (Build(next, rest, touched), rest);
+                    return (Build(next, rest, touched, query), rest);
                 }
             };
         }

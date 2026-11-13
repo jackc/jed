@@ -9,7 +9,7 @@ internal static partial class StatementExecution
         try
         {
             var converted = Resolve.Cast(value, target);
-            return value.Type == target || Evaluate.Compare(value, converted) == 0 ? converted : null;
+            return value.Type == target || Evaluate.Compare(value, converted) == 0 ? converted : (SqlValue?)null;
         }
         catch (SqlException error) when (error.SqlState is SqlStates.NumericValueOutOfRange or SqlStates.InvalidTextRepresentation) { return null; }
     }

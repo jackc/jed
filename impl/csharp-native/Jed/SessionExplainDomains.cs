@@ -15,7 +15,7 @@ public sealed partial class Session
         try
         {
             var scope = (domainTransaction ?? lease.Scope).Fork();
-            BindDomainCollations(scope, outerMeter.Unicode, outerMeter.Temporal.Data);
+            BindDomainCollations(scope, outerMeter.Unicode, outerMeter.Temporal.Data, outerMeter.Temporal.Environment);
             var main = scope.Get("main"); var catalog = scope.BindCatalog(main);
             StatementExecution.ValidateCatalogTarget(syntax.Inner);
             CheckPrivileges(syntax.Inner, catalog);
@@ -32,7 +32,7 @@ public sealed partial class Session
                     var persistent = PersistentWrite(syntax.Inner, scope);
                     await lease.DisposeAsync().ConfigureAwait(false);
                     lease = await DomainLease.Acquire(db, temp, persistent, true, token).ConfigureAwait(false);
-                    scope = lease.Scope.Fork(); BindDomainCollations(scope, outerMeter.Unicode, outerMeter.Temporal.Data);
+                    scope = lease.Scope.Fork(); BindDomainCollations(scope, outerMeter.Unicode, outerMeter.Temporal.Data, outerMeter.Temporal.Environment);
                     main = scope.Get("main"); catalog = scope.BindCatalog(main);
                 }
             }

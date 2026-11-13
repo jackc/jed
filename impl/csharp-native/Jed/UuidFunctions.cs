@@ -3,7 +3,7 @@ using System.Buffers.Binary;
 namespace Jed;
 
 /// <summary>Reproducible splitmix64 source. This is not a cryptographically secure random generator.</summary>
-public sealed class SeededRandomSource(ulong seed)
+public sealed class SeededRandomSource(ulong seed) : IRandomSource
 {
     private readonly object gate = new();
     private ulong state = seed;

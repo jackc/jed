@@ -19,7 +19,7 @@ unless File.executable?(peer)
 end
 corpus = File.join(CSharpNativeTasks.baseline_spec, "conformance/suites")
 passed = File.readlines(ENV.fetch("usage_results")).filter_map do |line|
-  match = /\APASS (.*?): \d+ records, reopened before every record\s*\z/.match(line)
+  match = /\APASS (.*?): \d+ records, (?:reopened before every record|retained fixture file)\s*\z/.match(line)
   next unless match
   path = File.expand_path(match[1])
   abort "Result file is outside the pinned corpus: #{path}" unless path.start_with?(corpus + "/")

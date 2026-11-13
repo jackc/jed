@@ -5,6 +5,7 @@ namespace Jed;
 internal sealed record GinAccess(CatalogIndex Index, StorageTree Tree, int Column, GinQueryNode[] Arms,
     long EstimatedRows, long EstimatedEntries, long EstimatedPages, long EstimatedCost)
 {
+    internal bool Fallback => Arms.Any(arm => arm.Fallback);
     internal static GinAccess? Select(CatalogTable table, StorageTree primary, Resolved? filter, QueryStorage context, Meter? meter = null)
     {
         return Candidates(table, primary, filter, context, meter).OrderBy(candidate => candidate.EstimatedCost)
@@ -26,15 +27,15 @@ internal sealed record GinAccess(CatalogIndex Index, StorageTree Tree, int Colum
                 long rows = 0, entries = 0;
                 foreach (var arm in arms)
                 {
-                    var estimate = stats is null || arm.Unbound ? (Rows: !arm.Unbound && arm.Terms.Length == 0 && arm.Children.Length == 0 ? 0 : Estimate.Fraction(table.RowCount, "matching"), Entries: 0L) : EstimateNode(arm, stats);
+                    var estimate = stats is null || arm.Unbound || arm.Fallback ? (Rows: !arm.Unbound && !arm.Fallback && arm.Terms.Length == 0 && arm.Children.Length == 0 ? 0 : Estimate.Fraction(table.RowCount, "matching"), Entries: 0L) : EstimateNode(arm, stats);
                     rows = Math.Min(stats?.NonnullRows ?? table.RowCount, Estimate.Add(rows, estimate.Rows));
-                    entries = Estimate.Add(entries, stats is null || arm.Unbound ? estimate.Rows : estimate.Entries);
+                    entries = Estimate.Add(entries, stats is null || arm.Unbound || arm.Fallback ? estimate.Rows : estimate.Entries);
                 }
                 long pages = 0;
                 if (entries > 0)
                 {
                     var totalEntries = index.Keys.Aggregate(0L, (count, key) => Estimate.Add(count, StatisticsView.Find(context.Catalog, table, key.Column)?.TermEntries ?? 0));
-                    pages = stats is null || arms.Any(arm => arm.Unbound) || totalEntries == 0 ? Estimate.Fraction(tree.NodeCount, "matching") : Estimate.Scale(tree.NodeCount, entries, totalEntries);
+                    pages = stats is null || arms.Any(arm => arm.Unbound || arm.Fallback) || totalEntries == 0 ? Estimate.Fraction(tree.NodeCount, "matching") : Estimate.Scale(tree.NodeCount, entries, totalEntries);
                     pages = Math.Clamp(pages, tree.Height, tree.NodeCount);
                 }
                 var cost = Estimate.Add(Estimate.Add(pages, entries), Estimate.Multiply(rows, Estimate.Add(primary.Height + 1L, PredicatePlan.Nodes(filter))));
@@ -71,6 +72,15 @@ internal sealed record GinAccess(CatalogIndex Index, StorageTree Tree, int Colum
     internal async IAsyncEnumerable<StorageRecord> Records(StorageTree primary, Meter meter,
         IReadOnlySet<int>? touched, [EnumeratorCancellation] CancellationToken token, bool reverse = false)
     {
+        if (Fallback)
+        {
+            meter.Charge(await primary.CountRangePagesAsync(null, true, null, true, token).ConfigureAwait(false));
+            await foreach (var record in primary.ScanAsync(token).ConfigureAwait(false)) meter.Charge(primary.ValueReadUnits(record, touched));
+            meter.Checkpoint(token);
+            await foreach (var record in primary.ScanRangeAsync(null, true, null, true, reverse, token).ConfigureAwait(false))
+            { meter.Charge(Costs.StorageRowRead); meter.Checkpoint(token); yield return record; }
+            yield break;
+        }
         var candidates = new SortedSet<byte[]>(StatisticsBytes.Instance);
         foreach (var arm in Arms) candidates.UnionWith(await GinGather.Run(Tree, arm, meter, token).ConfigureAwait(false));
         foreach (var key in reverse ? candidates.Reverse() : candidates)

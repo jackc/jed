@@ -9,6 +9,13 @@ internal static class ExplainExecution
     internal static ExplainedStatement Prepare(StatementSyntax statement, Database database, DatabaseSnapshot snapshot,
         PendingDatabase? pending, Catalog catalog, Meter meter, CancellationToken token, QueryScope? scope = null)
     {
+        var target = statement switch { InsertSyntax insertTarget => insertTarget.Table, UpdateSyntax updateTarget => updateTarget.Table, DeleteSyntax deleteTarget => deleteTarget.Table, _ => null };
+        if (target is not null && (catalog.Scope?.View(target)?.View ?? (catalog.Views ?? []).FirstOrDefault(view => view.Name == target)) is { } view)
+        {
+            var execution = pending ?? new PendingDatabase(snapshot) { Catalog = catalog };
+            var rewritten = StatementExecution.RewriteView(database, execution, statement, view, meter, token);
+            return Prepare(rewritten, database, snapshot, pending, catalog, meter, token, scope);
+        }
         if (statement is WithStatementSyntax || statement is SelectSyntax writing && WritableCteExecution.HasWrites(writing))
         {
             var definitions = statement is WithStatementSyntax wrapped ? wrapped.Definitions : ((SelectSyntax)statement).With!;
@@ -73,14 +80,15 @@ internal static class ExplainExecution
         {
             var name = statement is UpdateSyntax update ? update.Table : ((DeleteSyntax)statement).Table;
             var table = StatementExecution.ResolveTable(catalog, name);
-            var columns = StatementExecution.Columns(table);
+            var viewBinding = statement is UpdateSyntax viewUpdate ? viewUpdate.ViewBinding : ((DeleteSyntax)statement).ViewBinding;
+            var columns = viewBinding?.Columns ?? StatementExecution.Columns(table);
             var syntaxFilter = statement is UpdateSyntax u ? u.Filter : ((DeleteSyntax)statement).Filter;
             var binder = new SubqueryBinder(columns, database, snapshot, pending, catalog, meter, token, scope);
             var filter = syntaxFilter is null ? null : Resolve.Expr(binder.Bind(syntaxFilter), SqlType.Boolean);
             var touched = new HashSet<int>();
             void Touch(Resolved expression)
             {
-                if (expression.Op == "column") touched.Add(expression.Slot % columns.Length);
+                if (expression.Op == "column") touched.Add(expression.Slot % table.Columns.Length);
                 foreach (var argument in expression.Args) Touch(argument);
             }
             if (filter is not null) Touch(filter);
@@ -89,7 +97,7 @@ internal static class ExplainExecution
                     if (assignment.Value.Op != "default") Touch(Resolve.Expr(binder.Bind(assignment.Value)));
             var returning = statement is UpdateSyntax returningUpdate ? returningUpdate.Returning : ((DeleteSyntax)statement).Returning;
             if (returning.Length != 0)
-                foreach (var projection in Resolve.Select(new(returning, null, null, 0), columns).Projections) Touch(projection.Expression);
+                foreach (var projection in Resolve.Select(new(returning, null, null, 0), viewBinding?.Returning ?? columns).Projections) Touch(projection.Expression);
             var tree = database.Tree(table, pending, snapshot);
             var access = AccessPlan.Select(table, tree, filter, new(database, snapshot, pending, catalog), meter);
             var scan = ExplainPlanning.Scan(table, access, filter, touched, false, meter, catalog, tree.Height);

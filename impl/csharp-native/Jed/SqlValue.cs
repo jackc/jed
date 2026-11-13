@@ -4,7 +4,7 @@ using System.Text;
 namespace Jed;
 
 /// <summary>An immutable, owned scalar value. default(SqlValue) is untyped SQL NULL.</summary>
-public readonly struct SqlValue
+public readonly partial struct SqlValue
 {
     private readonly bool present;
     private readonly long integer;

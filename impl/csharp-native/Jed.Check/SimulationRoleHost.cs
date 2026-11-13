@@ -2,9 +2,10 @@ using Jed;
 
 // The registry models only exclusive OS ownership and stream endpoints. Every
 // snapshot, page request and commit still uses the production protocol handlers.
-internal sealed class SimulationRoleRegistry(SimulationNetwork network)
+internal sealed class SimulationRoleRegistry(SimulationNetwork network, Func<long>? now = null, Action<long>? advance = null)
 {
     private readonly SimulationNetwork network = network;
+    private long localClock;
     private sealed record Owner(int Process, Database? Database = null, PageOwnerServer? Server = null);
     private readonly Dictionary<string, Owner> owners = new(StringComparer.Ordinal);
     internal IFileRoleHost Host(int process) => new HostAdapter(this, process);
@@ -22,6 +23,12 @@ internal sealed class SimulationRoleRegistry(SimulationNetwork network)
     }
     private sealed class HostAdapter(SimulationRoleRegistry registry, int process) : IFileRoleHost
     {
+        public long NowMicroseconds => registry.Now;
+        public async ValueTask PollAsync(CancellationToken token)
+        {
+            token.ThrowIfCancellationRequested(); registry.Advance();
+            await Task.Yield();
+        }
         public async ValueTask<PageClientConnection?> ElectAsync(string path, bool readOnly, CancellationToken token)
         {
             if (!registry.owners.TryGetValue(path, out var owner))
@@ -40,5 +47,11 @@ internal sealed class SimulationRoleRegistry(SimulationNetwork network)
         }
         public void Release(string path)
         { if (registry.owners.TryGetValue(path, out var owner) && owner.Process == process) registry.owners.Remove(path); }
+    }
+    private long Now => now?.Invoke() ?? localClock;
+    private void Advance()
+    {
+        if (advance is not null) advance(2000);
+        else localClock = checked(localClock + 2000);
     }
 }

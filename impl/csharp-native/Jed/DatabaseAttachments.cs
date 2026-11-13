@@ -33,7 +33,7 @@ public sealed partial class Database
         ReserveAttachment(name); Database? created = null;
         try
         {
-            created = await CreateInMemoryAsync(cancellationToken: cancellationToken).ConfigureAwait(false);
+            created = await CreateInMemoryAsync(cancellationToken: cancellationToken, environment: Environment).ConfigureAwait(false);
             lock (gate) { Check(); if (attachmentsClosing) throw new SqlException(SqlStates.ObjectInUse, "database is closing"); attachments.Add(name, new(name, created, readOnly)); created = null; }
         }
         finally
@@ -48,6 +48,7 @@ public sealed partial class Database
         ReserveAttachment(name); Database? opened = null;
         try
         {
+            options = (options ?? new()) with { Environment = Environment };
             if (ScratchHost?.Encrypted == true) options = (options ?? new()) with { ScratchEncryption = ScratchEncryption.On };
             opened = await OpenFileAsync(path, options, cancellationToken).ConfigureAwait(false);
             lock (gate)

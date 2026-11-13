@@ -27,6 +27,7 @@ internal static class ExplainExpression
             case "collate": return "(" + Arg(0) + " collate " + Identifier(expression.Text) + ")";
             case "cast": case "promote": case "float_widen": return "cast(" + Arg(0) + " as " + expression.Type.Name() + ")";
             case "join_source": return "join";
+            case "host": return expression.Text + "(" + Args() + ")";
             case "call": return (expression.Text switch { "width_bucket_array" => "width_bucket", "substring" => "substr", "position" => "strpos", _ => expression.Text }) + "(" + Args() + ")";
             case "array": return "array[" + Args() + "]";
             case "row": return "row(" + Args() + ")";

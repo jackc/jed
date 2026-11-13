@@ -2,9 +2,9 @@ using System.Globalization;
 
 namespace Jed;
 
-internal sealed record Resolved(string Op, SqlType Type, SqlValue Constant, Resolved[] Args, string Text = "", TypeSpec? Target = null, FunctionFact? Function = null, int Slot = -1, SubqueryCell? Subquery = null, OuterBinding? Outer = null, Resolved[]? GrowthOperands = null, JsonSqlSpec? Json = null, CollationDerivation? Collation = null, RegexCall? Regex = null, SimilarCall? Similar = null, bool ArrayArguments = false, bool SessionDependent = false, int ParameterIndex = 0, bool ParameterUnbound = false, bool BoundSource = false)
+internal sealed record Resolved(string Op, SqlType Type, SqlValue Constant, Resolved[] Args, string Text = "", TypeSpec? Target = null, FunctionFact? Function = null, int Slot = -1, SubqueryCell? Subquery = null, OuterBinding? Outer = null, Resolved[]? GrowthOperands = null, JsonSqlSpec? Json = null, CollationDerivation? Collation = null, RegexCall? Regex = null, SimilarCall? Similar = null, bool ArrayArguments = false, bool SessionDependent = false, int ParameterIndex = 0, bool ParameterUnbound = false, bool BoundSource = false, HostFunction? HostFunction = null)
 {
-    internal bool NeedsAsync { get; } = Op is "column" or "outer" or "correlated" or "in_correlated" or "quantified_correlated" || Args.Any(argument => argument.NeedsAsync);
+    internal bool NeedsAsync { get; init; } = Op is "column" or "outer" or "correlated" or "in_correlated" or "quantified_correlated" or "in_init" or "quantified_init" || Args.Any(argument => argument.NeedsAsync);
 }
 internal sealed record Projection(Resolved Expression, string Name);
 internal sealed record SortPlan(Resolved Expression, bool Descending, bool NullsFirst)
@@ -17,9 +17,14 @@ internal sealed record SortPlan(Resolved Expression, bool Descending, bool Nulls
     }
 }
 internal sealed record SelectPlan(Projection[] Projections, Resolved? Filter, long? Limit, long Offset, bool Empty,
-    SortPlan[]? Order = null, bool Distinct = false, GroupPlan? Group = null, bool StreamDistinct = false, bool ChargeRows = true, WindowStage? Windows = null, bool WindowPrefix = false, bool AggregateLane = false, int DistinctOnCount = 0, ExplainStages? Observation = null, AccessPlan? Access = null, bool ColumnarProjection = false, SpillPolicy? Spill = null, bool ScanReverse = false, Func<ValueTask>? BeforeZeroLimit = null, bool AccessOrdering = false);
+    SortPlan[]? Order = null, bool Distinct = false, GroupPlan? Group = null, bool StreamDistinct = false, bool ChargeRows = true, WindowStage? Windows = null, bool WindowPrefix = false, bool AggregateLane = false, int DistinctOnCount = 0, ExplainStages? Observation = null, AccessPlan? Access = null, bool ColumnarProjection = false, SpillPolicy? Spill = null, bool ScanReverse = false, Func<ValueTask>? BeforeZeroLimit = null, bool AccessOrdering = false)
+{
+    // Runtime plan rewrites retain this identity; each invocation supplies its
+    // own scoped read-ahead state, including nested/correlated invocations.
+    internal object HostBatchIdentity { get; } = new();
+}
 internal sealed record BoundColumn(string Name, SqlType Type, string? Qualifier = null, bool Hidden = false, OuterBinding? Outer = null, int Level = 0, Resolved? Projection = null, object? BaseSource = null, bool PrimaryKey = false, CollationDerivation? Collation = null,
-    string? RowName = null, bool NotNull = false, bool NullExtended = false, bool WholeRow = true, bool ScalarRelation = false, bool RecursiveHidden = false);
+    string? RowName = null, bool NotNull = false, bool NullExtended = false, bool WholeRow = true, bool ScalarRelation = false, bool RecursiveHidden = false, bool LateralForbidden = false);
 
 internal static partial class Resolve
 {
@@ -116,6 +121,12 @@ if (item.Alias is not null) throw Errors.Syntax("star expansion cannot have an a
             var dot = expression.Text.LastIndexOf('.');
             var name = dot < 0 ? expression.Text : expression.Text[(dot + 1)..];
             var qualifier = dot < 0 ? null : expression.Text[..dot];
+            if (qualifier is not null)
+            {
+                var relations = columns.Where(column => column.Qualifier == qualifier).OrderBy(column => column.Level).ToArray();
+                if (relations.Length != 0 && relations[0].LateralForbidden)
+                    throw new SqlException(SqlStates.InvalidColumnReference, "LATERAL reference requires an inner or left join");
+            }
             var matches = columns.Select((column, slot) => (column, slot)).Where(pair => pair.column.Name == name &&
                 (qualifier is null ? !pair.column.Hidden : pair.column.Qualifier == qualifier)).ToArray();
             if (matches.Length > 0) { var level = matches.Min(match => match.column.Level); matches = matches.Where(match => match.column.Level == level).ToArray(); }
@@ -125,6 +136,7 @@ if (item.Alias is not null) throw Errors.Syntax("star expansion cannot have an a
                 if (qualifier is null && WholeRow(expression, columns) is { } whole) return whole;
                 throw new SqlException(SqlStates.UndefinedColumn, $"column does not exist: {expression.Text}");
             }
+            if (matches[0].column.LateralForbidden) throw new SqlException(SqlStates.InvalidColumnReference, "LATERAL reference requires an inner or left join");
             if (matches.Length > 1) throw new SqlException(SqlStates.AmbiguousColumn, $"ambiguous column: {expression.Text}");
             var selected = matches[0];
             var binding = selected.column.Projection is { } projection ? projection with { Collation = selected.column.Collation } : (selected.column.Outer is { } outer
@@ -299,7 +311,7 @@ if (item.Alias is not null) throw Errors.Syntax("star expansion cannot have an a
             {
                 var inner = Expr(expression.Args[0]);
                 BooleanOperand(inner);
-                return Node("not", SqlType.Boolean, inner);
+                return Node("not", SqlType.Boolean, inner) with { Text = expression.Text };
             }
             case "is_null": case "is_not_null":
                 return Node(expression.Op, SqlType.Boolean, Expr(expression.Args[0]));

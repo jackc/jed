@@ -56,6 +56,7 @@ public sealed partial class Database
             var recovered = await StorageRecovery.OpenAsync(store, token).ConfigureAwait(false);
             var pager = new StoragePager(store, recovered.Meta.PageSize, options.CacheBytes);
             var catalog = await Catalog.ReadAsync(pager, recovered.Meta, token).ConfigureAwait(false);
+            catalog = BindEnvironment(catalog, options.Environment!);
             catalog = await StorageTree.ValidateCatalogSpinesAsync(pager, catalog, recovered.Meta, token).ConfigureAwait(false);
             return new(pager, recovered, catalog, null);
         }
@@ -64,6 +65,7 @@ public sealed partial class Database
         {
             var pager = new StoragePager(store, encrypted.Meta.Header.PageSize, options.CacheBytes, encrypted.Codec);
             var catalog = await Catalog.ReadAsync(pager, encrypted.Meta, token).ConfigureAwait(false);
+            catalog = BindEnvironment(catalog, options.Environment!);
             catalog = await StorageTree.ValidateCatalogSpinesAsync(pager, catalog, encrypted.Meta.Header, token).ConfigureAwait(false);
             return new(pager, encrypted.Recovered, catalog, encrypted.KeyBlock);
         }
@@ -112,9 +114,12 @@ public sealed partial class Database
         catch (SqlException error) when (held && error.SqlState == SqlStates.DataCorrupted)
         { throw new SqlException(SqlStates.StaleKey, "database data key changed; reopen with its current credential"); }
     }
-    private static async ValueTask<Catalog> ReadServedCatalogAsync(StoragePager pager, ServedStorage served, CancellationToken token)
+    private static Catalog BindEnvironment(Catalog catalog, DatabaseEnvironment environment) => catalog.BindCollations(environment.UnicodeData, environment.TimeZones, environment);
+
+    private static async ValueTask<Catalog> ReadServedCatalogAsync(StoragePager pager, ServedStorage served, DatabaseEnvironment environment, CancellationToken token)
     {
         var catalog = served.Encrypted is { } encrypted ? await Catalog.ReadAsync(pager, encrypted, token).ConfigureAwait(false) : await Catalog.ReadAsync(pager, served.Meta, token).ConfigureAwait(false);
+        catalog = BindEnvironment(catalog, environment);
         catalog = await StorageTree.ValidateCatalogSpinesAsync(pager, catalog, served.Meta, token).ConfigureAwait(false);
         return catalog;
     }

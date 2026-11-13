@@ -12,6 +12,7 @@ internal sealed partial class SimulationRunner
         internal bool Reclaimed;
         internal Database Database = null!;
         internal string? Pending;
+        internal KeyAttempt? KeyAttempt;
         internal readonly Dictionary<ulong, HashSet<string>> History = [];
         internal void Remember(ulong version, string digest)
         {
@@ -21,6 +22,30 @@ internal sealed partial class SimulationRunner
     }
     private readonly SortedDictionary<string, AttachmentState> attached = new(Utf8NameComparer.Instance);
     private DatabaseFileOptions processOptions = null!;
+
+    private void BindCurrentAttachments()
+    {
+        var registry = database.AcquireAttachmentRegistry();
+        try
+        {
+            foreach (var item in registry)
+                if (attached.TryGetValue(item.Name, out var state)) state.Database = item.Database;
+        }
+        finally { database.ReleaseAttachmentRegistry(); }
+    }
+    private async Task AttachEverywhere(AttachmentState state)
+    {
+        var owner = roles.OwnerOf("sim.jed") ?? processes.First().Key;
+        _ = SelectServiceProcess(owner);
+        if (roles.OwnerOf("sim.jed") is null) ObserveService(await Digest());
+        foreach (var process in new[] { owner }.Concat(processes.Keys.Where(pid => pid != owner)))
+        {
+            _ = SelectServiceProcess(process);
+            if (!database.AttachedDatabases.Contains(state.Name)) await OpenAttachment(state);
+            await network.SettleAsync();
+        }
+        _ = SelectServiceProcess(owner);
+    }
 
     private async Task<string> AttachmentDigest(AttachmentState state)
     {
@@ -40,10 +65,11 @@ internal sealed partial class SimulationRunner
         if (!await fs.ExistsAsync(state.File))
         {
             await using (var created = await Database.CreateFileAsync(state.File,
-                Options() with { Credential = state.Key < 0 ? null : keys[state.Key] }, trace.PageSize)) { }
+                Options() with { Credential = state.Key < 0 ? null : keys[state.Key], RoleHost = null, Locking = FileLocking.None }, trace.PageSize)) { }
             state.Floor = 1;
         }
-        if (!database.AttachedDatabases.Contains(name)) await OpenAttachment(state);
+        if (trace.Service) await AttachEverywhere(state);
+        else if (!database.AttachedDatabases.Contains(name)) await OpenAttachment(state);
         state.Version = state.Database.Version;
         var digest = await AttachmentDigest(state);
         VerifyAttachment(state, digest);
@@ -70,7 +96,19 @@ internal sealed partial class SimulationRunner
                 SimulationStorageChecks.Require(state.Floor == 0, "durable attachment file disappeared");
                 attached.Remove(state.Name); continue;
             }
-            await OpenAttachment(state);
+            if (state.KeyAttempt is { } change) VerifyKeyAttempt(fs.Image(state.File), change);
+            var oldKey = state.Key;
+            var unlocked = false;
+            foreach (var candidate in new[] { state.Key, -1, 0, 1, 2, 3 }.Distinct())
+            {
+                if (!trace.Encrypted && candidate != -1) continue;
+                state.Key = candidate;
+                try { await OpenAttachment(state); unlocked = true; break; }
+                catch (SqlException error) when (error.SqlState is SqlStates.InvalidPassword or SqlStates.CredentialRequired or SqlStates.CredentialNotApplicable) { }
+            }
+            SimulationStorageChecks.Require(unlocked, "attachment recovery cannot unlock with an authorized key");
+            if (oldKey != state.Key || state.KeyAttempt is not null)
+            { json.Start(checked((int)fs.Step), "unlocked").Text("db", state.Name).Number("key", state.Key); Emit(); }
         }
     }
     private void VerifyAttachment(AttachmentState state, string digest)
@@ -93,21 +131,21 @@ internal sealed partial class SimulationRunner
     {
         foreach (var state in attached.Values) state.Pending = await SimulationRows.Digest(session, fs, state.Name);
     }
-    private async Task FinishAttachedCommit(Dictionary<string, StorageRecovered> before, bool quiet)
+    private async Task FinishAttachedCommit(Dictionary<string, StorageRecovered> before, Dictionary<string, ulong> acknowledged, bool quiet)
     {
         foreach (var state in attached.Values)
         {
-            var old = state.Version; state.Version = state.Database.Version;
+            var old = state.Version; state.Version = acknowledged[state.Name];
             var digest = await AttachmentDigest(state);
             SimulationStorageChecks.Require(state.Pending is null || state.Pending == digest, "attachment commit differs from pending session");
             SimulationStorageChecks.Require(old != state.Version || state.History[old].Contains(digest), "unchanged attachment commit changed contents");
             state.Remember(state.Version, digest);
             if (state.Version != old && fs.EntryDurable(state.File))
-                state.Floor = Math.Max(state.Floor, state.Database.CommittedStorageForTesting().Batch?.FloorTransactionId ?? state.Version);
-            await Oracle(() => SimulationStorageChecks.Live(state.Database));
-            if (state.Version != old) CheckGrowth(state.Database, state.File, before[state.Name], quiet, ref state.Growth, ref state.Reclaimed);
+                state.Floor = Math.Max(state.Floor, (trace.Service ? roles.DatabaseOf(state.File) ?? state.Database : state.Database).CommittedStorageForTesting().Batch?.FloorTransactionId ?? state.Version);
+            if (!trace.Service || state.Database.FileRole == "owner") await Oracle(() => SimulationStorageChecks.Live(state.Database));
+            if (state.Version != old && !trace.Service) CheckGrowth(state.Database, state.File, before[state.Name], quiet, ref state.Growth, ref state.Reclaimed);
         }
-        WriteAttachmentVersions(AttachmentVersions());
+        WriteAttachmentVersions(attached.ToDictionary(pair => pair.Key, pair => pair.Value.Version, StringComparer.Ordinal));
     }
     private void RecordAttachedAttempts()
     {
@@ -133,11 +171,11 @@ internal sealed partial class SimulationRunner
             json.Object(state.Name).Number(recovered ? "recovered" : "version", state.Version).Text("digest", digest);
             if (!summary)
             {
-                await Oracle(() => SimulationStorageChecks.Live(state.Database));
+                if (!trace.Service || state.Database.FileRole == "owner") await Oracle(() => SimulationStorageChecks.Live(state.Database));
                 var bytes = images is null ? fs.Image(state.File) : images[state.Name];
                 var checkedImage = await SimulationStorageChecks.Image(bytes, state.Version, state.Key < 0 ? null : keys[state.Key].Value);
                 json.Number("live", checkedImage.Live).Number("pages", checkedImage.Pages).Number("free", checkedImage.Free).Text("image", checkedImage.Image);
-                if (Environment.GetEnvironmentVariable("JED_SIM_OUT") is { Length: > 0 } output)
+                if (System.Environment.GetEnvironmentVariable("JED_SIM_OUT") is { Length: > 0 } output)
                     File.WriteAllBytes(Path.Combine(output, $"{Path.GetFileNameWithoutExtension(trace.Name)}.csharp-native.step{fs.Step}.{state.Name}.img"), bytes);
             }
             json.EndObject();

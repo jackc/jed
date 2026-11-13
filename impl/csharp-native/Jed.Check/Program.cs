@@ -2,12 +2,21 @@ using Jed;
 
 try
 {
+    if (args is ["performance-ready"]) { await PerformanceDiagnostics.Ready(); return 0; }
+    if (args is ["performance", var performanceInput]) { await PerformanceDiagnostics.Run(performanceInput); return 0; }
+    if (args is ["stress", var stressInput, var stressStorage]) { await StressRunner.Run(stressInput, stressStorage); return 0; }
+    if (args is ["native-api"]) { await NativeApiTests.Run(); return 0; }
+    if (args is ["host-functions"]) { await HostFunctionTests.Run(); return 0; }
+    if (args is ["environment-host", var environmentRoot]) { await EnvironmentHostTests.Run(environmentRoot); return 0; }
     if (args.Length >= 3 && args[0] == "process-actor") return await ProcessActor.Run(args.Skip(1).ToArray());
     if (args is ["test", var root])
     {
         await HostTests.Run();
         await SessionCapabilityTests.Run();
         await ParameterHostTests.Run();
+        await NativeApiTests.Run();
+        await EnvironmentHostTests.Run(root);
+        await HostFunctionTests.Run();
         await DatabaseTests.Run();
         DecimalTests.Run();
         EncodingTests.Run(root);
@@ -104,7 +113,7 @@ try
         var failures = 0; var records = 0; var skipped = 0;
         var transcript = new List<string>();
         var encrypted = args[0] == "corpus-encrypted";
-        var transcriptPath = Environment.GetEnvironmentVariable("JED_CONFORMANCE_TRANSCRIPT");
+        var transcriptPath = System.Environment.GetEnvironmentVariable("JED_CONFORMANCE_TRANSCRIPT");
         if (encrypted && string.IsNullOrEmpty(transcriptPath)) throw new ArgumentException("encrypted corpus requires JED_CONFORMANCE_TRANSCRIPT for independent comparison");
         foreach (var file in args.Skip(1))
         {

@@ -98,27 +98,28 @@ internal static partial class Corpus
         }
         var attachmentNames = File.ReadLines(file).Select(line => Regex.Match(line, "^#\\s*attach:\\s*(\\S+)\\s*$", RegexOptions.CultureInvariant)).Where(match => match.Success).Select(match => match.Groups[1].Value).ToArray();
         var sessionOptions = new SessionOptions { TimeZones = timeZones, UnicodeData = unicodeData };
-        if (fileBacked)
+        var environment = DatabaseEnvironment.Builder().WithLoadedData(unicodeData, timeZones).Build();
+        if (fileBacked && fixture is null)
         {
             await RunDisk(file, records, sessionOptions, transcript).ConfigureAwait(false);
             Console.WriteLine($"PASS {file}: {records.Count} records, reopened before every record"); return records.Count;
         }
         using var backing = fixture is not null ? new CorpusFile() : null;
-        await using var database = fixture is not null ? await OpenFixture(file, fixture, backing!.Path).ConfigureAwait(false)
-            : attachmentNames.Length == 0 ? null : await Database.CreateInMemoryAsync().ConfigureAwait(false);
+        await using var database = fixture is not null ? await OpenFixture(file, fixture, backing!.Path, environment).ConfigureAwait(false)
+            : attachmentNames.Length == 0 ? null : await Database.CreateInMemoryAsync(environment: environment).ConfigureAwait(false);
         if (database is not null) foreach (var attachment in attachmentNames) await database.AttachInMemoryAsync(attachment).ConfigureAwait(false);
         if (fixture?.ExpectedError is not null)
         {
             if (records.Count != 0) throw new InvalidDataException("fixture open-error case cannot contain SQL records");
             Console.WriteLine($"PASS {file}: 1 fixture open-error record"); return 1;
         }
-        await using var session = database is null ? new Session(sessionOptions) : database.CreateSession(sessionOptions);
+        await using var session = database is null ? new Session(sessionOptions, environment) : database.CreateSession(sessionOptions);
         foreach (var record in records)
         {
-            try { await RunRecord(session, record).ConfigureAwait(false); }
+            try { await RunRecord(session, record, transcript).ConfigureAwait(false); }
             catch (Exception error) { throw new InvalidDataException($"{file}:{record.Line}: {record.Sql}\n{error}", error); }
         }
-        Console.WriteLine($"PASS {file}: {records.Count} records");
+        Console.WriteLine($"PASS {file}: {records.Count} records" + (fileBacked ? ", retained fixture file" : ""));
         return records.Count;
     }
 
@@ -144,7 +145,7 @@ internal static partial class Corpus
         }
         return result;
     }
-    private static async Task<Database?> OpenFixture(string file, FixtureSpec fixture, string backing)
+    private static async Task<Database?> OpenFixture(string file, FixtureSpec fixture, string backing, DatabaseEnvironment environment)
     {
         var directory = new DirectoryInfo(Path.GetDirectoryName(Path.GetFullPath(file))!);
         while (directory is not null && directory.Name != "spec") directory = directory.Parent;
@@ -157,7 +158,7 @@ internal static partial class Corpus
         try
         {
             await File.WriteAllBytesAsync(backing, bytes).ConfigureAwait(false);
-            database = await Database.OpenFileAsync(backing, new() { Locking = FileLocking.None }).ConfigureAwait(false);
+            database = await Database.OpenFileAsync(backing, new() { Locking = FileLocking.None, Environment = environment }).ConfigureAwait(false);
         }
         catch (SqlException error) when (fixture.ExpectedError is not null)
         { Equal(fixture.ExpectedError, error.SqlState, "fixture open SQLSTATE"); return null; }
@@ -309,12 +310,12 @@ internal static partial class Corpus
                 if (expected[i] != actual[i] && !(fields[1][i % fields[1].Length] == 'R' && RealEqual(expected[i], actual[i])))
                     throw new InvalidDataException($"values: cell {i}: expected {expected[i]}, got {actual[i]}");
         }
-        if (transcript is not null && cost is not null)
+        if (transcript is not null && cost is not null && failure is null)
             transcript("cost", record.Sql, (rows?.Cost ?? failure?.Cost ?? 0).ToString(CultureInfo.InvariantCulture));
     }
     private static long ForcedWorkMem()
     {
-        var text = Environment.GetEnvironmentVariable("JED_CONFORMANCE_WORK_MEM");
+        var text = System.Environment.GetEnvironmentVariable("JED_CONFORMANCE_WORK_MEM");
         if (text is null) return Database.DefaultWorkMem;
         if (!long.TryParse(text, NumberStyles.None, CultureInfo.InvariantCulture, out var value))
             throw new InvalidDataException("JED_CONFORMANCE_WORK_MEM must be nonnegative bytes");

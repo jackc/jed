@@ -62,7 +62,7 @@ internal static class PointAccess
         List<byte[]>? Points(Resolved expression)
         {
             if (InvalidLeaf(expression)) return null;
-            if (expression.Op == "quantified" && expression.Args[1] is { Op: "array" } literalArray && literalArray.Type.Element != type && !(type.IsInteger() && literalArray.Args.All(arg => arg.Op == "constant" && arg.Type.IsInteger()))) return null;
+            if (expression.Op == "quantified" && expression.Args[1] is { Op: "array" } literalArray && literalArray.Type.Element != type && !(type.IsInteger() && literalArray.Args.All(AccessConstant.IntegerLiteralOrNull))) return null;
             if (expression.Op == "and")
             {
                 var a = Points(expression.Args[0]); var b = Points(expression.Args[1]);

@@ -57,6 +57,8 @@ internal static class DistinctExecution
             return left.Ordinal.CompareTo(right.Ordinal);
         });
         var unique = new List<SqlValue[]>();
+        using var hostBatch = HostBatchReplay.HasEligible(plan.Projections.Select(item => item.Expression))
+            ? meter.HostBatches.Begin(plan.Projections.Select(item => item.Expression), retained.Select(item => item.Values).ToArray()) : null;
         foreach (var row in retained)
         {
             var projected = new SqlValue[plan.Projections.Length];

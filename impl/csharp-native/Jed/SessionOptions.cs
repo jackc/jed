@@ -11,21 +11,22 @@ public sealed record SessionOptions
     public long TempBuffers { get; init; } = 32L * 1024 * 1024;
     public long MaxTempStorageBytes { get; init; } = 1024L * 1024 * 1024;
     public long MaxSqlLength { get; init; } = 1024 * 1024;
-    public Func<long>? Clock { get; init; }
-    public Func<int, byte[]>? RandomSource { get; init; }
+    internal Func<long>? Clock { get; init; }
+    internal Func<int, byte[]>? RandomSource { get; init; }
     public string TimeZone { get; init; } = "UTC";
-    public TimeZoneData? TimeZones { get; init; }
-    public UnicodeData? UnicodeData { get; init; }
+    internal TimeZoneData? TimeZones { get; init; }
+    internal UnicodeData? UnicodeData { get; init; }
     // The operating-system clock is confined to the host configuration seam.
     internal static long HostClock() => (TimeProvider.System.GetUtcNow().Ticks - DateTime.UnixEpoch.Ticks) / 10;
 }
 
-internal sealed class TemporalContext(Func<long> clock, string zone, TimeZoneData? data = null, UnicodeData? unicode = null)
+internal sealed class TemporalContext(Func<long> clock, string zone, TimeZoneData? data = null, UnicodeData? unicode = null, DatabaseEnvironment? environment = null)
 {
+    internal DatabaseEnvironment? Environment { get; } = environment;
     internal UnicodeData? Unicode { get; } = unicode;
     internal TimeZoneData? Data => data;
     internal bool UsesSessionZone { get; private set; }
-    internal TemporalContext LiteralContext() => new(clock, Zone, data, Unicode);
+    internal TemporalContext LiteralContext() => new(clock, Zone, data, Unicode, Environment);
     private long? statementMicros;
     internal string Zone { get; } = zone;
     internal long StatementMicros => statementMicros ??= ClockMicros();

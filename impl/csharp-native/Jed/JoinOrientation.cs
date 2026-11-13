@@ -19,11 +19,14 @@ internal static class JoinOrientation
         var outerCost = AccessPlan.Select(a.Table, a.Tree, a.Filter, a.Storage, meter).EstimatedCost;
         var innerCost = AccessPlan.Select(b.Table, b.Tree, b.Filter, b.Storage, meter).EstimatedCost;
         var residual = PredicatePlan.Combine(new[] { on, where }.OfType<Resolved>());
-        var work = Estimate.Add(innerCost, Estimate.Multiply(Estimate.Multiply(outerRows, innerRows), residual is null ? 0 : PredicatePlan.Nodes(residual)));
+        var filtered = Estimate.Multiply(Estimate.JoinRows(outer, inner, on), where is null ? 0 : PredicatePlan.Nodes(where));
+        var work = Estimate.Add(innerCost, Estimate.Multiply(Estimate.Multiply(outerRows, innerRows), on is null ? 0 : PredicatePlan.Nodes(on)));
+        work = Estimate.Add(work, filtered);
         var hash = HashJoinPlan.Select(authored, outer.Columns.Length, kind, outerRows, innerRows, on);
-        if (hash is not null) work = Math.Min(work, Estimate.Add(innerCost, HashJoinPlan.Work(outerRows, innerRows, hash.Types, residual)));
+        if (hash is not null) work = Math.Min(work, Estimate.Add(filtered, Estimate.Add(innerCost, HashJoinPlan.Work(outerRows, innerRows, hash.Types, on))));
         var inl = IndexNestedLoop.Select(inner, outer.Columns.Length, kind, residual);
-        if (inl is not null) work = Math.Min(work, inl.EstimateWork(outerRows, residual, meter));
+        if (inl is not null) work = Math.Min(work, Estimate.Add(inl.EstimateWork(outerRows, on, meter),
+            Estimate.Multiply(inl.EstimateRows(outerRows, on, meter), where is null ? 0 : PredicatePlan.Nodes(where))));
         return Estimate.Add(outerCost, work);
     }
     internal static PreparedRelation Restore(PreparedRelation physical, BoundColumn[] columns, int left, int right, CancellationToken token)

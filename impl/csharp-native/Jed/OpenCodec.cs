@@ -56,8 +56,8 @@ internal static class OpenCodec
             var flags = reader.Byte();
             if ((flags & 0xe0) != 0) throw StorageFormat.Corrupt("reserved range flags");
             if ((flags & 1) != 0) return SqlValue.Range(SqlRange.Empty(type));
-            SqlValue? lower = (flags & 2) != 0 ? null : StoredValues.ReadBody(ref reader, type.Element!, depth);
-            SqlValue? upper = (flags & 4) != 0 ? null : StoredValues.ReadBody(ref reader, type.Element!, depth);
+            SqlValue? lower = (flags & 2) != 0 ? (SqlValue?)null : StoredValues.ReadBody(ref reader, type.Element!, depth);
+            SqlValue? upper = (flags & 4) != 0 ? (SqlValue?)null : StoredValues.ReadBody(ref reader, type.Element!, depth);
             if (lower is { } lo && upper is { } hi)
             {
                 var order = Evaluate.Compare(lo, hi);

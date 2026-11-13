@@ -82,7 +82,7 @@ public sealed partial class Database
         try
         {
             await CopySnapshotImageAsync(snapshot, output, snapshot.Meta.TransactionId + 1, ownedCodec, keyBlock?.Block, token).ConfigureAwait(false);
-            var opened = await OpenFileStorageAsync(output, new(), ownedCodec, token).ConfigureAwait(false);
+            var opened = await OpenFileStorageAsync(output, new() { Environment = Environment }, ownedCodec, token).ConfigureAwait(false);
             lock (gate)
             {
                 Check(); pager = opened.Pager; committer = new(pager, opened.Recovered);

@@ -5,8 +5,12 @@ namespace Jed;
 internal sealed class SubqueryCell(PreparedRelation source, string mode, OuterFrame frame, int[] referencedSlots, Meter meter, bool rowValued = false)
 {
     internal ExplainNode? Plan => source.Plan;
+    internal bool PerRow { get; private set; }
+    internal void DeferMembership() { if (mode == "set") PerRow = true; }
+    internal bool OrderEvaluation { get; private set; }
+    internal void DeferOrderScalar() { if (mode == "scalar") { PerRow = true; OrderEvaluation = true; } }
     private long heldBytes;
-    internal void ReleaseConsumed() { if (IsCorrelated) { meter.Memory.Release(heldBytes); heldBytes = 0; Values.Clear(); } }
+    internal void ReleaseConsumed() { if (IsCorrelated || PerRow) { meter.Memory.Release(heldBytes); heldBytes = 0; Values.Clear(); } }
     private int[]? groupedSlots;
     internal void Group(Resolved[] keys)
     {
@@ -30,7 +34,7 @@ internal sealed class SubqueryCell(PreparedRelation source, string mode, OuterFr
     {
         if (Initialized) return;
         if (source.InitializeConstants is { } constants) await constants().ConfigureAwait(false);
-        if (IsCorrelated) return;
+        if (IsCorrelated || PerRow) return;
         await Read().ConfigureAwait(false); Initialized = true;
     }
     internal async ValueTask Execute(SqlValue[]? row)
@@ -46,6 +50,7 @@ internal sealed class SubqueryCell(PreparedRelation source, string mode, OuterFr
     }
     private async ValueTask Read()
     {
+        using var budget = meter.BeginSubquery();
         meter.Memory.Release(heldBytes); heldBytes = 0; Values.Clear();
         if (source.Initialize is { } initialize) await initialize().ConfigureAwait(false);
         await foreach (var row in source.Rows.ConfigureAwait(false))
@@ -100,6 +105,21 @@ internal static class SubqueryExecution
         Catalog catalog, Meter meter, CancellationToken cancellationToken, QueryScope? scope, List<SubqueryCell> cells)
     {
         Expression BindExpression(Expression expression) => Bind(expression, frame, database, snapshot, pending, catalog, meter, cancellationToken, scope, cells);
+        Expression BindOrder(Expression expression)
+        {
+            Resolved PerRow(Resolved value)
+            {
+                if (value.Op == "initplan" && value.Subquery is { } cell)
+                {
+                    cell.DeferOrderScalar();
+                    if (cell.PerRow) value = value with { Op = "correlated", NeedsAsync = true };
+                }
+                var arguments = value.Args.Select(PerRow).ToArray();
+                return value with { Args = arguments, NeedsAsync = value.NeedsAsync || arguments.Any(argument => argument.NeedsAsync) };
+            }
+            Expression Visit(Expression node) => node with { Binding = node.Binding is null ? null : PerRow(node.Binding), Args = node.Args.Select(Visit).ToArray() };
+            return Visit(BindExpression(expression));
+        }
         return query with
         {
             DistinctOn = query.DistinctOn?.Select(BindExpression).ToArray(),
@@ -111,7 +131,7 @@ internal static class SubqueryExecution
             }, StringComparer.Ordinal),
 
             Filter = query.Filter is null ? null : BindExpression(query.Filter),
-            Order = query.Order?.Select(order => order with { Expression = BindExpression(order.Expression) }).ToArray(),
+            Order = query.Order?.Select(order => order with { Expression = BindOrder(order.Expression) }).ToArray(),
             GroupBy = query.GroupBy?.Select(BindExpression).ToArray(), Having = query.Having is null ? null : BindExpression(query.Having)
         };
     }
@@ -129,7 +149,13 @@ internal static class SubqueryExecution
     internal static async ValueTask<SqlValue> InAsync(Resolved expression, Meter meter, SqlValue[]? row, bool correlated = false)
     {
         if (!correlated) meter.Charge(Costs.OperatorEval);
-        return Negate(Membership(await Evaluate.ExprAsync(expression.Args[0], meter, row: row).ConfigureAwait(false), expression.Subquery!.Values, meter), expression.Text == "not");
+        var cell = expression.Subquery!;
+        try
+        {
+            if (cell.PerRow && !correlated) await cell.Execute(row).ConfigureAwait(false);
+            return Negate(Membership(await Evaluate.ExprAsync(expression.Args[0], meter, row: row).ConfigureAwait(false), cell.Values, meter), expression.Text == "not");
+        }
+        finally { if (cell.PerRow) cell.ReleaseConsumed(); }
     }
     private static SqlValue Negate(SqlValue value, bool negate) => negate && !value.IsNull ? SqlValue.Boolean(!value.AsBoolean()) : value;
     private static SqlValue Membership(SqlValue left, IEnumerable<SqlValue> values, Meter meter)

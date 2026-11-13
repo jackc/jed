@@ -19,7 +19,7 @@ internal static class FileCoordinationTests
                 var incarnation = Enumerable.Range(0, 16).Select(i => (byte)i).ToArray();
                 var endpoint = bundle.SelectEndpoint(incarnation);
                 if (endpoint is null) throw new InvalidDataException("test host has no private endpoint directory");
-                var owner = new PageOwnerRecord(true, LinuxFileHost.EffectiveUid, incarnation, (uint)Environment.ProcessId, endpoint);
+                var owner = new PageOwnerRecord(true, LinuxFileHost.EffectiveUid, incarnation, (uint)System.Environment.ProcessId, endpoint);
                 await bundle.PublishOwnerAsync(owner);
                 Corpus.Equal(endpoint, bundle.ReadOwner()!.Endpoint, "atomic owner record publication");
                 Corpus.Equal(true, File.Exists(Path.Combine(path + ".lock", "protocol-v2")), "persistent protocol marker");

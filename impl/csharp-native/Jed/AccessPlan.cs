@@ -63,12 +63,12 @@ internal sealed record AccessPlan(AccessKind Kind, long EstimatedRows, long Esti
             var unknown = access.Predicate.Args.Any(arg => arg.ParameterUnbound);
             var rows = !unknown && (access.Query.IsNull || access.Strategy == 0 && access.Query.Type.Kind == SqlKind.Range && access.Query.AsRange().IsEmpty)
                 ? 0 : access.Strategy != 1 ? Estimate.Fraction(table.RowCount, "matching") : Estimate.Rows(table, storage.Catalog, access.Predicate);
-            var root = access.Index.Gist?.Root;
-            var shape = root is null ? storage.Database.IndexTree(access.Index, storage.Pending, storage.Snapshot) : null;
-            var height = root is null ? shape!.Height : Height(root);
-            var nodeCount = root?.Count ?? shape!.NodeCount;
+            // The shared structural estimator uses table shape for GiST;
+            // resident opclass nodes are execution facts, not planning inputs.
+            var height = tree.Height;
+            var nodeCount = tree.NodeCount;
             var pages = rows == 0 ? 0 : Math.Clamp(access.Strategy != 1 ? Estimate.Fraction(nodeCount, "matching") : Estimate.Rows(table, storage.Catalog, access.Predicate, nodeCount), height, nodeCount);
-            var descents = rows == 0 ? 0 : unknown || root is null ? Math.Max(0, height - 1) : Descent(root, access);
+            var descents = pages;
             var cost = Estimate.Add(Estimate.Add(pages, descents), Estimate.Multiply(rows, Estimate.Add(tree.Height + 1L, filter is null ? 0 : PredicatePlan.Nodes(filter))));
             yield return new(AccessKind.Gist, rows, pages, descents, cost, access.Predicate, access.Index, Gist: access);
         }
@@ -97,15 +97,6 @@ internal sealed record AccessPlan(AccessKind Kind, long EstimatedRows, long Esti
         foreach (var generic in KeySetShape.UnknownCandidates(table, tree, filter, storage)) yield return generic;
         yield return new(AccessKind.Full, table.RowCount, tree.NodeCount, 0, ScanCost(table.RowCount, tree.NodeCount, filter), Scan: new());
     }
-    private static int Height(GistNode node) => node.Leaf ? 1 : 1 + Height(node.Entries[0].Child!);
-    private static long Descent(GistNode node, GistAccess access)
-    {
-        if (node.Leaf) return 0;
-        long count = 1;
-        foreach (var entry in node.Entries)
-            if (entry.Bound.Matches([access.Query], [access.Strategy], false)) count = Estimate.Add(count, Descent(entry.Child!, access));
-        return count;
-    }
     internal async ValueTask Prime(CatalogTable table, StorageTree tree, QueryStorage storage, Meter meter, IReadOnlySet<int>? touched, CancellationToken token)
     {
         if (IndexSet is not null) return;
@@ -115,11 +106,13 @@ internal sealed record AccessPlan(AccessKind Kind, long EstimatedRows, long Esti
         }
         else if (Gin is not null)
         {
-            foreach (var arm in Gin.Arms) _ = await GinGather.Run(Gin.Tree, arm, meter, token).ConfigureAwait(false);
+            if (Gin.Fallback) await ChargeRange(tree, new(), meter, touched, token).ConfigureAwait(false);
+            else foreach (var arm in Gin.Arms) _ = await GinGather.Run(Gin.Tree, arm, meter, token).ConfigureAwait(false);
         }
         else if (Gist is not null)
         {
-            if (!Gist.Query.IsNull)
+            if (Gist.Fallback) await ChargeRange(tree, new(), meter, touched, token).ConfigureAwait(false);
+            else if (!Gist.Query.IsNull)
             {
                 var gist = await storage.Database.GistAsync(table, Gist.Index, storage.Pending, storage.Snapshot, token).ConfigureAwait(false);
                 _ = gist.Probe([Gist.Query], [Gist.Strategy], meter);
@@ -142,13 +135,36 @@ internal sealed record AccessPlan(AccessKind Kind, long EstimatedRows, long Esti
             meter.Charge(tree.ValueReadUnits(record, touched));
     }
     internal async IAsyncEnumerable<SqlValue[]> Rows(CatalogTable table, StorageTree tree, QueryStorage storage, Meter meter,
-        IReadOnlySet<int>? touched, [EnumeratorCancellation] CancellationToken token, bool reverse = false)
+        IReadOnlySet<int>? touched, [EnumeratorCancellation] CancellationToken token, bool reverse = false, HostScanBatch? hostBatch = null)
     {
+        if (hostBatch is not null && Ranges is null && IndexSet is null && Btree is null && Gist is null && Gin is null)
+        {
+            SqlValue[]? failedRow = null; Exception? decodeFailure = null;
+            async IAsyncEnumerable<SqlValue[]> UnmeteredRows()
+            {
+                await foreach (var record in Records(table, tree, storage, meter, touched, token, reverse, chargeRows: false).ConfigureAwait(false))
+                {
+                    SqlValue[] row;
+                    try { row = tree.DecodeDeferredRow(table, record); }
+                    catch (Exception error) { decodeFailure = error; row = failedRow = new SqlValue[0]; }
+                    yield return row;
+                    if (decodeFailure is not null) yield break;
+                }
+            }
+            await foreach (var row in HostPullWindow.Read(UnmeteredRows(), hostBatch.Roots, meter, Costs.StorageRowRead,
+                () => hostBatch.Remaining, token).ConfigureAwait(false))
+            {
+                meter.Charge(Costs.StorageRowRead); meter.Checkpoint(token);
+                if (ReferenceEquals(row, failedRow)) System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(decodeFailure!).Throw();
+                yield return row;
+            }
+            yield break;
+        }
         await foreach (var record in Records(table, tree, storage, meter, touched, token, reverse).ConfigureAwait(false))
             yield return tree.DecodeDeferredRow(table, record);
     }
     internal async IAsyncEnumerable<StorageRecord> Records(CatalogTable table, StorageTree tree, QueryStorage storage, Meter meter,
-        IReadOnlySet<int>? touched, [EnumeratorCancellation] CancellationToken token, bool reverse = false)
+        IReadOnlySet<int>? touched, [EnumeratorCancellation] CancellationToken token, bool reverse = false, bool chargeRows = true)
     {
         if (IndexSet is not null)
         {
@@ -197,7 +213,7 @@ internal sealed record AccessPlan(AccessKind Kind, long EstimatedRows, long Esti
         {
             if (range.Empty) continue;
             await foreach (var record in tree.ScanRangeAsync(range.Lower, range.LowerInclusive, range.Upper, range.UpperInclusive, reverse, token).ConfigureAwait(false))
-            { meter.Charge(Costs.StorageRowRead); meter.Checkpoint(token); yield return record; }
+            { if (chargeRows) { meter.Charge(Costs.StorageRowRead); meter.Checkpoint(token); } yield return record; }
         }
     }
 }

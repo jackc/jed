@@ -115,7 +115,7 @@ internal sealed partial class Parser
         do
         {
             var expression = Eat("*") ? Node("star", "") : Expr();
-            var alias = Eat("as") ? Name() : token.Kind == TokenKind.QuotedName || token.Kind == TokenKind.Word && !Clause(token.Text) ? Name() : null;
+            var alias = Eat("as") ? Name() : token.Kind == TokenKind.QuotedName || token.Kind == TokenKind.Word && !NoBareLabel(token.Text) ? Name() : null;
             items.Add(new(expression, alias));
         } while (Eat(","));
         IntoClause(ownsInto);
@@ -175,6 +175,7 @@ internal sealed partial class Parser
         if (Eat(".")) name = DatabaseDomains.Qualified(name, Name());
         return name;
     }
+    private static bool NoBareLabel(string value) => value is "array" or "as" or "char" or "character" or "create" or "day" or "except" or "fetch" or "filter" or "for" or "from" or "grant" or "group" or "having" or "hour" or "intersect" or "into" or "isnull" or "limit" or "minute" or "month" or "notnull" or "offset" or "on" or "order" or "over" or "overlaps" or "precision" or "returning" or "second" or "to" or "union" or "varying" or "where" or "window" or "with" or "within" or "without" or "year";
     private static bool Clause(string value) => value is "into" or "from" or "where" or "group" or "having" or "window" or "order" or "limit" or "offset" or "union" or "intersect" or "except" or "fetch" or "for" or "returning" or "on" or "join" or "cross" or "inner" or "left" or "right" or "full" or "natural" or "using";
     private (long? Value, Expression? Parameter) QueryCount(bool limit)
     {
@@ -346,7 +347,7 @@ internal sealed partial class Parser
             {
                 Take(); left = Node("cast", TypeName(), left); continue;
             }
-            if (Is("at") && minimum <= 70)
+            if (Is("at") && Peek().Text == "time" && Peek(2).Text == "zone" && minimum <= 70)
             {
                 Take(); Expect("time"); Expect("zone"); left = Node("at_time_zone", "", left, Expr(71)); continue;
             }
@@ -364,10 +365,10 @@ internal sealed partial class Parser
                     var right = Expr(41); nesting--;
                     left = Node(negate ? "not_distinct" : "distinct", "", left, right);
                 }
-                else throw Errors.Unsupported("IS predicates other than NULL/DISTINCT FROM");
+                else throw Errors.Syntax("expected IS predicate");
                 continue;
             }
-            if (minimum <= 35 && (Is("between") || Is("in") || Is("like") || Is("ilike") || Is("similar") || Is("not") && Peek().Text is "between" or "in" or "like" or "ilike" or "similar"))
+            if (minimum <= 35 && (Is("between") || Is("in") || Is("like") || Is("ilike") || Is("similar") && Peek().Text == "to" || Is("not") && Peek().Text is "between" or "in" or "like" or "ilike" or "similar"))
             {
                 var negate = Eat("not");
                 if (Eat("between"))
@@ -405,7 +406,7 @@ internal sealed partial class Parser
                     if (Eat("escape")) pattern = Node("call", "like_escape", pattern, Expr(41));
                     left = Node(matchOperation, "", left, pattern);
                 }
-                if (negate) left = left.Op == "in_subquery" ? left with { Text = "not" } : Node("not", "", left);
+                if (negate) left = left.Op == "in_subquery" ? left with { Text = "not" } : Node("not", left.Op is "like" or "ilike" or "similar" ? "predicate" : "", left);
                 continue;
             }
             var precedence = token.Kind is TokenKind.Word or TokenKind.Symbol ? token.Text switch

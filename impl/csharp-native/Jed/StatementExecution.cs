@@ -4,7 +4,13 @@ internal sealed record StatementResult(Column[] Columns, Row[] Rows, long? Affec
 
 internal static partial class StatementExecution
 {
-    internal static CatalogTable ResolveTable(Catalog catalog, string name) => catalog.Scope?.Table(name) ?? Table(catalog, name);
+    internal static CatalogTable ResolveTable(Catalog catalog, string name) => catalog.Scope?.Table(name) ?? Table(catalog, LocalMainName(name));
+    internal static string LocalMainName(string name)
+    {
+        var qualified = DatabaseDomains.Name(name);
+        if (qualified.Domain is not (null or "main")) throw new SqlException(SqlStates.UndefinedTable, "database is not attached: " + qualified.Domain);
+        return qualified.Local;
+    }
     internal static CatalogTable Table(Catalog catalog, string name) => catalog.Tables.FirstOrDefault(t => t.Name == name)
         ?? throw new SqlException(SqlStates.UndefinedTable, $"table does not exist: {name}");
     internal static BoundColumn[] Columns(CatalogTable table, string? alias = null)
@@ -67,6 +73,7 @@ internal static partial class StatementExecution
         {
             WritableCollations(Table(pending.Catalog, target), pending.Catalog);
             WritableIndexDependencies(Table(pending.Catalog, target), pending.Catalog);
+            if (statement is InsertSyntax or UpdateSyntax or MergeSyntax) WritableCheckDependencies(Table(pending.Catalog, target), pending.Catalog, meter);
         }
         switch (statement)
         {
@@ -164,8 +171,10 @@ internal static partial class StatementExecution
                     if (expressions.Length != 0 && expressions.Length != slots.Length) throw Errors.Syntax("INSERT value count differs from column count");
                     for (var i = 0; i < expressions.Length; i++) if (expressions[i].Op != "default") Assignable(Resolve.Expr(AssignmentLiteral(expressions[i], table.Columns[slots[i]].Type), table.Columns[slots[i]].Type.Type).Type, table.Columns[slots[i]].Type.Type);
                 }
-                foreach (var check in insert.ViewChecks ?? []) _ = returnBinder.Bind(check);
+                var checkBinder = new SubqueryBinder(Columns(table), database, pending.Before, readState, readState.Catalog, meter, cancellationToken, context?.Scope);
+                foreach (var check in insert.ViewChecks ?? []) _ = checkBinder.Bind(check);
                 await inputBinder.Initialize().ConfigureAwait(false);
+                await checkBinder.Initialize().ConfigureAwait(false);
                 var results = new List<Row>(); var inserted = new List<SqlValue[]>(); var exclusionRows = new List<(StorageRecord Record, SqlValue[] Values)>();
                 long nextRow = -1;
                 if (table.PrimaryKey.Length == 0)
@@ -180,7 +189,7 @@ internal static partial class StatementExecution
                         var declaration = table.Columns[column];
                         var useDefault = supplied < 0 || supplied >= expressions.Length || expressions[supplied].Op == "default" || declaration.Identity && insert.Overriding == "user";
                         if (!useDefault && declaration.IdentityAlways && insert.Overriding != "system") throw new SqlException(SqlStates.GeneratedAlways, "explicit value for GENERATED ALWAYS identity");
-                        values[column] = useDefault ? InsertDefault(insert, column, declaration, meter, pending.Catalog) : await AssignAsync(expressions[supplied], declaration.Type, [], [], meter, pending.Catalog).ConfigureAwait(false);
+                        values[column] = useDefault ? InsertDefault(insert, column, declaration, meter, pending.Catalog) : await InsertValueAsync(expressions[supplied], declaration.Type, meter, pending.Catalog).ConfigureAwait(false);
                     }
                     Validate(table, values, meter, pending.Catalog); inserted.Add(values);
                     var encoded = tree.PrepareRecord(table.EncodeRow(values, checked(++nextRow)), meter);
@@ -258,10 +267,12 @@ internal static partial class StatementExecution
                 else if (target.Value.Op != "default") Assignable(Resolve.Expr(AssignmentLiteral(Resolve.Bind(target.Value, columns), table.Columns[target.Slot].Type), table.Columns[target.Slot].Type.Type).Type, table.Columns[target.Slot].Type.Type);
         var returnBinder = new SubqueryBinder(viewBinding?.Returning ?? ReturningColumns(table, aliases), database, pending.Before, readState, readState.Catalog, meter, cancellationToken, context?.Scope);
         var returning = Returning(table, items, pending.Catalog, meter, returnBinder, aliases);
-        foreach (var check in viewChecks ?? []) _ = returnBinder.Bind(check);
+        var checkBinder = new SubqueryBinder(Columns(table), database, pending.Before, readState, readState.Catalog, meter, cancellationToken, context?.Scope);
+        foreach (var check in viewChecks ?? []) _ = checkBinder.Bind(check);
         var initializationStart = meter.Accrued;
         await binder.Initialize().ConfigureAwait(false);
         context?.MutationObservation?.Filter?.AttributeLocal(meter.Accrued - initializationStart);
+        await checkBinder.Initialize().ConfigureAwait(false);
         if (filter is not null && Resolve.EmptyFilter(filter)) return new(returning.Select(projection => new Column(projection.Name, projection.Expression.Type)).ToArray(), [], 0);
         await returnBinder.Initialize().ConfigureAwait(false);
         var results = new List<Row>();
@@ -305,6 +316,13 @@ internal static partial class StatementExecution
             await ValidatePinnedKeys(database, context, table, changes.Select(change =>
                 (table.EncodeRow(change.Values, table.PrimaryKey.Length == 0 ? KeyEncoding.ReadInteger(change.Old.Key) : 0), change.Values)),
                 changes.Select(change => Convert.ToHexString(change.Old.Key)).ToHashSet(StringComparer.Ordinal), meter, cancellationToken).ConfigureAwait(false);
+        if (targets is not null)
+            await ValidateFinalIndexKeys(database, pending, table, changes.Select(change =>
+                (table.EncodeRow(change.Values, table.PrimaryKey.Length == 0 ? KeyEncoding.ReadInteger(change.Old.Key) : 0), change.Values)),
+                changes.Select(change => Convert.ToHexString(change.Old.Key)).ToHashSet(StringComparer.Ordinal), meter, cancellationToken).ConfigureAwait(false);
+        var rekeys = targets is not null && changes.Any(change => !change.Old.Key.AsSpan().SequenceEqual(
+            table.EncodeRow(change.Values, table.PrimaryKey.Length == 0 ? KeyEncoding.ReadInteger(change.Old.Key) : 0).Key));
+        var priorRecords = new Dictionary<string, StorageRecord>(StringComparer.Ordinal);
         var removed = 0;
         var inPlace = new HashSet<string>(StringComparer.Ordinal);
         var newKeys = new HashSet<string>(StringComparer.Ordinal);
@@ -333,7 +351,8 @@ internal static partial class StatementExecution
                         !oldEntry.Record.Key.AsSpan().SequenceEqual(newEntry.Record.Key);
                 }).ToArray() };
                 changedIndexes[Convert.ToHexString(change.Old.Key)] = indexTable;
-                await RemoveIndexes(database, pending, indexTable, currentValues, meter, cancellationToken, assignments is null ? null : change.Values, replacement?.Key).ConfigureAwait(false);
+                priorRecords[Convert.ToHexString(change.Old.Key)] = currentValues;
+                if (targets is null || rekeys) await RemoveIndexes(database, pending, indexTable, currentValues, meter, cancellationToken, assignments is null ? null : change.Values, replacement?.Key).ConfigureAwait(false);
                 removed++;
             }
             context?.Move(table.Name, change.Old.Key, null);
@@ -345,7 +364,10 @@ internal static partial class StatementExecution
                 var encoded = tree.KeepUnchangedChains(tree.PrepareRecord(table.EncodeRow(change.Values, table.PrimaryKey.Length == 0 ? KeyEncoding.ReadInteger(change.Old.Key) : 0), meter), storedRows[Convert.ToHexString(change.Old.Key)], unchanged);
                 if (await tree.FindAsync(encoded.Key, cancellationToken).ConfigureAwait(false) is not null && !inPlace.Contains(Convert.ToHexString(change.Old.Key))) throw new SqlException(SqlStates.UniqueViolation, "duplicate primary key");
                 tree = await tree.UpsertAsync(encoded, cancellationToken).ConfigureAwait(false);
-                await AddIndexes(database, pending, changedIndexes.GetValueOrDefault(Convert.ToHexString(change.Old.Key), table), encoded, change.Values, meter, cancellationToken).ConfigureAwait(false);
+                var indexTable = changedIndexes.GetValueOrDefault(Convert.ToHexString(change.Old.Key), table);
+                if (!rekeys && priorRecords.TryGetValue(Convert.ToHexString(change.Old.Key), out var prior))
+                    await RemoveIndexes(database, pending, indexTable, prior, meter, cancellationToken, change.Values, encoded.Key).ConfigureAwait(false);
+                await AddIndexes(database, pending, indexTable, encoded, change.Values, meter, cancellationToken, uniqueValidated: true).ConfigureAwait(false);
                 context?.Move(table.Name, change.Old.Key, encoded.Key);
             }
         }
@@ -372,6 +394,18 @@ internal static partial class StatementExecution
         else if (type.Type == SqlType.Interval) value = SqlValue.Interval(IntervalInput.Parse(expression.Text, type.IntervalFields, type.Precision));
         else return expression;
         return new("bound", "", [], Binding: new("constant", value.Type, value, []));
+    }
+    private static async ValueTask<SqlValue> InsertValueAsync(Expression expression, TypeSpec type, Meter meter, Catalog catalog)
+    {
+        static bool LiteralFields(Expression value) => value.Op switch
+        {
+            "integer" or "decimal" or "text" or "boolean" or "null" or "parameter" => true,
+            "bound" => value.Binding?.Op == "constant",
+            "row" or "array" => value.Args.All(LiteralFields),
+            _ => false
+        };
+        using Meter.CostScope? free = expression.Op is "row" or "array" && LiteralFields(expression) ? meter.SuppressCost() : null;
+        return await AssignAsync(expression, type, [], [], meter, catalog).ConfigureAwait(false);
     }
     private static async ValueTask<SqlValue> AssignAsync(Expression expression, TypeSpec type, BoundColumn[] columns, SqlValue[] row, Meter meter, Catalog catalog)
     {
@@ -401,6 +435,8 @@ internal static partial class StatementExecution
         foreach (var check in table.Checks ?? [])
         {
             var expression = Resolve.Expr(Resolve.Bind(Resolve.BindTypes(StoredExpression(check.Expression), catalog, meter.Temporal), Columns(table)));
+            HostDependencies.Verify(check.HostDependencies, meter.Temporal.Environment);
+            HostDependencies.VerifyResolved(check.HostDependencies, expression);
             var result = Evaluate.Expr(expression, meter, row: row);
             if (!result.IsNull && !result.AsBoolean()) throw new SqlException(SqlStates.CheckViolation, $"check failed: {check.Name}");
         }

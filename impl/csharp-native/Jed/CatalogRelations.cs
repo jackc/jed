@@ -55,6 +55,20 @@ internal static class CatalogRelations
         if (type.Type.Kind is SqlKind.Timestamp or SqlKind.Timestamptz or SqlKind.Interval && type.Precision is { } temporal) name += $"({temporal})";
         return name;
     }
+    private static string IndexExpression(string text)
+    {
+        // Parentheses required by CREATE INDEX are not part of the displayed
+        // expression. Keep opaque corrupt definitions readable for diagnosis.
+        try
+        {
+            _ = Parser.ParseExpression(text);
+            var tokens = ViewTokens.Read(text);
+            while (tokens.Count >= 2 && tokens[0].Kind == TokenKind.Symbol && tokens[0].Text == "(" && ViewTokens.Close(tokens, 0) == tokens.Count - 1)
+                tokens = tokens.GetRange(1, tokens.Count - 2);
+            return ViewTokens.Render(tokens);
+        }
+        catch (SqlException) { return text; }
+    }
     private static string? Default(CatalogColumn column)
     {
         if (column.DefaultExpression is { } expression) return expression;
@@ -88,7 +102,7 @@ internal static class CatalogRelations
                 foreach (var item in tables.SelectMany(table => (table.Indexes ?? []).Select(index => (table, index))).OrderBy(item => item.index.Name, Utf8NameComparer.Instance))
                 {
                     var (table, index) = item;
-                    yield return [T(index.Name), T(table.Name), A(index.Keys.Select(key => key.Expression ?? table.Columns[key.Column].Name)), B(index.Unique), T(index.Kind switch { 0 => "btree", 1 => "gin", _ => "gist" }), T(index.Predicate), BA(index.Keys.Select(key => (key.Options & 1) != 0)), BA(index.Keys.Select(key => (key.Options & 2) != 0))];
+                    yield return [T(index.Name), T(table.Name), A(index.Keys.Select(key => key.Expression is { } expression ? IndexExpression(expression) : table.Columns[key.Column].Name)), B(index.Unique), T(index.Kind switch { 0 => "btree", 1 => "gin", _ => "gist" }), T(index.Predicate), BA(index.Keys.Select(key => (key.Options & 1) != 0)), BA(index.Keys.Select(key => (key.Options & 2) != 0))];
                 }
                 break;
             case "jed_constraints":

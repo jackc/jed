@@ -6,19 +6,28 @@ namespace Jed;
 /// <summary>Immutable host-loaded JTZ data. SQL can only consult zones already loaded here.</summary>
 public sealed class TimeZoneData
 {
-    private readonly byte[] bundle;
+    private readonly byte[]? bundle;
     private readonly Dictionary<string, TimeZoneRule> zones;
     private readonly Dictionary<string, string> links;
     public string Version { get; }
     public IReadOnlyList<string> ZoneNames { get; }
     public IReadOnlyDictionary<string, string> Links { get; }
-    private TimeZoneData(byte[] bundle, string version, Dictionary<string, TimeZoneRule> zones, Dictionary<string, string> links)
+    private TimeZoneData(byte[]? bundle, string version, Dictionary<string, TimeZoneRule> zones, Dictionary<string, string> links)
     {
         this.bundle = bundle; Version = version; this.zones = zones; this.links = links;
         ZoneNames = Array.AsReadOnly(zones.Keys.Order(StringComparer.Ordinal).ToArray());
         Links = new System.Collections.ObjectModel.ReadOnlyDictionary<string, string>(links);
     }
-    public byte[] Save() => bundle.ToArray();
+    public byte[] Save() => bundle?.ToArray() ?? throw new InvalidOperationException("an additive time-zone environment has no single source bundle");
+    public TimeZoneData Add(TimeZoneData other)
+    {
+        ArgumentNullException.ThrowIfNull(other);
+        var mergedZones = new Dictionary<string, TimeZoneRule>(zones, StringComparer.Ordinal);
+        var mergedLinks = new Dictionary<string, string>(links, StringComparer.Ordinal);
+        foreach (var (name, zone) in other.zones) if (!mergedZones.ContainsKey(name) && !mergedLinks.ContainsKey(name)) mergedZones.Add(name, zone);
+        foreach (var (name, target) in other.links) if (!mergedZones.ContainsKey(name) && !mergedLinks.ContainsKey(name)) mergedLinks.Add(name, target);
+        return new(null, Version, mergedZones, mergedLinks);
+    }
     public static TimeZoneData Load(ReadOnlySpan<byte> bytes)
     {
         try { return Read(bytes); }

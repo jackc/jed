@@ -17,6 +17,8 @@ internal static partial class StatementExecution
     private static void ValidateIndexDependencies(Resolved expression)
     {
         if (expression.Op == "row" && expression.Text == "whole_row") throw Errors.Unsupported("whole-row reference in stored index expression");
+        if (expression.HostFunction is { } host && (host.Volatility != FunctionVolatility.Immutable || string.IsNullOrEmpty(host.ComponentId)))
+            throw new SqlException(SqlStates.InvalidObjectDefinition, "index host function must be immutable and versioned");
         ValidateTemporalDependencies(expression);
         if (expression.Op == "stable_date") throw new SqlException(SqlStates.InvalidObjectDefinition, "index expression depends on statement clock");
         static bool Zoned(SqlType type) => type == SqlType.Timestamptz || type.Element is { } element && Zoned(element) || type.Fields.Any(field => Zoned(field.Type));
@@ -61,7 +63,7 @@ internal static partial class StatementExecution
             if (((key.Options & 2) != 0) != descending) presence ^= 1;
             if (presence == 1) continue;
             if (presence != 0) throw StorageFormat.Corrupt("invalid secondary key presence tag");
-            var resolved = key.Expression is { } expression ? Resolve.Expr(Resolve.Bind(Resolve.BindTypes(StoredExpression(expression), catalog, new TemporalContext(static () => throw new InvalidOperationException("stored index cannot read clock"), "UTC", data: catalog.BoundTimeZones, unicode: catalog.BoundUnicode)), Columns(table))) : null;
+            var resolved = key.Expression is { } expression ? Resolve.Expr(Resolve.Bind(Resolve.BindTypes(StoredExpression(expression), catalog, new TemporalContext(static () => throw new InvalidOperationException("stored index cannot read clock"), "UTC", data: catalog.BoundTimeZones, unicode: catalog.BoundUnicode, environment: catalog.BoundEnvironment)), Columns(table))) : null;
             var type = resolved?.Type ?? table.Columns[key.Column].Type.Type;
             position += KeyEncoding.KeyLength(entry[position..], type, descending: descending, collation: resolved?.Collation?.Table ?? key.CollationData ?? (key.Expression is null ? table.Columns[key.Column].CollationData : null));
         }
@@ -110,21 +112,39 @@ internal static partial class StatementExecution
             }
         }
     }
-    private static async ValueTask<StorageTree> AddIndexRecord(StorageTree tree, CatalogIndex index, IndexedRecord entry, CancellationToken token)
+    private static async ValueTask ValidateFinalIndexKeys(Database database, PendingDatabase pending, CatalogTable table,
+        IEnumerable<(StorageRecord Record, SqlValue[] Values)> rows, ISet<string> replaced, Meter meter, CancellationToken token)
     {
-        if (index.Unique && !entry.HasNull)
+        var candidates = rows.ToArray();
+        foreach (var index in (table.Indexes ?? []).Where(index => index.Unique))
+        {
+            var keys = new HashSet<string>(StringComparer.Ordinal);
+            var tree = database.IndexTree(index, pending, pending.Before);
+            foreach (var (record, values) in candidates)
+            {
+                if (IndexRecord(table, index, record, values, meter, pending.Catalog) is not { HasNull: false } entry) continue;
+                if (!keys.Add(Convert.ToHexString(entry.Prefix))) throw new SqlException(SqlStates.UniqueViolation, "duplicate unique key: " + index.Name);
+                await foreach (var existing in tree.ScanRangeAsync(entry.Prefix, true, PrefixEnd(entry.Prefix), false, cancellationToken: token).ConfigureAwait(false))
+                    if (!replaced.Contains(Convert.ToHexString(IndexStorageKey(table, index, existing.Key, pending.Catalog))))
+                        throw new SqlException(SqlStates.UniqueViolation, "duplicate unique key: " + index.Name);
+            }
+        }
+    }
+    private static async ValueTask<StorageTree> AddIndexRecord(StorageTree tree, CatalogIndex index, IndexedRecord entry, CancellationToken token, bool uniqueValidated = false)
+    {
+        if (index.Unique && !entry.HasNull && !uniqueValidated)
             await foreach (var existing in tree.ScanRangeAsync(entry.Prefix, true, PrefixEnd(entry.Prefix), false, cancellationToken: token).ConfigureAwait(false))
                 if (!existing.Key.AsSpan().SequenceEqual(entry.Record.Key)) throw new SqlException(SqlStates.UniqueViolation, $"duplicate unique key: {index.Name}");
         return await tree.UpsertAsync(entry.Record, token).ConfigureAwait(false);
     }
-    private static async ValueTask AddIndexes(Database database, PendingDatabase pending, CatalogTable table, StorageRecord record, SqlValue[] values, Meter meter, CancellationToken token)
+    private static async ValueTask AddIndexes(Database database, PendingDatabase pending, CatalogTable table, StorageRecord record, SqlValue[] values, Meter meter, CancellationToken token, bool uniqueValidated = false)
     {
         foreach (var index in table.Indexes ?? [])
         {
             if (index.Kind == 1) { await AddGin(database, pending, table, index, record, values, meter, token).ConfigureAwait(false); continue; }
             if (IndexRecord(table, index, record, values, meter, pending.Catalog) is not { } entry) continue;
             var tree = database.IndexTree(index, pending, pending.Before);
-            pending.IndexTrees[index.Name] = await AddIndexRecord(tree, index, entry, token).ConfigureAwait(false);
+            pending.IndexTrees[index.Name] = await AddIndexRecord(tree, index, entry, token, uniqueValidated).ConfigureAwait(false);
         }
     }
     private static async ValueTask RemoveIndexes(Database database, PendingDatabase pending, CatalogTable table, StorageRecord record, Meter meter, CancellationToken token, SqlValue[]? replacementValues = null, byte[]? replacementKey = null)
@@ -143,12 +163,25 @@ internal static partial class StatementExecution
     {
         if (index.Kind == 1) { await BuildGin(database, pending, table, index, meter, token, chargeScan).ConfigureAwait(false); return; }
         var source = database.Tree(table, pending, pending.Before);
-        if (chargeScan) { meter.Charge(await source.CountPagesAsync(token).ConfigureAwait(false)); meter.Checkpoint(); }
+        var touched = new HashSet<int>();
+        void Touch(string expression) => touched.UnionWith(PredicatePlan.Slots(Resolve.Expr(Resolve.Bind(
+            Resolve.BindTypes(StoredExpression(expression), pending.Catalog, meter.Temporal), Columns(table)))));
+        foreach (var key in index.Keys)
+            if (key.Expression is { } expression) Touch(expression); else touched.Add(key.Column);
+        if (index.Predicate is { } predicate) Touch(predicate);
+        if (chargeScan)
+        {
+            await foreach (var record in source.ScanAsync(token, () => meter.Charge(Costs.PageRead)).ConfigureAwait(false))
+                meter.Charge(source.ValueReadUnits(record, touched));
+            meter.Checkpoint();
+        }
         var records = new List<IndexedRecord>();
         await foreach (var record in source.ScanAsync(token).ConfigureAwait(false))
         {
             if (chargeScan) meter.Charge(Costs.StorageRowRead); meter.Checkpoint();
-            if (IndexRecord(table, index, record, table.DecodeRow(await source.MaterializeRecordAsync(record, token).ConfigureAwait(false)), meter, pending.Catalog) is { } entry) records.Add(entry);
+            var values = source.DecodeDeferredRow(table, record);
+            foreach (var column in touched) values[column] = await values[column].ResolveAsync(token).ConfigureAwait(false);
+            if (IndexRecord(table, index, record, values, meter, pending.Catalog) is { } entry) records.Add(entry);
         }
         records.Sort((left, right) => left.Record.Key.AsSpan().SequenceCompareTo(right.Record.Key));
         var tree = database.IndexTree(index with { Root = 0, RootTag = default, Shape = null, Gist = null }, null, pending.Before);

@@ -61,6 +61,23 @@ internal sealed partial class Parser
         } while (Eat(","));
         return new(rows.ToArray());
     }
+    private bool ParenthesizedQuery()
+    {
+        if (!Is("(")) return false;
+        var first = 1;
+        while (Peek(first).Text == "(") first++;
+        if (Peek(first).Text is not ("select" or "values" or "with")) return false;
+        var depth = 1;
+        for (var i = 1; ; i++)
+        {
+            var next = Peek(i);
+            if (next.Kind == TokenKind.End) return false;
+            if (next.Kind != TokenKind.Symbol) continue;
+            if (next.Text == "(") depth++;
+            else if (next.Text == ")" && --depth == 0)
+                return Peek(i + 1).Text is ")" or "union" or "intersect" or "except" or "order" or "limit" or "offset";
+        }
+    }
     private RelationSyntax RelationFactor()
     {
         var lateral = Eat("lateral");
@@ -68,7 +85,7 @@ internal sealed partial class Parser
         if (Eat("("))
         {
 nesting++; Depth(nesting);
-if (Is("select") || Is("values") || Is("with")) source = new DerivedRelation(Select());
+if (Is("select") || Is("values") || Is("with") || ParenthesizedQuery()) source = new DerivedRelation(Select());
 else
 {
     var group = JoinedFromRelation();

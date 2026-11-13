@@ -4,6 +4,7 @@ namespace Jed;
 
 internal sealed record GistAccess(CatalogIndex Index, SqlValue Query, byte Strategy, QueryStorage Storage, Resolved Predicate)
 {
+    internal bool Fallback => Strategy == 2 && !Query.IsNull && Query.Type.Kind == SqlKind.Range && Query.AsRange().IsEmpty;
     internal static GistAccess? Select(CatalogTable table, Resolved? filter, QueryStorage storage, Meter meter)
     => Candidates(table, filter, storage, meter).FirstOrDefault();
     internal static IEnumerable<GistAccess> Candidates(CatalogTable table, Resolved? filter, QueryStorage storage, Meter meter)
@@ -26,7 +27,6 @@ internal sealed record GistAccess(CatalogIndex Index, SqlValue Query, byte Strat
                 if (type.Kind == SqlKind.Range)
                 {
                     if (op is not ("&&" or "@>")) continue;
-                    if (op == "@>" && right.Type.Kind == SqlKind.Range && !query.IsNull && query.AsRange().IsEmpty) continue;
                     yield return new(index, query, op == "&&" ? (byte)0 : (byte)2, storage, term);
                 }
                 if (op == "=" && right.Type == type) yield return new(index, query, 1, storage, term);
@@ -42,6 +42,12 @@ internal sealed record GistAccess(CatalogIndex Index, SqlValue Query, byte Strat
     internal async IAsyncEnumerable<StorageRecord> Records(CatalogTable table, StorageTree primary, Meter meter,
         IReadOnlySet<int>? touched, [EnumeratorCancellation] CancellationToken token, bool reverse = false)
     {
+        if (Fallback)
+        {
+            var full = new AccessPlan(AccessKind.Full, table.RowCount, primary.NodeCount, 0, 0, Scan: new());
+            await foreach (var record in full.Records(table, primary, Storage, meter, touched, token, reverse).ConfigureAwait(false)) yield return record;
+            yield break;
+        }
         if (Query.IsNull || Strategy == 0 && Query.Type.Kind == SqlKind.Range && Query.AsRange().IsEmpty) yield break;
         var gist = await Storage.Database.GistAsync(table, Index, Storage.Pending, Storage.Snapshot, token).ConfigureAwait(false);
         var keys = gist.Probe([Query], [Strategy], meter);

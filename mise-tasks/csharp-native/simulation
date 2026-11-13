@@ -4,12 +4,14 @@
 #USAGE flag "--file <path>" help="Complete .sim trace; defaults to pinned ANALYZE/drop recovery regression"
 #USAGE flag "--peer" help="Compare exact transcript with independently executed pinned Go simulation"
 #USAGE flag "--no-build" help="Use an existing C# Release assembly"
+#USAGE flag "--assembly <path>" help="Explicit immutable actor DLL for --no-build sweep runs"
 require_relative "../../impl/csharp-native/Tools/tasks"
 require "tmpdir"
 file = ENV["usage_file"] || File.join(CSharpNativeTasks.baseline_spec, "conformance/sim/regress/analyze-then-drop-table.sim")
 abort "Trace must be an existing .sim file" unless File.file?(file) && file.end_with?(".sim")
 file = File.expand_path(file)
-dll = ENV["usage_no_build"] == "true" ? File.join(CSharpNativeTasks::PACKAGE, "Jed.Check/bin/Release/net11.0/Jed.Check.dll") : CSharpNativeTasks.build
+abort "--assembly requires --no-build" if ENV["usage_assembly"] && ENV["usage_no_build"] != "true"
+dll = ENV["usage_no_build"] == "true" ? ENV["usage_assembly"] || File.join(CSharpNativeTasks::PACKAGE, "Jed.Check/bin/Release/net11.0/Jed.Check.dll") : CSharpNativeTasks.build
 diagnostics = File.join(Dir.tmpdir, "jed-csharp-simulation-" + File.basename(file, ".sim"))
 FileUtils.mkdir_p(diagnostics)
 output = error = status = nil
@@ -44,6 +46,13 @@ Dir.mktmpdir("jed-csharp-sim-peer-") do |directory|
   abort "Pinned simulator failed:\n#{peer_output}\n#{peer_error}" unless peer_status.success?
   Dir.glob(File.join(directory, "*.img")).each { |image| FileUtils.cp(image, diagnostics) }
   expected = File.binread(File.join(directory, "#{File.basename(file, '.sim')}.go.jsonl"))
+  per_core = File.foreach(file).any? { |line| line.start_with?("fault read_error", "fault enospc", "fault spill_error", "corrupt") }
+  if per_core
+    File.binwrite(File.join(diagnostics, "csharp-native.jsonl"), output)
+    File.binwrite(File.join(diagnostics, "go.jsonl"), expected)
+    warn "PASS complete C#/Go intrinsic oracles; transcript comparison excluded by simulation-testing.md §6.3"
+    exit 0
+  end
   unless expected == output
     actual = File.join(diagnostics, "csharp-native.jsonl"); golden = File.join(diagnostics, "go.jsonl")
     File.binwrite(actual, output); File.binwrite(golden, expected)

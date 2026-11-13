@@ -143,8 +143,10 @@ internal static partial class StatementExecution
         var returnTable = insert.Alias is { } alias ? table with { Name = alias } : table;
         var returnBinder = new SubqueryBinder(insert.ViewBinding?.Returning ?? ReturningColumns(returnTable, insert.ReturningAliases), database, pending.Before, readState, readState.Catalog, meter, token, context?.Scope);
         var returning = Returning(returnTable, insert.Returning, pending.Catalog, meter, returnBinder, insert.ReturningAliases);
-        foreach (var check in insert.ViewChecks ?? []) _ = returnBinder.Bind(check);
+        var checkBinder = new SubqueryBinder(Columns(table), database, pending.Before, readState, readState.Catalog, meter, token, context?.Scope);
+        foreach (var check in insert.ViewChecks ?? []) _ = checkBinder.Bind(check);
         await inputBinder.Initialize().ConfigureAwait(false); await binder.Initialize().ConfigureAwait(false);
+        await checkBinder.Initialize().ConfigureAwait(false);
         var planned = new List<UpsertRow>(); var updated = new HashSet<string>(StringComparer.Ordinal);
         long rowid = -1;
         if (table.PrimaryKey.Length == 0) await foreach (var record in source.ScanAsync(token).ConfigureAwait(false)) rowid = Math.Max(rowid, KeyEncoding.ReadInteger(record.Key));
@@ -157,7 +159,7 @@ internal static partial class StatementExecution
                 var supplied = Array.IndexOf(slots, i); var column = table.Columns[i];
                 var useDefault = supplied < 0 || supplied >= expressions.Length || expressions[supplied].Op == "default" || column.Identity && insert.Overriding == "user";
                 if (!useDefault && column.IdentityAlways && insert.Overriding != "system") throw new SqlException(SqlStates.GeneratedAlways, "explicit identity value");
-                values[i] = useDefault ? InsertDefault(insert, i, column, meter, pending.Catalog) : await AssignAsync(expressions[supplied], column.Type, [], [], meter, pending.Catalog).ConfigureAwait(false);
+                values[i] = useDefault ? InsertDefault(insert, i, column, meter, pending.Catalog) : await InsertValueAsync(expressions[supplied], column.Type, meter, pending.Catalog).ConfigureAwait(false);
             }
             Validate(table, values, meter, pending.Catalog);
             var record = table.EncodeRow(values, checked(rowid + 1));
@@ -203,6 +205,10 @@ internal static partial class StatementExecution
         planned = planned.OrderBy(row => row.Old is null ? 0 : 1).ToList();
         await ValidatePinnedKeys(database, context, table, planned.Select(row => (row.Record, row.Values)),
             planned.Where(row => row.Old is not null).Select(row => Convert.ToHexString(row.Old!.Key)).ToHashSet(StringComparer.Ordinal), meter, token).ConfigureAwait(false);
+        await ValidateFinalIndexKeys(database, pending, table, planned.Select(row => (row.Record, row.Values)),
+            planned.Where(row => row.Old is not null).Select(row => Convert.ToHexString(row.Old!.Key)).ToHashSet(StringComparer.Ordinal), meter, token).ConfigureAwait(false);
+        var rekeys = planned.Any(row => row.Old is not null && !row.Old.Key.AsSpan().SequenceEqual(row.Record.Key));
+        var priorRecords = new Dictionary<string, StorageRecord>(StringComparer.Ordinal);
         var tree = source;
         var removed = 0;
         var inPlace = new HashSet<string>(StringComparer.Ordinal);
@@ -229,7 +235,8 @@ internal static partial class StatementExecution
                         !oldEntry.Record.Key.AsSpan().SequenceEqual(newEntry.Record.Key);
                 }).ToArray() };
                 changedIndexes[Convert.ToHexString(row.Old!.Key)] = indexTable;
-                await RemoveIndexes(database, pending, indexTable, materialized, meter, token, row.Values, row.Record.Key).ConfigureAwait(false);
+                priorRecords[Convert.ToHexString(row.Old!.Key)] = materialized;
+                if (rekeys) await RemoveIndexes(database, pending, indexTable, materialized, meter, token, row.Values, row.Record.Key).ConfigureAwait(false);
                 removed++;
             }
             context?.Move(table.Name, row.Old!.Key, null);
@@ -239,7 +246,10 @@ internal static partial class StatementExecution
             if (await tree.FindAsync(row.Record.Key, token).ConfigureAwait(false) is not null &&
                 (row.Old is null || !inPlace.Contains(Convert.ToHexString(row.Old.Key)))) throw new SqlException(SqlStates.UniqueViolation, "duplicate primary key");
             tree = await tree.UpsertAsync(tree.PrepareRecord(row.Record, meter), token).ConfigureAwait(false);
-            await AddIndexes(database, pending, row.Old is null ? table : changedIndexes.GetValueOrDefault(Convert.ToHexString(row.Old.Key), table), row.Record, row.Values, meter, token).ConfigureAwait(false);
+            var indexTable = row.Old is null ? table : changedIndexes.GetValueOrDefault(Convert.ToHexString(row.Old.Key), table);
+            if (!rekeys && row.Old is not null && priorRecords.TryGetValue(Convert.ToHexString(row.Old.Key), out var prior))
+                await RemoveIndexes(database, pending, indexTable, prior, meter, token, row.Values, row.Record.Key).ConfigureAwait(false);
+            await AddIndexes(database, pending, indexTable, row.Record, row.Values, meter, token, uniqueValidated: true).ConfigureAwait(false);
             if (row.Old is not null) context?.Move(table.Name, row.Old.Key, row.Record.Key);
         }
         if (planned.Count != 0) { Put(pending, table with { RowCount = checked(table.RowCount - removed + planned.Count) }, tree); StaleStatistics(pending, table.Name); }

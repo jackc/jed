@@ -15,7 +15,7 @@ internal static partial class Estimate
         }
         if (plan.Group is { } group)
         {
-            rows = group.Sets is null ? Groups(group.Keys.Length) : group.Sets.Aggregate(0L, (sum, set) => Add(sum, Groups(set.Length)));
+            rows = group.Sets is null ? Groups(group.Keys.Length) : Multiply(Groups(group.Keys.Length), group.Sets.Length);
             rows = Rows(rows, group.Having);
         }
         if (plan.Distinct) rows = Groups(plan.DistinctOnCount == 0 ? plan.Projections.Length : plan.DistinctOnCount);

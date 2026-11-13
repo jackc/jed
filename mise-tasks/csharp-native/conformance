@@ -4,11 +4,13 @@
 #USAGE flag "--disk" help="Reopen a native file handle before every record"
 #USAGE flag "--encrypted" help="Use encrypted disk records and write a cost/EXPLAIN transcript for peer comparison"
 #USAGE flag "--no-build" help="Use an existing Release assembly"
+#USAGE flag "--variant <name>" default="jit" help="jit, jit-runtime-async, aot, or aot-runtime-async (publish AOT first)"
 #USAGE flag "--all" help="Attempt every pinned SQL corpus file (incomplete experiment will fail)"
 #USAGE flag "--suite <name>" help="One directory of complete frozen corpus files"
 #USAGE flag "--match <pattern>" help="Complete frozen files whose basenames match this glob"
 #USAGE flag "--file <path>" help="One complete .test file; default is the shared scalar foundation supplement"
 require_relative "../../impl/csharp-native/Tools/tasks"
+require "tmpdir"
 files = ENV["usage_file"] ? [ENV.fetch("usage_file")] : []
 suite = ENV["usage_suite"]
 pattern = ENV["usage_match"]
@@ -32,8 +34,31 @@ abort "Every selected file must exist and end in .test" unless files.all? { |f| 
 encrypted = ENV["usage_encrypted"] == "true"
 ENV["JED_CONFORMANCE_TRANSCRIPT"] ||= File.join(CSharpNativeTasks::BUILD, "conformance-encrypted.tsv") if encrypted
 mode = encrypted ? "corpus-encrypted" : ENV["usage_disk"] == "true" ? "corpus-file" : "corpus"
-if ENV["usage_no_build"] == "true"
-  CSharpNativeTasks.run(File.join(CSharpNativeTasks::PACKAGE, "Jed.Check/bin/Release/net11.0/Jed.Check.dll"), mode, *files)
+variant = ENV.fetch("usage_variant", "jit")
+abort "Unknown variant" unless %w[jit jit-runtime-async aot aot-runtime-async].include?(variant)
+if variant.start_with?("aot")
+  actor = File.join(CSharpNativeTasks::BUILD, "aot", variant == "aot" ? "default" : "runtime-async", "Jed.Check")
+elsif ENV["usage_no_build"] == "true"
+  actor = File.join(CSharpNativeTasks::PACKAGE, "Jed.Check/bin/Release/net11.0/Jed.Check.dll")
 else
-  CSharpNativeTasks.check(mode, *files)
+  actor = CSharpNativeTasks.build(runtime_async: variant == "jit-runtime-async")
 end
+abort "Build/publish the selected variant first" unless File.file?(actor)
+metadata = File.join(File.dirname(actor), "build.json")
+abort "Rebuild/publish to record compilation settings" unless File.file?(metadata)
+build = JSON.parse(File.read(metadata))
+abort "Actor async compilation differs from selected variant" unless build.fetch("runtime_async") == variant.end_with?("runtime-async")
+source = File.dirname(actor)
+capture = Dir.mktmpdir("conformance-actor-", CSharpNativeTasks::BUILD)
+hashes = Dir.glob(File.join(source, "*")).select { File.file?(_1) }.to_h { |path| [File.basename(path), Digest::SHA256.file(path).hexdigest] }
+hashes.each_key { |name| FileUtils.cp(File.join(source, name), File.join(capture, name)) }
+hashes.each do |name, hash|
+  abort "Conformance actor changed during capture" unless Digest::SHA256.file(File.join(source, name)).hexdigest == hash && Digest::SHA256.file(File.join(capture, name)).hexdigest == hash
+end
+File.write(File.join(capture, "artifacts.json"), JSON.pretty_generate(hashes) + "\n")
+actor = File.join(capture, File.basename(actor))
+puts "Conformance variant #{variant}; source SHA-256: #{build.fetch('source_sha256')}"
+puts "Immutable conformance actor: #{capture}"
+$stdout.flush
+exec(actor, mode, *files) if variant.start_with?("aot")
+CSharpNativeTasks.run(actor, mode, *files)

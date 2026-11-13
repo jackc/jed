@@ -9,7 +9,7 @@ internal static partial class Corpus
         using var backing = new CorpusFile();
         using var credential = transcript is null ? null : DatabaseCredential.FromKey(Enumerable.Repeat((byte)0x4a, 32).ToArray());
         var options = new DatabaseFileOptions { Locking = FileLocking.None,
-            Credential = credential };
+            Credential = credential, Environment = DatabaseEnvironment.Builder().WithLoadedData(sessionOptions.UnicodeData, sessionOptions.TimeZones).Build() };
         await using (var initial = await Database.CreateFileAsync(backing.Path, options).ConfigureAwait(false)) { }
         long storageLimit = 0;
         foreach (var record in records)

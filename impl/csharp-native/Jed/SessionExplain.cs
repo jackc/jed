@@ -11,7 +11,7 @@ public sealed partial class Session
         await using var pin = readTransaction?.Retain() ?? await db.PinAsync(token).ConfigureAwait(false);
         if (transaction is not null) db.CheckPendingRole(transaction);
         readTransaction?.CheckRole();
-        var catalog = (transaction?.Catalog ?? readTransaction?.Snapshot.Catalog ?? pin.Snapshot.Catalog).BindCollations(outerMeter.Unicode, outerMeter.Temporal.Data);
+        var catalog = (transaction?.Catalog ?? readTransaction?.Snapshot.Catalog ?? pin.Snapshot.Catalog).BindCollations(outerMeter.Unicode, outerMeter.Temporal.Data, outerMeter.Temporal.Environment);
         StatementExecution.ValidateCatalogTarget(syntax.Inner);
         CheckPrivileges(syntax.Inner, catalog);
         var writes = syntax.Analyze && ExplainExecution.Writes(syntax.Inner, catalog);
@@ -22,7 +22,7 @@ public sealed partial class Session
         try
         {
             var snapshot = pending?.Before ?? readTransaction?.Snapshot ?? pin.Snapshot;
-            catalog = (pending?.Catalog ?? catalog).BindCollations(outerMeter.Unicode, outerMeter.Temporal.Data);
+            catalog = (pending?.Catalog ?? catalog).BindCollations(outerMeter.Unicode, outerMeter.Temporal.Data, outerMeter.Temporal.Environment);
             if (writes) pending!.Catalog = catalog;
             var innerMeter = new Meter(this, limit, token, queryOptions);
             innerMeter.Sequences.Bind(catalog, pending);

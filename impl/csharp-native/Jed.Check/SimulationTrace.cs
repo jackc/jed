@@ -4,7 +4,7 @@ internal sealed record SimulationStep(int Index, int Line, string Operation, str
 
 internal sealed record SimulationTrace(string Name, ulong Seed, int PageSize, long CacheBytes, long Clock,
     int Sector, string Synchronous, long FlushIntervalMilliseconds, long WorkMemory, long TempBuffers,
-    long MaxQueryMemory, long MaxStorage, bool Encrypted, SimulationStep[] Steps)
+    long MaxQueryMemory, long MaxStorage, bool Encrypted, bool Service, SimulationStep[] Steps)
 {
     internal static SimulationTrace Read(string path)
     {
@@ -22,7 +22,7 @@ internal sealed record SimulationTrace(string Name, ulong Seed, int PageSize, lo
                 {
                     var key = text[1..colon].Trim();
                     if (key is "format" or "profile" or "seed" or "page_size" or "cache_bytes" or "clock" or "sector" or "synchronous" or
-                        "flush_interval_ms" or "work_mem" or "temp_buffers" or "max_query_memory_bytes" or "max_storage_bytes" or "encrypted")
+                        "flush_interval_ms" or "work_mem" or "temp_buffers" or "max_query_memory_bytes" or "max_storage_bytes" or "encrypted" or "processes")
                     {
                         if (!settings.TryAdd(key, text[(colon + 1)..].Trim())) throw Invalid(line, "duplicate header " + key);
                     }
@@ -58,7 +58,7 @@ internal sealed record SimulationTrace(string Name, ulong Seed, int PageSize, lo
         return new(Path.GetFileName(path), settings.TryGetValue("seed", out var seed) ? ulong.Parse(seed, CultureInfo.InvariantCulture) : 1,
             pageSize, Number("cache_bytes", 0), Number("clock", 1700000000000000), sector, synchronous,
             Number("flush_interval_ms", 0), Number("work_mem", 0), Number("temp_buffers", 0), Number("max_query_memory_bytes", 0),
-            Number("max_storage_bytes", 0), Number("encrypted", 0) == 1, steps.ToArray());
+            Number("max_storage_bytes", 0), Number("encrypted", 0) == 1, settings.GetValueOrDefault("processes") == "service", steps.ToArray());
 
         InvalidDataException Invalid(int line, string message) => new($"{path}:{line + 1}: {message}");
     }

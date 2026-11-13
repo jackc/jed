@@ -69,6 +69,7 @@ internal static partial class StatementExecution
             QueryColumnType(create.Query, column, i, pending.Catalog))).ToArray();
         for (var i = 0; i < columns.Length; i++)
         {
+            columns[i] = columns[i] with { IntervalFields = columns[i].Type.IntervalFields };
             if (CollationRules.Collatable(columns[i].Type.Type)) CollationRules.Require(query.Columns[i].Collation);
             columns[i] = ColumnCollation(pending, columns[i], query.Columns[i].Collation?.Name, meter);
         }

@@ -1,0 +1,81 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#MISE description="Explicit opt-in: complete pinned saved or generated simulation traces with exact independent Go comparison"
+#USAGE flag "--no-build" help="Capture an existing C# Release assembly"
+#USAGE flag "--assembly <path>" help="Explicit immutable actor DLL for --no-build sweep runs"
+#USAGE flag "--regress" help="Run every saved baseline regression instead of generated profiles"
+#USAGE flag "--profile <profile>" default="all" help="Pinned profile name or all"
+#USAGE flag "--seeds <seeds>" default="1" help="Unsigned seed or inclusive range, for example 1..8"
+#USAGE flag "--steps <steps>" help="Explicit diagnostic trace length; default preserves each canonical profile length"
+require_relative "../../impl/csharp-native/Tools/peer_actors"
+require_relative "../../scripts/lib/bundle_setup"
+require "tmpdir"
+
+policy_paths = %w[mise-tasks/csharp-native/simulation mise-tasks/csharp-native/simulation-sweep].map { File.join(CSharpNativeTasks::ROOT, _1) }
+policy_hashes = policy_paths.to_h { |path| [path, Digest::SHA256.file(path).hexdigest] }
+check_policy = -> { abort "Simulation tooling changed during the sweep; rerun for stable evidence" unless policy_hashes.all? { |path, hash| Digest::SHA256.file(path).hexdigest == hash } }
+
+revision = CSharpNativeTasks::BASELINE.fetch("semantic_revision")
+peers = CSharpPeerActors.root
+generator = File.join(peers, "scripts/sim_gen.rb")
+unless File.file?(generator)
+  statuses = Open3.pipeline(["git", "archive", revision, "scripts/sim_gen.rb", "scripts/lib", { chdir: CSharpNativeTasks::ROOT }], ["tar", "-x", "-C", peers])
+  abort "Cannot extract frozen trace generator" unless statuses.all?(&:success?)
+end
+# The pinned generator uses the same bootstrap; avoid loading two DevPaths modules.
+$LOADED_FEATURES << File.join(peers, "scripts/lib/bundle_setup.rb")
+require generator
+output = Dir.mktmpdir("jed-csharp-simulation-sweep-")
+warn "Simulation sweep evidence: #{output}"
+seed_text = ENV.fetch("usage_seeds", "1")
+abort "Seeds must be an unsigned integer or inclusive range" unless seed_text.match?(/\A\d+(?:\.\.\d+)?\z/)
+first, last = seed_text.split("..").map { Integer(_1) }; last ||= first
+abort "Invalid seed range" unless first <= last && last <= 0xffff_ffff_ffff_ffff && last - first < 10000
+seeds = (first..last).to_a
+selected = ENV.fetch("usage_profile", "all")
+selected = selected == "all" ? SimGen.profile_names : [selected]
+abort "Unknown pinned profile" unless (selected - SimGen.profile_names).empty?
+steps = ENV["usage_steps"] && Integer(ENV["usage_steps"])
+abort "Steps must be positive" if steps && steps <= 0
+traces = if ENV["usage_regress"] == "true"
+           Dir.glob(File.join(peers, "spec/conformance/sim/regress/*.sim")).sort
+         else
+           directory = File.join(output, "traces"); FileUtils.mkdir_p(directory)
+           selected.product(seeds).map do |profile, seed|
+             path = File.join(directory, "#{profile}-#{seed}.sim")
+             File.write(path, SimGen.generate(profile, seed, steps: steps)); path
+           end
+         end
+abort "No complete traces selected" if traces.empty?
+abort "--assembly requires --no-build" if ENV["usage_assembly"] && ENV["usage_no_build"] != "true"
+dll = ENV["usage_no_build"] == "true" ? ENV["usage_assembly"] || File.join(CSharpNativeTasks::PACKAGE, "Jed.Check/bin/Release/net11.0/Jed.Check.dll") : CSharpNativeTasks.build
+actor = File.join(output, "actor"); FileUtils.mkdir_p(actor)
+source = File.dirname(dll)
+hashes = Dir.glob(File.join(source, "*")).select { File.file?(_1) }.to_h { |path| [File.basename(path), Digest::SHA256.file(path).hexdigest] }
+hashes.each_key { |name| FileUtils.cp(File.join(source, name), File.join(actor, name)) }
+hashes.each { |name, hash| abort "Simulation actor changed during capture" unless Digest::SHA256.file(File.join(source, name)).hexdigest == hash && Digest::SHA256.file(File.join(actor, name)).hexdigest == hash }
+manifest = { baseline: revision, generator_sha256: Digest::SHA256.file(generator).hexdigest,
+  artifacts: hashes, tool_policy_sha256: policy_hashes, profile_names: selected, seeds: seeds, steps_override: steps,
+  traces: traces.to_h { |path| [File.basename(path), Digest::SHA256.file(path).hexdigest] } }
+File.write(File.join(output, "manifest.json"), JSON.pretty_generate(manifest) + "\n")
+results = traces.map do |path|
+  check_policy.call
+  log = File.join(output, File.basename(path, ".sim") + ".log")
+  progress = log + ".progress"
+  command = ["timeout", "180", "mise", "run", "csharp-native:simulation", "--no-build", "--assembly", File.join(actor, "Jed.Check.dll"), "--file", path, "--peer"]
+  passed = system({ "JED_SIM_PROGRESS" => progress }, *command, out: log, err: [:child, :out])
+  status = $?&.exitstatus
+  check_policy.call
+  mode = File.foreach(path).any? { |line| line.start_with?("fault read_error", "fault enospc", "fault spill_error", "corrupt") } ? "intrinsic" : "exact"
+  row = { trace: File.basename(path), pass: passed, mode: mode, status: status, log: log }
+  puts "#{passed ? 'PASS' : 'FAIL'} #{mode} complete simulation #{File.basename(path)}"
+  row
+end
+check_policy.call
+File.write(File.join(output, "results.json"), JSON.pretty_generate(results) + "\n")
+puts "Simulation sweep: #{results.count { _1[:pass] }}/#{results.length} complete peer-oracle traces passed"
+%w[exact intrinsic].each do |mode|
+  selected_results = results.select { _1[:mode] == mode }
+  puts "  #{mode}: #{selected_results.count { _1[:pass] }}/#{selected_results.length}"
+end
+exit(results.all? { _1[:pass] } ? 0 : 1)

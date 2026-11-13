@@ -1,7 +1,7 @@
 # C# experiment cryptographic provider audit
 
 Status: **provider approved; experimental encrypted file and page-service integration verified on
-Linux x86-64; acceptance and security review incomplete** (2026-11-12).
+Linux x86-64; scoped implementation review complete, final simulation acceptance in progress** (2026-11-13).
 This records the implemented boundary and its evidence, not production approval or full-core parity.
 Swift's swift-crypto/reference-Argon2 approval does not authorize a C# package.
 
@@ -65,7 +65,11 @@ shared encrypted files (309 body pages) decrypt and reseal exactly, including
 meta and key-block handling. A substitute provider or extra package requires another
 approval; ordinary implementation choices do not.
 
-## Storage and host integration evidence
+## Historical storage and host integration evidence
+
+The following records preserve their original source hashes. Later complete acceptance
+results in the current review section supersede the dated coverage gaps; they do not
+retroactively attribute later code to an earlier run.
 
 The experimental file API creates and opens encrypted databases with a host key or passphrase
 credential. The page codec is integrated through catalog chains, table and index root pointers,
@@ -232,30 +236,109 @@ The comparison is reproducible with `csharp-native:conformance-peer`; its diagno
 `/tmp/jed-csharp-process-all-latest.log`, `/tmp/jed-csharp-full-disk-first.log` and
 `/tmp/jed-csharp-full-encrypted-first.log`; rerun through the corresponding opt-in mise tasks.
 
-## Remaining acceptance gates
+## Later integration evidence
 
-The full host suite subsequently passed at
-`db0ab23f0e9fced13fca929bd46b5319bf30d595699b10e1108d3d40833ed9a1`
-(`/tmp/jed-csharp-growth-host.log`). This includes geometric file preallocation with
-durably written zeros, Linux `fdatasync` commit barriers, and simulation invariants
-for inode identity across rename and per-step write-issue decisions. The complete
-encrypted rekey regression executes with its structural/durability oracles and is
-self-deterministic. At
-`dced2ab0e08dea734e1c53be66cfdab1d15c541db57ba4a93105c4407ca59ae4`,
-all its physical image hashes, recovered generations, rows, live/page/free counts
-match the pinned peer through all 403 steps (indices 0–402). Two SQL cost events
-still differ: ANALYZE at step 335 and ALTER TABLE at step 372. It is therefore not
-yet an exact-transcript pass. The complete separator-overflow regression passes
-exactly at that same source; logs are `/tmp/jed-csharp-sim-encrypted-self-pin.log`
-and `/tmp/jed-csharp-sim-reclaim-self-pin.log`.
+The full host suite passed again at
+`3b092099519185655eac42c9e9527bcc05cdc50e9f9b77854d9bbc2338afdfa9`,
+including deterministic stream-backed page-service ownership, real independent client
+engines, disconnect/reconnect, owner death and client promotion. The complete encrypted
+rekey regression now matches the pinned Go transcript exactly through all 403 steps
+(indices 0–402): SQL costs, rows/errors, credential events, recovered generations,
+physical image hashes and live/page/free counts. The earlier ANALYZE and ALTER cost
+mismatches were duplicated overflow-read charges and are fixed. The diagnostic log is
+`/tmp/jed-csharp-sim-encrypted-complete-final.log`.
 
-Complete operator spill integration, cross-core relaxed service coverage and the full simulation/fault
-matrix remain incomplete. Single-process regression passes do not cover attachment/service scheduling,
-all corruption cases or every crash profile. Full SQL parity, resolution of the encrypted transcript differences,
-current full-engine NativeAOT verification and performance measurements remain separate experiment
-gates; the earlier frozen checkpoint's NativeAOT pass does not cover these later changes.
+All three complete relaxed attachment regressions also match the pinned peer exactly:
+`relaxed-attachments-close-order`, `relaxed-floor-unsynced-compaction-rename` and
+`relaxed-deadline-flush`. Their checks cover independent domain histories and durability
+floors, named attachment close order, deadline rollover, and rename recovery. The first
+two passed at `64a2f99b975f6c6ce6497ad72aa78f2bfd62b88560c68924da7ffcf98ee1dfef`;
+the deadline trace passed at
+`ba940a7942942b8ae7d4ba5ea9a95c9c9e17565e32ed3fb9ee311286f83107bd`.
+
+The injected service adapter uses the production protocol-v2 server, client and role
+driver over deterministic byte streams. Complete exact peer passes include
+`encryption-service-reconnect-keeps-held-key`, `encryption-service-promote-after-rekey`,
+and `encryption-service-backup-current-key-block`: held-key reconnection, stale-key
+promotion rejection, and byte-identical backup using the owner's current key block.
+The relaxed `service-backup-after-owner-lost` trace also passes exactly, including
+recovery below the previous visible generation while respecting the durable floor.
+These passes do not establish the full service scheduling/fault matrix. Larger service
+and attachment traces, corruption scenarios and every crash profile remain in progress.
+
+At `8ab08af3506006c732f6a9482270c307b3d073051aab1eeb903b297c8396e5ff`,
+the complete 304-step `service-owner-and-clients` trace matches the pinned Go transcript
+exactly, including owner maintenance generations, frame disconnects, promotion, physical
+image hashes and SQL costs. `service-owner-lost-unstabilized-generation` also passes
+exactly: an adopted generation can be lost back to the durable floor when its next
+stabilization barrier fails. Logs are `/tmp/jed-csharp-sim-service-owner-final.log` and
+`/tmp/jed-csharp-sim-service-unstable-first.log`. Full host tests subsequently pass at
+`18fab9fa08242d9375cf510a5fe94e5f561ba5ef0f32a7d56ed8c312b9a1df2f`,
+including failed promotion cleanup: a stale held key releases ownership on each failed
+attempt, allowing a fresh credential to become owner. These checks still leave the
+larger service-backup and service-attachment histories open.
+
+Full SQL parity, complete operator spill integration, current full-engine NativeAOT
+verification and performance measurements remain separate experiment gates; the earlier
+frozen checkpoint's NativeAOT pass does not cover these later changes.
 
 Secret erasure and constant-time behavior still require explicit security analysis. Owned temporary
 secrets are cleared on cleanup paths, but managed copies, provider scratch state and exceptional
 provider exits prevent a complete erasure claim. Serial Argon2 lanes and safe API use do not establish
 constant-time behavior. Other operating systems and architectures remain unverified.
+
+## Current scoped security review and acceptance boundary
+
+The implementation review covers `CryptoProvider.cs`, `StorageCryptoKeys.cs`,
+`StorageCryptoPages.cs`, `StorageCryptoRecovery.cs`, encrypted scratch, credential
+maintenance, recovery and the injected entropy/environment ownership paths. It finds:
+
+- AES block operations, GCM and HKDF remain behind BCL safe APIs. The only package
+  calls are SHA-224 and Argon2id. XAES is the specified derivation and framing glue;
+  there is no handwritten block cipher, authentication primitive or unsafe engine code.
+- Bound authentication tags use `CryptographicOperations.FixedTimeEquals`, including
+  cached-page admission. GCM tag failure returns no plaintext; temporary output is
+  cleared on failure. Metadata authentication failure cannot silently select an older
+  generation after a complete candidate was selected.
+- Argon2id untrusted parameters are range-checked before provider allocation. No
+  TaskFactory is supplied. The managed and AVX2 helper paths have identical shared
+  vector evidence; that does not establish identical execution time.
+- Owned credentials, data keys, derived keys and decrypt scratch are cleared in
+  disposal/finally paths. Caller credentials are copied, and a handle's retained key
+  lifetime is independent of the caller disposing its credential. Failed role
+  promotion releases the exclusive claim and owned opening resources.
+- The immutable `DatabaseEnvironment` separates SQL randomness from key entropy.
+  Each open/create obtains its own key stream from the environment factory. The
+  explicitly insecure seeded factory exists for reproducible fixtures only; default
+  sources use operating-system randomness. Attachments and temp domains share the
+  handle's environment. Scratch encryption has independently owned ephemeral keys.
+
+This is a scoped source and failure-path review, not an independent cryptographic
+certification. BCL/provider internals, managed copies, JIT/AOT register or stack
+spills, and exceptional Argon2 provider exits prevent a complete secret-erasure
+claim. Argon2id includes data-dependent accesses by design; safe APIs, serial lanes
+and fixed-time tag comparison do not justify a blanket constant-time claim. No
+whole-engine memory bound or production approval follows from this review.
+
+The complete real-process matrix subsequently passes **496/496** ordered pairings
+across C#, Go, Rust and Node, including plaintext/encrypted service and backup image
+comparison. Threaded stress passes C# memory, plaintext and encrypted file hosts plus
+Go with 16,000 reader checks and identical final checksum. Artifact hashes and logs
+are retained in `impl/csharp-native/VERIFICATION.md`.
+
+Current whole-engine JIT and NativeAOT host checks pass at the parent-coordinated
+capture18, including the immutable environment and native host API. The same capture's
+NativeAOT memory corpus passes all 761 eligible files (21,954 records; two declared
+exclusions), and all 676 eligible encrypted files pass exact independent Go
+cost/EXPLAIN transcript comparison (2,761 events). The experiment verification
+record owns the full capture hash and commands. These results supersede earlier
+statements that current NativeAOT or full encrypted SQL coverage had not been run.
+
+Final deterministic simulation acceptance remains open: capture20 saved coverage is
+19/19 complete exact traces. Generated seed-one coverage is 19/22 profiles
+(16/19 exact and 3/3 intrinsic); the remaining encrypted attachment, replay and
+service cases are under correction. Exact peer comparison and intrinsic per-core
+fault oracles are reported separately under the canonical policy.
+The tooling records and checks its own policy hashes so one accepted sweep cannot
+silently span a policy change. Other operating systems and architectures remain
+unverified; promotion and production delivery still require a separate decision.

@@ -65,7 +65,12 @@ internal static partial class StatementExecution
     internal static StatementSyntax RewriteView(Database database, PendingDatabase pending, StatementSyntax statement, CatalogView view, Meter meter, CancellationToken token)
     {
         var kind = statement is InsertSyntax ? "insert" : statement is UpdateSyntax or MergeSyntax ? "update" : "delete";
-        var plan = PlanViewWrite(database, pending, view, kind, meter, token);
+        // A rewritten predicate can retain correlated subqueries until rows are
+        // checked. Freeze every domain, not just the target's pending tree.
+        var frozen = pending.Catalog.Scope is { } domains
+            ? DomainExecution.ReadPending(domains.Fork(), domains.Items.First(domain => ReferenceEquals(domain.Database, database)).Name)
+            : pending.Fork();
+        var plan = PlanViewWrite(database, frozen, view, kind, meter, token);
         var baseName = plan.Table.Domain is { } home ? DatabaseDomains.Qualified(home.Name, plan.Table.Name) : plan.Table.Name;
         var label = statement switch { InsertSyntax { Alias: { } alias } => alias, MergeSyntax { Alias: { } alias } => alias, _ => view.Name };
         var viewColumns = view.Columns.Select((column, i) => new BoundColumn(column.Name, plan.Projection[i].Type, label, Collation: plan.Projection[i].Collation, WholeRow: false)).ToArray();

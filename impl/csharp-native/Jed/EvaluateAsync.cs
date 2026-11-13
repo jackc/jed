@@ -25,7 +25,14 @@ internal static partial class Evaluate
             var input = await ExprAsync(expression.Args[0], meter, row: row).ConfigureAwait(false);
             return LiteralMembership(expression, input, meter);
         }
-        meter.Charge(expression.Function?.Cost ?? Costs.OperatorEval);
+        if (!(expression.Op == "not" && expression.Text == "predicate")) meter.Charge(expression.HostFunction?.Cost ?? expression.Function?.Cost ?? Costs.OperatorEval);
+        if (expression.Op == "host")
+        {
+            meter.Guard();
+            var values = new SqlValue[expression.Args.Length];
+            for (var i = 0; i < values.Length; i++) values[i] = await ExprAsync(expression.Args[i], meter, row: row).ConfigureAwait(false);
+            return HostFunctionExecution.Call(expression, values, meter, row);
+        }
         if (expression.Op is "json_sql" or "is_json") return await JsonSql.EvaluateAsync(expression, meter, row).ConfigureAwait(false);
         if (expression.Op == "correlated")
         {
@@ -37,7 +44,7 @@ internal static partial class Evaluate
         {
             try
             {
-                if (expression.Op == "quantified_correlated") { meter.Guard(); await expression.Subquery!.Execute(row).ConfigureAwait(false); }
+                if (expression.Op == "quantified_correlated" || expression.Subquery!.PerRow) { meter.Guard(); await expression.Subquery!.Execute(row).ConfigureAwait(false); }
                 var input = await ExprAsync(expression.Args[0], meter, row: row).ConfigureAwait(false);
                 return OpenOperators.QuantifiedValues(expression.Text, input, expression.Subquery!.Values, meter, expression.Collation);
             }

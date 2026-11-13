@@ -46,6 +46,9 @@ outputs = {
   "SqlStates.g.cs" => header + "public static class SqlStates\n{\n#{states.join("\n")}\n}\n",
   "ScalarCatalog.g.cs" => header + "internal static class ScalarCatalog\n{\n    internal static readonly string[] KnownNames = [#{known_names}];\n    internal static readonly ScalarFact[] Facts =\n    [\n#{facts.join("\n")}\n    ];\n}\n"
 }
+coercions = TomlRB.load_file(File.join(spec, "types/compare.toml")).fetch("arg_coercion")
+coercion_rows = coercions.map { |row| "        (#{quote.call(row.fetch('from'))}, SqlType.#{pascal.call(row.fetch('to'))}, #{row.fetch('cost')})," }
+outputs["ArgCoercionFacts.g.cs"] = header + "internal static class ArgCoercionFacts\n{\n    internal static readonly (string From, SqlType To, int Cost)[] Rows =\n    [\n#{coercion_rows.join("\n")}\n    ];\n}\n"
 safe_functions = functions.select { |f| f["traps"] == false }.map { |f| f.fetch("name") }.uniq
 safe_casts = casts.select { |c| c["traps"] == false }.map { |c| "        (SqlType.#{pascal.call(c.fetch('from'))}, SqlType.#{pascal.call(c.fetch('to'))})," }
 non_equality_casts = casts.select { |c| c["preserves_equality"] == false }.map { |c| "        (SqlType.#{pascal.call(c.fetch('from'))}, SqlType.#{pascal.call(c.fetch('to'))})," }

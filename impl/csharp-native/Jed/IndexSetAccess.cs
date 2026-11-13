@@ -88,7 +88,7 @@ internal sealed record IndexSetAccess(CatalogIndex Index, StorageTree Tree, Tabl
             return Arm(term);
         }
         if (term.Args.Length == 0 || !Resolve.Equivalent(term.Args[0], key)) return null;
-        if (term.Op == "quantified" && term.Args[1] is { Op: "array" } literalArray && literalArray.Type.Element != key.Type && !(key.Type.IsInteger() && literalArray.Args.All(arg => arg.Op == "constant" && arg.Type.IsInteger()))) return null;
+        if (term.Op == "quantified" && term.Args[1] is { Op: "array" } literalArray && literalArray.Type.Element != key.Type && !(key.Type.IsInteger() && literalArray.Args.All(AccessConstant.IntegerLiteralOrNull))) return null;
         IEnumerable<Resolved>? values = null;
         if (term.Op == "in_list" && term.Text != "not" && term.Args.Skip(1).All(value => value.Op == "constant")) values = term.Args.Skip(1);
         else if (term.Op == "quantified" && term.Text == "= any")

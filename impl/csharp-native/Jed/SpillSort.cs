@@ -75,7 +75,13 @@ internal static class SpillSort
             await sorter.Add(retained, token).ConfigureAwait(false);
         }
         long skipped = 0, produced = 0;
-        await foreach (var row in sorter.Read(token).ConfigureAwait(false))
+        var roots = plan.Projections.Select(item => item.Expression).ToArray();
+        long? Remaining() => plan.Limit is { } limit ? Math.Max(0, Meter.Add(plan.Offset, limit) - skipped) : null;
+        // A metered merge updates its charged run heads on each pull. Keep that
+        // account schedule scalar; an unmetered merge may read the full window.
+        var output = HostPullWindow.Read(sorter.Read(token), roots, meter, Costs.RowProduced, Remaining, token,
+            maximum: meter.Memory.Enabled ? 1 : 64);
+        await foreach (var row in output.ConfigureAwait(false))
         {
             if (skipped++ < plan.Offset) continue;
             if (plan.Limit is { } limit && produced >= limit) break;

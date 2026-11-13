@@ -2,7 +2,9 @@ namespace Jed;
 
 internal static class FunctionResolve
 {
-    internal static Resolved Call(Expression expression)
+    internal static Resolved Call(Expression expression) => HostFunctionResolve.Call(expression, Builtin);
+
+    private static Resolved Builtin(Expression expression)
     {
         if (expression.Text == "merge_action") throw Errors.Syntax("merge_action() requires MERGE RETURNING");
         if (expression.Text == "timezone")
@@ -170,7 +172,7 @@ internal static class FunctionResolve
         return result.Select(e => e!).ToArray();
     }
 
-    private static bool Matches(SqlType type, string family) => family switch
+    internal static bool Matches(SqlType type, string family) => family switch
     {
         "any" => true,
         "integer" => type.IsInteger(),

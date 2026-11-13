@@ -252,7 +252,7 @@ internal sealed class PrivilegeDiscovery(Catalog catalog, Action<string, TablePr
     {
         if (expression is null) return;
         if (expression.Op is "call" or "call_distinct" or "ordered_aggregate" &&
-            (FunctionCatalog.Facts.Any(fact => fact.Name == expression.Text) || AggregateResolve.IsAggregate(expression with { Window = null }) ||
+            (FunctionCatalog.Facts.Any(fact => fact.Name == expression.Text) || catalog.BoundEnvironment?.Functions.Any(function => function.Name == expression.Text) == true || AggregateResolve.IsAggregate(expression with { Window = null }) ||
              expression.Text is "row_number" or "rank" or "dense_rank" or "percent_rank" or "cume_dist" or "ntile" or "lag" or "lead" or "first_value" or "last_value" or "nth_value")) functionCheck(expression.Text);
         foreach (var argument in expression.Args) Expr(argument, visible, tables, depth);
         Expr(expression.Predicate, visible, tables, depth);

@@ -6,6 +6,10 @@ internal sealed class SimulationNetwork
 {
     private readonly object gate = new();
     private readonly List<Link> links = [];
+    private int frames, disconnectAt;
+    internal bool Disconnected { get; private set; }
+    internal void BeginStep(int nth = 0)
+    { lock (gate) { frames = 0; disconnectAt = nth; Disconnected = false; } }
     private TaskCompletionSource changed = Signal();
     private static TaskCompletionSource Signal() => new(TaskCreationOptions.RunContinuationsAsynchronously);
     private void Pulse() { var previous = changed; changed = Signal(); previous.TrySetResult(); }
@@ -21,8 +25,16 @@ internal sealed class SimulationNetwork
     { lock (gate) { var endpoint = (Endpoint)stream; endpoint.Link.Serving = serving; _ = Finished(serving); } }
     private async Task Finished(Task task)
     { try { await task.ConfigureAwait(false); } finally { lock (gate) Pulse(); } }
-    internal void Disconnect(int client, string path)
-    { lock (gate) foreach (var link in links.Where(link => link.ClientProcess == client && link.Path == path)) link.End(); }
+    internal bool Disconnect(int client, string path)
+    {
+        lock (gate)
+        {
+            var found = false;
+            foreach (var link in links.Where(link => !link.Ended && link.ClientProcess == client && link.Path == path))
+            { found = true; link.End(); }
+            return found;
+        }
+    }
     internal void Kill(int process)
     { lock (gate) foreach (var link in links.Where(link => link.ClientProcess == process || link.OwnerProcess == process)) link.End(); }
     internal async Task SettleAsync(CancellationToken token = default)
@@ -110,6 +122,8 @@ internal sealed class SimulationNetwork
             lock (Link.Network.gate)
             {
                 if (Link.Ended) throw new IOException("simulated connection lost");
+                if (++Link.Network.frames == Link.Network.disconnectAt)
+                { Link.Network.Disconnected = true; Link.End(); throw new IOException("simulated frame disconnect"); }
                 var completion = Signal(); Peer.queued.Enqueue(source.ToArray()); Peer.consumed.Add(completion);
                 Peer.Waiting = false; Peer.Wake(); Link.Network.Pulse(); receipt = completion.Task;
             }

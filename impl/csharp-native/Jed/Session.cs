@@ -23,36 +23,40 @@ public sealed partial class Session : IAsyncDisposable
     public long LifetimeCost { get; internal set; }
     public long LifetimeMaxCost { get; private set; }
     private readonly SessionOptions options;
+    public DatabaseEnvironment Environment { get; }
     private TimeZoneData? timeZones;
     private UnicodeData? unicodeData;
-    internal TemporalContext NewTemporalContext(QueryOptions? query = null) => new(query?.Clock ?? options.Clock ?? database?.Clock ?? SessionOptions.HostClock, query?.TimeZone ?? options.TimeZone, timeZones, unicodeData);
+    internal TemporalContext NewTemporalContext(QueryOptions? query = null) => new(query?.Clock ?? options.Clock ?? database?.Clock ?? Environment.ClockSource.NowMicroseconds, query?.TimeZone ?? options.TimeZone, timeZones, unicodeData, Environment);
 
     public Session(long lifetimeMaxCost = 0) : this(new SessionOptions { LifetimeMaxCost = lifetimeMaxCost }) { }
 
-    public Session(SessionOptions options)
+    public Session(SessionOptions options) : this(options, Jed.DatabaseEnvironment.Builder().Build()) { }
+
+    public Session(SessionOptions options, DatabaseEnvironment environment)
     {
+        ArgumentNullException.ThrowIfNull(environment); Environment = environment;
         ArgumentNullException.ThrowIfNull(options);
         if ((options.DefaultPrivileges & ~TablePrivileges.All) != 0) throw new ArgumentOutOfRangeException(nameof(options));
         if (options.LifetimeMaxCost < 0) throw new ArgumentOutOfRangeException(nameof(options));
-        _ = TimeZoneData.Resolve(options.TimeZone, options.TimeZones);
-        timeZones = options.TimeZones;
-        unicodeData = options.UnicodeData;
+        _ = TimeZoneData.Resolve(options.TimeZone, options.TimeZones ?? environment.TimeZones);
+        timeZones = options.TimeZones ?? environment.TimeZones;
+        unicodeData = options.UnicodeData ?? environment.UnicodeData;
         this.options = options; defaultPrivileges = options.DefaultPrivileges;
         if (options.MaxTempStorageBytes < 0 || options.TempBuffers < 0) throw new ArgumentOutOfRangeException(nameof(options));
         tempStorageLimit = options.MaxTempStorageBytes; allowDdl = options.AllowDdl; allowTempDdl = options.AllowTempDdl ?? options.AllowDdl;
         LifetimeMaxCost = options.LifetimeMaxCost; MaxQueryMemoryBytes = options.MaxQueryMemoryBytes;
     }
 
-    internal Session(Database database, long lifetimeMaxCost) : this(lifetimeMaxCost) { this.database = database; }
-    internal Session(Database database, SessionOptions options) : this(options) { this.database = database; }
+    internal Session(Database database, long lifetimeMaxCost) : this(new SessionOptions { LifetimeMaxCost = lifetimeMaxCost }, database.Environment) { this.database = database; }
+    internal Session(Database database, SessionOptions options) : this(options, database.Environment) { this.database = database; }
 
     /// <summary>Install an immutable, validated host-provided JTZ bundle for later statements.</summary>
-    public void LoadTimeZoneData(ReadOnlySpan<byte> bytes)
+    internal void LoadTimeZoneData(ReadOnlySpan<byte> bytes)
     {
         using var operation = Enter(); timeZones = TimeZoneData.Load(bytes);
     }
     /// <summary>Add validated host-provided Unicode collation and casing data.</summary>
-    public void LoadUnicodeData(ReadOnlySpan<byte> bytes)
+    internal void LoadUnicodeData(ReadOnlySpan<byte> bytes)
     {
         using var operation = Enter(); var data = UnicodeData.Load(bytes); unicodeData = unicodeData is null ? data : unicodeData.Add(data);
     }
@@ -83,6 +87,15 @@ public sealed partial class Session : IAsyncDisposable
             meter.Checkpoint();
             var parameterContext = new Parameters();
             var statement = parameterContext.Statement(prepared ?? new Parser(sql).ParseStatement());
+            // A lost role invalidates the transaction itself. Keep reporting that
+            // failure before SQL's aborted-transaction handling, including COMMIT;
+            // only a full rollback can discard the unusable admission and pins.
+            if (statement is not TransactionSyntax { Operation: "rollback" })
+            {
+                domainTransactionLease?.CheckRoles();
+                if (transaction is not null) database!.CheckPendingRole(transaction);
+                readTransaction?.CheckRole();
+            }
             StatementExecution.ValidateCatalogTarget(statement);
             CheckReindexTransaction(statement);
             if (statement is ExplainSyntax explain)
@@ -92,8 +105,6 @@ public sealed partial class Session : IAsyncDisposable
             if (hostReadSession && statement is not SelectSyntax) throw new SqlException(SqlStates.ReadOnlySqlTransaction, "read handle cannot write");
             if (statement is not TransactionSyntax) meter.Memory.HoldPending(CurrentPendingBytes());
             if (NeedsDomains(statement, sql)) return await DomainQuery(statement, parameterContext, queryOptions?.Parameters ?? [], meter, cancellationToken).ConfigureAwait(false);
-            if (transaction is not null && statement is not TransactionSyntax { Operation: "rollback" }) database!.CheckPendingRole(transaction);
-            if (statement is not TransactionSyntax { Operation: "rollback" }) readTransaction?.CheckRole();
             if (statement is TransactionSyntax control)
             {
                 parameterContext.Bind(queryOptions?.Parameters ?? [], meter.Temporal);
@@ -107,7 +118,7 @@ public sealed partial class Session : IAsyncDisposable
                 var pin = readTransaction?.Retain() ?? await db.PinAsync(cancellationToken).ConfigureAwait(false);
                 try
                 {
-                    var catalog = (transaction?.Catalog ?? readTransaction?.Snapshot.Catalog ?? pin.Snapshot.Catalog).BindCollations(meter.Unicode, meter.Temporal.Data);
+                    var catalog = (transaction?.Catalog ?? readTransaction?.Snapshot.Catalog ?? pin.Snapshot.Catalog).BindCollations(meter.Unicode, meter.Temporal.Data, meter.Temporal.Environment);
                     CheckPrivileges(statement, catalog);
                     if (SequenceExecution.Writes(select, catalog))
                     {
@@ -131,7 +142,7 @@ public sealed partial class Session : IAsyncDisposable
             try
             {
                 pendingWrite.TrackMemory = meter.Memory.Enabled;
-                pendingWrite.Catalog = pendingWrite.Catalog.BindCollations(meter.Unicode, meter.Temporal.Data);
+                pendingWrite.Catalog = pendingWrite.Catalog.BindCollations(meter.Unicode, meter.Temporal.Data, meter.Temporal.Environment);
                 meter.Sequences.Bind(pendingWrite.Catalog, pendingWrite);
                 if (parameterContext.Any) parameterContext.Infer(statement, handle, pendingWrite.Before, pendingWrite, pendingWrite.Catalog, meter, cancellationToken);
                 parameterContext.Bind(queryOptions?.Parameters ?? [], meter.Temporal);
@@ -164,7 +175,7 @@ public sealed partial class Session : IAsyncDisposable
     private async ValueTask<Database> GetDatabase(CancellationToken cancellationToken)
     {
         if (database is not null) return database;
-        database = await Database.CreateInMemoryAsync(cancellationToken: cancellationToken).ConfigureAwait(false);
+        database = await Database.CreateInMemoryAsync(cancellationToken: cancellationToken, environment: Environment).ConfigureAwait(false);
         ownsDatabase = true; return database;
     }
     internal void FailStatement() { if (TransactionOpen && !hostReadSession) transactionFailed = true; }
@@ -197,7 +208,7 @@ public sealed partial class Session : IAsyncDisposable
 public sealed record Column(string Name, SqlType Type);
 
 /// <summary>An owned row; values remain valid after advancing or closing the cursor.</summary>
-public sealed class Row
+public sealed partial class Row
 {
     private readonly SqlValue[] values;
     internal Row(SqlValue[] values) { this.values = values; }
@@ -215,13 +226,12 @@ public sealed class Row
 }
 
 /// <summary>A single-pass asynchronous stream with exact cost available after drain or failure.</summary>
-public sealed class Rows : IAsyncEnumerable<Row>, IAsyncDisposable
+public sealed partial class Rows : IAsyncEnumerable<Row>, IAsyncDisposable
 {
     private readonly Session session;
     private readonly IAsyncEnumerator<Row> stream;
     private readonly IDisposable? retained;
     private readonly Meter meter;
-    private readonly bool guardCost;
     private bool finished;
     private bool disposed;
     private int enumerated;
@@ -238,7 +248,7 @@ public sealed class Rows : IAsyncEnumerable<Row>, IAsyncDisposable
 
     internal Rows(Session session, Column[] columns, IAsyncEnumerable<Row> source, Meter meter, IDisposable? retained = null, long? affected = null, bool guardCost = true)
     {
-        this.session = session; this.meter = meter; this.retained = retained; this.guardCost = guardCost;
+        this.session = session; this.meter = meter; this.retained = retained;
         stream = source.GetAsyncEnumerator(); Columns = Array.AsReadOnly(columns); AffectedRows = affected;
     }
 
@@ -286,8 +296,9 @@ public sealed class Rows : IAsyncEnumerable<Row>, IAsyncDisposable
 
     private void CursorCheckpoint(CancellationToken cancellationToken)
     {
-        if (guardCost) meter.Checkpoint(cancellationToken);
-        else meter.CheckCancellation(cancellationToken);
+        // Cursor movement adds no execution work. Cost guards belong to the
+        // retained operator continuation, including its exact final-charge boundary.
+        meter.CheckCancellation(cancellationToken);
     }
 
     public async ValueTask DisposeAsync()

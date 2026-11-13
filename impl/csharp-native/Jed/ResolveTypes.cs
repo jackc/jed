@@ -4,7 +4,7 @@ internal static partial class Resolve
 {
     internal static Expression BindTypes(Expression expression, Catalog catalog, TemporalContext? context = null) => expression with
     {
-        Context = context ?? expression.Context,
+        Context = context ?? expression.Context ?? (catalog.BoundEnvironment is { } environment ? new TemporalContext(environment.ClockSource.NowMicroseconds, "UTC", environment.TimeZones, environment.UnicodeData, environment) : null),
         AggregateOrder = expression.AggregateOrder?.Select(key => key with { Expression = BindTypes(key.Expression, catalog, context) }).ToArray(),
         Window = expression.Window is null ? null : BindTypes(expression.Window, catalog, context),
 

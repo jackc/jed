@@ -4,7 +4,7 @@ using Jed;
 
 internal sealed partial class SimulationRunner
 {
-    private sealed record Handle(Session Session, bool Write, ulong Version, Dictionary<string, ulong> Attachments);
+    private sealed record Handle(Session Session, bool Write, ulong Version, Dictionary<string, ulong> Attachments, int Process);
     private readonly SimulationTrace trace;
     private readonly SimulationFileSystem fs;
     private readonly Dictionary<string, Handle> sessions = new(StringComparer.Ordinal);
@@ -24,7 +24,7 @@ internal sealed partial class SimulationRunner
     private KeyAttempt? keyAttempt;
     private readonly DatabaseCredential[] keys = Enumerable.Range(0, 4).Select(index => DatabaseCredential.FromKey(Enumerable.Repeat((byte)(0x4a + index), 32).ToArray())).ToArray();
     private SimulationRunner(SimulationTrace trace)
-    { this.trace = trace; fs = new(trace.Seed, trace.PageSize, trace.Sector); clock = trace.Clock; key = trace.Encrypted ? 0 : -1; }
+    { this.trace = trace; fs = new(trace.Seed, trace.PageSize, trace.Sector); clock = trace.Clock; key = trace.Encrypted ? 0 : -1; roles = new(network, () => clock, increment => clock = checked(clock + increment)); }
 
     internal static async Task Run(string path)
     {
@@ -37,12 +37,14 @@ internal sealed partial class SimulationRunner
     }
     private DatabaseFileOptions Options()
     {
-        var random = new SeededRandomSource(SimulationFileSystem.Decide(trace.Seed, 14, openings++, 0, 0));
-        return new() { FileHost = fs, ScratchDevices = fs, Locking = FileLocking.None,
+        var environment = DatabaseEnvironment.Builder().WithInsecureKeySeed(SimulationFileSystem.Decide(trace.Seed, 14, openings++, (ulong)selectedProcess, 0)).Build();
+        return new() { FileHost = fs, ScratchDevices = fs, Locking = trace.Service ? FileLocking.Auto : FileLocking.None,
+            RoleHost = trace.Service ? roles.Host(selectedProcess) : null,
+            IdleTransactionMilliseconds = 0, IdleSessionMilliseconds = 0, ShutdownGraceMilliseconds = 1000,
             Synchronous = trace.Synchronous == "off" ? Synchronous.Off : Synchronous.On,
             FlushIntervalMilliseconds = trace.FlushIntervalMilliseconds, Clock = () => clock, EnableIdleFlush = false,
             CacheBytes = trace.CacheBytes == 0 ? 256L * 1024 * 1024 : trace.CacheBytes,
-            Entropy = count => new byte[count], KeyEntropy = random.Fill, ScratchEntropy = new SeededRandomSource(trace.Seed).Fill,
+            Environment = environment, Entropy = count => new byte[count], ScratchEntropy = new SeededRandomSource(trace.Seed).Fill,
             ScratchEncryption = trace.Encrypted ? ScratchEncryption.On : ScratchEncryption.Auto, Credential = key < 0 ? null : keys[key] };
     }
     private SessionOptions SessionOptions(ulong step)
@@ -56,15 +58,18 @@ internal sealed partial class SimulationRunner
         // Reject unsupported driver modes explicitly, before running a partial
         // history. A passing trace always executes every requested operation.
         foreach (var step in trace.Steps)
-            if (step.Operation is not ("open" or "on" or "commit" or "rollback" or "close" or "fault" or "crash" or "reopen" or "compact" or "check" or "clock" or "change_key" or "rekey" or "attach"))
+            if (step.Operation is not ("open" or "on" or "commit" or "rollback" or "close" or "fault" or "crash" or "reopen" or "compact" or "check" or "clock" or "change_key" or "rekey" or "attach" or "spawn" or "disconnect" or "kill" or "exit" or "backup" or "corrupt" or "replay" or "restore"))
                 throw new NotSupportedException("simulation operation " + step.Operation);
-        database = await Database.CreateFileAsync("sim.jed", Options(), trace.PageSize);
+        database = await Database.CreateFileAsync("sim.jed", Options() with { RoleHost = null, Locking = FileLocking.None }, trace.PageSize);
         await database.DisposeAsync();
         database = await Database.OpenFileAsync("sim.jed", processOptions = Options());
+        if (trace.Service) processes.Add(0, new(database, processOptions));
         Configure(); version = floor = attempted = database.Version;
         AddHistory(version, await Digest());
         foreach (var step in trace.Steps)
         {
+            if (System.Environment.GetEnvironmentVariable("JED_SIM_PROGRESS") is { Length: > 0 } progress)
+                File.AppendAllText(progress, $"{trace.Name}:{step.Index} {step.Operation}\n");
             try { await Step(step); }
             catch (Exception error)
             {
@@ -89,9 +94,13 @@ internal sealed partial class SimulationRunner
     { await using var session = database.CreateSession(SessionOptions(fs.Step) with { MaxQueryMemoryBytes = 0 }); return await SimulationRows.Digest(session, fs); }
     private async Task CloseClean()
     {
-        foreach (var handle in sessions.Values) await handle.Session.DisposeAsync();
-        sessions.Clear(); var closingVersion = database.Version;
-        await database.DisposeAsync();
+        var closingVersion = version;
+        if (trace.Service) await CloseService();
+        else
+        {
+            foreach (var handle in sessions.Values) await handle.Session.DisposeAsync();
+            sessions.Clear(); closingVersion = database.Version; await database.DisposeAsync();
+        }
         if (fs.EntryDurable("sim.jed") && fs.ContentDurable("sim.jed")) floor = Math.Max(floor, closingVersion);
         foreach (var state in attached.Values)
             if (fs.EntryDurable(state.File) && fs.ContentDurable(state.File)) state.Floor = Math.Max(state.Floor, state.Version);
@@ -107,18 +116,40 @@ internal sealed partial class SimulationRunner
         if (step.Operation == "fault")
         {
             var kind = args[0]; var probability = Parameter(args, kind == "power_loss" ? "survive" : kind == "process_crash" ? "issue" : "p", 0);
-            if (kind is not ("power_loss" or "process_crash" or "io_error" or "read_error" or "enospc" or "spill_error")) throw new NotSupportedException("simulation fault " + kind);
+            if (kind is not ("power_loss" or "process_crash" or "io_error" or "read_error" or "enospc" or "spill_error" or "disconnect")) throw new NotSupportedException("simulation fault " + kind);
             armed = new(kind, probability, Parameter(args, "tear", 0), Parameter(args, "nth", 1), args.FirstOrDefault(value => value.StartsWith("op=", StringComparison.Ordinal))?[3..] ?? "");
             json.Start(step.Index, "fault").Text("kind", kind); Emit(); return;
         }
-        var active = armed; armed = null; fs.BeginStep((ulong)step.Index, active); pendingDigest = null; keyAttempt = null;
-        foreach (var state in attached.Values) state.Pending = null;
+        // The canonical host restarts p0 when a real operation follows the
+        // last clean process exit. Clock/control and image-probe steps do not.
+        if (trace.Service && processes.Count == 0 && step.Operation is not
+            ("spawn" or "clock" or "tick" or "disconnect" or "exit" or "kill" or "crash" or "corrupt" or "replay" or "restore"))
+        {
+            fs.BeginStep((ulong)step.Index, null);
+            json.Start(step.Index, "spawn"); await SpawnProcess(0); Emit();
+        }
+        var active = armed; armed = null; fs.BeginStep((ulong)step.Index, active?.Kind == "disconnect" ? null : active); network.BeginStep(active?.Kind == "disconnect" ? active.Nth : 0); pendingDigest = null; keyAttempt = null;
+        foreach (var state in attached.Values) { state.Pending = null; state.KeyAttempt = null; }
         var attachmentStarts = attached.ToDictionary(pair => pair.Key, pair => pair.Value.Version, StringComparer.Ordinal);
-        var start = version;
+        var start = version; var acknowledged = false;
+        if (step.Operation is "corrupt" or "replay" or "restore")
+        {
+            if (step.Operation == "corrupt") await CorruptImage(step);
+            else if (step.Operation == "replay") await ReplayPage(step);
+            else await RestoreBackup(step);
+            return;
+        }
         if (step.Operation == "crash")
         {
             fs.Crash(args[0] == "power", Parameter(args, "survive", 0), Parameter(args, "tear", 0));
             await Recover(step.Index, "none"); return;
+        }
+        if (trace.Service && !SelectProcess(step) && step.Operation is "open" or "backup")
+        {
+            json.Start(step.Index, step.Operation);
+            if (step.Operation == "open") json.Text("sid", args[0]);
+            else json.Number("pid", args.Length > 1 ? ProcessNumber(args[1]) : 0);
+            json.Flag("skip", true); Emit(); return;
         }
         json.Start(step.Index, step.Operation);
         if (step.Operation is "open" or "on" or "commit" or "rollback" or "close") json.Text("sid", args[0]);
@@ -126,16 +157,25 @@ internal sealed partial class SimulationRunner
         {
             switch (step.Operation)
             {
+                case "spawn": await SpawnProcess(ProcessNumber(args[0])); break;
+                case "disconnect": await DisconnectProcess(ProcessNumber(args[0])); break;
+                case "kill":
+                    await EndProcess(ProcessNumber(args[0]), true);
+                    if (processes.Count == 0) { _ = json.End(); await Recover(step.Index, "none"); return; }
+                    break;
+                case "exit": await EndProcess(ProcessNumber(args[0]), false); break;
                 case "attach": await AttachDomain(args[0]); break;
+                case "backup": await Backup(args[0]); break;
                 case "open":
                 {
-                    if (args.Length > 2) throw new NotSupportedException("simulation service process handle");
+                    if (args.Length > 2 && !trace.Service) throw new InvalidDataException("process handle outside service trace");
                     if (sessions.ContainsKey(args[0]) || (args[1] == "write" && sessions.Values.Any(handle => handle.Write))) throw new InvalidDataException("trace opens a duplicate session or second writer");
                     var write = args[1] == "write";
                     if (!write && args[1] != "read") throw new InvalidDataException("invalid session mode");
                     var session = write ? await database.OpenWriteSessionAsync(SessionOptions((ulong)step.Index)) : await database.OpenReadSessionAsync(SessionOptions((ulong)step.Index));
+                    if (trace.Service) ObserveService(await SimulationRows.Digest(session, fs));
                     var versions = AttachmentVersions();
-                    sessions.Add(args[0], new(session, write, database.Version, versions));
+                    sessions.Add(args[0], new(session, write, database.Version, versions, selectedProcess));
                     json.Number("version", database.Version); WriteAttachmentVersions(versions); break;
                 }
                 case "on":
@@ -144,51 +184,65 @@ internal sealed partial class SimulationRunner
                     json.Number("rows", rows.Rendered.Length).Number("affected", rows.Affected).Text("hash", rows.Hash).Number("cost", rows.Cost); break;
                 case "commit":
                     if (!sessions.Remove(args[0], out var committing)) { json.Flag("skip", true); break; }
-                    try { pendingDigest = await SimulationRows.Digest(committing.Session, fs); await PrepareAttachedCommit(committing.Session); }
-                    catch (SqlException error) when (error.SqlState == SqlStates.InFailedSqlTransaction) { }
-                    var beforeCommit = database.CommittedStorageForTesting();
-                    var attachedBefore = attached.ToDictionary(pair => pair.Key, pair => pair.Value.Database.CommittedStorageForTesting(), StringComparer.Ordinal);
-                    await committing.Session.CommitAsync();
-                    version = database.Version;
-                    if (Environment.GetEnvironmentVariable("JED_SIM_OUT") is { Length: > 0 } stateDirectory)
+                    try
                     {
-                        var state = database.CommittedStorageForTesting();
-                        File.AppendAllText(Path.Combine(stateDirectory, "commits.jsonl"), System.Text.Json.JsonSerializer.Serialize(new
+                        try { pendingDigest = await SimulationRows.Digest(committing.Session, fs); }
+                        catch (SqlException error) when (error.SqlState != SqlStates.DataCorrupted) { }
+                        try { await PrepareAttachedCommit(committing.Session); }
+                        catch (SqlException error) when (error.SqlState != SqlStates.DataCorrupted) { }
+                        var beforeCommit = database.CommittedStorageForTesting();
+                        var attachedBefore = attached.ToDictionary(pair => pair.Key, pair => pair.Value.Database.CommittedStorageForTesting(), StringComparer.Ordinal);
+                        await committing.Session.CommitAsync();
+                        acknowledged = true;
+                        var acknowledgedAttachments = AttachmentVersions();
+                        version = database.Version;
+                        if (System.Environment.GetEnvironmentVariable("JED_SIM_OUT") is { Length: > 0 } stateDirectory)
                         {
-                            step = step.Index, version, state.ReclamationLive, state.FreeGeneration,
-                            free = state.FreePages.Count, state.Meta.PageCount, oldest = database.OldestLiveVersion
-                        }) + "\n");
+                            var state = database.CommittedStorageForTesting();
+                            File.AppendAllText(Path.Combine(stateDirectory, "commits.jsonl"), FormattableString.Invariant($"{{\"step\":{step.Index},\"version\":{version},\"ReclamationLive\":{state.ReclamationLive},\"FreeGeneration\":{state.FreeGeneration},\"free\":{state.FreePages.Count},\"PageCount\":{state.Meta.PageCount},\"oldest\":{database.OldestLiveVersion}}}\n"));
+                        }
+                        var digest = await Digest();
+                        SimulationStorageChecks.Require(pendingDigest is null || pendingDigest == digest, "acknowledged commit differs from pending session");
+                        SimulationStorageChecks.Require(version != start || history[start].Contains(digest), "unchanged commit changed contents");
+                        AddHistory(version, digest);
+                        if (version != start && fs.EntryDurable("sim.jed"))
+                        {
+                            var committed = (trace.Service ? roles.DatabaseOf("sim.jed") ?? database : database).CommittedStorageForTesting();
+                            floor = Math.Max(floor, committed.Batch?.FloorTransactionId ?? version);
+                        }
+                        if (!trace.Service || database.FileRole == "owner") await Oracle(() => SimulationStorageChecks.Live(database));
+                        if (version != start && !trace.Service) CheckGrowth(beforeCommit, active is null && sessions.Count == 0);
+                        json.Number("version", version);
+                        await FinishAttachedCommit(attachedBefore, acknowledgedAttachments, active is null && sessions.Count == 0);
+                        if (trace.Service) json.Text("role", database.FileRole); break;
                     }
-                    var digest = await Digest();
-                    SimulationStorageChecks.Require(pendingDigest is null || pendingDigest == digest, "acknowledged commit differs from pending session");
-                    SimulationStorageChecks.Require(version != start || history[start].Contains(digest), "unchanged commit changed contents");
-                    AddHistory(version, digest);
-                    if (version != start && fs.EntryDurable("sim.jed"))
-                    {
-                        var committed = database.CommittedStorageForTesting();
-                        floor = Math.Max(floor, committed.Batch?.FloorTransactionId ?? version);
-                    }
-                    await Oracle(() => SimulationStorageChecks.Live(database));
-                    if (version != start) CheckGrowth(beforeCommit, active is null && sessions.Count == 0);
-                    json.Number("version", version);
-                    await FinishAttachedCommit(attachedBefore, active is null && sessions.Count == 0); break;
+                    finally { await committing.Session.DisposeAsync(); }
                 case "rollback":
                 case "close":
                     if (!sessions.Remove(args[0], out var closing)) { json.Flag("skip", true); break; }
-                    if (!closing.Write)
+                    if (!closing.Write && step.Operation == "close")
                     {
-                        var pinned = await SimulationRows.Digest(closing.Session, fs);
-                        SimulationStorageChecks.Require(history[closing.Version].Contains(pinned), "reader snapshot changed while pinned");
-                        await CheckAttachedReader(closing);
+                        try
+                        {
+                            var pinned = await SimulationRows.Digest(closing.Session, fs);
+                            SimulationStorageChecks.Require(history[closing.Version].Contains(pinned), "reader snapshot changed while pinned");
+                            await CheckAttachedReader(closing);
+                        }
+                        catch (SqlException error) when (trace.Service && error.SqlState == SqlStates.ConnectionFailure)
+                        { json.Flag("lost", true); }
                     }
-                    await closing.Session.DisposeAsync(); break;
+                    try { if (step.Operation == "rollback") await closing.Session.RollbackAsync(); }
+                    finally { await closing.Session.DisposeAsync(); }
+                    break;
                 case "clock": clock = checked(clock + long.Parse(args[0], CultureInfo.InvariantCulture)); break;
                 case "reopen":
                     await CloseClean(); database = await Database.OpenFileAsync("sim.jed", processOptions = Options()); Configure(); await ReattachDomains();
+                    if (trace.Service) processes.Add(0, new(database, processOptions));
                     version = database.Version; var reopened = await Digest();
                     SimulationStorageChecks.Require(history[version].Contains(reopened), "clean reopen changed contents");
                     json.Number("version", version).Text("digest", reopened); await AttachedFields(false, summary: true); break;
                 case "change_key":
+                    if (args.Length > 1 && args[1] != "main") { await AttachmentMaintenance(step, args[1]); break; }
                     if (!trace.Encrypted) { json.Flag("skip", true); break; }
                     var replacementKey = int.Parse(args[0], CultureInfo.InvariantCulture);
                     if (replacementKey is < 1 or > 3 || args.Length > 1 && args[1] != "main") throw new InvalidDataException("invalid credential target");
@@ -196,7 +250,9 @@ internal sealed partial class SimulationRunner
                     await database.ChangeCredentialAsync(keys[replacementKey]); keyAttempt = keyAttempt with { Acknowledged = true }; key = replacementKey; json.Number("key", key); break;
                 case "rekey":
                 case "compact":
-                    if (step.Operation == "compact" && args.Length > 0 && args[0] != "main" || step.Operation == "rekey" && args.Length > 1 && args[1] != "main") throw new NotSupportedException("simulation attachment compaction");
+                    var targetName = step.Operation == "compact" ? args.FirstOrDefault() ?? "main" : args.Length > 1 ? args[1] : "main";
+                    if (targetName != "main") { await AttachmentMaintenance(step, targetName); break; }
+                    if (step.Operation == "rekey" && !trace.Encrypted) { json.Flag("skip", true); break; }
                     pendingDigest = await Digest(); AddHistory(start + 1, pendingDigest);
                     if (step.Operation == "rekey")
                     {
@@ -210,7 +266,7 @@ internal sealed partial class SimulationRunner
                     SimulationStorageChecks.Require(version == start + 1 && pendingDigest == await Digest(), "compaction changed contents or generation incorrectly");
                     AddHistory(version, pendingDigest); floor = version; Configure(); json.Number("version", version); break;
                 case "check":
-                    await Oracle(() => SimulationStorageChecks.Live(database));
+                    if (!trace.Service || database.FileRole == "owner") await Oracle(() => SimulationStorageChecks.Live(database));
                     await Fields(false); await AttachedFields(false); break;
                 default: throw new NotSupportedException("simulation operation " + step.Operation);
             }
@@ -223,11 +279,23 @@ internal sealed partial class SimulationRunner
             json.Text("error", error.SqlState); RecordAttempt(start);
         }
         Emit();
+        if (trace.Service)
+        {
+            await network.SettleAsync();
+            if (acknowledged && database.FileRole == "client" && pendingDigest is not null)
+                await ObserveMaintenance(step.Index, pendingDigest);
+        }
+        if (active?.Kind == "disconnect")
+        { json.Start(step.Index, "disconnected").Text("fired", network.Disconnected ? "frame" : "end"); Emit(); return; }
         if (fs.DurableBarrier("sim.jed")) floor = Math.Max(floor, start);
         foreach (var state in attached.Values)
             if (fs.DurableBarrier(state.File) && attachmentStarts.TryGetValue(state.Name, out var old)) state.Floor = Math.Max(state.Floor, old);
         if (active is not null)
-        { fs.EndFaultedStep(); var fired = fs.Fired; await Recover(step.Index, fired); }
+        {
+            fs.EndFaultedStep(); var fired = fs.Fired;
+            if (trace.Service && active.Kind != "power_loss" && await LoseOwners(step.Index, fired)) return;
+            await Recover(step.Index, fired);
+        }
     }
     private void CheckGrowth(StorageRecovered before, bool quiet)
         => CheckGrowth(database, "sim.jed", before, quiet, ref growthBound, ref previousReclaimed);
@@ -266,7 +334,7 @@ internal sealed partial class SimulationRunner
     private async Task Fields(bool recovered, byte[]? recoveredImage = null)
     {
         var digest = await Digest(); var bytes = recoveredImage ?? fs.Image("sim.jed");
-        if (Environment.GetEnvironmentVariable("JED_SIM_OUT") is { Length: > 0 } output)
+        if (System.Environment.GetEnvironmentVariable("JED_SIM_OUT") is { Length: > 0 } output)
         {
             Directory.CreateDirectory(output);
             File.WriteAllBytes(Path.Combine(output, $"{Path.GetFileNameWithoutExtension(trace.Name)}.csharp-native.step{fs.Step}.img"), bytes);
@@ -276,29 +344,13 @@ internal sealed partial class SimulationRunner
     }
     private async Task Recover(int step, string fired)
     {
+        if (trace.Service) await CrashService();
         sessions.Clear(); fs.Restart();
         var image = fs.Image("sim.jed");
         var attachmentImages = new Dictionary<string, byte[]>(StringComparer.Ordinal);
         foreach (var state in attached.Values)
             if (await fs.ExistsAsync(state.File)) attachmentImages.Add(state.Name, fs.Image(state.File));
-        bool Unlocks(int candidate)
-        {
-            if (image[6] == 0) return candidate < 0;
-            if (candidate < 0) return false;
-            try
-            {
-                var block = StorageKeyBlock.Select(image.AsSpan(2 * trace.PageSize, trace.PageSize), image.AsSpan(3 * trace.PageSize, trace.PageSize));
-                var secret = block.Block.Unwrap(keys[candidate].Value); CryptographicOperations.ZeroMemory(secret); return true;
-            }
-            catch (SqlException error) when (error.SqlState == SqlStates.InvalidPassword) { return false; }
-        }
-        if (keyAttempt is { } change)
-        {
-            var oldWorks = Unlocks(change.Old); var newWorks = Unlocks(change.Next);
-            SimulationStorageChecks.Require(change.Old == change.Next ? oldWorks :
-                oldWorks && !newWorks && !change.Acknowledged || !oldWorks && newWorks || change.EntryPending && !oldWorks && !newWorks,
-                "credential recovery violates atomic replacement or acknowledged durability");
-        }
+        VerifyKeyAttempt(image);
         var options = processOptions = Options(); var oldKey = key; var opened = false;
         foreach (var candidate in new[] { key, -1, 0, 1, 2, 3 }.Distinct())
         {
@@ -311,6 +363,7 @@ internal sealed partial class SimulationRunner
             catch (SqlException error) when (error.SqlState is SqlStates.InvalidPassword or SqlStates.CredentialRequired or SqlStates.CredentialNotApplicable) { }
         }
         SimulationStorageChecks.Require(opened, "recovery cannot unlock with any authorized simulation key");
+        if (trace.Service) processes.Add(0, new(database, processOptions));
         if (key != oldKey || keyAttempt is not null) { json.Start(step, "unlocked").Number("key", key); Emit(); }
         Configure(); version = database.Version;
         await ReattachDomains();
@@ -318,5 +371,28 @@ internal sealed partial class SimulationRunner
         var digest = await Digest();
         SimulationStorageChecks.Require(history.TryGetValue(version, out var values) && values.Contains(digest), "recovered unrecorded contents");
         json.Start(step, "crash").Text("fired", fired); await Fields(true, image); await AttachedFields(true, attachmentImages); Emit();
+    }
+    private bool Unlocks(byte[] image, int candidate)
+    {
+        if (image[6] == 0) return candidate < 0;
+        if (candidate < 0) return false;
+        try
+        {
+            var block = StorageKeyBlock.Select(image.AsSpan(2 * trace.PageSize, trace.PageSize), image.AsSpan(3 * trace.PageSize, trace.PageSize));
+            var secret = block.Block.Unwrap(keys[candidate].Value); CryptographicOperations.ZeroMemory(secret); return true;
+        }
+        catch (SqlException error) when (error.SqlState == SqlStates.InvalidPassword) { return false; }
+    }
+    private void VerifyKeyAttempt(byte[] image)
+    {
+        if (keyAttempt is not { } change) return;
+        VerifyKeyAttempt(image, change);
+    }
+    private void VerifyKeyAttempt(byte[] image, KeyAttempt change)
+    {
+        var oldWorks = Unlocks(image, change.Old); var newWorks = Unlocks(image, change.Next);
+        SimulationStorageChecks.Require(change.Old == change.Next ? oldWorks :
+            oldWorks && !newWorks && !change.Acknowledged || !oldWorks && newWorks || change.EntryPending && !oldWorks && !newWorks,
+            "credential recovery violates atomic replacement or acknowledged durability");
     }
 }

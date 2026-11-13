@@ -21,7 +21,8 @@ internal static class KeySetEstimate
             {
                 long sum = 0;
                 foreach (var alternative in alternatives)
-                    sum = Math.Min(rows, Estimate.Add(sum, MemberRows(table, catalog, alternative, rows)));
+                    sum = Math.Min(rows, Estimate.Add(sum, unique && keys.Length == 1 && points
+                        ? Math.Min(1, MemberRows(table, catalog, alternative, rows)) : MemberRows(table, catalog, alternative, rows)));
                 rows = sum;
             }
             if (clips.Length != 0) rows = MemberRows(table, catalog, PredicatePlan.Combine(clips)!, rows);
@@ -52,6 +53,9 @@ internal static class KeySetEstimate
 
 internal static class AccessConstant
 {
+    internal static bool IntegerLiteralOrNull(Resolved expression) =>
+        expression.Op == "constant" && !expression.ParameterUnbound && (expression.Type.IsInteger() || expression.Constant.IsNull) ||
+        expression.Op is "promote" or "cast" && Try(expression.Args[0], out var value) && value.IsNull;
     internal static bool NumericFamilies(SqlType left, SqlType right) =>
         (left.IsInteger() || left == SqlType.Decimal) && (right.IsInteger() || right == SqlType.Decimal);
     internal static bool Compatible(Resolved value, SqlType key) => value.Type == key || value.Type.IsInteger() && key.IsInteger() || value.BoundSource && NumericFamilies(value.Type, key);
@@ -73,6 +77,8 @@ internal static class AccessConstant
         if (expression.Op == "constant" && !expression.ParameterUnbound) { value = expression.Constant; return true; }
         if (expression.Op == "promote" && Try(expression.Args[0], out var inner))
         { value = Resolve.Cast(inner, expression.Type); return true; }
+        if (expression.Op == "cast" && Try(expression.Args[0], out var operand) && operand.IsNull)
+        { value = SqlValue.Null(expression.Type); return true; }
         value = default; return false;
     }
 }

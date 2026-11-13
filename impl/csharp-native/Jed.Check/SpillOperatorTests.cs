@@ -78,6 +78,41 @@ internal static class SpillOperatorTests
                     Corpus.Equal(0, stateMeter.Memory.ReleaseUnderflows, "state reservation ownership");
                     Corpus.Equal(0, Directory.GetFiles(directory).Length, "state removes scratch files");
                 }
+                // A cancelled operation has the same boundary before and after
+                // spill, and must not append a row or change keyed state.
+                using var canceled = new CancellationTokenSource(); canceled.Cancel();
+                async ValueTask Reject(Func<ValueTask> operation)
+                {
+                    try { await operation(); }
+                    catch (OperationCanceledException error) when (error.CancellationToken == canceled.Token) { return; }
+                    throw new InvalidDataException("scratch operation ignored cancellation");
+                }
+                foreach (var budget in new[] { 4096L, 1L })
+                {
+                    await using var state = new SpillKeyState(host, budget, meter);
+                    await using var spool = new SpillRowSpool(host, budget, meter);
+                    await using var hashRows = new SpillHashRows(host, budget, meter);
+                    await using var sort = new ExternalSorter(host, budget, meter, (a, b) => a[0].AsInteger().CompareTo(b[0].AsInteger()));
+                    await state.Put([1], [2], 64, default);
+                    await spool.Append([SqlValue.Integer(1)], default);
+                    await hashRows.Add(1, [SqlValue.Integer(1)], default);
+                    await sort.Add([SqlValue.Integer(1)], default);
+                    var held = meter.Memory.Used;
+                    await Reject(async () => { _ = await state.Get([1], canceled.Token); });
+                    await Reject(async () => { _ = await state.Put([1], [3], 64, canceled.Token); });
+                    await Reject(() => spool.Append([SqlValue.Integer(2)], canceled.Token));
+                    await Reject(() => hashRows.Add(1, [SqlValue.Integer(2)], canceled.Token));
+                    await Reject(() => sort.Add([SqlValue.Integer(2)], canceled.Token));
+                    Corpus.Equal(held, meter.Memory.Used, "cancelled scratch operations preserve reservations");
+                    Corpus.Equal((byte)2, (await state.Get([1], default))!.Bytes[0], "cancelled update preserves payload");
+                    var count = 0; await foreach (var unused in spool.Read()) count++;
+                    Corpus.Equal(1, count, "cancelled append preserves spool");
+                    count = 0; await foreach (var unused in hashRows.Read(1, default)) count++;
+                    Corpus.Equal(1, count, "cancelled append preserves hash bucket");
+                    count = 0; await foreach (var unused in sort.Read()) count++;
+                    Corpus.Equal(1, count, "cancelled append preserves sorter");
+                }
+                Corpus.Equal(0L, meter.Memory.Used, "cancelled scratch owners release reservations");
                 await using (var partial = new ExternalSorter(host, 1, meter, (a, b) => a[0].AsInteger().CompareTo(b[0].AsInteger())))
                 {
                     for (var i = 0; i < 12; i++) await partial.Add([SqlValue.Integer(i)], default);

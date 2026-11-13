@@ -46,11 +46,18 @@ internal static partial class StatementExecution
     private static CatalogColumn WithDefault(CatalogColumn column, Expression? expression, string? text, Meter meter, Catalog catalog)
     {
         column = column with { IntervalFields = column.Type.IntervalFields };
-        if (expression is null) return column with { Default = null, DefaultExpression = null };
+        if (expression is null || expression.Op == "null") return column with { Default = null, DefaultExpression = null };
         if (expression.Op == "text" && column.Type.Type == SqlType.Date && TemporalText.IsClockDate(expression.Text))
             return column with { Default = null, DefaultExpression = text ?? throw new InvalidOperationException("missing persisted default text") };
         expression = Resolve.BindTypes(expression, catalog, meter.Temporal);
         ValidateStoredExpression(expression, isDefault: true);
+        if (column.Type.Type.Kind == SqlKind.Composite && expression.Op == "text")
+        {
+            // The format stores every non-NULL composite default as SQL text,
+            // including record-input literals; validate the assignment now.
+            _ = Assign(expression, column.Type, [], [], meter, catalog);
+            return column with { Default = null, DefaultExpression = text ?? throw new InvalidOperationException("missing persisted default text") };
+        }
         if (expression.Op == "text" && (column.Type.Type.IsNumeric() || column.Type.Type == SqlType.Boolean)) throw Errors.Type("cross-family literal DEFAULT");
         if (expression.Op is "null" or "integer" or "decimal" or "text" or "boolean")
             return column with { Default = Assign(expression, column.Type, [], [], meter, catalog), DefaultExpression = null };
@@ -194,7 +201,9 @@ internal static partial class StatementExecution
             globalNames.Add(name);
             switch (definition.Kind)
             {
-                case "check": checks.Add(new(name, definition.Text!)); break;
+                case "check":
+                    var checkExpression = Resolve.Expr(Resolve.Bind(Resolve.BindTypes(definition.Expression!, catalog, meter.Temporal), Columns(table)));
+                    checks.Add(new(name, definition.Text!, HostDependencies.Collect([checkExpression], immutable: false))); break;
                 case "unique":
                     if (ordinals.Distinct().Count() != ordinals.Length) throw new SqlException(SqlStates.DuplicateColumn, "duplicate unique column");
                     foreach (var ordinal in ordinals) Keyable(table.Columns[ordinal].Type.Type);

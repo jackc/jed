@@ -19,6 +19,13 @@ internal sealed class ExplainNode(string label, string detail, long rows, long c
     private long measuredActual;
     private long localActual;
     internal Func<long>? HiddenActual { get; set; }
+    internal ExplainNode? ObservationSource { get; init; }
+    internal void ResetActual()
+    {
+        measuredActual = 0; localActual = 0;
+        ObservationSource?.ResetActual();
+        foreach (var child in Children) child.ResetActual();
+    }
     internal bool SumChildren { get; init; } = true;
     internal long ActualCost => Math.Max(measuredActual, (SumChildren ? Children : []).Aggregate(Estimate.Add(localActual, HiddenActual?.Invoke() ?? 0),
         (cost, child) => Estimate.Add(cost, child.ActualCost)));

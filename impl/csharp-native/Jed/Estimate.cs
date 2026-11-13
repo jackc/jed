@@ -67,6 +67,8 @@ internal static partial class Estimate
             "=" => Fraction(count, "equality"), "<>" or "!=" => count - Fraction(count, "equality"),
             "<" or "<=" or ">" or ">=" => Fraction(count, "inequality"),
             "is_null" => Fraction(count, "null_test"), "is_not_null" => count - Fraction(count, "null_test"),
+            "like" or "ilike" or "~" or "~*" or "similar" => Fraction(count, "match"),
+            "!~" or "!~*" => count - Fraction(count, "match"),
             "not" => count - Rows(count, predicate.Args[0]),
             "column" when predicate.Type == SqlType.Boolean => Fraction(count, "boolean"),
             _ => Fraction(count, "opaque")
@@ -80,6 +82,7 @@ internal static partial class Estimate
             if (predicate.Op == "quantified_init" && predicate.Text is not ("= any" or "<> all")) return false;
             complement = predicate.Op == "in_init" ? predicate.Text == "not" : predicate.Text == "<> all";
             var cell = predicate.Subquery!;
+            if (complement && !cell.Initialized) return false;
             elements = cell.Initialized ? cell.Values.Select(value => new Resolved("constant", value.Type, value, [])).ToArray() :
                 Enumerable.Repeat(new Resolved("constant", predicate.Args[0].Type, default, [], ParameterUnbound: true), (int)PlannerFacts.ArrayElements).ToArray();
             return true;
@@ -89,13 +92,16 @@ internal static partial class Estimate
         var array = predicate.Args[1];
         static bool Unknown(Resolved value) => value.ParameterUnbound || value.Op == "outer" ||
             value.Op is "cast" or "promote" && Unknown(value.Args[0]);
+        static bool NullLiteral(Resolved value) => value.Op == "constant" && !value.ParameterUnbound && value.Constant.IsNull ||
+            value.Op is "cast" or "promote" && NullLiteral(value.Args[0]);
         if (array.Op == "array" && array.Text != "nested")
         {
             var items = new List<Resolved>();
             foreach (var argument in array.Args)
             {
                 if (Unknown(argument)) items.Add(new("constant", array.Type.Element!, default, [], ParameterUnbound: true));
-                else if (GinQuery.Value(argument, out var known)) items.Add(new("constant", known.Type, known, []));
+                else if (argument.Op == "constant") items.Add(argument);
+                else if (NullLiteral(argument)) items.Add(new("constant", argument.Type, SqlValue.Null(argument.Type), []));
                 else return false;
             }
             elements = items.ToArray(); return true;

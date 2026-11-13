@@ -12,7 +12,13 @@ internal static partial class Evaluate
         if (expression.Op == "collate") return Expr(expression.Args[0], meter, filter, row);
         if (expression.Op == "column") return row is null ? throw new InvalidOperationException("column outside row") : row[expression.Slot];
         if (expression.Op == "promote") return TemporalText.Cast(Expr(expression.Args[0], meter, row: row), expression.Type, meter);
-        if (!entered) meter.Charge(expression.Op == "in_list" ? (expression.Args.Length - 2) * Costs.OperatorEval : expression.Function?.Cost ?? Costs.OperatorEval);
+        if (!entered && !(expression.Op == "not" && expression.Text == "predicate")) meter.Charge(expression.Op == "in_list" ? (expression.Args.Length - 2) * Costs.OperatorEval : expression.HostFunction?.Cost ?? expression.Function?.Cost ?? Costs.OperatorEval);
+        if (expression.Op == "host")
+        {
+            meter.Guard();
+            var arguments = expression.Args.Select(argument => Expr(argument, meter, row: row)).ToArray();
+            return HostFunctionExecution.Call(expression, arguments, meter, row);
+        }
         if (expression.Op == "in_list") return LiteralMembership(expression, Expr(expression.Args[0], meter, row: row), meter);
         if (expression.Op == "quantified_init") return OpenOperators.QuantifiedValues(expression.Text, Expr(expression.Args[0], meter, row: row), expression.Subquery!.Values, meter, expression.Collation);
         if (expression.Op is "array" or "row" or "field" or "subscript") return OpenExpression.Evaluate(expression, meter, row);
@@ -170,7 +176,7 @@ internal static partial class Evaluate
         });
     }
 
-    internal static bool Constant(Resolved expression) => !expression.ParameterUnbound && expression.Op is not ("column" or "outer" or "correlated" or "in_correlated" or "quantified_correlated" or "quantified_init" or "subquery" or "parameter_host" or "stable_date" or "initplan" or "in_init") &&
+    internal static bool Constant(Resolved expression) => !expression.ParameterUnbound && expression.Op is not ("column" or "outer" or "correlated" or "in_correlated" or "quantified_correlated" or "quantified_init" or "subquery" or "parameter_host" or "host" or "stable_date" or "initplan" or "in_init") &&
         !(expression.Op == "call" && expression.Text is "now" or "clock_timestamp" or "current_date" or "nextval" or "currval" or "setval" or "lastval" or "uuidv4" or "gen_random_uuid" or "uuidv7" or "current_setting") && expression.Args.All(Constant);
     internal static void Growth(Resolved[] operands, SqlValue result, Meter meter)
     {

@@ -23,7 +23,7 @@ internal static partial class StatementExecution
             return PrepareMerge(database, pending, (MergeSyntax)RewriteView(database, pending, syntax, namedView, meter, token), meter, token, context);
         var table = Table(pending.Catalog, syntax.Table); var read = context?.Read ?? pending.Fork();
         var target = table with { Name = syntax.Alias ?? table.Name };
-        var source = RelationExecution.Prepare(syntax.Source, database, pending.Before, read, read.Catalog, meter, token, context?.Scope);
+        var source = RelationLayout.Normalize(RelationExecution.Prepare(syntax.Source, database, pending.Before, read, read.Catalog, meter, token, context?.Scope), meter, token);
         var label = syntax.Source switch
         {
             TableRelation named => named.Alias ?? DatabaseDomains.Name(named.Name).Local,

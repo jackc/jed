@@ -3,16 +3,19 @@
 #MISE description="Explicit opt-in: real C# processes against the pinned page-service corpus"
 #USAGE flag "--filter <substring>" help="Select scenario filenames containing this substring"
 #USAGE flag "--no-build" help="Use an existing Release actor build"
+#USAGE flag "--cores <cores>" default="csharp-native" help="Unique cores including csharp-native; peers go,rust,node use pinned offline builds"
 require_relative "../../impl/csharp-native/Tools/tasks"
+require_relative "../../impl/csharp-native/Tools/peer_actors"
 require "tmpdir"
 require "shellwords"
-cores = ENV.fetch("JED_PROCESS_CORES", "csharp-native").split(",", -1)
-abort "This experimental task requires exactly csharp-native; peer pairings use service-interop" unless cores == ["csharp-native"]
+cores = ENV.fetch("usage_cores", ENV.fetch("JED_PROCESS_CORES", "csharp-native")).split(",", -1)
+abort "Select unique cores including csharp-native and only go,rust,node peers" unless cores.include?("csharp-native") && cores.uniq == cores && (cores - %w[csharp-native go rust node]).empty?
 revision = CSharpNativeTasks::BASELINE.fetch("semantic_revision")
 frozen_driver, error, status = Open3.capture3("git", "show", "#{revision}:scripts/process_conformance.rb", chdir: CSharpNativeTasks::ROOT)
 abort "Cannot read pinned process driver: #{error}" unless status.success?
 adapted_driver = frozen_driver.sub('              when "swift-native" then', '              when "csharp-native" then [ENV.fetch("JED_CSHARP_PROCESS_ACTOR")]' + "\n" + '              when "swift-native" then')
 abort "Shared process driver differs from pinned semantics" unless File.binread(File.join(CSharpNativeTasks::ROOT, "scripts/process_conformance.rb")) == adapted_driver.b
+peers = (cores - ["csharp-native"]).to_h { |core| [core, CSharpPeerActors.command(core)] }
 base = CSharpNativeTasks.baseline_spec
 corpus = File.join(base, "conformance/process")
 files = Dir.glob(File.join(corpus, "*.process.toml")).sort
@@ -40,13 +43,29 @@ Dir.mktmpdir("jed-csharp-process-") do |directory|
   command = [CSharpNativeTasks.dotnet, File.join(artifact, "Jed.Check.dll"), "process-actor"].shelljoin
   File.write(actor, "#!/bin/sh\nexec #{command} \"$@\"\n")
   File.chmod(0o500, actor)
+  driver = adapted_driver.dup
+  replacements = {
+    'require_relative "lib/bundle_setup"' => 'require ' + File.join(CSharpNativeTasks::ROOT, "scripts/lib/bundle_setup").dump,
+    'ROOT = File.expand_path("..", __dir__)' => 'ROOT = ' + CSharpNativeTasks::ROOT.dump
+  }
+  peers.each do |core, command|
+    original = case core
+               when "go" then '[File.join(ROOT, "impl/go/process_actor")]'
+               when "rust" then '[File.join(ROOT, "impl/rust/target/release/process_actor")]'
+               when "node" then '["node", File.join(ROOT, "impl/ts/src/bin/process_actor.ts")]'
+               end
+    replacements[original] = command.inspect
+    warn "Pinned #{core} peer: #{command.join(' ')}"
+  end
+  replacements.each { |from, to| abort "Pinned process transport adapter changed: #{from}" unless driver.sub!(from, to) }
+  driver_path = File.join(directory, "process_conformance.rb"); File.write(driver_path, driver)
   warn "Pinned C# process selection: #{selected.length}/31 scenarios; actor #{before.fetch('Jed.Check.dll')}; engine #{before.fetch('Jed.CSharpExperiment.dll')}"
   environment = CSharpNativeTasks.environment.merge(
-    "JED_PROCESS_CORES" => "csharp-native", "JED_CSHARP_PROCESS_ACTOR" => actor,
+    "JED_PROCESS_CORES" => cores.join(","), "JED_CSHARP_PROCESS_ACTOR" => actor,
     "JED_PROCESS_PAGES_ACTOR" => actor, "JED_PROCESS_CORPUS" => corpus,
     "JED_PROCESS_FIXTURE_ROOT" => File.join(base, "fileformat/fixtures"), "JED_PROCESS_STRICT_CORES" => "1")
   environment["JED_PROCESS_FILTER"] = filter if filter
-  system(environment, "ruby", File.join(CSharpNativeTasks::ROOT, "scripts/process_conformance.rb"))
+  system(environment, "ruby", driver_path)
   status = $?
 end
 exit(status&.exitstatus || 1)

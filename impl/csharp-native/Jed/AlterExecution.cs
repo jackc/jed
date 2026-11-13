@@ -36,7 +36,9 @@ internal static partial class StatementExecution
         }
         if (!pending.Catalog.Tables.Any(table => table.Name == actions[0].Table) && RelationExists(pending.Catalog, actions[0].Table))
             throw new SqlException(SqlStates.WrongObjectType, "ALTER TABLE target is not a table");
-        var original = Table(pending.Catalog, actions[0].Table); var table = original;
+        var original = Table(pending.Catalog, actions[0].Table);
+        if (actions.Any(action => action.Operation is "type" or "drop_column" or "rename" or "rename_column"))
+            foreach (var index in original.Indexes ?? []) ParseIndexDefinitions(index); var table = original;
         var removedIndexNames = new HashSet<string>(StringComparer.Ordinal);
         var retypedColumns = new HashSet<string>(StringComparer.Ordinal);
         var values = Enumerable.Range(0, original.Columns.Length).Select(i => new AlterValue(i)).ToList();
@@ -152,6 +154,7 @@ internal static partial class StatementExecution
                     rowSteps.Add(new("drop", ordinal)); values.RemoveAt(ordinal); rewrite = true; break;
                 }
                 case "type":
+                    WritableCheckDependencies(table, pending.Catalog, meter);
                 {
                     retypedColumns.Add(columns[ordinal].Name);
                     var type = SqlTypes.ParseSpec(action.Name!, pending.Catalog.NamedType);
@@ -172,6 +175,7 @@ internal static partial class StatementExecution
                     if (changedColumn.Default is { } constant) changedColumn = changedColumn with { Default = Evaluate.Expr(new("cast", type.Type, default, [new Resolved("constant", constant.Type, constant, [])], Target: type), meter) };
                     if (changedColumn.DefaultExpression is { } defaultText)
                     {
+                        _ = StoredExpression(defaultText);
                         var castText = "CAST ( " + defaultText + " AS " + action.Name + " )";
                         changedColumn = WithDefault(changedColumn, Parser.ParseExpression(castText), castText, meter, pending.Catalog);
                     }
@@ -250,6 +254,7 @@ internal static partial class StatementExecution
                 }
                 case "rename":
                 {
+                    foreach (var column in table.Columns) if (column.DefaultExpression is { } definition) _ = StoredExpression(definition);
                     if (RelationExistsAnywhere(pending.Catalog, action.Name!)) throw new SqlException(SqlStates.DuplicateTable, "relation already exists");
                     RenameViews(pending, table.Name, action.Name!, 0);
                     var old = table.Name;
@@ -283,6 +288,12 @@ internal static partial class StatementExecution
                 for (var i = 0; i < foreign.Columns.Length; i++)
                     if (!ForeignKeyTypes(child.Columns[foreign.Columns[i]].Type.Type, parent.Columns[foreign.ParentColumns[i]].Type.Type)) throw Errors.Type("foreign key types must remain comparable");
             }
+        if (rowSteps.Any(step => step.Operation == "type"))
+        {
+            table = table with { Checks = (table.Checks ?? []).Select(check => check with { HostDependencies = HostDependencies.Collect(
+                [Resolve.Expr(Resolve.Bind(Resolve.BindTypes(StoredExpression(check.Expression), pending.Catalog, meter.Temporal), Columns(table)))], immutable: false) }).ToArray() };
+            finalTables = finalTables.Select(candidate => candidate.Name == table.Name ? table : candidate).ToArray();
+        }
         pending.Catalog = pending.Catalog with { Tables = finalTables };
         RevalidateViews(database, pending, table.Name, 0, meter, token);
         var source = database.Tree(original, pending, pending.Before); var result = source;

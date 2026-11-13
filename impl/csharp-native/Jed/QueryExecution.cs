@@ -54,7 +54,8 @@ internal static class QueryExecution
                     candidate.Kind is AccessKind.Primary or AccessKind.PrimaryIntervals or AccessKind.Full);
                 selected = compatible.OrderBy(candidate => candidate.EstimatedCost).First() with { Ordered = ordered.Ordered, Streaming = ordered.Streaming };
             }
-            await foreach (var row in selected.Rows(table, tree, storage, meter, touched, cancellationToken, initialized.Access is null ? access.Scan.Reverse : initialized.ScanReverse).ConfigureAwait(false)) yield return row;
+            await foreach (var row in selected.Rows(table, tree, storage, meter, touched, cancellationToken, initialized.Access is null ? access.Scan.Reverse : initialized.ScanReverse,
+                meter.HostBatches.ScanFor(initialized)).ConfigureAwait(false)) yield return row;
         }
         else
         {
@@ -86,6 +87,7 @@ internal static class QueryExecution
     {
         using var inputMemory = new QueryInputMemory(meter);
         var retainProjectedSource = plan.Group is not null || plan.Windows is not null;
+        var groupSpool = plan.Group is not null && plan.Spill is not null && plan.Windows is null;
         var retainInput = eagerInput && plan.Group is null && plan.Windows is null && !plan.Distinct;
         if (retainInput)
         {
@@ -97,6 +99,7 @@ internal static class QueryExecution
         // turn a non-key residual into a new statement-wide contradiction.
         var correlatedFilter = plan.Filter is not null && ContainsOuter(plan.Filter);
         plan = PlanTransform.InitialValues(plan);
+        using var hostScan = meter.HostBatches.BeginScan(plan, !sourceMemory && !eagerInput);
         if (!correlatedFilter && plan.Filter is not null && Resolve.EmptyFilter(plan.Filter)) plan = plan with { Empty = true };
         if (plan.ColumnarProjection)
         {
@@ -222,6 +225,9 @@ internal static class QueryExecution
             if (!heap) rows.Sort(Compare);
             decorations.Dispose();
             if (collatedHeap) foreach (var row in rows) sortMemory.Reserve(row.Row);
+            using var hostBatch = HostBatchReplay.HasEligible(plan.Projections.Select(projection => projection.Expression))
+                ? meter.HostBatches.Begin(plan.Projections.Select(projection => projection.Expression),
+                    rows.Where((_, index) => index >= plan.Offset && (plan.Limit is null || index - plan.Offset < plan.Limit.Value)).Select(row => row.Row).ToArray()) : null;
             SortValue[]? previous = null;
             foreach (var row in rows)
             {
@@ -237,9 +243,24 @@ internal static class QueryExecution
             }
             yield break;
         }
+        IDisposable? bufferedHostBatch = null;
+        var bufferedRoots = (plan.Filter is { } bufferedFilter ? new[] { bufferedFilter } : [])
+            .Concat(plan.Projections.Select(projection => projection.Expression)).ToArray();
+        if (retainInput && HostBatchReplay.HasEligible(bufferedRoots))
+        {
+            var buffered = new List<SqlValue[]>();
+            await foreach (var row in source.WithCancellation(cancellationToken).ConfigureAwait(false)) buffered.Add(row);
+            source = BufferedSource(buffered);
+            bufferedHostBatch = meter.HostBatches.Begin(bufferedRoots, buffered);
+        }
+        using var hostBatchScope = bufferedHostBatch;
+        if (groupSpool)
+            source = HostPullWindow.Read(source, bufferedRoots, meter, Costs.RowProduced,
+                () => plan.Limit is { } count ? Math.Max(0, Meter.Add(plan.Offset, count) - skipped) : null, cancellationToken);
         await foreach (var row in source.WithCancellation(cancellationToken).ConfigureAwait(false))
         {
             if (!await KeepsAsync(plan.Filter, row, meter, plan.Observation?.Filter).ConfigureAwait(false)) { inputMemory.Release(row); continue; }
+            hostScan?.Passed();
             if (skipped++ < plan.Offset) { inputMemory.Release(row); continue; }
             if (transferIdentity && sourceMemory)
             {
@@ -309,7 +330,7 @@ internal static async ValueTask<bool> KeepsValueAsync(Resolved? expression, SqlV
         meter.Checkpoint(); if (chargeRow) meter.Charge(Costs.RowProduced);
         var values = new SqlValue[projections.Length];
         for (var i = 0; i < values.Length; i++) values[i] = await Evaluate.ExprAsync(projections[i].Expression, meter, row: row).ConfigureAwait(false);
-        meter.Checkpoint(); return new(values);
+        meter.CheckCancellation(); return new(values);
     }
     internal static bool Keeps(Resolved? filter, SqlValue[] row, Meter meter)
     {
@@ -322,7 +343,7 @@ internal static async ValueTask<bool> KeepsValueAsync(Resolved? expression, SqlV
         meter.Checkpoint(); if (chargeRow) meter.Charge(Costs.RowProduced);
         var values = new SqlValue[projections.Length];
         for (var i = 0; i < values.Length; i++) values[i] = Evaluate.Expr(projections[i].Expression, meter, row: row);
-        meter.Checkpoint(); return new(values);
+        meter.CheckCancellation(); return new(values);
     }
     internal static long KeyBytes(SqlValue value) => OpenValue.PayloadBytes(value);
     private static bool ContainsOuter(Resolved expression) => expression.Op == "outer" || expression.Args.Any(ContainsOuter);

@@ -80,7 +80,7 @@ internal sealed record GistBounds(GistComponent[] Components)
                 if (strategies[i] == 1 && leaf)
                 { if (Evaluate.Compare(range, query) != 0) return false; }
                 else if (strategies[i] == 1 && query.AsRange().IsEmpty) { /* empty leaves may lie below any hull */ }
-                else if (!OpenFunctions.Predicate(strategies[i] == 2 && query.Type.Kind != SqlKind.Range ? "@>" : "&&", range, query).AsBoolean()) return false;
+                else if (!OpenFunctions.Predicate(strategies[i] == 2 && (leaf || query.Type.Kind != SqlKind.Range) ? "@>" : "&&", range, query).AsBoolean()) return false;
             }
             else
             {

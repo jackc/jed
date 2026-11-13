@@ -9,4 +9,6 @@ internal interface IFileRoleHost
     ValueTask<PageClientConnection?> ElectAsync(string path, bool readOnly, CancellationToken token);
     void Publish(string path, Database database, PageOwnerServer server);
     void Release(string path);
+    long NowMicroseconds { get; }
+    ValueTask PollAsync(CancellationToken token);
 }

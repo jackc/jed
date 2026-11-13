@@ -16,7 +16,7 @@ internal static class CatalogTableCodec
             var spec = ReadType(ref reader, code, out var intervalFields);
             if (code == 14 && (flags & ~10) != 0 || code is 15 or 17 && (flags & ~(code == 15 && spec.Type.Element == SqlType.Text ? 66 : 2)) != 0)
                 throw StorageFormat.Corrupt("invalid recursive column flags");
-            SqlValue? defaultValue = (flags & 4) != 0 ? StoredValues.Decode(ref reader, spec.Type) : null;
+            SqlValue? defaultValue = (flags & 4) != 0 ? StoredValues.Decode(ref reader, spec.Type) : (SqlValue?)null;
             var defaultExpression = (flags & 8) != 0 ? reader.String() : null;
             var collation = (flags & 64) != 0 ? Name(ref reader) : null;
             if (collation is not null && code != 4 && !(code == 15 && spec.Type.Element == SqlType.Text))

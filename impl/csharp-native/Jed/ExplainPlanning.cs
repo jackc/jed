@@ -25,6 +25,34 @@ internal static class ExplainPlanning
             WithTouched = relation.WithTouched is null ? null : mask => Wrapper(relation.WithTouched(mask), label, meter)
         };
     }
+    internal static PreparedRelation CteReference(PreparedRelation relation, ExplainCte definition, Meter meter)
+    {
+        var body = relation.Plan ?? definition.Body;
+        if (definition.Materialized)
+        {
+            PreparedRelation Scan(Resolved? filter)
+            {
+                var rows = filter is null ? body.EstimatedRows : Estimate.Rows(body.EstimatedRows, filter);
+                var cost = Estimate.Add(body.EstimatedRows, Estimate.Multiply(body.EstimatedRows, filter is null ? 0 : Expressions([filter])));
+                var source = relation with { Rows = filter is null ? relation.Rows : PredicatePlan.Rows(relation.Rows, filter, meter, meter.Cancellation, relation.MemoryOutput), EstimatedRows = rows };
+                var scan = Attach(source, new("CTE Scan " + definition.Name, filter is null ? "-" : meter.Explain!.Verbose ? Predicate(filter, true) : "filter:" + Predicate(filter, false), rows, cost), meter);
+                return scan with { WithTouched = null, PushFilter = next => (Scan(PredicatePlan.Order(PredicatePlan.Combine(new[] { filter, next }.OfType<Resolved>()))), null) };
+            }
+            return Scan(null);
+        }
+        var wrapped = Attach(relation, new("CTE Scan " + definition.Name, "-", body.EstimatedRows,
+            definition.Materialized ? body.EstimatedRows : body.EstimatedCost,
+            definition.Materialized || definition.DefinitionVisible ? [] : [body]), meter);
+        return wrapped with
+        {
+            PushFilter = relation.PushFilter is null ? null : predicate =>
+            {
+                var pushed = relation.PushFilter(predicate);
+                return (CteReference(pushed.Relation, definition, meter), pushed.Residual);
+            },
+            WithTouched = relation.WithTouched is null ? null : mask => CteReference(relation.WithTouched(mask), definition, meter)
+        };
+    }
     internal static PreparedRelation Function(PreparedRelation relation, string name, Resolved[] arguments, Meter meter)
     {
         if (meter.Explain is null) return relation;
@@ -46,7 +74,7 @@ internal static class ExplainPlanning
     private static long Expression(Resolved value)
     {
         var cost = PredicatePlan.Nodes(value);
-        foreach (var subquery in Subqueries(value).Where(cell => cell.IsCorrelated)) cost = Estimate.Add(cost, subquery.Plan?.EstimatedCost ?? 0);
+        foreach (var subquery in Subqueries(value).Where(cell => cell.IsCorrelated || cell.OrderEvaluation)) cost = Estimate.Add(cost, subquery.Plan?.EstimatedCost ?? 0);
         return cost;
     }
     private static IEnumerable<SubqueryCell> Subqueries(Resolved value)
@@ -67,7 +95,7 @@ internal static class ExplainPlanning
             all ? "all" : "distinct", rows, Estimate.Add(a.EstimatedCost, b.EstimatedCost), a, b), meter);
     }
     internal static PreparedRelation Join(PreparedRelation relation, PreparedRelation left, PreparedRelation right,
-        string kind, Resolved? predicate, HashJoinPlan? hash, IndexNestedLoop? inl, Meter meter)
+        string kind, Resolved? predicate, HashJoinPlan? hash, IndexNestedLoop? inl, Meter meter, bool lateral = false)
     {
         if (meter.Explain is null) return relation;
         var a = left.Plan ?? throw new InvalidOperationException("missing left join plan");
@@ -96,12 +124,10 @@ internal static class ExplainPlanning
             b.EstimatedCost = Estimate.Multiply(a.EstimatedRows, scanCost);
             if (b.Label.StartsWith("Scan ", StringComparison.Ordinal))
             {
-                var printed = inl.Bounds.Select(term => term with { Args = term.Args.Select(arg => arg.Op == "column"
-                    ? arg.Slot >= inl.OuterWidth ? arg with { Slot = arg.Slot - inl.OuterWidth } : new Resolved("join_source", arg.Type, default, []) : arg).ToArray() });
                 var touched = b.Detail.IndexOf("; touched=", StringComparison.Ordinal);
                 var accessDetail = access.Kind switch
                 {
-                    AccessKind.Primary => "PK bound: " + Bound(PredicatePlan.Combine(printed), inl.Source.Table),
+                    AccessKind.Primary => "PK bound: " + Bound(access.Predicate, inl.Source.Table),
                     AccessKind.Btree => "Index bound: using " + access.Index!.Name,
                     AccessKind.Gist => "GiST bound: using " + access.Index!.Name,
                     AccessKind.Gin => "GIN bound: using " + access.Index!.Name,
@@ -113,6 +139,17 @@ internal static class ExplainPlanning
             }
             inl.Observation = b;
             work = Estimate.Add(b.EstimatedCost, Estimate.Multiply(b.EstimatedRows, predicate is null ? 0 : Expressions([predicate])));
+        }
+        if (lateral)
+        {
+            ExplainNode Scale(ExplainNode node) => new(node.Label, node.Detail,
+                Estimate.Multiply(node.EstimatedRows, a.EstimatedRows), Estimate.Multiply(node.EstimatedCost, a.EstimatedRows), node.Children.Select(Scale).ToArray())
+            {
+                LogicalRows = node.LogicalRows, Table = node.Table, Catalog = node.Catalog,
+                Access = node.Access, ScanHeight = node.ScanHeight, SumChildren = false,
+                HiddenActual = () => node.ActualCost, ObservationSource = node
+            };
+            b = Scale(b);
         }
         var cost = inl is null ? Estimate.Add(Estimate.Add(a.EstimatedCost, b.EstimatedCost), work) : Estimate.Add(a.EstimatedCost, work);
         var detail = kind + (hash is null ? "" : "; keys=" + hash.Types.Length);
@@ -204,7 +241,7 @@ internal static class ExplainPlanning
                 (left, right) = (right, left);
                 operation = operation switch { "<" => ">", "<=" => ">=", ">" => "<", ">=" => "<=", _ => operation };
             }
-            if (left.Op == "column") bounds.Add(table.Columns[left.Slot].Name + " " + operation + " " + (right.Op == "outer" ? "outer" : right.Op == "constant" && !right.ParameterUnbound && right.Constant.IsNull ? "<value>" : ExplainExpression.Print(right)));
+            if (left.Op == "column") bounds.Add(table.Columns[left.Slot].Name + " " + operation + " " + (right.ParameterIndex > 0 ? ExplainExpression.Print(right) : right.BoundSource ? "join" : right.Op == "outer" ? "outer" : right.Op == "constant" && !right.ParameterUnbound && right.Constant.IsNull ? "<value>" : ExplainExpression.Print(right)));
         }
         return bounds.Count == 0 ? "-" : string.Join(" and ", bounds);
     }
@@ -219,8 +256,8 @@ internal static class ExplainPlanning
                 ? Estimate.Rows(table, catalog, plan.Filter) : Estimate.Rows(input.LogicalRows, plan.Filter);
             var pulled = output == 0 ? input.EstimatedRows : Math.Min(input.EstimatedRows, Estimate.Scale(input.EstimatedRows, needed, output));
             if (bounded == 0) pulled = 0;
-            var pages = pulled == 0 ? 0 : access.Kind == AccessKind.Full
-                ? Math.Min(access.EstimatedPages, Math.Max(input.ScanHeight, Estimate.Scale(access.EstimatedPages, pulled, input.EstimatedRows)))
+            var pages = pulled == 0 ? 0 : access.Kind is AccessKind.Full or AccessKind.Primary or AccessKind.PrimaryIntervals
+                ? Math.Min(access.EstimatedPages, Math.Max(input.ScanHeight, pulled))
                 : access.EstimatedPages;
             var fetch = access.Kind is AccessKind.Btree or AccessKind.IndexIntervals or AccessKind.Gin or AccessKind.Gist ? input.ScanHeight + 1L : 1;
             input.EstimatedRows = pulled;
@@ -231,7 +268,7 @@ internal static class ExplainPlanning
         {
             var rows = Math.Min(node.EstimatedRows, node.Table is { } table && node.Catalog is { } catalog ? Estimate.Rows(table, catalog, predicate) : Estimate.Rows(node.LogicalRows, predicate));
             filter = node = new("Filter", Predicate(predicate, meter.Explain!.Verbose) + (plan.Empty ? "; contradiction" : ""), rows,
-                Estimate.Add(node.EstimatedCost, Estimate.Multiply(node.EstimatedRows, Expressions([predicate]))), node);
+                Estimate.Add(Uncorrelated([predicate]), Estimate.Add(node.EstimatedCost, Estimate.Multiply(node.EstimatedRows, Expressions([predicate])))), node);
             var hidden = Subqueries(predicate).Where(cell => !cell.IsCorrelated).Distinct().ToArray();
             filter.HiddenActual = () => hidden.Aggregate(0L, (cost, cell) => Estimate.Add(cost, cell.Plan?.ActualCost ?? 0));
         }
@@ -246,6 +283,11 @@ internal static class ExplainPlanning
             var cost = Estimate.Add(node.EstimatedCost, Estimate.Multiply(node.EstimatedRows, Estimate.Add(group.Aggregates.Length,
                 Expressions(group.Keys.Concat(group.Aggregates.SelectMany(Arguments))))));
             var detail = "groups=" + group.Keys.Length + " aggs=" + group.Aggregates.Length;
+            if (group.Sets is { Length: > 1 } sets)
+            {
+                rows = Estimate.Multiply(rows, sets.Length);
+                detail += "; sets=" + sets.Length;
+            }
             if (group.Having is { } having)
             {
                 detail += "; " + Predicate(having, meter.Explain!.Verbose, "having");
@@ -283,10 +325,10 @@ internal static class ExplainPlanning
             .Concat(plan.Filter is null ? [] : [plan.Filter]).Concat((plan.Order ?? []).Select(key => key.Expression))
             .Concat(plan.Group?.Keys ?? []).Concat(plan.Group?.Aggregates.SelectMany(item => new[] { item.Argument }.OfType<Resolved>().Concat(item.Extra ?? [])) ?? [])
             .Concat(plan.Group?.Having is { } havingExpression ? [havingExpression] : []);
-        node.EstimatedCost = Estimate.Add(node.EstimatedCost, Uncorrelated(expressions));
-        if (meter.Explain!.Verbose) node.Append("output=[" + string.Join(", ", plan.Projections.Select(projection => ExplainExpression.Print(projection.Expression))) + "]");
+        node.EstimatedCost = Estimate.Add(node.EstimatedCost, Math.Max(0, Uncorrelated(expressions) - (plan.Filter is null ? 0 : Uncorrelated([plan.Filter]))));
+        if (meter.Explain!.Verbose && node.Label is not ("Union" or "Intersect" or "Except")) node.Append("output=[" + string.Join(", ", plan.Projections.Select(projection => ExplainExpression.Print(projection.Expression))) + "]");
         return new(node, filter, aggregate, window, sort, distinct, limit);
     }
-    internal static long Uncorrelated(IEnumerable<Resolved> expressions) => expressions.SelectMany(Subqueries).Where(cell => !cell.IsCorrelated).Distinct()
+    internal static long Uncorrelated(IEnumerable<Resolved> expressions) => expressions.SelectMany(Subqueries).Where(cell => !cell.IsCorrelated && !cell.OrderEvaluation).Distinct()
         .Aggregate(0L, (cost, cell) => Estimate.Add(cost, cell.Plan?.EstimatedCost ?? 0));
 }

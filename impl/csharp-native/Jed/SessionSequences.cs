@@ -11,7 +11,7 @@ public sealed partial class Session
         try
         {
             pending.TrackMemory = meter.Memory.Enabled;
-            pending.Catalog = pending.Catalog.BindCollations(meter.Unicode, meter.Temporal.Data);
+            pending.Catalog = pending.Catalog.BindCollations(meter.Unicode, meter.Temporal.Data, meter.Temporal.Environment);
             meter.Sequences.Bind(pending.Catalog, pending);
             if (parameters.Any) parameters.Infer(select, db, pending.Before, pending, pending.Catalog, meter, token);
             parameters.Bind(parameterValues, meter.Temporal);

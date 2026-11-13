@@ -11,7 +11,7 @@ internal sealed class FileClaim : IDisposable
 {
     private static readonly ConcurrentDictionary<string, byte> OpenPaths = new(StringComparer.Ordinal);
     internal string Path { get; }
-    internal int ProcessId { get; } = Environment.ProcessId;
+    internal int ProcessId { get; } = System.Environment.ProcessId;
     private bool disposed;
     private FileClaim(string path) { Path = path; }
     internal static FileClaim Acquire(string path, bool creating)
@@ -30,7 +30,7 @@ internal sealed class FileClaim : IDisposable
     internal void VerifyProcess()
     {
         ObjectDisposedException.ThrowIf(disposed, this);
-        if (Environment.ProcessId != ProcessId) throw new SqlException(SqlStates.ObjectInUse, "database handle inherited across fork; reopen it in the child");
+        if (System.Environment.ProcessId != ProcessId) throw new SqlException(SqlStates.ObjectInUse, "database handle inherited across fork; reopen it in the child");
     }
     public void Dispose()
     {
@@ -168,7 +168,7 @@ internal sealed class FileLockBundle : IDisposable
         if (PageWire.Utf8.GetByteCount(endpoint) <= 100 && LinuxFileHost.PrivateDirectory(userDirectory, create: true)) return endpoint;
         var suffix = "jed-" + Convert.ToHexStringLower(incarnation[..8]) + ".sock";
         var fallback = "/tmp/jed-" + LinuxFileHost.EffectiveUid.ToString(System.Globalization.CultureInfo.InvariantCulture);
-        foreach (var candidate in new[] { Environment.GetEnvironmentVariable("XDG_RUNTIME_DIR"), fallback })
+        foreach (var candidate in new[] { System.Environment.GetEnvironmentVariable("XDG_RUNTIME_DIR"), fallback })
         {
             if (string.IsNullOrEmpty(candidate) || !System.IO.Path.IsPathFullyQualified(candidate)) continue;
             endpoint = System.IO.Path.Combine(candidate, suffix);
@@ -197,7 +197,7 @@ internal sealed class FileLockBundle : IDisposable
         disposed = true;
         // A child must never unlock the inherited open-file description or delete
         // its parent's record. Closing its own descriptor copy is sufficient.
-        if (Environment.ProcessId == Claim.ProcessId)
+        if (System.Environment.ProcessId == Claim.ProcessId)
         {
             if (OwnsPresence)
             {

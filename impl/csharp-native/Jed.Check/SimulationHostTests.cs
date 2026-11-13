@@ -30,6 +30,7 @@ internal static class SimulationHostTests
         await InodeFaultIdentity();
         await RelaxedClock();
         await PageService();
+        await FailedPromotionReleasesOwnership();
         for (ulong seed = 1; seed <= 12; seed++) await Recovery(seed);
         Console.WriteLine("PASS simulation host: write-order independence, delayed unissued writes, directory durability and real-engine crash/recovery across content-keyed torn images");
     }
@@ -62,6 +63,16 @@ internal static class SimulationHostTests
             var rows = await SimulationRows.Query(reconnected, "SELECT id FROM t");
             Corpus.Equal(1, rows.Rendered.Length, "simulated reconnect restores service access");
         }
+        var abandoned = await client.OpenWriteSessionAsync(cancellationToken: timeout.Token);
+        await Execute(abandoned, "INSERT INTO t VALUES (6)");
+        network.Disconnect(1, Path.GetFullPath("service.jed")); await network.SettleAsync(timeout.Token);
+        for (var attempt = 0; attempt < 2; attempt++)
+        {
+            try { await SimulationRows.Query(abandoned, "SELECT id FROM t"); throw new InvalidDataException("lost writer role admitted a query"); }
+            catch (SqlException error) when (error.SqlState == SqlStates.ConnectionFailure) { }
+        }
+        try { await abandoned.CommitAsync(timeout.Token); throw new InvalidDataException("lost writer role acknowledged a commit"); }
+        catch (SqlException error) when (error.SqlState == SqlStates.ConnectionFailure) { }
         await roles.KillAsync(0);
         await using (var promoted = client.CreateSession()) await Execute(promoted, "INSERT INTO t VALUES (5)");
         await network.SettleAsync(timeout.Token);
@@ -69,6 +80,44 @@ internal static class SimulationHostTests
         Corpus.Equal(1, roles.OwnerOf("service.jed")!.Value, "exclusive simulated owner follows promotion");
         await client.DisposeAsync(); await network.SettleAsync(timeout.Token);
         Corpus.Equal<int?>(null, roles.OwnerOf("service.jed"), "clean close releases injected ownership");
+    }
+
+    private static async Task FailedPromotionReleasesOwnership()
+    {
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(20));
+        var fs = new SimulationFileSystem(47, 1024);
+        var network = new SimulationNetwork(); var roles = new SimulationRoleRegistry(network);
+        using var firstKey = DatabaseCredential.FromKey(new byte[32]);
+        using var nextKey = DatabaseCredential.FromKey(Enumerable.Repeat((byte)1, 32).ToArray());
+        DatabaseFileOptions Options(int process, DatabaseCredential credential, byte entropy) => new()
+        {
+            FileHost = fs, ScratchDevices = fs, RoleHost = roles.Host(process), Credential = credential,
+            EnableIdleFlush = false, IdleTransactionMilliseconds = 0, ShutdownGraceMilliseconds = 1,
+            Entropy = count => new byte[count], KeyEntropy = count => Enumerable.Repeat(entropy, count).ToArray()
+        };
+        _ = await Database.CreateFileAsync("promotion.jed", Options(0, firstKey, 3), 1024, timeout.Token);
+        var client = await Database.OpenFileAsync("promotion.jed", Options(1, firstKey, 3), timeout.Token);
+        await roles.KillAsync(0);
+        // Model replacement after the old owner died: the surviving client still
+        // holds its original data key, while the file requires a different key.
+        await using (var replacement = await Database.CreateFileAsync("replacement.jed",
+            Options(2, nextKey, 7) with { RoleHost = null, Locking = FileLocking.None }, 1024, timeout.Token)) { }
+        await fs.MoveAsync("replacement.jed", "promotion.jed", true, timeout.Token);
+        await fs.SyncDirectoryAsync("promotion.jed", timeout.Token);
+        for (var attempt = 0; attempt < 2; attempt++)
+        {
+            try
+            {
+                await using var pin = await client.PinAsync(timeout.Token);
+                throw new InvalidDataException("stale held key promoted into a replacement file");
+            }
+            catch (SqlException error) when (error.SqlState == SqlStates.StaleKey) { }
+            Corpus.Equal<int?>(null, roles.OwnerOf("promotion.jed"), "failed promotion releases exclusive ownership");
+        }
+        await using (var correct = await Database.OpenFileAsync("promotion.jed", Options(2, nextKey, 7), timeout.Token))
+            Corpus.Equal("owner", correct.FileRole, "fresh credential can acquire ownership after failed promotion");
+        await client.DisposeAsync();
+        await network.SettleAsync(timeout.Token);
     }
 
     private static async Task InodeFaultIdentity()

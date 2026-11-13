@@ -33,6 +33,14 @@ internal sealed class ParameterSlot(int index)
     private static SqlValue Coerce(SqlValue value, SqlType target, TemporalContext temporal)
     {
         if (value.IsNull) return SqlValue.Null(target);
+        if (value.NativeTemporal is { } native)
+            return target.Kind switch
+            {
+                SqlKind.Date => SqlValue.Date(native.Days),
+                SqlKind.Timestamp => SqlValue.Timestamp(native.CalendarMicros),
+                SqlKind.Timestamptz when native.InstantMicros is { } instant => SqlValue.Timestamp(instant, withZone: true),
+                _ => throw Errors.Type("native time requires a compatible temporal parameter; use DateTimeOffset for an instant")
+            };
         if (value.Type.Kind == SqlKind.Array && target.Kind == SqlKind.Array && value.AsArray().Count == 0)
             return SqlValue.Array(new(target.Element!, []));
         if (value.Type == SqlType.Text && target.Kind is SqlKind.Text or SqlKind.Bytea or SqlKind.Uuid or SqlKind.Date or SqlKind.Timestamp or SqlKind.Timestamptz or SqlKind.Interval or SqlKind.Array or SqlKind.Range or SqlKind.Composite or SqlKind.Json or SqlKind.Jsonb or SqlKind.Jsonpath) return TemporalText.Parse(value.AsText(), target, temporal);
@@ -54,8 +62,8 @@ internal sealed class ParameterSlot(int index)
         {
             var range = value.AsRange();
             return SqlValue.Range(range.IsEmpty ? SqlRange.Empty(target) : new(target,
-                range.Lower is { } lower ? Coerce(lower, target.Element!, temporal) : null,
-                range.Upper is { } upper ? Coerce(upper, target.Element!, temporal) : null,
+                range.Lower is { } lower ? Coerce(lower, target.Element!, temporal) : (SqlValue?)null,
+                range.Upper is { } upper ? Coerce(upper, target.Element!, temporal) : (SqlValue?)null,
                 range.LowerInclusive, range.UpperInclusive));
         }
         throw Errors.Type($"parameter requires {target.Name()}");
@@ -137,8 +145,8 @@ internal sealed class Parameters
         if (pending is not null && statement is WithStatementSyntax wrapped)
             return WritableCteExecution.Prepare(database, pending, wrapped.Definitions, wrapped.Recursive, wrapped.Body, meter, token).Columns;
         var target = statement switch { InsertSyntax insert => insert.Table, UpdateSyntax update => update.Table, DeleteSyntax delete => delete.Table, _ => null };
-        if (pending is not null && (catalog.Views ?? []).FirstOrDefault(view => view.Name == target) is { } view)
-            statement = StatementExecution.RewriteView(database, pending, statement, view, meter, token);
+        if ((catalog.Views ?? []).FirstOrDefault(view => view.Name == target) is { } view)
+            statement = StatementExecution.RewriteView(database, pending ?? new PendingDatabase(snapshot) { Catalog = catalog }, statement, view, meter, token);
         CatalogTable TargetTable(string name) => localDomain && DatabaseDomains.Name(name).Domain is null ? StatementExecution.Table(catalog, name) : StatementExecution.ResolveTable(catalog, name);
         BoundColumn[] Query(SelectSyntax query) => RelationExecution.Query(query, database, snapshot, pending, catalog, meter, token, scope: scope).Columns;
         BoundColumn[] Returning(CatalogTable table, SelectItem[] items, BoundColumn[]? viewColumns = null, ReturningAliases? aliases = null)

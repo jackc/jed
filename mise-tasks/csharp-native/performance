@@ -1,0 +1,75 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#MISE description="Explicit opt-in: matched JIT/NativeAOT and frozen Go performance diagnostics"
+#USAGE flag "--variant <name>" default="jit" help="jit, jit-runtime-async, aot, or aot-runtime-async (publish AOT first)"
+#USAGE flag "--no-build" help="Use the existing Release assembly"
+#USAGE flag "--output <path>" help="JSON evidence path (default .build/performance-<variant>.json)"
+require_relative "../../impl/csharp-native/Tools/tasks"
+require "time"
+
+variant = ENV.fetch("usage_variant", "jit")
+abort "Unknown variant" unless %w[jit jit-runtime-async aot aot-runtime-async].include?(variant)
+if variant.start_with?("jit")
+  dll = ENV["usage_no_build"] == "true" ? File.join(CSharpNativeTasks::PACKAGE, "Jed.Check/bin/Release/net11.0/Jed.Check.dll") : CSharpNativeTasks.build(runtime_async: variant == "jit-runtime-async")
+  actor = [CSharpNativeTasks.dotnet, dll]
+else
+  actor = [File.join(CSharpNativeTasks::BUILD, "aot", variant == "aot" ? "default" : "runtime-async", "Jed.Check")]
+end
+abort "Build/publish the chosen actor first" unless File.file?(actor.last)
+stamp = File.join(File.dirname(actor.last), "source.sha256")
+abort "Rebuild/publish to record the actor's source identity" unless File.file?(stamp)
+actor_source = File.read(stamp).strip
+build_path = File.join(File.dirname(actor.last), "build.json")
+abort "Rebuild/publish to record compilation settings" unless File.file?(build_path)
+build = JSON.parse(File.read(build_path))
+abort "Actor async compilation differs from selected variant" unless build.fetch("runtime_async") == variant.end_with?("runtime-async")
+revision = CSharpNativeTasks::BASELINE.fetch("semantic_revision")
+peer_root = File.join(CSharpNativeTasks::BUILD, "simulation-peer-#{revision}", "impl/go")
+abort "Run csharp-native:simulation --peer first to extract the frozen peer" unless File.file?(File.join(peer_root, "go.mod"))
+peer = File.join(CSharpNativeTasks::BUILD, "performance-go")
+source = File.join(CSharpNativeTasks::PACKAGE, "Tools/performance.go")
+abort "Frozen Go diagnostic build failed" unless system({ "GOPROXY" => "off" }, "go", "build", "-o", peer, source, chdir: peer_root)
+cases = [
+  ["scalar", "query", "SELECT 12345 * 6789", 100, 1000],
+  ["point", "query", "SELECT id, v FROM t WHERE id = 1024", 100, 1000],
+  ["range", "query", "SELECT id, v FROM t WHERE id BETWEEN 1000 AND 1100 ORDER BY id", 20, 100],
+  ["aggregate", "query", "SELECT count(*), sum(v) FROM t", 10, 50],
+  ["join", "query", "SELECT count(*), sum(a.v + b.v) FROM t a JOIN t b ON a.id = b.id", 5, 25],
+  ["sort", "query", "SELECT id, v FROM t ORDER BY v DESC, id LIMIT 100", 10, 50],
+  ["rollback", "rollback", "UPDATE t SET v = v + 1 WHERE id = 1024", 20, 100],
+  ["durable", "durable", "UPDATE t SET v = v + 1 WHERE id = 1024", 10, 50],
+  ["cold_open", "cold_open", "SELECT id, v FROM t WHERE id = 1024", 5, 25]
+].map { |name, mode, sql, warmup, iterations| { name:, mode:, sql:, warmup:, iterations: } }
+input = { setup: ["CREATE TABLE t (id i32 PRIMARY KEY, v i64)", "INSERT INTO t SELECT i, i::i64 * 2 FROM generate_series(1, 4096) AS g(i)"], cases: }
+input_path = File.join(CSharpNativeTasks::BUILD, "performance-input.json")
+File.write(input_path, JSON.pretty_generate(input) + "\n")
+results = {}
+{ variant => actor, "go" => [peer] }.each do |name, command|
+  puts "Diagnostic actor #{name}"; $stdout.flush
+  startup = 5.times.map do
+    start = Process.clock_gettime(Process::CLOCK_MONOTONIC, :nanosecond)
+    out, err, status = Open3.capture3(CSharpNativeTasks.environment, *command, "performance-ready")
+    elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC, :nanosecond) - start
+    abort "Startup failed: #{err}" unless status.success? && out.strip == "ready"
+    elapsed
+  end
+  out, err, status = Open3.capture3(CSharpNativeTasks.environment, *command, "performance", input_path)
+  abort "Diagnostic failed: #{out}\n#{err}" unless status.success?
+  records = out.lines.map { JSON.parse(_1) }
+  abort "Incomplete diagnostic" unless records.map { _1.fetch("name") } == cases.map { _1.fetch(:name) }
+  results[name] = { command:, actor_sha256: Digest::SHA256.file(command.last).hexdigest, startup_ns: startup, records: }
+end
+results.fetch(variant).fetch(:records).zip(results.fetch("go").fetch(:records)).each do |ours, peer_record|
+  %w[name mode warmup iterations rows checksum].each do |key|
+    abort "Answer mismatch #{ours.fetch('name')}.#{key}: #{ours[key]} != #{peer_record[key]}" unless ours[key] == peer_record[key]
+  end
+end
+evidence = { generated_at: Time.now.utc.iso8601, variant:, semantic_revision: revision, source_sha256: actor_source,
+             diagnostic_source_sha256: CSharpNativeTasks.source_digest,
+             sdk: CSharpNativeTasks.sdk_version, build: build, input_sha256: Digest::SHA256.file(input_path).hexdigest,
+             platform: RUBY_PLATFORM, cpu: File.readlines("/proc/cpuinfo").find { _1.start_with?("model name") }&.strip,
+             durability: "synchronous=on; fsync enabled; default crash-clean file ownership", page_size: 8192,
+             notes: "Diagnostic workloads, not the canonical benchmark suite. Cold open includes open/query/close with a warm OS page cache. Startup includes process launch and SELECT 1. Checksum rendering is inside timed drains. Allocation totals include managed runtime/background work. No forced GC.", input:, results: }
+path = ENV["usage_output"] || File.join(CSharpNativeTasks::BUILD, "performance-#{variant}.json")
+File.write(path, JSON.pretty_generate(evidence) + "\n")
+puts "9 matched diagnostic workloads; evidence: #{path}"

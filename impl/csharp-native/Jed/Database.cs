@@ -54,13 +54,16 @@ public sealed partial class Database : IAsyncDisposable
     private bool ephemeral;
     private TaskCompletionSource? maintenance = null;
 
-    private Database(StoragePager pager, StorageRecovered recovered, Catalog catalog)
+    public DatabaseEnvironment Environment { get; }
+
+    private Database(StoragePager pager, StorageRecovered recovered, Catalog catalog, DatabaseEnvironment? environment = null)
     {
+        Environment = environment ?? Jed.DatabaseEnvironment.Builder().Build();
         this.pager = pager; ownedCodec = pager.Codec; committer = new(pager, recovered); current = new(catalog, recovered.Meta) { Encrypted = recovered.Encrypted };
     }
-    public static Task<Database> CreateInMemoryAsync(int pageSize = 8192, CancellationToken cancellationToken = default)
-        => CreateStoreAsync(new MemoryBlockStore(), pageSize, cancellationToken);
-    internal static async Task<Database> CreateStoreAsync(IBlockStore store, int pageSize = 8192, CancellationToken cancellationToken = default)
+    internal static Task<Database> CreateInMemoryAsync(int pageSize = 8192, CancellationToken cancellationToken = default, DatabaseEnvironment? environment = null)
+        => CreateStoreAsync(new MemoryBlockStore(), pageSize, cancellationToken, environment);
+    internal static async Task<Database> CreateStoreAsync(IBlockStore store, int pageSize = 8192, CancellationToken cancellationToken = default, DatabaseEnvironment? environment = null)
     {
         if (!StorageFormat.ValidPageSize(pageSize)) throw new ArgumentOutOfRangeException(nameof(pageSize));
         var meta = new StorageMeta(pageSize, 1, 2, 3, 0, 1);
@@ -70,11 +73,11 @@ public sealed partial class Database : IAsyncDisposable
         await store.WriteAsync(0, bytes, cancellationToken).ConfigureAwait(false);
         await store.WriteAsync(pageSize, bytes, cancellationToken).ConfigureAwait(false);
         await store.WriteAsync(2L * pageSize, StorageFormat.EncodePage(pageSize, new(1, 0, 0, 0), []), cancellationToken).ConfigureAwait(false);
-        return await OpenStoreAsync(store, cancellationToken, ephemeral: true).ConfigureAwait(false);
+        return await OpenStoreAsync(store, cancellationToken, ephemeral: true, environment: environment).ConfigureAwait(false);
         }
         catch { await store.DisposeAsync().ConfigureAwait(false); throw; }
     }
-    internal static async Task<Database> OpenStoreAsync(IBlockStore store, CancellationToken cancellationToken = default, bool ephemeral = false)
+    internal static async Task<Database> OpenStoreAsync(IBlockStore store, CancellationToken cancellationToken = default, bool ephemeral = false, DatabaseEnvironment? environment = null)
     {
         try
         {
@@ -82,7 +85,7 @@ public sealed partial class Database : IAsyncDisposable
             var pager = new StoragePager(store, recovered.Meta.PageSize);
             var catalog = await Catalog.ReadAsync(pager, recovered.Meta, cancellationToken).ConfigureAwait(false);
             catalog = await StorageTree.ValidateCatalogSpinesAsync(pager, catalog, recovered.Meta, cancellationToken).ConfigureAwait(false);
-            return new(pager, recovered, catalog) { ephemeral = ephemeral };
+            return new(pager, recovered, catalog, environment) { ephemeral = ephemeral };
         }
         catch { await store.DisposeAsync().ConfigureAwait(false); throw; }
     }

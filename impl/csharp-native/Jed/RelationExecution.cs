@@ -3,33 +3,35 @@ using System.Runtime.CompilerServices;
 namespace Jed;
 
 internal sealed record PreparedRelation(BoundColumn[] Columns, IAsyncEnumerable<SqlValue[]> Rows, Func<ValueTask>? Initialize = null, OuterFrame[]? Dependencies = null, Func<ValueTask>? InitializeConstants = null, bool NoReturning = false,
-    Func<Resolved, (PreparedRelation Relation, Resolved? Residual)>? PushFilter = null, long? EstimatedRows = null, BaseRelationAccess? BaseAccess = null, bool MemoryOutput = false, Func<HashSet<int>, PreparedRelation>? WithTouched = null, CrossJoinChain? CrossChain = null, ExplainNode? Plan = null, Func<SortPlan[], long, Resolved?, PreparedRelation?>? Bounded = null, ExplainCte? Cte = null, bool BoundedOutput = false, Func<AccessPlan, PreparedRelation>? WithAccess = null, AccessPlan? SelectedAccess = null);
+    Func<Resolved, (PreparedRelation Relation, Resolved? Residual)>? PushFilter = null, long? EstimatedRows = null, BaseRelationAccess? BaseAccess = null, bool MemoryOutput = false, Func<HashSet<int>, PreparedRelation>? WithTouched = null, CrossJoinChain? CrossChain = null, ExplainNode? Plan = null, Func<SortPlan[], long, Resolved?, PreparedRelation?>? Bounded = null, ExplainCte? Cte = null, bool BoundedOutput = false, Func<AccessPlan, PreparedRelation>? WithAccess = null, AccessPlan? SelectedAccess = null, Func<SelectPlan, PreparedRelation>? WithQuery = null, bool RawLayout = false);
 
 internal static class RelationExecution
 {
-    internal static PreparedRelation Prepare(RelationSyntax source, Database database, DatabaseSnapshot snapshot,
-        PendingDatabase? pending, Catalog catalog, Meter meter, CancellationToken cancellationToken, QueryScope? scope = null, QueryScope? preceding = null)
+    private static void ValidateJoinWindows(RelationSyntax source)
     {
+        switch (source)
+        {
+            case JoinedRelation join:
+                if (join.On is { } predicate && WindowResolve.Contains(predicate)) throw new SqlException(SqlStates.WindowingError, "window functions are not allowed in JOIN conditions");
+                ValidateJoinWindows(join.Left); ValidateJoinWindows(join.Right); break;
+            case GroupedRelation group: ValidateJoinWindows(group.Source); break;
+            case AliasedRelation alias: ValidateJoinWindows(alias.Source); break;
+            case LateralRelation lateral: ValidateJoinWindows(lateral.Source); break;
+        }
+    }
+    internal static PreparedRelation Prepare(RelationSyntax source, Database database, DatabaseSnapshot snapshot,
+        PendingDatabase? pending, Catalog catalog, Meter meter, CancellationToken cancellationToken, QueryScope? scope = null, QueryScope? preceding = null, bool fixedPrefix = false)
+    {
+        ValidateJoinWindows(source);
         if (source is JoinedRelation && NWayPlanning.Prepare(source, database, snapshot, pending, catalog, meter, cancellationToken, scope) is { } island) return island;
         switch (source)
         {
 case GroupedRelation group:
-{
-    PreparedRelation Wrap(PreparedRelation input) => input with
-    {
-        Rows = GroupRows(input.Rows, meter, cancellationToken), BaseAccess = null, CrossChain = null,
-        WithTouched = input.WithTouched is null ? null : mask => Wrap(input.WithTouched(mask)),
-        PushFilter = input.PushFilter is null ? null : filter =>
-        {
-            var pushed = input.PushFilter(filter); return (Wrap(pushed.Relation), pushed.Residual);
-        }
-    };
-    return Wrap(Prepare(group.Source, database, snapshot, pending, catalog, meter, cancellationToken, scope, preceding));
-}
+    return GroupRelation(Prepare(group.Source, database, snapshot, pending, catalog, meter, cancellationToken, scope, preceding), meter, cancellationToken);
             case LateralRelation lateral: return Prepare(lateral.Source, database, snapshot, pending, catalog, meter, cancellationToken, preceding ?? scope);
             case AliasedRelation aliased:
             {
-                var input = Prepare(aliased.Source, database, snapshot, pending, catalog, meter, cancellationToken, scope, preceding);
+                var input = RelationLayout.Normalize(Prepare(aliased.Source, database, snapshot, pending, catalog, meter, cancellationToken, scope, preceding), meter, cancellationToken);
                 var slots = Enumerable.Range(0, input.Columns.Length).Where(i => !input.Columns[i].Hidden).ToArray();
                 PreparedRelation Wrap(PreparedRelation source) => source with
                 {
@@ -79,26 +81,24 @@ var columns = left.Columns.Select((column, index) => column with { Type = Resolv
                     if (cte.NoReturning) throw Errors.Unsupported("WITH query has no RETURNING clause");
                     var reference = cte with { Columns = Alias(cte.Columns, named.Alias ?? named.Name, named.ColumnAliases) };
                     if (meter.Explain is not null && cte.Cte is { } definition)
-                        reference = ExplainPlanning.Attach(reference, new("CTE Scan " + definition.Name, "-", definition.Body.EstimatedRows,
-                            definition.Materialized ? definition.Body.EstimatedRows : definition.Body.EstimatedCost,
-                            definition.Materialized || definition.DefinitionVisible ? [] : [definition.Body]), meter);
+                        reference = ExplainPlanning.CteReference(reference, definition, meter);
                     return reference;
                 }
                 if (CatalogRelations.IsCatalogName(named.Name)) return CatalogRelations.Prepare(named, database, snapshot, pending, catalog, meter, cancellationToken);
                 if (catalog.Scope?.View(named.Name) is { } scopedView)
                 {
                     var home = scopedView.Domain; var viewCatalog = home.Catalog with { Scope = catalog.Scope.Stored(home.Name) };
-                    var body = Query(StatementExecution.ViewQuery(scopedView.View), home.Database, home.Snapshot, home.Pending, viewCatalog, meter, cancellationToken);
+                    var body = Query(StatementExecution.ViewQuery(scopedView.View), home.Database, home.Snapshot, home.Pending, viewCatalog, meter, cancellationToken, derived: true);
                     var columns = Alias(body.Columns, scopedView.View.Name, scopedView.View.Columns.Select(column => column.Name).ToArray());
                     columns = columns.Select(column => column with { RowName = column.Name, Collation = column.Collation?.Implicit() }).ToArray();
-                    return body with { Columns = Alias(columns, named.Alias ?? scopedView.View.Name, named.ColumnAliases) };
+                    return ExplainPlanning.Wrapper(body with { Columns = Alias(columns, named.Alias ?? scopedView.View.Name, named.ColumnAliases) }, "Subquery " + (named.Alias ?? scopedView.View.Name), meter);
                 }
-                if (catalog.Scope is null && (catalog.Views ?? []).FirstOrDefault(view => view.Name == named.Name) is { } view)
+                if (catalog.Scope is null && (catalog.Views ?? []).FirstOrDefault(view => view.Name == StatementExecution.LocalMainName(named.Name)) is { } view)
                 {
-                    var body = Query(StatementExecution.ViewQuery(view), database, snapshot, pending, catalog, meter, cancellationToken);
-                    var columns = Alias(body.Columns, named.Name, view.Columns.Select(column => column.Name).ToArray());
+                    var body = Query(StatementExecution.ViewQuery(view), database, snapshot, pending, catalog, meter, cancellationToken, derived: true);
+                    var columns = Alias(body.Columns, view.Name, view.Columns.Select(column => column.Name).ToArray());
                     columns = columns.Select(column => column with { RowName = column.Name, Collation = column.Collation?.Implicit() }).ToArray();
-                    return body with { Columns = Alias(columns, named.Alias ?? named.Name, named.ColumnAliases) };
+                    return ExplainPlanning.Wrapper(body with { Columns = Alias(columns, named.Alias ?? view.Name, named.ColumnAliases) }, "Subquery " + (named.Alias ?? view.Name), meter);
                 }
                 var table = StatementExecution.ResolveTable(catalog, named.Name);
                 var tableColumns = Alias(StatementExecution.Columns(table), named.Alias ?? table.Name, named.ColumnAliases);
@@ -170,15 +170,20 @@ var columns = left.Columns.Select((column, index) => column with { Type = Resolv
             case DerivedRelation derived:
             {
                 var query = Query(derived.Query, database, snapshot, pending, catalog, meter, cancellationToken, derived: true, scope: scope);
+                if (query.Dependencies is { Length: > 0 } && query.Plan is { } bodyPlan)
+                    query = query with { Rows = ResetGroupObservation(query.Rows, bodyPlan, bodyPlan, cancellationToken) };
                 return ExplainPlanning.Wrapper(query with { Columns = Alias(query.Columns.Select(column => column with { Collation = column.Collation?.Implicit() }).ToArray(), derived.Alias, derived.ColumnAliases) }, "Subquery" + (derived.Alias is null ? "" : " " + derived.Alias), meter);
             }
             case JoinedRelation join:
             {
-                var left = Prepare(join.Left, database, snapshot, pending, catalog, meter, cancellationToken, scope, preceding);
+                var left = RelationLayout.Normalize(Prepare(join.Left, database, snapshot, pending, catalog, meter, cancellationToken, scope, preceding, fixedPrefix: join.Left is JoinedRelation), meter, cancellationToken);
                 var lateralFrame = new OuterFrame(left.Columns);
-                var rightScope = new QueryScope(preceding ?? scope, lateralFrame);
-                var right = Prepare(join.Right, database, snapshot, pending, catalog, meter, cancellationToken, scope, rightScope);
-                var lateral = (right.Dependencies ?? []).Contains(lateralFrame);
+                var rightScope = new QueryScope(preceding ?? scope, lateralFrame, sameLevel: preceding is not null, forbidden: join.Kind is "right" or "full");
+                var rightSyntax = join.Kind == "cross" && join.Right is JoinedRelation ? new GroupedRelation(join.Right) : join.Right;
+                var right = RelationLayout.Normalize(Prepare(rightSyntax, database, snapshot, pending, catalog, meter, cancellationToken, scope, rightScope), meter, cancellationToken);
+                var lateral = (right.Dependencies ?? []).Contains(lateralFrame) ||
+                    join.Kind is "inner" or "cross" or "left" && rightScope.OuterColumns.Any(column =>
+                        column.Level == 1 && column.Outer is { } outer && (right.Dependencies ?? []).Contains(outer.Frame));
                 if (lateral && join.Kind is "right" or "full") throw new SqlException(SqlStates.InvalidColumnReference, "LATERAL reference requires an inner or left join");
 
                 var leftAliases = left.Columns.Where(c => c.Qualifier is not null).Select(c => c.Qualifier).ToHashSet(StringComparer.Ordinal);
@@ -186,6 +191,8 @@ var columns = left.Columns.Select((column, index) => column with { Type = Resolv
                     throw new SqlException(SqlStates.DuplicateAlias, "relation alias appears twice");
                 var inputColumns = left.Columns.Concat(right.Columns).ToArray();
                 var usingNames = join.Natural ? left.Columns.Where(c => !c.Hidden && right.Columns.Any(r => !r.Hidden && r.Name == c.Name)).Select(c => c.Name).Distinct(StringComparer.Ordinal).ToArray() : join.Using ?? [];
+                if (join.Natural && join.Kind == "cross") throw Errors.Syntax("NATURAL CROSS JOIN is not supported");
+                if (join.Kind == "full" && usingNames.Length != 0) throw Errors.Unsupported("FULL JOIN USING is not supported");
                 if (usingNames.Distinct(StringComparer.Ordinal).Count() != usingNames.Length) throw new SqlException(SqlStates.DuplicateColumn, "duplicate USING column");
                 var usingSlots = usingNames.Select(name =>
                 {
@@ -237,8 +244,31 @@ var columns = left.Columns.Select((column, index) => column with { Type = Resolv
                     }
                     return value with { Args = value.Args.Select(InputPredicate).ToArray() };
                 }
-                PreparedRelation Build(PreparedRelation a, PreparedRelation b, Resolved? on, Resolved? where = null, HashSet<int>? touched = null, bool reversed = false)
+                PreparedRelation Build(PreparedRelation a, PreparedRelation b, Resolved? on, Resolved? where = null, HashSet<int>? touched = null, bool reversed = false, SelectPlan? parentPlan = null)
                 {
+                    PreparedRelation BoundResidual(PreparedRelation input, int offset)
+                    {
+                        if (where is null || input.BaseAccess is not { } accessSource || input.WithAccess is null) return input;
+                        var terms = PredicatePlan.Conjuncts(where).Where(term =>
+                        {
+                            if (term.Op is not ("=" or "<" or "<=" or ">" or ">=") || term.Args.Length != 2) return false;
+                            var key = term.Args[0]; var value = term.Args[1];
+                            if (key.Op != "column") (key, value) = (value, key);
+                            return key.Op == "column" && key.Slot >= offset && key.Slot < offset + input.Columns.Length &&
+                                accessSource.Table.PrimaryKey.Contains(key.Slot - offset) && value.Op == "constant" && !value.Constant.IsNull;
+                        }).Select(term => PredicatePlan.Shift(term, -offset)).ToArray();
+                        if (terms.Length == 0) return input;
+                        var predicate = PredicatePlan.Combine(terms.Concat(accessSource.Filter is null ? [] : [accessSource.Filter]));
+                        var selected = AccessPlan.Select(accessSource.Table, accessSource.Tree, predicate, accessSource.Storage, meter);
+                        if (selected.Kind == AccessKind.Full) return input;
+                        selected = selected with { EstimatedCost = Math.Max(0, selected.EstimatedCost -
+                            Estimate.Multiply(selected.EstimatedRows, PredicatePlan.Nodes(predicate!) - (accessSource.Filter is null ? 0 : PredicatePlan.Nodes(accessSource.Filter)))) };
+                        return input.WithAccess(selected);
+                    }
+                    if (join.Kind is "left" or "right" or "full")
+                    {
+                        a = BoundResidual(a, 0); b = BoundResidual(b, a.Columns.Length);
+                    }
                     var authored = reversed ? JoinOrientation.Expression(authoredPredicate, b.Columns.Length, a.Columns.Length) : authoredPredicate;
                     if (!reversed && !lateral && usingSlots.Length == 0 && cells.Count == 0 && join.Kind is "inner" or "cross" &&
                         a.BaseAccess is not null && b.BaseAccess is not null && (a.Dependencies?.Length ?? 0) == 0 && (b.Dependencies?.Length ?? 0) == 0)
@@ -251,18 +281,19 @@ var columns = left.Columns.Select((column, index) => column with { Type = Resolv
                         if (reverseCost < originalCost)
                         {
                             var swappedTouched = touched?.Select(slot => JoinOrientation.Slot(slot, leftWidth, rightWidth)).ToHashSet();
-                            return JoinOrientation.Restore(Build(b, a, swappedOn, swappedWhere, swappedTouched, true), columns, leftWidth, rightWidth, cancellationToken);
+                            return JoinOrientation.Restore(Build(b, a, swappedOn, swappedWhere, swappedTouched, true, parentPlan), columns, leftWidth, rightWidth, cancellationToken);
                         }
                     }
                     var inl = lateral ? null : IndexNestedLoop.Select(b, a.Columns.Length, join.Kind, PredicatePlan.Combine(new[] { on, where }.OfType<Resolved>()));
                     var hash = !lateral && join.Left is not JoinedRelation && join.Right is not JoinedRelation ? HashJoinPlan.Select(authored, a.Columns.Length, join.Kind, a.EstimatedRows, b.EstimatedRows, on) : null;
-                    if (join.Kind is "inner" or "cross" && a.BaseAccess is not null && a.EstimatedRows is { } outerCount && b.EstimatedRows is { } innerCount && b.BaseAccess is { } innerBase)
+                    if ((join.Kind is "inner" or "cross" || fixedPrefix) && a.BaseAccess is not null && a.EstimatedRows is { } outerCount && b.EstimatedRows is { } innerCount && b.BaseAccess is { } innerBase)
                     {
                         var fullCost = AccessPlan.Select(innerBase.Table, innerBase.Tree, innerBase.Filter, innerBase.Storage, meter).EstimatedCost;
-                        var residual = PredicatePlan.Combine(new[] { on, where }.OfType<Resolved>());
-                        var loopCost = Estimate.Add(fullCost, Estimate.Multiply(Estimate.Multiply(outerCount, innerCount), residual is null ? 0 : PredicatePlan.Nodes(residual)));
-                        var hashCost = hash is null ? long.MaxValue : Estimate.Add(fullCost, HashJoinPlan.Work(outerCount, innerCount, hash.Types, residual));
-                        var indexCost = inl?.EstimateWork(outerCount, residual, meter) ?? long.MaxValue;
+                        var filterWork = Estimate.Multiply(Estimate.JoinRows(a, b, on), where is null ? 0 : PredicatePlan.Nodes(where));
+                        var loopCost = Estimate.Add(filterWork, Estimate.Add(fullCost, Estimate.Multiply(Estimate.Multiply(outerCount, innerCount), on is null ? 0 : PredicatePlan.Nodes(on))));
+                        var hashCost = hash is null ? long.MaxValue : Estimate.Add(filterWork, Estimate.Add(fullCost, HashJoinPlan.Work(outerCount, innerCount, hash.Types, on)));
+                        var indexCost = inl is null ? long.MaxValue : Estimate.Add(inl.EstimateWork(outerCount, on, meter),
+                            Estimate.Multiply(inl.EstimateRows(outerCount, on, meter), where is null ? 0 : PredicatePlan.Nodes(where)));
                         if (inl is not null && indexCost <= loopCost && indexCost <= hashCost) hash = null;
                         else { inl = null; if (hashCost > loopCost) hash = null; }
                     }
@@ -270,7 +301,7 @@ var columns = left.Columns.Select((column, index) => column with { Type = Resolv
                     if (inl is not null) inl.PinnedAccess = AccessPlan.Select(inl.Source.Table, inl.Source.Tree, inl.GenericPredicate(), inl.Source.Storage, meter);
                     var chain = !lateral && inl is null && usingSlots.Length == 0 && join.Kind == "cross" && on is null && join.Left is not (GroupedRelation or AliasedRelation) && join.Right is not JoinedRelation
                         ? new CrossJoinChain((a.CrossChain?.Inputs ?? [a]).Append(b).ToArray()) : null;
-                    var spill = hash is not null && database.WorkMem > 0 && database.ScratchHost is { } scratch
+                    var spill = (hash is not null || parentPlan?.Group is not null || parentPlan is { Distinct: true, DistinctOnCount: 0 }) && database.WorkMem > 0 && database.ScratchHost is { } scratch
                         ? new SpillPolicy(scratch, database.WorkMem, null) : null;
                     if (touched is not null)
                     {
@@ -278,6 +309,7 @@ var columns = left.Columns.Select((column, index) => column with { Type = Resolv
                         if (on is not null) mask.UnionWith(PredicatePlan.Slots(on));
                         if (where is not null) mask.UnionWith(PredicatePlan.Slots(where));
                         foreach (var pair in usingSlots) { mask.Add(pair.Left); mask.Add(a.Columns.Length + pair.Right); }
+                        if (lateral) mask.UnionWith(lateralFrame.ReferencedSlots);
                         var leftMask = mask.Where(slot => slot < a.Columns.Length).ToHashSet();
                         var rightMask = mask.Where(slot => slot >= a.Columns.Length).Select(slot => slot - a.Columns.Length).ToHashSet();
                         if (a.WithTouched is { } touchLeft) a = touchLeft(leftMask);
@@ -291,7 +323,7 @@ var columns = left.Columns.Select((column, index) => column with { Type = Resolv
                     var estimated = inl is null ? Estimate.JoinRows(a, b, on) : inl.EstimateRows(a.EstimatedRows ?? PlannerFacts.SrfRows, on, meter);
                     if (join.Kind is "left" or "full") estimated = Math.Max(estimated, a.EstimatedRows ?? PlannerFacts.SrfRows);
                     if (join.Kind is "right" or "full") estimated = Math.Max(estimated, b.EstimatedRows ?? PlannerFacts.SrfRows);
-                    prepared = ExplainPlanning.Join(prepared with { EstimatedRows = estimated }, a, b, join.Kind, on, hash, inl, meter);
+                    prepared = ExplainPlanning.Join(prepared with { EstimatedRows = estimated }, a, b, join.Kind, on, hash, inl, meter, lateral);
                     PreparedRelation? Bounded(SortPlan[] order, long count, Resolved? finalFilter)
                     {
                         if (lateral || hash is not null || usingSlots.Length != 0 || join.Kind is not ("inner" or "cross") ||
@@ -306,7 +338,7 @@ var columns = left.Columns.Select((column, index) => column with { Type = Resolv
                             : SpillStreamingJoin.Run(a, b, on, finalFilter, join.Kind, inl, count, spill, meter, cancellationToken), MemoryOutput = spill is null };
                     }
                     PreparedRelation? retained = null;
-                    retained = prepared with { Bounded = Bounded, CrossChain = chain, MemoryOutput = spill is null, BoundedOutput = spill is not null, WithTouched = mask => touched is not null && touched.SetEquals(mask) ? retained! : Build(a, b, on, where, mask, reversed), PushFilter = filter =>
+                    retained = prepared with { WithQuery = queryPlan => Build(a, b, on, where, touched, reversed, queryPlan), Bounded = Bounded, CrossChain = chain, MemoryOutput = spill is null, BoundedOutput = spill is not null, WithTouched = mask => touched is not null && touched.SetEquals(mask) ? retained! : Build(a, b, on, where, mask, reversed, parentPlan), PushFilter = filter =>
                     {
                         var leftFilters = new List<Resolved>(); var rightFilters = new List<Resolved>(); var residual = new List<Resolved>();
                         foreach (var item in PredicatePlan.Conjuncts(filter))
@@ -319,7 +351,7 @@ var columns = left.Columns.Select((column, index) => column with { Type = Resolv
                         }
                         var nextLeft = leftFilters.Count == 0 ? a : PredicatePlan.Filter(a, PredicatePlan.Order(PredicatePlan.Combine(leftFilters))!, meter, cancellationToken);
                         var nextRight = rightFilters.Count == 0 ? b : PredicatePlan.Filter(b, PredicatePlan.Order(PredicatePlan.Combine(rightFilters))!, meter, cancellationToken);
-                        return (Build(nextLeft, nextRight, on, PredicatePlan.Combine(residual.Select(InputPredicate)), touched, reversed), PredicatePlan.Combine(residual));
+                        return (Build(nextLeft, nextRight, on, PredicatePlan.Combine(residual.Select(InputPredicate)), touched, reversed, parentPlan), PredicatePlan.Combine(residual));
                     } };
                     return retained;
                 }
@@ -364,7 +396,7 @@ var columns = left.Columns.Select((column, index) => column with { Type = Resolv
                     var materialized = references > 0 && (recursive || definition.Materialized == true || definition.Materialized is null && references > 1);
                     var inlined = references > 0 && !materialized;
                     ctePlans.Add((new("CTE " + definition.Name, materialized ? "materialized" : "inlined",
-                        definitionPlan.EstimatedRows, inlined ? 0 : definitionPlan.EstimatedCost, inlined ? [] : [definitionPlan]), materialized));
+                        definitionPlan.EstimatedRows, materialized ? definitionPlan.EstimatedCost : 0, inlined ? [] : [definitionPlan]), materialized));
                     body = body with { Cte = new(definition.Name, materialized, definitionPlan) };
                 }
                 scope.Add(definition.Name, body);
@@ -372,7 +404,7 @@ var columns = left.Columns.Select((column, index) => column with { Type = Resolv
         }
         var subqueries = new List<SubqueryCell>();
         SelectPlan plan; PreparedRelation? preparedInput = null; BaseRelationAccess? baseInput = null; OuterFrame frame; OuterFrame[] inputDependencies = []; Func<ValueTask>? inputConstants = null;
-        if (query.Table is not null && !CatalogRelations.IsCatalogName(query.Table) && !(scope?.TryGet(query.Table, out _) ?? false) && (catalog.Scope is { } domains ? domains.View(query.Table) is null : !(catalog.Views ?? []).Any(view => view.Name == query.Table)))
+        if (query.Table is not null && !CatalogRelations.IsCatalogName(query.Table) && !(scope?.TryGet(query.Table, out _) ?? false) && (catalog.Scope is { } domains ? domains.View(query.Table) is null : !(catalog.Views ?? []).Any(view => view.Name == StatementExecution.LocalMainName(query.Table))))
         {
             var table = StatementExecution.ResolveTable(catalog, query.Table);
             var columns = StatementExecution.Columns(table, query.TableAlias); frame = new(columns);
@@ -388,6 +420,7 @@ var columns = left.Columns.Select((column, index) => column with { Type = Resolv
             plan = Resolve.Select(query, input.Columns.Concat(scope?.OuterColumns ?? []).ToArray());
             preparedInput = input;
         }
+        if (derived) foreach (var subquery in subqueries) subquery.DeferMembership();
         if (derived && query.ValuesQuery && query.Order is not { Length: > 0 } && query.Limit is null && query.Offset == 0) plan = plan with { ChargeRows = false };
 
         async ValueTask Constants()
@@ -420,7 +453,6 @@ PreparedRelation Build(SelectPlan requested)
     if (baseInput is { } source)
     {
         var planning = PlanTransform.CorrelatedAccess(active.Filter) ? active with { Filter = PlanTransform.GenericAccess(active.Filter!) } : active;
-        if (!source.Storage.MembershipBounds && planning.Filter is not null) planning = planning with { Filter = PlanTransform.WithoutMembershipBounds(planning.Filter) };
         var pipeline = SinglePipeline.Select(source.Table, source.Tree, planning, source.Storage, meter);
         active = pipeline.Plan with { Filter = active.Filter };
         if (meter.Explain is not null)
@@ -437,17 +469,20 @@ PreparedRelation Build(SelectPlan requested)
     else
     {
         var input = preparedInput!;
-        if (active.Filter is { } filter && input.PushFilter is { } push)
+        if (!active.Empty && active.Filter is { } filter && input.PushFilter is { } push && input.Cte?.Materialized != true)
         {
             var pushed = push(filter); input = pushed.Relation; active = active with { Filter = pushed.Residual };
         }
         if (input.WithTouched is { } withTouched) input = withTouched(StorageTouchedColumns.Collect(active));
+        if (input.WithQuery is { } withQuery) input = withQuery(active);
         if (active.Group is null && active.Windows is null && !active.Distinct && active.Limit is { } limit && input.Bounded is { } bounded &&
             bounded(active.Order ?? [], Estimate.Add(active.Offset, limit), active.Filter) is { } boundedRelation)
         {
             input = boundedRelation;
             if (meter.Explain is not null && active.Order is { Length: > 0 }) input.Plan?.Append("ordered: join pk ordered");
             active = active with { Order = [], Filter = null };
+            if (limit == 0)
+                active = active with { BeforeZeroLimit = async () => { await foreach (var _ in input.Rows.WithCancellation(cancellationToken).ConfigureAwait(false)) { } } };
         }
         rows = input.Rows; sourceMemory = input.MemoryOutput; boundedInput = input.BoundedOutput;
         inputPlan = input.Plan;
@@ -543,6 +578,33 @@ return Build(plan);
     {
         await foreach (var row in source.ConfigureAwait(false)) yield return Enumerable.Range(0, row.Count).Select(i => row[i]).ToArray();
     }
+private static PreparedRelation GroupRelation(PreparedRelation input, Meter meter, CancellationToken token)
+{
+    if (input.WithTouched is { } touch) input = touch(Enumerable.Range(0, input.Columns.Length).ToHashSet());
+    var grouped = input with { Rows = GroupRows(input.Rows, meter, token), BaseAccess = null, CrossChain = null, WithTouched = null, PushFilter = null, WithQuery = null };
+    if (input.Dependencies is { Length: > 0 } && meter.Explain is not null && input.Plan is { } body)
+    {
+        var projected = new ExplainNode(body.Label, body.Detail, body.EstimatedRows,
+            Estimate.Add(body.EstimatedCost, body.EstimatedRows), body.Children.ToArray());
+        grouped = ExplainPlanning.Attach(grouped, projected, meter);
+        grouped = grouped with { Rows = ResetGroupObservation(grouped.Rows, projected, body, token) };
+        grouped = ExplainPlanning.Wrapper(grouped, "Subquery", meter);
+    }
+    return grouped with
+    {
+        WithTouched = null,
+        PushFilter = input.PushFilter is null ? null : filter =>
+        {
+            var pushed = input.PushFilter(filter); return (GroupRelation(pushed.Relation, meter, token), pushed.Residual);
+        }
+    };
+}
+private static async IAsyncEnumerable<SqlValue[]> ResetGroupObservation(IAsyncEnumerable<SqlValue[]> rows,
+    ExplainNode projected, ExplainNode body, [EnumeratorCancellation] CancellationToken token)
+{
+    body.ResetActual(); if (!ReferenceEquals(body, projected)) projected.ResetActual();
+    await foreach (var row in rows.WithCancellation(token).ConfigureAwait(false)) yield return row;
+}
 private static async IAsyncEnumerable<SqlValue[]> GroupRows(IAsyncEnumerable<SqlValue[]> rows, Meter meter,
     [EnumeratorCancellation] CancellationToken token)
 {

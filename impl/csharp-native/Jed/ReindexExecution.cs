@@ -40,7 +40,7 @@ internal static partial class StatementExecution
     private static async ValueTask ReindexTable(Database database, PendingDatabase pending, CatalogTable table,
         CatalogIndex[] indexes, Meter meter, CancellationToken token)
     {
-        WritableCollations(table, pending.Catalog);
+        WritableCollations(table with { Indexes = indexes }, pending.Catalog);
         var rebuilt = (table.Indexes ?? []).ToDictionary(index => index.Name, StringComparer.Ordinal);
         foreach (var index in indexes.OrderBy(index => index.Name, Utf8NameComparer.Instance))
         {

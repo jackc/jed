@@ -18,6 +18,8 @@ public sealed partial class Database
         if (state.Client is not null) await state.Client.DisposeAsync().ConfigureAwait(false);
         if (state.Server is not null) await state.Server.DisposeAsync().ConfigureAwait(false);
         if (state.LocalStore is not null) await state.LocalStore.DisposeAsync().ConfigureAwait(false);
+        if (ScratchHost is not null) await ScratchHost.DisposeAsync().ConfigureAwait(false);
+        ownedCodec?.Dispose();
         state.Options.RoleHost.Release(state.Path);
     }
 }

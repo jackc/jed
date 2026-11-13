@@ -10,7 +10,7 @@ public sealed partial class Database
     public static async Task<Database> OpenRemoteAsync(Func<CancellationToken, ValueTask<Stream>> connect,
         DatabaseFileOptions? options = null, CancellationToken cancellationToken = default)
     {
-        ArgumentNullException.ThrowIfNull(connect); options ??= new();
+        ArgumentNullException.ThrowIfNull(connect); options = (options ?? new()).WithEnvironment();
         if (options.CacheBytes < 0) throw new ArgumentOutOfRangeException(nameof(options));
         if (options.Locking != FileLocking.Auto) throw new ArgumentException("remote clients require automatic locking", nameof(options));
         var credential = options.Credential?.Value.WireCopy() ?? new PageWireCredential(0, []);
@@ -26,13 +26,14 @@ public sealed partial class Database
                 var store = new PageClientStore(client, read);
                 var served = await UnlockClientAsync(store, read.Meta, options, null, false, cancellationToken).ConfigureAwait(false); codec = served.Codec;
                 var pager = new StoragePager(store, served.Meta.PageSize, options.CacheBytes, codec);
-                var catalog = await ReadServedCatalogAsync(pager, served, cancellationToken).ConfigureAwait(false);
+                var catalog = await ReadServedCatalogAsync(pager, served, options.Environment!, cancellationToken).ConfigureAwait(false);
                 var state = new FileState(null, "", options) { Client = client, Reconnect = Connect, RemoteCredential = credential };
-                database = new(pager, new(served.Meta, 0, 0, [], [], []) { Encrypted = served.Encrypted }, catalog) { fileState = state, keyBlock = served.KeyBlock };
+                database = new(pager, new(served.Meta, 0, 0, [], [], []) { Encrypted = served.Encrypted }, catalog, options.Environment) { fileState = state, keyBlock = served.KeyBlock };
             }
             finally { await EndRemoteReadAsync(client, read.TransactionId).ConfigureAwait(false); }
             database.ObserveClient(client);
             database.SetWorkMem(options.WorkMem == 0 ? DefaultWorkMem : options.WorkMem);
+            database.SetStorageLimit(options.MaxStorageBytes);
             database.ScratchHost = new(options.ScratchEncryption == ScratchEncryption.On || database.ownedCodec is not null, options.ScratchEntropy, devices: options.ScratchDevices);
             return database;
         }

@@ -1,0 +1,38 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#MISE description="Explicit opt-in: inspect SQL using the frozen Go peer for C# diagnostics"
+#USAGE arg "<file>" help="SQL file with blank lines separating statements"
+require_relative "../../impl/csharp-native/Tools/tasks"
+revision = CSharpNativeTasks::BASELINE.fetch("semantic_revision")
+peer = File.join(CSharpNativeTasks::BUILD, "simulation-peer-#{revision}", "impl/go")
+abort "Run a C# simulation with --peer first to extract the pinned peer" unless File.file?(File.join(peer, "go.mod"))
+source = File.join(CSharpNativeTasks::BUILD, "inspect-peer.go")
+File.write(source, <<~'GO')
+  package main
+  import (
+    "context"
+    "fmt"
+    "os"
+    "strings"
+    jed "github.com/jackc/jed/impl/go"
+  )
+  func main() {
+    input, err := os.ReadFile(os.Args[1]); if err != nil { panic(err) }
+    db, err := jed.CreateDatabase(jed.CreateOptions{}); if err != nil { panic(err) }; defer db.Close()
+    session := db.Session(jed.SessionOptions{}); defer session.Close()
+    for _, sql := range strings.Split(strings.TrimSpace(string(input)), "\n\n") {
+      fmt.Println(sql)
+      rows, err := session.Query(context.Background(), sql)
+      if err != nil { fmt.Println(err); continue }
+      fmt.Println(strings.Join(rows.ColumnNames(), " | "))
+      for rows.Next() {
+        values := make([]string, len(rows.Row()))
+        for i, value := range rows.Row() { values[i], err = session.Render(value); if err != nil { panic(err) } }
+        fmt.Println(strings.Join(values, " | "))
+      }
+      if rows.Err() != nil { fmt.Println(rows.Err()) }
+      fmt.Printf("cost=%d\n", rows.Cost()); rows.Close()
+    }
+  }
+GO
+abort "Pinned peer inspection failed" unless system("go", "run", source, File.expand_path(ENV.fetch("usage_file")), chdir: peer)

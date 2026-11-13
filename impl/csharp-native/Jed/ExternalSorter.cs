@@ -17,6 +17,7 @@ internal sealed class ExternalSorter(ScratchHost host, long workMem, Meter meter
     internal long PeakResidentBytes { get; private set; }
     internal async ValueTask Add(SqlValue[] values, CancellationToken token)
     {
+        token.ThrowIfCancellationRequested();
         ObjectDisposedException.ThrowIf(disposed, this);
         if (finished) throw new InvalidOperationException("sort already finished");
         var row = new SqlValue[values.Length];

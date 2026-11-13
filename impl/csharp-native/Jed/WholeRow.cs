@@ -7,6 +7,7 @@ internal static partial class Resolve
         var members = columns.Select((column, slot) => (column, slot)).Where(item => item.column.Qualifier == expression.Text && item.column.WholeRow).ToArray();
         if (members.Length == 0) return null;
         var level = members.Min(item => item.column.Level); members = members.Where(item => item.column.Level == level).ToArray();
+        if (members[0].column.LateralForbidden) throw new SqlException(SqlStates.InvalidColumnReference, "LATERAL reference requires an inner or left join");
         var fields = new List<Expression>();
         foreach (var (column, slot) in members)
         {

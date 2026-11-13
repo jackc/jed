@@ -4,10 +4,21 @@ namespace Jed;
 
 internal sealed record CteSyntax(string Name, string[]? Columns, SelectSyntax Query, bool? Materialized, StatementSyntax? Mutation = null, SearchSyntax? Search = null, CycleSyntax? Cycle = null);
 internal sealed record WithStatementSyntax(CteSyntax[] Definitions, bool Recursive, StatementSyntax Body) : StatementSyntax;
-internal sealed class QueryScope(QueryScope? parent = null, OuterFrame? frame = null)
+internal sealed class QueryScope(QueryScope? parent = null, OuterFrame? frame = null, bool sameLevel = false, bool forbidden = false)
 {
-    internal BoundColumn[] OuterColumns { get; } = frame is null ? parent?.OuterColumns ?? [] :
-        frame.Columns.Select((column, slot) => column with { Outer = new(frame, slot), Level = 1, Projection = column.Projection is { } projection ? frame.Lift(projection) : null }).Concat((parent?.OuterColumns ?? []).Select(column => column with { Level = column.Level + 1 })).ToArray();
+    internal BoundColumn[] OuterColumns { get; } = Columns(parent, frame, sameLevel, forbidden);
+    private static BoundColumn[] Columns(QueryScope? parent, OuterFrame? frame, bool sameLevel, bool forbidden)
+    {
+        if (frame is null) return parent?.OuterColumns ?? [];
+        var current = frame.Columns.Select((column, slot) => column with
+        {
+            Outer = new(frame, slot), Level = 1, LateralForbidden = forbidden || column.LateralForbidden,
+            Projection = column.Projection is { } projection ? frame.Lift(projection) : null
+        });
+        var inherited = parent?.OuterColumns ?? [];
+        return sameLevel ? inherited.Concat(current).ToArray() :
+            current.Concat(inherited.Select(column => column with { Level = column.Level + 1 })).ToArray();
+    }
     private readonly Dictionary<string, PreparedRelation> relations = new(StringComparer.Ordinal);
     internal bool TryGet(string name, out PreparedRelation relation)
     {

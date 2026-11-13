@@ -1,5 +1,21 @@
 # C# experiment progress
 
+## Current development state
+
+The complete `5adaba0d` SQL inventory passes every applicable memory, plain-file
+and encrypted file, including all 2,761 encrypted cost/EXPLAIN events against
+frozen Go. The detailed counts and source identity are in `VERIFICATION.md`.
+Reopened composite defaults, CTAS interval qualifiers, dependent views and fixture
+handling are repaired. Full host, mixed-process and threaded-stress evidence is
+recorded separately; passing SQL is not treated as proof of the embedding API.
+
+Immutable environments, host-function registration and native binding/result
+helpers now pass full JIT and NativeAOT host tests. Streaming host batching and
+the complete simulation matrix remain active work. The opt-in diagnostic benchmark
+host passes matched-answer smoke checks; quiet JIT/NativeAOT measurements remain.
+It records startup/cold-open timings, allocation/GC observations and enabled
+durability barriers. The experiment remains incomplete and unfrozen.
+
 ## 2026-11-12 — charter, tooling and first vertical slice
 
 Authorization follows the Swift experiment lifecycle: an independent engine,
@@ -305,3 +321,28 @@ spilling at a prior capture, including ordered collections. Shared group/DISTINC
 spill thresholds and upstream SRF memory accounting have focused passing evidence.
 Encrypted recovery now reproduces every physical image in its saved regression;
 SQL cost checks and additional simulator traces remain separate acceptance work.
+
+### Continued planner and service verification — 2026-11-13
+
+The complete canonical memory run at
+`c250b53b8116d2d0ddf45c6619d83f85c6dd3ef77c3b99a79c4d252ee5408a46`
+passes 737 of 763 files, with 21,381 records in passing files, 24 failures and two
+declared mode exclusions. Remaining failures concern join planning, scope,
+EXPLAIN and resource scheduling. Later focused captures close further cases;
+they do not replace a complete acceptance run.
+
+The saved 403-step encrypted recovery trace now matches the pinned Go peer
+exactly, including costs, images and key events. The complete 304-step
+owner/client service trace also matches, using the production protocol handlers
+over an injected transport. Reconnect, rekey/promotion and current-key backup
+regressions have separate complete passing traces. Full backend, spill, host,
+NativeAOT and performance verification remain required before completion.
+
+2026-11-13 host matrix follow-up: all 496 canonical mixed C#/Go/Rust/Node
+process pairings pass, including exact final and backup images. The threaded
+stress profile passes on C# memory/plain/encrypted hosts and the independent Go
+actor (16,000 snapshot checks, identical final checksum). Saved deterministic
+simulation coverage is 18/19 complete exact traces; the remaining attachment
+maintenance event is being corrected and rerun. Detailed immutable artifact
+hashes and logs are in VERIFICATION.md. Immutable environment and host-function
+APIs are being integrated before the next complete host/NativeAOT capture.

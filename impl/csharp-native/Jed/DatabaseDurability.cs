@@ -2,7 +2,7 @@ namespace Jed;
 
 public sealed partial class Database
 {
-    internal Func<long>? Clock => fileState?.Options.Clock;
+    internal Func<long> Clock => fileState?.Options.Clock ?? Environment.ClockSource.NowMicroseconds;
     private bool SynchronousCommits => fileState?.Options.Synchronous != Synchronous.Off;
 
     // Called only for an actual owner commit, after writer admission. Memory

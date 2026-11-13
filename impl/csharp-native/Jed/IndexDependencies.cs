@@ -32,6 +32,8 @@ internal static partial class StatementExecution
 
     private static CatalogIndex PinIndexDependencies(CatalogIndex index, IEnumerable<Resolved> expressions, Meter meter)
     {
+        expressions = expressions.ToArray();
+        var hostPins = HostDependencies.Collect(expressions, immutable: true);
         var pins = new Dictionary<string, CatalogTimezoneDependency>(StringComparer.Ordinal); var dynamic = false;
         void Pin(string name, bool loaded = false)
         {
@@ -62,11 +64,19 @@ internal static partial class StatementExecution
         }
         foreach (var expression in expressions) { ValidateIndexDependencies(expression); Visit(expression); }
         if (pins.Count > ushort.MaxValue) throw new SqlException(SqlStates.ProgramLimitExceeded, "too many time-zone dependencies");
-        return index with { TimezoneDependencies = pins.Count != 0 || dynamic ? pins.Values.OrderBy(pin => pin.Name, Utf8NameComparer.Instance).ToArray() : null, DynamicTimezone = dynamic };
+        return index with { HostDependencies = hostPins, TimezoneDependencies = pins.Count != 0 || dynamic ? pins.Values.OrderBy(pin => pin.Name, Utf8NameComparer.Instance).ToArray() : null, DynamicTimezone = dynamic };
     }
 
+    private static void ParseIndexDefinitions(CatalogIndex index)
+    {
+        foreach (var key in index.Keys) if (key.Expression is { } expression) _ = StoredExpression(expression);
+        if (index.Predicate is { } predicate) _ = StoredExpression(predicate);
+    }
     internal static bool IndexDependenciesUsable(CatalogIndex index, Catalog catalog)
     {
+        try { ParseIndexDefinitions(index); }
+        catch (SqlException error) when (error.SqlState == SqlStates.UnparsableStoredDefinition) { return false; }
+        try { VerifyIndexHostDependencies(index, catalog); } catch (SqlException) { return false; }
         if (index.TimezoneDependencies is not { } pins) return true;
         var data = catalog.BoundTimeZones;
         if (index.DynamicTimezone)
@@ -86,8 +96,21 @@ internal static partial class StatementExecution
         }
         return true;
     }
+    private static void VerifyIndexHostDependencies(CatalogIndex index, Catalog catalog)
+    {
+        if (index.HostDependencies is null && !(catalog.BoundEnvironment?.Functions.Count > 0)) return;
+        HostDependencies.Verify(index.HostDependencies, catalog.BoundEnvironment);
+        var table = catalog.Tables.FirstOrDefault(table => (table.Indexes ?? []).Any(candidate => candidate.Name == index.Name));
+        if (table is null) return;
+        var resolved = index.Keys.Where(key => key.Expression is not null).Select(key => key.Expression!)
+            .Concat(index.Predicate is null ? [] : new[] { index.Predicate })
+            .Select(text => Resolve.Expr(Resolve.Bind(Resolve.BindTypes(StoredExpression(text), catalog), Columns(table)))).ToArray();
+        HostDependencies.VerifyResolved(index.HostDependencies, resolved);
+        foreach (var expression in resolved) ValidateIndexDependencies(expression);
+    }
     private static void WritableIndexDependencies(CatalogTable table, Catalog catalog)
     {
+        foreach (var index in table.Indexes ?? []) { ParseIndexDefinitions(index); VerifyIndexHostDependencies(index, catalog); }
         if ((table.Indexes ?? []).Any(index => !IndexDependenciesUsable(index, catalog)))
             throw new SqlException(SqlStates.CollationVersionMismatch, "index dependency differs from the loaded environment; rebuild the index");
     }

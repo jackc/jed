@@ -27,8 +27,10 @@ SHA-224/Argon2id dependency. The explicit AOT task also restores the SDK's Micro
 compiler/runtime packs and needs a native compiler such as clang.
 
 `csharp-native:conformance --file path/to/file.test` attempts one complete file.
-`--suite name` attempts a pinned suite; `--all` attempts the pinned baseline and is expected to fail while the engine and
-adapters are incomplete. Neither option silently skips unsupported records.
+`--suite name` attempts a pinned suite; `--all` attempts the pinned baseline.
+Neither option silently skips unsupported records. `--variant aot` runs the
+published NativeAOT executable; `jit-runtime-async` and `aot-runtime-async`
+select the separately verified runtime-async compilations.
 `--disk` reopens the native file and session before every eligible record. `--encrypted`
 uses the same reopened file path under a fixed fixture credential and writes the separate
 cost/EXPLAIN transcript; `csharp-native:conformance-peer <run-log>` compares complete passing
@@ -41,7 +43,7 @@ No normal repository task builds or installs this experiment.
 ```csharp
 using Jed;
 
-await using var database = await Database.CreateInMemoryAsync();
+await using var database = await Database.CreateAsync(new() { Path = "example.jed" });
 await using var session = database.CreateSession();
 await using var rows = await session.QueryAsync(
     "SELECT CAST(40 AS i32) + 2 AS answer",
@@ -65,6 +67,80 @@ rows; `null` means the statement has no command count. Prepared `ExecuteAsync`
 drains the cursor and returns the same nullable count. `CREATE TABLE AS` reports
 the copied row count, except `WITH NO DATA` and skipped `IF NOT EXISTS` commands.
 
+Native parameters use `SqlValue` implicit conversions, preserving the same static
+inference and range checks as explicit values:
+
+```csharp
+await session.ExecuteAsync("INSERT INTO items (id, name) VALUES ($1, $2)", [42, "sample"]);
+await foreach (var item in session.QueryAsync(
+    "SELECT id, name FROM items WHERE id = $1",
+    row => (Id: row.Get<int>(0), Name: row.Get<string>(1)), [42]))
+    Console.WriteLine(item);
+```
+
+`Row.Get<T>` checks the SQL family and destination range; nullable/reference
+destinations accept SQL NULL, while a nonnullable destination rejects it.
+`Rows.GetOrdinal` resolves a column name once for indexed reads. `Row.Values()`
+returns native scalars and engine container values; the raw `row[index]` remains
+available for full fidelity. `SqlValue.From(object)` handles nullable scalars,
+one-dimensional native arrays and `ISqlValueProvider` conversions. `SqlArray`
+supplies explicit multidimensional shapes. Large SQL decimals remain
+`ExactDecimal`; conversion to `System.Decimal` rejects precision loss.
+
+`DateTimeOffset` parameters bind their instant to `timestamptz` and their own
+calendar fields to `timestamp`/`date`, independently of the session zone, including
+array elements. UTC `DateTime` carries an instant; unspecified `DateTime` carries
+calendar fields only. Local `DateTime` requires explicit conversion to
+`DateTimeOffset`. `DateOnly` binds a date. Sub-microsecond timestamp ticks are
+truncated toward the earlier microsecond. Native reads distinguish unspecified
+`DateTime` from UTC `DateTimeOffset`; values outside the CLR temporal range stay
+raw `SqlValue` in `Values()`, and typed temporal getters reject them.
+
+`QueryFirstOrDefaultAsync` returns the first owned row or null and closes the
+cursor. The generic mapping overload streams through a caller-supplied delegate;
+breaking iteration or a mapper exception closes the cursor. It uses no reflection
+or implicit result collection and works under NativeAOT.
+
+Outside inputs and host functions belong to an immutable `DatabaseEnvironment`:
+
+```csharp
+var environment = DatabaseEnvironment.Builder()
+    .RegisterFunction(new HostFunction("host_identity", [SqlType.I64], SqlType.I64,
+        arguments => arguments[0])
+    {
+        Volatility = FunctionVolatility.Immutable,
+        Cost = 1,
+        ComponentId = "example",
+        SemanticVersion = 1
+    })
+    .Build();
+await using var custom = await Database.CreateAsync(new() { Environment = environment });
+```
+
+The builder also loads pinned Unicode/time-zone bundles and accepts injected clock
+and random sources. Builder changes do not alter previously built environments;
+explicitly shared stateful sources remain shared. Temporary databases and attached
+files inherit the environment. Persisted host-dependent expressions pin component
+and semantic versions; an incompatible registration requires an explicit rebuild.
+Host kernels are strict about NULL and their result types are checked. A batch
+kernel appends results in row order; a thrown error identifies the first row after
+that successful prefix. Host code remains outside the built-in safety guarantees.
+
+Nonvolatile batch kernels with trivial arguments can prefetch up to 1,024 rows
+already held by an eager buffer, resident sort or DISTINCT stage. Streaming
+primary/full scans over a single interval, spilled sort output and grouped output
+spools use windows of at most 64 rows. Cost headroom and the remaining LIMIT window
+reduce those caps. Replay preserves ordinary per-row charges, NULL handling,
+result checks and error order; read-ahead defers a source error until its preceding
+rows have been consumed and never fetches a deferred large value speculatively.
+
+Disjoint-interval and secondary-index streaming paths currently call batch
+kernels one row at a time. A spilled sort with an active query-memory account also
+uses one-row windows to preserve its charged merge-head schedule. Volatile,
+zero-argument, conditional and nontrivial-argument calls stay scalar. These are
+optimization limits: chunk sizes and callback counts are host-observable, but are
+not a cross-core conformance contract ([batch ABI](../../spec/design/extensibility.md)).
+
 `SqlException.SqlState` is the stable error identity. Cancellation throws
 `SqlCanceledException`, an `OperationCanceledException` carrying SQLSTATE `57014`
 through `ISqlError`; tasks and value tasks enter the canceled state. Cursor cost
@@ -74,13 +150,16 @@ without executing its expressions.
 Resident scalar operations complete inline. File reads, recovery, commit and the
 page-client transport await I/O through the same semantic core. Durable barriers
 use the required OS synchronization operation. There is no Task.Run wrapper.
-`Database.CreateFileAsync` and `Database.OpenFileAsync` expose the experimental
+`Database.CreateAsync(new() { Path = "example.jed" })` creates a new file;
+`Database.OpenAsync("example.jed")` opens an existing file. Omitting `Path` creates
+an in-memory database through the same options surface. These expose the experimental
 Linux file host; use separate sessions for independent cursors and transactions.
 `DatabaseFileOptions.Synchronous` defaults to `Synchronous.On`. `Off` keeps commits atomic
 while batching durability; the page owner maintains the cumulative manifest and durable floor.
 `FlushIntervalMilliseconds` defaults to 1000 (zero disables the time trigger). Close, maintenance,
-cap and deadline flushes make the pending batch durable. The optional `Clock` callback returns
-Unix microseconds and supplies both durability deadlines and sessions without a clock override.
+cap and deadline flushes make the pending batch durable. The environment's
+`IClockSource.NowMicroseconds()` returns Unix microseconds and supplies both
+durability deadlines and SQL clock functions.
 
 `Database.ChangeCredentialAsync` rewraps an encrypted file's data key without
 rewriting its data pages. The current file owner performs the operation; retained
@@ -96,8 +175,8 @@ decrypts the selected file. An encrypted scratch policy on the parent is inherit
 by its attached file handles.
 
 The public surface includes exact decimal, temporal and recursive values, parameter
-binding and reusable prepared syntax. The scope inventory records missing SQL,
-resource-accounting, spill, host and maintenance behavior. JIT/NativeAOT evidence
-is tied to specific source digests in the verification record; performance remains
-unmeasured. No public package compatibility promise is made by these experimental
-APIs.
+binding and reusable prepared syntax. The scope inventory and verification record
+track implemented coverage and the remaining host, simulation and measurement
+gates. JIT/NativeAOT evidence is tied to specific source digests; diagnostic timings
+are not yet accepted measurements. No public package compatibility promise is
+made by these experimental APIs.

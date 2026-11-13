@@ -108,7 +108,7 @@ internal static class ProcessActor
                             }
                             break;
                         case "HANGUP_NEXT_ACK": activeDatabase.BeforeNextAcknowledgementForTesting(() => throw new IOException("injected lost acknowledgement")); break;
-                        case "CRASH_NEXT_ACK": activeDatabase.BeforeNextAcknowledgementForTesting(() => Environment.Exit(86)); break;
+                        case "CRASH_NEXT_ACK": activeDatabase.BeforeNextAcknowledgementForTesting(() => System.Environment.Exit(86)); break;
                         case "CLOSE":
                             if (reader is not null) await reader.DisposeAsync().ConfigureAwait(false); reader = null;
                             if (writer is not null) await writer.DisposeAsync().ConfigureAwait(false); writer = null;
@@ -133,7 +133,7 @@ internal static class ProcessActor
     private static void Reply(Exception error)
     {
         Console.WriteLine("ERR\t" + (error is ISqlError sql ? sql.SqlState : "XXXXX") + "\t" + Convert.ToHexStringLower(System.Text.Encoding.UTF8.GetBytes(error.Message))); Console.Out.Flush();
-        if (Environment.GetEnvironmentVariable("JED_PROCESS_TRACE") == "1") Console.Error.WriteLine(error);
+        if (System.Environment.GetEnvironmentVariable("JED_PROCESS_TRACE") == "1") Console.Error.WriteLine(error);
     }
     private static string Sql(string hex) => new System.Text.UTF8Encoding(false, true).GetString(Convert.FromHexString(hex));
     private static async Task Execute(Session session, string sql)

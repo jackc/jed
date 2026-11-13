@@ -175,8 +175,8 @@ internal sealed record SecondaryAccess(CatalogIndex Index, StorageTree Tree, Tab
 internal static partial class StatementExecution
 {
     internal static Resolved[] ResolveIndexKeys(CatalogTable table, CatalogIndex index, Catalog catalog) => index.Keys.Select(key => key.Expression is { } sql
-        ? Resolve.Expr(Resolve.Bind(Resolve.BindTypes(StoredExpression(sql), catalog, new TemporalContext(static () => throw new InvalidOperationException("index key reads clock"), "UTC", data: catalog.BoundTimeZones, unicode: catalog.BoundUnicode)), Columns(table)))
+        ? Resolve.Expr(Resolve.Bind(Resolve.BindTypes(StoredExpression(sql), catalog, new TemporalContext(static () => throw new InvalidOperationException("index key reads clock"), "UTC", data: catalog.BoundTimeZones, unicode: catalog.BoundUnicode, environment: catalog.BoundEnvironment)), Columns(table)))
         : new Resolved("column", table.Columns[key.Column].Type.Type, default, [], Slot: key.Column, Collation: CollationRules.Collatable(table.Columns[key.Column].Type.Type) ? new(table.Columns[key.Column].Collation ?? "C", Table: table.Columns[key.Column].CollationData) : null)).ToArray();
     internal static Resolved? ResolveIndexPredicate(CatalogTable table, CatalogIndex index, Catalog catalog) => index.Predicate is { } sql
-        ? Resolve.Expr(Resolve.Bind(Resolve.BindTypes(StoredExpression(sql), catalog, new TemporalContext(static () => throw new InvalidOperationException("index predicate reads clock"), "UTC", data: catalog.BoundTimeZones, unicode: catalog.BoundUnicode)), Columns(table))) : null;
+        ? Resolve.Expr(Resolve.Bind(Resolve.BindTypes(StoredExpression(sql), catalog, new TemporalContext(static () => throw new InvalidOperationException("index predicate reads clock"), "UTC", data: catalog.BoundTimeZones, unicode: catalog.BoundUnicode, environment: catalog.BoundEnvironment)), Columns(table))) : null;
 }

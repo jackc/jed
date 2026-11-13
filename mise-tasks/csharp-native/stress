@@ -1,0 +1,66 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#MISE description="Explicit opt-in: pinned parallel reader/writer stress on C# memory/plain/encrypted hosts and independent Go checksum"
+#USAGE flag "--no-build" help="Capture the existing C# Release assembly"
+require_relative "../../impl/csharp-native/Tools/peer_actors"
+require_relative "../../scripts/lib/bundle_setup"
+require "toml-rb"
+require "tmpdir"
+
+revision = CSharpNativeTasks::BASELINE.fetch("semantic_revision")
+peers = CSharpPeerActors.root
+marker = File.join(peers, ".stress-complete")
+unless File.file?(marker)
+  statuses = Open3.pipeline(["git", "archive", revision, "bench/go", "stress", { chdir: CSharpNativeTasks::ROOT }], ["tar", "-x", "-C", peers])
+  abort "Cannot extract pinned stress peer" unless statuses.all?(&:success?)
+  File.write(marker, revision + "\n")
+end
+profiles = Dir.glob(File.join(peers, "stress/*.stress.toml")).sort
+abort "Pinned stress inventory changed" unless profiles.map { File.basename(_1) } == ["balance_transfer.stress.toml"]
+inputs = profiles.map { TomlRB.parse(File.read(_1)) }
+go = File.join(peers, "bench/go/stress_actor")
+unless File.executable?(go)
+  abort "Offline Go stress peer build failed" unless system({ "GOPROXY" => "off", "CGO_ENABLED" => "0" }, "go", "build", "-o", go, "./cmd/stress", chdir: File.join(peers, "bench/go"))
+end
+dll = ENV["usage_no_build"] == "true" ? File.join(CSharpNativeTasks::PACKAGE, "Jed.Check/bin/Release/net11.0/Jed.Check.dll") : CSharpNativeTasks.build
+output = Dir.mktmpdir("jed-csharp-stress-")
+warn "Stress evidence: #{output}"
+actor = File.join(output, "actor"); FileUtils.mkdir_p(actor)
+source = File.dirname(dll)
+hashes = Dir.glob(File.join(source, "*")).select { File.file?(_1) }.to_h { |path| [File.basename(path), Digest::SHA256.file(path).hexdigest] }
+hashes.each_key { |name| FileUtils.cp(File.join(source, name), File.join(actor, name)) }
+hashes.each { |name, hash| abort "Stress actor changed during capture" unless Digest::SHA256.file(File.join(source, name)).hexdigest == hash && Digest::SHA256.file(File.join(actor, name)).hexdigest == hash }
+input = File.join(output, "profiles.json"); File.write(input, JSON.generate(schema: 1, profiles: inputs))
+results = []; failures = []
+%w[memory disk encrypted].each do |storage|
+  stdout, stderr, status = Open3.capture3(CSharpNativeTasks.environment, CSharpNativeTasks.dotnet, File.join(actor, "Jed.Check.dll"), "stress", input, storage)
+  File.write(File.join(output, storage + ".jsonl"), stdout); File.write(File.join(output, storage + ".log"), stderr)
+  failures << "C# #{storage} runner failed: #{stderr}" unless status.success?
+  rows = stdout.lines.map { JSON.parse(_1) }
+  failures << "C# #{storage} incomplete profile output" unless rows.length == inputs.length
+  results.concat(rows)
+end
+go_results = File.join(output, "go.jsonl")
+stdout, stderr, status = Open3.capture3(go, File.join(peers, "stress"), go_results)
+File.write(File.join(output, "go.log"), stdout + stderr)
+failures << "Pinned Go stress failed" unless status.success?
+results.concat(File.readlines(go_results).map { JSON.parse(_1) }) if File.file?(go_results)
+inputs.each do |profile|
+  name = profile.fetch("meta").fetch("name")
+  rows = results.select { _1["name"] == name }
+  expected_checks = profile.fetch("worker").select { _1["kind"] == "reader" }.sum { _1.fetch("count") * _1.fetch("iterations") }
+  writers = profile.fetch("worker").select { _1["kind"] == "writer" }
+  expected = { "schema" => 1, "status" => "pass", "mode" => "threaded", "invariant_checks" => expected_checks,
+    "writers" => writers.sum { _1.fetch("count") }, "writer_iters" => writers.sum { _1.fetch("count") * _1.fetch("iterations") },
+    "final_ok" => true, "cross_core_checksum" => profile.fetch("final").fetch("cross_core_checksum") }
+  failures << "#{name}: missing or duplicate core/storage outputs" unless rows.map { [_1["lang"], _1["storage"]] }.sort_by(&:inspect) == [["csharp-native", "memory"], ["csharp-native", "disk"], ["csharp-native", "encrypted"], ["go", nil]].sort_by(&:inspect)
+  rows.each do |row|
+    expected.each { |key, value| failures << "#{row['lang']}/#{row['storage']}: #{key} differs" unless row[key] == value && (!value.is_a?(Integer) || row[key].is_a?(Integer)) }
+    failures << "invalid stress checksum" unless row["checksum"].is_a?(String) && row["checksum"].match?(/\A[0-9a-f]{16}\z/)
+  end
+  failures << "#{name}: independent final checksum differs" unless rows.map { _1["checksum"] }.uniq.length == 1
+end
+File.write(File.join(output, "report.json"), JSON.pretty_generate(baseline: revision, profiles: profiles.to_h { [File.basename(_1), Digest::SHA256.file(_1).hexdigest] },
+  csharp_artifacts: hashes, go_actor: Digest::SHA256.file(go).hexdigest, results: results, failures: failures) + "\n")
+abort failures.join("\n") unless failures.empty?
+puts "PASS parallel stress: 3 C# storage modes and pinned Go, #{results.sum { _1.fetch('invariant_checks') }} snapshot checks, exact final checksum #{results.first.fetch('checksum')}"

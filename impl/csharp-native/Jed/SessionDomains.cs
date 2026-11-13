@@ -34,17 +34,19 @@ public sealed partial class Session
     {
         if (temporaryDatabase is not null) return temporaryDatabase;
         var root = await GetDatabase(token).ConfigureAwait(false);
+        await using var rootPin = await root.PinAsync(token).ConfigureAwait(false);
+        var pageSize = rootPin.Snapshot.Meta.PageSize;
         temporaryDatabase = root.ScratchHost is { } scratch
-            ? await Database.CreateStoreAsync(scratch.CreateSpillable(options.TempBuffers == 0 ? long.MaxValue : options.TempBuffers), cancellationToken: token).ConfigureAwait(false)
-            : await Database.CreateInMemoryAsync(cancellationToken: token).ConfigureAwait(false);
+            ? await Database.CreateStoreAsync(scratch.CreateSpillable(options.TempBuffers == 0 ? long.MaxValue : options.TempBuffers), pageSize, cancellationToken: token, environment: Environment).ConfigureAwait(false)
+            : await Database.CreateInMemoryAsync(pageSize, cancellationToken: token, environment: Environment).ConfigureAwait(false);
         return temporaryDatabase;
     }
 
-    private static void BindDomainCollations(DatabaseDomains scope, UnicodeData? unicode, TimeZoneData? timeZones)
+    private static void BindDomainCollations(DatabaseDomains scope, UnicodeData? unicode, TimeZoneData? timeZones, DatabaseEnvironment? environment)
     {
         foreach (var domain in scope.Items.ToArray())
         {
-            var catalog = scope.BindCatalog(domain).BindCollations(unicode, timeZones);
+            var catalog = scope.BindCatalog(domain).BindCollations(unicode, timeZones, environment);
             if (domain.Pending is { } pending) pending.Catalog = catalog;
             else scope.Replace(domain with { Snapshot = domain.Snapshot with { Catalog = catalog } });
         }
@@ -90,7 +92,7 @@ public sealed partial class Session
         try
         {
             var scope = (domainTransaction ?? lease.Scope).Fork();
-            BindDomainCollations(scope, meter.Unicode, meter.Temporal.Data);
+            BindDomainCollations(scope, meter.Unicode, meter.Temporal.Data, meter.Temporal.Environment);
             var main = scope.Get("main"); var catalog = scope.BindCatalog(main);
             var writes = statement is not SelectSyntax selected || SequenceExecution.Writes(selected, catalog);
             CheckDdl(statement, DomainExecution.Target(statement) is { } target && scope.Resolve(target,
@@ -101,7 +103,7 @@ public sealed partial class Session
                 var persistent = PersistentWrite(statement, scope);
                 await lease.DisposeAsync().ConfigureAwait(false);
                 lease = await DomainLease.Acquire(db, temp, persistent, true, token).ConfigureAwait(false);
-                scope = lease.Scope.Fork(); BindDomainCollations(scope, meter.Unicode, meter.Temporal.Data);
+                scope = lease.Scope.Fork(); BindDomainCollations(scope, meter.Unicode, meter.Temporal.Data, meter.Temporal.Environment);
                 main = scope.Get("main"); catalog = scope.BindCatalog(main);
             }
             foreach (var domain in scope.Items) if (domain.Pending is { } pending) pending.TrackMemory = domain.Name != "temp" && meter.Memory.Enabled;
@@ -180,7 +182,7 @@ public sealed partial class Session
                     lease!.CheckRoles();
                     if (!domainReadOnly)
                     {
-                        BindDomainCollations(scope, meter.Unicode, meter.Temporal.Data); meter.Sequences.Bind(scope.BindCatalog(scope.Get("main")), scope.Get("main").Pending);
+                        BindDomainCollations(scope, meter.Unicode, meter.Temporal.Data, meter.Temporal.Environment); meter.Sequences.Bind(scope.BindCatalog(scope.Get("main")), scope.Get("main").Pending);
                         await StatementExecution.TemporaryCommit(scope, meter, token).ConfigureAwait(false);
                         await lease!.ReleaseWriterPinsForCommitAsync().ConfigureAwait(false);
                         await Database.CommitDomainsAsync(scope, token).ConfigureAwait(false);

@@ -5,6 +5,7 @@
 #USAGE flag "--native-instructions" help="Also verify this host's accelerated instruction set (artifact is host-specific)"
 require_relative "../../impl/csharp-native/Tools/tasks"
 require_relative "../../impl/csharp-native/Tools/encoding"
+require "tmpdir"
 CSharpNativeEncoding.generate
 
 abort "Initial AOT acceptance targets Linux x86-64" unless RUBY_PLATFORM.include?("linux") && RUBY_PLATFORM.include?("x86_64")
@@ -13,17 +14,34 @@ native = ENV["usage_native_instructions"] == "true"
 output += "-native" if native
 feature = ENV["usage_runtime_async"] == "true" ? "runtime-async=on" : ""
 puts "C# net11.0 NativeAOT, SDK #{CSharpNativeTasks.sdk_version}, Runtime Async #{feature.empty? ? 'default' : 'on'}"
-puts "Source SHA-256: #{CSharpNativeTasks.source_digest}"
+digest = CSharpNativeTasks.source_digest
+puts "Source SHA-256: #{digest}"
 puts "NativeAOT instruction set: #{native ? 'native (host-specific)' : 'SDK default'}"
+$stdout.flush
+# Native compilation is long enough that other independent work may continue.
+# Copy only declared project inputs, then verify the source capture before any
+# compiler sees it. Both JIT and native compilation use this immutable directory.
+FileUtils.mkdir_p(CSharpNativeTasks::BUILD)
+capture = Dir.mktmpdir("aot-source-", CSharpNativeTasks::BUILD)
+inputs = %w[global.json Directory.Build.props NuGet.Config] +
+         Dir.glob("{Jed,Jed.Check}/*.{cs,csproj,json}", base: CSharpNativeTasks::PACKAGE)
+inputs.sort.each do |relative|
+  target = File.join(capture, relative)
+  FileUtils.mkdir_p(File.dirname(target))
+  FileUtils.cp(File.join(CSharpNativeTasks::PACKAGE, relative), target)
+end
+abort "C# sources changed during AOT capture; retry" unless CSharpNativeTasks.source_digest == digest
+File.write(File.join(capture, "source.sha256"), digest + "\n")
+puts "Immutable NativeAOT source capture: #{capture}"
 $stdout.flush
 restored = system(CSharpNativeTasks.environment, CSharpNativeTasks.dotnet,
                   "restore", "Jed.Check/Jed.Check.csproj", "--runtime", "linux-x64", "-p:PublishAot=true",
-                  "-p:RestoreLockedMode=true", chdir: CSharpNativeTasks::PACKAGE)
+                  "-p:RestoreLockedMode=true", chdir: capture)
 exit($?&.exitstatus || 1) unless restored
 # A different Features value must not reuse a previous compiler invocation's IL.
 clean = system(CSharpNativeTasks.environment, CSharpNativeTasks.dotnet,
                "clean", "Jed.Check/Jed.Check.csproj", "--configuration", "Release", "--runtime", "linux-x64",
-               "--nologo", "--verbosity", "quiet", chdir: CSharpNativeTasks::PACKAGE)
+               "--nologo", "--verbosity", "quiet", chdir: capture)
 exit($?&.exitstatus || 1) unless clean
 # Feed mapping admits only the approved exact-pinned crypto dependency and the
 # SDK's first-party compiler/runtime packs from the official feed.
@@ -31,6 +49,10 @@ ok = system(CSharpNativeTasks.environment, CSharpNativeTasks.dotnet,
             "publish", "Jed.Check/Jed.Check.csproj", "--configuration", "Release", "--runtime", "linux-x64",
             "-p:PublishAot=true", "-p:Features=#{feature}", "--no-restore",
             "-p:IlcInstructionSet=#{native ? 'native' : ''}",
-            "--output", output, chdir: CSharpNativeTasks::PACKAGE)
+            "--output", output, chdir: capture)
 exit($?&.exitstatus || 1) unless ok
+File.write(File.join(output, "source.sha256"), digest + "\n")
+File.write(File.join(output, "build.json"), JSON.pretty_generate(source_sha256: digest,
+  sdk: CSharpNativeTasks.sdk_version, configuration: "Release", runtime_async: !feature.empty?,
+  compilation: "nativeaot", instructions: native ? "native" : "default") + "\n")
 exec(File.join(output, "Jed.Check"), "test", CSharpNativeTasks::ROOT)

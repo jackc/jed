@@ -23,6 +23,8 @@ internal static class PredicatePlan
     internal static long Nodes(Resolved expression)
     {
         var local = expression.Op is "column" or "outer" or "constant" or "promote" ? 0L : 1;
+        if (expression.HostFunction is { } host) local = host.Cost;
+        if (expression.Op == "not" && expression.Text == "predicate") local = 0;
         if (expression.Op == "in_list") local = 2L * (expression.Args.Length - 1) - 1;
         if (expression.Op == "quantified" && expression.Args.Length == 2)
         {
@@ -38,7 +40,7 @@ internal static class PredicatePlan
         if (expression.Op is "<" or "<=" or ">" or ">=" && expression.Collation?.Table is not null) return false;
         if (expression.Op is "and" or "or" or "not") return expression.Args.All(Safe);
         if (expression.Op is "=" or "<>" or "!=" or "<" or "<=" or ">" or ">=" or "distinct" or "not_distinct" or "is_null" or "is_not_null" or "in" or "in_list") return expression.Args.All(Value);
-        if (expression.Op is "like" or "ilike" && Value(expression.Args[0]) && expression.Args[1] is { Op: "constant" } pattern)
+        if (expression.Op is "like" or "ilike" && Value(expression.Args[0]) && expression.Args[1] is { Op: "constant", ParameterUnbound: false } pattern)
         {
             if (pattern.Constant.IsNull) return true;
             var text = pattern.Constant.AsText();
@@ -51,7 +53,7 @@ internal static class PredicatePlan
     {
         if (expression.Op is "column" or "constant") return true;
         if (expression.Op is "cast" or "promote")
-            return expression.Target?.Precision is null && (expression.Type == expression.Args[0].Type || PlannerFacts.SafeCasts.Contains((expression.Args[0].Type, expression.Type))) && Value(expression.Args[0]);
+            return expression.Target?.Precision is null && (expression.Op == "promote" && expression.Type == expression.Args[0].Type || PlannerFacts.SafeCasts.Contains((expression.Args[0].Type, expression.Type))) && Value(expression.Args[0]);
         return expression.Function is { } function && PlannerFacts.SafeFunctions.Contains(function.Name, StringComparer.Ordinal) && expression.Args.All(Value);
     }
     internal static bool PreservesEquality(Resolved expression) =>
@@ -76,8 +78,16 @@ internal static class PredicatePlan
             filter = pushed.Residual;
         }
         var original = input; var current = filter;
-        return input with { CrossChain = null, Rows = Rows(input.Rows, filter, meter, cancellationToken, input.MemoryOutput), EstimatedRows = input.EstimatedRows is { } count ? Estimate.Rows(count, filter) : null, PushFilter = next =>
+        var result = input with { CrossChain = null, Rows = Rows(input.Rows, filter, meter, cancellationToken, input.MemoryOutput), EstimatedRows = input.EstimatedRows is { } count ? Estimate.Rows(count, filter) : null, PushFilter = next =>
             (Filter(original, Order(Combine([current, next]))!, meter, cancellationToken), null) };
+        if (meter.Explain is { } explain && input.Plan is { } child && (child.Label.StartsWith("Subquery", StringComparison.Ordinal) || child.Label.StartsWith("SRF ", StringComparison.Ordinal) || child.Label.StartsWith("Catalog Scan ", StringComparison.Ordinal)))
+        {
+            var detail = (explain.Verbose ? "" : "filter:") + ExplainPlanning.Predicate(filter, explain.Verbose, "filter");
+            var node = new ExplainNode(child.Label, child.Detail == "-" ? detail : child.Detail + "; " + detail,
+                Estimate.Rows(child.EstimatedRows, filter), Estimate.Add(child.EstimatedCost, Estimate.Multiply(child.EstimatedRows, PredicatePlan.Nodes(filter))), child.Children.ToArray());
+            result = ExplainPlanning.Attach(result, node, meter);
+        }
+        return result;
     }
     internal static async IAsyncEnumerable<SqlValue[]> Rows(IAsyncEnumerable<SqlValue[]> input, Resolved filter, Meter meter,
         [EnumeratorCancellation] CancellationToken cancellationToken, bool memoryOutput = false)

@@ -1,4 +1,80 @@
-# C# experiment — initial verification
+# C# experiment — verification history
+
+## Latest SQL inventory — development capture, not acceptance
+
+Integrated capture `f718b8c3aa739f79cb82e2cf9ffe5641688ef91d7b4fb1a5106ba1c243f41074`
+passes the full JIT host executable and all three SQL modes with the counts below,
+including the independent encrypted 676-file/2,761-event comparison. It adds
+streaming host batches, corrected rowwise secondary-index mutation order, and
+complete corruption/replay/restore simulation adapters. Logs:
+`/tmp/jed-csharp-host20-decimal.log`, `/tmp/jed-csharp-full-{memory,disk,encrypted}20.log`,
+`/tmp/jed-csharp-encrypted-peer20.log`.
+
+Both default and runtime-async NativeAOT publications pass the full host executable
+at this source (`/tmp/jed-csharp-aot20.log`, `/tmp/jed-csharp-aot-runtime20.log`).
+Runtime-async JIT passes full host and applicable memory SQL at
+`8210529196d0a2808d744a9ad6eff98e7c9d29a5505dc231be60f4bdae0a6a25`;
+only the sweep tool's explicit assembly selection changed between these captures.
+All 387 engine/harness/project inputs compare byte-identically (combined SHA-256
+`220e7c8d85a3d9bb015a93bd90f75a999ff7b4fad21ecbc67eaec96ceb117b8b`).
+Logs: `/tmp/jed-csharp-host-runtime20.log`, `/tmp/jed-csharp-full-runtime-memory20.log`.
+All four compilation modes (default/runtime-async, JIT/NativeAOT) now pass all
+three complete SQL inventories with the same counts below: **12 inventories**,
+**246,076 records in passing files**, zero failed files. All four encrypted
+transcripts are byte-identical to the independently peer-verified default JIT
+transcript (2,761 events each). Logs use `/tmp/jed-csharp-full-` followed by
+`memory20`, `disk20`, `encrypted20`, or the corresponding `runtime-`, `aot-`,
+and `aot-runtime-` prefix. This is compilation-mode parity at the identified
+project inputs; subsequent review fixes require their own verification.
+
+All **19/19 saved simulation regressions** pass complete exact Go/C# transcripts
+at capture20. The sweep captures the actor and guards its tool-policy hashes;
+evidence is `/tmp/jed-csharp-saved20.log`. Generated-profile acceptance remains
+in progress: intrinsic fault checks and exact peer comparisons are reported
+separately according to the canonical `simulation-testing.md` §6.3 policy.
+Passing intrinsic checks does not imply byte-identical peer transcripts.
+
+The preceding broad capture is retained here for comparison:
+
+Source `5adaba0dec0ad2e1f5d96d7c1be57f8896e1e993c4c4f1a2140c8f1c28797562`
+compiled with zero warnings/errors. All 763 frozen files were selected in each mode:
+
+| Mode | Complete passing files | Records in passing files | Failed files | Declared exclusions |
+|---|---:|---:|---:|---:|
+| Memory | 761 | 21,954 | 0 | 2 |
+| Plain file | 677 | 19,800 | 0 | 86 |
+| Encrypted file, rows/types/errors | 676 | 19,765 | 0 | 87 |
+
+Independent encrypted cost/EXPLAIN comparison matches **676/676** complete files
+(2,761 events). This closes the per-invocation LATERAL EXPLAIN observation and
+comma-item USING cost differences. Logs are `/tmp/jed-csharp-full-{memory,disk,encrypted}18.log`
+and `/tmp/jed-csharp-encrypted-peer18.log`. Exclusions follow the shared corpus's
+declared storage-mode rules; they are not waived implementation failures.
+
+The same capture passes the complete JIT and clean default-instruction NativeAOT
+host executable, including immutable environment inheritance, registered host
+functions and dependency pins, buffered batch replay, native parameter/result
+conversions and async mapping lifetime tests. Logs: `/tmp/jed-csharp-host18.log`
+and `/tmp/jed-csharp-aot18.log`. The AOT executable uses an immutable source capture;
+its source identity is recorded with the artifact.
+That NativeAOT artifact also passes the complete memory and reopened-file SQL
+inventories with the same file/record/exclusion counts above. Logs:
+`/tmp/jed-csharp-full-aot-memory18.log`, `/tmp/jed-csharp-full-aot-disk18.log`.
+
+The prior `0c1b6f6cbca95423dd9c5cc73eeb2d7761d45113bd425b734e4ea5135a20e5c5`
+capture passes all 326 records across complete composite-default/assignment,
+column/temporal/view introspection, MERGE-source and fixture-backed collation/stored-definition
+files (`/tmp/jed-csharp-disk-persistence15.log`). Composite literal defaults now
+persist as expression text, bare NULL defaults carry no default flag, and CTAS
+retains interval qualifiers. Fixture directives use the actual prebuilt image,
+retaining its handle as the pinned peer does; they are not silently replaced with
+fresh files or claimed to reopen before each record. Encrypted transcripts omit
+expected-error statement costs exactly as the independent runner does.
+
+This SQL inventory does not prove host API completeness. Final edge-case review,
+the generated simulation matrix, complete runtime-async/final artifact checks,
+and diagnostic measurements remain acceptance work. Earlier dated
+sections below are historical evidence.
 
 Date: 2026-11-12 (America/Chicago). **First scalar milestone only; the engine is
 incomplete and not frozen.** No performance claim or package publication.
@@ -439,3 +515,89 @@ complete simulator coverage and fresh NativeAOT acceptance are still pending.
   The first simulated-transport test exposed a handshake deadlock in the test
   network's write acknowledgement; the passing capture acknowledges consumed
   bytes and separately waits for protocol quiescence.
+
+### Planner and service follow-up — 2026-11-13
+
+- Canonical memory source
+  `c250b53b8116d2d0ddf45c6619d83f85c6dd3ef77c3b99a79c4d252ee5408a46`:
+  **737/763 files PASS**, 21,381 records in passing files, 24 failed files,
+  two declared exclusions. Log: `/tmp/jed-csharp-full-checkpoint11.log`.
+- Complete encrypted recovery regression: **403 steps exact peer PASS**,
+  including SQL costs and physical images, at the earlier host capture
+  `3b092099519185655eac42c9e9527bcc05cdc50e9f9b77854d9bbc2338afdfa9`.
+  Log: `/tmp/jed-csharp-sim-encrypted-complete-final.log`.
+- Complete owner/client service trace: **304 steps exact peer PASS**, at
+  `8ab08af3506006c732f6a9482270c307b3d073051aab1eeb903b297c8396e5ff`.
+  Log: `/tmp/jed-csharp-sim-service-owner-final.log`. The adapter executes real
+  owner/client protocol handlers, owner loss, reconnection and promotion.
+- Separate complete service regressions pass across the recorded captures:
+  reconnect with a held key (`d8717067`), failed promotion after rekey
+  (`7ff6bccab`), and backup with the current credential (`ed50f101`).
+- Both ordered-join planner files pass on disk at `ed50f101`, together with
+  the main and spill query-memory files: 190 records, no failures. Later focused
+  `8ab08af3` verification passes the complete GiST index-join file (10 records)
+  and membership-subquery EXPLAIN file (13 records).
+
+The new failed-promotion host invariant initially used an invalid 512-byte
+encrypted page size and stopped the host task during setup. It is corrected to
+1024 bytes; this capture is not recorded as a passing complete host run. Fresh
+full host, backend, NativeAOT and performance gates remain outstanding.
+
+### Independent process and threaded-host coverage — 2026-11-13
+
+The complete pinned process corpus passes **496/496 cases**: 31 scenarios across
+all 16 ordered C#/Go/Rust/Node actor pairings, including encrypted service,
+recovery, maintenance, backup and final-image byte comparison. Peer actors were
+built offline from semantic baseline `b1a6affca7725e0b07a4f734eddb1c569ef76bcf`.
+The C# actor SHA-256 was
+`7c0474be1fd5acf26fc93ece5635b0312c3a24becb1914a45f034e87438fe4e8`;
+engine SHA-256 was
+`a68bda470eb3fd161a36747f4c030dee55d7701177889013a9bfadd732e1aa90`.
+Log: `/tmp/jed-csharp-process-mixed-all.log`.
+
+The pinned threaded stress profile passes on C# memory, plaintext file and
+encrypted file hosts, plus the independent Go actor: four writers perform 250
+transfers each, eight readers check 500 snapshots each, **16,000 checks total**.
+Every run produces final checksum `f3e75496a3111181`. C# source:
+`2f316bcd36ee9fab5812cc96462a858ac3c7c61cfcefc51f5c0db7b385cdd875`.
+Log: `/tmp/jed-csharp-stress-first.log`; machine-readable report:
+`/tmp/jed-csharp-stress-20261113-1214782-5jt4ql/report.json`.
+These are correctness checks, not controlled performance measurements.
+
+Complete host checks pass at source
+`424569b2382bcc51136932708f3d909eaf51910c6a64fe5eeff151066c9f402f`,
+including failed encrypted promotion releasing its exclusive claim, repeated
+lost-writer operations preserving `08006`, and deterministic host-clock shutdown.
+Log: `/tmp/jed-csharp-service-role-host.log`.
+The complete service-backups simulation also passes exact independent comparison
+at this source: **303 steps**, `/tmp/jed-csharp-sim-service-backups-role.log`.
+A subsequent immutable-assembly sweep passes **18/19 complete saved traces**;
+only the full service-attachments trace differs, in the placement of one
+maintenance event after acknowledged commit. A driver correction is pending
+verification; the saved sweep is not yet an acceptance pass.
+
+### Stable simulation policy, capture20 (2026-11-13)
+
+Source `f718b8c3aa739f79cb82e2cf9ffe5641688ef91d7b4fb1a5106ba1c243f41074`:
+all **19/19 saved baseline simulations pass exact independent Go transcript comparison**.
+The complete generated seed-one sweep passes **19/22** profiles: **16/19 exact**
+and **3/3 intrinsic**. Corruption, resource and spill traces use the canonical
+per-core fault policy; both cores execute their full recovery/structural oracles.
+This is partial generated acceptance, not a full pass. The three failures are
+`encryption-attachments`, `encryption-replay`, and `encryption-service`; their
+adapter/nonce-order fixes are tracked for a later capture.
+
+Commands used explicit immutable `--assembly` copies with `--no-build`:
+`mise run csharp-native:simulation-sweep --regress` and
+`mise run csharp-native:simulation-sweep --profile all --seeds 1`.
+Logs: `/tmp/jed-csharp-saved20.log`, `/tmp/jed-csharp-generated20.log`.
+Evidence directories: `/tmp/jed-csharp-simulation-sweep-20261113-63-d1a06u`
+and `/tmp/jed-csharp-simulation-sweep-20261113-64-gvl4ho`.
+Each manifest records all artifact, trace, generator and comparator/tool policy
+SHA-256 hashes; policy hashes are checked before and after every trace and at
+completion. Engine DLL SHA-256:
+`8cf12044b552614a5d59e61cbecd787348b84305f7c4595279312d786076a417`;
+actor DLL SHA-256:
+`1d0228f39dff9c705717b7878d588387a7fa61907da9a3f82072d6edc4799604`.
+These stable runs supersede capture18 sweeps as evidence; capture18's mid-run
+policy change means that earlier aggregate remains diagnostic only.

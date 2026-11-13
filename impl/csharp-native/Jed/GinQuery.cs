@@ -1,6 +1,6 @@
 namespace Jed;
 
-internal sealed record GinQueryNode(bool All, byte[][] Terms, GinQueryNode[] Children, bool Unbound = false)
+internal sealed record GinQueryNode(bool All, byte[][] Terms, GinQueryNode[] Children, bool Unbound = false, bool Fallback = false)
 {
     internal static GinQueryNode Empty { get; } = new(false, [], []);
     internal static GinQueryNode Make(bool all, IEnumerable<byte[]> terms, IEnumerable<GinQueryNode>? children = null)
@@ -85,17 +85,17 @@ internal static class GinQuery
                 converted.Add(cast);
             }
             var terms = StatisticsTerms.Extract(SqlValue.Array(new(type.Element!, converted))).ToArray();
-            if (terms.Length == 0 && operation is "@>" or "=") return true;
+            if (terms.Length == 0 && operation is "@>" or "=") { result = new(false, [], [], Fallback: true); return true; }
             result = GinQueryNode.Make(operation != "&&", terms); return true;
         }
         if (type != SqlType.Jsonb || operation is not ("@>" or "?" or "?|" or "?&" or "@?" or "@@")) return false;
         if (value.IsNull) { result = GinQueryNode.Empty; return true; }
-        if (operation is "@?" or "@@") { result = GinJsonPath.Extract(value.AsJsonpath(), operation == "@@"); return true; }
+        if (operation is "@?" or "@@") { result = GinJsonPath.Extract(value.AsJsonpath(), operation == "@@") ?? new(false, [], [], Fallback: true); return true; }
         var extracted = operation == "@>" ? StatisticsTerms.Extract(value) : operation == "?"
             ? StatisticsTerms.Extract(SqlValue.Jsonb(SqlJsonNode.String(value.AsText())))
             : value.AsArray().Values.Where(item => !item.IsNull).SelectMany(item => StatisticsTerms.Extract(SqlValue.Jsonb(SqlJsonNode.String(item.AsText()))));
         var list = extracted.ToArray();
-        if (list.Length == 0 && operation is "@>" or "?&") return true;
+        if (list.Length == 0 && operation is "@>" or "?&") { result = new(false, [], [], Fallback: true); return true; }
         result = GinQueryNode.Make(operation != "?|", list); return true;
     }
     internal static bool Value(Resolved expression, out SqlValue value, Meter? meter = null)

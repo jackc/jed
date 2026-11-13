@@ -55,7 +55,7 @@ internal static class ScratchValues
                 var flags = reader.Byte();
                 if ((flags & 1) != 0) return SqlValue.Range(SqlRange.Empty(type));
                 var lower = Read(ref reader, type.Element!); var upper = Read(ref reader, type.Element!);
-                return SqlValue.Range(SqlRange.Stored(type, lower.IsNull ? null : lower, upper.IsNull ? null : upper, (flags & 2) != 0, (flags & 4) != 0));
+                return SqlValue.Range(SqlRange.Stored(type, lower.IsNull ? (SqlValue?)null : lower, upper.IsNull ? (SqlValue?)null : upper, (flags & 2) != 0, (flags & 4) != 0));
             default: return StoredValues.ReadBody(ref reader, type);
         }
     }

@@ -135,7 +135,7 @@ internal sealed partial class Parser
         do
         {
             var expression = Eat("*") ? Node("star", "") : Expr();
-            var alias = Eat("as") ? Name() : token.Kind == TokenKind.QuotedName || token.Kind == TokenKind.Word && !Clause(token.Text) ? Name() : null;
+            var alias = Eat("as") ? Name() : token.Kind == TokenKind.QuotedName || token.Kind == TokenKind.Word && !NoBareLabel(token.Text) ? Name() : null;
             items.Add(new(expression, alias));
         } while (Eat(","));
         return (items.ToArray(), aliases);
