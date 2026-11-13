@@ -1,0 +1,17 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#MISE description="Explicit opt-in: attempt selected C# corpus files; unsupported behavior fails"
+#USAGE flag "--all" help="Attempt every pinned SQL corpus file (incomplete experiment will fail)"
+#USAGE flag "--file <path>" help="One complete .test file; default is the shared scalar foundation supplement"
+require_relative "../../impl/csharp-native/Tools/tasks"
+files = ENV["usage_file"] ? [ENV.fetch("usage_file")] : []
+if ENV["usage_all"] == "true"
+  abort "--all cannot be combined with file arguments" unless files.empty?
+  files = Dir.glob(File.join(CSharpNativeTasks.baseline_spec, "conformance/suites/**/*.test")).sort
+else
+  files = CSharpNativeTasks::BASELINE.fetch("supplemental_corpus") if files.empty?
+  files = files.map { |f| File.expand_path(f, CSharpNativeTasks::ROOT) }
+end
+abort "No corpus files selected" if files.empty?
+abort "Every selected file must exist and end in .test" unless files.all? { |f| File.file?(f) && f.end_with?(".test") }
+CSharpNativeTasks.check("corpus", *files)

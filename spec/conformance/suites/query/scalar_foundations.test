@@ -1,0 +1,255 @@
+# Scalar-only foundation slice, shared by every core. It isolates existing SQL
+# behavior without requiring table storage or aggregates. The C# experiment uses
+# this complete file as an initial slice; it does not claim every capability below.
+# requires: query.select, query.select_no_from, query.column_alias, query.where_eq, query.limit, query.offset, query.logical_connectives, expr.arithmetic, expr.comparison_value, expr.parens, expr.precedence, cast.explicit, types.i16, types.i32, types.i64, types.boolean, types.text, null.three_valued, resource.cost_metering, error.overflow_trap, error.division_by_zero
+
+# names: ?column?, answer
+# types: i64, i64
+# cost: 2
+query II nosort
+SELECT 1, 6 * 7 AS answer
+----
+1
+42
+
+# cost: 3
+query II nosort
+SELECT 6 + 4 * 2, -7
+----
+14
+-7
+
+query III nosort
+SELECT (6 + 4) * 2, -7 / 3, -7 % 3
+----
+20
+-2
+-1
+
+# types: i16, i32, i64
+query III nosort
+SELECT CAST(32767 AS i16), CAST(2147483647 AS i32), 9223372036854775807
+----
+32767
+2147483647
+9223372036854775807
+
+# types: i16, i32, i64
+query III nosort
+SELECT CAST(-32768 AS i16), CAST(-2147483648 AS i32), -9223372036854775808
+----
+-32768
+-2147483648
+-9223372036854775808
+
+# types: i16, i32, i64
+query III nosort
+SELECT CAST(1 AS i16) + 2, CAST(1 AS i16) + CAST(2 AS i32), CAST(1 AS i32) + CAST(2 AS i64)
+----
+3
+3
+3
+
+statement error 22003
+SELECT CAST(32768 AS i16)
+
+statement error 22003
+SELECT CAST(2147483648 AS i32)
+
+statement error 22003
+SELECT CAST(32767 AS i16) + CAST(1 AS i16)
+
+statement error 22003
+SELECT 9223372036854775807 + 1
+
+statement error 22003
+SELECT -CAST(-9223372036854775808 AS i64)
+
+statement error 22003
+SELECT CAST(-32768 AS i16) / CAST(-1 AS i16)
+
+statement error 22003
+SELECT CAST(-2147483648 AS i32) / CAST(-1 AS i32)
+
+statement error 22003
+SELECT -9223372036854775808 / -1
+
+query III nosort
+SELECT CAST(-32768 AS i16) % CAST(-1 AS i16), CAST(-2147483648 AS i32) % CAST(-1 AS i32), -9223372036854775808 % -1
+----
+0
+0
+0
+
+statement error 22012
+SELECT 1 / 0
+
+statement error 22012
+SELECT 1 % 0
+
+# names: flag, missing, message
+# types: boolean, i32, text
+query BIT nosort
+SELECT true AS flag, CAST(NULL AS i32) AS missing, 'it''s text' AS message
+----
+true
+NULL
+it's text
+
+query BBBBBB nosort
+SELECT true AND NULL, false AND NULL, true OR NULL, false OR NULL, NOT NULL, NOT false
+----
+NULL
+false
+true
+NULL
+NULL
+true
+
+# cost: 3
+query BB nosort
+SELECT false AND (1 / 0 = 0), true OR (1 / 0 = 0)
+----
+false
+true
+
+query BBBBBB nosort
+SELECT 1 = 1, 1 <> 2, 1 != 1, 1 < 2, 2 >= 2, 2 <= 1
+----
+true
+true
+false
+true
+true
+false
+
+query BBBB nosort
+SELECT NULL = 1, NULL IS NULL, NULL IS NOT NULL, 1 IS NOT NULL
+----
+NULL
+true
+false
+true
+
+query BBBB nosort
+SELECT NULL IS DISTINCT FROM NULL, NULL IS DISTINCT FROM 1, 1 IS NOT DISTINCT FROM 1, 1 IS NOT DISTINCT FROM NULL
+----
+false
+true
+true
+false
+
+# cost: 0
+query I nosort
+SELECT 1 WHERE false
+----
+
+# cost: 0
+query I nosort
+SELECT 1 WHERE NULL
+----
+
+# cost: 2
+query I nosort
+SELECT 1 WHERE 1 = 1
+----
+1
+
+# cost: 0
+query I nosort
+SELECT 1 / 0 LIMIT 0
+----
+
+# cost: 0
+query I nosort
+SELECT 1 / 0 OFFSET 1
+----
+
+# cost: 1
+query I nosort
+SELECT 9 LIMIT 1 OFFSET 0
+----
+9
+
+# WHERE is evaluated before OFFSET skips the virtual row.
+# cost: 1
+query I nosort
+SELECT 1 WHERE 2 = 2 OFFSET 1
+----
+
+# A literal FALSE conjunct lets the planner prove the relation empty.
+# cost: 0
+query I nosort
+SELECT 1 WHERE false AND (1 / 0 = 0)
+----
+
+# NULL as a top-level filter conjunct also proves no row can survive.
+# cost: 0
+query I nosort
+SELECT 1 WHERE NULL AND (1 / 0 = 0)
+----
+
+# Runtime NULL still short-circuits a filter's AND, without a literal rewrite.
+# cost: 2
+query I nosort
+SELECT 1 WHERE CAST(NULL AS boolean) AND (1 / 0 = 0)
+----
+
+# UTF-8 order differs from UTF-16 ordinal order across this boundary.
+query BB nosort
+SELECT '😀' > '', 'é' <> 'é'
+----
+true
+true
+
+# cost: 4
+query B nosort
+SELECT 'abc' = 'abd'
+----
+false
+
+query BBBB nosort
+SELECT 'off'::boolean, 'tr'::boolean, CAST(0 AS boolean), CAST(3 AS boolean)
+----
+false
+true
+false
+true
+
+# types: i32, text
+query IT nosort
+SELECT CAST(true AS i32), CAST(-12 AS text)
+----
+1
+-12
+
+# cost: 1
+query I nosort
+SELECT ' +42 '::i32
+----
+42
+
+statement error 22P02
+SELECT 'not an integer'::i32
+
+statement error 22P02
+SELECT 'o'::boolean
+
+# names: ExactName
+query I nosort
+SELECT -- line comment
+/* outer /* nested */ comment */ 5 AS "ExactName"
+----
+5
+
+statement error 42703
+SELECT absent_column
+
+statement error 42601
+SELECT *
+
+statement error 42601
+SELECT (1 + 2
+
+statement error 42601
+SELECT 'unterminated

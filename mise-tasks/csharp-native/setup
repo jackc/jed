@@ -1,0 +1,24 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#MISE description="Explicit opt-in: install the checksum-pinned .NET SDK for the C# experiment"
+#USAGE flag "--archive <path>" help="Use an already downloaded SDK archive (SHA-512 is still verified)"
+
+require "digest"
+require "tmpdir"
+require_relative "../../impl/csharp-native/Tools/tasks"
+
+abort "Initial setup supports Linux x86-64 only" unless RUBY_PLATFORM.include?("linux") && RUBY_PLATFORM.include?("x86_64")
+version = CSharpNativeTasks.sdk_version
+abort "Update and review the SDK checksum when changing global.json" unless version == "11.0.100"
+expected = "1bec9cca2ec689b1e80245b84f2b53c9441d1aa6daccf2ceb27490768bffa95954fa585bd275def31069d874d543d9ba9e6591fe9ade2dbd9f34ec5c0fd0050c"
+Dir.mktmpdir("jed-csharp-sdk-") do |temporary|
+  archive = ENV["usage_archive"] ? File.expand_path(ENV.fetch("usage_archive")) : File.join(temporary, "sdk.tar.gz")
+  unless ENV["usage_archive"]
+    url = "https://builds.dotnet.microsoft.com/dotnet/Sdk/#{version}/dotnet-sdk-#{version}-linux-x64.tar.gz"
+    abort "SDK download failed" unless system("curl", "--fail", "--location", "--retry", "2", "--output", archive, url)
+  end
+  abort "SDK SHA-512 mismatch" unless Digest::SHA512.file(archive).hexdigest == expected
+  FileUtils.mkdir_p(CSharpNativeTasks::SDK)
+  abort "SDK extraction failed" unless system("tar", "-xzf", archive, "-C", CSharpNativeTasks::SDK)
+end
+CSharpNativeTasks.run("--version")

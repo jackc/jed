@@ -24,6 +24,12 @@
 /impl/swift-native/.swiftpm/
 /impl/swift-native/results/
 
+# Opt-in native C# experiment; SDK and CLI home live under .dev/.
+/impl/csharp-native/.build/
+/impl/csharp-native/**/bin/
+/impl/csharp-native/**/obj/
+/impl/csharp-native/results/
+
 # Go build artifacts. NOTE: do not ignore "*.test" — the conformance corpus files
 # use that extension (spec/conformance/suites/**/*.test).
 /impl/go/bin/

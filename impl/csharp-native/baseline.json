@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "semantic_revision": "b1a6affca7725e0b07a4f734eddb1c569ef76bcf",
+  "status": "in-progress",
+  "platform": "linux-x64",
+  "supplemental_corpus": ["spec/conformance/suites/query/scalar_foundations.test"]
+}

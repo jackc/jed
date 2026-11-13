@@ -47,11 +47,18 @@ files in the same change.
   supply a fresh worker through `workerFactory` and call the public
   `startDatabaseWorker({ configure })` helper. Jed owns worker cleanup. Configuration may await;
   SQL kernels remain synchronous, with no application-thread callback RPC.
-- Experimental cores (`impl/ruby-native` and `impl/swift-native`) are opt-in: exclude them
+- Experimental cores (`impl/ruby-native`, `impl/swift-native`, and `impl/csharp-native`) are opt-in: exclude them
   from normal tests, benchmarks, CI, and future feature updates unless explicitly
   requested. Record coverage and omissions against the experiment's source revision;
   promotion to supported status requires a separate decision. See
   `spec/design/ruby-native-experiment.md` and `spec/design/swift-native-experiment.md`.
+  The C# experiment is authorized (2026-11-12), in progress against semantic baseline
+  `b1a6affca7725e0b07a4f734eddb1c569ef76bcf`, and targets Linux x86-64 with pinned .NET 11
+  and an async-first public API (inline resident kernels, real awaited I/O when storage is
+  implemented, no Task.Run wrapper). The initial scalar slice is verified; storage is missing.
+  Full parity, full-engine NativeAOT verification and measured performance remain acceptance gates;
+  no C# third-party dependency or production delivery is selected. See
+  `spec/design/csharp-native-experiment.md` and its scope/host/crypto matrices.
   The explicitly requested Ruby refresh (2026-11-12) tracks supported-core revision
   `b1a6affc`; coverage and remaining omissions are recorded in
   `impl/ruby-native/PARITY_UPDATE_2026-11-12.md`. Its experimental status and prior

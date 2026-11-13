@@ -1,0 +1,43 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#MISE description="Explicit opt-in: generate C# catalog data from its pinned spec"
+#USAGE flag "--check" help="Fail if generated data differs; do not write"
+require "bundler/setup"
+require "toml-rb"
+require_relative "../../impl/csharp-native/Tools/tasks"
+
+spec = CSharpNativeTasks.baseline_spec
+pascal = ->(name) { name.split("_").map(&:capitalize).join }
+quote = ->(value) { JSON.generate(value.to_s) }
+header = "// Generated data from #{CSharpNativeTasks::BASELINE.fetch('semantic_revision')}.\n// Regenerate only with mise run csharp-native:codegen.\nnamespace Jed;\n\n"
+schedule = TomlRB.load_file(File.join(spec, "cost/schedule.toml"))
+costs = schedule.fetch("unit").map { |u| "    internal const long #{pascal.call(u.fetch('id'))} = #{u.fetch('weight')};" }
+errors = TomlRB.load_file(File.join(spec, "errors/registry.toml")).fetch("error")
+states = errors.map { |e| "    public const string #{pascal.call(e.fetch('name'))} = #{quote.call(e.fetch('code'))};" }
+types = TomlRB.load_file(File.join(spec, "types/scalars.toml")).fetch("type")
+# Only these representations are implemented in the first slice. Aliases/ranges
+# still come from the spec; this selection is not a full capability declaration.
+selected = types.select { |t| %w[i16 i32 i64 boolean text].include?(t.fetch("id")) }
+facts = selected.map do |t|
+  aliases = ([t.fetch("id")] + t.fetch("aliases")).map { |a| quote.call(a) }.join(", ")
+  "        new(SqlType.#{pascal.call(t.fetch('id'))}, #{quote.call(t.fetch('id'))}, #{quote.call(t.fetch('family'))}, #{t.fetch('min', 0)}L, #{t.fetch('max', 0)}L, #{t.fetch('rank', 0)}, [#{aliases}]),"
+end
+ids = selected.map { |t| t.fetch("id") }
+known_names = types.flat_map { |t| [t.fetch("id"), *t.fetch("aliases")] }.uniq.map { |name| quote.call(name) }.join(", ")
+casts = TomlRB.load_file(File.join(spec, "types/casts.toml")).fetch("cast").select { |c| ids.include?(c.fetch("from")) && ids.include?(c.fetch("to")) }
+pairs = casts.map { |c| "        (SqlType.#{pascal.call(c.fetch('from'))}, SqlType.#{pascal.call(c.fetch('to'))})," }
+outputs = {
+  "CastCatalog.g.cs" => header + "internal static class CastCatalog\n{\n    internal static readonly (SqlType, SqlType)[] Pairs =\n    [\n#{pairs.join("\n")}\n    ];\n}\n",
+  "Costs.g.cs" => header + "internal static class Costs\n{\n#{costs.join("\n")}\n}\n",
+  "SqlStates.g.cs" => header + "public static class SqlStates\n{\n#{states.join("\n")}\n}\n",
+  "ScalarCatalog.g.cs" => header + "internal static class ScalarCatalog\n{\n    internal static readonly string[] KnownNames = [#{known_names}];\n    internal static readonly ScalarFact[] Facts =\n    [\n#{facts.join("\n")}\n    ];\n}\n"
+}
+outputs.each do |name, content|
+  path = File.join(CSharpNativeTasks::PACKAGE, "Jed", name)
+  if ENV["usage_check"] == "true"
+    abort "Stale generated catalog #{path}" unless File.file?(path) && File.binread(path) == content
+  else
+    File.write(path, content)
+  end
+end
+puts "#{outputs.length} C# data catalogs #{ENV['usage_check'] == 'true' ? 'verified' : 'generated'}"

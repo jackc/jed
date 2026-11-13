@@ -174,6 +174,7 @@ Its implementation, correctness revalidation and diagnostic measurements are
 complete, including 543 native tests and all 749 frozen SQL files. Original
 evidence remains preserved, without changing experimental status or the separate
 production decision.
+
 A second pass on 2026-11-09, requested by the maintainer, removed per-row and
 per-statement copy costs found by profiling. On the 22 diagnostic workloads
 Swift/Rust falls from 5.75× to 3.85× (scans 2.63×; per-statement paths remain
@@ -192,6 +193,19 @@ A fifth pass added a cached direct read for prepared integer- and UUID-key
 lookups, which reproduces the general path's charge order with or without a
 cost ceiling, and cached UPDATE/DELETE access inventories. A point lookup is 1.19× Rust and Swift/Rust is 1.28× overall
 (per-statement paths 2.58×; single-row writes remain 6–7×), same gates re-run.
+
+The **native C# experiment** (`impl/csharp-native`) was authorized 2026-11-12 and
+is in progress against the supported-core semantic baseline
+`b1a6affca7725e0b07a4f734eddb1c569ef76bcf`. It targets Linux x86-64 with pinned .NET 11
+and an async-first public API: inline resident kernels and real awaited I/O when
+storage is implemented, with no Task.Run wrapper. The initial scalar slice is
+verified; storage remains missing. It uses only opt-in `csharp-native:*` tasks,
+and has no automatic future-maintenance or website obligation. Full baseline
+parity, full-engine NativeAOT verification and measured performance remain gates.
+No C# third-party dependency is approved yet; production delivery and promotion
+remain separate decisions. See
+[csharp-native-experiment.md](spec/design/csharp-native-experiment.md) and its
+scope, host and crypto inventories.
 
 The maintainer approved Ruby's OpenSSL binding for vetted cryptographic digest
 functions and stdlib Zlib for byte-identical CRC32 checksums in this experiment.

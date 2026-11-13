@@ -22,6 +22,26 @@
 # and in the design's divergence ledger rather than adopted as SQL semantics.
 
 [[override]]
+file = "query/scalar_foundations.test"
+sql = "SELECT 1 / 0 LIMIT 0"
+reason = "jed evaluates projection expressions only for emitted rows (cost.md §3, FROM-less SELECT); LIMIT 0 does not evaluate the division and costs zero. PostgreSQL folds the immutable constant division at planning time and raises 22012. This preserves existing supported-core evaluation semantics, not a C# exception."
+
+[[override]]
+file = "query/scalar_foundations.test"
+sql = "SELECT 1 / 0 OFFSET 1"
+reason = "jed applies OFFSET before projection (cost.md §3, FROM-less SELECT); the sole virtual row is skipped, so the division is never evaluated and cost is zero. PostgreSQL folds the immutable constant division at planning time and raises 22012. This preserves existing supported-core evaluation semantics, not a C# exception."
+
+[[override]]
+file = "query/scalar_foundations.test"
+sql = "SELECT 1 WHERE NULL AND (1 / 0 = 0)"
+reason = "jed's planner proves a literal NULL filter conjunct cannot admit a row (planner.md §3), so this query does no execution work. PostgreSQL attempts to fold the immutable division while planning and raises 22012 before executor short-circuiting. Existing supported cores agree with jed's zero-cost result."
+
+[[override]]
+file = "query/scalar_foundations.test"
+sql = "SELECT 1 WHERE CAST(NULL AS boolean) AND (1 / 0 = 0)"
+reason = "jed's top-level filter AND stops at a runtime NULL (cost.md §3): one AND plus one cast, with no evaluation of the division. PostgreSQL attempts to fold the immutable division while planning and raises 22012 before executor short-circuiting. Existing supported cores agree on the empty result and cost 2."
+
+[[override]]
 file = "query/order_by_topk.test"
 sql = "SELECT id FROM tk ORDER BY 1 / (id - id) LIMIT 0"
 reason = "jed preserves its blocking ORDER BY evaluation schedule under LIMIT 0: every fallible ORDER expression is evaluated at the ordinary pre-sort point, so the first row traps 22012. PostgreSQL plans LIMIT 0 as a no-execution node and does not evaluate the sort key. The top-k rule is results/cost neutral relative to jed's pre-rule full-sort lane; changing this established resource/error timing is outside this optimization (cost.md 'Blocking ORDER BY + LIMIT')."

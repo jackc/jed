@@ -1,0 +1,6 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#MISE description="Explicit opt-in: build the native C# experiment"
+#USAGE flag "-c --configuration <configuration>" default="Release" help="Debug or Release"
+require_relative "../../impl/csharp-native/Tools/tasks"
+CSharpNativeTasks.build(ENV.fetch("usage_configuration", "Release"))

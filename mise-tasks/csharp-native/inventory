@@ -1,0 +1,14 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#MISE description="Explicit opt-in: report the pinned C# acceptance inventory without claiming coverage"
+require_relative "../../impl/csharp-native/Tools/tasks"
+spec = CSharpNativeTasks.baseline_spec
+puts JSON.pretty_generate({
+  semantic_revision: CSharpNativeTasks::BASELINE.fetch("semantic_revision"),
+  spec_files: Dir.glob(File.join(spec, "**/*")).count { |p| File.file?(p) },
+  sql_files: Dir.glob(File.join(spec, "conformance/suites/**/*.test")).length,
+  process_files: Dir.glob(File.join(spec, "conformance/process/**/*.toml")).length,
+  simulation_regressions: Dir.glob(File.join(spec, "conformance/sim/regress/*.sim")).length,
+  supplemental_corpus: CSharpNativeTasks::BASELINE.fetch("supplemental_corpus"),
+  full_parity: false
+})

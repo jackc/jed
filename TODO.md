@@ -363,7 +363,7 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 - [ ] **Public, stable C API + header** — the Ruby gem already loads a Rust `cdylib`; promoting that
   boundary to a documented, versioned C ABI lets PHP, Dart/Flutter, Elixir, and others bind cheaply
   (SQLite's C API is the reason it is everywhere). _(size: L)_
-- [ ] **C#** core — **lean native** (value-type generics, `Span<T>`, NativeAOT → near-Rust speed *and* a clean pure-managed NuGet package; in-process host functions). Strongest native candidate. _(size: XL native / L wrap; §2)_
+- [ ] **Native C# experiment** — authorized 2026-11-12, in progress against `b1a6affca7725e0b07a4f734eddb1c569ef76bcf`. Opt-in Linux x86-64/.NET 11 implementation with async-first public APIs; full baseline parity, host/storage/crypto/process/simulation gates and JIT/NativeAOT measurements remain open. See [charter](spec/design/csharp-native-experiment.md) and [scope](spec/design/csharp-native-scope.md). Production delivery and promotion are separate decisions; performance is unmeasured. _(size: XL; §2)_
 - [ ] **Production Swift delivery decision** — native or wrapped remains separate from the frozen experiment. Its [measured results](impl/swift-native/BENCHMARKS.md) inform that decision but do not change the existing wrap leaning (safe Rust + Apple packaging) or imply promotion. Apple support still needs builds and tests on Apple platforms. _(size: L wrap / XL native; §2/§13)_
 - [ ] **Java** core — **conflicted**: wrap for performance (pre-Valhalla boxing + JIT warmup hurt a native core), native for clean pure-JAR packaging + in-process host functions (no JNI/upcall tax). Decide at scheduling time; Valhalla shifts it toward native. _(size: XL native / L wrap; §2)_
 

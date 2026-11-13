@@ -23,6 +23,14 @@ failing test the day it is written. Everything below follows from taking that li
 
 ## 1. The principle: a core only earns its place if it can *disagree*
 
+The [native C# experiment](csharp-native-experiment.md), authorized 2026-11-12,
+is in progress under `impl/csharp-native`, with semantic baseline
+`b1a6affca7725e0b07a4f734eddb1c569ef76bcf`. It follows the opt-in experimental
+lifecycle below. It does not expand the supported differential set or select
+production delivery. The C# performance estimates later in this document remain
+hypotheses until measured; ordinary managed packaging and NativeAOT deployment
+are distinct choices.
+
 **Frozen experiments are separate from supported cores.** The explicitly requested
 pure Ruby experiment (`impl/ruby-native`) investigates native Ruby execution,
 including Ruby's JITs. It is not in normal tests, benchmarks, CI, or the future
