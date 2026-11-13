@@ -196,8 +196,8 @@ cost ceiling, and cached UPDATE/DELETE access inventories. A point lookup is 1.1
 
 The **native C# experiment** (`impl/csharp-native`) was authorized 2026-11-12 and
 completed/frozen 2026-11-13 against supported-core semantic baseline
-`b1a6affca7725e0b07a4f734eddb1c569ef76bcf`. The frozen implementation is local-only
-commit `757ea35138d50dcb9617231b190f4a5e990dbc1d` on `codex/csharp-native-experiment`.
+`b1a6affca7725e0b07a4f734eddb1c569ef76bcf`. The frozen implementation is
+commit `2849dd23f3e28b0e91674e27f99be2da58681805`.
 It targets Linux x86-64 with pinned .NET 11
 and async-first public APIs: inline resident kernels and awaited storage I/O, no
 Task.Run wrapper. Engine34 passes all 12 memory/plain/encrypted SQL inventories

@@ -2,9 +2,12 @@
 
 ## Frozen experiment verification — 2026-11-13
 
-Frozen implementation: local-only commit
-`757ea35138d50dcb9617231b190f4a5e990dbc1d` on `codex/csharp-native-experiment`.
-This work has not been pushed or merged.
+Frozen implementation: commit
+`2849dd23f3e28b0e91674e27f99be2da58681805`. Rebased onto master `8efcd3aa0` on 2026-11-13;
+the 424-input frozen source digest is unchanged. The semantic baseline remains
+pinned, including its pre-incremental-reclamation storage behavior. Post-rebase
+`mise run verify`, `mise run csharp-native:codegen --check` and the full JIT host
+check (`mise run csharp-native:test`) pass; log hashes are in `freeze.json`.
 
 The independent C# core is complete and frozen against semantic baseline
 `b1a6affca7725e0b07a4f734eddb1c569ef76bcf` on Linux x86-64 with .NET SDK
