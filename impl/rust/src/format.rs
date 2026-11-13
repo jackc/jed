@@ -700,7 +700,7 @@ fn crc32_update(mut crc: u32, data: &[u8]) -> u32 {
 
 /// Extend a finalized standard CRC-32/IEEE checksum. `crc32_extend(crc32_extend(0, a), b)` equals
 /// the checksum of `a ‖ b`, matching the public composition convention used by Go and Node.
-fn crc32_extend(crc: u32, data: &[u8]) -> u32 {
+pub(crate) fn crc32_extend(crc: u32, data: &[u8]) -> u32 {
     !crc32_update(!crc, data)
 }
 
@@ -3972,8 +3972,8 @@ pub(crate) fn plan_free_list(
         let base = meta_page(
             cap, ps as u32, snap.txid, cat_root, new_pc, head, live_pages,
         );
-        let mut dirty = commit_manifest::entries_of(written);
-        dirty.extend(commit_manifest::entries_of(&pages));
+        let mut dirty = commit_manifest::entries_of(written, cap.encrypted_variant());
+        dirty.extend(commit_manifest::entries_of(&pages, cap.encrypted_variant()));
         let mut entries = Vec::with_capacity(pending.len() + dirty.len());
         entries.extend_from_slice(pending);
         entries.extend_from_slice(&dirty);
@@ -6077,8 +6077,10 @@ pub(crate) struct MetaFields {
     pub(crate) page_count: u32,
     pub(crate) free_list_head: u32,
     pub(crate) manifest_head: u32,
-    /// The number of pages the commit manifest lists (meta offset 40).
+    /// The number of pages the commit manifest lists (meta offset 40, its narrow bit masked).
     pub(crate) dirty_count: u32,
+    /// Whether the manifest's entries are narrow (manifest-crc32.md §2).
+    pub(crate) narrow: bool,
     /// The length of the manifest overflow chain (meta offset 44).
     pub(crate) manifest_pages: u32,
     /// The CRC-64 over the manifest chain (meta offset 48).
@@ -6094,7 +6096,8 @@ pub(crate) fn meta_fields(m: &[u8]) -> Option<MetaFields> {
         page_count: meta.page_count,
         free_list_head: meta.free_list_head,
         manifest_head: u32_at(36),
-        dirty_count: u32_at(40),
+        dirty_count: commit_manifest::count_of(m).0 as u32,
+        narrow: commit_manifest::count_of(m).1,
         manifest_pages: u32_at(44),
         manifest_crc: u64::from_be_bytes(m[48..56].try_into().unwrap()),
     })
@@ -6104,6 +6107,20 @@ pub(crate) fn meta_fields(m: &[u8]) -> Option<MetaFields> {
 /// digest (spec/design/validated-cow.md), and the page service's commit digest.
 pub(crate) fn commit_crc64(crc: u64, bytes: &[u8]) -> u64 {
     commit_manifest::extend(crc, bytes)
+}
+
+/// A listed page's manifest identity and the chain digest's step, in a manifest of the given width
+/// (manifest-crc32.md §2): the page service checks a client's delta with these.
+pub(crate) fn manifest_page_digest(page: &[u8], encrypted: bool, narrow: bool) -> u64 {
+    commit_manifest::page_digest(page, encrypted, narrow)
+}
+
+pub(crate) fn manifest_chain_extend(crc: u64, bytes: &[u8], narrow: bool) -> u64 {
+    commit_manifest::chain_extend(crc, bytes, narrow)
+}
+
+pub(crate) fn manifest_capacities_for(ps: usize, cap: Cap, narrow: bool) -> (usize, usize) {
+    commit_manifest::capacities_for(ps, cap, narrow)
 }
 
 /// How many manifest entries a meta page of `ps` bytes holds inline, and how many one manifest
@@ -6140,7 +6157,7 @@ pub(crate) fn encode_manifest(
     ids: &[u32],
 ) -> (Vec<u8>, Vec<(u32, Vec<u8>)>) {
     let cap = Cap::plain(meta.len() as u32);
-    commit_manifest::encode(meta, cap, commit_manifest::entries_of(written), ids)
+    commit_manifest::encode(meta, cap, commit_manifest::entries_of(written, false), ids)
 }
 
 /// A body page of type `page_type` (tests that build a commit delta by hand).

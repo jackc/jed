@@ -55,6 +55,8 @@ pub(crate) struct Delta {
     pub(crate) meta: Vec<u8>,
     /// Body pages are ciphertext (encrypted.md §6): checked by their manifest identity alone.
     encrypted: bool,
+    /// The client's manifest entries are narrow (manifest-crc32.md §2), as its meta declares.
+    narrow: bool,
     /// The new meta's page count and free-list head.
     pub(crate) page_count: u32,
     pub(crate) free_list_head: u32,
@@ -97,7 +99,7 @@ struct Listing {
 }
 
 impl Listing {
-    /// List `count` 12-byte manifest entries from `entries` into `delta`.
+    /// List `count` manifest entries, in the delta's entry width, from `entries` into `delta`.
     fn list(
         &mut self,
         base: &DeltaBase,
@@ -106,14 +108,20 @@ impl Listing {
         entries: &[u8],
         count: usize,
     ) -> Result<()> {
-        for entry in entries[..count * 12].as_chunks::<12>().0 {
+        let width = if delta.narrow { 8 } else { 12 };
+        for entry in entries[..count * width].chunks_exact(width) {
             let index = u32_at(entry, 0);
+            let digest = if delta.narrow {
+                u64::from(u32_at(entry, 4))
+            } else {
+                u64_at(entry, 4)
+            };
             if index <= self.last {
                 return Err(invalid("manifest indices are not strictly ascending"));
             }
-            if let Some(&digest) = base.pending.get(&index) {
+            if let Some(pending) = base.pending.get(&index) {
                 // A page an earlier commit of the batch wrote: listed, never sent again.
-                if u64_at(entry, 4) != digest {
+                if digest != *pending {
                     return Err(invalid(format!(
                         "pending page {index} is listed with another digest"
                     )));
@@ -132,7 +140,7 @@ impl Listing {
                 )));
             }
             self.last = index;
-            delta.expected.insert(index, u64_at(entry, 4));
+            delta.expected.insert(index, digest);
             delta.protected.insert(index);
             self.root_seen |= index == root_page;
             self.free_head_seen |= index == delta.free_list_head;
@@ -173,12 +181,14 @@ pub(crate) fn begin_delta(base: &DeltaBase, cb: CommitBegin) -> Result<Delta> {
     }
     let ps = base.page_size as usize;
     let cap = format::Cap::of(base.page_size, base.encrypted);
-    let (inline_capacity, overflow_capacity) = format::manifest_capacities(ps, cap);
+    let (inline_capacity, overflow_capacity) = format::manifest_capacities_for(ps, cap, m.narrow);
+    let width = if m.narrow { 8 } else { 12 };
     let inline_at = if base.encrypted { 96 } else { 64 };
     let mut delta = Delta {
         txid: cb.txid,
         meta: cb.meta,
         encrypted: base.encrypted,
+        narrow: m.narrow,
         page_count: m.page_count,
         free_list_head: m.free_list_head,
         expected: HashMap::with_capacity(m.dirty_count as usize),
@@ -222,12 +232,12 @@ pub(crate) fn begin_delta(base: &DeltaBase, cb: CommitBegin) -> Result<Delta> {
             || u64_at(&block, 16) != m.txid
             || u32_at(&block, 24) as usize != ordinal
             || block[28..32] != [0; 4]
-            || block[32 + 12 * count..].iter().any(|b| *b != 0)
+            || block[32 + width * count..].iter().any(|b| *b != 0)
         {
             return Err(invalid("a manifest page is malformed"));
         }
-        chain_crc = format::commit_crc64(chain_crc, &id.to_be_bytes());
-        chain_crc = format::commit_crc64(chain_crc, &block);
+        chain_crc = format::manifest_chain_extend(chain_crc, &id.to_be_bytes(), m.narrow);
+        chain_crc = format::manifest_chain_extend(chain_crc, &block, m.narrow);
         delta.protected.insert(id);
         listing.list(base, m.root_page, &mut delta, &block[32..], count)?;
         delta.manifest.push(IndexedPage {
@@ -275,7 +285,10 @@ impl Delta {
         let b = &page.page;
         let plain_ok =
             self.encrypted || ((1..=7).contains(&b[0]) && format::page_crc(b) == u32_at(b, 12));
-        if b.len() != self.meta.len() || !plain_ok || format::commit_crc64(0, b) != crc {
+        if b.len() != self.meta.len()
+            || !plain_ok
+            || format::manifest_page_digest(b, self.encrypted, self.narrow) != crc
+        {
             return Err(invalid(format!(
                 "page {index} does not match its manifest identity"
             )));
