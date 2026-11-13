@@ -15,9 +15,9 @@ costs = schedule.fetch("unit").map { |u| "    internal const long #{pascal.call(
 errors = TomlRB.load_file(File.join(spec, "errors/registry.toml")).fetch("error")
 states = errors.map { |e| "    public const string #{pascal.call(e.fetch('name'))} = #{quote.call(e.fetch('code'))};" }
 types = TomlRB.load_file(File.join(spec, "types/scalars.toml")).fetch("type")
-# Only these representations are implemented in the first slice. Aliases/ranges
-# still come from the spec; this selection is not a full capability declaration.
-selected = types.select { |t| %w[i16 i32 i64 boolean text].include?(t.fetch("id")) }
+# Descriptors do not declare implementation coverage. Every scalar's shared
+# identity is available to resolution; unimplemented kernels still fail closed.
+selected = types
 facts = selected.map do |t|
   aliases = ([t.fetch("id")] + t.fetch("aliases")).map { |a| quote.call(a) }.join(", ")
   "        new(SqlType.#{pascal.call(t.fetch('id'))}, #{quote.call(t.fetch('id'))}, #{quote.call(t.fetch('family'))}, #{t.fetch('min', 0)}L, #{t.fetch('max', 0)}L, #{t.fetch('rank', 0)}, [#{aliases}]),"
@@ -26,12 +26,38 @@ ids = selected.map { |t| t.fetch("id") }
 known_names = types.flat_map { |t| [t.fetch("id"), *t.fetch("aliases")] }.uniq.map { |name| quote.call(name) }.join(", ")
 casts = TomlRB.load_file(File.join(spec, "types/casts.toml")).fetch("cast").select { |c| ids.include?(c.fetch("from")) && ids.include?(c.fetch("to")) }
 pairs = casts.map { |c| "        (SqlType.#{pascal.call(c.fetch('from'))}, SqlType.#{pascal.call(c.fetch('to'))})," }
+functions = TomlRB.load_file(File.join(spec, "functions/catalog.toml")).fetch("operator").select { |o| o.fetch("kind") == "function" }
+array = ->(values) { "[#{values.map { |v| quote.call(v) }.join(', ')}]" }
+function_facts = functions.map do |f|
+  "        new(#{quote.call(f.fetch('name'))}, #{array.call(f.fetch('arg_families'))}, #{quote.call(f.fetch('result'))}, #{quote.call(f.fetch('null'))}, #{f.fetch('cost', 1)}, #{f.fetch('variadic', false)}, #{array.call(f.fetch('arg_names', []))}, #{array.call(f.fetch('arg_defaults', []))}),"
+end
+datetime = TomlRB.load_file(File.join(spec, "types/datetime_units.toml"))
+datetime_tables = %w[delta date].map do |table|
+  rows = datetime.fetch(table).map { |entry| "        (#{quote.call(entry.fetch('token'))}, #{quote.call(entry.fetch('type'))}, #{quote.call(entry.fetch('value', ''))})," }
+  "    internal static readonly (string Token, string Kind, string Value)[] #{pascal.call(table)} =\n    [\n#{rows.join("\n")}\n    ];"
+end
+qualifier_rows = datetime.fetch("interval_qualifier").map { |entry| "        (#{entry.fetch('code')}, #{quote.call(entry.fetch('name'))}, #{quote.call(entry.fetch('least'))}, #{entry.fetch('mm_ss', false)})," }
+datetime_tables << "    internal static readonly (byte Code, string Name, string Least, bool MinuteSecond)[] Qualifiers =\n    [\n#{qualifier_rows.join("\n")}\n    ];"
 outputs = {
+  "DatetimeUnits.g.cs" => header + "internal static class DatetimeUnits\n{\n    internal const int TokenMaxLength = #{datetime.fetch('token_max_len')};\n#{datetime_tables.join("\n")}\n}\n",
+  "FunctionCatalog.g.cs" => header + "internal static class FunctionCatalog\n{\n    internal static readonly FunctionFact[] Facts =\n    [\n#{function_facts.join("\n")}\n    ];\n}\n",
   "CastCatalog.g.cs" => header + "internal static class CastCatalog\n{\n    internal static readonly (SqlType, SqlType)[] Pairs =\n    [\n#{pairs.join("\n")}\n    ];\n}\n",
   "Costs.g.cs" => header + "internal static class Costs\n{\n#{costs.join("\n")}\n}\n",
   "SqlStates.g.cs" => header + "public static class SqlStates\n{\n#{states.join("\n")}\n}\n",
   "ScalarCatalog.g.cs" => header + "internal static class ScalarCatalog\n{\n    internal static readonly string[] KnownNames = [#{known_names}];\n    internal static readonly ScalarFact[] Facts =\n    [\n#{facts.join("\n")}\n    ];\n}\n"
 }
+ranges = TomlRB.load_file(File.join(spec, "types/ranges.toml")).fetch("range")
+range_rows = ranges.map { |entry| "        new(#{quote.call(entry.fetch('id'))}, SqlType.#{pascal.call(entry.fetch('element'))}, #{array.call(entry.fetch('aliases'))}, #{entry.fetch('discrete')})," }
+outputs["RangeCatalog.g.cs"] = header + "internal static class RangeCatalog\n{\n    internal static readonly RangeFact[] Facts =\n    [\n#{range_rows.join("\n")}\n    ];\n}\n"
+formatting = TomlRB.load_file(File.join(spec, "types/formatting.toml"))
+format_tables = %w[dch num].map do |table|
+  rows = formatting.fetch(table).map { |entry| "        (#{quote.call(entry.fetch('name'))}, #{quote.call(entry.fetch('id'))}, #{entry.fetch('is_digit', false)}, #{quote.call(entry.fetch('date_mode', 'none'))})," }
+  "    internal static readonly (string Name, string Id, bool Digit, string Mode)[] #{pascal.call(table)} =\n    [\n#{rows.join("\n")}\n    ];"
+end
+suffix_rows = formatting.fetch("suffixes").map { |entry| "        (#{quote.call(entry.fetch('name'))}, #{quote.call(entry.fetch('id'))}, #{quote.call(entry.fetch('type'))})," }
+format_tables << "    internal static readonly (string Name, string Id, string Type)[] Suffixes =\n    [\n#{suffix_rows.join("\n")}\n    ];"
+formatting.fetch("words").each { |name, words| format_tables << "    internal static readonly string[] #{pascal.call(name)} = #{array.call(words)};" }
+outputs["FormattingCatalog.g.cs"] = header + "internal static class FormattingCatalog\n{\n#{format_tables.join("\n")}\n}\n"
 outputs.each do |name, content|
   path = File.join(CSharpNativeTasks::PACKAGE, "Jed", name)
   if ENV["usage_check"] == "true"

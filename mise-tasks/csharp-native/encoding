@@ -1,0 +1,8 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#MISE description="Explicit opt-in: check complete pinned scalar key-encoding fixture files"
+#USAGE flag "--prepare-only" help="Generate test-only JSON without building or running C#"
+require_relative "../../impl/csharp-native/Tools/encoding"
+CSharpNativeEncoding.generate
+exit 0 if ENV["usage_prepare_only"] == "true"
+CSharpNativeTasks.check("encoding", CSharpNativeTasks::ROOT)

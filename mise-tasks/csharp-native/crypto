@@ -1,0 +1,7 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#MISE description="Explicit opt-in: C# provider vectors against the pinned shared spec"
+#USAGE flag "--portable" help="Disable .NET hardware intrinsics to verify provider fallback"
+require_relative "../../impl/csharp-native/Tools/tasks"
+ENV["DOTNET_EnableHWIntrinsic"] = "0" if ENV["usage_portable"] == "true"
+CSharpNativeTasks.check("crypto", File.dirname(CSharpNativeTasks.baseline_spec))

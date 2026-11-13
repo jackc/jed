@@ -54,10 +54,15 @@ files in the same change.
   `spec/design/ruby-native-experiment.md` and `spec/design/swift-native-experiment.md`.
   The C# experiment is authorized (2026-11-12), in progress against semantic baseline
   `b1a6affca7725e0b07a4f734eddb1c569ef76bcf`, and targets Linux x86-64 with pinned .NET 11
-  and an async-first public API (inline resident kernels, real awaited I/O when storage is
-  implemented, no Task.Run wrapper). The initial scalar slice is verified; storage is missing.
+  and an async-first public API (inline resident kernels, awaited storage I/O, no Task.Run
+  wrapper). Scalar, relational, paged-storage, encrypted-file and owner/client interoperability
+  slices have passing checks; full SQL, file-host, resource and interoperability acceptance
+  remains incomplete.
   Full parity, full-engine NativeAOT verification and measured performance remain acceptance gates;
-  no C# third-party dependency or production delivery is selected. See
+  BouncyCastle.Cryptography 2.7.0 is approved for SHA-224 and Argon2id plus their
+  reviewed internal crypto helpers, subject to shared vectors and JIT/NativeAOT
+  checks. Subagent implementation/review is authorized; production delivery remains
+  undecided. See
   `spec/design/csharp-native-experiment.md` and its scope/host/crypto matrices.
   The explicitly requested Ruby refresh (2026-11-12) tracks supported-core revision
   `b1a6affc`; coverage and remaining omissions are recorded in

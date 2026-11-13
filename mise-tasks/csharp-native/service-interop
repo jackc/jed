@@ -1,0 +1,19 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#MISE description="Explicit opt-in: native C#/Go page-service interoperability against pinned peer sources"
+require_relative "../../impl/csharp-native/Tools/tasks"
+revision = CSharpNativeTasks::BASELINE.fetch("semantic_revision")
+peer_root = File.join(CSharpNativeTasks::BUILD, "service-peer-#{revision}")
+marker = File.join(peer_root, ".complete")
+unless File.file?(marker)
+  FileUtils.mkdir_p(peer_root)
+  statuses = Open3.pipeline(["git", "archive", revision, "impl/go", { chdir: CSharpNativeTasks::ROOT }], ["tar", "-x", "-C", peer_root])
+  abort "Cannot extract pinned Go peer" unless statuses.all?(&:success?)
+  File.write(marker, "#{revision}\n")
+end
+peer = File.join(peer_root, "process_actor")
+unless File.executable?(peer)
+  abort "Go peer build failed" unless system("go", "build", "-o", peer, "./cmd/process_actor", chdir: File.join(peer_root, "impl/go"))
+end
+puts "Peer Go semantic revision: #{revision}"
+CSharpNativeTasks.check("service-interop", peer)

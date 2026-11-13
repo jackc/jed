@@ -74,7 +74,7 @@ internal static class HostTests
         Console.WriteLine("PASS host API: inline completion, owned rows, drain errors, cost/lifetime limits, cancellation, Unicode, nesting, disposal and locale");
     }
 
-    private static async Task Error(string expected, Func<Task> action)
+    internal static async Task Error(string expected, Func<Task> action)
     {
         try { await action(); }
         catch (Exception error) when (error is ISqlError sql)

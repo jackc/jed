@@ -1,0 +1,10 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#MISE description="Explicit opt-in: restore the approved C# package and SDK tooling locks"
+#USAGE flag "--aot" help="Restore NativeAOT compiler/runtime packs as well"
+#USAGE flag "--refresh-lock" help="Explicitly regenerate locks after an approved dependency or pinned SDK change"
+require_relative "../../impl/csharp-native/Tools/tasks"
+arguments = ["restore", "Jed.Check/Jed.Check.csproj"]
+arguments += ["--runtime", "linux-x64", "-p:PublishAot=true"] if ENV["usage_aot"] == "true"
+arguments += ENV["usage_refresh_lock"] == "true" ? ["--force-evaluate", "-p:RestoreLockedMode=false"] : ["-p:RestoreLockedMode=true"]
+CSharpNativeTasks.run(*arguments)

@@ -1,5 +1,12 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <AssemblyName>Jed.CSharpExperiment</AssemblyName>
+    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
+    <NuGetLockFilePath Condition="'$(PublishAot)' == 'true'">packages.aot.lock.json</NuGetLockFilePath>
   </PropertyGroup>
+  <ItemGroup>
+    <!-- Explicit maintainer approval: SHA-224 and Argon2id plus internal helpers only. -->
+    <PackageReference Include="BouncyCastle.Cryptography" Version="[2.7.0]" />
+    <InternalsVisibleTo Include="Jed.Check" />
+  </ItemGroup>
 </Project>

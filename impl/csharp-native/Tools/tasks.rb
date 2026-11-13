@@ -20,6 +20,7 @@ module CSharpNativeTasks
   def source_digest
     paths = Dir.glob("impl/csharp-native/{Jed,Jed.Check}/*.cs", base: ROOT) +
             Dir.glob("impl/csharp-native/{Jed,Jed.Check}/*.csproj", base: ROOT) +
+            Dir.glob("impl/csharp-native/{Jed,Jed.Check}/packages*.lock.json", base: ROOT) +
             Dir.glob("impl/csharp-native/Tools/*.rb", base: ROOT) +
             Dir.glob("mise-tasks/csharp-native/*", base: ROOT) +
             %w[impl/csharp-native/global.json impl/csharp-native/baseline.json
@@ -60,7 +61,7 @@ module CSharpNativeTasks
     puts "Source SHA-256: #{source_digest}"
     $stdout.flush
     ok = system(environment, dotnet, "build", "Jed.Check/Jed.Check.csproj", "--configuration", configuration,
-                "--no-incremental", "-p:Features=#{feature}",
+                "--no-incremental", "-p:Features=#{feature}", "-p:RestoreLockedMode=true",
                 "--nologo", chdir: PACKAGE)
     exit($?&.exitstatus || 1) unless ok
     File.join(PACKAGE, "Jed.Check/bin", configuration, "net11.0/Jed.Check.dll")

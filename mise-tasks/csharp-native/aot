@@ -2,29 +2,35 @@
 # frozen_string_literal: true
 #MISE description="Explicit opt-in: publish and test the C# NativeAOT host (downloads Microsoft compiler packs)"
 #USAGE flag "--runtime-async" help="Also enable .NET 11 runtime-native async"
+#USAGE flag "--native-instructions" help="Also verify this host's accelerated instruction set (artifact is host-specific)"
 require_relative "../../impl/csharp-native/Tools/tasks"
+require_relative "../../impl/csharp-native/Tools/encoding"
+CSharpNativeEncoding.generate
 
 abort "Initial AOT acceptance targets Linux x86-64" unless RUBY_PLATFORM.include?("linux") && RUBY_PLATFORM.include?("x86_64")
 output = File.join(CSharpNativeTasks::BUILD, "aot", ENV["usage_runtime_async"] == "true" ? "runtime-async" : "default")
+native = ENV["usage_native_instructions"] == "true"
+output += "-native" if native
 feature = ENV["usage_runtime_async"] == "true" ? "runtime-async=on" : ""
 puts "C# net11.0 NativeAOT, SDK #{CSharpNativeTasks.sdk_version}, Runtime Async #{feature.empty? ? 'default' : 'on'}"
 puts "Source SHA-256: #{CSharpNativeTasks.source_digest}"
+puts "NativeAOT instruction set: #{native ? 'native (host-specific)' : 'SDK default'}"
 $stdout.flush
 restored = system(CSharpNativeTasks.environment, CSharpNativeTasks.dotnet,
                   "restore", "Jed.Check/Jed.Check.csproj", "--runtime", "linux-x64", "-p:PublishAot=true",
-                  "--source", "https://api.nuget.org/v3/index.json", chdir: CSharpNativeTasks::PACKAGE)
+                  "-p:RestoreLockedMode=true", chdir: CSharpNativeTasks::PACKAGE)
 exit($?&.exitstatus || 1) unless restored
 # A different Features value must not reuse a previous compiler invocation's IL.
 clean = system(CSharpNativeTasks.environment, CSharpNativeTasks.dotnet,
                "clean", "Jed.Check/Jed.Check.csproj", "--configuration", "Release", "--runtime", "linux-x64",
                "--nologo", "--verbosity", "quiet", chdir: CSharpNativeTasks::PACKAGE)
 exit($?&.exitstatus || 1) unless clean
-# These are the SDK's first-party compiler/runtime packs, not engine PackageReferences.
-# Ordinary builds keep all NuGet feeds disabled. Only this explicit AOT task restores
-# the Microsoft toolchain from the official feed.
+# Feed mapping admits only the approved exact-pinned crypto dependency and the
+# SDK's first-party compiler/runtime packs from the official feed.
 ok = system(CSharpNativeTasks.environment, CSharpNativeTasks.dotnet,
             "publish", "Jed.Check/Jed.Check.csproj", "--configuration", "Release", "--runtime", "linux-x64",
             "-p:PublishAot=true", "-p:Features=#{feature}", "--no-restore",
+            "-p:IlcInstructionSet=#{native ? 'native' : ''}",
             "--output", output, chdir: CSharpNativeTasks::PACKAGE)
 exit($?&.exitstatus || 1) unless ok
 exec(File.join(output, "Jed.Check"), "test", CSharpNativeTasks::ROOT)

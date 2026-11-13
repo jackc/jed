@@ -2,12 +2,20 @@
 # frozen_string_literal: true
 #MISE description="Explicit opt-in: attempt selected C# corpus files; unsupported behavior fails"
 #USAGE flag "--all" help="Attempt every pinned SQL corpus file (incomplete experiment will fail)"
+#USAGE flag "--suite <name>" help="One directory of complete frozen corpus files"
 #USAGE flag "--file <path>" help="One complete .test file; default is the shared scalar foundation supplement"
 require_relative "../../impl/csharp-native/Tools/tasks"
 files = ENV["usage_file"] ? [ENV.fetch("usage_file")] : []
+suite = ENV["usage_suite"]
+abort "--suite cannot be combined with --file or --all" if suite && (!files.empty? || ENV["usage_all"] == "true")
 if ENV["usage_all"] == "true"
   abort "--all cannot be combined with file arguments" unless files.empty?
   files = Dir.glob(File.join(CSharpNativeTasks.baseline_spec, "conformance/suites/**/*.test")).sort
+elsif suite
+  base = File.join(CSharpNativeTasks.baseline_spec, "conformance/suites")
+  directory = File.expand_path(suite, base)
+  abort "Unknown suite" unless directory.start_with?(base + "/") && File.directory?(directory)
+  files = Dir.glob(File.join(directory, "**/*.test")).sort
 else
   files = CSharpNativeTasks::BASELINE.fetch("supplemental_corpus") if files.empty?
   files = files.map { |f| File.expand_path(f, CSharpNativeTasks::ROOT) }

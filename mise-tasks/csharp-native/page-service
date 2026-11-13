@@ -1,0 +1,5 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#MISE description="Explicit opt-in: C# page-service wire fixtures and isolated host transport invariants"
+require_relative "../../impl/csharp-native/Tools/tasks"
+CSharpNativeTasks.check("page-service", File.dirname(CSharpNativeTasks.baseline_spec))

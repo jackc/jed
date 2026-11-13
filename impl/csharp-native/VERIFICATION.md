@@ -77,3 +77,84 @@ They are not new C# divergences. The full default CI suite was not run: no
 supported engine implementation changed, and scoped three-core conformance plus
 normal spec verification passed. Windows, macOS, ARM and browser/mobile hosts
 remain unverified. Crypto provider selection and dependency approval remain open.
+
+## Subsequent implementation checkpoints — 2026-11-12/13
+
+The initial milestone above remains historical evidence. Dependency approval is
+now granted and implemented, while full acceptance remains incomplete.
+
+Release JIT integrated checks passed at source prefix `ad64b602` after adding:
+
+- Exact decimal tests with 4,000 independent test-only bignum oracle trials.
+- Six complete scalar encoding files (202 vectors), three complete temporal
+  fixture files (319 parse/error/render vectors), and 4,000 calendar invariants.
+- Nineteen packed leaf goldens, eleven interior goldens, multi-way split bytes,
+  600 permuted deletions and exact tree page deltas.
+- All 107 shared catalog goldens decoded/re-encoded byte-for-byte, all entry kinds.
+- Recovery of 110 plaintext fixtures; failed COW stages and poisoned-handle checks.
+- Database host tests for commit visibility, pending reads, rollback, retained
+  cursors, uniqueness and synthetic row keys.
+- Crypto provider vectors and six encrypted golden files: 309 body pages and
+  their meta/key-block codecs decrypt/reseal byte-for-byte.
+
+The provider was also exercised in earlier clean NativeAOT builds with Runtime
+Async, both portable and native-instruction targets, covering scalar and AVX2
+BLAKE2b paths. These earlier builds do **not** establish AOT acceptance of the
+subsequently expanded SQL/database engine; a fresh full-engine gate remains due.
+
+A complete SQL diagnostic at source
+`cc0d2150e7f423cd696b795e179b02ba1eff7116522fead906ac657d447e4d5d`
+passed 69/763 files (1,331 records), with 694 files failing and no capability skips.
+Raw working log: `/tmp/jed-csharp-tables.log` (ephemeral). All shared SQL records
+still drain the public cursor externally. No full SQL, file-host, cross-core
+interchange, process, simulation, resource-accounting or benchmark acceptance is
+claimed by these intermediate checks.
+
+## Integrated native-engine checkpoint — 2026-11-13
+
+At source SHA-256
+`85011fc9fa2e593f2f9ee6e3f22c19da50fd601ed739b6d533c0a40d5a489e29`,
+the expanded native engine passes:
+
+| Command | Result |
+|---|---|
+| `mise run csharp-native:test` | Release JIT full host/fixture/supplement checks pass; AVX2 enabled |
+| `mise run csharp-native:crypto --portable` | Provider vectors pass with AVX2 disabled |
+| `mise run csharp-native:aot` | Clean SDK-default instruction-set NativeAOT build and full host checks pass; AVX2 disabled |
+| `mise run csharp-native:aot --runtime-async --native-instructions` | Clean Runtime Async NativeAOT build and full host checks pass; host-specific instructions, AVX2 enabled |
+| `mise run csharp-native:codegen --check` | Eight generated data catalogs match the pinned spec |
+| `mise run verify` | Normal repository spec checks pass |
+
+Both NativeAOT builds completed without warnings or errors. These results cover
+implemented host and fixture paths, including exact numerics, temporal/timezone
+values, recursive codecs, JSON binary goldens, prepared AST reuse, real file I/O,
+encrypted storage, compressed/overflow values and process coordination. They do
+not establish complete SQL, resource, simulation, maintenance or platform acceptance.
+
+The expanded Go↔C# owner/client interoperability run passed separately at source
+`e3140dd7f61f56a203f32e8125ea7fded2c8068e8862420a9d2a16cfd9950c6a`.
+It covers both owner directions, plaintext and encrypted files, role handoff,
+owner death, lost-acknowledgment recovery, snapshot pins, and compressed and
+incompressible large SQL values. Its source identity differs from this checkpoint;
+these are scoped interoperability checks, not the entire shared process corpus.
+
+The first full-SQL run at that same `85011fc9` source aborted with a stack
+overflow in sequence-write classification while expanding views through CTE
+shadowing. It is an incomplete diagnostic, not a 763-file result. The host/AOT
+checks above did not cover that SQL case; a corrected source needs fresh checks.
+
+The corrected sequence-write discovery carries lexical CTE scope, uses a fresh
+scope when entering a view, guards active view cycles and bounds expansion.
+At corrected source SHA-256
+`8d5b2a68950da35d5b73653205a281f9afb30c0b1e17bd6574e1d9db6a047d8c`,
+`mise run csharp-native:conformance --all` completed **763 files**: **293 passed**,
+**7,148 records in passing files**, **470 failed**. The command exits nonzero for
+those failures. No unsupported capability is silently skipped. Ephemeral raw log:
+`/tmp/jed-csharp-checkpoint-full2.log`.
+
+After that complete SQL diagnostic, all four integrated host/crypto/build commands
+listed above were rerun successfully at corrected digest `8d5b2a68…`: Release
+JIT, portable provider vectors, SDK-default NativeAOT, and Runtime Async NativeAOT
+with host-native instructions. Both clean NativeAOT publishes again completed
+without warnings or errors. This verifies the corrected checkpoint's implemented
+host paths while leaving the 470 SQL failures and remaining acceptance gates open.

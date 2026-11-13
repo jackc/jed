@@ -197,13 +197,15 @@ cost ceiling, and cached UPDATE/DELETE access inventories. A point lookup is 1.1
 The **native C# experiment** (`impl/csharp-native`) was authorized 2026-11-12 and
 is in progress against the supported-core semantic baseline
 `b1a6affca7725e0b07a4f734eddb1c569ef76bcf`. It targets Linux x86-64 with pinned .NET 11
-and an async-first public API: inline resident kernels and real awaited I/O when
-storage is implemented, with no Task.Run wrapper. The initial scalar slice is
-verified; storage remains missing. It uses only opt-in `csharp-native:*` tasks,
+and an async-first public API: inline resident kernels and awaited storage I/O,
+with no Task.Run wrapper. Scalar, relational, paged-storage, encrypted-file and
+owner/client interoperability slices have passing checks; full SQL, file-host,
+resource and interoperability acceptance remains incomplete. It uses only opt-in `csharp-native:*` tasks,
 and has no automatic future-maintenance or website obligation. Full baseline
 parity, full-engine NativeAOT verification and measured performance remain gates.
-No C# third-party dependency is approved yet; production delivery and promotion
-remain separate decisions. See
+The maintainer approved exact-pinned BouncyCastle.Cryptography 2.7.0 for SHA-224
+and Argon2id (including their internal helpers) and subagent implementation/review
+on 2026-11-12. Production delivery and promotion remain separate decisions. See
 [csharp-native-experiment.md](spec/design/csharp-native-experiment.md) and its
 scope, host and crypto inventories.
 
@@ -1538,6 +1540,14 @@ new cryptographic primitives, or native engine components. Parser, planner, exec
 types, exact arithmetic, codecs, storage algorithms and noncrypto built-ins remain
 handwritten Swift. Ordinary OS interfaces may implement sanctioned host seams. See
 [swift-native-crypto.md](spec/design/swift-native-crypto.md).
+
+**Approved C# experiment dependency (2026-11-12, clause 3).** `impl/csharp-native`
+may use exact-pinned `BouncyCastle.Cryptography = 2.7.0` for SHA-224 and Argon2id
+only, including their internal cryptographic helpers and reviewed acceleration.
+Approval is subject to backend review and passing shared vectors under JIT and
+NativeAOT. AES/GCM, HKDF and other required digests use .NET's built-in providers.
+No other new package or unsafe engine access is approved. See
+[csharp-native-crypto.md](spec/design/csharp-native-crypto.md).
 
 **Approved AEAD benchmark dependencies (2026-10-17, clause 3).** The isolated `bench/aead/`
 experiment may use exact-pinned RustCrypto `aes-gcm` / `chacha20poly1305`, Go

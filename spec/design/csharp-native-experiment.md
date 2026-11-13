@@ -96,8 +96,9 @@ error/cost order, cancellation boundaries or commit outcome semantics.
 Host functions will use in-process delegates and the existing batched contract.
 ADO.NET, EF integration and public NuGet packaging are separate follow-ons.
 
-Crypto and ordinary OS operations stay behind narrow host seams. No C# third-party
-dependency is approved yet; see the [crypto audit](csharp-native-crypto.md).
+Crypto and ordinary OS operations stay behind narrow host seams. The maintainer
+approved BouncyCastle.Cryptography 2.7.0 for SHA-224 and Argon2id with their internal
+helpers on 2026-11-12; see the [crypto audit](csharp-native-crypto.md).
 Protocol-v2 locks, directory durability and file replacement need explicit host
 proofs. BCL method names alone do not prove cross-core lock interoperability.
 
@@ -113,9 +114,9 @@ by this charter.
 ## Full-build readiness audit (2026-11-12)
 
 The scalar milestone is committed locally as `aeb741bd`. The one identified
-external approval blocker is the concrete crypto dependency proposal in the
-[crypto audit](csharp-native-crypto.md). Subagent implementation/review is an
-optional execution choice, pending user authorization, not a prerequisite.
+external approval blocker was resolved by the maintainer's approval of the
+concrete crypto dependency in the [crypto audit](csharp-native-crypto.md).
+Subagent implementation/review was also explicitly authorized on 2026-11-12.
 
 The SDK, compiler, Linux host, PostgreSQL oracle, supported peer builds and shared
 fixtures are available in the current checkout. Unicode/time-zone bundles and

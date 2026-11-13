@@ -12,5 +12,17 @@ internal static class ScalarCatalog
         new(SqlType.I64, "i64", "integer", -9223372036854775808L, 9223372036854775807L, 3, ["i64", "bigint", "int8"]),
         new(SqlType.Boolean, "boolean", "boolean", 0L, 0L, 0, ["boolean", "bool"]),
         new(SqlType.Text, "text", "text", 0L, 0L, 0, ["text", "varchar", "character varying", "string"]),
+        new(SqlType.Decimal, "decimal", "decimal", 0L, 0L, 0, ["decimal", "numeric", "dec"]),
+        new(SqlType.Bytea, "bytea", "bytea", 0L, 0L, 0, ["bytea"]),
+        new(SqlType.Uuid, "uuid", "uuid", 0L, 0L, 0, ["uuid"]),
+        new(SqlType.Timestamp, "timestamp", "timestamp", 0L, 0L, 0, ["timestamp", "timestamp without time zone"]),
+        new(SqlType.Timestamptz, "timestamptz", "timestamptz", 0L, 0L, 0, ["timestamptz", "timestamp with time zone"]),
+        new(SqlType.Interval, "interval", "interval", 0L, 0L, 0, ["interval"]),
+        new(SqlType.F32, "f32", "float", 0L, 0L, 1, ["f32", "real", "float4"]),
+        new(SqlType.F64, "f64", "float", 0L, 0L, 2, ["f64", "double precision", "float", "float8"]),
+        new(SqlType.Date, "date", "date", 0L, 0L, 0, ["date"]),
+        new(SqlType.Json, "json", "json", 0L, 0L, 0, ["json"]),
+        new(SqlType.Jsonb, "jsonb", "jsonb", 0L, 0L, 0, ["jsonb"]),
+        new(SqlType.Jsonpath, "jsonpath", "jsonpath", 0L, 0L, 0, ["jsonpath"]),
     ];
 }
