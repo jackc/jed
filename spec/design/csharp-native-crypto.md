@@ -1,7 +1,7 @@
 # C# experiment cryptographic provider audit
 
 Status: **provider approved; experimental encrypted file and page-service integration verified on
-Linux x86-64; scoped implementation review complete, final simulation acceptance in progress** (2026-11-13).
+Linux x86-64; scoped implementation review and final simulation verification complete** (2026-11-13).
 This records the implemented boundary and its evidence, not production approval or full-core parity.
 Swift's swift-crypto/reference-Argon2 approval does not authorize a C# package.
 
@@ -67,7 +67,7 @@ approval; ordinary implementation choices do not.
 
 ## Historical storage and host integration evidence
 
-The following records preserve their original source hashes. Later complete acceptance
+The following records preserve their original source hashes. Later complete verification
 results in the current review section supersede the dated coverage gaps; they do not
 retroactively attribute later code to an earlier run.
 
@@ -263,8 +263,9 @@ and `encryption-service-backup-current-key-block`: held-key reconnection, stale-
 promotion rejection, and byte-identical backup using the owner's current key block.
 The relaxed `service-backup-after-owner-lost` trace also passes exactly, including
 recovery below the previous visible generation while respecting the durable floor.
-These passes do not establish the full service scheduling/fault matrix. Larger service
-and attachment traces, corruption scenarios and every crash profile remain in progress.
+Those focused passes did not establish the full service scheduling/fault matrix.
+At that checkpoint, larger service/attachment traces, corruption scenarios and
+the complete crash-profile sweep remained in progress; final evidence is below.
 
 At `8ab08af3506006c732f6a9482270c307b3d073051aab1eeb903b297c8396e5ff`,
 the complete 304-step `service-owner-and-clients` trace matches the pinned Go transcript
@@ -326,19 +327,35 @@ comparison. Threaded stress passes C# memory, plaintext and encrypted file hosts
 Go with 16,000 reader checks and identical final checksum. Artifact hashes and logs
 are retained in `impl/csharp-native/VERIFICATION.md`.
 
-Current whole-engine JIT and NativeAOT host checks pass at the parent-coordinated
-capture18, including the immutable environment and native host API. The same capture's
-NativeAOT memory corpus passes all 761 eligible files (21,954 records; two declared
-exclusions), and all 676 eligible encrypted files pass exact independent Go
-cost/EXPLAIN transcript comparison (2,761 events). The experiment verification
-record owns the full capture hash and commands. These results supersede earlier
-statements that current NativeAOT or full encrypted SQL coverage had not been run.
+Capture34, source
+`7124c0e6a67e3fb3955ef6df359faaa94d8d375702b887b72cc439a851a51594`, passes
+full host checks under default/runtime-async JIT and NativeAOT, including crypto,
+encrypted storage, maintenance and scratch invariants. Each variant passes all
+676 applicable encrypted SQL files, and all four cost/EXPLAIN transcripts match
+the independent pinned Go transcript (2,761 events). The complete 496-case
+mixed-core process matrix includes encrypted reads, writes, backups and reopening.
+The [verification record](../../impl/csharp-native/VERIFICATION.md) owns the
+artifact identities and commands. These results do not transfer automatically to
+later engine changes. The exceptional writer-pin admission cleanup fix and its
+regression are included in capture34.
 
-Final deterministic simulation acceptance remains open: capture20 saved coverage is
-19/19 complete exact traces. Generated seed-one coverage is 19/22 profiles
-(16/19 exact and 3/3 intrinsic); the remaining encrypted attachment, replay and
-service cases are under correction. Exact peer comparison and intrinsic per-core
-fault oracles are reported separately under the canonical policy.
-The tooling records and checks its own policy hashes so one accepted sweep cannot
-silently span a policy change. Other operating systems and architectures remain
-unverified; promotion and production delivery still require a separate decision.
+The final bounded deterministic simulation matrix passes at harness capture35
+(`456e9a13909cefb2bb9577be7fcdcee788537ae796db3fc7eddac360713fcf31`):
+**85/85 complete traces**, comprising all 19 saved regressions and all 22 generated
+profiles at seeds 1, 2 and 3. **76/76** compare exact independent Go transcripts;
+**9/9** use the canonical per-core corruption/resource/spill fault oracles. Neither
+category skips recovery or structural checks, and intrinsic passes do not imply
+byte-identical fault transcripts. This closes the earlier attachment, replay and
+service acceptance gaps. It is a bounded matrix, not exhaustive fuzzing.
+
+Capture35 changes only two simulator cache assignments after validated generation
+adoption; its engine DLL is byte-identical to capture34. The committed
+`impl/csharp-native/verification/simulation35.json` retains all four sweep manifests,
+complete results, input/artifact/tool hashes and log hashes. Tooling policy hashes
+are checked throughout each sweep, preventing one accepted result from silently
+spanning a policy change.
+
+Other operating systems and architectures remain unverified. The provider review
+is scoped to the approved boundary and is not an independent security audit or a
+claim of complete secret erasure. Promotion and production delivery require a
+separate decision.

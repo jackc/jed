@@ -48,7 +48,9 @@ public sealed partial class Database
             }
             if (state is not null)
             {
-                await committer.FlushAsync(token: cancellationToken).ConfigureAwait(false);
+                // The replacement image makes the published batch durable.
+                // Keep the old file at its existing floor until replacement
+                // succeeds; an early flush would change crash recovery.
                 _ = await OwnerSnapshotAsync(cancellationToken).ConfigureAwait(false);
             }
             DatabaseSnapshot snapshot;
@@ -101,10 +103,9 @@ public sealed partial class Database
         var mode = await host.GetPermissionsAsync(state.Path, token).ConfigureAwait(false);
         // The reserved stale name is unlinked first; CreateNew then refuses a
         // concurrent replacement or symlink instead of following it.
-        await host.DeleteAsync(temporary).ConfigureAwait(false);
         try
         {
-            await using (var output = await host.OpenAsync(temporary, FileMode.CreateNew, token: token).ConfigureAwait(false))
+            await using (var output = await host.CreateTemporaryAsync(temporary, token).ConfigureAwait(false))
             {
                 await host.SetPermissionsAsync(temporary, mode, token).ConfigureAwait(false);
                 await CopySnapshotImageAsync(snapshot, output, snapshot.Meta.TransactionId + 1, ownedCodec, keyBlock?.Block, token).ConfigureAwait(false);

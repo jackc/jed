@@ -19,7 +19,7 @@ public sealed partial class Session : IAsyncDisposable
     private sealed record SavepointFrame(string Name, PendingDatabase? Pending, SequenceState Sequences);
     private readonly List<SavepointFrame> savepoints = [];
     public long MaxQueryMemoryBytes { get; private set; }
-    public void SetQueryMemoryLimit(long maximum) { using var operation = Enter(); MaxQueryMemoryBytes = maximum; }
+    public void SetQueryMemoryLimit(long maximum) { using var operation = Enter(); MaxQueryMemoryBytes = Math.Max(0, maximum); }
     public long LifetimeCost { get; internal set; }
     public long LifetimeMaxCost { get; private set; }
     private readonly SessionOptions options;
@@ -44,7 +44,7 @@ public sealed partial class Session : IAsyncDisposable
         this.options = options; defaultPrivileges = options.DefaultPrivileges;
         if (options.MaxTempStorageBytes < 0 || options.TempBuffers < 0) throw new ArgumentOutOfRangeException(nameof(options));
         tempStorageLimit = options.MaxTempStorageBytes; allowDdl = options.AllowDdl; allowTempDdl = options.AllowTempDdl ?? options.AllowDdl;
-        LifetimeMaxCost = options.LifetimeMaxCost; MaxQueryMemoryBytes = options.MaxQueryMemoryBytes;
+        LifetimeMaxCost = options.LifetimeMaxCost; MaxQueryMemoryBytes = Math.Max(0, options.MaxQueryMemoryBytes);
     }
 
     internal Session(Database database, long lifetimeMaxCost) : this(new SessionOptions { LifetimeMaxCost = lifetimeMaxCost }, database.Environment) { this.database = database; }
@@ -78,7 +78,9 @@ public sealed partial class Session : IAsyncDisposable
         if (maxCost < 0) throw new ArgumentOutOfRangeException(nameof(maxCost));
         if (cancellationToken.IsCancellationRequested) throw new SqlCanceledException(cancellationToken);
         if (queryOptions?.MaxScalarBytes < 0 || queryOptions?.MaxSqlLength < 0) throw new ArgumentOutOfRangeException(nameof(queryOptions));
-        var meter = new Meter(this, maxCost, cancellationToken, queryOptions);
+        using var cursorCancellation = new CursorCancellation(cancellationToken);
+        cancellationToken = cursorCancellation.Token;
+        var meter = new Meter(this, maxCost, cancellationToken, queryOptions) { CursorCancellation = cursorCancellation };
         try
         {
             var maxSqlLength = queryOptions?.MaxSqlLength ?? options.MaxSqlLength;
@@ -161,8 +163,8 @@ public sealed partial class Session : IAsyncDisposable
             if (error is not SqlException { SqlState: SqlStates.ActiveSqlTransaction }) FailStatement();
             if (error is SqlException sqlError) sqlError.Cost = meter.Accrued;
             if (error is SqlCanceledException canceled) canceled.Cost = meter.Accrued;
-            if (error is OperationCanceledException && error is not SqlCanceledException)
-                throw new SqlCanceledException(cancellationToken) { Cost = meter.Accrued };
+            if (error is OperationCanceledException)
+                throw new SqlCanceledException(cursorCancellation.CanceledToken) { Cost = meter.Accrued };
             throw;
         }
     }
@@ -198,7 +200,12 @@ public sealed partial class Session : IAsyncDisposable
         if (transaction is not null) { var pending = transaction; transaction = null; await database!.EndWriteAsync(pending).ConfigureAwait(false); }
         if (readTransaction is not null) { await readTransaction.DisposeAsync().ConfigureAwait(false); readTransaction = null; }
         savepoints.Clear();
-        if (domainTransactionLease is not null) { await domainTransactionLease.ReleaseWriters().ConfigureAwait(false); await domainTransactionLease.DisposeAsync().ConfigureAwait(false); domainTransactionLease = null; domainTransaction = null; }
+        if (domainTransactionLease is not null)
+        {
+            var lease = domainTransactionLease; domainTransactionLease = null; domainTransaction = null;
+            try { await lease.ReleaseWriters().ConfigureAwait(false); }
+            finally { await lease.DisposeAsync().ConfigureAwait(false); }
+        }
         if (temporaryDatabase is not null) { await temporaryDatabase.DisposeAsync().ConfigureAwait(false); temporaryDatabase = null; }
         if (ownsDatabase) await database!.DisposeAsync().ConfigureAwait(false);
         disposed = true;
@@ -232,6 +239,7 @@ public sealed partial class Rows : IAsyncEnumerable<Row>, IAsyncDisposable
     private readonly IAsyncEnumerator<Row> stream;
     private readonly IDisposable? retained;
     private readonly Meter meter;
+    private IDisposable? cancellationLease;
     private bool finished;
     private bool disposed;
     private int enumerated;
@@ -250,6 +258,7 @@ public sealed partial class Rows : IAsyncEnumerable<Row>, IAsyncDisposable
     {
         this.session = session; this.meter = meter; this.retained = retained;
         stream = source.GetAsyncEnumerator(); Columns = Array.AsReadOnly(columns); AffectedRows = affected;
+        cancellationLease = meter.CursorCancellation?.Retain();
     }
 
     public async ValueTask<Row?> ReadAsync(CancellationToken cancellationToken = default)
@@ -262,9 +271,11 @@ public sealed partial class Rows : IAsyncEnumerable<Row>, IAsyncDisposable
         try
         {
             if (finished) return null;
+            using var readCancellation = meter.CursorCancellation?.Register(cancellationToken) ?? default;
             CursorCheckpoint(cancellationToken);
             if (!await stream.MoveNextAsync().ConfigureAwait(false))
             {
+                CursorCheckpoint(cancellationToken);
                 finished = true; await stream.DisposeAsync().ConfigureAwait(false); await ReleaseRetainedAsync().ConfigureAwait(false);
                 CursorCheckpoint(cancellationToken); return null;
             }
@@ -278,10 +289,11 @@ public sealed partial class Rows : IAsyncEnumerable<Row>, IAsyncDisposable
             finally { await ReleaseRetainedAsync().ConfigureAwait(false); }
             if (error is SqlException sql) sql.Cost = Cost;
             if (error is SqlCanceledException canceled) canceled.Cost = Cost;
-            if (error is OperationCanceledException && error is not SqlCanceledException)
-                throw new SqlCanceledException(cancellationToken) { Cost = Cost };
+            if (error is OperationCanceledException)
+                throw new SqlCanceledException(meter.CursorCancellation?.CanceledToken ?? cancellationToken) { Cost = Cost };
             throw;
         }
+        finally { if (finished) Interlocked.Exchange(ref cancellationLease, null)?.Dispose(); }
     }
 
     public async IAsyncEnumerator<Row> GetAsyncEnumerator(CancellationToken cancellationToken = default)
@@ -299,6 +311,11 @@ public sealed partial class Rows : IAsyncEnumerable<Row>, IAsyncDisposable
         // Cursor movement adds no execution work. Cost guards belong to the
         // retained operator continuation, including its exact final-charge boundary.
         meter.CheckCancellation(cancellationToken);
+        if (!finished)
+        {
+            if (retained is DomainLease domains) domains.CheckRoles();
+            else if (retained is Database.SnapshotPin pin) pin.CheckRole();
+        }
     }
 
     public async ValueTask DisposeAsync()
@@ -307,7 +324,11 @@ public sealed partial class Rows : IAsyncEnumerable<Row>, IAsyncDisposable
         using var operation = Enter();
         disposed = true;
         try { await stream.DisposeAsync().ConfigureAwait(false); }
-        finally { await ReleaseRetainedAsync().ConfigureAwait(false); }
+        finally
+        {
+            try { await ReleaseRetainedAsync().ConfigureAwait(false); }
+            finally { Interlocked.Exchange(ref cancellationLease, null)?.Dispose(); }
+        }
     }
 
     private ValueTask ReleaseRetainedAsync()

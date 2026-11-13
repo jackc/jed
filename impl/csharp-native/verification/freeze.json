@@ -1,0 +1,23 @@
+{
+  "semantic_revision": "b1a6affca7725e0b07a4f734eddb1c569ef76bcf",
+  "status": "frozen",
+  "verified_engine_source_sha256": "7124c0e6a67e3fb3955ef6df359faaa94d8d375702b887b72cc439a851a51594",
+  "verified_harness_source_sha256": "456e9a13909cefb2bb9577be7fcdcee788537ae796db3fc7eddac360713fcf31",
+  "frozen_source_sha256": "8c87434015f456113b66c39a26f14447728faf21f2cd68ad53d1751cc3059353",
+  "input_count": 424,
+  "changed_after_verification": [
+    {
+      "path": "impl/csharp-native/baseline.json",
+      "before_sha256": "d1cfa29bc8c9aaf33714f1c05193adde1c619ea37ed044d6bceff30c3b106b13",
+      "after_sha256": "20074a9f869fb466a583e5c22693885a000d2ef281d2923a04460826289f1385"
+    }
+  ],
+  "engine_harness_and_tooling_unchanged": true,
+  "scope": "The sole post-verification input change is baseline.json status in-progress to frozen; engine, harness, project configuration, package locks, generated data, tasks and supplemental corpus remain byte-identical to verified capture35.",
+  "final_spec_verification": {
+    "command": "mise run verify",
+    "exit_code": 0,
+    "log": "/tmp/jed-csharp-verify-freeze.log",
+    "log_sha256": "652cd2d2961b62a3e3fcc2bc12519cab6b71ccfb6f3cb7d719613192eed5a453"
+  }
+}

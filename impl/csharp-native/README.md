@@ -1,11 +1,24 @@
 # Native C# experiment
 
 An independent, handwritten C# engine experiment targeting **.NET 11** and Linux
-x86-64. It is opt-in and **incomplete**. Native SQL execution, paged storage,
-transactions, encrypted files and owner/client process coordination are implemented
-and undergoing shared-corpus verification. Full baseline parity is still pending. See the [charter](../../spec/design/csharp-native-experiment.md),
+x86-64, completed and frozen against semantic baseline
+`b1a6affca7725e0b07a4f734eddb1c569ef76bcf`. It remains opt-in; production delivery
+and supported-core promotion require separate decisions.
+
+All 763 distinct baseline SQL files pass across their applicable storage modes.
+Engine34 passes all 12 memory/plain/encrypted inventories under default/runtime-async
+JIT and NativeAOT, all four host executables, 496 mixed-core process cases and
+16,000 threaded snapshot checks. The final stable simulation sweep passes all
+85 traces: 76 exact peer comparisons and nine intrinsic fault checks. See the
+[charter](../../spec/design/csharp-native-experiment.md),
 [scope](../../spec/design/csharp-native-scope.md) and
-[verification record](VERIFICATION.md).
+[verification record](VERIFICATION.md) for identities, exclusions and freeze proof.
+
+[Measured diagnostics](BENCHMARKS.md) show substantial current time and allocation
+overhead against pinned Go. They do not validate the earlier near-Rust performance
+expectations. Files were on tmpfs: synchronous barriers were enabled, but commit
+timings are not physical-disk durability latency. These results do not select a
+production C# delivery strategy.
 
 ## Run explicitly
 
@@ -176,7 +189,7 @@ by its attached file handles.
 
 The public surface includes exact decimal, temporal and recursive values, parameter
 binding and reusable prepared syntax. The scope inventory and verification record
-track implemented coverage and the remaining host, simulation and measurement
-gates. JIT/NativeAOT evidence is tied to specific source digests; diagnostic timings
-are not yet accepted measurements. No public package compatibility promise is
+record the completed baseline gates and explicit platform/optimization limits.
+JIT/NativeAOT evidence and diagnostic measurements are tied to specific artifacts.
+No public package compatibility promise is
 made by these experimental APIs.

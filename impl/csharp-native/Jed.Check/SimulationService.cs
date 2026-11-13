@@ -98,7 +98,8 @@ internal sealed partial class SimulationRunner
     {
         var owners = new[] { roles.OwnerOf("sim.jed") }.Concat(attached.Values.Select(state => roles.OwnerOf(state.File)))
             .Where(pid => pid is not null).Select(pid => pid!.Value).Distinct().Order().ToArray();
-        if (owners.Length == 0 || owners.Length >= processes.Count) return false;
+        if (owners.Length == 0) owners = [selectedProcess];
+        if (owners.Length >= processes.Count) return false;
         fs.Restart();
         foreach (var pid in owners)
         {
@@ -115,6 +116,16 @@ internal sealed partial class SimulationRunner
             VerifyKeyAttempt(image);
             key = candidate; json.Start(step, "unlocked").Number("key", key); Emit();
         }
+        foreach (var attachment in attached.Values)
+        {
+            if (attachment.KeyAttempt is not { } change || !await fs.ExistsAsync(attachment.File)) continue;
+            var image = fs.Image(attachment.File);
+            var candidate = new[] { attachment.Key, -1, 0, 1, 2, 3 }.Distinct()
+                .FirstOrDefault(candidate => Unlocks(image, candidate), -2);
+            SimulationStorageChecks.Require(candidate != -2, "dead owner's attachment cannot be unlocked by any simulation key");
+            VerifyKeyAttempt(image, change); attachment.Key = candidate;
+            json.Start(step, "unlocked").Text("db", attachment.Name).Number("key", candidate); Emit();
+        }
         return true;
     }
     private void ObserveService(string digest)
@@ -123,10 +134,21 @@ internal sealed partial class SimulationRunner
         var observed = database.Version;
         SimulationStorageChecks.Require((observed >= version || ownerLost && observed >= floor) && observed <= attempted &&
             history.TryGetValue(observed, out var values) && values.Contains(digest), "service observed a generation outside its recorded history");
-        version = observed; ownerLost = false;
+        version = observed; committedDigest = digest; ownerLost = false;
     }
-    private async Task ObserveMaintenance(int step, string digest)
+    private async Task ObserveMaintenance(int step, string digest, ulong previousVersion, Dictionary<string, ulong> previousAttachments)
     {
+        if (fs.IsDead)
+        {
+            // A client ACK may precede the owner's failed maintenance commit.
+            // Admit only that next generation with unchanged contents; recovery
+            // must still validate the complete image and its recorded digest.
+            if (version > previousVersion) AddHistory(version + 1, digest);
+            foreach (var attachment in attached.Values)
+                if (attachment.Database.FileRole == "client" && previousAttachments.TryGetValue(attachment.Name, out var previous) && attachment.Version > previous)
+                    attachment.Remember(attachment.Version + 1, attachment.CommittedDigest);
+            return;
+        }
         if (roles.DatabaseOf("sim.jed") is { } owner)
         {
             var state = owner.CommittedStorageForTesting();

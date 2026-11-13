@@ -16,6 +16,7 @@ internal sealed partial class SimulationRunner
     private ulong version, floor, attempted;
     private SimulationFileSystem.Fault? armed;
     private string? pendingDigest;
+    private string committedDigest = "";
     private long growthBound;
     private bool previousReclaimed;
     private ulong openings;
@@ -87,11 +88,19 @@ internal sealed partial class SimulationRunner
         var storage = database.CommittedStorageForTesting();
         growthBound = storage.Meta.PageCount - storage.FreePages.Count; previousReclaimed = false;
     }
-    private void Emit() => transcript.Add(json.End());
+    private void Emit()
+    {
+        var line = json.End(); transcript.Add(line);
+        if (System.Environment.GetEnvironmentVariable("JED_SIM_DIAGNOSTICS") == "1")
+        {
+            var state = (trace.Service ? roles.DatabaseOf("sim.jed") ?? database : database).PublishedStateForTesting().Storage;
+            Console.Error.WriteLine($"model step={fs.Step} floor={floor} version={version} ownerVersion={state.Meta.TransactionId} batchFloor={state.Batch?.FloorTransactionId} durable={fs.ContentDurable("sim.jed")} event={line}");
+        }
+    }
     private void AddHistory(ulong generation, string digest)
     { if (!history.TryGetValue(generation, out var values)) history.Add(generation, values = []); values.Add(digest); attempted = Math.Max(attempted, generation); }
     private async Task<string> Digest()
-    { await using var session = database.CreateSession(SessionOptions(fs.Step) with { MaxQueryMemoryBytes = 0 }); return await SimulationRows.Digest(session, fs); }
+    { await using var session = database.CreateSession(SessionOptions(fs.Step) with { MaxQueryMemoryBytes = 0 }); return committedDigest = await SimulationRows.Digest(session, fs); }
     private async Task CloseClean()
     {
         var closingVersion = version;
@@ -131,6 +140,15 @@ internal sealed partial class SimulationRunner
         var active = armed; armed = null; fs.BeginStep((ulong)step.Index, active?.Kind == "disconnect" ? null : active); network.BeginStep(active?.Kind == "disconnect" ? active.Nth : 0); pendingDigest = null; keyAttempt = null;
         foreach (var state in attached.Values) { state.Pending = null; state.KeyAttempt = null; }
         var attachmentStarts = attached.ToDictionary(pair => pair.Key, pair => pair.Value.Version, StringComparer.Ordinal);
+        bool BatchOpen(Database selected, string path)
+        {
+            var owner = trace.Service ? roles.DatabaseOf(path) ?? selected : selected;
+            var batch = owner.PublishedStateForTesting().Storage.Batch;
+            return trace.Synchronous == "off" && batch is not null &&
+                (batch.DeadlineMicroseconds is null || clock < batch.DeadlineMicroseconds);
+        }
+        var mainBatchOpen = BatchOpen(database, "sim.jed");
+        var attachmentBatches = attached.ToDictionary(pair => pair.Key, pair => BatchOpen(pair.Value.Database, pair.Value.File), StringComparer.Ordinal);
         var start = version; var acknowledged = false;
         if (step.Operation is "corrupt" or "replay" or "restore")
         {
@@ -164,7 +182,7 @@ internal sealed partial class SimulationRunner
                     if (processes.Count == 0) { _ = json.End(); await Recover(step.Index, "none"); return; }
                     break;
                 case "exit": await EndProcess(ProcessNumber(args[0]), false); break;
-                case "attach": await AttachDomain(args[0]); break;
+                case "attach": json.Text("db", args[0]); await AttachDomain(args[0]); break;
                 case "backup": await Backup(args[0]); break;
                 case "open":
                 {
@@ -190,27 +208,46 @@ internal sealed partial class SimulationRunner
                         catch (SqlException error) when (error.SqlState != SqlStates.DataCorrupted) { }
                         try { await PrepareAttachedCommit(committing.Session); }
                         catch (SqlException error) when (error.SqlState != SqlStates.DataCorrupted) { }
-                        var beforeCommit = database.CommittedStorageForTesting();
-                        var attachedBefore = attached.ToDictionary(pair => pair.Key, pair => pair.Value.Database.CommittedStorageForTesting(), StringComparer.Ordinal);
-                        await committing.Session.CommitAsync();
+                        var beforePublication = database.PublishedStateForTesting();
+                        var beforeCommit = beforePublication.Storage;
+                        var beforeAttachmentVersions = AttachmentVersions(published: true);
+                        var attachedBefore = attached.ToDictionary(pair => pair.Key, pair => pair.Value.Database.PublishedStateForTesting().Storage, StringComparer.Ordinal);
+                        try { await committing.Session.CommitAsync(); }
+                        catch
+                        {
+                            SimulationStorageChecks.Require(database.PublishedStateForTesting().Version == beforePublication.Version,
+                                "failed commit published the main generation");
+                            foreach (var (name, before) in beforeAttachmentVersions)
+                                SimulationStorageChecks.Require(attached[name].Database.PublishedStateForTesting().Version == before,
+                                    "failed commit published attachment " + name);
+                            throw;
+                        }
                         acknowledged = true;
-                        var acknowledgedAttachments = AttachmentVersions();
-                        version = database.Version;
+                        var publication = database.PublishedStateForTesting();
+                        var acknowledgedAttachments = AttachmentVersions(published: true);
+                        version = publication.Version;
+                        SimulationStorageChecks.Require(version == start || start < ulong.MaxValue && version == start + 1,
+                            "commit published an invalid generation transition");
+                        SimulationStorageChecks.Require(version == start || pendingDigest is not null,
+                            "commit published changes after its in-flight digest failed");
                         if (System.Environment.GetEnvironmentVariable("JED_SIM_OUT") is { Length: > 0 } stateDirectory)
                         {
-                            var state = database.CommittedStorageForTesting();
-                            File.AppendAllText(Path.Combine(stateDirectory, "commits.jsonl"), FormattableString.Invariant($"{{\"step\":{step.Index},\"version\":{version},\"ReclamationLive\":{state.ReclamationLive},\"FreeGeneration\":{state.FreeGeneration},\"free\":{state.FreePages.Count},\"PageCount\":{state.Meta.PageCount},\"oldest\":{database.OldestLiveVersion}}}\n"));
+                            var state = publication.Storage;
+                            File.AppendAllText(Path.Combine(stateDirectory, "commits.jsonl"), FormattableString.Invariant($"{{\"step\":{step.Index},\"version\":{version},\"ReclamationLive\":{state.ReclamationLive},\"FreeGeneration\":{state.FreeGeneration},\"free\":{state.FreePages.Count},\"PageCount\":{state.Meta.PageCount},\"oldest\":{publication.Oldest}}}\n"));
                         }
-                        var digest = await Digest();
+                        var digest = version == start ? committedDigest :
+                            await ReadCommitDigest(fs, trace.Synchronous == "off", trace.Service, pendingDigest!, Digest);
                         SimulationStorageChecks.Require(pendingDigest is null || pendingDigest == digest, "acknowledged commit differs from pending session");
                         SimulationStorageChecks.Require(version != start || history[start].Contains(digest), "unchanged commit changed contents");
+                        committedDigest = digest;
                         AddHistory(version, digest);
                         if (version != start && fs.EntryDurable("sim.jed"))
                         {
-                            var committed = (trace.Service ? roles.DatabaseOf("sim.jed") ?? database : database).CommittedStorageForTesting();
+                            var committed = (trace.Service ? roles.DatabaseOf("sim.jed") ?? database : database).PublishedStateForTesting().Storage;
                             floor = Math.Max(floor, committed.Batch?.FloorTransactionId ?? version);
                         }
-                        if (!trace.Service || database.FileRole == "owner") await Oracle(() => SimulationStorageChecks.Live(database));
+                        if (!(trace.Synchronous == "off" && fs.Fired != "none") && (!trace.Service || database.FileRole == "owner"))
+                            await Oracle(() => SimulationStorageChecks.Live(database));
                         if (version != start && !trace.Service) CheckGrowth(beforeCommit, active is null && sessions.Count == 0);
                         json.Number("version", version);
                         await FinishAttachedCommit(attachedBefore, acknowledgedAttachments, active is null && sessions.Count == 0);
@@ -253,7 +290,7 @@ internal sealed partial class SimulationRunner
                     var targetName = step.Operation == "compact" ? args.FirstOrDefault() ?? "main" : args.Length > 1 ? args[1] : "main";
                     if (targetName != "main") { await AttachmentMaintenance(step, targetName); break; }
                     if (step.Operation == "rekey" && !trace.Encrypted) { json.Flag("skip", true); break; }
-                    pendingDigest = await Digest(); AddHistory(start + 1, pendingDigest);
+                    pendingDigest = committedDigest; AddHistory(start + 1, pendingDigest);
                     if (step.Operation == "rekey")
                     {
                         var targetKey = args[0] == "plain" ? -1 : int.Parse(args[0], CultureInfo.InvariantCulture);
@@ -272,9 +309,14 @@ internal sealed partial class SimulationRunner
             }
         }
         catch (SimulationFileSystem.CrashException)
-        { json.Text("error", SqlStates.IoError); RecordAttempt(start); }
+        {
+            if (acknowledged) throw new InvalidDataException("acknowledged commit failed a post-publication oracle");
+            json.Text("error", SqlStates.IoError); RecordAttempt(start);
+        }
         catch (SqlException error)
         {
+            if (acknowledged) throw new InvalidDataException("acknowledged commit failed a post-publication oracle", error);
+            if (System.Environment.GetEnvironmentVariable("JED_SIM_DIAGNOSTICS") == "1") Console.Error.WriteLine($"simulation step {step.Index}: {error}");
             if (error.SqlState == SqlStates.DataCorrupted) throw new InvalidDataException("unexpected corruption outside corruption mode", error);
             json.Text("error", error.SqlState); RecordAttempt(start);
         }
@@ -283,13 +325,17 @@ internal sealed partial class SimulationRunner
         {
             await network.SettleAsync();
             if (acknowledged && database.FileRole == "client" && pendingDigest is not null)
-                await ObserveMaintenance(step.Index, pendingDigest);
+                await ObserveMaintenance(step.Index, pendingDigest, start, attachmentStarts);
         }
         if (active?.Kind == "disconnect")
         { json.Start(step.Index, "disconnected").Text("fired", network.Disconnected ? "frame" : "end"); Emit(); return; }
-        if (fs.DurableBarrier("sim.jed")) floor = Math.Max(floor, start);
+        // Growth can accidentally fsync a batch's pending slot; the next batch
+        // commit may overwrite it. Only a step that began outside that batch
+        // proves its starting generation durable (canonical step oracle §8.2).
+        if (fs.DurableBarrier("sim.jed") && !mainBatchOpen) floor = Math.Max(floor, start);
         foreach (var state in attached.Values)
-            if (fs.DurableBarrier(state.File) && attachmentStarts.TryGetValue(state.Name, out var old)) state.Floor = Math.Max(state.Floor, old);
+            if (fs.DurableBarrier(state.File) && !attachmentBatches.GetValueOrDefault(state.Name) && attachmentStarts.TryGetValue(state.Name, out var old))
+                state.Floor = Math.Max(state.Floor, old);
         if (active is not null)
         {
             fs.EndFaultedStep(); var fired = fs.Fired;
@@ -301,7 +347,7 @@ internal sealed partial class SimulationRunner
         => CheckGrowth(database, "sim.jed", before, quiet, ref growthBound, ref previousReclaimed);
     private void CheckGrowth(Database selected, string path, StorageRecovered before, bool quiet, ref long bound, ref bool previouslyReclaimed)
     {
-        var after = selected.CommittedStorageForTesting();
+        var after = selected.PublishedStateForTesting().Storage;
         var firstBody = after.Encrypted is null ? 2u : 4u;
         var written = fs.WrittenPages(path).Where(page => page >= firstBody).ToArray();
         var threshold = Math.Max(16, 2 * bound);

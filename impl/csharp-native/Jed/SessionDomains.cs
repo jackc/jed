@@ -140,7 +140,7 @@ public sealed partial class Session
             if (domainTransaction is null)
             {
                 await StatementExecution.TemporaryCommit(scope, meter, token).ConfigureAwait(false);
-                await lease!.ReleaseWriterPinsForCommitAsync().ConfigureAwait(false);
+                await lease!.PrepareWriterPinsForCommitAsync().ConfigureAwait(false);
                 await Database.CommitDomainsAsync(scope, token).ConfigureAwait(false);
                 meter.Memory.HoldPending(0);
             }
@@ -184,7 +184,7 @@ public sealed partial class Session
                     {
                         BindDomainCollations(scope, meter.Unicode, meter.Temporal.Data, meter.Temporal.Environment); meter.Sequences.Bind(scope.BindCatalog(scope.Get("main")), scope.Get("main").Pending);
                         await StatementExecution.TemporaryCommit(scope, meter, token).ConfigureAwait(false);
-                        await lease!.ReleaseWriterPinsForCommitAsync().ConfigureAwait(false);
+                        await lease!.PrepareWriterPinsForCommitAsync().ConfigureAwait(false);
                         await Database.CommitDomainsAsync(scope, token).ConfigureAwait(false);
                     }
                 }
@@ -194,7 +194,11 @@ public sealed partial class Session
             {
                 if (rollback && sequenceBeforeTransaction is not null) sequenceState = sequenceBeforeTransaction;
                 sequenceBeforeTransaction = null; transactionFailed = false; domainReadOnly = false; domainSavepoints.Clear();
-                if (lease is not null) { await lease.ReleaseWriters().ConfigureAwait(false); await lease.DisposeAsync().ConfigureAwait(false); }
+                if (lease is not null)
+                {
+                    try { await lease.ReleaseWriters().ConfigureAwait(false); }
+                    finally { await lease.DisposeAsync().ConfigureAwait(false); }
+                }
             }
             return;
         }

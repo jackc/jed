@@ -3,6 +3,7 @@ namespace Jed;
 internal sealed class Meter(Session session, long limit, CancellationToken cancellation, QueryOptions? options = null)
 {
     internal CancellationToken Cancellation => cancellation;
+    internal CursorCancellation? CursorCancellation { get; init; }
     internal long Accrued { get; private set; }
     internal ExplainSyntax? Explain { get; set; }
     private readonly long memoryLimit = options?.MaxQueryMemoryBytes ?? session.MaxQueryMemoryBytes;

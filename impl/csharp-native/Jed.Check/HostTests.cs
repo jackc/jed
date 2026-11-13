@@ -4,6 +4,15 @@ internal static class HostTests
 {
     internal static async Task Run()
     {
+        await CursorCancellationTests.Run();
+        await using (var memoryLimits = new Session(new SessionOptions { MaxQueryMemoryBytes = -1 }))
+        {
+            Corpus.Equal(0L, memoryLimits.MaxQueryMemoryBytes, "negative initial query memory is normalized to unlimited");
+            memoryLimits.SetQueryMemoryLimit(123);
+            Corpus.Equal(123L, memoryLimits.MaxQueryMemoryBytes, "positive query memory getter");
+            memoryLimits.SetQueryMemoryLimit(long.MinValue);
+            Corpus.Equal(0L, memoryLimits.MaxQueryMemoryBytes, "nonpositive query memory setter is normalized to unlimited");
+        }
         await using var session = new Session();
         var pending = session.QueryAsync("SELECT 7 AS n");
         Corpus.Equal(true, pending.IsCompletedSuccessfully, "resident query completes inline");

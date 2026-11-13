@@ -1,0 +1,36 @@
+{
+  "semantic_revision": "b1a6affca7725e0b07a4f734eddb1c569ef76bcf",
+  "capture34_source_sha256": "7124c0e6a67e3fb3955ef6df359faaa94d8d375702b887b72cc439a851a51594",
+  "capture35_source_sha256": "456e9a13909cefb2bb9577be7fcdcee788537ae796db3fc7eddac360713fcf31",
+  "comparison": {
+    "source34_manifest": "source34.json",
+    "input_count": 424,
+    "aggregation": "SHA-256 of sorted UTF-8 repository-relative path, NUL, file bytes, NUL",
+    "changed_paths": [
+      {
+        "path": "impl/csharp-native/Jed.Check/SimulationBackup.cs",
+        "capture34_sha256": "20e2e5b4a423a3532c6aefaa2a530cf912e5e789ace1e3229ba726fa9cca71e8",
+        "capture35_sha256": "212a03f05b349f16c898cae4405fcceab6235f23b7427d2a955d1260dad6fe29"
+      },
+      {
+        "path": "impl/csharp-native/Jed.Check/SimulationService.cs",
+        "capture34_sha256": "cf354b60bdfaba93e1aacfad6d58d000558725beda650badbcae46a5bb10b0de",
+        "capture35_sha256": "557e8bdfb1d48317e1a18031ea4de6828c52b38ef957cd98699ee56cd5396eab"
+      }
+    ],
+    "engine_input_changes": 0,
+    "all_other_recorded_inputs_identical": true
+  },
+  "default_jit": {
+    "engine_dll_identical": true,
+    "engine_dll_sha256": "8d61294762ee65ca6023a5d830096fdf698e517ef6eea75fea3bd54dbcdd22a1",
+    "capture34_check_dll_sha256": "1b3da17d1b8f6174b8f3d373a748b8174a0a5d68c1cf57d86688f8cf0e522521",
+    "capture35_check_dll_sha256": "2227b4855b6cc3f235d90a4dfa8da065056c1b5ca25987c4f6928e034b4fddbf"
+  },
+  "capture35_full_host": {
+    "log": "/tmp/jed-csharp-host-capture35.log",
+    "sha256": "5d887201b817624d0a80a4a8e20d45f139fa24a6afe49e7e7409dfda6c818058",
+    "exit_code": 0
+  },
+  "scope": "The two simulator-only edits adopt a digest alongside its recovered version after the existing history/durability validation. No engine or SQL-corpus adapter inputs changed. The four capture34 engine artifacts retain their verified SQL/host results and are preserved for measurements."
+}

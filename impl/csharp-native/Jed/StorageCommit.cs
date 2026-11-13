@@ -100,7 +100,10 @@ internal sealed class StorageAllocation
             if ((page & 1023) == 0) token.ThrowIfCancellationRequested();
             if (!reachable.Contains(page) && !body.ContainsKey(page) && !Pending(page)) remaining.Add(page);
         }
-        lastReclamationLive = checked(high - (uint)remaining.Count - (Encrypted ? 4U : 2U));
+        // Earlier relaxed-batch writes stay protected until the barrier, but
+        // are not live for the next reclamation threshold. Count the new graph
+        // and this commit's writes before retaining those older dependencies.
+        lastReclamationLive = checked((uint)reachable.Count + (uint)body.Keys.Count(page => !reachable.Contains(page)));
         freeGeneration = checked(before.Meta.TransactionId + 1);
     }
 
@@ -151,7 +154,6 @@ internal sealed class StorageAllocation
             var inlineCapacity = Encrypted ? StorageCryptoMeta.InlineCapacity(size) : StorageFormat.InlineCapacity(size);
             var overflowEntries = Math.Max(0, (before.Batch?.Pending.Length ?? 0) + body.Count + freeIds.Count - inlineCapacity);
             var required = (overflowEntries + StorageFormat.OverflowCapacity(size) - 1) / StorageFormat.OverflowCapacity(size);
-            if (required > reserved) { reserved = required; continue; }
             var pages = body.Select(pair => new StorageWrite(pair.Key, pair.Value)).ToList();
             var persisted = persist.ToArray();
             byte[] nextTag = new byte[16];
@@ -168,6 +170,10 @@ internal sealed class StorageAllocation
                 if (codec is not null) { encoded = codec.SealBody(freeIds[i], encoded); nextTag = encoded.AsSpan(size - 16).ToArray(); }
                 pages.Add(new(freeIds[i], encoded));
             }
+            // A reservation retry follows ordinary free-list serialization.
+            // Encrypted attempts consume their seals even when this plan is
+            // discarded, preserving the specified nonce stream across retries.
+            if (required > reserved) { reserved = required; continue; }
             var entries = pages.Select(page => new StorageManifestEntry(page.Page, StorageFormat.Crc64(page.Bytes)))
                 .Concat(before.Batch?.Pending ?? []).OrderBy(entry => entry.Page).ToArray();
             if (entries.Select(entry => entry.Page).Distinct().Count() != entries.Length)

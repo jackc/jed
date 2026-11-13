@@ -20,7 +20,7 @@ internal sealed partial class SimulationRunner
             SimulationStorageChecks.Require(state.Database.Version == oldVersion, "credential change advanced attachment version");
             json.Number("key", next); return;
         }
-        var digest = await AttachmentDigest(state);
+        var digest = state.CommittedDigest;
         state.Pending = digest; state.Remember(oldVersion + 1, digest);
         if (step.Operation == "rekey")
         {

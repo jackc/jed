@@ -1,20 +1,45 @@
 # C# experiment progress
 
-## Current development state
+## Completed experimental baseline — 2026-11-13
 
-The complete `5adaba0d` SQL inventory passes every applicable memory, plain-file
-and encrypted file, including all 2,761 encrypted cost/EXPLAIN events against
-frozen Go. The detailed counts and source identity are in `VERIFICATION.md`.
-Reopened composite defaults, CTAS interval qualifiers, dependent views and fixture
-handling are repaired. Full host, mixed-process and threaded-stress evidence is
-recorded separately; passing SQL is not treated as proof of the embedding API.
+The experiment is complete and frozen against semantic baseline
+`b1a6affca7725e0b07a4f734eddb1c569ef76bcf`. It remains opt-in, with no automatic
+future feature updates. Production delivery and supported-core promotion are
+separate decisions.
 
-Immutable environments, host-function registration and native binding/result
-helpers now pass full JIT and NativeAOT host tests. Streaming host batching and
-the complete simulation matrix remain active work. The opt-in diagnostic benchmark
-host passes matched-answer smoke checks; quiet JIT/NativeAOT measurements remain.
-It records startup/cold-open timings, allocation/GC observations and enabled
-durability barriers. The experiment remains incomplete and unfrozen.
+Engine34 (`7124c0e6a67e3fb3955ef6df359faaa94d8d375702b887b72cc439a851a51594`)
+passes all 12 complete SQL inventories: memory, reopened plain files and reopened
+encrypted files under default/runtime-async JIT and NativeAOT. Every one of the
+763 distinct SQL files passes in at least one storage mode. Each compilation
+variant also passes the full host executable, including the exceptional writer-pin
+admission cleanup regression found in final review. Encrypted cost/EXPLAIN
+transcripts match across variants and the independent pinned Go peer.
+
+The complete 496-case mixed-core process matrix and 16,000 threaded snapshot
+checks pass, along with generation checks for 14 mechanical catalogs and mise
+task verification. The stable final simulation actor passes 85 traces: 19 saved
+regressions plus 22 generated profiles at three seeds, comprising 76 exact peer
+comparisons and nine intrinsic fault checks. The two validated digest-cache
+adoption fixes in harness35 leave the verified engine34 unchanged. Exact counts,
+exclusions, artifacts and metadata-only freeze proof are in
+[VERIFICATION.md](VERIFICATION.md).
+
+Native binding/results, immutable environments, host registration and buffered/
+streaming batch replay are implemented and verified. Batch optimization reach is
+in [README.md](README.md); callback chunk sizes are not cross-core contracts.
+Public async I/O cancellation, ownership, role revocation, resource accounting
+and spill have separate host invariants.
+
+The four compilation variants each completed three sequential diagnostic
+measurement runs with nine paired workloads. [BENCHMARKS.md](BENCHMARKS.md) and
+the raw JSON retain matched answers, artifact hashes, paired medians, startup,
+allocation and GC observations. Current C# time/allocation overhead is substantial
+against pinned Go and does not validate earlier near-Rust expectations. These
+file-backed measurements used tmpfs and do not establish physical-disk durability
+latency or a production-delivery choice.
+
+Everything below is historical. Earlier gaps and failed runs retain their original
+source identities; they are not current omissions or evidence for later code.
 
 ## 2026-11-12 — charter, tooling and first vertical slice
 

@@ -5,7 +5,7 @@ using Jed;
 internal sealed partial class SimulationFileSystem(ulong seed, int pageSize, int sectorSize = 64) : IFileHost, IScratchDeviceHost
 {
     internal sealed record Fault(string Kind, int Probability = 0, int Tear = 0, int Nth = 1, string Operation = "");
-    internal sealed class CrashException : Exception { }
+    internal sealed class CrashException : IOException { }
     private sealed record Pending(byte[] Bytes, bool Issued);
     private sealed class Inode(string origin)
     {
@@ -25,6 +25,7 @@ internal sealed partial class SimulationFileSystem(ulong seed, int pageSize, int
     private int syncs;
     private long generation;
     private bool dead;
+    internal bool IsDead => dead;
     private bool crashAtBarrier;
     private int PageSize => pageSize;
     private ulong scratchOrdinal;
@@ -108,6 +109,16 @@ internal sealed partial class SimulationFileSystem(ulong seed, int pageSize, int
         }
         else if (mode != FileMode.Open) throw new InvalidOperationException("unsupported simulation open mode");
         return ValueTask.FromResult<IBlockStore>(new Device(this, Find(path), path, generation, readOnly));
+    }
+
+    public ValueTask<IBlockStore> CreateTemporaryAsync(string path, CancellationToken token = default)
+    {
+        Check(token); path = Name(path);
+        // Canonical writeFile replaces a reserved staging inode with one
+        // namespace event, even when an earlier crash left that name behind.
+        var inode = new Inode(path); inodes.Add(inode); directory[path] = inode;
+        directoryChanges.Add(new("create", path, null, inode)); Operations.Add($"create {path}");
+        return ValueTask.FromResult<IBlockStore>(new Device(this, inode, path, generation, false));
     }
 
     public ValueTask DeleteAsync(string path, CancellationToken token = default)
@@ -210,6 +221,8 @@ internal sealed partial class SimulationFileSystem(ulong seed, int pageSize, int
             inode.Pending.Clear(); inode.Cache = inode.Durable.ToArray();
         }
         var keep = (int)(Decide(seed, 10, Step, 0, 0) % (uint)(directoryChanges.Count + 1));
+        if (System.Environment.GetEnvironmentVariable("JED_SIM_DIAGNOSTICS") == "1")
+            Console.Error.WriteLine($"directory recovery step {Step}: keep {keep}/{directoryChanges.Count}: {string.Join(", ", directoryChanges.Select(change => $"{change.Kind} {change.Path} {change.Destination}"))}");
         var recovered = new Dictionary<string, Inode>(durableDirectory, StringComparer.Ordinal);
         foreach (var change in directoryChanges.Take(keep)) Apply(recovered, change);
         directory = recovered; durableDirectory = new(recovered, StringComparer.Ordinal); directoryChanges.Clear();
@@ -266,8 +279,18 @@ internal sealed partial class SimulationFileSystem(ulong seed, int pageSize, int
     private static void Land(Inode inode, long offset, byte[] bytes) => Copy(ref inode.Durable, offset, bytes);
     private void CaptureArchive(Inode inode)
     {
-        for (uint page = 4; (ulong)(page + 1) * (uint)pageSize <= (ulong)inode.Durable.Length; page++)
-            Archive(inode, page, inode.Durable.AsSpan(checked((int)page * pageSize), pageSize).ToArray());
+        // The replay archive records full pages in writes made durable by
+        // this barrier. File-growth zeros and unwritten slack are not history.
+        foreach (var (offset, versions) in inode.Pending.OrderBy(pair => pair.Key))
+        {
+            if (offset % pageSize != 0) continue;
+            var bytes = versions[^1].Bytes;
+            for (var start = 0; start + pageSize <= bytes.Length; start += pageSize)
+            {
+                var page = checked((uint)((offset + start) / pageSize));
+                if (page >= 4) Archive(inode, page, bytes.AsSpan(start, pageSize).ToArray());
+            }
+        }
     }
     private static void Archive(Inode inode, uint page, byte[] bytes)
     {
@@ -277,7 +300,7 @@ internal sealed partial class SimulationFileSystem(ulong seed, int pageSize, int
     }
     private void CommitData(Inode inode)
     {
-        inode.Durable = inode.Cache.ToArray(); inode.Pending.Clear(); CaptureArchive(inode);
+        inode.Durable = inode.Cache.ToArray(); CaptureArchive(inode); inode.Pending.Clear();
         foreach (var (path, current) in directory)
             if (directoryChanges.Count == 0 && ReferenceEquals(current, inode) && durableDirectory.TryGetValue(path, out var durable) && ReferenceEquals(durable, inode)) durableBarriers.Add(path);
     }

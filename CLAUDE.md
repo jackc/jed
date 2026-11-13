@@ -195,19 +195,25 @@ cost ceiling, and cached UPDATE/DELETE access inventories. A point lookup is 1.1
 (per-statement paths 2.58×; single-row writes remain 6–7×), same gates re-run.
 
 The **native C# experiment** (`impl/csharp-native`) was authorized 2026-11-12 and
-is in progress against the supported-core semantic baseline
+completed/frozen 2026-11-13 against supported-core semantic baseline
 `b1a6affca7725e0b07a4f734eddb1c569ef76bcf`. It targets Linux x86-64 with pinned .NET 11
-and an async-first public API: inline resident kernels and awaited storage I/O,
-with no Task.Run wrapper. Scalar, relational, paged-storage, encrypted-file and
-owner/client interoperability slices have passing checks; full SQL, file-host,
-resource and interoperability acceptance remains incomplete. It uses only opt-in `csharp-native:*` tasks,
-and has no automatic future-maintenance or website obligation. Full baseline
-parity, full-engine NativeAOT verification and measured performance remain gates.
+and async-first public APIs: inline resident kernels and awaited storage I/O, no
+Task.Run wrapper. Engine34 passes all 12 memory/plain/encrypted SQL inventories
+under default/runtime-async JIT/NativeAOT and all four host executables; every one
+of the 763 baseline files passes in at least one storage mode. All 496 mixed-core
+process cases, 16,000 threaded snapshot checks and 85 stable fault traces pass
+(76 exact peer comparisons, nine intrinsic checks). Verification and the
+metadata-only freeze proof are in `impl/csharp-native/VERIFICATION.md`.
+Four variants ×three diagnostic measurement repeats are recorded in
+`impl/csharp-native/BENCHMARKS.md`. Current time/allocation overhead against Go is
+substantial and does not validate earlier near-Rust expectations; tmpfs commit
+timings are not physical-disk durability latency. Production delivery and promotion
+remain separate decisions. The experiment uses only opt-in `csharp-native:*` tasks
+and has no automatic future-maintenance or website obligation.
 The maintainer approved exact-pinned BouncyCastle.Cryptography 2.7.0 for SHA-224
-and Argon2id (including their internal helpers) and subagent implementation/review
-on 2026-11-12. Production delivery and promotion remain separate decisions. See
-[csharp-native-experiment.md](spec/design/csharp-native-experiment.md) and its
-scope, host and crypto inventories.
+and Argon2id (including internal helpers) and subagent implementation/review on
+2026-11-12. See [csharp-native-experiment.md](spec/design/csharp-native-experiment.md)
+and its scope, host and crypto inventories.
 
 The maintainer approved Ruby's OpenSSL binding for vetted cryptographic digest
 functions and stdlib Zlib for byte-identical CRC32 checksums in this experiment.

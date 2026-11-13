@@ -1,6 +1,135 @@
 # C# experiment — verification history
 
-## Latest SQL inventory — development capture, not acceptance
+## Frozen experiment verification — 2026-11-13
+
+The independent C# core is complete and frozen against semantic baseline
+`b1a6affca7725e0b07a4f734eddb1c569ef76bcf` on Linux x86-64 with .NET SDK
+11.0.100. It remains an opt-in experiment, outside normal CI and future feature
+maintenance. Other platforms and production packaging are not verified here.
+
+Engine capture34 is
+`7124c0e6a67e3fb3955ef6df359faaa94d8d375702b887b72cc439a851a51594`.
+All four Release configurations—default/runtime-async JIT and default/runtime-async
+NativeAOT—pass their complete host executables and the following SQL inventories.
+NativeAOT uses the SDK's default instruction set.
+
+| Storage mode | Selected files | Passing files | Records | Failures | Canonical mode exclusions |
+|---|---:|---:|---:|---:|---:|
+| Memory | 763 | 761 | 21,954 | 0 | 2 |
+| Reopened plain file | 763 | 677 | 19,800 | 0 | 86 |
+| Reopened encrypted file | 763 | 676 | 19,765 | 0 | 87 |
+
+Across the three storage modes, **all 763 distinct baseline files pass**; no file
+is excluded everywhere. Across four configurations, that is **12 complete
+inventories and 246,076 passing records**. All four encrypted cost/EXPLAIN
+transcripts are byte-identical, and the independently executed frozen Go peer
+matches all 676 complete encrypted files and 2,761 events. Transcript SHA-256:
+`c692430ab8bcfd11335a4af171ff35dc4cdb26e125a0b8c068fdb4116ed65f1f`.
+
+The remaining correctness gates pass:
+
+- **496/496 process cases:** all 31 canonical scenarios across the 16
+  C#/Go/Rust/Node pairings, including plaintext/encrypted image and backup interchange.
+- **16,000 threaded snapshot checks:** C# memory/plain/encrypted hosts and frozen
+  Go finish with the identical checksum `f3e75496a3111181`.
+- **85/85 complete fault traces:** all 19 saved regressions and all 22 generated
+  profiles at seeds 1, 2 and 3. There are 76 exact Go/C# transcript matches and
+  nine passing per-core intrinsic-oracle cases under `simulation-testing.md` §6.3.
+- **All four full host executables:** shared bytes/crypto vectors, storage and
+  recovery, maintenance, environments/extensions, native bindings/results,
+  resource/spill invariants, batch replay, suspended-I/O cancellation and retained
+  cursor lifetimes. Each also passes the 45-record scalar supplement.
+- **14 generated C# data catalogs** and the repository's **`mise run verify`** checks.
+
+The final simulator is capture35,
+`456e9a13909cefb2bb9577be7fcdcee788537ae796db3fc7eddac360713fcf31`.
+It fixes two harness-only cached-digest updates after an already-validated service
+recovery or backup adoption. Of 424 recorded source inputs, only those two harness
+files changed from capture34; the engine DLL is byte-identical, SHA-256
+`8d61294762ee65ca6023a5d830096fdf698e517ef6eea75fea3bd54dbcdd22a1`.
+Capture35 also passes the full JIT host executable. The SQL and process evidence
+therefore uses the same final engine, while the fault sweep uses the corrected
+simulator. No SQL assertion, fault-history invariant or mode policy was weakened.
+
+The final lifecycle regression was demonstrated failing before its fix. It checks
+partial admission of retained writer pins, a subsequent remote disconnect,
+failure of a buffered cursor with `08006`, and release of all pins and registry
+references through both rollback and session disposal. Capture34 includes the fix.
+
+Machine-readable evidence preserves source, executable, transcript and log hashes:
+[`engine34.json`](verification/engine34.json),
+[`source34.json`](verification/source34.json),
+[`source35.json`](verification/source35.json), and
+[`simulation35.json`](verification/simulation35.json).
+
+All **12 sequential performance runs** (four compilation variants, three repeats
+each) pass their nine paired answer/checksum comparisons against frozen Go. The
+quiet measurements use the same four immutable capture34 actors described above.
+Timing, startup, allocation and GC observations, methodology and limits are in
+[`BENCHMARKS.md`](BENCHMARKS.md), with raw JSON in `measurements/`. These are
+diagnostic workloads, not the canonical benchmark suite or a general speed claim.
+
+The frozen checkout's source SHA-256 is
+`8c87434015f456113b66c39a26f14447728faf21f2cd68ad53d1751cc3059353`.
+The only input changed after capture35 verification is `baseline.json`'s lifecycle
+status, from `in-progress` to `frozen`. The exact 424-input comparison in
+[`freeze.json`](verification/freeze.json) proves the engine, harness, project
+configuration, dependencies, generated data, task tooling and supplemental corpus
+are unchanged. Documentation and measurement records are outside this source digest.
+
+Earlier sections below are historical evidence, including failures corrected
+before these final checks.
+
+## Capture32 engine verification — 2026-11-13
+
+Semantic baseline: `b1a6affca7725e0b07a4f734eddb1c569ef76bcf`.
+Engine capture32 source SHA-256:
+`693be66ec1bd2b1480e444a3474413ce39ae3a4b35cde393443e7f7a30d9a54e`.
+Toolchain: .NET SDK 11.0.100, Release, Linux x86-64. Both NativeAOT builds use
+the SDK's default instruction set. Experimental runtime-native async is tested
+as an additional compiler variant; the public API is async in every variant.
+
+All four variants—default/runtime-async JIT and default/runtime-async
+NativeAOT—pass the full host executable and these complete SQL inventories:
+
+| Storage mode | Selected files | Passing files | Records | Failures | Declared exclusions |
+|---|---:|---:|---:|---:|---:|
+| Memory | 763 | 761 | 21,954 | 0 | 2 |
+| Reopened plain file | 763 | 677 | 19,800 | 0 | 86 |
+| Reopened encrypted file | 763 | 676 | 19,765 | 0 | 87 |
+
+That is **12 complete inventories and 246,076 passing records**. Exclusions are
+the canonical storage-mode rules, not waived implementation failures. All four
+encrypted cost/EXPLAIN transcripts are byte-identical (2,761 events, SHA-256
+`c692430ab8bcfd11335a4af171ff35dc4cdb26e125a0b8c068fdb4116ed65f1f`), and
+an independently executed frozen Go peer matches all 676 complete files.
+
+The complete process matrix passes **496/496 cases**: 31 canonical scenarios
+across all 16 C#/Go/Rust/Node pairings, including plaintext/encrypted files and
+backup interchange. The threaded stress profile passes on C# memory/plain/
+encrypted hosts and frozen Go: **16,000 snapshot checks**, identical final
+checksum `f3e75496a3111181`.
+
+The host executable covers the byte fixtures, crypto vectors and narrow approved
+backend, storage/recovery/maintenance, resource and spill invariants, environments
+and extensions, native parameters/results, streaming batch replay, suspended-I/O
+cancellation, and retained cursors across commit, rollback and connection loss.
+The supplemental scalar corpus passes all 45 records in each host run.
+
+Raw logs: `/tmp/jed-csharp-host-capture32.log`,
+`/tmp/jed-csharp-runtime-host32.log`, `/tmp/jed-csharp-aot32.log`,
+`/tmp/jed-csharp-aot-runtime32.log`; SQL logs use
+`/tmp/jed-csharp-final32-{memory,disk,encrypted}.log` and
+`/tmp/jed-csharp-full-{runtime,aot,aot-runtime}-{memory,disk,encrypted}32.log`.
+Peer/process/stress logs use `/tmp/jed-csharp-final32-{encrypted-peer,process,stress}.log`.
+
+Machine-readable counts and artifact/log hashes are in
+[`verification/engine32.json`](verification/engine32.json). Final review subsequently
+identified an exceptional writer-pin admission cleanup path; capture32 is preserved
+as evidence, not final acceptance. Simulation verification and diagnostic measurements
+are recorded separately when complete. Earlier sections preserve development evidence.
+
+## Historical capture20 SQL inventory
 
 Integrated capture `f718b8c3aa739f79cb82e2cf9ffe5641688ef91d7b4fb1a5106ba1c243f41074`
 passes the full JIT host executable and all three SQL modes with the counts below,
@@ -601,3 +730,44 @@ actor DLL SHA-256:
 `1d0228f39dff9c705717b7878d588387a7fa61907da9a3f82072d6edc4799604`.
 These stable runs supersede capture18 sweeps as evidence; capture18's mid-run
 policy change means that earlier aggregate remains diagnostic only.
+
+### Final bounded simulation acceptance, capture35 (2026-11-13)
+
+**85/85 complete simulations pass**: all 19 saved baseline regressions plus all
+22 canonical generated profiles at seeds 1, 2 and 3. The four independent sweeps
+use the same immutable default JIT actor and unchanged comparison policy, with
+no trace-length overrides. Results are **76/76 exact independent Go transcript
+comparisons** and **9/9 intrinsic per-core fault checks**. The latter are the
+canonical corruption, resource and spill profiles; they run both cores' complete
+recovery and structural oracles, while excluding cross-core transcript equality
+under `simulation-testing.md` §6.3. This is bounded seed coverage, not exhaustive
+fuzzing or a security certification.
+
+Harness source:
+`456e9a13909cefb2bb9577be7fcdcee788537ae796db3fc7eddac360713fcf31`.
+Engine DLL SHA-256:
+`8d61294762ee65ca6023a5d830096fdf698e517ef6eea75fea3bd54dbcdd22a1`;
+actor DLL SHA-256:
+`2227b4855b6cc3f235d90a4dfa8da065056c1b5ca25987c4f6928e034b4fddbf`.
+The engine is byte-identical to capture34. Capture35 changes only the simulator's
+service-open and owner-lost backup adoption: after validating the recovered
+version and digest against recorded history, both cached fields now advance
+together. This matches the pinned simulator's `observeDB` and backup contract.
+It preserves the unchanged-commit, acknowledged-content and recovery assertions;
+it does not relax an engine invariant. Capture34's 84/85 diagnostic result exposed
+that cache omission; capture35 reruns the entire matrix after correcting it.
+
+The committed [simulation35.json](verification/simulation35.json) retains all four
+original sweep manifests and results, every trace/input/artifact/tool-policy hash,
+all per-trace and sweep log hashes, and the two focused exact-pass logs. The
+[source35.json](verification/source35.json) record establishes the two-file
+harness-only difference and unchanged engine provenance. The sweeps verify their
+tooling hashes before and after every trace and at completion.
+
+Commands share `mise run csharp-native:simulation-sweep --no-build --assembly
+/tmp/jed-csharp-storage-capture35/Jed.Check.dll`; the four selections are
+`--regress`, `--profile all --seeds 1`, `--profile all --seeds 2`, and
+`--profile all --seeds 3`. All four exit zero. Logs are
+`/tmp/jed-csharp-simulation35-{saved,seed1,seed2,seed3}.log`.
+The manifest/result directories under `/tmp/jed-csharp-simulation-sweep-20261113-63-`
+are respectively `5ctrra`, `87zvv2`, `k78bkc`, and `3vb6ld`.

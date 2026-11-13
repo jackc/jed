@@ -1,0 +1,1953 @@
+{
+  "method": "median of three within-run medians; ratio is median of three paired C#/Go median ratios; allocation is median allocated_bytes/iterations; GC is per-workload total collections over the measured iterations",
+  "source_sha256": "7124c0e6a67e3fb3955ef6df359faaa94d8d375702b887b72cc439a851a51594",
+  "variants": {
+    "jit": {
+      "actor_sha256": "1b3da17d1b8f6174b8f3d373a748b8174a0a5d68c1cf57d86688f8cf0e522521",
+      "startup_ns": {
+        "csharp": 85696626,
+        "go": 2499001
+      },
+      "workloads": {
+        "scalar": {
+          "warmup": 100,
+          "iterations": 1000,
+          "csharp_ns": 26800.0,
+          "go_ns": 566.0,
+          "paired_ratio": 47.60213143872114,
+          "csharp_run_medians_ns": [
+            11400.0,
+            26800.0,
+            27100.0
+          ],
+          "go_run_medians_ns": [
+            567.0,
+            563.0,
+            566.0
+          ],
+          "paired_ratios": [
+            20.105820105820104,
+            47.60213143872114,
+            47.879858657243815
+          ],
+          "csharp_allocated_bytes_per_op": 25736.672,
+          "go_allocated_bytes_per_op": 1352.576,
+          "csharp_gc_collections": [
+            [
+              2,
+              0,
+              0
+            ],
+            [
+              2,
+              0,
+              0
+            ],
+            [
+              2,
+              0,
+              0
+            ]
+          ],
+          "go_gc_collections": [
+            [
+              1
+            ],
+            [
+              1
+            ],
+            [
+              1
+            ]
+          ]
+        },
+        "point": {
+          "warmup": 100,
+          "iterations": 1000,
+          "csharp_ns": 162200.0,
+          "go_ns": 1319.5,
+          "paired_ratio": 121.40962485790072,
+          "csharp_run_medians_ns": [
+            166600.0,
+            162200.0,
+            160200.0
+          ],
+          "go_run_medians_ns": [
+            1317.0,
+            1365.0,
+            1319.5
+          ],
+          "paired_ratios": [
+            126.49962034927866,
+            118.82783882783883,
+            121.40962485790072
+          ],
+          "csharp_allocated_bytes_per_op": 58920.0,
+          "go_allocated_bytes_per_op": 2008.16,
+          "csharp_gc_collections": [
+            [
+              4,
+              1,
+              0
+            ],
+            [
+              4,
+              1,
+              0
+            ],
+            [
+              4,
+              1,
+              0
+            ]
+          ],
+          "go_gc_collections": [
+            [
+              1
+            ],
+            [
+              1
+            ],
+            [
+              1
+            ]
+          ]
+        },
+        "range": {
+          "warmup": 20,
+          "iterations": 100,
+          "csharp_ns": 440050.0,
+          "go_ns": 20623.5,
+          "paired_ratio": 21.69176545978853,
+          "csharp_run_medians_ns": [
+            585650.0,
+            437600.0,
+            440050.0
+          ],
+          "go_run_medians_ns": [
+            20623.5,
+            21913.5,
+            20286.5
+          ],
+          "paired_ratios": [
+            28.397216767280046,
+            19.969425240148766,
+            21.69176545978853
+          ],
+          "csharp_allocated_bytes_per_op": 490464.0,
+          "go_allocated_bytes_per_op": 9296.0,
+          "csharp_gc_collections": [
+            [
+              2,
+              0,
+              0
+            ],
+            [
+              2,
+              0,
+              0
+            ],
+            [
+              2,
+              0,
+              0
+            ]
+          ],
+          "go_gc_collections": [
+            [
+              0
+            ],
+            [
+              1
+            ],
+            [
+              0
+            ]
+          ]
+        },
+        "aggregate": {
+          "warmup": 10,
+          "iterations": 50,
+          "csharp_ns": 4666600.0,
+          "go_ns": 242273.0,
+          "paired_ratio": 19.30069814379777,
+          "csharp_run_medians_ns": [
+            4610450.0,
+            4802250.0,
+            4666600.0
+          ],
+          "go_run_medians_ns": [
+            243626.0,
+            242273.0,
+            241784.0
+          ],
+          "paired_ratios": [
+            18.924293794586784,
+            19.821647480321786,
+            19.30069814379777
+          ],
+          "csharp_allocated_bytes_per_op": 18642407.2,
+          "go_allocated_bytes_per_op": 19320.0,
+          "csharp_gc_collections": [
+            [
+              49,
+              0,
+              0
+            ],
+            [
+              49,
+              0,
+              0
+            ],
+            [
+              49,
+              0,
+              0
+            ]
+          ],
+          "go_gc_collections": [
+            [
+              0
+            ],
+            [
+              1
+            ],
+            [
+              0
+            ]
+          ]
+        },
+        "join": {
+          "warmup": 5,
+          "iterations": 25,
+          "csharp_ns": 178273500,
+          "go_ns": 5544774,
+          "paired_ratio": 32.20210598303917,
+          "csharp_run_medians_ns": [
+            176417200,
+            178273500,
+            178553400
+          ],
+          "go_run_medians_ns": [
+            5455201,
+            5712367,
+            5544774
+          ],
+          "paired_ratios": [
+            32.339266692464676,
+            31.208341480860735,
+            32.20210598303917
+          ],
+          "csharp_allocated_bytes_per_op": 81737603.84,
+          "go_allocated_bytes_per_op": 5569819.84,
+          "csharp_gc_collections": [
+            [
+              109,
+              17,
+              5
+            ],
+            [
+              109,
+              20,
+              5
+            ],
+            [
+              109,
+              17,
+              5
+            ]
+          ],
+          "go_gc_collections": [
+            [
+              63
+            ],
+            [
+              64
+            ],
+            [
+              63
+            ]
+          ]
+        },
+        "sort": {
+          "warmup": 10,
+          "iterations": 50,
+          "csharp_ns": 43985750.0,
+          "go_ns": 1010816.0,
+          "paired_ratio": 43.78597686405087,
+          "csharp_run_medians_ns": [
+            43985750.0,
+            43487050.0,
+            44571200.0
+          ],
+          "go_run_medians_ns": [
+            1019050.0,
+            993173.0,
+            1010816.0
+          ],
+          "paired_ratios": [
+            43.16348559933271,
+            43.78597686405087,
+            44.09427630745853
+          ],
+          "csharp_allocated_bytes_per_op": 7004408.0,
+          "go_allocated_bytes_per_op": 296152.32,
+          "csharp_gc_collections": [
+            [
+              19,
+              0,
+              0
+            ],
+            [
+              19,
+              0,
+              0
+            ],
+            [
+              19,
+              0,
+              0
+            ]
+          ],
+          "go_gc_collections": [
+            [
+              5
+            ],
+            [
+              5
+            ],
+            [
+              5
+            ]
+          ]
+        },
+        "rollback": {
+          "warmup": 20,
+          "iterations": 100,
+          "csharp_ns": 281850.0,
+          "go_ns": 29379.0,
+          "paired_ratio": 10.009411012660475,
+          "csharp_run_medians_ns": [
+            311050.0,
+            279550.0,
+            281850.0
+          ],
+          "go_run_medians_ns": [
+            29736.0,
+            29379.0,
+            28158.5
+          ],
+          "paired_ratios": [
+            10.460384718859295,
+            9.515300044249294,
+            10.009411012660475
+          ],
+          "csharp_allocated_bytes_per_op": 743040.0,
+          "go_allocated_bytes_per_op": 127072.08,
+          "csharp_gc_collections": [
+            [
+              4,
+              1,
+              0
+            ],
+            [
+              4,
+              1,
+              0
+            ],
+            [
+              5,
+              2,
+              1
+            ]
+          ],
+          "go_gc_collections": [
+            [
+              5
+            ],
+            [
+              5
+            ],
+            [
+              5
+            ]
+          ]
+        },
+        "durable": {
+          "warmup": 10,
+          "iterations": 50,
+          "csharp_ns": 845700.0,
+          "go_ns": 170981.0,
+          "paired_ratio": 4.946163608822033,
+          "csharp_run_medians_ns": [
+            845700.0,
+            976000.0,
+            791350.0
+          ],
+          "go_run_medians_ns": [
+            170981.0,
+            169665.0,
+            171723.5
+          ],
+          "paired_ratios": [
+            4.946163608822033,
+            5.752512303657207,
+            4.608280171321922
+          ],
+          "csharp_allocated_bytes_per_op": 1457553.76,
+          "go_allocated_bytes_per_op": 298479.36,
+          "csharp_gc_collections": [
+            [
+              4,
+              1,
+              0
+            ],
+            [
+              4,
+              0,
+              0
+            ],
+            [
+              4,
+              1,
+              0
+            ]
+          ],
+          "go_gc_collections": [
+            [
+              6
+            ],
+            [
+              5
+            ],
+            [
+              6
+            ]
+          ]
+        },
+        "cold_open": {
+          "warmup": 5,
+          "iterations": 25,
+          "csharp_ns": 734900,
+          "go_ns": 256510,
+          "paired_ratio": 2.8312361213915618,
+          "csharp_run_medians_ns": [
+            719100,
+            740500,
+            734900
+          ],
+          "go_run_medians_ns": [
+            253988,
+            256510,
+            297719
+          ],
+          "paired_ratios": [
+            2.8312361213915618,
+            2.8868270242875522,
+            2.4684350007893348
+          ],
+          "csharp_allocated_bytes_per_op": 248966.4,
+          "go_allocated_bytes_per_op": 499178.56,
+          "csharp_gc_collections": [
+            [
+              0,
+              0,
+              0
+            ],
+            [
+              0,
+              0,
+              0
+            ],
+            [
+              0,
+              0,
+              0
+            ]
+          ],
+          "go_gc_collections": [
+            [
+              5
+            ],
+            [
+              4
+            ],
+            [
+              5
+            ]
+          ]
+        }
+      },
+      "diagnostic_ratio_geomean": 19.848858616694738
+    },
+    "jit-runtime-async": {
+      "actor_sha256": "5ceeadd471c1c92f2e16778783e33f14da12221ec0b3f0c3685012af27b39e45",
+      "startup_ns": {
+        "csharp": 81027884,
+        "go": 2442460
+      },
+      "workloads": {
+        "scalar": {
+          "warmup": 100,
+          "iterations": 1000,
+          "csharp_ns": 11200.0,
+          "go_ns": 556.0,
+          "paired_ratio": 25.233644859813083,
+          "csharp_run_medians_ns": [
+            15400.0,
+            10800.0,
+            11200.0
+          ],
+          "go_run_medians_ns": [
+            556.0,
+            428.0,
+            704.0
+          ],
+          "paired_ratios": [
+            27.697841726618705,
+            25.233644859813083,
+            15.909090909090908
+          ],
+          "csharp_allocated_bytes_per_op": 25760.672,
+          "go_allocated_bytes_per_op": 1352.032,
+          "csharp_gc_collections": [
+            [
+              2,
+              0,
+              0
+            ],
+            [
+              2,
+              0,
+              0
+            ],
+            [
+              2,
+              0,
+              0
+            ]
+          ],
+          "go_gc_collections": [
+            [
+              0
+            ],
+            [
+              1
+            ],
+            [
+              1
+            ]
+          ]
+        },
+        "point": {
+          "warmup": 100,
+          "iterations": 1000,
+          "csharp_ns": 163300.0,
+          "go_ns": 1355.5,
+          "paired_ratio": 120.47215049797123,
+          "csharp_run_medians_ns": [
+            163300.0,
+            158200.0,
+            165400.0
+          ],
+          "go_run_medians_ns": [
+            1355.5,
+            1546.0,
+            1329.0
+          ],
+          "paired_ratios": [
+            120.47215049797123,
+            102.32858990944372,
+            124.45447705041384
+          ],
+          "csharp_allocated_bytes_per_op": 58776.0,
+          "go_allocated_bytes_per_op": 2013.576,
+          "csharp_gc_collections": [
+            [
+              4,
+              1,
+              0
+            ],
+            [
+              4,
+              1,
+              0
+            ],
+            [
+              4,
+              1,
+              0
+            ]
+          ],
+          "go_gc_collections": [
+            [
+              1
+            ],
+            [
+              1
+            ],
+            [
+              1
+            ]
+          ]
+        },
+        "range": {
+          "warmup": 20,
+          "iterations": 100,
+          "csharp_ns": 438850.0,
+          "go_ns": 20110.5,
+          "paired_ratio": 21.762343137988672,
+          "csharp_run_medians_ns": [
+            436150.0,
+            447900.0,
+            438850.0
+          ],
+          "go_run_medians_ns": [
+            20041.5,
+            20711.5,
+            20110.5
+          ],
+          "paired_ratios": [
+            21.762343137988672,
+            21.625666900031383,
+            21.82193381566843
+          ],
+          "csharp_allocated_bytes_per_op": 490288.0,
+          "go_allocated_bytes_per_op": 9296.0,
+          "csharp_gc_collections": [
+            [
+              2,
+              0,
+              0
+            ],
+            [
+              2,
+              0,
+              0
+            ],
+            [
+              2,
+              0,
+              0
+            ]
+          ],
+          "go_gc_collections": [
+            [
+              1
+            ],
+            [
+              0
+            ],
+            [
+              0
+            ]
+          ]
+        },
+        "aggregate": {
+          "warmup": 10,
+          "iterations": 50,
+          "csharp_ns": 4802450.0,
+          "go_ns": 245141.5,
+          "paired_ratio": 19.496253687679754,
+          "csharp_run_medians_ns": [
+            4802450.0,
+            5082600.0,
+            4738350.0
+          ],
+          "go_run_medians_ns": [
+            249210.5,
+            245141.5,
+            243039.0
+          ],
+          "paired_ratios": [
+            19.270656733965865,
+            20.73333156564678,
+            19.496253687679754
+          ],
+          "csharp_allocated_bytes_per_op": 18649443.04,
+          "go_allocated_bytes_per_op": 19320.32,
+          "csharp_gc_collections": [
+            [
+              49,
+              0,
+              0
+            ],
+            [
+              49,
+              0,
+              0
+            ],
+            [
+              49,
+              0,
+              0
+            ]
+          ],
+          "go_gc_collections": [
+            [
+              1
+            ],
+            [
+              0
+            ],
+            [
+              0
+            ]
+          ]
+        },
+        "join": {
+          "warmup": 5,
+          "iterations": 25,
+          "csharp_ns": 174484500,
+          "go_ns": 5629477,
+          "paired_ratio": 30.979929396638443,
+          "csharp_run_medians_ns": [
+            174400800,
+            177490100,
+            174484500
+          ],
+          "go_run_medians_ns": [
+            5629477,
+            5368672,
+            5770048
+          ],
+          "paired_ratios": [
+            30.979929396638443,
+            33.06033596390318,
+            30.239696446199407
+          ],
+          "csharp_allocated_bytes_per_op": 81737686.4,
+          "go_allocated_bytes_per_op": 5569844.16,
+          "csharp_gc_collections": [
+            [
+              109,
+              22,
+              7
+            ],
+            [
+              110,
+              18,
+              6
+            ],
+            [
+              109,
+              19,
+              6
+            ]
+          ],
+          "go_gc_collections": [
+            [
+              64
+            ],
+            [
+              62
+            ],
+            [
+              64
+            ]
+          ]
+        },
+        "sort": {
+          "warmup": 10,
+          "iterations": 50,
+          "csharp_ns": 43602000.0,
+          "go_ns": 1004920.0,
+          "paired_ratio": 43.362790604417086,
+          "csharp_run_medians_ns": [
+            43253950.0,
+            45020550.0,
+            43602000.0
+          ],
+          "go_run_medians_ns": [
+            997490.0,
+            1004920.0,
+            1011835.5
+          ],
+          "paired_ratios": [
+            43.362790604417086,
+            44.80013334394778,
+            43.091984813737014
+          ],
+          "csharp_allocated_bytes_per_op": 7004360.0,
+          "go_allocated_bytes_per_op": 296159.04,
+          "csharp_gc_collections": [
+            [
+              19,
+              0,
+              0
+            ],
+            [
+              19,
+              0,
+              0
+            ],
+            [
+              19,
+              0,
+              0
+            ]
+          ],
+          "go_gc_collections": [
+            [
+              5
+            ],
+            [
+              5
+            ],
+            [
+              5
+            ]
+          ]
+        },
+        "rollback": {
+          "warmup": 20,
+          "iterations": 100,
+          "csharp_ns": 286050.0,
+          "go_ns": 28702.0,
+          "paired_ratio": 9.966204445683228,
+          "csharp_run_medians_ns": [
+            293400.0,
+            286050.0,
+            274150.0
+          ],
+          "go_run_medians_ns": [
+            28492.5,
+            28702.0,
+            29695.5
+          ],
+          "paired_ratios": [
+            10.297446696499078,
+            9.966204445683228,
+            9.232038524355541
+          ],
+          "csharp_allocated_bytes_per_op": 742888.0,
+          "go_allocated_bytes_per_op": 127074.16,
+          "csharp_gc_collections": [
+            [
+              4,
+              1,
+              0
+            ],
+            [
+              4,
+              1,
+              0
+            ],
+            [
+              4,
+              0,
+              0
+            ]
+          ],
+          "go_gc_collections": [
+            [
+              5
+            ],
+            [
+              5
+            ],
+            [
+              4
+            ]
+          ]
+        },
+        "durable": {
+          "warmup": 10,
+          "iterations": 50,
+          "csharp_ns": 795100.0,
+          "go_ns": 175024.0,
+          "paired_ratio": 4.514238047353506,
+          "csharp_run_medians_ns": [
+            790100.0,
+            795100.0,
+            810600.0
+          ],
+          "go_run_medians_ns": [
+            175024.0,
+            187382.0,
+            173318.5
+          ],
+          "paired_ratios": [
+            4.514238047353506,
+            4.243203722876263,
+            4.67693869956179
+          ],
+          "csharp_allocated_bytes_per_op": 1455548.96,
+          "go_allocated_bytes_per_op": 298477.12,
+          "csharp_gc_collections": [
+            [
+              4,
+              0,
+              0
+            ],
+            [
+              4,
+              0,
+              0
+            ],
+            [
+              4,
+              1,
+              0
+            ]
+          ],
+          "go_gc_collections": [
+            [
+              6
+            ],
+            [
+              7
+            ],
+            [
+              6
+            ]
+          ]
+        },
+        "cold_open": {
+          "warmup": 5,
+          "iterations": 25,
+          "csharp_ns": 690800,
+          "go_ns": 256223,
+          "paired_ratio": 2.7175546301463958,
+          "csharp_run_medians_ns": [
+            690800,
+            696300,
+            682200
+          ],
+          "go_run_medians_ns": [
+            253443,
+            256223,
+            283407
+          ],
+          "paired_ratios": [
+            2.725662180450831,
+            2.7175546301463958,
+            2.40713884978141
+          ],
+          "csharp_allocated_bytes_per_op": 245831.04,
+          "go_allocated_bytes_per_op": 499449.6,
+          "csharp_gc_collections": [
+            [
+              0,
+              0,
+              0
+            ],
+            [
+              0,
+              0,
+              0
+            ],
+            [
+              0,
+              0,
+              0
+            ]
+          ],
+          "go_gc_collections": [
+            [
+              5
+            ],
+            [
+              4
+            ],
+            [
+              5
+            ]
+          ]
+        }
+      },
+      "diagnostic_ratio_geomean": 18.132010465720175
+    },
+    "aot": {
+      "actor_sha256": "eb5ec6dbf049bc11327f1d577c835d06a322c84583b14c6a71032d14be9da5b5",
+      "startup_ns": {
+        "csharp": 5276664,
+        "go": 3082921
+      },
+      "workloads": {
+        "scalar": {
+          "warmup": 100,
+          "iterations": 1000,
+          "csharp_ns": 6000.0,
+          "go_ns": 601.0,
+          "paired_ratio": 9.333333333333334,
+          "csharp_run_medians_ns": [
+            10600.0,
+            5600.0,
+            6000.0
+          ],
+          "go_run_medians_ns": [
+            601.0,
+            600.0,
+            658.0
+          ],
+          "paired_ratios": [
+            17.63727121464226,
+            9.333333333333334,
+            9.118541033434651
+          ],
+          "csharp_allocated_bytes_per_op": 27528.768,
+          "go_allocated_bytes_per_op": 1357.72,
+          "csharp_gc_collections": [
+            [
+              2,
+              0,
+              0
+            ],
+            [
+              2,
+              0,
+              0
+            ],
+            [
+              2,
+              0,
+              0
+            ]
+          ],
+          "go_gc_collections": [
+            [
+              1
+            ],
+            [
+              1
+            ],
+            [
+              1
+            ]
+          ]
+        },
+        "point": {
+          "warmup": 100,
+          "iterations": 1000,
+          "csharp_ns": 57300.0,
+          "go_ns": 1326.0,
+          "paired_ratio": 43.21266968325792,
+          "csharp_run_medians_ns": [
+            57200.0,
+            57300.0,
+            57300.0
+          ],
+          "go_run_medians_ns": [
+            1382.5,
+            884.5,
+            1326.0
+          ],
+          "paired_ratios": [
+            41.374321880650996,
+            64.7823629169022,
+            43.21266968325792
+          ],
+          "csharp_allocated_bytes_per_op": 62080.0,
+          "go_allocated_bytes_per_op": 2008.176,
+          "csharp_gc_collections": [
+            [
+              3,
+              1,
+              0
+            ],
+            [
+              3,
+              1,
+              0
+            ],
+            [
+              3,
+              1,
+              0
+            ]
+          ],
+          "go_gc_collections": [
+            [
+              1
+            ],
+            [
+              1
+            ],
+            [
+              1
+            ]
+          ]
+        },
+        "range": {
+          "warmup": 20,
+          "iterations": 100,
+          "csharp_ns": 229900.0,
+          "go_ns": 21954.5,
+          "paired_ratio": 10.471657291215925,
+          "csharp_run_medians_ns": [
+            307100.0,
+            222150.0,
+            229900.0
+          ],
+          "go_run_medians_ns": [
+            21913.5,
+            22027.5,
+            21954.5
+          ],
+          "paired_ratios": [
+            14.014192164647364,
+            10.085120871637725,
+            10.471657291215925
+          ],
+          "csharp_allocated_bytes_per_op": 513304.0,
+          "go_allocated_bytes_per_op": 9296.0,
+          "csharp_gc_collections": [
+            [
+              3,
+              0,
+              0
+            ],
+            [
+              3,
+              1,
+              0
+            ],
+            [
+              3,
+              1,
+              0
+            ]
+          ],
+          "go_gc_collections": [
+            [
+              1
+            ],
+            [
+              0
+            ],
+            [
+              0
+            ]
+          ]
+        },
+        "aggregate": {
+          "warmup": 10,
+          "iterations": 50,
+          "csharp_ns": 6246700.0,
+          "go_ns": 243258.0,
+          "paired_ratio": 26.643522515189634,
+          "csharp_run_medians_ns": [
+            6481250.0,
+            6246700.0,
+            6134750.0
+          ],
+          "go_run_medians_ns": [
+            243258.0,
+            147582.5,
+            245660.5
+          ],
+          "paired_ratios": [
+            26.643522515189634,
+            42.32683414361459,
+            24.9724721719609
+          ],
+          "csharp_allocated_bytes_per_op": 20130248.0,
+          "go_allocated_bytes_per_op": 19320.0,
+          "csharp_gc_collections": [
+            [
+              54,
+              0,
+              0
+            ],
+            [
+              54,
+              0,
+              0
+            ],
+            [
+              54,
+              0,
+              0
+            ]
+          ],
+          "go_gc_collections": [
+            [
+              0
+            ],
+            [
+              0
+            ],
+            [
+              1
+            ]
+          ]
+        },
+        "join": {
+          "warmup": 5,
+          "iterations": 25,
+          "csharp_ns": 201911000,
+          "go_ns": 5563431,
+          "paired_ratio": 36.2252717792312,
+          "csharp_run_medians_ns": [
+            201911000,
+            201536800,
+            210246800
+          ],
+          "go_run_medians_ns": [
+            5754198,
+            5563431,
+            5431193
+          ],
+          "paired_ratios": [
+            35.08933825356722,
+            36.2252717792312,
+            38.710979337320545
+          ],
+          "csharp_allocated_bytes_per_op": 85650631.68,
+          "go_allocated_bytes_per_op": 5569782.72,
+          "csharp_gc_collections": [
+            [
+              115,
+              14,
+              7
+            ],
+            [
+              114,
+              13,
+              2
+            ],
+            [
+              114,
+              13,
+              6
+            ]
+          ],
+          "go_gc_collections": [
+            [
+              63
+            ],
+            [
+              62
+            ],
+            [
+              64
+            ]
+          ]
+        },
+        "sort": {
+          "warmup": 10,
+          "iterations": 50,
+          "csharp_ns": 76181900.0,
+          "go_ns": 1013708.0,
+          "paired_ratio": 75.17247426062406,
+          "csharp_run_medians_ns": [
+            76181900.0,
+            76069050.0,
+            76306000.0
+          ],
+          "go_run_medians_ns": [
+            1013708.0,
+            1010756.5,
+            1015079.0
+          ],
+          "paired_ratios": [
+            75.15172021923473,
+            75.25952096276403,
+            75.17247426062406
+          ],
+          "csharp_allocated_bytes_per_op": 7695168.0,
+          "go_allocated_bytes_per_op": 296156.8,
+          "csharp_gc_collections": [
+            [
+              20,
+              0,
+              0
+            ],
+            [
+              20,
+              0,
+              0
+            ],
+            [
+              20,
+              0,
+              0
+            ]
+          ],
+          "go_gc_collections": [
+            [
+              5
+            ],
+            [
+              5
+            ],
+            [
+              5
+            ]
+          ]
+        },
+        "rollback": {
+          "warmup": 20,
+          "iterations": 100,
+          "csharp_ns": 298950.0,
+          "go_ns": 28804.5,
+          "paired_ratio": 10.378586679164714,
+          "csharp_run_medians_ns": [
+            298950.0,
+            296850.0,
+            308850.0
+          ],
+          "go_run_medians_ns": [
+            28804.5,
+            34116.5,
+            27824.0
+          ],
+          "paired_ratios": [
+            10.378586679164714,
+            8.701068397989243,
+            11.100129384703854
+          ],
+          "csharp_allocated_bytes_per_op": 747632.0,
+          "go_allocated_bytes_per_op": 127072.72,
+          "csharp_gc_collections": [
+            [
+              4,
+              0,
+              0
+            ],
+            [
+              4,
+              1,
+              0
+            ],
+            [
+              4,
+              0,
+              0
+            ]
+          ],
+          "go_gc_collections": [
+            [
+              5
+            ],
+            [
+              5
+            ],
+            [
+              5
+            ]
+          ]
+        },
+        "durable": {
+          "warmup": 10,
+          "iterations": 50,
+          "csharp_ns": 808300.0,
+          "go_ns": 175016.0,
+          "paired_ratio": 4.592720233759682,
+          "csharp_run_medians_ns": [
+            789950.0,
+            810250.0,
+            808300.0
+          ],
+          "go_run_medians_ns": [
+            175016.0,
+            176420.5,
+            170123.0
+          ],
+          "paired_ratios": [
+            4.513587329158477,
+            4.592720233759682,
+            4.751268200067011
+          ],
+          "csharp_allocated_bytes_per_op": 1462156.32,
+          "go_allocated_bytes_per_op": 298527.52,
+          "csharp_gc_collections": [
+            [
+              4,
+              1,
+              0
+            ],
+            [
+              4,
+              1,
+              0
+            ],
+            [
+              4,
+              0,
+              0
+            ]
+          ],
+          "go_gc_collections": [
+            [
+              7
+            ],
+            [
+              7
+            ],
+            [
+              6
+            ]
+          ]
+        },
+        "cold_open": {
+          "warmup": 5,
+          "iterations": 25,
+          "csharp_ns": 653300,
+          "go_ns": 292062,
+          "paired_ratio": 2.261921421525628,
+          "csharp_run_medians_ns": [
+            662700,
+            650700,
+            653300
+          ],
+          "go_run_medians_ns": [
+            292981,
+            275420,
+            292062
+          ],
+          "paired_ratios": [
+            2.261921421525628,
+            2.362573524072326,
+            2.236853818709726
+          ],
+          "csharp_allocated_bytes_per_op": 252213.12,
+          "go_allocated_bytes_per_op": 500796.8,
+          "csharp_gc_collections": [
+            [
+              0,
+              0,
+              0
+            ],
+            [
+              0,
+              0,
+              0
+            ],
+            [
+              0,
+              0,
+              0
+            ]
+          ],
+          "go_gc_collections": [
+            [
+              5
+            ],
+            [
+              4
+            ],
+            [
+              5
+            ]
+          ]
+        }
+      },
+      "diagnostic_ratio_geomean": 14.749558384509893
+    },
+    "aot-runtime-async": {
+      "actor_sha256": "e55c82101326c3d17c2613a5000a3a1958df4c49314a84cf968ddc5032d1b339",
+      "startup_ns": {
+        "csharp": 5099826,
+        "go": 3083930
+      },
+      "workloads": {
+        "scalar": {
+          "warmup": 100,
+          "iterations": 1000,
+          "csharp_ns": 9400.0,
+          "go_ns": 579.0,
+          "paired_ratio": 16.407599309153714,
+          "csharp_run_medians_ns": [
+            5400.0,
+            9500.0,
+            9400.0
+          ],
+          "go_run_medians_ns": [
+            640.0,
+            579.0,
+            430.0
+          ],
+          "paired_ratios": [
+            8.4375,
+            16.407599309153714,
+            21.86046511627907
+          ],
+          "csharp_allocated_bytes_per_op": 27384.768,
+          "go_allocated_bytes_per_op": 1352.24,
+          "csharp_gc_collections": [
+            [
+              2,
+              0,
+              0
+            ],
+            [
+              2,
+              0,
+              0
+            ],
+            [
+              2,
+              0,
+              0
+            ]
+          ],
+          "go_gc_collections": [
+            [
+              1
+            ],
+            [
+              1
+            ],
+            [
+              1
+            ]
+          ]
+        },
+        "point": {
+          "warmup": 100,
+          "iterations": 1000,
+          "csharp_ns": 57000.0,
+          "go_ns": 1371.5,
+          "paired_ratio": 41.56033539919796,
+          "csharp_run_medians_ns": [
+            57000.0,
+            57000.0,
+            85800.0
+          ],
+          "go_run_medians_ns": [
+            1383.0,
+            1371.5,
+            1355.0
+          ],
+          "paired_ratios": [
+            41.21475054229935,
+            41.56033539919796,
+            63.321033210332104
+          ],
+          "csharp_allocated_bytes_per_op": 61936.0,
+          "go_allocated_bytes_per_op": 2008.576,
+          "csharp_gc_collections": [
+            [
+              3,
+              1,
+              0
+            ],
+            [
+              3,
+              1,
+              0
+            ],
+            [
+              3,
+              1,
+              0
+            ]
+          ],
+          "go_gc_collections": [
+            [
+              1
+            ],
+            [
+              1
+            ],
+            [
+              1
+            ]
+          ]
+        },
+        "range": {
+          "warmup": 20,
+          "iterations": 100,
+          "csharp_ns": 207400.0,
+          "go_ns": 20176.0,
+          "paired_ratio": 10.485868850801355,
+          "csharp_run_medians_ns": [
+            207400.0,
+            206850.0,
+            213850.0
+          ],
+          "go_run_medians_ns": [
+            19779.0,
+            20313.0,
+            20176.0
+          ],
+          "paired_ratios": [
+            10.485868850801355,
+            10.183133953625758,
+            10.599226804123711
+          ],
+          "csharp_allocated_bytes_per_op": 513160.0,
+          "go_allocated_bytes_per_op": 9296.0,
+          "csharp_gc_collections": [
+            [
+              3,
+              1,
+              0
+            ],
+            [
+              3,
+              1,
+              0
+            ],
+            [
+              3,
+              1,
+              0
+            ]
+          ],
+          "go_gc_collections": [
+            [
+              0
+            ],
+            [
+              0
+            ],
+            [
+              0
+            ]
+          ]
+        },
+        "aggregate": {
+          "warmup": 10,
+          "iterations": 50,
+          "csharp_ns": 6753050.0,
+          "go_ns": 246242.5,
+          "paired_ratio": 27.33809151547763,
+          "csharp_run_medians_ns": [
+            6753050.0,
+            6731800.0,
+            7052100.0
+          ],
+          "go_run_medians_ns": [
+            249070.5,
+            246242.5,
+            245186.0
+          ],
+          "paired_ratios": [
+            27.113006156891323,
+            27.33809151547763,
+            28.762245805225422
+          ],
+          "csharp_allocated_bytes_per_op": 20130104.0,
+          "go_allocated_bytes_per_op": 19320.0,
+          "csharp_gc_collections": [
+            [
+              54,
+              0,
+              0
+            ],
+            [
+              54,
+              0,
+              0
+            ],
+            [
+              54,
+              0,
+              0
+            ]
+          ],
+          "go_gc_collections": [
+            [
+              0
+            ],
+            [
+              0
+            ],
+            [
+              0
+            ]
+          ]
+        },
+        "join": {
+          "warmup": 5,
+          "iterations": 25,
+          "csharp_ns": 200096300,
+          "go_ns": 5672071,
+          "paired_ratio": 35.29143503543294,
+          "csharp_run_medians_ns": [
+            200096300,
+            208734200,
+            200042900
+          ],
+          "go_run_medians_ns": [
+            5692358,
+            5672071,
+            5668313
+          ],
+          "paired_ratios": [
+            35.15174203730686,
+            36.80035034822378,
+            35.29143503543294
+          ],
+          "csharp_allocated_bytes_per_op": 85650422.4,
+          "go_allocated_bytes_per_op": 5569814.72,
+          "csharp_gc_collections": [
+            [
+              114,
+              12,
+              5
+            ],
+            [
+              114,
+              16,
+              5
+            ],
+            [
+              114,
+              16,
+              5
+            ]
+          ],
+          "go_gc_collections": [
+            [
+              63
+            ],
+            [
+              63
+            ],
+            [
+              62
+            ]
+          ]
+        },
+        "sort": {
+          "warmup": 10,
+          "iterations": 50,
+          "csharp_ns": 74655550.0,
+          "go_ns": 1033333.0,
+          "paired_ratio": 72.11774907024163,
+          "csharp_run_medians_ns": [
+            74521650.0,
+            74655550.0,
+            74992700.0
+          ],
+          "go_run_medians_ns": [
+            1033333.0,
+            994831.0,
+            1051861.0
+          ],
+          "paired_ratios": [
+            72.11774907024163,
+            75.04344959093555,
+            71.29525669266187
+          ],
+          "csharp_allocated_bytes_per_op": 7695024.0,
+          "go_allocated_bytes_per_op": 296152.32,
+          "csharp_gc_collections": [
+            [
+              20,
+              0,
+              0
+            ],
+            [
+              20,
+              0,
+              0
+            ],
+            [
+              20,
+              0,
+              0
+            ]
+          ],
+          "go_gc_collections": [
+            [
+              5
+            ],
+            [
+              5
+            ],
+            [
+              5
+            ]
+          ]
+        },
+        "rollback": {
+          "warmup": 20,
+          "iterations": 100,
+          "csharp_ns": 304800.0,
+          "go_ns": 28954.0,
+          "paired_ratio": 10.25158078837616,
+          "csharp_run_medians_ns": [
+            305800.0,
+            291950.0,
+            304800.0
+          ],
+          "go_run_medians_ns": [
+            28930.0,
+            28954.0,
+            29732.0
+          ],
+          "paired_ratios": [
+            10.570342205323193,
+            10.08323547696346,
+            10.25158078837616
+          ],
+          "csharp_allocated_bytes_per_op": 747416.0,
+          "go_allocated_bytes_per_op": 127070.48,
+          "csharp_gc_collections": [
+            [
+              4,
+              1,
+              0
+            ],
+            [
+              4,
+              1,
+              0
+            ],
+            [
+              4,
+              0,
+              0
+            ]
+          ],
+          "go_gc_collections": [
+            [
+              5
+            ],
+            [
+              5
+            ],
+            [
+              5
+            ]
+          ]
+        },
+        "durable": {
+          "warmup": 10,
+          "iterations": 50,
+          "csharp_ns": 777400.0,
+          "go_ns": 175187.0,
+          "paired_ratio": 4.4375438816807184,
+          "csharp_run_medians_ns": [
+            765650.0,
+            803800.0,
+            777400.0
+          ],
+          "go_run_medians_ns": [
+            175872.5,
+            169896.5,
+            175187.0
+          ],
+          "paired_ratios": [
+            4.353437859813217,
+            4.731115708681462,
+            4.4375438816807184
+          ],
+          "csharp_allocated_bytes_per_op": 1459983.36,
+          "go_allocated_bytes_per_op": 298464.0,
+          "csharp_gc_collections": [
+            [
+              4,
+              0,
+              0
+            ],
+            [
+              5,
+              2,
+              1
+            ],
+            [
+              4,
+              0,
+              0
+            ]
+          ],
+          "go_gc_collections": [
+            [
+              6
+            ],
+            [
+              6
+            ],
+            [
+              6
+            ]
+          ]
+        },
+        "cold_open": {
+          "warmup": 5,
+          "iterations": 25,
+          "csharp_ns": 643700,
+          "go_ns": 278576,
+          "paired_ratio": 2.345858939750732,
+          "csharp_run_medians_ns": [
+            643700,
+            653500,
+            638500
+          ],
+          "go_run_medians_ns": [
+            255996,
+            278576,
+            294779
+          ],
+          "paired_ratios": [
+            2.5144924139439677,
+            2.345858939750732,
+            2.166029466142432
+          ],
+          "csharp_allocated_bytes_per_op": 248631.68,
+          "go_allocated_bytes_per_op": 499544.96,
+          "csharp_gc_collections": [
+            [
+              0,
+              0,
+              0
+            ],
+            [
+              0,
+              0,
+              0
+            ],
+            [
+              0,
+              0,
+              0
+            ]
+          ],
+          "go_gc_collections": [
+            [
+              4
+            ],
+            [
+              4
+            ],
+            [
+              5
+            ]
+          ]
+        }
+      },
+      "diagnostic_ratio_geomean": 15.54789174947897
+    }
+  },
+  "evidence_sha256": {
+    "jit-1.json": "f39b2971a10b6d7345ab6e220b23fafa491b5a2a50880f9ee9cf62edf2ce486e",
+    "jit-2.json": "f35365cee3a16819eae33c84a1d0638fe16747bb90989e0898d51f09df1ef32e",
+    "jit-3.json": "8c2274f9bb9147ccef6d14eba11daa8325f81a2a2741eb341f33e7c024076e25",
+    "jit-runtime-async-1.json": "a516bca4527f3a24c4335056db3de231757301be7f6fc9b434f0df0757c2cd86",
+    "jit-runtime-async-2.json": "4fdec29576a4b8a8e80a58a1ab6e5e5c49ff37a8f4d603eacf0ff3291ffe5533",
+    "jit-runtime-async-3.json": "253b5b23c2798a663d714de4d8de6cc29b79fc3750dc435ebe05ef3b0739a49d",
+    "aot-1.json": "513e84f8180488fd21958b144fb635a9153637665749d6d32be669330ca2cf4c",
+    "aot-2.json": "4333a189abbf5748d60728e1728eb32b2d5cb9be97ed274aa403de8fb669a0e2",
+    "aot-3.json": "681bff2bda1db61045533019a18d7bc5fe9050dff1162f27ebe144aceba8a8a8",
+    "aot-runtime-async-1.json": "328805ab7852b73557c852602e0eaa371d9716f22686e854b74eae97359d2255",
+    "aot-runtime-async-2.json": "d89757b65af8a38bc8104cb6c06850924e8258f04a3098cda9f9f2b6a2524d1c",
+    "aot-runtime-async-3.json": "21892afdb8128826cad6b3034ef4a9e7239be81e29541951b1e521c85962e9f1"
+  },
+  "environment": {
+    "date": "2026-11-13",
+    "os": "Linux 7.0.0-38-generic x86_64",
+    "cpu": "Intel Core Ultra 9 285K",
+    "logical_cpus": 24,
+    "dotnet_sdk": "11.0.100",
+    "dotnet_runtime": "11.0.0",
+    "go_runtime": "go1.27.1",
+    "temporary_database_filesystem": "tmpfs",
+    "filesystem_observation": "findmnt -T /tmp -no SOURCE,FSTYPE,OPTIONS on the unsandboxed measurement host",
+    "durability": "synchronous=on with native barriers enabled; tmpfs does not measure physical-disk persistence latency",
+    "execution_order": [
+      "jit \u00d73",
+      "jit-runtime-async \u00d73",
+      "aot \u00d73",
+      "aot-runtime-async \u00d73"
+    ],
+    "affinity_pinned": false,
+    "forced_gc": false,
+    "randomized_order": false
+  }
+}

@@ -1,14 +1,14 @@
 # C# experiment scope and acceptance
 
 Baseline: `b1a6affca7725e0b07a4f734eddb1c569ef76bcf`. Full supported
-Rust/Go/TypeScript behavior at that revision is the target. This table is a work
-inventory, not a capability declaration. The baseline manifest and spec tree
+Rust/Go/TypeScript behavior at that revision is the target. This table records the completed
+experimental scope; it is not a supported-core or production promise. The baseline manifest and spec tree
 remain the detailed inventory; `csharp-native:inventory` reports their sizes.
 
 | Area | Canonical contracts | Status |
 |---|---|---|
 | SQL syntax and static resolution | grammar/, types/, functions/, errors/; design/grammar.md, types.md | Handwritten parser/resolver, prepared syntax and inferred parameters implemented; complete baseline inventory runs in all three storage modes |
-| Scalar expressions and built-ins | functions/catalog.toml; design/functions.md and individual type/function designs | Full scalar corpus, regex, pinned collation, text/encoding and approved cryptographic functions exercised; final-source acceptance pending |
+| Scalar expressions and built-ins | functions/catalog.toml; design/functions.md and individual type/function designs | Full scalar corpus, regex, pinned collation, text/encoding and approved cryptographic functions exercised; verified in all four compilation variants |
 | Exact numerics and temporal types | design/decimal.md, float.md, date.md, timestamp.md, interval.md, timezones.md | Handwritten exact decimal and temporal/timezone implementation with complete relevant corpus and byte-vector checks |
 | Recursive types and extensions | design/extensibility.md, array.md, ranges.md | Arrays, composites, ranges and recursive codecs implemented; immutable environment/host scalar registration and native API ergonomics pass host checks; held/streaming batch replay tests pass, with optimization reach described below |
 | JSON and JSON path | design/json*.md | Native values, codecs, path evaluation, SQL/JSON and aggregates implemented and exercised by complete baseline files |
@@ -18,17 +18,28 @@ remain the detailed inventory; `csharp-native:inventory` reports their sizes.
 | Page storage, encoding, durable commits | fileformat/, encoding/; design/storage.md, validated-cow.md | Native v52 trees/catalog/COW and compressed values; golden/host checks and all 496 mixed-core process cases pass at recorded captures |
 | Encryption and maintenance | design/encryption.md, fileformat/encrypted.md | Credentials, recovery, rekey, compact/export/backup and sealed scratch implemented; vectors, host checks and all-peer byte interchange exercised |
 | Resource accounting, spilling | cost/; design/cost.md, memory.md, spill.md | Cost/scalar/Q1-Q4 accounts, live-page limits and bounded spill implemented; complete resource corpus and tiny-budget plaintext/encrypted operator tests pass at recorded captures |
-| Host tooling and failure simulation | csharp-native-host-matrix.md | Complete SQL adapters, host/fixture runner, all-peer process matrix and stress implemented; saved/generated simulation matrix, runtime-async/final artifact verification and measurements remain open |
+| Host tooling and failure simulation | csharp-native-host-matrix.md | Complete SQL adapters and host/fixture runner pass all four compilation variants at capture34; mixed-core process matrix and stress pass; all 85 final fault traces and four-variant diagnostic measurements complete |
 
 Each slice must run complete selected shared files, including all their assertions.
 Selected-file results must list the files; unselected baseline files remain
 unverified. The eventual full gate attempts every applicable baseline file and
 reports failures rather than filtering by an optimistic capability list.
 
-These statuses describe implementation progress, not a frozen acceptance claim.
-See `impl/csharp-native/VERIFICATION.md` for exact source digests and remaining
-failures. A passing SQL corpus cannot establish host extension or embedding API
-completeness, which have separate host tests and audits.
+The experiment is complete and frozen on Linux x86-64. Engine34 passes all
+applicable baseline SQL files in all three storage modes and four compilation
+variants, plus each full host executable. All 763 distinct SQL files pass in at
+least one storage mode. The stable final saved/generated fault sweep passes all
+85 traces (76 exact comparisons, nine intrinsic checks). Diagnostic measurements
+are complete, with substantial current overhead and explicit tmpfs limits.
+See [verification](../../impl/csharp-native/VERIFICATION.md) and
+[measurements](../../impl/csharp-native/BENCHMARKS.md) for exact identities,
+canonical exclusions and evidence. Passing SQL alone does not establish the
+embedding API; that surface has separate host tests and audits.
+
+Backup follows the baseline's explicit API boundary in `page-service.md` §9:
+both backup forms are implemented and verified through an internal tooling entry
+point, while a public backup API remains unnamed in the shared contract. Public
+NuGet, ADO.NET/EF integration and additional platform hosts are separate work.
 
 Host batching follows the speculative-kernel/scalar-replay contract in
 `extensibility.md` §4.2.1. Current multi-row sites are eager row buffers, resident
@@ -44,8 +55,9 @@ The JIT full-host capture
 passes batch/scalar equivalence checks for resident/file sort, grouping spools,
 scan/filter projection, strict NULL, prefix failures, deferred values/source
 errors, early close, cancellation, LIMIT and cost/query-memory ceilings.
-Final runtime-async and NativeAOT evidence is recorded separately in
-`impl/csharp-native/VERIFICATION.md`.
+Capture34 repeats these host checks under default/runtime-async JIT and NativeAOT;
+the verification record retains each artifact identity. Later engine changes are
+not implicitly covered by those runs.
 
 The foundation supplement is `spec/conformance/suites/query/scalar_foundations.test`,
 added after the pinned revision and checked against supported cores and PostgreSQL.

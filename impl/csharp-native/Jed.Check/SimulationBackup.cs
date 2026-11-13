@@ -24,7 +24,7 @@ internal sealed partial class SimulationRunner
         var snapshot = form == "compacted" ? copy.Version - 1 : copy.Version;
         SimulationStorageChecks.Require(snapshot >= floor && (snapshot >= version || ownerLost) && snapshot <= attempted && history.TryGetValue(snapshot, out var values) && values.Contains(digest),
             "backup contains an unrecorded snapshot or violates the durability floor");
-        if (ownerLost) { version = snapshot; ownerLost = false; }
+        if (ownerLost) { version = snapshot; committedDigest = digest; ownerLost = false; }
         var result = await SimulationStorageChecks.Image(bytes, copy.Version, key < 0 ? null : keys[key].Value);
         backups.Add(new(backupOrdinal, destination, copy.Version, digest, key));
         json.Number("version", copy.Version).Text("digest", digest).Number("live", result.Live).Number("pages", result.Pages)

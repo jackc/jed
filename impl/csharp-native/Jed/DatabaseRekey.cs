@@ -85,10 +85,9 @@ public sealed partial class Database
         var temporary = state.Path + ".jedtmp"; var original = committer.Current; var role = state.Role;
         var host = state.Options.FileHost;
         var mode = await host.GetPermissionsAsync(state.Path, token).ConfigureAwait(false); var previousCodec = ownedCodec;
-        await host.DeleteAsync(temporary).ConfigureAwait(false);
         try
         {
-            await using (var output = await host.OpenAsync(temporary, FileMode.CreateNew, token: token).ConfigureAwait(false))
+            await using (var output = await host.CreateTemporaryAsync(temporary, token).ConfigureAwait(false))
             {
                 await host.SetPermissionsAsync(temporary, mode, token).ConfigureAwait(false);
                 await RebuildImageAsync(snapshot, output, replacement, block, token).ConfigureAwait(false);

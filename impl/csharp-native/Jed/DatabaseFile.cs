@@ -75,6 +75,7 @@ public sealed partial class Database
         internal bool NeedsElection;
         internal bool Closing;
         internal bool RepairKeys;
+        internal SemaphoreSlim? RemoteWriterGate;
         internal bool DirectoryPending;
         internal ulong HandoffRequester;
     }
@@ -191,10 +192,12 @@ public sealed partial class Database
         var host = options.FileHost;
         if (await host.ExistsAsync(path, token).ConfigureAwait(false)) throw new SqlException(SqlStates.DuplicateFile, "database already exists: " + path);
         var temporary = path + ".jedtmp";
+        // This reserved sibling may survive a failed create. Unlink it before
+        // exclusive creation, so a retry cannot follow an old file or symlink.
         var ownsTemporary = false;
         try
         {
-            await using (var store = await host.OpenAsync(temporary, FileMode.CreateNew, token: token).ConfigureAwait(false))
+            await using (var store = await host.CreateTemporaryAsync(temporary, token).ConfigureAwait(false))
             {
                 ownsTemporary = true;
                 var pages = options.Credential is null
@@ -659,7 +662,7 @@ public sealed partial class Database
             CheckRole(role); held = writer; await held.WaitAsync(token).ConfigureAwait(false);
             lock (gate)
             {
-                if (state.Admission is null) break;
+                if (state.Admission is null) { state.RemoteWriterGate = held; break; }
                 held.Release();
             }
         }
@@ -680,6 +683,7 @@ public sealed partial class Database
         catch (Exception error)
         {
             if (committer.IsPoisoned) PoisonFile(error);
+            lock (gate) if (ReferenceEquals(state.RemoteWriterGate, held)) state.RemoteWriterGate = null;
             held.Release(); throw;
         }
     }
@@ -776,7 +780,16 @@ public sealed partial class Database
                 await database.RunRemoteMaintenanceAsync(role, CancellationToken.None).ConfigureAwait(false);
         }
         public ValueTask DisposeAsync()
-        { if (Interlocked.Exchange(ref disposed, 1) == 0) { pin.Dispose(); held.Release(); } return ValueTask.CompletedTask; }
+        {
+            if (Interlocked.Exchange(ref disposed, 1) == 0)
+            {
+                pin.Dispose();
+                lock (database.gate)
+                    if (ReferenceEquals(database.fileState!.RemoteWriterGate, held)) database.fileState.RemoteWriterGate = null;
+                held.Release();
+            }
+            return ValueTask.CompletedTask;
+        }
     }
     private void PoisonFile(Exception error)
     {

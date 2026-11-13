@@ -98,12 +98,13 @@ public sealed partial class Database
         AttachedDatabase[] owned;
         lock (gate)
         {
-            if (disposed || attachments.Count == 0) return;
-            if (domainLeases != 0 || attaching.Count != 0 || pins.Count != 0 || writer.CurrentCount == 0)
-                throw new SqlException(SqlStates.ObjectInUse, "database has live domain operations");
+            if (attachments.Count == 0) return;
             attachmentsClosing = true; owned = attachments.Values.OrderBy(item => item.Name, Utf8NameComparer.Instance).ToArray();
         }
-        foreach (var attachment in owned) await attachment.Database.DisposeAsync().ConfigureAwait(false);
-        lock (gate) attachments.Clear();
+        foreach (var attachment in owned)
+        {
+            await attachment.Database.DisposeAsync().ConfigureAwait(false);
+            lock (gate) attachments.Remove(attachment.Name);
+        }
     }
 }

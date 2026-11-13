@@ -26,13 +26,124 @@ internal static class SimulationHostTests
         var survived = await fs.ExistsAsync("uncommitted");
         fs.BeginStep(3); fs.Crash(power: true); fs.Restart();
         Corpus.Equal(survived, await fs.ExistsAsync("uncommitted"), "recovered directory prefix stays durable");
+        await CommitReadback();
+        await TemporaryReplacement();
+        await RelaxedImageMaintenance();
         await ScratchFaults();
         await InodeFaultIdentity();
         await RelaxedClock();
         await PageService();
         await FailedPromotionReleasesOwnership();
+        await CloseOwnerWithRemoteWriter();
+        await RetainedWriterSnapshots();
+        await FailedWriterProtection();
         for (ulong seed = 1; seed <= 12; seed++) await Recovery(seed);
         Console.WriteLine("PASS simulation host: write-order independence, delayed unissued writes, directory durability and real-engine crash/recovery across content-keyed torn images");
+    }
+
+    private static async Task CommitReadback()
+    {
+        var fs = new SimulationFileSystem(19, 256);
+        var calls = 0;
+        Task<string> DisconnectOnce() => ++calls == 1
+            ? Task.FromException<string>(new SqlException(SqlStates.ConnectionFailure, "read-back disconnected"))
+            : Task.FromResult("committed");
+        Corpus.Equal("committed", await SimulationRunner.ReadCommitDigest(fs, false, true, "pending", DisconnectOnce), "read-back retries a live service disconnect");
+        Corpus.Equal(2, calls, "read-back retries once");
+        foreach (var state in new[] { SqlStates.ConnectionFailure, SqlStates.IoError, SqlStates.DataCorrupted })
+        {
+            calls = 0;
+            var failure = new SqlException(state, "read-back failure");
+            Task<string> Fail() { calls++; return Task.FromException<string>(failure); }
+            try
+            {
+                await SimulationRunner.ReadCommitDigest(fs, false, true, "pending", Fail);
+                throw new InvalidDataException("unexpected read-back failure was hidden");
+            }
+            catch (SqlException error) when (ReferenceEquals(error, failure)) { }
+            Corpus.Equal(state == SqlStates.ConnectionFailure ? 2 : 1, calls, "only live connection failures retry");
+        }
+        fs.Crash(power: false);
+        Corpus.Equal(true, fs.IsDead, "read-back host records owner death");
+        foreach (var state in new[] { SqlStates.IoError, SqlStates.ConnectionFailure })
+            Corpus.Equal("pending", await SimulationRunner.ReadCommitDigest(fs, false, true, "pending",
+                () => Task.FromException<string>(new SqlException(state, "owner died after ACK"))), "dead service defers read-back to recovery");
+        foreach (var state in new[] { SqlStates.DataCorrupted, SqlStates.DivisionByZero })
+        {
+            var failure = new SqlException(state, "not an IO fault");
+            try
+            {
+                await SimulationRunner.ReadCommitDigest(fs, true, true, "pending", () => Task.FromException<string>(failure));
+                throw new InvalidDataException("dead-owner fallback hid an unexpected error");
+            }
+            catch (SqlException error) when (ReferenceEquals(error, failure)) { }
+        }
+        fs.Restart();
+        await using var store = await fs.OpenAsync("sim.jed", FileMode.CreateNew);
+        fs.BeginStep(1, new("io_error", Operation: "sync"));
+        await store.WriteAsync(0, new byte[256]);
+        try { await store.SyncAsync(); throw new InvalidDataException("cap-flush fault did not fire"); }
+        catch (IOException) { }
+        Corpus.Equal("sync", fs.Fired, "relaxed read-back fallback requires a fired fault");
+        Corpus.Equal("pending", await SimulationRunner.ReadCommitDigest(fs, true, false, "pending",
+            () => Task.FromException<string>(new SqlException(SqlStates.IoError, "cap flush failed"))), "relaxed cap flush defers read-back to recovery");
+    }
+
+    private static async Task TemporaryReplacement()
+    {
+        var fs = new SimulationFileSystem(2, 256);
+        foreach (var (path, value) in new[] { ("sim.jed", (byte)1), ("sim.jed.jedtmp", (byte)2) })
+        {
+            await using var store = await fs.OpenAsync(path, FileMode.CreateNew);
+            await store.WriteAsync(0, new[] { value }); await store.SyncAsync();
+        }
+        await fs.SyncDirectoryAsync("sim.jed");
+        fs.BeginStep(194);
+        await using (var replacement = await fs.CreateTemporaryAsync("sim.jed.jedtmp"))
+        {
+            await replacement.WriteAsync(0, new byte[] { 3 }); await replacement.SyncAsync();
+        }
+        await fs.MoveAsync("sim.jed.jedtmp", "sim.jed", overwrite: true);
+        fs.Crash(power: false); fs.Restart();
+        fs.BeginStep(200); fs.Crash(power: true, survive: 1000); fs.Restart();
+        // Lane 10 retains both canonical operations (replace, rename). An
+        // extra unlink would change the prefix selection and lose the rename.
+        Corpus.Equal((byte)3, fs.Image("sim.jed")[0], "stale staging replacement preserves the canonical directory prefix");
+        Corpus.Equal(false, await fs.ExistsAsync("sim.jed.jedtmp"), "surviving rename consumes staging name");
+        var rejected = false;
+        try { await using var unexpected = await fs.OpenAsync("sim.jed", FileMode.CreateNew); }
+        catch (IOException) { rejected = true; }
+        Corpus.Equal(true, rejected, "exclusive creation refuses an existing file");
+    }
+
+    private static async Task RelaxedImageMaintenance()
+    {
+        foreach (var fail in new[] { false, true })
+        {
+            var fs = new SimulationFileSystem(89, 512);
+            var options = new DatabaseFileOptions { FileHost = fs, Locking = FileLocking.None,
+                Synchronous = Synchronous.Off, EnableIdleFlush = false, Clock = () => 0 };
+            var database = await Database.CreateFileAsync("maintenance.jed", options, 512);
+            await using (var session = database.CreateSession()) await Execute(session, "CREATE TABLE t(id i32 PRIMARY KEY)");
+            var batch = database.CommittedStorageForTesting().Batch ?? throw new InvalidDataException("relaxed mutation did not start a batch");
+            var target = database.Version + 1;
+            fs.Operations.Clear(); fs.BeginStep(1, fail ? new("power_loss", Probability: 0) : null);
+            try { await database.CompactAsync(); }
+            catch (SqlException error) when (fail && error.SqlState == SqlStates.IoError && fs.Fired == "barrier") { }
+            Corpus.Equal(false, fs.Operations.Contains("sync maintenance.jed"), "image maintenance does not preflush the old relaxed file");
+            Corpus.Equal(true, fs.Operations.Contains("sync maintenance.jed.jedtmp"), "replacement image receives the first data barrier");
+            if (fail)
+            {
+                Corpus.Equal("barrier", fs.Fired, "replacement failure reached its barrier"); fs.Restart();
+            }
+            else
+            {
+                Corpus.Equal<StorageBatch?>(null, database.CommittedStorageForTesting().Batch, "successful replacement ends the relaxed batch");
+                await database.DisposeAsync(); fs.Crash(power: true); fs.Restart();
+            }
+            await using var reopened = await Database.OpenFileAsync("maintenance.jed", options);
+            Corpus.Equal(fail ? batch.FloorTransactionId : target, reopened.Version, "replacement failure preserves old floor while success publishes new durable image");
+        }
     }
 
     private static async Task PageService()
@@ -80,6 +191,124 @@ internal static class SimulationHostTests
         Corpus.Equal(1, roles.OwnerOf("service.jed")!.Value, "exclusive simulated owner follows promotion");
         await client.DisposeAsync(); await network.SettleAsync(timeout.Token);
         Corpus.Equal<int?>(null, roles.OwnerOf("service.jed"), "clean close releases injected ownership");
+    }
+
+    private static async Task RetainedWriterSnapshots()
+    {
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(20));
+        var fs = new SimulationFileSystem(49, 512);
+        var network = new SimulationNetwork(); var roles = new SimulationRoleRegistry(network);
+        DatabaseFileOptions Options(int process) => new()
+        {
+            FileHost = fs, ScratchDevices = fs, RoleHost = roles.Host(process), CacheBytes = 1,
+            EnableIdleFlush = false, IdleTransactionMilliseconds = 0, ShutdownGraceMilliseconds = 1,
+            Entropy = count => new byte[count]
+        };
+        await using var owner = await Database.CreateFileAsync("retained.jed", Options(0), 512, timeout.Token);
+        await using var local = owner.CreateSession();
+        await Execute(local, "CREATE TABLE t(id i64 PRIMARY KEY)");
+        await using var client = await Database.OpenFileAsync("retained.jed", Options(1), timeout.Token);
+        foreach (var commit in new[] { false, true })
+        {
+            await Execute(local, "INSERT INTO t SELECT g FROM generate_series(1,100) g");
+            var lease = await DomainLease.Acquire(client, null, true, false, timeout.Token);
+            var retained = lease.Retain();
+            try
+            {
+                if (commit)
+                {
+                    var domain = lease.Scope.Get("main"); var pending = domain.Pending!;
+                    var table = pending.Catalog.Tables.Single();
+                    pending.Trees[table.Name] = await client.Tree(table, pending, pending.Before)
+                        .UpsertAsync(table.EncodeRow([SqlValue.Integer(101)]));
+                    pending.Catalog = pending.Catalog with { Tables = [table with { RowCount = 101 }] };
+                    pending.Changed = true;
+                    await lease.PrepareWriterPinsForCommitAsync();
+                    await Database.CommitDomainsAsync(lease.Scope, timeout.Token);
+                }
+                await lease.ReleaseWriters(); await lease.DisposeAsync();
+                await Execute(local, "DELETE FROM t");
+                retained.CheckRoles();
+                var snapshot = retained.Scope.Get("main").Snapshot;
+                var tree = client.Tree(snapshot.Catalog.Tables.Single(), null, snapshot);
+                var count = 0;
+                await foreach (var record in tree.ScanAsync(cancellationToken: timeout.Token)) count++;
+                Corpus.Equal(100, count, "retained remote writer snapshot survives " + (commit ? "commit" : "rollback") + " and eviction");
+                if (commit)
+                {
+                    await using var cursorSession = client.CreateSession();
+                    await using var cursor = new Rows(cursorSession, [new Column("n", SqlType.I64)],
+                        QueryExecution.Materialized([new Row([SqlValue.Integer(7)])]), new Meter(cursorSession, 0, default), retained.Retain());
+                    network.Disconnect(1, Path.GetFullPath("retained.jed")); await network.SettleAsync(timeout.Token);
+                    await HostTests.Error(SqlStates.ConnectionFailure, async () => { _ = await cursor.ReadAsync(timeout.Token); });
+                }
+            }
+            finally { await lease.DisposeAsync(); await retained.DisposeAsync(); }
+        }
+    }
+
+    private static async Task FailedWriterProtection()
+    {
+        foreach (var disposeSession in new[] { false, true })
+        {
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(20));
+            var fs = new SimulationFileSystem(50, 512);
+            var network = new SimulationNetwork(); var roles = new SimulationRoleRegistry(network);
+            DatabaseFileOptions Options(int process) => new()
+            {
+                FileHost = fs, ScratchDevices = fs, RoleHost = roles.Host(process), CacheBytes = 1,
+                EnableIdleFlush = false, IdleTransactionMilliseconds = 0, ShutdownGraceMilliseconds = 1,
+                Entropy = count => new byte[count]
+            };
+            // Main sorts before the remote attachment: its reader pin succeeds
+            // before the disconnected attachment's protection fails.
+            var main = await Database.CreateFileAsync("a-protection.jed", Options(0), 512, timeout.Token);
+            await using var owner = await Database.CreateFileAsync("z-protection.jed", Options(1), 512, timeout.Token);
+            await main.AttachFileAsync("a1", "z-protection.jed", Options(0), timeout.Token);
+            var session = main.CreateSession();
+            await Execute(session, "BEGIN");
+            var cursor = await session.QueryAsync("SELECT 7", cancellationToken: timeout.Token);
+            network.Disconnect(0, Path.GetFullPath("z-protection.jed")); await network.SettleAsync(timeout.Token);
+            await HostTests.Error(SqlStates.ConnectionFailure, async () =>
+            {
+                if (disposeSession) await session.DisposeAsync();
+                else await Execute(session, "ROLLBACK");
+            });
+            await HostTests.Error(SqlStates.ConnectionFailure, async () => { _ = await cursor.ReadAsync(timeout.Token); });
+            await cursor.DisposeAsync();
+            await session.DisposeAsync();
+            // Both the successful partial pin and the root registry reference
+            // must be gone, otherwise close reports an active local operation.
+            await main.DisposeAsync();
+        }
+    }
+
+    private static async Task CloseOwnerWithRemoteWriter()
+    {
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(20));
+        var fs = new SimulationFileSystem(48, 512);
+        var network = new SimulationNetwork(); var roles = new SimulationRoleRegistry(network);
+        DatabaseFileOptions Options(int process) => new()
+        {
+            FileHost = fs, ScratchDevices = fs, RoleHost = roles.Host(process),
+            EnableIdleFlush = false, IdleTransactionMilliseconds = 0, ShutdownGraceMilliseconds = 1,
+            Entropy = count => new byte[count]
+        };
+        var owner = await Database.CreateFileAsync("closing.jed", Options(0), 512, timeout.Token);
+        await owner.AttachInMemoryAsync("a1", cancellationToken: timeout.Token);
+        await using (var local = await owner.OpenWriteSessionAsync(cancellationToken: timeout.Token))
+        {
+            await HostTests.Error(SqlStates.ObjectInUse, async () => await owner.DisposeAsync());
+            await local.RollbackAsync(timeout.Token);
+        }
+        var client = await Database.OpenFileAsync("closing.jed", Options(1), timeout.Token);
+        await using var remote = await client.OpenWriteSessionAsync(cancellationToken: timeout.Token);
+        await owner.DisposeAsync();
+        await network.SettleAsync(timeout.Token);
+        Corpus.Equal<int?>(null, roles.OwnerOf("closing.jed"), "owner shutdown drains a remote writer before closing attachments");
+        await HostTests.Error(SqlStates.ConnectionFailure, async () => await remote.CommitAsync(timeout.Token));
+        await remote.DisposeAsync();
+        await client.DisposeAsync();
     }
 
     private static async Task FailedPromotionReleasesOwnership()
@@ -222,6 +451,7 @@ internal static class SimulationHostTests
         fs.BeginStep(5, new("power_loss", Probability: (int)(seed % 3) * 500, Tear: 450));
         try { await Execute(writer, "COMMIT"); throw new InvalidDataException("commit reached no barrier"); }
         catch (SimulationFileSystem.CrashException) { }
+        catch (SqlException error) when (error.SqlState == SqlStates.IoError && fs.Fired == "barrier") { }
         // Deliberately abandon the killed engine. Calling its clean Dispose
         // would test a graceful shutdown, not a process crash.
         fs.Restart();

@@ -349,10 +349,18 @@ internal static class StorageTests
         Corpus.Equal(1, writer.Current.FloorSlot, "relaxed commit preserves durable floor slot");
         var firstIds = first.Body.Select(page => page.Page).ToHashSet();
         var second = Plan();
+        Corpus.Equal(1U, second.LastReclamationLive!.Value, "older batch dependencies do not inflate reclamation live count");
         Corpus.Equal(false, second.Body.Any(page => firstIds.Contains(page.Page)), "batch never rewrites an earlier body page");
         Corpus.Equal(false, second.Body.Any(page => page.Page == 2), "newly orphaned floor root is not reusable inside batch");
         Corpus.Equal((uint)(first.Body.Length + second.Body.Length), second.Meta.ManifestEntries, "manifest includes prior batch body writes");
         Corpus.Equal(false, second.FreePages.Overlaps(firstIds), "pending body pages excluded from persisted free list");
+        var orphanAllocation = new StorageAllocation(writer.Current, eagerReclaim: false);
+        var orphanRoot = orphanAllocation.AddPage(StorageFormat.EncodePage(256, new(1, 0, 0, 0), []));
+        var orphan = orphanAllocation.AddPage(StorageFormat.EncodePage(256, new(1, 0, 0, 0), []));
+        orphanAllocation.CollectUnreachable(new HashSet<uint> { orphanRoot }, default);
+        var orphanPlan = orphanAllocation.Prepare(orphanRoot, 1);
+        Corpus.Equal(2U, orphanPlan.LastReclamationLive!.Value, "current orphan writes count toward reclamation threshold");
+        Corpus.Equal(false, orphanPlan.FreePages.Contains(orphan), "current orphan write remains a protected manifest dependency");
         await writer.CommitAsync(second, synchronous: false, deadlineMicroseconds: deadline);
         Corpus.Equal(first.Meta.PageCount <= second.Meta.PageCount, true, "batch cannot lower high-water after its first commit");
         Corpus.Equal(3UL, (await StorageRecovery.OpenAsync(device)).Meta.TransactionId, "complete cumulative manifest reopens newest generation");

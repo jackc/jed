@@ -1,0 +1,33 @@
+{
+  "semantic_revision": "b1a6affca7725e0b07a4f734eddb1c569ef76bcf",
+  "capture32_source_sha256": "693be66ec1bd2b1480e444a3474413ce39ae3a4b35cde393443e7f7a30d9a54e",
+  "capture33_source_sha256": "0cf098642148d17d745078023591d50272158d8188923558e6fc21c3482bdc3e",
+  "comparison": {
+    "project_input_count": 393,
+    "path_set_identical": true,
+    "source32_capture": "/home/jack/.codex/worktrees/ca26/jed/impl/csharp-native/.build/aot-source-20261113-2839098-p7vhlt",
+    "aggregation": "SHA-256 of sorted UTF-8 relative path, NUL, file bytes, NUL for every declared NativeAOT project input",
+    "capture32_project_inputs_sha256": "ebc47c461893d79648e76667d5c3bd3969345209dd26ef36ade8a0e6f8251f3f",
+    "capture33_project_inputs_sha256": "074c5f46780670217dfca80977381f61fe4540e1e1353dab81e024bebee2fe3d",
+    "changed_paths": [
+      {
+        "path": "Jed.Check/SimulationRunner.cs",
+        "capture32_sha256": "3cabc20ba47806d85cb9c5ebca27b581b04436d580d859fb9a58f4dd76747e8c",
+        "capture33_sha256": "4a3ea3f3096fbd41a758dfc8886814ffa743da098abf2138ab5eb1bdabf6277a"
+      }
+    ],
+    "engine_input_changes": 0
+  },
+  "default_jit": {
+    "engine_dll_identical": true,
+    "engine_dll_sha256": "ddbdf12114b1313d62c0a1fa78882d3602b989b2b8597991a0718114e498cf36",
+    "capture32_check_dll_sha256": "becfda92688877d6d3148a8a3206be45f75b32274f82939454b2288cb3492f67",
+    "capture33_check_dll_sha256": "a574fbc952265c11cf9fcb9e7aaed7239fd6ca0b3a51c34ec04276cee1c76086"
+  },
+  "capture33_full_host": {
+    "log": "/tmp/jed-csharp-host-capture33.log",
+    "sha256": "10bbdac5d24b95ed4035a7e04120539cacacd3dc1197975eff6a4039d4900cbc",
+    "exit_code": 0
+  },
+  "scope": "Historical provenance for captures32 and33 only. The sole changed project input corrects the simulator failed-commit publication invariant to compare current published versions, rather than possibly lagging page-client allocator metadata."
+}

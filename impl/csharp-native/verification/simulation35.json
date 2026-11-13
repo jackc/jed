@@ -1,0 +1,1064 @@
+{
+  "semantic_revision": "b1a6affca7725e0b07a4f734eddb1c569ef76bcf",
+  "date": "2026-11-13",
+  "harness_capture": 35,
+  "source_sha256": "456e9a13909cefb2bb9577be7fcdcee788537ae796db3fc7eddac360713fcf31",
+  "engine_capture": 34,
+  "source_provenance": {
+    "path": "source35.json",
+    "sha256": "58819801cf7d256f9b6e9abd7921dd8e7f70761d3dbfbb9b240ed1b2186a67a8"
+  },
+  "engine_dll_sha256": "8d61294762ee65ca6023a5d830096fdf698e517ef6eea75fea3bd54dbcdd22a1",
+  "actor_dll_sha256": "2227b4855b6cc3f235d90a4dfa8da065056c1b5ca25987c4f6928e034b4fddbf",
+  "counts": {
+    "total": 85,
+    "passed": 85,
+    "exact": {
+      "total": 76,
+      "passed": 76
+    },
+    "intrinsic": {
+      "total": 9,
+      "passed": 9
+    }
+  },
+  "policy": "All 19 frozen saved regressions and all 22 canonical generated profiles at seeds 1, 2 and 3; no trace-length overrides. Every trace runs complete C# determinism, recovery and structural oracles and independent pinned Go execution. Exact mode compares full transcripts. Canonical corruption/read_error/enospc/spill_error traces retain per-core intrinsic oracles and exclude cross-core transcript equality, per simulation-testing.md section 6.3. Tool policy hashes were checked before and after every trace and at sweep completion.",
+  "scope": "Linux x86-64 default JIT actor. Capture35 changes only two simulator validated-digest adoption assignments; engine inputs and DLL are identical to capture34. The bounded seed set is evidence, not exhaustive fuzzing or a security certification.",
+  "focused": [
+    {
+      "name": "service1",
+      "log": "/tmp/jed-csharp-simulation35-focused-service1.log",
+      "sha256": "62655b9f57183d57b3ac94f50202c4b28c4d4c06bba80029a88ac56f03bfb232",
+      "exit_code": 0
+    },
+    {
+      "name": "backup",
+      "log": "/tmp/jed-csharp-simulation35-focused-backup.log",
+      "sha256": "9ebf8b4fdd7f84669effcc99be8c38eaec5440652c545956b8d6baf5e12f4fd9",
+      "exit_code": 0
+    }
+  ],
+  "sweeps": [
+    {
+      "label": "saved",
+      "command": "mise run csharp-native:simulation-sweep --no-build --assembly /tmp/jed-csharp-storage-capture35/Jed.Check.dll --regress",
+      "exit_code": 0,
+      "evidence_directory": "/tmp/jed-csharp-simulation-sweep-20261113-63-5ctrra",
+      "log": "/tmp/jed-csharp-simulation35-saved.log",
+      "log_sha256": "12f2471200d4f7e8a40855640b2e8bdfebfec13d3affd50568b4ffc316f82c64",
+      "manifest_path": "/tmp/jed-csharp-simulation-sweep-20261113-63-5ctrra/manifest.json",
+      "manifest_sha256": "89621c4e42d1b5004fe6778452b1be74bdd009ae69932bf226ab653bfc644bd0",
+      "manifest": {
+        "baseline": "b1a6affca7725e0b07a4f734eddb1c569ef76bcf",
+        "generator_sha256": "bd497ee9703f0340f350008fc8de6b04847b20c8ae9f784bb78b392400293b12",
+        "artifacts": {
+          "BouncyCastle.Cryptography.dll": "ef92fc661e8d7ba8ec4d39a7cdfcdba41f14cb327f0d24fe79d0b5bb428899b5",
+          "Jed.CSharpExperiment.dll": "8d61294762ee65ca6023a5d830096fdf698e517ef6eea75fea3bd54dbcdd22a1",
+          "Jed.CSharpExperiment.pdb": "4daf2ad0a47ce5e84dd078e60f71ceef9de9c500a7d36435396e84a706b726fd",
+          "Jed.Check": "249c10d0b1960b61e52091650d52e1009a3977ab07fb135995199317c579b641",
+          "Jed.Check.deps.json": "203fc9a5e456ea866d125285f8d44fb55551ade67bb601392ed0d24a7f8286b4",
+          "Jed.Check.dll": "2227b4855b6cc3f235d90a4dfa8da065056c1b5ca25987c4f6928e034b4fddbf",
+          "Jed.Check.pdb": "9a5edf14142ba8c23979bd346dd8d9c5811b32ebf5b0c699311ba1e97a349f45",
+          "Jed.Check.runtimeconfig.json": "8c019e2c7c9acc0440d8b263897f7b0079b1c6895307921604be20e732900366",
+          "build.json": "85351c219f47ff7fb75b5c8b094256bd1a3c54a801a901ea182a13f64d9817d5",
+          "source.sha256": "44cb82f7b7ae67d624d9fff770d823388222fd316c4551166215cfa9e280b5e5"
+        },
+        "tool_policy_sha256": {
+          "/home/jack/.codex/worktrees/ca26/jed/mise-tasks/csharp-native/simulation": "4c528cada14abf46f74dc3b9f52d493d07491e28cc1cd00ac8aa5ec4acdf1662",
+          "/home/jack/.codex/worktrees/ca26/jed/mise-tasks/csharp-native/simulation-sweep": "81d0a0351153b4d834212007f3ad66ee19f3777bb33668108413edde084abca3"
+        },
+        "profile_names": [
+          "attachments",
+          "big-commits",
+          "compaction",
+          "corruption",
+          "crash-storm",
+          "ddl-churn",
+          "encryption",
+          "encryption-attachments",
+          "encryption-replay",
+          "encryption-service",
+          "growth",
+          "large-values",
+          "mixed",
+          "relaxed",
+          "resource",
+          "reuse-under-pins",
+          "service",
+          "service-attachments",
+          "service-relaxed",
+          "spill",
+          "stabilization",
+          "truncation"
+        ],
+        "seeds": [
+          1
+        ],
+        "steps_override": null,
+        "traces": {
+          "analyze-then-drop-table.sim": "3cdaadbd046d24fea14877ecf85ca8fe0ec0ca52d30499e20b7226978dd6e37f",
+          "compaction-crash-before-dir-sync.sim": "e1e3c1f736d0e317e459c25096cc9de16ac75bfb5eeadacf94a268a88d2197d1",
+          "delete-empty-unary-subtree.sim": "d4e0f66ec4d15cb55fc447d99e664ba524bccca4250bdb2162400f60275db2aa",
+          "delete-merge-separator-overflow.sim": "8f2f56379445cd1643db1e3b8108e9df6420b85329f90d40e05eb1fe163c6963",
+          "encryption-rekey-rename-not-durable.sim": "5b65ca1b9ba0f83861879b3d818735e0eb81ad3539885e40b3feb6f479094991",
+          "encryption-service-backup-current-key-block.sim": "a3f33a3a882b4a1660f1c980ce5c3f6b477f2ec2f4508e20916104c2efa146bd",
+          "encryption-service-promote-after-rekey.sim": "6b4f4c0052bd293e3399b10d5b68998ecda04672a86a8ac6b0c205d925133d7c",
+          "encryption-service-reconnect-keeps-held-key.sim": "a3f62c0482d6a244a8d69a758649859819d249a406f18ecb4a68c47ff8a9e912",
+          "relaxed-attachments-close-order.sim": "da9755cc9eb689646b01c77834d990ed9a243ec5f1aea89c2e1eb545a250464e",
+          "relaxed-close-truncation-floor.sim": "c1b78f0d662475bf4e9594e2271942cf468bccc662066fd74bc7f4d63765d5e3",
+          "relaxed-deadline-flush.sim": "616611a44291f30dcbfb977e73841e5d15db16b60f39038a079464d384d55c22",
+          "relaxed-floor-unsynced-compaction-rename.sim": "14f1cb13dea5aa75a9184d24a02f404abe7f4a09188b6adcbae3f7200011d9da",
+          "service-attachments-owner-and-clients.sim": "b4ad8e2dd83a90feaf638f8529c208e9622e25e9e794bdaaba43e0436348c00c",
+          "service-backup-after-owner-lost.sim": "a5a2d2f74dbbe255cbdb620e823385eff6470957923b03721a80e07b9ccce682",
+          "service-backups.sim": "a557bdf12dafc92123f7bf5cd318db32fcfc953e88fe6c7f8b4b03723098838d",
+          "service-disconnect-spares-served-connections.sim": "bd19bd38bb6dfae13b2c8b70dc9d2aea828717f9741fdf00794e587b5488a653",
+          "service-owner-and-clients.sim": "3b8b1c64bcffeb960cd7d2035861037b935643d9c003217f8d9150a5a855759c",
+          "service-owner-lost-unstabilized-generation.sim": "8af68ca4d0bffbb11d0e405edbc85baedf0fdd92c6541c850252936053a75396",
+          "stale-root-leaf-chains.sim": "123fe059f00f764f93500c6715cecff4be42bd3401c958d214a9daea8ca9716d"
+        }
+      },
+      "results_path": "/tmp/jed-csharp-simulation-sweep-20261113-63-5ctrra/results.json",
+      "results_sha256": "57a16886c4ca62495a5f6efb68562341fcf4b59a9bf80c03b7240771eb5aca7a",
+      "results": [
+        {
+          "trace": "analyze-then-drop-table.sim",
+          "pass": true,
+          "mode": "exact",
+          "status": 0,
+          "log": "/tmp/jed-csharp-simulation-sweep-20261113-63-5ctrra/analyze-then-drop-table.log",
+          "log_sha256": "39f944d2477edee11c2430d5a43e66fa9b606ff63785ddacc949664d8ad17d23"
+        },
+        {
+          "trace": "compaction-crash-before-dir-sync.sim",
+          "pass": true,
+          "mode": "exact",
+          "status": 0,
+          "log": "/tmp/jed-csharp-simulation-sweep-20261113-63-5ctrra/compaction-crash-before-dir-sync.log",
+          "log_sha256": "6552f30dcea148a610d3ebec8fd207bd657345085be1d9480ec2305cf5b4dbee"
+        },
+        {
+          "trace": "delete-empty-unary-subtree.sim",
+          "pass": true,
+          "mode": "exact",
+          "status": 0,
+          "log": "/tmp/jed-csharp-simulation-sweep-20261113-63-5ctrra/delete-empty-unary-subtree.log",
+          "log_sha256": "2e89f59b819e4c88942a88658137f812ad0f4362db5873f8be74665077600bde"
+        },
+        {
+          "trace": "delete-merge-separator-overflow.sim",
+          "pass": true,
+          "mode": "exact",
+          "status": 0,
+          "log": "/tmp/jed-csharp-simulation-sweep-20261113-63-5ctrra/delete-merge-separator-overflow.log",
+          "log_sha256": "a79aa7dfd763b67b5ea292588cbad3616174f988c0869c7108f946ae68e90838"
+        },
+        {
+          "trace": "encryption-rekey-rename-not-durable.sim",
+          "pass": true,
+          "mode": "exact",
+          "status": 0,
+          "log": "/tmp/jed-csharp-simulation-sweep-20261113-63-5ctrra/encryption-rekey-rename-not-durable.log",
+          "log_sha256": "7e8980804e54c2460abe05b26d717fc2ad3def1fe0f43c07c275f8003c7a6955"
+        },
+        {
+          "trace": "encryption-service-backup-current-key-block.sim",
+          "pass": true,
+          "mode": "exact",
+          "status": 0,
+          "log": "/tmp/jed-csharp-simulation-sweep-20261113-63-5ctrra/encryption-service-backup-current-key-block.log",
+          "log_sha256": "0d28b4a278cb42d9841767b8d3e10dff597dddfcfe11661f32fa8fa8924d9d8e"
+        },
+        {
+          "trace": "encryption-service-promote-after-rekey.sim",
+          "pass": true,
+          "mode": "exact",
+          "status": 0,
+          "log": "/tmp/jed-csharp-simulation-sweep-20261113-63-5ctrra/encryption-service-promote-after-rekey.log",
+          "log_sha256": "cc6d7619ccc12ef7c2c2bf1992b1fdedc5cc03b35290ee8a69e502f15339ca2a"
+        },
+        {
+          "trace": "encryption-service-reconnect-keeps-held-key.sim",
+          "pass": true,
+          "mode": "exact",
+          "status": 0,
+          "log": "/tmp/jed-csharp-simulation-sweep-20261113-63-5ctrra/encryption-service-reconnect-keeps-held-key.log",
+          "log_sha256": "ffe79d2765f355dc1235f7e50bdcd86bb0780349f092ce83b99c92af10e8e4a4"
+        },
+        {
+          "trace": "relaxed-attachments-close-order.sim",
+          "pass": true,
+          "mode": "exact",
+          "status": 0,
+          "log": "/tmp/jed-csharp-simulation-sweep-20261113-63-5ctrra/relaxed-attachments-close-order.log",
+          "log_sha256": "6794d2a4b268bc5d9d32cca9f40ece8df0884d04b21dcd13b25237513d2a215c"
+        },
+        {
+          "trace": "relaxed-close-truncation-floor.sim",
+          "pass": true,
+          "mode": "exact",
+          "status": 0,
+          "log": "/tmp/jed-csharp-simulation-sweep-20261113-63-5ctrra/relaxed-close-truncation-floor.log",
+          "log_sha256": "f4e3eaff9939c5034bbf4ef6b9d1a5f837047d9b97197acf0462c068b6919758"
+        },
+        {
+          "trace": "relaxed-deadline-flush.sim",
+          "pass": true,
+          "mode": "exact",
+          "status": 0,
+          "log": "/tmp/jed-csharp-simulation-sweep-20261113-63-5ctrra/relaxed-deadline-flush.log",
+          "log_sha256": "7d1172f98694da37d174a543f391f90726ad8586a4fd17c91e1111c60b55d58b"
+        },
+        {
+          "trace": "relaxed-floor-unsynced-compaction-rename.sim",
+          "pass": true,
+          "mode": "exact",
+          "status": 0,
+          "log": "/tmp/jed-csharp-simulation-sweep-20261113-63-5ctrra/relaxed-floor-unsynced-compaction-rename.log",
+          "log_sha256": "dd4b876041fbb1e8ed069851eb416dab25452df62f1609a821d54fc17aeac118"
+        },
+        {
+          "trace": "service-attachments-owner-and-clients.sim",
+          "pass": true,
+          "mode": "exact",
+          "status": 0,
+          "log": "/tmp/jed-csharp-simulation-sweep-20261113-63-5ctrra/service-attachments-owner-and-clients.log",
+          "log_sha256": "af099b5868f368b4ea9426ccfea0dd4c82f0d6b3a79ad5f2a8976f378e5925d2"
+        },
+        {
+          "trace": "service-backup-after-owner-lost.sim",
+          "pass": true,
+          "mode": "exact",
+          "status": 0,
+          "log": "/tmp/jed-csharp-simulation-sweep-20261113-63-5ctrra/service-backup-after-owner-lost.log",
+          "log_sha256": "643f1d9b9ea21eca28f33aee10b1b7b64685350e9745f81477d52cb453d15eda"
+        },
+        {
+          "trace": "service-backups.sim",
+          "pass": true,
+          "mode": "exact",
+          "status": 0,
+          "log": "/tmp/jed-csharp-simulation-sweep-20261113-63-5ctrra/service-backups.log",
+          "log_sha256": "930fde9c83220c7d68cd660bc05c3718e6ab05b01775bcd0b0ae564227472708"
+        },
+        {
+          "trace": "service-disconnect-spares-served-connections.sim",
+          "pass": true,
+          "mode": "exact",
+          "status": 0,
+          "log": "/tmp/jed-csharp-simulation-sweep-20261113-63-5ctrra/service-disconnect-spares-served-connections.log",
+          "log_sha256": "14461371fb619735d1dc90d5e66fb6d47a3f973e6aab93178e07c0f2cccdb43d"
+        },
+        {
+          "trace": "service-owner-and-clients.sim",
+          "pass": true,
+          "mode": "exact",
+          "status": 0,
+          "log": "/tmp/jed-csharp-simulation-sweep-20261113-63-5ctrra/service-owner-and-clients.log",
+          "log_sha256": "53700ca6c7fbddb3c7f01ecca7a89074413201913d70cec6b651a1be95cafff7"
+        },
+        {
+          "trace": "service-owner-lost-unstabilized-generation.sim",
+          "pass": true,
+          "mode": "exact",
+          "status": 0,
+          "log": "/tmp/jed-csharp-simulation-sweep-20261113-63-5ctrra/service-owner-lost-unstabilized-generation.log",
+          "log_sha256": "9f8732dd0a6adc7a76de6c663fdec69dd2aaa0d882cf67b6e124c40d36dbfafc"
+        },
+        {
+          "trace": "stale-root-leaf-chains.sim",
+          "pass": true,
+          "mode": "exact",
+          "status": 0,
+          "log": "/tmp/jed-csharp-simulation-sweep-20261113-63-5ctrra/stale-root-leaf-chains.log",
+          "log_sha256": "8bb1aecb36beacef412c04cb2b77716bdd533be7be7bf911a99ebb002bca28e7"
+        }
+      ]
+    },
+    {
+      "label": "seed1",
+      "command": "mise run csharp-native:simulation-sweep --no-build --assembly /tmp/jed-csharp-storage-capture35/Jed.Check.dll --profile all --seeds 1",
+      "exit_code": 0,
+      "evidence_directory": "/tmp/jed-csharp-simulation-sweep-20261113-63-87zvv2",
+      "log": "/tmp/jed-csharp-simulation35-seed1.log",
+      "log_sha256": "09333cb78683845ff95040e7f1f72877b621d7fb346942e3f33fd14ff91ffc81",
+      "manifest_path": "/tmp/jed-csharp-simulation-sweep-20261113-63-87zvv2/manifest.json",
+      "manifest_sha256": "a9dcef95c014ebbcc61102a7f202e6f849e2df3db11f1f67fdb0aaf26c857413",
+      "manifest": {
+        "baseline": "b1a6affca7725e0b07a4f734eddb1c569ef76bcf",
+        "generator_sha256": "bd497ee9703f0340f350008fc8de6b04847b20c8ae9f784bb78b392400293b12",
+        "artifacts": {
+          "BouncyCastle.Cryptography.dll": "ef92fc661e8d7ba8ec4d39a7cdfcdba41f14cb327f0d24fe79d0b5bb428899b5",
+          "Jed.CSharpExperiment.dll": "8d61294762ee65ca6023a5d830096fdf698e517ef6eea75fea3bd54dbcdd22a1",
+          "Jed.CSharpExperiment.pdb": "4daf2ad0a47ce5e84dd078e60f71ceef9de9c500a7d36435396e84a706b726fd",
+          "Jed.Check": "249c10d0b1960b61e52091650d52e1009a3977ab07fb135995199317c579b641",
+          "Jed.Check.deps.json": "203fc9a5e456ea866d125285f8d44fb55551ade67bb601392ed0d24a7f8286b4",
+          "Jed.Check.dll": "2227b4855b6cc3f235d90a4dfa8da065056c1b5ca25987c4f6928e034b4fddbf",
+          "Jed.Check.pdb": "9a5edf14142ba8c23979bd346dd8d9c5811b32ebf5b0c699311ba1e97a349f45",
+          "Jed.Check.runtimeconfig.json": "8c019e2c7c9acc0440d8b263897f7b0079b1c6895307921604be20e732900366",
+          "build.json": "85351c219f47ff7fb75b5c8b094256bd1a3c54a801a901ea182a13f64d9817d5",
+          "source.sha256": "44cb82f7b7ae67d624d9fff770d823388222fd316c4551166215cfa9e280b5e5"
+        },
+        "tool_policy_sha256": {
+          "/home/jack/.codex/worktrees/ca26/jed/mise-tasks/csharp-native/simulation": "4c528cada14abf46f74dc3b9f52d493d07491e28cc1cd00ac8aa5ec4acdf1662",
+          "/home/jack/.codex/worktrees/ca26/jed/mise-tasks/csharp-native/simulation-sweep": "81d0a0351153b4d834212007f3ad66ee19f3777bb33668108413edde084abca3"
+        },
+        "profile_names": [
+          "attachments",
+          "big-commits",
+          "compaction",
+          "corruption",
+          "crash-storm",
+          "ddl-churn",
+          "encryption",
+          "encryption-attachments",
+          "encryption-replay",
+          "encryption-service",
+          "growth",
+          "large-values",
+          "mixed",
+          "relaxed",
+          "resource",
+          "reuse-under-pins",
+          "service",
+          "service-attachments",
+          "service-relaxed",
+          "spill",
+          "stabilization",
+          "truncation"
+        ],
+        "seeds": [
+          1
+        ],
+        "steps_override": null,
+        "traces": {
+          "attachments-1.sim": "7088e2570552083d78887a1a30718fec2a993134f8cddadd1b067ce5d21d2bd2",
+          "big-commits-1.sim": "7969266a181c01da4def36e2e558f2618aa5ac2d1158ad79c39f8b769e5ae2f8",
+          "compaction-1.sim": "b1fb7575754c8b16a367ad18692912435e11f3825c889aff1e2551a11929a7c2",
+          "corruption-1.sim": "16dcf83366d6f8be66d1e97e12520e83427422aa233fbb0c4d3def603a40ba1d",
+          "crash-storm-1.sim": "7c83c8d65f199c4fd72619ad9cb30f4373711a7809f06e20ddbafd7b4c74fa16",
+          "ddl-churn-1.sim": "3108495d3cf1412cf446137a3a1126374e96ba0be261f29335f9832b48c77fd1",
+          "encryption-1.sim": "59852d1b6037da7590cb82491690567e94decb7bb06ea94df1b9a225dcd97cd3",
+          "encryption-attachments-1.sim": "55b0ca024e7f73bd25f6817073ad071e16e1ea74d455dc430b85d9b0eb3cb7d0",
+          "encryption-replay-1.sim": "dc18be0bf6172cc20ded0f7f0c6fb897b8cc63614acae16a78c07e03692e05cf",
+          "encryption-service-1.sim": "640b58157c0f3cb73fb2087776ace70aa98cf0209e69c08bc39916b0e0fef3ac",
+          "growth-1.sim": "004432d86c3b3a3152af8cdb775389439a9b3c4bd8f15f1bf21444effa9b7228",
+          "large-values-1.sim": "f8d916eb678e4749e999de687d9894b87c93b7a716eea026ac888052b381353a",
+          "mixed-1.sim": "1cb856b52dce0fec1508a0a5a19be73abd0ec62a1405dd7d692f3328de10330b",
+          "relaxed-1.sim": "a747da3eebf8d882bedf66b2fab11501b3ad8e1623f6248c36c6df49172717eb",
+          "resource-1.sim": "9184598dda474a2a10dd3d1a6876527a57abaa24e0c1a0d7f097e0a2c877eb5e",
+          "reuse-under-pins-1.sim": "f7a9d8e75b130f50bdeade705bd9939e49179542a44f853a000d38392f259c4b",
+          "service-1.sim": "ca35abc82b661739fbe05272842fa960781755f3ef7a6ef1eb9f028c6dfc1526",
+          "service-attachments-1.sim": "7d3a882b6a12f8d1f838de827f656cf8d29c8497c2a5e71e31085036777e46dd",
+          "service-relaxed-1.sim": "d9f1f60a32ea51cbae5f1c714ef0fcd513f30284ccd3b6fac308cd7a74c18494",
+          "spill-1.sim": "de4ac4476379136a85f8224a106ad954057e9a1ab53c5392017f0fa1b88b32eb",
+          "stabilization-1.sim": "0948d85f7a447c573df2f35c3074138d37af6f65cd608235fc665d7d7b59eae5",
+          "truncation-1.sim": "6242043142937ff9da5865f43643bc32bb1907b8b95c1ac0732eed02dd99d346"
+        }
+      },
+      "results_path": "/tmp/jed-csharp-simulation-sweep-20261113-63-87zvv2/results.json",
+      "results_sha256": "b06220358a0c68744ab0fdc9eba58ea62e8565c50860156d091f6ecb62f8faef",
+      "results": [
+        {
+          "trace": "attachments-1.sim",
+          "pass": true,
+          "mode": "exact",
+          "status": 0,
+          "log": "/tmp/jed-csharp-simulation-sweep-20261113-63-87zvv2/attachments-1.log",
+          "log_sha256": "06643ac3bbddaca717dba538cd10ff8322260f73b91ed0be3832d452e5d144b6"
+        },
+        {
+          "trace": "big-commits-1.sim",
+          "pass": true,
+          "mode": "exact",
+          "status": 0,
+          "log": "/tmp/jed-csharp-simulation-sweep-20261113-63-87zvv2/big-commits-1.log",
+          "log_sha256": "9f7c90daa0073aa63982e1ef254d373e03903036997c355d9539de3a633cb354"
+        },
+        {
+          "trace": "compaction-1.sim",
+          "pass": true,
+          "mode": "exact",
+          "status": 0,
+          "log": "/tmp/jed-csharp-simulation-sweep-20261113-63-87zvv2/compaction-1.log",
+          "log_sha256": "b7a45d133634517a233d3893694db6f2a01e12a31953f990d8e6955619aeee80"
+        },
+        {
+          "trace": "corruption-1.sim",
+          "pass": true,
+          "mode": "intrinsic",
+          "status": 0,
+          "log": "/tmp/jed-csharp-simulation-sweep-20261113-63-87zvv2/corruption-1.log",
+          "log_sha256": "ea186d4990c24bead65d1710e9bce11300c8b6fe978e432be3e4b0121dbe8466"
+        },
+        {
+          "trace": "crash-storm-1.sim",
+          "pass": true,
+          "mode": "exact",
+          "status": 0,
+          "log": "/tmp/jed-csharp-simulation-sweep-20261113-63-87zvv2/crash-storm-1.log",
+          "log_sha256": "a72802f5e877e2401e860b0da5ca68c155436b759ddfb4522d6b85d0011940b5"
+        },
+        {
+          "trace": "ddl-churn-1.sim",
+          "pass": true,
+          "mode": "exact",
+          "status": 0,
+          "log": "/tmp/jed-csharp-simulation-sweep-20261113-63-87zvv2/ddl-churn-1.log",
+          "log_sha256": "c14186da603dcdf4a1782cc4a69aade210707e735e3e950178466c792c7cc042"
+        },
+        {
+          "trace": "encryption-1.sim",
+          "pass": true,
+          "mode": "exact",
+          "status": 0,
+          "log": "/tmp/jed-csharp-simulation-sweep-20261113-63-87zvv2/encryption-1.log",
+          "log_sha256": "2ed104dd43a2cecc2f3fe770996ae0c66b84beff533d679b9616b3c2ea250f8f"
+        },
+        {
+          "trace": "encryption-attachments-1.sim",
+          "pass": true,
+          "mode": "exact",
+          "status": 0,
+          "log": "/tmp/jed-csharp-simulation-sweep-20261113-63-87zvv2/encryption-attachments-1.log",
+          "log_sha256": "ca2c4b3f62e44e8943a2e0528b9f54e74c82af6f52719c7ba6590b7d1beef894"
+        },
+        {
+          "trace": "encryption-replay-1.sim",
+          "pass": true,
+          "mode": "exact",
+          "status": 0,
+          "log": "/tmp/jed-csharp-simulation-sweep-20261113-63-87zvv2/encryption-replay-1.log",
+          "log_sha256": "7616c83236edf6d87e07eb966e151a540800c031b5705bee946a6d8a50928f19"
+        },
+        {
+          "trace": "encryption-service-1.sim",
+          "pass": true,
+          "mode": "exact",
+          "status": 0,
+          "log": "/tmp/jed-csharp-simulation-sweep-20261113-63-87zvv2/encryption-service-1.log",
+          "log_sha256": "c18f68cf764e71ce1c596447e07163e5b57a4ed378f7a68ef742ba3586c59376"
+        },
+        {
+          "trace": "growth-1.sim",
+          "pass": true,
+          "mode": "exact",
+          "status": 0,
+          "log": "/tmp/jed-csharp-simulation-sweep-20261113-63-87zvv2/growth-1.log",
+          "log_sha256": "93c7c8ff63e1748af986a0755ac0a926f2f8b204f2b9a3c81a5fc8260395f0db"
+        },
+        {
+          "trace": "large-values-1.sim",
+          "pass": true,
+          "mode": "exact",
+          "status": 0,
+          "log": "/tmp/jed-csharp-simulation-sweep-20261113-63-87zvv2/large-values-1.log",
+          "log_sha256": "4ed7ec8d41a0b94ba701f7adc85b14c56c752cdbf24005e76c487e7ed5487268"
+        },
+        {
+          "trace": "mixed-1.sim",
+          "pass": true,
+          "mode": "exact",
+          "status": 0,
+          "log": "/tmp/jed-csharp-simulation-sweep-20261113-63-87zvv2/mixed-1.log",
+          "log_sha256": "61ef5ea9091b199d2b13f385469a051b058f8b1a2d9264eef949d37c2f948eab"
+        },
+        {
+          "trace": "relaxed-1.sim",
+          "pass": true,
+          "mode": "exact",
+          "status": 0,
+          "log": "/tmp/jed-csharp-simulation-sweep-20261113-63-87zvv2/relaxed-1.log",
+          "log_sha256": "ac35b0069ffeb5c493143bd5fc7e88966dae8b215603141c4cd5327d89be86b7"
+        },
+        {
+          "trace": "resource-1.sim",
+          "pass": true,
+          "mode": "intrinsic",
+          "status": 0,
+          "log": "/tmp/jed-csharp-simulation-sweep-20261113-63-87zvv2/resource-1.log",
+          "log_sha256": "2b5303886bd2bfe3e7f0f318f11da1d719e74ac25da8b18013449768959a41f9"
+        },
+        {
+          "trace": "reuse-under-pins-1.sim",
+          "pass": true,
+          "mode": "exact",
+          "status": 0,
+          "log": "/tmp/jed-csharp-simulation-sweep-20261113-63-87zvv2/reuse-under-pins-1.log",
+          "log_sha256": "03a50f3c4cd967c8af5acfda92108f8be19467060cdd67ea5258e8f5739de9a3"
+        },
+        {
+          "trace": "service-1.sim",
+          "pass": true,
+          "mode": "exact",
+          "status": 0,
+          "log": "/tmp/jed-csharp-simulation-sweep-20261113-63-87zvv2/service-1.log",
+          "log_sha256": "898eaeaa375e12b6d0e938a1f3c5acd09c18cf8e09717261ff8d35b18457aa8c"
+        },
+        {
+          "trace": "service-attachments-1.sim",
+          "pass": true,
+          "mode": "exact",
+          "status": 0,
+          "log": "/tmp/jed-csharp-simulation-sweep-20261113-63-87zvv2/service-attachments-1.log",
+          "log_sha256": "bc5dc473266e9a7e6fd565f3ea541281a8ca75fec5f68c97786596e6b97aee56"
+        },
+        {
+          "trace": "service-relaxed-1.sim",
+          "pass": true,
+          "mode": "exact",
+          "status": 0,
+          "log": "/tmp/jed-csharp-simulation-sweep-20261113-63-87zvv2/service-relaxed-1.log",
+          "log_sha256": "05b0f48e1b6b58adb525bedd922b207198dc233656675911e43e3827e04c33b2"
+        },
+        {
+          "trace": "spill-1.sim",
+          "pass": true,
+          "mode": "intrinsic",
+          "status": 0,
+          "log": "/tmp/jed-csharp-simulation-sweep-20261113-63-87zvv2/spill-1.log",
+          "log_sha256": "d2e8f8b70c25bc3e21523ec5f1828d8331c82ca20da524ffcf110583603e3ed8"
+        },
+        {
+          "trace": "stabilization-1.sim",
+          "pass": true,
+          "mode": "exact",
+          "status": 0,
+          "log": "/tmp/jed-csharp-simulation-sweep-20261113-63-87zvv2/stabilization-1.log",
+          "log_sha256": "dd5f39cc1bf177ec195e8241f1e4a5be285d3abce620005b7a105800084adcf4"
+        },
+        {
+          "trace": "truncation-1.sim",
+          "pass": true,
+          "mode": "exact",
+          "status": 0,
+          "log": "/tmp/jed-csharp-simulation-sweep-20261113-63-87zvv2/truncation-1.log",
+          "log_sha256": "427667b1f2b0fecc41a38fcc370d9256385bbc5d7fdced10f93cb51a2fb14400"
+        }
+      ]
+    },
+    {
+      "label": "seed2",
+      "command": "mise run csharp-native:simulation-sweep --no-build --assembly /tmp/jed-csharp-storage-capture35/Jed.Check.dll --profile all --seeds 2",
+      "exit_code": 0,
+      "evidence_directory": "/tmp/jed-csharp-simulation-sweep-20261113-63-k78bkc",
+      "log": "/tmp/jed-csharp-simulation35-seed2.log",
+      "log_sha256": "457889c81ffd70a5c3bcd80f664917872eb9eb4dc16eec146b46dcae7e61c626",
+      "manifest_path": "/tmp/jed-csharp-simulation-sweep-20261113-63-k78bkc/manifest.json",
+      "manifest_sha256": "58311c21e7266419638a48c8cd0076d6a47e8548b6f9de5ed902770e5c573a16",
+      "manifest": {
+        "baseline": "b1a6affca7725e0b07a4f734eddb1c569ef76bcf",
+        "generator_sha256": "bd497ee9703f0340f350008fc8de6b04847b20c8ae9f784bb78b392400293b12",
+        "artifacts": {
+          "BouncyCastle.Cryptography.dll": "ef92fc661e8d7ba8ec4d39a7cdfcdba41f14cb327f0d24fe79d0b5bb428899b5",
+          "Jed.CSharpExperiment.dll": "8d61294762ee65ca6023a5d830096fdf698e517ef6eea75fea3bd54dbcdd22a1",
+          "Jed.CSharpExperiment.pdb": "4daf2ad0a47ce5e84dd078e60f71ceef9de9c500a7d36435396e84a706b726fd",
+          "Jed.Check": "249c10d0b1960b61e52091650d52e1009a3977ab07fb135995199317c579b641",
+          "Jed.Check.deps.json": "203fc9a5e456ea866d125285f8d44fb55551ade67bb601392ed0d24a7f8286b4",
+          "Jed.Check.dll": "2227b4855b6cc3f235d90a4dfa8da065056c1b5ca25987c4f6928e034b4fddbf",
+          "Jed.Check.pdb": "9a5edf14142ba8c23979bd346dd8d9c5811b32ebf5b0c699311ba1e97a349f45",
+          "Jed.Check.runtimeconfig.json": "8c019e2c7c9acc0440d8b263897f7b0079b1c6895307921604be20e732900366",
+          "build.json": "85351c219f47ff7fb75b5c8b094256bd1a3c54a801a901ea182a13f64d9817d5",
+          "source.sha256": "44cb82f7b7ae67d624d9fff770d823388222fd316c4551166215cfa9e280b5e5"
+        },
+        "tool_policy_sha256": {
+          "/home/jack/.codex/worktrees/ca26/jed/mise-tasks/csharp-native/simulation": "4c528cada14abf46f74dc3b9f52d493d07491e28cc1cd00ac8aa5ec4acdf1662",
+          "/home/jack/.codex/worktrees/ca26/jed/mise-tasks/csharp-native/simulation-sweep": "81d0a0351153b4d834212007f3ad66ee19f3777bb33668108413edde084abca3"
+        },
+        "profile_names": [
+          "attachments",
+          "big-commits",
+          "compaction",
+          "corruption",
+          "crash-storm",
+          "ddl-churn",
+          "encryption",
+          "encryption-attachments",
+          "encryption-replay",
+          "encryption-service",
+          "growth",
+          "large-values",
+          "mixed",
+          "relaxed",
+          "resource",
+          "reuse-under-pins",
+          "service",
+          "service-attachments",
+          "service-relaxed",
+          "spill",
+          "stabilization",
+          "truncation"
+        ],
+        "seeds": [
+          2
+        ],
+        "steps_override": null,
+        "traces": {
+          "attachments-2.sim": "9f94997e56be0de4f0e8a732511eebb147dafe6fa3bcb573b742123ad5aec6b3",
+          "big-commits-2.sim": "eb3a938fdd21f7bb297eb1052c13cde8a24405035c4eab43e9a8c9bdc2655c7a",
+          "compaction-2.sim": "55d31102c59863ae6723c77e46d0673d42606c1725ea4cd6a5bf95501ecf4fe2",
+          "corruption-2.sim": "7c1cc50c4046672c87181b908ce8c8bb4b8eb42c8e93f82883b2974105197d04",
+          "crash-storm-2.sim": "7caa89f41efc4a7d9e7d921f2ffd371441373ba5e9606cdaba1afa3b6c83e94e",
+          "ddl-churn-2.sim": "dd27dc5574ae980ab4abadca66b43dc544396e4f2a22599b4810f02471966f95",
+          "encryption-2.sim": "82772f365a90c373cce4bf00a197f670f660e9f41c436cb229659c8e17cdde93",
+          "encryption-attachments-2.sim": "d6381129e362b7b35d706fd029813f5910a4b867c98b62e1bb55f7717840d2f7",
+          "encryption-replay-2.sim": "24bb475c3c259b9a368fe2f12e64d44b03ae77a8adddb6a27f454b160d1bc216",
+          "encryption-service-2.sim": "3383d896a4c422666afae7414fbbc0316a8bd5986f3c9a33c0b87ab3ceb83a31",
+          "growth-2.sim": "c5196c7a636384cde2340b18fc51242bead7bcb46287cfd4e2125e639ec7708a",
+          "large-values-2.sim": "4cb7b549c4980a659e81e6bc279e6fe91a19174b3cdc327f209128e93ad84dc9",
+          "mixed-2.sim": "40189cf102a5eb555b07d9d6b1f6e331d3b5eccd33974af35268a79d5304892b",
+          "relaxed-2.sim": "79dc80b156c4191087ce802c6b6ca222629e729cb6ba071e5f3f807042f10055",
+          "resource-2.sim": "3c3dd3cf15b62b8627f7a3c8134a02ad8b4a41a232ce03c227cb83475e01bfef",
+          "reuse-under-pins-2.sim": "276c3b213754dfb46940305339291f07511b7905e8fe17867d6773aa3956291b",
+          "service-2.sim": "06d4ca9ac3907a0849d76b3629fc04b427a29330b71c69e54676e8deba9397f5",
+          "service-attachments-2.sim": "b76c448d39214cbbf3fec5c6d8c57bf9fff384aa709068c5df03b2a1b792910a",
+          "service-relaxed-2.sim": "4713508b26d01d088f88afb0fa4e58b91e08ed9726c7b72feaa13bf44b896b09",
+          "spill-2.sim": "47f75c17dca252317b9e49a5d8be997c64b6ca6850e36070ae20df4cb77d1930",
+          "stabilization-2.sim": "43a271758c87f08f6c0b81b1dec822b2074521212406dda1c3ff6ee7a6074a4b",
+          "truncation-2.sim": "152dab7828fb125fe6cfbfb01eb0abb358d17a0a004b6970169009022bdc04e8"
+        }
+      },
+      "results_path": "/tmp/jed-csharp-simulation-sweep-20261113-63-k78bkc/results.json",
+      "results_sha256": "d948f23271c846f7ccee15fe529955300a7d726dca0769f63782e34372a99e40",
+      "results": [
+        {
+          "trace": "attachments-2.sim",
+          "pass": true,
+          "mode": "exact",
+          "status": 0,
+          "log": "/tmp/jed-csharp-simulation-sweep-20261113-63-k78bkc/attachments-2.log",
+          "log_sha256": "ac5f93675a7b0d67f83edf24c3fc0d912b33f5b2ae9c26193fb558b104380824"
+        },
+        {
+          "trace": "big-commits-2.sim",
+          "pass": true,
+          "mode": "exact",
+          "status": 0,
+          "log": "/tmp/jed-csharp-simulation-sweep-20261113-63-k78bkc/big-commits-2.log",
+          "log_sha256": "f1c0a5309e684077ae770f52e770c197f05c97c8ec2f7d87a832e58f58e358f8"
+        },
+        {
+          "trace": "compaction-2.sim",
+          "pass": true,
+          "mode": "exact",
+          "status": 0,
+          "log": "/tmp/jed-csharp-simulation-sweep-20261113-63-k78bkc/compaction-2.log",
+          "log_sha256": "bc6de4ab0d40d01f9819071a3bbc9126bd4360d06280e3a4f9bc9affcc278bb3"
+        },
+        {
+          "trace": "corruption-2.sim",
+          "pass": true,
+          "mode": "intrinsic",
+          "status": 0,
+          "log": "/tmp/jed-csharp-simulation-sweep-20261113-63-k78bkc/corruption-2.log",
+          "log_sha256": "b557f8a274808406a9dfddeb0738193aaee0f65f45b7a72c6f6fc9c0f55e4485"
+        },
+        {
+          "trace": "crash-storm-2.sim",
+          "pass": true,
+          "mode": "exact",
+          "status": 0,
+          "log": "/tmp/jed-csharp-simulation-sweep-20261113-63-k78bkc/crash-storm-2.log",
+          "log_sha256": "b8baf7662e6b1274b911d4b4657a4725c9baf07875134ae52499e67712ab5051"
+        },
+        {
+          "trace": "ddl-churn-2.sim",
+          "pass": true,
+          "mode": "exact",
+          "status": 0,
+          "log": "/tmp/jed-csharp-simulation-sweep-20261113-63-k78bkc/ddl-churn-2.log",
+          "log_sha256": "f9feae5cb02a2b7646f4f250c00eb572fcd7cf802237fb4ea3b95d49262d9c58"
+        },
+        {
+          "trace": "encryption-2.sim",
+          "pass": true,
+          "mode": "exact",
+          "status": 0,
+          "log": "/tmp/jed-csharp-simulation-sweep-20261113-63-k78bkc/encryption-2.log",
+          "log_sha256": "9c8aeafe2abc42c4a6352bed5a5613104f59677f697a9447c5c6fde2ad488e50"
+        },
+        {
+          "trace": "encryption-attachments-2.sim",
+          "pass": true,
+          "mode": "exact",
+          "status": 0,
+          "log": "/tmp/jed-csharp-simulation-sweep-20261113-63-k78bkc/encryption-attachments-2.log",
+          "log_sha256": "11440f17a8b1089edaf2804b747a14919d0a95cf4042fd9591f4294343d4f056"
+        },
+        {
+          "trace": "encryption-replay-2.sim",
+          "pass": true,
+          "mode": "exact",
+          "status": 0,
+          "log": "/tmp/jed-csharp-simulation-sweep-20261113-63-k78bkc/encryption-replay-2.log",
+          "log_sha256": "e5c8981677c3c4c3b1920e51bd8b92ae931dec841a4eef33a552a940ffb419b0"
+        },
+        {
+          "trace": "encryption-service-2.sim",
+          "pass": true,
+          "mode": "exact",
+          "status": 0,
+          "log": "/tmp/jed-csharp-simulation-sweep-20261113-63-k78bkc/encryption-service-2.log",
+          "log_sha256": "3f5c491b0ae59a8544de97979def8f6d71b98e80400560759c293c0062baae34"
+        },
+        {
+          "trace": "growth-2.sim",
+          "pass": true,
+          "mode": "exact",
+          "status": 0,
+          "log": "/tmp/jed-csharp-simulation-sweep-20261113-63-k78bkc/growth-2.log",
+          "log_sha256": "8e24eb87cb160a7e7d8495f72f6840e5c8676f585e3aaad1b6c897808382ee1c"
+        },
+        {
+          "trace": "large-values-2.sim",
+          "pass": true,
+          "mode": "exact",
+          "status": 0,
+          "log": "/tmp/jed-csharp-simulation-sweep-20261113-63-k78bkc/large-values-2.log",
+          "log_sha256": "690db58d999ba958ff01346f1b4ad58a3fbac5cb5c34fcca85775c9db9fbd35c"
+        },
+        {
+          "trace": "mixed-2.sim",
+          "pass": true,
+          "mode": "exact",
+          "status": 0,
+          "log": "/tmp/jed-csharp-simulation-sweep-20261113-63-k78bkc/mixed-2.log",
+          "log_sha256": "52ffab4801b49b8267454795888823863945f076e008e1769e9211ba30c3de70"
+        },
+        {
+          "trace": "relaxed-2.sim",
+          "pass": true,
+          "mode": "exact",
+          "status": 0,
+          "log": "/tmp/jed-csharp-simulation-sweep-20261113-63-k78bkc/relaxed-2.log",
+          "log_sha256": "ff56a040d8d4462b472c3f47a059525fc93c59b1d5150560079a7b2e3e366fe1"
+        },
+        {
+          "trace": "resource-2.sim",
+          "pass": true,
+          "mode": "intrinsic",
+          "status": 0,
+          "log": "/tmp/jed-csharp-simulation-sweep-20261113-63-k78bkc/resource-2.log",
+          "log_sha256": "c7b2ed748e26dc7f70ca468d2c7eb480146e809dcc037b0af71dbfb59bfa078f"
+        },
+        {
+          "trace": "reuse-under-pins-2.sim",
+          "pass": true,
+          "mode": "exact",
+          "status": 0,
+          "log": "/tmp/jed-csharp-simulation-sweep-20261113-63-k78bkc/reuse-under-pins-2.log",
+          "log_sha256": "06411a0c498abb8a20756320ee1c382a21cd623afe3349ace07522513e3cefb6"
+        },
+        {
+          "trace": "service-2.sim",
+          "pass": true,
+          "mode": "exact",
+          "status": 0,
+          "log": "/tmp/jed-csharp-simulation-sweep-20261113-63-k78bkc/service-2.log",
+          "log_sha256": "2a68d31f862a1ee68df68103be02f2734d129c85bcb691a2e48c39d61cc73782"
+        },
+        {
+          "trace": "service-attachments-2.sim",
+          "pass": true,
+          "mode": "exact",
+          "status": 0,
+          "log": "/tmp/jed-csharp-simulation-sweep-20261113-63-k78bkc/service-attachments-2.log",
+          "log_sha256": "d115bf0fbda5aba2a425abe826edbb183f66f9d2b0db8a4fd997b89f3bfe7830"
+        },
+        {
+          "trace": "service-relaxed-2.sim",
+          "pass": true,
+          "mode": "exact",
+          "status": 0,
+          "log": "/tmp/jed-csharp-simulation-sweep-20261113-63-k78bkc/service-relaxed-2.log",
+          "log_sha256": "11a235b1912366a5270342c2333f3743c9b79d42040830204c78532d35f0ab44"
+        },
+        {
+          "trace": "spill-2.sim",
+          "pass": true,
+          "mode": "intrinsic",
+          "status": 0,
+          "log": "/tmp/jed-csharp-simulation-sweep-20261113-63-k78bkc/spill-2.log",
+          "log_sha256": "513eb40ef1937647234e55c6bc19fac45c4f2f49dcf784b904d9db3b7391d1fb"
+        },
+        {
+          "trace": "stabilization-2.sim",
+          "pass": true,
+          "mode": "exact",
+          "status": 0,
+          "log": "/tmp/jed-csharp-simulation-sweep-20261113-63-k78bkc/stabilization-2.log",
+          "log_sha256": "5191b588190fee064c20b19f36fc69702fbf789b9a2b3499878c7022b93a7c49"
+        },
+        {
+          "trace": "truncation-2.sim",
+          "pass": true,
+          "mode": "exact",
+          "status": 0,
+          "log": "/tmp/jed-csharp-simulation-sweep-20261113-63-k78bkc/truncation-2.log",
+          "log_sha256": "7815eb58adeaa4b16099df192e97b75de7ad1ada7ebbe8362d0cc7e3bbd18793"
+        }
+      ]
+    },
+    {
+      "label": "seed3",
+      "command": "mise run csharp-native:simulation-sweep --no-build --assembly /tmp/jed-csharp-storage-capture35/Jed.Check.dll --profile all --seeds 3",
+      "exit_code": 0,
+      "evidence_directory": "/tmp/jed-csharp-simulation-sweep-20261113-63-3vb6ld",
+      "log": "/tmp/jed-csharp-simulation35-seed3.log",
+      "log_sha256": "f6071fa7c682ec0ed9e29692b00ec89e10933625728349c6466934145dd56fa8",
+      "manifest_path": "/tmp/jed-csharp-simulation-sweep-20261113-63-3vb6ld/manifest.json",
+      "manifest_sha256": "34183a554252b215a08a66dd4c7977c51143ce8a95bbc8611ddf5c195fc5712a",
+      "manifest": {
+        "baseline": "b1a6affca7725e0b07a4f734eddb1c569ef76bcf",
+        "generator_sha256": "bd497ee9703f0340f350008fc8de6b04847b20c8ae9f784bb78b392400293b12",
+        "artifacts": {
+          "BouncyCastle.Cryptography.dll": "ef92fc661e8d7ba8ec4d39a7cdfcdba41f14cb327f0d24fe79d0b5bb428899b5",
+          "Jed.CSharpExperiment.dll": "8d61294762ee65ca6023a5d830096fdf698e517ef6eea75fea3bd54dbcdd22a1",
+          "Jed.CSharpExperiment.pdb": "4daf2ad0a47ce5e84dd078e60f71ceef9de9c500a7d36435396e84a706b726fd",
+          "Jed.Check": "249c10d0b1960b61e52091650d52e1009a3977ab07fb135995199317c579b641",
+          "Jed.Check.deps.json": "203fc9a5e456ea866d125285f8d44fb55551ade67bb601392ed0d24a7f8286b4",
+          "Jed.Check.dll": "2227b4855b6cc3f235d90a4dfa8da065056c1b5ca25987c4f6928e034b4fddbf",
+          "Jed.Check.pdb": "9a5edf14142ba8c23979bd346dd8d9c5811b32ebf5b0c699311ba1e97a349f45",
+          "Jed.Check.runtimeconfig.json": "8c019e2c7c9acc0440d8b263897f7b0079b1c6895307921604be20e732900366",
+          "build.json": "85351c219f47ff7fb75b5c8b094256bd1a3c54a801a901ea182a13f64d9817d5",
+          "source.sha256": "44cb82f7b7ae67d624d9fff770d823388222fd316c4551166215cfa9e280b5e5"
+        },
+        "tool_policy_sha256": {
+          "/home/jack/.codex/worktrees/ca26/jed/mise-tasks/csharp-native/simulation": "4c528cada14abf46f74dc3b9f52d493d07491e28cc1cd00ac8aa5ec4acdf1662",
+          "/home/jack/.codex/worktrees/ca26/jed/mise-tasks/csharp-native/simulation-sweep": "81d0a0351153b4d834212007f3ad66ee19f3777bb33668108413edde084abca3"
+        },
+        "profile_names": [
+          "attachments",
+          "big-commits",
+          "compaction",
+          "corruption",
+          "crash-storm",
+          "ddl-churn",
+          "encryption",
+          "encryption-attachments",
+          "encryption-replay",
+          "encryption-service",
+          "growth",
+          "large-values",
+          "mixed",
+          "relaxed",
+          "resource",
+          "reuse-under-pins",
+          "service",
+          "service-attachments",
+          "service-relaxed",
+          "spill",
+          "stabilization",
+          "truncation"
+        ],
+        "seeds": [
+          3
+        ],
+        "steps_override": null,
+        "traces": {
+          "attachments-3.sim": "f81d4e1a82a6d0574173edc1dd105287133af3ca796af7c198bb60a60ec67056",
+          "big-commits-3.sim": "24077552ac4c2f66acd336171d19e966d181846a280844cb051bf85ea7d7fb36",
+          "compaction-3.sim": "0a2687a2a4b0d4be41e7fbf9cad3b1ba04717671b35b6ce7c5284c6c80b875e6",
+          "corruption-3.sim": "5fabba5c51a91cd0e34a144c12c939f6571c16edfa483184a7fc501e0022c135",
+          "crash-storm-3.sim": "9e83d0667a9310028f8b0316947a332c6b98854104e02c61d300d0fa0e584852",
+          "ddl-churn-3.sim": "4ad935e9272ce4fe783a2ce6ad1a287cd7facf61533a14a5be2edf04e38b60d8",
+          "encryption-3.sim": "e1d347d76b31475cbda18b8852403de15de8753d366e196ab65e85051f954bf4",
+          "encryption-attachments-3.sim": "b30e9d8a5e8932a84db735c8964f32e1e472f463163559c30485c00ef086cc48",
+          "encryption-replay-3.sim": "578c254ba1f233d8c37aa06ad2655bf69ffe3ed77a05c84641fde419a1638f75",
+          "encryption-service-3.sim": "ca3c9599ba49d4abf66015027e09c7048c41a9fd9113f8db07cea197d1e63959",
+          "growth-3.sim": "a2b4ccb6b74d8432e09e82249cd8e88130542a6c6285217dd9b49a46a55ade28",
+          "large-values-3.sim": "08b3f9cb29793fa800862be51f674152cca248c7be733349e57186513489f185",
+          "mixed-3.sim": "43ed3a9a5192a1668291d848a510fbe99405a5cba4fc125f263e18cdc4e2c2f4",
+          "relaxed-3.sim": "9580c93b3d50459583afcfdda80ca1b8f9092cc64c9ec4674c86cd33ffb7be67",
+          "resource-3.sim": "3a330de47f7f58d1dcca0ef1cdf1e3ed7d52448b4a9ada3d9d94a1fa3a2ce5cc",
+          "reuse-under-pins-3.sim": "3230a728c6d7e8b17b67b8372aff3fb246bee30457e140c9214313c1792ee204",
+          "service-3.sim": "9d12620138e9e8e15e33cf698831801d681e8bba0c1e2afc40ee181c1953d427",
+          "service-attachments-3.sim": "2c8da74fcce550a10f96974d6b7afe795764f34218e526160addcb38253b7004",
+          "service-relaxed-3.sim": "e08f5619c160ca177e86bb776af507ef2ba5493bc6bd1aad5245cfe848b76cd3",
+          "spill-3.sim": "91c728c6c90a25fb3497cfffb05fbab496ec1e206474db4f13cc934ad186d974",
+          "stabilization-3.sim": "5a229333649b03d3105fcc9f72acda348fa51441a382a59d0d5c990eb5b65f54",
+          "truncation-3.sim": "1c5d191997ff02060c4ee0733a0672abb6fc77c9cb8de2d273f794707d2ae81b"
+        }
+      },
+      "results_path": "/tmp/jed-csharp-simulation-sweep-20261113-63-3vb6ld/results.json",
+      "results_sha256": "af8987ce12940b3fe534b4e3a9e663c2267e294eefd3d59b8027c5e834235a47",
+      "results": [
+        {
+          "trace": "attachments-3.sim",
+          "pass": true,
+          "mode": "exact",
+          "status": 0,
+          "log": "/tmp/jed-csharp-simulation-sweep-20261113-63-3vb6ld/attachments-3.log",
+          "log_sha256": "349f3089f62eb5ec052c5982fc9c303b5dea9fe31696ef7055e0692777f756d7"
+        },
+        {
+          "trace": "big-commits-3.sim",
+          "pass": true,
+          "mode": "exact",
+          "status": 0,
+          "log": "/tmp/jed-csharp-simulation-sweep-20261113-63-3vb6ld/big-commits-3.log",
+          "log_sha256": "e81781c9d36f0497d94eefaf59bfd481583bb0b27753caf238eb5b40e82b4673"
+        },
+        {
+          "trace": "compaction-3.sim",
+          "pass": true,
+          "mode": "exact",
+          "status": 0,
+          "log": "/tmp/jed-csharp-simulation-sweep-20261113-63-3vb6ld/compaction-3.log",
+          "log_sha256": "d0b5aa31bf39a922ffdeb5c946e8055d7ff0b37d7f027f09a373a89044665c05"
+        },
+        {
+          "trace": "corruption-3.sim",
+          "pass": true,
+          "mode": "intrinsic",
+          "status": 0,
+          "log": "/tmp/jed-csharp-simulation-sweep-20261113-63-3vb6ld/corruption-3.log",
+          "log_sha256": "f509be94f1c931e0911cd214d34a7591b6877b7cbc89751aabd4f24b9c19c404"
+        },
+        {
+          "trace": "crash-storm-3.sim",
+          "pass": true,
+          "mode": "exact",
+          "status": 0,
+          "log": "/tmp/jed-csharp-simulation-sweep-20261113-63-3vb6ld/crash-storm-3.log",
+          "log_sha256": "3db32ed22f14400a81bacbda69f43f4942205af8ca43bc8f65199315e3bd2c09"
+        },
+        {
+          "trace": "ddl-churn-3.sim",
+          "pass": true,
+          "mode": "exact",
+          "status": 0,
+          "log": "/tmp/jed-csharp-simulation-sweep-20261113-63-3vb6ld/ddl-churn-3.log",
+          "log_sha256": "da6f0a415c49b50f332427b94d7bc70b830083678c4f35f255fb211bd2321bb9"
+        },
+        {
+          "trace": "encryption-3.sim",
+          "pass": true,
+          "mode": "exact",
+          "status": 0,
+          "log": "/tmp/jed-csharp-simulation-sweep-20261113-63-3vb6ld/encryption-3.log",
+          "log_sha256": "9fd382bdcfb40a89da84b5cb4456ae704ebd9fb6b3505b6be88d36f3dd33fd3c"
+        },
+        {
+          "trace": "encryption-attachments-3.sim",
+          "pass": true,
+          "mode": "exact",
+          "status": 0,
+          "log": "/tmp/jed-csharp-simulation-sweep-20261113-63-3vb6ld/encryption-attachments-3.log",
+          "log_sha256": "3f49c0b9c30b736fb698d43ce4022d8ce911de68d1ac5ef659043edca27d0c09"
+        },
+        {
+          "trace": "encryption-replay-3.sim",
+          "pass": true,
+          "mode": "exact",
+          "status": 0,
+          "log": "/tmp/jed-csharp-simulation-sweep-20261113-63-3vb6ld/encryption-replay-3.log",
+          "log_sha256": "6a0f53fa1e127b36d5e659478cc9a9fbae18df5aa024933009d5a3f3650a1f96"
+        },
+        {
+          "trace": "encryption-service-3.sim",
+          "pass": true,
+          "mode": "exact",
+          "status": 0,
+          "log": "/tmp/jed-csharp-simulation-sweep-20261113-63-3vb6ld/encryption-service-3.log",
+          "log_sha256": "cc91cb3c772d73264a0d398e41c7893a7fae17040505ba93719f47627b585364"
+        },
+        {
+          "trace": "growth-3.sim",
+          "pass": true,
+          "mode": "exact",
+          "status": 0,
+          "log": "/tmp/jed-csharp-simulation-sweep-20261113-63-3vb6ld/growth-3.log",
+          "log_sha256": "2d0d8ac317e5a7a1ab85cb982a8dc4b7b7cce1b58056f99e32b0b2c1f5cd2f16"
+        },
+        {
+          "trace": "large-values-3.sim",
+          "pass": true,
+          "mode": "exact",
+          "status": 0,
+          "log": "/tmp/jed-csharp-simulation-sweep-20261113-63-3vb6ld/large-values-3.log",
+          "log_sha256": "ffa0210cbc0c684b7b54176c3275f6135d7305cf6b7f9620c59030b1d126f204"
+        },
+        {
+          "trace": "mixed-3.sim",
+          "pass": true,
+          "mode": "exact",
+          "status": 0,
+          "log": "/tmp/jed-csharp-simulation-sweep-20261113-63-3vb6ld/mixed-3.log",
+          "log_sha256": "1b4f79109c066ab903ca9c1ce8d782424d73a4235fc2df6faad54671197d8ca7"
+        },
+        {
+          "trace": "relaxed-3.sim",
+          "pass": true,
+          "mode": "exact",
+          "status": 0,
+          "log": "/tmp/jed-csharp-simulation-sweep-20261113-63-3vb6ld/relaxed-3.log",
+          "log_sha256": "81dc485c8dd550ff69472d870f830d4ed6c8142f7defc3a06d370a9d4dea592e"
+        },
+        {
+          "trace": "resource-3.sim",
+          "pass": true,
+          "mode": "intrinsic",
+          "status": 0,
+          "log": "/tmp/jed-csharp-simulation-sweep-20261113-63-3vb6ld/resource-3.log",
+          "log_sha256": "efd448efec8f169c31c07e52576d4200f0ebcc539bf1ea9f4eee6ea644fd76a4"
+        },
+        {
+          "trace": "reuse-under-pins-3.sim",
+          "pass": true,
+          "mode": "exact",
+          "status": 0,
+          "log": "/tmp/jed-csharp-simulation-sweep-20261113-63-3vb6ld/reuse-under-pins-3.log",
+          "log_sha256": "781498727e0f31cbfb47e68c47abfb85c4c7ed65b003096968c017bd86815b20"
+        },
+        {
+          "trace": "service-3.sim",
+          "pass": true,
+          "mode": "exact",
+          "status": 0,
+          "log": "/tmp/jed-csharp-simulation-sweep-20261113-63-3vb6ld/service-3.log",
+          "log_sha256": "4ce5365f2f3d329d1ad823de3ce09f1b97833fce8cfc157a721156b3c56a930e"
+        },
+        {
+          "trace": "service-attachments-3.sim",
+          "pass": true,
+          "mode": "exact",
+          "status": 0,
+          "log": "/tmp/jed-csharp-simulation-sweep-20261113-63-3vb6ld/service-attachments-3.log",
+          "log_sha256": "2051f65108fbfc47b95aa4d439b535affc4b5a007eaf989695451fe69dbb3599"
+        },
+        {
+          "trace": "service-relaxed-3.sim",
+          "pass": true,
+          "mode": "exact",
+          "status": 0,
+          "log": "/tmp/jed-csharp-simulation-sweep-20261113-63-3vb6ld/service-relaxed-3.log",
+          "log_sha256": "ed45ff06a4afa0e4c6f21d7e336c3a39e07ecf6d929491cc905649e367c05b69"
+        },
+        {
+          "trace": "spill-3.sim",
+          "pass": true,
+          "mode": "intrinsic",
+          "status": 0,
+          "log": "/tmp/jed-csharp-simulation-sweep-20261113-63-3vb6ld/spill-3.log",
+          "log_sha256": "2a8510ad1492e2e71f574047e311434870a65fb4929506311d1585cf60576f04"
+        },
+        {
+          "trace": "stabilization-3.sim",
+          "pass": true,
+          "mode": "exact",
+          "status": 0,
+          "log": "/tmp/jed-csharp-simulation-sweep-20261113-63-3vb6ld/stabilization-3.log",
+          "log_sha256": "a806bf546d3b18bd9cc9afeccdffcef0b5c260231f574c3aa8d6568fcd599264"
+        },
+        {
+          "trace": "truncation-3.sim",
+          "pass": true,
+          "mode": "exact",
+          "status": 0,
+          "log": "/tmp/jed-csharp-simulation-sweep-20261113-63-3vb6ld/truncation-3.log",
+          "log_sha256": "f91a90f8080e06b9086ea2e27a91552a75d9f37a895b1fdfa0fdab09f6b9626a"
+        }
+      ]
+    }
+  ]
+}

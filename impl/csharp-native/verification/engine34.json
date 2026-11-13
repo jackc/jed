@@ -1,0 +1,425 @@
+{
+  "semantic_revision": "b1a6affca7725e0b07a4f734eddb1c569ef76bcf",
+  "source_sha256": "7124c0e6a67e3fb3955ef6df359faaa94d8d375702b887b72cc439a851a51594",
+  "artifacts": {
+    "jit": {
+      "directory": "/tmp/jed-csharp-storage-capture34",
+      "build": {
+        "source_sha256": "7124c0e6a67e3fb3955ef6df359faaa94d8d375702b887b72cc439a851a51594",
+        "sdk": "11.0.100",
+        "configuration": "Release",
+        "runtime_async": false,
+        "compilation": "jit"
+      },
+      "sha256": {
+        "Jed.Check.pdb": "796623854eef084ee83071fcaabf070c63b2bd300979265c8f96064939a5810c",
+        "BouncyCastle.Cryptography.dll": "ef92fc661e8d7ba8ec4d39a7cdfcdba41f14cb327f0d24fe79d0b5bb428899b5",
+        "Jed.Check": "249c10d0b1960b61e52091650d52e1009a3977ab07fb135995199317c579b641",
+        "source.sha256": "8fb2bbd81fd4b5fb19eb2d4367a244a0ef8e4a33c57349dd92ad38046c22673c",
+        "Jed.Check.deps.json": "203fc9a5e456ea866d125285f8d44fb55551ade67bb601392ed0d24a7f8286b4",
+        "Jed.Check.dll": "1b3da17d1b8f6174b8f3d373a748b8174a0a5d68c1cf57d86688f8cf0e522521",
+        "Jed.CSharpExperiment.pdb": "4daf2ad0a47ce5e84dd078e60f71ceef9de9c500a7d36435396e84a706b726fd",
+        "build.json": "40a2c48ebed193828b8012ebe3eaa053b61bba0cc78b470b67fdd4ef09cc2978",
+        "Jed.Check.runtimeconfig.json": "8c019e2c7c9acc0440d8b263897f7b0079b1c6895307921604be20e732900366",
+        "Jed.CSharpExperiment.dll": "8d61294762ee65ca6023a5d830096fdf698e517ef6eea75fea3bd54dbcdd22a1"
+      }
+    },
+    "jit-runtime-async": {
+      "directory": "/tmp/jed-csharp-runtime-capture34",
+      "build": {
+        "source_sha256": "7124c0e6a67e3fb3955ef6df359faaa94d8d375702b887b72cc439a851a51594",
+        "sdk": "11.0.100",
+        "configuration": "Release",
+        "runtime_async": true,
+        "compilation": "jit"
+      },
+      "sha256": {
+        "Jed.Check.pdb": "c2522ccf9db855a27adfc156fa1c65a71b8866209e27744b0f695db9e19a9eb7",
+        "BouncyCastle.Cryptography.dll": "ef92fc661e8d7ba8ec4d39a7cdfcdba41f14cb327f0d24fe79d0b5bb428899b5",
+        "Jed.Check": "249c10d0b1960b61e52091650d52e1009a3977ab07fb135995199317c579b641",
+        "source.sha256": "8fb2bbd81fd4b5fb19eb2d4367a244a0ef8e4a33c57349dd92ad38046c22673c",
+        "Jed.Check.deps.json": "203fc9a5e456ea866d125285f8d44fb55551ade67bb601392ed0d24a7f8286b4",
+        "Jed.Check.dll": "5ceeadd471c1c92f2e16778783e33f14da12221ec0b3f0c3685012af27b39e45",
+        "Jed.CSharpExperiment.pdb": "60eabb5068a2bb32d85444b8bd59d93e4f1c5d58a2bea2dcb0ae7c6abea1f684",
+        "build.json": "9d16051f38641b41b1bf89c03ad4b2b5a5872f089e76a87ea3226b4f567db0f2",
+        "Jed.Check.runtimeconfig.json": "8c019e2c7c9acc0440d8b263897f7b0079b1c6895307921604be20e732900366",
+        "Jed.CSharpExperiment.dll": "cb3a3bb76b3fbe5d13781b8c7649e1cc1417f4340d72c2008933d8d3ad00aa24"
+      }
+    },
+    "aot": {
+      "directory": "/home/jack/.codex/worktrees/ca26/jed/impl/csharp-native/.build/aot/default",
+      "build": {
+        "source_sha256": "7124c0e6a67e3fb3955ef6df359faaa94d8d375702b887b72cc439a851a51594",
+        "sdk": "11.0.100",
+        "configuration": "Release",
+        "runtime_async": false,
+        "compilation": "nativeaot",
+        "instructions": "default"
+      },
+      "sha256": {
+        "build.json": "5125f3de57ad780cc636cb594ab67e4f51d1ffdb0f698b87721001259c69cf1a",
+        "Jed.Check.dbg": "7f165ebc62531b9a60a4e645f67e00520cc943e57810211861579d509fc7371a",
+        "Jed.CSharpExperiment.pdb": "90fa8625e4b0bff4eb7448f589418bddbf878ad5db8bcd2fc8e4a1b078523d76",
+        "source.sha256": "8fb2bbd81fd4b5fb19eb2d4367a244a0ef8e4a33c57349dd92ad38046c22673c",
+        "Jed.Check": "eb5ec6dbf049bc11327f1d577c835d06a322c84583b14c6a71032d14be9da5b5"
+      }
+    },
+    "aot-runtime-async": {
+      "directory": "/home/jack/.codex/worktrees/ca26/jed/impl/csharp-native/.build/aot/runtime-async",
+      "build": {
+        "source_sha256": "7124c0e6a67e3fb3955ef6df359faaa94d8d375702b887b72cc439a851a51594",
+        "sdk": "11.0.100",
+        "configuration": "Release",
+        "runtime_async": true,
+        "compilation": "nativeaot",
+        "instructions": "default"
+      },
+      "sha256": {
+        "build.json": "73982ba3e82c96a43aead8b456aae5e9d28124a14296e397fb922e6143ea8b5d",
+        "Jed.Check.dbg": "229610851bacb1f801c9ac23f73ac1679286f64c2299c9d02052eb0f7d483595",
+        "Jed.CSharpExperiment.pdb": "82cdfc01f0cd55ef5c1344a1c557e079b84c3ec57137fcc643b825f83e2b70b4",
+        "source.sha256": "8fb2bbd81fd4b5fb19eb2d4367a244a0ef8e4a33c57349dd92ad38046c22673c",
+        "Jed.Check": "e55c82101326c3d17c2613a5000a3a1958df4c49314a84cf968ddc5032d1b339"
+      }
+    },
+    "verification": {
+      "runtime-memory": {
+        "log": "/tmp/jed-csharp-full-runtime-memory34.log",
+        "summary": "763 selected files, 21954 records in passing files, 0 failed files, 2 declared mode exclusions; no full-parity claim",
+        "sha256": "490ff6c973d658d7bd1359496c2827d3a99d2e19864a22fb776fb1abbcd63152",
+        "exit_code": 0
+      },
+      "runtime-disk": {
+        "log": "/tmp/jed-csharp-full-runtime-disk34.log",
+        "summary": "763 selected files, 19800 records in passing files, 0 failed files, 86 declared mode exclusions; no full-parity claim",
+        "sha256": "b404397018ce6bae11b18047937f9762c5fe59ff9677084911f4ce4920ae2390",
+        "exit_code": 0
+      },
+      "runtime-encrypted": {
+        "log": "/tmp/jed-csharp-full-runtime-encrypted34.log",
+        "summary": "763 selected files, 19765 records in passing files, 0 failed files, 87 declared mode exclusions; no full-parity claim",
+        "sha256": "f9605f09df6f7396782688fd24f5aab91b0385bbd75e2c319442c33d1062bdeb",
+        "exit_code": 0
+      },
+      "aot-memory": {
+        "log": "/tmp/jed-csharp-full-aot-memory34.log",
+        "summary": "763 selected files, 21954 records in passing files, 0 failed files, 2 declared mode exclusions; no full-parity claim",
+        "sha256": "90322a2f3a49a721784cbefb33d2ebd39788f19fcc8c43d84136f9cc313555c9",
+        "exit_code": 0
+      },
+      "aot-disk": {
+        "log": "/tmp/jed-csharp-full-aot-disk34.log",
+        "summary": "763 selected files, 19800 records in passing files, 0 failed files, 86 declared mode exclusions; no full-parity claim",
+        "sha256": "808e714174140a254dd4e13aa402503990de810a1896c13599cb0f401b5c9301",
+        "exit_code": 0
+      },
+      "aot-encrypted": {
+        "log": "/tmp/jed-csharp-full-aot-encrypted34.log",
+        "summary": "763 selected files, 19765 records in passing files, 0 failed files, 87 declared mode exclusions; no full-parity claim",
+        "sha256": "f0c9269c80c6e0139d6a0779a2f5c5146cc4bc8032163773545cbfaabfeb2174",
+        "exit_code": 0
+      },
+      "aot-runtime-memory": {
+        "log": "/tmp/jed-csharp-full-aot-runtime-memory34.log",
+        "summary": "763 selected files, 21954 records in passing files, 0 failed files, 2 declared mode exclusions; no full-parity claim",
+        "sha256": "c3032d38c3ec4debb26ba68b5388d729e6fdf5c1fe6060fbef1a1945166a7f8d",
+        "exit_code": 0
+      },
+      "aot-runtime-disk": {
+        "log": "/tmp/jed-csharp-full-aot-runtime-disk34.log",
+        "summary": "763 selected files, 19800 records in passing files, 0 failed files, 86 declared mode exclusions; no full-parity claim",
+        "sha256": "709a831930d38f062f48d82863733a83c4c6bb32e8e039dfe60a2f4df1a501e0",
+        "exit_code": 0
+      },
+      "aot-runtime-encrypted": {
+        "log": "/tmp/jed-csharp-full-aot-runtime-encrypted34.log",
+        "summary": "763 selected files, 19765 records in passing files, 0 failed files, 87 declared mode exclusions; no full-parity claim",
+        "sha256": "2bd311080cf61c4f7127095196649d71f283a83c5b97da71c5117e7f92fa95ba",
+        "exit_code": 0
+      }
+    }
+  },
+  "sql": [
+    {
+      "variant": "jit",
+      "storage": "memory",
+      "selected": 763,
+      "passed": 761,
+      "records": 21954,
+      "failed": 0,
+      "declared_exclusions": 2,
+      "log": "/tmp/jed-csharp-final34-memory.log",
+      "log_sha256": "56ea21f66237b28b6166a3b7a43104ebd50a02d47cb2edea0718cf55ad635b36"
+    },
+    {
+      "variant": "jit",
+      "storage": "disk",
+      "selected": 763,
+      "passed": 677,
+      "records": 19800,
+      "failed": 0,
+      "declared_exclusions": 86,
+      "log": "/tmp/jed-csharp-final34-disk.log",
+      "log_sha256": "538a4beb6034affcde9988894eaee81416a7a0e9efdf9c827dcb9add8b83f895"
+    },
+    {
+      "variant": "jit",
+      "storage": "encrypted",
+      "selected": 763,
+      "passed": 676,
+      "records": 19765,
+      "failed": 0,
+      "declared_exclusions": 87,
+      "log": "/tmp/jed-csharp-final34-encrypted.log",
+      "log_sha256": "e5a700e2d3dfca44275d4cdf1c95d474e465d6af477140812a98bb725484d434"
+    },
+    {
+      "variant": "jit-runtime-async",
+      "storage": "memory",
+      "selected": 763,
+      "passed": 761,
+      "records": 21954,
+      "failed": 0,
+      "declared_exclusions": 2,
+      "log": "/tmp/jed-csharp-full-runtime-memory34.log",
+      "log_sha256": "490ff6c973d658d7bd1359496c2827d3a99d2e19864a22fb776fb1abbcd63152"
+    },
+    {
+      "variant": "jit-runtime-async",
+      "storage": "disk",
+      "selected": 763,
+      "passed": 677,
+      "records": 19800,
+      "failed": 0,
+      "declared_exclusions": 86,
+      "log": "/tmp/jed-csharp-full-runtime-disk34.log",
+      "log_sha256": "b404397018ce6bae11b18047937f9762c5fe59ff9677084911f4ce4920ae2390"
+    },
+    {
+      "variant": "jit-runtime-async",
+      "storage": "encrypted",
+      "selected": 763,
+      "passed": 676,
+      "records": 19765,
+      "failed": 0,
+      "declared_exclusions": 87,
+      "log": "/tmp/jed-csharp-full-runtime-encrypted34.log",
+      "log_sha256": "f9605f09df6f7396782688fd24f5aab91b0385bbd75e2c319442c33d1062bdeb"
+    },
+    {
+      "variant": "aot",
+      "storage": "memory",
+      "selected": 763,
+      "passed": 761,
+      "records": 21954,
+      "failed": 0,
+      "declared_exclusions": 2,
+      "log": "/tmp/jed-csharp-full-aot-memory34.log",
+      "log_sha256": "90322a2f3a49a721784cbefb33d2ebd39788f19fcc8c43d84136f9cc313555c9"
+    },
+    {
+      "variant": "aot",
+      "storage": "disk",
+      "selected": 763,
+      "passed": 677,
+      "records": 19800,
+      "failed": 0,
+      "declared_exclusions": 86,
+      "log": "/tmp/jed-csharp-full-aot-disk34.log",
+      "log_sha256": "808e714174140a254dd4e13aa402503990de810a1896c13599cb0f401b5c9301"
+    },
+    {
+      "variant": "aot",
+      "storage": "encrypted",
+      "selected": 763,
+      "passed": 676,
+      "records": 19765,
+      "failed": 0,
+      "declared_exclusions": 87,
+      "log": "/tmp/jed-csharp-full-aot-encrypted34.log",
+      "log_sha256": "f0c9269c80c6e0139d6a0779a2f5c5146cc4bc8032163773545cbfaabfeb2174"
+    },
+    {
+      "variant": "aot-runtime-async",
+      "storage": "memory",
+      "selected": 763,
+      "passed": 761,
+      "records": 21954,
+      "failed": 0,
+      "declared_exclusions": 2,
+      "log": "/tmp/jed-csharp-full-aot-runtime-memory34.log",
+      "log_sha256": "c3032d38c3ec4debb26ba68b5388d729e6fdf5c1fe6060fbef1a1945166a7f8d"
+    },
+    {
+      "variant": "aot-runtime-async",
+      "storage": "disk",
+      "selected": 763,
+      "passed": 677,
+      "records": 19800,
+      "failed": 0,
+      "declared_exclusions": 86,
+      "log": "/tmp/jed-csharp-full-aot-runtime-disk34.log",
+      "log_sha256": "709a831930d38f062f48d82863733a83c4c6bb32e8e039dfe60a2f4df1a501e0"
+    },
+    {
+      "variant": "aot-runtime-async",
+      "storage": "encrypted",
+      "selected": 763,
+      "passed": 676,
+      "records": 19765,
+      "failed": 0,
+      "declared_exclusions": 87,
+      "log": "/tmp/jed-csharp-full-aot-runtime-encrypted34.log",
+      "log_sha256": "2bd311080cf61c4f7127095196649d71f283a83c5b97da71c5117e7f92fa95ba"
+    }
+  ],
+  "distinct_sql_files_passing_across_storage_modes": 763,
+  "host_logs": {
+    "jit": {
+      "path": "/tmp/jed-csharp-host-capture34.log",
+      "sha256": "0bafeb73f87fc65ce21adedb2ad2786ce2011dd2c1fb847874b291f20fdb6f0e"
+    },
+    "jit-runtime-async": {
+      "path": "/tmp/jed-csharp-runtime-host34.log",
+      "sha256": "a608d40f73e4f4ad6dd9f755d59b0a2023fe10e08d67b638f3606673a65c8d69"
+    },
+    "aot": {
+      "path": "/tmp/jed-csharp-aot34.log",
+      "sha256": "d378722636e5ef369eda2bacdab15e2dcc5e2ba07dc664393726d3e676355115"
+    },
+    "aot-runtime-async": {
+      "path": "/tmp/jed-csharp-aot-runtime34.log",
+      "sha256": "c26e0b049f1a663a8b7570bf1caec2af52a0ffaa01ba6cf3786e2cbd81815ff4"
+    }
+  },
+  "encrypted_transcripts": {
+    "jit": {
+      "path": "/tmp/jed-csharp-encrypted34.tsv",
+      "sha256": "c692430ab8bcfd11335a4af171ff35dc4cdb26e125a0b8c068fdb4116ed65f1f",
+      "events": 2761
+    },
+    "jit-runtime-async": {
+      "path": "/tmp/jed-csharp-runtime-encrypted34.tsv",
+      "sha256": "c692430ab8bcfd11335a4af171ff35dc4cdb26e125a0b8c068fdb4116ed65f1f",
+      "events": 2761
+    },
+    "aot": {
+      "path": "/tmp/jed-csharp-aot-encrypted34.tsv",
+      "sha256": "c692430ab8bcfd11335a4af171ff35dc4cdb26e125a0b8c068fdb4116ed65f1f",
+      "events": 2761
+    },
+    "aot-runtime-async": {
+      "path": "/tmp/jed-csharp-aot-runtime-encrypted34.tsv",
+      "sha256": "c692430ab8bcfd11335a4af171ff35dc4cdb26e125a0b8c068fdb4116ed65f1f",
+      "events": 2761
+    }
+  },
+  "encrypted-peer": {
+    "log": "/tmp/jed-csharp-final34-encrypted-peer.log",
+    "sha256": "852e472d00e1b98e39e86e3b6b9e2733e73b9b7f55bfe9f6aea9d07b8454c59f",
+    "summary": "676/676 complete row/type/error-passing encrypted files match independent pinned cost/EXPLAIN transcripts (2761 events); 0 mismatches. Other files remain outside this passing subset."
+  },
+  "process": {
+    "log": "/tmp/jed-csharp-final34-process.log",
+    "sha256": "2a22aadb1569606742447d7451cb0965f93e059b7be7911dd8a1276c9c4ee861",
+    "summary": "process conformance OK (csharp-native, go, rust, node pairings)"
+  },
+  "stress": {
+    "log": "/tmp/jed-csharp-final34-stress.log",
+    "sha256": "c84960479eadb75367d7deaff8dfc0868c100da4bff15e463f6f2b163c3b63dc",
+    "summary": "PASS parallel stress: 3 C# storage modes and pinned Go, 16000 snapshot checks, exact final checksum f3e75496a3111181"
+  },
+  "stress_report": {
+    "baseline": "b1a6affca7725e0b07a4f734eddb1c569ef76bcf",
+    "profiles": {
+      "balance_transfer.stress.toml": "474d387221395587874f488b5de52e9cac2d6001f93d64ad56834a9b5abb67d8"
+    },
+    "csharp_artifacts": {
+      "BouncyCastle.Cryptography.dll": "ef92fc661e8d7ba8ec4d39a7cdfcdba41f14cb327f0d24fe79d0b5bb428899b5",
+      "Jed.CSharpExperiment.dll": "8d61294762ee65ca6023a5d830096fdf698e517ef6eea75fea3bd54dbcdd22a1",
+      "Jed.CSharpExperiment.pdb": "4daf2ad0a47ce5e84dd078e60f71ceef9de9c500a7d36435396e84a706b726fd",
+      "Jed.Check": "249c10d0b1960b61e52091650d52e1009a3977ab07fb135995199317c579b641",
+      "Jed.Check.deps.json": "203fc9a5e456ea866d125285f8d44fb55551ade67bb601392ed0d24a7f8286b4",
+      "Jed.Check.dll": "1b3da17d1b8f6174b8f3d373a748b8174a0a5d68c1cf57d86688f8cf0e522521",
+      "Jed.Check.pdb": "796623854eef084ee83071fcaabf070c63b2bd300979265c8f96064939a5810c",
+      "Jed.Check.runtimeconfig.json": "8c019e2c7c9acc0440d8b263897f7b0079b1c6895307921604be20e732900366",
+      "build.json": "40a2c48ebed193828b8012ebe3eaa053b61bba0cc78b470b67fdd4ef09cc2978",
+      "source.sha256": "8fb2bbd81fd4b5fb19eb2d4367a244a0ef8e4a33c57349dd92ad38046c22673c"
+    },
+    "go_actor": "85496778c2594e327378e5f20202e8a5659972e0ef5f4ba2b138a4ef77b937b7",
+    "results": [
+      {
+        "schema": 1,
+        "name": "balance-transfer-sum-invariant",
+        "lang": "csharp-native",
+        "storage": "memory",
+        "mode": "threaded",
+        "status": "pass",
+        "invariant_checks": 4000,
+        "writers": 4,
+        "writer_iters": 1000,
+        "final_ok": true,
+        "checksum": "f3e75496a3111181",
+        "cross_core_checksum": true,
+        "duration_ms": 1003
+      },
+      {
+        "schema": 1,
+        "name": "balance-transfer-sum-invariant",
+        "lang": "csharp-native",
+        "storage": "disk",
+        "mode": "threaded",
+        "status": "pass",
+        "invariant_checks": 4000,
+        "writers": 4,
+        "writer_iters": 1000,
+        "final_ok": true,
+        "checksum": "f3e75496a3111181",
+        "cross_core_checksum": true,
+        "duration_ms": 1316
+      },
+      {
+        "schema": 1,
+        "name": "balance-transfer-sum-invariant",
+        "lang": "csharp-native",
+        "storage": "encrypted",
+        "mode": "threaded",
+        "status": "pass",
+        "invariant_checks": 4000,
+        "writers": 4,
+        "writer_iters": 1000,
+        "final_ok": true,
+        "checksum": "f3e75496a3111181",
+        "cross_core_checksum": true,
+        "duration_ms": 1290
+      },
+      {
+        "schema": 1,
+        "name": "balance-transfer-sum-invariant",
+        "lang": "go",
+        "mode": "threaded",
+        "status": "pass",
+        "invariant_checks": 4000,
+        "writers": 4,
+        "writer_iters": 1000,
+        "final_ok": true,
+        "checksum": "f3e75496a3111181",
+        "cross_core_checksum": true,
+        "duration_ms": 140
+      }
+    ],
+    "failures": []
+  },
+  "normal_checks": {
+    "codegen": {
+      "log": "/tmp/jed-csharp-codegen34.log",
+      "sha256": "637fba4fdc7138a04de1f41affde750c3c59dad888e5f8ecefa283debd2596be",
+      "exit_code": 0
+    },
+    "verify": {
+      "log": "/tmp/jed-csharp-verify34.log",
+      "sha256": "652cd2d2961b62a3e3fcc2bc12519cab6b71ccfb6f3cb7d719613192eed5a453",
+      "exit_code": 0
+    }
+  }
+}

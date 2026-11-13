@@ -9,6 +9,8 @@ internal sealed class DomainLease : IDisposable, IAsyncDisposable
         internal readonly Database Root = root;
         internal readonly List<(Database Database, PendingDatabase Pending)> Writers = [];
         internal readonly Dictionary<Database, Database.SnapshotPin> Pins = [];
+        internal readonly List<PageClientStore> RetainedStores = [];
+        internal System.Runtime.ExceptionServices.ExceptionDispatchInfo? ProtectionFailure;
         internal int References = 1;
         internal bool WritersReleased;
     }
@@ -24,7 +26,13 @@ internal sealed class DomainLease : IDisposable, IAsyncDisposable
             shared.References++; return new(shared, Scope);
         }
     }
-    internal void CheckRoles() { foreach (var pin in shared.Pins.Values) pin.CheckRole(); }
+    internal void CheckRoles()
+    {
+        shared.ProtectionFailure?.Throw();
+        foreach (var pin in shared.Pins.Values) pin.CheckRole();
+        if (!shared.WritersReleased)
+            foreach (var writer in shared.Writers) writer.Database.CheckPendingRole(writer.Pending);
+    }
     internal static async ValueTask<DomainLease> Acquire(Database root, Database? temporary, bool writePersistent, bool writeTemporary, CancellationToken token)
     {
         var registry = root.AcquireAttachmentRegistry(); var shared = new Shared(root);
@@ -43,9 +51,15 @@ internal sealed class DomainLease : IDisposable, IAsyncDisposable
             {
                 foreach (var entry in entries)
                 {
-                    var pin = await entry.Database.PinAsync(token).ConfigureAwait(false); shared.Pins.Add(entry.Database, pin);
                     var pending = shared.Writers.FirstOrDefault(writer => ReferenceEquals(writer.Database, entry.Database)).Pending;
-                    domains.Add(new(entry.Name, entry.Database, pending?.Before ?? pin.Snapshot, pending, entry.ReadOnly));
+                    DatabaseSnapshot snapshot;
+                    if (pending is not null) snapshot = pending.Before;
+                    else
+                    {
+                        var pin = await entry.Database.PinAsync(token).ConfigureAwait(false);
+                        shared.Pins.Add(entry.Database, pin); snapshot = pin.Snapshot;
+                    }
+                    domains.Add(new(entry.Name, entry.Database, snapshot, pending, entry.ReadOnly));
                 }
             }
             finally { root.DomainPublication.Release(); }
@@ -58,27 +72,59 @@ internal sealed class DomainLease : IDisposable, IAsyncDisposable
             throw;
         }
     }
-    // A writer gate protects its pending roots without a reader watermark. A
-    // cursor retaining this lease still needs those old roots after publication.
-    internal async ValueTask ReleaseWriterPinsForCommitAsync()
+    // The writer grant protects these roots until publication. Only a cursor
+    // that outlives that grant needs an additional independent reader pin.
+    internal async ValueTask PrepareWriterPinsForCommitAsync()
     {
-        List<Database.SnapshotPin> released = [];
-        lock (shared)
+        shared.ProtectionFailure?.Throw();
+        try
         {
-            if (shared.References != 1) return;
             foreach (var writer in shared.Writers)
-                if (shared.Pins.Remove(writer.Database, out var pin)) released.Add(pin);
+            {
+                lock (shared)
+                    if (shared.References <= 1 || shared.Pins.ContainsKey(writer.Database)) continue;
+                writer.Database.CheckPendingRole(writer.Pending);
+                var pin = await writer.Database.PinAsync().ConfigureAwait(false);
+                try { writer.Database.CheckPendingRole(writer.Pending); }
+                catch { await pin.DisposeAsync().ConfigureAwait(false); throw; }
+                if (pin.Snapshot.Meta.TransactionId != writer.Pending.Before.Meta.TransactionId)
+                {
+                    await pin.DisposeAsync().ConfigureAwait(false);
+                    throw new InvalidOperationException("retained writer roots changed before reader pin admission");
+                }
+                var keep = false;
+                lock (shared)
+                {
+                    if (shared.References > 1)
+                    {
+                        shared.Pins.Add(writer.Database, pin); keep = true;
+                        // Existing cursors retain the writer's pager, not the new
+                        // reader pager. Keep its byte store alive under this pin.
+                        if (writer.Pending.FileWrite is { Store: { } store } context)
+                        { context.Store = null; shared.RetainedStores.Add(store); }
+                    }
+                }
+                if (!keep) await pin.DisposeAsync().ConfigureAwait(false);
+            }
         }
-        foreach (var pin in released) await pin.DisposeAsync().ConfigureAwait(false);
+        catch (Exception error)
+        {
+            // A surviving cursor must fail closed when its old roots could not
+            // be protected, even after every writer grant has been released.
+            lock (shared) shared.ProtectionFailure ??= System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(error);
+            throw;
+        }
     }
     internal async ValueTask ReleaseWriters()
     {
+        Exception? failure = null;
+        try { if (!shared.WritersReleased) await PrepareWriterPinsForCommitAsync().ConfigureAwait(false); }
+        catch (Exception error) { failure = error; }
         lock (shared)
         {
             if (shared.WritersReleased) return;
             shared.WritersReleased = true;
         }
-        Exception? failure = null;
         foreach (var writer in shared.Writers.AsEnumerable().Reverse())
             try { await writer.Database.EndWriteAsync(writer.Pending).ConfigureAwait(false); }
             catch (Exception error) { failure ??= error; }
@@ -97,6 +143,9 @@ internal sealed class DomainLease : IDisposable, IAsyncDisposable
         try { await ReleaseWriters().ConfigureAwait(false); } catch (Exception error) { failure = error; }
         foreach (var pin in shared.Pins.Values)
             try { await pin.DisposeAsync().ConfigureAwait(false); }
+            catch (Exception error) { failure ??= error; }
+        foreach (var store in shared.RetainedStores)
+            try { await store.DisposeAsync().ConfigureAwait(false); }
             catch (Exception error) { failure ??= error; }
         shared.Root.ReleaseAttachmentRegistry();
         if (failure is not null) System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(failure).Throw();

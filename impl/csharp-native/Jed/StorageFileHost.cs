@@ -9,6 +9,13 @@ internal interface IFileHost
 {
     ValueTask<bool> ExistsAsync(string path, CancellationToken token = default);
     ValueTask<IBlockStore> OpenAsync(string path, FileMode mode, bool readOnly = false, CancellationToken token = default);
+    // Replace a reserved maintenance sibling. Native hosts unlink first and
+    // then claim it exclusively; crash hosts model this whole creation step.
+    async ValueTask<IBlockStore> CreateTemporaryAsync(string path, CancellationToken token = default)
+    {
+        await DeleteAsync(path, token).ConfigureAwait(false);
+        return await OpenAsync(path, FileMode.CreateNew, token: token).ConfigureAwait(false);
+    }
     ValueTask DeleteAsync(string path, CancellationToken token = default);
     ValueTask MoveAsync(string source, string destination, bool overwrite, CancellationToken token = default);
     ValueTask<int?> GetPermissionsAsync(string path, CancellationToken token = default);

@@ -268,6 +268,11 @@ public sealed partial class Database : IAsyncDisposable
             canReclaim = oldest > beforeStorage.Meta.TransactionId;
             reuse = !ephemeral ? oldest >= beforeStorage.FreeGeneration ? new(beforeStorage.FreePages) : []
                 : beforeStorage.FreePages.Where(page => !retiredAt.TryGetValue(page, out var at) || at <= oldest).ToHashSet();
+            // Raw, host-coordinated file attachments use the frozen conservative
+            // policy: their reader watermark must drain before any reuse.
+            // Auto/service attachments retain the ordinary free-generation gate.
+            if (!ephemeral && name is not ("main" or "temp") && !canReclaim &&
+                fileState is { Options: { Locking: FileLocking.None, RoleHost: null } }) reuse.Clear();
         }
         if (pending.FileWrite is { } remote) reuse = remote.Granted;
         var allocation = new StorageAllocation(beforeStorage, reuse, (pending.Before.Pager ?? pager).Codec, eagerReclaim: ephemeral);
@@ -360,8 +365,23 @@ public sealed partial class Database : IAsyncDisposable
     }
     public async ValueTask DisposeAsync()
     {
+        lock (gate)
+        {
+            if (disposed && attachments.Count == 0) return;
+            // Local sessions must end before close. A remote writer instead
+            // belongs to the page service and drains through its shutdown grace.
+            if (!disposed && (domainLeases != 0 || attaching.Count != 0 || pins.Count != 0 ||
+                writer.CurrentCount == 0 && !ReferenceEquals(fileState?.RemoteWriterGate, writer)))
+                throw new SqlException(SqlStates.ObjectInUse, "database has active local operations");
+            attachmentsClosing = true;
+        }
+        if (fileState is not null)
+        {
+            try { await DisposeFileAsync().ConfigureAwait(false); }
+            finally { await DisposeAttachedAsync().ConfigureAwait(false); }
+            return;
+        }
         await DisposeAttachedAsync().ConfigureAwait(false);
-        if (fileState is not null) { await DisposeFileAsync().ConfigureAwait(false); return; }
         lock (gate)
         {
             if (disposed) return;

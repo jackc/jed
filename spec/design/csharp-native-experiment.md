@@ -1,7 +1,7 @@
 # Native C# core experiment
 
-Authorized 2026-11-12. This is an **in-progress, opt-in experiment**, not a
-supported core or a production delivery decision. The semantic baseline is the
+Authorized 2026-11-12; completed and frozen 2026-11-13. This is an **opt-in
+experimental core**, not a supported core or a production delivery decision. The semantic baseline is the
 supported Rust/Go/TypeScript surface at
 `b1a6affca7725e0b07a4f734eddb1c569ef76bcf`. The language-neutral specification,
 catalogs and corpus at that revision are authoritative. Existing engines supply
@@ -30,6 +30,24 @@ cancellation boundaries, Linux multi-process interoperability, deterministic
 failure/recovery simulation, PostgreSQL oracle checks and healthy default tasks
 without .NET. Harnesses drain public cursors externally and check final costs and
 drain-time errors. Internal collectors cannot substitute for that path.
+
+## Recorded completion
+
+Engine34 passes all applicable frozen SQL files across memory/plain/encrypted
+storage and default/runtime-async JIT/NativeAOT: 12 inventories with exact
+cross-variant and independent encrypted cost/EXPLAIN checks. All 763 distinct SQL
+files pass in at least one storage mode. All four host executables, 496 mixed-core
+process cases and 16,000 threaded snapshot checks pass, including the final-review
+writer-pin admission cleanup regression.
+
+The stable final fault sweep passes 85 traces: 76 exact peer comparisons and nine
+intrinsic fault checks under the canonical per-profile policy. Four compilation
+variants each completed three sequential diagnostic measurement runs. See the
+[verification record](../../impl/csharp-native/VERIFICATION.md) for source/artifact
+identities and freeze proof, and [measurements](../../impl/csharp-native/BENCHMARKS.md)
+for results and limits. Current time/allocation overhead against Go is substantial;
+the tmpfs diagnostics do not validate earlier near-Rust performance expectations
+or physical-disk durability latency. Production delivery remains undecided.
 
 ## Toolchain and platforms
 
@@ -69,7 +87,7 @@ never using culture-sensitive or UTF-16 ordering. Host string input must reject
 ill-formed surrogate sequences. Unicode kernels count scalars. Names, UUID bytes,
 temporal values and float rendering follow the spec rather than host defaults.
 
-SQL decimal will use handwritten limbs and the exact scale/rounding contracts;
+SQL decimal uses handwritten limbs and the exact scale/rounding contracts;
 neither System.Decimal nor System.Numerics.BigInteger is its value-path engine.
 Open types derive recursively from their descriptors. Resource charges use the
 shared logical schedules, never CLR allocation estimates. Safe spans and bounded
@@ -86,14 +104,14 @@ ValueTask when it commonly completes synchronously. Keep synchronous entry point
 internal for conformance and diagnostics until a separate public API decision.
 Async suspension does not grant concurrent use of a session or cursor: reject
 overlapping operations and permit sequential continuation on different threads.
-Database handles will provide the shared thread-safe ownership boundary.
+Database handles provide the shared thread-safe ownership boundary.
 
 .NET 11 Runtime Async is a compiler/runtime optimization to verify separately
 with identical conformance, not an execution-semantic dependency. First use stable
 async APIs without enabling preview language features. Evaluate runtime-async
 compilation and NativeAOT on the same source; neither changes SQL scheduling,
 error/cost order, cancellation boundaries or commit outcome semantics.
-Host functions will use in-process delegates and the existing batched contract.
+Host functions use in-process delegates and the existing batched contract.
 ADO.NET, EF integration and public NuGet packaging are separate follow-ons.
 
 Crypto and ordinary OS operations stay behind narrow host seams. The maintainer
@@ -111,7 +129,7 @@ they do not silently move that revision. Implementation and performance evidence
 must identify the actual source tested. No freeze or performance claim is implied
 by this charter.
 
-## Full-build readiness audit (2026-11-12)
+## Historical full-build readiness audit (2026-11-12)
 
 The scalar milestone is committed locally as `aeb741bd`. The one identified
 external approval blocker was resolved by the maintainer's approval of the

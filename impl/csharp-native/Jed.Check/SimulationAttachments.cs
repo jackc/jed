@@ -12,6 +12,7 @@ internal sealed partial class SimulationRunner
         internal bool Reclaimed;
         internal Database Database = null!;
         internal string? Pending;
+        internal string CommittedDigest = "";
         internal KeyAttempt? KeyAttempt;
         internal readonly Dictionary<ulong, HashSet<string>> History = [];
         internal void Remember(ulong version, string digest)
@@ -50,11 +51,19 @@ internal sealed partial class SimulationRunner
     private async Task<string> AttachmentDigest(AttachmentState state)
     {
         await using var session = database.CreateSession(SessionOptions(fs.Step) with { MaxQueryMemoryBytes = 0 });
-        return await SimulationRows.Digest(session, fs, state.Name);
+        return state.CommittedDigest = await SimulationRows.Digest(session, fs, state.Name);
     }
     private async Task AttachDomain(string name)
     {
         if (sessions.Values.Any(handle => handle.Write)) throw new InvalidDataException("trace attaches with an open writer");
+        if (attached.TryGetValue(name, out var existing) && database.PublishedStateForTesting().Attachments.Contains(name) &&
+            (!trace.Service || processes.Values.All(process => process.Database.PublishedStateForTesting().Attachments.Contains(name))))
+        {
+            // An already attached domain only reports its recorded version.
+            // Opening an oracle read here could elect a new owner and alter the
+            // next process's role, unlike the canonical stepAttach operation.
+            json.Number("version", existing.Version); return;
+        }
         if (!attached.TryGetValue(name, out var state))
         {
             state = new(name, trace.Encrypted ? 0 : -1); attached.Add(name, state);
@@ -73,7 +82,7 @@ internal sealed partial class SimulationRunner
         state.Version = state.Database.Version;
         var digest = await AttachmentDigest(state);
         VerifyAttachment(state, digest);
-        json.Text("db", name).Number("version", state.Version);
+        json.Number("version", state.Version);
     }
     private async Task OpenAttachment(AttachmentState state)
     {
@@ -118,7 +127,12 @@ internal sealed partial class SimulationRunner
         SimulationStorageChecks.Require(state.History.TryGetValue(state.Version, out var values) && values.Contains(digest),
             $"attachment {state.Name} recovered unrecorded contents");
     }
-    private Dictionary<string, ulong> AttachmentVersions() => attached.ToDictionary(pair => pair.Key, pair => pair.Value.Database.Version, StringComparer.Ordinal);
+    private Dictionary<string, ulong> AttachmentVersions(bool published = false)
+    {
+        var names = (published ? database.PublishedStateForTesting().Attachments : database.AttachedDatabases).ToHashSet(StringComparer.Ordinal);
+        return attached.Where(pair => names.Contains(pair.Key)).ToDictionary(pair => pair.Key,
+            pair => published ? pair.Value.Database.PublishedStateForTesting().Version : pair.Value.Database.Version, StringComparer.Ordinal);
+    }
     private void WriteAttachmentVersions(Dictionary<string, ulong> versions)
     {
         if (attached.Count == 0) return;
@@ -135,14 +149,22 @@ internal sealed partial class SimulationRunner
     {
         foreach (var state in attached.Values)
         {
-            var old = state.Version; state.Version = acknowledged[state.Name];
-            var digest = await AttachmentDigest(state);
+            if (!acknowledged.TryGetValue(state.Name, out var published)) continue;
+            var old = state.Version; state.Version = published;
+            SimulationStorageChecks.Require(state.Version == old || old < ulong.MaxValue && state.Version == old + 1,
+                "attachment commit published an invalid generation transition");
+            SimulationStorageChecks.Require(state.Version == old || state.Pending is not null,
+                "attachment commit published changes after its in-flight digest failed");
+            var digest = state.Version == old ? state.CommittedDigest :
+                await ReadCommitDigest(fs, trace.Synchronous == "off", trace.Service, state.Pending!, () => AttachmentDigest(state));
             SimulationStorageChecks.Require(state.Pending is null || state.Pending == digest, "attachment commit differs from pending session");
             SimulationStorageChecks.Require(old != state.Version || state.History[old].Contains(digest), "unchanged attachment commit changed contents");
+            state.CommittedDigest = digest;
             state.Remember(state.Version, digest);
             if (state.Version != old && fs.EntryDurable(state.File))
-                state.Floor = Math.Max(state.Floor, (trace.Service ? roles.DatabaseOf(state.File) ?? state.Database : state.Database).CommittedStorageForTesting().Batch?.FloorTransactionId ?? state.Version);
-            if (!trace.Service || state.Database.FileRole == "owner") await Oracle(() => SimulationStorageChecks.Live(state.Database));
+                state.Floor = Math.Max(state.Floor, (trace.Service ? roles.DatabaseOf(state.File) ?? state.Database : state.Database).PublishedStateForTesting().Storage.Batch?.FloorTransactionId ?? state.Version);
+            if (!(trace.Synchronous == "off" && fs.Fired != "none") && (!trace.Service || state.Database.FileRole == "owner"))
+                await Oracle(() => SimulationStorageChecks.Live(state.Database));
             if (state.Version != old && !trace.Service) CheckGrowth(state.Database, state.File, before[state.Name], quiet, ref state.Growth, ref state.Reclaimed);
         }
         WriteAttachmentVersions(attached.ToDictionary(pair => pair.Key, pair => pair.Value.Version, StringComparer.Ordinal));
@@ -162,9 +184,11 @@ internal sealed partial class SimulationRunner
     }
     private async Task AttachedFields(bool recovered, Dictionary<string, byte[]>? images = null, bool summary = false)
     {
-        if (attached.Count == 0) return;
+        var names = database.AttachedDatabases.ToHashSet(StringComparer.Ordinal);
+        var active = attached.Values.Where(state => names.Contains(state.Name)).ToArray();
+        if (active.Length == 0) return;
         json.Object("dbs");
-        foreach (var state in attached.Values)
+        foreach (var state in active)
         {
             state.Version = state.Database.Version;
             var digest = await AttachmentDigest(state); VerifyAttachment(state, digest);

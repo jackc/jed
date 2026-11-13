@@ -42,6 +42,11 @@ internal static class EnvironmentHostTests
         }
         catch (ArgumentOutOfRangeException) { }
         Corpus.Equal(false, await fs.ExistsAsync("invalid-limit.jed"), "invalid storage allowance is rejected before creating a file");
+        await using (var abandoned = await fs.OpenAsync("retry-create.jed.jedtmp", FileMode.CreateNew))
+        { await abandoned.WriteAsync(0, new byte[] { 1, 2, 3 }); }
+        await using (var retried = await Database.CreateAsync(new() { Path = "retry-create.jed", PageSize = 1024,
+            FileHost = fs, Locking = FileLocking.None }))
+            Corpus.Equal(1UL, retried.Version, "create replaces its reserved stale temporary image");
         using var credential = DatabaseCredential.FromKey(new byte[32]);
         var options = new DatabaseFileOptions { Environment = environment, FileHost = fs, Locking = FileLocking.None, Credential = credential };
         await using (var encrypted = await Database.CreateFileAsync("environment-one.jed", options, 1024)) { }

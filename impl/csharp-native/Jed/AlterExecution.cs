@@ -272,7 +272,12 @@ internal static partial class StatementExecution
             }
             changed = true;
         }
-        if (!changed) return new([], []);
+        if (!changed)
+        {
+            // Skipped actions still complete an ALTER frame on an existing
+            // table, staging its catalog generation without rewriting rows.
+            Put(pending, table); return new([], []);
+        }
         foreach (var name in retypedColumns)
             if (table.Columns.Any(column => column.Name == name) && DependentViews(pending.Catalog, [table.Name], 0, name).Count != 0)
                 throw Errors.Unsupported("view depends on altered column type");
