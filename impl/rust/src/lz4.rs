@@ -258,7 +258,7 @@ mod tests {
             vec![b'y'; 70_000],
             b"the quick brown fox jumps over the lazy dog ".repeat(60),
             (0..5000u32)
-                .flat_map(|i| (i * 2_654_435_761).to_le_bytes())
+                .flat_map(|i| i.wrapping_mul(2_654_435_761).to_le_bytes())
                 .collect(),
         ];
         for src in &cases {
