@@ -2272,6 +2272,19 @@ ENC_PK_TABLE = {
   rows: (1..300).map { |i| [i, i == 3 ? nil : i * 10] }
 }.freeze
 
+# The encrypted deferred-interior history (cow history (e), DEFERRED_FIXTURES above).
+ENC_DEFERRED_FIXTURES = [
+  # (e) history (a) in an encrypted file (page size 1024, ENC_PK_TABLE's interior root over leaves):
+  # the entry carries the tag of the page it names, while the retained root's on-disk pointer still
+  # binds the old leaf's tag -- a reader that took the tag from the pointer would fail authentication.
+  # One commit (txid 2, slot 0), so slot 1 keeps the base generation and every core opens it with the
+  # goldens' key. The prefix is what the cores' every-golden tests key the credential on.
+  { file: "encrypted_cow_deferred_retained.jed", page_size: 1024, deferred: true,
+    deferred_history: :encrypted_retained, encrypted_history: true,
+    tables: [ENC_PK_TABLE.merge(rows: ENC_PK_TABLE[:rows].map { |id, v| [id, id == 100 ? 1001 : v] })],
+    expected_txid: 2 }
+].freeze
+
 # `encrypted_overflow_table`: incompressible values that spill into multi-page chains (slab C − 16 =
 # 952 bytes after the successor's tag), so external pointers and chain links carry tags.
 ENC_OVERFLOW_TABLE = {
@@ -2418,7 +2431,7 @@ FIXTURES = ([
   # Torn-write fallback: same image as pk_table, with one meta slot's CRC smashed.
   { file: "torn_meta_slot0.jed", page_size: 256, tables: [PK_TABLE], corrupt_slot: 0 },
   { file: "torn_meta_slot1.jed", page_size: 256, tables: [PK_TABLE], corrupt_slot: 1 }
-] + COW_FIXTURES + DEFERRED_FIXTURES + MALFORMED_FIXTURES).freeze
+] + COW_FIXTURES + DEFERRED_FIXTURES + ENC_DEFERRED_FIXTURES + MALFORMED_FIXTURES).freeze
 
 # --- primitives -------------------------------------------------------------
 
@@ -5213,10 +5226,87 @@ def deferred_fixture_image(fx)
     write_deferred_meta(image, ps, 0, 2, catalog, live, [a, b], { [21, 13] => a, [33, 4] => b })
     i21 = append_page(image, ps, deferred_interior(final, 21, { 13 => a }))
     write_deferred_meta(image, ps, 1, 3, catalog, live, [i21], { [33, 4] => b, [34, 0] => i21 })
+  when :encrypted_retained
+    return encrypted_deferred_image(fx)
   else
     raise "unknown deferred history #{fx[:deferred_history]}"
   end
   image
+end
+
+# The plaintext body of sealed page `index` of `image` (the page key opens it; no pointer needed).
+def opened_body(image, ps, index, page_key)
+  stored = image.byteslice(index * ps, ps)
+  body = Xaes.open(page_key, stored.byteslice(ps - RESERVE, 24), stored.byteslice(0, ps - RESERVE) +
+                   stored.byteslice(ps - TAG_LEN, TAG_LEN), ad_prefix(1, index))
+  body or raise "page #{index} does not open"
+end
+
+# Cow history (e) (DEFERRED_FIXTURES): the encrypted base, built as build_encrypted_image builds it
+# with the seeded stream kept running, then one deferring commit. The edited leaf's plaintext comes
+# from an encrypted build of the edited table under the same seeded key, where it is the only leaf
+# that differs; it is resealed at its new page, and the meta (sealed whole, the remap region inside
+# the seal) lists that page's ciphertext CRC-64 and keys the retained root's slot to it with its tag.
+def encrypted_deferred_image(fx)
+  ps = fx[:page_size]
+  final = fx[:tables][0]
+  base_table = ENC_PK_TABLE
+  edited = build_encrypted_image([], [], [final], ps, [], [])
+  rng = SeededStream.new(ENC_SEED)
+  block, dek = new_key_block(rng)
+  $enc = { ps: ps, rng: rng, tags: {}, page_key: Xaes.page_key(dek), meta_key: Xaes.meta_key(dek), txid: TXID }
+  image = build_image([], [], [base_table], ps, start_page: ENC_FIRST_BODY)
+  key_page = block + "\x00".b * (ps - block.bytesize)
+  image[2 * ps, ps] = key_page
+  image[3 * ps, ps] = key_page
+  raise "the edit changed the page count" unless edited.bytesize == image.bytesize
+
+  key = $enc[:page_key]
+  bodies = (ENC_FIRST_BODY...(image.bytesize / ps)).to_h do |i|
+    [i, [opened_body(image, ps, i, key), opened_body(edited, ps, i, key)]]
+  end
+  bodies.each do |i, (was, now)|
+    raise "the edit moved page #{i}'s type or count" unless was.byteslice(0, 8) == now.byteslice(0, 8)
+  end
+  leaves = bodies.select { |_, (was, now)| was.getbyte(0) == PAGE_LEAF && was != now }.keys
+  raise "the edit should change exactly one leaf, changed #{leaves}" unless leaves.size == 1
+
+  leaf = leaves.first
+  interiors = bodies.count { |_, (was, _)| was.getbyte(0) == PAGE_INTERIOR }
+  raise "expected one interior root over leaves, found #{interiors} interiors" unless interiors == 1
+
+  root, root_body = bodies.find { |_, (was, _)| was.getbyte(0) == PAGE_INTERIOR }.then { |i, (was, _)| [i, was] }
+  slot = (0..root_body.byteslice(4, 4).unpack1("N")).find do |k|
+    root_body.byteslice(PAGE_HEADER + k * (4 + TAG_LEN), 4).unpack1("N") == leaf
+  end or raise "the root does not name the edited leaf"
+  edited_body = bodies[leaf][1]
+
+  index = image.bytesize / ps
+  image << seal_body(index, PAGE_LEAF, edited_body.byteslice(4, 4).unpack1("N"), 0,
+                     edited_body.byteslice(PAGE_HEADER, ps - RESERVE - PAGE_HEADER))
+  tag = $enc[:tags][index]
+
+  base_meta = image.byteslice(ps, ps) # slot 1: the base generation, left in place
+  m = "\x00".b * ps
+  m[0, 4] = MAGIC
+  m[4, 2] = u16(VERSION)
+  m.setbyte(6, 1)
+  m.setbyte(7, RESERVE)
+  m[8, 4] = u32(ps)
+  m[12, 8] = u64(2)
+  m[20, 4] = base_meta.byteslice(20, 4) # the catalog chain is kept
+  m[24, 4] = u32(image.bytesize / ps)
+  m[56, 4] = base_meta.byteslice(56, 4) # the leaf replaced one for one
+  m[64, 16] = base_meta.byteslice(64, 16) # the kept catalog root's tag
+  lo, hi = manifest_area(ps, true)
+  m[40, 4] = u32(1)
+  m[lo, 12] = u32(index) + u64(crc64(image.byteslice(index * ps, ps)))
+  m[60, 4] = u32(1)
+  m[hi - remap_reserve(ps, true), 10 + TAG_LEN] = [root, slot, index].pack("NnN") + tag
+  image[0, ps] = seal_meta(m, 0)
+  image
+ensure
+  $enc = nil
 end
 
 # Each table's root data page, read back from a clean image's catalog.

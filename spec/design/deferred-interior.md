@@ -738,9 +738,18 @@ fixture's content check pins; keying it to the wrong slot is caught by the integ
 four and checks them clean (`TestRemapRubyHistories`). Without the layout a slot carrying entries is
 invalid: `retained` opens at its base generation, `fold`'s newest slot — an empty list, a zero region —
 is a valid v52 slot read correctly at txid 3, and `overwrite` and `retire`, with entries in both slots,
-open nowhere; Rust and TS list those two as unopenable until they read the layout. **Still owed:** case
-(e), the encrypted entry with its tag, and the writer's own deferral planner — these histories are
-assembled by hand, page by page, rather than planned the way §9.4 plans a commit.
+open nowhere; Rust and TS list those two as unopenable until they read the layout.
+
+Case (e) is `encrypted_cow_deferred_retained` (page size 1024): history (a) in an encrypted file, one
+commit, so slot 1 keeps the base generation and every core opens it with the goldens' key. The
+retained root's on-disk pointer still binds the old leaf's tag and the entry carries the new leaf's, so
+reading the edited row at all proves the reader took the tag from the entry. Sabotaged and resealed,
+an entry with the wrong tag or naming the old leaf is rejected when the page is read; a region edited
+without resealing passes keyless slot selection and fails meta authentication — `XX001`, never stale
+rows, for this new kind of bound pointer. The Go core reads it at txid 2 with the layout and at the
+base generation without (`TestRemapRubyEncryptedHistory`). **Still owed:** the writer's own deferral
+planner — these histories are assembled by hand, page by page, rather than planned the way §9.4 plans
+a commit.
 
 ### 9.9 What the landing change owes
 
@@ -755,7 +764,7 @@ page — so the from-scratch image no longer differs from v52 only by its versio
 
 Beyond the three cores and `verify.rb`:
 
-- **Fixtures** (plaintext (a)–(d) written, §9.8). A from-scratch image has no entries, so no static
+- **Fixtures** (written, §9.8). A from-scratch image has no entries, so no static
   golden can carry the region's bytes; the list needs a commit history, like the `cow_*.jed` family. A
   `cow_deferred.jed` group pinning (a) a single retained parent with one entry, (b) a repeated move overwriting one entry,
   (c) a fold emptying the list, (d) a parent dropped by its own rewrite, and (e) the encrypted entry
@@ -771,8 +780,6 @@ Beyond the three cores and `verify.rb`:
 - **A race review** of the commit path, which sets a page id on the committing snapshot's own nodes
   and swaps the resident list during planning (§6).
 - **`unassignPages`**, or its equivalent, must undo a retained interior when a plan is discarded.
-- **The encrypted `cow_deferred` case** (e), an entry carrying its tag; the plaintext histories (a)–(d)
-  and the reader are done (§9.8).
 - **The stamp's remaining surface** ([manifest-crc32.md](manifest-crc32.md) §4): give the integrity
   check and the page service's delta check a window, and change the manifest-overflow header check
   from "bytes 1–3 zero" to "flags zero, stamp equals the meta's txid" in Rust, TS and the Ruby

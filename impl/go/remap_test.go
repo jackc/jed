@@ -318,3 +318,36 @@ func TestRemapRubyHistories(t *testing.T) {
 		})
 	}
 }
+
+// Cow history (e): the encrypted retained parent. The entry carries the tag of the leaf it names while
+// the root's on-disk pointer still binds the old leaf's, so reading the edited row at all means this
+// core took the tag from the entry (deferred-interior.md §9.3). Without the layout the newest slot is
+// invalid and the base generation in slot 1 opens.
+func TestRemapRubyEncryptedHistory(t *testing.T) {
+	file := specPath(t, "fileformat/fixtures/encrypted_cow_deferred_retained.jed")
+	for _, on := range []bool{true, false} {
+		t.Run(fmt.Sprintf("layout %v", on), func(t *testing.T) {
+			withDefer(t, on)
+			db, err := openIntegrityCopy(t, file, encGoldenKey())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			want, v := uint64(1), int64(1000)
+			if on {
+				want, v = 2, 1001
+			}
+			if db.Version() != want {
+				t.Fatalf("recovered version %d, want %d", db.Version(), want)
+			}
+			got := query(t, db, "SELECT count(*), sum(id), (SELECT v FROM t WHERE id = 100) FROM t")
+			if got[0][0].Int != 300 || got[0][1].Int != 45150 || got[0][2].Int != v {
+				t.Fatalf("got %v, want 300 rows, sum 45150, v %d", got, v)
+			}
+			report, err := db.IntegrityCheck(context.Background(), "main", IntegrityCheckOptions{Level: IntegrityFull, MaxFindings: IntegrityUnlimited, Constraints: true})
+			if err != nil || !report.OK() {
+				t.Fatalf("integrity: %v %+v", err, report.Findings)
+			}
+		})
+	}
+}
