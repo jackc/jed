@@ -14,11 +14,12 @@ require "time"
 # and transport references; no default benchmark/CI task imports this module.
 module SwiftNativeBenchmark
   ROOT = SwiftNativeTasks::ROOT
-  BASELINE = "0b76dd6e9c2675b552eb8af9e820065351ffa4b3"
+  BASELINE = "b1a6affca7725e0b07a4f734eddb1c569ef76bcf"
+  WORKLOAD_COUNT = 157
   CORES = %w[swift rust go ts].freeze
   HASHES = {
-    "benchmarks.toml" => "a7be0f426d9d4432b238eca05b73d6a29b4a114b9c8aaca6c85f71cb94fe3f96",
-    "datasets.toml" => "b9bfb4cb1f27ae1757268a94434e96df67626bc6b39f005c3626ab3a6e289133",
+    "benchmarks.toml" => "8cc81154901f7d89b2738cea9a6687821cd7d59613e10220b9be0779b5ff7c2f",
+    "datasets.toml" => "ad83efd09f71b214f125c6c37206bfd2ceea6c8d43d31a5282b531d55fa82baf",
     "spill.toml" => "53c7d9034296e5c6cb03c61f30323f859f034a0ceb8645a49032f00790f084fb"
   }.freeze
   INTEGER_FIELDS = %w[iterations warmup readers total_ns ns_per_op min_ns p50_ns p90_ns p99_ns rows_total].freeze
@@ -43,7 +44,7 @@ module SwiftNativeBenchmark
     datasets = TomlRB.parse(source.fetch("datasets.toml").dup.force_encoding(Encoding::UTF_8))
     raise "unknown benchmark schema" unless corpus.fetch("schema_version") == 1 && datasets.fetch("schema_version") == 1
     all = corpus.fetch("bench").select { |bench| !bench.key?("engines") || bench.fetch("engines").include?("jed") }
-    raise "expected exactly 143 unique jed workloads" unless all.length == 143 && all.map { _1.fetch("name") }.uniq.length == 143
+    raise "expected exactly #{WORKLOAD_COUNT} unique jed workloads" unless all.length == WORKLOAD_COUNT && all.map { _1.fetch("name") }.uniq.length == WORKLOAD_COUNT
     chosen = all.select { |bench| !filter || bench.fetch("name").include?(filter) }
     raise "benchmark filter selects no workloads" if chosen.empty?
     workloads = chosen.map { normalize(_1) }
@@ -256,7 +257,7 @@ module SwiftNativeBenchmark
 
   def self_check
     projected, _, all = input
-    raise "workload inventory" unless projected.fetch(:benchmarks).length == 143 && all.uniq.length == 143
+    raise "workload inventory" unless projected.fetch(:benchmarks).length == WORKLOAD_COUNT && all.uniq.length == WORKLOAD_COUNT
     raise "five workload kinds" unless projected.fetch(:benchmarks).map { _1.fetch(:kind) }.uniq.sort == %w[cold_open concurrent_read query write_durable write_rollback]
     ["", "go", "swift,", "swift,swift", "swift,unknown"].each do |value|
       begin; selected_cores(value); raise "invalid cores accepted: #{value.inspect}"; rescue RuntimeError => error
@@ -300,7 +301,7 @@ module SwiftNativeBenchmark
         end
       end
     end
-    puts "benchmark adapter: 143 shared workloads; membership/parameter/timestamp rejection checks PASS"
+    puts "benchmark adapter: #{WORKLOAD_COUNT} shared workloads; membership/parameter/timestamp rejection checks PASS"
   end
 
   def run

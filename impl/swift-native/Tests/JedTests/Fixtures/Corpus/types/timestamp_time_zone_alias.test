@@ -1,0 +1,69 @@
+# The SQL-standard multi-word spellings `timestamp with time zone` (= timestamptz) and
+# `timestamp without time zone` (= timestamp) — spec/design/grammar.md §14, types.md §2. Four bare
+# words, any case, in every type position: a column / composite-field definition, ALTER COLUMN …
+# TYPE, `::`, CAST, an array type, a typed literal, and after a precision typmod
+# (`timestamp(3) with time zone`, PostgreSQL's TIMESTAMP '(' Iconst ')' opt_timezone). All rows
+# oracle-checked against PostgreSQL.
+# requires: ddl.create_table, ddl.primary_key, ddl.alter_table, dml.insert, query.select, query.select_no_from, query.where_eq, cast.explicit, cast.string_literal, types.i32, types.timestamp, types.timestamptz, types.timestamp_precision, types.array, types.composite
+
+statement ok
+CREATE TABLE tz_alias (id i32 PRIMARY KEY, a timestamp with time zone, b TIMESTAMP WITHOUT TIME ZONE, c Timestamp(2) With Time Zone, d timestamp(0) without time zone, e timestamp with time zone[])
+
+statement ok
+INSERT INTO tz_alias VALUES (1, '2024-01-01 12:00:00+05', '2024-01-01 12:00:00', '2024-01-01 12:00:00.125+00', '2024-01-01 12:00:00.5', '{"2024-01-01 00:00:00+01"}')
+
+# a is normalized to UTC, b keeps its wall clock, and c and d round to their precisions
+# types: timestamptz, timestamp, timestamptz, timestamp, timestamptz[]
+query TTTTT nosort
+SELECT a, b, c, d, e FROM tz_alias WHERE id = 1
+----
+2024-01-01 07:00:00+00
+2024-01-01 12:00:00
+2024-01-01 12:00:00.13+00
+2024-01-01 12:00:01
+{"2023-12-31 23:00:00+00"}
+
+# types: timestamptz, timestamp, timestamptz, timestamp
+query TTTT nosort
+SELECT '2024-06-01 08:30:00-02'::timestamp with time zone, CAST('2024-06-01 08:30:00' AS timestamp without time zone), '2024-06-01 08:30:00.4+00'::timestamp(0) with time zone, CAST('2024-06-01 08:30:00.44' AS TIMESTAMP(1) WITHOUT TIME ZONE)
+----
+2024-06-01 10:30:00+00
+2024-06-01 08:30:00
+2024-06-01 08:30:00+00
+2024-06-01 08:30:00.4
+
+# the typed-literal form
+# types: timestamptz, timestamp
+query TT nosort
+SELECT timestamp with time zone '2024-03-01 00:00:00+03', TIMESTAMP WITHOUT TIME ZONE '2024-03-01 00:00:00'
+----
+2024-02-29 21:00:00+00
+2024-03-01 00:00:00
+
+# an array cast target
+# types: timestamptz[]
+query T nosort
+SELECT '{"2024-01-01 00:00:00+00"}'::timestamp with time zone[]
+----
+{"2024-01-01 00:00:00+00"}
+
+# ALTER COLUMN … TYPE and a composite field
+statement ok
+ALTER TABLE tz_alias ALTER COLUMN b TYPE timestamp without time zone
+
+statement ok
+CREATE TYPE tz_pair AS (at timestamp with time zone, local timestamp(1) without time zone)
+
+# types: tz_pair
+query T nosort
+SELECT ROW('2024-01-01 00:00:00+00', '2024-01-01 00:00:00.25')::tz_pair
+----
+("2024-01-01 00:00:00+00","2024-01-01 00:00:00.3")
+
+# A quoted word does not form the keyword sequence.
+statement error 42601
+SELECT CAST('2024-01-01' AS timestamp with "time" zone)
+
+# The words must be complete: `timestamp with time` alone is a syntax error.
+statement error 42601
+SELECT CAST('2024-01-01' AS timestamp with time)

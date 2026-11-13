@@ -83,6 +83,7 @@ internal enum MutationExecutor {
                                  context: ExpressionContext, columns: Bool) -> ExpressionResolver {
         let read = context.writeScope?.readSnapshot ?? snapshot
         let resolver = ExpressionResolver(columns: columns ? relation.columns() : [], composites: read.types, scalar: context.scalar)
+        if let inference = context.parameterInference { resolver.inference = inference }
         resolver.cteBindings = context.writeScope?.cteBindings ?? [:]
         resolver.resolveAggregate = AggregateQueryPlan.forbidden
         resolver.hostFunctions = settings.environment.signatures; resolver.unicode = settings.environment.unicode
@@ -269,12 +270,13 @@ internal enum MutationExecutor {
         case .query(let query):
             if let column = always.min() { throw JedError("428C9", "cannot insert a non-DEFAULT value into an identity column").identity(relation.table.columns[column].name, insert: true) }
             source = []
+            try InsertLiteralInput.inferParameters(query, targets: destinations.map { relation.types[$0] }, resolver: resolver)
             sourcePlan = try SelectPlan.resolve(query, snapshot: read, settings: inputSettings, scalar: baseContext.scalar,
                                                using: resolver, finalizeParameters: false)
             // INSERT owns an eager source result. Its scalar scan/filter input
             // overlaps projection output under the same Q1 schedule as other
             // internally materialized queries; a public cursor may stream it.
-            if let plan = sourcePlan, !ColumnarExecution.projection(plan, baseContext) {
+            if let plan = sourcePlan, !plan.streamsComputedProjection, !ColumnarExecution.projection(plan, baseContext) {
                 sourcePlan!.materializeSource = plan.aggregation == nil && plan.window == nil && plan.relation == nil
                     && !plan.orderedByScan && plan.order.isEmpty && plan.limit == nil
             }
@@ -348,7 +350,7 @@ internal enum MutationExecutor {
         return InsertPreparation(read: read, settings: settings, inputSettings: inputSettings, relation: relation,
             destinations: destinations, discarded: discarded, sourcePlan: sourcePlan, inputLiterals: inputLiterals,
             slots: slots, defaults: defaults, checks: check, indexes: indexes, returning: returning,
-            conflict: conflict, parameterTypes: try ParameterBinding.finalize(resolver), sourceValidationError: sourceValidationError)
+            conflict: conflict, parameterTypes: try baseContext.parameterInference == nil ? ParameterBinding.finalize(resolver) : [], sourceValidationError: sourceValidationError)
         } catch let error as JedError { throw error.inDatabase(inputSettings.targetDomain) }
     }
     static func executeInsert(_ plan: InsertPreparation, snapshot: inout DomainSnapshot,
@@ -364,7 +366,7 @@ internal enum MutationExecutor {
             return value
         }
         var context = baseContext
-        context.parameters = try ParameterBinding.bind(parameters, types: plan.parameterTypes, timezone: settings.timeZone)
+        if context.parameterInference == nil { context.parameters = try ParameterBinding.bind(parameters, types: plan.parameterTypes, timezone: settings.timeZone) }
         let profileStart = context.meter.accrued
         defer { context.executionProfile?.add(plan.profileIdentity, .total, context.meter.accrued - profileStart) }
         var sourceReserved: Int64 = 0
@@ -455,7 +457,7 @@ internal enum MutationExecutor {
                 guard indexBatches[ordinal].insert(prefix.bytes).inserted, try !index.conflicts(prefix, store: existing) else { throw duplicateIndex(index, relation: relation, value: { values[$0] }, context: context) }
             }
             let record = try RecordDisposition.plan(key: key, values: values.map(RecordInput.value), types: relation.types,
-                codec: store.tree.codec, meter: compression, pager: store.tree.pool?.pager)
+                codec: store.tree.codec, layout: relation.store.tree.layout, meter: compression, pager: store.tree.pool?.pager)
             let entries = try indexes.map { try $0.entries({ values[$0] }, storageKey: key) }
             try relation.view?.validateNew({ values[$0] }, context: context)
             prepared.append((record, values, entries))
@@ -613,7 +615,7 @@ internal enum MutationExecutor {
         return MutationPreparation(read: read, settings: settings, inputSettings: inputSettings, relation: relation,
             deleting: deleting, predicate: predicate, changes: changes, assigned: assigned, touched: touched,
             checks: check, indexes: indexes, returning: returning, filters: filters, target: target,
-            parameterTypes: try ParameterBinding.finalize(resolver), readsColumns: readsColumns)
+            parameterTypes: try baseContext.parameterInference == nil ? ParameterBinding.finalize(resolver) : [], readsColumns: readsColumns)
         } catch let error as JedError { throw error.inDatabase(inputSettings.targetDomain) }
     }
     static func executeMutation(_ plan: MutationPreparation, snapshot: inout DomainSnapshot,
@@ -626,7 +628,7 @@ internal enum MutationExecutor {
         let filters = plan.filters, target = plan.target
         let actionState = suppliedState ?? baseContext.writeScope?.foreignKeys ?? ForeignKeyActions.State()
         var context = baseContext
-        context.parameters = try ParameterBinding.bind(parameters, types: plan.parameterTypes, timezone: settings.timeZone)
+        if context.parameterInference == nil { context.parameters = try ParameterBinding.bind(parameters, types: plan.parameterTypes, timezone: settings.timeZone) }
         let profileStart = context.meter.accrued
         defer { context.executionProfile?.add(plan.profileIdentity, .total, context.meter.accrued - profileStart) }
         if let view = relation.view {
@@ -717,7 +719,7 @@ internal enum MutationExecutor {
                     if let value = replacements[column] { return .value(value) }
                     return .kept(old.cells[column], pending: old.overflows[column])
                 }
-                let record = try RecordDisposition.plan(key: key, values: inputs, types: relation.types, codec: scanCodec,
+                let record = try RecordDisposition.plan(key: key, values: inputs, types: relation.types, codec: scanCodec, layout: relation.store.tree.layout,
                     meter: compression, pager: scanPager)
                 staged.append(Change(old: old, new: record))
             }

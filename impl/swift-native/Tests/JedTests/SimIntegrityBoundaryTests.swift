@@ -60,7 +60,7 @@ final class SimIntegrityBoundaryTests: XCTestCase {
         }
     }
 
-    func testImageCheckerRejectsAValidlyEncodedButMiskeyedTableRow() throws {
+    func testImageCheckerRejectsAStoredPrimaryKeyColumnInsteadOfElision() throws {
         let device = MemoryBlockStore(), storage = try StorageDomain.create(store: device, kind: .file, catalogID: 1, pageSize: 1024)
         var snapshot = storage.committed, image = snapshot.catalog
         let name = try SQLText("t"), integer = TypeDescriptor(.scalar(.i32))
@@ -76,7 +76,7 @@ final class SimIntegrityBoundaryTests: XCTestCase {
         let bytes = try device.read(at: 0, count: Int(device.size()))
         XCTAssertThrowsError(try SimIntegrity.image(bytes: bytes, credential: nil, environment: Environment.builder().build())) {
             XCTAssertEqual(($0 as? JedError)?.code, "XX001")
-            XCTAssertTrue(String(describing: $0).contains("row_key_not_primary_key"))
+            XCTAssertTrue(String(describing: $0).contains("stored elided column"))
         }
     }
 }

@@ -243,7 +243,9 @@ SELECT id, (SELECT count(*) FROM t i WHERE i.id <= o.id % 3) FROM n o ORDER BY i
 statement error 54P05
 SELECT id, (SELECT count(*) FROM t i WHERE i.id <= o.id % 3) FROM n o ORDER BY id DESC
 
-# max_query_memory_bytes: 384
+# EXISTS's inner scan computes its projection, so it streams and holds no relation buffer: the peak
+# is its one-row result (memory.md §5.4).
+# max_query_memory_bytes: 64
 query IB nosort
 SELECT id, EXISTS (SELECT 1 FROM t i WHERE i.id = o.id % 4) FROM n o ORDER BY id DESC
 ----
@@ -260,7 +262,7 @@ true
 1
 true
 
-# max_query_memory_bytes: 383
+# max_query_memory_bytes: 63
 statement error 54P05
 SELECT id, EXISTS (SELECT 1 FROM t i WHERE i.id = o.id % 4) FROM n o ORDER BY id DESC
 
@@ -289,13 +291,14 @@ SELECT count(*) FROM sink
 ----
 3
 
-# RETURNING rows are a buffered result. They are still held when the write's 27 staged bytes (the
-# two records, memory.md §7.3) join the account, so the statement needs both.
-# max_query_memory_bytes: 223
+# RETURNING rows are a buffered result. They are still held when the write's 15 staged bytes (the
+# two records, memory.md §7.3: a 4-byte key and a tag plus 3 or 2 text bytes each; the key column
+# has no stored value) join the account, so the statement needs both.
+# max_query_memory_bytes: 211
 statement error 54P05
 INSERT INTO sink VALUES (10, 'abc'), (11, 'de') RETURNING id, v
 
-# max_query_memory_bytes: 224
+# max_query_memory_bytes: 212
 query IT nosort
 INSERT INTO sink VALUES (10, 'abc'), (11, 'de') RETURNING id, v
 ----
@@ -304,11 +307,11 @@ abc
 11
 de
 
-# max_query_memory_bytes: 223
+# max_query_memory_bytes: 211
 statement error 54P05
 UPDATE sink SET v = upper(v) WHERE id >= 10 RETURNING id, v
 
-# max_query_memory_bytes: 224
+# max_query_memory_bytes: 212
 query IT rowsort
 UPDATE sink SET v = upper(v) WHERE id >= 10 RETURNING id, v
 ----

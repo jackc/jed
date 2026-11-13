@@ -1,5 +1,26 @@
 # Native Swift experiment — baseline scope and completion matrix
 
+## Authorized refresh (2026-11-12)
+
+The current semantic target is **`b1a6affca7725e0b07a4f734eddb1c569ef76bcf`**, superseding the
+original November 5 target. The mechanical snapshot pins **763 SQL files**, **116
+byte fixtures**, **19 simulation regressions**, 22 simulation profiles and the
+unchanged 31 process scenarios. Format v52 includes fixed numeric slots, key-column
+elision, narrow directories, shared key prefixes, offset/dictionary/array regions,
+and multi-way leaf splits. SQL additions include timestamp aliases, LIMIT/OFFSET
+parameters, INSERT/CTE parameter inference, whole-row references, cast-derived
+output names and contextual container literals. Streaming and aggregate lane
+selection follows the refreshed resource-accounting contract.
+
+[VERIFICATION.md](../../impl/swift-native/VERIFICATION.md) is the acceptance record
+for this refresh. The detailed audit below preserves its original baseline and
+actor-specific evidence; its earlier test counts and timing results do not certify
+this source. The generated snapshot is the exact current file inventory. The
+experiment remains opt-in and excluded from default CI and website integration;
+Apple platforms and production delivery remain unverified/undecided.
+
+## Preserved November 5–10 audit
+
 Durable preoptimization evidence is preserved in the ignored ext4
 [verification archive](../../impl/swift-native/results/verification-preoptimization-20261106/manifest.json):
 50 successful report/log/TSV files, 11,386,296 bytes, with original paths and

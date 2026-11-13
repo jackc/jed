@@ -131,7 +131,7 @@ internal enum MergeExecutor {
                     index: index, collation: source.projections[index].collation?.asColumn, unresolved: column.type == nil)
             }
         }
-        if !ColumnarExecution.projection(source, context) {
+        if !source.streamsComputedProjection, !ColumnarExecution.projection(source, context) {
             source.materializeSource = source.aggregation == nil && source.window == nil && source.relation == nil
                 && !source.orderedByScan && source.order.isEmpty && source.limit == nil
         }
@@ -239,7 +239,7 @@ internal enum MergeExecutor {
             for filter in view.filters { physical.formUnion(view.physicalColumns(filter.expression, level: filter.level)) }
         }
         let probe = probeExpression(condition, relation: relation)
-        let parameterTypes = try schemaOnly ? [] : ParameterBinding.finalize(resolver)
+        let parameterTypes = try schemaOnly || context.parameterInference != nil ? [] : ParameterBinding.finalize(resolver)
         return MergePreparation(read: read, settings: settings, inputSettings: inputSettings, relation: relation,
             source: source, sourceColumns: sourceColumns, sourceWidth: source.columns.count, condition: condition,
             probe: probe, clauses: clauses, returning: returning, checks: checks, indexes: indexes,

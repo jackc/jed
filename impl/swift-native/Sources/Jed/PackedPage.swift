@@ -7,19 +7,21 @@ internal struct StoredCell: Sendable {
     /// copy) cost more than the bytes it described. Decoding takes the
     /// column's descriptor from the owning tree.
     let width: UInt8
-    init(bytes: ArraySlice<UInt8>?, width: Int) { self.bytes = bytes; self.width = UInt8(width) }
+    let keyDerived: Bool
+    init(bytes: ArraySlice<UInt8>?, width: Int, keyDerived: Bool = false) { self.bytes = bytes; self.width = UInt8(width); self.keyDerived = keyDerived }
     init(bytes: ArraySlice<UInt8>?, type: TypeDescriptor) {
-        self.init(bytes: bytes, width: ValueCodec.fixedWidth(type.type) ?? 0)
+        self.init(bytes: bytes, width: LeafValue.width(type) ?? 0)
     }
     var fixedWidth: Int? { width == 0 ? nil : Int(width) }
-    var storedSize: Int { width == 0 ? bytes?.count ?? 0 : Int(width) }
+    var storedSize: Int { keyDerived ? 0 : width == 0 ? bytes?.count ?? 0 : Int(width) }
     var isNull: Bool { bytes == nil }
 
     func materialize(type: TypeDescriptor, pager: Pager? = nil, pageCount: UInt32? = nil) throws -> SQLValue {
         guard let bytes else { return .null }
-        if fixedWidth != nil { return try ValueCodec.decodeBody(bytes, type: type) }
+        if fixedWidth != nil { return try LeafValue.decode(bytes, type: type) }
         var reader = ByteReader(bytes)
         let tag = try reader.u8()
+        if tag == 5, LeafValue.bare(type.type) { return try ValueCodec.decodeRawBody(Array(bytes.dropFirst()), type: type) }
         if tag == 0 { return try ValueCodec.decode(bytes, type: type) }
         if tag == 3 {
             let raw = Int(try reader.u32()), compressed = Int(try reader.u16())
@@ -43,7 +45,7 @@ internal struct StoredCell: Sendable {
         guard fixedWidth == nil, let bytes else { return nil }
         var reader = ByteReader(bytes)
         switch try reader.u8() {
-        case 0: return nil
+        case 0, 5: return nil
         case 2, 4:
             let compressed = bytes.first == 4
             let first = try reader.u32(), stored = Int(try reader.u32())
@@ -122,313 +124,326 @@ internal struct PendingOverflow: Sendable {
 }
 
 internal final class PackedLeaf: Sendable {
-    /// Decode kinds resolved once per leaf. `other` uses the general codec.
-    private enum Kind: UInt8, Sendable {
-        case other, i16, i32, i64, timestamp, timestamptz, date, boolean, f32, f64, text, bytea
-        init(_ type: SQLType) {
-            guard case .scalar(let scalar) = type else { self = .other; return }
-            switch scalar {
-            case .i16: self = .i16
-            case .i32: self = .i32
-            case .i64: self = .i64
-            case .timestamp: self = .timestamp
-            case .timestamptz: self = .timestamptz
-            case .date: self = .date
-            case .boolean: self = .boolean
-            case .f32: self = .f32
-            case .f64: self = .f64
-            case .text: self = .text
-            case .bytea: self = .bytea
-            default: self = .other
-            }
-        }
-    }
-    /// Plain integers only: reading a region retains nothing. A fixed column
-    /// has width > 0 and a bitmap; a variable column's end offsets live in the
-    /// shared `offsets` vector starting at `directory`.
-    private struct Region: Sendable {
-        let kind: Kind
-        let width: Int
-        let bitmap: Int
-        let values: Int
-        let directory: Int
+    private enum Region: Sendable {
+        case key(Int, Int)
+        case fixed(bitmap: Int, values: Int, width: Int)
+        case spans([Range<Int>])
+        case base(bitmap: Int, values: Int, width: Int, base: UInt64, stride: Int)
+        case arrays(counts: [Int], offsets: [Int], values: Int, width: Int, base: UInt64, bits: Int)
     }
     let bytes: [UInt8]
     let types: [TypeDescriptor]
+    let layout: LeafLayout
     let count: Int
     let payloadSize: Int
+    private let prefix: [UInt8]
     private let keys: [Range<Int>]
     private let regions: [Region]
-    private let offsets: [Int]
 
-    convenience init(bytes: [UInt8], types: [TypeDescriptor], codec: any PageCodec) throws {
-        try self.init(bytes: bytes, types: types, capacity: codec.capacity, encrypted: codec.reservedBytes != 0)
+    convenience init(bytes: [UInt8], types: [TypeDescriptor], codec: any PageCodec, layout: LeafLayout = .index) throws {
+        try self.init(bytes: bytes, types: types, capacity: codec.capacity, encrypted: codec.reservedBytes != 0, layout: layout)
     }
-
-    convenience init(integrityBytes bytes: [UInt8], types: [TypeDescriptor], codec: any PageCodec) throws {
-        try self.init(bytes: bytes, types: types, capacity: codec.capacity, encrypted: codec.reservedBytes != 0, integrity: true)
+    convenience init(integrityBytes bytes: [UInt8], types: [TypeDescriptor], codec: any PageCodec, layout: LeafLayout = .index) throws {
+        try self.init(bytes: bytes, types: types, capacity: codec.capacity, encrypted: codec.reservedBytes != 0, layout: layout, integrity: true)
     }
-
-    private init(bytes: [UInt8], types: [TypeDescriptor], capacity: Int, encrypted: Bool, integrity: Bool = false) throws {
-        guard bytes.count == capacity + 16, bytes.count >= 16 else {
-            throw JedError.corruption("invalid packed leaf size")
-        }
+    private init(bytes: [UInt8], types: [TypeDescriptor], capacity: Int, encrypted: Bool,
+                 layout: LeafLayout, integrity: Bool = false) throws {
+        guard bytes.count == capacity + 16, bytes.count >= 16 else { throw JedError.corruption("invalid packed leaf size") }
         try PageEnvelope.validateHeader(bytes, encrypted: encrypted)
         guard bytes[0] == 2, try PageEnvelope.readU32(bytes, at: 12) == PageEnvelope.checksum(bytes, at: 12) else {
             throw JedError.corruption("invalid packed leaf header or checksum")
         }
-        let count = Int(try PageEnvelope.readU32(bytes, at: 4))
-        guard count > 0, count <= capacity / 4, types.count < capacity / 4 else {
-            throw JedError.corruption("invalid packed leaf directory counts")
-        }
+        let n = Int(try PageEnvelope.readU32(bytes, at: 4))
+        guard n > 0, n <= capacity, types.count < capacity / 2 else { throw JedError.corruption("invalid leaf counts") }
         var reader = ByteReader(bytes[16...])
-        var ends: [Int] = [], previous = 0
-        for _ in 0..<count {
-            let end = Int(try reader.u32())
-            guard end >= previous, end <= capacity - 4 * count else {
-                throw JedError.corruption("invalid key directory")
+        let flags = try reader.u8()
+        guard flags & ~3 == 0 else { throw JedError.corruption("invalid leaf flags") }
+        let fixed = flags & 1 != 0 ? Int(try reader.u16()) : nil
+        if let fixed, fixed == 0 { throw JedError.corruption("zero key stride") }
+        let prefixLength = flags & 2 != 0 ? Int(try reader.u16()) : 0
+        guard flags & 2 == 0 || prefixLength > 0,
+              fixed.map({ prefixLength < $0 }) ?? true else { throw JedError.corruption("invalid key prefix") }
+        let prefix = Array(try reader.take(prefixLength))
+        var ends: [Int] = []
+        if let fixed { ends = (1...n).map { $0 * (fixed - prefixLength) } }
+        else {
+            var prior = 0
+            for _ in 0..<n {
+                let end = Int(try reader.u16())
+                guard end >= prior else { throw JedError.corruption("invalid key directory") }
+                ends.append(end); prior = end
             }
-            ends.append(end); previous = end
         }
         let keyStart = 16 + reader.offset
-        _ = try reader.take(previous)
-        var ranges: [Range<Int>] = [], start = keyStart
-        for end in ends { ranges.append(start..<(keyStart + end)); start = keyStart + end }
-        for index in 1..<count where !integrity {
-            guard bytes[ranges[index - 1]].lexicographicallyPrecedes(bytes[ranges[index]]) else {
-                throw JedError.corruption("leaf keys are not strictly increasing")
-            }
+        _ = try reader.take(ends.last!)
+        var keys: [Range<Int>] = [], prior = 0
+        for end in ends { keys.append((keyStart + prior)..<(keyStart + end)); prior = end }
+        for row in 1..<n where !integrity {
+            guard bytes[keys[row - 1]].lexicographicallyPrecedes(bytes[keys[row]]) else { throw JedError.corruption("leaf keys are not strictly increasing") }
         }
         var starts: [Int] = []
-        for _ in 0...types.count { starts.append(Int(try reader.u32())) }
-        guard starts.first == reader.offset, let contentEnd = starts.last, contentEnd <= capacity,
+        for _ in 0...types.count { starts.append(Int(try reader.u16())) }
+        guard starts.first == reader.offset, let end = starts.last, end <= capacity,
               zip(starts, starts.dropFirst()).allSatisfy({ $0 <= $1 }),
-              bytes[(16 + contentEnd)...].allSatisfy({ $0 == 0 }) else {
-            throw JedError.corruption("invalid column directory or leaf padding")
+              bytes[(16 + end)...].allSatisfy({ $0 == 0 }) else { throw JedError.corruption("invalid column directory or leaf padding") }
+        var regions: [Region] = []
+        func null(_ bitmap: Int, _ row: Int) -> Bool { bytes[bitmap + row / 8] & (0x80 >> (row % 8)) != 0 }
+        func bitmap(_ cursor: inout ByteReader, start: Int) throws -> Int {
+            let at = start + cursor.offset, length = (n + 7) / 8
+            let bits = try cursor.take(length)
+            if n % 8 != 0, bits.last! & (UInt8.max >> (n % 8)) != 0 { throw JedError.corruption("invalid null bitmap padding") }
+            return at
         }
-        var regions: [Region] = [], allOffsets: [Int] = []
-        for column in types.indices {
-            let range = (16 + starts[column])..<(16 + starts[column + 1])
-            guard !range.isEmpty, bytes[range.lowerBound] == 0 else { throw JedError.corruption("invalid column region flags") }
-            if let width = ValueCodec.fixedWidth(types[column].type) {
-                let bitmapCount = (count + 7) / 8
-                guard range.count == 1 + bitmapCount + count * width else { throw JedError.corruption("invalid fixed column extent") }
-                let bitmap = (range.lowerBound + 1)..<(range.lowerBound + 1 + bitmapCount)
-                let values = bitmap.upperBound..<range.upperBound
-                if count % 8 != 0 {
-                    guard bytes[bitmap.upperBound - 1] & (UInt8.max >> (count % 8)) == 0 else {
-                        throw JedError.corruption("nonzero unused null-bitmap bits")
-                    }
+        func spans(_ cursor: inout ByteReader, count: Int, start: Int, tail: Int = 0) throws -> [Range<Int>] {
+            var ends: [Int] = [], previous = 0
+            for _ in 0..<count {
+                let value = Int(try cursor.u16())
+                guard value >= previous else { throw JedError.corruption("invalid value directory") }
+                ends.append(value); previous = value
+            }
+            guard previous == cursor.remaining - tail else { throw JedError.corruption("invalid value region extent") }
+            let at = start + cursor.offset
+            _ = try cursor.take(previous)
+            var result: [Range<Int>] = []; previous = 0
+            for end in ends { result.append((at + previous)..<(at + end)); previous = end }
+            return result
+        }
+        func validateSpans(_ ranges: [Range<Int>], type: TypeDescriptor) throws {
+            for range in ranges where !range.isEmpty && !integrity {
+                let tag = bytes[range.lowerBound]
+                guard tag == 2 || tag == 3 || tag == 4 || (LeafValue.bare(type.type) ? tag == 5 : tag == 0) else {
+                    throw JedError.corruption("invalid leaf value presence tag")
                 }
-                for row in 0..<count where bytes[bitmap.lowerBound + row / 8] & (0x80 >> (row % 8)) != 0 {
-                    let start = values.lowerBound + row * width
-                    guard bytes[start..<(start + width)].allSatisfy({ $0 == 0 }) else {
-                        throw JedError.corruption("nonzero NULL fixed-width slot")
-                    }
-                }
-                regions.append(Region(kind: Kind(types[column].type), width: width, bitmap: bitmap.lowerBound,
-                    values: values.lowerBound, directory: 0))
-            } else {
-                guard range.count >= 1 + count * 4 else { throw JedError.corruption("truncated variable column directory") }
-                var directory = ByteReader(bytes[(range.lowerBound + 1)..<range.upperBound])
-                var offsets: [Int] = [], prior = 0
-                let valueStart = range.lowerBound + 1 + count * 4
-                for _ in 0..<count {
-                    let end = Int(try directory.u32())
-                    guard end >= prior, end <= range.upperBound - valueStart else {
-                        throw JedError.corruption("invalid value directory")
-                    }
-                    if end > prior && !integrity {
-                        let first = bytes[valueStart + prior]
-                        guard first == 0 || first == 2 || first == 3 || first == 4 else {
-                            throw JedError.corruption("invalid leaf value presence tag")
-                        }
-                    }
-                    offsets.append(end); prior = end
-                }
-                guard prior == range.upperBound - valueStart else { throw JedError.corruption("unused variable column bytes") }
-                regions.append(Region(kind: Kind(types[column].type), width: 0, bitmap: 0,
-                    values: valueStart, directory: allOffsets.count))
-                allOffsets.append(contentsOf: offsets)
             }
         }
-        self.bytes = bytes; self.types = types; self.count = count
-        payloadSize = contentEnd; keys = ranges; self.regions = regions; offsets = allOffsets
+        for column in types.indices {
+            let start = 16 + starts[column], stop = 16 + starts[column + 1], type = types[column]
+            if start == stop {
+                guard let offset = layout.keyOffsets[column], let width = LeafValue.width(type),
+                      keys.allSatisfy({ prefixLength + $0.count >= offset + width }) else { throw JedError.corruption("invalid elided column") }
+                regions.append(.key(offset, width)); continue
+            }
+            if layout.keyOffsets[column] != nil { throw JedError.corruption("stored elided column") }
+            var region = ByteReader(bytes[start..<stop])
+            switch try region.u8() {
+            case 0:
+                if let width = LeafValue.width(type) {
+                    let bitmap = try bitmap(&region, start: start), values = start + region.offset
+                    guard region.remaining == n * width else { throw JedError.corruption("invalid fixed column extent") }
+                    for row in 0..<n where null(bitmap, row) {
+                        guard bytes[(values + row * width)..<(values + (row + 1) * width)].allSatisfy({ $0 == 0 }) else { throw JedError.corruption("nonzero NULL slot") }
+                    }
+                    regions.append(.fixed(bitmap: bitmap, values: values, width: width))
+                } else {
+                    let ranges = try spans(&region, count: n, start: start)
+                    try validateSpans(ranges, type: type); regions.append(.spans(ranges))
+                }
+            case 1:
+                guard LeafValue.integer(type), let width = LeafValue.width(type) else { throw JedError.corruption("invalid base-offset column") }
+                let bitmap = try bitmap(&region, start: start)
+                let base = CompactRegion.unsigned(try region.take(width)), stride = Int(try region.u8()), values = start + region.offset
+                guard [0, 1, 2, 4].contains(stride), stride < width, region.remaining == n * stride else { throw JedError.corruption("invalid offset width") }
+                let maximum = width == 8 ? UInt64.max : (UInt64(1) << (width * 8)) - 1
+                for row in 0..<n {
+                    let delta = CompactRegion.unsigned(try region.take(stride))
+                    guard delta <= maximum - base, !null(bitmap, row) || delta == 0 else { throw JedError.corruption("invalid column offset") }
+                }
+                regions.append(.base(bitmap: bitmap, values: values, width: width, base: base, stride: stride))
+            case 2:
+                guard LeafValue.bare(type.type) else { throw JedError.corruption("invalid dictionary column") }
+                let count = Int(try region.u16())
+                guard count > 0, count <= 256 else { throw JedError.corruption("invalid dictionary count") }
+                let entries = try spans(&region, count: count, start: start, tail: n)
+                try validateSpans(entries, type: type)
+                var ranges: [Range<Int>] = []
+                for _ in 0..<n {
+                    let code = Int(try region.u8()); guard code < count else { throw JedError.corruption("invalid dictionary code") }
+                    ranges.append(entries[code])
+                }
+                regions.append(.spans(ranges))
+            case 4:
+                guard let width = CompactRegion.arrayWidth(type.type) else { throw JedError.corruption("invalid packed array column") }
+                let counts = try region.take(n).map { $0 == 255 ? -1 : Int($0) }
+                var offsets: [Int] = [], total = 0
+                for count in counts { offsets.append(total); total += max(0, count) }
+                let base = CompactRegion.unsigned(try region.take(width)), bits = Int(try region.u8()), values = start + region.offset
+                guard bits <= width * 8, region.remaining == (total * bits + 7) / 8 else { throw JedError.corruption("invalid packed array extent") }
+                let data = try region.take(region.remaining)
+                if total * bits % 8 != 0, data.last! & (UInt8.max >> (total * bits % 8)) != 0 { throw JedError.corruption("invalid packed array padding") }
+                let maximum = width == 8 ? UInt64.max : (UInt64(1) << (width * 8)) - 1
+                for index in 0..<total {
+                    let delta = Self.bits(bytes, at: values * 8 + index * bits, count: bits)
+                    guard delta <= maximum - base else { throw JedError.corruption("packed array element overflows") }
+                }
+                regions.append(.arrays(counts: counts, offsets: offsets, values: values, width: width, base: base, bits: bits))
+            default: throw JedError.corruption("invalid column region kind")
+            }
+        }
+        self.bytes = bytes; self.types = types; self.layout = layout; count = n; payloadSize = end
+        self.keys = keys; self.prefix = prefix; self.regions = regions
     }
-
-    func key(at row: Int) -> ArraySlice<UInt8> { bytes[keys[row]] }
-
-    /// Three-way byte order of a stored key against a probe, without building
-    /// a slice: negative when the stored key sorts first.
+    private static func bits(_ bytes: [UInt8], at: Int, count: Int) -> UInt64 {
+        var value: UInt64 = 0
+        for bit in at..<(at + count) { value = (value << 1) | UInt64((bytes[bit / 8] >> (7 - bit % 8)) & 1) }
+        return value
+    }
+    func key(at row: Int) -> ArraySlice<UInt8> {
+        prefix.isEmpty ? bytes[keys[row]] : (prefix + bytes[keys[row]])[...]
+    }
     func compareKey(at row: Int, with other: [UInt8]) -> Int {
-        let range = keys[row], count = range.count, limit = min(count, other.count)
-        var index = 0
-        while index < limit {
-            let a = bytes[range.lowerBound + index], b = other[index]
-            if a != b { return a < b ? -1 : 1 }
-            index += 1
+        let suffix = keys[row], length = prefix.count + suffix.count
+        for index in 0..<min(length, other.count) {
+            let value = index < prefix.count ? prefix[index] : bytes[suffix.lowerBound + index - prefix.count]
+            if value != other[index] { return value < other[index] ? -1 : 1 }
         }
-        return count == other.count ? 0 : (count < other.count ? -1 : 1)
+        return length == other.count ? 0 : length < other.count ? -1 : 1
     }
-
-    /// The stored byte span of a cell, or nil for NULL.
-    @inline(__always)
-    private func span(row: Int, region: Region) -> Range<Int>? {
-        if region.width > 0 {
-            if bytes[region.bitmap + row / 8] & (0x80 >> (row % 8)) != 0 { return nil }
-            let start = region.values + row * region.width
-            return start..<(start + region.width)
+    private func null(_ bitmap: Int, _ row: Int) -> Bool { bytes[bitmap + row / 8] & (0x80 >> (row % 8)) != 0 }
+    func isNull(row: Int, column: Int) -> Bool {
+        switch regions[column] {
+        case .key: false
+        case .fixed(let bitmap, _, _), .base(let bitmap, _, _, _, _): null(bitmap, row)
+        case .spans(let spans): spans[row].isEmpty
+        case .arrays(let counts, _, _, _, _, _): counts[row] < 0
         }
-        let base = region.directory + row
-        let start = region.values + (row == 0 ? 0 : offsets[base - 1]), end = region.values + offsets[base]
-        return start == end ? nil : start..<end
     }
-
-    func isNull(row: Int, column: Int) -> Bool { span(row: row, region: regions[column]) == nil }
-
     func cell(row: Int, column: Int) -> StoredCell {
-        let range = span(row: row, region: regions[column])
-        return StoredCell(bytes: range.map { bytes[$0] }, width: regions[column].width)
+        let width = LeafValue.width(types[column]) ?? 0
+        if isNull(row: row, column: column) { return StoredCell(bytes: nil, width: width) }
+        switch regions[column] {
+        case .key(let offset, let width):
+            let key = key(at: row), start = key.startIndex + offset
+            return StoredCell(bytes: key[start..<(start + width)], width: width, keyDerived: true)
+        case .fixed(_, let values, let width):
+            return StoredCell(bytes: bytes[(values + row * width)..<(values + (row + 1) * width)], width: width)
+        case .spans(let spans): return StoredCell(bytes: bytes[spans[row]], width: 0)
+        case .base(_, let values, let width, let base, let stride):
+            let value = base + CompactRegion.unsigned(bytes[(values + row * stride)..<(values + (row + 1) * stride)])
+            return StoredCell(bytes: CompactRegion.bytes(value, width: width)[...], width: width)
+        case .arrays(let counts, let offsets, let values, let width, let base, let bits):
+            var writer = ByteWriter(); writer.u8(0); writer.u8(counts[row] == 0 ? 0 : 1); writer.u8(0)
+            if counts[row] > 0 {
+                writer.u32(UInt32(counts[row])); writer.u32(1)
+                for index in offsets[row]..<(offsets[row] + counts[row]) {
+                    let value = base + Self.bits(bytes, at: values * 8 + index * bits, count: bits)
+                    writer.append(CompactRegion.bytes(value, width: width))
+                }
+            }
+            return StoredCell(bytes: writer.bytes[...], width: 0)
+        }
     }
-
-    @inline(__always)
-    private func be32(_ at: Int) -> UInt32 {
-        UInt32(bytes[at]) << 24 | UInt32(bytes[at + 1]) << 16 | UInt32(bytes[at + 2]) << 8 | UInt32(bytes[at + 3])
+    /// Read fixed scalar bodies without allocating a reconstructed key or
+    /// offset cell. Region bounds and widths were checked at page admission.
+    private func word(row: Int, column: Int) -> UInt64? {
+        guard !isNull(row: row, column: column) else { return nil }
+        switch regions[column] {
+        case .fixed(_, let start, let width) where width <= 8:
+            return CompactRegion.unsigned(bytes[(start + row * width)..<(start + (row + 1) * width)])
+        case .base(_, let start, _, let base, let stride):
+            return base + CompactRegion.unsigned(bytes[(start + row * stride)..<(start + (row + 1) * stride)])
+        case .key(let offset, let width) where width <= 8:
+            var value: UInt64 = 0
+            for index in offset..<(offset + width) {
+                let byte = index < prefix.count ? prefix[index] : bytes[keys[row].lowerBound + index - prefix.count]
+                value = value << 8 | UInt64(byte)
+            }
+            return value
+        default: return nil
+        }
     }
-    @inline(__always)
-    private func be64(_ at: Int) -> UInt64 { UInt64(be32(at)) << 32 | UInt64(be32(at + 4)) }
-
-    /// Decode common scalar cells directly from the page. Returns nil when
-    /// the general codec must run (other types, compressed or external
-    /// values); results and errors match `cell(...).materialize()` exactly.
     func fastValue(row: Int, column: Int) throws -> SQLValue? {
-        let region = regions[column]
-        if region.kind == .other { return nil }
-        guard let range = span(row: row, region: region) else { return .null }
-        let at = range.lowerBound
-        switch region.kind {
-        case .i16: return .integer(Int64(Int16(bitPattern: (UInt16(bytes[at]) << 8 | UInt16(bytes[at + 1])) ^ 0x8000)))
-        case .i32: return .integer(Int64(Int32(bitPattern: be32(at) ^ 0x8000_0000)))
-        case .i64: return .integer(Int64(bitPattern: be64(at) ^ 0x8000_0000_0000_0000))
-        case .timestamp: return .timestamp(Int64(bitPattern: be64(at) ^ 0x8000_0000_0000_0000))
-        case .timestamptz: return .timestamptz(Int64(bitPattern: be64(at) ^ 0x8000_0000_0000_0000))
-        case .date: return .date(Int32(bitPattern: be32(at) ^ 0x8000_0000))
-        case .boolean:
-            guard bytes[at] <= 1 else { throw JedError.corruption("invalid boolean body") }
-            return .boolean(bytes[at] == 1)
-        case .f32: return .f32(be32(at))
-        case .f64: return .f64(be64(at))
-        case .text, .bytea:
-            // Inline tag 0, then a u16 length that must fill the span exactly.
-            guard bytes[at] == 0, range.count >= 3 else { return nil }
-            let length = Int(bytes[at + 1]) << 8 | Int(bytes[at + 2])
-            guard length == range.count - 3 else { return nil }
-            let body = Array(bytes[(at + 3)..<range.upperBound])
-            if region.kind == .bytea { return .bytea(body) }
-            do { return .text(try SQLText(utf8: body)) }
-            catch { throw JedError.corruption("invalid UTF-8 in stored text") }
-        case .other: return nil
+        if isNull(row: row, column: column) { return .null }
+        if case .scalar(let scalar) = types[column].type, let value = word(row: row, column: column) {
+            switch scalar {
+            case .i16: return .integer(Int64(Int16(bitPattern: UInt16(value) ^ 0x8000)))
+            case .i32: return .integer(Int64(Int32(bitPattern: UInt32(value) ^ 0x8000_0000)))
+            case .i64: return .integer(Int64(bitPattern: value ^ 0x8000_0000_0000_0000))
+            case .date: return .date(Int32(bitPattern: UInt32(value) ^ 0x8000_0000))
+            case .timestamp: return .timestamp(Int64(bitPattern: value ^ 0x8000_0000_0000_0000))
+            case .timestamptz: return .timestamptz(Int64(bitPattern: value ^ 0x8000_0000_0000_0000))
+            case .boolean:
+                guard value <= 1 else { throw JedError.corruption("invalid boolean body") }
+                return .boolean(value == 1)
+            case .f32: return .f32(UInt32(value))
+            case .f64: return .f64(value)
+            default: break
+            }
         }
+        let cell = cell(row: row, column: column)
+        if cell.fixedWidth != nil || cell.bytes?.first == 0 || cell.bytes?.first == 5 { return try cell.materialize(type: types[column]) }
+        return nil
     }
-
-    /// The value of a non-NULL i16/i32/i64 cell, exactly as `fastValue`
-    /// decodes it; nil for NULL and for every other column kind.
     func fastInteger(row: Int, column: Int) -> Int64? {
-        let region = regions[column]
-        guard region.kind == .i16 || region.kind == .i32 || region.kind == .i64,
-              let range = span(row: row, region: region) else { return nil }
-        let at = range.lowerBound
-        switch region.kind {
-        case .i16: return Int64(Int16(bitPattern: (UInt16(bytes[at]) << 8 | UInt16(bytes[at + 1])) ^ 0x8000))
-        case .i32: return Int64(Int32(bitPattern: be32(at) ^ 0x8000_0000))
-        default: return Int64(bitPattern: be64(at) ^ 0x8000_0000_0000_0000)
+        guard case .scalar(let scalar) = types[column].type, scalar.integerWidth != nil,
+              let value = word(row: row, column: column) else { return nil }
+        switch scalar {
+        case .i16: return Int64(Int16(bitPattern: UInt16(value) ^ 0x8000))
+        case .i32: return Int64(Int32(bitPattern: UInt32(value) ^ 0x8000_0000))
+        default: return Int64(bitPattern: value ^ 0x8000_0000_0000_0000)
         }
     }
-
-    /// A variable-width cell as an encoded predicate reads it: NULL, an inline
-    /// value (tag 0 and a u16 length filling the span) given as the byte range
-    /// of its body in `bytes`, or anything else.
     enum ShortBody { case null, inline(Range<Int>), other }
     func shortBody(row: Int, column: Int) -> ShortBody {
-        let region = regions[column]
-        guard region.width == 0 else { return .other }
-        guard let range = span(row: row, region: region) else { return .null }
-        let at = range.lowerBound
-        guard bytes[at] == 0, range.count >= 3 else { return .other }
-        let length = Int(bytes[at + 1]) << 8 | Int(bytes[at + 2])
-        guard length == range.count - 3 else { return .other }
-        return .inline((at + 3)..<range.upperBound)
+        if isNull(row: row, column: column) { return .null }
+        guard case .spans(let spans) = regions[column] else { return .other }
+        let span = spans[row]
+        if bytes[span.lowerBound] == 5 { return .inline((span.lowerBound + 1)..<span.upperBound) }
+        return .other
     }
-
-    /// A variable-width cell split at its tag byte: NULL, an inline value
-    /// (tag 0) given as the byte range after the tag, or anything else.
     func taggedBody(row: Int, column: Int) -> ShortBody {
-        let region = regions[column]
-        guard region.width == 0 else { return .other }
-        guard let range = span(row: row, region: region) else { return .null }
-        guard bytes[range.lowerBound] == 0 else { return .other }
-        return .inline((range.lowerBound + 1)..<range.upperBound)
+        if isNull(row: row, column: column) { return .null }
+        guard case .spans(let spans) = regions[column] else { return .other }
+        let span = spans[row]
+        guard bytes[span.lowerBound] == 0 else { return .other }
+        return .inline((span.lowerBound + 1)..<span.upperBound)
     }
-
-    /// True when `cell(...).largeFacts` is certainly nil without an error: a
-    /// fixed-width cell, a NULL, or a variable cell with the inline tag.
     func hasNoLargeFacts(row: Int, column: Int) -> Bool {
-        let region = regions[column]
-        if region.width > 0 { return true }
-        guard let range = span(row: row, region: region) else { return true }
-        return bytes[range.lowerBound] == 0
+        let cell = cell(row: row, column: column)
+        return cell.isNull || cell.fixedWidth != nil || cell.bytes?.first == 0 || cell.bytes?.first == 5
     }
-
     func record(at row: Int) -> PackedRecord {
         PackedRecord(key: Array(key(at: row)), cells: types.indices.map { cell(row: row, column: $0) })
     }
-
-    static func overhead(records: Int, types: [TypeDescriptor]) -> Int {
-        types.reduce(4 * records + 4 * (types.count + 1)) {
-            $0 + (ValueCodec.fixedWidth($1.type) == nil ? 1 + 4 * records : 1 + (records + 7) / 8)
+    static func overhead(records: Int, types: [TypeDescriptor], layout: LeafLayout = .index) -> Int {
+        var size = 1 + (layout.fixedKeyLength == nil ? 2 * records : 2) + 2 * (types.count + 1)
+        for column in types.indices where layout.keyOffsets[column] == nil {
+            size += LeafValue.width(types[column]) == nil ? 1 + 2 * records : 1 + (records + 7) / 8
         }
+        return size
     }
-
-    static func encodePayload(_ records: [PackedRecord], types: [TypeDescriptor], capacity: Int) throws -> [UInt8] {
-        guard !records.isEmpty, records.count <= capacity / 4,
-              records.allSatisfy({ $0.cells.count == types.count }),
-              zip(records, records.dropFirst()).allSatisfy({ $0.key.lexicographicallyPrecedes($1.key) }) else {
-            throw JedError.corruption("invalid packed leaf records")
+    static func measure(_ records: [PackedRecord], types: [TypeDescriptor], layout: LeafLayout = .index) -> Int {
+        payload(records, types: types, layout: layout).count
+    }
+    private static func payload(_ records: [PackedRecord], types: [TypeDescriptor], layout: LeafLayout) -> [UInt8] {
+        var prefix = 0
+        if let first = records.first?.key, let last = records.last?.key, records.count >= 2 {
+            while prefix < min(first.count, last.count, 65535), first[prefix] == last[prefix] { prefix += 1 }
+            if records.count * prefix <= prefix + 2 { prefix = 0 }
         }
-        let total = records.reduce(overhead(records: records.count, types: types)) { $0 + $1.weight }
-        guard total <= capacity else { throw JedError("0A000", "leaf payload exceeds page capacity") }
-        var keyDirectory = ByteWriter(), keys = ByteWriter(), regions: [[UInt8]] = []
-        for record in records { keys.append(record.key); keyDirectory.u32(UInt32(keys.bytes.count)) }
-        for column in types.indices {
-            var region = ByteWriter(); region.u8(0)
-            if let width = ValueCodec.fixedWidth(types[column].type) {
-                var bitmap = [UInt8](repeating: 0, count: (records.count + 7) / 8), values = ByteWriter()
-                for (row, record) in records.enumerated() {
-                    if let bytes = record.cells[column].bytes {
-                        guard bytes.count == width else { throw JedError.corruption("invalid fixed-width cell") }
-                        values.append(bytes)
-                    } else {
-                        bitmap[row / 8] |= 0x80 >> (row % 8)
-                        values.append(repeatElement(UInt8(0), count: width))
-                    }
-                }
-                region.append(bitmap); region.append(values.bytes)
-            } else {
-                var directory = ByteWriter(), values = ByteWriter()
-                for record in records {
-                    if let bytes = record.cells[column].bytes { values.append(bytes) }
-                    directory.u32(UInt32(values.bytes.count))
-                }
-                region.append(directory.bytes); region.append(values.bytes)
-            }
-            regions.append(region.bytes)
+        var writer = ByteWriter(); writer.u8((layout.fixedKeyLength == nil ? 0 : 1) | (prefix > 0 ? 2 : 0))
+        if let width = layout.fixedKeyLength { writer.u16(UInt16(width)) }
+        if prefix > 0 { writer.u16(UInt16(prefix)); writer.append(records[0].key.prefix(prefix)) }
+        if layout.fixedKeyLength == nil {
+            var end = 0
+            for record in records { end += record.key.count - prefix; writer.u16(UInt16(truncatingIfNeeded: end)) }
         }
-        var result = ByteWriter()
-        result.append(keyDirectory.bytes); result.append(keys.bytes)
-        var offset = result.bytes.count + 4 * (types.count + 1)
-        result.u32(UInt32(offset))
-        for region in regions { offset += region.count; result.u32(UInt32(offset)) }
-        for region in regions { result.append(region) }
-        return result.bytes
+        for record in records { writer.append(record.key.dropFirst(prefix)) }
+        let regions = types.indices.map { column -> [UInt8] in
+            if layout.keyOffsets[column] != nil { return [] }
+            return CompactRegion.encode(records.map { $0.cells[column] }, type: types[column])
+        }
+        var offset = writer.bytes.count + 2 * (types.count + 1)
+        writer.u16(UInt16(truncatingIfNeeded: offset))
+        for region in regions { offset += region.count; writer.u16(UInt16(truncatingIfNeeded: offset)) }
+        for region in regions { writer.append(region) }
+        return writer.bytes
+    }
+    static func encodePayload(_ records: [PackedRecord], types: [TypeDescriptor], capacity: Int, layout: LeafLayout = .index) throws -> [UInt8] {
+        guard !records.isEmpty, records.allSatisfy({ $0.cells.count == types.count }),
+              zip(records, records.dropFirst()).allSatisfy({ $0.key.lexicographicallyPrecedes($1.key) }),
+              layout.fixedKeyLength.map({ width in records.allSatisfy { $0.key.count == width } }) ?? true else { throw JedError.corruption("invalid packed leaf records") }
+        let bytes = payload(records, types: types, layout: layout)
+        guard bytes.count <= capacity else { throw JedError("0A000", "leaf payload exceeds page capacity") }
+        return bytes
     }
 }

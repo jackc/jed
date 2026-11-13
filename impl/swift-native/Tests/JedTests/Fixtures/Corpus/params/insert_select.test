@@ -1,0 +1,74 @@
+# A bare parameter projected by an INSERT … SELECT source takes its target column's type, as a
+# VALUES slot does (spec/design/api.md §5): the same select-list positions where a string literal
+# stays unknown for the target to type (grammar.md §24). Each `# params:` record binds host values
+# (conformance.md §1.2).
+# Format + the `requires` directive: ../../../design/conformance.md.
+# requires: harness.params, ddl.create_table, ddl.primary_key, dml.insert, dml.insert_column_list, dml.insert_select, query.select, query.where_eq, query.order_by, query.cte, types.i16, types.i32, types.i64, types.text, types.uuid, types.array
+
+statement ok
+CREATE TABLE feeds (id uuid PRIMARY KEY, url text)
+
+statement ok
+CREATE TABLE subscriptions (user_id uuid, feed_id uuid)
+
+statement ok
+INSERT INTO feeds VALUES ('00000000-0000-0000-0000-000000000001', 'feed')
+
+# $1 is typed uuid by subscriptions.user_id; $2 is text from the WHERE comparison.
+# params: '00000000-0000-0000-0000-000000000002', 'feed'
+statement ok
+INSERT INTO subscriptions (user_id, feed_id) SELECT $1, id FROM feeds WHERE url = $2
+
+query TT nosort
+SELECT user_id, feed_id FROM subscriptions
+----
+00000000-0000-0000-0000-000000000002
+00000000-0000-0000-0000-000000000001
+
+# The target column is the one the item lands in, through the column list's order.
+# params: '00000000-0000-0000-0000-000000000003'
+statement ok
+INSERT INTO subscriptions (feed_id, user_id) SELECT id, $1 FROM feeds
+
+query TT nosort
+SELECT user_id, feed_id FROM subscriptions ORDER BY user_id
+----
+00000000-0000-0000-0000-000000000002
+00000000-0000-0000-0000-000000000001
+00000000-0000-0000-0000-000000000003
+00000000-0000-0000-0000-000000000001
+
+# The SELECT under a WITH, and a container column.
+statement ok
+CREATE TABLE n (id i32 PRIMARY KEY, w i16, tags text[])
+
+# params: 1, 7, ARRAY['a', 'b']
+statement ok
+INSERT INTO n WITH s AS (SELECT 0 AS z) SELECT $1, $2, $3 FROM s
+
+# A parameter also used elsewhere in the query unifies with its target-column type.
+statement ok
+CREATE TABLE src (k i16 PRIMARY KEY)
+
+statement ok
+INSERT INTO src VALUES (2)
+
+# params: 2
+statement ok
+INSERT INTO n (id, w) SELECT k, $1 FROM src WHERE k = $1
+
+query IIT nosort
+SELECT id, w, tags FROM n ORDER BY id
+----
+1
+7
+{a,b}
+2
+2
+NULL
+
+# An explicitly typed parameter keeps its type, so an incompatible one is still refused.
+# params: '00000000-0000-0000-0000-000000000004'
+statement error 42804
+INSERT INTO subscriptions (user_id) SELECT $1::text FROM feeds
+

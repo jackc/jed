@@ -176,7 +176,7 @@ internal struct EncryptedPageCodec: PageCodec {
 
     private func validateMetaEnvelope(_ page: [UInt8], slot: UInt32) throws {
         guard slot <= 1, page.count == pageSize else { throw JedError.corruption("invalid meta envelope") }
-        guard Array(page.prefix(4)) == Array("JEDB".utf8), page[4] == 0, page[5] == 50,
+        guard Array(page.prefix(4)) == Array("JEDB".utf8), page[4] == 0, page[5] == UInt8(MetaPage.version),
               page[6] == 1, page[7] == 40, try PageEnvelope.readU32(page, at: 8) == UInt32(pageSize),
               page[60..<64].allSatisfy({ $0 == 0 }) else {
             throw JedError.corruption("invalid encrypted meta header")

@@ -250,7 +250,7 @@ private final class PackedPredicateAtom {
             }
             guard let cell = try row.storedCell(column) else { return nil }
             guard let bytes = cell.bytes else { meter.charge(charge); try meter.step(); return false }
-            guard bytes.first == 0, let body = Self.shortBody(bytes.dropFirst()) else { return nil }
+            guard let body = bytes.first == 5 ? bytes.dropFirst() : (bytes.first == 0 ? Self.shortBody(bytes.dropFirst()) : nil) else { return nil }
             let width: Int
             if text {
                 guard let count = Self.utf8Width(body) else { return nil }
@@ -263,7 +263,7 @@ private final class PackedPredicateAtom {
             if let (leaf, index) = row.packedPosition() {
                 // The same decisions as below, read from the page in place.
                 switch leaf.taggedBody(row: index, column: column) {
-                case .other: return nil
+                case .other: break
                 case .null: meter.charge(charge); try meter.step(); return false
                 case .inline(let range):
                     guard let hasNull = arraySpans(leaf.bytes, range, element: element) else { return nil }

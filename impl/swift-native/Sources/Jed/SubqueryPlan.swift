@@ -65,15 +65,21 @@ extension ExpressionResolver {
                 if let qualifier, scope.contains(where: { $0.qualifier == qualifier }) { break }
             }
         }
-        // A real column at any enclosing level wins before scalar-function
-        // labels are considered as whole-row references.
+        // Columns at every enclosing level win before relation labels.
         if qualifier == nil {
             for (level, scope) in ([columns] + outerScopes).enumerated() {
-                let matches = scope.filter { $0.scalarFunction && $0.qualifier == name }
-                if let column = matches.first {
-                    if column.lateralDenied { throw JedError("42P10", "invalid reference to FROM-clause entry in a lateral outer join").detailed(ErrorHints.lateralDetail) }
-                    guard matches.count == 1 else { throw JedError("42702", "column reference is ambiguous: \(name)") }
-                    if column.ungroupedAncestor { throw JedError("42803", "subquery uses ungrouped column \(name) from outer query") }
+                let matches = scope.filter { $0.qualifier == name && !$0.hiddenFromStar }
+                guard !matches.isEmpty else { continue }
+                if matches.contains(where: { $0.ambiguousRelation }) { throw JedError("42P09", "table reference is ambiguous: \(name)") }
+                if matches.contains(where: { $0.lateralDenied }) { throw JedError("42P10", "invalid lateral reference").detailed(ErrorHints.lateralDetail) }
+                if matches.contains(where: { $0.ungroupedAncestor }) { throw JedError("42803", "subquery uses ungrouped column from outer query") }
+                let scalar = matches.count == 1 && matches[0].scalarFunction
+                if !scalar && storageCollation { throw JedError("0A000", "whole-row references are not supported in index expressions or predicates") }
+                let presence = matches.contains(where: { $0.rowNullable }) ? matches.firstIndex(where: { $0.rowNotNull }) : nil
+                if !scalar && matches.contains(where: { $0.rowNullable }) && presence == nil {
+                    throw JedError("0A000", "NULL-extendable whole-row reference has no NOT NULL column")
+                }
+                let fields = matches.map { column -> ResolvedExpression in
                     let node: ResolvedExpression.Node
                     if level == 0 { referencedColumns.insert(column.index); node = .column(column.index) }
                     else {
@@ -83,6 +89,9 @@ extension ExpressionResolver {
                     return ResolvedExpression(type: column.unresolved ? nil : column.type, node: node, position: position,
                         collation: column.collation ?? (ExpressionCollation.collatable(column.type.type) ? .implicit(column.type.collation ?? SQLText(validatedUTF8: [67])) : nil))
                 }
+                if scalar { return fields[0] }
+                let types = matches.map { TypeField(name: $0.rowName ?? $0.name, descriptor: $0.type) }
+                return ResolvedExpression(type: TypeDescriptor(.record(types)), node: .row(fields), position: position, rowPresence: presence)
             }
         }
         if let qualifier, !([columns] + outerScopes).contains(where: { $0.contains { $0.qualifier == qualifier } }) {

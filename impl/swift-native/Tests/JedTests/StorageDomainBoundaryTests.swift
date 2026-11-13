@@ -32,13 +32,13 @@ final class StorageDomainBoundaryTests: XCTestCase {
         var image = snapshot.catalog
         image.tables.append(CatalogTable(name: name, columns: columns, primaryKey: [0], root: PageSealer.nullReference(snapshot.pool.codec)))
         try snapshot.updateCatalog(image, schemaChanged: true)
-        snapshot.setTableStore(name, snapshot.emptyStore(types: columns.map { TypeDescriptor($0.type.type == .scalar(.i64) ? .scalar(.i64) : .scalar(.bytea)) }))
+        snapshot.setTableStore(name, snapshot.emptyStore(types: columns.map { TypeDescriptor($0.type.type == .scalar(.i64) ? .scalar(.i64) : .scalar(.bytea)) }, primaryKey: [0]))
     }
     private func put(_ id: Int64, table: String, snapshot: inout DomainSnapshot, blob: [UInt8]? = nil) throws {
         let name = try name(table)
         var store = try XCTUnwrap(snapshot.tables[name]), values: [RecordInput] = [.value(.integer(id))]
         if let blob { values.append(.value(.bytea(blob))) }
-        let record = try RecordDisposition.plan(key: key(id), values: values, types: store.tree.types, codec: store.tree.codec)
+        let record = try RecordDisposition.plan(key: key(id), values: values, types: store.tree.types, codec: store.tree.codec, layout: store.tree.layout)
         try store.put(record, netStaging: true); snapshot.setTableStore(name, store)
     }
     private func commit(_ working: DomainSnapshot, to domain: StorageDomain,
@@ -51,7 +51,7 @@ final class StorageDomainBoundaryTests: XCTestCase {
         let paths = GeneratedSpec.sourceHashes.keys.filter {
             $0.hasPrefix("spec/fileformat/fixtures/") && !$0.contains("/cow_") && !$0.contains("/malformed_")
         }.sorted()
-        XCTAssertEqual(paths.count, 87)
+        XCTAssertEqual(paths.count, 91)
         for path in paths {
             let name = String(path.split(separator: "/").last!.dropLast(4))
             do {
@@ -245,7 +245,7 @@ final class StorageDomainBoundaryTests: XCTestCase {
         XCTAssertTrue(domain.pager.selected.entries.isEmpty); XCTAssertEqual(domain.pager.selected.meta.freeList.index, 0)
         policy.storageLimit = 1
         working = domain.committed
-        for id in 2..<30 { try put(Int64(id), table: "t", snapshot: &working) }
+        for id in 2..<300 { try put(Int64(id), table: "t", snapshot: &working) }
         device.reset(); expect("54P06") { _ = try domain.prepare(working, policy: policy) }
         XCTAssertFalse(device.log.contains("write")); XCTAssertFalse(domain.pager.isPoisoned)
         working = domain.committed
@@ -267,7 +267,7 @@ final class StorageDomainBoundaryTests: XCTestCase {
         XCTAssertTrue(try domain.pager.allocationSnapshot(reuseAllowed: true).persistedFree.isEmpty)
         let bytes = try device.memory.read(at: 0, count: Int(device.memory.size()))
         working = before
-        for id in 2...60 { try put(Int64(id), table: "t", snapshot: &working) }
+        for id in 2...300 { try put(Int64(id), table: "t", snapshot: &working) }
         var limited = DomainCommitPolicy(); limited.storageLimit = 1; limited.oldestPinnedVersion = before.txid
         device.reset()
         expect("54P06") { _ = try domain.prepare(working, policy: limited) }
@@ -288,7 +288,7 @@ final class StorageDomainBoundaryTests: XCTestCase {
             highWater + UInt32(retry.pages.body.count - reclaimed.count))
         _ = try domain.persist(retry)
         let name = try name("t")
-        XCTAssertEqual(domain.committed.tables[name]?.count, 60)
+        XCTAssertEqual(domain.committed.tables[name]?.count, 300)
         XCTAssertEqual(before.tables[name]?.count, 1)
         XCTAssertNotNil(try before.tables[name]?.get(key(1)))
         XCTAssertNil(try before.tables[name]?.get(key(60)))

@@ -1,5 +1,98 @@
 # Swift experiment verification
 
+## Authorized baseline refresh (2026-11-12)
+
+Linux refresh acceptance is complete. The native Swift experiment now targets supported-core revision
+`b1a6affca7725e0b07a4f734eddb1c569ef76bcf`: format **v52**, **763 SQL files**,
+**116 database fixtures**, **19 saved simulations**, 22 generated simulation
+profiles and 31 process scenarios. The implementation is verified against that
+revision. It remains opt-in; Linux x86-64 with Swift 6.4.2 is the verified
+platform, and Apple platforms remain unverified.
+
+The refresh includes compact leaf regions, primary-key body elision, fixed-width
+numeric slots and multiway tree splits; whole-row values, parameter inference
+across writable CTEs and INSERT SELECT, bound LIMIT/OFFSET, timestamp aliases,
+container string literals and cast output names; and current streaming,
+columnar-attempt and bounded aggregate accounting. The canonical shared corpus
+and byte fixtures are copied from the target Git blobs, not rewritten for Swift.
+The generated input fingerprint is
+`668d96ce2c6e1001d21e0cb8492a89ce65a4101d550ad547f12afb7de12adb2f`.
+
+### Refresh verification
+
+| Gate | Result |
+|---|---|
+| Release native/API and SQL corpus | **557 native tests**, zero failures; **763/763 files**, 21,959 records, 39,809 cells, 2,273 cost / 1,162 name / 105 type assertions. |
+| Exact query-memory and committed storage | Full four-core matrix: **245,756 measurements**, zero differences across memory, disk and disk-spill. Repeated successfully with finalized SQL actor `eedccc09` before the storage-stage follow-up. |
+| Encrypted SQL | Full four-core matrix repeated with SQL actor `eedccc09`: **79,060 record measurements**, zero failures or transcript differences. |
+| File interchange | Full Swift/Rust/Go/TS matrix: **2,787/2,787 phases**, all 116 fixtures plus generated encryption/attachment cases, zero failures. |
+| Integrity CLI | **50 exact reports + 11 boundary probes**, zero failures. |
+| Saved recovery simulations | **19/19 traces per core**, 57 transcript comparisons, **153 independently checked Swift images**, zero failures. |
+| Generated recovery simulations | **176/176 traces per core** (22 profiles × seeds 1–8), **459 transcript comparisons**, **7,049 independently checked Swift images**, zero failures after the write-stage correction. The shared driver retains its 23 per-core-fault exemptions. |
+| Mixed processes | **496 pairings** (31 scenarios × 4 × 4), zero failures. Supported-core preparation also passes its 279 pairings. |
+| Page-service SQL | All six client/owner directions, **118,800 records**, zero failures; captured SQL actor `eedccc09` before the storage-stage follow-up. |
+| Threaded stress | **20,000 snapshot checks** across five core/storage runs, zero failures; Swift memory + durable disk, Rust/Go threads and TS seeded interleaving agree on checksum `f3e75496a3111181`. |
+| PostgreSQL oracle | All eight new/changed SQL probes checked byte-identically: bound SELECT/INSERT/CTE parameters, whole rows, cast names, container literals, timestamp aliases and fixed decimals. |
+| Spec and adapter checks | `mise run verify`, generated snapshot check, benchmark adapter check and all 61 benchmark-report checks pass. The benchmark contract now contains 157 workloads; no new timings are claimed. |
+
+### Reproduction and evidence
+
+Run the opt-in tasks from the repository root. The main acceptance commands are:
+
+```sh
+mise run swift-native:test --configuration release --all-sql
+mise run swift-native:query-memory --configuration release --no-build --output EMPTY_DIRECTORY
+mise run swift-native:encrypted --configuration release --no-build --output EMPTY_DIRECTORY
+mise run swift-native:interop --configuration release --no-build --output EMPTY_DIRECTORY
+mise run swift-native:sim:sweep --configuration release --no-build --regress --output EMPTY_DIRECTORY
+mise run swift-native:sim:sweep --configuration release --no-build --seeds 1..8 --output EMPTY_DIRECTORY
+mise run concurrency:process
+JED_PROCESS_CORES=swift-native,rust,go,node mise run swift-native:process --configuration release --no-build
+mise run swift-native:service --configuration release --no-swift-build --output EMPTY_DIRECTORY
+mise run swift-native:stress --configuration release --no-swift-build --output EMPTY_DIRECTORY
+```
+
+Each `EMPTY_DIRECTORY` must be distinct. `--no-build` requires the corresponding
+actors to exist; the first mixed-process attempt failed because Rust/Go actors
+were absent, then passed after `concurrency:process` built them. Earlier SQL,
+fixture and resource-accounting failures are recorded in [PROGRESS.md](PROGRESS.md).
+The final rebuild also follows review fixes to replay eligibility and leaf
+validation, and a generated-simulation fix retaining the data/manifest growth
+boundary. One intermediate build detected edited input files and was discarded.
+
+The final SQL/resource/encrypted/service comparisons captured XCTest actor
+`eedccc091d30b37062129e5a8b92d8cb67ca30329950eac389ddba1c7617b4b0`.
+This includes cached point-read admission, the replay allowlist and leaf validation.
+The subsequent pager-stage correction changes when file growth can flush body
+pages; its final native suite, storage interchange and recovery/process gates use
+newly captured actors. The final simulator is
+`3dcc1cfd2a597d7426798dedfe3acd4d63b88991601662c100e5c7a363b8c168`,
+and the final process actor is
+`d989026ba46031d9b22ee9093ccb92bfa2228ac5e135509806914bd8419c0eea`.
+Stress captured `c6a97879f9dd71f60c9cb01e2aa1bdc7229694abe0a92a1d1c5ea17be7412553`
+before the final pager-stage correction. Each report records its own actor hashes;
+earlier results are not attributed to later binaries.
+
+The initial matrices and failed generated sweep remain archived alongside the
+successful follow-ups in [the local evidence archive](results/refresh-20261112/manifest.json):
+62 reports/logs/accounting TSVs, 14,368,383 bytes. The manifest SHA-256 is
+`b0b2b7bdaf86ce7550b46e0c497b7da8afc35afdcea116a794826fbb5a4fdc16`. No actor binaries or database
+images are copied into that local ignored evidence archive. Its source manifest
+covers 1,573 source/tool/fixture files and has SHA-256
+`6ce2825a161d453d099021d94ea31e3b86aa5d2e8ac316d2d6e70fd033f887ce`.
+
+Original evidence is retained under `/tmp/swift-refresh-*`: `memory-final`,
+`encrypted-final`, `service-final`, `interop-complete`, `integrity`,
+`regress-complete`, `sims-complete`, `stress-final`, and the `process-complete.log`,
+`release-complete.log`, `oracle.log`, `verify-final.log`, `codegen-final.log`,
+`bench-adapter.log` and `bench-report.log` files.
+No main-core implementation, dependency declaration, default CI inclusion or
+website reference was changed. Existing benchmark results below and in
+[BENCHMARKS.md](BENCHMARKS.md) describe their original v50 actors; they do not
+establish performance for the v52 refresh.
+
+## Preserved November 5–10 verification
+
 Status: **Linux acceptance and structural-performance revalidation are complete.**
 Current implementation revision: `fb34b0e8cb3d82287fbd3401e3426f04b3b86c7a`.
 The original snapshot and its evidence below remain preserved at

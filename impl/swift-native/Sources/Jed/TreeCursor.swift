@@ -193,7 +193,7 @@ internal struct TreeCursor: Sendable {
             guard case .onDisk(let reference, _, _) = node.children[next] else { break }
             references.append(reference); next += descending ? -1 : 1
         }
-        pool.prefetch(references, types: tree.types)
+        pool.prefetch(references, types: tree.types, layout: tree.layout)
         hintWindow = min(64, hintWindow * 2)
     }
 

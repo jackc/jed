@@ -17,7 +17,7 @@ CREATE INDEX pa_amt_active ON pa (amt) WHERE status = 'active'
 
 # --- OR / IN interval set over a partial index -----------------------------------------------------
 
-# cost: 43
+# cost: 40
 query II rowsort
 SELECT id, amt FROM pa WHERE status = 'active' AND amt IN (3, 20)
 ----
@@ -28,7 +28,7 @@ SELECT id, amt FROM pa WHERE status = 'active' AND amt IN (3, 20)
 40
 3
 
-# cost: 522
+# cost: 482
 query II rowsort
 SELECT id, amt FROM pa WHERE status = 'active' AND (amt < 2 OR amt > 35)
 ----
@@ -41,7 +41,7 @@ SELECT id, amt FROM pa WHERE status = 'active' AND (amt < 2 OR amt > 35)
 
 # --- the exact-order walk with a bound on the same partial index -----------------------------------
 
-# cost: 37
+# cost: 34
 query II nosort
 SELECT amt, id FROM pa WHERE status = 'active' AND amt > 30 ORDER BY amt LIMIT 3
 ----
@@ -61,7 +61,7 @@ statement ok
 INSERT INTO po VALUES (1, 3), (2, 20), (3, 36), (4, 99)
 
 # the ON implies the predicate
-# cost: 53
+# cost: 49
 query II rowsort
 SELECT po.k, pa.id FROM po JOIN pa ON pa.amt = po.want AND pa.status = 'active'
 ----
@@ -76,7 +76,7 @@ SELECT po.k, pa.id FROM po JOIN pa ON pa.amt = po.want AND pa.status = 'active'
 
 # the WHERE implies `status = 'active'`, which is NULL-rejecting, so an inner join may probe the
 # partial index per outer row
-# cost: 53
+# cost: 49
 query II rowsort
 SELECT po.k, pa.id FROM po JOIN pa ON pa.amt = po.want WHERE pa.status = 'active'
 ----
@@ -90,7 +90,7 @@ SELECT po.k, pa.id FROM po JOIN pa ON pa.amt = po.want WHERE pa.status = 'active
 110
 
 # a LEFT JOIN whose ON implies the predicate: unmatched outer rows are NULL-extended as usual
-# cost: 54
+# cost: 50
 query II rowsort
 SELECT po.k, pa.id FROM po LEFT JOIN pa ON pa.amt = po.want AND pa.status = 'active'
 ----
@@ -151,7 +151,7 @@ SELECT po.k, pa.id FROM po LEFT JOIN pa ON pa.amt = po.want WHERE pa.tag IS NULL
 NULL
 
 # with the ON implying it, the probe is sound
-# cost: 85
+# cost: 73
 query II rowsort
 SELECT po.k, pa.id FROM po LEFT JOIN pa ON pa.amt = po.want AND pa.tag IS NULL
 ----

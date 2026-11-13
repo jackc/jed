@@ -18,51 +18,51 @@ CREATE TABLE t (id i32 PRIMARY KEY, v text)
 # max_storage_bytes: 163840
 
 statement ok
-INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(0, 9) g
+INSERT INTO t SELECT g, rpad(g::text, 1002, 'x') FROM generate_series(0, 9) g
 
 statement ok
-INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(10, 19) g
+INSERT INTO t SELECT g, rpad(g::text, 1002, 'x') FROM generate_series(10, 19) g
 
 statement ok
-INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(20, 29) g
+INSERT INTO t SELECT g, rpad(g::text, 1002, 'x') FROM generate_series(20, 29) g
 
 statement ok
-INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(30, 39) g
+INSERT INTO t SELECT g, rpad(g::text, 1002, 'x') FROM generate_series(30, 39) g
 
 statement ok
-INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(40, 49) g
+INSERT INTO t SELECT g, rpad(g::text, 1002, 'x') FROM generate_series(40, 49) g
 
 statement ok
-INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(50, 59) g
+INSERT INTO t SELECT g, rpad(g::text, 1002, 'x') FROM generate_series(50, 59) g
 
 statement ok
-INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(60, 69) g
+INSERT INTO t SELECT g, rpad(g::text, 1002, 'x') FROM generate_series(60, 69) g
 
 statement ok
-INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(70, 79) g
+INSERT INTO t SELECT g, rpad(g::text, 1002, 'x') FROM generate_series(70, 79) g
 
 statement ok
-INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(80, 89) g
+INSERT INTO t SELECT g, rpad(g::text, 1002, 'x') FROM generate_series(80, 89) g
 
 statement ok
-INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(90, 99) g
+INSERT INTO t SELECT g, rpad(g::text, 1002, 'x') FROM generate_series(90, 99) g
 
 statement ok
-INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(100, 109) g
+INSERT INTO t SELECT g, rpad(g::text, 1002, 'x') FROM generate_series(100, 109) g
 
 statement ok
-INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(110, 119) g
+INSERT INTO t SELECT g, rpad(g::text, 1002, 'x') FROM generate_series(110, 119) g
 
 statement ok
-INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(120, 129) g
+INSERT INTO t SELECT g, rpad(g::text, 1002, 'x') FROM generate_series(120, 129) g
 
 # The live count is now exactly twenty pages: one catalog page, the leaves, and their interior root.
 statement ok
-INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(130, 139) g
+INSERT INTO t SELECT g, rpad(g::text, 1002, 'x') FROM generate_series(130, 139) g
 
 # The fifteenth batch would grow it past the limit: the autocommit write commits nothing.
 statement error 54P06
-INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(140, 149) g
+INSERT INTO t SELECT g, rpad(g::text, 1002, 'x') FROM generate_series(140, 149) g
 
 query I nosort
 SELECT count(*) FROM t
@@ -75,10 +75,10 @@ statement ok
 DELETE FROM t WHERE id >= 70
 
 statement ok
-INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(70, 79) g
+INSERT INTO t SELECT g, rpad(g::text, 1002, 'x') FROM generate_series(70, 79) g
 
 statement ok
-INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(80, 89) g
+INSERT INTO t SELECT g, rpad(g::text, 1002, 'x') FROM generate_series(80, 89) g
 
 query I nosort
 SELECT count(*) FROM t
@@ -95,7 +95,7 @@ statement ok
 INSERT INTO t VALUES (1000, 'z')
 
 statement error 54P06
-INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(90, 99) g
+INSERT INTO t SELECT g, rpad(g::text, 1002, 'x') FROM generate_series(90, 99) g
 
 # An index build adds live pages like any write. This one needs exactly fourteen more.
 statement error 54P06

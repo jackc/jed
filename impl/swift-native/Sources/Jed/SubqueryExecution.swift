@@ -49,7 +49,7 @@ internal final class SubqueryExecution {
         var plan = query.plan
         // Materialized query blocks retain their source while collecting the
         // projected result. Specialized aggregate and columnar lanes own theirs.
-        if !ColumnarExecution.projection(plan, current) { plan.materializeSource = plan.aggregation == nil && plan.window == nil && plan.relation == nil && !plan.orderedByScan && plan.order.isEmpty && plan.limit == nil }
+        if !plan.streamsComputedProjection, !ColumnarExecution.projection(plan, current) { plan.materializeSource = plan.aggregation == nil && plan.window == nil && plan.relation == nil && !plan.orderedByScan && plan.order.isEmpty && plan.limit == nil }
         let execution = SelectExecution(plan: plan, context: current)
         defer { execution.close() }
         var rows: [[SQLValue]] = [], bytes: Int64 = 0

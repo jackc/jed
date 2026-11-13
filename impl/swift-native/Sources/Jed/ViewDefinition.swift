@@ -432,6 +432,11 @@ internal enum ViewSyntax {
             for join in value.joins { try from(join.right); if let condition = join.condition { try expression(condition) } }
         }
         func query(_ value: SQLQuery) throws {
+            for spelling in [value.limit, value.offset].compactMap({ $0 }) where spelling.hasPrefix("$") {
+                if let index = Int(spelling.dropFirst()) {
+                    try visitExpression(SQLExpression(kind: .parameter(index), span: value.span, position: value.span.position))
+                }
+            }
             let enclosingCTEs = ctes
             defer { ctes = enclosingCTEs }
             try visitQuery(value)

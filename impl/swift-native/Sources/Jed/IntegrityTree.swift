@@ -45,7 +45,7 @@ internal extension IntegrityChecker {
             let keys: [[UInt8]], leaf: PackedLeaf?, children: [PageReference]
             do {
                 if bytes[0] == 2 {
-                    let packed = try PackedLeaf(integrityBytes: bytes, types: types, codec: codec)
+                    let packed = try PackedLeaf(integrityBytes: bytes, types: types, codec: codec, layout: table.map { .table(types: types, primaryKey: $0.primaryKey) } ?? .index)
                     leaf = packed; keys = (0..<packed.count).map { Array(packed.key(at: $0)) }; children = []
                 } else {
                     let interior = try IntegrityInterior(bytes, encrypted: meta.encrypted)
@@ -105,7 +105,7 @@ internal extension IntegrityChecker {
     }
     /// Replays a structurally visited table without strict key ordering. A
     /// damaged key order is itself a finding, not permission to omit its rows.
-    func scanRows(root: PageReference, types: [TypeDescriptor], body consume: ([UInt8], [SQLValue]) throws -> Void) throws {
+    func scanRows(root: PageReference, types: [TypeDescriptor], table: CatalogTable? = nil, body consume: ([UInt8], [SQLValue]) throws -> Void) throws {
         func visit(_ reference: PageReference, depth: Int) throws {
             try poll()
             guard depth < 256, reference.index >= meta.firstBodyPage, reference.index < meta.pageCount else {
@@ -113,7 +113,7 @@ internal extension IntegrityChecker {
             }
             let bytes = try body(reference)
             if bytes[0] == 2 {
-                let leaf = try PackedLeaf(integrityBytes: bytes, types: types, codec: codec)
+                let leaf = try PackedLeaf(integrityBytes: bytes, types: types, codec: codec, layout: table.map { .table(types: types, primaryKey: $0.primaryKey) } ?? .index)
                 for ordinal in 0..<leaf.count {
                     try poll()
                     let record = leaf.record(at: ordinal)

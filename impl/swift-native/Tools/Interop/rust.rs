@@ -154,7 +154,7 @@ fn run() -> Result<()> {
                 let mut rows = database.query(&text(f.get(1).ok_or("missing SQL")?)?, &[])?;
                 let mut out = Vec::new();
                 for row in rows.by_ref() {
-                    let fields: Result<Vec<_>> = row
+                    let fields: Result<Vec<_>> = row?
                         .into_iter()
                         .map(|v| match v {
                             Value::Null => Ok("-".into()),
@@ -164,7 +164,6 @@ fn run() -> Result<()> {
                         .collect();
                     out.push(fields?.join(":"));
                 }
-                rows.error()?;
                 Ok(format!("{};{}", out.len(), out.join(",")))
             }
             "ATTACH" => {

@@ -98,6 +98,16 @@ final class PagerTests: XCTestCase {
         XCTAssertTrue(store.log.isEmpty)
     }
 
+    func testManifestGrowthRetainsTheBodyWriteBoundary() throws {
+        let (store, pager) = try opened()
+        let plan = try pager.prepare(body: [body(63)], root: PageReference(63), pageCount: 65,
+            freeList: PageReference(0), livePages: 1, freePages: [], manifestPages: [64],
+            reuseAllowed: true, initialStage: PageWriteStage(count: 1, highWater: 64))
+        XCTAssertTrue(store.log.isEmpty)
+        try pager.commit(plan)
+        XCTAssertEqual(store.log, ["write:16128:256", "resize:32768", "write:16384:256", "write:0:256", "sync"])
+    }
+
     func testTornWritesRecoverAndFailedHandleCannotContinue() throws {
         for fault in [CommitFault.body(ordinal: 1, tearBytes: 18), .meta(tearBytes: 40), .sync(ordinal: 1)] {
             let (store, pager) = try opened()

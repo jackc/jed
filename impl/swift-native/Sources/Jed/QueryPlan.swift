@@ -322,7 +322,7 @@ internal struct SelectPlan {
         let types = try owner.tableTypes(table)
         scope = table.columns.enumerated().map { index, column in
             ExpressionColumn(name: index < from.columnAliases.count ? from.columnAliases[index] : column.name,
-                             qualifier: from.alias ?? table.name, type: types[index], index: index, catalogName: table.name)
+                             qualifier: from.alias ?? table.name, type: types[index], index: index, catalogName: table.name, rowName: column.name, rowNotNull: column.notNull)
         }
         return ResolvedInput(source: source, scope: scope, primaryKey: primaryKey, sourceDomain: sourceDomain,
             sourceSnapshot: sourceSnapshot, sourceTable: sourceTable, functionalKey: functionalKey, relation: nil)
@@ -430,17 +430,13 @@ internal struct SelectPlan {
                column == key, order[ordinal].descending == reverse,
                (order[ordinal].type.collation?.description ?? "C") == (scope[key].type.collation?.description ?? "C") {} else { orderedByScan = false }
         }
+        let limit = try RowCountBound.resolve(query.limit, code: "2201W", resolver: resolver, settings: settings)
+        let offset = try RowCountBound.resolve(query.offset, code: "2201X", resolver: resolver, settings: settings) ?? 0
         let parameters = try finalizeParameters ? ParameterBinding.finalize(resolver) : []
-        func bound(_ spelling: String?, code: String) throws -> Int64? {
-            guard let spelling else { return nil }
-            guard let value = try? TypeRules.unsignedLiteral(spelling), value <= UInt64(Int64.max) else {
-                throw JedError(code, "invalid row-count bound")
-            }
-            return Int64(value)
-        }
+
         var plan = SelectPlan(columns: columns, projections: projections, predicate: predicate, store: source,
                           touched: resolver.referencedColumns.union((relation?.initialFunctionOuterTouched ?? []).filter { index in scope.contains { $0.index == index } }).sorted(), parameters: parameters,
-                          limit: try bound(query.limit, code: "2201W"), offset: try bound(query.offset, code: "2201X") ?? 0,
+                          limit: limit, offset: offset,
                           order: order, orderedByScan: orderedByScan, descending: orderedByScan && reverse,
                           scan: BaseScanPlan(predicate: completePredicate,
                               keys: sourceDomain.map(DomainNames.isAttachment) == true ? [] : primaryKey,
@@ -502,7 +498,7 @@ internal struct SelectPlan {
         case .call(let call): return call.name
         case .conditionalFunction(let name, _): return SQLText(validatedUTF8: Array(name.utf8))
         case .field(_, let name): if let name { return name }
-        case .subscripted(let child, _), .parenthesized(let child): return outputName(child)
+        case .subscripted(let child, _), .parenthesized(let child), .cast(let child, _): return outputName(child)
         default: break
         }
         return SQLText(validatedUTF8: Array("?column?".utf8))
@@ -582,7 +578,7 @@ internal final class SelectExecution {
         guard plan.store != nil, plan.relation == nil, plan.aggregation == nil,
               plan.window == nil, plan.distinctOn == nil, !plan.materializeSource,
               plan.scan.pointSets.isEmpty,
-              (plan.order.isEmpty ? !plan.distinct && plan.limit != nil : plan.orderedByScan) else { return }
+              (plan.order.isEmpty ? !plan.distinct && (plan.limit != nil || plan.streamsComputedProjection) : plan.orderedByScan) else { return }
         if let candidate = plan.chosenAccess {
             switch candidate.path {
             case .primary, .full: break
@@ -612,7 +608,7 @@ internal final class SelectExecution {
         // own admission schedules (memory.md §5.1, streaming.md §4).
         if plan.store != nil, plan.relation == nil, plan.aggregation == nil,
            plan.window == nil, !plan.distinct, plan.distinctOn == nil,
-           plan.order.isEmpty, plan.limit == nil, !ColumnarExecution.projection(plan, context) {
+           plan.order.isEmpty, plan.limit == nil, !plan.streamsComputedProjection, !ColumnarExecution.projection(plan, context) {
             plan.materializeSource = true
         }
         initializedBackend = true
@@ -627,7 +623,18 @@ internal final class SelectExecution {
         else if !plan.order.isEmpty && !plan.orderedByScan { ordered = OrderedSelectExecution(plan: plan, context: context) }
         else if plan.chosenNWay != nil, plan.orderedByScan { orderedNWay = NWayAccessExecution(plan: plan, context: context, projected: true) }
         else if plan.chosenJoin != nil, plan.orderedByScan { orderedJoin = JoinAccessExecution(plan: plan, context: context, projected: true) }
-        else if ColumnarExecution.projection(plan, context) { columnar = ColumnarProjectionExecution(plan: plan, context: context) }
+        else if ColumnarExecution.projection(plan, context) {
+            let execution = ColumnarProjectionExecution(plan: plan, context: context)
+            if context.meter.limit > 0 || context.meter.lifetimeLimit > 0 {
+                let rewind = context.meter.mark()
+                do { try execution.prime(); try context.meter.guardCost(); columnar = execution }
+                catch {
+                    execution.close()
+                    if (error as? JedError)?.code == "57014" { throw error }
+                    rewind(); plan.materializeSource = true
+                }
+            } else { columnar = execution }
+        }
     }
     func next() throws -> [SQLValue]? {
         try initialize()
@@ -663,7 +670,7 @@ internal final class SelectExecution {
     private var buffersScanOutput: Bool {
         guard plan.store != nil, plan.relation == nil, plan.aggregation == nil,
               plan.window == nil, !plan.distinct, plan.distinctOn == nil, !plan.materializeSource, plan.productionCharge,
-              plan.order.isEmpty ? plan.limit != nil : plan.orderedByScan,
+              plan.order.isEmpty ? (plan.limit != nil || plan.streamsComputedProjection) : plan.orderedByScan,
               let candidate = plan.chosenAccess else { return false }
         switch candidate.path {
         case .primary, .full: return false
@@ -763,7 +770,7 @@ internal final class SelectExecution {
         guard record.cells.indices.contains(column), types.indices.contains(column),
               record.overflows[column] == nil else { return nil }
         let cell = record.cells[column]
-        guard cell.isNull || cell.fixedWidth != nil || cell.bytes?.first == 0 else { return nil }
+        guard cell.isNull || cell.fixedWidth != nil || cell.bytes?.first == 0 || cell.bytes?.first == 5 else { return nil }
         return try cell.materialize(type: types[column])
     }
     func close() {
@@ -787,7 +794,7 @@ internal enum ScanCost {
         // Read the store's facts once: this loop visits every row in range.
         let tree = store.tree
         var units = access.pages(tree)
-        let variable = touched.filter { ValueCodec.fixedWidth(tree.types[$0].type) == nil }
+        let variable = touched.filter { LeafValue.width(tree.types[$0]) == nil }
         if !variable.isEmpty {
             let slab = tree.codec.capacity, encrypted = tree.codec.reservedBytes != 0
             var scan = access.cursor(store); defer { scan.close() }
@@ -826,7 +833,7 @@ internal enum ScanCost {
     }
     /// The touched columns whose cells can hold large-value facts.
     static func variableColumns(_ touched: [Int], types: [TypeDescriptor]) -> [Int] {
-        touched.filter { ValueCodec.fixedWidth(types[$0].type) == nil }
+        touched.filter { LeafValue.width(types[$0]) == nil }
     }
     /// Decode the point's packed record once; accounting consumes its retained
     /// large-value facts without walking the same table interval again.
@@ -846,7 +853,7 @@ internal enum ScanCost {
         let slab = tree.codec.capacity, encrypted = tree.codec.reservedBytes != 0
         let chainSlab = slab - (encrypted ? 16 : 0)
         var units: Int64 = 0
-        for column in touched where ValueCodec.fixedWidth(tree.types[column].type) == nil {
+        for column in touched where LeafValue.width(tree.types[column]) == nil {
             guard let facts = try cells[column].largeFacts(encrypted: encrypted) else { continue }
             if facts.external != nil { units = saturatingAdd(units, Int64((facts.stored + chainSlab - 1) / chainSlab)) }
             if facts.compressed { units = saturatingAdd(units, Int64((facts.raw + slab - 1) / slab)) }
@@ -864,5 +871,20 @@ internal enum ScanCost {
             if facts.compressed { units = saturatingAdd(units, Int64((facts.raw + slab - 1) / slab)) }
         }
         return units
+    }
+}
+
+internal extension SelectPlan {
+    /// Unlimited single-table scans stream computed projections unless host
+    /// kernels need the established buffered batch schedule (memory.md §5.4).
+    var streamsComputedProjection: Bool {
+        guard store != nil, relation == nil, aggregation == nil, window == nil,
+              !distinct, distinctOn == nil, order.isEmpty,
+              projections.contains(where: { if case .column = $0.node { return false }; return true }) else { return false }
+        var callsHost = false
+        StoredExpressionDependencies.walk(projections + (predicate.map { [$0] } ?? [])) { expression in
+            if case .call(let call) = expression.node, call.hostID != nil { callsHost = true }
+        }
+        return !callsHost
     }
 }

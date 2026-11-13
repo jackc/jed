@@ -72,7 +72,7 @@ internal struct ExplainPlan {
             if plan.withQuery != nil || plan.compound != nil { lane = "deferred" }
             else if plan.relation == nil, plan.aggregation == nil, plan.window == nil, !plan.distinct,
                     plan.distinctOn == nil, plan.order.isEmpty || plan.orderedByScan,
-                    plan.limit != nil || plan.orderedByScan { lane = "streaming" }
+                    plan.limit != nil || plan.orderedByScan || plan.streamsComputedProjection { lane = "streaming" }
             else { lane = "buffered" }
         } else { lane = "buffered" }
         return Self(options: options, statement: statement, body: body, root: root, profile: profile, lane: lane,

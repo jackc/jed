@@ -18,7 +18,7 @@ internal enum DomainRebuilder {
         for table in source.catalog.tables {
             guard let old = source.tables[table.name] else { throw JedError.corruption("missing source table store") }
             let types = try source.tableTypes(table)
-            target.setTableStore(table.name, TableStore(tree: BPlusTree(codec: codec, types: types, pool: scratch.pool),
+            target.setTableStore(table.name, TableStore(tree: BPlusTree(codec: codec, types: types, pool: scratch.pool, layout: .table(types: types, primaryKey: table.primaryKey)),
                 nextRowID: old.nextRowID))
         }
         for name in source.indexes.keys {
@@ -38,7 +38,7 @@ internal enum DomainRebuilder {
                         RecordInput.value(try record.materialize(column: $0, type: stores[name]!.tree.types[$0], pager: source.pool.pager, pageCount: sourcePages))
                     }
                     let rebuilt = try RecordDisposition.plan(key: record.key, values: values,
-                        types: destination.tree.types, codec: codec)
+                        types: destination.tree.types, codec: codec, layout: destination.tree.layout)
                     try destination.put(rebuilt, netStaging: true)
                     if isIndex { target.setIndexStore(name, destination) }
                     else { target.setTableStore(name, destination) }

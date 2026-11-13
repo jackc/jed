@@ -19,7 +19,7 @@ final class PageServiceConnectionTests: XCTestCase {
             do {
                 let hello = try XCTUnwrap(server.readFrame(pageSize: 0, deadline: .now.advanced(by: .seconds(2))))
                 try server.send(ServiceFrame(request: hello.request, message: .helloOK(ServiceHelloReply(protocolVersion: 1,
-                    format: 50, pageSize: 1024, connection: 7, flags: 0, maxReadPages: 1024))), pageSize: 0)
+                    format: MetaPage.version, pageSize: 1024, connection: 7, flags: 0, maxReadPages: 1024))), pageSize: 0)
                 let writer = try XCTUnwrap(server.readFrame(pageSize: 1024, deadline: .now.advanced(by: .seconds(2))))
                 let pages = try XCTUnwrap(server.readFrame(pageSize: 1024, deadline: .now.advanced(by: .seconds(2))))
                 guard writer.message.code == 5, pages.message.code == 3 else { throw JedError("XX000", "unexpected test request order") }

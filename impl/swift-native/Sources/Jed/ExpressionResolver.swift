@@ -24,6 +24,9 @@ internal struct ExpressionColumn {
     /// RETURNING relation order is independent of its old/new storage slots.
     /// Ordinary FROM scopes retain their existing physical-order walk.
     var hintRelationOrder = 0
+    var rowName: SQLText? = nil
+    var rowNotNull = false
+    var rowNullable = false
 }
 
 /// One resolver per statement. Parameter inference is shared across every
@@ -31,8 +34,15 @@ internal struct ExpressionColumn {
 internal final class ExpressionResolver {
     var columns: [ExpressionColumn]
     var composites: [SQLText: CompositeType]
-    var parameters: [Int: TypeDescriptor] = [:]
-    var parameterUses: Set<Int> = []
+    var inference = ParameterInference()
+    var parameters: [Int: TypeDescriptor] {
+        get { inference.types }
+        set { inference.types = newValue }
+    }
+    var parameterUses: Set<Int> {
+        get { inference.uses }
+        set { inference.uses = newValue }
+    }
     var scalar: ScalarCasts.Context
     var hostFunctions: [HostFunctionSignature] = []
     var unicode = UnicodeDatabase()

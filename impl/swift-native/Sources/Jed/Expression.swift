@@ -10,23 +10,24 @@ internal struct ResolvedExpression {
         var position: Int
         var location: Int
         var collation: CollationDerivation?
+        var rowPresence: Int?
         var nonimmutable: Bool
         init(type: TypeDescriptor?, node: Node, position: Int, location: Int,
-             collation: CollationDerivation?, nonimmutable: Bool) {
+             collation: CollationDerivation?, nonimmutable: Bool, rowPresence: Int?) {
             self.type = type; self.node = node; self.position = position; self.location = location
-            self.collation = collation; self.nonimmutable = nonimmutable
+            self.collation = collation; self.nonimmutable = nonimmutable; self.rowPresence = rowPresence
         }
     }
     private var storage: Storage
     init(type: TypeDescriptor?, node: Node, position: Int, location: Int = 0,
-         collation: CollationDerivation? = nil, nonimmutable: Bool = false) {
+         collation: CollationDerivation? = nil, nonimmutable: Bool = false, rowPresence: Int? = nil) {
         storage = Storage(type: type, node: node, position: position, location: location,
-                          collation: collation, nonimmutable: nonimmutable)
+                          collation: collation, nonimmutable: nonimmutable, rowPresence: rowPresence)
     }
     private mutating func unique() -> Storage {
         if !isKnownUniquelyReferenced(&storage) {
             storage = Storage(type: storage.type, node: storage.node, position: storage.position,
-                location: storage.location, collation: storage.collation, nonimmutable: storage.nonimmutable)
+                location: storage.location, collation: storage.collation, nonimmutable: storage.nonimmutable, rowPresence: storage.rowPresence)
         }
         return storage
     }
@@ -58,6 +59,7 @@ internal struct ResolvedExpression {
         get { storage.nonimmutable }
         set { unique().nonimmutable = newValue }
     }
+    var rowPresence: Int? { storage.rowPresence }
     var isConstant: Bool { if case .constant = node { return true }; return false }
     indirect enum Node {
         case constant(SQLValue), column(Int), parameter(Int)
@@ -100,6 +102,9 @@ internal struct ExpressionContext {
     /// Only resident row owners install these peeks. Arbitrary column getters
     /// (including view expressions) may perform work and are never prefetched.
     var hostBatchColumn: ((Int) -> SQLValue?)?
+    /// Internal differential-test switch; never exposed as a host setting.
+    var columnarDisabled = false
+    var parameterInference: ParameterInference? = nil
     var parameters: [SQLValue]
     var meter: CostMeter
     var collatedKey: KeyEncoding.CollatedKey?
@@ -460,7 +465,9 @@ internal struct ExpressionContext {
 
     private func evaluateContainer(_ expression: ResolvedExpression) throws -> SQLValue {
         switch expression.node {
-        case .row(let fields): return .composite(try fields.map(evaluate))
+        case .row(let fields):
+            if let presence = expression.rowPresence, try evaluate(fields[presence]).isNull { return .null }
+            return .composite(try fields.map(evaluate))
         case .array(let sources, let nested):
             return try ArrayFunctions.construct(sources.map(evaluate), nested: nested,
                                                 constant: sources.allSatisfy(FunctionResolver.isConstant), meter: meter)

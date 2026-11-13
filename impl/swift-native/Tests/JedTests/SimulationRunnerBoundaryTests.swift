@@ -7,7 +7,7 @@ final class SimulationRunnerBoundaryTests: XCTestCase {
         let directory = try XCTUnwrap(Bundle.module.url(forResource: "Simulation", withExtension: nil, subdirectory: "Fixtures"))
         let paths = try FileManager.default.contentsOfDirectory(at: directory.appendingPathComponent("regress"), includingPropertiesForKeys: nil)
             .filter { $0.pathExtension == "sim" }.sorted { $0.path < $1.path }
-        XCTAssertEqual(paths.count, 18)
+        XCTAssertEqual(paths.count, 19)
         for path in paths { XCTAssertFalse(try SimTrace(String(contentsOf: path, encoding: .utf8)).steps.isEmpty, path.lastPathComponent) }
     }
     func testFrozenAnalyzeDropRegressionRunsTwiceDeterministically() throws {

@@ -179,7 +179,7 @@ extension MutationExecutor {
                     return .kept(old.cells[column], pending: old.overflows[column])
                 }
                 let record = try RecordDisposition.plan(key: storageKey, values: inputs, types: relation.types,
-                    codec: store.tree.codec, meter: compression, pager: store.tree.pool?.pager)
+                    codec: store.tree.codec, layout: relation.store.tree.layout, meter: compression, pager: store.tree.pool?.pager)
                 let indexed = try indexes.map { try $0.row({ changed[$0] }, storageKey: record.key) }
                 updated.append(ConflictRow(old: old, record: record, values: changed,
                     prefixes: indexed.map(\.prefix), entries: indexed.map(\.entries)))
@@ -193,7 +193,7 @@ extension MutationExecutor {
                 try relation.view?.validateNew({ values[$0] }, context: context)
                 let storageKey = try relation.key(values, store: &store, collatedKey: context.collatedKey)
                 let record = try RecordDisposition.plan(key: storageKey, values: values.map(RecordInput.value), types: relation.types,
-                    codec: store.tree.codec, meter: compression, pager: store.tree.pool?.pager)
+                    codec: store.tree.codec, layout: relation.store.tree.layout, meter: compression, pager: store.tree.pool?.pager)
                 let indexed = try indexes.map { try $0.row({ values[$0] }, storageKey: record.key) }
                 inserted.append(ConflictRow(old: nil, record: record, values: values,
                     prefixes: indexed.map(\.prefix), entries: indexed.map(\.entries)))

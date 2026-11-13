@@ -198,6 +198,7 @@ internal struct BPlusTree: Sendable {
     static let maximumDepth = 256
     let codec: any PageCodec
     let types: [TypeDescriptor]
+    let layout: LeafLayout
     let pool: NodePool?
     private(set) var root: TreeChild?
     private(set) var count: Int64?
@@ -218,8 +219,8 @@ internal struct BPlusTree: Sendable {
         return TreeNode(replacing: index, in: node, with: child, replacedCount: replacedCount, owner: editToken)
     }
 
-    init(codec: any PageCodec, types: [TypeDescriptor], pool: NodePool? = nil) {
-        self.codec = codec; self.types = types; self.pool = pool; root = nil; count = 0
+    init(codec: any PageCodec, types: [TypeDescriptor], pool: NodePool? = nil, layout: LeafLayout = .index) {
+        self.codec = codec; self.types = types; self.layout = layout; self.pool = pool; root = nil; count = 0
     }
 
     var nodeCount: Int { root?.nodeCount ?? 0 }
@@ -227,8 +228,8 @@ internal struct BPlusTree: Sendable {
     var isEmpty: Bool { root == nil }
 
     static func open(root reference: PageReference, rowCount: Int64? = nil, pageCount: UInt32,
-                     types: [TypeDescriptor], pool: NodePool) throws -> BPlusTree {
-        var tree = BPlusTree(codec: pool.codec, types: types, pool: pool)
+                     types: [TypeDescriptor], pool: NodePool, layout: LeafLayout = .index) throws -> BPlusTree {
+        var tree = BPlusTree(codec: pool.codec, types: types, pool: pool, layout: layout)
         guard rowCount.map({ $0 >= 0 && (($0 == 0) == (reference.index == 0)) }) ?? true else {
             throw JedError.corruption("tree root disagrees with row count")
         }
@@ -291,7 +292,7 @@ internal struct BPlusTree: Sendable {
         case .resident(let node): return node
         case .onDisk(let reference, let lower, let upper):
             guard let pool else { throw JedError.corruption("tree leaf has no paging source") }
-            let leaf = try pool.load(reference, types: types)
+            let leaf = try pool.load(reference, types: types, layout: layout)
             // The same two checks as `checkBounds`, against the page in place.
             if let lower, leaf.compareKey(at: 0, with: lower) < 0 {
                 throw JedError.corruption("tree key precedes its parent bound")
@@ -348,8 +349,15 @@ internal struct BPlusTree: Sendable {
         let newRoot: TreeNode
         switch result {
         case .whole(let node): newRoot = node
-        case .split(let left, let separator, let right):
-            newRoot = TreeNode(keys: [separator], children: [.resident(left), .resident(right)], codec: codec, owner: editToken)
+        case .split(let nodes, let separators):
+            var grown = buildInterior(separators, children: nodes.map(TreeChild.resident), edited: nil)
+                ?? .whole(TreeNode(keys: separators, children: nodes.map(TreeChild.resident), codec: codec, owner: editToken))
+            while case .split(let nodes, let separators) = grown {
+                grown = buildInterior(separators, children: nodes.map(TreeChild.resident), edited: nil)
+                    ?? .whole(TreeNode(keys: separators, children: nodes.map(TreeChild.resident), codec: codec, owner: editToken))
+            }
+            guard case .whole(let node) = grown else { throw JedError("XX000", "invalid tree rebuild") }
+            newRoot = node
         }
         guard newRoot.height <= Self.maximumDepth else { throw JedError("54000", "tree nesting limit exceeded") }
         root = .resident(newRoot)
@@ -376,40 +384,60 @@ internal struct BPlusTree: Sendable {
 
     private enum Rebuild {
         case whole(TreeNode)
-        case split(TreeNode, [UInt8], TreeNode)
+        case split([TreeNode], [[UInt8]])
     }
 
     private func makeLeaf(_ records: [PackedRecord], reference: PageReference? = nil) throws -> TreeNode {
-        TreeNode(records: try RecordLeaf(records, types: types), reference: reference)
+        TreeNode(records: try RecordLeaf(records, types: types, layout: layout), reference: reference)
     }
 
     /// Exact format.md fan-out selection. nil is the first delete abandon guard.
     static func splitPoint(range: ClosedRange<Int>, payload: Int, capacity: Int, rightEdge: Bool,
                            left: (Int) -> Int, right: (Int) -> Int) -> Int? {
-        guard let minimum = range.first(where: { right($0) <= capacity }),
-              let maximum = range.reversed().first(where: { left($0) <= capacity }), minimum <= maximum else { return nil }
+        func first(_ predicate: (Int) -> Bool) -> Int? {
+            var low = range.lowerBound, high = range.upperBound + 1
+            while low < high {
+                let middle = low + (high - low) / 2
+                if predicate(middle) { high = middle } else { low = middle + 1 }
+            }
+            return range.contains(low) ? low : nil
+        }
+        guard let minimum = first({ right($0) <= capacity }) else { return nil }
+        let maximum = (first({ left($0) > capacity }) ?? (range.upperBound + 1)) - 1
+        guard minimum <= maximum else { return nil }
         if rightEdge { return maximum }
-        let balanced = range.first(where: { 2 * left($0) >= payload }) ?? maximum
+        let balanced = first({ 2 * left($0) >= payload }) ?? maximum
         return max(minimum, min(balanced, maximum))
     }
 
     private func buildLeaf(_ records: [PackedRecord], edited: Int?) throws -> Rebuild {
-        var prefix = [0]
-        for record in records { prefix.append(prefix.last! + record.weight) }
-        let n = records.count, total = prefix[n]
-        let payload = total + PackedLeaf.overhead(records: n, types: types)
-        if payload <= codec.capacity { return .whole(try makeLeaf(records)) }
-        guard n >= 2, let middle = Self.splitPoint(range: 1...(n - 1), payload: payload,
+        let n = records.count
+        let whole = try makeLeaf(records)
+        if whole.payloadSize <= codec.capacity || n < 2 { return .whole(whole) }
+        func measure(_ range: Range<Int>) -> Int { PackedLeaf.measure(Array(records[range]), types: types, layout: layout) }
+        if let middle = Self.splitPoint(range: 1...(n - 1), payload: whole.payloadSize,
             capacity: codec.capacity, rightEdge: edited == n - 1,
-            left: { prefix[$0] + PackedLeaf.overhead(records: $0, types: types) },
-            right: { total - prefix[$0] + PackedLeaf.overhead(records: n - $0, types: types) }) else {
-            return .whole(try makeLeaf(records))
+            left: { measure(0..<$0) }, right: { measure($0..<n) }) {
+            return .split([try makeLeaf(Array(records[..<middle])), try makeLeaf(Array(records[middle...]))], [records[middle].key])
         }
-        return .split(try makeLeaf(Array(records[..<middle])), records[middle].key,
-                      try makeLeaf(Array(records[middle...])))
+        var low = 1, high = n
+        while low < high {
+            let middle = low + (high - low) / 2
+            if measure(0..<middle) <= codec.capacity { low = middle + 1 } else { high = middle }
+        }
+        let middle = low - 1
+        guard middle > 0 else { return .whole(whole) }
+        let left = try makeLeaf(Array(records[..<middle]))
+        let remainder = try buildLeaf(Array(records[middle...]), edited: edited.flatMap { $0 >= middle ? $0 - middle : nil })
+        switch remainder {
+        case .whole(let right):
+            guard right.payloadSize <= codec.capacity else { return .whole(whole) }
+            return .split([left, right], [records[middle].key])
+        case .split(let nodes, let separators): return .split([left] + nodes, [records[middle].key] + separators)
+        }
     }
 
-    private func buildInterior(_ keys: [[UInt8]], children: [TreeChild], edited: Int?) -> Rebuild? {
+    private func buildInterior(_ keys: [[UInt8]], children: [TreeChild], edited: Int?, multiway: Bool = true) -> Rebuild? {
         let n = keys.count, payload = PackedInterior.payloadSize(keys: keys, codec: codec)
         if payload <= codec.capacity || n < 2 { return .whole(TreeNode(keys: keys, children: children, codec: codec, owner: editToken)) }
         let middle: Int
@@ -421,12 +449,23 @@ internal struct BPlusTree: Sendable {
             guard let split = Self.splitPoint(range: 1...(n - 2), payload: payload, capacity: codec.capacity,
                 rightEdge: edited == n - 1,
                 left: { (width + 4) * $0 + width + prefix[$0] },
-                right: { (width + 4) * (n - 1 - $0) + width + prefix[n] - prefix[$0 + 1] }) else { return nil }
+                right: { (width + 4) * (n - 1 - $0) + width + prefix[n] - prefix[$0 + 1] }) else {
+                guard multiway, let m = (1...(n - 2)).reversed().first(where: { (width + 4) * $0 + width + prefix[$0] <= codec.capacity }),
+                      let remainder = buildInterior(Array(keys[(m + 1)...]), children: Array(children[(m + 1)...]),
+                        edited: edited.flatMap { $0 > m ? $0 - m - 1 : nil }) else { return nil }
+                let left = TreeNode(keys: Array(keys[..<m]), children: Array(children[...m]), codec: codec, owner: editToken)
+                switch remainder {
+                case .whole(let right):
+                    guard right.payloadSize <= codec.capacity else { return nil }
+                    return .split([left, right], [keys[m]])
+                case .split(let nodes, let separators): return .split([left] + nodes, [keys[m]] + separators)
+                }
+            }
             middle = split
         }
         let left = TreeNode(keys: Array(keys[..<middle]), children: Array(children[...middle]), codec: codec, owner: editToken)
         let right = TreeNode(keys: Array(keys[(middle + 1)...]), children: Array(children[(middle + 1)...]), codec: codec, owner: editToken)
-        return .split(left, keys[middle], right)
+        return .split([left, right], [keys[middle]])
     }
 
     private func inserting(_ node: TreeNode, record: PackedRecord, previous: inout PackedRecord?) throws -> Rebuild {
@@ -454,14 +493,16 @@ internal struct BPlusTree: Sendable {
         var keys = node.keys, children = node.children
         switch result {
         case .whole(let child): children[index] = .resident(child)
-        case .split(let left, let separator, let right):
-            keys.insert(separator, at: index); children[index] = .resident(left)
-            children.insert(.resident(right), at: index + 1)
+        case .split(let nodes, let separators):
+            keys.insert(contentsOf: separators, at: index); children[index] = .resident(nodes[0])
+            for ordinal in 1..<nodes.count { children.insert(.resident(nodes[ordinal]), at: index + ordinal) }
         }
         // No admissible interior split is normally only a delete-merge case.
         // An already oversized pending separator may also reach it: preserve
         // the pending shape and let commit preflight reject it safely.
-        return buildInterior(keys, children: Array(children), edited: index)
+        let lastInserted: Int
+        if case .split(_, let separators) = result { lastInserted = index + separators.count - 1 } else { lastInserted = index }
+        return buildInterior(keys, children: Array(children), edited: lastInserted)
             ?? .whole(TreeNode(keys: keys, children: children, codec: codec, owner: editToken))
     }
 
@@ -505,10 +546,12 @@ internal struct BPlusTree: Sendable {
         if left.isLeaf { result = try buildLeaf(left.records() + right.records(), edited: nil) }
         else {
             guard let merged = buildInterior(left.keys + [parent.keys[index]] + right.keys,
-                children: Array(left.children) + Array(right.children), edited: nil) else { return parent }
+                children: Array(left.children) + Array(right.children), edited: nil, multiway: false) else { return parent }
             result = merged
         }
-        if case .split(_, let separator, _) = result {
+        if case .split(_, let separators) = result {
+            guard separators.count == 1 else { return parent }
+            let separator = separators[0]
             // A longer replacement separator cannot force a delete-path split.
             guard parent.payloadSize - parent.keys[index].count + separator.count <= codec.capacity else { return parent }
         }
@@ -517,8 +560,8 @@ internal struct BPlusTree: Sendable {
         switch result {
         case .whole(let merged):
             keys.remove(at: index); children[index] = .resident(merged); children.remove(at: index + 1)
-        case .split(let newLeft, let separator, let newRight):
-            keys[index] = separator; children[index] = .resident(newLeft); children[index + 1] = .resident(newRight)
+        case .split(let nodes, let separators):
+            keys[index] = separators[0]; children[index] = .resident(nodes[0]); children[index + 1] = .resident(nodes[1])
         }
         if owned {
             parent.setRouting(keys: keys, children: children, codec: codec)
@@ -532,14 +575,14 @@ internal struct BPlusTree: Sendable {
     /// to stored references, including fresh values serialized beside it.
     /// A root containing only resident values keeps those payloads instead.
     mutating func refaultRoot(afterWriting written: Set<UInt32>,
-                             read: (PageReference, [TypeDescriptor]) throws -> PackedLeaf) throws {
+                             read: (PageReference, [TypeDescriptor], LeafLayout) throws -> PackedLeaf) throws {
         guard pool != nil, case .resident(let node) = root, node.isLeaf,
               let reference = node.reference, written.contains(reference.index) else { return }
         for row in 0..<node.entryCount {
             let record = node.record(at: row)
             for column in record.cells.indices where record.overflows[column] == nil {
                 if try record.cells[column].largeFacts(encrypted: codec.reservedBytes != 0)?.external != nil {
-                    let leaf = try read(reference, types)
+                    let leaf = try read(reference, types, layout)
                     root = .resident(TreeNode(leaf: leaf, reference: reference))
                     return
                 }
@@ -557,7 +600,7 @@ internal struct BPlusTree: Sendable {
         // A whole-image export has a different page-address space. Its returned
         // tree retains encoded records until the destination binds its own pool;
         // never send its newly assigned ids to the source's cache/device.
-        var result = fromScratch ? BPlusTree(codec: codec, types: types) : self
+        var result = fromScratch ? BPlusTree(codec: codec, types: types, layout: layout) : self
         result.count = count
         if let root {
             result.root = try serialize(root, isRoot: true, allocator: &allocation, fromScratch: fromScratch, entropy: entropy,
@@ -609,7 +652,7 @@ internal struct BPlusTree: Sendable {
                 records.append(PackedRecord(key: sealed.record.key, cells: sealed.record.cells, overflows: retained))
                 overflowPages.append(contentsOf: sealed.pages)
             }
-            payload = try PackedLeaf.encodePayload(records, types: types, capacity: codec.capacity)
+            payload = try PackedLeaf.encodePayload(records, types: types, capacity: codec.capacity, layout: layout)
         } else {
             payload = try PackedInterior.encodePayload(keys: node.keys, children: children.map { $0.reference! }, codec: codec)
         }

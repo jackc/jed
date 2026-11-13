@@ -31,7 +31,7 @@ final class PendingDispositionBoundaryTests: XCTestCase {
             else { XCTFail("wrong kept value") }
             let smaller = try RecordDisposition.plan(key: [1], values: [.kept(kept.cells[0], pending: kept.overflows[0]), .value(.bytea([]))],
                 types: [type, type], codec: codec)
-            XCTAssertEqual(smaller.cells[0].bytes?.first, compressed ? 3 : 0)
+            XCTAssertEqual(smaller.cells[0].bytes?.first, compressed ? 3 : 5)
             XCTAssertNil(smaller.overflows[0])
             if case .bytea(let value) = try smaller.materialize(column: 0, type: type) { XCTAssertEqual(value, payload) }
             else { XCTFail("wrong redisposed value") }

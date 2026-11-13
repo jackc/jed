@@ -32,14 +32,14 @@ final class RecordDispositionTests: XCTestCase {
 
     func testIrreducibleWideRowUsesExactLeafFitAndSplitsAtTwoRecords() throws {
         let codec = try PlainPageCodec(pageSize: 8192)
-        let types = [TypeDescriptor](repeating: TypeDescriptor(.scalar(.i32)), count: 600)
+        let types = [TypeDescriptor](repeating: TypeDescriptor(.scalar(.i32)), count: 1000)
         let values = [RecordInput](repeating: .value(.null), count: types.count)
         let first = try RecordDisposition.plan(key: [UInt8](repeating: 0, count: 8), values: values, types: types, codec: codec)
         var nextKey = first.key; nextKey[7] = 1
         let second = try RecordDisposition.plan(key: nextKey, values: values, types: types, codec: codec)
         XCTAssertEqual(RecordDisposition.recordMaximum(capacity: codec.capacity, columns: types.count), 0)
-        XCTAssertEqual(first.weight, 2408)
-        XCTAssertEqual(PackedLeaf.overhead(records: 1, types: types) + first.weight, 6016)
+        XCTAssertEqual(first.weight, 4008)
+        XCTAssertEqual(PackedLeaf.overhead(records: 1, types: types) + first.weight, 8013)
         var tree = BPlusTree(codec: codec, types: types)
         try tree.insert(first); try tree.insert(second)
         XCTAssertEqual(tree.height, 2); XCTAssertEqual(tree.nodeCount, 3)
@@ -52,7 +52,7 @@ final class RecordDispositionTests: XCTestCase {
         }
         let reopened = try BPlusTree.open(root: output.root, rowCount: 2, pageCount: allocator.highWater, types: types, pool: pool)
         XCTAssertEqual(try reopened.get(first.key)?.weight, first.weight)
-        XCTAssertEqual(try reopened.get(second.key)?.cells.count, 600)
+        XCTAssertEqual(try reopened.get(second.key)?.cells.count, 1000)
         XCTAssertTrue(try reopened.get(second.key)!.cells.allSatisfy(\.isNull))
     }
 
@@ -88,8 +88,8 @@ final class RecordDispositionTests: XCTestCase {
         let codec = try PlainPageCodec(pageSize: 256), meter = CostMeter()
         let row = try RecordDisposition.plan(key: [0], values: [.value(.text(SQLText(String(repeating: "a", count: 60)))), .value(.null)],
             types: [text, TypeDescriptor(.scalar(.i64))], codec: codec, meter: meter)
-        XCTAssertEqual(row.cells[0].bytes?.first, 0)
-        XCTAssertEqual(row.weight, 72)
+        XCTAssertEqual(row.cells[0].bytes?.first, 5)
+        XCTAssertEqual(row.weight, 70)
         XCTAssertTrue(row.cells[1].isNull)
         XCTAssertEqual(meter.accrued, 0)
     }
@@ -98,7 +98,7 @@ final class RecordDispositionTests: XCTestCase {
         let codec = try PlainPageCodec(pageSize: 256), meter = CostMeter()
         let input = SQLValue.text(try SQLText(String(repeating: "a", count: 70)))
         let row = try RecordDisposition.plan(key: [0], values: [.value(input), .value(input)], types: [text, text], codec: codec, meter: meter)
-        XCTAssertEqual(row.cells.map { $0.bytes?.first }, [3, 0])
+        XCTAssertEqual(row.cells.map { $0.bytes?.first }, [3, 5])
         XCTAssertEqual(meter.accrued, 1)
         XCTAssertLessThanOrEqual(row.weight, RecordDisposition.recordMaximum(capacity: codec.capacity, columns: 2))
         if case .text(let result) = try row.cells[0].materialize(type: text) { XCTAssertEqual(result, try SQLText(String(repeating: "a", count: 70))) }

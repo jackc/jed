@@ -41,7 +41,7 @@ internal extension BPlusTree {
                 }
                 records.append(PackedRecord(key: record.key, cells: cells))
             }
-            let payload = try PackedLeaf.encodePayload(records, types: types, capacity: target.capacity)
+            let payload = try PackedLeaf.encodePayload(records, types: types, capacity: target.capacity, layout: layout)
             let sealed = try PageSealer.seal(codec: target, index: index, type: 2,
                 count: UInt32(node.entryCount), payload: payload, entropy: entropy)
             try sink(sealed.page); return sealed.reference

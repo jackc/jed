@@ -9,14 +9,14 @@ require "tmpdir"
 
 # Opt-in public-host interchange. No engine or default task imports this file.
 module SwiftInterchange
-  BASELINE = "0b76dd6e9c2675b552eb8af9e820065351ffa4b3"
+  BASELINE = "b1a6affca7725e0b07a4f734eddb1c569ef76bcf"
   FIXTURES = File.join(SwiftNativeTasks::PACKAGE, "Tests/JedTests/Fixtures")
   TOOLS = File.join(SwiftNativeTasks::PACKAGE, "Tools/Interop")
   PEERS = %w[rust go ts].freeze
   KEY = "4a" * 32
   PASS = "Jed interchange test passphrase — 2026".unpack1("H*")
   CHECKERS = {
-    "verify.rb" => "308cbc629fbabad4792a75de0ea75de6646f4b5898fd5302db798243ea91ebb9",
+    "verify.rb" => "64308c4c1044d6d30eafb4ba34fb3ea49a45970545ecbf3c7018b7e439bc3dec",
     "lz4.rb" => "c4eb2a3fd9fe6d455d83351deb6512f8277661f1b6c3e287125e65417663e609",
     "xaes.rb" => "aeebcb1541f0c3312006852ec0928ce2aef0fa50fce328bc0b8bbde24b7d1882",
     "expr.rb" => "7b09424c5beb719a4527d8fed113010cd219bfc55752b1ccf9120bdff6111e76"
@@ -56,7 +56,7 @@ module SwiftInterchange
     snapshot = JSON.parse(File.read(File.join(FIXTURES, "SpecSnapshot.json")))
     raise "unexpected frozen baseline" unless snapshot.fetch("baseline") == BASELINE
     hashes = snapshot.fetch("source_hashes").select { |path, _| path.start_with?("spec/fileformat/fixtures/") && path.end_with?(".jed") }
-    raise "frozen fixture inventory must contain 112 images" unless hashes.length == 112
+    raise "frozen fixture inventory must contain 116 images" unless hashes.length == 116
     entries = hashes.sort.map do |path, hash|
       name = File.basename(path, ".jed")
       file = File.join(FIXTURES, File.basename(path))
@@ -414,7 +414,7 @@ module SwiftInterchange
         host_requirements(actor,entry)
         if entry[:kind] == "recovery"
           expected = entry.fetch(:applicability).fetch("probes").first.fetch("rows")
-          raise "selected recovery root differs" unless actor.query("SELECT id::text,v::text FROM t ORDER BY id") == expected
+          raise "selected recovery root differs" unless actor.query("SELECT id::text,v::text FROM t ORDER BY t.id") == expected
         end
         initial = snapshot(actor,opaque:entry[:kind]=="opaque-definitions")
         raise "reserved probe table collides with fixture" if initial.fetch("jed_tables").include?([PROBE])
@@ -611,7 +611,7 @@ module SwiftInterchange
     end
     entries = inventory
     wanted = wanted_phases(entries, PEERS)
-    raise "coverage inventory changed" unless wanted.length == 2691
+    raise "coverage inventory changed" unless wanted.length == 2787
     key = wanted.first
     records = {}; record(records, key, checked: true)
     begin
@@ -624,7 +624,7 @@ module SwiftInterchange
     record(records, ["outside", "go", "swift-first", "extra"])
     raise "extra coverage not reported" unless coverage(wanted, records).any? { _1.start_with?("unexpected") }
     checker_paths
-    puts "interchange adapter: 112 pinned applicability entries, #{wanted.length} required phases; framing/coverage guards PASS"
+    puts "interchange adapter: 116 pinned applicability entries, #{wanted.length} required phases; framing/coverage guards PASS"
     0
   end
 
@@ -695,7 +695,7 @@ module SwiftInterchange
     end
     failures.concat(coverage(wanted, records))
     report = {baseline: BASELINE, fixtures: entries.length, peers: peers, generated: generated,
-      complete_matrix: entries.length == 112 && peers.to_set == PEERS.to_set && generated && !filter,
+      complete_matrix: entries.length == 116 && peers.to_set == PEERS.to_set && generated && !filter,
       expected_phases: wanted.length, completed_phases: records.length, completed_cases: completed,
       records: records.values, failures: failures, source_identity: identity}
     report[:accepted] = report[:complete_matrix] && failures.empty?

@@ -73,7 +73,7 @@ final class IntegrityBoundaryTests: XCTestCase {
         let root = try XCTUnwrap(Bundle.module.url(forResource: "Fixtures", withExtension: nil))
         let images = try FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: nil)
             .filter { $0.pathExtension == "jed" }.sorted { $0.lastPathComponent < $1.lastPathComponent }
-        XCTAssertEqual(images.count, 112)
+        XCTAssertEqual(images.count, 116)
         let skips: [String: [IntegritySkip]] = [
             "collation_skew_corrupt.jed": [.init(object: "t_name_idx", reason: "missing_loaded_data")],
             "hostfunc_index_table.jed": [.init(object: "t_geo_idx", reason: "missing_host_function")],
@@ -109,7 +109,7 @@ final class IntegrityBoundaryTests: XCTestCase {
             }
             checked += 1
         }
-        XCTAssertEqual(checked, 108); XCTAssertEqual(rejected, 4)
+        XCTAssertEqual(checked, 112); XCTAssertEqual(rejected, 4)
     }
     func testDefaultsNamedDomainsCancellationAndConcurrentWriter() throws {
         let database = try Database(); defer { try? database.close() }

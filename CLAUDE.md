@@ -147,9 +147,10 @@ experiment, and promotion requires a separate decision. See
 [ruby-native-experiment.md](spec/design/ruby-native-experiment.md).
 
 The separately approved **native Swift experiment** (`impl/swift-native`, 2026-11-05)
-is frozen at `fb34b0e8cb3d82287fbd3401e3426f04b3b86c7a`. Its semantic target remains
-the entire supported Rust/Go/TypeScript surface at
-`0b76dd6e9c2675b552eb8af9e820065351ffa4b3`, not Ruby's frozen coverage. It is a
+was explicitly refreshed on 2026-11-12 to the supported Rust/Go/TypeScript surface at
+`b1a6affca7725e0b07a4f734eddb1c569ef76bcf`: format v52, 763 SQL files, 116 database
+fixtures and 19 saved simulations. The target remains pinned; future supported-core
+features do not update it automatically. It is a
 handwritten independent Swift engine. Linux conformance, host, file, crypto,
 process/simulation and optimization verification are recorded in
 [VERIFICATION.md](impl/swift-native/VERIFICATION.md). The original `3db8fc2` snapshot's
@@ -159,8 +160,8 @@ adds separate diagnostic comparisons of 22 peer, eight paired Swift and three
 Ruby workloads; it does not replace the original 143-workload full-suite evidence.
 Results apply to the recorded workloads, host and actors, not universal performance parity.
 Swift remains opt-in, outside default tasks and automatic future feature updates,
-with no website integration. The snapshot is committed locally; no push, master
-merge or package publication is implied. It neither promotes Swift into the
+with no website integration. The refresh is recorded independently of the older implementation checkpoints.
+It neither promotes Swift into the
 differential set nor selects native versus wrapped production delivery. Apple platforms
 remain unverified until built and tested there. See
 [swift-native-experiment.md](spec/design/swift-native-experiment.md).

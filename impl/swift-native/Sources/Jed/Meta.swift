@@ -12,7 +12,7 @@ internal struct ManifestEntry: Equatable, Sendable {
 }
 
 internal struct MetaPage: Sendable {
-    static let version: UInt16 = 50
+    static let version: UInt16 = 52
     let pageSize: Int
     let encrypted: Bool
     let txid: UInt64

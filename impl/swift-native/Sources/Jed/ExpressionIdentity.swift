@@ -29,6 +29,7 @@ internal enum ExpressionIdentity {
         func optional(_ a: ResolvedExpression?, _ b: ResolvedExpression?) -> Bool {
             if let a, let b { return same(a, b) }; return a == nil && b == nil
         }
+        guard a.rowPresence == b.rowPresence else { return false }
         switch (a.node, b.node) {
         case (.outerColumn(let x), .outerColumn(let y)): return x == y
         case (.subquery(let x), .subquery(let y)): return x === y

@@ -155,6 +155,9 @@ internal final class SQLParser {
             let second = word(); advance()
             name = SQLText(validatedUTF8: Array((first + " " + second).utf8))
         } else { name = try identifier() }
+        if name.description == "timestamp", let suffix = timestampZoneSuffix() {
+            name = SQLText(validatedUTF8: Array(("timestamp " + suffix).utf8))
+        }
         var result = SQLTypeSyntax(name: name, span: span(start))
         if eatSymbol("(") {
             result.modifiers.append(try integerSpelling(signed: false))
@@ -163,9 +166,22 @@ internal final class SQLParser {
         } else if name.utf8 == Array("interval".utf8) {
             try intervalQualifier(&result)
         }
+        if name.description == "timestamp", !result.modifiers.isEmpty, let suffix = timestampZoneSuffix() {
+            result.name = SQLText(validatedUTF8: Array(("timestamp " + suffix).utf8))
+        }
         while eatSymbol("[") { try expectSymbol("]"); result.arrayDimensions += 1 }
         result.span = span(start)
         return result
+    }
+    func timestampZoneSuffix() -> String? {
+        guard ["with", "without"].contains(word()), word(1) == "time", word(2) == "zone" else { return nil }
+        let suffix = word() + " time zone"
+        advance(); advance(); advance()
+        return suffix
+    }
+    func rowCountSpelling() throws -> String {
+        if case .parameter(let number) = peek().kind { advance(); return "$\(number)" }
+        return try integerSpelling()
     }
     func intervalQualifier(_ type: inout SQLTypeSyntax) throws {
         guard ["year", "month", "day", "hour", "minute", "second"].contains(word()) else { return }
@@ -239,10 +255,10 @@ internal final class SQLParser {
         for _ in 0..<2 {
             if eat("limit") {
                 guard result.limit == nil else { throw syntax("multiple LIMIT clauses not allowed") }
-                result.limit = try integerSpelling()
+                result.limit = try rowCountSpelling()
             } else if eat("offset") {
                 guard result.offset == nil else { throw syntax("multiple OFFSET clauses not allowed") }
-                result.offset = try integerSpelling()
+                result.offset = try rowCountSpelling()
             } else { break }
         }
         result.span = span(start)

@@ -69,12 +69,12 @@ internal final class NodePool: Sendable {
         return try read(reference)
     }
 
-    func load(_ reference: PageReference, types: [TypeDescriptor]) throws -> PackedLeaf {
+    func load(_ reference: PageReference, types: [TypeDescriptor], layout: LeafLayout = .index) throws -> PackedLeaf {
         while true {
             let identity = Identity(reference)
             let lookup = try state.withLock { state -> Lookup in
                 if var entry = state.entries[identity] {
-                    guard entry.leaf.types == types else { throw JedError.corruption("leaf reused under a different row type") }
+                    guard entry.leaf.types == types && entry.leaf.layout == layout else { throw JedError.corruption("leaf reused under a different row type") }
                     if !entry.referenced { entry.referenced = true; state.entries[identity] = entry }
                     return .hit(entry.leaf)
                 }
@@ -93,11 +93,11 @@ internal final class NodePool: Sendable {
                     if loading.speculative { continue }
                     throw error
                 }
-                guard leaf.types == types else { throw JedError.corruption("leaf reused under a different row type") }
+                guard leaf.types == types && leaf.layout == layout else { throw JedError.corruption("leaf reused under a different row type") }
                 return leaf
             case .load(let loading):
                 // No cache mutex across device I/O, authentication, or PAX parsing.
-                let result = Result { try PackedLeaf(bytes: read(reference), types: types, codec: codec) }
+                let result = Result { try PackedLeaf(bytes: read(reference), types: types, codec: codec, layout: layout) }
                 state.withLock { state in
                     // Invalidation detaches old flights before page reuse. Existing
                     // waiters still receive the old immutable result; it cannot reenter.
@@ -115,7 +115,7 @@ internal final class NodePool: Sendable {
 
     /// Physical stream-only read-ahead. Failed hints are discarded; a later
     /// ordinary fault reports any error for a page actually demanded by SQL.
-    func prefetch(_ references: [PageReference], types: [TypeDescriptor]) {
+    func prefetch(_ references: [PageReference], types: [TypeDescriptor], layout: LeafLayout = .index) {
         guard let readMany else { return }
         let flights = state.withLock { state -> [(PageReference, Identity, Loading)] in
             let limit = min(batchLimit, state.capacity.map { max(1, $0 / 4) } ?? batchLimit)
@@ -132,7 +132,7 @@ internal final class NodePool: Sendable {
         let result: Result<[PackedLeaf], any Error> = Result {
             let bodies = try readMany(flights.map { $0.0 })
             guard bodies.count == flights.count else { throw JedError("08006", "read-ahead returned the wrong page count") }
-            return try bodies.map { try PackedLeaf(bytes: $0, types: types, codec: codec) }
+            return try bodies.map { try PackedLeaf(bytes: $0, types: types, codec: codec, layout: layout) }
         }
         for (index, entry) in flights.enumerated() {
             let leaf = result.map { $0[index] }

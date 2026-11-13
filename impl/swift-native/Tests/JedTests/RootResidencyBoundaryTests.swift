@@ -30,7 +30,7 @@ final class RootResidencyBoundaryTests: XCTestCase {
     private func add(_ id: Int64, to snapshot: inout DomainSnapshot) throws {
         var store = try XCTUnwrap(snapshot.tables[tableName])
         let record = try RecordDisposition.plan(key: key(id), values: [.value(.integer(id)), .value(.bytea(payload(UInt32(id))))],
-            types: types, codec: snapshot.pool.codec)
+            types: types, codec: snapshot.pool.codec, layout: store.tree.layout)
         try store.put(record, netStaging: true); snapshot.setTableStore(tableName, store)
     }
     private func seeded(_ device: RootRefaultDevice, kind: StorageDomainKind = .file) throws -> StorageDomain {
@@ -40,7 +40,7 @@ final class RootResidencyBoundaryTests: XCTestCase {
             CatalogColumn(name: SQLText(validatedUTF8: Array("b".utf8)), type: CatalogTypeUse(.scalar(.bytea)))]
         catalog.tables.append(CatalogTable(name: tableName, columns: columns, primaryKey: [0], root: PageSealer.nullReference(domain.pager.codec)))
         try working.updateCatalog(catalog, schemaChanged: true)
-        working.setTableStore(tableName, working.emptyStore(types: types)); try add(1, to: &working)
+        working.setTableStore(tableName, working.emptyStore(types: types, primaryKey: [0])); try add(1, to: &working)
         _ = try domain.persist(XCTUnwrap(domain.prepare(working, verifyLiveCount: true)))
         return domain
     }
@@ -68,7 +68,7 @@ final class RootResidencyBoundaryTests: XCTestCase {
         }
         var working = committed, store = try XCTUnwrap(working.tables[tableName])
         let old = try XCTUnwrap(store.get(key(2)))
-        let replacement = try RecordDisposition.plan(key: old.key, values: old.cells.map { .kept($0) }, types: types, codec: domain.pager.codec)
+        let replacement = try RecordDisposition.plan(key: old.key, values: old.cells.map { .kept($0) }, types: types, codec: domain.pager.codec, layout: store.tree.layout)
         try store.put(replacement, netStaging: true); working.setTableStore(tableName, store)
         let next = try XCTUnwrap(domain.prepare(working, verifyLiveCount: true))
         XCTAssertEqual(next.pages.body.filter { $0.bytes.first == 4 }.count, 0)

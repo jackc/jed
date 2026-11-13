@@ -1,8 +1,8 @@
 {
-  "baseline": "0b76dd6e9c2675b552eb8af9e820065351ffa4b3",
-  "scope": "112 frozen spec/fileformat/fixtures images; excludes separate 24 integrity finding images",
+  "baseline": "b1a6affca7725e0b07a4f734eddb1c569ef76bcf",
+  "scope": "116 frozen spec/fileformat/fixtures images; excludes separate 24 integrity finding images",
   "classes": {
-    "ordinary_writable": 77,
+    "ordinary_writable": 81,
     "skewed_collation": 1,
     "writable_recovery": 18,
     "expected_open_error": 4,
@@ -13,7 +13,7 @@
   "fixtures": [
     {
       "file": "array_composite_table.jed",
-      "sha256": "6be81bfe2c523370eb8f1042c8c431b8370cbcd75e5bd9822f082ccc5c8ce69d",
+      "sha256": "2e16a4f5c649f2b0e421b274f9e6a63bc0ed93df5f8ef532082dbc936f85f776",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -27,7 +27,7 @@
     },
     {
       "file": "array_pk_table.jed",
-      "sha256": "73f0aa83186184c21054b798afcaac09a10f7d7753ce972d7387f579466cc560",
+      "sha256": "5f4ead9e8cb5d33fbb5eb4c6e542f32c23b5f684a41ab9c6fbb0ce683ef156a9",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -41,7 +41,7 @@
     },
     {
       "file": "array_table.jed",
-      "sha256": "6914c84052ee7b63c194a9bda240bd53c06eae01fff1a41c59dc1d96e6b7b8e5",
+      "sha256": "9a359935235b0509c1060383bb697c2b30fc64ad946dd2765405f0c380721c62",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -55,7 +55,7 @@
     },
     {
       "file": "bool_pk_table.jed",
-      "sha256": "1da4e370eb852b155a07fb34d480516fbab16249f1f90da4ab74f04e52ae9bd2",
+      "sha256": "037d3670dd8fb138b8c2d8669529eac780905405bd6c6585d52a6ad6abc6b817",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -69,7 +69,7 @@
     },
     {
       "file": "bool_table.jed",
-      "sha256": "de2f6b5ba533e3c3c2d36a770917a846f4d7ab7d87ba375fdb9f306b36879f69",
+      "sha256": "5a4cc4606a866fd10f9a6faf3fd3731c0cec0f2273b5548b0497a2306fc63414",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -83,7 +83,7 @@
     },
     {
       "file": "bytea_pk_table.jed",
-      "sha256": "5a7be0d400f794e65d4cc8aa29ec2c14f4a4928fed29ec0017549488f6278a9b",
+      "sha256": "79d7aa90921f537e327ca564b8677dbb3caf997d7dcf0b8af910cec9b0cebe87",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -97,7 +97,7 @@
     },
     {
       "file": "bytea_table.jed",
-      "sha256": "605abbf9fb6a1619956b09c337579eae0cc95ae734f506b728a9bc0ca503e37c",
+      "sha256": "2090db89139b90bfb9418bb8238db9ad48b908a3a55a9748ca67252d46c75160",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -111,7 +111,7 @@
     },
     {
       "file": "check_table.jed",
-      "sha256": "818766ff98f7a5cbc5fa383bb0cd2e9373cc1465a946580134e54f340caa18ea",
+      "sha256": "8af0e8ef0425c6cbc2fa5e388601594ed8ab206eac98893e4509eacbfb88e966",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -125,7 +125,7 @@
     },
     {
       "file": "collation_array_table.jed",
-      "sha256": "fa00afd3a21dd1dec1e9b225a138b3c0976d1568c542df971a929086ed6ee90c",
+      "sha256": "8b8dd80880d6a0d64276217fdcd10d8e954e7784de99e8ef4e458d15d0488939",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -141,7 +141,7 @@
     },
     {
       "file": "collation_pk_table.jed",
-      "sha256": "b7fa4917a52bd05a6ccf144e3b2db035186cf646259b11015e2432c803f8d897",
+      "sha256": "0976410352f8805ae61f0a2508a86cd9c2ef238e090cbfcd72f911c4894b4a8b",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -157,7 +157,7 @@
     },
     {
       "file": "collation_skew_corrupt.jed",
-      "sha256": "20905e6df1a297b27dbb706d33c72814aa814da9fb94a164932f9993f631ada9",
+      "sha256": "df606728d378e6f74fcc2795d4f7b1c647042b1c4bfcadfa89fe195e6ebaf62c",
       "class": "skewed_collation",
       "open": "success",
       "sidecar_mutation": true,
@@ -211,7 +211,7 @@
     },
     {
       "file": "collation_skew_twin.jed",
-      "sha256": "9254441f175481caa7b3e2daee4c55f31169f9ebc38cfd15a5e391865a13e193",
+      "sha256": "abd5c944670c6d69acb71fe0ac9bd875a98e13f92c4eada410d2b20d137cb1c0",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -227,7 +227,7 @@
     },
     {
       "file": "collation_table.jed",
-      "sha256": "64c0817b0a4276c471abdb786f95f021e65fdb6115b5da1296df459978d97aef",
+      "sha256": "e820ff7952785275d7c0737e429b9b5967705a35a285e71ddebf7dc7a28ff0cd",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -242,8 +242,20 @@
       ]
     },
     {
+      "file": "compact_leaf_table.jed",
+      "class": "ordinary_writable",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Read every original row across cores; update and reopen using both writers; compare committed bytes and independently check the image.",
+      "sources": [
+        "spec/fileformat/format.md"
+      ],
+      "sha256": "ebb44448f9d1d65448c928e45271566bff1fdcfc2863d3a88bc360df0c2dde52"
+    },
+    {
       "file": "composite_array_field_table.jed",
-      "sha256": "a5b59477825208f013c0782acbbfeae5e6cc4be5ba948462850b63168eb2226c",
+      "sha256": "0cea2ff4348609599c6058ad70860dfc1414b5a2b8bc81c01cc8b1bf0c791cb4",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -257,7 +269,7 @@
     },
     {
       "file": "composite_key_table.jed",
-      "sha256": "1dae3e41f23c71246a48662c2d17f03c0d09ca459f9915c72c8c35bd44547a2f",
+      "sha256": "9bea89f3485fe059e5cce2d2f2cc546bb77762d6cb2ab5d6f61deaea1d0f44df",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -271,7 +283,7 @@
     },
     {
       "file": "composite_pk_table.jed",
-      "sha256": "87d0190d40f33bcf4258f2b9af31e6773722f6a85d0cb580aa7b114af8afb2d8",
+      "sha256": "d8cfe4134d832a837292f018787ed8f72a6183d0e63fba598b3f798a01eb132b",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -285,7 +297,7 @@
     },
     {
       "file": "composite_range_field_table.jed",
-      "sha256": "c637b0cab95d054f0cf2e356443f0548a1b1bae822227aeec9b7c346b577fb02",
+      "sha256": "10ca8a1fe42b093acbf29270286d7186b04eff210dcff52f3f721bf6130caea2",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -299,7 +311,7 @@
     },
     {
       "file": "composite_type_table.jed",
-      "sha256": "5b0dee2b89b7d724f6a32b8f1981cc3531f9511d0aca42bf28a2a705dce5e00e",
+      "sha256": "fc08e9156f3ce3c3bb41747a8ee0a2b9d5e70c946c4cf3224574098c06770a95",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -313,7 +325,7 @@
     },
     {
       "file": "compressed_table.jed",
-      "sha256": "943a48e62d84839735c8b9835844a9809f3bc96eb53bfdcf0d7bd8a7921d0d13",
+      "sha256": "e3e945f29a8b138398637b14f976d802f50577e9d37cdb9ec58d0d25d94c7e4b",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -327,7 +339,7 @@
     },
     {
       "file": "cow_bad_padding.jed",
-      "sha256": "021a296a0499a812247fb90e68ecc7b6a52077a11ef18bc45acf1ef9acaedc1e",
+      "sha256": "db078ffee7d8b876dc01482799b6734e517c1680d2288071f505c8b0200367a5",
       "class": "writable_recovery",
       "open": "success",
       "sidecar_mutation": true,
@@ -373,7 +385,7 @@
     },
     {
       "file": "cow_duplicate_entry.jed",
-      "sha256": "65712f82f783660b7659d3e0951552794ab9ec0c3961533bdfe6d1b6f861c373",
+      "sha256": "afd71403978ee8ec17ba2efedddd1749e4e246b85357b43f841fb7209d2a3ecb",
       "class": "writable_recovery",
       "open": "success",
       "sidecar_mutation": true,
@@ -419,7 +431,7 @@
     },
     {
       "file": "cow_empty_tail.jed",
-      "sha256": "61768fea43c3622e301962157f369f2519d01ac3cbbd794737ca07e3039b881e",
+      "sha256": "10279f7874d5d478b3f302f57ca082f18288204e0f56cb4e74f3388e1e83ba29",
       "class": "writable_recovery",
       "open": "success",
       "sidecar_mutation": true,
@@ -465,7 +477,7 @@
     },
     {
       "file": "cow_free_head_manifest.jed",
-      "sha256": "c5f0654367900798838900748ec4a074b705370b8afb49aebd46c7e9a407c89b",
+      "sha256": "63baa539dcd08469a32510026793bbe57fd8d8ff8a70ac3a19eec72d518ee4ea",
       "class": "writable_recovery",
       "open": "success",
       "sidecar_mutation": true,
@@ -511,7 +523,7 @@
     },
     {
       "file": "cow_inline.jed",
-      "sha256": "bdc3737f3a457eddfb451a1f9ac82a3b35177fcabc08877c345e017ab474651f",
+      "sha256": "9a08cf165865863c9fb2f008be4dd74a00f01cff6d0ffe7b4ecf978182487069",
       "class": "writable_recovery",
       "open": "success",
       "sidecar_mutation": true,
@@ -557,7 +569,7 @@
     },
     {
       "file": "cow_invalid_free_list.jed",
-      "sha256": "76a2fcd397f52709afd5217e70c3f35270551d62865bbb163ce7cb55b0b74b6e",
+      "sha256": "8a66574839ff7746fd229273d5550a5de124c480643d4afab755d7d7a3f7dbda",
       "class": "expected_open_error",
       "open": "XX001",
       "sidecar_mutation": false,
@@ -571,7 +583,7 @@
     },
     {
       "file": "cow_manifest_cycle.jed",
-      "sha256": "30ac435bdc3877cefa2c36830b71b220ddeb2373e4cbf133b0a741b4192bfc17",
+      "sha256": "e19155a421a5dbfdae79a162243297563cfa01763dc8f45f50f96c6a7e7de1e5",
       "class": "writable_recovery",
       "open": "success",
       "sidecar_mutation": true,
@@ -617,7 +629,7 @@
     },
     {
       "file": "cow_missing_root.jed",
-      "sha256": "abc36e203f35dd18f437e1a4775547e06dcf6c6ac8a7036fa72c17ab29971710",
+      "sha256": "4411aba1f8e0e6bfe34a728143e39b6ebe7f6f5e6f4b108f696da02ae49d7ac6",
       "class": "writable_recovery",
       "open": "success",
       "sidecar_mutation": true,
@@ -663,7 +675,7 @@
     },
     {
       "file": "cow_out_of_bounds.jed",
-      "sha256": "1e58a0c51ea53354045a3a3cff1ab8853bcc911aad2c097a600874651ca64562",
+      "sha256": "60e15cbef5ceab4e51d945534d65bfe12aa11d90a73749bf9f48fb9ac763f3be",
       "class": "writable_recovery",
       "open": "success",
       "sidecar_mutation": true,
@@ -709,7 +721,7 @@
     },
     {
       "file": "cow_overflow.jed",
-      "sha256": "86c2b5c241603982c61395c33991780d5c2ee5324f36bebd2102f9925eebcdf9",
+      "sha256": "b7c4d10dce425c976d66d0b0eec9490a5cebe4362b898bee3ac453254408083f",
       "class": "writable_recovery",
       "open": "success",
       "sidecar_mutation": true,
@@ -755,7 +767,7 @@
     },
     {
       "file": "cow_root_manifest.jed",
-      "sha256": "214a18a52acf2d900a9c516a5214c5bef60d655f55e8a0ca373fab680416cb3e",
+      "sha256": "771b26993021f9db23afbc570e464b59392e31f3874aec552d368aa4c083c86c",
       "class": "writable_recovery",
       "open": "success",
       "sidecar_mutation": true,
@@ -801,7 +813,7 @@
     },
     {
       "file": "cow_stale_body.jed",
-      "sha256": "b597aea10103a86b91c1f44618cc4aacf67f2f64b665dbbff7cf3f4c32b0b4cc",
+      "sha256": "f5502365ad32182d674a2c8df31f129df9571a6205e1313320d80bc62b446f05",
       "class": "writable_recovery",
       "open": "success",
       "sidecar_mutation": true,
@@ -847,7 +859,7 @@
     },
     {
       "file": "cow_stale_orphan.jed",
-      "sha256": "ff540508cf0f592bb1d633fb439fb27d9510f104c20e887ab85901e3d30a4d9a",
+      "sha256": "6cbb7e2956cbdb88e6be8e90fd10a47a61c9548c6e20e641a83e85c153349098",
       "class": "writable_recovery",
       "open": "success",
       "sidecar_mutation": true,
@@ -893,7 +905,7 @@
     },
     {
       "file": "cow_torn_body.jed",
-      "sha256": "891f157817b4523f415c0141e9409693640fa7b555299c8a7162cc7774474d4c",
+      "sha256": "dbc7ef440222e4b206dfdfa643ab196c593a3362bdaf57448e514ec3442cc5d6",
       "class": "writable_recovery",
       "open": "success",
       "sidecar_mutation": true,
@@ -939,7 +951,7 @@
     },
     {
       "file": "cow_torn_manifest.jed",
-      "sha256": "bd76e5c430dd4dc37a0bbc5cd1f2f0842177091d3f6155012bbeed5eeb113fb0",
+      "sha256": "1f79abdf0b8a012af503f13bef4894a732a4dc11e930c8da6c7586646ade9101",
       "class": "writable_recovery",
       "open": "success",
       "sidecar_mutation": true,
@@ -985,7 +997,7 @@
     },
     {
       "file": "cow_torn_meta.jed",
-      "sha256": "259e230fc401d83e649791f462aa2454e3fe6dcd72f8e1215848d7f2971333cb",
+      "sha256": "baac2b8c9358fe3e6e991a5887d79521478256d9b95a37bd294df32f7ab4c3c4",
       "class": "writable_recovery",
       "open": "success",
       "sidecar_mutation": true,
@@ -1031,7 +1043,7 @@
     },
     {
       "file": "cow_wrong_manifest_txid.jed",
-      "sha256": "67beb95e6110fc43e6e3d30d147841454fc0eecf72acf1f7f30fe559037f7c6f",
+      "sha256": "7318b1794a9c726a1693b9a4602a8c3b521d7dd01549236ce28dff5b2cf2948c",
       "class": "writable_recovery",
       "open": "success",
       "sidecar_mutation": true,
@@ -1077,7 +1089,7 @@
     },
     {
       "file": "date_table.jed",
-      "sha256": "81c0d895612579d72492c48fba6548efdf604d8c6d88fe27dfb92ce7879c36d9",
+      "sha256": "907e2b75dc2dbcb6e8520a20d53d6cb9d1c80c2bae0e31e81a7b0998dda3b614",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -1090,8 +1102,20 @@
       ]
     },
     {
+      "file": "decimal_fixed_table.jed",
+      "class": "ordinary_writable",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Read every original row across cores; update and reopen using both writers; compare committed bytes and independently check the image.",
+      "sources": [
+        "spec/fileformat/format.md"
+      ],
+      "sha256": "b41179a3d2fa6ae5e556e4ca7214102a3e71e7949d1f4e9c16d83762918f343f"
+    },
+    {
       "file": "decimal_pk_table.jed",
-      "sha256": "e503c297d5f9feb5934e2a3d1027ae5c73f76168ee007c1b60a5ca4bcfed4de5",
+      "sha256": "3fe3c0a2dc8ee17e8929f9bfc5de0c4deabff0238249c52a96cd4152896ceb10",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -1105,7 +1129,7 @@
     },
     {
       "file": "decimal_table.jed",
-      "sha256": "c038007d1c5a7e8ef20ad12a27d7dc612d4ccd0eda6c538342ee68d7a31704c7",
+      "sha256": "f11510e766008d626a5fe10e1e14a5277ff557497f945f72e9a9f720257288ae",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -1119,7 +1143,7 @@
     },
     {
       "file": "default_expr_table.jed",
-      "sha256": "39ca5b07c23dce8e5022d651a875cf8409be94008d29823571f0d4ce6badbd2a",
+      "sha256": "e58fd40fcf672391ec1b5f766e3153314c5b44a7c9b50af88ad5c0f5700937b7",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -1133,7 +1157,7 @@
     },
     {
       "file": "default_table.jed",
-      "sha256": "6a7a73ff8903973f8db6ca568e52645ba6dbdec2645864c20bcf84f0e721a3b2",
+      "sha256": "176c1393c3825ee0cf76d4ca8bf8d934965bb69f91750015d679e02faf82fa93",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -1147,7 +1171,7 @@
     },
     {
       "file": "empty_db.jed",
-      "sha256": "53e939a832809b749c669c9f006ea371fde07c1ad763de2fb7af3c75b49b77fe",
+      "sha256": "85045e1b95f2166932f86fc3d65a0b4a04e139b86ae83a71894f96130824e90a",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -1161,7 +1185,7 @@
     },
     {
       "file": "encrypted_catalog.jed",
-      "sha256": "8e9b0c43b103924ec93da090cce14d6d710dd43ef4c40d42bfee3b182a07b5bf",
+      "sha256": "8292ea2346024e09d1eb8e572fe87a2f04a8d33cca03bd1f164f475539c1fa5d",
       "class": "encrypted_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -1185,7 +1209,7 @@
     },
     {
       "file": "encrypted_empty_db.jed",
-      "sha256": "49ec67b6e0773f270f7148429b90e9cdd4e8ffd253a79504e1372e98fc12c267",
+      "sha256": "e8ce7373bde907ef90c29f5ec55ddaeb0c8d2d9eb2c20d2d1a2def136898e44d",
       "class": "encrypted_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -1209,7 +1233,7 @@
     },
     {
       "file": "encrypted_index_table.jed",
-      "sha256": "94f32015e832b8c42dcd6881d4069659c98a5ac581c14835ff297b9f9d584d72",
+      "sha256": "898d6151c8af70267a2fed5703fd68e6c9ef3cb354a6f56d6245eebe34cbf698",
       "class": "encrypted_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -1233,7 +1257,7 @@
     },
     {
       "file": "encrypted_overflow_table.jed",
-      "sha256": "5e0f2d9d9fbd6d6d0281baa5c3b3daddd5af1cb204fbf4def2084d545a981fbe",
+      "sha256": "492f1a359a1f1b0db47f966bcee4aa90fd08aa3318f6db08129dd108e806eb1e",
       "class": "encrypted_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -1257,7 +1281,7 @@
     },
     {
       "file": "encrypted_pk_table.jed",
-      "sha256": "004157e8941ea31e22a890d46cf364d896fd2dd6ff1247c479e61517d87b0edd",
+      "sha256": "39d8555669356b011ed8f071b427f0297a9998d91bcd4f8c39b667af70eb152d",
       "class": "encrypted_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -1281,7 +1305,7 @@
     },
     {
       "file": "encrypted_rekey_index_table.jed",
-      "sha256": "3f9ce534c1c4a7aded53ec13d028cc957b45e4608f7e35a38e3304de9678f2fe",
+      "sha256": "96a9c7759160cc8aa640d59c68202853bc0eb0f6fc0577c77491a5a90b2ebe47",
       "class": "encrypted_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -1305,7 +1329,7 @@
     },
     {
       "file": "exclude_followon_table.jed",
-      "sha256": "988aef99b2cfe8e828c5f1172e6458f534bcca92bfd06b434fb9f8bee86f9f3e",
+      "sha256": "4c84c06235991203494ef5873621409499f76780466724c610e67be9b74585f5",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -1319,7 +1343,7 @@
     },
     {
       "file": "expr_index_table.jed",
-      "sha256": "9e857775a0519b16ef20bd6c9225b97682a0fbd2a9f2f01dcb5bed42d6e84c8c",
+      "sha256": "c96b41b6d88643bfac03061d05eb4d7d1979a8b348fa0ab2d62a35a1a9e23db2",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -1333,7 +1357,7 @@
     },
     {
       "file": "fk_table.jed",
-      "sha256": "cb775a28febc6c8b14f367ebc32c5ed01000233810102d2a5613454ea83b0441",
+      "sha256": "8303df37016d2d259275ad678597c1ebbdeca3886bc653149ac1a1386cec2296",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -1347,7 +1371,7 @@
     },
     {
       "file": "float32_pk_table.jed",
-      "sha256": "f1e858becee1b02031dbcbe1781e7307e08c5c6824cb3df4deaae6dedd5e90e0",
+      "sha256": "b4ba36919c9e4a800d15604736a324cf10e6c35ee7642dd117dfd5fd8e14cc5f",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -1361,7 +1385,7 @@
     },
     {
       "file": "float32_table.jed",
-      "sha256": "c62acef9cdcd6912f7e5cf92bbccf1252c1a07a2bb3b81ad46e665b0ab43a8e3",
+      "sha256": "ef35775474dcc4f4a8e755d6e2221c86c0dd35332350ab15407a06bf4ee34b58",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -1375,7 +1399,7 @@
     },
     {
       "file": "float64_pk_table.jed",
-      "sha256": "d78edec5364166eebd115bc2ad21b13398a0d7ae8db92947176dadc42f4c2117",
+      "sha256": "f222881354c2ac8dd0c943f92fcaad015fc73b2d3045447f7198a429d7ca2b68",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -1389,7 +1413,7 @@
     },
     {
       "file": "float64_table.jed",
-      "sha256": "c5b928235084cdee412f1b8b750b0aa61f20a5b4a6b71c7856a926c6ae9b2361",
+      "sha256": "6ab487f37e3a4043ac3f0997dc63a6bb53d7bccb05f900808859d95bce55a3b3",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -1403,7 +1427,7 @@
     },
     {
       "file": "gin_array_table.jed",
-      "sha256": "cb5b39e40a9e63807f9b9f06c0f8bbfb98c41a78ccbf97c98a15593249f10e5a",
+      "sha256": "b95650347f66718c6999c80706f4700b7ad28d01069d0feb83c3ebd68d732c58",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -1417,7 +1441,7 @@
     },
     {
       "file": "gin_decimal_bytea_table.jed",
-      "sha256": "fe927bf23023653da13b3d7b918502b174d60250aef51ef7c7dadc4492863a05",
+      "sha256": "295d360140e2f68edbd9dba08e0923e3a6e7afad56e1643833465fbb8099b0e1",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -1431,7 +1455,7 @@
     },
     {
       "file": "gin_float_table.jed",
-      "sha256": "e4742ecfab1dc0935e827ad78ba1c67647332d86867f6d4be280e2a8ec8236e9",
+      "sha256": "ada00f94820f23cefb9469e4c4d992d1938228a8c2cefac0f02f19941c3a1f73",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -1445,7 +1469,7 @@
     },
     {
       "file": "gin_interval_table.jed",
-      "sha256": "bd3792fe46d989183a19b8e4f05918d9b0f819641afac4453e64e3dc5ac40fb9",
+      "sha256": "c276ad35ebc7b9068222d67a2cb4604709e9c96408ceae61b918717123d2dc26",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -1459,7 +1483,7 @@
     },
     {
       "file": "gin_jsonb_table.jed",
-      "sha256": "13822c6bdd2ffefdccc01e6de74572ea803b9c07d6df7a5688ce01fcf4ca6601",
+      "sha256": "ac88c02c1701f34dcbc0eef8adf5c1eab808e6af0956a90daadec04d5e0d1c2e",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -1473,7 +1497,7 @@
     },
     {
       "file": "gin_multi_table.jed",
-      "sha256": "327380b12484a36ff3617163a64c4b958bea78a5cf6425b878c754afce387ed7",
+      "sha256": "fc5a46fd5b0634c07e2c5b38849eb862e1b7d0e463bc496b07af00e27dffc488",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -1487,7 +1511,7 @@
     },
     {
       "file": "gin_text_table.jed",
-      "sha256": "779ef321dfabfdefc7d20f70b625e641d41370f3461bd3095bd4b08ce8b40293",
+      "sha256": "111b89b3422479a9319391063d38958e2959a45acee2b5bdbb84e9b0f022376a",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -1501,7 +1525,7 @@
     },
     {
       "file": "gin_uuid_table.jed",
-      "sha256": "5a2b527112b16cbdb3c3e8acc9f5bbd24084bf882317078b3e6313589d1c1907",
+      "sha256": "510b253d0159a3a6a7eab1649bb496742cb96e2cfec0f16b39767b7c6dc66588",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -1515,7 +1539,7 @@
     },
     {
       "file": "gist_exclude_table.jed",
-      "sha256": "b32fb34d07d96ceea0b073590bb9145b2a95804f3529061cd4baf0c5bc354683",
+      "sha256": "787f7a6a1d0624f7fe31468bda3255e5f78d5eebf4ca0c5cbe8a71918a28e0a2",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -1529,7 +1553,7 @@
     },
     {
       "file": "gist_range_table.jed",
-      "sha256": "595c97de51924e90939a3550cf6c3b2f8e967aaa1b4be81db2a147d51d61918a",
+      "sha256": "c559864dc6819cd2c589f7c7dc51604c2ffdd3d254931ab608a1828f272e66a0",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -1543,7 +1567,7 @@
     },
     {
       "file": "gist_scalar_table.jed",
-      "sha256": "43b15d5c8245092479649a1a4caa4d0231bbc196f5fc6858ebd813bf9268be83",
+      "sha256": "94203d7aab9c233e88a0b947cebf645ff27a72484ffcaeb61323b2c23bf0cbdc",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -1557,7 +1581,7 @@
     },
     {
       "file": "hostfunc_check_table.jed",
-      "sha256": "bcb14e6507c35d5180b85d75db29dfa4c22bcf166c1c0c43f3e0db0d4ff7e3b1",
+      "sha256": "6740a7b0f67b5a18ecbbb3c3cb9da8daec06e7bac16aed1bd135ee8bcc54f1f5",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -1573,7 +1597,7 @@
     },
     {
       "file": "hostfunc_index_table.jed",
-      "sha256": "7fa6348f4e989ad3f5235d224e7ca1f63654dcb0a4c65fac19d4aa712e9ad6d1",
+      "sha256": "6b29e93eae12dd6163942e4adb6fdeba5ece821b0cc8f27838a564746005845b",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -1589,7 +1613,7 @@
     },
     {
       "file": "identity_table.jed",
-      "sha256": "84f278b37314249f418e0fd9ce9a062da3c25ce6d7a4881bb76525295c8a0c1e",
+      "sha256": "b4080355cb286c5357bcaf1f9d5cca7fe8a2183f0f6e60459f9d2ddf76033383",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -1603,7 +1627,7 @@
     },
     {
       "file": "index_table.jed",
-      "sha256": "75a24cd44189ff3801f717f950a91e218cca166a480815d522b99bec13c3ff53",
+      "sha256": "78738a4e12d325731d5b175700b86a9027c7e3bc480596f9fe8bb3716484f1ee",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -1617,7 +1641,7 @@
     },
     {
       "file": "interval_pk_table.jed",
-      "sha256": "ac691c0d89ff27bd6f84fa34939f23b849787750909a834d0d8c14fb3125dbda",
+      "sha256": "0444fb91cb2e55c8b5e727267d4d5f7dca6d9a3245ae5f210ec5b112def9105a",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -1631,7 +1655,7 @@
     },
     {
       "file": "interval_table.jed",
-      "sha256": "73a96c127373a4972f16f8f7d218912e5c9017e6c87c005d65208696e53c4f5e",
+      "sha256": "beef592b5f5e6b4a348ba3f09f8a9a81ea3efcba16a0e78e19da99a71456cc89",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -1645,7 +1669,7 @@
     },
     {
       "file": "json_table.jed",
-      "sha256": "79923cd6c4a3b4f5c09f2202436cbf306ead62096e11aa60a4e135b7fe2fb26c",
+      "sha256": "8a423866e580acb3d113bbbeb253e356130bc9578bae98220789d6d7fe9e37a8",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -1659,7 +1683,7 @@
     },
     {
       "file": "jsonb_table.jed",
-      "sha256": "ac6c1ad4f1ebf4178eae674e8ebc2d939b7bcea94bc5145492460a0d399e33ba",
+      "sha256": "57e4e3bdb6b5cace955a548f3ee98a05c8b7cadb5b7acb58d07c8bc40b59c719",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -1673,7 +1697,7 @@
     },
     {
       "file": "malformed_decimal_group.jed",
-      "sha256": "000250db96a8e1edc149b68ac2de4581e4ac30b325e4eb8b3780c073b0438857",
+      "sha256": "fc9458a2fdaca88f707eb8bf61f3b9863dcf2ce313ad716b1b1f3e1932e6bfd7",
       "class": "lazy_corruption",
       "open": "success",
       "sidecar_mutation": false,
@@ -1700,7 +1724,7 @@
     },
     {
       "file": "malformed_fk_type.jed",
-      "sha256": "ae6bf93a7a530d761db56910a32daf5d3e384ce29ef5b5fde2ec3be256305ae1",
+      "sha256": "4cb2d7494141372729e0d2a86cf039b23e755205aa27f24b8b42ab267bdde23c",
       "class": "expected_open_error",
       "open": "XX001",
       "sidecar_mutation": false,
@@ -1714,7 +1738,7 @@
     },
     {
       "file": "malformed_interior_cycle.jed",
-      "sha256": "ca0dbf11d955e41d213f5f5bc01ccf5971f37001ab1ca7e4ca99ea7ee62a7d0d",
+      "sha256": "8b13d64500a73e3d204d906ca7b62f461b922308818d4824789018307ad56a5d",
       "class": "expected_open_error",
       "open": "XX001",
       "sidecar_mutation": false,
@@ -1728,7 +1752,7 @@
     },
     {
       "file": "malformed_leaf_directory.jed",
-      "sha256": "1f2fc74a957b76a75461aea6e5d33c6151e3b939f967e2efffd3eecb9758e411",
+      "sha256": "c1112b94e18c2b4ddf0e56dec66a0c66583c10617a2b84dbb8b4bc6de2714d8a",
       "class": "lazy_corruption",
       "open": "success",
       "sidecar_mutation": false,
@@ -1755,7 +1779,7 @@
     },
     {
       "file": "malformed_missing_type.jed",
-      "sha256": "56e3ade1ae4a0adc72650984bbe9ac50b2648b7095b9f4ff28044f3a69e56a67",
+      "sha256": "7fa38ef87335d039e76f21202eed88b58c1827aa312c47cb007f4abef7c46e40",
       "class": "expected_open_error",
       "open": "XX001",
       "sidecar_mutation": false,
@@ -1769,7 +1793,7 @@
     },
     {
       "file": "malformed_overflow_cycle.jed",
-      "sha256": "4868cade375e4b871d2e742b7cc2cc02db7eae9cc72c57059e5f76b5b9e218e8",
+      "sha256": "864f28da0741d94fda79a70183ba5ff57469be2a4092ee3b6596023265403d3e",
       "class": "lazy_corruption",
       "open": "success",
       "sidecar_mutation": false,
@@ -1802,7 +1826,7 @@
     },
     {
       "file": "malformed_row_count.jed",
-      "sha256": "1f29d8b483e69dc6057449f8f6d02b959242df10f37a50119ce34e78b2102582",
+      "sha256": "a7b300bc360d00e9cd3d88d529034dbb9034bd3656801776985ccf8a9cc1b514",
       "class": "lazy_corruption",
       "open": "success",
       "sidecar_mutation": false,
@@ -1829,7 +1853,7 @@
     },
     {
       "file": "malformed_wrong_tree_leaf.jed",
-      "sha256": "d9813a84e739da7f70bb945447341a08cf13c33a617cbb246af89a799ea92b82",
+      "sha256": "de130b50421eee4a96c22440d267fcf72538c768514f22f94a70b2c48b8e3433",
       "class": "lazy_corruption",
       "open": "success",
       "sidecar_mutation": false,
@@ -1865,7 +1889,7 @@
     },
     {
       "file": "max_sep_table.jed",
-      "sha256": "da26a6fe23eed279542f3f1c35291374608e73c21ed9d62ad2c91a6749eaae15",
+      "sha256": "515c28bca2712ad00ada58c5b3f6cef6247a4a4f04ebc19dfde5b8210467d3ac",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -1878,8 +1902,20 @@
       ]
     },
     {
+      "file": "multiway_split.jed",
+      "class": "ordinary_writable",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Read every original row across cores; update and reopen using both writers; compare committed bytes and independently check the image.",
+      "sources": [
+        "spec/fileformat/format.md"
+      ],
+      "sha256": "02ffe125e8789760470a005daa18f34e7e5f4c94ad045aea5ba742f4a0e518f5"
+    },
+    {
       "file": "nested_composite_table.jed",
-      "sha256": "7b6b3492a6c663cf35a6f6ed20a6d76ea08237575eff11e8f82826535a4d5e5a",
+      "sha256": "3e1350a3cf25fcaf631e13abfd151d5c9e6e2048277dfd6bcaa0aa8063b54651",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -1893,7 +1929,7 @@
     },
     {
       "file": "nopk_table.jed",
-      "sha256": "417af9d1dab09908607b3d86e5732dc2c14cee0a386118aebcb129b5a50fb42e",
+      "sha256": "d615cf5988748b6615c3da5e050f46f42828062cd5b3aa1f88c2e9c666af4d72",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -1907,7 +1943,7 @@
     },
     {
       "file": "one_table_empty.jed",
-      "sha256": "a22ac0fef45eec907c6c70fea69a422a0f0ae3f94ba8acab44f4bff446458c66",
+      "sha256": "e200ff7b43d11556e97cd2a948428c6a803f0f7bd695849dbc151c3c7b9f7b1a",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -1921,7 +1957,7 @@
     },
     {
       "file": "ordered_index_table.jed",
-      "sha256": "03a2fba666e8c96c1f909af0ad1fe258fca5bf02cdf706fe8a080ead3d7a1e55",
+      "sha256": "16b7f81b415c47258d15c195cba76cadb2ee30aa0137c16aa859cf479814e9d9",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -1935,7 +1971,7 @@
     },
     {
       "file": "overflow_table.jed",
-      "sha256": "227344c12731a64ffe43593e51b48402cfccbae4550ce42c6565b3cfec99a943",
+      "sha256": "b0134b7fb1c6bffaaa264f8516058a106dad7b35c2df9d8e74fc3068be48a74e",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -1949,7 +1985,7 @@
     },
     {
       "file": "partial_index_table.jed",
-      "sha256": "2dd83f8daa4feb6e376107966e1fed2bc9ae42285208b0e329db1b23f6e6ae5f",
+      "sha256": "29c205d6430f11ab10046ff079cffa1c8a9f4fe15539f887160072985f2368d3",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -1963,7 +1999,7 @@
     },
     {
       "file": "pk_table.jed",
-      "sha256": "7ed0a5b03185ce5564c3c7d7f4e9656e7901fc5fd1f025fda7c2614854578975",
+      "sha256": "ff2210075494b866cf8c00697c63191ee9ff4500b84bcd473c45cd961e2cfb10",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -1977,7 +2013,7 @@
     },
     {
       "file": "range_pk_table.jed",
-      "sha256": "a2abcdfd18598532f413903af1edc80ff4e04a0dfeb625dfd10ef9710dcede2d",
+      "sha256": "b2ffd38b498b407c2dac487540313c1754d0968e952bcb7e41d41864379a111c",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -1991,7 +2027,7 @@
     },
     {
       "file": "range_table.jed",
-      "sha256": "8ca6bd20fe3d2d31f6801181ca5577647d21ab5e52ca5ad159017bfccae517a0",
+      "sha256": "3e205732ad5ad5d9f351454644f9a17ba1ffde66d63db997bf6e380beaef52f2",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -2005,7 +2041,7 @@
     },
     {
       "file": "row_count_table.jed",
-      "sha256": "f7a0215c56a13f1056cd2b2d3aeff95641fc0efb2e14da236cd41fdcbeecbeba",
+      "sha256": "8bf3772c49935dc18b23f9000fe8a394a3aa82ac59ed7b9c9b9189855083e9d2",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -2019,7 +2055,7 @@
     },
     {
       "file": "sequence_table.jed",
-      "sha256": "8f348eaee0814edf199f77f9003dc972774debfd0968a06120bef35723f4d12a",
+      "sha256": "4ef111cb559dc98e9d3e7cdece2d1b179e0a095a9e6a49e3e349a117d2ab97c6",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -2033,7 +2069,7 @@
     },
     {
       "file": "serial_table.jed",
-      "sha256": "f3ac5fe889c63457344fa99b2fc96ec65b92a832861cfa914ab637ad0701476a",
+      "sha256": "dd45a8cc596964cf118e16e328aa43bc85fa786a52d9d4fc0094c2e43d3a81af",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -2046,8 +2082,20 @@
       ]
     },
     {
+      "file": "statistics_decimal_table.jed",
+      "class": "ordinary_writable",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Read every original row across cores; update and reopen using both writers; compare committed bytes and independently check the image.",
+      "sources": [
+        "spec/fileformat/format.md"
+      ],
+      "sha256": "04fef346a9c6c4869600a48487d708e6a15735cdaa1dfa40a01e18b71a056c45"
+    },
+    {
       "file": "statistics_table.jed",
-      "sha256": "aa7c0bed4df659b027dab1528454de767f9b60339336bdbc0da4201087ced990",
+      "sha256": "b501ca0aef507b5722494503ffb2042a9980dd1e16810adc10852553022e6e1c",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -2061,7 +2109,7 @@
     },
     {
       "file": "statistics_terms_table.jed",
-      "sha256": "24dd1b085d87d04b2962ce54d22da8376c7a02cc41e5ab410e738e8b10cbfc61",
+      "sha256": "d953a4df039dea2e39ff1e9652707498bba020eed68a322b6d0a7c29626e5514",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -2075,7 +2123,7 @@
     },
     {
       "file": "tall_tree.jed",
-      "sha256": "9d2b0b255322c2400145b2edb2b74f81e1e4c87d87e4205719cf37c47de2feda",
+      "sha256": "76cc8657e287cb6c739b2f46f3097777c6674637406540ffce19fc39713bbb39",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -2089,7 +2137,7 @@
     },
     {
       "file": "temporal_typmod_table.jed",
-      "sha256": "8be0ef11cea7aecd160739b46e306ae965886eb5d28fe1927809a4431b1b2aab",
+      "sha256": "4103380f2680fec3fe9d4e73171bbcc9a03dd4193b0a2e8bf3c45a9a060e47c3",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -2103,7 +2151,7 @@
     },
     {
       "file": "text_pk_table.jed",
-      "sha256": "f946971091fc96a13a08343a28c9b3df80e405ccdc344ecfa7d8c7cbd85db6cf",
+      "sha256": "8783adbcef1cb139556d0ea48251bbc1c9fd10fd8ffc2a003c1b8ac1eca40b2a",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -2117,7 +2165,7 @@
     },
     {
       "file": "text_table.jed",
-      "sha256": "02a00277714aa88eef228075e7dba1a0eb8e3091c3952a131eded74301ecd1c2",
+      "sha256": "9e5194eed74ab57dc02c990c2fe7dfdf3979dc7da90b1a3fd7f319d504c56a70",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -2131,7 +2179,7 @@
     },
     {
       "file": "timestamp_table.jed",
-      "sha256": "476ad804d363ca2c844289929cb26aec16d52fa5e5ce99537a2c336c149d3fb4",
+      "sha256": "dc8483dd663966e0ef7fcacbd43ceab977fb0aa87ca39b3f9722f4ea9e4872f0",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -2145,7 +2193,7 @@
     },
     {
       "file": "timestamptz_table.jed",
-      "sha256": "0053782c7be9adf7512599bd7199e4ecc6eb595b0a9591768c3ab1482e9b471e",
+      "sha256": "19e759c8ae0715da93d6377d7f579feccc471f3c12f18aee50565223190023fb",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -2159,7 +2207,7 @@
     },
     {
       "file": "timezone_index_table.jed",
-      "sha256": "5686595d1a769bba1bbbd180d1485403480487732108d17a09348edd895d30e6",
+      "sha256": "750cc01ea15b7a9b8bf4628557bb5d057df12f4d33392aca546987c71429afb1",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -2175,7 +2223,7 @@
     },
     {
       "file": "torn_meta_slot0.jed",
-      "sha256": "737870f57de37445aadb37b575a7840013be44bcb9657ec8bb82bd8155c29022",
+      "sha256": "2ea50e6a22d93193ac47a8d374bf4be7a20e443e2f2939103d6e2aa362285609",
       "class": "writable_recovery",
       "open": "success",
       "sidecar_mutation": true,
@@ -2277,7 +2325,7 @@
     },
     {
       "file": "torn_meta_slot1.jed",
-      "sha256": "35ce670e448a9fa60c00c55686edf5d9fdbe2884cd3d4ad230d76dec3a5a410d",
+      "sha256": "bfdfaf3cf50ca7d9147cff2ebe9f277eb75a6f48a2561fb9d8f14c82d6987a59",
       "class": "writable_recovery",
       "open": "success",
       "sidecar_mutation": true,
@@ -2379,7 +2427,7 @@
     },
     {
       "file": "unique_table.jed",
-      "sha256": "b0f19df87ebebcfc01076faa6742d68f1a5cc468b868b0bdf818e7a1a250f2b9",
+      "sha256": "1ab93a1b721e41f591665d807970d4e043e49858ca60b9773708550e4f2eca2f",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -2393,7 +2441,7 @@
     },
     {
       "file": "unparsable_definitions.jed",
-      "sha256": "acd2d9cd72d3d2a9429346403b6981feee0338314a2251cec7beefc5a8d18692",
+      "sha256": "fa5ef7dd30f38f01f0669b36c0721ac196af8b2d3b930e8e148e1bdd3a23ab5a",
       "class": "unparsable_definitions",
       "open": "success",
       "sidecar_mutation": true,
@@ -2500,7 +2548,7 @@
     },
     {
       "file": "uuid_table.jed",
-      "sha256": "c0882b88f4f764ee16cd3f638886e142616f4709498247e723c3bc47fab5f50f",
+      "sha256": "fed3d35c59fc37b04693d08b629f674a5edd1725e81f3b06b725020191ec0672",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -2514,7 +2562,7 @@
     },
     {
       "file": "varchar_table.jed",
-      "sha256": "008f1af68afeedca7d0c7dee910a4f7026cfcc9786406331f37abe81eb27884e",
+      "sha256": "707b9e8e8b0ef744696a3d7bc12fbd760be2819227eab34f9ef40f0d579e95ce",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -2528,7 +2576,7 @@
     },
     {
       "file": "view_options_table.jed",
-      "sha256": "7ee7cb04321a2c38050e88c6715f5b110283b3c81097866205d1191744c28702",
+      "sha256": "395af05d64f709d6353af8f32836c21a0dccbebf8fd16c8310c76d5232ff9cfe",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -2542,7 +2590,7 @@
     },
     {
       "file": "view_table.jed",
-      "sha256": "bb92f24fd8960e4ced9100f3133db67a57e6a9974bad5f321e74bcdf2e8f88cf",
+      "sha256": "01825d006415c58ca528e62195656c4d03f32f22c3043af6f86bf91e5c9943d1",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,

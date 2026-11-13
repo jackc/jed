@@ -45,7 +45,7 @@ final class PackedSpanBoundaryTests: XCTestCase {
     private func cell(_ value: SQLValue, _ type: TypeDescriptor) throws -> TypedCell {
         if value.isNull { return TypedCell(bytes: nil, type: type) }
         let bytes: [UInt8]
-        if ValueCodec.fixedWidth(type.type) == nil { bytes = try ValueCodec.encode(value, type: type) }
+        if ValueCodec.fixedWidth(type.type) == nil { bytes = LeafValue.bare(type.type) ? [5] + (try ValueCodec.encodeRawBody(value, type: type)) : try ValueCodec.encode(value, type: type) }
         else { bytes = try ValueCodec.encodeBody(value, type: type) }
         return TypedCell(bytes: bytes[...], type: type)
     }
@@ -111,7 +111,7 @@ final class PackedSpanBoundaryTests: XCTestCase {
                 try assertEquivalent(equal(bytea, .bytea([0,255,0,42]), negated: negated), cells: [try cell(value, bytea)])
             }
         }
-        let malformed = TypedCell(bytes: [UInt8(0),0,2,41][...], type: text)
+        let malformed = TypedCell(bytes: [UInt8(5),0xff][...], type: text)
         // IS NULL has no value-decoding requirement, even for an invalid body.
         let row = try frame([malformed]); defer { row.close() }
         let meter = CostMeter(), context = ExpressionContext(meter: CostMeter())
@@ -175,7 +175,7 @@ final class PackedSpanBoundaryTests: XCTestCase {
         var badUTF8 = validArray; badUTF8[badUTF8.count - 1] = 0xff
         var badBitmap = try ValueCodec.encode(.array(SQLArray(elements: [.null])), type: array)
         badBitmap[badBitmap.count - 1] |= 1
-        let textBodies: [[UInt8]] = [[0,0,2,41], [0,0,1,0], [0,0,1,0xff], [0,0,2,0xc0,0x80], [0,0,1,65,0]]
+        let textBodies: [[UInt8]] = [[5,0], [5,0xff], [5,0xc0,0x80], [5,65,0]]
         let textExpression = equal(text, .text(try SQLText("a")))
         let arrayExpression = arrayOperation("&&", array, constant(.array(try SQLArray(elements: [])), array))
         let probes = textBodies.map { (text, $0, textExpression) }
@@ -196,7 +196,7 @@ final class PackedSpanBoundaryTests: XCTestCase {
     func testAndShortCircuitDoesNotDecodeAnUnreachedMalformedCell() throws {
         let left = nullTest(text), right = equal(bytea, .bytea([1]), index: 1)
         let expression = ResolvedExpression(type: boolean, node: .binary("and", left, right, boolean), position: 0)
-        let row = try frame([try cell(.text(SQLText("not null")), text), TypedCell(bytes: [UInt8(0),0,2,1][...], type: bytea)])
+        let row = try frame([try cell(.text(SQLText("not null")), text), TypedCell(bytes: [UInt8(3),0,0,0,1,0,1,0xff][...], type: bytea)])
         defer { row.close() }
         let meter = CostMeter(), context = ExpressionContext(meter: meter, column: { try row.value($0) })
         let filter = PackedLaneFilter(predicate: expression, types: [text,bytea], touched: [0,1], context: context)
@@ -232,7 +232,7 @@ final class PackedSpanBoundaryTests: XCTestCase {
         var store = try XCTUnwrap(base.tables[name]), cursor = store.cursor()
         let rejected = try XCTUnwrap(cursor.next()), kept = try XCTUnwrap(cursor.next()); cursor.close()
         var invalid = rejected.cells
-        invalid[2] = StoredCell(bytes: [UInt8(0),0,2,41][...], type: bytea)
+        invalid[2] = StoredCell(bytes: [UInt8(3),0,0,0,1,0,1,0xff][...], type: bytea)
         try store.put(PackedRecord(key: rejected.key, cells: invalid), netStaging: false)
         var snapshot = base; snapshot.setTableStore(name, store)
 
@@ -268,7 +268,7 @@ final class PackedSpanBoundaryTests: XCTestCase {
 
         // COUNT beside an encoded WHERE consumes nullness even when the
         // surviving body is invalid. MIN remains a value consumer.
-        invalid = kept.cells; invalid[2] = StoredCell(bytes: [UInt8(0),0,2,41][...], type: bytea)
+        invalid = kept.cells; invalid[2] = StoredCell(bytes: [UInt8(3),0,0,0,1,0,1,0xff][...], type: bytea)
         try store.put(PackedRecord(key: kept.key, cells: invalid), netStaging: false)
         snapshot.setTableStore(name, store)
         let counted = try run("SELECT count(payload) FROM t WHERE flag='yes'", snapshot: snapshot)

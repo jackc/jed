@@ -207,8 +207,9 @@ final class TreeBoundaryTests: XCTestCase {
             }
             let roots = candidates.subtracting(children).sorted()
             let root = try XCTUnwrap(selectLast ? roots.last : roots.first)
+            let layout: LeafLayout = types.isEmpty ? .index : .table(types: types, primaryKey: [0])
             let source = try BPlusTree.open(root: PageReference(root), pageCount: pageCount,
-                                           types: types, pool: pool(store, codec: codec))
+                                           types: types, pool: pool(store, codec: codec), layout: layout)
             var expected: [UInt32: [UInt8]] = [:]
             func collect(_ child: TreeChild) throws {
                 let node = try source.resolve(child), reference = try XCTUnwrap(child.reference)
@@ -216,7 +217,7 @@ final class TreeBoundaryTests: XCTestCase {
                 for child in node.children { try collect(child) }
             }
             try collect(XCTUnwrap(source.root))
-            var rebuilt = BPlusTree(codec: codec, types: types), cursor = TreeCursor(source)
+            var rebuilt = BPlusTree(codec: codec, types: types, layout: layout), cursor = TreeCursor(source)
             while let record = try cursor.next() { try rebuilt.insert(record) }
             var allocator = try PageAllocator(highWater: XCTUnwrap(expected.keys.min()), free: [], firstBody: 2)
             let result = try rebuilt.serialize(allocator: &allocator, fromScratch: true)

@@ -51,8 +51,8 @@ extension ExpressionResolver {
             let ranges = ["&&", "<<", ">>", "&<", "&>", "-|-", "+", "-", "*"]
             guard ranges.contains(op) || op == "@>" || op == "<@" else { return nil }
             let range = TypeDescriptor(.range(element))
-            if a.type == nil { a = try lhs.resolve(expected: range) }
-            if b.type == nil { b = try rhs.resolve(expected: range) }
+            if a.type == nil || FunctionResolver.bareString(left) { a = try lhs.resolve(expected: range) }
+            if b.type == nil || FunctionResolver.bareString(right) { b = try rhs.resolve(expected: range) }
             if a.type?.type != range.type || b.type?.type != range.type {
                 if op == "@>", a.type?.type == range.type {
                     b = try rhs.resolve(expected: TypeDescriptor(element))
@@ -65,6 +65,8 @@ extension ExpressionResolver {
             let result = ["+", "-", "*"].contains(op) ? range : TypeDescriptor(.scalar(.boolean))
             return ResolvedExpression(type: result, node: .rangeOperation(op, a, b, element), position: position)
         }
+        if case .array = a.type?.type, FunctionResolver.bareString(right) { b = try rhs.resolve(expected: a.type) }
+        if case .array = b.type?.type, FunctionResolver.bareString(left) { a = try lhs.resolve(expected: b.type) }
         let leftArray: Bool = { if case .array = a.type?.type { true } else { false } }()
         let rightArray: Bool = { if case .array = b.type?.type { true } else { false } }()
         if a.type == nil && b.type == nil && ["@>", "<@", "&&"].contains(op) {

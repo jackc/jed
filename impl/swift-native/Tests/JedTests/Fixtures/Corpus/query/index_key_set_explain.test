@@ -209,12 +209,12 @@ EXPLAIN SELECT a, c, id FROM tm WHERE a = 2 AND s = 'y' AND c IN (7, 70)
 Filter
 conjuncts=3
 2
-24
+22
 1
 Scan tm
 Index interval set: using tm_asc (a, s, c); intervals=2; touched=4
 2
-8
+6
 
 # A set on the text column is consumed too: an admitted entry steps over its text slot by decoding
 # the terminator.
@@ -225,12 +225,12 @@ EXPLAIN SELECT a, c, id FROM tm WHERE a = 2 AND s IN ('x', 'y') AND c = 7
 Filter
 conjuncts=3
 2
-24
+22
 1
 Scan tm
 Index interval set: using tm_asc (a, s, c); intervals=2; touched=4
 2
-8
+6
 
 # A final text range under a set.
 query ITTII nosort
@@ -240,12 +240,12 @@ EXPLAIN SELECT a, c, id FROM tm WHERE a IN (1, 3) AND s > 'x' AND c = 4
 Filter
 conjuncts=3
 4
-4007
+3607
 1
 Scan tm
 Index interval set: using tm_asc (a, s); intervals=2; touched=4
 400
-1203
+803
 
 # Every variable-width key type after a leading set is stepped over.
 statement ok

@@ -268,7 +268,7 @@ extension CatalogDDL {
             }
             built = try validation.finish()
             tableStore = try AlterRowRewrite.publish(rewritten.rows, nextID: rewritten.nextID,
-                types: table.columns.map { try $0.type.resolve(snapshot.types) }, original: originalStore, settings: settings)
+                types: table.columns.map { try $0.type.resolve(snapshot.types) }, original: originalStore, settings: settings, primaryKey: table.primaryKey)
         } else {
             tableStore = originalStore
             built = try validateAlterConstraints(&table, added: addedConstraints, store: originalStore,

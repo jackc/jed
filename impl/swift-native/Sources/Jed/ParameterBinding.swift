@@ -1,3 +1,8 @@
+internal final class ParameterInference {
+    var types: [Int: TypeDescriptor] = [:]
+    var uses: Set<Int> = []
+}
+
 /// Host binding is unmetered admission, before touching any row. It has no
 /// statement clock: text input follows type input, never special date words.
 internal enum ParameterBinding {

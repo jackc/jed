@@ -5,18 +5,10 @@
       "level": "quick",
       "max_findings": 100,
       "report": {
-        "findings": [
-          {
-            "kind": "row_key_not_primary_key",
-            "database": "main",
-            "object": "t",
-            "page": 3,
-            "key": "80000013"
-          }
-        ],
+        "findings": [],
         "truncated": false,
         "skipped": [],
-        "pages": 12,
+        "pages": 8,
         "rows": 40
       }
     },
@@ -26,18 +18,11 @@
       "report": {
         "findings": [
           {
-            "kind": "row_key_not_primary_key",
-            "database": "main",
-            "object": "t",
-            "page": 3,
-            "key": "80000013"
-          },
-          {
             "kind": "index_entry_missing",
             "database": "main",
             "object": "t_v_idx",
             "page": null,
-            "key": "80000013"
+            "key": "8000002d"
           },
           {
             "kind": "index_entry_count_mismatch",
@@ -49,7 +34,7 @@
         ],
         "truncated": false,
         "skipped": [],
-        "pages": 12,
+        "pages": 8,
         "rows": 40
       }
     }

@@ -34,6 +34,18 @@ private final class PackedAggregateDevice: BlockStore {
 /// Representation and ownership probes. Shared SQL owns aggregate semantics;
 /// these compare the packed and scalar lanes over the same pinned tree.
 final class PackedAggregateBoundaryTests: XCTestCase {
+    func testDiscardEligibilityExcludesStatefulAndContainerExpressions() throws {
+        let resolver = ExpressionResolver(columns: [ExpressionColumn(name: try SQLText("s"), qualifier: nil,
+            type: TypeDescriptor(.scalar(.text)), index: 0)])
+        for sql in ["lower(s)", "s LIKE 'a%'", "length(s)+1", "now()", "'today'::date", "1::i64"] {
+            XCTAssertTrue(ColumnarExecution.discardSafe(try resolver.resolve(SQLParser(sql).parseExpressionOnly())), sql)
+        }
+        for sql in ["regexp_count(s,'a+')", "s ~ 'a+'", "uuidv4()", "clock_timestamp()",
+                    "ARRAY[1,2]", "'{1,2}'::i32[]", "'{}'::jsonb", "jsonb_array_length('[]'::jsonb)"] {
+            XCTAssertFalse(ColumnarExecution.discardSafe(try resolver.resolve(SQLParser(sql).parseExpressionOnly())), sql)
+        }
+    }
+
     private struct Result {
         let rows: [[UInt8]]
         let cost: Int64
@@ -75,7 +87,8 @@ final class PackedAggregateBoundaryTests: XCTestCase {
         let meter = CostMeter(limit: costLimit, resources: resources, cancellation: cancellation)
         var settings = SessionSettings(environment: environment, options: SessionOptions())
         settings.options.workMemoryBytes = 0
-        let context = StatementServices(settings: settings, meter: meter).context()
+        var context = StatementServices(settings: settings, meter: meter).context()
+        context.columnarDisabled = !expectPacked
         guard case .query(let syntax) = try SQLParser(sql).parse() else {
             throw JedError("XX000", "packed aggregate probe expected SELECT")
         }

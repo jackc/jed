@@ -3,7 +3,7 @@
 #MISE description="Explicit opt-in: execute every frozen simulation regression through native Swift"
 #USAGE flag "-c --configuration <configuration>" default="debug" help="debug or release"
 #USAGE flag "--no-build" help="Use the existing native simulator"
-#USAGE flag "--input <path>" help="Explicit trace or directory; default is all 18 frozen regressions"
+#USAGE flag "--input <path>" help="Explicit trace or directory; default is all 19 frozen regressions"
 #USAGE flag "--output <path>" help="Transcript directory; default is a unique /tmp directory"
 
 require_relative "../../../impl/swift-native/Tools/swift_task"

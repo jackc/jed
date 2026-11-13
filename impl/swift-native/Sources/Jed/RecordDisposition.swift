@@ -36,7 +36,7 @@ internal enum RecordDisposition {
     }
 
     static func plan(key: [UInt8], values: [RecordInput], types: [TypeDescriptor],
-                     codec: any PageCodec, meter: CostMeter? = nil, pager: Pager? = nil,
+                     codec: any PageCodec, layout: LeafLayout = .index, meter: CostMeter? = nil, pager: Pager? = nil,
                      pageCount: UInt32? = nil) throws -> PackedRecord {
         guard values.count == types.count else {
             throw JedError("0A000", "record value count differs from its type layout")
@@ -44,12 +44,12 @@ internal enum RecordDisposition {
         var candidates: [Candidate] = []
         var total = key.count
         for (column, input) in values.enumerated() {
-            let type = types[column], width = ValueCodec.fixedWidth(type.type)
+            let type = types[column], width = LeafValue.width(type)
             var candidate = Candidate(type: type, fixed: width)
             switch input {
             case .value(let value):
                 candidate.null = value.isNull
-                if !value.isNull { candidate.raw = try ValueCodec.encodeRawBody(value, type: type) }
+                if !value.isNull { candidate.raw = try LeafValue.encode(value, type: type) }
                 candidate.rawLength = candidate.raw?.count ?? 0
             case .kept(let stored, let pending):
                 // A kept cell is the same column of the same table's prior record;
@@ -82,8 +82,9 @@ internal enum RecordDisposition {
                         } else { candidate.compressionRejected = true }
                     } else {
                         var reader = ByteReader(bytes)
-                        guard try reader.u8() == 0 else { throw JedError.corruption("invalid kept value form") }
-                        if shortLength(type.type) {
+                        let tag = try reader.u8()
+                        guard tag == 0 || tag == 5 else { throw JedError.corruption("invalid kept value form") }
+                        if shortLength(type.type) && tag != 5 {
                             let count = Int(try reader.u16())
                             guard count == reader.remaining else { throw JedError.corruption("invalid inline value length") }
                         }
@@ -93,8 +94,9 @@ internal enum RecordDisposition {
                 }
             }
             guard candidate.rawLength <= UInt32.max else { throw JedError("0A000", "value exceeds the byte-format limit") }
-            candidate.plainSize = width ?? (candidate.null ? 0 : candidate.rawLength + (shortLength(type.type) ? 3 : 1))
+            candidate.plainSize = width ?? (candidate.null ? 0 : candidate.rawLength + (shortLength(type.type) && !LeafValue.bare(type.type) ? 3 : 1))
             candidate.size = candidate.plainSize
+            if layout.keyOffsets[column] != nil { candidate.size = 0; candidate.plainSize = 0 }
             total += candidate.size; candidates.append(candidate)
         }
         let maximum = recordMaximum(capacity: codec.capacity, columns: types.count)
@@ -142,6 +144,13 @@ internal enum RecordDisposition {
         // record; commit preflight checks its exact leaf and separator fit.
         var cells: [StoredCell] = [], overflows: [Int: PendingOverflow] = [:]
         for (column, item) in candidates.enumerated() {
+            if let offset = layout.keyOffsets[column], let width = item.fixed {
+                let raw = try rawBytes(item, codec: codec, pager: pager, pageCount: pageCount)
+                guard !item.null, offset + width <= key.count, raw == Array(key[offset..<(offset + width)]) else {
+                    throw JedError.corruption("elided key column disagrees with its key")
+                }
+                cells.append(StoredCell(bytes: raw[...], width: width, keyDerived: true)); continue
+            }
             if item.null { cells.append(StoredCell(bytes: nil, type: item.type)); continue }
             if let original = item.original,
                item.fixed != nil || original.bytes?.first == item.form {
@@ -153,8 +162,8 @@ internal enum RecordDisposition {
                 encoded = try rawBytes(item, codec: codec, pager: pager, pageCount: pageCount)
             } else if item.form == 0 {
                 let raw = try rawBytes(item, codec: codec, pager: pager, pageCount: pageCount)
-                var writer = ByteWriter(); writer.u8(0)
-                if shortLength(item.type.type) {
+                var writer = ByteWriter(); writer.u8(LeafValue.bare(item.type.type) ? 5 : 0)
+                if shortLength(item.type.type) && !LeafValue.bare(item.type.type) {
                     guard raw.count <= UInt16.max else { throw JedError("0A000", "inline value exceeds its length field") }
                     writer.u16(UInt16(raw.count))
                 }

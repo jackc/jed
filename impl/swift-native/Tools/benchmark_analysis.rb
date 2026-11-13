@@ -26,7 +26,8 @@ module BenchmarkComparison
       # Read only the existing normalization/validation code. No run/build API is called.
       require File.join(File.expand_path(repo), "impl/swift-native/Tools/benchmark")
       projected, _, all = SwiftNativeBenchmark.input
-      raise Invalid, "canonical inventory is not exactly143 unique workloads" unless all.length == 143 && all.uniq.length == 143
+      expected = SwiftNativeBenchmark.const_defined?(:WORKLOAD_COUNT) ? SwiftNativeBenchmark::WORKLOAD_COUNT : 143
+      raise Invalid, "canonical inventory is not exactly #{expected} unique workloads" unless all.length == expected && all.uniq.length == expected
       new(baseline: SwiftNativeBenchmark::BASELINE, hashes: SwiftNativeBenchmark::HASHES,
           input: JSON.parse(JSON.generate(projected)))
     end
@@ -322,7 +323,7 @@ module BenchmarkComparison
     OptionParser.new do |parser|
       parser.banner = "mise run swift-native:bench-report --baseline COMPLETE_RUN --output EMPTY_DIR\n" \
                       "mise run swift-native:bench-report --before COMPLETE_RUN --after COMPLETE_RUN --output EMPTY_DIR"
-      parser.on("--baseline PATH", "Summarize one successful full 143-workload, four-core, three-round run") { options[:baseline] = _1 }
+      parser.on("--baseline PATH", "Summarize one successful full pinned-workload, four-core, three-round run") { options[:baseline] = _1 }
       parser.on("--before PATH", "Complete baseline run for before/after comparison") { options[:before] = _1 }
       parser.on("--after PATH", "Complete later run; requires --before") { options[:after] = _1 }
       parser.on("--output PATH", "Absent or empty destination for JSON, workload/category CSVs and report.md") { options[:output] = _1 }

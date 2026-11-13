@@ -100,14 +100,14 @@ SELECT id, v FROM big WHERE id IN (SELECT k FROM pick) ORDER BY id LIMIT 2
 420
 
 # NOT IN does not bound: full scan.
-# cost: 14021
+# cost: 14016
 query I nosort
 SELECT count(*) FROM big WHERE id NOT IN (SELECT k FROM pick WHERE k IS NOT NULL)
 ----
 1997
 
 # A correlated subquery does not bound: its values change per row.
-# cost: 36018
+# cost: 36013
 query II rowsort
 SELECT id, v FROM big WHERE id IN (SELECT k FROM pick WHERE pick.k = big.id AND big.v > 100)
 ----
@@ -119,7 +119,7 @@ SELECT id, v FROM big WHERE id IN (SELECT k FROM pick WHERE pick.k = big.id AND 
 # Inside a derived table body the subquery is evaluated with the body, not folded before its scan
 # opens, so the set has no values when the scan reads it and widens to every key: the cost is the
 # unbounded scan's, and the rows are unchanged.
-# cost: 36014
+# cost: 36009
 query I rowsort
 SELECT d.v FROM (SELECT v FROM big WHERE id IN (SELECT k FROM pick)) AS d
 ----

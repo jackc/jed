@@ -23,7 +23,7 @@ sql = "CREATE TABLE u (id i64 PRIMARY KEY, body text)"
 [[step]]
 actor = "a"
 command = "exec"
-sql = "INSERT INTO t SELECT g, repeat('x', 300) FROM generate_series(1, 2000) g"
+sql = "INSERT INTO t SELECT g, rpad(g::text, 302, 'x') FROM generate_series(1, 2000) g"
 
 [[step]]
 actor = "a"
@@ -33,7 +33,7 @@ sql = "DELETE FROM t WHERE id > 100"
 [[step]]
 actor = "a"
 command = "exec"
-sql = "INSERT INTO t SELECT g, repeat('z', 300) FROM generate_series(2001, 4000) g"
+sql = "INSERT INTO t SELECT g, rpad(g::text, 302, 'z') FROM generate_series(2001, 4000) g"
 
 [[step]]
 actor = "a"
@@ -120,25 +120,25 @@ expect_error = "58P02"
 actor = "-"
 command = "check_image"
 path = "client_pi"
-expect = "10:13:180:58"
+expect = "10:12:166:51"
 
 [[step]]
 actor = "-"
 command = "check_image"
 path = "client_c"
-expect = "11:13:15:0"
+expect = "11:12:14:0"
 
 [[step]]
 actor = "-"
 command = "check_image"
 path = "owner_pi"
-expect = "11:13:180:54"
+expect = "11:12:166:47"
 
 [[step]]
 actor = "-"
 command = "check_image"
 path = "owner_c"
-expect = "12:13:15:0"
+expect = "12:12:14:0"
 
 # A backup opens as an ordinary database: the client's copy predates the pending insert.
 [[step]]

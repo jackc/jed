@@ -37,7 +37,7 @@ extension IntegrityChecker {
             guard case .scalar = descriptor.type else { return false }
             return descriptor.decimal != nil || descriptor.textLimit != nil || descriptor.temporal != nil
         }
-        try scanRows(root: table.root, types: types) { key, row in
+        try scanRows(root: table.root, types: types, table: table) { key, row in
             for ordinal in table.columns.indices {
                 let column = table.columns[ordinal], value = row[ordinal]
                 if value.isNull {
@@ -97,7 +97,7 @@ extension IntegrityChecker {
         let (expression, reason) = try resolveCheck(table, types: types, definition: definition)
         if let reason { skip(definition.name, reason); return }
         guard let expression else { throw JedError.corruption("integrity CHECK resolution produced no expression") }
-        try scanRows(root: table.root, types: types) { key, row in
+        try scanRows(root: table.root, types: types, table: table) { key, row in
             var context = try self.freshContext()
             context.column = { row[$0] }
             let value: SQLValue
@@ -158,7 +158,7 @@ extension IntegrityChecker {
         if tableUnreadable.contains(plan.parent.name) { skip(foreign.name, "table_unreadable"); return }
         if let index = plan.index, indexClean[index.name] != true { skip(foreign.name, "index_unreadable"); return }
         let context = try freshContext()
-        try scanRows(root: table.root, types: types) { key, row in
+        try scanRows(root: table.root, types: types, table: table) { key, row in
             let nulls = foreign.columns.reduce(0) { $0 + (row[$1].isNull ? 1 : 0) }
             if nulls == foreign.columns.count || (nulls > 0 && !foreign.matchFull) { return }
             var detail = "no referenced row"

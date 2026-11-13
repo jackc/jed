@@ -201,7 +201,7 @@ final class EncryptionTests: XCTestCase {
     func testMetaAuthenticationBindsSlotAndOrderedManifest() throws {
         let codec = try EncryptedPageCodec(pageSize: 1024, dataKey: Array(repeating: 7, count: 32))
         var meta = [UInt8](repeating: 0, count: 1024)
-        meta.replaceSubrange(0..<8, with: [0x4a, 0x45, 0x44, 0x42, 0, 50, 1, 40])
+        meta.replaceSubrange(0..<8, with: [0x4a, 0x45, 0x44, 0x42, 0, 52, 1, 40])
         try PageEnvelope.putU32(1024, into: &meta, at: 8)
         let manifest = [ManifestPageBytes(pageIndex: 7, bytes: Array(repeating: 7, count: 1024)),
                         ManifestPageBytes(pageIndex: 5, bytes: Array(repeating: 5, count: 1024))]

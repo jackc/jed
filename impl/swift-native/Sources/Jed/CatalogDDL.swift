@@ -260,7 +260,7 @@ internal enum CatalogDDL {
             }
         }
         try snapshot.updateCatalog(image, schemaChanged: true)
-        snapshot.setTableStore(name, snapshot.emptyStore(types: try table.columns.map { try $0.type.resolve(snapshot.types) }))
+        snapshot.setTableStore(name, snapshot.emptyStore(types: try table.columns.map { try $0.type.resolve(snapshot.types) }, primaryKey: table.primaryKey))
         for index in table.indexes {
             let store = snapshot.emptyStore(types: [])
             snapshot.setIndexStore(index.name, store)

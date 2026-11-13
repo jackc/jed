@@ -1,0 +1,41 @@
+# Near-cap index entries (112 bytes) force a zero-separator interior at page 256.
+# Deleting its last two records must remove the empty unary subtree. Pulling the
+# parent separator down and splitting it again used to preserve an empty leaf.
+# The checks validate integrity and pin identical image hashes across cores;
+# reopen additionally checks the lazy packed-leaf path and surviving index rows.
+# format: simulation
+# seed: 1
+# page_size: 256
+# cache_bytes: 256
+# clock: 1700000000000000
+open w1 write
+on w1 CREATE TABLE t (id i32 PRIMARY KEY, s text)
+on w1 CREATE INDEX i_s ON t (s)
+on w1 INSERT INTO t VALUES (1, 'A' || repeat('x', 104))
+on w1 INSERT INTO t VALUES (2, 'B' || repeat('x', 104))
+on w1 INSERT INTO t VALUES (3, 'C' || repeat('x', 104))
+on w1 INSERT INTO t VALUES (4, 'D' || repeat('x', 104))
+on w1 INSERT INTO t VALUES (5, 'E' || repeat('x', 104))
+on w1 INSERT INTO t VALUES (6, 'F' || repeat('x', 104))
+commit w1
+check
+reopen
+open w2 write
+on w2 DELETE FROM t WHERE id = 5
+on w2 DELETE FROM t WHERE id = 6
+commit w2
+check
+reopen
+open r1 read
+on r1 SELECT id FROM t ORDER BY s
+commit r1
+check
+open w3 write
+on w3 DELETE FROM t WHERE id = 4
+on w3 DELETE FROM t WHERE id = 3
+on w3 DELETE FROM t WHERE id = 2
+on w3 DELETE FROM t WHERE id = 1
+commit w3
+check
+reopen
+check

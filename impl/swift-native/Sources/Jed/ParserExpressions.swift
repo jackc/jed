@@ -198,10 +198,14 @@ extension SQLParser {
             return expressionNode(.extract(field.asciiLowercased, value), from: start)
         }
         let twoWordType = (keyword == "double" && word(1) == "precision") || (keyword == "character" && word(1) == "varying")
+        let timestampType = keyword == "timestamp" && ["with", "without"].contains(word(1)) && word(2) == "time" && word(3) == "zone"
         if isIdentifier() && !["true", "false", "null"].contains(keyword),
-           case .string(let body) = peek(twoWordType ? 2 : 1).kind {
+           case .string(let body) = peek(timestampType ? 4 : twoWordType ? 2 : 1).kind {
             var name = try identifier()
             if twoWordType { name = SQLText(validatedUTF8: name.utf8 + [32] + (try identifier()).utf8) }
+            if timestampType, let suffix = timestampZoneSuffix() {
+                name = SQLText(validatedUTF8: Array(("timestamp " + suffix).utf8))
+            }
             let typeSpan = span(start)
             let bodyPosition = sourcePosition(cursor)
             advance()

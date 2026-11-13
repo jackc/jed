@@ -171,8 +171,8 @@ internal struct DomainSnapshot: Sendable {
         for (name, store) in indexes where old.indexes[name]?.revision !== store.revision { return true }
         return false
     }
-    func emptyStore(types: [TypeDescriptor]) -> TableStore {
-        TableStore(tree: BPlusTree(codec: pool.codec, types: types, pool: pool))
+    func emptyStore(types: [TypeDescriptor], primaryKey: [Int]? = nil) -> TableStore {
+        TableStore(tree: BPlusTree(codec: pool.codec, types: types, pool: pool, layout: primaryKey.map { .table(types: types, primaryKey: $0) } ?? .index))
     }
     func estimatorRevision(_ name: SQLText) -> StorageRevision? { estimatorRevisions[name] }
     mutating func advanceEstimatorRevision(_ name: SQLText) { estimatorRevisions[name] = StorageRevision() }
@@ -251,13 +251,13 @@ internal struct DomainSnapshot: Sendable {
     /// poisons future writes but does not reverse a known durable commit.
     mutating func finishPersistence(written: Set<UInt32>, remotePages: [UInt32: [UInt8]]? = nil) {
         let pool = self.pool
-        func read(_ reference: PageReference, _ types: [TypeDescriptor]) throws -> PackedLeaf {
+        func read(_ reference: PageReference, _ types: [TypeDescriptor], _ layout: LeafLayout) throws -> PackedLeaf {
             if let remotePages {
                 guard let bytes = remotePages[reference.index] else { throw JedError.corruption("missing committed root page") }
                 return try PackedLeaf(bytes: pool.codec.openBody(pageIndex: reference.index,
-                    sealed: bytes, expectedTag: reference.tag), types: types, codec: pool.codec)
+                    sealed: bytes, expectedTag: reference.tag), types: types, codec: pool.codec, layout: layout)
             }
-            return try pool.load(reference, types: types)
+            return try pool.load(reference, types: types, layout: layout)
         }
         do {
             for name in tables.keys.sorted() {

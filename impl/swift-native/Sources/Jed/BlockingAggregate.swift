@@ -192,12 +192,14 @@ internal final class BlockingAggregateExecution {
     private let plan: SelectPlan
     private let aggregate: AggregateQueryPlan
     private let context: ExpressionContext
+    private let allowColumnar: Bool
     private let hostBatch: HostBatch?
     private let ahead = HostReadAhead<[SQLValue]>()
     private var output: RowSpoolCursor?
     private var remaining: Int64 = 0
     private var started = false
-    init(plan: SelectPlan, aggregate: AggregateQueryPlan, context: ExpressionContext) {
+    init(plan: SelectPlan, aggregate: AggregateQueryPlan, context: ExpressionContext, allowColumnar: Bool = true) {
+        self.allowColumnar = allowColumnar
         self.plan = plan; self.aggregate = aggregate; self.context = context
         hostBatch = HostBatch(expressions: plan.projections, context: context)
     }
@@ -227,8 +229,12 @@ internal final class BlockingAggregateExecution {
         }
         return try plan.projections.map { try current.evaluate($0) }
     }
+    func prime() throws { if !started { started = true; try prepare() } }
     private func prepare() throws {
         var rows = try context.profile(plan.profileIdentity, .aggregate, excluding: [.source, .filter, .sort]) {
+            if allowColumnar, aggregate.keys.count == 1, ColumnarExecution.aggregation(plan, aggregate, context) {
+                return try ColumnarGroupSpool.build(plan: plan, aggregate: aggregate, context: context)
+            }
             let source = try BlockingRows.gather(plan, context: context)
             let input = try BlockingRows.filter(source, plan: plan, context: context)
             let groups = try BlockingAggregate.build(input, aggregate: aggregate, context: context)

@@ -1,0 +1,89 @@
+# A correlated subquery whose inner key / index bound comes from an outer TEXT column, under an outer
+# full scan that runs on the columnar lanes (spec/design/packed-leaf.md §11 Track A4). In the disk
+# storage mode the outer table's leaves are faulted from the file, so the lane reads its text columns
+# in place and a predicate the span compiler cannot help with (an OR, an EXISTS) is evaluated over a
+# scratch row that may still hold deferred values. The correlated subquery takes that row as its
+# outer row, and the inner bound encodes the outer value directly — so the value must be resolved
+# first. A regression reported against the Go core panicked here (an unresolved text value reached the
+# key encoder). Covers the inner PRIMARY KEY bound, a secondary-index bound, an EXISTS beside a span
+# atom, the aggregate lane, and the reported INSERT … SELECT (there into a temporary table; an ordinary
+# table here, since the disk mode reopens the database before every record).
+# requires: ddl.create_table, ddl.primary_key, ddl.secondary_index, dml.insert, dml.insert_multi_row, dml.insert_select, query.select, query.where_eq, query.qualified_column, query.subquery_exists, query.subquery_correlated, query.correlated_pushdown, types.text, types.i32
+
+statement ok
+CREATE TABLE all_logs (id text PRIMARY KEY, user_id text, name text, n i32)
+
+statement ok
+CREATE TABLE log_shares (log_id text, user_id text, PRIMARY KEY (log_id, user_id))
+
+statement ok
+CREATE TABLE log_tags (log_id text, tag text)
+
+statement ok
+CREATE INDEX log_tags_log_id ON log_tags (log_id)
+
+statement ok
+INSERT INTO all_logs VALUES ('l1', 'u1', 'alpha', 1), ('l2', 'u2', 'beta', 2), ('l3', 'u2', 'gamma', 3), ('l4', 'u3', 'delta', 4)
+
+statement ok
+INSERT INTO log_shares VALUES ('l2', 'u1'), ('l4', 'u2')
+
+statement ok
+INSERT INTO log_tags VALUES ('l3', 'x'), ('l4', 'y')
+
+# --- the inner PRIMARY KEY bound takes the outer text value -----------------------------------------
+
+query TT rowsort
+SELECT l.id, l.name FROM all_logs l WHERE l.user_id = 'u1' OR EXISTS (SELECT 1 FROM log_shares ls WHERE ls.log_id = l.id AND ls.user_id = 'u1')
+----
+l1
+alpha
+l2
+beta
+
+query T rowsort
+SELECT l.id FROM all_logs l WHERE EXISTS (SELECT 1 FROM log_shares ls WHERE ls.log_id = l.id)
+----
+l2
+l4
+
+# --- a secondary-index bound ---------------------------------------------------------------------
+
+query T rowsort
+SELECT l.id FROM all_logs l WHERE l.n = 1 OR EXISTS (SELECT 1 FROM log_tags t WHERE t.log_id = l.id)
+----
+l1
+l3
+l4
+
+# --- beside a span atom (the generic predicate's columns are filled per record) --------------------
+
+query T rowsort
+SELECT l.id FROM all_logs l WHERE l.name <> 'delta' AND EXISTS (SELECT 1 FROM log_tags t WHERE t.log_id = l.id)
+----
+l3
+
+# --- the aggregate lane ----------------------------------------------------------------------------
+
+query I nosort
+SELECT count(*) FROM all_logs l WHERE l.user_id = 'u3' OR EXISTS (SELECT 1 FROM log_shares ls WHERE ls.log_id = l.id AND ls.user_id = 'u1')
+----
+2
+
+# --- the reported shape: INSERT … SELECT into a temporary table ------------------------------------
+
+statement ok
+CREATE TABLE logs (id text PRIMARY KEY, name text)
+
+statement ok
+INSERT INTO logs (id, name) SELECT l.id, l.name FROM all_logs l WHERE l.user_id = 'u2' OR EXISTS (SELECT 1 FROM log_shares ls WHERE ls.log_id = l.id AND ls.user_id = 'u2')
+
+query TT rowsort
+SELECT id, name FROM logs
+----
+l2
+beta
+l3
+gamma
+l4
+delta

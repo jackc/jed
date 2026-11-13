@@ -30,7 +30,7 @@ CREATE INDEX o_ab ON o (a NULLS FIRST, b DESC)
 
 # DESC defaults to NULLS FIRST: the index's first entries are the NULL a's (ids 97, 194, ... in PK
 # order), then a = 49 ascending by id.
-# cost: 33
+# cost: 25
 query II nosort
 SELECT id, a FROM o ORDER BY a DESC LIMIT 8
 ----
@@ -52,7 +52,7 @@ NULL
 49
 
 # OFFSET composes with the walk.
-# cost: 31
+# cost: 22
 query II nosort
 SELECT id, a FROM o ORDER BY a DESC LIMIT 3 OFFSET 6
 ----
@@ -65,7 +65,7 @@ SELECT id, a FROM o ORDER BY a DESC LIMIT 3 OFFSET 6
 
 # A mismatched NULL placement is a different order: the blocking top-k sort serves it (made total by
 # the id key, since a top-k sort's ties are not the oracle's).
-# cost: 607
+# cost: 604
 query II nosort
 SELECT id, a FROM o ORDER BY a DESC NULLS LAST, id LIMIT 3
 ----
@@ -77,7 +77,7 @@ SELECT id, a FROM o ORDER BY a DESC NULLS LAST, id LIMIT 3
 49
 
 # Two ordered keys: a ASC NULLS FIRST, b DESC (NULLS FIRST by default) — the o_ab walk.
-# cost: 39
+# cost: 30
 query III nosort
 SELECT id, a, b FROM o ORDER BY a NULLS FIRST, b DESC LIMIT 9
 ----
@@ -112,7 +112,7 @@ NULL
 # --- access bounds over a DESC column -------------------------------------------------------------
 
 # Equality on the DESC column seeks one prefix.
-# cost: 61
+# cost: 49
 query I rowsort
 SELECT id FROM o WHERE a = 7
 ----
@@ -131,7 +131,7 @@ SELECT id FROM o WHERE a = 7
 
 # A range over the DESC column: the byte endpoints swap, and the NULL slot (which sorts FIRST under
 # DESC) stays outside the range.
-# cost: 121
+# cost: 97
 query I rowsort
 SELECT id FROM o WHERE a >= 48
 ----
@@ -160,7 +160,7 @@ SELECT id FROM o WHERE a >= 48
 98
 99
 
-# cost: 61
+# cost: 49
 query I rowsort
 SELECT id FROM o WHERE a < 1
 ----
@@ -177,7 +177,7 @@ SELECT id FROM o WHERE a < 1
 550
 600
 
-# cost: 169
+# cost: 145
 query I rowsort
 SELECT id FROM o WHERE a BETWEEN 20 AND 21
 ----
@@ -208,7 +208,7 @@ SELECT id FROM o WHERE a BETWEEN 20 AND 21
 
 # Equality prefix then a range on the DESC second key (o_ab: a NULLS FIRST, b DESC): the NULL b's
 # sort first in the b slot and are excluded.
-# cost: 23
+# cost: 20
 query II rowsort
 SELECT id, b FROM o WHERE a = 7 AND b > 8
 ----
@@ -220,7 +220,7 @@ SELECT id, b FROM o WHERE a = 7 AND b > 8
 11
 
 # The bound composes with the walk of the same index: a = 7 ORDER BY a NULLS FIRST, b DESC.
-# cost: 53
+# cost: 41
 query II nosort
 SELECT id, b FROM o WHERE a = 7 ORDER BY a NULLS FIRST, b DESC LIMIT 4
 ----
@@ -241,7 +241,7 @@ SELECT id FROM o WHERE a = NULL
 
 # --- key-set probes over a DESC column ------------------------------------------------------------
 
-# cost: 141
+# cost: 118
 query I rowsort
 SELECT id FROM o WHERE a IN (3, 47) AND id < 200
 ----
@@ -254,7 +254,7 @@ SELECT id FROM o WHERE a IN (3, 47) AND id < 200
 53
 
 # A set on the leading column, then an equality on the DESC b.
-# cost: 14
+# cost: 13
 query III rowsort
 SELECT id, a, b FROM o WHERE a = ANY(ARRAY[7, 9]) AND b = 9
 ----
@@ -312,7 +312,7 @@ CREATE TABLE s (x i32 PRIMARY KEY)
 statement ok
 INSERT INTO s VALUES (5), (44)
 
-# cost: 109
+# cost: 86
 query II rowsort
 SELECT s.x, o.id FROM s JOIN o ON o.a = s.x WHERE o.id < 150
 ----

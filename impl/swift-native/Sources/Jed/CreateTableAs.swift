@@ -74,7 +74,7 @@ internal enum CreateTableAs {
         // A temporary source can retain an older nominal composite identity
         // after another session recreates its main type name. CTAS captures the
         // resolved output tree, including that identity, with its new store.
-        snapshot.setTableStore(name, snapshot.emptyStore(types: storedTypes))
+        snapshot.setTableStore(name, snapshot.emptyStore(types: storedTypes, primaryKey: []))
         working.snapshots[settings.targetDomain] = snapshot
         if definition.withData {
             var filling = settings; filling.domains = working
@@ -92,7 +92,7 @@ internal enum CreateTableAs {
                     var sourcePlan = plan
                     sourcePlan.materializeSource = insertion.sourcePlan?.materializeSource ?? sourcePlan.materializeSource
                     insertion.sourcePlan = sourcePlan
-                    let fillPlan = WritableCTEPlan(bindings: writable.bindings, body: .insert(insert), query: nil,
+                    let fillPlan = WritableCTEPlan(inference: writable.inference, bindings: writable.bindings, body: .insert(insert), query: nil,
                         parameters: writable.parameters, visibleBindings: writable.visibleBindings)
                     filled = try WritableCTEExecution.execute(fillPlan, working: &working, settings: filling,
                         context: context, parameters: parameters, requireWritable: requireWritable,

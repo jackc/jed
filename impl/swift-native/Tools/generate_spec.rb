@@ -14,7 +14,7 @@ require "fileutils"
 
 module SwiftSpecGenerator
   ROOT = File.expand_path("../../..", __dir__)
-  BASELINE = "0b76dd6e9c2675b552eb8af9e820065351ffa4b3"
+  BASELINE = "b1a6affca7725e0b07a4f734eddb1c569ef76bcf"
   INPUTS = %w[
     spec/integrity/findings.toml
     spec/types/scalars.toml
@@ -75,7 +75,7 @@ module SwiftSpecGenerator
   )
   abort "cannot list frozen conformance corpus: #{corpus_error}" unless corpus_status.success?
   CORPUS_INPUTS = corpus_listing.lines.map(&:strip).select { |path| path.end_with?(".test") }.sort.freeze
-  abort "frozen corpus inventory changed" unless CORPUS_INPUTS.length == 749 &&
+  abort "frozen corpus inventory changed" unless CORPUS_INPUTS.length == 763 &&
     CORPUS_INPUTS.count { |path| path.include?("/concurrency/") } == 7
 
   process_listing, process_error, process_status = Open3.capture3(
@@ -92,7 +92,7 @@ module SwiftSpecGenerator
   )
   abort "cannot list frozen simulation inputs: #{simulation_error}" unless simulation_status.success?
   SIMULATION_INPUTS = simulation_listing.lines.map(&:strip).select { |path| path.end_with?(".sim", ".toml") }.sort.freeze
-  abort "frozen simulation inventory changed" unless SIMULATION_INPUTS.count { |path| path.end_with?(".sim") } == 18 &&
+  abort "frozen simulation inventory changed" unless SIMULATION_INPUTS.count { |path| path.end_with?(".sim") } == 19 &&
     SIMULATION_INPUTS.count { |path| path.end_with?(".toml") } == 22
 
   integrity_listing, integrity_error, integrity_status = Open3.capture3(

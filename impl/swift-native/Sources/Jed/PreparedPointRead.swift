@@ -5,8 +5,8 @@
 /// and builds a lane for that one row. This object records, once, what those
 /// steps would decide, and replays their charges, guards and reservations in
 /// the order of whichever lane the general path would take: the packed
-/// columnar lane without a cost ceiling, the materializing scalar lane with
-/// one. A ceiling's abort names the accrued cost, so the order is contract.
+/// columnar lane, with a discardable attempt under a cost ceiling and the
+/// materializing scalar fallback. A ceiling's accrued cost order is contract.
 ///
 /// Key columns are integers and UUIDs: fixed-width types whose equality
 /// costs one unit in every lane and whose parameter is its own key value.
@@ -130,36 +130,51 @@ internal final class PreparedPointRead {
         func next() throws -> [SQLValue]? {
             guard !finished else { return nil }
             finished = true
+            if meter.limit != 0 || meter.lifetimeLimit != 0 {
+                let rewind = meter.mark()
+                let gathered: [SQLValue]?
+                do { gathered = try gather(); try meter.guardCost() }
+                catch {
+                    close()
+                    if (error as? JedError)?.code == "57014" { throw error }
+                    rewind(); return try scalar()
+                }
+                guard let gathered else { return nil }
+                if plan.productionCharge { meter.charge(1); try meter.guardCost() }
+                return plan.output.map { gathered[$0] }
+            }
+            guard let gathered = try gather() else { return nil }
+            if plan.productionCharge { meter.charge(1); try meter.guardCost() }
+            return plan.output.map { gathered[$0] }
+        }
+        private func scalar() throws -> [SQLValue]? {
             guard let position = try ScanCost.chargePoint(store, key: key, variable: plan.variable, meter: meter) else { return nil }
             let pager = store.tree.pool?.pager
-            if meter.limit != 0 || meter.lifetimeLimit != 0 {
-                // The scalar lane (`SelectInput`, materialized source): the
-                // row is decoded whole and reserved before WHERE runs over
-                // it, and a checkpoint precedes the production unit.
-                try meter.step(); meter.charge(1)
-                var row = Array(repeating: SQLValue.null, count: plan.width)
-                for column in plan.touched { row[column] = try position.materialize(column, pager: pager) }
-                let bytes = MemorySizes.row(row)
-                try meter.reserveQuery(bytes); reserved = bytes
-                for _ in 0..<plan.filterUnits { meter.charge(1); try meter.step() }
-                try meter.checkpoint()
-                if plan.productionCharge { meter.charge(1); try meter.guardCost() }
-                return plan.projected.map { row[$0] }
-            }
-            // The packed columnar lane: WHERE reads the page in place, then
-            // only the projected values are gathered and reserved.
+            // The scalar fallback reserves its complete touched row before
+            // WHERE; every failed attempt has already released its lanes.
+            try meter.step(); meter.charge(1)
+            var row = Array(repeating: SQLValue.null, count: plan.width)
+            for column in plan.touched { row[column] = try position.materialize(column, pager: pager) }
+            let bytes = MemorySizes.row(row)
+            try meter.reserveQuery(bytes); reserved = bytes
+            for _ in 0..<plan.filterUnits { meter.charge(1); try meter.step() }
+            try meter.checkpoint()
+            if plan.productionCharge { meter.charge(1); try meter.guardCost() }
+            return plan.projected.map { row[$0] }
+        }
+        private func gather() throws -> [SQLValue]? {
+            guard let position = try ScanCost.chargePoint(store, key: key, variable: plan.variable, meter: meter) else { return nil }
+            let pager = store.tree.pool?.pager
             try meter.step(); meter.charge(1)
             for _ in 0..<plan.filterUnits { meter.charge(1); try meter.step() }
             var values: [SQLValue] = [], bytes: Int64 = 0
             values.reserveCapacity(plan.lanes.count)
             for column in plan.lanes {
                 let value = try position.materialize(column, pager: pager)
-                bytes = saturatingAdd(bytes, MemorySizes.value(value))
-                values.append(value)
+                bytes = saturatingAdd(bytes, MemorySizes.value(value)); values.append(value)
             }
             try meter.reserveQuery(bytes); reserved = bytes
-            if plan.productionCharge { meter.charge(1); try meter.guardCost() }
-            return plan.output.map { values[$0] }
+            return values
         }
 
         func close() { meter.resources.query.release(reserved); reserved = 0 }

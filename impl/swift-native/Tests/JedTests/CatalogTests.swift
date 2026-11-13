@@ -19,7 +19,7 @@ final class CatalogTests: XCTestCase {
         let paths = GeneratedSpec.sourceHashes.keys.filter {
             $0.hasPrefix("spec/fileformat/fixtures/") && !$0.contains("/cow_") && !$0.contains("/malformed_")
         }.sorted()
-        XCTAssertEqual(paths.count, 87)
+        XCTAssertEqual(paths.count, 91)
         for path in paths {
             let name = String(path.split(separator: "/").last!.dropLast(4))
             do {

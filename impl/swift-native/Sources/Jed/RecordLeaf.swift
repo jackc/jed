@@ -4,15 +4,14 @@
 /// A retained root can keep this form after commit, like its pending values.
 internal final class RecordLeaf: Sendable {
     let records: RecordList
+    let layout: LeafLayout
     let types: [TypeDescriptor]
     let pending: [Int: [Int: PendingOverflow]]
     let payloadSize: Int
 
     // Insert admission and packed reconstruction supply the declared tree
     // descriptors; split/merge and overflow sealing retain that canonical form.
-    init(_ records: [PackedRecord], types: [TypeDescriptor]) throws {
-        let total = records.reduce(PackedLeaf.overhead(records: records.count, types: types)) { $0 + $1.weight }
-        guard total <= UInt32.max else { throw JedError("0A000", "pending leaf exceeds the byte-format limit") }
+    init(_ records: [PackedRecord], types: [TypeDescriptor], layout: LeafLayout = .index) throws {
         guard records.allSatisfy({ $0.cells.count == types.count }),
               zip(records, records.dropFirst()).allSatisfy({ $0.key.lexicographicallyPrecedes($1.key) }) else {
             throw JedError.corruption("invalid packed leaf records")
@@ -23,10 +22,10 @@ internal final class RecordLeaf: Sendable {
             for column in types.indices {
                 let cell = record.cells[column]
                 guard let bytes = cell.bytes else { continue }
-                if let width = ValueCodec.fixedWidth(types[column].type) {
+                if let width = LeafValue.width(types[column]) {
                     guard bytes.count == width else { throw JedError.corruption("invalid fixed-width cell") }
                 } else if let tag = bytes.first {
-                    guard tag == 0 || tag == 2 || tag == 3 || tag == 4 else {
+                    guard tag == 0 || tag == 2 || tag == 3 || tag == 4 || tag == 5 else {
                         throw JedError.corruption("invalid leaf value presence tag")
                     }
                 } else {
@@ -41,14 +40,16 @@ internal final class RecordLeaf: Sendable {
             }
             if !record.overflows.isEmpty { pending[row] = record.overflows }
         }
-        self.records = RecordList(canonical); self.types = types; self.pending = pending; payloadSize = total
+        let total = PackedLeaf.measure(canonical, types: types, layout: layout)
+        guard total <= UInt32.max else { throw JedError("0A000", "pending leaf exceeds the byte-format limit") }
+        self.records = RecordList(canonical); self.types = types; self.layout = layout; self.pending = pending; payloadSize = total
     }
 
     /// Records already admitted by the validating initializer (or read from a
     /// validated page), in key order, with their exact payload size.
     private init(admitted records: RecordList, types: [TypeDescriptor],
-                 pending: [Int: [Int: PendingOverflow]], payloadSize: Int) {
-        self.records = records; self.types = types; self.pending = pending; self.payloadSize = payloadSize
+                 pending: [Int: [Int: PendingOverflow]], payloadSize: Int, layout: LeafLayout) {
+        self.records = records; self.types = types; self.layout = layout; self.pending = pending; self.payloadSize = payloadSize
     }
 
     /// Validate and normalize one incoming record exactly as the full
@@ -60,7 +61,7 @@ internal final class RecordLeaf: Sendable {
         var normalized: [StoredCell]?
         for column in types.indices {
             let cell = record.cells[column]
-            let width = ValueCodec.fixedWidth(types[column].type)
+            let width = LeafValue.width(types[column])
             guard Int(cell.width) == (width ?? 0) else {
                 throw JedError("0A000", "record differs from its tree's type contract")
             }
@@ -68,7 +69,7 @@ internal final class RecordLeaf: Sendable {
             if let width {
                 guard bytes.count == width else { throw JedError.corruption("invalid fixed-width cell") }
             } else if let tag = bytes.first {
-                guard tag == 0 || tag == 2 || tag == 3 || tag == 4 else {
+                guard tag == 0 || tag == 2 || tag == 3 || tag == 4 || tag == 5 else {
                     throw JedError.corruption("invalid leaf value presence tag")
                 }
             } else {
@@ -81,8 +82,8 @@ internal final class RecordLeaf: Sendable {
     }
 
     /// A validated clean page as writer records, without re-validating it.
-    /// A packed leaf's payload size is exactly its overhead plus the record
-    /// weights, and its accessor already reports an empty span as NULL.
+    /// Retain its exact compact payload size; its accessor already reports an
+    /// empty span as NULL.
     convenience init(adopting leaf: PackedLeaf, pending: [Int: [Int: PendingOverflow]]) {
         var records: [PackedRecord] = []
         records.reserveCapacity(leaf.count)
@@ -92,7 +93,7 @@ internal final class RecordLeaf: Sendable {
                 records.append(PackedRecord(key: record.key, cells: record.cells, overflows: overflows))
             } else { records.append(record) }
         }
-        self.init(admitted: RecordList(records), types: leaf.types, pending: pending, payloadSize: leaf.payloadSize)
+        self.init(admitted: RecordList(records), types: leaf.types, pending: pending, payloadSize: leaf.payloadSize, layout: leaf.layout)
     }
 
     private static func rekeyed(_ pending: [Int: [Int: PendingOverflow]], from row: Int, by delta: Int,
@@ -104,33 +105,29 @@ internal final class RecordLeaf: Sendable {
     }
 
     /// This leaf with one admitted record placed at `slot`: replacing the
-    /// record there, or inserted before it. Only the edited record is
-    /// examined; the others keep the admission this leaf already gave them.
+    /// record there, or inserted before it. Existing records keep their admission,
+    /// but compact region selection requires measuring the resulting leaf again.
     func placing(_ record: PackedRecord, at slot: Int, replacing: Bool) throws -> RecordLeaf {
-        let count = records.count + (replacing ? 0 : 1)
-        var total = payloadSize - PackedLeaf.overhead(records: records.count, types: types)
-            + PackedLeaf.overhead(records: count, types: types) + record.weight
         var edited = records, moved = pending
         if replacing {
-            total -= records[slot].weight
             edited.replace(at: slot, with: record)
             if moved[slot] != nil { moved[slot] = nil }
         } else {
             edited.insert(record, at: slot)
             moved = Self.rekeyed(pending, from: slot, by: 1)
         }
+        let total = PackedLeaf.measure(edited.flat, types: types, layout: layout)
         guard total <= UInt32.max else { throw JedError("0A000", "pending leaf exceeds the byte-format limit") }
         if !record.overflows.isEmpty { moved[slot] = record.overflows }
-        return RecordLeaf(admitted: edited, types: types, pending: moved, payloadSize: total)
+        return RecordLeaf(admitted: edited, types: types, pending: moved, payloadSize: total, layout: layout)
     }
 
     /// This leaf without the record at `slot`.
     func removing(at slot: Int) -> RecordLeaf {
         var edited = records
-        let old = edited.remove(at: slot)
-        let total = payloadSize - PackedLeaf.overhead(records: records.count, types: types)
-            + PackedLeaf.overhead(records: records.count - 1, types: types) - old.weight
+        _ = edited.remove(at: slot)
+        let total = PackedLeaf.measure(edited.flat, types: types, layout: layout)
         return RecordLeaf(admitted: edited, types: types, pending: Self.rekeyed(pending, from: slot, by: -1, dropping: slot),
-                          payloadSize: total)
+                          payloadSize: total, layout: layout)
     }
 }

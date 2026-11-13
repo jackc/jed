@@ -12,7 +12,7 @@ module SwiftSimulationSweep
   SOURCES = {
     "scripts/sim_gen.rb" => "bd497ee9703f0340f350008fc8de6b04847b20c8ae9f784bb78b392400293b12",
     "scripts/sim.rb" => "3fce68d66dbd9a6bffe0e79b588d5c699025672fabd768974c855c295546eaa2",
-    "spec/fileformat/verify.rb" => "308cbc629fbabad4792a75de0ea75de6646f4b5898fd5302db798243ea91ebb9",
+    "spec/fileformat/verify.rb" => "64308c4c1044d6d30eafb4ba34fb3ea49a45970545ecbf3c7018b7e439bc3dec",
     "spec/fileformat/lz4.rb" => "c4eb2a3fd9fe6d455d83351deb6512f8277661f1b6c3e287125e65417663e609",
     "spec/fileformat/xaes.rb" => "aeebcb1541f0c3312006852ec0928ce2aef0fa50fce328bc0b8bbde24b7d1882",
     "spec/fileformat/expr.rb" => "7b09424c5beb719a4527d8fed113010cd219bfc55752b1ccf9120bdff6111e76"
@@ -121,7 +121,7 @@ module SwiftSimulationSweep
     FileUtils.mkdir_p(output)
     abort "output directory must be empty" unless Dir.empty?(output)
     paths = if ENV["usage_regress"] == "true"
-      Dir[File.join(REGRESS_ROOT, "*.sim")].sort.tap { abort "frozen regression inventory is not 18" unless _1.length == 18 }
+      Dir[File.join(REGRESS_ROOT, "*.sim")].sort.tap { abort "frozen regression inventory is not 19" unless _1.length == 19 }
     else
       directory = File.join(output, "traces"); FileUtils.mkdir_p(directory)
       profiles.product(seeds).map do |profile, seed|

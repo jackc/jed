@@ -8,7 +8,7 @@ require "fileutils"
 
 root = File.expand_path("../..", __dir__)
 corpus = File.join(root, "bench/corpus")
-expected = "b9bfb4cb1f27ae1757268a94434e96df67626bc6b39f005c3626ab3a6e289133"
+expected = "ad83efd09f71b214f125c6c37206bfd2ceea6c8d43d31a5282b531d55fa82baf"
 abort "frozen benchmark dataset specification changed" unless Digest::SHA256.file(File.join(corpus, "datasets.toml")).hexdigest == expected
 
 data = File.expand_path(ENV.fetch("usage_data", File.join(root, "bench/data/swift-native")))

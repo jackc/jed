@@ -28,7 +28,7 @@ EXPLAIN SELECT l.k, o.v FROM lists l JOIN orders o ON o.id = ANY(l.ids)
 Nested Loop
 inner; on:conjuncts=1
 40
-157
+137
 1
 Scan lists
 Full scan; touched=2
@@ -38,7 +38,7 @@ Full scan; touched=2
 Scan orders
 Index-nested-loop PK interval set: id; intervals=1; arrays=1; touched=2
 40
-72
+52
 
 # A promoted i32[] converts each element to the i64 key.
 query ITTII nosort
@@ -48,7 +48,7 @@ EXPLAIN SELECT l.k, o.v FROM lists l JOIN orders o ON o.id = ANY(l.ids32)
 Nested Loop
 inner; on:conjuncts=1
 40
-157
+137
 1
 Scan lists
 Full scan; touched=2
@@ -58,7 +58,7 @@ Full scan; touched=2
 Scan orders
 Index-nested-loop PK interval set: id; intervals=1; arrays=1; touched=2
 40
-72
+52
 
 # A same-key range clips each outer row's points.
 query ITTII nosort
@@ -68,7 +68,7 @@ EXPLAIN SELECT l.k, o.v FROM lists l JOIN orders o ON o.id = ANY(l.ids) AND o.id
 Nested Loop
 inner; on:conjuncts=1
 8
-65
+61
 1
 Scan lists
 Full scan; touched=2
@@ -78,7 +78,7 @@ Full scan; touched=2
 Scan orders
 Index-nested-loop PK interval set: id; intervals=1; arrays=1; touched=2; filter:conjuncts=1
 8
-44
+40
 
 # A LEFT JOIN keeps the outer rows with no match.
 query ITTII nosort
@@ -88,7 +88,7 @@ EXPLAIN SELECT l.k, o.v FROM lists l LEFT JOIN orders o ON o.id = ANY(l.ids)
 Nested Loop
 left; on:conjuncts=1
 40
-157
+137
 1
 Scan lists
 Full scan; touched=2
@@ -98,7 +98,7 @@ Full scan; touched=2
 Scan orders
 Index-nested-loop PK interval set: id; intervals=1; arrays=1; touched=2
 40
-72
+52
 
 # --- an inner secondary index -----------------------------------------------------------------------
 
@@ -118,7 +118,7 @@ EXPLAIN SELECT l.k, ix.w FROM lists l JOIN ix ON ix.x = ANY(l.ids)
 Nested Loop
 inner; on:conjuncts=1
 400
-2033
+2021
 1
 Scan lists
 Full scan; touched=2
@@ -128,7 +128,7 @@ Full scan; touched=2
 Scan ix
 Index-nested-loop Index interval set: using ix_x; intervals=1; arrays=1; touched=2
 400
-1228
+1216
 
 # --- tuple-set members from a sibling --------------------------------------------------------------
 

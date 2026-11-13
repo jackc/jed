@@ -1,6 +1,6 @@
 # Malformed page: a child pointer into another table's leaf (storage.md §6) — the shape the
 # deterministic simulator produced when co-resident processes reused each other's pages.
-# Ruby-forged (verify.rb MALFORMED_FIXTURES): t (id i32, v i16) has two leaves; its root's second
+# Ruby-forged (verify.rb MALFORMED_FIXTURES): t (id i32, v i16; 300 rows) has several leaves; its root's second
 # child pointer now names u's root leaf, whose page is whole and CRC-valid but holds four columns
 # (i32, text, text, boolean). Reading u first leaves that page cached as u's leaf; t's scan then
 # reaches the same page and must reject it as XX001 rather than index columns its layout lacks.

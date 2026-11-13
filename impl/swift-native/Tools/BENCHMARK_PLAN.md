@@ -1,5 +1,8 @@
 # Frozen Swift release benchmark plan
 
+The 2026-11-12 refresh pins future runs to `b1a6affca7725e0b07a4f734eddb1c569ef76bcf`: 157 workloads and the current dataset fingerprint. Its adapter checks are separate from measurements; no new timings are claimed. The record below describes the original 143-workload comparison. To re-analyze those archived runs, use `bench-report --repo` with their original checkout; the analyzer accepts that checkout's pinned contract. New runs require freshly generated v52 datasets.
+
+
 The handwritten executable and immutable comparison driver are implemented,
 independently reviewed and committed locally; no package publication is implied.
 The complete release baseline and optimization comparison each cover all

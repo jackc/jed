@@ -55,10 +55,10 @@ internal enum CollationMigration {
                     var cursor = old.cursor(); defer { cursor.close() }
                     while let record = try cursor.next() { _ = try storageKey(record, values(record)) }
                 }
-                var rebuilt = snapshot.emptyStore(types: types), cursor = old.cursor(); defer { cursor.close() }
+                var rebuilt = snapshot.emptyStore(types: types, primaryKey: table.primaryKey), cursor = old.cursor(); defer { cursor.close() }
                 while let record = try cursor.next() {
                     let row = try values(record), key = try storageKey(record, row)
-                    let replacement = try RecordDisposition.plan(key: key, values: row.map(RecordInput.value), types: types, codec: snapshot.pool.codec)
+                    let replacement = try RecordDisposition.plan(key: key, values: row.map(RecordInput.value), types: types, codec: snapshot.pool.codec, layout: rebuilt.tree.layout)
                     try rebuilt.put(replacement, netStaging: true)
                 }
                 working.setTableStore(table.name, rebuilt)

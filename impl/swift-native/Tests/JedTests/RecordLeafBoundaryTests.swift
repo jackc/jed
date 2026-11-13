@@ -9,7 +9,7 @@ final class RecordLeafBoundaryTests: XCTestCase {
         let bytes: [UInt8]?
         if value.isNull { bytes = nil }
         else if ValueCodec.fixedWidth(type.type) != nil { bytes = try ValueCodec.encodeBody(value, type: type) }
-        else { bytes = try ValueCodec.encode(value, type: type) }
+        else { bytes = LeafValue.bare(type.type) ? [5] + (try ValueCodec.encodeRawBody(value, type: type)) : try ValueCodec.encode(value, type: type) }
         return StoredCell(bytes: bytes?[...], type: type)
     }
 

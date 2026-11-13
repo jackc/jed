@@ -19,6 +19,7 @@ public final class MemoryDiagnostics: Sendable {
     public var underflows: UInt64 { underflowCount.load(ordering: .relaxed) }
     public var peak: Int64 { highestBalance.load(ordering: .relaxed) }
     public func resetPeak() { highestBalance.store(0, ordering: .relaxed) }
+    internal func restorePeak(_ value: Int64) { highestBalance.store(value, ordering: .relaxed) }
     internal func recordUnderflow() { _ = underflowCount.wrappingAdd(1, ordering: .relaxed) }
     internal func recordBalance(_ value: Int64) {
         var previous = highestBalance.load(ordering: .relaxed)
@@ -90,6 +91,8 @@ internal final class QueryMemoryAccount {
         }
     }
 
+    func restoreUsed(_ value: Int64) { used = value }
+
     func syncPending(_ pending: Int64) throws {
         precondition(pending >= 0)
         guard active else { return }
@@ -130,6 +133,8 @@ internal final class StatementResources {
     }
 
     deinit { releaseStatementRows() }
+
+    func restoreScalar(_ bytes: Int64) { scalarUsed = bytes }
 
     func reserveScalar(_ bytes: Int64) throws {
         precondition(bytes >= 0)
@@ -185,6 +190,20 @@ internal final class CostMeter {
         }
         accrued = saturatingAdd(accrued, units)
         if let lifetime { lifetime.accrued = saturatingAdd(lifetime.accrued, units) }
+    }
+
+    /// A discarded pure lane attempt leaves no accounting trace. Its owners
+    /// must close before this rewind so their reservations are released once.
+    func mark() -> () -> Void {
+        let cost = accrued, total = lifetime?.accrued, ceiling = firstCeiling
+        let scalar = resources.scalarUsed, used = resources.query.used
+        let peak = resources.query.diagnostics.peak
+        return {
+            self.accrued = cost; self.firstCeiling = ceiling
+            if let total { self.lifetime?.accrued = total }
+            self.resources.restoreScalar(scalar); self.resources.query.restoreUsed(used)
+            if self.resources.query.active { self.resources.query.diagnostics.restorePeak(peak) }
+        }
     }
 
     /// A completed query block already charged the shared lifetime meter.

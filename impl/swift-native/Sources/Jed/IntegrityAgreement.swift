@@ -35,7 +35,7 @@ internal extension IntegrityChecker {
         guard indexClean[index.name] == true else { skip(index.name, "index_unreadable"); return }
         let plan = resolved!, types = try snapshot.tableTypes(table)
         var found: UInt64 = 0
-        try scanRows(root: table.root, types: types) { key, row in
+        try scanRows(root: table.root, types: types, table: table) { key, row in
             let entries: [StoredIndexPlan.Entry]
             do {
                 let old = plan.ordered

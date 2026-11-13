@@ -58,6 +58,7 @@ internal enum WritableCTEExecution {
             return value
         }
         var current = context
+        current.parameterInference = plan.inference
         current.parameters = try ParameterBinding.bind(parameters, types: plan.parameters, timezone: settings.timeZone)
         // Every actual DML part installs its own owner-specific pin below.
         current.writeScope = nil

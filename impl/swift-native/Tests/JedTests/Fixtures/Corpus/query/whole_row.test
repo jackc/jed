@@ -1,0 +1,336 @@
+# Whole-row references (spec/design/grammar.md §15 "Whole-row references"): a bare name that names no
+# column in scope but labels a FROM relation is that relation's ROW — PostgreSQL's makeWholeRowVar.
+# Its value is an anonymous record of the columns `rel.*` would expand to, so row_to_json / to_json /
+# to_jsonb / json_agg key each member by its column name. A base table or view keeps its catalog
+# column names under a column alias list (its row type is the table's, as in PostgreSQL); any other
+# relation — a derived table, CTE, VALUES list, or table function — takes the names it exposes. On
+# a row an outer join NULL-extends, the reference is NULL. Columns win: every scope level is searched
+# for a column before the name is tried as a relation label. Oracle-clean except the ledgered
+# divergences at the end (oracle_overrides.toml). Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, ddl.view, ddl.create_table_as, dml.insert, dml.insert_multi_row, dml.update, dml.delete, dml.returning, query.select, query.order_by, query.aggregates, query.group_by, query.distinct, query.join_inner, query.join_left, query.join_right, query.join_full, query.join_using, query.join_parenthesized, query.derived_table, query.cte, query.values, query.lateral, query.subquery_scalar, query.subquery_correlated, query.column_alias, types.composite, types.record_column, types.json, types.jsonb, types.i32, types.text, cast.operator, func.row_to_json, func.to_jsonb, func.json_builders, func.json_agg, func.json_each, query.whole_row
+
+statement ok
+CREATE TABLE p (id i32 PRIMARY KEY, name text)
+
+statement ok
+INSERT INTO p VALUES (1, 'a'), (2, 'b'), (3, 'a')
+
+statement ok
+CREATE TABLE q (id i32 PRIMARY KEY, y text)
+
+statement ok
+INSERT INTO q VALUES (1, 'z')
+
+# --- the reported query ---------------------------------------------------------------------------
+
+query T nosort
+SELECT coalesce(json_agg(row_to_json(t) ORDER BY t.id), '[]'::json) FROM (SELECT id, name FROM p) t
+----
+[{"id":1,"name":"a"}, {"id":2,"name":"b"}, {"id":3,"name":"a"}]
+
+# Over no rows json_agg is NULL, so the COALESCE gives the empty array.
+query T nosort
+SELECT coalesce(json_agg(row_to_json(t)), '[]'::json) FROM (SELECT id, name FROM p WHERE false) t
+----
+[]
+
+# --- the relation kinds and their field names -----------------------------------------------------
+
+# A base table, by alias and by its own name.
+query T rowsort
+SELECT row_to_json(t) FROM p t
+----
+{"id":1,"name":"a"}
+{"id":2,"name":"b"}
+{"id":3,"name":"a"}
+
+query T rowsort
+SELECT row_to_json(p) FROM p
+----
+{"id":1,"name":"a"}
+{"id":2,"name":"b"}
+{"id":3,"name":"a"}
+
+# A base table under a column alias list keeps its catalog names.
+query T nosort
+SELECT row_to_json(t) FROM p AS t(k) WHERE k = 1
+----
+{"id":1,"name":"a"}
+
+# A derived table takes the names it exposes, its alias list's included.
+query T nosort
+SELECT row_to_json(t) FROM (SELECT 1 AS a, 2 AS b) t(c)
+----
+{"c":1,"b":2}
+
+query T nosort
+SELECT row_to_json(t) FROM (SELECT id * 10 AS ten, upper(name) FROM p WHERE id = 2) t
+----
+{"ten":20,"upper":"B"}
+
+# A VALUES list: column1, column2, … unless aliased.
+query T nosort
+SELECT row_to_json(v) FROM (VALUES (1, 'z')) v
+----
+{"column1":1,"column2":"z"}
+
+query T nosort
+SELECT row_to_json(v) FROM (VALUES (1, 'z')) v(n, s)
+----
+{"n":1,"s":"z"}
+
+# A CTE.
+query T nosort
+WITH w AS (SELECT id, name FROM p WHERE id = 3) SELECT row_to_json(w) FROM w
+----
+{"id":3,"name":"a"}
+
+# A view keeps its own column names, under an alias list too.
+statement ok
+CREATE VIEW pv AS SELECT id, name AS nm FROM p
+
+query T nosort
+SELECT row_to_json(v) FROM pv v WHERE id = 1
+----
+{"id":1,"nm":"a"}
+
+query T nosort
+SELECT row_to_json(v) FROM pv v(z) WHERE z = 1
+----
+{"id":1,"nm":"a"}
+
+# A view's own column list names its fields.
+statement ok
+CREATE VIEW pv2 (a, b) AS SELECT id, name FROM p
+
+query TT nosort
+SELECT row_to_json(pv2), row_to_json(x) FROM pv2, pv2 AS x(c) WHERE pv2.a = 1 AND x.c = 1
+----
+{"a":1,"b":"a"}
+{"a":1,"b":"a"}
+
+# A multi-column table function: its record.
+query T nosort
+SELECT row_to_json(e) FROM jsonb_each('{"k": 1}') e
+----
+{"key":"k","value":1}
+
+# A one-column table function's whole-row reference is still its value.
+query T nosort
+SELECT to_json(g) FROM generate_series(1, 2) g ORDER BY g
+----
+1
+2
+
+# --- other uses of the record ---------------------------------------------------------------------
+
+# json_agg breaks the line between composite elements; the newlines are removed so the result is one
+# line.
+query T nosort
+SELECT replace(json_agg(t ORDER BY t.id)::text, chr(10), '') FROM p t
+----
+[{"id":1,"name":"a"},  {"id":2,"name":"b"},  {"id":3,"name":"a"}]
+
+query TT nosort
+SELECT to_json(t), to_jsonb(t) FROM p t WHERE id = 2
+----
+{"id":2,"name":"b"}
+{"id": 2, "name": "b"}
+
+query T nosort
+SELECT jsonb_agg(t ORDER BY t.id DESC) FROM p t
+----
+[{"id": 3, "name": "a"}, {"id": 2, "name": "b"}, {"id": 1, "name": "a"}]
+
+# Selected directly, it renders as the record's text.
+# names: t
+query T nosort
+SELECT t FROM p t ORDER BY t.id
+----
+(1,a)
+(2,b)
+(3,a)
+
+# Field selection off the record.
+query T nosort
+SELECT (t).name FROM p t WHERE id = 2
+----
+b
+
+query B nosort
+SELECT t = t FROM p t WHERE id = 1
+----
+true
+
+query B nosort
+SELECT t IS NULL FROM p t WHERE id = 1
+----
+false
+
+# ORDER BY, GROUP BY, and DISTINCT compare the records.
+query T nosort
+SELECT t FROM p t ORDER BY t DESC
+----
+(3,a)
+(2,b)
+(1,a)
+
+query T nosort
+SELECT t FROM p t ORDER BY 1
+----
+(1,a)
+(2,b)
+(3,a)
+
+query TI nosort
+SELECT row_to_json(t), count(*) FROM p t GROUP BY t ORDER BY t
+----
+{"id":1,"name":"a"}
+1
+{"id":2,"name":"b"}
+1
+{"id":3,"name":"a"}
+1
+
+query T nosort
+SELECT DISTINCT t FROM p t ORDER BY t
+----
+(1,a)
+(2,b)
+(3,a)
+
+# Grouped by the primary key, every column is functionally dependent on it.
+query T nosort
+SELECT row_to_json(t) FROM p t GROUP BY t.id ORDER BY t.id
+----
+{"id":1,"name":"a"}
+{"id":2,"name":"b"}
+{"id":3,"name":"a"}
+
+# In WHERE.
+query I nosort
+SELECT id FROM p t WHERE row_to_json(t)::text = '{"id":2,"name":"b"}'
+----
+2
+
+# --- outer joins ----------------------------------------------------------------------------------
+
+# A NULL-extended row's whole-row reference is NULL, not a record of NULLs.
+query ITB nosort
+SELECT p.id, row_to_json(q), q IS NULL FROM p LEFT JOIN q ON p.id = q.id ORDER BY p.id
+----
+1
+{"id":1,"y":"z"}
+false
+2
+NULL
+true
+3
+NULL
+true
+
+query IT nosort
+SELECT p.id, row_to_json(q) FROM q RIGHT JOIN p ON p.id = q.id ORDER BY p.id
+----
+1
+{"id":1,"y":"z"}
+2
+NULL
+3
+NULL
+
+query TT rowsort
+SELECT row_to_json(p), row_to_json(q) FROM p FULL JOIN q ON p.id = q.id AND p.name = 'b'
+----
+NULL
+{"id":1,"y":"z"}
+{"id":1,"name":"a"}
+NULL
+{"id":2,"name":"b"}
+NULL
+{"id":3,"name":"a"}
+NULL
+
+query I nosort
+SELECT count(q) FROM p LEFT JOIN q ON p.id = q.id
+----
+1
+
+# --- scoping --------------------------------------------------------------------------------------
+
+# A column of the name wins over the relation label.
+query T nosort
+SELECT row_to_json(t) FROM (SELECT ROW(9) AS t) s, p t2 WHERE t2.id = 1
+----
+{"f1":9}
+
+# A correlated reference to an enclosing query's relation.
+query T nosort
+SELECT (SELECT row_to_json(t)) FROM p t WHERE id = 1
+----
+{"id":1,"name":"a"}
+
+query IT nosort
+SELECT p.id, x.j FROM p CROSS JOIN LATERAL (SELECT row_to_json(p) AS j) x ORDER BY p.id
+----
+1
+{"id":1,"name":"a"}
+2
+{"id":2,"name":"b"}
+3
+{"id":3,"name":"a"}
+
+# A USING join leaves each side's row whole.
+query TT nosort
+SELECT row_to_json(p), row_to_json(q) FROM p JOIN q USING (id)
+----
+{"id":1,"name":"a"}
+{"id":1,"y":"z"}
+
+# An unaliased parenthesized join keeps its inner labels; an aliased one is one relation.
+query T nosort
+SELECT row_to_json(q) FROM (p JOIN q ON p.id = q.id)
+----
+{"id":1,"y":"z"}
+
+query T nosort
+SELECT row_to_json(j) FROM (p JOIN q USING (id)) j
+----
+{"id":1,"name":"a","y":"z"}
+
+# --- data-modifying statements --------------------------------------------------------------------
+
+query T nosort
+UPDATE p SET name = row_to_json(p)::text WHERE id = 3 RETURNING name
+----
+{"id":3,"name":"a"}
+
+statement ok
+DELETE FROM p WHERE row_to_json(p)::text LIKE '%"name":"{%'
+
+query I nosort
+SELECT count(*) FROM p
+----
+2
+
+# --- Deliberate divergences (ledgered in oracle_overrides.toml) ---
+
+# jed has no per-table row TYPE (composite.md §10.4): the reference is an anonymous record, which no
+# table column may hold (42P16). PostgreSQL creates a column of the table's row type.
+statement error 42P16
+CREATE TABLE pc AS SELECT t FROM p t
+
+# A NULL-extended row is told from a row of NULLs by a NOT NULL column of the relation. A relation
+# an outer join may NULL-extend with no such column (a derived table here) is 0A000; PostgreSQL
+# carries the whole row through the join.
+statement error 0A000
+SELECT row_to_json(s) FROM p LEFT JOIN (SELECT id FROM q) s ON p.id = s.id
+
+# A persisted index expression or predicate may not hold a whole-row reference: its dependencies are
+# the columns it names (index-dependencies.md), and ADD COLUMN would change the value. PostgreSQL
+# admits it.
+statement error 0A000
+CREATE INDEX p_whole ON p ((p IS NOT NULL))
+
+statement error 0A000
+CREATE INDEX p_whole ON p (id) WHERE p IS NOT NULL

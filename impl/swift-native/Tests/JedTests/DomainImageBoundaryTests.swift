@@ -17,7 +17,7 @@ final class DomainImageBoundaryTests: XCTestCase {
     }
 
     func testFrozenImagesStreamCanonicalBytesAndRepairTornMeta() throws {
-        XCTAssertEqual(paths().count, 87)
+        XCTAssertEqual(paths().count, 91)
         var encryptedCount = 0
         for path in paths() {
             let name = String(path.split(separator: "/").last!.dropLast(4))

@@ -71,7 +71,7 @@ internal final class RelationPlan {
                 unresolved: column.unresolved, scalarFunction: column.scalarFunction, hiddenFromStar: column.hiddenFromStar,
                 ambiguousRelation: column.ambiguousRelation, lateralDenied: column.lateralDenied,
                 ungroupedAncestor: column.ungroupedAncestor, catalogName: column.catalogName,
-                hintSubrelation: column.hintSubrelation, hintQualifiedOnly: column.hintQualifiedOnly, hintSkipHidden: column.hintSkipHidden)
+                hintSubrelation: column.hintSubrelation, hintQualifiedOnly: column.hintQualifiedOnly, hintSkipHidden: column.hintSkipHidden, rowName: column.rowName, rowNotNull: column.rowNotNull, rowNullable: column.rowNullable)
         }
         func source(_ input: SQLFrom, preceding: [ExpressionColumn] = [], predicateOffset: Int = 0) throws -> RelationPlan {
             let result: RelationPlan
@@ -107,7 +107,7 @@ internal final class RelationPlan {
                     qualifiedOnly: old.qualifiedOnly, unresolved: old.unresolved,
                     scalarFunction: old.scalarFunction, hiddenFromStar: old.hiddenFromStar,
                     catalogName: old.catalogName, hintSubrelation: old.hintSubrelation,
-                    hintQualifiedOnly: old.hintQualifiedOnly, hintSkipHidden: old.hintSkipHidden)
+                    hintQualifiedOnly: old.hintQualifiedOnly, hintSkipHidden: old.hintSkipHidden, rowName: old.rowName, rowNotNull: old.rowNotNull, rowNullable: old.rowNullable)
             }
             var combined = RelationPlan(body: result.body, columns: columns, functionalDependencies: result.functionalDependencies, baseTable: result.baseTable,
                 lateralColumns: result.lateralColumns, precedingWidth: result.precedingWidth,
@@ -120,7 +120,7 @@ internal final class RelationPlan {
                         index: preceding.count + column.index, collation: column.collation, qualifiedOnly: column.qualifiedOnly,
                         unresolved: column.unresolved, scalarFunction: column.scalarFunction, hiddenFromStar: column.hiddenFromStar,
                         lateralDenied: denied, catalogName: column.catalogName, hintSubrelation: column.hintSubrelation,
-                        hintQualifiedOnly: denied && (joinOrdinal > 0 || column.hintSubrelation), hintSkipHidden: column.hintSkipHidden)
+                        hintQualifiedOnly: denied && (joinOrdinal > 0 || column.hintSubrelation), hintSkipHidden: column.hintSkipHidden, rowName: column.rowName, rowNotNull: column.rowNotNull, rowNullable: column.rowNullable)
                 }
                 combined = try combine(combined, source(join.right, preceding: scope), kind: join.kind, syntax: join.condition,
                     natural: join.natural, using: join.using, precedingWidth: preceding.count, predicateOffset: predicateOffset, unseen: Array(preceding.dropFirst(hintFrameWidth)))
@@ -167,7 +167,7 @@ internal final class RelationPlan {
                     guard plan.columns.count == view.columns.count else { throw JedError("XX003", "stored view output changed") }
                     let columns = plan.columns.enumerated().map { ExpressionColumn(name: view.columns[$0.offset].name,
                         qualifier: input.alias ?? view.name, type: $0.element.type ?? TypeDescriptor(.scalar(.text)), index: $0.offset,
-                        collation: plan.projections[$0.offset].collation?.asColumn, catalogName: view.name) }
+                        collation: plan.projections[$0.offset].collation?.asColumn, catalogName: view.name, rowName: view.columns[$0.offset].name) }
                     result = RelationPlan(body: .derived(plan, inner), columns: columns, subqueryAlias: view.name)
                     return result
                 }
@@ -177,7 +177,7 @@ internal final class RelationPlan {
                 if selected.name != DomainNames.temporary { try settings.privileges.require(.select, on: table.name) }
                 let types = try owner.tableTypes(table)
                 let columns = table.columns.enumerated().map { ExpressionColumn(name: $0.element.name,
-                    qualifier: input.alias ?? table.name, type: types[$0.offset], index: $0.offset, catalogName: table.name) }
+                    qualifier: input.alias ?? table.name, type: types[$0.offset], index: $0.offset, catalogName: table.name, rowName: $0.element.name, rowNotNull: $0.element.notNull) }
                 result = RelationPlan(body: .base(store), columns: columns,
                     functionalDependencies: [(primaryKey: table.primaryKey, columns: Array(columns.indices))], baseTable: table,
                     sourceDomain: selected.name, sourceSnapshot: owner, sourceSettings: settings)
@@ -279,7 +279,12 @@ internal final class RelationPlan {
                     index: left.columns.count + column.index, collation: column.collation, qualifiedOnly: column.qualifiedOnly, unresolved: column.unresolved,
                     scalarFunction: column.scalarFunction, hiddenFromStar: column.hiddenFromStar,
                     catalogName: column.catalogName, hintSubrelation: column.hintSubrelation,
-                    hintQualifiedOnly: column.hintQualifiedOnly, hintSkipHidden: column.hintSkipHidden))
+                    hintQualifiedOnly: column.hintQualifiedOnly, hintSkipHidden: column.hintSkipHidden, rowName: column.rowName, rowNotNull: column.rowNotNull, rowNullable: column.rowNullable))
+            }
+            for index in columns.indices {
+                if index < left.columns.count ? (kind == "right" || kind == "full") : (kind == "left" || kind == "full") {
+                    columns[index].rowNullable = true
+                }
             }
             let previous = resolver.columns, aggregate = resolver.resolveAggregate, window = resolver.resolveWindow, hints = resolver.nameHints
             resolver.columns = columns.map { shifted($0, by: predicateOffset) }
@@ -792,7 +797,7 @@ internal final class SelectInput {
                     try context.meter.reserveQuery(GeneratedSpec.memoryRow); virtualBytes = GeneratedSpec.memoryRow
                 }
                 let incrementalFetch = !plan.materializeSource && plan.aggregation == nil && plan.window == nil
-                    && plan.distinctOn == nil && (plan.order.isEmpty ? !plan.distinct && plan.limit != nil : plan.orderedByScan)
+                    && plan.distinctOn == nil && (plan.order.isEmpty ? !plan.distinct && (plan.limit != nil || plan.streamsComputedProjection) : plan.orderedByScan)
                 if let store = plan.store, !empty {
                     if directCursor, access.intervals == nil, let lower = access.lower,
                        let upper = access.upper, lower.inclusive, upper.inclusive, lower.key == upper.key {
@@ -883,7 +888,7 @@ internal final class SelectInput {
     }
     var canReadAhead: Bool {
         guard plan.store != nil, relation == nil, joined == nil, nway == nil, buffered == nil, !empty else { return false }
-        guard plan.orderedByScan || plan.order.isEmpty && plan.limit != nil else { return false }
+        guard plan.orderedByScan || plan.order.isEmpty && (plan.limit != nil || plan.streamsComputedProjection) else { return false }
         if let candidate = plan.chosenAccess {
             switch candidate.path { case .primary, .full, .primaryIntervals: return true; default: return false }
         }

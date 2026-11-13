@@ -12,25 +12,25 @@ open w write
 on w statement ok
 CREATE TABLE t (id i32 PRIMARY KEY, v text)
 on w statement ok
-INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(0, 9) g
+INSERT INTO t SELECT g, rpad(g::text, 1002, 'x') FROM generate_series(0, 9) g
 on w statement ok
-INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(10, 19) g
+INSERT INTO t SELECT g, rpad(g::text, 1002, 'x') FROM generate_series(10, 19) g
 on w statement ok
-INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(20, 29) g
+INSERT INTO t SELECT g, rpad(g::text, 1002, 'x') FROM generate_series(20, 29) g
 on w statement ok
-INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(30, 39) g
+INSERT INTO t SELECT g, rpad(g::text, 1002, 'x') FROM generate_series(30, 39) g
 on w statement ok
-INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(40, 49) g
+INSERT INTO t SELECT g, rpad(g::text, 1002, 'x') FROM generate_series(40, 49) g
 on w statement ok
-INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(50, 59) g
+INSERT INTO t SELECT g, rpad(g::text, 1002, 'x') FROM generate_series(50, 59) g
 on w statement ok
-INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(60, 69) g
+INSERT INTO t SELECT g, rpad(g::text, 1002, 'x') FROM generate_series(60, 69) g
 on w statement ok
-INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(70, 79) g
+INSERT INTO t SELECT g, rpad(g::text, 1002, 'x') FROM generate_series(70, 79) g
 on w statement ok
-INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(80, 89) g
+INSERT INTO t SELECT g, rpad(g::text, 1002, 'x') FROM generate_series(80, 89) g
 on w statement ok
-INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(90, 99) g
+INSERT INTO t SELECT g, rpad(g::text, 1002, 'x') FROM generate_series(90, 99) g
 commit w
 
 # r pins the full database's version; the delete is admitted over the limit (it stages nothing).
@@ -43,7 +43,7 @@ commit w2
 # The delete's orphans are reclaimable only by compacting past r's version: the insert is refused.
 open w3 write
 on w3 statement ok
-INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(50, 59) g
+INSERT INTO t SELECT g, rpad(g::text, 1002, 'x') FROM generate_series(50, 59) g
 on w3 statement error 54P06
 COMMIT
 rollback w3
@@ -57,7 +57,7 @@ SELECT count(*) FROM t
 close r
 open w4 write
 on w4 statement ok
-INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(50, 59) g
+INSERT INTO t SELECT g, rpad(g::text, 1002, 'x') FROM generate_series(50, 59) g
 commit w4
 
 open r2 read

@@ -8,8 +8,8 @@
         "findings": [],
         "truncated": false,
         "skipped": [],
-        "pages": 53,
-        "rows": 40
+        "pages": 43,
+        "rows": 42
       }
     },
     {
@@ -22,7 +22,7 @@
             "database": "main",
             "object": "u_v1_idx",
             "page": null,
-            "key": "8000000a"
+            "key": "80000054"
           },
           {
             "kind": "index_entry_count_mismatch",
@@ -30,12 +30,19 @@
             "object": "u_v1_idx",
             "page": null,
             "key": null
+          },
+          {
+            "kind": "index_entry_count_mismatch",
+            "database": "main",
+            "object": "u_vp_idx",
+            "page": null,
+            "key": null
           }
         ],
         "truncated": false,
         "skipped": [],
-        "pages": 53,
-        "rows": 40
+        "pages": 43,
+        "rows": 42
       }
     }
   ]

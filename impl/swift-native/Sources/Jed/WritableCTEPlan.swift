@@ -1,6 +1,7 @@
 /// A writable WITH has one early query/schema-planning phase. DML source and
 /// assignment resolution stays in the same executor used by standalone DML.
 internal struct WritableCTEPlan {
+    let inference: ParameterInference
     let bindings: [CTEBinding]
     let body: SQLStatement
     let query: SelectPlan?
@@ -37,24 +38,26 @@ internal struct WritableCTEPlan {
         resolver.hostFunctions = settings.environment.signatures; resolver.unicode = settings.environment.unicode
         resolver.queryScope = SubqueryScope(snapshot: snapshot, settings: settings)
         resolver.checkFunction = { try settings.privileges.require(.execute, on: $0, function: true) }
+        var sharedContext = context
+        sharedContext.parameterInference = resolver.inference
         let bindings = try WithQueryPlan.resolveBindings(part.clause, snapshot: snapshot, settings: settings,
-            scalar: context.scalar, using: resolver, mutationContext: context, primary: part.body)
+            scalar: context.scalar, using: resolver, mutationContext: sharedContext, primary: part.body)
         let query = try part.body.queryBody.map {
             try SelectPlan.resolve($0, snapshot: snapshot, settings: settings, scalar: context.scalar,
                                    using: resolver, finalizeParameters: false)
         }
-        // Query parts have been counted by resolution. DML parts have only had
-        // their RETURNING schemas planned; count their full syntax exactly once.
+        let domains = QueryDomains.statement(snapshot: snapshot, settings: settings)
         for statement in bindings.compactMap(\.mutation) + (isMutation(part.body) ? [part.body] : []) {
-            for (name, count) in CTEReferenceCounts.count(statement) {
-                resolver.cteBindings[name]?.references += count
-            }
+            let owner = try StatementDomain.target(statement, in: domains)
+            let read = try domains.snapshot(owner)
+            var partSettings = settings; partSettings.targetDomain = owner
+            sharedContext.writeScope = StatementWriteScope(readSnapshot: read, cteBindings: resolver.cteBindings, foreignKeys: ForeignKeyActions.State())
+            _ = try MutationExecutor.prepare(statement, snapshot: read, settings: partSettings, context: sharedContext)
         }
-        // DML resolution runs later and visits its references again. Its static
-        // tally already chose these modes; late visits must not turn an inline
-        // CTE into a buffer which the lexical materialization pass skipped.
+        // Preparation counted each DML source once. Freeze the chosen mode
+        // before execution prepares those sources again with bound values.
         for binding in bindings { binding.executionBuffers = binding.buffers }
-        return Self(bindings: bindings, body: part.body, query: query,
+        return Self(inference: resolver.inference, bindings: bindings, body: part.body, query: query,
                     parameters: try ParameterBinding.finalize(resolver), visibleBindings: resolver.cteBindings)
     }
 }

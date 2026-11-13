@@ -31,7 +31,7 @@ internal enum AlterRowRewrite {
     static func materialize(table: CatalogTable, steps: [AlterRowStep], original: TableStore,
                             rekey: Bool, snapshot: DomainSnapshot, context: ExpressionContext) throws -> (rows: [Row], nextID: Int64) {
         let types = try table.columns.map { try $0.type.resolve(snapshot.types) }
-        var allocation = TableStore(tree: BPlusTree(codec: original.tree.codec, types: types, pool: original.tree.pool),
+        var allocation = TableStore(tree: BPlusTree(codec: original.tree.codec, types: types, pool: original.tree.pool, layout: .table(types: types, primaryKey: table.primaryKey)),
                                     nextRowID: rekey && table.primaryKey.isEmpty ? 0 : original.nextRowID)
         var rows: [Row] = [], keys: Set<[UInt8]> = []
         let compression = CostMeter(resources: context.meter.resources, cancellation: context.meter.cancellation)
@@ -69,15 +69,15 @@ internal enum AlterRowRewrite {
                 .object(table: table.name, constraint: CatalogSQL.objectName(table.name, label: "pkey"),
                     detail: context.errorDetail?.primary(table, types: types, value: { values[$0] }, ending: "is duplicated.")) }
             let rewritten = try RecordDisposition.plan(key: key, values: values.map(RecordInput.value), types: types,
-                codec: original.tree.codec, meter: compression, pager: original.tree.pool?.pager)
+                codec: original.tree.codec, layout: .table(types: types, primaryKey: table.primaryKey), meter: compression, pager: original.tree.pool?.pager)
             rows.append(Row(key: key, values: values, record: rewritten))
         }
         context.meter.charge(compression.accrued); try context.meter.step()
         return (rows, allocation.nextRowID)
     }
     static func publish(_ rows: [Row], nextID: Int64, types: [TypeDescriptor], original: TableStore,
-                        settings: SessionSettings) throws -> TableStore {
-        var result = TableStore(tree: BPlusTree(codec: original.tree.codec, types: types, pool: original.tree.pool), nextRowID: nextID)
+                        settings: SessionSettings, primaryKey: [Int]) throws -> TableStore {
+        var result = TableStore(tree: BPlusTree(codec: original.tree.codec, types: types, pool: original.tree.pool, layout: .table(types: types, primaryKey: primaryKey)), nextRowID: nextID)
         for row in rows.sorted(by: { $0.key.lexicographicallyPrecedes($1.key) }) {
             // Frozen ALTER rewrites retain a cumulative pending balance. Later
             // DML starts tracking new versions without reclaiming these rows.

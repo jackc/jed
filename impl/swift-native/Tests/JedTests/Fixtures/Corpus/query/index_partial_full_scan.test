@@ -18,7 +18,7 @@ statement ok
 CREATE INDEX sd_live_rank ON sd (rank) WHERE deleted_at IS NULL
 
 # the WHERE is exactly the predicate: the whole partial index (12 entries) is walked
-# cost: 61
+# cost: 49
 query IT rowsort
 SELECT id, name FROM sd WHERE deleted_at IS NULL
 ----
@@ -48,7 +48,7 @@ n50
 n75
 
 # an extra residual conjunct rides along
-# cost: 93
+# cost: 81
 query I rowsort
 SELECT id FROM sd WHERE deleted_at IS NULL AND name > 'n2'
 ----
@@ -63,7 +63,7 @@ SELECT id FROM sd WHERE deleted_at IS NULL AND name > 'n2'
 
 # ORDER BY the index key: the walk already delivers rank order (ties by PK), so the sort is elided
 # and the LIMIT stops the point lookups
-# cost: 21
+# cost: 17
 query II nosort
 SELECT rank, id FROM sd WHERE deleted_at IS NULL ORDER BY rank LIMIT 4
 ----
@@ -77,7 +77,7 @@ SELECT rank, id FROM sd WHERE deleted_at IS NULL ORDER BY rank LIMIT 4
 50
 
 # an aggregate over the live rows
-# cost: 74
+# cost: 62
 query II rowsort
 SELECT count(*), sum(rank) FROM sd WHERE deleted_at IS NULL
 ----
@@ -85,7 +85,7 @@ SELECT count(*), sum(rank) FROM sd WHERE deleted_at IS NULL
 642
 
 # NOT implied: the full scan
-# cost: 1207
+# cost: 1205
 query I rowsort
 SELECT count(*) FROM sd WHERE deleted_at IS NULL OR rank = 3
 ----
@@ -96,7 +96,7 @@ SELECT count(*) FROM sd WHERE deleted_at IS NULL OR rank = 3
 statement ok
 CREATE INDEX sd_hot ON sd (name) WHERE hot
 
-# cost: 13
+# cost: 10
 query IT nosort
 SELECT id, name FROM sd WHERE hot ORDER BY name LIMIT 3
 ----
@@ -109,7 +109,7 @@ n203
 
 # --- UPDATE / DELETE targets take the walk too -----------------------------------------------------
 
-# cost: 49
+# cost: 43
 query II rowsort
 UPDATE sd SET rank = rank + 1000 WHERE deleted_at IS NULL AND rank < 50 RETURNING id, rank
 ----
@@ -126,7 +126,7 @@ UPDATE sd SET rank = rank + 1000 WHERE deleted_at IS NULL AND rank < 50 RETURNIN
 75
 1048
 
-# cost: 110
+# cost: 98
 query I rowsort
 DELETE FROM sd WHERE deleted_at IS NULL AND name >= 'n275' RETURNING id
 ----
@@ -137,7 +137,7 @@ DELETE FROM sd WHERE deleted_at IS NULL AND name >= 'n275' RETURNING id
 
 # a bare boolean predicate estimates at the default boolean selectivity, so this DELETE's full scan
 # is cheaper than walking the index with a point lookup per entry
-# cost: 307
+# cost: 25
 query I rowsort
 DELETE FROM sd WHERE hot RETURNING id
 ----

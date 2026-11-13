@@ -4,7 +4,7 @@
 # the high-water, or that stages no record version and does not grow the catalog (pure deletes and
 # drops), is admitted — so a full database can always be repaired. A jed-specific resource contract,
 # not a PostgreSQL limit. The limit is a file-level ACTION (`# max_storage_bytes: N [database]`) set on
-# the handle from that point on. Pages are 8192 bytes; a t row holds a 1000-byte value, so a batch of
+# the handle from that point on. Pages are 8192 bytes; a t row holds a 1015-byte value, distinct per row, so a batch of
 # ten rows fills about one and a half leaves.
 # skip: disk — max_storage_bytes applies only to in-memory databases
 # attach: aux
@@ -17,38 +17,38 @@ CREATE TABLE t (id i32 PRIMARY KEY, v text)
 # max_storage_bytes: 163840
 
 statement ok
-INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(0, 9) g
+INSERT INTO t SELECT g, rpad(g::text, 1015, 'x') FROM generate_series(0, 9) g
 
 statement ok
-INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(10, 19) g
+INSERT INTO t SELECT g, rpad(g::text, 1015, 'x') FROM generate_series(10, 19) g
 
 statement ok
-INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(20, 29) g
+INSERT INTO t SELECT g, rpad(g::text, 1015, 'x') FROM generate_series(20, 29) g
 
 statement ok
-INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(30, 39) g
+INSERT INTO t SELECT g, rpad(g::text, 1015, 'x') FROM generate_series(30, 39) g
 
 statement ok
-INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(40, 49) g
+INSERT INTO t SELECT g, rpad(g::text, 1015, 'x') FROM generate_series(40, 49) g
 
 statement ok
-INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(50, 59) g
+INSERT INTO t SELECT g, rpad(g::text, 1015, 'x') FROM generate_series(50, 59) g
 
 statement ok
-INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(60, 69) g
+INSERT INTO t SELECT g, rpad(g::text, 1015, 'x') FROM generate_series(60, 69) g
 
 statement ok
-INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(70, 79) g
+INSERT INTO t SELECT g, rpad(g::text, 1015, 'x') FROM generate_series(70, 79) g
 
 statement ok
-INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(80, 89) g
+INSERT INTO t SELECT g, rpad(g::text, 1015, 'x') FROM generate_series(80, 89) g
 
 statement ok
-INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(90, 99) g
+INSERT INTO t SELECT g, rpad(g::text, 1015, 'x') FROM generate_series(90, 99) g
 
 # The eleventh batch cannot fit even after compaction: the autocommit write commits nothing.
 statement error 54P06
-INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(100, 109) g
+INSERT INTO t SELECT g, rpad(g::text, 1015, 'x') FROM generate_series(100, 109) g
 
 query I nosort
 SELECT count(*) FROM t
@@ -60,7 +60,7 @@ statement ok
 BEGIN
 
 statement ok
-INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(100, 109) g
+INSERT INTO t SELECT g, rpad(g::text, 1015, 'x') FROM generate_series(100, 109) g
 
 statement error 54P06
 COMMIT
@@ -80,31 +80,31 @@ SELECT count(*) FROM t
 50
 
 statement ok
-INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(50, 59) g
+INSERT INTO t SELECT g, rpad(g::text, 1015, 'x') FROM generate_series(50, 59) g
 
 statement ok
-INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(60, 69) g
+INSERT INTO t SELECT g, rpad(g::text, 1015, 'x') FROM generate_series(60, 69) g
 
 statement ok
-INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(70, 79) g
+INSERT INTO t SELECT g, rpad(g::text, 1015, 'x') FROM generate_series(70, 79) g
 
 statement ok
-INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(80, 89) g
+INSERT INTO t SELECT g, rpad(g::text, 1015, 'x') FROM generate_series(80, 89) g
 
 statement ok
-INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(90, 99) g
+INSERT INTO t SELECT g, rpad(g::text, 1015, 'x') FROM generate_series(90, 99) g
 
 statement ok
-INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(100, 109) g
+INSERT INTO t SELECT g, rpad(g::text, 1015, 'x') FROM generate_series(100, 109) g
 
 statement error 54P06
-INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(110, 119) g
+INSERT INTO t SELECT g, rpad(g::text, 1015, 'x') FROM generate_series(110, 119) g
 
 # Unlimited again: the same batch commits.
 # max_storage_bytes: 0
 
 statement ok
-INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(110, 119) g
+INSERT INTO t SELECT g, rpad(g::text, 1015, 'x') FROM generate_series(110, 119) g
 
 # An attached in-memory database has its own limit, independent of main's (six pages).
 # max_storage_bytes: 49152 aux
@@ -113,10 +113,10 @@ statement ok
 CREATE TABLE aux.a (id i32 PRIMARY KEY, v text)
 
 statement ok
-INSERT INTO aux.a SELECT g, repeat('y', 1000) FROM generate_series(1, 5) g
+INSERT INTO aux.a SELECT g, rpad(g::text, 1015, 'y') FROM generate_series(1, 5) g
 
 statement error 54P06
-INSERT INTO aux.a SELECT g, repeat('y', 1000) FROM generate_series(6, 20) g
+INSERT INTO aux.a SELECT g, rpad(g::text, 1015, 'y') FROM generate_series(6, 20) g
 
 # A multi-root commit rejected in the attachment publishes neither database.
 statement ok
@@ -126,7 +126,7 @@ statement ok
 INSERT INTO t VALUES (1000, 'z')
 
 statement ok
-INSERT INTO aux.a SELECT g, repeat('y', 1000) FROM generate_series(6, 20) g
+INSERT INTO aux.a SELECT g, rpad(g::text, 1015, 'y') FROM generate_series(6, 20) g
 
 statement error 54P06
 COMMIT
@@ -153,7 +153,7 @@ statement ok
 INSERT INTO aux.a VALUES (6, 'w')
 
 statement ok
-INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(1000, 1199) g
+INSERT INTO t SELECT g, rpad(g::text, 1015, 'x') FROM generate_series(1000, 1199) g
 
 statement error 54P06
 COMMIT
@@ -176,7 +176,7 @@ statement ok
 INSERT INTO scratch VALUES (1)
 
 statement ok
-INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(1000, 1199) g
+INSERT INTO t SELECT g, rpad(g::text, 1015, 'x') FROM generate_series(1000, 1199) g
 
 statement error 54P06
 COMMIT

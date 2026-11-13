@@ -1,5 +1,48 @@
 # Swift experiment progress
 
+## Authorized baseline refresh (2026-11-12, complete)
+
+Target: `b1a6affca7725e0b07a4f734eddb1c569ef76bcf`. The snapshot was regenerated from Git
+blobs, including 763 SQL files, 116 database fixtures and 19 saved regressions.
+The implementation now reads/writes v52, including compact leaf region selection,
+fixed numeric slots, key elision and multi-way splitting. SQL refresh includes
+parameters across INSERT/writable CTEs and LIMIT/OFFSET, whole-row expressions,
+timestamp aliases, container-literal context and output naming. Resource lane
+selection and bounded group-table handover were brought forward as well.
+
+Early full-run failures identified an encrypted meta check still fixed at v50,
+old low-level fixture constructors, duplicate CTE reference counting, and streaming
+and aggregate-accounting differences. The Rust interchange adapter now consumes
+its fallible row iterator. Recovery probes qualify their ORDER BY input column,
+because the newly inherited cast output name otherwise selects text ordering.
+The first all-peer interchange attempt also exposed missing existing TS dependencies;
+the normal `ts:lock_build` task provisioned the locked packages and helper.
+
+The complete file interchange and encrypted matrices pass, as do all 496 process
+pairings and 20,000 stress snapshot checks. Missing prebuilt process actors and
+locked benchmark dependencies were provisioned with the existing repository
+tasks. Review tightened pure-attempt eligibility (including regex and container
+exclusions), validated record shape before compact sizing, and checked cached
+point-read memory admission against the uncached path. Historical low-level tests
+were updated to exercise v52 compact representations rather than assume v50 sizes.
+
+The full generated sweep found one remaining cross-core recovery difference in
+`ddl-churn`, seed 4: data-page writes fit the existing allocation, but the
+subsequent free-list/manifest stage grows the file and flushes them. Swift had
+reserved both stages up front, so a process crash discarded writes that the
+supported cores had already flushed. Prepared commits now retain the initial
+body count/high-water and issue the same two growth stages, without moving any
+serialization after storage admission. The new pager event-order test and the
+four-core seed-4 replay (17 independently checked images) pass. The final release
+suite passes 557 native tests and all 763 SQL files; all 496 process pairings,
+2,787 interchange phases and 19 saved recovery traces pass after that correction.
+The full generated rerun passes all 176 traces in every core, 459 transcript
+comparisons and 7,049 independently checked Swift images, with zero failures.
+
+Current acceptance and exact commands are recorded in [VERIFICATION.md](VERIFICATION.md).
+Historical sections below retain their original checkpoints and measurements.
+No dependency declaration or default supported-core task was changed.
+
 ## Authorized structural performance follow-up (2026-11-06, complete)
 
 ### Final result

@@ -52,8 +52,10 @@ files in the same change.
   requested. Record coverage and omissions against the experiment's source revision;
   promotion to supported status requires a separate decision. See
   `spec/design/ruby-native-experiment.md` and `spec/design/swift-native-experiment.md`.
-  The Swift experiment is frozen at `fb34b0e8cb3d82287fbd3401e3426f04b3b86c7a` against
-  its recorded semantic baseline; Linux verification and measured results are in
+  The explicitly authorized Swift refresh (2026-11-12) targets supported-core
+  revision `b1a6affca7725e0b07a4f734eddb1c569ef76bcf` and format v52.
+  Its recorded inventory is 763 SQL files, 116 database fixtures and 19 saved
+  simulations; Linux verification and historical measured results are in
   `impl/swift-native/VERIFICATION.md` and `impl/swift-native/BENCHMARKS.md`.
   Apple platforms remain unverified. Production Swift delivery is undecided;
   the experiment adds no website docs, references, or live panels.

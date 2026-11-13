@@ -9,7 +9,7 @@ final class PackedPageTests: XCTestCase {
         let bytes: [UInt8]?
         if value.isNull { bytes = nil }
         else if ValueCodec.fixedWidth(type.type) != nil { bytes = try ValueCodec.encodeBody(value, type: type) }
-        else { bytes = try ValueCodec.encode(value, type: type) }
+        else { bytes = LeafValue.bare(type.type) ? [5] + (try ValueCodec.encodeRawBody(value, type: type)) : try ValueCodec.encode(value, type: type) }
         return StoredCell(bytes: bytes?[...], type: type)
     }
 
@@ -21,7 +21,7 @@ final class PackedPageTests: XCTestCase {
             PackedRecord(key: [3], cells: [try cell(.integer(-8), integer), try cell(.text(SQLText("")), text)])
         ]
         let payload = try PackedLeaf.encodePayload(rows, types: types, capacity: codec.capacity)
-        XCTAssertEqual(payload.count, rows.reduce(PackedLeaf.overhead(records: 3, types: types)) { $0 + $1.weight })
+        XCTAssertEqual(payload.count, PackedLeaf.measure(rows, types: types))
         let page = try PageSealer.seal(codec: codec, index: 2, type: 2, count: 3, payload: payload)
         let leaf = try PackedLeaf(bytes: page.page.bytes, types: types, codec: codec)
         XCTAssertEqual(leaf.count, 3)
@@ -45,7 +45,7 @@ final class PackedPageTests: XCTestCase {
         let payload = try PackedLeaf.encodePayload([row], types: [text], capacity: codec.capacity)
         let valid = try PageSealer.seal(codec: codec, index: 2, type: 2, count: 1, payload: payload).page.bytes
         // Header count, key end, region start/end, flags, value end, and tail.
-        for offset in [4, 16, 21, 25, 29, 30, 255] {
+        for offset in [4, 16, 17, 20, 22, 24, 25, 27, 255] {
             var corrupt = valid; corrupt[offset] ^= 0x80
             try PageEnvelope.putU32(PageEnvelope.checksum(corrupt, at: 12), into: &corrupt, at: 12)
             XCTAssertThrowsError(try PackedLeaf(bytes: corrupt, types: [text], codec: codec), "offset \(offset)") {

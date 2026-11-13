@@ -1,7 +1,7 @@
 #!/usr/bin/env ruby
 # frozen_string_literal: true
 #MISE description="Explicit opt-in: summarize a complete benchmark baseline or compare complete before/after runs; no measurements"
-#USAGE flag "--baseline <path>" help="One successful full 143-workload × 4-core × 3-round run; exclusive with --before/--after"
+#USAGE flag "--baseline <path>" help="One successful full 157-workload × 4-core × 3-round run; exclusive with --before/--after"
 #USAGE flag "--before <path>" help="Complete baseline for comparison; requires --after instead of --baseline"
 #USAGE flag "--after <path>" help="Complete later run for comparison; requires --before"
 #USAGE flag "--output <path>" help="Required absent/empty output directory for JSON, workload/category CSVs and Markdown"

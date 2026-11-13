@@ -84,11 +84,11 @@ internal final class StorageDomain: Sendable {
         var tables: [SQLText: TableStore] = [:], indexes: [SQLText: TableStore] = [:], gistTrees: [SQLText: GistTree] = [:]
         var gistPages: [UInt32] = [], relationNames = Set(catalog.tables.map(\.name) + catalog.sequences.map(\.name) + catalog.views.map(\.name))
         for table in catalog.tables.sorted(by: { $0.name < $1.name }) {
-            guard table.rowCount >= 0, UInt64(table.rowCount) <= UInt64(meta.pageCount) * UInt64(pager.codec.capacity / 4) else {
+            guard table.rowCount >= 0, UInt64(table.rowCount) <= UInt64(meta.pageCount) * UInt64(pager.codec.capacity) else {
                 throw JedError.corruption("table row count exceeds the file")
             }
             let rowTypes = try table.columns.map { try $0.type.resolve(types) }
-            let tree = try BPlusTree.open(root: table.root, rowCount: table.rowCount, pageCount: meta.pageCount, types: rowTypes, pool: pool)
+            let tree = try BPlusTree.open(root: table.root, rowCount: table.rowCount, pageCount: meta.pageCount, types: rowTypes, pool: pool, layout: .table(types: rowTypes, primaryKey: table.primaryKey))
             var nextRowID: Int64 = 0
             if table.primaryKey.isEmpty, !tree.isEmpty {
                 var cursor = TreeCursor(tree, descending: true)
@@ -318,7 +318,8 @@ internal final class StorageDomain: Sendable {
             prepared = try pager.prepare(body: body.pages + allocation.freeList.pages, root: body.root,
                 pageCount: allocation.freeList.highWater, freeList: allocation.freeList.head, livePages: live,
                 freePages: allocation.freeList.entries, manifestPages: allocation.manifestIDs,
-                reuseAllowed: policy.oldestPinnedVersion >= previous.freeGeneration, entropy: entropy)
+                reuseAllowed: policy.oldestPinnedVersion >= previous.freeGeneration, entropy: entropy,
+                initialStage: PageWriteStage(count: body.pages.count, highWater: body.allocation.highWater))
         } else {
             prepared = try pager.prepareMemory(body: body.pages, root: body.root, pageCount: body.allocation.highWater,
                 freePages: persist, reuseAllowed: policy.oldestPinnedVersion >= previous.freeGeneration,

@@ -1,5 +1,10 @@
 # Frozen file interchange acceptance (V10)
 
+The authorized 2026-11-12 refresh targets `b1a6affca7725e0b07a4f734eddb1c569ef76bcf`
+(v52, 763 SQL files, 116 database fixtures, 19 saved simulations). See
+[current verification](../VERIFICATION.md) for its results and actor provenance.
+The investigation and measurements below retain their original baseline.
+
 `mise run swift-native:interop` is opt-in. It builds four small transports using
 only each native core's public host API, copies the three native executables and
 Node transport into a retained evidence directory, then runs the complete matrix.

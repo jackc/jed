@@ -5,6 +5,11 @@ internal struct StoredPage: Sendable {
     let bytes: [UInt8]
 }
 
+internal struct PageWriteStage: Sendable {
+    let count: Int
+    let highWater: UInt32
+}
+
 /// Completed serialization, including encryption and manifest reservation, is
 /// separate from the storage phase. Constructing this value performs no writes.
 internal struct PreparedPageCommit: Sendable {
@@ -15,6 +20,7 @@ internal struct PreparedPageCommit: Sendable {
     let slot: UInt32
     let freePages: [UInt32]
     let entries: [ManifestEntry]
+    var initialStage: PageWriteStage? = nil
 }
 
 internal struct PagerAllocationState: Sendable {
@@ -437,8 +443,14 @@ internal final class Pager: Sendable {
 
     func prepare(body: [StoredPage], root: PageReference, pageCount: UInt32, freeList: PageReference,
                  livePages: UInt32, freePages: [UInt32], manifestPages: [UInt32], reuseAllowed: Bool,
-                 entropy: KeyEntropy? = nil) throws -> PreparedPageCommit {
+                 entropy: KeyEntropy? = nil, initialStage: PageWriteStage? = nil) throws -> PreparedPageCommit {
         let snapshot = try state.withLock { state -> State in try Self.checkWritable(state); return state }
+        if let initialStage {
+            guard (0...body.count).contains(initialStage.count),
+                  body.prefix(initialStage.count).allSatisfy({ $0.index < initialStage.highWater }) else {
+                throw JedError.corruption("invalid initial commit write stage")
+            }
+        }
         guard snapshot.selected.meta.txid < UInt64.max else { throw JedError.corruption("transaction id exhausted") }
         let txid = snapshot.selected.meta.txid + 1
         let safe = Set(reuseAllowed && snapshot.remoteReuse ? snapshot.freePages.filter { snapshot.pending.isEmpty || snapshot.floorFree.contains($0) } : [])
@@ -483,7 +495,8 @@ internal final class Pager: Sendable {
                 nonce: EncryptionPolicy.entropy(24, from: entropy))
         }
         return PreparedPageCommit(baseTxid: snapshot.selected.meta.txid, body: body,
-            manifest: manifest, metaBytes: metaBytes, slot: slot, freePages: freePages, entries: entries)
+            manifest: manifest, metaBytes: metaBytes, slot: slot, freePages: freePages, entries: entries,
+            initialStage: initialStage)
     }
 
     /// A false synchronous setting publishes before its deferred barrier. The
@@ -499,8 +512,16 @@ internal final class Pager: Sendable {
             do {
                 try stabilize(&state, syncDirectory: syncDirectory)
                 if state.pending.isEmpty { state.floorFree = Set(state.freePages) }
+                // Preserve the shared body/free-list write boundary. A second
+                // allocation can durably flush the first stage before the final
+                // commit barrier, which is observable after process death.
+                let firstCount = plan.initialStage?.count ?? 0
+                if let stage = plan.initialStage {
+                    try reserve(stage.highWater, state: &state)
+                    for page in plan.body.prefix(firstCount) { try write(page.index, bytes: page.bytes, state: &state) }
+                }
                 try reserve(plan.manifest.meta.pageCount, state: &state)
-                for page in plan.body { try write(page.index, bytes: page.bytes, state: &state) }
+                for page in plan.body.dropFirst(firstCount) { try write(page.index, bytes: page.bytes, state: &state) }
                 for page in plan.manifest.pages { try write(page.pageIndex, bytes: page.bytes, state: &state) }
                 try write(plan.slot, bytes: plan.metaBytes, state: &state)
                 if synchronous { try barrier(&state) }

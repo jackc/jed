@@ -25,7 +25,7 @@ extension ExpressionResolver {
             // type. A concrete scalar sibling supplies its declared context.
             array = try rhs.resolve(expected: scalarHint)
         }
-        if FunctionResolver.bareParameter(source), let hint {
+        if FunctionResolver.bareParameter(source) || FunctionResolver.bareString(source), let hint {
             array = try rhs.resolve(expected: hint)
         } else if constructor(source), !adaptable(operand), let hint = scalarHint {
             array = try rhs.resolve(expected: hint)

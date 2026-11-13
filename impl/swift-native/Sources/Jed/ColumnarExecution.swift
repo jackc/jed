@@ -1,34 +1,68 @@
-/// Packed-table lanes retain only the values they gather. Cost ceilings keep
-/// the scalar drive so the established abort schedule is unchanged.
+/// Packed-table lanes retain only the values they gather. Under cost ceilings,
+/// safe attempts rewind on failure and preserve the scalar abort schedule.
 internal enum ColumnarExecution {
     static func enabled(_ plan: SelectPlan, _ context: ExpressionContext) -> Bool {
-        plan.store != nil && plan.relation == nil && plan.scan.pointSets.isEmpty && !plan.scan.contradiction
+        !context.columnarDisabled && plan.store != nil && plan.relation == nil && plan.scan.pointSets.isEmpty && !plan.scan.contradiction
             && plan.chosenAccess?.intervals == nil && plan.chosenAccess?.orderedDefinition == nil
             && plan.chosenAccess?.gin == nil && plan.chosenAccess?.gist == nil
-            && context.meter.limit == 0 && context.meter.lifetimeLimit == 0 && context.executionProfile == nil
+            && context.executionProfile == nil
     }
     static func projection(_ plan: SelectPlan, _ context: ExpressionContext) -> Bool {
-        enabled(plan, context) && !plan.materializeSource && plan.aggregation == nil && plan.window == nil
+        enabled(plan, context) && (context.meter.limit == 0 && context.meter.lifetimeLimit == 0 || plan.predicate.map(discardSafe) ?? true) && !plan.materializeSource && plan.aggregation == nil && plan.window == nil
             && !plan.distinct && plan.order.isEmpty && plan.limit == nil && plan.offset == 0
             && !plan.projections.isEmpty && plan.projections.allSatisfy { if case .column = $0.node { return true }; return false }
     }
     static func aggregation(_ plan: SelectPlan, _ aggregate: AggregateQueryPlan, _ context: ExpressionContext) -> Bool {
-        guard enabled(plan, context), !plan.distinct, plan.productionCharge, plan.window == nil, plan.order.isEmpty,
+        guard enabled(plan, context), !plan.distinct, plan.productionCharge, plan.window == nil, plan.distinctOn == nil,
               aggregate.having == nil, aggregate.sets.count == 1, aggregate.grouping.isEmpty,
               aggregate.keys.count <= 1, aggregate.sets[0].count == aggregate.keys.count,
               !aggregate.calls.isEmpty else { return false }
         for key in aggregate.keys {
             guard case .column = key.node, case .scalar(let scalar) = key.type?.type, scalar.integerWidth != nil else { return false }
         }
+        if attempts(aggregate, context),
+           !(plan.predicate.map(discardSafe) ?? true) || !plan.order.allSatisfy({ discardSafe($0.expression) }) { return false }
         return aggregate.calls.allSatisfy { call in
             guard !call.distinct, call.filter == nil, call.order.isEmpty, call.direct.isEmpty, call.plan.withinGroup.isEmpty else { return false }
             if call.plan.name == "count_star" { return call.arguments.isEmpty }
-            guard call.arguments.count == 1, case .column = call.arguments[0].node else { return false }
+            guard call.arguments.count == 1, discardSafe(call.arguments[0]) else { return false }
             if ["count", "min", "max"].contains(call.plan.name) { return true }
             guard let type = call.arguments[0].type?.type else { return false }
-            if call.plan.name == "sum" { return [.scalar(.i16), .scalar(.i32), .scalar(.f32), .scalar(.f64)].contains(type) }
-            return call.plan.name == "avg" && [.scalar(.f32), .scalar(.f64)].contains(type)
+            return ["sum", "avg"].contains(call.plan.name) && [.scalar(.i16), .scalar(.i32), .scalar(.i64), .scalar(.decimal), .scalar(.f32), .scalar(.f64)].contains(type)
         }
+    }
+
+    static func attempts(_ aggregate: AggregateQueryPlan, _ context: ExpressionContext) -> Bool {
+        context.meter.limit > 0 || context.meter.lifetimeLimit > 0 || aggregate.calls.contains {
+            $0.arguments.contains { if case .column = $0.node { return false }; return true }
+        }
+    }
+    /// The shared safe-to-discard allowlist (cost.md §6.1). In particular,
+    /// host calls, volatile built-ins, subqueries and regex state cannot replay.
+    static func discardSafe(_ expression: ResolvedExpression) -> Bool {
+        func scalar(_ type: SQLType?) -> Bool {
+            guard case .scalar(let value) = type else { return false }
+            return ![.json, .jsonb, .jsonpath].contains(value)
+        }
+        switch expression.node {
+        case .constant(let value):
+            switch value {
+            case .array, .composite, .range, .json, .jsonb, .jsonpath: return false
+            default: return true
+            }
+        case .column, .parameter, .currentTimestamp, .currentDate, .dateInput: return true
+        case .cast(let child, let target, _), .convert(let child, let target):
+            guard scalar(child.type?.type), scalar(target.type) else { return false }
+        case .binary(_, _, _, let type): guard scalar(type.type) else { return false }
+        case .unary, .isNull, .distinct, .conditional, .coalesce, .extreme, .nullif: break
+        case .call(let call):
+            guard call.hostID == nil, call.regex == nil,
+                  scalar(call.resultType.type), call.arguments.allSatisfy({ $0.type == nil || scalar($0.type?.type) }),
+                  FunctionResolver.text(call.metadata.metadata, "volatility") != "volatile" else { return false }
+        case .pattern(let pattern): guard pattern.like else { return false }
+        default: return false
+        }
+        return StoredExpressionDependencies.children(expression).allSatisfy(discardSafe)
     }
 
     /// The existing lane admits packed operands, filters, and its one integer
@@ -57,6 +91,7 @@ internal final class ColumnarProjectionExecution {
         let row = outputLanes.map { lanes[$0][position] }; position += 1
         return row
     }
+    func prime() throws { if !started { try prepare(); started = true } }
     private func prepare() throws {
         let columns = Array(Set(plan.projections.compactMap { expression -> Int? in
             if case .column(let index) = expression.node { return index }; return nil

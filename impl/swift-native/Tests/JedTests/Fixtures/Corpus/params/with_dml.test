@@ -1,0 +1,93 @@
+# Bind parameters in a WITH whose parts are data-modifying (spec/design/api.md §5, writable-cte.md):
+# every part — each data-modifying CTE and the primary — types its $N into one statement-wide
+# collection before anything runs, the statement binds once, and every part reads those values. So a
+# part may use any subset of the parameters, and a $N used in two parts unifies. Each `# params:`
+# record binds host values (conformance.md §1.2).
+# Format + the `requires` directive: ../../../design/conformance.md.
+# requires: harness.params, ddl.create_table, ddl.primary_key, dml.insert, dml.insert_select, dml.insert_on_conflict, dml.update, dml.delete, dml.merge, dml.returning, dml.with_clause, query.select, query.select_no_from, query.where_eq, query.order_by, query.subquery_in, query.cte, query.cte_data_modifying, types.i32, types.text
+
+statement ok
+CREATE TABLE n (id i32 PRIMARY KEY, s text)
+
+statement ok
+INSERT INTO n VALUES (1, 'one'), (2, 'two')
+
+# A data-modifying primary under a query CTE.
+# params: 3, 'three'
+statement ok
+WITH c AS (SELECT 0 AS z) INSERT INTO n VALUES ($1, $2)
+
+# params: 4, 'four'
+statement ok
+WITH c AS (SELECT $1::i32 AS id) INSERT INTO n SELECT id, $2 FROM c
+
+# params: 'TWO', 2
+query IT nosort
+WITH c AS (SELECT 0 AS z) UPDATE n SET s = $1 WHERE id = $2 RETURNING id, s
+----
+2
+TWO
+
+# params: 4
+statement ok
+WITH c AS (SELECT 0 AS z) DELETE FROM n WHERE id = $1
+
+# params: 3, 'THREE'
+statement ok
+WITH c AS (SELECT 0 AS z) INSERT INTO n VALUES ($1, 'x') ON CONFLICT (id) DO UPDATE SET s = $2
+
+query IT nosort
+SELECT id, s FROM n ORDER BY id
+----
+1
+one
+2
+TWO
+3
+THREE
+
+# A data-modifying CTE's own parameters, read by a query primary.
+# params: 5, 'five'
+query IT nosort
+WITH d AS (INSERT INTO n VALUES ($1, $2) RETURNING id, s) SELECT id, s FROM d
+----
+5
+five
+
+# Each part uses a different subset: $2 only in the CTE, $1 only in the primary.
+# params: 'ONE', 'six'
+statement ok
+WITH d AS (INSERT INTO n VALUES (6, $2)) UPDATE n SET s = $1 WHERE id = 1
+
+# One parameter shared by two parts takes one type and one value.
+# params: 7
+query I nosort
+WITH d AS (INSERT INTO n VALUES ($1, 'seven') RETURNING id) SELECT id FROM n WHERE id = $1 - 6
+----
+1
+
+# A MERGE primary.
+# params: 6, 'SIX'
+statement ok
+WITH src AS (SELECT $1::i32 AS id) MERGE INTO n USING src ON n.id = src.id WHEN MATCHED THEN UPDATE SET s = $2
+
+query IT nosort
+SELECT id, s FROM n ORDER BY id
+----
+1
+ONE
+2
+TWO
+3
+THREE
+5
+five
+6
+SIX
+7
+seven
+
+# A parameter no part gives a type is still indeterminate.
+# params: 1
+statement error 42P18
+WITH c AS (SELECT 0 AS z) DELETE FROM n WHERE $1 IS NULL

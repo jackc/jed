@@ -1,18 +1,17 @@
 # Native Swift experiment
 
-**Frozen experimental snapshot** at `fb34b0e8cb3d82287fbd3401e3426f04b3b86c7a`.
-The semantic target remains the full supported jed surface at
-`0b76dd6e9c2675b552eb8af9e820065351ffa4b3`, with separately recorded shared corrections
-and postbaseline regressions. [VERIFICATION.md](VERIFICATION.md) maps completed
-Linux acceptance to its actual actors. The completed structural follow-up passes
-543 native tests and all 749 frozen SQL files. [BENCHMARKS.md](BENCHMARKS.md) records
-its diagnostic comparisons of 22 peer, eight paired Swift and three Ruby workloads,
-and preserves the original `3db8fc2` snapshot's complete 143-workload release
-baseline and optimization comparison. Each result retains its scope and limits.
-[PROGRESS.md](PROGRESS.md) preserves implementation history and failed attempts.
-The [experiment design](../../spec/design/swift-native-experiment.md) and its linked
-scope/host matrices preserve the baseline boundaries. This locally committed
-snapshot is not a pushed release, package publication or promotion.
+The explicitly requested 2026-11-12 refresh targets the supported jed surface at
+`b1a6affca7725e0b07a4f734eddb1c569ef76bcf`, including format **v52**, **763 SQL files**,
+**116 database fixtures**, and **19 saved simulation regressions**. It remains a
+pinned, opt-in experiment. See [VERIFICATION.md](VERIFICATION.md) for the refresh's
+actual Linux checks and remaining platform limits, and [PROGRESS.md](PROGRESS.md)
+for implementation history. The refresh preserves the experiment’s opt-in status
+and pinned maintenance scope.
+
+[BENCHMARKS.md](BENCHMARKS.md) preserves the older actors' measurements. Those
+v50 results are historical and do not establish performance for this v52 refresh.
+The [experiment design](../../spec/design/swift-native-experiment.md) and scope/host
+matrices record the acceptance boundaries.
 
 The independent engine is handwritten Swift. Approved crypto utilities are isolated
 in `JedCrypto`, using exact-pinned SwiftPM dependencies and pinned reference Argon2
@@ -75,10 +74,11 @@ files; `--temp` selects forced TEMP spilling with memory main and real native
 scratch. `swift-native:query-memory` compares every sequential record's exact
 peak and committed-main storage across Swift/Rust/Go/TS in memory, disk and
 disk-spill modes. Filters are diagnostic subsets; see
-[resource acceptance evidence](Tools/RESOURCE_ACCEPTANCE.md) for the complete
-241,412-measurement comparison and its postoptimization refresh.
+[current verification](VERIFICATION.md) for the refreshed 245,756-measurement
+comparison; [resource acceptance evidence](Tools/RESOURCE_ACCEPTANCE.md) preserves
+the original baseline investigation.
 
-`swift-native:interop` exercises all 112 frozen images with Swift and each
+`swift-native:interop` exercises all 116 frozen images with Swift and each
 supported core in both writer orders, plus generated plaintext/key/passphrase
 and attachment cases. Corruption and recovery fixtures have explicit probes;
 missing phases fail. See [interchange acceptance](Tools/INTERCHANGE_PLAN.md).
@@ -86,10 +86,9 @@ missing phases fail. See [interchange acceptance](Tools/INTERCHANGE_PLAN.md).
 fixed test credential and compares all cost/EXPLAIN transcripts across the four
 cores. It checks ordinary values/errors and exact file/record coverage, retains
 an immutable Swift actor and logs, and supports labelled diagnostic filters.
-The full encrypted and six-direction service comparisons pass. The optimized
-snapshot also passes the 77,612-record encrypted refresh and all 2,691 interchange
-phases; VERIFICATION.md records exact actors, the native host checks and earlier
-service/process evidence without extending old actors to later edits.
+The refresh passes 79,060 encrypted record measurements and all 2,787 interchange
+phases. VERIFICATION.md records the current gates and actor provenance separately
+from the older service/process evidence.
 
 `swift-native:service` runs all six Swift/supported-core client-owner directions
 through real external owner processes. It captures actors, asserts actual client

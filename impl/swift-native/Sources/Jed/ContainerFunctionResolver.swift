@@ -46,7 +46,7 @@ internal enum ContainerFunctionResolver {
         }
         if call.name.description == "width_bucket" && call.arguments.count == 2 {
             if originals[0].type == nil && originals[1].type == nil { throw JedError("42P18", "could not determine width_bucket argument types") }
-            if originals[1].type == nil, let operandType = originals[0].type {
+            if originals[1].type == nil || FunctionResolver.bareString(call.arguments[1].value), let operandType = originals[0].type {
                 let thresholds = try resolve(call.arguments[1].value, TypeDescriptor(.array(operandType.type)))
                 let row = FunctionSpecFact(category: "array", name: "width_bucket", kind: "function", metadata: ["result": .text("i32"), "null": .text("propagates")])
                 return make(row, [originals[0], thresholds], result: TypeDescriptor(.scalar(.i32)))

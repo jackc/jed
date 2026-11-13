@@ -1,5 +1,10 @@
 # Swift resource acceptance audit
 
+The authorized 2026-11-12 refresh targets `b1a6affca7725e0b07a4f734eddb1c569ef76bcf`
+(v52, 763 SQL files, 116 database fixtures, 19 saved simulations). See
+[current verification](../VERIFICATION.md) for its results and actor provenance.
+The investigation and measurements below retain their original baseline.
+
 Durable preoptimization evidence is preserved in the ignored ext4
 [verification archive](../results/verification-preoptimization-20261106/manifest.json):
 50 successful report/log/TSV files, 11,386,296 bytes, with original paths and

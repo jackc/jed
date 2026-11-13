@@ -26,12 +26,12 @@ EXPLAIN SELECT id, v FROM big WHERE id IN (SELECT k FROM pick)
 Filter
 conjuncts=1
 10
-49
+44
 1
 Scan big
 PK interval set: id; intervals=1; arrays=1; touched=2
 10
-18
+13
 
 query ITTII nosort
 EXPLAIN SELECT id, v FROM big WHERE id = ANY(SELECT ki FROM pick)
@@ -40,12 +40,12 @@ EXPLAIN SELECT id, v FROM big WHERE id = ANY(SELECT ki FROM pick)
 Filter
 conjuncts=1
 10
-49
+44
 1
 Scan big
 PK interval set: id; intervals=1; arrays=1; touched=2
 10
-18
+13
 
 # NOT IN and a correlated subquery do not bound.
 query ITTII nosort
@@ -55,17 +55,17 @@ EXPLAIN SELECT count(*) FROM big WHERE id NOT IN (SELECT k FROM pick WHERE k IS 
 Aggregate
 groups=0 aggs=1
 1
-4691
+4686
 1
 Filter
 conjuncts=1
 667
-4023
+4018
 2
 Scan big
 Full scan; touched=1
 2000
-2008
+2003
 
 query ITTII nosort
 EXPLAIN SELECT id, v FROM big WHERE id IN (SELECT k FROM pick WHERE pick.k = big.id)
@@ -74,12 +74,12 @@ EXPLAIN SELECT id, v FROM big WHERE id IN (SELECT k FROM pick WHERE pick.k = big
 Filter
 conjuncts=1
 667
-28675
+28670
 1
 Scan big
 Full scan; touched=2
 2000
-2008
+2003
 
 query ITTII nosort
 EXPLAIN SELECT d.v FROM (SELECT v FROM big WHERE id IN (SELECT k FROM pick)) AS d
@@ -88,17 +88,17 @@ EXPLAIN SELECT d.v FROM (SELECT v FROM big WHERE id IN (SELECT k FROM pick)) AS 
 Subquery d
 -
 10
-59
+54
 1
 Filter
 conjuncts=1
 10
-49
+44
 2
 Scan big
 PK interval set: id; intervals=1; arrays=1; touched=2
 10
-18
+13
 
 statement ok
 CREATE TABLE tp (tenant i64, id i64, w i64, PRIMARY KEY (tenant, id))
@@ -127,14 +127,14 @@ EXPLAIN DELETE FROM big WHERE id = ANY(SELECT k FROM pick WHERE k < 100)
 Delete big
 -
 10
-41
+36
 1
 Filter
 conjuncts=1
 10
-41
+36
 2
 Scan big
 PK interval set: id; intervals=1; arrays=1; touched=1
 10
-18
+13

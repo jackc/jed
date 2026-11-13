@@ -12,7 +12,7 @@ internal enum PageReachability {
                 for child in node.children { total += try count(child, tree: tree) }
                 return total
             }
-            guard tree.types.contains(where: { ValueCodec.fixedWidth($0.type) == nil }) else { return 1 }
+            guard tree.types.contains(where: { LeafValue.width($0) == nil }) else { return 1 }
             let leaf = try tree.resolve(child)
             var total: UInt64 = 1
             for row in 0..<leaf.entryCount {
@@ -76,16 +76,16 @@ internal enum PageReachability {
                 current = PageReference(next, tag: tag)
             }
         }
-        func tree(_ child: TreeChild, types: [TypeDescriptor]) throws {
+        func tree(_ child: TreeChild, types: [TypeDescriptor], layout: LeafLayout = .index) throws {
             guard let reference = child.reference else { throw JedError.corruption("unpersisted node in live-page walk") }
             try add(reference.index)
             let checked = readAllPages ? try read(reference) : nil
             if case .resident(let node) = child, !node.isLeaf {
-                for child in node.children { try tree(child, types: types) }
+                for child in node.children { try tree(child, types: types, layout: layout) }
                 return
             }
-            guard types.contains(where: { ValueCodec.fixedWidth($0.type) == nil }) else { return }
-            let leaf = try PackedLeaf(bytes: checked ?? read(reference), types: types, codec: codec)
+            guard types.contains(where: { LeafValue.width($0) == nil }) else { return }
+            let leaf = try PackedLeaf(bytes: checked ?? read(reference), types: types, codec: codec, layout: layout)
             for row in 0..<leaf.count {
                 for column in types.indices {
                     if let facts = try leaf.cell(row: row, column: column).largeFacts(encrypted: encrypted), let head = facts.external {
@@ -98,7 +98,7 @@ internal enum PageReachability {
         for page in gistPages { try add(page) }
         for name in snapshot.tables.keys.sorted() {
             let store = snapshot.tables[name]!
-            if let root = store.tree.root { try tree(root, types: store.tree.types) }
+            if let root = store.tree.root { try tree(root, types: store.tree.types, layout: store.tree.layout) }
         }
         for name in snapshot.indexes.keys.sorted() where snapshot.gistTrees[name] == nil {
             if let root = snapshot.indexes[name]!.tree.root { try tree(root, types: []) }

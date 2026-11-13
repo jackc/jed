@@ -128,6 +128,6 @@ internal struct TableStore: Sendable {
     mutating func clearPending() { pendingBytes = 0; forgetPendingKeys() }
     mutating func installPersistedTree(_ tree: BPlusTree) { self.tree = tree; clearPending() }
     func truncated() -> TableStore {
-        TableStore(tree: BPlusTree(codec: tree.codec, types: tree.types, pool: tree.pool), nextRowID: nextRowID)
+        TableStore(tree: BPlusTree(codec: tree.codec, types: tree.types, pool: tree.pool, layout: tree.layout), nextRowID: nextRowID)
     }
 }

@@ -105,16 +105,12 @@ internal final class CompoundQueryPlan {
             try ResolutionDiagnostics.comparable(type.type, at: term.expression.expressionLocation, ordering: true)
             return ResolvedOrderTerm(expression: value, type: type, descending: term.descending, nullsFirst: term.nullsFirst ?? term.descending)
         }
-        func bound(_ spelling: String?, code: String) throws -> Int64? {
-            guard let spelling else { return nil }
-            guard let value = try? TypeRules.unsignedLiteral(spelling), value <= UInt64(Int64.max) else {
-                throw JedError(code, "invalid row-count bound")
-            }
-            return Int64(value)
-        }
+
+        let limit = try RowCountBound.resolve(query.limit, code: "2201W", resolver: resolver, settings: settings)
+        let offset = try RowCountBound.resolve(query.offset, code: "2201X", resolver: resolver, settings: settings) ?? 0
         var result = SelectPlan(columns: columns, projections: projections, predicate: nil, store: nil, touched: [],
             parameters: try finalizeParameters ? ParameterBinding.finalize(resolver) : [],
-            limit: try bound(query.limit, code: "2201W"), offset: try bound(query.offset, code: "2201X") ?? 0,
+            limit: limit, offset: offset,
             order: order, orderedByScan: false, descending: false, scan: BaseScanPlan(predicate: nil, keys: [], types: []),
             compound: CompoundQueryPlan(body: body, settings: settings))
         result.offsetPresent = query.offset != nil

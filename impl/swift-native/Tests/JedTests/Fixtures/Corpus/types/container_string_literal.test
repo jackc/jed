@@ -1,0 +1,180 @@
+# A bare string literal beside an array or range operand is PostgreSQL's `unknown`: it takes the
+# operand's type and reads through `array_in` / `range_in`, just as it adapts to a uuid, date, or
+# jsonb sibling and to an array or range column on INSERT/UPDATE (spec/design/types.md §5). This
+# covers the comparisons, IN, BETWEEN, IS DISTINCT FROM, the containment/overlap and positional
+# operators, array `||`, range `+`/`*`/`-`, and the array operand of ANY/ALL and width_bucket. A
+# malformed literal is 22P02 from the input function. A string literal beside a composite is not
+# adapted (PostgreSQL reads it as an anonymous record and rejects it). Results verified against
+# PostgreSQL 18.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.comparison_order, query.is_distinct_from, expr.not_equal, expr.in_list, expr.between, types.array, types.range, types.i32, types.text, func.array, func.array_containment, func.array_quantified, func.range_operators, func.range_set_operators, resource.cost_metering
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, x i32[], tx text[], r int4range, n i32)
+
+statement ok
+INSERT INTO t VALUES (1, '{1,2}', '{a,b}', '[1,3)', 1), (2, '{3}', '{c}', '[5,9)', 10)
+
+# Comparisons, on either side.
+query I rowsort
+SELECT id FROM t WHERE x = '{1,2}'
+----
+1
+
+query I rowsort
+SELECT id FROM t WHERE '{1,2}' = x
+----
+1
+
+query I rowsort
+SELECT id FROM t WHERE x <> '{1,2}'
+----
+2
+
+query I rowsort
+SELECT id FROM t WHERE x < '{2}'
+----
+1
+
+query I rowsort
+SELECT id FROM t WHERE tx = '{a,b}'
+----
+1
+
+query I rowsort
+SELECT id FROM t WHERE x IN ('{3}', '{4}')
+----
+2
+
+query I rowsort
+SELECT id FROM t WHERE x IS DISTINCT FROM '{3}'
+----
+1
+
+query I rowsort
+SELECT id FROM t WHERE r = '[1,3)'
+----
+1
+
+query I rowsort
+SELECT id FROM t WHERE r BETWEEN '[1,2)' AND '[2,2)'
+----
+
+query I rowsort
+SELECT id FROM t WHERE r BETWEEN 'empty' AND '[2,2]'
+----
+1
+
+# Array containment, overlap, and concatenation.
+query I rowsort
+SELECT id FROM t WHERE x @> '{1}'
+----
+1
+
+query I rowsort
+SELECT id FROM t WHERE '{3}' <@ x
+----
+2
+
+query I rowsort
+SELECT id FROM t WHERE x && '{2,3}'
+----
+1
+2
+
+query T rowsort
+SELECT x || '{9}' FROM t
+----
+{1,2,9}
+{3,9}
+
+# Range operators.
+query I rowsort
+SELECT id FROM t WHERE r @> '[1,2)'
+----
+1
+
+query I rowsort
+SELECT id FROM t WHERE '[6,7)' <@ r
+----
+2
+
+query I rowsort
+SELECT id FROM t WHERE r && '[2,6)'
+----
+1
+2
+
+query I rowsort
+SELECT id FROM t WHERE r << '[4,5)'
+----
+1
+
+query I rowsort
+SELECT id FROM t WHERE r -|- '[3,5)'
+----
+1
+2
+
+query T rowsort
+SELECT r + '[3,5)' FROM t
+----
+[1,5)
+[3,9)
+
+query T rowsort
+SELECT r * '[2,6)' FROM t
+----
+[2,3)
+[5,6)
+
+query T rowsort
+SELECT r - '[2,3)' FROM t
+----
+[1,2)
+[5,9)
+
+# The array operand of ANY/ALL and width_bucket takes the array of the other operand's type.
+query I rowsort
+SELECT id FROM t WHERE n = ANY('{1,5}')
+----
+1
+
+query I rowsort
+SELECT id FROM t WHERE n <> ALL('{1,5}')
+----
+2
+
+query I rowsort
+SELECT id FROM t WHERE 1 = ANY('{1,5}')
+----
+1
+2
+
+query I rowsort
+SELECT id FROM t WHERE tx[1] = ANY('{c,d}')
+----
+2
+
+query I rowsort
+SELECT width_bucket(n, '{1,5,9}') FROM t
+----
+1
+3
+
+# A malformed literal is the input function's error.
+statement error 22P02
+SELECT id FROM t WHERE x = '{1,'
+
+statement error 22P02
+SELECT id FROM t WHERE x = '{a}'
+
+statement error 22P02
+SELECT id FROM t WHERE r && '[1'
+
+# `||` adapts the literal to the ARRAY, never to its element: a bare element string is a malformed
+# array literal. Appending a text element needs a typed operand (`'c'::text`, expr/text_concat.test).
+statement error 22P02
+SELECT ARRAY['a','b'] || 'c'
+
+statement error 22P02
+SELECT id FROM t WHERE n = ANY('{1,x}')

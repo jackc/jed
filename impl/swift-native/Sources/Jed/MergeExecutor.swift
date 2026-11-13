@@ -25,7 +25,7 @@ extension MergeExecutor {
                         context initial: ExpressionContext, parameters: [SQLValue]) throws -> MutationResult {
         do {
         var context = initial
-        context.parameters = try ParameterBinding.bind(parameters, types: plan.parameterTypes, timezone: plan.settings.timeZone)
+        if context.parameterInference == nil { context.parameters = try ParameterBinding.bind(parameters, types: plan.parameterTypes, timezone: plan.settings.timeZone) }
         let start = context.meter.accrued
         var sourceCost: Int64 = 0, probeCost: Int64 = 0, conditionCost: Int64 = 0, hashCost: Int64 = 0, unmatchedCost: Int64 = 0, unmatchedScanCost: Int64 = 0
         defer {
@@ -273,7 +273,7 @@ extension MergeExecutor {
                 return .kept(old.cells[column], pending: old.overflows[column])
             }
             action.record = try RecordDisposition.plan(key: action.key, values: inputs, types: relation.types,
-                codec: relation.store.tree.codec, meter: compression, pager: relation.store.tree.pool?.pager)
+                codec: relation.store.tree.codec, layout: relation.store.tree.layout, meter: compression, pager: relation.store.tree.pool?.pager)
         }
         context.meter.charge(compression.accrued); try context.meter.checkpoint()
         for action in actions {

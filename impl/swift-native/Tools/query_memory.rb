@@ -8,7 +8,7 @@ require "tmpdir"
 
 # An opt-in acceptance adapter. No engine or shared default task depends on it.
 module SwiftQueryMemory
-  BASELINE = "0b76dd6e9c2675b552eb8af9e820065351ffa4b3"
+  BASELINE = "b1a6affca7725e0b07a4f734eddb1c569ef76bcf"
   CORPUS = File.join(SwiftNativeTasks::PACKAGE, "Tests/JedTests/Fixtures/Corpus")
   LIVE = File.join(SwiftNativeTasks::ROOT, "spec/conformance/suites")
   MODES = %w[memory disk disk-spill].freeze

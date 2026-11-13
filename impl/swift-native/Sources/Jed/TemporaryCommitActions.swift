@@ -42,7 +42,7 @@ internal enum TemporaryCommitActions {
             let table = image.tables[ordinal]
             let hasRows = store.tree.root != nil || table.indexes.contains { work.indexes[$0.name]?.tree.root != nil }
             guard hasRows else { continue }
-            work.setTableStore(name, TableStore(tree: BPlusTree(codec: work.pool.codec, types: store.tree.types, pool: work.pool),
+            work.setTableStore(name, TableStore(tree: BPlusTree(codec: work.pool.codec, types: store.tree.types, pool: work.pool, layout: store.tree.layout),
                                                nextRowID: store.nextRowID))
             image.tables[ordinal].root = zero; image.tables[ordinal].rowCount = 0
             for index in table.indexes.indices {

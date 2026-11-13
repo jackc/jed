@@ -15,7 +15,7 @@ internal final class GroupedSelectExecution {
         }
     }
     private enum PackedOperand {
-        case star, nullness(Int), direct(Int), cached(Int)
+        case star, nullness(Int), direct(Int), cached(Int), expression(ResolvedExpression)
     }
     private struct Output {
         let row: [SQLValue]
@@ -35,6 +35,7 @@ internal final class GroupedSelectExecution {
     private var reserved: Int64 = 0
     private var sourceBytes: Int64 = 0
     private var bounded: BlockingAggregateExecution?
+    private var allowColumnar = true
     private var started = false
     private var position = 0
     private var emitted: Int64 = 0
@@ -45,7 +46,7 @@ internal final class GroupedSelectExecution {
     }
     func nextRaw() throws -> (row: [SQLValue], bytes: Int64)? {
         guard rawOutput else { throw JedError("XX000", "grouped raw output was not requested") }
-        if !started { try prepare(); started = true }
+        try ensurePrepared()
         guard position < outputs.count else { return nil }
         let output = outputs[position]; position += 1
         outputs[position - 1] = Output(row: [], bytes: 0, ordinal: output.ordinal)
@@ -53,13 +54,8 @@ internal final class GroupedSelectExecution {
         return (output.row, output.bytes)
     }
     func next() throws -> [SQLValue]? {
-        let wholeTableFold = context.executionProfile == nil && aggregate.keys.isEmpty && ColumnarExecution.aggregation(plan, aggregate, context)
-        if !rawOutput, context.spill?.canSpill == true, !wholeTableFold,
-           try !plan.scan.hasKnownContradiction(parameters: context.parameters, collatedKey: context.collatedKey) {
-            if bounded == nil { bounded = BlockingAggregateExecution(plan: plan, aggregate: aggregate, context: context) }
-            return try bounded?.next()
-        }
-        if !started { try prepare(); started = true }
+        try ensurePrepared()
+        if let bounded { return try bounded.next() }
         guard position < outputs.count, plan.limit == nil || emitted < plan.limit! else { return nil }
         let at = position
         let end = position + Int(min(Int64(outputs.count - position), plan.limit.map { $0 - emitted } ?? Int64.max))
@@ -73,6 +69,30 @@ internal final class GroupedSelectExecution {
             return values.indices.contains(slot) ? values[slot] : nil
         }
         return try plan.projections.map { try current.evaluate($0) }
+    }
+    private func ensurePrepared() throws {
+        guard !started else { return }
+        let lane = ColumnarExecution.aggregation(plan, aggregate, context)
+        let contradiction = try plan.scan.hasKnownContradiction(parameters: context.parameters, collatedKey: context.collatedKey)
+        let boundedHost = !rawOutput && context.spill?.canSpill == true
+            && !(aggregate.keys.isEmpty && lane)
+            && !contradiction
+        func run() throws {
+            if boundedHost || !rawOutput && context.spill?.canSpill == true && !allowColumnar && !contradiction {
+                let execution = BlockingAggregateExecution(plan: plan, aggregate: aggregate, context: context, allowColumnar: allowColumnar)
+                bounded = execution; try execution.prime()
+            } else { try prepare() }
+        }
+        if lane, ColumnarExecution.attempts(aggregate, context) {
+            let rewind = context.meter.mark()
+            do { try run(); try context.meter.guardCost(); started = true; return }
+            catch {
+                close()
+                if (error as? JedError)?.code == "57014" { throw error }
+                rewind(); allowColumnar = false
+            }
+        }
+        try run(); started = true
     }
     private func reserve(_ bytes: Int64) throws {
         try context.meter.reserveQuery(bytes); reserved = saturatingAdd(reserved, bytes)
@@ -89,7 +109,7 @@ internal final class GroupedSelectExecution {
     }
     private func prepareBody() throws {
         let meter = context.meter
-        let columnar = ColumnarExecution.aggregation(plan, aggregate, context)
+        let columnar = allowColumnar && ColumnarExecution.aggregation(plan, aggregate, context)
         let input = SelectInput(plan: plan, context: context)
         defer { input.close() }
         if !columnar { while let row = try input.next() { try source(row) } }
@@ -168,7 +188,7 @@ internal final class GroupedSelectExecution {
                 else { try group.states[ordinal].fold(arguments) }
             }
         }
-            if ColumnarExecution.packedAggregation(plan, aggregate, context) {
+            if columnar && ColumnarExecution.packedAggregation(plan, aggregate, context) {
                 try foldPacked(members: members, membership: membership)
             } else if columnar {
                 while let row = try input.next() {
@@ -248,11 +268,11 @@ internal final class GroupedSelectExecution {
         // With no predicate there is no decoded value to reuse. Fill one
         // compact vector directly, retaining touched order before any fold.
         // Filtered consumers keep the frame's once-per-record value reuse.
-        let direct = plan.predicate == nil, pager = plan.store!.tree.pool?.pager
+        let direct = plan.predicate == nil && aggregate.calls.allSatisfy { $0.arguments.allSatisfy { if case .column = $0.node { return true }; return false } }, pager = plan.store!.tree.pool?.pager
         var values = Array(repeating: SQLValue.null, count: direct ? decoded.count : 0)
         let keySlots = direct ? aggregate.keyColumns.map { decoded.firstIndex(of: $0)! } : []
-        let reads: [PackedOperand] = operands.map { operand in
-            guard let column = operand.column else { return .star }
+        let reads: [PackedOperand] = operands.enumerated().map { ordinal, operand in
+            guard let column = operand.column else { return aggregate.calls[ordinal].arguments.first.map(PackedOperand.expression) ?? .star }
             if operand.nullness { return .nullness(column) }
             return direct ? .direct(decoded.firstIndex(of: column)!) : .cached(column)
         }
@@ -328,6 +348,7 @@ internal final class GroupedSelectExecution {
                         try states[ordinal].foldCount(isNull: packed?.isNull(row: index, column: column) ?? node.isNull(row: index, column: column))
                     case .direct(let slot): try states[ordinal].foldScalar(values[slot])
                     case .cached(let column): try states[ordinal].foldScalar(row.value(column))
+                    case .expression(let expression): try states[ordinal].foldScalar(current.evaluate(expression))
                     }
                 }
             }
