@@ -14,7 +14,10 @@ the record of what was measured.
 same saving by a different route. §8 is the re-baselining against that rule: what composing the two
 required, the numbers against today's commit (deferral still halves a single-row commit), and the bug
 it exposed and fixed — a remap entry could outlive the page it names, which the old rule's periodic
-rebuild had been quietly healing.
+rebuild had been quietly healing. It then moved **again**, under leaf evening (`cb56b480e`), which
+makes a rebalance — and so a parent that cannot be retained — an ordinary event on the very
+workloads §8.2 measures: §8.5 says what that does and does not change, and §8.2's figures are a
+floor awaiting re-measurement, not today's saving.
 
 ## 1. The problem
 
@@ -362,6 +365,32 @@ every oracle and profile, the `truncation` profile included), and `mise run stre
 verifier (all three cores agree on the answer checksum). The default path — switch off — is
 unchanged and green. What remains open is §6's last bullet, now quantified there.
 
+### 8.5 The baseline moved a second time: leaf evening
+
+Every number above was taken at `68703736a`, which predates **leaf evening** (`cb56b480e`,
+[format.md](../fileformat/format.md) *Evening out with a sibling*): an overflowing leaf away from
+the right edge is now evened out with an adjacent sibling that has room, the pair re-split in two
+and **the new separator replacing the old one** in the parent, before a two-way split is accepted.
+
+That is a third site that changes a parent's separators, and so a third site that forbids retention.
+§9.4's condition (b) already covers it in words — "no split, merge **or rebalance** below it changed
+the separators" — and the Go prototype is correct against it today, because the evening path clears
+`sameKeys` on both of its branches. Nothing in §9 moves.
+
+What moves is **how often retention fires**, and therefore §8.2's column. Leaf evening makes a
+rebalance an ordinary event on exactly the workloads §8.2 measures — an index maintained by DML, a
+table with random keys — where before, an overflow away from the right edge simply split. Each such
+rebalance retires the parent that a deferred commit would have kept. So **24.0 / 39.9 / 48.0 KB is
+now a floor, not an estimate**, and the headline "deferral halves a single-row commit" is unverified
+against the current engine. The direction is clear (retention strictly less often ⇒ bytes strictly
+higher) but not the size: evening also writes *fewer* tree pages per bulk commit (411 → 386 on
+`cb56b480e`'s own load), and the append case — which never rebalances, by that commit's right-edge
+rule — should be unchanged.
+
+**The landing change owes a re-measurement** (§9.8): §8.2's three workloads at the tip, before any
+claim about what deferral saves is repeated. Until then cite §8.2 as "measured at `68703736a`,
+pre-leaf-evening", not as today's saving.
+
 ## 9. The format (ratified 2026-11-13)
 
 This section is the **byte specification** the other cores implement. It is not in
@@ -608,6 +637,9 @@ Beyond the three cores and `verify.rb`:
 - **A race review** of the commit path, which sets a page id on the committing snapshot's own nodes
   and swaps the resident list during planning (§6).
 - **`unassignPages`**, or its equivalent, must undo a retained interior when a plan is discarded.
+- **A re-measurement** of §8.2's three workloads at the tip, since leaf evening retires parents a
+  deferred commit would have kept (§8.5). Until it is taken, §8.2 is a floor measured at
+  `68703736a`, not the current saving.
 
 What it does **not** owe: row counts in the meta (§7.2), which would stop an insert writing the
 catalog page and is a separate change; and record-level logging (§7.3), which this design does not
