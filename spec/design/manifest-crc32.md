@@ -153,6 +153,10 @@ always written by the commit whose meta names it, under `synchronous = off` too,
 equality, stronger than the window. **The Rust, TS and Ruby validators carry the same `[1, 4)` zero
 check** and need the same change.
 
+`verify.rb` reads both the narrow manifest and the stamp, with the same window rule
+(deferred-interior.md §9.8), so the regression traces and a 550-trace image-checking sweep agree with
+it under these switches.
+
 **Not yet covered by the stamp**, each recorded for the landing (deferred-interior.md §9.9):
 the integrity check validates a live generation with no window (it holds one meta slot, not the
 floor); the page service checks a client delta's page digests but not its pages' stamps; and an

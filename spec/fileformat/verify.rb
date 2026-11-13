@@ -225,6 +225,122 @@ ENC_KEY = ("\x4A" * 32).b # the goldens' host key (kdf 2)
 def tag_len = $enc ? TAG_LEN : 0
 def first_body = $enc ? ENC_FIRST_BODY : ROOT_PAGE
 
+# --- The v53 layout, ahead of v53 (deferred-interior.md §9, manifest-crc32.md §2) -------------------
+# Until v53 is a real format version the Go core writes it behind three switches and no version bump,
+# so this reader takes the layout from the same environment variables. The simulator runs this file
+# as a subprocess of a sweep that set them, so the independent checker reads what the core wrote. At
+# v53 each becomes unconditional and the version byte decides. The narrow-manifest bit (offset 40's top
+# bit) is self-describing and needs no switch.
+DEFER_INTERIOR = ENV["JED_DEFER_INTERIOR"] == "on"
+PAGE_TXID_STAMP = ENV["JED_PAGE_TXID_STAMP"] == "on"
+MANIFEST_NARROW_FLAG = 1 << 31
+
+# The meta's manifest area [lo, hi): after the header (and an encrypted meta's tags), before an
+# encrypted meta's reserve.
+def manifest_area(ps, encrypted) = encrypted ? [96, ps - RESERVE] : [64, ps]
+
+# A remap entry: parent u32, slot u16, page u32, and an encrypted file's 16-byte tag of page (§9.2).
+def remap_entry_size(encrypted) = encrypted ? 10 + TAG_LEN : 10
+
+# The entries a meta carries: one third of the manifest area at every page size (§9.2).
+def remap_cap(ps, encrypted)
+  lo, hi = manifest_area(ps, encrypted)
+  ((hi - lo) / 3) / remap_entry_size(encrypted)
+end
+
+def remap_reserve(ps, encrypted) = DEFER_INTERIOR ? remap_entry_size(encrypted) * remap_cap(ps, encrypted) : 0
+
+# The meta's remap list (§9.2-§9.3), keyed by [parent, slot] => [page, tag]; nil when the slot is
+# structurally invalid. Without the deferred layout offset 60 is reserved zero, as through v52.
+def decode_remap(m, ps, encrypted, first, page_count)
+  count = m.byteslice(60, 4).unpack1("N")
+  return(count.zero? ? {} : nil) unless DEFER_INTERIOR
+  return nil if count > remap_cap(ps, encrypted)
+
+  size = remap_entry_size(encrypted)
+  _, hi = manifest_area(ps, encrypted)
+  at = hi - remap_reserve(ps, encrypted)
+  list = {}
+  targets = Set.new
+  prev = nil
+  count.times do
+    parent, slot, page = m.byteslice(at, 10).unpack("NnN")
+    tag = encrypted ? m.byteslice(at + 10, TAG_LEN).b : nil
+    key = [parent, slot]
+    return nil unless prev.nil? || (key <=> prev).positive?
+    return nil unless parent >= first && parent < page_count && page >= first && page < page_count
+    return nil if page == parent || !targets.add?(page)
+
+    list[key] = [page, tag]
+    prev = key
+    at += size
+  end
+  return nil unless m.byteslice(at, hi - at).bytes.all?(&:zero?)
+
+  list
+end
+
+# The stamp window (manifest-crc32.md §2.1): a page listed by a manifest must carry the low 16 bits of
+# a txid in (floor, newest]. An empty or inverted window, or one of 2^16 or more, admits every stamp.
+def stamp_in_window?(stamp, floor, newest)
+  return true unless PAGE_TXID_STAMP && floor && newest > floor
+
+  span = newest - floor
+  return true if span >= 1 << 16
+
+  d = (stamp - (floor & 0xFFFF)) & 0xFFFF
+  d >= 1 && d <= span
+end
+
+# The stamp a manifest-overflow page written by the commit at txid carries (0 without stamping).
+def stamp_of(txid) = PAGE_TXID_STAMP ? txid & 0xFFFF : 0
+
+# The child pointers of an interior page, resolved through the selected meta's remap list: one lookup
+# per slot, never transitive (§9.1). Returns [page, tag] pairs (tag nil in plaintext) so a walker can
+# bind each child's tag just before it reads that child -- a pointer the list overrides names a page
+# the node has moved off, whose number another pointer may now use with a different tag.
+def interior_children(pg, parent)
+  n = pg[:item_count]
+  pos = 0
+  kids = (0..n).map do
+    index, pos = take(pg[:payload], pos, 4)
+    index = index.unpack1("N")
+    tag = nil
+    if $enc
+      tag, pos = take(pg[:payload], pos, TAG_LEN)
+      raise "a pointer to no page carries a tag" if index.zero? && tag != ZERO_TAG
+
+      tag = tag.b
+    end
+    [index, tag]
+  end
+  list = $remap || {}
+  unless list.empty?
+    max = $remap_max[parent]
+    raise "remap entry names a slot past its parent's item count" if max && max > n
+
+    kids.each_index do |i|
+      entry = list[[parent, i]]
+      kids[i] = entry if entry
+    end
+  end
+  kids
+end
+
+# Make the selected meta's remap list the one interior reads resolve through.
+def install_remap(meta)
+  $remap = meta[:remap] || {}
+  $remap_max = Hash.new
+  $remap.each_key { |parent, slot| $remap_max[parent] = [($remap_max[parent] || 0), slot].max }
+end
+
+# Descend to a resolved child: bind its tag for the read (encrypted.md §2), then visit it.
+def visit_child(child, walk)
+  index, tag = child
+  $enc[:tags][index] = tag if $enc && !index.zero?
+  walk.call(index)
+end
+
 # The tag a pointer to page `index` carries (§2): nothing in a plaintext file, zeros for no page.
 def tag_of(index)
   return "".b unless $enc
@@ -5075,7 +5191,10 @@ def take_str(buf, pos)
   [s.force_encoding("UTF-8"), pos]
 end
 
-def read_meta(image, ps, slot)
+# A meta slot's structural fields, without reading any page it lists: the checks of read_meta before
+# the manifest, plus its remap list (deferred-interior.md §9.3), which is the slot's own bytes. The
+# stamp window's floor is the other slot read this way, as the Go core reads it (parseMeta).
+def read_meta_header(image, ps, slot)
   off = slot * ps
   return nil if off + ps > image.bytesize
 
@@ -5101,27 +5220,48 @@ def read_meta(image, ps, slot)
   return nil unless (first...meta[:page_count]).cover?(meta[:root_page])
   return nil unless meta[:live] <= meta[:page_count] - first
   return nil unless meta[:free_head].zero? || (first...meta[:page_count]).cover?(meta[:free_head])
-  return nil unless valid_manifest?(image, ps, m, meta)
+
+  meta[:remap] = decode_remap(m, ps, suite == 1, first, meta[:page_count])
+  return nil if meta[:remap].nil?
+
+  meta[:raw] = m
+  meta
+end
+
+# A meta slot that recovery may select: structurally valid, and every page its manifest lists is the
+# page this commit wrote. floor is the txid of the other slot when it is older (the stamp window's
+# floor, manifest-crc32.md §2.1), else nil.
+def read_meta(image, ps, slot, floor = nil)
+  meta = read_meta_header(image, ps, slot) or return nil
+  return nil unless valid_manifest?(image, ps, meta.delete(:raw), meta, floor)
 
   meta
 end
 
-def valid_manifest?(image, ps, m, meta)
+def valid_manifest?(image, ps, m, meta, floor = nil)
   head, count, chain_count = m.byteslice(36, 12).unpack("N3")
   digest = m.byteslice(48, 8).unpack1("Q>")
   encrypted = meta[:suite] == 1
   first = encrypted ? ENC_FIRST_BODY : ROOT_PAGE
-  # An encrypted meta's inline manifest follows its two tags and stops at its reserve (§6).
-  lo, hi = encrypted ? [96, ps - RESERVE] : [64, ps]
-  return false unless m.byteslice(60, 4) == "\x00".b * 4
+  # PROTOTYPE (manifest-crc32.md §2): the top bit of the count marks 8-byte entries -- the page id and
+  # its CRC-32 -- and a CRC-32 chain digest; otherwise 12-byte entries with a CRC-64.
+  narrow = (count & MANIFEST_NARROW_FLAG) != 0
+  count &= ~MANIFEST_NARROW_FLAG
+  esize = narrow ? 8 : 12
+  entry_pack = narrow ? "NN" : "NQ>"
+  chain_crc = narrow ? ->(data, crc) { Zlib.crc32(data, crc) } : ->(data, crc) { crc64(data, crc) }
+  # An encrypted meta's inline manifest follows its two tags and stops at its reserve (§6); under the
+  # deferred-interior layout the remap region takes the area's last third (deferred-interior.md §9.2).
+  lo, hi = manifest_area(ps, encrypted)
+  hi -= remap_reserve(ps, encrypted)
   return false if count + chain_count > meta[:page_count] - first
   return false unless (chain_count.zero? && head.zero? && digest.zero?) ||
                       (chain_count.positive? && head >= first && head < meta[:page_count])
   return false if count.zero? && (!chain_count.zero? || !head.zero? || !digest.zero?)
 
-  inline = [count, (hi - lo) / 12].min
-  refs = m.byteslice(lo, inline * 12).unpack("NQ>" * inline).each_slice(2).to_a
-  return false unless m.byteslice(lo + inline * 12, hi - lo - inline * 12).bytes.all?(&:zero?)
+  inline = [count, (hi - lo) / esize].min
+  refs = m.byteslice(lo, inline * esize).unpack(entry_pack * inline).each_slice(2).to_a
+  return false unless m.byteslice(lo + inline * esize, hi - lo - inline * esize).bytes.all?(&:zero?)
   chain = []
   chain_digest = 0
   remaining = count - inline
@@ -5129,16 +5269,19 @@ def valid_manifest?(image, ps, m, meta)
   chain_count.times do |ordinal|
     return false unless page >= first && page < meta[:page_count] && !chain.include?(page)
     block = image.byteslice(page * ps, ps)
-    return false unless block.getbyte(0) == 8 && block.byteslice(1, 3) == "\x00".b * 3
+    # Header bytes 1-3: flags zero, and the stamp of the commit whose meta names the page, which always
+    # wrote it (manifest-crc32.md §2.1) -- zero without stamping, as through v52.
+    return false unless block.getbyte(0) == 8 && block.getbyte(1).zero? &&
+                        block.byteslice(2, 2).unpack1("n") == stamp_of(meta[:txid])
     return false unless page_crc(block) == block.byteslice(12, 4).unpack1("N")
     return false unless block.byteslice(16, 8).unpack1("Q>") == meta[:txid]
     return false unless block.byteslice(24, 4).unpack1("N") == ordinal
     return false unless block.byteslice(28, 4) == "\x00".b * 4
     entries = block.byteslice(4, 4).unpack1("N")
-    return false unless entries == [remaining, (ps - 32) / 12].min
-    refs.concat(block.byteslice(32, entries * 12).unpack("NQ>" * entries).each_slice(2).to_a)
-    return false unless block.byteslice(32 + entries * 12, ps - 32 - entries * 12).bytes.all?(&:zero?)
-    chain_digest = crc64(u32(page) + block, chain_digest)
+    return false unless entries == [remaining, (ps - 32) / esize].min
+    refs.concat(block.byteslice(32, entries * esize).unpack(entry_pack * entries).each_slice(2).to_a)
+    return false unless block.byteslice(32 + entries * esize, ps - 32 - entries * esize).bytes.all?(&:zero?)
+    chain_digest = chain_crc.call(u32(page) + block, chain_digest)
     chain << page
     page = block.byteslice(8, 4).unpack1("N")
     remaining -= entries
@@ -5146,17 +5289,31 @@ def valid_manifest?(image, ps, m, meta)
   return false unless page.zero? && remaining.zero? && chain_digest == digest
   ids = refs.map(&:first)
   return false unless ids == ids.sort.uniq && (ids & chain).empty?
-  return false if count.positive? && !ids.include?(meta[:root_page])
+  # A deferring commit may keep its catalog chain, so its root need not be listed (§9.4).
+  return false if count.positive? && !DEFER_INTERIOR && !ids.include?(meta[:root_page])
   return false if count.positive? && meta[:free_head].positive? && !ids.include?(meta[:free_head])
   return false unless refs.all? do |index, expected|
     next false unless index >= first && index < meta[:page_count]
     block = image.byteslice(index * ps, ps)
-    # A listed encrypted page is ciphertext: its digest is the whole check (§6).
-    (encrypted || ((1..7).cover?(block.getbyte(0)) && page_crc(block) == block.byteslice(12, 4).unpack1("N"))) &&
-      crc64(block) == expected
+    # A listed encrypted page is ciphertext: its digest is the whole check (§6), and its stamp is
+    # sealed. A plaintext page must also pass its own checksum and carry a stamp from the window.
+    next crc_of_listed(block, encrypted, narrow) == expected if encrypted
+
+    (1..7).cover?(block.getbyte(0)) && page_crc(block) == block.byteslice(12, 4).unpack1("N") &&
+      crc_of_listed(block, encrypted, narrow) == expected &&
+      stamp_in_window?(block.byteslice(2, 2).unpack1("n"), floor, meta[:txid])
   end
   meta[:protected] = ids + chain
   true
+end
+
+# The manifest identity of a listed page (manifest-crc32.md §2): the CRC-64 of its bytes in a wide
+# manifest; in a narrow one a plaintext page's own header checksum and an encrypted page's CRC-32.
+def crc_of_listed(block, encrypted, narrow)
+  return crc64(block) unless narrow
+  return Zlib.crc32(block) if encrypted
+
+  block.byteslice(12, 4).unpack1("N")
 end
 
 # Logical free-list checks follow candidate selection, like catalog decoding. They
@@ -5194,13 +5351,16 @@ def validate_free_list!(image, ps, meta)
 end
 
 def select_meta(image, ps)
-  a = read_meta(image, ps, 0)
-  b = read_meta(image, ps, 1)
-  return (b && b[:txid] > a[:txid] ? b : a) if a && b
-  return a if a
-  return b if b
-
-  raise "no valid meta page"
+  # Each candidate's stamp floor is the other slot's txid when that slot parses and is older.
+  ha = read_meta_header(image, ps, 0)
+  hb = read_meta_header(image, ps, 1)
+  a = read_meta(image, ps, 0, hb && ha && hb[:txid] < ha[:txid] ? hb[:txid] : nil)
+  b = read_meta(image, ps, 1, ha && hb && ha[:txid] < hb[:txid] ? ha[:txid] : nil)
+  selected = (a && b ? (b[:txid] > a[:txid] ? b : a) : (a || b)) or raise "no valid meta page"
+  # The selected generation's remap list is the one every interior read resolves through, so no list
+  # survives from an earlier image (deferred-interior.md §9.3).
+  install_remap(selected)
+  selected
 end
 
 def read_page(image, ps, index)
@@ -6192,13 +6352,7 @@ def read_tree_rows(image, ps, root_page, columns)
         rows << columns.each_with_index.map { |c, ci| leaf_value(regions[ci], c, i, fetch) }
       end
     when PAGE_INTERIOR
-      n = pg[:item_count]
-      pos = 0
-      children = (0..n).map do
-        cp, pos = read_ptr(pg[:payload], pos)
-        cp
-      end
-      children.each { |cp| walk.call(cp) }
+      interior_children(pg, idx).each { |child| visit_child(child, walk) }
     else
       raise "expected a B-tree node page, got type #{pg[:type]}"
     end
@@ -6224,13 +6378,7 @@ def read_tree_keys(image, ps, root_page)
       leaf_keys, = parse_pax_leaf(pg[:payload], pg[:item_count], [])
       leaf_keys.each { |kk| keys << kk }
     when PAGE_INTERIOR
-      n = pg[:item_count]
-      pos = 0
-      children = (0..n).map do
-        cp, pos = read_ptr(pg[:payload], pos)
-        cp
-      end
-      children.each { |cp| walk.call(cp) }
+      interior_children(pg, idx).each { |child| visit_child(child, walk) }
     else
       raise "expected a B-tree node page, got type #{pg[:type]}"
     end

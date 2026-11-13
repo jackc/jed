@@ -628,12 +628,13 @@ class IntegrityCheck
       case pg[:type]
       when PAGE_INTERIOR
         begin
-          children, seps = parse_interior(pg)
+          children, seps = parse_interior(pg, page)
         rescue StandardError => e
           return corrupt(page, e.message)
         end
         check_keys(page, seps, lo, hi)
-        children.each_with_index do |child, i|
+        children.each_with_index do |(child, tag), i|
+          $enc[:tags][child] = tag if $enc && !child.zero? # bound for this read (verify.rb visit_child)
           visit(child, depth + 1, i.zero? ? lo : seps[i - 1], i == seps.size ? hi : seps[i])
         end
       when PAGE_LEAF
@@ -683,14 +684,13 @@ class IntegrityCheck
                                             detail: "a key lies outside the bounds its parent gives it")
     end
 
-    def parse_interior(pg)
+    # An interior's children as [page, tag] pairs resolved through the selected meta's remap list
+    # (verify.rb interior_children; deferred-interior.md §9.3), and its separators.
+    def parse_interior(pg, page)
       n = pg[:item_count]
       payload = pg[:payload]
-      pos = 0
-      children = (0..n).map do
-        cp, pos = read_ptr(payload, pos)
-        cp
-      end
+      children = interior_children(pg, page)
+      pos = (n + 1) * ($enc ? 4 + TAG_LEN : 4)
       ends = (0...n).map do
         e, pos = take(payload, pos, 4)
         e.unpack1("N")

@@ -703,6 +703,24 @@ only by a commit that lowers the high-water against the generation it commits on
 its "shrink owed" flag across the crash. `recover` now clears it in the Go, Rust and TS runners.
 Whether recovery itself should cut such a file is a separate question this change does not raise.
 
+**The Ruby reader (2026-11-13).** `spec/fileformat/verify.rb` reads all three parts of v53 ahead of
+the version: the remap region (§9.2) with every §9.3 check, resolution at each interior read — the
+decoder's table and index walks and the integrity reference (`integrity.rb`) — the narrow manifest,
+and the stamp with the same window rule. It takes the layout from the Go core's three switches, so the
+simulator's independent checker reads what the core wrote; at v53 the version byte decides instead.
+Two details: the selected meta installs its list in `select_meta`, so no list outlives the image it
+came from; and an interior's children come back as `(page, tag)` pairs whose tag is bound just before
+the child is read, because a retained page's stale pointer may name a page number another pointer now
+uses with a different tag. With every switch off `mise run verify` is unchanged (116 file-format
+fixtures, 24 integrity fixtures). With each switch alone and all three together the regression traces
+agree with the checker (the 61 disagreements are gone), and `sim.rb sweep --seeds 1..25 --profile all
+--cores go --check-images` with all three switches re-decided 21,641 crash images, every one agreeing.
+Coverage of the list itself is thinner than that count: in a 400-image sample, 15 recoveries (about
+4%) selected a meta carrying entries. The rest folded or never deferred. **The Ruby writer is not
+taught**: it cannot yet produce a deferring commit history, so the `cow_deferred.jed` fixtures below
+are still owed, and the committed v52 `cow_*` fixtures fail `mise run verify` with the switches on (their
+inline manifests no longer fit), which the version gate will resolve.
+
 ### 9.9 What the landing change owes
 
 v53 is **one change carrying both this section and [manifest-crc32.md](manifest-crc32.md)**, so this
@@ -732,8 +750,8 @@ Beyond the three cores and `verify.rb`:
 - **A race review** of the commit path, which sets a page id on the committing snapshot's own nodes
   and swaps the resident list during planning (§6).
 - **`unassignPages`**, or its equivalent, must undo a retained interior when a plan is discarded.
-- **`verify.rb` and the Ruby reference** must read the region (§9.2–§9.3) and resolve through it,
-  which also makes the simulator's independent image checker agree again (§9.8).
+- **The Ruby writer** must produce deferring histories for the `cow_deferred.jed` fixtures; the reader
+  side is done (§9.8).
 - **The stamp's remaining surface** ([manifest-crc32.md](manifest-crc32.md) §4): give the integrity
   check and the page service's delta check a window, and change the manifest-overflow header check
   from "bytes 1–3 zero" to "flags zero, stamp equals the meta's txid" in Rust, TS and the Ruby
