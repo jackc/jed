@@ -52,9 +52,11 @@ type Inst = { op: RegexOp; x: number; y: number; ch: number };
 type RegexClass = { negated: boolean; ranges: [number, number][] };
 
 function classAdmits(c: RegexClass, cp: number): boolean {
+  const ranges = c.ranges;
   let inside = false;
-  for (const [lo, hi] of c.ranges) {
-    if (cp >= lo && cp <= hi) {
+  for (let i = 0; i < ranges.length; i++) {
+    const r = ranges[i];
+    if (cp >= r[0] && cp <= r[1]) {
       inside = true;
       break;
     }
@@ -62,11 +64,80 @@ function classAdmits(c: RegexClass, cp: number): boolean {
   return inside !== c.negated;
 }
 
+// admits reports whether class k of p admits cp.
+function admits(p: RegexProgram, k: number, cp: number): boolean {
+  if (cp >= 128) return classAdmits(p.classes[k], cp);
+  let set = p.ascii[k];
+  if (set === null) {
+    set = new Uint8Array(128);
+    for (let c = 0; c < 128; c++) set[c] = classAdmits(p.classes[k], c) ? 1 : 0;
+    p.ascii[k] = set;
+  }
+  return set[cp] === 1;
+}
+
+// The VM's instruction codes, in the order of OP_NAMES. The consuming instructions and match come
+// first: a code above OP_MATCH is followed by the epsilon-closure.
+const OP_CHAR = 0;
+const OP_ANY = 1;
+const OP_ANY_CHAR = 2;
+const OP_CLASS = 3;
+const OP_MATCH = 4;
+const OP_JMP = 5;
+const OP_SPLIT = 6;
+const OP_SAVE = 7;
+const OP_ASSERT_START = 8;
+const OP_ASSERT_END = 9;
+const OP_ASSERT_LINE_START = 10;
+const OP_ASSERT_LINE_END = 11;
+const OP_NAMES: RegexOp[] = [
+  "char",
+  "any",
+  "anyChar",
+  "class",
+  "match",
+  "jmp",
+  "split",
+  "save",
+  "assertStart",
+  "assertEnd",
+  "assertLineStart",
+  "assertLineEnd",
+  "gate",
+];
+
+// codePointsOf returns the code points of s, as iterating the string yields them.
+export function codePointsOf(s: string): number[] {
+  const out: number[] = [];
+  const n = s.length;
+  for (let i = 0; i < n; i++) {
+    const c = s.charCodeAt(i);
+    if (c >= 0xd800 && c <= 0xdbff && i + 1 < n) {
+      const d = s.charCodeAt(i + 1);
+      if (d >= 0xdc00 && d <= 0xdfff) {
+        out.push((c - 0xd800) * 0x400 + (d - 0xdc00) + 0x10000);
+        i++;
+        continue;
+      }
+    }
+    out.push(c);
+  }
+  return out;
+}
+
 // A compiled pattern: the instruction array, the class table, and the capturing-group count
 // (excluding group 0, the whole match), plus the shape of its capture-slot trees (capShape) and the
 // dedup set (RegexSeen) its searches reuse.
 export type RegexProgram = {
   insts: Inst[];
+  // The instructions again as flat arrays, which the VM reads: an OP_ code and the x, y and ch fields.
+  ops: Uint8Array;
+  xs: Int32Array;
+  ys: Int32Array;
+  chs: Int32Array;
+  // Per class, whether it admits each code point below 128 (1) or not (0), built when a search first
+  // tests the class.
+  ascii: (Uint8Array | null)[];
   classes: RegexClass[];
   ngroups: number;
   capDepth: number;
@@ -804,7 +875,32 @@ function compileRegexWrapped(
   c.pushInst({ op: "save", x: 1, y: 0, ch: 0 });
   c.pushInst({ op: "match", x: 0, y: 0, ch: 0 });
   const [capDepth, capLeafLen] = capShape(2 * (ngroups + 1));
-  return { insts: c.insts, classes: c.classes, ngroups, capDepth, capLeafLen, seen: null };
+  const insts = c.insts;
+  const ops = new Uint8Array(insts.length);
+  const xs = new Int32Array(insts.length);
+  const ys = new Int32Array(insts.length);
+  const chs = new Int32Array(insts.length);
+  for (let i = 0; i < insts.length; i++) {
+    const inst = insts[i];
+    ops[i] = OP_NAMES.indexOf(inst.op);
+    xs[i] = inst.x;
+    ys[i] = inst.y;
+    chs[i] = inst.ch;
+  }
+  const ascii = c.classes.map(() => null);
+  return {
+    insts,
+    ops,
+    xs,
+    ys,
+    chs,
+    ascii,
+    classes: c.classes,
+    ngroups,
+    capDepth,
+    capLeafLen,
+    seen: null,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -891,19 +987,29 @@ export function regexSlots(p: RegexProgram, caps: CapNode): number[] {
 // Pike VM (regex.md §4)
 // ---------------------------------------------------------------------------
 
-type Thread = { pc: number; caps: CapNode | null };
-
-// The per-position dedup set (regex.md §4): marks[pc] === generation means pc was visited at the
-// current position, so moving to the next position is an increment, not a clear. A program keeps its
-// set and reuses it across searches and rows, so a search does no setup work in proportion to the
-// program, only the states it explores, which regex_step meters (§4.2).
-export type RegexSeen = { marks: Int32Array; generation: number };
+// A program's reusable search state (regex.md §4), which it keeps across searches and rows, so a
+// search does no setup work in proportion to the program, only the states it explores, which
+// regex_step meters (§4.2).
+//
+// buf holds, for a program of n instructions: the per-position dedup marks ([0, n): marks[pc] ===
+// generation means pc was visited at the current position, so moving to the next position is an
+// increment, not a clear), the pcs of the two thread lists ([n, 2n) and [2n, 3n)), and the pcs of the
+// closure stack ([3n, 4n): one entry per split). capsA / capsB / stackCaps are the capture slots of the same threads.
+// steps counts the states explored since the last charge.
+export type RegexSeen = {
+  buf: Int32Array;
+  generation: number;
+  capsA: (CapNode | null)[];
+  capsB: (CapNode | null)[];
+  stackCaps: (CapNode | null)[];
+  steps: number;
+};
 
 // nextGeneration starts a new generation. When the counter wraps, the stale marks could alias the new
 // generation, so they are cleared.
-function nextGeneration(seen: RegexSeen): number {
+function nextGeneration(p: RegexProgram, seen: RegexSeen): number {
   if (seen.generation === 0x7fffffff) {
-    seen.marks.fill(0);
+    seen.buf.fill(0, 0, p.ops.length);
     seen.generation = 0;
   }
   return ++seen.generation;
@@ -912,8 +1018,16 @@ function nextGeneration(seen: RegexSeen): number {
 // takeSeen returns a dedup set for one call's searches, the program's own when it holds one. The
 // caller gives it back by assigning p.seen.
 function takeSeen(p: RegexProgram): RegexSeen {
-  const seen = p.seen ?? { marks: new Int32Array(p.insts.length), generation: 0 };
+  const seen = p.seen ?? {
+    buf: new Int32Array(4 * p.ops.length),
+    generation: 0,
+    capsA: [],
+    capsB: [],
+    stackCaps: [],
+    steps: 0,
+  };
   p.seen = null;
+  seen.steps = 0;
   return seen;
 }
 
@@ -984,116 +1098,146 @@ function regexSearch(
   ends: boolean[] | null = null,
 ): CapNode | null {
   const len = input.length;
-  let clist: Thread[] = [];
-  let nlist: Thread[] = [];
+  const n = p.ops.length;
+  const ops = p.ops;
+  const chs = p.chs;
+  const xs = p.xs;
+  const buf = seen.buf;
+  // The current and next thread lists: where their pcs start in buf, their capture slots, their
+  // lengths.
+  let cl = n;
+  let nl = 2 * n;
+  let ccaps = seen.capsA;
+  let ncaps = seen.capsB;
+  let cn = addThread(p, seen, cl, ccaps, 0, nextGeneration(p, seen), 0, null, start, input, gate);
+  let nn = 0;
   let matched: CapNode | null = null;
 
-  const marks = seen.marks;
-  addThread(p, clist, marks, nextGeneration(seen), 0, null, start, input, m, gate);
-
   for (let sp = start; sp <= len; sp++) {
-    const generation = nextGeneration(seen);
-    nlist.length = 0;
-    inner: for (let i = 0; i < clist.length; i++) {
-      const th = clist[i];
-      const inst = p.insts[th.pc];
-      switch (inst.op) {
-        case "char":
-          if (sp < len && input[sp] === inst.ch) {
-            addThread(p, nlist, marks, generation, th.pc + 1, th.caps, sp + 1, input, m, gate);
-          }
+    const generation = nextGeneration(p, seen);
+    nn = 0;
+    const cp = sp < len ? input[sp] : -1;
+    inner: for (let i = 0; i < cn; i++) {
+      const pc = buf[cl + i];
+      switch (ops[pc]) {
+        case OP_CHAR:
+          if (cp !== chs[pc]) continue;
           break;
-        case "any":
-          if (sp < len && input[sp] !== 0x0a) {
-            addThread(p, nlist, marks, generation, th.pc + 1, th.caps, sp + 1, input, m, gate);
-          }
+        case OP_ANY:
+          if (sp >= len || cp === 0x0a) continue;
           break;
-        case "anyChar":
-          if (sp < len) {
-            addThread(p, nlist, marks, generation, th.pc + 1, th.caps, sp + 1, input, m, gate);
-          }
+        case OP_ANY_CHAR:
+          if (sp >= len) continue;
           break;
-        case "class":
-          if (sp < len && classAdmits(p.classes[inst.x], input[sp])) {
-            addThread(p, nlist, marks, generation, th.pc + 1, th.caps, sp + 1, input, m, gate);
-          }
+        case OP_CLASS:
+          if (sp >= len || !admits(p, xs[pc], cp)) continue;
           break;
-        case "match":
-          // An ends run records the position and keeps every thread (regex.md §8f).
+        default:
+          // match. An ends run records the position and keeps every thread (regex.md §8f).
           if (ends !== null) {
             ends[sp] = true;
-            break;
+            continue;
           }
-          matched = th.caps;
+          matched = ccaps[i];
           break inner; // cut lower-priority threads (leftmost-first, regex.md §4)
       }
+      nn = addThread(p, seen, nl, ncaps, nn, generation, pc + 1, ccaps[i], sp + 1, input, gate);
     }
-    const tmp = clist;
-    clist = nlist;
-    nlist = tmp;
+    const tl = cl;
+    cl = nl;
+    nl = tl;
+    const tc = ccaps;
+    ccaps = ncaps;
+    ncaps = tc;
+    cn = nn;
+    if (seen.steps > 0) {
+      m.charge(BigInt(seen.steps) * COSTS.regexStep);
+      seen.steps = 0;
+    }
     m.guard(); // §6 ceiling, once per input position
-    if (clist.length === 0) break;
+    if (cn === 0) break;
   }
   return matched;
 }
 
-// addThread performs the epsilon-closure: follow jmp/split/save/assert from pc, appending
-// consuming/match threads to `list`, deduping by pc within this generation. Iterative (explicit
-// stack) so a long jmp/split chain cannot overflow the native stack; the y arm of a split is pushed
-// before x so x is processed first (higher priority). Charges regex_step per explored state.
+// addThread performs the epsilon-closure: follow jmp/split/save/assert from pc0, appending
+// consuming/match threads to the list whose pcs start at buf[list] and whose capture slots are caps
+// (count threads so far; the new count is returned), deduping by pc within this generation. Iterative
+// (explicit stack) so a long jmp/split chain cannot overflow the native stack; the y arm of a split
+// waits on the stack while x is followed first (higher priority). Counts one regex_step per explored state
+// in seen.steps, which the search charges before its next guard.
 function addThread(
   p: RegexProgram,
-  list: Thread[],
-  marks: Int32Array,
+  seen: RegexSeen,
+  list: number,
+  caps: (CapNode | null)[],
+  count: number,
   generation: number,
   pc0: number,
   caps0: CapNode | null,
   sp: number,
   input: number[],
-  m: Meter,
   gate: boolean[] | null,
-): void {
+): number {
   const len = input.length;
-  const stack: Thread[] = [{ pc: pc0, caps: caps0 }];
-  while (stack.length > 0) {
-    const top = stack.pop() as Thread;
-    if (marks[top.pc] === generation) continue;
-    marks[top.pc] = generation;
-    m.charge(COSTS.regexStep);
-    const inst = p.insts[top.pc];
-    switch (inst.op) {
-      case "jmp":
-        stack.push({ pc: inst.x, caps: top.caps });
-        break;
-      case "split":
-        // Push y first, then x, so x pops first = higher priority.
-        stack.push({ pc: inst.y, caps: top.caps });
-        stack.push({ pc: inst.x, caps: top.caps });
-        break;
-      case "save":
-        stack.push({ pc: top.pc + 1, caps: withSlot(p, top.caps, inst.x, sp) });
-        break;
-      case "assertStart":
-        if (sp === 0) stack.push({ pc: top.pc + 1, caps: top.caps });
-        break;
-      case "assertEnd":
-        if (sp === len) stack.push({ pc: top.pc + 1, caps: top.caps });
-        break;
-      case "assertLineStart":
-        if (sp === 0 || input[sp - 1] === 0x0a) stack.push({ pc: top.pc + 1, caps: top.caps });
-        break;
-      case "assertLineEnd":
-        if (sp === len || input[sp] === 0x0a) stack.push({ pc: top.pc + 1, caps: top.caps });
-        break;
-      case "gate":
-        if (gate?.[sp]) stack.push({ pc: top.pc + 1, caps: top.caps });
-        break;
-      default:
+  const ops = p.ops;
+  const buf = seen.buf;
+  const scaps = seen.stackCaps;
+  const stack = 3 * ops.length;
+  let steps = 0;
+  let depth = 0;
+  let pc = pc0;
+  let c = caps0;
+  for (;;) {
+    // Follow the chain from pc until it reaches a state already visited or a thread to park, then
+    // take the next pending split arm.
+    while (buf[pc] !== generation) {
+      buf[pc] = generation;
+      steps++;
+      const op = ops[pc];
+      if (op <= OP_MATCH) {
         // char / any / class / match — parked for the consume loop.
-        list.push(top);
+        buf[list + count] = pc;
+        caps[count] = c;
+        count++;
         break;
+      }
+      if (op === OP_JMP) {
+        pc = p.xs[pc];
+      } else if (op === OP_SPLIT) {
+        // The y arm waits on the stack while x, the higher priority, is followed first.
+        buf[stack + depth] = p.ys[pc];
+        scaps[depth] = c;
+        depth++;
+        pc = p.xs[pc];
+      } else if (op === OP_SAVE) {
+        c = withSlot(p, c, p.xs[pc], sp);
+        pc++;
+      } else if (op === OP_ASSERT_START) {
+        if (sp !== 0) break;
+        pc++;
+      } else if (op === OP_ASSERT_END) {
+        if (sp !== len) break;
+        pc++;
+      } else if (op === OP_ASSERT_LINE_START) {
+        if (sp !== 0 && input[sp - 1] !== 0x0a) break;
+        pc++;
+      } else if (op === OP_ASSERT_LINE_END) {
+        if (sp !== len && input[sp] !== 0x0a) break;
+        pc++;
+      } else {
+        // gate
+        if (!gate?.[sp]) break;
+        pc++;
+      }
     }
+    if (depth === 0) break;
+    depth--;
+    pc = buf[stack + depth];
+    c = scaps[depth];
   }
+  seen.steps += steps;
+  return count;
 }
 
 // replaceMatches finds the matches regexp_replace(source, pattern, replacement, …) (regex.md §8)

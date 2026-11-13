@@ -248,6 +248,7 @@ import {
   compileSimilarMatcher,
   cpSlice,
   foldRegexPattern,
+  codePointsOf,
   regexIsMatch,
   regexNinst,
   regexpCount,
@@ -1593,7 +1594,7 @@ function* evalRegexNodeSteps(e: Of<"regex">, row: Row, env: EvalEnv, m: Meter): 
   // §16). The constant pattern was folded at resolve; a non-constant pattern is folded below.
   const prop = e.insensitive ? env.environment.property() : undefined;
   const sub = e.insensitive ? foldLowerSimple(subject.text, prop) : subject.text;
-  const subjCps = Array.from(sub, (c) => c.codePointAt(0) as number);
+  const subjCps = codePointsOf(sub);
   let matched: boolean;
   if (e.program !== null) {
     // Constant precompiled pattern: charge its regex_compile cost ONCE per statement execution
@@ -1639,7 +1640,7 @@ function similarSubstring(e: Of<"regexFunc">, vals: Value[], m: Meter): Value {
     m.guard();
   }
   if (subject.kind !== "text") return nullValue();
-  const cps = Array.from(subject.text, (c) => c.codePointAt(0) as number);
+  const cps = codePointsOf(subject.text);
   const span = similarSubstringSpan(sm, cps, m);
   return span === null ? nullValue() : textValue(cpSlice(cps, span[0], span[1]));
 }
@@ -1745,11 +1746,9 @@ function* evalRegexFuncNodeSteps(
   }
   // The original-case subject (for output/captures) and the matched subject (folded when
   // case-insensitive — same length, so offsets carry over, regex.md §8).
-  const origCps = Array.from(source, (ch) => ch.codePointAt(0) as number);
+  const origCps = codePointsOf(source);
   const prop = insensitive ? env.environment.property() : undefined;
-  const matchCps = insensitive
-    ? Array.from(foldLowerSimple(source, prop), (ch) => ch.codePointAt(0) as number)
-    : origCps;
+  const matchCps = insensitive ? codePointsOf(foldLowerSimple(source, prop)) : origCps;
   let prog: RegexProgram;
   if (e.program !== null) {
     if (!e.compileCharged) {
@@ -1769,7 +1768,7 @@ function* evalRegexFuncNodeSteps(
   const start0 = Math.min(start - 1, matchCps.length + 1);
   switch (e.func) {
     case "replace": {
-      const repl = Array.from(replacement, (ch) => ch.codePointAt(0) as number);
+      const repl = codePointsOf(replacement);
       return {
         kind: "text",
         text: regexpReplaceText(prog, matchCps, origCps, repl, global, m),

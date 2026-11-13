@@ -1664,8 +1664,102 @@ function forRangeAddValue(r: ForRange, ty: ColType, w: number, v: Value): void {
 
 // forRangeAddElems adds the elements (unsigned big-endian bodies of width w) in body[at, end).
 function forRangeAddElems(r: ForRange, body: Uint8Array, at: number, end: number, w: number): void {
-  if (w <= 4) for (let p = at; p < end; p += w) forRangeAddN(r, beUintN(body, p, w));
-  else for (let p = at; p < end; p += w) forRangeAdd(r, beUint(body, p, w));
+  if (w <= 4) {
+    for (let p = at; p < end; p += w) forRangeAddN(r, beUintN(body, p, w));
+    return;
+  }
+  if (at >= end) return;
+  // The least and greatest elements are found as (high, low 32 bits) number pairs.
+  const hw = w - 4;
+  let loH = beUintN(body, at, hw);
+  let loL = beUintN(body, at + hw, 4);
+  let hiH = loH;
+  let hiL = loL;
+  for (let p = at + w; p < end; p += w) {
+    const h = beUintN(body, p, hw);
+    const l = beUintN(body, p + hw, 4);
+    if (h < loH || (h === loH && l < loL)) {
+      loH = h;
+      loL = l;
+    } else if (h > hiH || (h === hiH && l > hiL)) {
+      hiH = h;
+      hiL = l;
+    }
+  }
+  forRangeAdd(r, (BigInt(loH) << 32n) | BigInt(loL));
+  if (hiH !== loH || hiL !== loL) forRangeAdd(r, (BigInt(hiH) << 32n) | BigInt(hiL));
+}
+
+// arrAccPacked adds to a the values of a packed-array region r that lazy still names (its entries
+// at or above 0), read from the packed elements with no value rebuilt. False, with a untouched, when
+// it does not apply: elements wider than 24 bits, or rows out of page order.
+function arrAccPacked(
+  a: ItemAcc,
+  payload: Uint8Array,
+  r: ArrRegion,
+  n: number,
+  lazy: number[],
+): boolean {
+  const bits = r.bits;
+  if (bits > 24) return false;
+  const mask = 2 ** bits - 1;
+  let empties = 0;
+  let arrays = 0;
+  let elems = 0;
+  let lo = mask;
+  let hi = 0;
+  let next = 0; // the page row the cursor is at
+  let bit = r.data * 8; // and where its elements start
+  for (let i = 0; i < lazy.length; i++) {
+    const at = lazy[i]!;
+    if (at < 0) continue;
+    if (at < next) return false;
+    for (; next < at; next++) {
+      const skip = payload[r.counts + next]!;
+      if (skip !== 255) bit += skip * bits;
+    }
+    const cnt = payload[r.counts + at]!;
+    next = at + 1;
+    if (cnt === 255) continue;
+    if (cnt === 0) {
+      empties++;
+      continue;
+    }
+    arrays++;
+    elems += cnt;
+    if (bits === 0) {
+      lo = 0;
+      continue;
+    }
+    for (let e = 0; e < cnt; e++) {
+      const p = bit >> 3;
+      const word =
+        ((payload[p]! << 24) |
+          (payload[p + 1]! << 16) |
+          (payload[p + 2]! << 8) |
+          payload[p + 3]!) >>>
+        0;
+      const v = (word >>> (32 - bits - (bit & 7))) & mask;
+      if (v < lo) lo = v;
+      if (v > hi) hi = v;
+      bit += bits;
+    }
+  }
+  a.empties += empties;
+  a.arrays += arrays;
+  a.elems += elems;
+  if (arrays === 0) return true;
+  const w = r.w;
+  if (w <= 4) {
+    const base = beUintN(payload, r.counts + n, w);
+    forRangeAddN(a.r, base + lo);
+    forRangeAddN(a.r, base + hi);
+  } else {
+    const base = beUint(payload, r.counts + n, w);
+    forRangeAdd(a.r, base + BigInt(lo));
+    forRangeAdd(a.r, base + BigInt(hi));
+  }
+  return true;
 }
 
 // forRangeBw is the offset width of a base-plus-offsets column of width w over this range.
@@ -2145,11 +2239,15 @@ class TableLeafSizer implements LeafSizer {
     const byCode = reg.kind === "var" && reg.codes >= 0 && ic.arrW === 0;
     const counts = byCode ? new Array<number>(256).fill(0) : null;
     const sp: Span = { buf: payload, start: 0, end: 0 };
+    const packed =
+      reg.kind === "arr" && reg.w === ic.arrW && arrAccPacked(acc, payload, reg, d.n, lazy);
     for (let i = 0; i < lazy.length; i++) {
       const at = lazy[i]!;
       if (at < 0) {
         this.classify(n.keys[i]!, n.vals[i]!, cap, this.scratch, memo);
         this.addItem(acc, ic.arrW, this.scratch[j]!);
+      } else if (packed) {
+        // arrAccPacked added the row.
       } else if (counts !== null) {
         counts[payload[(reg as VarRegion).codes + at]!]!++;
       } else {
@@ -8029,18 +8127,45 @@ function paxSearchPrefixed(
 ): { index: number; found: boolean } {
   const prefix = d.prefix!;
   const kp = prefix.length;
-  const head = key.length < kp ? key : key.subarray(0, kp);
-  const c = compareBytes(head, prefix);
-  // The probe differs from every key within the prefix: it sorts before all of them or after.
-  if (c !== 0) return { index: c < 0 ? 0 : d.n, found: false };
-  const rest = key.subarray(kp);
+  const klen = key.length;
+  const head = klen < kp ? klen : kp;
+  for (let i = 0; i < head; i++) {
+    const a = key[i]!;
+    const b = prefix[i]!;
+    // The probe differs from every key within the prefix: it sorts before all of them or after.
+    if (a !== b) return { index: a < b ? 0 : d.n, found: false };
+  }
+  if (klen < kp) return { index: 0, found: false };
+  // Each stored suffix is compared in place with the probe's bytes after the prefix.
+  const restLen = klen - kp;
+  const fixed = d.keyLen > 0 ? d.keyLen - kp : 0;
   let lo = 0;
   let hi = d.n;
   while (lo < hi) {
     const mid = (lo + hi) >> 1;
-    const suf = payload.subarray(paxSuffixLo(payload, d, mid), paxSuffixHi(payload, d, mid));
-    const cmp = compareBytes(suf, rest);
-    if (cmp === 0) return { index: mid, found: true };
+    let at: number;
+    let len: number;
+    if (fixed > 0) {
+      at = d.keyBlob + mid * fixed;
+      len = fixed;
+    } else {
+      at = paxSuffixLo(payload, d, mid);
+      len = paxSuffixHi(payload, d, mid) - at;
+    }
+    const m = len < restLen ? len : restLen;
+    let cmp = 0;
+    for (let i = 0; i < m; i++) {
+      const a = payload[at + i]!;
+      const b = key[kp + i]!;
+      if (a !== b) {
+        cmp = a < b ? -1 : 1;
+        break;
+      }
+    }
+    if (cmp === 0) {
+      if (len === restLen) return { index: mid, found: true };
+      cmp = len < restLen ? -1 : 1;
+    }
     if (cmp < 0) lo = mid + 1;
     else hi = mid;
   }
