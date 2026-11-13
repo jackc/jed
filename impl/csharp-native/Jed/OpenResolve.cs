@@ -22,7 +22,14 @@ internal static class OpenResolve
         if (expression.Text == "width_bucket" && expression.Args.Length == 2)
         {
             var thresholds = Resolve.Expr(expression.Args[1]);
+            if (thresholds.Type == SqlType.Unknown || expression.Args[1].Op == "text")
+            {
+                var sibling = Resolve.Expr(expression.Args[0]);
+                if (sibling.Type == SqlType.Unknown) throw new SqlException(SqlStates.IndeterminateDatatype, "cannot determine threshold element type");
+                thresholds = Resolve.Expr(expression.Args[1], SqlType.Array(sibling.Type));
+            }
             if (thresholds.Type.Kind != SqlKind.Array) throw Undefined();
+            try { Resolve.RequireOrderable(thresholds.Type.Element!); } catch (SqlException) { throw Undefined(); }
             var value = Resolve.Expr(expression.Args[0], thresholds.Type.Element);
             try { _ = Resolve.Common(value.Type, thresholds.Type.Element!); } catch (SqlException) { throw Undefined(); }
             result = Call("width_bucket_array", SqlType.I32, [value, thresholds], "propagates"); return true;
@@ -47,7 +54,10 @@ internal static class OpenResolve
                 var family = fact.Families[i];
                 if (family is "anyarray" or "anycompatiblearray")
                 {
-                    if (resolved[i].Type.Kind == SqlKind.Array && resolved[i].Type.Element == SqlType.Text && hint != SqlType.Text) throw Undefined();
+                    if (resolved[i].Type.Kind == SqlKind.Array)
+                    {
+                        try { _ = Resolve.Common(resolved[i].Type.Element!, hint); } catch (SqlException) { throw Undefined(); }
+                    }
                     resolved[i] = Resolve.Adapt(expression.Args[i], resolved[i], SqlType.Array(hint));
                 }
                 else if (family is "anyelement" or "anycompatible") resolved[i] = Resolve.Adapt(expression.Args[i], resolved[i], hint);

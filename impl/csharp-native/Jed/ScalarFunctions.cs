@@ -7,6 +7,17 @@ internal static class ScalarFunctions
 {
     internal static SqlValue Call(string name, SqlValue[] args, SqlType result, Meter meter)
     {
+        if (name == "current_setting")
+        {
+            if (args.Any(argument => argument.IsNull)) return SqlValue.Null(SqlType.Text);
+            var key = Session.VariableName(args[0].AsText());
+            if (meter.Variables.TryGetValue(key, out var value)) return SqlValue.Text(value);
+            if (args.Length == 2 && args[1].AsBoolean()) return SqlValue.Null(SqlType.Text);
+            throw new SqlException("42704", "unrecognized configuration parameter: " + key);
+        }
+        if (name is "uuidv4" or "gen_random_uuid" or "uuidv7" or "uuid_extract_version" or "uuid_extract_timestamp") return UuidFunctions.Call(name, args, meter);
+        if (name == "format") return TextFormat.Format(args, meter);
+        if (name == "similar_to_escape") return SqlValue.Text(SimilarPattern.Translate(args[0].AsText(), args.Length == 2 ? args[1].AsText() : "\\").Text);
         if (name is "nextval" or "currval" or "setval" or "lastval") return meter.Sequences.Call(name, args);
         if (name == "to_char" && args[0].Type.Kind is SqlKind.Timestamp or SqlKind.Timestamptz or SqlKind.Interval)
             return DateTimeFormat.Render(args[0], args[1].AsText(), meter);
@@ -18,7 +29,7 @@ internal static class ScalarFunctions
         if (OpenFunctions.TryCall(name, args, result, meter, out var open)) return open;
         if (TemporalFunctions.TryCall(name, args, meter, out var temporal)) return temporal;
         if (name == "pi") return SqlValue.Float(FloatValue.Pi);
-        if (args.Length > 0 && args[0].Type.IsFloat())
+        if (args.Length > 0 && args[0].Type.IsFloat() && (result.IsFloat() || name == "width_bucket"))
         {
             var floating = args[0].AsFloat();
             if (name == "width_bucket") return SqlValue.Integer(FloatValue.WidthBucket(floating, args[1].AsFloat(), args[2].AsFloat(), args[3].AsInteger()), SqlType.I32);
@@ -40,9 +51,9 @@ internal static class ScalarFunctions
             if (name == "concat_ws" && args[0].IsNull) return SqlValue.Null(SqlType.Text);
             var separator = name == "concat_ws" ? args[0].AsText() : "";
             var selected = args.Skip(name == "concat_ws" ? 1 : 0).Where(v => !v.IsNull).ToArray();
-            var output = string.Join(separator, selected.Select(v => v.Type == SqlType.Boolean ? v.AsBoolean() ? "t" : "f" : TemporalRender.CastText(v, meter)));
-            meter.Charge(TextEncoding.ByteCount(output)); meter.Guard();
-            return SqlValue.Text(output);
+            var rendered = selected.Select(v => v.Type == SqlType.Boolean ? v.AsBoolean() ? "t" : "f" : TemporalRender.CastText(v, meter)).ToArray();
+            if (name == "concat_ws") meter.ScalarOutput(rendered.Sum(text => (long)TextEncoding.ByteCount(text)) + Math.Max(0, rendered.Length - 1) * (long)TextEncoding.ByteCount(separator));
+            return SqlValue.Text(string.Join(separator, rendered));
         }
         if (name == "abs")
         {
@@ -94,7 +105,7 @@ internal static class ScalarFunctions
                 "set_byte" => SqlValue.OwnedBytes(Bytea.SetByte(bytes, args[1].AsInteger(), args[2].AsInteger())),
                 "set_bit" => SqlValue.OwnedBytes(Bytea.SetBit(bytes, args[1].AsInteger(), args[2].AsInteger())),
                 "position" => SqlValue.Integer(Bytea.Position(bytes, args[1].ByteSpan), SqlType.I32),
-                "btrim" => SqlValue.OwnedBytes(Bytea.Trim(bytes, args[1].ByteSpan)),
+                "btrim" or "ltrim" or "rtrim" => SqlValue.OwnedBytes(Bytea.Trim(bytes, args[1].ByteSpan, name != "rtrim", name != "ltrim")),
                 "overlay" => SqlValue.OwnedBytes(Bytea.Overlay(bytes, args[1].ByteSpan, args[2].AsInteger(), args.Length == 4 ? args[3].AsInteger() : null)),
                 _ => throw Errors.Unsupported($"bytea function {name}")
             };

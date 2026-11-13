@@ -64,12 +64,13 @@ internal static class StorageLargeValuesTests
             var replacement = originalValues!; replacement[0] = SqlValue.Integer(6, SqlType.I32);
             await session.ExecuteAsync(session.Prepare("INSERT INTO t VALUES ($1, $2, $3)"), replacement);
             Corpus.Equal(replacement[1].AsText(), await DatabaseFileTests.Scalar(session, "SELECT body FROM t WHERE id=6"), "freshly allocated chain roundtrip through lazy SQL");
-            uint freshHead;
+            uint freshHead; bool residentPayload;
             using (var snapshot = database.Pin())
             {
                 var table = snapshot.Snapshot.Catalog.Tables.Single(); var tree = database.Tree(table, null, snapshot.Snapshot);
                 var record = await tree.FindAsync(KeyEncoding.Integer(6, 4));
                 freshHead = StorageLargeValues.External(record!.Cells[1]) ? BinaryPrimitives.ReadUInt32BigEndian(record.Cells[1]!.AsSpan(1)) : 0;
+                residentPayload = record.FreshChains?[1] is not null;
                 Corpus.Equal(snapshot.Snapshot.Meta.LivePages, checked((uint)(snapshot.Snapshot.Catalog.Pages.Length + await tree.CountPagesAsync())), "fresh chain exact live-page count");
             }
             await DatabaseFileTests.Exec(session, "UPDATE t SET id=9 WHERE id=6");
@@ -77,7 +78,12 @@ internal static class StorageLargeValuesTests
             {
                 var table = snapshot.Snapshot.Catalog.Tables.Single(); var tree = database.Tree(table, null, snapshot.Snapshot);
                 var record = await tree.FindAsync(KeyEncoding.Integer(9, 4));
-                if (freshHead != 0) Corpus.Equal(freshHead, BinaryPrimitives.ReadUInt32BigEndian(record!.Cells[1]!.AsSpan(1)), "rekey preserves unassigned chain and cancels its retirement");
+                if (freshHead != 0)
+                {
+                    var nextHead = BinaryPrimitives.ReadUInt32BigEndian(record!.Cells[1]!.AsSpan(1));
+                    if (residentPayload) Corpus.Equal(false, freshHead == nextHead, "single-leaf resident payload rewrites its chain on rekey");
+                    else Corpus.Equal(freshHead, nextHead, "deferred unassigned chain survives rekey and cancels its retirement");
+                }
                 Corpus.Equal(snapshot.Snapshot.Meta.LivePages, checked((uint)(snapshot.Snapshot.Catalog.Pages.Length + await tree.CountPagesAsync())), "rekey exact live-page count");
             }
         }

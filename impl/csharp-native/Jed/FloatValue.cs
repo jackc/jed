@@ -92,7 +92,7 @@ internal static class FloatValue
 
     internal static double Unary(string function, double value)
     {
-        if (double.IsNaN(value)) return value;
+        if (double.IsNaN(value)) return function == "sign" ? 0 : value;
         switch (function)
         {
             case "abs": return Math.Abs(value);

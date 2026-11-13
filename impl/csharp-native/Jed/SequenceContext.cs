@@ -15,9 +15,28 @@ internal sealed class SequenceContext(SequenceState state, Meter meter)
     private PendingDatabase? pending;
     internal SequenceState State { get; } = state;
     internal void Bind(Catalog catalog, PendingDatabase? write = null) { snapshot = catalog; pending = write; }
+    internal IDisposable PushBinding(Catalog catalog, PendingDatabase? write)
+    {
+        var restore = new Binding(this, snapshot, pending); Bind(catalog, write); return restore;
+    }
+    private sealed class Binding(SequenceContext context, Catalog catalog, PendingDatabase? write) : IDisposable
+    {
+        public void Dispose() => context.Bind(catalog, write);
+    }
     internal static string Name(string text)
     {
         text = text.Trim();
+        var quoted = false;
+        for (var index = 0; index < text.Length; index++)
+        {
+            if (text[index] == '"')
+            {
+                if (quoted && index + 1 < text.Length && text[index + 1] == '"') { index++; continue; }
+                quoted = !quoted;
+            }
+            else if (!quoted && text[index] == '.')
+                return DatabaseDomains.Qualified(Name(text[..index]), Name(text[(index + 1)..]));
+        }
         if (text.Length == 0) throw new SqlException(SqlStates.InvalidName, "invalid sequence name");
         if (text[0] == '"')
         {
@@ -41,12 +60,18 @@ internal sealed class SequenceContext(SequenceState state, Meter meter)
         if (arguments.Any(value => value.IsNull)) return SqlValue.Null(SqlType.I64);
         if (operation == "lastval") return SqlValue.Integer(State.Last is { } last && State.Current.TryGetValue(last, out var lastValue) ? lastValue :
             throw new SqlException(SqlStates.ObjectNotInPrerequisiteState, "lastval is not defined"), SqlType.I64);
-        var name = Name(arguments[0].AsText()); var catalog = pending?.Catalog ?? snapshot;
+        var name = Name(arguments[0].AsText()); var catalog = pending?.Catalog ?? snapshot; var write = pending; var stateName = name;
+        if (snapshot.Scope is { } domains)
+        {
+            var domain = domains.Resolve(name); name = DatabaseDomains.Name(name).Local;
+            catalog = domain.Catalog; write = domain.Pending;
+            stateName = domain.Name == "main" ? name : DatabaseDomains.Qualified(domain.Name, name);
+        }
         var sequence = (catalog.Sequences ?? []).FirstOrDefault(sequence => sequence.Name == name)
             ?? throw new SqlException(SqlStates.UndefinedTable, "sequence does not exist");
-        if (operation == "currval") return SqlValue.Integer(State.Current.TryGetValue(name, out var current) ? current :
+        if (operation == "currval") return SqlValue.Integer(State.Current.TryGetValue(stateName, out var current) ? current :
             throw new SqlException(SqlStates.ObjectNotInPrerequisiteState, "currval is not defined"), SqlType.I64);
-        if (pending is null) throw new SqlException(SqlStates.ReadOnlySqlTransaction, "sequence mutation requires a writable statement");
+        if (write is null) throw new SqlException(SqlStates.ReadOnlySqlTransaction, "sequence mutation requires a writable statement");
         meter.Charge(Costs.SequenceAdvance); meter.Checkpoint();
         long value; var called = true;
         if (operation == "setval")
@@ -65,10 +90,10 @@ internal sealed class SequenceContext(SequenceState state, Meter meter)
             value = (long)next;
         }
         var updated = sequence with { LastValue = value, IsCalled = called };
-        pending.Catalog = pending.Catalog with { Sequences = (pending.Catalog.Sequences ?? []).Select(sequence => sequence.Name == name ? updated : sequence).ToArray() };
-        pending.Changed = true;
-        if (called) State.Current[name] = value;
-        if (operation == "nextval") State.Last = name;
+        write.Catalog = write.Catalog with { Sequences = (write.Catalog.Sequences ?? []).Select(sequence => sequence.Name == name ? updated : sequence).ToArray() };
+        write.Changed = true;
+        if (called) State.Current[stateName] = value;
+        if (operation == "nextval") State.Last = stateName;
         return SqlValue.Integer(value, SqlType.I64);
     }
 }

@@ -1,0 +1,5 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#MISE description="Explicit opt-in: native C# simulated filesystem and recovery invariants"
+require_relative "../../impl/csharp-native/Tools/tasks"
+CSharpNativeTasks.check("simulation-host")

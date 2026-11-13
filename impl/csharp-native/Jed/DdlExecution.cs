@@ -47,6 +47,8 @@ internal static partial class StatementExecution
     {
         column = column with { IntervalFields = column.Type.IntervalFields };
         if (expression is null) return column with { Default = null, DefaultExpression = null };
+        if (expression.Op == "text" && column.Type.Type == SqlType.Date && TemporalText.IsClockDate(expression.Text))
+            return column with { Default = null, DefaultExpression = text ?? throw new InvalidOperationException("missing persisted default text") };
         expression = Resolve.BindTypes(expression, catalog, meter.Temporal);
         ValidateStoredExpression(expression, isDefault: true);
         if (expression.Op == "text" && (column.Type.Type.IsNumeric() || column.Type.Type == SqlType.Boolean)) throw Errors.Type("cross-family literal DEFAULT");
@@ -55,9 +57,11 @@ internal static partial class StatementExecution
         var resolved = Resolve.Expr(expression, column.Type.Type); Assignable(resolved.Type, column.Type.Type);
         return column with { Default = null, DefaultExpression = text ?? throw new InvalidOperationException("missing persisted default text") };
     }
-    private static void Assignable(SqlType source, SqlType target)
+    internal static void Assignable(SqlType source, SqlType target)
     {
-        if (source != target && source != SqlType.Unknown && !(source == SqlType.F32 && target == SqlType.F64) && !(source.IsInteger() && (target.IsInteger() || target == SqlType.Decimal)))
+        if (source != target && source != SqlType.Unknown && !(source == SqlType.F32 && target == SqlType.F64) &&
+            !(source == SqlType.Jsonb && target == SqlType.Json) &&
+            !(source.IsInteger() && (target.IsInteger() || target == SqlType.Decimal)))
             throw Errors.Type($"cannot assign {source.Name()} to {target.Name()}");
     }
     private static Expression StoredExpression(string text)
@@ -70,6 +74,7 @@ internal static partial class StatementExecution
 
     private static StatementResult CreateType(PendingDatabase pending, CreateTypeSyntax create)
     {
+        if (create.Name.StartsWith("jed_", StringComparison.Ordinal)) throw new SqlException(SqlStates.ReservedName, "reserved type name");
         if ((pending.Catalog.Types ?? []).Any(type => type.Name == create.Name)) throw new SqlException(SqlStates.DuplicateObject, "type already exists");
         var names = new HashSet<string>(StringComparer.Ordinal); var fields = new List<CatalogField>();
         foreach (var field in create.Fields)
@@ -90,7 +95,8 @@ internal static partial class StatementExecution
             throw new SqlException(SqlStates.UndefinedObject, "type does not exist");
         }
         if ((pending.Catalog.Types ?? []).Any(type => type.Fields.Any(field => ReferencesType(field.Type.Type, drop.Name))) ||
-            pending.Catalog.Tables.Any(table => table.Columns.Any(column => ReferencesType(column.Type.Type, drop.Name))))
+            pending.Catalog.Tables.Any(table => table.Columns.Any(column => ReferencesType(column.Type.Type, drop.Name))) ||
+            pending.Catalog.Scope is { } scope && scope.Get("temp").Catalog.Tables.Any(table => table.Columns.Any(column => ReferencesType(column.Type.Type, drop.Name))))
         {
             if (drop.Cascade) throw Errors.Unsupported("DROP TYPE CASCADE with stored dependents");
             throw new SqlException(SqlStates.DependentObjectsStillExist, "type has dependents");
@@ -102,11 +108,13 @@ internal static partial class StatementExecution
 
     private static StatementResult CreateTable(PendingDatabase pending, CreateTableSyntax create, Meter meter)
     {
+        if (create.Name.StartsWith("jed_", StringComparison.Ordinal)) throw new SqlException(SqlStates.ReservedName, "reserved table name");
         if (RelationExists(pending.Catalog, create.Name))
         {
             if (create.IfNotExists) return new([], []);
             throw new SqlException(SqlStates.DuplicateTable, "relation already exists");
         }
+        if (create.OnCommit >= 128) throw new SqlException(SqlStates.InvalidTableDefinition, "ON COMMIT requires a temporary table");
         var names = new HashSet<string>(StringComparer.Ordinal); var columns = new List<CatalogColumn>();
         foreach (var column in create.Columns)
         {
@@ -152,11 +160,18 @@ internal static partial class StatementExecution
             var resolved = Resolve.Expr(Resolve.Bind(Resolve.BindTypes(definition.Expression!, catalog, meter.Temporal), Columns(table)));
             if (resolved.Type.Kind is not (SqlKind.Boolean or SqlKind.Unknown)) throw Errors.Type("CHECK must be boolean");
         }
-        var checks = (table.Checks ?? []).ToList(); var indexes = (table.Indexes ?? []).ToList(); var foreignKeys = (table.ForeignKeys ?? []).ToList();
+        var checks = (table.Checks ?? []).ToList(); var indexes = (table.Indexes ?? []).ToList(); var foreignKeys = (table.ForeignKeys ?? []).ToList(); var exclusions = (table.Exclusions ?? []).ToList();
         var names = ConstraintNames(table).ToHashSet(StringComparer.Ordinal);
         var globalNames = catalog.Tables.SelectMany(ConstraintNames).ToHashSet(StringComparer.Ordinal); globalNames.UnionWith(names);
         foreach (var definition in definitions.Where(d => d.Kind != "primary"))
         {
+            if (definition.Exclusion is { } excluded)
+            {
+                if (catalog.TypeParent is not null) throw Errors.Unsupported("exclusion constraint on temporary table");
+                if (excluded.Method == "gin") throw Errors.Unsupported("GIN does not support exclusion constraints");
+                if (excluded.Method is not ("btree" or "gist")) throw new SqlException(SqlStates.UndefinedObject, "unknown exclusion access method");
+                if (excluded.Elements.Any(element => element.Op != "name" || element.Text.Contains('.'))) throw Errors.Unsupported("exclusion elements must be bare columns");
+            }
             var ordinals = definition.Kind == "check" ? [] : definition.Columns.Select(c => ColumnIndex(table, c)).ToArray();
             string label; string part;
             if (definition.Kind == "check")
@@ -164,9 +179,9 @@ internal static partial class StatementExecution
                 var used = ExpressionNodes(definition.Expression!).Where(e => e.Op == "name").Select(e => e.Text.Split('.')[^1]).Distinct(StringComparer.Ordinal).ToArray();
                 part = used.Length == 1 ? used[0] : ""; label = "check";
             }
-            else { part = string.Join('_', definition.Columns); label = definition.Kind == "unique" ? "key" : "fkey"; }
-            var name = definition.Name ?? GeneratedName(table.Name, part, label, candidate => globalNames.Contains(candidate) || definition.Kind == "unique" && (RelationExists(catalog, candidate) || indexes.Any(i => i.Name == candidate)));
-            if (definition.Kind == "unique" && (name == table.Name || RelationExists(catalog, name) || indexes.Any(index => index.Name == name)))
+            else { part = string.Join('_', definition.Columns); label = definition.Kind == "unique" ? "key" : definition.Kind == "exclude" ? "excl" : "fkey"; }
+            var name = definition.Name ?? GeneratedName(table.Name, part, label, candidate => globalNames.Contains(candidate) || definition.Kind is "unique" or "exclude" && (RelationExists(catalog, candidate) || indexes.Any(i => i.Name == candidate)));
+            if (definition.Kind is "unique" or "exclude" && (name == table.Name || RelationExists(catalog, name) || indexes.Any(index => index.Name == name)))
                 throw new SqlException(SqlStates.DuplicateTable, "relation already exists");
             if (!names.Add(name)) throw new SqlException(SqlStates.DuplicateObject, "duplicate constraint name");
             globalNames.Add(name);
@@ -178,6 +193,39 @@ internal static partial class StatementExecution
                     foreach (var ordinal in ordinals) Keyable(table.Columns[ordinal].Type.Type);
                     if (RelationExists(catalog, name) || indexes.Any(index => index.Name == name)) throw new SqlException(SqlStates.DuplicateTable, "relation already exists");
                     indexes.Add(new(name, ordinals.Select(ordinal => new CatalogIndexKey(ordinal)).ToArray(), Unique: true, IsConstraint: true)); break;
+                case "exclude":
+                {
+                    var exclusion = definition.Exclusion!; var dependencies = new List<Resolved>();
+                    if (exclusion.Method == "gist" && ordinals.Distinct().Count() != ordinals.Length) throw new SqlException(SqlStates.DuplicateColumn, "duplicate GiST exclusion column");
+                    var operators = new byte[ordinals.Length];
+                    for (var i = 0; i < ordinals.Length; i++)
+                    {
+                        var type = table.Columns[ordinals[i]].Type.Type; var op = exclusion.Operators[i];
+                        if (exclusion.Method == "btree")
+                        {
+                            Keyable(type);
+                            if (op != "=") throw new SqlException(SqlStates.WrongObjectType, "operator is not supported by btree exclusion");
+                        }
+                        else
+                        {
+                            if (op is not ("=" or "&&")) throw Errors.Unsupported("GiST exclusion operator");
+                            if (op == "&&" && type.Kind != SqlKind.Range) throw new SqlException(SqlStates.UndefinedObject, "no overlap operator class for exclusion column");
+                            GistBounds.ValidateType(type);
+                        }
+                        operators[i] = op == "&&" ? (byte)0 : (byte)1;
+                    }
+                    if (exclusion.Predicate is { } predicate)
+                    {
+                        ValidateStoredExpression(predicate, immutable: true);
+                        var resolved = Resolve.Expr(Resolve.Bind(Resolve.BindTypes(predicate, catalog, meter.Temporal), Columns(table)));
+                        if (resolved.Type.Kind is not (SqlKind.Boolean or SqlKind.Unknown)) throw Errors.Type("exclusion predicate must be boolean");
+                        ValidateIndexDependencies(resolved); dependencies.Add(resolved);
+                    }
+                    var backing = PinIndexDependencies(new(name, ordinals.Select(ordinal => new CatalogIndexKey(ordinal)).ToArray(), Kind: exclusion.Method == "gist" ? (byte)2 : (byte)0, Predicate: exclusion.PredicateText), dependencies, meter);
+                    if (backing.Kind != 0 && backing.TimezoneDependencies is not null) throw Errors.Unsupported("named time-zone dependencies on GiST predicates");
+                    indexes.Add(backing);
+                    exclusions.Add(new(name, name, ordinals, operators)); break;
+                }
                 case "foreign":
                     var parent = definition.Parent == table.Name ? table : Table(catalog, definition.Parent!);
                     var referenced = definition.ParentColumns is null ? parent.PrimaryKey : definition.ParentColumns.Select(c => ColumnIndex(parent, c)).ToArray();
@@ -193,7 +241,7 @@ internal static partial class StatementExecution
             }
         }
         return table with { Checks = checks.OrderBy(c => c.Name, Utf8NameComparer.Instance).ToArray(),
-            Indexes = indexes.OrderBy(c => c.Name, Utf8NameComparer.Instance).ToArray(), ForeignKeys = foreignKeys.OrderBy(c => c.Name, Utf8NameComparer.Instance).ToArray() };
+            Indexes = indexes.OrderBy(c => c.Name, Utf8NameComparer.Instance).ToArray(), ForeignKeys = foreignKeys.OrderBy(c => c.Name, Utf8NameComparer.Instance).ToArray(), Exclusions = exclusions.OrderBy(c => c.Name, Utf8NameComparer.Instance).ToArray() };
     }
 
     private static ValueTask<StatementResult> AlterTable(Database database, PendingDatabase pending, AlterTableSyntax alter, Meter meter, CancellationToken token) =>

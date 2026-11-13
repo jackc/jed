@@ -1,18 +1,23 @@
 namespace Jed;
 
-internal sealed record ColumnSyntax(string Name, string Type, bool NotNull, bool PrimaryKey, Expression? Default, string? DefaultText = null, bool Identity = false, bool IdentityAlways = false, SequenceOptions? Sequence = null);
-internal sealed record CreateTableSyntax(string Name, ColumnSyntax[] Columns, string[] PrimaryKey, bool IfNotExists, ConstraintSyntax[]? Constraints = null) : StatementSyntax;
+internal sealed record ColumnSyntax(string Name, string Type, bool NotNull, bool PrimaryKey, Expression? Default, string? DefaultText = null, bool Identity = false, bool IdentityAlways = false, SequenceOptions? Sequence = null, string? Collation = null);
+internal sealed record CreateTableSyntax(string Name, ColumnSyntax[] Columns, string[] PrimaryKey, bool IfNotExists, ConstraintSyntax[]? Constraints = null, bool Temporary = false, byte OnCommit = 0) : StatementSyntax;
+internal sealed record DropTablesSyntax(string[] Names, bool IfExists, bool Cascade = false) : StatementSyntax;
 internal sealed record DropTableSyntax(string Name, bool IfExists, bool Cascade = false) : StatementSyntax;
-internal sealed record InsertSyntax(string Table, string[]? Columns, Expression[][] Values, SelectItem[] Returning, SelectSyntax? Source = null, string? Overriding = null, ConflictSyntax? Conflict = null, string? Alias = null, Expression[]? ViewChecks = null) : StatementSyntax;
+internal sealed record InsertSyntax(string Table, string[]? Columns, Expression[][] Values, SelectItem[] Returning, SelectSyntax? Source = null, string? Overriding = null, ConflictSyntax? Conflict = null, string? Alias = null, Expression[]? ViewChecks = null, ViewBinding? ViewBinding = null, Dictionary<int, Expression>? ViewDefaults = null, ReturningAliases? ReturningAliases = null) : StatementSyntax;
+internal sealed record ReturningAliases(string? Old, string? New);
 internal sealed record AssignmentSyntax(string Column, Expression Value);
-internal sealed record UpdateSyntax(string Table, AssignmentSyntax[] Assignments, Expression? Filter, SelectItem[] Returning, Expression[]? ViewChecks = null) : StatementSyntax;
-internal sealed record DeleteSyntax(string Table, Expression? Filter, SelectItem[] Returning) : StatementSyntax;
+internal sealed record UpdateSyntax(string Table, AssignmentSyntax[] Assignments, Expression? Filter, SelectItem[] Returning, Expression[]? ViewChecks = null, ViewBinding? ViewBinding = null, ReturningAliases? ReturningAliases = null) : StatementSyntax;
+internal sealed record DeleteSyntax(string Table, Expression? Filter, SelectItem[] Returning, ViewBinding? ViewBinding = null, ReturningAliases? ReturningAliases = null) : StatementSyntax;
 internal sealed record TransactionSyntax(string Operation, string? Name = null, bool ReadOnly = false) : StatementSyntax;
 
 internal sealed partial class Parser
 {
     private StatementSyntax OtherStatement()
     {
+        if (Eat("explain")) return ExplainStatement();
+        if (Eat("analyze")) return AnalyzeStatement();
+        if (Eat("reindex")) return ReindexStatement();
         if (Eat("create")) return CreateDefinition();
         if (Eat("alter")) return AlterDefinition();
         if (Eat("drop"))
@@ -31,8 +36,9 @@ internal sealed partial class Parser
                 return new DropIndexSyntax(name, optional, cascade);
             }
             Expect("table"); var ifExists = Eat("if"); if (ifExists) Expect("exists");
-            var table = QualifiedName(); var all = Eat("cascade"); if (!all) Eat("restrict");
-            return new DropTableSyntax(table, ifExists, all);
+            var tables = new List<string>(); do { tables.Add(QualifiedName()); } while (Eat(","));
+            var all = Eat("cascade"); if (!all) Eat("restrict");
+            return tables.Count == 1 ? new DropTableSyntax(tables[0], ifExists, all) : new DropTablesSyntax(tables.ToArray(), ifExists, all);
         }
         if (Eat("insert"))
         {
@@ -54,19 +60,22 @@ internal sealed partial class Parser
                 } while (Eat(","));
             }
             var conflict = OnConflict();
-            return new InsertSyntax(name, columns, values.ToArray(), Returning(), source, overriding, conflict, alias);
+            var returning = Returning();
+            return new InsertSyntax(name, columns, values.ToArray(), returning.Items, source, overriding, conflict, alias, ReturningAliases: returning.Aliases);
         }
         if (Eat("update"))
         {
             var name = QualifiedName(); Expect("set"); var assignments = new List<AssignmentSyntax>();
             do { var column = Name(); Expect("="); assignments.Add(new(column, Eat("default") ? Node("default", "") : Expr())); } while (Eat(","));
             var filter = Eat("where") ? Expr() : null;
-            return new UpdateSyntax(name, assignments.ToArray(), filter, Returning());
+            var returning = Returning();
+            return new UpdateSyntax(name, assignments.ToArray(), filter, returning.Items, ReturningAliases: returning.Aliases);
         }
         if (Eat("delete"))
         {
             Expect("from"); var name = QualifiedName(); var filter = Eat("where") ? Expr() : null;
-            return new DeleteSyntax(name, filter, Returning());
+            var returning = Returning();
+            return new DeleteSyntax(name, filter, returning.Items, ReturningAliases: returning.Aliases);
         }
         if (Eat("begin")) { if (!Eat("transaction")) Eat("work"); return BeginTransaction(); }
         if (Eat("start")) { Expect("transaction"); return BeginTransaction(); }
@@ -78,7 +87,7 @@ internal sealed partial class Parser
         }
         if (Eat("savepoint")) return new TransactionSyntax("savepoint", Name());
         if (Eat("release")) return new TransactionSyntax("release", SavepointName());
-        throw Errors.Unsupported($"statement {token.Text}");
+        throw Errors.Syntax($"unexpected statement: {token.Text}");
     }
     private TransactionSyntax BeginTransaction()
     {
@@ -92,15 +101,29 @@ internal sealed partial class Parser
         if (name == "savepoint" && token.Kind is TokenKind.Word or TokenKind.QuotedName) name = Name();
         return name;
     }
-    private SelectItem[] Returning()
+    private (SelectItem[] Items, ReturningAliases? Aliases) Returning()
     {
-        if (!Eat("returning")) return [];
+        if (!Eat("returning")) return ([], null);
+        ReturningAliases? aliases = null;
+        if (Is("with") && Peek().Text == "(" && Peek(2).Text is "old" or "new" && Peek(3).Text == "as")
+        {
+            Take(); Expect("("); string? old = null, current = null;
+            do
+            {
+                var version = Name();
+                if (version is not ("old" or "new")) throw Errors.Syntax("expected OLD or NEW");
+                Expect("as"); var alias = Name();
+                if (version == "old") { if (old is not null) throw Errors.Syntax("duplicate OLD alias"); old = alias; }
+                else { if (current is not null) throw Errors.Syntax("duplicate NEW alias"); current = alias; }
+            } while (Eat(","));
+            Expect(")"); aliases = new(old, current);
+        }
         var items = new List<SelectItem>();
         do
         {
             var expression = Eat("*") ? Node("star", "") : Expr();
             items.Add(new(expression, Eat("as") ? Name() : null));
         } while (Eat(","));
-        return items.ToArray();
+        return (items.ToArray(), aliases);
     }
 }

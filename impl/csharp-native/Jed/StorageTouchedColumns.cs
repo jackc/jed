@@ -17,7 +17,7 @@ internal static class StorageTouchedColumns
         if (plan.Group is { } group)
         {
             foreach (var key in group.Keys) Visit(key);
-            foreach (var aggregate in group.Aggregates) { Visit(aggregate.Argument); Visit(aggregate.Filter); foreach (var argument in aggregate.Extra ?? []) Visit(argument); foreach (var key in aggregate.Order ?? []) Visit(key.Expression); }
+            foreach (var aggregate in group.Aggregates) { Visit(aggregate.Argument); Visit(aggregate.Filter); foreach (var argument in aggregate.Extra ?? []) Visit(argument); foreach (var key in aggregate.Order ?? []) Visit(key.Expression); foreach (var key in aggregate.WithinOrder ?? []) Visit(key.Expression); }
         }
         else if (plan.Windows is { } windows)
         {
@@ -26,7 +26,7 @@ internal static class StorageTouchedColumns
                 foreach (var argument in window.Args) Visit(argument);
                 foreach (var key in window.Partition) Visit(key);
                 foreach (var key in window.Order) Visit(key.Expression);
-                if (window.Aggregate is { } aggregate) { Visit(aggregate.Argument); Visit(aggregate.Filter); foreach (var argument in aggregate.Extra ?? []) Visit(argument); foreach (var key in aggregate.Order ?? []) Visit(key.Expression); }
+                if (window.Aggregate is { } aggregate) { Visit(aggregate.Argument); Visit(aggregate.Filter); foreach (var argument in aggregate.Extra ?? []) Visit(argument); foreach (var key in aggregate.Order ?? []) Visit(key.Expression); foreach (var key in aggregate.WithinOrder ?? []) Visit(key.Expression); }
             }
             foreach (var projection in plan.Projections) Visit(projection.Expression);
             foreach (var key in plan.Order ?? []) Visit(key.Expression);

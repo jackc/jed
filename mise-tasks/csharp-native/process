@@ -1,0 +1,52 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#MISE description="Explicit opt-in: real C# processes against the pinned page-service corpus"
+#USAGE flag "--filter <substring>" help="Select scenario filenames containing this substring"
+#USAGE flag "--no-build" help="Use an existing Release actor build"
+require_relative "../../impl/csharp-native/Tools/tasks"
+require "tmpdir"
+require "shellwords"
+cores = ENV.fetch("JED_PROCESS_CORES", "csharp-native").split(",", -1)
+abort "This experimental task requires exactly csharp-native; peer pairings use service-interop" unless cores == ["csharp-native"]
+revision = CSharpNativeTasks::BASELINE.fetch("semantic_revision")
+frozen_driver, error, status = Open3.capture3("git", "show", "#{revision}:scripts/process_conformance.rb", chdir: CSharpNativeTasks::ROOT)
+abort "Cannot read pinned process driver: #{error}" unless status.success?
+adapted_driver = frozen_driver.sub('              when "swift-native" then', '              when "csharp-native" then [ENV.fetch("JED_CSHARP_PROCESS_ACTOR")]' + "\n" + '              when "swift-native" then')
+abort "Shared process driver differs from pinned semantics" unless File.binread(File.join(CSharpNativeTasks::ROOT, "scripts/process_conformance.rb")) == adapted_driver.b
+base = CSharpNativeTasks.baseline_spec
+corpus = File.join(base, "conformance/process")
+files = Dir.glob(File.join(corpus, "*.process.toml")).sort
+abort "Pinned process inventory must contain 31 scenarios" unless files.length == 31
+filter = ENV["usage_filter"] || ENV["JED_PROCESS_FILTER"]
+selected = files.select { filter.nil? || File.basename(_1).include?(filter) }
+abort "Filter selects no process scenario" if selected.empty?
+dll = if ENV["usage_no_build"] == "true"
+        File.join(CSharpNativeTasks::PACKAGE, "Jed.Check/bin/Release/net11.0/Jed.Check.dll")
+      else
+        CSharpNativeTasks.build
+      end
+abort "Missing actor build: #{dll}" unless File.file?(dll)
+status = nil
+Dir.mktmpdir("jed-csharp-process-") do |directory|
+  artifact = File.join(directory, "actor")
+  FileUtils.mkdir_p(artifact)
+  source = File.dirname(dll)
+  before = Dir.glob(File.join(source, "*" )).select { File.file?(_1) }.to_h { |path| [File.basename(path), Digest::SHA256.file(path).hexdigest] }
+  before.each_key { |name| FileUtils.cp(File.join(source, name), File.join(artifact, name)) }
+  before.each do |name, hash|
+    abort "Actor changed during snapshot" unless Digest::SHA256.file(File.join(source, name)).hexdigest == hash && Digest::SHA256.file(File.join(artifact, name)).hexdigest == hash
+  end
+  actor = File.join(directory, "jed-csharp-process")
+  command = [CSharpNativeTasks.dotnet, File.join(artifact, "Jed.Check.dll"), "process-actor"].shelljoin
+  File.write(actor, "#!/bin/sh\nexec #{command} \"$@\"\n")
+  File.chmod(0o500, actor)
+  warn "Pinned C# process selection: #{selected.length}/31 scenarios; actor #{before.fetch('Jed.Check.dll')}; engine #{before.fetch('Jed.CSharpExperiment.dll')}"
+  environment = CSharpNativeTasks.environment.merge(
+    "JED_PROCESS_CORES" => "csharp-native", "JED_CSHARP_PROCESS_ACTOR" => actor,
+    "JED_PROCESS_PAGES_ACTOR" => actor, "JED_PROCESS_CORPUS" => corpus,
+    "JED_PROCESS_FIXTURE_ROOT" => File.join(base, "fileformat/fixtures"), "JED_PROCESS_STRICT_CORES" => "1")
+  environment["JED_PROCESS_FILTER"] = filter if filter
+  system(environment, "ruby", File.join(CSharpNativeTasks::ROOT, "scripts/process_conformance.rb"))
+  status = $?
+end
+exit(status&.exitstatus || 1)

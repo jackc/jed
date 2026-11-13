@@ -4,9 +4,18 @@ internal sealed class Meter(Session session, long limit, CancellationToken cance
 {
     internal CancellationToken Cancellation => cancellation;
     internal long Accrued { get; private set; }
+    internal ExplainSyntax? Explain { get; set; }
+    private readonly long memoryLimit = options?.MaxQueryMemoryBytes ?? session.MaxQueryMemoryBytes;
+    private QueryMemoryAccount? memory;
+    internal QueryMemoryAccount Memory => memory ??= new(memoryLimit, this);
     private SequenceContext? sequences;
     internal SequenceContext Sequences => sequences ??= new(session.SequenceStateSnapshot(), this);
+    internal Dictionary<string, string> Variables { get; } = session.VariableSnapshot();
+    internal UuidContext Uuid { get; } = session.NewUuidContext(options);
     internal TemporalContext Temporal { get; } = session.NewTemporalContext(options);
+    internal UnicodeData? Unicode => Temporal.Unicode;
+    internal readonly Dictionary<RegexCall, RegexMachine> RegexMachines = new(ReferenceEqualityComparer.Instance);
+    internal readonly Dictionary<SimilarCall, RegexMachine[]> SimilarMachines = new(ReferenceEqualityComparer.Instance);
     private string? firstLimit;
     private long scalarBytes;
     private readonly long scalarLimit = options?.MaxScalarBytes is > 0 ? options.MaxScalarBytes : 64L * 1024 * 1024;
@@ -54,8 +63,12 @@ internal sealed class Meter(Session session, long limit, CancellationToken cance
     }
     internal void Checkpoint(CancellationToken additional = default)
     {
+        CheckCancellation(additional);
+        Guard();
+    }
+    internal void CheckCancellation(CancellationToken additional = default)
+    {
         if (cancellation.IsCancellationRequested) throw new SqlCanceledException(cancellation);
         if (additional.IsCancellationRequested) throw new SqlCanceledException(additional);
-        Guard();
     }
 }

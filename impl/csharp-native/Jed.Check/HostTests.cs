@@ -50,11 +50,13 @@ internal static class HostTests
         // Parser safety is outside finite SQL fixture reach at practical attack sizes.
         await Error(SqlStates.StatementTooComplex, async () => { _ = await session.QueryAsync("SELECT " + new string('(', 10_000) + "1" + new string(')', 10_000)); });
         await Error(SqlStates.StatementTooComplex, async () => { _ = await session.QueryAsync("SELECT " + string.Join("+", Enumerable.Repeat("1", 10_000))); });
-        await using (var nesting = await session.QueryAsync("SELECT " + new string('(', 256) + "1" + new string(')', 256)))
+        // The root expression counts as one level (cost.md §7).
+        await using (var nesting = await session.QueryAsync("SELECT " + new string('(', 255) + "1" + new string(')', 255)))
             Corpus.Equal(1L, (await nesting.ReadAsync())![0].AsInteger(), "maximum parentheses nesting");
-        await using (var unary = await session.QueryAsync("SELECT " + string.Concat(Enumerable.Repeat("NOT ", 256)) + "true"))
-            Corpus.Equal(true, (await unary.ReadAsync())![0].AsBoolean(), "maximum unary nesting");
-        await Error(SqlStates.StatementTooComplex, async () => { _ = await session.QueryAsync("SELECT " + string.Concat(Enumerable.Repeat("NOT ", 257)) + "true"); });
+        await using (var unary = await session.QueryAsync("SELECT " + string.Concat(Enumerable.Repeat("NOT ", 255)) + "true"))
+            Corpus.Equal(false, (await unary.ReadAsync())![0].AsBoolean(), "maximum unary nesting");
+        await Error(SqlStates.StatementTooComplex, async () => { _ = await session.QueryAsync("SELECT " + string.Concat(Enumerable.Repeat("NOT ", 256)) + "true"); });
+        await Error(SqlStates.StatementTooComplex, async () => { _ = await session.QueryAsync("SELECT " + new string('(', 256) + "1" + new string(')', 256)); });
         await Error(SqlStates.NameTooLong, async () => { _ = await session.QueryAsync("SELECT 1 AS \"" + new string('é', 32) + "\""); });
 
         await using var partial = await session.QueryAsync("SELECT 1 / 0");

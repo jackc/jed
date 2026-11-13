@@ -193,7 +193,9 @@ internal sealed class FileBlockStore : IBlockStore
 
     public ValueTask DisposeAsync() => stream.DisposeAsync();
 
-    internal void SyncDirectory()
+    internal void SyncDirectory() => SyncDirectory(directory);
+
+    internal static void SyncDirectory(string directory)
     {
         // Linux host seam, not an engine dependency. Directory sync is best
         // effort per validated-cow.md; data-file sync errors still propagate.

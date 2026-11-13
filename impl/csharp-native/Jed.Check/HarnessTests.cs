@@ -9,7 +9,7 @@ internal static class HarnessTests
             var file = Path.Combine(directory, "probe.test");
             foreach (var invalid in new[]
             {
-                "# max_query_memory_bytes: 32\nquery I nosort\nSELECT 1\n----\n1\n",
+                "# max_query_memory_bytes: 1\nquery I nosort\nSELECT 1\n----\n1\n",
                 "# types: text\nquery I nosort\nSELECT 1\n----\n1\n",
                 "# cost: 0\nquery I nosort\nSELECT 1\n----\n1\n",
                 "statement error 22003\nSELECT 1 / 0\n",

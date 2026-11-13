@@ -4,10 +4,18 @@ namespace Jed;
 
 internal sealed record CatalogColumn(string Name, TypeSpec Type, bool NotNull = false, SqlValue? Default = null,
     string? DefaultExpression = null, bool Identity = false, bool IdentityAlways = false, string? Collation = null,
-    byte IntervalFields = 0);
+    byte IntervalFields = 0)
+{
+    internal Collation? CollationData { get; init; }
+    internal bool CollationSkew { get; init; }
+}
 internal sealed record CatalogHostDependency(string Name, byte[] Arguments, byte Result, string Component, uint Version);
 internal sealed record CatalogCheck(string Name, string Expression, CatalogHostDependency[]? HostDependencies = null);
-internal sealed record CatalogIndexKey(int Column, string? Expression = null, byte Options = 0);
+internal sealed record CatalogIndexKey(int Column, string? Expression = null, byte Options = 0)
+{
+    internal Collation? CollationData { get; init; }
+    internal bool CollationSkew { get; init; }
+}
 internal sealed record CatalogTimezoneDependency(string Name, string Version, uint Checksum);
 internal sealed record CatalogIndex(string Name, CatalogIndexKey[] Keys, byte Kind = 0, uint Root = 0,
     bool Unique = false, bool IsConstraint = false, string? Predicate = null,
@@ -15,6 +23,9 @@ internal sealed record CatalogIndex(string Name, CatalogIndexKey[] Keys, byte Ki
     bool DynamicTimezone = false)
 {
     internal ReadOnlyMemory<byte> RootTag { get; init; }
+    internal StorageTreeShape? Shape { get; init; }
+    internal GistTree? Gist { get; init; }
+    internal DatabaseDomain? Domain { get; init; }
 }
 internal sealed record CatalogForeignKey(string Name, int[] Columns, string Parent, int[] ParentColumns,
     byte OnDelete = 0, byte OnUpdate = 0, bool MatchFull = false);
@@ -23,7 +34,13 @@ internal sealed record CatalogTable(string Name, CatalogColumn[] Columns, int[] 
     uint Root = 0, long RowCount = 0, CatalogCheck[]? Checks = null, CatalogIndex[]? Indexes = null,
     CatalogForeignKey[]? ForeignKeys = null, CatalogExclusion[]? Exclusions = null)
 {
+    // A committed single-leaf root retains its in-session records. Large values
+    // written in this handle still own their resident payload until demotion.
+    internal StorageRecord[]? ResidentRoot { get; init; }
+    internal byte OnCommit { get; init; }
     internal ReadOnlyMemory<byte> RootTag { get; init; }
+    internal StorageTreeShape? Shape { get; init; }
+    internal DatabaseDomain? Domain { get; init; }
     internal StorageLeafSchema LeafSchema()
     {
         var keyOffsets = Enumerable.Repeat(-1, Columns.Length).ToArray(); var offset = 0;
@@ -58,7 +75,7 @@ internal sealed record CatalogTable(string Name, CatalogColumn[] Columns, int[] 
         if (values.Count != Columns.Length) throw new ArgumentException("row width differs from schema");
         var writer = new WireWriter();
         if (PrimaryKey.Length == 0) writer.Bytes(KeyEncoding.Integer(rowid, 8));
-        else foreach (var ordinal in PrimaryKey) writer.Bytes(KeyEncoding.Encode(values[ordinal]));
+        else foreach (var ordinal in PrimaryKey) writer.Bytes(KeyEncoding.Encode(values[ordinal], collation: Columns[ordinal].CollationData));
         var cells = new byte[]?[values.Count];
         for (var i = 0; i < cells.Length; i++) cells[i] = StoredValues.Leaf(values[i], Columns[i].Type);
         return new(writer.ToArray(), cells);
@@ -78,7 +95,7 @@ internal sealed record CatalogWrite(uint Root, int PageCount, uint[] Pages, int 
 {
     internal ReadOnlyMemory<byte> RootTag { get; init; }
 }
-internal sealed record Catalog(CatalogTable[] Tables, uint[] Pages, CatalogComposite[]? Types = null,
+internal sealed partial record Catalog(CatalogTable[] Tables, uint[] Pages, CatalogComposite[]? Types = null,
     CatalogSequence[]? Sequences = null, CatalogCollation[]? Collations = null,
     CatalogStatistic[]? Statistics = null, CatalogView[]? Views = null)
 {
@@ -87,7 +104,7 @@ internal sealed record Catalog(CatalogTable[] Tables, uint[] Pages, CatalogCompo
     internal SqlType? NamedType(string name)
     {
         var composite = (Types ?? []).FirstOrDefault(type => type.Name == name);
-        if (composite is null) return null;
+        if (composite is null) return TypeParent?.NamedType(name);
         return SqlType.Composite(name, composite.Fields.Select(field => new SqlField(field.Name, field.Type.Type, field.NotNull,
             field.Type.Precision, field.Type.Scale, field.Type.Length, field.IntervalFields)));
     }
@@ -173,8 +190,29 @@ internal sealed record Catalog(CatalogTable[] Tables, uint[] Pages, CatalogCompo
 
     internal CatalogWrite Serialize(StorageAllocation allocation)
     {
+        var chunks = ImageChunks(allocation.PayloadCapacity - (allocation.Encrypted ? 16 : 0), allocation.Encrypted);
+        foreach (var page in Pages) allocation.Reclaim(page);
+        var ids = new uint[chunks.Count];
+        for (var i = 0; i < ids.Length; i++) ids[i] = allocation.ReservePage();
+        for (var i = ids.Length - 1; i >= 0; i--)
+        {
+            var chunk = chunks[i];
+            var payload = chunk.Payload;
+            if (allocation.Encrypted)
+            {
+                payload = new byte[16 + chunk.Payload.Length];
+                if (i + 1 < ids.Length) allocation.Tag(ids[i + 1]).Span.CopyTo(payload);
+                chunk.Payload.CopyTo(payload, 16);
+            }
+            allocation.SetPage(ids[i], StorageFormat.EncodePage(allocation.PageSize,
+                new(1, chunk.Flags, chunk.Count, i + 1 < ids.Length ? ids[i + 1] : 0), payload));
+        }
+        return new(ids[0], ids.Length, ids, ids.Length - Pages.Length) { RootTag = allocation.Tag(ids[0]) };
+    }
+
+    internal List<(byte[] Payload, uint Count, byte Flags)> ImageChunks(int capacity, bool encrypted)
+    {
         Validate();
-        var capacity = allocation.PayloadCapacity - (allocation.Encrypted ? 16 : 0);
         var chunks = new List<(byte[] Payload, uint Count, byte Flags)>();
         using var current = new MemoryStream(); uint count = 0;
         void Flush()
@@ -182,7 +220,7 @@ internal sealed record Catalog(CatalogTable[] Tables, uint[] Pages, CatalogCompo
             if (count == 0) return;
             chunks.Add((current.ToArray(), count, 0)); current.SetLength(0); count = 0;
         }
-        foreach (var entry in CatalogObjectCodec.Entries(this, allocation.Encrypted))
+        foreach (var entry in CatalogObjectCodec.Entries(this, encrypted))
         {
             if (entry.Length > capacity)
             {
@@ -201,23 +239,7 @@ internal sealed record Catalog(CatalogTable[] Tables, uint[] Pages, CatalogCompo
         }
         Flush();
         if (chunks.Count == 0) chunks.Add(([], 0, 0));
-        foreach (var page in Pages) allocation.Reclaim(page);
-        var ids = new uint[chunks.Count];
-        for (var i = 0; i < ids.Length; i++) ids[i] = allocation.ReservePage();
-        for (var i = ids.Length - 1; i >= 0; i--)
-        {
-            var chunk = chunks[i];
-            var payload = chunk.Payload;
-            if (allocation.Encrypted)
-            {
-                payload = new byte[16 + chunk.Payload.Length];
-                if (i + 1 < ids.Length) allocation.Tag(ids[i + 1]).Span.CopyTo(payload);
-                chunk.Payload.CopyTo(payload, 16);
-            }
-            allocation.SetPage(ids[i], StorageFormat.EncodePage(allocation.PageSize,
-                new(1, chunk.Flags, chunk.Count, i + 1 < ids.Length ? ids[i + 1] : 0), payload));
-        }
-        return new(ids[0], ids.Length, ids, ids.Length - Pages.Length) { RootTag = allocation.Tag(ids[0]) };
+        return chunks;
     }
 
     private void Validate()

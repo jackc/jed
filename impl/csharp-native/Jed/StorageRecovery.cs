@@ -7,6 +7,10 @@ internal sealed record StorageRecovered(StorageMeta Meta, int Slot, int FloorSlo
 {
     internal HashSet<uint> ManifestPages { get; init; } = [];
     internal StorageEncryptedMeta? Encrypted { get; init; }
+    internal uint? LastReclamationLive { get; init; }
+    internal ulong? ReclamationTransactionId { get; init; }
+    internal ulong FreeGeneration => ReclamationTransactionId ?? Meta.TransactionId;
+    internal uint ReclamationLive => LastReclamationLive ?? checked(Meta.PageCount - (uint)FreePages.Count);
     internal bool RequiresStabilization => Meta.ManifestEntries != 0;
 }
 

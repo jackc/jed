@@ -68,6 +68,13 @@ use the required OS synchronization operation. There is no Task.Run wrapper.
 `Database.CreateFileAsync` and `Database.OpenFileAsync` expose the experimental
 Linux file host; use separate sessions for independent cursors and transactions.
 
+`Database.ChangeCredentialAsync` rewraps an encrypted file's data key without
+rewriting its data pages. The current file owner performs the operation; retained
+readers keep their existing data key. `SerializeAsync` exports a committed
+plaintext snapshot, and `DeserializeAsync` copies a plaintext image into an
+independent in-memory database. These surfaces have host and byte-fixture checks;
+the verification record identifies the tested source revisions.
+
 The public surface includes exact decimal, temporal and recursive values, parameter
 binding and reusable prepared syntax. The scope inventory records missing SQL,
 resource-accounting, spill, host and maintenance behavior. JIT/NativeAOT evidence

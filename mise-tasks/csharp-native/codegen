@@ -29,7 +29,7 @@ pairs = casts.map { |c| "        (SqlType.#{pascal.call(c.fetch('from'))}, SqlTy
 functions = TomlRB.load_file(File.join(spec, "functions/catalog.toml")).fetch("operator").select { |o| o.fetch("kind") == "function" }
 array = ->(values) { "[#{values.map { |v| quote.call(v) }.join(', ')}]" }
 function_facts = functions.map do |f|
-  "        new(#{quote.call(f.fetch('name'))}, #{array.call(f.fetch('arg_families'))}, #{quote.call(f.fetch('result'))}, #{quote.call(f.fetch('null'))}, #{f.fetch('cost', 1)}, #{f.fetch('variadic', false)}, #{array.call(f.fetch('arg_names', []))}, #{array.call(f.fetch('arg_defaults', []))}),"
+  "        new(#{quote.call(f.fetch('name'))}, #{array.call(f.fetch('arg_families'))}, #{quote.call(f.fetch('result'))}, #{quote.call(f.fetch('null'))}, #{f.fetch('cost', 1)}, #{f.fetch('variadic', false)}, #{array.call(f.fetch('arg_names', []))}, #{array.call(f.fetch('arg_defaults', []))}, #{quote.call(f.fetch('volatility', 'immutable'))}),"
 end
 datetime = TomlRB.load_file(File.join(spec, "types/datetime_units.toml"))
 datetime_tables = %w[delta date].map do |table|
@@ -46,6 +46,14 @@ outputs = {
   "SqlStates.g.cs" => header + "public static class SqlStates\n{\n#{states.join("\n")}\n}\n",
   "ScalarCatalog.g.cs" => header + "internal static class ScalarCatalog\n{\n    internal static readonly string[] KnownNames = [#{known_names}];\n    internal static readonly ScalarFact[] Facts =\n    [\n#{facts.join("\n")}\n    ];\n}\n"
 }
+safe_functions = functions.select { |f| f["traps"] == false }.map { |f| f.fetch("name") }.uniq
+safe_casts = casts.select { |c| c["traps"] == false }.map { |c| "        (SqlType.#{pascal.call(c.fetch('from'))}, SqlType.#{pascal.call(c.fetch('to'))})," }
+estimator = TomlRB.load_file(File.join(spec, "cost/estimator.toml"))
+statistics_limits = estimator.select { |key, value| key.start_with?("statistics_") && value.is_a?(Integer) }.map { |key, value| "    internal const int #{pascal.call(key.delete_prefix("statistics_"))} = #{value};" }
+outputs["StatisticsLimits.g.cs"] = header + "internal static class StatisticsLimits\n{\n#{statistics_limits.join("\n")}\n}\n"
+selectivities = estimator.fetch("selectivity").map { |entry| "        (#{quote.call(entry.fetch('id'))}, #{entry.fetch('numerator')}L, #{entry.fetch('denominator')}L)," }
+outputs["ReclamationFacts.g.cs"] = header + "internal static class ReclamationFacts\n{\n    internal const long CompactMinPages = #{schedule.fetch('reclamation').fetch('compact_min_pages')};\n    internal const long CompactGrowth = #{schedule.fetch('reclamation').fetch('compact_growth')};\n}\n"
+outputs["PlannerFacts.g.cs"] = header + "internal static class PlannerFacts\n{\n    internal const long VariableKeyBytes = #{estimator.fetch('default_variable_key_bytes')};\n    internal const long DistinctValues = #{estimator.fetch('default_distinct_values')};\n    internal const long SrfRows = #{estimator.fetch('default_srf_rows')};\n    internal const long ArrayElements = #{estimator.fetch('default_array_elements')};\n    internal static readonly (string Name, long Numerator, long Denominator)[] Selectivities =\n    [\n#{selectivities.join("\n")}\n    ];\n    internal static readonly string[] SafeFunctions = #{array.call(safe_functions)};\n    internal static readonly (SqlType, SqlType)[] SafeCasts =\n    [\n#{safe_casts.join("\n")}\n    ];\n}\n"
 ranges = TomlRB.load_file(File.join(spec, "types/ranges.toml")).fetch("range")
 range_rows = ranges.map { |entry| "        new(#{quote.call(entry.fetch('id'))}, SqlType.#{pascal.call(entry.fetch('element'))}, #{array.call(entry.fetch('aliases'))}, #{entry.fetch('discrete')})," }
 outputs["RangeCatalog.g.cs"] = header + "internal static class RangeCatalog\n{\n    internal static readonly RangeFact[] Facts =\n    [\n#{range_rows.join("\n")}\n    ];\n}\n"
@@ -58,6 +66,11 @@ suffix_rows = formatting.fetch("suffixes").map { |entry| "        (#{quote.call(
 format_tables << "    internal static readonly (string Name, string Id, string Type)[] Suffixes =\n    [\n#{suffix_rows.join("\n")}\n    ];"
 formatting.fetch("words").each { |name, words| format_tables << "    internal static readonly string[] #{pascal.call(name)} = #{array.call(words)};" }
 outputs["FormattingCatalog.g.cs"] = header + "internal static class FormattingCatalog\n{\n#{format_tables.join("\n")}\n}\n"
+keywords = TomlRB.load_file(File.join(spec, "grammar/pg_keywords.toml")).fetch("keywords").map { |entry| entry.fetch("word") }
+abort "Unsorted PostgreSQL keyword fixture" unless keywords == keywords.sort && keywords.uniq == keywords
+outputs["QuotedKeywords.g.cs"] = header + "internal static class QuotedKeywords\n{\n    internal static readonly string[] Values = #{array.call(keywords)};\n}\n"
+memory = schedule.fetch("memory").map { |name, value| "    internal const long #{pascal.call(name)} = #{value};" }
+outputs["MemorySchedule.g.cs"] = header + "internal static class MemorySchedule\n{\n#{memory.join("\n")}\n}\n"
 outputs.each do |name, content|
   path = File.join(CSharpNativeTasks::PACKAGE, "Jed", name)
   if ENV["usage_check"] == "true"

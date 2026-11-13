@@ -5,7 +5,7 @@ internal static class OpenValue
     internal static SqlType Common(SqlType left, SqlType right)
     {
         if (left == right) return left;
-        if (left.Kind == SqlKind.Array && right.Kind == SqlKind.Array) return SqlType.Array(Resolve.Common(left.Element!, right.Element!));
+        if (left.Kind == SqlKind.Array && right.Kind == SqlKind.Array && left.Element!.IsInteger() && right.Element!.IsInteger()) return SqlType.Array(Resolve.Common(left.Element!, right.Element!));
         if (left.Kind == SqlKind.Composite && right.Kind == SqlKind.Composite && left.Identity == "record" && right.Identity == "record" && left.Fields.Count == right.Fields.Count)
             return SqlType.Record(left.Fields.Select((field, index) => new SqlField(field.Name, Resolve.Common(field.Type, right.Fields[index].Type))));
         throw Errors.Type("incompatible open value types");

@@ -2,7 +2,7 @@ namespace Jed;
 
 internal static class OpenExpression
 {
-    internal static Resolved Resolve(Expression expression, SqlType hint)
+    internal static Resolved Resolve(Expression expression, SqlType hint, bool explicitCast = false)
     {
         if (expression.Op == "array")
         {
@@ -21,7 +21,15 @@ internal static class OpenExpression
             for (var i = 0; i < values.Length; i++)
             {
                 var target = nested ? SqlType.Array(element) : element;
-                if (values[i].Type != target) values[i] = new("promote", target, default, [values[i]]);
+                if (values[i].Type != target)
+                {
+                    if (explicitCast)
+                    {
+                        if (!Jed.Resolve.CanCast(values[i].Type, target)) throw new SqlException(SqlStates.CannotCoerce, "array element cast is not supported");
+                    }
+                    else _ = Jed.Resolve.Common(values[i].Type, target);
+                    values[i] = new("promote", target, default, [values[i]]);
+                }
             }
             return new("array", SqlType.Array(element), default, values, nested ? "nested" : "");
         }
@@ -41,7 +49,7 @@ internal static class OpenExpression
         var source = Jed.Resolve.Expr(expression.Args[0]);
         if (expression.Op == "field")
         {
-            if (source.Type.Kind != SqlKind.Composite) throw Errors.Type("field access requires a record");
+            if (source.Type.Kind != SqlKind.Composite) throw new SqlException(SqlStates.WrongObjectType, "field access requires a record");
             var slot = Enumerable.Range(0, source.Type.Fields.Count).FirstOrDefault(i => source.Type.Fields[i].Name == expression.Text, -1);
             if (slot < 0) throw new SqlException(SqlStates.UndefinedColumn, "record field does not exist");
             return new("field", source.Type.Fields[slot].Type, default, [source], Slot: slot);

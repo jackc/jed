@@ -39,18 +39,20 @@ internal static class OpenOperators
     }
     internal static Resolved Quantified(Expression expression)
     {
-        var array = Resolve.Expr(expression.Args[1]);
-        if (array.Type.Kind != SqlKind.Array) throw Errors.Type("ANY/ALL requires an array");
+        var hint = expression.Args[1].Parameter is not null || expression.Args[1].Op == "text" ? Resolve.Expr(expression.Args[0]).Type : SqlType.Unknown;
+        var array = Resolve.Expr(expression.Args[1], hint == SqlType.Unknown ? SqlType.Unknown : SqlType.Array(hint));
+        if (array.Type.Kind != SqlKind.Array) throw new SqlException("42809", "ANY/ALL requires an array");
         var operand = Resolve.Expr(expression.Args[0], array.Type.Element);
-        _ = Resolve.Common(operand.Type, array.Type.Element!);
+        try { _ = Resolve.Common(operand.Type, array.Type.Element!); }
+        catch (SqlException error) when (error.SqlState == SqlStates.DatatypeMismatch) { throw new SqlException(SqlStates.UndefinedFunction, "quantified operands are not comparable"); }
         return new("quantified", SqlType.Boolean, default, [operand, array], expression.Text);
     }
-    internal static SqlValue QuantifiedValue(string text, SqlValue left, SqlValue right, Meter meter)
+    internal static SqlValue QuantifiedValue(string text, SqlValue left, SqlValue right, Meter meter, CollationDerivation? collation = null)
     {
         if (right.IsNull) return SqlValue.Null(SqlType.Boolean);
-        return QuantifiedValues(text, left, right.AsArray().Values, meter);
+        return QuantifiedValues(text, left, right.AsArray().Values, meter, collation);
     }
-    internal static SqlValue QuantifiedValues(string text, SqlValue left, IEnumerable<SqlValue> values, Meter meter)
+    internal static SqlValue QuantifiedValues(string text, SqlValue left, IEnumerable<SqlValue> values, Meter meter, CollationDerivation? collation = null)
     {
         var split = text.IndexOf(' '); var operation = text[..split]; var all = text[(split + 1)..] == "all"; var unknown = false;
         foreach (var element in values)
@@ -58,10 +60,15 @@ internal static class OpenOperators
             meter.Charge(Costs.OperatorEval); meter.Guard();
             if (left.IsNull || element.IsNull) { unknown = true; continue; }
             SqlValue comparison;
-            if (left.Type.Kind == SqlKind.Composite) comparison = OpenExpression.Compare(operation, left, element);
+            if (left.Type.Kind == SqlKind.Composite && left.Type.Identity == "record") comparison = OpenExpression.Compare(operation, left, element);
             else
             {
-                var order = Evaluate.Compare(left, element, meter);
+                // Quantified comparisons are inside this node: each visited
+                // element pays the comparison unit; byte scans are charged only
+                // by standalone scalar comparison nodes. Decimal and named
+                // collation work retain their own size-based contracts.
+                var innerMeter = left.Type == SqlType.Decimal || element.Type == SqlType.Decimal || collation?.Table is not null ? meter : null;
+                var order = operation is "=" or "<>" or "!=" ? Evaluate.Compare(left, element, left.Type == SqlType.Decimal || element.Type == SqlType.Decimal ? meter : null) : CollationRules.Compare(left, element, collation, innerMeter);
                 comparison = SqlValue.Boolean(operation switch { "=" => order == 0, "<>" or "!=" => order != 0, "<" => order < 0, "<=" => order <= 0, ">" => order > 0, ">=" => order >= 0, _ => throw Errors.Type("invalid quantified comparison") });
             }
             if (comparison.IsNull) unknown = true;

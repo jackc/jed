@@ -91,6 +91,16 @@ internal sealed class PageOwnerLedger
     {
         lock (gate) { var pending = publication; publication = null; pending?.TrySetException(error); }
     }
+    internal void PublishReplacement(byte[] nextMeta)
+    {
+        lock (gate)
+        {
+            Publish(nextMeta, []);
+            // Page identities were renumbered. Every older client cache must
+            // be discarded, including clients with no live snapshot pin.
+            invalidationFloor = transactionId;
+        }
+    }
     internal async ValueTask<byte> CommitStatusAsync(ulong version, ulong digest, CancellationToken cancellationToken = default)
     {
         while (true)

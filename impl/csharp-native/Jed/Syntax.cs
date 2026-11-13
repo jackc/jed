@@ -1,10 +1,15 @@
 namespace Jed;
 
-internal sealed record Expression(string Op, string Text, Expression[] Args, int Height = 0, Resolved? Binding = null, Expression? Predicate = null, TypeSpec? Type = null, SelectSyntax? Query = null, TemporalContext? Context = null, ParameterSlot? Parameter = null, OrderSyntax[]? AggregateOrder = null, WindowSyntax? Window = null);
+internal sealed record Expression(string Op, string Text, Expression[] Args, int Height = 0, Resolved? Binding = null, Expression? Predicate = null, TypeSpec? Type = null, SelectSyntax? Query = null, TemporalContext? Context = null, ParameterSlot? Parameter = null, OrderSyntax[]? AggregateOrder = null, WindowSyntax? Window = null, JsonSqlSpec? Json = null);
 internal sealed record SelectItem(Expression Expression, string? Alias);
 internal sealed record OrderSyntax(Expression Expression, bool Descending, bool? NullsFirst);
 internal sealed record SelectSyntax(SelectItem[] Items, Expression? Filter, long? Limit, long Offset,
-    string? Table = null, string? TableAlias = null, OrderSyntax[]? Order = null, bool Distinct = false, Expression[]? GroupBy = null, Expression? Having = null, RelationSyntax? Relation = null, bool ValuesQuery = false, bool SetQuery = false, CteSyntax[]? With = null, bool Recursive = false, Dictionary<string, WindowSyntax>? Windows = null) : StatementSyntax;
+    string? Table = null, string? TableAlias = null, OrderSyntax[]? Order = null, bool Distinct = false, Expression[]? GroupBy = null, Expression? Having = null, RelationSyntax? Relation = null, bool ValuesQuery = false, bool SetQuery = false, CteSyntax[]? With = null, bool Recursive = false, Dictionary<string, WindowSyntax>? Windows = null, int[][]? GroupingSets = null, bool GroupingExpansion = false) : StatementSyntax
+{
+    internal Expression[]? DistinctOn { get; init; }
+    internal bool HasLimit { get; init; }
+    internal bool HasOffset { get; init; }
+}
 internal abstract record StatementSyntax;
 
 internal sealed partial class Parser
@@ -12,13 +17,23 @@ internal sealed partial class Parser
     private const int MaxDepth = 256; // spec/design/cost.md §7, fixed across cores.
     private readonly Lexer lexer;
     private Token token;
-    private Token? lookahead;
+    private readonly List<Token> lookahead = [];
     private List<Token>? capturedTokens = null;
     private int nesting;
     internal Parser(string sql) { lexer = new(sql); token = lexer.Next(); }
     private bool Is(string text) => token.Kind is TokenKind.Word or TokenKind.Symbol && token.Text == text;
-    private Token Peek() => lookahead ??= lexer.Next();
-    private Token Take() { var result = token; capturedTokens?.Add(result); token = lookahead ?? lexer.Next(); lookahead = null; return result; }
+    private Token Peek(int distance = 1)
+    {
+        while (lookahead.Count < distance) lookahead.Add(lexer.Next());
+        return lookahead[distance - 1];
+    }
+    private Token Take()
+    {
+        var result = token; capturedTokens?.Add(result);
+        if (lookahead.Count == 0) token = lexer.Next();
+        else { token = lookahead[0]; lookahead.RemoveAt(0); }
+        return result;
+    }
     private bool Eat(string text) { if (!Is(text)) return false; Take(); return true; }
     private void Expect(string text) { if (!Eat(text)) throw Errors.Syntax($"expected {text}"); }
     private static void Depth(int depth)
@@ -27,7 +42,7 @@ internal sealed partial class Parser
     }
     private Expression Node(string op, string text, params Expression[] args)
     {
-        var height = args.Length == 0 ? 0 : args.Max(a => a.Height) + 1;
+        var height = args.Length == 0 ? 1 : args.Max(a => a.Height) + 1;
         Depth(nesting + height);
         return new(op, text, args, height);
     }
@@ -41,7 +56,7 @@ internal sealed partial class Parser
     internal StatementSyntax ParseStatement()
     {
         if (token.Kind == TokenKind.End) throw Errors.Syntax("empty SQL statement");
-        StatementSyntax statement = Is("select") || Is("values") || Is("with") || Is("(") ? Select() : OtherStatement();
+        StatementSyntax statement = Is("with") || Is("select") || Is("values") || Is("(") ? QueryStatement() : OtherStatement();
         Eat(";");
         if (token.Kind != TokenKind.End) throw Errors.Syntax($"unexpected token: {token.Text}");
         return statement;
@@ -52,6 +67,10 @@ internal sealed partial class Parser
         SelectSyntax left;
         if (Eat("(")) { nesting++; Depth(nesting); left = Select(); Expect(")"); nesting--; }
         else left = SelectCore();
+        return SetQueryTail(left, minimum);
+    }
+    private SelectSyntax SetQueryTail(SelectSyntax left, int minimum)
+    {
         while (true)
         {
             var precedence = Is("intersect") ? 2 : Is("union") || Is("except") ? 1 : -1;
@@ -63,10 +82,18 @@ internal sealed partial class Parser
     }
     private SelectSyntax SelectCore()
     {
+        var ownsInto = intoAllowed; intoAllowed = false;
         if (Is("values")) return new([new(Node("star", ""), null)], null, null, 0, Relation: ValuesBody(), ValuesQuery: true);
         Expect("select");
         var distinct = Eat("distinct");
         if (!distinct) Eat("all");
+        Expression[]? distinctOn = null;
+        if (distinct && Is("on") && Peek().Text == "(")
+        {
+            Take(); Expect("("); var keys = new List<Expression>();
+            do { keys.Add(Expr()); } while (Eat(","));
+            Expect(")"); distinctOn = keys.ToArray();
+        }
         var items = new List<SelectItem>();
         do
         {
@@ -74,6 +101,7 @@ internal sealed partial class Parser
             var alias = Eat("as") ? Name() : token.Kind == TokenKind.QuotedName || token.Kind == TokenKind.Word && !Clause(token.Text) ? Name() : null;
             items.Add(new(expression, alias));
         } while (Eat(","));
+        IntoClause(ownsInto);
         string? table = null, tableAlias = null;
         RelationSyntax? relation = null;
         if (Eat("from"))
@@ -82,8 +110,8 @@ internal sealed partial class Parser
             if (relation is TableRelation direct && direct.ColumnAliases is null) { table = direct.Name; tableAlias = direct.Alias; }
         }
         var filter = Eat("where") ? Expr() : null;
-        var group = new List<Expression>();
-        if (Eat("group")) { Expect("by"); do { group.Add(Expr()); } while (Eat(",")); }
+        Expression[] group = []; int[][]? groupingSets = null; var groupingExpansion = false;
+        if (Eat("group")) { Expect("by"); (group, groupingSets, groupingExpansion) = GroupingClause(); }
         var having = Eat("having") ? Expr() : null;
         Dictionary<string, WindowSyntax>? windows = null;
         if (Eat("window"))
@@ -95,7 +123,7 @@ internal sealed partial class Parser
                 if (!windows.TryAdd(name, definition)) throw new SqlException(SqlStates.WindowingError, "duplicate window name");
             } while (Eat(","));
         }
-        return new(items.ToArray(), filter, null, 0, table, tableAlias, Distinct: distinct, GroupBy: group.ToArray(), Having: having, Relation: relation, Windows: windows);
+        return new(items.ToArray(), filter, null, 0, table, tableAlias, Distinct: distinct, GroupBy: group, Having: having, Relation: relation, Windows: windows, GroupingSets: groupingSets, GroupingExpansion: groupingExpansion) { DistinctOn = distinctOn };
 
     }
     private SelectSyntax QueryTail(SelectSyntax query)
@@ -115,17 +143,21 @@ internal sealed partial class Parser
             } while (Eat(","));
         }
         long? limit = null; long offset = 0;
-        if (Eat("limit")) { if (query.Limit is not null) throw Errors.Syntax("multiple LIMIT clauses"); if (!Eat("all")) limit = Count(); }
-        if (Eat("offset")) offset = Count();
-        return query with { Order = order.Count == 0 ? query.Order : order.ToArray(), Limit = limit ?? query.Limit, Offset = offset == 0 ? query.Offset : offset };
+        var hasLimit = query.HasLimit; var hasOffset = query.HasOffset;
+        while (Is("limit") || Is("offset"))
+        {
+            if (Eat("limit")) { if (hasLimit || query.Limit is not null) throw Errors.Syntax("multiple LIMIT clauses"); hasLimit = true; if (!Eat("all")) limit = Count(); }
+            else { Expect("offset"); if (hasOffset) throw Errors.Syntax("multiple OFFSET clauses"); hasOffset = true; offset = Count(); }
+        }
+        return query with { Order = order.Count == 0 ? query.Order : order.ToArray(), Limit = limit ?? query.Limit, Offset = offset == 0 ? query.Offset : offset, HasLimit = hasLimit, HasOffset = hasOffset };
     }
     private string QualifiedName()
     {
         var name = Name();
-        if (Eat(".")) name += "." + Name();
+        if (Eat(".")) name = DatabaseDomains.Qualified(name, Name());
         return name;
     }
-    private static bool Clause(string value) => value is "from" or "where" or "group" or "having" or "window" or "order" or "limit" or "offset" or "union" or "intersect" or "except" or "fetch" or "for" or "returning" or "on" or "join" or "cross" or "inner" or "left" or "right" or "full" or "natural" or "using";
+    private static bool Clause(string value) => value is "into" or "from" or "where" or "group" or "having" or "window" or "order" or "limit" or "offset" or "union" or "intersect" or "except" or "fetch" or "for" or "returning" or "on" or "join" or "cross" or "inner" or "left" or "right" or "full" or "natural" or "using";
     private long Count()
     {
         if (token.Kind != TokenKind.Integer) throw Errors.Syntax("expected nonnegative integer");
@@ -143,12 +175,19 @@ internal sealed partial class Parser
             nesting++; Depth(nesting);
             if (Is("select") || Is("values") || Is("with")) left = Node("subquery", "") with { Query = Select() };
             else left = Expr();
+            if (left.Op == "subquery" && (Is("union") || Is("except") || Is("intersect")))
+                left = left with { Query = QueryTail(SetQueryTail(left.Query!, 0)) };
             if (Eat(","))
             {
                 var fields = new List<Expression> { left }; do { fields.Add(Expr()); } while (Eat(","));
                 left = Node("row", "", fields.ToArray());
             }
             Expect(")"); nesting--;
+        }
+        else if (token.Kind is TokenKind.Word or TokenKind.QuotedName && Peek().Text == ".")
+        {
+            var qualifier = Name(); Expect(".");
+            left = Eat("*") ? Node("star", qualifier) : Node("name", qualifier + "." + Name());
         }
         else if (Is("-") || Is("+") || Is("not"))
         {
@@ -192,7 +231,7 @@ internal sealed partial class Parser
             Expect("("); var field = token.Kind == TokenKind.String ? Take().Text : Name(); Expect("from");
             var source = Expr(); Expect(")"); left = Node("extract", field, source);
         }
-        else if (Eat("current_date")) left = Node("call", "current_date");
+        else if (Eat("current_date")) { if (Eat("(")) Expect(")"); left = Node("call", "current_date"); }
         else if (Eat("current_timestamp")) left = Node("call", "now");
         else if (token.Kind == TokenKind.Parameter) left = Node("parameter", Take().Text);
         else if (token.Kind is TokenKind.Word or TokenKind.QuotedName)
@@ -201,12 +240,24 @@ internal sealed partial class Parser
             var name = Name();
             if (!quoted && name == "double" && Eat("precision")) name += " precision";
             if (!quoted && name == "character" && Eat("varying")) name += " varying";
+            if (!quoted && name == "timestamp" && (Is("with") || Is("without")))
+            {
+                var withZone = Eat("with"); if (!withZone) Expect("without"); Expect("time"); Expect("zone");
+                if (withZone) name = "timestamptz";
+            }
             if (token.Kind == TokenKind.String)
             {
                 var literal = Node("text", Take().Text);
                 if (name == "interval") name = IntervalQualifier(name);
                 left = Node("cast", name, literal);
             }
+            else if (Is("(") && name is "json" or "json_value" or "json_query" or "json_exists" or "json_serialize")
+            {
+                Take(); left = JsonSpecial(name);
+            }
+            else if (name == "substring" && Eat("(")) left = SubstringSyntax();
+            else if (!quoted && name == "overlay" && Eat("(")) left = OverlaySyntax();
+            else if (!quoted && name == "position" && Eat("(")) left = PositionSyntax();
             else if (Eat("("))
             {
                 nesting++; Depth(nesting);
@@ -220,16 +271,17 @@ internal sealed partial class Parser
                         {
                             var label = Name(); Expect("=>"); args.Add(Node("named", label, Expr()));
                         }
-                        else args.Add(Eat("*") ? Node("star", "") : Expr());
+                        else args.Add(Eat("variadic") ? Node("variadic", "", Expr()) : Eat("*") ? Node("star", "") : Expr());
+                        if (args[^1].Op == "variadic" && Is(",")) throw Errors.Syntax("VARIADIC argument must be last");
                     } while (Eat(","));
                     if (Eat("order")) { Expect("by"); aggregateOrder = OrderItems(); }
                     Expect(")");
                 }
                 nesting--;
-                if (name is "coalesce" or "greatest" or "least" && args.Count == 0) throw Errors.Syntax("conditional function requires arguments");
+                if (name is "coalesce" or "greatest" or "least" && (args.Count == 0 || distinctArgument || aggregateOrder is not null || args.Any(argument => argument.Op is "named" or "variadic") || Is("over") || Is("filter") || Is("within"))) throw Errors.Syntax("invalid conditional expression syntax");
                 if (distinctArgument && (args.Count == 0 || args.Any(a => a.Op == "star"))) throw Errors.Syntax("DISTINCT requires an expression");
                 left = Node(name == "row" ? "row" : distinctArgument ? "call_distinct" : "call", name, args.ToArray()) with { AggregateOrder = aggregateOrder };
-                if (Eat("within")) { Expect("group"); Expect("("); Expect("order"); Expect("by"); left = left with { Op = "ordered_aggregate", AggregateOrder = OrderItems() }; Expect(")"); }
+                if (Eat("within")) { if (distinctArgument || aggregateOrder is not null) throw Errors.Syntax("invalid ordered-set aggregate decoration"); Expect("group"); Expect("("); Expect("order"); Expect("by"); left = left with { Op = "ordered_aggregate", AggregateOrder = OrderItems() }; Expect(")"); }
                 if (Eat("filter")) { Expect("("); Expect("where"); var predicate = Expr(); Expect(")"); left = left with { Predicate = predicate }; }
                 if (Eat("over")) left = left with { Window = Over() };
             }
@@ -241,8 +293,13 @@ internal sealed partial class Parser
         }
         else throw Errors.Syntax($"expected expression, found {token.Text}");
 
+        var seenIs = false; var seenComparison = false;
         while (true)
         {
+            if (Is("collate") && minimum <= 80)
+            {
+                Take(); if (token.Kind != TokenKind.QuotedName) throw Errors.Syntax("collation name must be quoted"); left = Node("collate", Name(), left); continue;
+            }
             if (Is("[") && minimum <= 80)
             {
                 var dimensions = new List<Expression> { left };
@@ -258,7 +315,7 @@ internal sealed partial class Parser
             }
             if (Is(".") && minimum <= 80)
             {
-                Take(); left = Node("field", Name(), left); continue;
+                Take(); left = Eat("*") ? Node("field_star", "", left) : Node("field", Name(), left); continue;
             }
             if (Is("::") && minimum <= 80)
             {
@@ -270,8 +327,10 @@ internal sealed partial class Parser
             }
             if (Is("is") && minimum <= 40)
             {
+                if (seenIs) throw Errors.Syntax("IS predicates do not associate"); seenIs = true;
                 Take(); var negate = Eat("not");
                 if (Eat("null")) left = Node(negate ? "is_not_null" : "is_null", "", left);
+                else if (Eat("json")) left = JsonPredicate(left, negate);
                 else if (Is("true") || Is("false") || Is("unknown"))
                     left = Node("is_boolean", (negate ? "not_" : "") + Take().Text, left);
                 else if (Eat("distinct"))
@@ -283,7 +342,7 @@ internal sealed partial class Parser
                 else throw Errors.Unsupported("IS predicates other than NULL/DISTINCT FROM");
                 continue;
             }
-            if (minimum <= 35 && (Is("between") || Is("in") || Is("like") || Is("not") && Peek().Text is "between" or "in" or "like"))
+            if (minimum <= 35 && (Is("between") || Is("in") || Is("like") || Is("ilike") || Is("similar") || Is("not") && Peek().Text is "between" or "in" or "like" or "ilike" or "similar"))
             {
                 var negate = Eat("not");
                 if (Eat("between"))
@@ -301,25 +360,33 @@ internal sealed partial class Parser
                         var operands = new List<Expression> { left };
                         do
                         {
-                            if (operands.Count > 1000) throw new SqlException(SqlStates.ProgramLimitExceeded, "IN list exceeds 1000 elements");
+                            if (operands.Count > 1000) throw new SqlException(SqlStates.StatementTooComplex, "IN list exceeds 1000 elements");
                             operands.Add(Expr());
                         } while (Eat(","));
-                        left = Node("in", "", operands.ToArray());
+                        left = operands.Count == 2 && operands[1] is { Op: "subquery", Query: { } nestedQuery }
+                            ? Node("in_subquery", "", operands[0], Node("subquery_set", "") with { Query = QueryTail(SetQueryTail(nestedQuery, 0)) })
+                            : Node("in", "", operands.ToArray());
                     }
                     Expect(")"); nesting--;
                 }
+                else if (Eat("similar"))
+                {
+                    Expect("to"); var pattern = Expr(41);
+                    left = Eat("escape") ? Node("similar", "", left, pattern, Expr(41)) : Node("similar", "", left, pattern);
+                }
                 else
                 {
-                    Expect("like"); var pattern = Expr(41);
+                    var matchOperation = Eat("ilike") ? "ilike" : "like"; if (matchOperation == "like") Expect("like"); var pattern = Expr(41);
                     if (Eat("escape")) pattern = Node("call", "like_escape", pattern, Expr(41));
-                    left = Node("like", "", left, pattern);
+                    left = Node(matchOperation, "", left, pattern);
                 }
-                if (negate) left = Node("not", "", left);
+                if (negate) left = left.Op == "in_subquery" ? left with { Text = "not" } : Node("not", "", left);
                 continue;
             }
             var precedence = token.Kind is TokenKind.Word or TokenKind.Symbol ? token.Text switch
             {
                 "or" => 10, "and" => 20,
+                "~" or "~*" or "!~" or "!~*" => 40,
                 "=" or "<>" or "!=" or "<" or "<=" or ">" or ">=" or "@>" or "<@" or "&&" or "-|-" or "<<" or ">>" or "&<" or "&>" or "?" or "?|" or "?&" or "@?" or "@@" => 40,
                 "->" or "->>" or "#>" or "#>>" or "#-" => 45,
                 "||" => 45, "+" or "-" => 50, "*" or "/" or "%" => 60, "^" => 65,
@@ -327,6 +394,11 @@ internal sealed partial class Parser
             } : -1;
             if (precedence < minimum) break;
             var operation = Take().Text;
+            if (operation is "=" or "<>" or "!=" or "<" or "<=" or ">" or ">=")
+            {
+                if (seenComparison) throw Errors.Syntax("comparison predicates do not associate");
+                seenComparison = true;
+            }
             nesting++; Depth(nesting);
             if (precedence == 40 && (Is("any") || Is("all") || Is("some")))
             {
@@ -334,6 +406,7 @@ internal sealed partial class Parser
                 var subquery = Is("select") || Is("values") || Is("with");
                 var array = subquery ? Node("subquery_set", "") with { Query = Select() } : Expr();
                 Expect(")"); nesting--;
+                if (array.Op == "subquery") { array = array with { Op = "subquery_set" }; subquery = true; }
                 left = Node(subquery ? "quantified_subquery" : "quantified", operation + " " + (quantifier == "all" ? "all" : "any"), left, array);
             }
             else
@@ -381,9 +454,10 @@ internal sealed partial class Parser
     }
     private string TypeName()
     {
+        var quoted = token.Kind == TokenKind.QuotedName;
         var name = Name();
-        if (name == "character" && Eat("varying")) name += " varying";
-        if (name == "double" && Eat("precision")) name += " precision";
+        if (!quoted && name == "character" && Eat("varying")) name += " varying";
+        if (!quoted && name == "double" && Eat("precision")) name += " precision";
         if (Eat("("))
         {
             var modifiers = new List<string>();

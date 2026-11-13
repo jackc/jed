@@ -16,7 +16,7 @@ internal ref struct KeyReader(ReadOnlySpan<byte> key, bool descending)
         if (count < 0 || count > input.Length - Position) throw StorageFormat.Corrupt("truncated index key");
         Position += count;
     }
-    internal void Skip(SqlType type, bool nullable = false, int depth = 0)
+    internal void Skip(SqlType type, bool nullable = false, int depth = 0, bool collated = false)
     {
         if (nullable)
         {
@@ -31,6 +31,8 @@ internal ref struct KeyReader(ReadOnlySpan<byte> key, bool descending)
             case SqlKind.I64 or SqlKind.Timestamp or SqlKind.Timestamptz or SqlKind.F64: Bytes(8); return;
             case SqlKind.Uuid or SqlKind.Interval: Bytes(16); return;
             case SqlKind.Text or SqlKind.Bytea:
+                if (collated && type.Kind == SqlKind.Text)
+                    for (var level = 0; level < 3; level++) while ((Byte() << 8 | Byte()) != 0) { }
                 while (true)
                 {
                     if (Byte() != 0) continue;
@@ -53,7 +55,7 @@ internal ref struct KeyReader(ReadOnlySpan<byte> key, bool descending)
                 while (true)
                 {
                     var element = Byte(); if (element == 0) break;
-                    if (element == 1) Skip(type.Element!, false, depth);
+                    if (element == 1) Skip(type.Element!, false, depth, collated);
                     else if (element != 2) throw StorageFormat.Corrupt("invalid array index element");
                 }
                 var rank = Byte(); Bytes(rank * 8); return;

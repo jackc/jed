@@ -4,7 +4,8 @@ internal sealed record CreateTypeSyntax(string Name, ColumnSyntax[] Fields) : St
 internal sealed record DropTypeSyntax(string Name, bool IfExists, bool Cascade) : StatementSyntax;
 
 internal sealed record ConstraintSyntax(string Kind, string? Name, string[] Columns, Expression? Expression = null,
-    string? Text = null, string? Parent = null, string[]? ParentColumns = null, byte OnDelete = 0, byte OnUpdate = 0, bool MatchFull = false);
+    string? Text = null, string? Parent = null, string[]? ParentColumns = null, byte OnDelete = 0, byte OnUpdate = 0, bool MatchFull = false, ExclusionSyntax? Exclusion = null);
+internal sealed record ExclusionSyntax(string Method, Expression[] Elements, string[] Operators, Expression? Predicate, string? PredicateText);
 internal sealed record IndexKeySyntax(Expression Expression, string Text, byte Options);
 internal sealed record CreateIndexSyntax(string? Name, string Table, IndexKeySyntax[] Keys, bool Unique, bool IfNotExists,
     string Method, Expression? Predicate = null, string? PredicateText = null) : StatementSyntax;
@@ -51,9 +52,12 @@ internal sealed partial class Parser
     }
     private StatementSyntax CreateDefinition()
     {
-        if (Eat("materialized")) throw Errors.Unsupported("materialized views");
         var replaceView = Eat("or"); if (replaceView) Expect("replace");
-        if (Eat("view")) return CreateView(replaceView);
+        if (Eat("unlogged")) throw Errors.Unsupported("unlogged tables");
+        var temporary = Eat("temp") || Eat("temporary");
+        if (temporary && !Is("table") && !Is("view")) throw Errors.Syntax("expected TABLE or VIEW after TEMP");
+        if (Eat("materialized")) throw Errors.Unsupported("materialized views");
+        if (Eat("view")) return CreateView(replaceView, temporary);
         if (replaceView) throw Errors.Syntax("expected VIEW");
         if (Eat("sequence")) return CreateSequence();
         if (Eat("type"))
@@ -76,7 +80,7 @@ internal sealed partial class Parser
             do
             {
                 var parenthesized = Is("("); var (expression, text) = CapturedExpression();
-                if (!parenthesized && expression.Op is not ("name" or "call")) throw Errors.Syntax("index expression requires parentheses");
+                if (!parenthesized && expression.Op is not ("name" or "call" or "collate")) throw Errors.Syntax("index expression requires parentheses");
                 var descending = Eat("desc"); if (!descending) Eat("asc");
                 var first = descending;
                 if (Eat("nulls")) { if (Eat("first")) first = true; else { Expect("last"); first = false; } }
@@ -89,12 +93,13 @@ internal sealed partial class Parser
         if (unique) throw Errors.Syntax("expected INDEX after UNIQUE");
         Expect("table"); var ifAbsent = Eat("if"); if (ifAbsent) { Expect("not"); Expect("exists"); }
         var tableName = QualifiedName();
-        if (Is("as")) return TableAs(tableName, null, ifAbsent);
+        temporary |= DatabaseDomains.Name(tableName).Domain == "temp";
+        if (Is("as") || Is("on")) return TableAs(tableName, null, ifAbsent, temporary);
         Expect("(");
         if (token.Kind is TokenKind.Word or TokenKind.QuotedName && Peek().Text is "," or ")")
         {
             var aliases = new List<string>(); do { aliases.Add(Name()); } while (Eat(",")); Expect(")");
-            return TableAs(tableName, aliases.ToArray(), ifAbsent);
+            return TableAs(tableName, aliases.ToArray(), ifAbsent, temporary);
         }
         var columns = new List<ColumnSyntax>(); var constraints = new List<ConstraintSyntax>();
         do
@@ -103,17 +108,27 @@ internal sealed partial class Parser
             else columns.Add(ColumnDefinition(constraints));
         } while (Eat(","));
         Expect(")");
-        return new CreateTableSyntax(tableName, columns.ToArray(), [], ifAbsent, constraints.ToArray());
+        return new CreateTableSyntax(tableName, columns.ToArray(), [], ifAbsent, constraints.ToArray(), temporary, OnCommit(temporary));
+    }
+    private byte OnCommit(bool temporary)
+    {
+        if (!Eat("on")) return 0;
+        Expect("commit");
+        var prefix = temporary ? 0 : 128;
+        if (Eat("drop")) return (byte)(prefix | 2);
+        if (Eat("delete")) { Expect("rows"); return (byte)(prefix | 1); }
+        Expect("preserve"); Expect("rows"); return (byte)prefix;
     }
     private bool IsTableConstraint() => Is("constraint") || Is("primary") && Peek().Text == "key" || Is("unique") && Peek().Text == "(" ||
-        Is("check") && Peek().Text == "(" || Is("foreign") && Peek().Text == "key";
+        Is("check") && Peek().Text == "(" || Is("foreign") && Peek().Text == "key" || Is("exclude") && Peek().Text is "(" or "using";
     private ColumnSyntax ColumnDefinition(List<ConstraintSyntax> constraints)
     {
         var name = Name(); var type = TypeName(); var notNull = false; var primary = false;
-        Expression? value = null; string? defaultText = null; var identity = false; var always = false; SequenceOptions? sequence = null;
+        Expression? value = null; string? defaultText = null; var identity = false; var always = false; SequenceOptions? sequence = null; string? collation = null;
         while (true)
         {
-            if (Eat("not")) { Expect("null"); notNull = true; }
+            if (Eat("collate")) { if (collation is not null) throw Errors.Syntax("multiple column collations"); collation = Name(); }
+            else if (Eat("not")) { Expect("null"); notNull = true; }
             else if (Eat("null")) { }
             else if (Eat("default")) { if (value is not null || identity) throw Errors.Syntax("multiple column defaults"); (value, defaultText) = CapturedExpression(); }
             else if (Eat("generated"))
@@ -130,11 +145,25 @@ internal sealed partial class Parser
             else if (Is("check") || Is("unique") || Is("constraint") || Is("references")) constraints.Add(ReadConstraint(name));
             else break;
         }
-        return new(name, type, notNull, false, value, defaultText, identity, always, sequence);
+        return new(name, type, notNull, false, value, defaultText, identity, always, sequence, collation);
     }
     private ConstraintSyntax ReadConstraint(string? column)
     {
         var name = Eat("constraint") ? Name() : null;
+        if (Eat("exclude"))
+        {
+            var method = Eat("using") ? Name() : "btree";
+            Expect("("); var elements = new List<Expression>(); var operators = new List<string>();
+            do
+            {
+                elements.Add(Expr()); Expect("with");
+                if (token.Kind != TokenKind.Symbol) throw Errors.Syntax("expected exclusion operator");
+                operators.Add(Take().Text);
+            } while (Eat(","));
+            Expect(")"); Expression? predicate = null; string? text = null;
+            if (Eat("where")) { Expect("("); (predicate, text) = CapturedExpression(); Expect(")"); }
+            return new("exclude", name, elements.Select(element => element.Text).ToArray(), Exclusion: new(method, elements.ToArray(), operators.ToArray(), predicate, text));
+        }
         if (Eat("check"))
         {
             Expect("("); var (expression, text) = CapturedExpression(); Expect(")");

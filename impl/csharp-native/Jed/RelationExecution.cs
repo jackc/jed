@@ -2,29 +2,56 @@ using System.Runtime.CompilerServices;
 
 namespace Jed;
 
-internal sealed record PreparedRelation(BoundColumn[] Columns, IAsyncEnumerable<SqlValue[]> Rows, Func<ValueTask>? Initialize = null, OuterFrame[]? Dependencies = null, Func<ValueTask>? InitializeConstants = null);
+internal sealed record PreparedRelation(BoundColumn[] Columns, IAsyncEnumerable<SqlValue[]> Rows, Func<ValueTask>? Initialize = null, OuterFrame[]? Dependencies = null, Func<ValueTask>? InitializeConstants = null, bool NoReturning = false,
+    Func<Resolved, (PreparedRelation Relation, Resolved? Residual)>? PushFilter = null, long? EstimatedRows = null, BaseRelationAccess? BaseAccess = null, bool MemoryOutput = false, Func<HashSet<int>, PreparedRelation>? WithTouched = null, CrossJoinChain? CrossChain = null, ExplainNode? Plan = null, Func<SortPlan[], long, Resolved?, PreparedRelation?>? Bounded = null, ExplainCte? Cte = null);
 
 internal static class RelationExecution
 {
     internal static PreparedRelation Prepare(RelationSyntax source, Database database, DatabaseSnapshot snapshot,
-        PendingDatabase? pending, Catalog catalog, Meter meter, CancellationToken cancellationToken, QueryScope? scope = null)
+        PendingDatabase? pending, Catalog catalog, Meter meter, CancellationToken cancellationToken, QueryScope? scope = null, QueryScope? preceding = null)
     {
         switch (source)
         {
-            case LateralRelation lateral: return Prepare(lateral.Source, database, snapshot, pending, catalog, meter, cancellationToken, scope);
+case GroupedRelation group:
+{
+    PreparedRelation Wrap(PreparedRelation input) => input with
+    {
+        Rows = GroupRows(input.Rows, meter, cancellationToken), BaseAccess = null, CrossChain = null,
+        WithTouched = input.WithTouched is null ? null : mask => Wrap(input.WithTouched(mask)),
+        PushFilter = input.PushFilter is null ? null : filter =>
+        {
+            var pushed = input.PushFilter(filter); return (Wrap(pushed.Relation), pushed.Residual);
+        }
+    };
+    return Wrap(Prepare(group.Source, database, snapshot, pending, catalog, meter, cancellationToken, scope, preceding));
+}
+            case LateralRelation lateral: return Prepare(lateral.Source, database, snapshot, pending, catalog, meter, cancellationToken, preceding ?? scope);
             case AliasedRelation aliased:
             {
-                var input = Prepare(aliased.Source, database, snapshot, pending, catalog, meter, cancellationToken, scope);
+                var input = Prepare(aliased.Source, database, snapshot, pending, catalog, meter, cancellationToken, scope, preceding);
                 var slots = Enumerable.Range(0, input.Columns.Length).Where(i => !input.Columns[i].Hidden).ToArray();
-                return input with { Columns = Alias(slots.Select(i => input.Columns[i]).ToArray(), aliased.Alias, aliased.ColumnAliases), Rows = Visible(input.Rows, slots) };
+                PreparedRelation Wrap(PreparedRelation source) => source with
+                {
+                    Columns = Alias(slots.Select(i => source.Columns[i] with { Projection = null }).ToArray(), aliased.Alias, aliased.ColumnAliases),
+                    Rows = Visible(source.Rows, slots), PushFilter = null, Bounded = null,
+                    WithTouched = source.WithTouched is null ? null : mask => Wrap(source.WithTouched(mask.Select(slot => slots[slot]).ToHashSet()))
+                };
+                return Wrap(input);
             }
             case SetRelation set:
             {
                 var left = Query(set.Left, database, snapshot, pending, catalog, meter, cancellationToken, scope: scope);
                 var right = Query(set.Right, database, snapshot, pending, catalog, meter, cancellationToken, scope: scope);
                 if (left.Columns.Length != right.Columns.Length) throw Errors.Syntax("set operands have different column counts");
-                var columns = left.Columns.Select((column, index) => column with { Type = Resolve.Common(column.Type, right.Columns[index].Type), Qualifier = null }).ToArray();
-                return new(columns, SetExecution.Run(left.Rows, right.Rows, columns.Select(column => column.Type).ToArray(), set.Operation, set.All, meter, cancellationToken), Dependencies: Merge(left.Dependencies, right.Dependencies), InitializeConstants: CombineConstants(left, right));
+if (set.Operation != "union" || !set.All)
+    foreach (var pair in left.Columns.Zip(right.Columns))
+    {
+        Resolve.RequireOrderable(pair.First.Type); Resolve.RequireOrderable(pair.Second.Type);
+        CollationRules.Require(CollationRules.Merge(new[] { pair.First.Collation, pair.Second.Collation }), true);
+    }
+var columns = left.Columns.Select((column, index) => column with { Type = Resolve.Common(column.Type, right.Columns[index].Type), Qualifier = null,
+                    Collation = CollationRules.Merge(new[] { column.Collation, right.Columns[index].Collation })?.Implicit() }).ToArray();
+                return ExplainPlanning.Set(new(columns, SetExecution.Run(left.Rows, right.Rows, columns.Select(column => column.Type).ToArray(), set.Operation, set.All, meter, cancellationToken, left.MemoryOutput, right.MemoryOutput), Dependencies: Merge(left.Dependencies, right.Dependencies), InitializeConstants: CombineConstants(left, right), MemoryOutput: true), left, right, set.Operation, set.All, meter);
             }
             case ValuesRelation values:
             {
@@ -37,48 +64,114 @@ internal static class RelationExecution
                     var expressions = syntaxRows.Select(row => row[column]).ToArray();
                     var resolved = Resolve.Unify(expressions).Select(value => value.Op == "float_widen" ? value with { Op = "promote" } : value).ToArray();
                     var type = resolved[0].Type == SqlType.Unknown ? SqlType.Text : resolved[0].Type;
-                    columns[column] = new($"column{column + 1}", type, "*VALUES*");
+                    columns[column] = new($"column{column + 1}", type, "*VALUES*", Collation: CollationRules.Merge(resolved)?.Implicit());
                     for (var row = 0; row < rows.Length; row++) rows[row][column] = resolved[row].Type == SqlType.Unknown ? Resolve.Expr(expressions[row], type) : resolved[row];
                 }
-                return Finish(columns, Values(rows, meter, cancellationToken), cells, rows.SelectMany(row => row), frame);
+                var preparedValues = Finish(columns, Values(rows, meter, cancellationToken), cells, rows.SelectMany(row => row), frame) with { EstimatedRows = rows.Length };
+                return meter.Explain is null ? preparedValues : ExplainPlanning.Attach(preparedValues,
+                    new("Values", "rows=" + rows.Length, rows.Length, Estimate.Add(rows.Length, ExplainPlanning.Expressions(rows.SelectMany(row => row)))), meter);
             }
             case TableRelation named:
             {
                 if (scope is not null && scope.TryGet(named.Name, out var cte))
-                    return cte with { Columns = Alias(cte.Columns, named.Alias ?? named.Name, named.ColumnAliases) };
-                if ((catalog.Views ?? []).FirstOrDefault(view => view.Name == named.Name) is { } view)
+                {
+                    if (cte.NoReturning) throw Errors.Unsupported("WITH query has no RETURNING clause");
+                    var reference = cte with { Columns = Alias(cte.Columns, named.Alias ?? named.Name, named.ColumnAliases) };
+                    if (meter.Explain is not null && cte.Cte is { } definition)
+                        reference = ExplainPlanning.Attach(reference, new("CTE Scan " + definition.Name, "-", definition.Body.EstimatedRows,
+                            definition.Materialized ? definition.Body.EstimatedRows : definition.Body.EstimatedCost,
+                            definition.Materialized ? [] : [definition.Body]), meter);
+                    return reference;
+                }
+                if (CatalogRelations.IsCatalogName(named.Name)) return CatalogRelations.Prepare(named, database, snapshot, pending, catalog, meter, cancellationToken);
+                if (catalog.Scope?.View(named.Name) is { } scopedView)
+                {
+                    var home = scopedView.Domain; var viewCatalog = home.Catalog with { Scope = catalog.Scope.Stored(home.Name) };
+                    var body = Query(StatementExecution.ViewQuery(scopedView.View), home.Database, home.Snapshot, home.Pending, viewCatalog, meter, cancellationToken);
+                    var columns = Alias(body.Columns, scopedView.View.Name, scopedView.View.Columns.Select(column => column.Name).ToArray());
+                    columns = columns.Select(column => column with { RowName = column.Name, Collation = column.Collation?.Implicit() }).ToArray();
+                    return body with { Columns = Alias(columns, named.Alias ?? scopedView.View.Name, named.ColumnAliases) };
+                }
+                if (catalog.Scope is null && (catalog.Views ?? []).FirstOrDefault(view => view.Name == named.Name) is { } view)
                 {
                     var body = Query(StatementExecution.ViewQuery(view), database, snapshot, pending, catalog, meter, cancellationToken);
                     var columns = Alias(body.Columns, named.Name, view.Columns.Select(column => column.Name).ToArray());
+                    columns = columns.Select(column => column with { RowName = column.Name, Collation = column.Collation?.Implicit() }).ToArray();
                     return body with { Columns = Alias(columns, named.Alias ?? named.Name, named.ColumnAliases) };
                 }
-                var table = StatementExecution.Table(catalog, named.Name);
-
-                return new(Alias(StatementExecution.Columns(table), named.Alias ?? named.Name, named.ColumnAliases),
-                    QueryExecution.TableSource(table, database.Tree(table, pending, snapshot), meter, cancellationToken));
+                var table = StatementExecution.ResolveTable(catalog, named.Name);
+                var tableColumns = Alias(StatementExecution.Columns(table), named.Alias ?? table.Name, named.ColumnAliases);
+                var tree = database.Tree(table, pending, snapshot);
+                PreparedRelation Scan(Resolved? filter)
+                {
+                    var projection = tableColumns.Select((column, slot) => new Projection(new("column", column.Type, default, [], Slot: slot, Collation: column.Collation), column.Name)).ToArray();
+                    var scanPlan = new SelectPlan(projection, filter, null, 0, false);
+                    var storage = new QueryStorage(database, snapshot, pending, catalog);
+                    ExplainNode? scanNode = null;
+                    if (meter.Explain is not null)
+                    {
+                        var access = AccessPlan.Select(table, tree, filter, storage, meter);
+                        scanPlan = scanPlan with { Access = access };
+                        scanNode = ExplainPlanning.Scan(table, access, filter, StorageTouchedColumns.Collect(scanPlan), true, meter, catalog, tree.Height);
+                    }
+                    var sourceRows = QueryExecution.DeferredTableSource(table, tree, scanPlan, meter, cancellationToken, new(database, snapshot, pending, catalog));
+                    var rows = filter is null ? sourceRows : PredicatePlan.Rows(sourceRows, filter, meter, cancellationToken);
+                    var preparedScan = new PreparedRelation(tableColumns, rows, BaseAccess: new(table, tree, filter, storage), EstimatedRows: Estimate.Rows(table.RowCount, filter), PushFilter: next =>
+                        (Scan(PredicatePlan.Order(filter is null ? next : PredicatePlan.Combine([filter, next]))), null));
+                    return scanNode is null ? preparedScan : ExplainPlanning.Attach(preparedScan, scanNode, meter);
+                }
+                return Scan(null);
             }
             case FunctionRelation function:
             {
-                if (function.Function.Text != "generate_series") throw new SqlException(SqlStates.UndefinedFunction, "unknown set-returning function");
+                var functionScope = preceding ?? scope;
                 var cells = new List<SubqueryCell>(); var frame = new OuterFrame([]);
-                var expressions = function.Function.Args.Select(value => Resolve.Bind(SubqueryExecution.Bind(value, frame, database, snapshot, pending, catalog, meter, cancellationToken, scope, cells), scope?.OuterColumns ?? [])).ToArray();
+                var expressions = function.Function.Args.Select(value => Resolve.Bind(SubqueryExecution.Bind(value, frame, database, snapshot, pending, catalog, meter, cancellationToken, functionScope, cells), functionScope?.OuterColumns ?? [])).ToArray();
+                var definitions = function.Definitions?.Select(field =>
+                {
+                    var spec = SqlTypes.ParseSpec(field.TypeName, catalog.NamedType);
+                    return new SqlField(field.Name, spec.Type, Precision: spec.Precision, Scale: spec.Scale, Length: spec.Length, IntervalFields: spec.IntervalFields);
+                }).ToArray();
+                if (JsonSetFunctions.TryResolve(function.Function with { Args = expressions }, out var jsonFunction, out var jsonColumns, definitions))
+                {
+                    var name = function.Function.Text;
+                    if (jsonColumns.Length == 1 && !name.Contains("record", StringComparison.Ordinal) && name != "json_table") jsonColumns[0] = jsonColumns[0] with { ScalarRelation = true };
+                    if (jsonColumns.Length == 1 && (name.EndsWith("object_keys", StringComparison.Ordinal) || name.StartsWith("jsonb_path_query", StringComparison.Ordinal)))
+                        jsonColumns[0] = jsonColumns[0] with { Name = function.Alias ?? name };
+                    return ExplainPlanning.Function(Finish(Alias(jsonColumns, function.Alias ?? name, function.ColumnAliases), JsonSetFunctions.Rows(jsonFunction, meter, cancellationToken), cells, jsonFunction.Args, frame), name, [jsonFunction], meter);
+                }
+                if (function.Function.Text == "unnest")
+                {
+                    var array = OpenSetFunctions.Resolve(function.Function with { Args = expressions });
+                    var fields = OpenSetFunctions.Columns(array, definitions);
+                    var outputs = fields is null ? [new BoundColumn(function.Alias ?? "unnest", array.Type.Element!, Collation: array.Collation, ScalarRelation: true)] :
+                        fields.Select(field => new BoundColumn(field.Name, field.Type)).ToArray();
+                    return ExplainPlanning.Function(Finish(Alias(outputs, function.Alias ?? "unnest", function.ColumnAliases), OpenSetFunctions.Rows(array, meter, cancellationToken, fields), cells, [array], frame), "unnest", [array], meter);
+                }
+                if (function.Function.Text is "regexp_matches" or "regexp_split_to_table")
+                {
+                    var regex = RegexSetFunctions.Resolve(function.Function with { Args = expressions });
+                    var output = new BoundColumn(function.Alias ?? function.Function.Text, regex.Type, Collation: regex.Collation, ScalarRelation: true);
+                    return ExplainPlanning.Function(Finish(Alias([output], function.Alias ?? function.Function.Text, function.ColumnAliases), RegexSetFunctions.Rows(regex, meter, cancellationToken), cells, regex.Args, frame), function.Function.Text, [regex], meter);
+                }
+                if (function.Function.Text != "generate_series") throw new SqlException(SqlStates.UndefinedFunction, "unknown set-returning function");
                 if (expressions.Length is not (2 or 3)) throw new SqlException(SqlStates.UndefinedFunction, "generate_series requires two or three arguments");
                 var args = expressions.All(e => e.Op == "null") ? expressions.Select(e => Resolve.Expr(e, SqlType.I64)).ToArray() : Resolve.Unify(expressions);
                 if (args.Any(a => !a.Type.IsInteger())) throw new SqlException(SqlStates.UndefinedFunction, "generate_series requires integers");
-                var columns = Alias([new(function.Alias ?? "generate_series", args[0].Type)], function.Alias ?? "generate_series", function.ColumnAliases);
-                return Finish(columns, Series(args, meter, cancellationToken), cells, args, frame);
+                var columns = Alias([new(function.Alias ?? "generate_series", args[0].Type, ScalarRelation: true)], function.Alias ?? "generate_series", function.ColumnAliases);
+                return ExplainPlanning.Function(Finish(columns, Series(args, meter, cancellationToken), cells, args, frame), "generate_series", args, meter);
             }
             case DerivedRelation derived:
             {
                 var query = Query(derived.Query, database, snapshot, pending, catalog, meter, cancellationToken, derived: true, scope: scope);
-                return query with { Columns = Alias(query.Columns, derived.Alias, derived.ColumnAliases) };
+                return ExplainPlanning.Wrapper(query with { Columns = Alias(query.Columns.Select(column => column with { Collation = column.Collation?.Implicit() }).ToArray(), derived.Alias, derived.ColumnAliases) }, "Subquery" + (derived.Alias is null ? "" : " " + derived.Alias), meter);
             }
             case JoinedRelation join:
             {
-                var left = Prepare(join.Left, database, snapshot, pending, catalog, meter, cancellationToken, scope);
+                var left = Prepare(join.Left, database, snapshot, pending, catalog, meter, cancellationToken, scope, preceding);
                 var lateralFrame = new OuterFrame(left.Columns);
-                var rightScope = join.Right is LateralRelation or FunctionRelation ? new QueryScope(scope, lateralFrame) : scope;
-                var right = Prepare(join.Right, database, snapshot, pending, catalog, meter, cancellationToken, rightScope);
+                var rightScope = new QueryScope(preceding ?? scope, lateralFrame);
+                var right = Prepare(join.Right, database, snapshot, pending, catalog, meter, cancellationToken, scope, rightScope);
                 var lateral = (right.Dependencies ?? []).Contains(lateralFrame);
                 if (lateral && join.Kind is "right" or "full") throw new SqlException(SqlStates.InvalidColumnReference, "LATERAL reference requires an inner or left join");
 
@@ -98,6 +191,7 @@ internal static class RelationExecution
                     return (Left: a[0], Right: b[0], Type: common);
                 }).ToArray();
                 var cells = new List<SubqueryCell>(); var frame = new OuterFrame(inputColumns);
+                if (join.On is { } on && WindowResolve.Contains(on)) throw new SqlException(SqlStates.WindowingError, "window functions are not allowed in JOIN conditions");
                 var predicate = join.On is null ? null : Resolve.Expr(Resolve.Bind(SubqueryExecution.Bind(join.On, frame, database, snapshot, pending, catalog, meter, cancellationToken, scope, cells), inputColumns.Concat(scope?.OuterColumns ?? []).ToArray()));
                 foreach (var pair in usingSlots)
                 {
@@ -107,8 +201,82 @@ internal static class RelationExecution
                     predicate = predicate is null ? equal : new("and", SqlType.Boolean, default, [predicate, equal]);
                 }
                 if (predicate is not null && predicate.Type.Kind is not (SqlKind.Boolean or SqlKind.Unknown)) throw Errors.Type("JOIN ON requires boolean");
-                var columns = usingNames.Select((name, i) => new BoundColumn(name, usingSlots[i].Type)).Concat(inputColumns.Select(c => c with { Hidden = c.Hidden || usingNames.Contains(c.Name, StringComparer.Ordinal) })).ToArray();
-                return Finish(columns, Join(left, right, predicate, join.Kind, usingSlots, meter, cancellationToken, lateral ? lateralFrame : null), cells, predicate is null ? [] : [predicate], frame, Merge(left.Dependencies, right.Dependencies).Where(dependency => dependency != lateralFrame).ToArray(), CombineConstants(left, right));
+                var authoredPredicate = predicate;
+                if (predicate is not null)
+                {
+                    var leftFilters = new List<Resolved>(); var rightFilters = new List<Resolved>(); var residual = new List<Resolved>();
+                    foreach (var item in PredicatePlan.Conjuncts(PredicatePlan.Order(predicate)!))
+                    {
+                        var slots = PredicatePlan.Slots(item);
+                        if (join.Left is not (JoinedRelation or AliasedRelation) && slots.Count != 0 && PredicatePlan.Safe(item) && slots.All(slot => slot < left.Columns.Length) && join.Kind is "inner" or "right") leftFilters.Add(item);
+                        else if (join.Right is not (JoinedRelation or AliasedRelation) && slots.Count != 0 && !lateral && PredicatePlan.Safe(item) && slots.All(slot => slot >= left.Columns.Length) && join.Kind is "inner" or "left") rightFilters.Add(PredicatePlan.Shift(item, -left.Columns.Length));
+                        else residual.Add(item);
+                    }
+                    if (leftFilters.Count != 0) left = PredicatePlan.Filter(left, PredicatePlan.Order(PredicatePlan.Combine(leftFilters))!, meter, cancellationToken);
+                    if (rightFilters.Count != 0) right = PredicatePlan.Filter(right, PredicatePlan.Order(PredicatePlan.Combine(rightFilters))!, meter, cancellationToken);
+                    predicate = PredicatePlan.Combine(residual);
+                }
+                var columns = usingNames.Select((name, i) => new BoundColumn(name, usingSlots[i].Type)).Concat(inputColumns.Select((c, i) => c with
+                {
+                    Hidden = c.Hidden || usingNames.Contains(c.Name, StringComparer.Ordinal),
+                    NullExtended = c.NullExtended || (i < left.Columns.Length ? join.Kind is "right" or "full" : join.Kind is "left" or "full")
+                })).ToArray();
+                PreparedRelation Build(PreparedRelation a, PreparedRelation b, Resolved? on, Resolved? where = null, HashSet<int>? touched = null)
+                {
+                    var inl = lateral ? null : IndexNestedLoop.Select(b, a.Columns.Length, join.Kind, PredicatePlan.Combine(new[] { on, where }.OfType<Resolved>()));
+                    var hash = !lateral && join.Left is not JoinedRelation && join.Right is not JoinedRelation ? HashJoinPlan.Select(authoredPredicate, a.Columns.Length, join.Kind, a.EstimatedRows, b.EstimatedRows, on) : null;
+                    if (a.EstimatedRows is { } outerCount && b.EstimatedRows is { } innerCount && b.BaseAccess is { } innerBase)
+                    {
+                        var fullCost = AccessPlan.Select(innerBase.Table, innerBase.Tree, innerBase.Filter, innerBase.Storage, meter).EstimatedCost;
+                        var residual = PredicatePlan.Combine(new[] { on, where }.OfType<Resolved>());
+                        var loopCost = Estimate.Add(fullCost, Estimate.Multiply(Estimate.Multiply(outerCount, innerCount), residual is null ? 0 : PredicatePlan.Nodes(residual)));
+                        var hashCost = hash is null ? long.MaxValue : Estimate.Add(fullCost, HashJoinPlan.Work(outerCount, innerCount, hash.Types, residual));
+                        var indexCost = inl?.EstimateWork(outerCount, residual) ?? long.MaxValue;
+                        if (inl is not null && indexCost <= loopCost && indexCost <= hashCost) hash = null;
+                        else { inl = null; if (hashCost > loopCost) hash = null; }
+                    }
+                    else if (inl is not null) hash = null;
+                    var chain = !lateral && inl is null && usingSlots.Length == 0 && join.Kind == "cross" && on is null && join.Left is not (GroupedRelation or AliasedRelation) && join.Right is not JoinedRelation
+                        ? new CrossJoinChain((a.CrossChain?.Inputs ?? [a]).Append(b).ToArray()) : null;
+                    var joinedRows = chain is { Inputs.Length: > 2 } ? chain.Rows(meter, touched, cancellationToken) : Join(a, b, on, join.Kind, usingSlots, meter, cancellationToken, lateral ? lateralFrame : null, hash, inl, touched);
+                    var prepared = Finish(columns, joinedRows, cells,
+                        on is null ? [] : [on], frame, Merge(a.Dependencies, b.Dependencies).Where(dependency => dependency != lateralFrame).ToArray(), CombineConstants(a, b));
+                    if (meter.Explain is not null && touched is not null)
+                    {
+                        var mask = new HashSet<int>(touched);
+                        if (on is not null) mask.UnionWith(PredicatePlan.Slots(on));
+                        if (where is not null) mask.UnionWith(PredicatePlan.Slots(where));
+                        ExplainPlanning.Touched(a.Plan, mask.Count(slot => slot < a.Columns.Length));
+                        ExplainPlanning.Touched(b.Plan, mask.Count(slot => slot >= a.Columns.Length && slot < a.Columns.Length + b.Columns.Length));
+                    }
+                    prepared = ExplainPlanning.Join(prepared, a, b, join.Kind, on, hash, inl, meter);
+                    PreparedRelation? Bounded(SortPlan[] order, long count, Resolved? finalFilter)
+                    {
+                        if (lateral || hash is not null || usingSlots.Length != 0 || join.Kind is not ("inner" or "cross") ||
+                            a.BaseAccess is not { } first || b.BaseAccess is null) return null;
+                        var keys = first.Table.PrimaryKey;
+                        var driver = AccessPlan.Select(first.Table, first.Tree, first.Filter, first.Storage, meter);
+                        if (driver.Kind is not (AccessKind.Primary or AccessKind.Full or AccessKind.PrimaryIntervals)) return null;
+                        if (first.Table.PrimaryKey.Length == 0 || order.Length > keys.Length ||
+                            order.Select((key, slot) => key.Descending || key.Expression.Op != "column" || key.Expression.Slot != keys[slot] || key.Expression.Collation?.Table is not null).Any(value => value)) return null;
+                        return prepared with { Rows = StreamingJoin.Run(a, b, on, finalFilter, join.Kind, inl, count, meter, cancellationToken), MemoryOutput = true };
+                    }
+                    return prepared with { Bounded = Bounded, CrossChain = chain, MemoryOutput = true, WithTouched = mask => Build(a, b, on, where, mask), PushFilter = filter =>
+                    {
+                        var leftFilters = new List<Resolved>(); var rightFilters = new List<Resolved>(); var residual = new List<Resolved>();
+                        foreach (var item in PredicatePlan.Conjuncts(filter))
+                        {
+                            var slots = PredicatePlan.Slots(item);
+                            if (usingSlots.Length == 0 && slots.Count != 0 && PredicatePlan.Safe(item) && slots.All(slot => slot < a.Columns.Length) && join.Kind is "inner" or "cross" or "left") leftFilters.Add(item);
+                            else if (usingSlots.Length == 0 && slots.Count != 0 && !lateral && PredicatePlan.Safe(item) && slots.All(slot => slot >= a.Columns.Length) && join.Kind is "inner" or "cross" or "right") rightFilters.Add(PredicatePlan.Shift(item, -a.Columns.Length));
+                            else residual.Add(item);
+                        }
+                        var nextLeft = leftFilters.Count == 0 ? a : PredicatePlan.Filter(a, PredicatePlan.Order(PredicatePlan.Combine(leftFilters))!, meter, cancellationToken);
+                        var nextRight = rightFilters.Count == 0 ? b : PredicatePlan.Filter(b, PredicatePlan.Order(PredicatePlan.Combine(rightFilters))!, meter, cancellationToken);
+                        return (Build(nextLeft, nextRight, on, PredicatePlan.Combine(residual), touched), PredicatePlan.Combine(residual));
+                    } };
+                }
+                return Build(left, right, PredicatePlan.Order(predicate));
             }
             default: throw Errors.Unsupported("relation source");
         }
@@ -116,8 +284,10 @@ internal static class RelationExecution
     internal static PreparedRelation Query(SelectSyntax query, Database database, DatabaseSnapshot snapshot, PendingDatabase? pending,
         Catalog catalog, Meter meter, CancellationToken cancellationToken, bool derived = false, QueryScope? scope = null)
     {
+        if (query.With?.Any(definition => definition.Mutation is not null) == true) throw Errors.Unsupported("nested data-modifying WITH");
         query = Resolve.BindTypes(query, catalog, meter.Temporal);
         var buffers = new List<CteBuffer>();
+        var ctePlans = new List<(ExplainNode Node, bool Executed)>();
         if (query.With is { Length: > 0 } definitions)
         {
             scope = new(scope);
@@ -127,35 +297,43 @@ internal static class RelationExecution
                 var recursive = query.Recursive && CteBuffer.References(definition.Query, definition.Name) > 0;
                 var body = recursive ? RecursiveExecution.Prepare(definition, database, snapshot, pending, catalog, meter, cancellationToken, scope) :
                     Query(definition.Query, database, snapshot, pending, catalog, meter, cancellationToken, scope: scope);
-                body = body with { Columns = Alias(body.Columns, definition.Name, definition.Columns) };
+                body = body with { Columns = Alias(body.Columns.Select(column => column with { Collation = column.Collation?.Implicit() }).ToArray(), definition.Name, definition.Columns) };
                 var references = CteBuffer.References(query with { With = null }, definition.Name) + definitions.Skip(i + 1).Sum(later => CteBuffer.References(later.Query, definition.Name));
                 if (references > 0 && (recursive || definition.Materialized == true || definition.Materialized is null && references > 1))
                 {
-                    var buffer = new CteBuffer(body, meter); buffers.Add(buffer); body = body with { Rows = buffer.Read(cancellationToken) };
+                    var buffer = new CteBuffer(body, meter); buffers.Add(buffer); body = body with { Rows = buffer.Read(cancellationToken), PushFilter = null, BaseAccess = null, MemoryOutput = true };
+                }
+                if (meter.Explain is not null && body.Plan is { } definitionPlan)
+                {
+                    var materialized = references > 0 && (recursive || definition.Materialized == true || definition.Materialized is null && references > 1);
+                    var inlined = references > 0 && !materialized;
+                    ctePlans.Add((new("CTE " + definition.Name, materialized ? "materialized" : "inlined",
+                        definitionPlan.EstimatedRows, inlined ? 0 : definitionPlan.EstimatedCost, inlined ? [] : [definitionPlan]), materialized));
+                    body = body with { Cte = new(definition.Name, materialized, definitionPlan) };
                 }
                 scope.Add(definition.Name, body);
             }
         }
         var subqueries = new List<SubqueryCell>();
-        SelectPlan plan; IAsyncEnumerable<SqlValue[]> rows; OuterFrame frame; OuterFrame[] inputDependencies = []; Func<ValueTask>? inputConstants = null;
-        if (query.Table is not null && !(scope?.TryGet(query.Table, out _) ?? false) && !(catalog.Views ?? []).Any(view => view.Name == query.Table))
+        SelectPlan plan; PreparedRelation? preparedInput = null; BaseRelationAccess? baseInput = null; OuterFrame frame; OuterFrame[] inputDependencies = []; Func<ValueTask>? inputConstants = null;
+        if (query.Table is not null && !CatalogRelations.IsCatalogName(query.Table) && !(scope?.TryGet(query.Table, out _) ?? false) && (catalog.Scope is { } domains ? domains.View(query.Table) is null : !(catalog.Views ?? []).Any(view => view.Name == query.Table)))
         {
-            var table = StatementExecution.Table(catalog, query.Table);
+            var table = StatementExecution.ResolveTable(catalog, query.Table);
             var columns = StatementExecution.Columns(table, query.TableAlias); frame = new(columns);
             query = SubqueryExecution.Bind(query, frame, database, snapshot, pending, catalog, meter, cancellationToken, scope, subqueries);
             plan = Resolve.Select(query, columns.Concat(scope?.OuterColumns ?? []).ToArray());
-            rows = QueryExecution.DeferredTableSource(table, database.Tree(table, pending, snapshot), plan, meter, cancellationToken);
-            plan = TableAccess.Prepare(plan, table).Plan;
+            baseInput = new(table, database.Tree(table, pending, snapshot), null, new(database, snapshot, pending, catalog));
         }
         else
         {
-            var input = query.Relation is null ? new PreparedRelation([], QueryExecution.ScalarSource()) : Prepare(query.Relation, database, snapshot, pending, catalog, meter, cancellationToken, scope);
+            var input = query.Relation is null ? new PreparedRelation([], QueryExecution.ScalarSource(meter)) : Prepare(query.Relation, database, snapshot, pending, catalog, meter, cancellationToken, scope);
             frame = new(input.Columns); inputDependencies = input.Dependencies ?? []; inputConstants = input.InitializeConstants;
             query = SubqueryExecution.Bind(query, frame, database, snapshot, pending, catalog, meter, cancellationToken, scope, subqueries);
-            plan = Resolve.Select(query, input.Columns.Concat(scope?.OuterColumns ?? []).ToArray()); rows = input.Rows;
+            plan = Resolve.Select(query, input.Columns.Concat(scope?.OuterColumns ?? []).ToArray());
+            preparedInput = input;
         }
         if (derived && query.ValuesQuery && query.Order is not { Length: > 0 } && query.Limit is null && query.Offset == 0) plan = plan with { ChargeRows = false };
-        var result = Projected(QueryExecution.Select(plan, rows, meter, cancellationToken));
+
         async ValueTask Constants()
         {
             if (inputConstants is not null) await inputConstants().ConfigureAwait(false);
@@ -168,12 +346,80 @@ internal static class RelationExecution
             foreach (var buffer in buffers) await buffer.Materialize(cancellationToken).ConfigureAwait(false);
         }
 
-        if (buffers.Count > 0 || subqueries.Count > 0) result = SubqueryExecution.Initialized(Initialize, result, cancellationToken);
         var dependencies = Correlation.Dependencies(plan);
         dependencies.UnionWith(inputDependencies);
         foreach (var buffer in buffers) dependencies.UnionWith(buffer.Dependencies);
         dependencies.Remove(frame);
-        return new(plan.Projections.Select(projection => new BoundColumn(projection.Name, projection.Expression.Type)).ToArray(), result, Initialize, dependencies.ToArray(), Constants);
+var outputColumns = plan.Projections.Select(projection => new BoundColumn(projection.Name, projection.Expression.Type, Collation: projection.Expression.Collation)).ToArray();
+PreparedRelation Build(SelectPlan requested)
+{
+    var active = requested;
+    IAsyncEnumerable<SqlValue[]> rows;
+    var sourceMemory = false;
+    ExplainNode? inputPlan = null;
+    if (baseInput is { } source)
+    {
+        if (meter.Explain is not null)
+        {
+            var access = AccessPlan.Select(source.Table, source.Tree, active.Filter, source.Storage, meter);
+            active = active with { Access = access };
+            inputPlan = ExplainPlanning.Scan(source.Table, access, active.Filter, StorageTouchedColumns.Collect(active), false, meter, catalog, source.Tree.Height);
+        }
+        rows = QueryExecution.DeferredTableSource(source.Table, source.Tree, active, meter, cancellationToken, source.Storage);
+        if (inputPlan is not null) rows = ExplainObservation.Rows(rows, inputPlan, meter, cancellationToken);
+        active = TableAccess.Prepare(active, source.Table).Plan;
+        if (inputPlan is not null && requested.Order is { Length: > 0 } && active.Order is not { Length: > 0 })
+            inputPlan.Append("ordered: pk ordered" + (requested.Order[0].Descending ? " (reverse)" : ""));
+        active = active with { AggregateLane = GroupExecution.Lane(active), ColumnarProjection = active.Group is null && active.Windows is null && !active.Distinct &&
+            active.Limit is null && active.Offset == 0 && active.Order is not { Length: > 0 } && active.Projections.All(projection => projection.Expression.Op == "column") };
+    }
+    else
+    {
+        var input = preparedInput!;
+        if (active.Filter is { } filter && input.PushFilter is { } push)
+        {
+            var pushed = push(filter); input = pushed.Relation; active = active with { Filter = pushed.Residual };
+        }
+        if (input.WithTouched is { } withTouched) input = withTouched(StorageTouchedColumns.Collect(active));
+        if (active.Group is null && active.Windows is null && !active.Distinct && active.Limit is { } limit && input.Bounded is { } bounded &&
+            bounded(active.Order ?? [], Estimate.Add(active.Offset, limit), active.Filter) is { } boundedInput)
+        {
+            input = boundedInput;
+            if (meter.Explain is not null && active.Order is { Length: > 0 }) input.Plan?.Append("ordered: join pk ordered");
+            active = active with { Order = [], Filter = null };
+        }
+        rows = input.Rows; sourceMemory = input.MemoryOutput;
+        inputPlan = input.Plan;
+    }
+    if (meter.Explain is not null)
+    {
+        inputPlan ??= query.Relation is null ? new ExplainNode("Result", "-", 1, 0) : throw new InvalidOperationException("missing EXPLAIN relation plan");
+        active = active with { Observation = ExplainPlanning.Select(active, inputPlan, meter) };
+        if (ctePlans.Count != 0)
+        {
+            var child = active.Observation!.Root;
+            var cost = ctePlans.Where(item => item.Executed).Aggregate(child.EstimatedCost, (sum, item) => Estimate.Add(sum, item.Node.EstimatedCost));
+            active = active with { Observation = active.Observation with { Root = new("WITH", "ctes=" + ctePlans.Count,
+                child.EstimatedRows, cost, ctePlans.Select(item => item.Node).Append(child).ToArray()) } };
+        }
+    }
+    var identityValues = derived && query.ValuesQuery && active.Order is not { Length: > 0 } && active.Filter is null &&
+        active.Projections.Select((projection, slot) => projection.Expression.Op == "column" && projection.Expression.Slot == slot).All(value => value);
+    var result = Projected(QueryExecution.Select(active, rows, meter, cancellationToken, sourceMemory, eagerInput: baseInput is null && query.Relation is not null, transferIdentity: identityValues, bufferOutput: buffers.Count != 0));
+    if (buffers.Count > 0 || subqueries.Count > 0) result = SubqueryExecution.Initialized(Initialize, result, cancellationToken);
+    if (buffers.Count > 0) result = CteBuffer.DisposeAfter(buffers, result, cancellationToken);
+    if (active.Observation is { } observation) result = ExplainObservation.Rows(result, observation.Root, meter, cancellationToken, inclusive: true);
+    var prepared = new PreparedRelation(outputColumns, result, Initialize, dependencies.ToArray(), Constants, MemoryOutput: identityValues || buffers.Count != 0, Plan: active.Observation?.Root);
+    if (query.With is not null || query.ValuesQuery || requested.Limit is not null || requested.Offset != 0) return prepared;
+    return prepared with { PushFilter = filter =>
+    {
+        var split = DerivedPushdown.Split(requested, filter);
+        if (split.Pushed is null) return (prepared, filter);
+        var combined = PredicatePlan.Order(PredicatePlan.Combine(new[] { requested.Filter, split.Pushed }.OfType<Resolved>()));
+        return (Build(requested with { Filter = combined, Empty = combined is not null && Resolve.EmptyFilter(combined) }), split.Residual);
+    } };
+}
+return Build(plan);
     }
     private static Func<ValueTask> CombineConstants(params PreparedRelation[] inputs) => async () =>
     {
@@ -199,15 +445,13 @@ internal static class RelationExecution
     }
     private static async IAsyncEnumerable<SqlValue[]> Values(Resolved[][] rows, Meter meter, [EnumeratorCancellation] CancellationToken cancellationToken)
     {
-        var materialized = new List<SqlValue[]>();
         foreach (var row in rows)
         {
             meter.Checkpoint(cancellationToken); meter.Charge(Costs.RowProduced);
             var result = new SqlValue[row.Length];
             for (var i = 0; i < row.Length; i++) result[i] = await Evaluate.ExprAsync(row[i], meter).ConfigureAwait(false);
-            meter.Checkpoint(cancellationToken); materialized.Add(result);
+            meter.Checkpoint(cancellationToken); yield return result;
         }
-        foreach (var row in materialized) yield return row;
     }
     private static async IAsyncEnumerable<SqlValue[]> Series(Resolved[] args, Meter meter, [EnumeratorCancellation] CancellationToken cancellationToken)
     {
@@ -234,12 +478,33 @@ internal static class RelationExecution
     {
         await foreach (var row in source.ConfigureAwait(false)) yield return Enumerable.Range(0, row.Count).Select(i => row[i]).ToArray();
     }
+private static async IAsyncEnumerable<SqlValue[]> GroupRows(IAsyncEnumerable<SqlValue[]> rows, Meter meter,
+    [EnumeratorCancellation] CancellationToken token)
+{
+    await foreach (var row in rows.WithCancellation(token).ConfigureAwait(false))
+    { meter.Charge(Costs.RowProduced); meter.Checkpoint(token); yield return row; }
+}
     private static async IAsyncEnumerable<SqlValue[]> Join(PreparedRelation left, PreparedRelation right, Resolved? predicate, string kind,
-        (int Left, int Right, SqlType Type)[] usingSlots, Meter meter, [EnumeratorCancellation] CancellationToken cancellationToken, OuterFrame? lateral = null)
+        (int Left, int Right, SqlType Type)[] usingSlots, Meter meter, [EnumeratorCancellation] CancellationToken cancellationToken, OuterFrame? lateral = null, HashJoinPlan? hashPlan = null, IndexNestedLoop? inl = null, HashSet<int>? touched = null)
     {
+        using var outputMemory = new QueryInputMemory(meter);
+        using var leftMemory = new QueryInputMemory(meter);
+        using var rightMemory = new QueryInputMemory(meter);
+        var output = new List<SqlValue[]>();
+        var needed = touched is null ? Enumerable.Range(0, usingSlots.Length + left.Columns.Length + right.Columns.Length).ToHashSet() : new HashSet<int>(touched);
+        if (predicate is not null) foreach (var slot in PredicatePlan.Slots(predicate)) needed.Add(slot + usingSlots.Length);
+        if (lateral is not null) foreach (var slot in lateral.ReferencedSlots) needed.Add(slot + usingSlots.Length);
+        if (left.BaseAccess?.Filter is { } leftFilter) foreach (var slot in PredicatePlan.Slots(leftFilter)) needed.Add(slot + usingSlots.Length);
+        if (right.BaseAccess?.Filter is { } rightFilter) foreach (var slot in PredicatePlan.Slots(rightFilter)) needed.Add(slot + usingSlots.Length + left.Columns.Length);
+        foreach (var pair in usingSlots) { needed.Add(usingSlots.Length + pair.Left); needed.Add(usingSlots.Length + left.Columns.Length + pair.Right); }
+        var leftTouched = needed.Where(slot => slot >= usingSlots.Length && slot < usingSlots.Length + left.Columns.Length).Select(slot => slot - usingSlots.Length).ToHashSet();
+        var rightTouched = needed.Where(slot => slot >= usingSlots.Length + left.Columns.Length).Select(slot => slot - usingSlots.Length - left.Columns.Length).ToHashSet();
+        if (left.WithTouched is { } leftMask) left = leftMask(leftTouched);
+        if (right.WithTouched is { } rightMask) right = rightMask(rightTouched);
         var leftRows = new List<SqlValue[]>(); var rightRows = new List<SqlValue[]>();
-        await foreach (var row in left.Rows.WithCancellation(cancellationToken).ConfigureAwait(false)) leftRows.Add(row);
-        if (lateral is null) await foreach (var row in right.Rows.WithCancellation(cancellationToken).ConfigureAwait(false)) rightRows.Add(row);
+        await foreach (var row in left.Rows.WithCancellation(cancellationToken).ConfigureAwait(false)) leftRows.Add(await leftMemory.TakeAsync(row, left.MemoryOutput, leftTouched).ConfigureAwait(false));
+        if (lateral is null && inl is null) await foreach (var row in right.Rows.WithCancellation(cancellationToken).ConfigureAwait(false)) rightRows.Add(await rightMemory.TakeAsync(row, right.MemoryOutput, rightTouched).ConfigureAwait(false));
+        using var hash = hashPlan is null ? null : await HashJoinTable.Build(hashPlan, rightRows, meter).ConfigureAwait(false);
         var matchedRight = new bool[rightRows.Count];
         SqlValue[] Output(SqlValue[] a, SqlValue[] b)
         {
@@ -250,27 +515,36 @@ internal static class RelationExecution
             }
             a.CopyTo(row, usingSlots.Length); b.CopyTo(row, usingSlots.Length + a.Length); return row;
         }
-foreach (var a in leftRows)
+        foreach (var a in leftRows)
+        {
+            if (lateral is not null)
+            {
+                lateral.Assign(a); rightMemory.Dispose(); rightRows.Clear();
+                if (right.Initialize is { } initialize) await initialize().ConfigureAwait(false);
+                await foreach (var row in right.Rows.WithCancellation(cancellationToken).ConfigureAwait(false)) rightRows.Add(await rightMemory.TakeAsync(row, right.MemoryOutput, rightTouched).ConfigureAwait(false));
+                matchedRight = new bool[rightRows.Count];
+            }
+if (inl is not null)
 {
-    if (lateral is not null)
-    {
-        lateral.Assign(a); rightRows.Clear();
-        if (right.Initialize is { } initialize) await initialize().ConfigureAwait(false);
-        await foreach (var row in right.Rows.WithCancellation(cancellationToken).ConfigureAwait(false)) rightRows.Add(row);
-        matchedRight = new bool[rightRows.Count];
-    }
-    var matched = false;
+    rightMemory.Dispose(); rightRows.Clear();
+    await foreach (var row in inl.Rows(a, meter, cancellationToken).ConfigureAwait(false)) rightRows.Add(await rightMemory.TakeAsync(row, false, rightTouched).ConfigureAwait(false));
+    matchedRight = new bool[rightRows.Count];
+}
+var matched = false;
 
-            for (var i = 0; i < rightRows.Count; i++)
+            IEnumerable<int> candidates = hash is null ? Enumerable.Range(0, rightRows.Count) : await hash.Probe(hashPlan!, a, meter).ConfigureAwait(false);
+            foreach (var i in candidates)
             {
                 meter.Checkpoint(cancellationToken); var b = rightRows[i];
                 if (!await QueryExecution.KeepsAsync(predicate, a.Concat(b).ToArray(), meter).ConfigureAwait(false)) continue;
-                matched = true; matchedRight[i] = true; yield return Output(a, b);
+                matched = true; matchedRight[i] = true; output.Add(outputMemory.Take(Output(a, b), false, needed));
             }
-            if (!matched && kind is "left" or "full") yield return Output(a, right.Columns.Select(c => SqlValue.Null(c.Type)).ToArray());
+            if (!matched && kind is "left" or "full") output.Add(outputMemory.Take(Output(a, right.Columns.Select(c => SqlValue.Null(c.Type)).ToArray()), false, needed));
         }
         if (kind is "right" or "full")
             for (var i = 0; i < rightRows.Count; i++)
-                if (!matchedRight[i]) yield return Output(left.Columns.Select(c => SqlValue.Null(c.Type)).ToArray(), rightRows[i]);
+                if (!matchedRight[i]) output.Add(outputMemory.Take(Output(left.Columns.Select(c => SqlValue.Null(c.Type)).ToArray(), rightRows[i]), false, needed));
+        leftMemory.Dispose(); rightMemory.Dispose(); hash?.Dispose();
+        foreach (var row in output) { outputMemory.Transfer(row); yield return row; }
     }
 }

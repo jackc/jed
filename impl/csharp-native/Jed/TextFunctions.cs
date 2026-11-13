@@ -28,6 +28,17 @@ internal static class TextFunctions
                 var end = args.Length == 2 ? runes.Length : start > long.MaxValue - count ? runes.Length : Math.Clamp(start + count <= 0 ? 0 : start + count - 1, 0, runes.Length);
                 result = Join(runes.Skip((int)first).Take((int)Math.Max(0, end - first))); break;
             }
+            case "overlay":
+            {
+                var start = args[2].AsInteger();
+                var replacement = args[1].AsText();
+                var count = args.Length == 4 ? args[3].AsInteger() : replacement.EnumerateRunes().Count();
+                if (start <= 0) throw new SqlException(SqlStates.SubstringError, "overlay start must be positive");
+                if (start > int.MaxValue || count < int.MinValue || count > int.MaxValue || start + count > int.MaxValue || start + count < int.MinValue) throw Errors.Overflow();
+                var prefix = (int)Math.Min(runes.Length, start - 1);
+                var suffix = (int)Math.Clamp(start + count - 1, 0, runes.Length);
+                result = Join(runes.Take(prefix)) + replacement + Join(runes.Skip(suffix)); break;
+            }
             case "left": case "right":
             {
                 var count = args[1].AsInteger();
@@ -35,8 +46,8 @@ internal static class TextFunctions
                 result = Join(name == "left" ? runes.Take(take) : runes.Skip(runes.Length - take)); break;
             }
             case "reverse": result = Join(runes.Reverse()); break;
-            case "lower": result = TextEncoding.FoldName(text); break;
-            case "upper": result = string.Concat(text.Select(c => c is >= 'a' and <= 'z' ? (char)(c - 32) : c)); break;
+            case "lower": result = UnicodeData.Fold(text, false, meter.Unicode); break;
+            case "upper": result = UnicodeData.Fold(text, true, meter.Unicode); break;
             case "initcap":
             {
                 var word = false; var builder = new StringBuilder();
@@ -105,7 +116,7 @@ internal static class TextFunctions
             case "replace":
             {
                 var from = args[1].AsText(); var to = args[2].AsText();
-                meter.Charge(args.Sum(v => (long)v.TextBytes)); meter.Guard();
+                meter.Charge(args[0].TextBytes); meter.Guard();
                 long matches = 0;
                 if (from.Length > 0)
                     for (var at = 0; at <= text.Length - from.Length;)
@@ -127,6 +138,7 @@ internal static class TextFunctions
                 }
                 result = builder.ToString(); break;
             }
+            case "quote_ident": result = TextFormat.Identifier(text); break;
             case "quote_literal": case "quote_nullable":
                 result = (text.Contains('\\') ? "E" : "") + "'" + text.Replace("\\", "\\\\", StringComparison.Ordinal).Replace("'", "''", StringComparison.Ordinal) + "'"; break;
             default: throw Errors.Unsupported($"text function {name}");
@@ -141,12 +153,13 @@ internal static class TextFunctions
         for (var i = 0; i < raw.Length; i++)
         {
             if (raw[i].Value == '\\')
-            { if (++i == raw.Length) throw new SqlException(SqlStates.InvalidEscapeSequence, "LIKE pattern ends in escape"); tokens.Add((0, raw[i])); }
+            { if (++i == raw.Length) { tokens.Add((3, default)); break; } tokens.Add((0, raw[i])); }
             else tokens.Add((raw[i].Value == '%' ? 2 : raw[i].Value == '_' ? 1 : 0, raw[i]));
         }
         var at = 0; var token = 0; var star = -1; var restart = 0;
         while (at < input.Length)
         {
+            if (token < tokens.Count && tokens[token].Kind == 3) throw new SqlException(SqlStates.InvalidEscapeSequence, "LIKE pattern ends in escape");
             if (token < tokens.Count && (tokens[token].Kind == 1 || tokens[token].Kind == 0 && tokens[token].Rune == input[at])) { at++; token++; }
             else if (token < tokens.Count && tokens[token].Kind == 2) { star = token++; restart = at; }
             else if (star >= 0) { token = star + 1; at = ++restart; }

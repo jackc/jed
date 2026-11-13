@@ -4,8 +4,15 @@ internal static class FunctionResolve
 {
     internal static Resolved Call(Expression expression)
     {
+        if (expression.Text == "timezone")
+        {
+            if (expression.Args.Length != 2) throw new SqlException(SqlStates.UndefinedFunction, "timezone requires two arguments");
+            return Resolve.Expr(expression with { Op = "at_time_zone", Text = "", Args = [expression.Args[1], expression.Args[0]] });
+        }
+        if (VariadicResolve.TryCall(expression, out var variadic)) return variadic;
         if (JsonResolve.TryCall(expression, out var jsonCall)) return jsonCall;
         if (OpenResolve.TryCall(expression, out var openCall)) return openCall;
+        if (expression.Args.Any(argument => argument.Op == "variadic")) throw new SqlException(SqlStates.UndefinedFunction, "function is not variadic");
         var name = expression.Text;
         if (name == "date_trunc")
         {
@@ -22,7 +29,9 @@ internal static class FunctionResolve
         {
             var arity = name == "width_bucket" ? 4 : 2;
             if (expression.Args.Length != arity) throw new SqlException(SqlStates.UndefinedFunction, $"invalid arity for {name}");
-            var operands = Resolve.Unify(expression.Args.Take(name == "width_bucket" ? 3 : 2).ToArray());
+            Resolved[] operands;
+            try { operands = Resolve.Unify(expression.Args.Take(name == "width_bucket" ? 3 : 2).ToArray()); }
+            catch (SqlException error) when (error.SqlState == SqlStates.DatatypeMismatch) { throw new SqlException(SqlStates.UndefinedFunction, "no matching numeric function"); }
             if (!operands[0].Type.IsNumeric()) throw Errors.Type("numeric operands required");
             if (name == "width_bucket")
             {
@@ -43,7 +52,12 @@ internal static class FunctionResolve
                 _ = Resolve.Common(left.Type, right.Type);
                 return new(name, left.Type, default, [left, right]);
             }
-            var unified = Resolve.Unify(expression.Args);
+            var unified = Resolve.Unify(expression.Args, adaptFloatLiterals: false);
+            if (name is "greatest" or "least")
+            {
+                try { Resolve.RequireOrderable(unified[0].Type); }
+                catch (SqlException error) when (error.SqlState == SqlStates.DatatypeMismatch) { throw new SqlException(SqlStates.UndefinedFunction, "arguments are not orderable"); }
+            }
             return new(name, unified[0].Type, default, unified);
         }
         // A nonliteral argument may itself contain overloaded calls. Resolve it
@@ -59,22 +73,32 @@ internal static class FunctionResolve
             return value;
         }
         var candidates = new List<(FunctionFact Fact, Expression[] Args, int Score)>();
-        foreach (var fact in FunctionCatalog.Facts.Where(f => f.Name == name))
+        var stringFallback = false;
+        for (var pass = 0; pass < 2 && candidates.Count == 0; pass++)
         {
-            var args = Arrange(fact, expression.Args);
-            if (args is null) continue;
-            var score = 0; var valid = true;
-            for (var i = 0; i < args.Length; i++)
+            stringFallback = pass == 1;
+            foreach (var fact in FunctionCatalog.Facts.Where(f => f.Name == name))
             {
-                var family = fact.Families[Math.Min(i, fact.Families.Length - 1)];
-                if (args[i].Op is "null" or "text" or "parameter" || family == "any") continue;
-                var type = Initial(args[i]).Type;
-                if (Matches(type, family)) continue;
-                if (type.IsInteger() && family == "decimal") { score++; continue; }
-                if (args[i].Op is "integer" or "decimal" && family == "float") { score += 2; continue; }
-                valid = false; break;
+                var args = Arrange(fact, expression.Args);
+                if (args is null) continue;
+                var score = 0; var valid = true;
+                for (var i = 0; i < args.Length; i++)
+                {
+                    var family = fact.Families[Math.Min(i, fact.Families.Length - 1)];
+                    if (args[i].Op is "null" or "parameter" || family == "any") continue;
+                    if (args[i].Op == "text" && stringFallback)
+                    {
+                        if (family is "text" or "bytea" or "uuid" or "date" or "timestamp" or "timestamptz" or "interval" or "json" or "jsonb" or "jsonpath") continue;
+                        valid = false; break;
+                    }
+                    var type = Initial(args[i]).Type;
+                    if (Matches(type, family)) continue;
+                    if (type.IsInteger() && family == "decimal") { score++; continue; }
+                    if (args[i].Op is "integer" or "decimal" && family == "float") { score += 2; continue; }
+                    valid = false; break;
+                }
+                if (valid) candidates.Add((fact, args, score));
             }
-            if (valid) candidates.Add((fact, args, score));
         }
         if (candidates.Count == 0) throw new SqlException(SqlStates.UndefinedFunction, $"no matching function: {name}");
         var bestScore = candidates.Min(c => c.Score);
@@ -83,7 +107,7 @@ internal static class FunctionResolve
         // surviving signature must determine one family, without a host default.
         for (var i = 0; i < expression.Args.Length && candidates.Count > 1; i++)
         {
-            if (expression.Args[i].Op is not ("null" or "text" or "parameter")) continue;
+            if (expression.Args[i].Op is not ("null" or "parameter") && !(stringFallback && expression.Args[i].Op == "text")) continue;
             var position = i;
             if (candidates.Any(c => c.Fact.Families[Math.Min(position, c.Fact.Families.Length - 1)] == "text"))
                 candidates.RemoveAll(c => c.Fact.Families[Math.Min(position, c.Fact.Families.Length - 1)] != "text");
@@ -106,7 +130,7 @@ internal static class FunctionResolve
         if (result == SqlType.F64)
             for (var i = 0; i < resolved.Length; i++)
                 if (resolved[i].Type == SqlType.F32) resolved[i] = new("float_widen", SqlType.F64, default, [resolved[i]]);
-        return new("call", result, default, resolved, name, Function: chosen.Fact);
+        return SimilarFunctions.Prepare(RegexResolve.Prepare(new("call", result, default, resolved, name, Function: chosen.Fact), expression.Context?.Unicode));
     }
 
     private static Expression[]? Arrange(FunctionFact fact, Expression[] supplied)
@@ -160,6 +184,7 @@ internal static class FunctionResolve
     };
     private static SqlType ResultType(string result)
     {
+        if (result == "text[]") return SqlType.Array(SqlType.Text);
         if (ScalarCatalog.KnownNames.Contains(result, StringComparer.Ordinal)) return SqlTypes.Parse(result);
         throw Errors.Unsupported($"function result {result}");
     }

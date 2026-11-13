@@ -151,10 +151,10 @@ public static class SqlTypes
             if (values[0] is < 1 or > 10485760) throw new SqlException(SqlStates.InvalidParameterValue, "invalid varchar length");
             return new(fact.Type, Length: values[0]);
         }
-        if (fact.Type.Kind is SqlKind.Timestamp or SqlKind.Timestamptz && values.Length == 1)
+        if (fact.Type.Kind is SqlKind.Timestamp or SqlKind.Timestamptz)
         {
-            if (values[0] is < 0 or > 6) throw new SqlException(SqlStates.InvalidParameterValue, "invalid timestamp precision");
-            return new(fact.Type, Precision: values[0]);
+            if (values.Length != 1 || values[0] < 0) throw Errors.Syntax("timestamp requires one unsigned precision");
+            return new(fact.Type, Precision: Math.Min(values[0], 6));
         }
         throw Errors.Unsupported("modifier for this type");
     }

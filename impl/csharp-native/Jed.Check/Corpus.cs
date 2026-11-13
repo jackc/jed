@@ -11,7 +11,7 @@ internal static class Corpus
     private static readonly HashSet<string> DirectiveNames = new(StringComparer.Ordinal)
     {
         "requires", "cost", "types", "names", "max_cost", "lifetime_max_cost", "params", "fixture", "skip",
-        "load-collation", "load-timezone", "upgrade-collations", "timezone", "collation", "attach",
+        "load-collation", "load-timezone", "upgrade-collations", "timezone", "attach",
         "max_scalar_bytes", "max_query_memory_bytes", "max_sql_length", "max_storage_bytes", "max_temp_storage_bytes",
         "default_privileges", "grant", "revoke", "allow_ddl", "allow_temp_ddl", "work_mem", "set", "seed", "clock", "clock_advance"
     };
@@ -30,14 +30,15 @@ internal static class Corpus
                 if (match.Success)
                 {
                     var key = match.Groups[1].Value;
-                    if (key is "load-timezone" or "fixture") { i++; continue; }
+                    if (key is "load-timezone" or "load-collation" or "fixture" or "attach") { i++; continue; }
                     if (key == "skip" && match.Groups[2].Value.Split(' ', StringSplitOptions.RemoveEmptyEntries).FirstOrDefault() == "disk")
                     { i++; continue; } // A disk-only reopen restriction does not skip this memory-mode run.
                     if (key != "requires" && DirectiveNames.Contains(key))
                     {
-                        if (key is not ("cost" or "types" or "names" or "max_cost" or "lifetime_max_cost" or "clock" or "clock_advance" or "timezone" or "max_scalar_bytes" or "max_sql_length" or "params"))
+                        if (key is not ("cost" or "types" or "names" or "max_cost" or "lifetime_max_cost" or "clock" or "clock_advance" or "seed" or "timezone" or "max_scalar_bytes" or "max_sql_length" or "params" or "upgrade-collations" or "allow_ddl" or "allow_temp_ddl" or "max_temp_storage_bytes" or "max_query_memory_bytes" or "max_storage_bytes" or "default_privileges" or "grant" or "revoke" or "set"))
                             throw new InvalidDataException($"{file}:{i + 1}: unsupported harness directive {key}");
-                        if (!pending.TryAdd(key, match.Groups[2].Value)) throw new InvalidDataException($"duplicate directive {key}");
+                        if (key is "grant" or "revoke" or "max_storage_bytes" && pending.TryGetValue(key, out var previous)) pending[key] = previous + "\n" + match.Groups[2].Value;
+                        else if (!pending.TryAdd(key, match.Groups[2].Value)) throw new InvalidDataException($"duplicate directive {key}");
                     }
                 }
                 i++; continue;
@@ -67,6 +68,7 @@ internal static class Corpus
 
     internal static async Task<int> Run(string file)
     {
+        if (File.ReadLines(file).Any(line => line.Trim() == "# format: concurrency")) return await ConcurrencyCorpus.Run(file).ConfigureAwait(false);
         var records = Parse(file);
         var zones = File.ReadLines(file).Select(line => Regex.Match(line, "^#\\s*load-timezone:\\s*(.*?)\\s*$", RegexOptions.CultureInvariant)).Where(match => match.Success).Select(match => match.Groups[1].Value).ToArray();
         TimeZoneData? timeZones = null;
@@ -79,17 +81,29 @@ internal static class Corpus
             foreach (var zone in zones) _ = timeZones.Resolve(zone);
         }
         var fixture = Fixture(file);
-        await using var database = fixture is null ? null : await OpenFixture(file, fixture).ConfigureAwait(false);
+        var collationNames = File.ReadLines(file).Select(line => Regex.Match(line, "^#\\s*load-collation:\\s*([^= ]+)", RegexOptions.CultureInvariant)).Where(match => match.Success).Select(match => match.Groups[1].Value).ToArray();
+        UnicodeData? unicodeData = null;
+        if (collationNames.Length != 0)
+        {
+            var directory = new DirectoryInfo(Path.GetDirectoryName(Path.GetFullPath(file))!);
+            while (directory is not null && directory.Name != "spec") directory = directory.Parent;
+            if (directory is null) throw new InvalidDataException("collation corpus has no spec root");
+            unicodeData = UnicodeData.Load(File.ReadAllBytes(Path.Combine(directory.FullName, "collation/fixtures/unicode.jucd")));
+            foreach (var name in collationNames) _ = unicodeData.Resolve(name);
+        }
+        var attachmentNames = File.ReadLines(file).Select(line => Regex.Match(line, "^#\\s*attach:\\s*(\\S+)\\s*$", RegexOptions.CultureInvariant)).Where(match => match.Success).Select(match => match.Groups[1].Value).ToArray();
+        await using var database = fixture is null ? attachmentNames.Length == 0 ? null : await Database.CreateInMemoryAsync().ConfigureAwait(false) : await OpenFixture(file, fixture).ConfigureAwait(false);
+        if (database is not null) foreach (var attachment in attachmentNames) await database.AttachInMemoryAsync(attachment).ConfigureAwait(false);
         if (fixture?.ExpectedError is not null)
         {
             if (records.Count != 0) throw new InvalidDataException("fixture open-error case cannot contain SQL records");
             Console.WriteLine($"PASS {file}: 1 fixture open-error record"); return 1;
         }
-        await using var session = database is null ? new Session(new SessionOptions { TimeZones = timeZones }) : database.CreateSession(new SessionOptions { TimeZones = timeZones });
+        await using var session = database is null ? new Session(new SessionOptions { TimeZones = timeZones, UnicodeData = unicodeData }) : database.CreateSession(new SessionOptions { TimeZones = timeZones, UnicodeData = unicodeData });
         foreach (var record in records)
         {
             try { await RunRecord(session, record).ConfigureAwait(false); }
-            catch (Exception error) { throw new InvalidDataException($"{file}:{record.Line}: {record.Sql}\n{error.Message}", error); }
+            catch (Exception error) { throw new InvalidDataException($"{file}:{record.Line}: {record.Sql}\n{error}", error); }
         }
         Console.WriteLine($"PASS {file}: {records.Count} records");
         return records.Count;
@@ -138,10 +152,53 @@ internal static class Corpus
         var syntax = new Parser("SELECT " + text).Parse();
         await using var session = new Session();
         var meter = new Meter(session, 0, CancellationToken.None);
-        return syntax.Items.Select(item => Evaluate.Expr(Resolve.Expr(item.Expression), meter)).ToArray();
+        return syntax.Items.Select(item => Evaluate.Expr(Resolve.Expr(item.Expression,
+            item.Expression is { Op: "array", Args.Length: 0 } ? SqlType.Array(SqlType.I64) : null), meter)).ToArray();
     }
-    private static async Task RunRecord(Session session, CorpusRecord record)
+    private static TablePrivileges ParsePrivileges(string text)
     {
+        var result = TablePrivileges.None;
+        foreach (var name in text.Split(',', StringSplitOptions.TrimEntries)) result |= name switch
+        {
+            "ALL" => TablePrivileges.All, "NONE" => TablePrivileges.None, "SELECT" => TablePrivileges.Select,
+            "INSERT" => TablePrivileges.Insert, "UPDATE" => TablePrivileges.Update, "DELETE" => TablePrivileges.Delete,
+            _ => throw new InvalidDataException("invalid table privilege: " + name)
+        };
+        return result;
+    }
+    internal static async Task RunRecord(Session session, CorpusRecord record)
+    {
+        session.ResetPrivileges(); session.ResetVariables();
+        if (record.Directives.TryGetValue("max_storage_bytes", out var storageLimits)) foreach (var directive in storageLimits.Split('\n'))
+        {
+            var pieces = directive.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+            if (pieces.Length is < 1 or > 2) throw new InvalidDataException("invalid storage limit action");
+            await session.SetDatabaseStorageLimitAsync(long.Parse(pieces[0], CultureInfo.InvariantCulture), pieces.Length == 2 ? pieces[1] : "main").ConfigureAwait(false);
+        }
+        if (record.Directives.TryGetValue("default_privileges", out var defaults)) session.SetDefaultPrivileges(ParsePrivileges(defaults));
+        foreach (var key in new[] { "grant", "revoke" })
+            if (record.Directives.TryGetValue(key, out var rules)) foreach (var rule in rules.Split('\n'))
+            {
+                var parts = rule.Split(" ON ", 2, StringSplitOptions.None);
+                if (parts.Length != 2) throw new InvalidDataException("invalid privilege directive");
+                if (parts[0].Trim() == "EXECUTE") { if (key == "grant") session.GrantExecute(parts[1].Trim()); else session.RevokeExecute(parts[1].Trim()); }
+                else if (key == "grant") session.Grant(parts[1].Trim(), ParsePrivileges(parts[0]));
+                else session.Revoke(parts[1].Trim(), ParsePrivileges(parts[0]));
+            }
+        if (record.Directives.TryGetValue("set", out var settings)) foreach (var setting in settings.Split(','))
+        {
+            var pair = setting.Split('=', 2);
+            if (pair.Length != 2) throw new InvalidDataException("invalid variable directive");
+            session.SetVar(pair[0].Trim(), pair[1].Trim());
+        }
+        session.SetAllowDdl(!record.Directives.TryGetValue("allow_ddl", out var ddl) || ddl == "on");
+        session.SetAllowTempDdl(record.Directives.TryGetValue("allow_temp_ddl", out var tempDdl) ? tempDdl == "on" : ddl != "off");
+        session.SetTempStorageLimit(record.Directives.TryGetValue("max_temp_storage_bytes", out var tempLimit) ? long.Parse(tempLimit, CultureInfo.InvariantCulture) : 1024L * 1024 * 1024);
+        if (record.Directives.TryGetValue("upgrade-collations", out var upgrade))
+        {
+            if (upgrade.Length != 0) throw new InvalidDataException("upgrade-collations takes no value");
+            await session.UpgradeCollationsAsync().ConfigureAwait(false);
+        }
         if (record.Directives.TryGetValue("lifetime_max_cost", out var lifetime)) session.SetLifetimeCostLimit(long.Parse(lifetime, CultureInfo.InvariantCulture));
         var fields = record.Header.Split(' ', StringSplitOptions.RemoveEmptyEntries);
         var query = fields[0] == "query";
@@ -175,15 +232,19 @@ internal static class Corpus
             var options = new QueryOptions
             {
                 MaxCost = ceiling, Clock = clock,
+                RandomSource = record.Directives.TryGetValue("seed", out var seed) ? new SeededRandomSource(ulong.Parse(seed, CultureInfo.InvariantCulture)).Fill : null,
                 Parameters = record.Directives.TryGetValue("params", out var parameters) ? await ParseParameters(parameters).ConfigureAwait(false) : [],
                 TimeZone = record.Directives.GetValueOrDefault("timezone"),
+                MaxQueryMemoryBytes = record.Directives.TryGetValue("max_query_memory_bytes", out var queryMemory) ? long.Parse(queryMemory, CultureInfo.InvariantCulture) : null,
                 MaxScalarBytes = record.Directives.TryGetValue("max_scalar_bytes", out var scalar) ? long.Parse(scalar, CultureInfo.InvariantCulture) : 0,
                 MaxSqlLength = record.Directives.TryGetValue("max_sql_length", out var input) ? long.Parse(input, CultureInfo.InvariantCulture) : null
             };
             rows = await session.QueryAsync(record.Sql, options).ConfigureAwait(false);
             if (query)
             {
-                Equal(fields[1].Length, rows.Columns.Count, "column count");
+                // Shared runners use coltypes only to group/render flat cells.
+                // Explicit names/types directives assert result metadata; legacy
+                // homogeneous records may carry one tag for several columns.
                 if (record.Directives.TryGetValue("types", out var types))
                     EqualList(Split(types), rows.Columns.Select(c => c.Type.Name()).ToArray(), "types");
                 if (record.Directives.TryGetValue("names", out var names))

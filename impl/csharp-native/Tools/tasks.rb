@@ -58,12 +58,14 @@ module CSharpNativeTasks
     abort "configuration must be Debug or Release" unless %w[Debug Release].include?(configuration)
     feature = runtime_async ? "runtime-async=on" : ""
     puts "C# target net11.0, SDK #{sdk_version}, #{configuration}, Runtime Async #{runtime_async ? 'on' : 'default'}"
-    puts "Source SHA-256: #{source_digest}"
+    digest = source_digest
+    puts "Source SHA-256: #{digest}"
     $stdout.flush
     ok = system(environment, dotnet, "build", "Jed.Check/Jed.Check.csproj", "--configuration", configuration,
                 "--no-incremental", "-p:Features=#{feature}", "-p:RestoreLockedMode=true",
                 "--nologo", chdir: PACKAGE)
     exit($?&.exitstatus || 1) unless ok
+    abort "C# sources changed during compilation; rerun verification for a stable source digest" unless source_digest == digest
     File.join(PACKAGE, "Jed.Check/bin", configuration, "net11.0/Jed.Check.dll")
   end
 

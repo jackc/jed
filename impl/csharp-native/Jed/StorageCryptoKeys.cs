@@ -29,6 +29,8 @@ internal sealed class StorageCredential : IDisposable
         // SQL or error prose and need no immutable string copy in the engine.
         return new(1, utf8, memoryKiB, passes, lanes);
     }
+    internal PageWireCredential WireCopy()
+    { ObjectDisposedException.ThrowIf(disposed, this); return new(Kind, secret.ToArray()); }
     internal byte[] Derive(ReadOnlySpan<byte> salt, uint memoryKiB, uint passes, uint lanes)
     {
         ObjectDisposedException.ThrowIf(disposed, this);

@@ -49,6 +49,14 @@ internal static class JsonResolve
         if (JsonPathFunctions.TryResolve(expression, out result)) return true;
         if (name is "json_build_array" or "jsonb_build_array" or "json_build_object" or "jsonb_build_object")
         {
+            if (expression.Args.Any(arg => arg.Op == "variadic"))
+            {
+                if (expression.Args.Length != 1) throw Undefined();
+                var array = Resolve.Expr(expression.Args[0].Args[0]);
+                if (array.Type.Kind != SqlKind.Array) throw new SqlException("42804", "VARIADIC argument must be an array");
+                result = Call(name, name.StartsWith("jsonb", StringComparison.Ordinal) ? SqlType.Jsonb : SqlType.Json, [array], "propagates");
+                result = result with { Function = result.Function! with { Variadic = true } }; return true;
+            }
             var values = expression.Args.Select(arg => Resolve.Expr(arg)).ToArray();
             result = Call(name, name.StartsWith("jsonb", StringComparison.Ordinal) ? SqlType.Jsonb : SqlType.Json, values, "none"); return true;
         }
@@ -61,7 +69,8 @@ internal static class JsonResolve
             var values = new List<Resolved> { value };
             if (expression.Args.Length == 2)
             {
-                var flag = Resolve.Expr(expression.Args[1], SqlType.Boolean); if (flag.Type != SqlType.Boolean) throw Undefined(); values.Add(flag);
+                var flagSource = expression.Args[1];
+                var flag = flagSource.Op == "text" ? Resolve.Expr(new("cast", "boolean", [flagSource], Type: new(SqlType.Boolean))) : Resolve.Expr(flagSource, SqlType.Boolean); if (flag.Type != SqlType.Boolean) throw Undefined(); values.Add(flag);
             }
             result = Call(name, SqlType.Json, values.ToArray(), "propagates"); return true;
         }

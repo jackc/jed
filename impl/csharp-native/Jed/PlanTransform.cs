@@ -4,9 +4,9 @@ internal static class PlanTransform
 {
     internal static Resolved InitialValues(Resolved expression)
     {
-        if (expression.Op == "outer") return new("constant", expression.Type, expression.Outer!.Value, []);
+        if (expression.Op == "outer") return new("constant", expression.Type, expression.Outer!.Value, [], Collation: expression.Collation);
         if (expression.Op == "initplan" && expression.Subquery!.Initialized)
-            return new("constant", expression.Type, expression.Subquery.Value, []);
+            return new("constant", expression.Type, expression.Subquery.Value, [], Collation: expression.Collation);
         return expression with { Args = expression.Args.Select(InitialValues).ToArray() };
     }
     internal static SelectPlan InitialValues(SelectPlan plan) => Map(plan, InitialValues);
@@ -37,7 +37,9 @@ internal static class PlanTransform
             {
                 Argument = aggregate.Argument is null ? null : map(aggregate.Argument), Filter = aggregate.Filter is null ? null : map(aggregate.Filter),
                 Extra = aggregate.Extra?.Select(map).ToArray(),
-                Order = aggregate.Order?.Select(key => key with { Expression = map(key.Expression) }).ToArray()
+                Order = aggregate.Order?.Select(key => key with { Expression = map(key.Expression) }).ToArray(),
+                WithinOrder = aggregate.WithinOrder?.Select(key => key with { Expression = map(key.Expression) }).ToArray(),
+                Direct = aggregate.Direct?.Select(map).ToArray()
             }).ToArray()
         }
     };

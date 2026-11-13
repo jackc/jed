@@ -1,0 +1,5 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#MISE description="Explicit opt-in: C# image, compaction, credential and backup invariants"
+require_relative "../../impl/csharp-native/Tools/tasks"
+CSharpNativeTasks.check("maintenance", File.dirname(CSharpNativeTasks.baseline_spec))

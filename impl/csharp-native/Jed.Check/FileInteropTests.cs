@@ -19,7 +19,7 @@ internal static class FileInteropTests
             await CSharpClient(Path.Combine(directory, "encrypted-client.jed"), peerExecutable, true);
         }
         finally { Directory.Delete(directory, recursive: true); }
-        Console.WriteLine("PASS cross-process file service: plaintext/encrypted C#↔Go SQL reads/writes, snapshot pins, refresh/promotion, yield/read-only handoff both directions, lost/crashed-owner acknowledgement resolution, retained DEK after credential disposal");
+        Console.WriteLine("PASS cross-process file service: plaintext/encrypted C#↔Go SQL reads/writes, snapshot pins, refresh/promotion, yield/read-only handoff both directions, lost/crashed-owner acknowledgement resolution, retained DEK after credential disposal, live-client compaction refresh and both remote backup forms");
     }
     private const string TestKey = "4242424242424242424242424242424242424242424242424242424242424242";
     private static async Task CSharpOwner(string path, string executable, bool encrypted = false)
@@ -41,7 +41,40 @@ internal static class FileInteropTests
         Corpus.Equal("11", await client.Sql("READ_QUERY_I64", "SELECT n FROM t WHERE id=1"), "remote pinned generation remains readable");
         await client.Command("READ_CLOSE");
         Corpus.Equal("33", await client.Sql("QUERY_I64", "SELECT n FROM t WHERE id=1"), "Go refreshes C# commit");
-        await LargeValues(session, client);
+        // The pinned Go peer poisons its client writer after appending to an
+        // inherited overflow root (also reproduced with a Go owner). Isolate
+        // that peer writer lifetime; the retained client still verifies full
+        // invalidation and subsequent writes across the replacement below.
+        await using (var overflowWriter = await Actor.Start(executable, "open", path, encrypted ? ["key=" + TestKey] : []))
+            await LargeValues(session, overflowWriter);
+        await client.Sql("EXEC", "UPDATE t SET n=33 WHERE id=1");
+        await client.Command("READ_OPEN");
+        Corpus.Equal("33", await client.Sql("READ_QUERY_I64", "SELECT n FROM t WHERE id=1"), "Go pins before compaction refusal");
+        await HostTests.Error(SqlStates.ObjectInUse, () => owner.CompactAsync());
+        await client.Command("READ_CLOSE");
+        var compactDeadline = Stopwatch.StartNew();
+        while (true)
+        {
+            try { await owner.CompactAsync(); break; }
+            catch (SqlException error) when (error.SqlState == SqlStates.ObjectInUse && compactDeadline.ElapsedMilliseconds < 5000)
+            { await Task.Delay(10); }
+        }
+        Corpus.Equal("33", await client.Sql("QUERY_I64", "SELECT n FROM t WHERE id=1"), "Go reloads all pages after C# compaction");
+        await client.Sql("EXEC", "UPDATE t SET n=34 WHERE id=1");
+        Corpus.Equal("34", await DatabaseFileTests.Scalar(session, "SELECT n FROM t WHERE id=1"), "Go commits through replaced owner file");
+        await client.Sql("EXEC", "UPDATE t SET n=33 WHERE id=1");
+        if (encrypted)
+        {
+            var newKey = new string('3', 64);
+            using var replacement = DatabaseCredential.FromKey(Convert.FromHexString(newKey));
+            await client.Command("READ_OPEN");
+            await owner.ChangeCredentialAsync(replacement);
+            Corpus.Equal("33", await client.Sql("READ_QUERY_I64", "SELECT n FROM t WHERE id=1"), "Go pinned reader survives credential rewrap");
+            await client.Command("READ_CLOSE");
+            Corpus.Equal("33", await client.Sql("QUERY_I64", "SELECT n FROM t WHERE id=1"), "Go held data key survives owner credential change");
+            await using var fresh = await Actor.Start(executable, "open", path, "key=" + newKey);
+            Corpus.Equal("33", await fresh.Sql("QUERY_I64", "SELECT n FROM t WHERE id=1"), "fresh Go client unlocks new credential");
+        }
     }
     private static async Task CSharpClient(string path, string executable, bool encrypted = false)
     {
@@ -51,6 +84,12 @@ internal static class FileInteropTests
         await using var database = await Database.OpenFileAsync(path, new() { Credential = credential });
         credential?.Dispose();
         await using var session = database.CreateSession();
+        await HostTests.Error(SqlStates.ObjectInUse, () => database.CompactAsync());
+        if (encrypted)
+        {
+            using var replacement = DatabaseCredential.FromKey(new byte[32]);
+            await HostTests.Error(SqlStates.ObjectNotInPrerequisiteState, () => database.ChangeCredentialAsync(replacement));
+        }
         Corpus.Equal("11", await DatabaseFileTests.Scalar(session, "SELECT n FROM t WHERE id=1"), "C# reads Go file");
         await DatabaseFileTests.Exec(session, "INSERT INTO t VALUES (2,22)");
         Corpus.Equal("22", await owner.Sql("QUERY_I64", "SELECT n FROM t WHERE id=2"), "Go adopts C# commit");
@@ -62,6 +101,14 @@ internal static class FileInteropTests
         }
         Corpus.Equal("33", await DatabaseFileTests.Scalar(session, "SELECT n FROM t WHERE id=1"), "C# refreshes Go commit");
         await LargeValues(session, owner);
+        foreach (var compacted in new[] { false, true })
+        {
+            var backup = path + (compacted ? ".compacted-backup" : ".page-backup");
+            await database.BackupForTestingAsync(backup, compacted);
+            await using var restored = await Actor.Start(executable, "open", backup, encrypted ? ["key=" + TestKey] : []);
+            Corpus.Equal("33", await restored.Sql("QUERY_I64", "SELECT n FROM t WHERE id=1"), "Go opens C# page-client backup");
+            Corpus.Equal("6000", await restored.Sql("QUERY_I64", "SELECT length(body) FROM large_values WHERE id=1"), "page-client backup retains overflow values");
+        }
         await owner.Command("HANGUP_NEXT_ACK");
         await DatabaseFileTests.Exec(session, "INSERT INTO t VALUES (4,55)");
         Corpus.Equal("55", await owner.Sql("QUERY_I64", "SELECT n FROM t WHERE id=4"), "lost Go acknowledgement resolved without duplicate publication");

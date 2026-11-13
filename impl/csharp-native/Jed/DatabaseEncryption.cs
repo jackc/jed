@@ -54,14 +54,18 @@ public sealed partial class Database
             if (heldCodec is not null) throw new SqlException(SqlStates.StaleKey, "encrypted database was replaced by plaintext; reopen it");
             if (options.Credential is not null) throw new SqlException(SqlStates.CredentialNotApplicable, "credential does not apply to a plaintext file");
             var recovered = await StorageRecovery.OpenAsync(store, token).ConfigureAwait(false);
-            var pager = new StoragePager(store, recovered.Meta.PageSize);
-            return new(pager, recovered, await Catalog.ReadAsync(pager, recovered.Meta, token).ConfigureAwait(false), null);
+            var pager = new StoragePager(store, recovered.Meta.PageSize, options.CacheBytes);
+            var catalog = await Catalog.ReadAsync(pager, recovered.Meta, token).ConfigureAwait(false);
+            catalog = await StorageTree.ValidateCatalogSpinesAsync(pager, catalog, recovered.Meta, token).ConfigureAwait(false);
+            return new(pager, recovered, catalog, null);
         }
         var encrypted = await StorageCryptoRecovery.OpenAsync(store, options.Credential?.Value, options.KeyEntropy, token, heldCodec).ConfigureAwait(false);
         try
         {
-            var pager = new StoragePager(store, encrypted.Meta.Header.PageSize, codec: encrypted.Codec);
-            return new(pager, encrypted.Recovered, await Catalog.ReadAsync(pager, encrypted.Meta, token).ConfigureAwait(false), encrypted.KeyBlock);
+            var pager = new StoragePager(store, encrypted.Meta.Header.PageSize, options.CacheBytes, encrypted.Codec);
+            var catalog = await Catalog.ReadAsync(pager, encrypted.Meta, token).ConfigureAwait(false);
+            catalog = await StorageTree.ValidateCatalogSpinesAsync(pager, catalog, encrypted.Meta.Header, token).ConfigureAwait(false);
+            return new(pager, encrypted.Recovered, catalog, encrypted.KeyBlock);
         }
         catch { encrypted.Dispose(); throw; }
     }
@@ -108,6 +112,10 @@ public sealed partial class Database
         catch (SqlException error) when (held && error.SqlState == SqlStates.DataCorrupted)
         { throw new SqlException(SqlStates.StaleKey, "database data key changed; reopen with its current credential"); }
     }
-    private static ValueTask<Catalog> ReadServedCatalogAsync(StoragePager pager, ServedStorage served, CancellationToken token) =>
-        served.Encrypted is { } encrypted ? Catalog.ReadAsync(pager, encrypted, token) : Catalog.ReadAsync(pager, served.Meta, token);
+    private static async ValueTask<Catalog> ReadServedCatalogAsync(StoragePager pager, ServedStorage served, CancellationToken token)
+    {
+        var catalog = served.Encrypted is { } encrypted ? await Catalog.ReadAsync(pager, encrypted, token).ConfigureAwait(false) : await Catalog.ReadAsync(pager, served.Meta, token).ConfigureAwait(false);
+        catalog = await StorageTree.ValidateCatalogSpinesAsync(pager, catalog, served.Meta, token).ConfigureAwait(false);
+        return catalog;
+    }
 }

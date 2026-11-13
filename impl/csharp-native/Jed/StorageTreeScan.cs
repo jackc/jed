@@ -8,6 +8,8 @@ internal sealed partial class StorageTree
         CancellationToken cancellationToken = default)
     {
         if (root is null || EmptyRange(lower, lowerInclusive, upper, upperInclusive)) return 0;
+        cancellationToken.ThrowIfCancellationRequested();
+        if (HasShape(root)) return CountRangeNodes(lower, lowerInclusive, upper, upperInclusive);
         return await CountRange(root, lower, lowerInclusive, upper, upperInclusive, new HashSet<uint>(), 0, cancellationToken).ConfigureAwait(false);
     }
     private async ValueTask<long> CountRange(Ref reference, byte[]? lower, bool lowerInclusive, byte[]? upper, bool upperInclusive,

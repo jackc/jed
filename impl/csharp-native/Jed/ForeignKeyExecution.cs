@@ -25,7 +25,7 @@ internal static partial class StatementExecution
     private sealed record DeferredForeignCheck(CatalogTable Parent, string Child, CatalogForeignKey Foreign, SqlValue[][] Rows, byte Action);
     private static async ValueTask ApplyReferentialActions(Database database, PendingDatabase pending, CatalogTable parent,
         IReadOnlyList<(StorageRecord Old, SqlValue[] Values)> changes, bool deleting, Meter meter, CancellationToken token, int depth = 0,
-        List<DeferredForeignCheck>? deferred = null)
+        List<DeferredForeignCheck>? deferred = null, StatementContext? context = null)
     {
         if (depth > 128) throw new SqlException(SqlStates.ProgramLimitExceeded, "referential action nesting limit");
         deferred ??= [];
@@ -92,11 +92,13 @@ internal static partial class StatementExecution
                         await AddIndexes(database, pending, child, encoded, replacement.Values, meter, token).ConfigureAwait(false);
                     }
                 Put(pending, child with { RowCount = cascadeDelete ? child.RowCount - replacements.Count : child.RowCount }, tree);
-                await ApplyReferentialActions(database, pending, child, replacements, cascadeDelete, meter, token, depth + 1, deferred).ConfigureAwait(false);
-                if (!cascadeDelete) await ValidateForeignKeys(database, pending, child, replacements.Select(change => change.Values).ToArray(), token).ConfigureAwait(false);
+                await ApplyReferentialActions(database, pending, child, replacements, cascadeDelete, meter, token, depth + 1, deferred, context).ConfigureAwait(false);
+                if (!cascadeDelete) await ForeignCheck(context, () => ValidateForeignKeys(database, pending, child, replacements.Select(change => change.Values).ToArray(), token)).ConfigureAwait(false);
             }
         }
         if (depth != 0) return;
+        async ValueTask SettleChecks()
+        {
         foreach (var check in deferred.OrderBy(check => check.Child, Utf8NameComparer.Instance).ThenBy(check => check.Foreign.Name, Utf8NameComparer.Instance))
         {
             var seen = new HashSet<string>(StringComparer.Ordinal);
@@ -110,5 +112,12 @@ internal static partial class StatementExecution
                     throw new SqlException(SqlStates.ForeignKeyViolation, "referencing row prevents parent change");
             }
         }
+        }
+        await ForeignCheck(context, SettleChecks).ConfigureAwait(false);
+    }
+    private static ValueTask ForeignCheck(StatementContext? context, Func<ValueTask> check)
+    {
+        if (context is null) return check();
+        context.ForeignChecks.Add(check); return ValueTask.CompletedTask;
     }
 }

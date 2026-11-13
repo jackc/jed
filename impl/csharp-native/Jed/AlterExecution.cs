@@ -16,6 +16,22 @@ internal static partial class StatementExecution
     }
     private static async ValueTask<StatementResult> AlterFrame(Database database, PendingDatabase pending, AlterTableSyntax[] actions, Meter meter, CancellationToken token)
     {
+        if ((pending.Catalog.Views ?? []).Any(view => view.Name == actions[0].Table))
+        {
+            foreach (var action in actions)
+            {
+                var viewAction = action.Operation switch
+                {
+                    "default" => new AlterViewSyntax(action.Table, "default", action.Column, Default: action.Expression, DefaultText: action.Text),
+                    "drop_default" => new AlterViewSyntax(action.Table, "default", action.Column),
+                    "rename" => new AlterViewSyntax(action.Table, "rename", Value: action.Name),
+                    "rename_column" => new AlterViewSyntax(action.Table, "rename_column", action.Column, action.Name),
+                    _ => throw new SqlException(SqlStates.WrongObjectType, "ALTER TABLE action requires a table")
+                };
+                _ = AlterView(database, pending, viewAction, meter, token);
+            }
+            return new([], []);
+        }
         var original = Table(pending.Catalog, actions[0].Table); var table = original;
         var values = Enumerable.Range(0, original.Columns.Length).Select(i => new AlterValue(i)).ToList();
         var rewrite = false; var validate = false; var changed = false;
@@ -86,7 +102,11 @@ internal static partial class StatementExecution
                     if (table.PrimaryKey.Contains(ordinal)) throw Errors.Unsupported("dropping primary key member");
                     var name = columns[ordinal].Name;
                     DropDependentViews(pending, table.Name, 0, action.Cascade, name);
+                    DropViewColumnAliases(pending, table.Name, ordinal);
                     static int Shift(int value, int removed) => value > removed ? value - 1 : value;
+                    if (!action.Cascade && (table.Exclusions ?? []).Any(exclusion => !exclusion.Columns.Contains(ordinal) &&
+                        table.Indexes!.Any(index => index.Name == exclusion.Index && index.Predicate is { } predicate && ExpressionUses(predicate, name))))
+                        throw new SqlException(SqlStates.DependentObjectsStillExist, "exclusion predicate depends on column");
                     var retainedIndexes = (table.Indexes ?? []).Where(index => !index.Keys.Any(key => key.Column == ordinal || key.Expression is { } expr && ExpressionUses(expr, name)) &&
                         (index.Predicate is null || !ExpressionUses(index.Predicate, name))).ToArray();
                     foreach (var child in pending.Catalog.Tables.Select(item => item.Name == table.Name ? table : item).ToArray())
@@ -111,6 +131,7 @@ internal static partial class StatementExecution
                         PrimaryKey = table.PrimaryKey.Select(value => Shift(value, ordinal)).ToArray(),
                         Checks = (table.Checks ?? []).Where(check => !ExpressionUses(check.Expression, name)).ToArray(),
                         Indexes = retainedIndexes.Select(index => index with { Keys = index.Keys.Select(key => key.Column < 0 ? key : key with { Column = Shift(key.Column, ordinal) }).ToArray() }).ToArray(),
+                        Exclusions = (table.Exclusions ?? []).Where(exclusion => retainedIndexes.Any(index => index.Name == exclusion.Index)).Select(exclusion => exclusion with { Columns = exclusion.Columns.Select(value => Shift(value, ordinal)).ToArray() }).ToArray(),
                         ForeignKeys = (table.ForeignKeys ?? []).Where(foreign => !foreign.Columns.Contains(ordinal)).Select(foreign => foreign with { Columns = foreign.Columns.Select(value => Shift(value, ordinal)).ToArray() }).ToArray()
                     };
                     if (table.Columns.Length == 0) throw Errors.Unsupported("zero-column tables");
@@ -135,6 +156,8 @@ internal static partial class StatementExecution
                     expression ??= new("column", columns[ordinal].Type.Type, default, [], Slot: ordinal);
                     rowSteps.Add(new("type", ordinal, Type: type, Expression: new Resolved("cast", type.Type, default, [expression], Target: type)));
                     var changedColumn = columns[ordinal] with { Type = type, IntervalFields = type.IntervalFields };
+                    if (!CollationRules.Collatable(type.Type)) changedColumn = changedColumn with { Collation = null, CollationData = null, CollationSkew = false };
+                    else if (!CollationRules.Collatable(columns[ordinal].Type.Type)) changedColumn = ColumnCollation(pending, changedColumn, null, meter);
                     if (changedColumn.Default is { } constant) changedColumn = changedColumn with { Default = Evaluate.Expr(new("cast", type.Type, default, [new Resolved("constant", constant.Type, constant, [])], Target: type), meter) };
                     if (changedColumn.DefaultExpression is { } defaultText)
                     {
@@ -168,7 +191,8 @@ internal static partial class StatementExecution
                         if (action.IfExists) continue;
                         throw new SqlException(SqlStates.UndefinedObject, "constraint does not exist");
                     }
-                    var remaining = (table.Indexes ?? []).Where(index => !index.IsConstraint || index.Name != name).ToArray();
+                    var excludedIndex = (table.Exclusions ?? []).FirstOrDefault(exclusion => exclusion.Name == name)?.Index;
+                    var remaining = (table.Indexes ?? []).Where(index => (!index.IsConstraint || index.Name != name) && index.Name != excludedIndex).ToArray();
                     foreach (var child in pending.Catalog.Tables.Select(item => item.Name == table.Name ? table : item).ToArray())
                     {
                         var lost = (child.ForeignKeys ?? []).Where(foreign => foreign.Parent == table.Name && !SameColumns(foreign.ParentColumns, table.PrimaryKey) &&
@@ -180,14 +204,15 @@ internal static partial class StatementExecution
                     }
                     table = table with { Checks = (table.Checks ?? []).Where(check => check.Name != name).ToArray(),
                         ForeignKeys = (table.ForeignKeys ?? []).Where(foreign => foreign.Name != name).ToArray(),
-                        Indexes = (table.Indexes ?? []).Where(index => !index.IsConstraint || index.Name != name).ToArray() }; break;
+                        Exclusions = (table.Exclusions ?? []).Where(exclusion => exclusion.Name != name).ToArray(),
+                        Indexes = remaining }; break;
                 }
                 case "rename_constraint":
                 {
                     var name = action.Column!; var renamed = action.Name!;
                     if (!ConstraintNames(table).Contains(name, StringComparer.Ordinal)) throw new SqlException(SqlStates.UndefinedObject, "constraint does not exist");
                     if (ConstraintNames(table).Contains(renamed, StringComparer.Ordinal)) throw new SqlException(SqlStates.DuplicateObject, "constraint already exists");
-                    var index = (table.Indexes ?? []).FirstOrDefault(index => index.IsConstraint && index.Name == name);
+                    var index = (table.Indexes ?? []).FirstOrDefault(index => index.Name == name && (index.IsConstraint || (table.Exclusions ?? []).Any(exclusion => exclusion.Index == name)));
                     if (index is not null && RelationExists(pending.Catalog, renamed)) throw new SqlException(SqlStates.DuplicateTable, "relation already exists");
                     table = table with { Checks = (table.Checks ?? []).Select(check => check.Name == name ? check with { Name = renamed } : check).ToArray(),
                         ForeignKeys = (table.ForeignKeys ?? []).Select(foreign => foreign.Name == name ? foreign with { Name = renamed } : foreign).ToArray(),
@@ -212,9 +237,11 @@ internal static partial class StatementExecution
                 }
                 case "rename":
                 {
-                    if (RelationExists(pending.Catalog, action.Name!)) throw new SqlException(SqlStates.DuplicateTable, "relation already exists");
+                    if (RelationExistsAnywhere(pending.Catalog, action.Name!)) throw new SqlException(SqlStates.DuplicateTable, "relation already exists");
                     RenameViews(pending, table.Name, action.Name!, 0);
-                    var old = table.Name; table = table with { Name = action.Name!,
+                    var old = table.Name;
+                    pending.Catalog = pending.Catalog with { Statistics = pending.Catalog.Statistics?.Select(stat => stat.Table == old ? stat with { Table = action.Name! } : stat).ToArray() };
+                    table = table with { Name = action.Name!,
                         Checks = (table.Checks ?? []).Select(check => check with { Expression = RenameExpression(check.Expression, old, action.Name!) }).ToArray() };
                     pending.Catalog = pending.Catalog with { Tables = pending.Catalog.Tables.Where(item => item.Name != old).Select(item => item with {
                         ForeignKeys = (item.ForeignKeys ?? []).Select(foreign => foreign.Parent == old ? foreign with { Parent = action.Name! } : foreign).ToArray() }).ToArray(),
@@ -230,7 +257,8 @@ internal static partial class StatementExecution
         if (!changed) return new([], []);
         foreach (var ordinal in table.PrimaryKey) Keyable(table.Columns[ordinal].Type.Type);
         foreach (var index in table.Indexes ?? [])
-            foreach (var key in index.Keys.Where(key => key.Expression is null)) Keyable(table.Columns[key.Column].Type.Type);
+            foreach (var key in index.Keys.Where(key => key.Expression is null))
+                if (index.Kind == 1) GinIndex.ValidateType(table.Columns[key.Column].Type.Type); else Keyable(table.Columns[key.Column].Type.Type);
         var finalTables = pending.Catalog.Tables.Where(item => item.Name != original.Name && item.Name != table.Name).Append(table).ToArray();
         foreach (var child in finalTables)
             foreach (var foreign in child.ForeignKeys ?? [])
@@ -285,17 +313,19 @@ internal static partial class StatementExecution
         var rebuildExistingIndexes = rekeyed || values.Any(value => value.Cast is not null);
         var renamedIndexes = actions.Where(action => action.Operation == "rename_constraint").ToDictionary(action => action.Column!, action => action.Name!, StringComparer.Ordinal);
         Put(pending, table, rewrite ? result : null);
+        if (rowSteps.Any(step => step.Operation is "type" or "drop")) ClearStatistics(pending, table.Name);
         foreach (var index in original.Indexes ?? [])
             if (rebuildExistingIndexes || !renamedIndexes.ContainsKey(index.Name) && !(table.Indexes ?? []).Any(current => current.Name == index.Name))
             {
                 var cleared = await database.IndexTree(index, pending, pending.Before).ClearAsync(token).ConfigureAwait(false);
-                pending.RetiredPages.UnionWith(cleared.RetiredPages); pending.IndexTrees.Remove(index.Name);
+                pending.RetiredPages.UnionWith(cleared.RetiredPages); if (index.Gist is { } gist) pending.RetiredPages.UnionWith(gist.Pages); pending.IndexTrees.Remove(index.Name);
             }
         foreach (var index in table.Indexes ?? [])
             if (rebuildExistingIndexes || !renamedIndexes.ContainsValue(index.Name) && !(original.Indexes ?? []).Any(prior => prior.Name == index.Name))
                 await BuildIndex(database, pending, table, index, meter, token, chargeScan: false).ConfigureAwait(false);
         if (candidateRows.Count != 0)
         {
+            ValidateAddedExclusions(table, original, candidateRows.ToArray(), meter, pending.Catalog);
             foreach (var foreign in table.ForeignKeys ?? [])
             {
                 if (foreign.Parent != table.Name || (original.ForeignKeys ?? []).Any(prior => prior.Name == foreign.Name)) continue;

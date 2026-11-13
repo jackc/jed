@@ -17,6 +17,8 @@ internal static partial class StatementExecution
             var item = items[i];
             if (item.Expression.Op != "text" || targets[i].Type.Kind is not (SqlKind.Uuid or SqlKind.Bytea or SqlKind.Date or SqlKind.Timestamp or SqlKind.Timestamptz or SqlKind.Interval or SqlKind.Composite or SqlKind.Array or SqlKind.Range or SqlKind.Json or SqlKind.Jsonb)) continue;
             if ((query.Order ?? []).Any(order => UsedAsKey(order.Expression, i)) || (query.GroupBy ?? []).Any(key => UsedAsKey(key, i))) continue;
+            if (targets[i].Type == SqlType.Date && TemporalText.IsClockDate(item.Expression.Text))
+                _ = TemporalInput.ParseDate(item.Expression.Text);
             var bound = Resolve.Expr(Resolve.BindTypes(item.Expression, catalog, meter.Temporal), targets[i].Type);
             items[i] = item with { Expression = new("bound", "", [], Binding: bound) };
         }

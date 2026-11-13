@@ -13,10 +13,11 @@ public sealed class TimeZoneRule
     private readonly TimeZoneOffset[] types;
     private readonly PosixZone? future;
     public string Name { get; }
+    internal bool IsFixed { get; }
     public string Version { get; }
     public uint Checksum { get; }
     internal TimeZoneRule(string name, int offset)
-    { Name = name; Version = ""; transitions = []; transitionTypes = []; types = [new(offset, FixedAbbreviation(offset), false)]; }
+    { Name = name; IsFixed = true; Version = ""; transitions = []; transitionTypes = []; types = [new(offset, FixedAbbreviation(offset), false)]; }
     private static string FixedAbbreviation(int offset)
     {
         if (offset == 0) return "UTC";

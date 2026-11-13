@@ -32,11 +32,11 @@ internal static partial class StatementExecution
         {
             var column = access.Columns[i]; var value = parentRow[foreign.ParentColumns[Array.IndexOf(foreign.Columns, column)]];
             if (value.IsNull || EqualCast(value, child.Columns[column].Type.Type) is not { } converted) return null;
-            if (access.Index is null) writer.Bytes(KeyEncoding.Encode(converted));
+            if (access.Index is null) writer.Bytes(KeyEncoding.Encode(converted, collation: child.Columns[column].CollationData));
             else
             {
                 var options = access.Index.Keys[i].Options; var descending = (options & 1) != 0;
-                var encoded = KeyEncoding.Encode(converted, true, descending);
+                var encoded = KeyEncoding.Encode(converted, true, descending, collation: child.Columns[column].CollationData);
                 if (((options & 2) != 0) != descending) encoded[0] ^= 1;
                 writer.Bytes(encoded);
             }

@@ -16,23 +16,42 @@ internal static partial class Evaluate
     private static async ValueTask<SqlValue> PendingExpression(Resolved expression, Meter meter, bool filter, SqlValue[]? row)
     {
         meter.Guard();
+        if (expression.Op == "collate") return await ExprAsync(expression.Args[0], meter, filter, row).ConfigureAwait(false);
         if (expression.Op == "in_init") return await SubqueryExecution.InAsync(expression, meter, row).ConfigureAwait(false);
-        if (expression.Op is "promote") return Resolve.Cast(await ExprAsync(expression.Args[0], meter, row: row).ConfigureAwait(false), expression.Type);
+        if (expression.Op is "promote") return TemporalText.Cast(await ExprAsync(expression.Args[0], meter, row: row).ConfigureAwait(false), expression.Type, meter);
+        if (expression.Op == "in_list")
+        {
+            meter.Charge((expression.Args.Length - 2) * Costs.OperatorEval); meter.Guard();
+            var input = await ExprAsync(expression.Args[0], meter, row: row).ConfigureAwait(false);
+            return LiteralMembership(expression, input, meter);
+        }
         meter.Charge(expression.Function?.Cost ?? Costs.OperatorEval);
+        if (expression.Op is "json_sql" or "is_json") return await JsonSql.EvaluateAsync(expression, meter, row).ConfigureAwait(false);
         if (expression.Op == "correlated")
         {
-            meter.Guard(); await expression.Subquery!.Execute(row).ConfigureAwait(false); return expression.Subquery.Value;
+            meter.Guard();
+            try { await expression.Subquery!.Execute(row).ConfigureAwait(false); return expression.Subquery.Value; }
+            finally { expression.Subquery!.ReleaseConsumed(); }
         }
         if (expression.Op is "quantified_init" or "quantified_correlated")
         {
-            if (expression.Op == "quantified_correlated") { meter.Guard(); await expression.Subquery!.Execute(row).ConfigureAwait(false); }
-            var input = await ExprAsync(expression.Args[0], meter, row: row).ConfigureAwait(false);
-            return OpenOperators.QuantifiedValues(expression.Text, input, expression.Subquery!.Values, meter);
+            try
+            {
+                if (expression.Op == "quantified_correlated") { meter.Guard(); await expression.Subquery!.Execute(row).ConfigureAwait(false); }
+                var input = await ExprAsync(expression.Args[0], meter, row: row).ConfigureAwait(false);
+                return OpenOperators.QuantifiedValues(expression.Text, input, expression.Subquery!.Values, meter, expression.Collation);
+            }
+            finally { expression.Subquery!.ReleaseConsumed(); }
         }
         if (expression.Op == "in_correlated")
         {
-            meter.Guard(); await expression.Subquery!.Execute(row).ConfigureAwait(false);
-            return await SubqueryExecution.InAsync(expression, meter, row, correlated: true).ConfigureAwait(false);
+            meter.Guard();
+            try
+            {
+                await expression.Subquery!.Execute(row).ConfigureAwait(false);
+                return await SubqueryExecution.InAsync(expression, meter, row, correlated: true).ConfigureAwait(false);
+            }
+            finally { expression.Subquery!.ReleaseConsumed(); }
         }
         if (expression.Op == "case")
         {
@@ -59,7 +78,7 @@ internal static partial class Evaluate
             {
                 var value = await ExprAsync(argument, meter, row: row).ConfigureAwait(false);
                 if (value.IsNull) continue;
-                if (best.IsNull || (expression.Op == "greatest" ? Compare(value, best, meter) > 0 : Compare(value, best, meter) < 0)) best = value;
+                if (best.IsNull || (expression.Op == "greatest" ? CollationRules.Compare(value, best, expression.Collation, meter) > 0 : CollationRules.Compare(value, best, expression.Collation, meter) < 0)) best = value;
             }
             return best;
         }

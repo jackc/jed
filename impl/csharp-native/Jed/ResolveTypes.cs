@@ -17,6 +17,7 @@ internal static partial class Resolve
     {
         Windows = query.Windows?.ToDictionary(pair => pair.Key, pair => BindTypes(pair.Value, catalog, context), StringComparer.Ordinal),
         With = query.With?.Select(definition => definition with { Query = BindTypes(definition.Query, catalog, context) }).ToArray(),
+        DistinctOn = query.DistinctOn?.Select(expression => BindTypes(expression, catalog, context)).ToArray(),
         Items = query.Items.Select(item => item with { Expression = BindTypes(item.Expression, catalog, context) }).ToArray(),
         Filter = query.Filter is null ? null : BindTypes(query.Filter, catalog, context),
         Order = query.Order?.Select(order => order with { Expression = BindTypes(order.Expression, catalog, context) }).ToArray(),
@@ -42,6 +43,7 @@ internal static partial class Resolve
         ValuesRelation values => values with { Values = values.Values.Select(row => row.Select(expression => BindTypes(expression, catalog, context)).ToArray()).ToArray() },
         DerivedRelation derived => derived with { Query = BindTypes(derived.Query, catalog, context) },
         FunctionRelation function => function with { Function = BindTypes(function.Function, catalog, context) },
+        GroupedRelation group => group with { Source = BindTypes(group.Source, catalog, context) },
         JoinedRelation join => join with { Left = BindTypes(join.Left, catalog, context), Right = BindTypes(join.Right, catalog, context), On = join.On is null ? null : BindTypes(join.On, catalog, context) },
         _ => source
     };

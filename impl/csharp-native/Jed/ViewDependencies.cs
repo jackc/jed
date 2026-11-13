@@ -2,9 +2,11 @@ namespace Jed;
 
 internal static partial class StatementExecution
 {
-    private static CatalogViewDependency[] ViewDependencies(SelectSyntax query, Catalog catalog)
+    internal static CatalogViewDependency[] ViewDependencies(SelectSyntax query, Catalog catalog)
     {
         var dependencies = new Dictionary<(byte Kind, string Name), HashSet<string>>();
+        Catalog Home(string name) => catalog.Scope?.Resolve(name).Catalog ?? catalog;
+        CatalogTable? SourceTable(string name) => Home(name).Tables.FirstOrDefault(table => table.Name == DatabaseDomains.Name(name).Local);
         void Add(byte kind, string name, string? column = null)
         {
             if (!dependencies.TryGetValue((kind, name), out var columns)) dependencies.Add((kind, name), columns = new(StringComparer.Ordinal));
@@ -22,18 +24,18 @@ internal static partial class StatementExecution
             {
                 var dot = expression.Text.LastIndexOf('.'); var name = expression.Text[(dot + 1)..]; var label = dot < 0 ? null : expression.Text[..dot];
                 foreach (var source in scope.Where(source => label is null || source.Label == label))
-                    if (catalog.Tables.FirstOrDefault(table => table.Name == source.Table) is { } table && table.Columns.Any(column => column.Name == name)) Add(0, table.Name, name);
+                    if (SourceTable(source.Table) is { } table && table.Columns.Any(column => column.Name == name)) Add(0, table.Name, name);
             }
             if (expression.Op == "star")
                 foreach (var source in scope.Where(source => expression.Text.Length == 0 || source.Label == expression.Text))
-                    if (catalog.Tables.FirstOrDefault(table => table.Name == source.Table) is { } table)
+                    if (SourceTable(source.Table) is { } table)
                         foreach (var column in table.Columns) Add(0, table.Name, column.Name);
             if (expression.Op == "cast") Type(SqlTypes.ParseSpec(expression.Text, catalog.NamedType).Type);
             if (expression.Op == "call" && expression.Text is "nextval" or "currval" or "setval" && expression.Args.Length > 0 && expression.Args[0].Op == "text")
             {
                 var name = SequenceContext.Name(expression.Args[0].Text);
-                if (!(catalog.Sequences ?? []).Any(sequence => sequence.Name == name)) throw new SqlException(SqlStates.UndefinedTable, "view sequence does not exist");
-                Add(2, name);
+                if (!(Home(name).Sequences ?? []).Any(sequence => sequence.Name == DatabaseDomains.Name(name).Local)) throw new SqlException(SqlStates.UndefinedTable, "view sequence does not exist");
+                Add(2, DatabaseDomains.Name(name).Local);
             }
             if (expression.Query is { } body) Query(body, scope, ctes);
             foreach (var argument in expression.Args) Expr(argument, scope, ctes);
@@ -55,21 +57,27 @@ internal static partial class StatementExecution
                 case LateralRelation lateral: Relation(lateral.Source, scope, ctes); break;
                 case AliasedRelation aliased: Relation(aliased.Source, scope, ctes); break;
                 case TableRelation table when !ctes.Contains(table.Name):
-                    scope.Add((table.Alias ?? table.Name, table.Name));
-                    if (catalog.Tables.Any(item => item.Name == table.Name)) Add(0, table.Name);
-                    else if ((catalog.Views ?? []).Any(item => item.Name == table.Name)) Add(1, table.Name);
+                {
+                    var local = DatabaseDomains.Name(table.Name).Local;
+                    scope.Add((table.Alias ?? local, table.Name));
+                    var home = Home(table.Name);
+                    if (catalog.Scope?.Resolve(table.Name).Name is { } domain && domain is not ("main" or "temp")) throw Errors.Unsupported("view body references an attached database");
+                    if (home.Tables.Any(item => item.Name == local)) Add(0, local);
+                    else if ((home.Views ?? []).Any(item => item.Name == local)) Add(1, local);
                     break;
+                }
                 case DerivedRelation derived: Query(derived.Query, [], ctes); break;
                 case SetRelation set: Query(set.Left, scope, ctes); Query(set.Right, scope, ctes); break;
                 case FunctionRelation function: Expr(function.Function, scope, ctes); break;
                 case ValuesRelation values: foreach (var row in values.Values) foreach (var value in row) Expr(value, scope, ctes); break;
+                case GroupedRelation group: Relation(group.Source, scope, ctes); break;
                 case JoinedRelation join:
                     Relation(join.Left, scope, ctes); Relation(join.Right, scope, ctes);
                     if (join.On is { } predicate) Expr(predicate, scope, ctes);
                     foreach (var name in join.Using ?? []) Expr(new("name", name, []), scope, ctes);
                     if (join.Natural)
                     {
-                        var columns = scope.SelectMany(source => catalog.Tables.FirstOrDefault(table => table.Name == source.Table)?.Columns.Select(column => column.Name) ?? []);
+                        var columns = scope.SelectMany(source => SourceTable(source.Table)?.Columns.Select(column => column.Name) ?? []);
                         foreach (var name in columns.GroupBy(name => name).Where(group => group.Count() > 1).Select(group => group.Key)) Expr(new("name", name, []), scope, ctes);
                     }
                     break;
@@ -78,7 +86,11 @@ internal static partial class StatementExecution
         void Query(SelectSyntax body, List<(string Label, string Table)> outer, HashSet<string> inherited)
         {
             var ctes = new HashSet<string>(inherited, StringComparer.Ordinal);
-            foreach (var cte in body.With ?? []) { ctes.Add(cte.Name); Query(cte.Query, [], ctes); }
+            foreach (var cte in body.With ?? [])
+            {
+                if (body.Recursive) ctes.Add(cte.Name);
+                Query(cte.Query, [], ctes); ctes.Add(cte.Name);
+            }
             var scope = new List<(string Label, string Table)>(); Relation(body.Relation, scope, ctes);
             if (body.Relation is null && body.Table is { } name) Relation(new TableRelation(name, body.TableAlias), scope, ctes);
             scope.AddRange(outer.Where(source => !scope.Any(inner => inner.Label == source.Label)));
@@ -86,6 +98,7 @@ internal static partial class StatementExecution
             if (body.Filter is { } filter) Expr(filter, scope, ctes);
             if (body.Having is { } having) Expr(having, scope, ctes);
             foreach (var group in body.GroupBy ?? []) Expr(group, scope, ctes);
+            foreach (var key in body.DistinctOn ?? []) Expr(key, scope, ctes);
             foreach (var order in body.Order ?? []) Expr(order.Expression, scope, ctes);
             foreach (var window in body.Windows?.Values.AsEnumerable() ?? []) Window(window, scope, ctes);
         }
@@ -95,16 +108,21 @@ internal static partial class StatementExecution
     }
     private static StatementResult AlterView(Database database, PendingDatabase pending, AlterViewSyntax alter, Meter meter, CancellationToken token)
     {
+        if (alter.Actions is { } actions)
+        {
+            foreach (var action in actions) AlterView(database, pending, action with { Name = alter.Name }, meter, token);
+            return new([], []);
+        }
         var view = (pending.Catalog.Views ?? []).FirstOrDefault(view => view.Name == alter.Name);
+        if (view is null && alter.IfExists && !RelationExists(pending.Catalog, alter.Name)) return new([], []);
         if (view is null) throw new SqlException(RelationExists(pending.Catalog, alter.Name) ? SqlStates.WrongObjectType : SqlStates.UndefinedTable, "view does not exist");
         if (alter.Operation == "rename")
         {
-            if (RelationExists(pending.Catalog, alter.Value!)) throw new SqlException(SqlStates.DuplicateTable, "relation already exists");
+            if (RelationExistsAnywhere(pending.Catalog, alter.Value!)) throw new SqlException(SqlStates.DuplicateTable, "relation already exists");
             if (alter.Value!.StartsWith("jed_", StringComparison.Ordinal)) throw new SqlException(SqlStates.ReservedName, "reserved view name");
-            // Stored definitions bind by name. Renames must rewrite dependent relation tokens too.
-            var views = (pending.Catalog.Views ?? []).Select(item => item.Name == view.Name ? item with { Name = alter.Value! } : item.Dependencies.Any(dependency => dependency.Kind == 1 && dependency.Name == view.Name)
-                ? item with { Definition = RewriteViewRelation(item.Definition, view.Name, alter.Value!), Dependencies = item.Dependencies.Select(dependency => dependency.Kind == 1 && dependency.Name == view.Name ? dependency with { Name = alter.Value! } : dependency).ToArray() } : item).ToArray();
-            pending.Catalog = pending.Catalog with { Views = views }; pending.Changed = true; return new([], []);
+            RenameViews(pending, view.Name, alter.Value!, 1);
+            pending.Catalog = pending.Catalog with { Views = (pending.Catalog.Views ?? []).Select(item => item.Name == view.Name ? item with { Name = alter.Value! } : item).ToArray() };
+            pending.Changed = true; return new([], []);
         }
         if (alter.Operation is "rename_column" or "default")
         {
@@ -120,12 +138,17 @@ internal static partial class StatementExecution
             else
             {
                 var query = RelationExecution.Query(ViewQuery(view), database, pending.Before, pending, pending.Catalog, meter, token);
-                if (alter.Default is { } value)
+                var type = QueryColumnType(ViewQuery(view), query.Columns[index], index, pending.Catalog);
+                var validated = WithDefault(new CatalogColumn(columns[index].Name, type), alter.Default, alter.DefaultText, meter, pending.Catalog);
+                var text = validated.DefaultExpression;
+                if (validated.Default is { IsNull: false } constant)
                 {
-                    ValidateStoredExpression(value, isDefault: true);
-                    var resolved = Resolve.Expr(Resolve.BindTypes(value, pending.Catalog, meter.Temporal), query.Columns[index].Type); Assignable(resolved.Type, query.Columns[index].Type);
+                    if (constant.Type == SqlType.Decimal && alter.Default is { } literal && literal.Op is "integer" or "decimal")
+                        constant = Assign(literal, type with { Precision = null, Scale = null }, [], [], meter, pending.Catalog);
+                    var rendered = constant.ToString();
+                    text = constant.Type.IsInteger() || constant.Type == SqlType.Decimal || constant.Type == SqlType.Boolean ? rendered : "'" + rendered.Replace("'", "''", StringComparison.Ordinal) + "'";
                 }
-                columns[index] = columns[index] with { DefaultExpression = alter.DefaultText };
+                columns[index] = columns[index] with { DefaultExpression = text };
             }
             view = view with { Columns = columns };
         }
@@ -137,31 +160,69 @@ internal static partial class StatementExecution
         }
         pending.Catalog = pending.Catalog with { Views = (pending.Catalog.Views ?? []).Select(item => item.Name == view.Name ? view : item).ToArray() }; pending.Changed = true; return new([], []);
     }
-    private static string RewriteViewRelation(string text, string before, string after, string[]? exposedColumns = null, int renamedColumn = -1)
+    private static string RewriteViewRelation(string text, string before, string after, string[]? exposedColumns = null, int renamedColumn = -1, int droppedColumn = -1)
     {
-        var lexer = new Lexer(text); var tokens = new List<Token>(); Token token;
-        while ((token = lexer.Next()).Kind != TokenKind.End) tokens.Add(token);
+        List<Token> Rewrite(List<Token> tokens, HashSet<string> inherited)
+        {
+            var ctes = new HashSet<string>(inherited, StringComparer.Ordinal); var prefixEnd = 0;
+            if (tokens.Count > 0 && tokens[0].Kind == TokenKind.Word && tokens[0].Text == "with")
+            {
+                var cursor = 1; var recursive = tokens[cursor].Text == "recursive"; if (recursive) cursor++;
+                while (true)
+                {
+                    var name = tokens[cursor++].Text;
+                    if (tokens[cursor].Text == "(") cursor = ViewTokens.Close(tokens, cursor) + 1;
+                    while (tokens[cursor].Text != "(") cursor++;
+                    var close = ViewTokens.Close(tokens, cursor);
+                    if (recursive) ctes.Add(name);
+                    var inner = Rewrite(tokens.GetRange(cursor + 1, close - cursor - 1), ctes);
+                    tokens.RemoveRange(cursor + 1, close - cursor - 1); tokens.InsertRange(cursor + 1, inner);
+                    ctes.Add(name); cursor += inner.Count + 2;
+                    if (cursor >= tokens.Count || tokens[cursor].Text != ",") break;
+                    cursor++;
+                }
+                prefixEnd = cursor;
+            }
+            ViewTokens.Nested(tokens, prefixEnd, nested => Rewrite(nested, ctes));
         var clauses = new HashSet<string>(["where", "group", "having", "order", "limit", "offset", "union", "intersect", "except", "join", "inner", "left", "right", "full", "cross", "natural", "on", "using", "window"], StringComparer.Ordinal);
-        var from = false; var expect = false; var states = new Stack<(bool From, bool Expect)>();
-        for (var i = 0; i < tokens.Count; i++)
+        var from = false; var expect = false;
+        for (var i = prefixEnd; i < tokens.Count; i++)
         {
             var current = tokens[i];
-            if (current.Text == "(") { states.Push((from, expect)); from = false; expect = false; continue; }
-            if (current.Text == ")") { if (states.TryPop(out var state)) { from = state.From; expect = false; } continue; }
+            if (current.Kind == TokenKind.Symbol && current.Text == "(") { i = ViewTokens.Close(tokens, i); expect = false; continue; }
             if (current.Kind == TokenKind.Word && current.Text is "from" or "join") { from = true; expect = true; continue; }
             if (current.Kind == TokenKind.Word && clauses.Contains(current.Text)) { if (current.Text is "where" or "group" or "having" or "order" or "limit" or "offset" or "union" or "intersect" or "except" or "window") from = false; expect = false; continue; }
             if (current.Text == "," && from) { expect = true; continue; }
             if (!expect) continue;
             expect = false;
-            if (current.Text == "main" && i + 2 < tokens.Count && tokens[i + 1].Text == ".") { i += 2; current = tokens[i]; }
+            var qualified = current.Text == "main" && i + 2 < tokens.Count && tokens[i + 1].Text == ".";
+            if (qualified) { i += 2; current = tokens[i]; }
+            if (!qualified && ctes.Contains(current.Text)) continue;
             if (current.Text != before || current.Kind is not (TokenKind.Word or TokenKind.QuotedName)) continue;
             var end = i + 1; var hasAlias = false;
             if (end < tokens.Count && tokens[end].Text == "as") { hasAlias = true; end += 2; }
             else if (end < tokens.Count && (tokens[end].Kind == TokenKind.QuotedName || tokens[end].Kind == TokenKind.Word && !clauses.Contains(tokens[end].Text))) { hasAlias = true; end++; }
             if (after != before) tokens[i] = new(TokenKind.QuotedName, after);
+            if (droppedColumn >= 0 && !hasAlias) continue;
             if (!hasAlias)
             {
                 tokens.InsertRange(end, [new(TokenKind.Word, "as"), new(TokenKind.QuotedName, before)]); end += 2;
+            }
+            if (droppedColumn >= 0 && end < tokens.Count && tokens[end].Text == "(")
+            {
+                var listEnd = ViewTokens.Close(tokens, end);
+                var names = tokens.GetRange(end + 1, listEnd - end - 1).Where(item => item.Kind is TokenKind.Word or TokenKind.QuotedName).ToList();
+                if (droppedColumn < names.Count)
+                {
+                    names.RemoveAt(droppedColumn); var replacement = new List<Token>();
+                    if (names.Count != 0)
+                    {
+                        replacement.Add(new(TokenKind.Symbol, "("));
+                        foreach (var name in names) { if (replacement.Count > 1) replacement.Add(new(TokenKind.Symbol, ",")); replacement.Add(name); }
+                        replacement.Add(new(TokenKind.Symbol, ")"));
+                    }
+                    tokens.RemoveRange(end, listEnd - end + 1); tokens.InsertRange(end, replacement); end += replacement.Count;
+                }
             }
             if (renamedColumn >= 0 && exposedColumns is not null)
             {
@@ -183,14 +244,22 @@ internal static partial class StatementExecution
             }
             i = end - 1;
         }
-        return string.Join(' ', tokens.Select(Parser.RenderToken));
+        return tokens;
+        }
+        return ViewTokens.Render(Rewrite(ViewTokens.Read(text), new(StringComparer.Ordinal)));
+    }
+    private static void DropViewColumnAliases(PendingDatabase pending, string table, int ordinal)
+    {
+        EditScopedViews(pending, views => views.Select(view =>
+            view.Dependencies.Any(dependency => dependency.Kind == 0 && dependency.Name == table)
+                ? view with { Definition = RewriteViewRelation(view.Definition, table, table, droppedColumn: ordinal) } : view).ToArray());
     }
     private static void RenameViews(PendingDatabase pending, string before, string after, byte kind, string[]? columns = null, int renamedColumn = -1, string? renamedTo = null)
     {
-        pending.Catalog = pending.Catalog with { Views = (pending.Catalog.Views ?? []).Select(view => view.Dependencies.Any(dependency => dependency.Kind == kind && dependency.Name == before) ? view with {
+        EditScopedViews(pending, views => views.Select(view => view.Dependencies.Any(dependency => dependency.Kind == kind && dependency.Name == before) ? view with {
             Definition = RewriteViewRelation(view.Definition, before, after, columns, renamedColumn),
             Dependencies = view.Dependencies.Select(dependency => dependency.Kind == kind && dependency.Name == before ? dependency with { Name = after,
                 Columns = dependency.Columns.Select(column => columns is not null && renamedColumn >= 0 && column == columns[renamedColumn] ? renamedTo! : column).Order(Utf8NameComparer.Instance).ToArray() } : dependency).OrderBy(dependency => dependency.Name, Utf8NameComparer.Instance).ThenBy(dependency => dependency.Kind).ToArray()
-        } : view).ToArray() };
+        } : view).ToArray());
     }
 }

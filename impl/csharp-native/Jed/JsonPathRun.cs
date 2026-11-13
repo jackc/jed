@@ -4,29 +4,51 @@ using System.Text;
 namespace Jed;
 
 /// <summary>Depth-first SQL/JSON sequence evaluator. Accessor chains use an explicit stack.</summary>
-internal sealed class JsonPathRun(SqlJsonPath path, SqlJsonNode document, SqlJsonNode variables, Meter meter, int variableBases = 1)
+internal readonly record struct JsonPathBinding(string Name, SqlJsonNode Value, int Base);
+
+internal sealed class JsonPathRun(SqlJsonPath path, SqlJsonNode document, SqlJsonNode variables, Meter meter, int variableBases = 1, JsonPathBinding[]? passing = null)
 {
     private readonly record struct Item(SqlJsonNode Node, int Last = -1, bool Suppress = false, long Base = 0, long Offset = 0);
     private long nextBase = variableBases + 1;
     private readonly Dictionary<(long Base, SqlJsonNode Node), long> offsets = new();
+    private readonly Dictionary<PathExpr, RegexMachine> regex = new(ReferenceEqualityComparer.Instance);
+    private readonly JsonPathBinding[]? bindings = passing?.OrderBy(binding => binding.Name, StringComparer.Ordinal).ToArray();
     private void Charge(long amount = 1) { meter.Charge(amount); meter.Guard(); }
     private static SqlException Error(string state, string message = "invalid SQL/JSON path operation") => new(state, message);
-    internal (List<SqlJsonNode> Items, bool Failed) Run(bool silent = false, bool exists = false)
+    internal bool Failed { get; private set; }
+    internal (List<SqlJsonNode> Items, bool Failed) Run(bool silent = false, bool exists = false, bool chargeItems = true)
+    {
+        var result = new List<SqlJsonNode>();
+        foreach (var item in Sequence(silent, exists)) { if (chargeItems) Charge(); result.Add(item); }
+        return (result, Failed);
+    }
+    internal IEnumerable<SqlJsonNode> Sequence(bool silent = false, bool exists = false)
     {
         if (variables.Kind != SqlJsonKind.Object) throw Error("22023", "vars argument is not an object");
         Charge(TextEncoding.ByteCount(path.Text) * Costs.JsonpathCompile);
         var program = SqlJsonPath.Parse(path.Text);
-        Layout(document, 0, 0); Layout(variables, 0, 1);
-        var result = new List<SqlJsonNode>(); var failed = false;
+        var pending = new Stack<PathExpr>(); pending.Push(program.Root);
+        while (pending.TryPop(out var expression))
+        {
+            if (expression.Op == "regex")
+            {
+                var compiled = RegexProgram.Compile(expression.Args[1].Value!.Text!, expression.Text, meter.Unicode, jsonPath: true);
+                Charge(compiled.Code.Length * Costs.RegexCompile); regex.Add(expression, new(compiled));
+            }
+            for (var i = expression.Args.Length - 1; i >= 0; i--) pending.Push(expression.Args[i]);
+        }
+        Layout(document, 0, 0);
+        if (bindings is null) Layout(variables, 0, 1);
+        else foreach (var binding in bindings) Layout(binding.Value, 0, binding.Base);
         using var iterator = Eval(program.Root, new(document), exists && !path.Strict).GetEnumerator();
         while (true)
         {
             bool more;
             try { more = iterator.MoveNext(); }
-            catch (SqlException error) when (silent && Suppressible(error)) { failed = true; break; }
-            if (!more) break; result.Add(iterator.Current.Node); if (exists && !path.Strict) break;
+            catch (SqlException error) when (silent && Suppressible(error)) { Failed = true; more = false; }
+            if (!more) yield break;
+            yield return iterator.Current.Node; if (exists && !path.Strict) yield break;
         }
-        return (result, failed);
     }
     private static bool Suppressible(SqlException error) => error.SqlState.StartsWith("22", StringComparison.Ordinal);
     private static bool Accessor(PathExpr expression) => expression.Op is "member" or "members" or "elements" or "index" or "filter" or "method" or "descendants";
@@ -57,14 +79,21 @@ internal sealed class JsonPathRun(SqlJsonPath path, SqlJsonNode document, SqlJso
         if (expression.Predicate) { yield return new(TruthNode(Truth(expression, current))); yield break; }
         switch (expression.Op)
         {
-            case "root": yield return new(document); yield break;
+            case "root": yield return new(document, Suppress: current.Suppress); yield break;
             case "current": yield return current; yield break;
             case "last": yield return new(SqlJsonNode.Numeric(ExactDecimal.FromInt64(current.Last))); yield break;
             case "literal": yield return new(expression.Value!); yield break;
             case "variable":
+                if (bindings is not null)
+                {
+                    var low = 0; var high = bindings.Length;
+                    while (low < high) { var middle = low + (high - low) / 2; if (StringComparer.Ordinal.Compare(bindings[middle].Name, expression.Text) < 0) low = middle + 1; else high = middle; }
+                    if (low == bindings.Length || bindings[low].Name != expression.Text) throw Error("42704", "could not find jsonpath variable " + expression.Text);
+                    var binding = bindings[low]; yield return new(binding.Value, Suppress: current.Suppress, Base: binding.Base); yield break;
+                }
                 var member = variables.Members.FirstOrDefault(member => member.Key == expression.Text);
                 if (member.Value is null) throw Error("42704", "could not find jsonpath variable " + expression.Text);
-                yield return new(member.Value, Base: 1, Offset: offsets.GetValueOrDefault((1, member.Value))); yield break;
+                yield return new(member.Value, Suppress: current.Suppress, Base: 1, Offset: offsets.GetValueOrDefault((1, member.Value))); yield break;
             case "+": case "-": case "*": case "/": case "%":
                 if (expression.Args.Length == 1)
                 {
@@ -78,7 +107,7 @@ internal sealed class JsonPathRun(SqlJsonPath path, SqlJsonNode document, SqlJso
                 var left = Unwrap(Eval(expression.Args[0], current), !path.Strict).ToArray(); var right = Unwrap(Eval(expression.Args[1], current), !path.Strict).ToArray();
                 if (left.Length != 1 || left[0].Node.Kind != SqlJsonKind.Number || right.Length != 1 || right[0].Node.Kind != SqlJsonKind.Number) throw Error("22038");
                 var a = left[0].Node.Number!; var b = right[0].Node.Number!; Charge();
-                if (!(b.IsZero && expression.Op is "/" or "%")) Charge(Math.Max(0, a.DecimalWork(b, expression.Op) - 1));
+                if (!(b.IsZero && expression.Op is "/" or "%")) Charge(a.DecimalWork(b, expression.Op));
                 var value = expression.Op switch { "+" => a.Add(b), "-" => a.Subtract(b), "*" => a.Multiply(b), "/" => a.Divide(b), _ => a.Remainder(b) };
                 Charge(); yield return new(SqlJsonNode.Numeric(value)); yield break;
             default: throw Error("42601");
@@ -182,11 +211,17 @@ internal sealed class JsonPathRun(SqlJsonPath path, SqlJsonNode document, SqlJso
             var unknown = false; var any = false;
             foreach (var a in left)
             {
-                if (expression.Op == "regex") throw Errors.Unsupported("JSON path regular expressions");
+                if (expression.Op == "regex")
+                {
+                    Charge();
+                    if (a.Node.Kind != SqlJsonKind.String) { if (path.Strict) return null; unknown = true; }
+                    else if (regex[expression].Search(a.Node.Text!, meter: meter).Captures is not null) { if (!path.Strict) return true; any = true; }
+                    continue;
+                }
                 foreach (var b in right)
                 {
                     Charge(); bool? pair;
-                    if (a.Node.Kind == SqlJsonKind.Number && b.Node.Kind == SqlJsonKind.Number) Charge(Math.Max(0, a.Node.Number!.DecimalWork(b.Node.Number!, "+") - 1));
+                    if (a.Node.Kind == SqlJsonKind.Number && b.Node.Kind == SqlJsonKind.Number) Charge(a.Node.Number!.DecimalWork(b.Node.Number!, "+"));
                     if (a.Node.Kind == SqlJsonKind.String && b.Node.Kind == SqlJsonKind.String) Charge(Math.Max(0, Math.Min(a.Node.Text!.EnumerateRunes().Count(), b.Node.Text!.EnumerateRunes().Count()) - 1));
                     if (expression.Op == "starts") pair = a.Node.Kind == SqlJsonKind.String && b.Node.Kind == SqlJsonKind.String ? a.Node.Text!.StartsWith(b.Node.Text!, StringComparison.Ordinal) : null;
                     else if (a.Node.Kind == SqlJsonKind.Null || b.Node.Kind == SqlJsonKind.Null)
@@ -243,13 +278,14 @@ internal sealed class JsonPathRun(SqlJsonPath path, SqlJsonNode document, SqlJso
             {
                 var precision = method.Args[1].Value!.Number!.Truncate().ToInt64(); var scale = method.Args.Length > 2 ? method.Args[2].Value!.Number!.Truncate().ToInt64() : 0;
                 if (precision < int.MinValue || precision > int.MaxValue || scale < int.MinValue || scale > int.MaxValue) throw Error("22036");
-                if (precision < 1 || precision > 1000 || scale < -1000 || scale > 1000) throw Error("22023"); number = number.Coerce((int)precision, (int)scale);
+                if (precision < 1 || precision > 1000 || scale < -1000 || scale > 1000) throw Error("22023"); number = number.Round((int)scale);
+                if (!number.IsZero && number.Digits - number.Scale > precision - scale) throw Error("22036");
             }
             return SqlJsonNode.Numeric(number);
         }
         catch (SqlException error) when (error.SqlState != "22023") { throw Error("22036", "invalid argument for jsonpath item method " + method.Text); }
     }
-    private static ExactDecimal RoundSignificant(ExactDecimal value, int precision)
+    internal static ExactDecimal RoundSignificant(ExactDecimal value, int precision)
     {
         var absolute = value.Abs(); var shifted = ExactDecimal.Parse(absolute.ToString() + "e" + precision.ToString(CultureInfo.InvariantCulture));
         var rounded = NumberFormat.HalfEven(shifted, 0);

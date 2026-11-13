@@ -146,7 +146,7 @@ internal sealed class PageClientConnection : IAsyncDisposable
             await RegisterAndWriteAsync(8, request, new Dictionary<string, object>(), cancellationToken).ConfigureAwait(false);
             commitEndWritten?.Invoke();
         }
-        catch (Exception error) { if (acquired) Fail(error); ReleaseSlot(request); throw; }
+        catch (Exception error) { if (acquired) Fail(error); ReleaseSlot(request); if (acquired && error is IOException or SocketException or ObjectDisposedException) ThrowFailed(); throw; }
         finally { if (acquired) sendGate.Release(); }
         var reply = await AwaitReplyAsync(request, cancellationToken).ConfigureAwait(false);
         var transactionId = reply.Get<ulong>("txid");
@@ -170,7 +170,7 @@ internal sealed class PageClientConnection : IAsyncDisposable
             await sendGate.WaitAsync(cancellationToken).ConfigureAwait(false); acquired = true; ThrowFailed();
             await RegisterAndWriteAsync(code, request, Message(code, 1, fields).Fields, cancellationToken).ConfigureAwait(false);
         }
-        catch (Exception error) { if (acquired) Fail(error); ReleaseSlot(request); throw; }
+        catch (Exception error) { if (acquired) Fail(error); ReleaseSlot(request); if (acquired && error is IOException or SocketException or ObjectDisposedException) ThrowFailed(); throw; }
         finally { if (acquired) sendGate.Release(); }
         return await AwaitReplyAsync(request, cancellationToken).ConfigureAwait(false);
     }
@@ -188,7 +188,7 @@ internal sealed class PageClientConnection : IAsyncDisposable
     {
         await sendGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try { ThrowFailed(); await WriteLockedAsync(code, Message(code, 1, fields).Fields, cancellationToken).ConfigureAwait(false); }
-        catch (Exception error) { Fail(error); throw; }
+        catch (Exception error) { Fail(error); if (error is IOException or SocketException or ObjectDisposedException) ThrowFailed(); throw; }
         finally { sendGate.Release(); }
     }
     private uint AllocateId()

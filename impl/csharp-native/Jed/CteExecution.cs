@@ -2,11 +2,12 @@ using System.Runtime.CompilerServices;
 
 namespace Jed;
 
-internal sealed record CteSyntax(string Name, string[]? Columns, SelectSyntax Query, bool? Materialized);
+internal sealed record CteSyntax(string Name, string[]? Columns, SelectSyntax Query, bool? Materialized, StatementSyntax? Mutation = null);
+internal sealed record WithStatementSyntax(CteSyntax[] Definitions, bool Recursive, StatementSyntax Body) : StatementSyntax;
 internal sealed class QueryScope(QueryScope? parent = null, OuterFrame? frame = null)
 {
     internal BoundColumn[] OuterColumns { get; } = frame is null ? parent?.OuterColumns ?? [] :
-        frame.Columns.Select((column, slot) => column with { Outer = new(frame, slot), Level = 1 }).Concat((parent?.OuterColumns ?? []).Select(column => column with { Level = column.Level + 1 })).ToArray();
+        frame.Columns.Select((column, slot) => column with { Outer = new(frame, slot), Level = 1, Projection = column.Projection is { } projection ? frame.Lift(projection) : null }).Concat((parent?.OuterColumns ?? []).Select(column => column with { Level = column.Level + 1 })).ToArray();
     private readonly Dictionary<string, PreparedRelation> relations = new(StringComparer.Ordinal);
     internal bool TryGet(string name, out PreparedRelation relation)
     {
@@ -23,18 +24,35 @@ internal sealed class CteBuffer(PreparedRelation source, Meter meter)
     internal OuterFrame[] Dependencies => source.Dependencies ?? [];
     private List<SqlValue[]>? rows;
     private long[]? versions;
+    private long heldBytes;
+    internal void Release() { meter.Memory.Release(heldBytes); heldBytes = 0; rows = null; versions = null; }
     internal async ValueTask Materialize(CancellationToken cancellationToken)
     {
         var current = (source.Dependencies ?? []).Select(frame => frame.Version).ToArray();
         if (rows is not null && versions is not null && versions.SequenceEqual(current)) return;
+        Release();
         var collected = new List<SqlValue[]>();
-        await foreach (var row in source.Rows.WithCancellation(cancellationToken).ConfigureAwait(false)) collected.Add(row);
+        await foreach (var row in source.Rows.WithCancellation(cancellationToken).ConfigureAwait(false))
+        {
+            if (meter.Memory.Enabled)
+            {
+                var bytes = MemorySize.RowBytes(row); if (!source.MemoryOutput) meter.Memory.Reserve(bytes);
+                heldBytes = Meter.Add(heldBytes, bytes);
+            }
+            collected.Add(row);
+        }
         rows = collected; versions = current;
     }
     internal async IAsyncEnumerable<SqlValue[]> Read([EnumeratorCancellation] CancellationToken cancellationToken)
     {
         await Materialize(cancellationToken).ConfigureAwait(false);
-        foreach (var row in rows!) { meter.Charge(Costs.CteScanRow); meter.Checkpoint(cancellationToken); yield return row; }
+        foreach (var row in rows!) { meter.Charge(Costs.CteScanRow); meter.Checkpoint(cancellationToken); meter.Memory.ReserveRow(row); yield return row.ToArray(); }
+    }
+    internal static async IAsyncEnumerable<SqlValue[]> DisposeAfter(IReadOnlyList<CteBuffer> buffers, IAsyncEnumerable<SqlValue[]> source,
+        [EnumeratorCancellation] CancellationToken cancellationToken)
+    {
+        try { await foreach (var row in source.WithCancellation(cancellationToken).ConfigureAwait(false)) yield return row; }
+        finally { foreach (var buffer in buffers) buffer.Release(); }
     }
     internal static async IAsyncEnumerable<SqlValue[]> Initialize(CteBuffer[] buffers, IAsyncEnumerable<SqlValue[]> source,
         [EnumeratorCancellation] CancellationToken cancellationToken)
@@ -50,6 +68,7 @@ internal sealed class CteBuffer(PreparedRelation source, Meter meter)
             AliasedRelation aliased => Source(aliased.Source),
             TableRelation named => named.Name == name ? 1 : 0,
             DerivedRelation derived => References(derived.Query, name),
+            GroupedRelation group => Source(group.Source),
             JoinedRelation join => Source(join.Left) + Source(join.Right),
             SetRelation set => References(set.Left, name) + References(set.Right, name),
             _ => 0
@@ -62,8 +81,10 @@ internal sealed class CteBuffer(PreparedRelation source, Meter meter)
 
 internal sealed partial class Parser
 {
-    private SelectSyntax WithQuery()
+    private SelectSyntax WithQuery() => WithStatement() as SelectSyntax ?? throw Errors.Unsupported("data-modifying WITH requires the statement top level");
+    private StatementSyntax WithStatement()
     {
+        var primaryInto = intoAllowed; intoAllowed = false;
         var recursive = Eat("recursive"); var definitions = new List<CteSyntax>();
         do
         {
@@ -72,9 +93,15 @@ internal sealed partial class Parser
             if (Eat("(")) { var names = new List<string>(); do { names.Add(Name()); } while (Eat(",")); Expect(")"); columns = names.ToArray(); }
             Expect("as"); bool? materialized = Eat("materialized") ? true : null;
             if (Eat("not")) { Expect("materialized"); materialized = false; }
-            Expect("("); nesting++; Depth(nesting); var query = Select(); Expect(")"); nesting--;
-            definitions.Add(new(name, columns, query, materialized));
+            Expect("("); nesting++; Depth(nesting);
+            StatementSyntax body = Is("insert") || Is("update") || Is("delete") ? OtherStatement() : Select();
+            Expect(")"); nesting--;
+            definitions.Add(body is SelectSyntax query ? new(name, columns, query, materialized) : new(name, columns, new([], null, null, 0), materialized, body));
         } while (Eat(","));
-        var result = Select(); return result with { With = definitions.ToArray(), Recursive = recursive };
+        var mutation = Is("insert") || Is("update") || Is("delete");
+        intoAllowed = primaryInto && !mutation;
+        StatementSyntax result = mutation ? OtherStatement() : Select();
+        if (result is SelectSyntax { With.Length: > 0 }) throw Errors.Syntax("multiple WITH clauses");
+        return result is SelectSyntax queryResult ? queryResult with { With = definitions.ToArray(), Recursive = recursive } : new WithStatementSyntax(definitions.ToArray(), recursive, result);
     }
 }

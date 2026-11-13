@@ -62,7 +62,7 @@ internal sealed record StorageInterior(uint[] Children, byte[][] Separators)
 // retains only the paths it rewrites and scans keep only their traversal stack.
 internal sealed partial class StorageTree
 {
-    private sealed record Ref(uint Page = 0, Node? Dirty = null, ReadOnlyMemory<byte> Tag = default);
+    private sealed record Ref(uint Page = 0, Node? Dirty = null, ReadOnlyMemory<byte> Tag = default, StorageTreeShape? Shape = null, Node? Resident = null);
     private sealed record Node(StorageRecord[]? Rows = null, StorageLeaf? Packed = null,
         Ref[]? Children = null, byte[][]? Keys = null)
     {
@@ -79,21 +79,23 @@ internal sealed partial class StorageTree
     private readonly uint pageCount;
     private readonly HashSet<uint> retired;
 
-    internal StorageTree(StoragePager pager, StorageLeafSchema schema, uint rootPage = 0, uint pageCount = uint.MaxValue, ReadOnlyMemory<byte> rootTag = default)
-        : this(pager, schema, rootPage == 0 ? null : new Ref(rootPage, Tag: rootTag), pageCount, []) { }
+    internal StorageTree(StoragePager pager, StorageLeafSchema schema, uint rootPage = 0, uint pageCount = uint.MaxValue, ReadOnlyMemory<byte> rootTag = default, StorageTreeShape? shape = null, StorageRecord[]? residentRoot = null)
+        : this(pager, schema, rootPage == 0 ? null : new Ref(rootPage, Tag: rootTag, Shape: shape, Resident: residentRoot is null ? null : new(Rows: residentRoot)), pageCount, []) { }
 
     private StorageTree(StoragePager pager, StorageLeafSchema schema, Ref? root, uint pageCount, HashSet<uint> retired)
     {
         this.pager = pager; this.schema = schema; this.root = root; this.pageCount = pageCount; this.retired = retired;
     }
 
+    internal StorageTreeShape? SerializedShape { get; private set; }
+    internal StorageRecord[]? SerializedRootRecords { get; private set; }
     internal bool IsEmpty => root is null;
     internal int PageDelta => DirtyCount(root) - retired.Count;
     internal IReadOnlySet<uint> RetiredPages => retired;
 
     internal async ValueTask<StorageTree> ClearAsync(CancellationToken cancellationToken = default)
     {
-        if (root is null) return this;
+        if (root is null) return new(pager, schema, null, pageCount, retired);
         var dead = new HashSet<uint>(retired); var seen = new HashSet<uint>();
         async ValueTask Walk(Ref reference, int depth)
         {
@@ -191,7 +193,7 @@ internal sealed partial class StorageTree
             if (height++ > 64) throw Errors.Unsupported("tree height");
             split = Divide(new(Children: split.Nodes, Keys: split.Keys), -1, multiway: true)!;
         }
-        return new(pager, schema, split.Nodes[0], pageCount, dead);
+        return Written(new(pager, schema, split.Nodes[0], pageCount, dead), record);
     }
 
     private async ValueTask<Split> Insert(Ref reference, StorageRecord record, HashSet<uint> dead,
@@ -204,6 +206,7 @@ internal sealed partial class StorageTree
             Node changed; int edited;
             if (node.IsLeaf)
             {
+                await RetireResidentChains(reference, dead, token).ConfigureAwait(false);
                 var rows = node.Records().ToList(); edited = LowerBound(node, record.Key);
                 if (edited < rows.Count && rows[edited].Key.AsSpan().SequenceEqual(record.Key))
                 {
@@ -241,7 +244,7 @@ internal sealed partial class StorageTree
             if (updated.Page != 0) dead.Add(updated.Page);
             updated = node.IsLeaf ? null : node.Children![0];
         }
-        return new(pager, schema, updated, pageCount, dead);
+        return Deleted(new(pager, schema, updated, pageCount, dead), key.Span);
     }
 
     private async ValueTask<(Ref Reference, bool Changed)> Remove(Ref reference, ReadOnlyMemory<byte> key, HashSet<uint> dead,
@@ -255,6 +258,7 @@ internal sealed partial class StorageTree
             {
                 var at = LowerBound(node, key.Span);
                 if (at == node.Count || !node.Key(at).AsSpan().SequenceEqual(key.Span)) return (reference, false);
+                await RetireResidentChains(reference, dead, token).ConfigureAwait(false);
                 var rows = node.Records().ToList();
                 await RetireChains(rows[at], dead, token).ConfigureAwait(false); rows.RemoveAt(at);
                 if (reference.Page != 0) dead.Add(reference.Page);
@@ -360,35 +364,47 @@ internal sealed partial class StorageTree
     {
         if (allocation.Encrypted != pager.Encrypted) throw new ArgumentException("tree and allocator variants differ");
         foreach (var id in retired) allocation.Reclaim(id);
-        return root is null ? new(0, allocation.Encrypted ? new byte[16] : default) : await Write(root, allocation, cancellationToken).ConfigureAwait(false);
+        if (root is null) { SerializedShape = null; SerializedRootRecords = null; return new(0, allocation.Encrypted ? new byte[16] : default); }
+        var written = await Write(root, allocation, cancellationToken).ConfigureAwait(false);
+        SerializedShape = written.Shape;
+        SerializedRootRecords = written.Resident?.Records();
+        return new(written.Page, written.Tag);
     }
 
-    private async ValueTask<StoragePageReference> Write(Ref reference, StorageAllocation allocation, CancellationToken token)
+    private async ValueTask<Ref> Write(Ref reference, StorageAllocation allocation, CancellationToken token)
     {
         token.ThrowIfCancellationRequested();
-        if (reference.Dirty is not { } node) return new(reference.Page, reference.Tag);
+        if (reference.Dirty is not { } node) return reference;
         if (node.IsLeaf)
         {
             var id = allocation.ReservePage();
-            var rows = node.Records().Select(row => StorageLargeValues.WriteFresh(row, allocation)).ToArray();
+            var original = node.Records();
+            var rows = original.Select(row => StorageLargeValues.WriteFresh(row, allocation)).ToArray();
             allocation.SetPage(id, StorageLeaf.Encode(pager.PageSize, schema, rows, pager.Encrypted));
-            return new(id, allocation.Tag(id));
+            // Only the root's returned Resident payload survives publication;
+            // interior serialization keeps child shapes and drops leaf rows.
+            var retained = rows.Select((row, index) => row with { FreshChains = original[index].FreshChains }).ToArray();
+            return new(id, Tag: allocation.Tag(id), Shape: new(id, allocation.Tag(id)), Resident: new(Rows: retained));
         }
         var children = new uint[node.Children!.Length];
+        var shapes = new StorageTreeShape?[children.Length];
         var tags = pager.Encrypted ? new byte[children.Length][] : null;
         for (var i = 0; i < children.Length; i++)
         {
-            var child = await Write(node.Children[i], allocation, token).ConfigureAwait(false); children[i] = child.Page;
+            var child = await Write(node.Children[i], allocation, token).ConfigureAwait(false); children[i] = child.Page; shapes[i] = child.Shape;
             if (tags is not null) tags[i] = child.Tag.ToArray();
         }
         var page = allocation.AddPage(new StorageInterior(children, node.Keys!) { Tags = tags }.Encode(pager.PageSize, pager.Encrypted));
-        return new(page, allocation.Tag(page));
+        var shape = shapes.All(item => item is not null) ? new StorageTreeShape(page, allocation.Tag(page), node.Keys!, shapes.Select(item => item!).ToArray()) : null;
+        return new(page, Tag: allocation.Tag(page), Shape: shape);
     }
 
     private async ValueTask<Node> Load(Ref reference, CancellationToken token)
     {
         token.ThrowIfCancellationRequested();
         if (reference.Dirty is { } node) return node;
+        if (reference.Resident is { } resident) return resident;
+        if (reference.Shape is { IsLeaf: false } shape) return ShapeNode(shape);
         if (!StorageFormat.BodyPointer(reference.Page, pageCount)) throw StorageFormat.Corrupt("tree pointer out of bounds");
         var page = await pager.ReadPageAsync(new StoragePageReference(reference.Page, reference.Tag), token).ConfigureAwait(false);
         return page.Span[0] switch

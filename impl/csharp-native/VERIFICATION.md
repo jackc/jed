@@ -158,3 +158,168 @@ JIT, portable provider vectors, SDK-default NativeAOT, and Runtime Async NativeA
 with host-native instructions. Both clean NativeAOT publishes again completed
 without warnings or errors. This verifies the corrected checkpoint's implemented
 host paths while leaving the 470 SQL failures and remaining acceptance gates open.
+
+## Subsequent development checks — 2026-11-13
+
+These checks ran during parallel implementation and are scoped diagnostics, not
+a new frozen full-core acceptance result.
+
+- Credential rewrapping: full host checks passed at
+  `94210e5d854c47b689ba6b84bd68192e95286c2be4823339916387875b5090ea`,
+  including before/after faults at five write stages, divergent-copy recovery,
+  retained readers, and unchanged data/meta bytes. Go↔C# service checks passed at
+  `082bee42081c1b5388096a0cd5e64ca9f84ad982eff631cc247a9db3c4218ebe`,
+  including a pinned Go reader across rewrapping and fresh-client credentials.
+- Plaintext image serialization/deserialization: full host checks passed at
+  `010a23db88479c36b9a90300d06fd60cf67c0607580355de6b460f6fa94131a0`,
+  including 22 complete shared image byte comparisons, committed-only export,
+  input ownership, and independent imported storage.
+- Aggregates: 48/52 complete files and 798 records in passing files at
+  `87ad7f95556e0b1e72f8c3dda7c484e37cb510919a0c88e9fc6914b6ac74d6e9`.
+  Ordered/hypothetical sets, interval/array percentiles, statistical aggregates,
+  grouping sets, and primary-key functional dependencies pass their full files.
+  Remaining files require join planning/costs or collation; a subsequent named
+  window correction advances the star-grouping file to its join cost check.
+- JSON: 41/51 complete files and 1,192 records in passing files at
+  `7ff59771602f1cba99b34c74531373331d38bb7891a1f65fc9778e484a87aef5`.
+  SQL/JSON constructors and query functions, record/populate functions, typed
+  JSON_TABLE columns, and most JSONPath methods have full-file coverage. The
+  remaining failures include relational planning, whole-row references, regex,
+  dependency checks, and cost behavior.
+
+These source identities differ. None supersedes the checkpoint's complete
+763-file SQL attempt or proves NativeAOT parity for subsequent additions.
+
+### Integrated development SQL and retained-shape checks
+
+Full SQL diagnostic at
+`e567343811c95f4508035ce94c9763fcd51782292881b0afb6952e8035f7f06b`:
+`mise run csharp-native:conformance --all` completed all **763 files**, with
+**439 passing**, **11,467 records in passing files**, and **324 failing**.
+The command exits nonzero. No capability skips were introduced. Ephemeral log:
+`/tmp/jed-csharp-full-development.log`. In particular, the JSON point-set cost
+file regressed after correcting literal-IN evaluation; adjacent fixed-width
+point probes must merge, and that later source correction needs fresh evidence.
+
+Full host tests passed at
+`e1c37ef2843017732e9c902ba0e38977cc93c2e250864b504551a6c0e738c088`,
+including maintenance, collation/regex/open-key fixtures, multi-domain commit
+preflight/staged-failure/retry invariants, and retained B-tree shape checks.
+The shape tests evict the pager completely and verify that height, node count,
+and bounded node estimates cause zero device reads, both for dirty paths and
+after commit/reopen. These host checks precede later SQL/planner changes and
+are not a NativeAOT or full-core acceptance claim.
+
+### Corpus render-tag adapter
+
+The C# runner follows the shared runners' flat-cell comparison contract: query
+render tags determine comparison grouping and float tolerance, while `# names:`
+and `# types:` assert result metadata. It does not add an assertion that tag
+count equals the engine's result-column count. Existing homogeneous records in
+`expr/string_functions.test` use one tag for several columns. Rust, Go, and the
+Ruby experimental runner compare those records without a width assertion; the
+C# adapter now does likewise. Expected cell count, exact non-float cell values,
+explicit names/types, SQLSTATE, and cost assertions remain enforced. No frozen
+corpus file was changed for this adjustment.
+
+### Integrated SQL diagnostic after host and resource integration — 2026-11-13
+
+The complete frozen 763-file run at source SHA-256
+`bb40e2c4201433bc4539d8132762547bb15a42428baad77a527b605d6bf8682e`
+passes **524 files**, containing **14,227 records in passing files**; **239 files
+fail**. All seven shared concurrency files pass through real session admission
+and snapshot/watermark APIs. The unmodified `expr/string_functions.test` passes
+161 records after aligning the adapter's render-header behavior with the shared
+runners; the frozen corpus was not changed. No capability skips were added.
+
+The raw development log is `/tmp/jed-csharp-full-next.log`; the condensed failure
+list is `/tmp/jed-csharp-full-next-failures.txt`. Remaining failures concentrate
+in access/join planning, GIN/GiST/exclusion, DDL/DML, resource accounting and
+spill, and EXPLAIN. This is a development breadth measurement, not final JIT/AOT,
+process/simulation, performance, or full-core acceptance. Subsequent source edits
+require their own verification.
+
+### Deterministic ANALYZE and GIN posting bytes (development)
+
+At source digest `a0e6caa0824e4b8cc6689292a10fa66a5526a03edd38b21709bcfe426f389d3f`,
+`mise run csharp-native:encoding` passed collection of eight complete column facts from
+`statistics_table`, `statistics_decimal_table`, and `statistics_terms_table`, comparing all
+summary fields and exact typed MCV/histogram/term bytes with the pinned shared images.
+The same run passed every `gin_jsonb_terms.toml` case (24), all five posting-run codec cases,
+three greedy-packing cases and five maintenance histories from `gin_posting_runs.toml`.
+The fixtures are consumed directly through the test-only TOML-to-JSON adapter.
+
+The handwritten collector uses storage-key hash-priority sampling, bounded KMV, exact integer
+NDV scaling, MCV/histogram selection and lossy GIN term counters. `ANALYZE` publishes all selected
+columns atomically, ordinary changed DML marks facts stale, and schema changes retain or discard
+facts by the shared ordinal/type contract. The development sweep at `bb40e2c4` passed the complete
+`analyze_oracle` (5 records), `statistics_kmv_boundary` (14), transaction statistics (21), scoped
+introspection statistics (18), and fixed-width decimal (54) files. Estimator/EXPLAIN and GIN query
+acceptance remain separate checks.
+
+The initial native GIN storage slice passed the complete `ddl/create_gin_index.test` (15 records)
+at `a0e6caa0`: kind-1 index creation and maintenance use canonical bounded posting runs over the
+ordinary COW B-tree. Query gathers, planner selection and complete GIN conformance are still in
+progress; these results do not claim full GIN parity.
+
+At `c83395b57b9f96485839dc22ece57038ad0582ced8e3e032e744003414220ea8`, the complete
+encoding task also rebuilt all eight shared GIN database images by dropping and recreating their
+indexes through SQL. Every image byte matched after normalizing only the expected transaction
+number and its meta checksum for those extra DDL commits. This covers array, multi-column, JSONB,
+float, interval, UUID, text, and decimal/bytea index images. The complete `query/gin_scan.test`
+passed 13 records at `633b3e50`; mutation, sibling-join and broader GIN query checks remain underway.
+
+The complete filename-selected GIN diagnostic (`mise run csharp-native:conformance --match
+'*gin*.test'`) at `75819bb8a25e3d3a36105c5b28e57a7f40d66dda7823420a2591bce07d6a6d96`
+passed 20 of 30 files, containing 424 records in passing files. All GIN DDL, SELECT/mutation,
+element-type, disjunction, skip-scan, multi-column, JSONB/JSONpath, and JSONB sibling-join files
+passed. Nine files stopped at EXPLAIN and the array sibling-join file stopped at its array-equality
+join cost assertion (expected 166, observed 51). The log is `/tmp/jed-csharp-gin-all3.log`.
+These explicit failures remain acceptance gates; the diagnostic does not claim full GIN parity.
+
+Further development checks (2026-11-13, each result scoped to its own source digest):
+
+- `c83395b57b9f96485839dc22ece57038ad0582ced8e3e032e744003414220ea8`: complete encoding
+  checks passed, including four GiST golden structures (27 table rows), eight rebuilt GIN images,
+  recursive storage codecs, memory sizes, regex, collation and timezone fixtures.
+- `91f4678cbd29bdee8d103d3ca278882ee840c9d1071aebc5f8c2ff2c25f17d81`: encrypted rekey golden
+  matched byte-for-byte, including reverse insertion order and forced scratch spill; plaintext,
+  encrypted and changed-key round trips and pre-replacement failure behavior passed.
+- `4c527944417498bac30fc966cc65dda58749b498a0834f4609ea2fb185a3e938`: eight exclusion/storage-limit
+  corpus files passed (227 records). `99660591a71c649c3b73af8c9474b783042cff7ce4e5b146c322bd5476961c48`
+  passed REINDEX, REINDEX divergences, savepoints, exclusion REINDEX and no-escape checks (217 records).
+- `c3b2d0bbeb35f676b322bcde7e0310e760b18875388d45f9b675afddbf636028`: complete eager query-memory
+  file passed (24 records), including the exact three-relation full-width buffering boundary;
+  scalar GiST scan passed (19). The other three selected files failed explicitly.
+- `a96698b66273a56926c68e2930f623c0e4c9f5a1796e80d9ce3dad3735182afa`: four complete diagnostic
+  files still failed. Earlier failures in derived VALUES ownership, window aggregate state and
+  grouped qualified ORDER BY had advanced to CTE retention and later join/query cases. This is
+  partial diagnostic progress, not a passing-file or full-memory claim.
+
+New common access-path inventory and join costing, memory ownership, EXPLAIN, filesystem fault
+simulation and periodic reclamation remain under active integration. These development checks do
+not supersede the last frozen JIT/NativeAOT checkpoint or establish complete process/simulation
+acceptance. A single fresh-source full verification is still required.
+
+Integrated development checkpoint (2026-11-13):
+
+- Full host checks passed at `d37f6ce41af47ac84e30473cbb0f509b5291c256113b786f49c2aa17a96a3307`
+  (`/tmp/jed-csharp-allocator-host2.log`). This includes native/remote file maintenance,
+  periodic reclamation and trailing shrink, real domain storage-limit preflight, resident large
+  values, simulation filesystem/scratch adapters, and plaintext/encrypted spill primitives.
+- At `0f9728cac64fc7ce0e1b371a423b14b9062f9a3e3f2ae56ebb932168eb62a2fe`, SELECT INTO (40 records),
+  its jed-specific cases (34), whole-row behavior (51), and main query-memory accounting (51)
+  passed complete files. Three other selected files still failed: CTAS ANALYZE actual counters,
+  GiST join EXPLAIN estimates, and a GIN join cost (32 expected, 37 observed).
+  See `/tmp/jed-csharp-ddl-checkpoint.log`. The full SQL diagnostic uses this same digest.
+- Complete query-memory operator-state coverage passed 42 records at
+  `1ae1aa59a253a4526ad9c906afd6df21753f0dc8626c0338508621cfe3e2f16a`.
+- External sorter and repeatable row-spool host checks passed at
+  `24d8306e210c7c98477ede84eb999e80cd6794ca07345d00e24609d63bb533eb`: stable bounded run merging,
+  plaintext/encrypted scratch, query-account-driven spilling, early disposal and exact ownership.
+  SQL operator integration remains separate work; these checks alone do not establish SQL spill parity.
+
+Cumulative process evidence is now 30 of 31 scenarios across scoped runs; relaxed durability
+batching remains. This is not a single passing process suite. Canonical simulation trace execution,
+complete SQL conformance, SQL spill, full physical planning and final clean JIT/NativeAOT verification
+remain acceptance gates. No full-core or promotion claim is made.

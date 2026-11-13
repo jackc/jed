@@ -85,6 +85,7 @@ public sealed class TimeZoneData
         byte next;
         do { if (position == source.Length) throw TimeZoneRule.Bad("truncated LZ4 length"); next = source[position++]; length = checked(length + next); } while (next == 255);
     }
+    internal TimeZoneRule LoadedRule(string name) => zones.TryGetValue(name, out var rule) ? rule : links.TryGetValue(name, out var target) ? zones[target] : throw TimeZoneRule.Bad("time zone is not loaded: " + name);
     public TimeZoneRule Resolve(string name) => Resolve(name, this);
     internal static TimeZoneRule Resolve(string name, TimeZoneData? data)
     {

@@ -158,3 +158,77 @@ files. Remaining failures include unimplemented syntax, host/harness directives,
 planner/cost differences, SQL correctness/validation gaps, resource accounting,
 and maintenance behavior. Full baseline parity remains the completion criterion;
 this is an implementation checkpoint, not a completed or frozen experiment.
+
+### Post-checkpoint aggregate and window work
+
+Following local checkpoint `55948a11`, selected diagnostics pass 38 of 52 aggregate
+files (656 records in passing files), including all one- and two-argument
+statistical aggregate files, array aggregation and string aggregation. JSON array
+and object aggregate files also pass in the JSON suite. Window diagnostics pass
+20 of 22 files (244 records); the remaining files require collation support.
+These are development diagnostics while other modules evolve, not a new frozen
+acceptance run. Grouping sets and ordered-set aggregates are the next relational
+slices; resource accounts and spill remain open.
+
+### Integrated development diagnostic — 2026-11-13
+
+The complete 763-file run at source SHA-256
+`e567343811c95f4508035ce94c9763fcd51782292881b0afb6952e8035f7f06b`
+passes **439 files**, containing **11,467 records in passing files**; **324 files
+fail**. This includes 50/52 aggregate files, 21/22 window files, 50/51 JSON files,
+and 9/11 transaction files. Failures remain explicit. The raw diagnostic is
+`/tmp/jed-csharp-full-development.log`; it supersedes earlier full SQL attempts
+as a breadth measurement, not as final acceptance.
+
+Recent implementation includes writable CTEs, updatable views, SQL/JSON and
+JSONPath, handwritten regex, collation metadata and keys, grouping/ordered-set
+aggregates, retained tree structure, initial predicate pushdown and index joins,
+file maintenance, and temporary/attached database routing. The remaining work
+includes complete access and join selection, GIN/GiST/exclusion, EXPLAIN and
+statistics, catalog relations, resource accounting and spill, shared concurrency
+adapters, typing/error edge cases, and final host/process/JIT/AOT verification.
+Subsequent fixes are not implicitly covered by this source digest.
+
+### Integrated SQL diagnostic after host and resource integration — 2026-11-13
+
+The complete frozen 763-file run at source SHA-256
+`bb40e2c4201433bc4539d8132762547bb15a42428baad77a527b605d6bf8682e`
+passes **524 files**, containing **14,227 records in passing files**; **239 files
+fail**. All seven shared concurrency files pass through real session admission
+and snapshot/watermark APIs. The unmodified `expr/string_functions.test` passes
+161 records after aligning the adapter's render-header behavior with the shared
+runners; the frozen corpus was not changed. No capability skips were added.
+
+The raw development log is `/tmp/jed-csharp-full-next.log`; the condensed failure
+list is `/tmp/jed-csharp-full-next-failures.txt`. Remaining failures concentrate
+in access/join planning, GIN/GiST/exclusion, DDL/DML, resource accounting and
+spill, and EXPLAIN. This is a development breadth measurement, not final JIT/AOT,
+process/simulation, performance, or full-core acceptance. Subsequent source edits
+require their own verification.
+
+### Indexes, maintenance and resource integration — 2026-11-13
+
+Native GIN and GiST storage/query paths, exclusion constraints and REINDEX are now implemented.
+Shared GIN image rebuilds and GiST structures pass their golden checks; encrypted rekeying matches
+its shared golden byte-for-byte. Dependency lifecycle checks include timezone pinning and atomic
+REINDEX behavior. GIN's full filename-selected diagnostic passes 20/30 files; its remaining gates
+are EXPLAIN and one array join cost case. These are scoped development results in VERIFICATION.md.
+
+A retained access inventory now supplies physical facts to execution and EXPLAIN. Complete
+statistics-based selection, order-aware pipelines, join orientation/search, all query-memory and
+spill paths, the remaining SQL features and final verification are still being built. Process
+checks have cumulative evidence for 28/31 scenarios across separate diagnostics; this is not a
+single passing full-suite result. Filesystem fault simulation and durable periodic reclamation
+are in progress. No promotion or full-parity claim is made.
+
+### Host and query-memory checkpoint — 2026-11-13
+
+Integrated host checks are green, including periodic reclamation, remote maintenance, resident
+large-value rewrite rules, encrypted/plaintext scratch and external-sort primitives. Complete
+main, eager and operator-state query-memory files now have passing scoped diagnostics. SELECT INTO
+and whole-row files pass. Process evidence has advanced to 30/31 scenarios across separate runs;
+relaxed durability batching is still outstanding. VERIFICATION.md records exact source digests.
+
+The entire experimental core is still incomplete. Remaining work includes physical access/join
+planning, EXPLAIN estimates and actual counters, residual SQL cases, connecting bounded spill
+operators to SQL, canonical fault-simulation traces and final full-source JIT/NativeAOT checks.

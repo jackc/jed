@@ -1,6 +1,9 @@
 namespace Jed;
 
-internal sealed record DatabaseSnapshot(Catalog Catalog, StorageMeta Meta, StoragePager? Pager = null);
+internal sealed record DatabaseSnapshot(Catalog Catalog, StorageMeta Meta, StoragePager? Pager = null)
+{
+    internal StorageEncryptedMeta? Encrypted { get; init; }
+}
 internal sealed class PendingDatabase(DatabaseSnapshot before)
 {
     internal readonly DatabaseSnapshot Before = before;
@@ -9,50 +12,68 @@ internal sealed class PendingDatabase(DatabaseSnapshot before)
     internal Dictionary<string, StorageTree> IndexTrees = new(StringComparer.Ordinal);
     internal HashSet<uint> RetiredPages = [];
     internal bool Changed;
+    internal bool TrackMemory;
+    internal long PendingBytes => Trees.Values.Concat(IndexTrees.Values).Aggregate(0L, (bytes, tree) => Meter.Add(bytes, tree.PendingBytes));
+    internal void ForgetPendingKeys()
+    {
+        Trees = Trees.ToDictionary(item => item.Key, item => item.Value.ForgetPendingKeys(), StringComparer.Ordinal);
+        IndexTrees = IndexTrees.ToDictionary(item => item.Key, item => item.Value.ForgetPendingKeys(), StringComparer.Ordinal);
+    }
     internal SemaphoreSlim? WriterGate;
     internal StorageRecovered? StorageBefore;
     internal long Role;
     internal Database.FileWriteContext? FileWrite;
-    internal PendingDatabase Fork() => new(Before) { Catalog = Catalog, Trees = new(Trees, StringComparer.Ordinal), IndexTrees = new(IndexTrees, StringComparer.Ordinal), RetiredPages = new(RetiredPages), Changed = Changed, WriterGate = WriterGate, StorageBefore = StorageBefore, Role = Role, FileWrite = FileWrite };
+    internal PendingDatabase Fork() => new(Before) { Catalog = Catalog, Trees = new(Trees, StringComparer.Ordinal), IndexTrees = new(IndexTrees, StringComparer.Ordinal), RetiredPages = new(RetiredPages), Changed = Changed, TrackMemory = TrackMemory, WriterGate = WriterGate, StorageBefore = StorageBefore, Role = Role, FileWrite = FileWrite };
 }
 
 /// <summary>A shared database handle. Sessions serialize their own operations; readers retain a committed snapshot.</summary>
 public sealed partial class Database : IAsyncDisposable
 {
     private readonly object gate = new();
+    internal SemaphoreSlim DomainPublication { get; } = new(1, 1);
+    internal long MaxStorageBytes { get; set; }
+    internal ScratchHost? ScratchHost { get; private set; }
     private SemaphoreSlim writer = new(1, 1);
     private StoragePager pager;
     private StorageCommitter committer;
-    private readonly StoragePageCodec? ownedCodec;
+    private StoragePageCodec? ownedCodec;
     private StorageKeySelection? keyBlock;
     private DatabaseSnapshot current;
     private readonly Dictionary<ulong, int> pins = [];
     private readonly Dictionary<uint, ulong> retiredAt = [];
     private bool disposed;
+    private bool ephemeral;
+    private TaskCompletionSource? maintenance = null;
 
     private Database(StoragePager pager, StorageRecovered recovered, Catalog catalog)
     {
-        this.pager = pager; ownedCodec = pager.Codec; committer = new(pager, recovered); current = new(catalog, recovered.Meta);
+        this.pager = pager; ownedCodec = pager.Codec; committer = new(pager, recovered); current = new(catalog, recovered.Meta) { Encrypted = recovered.Encrypted };
     }
-    public static async Task<Database> CreateInMemoryAsync(int pageSize = 8192, CancellationToken cancellationToken = default)
+    public static Task<Database> CreateInMemoryAsync(int pageSize = 8192, CancellationToken cancellationToken = default)
+        => CreateStoreAsync(new MemoryBlockStore(), pageSize, cancellationToken);
+    internal static async Task<Database> CreateStoreAsync(IBlockStore store, int pageSize = 8192, CancellationToken cancellationToken = default)
     {
         if (!StorageFormat.ValidPageSize(pageSize)) throw new ArgumentOutOfRangeException(nameof(pageSize));
         var meta = new StorageMeta(pageSize, 1, 2, 3, 0, 1);
-        var store = new MemoryBlockStore();
         var bytes = StorageFormat.EncodeMeta(meta);
+        try
+        {
         await store.WriteAsync(0, bytes, cancellationToken).ConfigureAwait(false);
         await store.WriteAsync(pageSize, bytes, cancellationToken).ConfigureAwait(false);
         await store.WriteAsync(2L * pageSize, StorageFormat.EncodePage(pageSize, new(1, 0, 0, 0), []), cancellationToken).ConfigureAwait(false);
-        return await OpenStoreAsync(store, cancellationToken).ConfigureAwait(false);
+        return await OpenStoreAsync(store, cancellationToken, ephemeral: true).ConfigureAwait(false);
+        }
+        catch { await store.DisposeAsync().ConfigureAwait(false); throw; }
     }
-    internal static async Task<Database> OpenStoreAsync(IBlockStore store, CancellationToken cancellationToken = default)
+    internal static async Task<Database> OpenStoreAsync(IBlockStore store, CancellationToken cancellationToken = default, bool ephemeral = false)
     {
         try
         {
             var recovered = await StorageRecovery.OpenAsync(store, cancellationToken).ConfigureAwait(false);
             var pager = new StoragePager(store, recovered.Meta.PageSize);
             var catalog = await Catalog.ReadAsync(pager, recovered.Meta, cancellationToken).ConfigureAwait(false);
-            return new(pager, recovered, catalog);
+            catalog = await StorageTree.ValidateCatalogSpinesAsync(pager, catalog, recovered.Meta, cancellationToken).ConfigureAwait(false);
+            return new(pager, recovered, catalog) { ephemeral = ephemeral };
         }
         catch { await store.DisposeAsync().ConfigureAwait(false); throw; }
     }
@@ -65,6 +86,7 @@ public sealed partial class Database : IAsyncDisposable
             recovery = await StorageCryptoRecovery.OpenAsync(store, credential, entropy, cancellationToken).ConfigureAwait(false);
             var pager = new StoragePager(store, recovery.Meta.Header.PageSize, codec: recovery.Codec);
             var catalog = await Catalog.ReadAsync(pager, recovery.Meta, cancellationToken).ConfigureAwait(false);
+            catalog = await StorageTree.ValidateCatalogSpinesAsync(pager, catalog, recovery.Meta.Header, cancellationToken).ConfigureAwait(false);
             return new(pager, recovery.Recovered, catalog) { keyBlock = recovery.KeyBlock };
         }
         catch { recovery?.Dispose(); await store.DisposeAsync().ConfigureAwait(false); throw; }
@@ -78,16 +100,31 @@ public sealed partial class Database : IAsyncDisposable
         lock (gate) { Check(); return new(this, options); }
     }
     internal ValueTask<SnapshotPin> PinAsync(CancellationToken cancellationToken = default) =>
-        fileState is null ? ValueTask.FromResult(Pin()) : PinFileAsync(cancellationToken);
+        fileState is null ? PinMemoryAsync(cancellationToken) : PinFileAsync(cancellationToken);
+    private async ValueTask<SnapshotPin> PinMemoryAsync(CancellationToken token)
+    {
+        while (true)
+        {
+            token.ThrowIfCancellationRequested(); Task wait;
+            lock (gate)
+            {
+                Check();
+                if (maintenance is null) return Pin();
+                wait = maintenance.Task;
+            }
+            await wait.WaitAsync(token).ConfigureAwait(false);
+        }
+    }
     internal SnapshotPin Pin()
     {
         lock (gate)
         {
             Check();
             if (fileState is not null) throw new InvalidOperationException("file snapshots require PinAsync");
+            if (maintenance is not null) throw new SqlException(SqlStates.ObjectInUse, "database maintenance is active");
             var generation = current.Meta.TransactionId;
             pins[generation] = pins.GetValueOrDefault(generation) + 1;
-            return new(this, current);
+            return new(this, current with { Pager = pager });
         }
     }
     internal sealed class SnapshotPin : IDisposable, IAsyncDisposable
@@ -98,6 +135,7 @@ public sealed partial class Database : IAsyncDisposable
             internal readonly DatabaseSnapshot Snapshot = snapshot;
             internal readonly Func<ValueTask>? Release = release;
             internal readonly long Role = database.fileState?.Role ?? 0;
+            internal readonly PageClientConnection? Connection = database.fileState?.Client;
             internal int References = 1;
         }
         private readonly Shared shared;
@@ -107,6 +145,7 @@ public sealed partial class Database : IAsyncDisposable
         internal void CheckRole()
         {
             if (shared.Database.fileState is not null) shared.Database.CheckRole(shared.Role);
+            if (shared.Connection is { IsConnected: false }) throw new SqlException(SqlStates.ConnectionFailure, "snapshot page-service connection lost");
         }
         private Task? releasing;
         internal SnapshotPin Retain()
@@ -148,66 +187,143 @@ public sealed partial class Database : IAsyncDisposable
         try { if (pending.FileWrite is not null) await pending.FileWrite.DisposeAsync().ConfigureAwait(false); }
         finally { pending.WriterGate!.Release(); }
     }
-    internal StorageTree Tree(CatalogTable table, PendingDatabase? pending, DatabaseSnapshot snapshot) =>
-        pending is not null && pending.Trees.TryGetValue(table.Name, out var tree) ? tree : new(snapshot.Pager ?? pager, table.LeafSchema(), table.Root, snapshot.Meta.PageCount, table.RootTag);
-
-    internal StorageTree IndexTree(CatalogIndex index, PendingDatabase? pending, DatabaseSnapshot snapshot) =>
-        pending is not null && pending.IndexTrees.TryGetValue(index.Name, out var tree) ? tree :
-            new(snapshot.Pager ?? pager, new StorageLeafSchema([]), index.Root, snapshot.Meta.PageCount, index.RootTag);
+    internal StorageTree Tree(CatalogTable table, PendingDatabase? pending, DatabaseSnapshot snapshot)
+    {
+        if (table.Domain is { } domain) return domain.Database.Tree(table with { Domain = null }, domain.Pending, domain.Snapshot);
+        var result = pending is not null && pending.Trees.TryGetValue(table.Name, out var tree) ? tree :
+            new(snapshot.Pager ?? pager, table.LeafSchema(), table.Root, snapshot.Meta.PageCount, table.RootTag, table.Shape, table.ResidentRoot);
+        return pending is null ? result : result.WithPendingTracking(pending.TrackMemory);
+    }
+    internal StorageTree IndexTree(CatalogIndex index, PendingDatabase? pending, DatabaseSnapshot snapshot)
+    {
+        if (index.Domain is { } domain) return domain.Database.IndexTree(index with { Domain = null }, domain.Pending, domain.Snapshot);
+        var result = pending is not null && pending.IndexTrees.TryGetValue(index.Name, out var tree) ? tree :
+            index.Kind == 2 ? index.Root == 0 ? new(snapshot.Pager ?? pager, new StorageLeafSchema([])) : index.Gist?.Leaves ?? throw StorageFormat.Corrupt("GiST index was not loaded") :
+            new(snapshot.Pager ?? pager, new StorageLeafSchema([]), index.Root, snapshot.Meta.PageCount, index.RootTag, index.Shape);
+        return pending is null ? result : result.WithPendingTracking(pending.TrackMemory);
+    }
 
     internal async ValueTask CommitAsync(PendingDatabase pending, CancellationToken cancellationToken)
     {
         CheckPendingRole(pending);
         if (!pending.Changed) return;
+        var prepared = await PrepareCommitAsync(pending, "main", cancellationToken).ConfigureAwait(false);
+        await DomainPublication.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            if (ephemeral)
+            {
+                await committer.StageMemoryAsync(prepared.Plan, cancellationToken).ConfigureAwait(false);
+                committer.AdoptStagedMemory(prepared.Plan); AdoptPreparedCommit(prepared);
+            }
+            else
+            {
+                using var publication = await CommitFileOrMemoryAsync(pending, prepared.Plan, cancellationToken).ConfigureAwait(false);
+                if (pending.FileWrite?.ResolvedAfterRoleChange != true) AdoptPreparedCommit(prepared);
+            }
+        }
+        finally { DomainPublication.Release(); }
+    }
+    internal async ValueTask ValidatePendingStorageAsync(PendingDatabase pending, string name, CancellationToken cancellationToken = default)
+    {
+        if (!pending.Changed || MaxStorageBytes <= 0) return;
+        if (name == "temp")
+        {
+            if ((long)pending.Before.Meta.PageCount * pending.Before.Meta.PageSize > MaxStorageBytes)
+                throw new SqlException(SqlStates.TempStorageLimitExceeded, "temporary storage exceeded its limit");
+        }
+        else _ = await PrepareCommitAsync(pending, name, cancellationToken).ConfigureAwait(false);
+    }
+    private sealed record PreparedCommit(PendingDatabase Pending, Catalog Catalog, StorageCommitPlan Plan);
+    private async ValueTask<PreparedCommit> PrepareCommitAsync(PendingDatabase pending, string name, CancellationToken cancellationToken, bool compacted = false)
+    {
+        CheckPendingRole(pending);
         var beforeStorage = pending.StorageBefore ?? committer.Current;
-        HashSet<uint> reuse;
+        HashSet<uint> reuse; bool canReclaim;
         lock (gate)
         {
             Check();
             var oldest = pins.Count == 0 ? ulong.MaxValue : pins.Keys.Min();
             if (fileState?.Ledger?.OldestPin is { } remoteOldest) oldest = Math.Min(oldest, remoteOldest);
-            reuse = beforeStorage.FreePages.Where(page => !retiredAt.TryGetValue(page, out var at) || at <= oldest).ToHashSet();
+            canReclaim = oldest >= beforeStorage.Meta.TransactionId;
+            reuse = !ephemeral ? oldest >= beforeStorage.FreeGeneration ? new(beforeStorage.FreePages) : []
+                : beforeStorage.FreePages.Where(page => !retiredAt.TryGetValue(page, out var at) || at <= oldest).ToHashSet();
         }
         if (pending.FileWrite is { } remote) reuse = remote.Granted;
-        var allocation = new StorageAllocation(beforeStorage, reuse, (pending.Before.Pager ?? pager).Codec);
+        var allocation = new StorageAllocation(beforeStorage, reuse, (pending.Before.Pager ?? pager).Codec, eagerReclaim: ephemeral);
         long delta = -pending.RetiredPages.Count;
         foreach (var page in pending.RetiredPages) allocation.Reclaim(page);
         var tables = new List<CatalogTable>();
         foreach (var pendingTable in pending.Catalog.Tables.OrderBy(t => t.Name, Utf8NameComparer.Instance))
         {
-            var table = pendingTable;
+            var table = pendingTable with { Domain = null };
             if (pending.Trees.TryGetValue(table.Name, out var tree))
             {
                 delta += tree.PageDelta;
                 var root = await tree.SerializeBoundAsync(allocation, cancellationToken).ConfigureAwait(false);
-                table = table with { Root = root.Page, RootTag = root.Tag };
+                table = table with { Root = root.Page, RootTag = root.Tag, Shape = tree.SerializedShape, ResidentRoot = tree.SerializedRootRecords };
             }
             var indexes = new List<CatalogIndex>();
             foreach (var index in (table.Indexes ?? []).OrderBy(item => item.Name, Utf8NameComparer.Instance))
             {
                 if (pending.IndexTrees.TryGetValue(index.Name, out var indexTree))
                 {
+                    if (index.Kind == 2)
+                    {
+                        var gist = await GistTree.BuildAsync(indexTree, index.Keys.Select(key => table.Columns[key.Column].Type.Type).ToArray(), cancellationToken).ConfigureAwait(false);
+                        var oldPages = index.Gist?.Pages ?? [];
+                        foreach (var page in oldPages) if (!pending.RetiredPages.Contains(page)) { allocation.Reclaim(page); delta--; }
+                        var serialized = gist.Serialize(allocation); delta += serialized.Pages.Length;
+                        indexes.Add(index with { Root = serialized.Root.Page, RootTag = serialized.Root.Tag, Gist = gist with { Leaves = gist.Leaves.CommittedResidentCopy(), Pages = serialized.Pages }, Domain = null });
+                        continue;
+                    }
                     delta += indexTree.PageDelta;
                     var indexRoot = await indexTree.SerializeBoundAsync(allocation, cancellationToken).ConfigureAwait(false);
-                    indexes.Add(index with { Root = indexRoot.Page, RootTag = indexRoot.Tag });
+                    indexes.Add(index with { Root = indexRoot.Page, RootTag = indexRoot.Tag, Shape = indexTree.SerializedShape, Domain = null });
                 }
-                else indexes.Add(index);
+                else indexes.Add(index with { Domain = null });
             }
             tables.Add(table with { Indexes = indexes.ToArray() });
         }
-        var catalog = pending.Catalog with { Tables = tables.ToArray() };
+        var catalog = pending.Catalog with { Tables = tables.ToArray(), Scope = null };
         var encoded = catalog.Serialize(allocation); delta += encoded.PageDelta;
         var live = checked((uint)(beforeStorage.Meta.LivePages + delta));
-        var plan = allocation.Prepare(encoded.Root, live);
-        var previouslyFree = beforeStorage.FreePages;
-        using var publication = await CommitFileOrMemoryAsync(pending, plan, cancellationToken).ConfigureAwait(false);
-        if (pending.FileWrite?.ResolvedAfterRoleChange == true) return;
+        if (!ephemeral && pending.FileWrite is null && canReclaim &&
+            (beforeStorage.ReclamationLive == 0 || allocation.OffFreeListCount > ReclamationFacts.CompactMinPages &&
+            allocation.OffFreeListCount > ReclamationFacts.CompactGrowth * beforeStorage.ReclamationLive))
+        {
+            var plannedMeta = new StorageMeta(allocation.PageSize, checked(beforeStorage.Meta.TransactionId + 1),
+                encoded.Root, allocation.PageCount, 0, live);
+            var plannedSnapshot = new DatabaseSnapshot(catalog with { Pages = encoded.Pages }, plannedMeta)
+            { Encrypted = allocation.PlannedEncryption(plannedMeta) };
+            var reachable = await new StorageSnapshotCopy(allocation.ReadView(pending.Before.Pager ?? pager), plannedSnapshot)
+                .ReachableAsync(cancellationToken).ConfigureAwait(false);
+            allocation.CollectUnreachable(reachable, cancellationToken);
+        }
+        var plan = ephemeral ? allocation.PrepareMemory(encoded.Root, live) : allocation.Prepare(encoded.Root, live, truncate: pending.FileWrite is null);
+        if (name != "temp" && MaxStorageBytes > 0)
+        {
+            var grows = fileState is null ? plan.Meta.PageCount > plan.Before.Meta.PageCount : plan.Meta.LivePages > plan.Before.Meta.LivePages;
+            var pages = fileState is null ? plan.Meta.PageCount : plan.Meta.LivePages;
+            if (grows && (long)pages * plan.Meta.PageSize > MaxStorageBytes)
+            {
+                if (fileState is null && !compacted && await ReclaimMemoryOrphansAsync(pending, cancellationToken).ConfigureAwait(false))
+                    return await PrepareCommitAsync(pending, name, cancellationToken, compacted: true).ConfigureAwait(false);
+                var repair = pending.PendingBytes == 0 && encoded.Pages.Length <= pending.Before.Catalog.Pages.Length;
+                if (!repair) throw new SqlException(SqlStates.StorageLimitExceeded, $"storage of database \"{name}\" exceeded the limit of {MaxStorageBytes} bytes");
+            }
+        }
+        return new(pending, catalog with { Pages = encoded.Pages }, plan);
+    }
+    private void AdoptPreparedCommit(PreparedCommit prepared)
+    {
+        var plan = prepared.Plan;
         lock (gate)
         {
             foreach (var page in plan.FreePages)
-                if (!previouslyFree.Contains(page)) retiredAt[page] = plan.Meta.TransactionId;
+                if (!plan.Before.FreePages.Contains(page)) retiredAt[page] = plan.Meta.TransactionId;
             foreach (var page in retiredAt.Keys.Where(page => !plan.FreePages.Contains(page)).ToArray()) retiredAt.Remove(page);
-            current = new(catalog with { Pages = encoded.Pages }, plan.Meta, pending.Before.Pager);
+            current = new(prepared.Catalog, plan.Meta, prepared.Pending.Before.Pager) { Encrypted = plan.Encrypted };
             if (fileState?.Ledger is { } ledger)
             {
                 ledger.Publish(plan.MetaBytes, plan.Body.Select(page => page.Page).Concat(plan.Manifest.Select(page => page.Page)));
@@ -223,6 +339,7 @@ public sealed partial class Database : IAsyncDisposable
     }
     public async ValueTask DisposeAsync()
     {
+        await DisposeAttachedAsync().ConfigureAwait(false);
         if (fileState is not null) { await DisposeFileAsync().ConfigureAwait(false); return; }
         lock (gate)
         {

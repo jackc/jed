@@ -28,15 +28,7 @@ internal static class OpenFunctions
             }; return true;
         }
         if (name == "range_merge") { value = RangeSet("merge", args[0], args[1]); return true; }
-        if (name == "width_bucket_array")
-        {
-            var array = args[1].AsArray();
-            if (array.Rank > 1) throw new SqlException(SqlStates.ArraySubscriptError, "threshold array must be one-dimensional");
-            if (array.Values.Any(v => v.IsNull)) throw new SqlException(SqlStates.NullValueNotAllowed, "threshold array contains NULL");
-            var low = 0; var high = array.Count;
-            while (low < high) { var mid = low + (high - low) / 2; meter.Charge(Costs.OperatorEval); meter.Guard(); if (Evaluate.Compare(args[0], array.Values[mid], meter) < 0) high = mid; else low = mid + 1; }
-            value = SqlValue.Integer(low, SqlType.I32); return true;
-        }
+        if (name == "width_bucket_array") { value = WidthBucket(args, meter); return true; }
         if (name == "string_to_array")
         {
             if (args[0].IsNull) { value = SqlValue.Null(result); return true; }
@@ -75,8 +67,7 @@ internal static class OpenFunctions
             meter.Charge(TemporalRender.ZoneCount(args[0]) * Costs.Timezone); meter.Guard();
             var pieces = source.Values.Where(v => !v.IsNull || substitute is not null).Select(v => v.IsNull ? substitute! : v.Type == SqlType.Boolean ? v.AsBoolean() ? "t" : "f" : TemporalRender.Value(v, meter.Temporal, true)).ToArray();
             var bytes = pieces.Sum(piece => (long)TextEncoding.ByteCount(piece)) + Math.Max(0, pieces.Length - 1) * (long)TextEncoding.ByteCount(separator);
-            meter.Charge(OpenValue.PayloadBytes(args[0]) + bytes); meter.Guard(); meter.ScalarReserve(bytes);
-            if (bytes > int.MaxValue) throw new SqlException(SqlStates.ProgramLimitExceeded, "array text is too large");
+            meter.Charge(OpenValue.PayloadBytes(args[0])); meter.Guard(); meter.ScalarOutput(bytes);
             value = SqlValue.Text(string.Join(separator, pieces)); return true;
         }
         if (name != "array_replace" && source.Rank > 1) throw Errors.Unsupported("multidimensional array search or removal");
@@ -90,7 +81,7 @@ internal static class OpenFunctions
         if (name == "array_replace")
         {
             var bytes = 16L * source.Rank + source.Values.Sum(element => 32L + OpenValue.PayloadBytes(Matches(element) ? args[2] : element));
-            meter.Charge(OpenValue.PayloadBytes(args[0]) + bytes); meter.Guard(); meter.ScalarReserve(bytes);
+            meter.Charge(OpenValue.PayloadBytes(args[0])); meter.Guard(); meter.ScalarOutput(bytes);
             value = SqlValue.Array(new(source.ElementType, source.Values.Select(element => Matches(element) ? args[2] : element), source.Dimensions, source.LowerBounds, true)); return true;
         }
         var positions = new List<SqlValue>(); var start = args.Length == 3 ? args[2].AsInteger() : long.MinValue;
@@ -124,6 +115,20 @@ internal static class OpenFunctions
         return SqlValue.Array(new(result.Element!, a.Values.Concat(b.Values), dimensions, large.LowerBounds));
     }
     private static SqlException Shape() => new(SqlStates.ArraySubscriptError, "incompatible array dimensions");
+
+    internal static SqlValue WidthBucket(SqlValue[] args, Meter meter, CollationDerivation? collation = null)
+    {
+        var array = args[1].AsArray();
+        if (array.Rank > 1) throw new SqlException(SqlStates.ArraySubscriptError, "threshold array must be one-dimensional");
+        if (array.Values.Any(value => value.IsNull)) throw new SqlException(SqlStates.NullValueNotAllowed, "threshold array contains NULL");
+        var low = 0; var high = array.Count;
+        while (low < high)
+        {
+            var middle = low + (high - low) / 2; meter.Charge(Costs.OperatorEval); meter.Guard();
+            if (CollationRules.Compare(args[0], array.Values[middle], collation, meter) < 0) high = middle; else low = middle + 1;
+        }
+        return SqlValue.Integer(low, SqlType.I32);
+    }
 
     internal static SqlValue RangeSet(string operation, SqlValue left, SqlValue right)
     {

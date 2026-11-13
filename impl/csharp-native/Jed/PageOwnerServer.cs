@@ -16,6 +16,7 @@ internal interface IPageOwnerWrite : IAsyncDisposable
     ValueTask BeginCommitAsync(ulong transactionId, byte[] meta, PageWirePage[] manifest, CancellationToken cancellationToken);
     ValueTask WritePagesAsync(PageWirePage[] pages, CancellationToken cancellationToken);
     ValueTask<ulong> CompleteCommitAsync(CancellationToken cancellationToken);
+    ValueTask AfterAcknowledgementAsync() => ValueTask.CompletedTask;
 }
 internal sealed record PageOwnerOptions(bool ReadOnly = false, bool Yields = false, int MaxConnections = 0,
     long IdleSessionMilliseconds = 0, long IdleTransactionMilliseconds = 60000);
@@ -24,7 +25,8 @@ internal sealed record PageOwnerBackend(PageOwnerLedger Ledger,
     Func<bool, CancellationToken, ValueTask<IPageOwnerWrite>> BeginWrite,
     Func<CancellationToken, ValueTask> AwaitAdmission,
     Func<ulong, CancellationToken, ValueTask<byte>> RequestOwnership,
-    Action<ulong>? OwnershipAnswered = null);
+    Action<ulong>? OwnershipAnswered = null,
+    Func<byte[], ulong, CancellationToken, ValueTask<PageOwnerLedger.PageOwnerPin>>? AcquireRead = null);
 
 // Only the role driver binds/unlinks endpoints and releases presence. This
 // transport can also serve a stream relay without taking file ownership itself.
@@ -39,6 +41,7 @@ internal sealed class PageOwnerServer(PageOwnerBackend ownerBackend, PageOwnerOp
     private Socket? listener;
     private Task? accepting;
     private int disposed;
+    internal Action? BeforeAcknowledgementForTesting;
     internal int ConnectionCount => connections.Count;
     internal bool HasConnection(ulong id) => connections.TryGetValue(id, out var connection) && connection.IsOpen;
     internal void Abort()
@@ -225,7 +228,9 @@ internal sealed class PageOwnerServer(PageOwnerBackend ownerBackend, PageOwnerOp
             {
                 await Backend.AwaitAdmission(stopped.Token).ConfigureAwait(false);
                 stopped.Token.ThrowIfCancellationRequested();
-                var pin = Backend.Ledger.Pin(request.Get<byte[]>("incarnation"), request.Get<ulong>("last_txid"));
+                var pin = Backend.AcquireRead is { } acquire
+                    ? await acquire(request.Get<byte[]>("incarnation"), request.Get<ulong>("last_txid"), stopped.Token).ConfigureAwait(false)
+                    : Backend.Ledger.Pin(request.Get<byte[]>("incarnation"), request.Get<ulong>("last_txid"));
                 lock (pins)
                 {
                     if (!pins.TryGetValue(pin.Snapshot.TransactionId, out var stack)) pins.Add(pin.Snapshot.TransactionId, stack = new());
@@ -324,15 +329,29 @@ internal sealed class PageOwnerServer(PageOwnerBackend ownerBackend, PageOwnerOp
                     if (!commitStarted) throw PageWire.Invalid("commit_end before commit_begin");
                     if (rejectedDelta is not null) { var failure = rejectedDelta; await ReleaseWriteAsync().ConfigureAwait(false); throw failure; }
                     completing = true;
+                    var committed = false;
                     try
                     {
                         // A disconnect must not cancel storage after Check C.
                         var version = await writer.CompleteCommitAsync(CancellationToken.None).ConfigureAwait(false);
+                        committed = true;
+                        Interlocked.Exchange(ref server.BeforeAcknowledgementForTesting, null)?.Invoke();
                         await ReplyAsync(0x48, request.RequestId, ("txid", version)).ConfigureAwait(false);
                     }
                     catch (SqlException error) when (error.SqlState == SqlStates.ProtocolViolation) { throw; }
                     catch { Close(); throw; }
-                    finally { completing = false; await ReleaseWriteAsync().ConfigureAwait(false); }
+                    finally
+                    {
+                        try
+                        {
+                            // The committed client generation is already acknowledged
+                            // (or its reply was lost). Keep the writer gate through
+                            // owner-only reclamation; invalid/failed deltas never run it.
+                            if (committed) await writer.AfterAcknowledgementAsync().ConfigureAwait(false);
+                        }
+                        catch { Close(); throw; }
+                        finally { completing = false; await ReleaseWriteAsync().ConfigureAwait(false); }
+                    }
                 }
             }
             finally { writeState.Release(); }

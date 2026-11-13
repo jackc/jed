@@ -8,6 +8,8 @@ internal sealed record StorageCommitPlan(StorageRecovered Before, StorageMeta Me
     SortedSet<uint> FreePages, HashSet<uint> FreeListPages, HashSet<uint> ProtectedPages)
 {
     internal StorageEncryptedMeta? Encrypted { get; init; }
+    internal uint? LastReclamationLive { get; init; }
+    internal ulong? ReclamationTransactionId { get; init; }
 }
 
 // The relational storage serializer owns reachability and passes exact live-page
@@ -22,18 +24,24 @@ internal sealed class StorageAllocation
     private readonly SortedDictionary<uint, byte[]> body = [];
     private uint high;
     private readonly StoragePageCodec? codec;
+    private readonly bool eagerReclaim;
+    private uint? lastReclamationLive;
+    private ulong freeGeneration;
 
-    internal StorageAllocation(StorageRecovered before, IReadOnlySet<uint>? reuseGrant = null, StoragePageCodec? codec = null)
+    internal StorageAllocation(StorageRecovered before, IReadOnlySet<uint>? reuseGrant = null, StoragePageCodec? codec = null, bool eagerReclaim = true)
     {
-        this.before = before; this.codec = codec;
+        this.before = before; this.codec = codec; this.eagerReclaim = eagerReclaim; lastReclamationLive = before.ReclamationLive; freeGeneration = before.FreeGeneration;
         if ((before.Encrypted is not null) != (codec is not null)) throw new ArgumentException("storage codec differs from recovered variant");
         remaining = new(before.FreePages);
         safe = new(before.FreePages.Where(id => reuseGrant is null || reuseGrant.Contains(id)));
         // Housekeeping chains become unreachable when the alternate meta is
         // published. Persist them as retired, but never allocate from them in
         // this commit: the current recovery candidate still depends on them.
-        remaining.UnionWith(before.FreeListPages);
-        remaining.UnionWith(before.ManifestPages);
+        if (eagerReclaim)
+        {
+            remaining.UnionWith(before.FreeListPages);
+            remaining.UnionWith(before.ManifestPages);
+        }
         high = before.Meta.PageCount;
     }
 
@@ -69,13 +77,49 @@ internal sealed class StorageAllocation
     {
         if (id < (Encrypted ? 4 : 2) || id >= before.Meta.PageCount || body.ContainsKey(id))
             throw new ArgumentException("invalid reclaimed page");
-        remaining.Add(id);
+        if (eagerReclaim) remaining.Add(id);
     }
 
-    internal StorageCommitPlan Prepare(uint root, uint livePages)
+    internal uint PageCount => high;
+    internal long OffFreeListCount => (long)high - remaining.Count;
+    internal StoragePager ReadView(StoragePager source) => new(new StoragePlannedView(source.Store, PageSize, high, body), PageSize, codec: codec);
+    internal StorageEncryptedMeta? PlannedEncryption(StorageMeta meta) => codec is null ? null : new(meta, Tag(meta.Root).ToArray(), new byte[16]);
+    internal void CollectUnreachable(IReadOnlySet<uint> reachable, CancellationToken token)
+    {
+        remaining.Clear();
+        for (uint page = Encrypted ? 4U : 2U; page < high; page++)
+        {
+            if ((page & 1023) == 0) token.ThrowIfCancellationRequested();
+            if (!reachable.Contains(page) && !body.ContainsKey(page)) remaining.Add(page);
+        }
+        lastReclamationLive = checked(high - (uint)remaining.Count - (Encrypted ? 4U : 2U));
+        freeGeneration = checked(before.Meta.TransactionId + 1);
+    }
+
+    internal StorageCommitPlan PrepareMemory(uint root, uint livePages)
+    {
+        if (body.Count == 0 || !body.ContainsKey(root) || body.Values.Any(page => page.Length != PageSize))
+            throw new ArgumentException("incomplete memory commit pages");
+        // Memory domains retain the free identities in the handle. They do not
+        // reserve physical pages for durable free-list or manifest chains.
+        var meta = new StorageMeta(PageSize, checked(before.Meta.TransactionId + 1), root, high, 0, livePages);
+        StorageEncryptedMeta? encrypted = null; byte[] bytes;
+        if (codec is null) bytes = StorageFormat.EncodeMeta(meta);
+        else
+        {
+            encrypted = new(meta, Tag(root).ToArray(), new byte[16]);
+            bytes = codec.SealMeta((uint)(1 - before.FloorSlot), StorageCryptoMeta.Encode(meta, encrypted.RootTag, encrypted.FreeListTag, []), []);
+        }
+        return new(before, meta, body.Select(page => new StorageWrite(page.Key, page.Value)).ToArray(), [], bytes,
+            new(remaining), [], new(body.Keys)) { Encrypted = encrypted, LastReclamationLive = lastReclamationLive, ReclamationTransactionId = freeGeneration };
+    }
+
+    internal StorageCommitPlan Prepare(uint root, uint livePages, bool truncate = false)
     {
         if (body.Count == 0 || !body.ContainsKey(root)) throw new ArgumentException("changed domain must write its catalog root");
         if (body.Values.Any(page => page.Length == 0)) throw new ArgumentException("reserved page has not been encoded");
+        if (truncate)
+            while (high > (Encrypted ? 4U : 2U) && safe.Remove(high - 1)) { remaining.Remove(--high); }
         var size = before.Meta.PageSize;
         var txid = checked(before.Meta.TransactionId + 1);
         // Monotone reservation: freeing a reserved page from the persisted list
@@ -149,7 +193,7 @@ internal sealed class StorageAllocation
             var dependencies = new HashSet<uint>(pages.Select(page => page.Page));
             dependencies.UnionWith(manifests);
             if (persist.Overlaps(dependencies)) throw new InvalidOperationException("free list overlaps commit dependencies");
-            return new(before, meta, pages.OrderBy(page => page.Page).ToArray(), overflow, metaBytes, persist, new(freeIds), dependencies) { Encrypted = encryptedMeta };
+            return new(before, meta, pages.OrderBy(page => page.Page).ToArray(), overflow, metaBytes, persist, new(freeIds), dependencies) { Encrypted = encryptedMeta, LastReclamationLive = lastReclamationLive, ReclamationTransactionId = freeGeneration };
         }
     }
 
@@ -189,6 +233,26 @@ internal sealed class StorageCommitter
         Current = recovered; stabilize = !stabilized && recovered.RequiresStabilization;
     }
 
+    internal async ValueTask StageMemoryAsync(StorageCommitPlan plan, CancellationToken token)
+    {
+        if (IsPoisoned || !ReferenceEquals(plan.Before, Current) || Volatile.Read(ref committing) != 0)
+            throw new InvalidOperationException("cannot stage into active, stale or poisoned storage");
+        // No meta write or barrier: readers continue from Current. An abandoned
+        // stage is unreachable and can be overwritten by the next plan.
+        foreach (var write in plan.Body.Concat(plan.Manifest))
+        {
+            pager.Invalidate(write.Page);
+            await pager.Store.WriteAsync((long)write.Page * pager.PageSize, write.Bytes, token).ConfigureAwait(false);
+        }
+    }
+    internal void AdoptStagedMemory(StorageCommitPlan plan)
+    {
+        Current = new(plan.Meta, 1 - plan.Before.FloorSlot, 1 - plan.Before.FloorSlot,
+            plan.ProtectedPages, plan.FreePages, plan.FreeListPages)
+        { ManifestPages = plan.Manifest.Select(page => page.Page).ToHashSet(), Encrypted = plan.Encrypted, LastReclamationLive = plan.LastReclamationLive, ReclamationTransactionId = plan.ReclamationTransactionId };
+        stabilize = false; directoryPending = false;
+    }
+
     internal async ValueTask CommitAsync(StorageCommitPlan plan, CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
@@ -221,8 +285,21 @@ internal sealed class StorageCommitter
                 var slot = 1 - Current.FloorSlot;
                 await pager.Store.WriteAsync((long)slot * pager.PageSize, plan.MetaBytes, cancellationToken).ConfigureAwait(false);
                 await pager.Store.SyncAsync(cancellationToken).ConfigureAwait(false);
+                if (plan.Meta.PageCount < plan.Before.Meta.PageCount)
+                {
+                    var floor = Math.Max(1, 16 * 1024 / pager.PageSize);
+                    var cap = Math.Max(1, 1024 * 1024 / pager.PageSize);
+                    var targetLength = checked(((long)plan.Meta.PageCount + Math.Clamp((long)plan.Meta.PageCount, floor, cap)) * pager.PageSize);
+                    if (targetLength < length)
+                    {
+                        // Shrinking only drops slack after publication is durable.
+                        // Failure must not turn that successful commit into an error.
+                        try { await pager.Store.SetLengthAsync(targetLength, CancellationToken.None).ConfigureAwait(false); }
+                        catch (Exception error) when (error is IOException or SqlException) { }
+                    }
+                }
                 Current = new(plan.Meta, slot, slot, plan.ProtectedPages, plan.FreePages, plan.FreeListPages)
-                { ManifestPages = plan.Manifest.Select(page => page.Page).ToHashSet(), Encrypted = plan.Encrypted };
+                { ManifestPages = plan.Manifest.Select(page => page.Page).ToHashSet(), Encrypted = plan.Encrypted, LastReclamationLive = plan.LastReclamationLive, ReclamationTransactionId = plan.ReclamationTransactionId };
                 stabilize = false; directoryPending = false;
             }
             catch { IsPoisoned = true; throw; }

@@ -8,10 +8,12 @@ internal static class QueryExecution
     {
         await ValueTask.CompletedTask.ConfigureAwait(false); yield break;
     }
-    internal static async IAsyncEnumerable<SqlValue[]> ScalarSource()
+    internal static async IAsyncEnumerable<SqlValue[]> ScalarSource(Meter meter)
     {
         await ValueTask.CompletedTask.ConfigureAwait(false);
-        yield return [];
+        var bytes = meter.Memory.ReserveRow(Array.Empty<SqlValue>());
+        try { yield return []; }
+        finally { meter.Memory.Release(bytes); }
     }
     internal static async IAsyncEnumerable<SqlValue[]> TableSource(CatalogTable table, StorageTree tree, Meter meter,
         [EnumeratorCancellation] CancellationToken cancellationToken, TableScan? scan = null, IReadOnlySet<int>? touched = null)
@@ -30,40 +32,65 @@ internal static class QueryExecution
         }
     }
     internal static async IAsyncEnumerable<SqlValue[]> DeferredTableSource(CatalogTable table, StorageTree tree, SelectPlan plan, Meter meter,
-        [EnumeratorCancellation] CancellationToken cancellationToken)
+        [EnumeratorCancellation] CancellationToken cancellationToken, QueryStorage? storage = null)
     {
         var initialized = PlanTransform.InitialValues(plan);
         var access = TableAccess.Prepare(initialized, table);
         var touched = StorageTouchedColumns.Collect(initialized);
-        var ranges = PointAccess.Ranges(initialized.Filter, table);
-        if (ranges is null)
+        if (storage is not null)
+        {
+            var selected = initialized.Access ?? AccessPlan.Select(table, tree, initialized.Filter, storage, meter);
+            await foreach (var row in selected.Rows(table, tree, storage, meter, touched, cancellationToken, access.Scan.Reverse).ConfigureAwait(false)) yield return row;
+        }
+        else
         {
             await foreach (var row in TableSource(table, tree, meter, cancellationToken, access.Scan, touched).ConfigureAwait(false)) yield return row;
+        }
+    }
+
+    internal static async IAsyncEnumerable<Row> Select(SelectPlan plan, IAsyncEnumerable<SqlValue[]> source, Meter meter,
+        [EnumeratorCancellation] CancellationToken cancellationToken = default, bool sourceMemory = false, bool eagerInput = false,
+        bool transferIdentity = false, bool bufferOutput = false)
+    {
+        var execution = SelectCore(plan, source, meter, cancellationToken, sourceMemory, eagerInput, transferIdentity);
+        if (!bufferOutput)
+        {
+            await foreach (var row in execution.ConfigureAwait(false)) yield return row;
             yield break;
         }
-        foreach (var range in ranges)
+        using var memory = new QueryInputMemory(meter); var rows = new List<SqlValue[]>();
+        await foreach (var row in execution.ConfigureAwait(false))
         {
-            meter.Charge(await tree.CountRangePagesAsync(range.Lower, true, range.Upper, true, cancellationToken).ConfigureAwait(false));
-            await foreach (var record in tree.ScanRangeAsync(range.Lower, true, range.Upper, true, cancellationToken: cancellationToken).ConfigureAwait(false))
-                meter.Charge(tree.ValueReadUnits(record, touched));
+            var values = Enumerable.Range(0, row.Count).Select(i => row[i]).ToArray();
+            memory.Take(values, transferIdentity); rows.Add(values);
         }
-        meter.Checkpoint();
-        if (access.Scan.Reverse) Array.Reverse(ranges);
-        foreach (var range in ranges)
-            await foreach (var record in tree.ScanRangeAsync(range.Lower, true, range.Upper, true, cancellationToken: cancellationToken).ConfigureAwait(false))
-            {
-                meter.Charge(Costs.StorageRowRead); meter.Checkpoint(); yield return tree.DecodeDeferredRow(table, record);
-            }
-
+        foreach (var row in rows) { memory.Transfer(row); yield return new Row(row); }
     }
-    internal static async IAsyncEnumerable<Row> Select(SelectPlan plan, IAsyncEnumerable<SqlValue[]> source, Meter meter,
-        [EnumeratorCancellation] CancellationToken cancellationToken = default)
+
+    private static async IAsyncEnumerable<Row> SelectCore(SelectPlan plan, IAsyncEnumerable<SqlValue[]> source, Meter meter,
+        [EnumeratorCancellation] CancellationToken cancellationToken = default, bool sourceMemory = false, bool eagerInput = false, bool transferIdentity = false)
     {
+        using var inputMemory = new QueryInputMemory(meter);
+        var retainProjectedSource = plan.Group is not null || plan.Windows is not null;
+        var retainInput = eagerInput && plan.Group is null && plan.Windows is null && !plan.Distinct;
+        if (retainInput)
+        {
+            source = EagerSource(source, inputMemory, sourceMemory, StorageTouchedColumns.Collect(plan), cancellationToken);
+            sourceMemory = true; retainProjectedSource = true;
+        }
+        else if (sourceMemory && plan.Group is null && plan.Windows is null) source = inputMemory.Adopt(source, cancellationToken);
         plan = PlanTransform.InitialValues(plan);
         if (plan.Filter is not null && Resolve.EmptyFilter(plan.Filter)) plan = plan with { Empty = true };
+        if (plan.ColumnarProjection)
+        {
+            source = ColumnarSource(plan, source, meter, cancellationToken);
+            plan = plan with { Filter = null };
+        }
         if (plan.Group is { } grouping)
         {
-            source = GroupExecution.Run(grouping, plan.Empty ? EmptySource() : source, plan.Filter, meter, cancellationToken);
+            source = inputMemory.Adopt(GroupExecution.Run(grouping, plan.Empty ? EmptySource() : source, plan.Filter, meter, cancellationToken, sourceMemory, StorageTouchedColumns.Collect(plan), plan.AggregateLane, plan.Observation?.Filter), cancellationToken);
+            if (plan.Observation?.Aggregate is { } groupObservation) source = ExplainObservation.Rows(source, groupObservation, meter, cancellationToken, inclusive: true);
+            sourceMemory = true;
             plan = plan with { Filter = null, Empty = false, Group = null };
             // Aggregates finalize even when LIMIT excludes every output row.
             if (plan.Limit == 0 && !plan.Distinct)
@@ -80,7 +107,9 @@ internal static class QueryExecution
                 source = WindowPrefix.Take(plan.Empty ? EmptySource() : source, plan.Filter, count, meter, cancellationToken);
                 plan = plan with { Filter = null, Empty = false };
             }
-            source = WindowExecution.Run(windows, plan.Empty ? EmptySource() : source, plan.Filter, meter, cancellationToken);
+            source = inputMemory.Adopt(WindowExecution.Run(windows, plan.Empty ? EmptySource() : source, plan.Filter, meter, cancellationToken, sourceMemory, StorageTouchedColumns.Collect(plan), plan.Observation?.Filter), cancellationToken);
+            if (plan.Observation?.Window is { } windowObservation) source = ExplainObservation.Rows(source, windowObservation, meter, cancellationToken, inclusive: true);
+            sourceMemory = true;
             plan = plan with { Filter = null, Empty = false, Windows = null };
             if (plan.Limit == 0)
             {
@@ -89,9 +118,9 @@ internal static class QueryExecution
             }
         }
         if (plan.Empty) yield break;
-        if (plan.Distinct)
+        if (plan.Distinct && plan.DistinctOnCount == 0)
         {
-            await foreach (var row in DistinctExecution.Run(plan, source, meter, cancellationToken).ConfigureAwait(false)) yield return row;
+            await foreach (var row in DistinctExecution.Run(plan, source, meter, cancellationToken, sourceMemory, inputMemory).ConfigureAwait(false)) yield return row;
             yield break;
         }
         var order = plan.Order ?? [];
@@ -99,32 +128,53 @@ internal static class QueryExecution
         long skipped = 0, produced = 0;
         if (order.Length != 0)
         {
-            var rows = new List<(SqlValue[] Row, SqlValue[] Keys, int Ordinal)>();
-            await foreach (var row in source.WithCancellation(cancellationToken).ConfigureAwait(false))
-            {
-                if (!await KeepsAsync(plan.Filter, row, meter).ConfigureAwait(false)) continue;
-                var keys = new SqlValue[order.Length];
-                for (var i = 0; i < keys.Length; i++)
-                {
-                    keys[i] = await Evaluate.ExprAsync(order[i].Expression, meter, row: row).ConfigureAwait(false);
-                    var work = KeyBytes(keys[i]);
-                    if (work != 0) { meter.Charge(work * Costs.SortKey); meter.Guard(); }
-                }
-                rows.Add((row, keys, rows.Count));
-            }
-            rows.Sort((left, right) =>
+            using var sortMemory = new QueryInputMemory(meter);
+            var rows = new List<(SqlValue[] Row, SortValue[] Keys, int Ordinal)>();
+            var heap = !sourceMemory && plan.DistinctOnCount == 0 && plan.Limit is not null && order.All(key => key.Expression.Op == "column" && key.Expression.Collation?.Table is null);
+            var capacity = plan.Limit == 0 ? 0 : plan.Limit is { } take ? Estimate.Add(plan.Offset, take) : long.MaxValue;
+            var ordinal = 0;
+            int Compare((SqlValue[] Row, SortValue[] Keys, int Ordinal) left, (SqlValue[] Row, SortValue[] Keys, int Ordinal) right)
             {
                 for (var i = 0; i < order.Length; i++)
                 {
-                    var a = left.Keys[i]; var b = right.Keys[i];
-                    var compare = a.IsNull || b.IsNull ? a.IsNull == b.IsNull ? 0 : (a.IsNull == order[i].NullsFirst ? -1 : 1) :
-                        order[i].Descending ? Evaluate.Compare(b, a) : Evaluate.Compare(a, b);
-                    if (compare != 0) return compare;
+                    var compared = SortValue.Compare(left.Keys[i], right.Keys[i], order[i]);
+                    if (compared != 0) return compared;
                 }
                 return left.Ordinal.CompareTo(right.Ordinal);
-            });
+            }
+            await foreach (var row in source.WithCancellation(cancellationToken).ConfigureAwait(false))
+            {
+                if (!await KeepsAsync(plan.Filter, row, meter, plan.Observation?.Filter).ConfigureAwait(false)) { inputMemory.Release(row); continue; }
+                if (heap && capacity == 0) continue;
+                var keyCost = meter.Accrued;
+                var keys = new SortValue[order.Length];
+                for (var i = 0; i < keys.Length; i++)
+                {
+                    var value = await Evaluate.ExprAsync(order[i].Expression, meter, row: row).ConfigureAwait(false);
+                    if (order[i].Expression.Op != "column") sortMemory.ReserveValue(value);
+                    keys[i] = CollationRules.Decorate(value, order[i].Expression, meter);
+                }
+                plan.Observation?.Sort?.AttributeLocal(meter.Accrued - keyCost);
+                var candidate = (Row: row, Keys: keys, Ordinal: ordinal++);
+                if (heap && rows.Count >= capacity && Compare(candidate, rows[^1]) >= 0) continue;
+                var buffered = sourceMemory ? row : await sortMemory.TakeAsync(row, false, StorageTouchedColumns.Collect(plan)).ConfigureAwait(false);
+                rows.Add((buffered, keys, candidate.Ordinal));
+                if (heap)
+                {
+                    rows.Sort(Compare);
+                    if (rows.Count > capacity) { sortMemory.Release(rows[^1].Row); rows.RemoveAt(rows.Count - 1); }
+                }
+            }
+            if (!heap) rows.Sort(Compare);
+            SortValue[]? previous = null;
             foreach (var row in rows)
             {
+                if (plan.DistinctOnCount != 0)
+                {
+                    var same = previous is not null && Enumerable.Range(0, plan.DistinctOnCount).All(i => SortValue.Compare(previous[i], row.Keys[i], order[i]) == 0);
+                    if (same) { sortMemory.Release(row.Row); inputMemory.Release(row.Row); continue; }
+                    previous = row.Keys;
+                }
                 if (skipped++ < plan.Offset) continue;
                 if (plan.Limit is { } limit && produced >= limit) break;
                 produced++; yield return await ProjectAsync(plan.Projections, row.Row, meter, plan.ChargeRows).ConfigureAwait(false);
@@ -133,17 +183,64 @@ internal static class QueryExecution
         }
         await foreach (var row in source.WithCancellation(cancellationToken).ConfigureAwait(false))
         {
-            if (!await KeepsAsync(plan.Filter, row, meter).ConfigureAwait(false)) continue;
-            if (skipped++ < plan.Offset) continue;
-            produced++; yield return await ProjectAsync(plan.Projections, row, meter, plan.ChargeRows).ConfigureAwait(false);
+            if (!await KeepsAsync(plan.Filter, row, meter, plan.Observation?.Filter).ConfigureAwait(false)) { inputMemory.Release(row); continue; }
+            if (skipped++ < plan.Offset) { inputMemory.Release(row); continue; }
+            if (transferIdentity && sourceMemory)
+            {
+                if (plan.ChargeRows) meter.Charge(Costs.RowProduced);
+                inputMemory.Transfer(row); produced++; yield return new Row(row);
+                if (plan.Limit is { } identityLimit && produced >= identityLimit) yield break;
+                continue;
+            }
+            var projected = await ProjectAsync(plan.Projections, row, meter, plan.ChargeRows).ConfigureAwait(false);
+            if (!retainProjectedSource) inputMemory.Release(row);
+            produced++; yield return projected;
             if (plan.Limit is { } limit && produced >= limit) yield break;
         }
     }
-    internal static async ValueTask<bool> KeepsAsync(Resolved? filter, SqlValue[] row, Meter meter)
+    private static async IAsyncEnumerable<SqlValue[]> ColumnarSource(SelectPlan plan, IAsyncEnumerable<SqlValue[]> source, Meter meter,
+        [EnumeratorCancellation] CancellationToken token)
+    {
+        using var memory = new QueryInputMemory(meter);
+        var rows = new List<SqlValue[]>(); var slots = plan.Projections.Select(projection => projection.Expression.Slot).Distinct().ToArray();
+        long bytes = 0;
+        await foreach (var row in source.WithCancellation(token).ConfigureAwait(false))
+        {
+            if (!await KeepsAsync(plan.Filter, row, meter, plan.Observation?.Filter).ConfigureAwait(false)) continue;
+            foreach (var slot in slots)
+            {
+                row[slot] = await row[slot].ResolveAsync(token).ConfigureAwait(false);
+                if (meter.Memory.Enabled) bytes = Meter.Add(bytes, MemorySize.ValueBytes(row[slot]));
+            }
+            rows.Add(row);
+        }
+        memory.ReserveBytes(bytes);
+        foreach (var row in rows) yield return row;
+    }
+
+    private static async IAsyncEnumerable<SqlValue[]> EagerSource(IAsyncEnumerable<SqlValue[]> source, QueryInputMemory memory,
+        bool transferred, HashSet<int> touched, [EnumeratorCancellation] CancellationToken token)
+    {
+        var rows = new List<SqlValue[]>();
+        await foreach (var row in source.WithCancellation(token).ConfigureAwait(false)) rows.Add(await memory.TakeAsync(row, transferred, touched).ConfigureAwait(false));
+        foreach (var row in rows) yield return row;
+    }
+internal static async ValueTask<bool> KeepsValueAsync(Resolved? expression, SqlValue[] row, Meter meter)
+{
+    if (expression is null) return true;
+    var result = await Evaluate.ExprAsync(expression, meter, row: row).ConfigureAwait(false);
+    return !result.IsNull && result.AsBoolean();
+}
+    internal static async ValueTask<bool> KeepsAsync(Resolved? filter, SqlValue[] row, Meter meter, ExplainNode? observation = null)
     {
         if (filter is null) return true;
-        var result = await Evaluate.ExprAsync(filter, meter, true, row).ConfigureAwait(false);
-        return !result.IsNull && result.AsBoolean();
+        var before = meter.Accrued;
+        try
+        {
+            var result = await Evaluate.ExprAsync(filter, meter, true, row).ConfigureAwait(false);
+            return !result.IsNull && result.AsBoolean();
+        }
+        finally { observation?.AttributeLocal(meter.Accrued - before); }
     }
     internal static async ValueTask<Row> ProjectAsync(Projection[] projections, SqlValue[] row, Meter meter, bool chargeRow = true)
     {

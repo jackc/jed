@@ -30,6 +30,11 @@ internal static class WindowResolve
                 Partition = window.Partition.Select(key => Resolve.Bind(key, columns)).ToArray(),
                 Order = window.Order.Select(key => key with { Expression = Resolve.Bind(key.Expression, columns) }).ToArray()
             };
+            foreach (var key in window.Partition.Concat(window.Order.Select(key => key.Expression)))
+            {
+                var validation = AggregateResolve.Prepare(syntax with { Items = [new(key, null)], Order = null, Windows = null, Having = null }, columns);
+                _ = Resolve.Expr(validation.Syntax.Items[0].Expression);
+            }
             named.Add(name, window);
         }
 
@@ -38,6 +43,7 @@ internal static class WindowResolve
             if (expression.Window is null && expression.Op == "call" && Names.Contains(expression.Text)) throw new SqlException(SqlStates.WrongObjectType, "window function requires OVER");
             if (expression.Window is { } window)
             {
+                if (expression.Op == "ordered_aggregate") throw Errors.Unsupported("ordered-set aggregate window");
                 if (expression.Args.Any(Contains) || expression.Predicate is { } predicate && Contains(predicate)) throw Invalid("nested window function");
                 window = ExpandWindow(window);
                 if (window.Partition.Any(Contains) || window.Order.Any(key => Contains(key.Expression))) throw Invalid("window function in window key");
@@ -55,6 +61,7 @@ internal static class WindowResolve
         return syntax with
         {
             Windows = named,
+            DistinctOn = syntax.DistinctOn?.Select(ExpandExpression).ToArray(),
             Items = syntax.Items.Select(item => item with { Expression = ExpandExpression(item.Expression) }).ToArray(),
             Order = syntax.Order?.Select(key => key with { Expression = ExpandExpression(key.Expression) }).ToArray()
         };
@@ -62,15 +69,19 @@ internal static class WindowResolve
     internal static (SelectSyntax Syntax, WindowStage? Stage) Prepare(SelectSyntax syntax, BoundColumn[] columns, GroupPlan? grouping)
     {
         var plans = new List<WindowPlan>();
-        var width = grouping is null ? columns.Count(column => column.Outer is null) : grouping.Keys.Length + grouping.Aggregates.Length;
+        var rewritten = new List<(Expression Source, Expression Result)>();
+        var width = grouping is null ? columns.Count(column => column.Outer is null) : grouping.Keys.Length + (grouping.GroupingColumns?.Length ?? 0) + grouping.Aggregates.Length;
         Expression Rewrite(Expression expression)
         {
             if (expression.Window is not { } window) return expression with { Args = expression.Args.Select(Rewrite).ToArray() };
+            var sourceExpression = Resolve.Bind(expression, columns);
+            foreach (var prior in rewritten) if (SyntaxIdentity.Same(sourceExpression, prior.Source)) return prior.Result;
             if (expression.AggregateOrder is { Length: > 0 }) throw Errors.Unsupported("aggregate ORDER BY in window function");
             if (expression.Op == "call_distinct") throw Errors.Unsupported("DISTINCT window aggregate");
             var args = expression.Args.Where(arg => arg.Op != "star").Select(arg => Resolve.Expr(Resolve.Bind(arg, columns))).ToArray();
             var partition = window.Partition.Select(key => Resolve.Expr(key)).ToArray();
             var order = window.Order.Select(key => new SortPlan(Resolve.Expr(key.Expression), key.Descending, key.NullsFirst ?? key.Descending)).ToArray();
+            foreach (var key in partition.Concat(order.Select(key => key.Expression))) { Resolve.RequireOrderable(key.Type); CollationRules.Require(key, true); }
             static bool Outer(Resolved expression) => expression.Op == "outer" || expression.Args.Any(Outer);
             if (partition.Any(Outer) || order.Any(key => Outer(key.Expression)))
                 throw Errors.Unsupported("correlated window key");
@@ -104,7 +115,7 @@ internal static class WindowResolve
             }
             else
             {
-                var call = expression with { Window = null };
+                var call = Resolve.Bind(expression with { Window = null }, columns);
                 if (!AggregateResolve.IsAggregate(call)) throw new SqlException(SqlStates.UndefinedFunction, "function is not a window function");
                 var prepared = AggregateResolve.Prepare(new([new(call, null)], null, null, 0), columns);
                 aggregate = prepared.Plan!.Aggregates[0]; type = aggregate.Type;
@@ -123,10 +134,13 @@ internal static class WindowResolve
                 }
             }
             var slot = width + plans.Count; plans.Add(new(expression.Text, args, type, partition, order, window.Frame, aggregate));
-            return new("bound", expression.Text, [], Binding: new("column", type, default, [], Slot: slot));
+            var collation = CollationRules.Collatable(type) ? aggregate?.Collation ?? CollationRules.Merge(args) : null;
+            var replacement = new Expression("bound", expression.Text, [], Binding: new("column", type, default, [], Slot: slot, Collation: collation));
+            rewritten.Add((sourceExpression, replacement)); return replacement;
         }
         var result = syntax with
         {
+            DistinctOn = syntax.DistinctOn?.Select(Rewrite).ToArray(),
             Items = syntax.Items.Select(item => item with { Expression = Rewrite(item.Expression) }).ToArray(),
             Order = syntax.Order?.Select(key => key with { Expression = Rewrite(key.Expression) }).ToArray()
         };

@@ -28,13 +28,15 @@ internal static class PageOwnerTests
         await using var store = new MemoryBlockStore();
         await store.WriteAsync(0, rawMeta); await store.WriteAsync(size, rawMeta); await store.WriteAsync(2L * size, rawRoot);
         using var gate = new SemaphoreSlim(1);
+        var maintenanceEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var maintenanceReleased = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var backend = new PageOwnerBackend(ledger,
             async (index, token) => { var bytes = new byte[size]; await store.ReadAsync((long)index * size, bytes, token); return bytes; },
             async (relaxed, token) =>
             {
                 if (relaxed) throw new SqlException(SqlStates.FeatureNotSupported, "test adapter supports durable commits only");
                 await gate.WaitAsync(token);
-                return new TestWrite(store, ledger, initial, gate);
+                return new TestWrite(store, ledger, initial, gate, maintenanceEntered, maintenanceReleased);
             },
             _ => ValueTask.CompletedTask,
             (_, _) => ValueTask.FromResult((byte)1));
@@ -53,6 +55,10 @@ internal static class PageOwnerTests
             var write = await client.BeginWriteAsync(read.Incarnation, 1, 1000, cancellationToken: timeout.Token);
             Corpus.Equal(false, write.Snapshot.InvalidateAll, "same generation exact cache");
             Corpus.Equal(2ul, await client.CommitAsync(plan, timeout.Token), "remote commit result");
+            await maintenanceEntered.Task.WaitAsync(timeout.Token);
+            Corpus.Equal(0, gate.CurrentCount, "after-ACK maintenance retains the writer gate");
+            Corpus.Equal(0, ledger.PinCount, "after-ACK maintenance releases the old write pin");
+            maintenanceReleased.TrySetResult();
             Corpus.Equal((byte)0, await client.CommitStatusAsync(2, PageOwnerLedger.ResolutionDigest(plan.MetaBytes), timeout.Token), "commit resolution committed");
             Corpus.Equal((byte)1, await client.CommitStatusAsync(2, 0, timeout.Token), "commit resolution differing digest");
             Corpus.Equal((byte)1, await client.CommitStatusAsync(3, 0, timeout.Token), "future commit not committed");
@@ -69,11 +75,12 @@ internal static class PageOwnerTests
             try { _ = await readOnly.ReadPagesAsync(readOnlyPin.TransactionId, [1], timeout.Token); throw new InvalidDataException("meta read accepted as body"); }
             catch (SqlException error) when (error.SqlState == SqlStates.ProtocolViolation) { }
         }
-        finally { await server.DisposeAsync(); File.Delete(path); }
+        finally { maintenanceReleased.TrySetResult(); await server.DisposeAsync(); File.Delete(path); }
         Corpus.Equal(0, ledger.PinCount, "connection disposal releases all pins");
         Console.WriteLine("PASS page-owner host adapter: real client reads, writer lease, streamed Check A/B/C, durable publication, cache invalidation, resolution and pin cleanup");
     }
-    private sealed class TestWrite(MemoryBlockStore store, PageOwnerLedger ledger, StorageMeta before, SemaphoreSlim gate) : IPageOwnerWrite
+    private sealed class TestWrite(MemoryBlockStore store, PageOwnerLedger ledger, StorageMeta before, SemaphoreSlim gate,
+        TaskCompletionSource maintenanceEntered, TaskCompletionSource maintenanceReleased) : IPageOwnerWrite
     {
         private PageCommitValidator? validation;
         private int disposed;
@@ -101,6 +108,11 @@ internal static class PageOwnerTests
         {
             if (Interlocked.Exchange(ref disposed, 1) == 0) { Pin.Dispose(); gate.Release(); }
             return ValueTask.CompletedTask;
+        }
+        public async ValueTask AfterAcknowledgementAsync()
+        {
+            Pin.Dispose(); maintenanceEntered.TrySetResult();
+            await maintenanceReleased.Task.ConfigureAwait(false);
         }
     }
     private static void Reject(Action action, string name)

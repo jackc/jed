@@ -181,10 +181,10 @@ internal static class StoredValues
 
 internal static class KeyEncoding
 {
-    internal static int KeyLength(ReadOnlySpan<byte> key, SqlType type, bool nullable = false, bool descending = false)
+    internal static int KeyLength(ReadOnlySpan<byte> key, SqlType type, bool nullable = false, bool descending = false, Collation? collation = null)
     {
         var reader = new KeyReader(key, descending);
-        reader.Skip(type, nullable);
+        reader.Skip(type, nullable, collated: collation is not null);
         return reader.Position;
     }
     internal static byte[] Integer(long value, int width)
@@ -206,7 +206,7 @@ internal static class KeyEncoding
         8 => unchecked((long)(BinaryPrimitives.ReadUInt64BigEndian(bytes) ^ 0x8000000000000000UL)),
         _ => throw StorageFormat.Corrupt("invalid fixed integer width")
     };
-    internal static byte[] Encode(SqlValue value, bool nullable = false, bool descending = false)
+    internal static byte[] Encode(SqlValue value, bool nullable = false, bool descending = false, Collation? collation = null)
     {
         var writer = new WireWriter();
         if (value.IsNull)
@@ -236,10 +236,10 @@ internal static class KeyEncoding
                     writer.U64((bits64 & 0x8000000000000000UL) != 0 ? ~bits64 : bits64 ^ 0x8000000000000000UL); break;
                 case SqlKind.Boolean: writer.Byte(value.AsBoolean() ? (byte)1 : (byte)0); break;
                 case SqlKind.Uuid: writer.Bytes(value.ByteSpan); break;
-                case SqlKind.Text: Escape(writer, TextEncoding.Utf8.GetBytes(value.AsText())); break;
+                case SqlKind.Text: if (collation is null) Escape(writer, TextEncoding.Utf8.GetBytes(value.AsText())); else writer.Bytes(collation.SortKey(value.AsText())); break;
                 case SqlKind.Bytea: Escape(writer, value.ByteSpan); break;
                 case SqlKind.Decimal: writer.Bytes(Decimal(value.AsDecimal())); break;
-                case SqlKind.Array or SqlKind.Composite or SqlKind.Range: OpenCodec.Key(writer, value); break;
+                case SqlKind.Array or SqlKind.Composite or SqlKind.Range: OpenCodec.Key(writer, value, collation); break;
                 default: throw Errors.Unsupported($"key of type {value.Type.Name()}");
             }
         }

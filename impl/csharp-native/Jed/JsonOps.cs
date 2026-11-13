@@ -56,7 +56,7 @@ internal static class JsonOps
     internal static SqlValue Extract(SqlValue value, SqlValue selector, bool text, bool path)
     {
         var outputType = text ? SqlType.Text : value.Type;
-        if (value.IsNull || selector.IsNull) return SqlValue.Null(outputType);
+        if (value.IsNull || selector.IsNull || path && selector.AsArray().Values.Any(step => step.IsNull)) return SqlValue.Null(outputType);
         var root = Node(value); SqlJsonNode? found = null;
         if (!path)
         {
@@ -97,6 +97,12 @@ internal static class JsonOps
         if (found is null || text && found.Kind == SqlJsonKind.Null) return SqlValue.Null(outputType);
         if (text) return SqlValue.Text(found.Kind == SqlJsonKind.String ? found.Text! : value.Type == SqlType.Json ? found.Verbatim : found.ToString());
         return value.Type == SqlType.Jsonb ? SqlValue.Jsonb(found) : SqlValue.StoredJson(found.Verbatim);
+    }
+    internal static bool ExtractionBuilds(string operation, SqlValue source, SqlValue selector)
+    {
+        if (source.Type != SqlType.Jsonb || operation is not ("->>" or "#>>") || source.IsNull || selector.IsNull) return false;
+        var extracted = Extract(source, selector, false, operation[0] == '#');
+        return !extracted.IsNull && !Scalar(extracted.AsJsonb());
     }
     internal static int? Index(string input)
     {

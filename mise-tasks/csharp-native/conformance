@@ -3,14 +3,18 @@
 #MISE description="Explicit opt-in: attempt selected C# corpus files; unsupported behavior fails"
 #USAGE flag "--all" help="Attempt every pinned SQL corpus file (incomplete experiment will fail)"
 #USAGE flag "--suite <name>" help="One directory of complete frozen corpus files"
+#USAGE flag "--match <pattern>" help="Complete frozen files whose basenames match this glob"
 #USAGE flag "--file <path>" help="One complete .test file; default is the shared scalar foundation supplement"
 require_relative "../../impl/csharp-native/Tools/tasks"
 files = ENV["usage_file"] ? [ENV.fetch("usage_file")] : []
 suite = ENV["usage_suite"]
-abort "--suite cannot be combined with --file or --all" if suite && (!files.empty? || ENV["usage_all"] == "true")
+pattern = ENV["usage_match"]
+abort "Choose only one of --suite, --match, --file, or --all" if [suite, pattern, (!files.empty? ? true : nil), (ENV["usage_all"] == "true" ? true : nil)].compact.length > 1
 if ENV["usage_all"] == "true"
   abort "--all cannot be combined with file arguments" unless files.empty?
   files = Dir.glob(File.join(CSharpNativeTasks.baseline_spec, "conformance/suites/**/*.test")).sort
+elsif pattern
+  files = Dir.glob(File.join(CSharpNativeTasks.baseline_spec, "conformance/suites/**/*.test")).select { |path| File.fnmatch?(pattern, File.basename(path), File::FNM_EXTGLOB) }.sort
 elsif suite
   base = File.join(CSharpNativeTasks.baseline_spec, "conformance/suites")
   directory = File.expand_path(suite, base)

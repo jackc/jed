@@ -1,6 +1,6 @@
 namespace Jed;
 
-/// <summary>An owned file credential. Dispose it after open/create completes; database handles retain only their unwrapped data key.</summary>
+/// <summary>An owned file credential. Dispose it after open/create completes; local handles retain only their unwrapped data key; remote handles also retain an owned credential copy for transport reconnection.</summary>
 public sealed class DatabaseCredential : IDisposable
 {
     internal StorageCredential Value { get; }

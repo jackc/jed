@@ -28,15 +28,22 @@ internal sealed class JsonPathParser
             var op = Current.Kind is "symbol" or "name" ? TextEncoding.FoldName(Current.Text) : "";
             var precedence = op switch { "||" => 1, "&&" => 2, "==" or "!=" or "<>" or "<" or "<=" or ">" or ">=" or "starts" or "like_regex" => 3, "+" or "-" => 4, "*" or "/" or "%" => 5, _ => 0 };
             if (precedence < minimum) break;
-            position++; Enter(); chain++;
+            position++;
+            if (precedence != 3) { Enter(); chain++; }
             PathExpr right;
-            if (op == "starts") { Expect("with"); right = Primary(); if (right.Op != "variable" && !(right.Op == "literal" && right.Value!.Kind == SqlJsonKind.String)) throw Syntax(); }
+            if (op == "starts")
+            {
+                Expect("with"); if (Current.Kind is not ("variable" or "string")) throw Syntax();
+                right = Current.Kind == "variable" ? new("variable", Current.Text, []) : new("literal", "", [], SqlJsonNode.String(Current.Text)); position++;
+            }
             else if (op == "like_regex")
             {
                 if (Current.Kind != "string") throw Syntax(); right = new("literal", "", [], SqlJsonNode.String(Current.Text)); position++;
                 var flags = "";
                 if (Take("flag")) { if (Current.Kind != "string") throw Syntax(); flags = Current.Text; position++; }
                 if (flags.Any(c => !"ismxq".Contains(c))) throw new SqlException("42601", "invalid regular expression option");
+                if (flags.Contains('x') && !flags.Contains('q')) throw Errors.Unsupported("expanded JSON path regular expressions");
+                _ = RegexProgram.Compile(right.Value!.Text!, flags, jsonPath: true);
                 if (left.Predicate) throw Syntax(); left = new("regex", string.Concat("ismxq".Where(flags.Contains)), [left, right]); continue;
             }
             else right = Expr(precedence + 1);
@@ -46,7 +53,7 @@ internal sealed class JsonPathParser
         }
         depth -= chain; return left;
     }
-    private PathExpr Primary()
+    private PathExpr Primary(bool allowUnknown = true)
     {
         var token = Current; position++; PathExpr result; var grouped = false;
         if (token.Kind == "symbol" && token.Text is "+" or "-")
@@ -58,9 +65,13 @@ internal sealed class JsonPathParser
         }
         if (token.Kind == "symbol" && token.Text == "!")
         {
-            if (!Is("(") && !Is("exists")) throw Syntax(); Enter(); var predicate = Primary(); depth--; if (!predicate.Predicate) throw Syntax(); return new("!", "", [predicate]);
+            if (!Is("(") && !Is("exists")) throw Syntax(); Enter();
+            PathExpr predicate;
+            if (Take("(")) { predicate = Expr(1); Expect(")"); }
+            else predicate = Primary(false);
+            depth--; if (!predicate.Predicate) throw Syntax(); return new("!", "", [predicate]);
         }
-        if (token.Text == "(") { Enter(); result = Expr(1); Expect(")"); depth--; grouped = true; }
+        if (token.Kind == "symbol" && token.Text == "(") { Enter(); result = Expr(1); Expect(")"); depth--; grouped = true; }
         else if (token.Kind == "string") result = new("literal", "", [], SqlJsonNode.String(token.Text));
         else if (token.Kind == "number") result = new("literal", "", [], SqlJsonNode.Numeric(ExactDecimal.Parse(token.Text)));
         else if (token.Kind == "variable") result = new("variable", token.Text, []);
@@ -70,7 +81,7 @@ internal sealed class JsonPathParser
         else if (token.Text is "null" or "true" or "false") result = new("literal", "", [], token.Text == "null" ? SqlJsonNode.Null : SqlJsonNode.Boolean(token.Text == "true"));
         else if (token.Text.Equals("exists", StringComparison.OrdinalIgnoreCase)) { Expect("("); Enter(); var value = Expr(1); Expect(")"); depth--; if (value.Predicate) throw Syntax(); result = new("exists", "", [value]); }
         else throw Syntax();
-        if (grouped && Take("is")) { Expect("unknown"); if (!result.Predicate) throw Syntax(); result = new("unknown", "", [result]); grouped = false; }
+        if (allowUnknown && grouped && Take("is")) { Expect("unknown"); if (!result.Predicate) throw Syntax(); result = new("unknown", "", [result]); grouped = false; }
         while (true)
         {
             if (Take("."))
@@ -91,7 +102,23 @@ internal sealed class JsonPathParser
                 if (!quoted && Take("("))
                 {
                     member = TextEncoding.FoldName(member); var arguments = new List<PathExpr> { result };
-                    if (!Take(")")) { do { arguments.Add(Expr(1)); } while (Take(",")); Expect(")"); }
+                    if (!Take(")"))
+                    {
+                        do
+                        {
+                            if (member == "datetime")
+                            {
+                                if (Current.Kind != "string") throw Syntax(); arguments.Add(new("literal", "", [], SqlJsonNode.String(Current.Text))); position++;
+                            }
+                            else
+                            {
+                                var negative = Take("-"); if (!negative) Take("+");
+                                if (Current.Kind != "number" || Current.Text.Any(c => !char.IsAsciiDigit(c)) || Current.Text.Length > 1 && Current.Text[0] == '0') throw Syntax();
+                                var number = ExactDecimal.Parse(Current.Text); position++; arguments.Add(new("literal", "", [], SqlJsonNode.Numeric(negative ? number.Negate() : number)));
+                            }
+                        } while (Take(","));
+                        Expect(")");
+                    }
                     var supported = new[] { "type", "size", "double", "ceiling", "floor", "abs", "keyvalue", "bigint", "boolean", "integer", "number", "string", "date", "decimal", "datetime", "time", "time_tz", "timestamp", "timestamp_tz" };
                     if (!supported.Contains(member, StringComparer.Ordinal)) throw Syntax();
                     var maximum = member == "decimal" ? 3 : member is "datetime" or "time" or "time_tz" or "timestamp" or "timestamp_tz" ? 2 : 1;

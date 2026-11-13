@@ -20,7 +20,7 @@ internal static class SequenceExecution
             {
                 // Ordinary WITH bodies see earlier siblings; recursive bodies also see
                 // their own name. Nested queries inherit precisely this lexical scope.
-                writes |= Query(definition.Query, visible, depth + 1);
+                writes |= definition.Mutation is not null || Query(definition.Query, visible, depth + 1);
                 visible.Add(definition.Name);
             }
             foreach (var item in query.Items) writes |= Expression(item.Expression, visible, depth);
@@ -77,6 +77,7 @@ internal static class SequenceExecution
                     return writes;
                 }
                 case DerivedRelation derived: return Query(derived.Query, visible, depth + 1);
+                case GroupedRelation group: return Relation(group.Source, visible, depth);
                 case JoinedRelation join: return Relation(join.Left, visible, depth) | Relation(join.Right, visible, depth) | Expression(join.On, visible, depth);
                 case SetRelation set: return Query(set.Left, visible, depth + 1) | Query(set.Right, visible, depth + 1);
                 default: return false;
@@ -123,7 +124,8 @@ internal static partial class StatementExecution
         var serialType = definition.Type switch { "serial" or "serial4" => "i32", "bigserial" or "serial8" => "i64", "smallserial" or "serial2" => "i16", _ => null };
         if (serialType is not null && (definition.Default is not null || definition.Identity)) throw Errors.Syntax("multiple defaults or identities");
         var type = SqlTypes.ParseSpec(serialType ?? definition.Type, pending.Catalog.NamedType);
-        if (serialType is null && !definition.Identity) return WithDefault(new(definition.Name, type, definition.NotNull), definition.Default, definition.DefaultText, meter, pending.Catalog);
+        if (serialType is null && !definition.Identity) return WithDefault(ColumnCollation(pending, new(definition.Name, type, definition.NotNull), definition.Collation, meter), definition.Default, definition.DefaultText, meter, pending.Catalog);
+        if (definition.Collation is not null) throw Errors.Type("COLLATE requires text or text[]");
         if (!type.Type.IsInteger()) throw new SqlException(SqlStates.InvalidParameterValue, "identity column type must be integer");
         var options = definition.Sequence ?? new SequenceOptions();
         var names = (reserved ?? []).ToHashSet(StringComparer.Ordinal);

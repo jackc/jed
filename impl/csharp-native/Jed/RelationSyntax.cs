@@ -1,12 +1,14 @@
 namespace Jed;
 
 internal abstract record RelationSyntax;
+internal sealed record GroupedRelation(RelationSyntax Source) : RelationSyntax;
 internal sealed record LateralRelation(RelationSyntax Source) : RelationSyntax;
 internal sealed record AliasedRelation(RelationSyntax Source, string Alias, string[]? ColumnAliases) : RelationSyntax;
 internal sealed record SetRelation(SelectSyntax Left, SelectSyntax Right, string Operation, bool All) : RelationSyntax;
 internal sealed record ValuesRelation(Expression[][] Values) : RelationSyntax;
 internal sealed record TableRelation(string Name, string? Alias = null, string[]? ColumnAliases = null) : RelationSyntax;
-internal sealed record FunctionRelation(Expression Function, string? Alias = null, string[]? ColumnAliases = null) : RelationSyntax;
+internal sealed record RecordColumnSyntax(string Name, string TypeName);
+internal sealed record FunctionRelation(Expression Function, string? Alias = null, string[]? ColumnAliases = null, RecordColumnSyntax[]? Definitions = null) : RelationSyntax;
 internal sealed record DerivedRelation(SelectSyntax Query, string? Alias = null, string[]? ColumnAliases = null) : RelationSyntax;
 internal sealed record JoinedRelation(RelationSyntax Left, RelationSyntax Right, string Kind, Expression? On, string[]? Using = null, bool Natural = false) : RelationSyntax;
 
@@ -14,10 +16,15 @@ internal sealed partial class Parser
 {
     private RelationSyntax FromRelation()
     {
-        var left = RelationFactor();
+        var left = JoinedFromRelation();
+        while (Eat(",")) left = new JoinedRelation(left, JoinedFromRelation(), "cross", null);
+        return left;
+    }
+    private RelationSyntax JoinedFromRelation()
+    {
+        var left = RelationFactor(); if (left is GroupedRelation leading) left = leading.Source;
         while (true)
         {
-            if (Eat(",")) { left = new JoinedRelation(left, RelationFactor(), "cross", null); continue; }
             var natural = Eat("natural");
             var explicitKind = Is("left") || Is("right") || Is("full") || Is("inner") || Is("cross");
             var kind = explicitKind ? Take().Text : "inner";
@@ -28,6 +35,7 @@ internal sealed partial class Parser
                 break;
             }
             var right = RelationFactor(); Expression? predicate = null; string[]? usingColumns = null;
+            if ((kind == "cross" || natural) && (Is("on") || Is("using"))) throw Errors.Syntax("CROSS/NATURAL JOIN cannot have ON or USING");
             if (Eat("on")) predicate = Expr();
             else if (Eat("using"))
             {
@@ -57,7 +65,15 @@ internal sealed partial class Parser
         RelationSyntax source;
         if (Eat("("))
         {
-            source = Is("select") || Is("values") || Is("with") ? new DerivedRelation(Select()) : FromRelation();
+nesting++; Depth(nesting);
+if (Is("select") || Is("values") || Is("with")) source = new DerivedRelation(Select());
+else
+{
+    var group = JoinedFromRelation();
+    if (group is not JoinedRelation) throw Errors.Syntax("parenthesized FROM requires a join");
+    source = new GroupedRelation(group);
+}
+nesting--;
             Expect(")");
         }
         else
@@ -65,20 +81,50 @@ internal sealed partial class Parser
             var name = QualifiedName();
             if (Eat("("))
             {
+                if (name == "json_table") source = new FunctionRelation(JsonTable());
+                else
+                {
                 var args = new List<Expression>();
-                if (!Eat(")")) { do { args.Add(Expr()); } while (Eat(",")); Expect(")"); }
+                if (!Eat(")"))
+                {
+                    do
+                    {
+                        if (token.Kind is TokenKind.Word or TokenKind.QuotedName && Peek().Text == "=>") { var label = Name(); Expect("=>"); args.Add(Node("named", label, Expr())); }
+                        else args.Add(Expr());
+                    } while (Eat(","));
+                    Expect(")");
+                }
                 source = new FunctionRelation(Node("call", name, args.ToArray()));
+                }
             }
             else source = new TableRelation(name);
         }
-        var alias = Eat("as") ? Name() : token.Kind == TokenKind.QuotedName || token.Kind == TokenKind.Word && !Clause(token.Text) ? Name() : null;
-        string[]? columns = null;
-        if (alias is not null && Eat("(")) { var names = new List<string>(); do { names.Add(Name()); } while (Eat(",")); Expect(")"); columns = names.ToArray(); }
+        var explicitAlias = Eat("as");
+        var alias = explicitAlias && Is("(") ? null : explicitAlias ? Name() : token.Kind == TokenKind.QuotedName || token.Kind == TokenKind.Word && !Clause(token.Text) ? Name() : null;
+        string[]? columns = null; RecordColumnSyntax[]? definitions = null;
+        if ((alias is not null || explicitAlias) && Eat("("))
+        {
+            var names = new List<string>(); var fields = new List<RecordColumnSyntax>(); bool? typed = null;
+            do
+            {
+                var fieldName = Name(); var hasType = !Is(",") && !Is(")");
+                if (typed.HasValue && typed.Value != hasType) throw Errors.Syntax("inconsistent column definition list"); typed = hasType;
+                if (hasType) fields.Add(new(fieldName, TypeName())); else names.Add(fieldName);
+            } while (Eat(","));
+            Expect(")");
+            if (typed == true)
+            {
+                if (source is not FunctionRelation { Function.Text: "unnest" or "json_to_record" or "json_to_recordset" or "jsonb_to_record" or "jsonb_to_recordset" }) throw Errors.Syntax("column definition list requires a record-returning function");
+                if (fields.Select(field => field.Name).Distinct(StringComparer.Ordinal).Count() != fields.Count) throw new SqlException("42701", "duplicate column name");
+                definitions = fields.ToArray();
+            }
+            else columns = names.ToArray();
+        }
         if (lateral && source is not (DerivedRelation or FunctionRelation)) throw Errors.Syntax("LATERAL requires query or function");
         source = source switch
         {
             TableRelation table => table with { Alias = alias, ColumnAliases = columns },
-            FunctionRelation function => function with { Alias = alias, ColumnAliases = columns },
+            FunctionRelation function => function with { Alias = alias, ColumnAliases = columns, Definitions = definitions },
             DerivedRelation derived => derived with { Alias = alias, ColumnAliases = columns },
             _ => alias is null ? source : new AliasedRelation(source, alias, columns)
         };

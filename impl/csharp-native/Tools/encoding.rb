@@ -37,6 +37,27 @@ module CSharpNativeEncoding
       { "source" => relative, "sha256" => Digest::SHA256.file(path).hexdigest, "data" => TomlRB.load_file(path) }
     end
     File.write(File.join(CSharpNativeTasks::BUILD, "timezone-vectors.json"), JSON.generate({ "semantic_revision" => CSharpNativeTasks::BASELINE.fetch("semantic_revision"), "files" => timezone }))
+    collation = %w[compiler sortkey bundle].map do |name|
+      relative = "collation/vectors/#{name}.toml"
+      path = File.join(spec, relative)
+      { "source" => relative, "sha256" => Digest::SHA256.file(path).hexdigest, "data" => TomlRB.load_file(path) }
+    end
+    File.write(File.join(CSharpNativeTasks::BUILD, "collation-vectors.json"), JSON.generate({ "semantic_revision" => CSharpNativeTasks::BASELINE.fetch("semantic_revision"), "files" => collation }))
+    regex = %w[program_vectors match_vectors similar_vectors].map do |name|
+      relative = "regex/#{name}.toml"
+      path = File.join(spec, relative)
+      { "source" => relative, "sha256" => Digest::SHA256.file(path).hexdigest, "data" => TomlRB.load_file(path) }
+    end
+    File.write(File.join(CSharpNativeTasks::BUILD, "regex-vectors.json"), JSON.generate({ "semantic_revision" => CSharpNativeTasks::BASELINE.fetch("semantic_revision"), "files" => regex }))
+    gin = %w[gin_jsonb_terms gin_posting_runs].map do |name|
+      relative = "encoding/#{name}.toml"
+      path = File.join(spec, relative)
+      { "source" => relative, "sha256" => Digest::SHA256.file(path).hexdigest, "data" => TomlRB.load_file(path) }
+    end
+    File.write(File.join(CSharpNativeTasks::BUILD, "gin-vectors.json"), JSON.generate({ "semantic_revision" => CSharpNativeTasks::BASELINE.fetch("semantic_revision"), "files" => gin }))
+    memory = "cost/memory_sizes.toml"
+    memory_path = File.join(spec, memory)
+    File.write(File.join(CSharpNativeTasks::BUILD, "memory-vectors.json"), JSON.generate({ "semantic_revision" => CSharpNativeTasks::BASELINE.fetch("semantic_revision"), "source" => memory, "sha256" => Digest::SHA256.file(memory_path).hexdigest, "data" => TomlRB.load_file(memory_path) }))
     puts "Prepared #{files.length} complete pinned encoding fixture files"
     destination
   end

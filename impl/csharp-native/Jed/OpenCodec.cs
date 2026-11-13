@@ -84,7 +84,7 @@ internal static class OpenCodec
             elements.Add(nulls.Length != 0 && (nulls[i / 8] & (128 >> (i % 8))) != 0 ? SqlValue.Null(type.Element!) : StoredValues.ReadBody(ref reader, type.Element!, depth));
         return SqlValue.Array(new(type.Element!, elements, dimensions, bounds, true));
     }
-    internal static void Key(WireWriter writer, SqlValue value)
+    internal static void Key(WireWriter writer, SqlValue value, Collation? collation = null)
     {
         if (value.Type.Kind == SqlKind.Array)
         {
@@ -93,7 +93,7 @@ internal static class OpenCodec
             foreach (var element in array.Values)
             {
                 writer.Byte(element.IsNull ? (byte)2 : (byte)1);
-                if (!element.IsNull) writer.Bytes(KeyEncoding.Encode(element));
+                if (!element.IsNull) writer.Bytes(KeyEncoding.Encode(element, collation: collation));
             }
             writer.Byte(0); writer.Byte((byte)array.Rank);
             for (var i = 0; i < array.Rank; i++) { writer.U32((uint)array.Dimensions[i]); writer.Bytes(KeyEncoding.Integer(array.LowerBounds[i], 4)); }

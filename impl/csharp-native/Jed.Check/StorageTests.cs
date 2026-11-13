@@ -54,6 +54,7 @@ internal static class StorageTests
         }
         await Cache();
         await Commit(empty);
+        await TrailingTruncation(empty);
         await Leaves(fixtureRoot);
         await Trees(empty, fixtureRoot);
         await CacheRaces();
@@ -371,11 +372,34 @@ internal static class StorageTests
         catch (IOException) { }
     }
 
+    private static async Task TrailingTruncation(byte[] empty)
+    {
+        foreach (var fail in new[] { false, true })
+        {
+            var image = new byte[100 * 256]; empty.CopyTo(image, 0);
+            var meta = new StorageMeta(256, 1, 2, 100, 0, 1);
+            var before = new StorageRecovered(meta, 0, 1, [2], new(Enumerable.Range(3, 97).Select(id => (uint)id)), []);
+            await using var store = new RecordingStore(image) { FailResize = fail };
+            var writer = new StorageCommitter(new StoragePager(store, 256), before);
+            var allocation = new StorageAllocation(before, eagerReclaim: false);
+            var root = allocation.AddPage(StorageFormat.EncodePage(256, new(1, 0, 0, 0), []));
+            var plan = allocation.Prepare(root, 1, truncate: true);
+            Corpus.Equal(4u, plan.Meta.PageCount, "only previously free tail trimmed");
+            await writer.CommitAsync(plan);
+            Corpus.Equal("sync", store.Events[^2], "truncation follows durable barrier");
+            Corpus.Equal("grow", store.Events[^1], "physical resize is final operation");
+            Corpus.Equal(fail ? 100L * 256 : 68L * 256, await store.GetLengthAsync(), "one geometric growth step retained after shrink");
+            Corpus.Equal(false, writer.IsPoisoned, "failed optional shrink does not poison durable commit");
+            Corpus.Equal(2UL, writer.Current.Meta.TransactionId, "shrink failure still publishes successful commit");
+        }
+    }
+
     private sealed class RecordingStore(byte[] initial) : IBlockStore
     {
         private readonly MemoryBlockStore inner = new(initial);
         internal readonly List<string> Events = [];
         internal bool FailSync;
+        internal bool FailResize;
         internal uint? FailReadPage;
         public ValueTask ReadAsync(long offset, Memory<byte> destination, CancellationToken cancellationToken = default)
         {
@@ -389,7 +413,9 @@ internal static class StorageTests
         public ValueTask<long> GetLengthAsync(CancellationToken cancellationToken = default) => inner.GetLengthAsync(cancellationToken);
         public ValueTask SetLengthAsync(long length, CancellationToken cancellationToken = default)
         {
-            Events.Add("grow"); return inner.SetLengthAsync(length, cancellationToken);
+            Events.Add("grow");
+            if (FailResize) throw new IOException("injected resize failure");
+            return inner.SetLengthAsync(length, cancellationToken);
         }
         public ValueTask SyncAsync(CancellationToken cancellationToken = default)
         {

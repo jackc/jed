@@ -102,13 +102,14 @@ internal static class PageWire
         var length = BinaryPrimitives.ReadUInt32BigEndian(prefix);
         ValidateLength(length); // reject a hostile size before reading/allocating the body
         var bytes = new byte[(int)length + 4]; prefix.CopyTo(bytes, 0);
-        await stream.ReadExactlyAsync(bytes.AsMemory(4), cancellationToken).ConfigureAwait(false);
-        return Decode(bytes, pageSize);
+        try { await stream.ReadExactlyAsync(bytes.AsMemory(4), cancellationToken).ConfigureAwait(false); return Decode(bytes, pageSize); }
+        finally { if (bytes[4] == 1) System.Security.Cryptography.CryptographicOperations.ZeroMemory(bytes); }
     }
     internal static async ValueTask WriteAsync(Stream stream, PageWireMessage message, int pageSize = 0, CancellationToken cancellationToken = default)
     {
         var bytes = Encode(message, pageSize);
-        await stream.WriteAsync(bytes, cancellationToken).ConfigureAwait(false);
+        try { await stream.WriteAsync(bytes, cancellationToken).ConfigureAwait(false); }
+        finally { if (message.Code == 1) System.Security.Cryptography.CryptographicOperations.ZeroMemory(bytes); }
     }
     private static void ValidateLength(uint length)
     {

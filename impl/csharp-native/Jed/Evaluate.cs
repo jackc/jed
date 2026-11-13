@@ -9,18 +9,34 @@ internal static partial class Evaluate
         if (expression.Op == "initplan") return expression.Subquery!.Value;
         if (expression.Op == "in_init") return SubqueryExecution.In(expression, meter, row);
         if (expression.Op == "constant") return expression.Constant;
+        if (expression.Op == "collate") return Expr(expression.Args[0], meter, filter, row);
         if (expression.Op == "column") return row is null ? throw new InvalidOperationException("column outside row") : row[expression.Slot];
-        if (expression.Op == "promote") return Resolve.Cast(Expr(expression.Args[0], meter, row: row), expression.Type);
-        if (!entered) meter.Charge(expression.Function?.Cost ?? Costs.OperatorEval);
-        if (expression.Op == "quantified_init") return OpenOperators.QuantifiedValues(expression.Text, Expr(expression.Args[0], meter, row: row), expression.Subquery!.Values, meter);
+        if (expression.Op == "promote") return TemporalText.Cast(Expr(expression.Args[0], meter, row: row), expression.Type, meter);
+        if (!entered) meter.Charge(expression.Op == "in_list" ? (expression.Args.Length - 2) * Costs.OperatorEval : expression.Function?.Cost ?? Costs.OperatorEval);
+        if (expression.Op == "in_list") return LiteralMembership(expression, Expr(expression.Args[0], meter, row: row), meter);
+        if (expression.Op == "quantified_init") return OpenOperators.QuantifiedValues(expression.Text, Expr(expression.Args[0], meter, row: row), expression.Subquery!.Values, meter, expression.Collation);
         if (expression.Op is "array" or "row" or "field" or "subscript") return OpenExpression.Evaluate(expression, meter, row);
         if (expression.Op == "float_widen") return Resolve.Cast(Expr(expression.Args[0], meter, row: row), expression.Type);
+        if (expression.Op is "json_sql" or "is_json") return JsonSql.Evaluate(expression, meter, row);
+        if (expression.Similar is not null) return SimilarFunctions.Call(expression, expression.Args.Select(argument => Expr(argument, meter, row: row)).ToArray(), meter);
+        if (expression.Regex is not null)
+        {
+            var values = expression.Args.Select(argument => Expr(argument, meter, row: row)).ToArray();
+            return RegexFunctions.Call(expression, values, meter);
+        }
         if (expression.Op == "call")
         {
             var args = expression.Args.Select(a => Expr(a, meter, row: row)).ToArray();
+            if (expression.ArrayArguments)
+            {
+                if (args[^1].IsNull && expression.Text != "format") return SqlValue.Null(expression.Type);
+                args = args.Take(args.Length - 1).Concat(args[^1].IsNull ? [] : args[^1].AsArray().Values).ToArray();
+            }
             if (expression.Function!.Nulls == "propagates" && args.Any(a => a.IsNull)) return SqlValue.Null(expression.Type);
-            var result = ScalarFunctions.Call(expression.Text, args, expression.Type, meter);
-            if (expression.Text is "array_append" or "array_prepend" or "array_cat" or "to_char" or "json_build_array" or "jsonb_build_array" or "json_build_object" or "jsonb_build_object" or "to_json" or "to_jsonb" or "array_to_json" or "row_to_json" or "json_object" or "jsonb_object" or "jsonb_set" or "jsonb_set_lax" or "jsonb_insert" or "jsonb_path_query_array" or "jsonb_path_query_array_tz") Growth(expression.GrowthOperands ?? expression.Args, result, meter);
+            if (expression.Function.Variadic && expression.Text is "json_build_array" or "jsonb_build_array" or "json_build_object" or "jsonb_build_object") args = args[0].AsArray().Values.ToArray();
+            var result = expression.Text == "width_bucket_array" ? OpenFunctions.WidthBucket(args, meter, expression.Collation) : ScalarFunctions.Call(expression.Text, args, expression.Type, meter);
+            var grows = expression.Text is "encode" or "overlay" or "quote_literal" or "quote_nullable" or "quote_ident" or "like_escape" or "concat" or "similar_to_escape" or "array_append" or "array_prepend" or "array_cat" or "to_char" or "json_build_array" or "jsonb_build_array" or "json_build_object" or "jsonb_build_object" or "to_json" or "to_jsonb" or "array_to_json" or "row_to_json" or "json_object" or "jsonb_object" or "jsonb_set" or "jsonb_set_lax" or "jsonb_insert" or "jsonb_path_query_array" or "jsonb_path_query_array_tz" or "json_scalar" or "json_serialize";
+            if (grows && !(expression.Text == "jsonb_set_lax" && args[2].IsNull && !args[4].IsNull && args[4].AsText() is "delete_key" or "return_target")) Growth(expression.GrowthOperands ?? expression.Args, result, meter);
             return result;
         }
         if (expression.Op == "case")
@@ -40,7 +56,7 @@ internal static partial class Evaluate
                 var value = Expr(argument, meter, row: row);
                 if (value.IsNull) continue;
                 if (expression.Op == "coalesce") return value;
-                if (best.IsNull || (expression.Op == "greatest" ? Compare(value, best, meter) > 0 : Compare(value, best, meter) < 0)) best = value;
+                if (best.IsNull || (expression.Op == "greatest" ? CollationRules.Compare(value, best, expression.Collation, meter) > 0 : CollationRules.Compare(value, best, expression.Collation, meter) < 0)) best = value;
             }
             return best;
         }
@@ -51,9 +67,9 @@ internal static partial class Evaluate
             case "extract": return TemporalFunctions.Extract(expression.Text, left, meter);
             case "cast":
                 var cast = TemporalText.Cast(left, expression.Type, meter);
-                if ((expression.Type == SqlType.Text && (left.Type.Kind == SqlKind.Array || left.Type == SqlType.Bytea || left.Type == SqlType.Jsonb)) || expression.Type == SqlType.Json && left.Type == SqlType.Jsonb)
+                if ((expression.Type == SqlType.Text && (left.Type.Kind == SqlKind.Array || left.Type == SqlType.Bytea || left.Type == SqlType.Jsonb)) || expression.Type == SqlType.Json && left.Type == SqlType.Jsonb || left.Type.Kind == SqlKind.Array && left.Type.Element == SqlType.Bytea && expression.Type.Kind == SqlKind.Array && expression.Type.Element == SqlType.Text)
                     Growth(expression.GrowthOperands ?? expression.Args, cast, meter);
-                if (!left.IsNull && left.Type == SqlType.Text && expression.Type == SqlType.Jsonpath && !(expression.GrowthOperands ?? expression.Args).All(Constant))
+                if (!left.IsNull && left.Type == SqlType.Text && expression.Type == SqlType.Jsonpath)
                 { meter.Charge(System.Text.Encoding.UTF8.GetByteCount(left.AsText()) * Costs.JsonpathCompile); meter.Guard(); }
                 return Resolve.ApplyModifier(cast, expression.Target!);
             case "is_boolean":
@@ -95,12 +111,12 @@ internal static partial class Evaluate
             return SqlValue.Boolean(expression.Op == "not_distinct" ? equal : !equal);
         }
         if (expression.Op == "at_time_zone") return TemporalFunctions.AtTimeZone(left, right, meter);
-        if (expression.Op == "quantified") return OpenOperators.QuantifiedValue(expression.Text, left, right, meter);
+        if (expression.Op == "quantified") return OpenOperators.QuantifiedValue(expression.Text, left, right, meter, expression.Collation);
         if (expression.Op == "json_path_binary") return JsonPathFunctions.Operator(expression.Text, left, right, meter);
         if (expression.Op == "json_binary")
         {
             var result = JsonOps.Binary(expression.Text, left, right);
-            if (expression.Text == "||") Growth(expression.GrowthOperands ?? expression.Args, result, meter);
+            if (expression.Text == "||" || JsonOps.ExtractionBuilds(expression.Text, left, right)) Growth(expression.GrowthOperands ?? expression.Args, result, meter);
             return result;
         }
         if (expression.Op == "open_predicate") return OpenFunctions.Predicate(expression.Text, left, right);
@@ -114,6 +130,7 @@ internal static partial class Evaluate
             Growth(expression.GrowthOperands ?? expression.Args, result, meter); return result;
         }
         if (expression.Op == "like") return SqlValue.Boolean(TextFunctions.Like(left.AsText(), right.AsText()));
+        if (expression.Op == "ilike") return SqlValue.Boolean(TextFunctions.Like(UnicodeData.Fold(left.AsText(), false, meter.Unicode, false), UnicodeData.Fold(right.AsText(), false, meter.Unicode, false)));
         if (expression.Op is "+" or "-" or "*" or "/" or "%" or "^")
         {
             if (expression.Type.IsFloat()) return SqlValue.Float(expression.Op == "^" ? FloatValue.Power(left.AsFloat(), right.AsFloat()) :
@@ -144,7 +161,7 @@ internal static partial class Evaluate
             catch (OverflowException) { throw Errors.Overflow(); }
         }
         if (left.Type.Kind == SqlKind.Composite) return OpenExpression.Compare(expression.Op, left, right);
-        var order = Compare(left, right, meter);
+        var order = expression.Op is "<" or "<=" or ">" or ">=" ? CollationRules.Compare(left, right, expression.Collation, meter) : Compare(left, right, meter);
         return SqlValue.Boolean(expression.Op switch
         {
             "=" => order == 0, "<>" or "!=" => order != 0,
@@ -153,8 +170,8 @@ internal static partial class Evaluate
         });
     }
 
-    internal static bool Constant(Resolved expression) => expression.Op is not ("column" or "outer" or "correlated" or "in_correlated" or "quantified_correlated" or "quantified_init" or "subquery" or "parameter_host" or "stable_date" or "initplan" or "in_init") &&
-        !(expression.Op == "call" && expression.Text is "now" or "clock_timestamp" or "current_date" or "nextval" or "currval" or "setval") && expression.Args.All(Constant);
+    internal static bool Constant(Resolved expression) => !expression.ParameterUnbound && expression.Op is not ("column" or "outer" or "correlated" or "in_correlated" or "quantified_correlated" or "quantified_init" or "subquery" or "parameter_host" or "stable_date" or "initplan" or "in_init") &&
+        !(expression.Op == "call" && expression.Text is "now" or "clock_timestamp" or "current_date" or "nextval" or "currval" or "setval" or "lastval" or "uuidv4" or "gen_random_uuid" or "uuidv7" or "current_setting") && expression.Args.All(Constant);
     internal static void Growth(Resolved[] operands, SqlValue result, Meter meter)
     {
         if (result.IsNull || operands.All(Constant)) return;
@@ -184,7 +201,7 @@ internal static partial class Evaluate
             return left.ByteSpan.SequenceCompareTo(right.ByteSpan);
         }
         var a = left.AsText(); var b = right.AsText();
-        var length = Math.Min(left.TextBytes, right.TextBytes);
+        var length = Math.Min(a.EnumerateRunes().Count(), b.EnumerateRunes().Count());
         meter?.Charge(Math.Max(0, length - 1) * Costs.VarlenCompare);
         meter?.Guard();
         // Valid Unicode scalar order equals UTF-8 byte order. Iterate scalars

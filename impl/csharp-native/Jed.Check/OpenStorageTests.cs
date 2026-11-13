@@ -8,13 +8,14 @@ internal static class OpenStorageTests
         using var baseline = JsonDocument.Parse(File.ReadAllBytes(Path.Combine(root, "impl/csharp-native/baseline.json")));
         var revision = baseline.RootElement.GetProperty("semantic_revision").GetString();
         var directory = Path.Combine(root, $"impl/csharp-native/.build/baseline-{revision}/spec/fileformat/fixtures");
+        var unicode = UnicodeData.Load(File.ReadAllBytes(Path.Combine(directory, "../../collation/fixtures/unicode.jucd")));
         var names = new[] { "array_table", "array_pk_table", "array_composite_table", "composite_type_table", "nested_composite_table", "composite_array_field_table", "composite_range_field_table", "composite_pk_table", "composite_key_table", "range_table", "range_pk_table", "gin_array_table", "gist_range_table", "collation_array_table", "json_table", "jsonb_table" };
         var rows = 0; var cells = 0;
         foreach (var name in names)
         {
             await using var device = new FileBlockStore(Path.Combine(directory, name + ".jed"), FileMode.Open, readOnly: true);
             var recovered = await StorageRecovery.OpenAsync(device); var pager = new StoragePager(device, recovered.Meta.PageSize);
-            var catalog = await Catalog.ReadAsync(pager, recovered.Meta);
+            var catalog = (await Catalog.ReadAsync(pager, recovered.Meta)).BindCollations(unicode);
             foreach (var table in catalog.Tables)
             {
                 var tree = new StorageTree(pager, table.LeafSchema(), table.Root, recovered.Meta.PageCount);
@@ -33,7 +34,7 @@ internal static class OpenStorageTests
                         }
                         cells++;
                     }
-                    if (table.PrimaryKey.Length != 0 && table.PrimaryKey.All(index => table.Columns[index].Collation is null))
+                    if (table.PrimaryKey.Length != 0)
                     {
                         var rewritten = table.EncodeRow(values);
                         Corpus.Equal(Convert.ToHexString(record.Key), Convert.ToHexString(rewritten.Key), $"{name} exact row key bytes");
@@ -42,6 +43,6 @@ internal static class OpenStorageTests
                 }
             }
         }
-        Console.WriteLine($"PASS open value cells: {names.Length} shared golden files, {rows} rows, {cells} byte-exact cells and recursive text inverses; uncollated primary keys checked, collated primary key bytes pending");
+        Console.WriteLine($"PASS open value cells: {names.Length} shared golden files, {rows} rows, {cells} byte-exact cells and recursive text inverses; all primary key bytes checked including collated keys");
     }
 }

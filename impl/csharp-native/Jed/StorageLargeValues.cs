@@ -117,8 +117,12 @@ internal static class StorageLargeValues
         body.CopyTo(result, 1); return result;
     }
 
-    internal static async ValueTask WalkChainAsync(byte[] cell, StoragePager pager, uint pageCount,
+    internal static ValueTask WalkChainAsync(byte[] cell, StoragePager pager, uint pageCount,
         Action<uint, ReadOnlyMemory<byte>> visit, CancellationToken token)
+        => WalkBoundChainAsync(cell, pager, pageCount, (reference, slab) => visit(reference.Page, slab), token);
+
+    internal static async ValueTask WalkBoundChainAsync(byte[] cell, StoragePager pager, uint pageCount,
+        Action<StoragePageReference, ReadOnlyMemory<byte>> visit, CancellationToken token)
     {
         var info = Inspect(cell, pager.Encrypted); var remaining = info.Stored;
         var current = new StoragePageReference(info.First, info.Tag); var seen = new HashSet<uint>();
@@ -135,7 +139,7 @@ internal static class StorageLargeValues
                 throw StorageFormat.Corrupt("nonzero overflow padding");
             var nextTag = pager.Encrypted ? bytes.Slice(16, 16) : default;
             if (pager.Encrypted && header.Next == 0 && !StorageFormat.IsZero(nextTag.Span)) throw StorageFormat.Corrupt("nonzero overflow tail tag");
-            visit(current.Page, bytes.Slice(start, length)); remaining -= length; current = new(header.Next, nextTag);
+            visit(current, bytes.Slice(start, length)); remaining -= length; current = new(header.Next, nextTag);
         }
     }
 
@@ -210,10 +214,19 @@ internal sealed partial class StorageTree
     }
     private int FreshPageCount(StorageRecord record) => record.FreshChains is null ? 0 : checked((int)record.FreshChains.Sum(payload =>
         payload is null ? 0L : StorageLargeValues.Slabs(payload.Length, pager.PayloadCapacity - (pager.Encrypted ? 16 : 0))));
+    private async ValueTask RetireResidentChains(Ref reference, HashSet<uint> dead, CancellationToken token)
+    {
+        if (reference.Resident is not { IsLeaf: true } resident) return;
+        foreach (var row in resident.Records())
+            for (var column = 0; column < row.Cells.Length; column++)
+                if (row.FreshChains?[column] is not null && StorageLargeValues.External(row.Cells[column]))
+                    await StorageLargeValues.WalkChainAsync(row.Cells[column]!, pager, pageCount, (id, _) => dead.Add(id), token).ConfigureAwait(false);
+    }
     private async ValueTask RetireChains(StorageRecord record, HashSet<uint> dead, CancellationToken token, StorageRecord? replacement = null)
     {
         for (var i = 0; i < record.Cells.Length; i++)
-            if (schema.Columns[i].Width == 0 && StorageLargeValues.External(record.Cells[i]) && record.FreshChains?[i] is null)
+            if (schema.Columns[i].Width == 0 && StorageLargeValues.External(record.Cells[i]) &&
+                StorageLargeValues.Inspect(record.Cells[i]!, pager.Encrypted).First != 0)
             {
                 if (replacement?.Cells[i] is { } kept && replacement.FreshChains?[i] is null && kept.AsSpan().SequenceEqual(record.Cells[i])) continue;
                 await StorageLargeValues.WalkChainAsync(record.Cells[i]!, pager, pageCount, (id, _) => dead.Add(id), token).ConfigureAwait(false);

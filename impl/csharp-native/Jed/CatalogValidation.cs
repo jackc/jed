@@ -6,10 +6,10 @@ internal static class CatalogValidation
     internal static void Validate(Catalog catalog)
     {
         var tables = Unique(catalog.Tables, item => item.Name);
-        var types = Unique(catalog.Types ?? [], item => item.Name);
+        var types = Unique((catalog.Types ?? []).Concat(catalog.TypeParent?.Types ?? []), item => item.Name);
         var sequences = Unique(catalog.Sequences ?? [], item => item.Name);
         var collations = Unique(catalog.Collations ?? [], item => item.Name);
-        var views = Unique(catalog.Views ?? [], item => item.Name);
+        var views = Unique((catalog.Views ?? []).Concat(catalog.TypeParent?.Views ?? []), item => item.Name);
         if (collations.Values.Count(item => item.IsDefault) > 1) throw StorageFormat.Corrupt("multiple default collations");
         var visiting = new HashSet<string>(StringComparer.Ordinal); var visited = new HashSet<string>(StringComparer.Ordinal);
         void Type(SqlType type, int depth)
@@ -56,14 +56,15 @@ internal static class CatalogValidation
                 switch (dependency.Kind)
                 {
                     case 0:
-                        if (!tables.TryGetValue(dependency.Name, out var table) || dependency.Columns.Any(column => !table.Columns.Any(c => c.Name == column)))
+                        var table = tables.GetValueOrDefault(dependency.Name) ?? catalog.TypeParent?.Tables.FirstOrDefault(item => item.Name == dependency.Name);
+                        if (table is null || dependency.Columns.Any(column => !table.Columns.Any(c => c.Name == column)))
                             throw StorageFormat.Corrupt("missing view table or column dependency");
                         break;
                     case 1:
                         if (!views.ContainsKey(dependency.Name)) throw StorageFormat.Corrupt("missing view dependency");
                         View(dependency.Name, depth + 1); break;
                     case 2:
-                        if (!sequences.ContainsKey(dependency.Name)) throw StorageFormat.Corrupt("missing view sequence dependency"); break;
+                        if (!sequences.ContainsKey(dependency.Name) && !(catalog.TypeParent?.Sequences ?? []).Any(sequence => sequence.Name == dependency.Name)) throw StorageFormat.Corrupt("missing view sequence dependency"); break;
                     case 3:
                         if (!types.ContainsKey(dependency.Name)) throw StorageFormat.Corrupt("missing view type dependency"); break;
                     default: throw StorageFormat.Corrupt("invalid view dependency kind");
@@ -82,7 +83,7 @@ internal static class CatalogValidation
         return map;
     }
 
-    private static void Statistics(CatalogStatistic[] items, Dictionary<string, CatalogTable> tables)
+    internal static void Statistics(CatalogStatistic[] items, Dictionary<string, CatalogTable> tables)
     {
         foreach (var group in items.GroupBy(item => (item.Table, item.Column)))
         {
@@ -90,7 +91,8 @@ internal static class CatalogValidation
                 throw StorageFormat.Corrupt("invalid statistic owner");
             var summaries = group.Where(item => item.Kind == 0).ToArray();
             if (summaries.Length != 1) throw StorageFormat.Corrupt("missing or duplicate statistic summary");
-            var summary = summaries[0]; var type = table.Columns[group.Key.Column].Type.Type;
+            var summary = summaries[0]; var column = table.Columns[group.Key.Column]; var type = column.Type.Type;
+            var orderAvailable = column.Collation is null or "C" || column.CollationData is not null && !column.CollationSkew;
             var termEligible = type.Kind == SqlKind.Jsonb || type.Kind == SqlKind.Array && type.Element!.Kind is
                 SqlKind.Boolean or SqlKind.Date or SqlKind.Timestamp or SqlKind.Timestamptz or SqlKind.I16 or SqlKind.I32 or SqlKind.I64 or SqlKind.F32 or SqlKind.F64 or SqlKind.Decimal or SqlKind.Text or SqlKind.Bytea or SqlKind.Uuid or SqlKind.Interval;
             var distributionEligible = type.Kind is not (SqlKind.Composite or SqlKind.Array or SqlKind.Json or SqlKind.Jsonb or SqlKind.Jsonpath);
@@ -116,13 +118,13 @@ internal static class CatalogValidation
                     {
                         var reader = new WireReader(item.Value); var value = StoredValues.Decode(ref reader, type); reader.Finish();
                         if (value.IsNull || !StoredValues.Encode(value).AsSpan().SequenceEqual(item.Value)) throw StorageFormat.Corrupt("noncanonical statistic value");
-                        key = KeyEncoding.Encode(value);
-                        if (key.Length > 128 || kind == 1 && (item.SampleFrequency == 0 || item.SampleFrequency > summary.SampleNonnullRows))
+                        key = KeyEncoding.Encode(value, collation: table.Columns[group.Key.Column].CollationData);
+                        if (orderAvailable && key.Length > 128 || kind == 1 && (item.SampleFrequency == 0 || item.SampleFrequency > summary.SampleNonnullRows))
                             throw StorageFormat.Corrupt("invalid statistic distribution value");
                     }
                     var frequency = kind == 1 ? item.SampleFrequency : item.RowCount;
                     if (kind != 2 && !keys.Add(Convert.ToHexString(key))) throw StorageFormat.Corrupt("duplicate statistic value");
-                    if (prior is not null && (kind == 2 ? prior.AsSpan().SequenceCompareTo(key) > 0 :
+                    if (prior is not null && (kind == 3 || orderAvailable) && (kind == 2 ? prior.AsSpan().SequenceCompareTo(key) > 0 :
                         frequency > priorCount || frequency == priorCount && prior.AsSpan().SequenceCompareTo(key) >= 0))
                         throw StorageFormat.Corrupt("unordered statistic values");
                     prior = key; priorCount = frequency;
