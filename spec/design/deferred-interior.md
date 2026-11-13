@@ -1,6 +1,12 @@
-# Deferred interior pages (proposal)
+# Deferred interior pages (ratified 2026-11-13)
 
-**Status: specified, prototyped in the Go core only.** The prototype runs behind
+**Status: ratified, landing as `format_version` 53 together with
+[manifest-crc32.md](manifest-crc32.md).** The two were sequenced against each other and the answer
+is that they are one change: both rewrite the meta's manifest area, and the narrower manifest entry
+that change brings buys back almost exactly what this one's remap region spends (§9.2). Landing them
+apart would spend two format bumps and write this section's capacity arithmetic twice.
+
+**Prototyped in the Go core only.** The prototype runs behind
 `JED_DEFER_INTERIOR=on`; nothing is in `format.md`, the Ruby reference, or the Rust and TS cores, and
 the prototype does not bump the format version. **§9 is the byte specification** the other cores
 implement — ratified 2026-11-13, answering §7's questions 1 and 5, and *not* the prototype's layout:
@@ -478,15 +484,25 @@ why one rule replaces the prototype's two). Entries are written ascending from `
 cap`, sorted by `(parent, slot)`, and the rest of the region is zero. The inline manifest keeps the
 front of the area, its capacity now
 
-    I = floor((A − entry_size × cap) / 12)
+    I = floor((A − entry_size × cap) / manifest_entry_size)
 
-| page size | variant | `cap` | `I` (was) |
-|---|---|---|---|
-| 256 | plaintext | 6 | 11 (16) |
-| 4096 | plaintext | 134 | 224 (336) |
-| 8192 | plaintext | 270 | 452 (677) |
-| 1024 | encrypted | 11 | 50 (74) |
-| 8192 | encrypted | 103 | 448 (671) |
+where `manifest_entry_size` is **8** under v53 ([manifest-crc32.md](manifest-crc32.md) §2), against
+12 through v52.
+
+| page size | variant | `cap` | `I` (v53) | v52 | this change alone |
+|---|---|---|---|---|---|
+| 256 | plaintext | 6 | 16 | 16 | 11 |
+| 4096 | plaintext | 134 | 336 | 336 | 224 |
+| 8192 | plaintext | 270 | 678 | 677 | 452 |
+| 1024 | encrypted | 11 | 75 | 74 | 50 |
+| 8192 | encrypted | 103 | 672 | 671 | 448 |
+
+The last column is what this section said before the two changes were sequenced together, and is
+why they are: the region costs a third of the area, the narrower entry pays for almost exactly that
+third, and the inline capacity comes out **unchanged or one better than v52 at every page size**.
+Since the inline capacity is also the `synchronous = off` batch cap
+([validated-cow.md](validated-cow.md) §4), deferral lands here at no cost to batch length, where on
+its own it would have cut that cap by a third.
 
 The region is inside the encrypted meta's seal, like the rest of the page, and before its reserve.
 It is covered by the meta CRC-32 in both variants. There is **no marker byte**: the version fixes
@@ -495,8 +511,13 @@ from-scratch image (*From-scratch image*, format.md) changes only by its version
 exactly as v51 and v52 did. The **bootstrap** rule is extended: a zero-dirty-entry meta requires
 `remap_entries = 0` along with its other descriptor fields.
 
-If [manifest-crc32.md](manifest-crc32.md) lands as well, its 8-byte manifest entry makes `I` 678 at
-8 KiB plaintext rather than 452; nothing else here changes.
+**The page-header stamp.** v53 also spends the page header's two reserved bytes at offset 2 on
+`txid16`, a second and independent detector for a lost page write
+([manifest-crc32.md](manifest-crc32.md) §2.1). It touches nothing in this section: the stamp is
+checked only when a manifest entry is validated, and a **retained interior is never written and
+never listed**, so it keeps the older stamp of the commit that really wrote it and is never checked
+against a window it would fail. That scoping is a precondition of retention, not a consequence of
+it — a stamp checked on every page read would make §9.4 impossible.
 
 ### 9.3 Validation on open
 
@@ -632,6 +653,15 @@ costs 2 bytes an entry (10 against 8), which is ~20% of the capacity at a fixed 
 removing the one correctness rule in the design that reaches outside it into the free list.
 
 ### 9.8 What the landing change owes
+
+v53 is **one change carrying both this section and [manifest-crc32.md](manifest-crc32.md)**, so this
+list is the whole of it. That doc's own share is the 8-byte manifest entry, the `txid16` page-header
+stamp and its batch window, and the meta's offset 40 (the prototype's narrow-layout bit drops) and
+offset 48 (`manifest_crc64` → `manifest_crc32`, high 4 bytes reserved zero).
+
+**Every golden regenerates regardless of this section**, because the stamp changes the bytes of every
+page — so the from-scratch image no longer differs from v52 only by its version byte and meta CRC, as
+§9.2 says it would have on its own.
 
 Beyond the three cores and `verify.rb`:
 

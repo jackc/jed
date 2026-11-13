@@ -1,8 +1,12 @@
-# Commit manifest: record the page's CRC-32 (proposal)
+# Commit manifest: record the page's CRC-32 (ratified 2026-11-13)
 
-**Status: proposal, prototyped in the Go core only**, behind `JED_MANIFEST_CRC32=on`. Nothing here is
-in `format.md`, the Ruby reference, or the Rust and TS cores, and the prototype does not bump the
-format version.
+**Status: ratified, landing as part of `format_version` 53 together with
+[deferred-interior.md](deferred-interior.md).** The two were sequenced against each other and the
+answer is that they are one change: both rewrite the meta's manifest area, and landing them apart
+would spend two format bumps and write that area's capacity arithmetic twice (§3). Nothing here is
+in `format.md`, the Ruby reference, or the Rust and TS cores yet; the Go prototype behind
+`JED_MANIFEST_CRC32=on` is the measurement artifact and is superseded by this spec, which adds a
+page-header stamp the prototype does not have (§2.1).
 
 ## 1. The problem
 
@@ -36,25 +40,80 @@ A manifest entry becomes `page_index u32, crc32 u32` (8 bytes instead of 12).
   additionally requires the field to equal the entry.
 - **Encrypted page:** the page has no plaintext checksum, so the entry's `crc32` is the CRC-32/IEEE
   of the stored ciphertext. This replaces the CRC-64 pass, one for one, and stays keyless.
-- **Manifest-overflow chain:** `manifest_crc64` (meta offset 48) becomes the CRC-32/IEEE of the same
-  `page_id || page` stream, in the same 8-byte field.
+- **Manifest-overflow chain:** `manifest_crc64` (meta offset 48) becomes `manifest_crc32`, the
+  CRC-32/IEEE of the same `page_id || page` stream, in the low 4 bytes of the same 8-byte field. The
+  high 4 bytes are reserved, zero, and validated zero.
 
-The prototype marks a meta with narrow entries by the top bit of its dirty-count field (offset 40), so
-both layouts read without a version bump. A real format version would drop the bit.
+The prototype marked a meta with narrow entries by the top bit of its dirty-count field (offset 40),
+so both layouts could read without a version bump. **v53 drops that bit**: the version fixes the
+layout, and offset 40 is a plain count again.
 
 What the entry binds is unchanged: the content this transaction wrote, so an older but internally
-valid page at a reused address is rejected. The strength drops from 64 bits to 32: such a page is
-wrongly accepted with probability 2⁻³², per lost page write, per power failure. Neither checksum is
-authentication.
+valid page at a reused address is rejected.
+
+### 2.1 The stale-page stamp (new in this spec)
+
+Narrowing the entry alone would drop the strength of that rejection from 64 bits to 32: a lost page
+write that leaves an older, internally valid page behind is wrongly accepted with probability 2⁻³²,
+per lost page write, per power failure. **The maintainer ratified a second, independent detector
+rather than a wider hash** (2026-11-13), because any wider value costs a second pass over the page,
+which is the entire CPU win.
+
+**Page header offset 2**, two bytes reserved and zero through v52
+([../fileformat/format.md](../fileformat/format.md) *Page header*), becomes `txid16` (u16): the low
+16 bits of the txid of the commit that wrote the page. It sits inside the region the page's own
+CRC-32 already covers, so it costs no extra bytes anywhere and no extra hashing.
+
+Recovery, validating a manifest entry, now makes **two independent checks**: the page's content
+against the entry's `crc32`, and the page's `txid16` against the commit window. A stale page left by
+a lost write carries the stamp of the commit that really wrote it, so it fails the second check
+outright — **detected with certainty**, not with probability — unless it is from a commit exactly
+65,536·k earlier, where the 32-bit CRC is the backstop. The effective strength is ≈2⁻⁴⁸ in general
+and exact for the realistic case.
+
+**The window.** Under `synchronous = on` a manifest describes one commit and the check is equality
+with that commit's low 16 bits. Under `synchronous = off` a cumulative manifest lists every page
+written since the durability floor ([validated-cow.md](validated-cow.md) §4), and each page carries
+the stamp of its *own* commit, so the check is membership in `(floor_txid, newest_txid]`:
+
+    (txid16 − floor_txid) mod 2¹⁶  ∈  [1, newest_txid − floor_txid]
+
+A batch is bounded by the inline manifest capacity (§3), at most 1,016 commits, far below 2¹⁶, so
+the window's low-16 values are distinct and the check is exact rather than approximate.
+
+**Scope.** Every page carrying a page header is stamped, uniformly, so the rule is total and the
+writer needs no per-type case. The stamp is checked **only** during manifest validation — an
+ordinary page read is validated by its CRC-32, as today. That scoping is what keeps the stamp
+compatible with every rule that lets a page survive a commit unwritten: a retained interior under
+[deferred-interior.md](deferred-interior.md) §9.4, a shared overflow chain under
+[large-values.md](large-values.md) §15, and a kept catalog chain all keep an older stamp, and none
+of them is written or listed, so none is ever checked against a window it would fail.
+
+Neither checksum is authentication. In an encrypted file the page's 128-bit AEAD tag already
+provides that, and the stamp rides inside the sealed plaintext.
 
 ## 3. Effect
 
-- **Capacity.** The inline manifest of an 8 KiB meta holds 1,016 entries instead of 677 (678 instead
-  of 452 beside a remap list, [deferred-interior.md](deferred-interior.md) §9.2). The inline capacity is
-  also the `synchronous = off` batch cap, so a batch holds half again as many pages.
+- **Capacity.** A narrower entry buys back almost exactly what the deferred-interior remap region
+  spends. The region takes a third of the manifest area ([deferred-interior.md](deferred-interior.md)
+  §9.2); the entry shrinks 12 → 8. Landed together, the inline manifest capacity is **unchanged or
+  one better than v52 at every page size**:
+
+  | page size | variant | remap `cap` | inline `I` (v53) | v52 | deferred alone |
+  |---|---|---|---|---|---|
+  | 256 | plaintext | 6 | 16 | 16 | 11 |
+  | 4096 | plaintext | 134 | 336 | 336 | 224 |
+  | 8192 | plaintext | 270 | 678 | 677 | 452 |
+  | 1024 | encrypted | 11 | 75 | 74 | 50 |
+  | 8192 | encrypted | 103 | 672 | 671 | 448 |
+
+  The inline capacity is also the `synchronous = off` batch cap, so deferred interiors cost nothing
+  there when the two land together, where landing deferral alone would have cut it by a third. This
+  is the concrete reason the sequencing answer is "one version, both at once."
 - **CPU.** In the Go core's commit profile the CRC-64 fell from 0.61 s to 0.03 s over 6,000
   single-row commits (0.28 s to 0.05 s with deferred interiors). Commit time, `fsync` off, one run
-  each, with deferred interiors on: 243 → 228 µs, 328 → 295 µs, 303 → 254 µs.
+  each, with deferred interiors on: 243 → 228 µs, 328 → 295 µs, 303 → 254 µs. The stamp is a 2-byte
+  store inside a buffer the writer already owns and does not appear in the profile.
 - **Bytes written** are unchanged.
 
 The CRC-64 that remains is the page service's commit-resolution digest of the meta page, a wire
@@ -68,19 +127,25 @@ with deferred interiors, `sim:sweep 1..200 all go` (4,400 traces) and the random
 test. With the switch off the unit tests and an 880-trace sweep pass.
 
 Not run: the simulator's regression traces (their Ruby checker reads 12-byte entries), anything
-cross-core, the page-service process corpus.
+cross-core, the page-service process corpus. **None of this covers §2.1**, which postdates the
+prototype and is unmeasured.
 
-## 5. Open questions
+## 5. Decided
 
-1. Whether 32 bits is enough. The alternative that keeps 64 bits and stays fast in every core is two
-   XXH32 passes with different seeds (about 1.4 µs per page in Node); it needs a new hand-written
-   hash in three cores and the Ruby reference.
-2. Whether the page header checksum itself should change. Its slow paths are the hand-written
-   slicing-by-8 in Rust and the browser.
-3. The commit-resolution digest could move to CRC-32 with the wire protocol's next revision.
+1. ~~Whether 32 bits is enough.~~ **Answered 2026-11-13:** 32 bits, plus the independent `txid16`
+   stamp of §2.1. The alternative that keeps 64 bits in the entry — two seeded XXH32 passes — was
+   declined because it needs a new hand-written hash in three cores and the Ruby reference and
+   reintroduces the second pass over the page that this change exists to remove.
+2. **Open:** whether the page header checksum itself should change. Its slow paths are the
+   hand-written slicing-by-8 in Rust and the browser. Out of scope for v53.
+3. **Open:** the commit-resolution digest could move to CRC-32 with the wire protocol's next
+   revision. Out of scope for v53.
 
 ## 6. Work if adopted
 
-`format.md` (*Commit manifest*, meta table, inline capacity), `validated-cow.md`, `encrypted.md` §6,
-`page-service.md` and the `spec/pageservice/` fixtures, the `cow_*` fixtures, the Ruby reference and
-`verify.rb`, the three cores, the simulator's checkers.
+Folded into the single v53 landing change ([deferred-interior.md](deferred-interior.md) §9.8), which
+owns the shared surface. This change's own share: `format.md` (*Page header* for the stamp,
+*Commit manifest*, the meta table at offset 40 and 48, inline capacity), `validated-cow.md`
+(including the §4 batch window), `encrypted.md` §6, `page-service.md` and the `spec/pageservice/`
+fixtures, the `cow_*` fixtures, the Ruby reference and `verify.rb`, the three cores, the simulator's
+checkers. Every golden regenerates regardless, since the stamp changes every page's bytes.

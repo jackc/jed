@@ -259,27 +259,37 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   - [ ] _follow-on:_ an integrity fixture with a stored primary-key column (a `text` key), so `row_key_not_primary_key` is produced again; the v52 fixtures' integer keys are elided and cannot disagree with their rows. _(size: S)_
   - [ ] _follow-on:_ have the integrity check verify the content-dependent choices (the stored prefix is the longest one; each region has its smallest kind). _(size: S)_
   - [ ] _follow-on:_ fixed-length keys for index trees whose key columns are all `NOT NULL` (needs `ALTER TABLE … DROP NOT NULL` to rebuild the index), and a shared prefix in interior pages (leaf-structural.md §5, §7).
-- [ ] **Deferred interior pages (would be format v53)** — a commit writes only the nodes whose own
-  content changed; an interior whose only change is a child's page keeps its page and the meta
-  carries a `(parent, slot) → page` remap list, emptied by a fold. Halves the bytes of a single-row
-  commit (48.5 → 24.2, 84.1 → 40.1, 96.1 → 48.1 KB, re-measured at `03cc46acc`). **The byte format
-  is ratified** ([deferred-interior.md §9](spec/design/deferred-interior.md)) and deliberately not
-  yet in `format.md`; the Go prototype behind `JED_DEFER_INTERIOR=on` keys entries the *old* way (by
-  child page), so landing it is a rewrite of `remap.go`, not a port. Owes: §9 moved into format.md
-  as the next version, Rust + TS + `verify.rb`, the `cow_deferred.jed` fixture family (no
-  from-scratch golden can carry the region), page-service validation of a client delta's list plus
-  wire fixtures, the simulator's `replay` step at a remap entry — a new kind of bound pointer, which
-  the encryption security review owes an opinion on — a race review of the commit path, and
-  `unassignPages` undoing a retained interior (§9.8). _(size: L)_
-- [ ] **Commit manifest: record the page's CRC-32** — a manifest entry carries the CRC-64/ECMA-182 of
-  each page, which every body page already has a CRC-32/IEEE for, so a commit hashes each page twice
-  and the CRC-64 byte-at-a-time loop was the largest single CPU cost of a small commit in the Go core
-  (0.76 GB/s Go, 0.33 Node, against 52 GB/s for a platform CRC-32).
-  → [manifest-crc32.md](spec/design/manifest-crc32.md), prototyped behind `JED_MANIFEST_CRC32=on` in
-  the Go core only. **Sequence it against the item above**, which it collides with: both rewrite the
-  meta's manifest area, a CRC-32 entry is 8 bytes instead of 12 (so the inline capacity beside a
-  remap list goes 452 → 678 at 8 KiB, deferred-interior.md §9.2), and landing them separately spends
-  two format bumps where one would do. _(size: M + decision)_
+- [ ] **Format v53: deferred interior pages + the narrow commit manifest** — **sequenced together and
+  ratified 2026-11-13**; they are one change, not two. Both rewrite the meta's manifest area, and
+  landing them apart would spend two format bumps and write the capacity arithmetic twice.
+  → [deferred-interior.md §9](spec/design/deferred-interior.md), [manifest-crc32.md](spec/design/manifest-crc32.md)
+  - **Deferred interiors** — a commit writes only the nodes whose own content changed; an interior
+    whose only change is a child's page keeps its page and the meta carries a `(parent, slot) → page`
+    remap list, emptied by a fold. Halves the bytes of a single-row commit (48.5 → 24.2, 84.1 → 40.1,
+    96.1 → 48.1 KB, re-measured at `03cc46acc`). The Go prototype behind `JED_DEFER_INTERIOR=on` keys
+    entries the *old* way (by child page), so landing it is a rewrite of `remap.go`, not a port.
+  - **Narrow manifest** — an entry becomes `page_index u32, crc32 u32` (8 bytes, not 12), copied from
+    the page's existing header checksum instead of a second CRC-64 pass, which was the largest single
+    CPU cost of a small commit in the Go core. Prototyped behind `JED_MANIFEST_CRC32=on`, Go only.
+  - **Decision taken:** 32-bit entries, plus a new independent detector the prototypes do not have —
+    the page header's two reserved bytes at offset 2 become `txid16`, the low 16 bits of the writing
+    commit's txid, checked against the commit window only during manifest validation
+    (manifest-crc32.md §2.1). A stale page left by a lost write is then caught with certainty rather
+    than at 2⁻³². Costs no entry bytes and no extra hashing. The 64-bit alternative (two seeded XXH32
+    passes) was declined: a new hand-written hash in three cores plus the Ruby reference, and it
+    reintroduces the second pass the change exists to remove.
+  - **Why together, concretely:** the remap region costs a third of the manifest area and the narrower
+    entry pays for almost exactly that third, so the inline capacity — which is also the
+    `synchronous = off` batch cap — comes out **unchanged or one better than v52 at every page size**
+    (678 vs 677 at 8 KiB plaintext). Deferral alone would have cut it 677 → 452.
+  - Owes: §9 moved into format.md as v53, Rust + TS + the Ruby reference + `verify.rb`, every golden
+    regenerated (the stamp changes every page's bytes), the `cow_deferred.jed` fixture family (no
+    from-scratch golden can carry the region), page-service validation of a client delta's list plus
+    wire fixtures, the simulator's `replay` step at a remap entry — a new kind of bound pointer, which
+    the encryption security review owes an opinion on — a race review of the commit path, and
+    `unassignPages` undoing a retained interior (§9.8). The stamp itself is **unmeasured**: it
+    postdates both prototypes. _(size: L)_
+
 - [ ] **Upgrade path for older files + an on-disk stability commitment (a 1.0 blocker)** — a reader
   accepts only the current `format_version` ([format.md](spec/fileformat/format.md)), so every bump
   strands existing files, and the CLI's `--dump` needs the old binary to cross. Decide the 1.0 policy:
