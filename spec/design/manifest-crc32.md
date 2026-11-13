@@ -49,8 +49,8 @@ authentication.
 
 ## 3. Effect
 
-- **Capacity.** The inline manifest of an 8 KiB meta holds 1,016 entries instead of 677 (675 instead
-  of 450 beside a remap list, [deferred-interior.md](deferred-interior.md)). The inline capacity is
+- **Capacity.** The inline manifest of an 8 KiB meta holds 1,016 entries instead of 677 (678 instead
+  of 452 beside a remap list, [deferred-interior.md](deferred-interior.md) §9.2). The inline capacity is
   also the `synchronous = off` batch cap, so a batch holds half again as many pages.
 - **CPU.** In the Go core's commit profile the CRC-64 fell from 0.61 s to 0.03 s over 6,000
   single-row commits (0.28 s to 0.05 s with deferred interiors). Commit time, `fsync` off, one run

@@ -1,8 +1,12 @@
 # Deferred interior pages (proposal)
 
-**Status: proposal, prototyped in the Go core only**, behind `JED_DEFER_INTERIOR=on`. Nothing here is
-in `format.md`, the Ruby reference, or the Rust and TS cores, and the prototype does not bump the
-format version.
+**Status: specified, prototyped in the Go core only.** The prototype runs behind
+`JED_DEFER_INTERIOR=on`; nothing is in `format.md`, the Ruby reference, or the Rust and TS cores, and
+the prototype does not bump the format version. **§9 is the byte specification** the other cores
+implement — ratified 2026-11-13, answering §7's questions 1 and 5, and *not* the prototype's layout:
+it keys an entry by the parent page and child slot rather than the child's page id, which removes the
+held-id rule and §8.3's bug class by construction. Where §3 and §9 differ, §9 is the spec and §3 is
+the record of what was measured.
 
 **Its baseline moved.** The prototype was measured on top of the kept-chain free list
 ([free-list-kept-chain.md](free-list-kept-chain.md)), which has since been closed and removed;
@@ -52,7 +56,8 @@ page from disk consults the list.
 
 ## 3. What the prototype does
 
-**Meta page.** The inline manifest area of a meta ends with a 4-byte marker, a 4-byte count, and
+**Meta page** (the prototype's; §9.2 is the specified layout). The inline manifest area of a meta
+ends with a 4-byte marker, a 4-byte count, and
 before them the entries, sorted by disk page: `disk page`, `current page` (8 bytes), and in an
 encrypted file the current page's tag as well (24 bytes), since every pointer there binds the page it
 names. The region is 2,728 bytes from 4 KiB up: 340 entries in a plaintext meta, 113 in an encrypted
@@ -156,19 +161,25 @@ know the list; anything cross-core; the page-service process corpus; the race de
   generation). That is the independent checker, not the engine: the same run with migration (§8.4)
   disabled fails the identical 40, and `mise run sim:sweep 1..20 all go` — which does not re-decide
   recovery in Ruby — passes all 440 traces. Teaching the shared reference checker a Go-only
-  prototype's bytes is the wrong direction, so this stays open by choice.
+  prototype's bytes is the wrong direction, so this stays open by choice. §9 is what closes it: the
+  landing change teaches `verify.rb` a specified format, not a Go-only prototype's bytes.
 
 ## 7. Open questions
 
-1. **List capacity against manifest capacity.** Both live in the meta page. A larger list folds less
-   often; a smaller inline manifest overflows sooner.
+1. ~~**List capacity against manifest capacity.**~~ **Answered (§9.2, §9.7):** the list takes one
+   third of the manifest area at every page size. The two consumers need the meta at disjoint times,
+   so neither is squeezed.
 2. **Row counts.** Carrying per-table count changes beside the list would stop inserts and deletes
    writing the catalog page (about 8 KB of the 41 KB insert).
 3. **Leaf-sized writes remain.** An append still rewrites a whole leaf per tree. Closing that needs
    record-level logging, which this design does not attempt.
 4. **Page clients.** A client needs the owner's list to read interiors; `begin_read` already carries
-   the meta.
-5. Whether the list should be scoped per parent page, which would remove the held-id rule.
+   the meta. §9.8 states what the owner must validate in a client's delta; the wire fixtures are
+   still owed.
+5. ~~Whether the list should be scoped per parent page, which would remove the held-id rule.~~
+   **Answered: yes (§9.1, §9.5, §9.7).** An entry is keyed by `(parent page, child slot)`. The
+   held-id rule, the reverse index, the injectivity invariant and §8.3's bug all served the global
+   child-page key and are gone with it.
 
 ## 8. Re-baselined against incremental reclamation (2026-11-13)
 
@@ -350,3 +361,254 @@ the disk conformance corpus (677 passed, 0 failed), `mise run sim:sweep 1..20 al
 every oracle and profile, the `truncation` profile included), and `mise run stress` under the strict
 verifier (all three cores agree on the answer checksum). The default path — switch off — is
 unchanged and green. What remains open is §6's last bullet, now quantified there.
+
+## 9. The format (ratified 2026-11-13)
+
+This section is the **byte specification** the other cores implement. It is not in
+[../fileformat/format.md](../fileformat/format.md) yet and must not be until a core implements it:
+that doc is the contract the three cores and the Ruby reference already satisfy, and its "readers
+accept only the exact current version" rule would be false the moment it claimed a version nobody
+writes. The landing change moves this section into format.md as the next `format_version` (**53** as
+of this writing), teaches [../fileformat/verify.rb](../fileformat/verify.rb), regenerates the
+goldens, and brings all three cores up together.
+
+**It is not the prototype's layout.** §7's questions 1 and 5 are answered here, and answer 5 changes
+how an entry is keyed. The Go prototype keys the list by the *child's* on-disk page id, globally;
+this spec keys it by **the parent page and the child's slot**. That is the whole of §8.3's bug class
+and the held-id rule, removed by construction (§9.5). The prototype stays as it is — it is the
+measurement artifact §8.2 reports — and is brought to this keying in the landing change, or
+retired then.
+
+### 9.1 What an entry says
+
+> **`(parent, slot) → (page[, tag])`** — in the interior page whose index is `parent`, the child
+> pointer in slot `slot` names a page the node has since moved off. The subtree root is at `page`.
+> The pointer's own on-disk value is ignored.
+
+An interior node with `item_count = N` has `N + 1` child pointers (*Interior node*, format.md), so
+`slot` is in `[0, N]`. Resolution is **per page, one lookup, never transitive**: a reader reading the
+interior page at index `p` resolves its slot `i` through the entry `(p, i)` when one exists, and
+reads the resulting page's own pointers the same way. A page written fresh names its children
+directly and so keys no entries; a page that keys entries may itself be the target of another
+entry, which is an independent lookup, not a chain.
+
+**Scope.** Interior pages of a table B+tree and of a B-tree or GIN index (`page_type 3`) only.
+Not catalog pages: a tree root that moves rewrites the catalog chain, as today, and a chain whose
+bytes are unchanged is not rewritten (which is why a non-indexed single-row update writes no catalog
+page, §8.2). Not GiST pages: an R-tree is rewritten whole by every commit that touches it
+([incremental-reclaim.md](incremental-reclaim.md) §3). Not leaves — a leaf has no child pointers.
+
+### 9.2 Bytes
+
+Meta offset **60**, reserved zero through v52, becomes `remap_entries` (u32): the number of entries
+the slot carries.
+
+> **A pre-existing gap this field sits on.** format.md names *reserved fields* among what slot
+> selection validates, and [../fileformat/verify.rb](../fileformat/verify.rb) rejects a slot whose
+> bytes 60–63 are nonzero — but the Rust and TS cores never read them, so the reference and the
+> cores disagree today on whether a corrupt slot with a bit set there is a valid candidate, and so on
+> which generation a damaged file recovers. That is independent of this proposal and should be fixed
+> under v52, by giving Rust and TS the check Ruby already has, rather than by dropping Ruby's. Under
+> v53 the same check becomes `remap_entries ≤ cap` (§9.3).
+
+The entries occupy the **tail of the meta's manifest area**, which is
+`[64, page_size)` in a plaintext meta and `[96, page_size − 40)` in an encrypted one
+([../fileformat/encrypted.md](../fileformat/encrypted.md) §6) — call that area `[lo, hi)` and its
+size `A = hi − lo`. An entry is:
+
+| offset | size | field |
+|---|---|---|
+| 0 | 4 | `parent` (u32) — the interior page the pointer lives in |
+| 4 | 2 | `slot` (u16) — which child pointer |
+| 6 | 4 | `page` (u32) — where that subtree root is now |
+| 10 | 16 | `tag` — **encrypted files only**: the AEAD tag of `page`, as every bound pointer carries ([../fileformat/encrypted.md](../fileformat/encrypted.md) §2) |
+
+So `entry_size` is **10** bytes plaintext, **26** encrypted. A `u16` slot is enough at every legal
+page size: an interior payload is `8N + 4 + Σ sep_len ≤ C` (format.md *Interior node*), so
+`N ≤ 8189` at the 65,536-byte maximum. The region is the last
+`entry_size × cap` bytes of the area, where
+
+    cap = floor(floor(A / 3) / entry_size)
+
+— **one third of the manifest area, every page size** (answer to §7.1; §9.7 says why a third, and
+why one rule replaces the prototype's two). Entries are written ascending from `hi − entry_size ×
+cap`, sorted by `(parent, slot)`, and the rest of the region is zero. The inline manifest keeps the
+front of the area, its capacity now
+
+    I = floor((A − entry_size × cap) / 12)
+
+| page size | variant | `cap` | `I` (was) |
+|---|---|---|---|
+| 256 | plaintext | 6 | 11 (16) |
+| 4096 | plaintext | 134 | 224 (336) |
+| 8192 | plaintext | 270 | 452 (677) |
+| 1024 | encrypted | 11 | 50 (74) |
+| 8192 | encrypted | 103 | 448 (671) |
+
+The region is inside the encrypted meta's seal, like the rest of the page, and before its reserve.
+It is covered by the meta CRC-32 in both variants. There is **no marker byte**: the version fixes
+the layout, and a slot with no entries writes `remap_entries = 0` and a zero region — so a
+from-scratch image (*From-scratch image*, format.md) changes only by its version byte and meta CRC,
+exactly as v51 and v52 did. The **bootstrap** rule is extended: a zero-dirty-entry meta requires
+`remap_entries = 0` along with its other descriptor fields.
+
+If [manifest-crc32.md](manifest-crc32.md) lands as well, its 8-byte manifest entry makes `I` 678 at
+8 KiB plaintext rather than 452; nothing else here changes.
+
+### 9.3 Validation on open
+
+With the other header bounds, before the area is touched: `remap_entries ≤ cap`. Then, over the
+region: entries strictly ascending by `(parent, slot)`; `parent` and `page` both in
+`[first_body_page, page_count)`; `page ≠ parent`; `page` values pairwise distinct (every live page
+has exactly one parent pointer, so two entries can never name one page). Any failure makes the candidate
+structurally invalid and the other slot may be tried — the region is the meta slot's own bytes under
+its own CRC, like the inline manifest, not a separate chain validated after selection like the free
+list.
+
+A reader does **not** verify that a parent is reachable or is an interior page; an entry whose
+parent is never read is inert, and §9.5 is what makes sure there are none. When a pointer *is*
+resolved, the parent page must be `page_type 3` with `slot ≤ item_count`, else `XX001`. In an
+encrypted file the resolved pointer's tag is the entry's, and the target page must authenticate
+under it exactly as a pointer-bound page does.
+
+The list is applied everywhere an interior page's pointers are read from disk: the open-time
+skeleton read, a demand-paged interior fault, the integrity check, the free-list backstop rebuild's
+walk, and backup's walk. A page-identical backup copies the pinned generation's list into the
+copy's bootstrap meta.
+
+### 9.4 What a commit publishes
+
+Let `E₀` be the entry set of the snapshot being committed against. The commit computes, **before
+allocation**, in this order:
+
+1. **The migration page `M`** (§9.6): the top page of the file when it is not free and some lower
+   page is free, else 0.
+2. **Retention.** An interior node keeps its page iff (a) it replaces a persisted page one for one,
+   (b) its separator set is still that page's — no split, merge or rebalance below it changed the
+   separators, so the slot count and every slot index are fixed for that page's whole lifetime —
+   and (c) its page is not `M`.
+3. **The entry set `E`**: `E₀`, minus every entry whose `parent` page this commit **retires** — wrote
+   fresh elsewhere, merged away, or dropped with its table, i.e. every former parent that is no
+   longer a live interior of the new snapshot (§9.5) — plus `(P, i) → C` for every retained interior
+   `P` whose slot-`i` child this commit rewrote to `C`. An add overwrites an existing `(P, i)`, so a
+   child that moves repeatedly under one parent occupies one entry forever.
+4. **The fold test**: if `|E| > cap`, the commit **folds**.
+
+A **fold** writes fresh every **stale** interior — one that keys an entry in `E₀`, which is exactly
+an interior whose on-disk pointers disagree with the live tree — and every ancestor of one, along
+with everything the commit would write anyway; it retains nothing and publishes `remap_entries = 0`.
+A fold therefore costs paths to stale pages anywhere in the tree, not just under this commit's
+changes. That is the work today's commit does on every commit, paid once per fold instead.
+
+The decision is a pure function of `E₀`, the dirty-node structure, the committed free list and the
+high-water, all known before allocation, so it is identical in every core. After it, allocation,
+write order, the manifest, the meta and the barrier are unchanged
+([validated-cow.md](validated-cow.md)).
+
+**Relaxed batches.** Under `synchronous = off` a batch is open while its pending set is non-empty, so
+a relaxed commit must write at least one page: a commit with no dirty tree node rewrites the catalog
+chain instead of keeping it (§6; without the rule the simulator's durability oracle fails).
+
+**Live pages.** The count rule (format.md *Live page count*) is unchanged, but the delta counts a
+retained interior and a kept catalog chain as replaced, so the commit adds them back.
+
+### 9.5 Reclamation: no held pages
+
+The orphan set a commit lists ([incremental-reclaim.md](incremental-reclaim.md)) changes in exactly
+two ways:
+
+- **A retained interior's page is live**, at the page the *previous* snapshot's node holds, so it is
+  not an orphan and the walk must not list it (the prototype's `retainedIDs`). It also must not be
+  used as the walk's shared boundary: that boundary stops the walk *descending*, and the leaves and
+  overflow chains orphaned under a retained interior are reachable only through it (§8.3's recorded
+  wrong shortcut).
+- **Every entry whose parent the commit retires is dropped** (§9.4 step 3). The three ways a parent
+  leaves the tree — written fresh, merged away, dropped with its table — all orphan its page, so the
+  retired parents are exactly `E₀`'s parents that the orphan set contains, and the rule is total.
+  Note that the writer computes it from **its own mutation**, not from the orphan walk: every writer
+  knows which interiors it wrote fresh and which the tree lost, a page client included, so the drop
+  does not depend on enumerating orphans.
+
+Together these give the property the prototype's global keying could not: **no page is held off the
+free list by the list.** A parent's entries die in the same commit that orphans its page, and a
+commit never reuses a page it orphans (the orphan joins the list this commit persists, not the safe
+set it allocates from — format.md *Reclamation*), so a reused page can never be read through a
+surviving entry. There is no `held` set, no leak measure correction, and no allowance in the
+simulator's bounded-growth oracle (§5 needed one; this spec does not).
+
+The §8.3 bug class goes with it. That bug was the cost of keeping "the key is always what the
+on-disk pointer says" true across repeated moves — a reverse index, an injectivity invariant, and
+collision retirement. A `(parent, slot)` key is a position in a page whose bytes are fixed for the
+entry's lifetime (step 2b), so it never changes and the entry is a plain overwrite.
+
+**A page client** lists no orphans, but it still **drops** — by the rule above, which is local to
+its own mutation. It must: a retired parent's page is dead and unlisted only until the owner's
+backstop rebuild finds it, after which the page is reusable, and an entry that outlived it would
+then be applied to whatever interior landed there. What the client's commit does leave is the
+ordinary leak the rebuild already exists for: the retired page itself, on no list.
+
+### 9.6 Trailing truncation
+
+Trailing truncation cuts only the **contiguous** run of free pages below the high-water (format.md
+*Trailing truncation*), and deferral's whole point is that an interior does not move — so one
+retained interior at the top of the file pins its entire length, where without deferral the commit
+that rewrites it lands it on a low free page and the top drains on its own.
+
+So a commit names `M`, the top page of the file when it is not free (which is to say, when it is
+what blocks the run) and some lower page is free to land on, and refuses to retain the node whose
+page that is (§9.4 step 2c); the catalog chain is likewise rewritten when its root is `M`. The node
+is written fresh onto the lowest free page, its parent takes an entry, and the next commit's run
+reaches past it.
+
+Its four properties, measured in §8.4: it costs one page write per commit and **only while the file
+is blocked** (`M = 0` once the top is free); it is **monotone**, since the allocator draws the
+lowest free page and `M` is the top one; it needs **no state**, being computed from the committed
+free list and high-water the commit already holds; and it only ever moves a node the commit was
+going to serialize anyway. A blocker no statement touches is retried, free, on every commit until
+one does.
+
+The honest cost: a deferred file packs about 2% looser, because a retained interior or catalog page
+that is not the blocker does not migrate.
+
+### 9.7 Why these two answers
+
+**A third of the area, for the list (§7.1).** The two consumers need the meta at disjoint times. A
+deferring commit writes one to three pages, so its manifest has a handful of entries and fits inline
+at any sizing; the commits that fill an inline manifest are bulk transactions, which are exactly the
+commits that fold, so they publish no list at all. And an overflow manifest page costs one page
+write against the hundreds such a commit already writes. The list's own appetite is bounded the same
+way from the other side: folds amortize, so at the prototype's 8 KiB capacity they ran about one
+commit in a hundred, and doubling the region halves an already-negligible cost. A third of the area
+sits where neither consumer is squeezed, and — the reason to prefer it to the prototype's 2,728
+bytes — it is **one rule at every page size**, reproducing both the prototype's 8 KiB share and the
+"a third" rule it needed below 4 KiB for the simulator's small pages.
+
+**Per-parent keying (§7.5).** §9.5. The held-id rule, the reverse index, the injectivity invariant
+and §8.3's bug all exist to serve a global child-page key; a position key needs none of them. It
+costs 2 bytes an entry (10 against 8), which is ~20% of the capacity at a fixed region size, against
+removing the one correctness rule in the design that reaches outside it into the free list.
+
+### 9.8 What the landing change owes
+
+Beyond the three cores and `verify.rb`:
+
+- **Fixtures.** A from-scratch image has no entries, so no static golden can carry the region's
+  bytes; the list needs a commit history, like the `cow_*.jed` family. A `cow_deferred.jed` group
+  pinning (a) a single retained parent with one entry, (b) a repeated move overwriting one entry,
+  (c) a fold emptying the list, (d) a parent dropped by its own rewrite, and (e) the encrypted entry
+  with its tag, each selected and re-walked by the Ruby reference.
+- **The page service.** `begin_read` already carries the meta, so a client reads the list it needs;
+  the owner must **validate a client delta's list** — count against `cap`, ordering and bounds as
+  §9.3, plus: no entry's `parent` may be in the delta's own dirty-page set, since a page written
+  fresh names its children directly. The wire fixtures (`spec/pageservice/`) grow with it. A client
+  forgets the kept catalog chain on every reload, since another process may have rewritten it.
+- **The simulator.** The `replay` step must put an old page back at a remap entry — a new kind of
+  bound pointer, and in an encrypted file a case the security review owes an opinion on
+  ([encryption.md](encryption.md)). The bounded-growth oracle needs no allowance (§9.5).
+- **A race review** of the commit path, which sets a page id on the committing snapshot's own nodes
+  and swaps the resident list during planning (§6).
+- **`unassignPages`**, or its equivalent, must undo a retained interior when a plan is discarded.
+
+What it does **not** owe: row counts in the meta (§7.2), which would stop an insert writing the
+catalog page and is a separate change; and record-level logging (§7.3), which this design does not
+attempt.

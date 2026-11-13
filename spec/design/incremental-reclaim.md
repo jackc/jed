@@ -175,7 +175,11 @@ thing to reuse, and which the old rebuild had been healing — fixed in
 [deferred-interior.md](deferred-interior.md) §8.3. It also showed where this rule and that prototype
 pull against each other: trailing truncation cuts only a contiguous run of free pages, so one retained
 interior at the top pins a file's length. The prototype now moves that one page per commit
-([deferred-interior.md](deferred-interior.md) §8.4); nothing in this rule changes.
+([deferred-interior.md](deferred-interior.md) §8.4); nothing in this rule changes. The specified
+form of that proposal ([deferred-interior.md](deferred-interior.md) §9) touches this rule in exactly
+two places and holds no page off the list: a retained interior's page is live and must be kept out
+of the orphan set without becoming the walk's shared boundary, and every entry whose parent page is
+in the orphan set is dropped by the commit that lists it.
 
 The cost they each attack shrinks under this proposal anyway: the list is now about the size of the
 pages recent commits orphaned (plus whatever a delete-heavy commit freed), not up to one entry per
