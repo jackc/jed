@@ -2470,6 +2470,136 @@ impl RangeCursor {
     }
 }
 
+/// The room a sibling needs to take part in evening out: `C / LEAF_EVEN_ROOM` bytes free (format.md
+/// "Evening out with a sibling").
+const LEAF_EVEN_ROOM: usize = 8;
+
+/// Whether writing `key` into `leaf` is a **right-edge edit** (format.md "Split point"): the written
+/// record is the leaf's last, because `key` replaces its last key or sorts after it.
+fn at_right_edge(leaf: &Node, key: &[u8]) -> bool {
+    leaf.is_leaf() && leaf.len() > 0 && key >= leaf.key_at(leaf.len() - 1)
+}
+
+/// The two leaves and separator that replace children `j`, `j + 1` and separator `j` of a parent.
+type Evened = (usize, Arc<Node>, Vec<u8>, Arc<Node>);
+
+/// Try to even the overflowing leaf child `i` of `node` out with an adjacent sibling instead of
+/// splitting it (format.md "Evening out with a sibling"). `left` / `right` are the leaf's own
+/// two-way split halves. The right sibling is tried, then the left one; a right-edge edit tries the
+/// right one only, so an append to the tree's last leaf splits as it always did and reads no other
+/// leaf. A sibling takes part when its payload is at most `C − C / LEAF_EVEN_ROOM`; the two leaves'
+/// records are then split in two by the balanced rule, as the delete path's merge-overflow does
+/// ([`merge_at`]). A candidate fails when the pair has no two-way split that fits — it would have
+/// to go multi-way, which the parent's key count cannot absorb here — or when the new separator
+/// would overflow `node` ([`merge_at`]'s second abandon rule).
+///
+/// `node` is not modified. The halves give up their vectors only once a candidate has succeeded, so
+/// `None` leaves them as they were.
+#[allow(clippy::too_many_arguments)]
+fn even_leaves(
+    node: &Node,
+    i: usize,
+    left: &mut Arc<Node>,
+    right: &mut Arc<Node>,
+    right_edge: bool,
+    src: Option<&dyn LeafSource>,
+    cap: Cap,
+    shape: &LeafShape,
+) -> Result<Option<Evened>> {
+    let limit = cap.c - cap.c / LEAF_EVEN_ROOM;
+    for s in [Some(i + 1), i.checked_sub(1)].into_iter().flatten() {
+        if s >= node.children.len() || (s < i && right_edge) {
+            continue;
+        }
+        let sib = child(node, s, src)?;
+        if !sib.leaf_payload_below(limit + 1, cap, shape) {
+            continue;
+        }
+        let (mut sk, mut sv, sw) = sib.decoded_parts()?;
+        let own_left = left.keys.len();
+        let own = own_left + right.keys.len();
+        // The sibling's records come before the leaf's when it is the left one.
+        let before = if s < i { sk.len() } else { 0 };
+        let total = own + sk.len();
+        let mut weights: Vec<u32> = Vec::with_capacity(total);
+        if s < i {
+            weights.extend_from_slice(&sw);
+        }
+        weights.extend_from_slice(&left.weights);
+        weights.extend_from_slice(&right.weights);
+        if s > i {
+            weights.extend_from_slice(&sw);
+        }
+        let split = {
+            let key = |x: usize| -> &[u8] {
+                if x < before {
+                    &sk[x]
+                } else if x < before + own_left {
+                    &left.keys[x - before]
+                } else if x < before + own {
+                    &right.keys[x - before - own_left]
+                } else {
+                    &sk[x - own]
+                }
+            };
+            let row = |x: usize| -> &[Value] {
+                if x < before {
+                    &sv[x]
+                } else if x < before + own_left {
+                    &left.vals[x - before]
+                } else if x < before + own {
+                    &right.vals[x - before - own_left]
+                } else {
+                    &sv[x - own]
+                }
+            };
+            // The pair overflows, because the leaf alone does: `Whole` means a single record that
+            // fits no leaf, and `Multi` that no two halves fit. Either way the leaf splits.
+            let plan = leaf_split_point(&weights, &key, &row, cap, shape, None, None);
+            match plan.split {
+                LeafSplit::Two(m) => Some((m, key(m).len(), plan.halves)),
+                LeafSplit::Whole | LeafSplit::Multi(_) => None,
+            }
+        };
+        let Some((m, sep_len, halves)) = split else {
+            continue;
+        };
+        let j = i.min(s);
+        if interior_payload(cap, &node.keys) - node.keys[j].len() + sep_len > cap.c {
+            continue;
+        }
+        let l = Arc::get_mut(left).expect("a fresh split half is uniquely owned");
+        let r = Arc::get_mut(right).expect("a fresh split half is uniquely owned");
+        let mut keys = Vec::with_capacity(total);
+        let mut vals = Vec::with_capacity(total);
+        if s < i {
+            keys.append(&mut sk);
+            vals.append(&mut sv);
+        }
+        keys.append(&mut l.keys);
+        vals.append(&mut l.vals);
+        keys.append(&mut r.keys);
+        vals.append(&mut r.vals);
+        if s > i {
+            keys.append(&mut sk);
+            vals.append(&mut sv);
+        }
+        let rkeys = keys.split_off(m);
+        let rvals = vals.split_off(m);
+        let rweights = weights.split_off(m);
+        let sep = rkeys[0].clone();
+        // The halves were measured as the split point was chosen, so neither is measured again.
+        let (lsizes, rsizes) = halves.unzip();
+        return Ok(Some((
+            j,
+            Node::new_leaf_sized(keys, vals, weights, lsizes),
+            sep,
+            Node::new_leaf_sized(rkeys, rvals, rweights, rsizes),
+        )));
+    }
+    Ok(None)
+}
+
 /// Recursive insert. Descends to the holding leaf (interior nodes route via
 /// [`Node::child_slot`]); on overwrite, sets `*old` and rebuilds with the value+weight replaced
 /// (which may now overflow). Splits propagate back up: a leaf split copies its boundary key up, an
@@ -2536,8 +2666,10 @@ fn node_insert(
     if node.page.load(Ordering::Relaxed) == 0
         && let Some(node) = Arc::get_mut(node)
     {
+        let right_edge;
         let sub = match &mut node.children[i] {
             Child::Resident(c) => {
+                right_edge = at_right_edge(c, &key);
                 node_insert(c, key, val, weight, old, src, cap, shape, keep_existing)?
             }
             Child::OnDisk(page) => {
@@ -2550,6 +2682,7 @@ fn node_insert(
                         )
                     }
                 };
+                right_edge = at_right_edge(&c, &key);
                 match node_insert(
                     &mut c,
                     key,
@@ -2575,11 +2708,22 @@ fn node_insert(
                 Ok(Ins::Kept)
             }
             Ins::Split {
-                left,
+                mut left,
                 sep,
-                right,
+                mut right,
                 more,
             } => {
+                // Even a leaf out with a sibling before accepting its two-way split.
+                if left.is_leaf()
+                    && more.is_empty()
+                    && let Some((j, l, even_sep, r)) =
+                        even_leaves(node, i, &mut left, &mut right, right_edge, src, cap, shape)?
+                {
+                    node.keys[j] = even_sep;
+                    node.children[j] = Child::Resident(l);
+                    node.children[j + 1] = Child::Resident(r);
+                    return Ok(Ins::Kept);
+                }
                 let edited = absorb_split(
                     &mut node.keys,
                     &mut node.children,
@@ -2602,6 +2746,7 @@ fn node_insert(
         };
     }
     let mut c = child(node, i, src)?;
+    let right_edge = at_right_edge(&c, &key);
     match node_insert(
         &mut c,
         key,
@@ -2628,13 +2773,23 @@ fn node_insert(
             Ok(Ins::Whole(Node::new_interior(node.keys.clone(), children)))
         }
         Ins::Split {
-            left,
+            mut left,
             sep,
-            right,
+            mut right,
             more,
         } => {
             let mut keys = node.keys.clone();
             let mut children = node.children.clone();
+            if left.is_leaf()
+                && more.is_empty()
+                && let Some((j, l, even_sep, r)) =
+                    even_leaves(node, i, &mut left, &mut right, right_edge, src, cap, shape)?
+            {
+                keys[j] = even_sep;
+                children[j] = Child::Resident(l);
+                children[j + 1] = Child::Resident(r);
+                return Ok(Ins::Whole(Node::new_interior(keys, children)));
+            }
             let edited = absorb_split(&mut keys, &mut children, i, left, sep, right, more);
             Ok(build_interior(keys, children, cap, Some(edited), true)
                 .expect("insert-path interior split always has a valid split point"))

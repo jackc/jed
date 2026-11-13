@@ -235,6 +235,10 @@ The v23 rule — *"payload > C → 2-way median-**record**-promote"* ([transacti
   unary roots. The exact removal rule is in format.md *Delete*; ordinary leaf
   merges and both merge-abandon rules remain unchanged.
 
+> **Since extended on the insert path:** a leaf that overflows is evened out with an adjacent
+> sibling that has room before it is split (format.md *Evening out with a sibling*). The split
+> itself, the merges and the abandon rules are as described here.
+
 The split point, fan-out determination (page-fit, not a tuning constant), and the single-record
 cap are re-derived for the two-layout world and **pinned with golden fixtures** — this is a §8
 cross-core byte contract, so all four implementations (Rust/Go/TS + the Ruby reference) must

@@ -1769,6 +1769,13 @@ func (r *simRunner) stepCommit(i int, st simStep) {
 				// read back through it; the acknowledged commit is checked by the recovery that follows.
 				published, ok = in.digest, true
 			}
+			if !ok && r.service && r.fs.fired == "write" && simCode(r.digestErr) == "08006" {
+				// The same, one fault short of killing the owner: a write error poisoned its storage handle
+				// (simulation-testing.md §6.4), so it serves nothing more while it still holds presence, and
+				// no other process can take ownership. The read-back fails 08006 for want of an owner, not
+				// for want of the commit, which the recovery that follows checks against the floor below.
+				published, ok = in.digest, true
+			}
 			if !ok || published != in.digest {
 				r.diagnostics = map[string]string{"before-commit.txt": in.text, "after-commit.txt": r.lastDigestText}
 				r.fail(i, "version %d of %s does not contain what its transaction saw before commit", now, d.name)

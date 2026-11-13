@@ -4,8 +4,8 @@ package jed
 // position-aware split rule produces, observed through the page_read block of a full
 // scan (= structural node count, cost.md §3). Ascending inserts take the right-edge
 // append split (byte-identical to the old always-largest-left rule, ~full leaves);
-// random-order inserts take the balanced split and settle near the classic ~2/3 fill —
-// before this rule they splintered into [N-2 | 1] pairs and converged on a few-percent
+// random-order inserts even out with a sibling or take the balanced split — before the
+// position-aware rule they splintered into [N-2 | 1] pairs and converged on a few-percent
 // fill (the spec/design/benchmarks.md finding). CREATE INDEX inserts its entries sorted
 // (indexes.md §1), so a built index packs like the ascending case. Mirrored in
 // impl/rust/tests/split_shape.rs and impl/ts/tests/split_shape.test.ts.
@@ -23,17 +23,24 @@ import (
 // format v52, whose leaves hold about ten times as many of these rows.)
 func splitShapeDB(t *testing.T, shuffled bool) *engine {
 	t.Helper()
+	return splitShapeOrderDB(t, func(i int) int {
+		if shuffled {
+			return (i * 37) % 1210
+		}
+		return i
+	})
+}
+
+// splitShapeOrderDB is the same table with its 1210 rows inserted in the order pk(0), pk(1), ….
+func splitShapeOrderDB(t *testing.T, pk func(i int) int) *engine {
+	t.Helper()
 	db, err := create(filepath.Join(t.TempDir(), "t.jed"), databaseOptions{PageSize: 256, noSync: true})
 	if err != nil {
 		t.Fatal(err)
 	}
 	siRun(t, db, "CREATE TABLE t (id bigint PRIMARY KEY, v integer)")
 	for i := 0; i < 1210; i++ {
-		pk := i
-		if shuffled {
-			pk = (i * 37) % 1210
-		}
-		siRun(t, db, fmt.Sprintf("INSERT INTO t VALUES (%d, %d)", pk, pk%7))
+		siRun(t, db, fmt.Sprintf("INSERT INTO t VALUES (%d, %d)", pk(i), pk(i)%7))
 	}
 	return db
 }
@@ -56,16 +63,31 @@ func TestSplitShapeCostsArePinned(t *testing.T) {
 	asc := splitShapeDB(t, false)
 	pin(asc, "SELECT count(*) FROM t", 2436)
 	shuf := splitShapeDB(t, true)
-	pin(shuf, "SELECT count(*) FROM t", 2443)
+	pin(shuf, "SELECT count(*) FROM t", 2436)
+
+	// Evening out with a sibling (format.md): a leaf that overflows away from the tree's right edge
+	// shares its records with a sibling that has room before it splits, which is why the shuffled
+	// tree costs exactly what the ascending one does (2443 before the rule). Descending inserts
+	// overflow at each leaf's left edge and even out with the right sibling; the zigzag order
+	// (0, 1209, 1, 1208, …) grows two fronts that meet in the middle, so its overflows find room on
+	// either side. Both land one node behind.
+	pin(splitShapeOrderDB(t, func(i int) int { return 1209 - i }), "SELECT count(*) FROM t", 2437)
+	pin(splitShapeOrderDB(t, func(i int) int {
+		if i%2 == 0 {
+			return i / 2
+		}
+		return 1209 - i/2
+	}), "SELECT count(*) FROM t", 2437)
 
 	// Sorted index build (indexes.md §1) packs the index tree like the ascending case;
 	// the build charges only its table scan, and the bounded lookup's cost pins the
 	// index path's shape (pk ≡ 3 mod 7 in [0,1209] ⇒ 173 admitted rows for v = 3). The
 	// lookup rose from v23's 100: a B+tree point lookup always descends to a leaf
 	// (interior records could terminate a v23 descent early), so each of the 17 table
-	// fetches pays the full root→leaf path. Re-pinned for format v52 (the compact leaf).
-	pin(shuf, "CREATE INDEX t_v_idx ON t (v)", 1232)
-	pin(shuf, "SELECT id FROM t WHERE v = 3", 1045)
+	// fetches pays the full root→leaf path. Re-pinned for format v52 (the compact leaf), and again
+	// when evening out left the shuffled table tree one level shorter (1045 before).
+	pin(shuf, "CREATE INDEX t_v_idx ON t (v)", 1225)
+	pin(shuf, "SELECT id FROM t WHERE v = 3", 872)
 
 	// The complete INSERT mutation guard: the committed shape above already contains table-leaf and
 	// table-interior splits plus a split secondary index. In one working root, overwrite an existing
@@ -83,8 +105,8 @@ func TestSplitShapeCostsArePinned(t *testing.T) {
 	for id := 1210; id <= 2209; id++ {
 		siRun(t, shuf, fmt.Sprintf("INSERT INTO t VALUES (%d, %d)", id, id%7))
 	}
-	pin(shuf, "SELECT count(*) FROM t", 4456)
-	pin(shuf, "SELECT id FROM t WHERE v = 3", 1909)
+	pin(shuf, "SELECT count(*) FROM t", 4450)
+	pin(shuf, "SELECT id FROM t WHERE v = 3", 1907)
 	if err := tx.Rollback(); err != nil {
 		t.Fatal(err)
 	}
@@ -95,6 +117,6 @@ func TestSplitShapeCostsArePinned(t *testing.T) {
 	if !bytes.Equal(after, before) {
 		t.Fatal("rollback changed the committed image")
 	}
-	pin(shuf, "SELECT count(*) FROM t", 2443)
-	pin(shuf, "SELECT id FROM t WHERE v = 3", 1045)
+	pin(shuf, "SELECT count(*) FROM t", 2436)
+	pin(shuf, "SELECT id FROM t WHERE v = 3", 872)
 }

@@ -334,6 +334,11 @@ version 6.)
   session**, which sees its own writes.
 - After an acknowledged commit, a fresh read session's digest of the new version must equal that
   in-flight digest: the commit published exactly what its transaction saw. The digest is recorded.
+  Under the page service the read-back may find no owner to serve it: the fault that fired in this
+  step killed the owner, or poisoned its storage handle (§6.4), and a poisoned owner serves nothing
+  more while it still holds presence. A read-back that fails `08006` for that reason is taken as the
+  in-flight digest, which still raises the floor — so the recovery that follows must produce the
+  acknowledged commit, and the acknowledgement is checked there rather than excused.
 - After a failed commit that wrote at least one page **of a database's file**, the in-flight digest is
   recorded as attempted at that database's next version, since a crash may still recover it.
 - A commit that leaves a database's version unchanged must leave its digest unchanged too.

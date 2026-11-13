@@ -4528,6 +4528,41 @@ def split_node(node, cap, edited)
   [:split, nodes, seps]
 end
 
+# The room a sibling needs to take part in evening out: C / EVEN_ROOM bytes free.
+EVEN_ROOM = 8
+
+# Evening out with a sibling (format.md "Evening out with a sibling"): leaf child i of `node`
+# overflowed and split two-way into `left` / `right`. Try the right sibling, then the left one (a
+# right-edge edit tries the right one only): a sibling with room takes part, the pair's records are
+# split in two by the balanced rule, and the candidate fails when no two-way split point keeps both
+# halves in a page or the new separator would overflow `node`. Returns [j, left, separator, right]
+# replacing children j, j+1 and separator j of `node`, or nil when the leaf must split.
+def even_leaves(node, i, left, right, key, cap)
+  right_edge = right[:keys].last == key
+  own_keys = left[:keys] + right[:keys]
+  own_recs = left[:recs] + right[:recs]
+  [i + 1, i - 1].each do |s|
+    next if s.negative? || s >= node[:children].size || (s < i && right_edge)
+
+    sib = node[:children][s]
+    next if node_payload(sib) > cap - cap / EVEN_ROOM
+
+    keys, recs = s < i ? [sib[:keys] + own_keys, sib[:recs] + own_recs] : [own_keys + sib[:keys], own_recs + sib[:recs]]
+    n = keys.size
+    leftp = ->(m) { recs_payload_size(recs[0, m]) }
+    rightp = ->(m) { recs_payload_size(recs[m..]) }
+    m = pick_split_m(1..(n - 1), recs_payload_size(recs), cap, false, leftp, rightp)
+    next if m.nil?
+
+    j = [i, s].min
+    next if node_payload(node) - node[:keys][j].bytesize + keys[m].bytesize > cap
+
+    return [j, { keys: keys[0, m], recs: recs[0, m], children: [] }, keys[m].dup,
+            { keys: keys[m..], recs: recs[m..], children: [] }]
+  end
+  nil
+end
+
 # What the last leaf edit did, for a fixture's assertions (`ops` tables): { ways:, prefix_before:,
 # prefix_after: } — the number of leaves the edited leaf became, and the byte length of its stored
 # key prefix before the edit and of the edited (pre-split) leaf's key set after it.
@@ -4536,8 +4571,9 @@ $leaf_edit = nil
 # Insert (key, rec) into the subtree — or, with `replace`, put rec in place of the record already
 # under key — rebuilding (copy-on-write) and splitting up the path. An interior descent routes by
 # partition_point(sep <= key) — a key equal to a separator lies RIGHT (format.md "Interior node");
-# leaves hold the records. A parent absorbs every separator a child split hands up, in order, and
-# its own edited position is the last of them.
+# leaves hold the records. A leaf that overflows and splits two-way is evened out with a sibling
+# first (even_leaves). A parent absorbs every separator a child split hands up, in order, and its
+# own edited position is the last of them.
 def tree_insert(node, key, rec, cap, replace: false)
   if node_leaf?(node)
     i = node[:keys].bsearch_index { |k| k >= key } || node[:keys].size
@@ -4564,6 +4600,15 @@ def tree_insert(node, key, rec, cap, replace: false)
   children = node[:children].dup
   if res[0] == :split
     _, nodes, seps = res
+    if nodes.size == 2 && node_leaf?(nodes[0]) &&
+       (ev = even_leaves(node, i, nodes[0], nodes[1], key, cap))
+      j, even_left, even_sep, even_right = ev
+      keys = node[:keys].dup
+      keys[j] = even_sep
+      children[j] = even_left
+      children[j + 1] = even_right
+      return [:whole, { keys: keys, recs: [], children: children }]
+    end
     children[i, 1] = nodes
     split_node({ keys: node[:keys].dup.insert(i, *seps), recs: [], children: children }, cap,
                i + seps.size - 1)

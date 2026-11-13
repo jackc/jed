@@ -1597,6 +1597,39 @@ halves exist and **multi-way** otherwise (below). For a key-only index, a single
 a leaf, or a node may not fit one separator. The mutation then fails `0A000`; it does not invent an
 empty leaf or emit an oversized page.
 
+**Evening out with a sibling (leaves).** A leaf that overflows on the insert path is first evened
+out with an adjacent leaf under the same parent, and is split only when that fails. Let the
+overflowing leaf `L` be `child[i]` of its parent `P`, holding its records with the inserted or
+replaced one, and let `L`'s own split be **two-way** (a leaf with no two fitting halves is not
+evened; it splits multi-way, below). The candidates are the **right** sibling `child[i+1]`, then the
+**left** sibling `child[i−1]`, each when `P` has it; a **right-edge edit** (below) considers the
+right sibling only. For a candidate `S`:
+
+1. `S` takes part only when it has room: `payload(S) ≤ C − ⌊C/8⌋`.
+2. Let `M` be the two leaves' records in key order. `M` overflows, because `L` alone does. Split it
+   **two-way** by the **balanced** rule, with no edited position, exactly as the delete path's
+   merge-overflow split does, giving `m`. The candidate fails when no `m` keeps both halves
+   fitting — the pair is never split multi-way, which would change `P`'s key count.
+3. With `j = min(i, index of S)`, the candidate fails when `payload(P) − sep_len(j) + len(key[m]) >
+   C` — the delete path's second abandon rule, tested against `P` as it is before this insert
+   changes it.
+4. Otherwise the two halves replace `child[j]` and `child[j+1]`, and `key[m]` replaces separator
+   `j`. `P` keeps its key count, so nothing propagates further up.
+
+The first candidate that succeeds is taken. When neither does, `L` splits as below. A root leaf has
+no sibling, and interior nodes are never evened out. The candidate order, the room threshold and
+both failure tests are part of this byte contract.
+
+> Why: a split away from the right edge leaves two half-full leaves, so leaves filled in arrival
+> order settle near two-thirds full, and an index is filled that way. Evening out first holds them
+> near 84%: on a 1.3M-row, twelve-index load the index trees were a quarter smaller (73 → 56 MB,
+> 64% → 84% full), for about 6% more load time and no more tree pages written per commit — fewer, in
+> fact, on a bulk load (411 → 386), and within a page of the old count on single-row writes. A
+> right-edge edit looks right only, so an append to the tree's last leaf, which has no right sibling,
+> splits exactly as before and reads no other leaf. The room threshold keeps a sibling that is itself
+> nearly full from being rewritten for a few bytes of slack: at `C/8` a densely packed tree stops
+> evening out instead of rewriting two leaves for every insert.
+
 **Split point (shared machinery).** For an overflowing node with entries `e[0 … N)`, define
 `leftpayload(m)` / `rightpayload(m)` as the payload of the would-be left / right node under the
 kind's split shape (below), and:
@@ -1611,10 +1644,10 @@ m          = right-edge edit ? m_max : clamp(min(m_balanced, m_max), m_min, m_ma
 A **right-edge edit** means the entry whose insert/replace triggered the rebuild is the node's
 last (`index N−1`; for an interior node, the separator the child split just handed up landed at
 the right edge) — sequential ascending loads land here every time and keep packing left nodes
-~full. The delete path's **merge-overflow** split (below) has no edited position and always takes
-the balanced arm. An insertion with no fitting two-way split (no `m_min ≤ m_max`, including no
-`m_min` at all) splits multi-way (next). An interior **merge**-overflow with no fitting split instead **abandons
-the merge** (below).
+~full. The delete path's **merge-overflow** split (below) and the insert path's evening-out split
+(above) have no edited position and always take the balanced arm. An insertion with no fitting
+two-way split (no `m_min ≤ m_max`, including no `m_min` at all) splits multi-way (next). An
+interior **merge**-overflow with no fitting split instead **abandons the merge** (below).
 
 **Multi-way split (v52, insert path only).** Through v51 a table leaf's payload was the sum of its
 capped records, so a leaf that overflowed by one record always had two fitting halves. A v52 leaf's
@@ -1652,7 +1685,8 @@ is a sum, so it splits multi-way only when it received separators too long for t
 > (secondary-index maintenance, a future random pk source) leaves converge on a few-percent
 > fill (the 2026-06 benchmark finding, [../design/benchmarks.md](../design/benchmarks.md)).
 > The position hint keeps the ascending fast path byte-for-byte unchanged while random
-> inserts settle at the classic ~66-70% B-tree fill.
+> inserts settle at the classic ~66-70% B-tree fill by splitting alone; evening out with a
+> sibling first (above) raises that.
 
 **Leaf split (copy-up).** Range `m ∈ [1, N−1]`. The left leaf gets records `[0, m)`, the right
 leaf gets `[m, N)` — **no record leaves the leaf level** — and the parent gains a separator that is

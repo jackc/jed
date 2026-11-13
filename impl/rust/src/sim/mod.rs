@@ -2551,6 +2551,18 @@ impl<'a> Runner<'a> {
                     // recovery that follows.
                     published = Some(inflight.clone());
                 }
+                if published.is_none()
+                    && self.service
+                    && self.disk().fired == "write"
+                    && self.digest_err.as_ref().map(engine_code).as_deref() == Some("08006")
+                {
+                    // The same, one fault short of killing the owner: a write error poisoned its
+                    // storage handle (simulation-testing.md §6.4), so it serves nothing more while it
+                    // still holds presence, and no other process can take ownership. The read-back
+                    // fails 08006 for want of an owner, not for want of the commit, which the
+                    // recovery that follows checks against the floor below.
+                    published = Some(inflight.clone());
+                }
                 if published.as_deref() != Some(inflight.as_str()) {
                     self.diagnostics = vec![
                         ("before-commit.txt".to_string(), inflight_text),

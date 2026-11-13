@@ -1746,6 +1746,19 @@ export class SimRunner {
           // read back through it; the acknowledged commit is checked by the recovery that follows.
           published = inflight.digest;
         }
+        if (
+          published === null &&
+          this.service &&
+          this.fs.fired === "write" &&
+          this.digestErr !== null &&
+          errCode(this.digestErr) === "08006"
+        ) {
+          // The same, one fault short of killing the owner: a write error poisoned its storage handle
+          // (simulation-testing.md §6.4), so it serves nothing more while it still holds presence, and
+          // no other process can take ownership. The read-back fails 08006 for want of an owner, not
+          // for want of the commit, which the recovery that follows checks against the floor below.
+          published = inflight.digest;
+        }
         if (published === null || published !== inflight.digest) {
           this.diagnostics = new Map([
             ["before-commit.txt", inflight.text],

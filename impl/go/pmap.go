@@ -2130,6 +2130,20 @@ func nodeInsert(n *pnode, key []byte, val storedRow, weight uint32, old *storedR
 			n.children[i] = residentRef(sub.whole)
 			return insOut{whole: n}, nil
 		}
+		if childNode.isLeaf() && len(sub.more) == 0 {
+			// Even the leaf out with a sibling before accepting its two-way split (leaf_even.go).
+			j, ev, ok, err := evenLeaves(n, i, sub, key, generation, src, cap, shape)
+			if err != nil {
+				return insOut{}, err
+			}
+			if ok {
+				n.keys[j] = ev.sep
+				n.sameKeys = false
+				n.children[j] = residentRef(ev.left)
+				n.children[j+1] = residentRef(ev.right)
+				return insOut{whole: n}, nil
+			}
+		}
 		var edited int
 		n.keys, n.children, edited = absorbSplit(n.keys, n.children, i, sub)
 		n.sameKeys = false
@@ -2148,6 +2162,21 @@ func nodeInsert(n *pnode, key []byte, val storedRow, weight uint32, old *storedR
 		children[i] = residentRef(sub.whole)
 		origin, same := originOf(n)
 		return insOut{whole: &pnode{keys: cloneKeys(n.keys), children: children, owner: generation, origin: origin, sameKeys: same}}, nil
+	}
+	if childNode.isLeaf() && len(sub.more) == 0 {
+		j, ev, ok, err := evenLeaves(n, i, sub, key, generation, src, cap, shape)
+		if err != nil {
+			return insOut{}, err
+		}
+		if ok {
+			keys := cloneKeys(n.keys)
+			keys[j] = ev.sep
+			children := cloneChildren(n.children)
+			children[j] = residentRef(ev.left)
+			children[j+1] = residentRef(ev.right)
+			origin, _ := originOf(n)
+			return insOut{whole: &pnode{keys: keys, children: children, owner: generation, origin: origin}}, nil
+		}
 	}
 	keys, children, edited := absorbSplit(cloneKeys(n.keys), cloneChildren(n.children), i, sub)
 	out, ok := buildInterior(keys, children, cap, edited, generation, true)

@@ -228,6 +228,11 @@ phase 1 recomputes identically, so phase 2's tree edits still cannot fail:
   of the few-percent fill that storage-key-order (random in entry-key space) insertion
   produced. The sort order is part of the byte contract: it fixes the built tree's shape,
   and therefore the committed pages, across cores (CLAUDE.md §8).
+- **An index maintained by DML** receives its entries in arrival order, not key order, so its
+  leaves overflow away from the right edge. A leaf that does is evened out with an adjacent
+  sibling that has room before it is split (spec/fileformat/format.md "Evening out with a
+  sibling"), which holds such an index near 84% full instead of the two-thirds that splitting
+  alone gives.
 
 Maintenance work is **unmetered** (like sort and the commit itself — cost.md §3 "What is
 NOT metered"); the *scan* side of CREATE INDEX is metered. **Expression-key evaluation is

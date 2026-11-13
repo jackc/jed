@@ -2003,6 +2003,79 @@ function buildInterior(
   };
 }
 
+// LEAF_EVEN_ROOM sets the room a sibling needs to take part in evening out: C / LEAF_EVEN_ROOM bytes
+// free (format.md "Evening out with a sibling").
+const LEAF_EVEN_ROOM = 8;
+
+type Evened = { j: number; left: PNode; sep: Uint8Array; right: PNode };
+
+// evenLeaves tries to even the overflowing leaf child i of n out with an adjacent sibling instead
+// of splitting it (format.md "Evening out with a sibling"). sub is the leaf's own two-way split,
+// key the key just written. The right sibling is tried, then the left one; an edit at the leaf's
+// right edge tries the right one only, so an append to the tree's last leaf splits as it always did
+// and reads no other leaf. A sibling takes part when its payload is at most C - C / LEAF_EVEN_ROOM;
+// the two leaves' records are then split in two by the balanced rule, as the delete path's
+// merge-overflow does (mergeAt). A candidate fails when the pair has no two-way split that fits —
+// it would have to go multi-way, which the parent's key count cannot absorb here — or when the new
+// separator would overflow n (mergeAt's second abandon rule).
+//
+// The returned halves and separator replace children j and j+1 and separator j of n, which keeps
+// its key count; null means the leaf must split. n is not modified here.
+function* evenLeavesSteps(
+  n: PNode,
+  i: number,
+  sub: { left: PNode; right: PNode },
+  key: Uint8Array,
+  generation: MutationGeneration,
+  src: LeafSource | null,
+  cap: Cap,
+  shape: LeafShape,
+): Steps<Evened | null> {
+  const own = sub.right.keys;
+  const rightEdge = compareBytes(own[own.length - 1]!, key) === 0;
+  const limit = cap.c - Math.floor(cap.c / LEAF_EVEN_ROOM);
+  for (const s of [i + 1, i - 1]) {
+    if (s < 0 || s >= n.children.length || (s < i && rightEdge)) continue;
+    const sib = yield* resolveChildSteps(n.children[s], src);
+    if (!payloadAtMost(sib, limit, cap, shape)) continue;
+    const p = leafParts(sib);
+    const l = sub.left;
+    const r = sub.right;
+    // The pair overflows, because the leaf alone does: a whole result means a single record that
+    // fits no leaf, and a multi-way one that no two halves fit. Either way the leaf splits.
+    const merged =
+      s < i
+        ? buildLeaf(
+            p.keys.concat(l.keys, r.keys),
+            p.vals.concat(l.vals, r.vals),
+            p.weights.concat(l.weights, r.weights),
+            cap,
+            shape,
+            null,
+            generation,
+          )
+        : buildLeaf(
+            l.keys.concat(r.keys, p.keys),
+            l.vals.concat(r.vals, p.vals),
+            l.weights.concat(r.weights, p.weights),
+            cap,
+            shape,
+            null,
+            generation,
+          );
+    const j = Math.min(i, s);
+    if (
+      merged.whole !== null ||
+      merged.more.length > 0 ||
+      interiorPayload(cap, n.keys) - n.keys[j]!.length + merged.sep.length > cap.c
+    ) {
+      continue;
+    }
+    return { j, left: merged.left, sep: merged.sep, right: merged.right };
+  }
+  return null;
+}
+
 // nodeInsert is the recursive insert. It descends to the holding LEAF (interior nodes only route,
 // via childSlot); on overwrite it sets ctx and rebuilds with the value+weight replaced (which may
 // now overflow). Splits propagate back up: a leaf split copies its boundary key up, an interior
@@ -2132,6 +2205,16 @@ function* nodeInsertSteps(
       n.children[i] = residentRef(sub.whole);
       return { whole: n };
     }
+    if (isLeaf(sub.left) && sub.more.length === 0) {
+      // Even the leaf out with a sibling before accepting its two-way split.
+      const ev = yield* evenLeavesSteps(n, i, sub, key, generation, src, cap, shape);
+      if (ev !== null) {
+        n.keys[ev.j] = ev.sep;
+        n.children[ev.j] = residentRef(ev.left);
+        n.children[ev.j + 1] = residentRef(ev.right);
+        return { whole: n };
+      }
+    }
     const edited = absorbSplit(n.keys, n.children, i, sub);
     if (payload(n, cap, shape) <= cap.c || n.keys.length < 2) return { whole: n };
     const out = buildInterior(n.keys, n.children, cap, edited, generation, true);
@@ -2143,6 +2226,17 @@ function* nodeInsertSteps(
     const children = n.children.slice();
     children[i] = residentRef(sub.whole);
     return { whole: newInterior(n.keys.slice(), children, generation) };
+  }
+  if (isLeaf(sub.left) && sub.more.length === 0) {
+    const ev = yield* evenLeavesSteps(n, i, sub, key, generation, src, cap, shape);
+    if (ev !== null) {
+      const keys = n.keys.slice();
+      keys[ev.j] = ev.sep;
+      const children = n.children.slice();
+      children[ev.j] = residentRef(ev.left);
+      children[ev.j + 1] = residentRef(ev.right);
+      return { whole: newInterior(keys, children, generation) };
+    }
   }
   const keys = n.keys.slice();
   const children = n.children.slice();

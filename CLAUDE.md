@@ -868,6 +868,11 @@ session/clock/state dependencies, and pin named timezone data until an explicit 
   savings`, a function of its keys and rows, which the split and merge rules measure. Invisible to
   SQL; costs that count pages moved ([spec/design/leaf-structural.md](spec/design/leaf-structural.md)).
   Per-column symbol tables for text and `jsonb` are prototyped and held for a later version.
+- **Evening out leaves (no format bump).** A leaf that overflows on insert is evened out with an
+  adjacent sibling that has room before it is split, so leaves filled in arrival order (an index
+  maintained by DML, a table with random keys) settle near 84% full instead of two-thirds. It changes
+  tree shape only: old files stay readable, it is invisible to SQL, and costs that count pages moved
+  (`spec/fileformat/format.md` *Evening out with a sibling*).
 - On-disk format and key encoding are spec'd with byte fixtures (§8). **Status:** the
   single-file on-disk format is authored in `spec/fileformat/format.md` and is now the
   **page-backed copy-on-write B+tree** (`format_version` 24 — the B+tree reshape,
