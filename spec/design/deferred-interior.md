@@ -15,9 +15,9 @@ same saving by a different route. §8 is the re-baselining against that rule: wh
 required, the numbers against today's commit (deferral still halves a single-row commit), and the bug
 it exposed and fixed — a remap entry could outlive the page it names, which the old rule's periodic
 rebuild had been quietly healing. It then moved **again**, under leaf evening (`cb56b480e`), which
-makes a rebalance — and so a parent that cannot be retained — an ordinary event on the very
-workloads §8.2 measures: §8.5 says what that does and does not change, and §8.2's figures are a
-floor awaiting re-measurement, not today's saving.
+adds a third site that forbids retention: §8.5 re-measures §8.2's three workloads at the tip and
+finds them **unchanged** — deferral still halves a single-row commit — and says why these workloads
+never reach the new path.
 
 ## 1. The problem
 
@@ -377,19 +377,33 @@ That is a third site that changes a parent's separators, and so a third site tha
 the separators" — and the Go prototype is correct against it today, because the evening path clears
 `sameKeys` on both of its branches. Nothing in §9 moves.
 
-What moves is **how often retention fires**, and therefore §8.2's column. Leaf evening makes a
-rebalance an ordinary event on exactly the workloads §8.2 measures — an index maintained by DML, a
-table with random keys — where before, an overflow away from the right edge simply split. Each such
-rebalance retires the parent that a deferred commit would have kept. So **24.0 / 39.9 / 48.0 KB is
-now a floor, not an estimate**, and the headline "deferral halves a single-row commit" is unverified
-against the current engine. The direction is clear (retention strictly less often ⇒ bytes strictly
-higher) but not the size: evening also writes *fewer* tree pages per bulk commit (411 → 386 on
-`cb56b480e`'s own load), and the append case — which never rebalances, by that commit's right-edge
-rule — should be unchanged.
+What could move is **how often retention fires**, and therefore §8.2's column: each rebalance
+retires a parent that a deferred commit would have kept. So §8.2 was re-measured at the tip
+(`03cc46acc`), same harness, same three workloads, `-count=1` because `deferInterior` is a
+package-level `os.Getenv` initializer and Go's test cache does not key on it:
 
-**The landing change owes a re-measurement** (§9.8): §8.2's three workloads at the tip, before any
-claim about what deferral saves is repeated. Until then cite §8.2 as "measured at `68703736a`,
-pre-leaf-evening", not as today's saving.
+| commit | today | + deferred interiors | ratio | §8.2's figures |
+|---|---|---|---|---|
+| update a non-indexed column | 48.5 KB | **24.2 KB** | 0.499 | 48.5 → 24.0 |
+| update an indexed column | 84.1 KB | **40.1 KB** | 0.477 | 84.4 → 39.9 |
+| insert (append) | 96.1 KB | **48.1 KB** | 0.501 | 96.0 → 48.0 |
+
+**The effect is nil — both columns reproduce to within 0.4%, and interior pages per commit are
+unchanged at 0.0 / 0.1 / 0.0.** Deferral still halves a single-row commit on the current engine, and
+the paragraph above overestimated: it reasoned from the mechanism (a third site forbidding
+retention) without asking how often these three workloads reach it. Three rules keep them away from
+it. The non-indexed update replaces a value in place and overflows no leaf at all. The append is at
+the right edge, where `cb56b480e`'s own rule tries only the right sibling, so the last leaf splits
+exactly as before. And evening requires a sibling with `C/8` bytes free, which a tree freshly built
+by a 300k-row bulk load and then compacted — the §8.2 setup — rarely has.
+
+So the mechanism is real but the workloads do not exercise it. **A workload that would** is one
+whose leaves are loosely packed and mutated away from the right edge: the DML-maintained index and
+random-key table `cb56b480e` reports a quarter smaller. That is not what §8.2 measures, and
+measuring it is a question about leaf evening's interaction, not about whether deferral pays.
+
+Latency, worth little as one run each on a machine that was not reserved: 207 → 196, 328 → 293,
+505 → 446 µs/commit.
 
 ## 9. The format (ratified 2026-11-13)
 
@@ -637,9 +651,10 @@ Beyond the three cores and `verify.rb`:
 - **A race review** of the commit path, which sets a page id on the committing snapshot's own nodes
   and swaps the resident list during planning (§6).
 - **`unassignPages`**, or its equivalent, must undo a retained interior when a plan is discarded.
-- **A re-measurement** of §8.2's three workloads at the tip, since leaf evening retires parents a
-  deferred commit would have kept (§8.5). Until it is taken, §8.2 is a floor measured at
-  `68703736a`, not the current saving.
+- ~~A re-measurement of §8.2's three workloads at the tip.~~ **Taken** (§8.5): unchanged at
+  `03cc46acc`, so the saving stands as stated. What is still unmeasured is a loosely-packed tree
+  mutated away from the right edge, where leaf evening's rebalance is common — a question about that
+  change, not a precondition for this one.
 
 What it does **not** owe: row counts in the meta (§7.2), which would stop an insert writing the
 catalog page and is a separate change; and record-level logging (§7.3), which this design does not
