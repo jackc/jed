@@ -183,7 +183,7 @@ know the list; anything cross-core; the page-service process corpus; the race de
 3. **Leaf-sized writes remain.** An append still rewrites a whole leaf per tree. Closing that needs
    record-level logging, which this design does not attempt.
 4. **Page clients.** A client needs the owner's list to read interiors; `begin_read` already carries
-   the meta. §9.8 states what the owner must validate in a client's delta; the wire fixtures are
+   the meta. §9.9 states what the owner must validate in a client's delta; the wire fixtures are
    still owed.
 5. ~~Whether the list should be scoped per parent page, which would remove the held-id rule.~~
    **Answered: yes (§9.1, §9.5, §9.7).** An entry is keyed by `(parent page, child slot)`. The
@@ -508,8 +508,15 @@ The region is inside the encrypted meta's seal, like the rest of the page, and b
 It is covered by the meta CRC-32 in both variants. There is **no marker byte**: the version fixes
 the layout, and a slot with no entries writes `remap_entries = 0` and a zero region — so a
 from-scratch image (*From-scratch image*, format.md) changes only by its version byte and meta CRC,
-exactly as v51 and v52 did. The **bootstrap** rule is extended: a zero-dirty-entry meta requires
-`remap_entries = 0` along with its other descriptor fields.
+exactly as v51 and v52 did.
+
+> **Corrected 2026-11-13, while implementing.** This section originally extended the **bootstrap**
+> rule so that a zero-dirty-entry meta requires `remap_entries = 0`. That contradicts §9.3, which
+> requires a page-identical backup to copy the pinned generation's list into the copy's bootstrap
+> meta — and a backup cannot fold instead, since it copies interior pages verbatim. The extension is
+> dropped: the bootstrap rule keeps its v52 meaning for the manifest (descriptor fields and the inline
+> manifest area zero), and the remap region of a bootstrap meta is validated by §9.3 like any other.
+> Nothing is lost: a from-scratch image has no list in any case.
 
 **The page-header stamp.** v53 also spends the page header's two reserved bytes at offset 2 on
 `txid16`, a second and independent detector for a lost page write
@@ -652,7 +659,51 @@ and §8.3's bug all exist to serve a global child-page key; a position key needs
 costs 2 bytes an entry (10 against 8), which is ~20% of the capacity at a fixed region size, against
 removing the one correctness rule in the design that reaches outside it into the free list.
 
-### 9.8 What the landing change owes
+### 9.8 The Go implementation (2026-11-13)
+
+`impl/go/remap.go` now implements this section, replacing the prototype of §3 behind the same
+`JED_DEFER_INTERIOR=on` switch, still without a version bump. Three choices the spec leaves to the
+implementation, recorded so the other cores make the same ones:
+
+- **The decision precedes allocation** (§9.4). `planDeferral` walks the dirty structure without
+  allocating, deciding retention exactly as serialization will and collecting the shared boundary
+  serialization would record; it then forms `E` and applies the fold test. The prototype's
+  conservative pre-check (`|E0| + dirty nodes ≤ cap`) folded where §9.4 does not and could not be
+  reproduced byte for byte by another core, so it is gone. A dirty child without an origin under a
+  retained parent simply takes an entry — the prototype forbade that, and (parent, slot) keying makes
+  the restriction unnecessary.
+- **The drop rule is the live-page delta's walk** (§9.5). Every writer, a page client included,
+  already walks the previous snapshot's interiors that the new one does not share in order to publish
+  its live count. An `E0` parent that walk reaches and the commit does not retain is retired. It is
+  total — merged-away nodes and dropped tables and indexes are reached the same way — and needs no
+  orphan enumeration. With no previous snapshot to walk, the commit folds rather than guess.
+- **Staleness is the list's, not a flag's.** A node is stale iff its page keys an entry; the fold and
+  the loader both ask the list.
+
+The backstop free-list rebuild no longer prunes the list (it used to heal the global keying's leaks);
+it now **asserts** that every surviving entry's parent and target are reachable, so a drop-rule bug
+fails loudly. The simulator's bounded-growth oracle lost its deferral allowance.
+
+Run: unit suite off and on (alone, and with both other switches — the only failures are the v52
+fixture byte comparisons the stamp causes); `TestRemap*` for the §9.2 capacity table, the byte round
+trip, every §9.3 rejection, the read-time slot check, and an end-to-end file that defers, folds,
+merges, drops an index, passes the full integrity check after each phase and reopens to the same
+rows; `sim:sweep 1..200 all go` with deferral alone and with all three switches (4,400 traces each,
+every oracle, no allowance); `sim:sweep 1..50` across all three cores with every switch off (1,100
+traces). The committed regression traces pass in the Go runner with deferral on, but the independent
+Ruby image checker disagrees with 61 recoveries: it still reads offset 60 as reserved zero and sizes
+the inline manifest the v52 way — the `verify.rb` work below.
+
+**A latent oracle bug, found by deferral and fixed in all three runners.** `large-values-28`, under
+`synchronous = off`, failed the trailing-truncation oracle in the old prototype and the new code
+alike: two relaxed batches lowered the high-water and were each lost to a power failure before their
+flush, recovery adopted the lowered generations over a longer file, and the next lifetime's flush
+was blamed for not cutting it. The engine follows format.md (*Trailing truncation*: the file is cut
+only by a commit that lowers the high-water against the generation it commits on); the oracle kept
+its "shrink owed" flag across the crash. `recover` now clears it in the Go, Rust and TS runners.
+Whether recovery itself should cut such a file is a separate question this change does not raise.
+
+### 9.9 What the landing change owes
 
 v53 is **one change carrying both this section and [manifest-crc32.md](manifest-crc32.md)**, so this
 list is the whole of it. That doc's own share is the 8-byte manifest entry, the `txid16` page-header
@@ -681,6 +732,8 @@ Beyond the three cores and `verify.rb`:
 - **A race review** of the commit path, which sets a page id on the committing snapshot's own nodes
   and swaps the resident list during planning (§6).
 - **`unassignPages`**, or its equivalent, must undo a retained interior when a plan is discarded.
+- **`verify.rb` and the Ruby reference** must read the region (§9.2–§9.3) and resolve through it,
+  which also makes the simulator's independent image checker agree again (§9.8).
 - **The stamp's remaining surface** ([manifest-crc32.md](manifest-crc32.md) §4): give the integrity
   check and the page service's delta check a window, and change the manifest-overflow header check
   from "bytes 1–3 zero" to "flags zero, stamp equals the meta's txid" in Rust, TS and the Ruby

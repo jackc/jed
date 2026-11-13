@@ -755,13 +755,19 @@ func (st *storage) commitDurable(snap *snapshot, canReclaim, canReuse bool, budg
 		}
 		// PROTOTYPE (remap.go): defer interior pages when this commit can; otherwise, if any interior
 		// is stale, fold — write every stale interior fresh and empty the remap list.
+		// The decision is §9.4's: a pure function of the committed list, the dirty-node structure, the
+		// committed free list and the high-water, taken before allocation.
 		var d *deferCtx
 		var prevCat *catState
 		encrypted := st.paging.codec() != nil
-		canDefer := deferOn(int(st.pageSize), encrypted) &&
-			st.paging.remap.len()+snap.dirtyNodeCount() <= remapCapFor(int(st.pageSize), encrypted)
-		if canDefer {
-			d = &deferCtx{remap: st.paging.remap.clone(), migrate: migrateHint(st.freePages, st.pageCount)}
+		if deferOn(int(st.pageSize), encrypted) {
+			var prev *snapshot
+			if budget != nil {
+				prev = budget.prev
+			}
+			d = snap.planDeferral(prev, st.paging.remap, migrateHint(st.freePages, st.pageCount), remapCapFor(int(st.pageSize), encrypted))
+		}
+		if d != nil {
 			prevCat = st.paging.cat
 			if prevCat != nil && d.migrate != 0 && prevCat.root.page == d.migrate {
 				prevCat = nil // the catalog chain blocks truncation too; rewrite it low
@@ -772,7 +778,7 @@ func (st *storage) commitDurable(snap *snapshot, canReclaim, canReuse bool, budg
 				prevCat = nil
 			}
 		} else {
-			snap.unstale()
+			snap.unstale(st.paging.remap.parents()) // fold: the published list is empty
 		}
 		write, err := snap.incrementalImageDeferred(st.pageSize, st.pageCount, st.freePages, canReuse, allowed, st.paging, d, prevCat)
 		if err != nil {

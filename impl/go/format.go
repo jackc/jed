@@ -1504,34 +1504,25 @@ func serializeDirty(n *pnode, colTypes []colType, keyLen int, memo *compressMemo
 			moved = append(moved, i)
 		}
 	}
-	if d != nil && len(n.children) > 0 {
-		// PROTOTYPE (remap.go): an interior whose separators are its persisted page's, and whose
-		// rewritten children each replace a persisted node one for one, keeps its page. The remap
-		// list records where those children went.
-		deferrable := n.origin.page != 0 && n.sameKeys && n.origin.page != d.migrate
+	if d != nil && len(n.children) > 0 && n.origin.page != 0 && d.retain[n.origin.page] {
+		// PROTOTYPE (remap.go): an interior the plan retains keeps its page (deferred-interior.md
+		// §9.4); each child that moved off the page its slot resolved to takes an entry keyed by this
+		// page and that slot, overwriting any earlier one.
 		for _, i := range moved {
 			c := n.children[i].node
-			deferrable = deferrable && (c.origin.page != 0)
-		}
-		if deferrable {
-			for _, i := range moved {
-				if c := n.children[i].node; childPages[i].page != c.origin.page {
-					d.remap.replace(c.origin.page, childPages[i])
-				}
-			}
-			n.setRef(n.origin) // its page and, in an encrypted file, that page's tag
-			n.stale = true
-			d.retained++
-			d.retainedIDs = append(d.retainedIDs, n.origin.page)
-			return n.ref(), nil
-		}
-		// Written fresh: it names its children directly, so their entries go.
-		for i, c := range n.children {
-			d.remap.drop(childPages[i].page)
-			if c.node != nil && c.node.origin.page != 0 {
-				d.remap.drop(c.node.origin.page)
+			if childPages[i].page != c.origin.page {
+				d.remap.set(n.origin.page, uint16(i), childPages[i])
 			}
 		}
+		if d.remap.len() > d.capacity {
+			// planDeferral counted exactly the entries this adds, so this is a logic error.
+			panic("deferral plan overran the remap list")
+		}
+		n.setRef(n.origin) // its page and, in an encrypted file, that page's tag
+		n.stale = d.remap.keys(n.origin.page)
+		d.retained++
+		d.retainedIDs = append(d.retainedIDs, n.origin.page)
+		return n.ref(), nil
 	}
 	// Encode a leaf's records, spilling over-large values to overflow pages drawn from the same
 	// allocator (free-list first, then high-water — large-values.md §12). A dirty leaf may carry
@@ -2167,9 +2158,7 @@ func loadEngineSharedPagingAt(paging *sharedPaging, env *Environment, at loadAt)
 			chain = len(db.freeChain.refs)
 		}
 		// PROTOTYPE (remap.go): the loaded list's keys are dead pages held off the free list, not leaks.
-		in.remapHeld = mt.remap.held()
-		sortUint32s(in.remapHeld)
-		in.tolerated = max(0, int(mt.pageCount)-int(pcap.firstBody())-len(db.freePages)-int(mt.livePages)-chain-int(mt.manifestPages)-len(in.remapHeld))
+		in.tolerated = max(0, int(mt.pageCount)-int(pcap.firstBody())-len(db.freePages)-int(mt.livePages)-chain-int(mt.manifestPages))
 		db.incr = in
 	}
 	db.committed = snap
@@ -2278,10 +2267,10 @@ func collectLeafOverflowWith(read func(pageRef) ([]byte, error), pcap pageCap, p
 			if err != nil {
 				return err
 			}
-			if to, ok := remap.lookup(cp.page); ok { // PROTOTYPE (remap.go)
-				cp = to
-			}
 			cps = append(cps, cp)
+		}
+		if err := remap.resolve(pageIdx.page, cps); err != nil { // PROTOTYPE (remap.go)
+			return err
 		}
 		for _, cp := range cps {
 			if err := collectLeafOverflowWith(read, pcap, cp, colTypes, reached, seen, depth+1, remap); err != nil {
@@ -2798,17 +2787,13 @@ func freeListCandidates(snap *snapshot, paging *sharedPaging, catRoot pageRef, w
 		for _, e := range pending {
 			reached[e.index] = true
 		}
-		// PROTOTYPE (remap.go): an entry whose node is gone (merged away) goes now, before its page
-		// can be listed free and reused; the ids the surviving entries are keyed by stay off the list.
-		if remap != nil {
-			for disk, cur := range remap.fwd {
-				if !reached[cur.page] {
-					delete(remap.fwd, disk)
-					delete(remap.rev, cur.page)
-				}
-			}
-			for _, p := range remap.held() {
-				reached[p] = true
+		// PROTOTYPE (remap.go): an entry dies in the commit that retires its parent (deferred-interior.md
+		// §9.5), so every surviving entry's parent and target are live and nothing is held off this list.
+		// A rebuild is the place to check it: an entry on a dead parent would be applied to whatever
+		// interior is later written at that page.
+		for _, k := range remap.sorted() {
+			if to := remap.entries[k]; !reached[k.parent] || !reached[to.page] {
+				return nil, 0, 0, false, newError(DataCorrupted, "remap entry outlives its parent or target page")
 			}
 		}
 		var free []uint32
@@ -2895,11 +2880,13 @@ func readSkeletonNode(paging *sharedPaging, pageIdx pageRef, colTypes []colType,
 			if err != nil {
 				return childRef{}, 0, err
 			}
-			if to, ok := remap.lookup(cp.page); ok { // PROTOTYPE (remap.go)
-				cp, stale = to, true
-			}
 			childPtrs = append(childPtrs, cp)
 		}
+		// PROTOTYPE (remap.go): this page's entries redirect its slots; it is stale if it keys any.
+		if err := remap.resolve(pageIdx.page, childPtrs); err != nil {
+			return childRef{}, 0, err
+		}
+		stale = remap.keys(pageIdx.page)
 		// v24: the record-free routing skeleton — an end-offset separator directory + key blob.
 		// Separators carry no values, so no lazy decode and no chains to mark.
 		keys, err := readSeparators(pg.payload, &pos, n)
@@ -5854,7 +5841,9 @@ func parseMeta(m []byte) (meta, bool) {
 	}
 	lo, hi := manifestInlineAreaOf(m, pcap)
 	inline := min(int(count), (hi-lo)/esize)
-	remap, ok := decodeRemap(m)
+	// Offset 60 is remap_entries under the deferred-interior layout and reserved zero otherwise;
+	// decodeRemap validates both (deferred-interior.md §9.3).
+	remap, ok := decodeRemap(m, first, pageCount)
 	if !ok {
 		return meta{}, false
 	}
@@ -5866,12 +5855,10 @@ func parseMeta(m []byte) (meta, bool) {
 	if freeListHead != 0 && (freeListHead < first || freeListHead >= pageCount) {
 		return meta{}, false
 	}
-	// Bytes 60–63 are reserved zero (format.md *Meta page*), and slot selection validates the reserved
-	// fields: a slot with a bit set here is not a valid candidate. All four implementations must agree,
-	// or they recover different generations from one damaged file.
-	if binary.BigEndian.Uint32(m[60:64]) != 0 {
-		return meta{}, false
-	}
+	// Bytes 60–63 are reserved zero (format.md *Meta page*) unless the deferred-interior layout gives
+	// them to remap_entries; decodeRemap enforced either above. Slot selection validates the reserved
+	// fields: all four implementations must agree, or they recover different generations from one
+	// damaged file.
 	// v34: the live pages are a subset of the body pages.
 	livePages := binary.BigEndian.Uint32(m[56:60])
 	if livePages > body {

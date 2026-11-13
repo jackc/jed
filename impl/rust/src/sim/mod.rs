@@ -3617,6 +3617,10 @@ impl<'a> Runner<'a> {
         self.disk().process_death();
         let mut images: HashMap<String, Vec<u8>> = HashMap::new();
         for name in self.order() {
+            // A batch the process died holding is never flushed, so the shrink it owed is void: the
+            // file is cut only by a commit that lowers the high-water against the generation recovery
+            // adopts (format.md *Trailing truncation*).
+            self.sdb(&name).shrink_due = false;
             let image = self.image(&name);
             let Some(image) = image.or_else(|| (name == "main").then(Vec::new)) else {
                 // A crash during the attachment's create: allowed only while create had not

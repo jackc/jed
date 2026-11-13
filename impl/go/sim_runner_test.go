@@ -1964,7 +1964,7 @@ func (r *simRunner) simIncrState(d *simDB) (first uint32, tolerated int) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	if st.incr != nil {
-		tolerated = st.incr.tolerated + len(st.incr.remapHeld)
+		tolerated = st.incr.tolerated // deferred interiors hold no page (deferred-interior.md §9.5)
 	}
 	return st.paging.cap().firstBody(), tolerated
 }
@@ -2082,11 +2082,9 @@ func (r *simRunner) checkGrowth(i int, d *simDB, quiet bool) {
 	} else if quiet && d.high-d.free > max(compactMinPages, uint32(compactGrowth)*d.lacBound) {
 		reclaimed = true
 		// PROTOTYPE (remap.go): page ids that key a remap entry stay off the free list until a fold.
-		held := uint32(0)
-		if deferOn(int(r.pageSize), false) {
-			held = uint32(remapCapFor(int(r.pageSize), false))
-		}
-		if leaked := pc - 2 - live - free; pc < 2+live+free || leaked > written+held {
+		// Deferred interiors need no allowance: an entry dies in the commit that orphans its parent, so
+		// it holds no page off the free list (deferred-interior.md §9.5).
+		if leaked := pc - 2 - live - free; pc < 2+live+free || leaked > written {
 			r.fail(i, "bounded growth: %s has %d pages, %d live and %d free, after a commit that wrote %d "+
 				"must have reclaimed every dead page", d.name, pc, live, free, written)
 			return
@@ -2661,6 +2659,11 @@ func (r *simRunner) recover(i int, fired string) bool {
 	r.fs.processDeath()
 	images := map[string][]byte{}
 	for _, d := range r.order() {
+		// A batch the process died holding is never flushed, so the shrink it owed is void: the file is
+		// cut only by a commit that lowers the high-water against the generation recovery adopts
+		// (format.md *Trailing truncation*). Without this, a flag set before the crash outlives it and
+		// blames the next lifetime's flush for a lowering that lifetime never made.
+		d.shrinkDue = false
 		images[d.name] = r.image(d)
 		if d.name != "main" && images[d.name] == nil {
 			// A crash during the attachment's create: allowed only while create had not returned.

@@ -2601,6 +2601,10 @@ export class SimRunner {
     this.fs.processDeath();
     const images = new Map<string, Uint8Array | null>();
     for (const d of this.order()) {
+      // A batch the process died holding is never flushed, so the shrink it owed is void: the file is
+      // cut only by a commit that lowers the high-water against the generation recovery adopts
+      // (format.md *Trailing truncation*).
+      d.shrinkDue = false;
       const image = this.image(d);
       images.set(d.name, image);
       if (d.name !== "main" && image === null) {

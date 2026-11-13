@@ -266,8 +266,9 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   - **Deferred interiors** — a commit writes only the nodes whose own content changed; an interior
     whose only change is a child's page keeps its page and the meta carries a `(parent, slot) → page`
     remap list, emptied by a fold. Halves the bytes of a single-row commit (48.5 → 24.2, 84.1 → 40.1,
-    96.1 → 48.1 KB, re-measured at `03cc46acc`). The Go prototype behind `JED_DEFER_INTERIOR=on` keys
-    entries the *old* way (by child page), so landing it is a rewrite of `remap.go`, not a port.
+    96.1 → 48.1 KB, re-measured at `03cc46acc`). The Go core implements the ratified §9 layout behind
+    `JED_DEFER_INTERIOR=on` — (parent, slot) keying, decided before allocation, no held pages
+    (deferred-interior.md §9.8); the byte savings have not been re-measured on it.
   - **Narrow manifest** — an entry becomes `page_index u32, crc32 u32` (8 bytes, not 12), copied from
     the page's existing header checksum instead of a second CRC-64 pass, which was the largest single
     CPU cost of a small commit in the Go core. Prototyped behind `JED_MANIFEST_CRC32=on`, Go only.
@@ -287,7 +288,7 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
     from-scratch golden can carry the region), page-service validation of a client delta's list plus
     wire fixtures, the simulator's `replay` step at a remap entry — a new kind of bound pointer, which
     the encryption security review owes an opinion on — a race review of the commit path, and
-    `unassignPages` undoing a retained interior (§9.8). The stamp itself is **unmeasured**: it
+    `unassignPages` undoing a retained interior (§9.9). The stamp itself is **unmeasured**: it
     postdates both prototypes. _(size: L)_
 
 - [ ] **Upgrade path for older files + an on-disk stability commitment (a 1.0 blocker)** — a reader

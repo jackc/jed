@@ -153,7 +153,7 @@ always written by the commit whose meta names it, under `synchronous = off` too,
 equality, stronger than the window. **The Rust, TS and Ruby validators carry the same `[1, 4)` zero
 check** and need the same change.
 
-**Not yet covered by the stamp**, each recorded for the landing (deferred-interior.md §9.8):
+**Not yet covered by the stamp**, each recorded for the landing (deferred-interior.md §9.9):
 the integrity check validates a live generation with no window (it holds one meta slot, not the
 floor); the page service checks a client delta's page digests but not its pages' stamps; and an
 encrypted page's stamp is sealed, so keyless manifest validation cannot read it — there the AEAD tag
@@ -172,7 +172,7 @@ a pointer binds is the stronger check already.
 
 ## 6. Work if adopted
 
-Folded into the single v53 landing change ([deferred-interior.md](deferred-interior.md) §9.8), which
+Folded into the single v53 landing change ([deferred-interior.md](deferred-interior.md) §9.9), which
 owns the shared surface. This change's own share: `format.md` (*Page header* for the stamp,
 *Commit manifest*, the meta table at offset 40 and 48, inline capacity), `validated-cow.md`
 (including the §4 batch window), `encrypted.md` §6, `page-service.md` and the `spec/pageservice/`

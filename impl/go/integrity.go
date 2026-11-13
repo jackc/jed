@@ -323,7 +323,7 @@ func (k *integrityChecker) checkLiveGeneration(pin *integrityPin) error {
 			return err
 		}
 	}
-	k.remap, _ = decodeRemap(pin.metaRaw)
+	k.remap, _ = decodeRemap(pin.metaRaw, k.pcap.firstBody(), k.gen.meta.pageCount)
 	protected, bad, valid, err := commitManifestDependencies(k.gen.meta, pin.metaRaw, k.paging.pgr.pageSize, k.paging.readBlock, stampWindow{})
 	if err != nil {
 		return err
@@ -1100,7 +1100,9 @@ func (w *integrityTree) visit(ref pageRef, depth int, lo, hi []byte) error {
 	switch pg.pageType {
 	case pageInterior:
 		children, seps, err := parseIntegrityInterior(pg, w.k.pcap)
-		w.k.remapChildren(children)
+		if err == nil {
+			err = w.k.remap.resolve(ref.page, children) // PROTOTYPE (remap.go)
+		}
 		if err != nil {
 			return w.corrupt(ref.page, err.Error())
 		}
@@ -1393,7 +1395,9 @@ func (k *integrityChecker) scanRows(ref pageRef, colTypes []colType, depth int, 
 	switch pg.pageType {
 	case pageInterior:
 		children, _, err := parseIntegrityInterior(pg, k.pcap)
-		k.remapChildren(children)
+		if err == nil {
+			err = k.remap.resolve(ref.page, children) // PROTOTYPE (remap.go)
+		}
 		if err != nil {
 			return err
 		}
@@ -1696,14 +1700,4 @@ func (k *integrityChecker) checkFreeList() error {
 		}
 	}
 	return nil
-}
-
-// remapChildren redirects an interior's child pointers through the generation's remap list
-// (PROTOTYPE, remap.go).
-func (k *integrityChecker) remapChildren(children []pageRef) {
-	for i := range children {
-		if to, ok := k.remap.lookup(children[i].page); ok {
-			children[i] = to
-		}
-	}
 }

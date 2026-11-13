@@ -61,11 +61,10 @@ func manifestInlineArea(ps int, pcap pageCap) (int, int) {
 	return lo, hi
 }
 
-// manifestInlineAreaOf is the inline manifest area of the meta page m as m itself declares it: a
-// meta carrying a remap list (remap.go) ends its manifest before the list.
+// manifestInlineAreaOf is the inline manifest area of the meta page m: under the deferred-interior
+// layout (remap.go) the remap region takes the last third, whether or not it holds entries.
 func manifestInlineAreaOf(m []byte, pcap pageCap) (int, int) {
-	lo, hi := remapArea(len(m), pcap.encrypted())
-	return lo, hi - metaRemapReserve(m)
+	return manifestInlineArea(len(m), pcap)
 }
 
 func manifestInlineCapacity(ps int, pcap pageCap) int {
@@ -308,7 +307,7 @@ func commitManifestDependencies(m meta, raw []byte, pageSize uint32, read func(u
 	last := first - 1
 	seen := uint32(0)
 	// PROTOTYPE (remap.go): a meta with a remap list may keep its catalog chain from an earlier commit.
-	rootSeen, freeHeadSeen := metaRemapReserve(raw) != 0, m.freeListHead == 0
+	rootSeen, freeHeadSeen := deferOn(len(raw), pcap.encrypted()), m.freeListHead == 0
 	size := manifestEntrySize(m.narrow)
 	validate := func(entries []byte, count uint32) (uint32, bool, error) {
 		for i := uint32(0); i < count; i++ {

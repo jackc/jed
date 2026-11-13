@@ -29,11 +29,11 @@ var incrVerify = os.Getenv("JED_INCR_VERIFY") == "on"
 // (leaf_sym.go) keeps pages off the free list by rules of its own, so under it the commit falls back
 // to the compact_growth rebuild.
 //
-// The deferred-interior prototype (remap.go) runs alongside this rule: its remap keys and retained
-// pages are withheld from the list the way the batch's pages are (incrOrphans, incrState.remapHeld,
-// incrementalWrite.retainedIDs). Composing the two exposed a bug in that prototype's own bookkeeping
-// — a remap entry could outlive the page it names, which this rule is the first thing to reuse, and
-// which the old compact_growth rebuild had been healing with its prune (deferred-interior.md §8.3).
+// The deferred-interior prototype (remap.go) runs alongside this rule: its retained interiors are
+// withheld from the list the way the batch's pages are (incrementalWrite.retainedIDs). Its entries,
+// keyed by (parent page, slot), die in the commit that orphans their parent, so they hold no page off
+// the list (deferred-interior.md §9.5) -- the held set the earlier global keying needed, and the bug
+// it caused (§8.3), are gone.
 // JED_DEFER_INTERIOR remains a research switch: §6 there lists the gaps that are still open.
 func incrOn() bool { return !leafSym && !leafSymCol }
 
@@ -58,11 +58,6 @@ type incrState struct {
 	gens []freeGen
 	// held is the orphans written inside the pending relaxed batch (validated-cow.md §4), sorted.
 	held []uint32
-	// remapHeld is the on-disk page ids the committed meta's remap list is keyed by (PROTOTYPE,
-	// remap.go), sorted. Each is a dead page that must stay off the free list while its entry exists:
-	// a pointer legitimately holding a reused id would be redirected. A fold empties the list and the
-	// next commit lists them.
-	remapHeld []uint32
 	// tolerated is the unlisted dead pages the state started with (a reopen loses the held pages and a
 	// one-entry list; a page client's commit leaks its orphans); incrCheck's strict mode allows them.
 	tolerated     int
@@ -145,8 +140,7 @@ func (st *storage) incrLeaked() int64 {
 	}
 	in := st.incr
 	return int64(st.pageCount) - int64(st.paging.cap().firstBody()) - int64(len(st.freePages)) -
-		int64(st.live.live) - int64(chain) - int64(in.manifestCount) - int64(len(in.held)) -
-		int64(len(in.remapHeld))
+		int64(st.live.live) - int64(chain) - int64(in.manifestCount) - int64(len(in.held))
 }
 
 // incrDue is the incremental mode's rebuild trigger.
@@ -161,24 +155,11 @@ func (st *storage) incrDue() bool {
 func (st *storage) incrOrphans(write incrementalWrite, pending []manifestEntry) (listable, held []uint32) {
 	in := st.incr
 	all := append([]uint32(nil), in.tree...)
-	// PROTOTYPE (remap.go): the ids this commit's list is keyed by stay off the free list; the ones the
-	// committed list was keyed by and this one is not — a fold drops every entry — are listed now, like
-	// any other orphan the commit may list (they are dead at its fallback, which still carries the
-	// entry, and reusable only from the next commit).
-	keys := write.remap.held()
-	keySet := make(map[uint32]bool, len(keys)+len(write.retainedIDs))
-	for _, p := range keys {
-		keySet[p] = true
-	}
-	// A retained interior is still live at the page the previous snapshot's node holds, which the
+	keySet := make(map[uint32]bool, len(write.retainedIDs))
+	// PROTOTYPE (remap.go): a retained interior is still live at the page the previous snapshot's node holds, which the
 	// orphan walk reports because it has to descend through that node.
 	for _, p := range write.retainedIDs {
 		keySet[p] = true
-	}
-	for _, p := range in.remapHeld {
-		if !keySet[p] {
-			all = append(all, p)
-		}
 	}
 	if in.known {
 		if write.catalogIDs != nil {
@@ -259,10 +240,6 @@ func (st *storage) incrAfter(txid uint64, write incrementalWrite, plan validated
 	if plan.pageCount < st.pageCount {
 		in.gens = trimGens(in.gens, plan.pageCount)
 	}
-	// PROTOTYPE (remap.go): the list as the commit publishes it — a rebuild has already dropped the
-	// entries whose node is gone (format.go), so this is the surviving set.
-	in.remapHeld = write.remap.held()
-	sortUint32s(in.remapHeld)
 	if write.catalogIDs != nil {
 		in.catalog = write.catalogIDs
 	}
@@ -304,7 +281,6 @@ func (st *storage) incrForeign(free []uint32, manifestPages uint32) {
 	in.catalog, in.gist, in.manifest = nil, nil, nil
 	in.manifestCount = manifestPages
 	in.tree = nil
-	in.remapHeld = nil
 }
 
 func trimGens(gens []freeGen, pageCount uint32) []freeGen {
@@ -490,9 +466,6 @@ func (st *storage) incrCheck(snap *snapshot, write incrementalWrite, plan valida
 	}
 	held := map[uint32]bool{}
 	for _, p := range st.incr.held {
-		held[p] = true
-	}
-	for _, p := range write.remap.held() { // PROTOTYPE (remap.go): withheld, not leaked
 		held[p] = true
 	}
 	var leaked []uint32
