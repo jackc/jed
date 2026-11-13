@@ -343,16 +343,26 @@ whole-engine memory guarantee. Host extensions remain outside these guarantees.
 
 ## Git And Collaboration
 
-- Multiple agents may work from separate containers. Sync through `origin`, not
-  shared working-tree assumptions.
-- Before continuing work reported by another instance, fetch and verify the
-  referenced commit or branch locally.
+- Multiple agent sessions share one checkout, each in its own git worktree, so
+  they share one object store and one ref namespace: a commit in any worktree is
+  readable from every other with no push and no fetch. Working tree, index, and
+  HEAD are per-worktree, so committing — not pushing — is what hands work over.
+- The shared refs are writable by every session: another may move or delete a
+  branch under you, bare `git stash` / `git stash pop` is unsafe in a worktree,
+  and a branch checked out in one worktree cannot be checked out in another.
+  `master` lives in the main checkout, the only place it can be fast-forwarded.
+- Before continuing work reported by another session, verify the referenced
+  commit or branch against git rather than its prose. This is a local lookup; a
+  fetch is needed only for work from another machine.
+- `origin` is the public GitHub repository, so a push publishes. It is not how
+  work reaches another session; push a branch or `master` only when asked.
 - Merge to `master` only when verification is green.
 - `master` history must stay linear. Use fast-forward-only integration, rebased
   branches, squash merges, or cherry-picks; do not create merge commits on
   `master`.
-- A note that work is "landed" or committed at a hash should mean pushed unless
-  it explicitly says branch-only or local-only.
+- A note that work is "landed" or committed at a hash should say whether it is
+  pushed or local-only — not for another session to find it, which needs no
+  push, but because only a pushed commit is published and backed up.
 
 ## Typical Workflow
 

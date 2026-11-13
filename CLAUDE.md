@@ -1077,28 +1077,40 @@ The design is optimized for AI agents even more than for humans. In practice:
   self-test do for the corpus readers.
 - **Spec-first per subsystem.** A subsystem's design doc + the relevant corpus is what an
   agent needs to work it without holding the whole engine in context.
-- **Multiple agent instances; sync through `origin`, not just shared memory.** Several
-  Claude instances run in **separate devcontainers** that share the project memory directory
-  and `project-status.md` (one `/persist` volume) but **not** a git working tree — each
-  container's checkout drifts independently. `origin` is the **public GitHub repository**
-  (`https://github.com/jackc/jed`) — the **only** upstream (the former private hub is gone), so
-  it is the propagation path, and anything pushed there is published. **There is no standing
-  push exception:** push a branch or `master` only when the user asks (the harness default).
-  **Merge to `master` only when green** (`mise run ci` / verify). **`master` keeps a
-  strictly linear history — no merge bubbles, ever.** A merge into `master` must be
-  fast-forward-only; integrate by **rebasing the feature branch onto the current `master`
-  tip** (then ff), or equivalently **squash-merge** or **cherry-pick**. Whatever the
-  mechanism, the result is a flat sequence of commits with no merge commits — never `git
-  merge` a divergent branch in a way that creates a merge commit, and never `git pull`
-  without `--ff-only`/`--rebase` on `master`. (The range-types and upsert landings above —
-  clean fast-forwards / rebased ladders — are the model.) **Memory references
-  *pushed* state:** a "landed / committed at `<hash>`" note means pushed, and must say so
-  (or explicitly "branch-only, NOT pushed — container-local") so the next instance knows
-  whether `git fetch` will find it. Before trusting or continuing another instance's work,
-  `git fetch origin` and verify against your own git (`git cat-file -t <hash>`, `git log`,
-  `git branch -a`) rather than the prose. **Worktrees do not solve this** — they share an
-  object store by absolute path on *one* filesystem, and `/workspaces` is container-local
-  (only `/persist` is shared), so a worktree made in one container is invisible in another.
+- **Many agent sessions, one object store: sync is `git`, and it is local.** Several agent
+  sessions work this machine at once — Claude and Codex both — each in its own **git worktree of
+  one checkout**, not a container of its own. `git worktree list` shows them all and
+  `git rev-parse --git-common-dir` resolves to the same `.git` from every one, so they share
+  **one object store and one ref namespace**: a commit made in any worktree is readable from
+  every other the moment it exists, by SHA or by branch name, with **no push and no fetch**.
+  (This supersedes the former devcontainer setup, where each instance had its own checkout on a
+  container-local filesystem and `origin` was the only propagation path. Worktrees were said not
+  to solve that; they are what solves it now.) What is *not* shared is each worktree's working
+  tree, index and HEAD, so the boundary that makes work visible to another session is
+  **committing**, not pushing — a WIP commit is enough to hand it over. Three consequences:
+  the shared refs are **writable** by every session, so another may move or delete a branch
+  under you (the shared stash stack is the same phenomenon, which is why bare `git stash` /
+  `git stash pop` is forbidden in a worktree); a branch checked out in one worktree **cannot**
+  be checked out in another, and `master` lives in the main checkout, so that is the only place
+  a fast-forward can happen (`git -C <main checkout> merge --ff-only <sha>`, after checking it
+  is clean); and before trusting or continuing another session's work, verify it against your
+  own git (`git cat-file -t <hash>`, `git log`, `git branch -a`) rather than its prose — now a
+  local lookup, so there is no excuse for taking the prose on faith.
+- **`origin` is the public GitHub repository** (`https://github.com/jackc/jed`) — the **only**
+  upstream (the former private hub is gone), and anything pushed there is **published**. It is no
+  longer how work reaches another session, so its purpose is publication, backup, and reaching
+  another machine. **There is no standing push exception:** push a branch or `master` only when
+  the user asks (the harness default). **Merge to `master` only when green** (`mise run ci` /
+  verify). **`master` keeps a strictly linear history — no merge bubbles, ever.** A merge into
+  `master` must be fast-forward-only; integrate by **rebasing the feature branch onto the current
+  `master` tip** (then ff), or equivalently **squash-merge** or **cherry-pick**. Whatever the
+  mechanism, the result is a flat sequence of commits with no merge commits — never `git merge` a
+  divergent branch in a way that creates a merge commit, and never `git pull` without
+  `--ff-only`/`--rebase` on `master`. (The range-types and upsert landings above — clean
+  fast-forwards / rebased ladders — are the model.) **Memory still distinguishes *pushed* state:**
+  a "landed / committed at `<hash>`" note says which it is, "pushed" or "local only, NOT pushed" —
+  not because another session could not otherwise find it (it can, without fetching) but because
+  only a pushed commit is published, backed up, and visible off this machine.
 
 ---
 
