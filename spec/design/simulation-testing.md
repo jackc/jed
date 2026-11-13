@@ -442,18 +442,15 @@ checked structurally.
 of a database. The engine reclaims only when no reader is pinned behind the new version
 (transactions.md §8), so a workload that holds a reader legitimately grows until the readers close;
 only a **quiet** commit — no other session open, a single process, no armed fault — is held to a
-bound. A file commit reclaims in-commit once its pages off the free list (`page_count − free`) pass
-`max(compact_min_pages, compact_growth × L)`, where `L` is the live count at its last reclamation
-(memory.md §8.4, format.md *Reclamation*). A commit only adds pages off the list, so the count it
-began with is a lower bound on the one the engine tests. The
-runner cannot see `L`, so it tracks an upper bound per process lifetime: at an open (or recovery,
-compaction, attach), the page count minus the free list, which is what the engine seeds `L` with
-(format.md *Reclamation*); after each commit, the maximum of that and its live pages plus the pages
-it wrote. Then:
+bound. Every file commit lists the pages it orphans in its own free list (format.md *Reclamation*,
+incremental-reclaim.md), so after a quiet commit every page below its high-water is a meta page,
+live, on the free list, written by the commit itself (its manifest and free-list pages), or one of
+the dead pages the process lifetime began with unlisted (`tolerated`: held pages or a one-entry list
+lost at a close, a file written by an older binary; the core reports it, it is zero on a fresh file,
+and a rebuild resets it). A lifetime begins at an open, a recovery, a compaction, an attach, or the
+corruption step's reopen. Then:
 
-- a quiet commit that **began** with more pages off the list than that threshold must have reclaimed: every page below its
-  high-water is a meta page, live, on the free list, or written by the commit itself (its manifest
-  and free-list pages) — `page_count − 2 − live − free ≤ written`;
+- a quiet commit has `0 ≤ page_count − first_body − live − free ≤ written + tolerated`;
 - the next commit, if quiet too, reuses that free list before it grows the file: its high-water grows
   by at most `max(0, written − free)`.
 

@@ -70,6 +70,7 @@ import {
   unlockCodecSteps,
 } from "./crypto.ts";
 import { COMPACT_GROWTH, COMPACT_MIN_PAGES } from "./costs.ts";
+import { type IncrPlan, mergeSorted, newIncrState } from "./incr_reclaim.ts";
 import {
   type CommitManifest,
   type CommitMeta,
@@ -5737,6 +5738,10 @@ export type IncrementalWrite = {
   // rewritten whole every commit.
   catalogPages: number;
   gistPages: number;
+  // catalogIds and gistIds are the catalog and GiST R-tree pages written, which the next commit orphans
+  // whole (incremental-reclaim.md §3.1).
+  catalogIds: number[];
+  gistIds: number[];
 };
 
 // LiveCount is the live-page accounting of one committed file state (spec/design/memory.md §8.7):
@@ -5780,6 +5785,104 @@ export function* liveAfterSteps(
     throw engineError("data_corrupted", "live page count out of range");
   }
   return { live, catalog: write.catalogPages, gist: write.gistPages };
+}
+
+// liveAfterIdsSteps is liveAfterSteps that also returns the orphaned B-tree and overflow page ids, which
+// an incremental commit lists in its free list (incremental-reclaim.md §3.1, incr_reclaim.ts).
+export function* liveAfterIdsSteps(
+  count: LiveCount,
+  write: IncrementalWrite,
+  prev: Snapshot,
+  paging: SharedPaging,
+): Steps<{ live: LiveCount; ids: number[] }> {
+  const ids: number[] = [];
+  yield* orphanedTreePageIdsSteps(prev, write.kept, write.sharedChains, paging, paging.cap(), ids);
+  const live = count.live + write.pages.length - count.catalog - count.gist - ids.length;
+  if (live < 0 || live > 0xffff_ffff) {
+    throw engineError("data_corrupted", "live page count out of range");
+  }
+  return { live: { live, catalog: write.catalogPages, gist: write.gistPages }, ids };
+}
+
+// orphanedTreePageIdsSteps is orphanedTreePages listing the pages into out instead of counting them.
+// An orphaned leaf's overflow chains are followed page by page (chainPages reads each page's header).
+function* orphanedTreePageIdsSteps(
+  prev: Snapshot,
+  kept: Set<number>,
+  shared: Set<number>,
+  paging: SharedPaging,
+  cap: Cap,
+  out: number[],
+): Steps<void> {
+  for (const st of prev.stores.values()) {
+    const colTypes = st.columnTypes();
+    const spill = anySpillable(colTypes) ? colTypes : null;
+    yield* orphanedNodeIdsSteps(st.treeRoot(), kept, shared, paging, spill, cap, out);
+  }
+  for (const ist of prev.indexStores.values()) {
+    yield* orphanedNodeIdsSteps(ist.treeRoot(), kept, shared, paging, null, cap, out);
+  }
+}
+
+function* orphanedNodeIdsSteps(
+  n: PNode | null,
+  kept: Set<number>,
+  shared: Set<number>,
+  paging: SharedPaging,
+  colTypes: ColType[] | null,
+  cap: Cap,
+  out: number[],
+): Steps<void> {
+  if (n === null || n.page === 0 || kept.has(n.page)) return;
+  if (n.children.length === 0) {
+    yield* orphanedLeafIdsSteps(n.page, n.tag ?? NO_TAG, shared, paging, colTypes, cap, out);
+    return;
+  }
+  out.push(n.page);
+  for (const c of n.children) {
+    if (c.node !== null)
+      yield* orphanedNodeIdsSteps(c.node, kept, shared, paging, colTypes, cap, out);
+    else if (!kept.has(c.page))
+      yield* orphanedLeafIdsSteps(c.page, c.tag ?? NO_TAG, shared, paging, colTypes, cap, out);
+  }
+}
+
+// orphanedLeafIdsSteps lists one orphaned leaf page plus the overflow pages its external values own.
+function* orphanedLeafIdsSteps(
+  pageIdx: number,
+  tag: Uint8Array,
+  shared: Set<number>,
+  paging: SharedPaging,
+  colTypes: ColType[] | null,
+  cap: Cap,
+  out: number[],
+): Steps<void> {
+  out.push(pageIdx);
+  if (colTypes === null) return;
+  const pg = parsePage(yield* paging.readBodyPageSteps(pageIdx, tag));
+  if (pg.pageType !== PAGE_LEAF) throw engineError("data_corrupted", "expected a B-tree leaf page");
+  const n = pg.itemCount;
+  const dirs = parsePaxLeaf(pg.payload, n, colTypes);
+  for (let c = 0; c < colTypes.length; c++) {
+    if (fixedValueWidth(colTypes[c]!) !== null) continue;
+    const tyref: TypeRef = { cols: colTypes, idx: c };
+    const sp: Span = { buf: pg.payload, start: 0, end: 0 };
+    for (let i = 0; i < n; i++) {
+      if (!paxChainSpan(pg.payload, dirs, c, i, sp)) continue;
+      const v = readValueLazy(tyref, sp.buf, sp.start, sp.end, null, cap.tag);
+      if (v.kind !== "unfetched") continue;
+      if (v.ref.form !== TAG_EXTERNAL && v.ref.form !== TAG_EXTERNAL_COMP) continue;
+      if (shared.has(v.ref.firstPage)) continue; // kept by a rewritten record (large-values.md §15)
+      const pages = yield* chainPagesSteps(
+        v.ref.firstPage,
+        v.ref.firstTag ?? NO_TAG,
+        v.ref.storedLen,
+        (p, t) => paging.readBodyPageSteps(p, t),
+        cap.tag,
+      );
+      out.push(...pages);
+    }
+  }
 }
 
 // orphanedTreePages counts the B-tree pages of prev (table data trees and B-tree/GIN index trees) that
@@ -6070,6 +6173,7 @@ function serializeIncremental(
   const kept = new Set<number>();
   const shared = new Set<number>();
   let gistPages = 0;
+  const gistIds: number[] = [];
   const rootDataPage: TreeRef[] = new Array(keys.length).fill(NO_TREE);
   const indexRoots: TreeRef[][] = keys.map(() => []);
   const indexColTypes: ColType[] = [];
@@ -6115,6 +6219,7 @@ function serializeIncremental(
               // keys were corrupt.
               checkGistPage(p, cap);
               gistPages++;
+              gistIds.push(p.pageNo);
               const { bytes, tag } = seal.page(
                 p.pageNo,
                 p.pageType,
@@ -6180,6 +6285,8 @@ function serializeIncremental(
     sharedChains: shared,
     catalogPages: catPages.length,
     gistPages,
+    catalogIds: catPages.slice(),
+    gistIds,
   };
 }
 
@@ -6722,13 +6829,15 @@ export function collectTreePages(n: PNode | null, reached: Set<number>): void {
 // readFreeList reads a persisted free-list (v25) by following the page_type 7 chain from head (meta
 // offset 28) through the pager, collecting every free page index. head === 0 is an empty free-list. The
 // inverse of the serialization in serializeFreeList; replaces the v24 reconstruct-on-open reachability
-// walk (spec/fileformat/format.md *Reclamation*).
+// walk (spec/fileformat/format.md *Reclamation*). chainOut, when given, receives the chain's own page
+// ids in chain order (incremental-reclaim.md §3.1: the next commit orphans them).
 function* readFreeListSteps(
   paging: SharedPaging,
   head: number,
   headTag: Uint8Array,
   pageCount: number,
   protectedPages: Set<number>,
+  chainOut: number[] | null = null,
 ): Steps<number[]> {
   const free: number[] = [];
   const chain = new Set<number>();
@@ -6740,6 +6849,7 @@ function* readFreeListSteps(
     if (p < first || p >= pageCount || chain.has(p))
       throw engineError("data_corrupted", "invalid free-list chain");
     chain.add(p);
+    chainOut?.push(p);
     const pg = parsePage(yield* paging.readBodyPageSteps(p, tag));
     if (pg.pageType !== PAGE_FREELIST)
       throw engineError("data_corrupted", "expected a free-list page");
@@ -6882,6 +6992,9 @@ export function trailingRun(safe: number[], high: number): { below: number[]; st
 // unioned in so a wholesale-rewritten GiST R-tree is never freed); CARRY (otherwise): the persisted list
 // is freeRemaining. Either way the chain pages come from freeRemaining. Returns the chain pages, head,
 // the new free-list, the new high-water, and the live count to remember (unchanged when not compacting).
+// incr is an incremental commit's plan (incremental-reclaim.md §3.2, incr_reclaim.ts): its orphans join
+// the persisted list but never the safe pages this commit may draw from, and its leak trigger replaces
+// the compact_growth rule.
 export function* planFreeListSteps(
   snap: Snapshot,
   paging: SharedPaging,
@@ -6898,17 +7011,20 @@ export function* planFreeListSteps(
   pending: { index: number }[] = [],
   allowed: Set<number> | null = null,
   truncate = false,
+  incr: IncrPlan | null = null,
 ): Steps<FreeListPlan> {
   // liveAtCompaction=0 is the shared-mode orphan sentinel: a co-resident commit deliberately
   // persisted no reusable free list, so the first proven-alone commit must reconstruct regardless
   // of the ordinary periodic threshold.
-  const compact =
-    canReclaim &&
-    (liveAtCompaction === 0 || reclaimDue(pageCount, freeRemaining.length, liveAtCompaction));
+  const due =
+    incr !== null ? incr.due : reclaimDue(pageCount, freeRemaining.length, liveAtCompaction);
+  const compact = canReclaim && (liveAtCompaction === 0 || due);
   let persistList = freeRemaining;
+  if (incr !== null && !compact) persistList = mergeSorted(freeRemaining.slice(), incr.listed);
   let newLive = liveAtCompaction;
   let newGen = genTxid;
   if (compact) {
+    reclaimWalks.count++;
     const reached = yield* reachablePagesSteps(snap, paging, catRoot, catTag);
     for (const w of written) reached.add(w.index);
     newLive = reached.size;
@@ -6989,9 +7105,13 @@ export function* planFreeListSteps(
       newLive,
       newGen,
       manifestIds,
+      rebuilt: compact,
     };
   }
 }
+
+// reclaimWalks counts the reachability rebuilds of file commits (test observability).
+export const reclaimWalks = { count: 0 };
 
 // FreeListPlan is a commit's free-list plan (planFreeListSteps).
 export type FreeListPlan = {
@@ -7004,6 +7124,8 @@ export type FreeListPlan = {
   newLive: number;
   newGen: bigint;
   manifestIds: number[];
+  // rebuilt is whether the commit rebuilt the free list by a reachability walk.
+  rebuilt: boolean;
 };
 
 // loadEnginePaged opens a file-backed database demand-paged (spec/design/pager.md, P6.4b): it loads
@@ -7152,6 +7274,8 @@ function* loadAtMetaSteps(
   let catPage = mt.rootPage;
   let catTag = mt.rootTag;
   const catSeen = new Set<number>();
+  // The GiST R-tree pages the load reads (incr_reclaim.ts: the next commit orphans them whole).
+  const loadedGist: number[] = [];
   // typesChecked records that every composite type registered so far has passed
   // validateCompositeTypes. A table resolves its column types as it is registered, so the types it
   // reaches must be known-present and acyclic first (composite.md §3).
@@ -7295,6 +7419,7 @@ function* loadAtMetaSteps(
           yield* readGistLeafKeysSteps(
             function* (p, t) {
               live.gist++;
+              loadedGist.push(p);
               at.gist?.(p);
               const pg2 = parsePage(yield* paging.readBodyPageSteps(p, t));
               return { pageType: pg2.pageType, itemCount: pg2.itemCount, payload: pg2.payload };
@@ -7353,14 +7478,17 @@ function* loadAtMetaSteps(
   db.pageCount = mt.pageCount;
   // v25: load the free-list directly from the persisted chain (meta offset 28) — no reachability walk
   // (spec/fileformat/format.md *Reclamation*).
-  if (adopt !== null)
+  if (adopt !== null) {
+    db.freeChain = [];
     db.freePages = yield* readFreeListSteps(
       paging,
       mt.freeListHead,
       mt.freeListTag,
       mt.pageCount,
       protectedPages,
+      db.freeChain,
     );
+  }
   // Every persisted free page is dead at the committed version (the free-list is "as of" mt.txid), so its
   // reuse generation is mt.txid: at open oldest_live == committed and any later reader pins ≥ the committed
   // version, so reuse is safe (transactions.md §8, the free-list generation gate).
@@ -7370,6 +7498,32 @@ function* loadAtMetaSteps(
   const estimate = mt.pageCount - db.freePages.length;
   if (estimate > 0) db.liveAtCompaction = estimate;
   db.live = live;
+  if (adopt !== null) {
+    // The committed state's wholesale pages, which the next commit orphans (incr_reclaim.ts): the
+    // catalog chain and GiST pages just read, and the meta's manifest-overflow chain.
+    const inc = newIncrState();
+    inc.known = true;
+    inc.gist = loadedGist;
+    inc.manifestCount = mt.overflowCount;
+    inc.catalog = [...catSeen].sort((a, b) => a - b);
+    let id = mt.overflowHead;
+    for (let i = 0; i < mt.overflowCount; i++) {
+      const block = yield* paging.readPageSteps(id);
+      inc.manifest.push(id);
+      id = ((block[8]! << 24) | (block[9]! << 16) | (block[10]! << 8) | block[11]!) >>> 0;
+    }
+    // A reopen loses the held pages and a one-entry list: the dead pages it starts with unlisted.
+    inc.tolerated = Math.max(
+      0,
+      mt.pageCount -
+        capFirstBody(cap) -
+        db.freePages.length -
+        mt.livePages -
+        db.freeChain.length -
+        mt.overflowCount,
+    );
+    db.incr = inc;
+  }
   db.committed = snap;
   db.paging = paging;
   // The floor slot (validated-cow.md §4): the selected slot, or txid & 1 when both slots carry it.

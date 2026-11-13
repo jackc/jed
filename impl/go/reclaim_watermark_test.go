@@ -28,9 +28,6 @@ func countOf(db *Database, rd *Session) (int64, error) {
 }
 
 func TestFallbackReaderSnapshotIsolationUnderReclamation(t *testing.T) {
-	if incrOn() {
-		t.Skip("PROTOTYPE (incr_reclaim.go): drives the rebuild path, which incremental reclamation does not take here")
-	}
 	path := filepath.Join(t.TempDir(), "fallback.jed")
 	db, err := CreateDatabase(CreateOptions{Path: path, PageSize: 256, SkipFsync: true})
 	if err != nil {
@@ -50,17 +47,20 @@ func TestFallbackReaderSnapshotIsolationUnderReclamation(t *testing.T) {
 	var pinnedCount int64
 	var pinErr error
 
-	// The hook fires in the persist→publish window. It acts ONLY on a commit that compacted — i.e. one
-	// that advanced freeGenTxid past the still-published version, so a page reachable at the published
-	// (fallback) version has just entered the reusable free-list. That is exactly the version the reader
+	// The hook fires in the persist→publish window. It acts ONLY on a commit that put a page reachable
+	// at the still-published (fallback) version on the free list: one that compacted (advanced
+	// freeGenTxid past the published version) or that listed its orphans as a newer generation
+	// (incremental reclamation, incr_reclaim.go). That is exactly the version the reader
 	// below pins, and the version a subsequent reuse-commit would overwrite on the buggy path.
 	afterPersistHook = func() {
 		if hookFired.Load() {
 			return
 		}
 		published := db.core.roots.Load().committed.txid
-		if db.core.storage.freeGenTxid <= published {
-			return // this commit did not compact — nothing fresh in the reusable free-list yet
+		st := db.core.storage
+		listed := st.incr != nil && len(st.incr.gens) > 0 && st.incr.gens[len(st.incr.gens)-1].txid > published
+		if st.freeGenTxid <= published && !listed {
+			return // nothing reachable at the published version entered the free list yet
 		}
 		hookFired.Store(true)
 		close(readerReady)

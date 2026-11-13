@@ -1947,7 +1947,7 @@ func simMetaOf(image []byte, ps uint32, v uint64) (pageCount, live uint32, ok bo
 }
 
 // simIncrState is database d's first body page and the unlisted dead pages its incremental
-// reclamation state carries (PROTOTYPE, incr_reclaim.go).
+// reclamation state carries (incr_reclaim.go).
 func (r *simRunner) simIncrState(d *simDB) (first uint32, tolerated int) {
 	st, err := r.db.core.withStorage(d.name)
 	if err != nil {
@@ -1991,15 +1991,17 @@ func (r *simRunner) observeGrowth(d *simDB) {
 
 // checkGrowth checks the reader-aware bounded-growth invariant after a commit published a new
 // version of d (simulation-testing.md §8.3). With no reader pinned, no other process, and no fault,
-// the engine reclaims in the commit once the pages off its free list pass compact_growth × the live
-// count at its last reclamation (memory.md §8.4); readers legitimately hold reclamation back, so a
-// commit with one open is not checked. A commit only adds pages off the list (each page it allocates
-// leaves the list or grows the file), so the count it began with is a lower bound. Two checks follow:
-//   - a quiet commit that began with more pages off the list than max(compact_min_pages,
-//     compact_growth × an upper bound on that live count) must have reclaimed: every page below the
-//     high-water is meta, live, free, or written by the commit itself (its manifest and free-list
-//     pages);
+// every file commit lists the pages it orphans in its own free list (incremental-reclaim.md §5);
+// readers legitimately hold reuse back, so a commit with one open is not checked. Two checks follow:
+//   - after a quiet commit every page below the high-water is meta, live, free, or written by the
+//     commit itself (its manifest and free-list pages), plus the dead pages the lifetime began with
+//     unlisted, which only the leak-triggered rebuild returns;
 //   - the next quiet commit reuses that free list before it grows the file.
+//
+// Under a Go-only prototype that turns incremental reclamation off (incrOn), the commit instead
+// rebuilds once the pages off its free list pass compact_growth × the live count at its last
+// reclamation, and the first check applies only to a commit that began past that threshold (a commit
+// only adds pages off the list, so the count it began with is a lower bound).
 func (r *simRunner) checkGrowth(i int, d *simDB, quiet bool) {
 	if r.service {
 		return
@@ -2058,7 +2060,7 @@ func (r *simRunner) checkGrowth(i int, d *simDB, quiet bool) {
 	}
 	reclaimed := false
 	if incrOn() && quiet {
-		// PROTOTYPE (incr_reclaim.go): every quiet commit lists what it orphans, so the file is its live
+		// Every quiet commit lists what it orphans (incremental-reclaim.md §5), so the file is its live
 		// pages, its free list, and the pages the commit itself wrote that nothing lists (its free-list
 		// chain and manifest overflow), plus the dead pages this lifetime began with unlisted (a held
 		// batch or a one-entry list lost at close), which only a rebuild returns.

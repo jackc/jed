@@ -18,6 +18,7 @@ import type { Engine } from "../executor.ts";
 import { FORMAT_VERSION } from "../format.ts";
 import type { LockHost } from "../lockhost.ts";
 import type { SharedPaging } from "../paging.ts";
+import { reuseGeneration } from "../incr_reclaim.ts";
 import { armClientBatch, bindBatchDeadline } from "../persist.ts";
 import type { ServiceEngineFacts, ServiceOwnerHandle, ServicePending } from "../shared.ts";
 import { type BlockingChannel, ProcessWorker } from "./blocking.ts";
@@ -185,7 +186,12 @@ export class ServiceOwner implements ServiceOwnerHandle {
     // The service applies the time-based flush's rule 4 to the batch its relaxed clients plan against and
     // commit into, so the batch deadline lives in the shared state (validated-cow.md §4.1).
     bindBatchDeadline(storage, owner.state);
-    owner.state.setEngineFactsLocked(storage.freeGenTxid, storage.liveAtCompaction, null);
+    owner.state.setEngineFactsLocked(
+      reuseGeneration(storage),
+      storage.liveAtCompaction,
+      null,
+      storage.incr?.held.length ?? 0,
+    );
     host.writeOwnerRecord(dbPath, {
       serving: owner.endpoint !== "",
       uid,
@@ -244,7 +250,12 @@ export class ServiceOwner implements ServiceOwnerHandle {
     this.state.lock();
     try {
       this.state.publishLocked(txid, meta, written);
-      this.state.setEngineFactsLocked(facts.freeGenTxid, facts.liveAtCompaction, facts.localOldest);
+      this.state.setEngineFactsLocked(
+        facts.freeGenTxid,
+        facts.liveAtCompaction,
+        facts.localOldest,
+        facts.heldPages,
+      );
     } finally {
       this.state.unlock();
     }
@@ -257,7 +268,12 @@ export class ServiceOwner implements ServiceOwnerHandle {
     // A rekey replaced the data key, or encrypted or decrypted the file (encrypted.md §12).
     this.state.setKeyLocked(paging.codec()?.dataKey() ?? null);
     paging.setBatchMirror(this.state);
-    this.state.setEngineFactsLocked(facts.freeGenTxid, facts.liveAtCompaction, facts.localOldest);
+    this.state.setEngineFactsLocked(
+      facts.freeGenTxid,
+      facts.liveAtCompaction,
+      facts.localOldest,
+      facts.heldPages,
+    );
   }
 
   epoch(): number {

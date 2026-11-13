@@ -24,6 +24,17 @@ import {
   type Durability,
   type IdleTarget,
 } from "./idle_flush.ts";
+import {
+  excludeNewer,
+  incrActive,
+  incrAfter,
+  incrDue,
+  incrLeaked,
+  incrMerge,
+  incrNewer,
+  incrOrphans,
+  type IncrPlan,
+} from "./incr_reclaim.ts";
 import { cacheLeaves } from "./paging.ts";
 import { wallClock } from "./seam.ts";
 import type { SpillSink } from "./spill.ts";
@@ -32,6 +43,7 @@ import {
   incrementalImage,
   incrementalImageSteps,
   type IncrementalWrite,
+  liveAfterIdsSteps,
   liveAfterSteps,
   type LiveCount,
   metaPage,
@@ -95,7 +107,15 @@ function* admitFileSteps(
   prev: Snapshot,
   budget: BudgetCtx | null,
 ): Steps<LiveCount> {
-  const live = yield* liveAfterSteps(db.live, write, prev, db.paging!);
+  let live: LiveCount;
+  if (incrActive(db)) {
+    // An incremental commit lists its B-tree and overflow orphans (incr_reclaim.ts).
+    const after = yield* liveAfterIdsSteps(db.live, write, prev, db.paging!);
+    live = after.live;
+    db.incr!.tree = after.ids;
+  } else {
+    live = yield* liveAfterSteps(db.live, write, prev, db.paging!);
+  }
   const limit = db.storageBudget.limit;
   if (
     budget === null ||
@@ -280,6 +300,9 @@ export function* precheckBudgetSteps(
 // budget is the domain's committed-storage context (memory.md §8.3, §8.7): an in-memory store is
 // planned under it, a durable one admitted under its file form. A durable commit without one (a bare
 // engine's persistHook) takes its live-page delta against db.committed, still the previous snapshot.
+// oldest is the reader watermark the commit was gated by, when the caller knows it: it lets older
+// free-list generations be reused under a pinned reader (incremental-reclaim.md §3.3). A bare engine's
+// commit (canReclaim undefined) reuses ungated, so every generation merges.
 export function persistImpl(
   db: Engine,
   snap: Snapshot,
@@ -287,8 +310,9 @@ export function persistImpl(
   canReuse = true,
   budget: BudgetCtx | null = null,
   truncate = true,
+  oldest: bigint | null = null,
 ): IncrementalWrite {
-  return runSync(persistSteps(db, snap, canReclaim, canReuse, budget, truncate));
+  return runSync(persistSteps(db, snap, canReclaim, canReuse, budget, truncate, oldest));
 }
 
 // persistSteps is persistImpl as one continuation (ts-runtime.md §11.2): the synchronous internal API
@@ -301,6 +325,7 @@ export function* persistSteps(
   canReuse = true,
   budget: BudgetCtx | null = null,
   truncate = true,
+  oldest: bigint | null = null,
 ): Steps<IncrementalWrite> {
   // The batch deadline (validated-cow.md §4.1): the idle flusher is held off from the clock reading to
   // the publish, so it never runs inside a commit that awaits. The file's owner times every batch, a
@@ -308,11 +333,20 @@ export function* persistSteps(
   // times none.
   const deadline = timedFile(db) ? db.batchDeadline : null;
   if (deadline === null) {
-    return yield* persistBodySteps(db, snap, canReclaim, canReuse, budget, truncate, null);
+    return yield* persistBodySteps(db, snap, canReclaim, canReuse, budget, truncate, oldest, null);
   }
   deadline.enter();
   try {
-    return yield* persistBodySteps(db, snap, canReclaim, canReuse, budget, truncate, deadline);
+    return yield* persistBodySteps(
+      db,
+      snap,
+      canReclaim,
+      canReuse,
+      budget,
+      truncate,
+      oldest,
+      deadline,
+    );
   } finally {
     deadline.leave();
   }
@@ -325,6 +359,7 @@ function* persistBodySteps(
   canReuse: boolean,
   budget: BudgetCtx | null,
   truncate: boolean,
+  oldest: bigint | null,
   deadline: BatchDeadline | null,
 ): Steps<IncrementalWrite> {
   let allowed: Set<number> | null = null;
@@ -346,7 +381,16 @@ function* persistBodySteps(
         pending = false;
       }
     }
+    // Fold the generations no reader can observe; the rest stay off this commit's reuse
+    // (incremental-reclaim.md §3.3).
+    let newer: Set<number> | null = null;
+    if (incrActive(db)) {
+      if (canReclaim === undefined || canReclaim) incrMerge(db, snap.txid);
+      else if (oldest !== null) incrMerge(db, oldest);
+      newer = incrNewer(db);
+    }
     allowed = yield* reuseAllowedSteps(db, pending);
+    if (newer !== null) allowed = excludeNewer(allowed, newer, db.freePages);
   }
   const write =
     db.paging !== null && db.persistHook === null
@@ -624,6 +668,14 @@ function* commitFileSteps(
   // A relaxed batch's pending set joins the manifest and stays off the free list (validated-cow.md §4).
   const relaxed = relaxedFile(db);
   const pending = batchEntries(db);
+  // An incremental commit lists what it orphans (incr_reclaim.ts); the leak trigger decides a rebuild.
+  let incr: IncrPlan | null = null;
+  let listed: number[] = [];
+  let held: number[] = [];
+  if (incrActive(db)) {
+    ({ listable: listed, held } = incrOrphans(db, pending));
+    incr = { listed, due: incrDue(db) };
+  }
   const plan = yield* planFreeListSteps(
     snap,
     paging,
@@ -642,6 +694,7 @@ function* commitFileSteps(
     // Only the file's owner lowers the high-water, and only against a durable floor: a commit inside a
     // relaxed batch may not cut pages the batch has yet to make durable (validated-cow.md §4).
     truncate && pending.length === 0,
+    incr,
   );
   yield* verifyLiveCountSteps(snap, paging, write, live);
   yield* paging.reserveSteps(plan.newPageCount);
@@ -687,11 +740,18 @@ function* commitFileSteps(
   const capReached = relaxed && paging.batchCapReached();
   db.lastCommitMeta = meta;
   db.lastCommitWritten = [...write.pages, ...plan.pages, ...manifest.pages].map((pg) => pg.index);
+  if (incr !== null) incrAfter(db, snap.txid, write, plan, listed, held, pending);
   db.pageCount = plan.newPageCount;
   db.freePages = plan.persisted;
+  db.freeChain = plan.pages.map((pg) => pg.index);
   db.liveAtCompaction = plan.newLive;
   db.freeGenTxid = plan.newGen;
   db.live = live;
+  if (incr !== null && db.incr!.unknownBefore) {
+    // A commit after a foreign one could not orphan that commit's wholesale pages: they stay
+    // unlisted until a rebuild.
+    db.incr!.tolerated = Math.max(0, incrLeaked(db));
+  }
   if (capReached) yield* capFlushSteps(db);
   return capReached;
 }

@@ -565,7 +565,7 @@ func planValidatedCommit(snap *snapshot, paging *sharedPaging, write incremental
 		kept := false
 		switch {
 		case freeKeptChainOff:
-		case incr != nil: // PROTOTYPE (incr_reclaim.go): the list grows in the middle; always a fresh chain
+		case incr != nil: // the list grows in the middle; always a fresh chain
 		case rebuilt || prevChain == nil:
 		case len(persist) == 0:
 			kept = true // the list is used up: no chain

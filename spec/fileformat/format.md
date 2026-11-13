@@ -1970,10 +1970,12 @@ chunks of `entries_per_page = (page_size − 16) / 4`, one page per chunk, linke
 `next_page`; `free_list_head` (meta offset 28) points at the first chunk. An empty free-list is
 `free_list_head = 0` and **no** `page_type 7` page.
 
-### Reclamation (the free-list, v25 — persisted + continuous within-session)
+### Reclamation (the free-list, v25 — persisted; each commit lists its orphans)
 
 Every commit copy-on-writes a path of pages, **orphaning** the pages the old root referenced but
-the new one no longer does. Two mechanisms recover them; through v24 only the first existed.
+the new one no longer does. The persisted free-list holds them; through v24 it was rebuilt at every
+open, and through format v52's first binaries a file commit left its orphans unlisted until a
+periodic rebuild. The list's bytes are unchanged; what a commit puts on it is the rule below.
 
 - **Persisted free-list (v25).** The allocator (step 1) draws dirty/catalog pages from the
   free-list (lowest index first) before extending the file, exactly as before; at commit the
@@ -1989,42 +1991,66 @@ the new one no longer does. Two mechanisms recover them; through v24 only the fi
   are excluded from the list they carry and never handed back for reuse until the next commit
   orphans them.
 
-- **Continuous within-session reclamation (v25).** Pages an old root orphans **during** the
-  session are returned to the free-list **within the session** (not only at the next open):
-  periodically, the writer rebuilds the free-list as `[2, page_count)` minus the pages reachable
-  from the committed root (the catalog chain, every table/index node, live overflow chains, **and**
-  the current free-list pages). **The trigger** measures the pages **off the free list** —
-  `page_count − |free-list|`, the live pages plus the dead ones no list holds yet — not the
-  high-water: a commit rebuilds when that count, taken after its own tree and catalog pages are
-  allocated, exceeds both `compact_min_pages` and `compact_growth × L`, where `L` is the live count
-  the last rebuild found (seeded at open with `page_count − |free-list|`; the constants are
-  `[reclamation]` in `spec/cost/schedule.toml`). The high-water shrinks only by *Trailing
-  truncation* below, which takes pages off the list and the high-water together, so a trigger on
-  `page_count` alone would, once a file first passed `2 × L`, stay true and walk the whole
-  database on every later commit. Measured off the list, a rebuild returns the
-  count to `L`, the next one waits until about `L` more dead pages have accumulated, and the
-  rebuild is amortized O(height)/commit. The file grows only when the free-list is empty, when
-  every page below the high-water is off the list, so `page_count` stays within about `2 ×` the
-  largest live count. This
-  is what keeps the **persisted** free-list bounded: without it, orphans would accumulate untouched
-  (reconstruct-on-open used to sweep them, but v25 no longer walks on open), so the file would grow
-  without bound across sessions. A pure in-memory database (no meta, never reopened) gets this
-  reclamation with no persistence.
+- **Each file commit lists its orphans (incremental reclamation).** Commit `N`'s **orphan set** is
+  every page reachable from `N−1`'s meta that `N`'s meta does not reach: the B-tree nodes outside the
+  subtrees `N` shares with `N−1` and the overflow chains of the orphaned leaves (the same walk that
+  maintains `live_pages`, now listing ids; a chain is followed page by page), `N−1`'s catalog chain,
+  its GiST R-tree pages (rewritten whole every commit), its free-list chain pages, and its
+  manifest-overflow pages (validated-cow.md §2). **Commit `N` lists its orphan set in its own
+  persisted free list — merged in ascending order with the entries it did not consume — and does not
+  reuse any of it.** Every orphan is reachable from `N`'s fallback meta (`N−1`), so it joins the
+  list `N` persists but not the *safe* pages `N` draws its tree, catalog, free-list, and manifest
+  pages from; from `N+1` on it is an ordinary free page, subject to the watermark below and, under
+  `synchronous = off`, to the batch rule (validated-cow.md §4, which also defines the **held** pages:
+  orphans written inside the pending batch, listed by the first commit planned with nothing
+  pending). Because the orphans are persisted with the commit that created them, a close or a crash
+  leaks none of them. The ids of the catalog, GiST, and manifest pages are not derivable from `N`'s
+  snapshot, so the writer keeps them from the commit that wrote them; at open they come from what the
+  load reads anyway (the catalog chain, the GiST pages, and the selected meta's manifest chain). See
+  [incremental-reclaim.md](../design/incremental-reclaim.md).
+
+- **The backstop rebuild.** The writer can still rebuild the free list as `[2, page_count)` minus
+  the pages reachable from the committed root (the catalog chain, every table/index node, live
+  overflow chains, **and** the current free-list pages) — a walk of the whole reachable database.
+  With every commit listing its orphans it runs only to recover **leaks**: dead pages no list holds
+  (held pages lost at a close or crash, a one-entry list kept only in memory, a page client's commit,
+  which plans against its owner's list and lists nothing, or a file written by an older binary).
+  Their count is exact in the committed state:
+
+      leaked = page_count − first_body_page − |free list| − live_pages
+               − free-list chain pages − manifest-overflow pages − held pages
+
+  A commit rebuilds, when it may (no older reader, owner only), when `leaked > compact_min_pages`
+  and `leaked × leak_den > live_pages` (`[reclamation]` in `spec/cost/schedule.toml`), measured
+  before the commit. The first commit of a handle whose reclamation state is unknown (the
+  `liveAtCompaction = 0` sentinel of a fresh file or a page-service handoff) also rebuilds. The
+  file therefore holds its live pages, the pages the last commit wrote, and what readers and batches
+  legitimately hold back — not up to twice its live size, as the v25 periodic rule
+  (`compact_growth × L`) allowed.
+
+- **In-memory stores keep the periodic rebuild.** A pure in-memory database or attachment and a
+  session temp domain (no meta, never reopened) rebuild after a commit once the pages off their free
+  list — `page_count − |free-list|`, the live pages plus the dead ones no list holds — exceed both
+  `compact_min_pages` and `compact_growth × L`, where `L` is the live count the last rebuild found.
+  Measured off the list rather than by `page_count` (which shrinks only by truncation), the rebuild
+  is amortized O(height)/commit.
 
 **The watermark (transactions.md §8).** A page reachable at a live reader's pinned version must not be
 recycled, so **reuse** of the free-list is gated on the reader-liveness watermark. Each storage tracks
-`free_gen_txid` — the version the current free-list is "as of" (the last rebuild's `txid`, or the
-committed version at open); every page in the list is dead at that version. A commit reuses the list
-only when `oldest_live_txid ≥ free_gen_txid`; otherwise it allocates from the high-water and the list
-waits (still persisted). The gate covers **both** the data-page allocator **and** the free-list
-**chain** pages (which overwrite in place — torn-write-safe at the fallback snapshot, but not
-reader-safe). On an otherwise-idle single writer `oldest_live_txid == committed.txid ≥ free_gen_txid`,
-so the gate always passes and the on-disk bytes a single-handle commit writes are **unchanged** — the
-gate only *defers* reuse under an older-pinning reader, never changes *which* pages a commit picks.
-This is what makes the watermark load-bearing (through v24 the reconstruct-on-open list held only pages
-already dead at open, so the gate held trivially). Paired with **atomic pin registration** (a reader
-loads the committed root and registers its pin under one lock, and publish takes the same lock) so the
-watermark can never miss a reader mid-registration.
+`free_gen_txid` — the version the base free-list is "as of" (the last rebuild's `txid`, or the
+committed version at open); every page in it is dead at that version. Each later commit's listed
+orphans form a **generation** tagged with that commit's `txid`, kept in memory only. Before planning,
+every generation whose `txid ≤ oldest_live_txid` merges into the base (`free_gen_txid` rises to the
+largest merged `txid`), and a commit reuses only the base, and only when
+`oldest_live_txid ≥ free_gen_txid`; otherwise it allocates from the high-water and the list waits
+(still persisted). At open every listed page is dead at the committed version and no reader exists,
+so the whole list is one generation again. The gate covers **both** the data-page allocator **and**
+the free-list **chain** pages (which overwrite in place — torn-write-safe at the fallback snapshot,
+but not reader-safe). On an otherwise-idle single writer `oldest_live_txid == committed.txid`, so
+every generation merges and the gate always passes: the gate only *defers* reuse under an
+older-pinning reader, never changes *which* pages a commit picks. Paired with **atomic pin
+registration** (a reader loads the committed root and registers its pin under one lock, and publish
+takes the same lock) so the watermark can never miss a reader mid-registration.
 
 ### Trailing truncation
 
@@ -2041,7 +2067,7 @@ written: they are past `page_count`. The run is empty, and the commit unchanged,
 
 - reuse is gated off (`oldest_live_txid < free_gen_txid`, *The watermark* above): `S` is then empty,
   because a page dead at the free-list's generation may still be reachable from a live reader's
-  version;
+  version; a page of an unmerged generation is never in `S` either;
 - the commit is a page client's planned `CommitDelta`: only the owner lowers the high-water
   ([../design/page-service.md](../design/page-service.md) §6), and an owner rejects a delta whose
   page count shrinks;
@@ -2055,8 +2081,8 @@ written: they are past `page_count`. The run is empty, and the commit unchanged,
   commits of the batch draw from the lowered high-water, which hands out only those pages.
 
 Only pages of `S` are truncated, never this commit's own orphans (still reachable from the
-fallback), so a reclamation rebuild's newly freed top pages are truncated by the **next** commit,
-once they are on the persisted list. Every truncated page is dead at the new and the fallback
+fallback), so the top pages a commit orphans (or a rebuild finds dead) are truncated by the **next**
+commit, once they are on the persisted list and safe. Every truncated page is dead at the new and the fallback
 snapshot and listed in no manifest, so recovery (either slot) never reads it, and a later commit
 that grows the file again writes each page before anything references it. The rule is a pure
 function of the committed state, identical in every core.

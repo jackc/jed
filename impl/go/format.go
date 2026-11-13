@@ -1220,8 +1220,8 @@ type incrementalWrite struct {
 	retained uint32
 	remap    *remapState
 	cat      *catState
-	// PROTOTYPE (incr_reclaim.go): the catalog pages written (nil when the chain was kept) and the GiST
-	// R-tree pages written, which the next commit orphans whole.
+	// catalogIDs and gistIDs are the catalog pages written (nil when the chain was kept) and the GiST
+	// R-tree pages written, which the next commit orphans whole (incr_reclaim.go).
 	catalogIDs []uint32
 	gistIDs    []uint32
 }
@@ -1824,7 +1824,7 @@ func loadEngineSharedPagingAt(paging *sharedPaging, env *Environment, at loadAt)
 	// walk — so the catalog + skeleton load no longer tracks a reached set. The live count is the meta's
 	// (v34); the catalog chain and the GiST R-trees it rewrites whole are counted as they are read.
 	live := liveCount{live: mt.livePages}
-	var loadedGist []uint32 // PROTOTYPE (incr_reclaim.go)
+	var loadedGist []uint32 // incr_reclaim.go
 	catPage := pageRef{page: mt.rootPage, tag: mt.rootTag}
 	catSeen := map[uint32]bool{}
 	// typesChecked records that every composite type registered so far has passed
@@ -2134,14 +2134,9 @@ func loadEngineSharedPagingAt(paging *sharedPaging, env *Environment, at loadAt)
 	if live := int(mt.pageCount) - len(db.freePages); live > 0 {
 		db.liveAtCompaction = uint32(live)
 	}
-	if reclaimSeedLive && mt.livePages > 0 {
-		// EXPERIMENT (incremental-reclaim.md §6): the reopen-seed fix landing separately — seed with the
-		// meta's exact live count.
-		db.liveAtCompaction = mt.livePages
-	}
 	db.live = live
 	if incrOn() && at.meta == nil {
-		// PROTOTYPE (incr_reclaim.go): the committed state's wholesale pages, which the next commit
+		// The committed state's wholesale pages, which the next commit
 		// orphans: the catalog chain and GiST pages just read, and the meta's manifest-overflow chain.
 		in := &incrState{known: true, gist: loadedGist, manifestCount: mt.manifestPages}
 		for p := range catSeen {
@@ -2803,7 +2798,7 @@ func freeListCandidates(snap *snapshot, paging *sharedPaging, catRoot pageRef, w
 	// liveAtCompaction==0 is the shared-file handoff sentinel: reconstruct on the first proven-alone
 	// commit even when the file is still below the ordinary amortization threshold.
 	due := reclaimDue(pageCount, len(freeRemaining), liveAtCompaction)
-	if incr != nil { // PROTOTYPE (incr_reclaim.go): the leak trigger replaces the 2× rule
+	if incr != nil { // the leak trigger replaces the 2× rule
 		due = incr.due
 	}
 	compact := canReclaim && (liveAtCompaction == 0 || due)

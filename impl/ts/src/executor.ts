@@ -324,6 +324,7 @@ import {
   stageTemp,
   type StorageBudget,
 } from "./persist.ts";
+import type { IncrState } from "./incr_reclaim.ts";
 import { Decimal, momentVariance, workLinear, workMul } from "./decimal.ts";
 import {
   encodeBool,
@@ -2368,6 +2369,12 @@ export class Engine {
   // older version (single-handle, reconstruct-on-open, all readers current) the gate always passes, so the
   // on-disk byte layout is byte-for-byte unchanged.
   freeGenTxid: bigint;
+  // freeChain is the page ids of the persisted free-list chain that holds freePages (in chain order;
+  // empty when the list is not persisted). The next commit orphans them (incremental-reclaim.md §3.1).
+  freeChain: number[];
+  // incr is a durable file storage's incremental-reclamation state (incr_reclaim.ts): set by the load
+  // and by create, or lazily by the first commit; null for in-memory and temp domains.
+  incr: IncrState | null;
   // live is the live-page accounting of the committed file state (spec/design/memory.md §8.7): read
   // from the meta at open and advanced by every durable commit. Unused for an in-memory storage.
   live: LiveCount;
@@ -2485,6 +2492,8 @@ export class Engine {
     this.reclaimWithinSession = false;
     this.liveAtCompaction = 0;
     this.freeGenTxid = 0n;
+    this.freeChain = [];
+    this.incr = null;
     this.live = { live: 0, catalog: 0, gist: 0 };
     this.lastCommitMeta = null;
     this.lastCommitWritten = [];
@@ -24455,6 +24464,8 @@ export class Engine {
     e.reclaimWithinSession = false;
     e.liveAtCompaction = 0;
     e.freeGenTxid = 0n;
+    e.freeChain = [];
+    e.incr = null;
     e.live = { live: 0, catalog: 0, gist: 0 };
     e.tempStorage = null;
     e.spilled = false;

@@ -30,6 +30,7 @@ import { engineError } from "./errors.ts";
 import { runAsync, runSync, type Steps } from "./execution.ts";
 import { loadEnginePagedSteps, toImageSteps, unlockPagerSteps } from "./format.ts";
 import { capFirstBody, capOf } from "./cap.ts";
+import { freshImageIncr } from "./incr_reclaim.ts";
 import {
   type Argon2Params,
   createCodecSteps,
@@ -146,8 +147,10 @@ export function* createOpfsWithHandleSteps(
   db.pageCount = Math.floor(bytes.length / db.pageSize);
   // The image is of an empty database: every body page is live, and every one is a catalog page
   // (spec/design/memory.md §8.7).
-  const body = db.pageCount - capFirstBody(capOf(db.pageSize, codec !== null));
+  const first = capFirstBody(capOf(db.pageSize, codec !== null));
+  const body = db.pageCount - first;
   db.live = { live: body, catalog: body, gist: 0 };
+  db.incr = freshImageIncr(first, db.pageCount);
   // Adopt the just-written handle as the open pager + buffer pool, so later commits write through the
   // seam without re-acquiring (spec/design/pager.md). Pager.fromStore reads the page size from the meta
   // header just written.

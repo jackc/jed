@@ -17,6 +17,8 @@ pub const MEMORY_ENTRY: i64 = 32;
 /// Within-session compaction trigger (spec/design/memory.md §8.4).
 pub const COMPACT_MIN_PAGES: u32 = 16;
 pub const COMPACT_GROWTH: u64 = 2;
+/// File commits' backstop rebuild trigger (spec/design/incremental-reclaim.md §3.5).
+pub const RECLAIM_LEAK_DEN: u64 = 16;
 
 /// The deterministic cost-unit weights, mirroring spec/cost/schedule.toml.
 pub struct CostSchedule {

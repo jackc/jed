@@ -81,8 +81,10 @@ fn trailing_truncation_shrinks_a_file_after_a_delete() {
     let peak_length = std::fs::metadata(&path).unwrap().len();
     churn(&db, 600, "a");
     let pc = db.page_count();
+    // The dropped rows are about two thirds of the peak (the file holds its live pages plus the last
+    // commit's writes: incremental-reclaim.md).
     assert!(
-        pc * 3 <= peak,
+        pc * 2 <= peak,
         "trailing truncation returns the dead top of the file: {peak} pages at peak, {pc} after churn"
     );
     let length = std::fs::metadata(&path).unwrap().len();

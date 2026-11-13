@@ -21,7 +21,6 @@ mod disk;
 mod locks;
 mod net;
 
-use crate::costs::{COMPACT_GROWTH, COMPACT_MIN_PAGES};
 use crate::crypto::Credential;
 use crate::environment::Environment;
 use crate::error::EngineError;
@@ -603,16 +602,14 @@ struct SimDb {
     /// ... nor a newer one than was ever attempted.
     max_attempted: u64,
 
-    // Bounded growth (§8.3), tracked over one process lifetime: an upper bound on the live count the
-    // engine's reclamation trigger compares against, and what the previous commit left.
+    // Bounded growth (§8.3), tracked over one process lifetime: the allocator state, and what the
+    // previous commit left.
     /// The page high-water now.
     high: u32,
     /// The free list the next commit allocates from.
     free: u32,
     /// Where that free list's trailing run below `high` starts (`high`: none).
     trail: u32,
-    /// ≥ the engine's live-at-last-reclamation.
-    lac_bound: u32,
     /// The previous commit in this lifetime.
     last: Growth,
     /// Whether the current step began with a relaxed batch pending on this database's file: its
@@ -687,7 +684,6 @@ impl SimDb {
             high: 0,
             free: 0,
             trail: 0,
-            lac_bound: 0,
             last: Growth::default(),
             batch_open: false,
             batch_pending: false,
@@ -2791,30 +2787,25 @@ impl<'a> Runner<'a> {
     }
 
     /// Start a new bounded-growth lifetime for database `name` (an open, a recovery, a compaction, an
-    /// attach). The engine seeds its reclamation trigger with the page count minus the free list
-    /// (format.md *Reclamation*), so a file whose dead pages are not all listed is reclaimed only
-    /// after it doubles.
+    /// attach). The dead pages the lifetime begins with unlisted are the engine's to carry
+    /// (incremental-reclaim.md §5); only its leak-triggered rebuild returns them.
     fn observe_growth(&mut self, name: &str) {
         let (pc, free, trail) = self.allocator(name);
         let d = self.sdb(name);
         d.high = pc;
         d.free = free;
         d.trail = trail;
-        d.lac_bound = pc.wrapping_sub(free);
         d.last = Growth::default();
     }
 
     /// Check the reader-aware bounded-growth invariant after a commit published a new version of
     /// database `name` (simulation-testing.md §8.3). With no reader pinned, no other process, and no
-    /// fault, the engine reclaims in the commit once the pages off its free list pass compact_growth
-    /// × the live count at its last reclamation (memory.md §8.4); readers legitimately hold
-    /// reclamation back, so a commit with one open is not checked. A commit only adds pages off the
-    /// list (each page it allocates leaves the list or grows the file), so the count it began with is
-    /// a lower bound. Two checks follow:
-    ///   - a quiet commit that began with more pages off the list than max(compact_min_pages,
-    ///     compact_growth × an upper bound on that live count) must have reclaimed: every page below
-    ///     the high-water is meta, live, free, or written by the commit itself (its manifest and
-    ///     free-list pages);
+    /// fault, every file commit lists the pages it orphans in its own free list
+    /// (incremental-reclaim.md §5); readers legitimately hold reuse back, so a commit with one open
+    /// is not checked. Two checks follow:
+    ///   - after a quiet commit every page below the high-water is meta, live, free, or written by
+    ///     the commit itself (its manifest and free-list pages), plus the dead pages the lifetime
+    ///     began with unlisted, which only the leak-triggered rebuild returns;
     ///   - the next quiet commit reuses that free list before it grows the file.
     fn check_growth(&mut self, i: usize, name: &str, quiet: bool) {
         if self.service {
@@ -2879,10 +2870,7 @@ impl<'a> Runner<'a> {
                 return;
             }
         }
-        let (before, unlisted, lac_bound) = {
-            let d = &self.dbs[name];
-            (d.last, d.high.wrapping_sub(d.free), d.lac_bound)
-        };
+        let before = self.dbs[name].last;
         if self.dbs[name].batch_open {
             // A commit inside a relaxed batch neither reuses nor frees the batch's pages
             // (validated-cow.md §4); only the bounds carry forward.
@@ -2890,7 +2878,6 @@ impl<'a> Runner<'a> {
             d.high = pc;
             d.free = free;
             d.trail = trail;
-            d.lac_bound = d.lac_bound.max(live.wrapping_add(written));
             d.last = Growth::default();
             return;
         }
@@ -2909,26 +2896,28 @@ impl<'a> Runner<'a> {
             return;
         }
         let mut reclaimed = false;
-        if quiet
-            && unlisted as u64 > (COMPACT_MIN_PAGES as u64).max(COMPACT_GROWTH * lac_bound as u64)
-        {
-            reclaimed = true;
-            let leaked = pc.wrapping_sub(2).wrapping_sub(live).wrapping_sub(free);
-            if (pc as u64) < 2 + live as u64 + free as u64 || leaked > written {
+        if quiet {
+            // Every quiet commit lists what it orphans (incremental-reclaim.md §5), so the file is its
+            // live pages, its free list, and the pages the commit itself wrote that nothing lists (its
+            // free-list chain and manifest overflow), plus the dead pages this lifetime began with
+            // unlisted (a held batch or a one-entry list lost at close), which only a rebuild returns.
+            let (first, tolerated) = self.db().sim_incr_state(name);
+            let leaked = i64::from(pc) - i64::from(first) - i64::from(live) - i64::from(free);
+            if leaked < 0 || leaked > i64::from(written) + tolerated {
                 self.fail(
                     i,
                     format!(
-                        "bounded growth: {name} has {pc} pages, {live} live and {free} free, after a commit that wrote {written} must have reclaimed every dead page"
+                        "incremental reclamation: {name} has {pc} pages, {live} live and {free} free, after a quiet commit that wrote {written} ({tolerated} unlisted dead pages carried in)"
                     ),
                 );
                 return;
             }
+            reclaimed = true;
         }
         let d = self.sdb(name);
         d.high = pc;
         d.free = free;
         d.trail = trail;
-        d.lac_bound = d.lac_bound.max(live.wrapping_add(written));
         d.last = Growth {
             reclaimed,
             high: pc,
@@ -3774,6 +3763,9 @@ impl<'a> Runner<'a> {
             self.fail(i, format!("corrupt: reopen after repair failed: {e}"));
             return false;
         }
+        // The reopen starts a new bounded-growth lifetime (an in-memory one-entry free list did not
+        // survive the close).
+        self.observe_growth("main");
         let v = self.db().version();
         if v != version {
             self.fail(

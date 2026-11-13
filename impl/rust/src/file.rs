@@ -570,13 +570,19 @@ impl Engine {
         self.page_count = (bytes.len() / self.page_size as usize) as u32;
         // `create` writes an empty database: every body page is live, and every one is a catalog page.
         debug_assert_eq!(self.committed.stores_iter().count(), 0);
-        let body =
-            self.page_count - crate::format::Cap::of(self.page_size, codec.is_some()).first_body();
+        let first_body = crate::format::Cap::of(self.page_size, codec.is_some()).first_body();
+        let body = self.page_count - first_body;
         self.live = crate::format::LiveCount {
             live: body,
             catalog: body,
             gist: 0,
         };
+        // Every body page of the fresh image is a catalog page, which the first commit orphans
+        // (incremental-reclaim.md §3.1).
+        self.incr = Some(crate::incr_reclaim::IncrState::fresh(
+            first_body,
+            self.page_count,
+        ));
         Ok(())
     }
 
@@ -601,8 +607,22 @@ impl Engine {
         let write =
             snap.incremental_image(self.page_size, self.page_count, &free, true, Some(&*paging))?;
         // The live-page count this commit publishes (spec/design/memory.md §8.7): `self.committed`
-        // is still the previous snapshot here.
-        let live = self.live.after(&write, &self.committed, &paging)?;
+        // is still the previous snapshot here. A file commit reclaims incrementally
+        // (incremental-reclaim.md): it lists the B-tree and overflow pages it orphans, and a bare
+        // engine reuses ungated (oldest_live == committed), so every generation merges first.
+        let incr_on = self.path.is_some();
+        if incr_on && self.incr.is_none() {
+            self.incr = Some(crate::incr_reclaim::IncrState::default());
+        }
+        let live = match self.incr.as_mut().filter(|_| incr_on) {
+            Some(incr) => {
+                incr.merge(snap.txid, &mut self.free_gen_txid);
+                let (live, tree) = self.live.after_ids(&write, &self.committed, &paging)?;
+                incr.tree = tree;
+                live
+            }
+            None => self.live.after(&write, &self.committed, &paging)?,
+        };
         // v25: write the dirty tree + catalog first (unsynced), so the in-commit reachability walk can
         // read the new catalog back through the pager (read-your-writes) — the free-list persisted this
         // commit thus reclaims this commit's fresh orphans (`plan_free_list`); a short open→commit→close
@@ -633,6 +653,22 @@ impl Engine {
         // Watermark-gated by this handle's live streaming cursors; periodic (~2×-live) inside
         // `plan_free_list`. A file is never reopened concurrently by this bare-`Engine` handle.
         let can_reclaim = self.open_streams.load(std::sync::atomic::Ordering::Relaxed) == 0;
+        // The incremental listing (incremental-reclaim.md §3.2); a bare engine never batches, so
+        // nothing is held.
+        let incr_plan = self.incr.as_ref().filter(|_| incr_on).map(|incr| {
+            let first_body = paging.cap().first_body();
+            let leaked = incr.leaked(
+                self.page_count,
+                first_body,
+                self.free_pages.len(),
+                self.free_chain.len(),
+                self.live.live,
+            );
+            crate::incr_reclaim::IncrPlan {
+                listed: incr.orphans(&self.free_chain, &[]).0,
+                due: crate::incr_reclaim::leak_due(leaked, self.live.live),
+            }
+        });
         let plan = crate::format::plan_free_list(
             snap,
             &paging,
@@ -651,6 +687,7 @@ impl Engine {
             live.live,
             &[],
             None,
+            incr_plan.as_ref(),
         )?;
         crate::format::verify_live_count(snap, &paging, &write, live)?;
         {
@@ -674,11 +711,44 @@ impl Engine {
         for (index, _) in write.pages.iter().chain(plan.auxiliary.iter()) {
             paging.invalidate(*index);
         }
+        if let Some(incr_plan) = incr_plan {
+            let incr = self
+                .incr
+                .as_mut()
+                .expect("an incremental plan has its state");
+            incr.after(
+                snap.txid,
+                &write,
+                &plan,
+                incr_plan.listed,
+                Vec::new(),
+                &[],
+                self.page_count,
+            );
+        }
         self.page_count = plan.page_count;
         self.free_pages = plan.persisted;
+        self.free_chain = plan.chain;
         self.live_at_compaction = plan.live;
         self.free_gen_txid = plan.generation;
         self.live = live;
+        if let Some(incr) = self
+            .incr
+            .as_mut()
+            .filter(|incr| incr_on && incr.unknown_before)
+        {
+            // A commit after a foreign one could not orphan that commit's wholesale pages: they stay
+            // unlisted until a rebuild.
+            incr.tolerated = incr
+                .leaked(
+                    self.page_count,
+                    paging.cap().first_body(),
+                    self.free_pages.len(),
+                    self.free_chain.len(),
+                    self.live.live,
+                )
+                .max(0);
+        }
         Ok(())
     }
 
@@ -1181,6 +1251,61 @@ mod tests {
         assert_eq!(err.state, SqlState::FeatureNotSupported);
         assert!(err.message.contains("too small"), "{}", err.message);
         assert!(!path.exists(), "no file written on a rejected page size");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The bare single-handle engine's file commit lists the pages it orphans in its own free list
+    /// (incremental-reclaim.md), so steady churn never walks the database and the file stays at its
+    /// live pages plus what the last commit wrote. Mirrors the Go
+    /// TestReclaimTriggerFileCommitsListTheirOrphans (which drives the bare engine).
+    #[test]
+    fn bare_engine_file_commits_list_their_orphans() {
+        let path = tmp("jed_bare_incr_reclaim.jed");
+        let _ = std::fs::remove_file(&path);
+        let mut db = Engine::create(
+            &path,
+            DatabaseOptions {
+                page_size: 256,
+                no_sync: true,
+            },
+        )
+        .unwrap();
+        execute(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, pad text)").unwrap();
+        execute(
+            &mut db,
+            "INSERT INTO t SELECT g, 'pad-pad-pad-pad-pad-pad-pad-pad' || g::text FROM generate_series(1, 1000) g",
+        )
+        .unwrap();
+        let walks = crate::format::RECLAIM_WALKS.with(|w| w.get());
+        for k in 0..400 {
+            execute(
+                &mut db,
+                &format!("UPDATE t SET pad = 'r{k}' WHERE id = 500"),
+            )
+            .unwrap();
+            // Every page below the high-water is meta, live, listed free, or a free-list chain or
+            // manifest page the commit itself wrote.
+            let first = db.paging.as_ref().unwrap().cap().first_body();
+            let unlisted = i64::from(db.page_count)
+                - i64::from(first)
+                - i64::from(db.live.live)
+                - db.free_pages.len() as i64
+                - db.free_chain.len() as i64;
+            assert!(
+                (0..=2).contains(&unlisted),
+                "round {k}: {} pages, {} live, {} free, {} chain: {unlisted} dead pages unlisted",
+                db.page_count,
+                db.live.live,
+                db.free_pages.len(),
+                db.free_chain.len()
+            );
+        }
+        let walked = crate::format::RECLAIM_WALKS.with(|w| w.get()) - walks;
+        assert_eq!(
+            walked, 0,
+            "{walked} of 400 steady commits walked the database"
+        );
+        db.close().unwrap();
         let _ = std::fs::remove_file(&path);
     }
 

@@ -74,8 +74,10 @@ its free-list and manifest pages. The existing reclamation walk already treats a
 written tree/catalog/overflow pages as live. Manifest allocation extends that invariant.
 The next commit allocates only from that persisted free list or the high-water, subject to
 the existing reader watermark and process-presence rules. It cannot overwrite its fallback's
-recovery dependencies. It may put old dependencies into its *new* free list; they become
-reusable only by a subsequent commit, when the meta slot that required them is replaced.
+recovery dependencies. It puts old dependencies into its *new* free list — every commit lists its **orphans**, the pages
+reachable from its fallback that it no longer reaches, including the fallback's free-list and
+manifest pages (format.md *Reclamation*) — but never reuses them itself; they become reusable only
+by a subsequent commit, when the meta slot that required them is replaced.
 No metadata checkpoint is required to permit normal reuse.
 
 **Trailing truncation** ([fileformat/format.md](../fileformat/format.md) *Trailing truncation*)
@@ -206,8 +208,13 @@ barrier ([page-service.md](page-service.md) §6). The rules:
    that was the floor or earlier, already pending (and listed) if it was written in this batch. Only
    pages written since the floor need a manifest entry, so a kept chain adds none.
 4. **Free-list exclusion.** A commit's persisted free list excludes the whole pending set, since
-   every pending page is a dependency of its manifest. Reclamation still runs; a page orphaned
-   during a batch is listed by the first reclamation after the floor moves past it.
+   every pending page is a dependency of its manifest. A commit inside a batch still lists its
+   orphans (format.md *Reclamation*), split by this line: an orphan that is not pending was written at
+   or before the floor and is listed by the commit that orphans it (rule 3 keeps the batch from
+   reusing it, since the floor's recorded list does not hold it); an orphan that is pending is
+   **held** in memory and listed by the first commit planned with nothing pending — after the flush,
+   so the floor that flush makes does not list it either. Held pages lost at a close or crash are
+   leaks, recovered by the backstop rebuild ([incremental-reclaim.md](incremental-reclaim.md) §3.4–3.5).
 
 A relaxed commit writes its pages and meta as usual and publishes **without** the barrier. A
 **flush** executes the host's ordinary durable `sync`; on success the floor becomes the newest

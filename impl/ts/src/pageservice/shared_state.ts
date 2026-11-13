@@ -127,6 +127,9 @@ const FLOOR_TXID = 6;
 // the worker's rule-4 steps read and set the deadline, always holding the writer gate.
 const BATCH_DEADLINE = 7;
 const FLUSH_INTERVAL = 8;
+// HELD_PAGES is how many orphans the engine thread holds back from a relaxed batch when it last
+// published (incremental-reclaim.md §3.4): its maintenance trigger does not count them as leaked.
+const HELD_PAGES = 9;
 const BIG_SLOTS = 10;
 
 // Byte offsets of the other regions (each 8-byte aligned).
@@ -492,6 +495,10 @@ export class ServiceState {
     return Number(this.big[LIVE_AT_COMPACTION]!);
   }
 
+  heldPagesLocked(): number {
+    return Number(this.big[HELD_PAGES]!);
+  }
+
   // engineOldestLocked is the oldest version the engine thread's local readers pinned at its last
   // publication, or null.
   engineOldestLocked(): bigint | null {
@@ -500,11 +507,18 @@ export class ServiceState {
   }
 
   // setEngineFactsLocked records the engine thread's page accounting facts with a publication: the free
-  // list's generation, the live count at the last reclamation, and its oldest local pin.
-  setEngineFactsLocked(freeGenTxid: bigint, liveAtCompaction: number, oldest: bigint | null): void {
+  // list's generation (its unmerged incremental generations included), the live count at the last
+  // reclamation, its oldest local pin, and the orphans it holds back from a relaxed batch.
+  setEngineFactsLocked(
+    freeGenTxid: bigint,
+    liveAtCompaction: number,
+    oldest: bigint | null,
+    heldPages: number,
+  ): void {
     this.big[FREE_GEN_TXID] = freeGenTxid;
     this.big[LIVE_AT_COMPACTION] = BigInt(liveAtCompaction);
     this.big[ENGINE_OLDEST] = oldest ?? -1n;
+    this.big[HELD_PAGES] = BigInt(heldPages);
   }
 
   clearEngineOldestLocked(): void {

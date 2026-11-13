@@ -313,7 +313,7 @@ type storage struct {
 	// older version (single-handle, reconstruct-on-open, all readers current) the gate always passes, so the
 	// on-disk byte layout is byte-for-byte unchanged.
 	freeGenTxid uint64
-	// incr is the incremental-reclamation state (PROTOTYPE, incr_reclaim.go); nil until first used.
+	// incr is the incremental-reclamation state (incr_reclaim.go); nil until first used.
 	incr     *incrState
 	readOnly bool      // opened read-only (api.md §2.1): every session is then read-only, a write is 25006. Always false in-memory.
 	path     string    // the backing file path; "" for an in-memory database (surfaced by Database.Path / Session.Path)
@@ -606,8 +606,8 @@ type budgetCtx struct {
 	// guard, when set, is checked under storage.mu before the commit writes anything: a page-service
 	// commit fails 08006 when the handle's role changed since its transaction began (README.md §6.5).
 	guard func() error
-	// oldest is the reader watermark the commit was gated by, when oldestKnown (PROTOTYPE,
-	// incr_reclaim.go: it lets older free-list generations be reused under a pinned reader).
+	// oldest is the reader watermark the commit was gated by, when oldestKnown (incr_reclaim.go: it
+	// lets older free-list generations be reused under a pinned reader).
 	oldest      uint64
 	oldestKnown bool
 }
@@ -737,7 +737,7 @@ func (st *storage) commitDurable(snap *snapshot, canReclaim, canReuse bool, budg
 				pending = false
 			}
 		}
-		// PROTOTYPE (incr_reclaim.go): fold the generations no reader can observe; the rest stay off
+		// fold the generations no reader can observe; the rest stay off
 		// this commit's reuse.
 		var newer map[uint32]bool
 		if st.incrActive() {

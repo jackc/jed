@@ -2303,6 +2303,10 @@ pub(crate) struct IncrementalWrite {
     /// rewritten whole every commit.
     pub(crate) catalog_pages: u32,
     pub(crate) gist_pages: u32,
+    /// The catalog pages and the GiST R-tree pages written, which the next commit orphans whole
+    /// (incremental-reclaim.md §3.1).
+    pub(crate) catalog_ids: Vec<u32>,
+    pub(crate) gist_ids: Vec<u32>,
 }
 
 /// The live-page accounting of one committed file state (spec/design/memory.md §8.7): `live` is the
@@ -2347,6 +2351,125 @@ impl LiveCount {
             gist: write.gist_pages,
         })
     }
+
+    /// [`after`](Self::after) that also returns the orphaned B-tree and overflow page ids
+    /// (incremental-reclaim.md §2): an incremental commit lists them in its own free list.
+    pub(crate) fn after_ids(
+        self,
+        write: &IncrementalWrite,
+        prev: &Snapshot,
+        paging: &SharedPaging,
+    ) -> Result<(LiveCount, Vec<u32>)> {
+        let ids = orphaned_tree_page_ids(
+            prev,
+            &write.kept,
+            &write.shared_chains,
+            paging,
+            paging.cap(),
+        )?;
+        let live = i64::from(self.live) + write.pages.len() as i64
+            - i64::from(self.catalog)
+            - i64::from(self.gist)
+            - ids.len() as i64;
+        let live = u32::try_from(live).map_err(|_| corrupt("live page count out of range"))?;
+        Ok((
+            LiveCount {
+                live,
+                catalog: write.catalog_pages,
+                gist: write.gist_pages,
+            },
+            ids,
+        ))
+    }
+}
+
+/// [`orphaned_tree_pages`] listing the pages instead of counting them (incremental-reclaim.md §2). An
+/// orphaned leaf's overflow chains are followed page by page ([`chain_pages`] reads each page's
+/// header).
+pub(crate) fn orphaned_tree_page_ids(
+    prev: &Snapshot,
+    kept: &HashSet<u32>,
+    shared: &HashSet<u32>,
+    paging: &SharedPaging,
+    cap: Cap,
+) -> Result<Vec<u32>> {
+    let mut out = Vec::new();
+    for st in prev.stores_iter() {
+        if let Some(root) = st.tree_root() {
+            let shape = any_spillable(st.col_types()).then(|| st.shape());
+            orphaned_node_ids(root, kept, shared, paging, shape, cap, &mut out)?;
+        }
+    }
+    for st in prev.index_stores_iter() {
+        if let Some(root) = st.tree_root() {
+            orphaned_node_ids(root, kept, shared, paging, None, cap, &mut out)?;
+        }
+    }
+    Ok(out)
+}
+
+fn orphaned_node_ids(
+    node: &Node,
+    kept: &HashSet<u32>,
+    shared: &HashSet<u32>,
+    paging: &SharedPaging,
+    shape: Option<&Arc<LeafShape>>,
+    cap: Cap,
+    out: &mut Vec<u32>,
+) -> Result<()> {
+    let page = node.page_ref();
+    if page.page == 0 || kept.contains(&page.page) {
+        return Ok(());
+    }
+    if node.children.is_empty() {
+        return orphaned_leaf_ids(page, shared, paging, shape, cap, out);
+    }
+    out.push(page.page);
+    for child in &node.children {
+        match child {
+            Child::Resident(n) => orphaned_node_ids(n, kept, shared, paging, shape, cap, out)?,
+            Child::OnDisk(p) if kept.contains(&p.page) => {}
+            Child::OnDisk(p) => orphaned_leaf_ids(*p, shared, paging, shape, cap, out)?,
+        }
+    }
+    Ok(())
+}
+
+/// One orphaned leaf page plus the overflow pages its external values own, by id.
+fn orphaned_leaf_ids(
+    page_idx: PageRef,
+    kept_chains: &HashSet<u32>,
+    paging: &SharedPaging,
+    shape: Option<&Arc<LeafShape>>,
+    cap: Cap,
+    out: &mut Vec<u32>,
+) -> Result<()> {
+    out.push(page_idx.page);
+    let Some(shape) = shape else {
+        return Ok(());
+    };
+    let block = paging.read_body(page_idx)?;
+    let page = parse_page(&block)?;
+    if page.page_type != PAGE_LEAF {
+        return Err(corrupt("expected a B-tree leaf page"));
+    }
+    let n = page.item_count as usize;
+    let fetch = |p: PageRef| paging.read_body(p);
+    for_each_chain_value(&block, n, shape, cap, &mut |v| {
+        let (first, stored) = match v {
+            Value::Unfetched(Unfetched::External { first, len, .. })
+                if !kept_chains.contains(&first.page) =>
+            {
+                (first, len as usize)
+            }
+            Value::Unfetched(Unfetched::ExternalComp {
+                first, stored_len, ..
+            }) if !kept_chains.contains(&first.page) => (first, stored_len as usize),
+            _ => return Ok(()),
+        };
+        out.extend(chain_pages(first, stored, &fetch, cap)?);
+        Ok(())
+    })
 }
 
 /// The B-tree pages of `prev` (table data trees and B-tree/GIN index trees) that the new snapshot no
@@ -2611,6 +2734,7 @@ impl Snapshot {
         let mut kept: HashSet<u32> = HashSet::new();
         let mut shared: HashSet<u32> = HashSet::new();
         let mut gist_pages = 0u32;
+        let mut gist_ids: Vec<u32> = Vec::new();
         let mut root_data_page = vec![PageRef::NONE; tables.len()];
         let mut index_roots: Vec<Vec<PageRef>> = vec![Vec::new(); tables.len()];
         for (ti, (_, table, store)) in tables.iter().enumerate() {
@@ -2646,6 +2770,7 @@ impl Snapshot {
                             return Err(corrupt("GiST node overflows its page"));
                         }
                         gist_pages += 1;
+                        gist_ids.push(p.page_no);
                         let (bytes, tag) = seal.page(
                             p.page_no,
                             p.page_type,
@@ -2724,6 +2849,8 @@ impl Snapshot {
             shared_chains: shared,
             catalog_pages: cat_pages.len() as u32,
             gist_pages,
+            catalog_ids: cat_pages,
+            gist_ids,
         })
     }
 }
@@ -2820,15 +2947,28 @@ pub(crate) fn read_free_list(
     page_count: u32,
     protected: &HashSet<u32>,
 ) -> Result<Vec<u32>> {
+    Ok(read_free_list_chain(paging, head, page_count, protected)?.0)
+}
+
+/// [`read_free_list`] that also returns the chain's own pages, in chain order: the next commit
+/// orphans them (incremental-reclaim.md §3.1).
+pub(crate) fn read_free_list_chain(
+    paging: &SharedPaging,
+    head: PageRef,
+    page_count: u32,
+    protected: &HashSet<u32>,
+) -> Result<(Vec<u32>, Vec<u32>)> {
     let cap = paging.cap();
     let first = cap.first_body();
     let mut chain = HashSet::new();
+    let mut chain_ids = Vec::new();
     let mut free = Vec::new();
     let mut p = head;
     while p.page != 0 {
         if p.page < first || p.page >= page_count || !chain.insert(p.page) {
             return Err(corrupt("invalid free-list chain"));
         }
+        chain_ids.push(p.page);
         let block = paging.read_body(p)?;
         let page = parse_page(&block)?;
         if page.page_type != PAGE_FREELIST {
@@ -2852,7 +2992,7 @@ pub(crate) fn read_free_list(
     if free.iter().any(|p| chain.contains(p)) {
         return Err(corrupt("free list contains its own chain"));
     }
-    Ok(free)
+    Ok((free, chain_ids))
 }
 
 /// Assign a page to one **dirty** node (and its dirty descendants) post-order, appending each as a
@@ -3143,6 +3283,9 @@ impl Engine {
             gist: 0,
         };
         let mut cat_seen: HashSet<u32> = HashSet::new();
+        // The GiST R-tree pages the load reads: the next commit orphans them whole
+        // (incremental-reclaim.md §3.1).
+        let loaded_gist: std::cell::RefCell<Vec<u32>> = std::cell::RefCell::new(Vec::new());
         // Index stores are keyed by index name alone, so a repeated name would share one tree.
         let mut index_names: HashSet<String> = HashSet::new();
         // Whether every composite type registered so far has passed `validate_composite_types`. A
@@ -3317,6 +3460,7 @@ impl Engine {
                             read_gist_leaf_keys(
                                 &|p: PageRef| {
                                     gist_pages.set(gist_pages.get() + 1);
+                                    loaded_gist.borrow_mut().push(p.page);
                                     if let Some(hook) = at.gist {
                                         hook(p.page);
                                     }
@@ -3379,7 +3523,7 @@ impl Engine {
         // v25: load the free-list directly from the persisted chain (meta offset 28) — no
         // reachability walk (spec/fileformat/format.md *Reclamation*).
         if !given {
-            db.free_pages = read_free_list(
+            (db.free_pages, db.free_chain) = read_free_list_chain(
                 &paging,
                 PageRef {
                     page: meta.free_list_head,
@@ -3398,6 +3542,33 @@ impl Engine {
         // `compacted_free_list`).
         db.live_at_compaction = meta.page_count.saturating_sub(db.free_pages.len() as u32);
         db.live = live;
+        if !given {
+            // The committed state's wholesale pages, which the next commit orphans
+            // (incremental-reclaim.md §3.1): the catalog chain and GiST pages just read, and the
+            // meta's manifest-overflow chain.
+            let mut incr = crate::incr_reclaim::IncrState {
+                known: true,
+                gist: loaded_gist.into_inner(),
+                manifest_count: meta.manifest_pages,
+                ..Default::default()
+            };
+            incr.catalog = cat_seen.iter().copied().collect();
+            incr.catalog.sort_unstable();
+            let mut id = meta.manifest_head;
+            for _ in 0..meta.manifest_pages {
+                let block = paging.pager().read_block(id)?;
+                incr.manifest.push(id);
+                id = u32::from_be_bytes(block[8..12].try_into().unwrap());
+            }
+            incr.tolerated = (i64::from(meta.page_count)
+                - i64::from(cap.first_body())
+                - db.free_pages.len() as i64
+                - i64::from(meta.live_pages)
+                - db.free_chain.len() as i64
+                - i64::from(meta.manifest_pages))
+            .max(0);
+            db.incr = Some(incr);
+        }
         db.committed = snap;
         // Stores created in a LATER session bind this same pager at creation (Snapshot::store_paging),
         // so they join the post-commit residency flip like the loaded stores attached above.
@@ -3688,14 +3859,19 @@ pub(crate) fn plan_free_list(
     live_pages: u32,
     pending: &[(u32, u64)],
     allowed: Option<&HashSet<u32>>,
+    incr: Option<&crate::incr_reclaim::IncrPlan>,
 ) -> Result<CommitPlan> {
     // `live_at_compaction == 0` marks a store whose reclaimable set is unknown, so a commit that may
     // reclaim reconstructs it immediately even for a small file. Ordinary stores retain the amortized
-    // periodic trigger.
-    let compact = policy.reclaim
-        && (live_at_compaction == 0
-            || reclaim_due(page_count, free_remaining.len(), live_at_compaction));
+    // periodic trigger; an incremental commit (incremental-reclaim.md §3.5) uses the leak trigger
+    // instead.
+    let due = match incr {
+        Some(incr) => incr.due,
+        None => reclaim_due(page_count, free_remaining.len(), live_at_compaction),
+    };
+    let compact = policy.reclaim && (live_at_compaction == 0 || due);
     let (mut persist_list, new_live, new_gen) = if compact {
+        RECLAIM_WALKS.with(|w| w.set(w.get() + 1));
         let mut reached = reachable_pages(snap, paging, cat_root)?;
         for (index, _) in written {
             reached.insert(*index);
@@ -3711,6 +3887,14 @@ pub(crate) fn plan_free_list(
             .collect();
         // The recomputed list is proven dead at snap.txid — its reuse generation (the §8 gate).
         (free, live, snap.txid)
+    } else if let Some(incr) = incr {
+        // The commit lists its orphans in its own free list but does not reuse them: they are not in
+        // `safe` (incremental-reclaim.md §3.2).
+        (
+            crate::incr_reclaim::merge_sorted(free_remaining.to_vec(), incr.listed.clone()),
+            live_at_compaction,
+            gen_txid,
+        )
     } else {
         (free_remaining.to_vec(), live_at_compaction, gen_txid)
     };
@@ -3794,6 +3978,7 @@ pub(crate) fn plan_free_list(
         entries.extend_from_slice(pending);
         entries.extend_from_slice(&dirty);
         let (meta, overflow) = commit_manifest::encode(base, cap, entries, &ids);
+        let chain = pages.iter().map(|(index, _)| *index).collect();
         let mut auxiliary = pages;
         auxiliary.extend(overflow.iter().cloned());
         return Ok(CommitPlan {
@@ -3801,10 +3986,12 @@ pub(crate) fn plan_free_list(
             manifest: overflow,
             meta,
             persisted,
+            chain,
             page_count: new_pc,
             live: new_live,
             generation: new_gen,
             dirty,
+            rebuilt: compact,
         });
     }
 }
@@ -3845,12 +4032,23 @@ pub(crate) struct CommitPlan {
     /// The meta page, unsealed: [`seal_meta`] completes it for the slot it is written to.
     pub meta: Vec<u8>,
     pub persisted: Vec<u32>,
+    /// The free-list chain pages written (in chain order), which the next commit orphans
+    /// (incremental-reclaim.md §3.1).
+    pub chain: Vec<u32>,
     pub page_count: u32,
     pub live: u32,
     pub generation: u64,
     /// The commit's own manifest entries (its body and free-list pages), which a relaxed commit
     /// adds to the pending set (validated-cow.md §4).
     pub dirty: Vec<(u32, u64)>,
+    /// Whether the commit rebuilt the free list by a reachability walk.
+    pub rebuilt: bool,
+}
+
+thread_local! {
+    /// How many reachability rebuilds file commits ran on this thread (test observability; per
+    /// thread, so parallel tests do not see each other's commits).
+    pub(crate) static RECLAIM_WALKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// Add every node page of a resident B+tree to `reached`: an interior/leaf node's own set-once page,
@@ -5586,6 +5784,10 @@ pub(crate) struct Meta {
     pub(crate) free_list_head: u32,
     /// The exact live page count (v34 — meta offset 56, spec/design/memory.md §8.7).
     pub(crate) live_pages: u32,
+    /// The manifest-overflow chain's head and length (meta offsets 36 and 44, validated-cow.md §2):
+    /// pages the next commit orphans (incremental-reclaim.md §3.1).
+    pub(crate) manifest_head: u32,
+    pub(crate) manifest_pages: u32,
 }
 
 /// The meta page a demand-paged open selected (deterministic-simulation integrity checker,
@@ -6014,6 +6216,8 @@ pub(crate) fn parse_meta(m: &[u8]) -> Option<Meta> {
         page_count,
         free_list_head,
         live_pages,
+        manifest_head: u32::from_be_bytes(m[36..40].try_into().unwrap()),
+        manifest_pages: u32::from_be_bytes(m[44..48].try_into().unwrap()),
     })
 }
 

@@ -45,7 +45,9 @@ func TestTrailingTruncationShrinksAFileAfterADelete(t *testing.T) {
 	peakLength := fileLength(t, path)
 	churn(t, db, 600, "a")
 	pc := db.PageCount()
-	if pc*3 > peak {
+	// The dropped table is about two thirds of the peak (the file holds its live pages plus the last
+	// commit's writes: incremental-reclaim.md).
+	if pc*2 > peak {
 		t.Fatalf("trailing truncation should return the dead top of the file: %d pages at peak, %d after churn", peak, pc)
 	}
 	limit := int64(pc+growthStep(pc, compactPage)) * compactPage
@@ -176,7 +178,9 @@ func TestTrailingTruncationWaitsForTheFlushUnderSynchronousOff(t *testing.T) {
 	}
 	s.Close()
 	pc := db.PageCount()
-	if pc*3 > peak {
+	// The dropped table is about two thirds of the peak (the file holds its live pages plus the last
+	// commit's writes: incremental-reclaim.md).
+	if pc*2 > peak {
 		t.Fatalf("trailing truncation should return the dropped table's pages: %d pages at the peak, %d after churn", peak, pc)
 	}
 	if !deferred {

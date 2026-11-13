@@ -36,16 +36,18 @@ test("fallback reader stays snapshot-isolated under within-session reclamation (
     try {
       let reader: Session | null = null;
       let pinnedCount = -1n;
-      // The hook fires in the persist→publish window; act ONLY on a commit that compacted (advanced the
-      // free-list generation past the still-published version), which just placed a page reachable at the
-      // fallback version into the reusable free-list. Pin a reader at that fallback version synchronously.
-      setAfterPersistHook((committedTxid, freeGenTxid) => {
-        if (reader !== null || freeGenTxid <= committedTxid) return;
+      // The hook fires in the persist→publish window; act ONLY on a commit that put a page reachable at
+      // the still-published (fallback) version on the free list: one that compacted (advanced the
+      // free-list generation past it) or that listed its orphans as a newer generation (incremental
+      // reclamation, incr_reclaim.ts). Pin a reader at that fallback version synchronously.
+      setAfterPersistHook((committedTxid, _freeGenTxid, listedGenTxid) => {
+        if (reader !== null || listedGenTxid <= committedTxid) return;
         reader = db.readSession(); // pins the PRIOR published (fallback) version
         pinnedCount = countSession(reader);
       });
 
-      // Drive commits until one compacts and fires the hook (pinning the fallback reader mid-commit).
+      // Drive commits until one frees a fallback page and fires the hook (pinning the fallback reader
+      // mid-commit).
       let i = 121;
       while (reader === null && i <= 4000) {
         db.execute(`INSERT INTO t VALUES (${i})`);
@@ -54,7 +56,7 @@ test("fallback reader stays snapshot-isolated under within-session reclamation (
       setAfterPersistHook(null);
       assert.ok(
         reader !== null,
-        "no compacting commit occurred — test did not exercise the reuse path",
+        "no commit freed a fallback page — test did not exercise the reuse path",
       );
 
       // Hammer reuse-commits while the reader is pinned at the fallback version: on the buggy path these

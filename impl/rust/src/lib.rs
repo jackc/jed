@@ -53,6 +53,7 @@ mod gin_jsonpath;
 mod gin_runs;
 mod gist;
 mod idle_flush;
+mod incr_reclaim;
 mod integrity;
 /// The integrity check's finding kinds and skip reasons (spec/integrity/findings.toml), generated
 /// by `scripts/gen_integrity.rb`: the values of [`IntegrityFinding::kind`] and

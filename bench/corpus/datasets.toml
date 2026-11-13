@@ -31,7 +31,9 @@ schema_version = 1
 # 15: the on-disk format bumped 50 → 51 (fixed-width stored numeric(p,s)); invalidate the v50
 #    datasets.
 # 16: the on-disk format bumped 51 → 52 (the compact leaf); invalidate the v51 datasets.
-generator_version = 16
+# 17: file commits list their own orphans (spec/design/incremental-reclaim.md): generated files are
+#    smaller and their free lists differ; regenerate.
+generator_version = 17
 
 [[dataset]]
 name = "small"

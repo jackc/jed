@@ -22,6 +22,8 @@ const (
 const (
 	compactMinPages uint32 = 16
 	compactGrowth   uint64 = 2
+	// File commits' backstop rebuild trigger (spec/design/incremental-reclaim.md §3.5).
+	reclaimLeakDen uint64 = 16
 )
 
 // CostSchedule holds the deterministic cost-unit weights, mirroring spec/cost/schedule.toml.

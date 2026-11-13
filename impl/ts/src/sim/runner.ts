@@ -8,7 +8,7 @@ import { join } from "node:path";
 
 import type { BlockStore } from "../blockstore.ts";
 import { parseCommitMeta } from "../commit_manifest.ts";
-import { COMPACT_GROWTH, COMPACT_MIN_PAGES } from "../costs.ts";
+import { capFirstBody } from "../cap.ts";
 import { EngineError, engineError } from "../errors.ts";
 import type { Engine } from "../executor.ts";
 // The Node file host registers the file compactor, the attach opener, and the directory barrier the
@@ -1919,6 +1919,15 @@ export class SimRunner {
     return { pageCount: st.pageCount, free: st.freePages.length, trail };
   }
 
+  // incrState is database d's first body page and the unlisted dead pages its incremental reclamation
+  // state carries (incr_reclaim.ts).
+  private incrState(d: SimDB): { first: number; tolerated: number } {
+    const core = coreOf(this.database);
+    const st = d.name === "main" ? core.storage : core.attachments.get(d.name)?.storage;
+    if (st === undefined || st.paging === null) return { first: 2, tolerated: 0 };
+    return { first: capFirstBody(st.paging.cap()), tolerated: st.incr?.tolerated ?? 0 };
+  }
+
   // observeGrowth starts a new bounded-growth lifetime for d (an open, a recovery, a compaction, an
   // attach). The engine seeds its reclamation trigger with the page count minus the free list
   // (format.md *Reclamation*), so a file whose dead pages are not all listed is reclaimed only after
@@ -1934,14 +1943,11 @@ export class SimRunner {
 
   // checkGrowth checks the reader-aware bounded-growth invariant after a commit published a new
   // version of d (simulation-testing.md §8.3). With no reader pinned, no other process, and no fault,
-  // the engine reclaims in the commit once the pages off its free list pass compact_growth × the live
-  // count at its last reclamation (memory.md §8.4); readers legitimately hold reclamation back, so a
-  // commit with one open is not checked. A commit only adds pages off the list (each page it allocates
-  // leaves the list or grows the file), so the count it began with is a lower bound. Two checks follow:
-  //   - a quiet commit that began with more pages off the list than max(compact_min_pages,
-  //     compact_growth × an upper bound on that live count) must have reclaimed: every page below the
-  //     high-water is meta, live, free, or written by the commit itself (its manifest and free-list
-  //     pages);
+  // every file commit lists the pages it orphans in its own free list (incremental-reclaim.md §5);
+  // readers legitimately hold reuse back, so a commit with one open is not checked. Two checks follow:
+  //   - after a quiet commit every page below the high-water is meta, live, free, or written by the
+  //     commit itself (its manifest and free-list pages), plus the dead pages the lifetime began with
+  //     unlisted, which only the leak-triggered rebuild returns;
   //   - the next quiet commit reuses that free list before it grows the file.
   private checkGrowth(i: number, d: SimDB, quiet: boolean): void {
     if (this.service) return;
@@ -2019,16 +2025,22 @@ export class SimRunner {
       return;
     }
     let reclaimed = false;
-    if (quiet && d.high - d.free > Math.max(COMPACT_MIN_PAGES, COMPACT_GROWTH * d.lacBound)) {
-      reclaimed = true;
-      if (pc < 2 + live + free || pc - 2 - live - free > written) {
+    if (quiet) {
+      // Every quiet commit lists what it orphans (incremental-reclaim.md §5), so the file is its live
+      // pages, its free list, and the pages the commit itself wrote that nothing lists (its free-list
+      // chain and manifest overflow), plus the dead pages this lifetime began with unlisted (a held
+      // batch or a one-entry list lost at close), which only a rebuild returns.
+      const { first, tolerated } = this.incrState(d);
+      const leaked = pc - first - live - free;
+      if (leaked < 0 || leaked > written + tolerated) {
         this.fail(
           i,
-          `bounded growth: ${d.name} has ${pc} pages, ${live} live and ${free} free, after a commit ` +
-            `that wrote ${written} must have reclaimed every dead page`,
+          `incremental reclamation: ${d.name} has ${pc} pages, ${live} live and ${free} free, after a ` +
+            `quiet commit that wrote ${written} (${tolerated} unlisted dead pages carried in)`,
         );
         return;
       }
+      reclaimed = true;
     }
     d.high = pc;
     d.free = free;
@@ -2725,6 +2737,9 @@ export class SimRunner {
       this.fail(i, "corrupt: reopen after repair failed: " + errText(e));
       return false;
     }
+    // The reopen starts a new bounded-growth lifetime (an in-memory one-entry free list did not
+    // survive the close).
+    this.observeGrowth(m);
     const v = versionOf(this.database);
     if (v !== m.version) {
       this.fail(i, `corrupt: after repair version ${v}, want ${m.version}`);

@@ -105,15 +105,16 @@ expect = "163840"
 [[step]]
 actor = "a"
 command = "page_count"
-expect = "33"
+expect = "27"
 
 [[step]]
 actor = "a"
 command = "close"
 
 # An owner and its page client alternate the same batches. The limit trips at the same batch and both
-# processes report the same live count; the owner's maintenance commits keep the file at 33 pages,
-# as alone.
+# processes report the same live count. Alone, each commit lists its own orphans (27 pages); a page
+# client's commit lists none, so here the file reaches 36 pages, its leaks under the owner's
+# backstop threshold (compact_min_pages; format.md *Reclamation*).
 
 [[step]]
 actor = "a"
@@ -235,7 +236,7 @@ expect = "163840"
 [[step]]
 actor = "a"
 command = "page_count"
-expect = "33"
+expect = "36"
 
 # A client's delete lowers the live count the owner commits against.
 

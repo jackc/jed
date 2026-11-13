@@ -376,6 +376,12 @@ pub(crate) struct Storage {
     /// pinning an older version (single-handle, reconstruct-on-open, all readers current) the gate always
     /// passes, so the on-disk byte layout is byte-for-byte unchanged.
     free_gen_txid: u64,
+    /// The persisted free list's own chain pages, in chain order (a file-backed domain): the next
+    /// commit orphans them (incremental-reclaim.md §3.1).
+    free_chain: Vec<u32>,
+    /// The incremental-reclamation state of a file-backed domain ([`crate::incr_reclaim`]); `None`
+    /// until first used, and for an in-memory or temp domain.
+    incr: Option<crate::incr_reclaim::IncrState>,
     /// The committed-storage budget (memory.md §8): the in-memory form (Q4a) or the file form (§8.7).
     budget: StorageBudget,
     /// The version of the commit whose catalog root, high-water and free list an in-memory domain's
@@ -449,6 +455,9 @@ pub(crate) struct BudgetCtx<'a> {
     /// Whether the commit stages any record version; one that stages none and does not grow the
     /// catalog is admitted over the limit (the repair exemption, memory.md §8.3).
     pub(crate) stages_rows: bool,
+    /// The reader watermark the commit was gated by, when known (the main domain's commit): it lets
+    /// older free-list generations be reused under a pinned reader (incremental-reclaim.md §3.3).
+    pub(crate) oldest: Option<u64>,
 }
 
 /// The `max_storage_bytes` state of one domain (memory.md §8.1–§8.3, §8.7): the limit, plus what
@@ -538,6 +547,8 @@ impl Storage {
             spilled: false,
             live_at_compaction: 0,
             free_gen_txid: 0,
+            free_chain: Vec::new(),
+            incr: None,
             budget: StorageBudget::default(),
             adopted_txid: None,
             live: crate::format::LiveCount::default(),
@@ -792,19 +803,26 @@ impl Storage {
     /// unlimited, when it does not grow the live count, when it fits, or under the repair exemption
     /// (it stages no record version and rewrites no more catalog pages than the last commit). There is
     /// no forced compaction: reclaiming dead pages cannot lower the measure.
+    ///
+    /// An incremental commit (incremental-reclaim.md §2) also lists the B-tree and overflow pages
+    /// the commit orphans, returned beside the count.
     fn admit_file(
         &self,
         write: &crate::format::IncrementalWrite,
         ctx: &BudgetCtx<'_>,
-    ) -> Result<crate::format::LiveCount> {
-        let live = self.live.after(write, ctx.prev, &self.paging)?;
+    ) -> Result<(crate::format::LiveCount, Vec<u32>)> {
+        let (live, tree) = if self.incr_on() {
+            self.live.after_ids(write, ctx.prev, &self.paging)?
+        } else {
+            (self.live.after(write, ctx.prev, &self.paging)?, Vec::new())
+        };
         let limit = self.budget.limit;
         if limit <= 0
             || live.live <= self.live.live
             || u64::from(live.live) * u64::from(self.page_size) <= limit as u64
             || (!ctx.stages_rows && write.catalog_pages <= self.live.catalog)
         {
-            return Ok(live);
+            return Ok((live, tree));
         }
         Err(storage_limit_error(ctx.name, limit))
     }
@@ -1172,7 +1190,25 @@ impl Storage {
                 batch.clear();
                 pending = false;
             }
-            let allowed = self.reuse_allowed(pending);
+            // Fold the free-list generations no reader can observe; the rest stay off this commit's
+            // reuse (incremental-reclaim.md §3.3).
+            let mut newer = None;
+            if self.incr_active() {
+                if can_reclaim {
+                    self.incr_merge(snap.txid);
+                } else if let Some(oldest) = ctx.oldest {
+                    self.incr_merge(oldest);
+                }
+                newer = self.incr.as_ref().and_then(|incr| incr.newer());
+            }
+            let mut allowed = self.reuse_allowed(pending);
+            if let Some(newer) = &newer {
+                allowed = Some(Arc::new(crate::incr_reclaim::exclude_newer(
+                    allowed.as_deref(),
+                    newer,
+                    &self.free_pages,
+                )));
+            }
             let write = snap.incremental_image_allowed(
                 self.page_size,
                 self.page_count,
@@ -1181,7 +1217,12 @@ impl Storage {
                 allowed.as_deref(),
                 Some(&self.paging),
             )?;
-            let live = self.admit_file(&write, ctx)?;
+            let (live, tree) = self.admit_file(&write, ctx)?;
+            if self.incr_on()
+                && let Some(incr) = self.incr.as_mut()
+            {
+                incr.tree = tree;
+            }
             let cap_reached = self.commit_file(
                 snap,
                 write,
@@ -1230,6 +1271,18 @@ impl Storage {
         }
         let relaxed = self.relaxed_file();
         let pending = self.batch_entries();
+        // An incremental commit lists its orphans (incremental-reclaim.md §3.2), holding those a
+        // pending batch wrote (§3.4), and rebuilds only on the leak trigger (§3.5).
+        let mut incr = None;
+        if self.incr_active() {
+            let (listed, held) = self
+                .incr
+                .as_ref()
+                .expect("incr_active creates the state")
+                .orphans(&self.free_chain, &pending);
+            let due = self.incr_due();
+            incr = Some((crate::incr_reclaim::IncrPlan { listed, due }, held));
+        }
         let plan = crate::format::plan_free_list(
             snap,
             &self.paging,
@@ -1252,6 +1305,7 @@ impl Storage {
             live.live,
             &pending,
             allowed,
+            incr.as_ref().map(|(plan, _)| plan),
         )?;
         crate::format::verify_live_count(snap, &self.paging, &write, live)?;
         let (cap_reached, sealed_meta) = {
@@ -1290,15 +1344,92 @@ impl Storage {
             // The meta as written: an encrypted one is sealed (encrypted.md §6).
             self.last_commit = Some((sealed_meta, written));
         }
+        let is_incr = incr.is_some();
+        if let Some((incr_plan, held)) = incr {
+            let page_count = self.page_count;
+            self.incr
+                .as_mut()
+                .expect("incr_active creates the state")
+                .after(
+                    snap.txid,
+                    &write,
+                    &plan,
+                    incr_plan.listed,
+                    held,
+                    &pending,
+                    page_count,
+                );
+        }
         self.page_count = plan.page_count;
         self.free_pages = plan.persisted;
+        self.free_chain = plan.chain;
         self.live_at_compaction = plan.live;
         self.free_gen_txid = plan.generation;
         self.live = live;
+        if is_incr && self.incr.as_ref().is_some_and(|incr| incr.unknown_before) {
+            // A commit after a foreign one could not orphan that commit's wholesale pages: they stay
+            // unlisted until a rebuild.
+            let leaked = self.incr_leaked().max(0);
+            self.incr
+                .as_mut()
+                .expect("incr_active creates the state")
+                .tolerated = leaked;
+        }
         if cap_reached {
             self.start_cap_flush();
         }
         Ok(cap_reached)
+    }
+
+    /// Whether this domain's commits reclaim incrementally (incremental-reclaim.md): a file's owner
+    /// (or alone process). A page client's commit is planned against its owner's free list and leaves
+    /// its orphans unlisted; an in-memory or temp domain keeps its post-commit rebuild.
+    fn incr_on(&self) -> bool {
+        self.path.is_some() && !self.service_client
+    }
+
+    /// [`incr_on`](Self::incr_on), creating an empty (unknown) state when there is none yet.
+    pub(crate) fn incr_active(&mut self) -> bool {
+        if !self.incr_on() {
+            return false;
+        }
+        if self.incr.is_none() {
+            self.incr = Some(crate::incr_reclaim::IncrState::default());
+        }
+        true
+    }
+
+    /// Fold every free-list generation no reader older than `oldest` can observe into the base
+    /// generation (incremental-reclaim.md §3.3).
+    pub(crate) fn incr_merge(&mut self, oldest: u64) {
+        if let Some(incr) = self.incr.as_mut() {
+            incr.merge(oldest, &mut self.free_gen_txid);
+        }
+    }
+
+    /// Whether a free-list generation newer than the base is still unmerged.
+    #[cfg(unix)]
+    pub(crate) fn incr_unmerged(&self) -> bool {
+        self.incr.as_ref().is_some_and(|incr| !incr.gens.is_empty())
+    }
+
+    /// The exact count of dead pages no list holds in the committed state
+    /// ([`crate::incr_reclaim::IncrState::leaked`]).
+    pub(crate) fn incr_leaked(&self) -> i64 {
+        self.incr.as_ref().map_or(0, |incr| {
+            incr.leaked(
+                self.page_count,
+                self.paging.cap().first_body(),
+                self.free_pages.len(),
+                self.free_chain.len(),
+                self.live.live,
+            )
+        })
+    }
+
+    /// The incremental mode's rebuild trigger (incremental-reclaim.md §3.5).
+    pub(crate) fn incr_due(&self) -> bool {
+        crate::incr_reclaim::leak_due(self.incr_leaked(), self.live.live)
     }
 
     /// The IN-MEMORY branch of [`commit_durable`]: a `MemoryBlockStore` is never reopened, so it keeps
@@ -1427,6 +1558,8 @@ impl Storage {
         self.free_pages = engine.free_pages.clone();
         self.live_at_compaction = engine.live_at_compaction;
         self.free_gen_txid = engine.free_gen_txid;
+        self.free_chain = engine.free_chain.clone();
+        self.incr = engine.incr.clone();
         self.live = engine.live;
         self.adopted_txid = None;
         self.budget.last_cat_root = crate::format::PageRef::NONE;
@@ -1495,6 +1628,8 @@ impl Storage {
         self.free_pages = engine.free_pages.clone();
         self.live_at_compaction = engine.live_at_compaction;
         self.free_gen_txid = engine.free_gen_txid;
+        self.free_chain = engine.free_chain.clone();
+        self.incr = engine.incr.clone();
         self.live = engine.live;
         self.adopted_txid = None;
         self.budget.last_cat_root = crate::format::PageRef::NONE;
@@ -1814,8 +1949,21 @@ impl Shared {
         live.register(txid);
         *pins.entry(txid).or_insert(0) += 1;
         // Later pins are on this snapshot or newer, so they cannot void the grant.
-        let grant = live.oldest().map_or(txid, |oldest| oldest.min(txid)) >= free_gen_txid;
+        let oldest = live.oldest().map_or(txid, |oldest| oldest.min(txid));
+        let mut grant = oldest >= free_gen_txid;
         drop(live);
+        {
+            // A client reuses only listed pages no reader can observe; it cannot tell the free-list
+            // generations apart, so any unmerged generation withholds the grant
+            // (incremental-reclaim.md §3.3).
+            let mut st = self.storage.lock().expect("storage lock not poisoned");
+            if st.incr_active() {
+                st.incr_merge(oldest);
+                if st.incr_unmerged() {
+                    grant = false;
+                }
+            }
+        }
         let mut reuse = Vec::new();
         let granted = match floor {
             // Inside a batch the grant narrows to the committed free pages that were free at the
@@ -1966,9 +2114,12 @@ impl Shared {
             pager.cache_validation(&delta.meta, Arc::new(delta.protected.clone()));
             relaxed && pager.batch_cap_reached()
         };
-        let free_tag = crate::format::parse_meta(&delta.meta)
+        let parsed = crate::format::parse_meta(&delta.meta);
+        let free_tag = parsed
+            .as_ref()
             .map_or(crate::crypto::NO_TAG, |m| m.free_list_tag);
-        let free = crate::format::read_free_list(
+        let manifest_pages = parsed.as_ref().map_or(0, |m| m.manifest_pages);
+        let (free, chain) = crate::format::read_free_list_chain(
             &st.paging,
             crate::format::PageRef {
                 page: delta.free_list_head,
@@ -1978,7 +2129,13 @@ impl Shared {
             &delta.protected,
         )?;
         st.page_count = delta.page_count;
+        // The client's commit was not planned here: its listed pages keep their generations, and
+        // the new state's wholesale pages are unknown (incremental-reclaim.md §3.5).
+        if let Some(incr) = st.incr.as_mut() {
+            incr.foreign(&free, manifest_pages);
+        }
         st.free_pages = free;
+        st.free_chain = chain;
         if relaxed {
             st.after_client_commit(began_empty, cap_reached);
         }
@@ -2105,14 +2262,13 @@ impl Shared {
         if !self.role_is(&role) {
             return;
         }
-        if !(st.live_at_compaction == 0
-            || crate::format::reclaim_due(
-                st.page_count,
-                st.free_pages.len(),
-                st.live_at_compaction,
-            )
-            || st.ends_free())
-        {
+        // An incremental owner uses the leak trigger (incremental-reclaim.md §3.5).
+        let due = if st.incr_active() {
+            st.incr_due()
+        } else {
+            crate::format::reclaim_due(st.page_count, st.free_pages.len(), st.live_at_compaction)
+        };
+        if !(st.live_at_compaction == 0 || due || st.ends_free()) {
             return;
         }
         let mut snap = (*committed).clone();
@@ -2122,6 +2278,7 @@ impl Shared {
             prev: &committed,
             can_compact: false,
             stages_rows: false,
+            oldest: None,
         };
         if st.commit_durable(&snap, true, true, Some(&budget)).is_err() {
             let reopen = st.paging.pager().commit_requires_reopen();
@@ -2417,6 +2574,7 @@ impl Shared {
                     prev: &prev,
                     can_compact,
                     stages_rows,
+                    oldest: None,
                 };
                 // A local reader pins the whole roots map, so reuse is safe only when that common
                 // watermark says no older attachment root is live.
@@ -2428,6 +2586,7 @@ impl Shared {
                     prev,
                     can_compact,
                     stages_rows,
+                    oldest: None,
                 });
                 let staged =
                     att_storage.stage_in_memory(snap, budget.as_ref(), name.to_string())?;
@@ -2554,6 +2713,7 @@ impl Shared {
                             prev: &prev,
                             can_compact,
                             stages_rows: snap.staged_bytes() != 0,
+                            oldest: None,
                         },
                     )
                 })?;
@@ -2581,6 +2741,7 @@ impl Shared {
                 prev: &prev,
                 can_compact,
                 stages_rows: main_stages_rows,
+                oldest: None,
             },
         )
     }
@@ -2825,6 +2986,7 @@ impl Shared {
             prev: &prev,
             can_compact,
             stages_rows,
+            oldest: Some(oldest),
         };
         st.commit_durable(snap, can_reclaim, can_reuse, Some(&budget))
     }
@@ -3041,6 +3203,8 @@ impl Database {
             spilled: false,
             live_at_compaction: engine.live_at_compaction,
             free_gen_txid: engine.free_gen_txid,
+            free_chain: engine.free_chain.clone(),
+            incr: engine.incr.clone(),
             budget: StorageBudget::default(),
             adopted_txid: None,
             live: engine.live,
@@ -4081,6 +4245,8 @@ impl Database {
                 spilled: false,
                 live_at_compaction: engine.live_at_compaction,
                 free_gen_txid: engine.free_gen_txid,
+                free_chain: engine.free_chain.clone(),
+                incr: engine.incr.clone(),
                 budget: StorageBudget {
                     limit: source.max_storage_bytes,
                     ..StorageBudget::default()
@@ -5673,6 +5839,19 @@ impl Database {
     /// next commit draws from (`main` or an attachment) — and where the free list's trailing run below
     /// the high-water starts (the high-water when its top page is not free; format.md *Trailing
     /// truncation*); `None` if there is no such database.
+    /// Database `name`'s first body page and the unlisted dead pages its incremental-reclamation
+    /// state carries in (incremental-reclaim.md §5, the simulator's growth oracle); `(2, 0)` when
+    /// there is no such database.
+    #[cfg(feature = "sim")]
+    pub(crate) fn sim_incr_state(&self, name: &str) -> (u32, i64) {
+        self.0
+            .with_storage(name, |st| {
+                let tolerated = st.incr.as_ref().map_or(0, |incr| incr.tolerated);
+                Ok((st.paging.cap().first_body(), tolerated))
+            })
+            .unwrap_or((2, 0))
+    }
+
     pub(crate) fn sim_allocator(&self, name: &str) -> Option<(u32, u32, u32)> {
         let of = |st: &Storage| {
             let (_, trail) = crate::format::trailing_run(&st.free_pages, st.page_count);
@@ -6053,10 +6232,11 @@ mod temp_reclaim_internal_tests {
         );
     }
 
-    /// The periodic reclamation trigger (format.md *Reclamation*) measures the pages off the free
+    /// The in-memory post-commit trigger (format.md *Reclamation*) measures the pages off the free
     /// list, not the high-water, which never shrinks: measured by the high-water, every commit after
     /// the first crossing walked the whole database again. Churns one row past the threshold, then
     /// counts walks (each moves `free_gen_txid` to its commit's snapshot) over further commits.
+    /// (A file commit lists its orphans instead: incremental-reclaim.md.)
     fn churn_counting_walks(db: &Database) -> usize {
         const ROUNDS: usize = 200;
         let mut sess = db.session(SessionOptions::default());
@@ -6092,8 +6272,11 @@ mod temp_reclaim_internal_tests {
         walks
     }
 
+    /// A file commit lists the pages it orphans in its own free list (incremental-reclaim.md), so
+    /// steady churn never walks the database and the file stays at its live pages plus what the last
+    /// commit wrote. Mirrors the Go TestReclaimTriggerFileCommitsListTheirOrphans.
     #[test]
-    fn reclaim_trigger_file_commits_do_not_walk_every_time() {
+    fn reclaim_trigger_file_commits_list_their_orphans() {
         let path =
             std::env::temp_dir().join(format!("jed_reclaim_trigger_{}.jed", std::process::id()));
         let _ = std::fs::remove_file(&path);
@@ -6104,7 +6287,41 @@ mod temp_reclaim_internal_tests {
             ..Default::default()
         })
         .unwrap();
-        churn_counting_walks(&db);
+        let mut sess = db.session(SessionOptions::default());
+        sess.query_outcome("CREATE TABLE t (id i32 PRIMARY KEY, pad text)", &[])
+            .unwrap();
+        sess.query_outcome(
+            "INSERT INTO t SELECT g, 'pad-pad-pad-pad-pad-pad-pad-pad' || g::text FROM generate_series(1, 1000) g",
+            &[],
+        )
+        .unwrap();
+        let walks = crate::format::RECLAIM_WALKS.with(|w| w.get());
+        for k in 0..400 {
+            sess.query_outcome(&format!("UPDATE t SET pad = 'r{k}' WHERE id = 500"), &[])
+                .unwrap();
+            // Every page below the high-water is meta, live, listed free, or a free-list chain or
+            // manifest page the commit itself wrote.
+            let st = db.0.storage.lock().unwrap();
+            let unlisted = i64::from(st.page_count)
+                - i64::from(st.paging.cap().first_body())
+                - i64::from(st.live.live)
+                - st.free_pages.len() as i64
+                - st.free_chain.len() as i64;
+            assert!(
+                (0..=2).contains(&unlisted),
+                "round {k}: {} pages, {} live, {} free, {} chain: {unlisted} dead pages unlisted",
+                st.page_count,
+                st.live.live,
+                st.free_pages.len(),
+                st.free_chain.len()
+            );
+        }
+        let walked = crate::format::RECLAIM_WALKS.with(|w| w.get()) - walks;
+        assert_eq!(
+            walked, 0,
+            "{walked} of 400 steady commits walked the database"
+        );
+        drop(sess);
         drop(db);
         let _ = std::fs::remove_file(&path);
     }
@@ -6609,6 +6826,94 @@ mod reclaim_watermark_tests {
         }
     }
 
+    /// Under incremental reclamation (incremental-reclaim.md §3.3) a pinned reader holds back only
+    /// the generations listed after its version. Its snapshot stays intact while the writer churns,
+    /// the writer still reuses pages listed before the pin, and once the reader closes the next commits
+    /// merge the held generations and stop growing the file. Mirrors the Go
+    /// TestIncrReclaimReaderHoldsOnlyNewerGenerations.
+    #[test]
+    fn incr_reclaim_reader_holds_only_newer_generations() {
+        let path = std::env::temp_dir().join(format!("jed_incr_reader_{}.jed", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::create(CreateOptions {
+            path: Some(path.clone()),
+            page_size: 256,
+            skip_fsync: true,
+            ..Default::default()
+        })
+        .unwrap();
+        let exec = |sql: &str| {
+            db.session(SessionOptions::default())
+                .query_outcome(sql, &[])
+                .unwrap_or_else(|e| panic!("{sql}: {}", e.message));
+        };
+        exec("CREATE TABLE t (id i64 PRIMARY KEY, v text)");
+        exec("INSERT INTO t SELECT g, repeat('a', 30) FROM generate_series(1, 200) g");
+        for i in 0..50 {
+            exec(&format!(
+                "UPDATE t SET v = repeat('b', 30) WHERE id = {}",
+                1 + i % 200
+            ));
+        }
+        let steady = db.page_count();
+        let mut rd = db.read_session();
+        let pinned = count(&mut rd);
+        for i in 0..300 {
+            exec(&format!(
+                "UPDATE t SET v = repeat('c', 30) WHERE id = {}",
+                1 + i % 200
+            ));
+            if i % 50 == 0 {
+                // A no-op delete: an empty commit.
+                exec(&format!("DELETE FROM t WHERE id = {}", 1000 + i));
+            }
+        }
+        let gens = || {
+            db.0.storage
+                .lock()
+                .unwrap()
+                .incr
+                .as_ref()
+                .map_or(0, |incr| incr.gens.len())
+        };
+        assert!(
+            gens() > 0,
+            "a pinned reader left no newer generation unmerged"
+        );
+        assert_eq!(
+            count(&mut rd),
+            pinned,
+            "the pinned reader's snapshot changed"
+        );
+        drop(rd);
+        let grown = db.page_count();
+        assert!(
+            grown > steady,
+            "the file did not grow under the pin ({steady} → {grown}): the test does not exercise the gate"
+        );
+        for i in 0..300 {
+            exec(&format!(
+                "UPDATE t SET v = repeat('d', 30) WHERE id = {}",
+                1 + i % 200
+            ));
+        }
+        let leaked = db.0.storage.lock().unwrap().incr_leaked();
+        assert!(
+            gens() <= 1,
+            "{} generations remain unmerged with no reader",
+            gens()
+        );
+        assert_eq!(leaked, 0, "{leaked} dead pages left unlisted");
+        let after = db.page_count();
+        assert!(
+            after <= grown,
+            "the file kept growing after the reader closed: {grown} → {after}"
+        );
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(path.with_extension("jed.lock"));
+    }
+
     #[test]
     fn fallback_reader_snapshot_isolation_under_reclamation() {
         let path = std::env::temp_dir().join("jed_fallback_reader_isolation.jed");
@@ -6660,9 +6965,10 @@ mod reclaim_watermark_tests {
             );
         });
 
-        // The hook fires in the persist→publish window; it acts ONLY on a commit that compacted (advanced
-        // free_gen_txid past the still-published version) — the case that just placed a page reachable at
-        // the fallback version into the reusable free-list.
+        // The hook fires in the persist→publish window; it acts ONLY on a commit that put a page
+        // reachable at the still-published (fallback) version on the free list: one that compacted
+        // (advanced free_gen_txid past the published version) or that listed its orphans as a newer
+        // generation (incremental reclamation, incremental-reclaim.md §3.3).
         {
             let shared = db.0.clone();
             let fired = fired.clone();
@@ -6673,9 +6979,17 @@ mod reclaim_watermark_tests {
                     return;
                 }
                 let published = shared.committed_version();
-                let generation = shared.storage.lock().unwrap().free_gen_txid;
-                if generation <= published {
-                    return; // not a compacting commit — nothing fresh in the reusable free-list yet
+                let (generation, listed) = {
+                    let st = shared.storage.lock().unwrap();
+                    let listed = st
+                        .incr
+                        .as_ref()
+                        .and_then(|incr| incr.gens.last())
+                        .is_some_and(|g| g.txid > published);
+                    (st.free_gen_txid, listed)
+                };
+                if generation <= published && !listed {
+                    return; // nothing reachable at the published version entered the free list yet
                 }
                 fired.store(true, Ordering::SeqCst);
                 ready.lock().unwrap().take().unwrap().send(()).unwrap();

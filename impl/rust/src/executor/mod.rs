@@ -571,6 +571,12 @@ pub struct Engine {
     /// older than G. A bare single-handle `Engine` has no live registry oldest_live == committed, so the
     /// gate always passes and the byte layout is unchanged.
     pub(crate) free_gen_txid: u64,
+    /// The persisted free list's own chain pages (`page_type 7`), in chain order: the next file commit
+    /// orphans them (incremental-reclaim.md §3.1). Empty for an in-memory database.
+    pub(crate) free_chain: Vec<u32>,
+    /// The incremental-reclamation state the load (or `create`) recovered
+    /// ([`crate::incr_reclaim`]); `None` for an in-memory database.
+    pub(crate) incr: Option<crate::incr_reclaim::IncrState>,
     /// The shared paging context for a file-backed database (spec/design/pager.md): the open pager
     /// (kept for the handle's life) + the bounded leaf buffer pool, shared (`Arc`) with every table
     /// store so reads fault `OnDisk` leaves through the one pool. The load reads pages through it and

@@ -30,6 +30,7 @@ import { EngineError, engineError } from "./errors.ts";
 import { Environment } from "./environment.ts";
 import type { FileHost, WriteAt } from "./filehost.ts";
 import { capFirstBody, capOf } from "./cap.ts";
+import { freshImageIncr } from "./incr_reclaim.ts";
 import {
   type Argon2Params,
   createCodec,
@@ -250,8 +251,10 @@ function writeFullImage(
   db.pageCount = Math.floor(bytes.length / db.pageSize);
   // The image is of an empty database: every body page is live, and every one is a catalog page
   // (spec/design/memory.md §8.7).
-  const body = db.pageCount - capFirstBody(capOf(db.pageSize, codec !== null));
+  const first = capFirstBody(capOf(db.pageSize, codec !== null));
+  const body = db.pageCount - first;
   db.live = { live: body, catalog: body, gist: 0 };
+  db.incr = freshImageIncr(first, db.pageCount);
 }
 
 // OpenOptions are open-time settings for a file-backed database (spec/design/api.md §2.1). Unlike

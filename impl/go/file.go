@@ -330,7 +330,7 @@ func (db *engine) writeFullImage(files fileHost, noSync bool, codec *pageCodec) 
 	// create writes an empty database: every body page is live, and every one is a catalog page.
 	body := db.pageCount - capOf(db.pageSize, codec != nil).firstBody()
 	db.live = liveCount{live: body, catalog: body}
-	if incrOn() { // PROTOTYPE (incr_reclaim.go): every body page of a fresh image is a catalog page
+	if incrOn() { // every body page of a fresh image is a catalog page
 		in := &incrState{known: true}
 		for p := capOf(db.pageSize, codec != nil).firstBody(); p < db.pageCount; p++ {
 			in.catalog = append(in.catalog, p)
@@ -360,10 +360,10 @@ func (db *engine) persist(snap *snapshot) error {
 	st := storage{
 		pageSize: db.pageSize, pageCount: db.pageCount, freePages: db.freePages, freeChain: db.freeChain,
 		paging: db.paging, liveAtCompaction: db.liveAtCompaction, freeGenTxid: db.freeGenTxid,
-		path: db.path, dirSynced: db.dirSynced, incr: db.incr,
+		path: db.path, dirSynced: db.dirSynced, incr: db.incr, live: db.live,
 	}
 	var live liveCount
-	if st.incrActive() { // PROTOTYPE (incr_reclaim.go)
+	if st.incrActive() { // incr_reclaim.go
 		st.incrMerge(snap.txid) // a bare engine reuses ungated (oldest_live == committed)
 		live, st.incr.tree, err = db.live.afterIDs(write, db.committed, db.paging)
 	} else {

@@ -221,16 +221,17 @@ sits so the options stay open (CLAUDE.md §9).
   a `page_type 7` chain — [../fileformat/format.md](../fileformat/format.md) *Free-list page*),
   so **open reads it directly** rather than reconstructing it by walking every leaf (the second
   full leaf pass for spillable overflow chains is gone). Persistence is paired with **continuous within-session
-  reclamation** for the file/in-memory main domain: a file commit reclaims **this commit's fresh
-  orphans in-commit** — periodically, once the pages off the free list (`page_count − |free|`)
-  pass ~2× the live count at the last rebuild, so the file stays within ~2× live and the O(live)
-  reachability walk is amortized O(height)/commit (the trigger is format.md *Reclamation*; measuring
-  the never-shrinking high-water instead would walk on every commit once a file had doubled)
-  — because with open no longer reconstructing, orphans left unpersisted would leak permanently
+  reclamation** for the file/in-memory main domain: a file commit **lists the pages it orphans in
+  its own free list** (the live-delta walk's tree nodes and overflow chains plus the previous catalog
+  chain, GiST, free-list and manifest pages), reusable from the next commit, so the file stays at its
+  live pages plus the last commit's writes and the O(live) reachability walk runs only as a backstop
+  for leaks (format.md *Reclamation*, [incremental-reclaim.md](incremental-reclaim.md)); an in-memory
+  store rebuilds periodically once the pages off its free list pass ~2× the live count at the last
+  rebuild — because with open no longer reconstructing, orphans left unpersisted would leak permanently
   (a short open→commit→close session especially). This is what makes the **oldest-live-snapshot
-  watermark** (transactions.md §8 — a page freed at `txid T` is reusable only once
-  `oldest_live_txid > T`) **load-bearing**: the in-commit rebuild is deferred while any reader
-  pins an older version. A free-list page is drawn from the free-list itself (never the
+  watermark** (transactions.md §8 — a page listed by commit `T` is reusable only once
+  `oldest_live_txid ≥ T`) **load-bearing**: reuse of a commit's listed orphans, and the rebuild, are
+  deferred while any reader pins an older version. A free-list page is drawn from the free-list itself (never the
   high-water), so persisting the free-list does not grow the file, and it is torn-write-safe (a
   reused/rewritten page is dead at the fallback snapshot). An in-memory database reclaims the
   same way with **no persistence** (no meta, never reopened — post-commit RAM rebuild).

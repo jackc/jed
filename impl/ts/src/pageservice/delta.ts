@@ -264,13 +264,15 @@ export function metaAuthenticates(
 // readFreeListChain reads the committed free list (the page_type 7 chain at head) through read, for the
 // reuse grant's granted pages. A malformed chain yields null: the owner then grants no reuse. In an
 // encrypted database (codec set) each page is opened against the tag its predecessor binds, starting
-// with headTag, the meta's (spec/fileformat/encrypted.md §2).
+// with headTag, the meta's (spec/fileformat/encrypted.md §2). chainOut, when given, receives the chain's
+// own page ids.
 export function readFreeListChain(
   read: (index: number) => Uint8Array,
   head: number,
   pageCount: number,
   codec: PageCodec | null = null,
   headTag: Uint8Array = new Uint8Array(16),
+  chainOut: number[] | null = null,
 ): number[] | null {
   const free: number[] = [];
   const chain = new Set<number>();
@@ -280,6 +282,7 @@ export function readFreeListChain(
   for (let p = head; p !== 0; ) {
     if (p < first || p >= pageCount || chain.has(p)) return null;
     chain.add(p);
+    chainOut?.push(p);
     let b: Uint8Array;
     try {
       b = codec === null ? read(p) : codec.openBody(p, read(p), tag);

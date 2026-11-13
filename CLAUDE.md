@@ -899,8 +899,10 @@ session/clock/state dependencies, and pin named timezone data until an explicit 
   auto-drops it and `DROP SEQUENCE` of an owned sequence is `2BP01`, `spec/design/sequences.md` §12),
   and **on-disk free-list persistence + continuous within-session reclamation**
   (`format_version` 25 — meta offset 28 `free_list_head` + a new `page_type 7` free-list page; open
-  reads the persisted free-list instead of the reachability walk, and a file commit reclaims its fresh
-  orphans in-commit under the reader watermark, `spec/design/storage.md` §6). **Tree loading reads only
+  reads the persisted free-list instead of the reachability walk, and a file commit lists the pages it
+  orphans in its own free list, reusable from the next commit under the reader watermark, with a
+  reachability rebuild only as a leak backstop — `spec/design/storage.md` §6,
+  `spec/design/incremental-reclaim.md`). **Tree loading reads only
   the interior spine** — with v25's free-list persistence, v28 removes the last reason open touched
   every leaf by persisting an exact nonnegative signed-i64 row count in each table catalog entry.
   The catalog loader checks `(root_data_page == 0) == (row_count == 0)` and installs the count beside

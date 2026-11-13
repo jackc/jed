@@ -1,11 +1,12 @@
-# Incremental free-list reclamation (proposal)
+# Incremental free-list reclamation
 
-**Status: proposal, prototyped in the Go core only**, behind `JED_INCR_RECLAIM=on`. Nothing here is in
-`format.md`, the Ruby reference, or the Rust and TS cores. **It needs no format change**: a file
-written under it is an ordinary v52 file whose free list holds more entries, and every core reads it.
-What changes is the content of each commit's free list, so cross-core byte identity of new commits
-would need all three cores to adopt the rule (§9). §7 records what the prototype does, what was run
-against it, and the measurements.
+**Status: adopted in the Rust, Go and TypeScript cores** (2026-11-13). The normative rule is
+[format.md](../fileformat/format.md) *Reclamation*; this document is its design record: the problem,
+the rule's derivation and safety argument, and the measurements taken on the Go prototype before
+adoption (§7). **It needed no format change**: a file written under it is an ordinary v52 file whose
+free list holds more entries, and every older binary reads it (it only stops listing orphans). What
+changed is the content of each commit's free list, which is part of the cross-core byte contract, so
+the three cores adopted it together.
 
 ## 1. The problem
 
@@ -46,7 +47,8 @@ list them.
 Commit `N`'s **orphan set** is every page reachable from `N−1`'s meta that `N`'s meta does not reach:
 
 1. the B-tree nodes and overflow chains of §2 (the live-delta walk, listing ids);
-2. `N−1`'s catalog chain, unless `N` kept it byte-identical (only the deferred-interior prototype does);
+2. `N−1`'s catalog chain, unless `N` kept it byte-identical (only Go's deferred-interior prototype
+   does, and it turns this rule off);
 3. `N−1`'s GiST R-tree pages (rewritten whole by every commit, gist.md §4.1);
 4. `N−1`'s free-list chain pages;
 5. `N−1`'s manifest-overflow pages ([validated-cow.md](validated-cow.md) §2).
@@ -144,7 +146,7 @@ determines exactly how many dead pages no list holds:
              − free-list chain pages − manifest-overflow pages − held pages
 
 A commit rebuilds when it may (no older reader, owner-only as today) and `leaked > compact_min_pages`
-and `leaked > live_pages / 16`. The fraction is a constant like `compact_growth` (§8). The
+and `leaked × leak_den > live_pages` (`leak_den = 16`, `[reclamation]` in `spec/cost/schedule.toml`). The
 page-service owner's maintenance-commit trigger uses the same test. A rebuild clears the generations
 (every listed page is then dead at the rebuild's txid, which `oldest_live` equals) and keeps held only
 the pages still pending, which the rebuild excludes as today.
@@ -164,7 +166,8 @@ writer trims the generations to the new high-water as a precaution.
 suffix of the previous one: it relies on the list shrinking only from its ends between rebuilds (§2
 there). Incremental reclamation adds entries in the middle of the list at almost every commit, so the
 suffix test fails on almost every commit and the kept chain degenerates to today's fresh chain. The two
-do not compose; the prototype writes a fresh chain whenever it is on.
+do not compose; a commit under this rule writes a fresh chain (Go's kept-chain prototype stays a
+prototype, off by default).
 
 The cost they each attack shrinks under this proposal anyway: the list is now about the size of the
 pages recent commits orphaned (plus whatever a delete-heavy commit freed), not up to one entry per
@@ -214,17 +217,18 @@ reopen, as the replay step does.
 
 ## 6. Interaction with the reopen-seed fix
 
-A separate change (landing on its own) seeds today's trigger at open with the meta's exact
-`live_pages` instead of `page_count − |free list|`, which had let a file reach about 4× live across
-reopens. The leak trigger of §3.5 uses `live_pages` directly and needs no seed. The measurements in §7
-show today's rule both with and without that fix (the prototype carries it as
-`JED_RECLAIM_SEED_LIVE=on`, a measurement switch only).
+A separate change seeds the in-memory/periodic trigger at open with the meta's exact `live_pages`
+instead of `page_count − |free list|`, which had let a file reach about 4× live across reopens. The
+leak trigger of §3.5 uses `live_pages` directly and needs no seed; file commits no longer use the
+periodic trigger at all. The measurements in §7 show the periodic rule both with and without that
+fix.
 
-## 7. The Go prototype
+## 7. The Go prototype and its measurements
 
-In `impl/go`:
+This section records the prototype as it stood before adoption, when it was Go-only and behind
+`JED_INCR_RECLAIM=on`; the switch is gone and the rule is now on in every core. In `impl/go`:
 
-- `incr_reclaim.go`: the switch (`JED_INCR_RECLAIM=on`), the in-memory state (`incrState`: the
+- `incr_reclaim.go`: the in-memory state (`incrState`: the
   committed state's catalog, GiST and manifest pages; the generations; the held set), the orphan-id
   walk (`orphanedTreePageIDs`, `liveCount.afterIDs`), the leak count and trigger, and a verifier
   (`JED_INCR_VERIFY=on`: after every commit, a reachability walk checks that no listed page is live or
@@ -241,8 +245,9 @@ In `impl/go`:
   trigger.
 - `file.go`: the bare-engine commit path.
 
-Not combined with the deferred-interior or symbol-table prototypes (`incrOn` is false when either is
-on): both keep pages off the free list by rules of their own. In-memory databases and temp domains keep
+Not combined with Go's deferred-interior or symbol-table prototypes (`incrOn` is false when either is
+on, and the commit falls back to the `compact_growth` rebuild): both keep pages off the free list by
+rules of their own. In-memory databases and temp domains keep
 their post-commit rebuild (`maybeCompact`); they have no file to grow.
 
 ### 7.1 Run against it
@@ -289,7 +294,7 @@ The modes: **2×** is master; **2× + seed** adds the reopen-seed fix of §6, th
 **incr** is this prototype (`JED_INCR_LEAK_DEN` 16). Page counts are identical in both runs (the
 workloads are deterministic); latencies are the first run's and the second agrees within a few
 percent. "Walks" is reachability rebuilds; ratios are `page_count / live_pages` sampled after every
-commit. `EXPERIMENT` harness: `impl/go/zz_incr_measure_test.go` (`JED_INCR_MEASURE=a|b`).
+commit. The `EXPERIMENT` harness (`impl/go/zz_incr_measure_test.go`, `JED_INCR_MEASURE=a|b`) was removed at adoption; it is in commit `71a58efb`.
 
 **(a)** A 300k-row table with a secondary index (`id i64 PRIMARY KEY, k i64, pad text` of 40–80
 bytes, index on `k`), loaded by 600 random-key 500-row inserts, then 25,000 single-row updates of the
@@ -344,20 +349,25 @@ What the numbers say:
 
 ## 8. Open questions
 
-1. The leak fraction (1/16 in the prototype) and whether `compact_min_pages` stays its floor.
-2. Whether to list held pages at close with a maintenance commit (§3.5), and whether a page client
+1. Whether to list held pages at close with a maintenance commit (§3.5), and whether a page client
    should list its own orphans for the owner to check.
-3. Whether the free list wants a structure that takes middle insertions without a rewrite (§3.7),
+2. Whether the free list wants a structure that takes middle insertions without a rewrite (§3.7),
    folding in the kept-chain idea.
-4. Whether in-memory databases should follow the same rule, retiring `maybeCompact`'s walk there too.
+3. Whether in-memory databases should follow the same rule, retiring `maybeCompact`'s walk there too.
 
-## 9. Work if adopted
+## 9. Adoption
 
-`format.md` *Reclamation* and *Trailing truncation* (the rule, the leak trigger, the generations as
-in-memory state), `validated-cow.md` §2/§4 (orphans listed by their commit; held pages), `transactions.md`
-§8 (per-commit generations), `page-service.md` §6 (the grant, the maintenance trigger), `memory.md`
-§8.4 and `spec/cost/schedule.toml` (`compact_growth` replaced by the leak fraction); the three cores in
-lockstep (the per-commit free list becomes part of the byte contract, so the per-core incremental-commit
-tests that pin free-list bytes change); the Ruby reference's commit model if it simulates one; the
-simulator's growth oracle in all three runners; the bench dataset `generator_version`. No format
-version bump: older binaries read the files, and only stop listing orphans.
+The rule is specified in `format.md` *Reclamation* and *Trailing truncation*, `validated-cow.md` §2
+and §4 rule 4 (held pages), `transactions.md` §8 (per-commit generations), `page-service.md` §6 (the
+grant, client orphans as leaks), `pageservice/README.md` (the maintenance trigger), `memory.md` §8.4
+and `spec/cost/schedule.toml` (`leak_den`), `storage.md` §6, and `simulation-testing.md` §8.3 (the
+growth oracle of §5, in all three runners). The bench dataset `generator_version` was bumped (17).
+The Ruby reference writes only from-scratch images, so the goldens are unchanged. The process
+corpus's pinned page counts and backup tuple were updated for the smaller files. A page client's
+commit now often makes the owner's maintenance commit due (its orphans are leaks), and an owner commit
+depends on the reader watermark more often than before (generations merge by it; a pin on the
+committed version defers a rebuild), while a client's `end_read` and EOF reach the owner
+asynchronously (pageservice/README.md §6.3). So two byte-identical scenarios (`cow_overflow`,
+`cow_stale_orphan`) were reordered: the owner takes the writer gate after a client commit, which waits
+for its maintenance decision, before its pinned reader closes; and the replacement client starts after
+the owner's commit, not before it.

@@ -531,8 +531,10 @@ fn relaxed_trailing_truncation_waits_for_the_flush() {
         }
     }
     let pc = state(&db).0;
+    // The dropped table is about two thirds of the peak (the file holds its live pages plus the
+    // last commit's writes: incremental-reclaim.md).
     assert!(
-        pc * 3 <= peak,
+        pc * 2 <= peak,
         "trailing truncation should return the dropped table's pages: {peak} pages at the peak, {pc} after churn"
     );
     assert!(

@@ -24,8 +24,13 @@
 
 import process from "node:process";
 
-import { type ManifestEntry, manifestInlineCapacity, parseCommitMeta } from "../commit_manifest.ts";
-import { COMPACT_GROWTH, COMPACT_MIN_PAGES } from "../costs.ts";
+import {
+  type CommitMeta,
+  type ManifestEntry,
+  manifestInlineCapacity,
+  parseCommitMeta,
+} from "../commit_manifest.ts";
+import { COMPACT_MIN_PAGES, RECLAIM_LEAK_DEN } from "../costs.ts";
 import { KEY_BLOCK_LEN, PageCodec } from "../crypto.ts";
 import type { RandomSource } from "../seam.ts";
 import { EngineError } from "../errors.ts";
@@ -178,12 +183,21 @@ function metaPageCount(meta: Uint8Array): number {
   return ((meta[24]! << 24) | (meta[25]! << 16) | (meta[26]! << 8) | meta[27]!) >>> 0;
 }
 
-// reclaimDue mirrors format.ts reclaimDue (format.md *Reclamation*), kept here so the service does not
-// import the engine: the pages off the free list exceed compact_min_pages and compact_growth × the
-// live count at the last reclamation.
-function reclaimDue(pageCount: number, free: number, live: number): boolean {
-  const unlisted = pageCount - free;
-  return unlisted > COMPACT_MIN_PAGES && unlisted > COMPACT_GROWTH * live;
+// leakDue mirrors incr_reclaim.ts incrDue (incremental-reclaim.md §3.5) over a client commit's meta,
+// kept here so the service does not import the engine: the dead pages no list holds — below the
+// high-water and not a meta or key-block page, live, free, a free-list chain page, a manifest-overflow
+// page of the meta, or held by the owner's relaxed batch — exceed compact_min_pages and
+// live / reclaim_leak_den. The owner adopts exactly these facts before its maintenance commit decides.
+function leakDue(
+  meta: CommitMeta,
+  encrypted: boolean,
+  free: number,
+  chain: number,
+  held: number,
+): boolean {
+  const first = encrypted ? 4 : 2;
+  const leaked = meta.pageCount - first - free - meta.livePages - chain - meta.overflowCount - held;
+  return leaked > COMPACT_MIN_PAGES && leaked * RECLAIM_LEAK_DEN > meta.livePages;
 }
 
 function freeListHead(meta: Uint8Array): number {
@@ -945,17 +959,19 @@ export class Connection {
     let due: boolean;
     let quiet = false;
     let live = 0;
+    let held = 0;
     state.lock();
     try {
       state.unpinLocked(w.base, 1);
       state.publishLocked(d.txid, d.meta, d.written);
       state.bumpEpoch();
       // A maintenance commit is due when no pin — every pin is older than the next txid — holds back
-      // reclamation (README §6.4) and either the pages off the free list passed the reclamation
-      // threshold (format.md *Reclamation*) or the free list ends at the high-water, which the
-      // maintenance commit then truncates (format.md *Trailing truncation*). The committed free list
-      // is read below to decide.
+      // reclamation (README §6.4) and either the dead pages no list holds passed the leak trigger
+      // (incremental-reclaim.md §3.5) or the free list ends at the high-water, which the maintenance
+      // commit then truncates (format.md *Trailing truncation*). The committed free list is read below
+      // to decide.
       live = state.liveAtCompactionLocked();
+      held = state.heldPagesLocked();
       quiet = state.oldestPinnedLocked() === null && state.engineOldestLocked() === null;
       due = quiet && live === 0;
     } finally {
@@ -963,6 +979,7 @@ export class Connection {
     }
     if (quiet && live !== 0) {
       let free: number[] | null;
+      const chain: number[] = [];
       try {
         free = readFreeListChain(
           (p) => this.db.readPage(p),
@@ -970,6 +987,7 @@ export class Connection {
           d.parsed.pageCount,
           codec,
           freeListTag(d.meta),
+          chain,
         );
       } catch {
         free = null;
@@ -978,7 +996,7 @@ export class Connection {
       // again from the free list it adopts.
       due =
         free === null ||
-        reclaimDue(d.parsed.pageCount, free.length, live) ||
+        leakDue(d.parsed, codec !== null, free.length, chain.length, held) ||
         free[free.length - 1] === d.parsed.pageCount - 1;
     }
     const maintenance = this.db.maintenanceDue(due);

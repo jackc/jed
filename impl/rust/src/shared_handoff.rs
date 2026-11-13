@@ -324,6 +324,8 @@ impl Shared {
             st.free_pages = engine.free_pages.clone();
             st.live_at_compaction = engine.live_at_compaction;
             st.free_gen_txid = engine.free_gen_txid;
+            st.free_chain = engine.free_chain.clone();
+            st.incr = engine.incr.clone();
             st.live = engine.live;
             st.read_only = engine.read_only;
             st.path = engine.path.clone();
@@ -849,6 +851,7 @@ impl Shared {
             storage.free_pages = engine.free_pages.clone();
             storage.live_at_compaction = engine.live_at_compaction;
             storage.free_gen_txid = engine.free_gen_txid;
+            storage.free_chain = engine.free_chain.clone();
             storage.live = engine.live;
             self.roots
                 .write()
@@ -954,6 +957,7 @@ impl Shared {
             prev: &prev,
             can_compact: false,
             stages_rows,
+            oldest: None,
         };
         let result = st.commit_durable(snap, false, conn.reuse_grant(), Some(&budget));
         // The commit ends the write transaction, whatever its outcome: the owner's batch it named is

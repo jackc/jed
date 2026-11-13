@@ -316,13 +316,18 @@ carry everything required.
   free_gen_txid`) for the snapshot the writer starts from. With it, the client allocator uses the
   persisted free list exactly as an alone process would; without it, the client allocates from the
   high-water, as a deferred in-process commit does today. Pins taken after `begin_write` are on the
-  writer's base snapshot or later, so they cannot invalidate the grant.
-- **Free-list rebuilds are owner-only.** The periodic in-commit reclamation (the
-  reachability walk once the pages off the free list pass about twice the live count, format.md
-  *Reclamation*) is O(live
-  pages). Run by a remote client it would fetch the whole database. Instead a client commit never
-  rebuilds; when a client commit crosses the rebuild threshold the owner runs a storage-maintenance
-  commit immediately after it. The client's commit is acknowledged first, so the maintenance commit
+  writer's base snapshot or later, so they cannot invalidate the grant. A client cannot tell the
+  owner's in-memory free-list generations apart (each owner commit lists its orphans as a generation
+  that merges into the base once no reader is older, format.md *Reclamation*), so the owner withholds
+  the grant while any generation is unmerged; with every reader current the grant is unchanged.
+- **Free-list rebuilds are owner-only.** An owner's commit lists its own orphans (format.md
+  *Reclamation*); a client's commit plans against the owner's free list and lists nothing, so its
+  orphans are leaks that only the backstop rebuild — a reachability walk, O(live pages) — returns.
+  Run by a remote client it would fetch the whole database. Instead a client commit never
+  rebuilds; when a client commit leaves the leaked count past the backstop threshold (or the owner's
+  reclamation state unknown) the owner runs a storage-maintenance commit immediately after it. The
+  owner's next own commit lists the orphans it can name, but not the client commit's catalog, GiST,
+  and manifest pages, which it did not plan; they wait for a rebuild too. The client's commit is acknowledged first, so the maintenance commit
   adds no latency to it, but the owner does not release the writer gate between the two, so no other
   writer starts in between. This makes a file's page layout depend on which
   process committed, which is fine for the cross-core contract (each role's rule is specified and

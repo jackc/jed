@@ -30,17 +30,26 @@ decimal_group = 4
 # One hash/dedup/group/state-map entry's fixed overhead (memory.md §6.1, Q2 operator state).
 entry = 32
 
-# Within-session compaction trigger for never-reopened in-RAM stores (in-memory databases and
-# attachments, session temp domains) and the in-commit file reclamation (format.md *Reclamation*;
-# temp-tables.md §6). A store's page_count is observable through the deterministic storage budgets
-# (max_temp_storage_bytes 54P03, max_storage_bytes 54P06 — memory.md §8.4), so the schedule is shared data:
-# compaction runs once the pages off the free list (page_count − |free list|, the live pages plus the
-# dead ones no list holds yet) exceed compact_min_pages and compact_growth × the live page count at
-# the last compaction. Not page_count alone: the high-water never shrinks, so once past the threshold
-# it would trigger the reachability walk on every commit.
+# Reclamation constants (format.md *Reclamation*; memory.md §8.4). A store's page_count is observable
+# through the deterministic storage budgets (max_temp_storage_bytes 54P03, max_storage_bytes 54P06), so
+# the schedule is shared data.
+#
+# compact_growth: the within-session compaction trigger for never-reopened in-RAM stores (in-memory
+# databases and attachments, session temp domains; temp-tables.md §6). Compaction runs once the pages
+# off the free list (page_count − |free list|, the live pages plus the dead ones no list holds yet)
+# exceed compact_min_pages and compact_growth × the live page count at the last compaction. Not
+# page_count alone: the high-water never shrinks, so once past the threshold it would trigger the
+# reachability walk on every commit.
+#
+# leak_den: the file commit's backstop rebuild (incremental-reclaim.md §3.5). A file commit lists the
+# pages it orphans in its own free list, so the only dead pages no list holds are leaks (held pages
+# lost at a close, a page client's orphans, a file written by an older binary). Their exact count is
+# known from the committed meta; the reachability rebuild runs once it exceeds compact_min_pages and
+# live_pages / leak_den.
 [reclamation]
 compact_min_pages = 16
 compact_growth = 2
+leak_den = 16
 
 # field doc -------------------------------------------------------------------
 # id      stable snake_case unit name; the codegen handle (a named field on the

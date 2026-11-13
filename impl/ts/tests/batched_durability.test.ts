@@ -358,8 +358,10 @@ test("relaxed trailing truncation waits for the flush", () => {
     if (pending && pc < high && now > (pc + growthStep(pc)) * PAGE) deferred = true;
   }
   const pc = state().pc;
+  // The dropped table is about two thirds of the peak (the file holds its live pages plus the last
+  // commit's writes: incremental-reclaim.md).
   assert.ok(
-    pc * 3 <= peak,
+    pc * 2 <= peak,
     `the dropped table's pages are returned: ${peak} pages at the peak, ${pc} after churn`,
   );
   assert.ok(deferred, "no relaxed commit lowered the high-water with its shrink left to the flush");

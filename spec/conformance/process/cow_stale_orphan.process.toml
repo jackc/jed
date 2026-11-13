@@ -36,6 +36,18 @@ actor = "b"
 command = "exec"
 sql = "UPDATE t SET v = 30 WHERE id = 1"
 
+# The owner decides on a maintenance commit after acknowledging the client's commit, still holding
+# the writer gate (page-service.md §6). Waiting for that gate orders the decision before the reader
+# below closes, so the pinned reader always defers it and the bytes do not depend on timing.
+[[step]]
+actor = "a"
+command = "write_open"
+argument = "5000"
+
+[[step]]
+actor = "a"
+command = "write_rollback"
+
 [[step]]
 actor = "a"
 command = "read_query_i64"
@@ -50,15 +62,18 @@ command = "read_close"
 actor = "b"
 command = "kill"
 
-[[step]]
-actor = "b"
-command = "start"
-argument = "open"
-
+# The replacement client starts after the owner's commit: its open's read pin is released
+# asynchronously (spec/pageservice/README.md §6.3), and a pin on the committed version defers the
+# owner's free-list rebuild, so a commit racing that release would not have timing-free bytes.
 [[step]]
 actor = "a"
 command = "exec"
 sql = "UPDATE t SET v = 40 WHERE id = 1"
+
+[[step]]
+actor = "b"
+command = "start"
+argument = "open"
 
 [[step]]
 actor = "b"

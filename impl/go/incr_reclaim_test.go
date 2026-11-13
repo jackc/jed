@@ -6,13 +6,13 @@ import (
 	"testing"
 )
 
-// PROTOTYPE (incr_reclaim.go): under incremental reclamation a pinned reader holds back only the
+// Under incremental reclamation (incr_reclaim.go) a pinned reader holds back only the
 // generations listed after its version. Its snapshot stays intact while the writer churns, the writer
 // still reuses pages listed before the pin, and once the reader closes the next commits merge the held
-// generations and stop growing the file. Runs only with JED_INCR_RECLAIM=on.
+// generations and stop growing the file.
 func TestIncrReclaimReaderHoldsOnlyNewerGenerations(t *testing.T) {
 	if !incrOn() {
-		t.Skip("JED_INCR_RECLAIM=on")
+		t.Skip("a Go-only prototype that disables incremental reclamation is on")
 	}
 	path := filepath.Join(t.TempDir(), "incr.jed")
 	db, err := CreateDatabase(CreateOptions{Path: path, PageSize: 256, SkipFsync: true})

@@ -471,10 +471,10 @@ attachment runs this election on its own file (§6.6).
   sessions adopt the commit's catalog at their next transaction begin, never in the commit path, so
   nothing a client commits can fail after it is durable (page-service.md §7); a transaction whose begin
   cannot adopt it (a collation this owner lacks, say) fails alone. After acknowledging, still holding
-  the gate, the owner adopts the catalog itself and, when the commit left the high-water past the
-  reclamation threshold (`page_count > compact_min_pages` and `page_count > compact_growth × the
-  live count at the last reclamation`, or that count unknown) and no pin is older than the next
-  `txid`, runs a **maintenance commit** (page-service.md §6): the unchanged snapshot committed at the
+  the gate, the owner adopts the catalog itself and, when the commit left more leaked pages than the
+  backstop threshold (format.md *Reclamation*: dead pages no free list holds, which a client commit's
+  orphans are, past `compact_min_pages` and `live_pages / leak_den`; or the reclamation state
+  unknown), or a free trailing run, and no pin is older than the next `txid`, runs a **maintenance commit** (page-service.md §6): the unchanged snapshot committed at the
   next `txid` with in-commit reclamation — it rewrites the catalog chain and the free list. An owner
   whose service runs off its engine thread (TS) hands the held gate to the engine thread, which adopts
   the catalog and runs the maintenance commit at its next event-loop turn, transaction begin, or gate

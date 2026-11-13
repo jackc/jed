@@ -122,6 +122,7 @@ import {
   storageBytes,
   writeKeyBlockSteps,
 } from "./persist.ts";
+import { incrActive, incrDue, incrForeign, reuseGeneration } from "./incr_reclaim.ts";
 import type { Durability } from "./idle_flush.ts";
 import type { Statement } from "./ast.ts";
 
@@ -129,12 +130,17 @@ import type { Statement } from "./ast.ts";
 // Session.publish AFTER the durable persist but BEFORE the committed-root swap — the window in which the
 // just-committed version is durable yet not yet published, so a reader that pins here still gets the PRIOR
 // committed version (the reuse-gate fallback-reader race, transactions.md §8). It receives the still-
-// published committed txid and the storage's new free-list generation, so a test can detect a compacting
-// commit and pin a fallback reader synchronously (JS is single-threaded — no thread coordination needed).
+// published committed txid, the storage's new free-list base generation, and the generation every page on
+// its free list is dead from (reuseGeneration: a rebuild's, or the newest incremental generation's —
+// incremental-reclaim.md §3.3), so a test can detect a commit that put a page reachable at the published
+// version on the free list and pin a fallback reader synchronously (JS is single-threaded — no thread
+// coordination needed).
 // The deterministic pin-registration regression test installs a closure.
-export let afterPersistHook: ((committedTxid: bigint, freeGenTxid: bigint) => void) | null = null;
+export let afterPersistHook:
+  | ((committedTxid: bigint, freeGenTxid: bigint, listedGenTxid: bigint) => void)
+  | null = null;
 export function setAfterPersistHook(
-  h: ((committedTxid: bigint, freeGenTxid: bigint) => void) | null,
+  h: ((committedTxid: bigint, freeGenTxid: bigint, listedGenTxid: bigint) => void) | null,
 ): void {
   afterPersistHook = h;
 }
@@ -145,11 +151,14 @@ import { renderIn, type Value } from "./value.ts";
 // ServiceEngineFacts are the owner's page-accounting facts its service needs to grant free-page reuse
 // and to decide a maintenance commit (spec/pageservice/README.md §3.5, §6.4): the free list's
 // generation, the live count at the last reclamation, and the oldest version a local reader pins (null
-// when none does).
+// when none does). freeGenTxid is the generation every listed free page is dead from, its unmerged
+// incremental generations included (incremental-reclaim.md §3.3, reuseGeneration); heldPages is how
+// many orphans the engine holds back from a relaxed batch (§3.4), which the maintenance trigger counts.
 export type ServiceEngineFacts = {
   freeGenTxid: bigint;
   liveAtCompaction: number;
   localOldest: bigint | null;
+  heldPages: number;
 };
 
 // ServicePending is what the owner's engine thread adopts from client commits (README §6.4): the
@@ -1209,7 +1218,11 @@ class SharedCore {
     if (loaded.committed.txid <= own) return;
     this.storage.pageCount = loaded.pageCount;
     this.storage.freePages = loaded.freePages;
+    this.storage.freeChain = loaded.freeChain;
     this.storage.live = loaded.live;
+    // The client commits' wholesale pages are unknown to this owner; the listed pages that survive
+    // keep their generations (incremental-reclaim.md §3.5).
+    incrForeign(this.storage, loaded.freePages, loaded.incr?.manifestCount ?? 0);
     this.committed = loaded.committed;
     this.planEpoch++;
   }
@@ -1225,10 +1238,14 @@ class SharedCore {
     const prev = this.committed;
     const newTxid = prev.txid + 1n;
     if (this.oldestLiveVersion(newTxid) !== newTxid) return;
+    // An owner reclaims incrementally, so its rebuild trigger is the leak count (incr_reclaim.ts).
+    const due = incrActive(st)
+      ? incrDue(st)
+      : reclaimDue(st.pageCount, st.freePages.length, st.liveAtCompaction);
     if (
       !(
         st.liveAtCompaction === 0 ||
-        reclaimDue(st.pageCount, st.freePages.length, st.liveAtCompaction) ||
+        due ||
         st.freePages[st.freePages.length - 1] === st.pageCount - 1
       )
     ) {
@@ -1261,9 +1278,10 @@ class SharedCore {
     for (const v of this.live.keys()) if (localOldest === null || v < localOldest) localOldest = v;
     this.serviceLocalOldest = localOldest !== null;
     this.service!.published(txid, st.lastCommitMeta, st.lastCommitWritten, {
-      freeGenTxid: st.freeGenTxid,
+      freeGenTxid: reuseGeneration(st),
       liveAtCompaction: st.liveAtCompaction,
       localOldest,
+      heldPages: st.incr?.held.length ?? 0,
     });
   }
 
@@ -1320,6 +1338,7 @@ class SharedCore {
     client.markAdopted(reply.incarnation, reply.txid);
     this.storage.pageCount = loaded.pageCount;
     this.storage.freePages = loaded.freePages;
+    this.storage.freeChain = loaded.freeChain;
     this.storage.liveAtCompaction = loaded.liveAtCompaction;
     this.storage.freeGenTxid = loaded.freeGenTxid;
     this.storage.live = loaded.live;
@@ -1460,9 +1479,10 @@ class SharedCore {
       if (main) {
         this.committed = compacted;
         service?.compactedLocked(compacted.txid, this.storage.paging!, {
-          freeGenTxid: this.storage.freeGenTxid,
+          freeGenTxid: reuseGeneration(this.storage),
           liveAtCompaction: this.storage.liveAtCompaction,
           localOldest: null,
+          heldPages: this.storage.incr?.held.length ?? 0,
         });
       } else {
         const attached = new Map(this.attached);
@@ -1523,6 +1543,8 @@ class SharedCore {
       oldest === snap.txid,
       oldest >= this.storage.freeGenTxid,
       budget,
+      true,
+      oldest,
     );
   }
 
@@ -1917,8 +1939,10 @@ function* adoptRewrittenSteps(st: Engine, paging: SharedPaging): Steps<Snapshot>
   st.paging = paging;
   st.pageCount = loaded.pageCount;
   st.freePages = loaded.freePages;
+  st.freeChain = loaded.freeChain;
   st.liveAtCompaction = loaded.liveAtCompaction;
   st.freeGenTxid = loaded.freeGenTxid;
+  st.incr = loaded.incr;
   st.live = loaded.live;
   st.storageBudget.lastCatRoot = 0;
   st.storageBudget.lastWritten = [];
@@ -3728,7 +3752,8 @@ export class Session {
       if (afterPersistHook !== null) {
         // The persist→publish window (test seam; §8 fallback-reader race point). core.committed is still the
         // PRIOR published root here — a reader pinned inside the hook gets that fallback version.
-        afterPersistHook(this.core.committed.txid, this.core.storage.freeGenTxid);
+        const st = this.core.storage;
+        afterPersistHook(this.core.committed.txid, st.freeGenTxid, reuseGeneration(st));
       }
       // The post-commit residency flip (bplus-reshape.md B4): the persist above assigned page ids to
       // every dirty node it wrote, so the committed tree can shed its leaf payloads — clean leaves

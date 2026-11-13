@@ -430,6 +430,16 @@ violation). Two mechanisms, in every core (`shared`/`format`/`persist` — Go/Ru
   never changes *which* pages a single-handle commit picks. So no `format_version` bump, and every
   golden is identical.
 
+- **Per-commit generations (file commits).** A file commit lists its own orphans in its free list
+  (format.md *Reclamation*), so one generation for the whole list would freeze reuse whenever any
+  reader is older than the last commit. Instead the writer keeps, in memory only, the base list (dead
+  at `free_gen_txid`) plus each later commit's listed orphans tagged with that commit's `txid`. Before
+  planning, every generation with `txid ≤ oldest_live_txid` merges into the base (`free_gen_txid`
+  rises to the largest merged `txid`); the allocator reuses only the base. A reader pinned at `v`
+  therefore holds back only what commits after `v` listed. At open the whole list is one generation
+  again; a page-service owner withholds a client's reuse grant while any generation is unmerged
+  (page-service.md §6).
+
 - **Atomic pin registration (the watermark can't be fooled).** A reader must not be invisible to the
   gate in the window between reading the committed root and registering its pin: were it, a writer could
   reclaim a version the reader is about to pin. So the load and the registration happen under one
@@ -439,8 +449,8 @@ violation). Two mechanisms, in every core (`shared`/`format`/`persist` — Go/Ru
   only the reuse gate is needed there; Go and Rust make it explicit.)
 
 The **fallback reader** is the case that motivates both: a reader that loads the committed root in a
-writer's persist→publish window pins the *prior* version just as that commit's compaction places one of
-its pages into the reusable free-list. The generation gate defers reuse of that page while the reader is
+writer's persist→publish window pins the *prior* version just as that commit places one of its pages
+on the free list (a compaction's rebuild, or the commit's own listed orphans). The generation gate defers reuse of that page while the reader is
 live; atomic registration guarantees the reader is counted. Each core has a deterministic regression
 test (a `AFTER_PERSIST_HOOK`-style seam pins the fallback reader, then reuse-commits hammer the pool)
 that fails "snapshot isolation violated" with the gate disabled and passes with it.

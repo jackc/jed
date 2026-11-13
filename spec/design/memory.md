@@ -853,10 +853,11 @@ point is a pure function of the sequence of operations, because each input is:
 - **Page allocation.** The copy-on-write commit serializer is deterministic, and
   so is the order it reuses free-list pages in. In-memory stores already share the
   file serializer.
-- **The compaction schedule.** The `16`-page floor and the `2 × live` trigger
-  (measured on the pages off the free list, format.md *Reclamation*) are shared data: `[reclamation]` in `spec/cost/schedule.toml`
-  (`compact_min_pages`, `compact_growth`), codegen'd into every core like the cost
-  schedule. They were hand-mirrored constants before Q4a, though `54P03` already
+- **The compaction schedule.** The `16`-page floor, the in-memory `2 × live` trigger
+  (measured on the pages off the free list), and the file commit's leak trigger (`live / 16`; a file
+  commit lists its own orphans, format.md *Reclamation*) are shared data: `[reclamation]` in
+  `spec/cost/schedule.toml` (`compact_min_pages`, `compact_growth`, `leak_den`), codegen'd into every
+  core like the cost schedule. They were hand-mirrored constants before Q4a, though `54P03` already
   depended on them.
 - **The reader watermark.** Which versions are pinned depends on the order of
   commits and pin points, and that order is the deterministic schedule the

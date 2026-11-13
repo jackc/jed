@@ -72,8 +72,10 @@ test("trailing truncation shrinks a file after a delete", () => {
   const peakLength = statSync(path).size;
   churn(db, 600, "a");
   const pc = db.pageCount;
+  // The dropped table is about two thirds of the peak (the file holds its live pages plus the last
+  // commit's writes: incremental-reclaim.md).
   assert.ok(
-    pc * 3 <= peak,
+    pc * 2 <= peak,
     `the dead top of the file is returned: ${peak} pages at peak, ${pc} after`,
   );
   const length = statSync(path).size;

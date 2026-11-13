@@ -1,10 +1,8 @@
 package jed
 
-// PROTOTYPE (spec/design/incremental-reclaim.md): incremental free-list reclamation. Each file commit
-// lists the pages it orphans in its own persisted free list, instead of leaving them unlisted until the
-// periodic reachability rebuild. Behind JED_INCR_RECLAIM=on; the Go core only; no format change (the
-// file is an ordinary v52 file whose free list simply holds more entries). Rust and TS still read and
-// write such a file, but their commits stop listing orphans and return to the 2× rule.
+// Incremental free-list reclamation (spec/design/incremental-reclaim.md; format.md *Reclamation*).
+// Each file commit lists the pages it orphans in its own persisted free list, so dead pages do not wait
+// for a reachability rebuild.
 //
 // The rules (design doc §3):
 //   - commit T lists its orphans in its own free list, but never reuses them itself: they are
@@ -19,36 +17,20 @@ package jed
 import (
 	"fmt"
 	"os"
-	"strconv"
 	"sync/atomic"
 )
 
-// incrReclaim turns the prototype on.
-var incrReclaim = os.Getenv("JED_INCR_RECLAIM") == "on"
-
 // incrVerify makes every incremental commit check its listed pages against a reachability walk (test
-// tooling; expensive).
+// tooling; expensive). JED_INCR_VERIFY_STRICT=on also fails a commit that leaves a dead page unlisted
+// beyond what its lifetime began with.
 var incrVerify = os.Getenv("JED_INCR_VERIFY") == "on"
 
-// incrLeakDen is the leak trigger's fraction: a rebuild runs once the unlisted dead pages exceed
-// compact_min_pages and live / incrLeakDen. JED_INCR_LEAK_DEN overrides the default 16.
-var incrLeakDen = func() uint64 {
-	if n, err := strconv.Atoi(os.Getenv("JED_INCR_LEAK_DEN")); err == nil && n > 0 {
-		return uint64(n)
-	}
-	return 16
-}()
+// incrOn is whether file commits reclaim incrementally. The Go-only deferred-interior (remap.go) and
+// symbol-table (leaf_sym.go) prototypes keep pages off the free list by rules of their own, so under
+// either the commit falls back to the compact_growth rebuild.
+func incrOn() bool { return !deferInterior && !leafSym && !leafSymCol }
 
-// incrOn is whether file commits reclaim incrementally. The prototype does not combine with the
-// deferred-interior (remap.go) or symbol-table (leaf_sym.go) prototypes: both keep pages off the free
-// list by rules of their own.
-func incrOn() bool { return incrReclaim && !deferInterior && !leafSym && !leafSymCol }
-
-// reclaimSeedLive (EXPERIMENT, JED_RECLAIM_SEED_LIVE=on) seeds the 2× trigger at open with the meta's
-// live count instead of page_count − |free list|: the fix landing separately, for a fair baseline.
-var reclaimSeedLive = os.Getenv("JED_RECLAIM_SEED_LIVE") == "on"
-
-// reclaimWalks counts reachability rebuilds of file commits (EXPERIMENT: either mode).
+// reclaimWalks counts reachability rebuilds of file commits (test observability).
 var reclaimWalks atomic.Uint64
 
 // incrState is a file storage's incremental-reclamation state. Nothing in it is persisted: it is
@@ -157,7 +139,7 @@ func (st *storage) incrLeaked() int64 {
 // incrDue is the incremental mode's rebuild trigger.
 func (st *storage) incrDue() bool {
 	leaked := st.incrLeaked()
-	return leaked > int64(compactMinPages) && uint64(leaked)*incrLeakDen > uint64(st.live.live)
+	return leaked > int64(compactMinPages) && uint64(leaked)*reclaimLeakDen > uint64(st.live.live)
 }
 
 // incrOrphans is what commit write orphans, split into the pages its free list may list now and those
@@ -206,9 +188,6 @@ func (st *storage) incrOrphans(write incrementalWrite, pending []manifestEntry) 
 
 // incrAfter records a published incremental commit.
 func (st *storage) incrAfter(txid uint64, write incrementalWrite, plan validatedCommitPlan, listed, held []uint32, pending []manifestEntry) {
-	if incrDebug != nil {
-		incrDebug(st, txid, listed, held, len(pending), plan)
-	}
 	in := st.incr
 	in.unknownBefore = !in.known
 	if plan.rebuilt {
@@ -474,15 +453,8 @@ func (st *storage) incrCheck(snap *snapshot, write incrementalWrite, plan valida
 		}
 	}
 	if len(leaked) > st.incr.tolerated {
-		incrLeakLog.Add(uint64(len(leaked) - st.incr.tolerated))
 		if os.Getenv("JED_INCR_VERIFY_STRICT") == "on" {
 			panic(fmt.Sprintf("incremental reclaim: txid %d leaves %d dead pages unlisted: %v", snap.txid, len(leaked), leaked[:min(len(leaked), 20)]))
 		}
 	}
 }
-
-// incrDebug, when set, sees every incremental commit (test tooling).
-var incrDebug func(st *storage, txid uint64, listed, held []uint32, pending int, plan validatedCommitPlan)
-
-// incrLeakLog counts the unlisted dead pages incrCheck observed (EXPERIMENT).
-var incrLeakLog atomic.Uint64

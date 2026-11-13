@@ -79,6 +79,8 @@ def rust_file(us)
     /// Within-session compaction trigger (spec/design/memory.md §8.4).
     pub const COMPACT_MIN_PAGES: u32 = #{reclaim('compact_min_pages')};
     pub const COMPACT_GROWTH: u64 = #{reclaim('compact_growth')};
+    /// File commits' backstop rebuild trigger (spec/design/incremental-reclaim.md §3.5).
+    pub const RECLAIM_LEAK_DEN: u64 = #{reclaim('leak_den')};
 
     /// The deterministic cost-unit weights, mirroring spec/cost/schedule.toml.
     pub struct CostSchedule {
@@ -128,6 +130,8 @@ def go_file(us)
     const (
     	compactMinPages uint32 = #{reclaim('compact_min_pages')}
     	compactGrowth   uint64 = #{reclaim('compact_growth')}
+    	// File commits' backstop rebuild trigger (spec/design/incremental-reclaim.md §3.5).
+    	reclaimLeakDen uint64 = #{reclaim('leak_den')}
     )
 
     // CostSchedule holds the deterministic cost-unit weights, mirroring spec/cost/schedule.toml.
@@ -168,6 +172,8 @@ def ts_file(us)
     // Within-session compaction trigger (spec/design/memory.md §8.4).
     export const COMPACT_MIN_PAGES = #{reclaim('compact_min_pages')};
     export const COMPACT_GROWTH = #{reclaim('compact_growth')};
+    // File commits' backstop rebuild trigger (spec/design/incremental-reclaim.md §3.5).
+    export const RECLAIM_LEAK_DEN = #{reclaim('leak_den')};
 
     // The deterministic cost-unit weights, mirroring spec/cost/schedule.toml. Weights are
     // bigint for i64 parity with the Rust/Go cores (a number is f64 — CLAUDE.md §8).

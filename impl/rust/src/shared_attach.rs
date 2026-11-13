@@ -448,6 +448,7 @@ impl Shared {
                 prev,
                 can_compact: compactable,
                 stages_rows: snap.staged_bytes() != 0,
+                oldest: None,
             },
         )
     }

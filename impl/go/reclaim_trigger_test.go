@@ -1,11 +1,12 @@
 package jed
 
-// The periodic reclamation trigger (format.md *Reclamation*): the walk runs once the pages off the
-// free list pass compact_growth × the live count at the last reclamation, not once the high-water
-// does. The high-water never shrinks, so measuring it made every commit after the first crossing walk
-// the whole database again. These tests count walks — each one moves freeGenTxid to its commit's
-// snapshot — over a steady single-row UPDATE churn: the file in-commit path and the in-memory
-// post-commit path.
+// The reclamation triggers. A file commit lists the pages it orphans in its own free list
+// (incremental-reclaim.md), so steady churn never walks the database and the file stays at its live
+// pages plus what the last commit wrote. The in-memory post-commit path keeps the periodic rebuild
+// (format.md *Reclamation*): the walk runs once the pages off the free list pass compact_growth × the
+// live count at the last reclamation, not once the high-water does — the high-water never shrinks, so
+// measuring it made every commit after the first crossing walk the whole database again. These tests
+// run a steady single-row UPDATE churn on each path.
 
 import (
 	"fmt"
@@ -31,8 +32,12 @@ func assertFewWalks(t *testing.T, walks int) {
 	}
 }
 
-func TestReclaimTriggerFileCommitsDoNotWalkEveryTime(t *testing.T) {
-	t.Parallel()
+// Not parallel: reclaimWalks is process-wide, and top-level parallel tests start only after the
+// sequential ones finish.
+func TestReclaimTriggerFileCommitsListTheirOrphans(t *testing.T) {
+	if !incrOn() {
+		t.Skip("a Go-only prototype that disables incremental reclamation is on")
+	}
 	db, err := create(filepath.Join(t.TempDir(), "trigger.jed"), databaseOptions{PageSize: 256, noSync: true})
 	if err != nil {
 		t.Fatal(err)
@@ -40,24 +45,22 @@ func TestReclaimTriggerFileCommitsDoNotWalkEveryTime(t *testing.T) {
 	defer db.Close()
 	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, pad text)")
 	mustExec(t, db, triggerSetupSQL)
-	// Cross the threshold first, so the counted rounds are all past it.
-	for k := 0; k < triggerRounds; k++ {
+	walks := reclaimWalks.Load()
+	for k := 0; k < 2*triggerRounds; k++ {
 		mustExec(t, db, triggerChurnSQL(k))
-	}
-	if db.freeGenTxid == 0 {
-		t.Fatal("the warm-up churn never reclaimed")
-	}
-	walks := 0
-	for k := 0; k < triggerRounds; k++ {
-		gen := db.freeGenTxid
-		mustExec(t, db, triggerChurnSQL(triggerRounds+k))
-		if db.freeGenTxid != gen {
-			walks++
+		// Every page below the high-water is meta, live, listed free, or a free-list chain or
+		// manifest page the commit itself wrote.
+		chain := 0
+		if db.freeChain != nil {
+			chain = len(db.freeChain.refs)
+		}
+		first := db.paging.cap().firstBody()
+		if unlisted := int(db.pageCount) - int(first) - int(db.live.live) - len(db.freePages) - chain; unlisted < 0 || unlisted > 2 {
+			t.Fatalf("round %d: %d pages, %d live, %d free, %d chain: %d dead pages unlisted", k, db.pageCount, db.live.live, len(db.freePages), chain, unlisted)
 		}
 	}
-	assertFewWalks(t, walks)
-	if hw, live := db.PageCount(), db.liveAtCompaction; hw > 3*live {
-		t.Fatalf("high-water %d is unbounded against %d live pages", hw, live)
+	if n := reclaimWalks.Load() - walks; n != 0 {
+		t.Fatalf("%d of %d steady commits walked the database (want 0)", n, 2*triggerRounds)
 	}
 }
 
