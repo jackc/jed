@@ -6,7 +6,8 @@ incomplete and not frozen.** No performance claim or package publication.
 ## Identity
 
 - Semantic baseline and supported peer source: `b1a6affca7725e0b07a4f734eddb1c569ef76bcf`.
-- C# implementation: uncommitted working-tree additions in this checkout.
+- C# implementation: tested as working-tree additions, subsequently committed
+  locally as `aeb741bd` on `codex/csharp-native-experiment`.
 - Source SHA-256: `35137d5de128ab1d4ae8a4813da3a0b7dda504320bb8a5c93ac087cb511e647d`.
   The task launcher computes this from sorted source paths and bytes, including
   engine/harness C#, project configuration, generated data, task tooling and the

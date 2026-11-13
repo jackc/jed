@@ -109,3 +109,33 @@ the original revision. Any supplemental corpus files are identified separately;
 they do not silently move that revision. Implementation and performance evidence
 must identify the actual source tested. No freeze or performance claim is implied
 by this charter.
+
+## Full-build readiness audit (2026-11-12)
+
+The scalar milestone is committed locally as `aeb741bd`. The one identified
+external approval blocker is the concrete crypto dependency proposal in the
+[crypto audit](csharp-native-crypto.md). Subagent implementation/review is an
+optional execution choice, pending user authorization, not a prerequisite.
+
+The SDK, compiler, Linux host, PostgreSQL oracle, supported peer builds and shared
+fixtures are available in the current checkout. Unicode/time-zone bundles and
+regex vectors are already repository inputs; implementing their consumers needs
+no new package or reference-source provisioning. Safe, narrow OS interop for
+flock, directory durability and other sanctioned Linux host operations is within
+the existing host-seam scope. Its cross-core behavior still requires proof.
+
+The remaining work is implementation and verification, not a sequence of user
+design decisions. Proceed with the existing choices: full frozen baseline,
+Linux x86-64, .NET 11, async-first public APIs, handwritten independent engine,
+JIT and NativeAOT acceptance, opt-in tasks and no production packaging. Build
+storage/encoding and the full harness early; then complete types and expressions,
+catalog/transactions and DDL/DML, relational planning/execution, resource/spill
+behavior, encryption/maintenance and the process/simulation adapters. Integrate
+each slice against complete relevant shared files and host fixtures, followed by
+the full gates in the scope/host matrices and diagnostic benchmarks.
+
+Routine architecture, module boundaries, API naming, tests and defect fixes can
+be resolved within this charter. A future spec contradiction, additional
+dependency or necessary scope change must be surfaced explicitly. Such an
+unknown is not evidence of a present blocker. Completion means verified baseline
+parity and recorded measurements; passing the scalar slice is not completion.
