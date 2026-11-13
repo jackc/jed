@@ -288,3 +288,34 @@ fn page_limit_is_rejected_before_wrapping_into_metadata() {
         .incremental_image(PS as u32, u32::MAX, &[], true, None);
     assert!(matches!(result, Err(e) if e.code() == "54000"));
 }
+
+/// Bytes 60–63 of a meta slot are reserved zero (format.md *Meta page*), and slot selection
+/// validates the reserved fields, so a slot with a bit set there is not a valid candidate. Every
+/// implementation must agree: verify.rb and the TS core have always rejected one, and a core that
+/// accepted it would recover a different generation than the reference does from the same damaged
+/// file. Per-core because it is a byte-level loader check with no SQL-visible form (CLAUDE.md §10).
+#[test]
+fn meta_reserved_field_is_rejected() {
+    let mut image = Engine::new().to_image(PS as u32, 1).unwrap();
+    let slot = &mut image[..PS];
+    assert!(
+        crate::format::parse_meta(slot).is_some(),
+        "the unmodified slot must validate"
+    );
+    for bits in [1_u32, 1 << 31, u32::MAX] {
+        slot[60..64].copy_from_slice(&bits.to_be_bytes());
+        let crc = crate::format::meta_crc(slot);
+        slot[32..36].copy_from_slice(&crc.to_be_bytes());
+        assert!(
+            crate::format::parse_meta(slot).is_none(),
+            "reserved bytes {bits:#010x} accepted"
+        );
+    }
+    slot[60..64].copy_from_slice(&0_u32.to_be_bytes());
+    let crc = crate::format::meta_crc(slot);
+    slot[32..36].copy_from_slice(&crc.to_be_bytes());
+    assert!(
+        crate::format::parse_meta(slot).is_some(),
+        "the restored slot must validate again"
+    );
+}

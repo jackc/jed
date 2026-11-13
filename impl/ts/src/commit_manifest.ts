@@ -185,7 +185,7 @@ export function parseCommitMeta(
     dv.getUint16(4, false) !== 52 || // format_version (format.ts FORMAT_VERSION)
     dv.getUint32(8, false) !== pageSize ||
     dv.getUint32(32, false) !== metaChecksum(block) ||
-    dv.getUint32(60, false) !== 0
+    dv.getUint32(60, false) !== 0 // bytes 60-63 are reserved zero (format.md *Meta page*): a slot with a bit set here is not a valid candidate, in every core and in verify.rb
   )
     return null;
   // Offsets 6/7: the encryption suite and its reserve (encrypted.md §6) — 0, 0 in plaintext; the

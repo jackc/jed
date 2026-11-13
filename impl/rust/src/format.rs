@@ -6190,6 +6190,12 @@ pub(crate) fn parse_meta(m: &[u8]) -> Option<Meta> {
     if root_page < first_body || root_page >= page_count {
         return None;
     }
+    // Bytes 60–63 are reserved zero (format.md *Meta page*), and slot selection validates the
+    // reserved fields: a slot with a bit set here is not a valid candidate. All four implementations
+    // must agree, or they recover different generations from one damaged file.
+    if u32::from_be_bytes(m[60..64].try_into().unwrap()) != 0 {
+        return None;
+    }
     // v34: the live pages are a subset of the body pages.
     let live_pages = u32::from_be_bytes(m[56..60].try_into().unwrap());
     if live_pages > page_count - first_body {

@@ -403,13 +403,13 @@ page, §8.2). Not GiST pages: an R-tree is rewritten whole by every commit that 
 Meta offset **60**, reserved zero through v52, becomes `remap_entries` (u32): the number of entries
 the slot carries.
 
-> **A pre-existing gap this field sits on.** format.md names *reserved fields* among what slot
-> selection validates, and [../fileformat/verify.rb](../fileformat/verify.rb) rejects a slot whose
-> bytes 60–63 are nonzero — but the Rust and TS cores never read them, so the reference and the
-> cores disagree today on whether a corrupt slot with a bit set there is a valid candidate, and so on
-> which generation a damaged file recovers. That is independent of this proposal and should be fixed
-> under v52, by giving Rust and TS the check Ruby already has, rather than by dropping Ruby's. Under
-> v53 the same check becomes `remap_entries ≤ cap` (§9.3).
+> **A gap this field sat on, found while placing it and fixed under v52.** format.md names *reserved
+> fields* among what slot selection validates, and [../fileformat/verify.rb](../fileformat/verify.rb)
+> and the TS core both rejected a slot whose bytes 60–63 are nonzero — but the **Rust** core never
+> read them, so it alone accepted such a corrupt slot as a valid candidate, and a damaged file could
+> recover a different generation in Rust than in the reference. Rust now makes the same check (and
+> the Go core, which had briefly dropped it, makes it again), with a per-core loader test in each.
+> Under v53 that check becomes `remap_entries ≤ cap` (§9.3).
 
 The entries occupy the **tail of the meta's manifest area**, which is
 `[64, page_size)` in a plaintext meta and `[96, page_size − 40)` in an encrypted one

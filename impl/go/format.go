@@ -5859,9 +5859,12 @@ func parseMeta(m []byte) (meta, bool) {
 	if freeListHead != 0 && (freeListHead < first || freeListHead >= pageCount) {
 		return meta{}, false
 	}
-	// Bytes 60–63 stay reserved zero (format.md *Meta page*). Not validated: Rust and TS read straight
-	// from live_pages at 56 to the checks below, and a one-core-only rejection would make the two
-	// disagree on a corrupt slot's validity — and so on which generation recovery lands.
+	// Bytes 60–63 are reserved zero (format.md *Meta page*), and slot selection validates the reserved
+	// fields: a slot with a bit set here is not a valid candidate. All four implementations must agree,
+	// or they recover different generations from one damaged file.
+	if binary.BigEndian.Uint32(m[60:64]) != 0 {
+		return meta{}, false
+	}
 	// v34: the live pages are a subset of the body pages.
 	livePages := binary.BigEndian.Uint32(m[56:60])
 	if livePages > body {

@@ -273,3 +273,33 @@ func TestValidatedAllocatorRejectsPageHighWaterOverflow(t *testing.T) {
 		t.Fatalf("free-list high-water overflow: %v", err)
 	}
 }
+
+// TestMetaReservedFieldRejected — bytes 60–63 of a meta slot are reserved zero (format.md *Meta
+// page*), and slot selection validates the reserved fields, so a slot with a bit set there is not a
+// valid candidate. Every implementation must agree: verify.rb and the TS core have always rejected
+// one, and a core that accepted it would recover a different generation than the reference does from
+// the same damaged file. Per-core because it is a byte-level loader check with no SQL-visible form
+// (CLAUDE.md §10).
+func TestMetaReservedFieldRejected(t *testing.T) {
+	const pageSize = 256
+	image, err := newSnapshot(NewEnvironment()).ToImage(pageSize, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	slot := append([]byte(nil), image[:pageSize]...)
+	if _, ok := parseMeta(slot); !ok {
+		t.Fatal("the unmodified slot must validate")
+	}
+	for _, bits := range []uint32{1, 1 << 31, 0xFFFFFFFF} {
+		binary.BigEndian.PutUint32(slot[60:64], bits)
+		binary.BigEndian.PutUint32(slot[32:36], metaCRC(slot))
+		if _, ok := parseMeta(slot); ok {
+			t.Fatalf("a slot with reserved bytes %#08x accepted", bits)
+		}
+	}
+	binary.BigEndian.PutUint32(slot[60:64], 0)
+	binary.BigEndian.PutUint32(slot[32:36], metaCRC(slot))
+	if _, ok := parseMeta(slot); !ok {
+		t.Fatal("the restored slot must validate again")
+	}
+}
