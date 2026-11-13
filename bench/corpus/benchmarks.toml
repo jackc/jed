@@ -28,7 +28,7 @@ dataset = "large"
 kind = "query"
 sql = "SELECT id, customer_id, amount, note FROM orders WHERE id = $1"
 warmup = 50000
-iterations = 50000
+iterations = 170000
 seed = 4201
 expect_rows_per_iter = 1
 
@@ -47,8 +47,8 @@ description = "PK point lookup on 100k sparse keys where ~90% of the probes are 
 dataset = "scratch"
 kind = "query"
 sql = "SELECT id, v FROM sparse_orders WHERE id = $1"
-warmup = 5000
-iterations = 50000
+warmup = 27000
+iterations = 270000
 seed = 4289
 setup_sql = [
   "DROP TABLE IF EXISTS sparse_orders",
@@ -77,8 +77,8 @@ description = "Composite-PK exact tuple lookup on 100k rows; direct concatenated
 dataset = "scratch"
 kind = "query"
 sql = "SELECT v FROM composite_orders WHERE bucket = 42 AND id = $1"
-warmup = 500
-iterations = 20000
+warmup = 5000
+iterations = 200000
 seed = 4253
 expect_rows_per_iter = 1
 engines = ["jed", "postgres"]
@@ -102,8 +102,8 @@ description = "Two disjoint parameterized PK ranges on 100k rows; canonical inte
 dataset = "scratch"
 kind = "query"
 sql = "SELECT id, v FROM interval_orders WHERE id BETWEEN $1 AND $2 OR id BETWEEN $3 AND $4 ORDER BY id"
-warmup = 500
-iterations = 15000
+warmup = 600
+iterations = 18000
 seed = 4254
 engines = ["jed", "postgres"]
 setup_sql = [
@@ -144,8 +144,8 @@ description = "PK = ANY(ARRAY[$1..$8]) on 100k rows; one point probe per element
 dataset = "scratch"
 kind = "query"
 sql = "SELECT id, v FROM any_orders WHERE id = ANY(ARRAY[$1, $2, $3, $4, $5, $6, $7, $8]) ORDER BY id"
-warmup = 500
-iterations = 15000
+warmup = 870
+iterations = 26000
 seed = 4291
 engines = ["jed", "postgres"]
 setup_sql = [
@@ -208,8 +208,8 @@ description = "Composite PK tenant = $1 AND id = ANY(ARRAY[$2..$9]) on 100k rows
 dataset = "scratch"
 kind = "query"
 sql = "SELECT id, v FROM tenant_orders WHERE tenant = $1 AND id = ANY(ARRAY[$2, $3, $4, $5, $6, $7, $8, $9]) ORDER BY id"
-warmup = 500
-iterations = 15000
+warmup = 670
+iterations = 20000
 seed = 4307
 engines = ["jed", "postgres"]
 setup_sql = [
@@ -277,8 +277,8 @@ description = "Index on (tenant, k): tenant = $1 AND k = ANY(ARRAY[$2..$9]) on 1
 dataset = "scratch"
 kind = "query"
 sql = "SELECT id, v FROM tenant_items WHERE tenant = $1 AND k = ANY(ARRAY[$2, $3, $4, $5, $6, $7, $8, $9]) ORDER BY id"
-warmup = 500
-iterations = 15000
+warmup = 600
+iterations = 18000
 seed = 4311
 engines = ["jed", "postgres"]
 setup_sql = [
@@ -348,8 +348,8 @@ description = "bigint PK = ANY(outer integer[] column) on 100k rows; eight conve
 dataset = "scratch"
 kind = "query"
 sql = "SELECT l.k, (SELECT count(*) FROM promoted_orders o WHERE o.id = ANY(l.ids)) FROM promoted_lists l WHERE l.k = $1"
-warmup = 200
-iterations = 3000
+warmup = 800
+iterations = 12000
 seed = 4292
 engines = ["jed", "postgres"]
 setup_sql = [
@@ -375,8 +375,8 @@ description = "PK = ANY($1) with a bound bigint[] of eight keys on 100k rows; on
 dataset = "scratch"
 kind = "query"
 sql = "SELECT id, v FROM any_param_orders WHERE id = ANY($1) ORDER BY id"
-warmup = 500
-iterations = 15000
+warmup = 670
+iterations = 20000
 seed = 4321
 engines = ["jed", "postgres"]
 setup_sql = [
@@ -400,8 +400,8 @@ description = "Composite PK tenant = $1 AND id = ANY($2) with a bound bigint[] o
 dataset = "scratch"
 kind = "query"
 sql = "SELECT id, v FROM tenant_param_orders WHERE tenant = $1 AND id = ANY($2) ORDER BY id"
-warmup = 500
-iterations = 15000
+warmup = 430
+iterations = 13000
 seed = 4322
 engines = ["jed", "postgres"]
 setup_sql = [
@@ -432,8 +432,8 @@ description = "Index on (tenant, region text, k): tenant = $1 AND region IN ('ea
 dataset = "scratch"
 kind = "query"
 sql = "SELECT id, v FROM region_items WHERE tenant = $1 AND region IN ('east', 'west') AND k = $2 ORDER BY id"
-warmup = 300
-iterations = 5000
+warmup = 4600
+iterations = 76000
 seed = 4323
 engines = ["jed", "postgres"]
 setup_sql = [
@@ -462,8 +462,8 @@ description = "PK IN (SELECT k FROM picks WHERE g = $1) on 100k rows; eight poin
 dataset = "scratch"
 kind = "query"
 sql = "SELECT id, v FROM sub_orders WHERE id IN (SELECT k FROM sub_picks WHERE g = $1) ORDER BY id"
-warmup = 100
-iterations = 2000
+warmup = 750
+iterations = 15000
 seed = 4324
 engines = ["jed", "postgres"]
 setup_sql = [
@@ -488,8 +488,8 @@ description = "PK (= ANY(ARRAY[$1..$4]) AND id > $5) OR id = $6 on 100k rows; cl
 dataset = "scratch"
 kind = "query"
 sql = "SELECT id, v FROM any_orders_leaf WHERE (id = ANY(ARRAY[$1, $2, $3, $4]) AND id > $5) OR id = $6 ORDER BY id"
-warmup = 100
-iterations = 2000
+warmup = 1000
+iterations = 21000
 seed = 4325
 engines = ["jed", "postgres"]
 setup_sql = [
@@ -541,8 +541,8 @@ description = "lists JOIN orders ON o.id = ANY(l.ids) WHERE l.k = $1; eight inne
 dataset = "scratch"
 kind = "query"
 sql = "SELECT o.id, o.v FROM inl_lists l JOIN inl_orders o ON o.id = ANY(l.ids) WHERE l.k = $1 ORDER BY o.id"
-warmup = 100
-iterations = 2000
+warmup = 2200
+iterations = 44000
 seed = 4326
 engines = ["jed", "postgres"]
 setup_sql = [
@@ -568,8 +568,8 @@ description = "tenants JOIN tp ON tp.tenant = t.tenant AND tp.id IN (3 ids) WHER
 dataset = "scratch"
 kind = "query"
 sql = "SELECT tp.id, tp.w FROM inl_tenants t JOIN inl_tp tp ON tp.tenant = t.tenant AND tp.id IN (17, 401, 977) WHERE t.name = $1 ORDER BY tp.id"
-warmup = 300
-iterations = 5000
+warmup = 1700
+iterations = 29000
 seed = 4327
 engines = ["jed", "postgres"]
 setup_sql = [
@@ -596,8 +596,8 @@ description = "Secondary-index range on 100k rows with a compatible ORDER BY and
 dataset = "scratch"
 kind = "query"
 sql = "SELECT id, x FROM bounded_orders WHERE x BETWEEN $1 AND $2 ORDER BY x LIMIT 5"
-warmup = 500
-iterations = 15000
+warmup = 1000
+iterations = 31000
 seed = 4255
 expect_rows_per_iter = 5
 engines = ["jed", "postgres"]
@@ -627,8 +627,8 @@ description = "Order-only secondary-index walk on 100k reverse-PK rows with LIMI
 dataset = "scratch"
 kind = "query"
 sql = "SELECT id, x FROM p6b_ordered ORDER BY x LIMIT 5"
-warmup = 500
-iterations = 15000
+warmup = 5000
+iterations = 150000
 seed = 4261
 expect_rows_per_iter = 5
 engines = ["jed", "postgres"]
@@ -648,8 +648,8 @@ description = "Index on (a, s text): a = $1 on 100k rows; ~100 index-bounded loo
 dataset = "scratch"
 kind = "query"
 sql = "SELECT id, s FROM vartail_orders WHERE a = $1 ORDER BY id"
-warmup = 20
-iterations = 300
+warmup = 430
+iterations = 6500
 seed = 4291
 expect_rows_per_iter = 100
 engines = ["jed", "postgres"]
@@ -675,8 +675,8 @@ description = "Partial index WHERE amt > 0, queried by an implying literal amt B
 dataset = "scratch"
 kind = "query"
 sql = "SELECT id, amt FROM partial_orders WHERE amt BETWEEN 50000 AND 50300 ORDER BY id"
-warmup = 20
-iterations = 300
+warmup = 350
+iterations = 5200
 seed = 4292
 engines = ["jed", "postgres"]
 setup_sql = [
@@ -696,8 +696,8 @@ description = "Soft-delete partial index (100 live of 100k rows): WHERE deleted 
 dataset = "scratch"
 kind = "query"
 sql = "SELECT id, k FROM softdel_orders WHERE deleted IS NULL ORDER BY k LIMIT 10"
-warmup = 20
-iterations = 300
+warmup = 5200
+iterations = 78000
 seed = 4293
 expect_rows_per_iter = 10
 engines = ["jed", "postgres"]
@@ -716,8 +716,8 @@ description = "Cost-selected GiST range containment over 50k rows with ten match
 dataset = "scratch"
 kind = "query"
 sql = "SELECT id FROM p6b_ranges WHERE span @> int4range(25000, 25001) ORDER BY id"
-warmup = 200
-iterations = 5000
+warmup = 2000
+iterations = 49000
 seed = 4262
 expect_rows_per_iter = 10
 engines = ["jed", "postgres"]
@@ -738,8 +738,8 @@ description = "Outer-PK ORDER BY LIMIT 10 over a 10k×100k 1:1 join; stop after 
 dataset = "scratch"
 kind = "query"
 sql = "SELECT o.id, i.v FROM join_outer o JOIN join_inner i ON i.id = o.k ORDER BY o.id LIMIT 10"
-warmup = 50
-iterations = 1000
+warmup = 22
+iterations = 440
 seed = 4256
 expect_rows_per_iter = 10
 engines = ["jed", "postgres"]
@@ -753,16 +753,16 @@ setup_sql = [
 ]
 
 # Deterministic in-memory hash join (query.hash_join) and its expression-key nested-loop reference.
-# Both produce 12,500 matches from the same 2,500×2,500 logical inputs. The bare same-type column
+# Both produce 5,000 matches from the same 1,000×1,000 logical inputs. The bare same-type column
 # equality selects hash join; wrapping the left key in +0 deliberately defeats the rule.
 [[bench]]
 name = "hash_join_equijoin"
-description = "In-memory hash equijoin: build/probe 2,500-row inputs instead of 6.25M nested-loop candidates"
+description = "In-memory hash equijoin: build/probe 1,000-row inputs instead of 1M nested-loop candidates"
 dataset = "scratch"
 kind = "query"
 sql = "SELECT count(*) FROM hash_left l JOIN hash_right r ON l.k = r.k"
-warmup = 2
-iterations = 10
+warmup = 18
+iterations = 180
 seed = 4257
 expect_rows_per_iter = 1
 engines = ["jed", "postgres"]
@@ -771,18 +771,18 @@ setup_sql = [
   "DROP TABLE IF EXISTS hash_left",
   "CREATE TABLE hash_left (id bigint PRIMARY KEY, k bigint)",
   "CREATE TABLE hash_right (id bigint PRIMARY KEY, k bigint)",
-  "INSERT INTO hash_left SELECT g, g % 500 FROM generate_series(1, 2500) AS g",
-  "INSERT INTO hash_right SELECT g, g % 500 FROM generate_series(1, 2500) AS g"
+  "INSERT INTO hash_left SELECT g, g % 200 FROM generate_series(1, 1000) AS g",
+  "INSERT INTO hash_right SELECT g, g % 200 FROM generate_series(1, 1000) AS g"
 ]
 
 [[bench]]
 name = "hash_join_nested_fallback"
-description = "Expression-key nested-loop reference for hash_join_equijoin; identical 12,500-row join result"
+description = "Expression-key nested-loop reference for hash_join_equijoin; identical 5,000-row join result"
 dataset = "scratch"
 kind = "query"
 sql = "SELECT count(*) FROM hash_ref_left l JOIN hash_ref_right r ON l.k + 0 = r.k"
-warmup = 2
-iterations = 10
+warmup = 1
+iterations = 6
 seed = 4258
 expect_rows_per_iter = 1
 engines = ["jed", "postgres"]
@@ -791,22 +791,22 @@ setup_sql = [
   "DROP TABLE IF EXISTS hash_ref_left",
   "CREATE TABLE hash_ref_left (id bigint PRIMARY KEY, k bigint)",
   "CREATE TABLE hash_ref_right (id bigint PRIMARY KEY, k bigint)",
-  "INSERT INTO hash_ref_left SELECT g, g % 500 FROM generate_series(1, 2500) AS g",
-  "INSERT INTO hash_ref_right SELECT g, g % 500 FROM generate_series(1, 2500) AS g"
+  "INSERT INTO hash_ref_left SELECT g, g % 200 FROM generate_series(1, 1000) AS g",
+  "INSERT INTO hash_ref_right SELECT g, g % 200 FROM generate_series(1, 1000) AS g"
 ]
 
 # Stage-2 WHERE pushdown (query.where_pushdown) and its results-identical residual reference. Each
-# 4,000-row input keeps 2% of its rows (flag = 1). The expression ON key keeps nested loop in both
-# forms, so the pushed form runs ON over 80 × 80 = 6,400 pairs while the `+ 0` reference — whose
-# arithmetic conjuncts never move — runs ON over all 16M pairs before filtering.
+# 1,000-row input keeps 2% of its rows (flag = 1). The expression ON key keeps nested loop in both
+# forms, so the pushed form runs ON over 20 × 20 = 400 pairs while the `+ 0` reference — whose
+# arithmetic conjuncts never move — runs ON over all 1M pairs before filtering.
 [[bench]]
 name = "where_pushdown_join"
-description = "Single-table WHERE conjuncts run inside each scan: 80×80 nested-loop pairs instead of 4,000×4,000"
+description = "Single-table WHERE conjuncts run inside each scan: 20×20 nested-loop pairs instead of 1,000×1,000"
 dataset = "scratch"
 kind = "query"
 sql = "SELECT count(*) FROM pd_left l JOIN pd_right r ON l.k + 0 = r.k WHERE l.flag = 1 AND r.flag = 1"
-warmup = 2
-iterations = 20
+warmup = 260
+iterations = 2600
 seed = 4271
 expect_rows_per_iter = 1
 engines = ["jed", "postgres"]
@@ -815,18 +815,18 @@ setup_sql = [
   "DROP TABLE IF EXISTS pd_left",
   "CREATE TABLE pd_left (id bigint PRIMARY KEY, k bigint, flag bigint)",
   "CREATE TABLE pd_right (id bigint PRIMARY KEY, k bigint, flag bigint)",
-  "INSERT INTO pd_left SELECT g, g % 400, CASE WHEN g % 50 = 0 THEN 1 ELSE 0 END FROM generate_series(1, 4000) AS g",
-  "INSERT INTO pd_right SELECT g, g % 400, CASE WHEN g % 50 = 0 THEN 1 ELSE 0 END FROM generate_series(1, 4000) AS g"
+  "INSERT INTO pd_left SELECT g, g % 400, CASE WHEN g % 50 = 0 THEN 1 ELSE 0 END FROM generate_series(1, 1000) AS g",
+  "INSERT INTO pd_right SELECT g, g % 400, CASE WHEN g % 50 = 0 THEN 1 ELSE 0 END FROM generate_series(1, 1000) AS g"
 ]
 
 [[bench]]
 name = "where_pushdown_join_residual"
-description = "Residual reference for where_pushdown_join: `+ 0` conjuncts stay above the 16M-pair nested loop"
+description = "Residual reference for where_pushdown_join: `+ 0` conjuncts stay above the 1M-pair nested loop"
 dataset = "scratch"
 kind = "query"
 sql = "SELECT count(*) FROM pd_ref_left l JOIN pd_ref_right r ON l.k + 0 = r.k WHERE l.flag + 0 = 1 AND r.flag + 0 = 1"
 warmup = 1
-iterations = 3
+iterations = 5
 seed = 4272
 expect_rows_per_iter = 1
 engines = ["jed", "postgres"]
@@ -835,8 +835,8 @@ setup_sql = [
   "DROP TABLE IF EXISTS pd_ref_left",
   "CREATE TABLE pd_ref_left (id bigint PRIMARY KEY, k bigint, flag bigint)",
   "CREATE TABLE pd_ref_right (id bigint PRIMARY KEY, k bigint, flag bigint)",
-  "INSERT INTO pd_ref_left SELECT g, g % 400, CASE WHEN g % 50 = 0 THEN 1 ELSE 0 END FROM generate_series(1, 4000) AS g",
-  "INSERT INTO pd_ref_right SELECT g, g % 400, CASE WHEN g % 50 = 0 THEN 1 ELSE 0 END FROM generate_series(1, 4000) AS g"
+  "INSERT INTO pd_ref_left SELECT g, g % 400, CASE WHEN g % 50 = 0 THEN 1 ELSE 0 END FROM generate_series(1, 1000) AS g",
+  "INSERT INTO pd_ref_right SELECT g, g % 400, CASE WHEN g % 50 = 0 THEN 1 ELSE 0 END FROM generate_series(1, 1000) AS g"
 ]
 
 # Stage-2 WHERE contradiction (query.where_contradiction): the empty literal range is proven at plan
@@ -847,8 +847,8 @@ description = "Provably empty `v > 100 AND v < 50` over 100k rows: no relation i
 dataset = "scratch"
 kind = "query"
 sql = "SELECT count(*) FROM contradiction_orders WHERE v > 100 AND v < 50"
-warmup = 100
-iterations = 5000
+warmup = 5800
+iterations = 290000
 seed = 4273
 expect_rows_per_iter = 1
 engines = ["jed", "postgres"]
@@ -867,8 +867,8 @@ description = "A derived table's bare-column conjunct moves into its body and se
 dataset = "scratch"
 kind = "query"
 sql = "SELECT d.id, d.v FROM (SELECT id, v FROM dp_orders) d WHERE d.id = 50000"
-warmup = 100
-iterations = 5000
+warmup = 820
+iterations = 41000
 seed = 4274
 expect_rows_per_iter = 1
 engines = ["jed", "postgres"]
@@ -884,8 +884,8 @@ description = "Residual reference for derived_pushdown_pk: `d.id + 0 = 50000` ru
 dataset = "scratch"
 kind = "query"
 sql = "SELECT d.id, d.v FROM (SELECT id, v FROM dp_ref_orders) d WHERE d.id + 0 = 50000"
-warmup = 2
-iterations = 20
+warmup = 3
+iterations = 32
 seed = 4275
 expect_rows_per_iter = 1
 engines = ["jed", "postgres"]
@@ -905,8 +905,8 @@ description = "A `length()` and a LIKE conjunct run inside each scan: 80×80 nes
 dataset = "scratch"
 kind = "query"
 sql = "SELECT count(*) FROM sc_left l JOIN sc_right r ON l.k + 0 = r.k WHERE length(l.s) = 3 AND r.s LIKE 'ab_'"
-warmup = 2
-iterations = 20
+warmup = 27
+iterations = 270
 seed = 4290
 expect_rows_per_iter = 1
 engines = ["jed", "postgres"]
@@ -929,8 +929,8 @@ description = "A conjunct over an integer UNION ALL bigint body moves into both 
 dataset = "scratch"
 kind = "query"
 sql = "SELECT s.id FROM (SELECT id FROM wa_narrow UNION ALL SELECT id FROM wa_wide) s WHERE s.id = 50000"
-warmup = 20
-iterations = 1000
+warmup = 520
+iterations = 26000
 seed = 4291
 expect_rows_per_iter = 2
 engines = ["jed", "postgres"]
@@ -953,8 +953,8 @@ description = "A grouping-column conjunct moves below a grouped body and seeks o
 dataset = "scratch"
 kind = "query"
 sql = "SELECT d.g, d.n, d.m FROM (SELECT g, count(*) AS n, max(v) AS m FROM gp_orders GROUP BY g) d WHERE d.g = 500"
-warmup = 100
-iterations = 2000
+warmup = 950
+iterations = 19000
 seed = 4278
 expect_rows_per_iter = 1
 engines = ["jed", "postgres"]
@@ -970,8 +970,8 @@ description = "Residual reference for grouped_pushdown_pk: `d.g + 0 = 500` group
 dataset = "scratch"
 kind = "query"
 sql = "SELECT d.g, d.n, d.m FROM (SELECT g, count(*) AS n, max(v) AS m FROM gp_ref_orders GROUP BY g) d WHERE d.g + 0 = 500"
-warmup = 2
-iterations = 20
+warmup = 9
+iterations = 91
 seed = 4279
 expect_rows_per_iter = 1
 engines = ["jed", "postgres"]
@@ -990,8 +990,8 @@ description = "A set-operation conjunct moves into both UNION ALL arms and seeks
 dataset = "scratch"
 kind = "query"
 sql = "SELECT s.id, s.v FROM (SELECT id, v FROM so_a UNION ALL SELECT id, v FROM so_b) s WHERE s.id = 50000 ORDER BY s.v"
-warmup = 100
-iterations = 5000
+warmup = 520
+iterations = 26000
 seed = 4280
 expect_rows_per_iter = 2
 engines = ["jed", "postgres"]
@@ -1011,7 +1011,7 @@ dataset = "scratch"
 kind = "query"
 sql = "SELECT s.id, s.v FROM (SELECT id, v FROM so_ref_a UNION ALL SELECT id, v FROM so_ref_b) s WHERE s.id + 0 = 50000 ORDER BY s.v"
 warmup = 2
-iterations = 20
+iterations = 16
 seed = 4281
 expect_rows_per_iter = 2
 engines = ["jed", "postgres"]
@@ -1035,8 +1035,8 @@ description = "A partition-key conjunct moves below a window and seeks one 100-r
 dataset = "scratch"
 kind = "query"
 sql = "SELECT d.g, d.id, d.rn FROM (SELECT g, id, row_number() OVER (PARTITION BY g ORDER BY v, id) AS rn FROM wp_orders) d WHERE d.g = 500 ORDER BY d.id"
-warmup = 50
-iterations = 1000
+warmup = 320
+iterations = 6300
 seed = 4803
 expect_rows_per_iter = 100
 engines = ["jed", "postgres"]
@@ -1052,8 +1052,8 @@ description = "Residual reference for window_pushdown_pk: `d.g + 0 = 500` number
 dataset = "scratch"
 kind = "query"
 sql = "SELECT d.g, d.id, d.rn FROM (SELECT g, id, row_number() OVER (PARTITION BY g ORDER BY v, id) AS rn FROM wp_ref_orders) d WHERE d.g + 0 = 500 ORDER BY d.id"
-warmup = 2
-iterations = 20
+warmup = 1
+iterations = 11
 seed = 4804
 expect_rows_per_iter = 100
 engines = ["jed", "postgres"]
@@ -1073,8 +1073,8 @@ description = "A conjunct on a single-reference CTE moves into its body and seek
 dataset = "scratch"
 kind = "query"
 sql = "WITH c AS (SELECT id, v FROM cp_orders) SELECT c.id, c.v FROM c WHERE c.id = 50000"
-warmup = 100
-iterations = 5000
+warmup = 380
+iterations = 19000
 seed = 4805
 expect_rows_per_iter = 1
 engines = ["jed", "postgres"]
@@ -1090,8 +1090,8 @@ description = "Residual reference for cte_pushdown_pk: `c.id + 0 = 50000` runs t
 dataset = "scratch"
 kind = "query"
 sql = "WITH c AS (SELECT id, v FROM cp_ref_orders) SELECT c.id, c.v FROM c WHERE c.id + 0 = 50000"
-warmup = 2
-iterations = 20
+warmup = 3
+iterations = 32
 seed = 4806
 expect_rows_per_iter = 1
 engines = ["jed", "postgres"]
@@ -1102,16 +1102,16 @@ setup_sql = [
 ]
 
 # Stage-2 ON pushdown (query.on_pushdown) and its results-identical ON-resident reference. The pushed
-# `r.flag = 1` filters each 4,000-row input's inner side to 2% before an expression-keyed nested loop;
-# spelled `r.flag + 0 = 1` it stays in the ON and is evaluated over all 16M pairs.
+# `r.flag = 1` filters each 1,000-row input's inner side to 2% before an expression-keyed nested loop;
+# spelled `r.flag + 0 = 1` it stays in the ON and is evaluated over all 1M pairs.
 [[bench]]
 name = "on_pushdown_join"
-description = "A single-side ON conjunct runs inside the inner scan: 4,000×80 nested-loop pairs instead of 4,000×4,000"
+description = "A single-side ON conjunct runs inside the inner scan: 1,000×20 nested-loop pairs instead of 1,000×1,000"
 dataset = "scratch"
 kind = "query"
 sql = "SELECT count(*) FROM op_left l JOIN op_right r ON l.k + 0 = r.k AND r.flag = 1"
-warmup = 2
-iterations = 20
+warmup = 21
+iterations = 210
 seed = 4276
 expect_rows_per_iter = 1
 engines = ["jed", "postgres"]
@@ -1120,18 +1120,18 @@ setup_sql = [
   "DROP TABLE IF EXISTS op_left",
   "CREATE TABLE op_left (id bigint PRIMARY KEY, k bigint)",
   "CREATE TABLE op_right (id bigint PRIMARY KEY, k bigint, flag bigint)",
-  "INSERT INTO op_left SELECT g, g % 400 FROM generate_series(1, 4000) AS g",
-  "INSERT INTO op_right SELECT g, g % 400, CASE WHEN g % 50 = 0 THEN 1 ELSE 0 END FROM generate_series(1, 4000) AS g"
+  "INSERT INTO op_left SELECT g, g % 400 FROM generate_series(1, 1000) AS g",
+  "INSERT INTO op_right SELECT g, g % 400, CASE WHEN g % 50 = 0 THEN 1 ELSE 0 END FROM generate_series(1, 1000) AS g"
 ]
 
 [[bench]]
 name = "on_pushdown_join_residual"
-description = "Residual reference for on_pushdown_join: `r.flag + 0 = 1` stays in the ON over 16M pairs"
+description = "Residual reference for on_pushdown_join: `r.flag + 0 = 1` stays in the ON over 1M pairs"
 dataset = "scratch"
 kind = "query"
 sql = "SELECT count(*) FROM op_ref_left l JOIN op_ref_right r ON l.k + 0 = r.k AND r.flag + 0 = 1"
 warmup = 1
-iterations = 3
+iterations = 5
 seed = 4277
 expect_rows_per_iter = 1
 engines = ["jed", "postgres"]
@@ -1140,22 +1140,22 @@ setup_sql = [
   "DROP TABLE IF EXISTS op_ref_left",
   "CREATE TABLE op_ref_left (id bigint PRIMARY KEY, k bigint)",
   "CREATE TABLE op_ref_right (id bigint PRIMARY KEY, k bigint, flag bigint)",
-  "INSERT INTO op_ref_left SELECT g, g % 400 FROM generate_series(1, 4000) AS g",
-  "INSERT INTO op_ref_right SELECT g, g % 400, CASE WHEN g % 50 = 0 THEN 1 ELSE 0 END FROM generate_series(1, 4000) AS g"
+  "INSERT INTO op_ref_left SELECT g, g % 400 FROM generate_series(1, 1000) AS g",
+  "INSERT INTO op_ref_right SELECT g, g % 400, CASE WHEN g % 50 = 0 THEN 1 ELSE 0 END FROM generate_series(1, 1000) AS g"
 ]
 
-# P7 reverse-orientation INL and its results-identical nested-loop reference. The indexed 50k-row
+# P7 reverse-orientation INL and its results-identical nested-loop reference. The indexed 10k-row
 # relation deliberately appears first in SQL. Costed two-relation search reverses the physical
-# order so the 250-row driver is left and the PK relation becomes the per-row bound inner; wrapping
+# order so the 100-row driver is left and the PK relation becomes the per-row bound inner; wrapping
 # the PK expression in +0 keeps the same equality result while making the INL bound ineligible.
 [[bench]]
 name = "join_reverse_inl"
-description = "P7 reverse physical order: 250 PK probes although the indexed 50k-row relation appears first"
+description = "P7 reverse physical order: 100 PK probes although the indexed 10k-row relation appears first"
 dataset = "scratch"
 kind = "query"
 sql = "SELECT count(*) FROM p7_reverse_inner i JOIN p7_reverse_driver d ON i.id = d.k"
-warmup = 2
-iterations = 10
+warmup = 320
+iterations = 3200
 seed = 4263
 expect_rows_per_iter = 1
 engines = ["jed", "postgres"]
@@ -1164,18 +1164,18 @@ setup_sql = [
   "DROP TABLE IF EXISTS p7_reverse_inner",
   "CREATE TABLE p7_reverse_inner (id bigint PRIMARY KEY, v bigint)",
   "CREATE TABLE p7_reverse_driver (id bigint PRIMARY KEY, k bigint)",
-  "INSERT INTO p7_reverse_inner SELECT g, g * 2 FROM generate_series(1, 50000) AS g",
-  "INSERT INTO p7_reverse_driver SELECT g, g * 199 FROM generate_series(1, 250) AS g"
+  "INSERT INTO p7_reverse_inner SELECT g, g * 2 FROM generate_series(1, 10000) AS g",
+  "INSERT INTO p7_reverse_driver SELECT g, g * 99 FROM generate_series(1, 100) AS g"
 ]
 
 [[bench]]
 name = "join_reverse_nested_fallback"
-description = "Expression-key nested-loop reference for join_reverse_inl; identical 250-row join result"
+description = "Expression-key nested-loop reference for join_reverse_inl; identical 100-row join result"
 dataset = "scratch"
 kind = "query"
 sql = "SELECT count(*) FROM p7_reverse_ref_inner i JOIN p7_reverse_ref_driver d ON i.id + 0 = d.k"
-warmup = 2
-iterations = 10
+warmup = 1
+iterations = 6
 seed = 4264
 expect_rows_per_iter = 1
 engines = ["jed", "postgres"]
@@ -1184,8 +1184,8 @@ setup_sql = [
   "DROP TABLE IF EXISTS p7_reverse_ref_inner",
   "CREATE TABLE p7_reverse_ref_inner (id bigint PRIMARY KEY, v bigint)",
   "CREATE TABLE p7_reverse_ref_driver (id bigint PRIMARY KEY, k bigint)",
-  "INSERT INTO p7_reverse_ref_inner SELECT g, g * 2 FROM generate_series(1, 50000) AS g",
-  "INSERT INTO p7_reverse_ref_driver SELECT g, g * 199 FROM generate_series(1, 250) AS g"
+  "INSERT INTO p7_reverse_ref_inner SELECT g, g * 2 FROM generate_series(1, 10000) AS g",
+  "INSERT INTO p7_reverse_ref_driver SELECT g, g * 99 FROM generate_series(1, 100) AS g"
 ]
 
 # P8 three-relation DP: the large indexed relation is authored first, but the complete N-way
@@ -1196,8 +1196,8 @@ description = "P8 three-way join search: drive 100 rows into indexed 20k-row and
 dataset = "scratch"
 kind = "query"
 sql = "SELECT count(*) FROM p8_j3_inner i JOIN p8_j3_driver d ON i.id = d.k JOIN p8_j3_tag t ON t.id = d.tag"
-warmup = 2
-iterations = 20
+warmup = 260
+iterations = 2600
 seed = 4265
 expect_rows_per_iter = 1
 engines = ["jed", "postgres"]
@@ -1221,8 +1221,8 @@ description = "P8 five-way DP: reverse a source-authored 20k-row PK chain from a
 dataset = "scratch"
 kind = "query"
 sql = "SELECT count(*) FROM p8_j5_r1 a JOIN p8_j5_r2 b ON a.id = b.id JOIN p8_j5_r3 c ON b.id = c.id JOIN p8_j5_r4 d ON c.id = d.id JOIN p8_j5_driver e ON d.id = e.k"
-warmup = 1
-iterations = 10
+warmup = 130
+iterations = 1300
 seed = 4266
 expect_rows_per_iter = 1
 engines = ["jed", "postgres"]
@@ -1252,8 +1252,8 @@ description = "P8 cap boundary: deterministic greedy search over a nine-relation
 dataset = "scratch"
 kind = "query"
 sql = "SELECT count(*) FROM p8_j9_r1 a JOIN p8_j9_r2 b ON a.id = b.id JOIN p8_j9_r3 c ON b.id = c.id JOIN p8_j9_r4 d ON c.id = d.id JOIN p8_j9_r5 e ON d.id = e.id JOIN p8_j9_r6 f ON e.id = f.id JOIN p8_j9_r7 h ON f.id = h.id JOIN p8_j9_r8 i ON h.id = i.id JOIN p8_j9_driver j ON i.id = j.k"
-warmup = 1
-iterations = 10
+warmup = 310
+iterations = 3100
 seed = 4267
 expect_rows_per_iter = 1
 engines = ["jed", "postgres"]
@@ -1296,8 +1296,8 @@ description = "P9 uniform distribution before ANALYZE: row-count fallback select
 dataset = "scratch"
 kind = "query"
 sql = "SELECT count(*) FROM p9_uniform WHERE v = 1"
-warmup = 2
-iterations = 20
+warmup = 900
+iterations = 9000
 seed = 4268
 expect_rows_per_iter = 1
 engines = ["jed", "postgres"]
@@ -1314,8 +1314,8 @@ description = "P9 uniform distribution after ANALYZE: NDV preserves the selectiv
 dataset = "scratch"
 kind = "query"
 sql = "SELECT count(*) FROM p9_uniform WHERE v = 1"
-warmup = 2
-iterations = 20
+warmup = 830
+iterations = 8300
 seed = 4269
 expect_rows_per_iter = 1
 engines = ["jed", "postgres"]
@@ -1333,8 +1333,8 @@ description = "P9 90%-skewed value before ANALYZE: fallback chooses an expensive
 dataset = "scratch"
 kind = "query"
 sql = "SELECT count(*) FROM p9_skew WHERE v = 0"
-warmup = 1
-iterations = 10
+warmup = 2
+iterations = 20
 seed = 4270
 expect_rows_per_iter = 1
 engines = ["jed", "postgres"]
@@ -1351,8 +1351,8 @@ description = "P9 90%-skewed value after ANALYZE: MCV evidence selects the cheap
 dataset = "scratch"
 kind = "query"
 sql = "SELECT count(*) FROM p9_skew WHERE v = 0"
-warmup = 1
-iterations = 10
+warmup = 19
+iterations = 190
 seed = 4271
 expect_rows_per_iter = 1
 engines = ["jed", "postgres"]
@@ -1370,8 +1370,8 @@ description = "Secondary-index equality lookup on 1M rows (~10 rows per customer
 dataset = "large"
 kind = "query"
 sql = "SELECT id, amount FROM orders WHERE customer_id = $1 ORDER BY id"
-warmup = 2000
-iterations = 20000
+warmup = 3900
+iterations = 39000
 seed = 4202
 
 [[bench.param]]
@@ -1389,8 +1389,8 @@ description = "Secondary-index-bounded UPDATE on 1M rows (~10 rows per customer)
 dataset = "large"
 kind = "write_rollback"
 sql = "UPDATE orders SET amount = amount + 1 WHERE customer_id = $1"
-warmup = 100
-iterations = 1000
+warmup = 380
+iterations = 3800
 seed = 4251
 batch = 1
 
@@ -1409,8 +1409,8 @@ description = "UPDATE on 1M rows whose WHERE has a broad PK range and a selectiv
 dataset = "large"
 kind = "write_rollback"
 sql = "UPDATE orders SET amount = amount + 1 WHERE id > $1 AND customer_id = $2"
-warmup = 20
-iterations = 200
+warmup = 310
+iterations = 3100
 seed = 4260
 batch = 1
 
@@ -1434,8 +1434,8 @@ dataset = "large"
 kind = "write_rollback"
 engines = ["jed", "postgres"]
 sql = "MERGE INTO orders o USING (VALUES ($1::bigint, $2::integer)) AS s(id, amt) ON o.id = s.id WHEN MATCHED THEN UPDATE SET amount = o.amount + s.amt WHEN NOT MATCHED THEN INSERT (id, customer_id, amount, note) VALUES (s.id, 1, s.amt, 'merge')"
-warmup = 100
-iterations = 1000
+warmup = 650
+iterations = 6500
 seed = 4302
 batch = 1
 
@@ -1460,8 +1460,8 @@ dataset = "small"
 kind = "write_rollback"
 engines = ["jed", "postgres"]
 sql = "MERGE INTO orders o USING (SELECT g AS amt FROM generate_series($1::integer, $1::integer + 199) AS s(g)) AS s ON o.amount = s.amt WHEN MATCHED THEN UPDATE SET customer_id = o.customer_id + 1"
-warmup = 20
-iterations = 200
+warmup = 11
+iterations = 110
 seed = 4303
 batch = 1
 
@@ -1479,8 +1479,8 @@ description = "DELETE on 1M rows whose WHERE `amount > 100000 AND amount < 50` i
 dataset = "large"
 kind = "write_rollback"
 sql = "DELETE FROM orders WHERE amount > 100000 AND amount < 50"
-warmup = 20
-iterations = 200
+warmup = 5500
+iterations = 55000
 seed = 4274
 batch = 1
 
@@ -1493,8 +1493,8 @@ description = "Secondary-index IN-list DELETE on 1M rows (four point probes), ro
 dataset = "large"
 kind = "write_rollback"
 sql = "DELETE FROM orders WHERE customer_id IN ($1, $2, $3, $4)"
-warmup = 100
-iterations = 1000
+warmup = 35
+iterations = 350
 seed = 4252
 batch = 1
 
@@ -1529,8 +1529,8 @@ description = "Expression-index equality lookup on 1M rows — lower(note) = $1 
 dataset = "large"
 kind = "query"
 sql = "SELECT id, amount FROM orders WHERE lower(note) = $1 ORDER BY id"
-warmup = 2000
-iterations = 20000
+warmup = 17000
+iterations = 170000
 seed = 4207
 
 [[bench.param]]
@@ -1550,8 +1550,8 @@ description = "Partial-index gated lookup on 1M rows — customer_id = $1 gated 
 dataset = "large"
 kind = "query"
 sql = "SELECT id, amount FROM orders WHERE amount >= 90000 AND customer_id = $1 ORDER BY id"
-warmup = 2000
-iterations = 20000
+warmup = 13000
+iterations = 130000
 seed = 4231
 
 [[bench.param]]
@@ -1570,8 +1570,8 @@ description = "10-value IN-list on the PRIMARY KEY over 1M rows — merged point
 dataset = "large"
 kind = "query"
 sql = "SELECT id, amount FROM orders WHERE id IN ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) ORDER BY id"
-warmup = 2000
-iterations = 40000
+warmup = 1500
+iterations = 30000
 seed = 4222
 
 [[bench.param]]
@@ -1633,8 +1633,8 @@ description = "GIN sibling-bound join: 10 term probes into the 200k-row array da
 dataset = "gin"
 kind = "query"
 sql = "SELECT o.id, d.id FROM gin_inl_outer o JOIN docs d ON d.tags @> o.q ORDER BY o.id, d.id"
-warmup = 5
-iterations = 50
+warmup = 4
+iterations = 45
 seed = 4257
 engines = ["jed", "postgres"]
 setup_sql = [
@@ -1654,8 +1654,8 @@ description = "GiST sibling-bound join: 10 scalar-equality probes into a 50k-row
 dataset = "scratch"
 kind = "query"
 sql = "SELECT p.id, s.id FROM gist_inl_outer p JOIN gist_inl_inner s ON s.room = p.q ORDER BY p.id, s.id"
-warmup = 2
-iterations = 10
+warmup = 130
+iterations = 1300
 seed = 4259
 expect_rows_per_iter = 500
 engines = ["jed", "postgres"]
@@ -1687,7 +1687,7 @@ dataset = "scratch"
 kind = "query"
 sql = "SELECT p.id, s.id FROM gist_inl_ref_outer p JOIN gist_inl_ref_inner s ON s.room >= p.q AND s.room <= p.q ORDER BY p.id, s.id"
 warmup = 2
-iterations = 10
+iterations = 8
 seed = 4260
 expect_rows_per_iter = 500
 engines = ["jed", "postgres"]
@@ -1721,8 +1721,8 @@ description = "8-value IN-list on a SECONDARY-INDEX column over 1M rows — merg
 dataset = "large"
 kind = "query"
 sql = "SELECT id, amount FROM orders WHERE customer_id IN ($1, $2, $3, $4, $5, $6, $7, $8) ORDER BY id"
-warmup = 1000
-iterations = 15000
+warmup = 330
+iterations = 5000
 seed = 4223
 
 [[bench.param]]
@@ -1778,8 +1778,8 @@ description = "Selective range on a SECONDARY-INDEX column over 1M rows — an i
 dataset = "large"
 kind = "query"
 sql = "SELECT id, amount FROM orders WHERE customer_id BETWEEN $1 AND $2 ORDER BY id"
-warmup = 500
-iterations = 8000
+warmup = 46
+iterations = 740
 seed = 4241
 
 [[bench.param]]
@@ -1803,8 +1803,8 @@ description = "Nonselective secondary-index range over 1M rows; P6a rejects the 
 dataset = "large"
 kind = "query"
 sql = "SELECT count(*) FROM orders WHERE customer_id >= $1"
-warmup = 3
-iterations = 20
+warmup = 1
+iterations = 3
 seed = 4261
 expect_rows_per_iter = 1
 
@@ -1820,7 +1820,7 @@ dataset = "large"
 kind = "query"
 sql = "SELECT count(*), sum(amount) FROM orders"
 warmup = 3
-iterations = 20
+iterations = 23
 seed = 4203
 expect_rows_per_iter = 1
 
@@ -1830,8 +1830,8 @@ description = "Full-table MIN/MAX over 1M rows — exercises the Go core's vecto
 dataset = "large"
 kind = "query"
 sql = "SELECT min(amount), max(amount) FROM orders"
-warmup = 3
-iterations = 20
+warmup = 2
+iterations = 14
 seed = 4220
 expect_rows_per_iter = 1
 
@@ -1841,8 +1841,8 @@ description = "Full-table count + sum over 1M rows behind a WHERE filter — the
 dataset = "large"
 kind = "query"
 sql = "SELECT count(*), sum(amount) FROM orders WHERE amount > $1"
-warmup = 3
-iterations = 20
+warmup = 1
+iterations = 9
 seed = 4221
 expect_rows_per_iter = 1
 
@@ -1861,8 +1861,8 @@ description = "GROUP BY an expression into 100 groups over 1M rows (count + sum 
 dataset = "large"
 kind = "query"
 sql = "SELECT amount / 1000 AS bucket, count(*), sum(amount) FROM orders GROUP BY amount / 1000 ORDER BY bucket"
-warmup = 2
-iterations = 10
+warmup = 1
+iterations = 3
 seed = 4287
 expect_rows_per_iter = 100
 
@@ -1872,8 +1872,8 @@ description = "GROUP BY customer_id into ~100k groups over 1M rows, HAVING keeps
 dataset = "large"
 kind = "query"
 sql = "SELECT customer_id, count(*), sum(amount) FROM orders GROUP BY customer_id HAVING count(*) >= 20 ORDER BY customer_id"
-warmup = 2
-iterations = 10
+warmup = 1
+iterations = 3
 seed = 4288
 
 [[bench]]
@@ -1883,7 +1883,7 @@ dataset = "large"
 kind = "query"
 sql = "SELECT id, amount FROM orders ORDER BY amount DESC, id ASC LIMIT 100"
 warmup = 2
-iterations = 10
+iterations = 13
 seed = 4204
 expect_rows_per_iter = 100
 
@@ -1893,8 +1893,8 @@ description = "Top-100 by the PRIMARY KEY over 1M rows — ORDER BY satisfied by
 dataset = "large"
 kind = "query"
 sql = "SELECT id, amount FROM orders ORDER BY id LIMIT 100"
-warmup = 2
-iterations = 10
+warmup = 2100
+iterations = 21000
 seed = 4214
 expect_rows_per_iter = 100
 
@@ -1967,7 +1967,7 @@ dataset = "scratch"
 kind = "write_rollback"
 sql = "DELETE FROM del_orders WHERE id = $1"
 warmup = 3
-iterations = 30
+iterations = 39
 seed = 4815
 batch = 1000
 setup_sql = [
@@ -1994,8 +1994,8 @@ description = "One PK-range DELETE of 10,000 consecutive rows on 100k rows, roll
 dataset = "scratch"
 kind = "write_rollback"
 sql = "DELETE FROM del_orders WHERE id BETWEEN $1 AND $2"
-warmup = 3
-iterations = 30
+warmup = 2
+iterations = 19
 seed = 4816
 batch = 1
 setup_sql = [
@@ -2147,8 +2147,8 @@ dataset = "scratch"
 kind = "write_rollback"
 sql = "UPDATE wide SET n = n + 1 WHERE id = $1"
 batch = 1
-warmup = 200
-iterations = 2000
+warmup = 920
+iterations = 9200
 seed = 4292
 engines = ["jed", "postgres"]
 setup_sql = [
@@ -2268,8 +2268,8 @@ description = "Full scan of 5k long-text rows: sum(length(body)) reads every com
 dataset = "text"
 kind = "query"
 sql = "SELECT count(*), sum(length(body)) FROM docs"
-warmup = 2
-iterations = 10
+warmup = 1
+iterations = 7
 seed = 4290
 expect_rows_per_iter = 1
 
@@ -2279,8 +2279,8 @@ description = "PK point read returning one 1,000–16,000-character body (LZ4 de
 dataset = "text"
 kind = "query"
 sql = "SELECT id, body FROM docs WHERE id = $1"
-warmup = 500
-iterations = 5000
+warmup = 1400
+iterations = 14000
 seed = 4291
 expect_rows_per_iter = 1
 
@@ -2297,8 +2297,8 @@ description = "SELECT DISTINCT over 5k long-text bodies (each body a dedup key)"
 dataset = "text"
 kind = "query"
 sql = "SELECT count(*) FROM (SELECT DISTINCT body FROM docs) s"
-warmup = 2
-iterations = 10
+warmup = 1
+iterations = 6
 seed = 4818
 expect_rows_per_iter = 1
 
@@ -2308,8 +2308,8 @@ description = "GROUP BY a long-text body over 5k rows (each body a grouping key)
 dataset = "text"
 kind = "query"
 sql = "SELECT count(*) FROM (SELECT body, count(*) AS n FROM docs GROUP BY body) s"
-warmup = 2
-iterations = 10
+warmup = 1
+iterations = 5
 seed = 4819
 expect_rows_per_iter = 1
 
@@ -2319,8 +2319,8 @@ description = "UNION of 5k long-text bodies with themselves (both inputs dedupli
 dataset = "text"
 kind = "query"
 sql = "SELECT count(*) FROM (SELECT body FROM docs UNION SELECT body FROM docs) s"
-warmup = 2
-iterations = 10
+warmup = 1
+iterations = 3
 seed = 4820
 expect_rows_per_iter = 1
 
@@ -2336,8 +2336,8 @@ dataset = "scratch"
 kind = "write_rollback"
 sql = "INSERT INTO lv_dst SELECT g + $1, repeat('x', 262144) FROM generate_series(1, 64) g"
 batch = 1
-warmup = 2
-iterations = 10
+warmup = 12
+iterations = 120
 seed = 4821
 engines = ["jed", "postgres"]
 setup_sql = [
@@ -2358,7 +2358,7 @@ kind = "write_rollback"
 sql = "INSERT INTO lv_dst SELECT id + $1, body FROM lv_src"
 batch = 1
 warmup = 2
-iterations = 10
+iterations = 8
 seed = 4822
 engines = ["jed", "postgres"]
 setup_sql = [
@@ -2380,8 +2380,8 @@ description = "Multi-reference materialized CTE: a per-customer order-count aggr
 dataset = "large"
 kind = "query"
 sql = "WITH cust AS (SELECT customer_id, count(*) AS n FROM orders GROUP BY customer_id) SELECT (SELECT count(*) FROM cust WHERE n > 5) AS many, (SELECT count(*) FROM cust WHERE n <= 5) AS few"
-warmup = 3
-iterations = 20
+warmup = 1
+iterations = 3
 seed = 4207
 expect_rows_per_iter = 1
 
@@ -2393,7 +2393,7 @@ kind = "query"
 engines = ["jed", "postgres"]
 sql = "SELECT g.g AS cust, top.id, top.amount FROM generate_series($1, $1 + 4) AS g CROSS JOIN LATERAL (SELECT id, amount FROM orders WHERE customer_id = g.g ORDER BY amount DESC, id LIMIT 3) AS top ORDER BY g.g, top.id"
 warmup = 1000
-iterations = 5000
+iterations = 6900
 seed = 4208
 
 [[bench.param]]
@@ -2415,8 +2415,8 @@ dataset = "large"
 kind = "query"
 engines = ["jed", "postgres"]
 sql = "SELECT g.g, o.amount FROM generate_series($1, $1 + 999) AS g JOIN orders o ON o.id = g.g ORDER BY g.g"
-warmup = 100
-iterations = 1000
+warmup = 55
+iterations = 550
 seed = 4231
 expect_rows_per_iter = 1000
 
@@ -2440,8 +2440,8 @@ dataset = "gin"
 kind = "query"
 engines = ["jed", "postgres"]
 sql = "SELECT id FROM docs WHERE tags @> ARRAY[$1::bigint, $2::bigint] ORDER BY id"
-warmup = 500
-iterations = 5000
+warmup = 150
+iterations = 1500
 seed = 4209
 
 [[bench.param]]
@@ -2461,8 +2461,8 @@ dataset = "gin"
 kind = "query"
 engines = ["jed", "postgres"]
 sql = "SELECT id FROM docs WHERE tags && ARRAY[$1::bigint, $2::bigint] ORDER BY id"
-warmup = 100
-iterations = 1000
+warmup = 24
+iterations = 240
 seed = 4210
 
 [[bench.param]]
@@ -2488,8 +2488,8 @@ dataset = "gin"
 kind = "query"
 engines = ["jed", "postgres"]
 sql = "SELECT id FROM docs WHERE $1::bigint = ANY(tags) ORDER BY id"
-warmup = 500
-iterations = 5000
+warmup = 58
+iterations = 580
 seed = 4211
 
 [[bench.param]]
@@ -2509,8 +2509,8 @@ dataset = "scratch"
 kind = "query"
 engines = ["jed", "postgres"]
 sql = "SELECT id FROM ttags WHERE tags @> ARRAY['all', 'u' || ($1::bigint)::text] ORDER BY id"
-warmup = 200
-iterations = 2000
+warmup = 190
+iterations = 1900
 seed = 4292
 setup_sql = [
   "DROP TABLE IF EXISTS ttags",
@@ -2531,8 +2531,8 @@ dataset = "scratch"
 kind = "query"
 engines = ["jed", "postgres"]
 sql = "SELECT id FROM ttags WHERE ('t' || ($1::bigint)::text) = ANY(tags) ORDER BY id"
-warmup = 100
-iterations = 1000
+warmup = 57
+iterations = 570
 seed = 4293
 setup_sql = [
   "DROP TABLE IF EXISTS ttags",
@@ -2559,8 +2559,8 @@ dataset = "scratch"
 kind = "query"
 engines = ["jed", "postgres"]
 sql = "SELECT id FROM tprices WHERE prices @> ARRAY[0.005, $1::bigint * 0.01] ORDER BY id"
-warmup = 200
-iterations = 2000
+warmup = 210
+iterations = 2100
 seed = 4294
 setup_sql = [
   "DROP TABLE IF EXISTS tprices",
@@ -2581,8 +2581,8 @@ dataset = "scratch"
 kind = "query"
 engines = ["jed", "postgres"]
 sql = "SELECT id FROM tblobs WHERE blobs @> ARRAY['\\x00'::bytea, ('u' || ($1::bigint)::text)::bytea] ORDER BY id"
-warmup = 200
-iterations = 2000
+warmup = 190
+iterations = 1900
 seed = 4295
 setup_sql = [
   "DROP TABLE IF EXISTS tblobs",
@@ -2610,8 +2610,8 @@ dataset = "scratch"
 kind = "query"
 engines = ["jed", "postgres"]
 sql = "SELECT count(*) FROM tstats WHERE tags @> ARRAY['all']"
-warmup = 5
-iterations = 50
+warmup = 14
+iterations = 140
 seed = 4296
 setup_sql = [
   "DROP TABLE IF EXISTS tstats",
@@ -2629,8 +2629,8 @@ dataset = "scratch"
 kind = "query"
 engines = ["jed", "postgres"]
 sql = "SELECT id FROM tstats WHERE tags @> ARRAY['u7'] AND n = 7 ORDER BY id"
-warmup = 20
-iterations = 200
+warmup = 540
+iterations = 5400
 seed = 4297
 setup_sql = [
   "DROP TABLE IF EXISTS tstats",
@@ -2653,8 +2653,8 @@ dataset = "scratch"
 kind = "query"
 engines = ["jed", "postgres"]
 sql = "SELECT count(*) FROM vscan WHERE s = 'v7'"
-warmup = 5
-iterations = 50
+warmup = 21
+iterations = 210
 seed = 4807
 expect_rows_per_iter = 1
 setup_sql = [
@@ -2670,8 +2670,8 @@ dataset = "scratch"
 kind = "query"
 engines = ["jed", "postgres"]
 sql = "SELECT count(*) FROM vscan WHERE s IS NULL"
-warmup = 5
-iterations = 50
+warmup = 29
+iterations = 290
 seed = 4808
 expect_rows_per_iter = 1
 setup_sql = [
@@ -2687,8 +2687,8 @@ dataset = "scratch"
 kind = "query"
 engines = ["jed", "postgres"]
 sql = "SELECT count(*) FROM vscan WHERE b = 'b7'::bytea"
-warmup = 5
-iterations = 50
+warmup = 21
+iterations = 210
 seed = 4809
 expect_rows_per_iter = 1
 setup_sql = [
@@ -2704,8 +2704,8 @@ dataset = "scratch"
 kind = "query"
 engines = ["jed", "postgres"]
 sql = "SELECT count(tags) FROM vscan"
-warmup = 5
-iterations = 50
+warmup = 32
+iterations = 320
 seed = 4810
 expect_rows_per_iter = 1
 setup_sql = [
@@ -2721,8 +2721,8 @@ dataset = "scratch"
 kind = "query"
 engines = ["jed", "postgres"]
 sql = "SELECT count(*) FROM vscan WHERE tags @> ARRAY['u7']"
-warmup = 5
-iterations = 50
+warmup = 17
+iterations = 170
 seed = 4811
 expect_rows_per_iter = 1
 setup_sql = [
@@ -2739,7 +2739,7 @@ kind = "query"
 engines = ["jed", "postgres"]
 sql = "SELECT max(s) FROM vscan"
 warmup = 5
-iterations = 50
+iterations = 47
 seed = 4812
 expect_rows_per_iter = 1
 setup_sql = [
@@ -2755,8 +2755,8 @@ dataset = "scratch"
 kind = "query"
 engines = ["jed", "postgres"]
 sql = "SELECT id, s FROM vscan WHERE n = 4242"
-warmup = 5
-iterations = 50
+warmup = 11
+iterations = 110
 seed = 4813
 expect_rows_per_iter = 1
 setup_sql = [
@@ -2778,8 +2778,8 @@ dataset = "scratch"
 kind = "query"
 engines = ["jed", "postgres"]
 sql = "SELECT count(*) FROM tstats_int WHERE tags @> ARRAY[$1]"
-warmup = 5
-iterations = 50
+warmup = 16
+iterations = 160
 seed = 4298
 setup_sql = [
   "DROP TABLE IF EXISTS tstats_int",
@@ -2805,8 +2805,8 @@ dataset = "scratch"
 kind = "query"
 engines = ["jed", "postgres"]
 sql = "SELECT id FROM tstats_int WHERE tags @> ARRAY[$1] AND n = 7 ORDER BY id"
-warmup = 20
-iterations = 200
+warmup = 570
+iterations = 5700
 seed = 4299
 setup_sql = [
   "DROP TABLE IF EXISTS tstats_int",
@@ -2837,8 +2837,8 @@ dataset = "scratch"
 kind = "query"
 engines = ["jed", "postgres"]
 sql = "SELECT count(*) FROM tskew WHERE k = $1"
-warmup = 5
-iterations = 50
+warmup = 11
+iterations = 110
 seed = 4300
 setup_sql = [
   "DROP TABLE IF EXISTS tskew",
@@ -2860,8 +2860,8 @@ dataset = "scratch"
 kind = "query"
 engines = ["jed", "postgres"]
 sql = "SELECT id, pad FROM tskew WHERE k = $1"
-warmup = 500
-iterations = 5000
+warmup = 4400
+iterations = 44000
 seed = 4301
 expect_rows_per_iter = 1
 setup_sql = [
@@ -2890,8 +2890,8 @@ dataset = "scratch"
 kind = "query"
 engines = ["jed", "postgres"]
 sql = "SELECT id FROM jdocs WHERE doc @> jsonb_build_object('n', $1::bigint) ORDER BY id"
-warmup = 200
-iterations = 2000
+warmup = 190
+iterations = 1900
 seed = 4290
 setup_sql = [
   "DROP TABLE IF EXISTS jdocs",
@@ -2920,8 +2920,8 @@ kind = "query"
 engines = ["jed", "postgres"]
 sql = "SELECT id FROM jdocs WHERE doc @@ '$.n == 7 && $.kind == \"k7\"' ORDER BY id"
 expect_rows_per_iter = 100
-warmup = 5
-iterations = 100
+warmup = 30
+iterations = 590
 seed = 4292
 setup_sql = [
   "DROP TABLE IF EXISTS jdocs",
@@ -2937,8 +2937,8 @@ dataset = "scratch"
 kind = "query"
 engines = ["jed", "postgres"]
 sql = "SELECT id FROM jdocs WHERE doc ? ('tag' || ($1::bigint)::text) ORDER BY id"
-warmup = 100
-iterations = 1000
+warmup = 55
+iterations = 550
 seed = 4291
 setup_sql = [
   "DROP TABLE IF EXISTS jdocs",
@@ -2967,8 +2967,8 @@ dataset = "gin"
 kind = "query"
 engines = ["jed", "postgres"]
 sql = "SELECT id FROM docs WHERE tags = ARRAY[$1::bigint, $2::bigint] ORDER BY id"
-warmup = 500
-iterations = 5000
+warmup = 150
+iterations = 1500
 seed = 4212
 
 [[bench.param]]
@@ -2993,8 +2993,8 @@ dataset = "gin"
 kind = "query"
 engines = ["jed", "postgres"]
 sql = "SELECT id FROM docs WHERE tags IN (ARRAY[$1::bigint, $2::bigint], ARRAY[$3::bigint], ARRAY[$2::bigint, $3::bigint]) ORDER BY id"
-warmup = 20
-iterations = 300
+warmup = 19
+iterations = 280
 seed = 4213
 
 [[bench.param]]
@@ -3026,8 +3026,8 @@ dataset = "gin"
 kind = "write_rollback"
 engines = ["jed", "postgres"]
 sql = "DELETE FROM docs WHERE tags @> ARRAY[$1::bigint, $2::bigint]"
-warmup = 100
-iterations = 1000
+warmup = 57
+iterations = 570
 seed = 4213
 batch = 1
 
@@ -3048,30 +3048,30 @@ max = 500
 # the cross-engine answer checksum (the matching row count) holds. No new data — reuses `large`.
 [[bench]]
 name = "regex_filter_scan"
-description = "Full-scan regex `~` filter over the 1M-row note text column (the linear-time Pike VM)"
-dataset = "large"
+description = "Full-scan regex `~` filter over the 10k-row note text column (the linear-time Pike VM)"
+dataset = "small"
 kind = "query"
 engines = ["jed", "postgres"]
 sql = "SELECT count(*) FROM orders WHERE note ~ '[aeiou]{2}'"
-warmup = 3
-iterations = 20
+warmup = 5
+iterations = 54
 seed = 4220
 expect_rows_per_iter = 1
 
-# Capture-tracking regex over the same 1M notes: a global regexp_replace whose two groups the
+# Capture-tracking regex over the same 10k notes: a global regexp_replace whose two groups the
 # template reorders and repeats, so every match records capture slots (the persistent capture-slot
 # tree, spec/design/regex.md §4.1) and expands the template (cost.md §8.1). Each match adds one
 # character, so the summed length checks the match count against PostgreSQL. The fixed-length
 # pattern matches the same spans under jed's leftmost-first and PG's leftmost-longest rules.
 [[bench]]
 name = "regex_replace_captures"
-description = "Global regexp_replace with two capture groups over the 1M-row note column"
-dataset = "large"
+description = "Global regexp_replace with two capture groups over the 10k-row note column"
+dataset = "small"
 kind = "query"
 engines = ["jed", "postgres"]
 sql = "SELECT sum(length(regexp_replace(note, '([aeiou])([a-z])', '\\2\\1\\1', 'g'))) FROM orders"
-warmup = 3
-iterations = 20
+warmup = 1
+iterations = 17
 seed = 4220
 expect_rows_per_iter = 1
 
@@ -3080,13 +3080,13 @@ expect_rows_per_iter = 1
 # matching rows are exactly regex_filter_scan's. jed + PostgreSQL only (SQLite has no SIMILAR TO).
 [[bench]]
 name = "similar_to_filter_scan"
-description = "Full-scan SIMILAR TO filter over the 1M-row note text column (translated to a regex)"
-dataset = "large"
+description = "Full-scan SIMILAR TO filter over the 10k-row note text column (translated to a regex)"
+dataset = "small"
 kind = "query"
 engines = ["jed", "postgres"]
 sql = "SELECT count(*) FROM orders WHERE note SIMILAR TO '%[aeiou]{2}%'"
-warmup = 3
-iterations = 20
+warmup = 2
+iterations = 27
 seed = 4220
 expect_rows_per_iter = 1
 
@@ -3095,13 +3095,13 @@ expect_rows_per_iter = 1
 # fixed-length vowel pair, so the summed length checks the matching rows against PostgreSQL.
 [[bench]]
 name = "similar_substring"
-description = "SUBSTRING(note SIMILAR … ESCAPE …) extracting the first vowel pair over 1M rows"
-dataset = "large"
+description = "SUBSTRING(note SIMILAR … ESCAPE …) extracting the first vowel pair over 10k rows"
+dataset = "small"
 kind = "query"
 engines = ["jed", "postgres"]
 sql = "SELECT sum(length(substring(note SIMILAR '%#\"[aeiou]{2}#\"%' ESCAPE '#'))) FROM orders"
-warmup = 3
-iterations = 20
+warmup = 1
+iterations = 12
 seed = 4220
 expect_rows_per_iter = 1
 
@@ -3119,8 +3119,8 @@ description = "Running SUM window over 1M rows, ORDER BY id LIMIT 100 (the windo
 dataset = "large"
 kind = "query"
 sql = "SELECT id, sum(amount) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running FROM orders ORDER BY id LIMIT 100"
-warmup = 2
-iterations = 10
+warmup = 840
+iterations = 8400
 seed = 4221
 expect_rows_per_iter = 100
 
@@ -3136,8 +3136,8 @@ description = "Moving 10-row COUNT(*) window over 1M rows, ORDER BY id LIMIT 100
 dataset = "large"
 kind = "query"
 sql = "SELECT id, count(*) OVER (ORDER BY id ROWS BETWEEN 9 PRECEDING AND CURRENT ROW) AS w FROM orders ORDER BY id LIMIT 100"
-warmup = 2
-iterations = 10
+warmup = 970
+iterations = 9700
 seed = 4222
 expect_rows_per_iter = 100
 
@@ -3151,8 +3151,8 @@ description = "Four window functions over one named window (PARTITION BY custome
 dataset = "small"
 kind = "query"
 sql = "SELECT id, row_number() OVER w AS rn, rank() OVER w AS rk, sum(amount) OVER w AS s, lag(amount) OVER w AS prev FROM orders WINDOW w AS (PARTITION BY customer_id ORDER BY amount, id) ORDER BY id"
-warmup = 2
-iterations = 10
+warmup = 5
+iterations = 52
 seed = 4224
 expect_rows_per_iter = 10000
 
@@ -3269,8 +3269,8 @@ description = "DELETE 10 childless parents over a 100k-row child with an index o
 dataset = "scratch"
 kind = "write_rollback"
 sql = "DELETE FROM fk_ri_parent WHERE id = $1"
-warmup = 100
-iterations = 1000
+warmup = 820
+iterations = 8200
 seed = 4282
 batch = 10
 engines = ["jed", "postgres"]
@@ -3296,8 +3296,8 @@ description = "DELETE 10 childless parents over a 100k-row child with no index o
 dataset = "scratch"
 kind = "write_rollback"
 sql = "DELETE FROM fk_ri_scan_parent WHERE id = $1"
-warmup = 2
-iterations = 20
+warmup = 1
+iterations = 4
 seed = 4283
 batch = 10
 engines = ["jed", "postgres"]
@@ -3327,8 +3327,8 @@ description = "DELETE 100 parents x 10 children each via ON DELETE CASCADE, FK c
 dataset = "scratch"
 kind = "write_rollback"
 sql = "DELETE FROM fk_cas_parent WHERE id BETWEEN $1 AND $2"
-warmup = 20
-iterations = 200
+warmup = 19
+iterations = 190
 seed = 4284
 batch = 1
 engines = ["jed", "postgres"]
@@ -3360,7 +3360,7 @@ dataset = "scratch"
 kind = "write_rollback"
 sql = "DELETE FROM fk_cas_scan_parent WHERE id BETWEEN $1 AND $2"
 warmup = 2
-iterations = 20
+iterations = 21
 seed = 4285
 batch = 1
 engines = ["jed", "postgres"]
@@ -3401,8 +3401,8 @@ kind = "query"
 engines = ["jed"]
 host_functions = true
 sql = "SELECT id, amount FROM orders WHERE customer_id BETWEEN $1 AND $2 ORDER BY id"
-warmup = 200
-iterations = 2000
+warmup = 68
+iterations = 680
 seed = 4801
 
 [[bench.param]]
@@ -3424,8 +3424,8 @@ kind = "query"
 engines = ["jed"]
 host_functions = true
 sql = "SELECT id, bench_mix_row(amount) FROM orders WHERE customer_id BETWEEN $1 AND $2 ORDER BY id"
-warmup = 200
-iterations = 2000
+warmup = 65
+iterations = 650
 seed = 4801
 
 [[bench.param]]
@@ -3447,8 +3447,8 @@ kind = "query"
 engines = ["jed"]
 host_functions = true
 sql = "SELECT id, bench_mix_batch(amount) FROM orders WHERE customer_id BETWEEN $1 AND $2 ORDER BY id"
-warmup = 200
-iterations = 2000
+warmup = 64
+iterations = 640
 seed = 4801
 
 [[bench.param]]
@@ -3474,8 +3474,8 @@ kind = "query"
 engines = ["jed"]
 host_functions = true
 sql = "SELECT id, amount FROM orders WHERE id BETWEEN $1 AND $2 ORDER BY id"
-warmup = 200
-iterations = 2000
+warmup = 150
+iterations = 1500
 seed = 4802
 
 [[bench.param]]
@@ -3497,8 +3497,8 @@ kind = "query"
 engines = ["jed"]
 host_functions = true
 sql = "SELECT id, bench_mix_row(amount) FROM orders WHERE id BETWEEN $1 AND $2 ORDER BY id"
-warmup = 200
-iterations = 2000
+warmup = 130
+iterations = 1300
 seed = 4802
 
 [[bench.param]]
@@ -3520,8 +3520,8 @@ kind = "query"
 engines = ["jed"]
 host_functions = true
 sql = "SELECT id, bench_mix_batch(amount) FROM orders WHERE id BETWEEN $1 AND $2 ORDER BY id"
-warmup = 200
-iterations = 2000
+warmup = 130
+iterations = 1300
 seed = 4802
 
 [[bench.param]]
@@ -3545,8 +3545,8 @@ description = "to_json / to_jsonb of 30k f64 values (10k rows x 3 columns) as Po
 dataset = "scratch"
 kind = "query"
 sql = "SELECT id, to_json(a)::text, to_jsonb(b)::text, to_json(c)::text FROM json_floats ORDER BY id"
-warmup = 1
-iterations = 10
+warmup = 3
+iterations = 30
 seed = 4294
 expect_rows_per_iter = 10000
 engines = ["jed", "postgres"]
@@ -3607,8 +3607,8 @@ dataset = "scratch"
 kind = "query"
 engines = ["jed", "postgres"]
 sql = "SELECT id, score FROM tdesc ORDER BY score DESC LIMIT 10"
-warmup = 20
-iterations = 200
+warmup = 9600
+iterations = 96000
 seed = 4303
 setup_sql = [
   "DROP TABLE IF EXISTS tdesc",
@@ -3624,8 +3624,8 @@ dataset = "scratch"
 kind = "query"
 engines = ["jed", "postgres"]
 sql = "SELECT count(*) FROM tdesc WHERE score >= 99000"
-warmup = 20
-iterations = 200
+warmup = 93
+iterations = 930
 seed = 4303
 setup_sql = [
   "DROP TABLE IF EXISTS tdesc",
@@ -3654,8 +3654,8 @@ dataset = "scratch"
 kind = "query"
 engines = ["jed", "postgres"]
 sql = "SELECT count(*), sum(amount)::text FROM ledger"
-warmup = 5
-iterations = 50
+warmup = 6
+iterations = 66
 seed = 4310
 expect_rows_per_iter = 1
 setup_sql = [
@@ -3671,8 +3671,8 @@ dataset = "scratch"
 kind = "query"
 engines = ["jed", "postgres"]
 sql = "SELECT sum(qty)::text FROM ledger"
-warmup = 5
-iterations = 50
+warmup = 7
+iterations = 70
 seed = 4311
 expect_rows_per_iter = 1
 setup_sql = [
@@ -3688,8 +3688,8 @@ dataset = "scratch"
 kind = "query"
 engines = ["jed", "postgres"]
 sql = "SELECT avg(amount)::text FROM ledger"
-warmup = 5
-iterations = 50
+warmup = 7
+iterations = 75
 seed = 4312
 expect_rows_per_iter = 1
 setup_sql = [
@@ -3705,8 +3705,8 @@ dataset = "scratch"
 kind = "query"
 engines = ["jed", "postgres"]
 sql = "SELECT count(*), max(amount)::text FROM ledger WHERE amount > $1::bigint"
-warmup = 5
-iterations = 50
+warmup = 3
+iterations = 27
 seed = 4313
 expect_rows_per_iter = 1
 setup_sql = [
@@ -3727,8 +3727,8 @@ dataset = "scratch"
 kind = "query"
 engines = ["jed", "postgres"]
 sql = "SELECT sum(amount * fee)::text, sum(amount + fee)::text FROM ledger"
-warmup = 5
-iterations = 50
+warmup = 1
+iterations = 12
 seed = 4314
 expect_rows_per_iter = 1
 setup_sql = [
@@ -3744,8 +3744,8 @@ dataset = "scratch"
 kind = "query"
 engines = ["jed", "postgres"]
 sql = "SELECT count(*), sum(g.n)::bigint, sum(g.t)::text, sum(g.m)::text FROM (SELECT region, count(*) AS n, sum(amount) AS t, max(fee) AS m FROM ledger GROUP BY region) g"
-warmup = 5
-iterations = 50
+warmup = 2
+iterations = 25
 seed = 4315
 expect_rows_per_iter = 1
 setup_sql = [
@@ -3761,8 +3761,8 @@ dataset = "scratch"
 kind = "query"
 engines = ["jed", "postgres"]
 sql = "SELECT count(*), sum(g.n)::bigint, sum(g.t)::text FROM (SELECT account, count(*) AS n, sum(amount) AS t FROM ledger GROUP BY account) g"
-warmup = 5
-iterations = 50
+warmup = 3
+iterations = 27
 seed = 4316
 expect_rows_per_iter = 1
 setup_sql = [
@@ -3778,8 +3778,8 @@ dataset = "scratch"
 kind = "query"
 engines = ["jed", "postgres"]
 sql = "SELECT region, count(*), sum(amount)::text FROM ledger GROUP BY region ORDER BY region"
-warmup = 5
-iterations = 50
+warmup = 4
+iterations = 39
 seed = 4317
 expect_rows_per_iter = 50
 setup_sql = [
@@ -3795,8 +3795,8 @@ dataset = "scratch"
 kind = "query"
 engines = ["jed", "postgres"]
 sql = "SELECT id, amount::text AS amount_text FROM ledger ORDER BY amount DESC, id ASC LIMIT 100"
-warmup = 5
-iterations = 50
+warmup = 4
+iterations = 39
 seed = 4318
 expect_rows_per_iter = 100
 setup_sql = [

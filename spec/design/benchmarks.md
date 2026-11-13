@@ -998,7 +998,7 @@ dataset     = "large"               # "small" | "large" | "scratch" (§8)
 kind        = "query"               # "query" | "write_rollback" | "write_durable" | "concurrent_read" (§8.1) | "cold_open" (§8.3)
 sql         = "SELECT id, customer_id, amount, note FROM orders WHERE id = $1"
 warmup      = 50000                 # enough random probes to touch essentially every leaf
-iterations  = 50000                 # timed iterations
+iterations  = 170000                # timed iterations (see "Iteration counts" below)
 seed        = 4201                  # splitmix64 seed for this bench's param stream (§4)
 
 [[bench.param]]                     # one entry per $N, ascending
@@ -1006,6 +1006,26 @@ gen = "int_uniform"                 # "int_uniform" | "serial" | "text" | "int_w
 min = 1                             # int_uniform: inclusive bounds
 max = 1000000
 ```
+
+**Iteration counts.** `iterations` is fixed per benchmark, never derived from elapsed time: the
+answer checksum folds every measured iteration, so every engine must run the same count, and a
+write lane's table state depends on it. Choose it so the timed phase takes **0.5 to 1 second**,
+judged by the geometric mean of the three jed cores (about 0.7 s; the slowest core may run a few
+times longer), with a floor of 3 iterations. `warmup` is about a tenth of `iterations` (at least 1)
+unless the lane needs a specific warm state, as `point_lookup_pk` does. A benchmark that needs the
+floor takes more than about a third of a second per iteration; prefer a smaller workload to a
+longer run. Lanes whose meaning depends on their counts keep them: `write_durable`,
+`concurrent_read`, `cold_open`, `point_lookup_pk_ramp`, and lanes with a `serial` parameter. When a
+change moves a benchmark's time well outside the range, retune its count in the same change;
+`ns_per_op` stays comparable across a retune, the checksum does not.
+
+Row counts follow the same thinking: a benchmark whose cost per row is constant gains nothing from
+more rows. On 2026-11-12 the four regex lanes (`regex_filter_scan`, `regex_replace_captures`,
+`similar_to_filter_scan`, `similar_substring`) moved from `large` (1M rows) to `small` (10k rows),
+and the nested-loop reference pairs shrank to about 1M candidate pairs: `where_pushdown_join` and
+`on_pushdown_join` to 1,000-row inputs, `hash_join_equijoin` to 1,000-row inputs with 200 keys, and
+`join_reverse_inl` to a 10,000-row inner with a 100-row driver, each with its reference. Numbers
+recorded elsewhere in this document for those lanes were measured at the earlier sizes.
 
 Optional keys:
 
