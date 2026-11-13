@@ -62,7 +62,7 @@ module JedNative
       # Settings and input validity apply even when an identical tree exists.
       raise Error.new('54000', 'SQL input exceeds max_sql_length') if @max_sql_length.positive? && sql.bytesize > @max_sql_length
       return prepare(sql) unless sql.is_a?(String)
-      raise Error.new('22021', 'invalid UTF-8 in SQL input') unless sql.valid_encoding?
+      raise Error.new('22021', 'invalid UTF-8 in SQL input') unless sql.dup.force_encoding(Encoding::UTF_8).valid_encoding? && !sql.include?("\0")
       cache = @native_statement_cache || @database.instance_variable_get(:@native_statement_cache)
       cache.fetch(sql)
     end

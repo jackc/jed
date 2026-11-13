@@ -5,18 +5,24 @@ module JedNative
   # strings must never alias a stored cell or a retained prepared expression.
   module HostValues
     module_function
-    def copy(value)
+    def copy(value, validate: true)
       case value
-      when String then value.dup
+      when String
+        copy = value.dup
+        unless value.is_a?(Bytea) || value.encoding == Encoding::BINARY || !validate
+          copy.force_encoding(Encoding::UTF_8)
+          raise Error.new('22021', 'text must be valid UTF-8 without NUL') unless copy.valid_encoding? && !copy.include?("\0")
+        end
+        copy
       when ArrayValue
-        ArrayValue.new(value.map { |element| copy(element) }, element_type: value.element_type&.dup,
+        ArrayValue.new(value.map { |element| copy(element, validate: validate) }, element_type: value.element_type&.dup,
                        dimensions: value.dimensions.dup, lower_bounds: value.lower_bounds.dup)
       when CompositeValue
-        CompositeValue.new(value.map { |element| copy(element) }, type_name: value.type_name.dup,
+        CompositeValue.new(value.map { |element| copy(element, validate: validate) }, type_name: value.type_name.dup,
                            field_names: value.field_names&.map(&:dup))
-      when Array then value.map { |element| copy(element) }
-      when Hash then value.to_h { |key, element| [copy(key), copy(element)] }
-      when JsonValue then JsonValue.new(copy(value.value), binary: value.binary, source: value.source&.dup)
+      when Array then value.map { |element| copy(element, validate: validate) }
+      when Hash then value.to_h { |key, element| [copy(key, validate: validate), copy(element, validate: validate)] }
+      when JsonValue then JsonValue.new(copy(value.value, validate: value.binary && validate), binary: value.binary, source: value.source&.dup)
       else value
       end
     end

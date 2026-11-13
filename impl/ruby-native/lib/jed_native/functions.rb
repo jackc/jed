@@ -108,7 +108,7 @@ module JedNative
       when 'sign'
         raise Error.new('42883', 'sign does not accept integer arguments') if a.is_a?(Integer)
         a.is_a?(Decimal) ? Decimal.new(a <=> 0) : a.nan? ? 0.0 : (a <=> 0).to_f
-      when 'round' then a.is_a?(Decimal) || a.is_a?(Integer) ? Decimal.parse(a).round(b || 0) : a.round(b || 0, half: :up).to_f
+      when 'round' then a.is_a?(Decimal) || a.is_a?(Integer) ? Decimal.parse(a).round(b || 0) : round_float(a, b || 0)
       when 'trunc' then a.is_a?(Decimal) ? a.trunc(b || 0) : a.truncate(b || 0).to_f
       when 'ceil', 'ceiling' then a.is_a?(Decimal) ? a.ceil : a.ceil.to_f
       when 'floor' then a.is_a?(Decimal) ? a.floor : a.floor.to_f
@@ -133,7 +133,11 @@ module JedNative
         return 0 if descending ? Types.compare(a, b).positive? : Types.compare(a, b).negative?
         return count + 1 if descending ? Types.compare(a, c) <= 0 : Types.compare(a, c) >= 0
         if a.is_a?(Float)
-          (((a - b) / (c - b)) * count).floor + 1
+          if (c - b).infinite?
+            (((a / 2 - b / 2) / (c / 2 - b / 2)) * count).floor + 1
+          else
+            (((a - b) / (c - b)) * count).floor + 1
+          end
         else
           ratio = (Decimal.parse(a).to_r - Decimal.parse(b).to_r) / (Decimal.parse(c).to_r - Decimal.parse(b).to_r)
           (ratio * count).floor + 1
@@ -145,13 +149,18 @@ module JedNative
         2.upto(a) { |i| context&.charge(((product.to_s.length + 3) / 4) * ((i.to_s.length + 3) / 4) - 1); product *= i }
         Decimal.new(product)
       when 'pi' then Math::PI
-      when 'degrees' then a.to_f * (180.0 / Math::PI)
-      when 'radians' then a.to_f * (Math::PI / 180.0)
+      when 'degrees', 'radians'
+        value = name == 'degrees' ? a.to_f / (Math::PI / 180.0) : a.to_f * (Math::PI / 180.0)
+        raise Error.new('22003', 'float out of range') if a.finite? && (value.infinite? || value.zero? && !a.zero?)
+        value
       when 'sqrt', 'exp', 'ln', 'log', 'log10', 'pow', 'power'
         math(name, args, context: context)
       when 'sin', 'cos', 'tan', 'asin', 'acos', 'atan', 'atan2', 'sinh', 'cosh', 'tanh', 'asinh', 'acosh', 'atanh', 'cbrt'
+        raise Error.new('22003', 'float out of range') if %w[sin cos tan].include?(name) && a.infinite?
         Math.public_send(name, *args.map(&:to_f))
-      when 'cot' then 1.0 / Math.tan(a.to_f)
+      when 'cot'
+        raise Error.new('22003', 'float out of range') if a.infinite?
+        1.0 / Math.tan(a.to_f)
       when 'length', 'char_length', 'character_length' then a.length
       when 'octet_length' then a.bytesize
       when 'bit_length' then a.bytesize * 8
@@ -255,9 +264,11 @@ module JedNative
         raise Error.new('0A000', 'bounded regular expressions are not implemented in the Ruby experiment')
       when 'array_append'
         raise Error.new('22000', 'argument must be empty or one-dimensional array') if a && a.dimensions.length > 1
-        array((a || []) + [b], a)
+        raise Error.new('22003', 'array subscript out of range') if a && !a.empty? && a.lower_bound + a.length >= 2**31
+        array((a || []) + [b], a).validate_bounds!
       when 'array_prepend'
         raise Error.new('22000', 'argument must be empty or one-dimensional array') if b && b.dimensions.length > 1
+        raise Error.new('22003', 'array subscript out of range') if b && !b.empty? && b.lower_bound == -2**31
         array([a] + (b || []), b)
       when 'array_cat' then array_concat(a, b)
       when 'cardinality' then a.length
@@ -411,20 +422,20 @@ module JedNative
       return a if b.empty?
       ad, bd = a.dimensions, b.dimensions
       if ad.length == bd.length
-        raise Error.new('2202E', 'cannot concatenate incompatible arrays') unless ad[1..] == bd[1..]
+        raise Error.new('2202E', 'cannot concatenate incompatible arrays') unless ad[1..] == bd[1..] && a.lower_bounds[1..] == b.lower_bounds[1..]
         dims = [ad[0] + bd[0]] + ad[1..]
         bounds = a.lower_bounds
       elsif ad.length == bd.length + 1
-        raise Error.new('2202E', 'cannot concatenate incompatible arrays') unless ad[1..] == bd
+        raise Error.new('2202E', 'cannot concatenate incompatible arrays') unless ad[1..] == bd && a.lower_bounds[1..] == b.lower_bounds
         dims = [ad[0] + 1] + ad[1..]
         bounds = a.lower_bounds
       elsif bd.length == ad.length + 1
-        raise Error.new('2202E', 'cannot concatenate incompatible arrays') unless bd[1..] == ad
+        raise Error.new('2202E', 'cannot concatenate incompatible arrays') unless bd[1..] == ad && b.lower_bounds[1..] == a.lower_bounds
         dims = [bd[0] + 1] + bd[1..]
         bounds = b.lower_bounds
       else raise Error.new('2202E', 'cannot concatenate incompatible arrays')
       end
-      ArrayValue.new(a + b, element_type: a.element_type, dimensions: dims, lower_bounds: bounds)
+      ArrayValue.new(a + b, element_type: a.element_type, dimensions: dims, lower_bounds: bounds).validate_bounds!
     end
     def lower_bound(value) = value.respond_to?(:lower_bound) ? value.lower_bound : 1
     def like_escape(pattern, escape)
@@ -488,17 +499,43 @@ module JedNative
       a, b = args
       return DecimalMath.call(name, args, context: context) if a.is_a?(Decimal) || b.is_a?(Decimal)
       raise Error.new('42883', "function #{name} does not accept integer arguments") if args.all? { |v| v.is_a?(Integer) }
-      result = case name
-      when 'sqrt' then Math.sqrt(a.to_f)
-      when 'exp' then Math.exp(a.to_f)
-      when 'ln' then Math.log(a.to_f)
-      when 'log10' then Math.log10(a.to_f)
-      when 'log' then b ? Math.log(b.to_f, a.to_f) : Math.log10(a.to_f)
-      else a.to_f**b.to_f
+      x, y = a.to_f, b&.to_f
+      if %w[pow power].include?(name)
+        return 1.0 if y.zero? || x == 1.0
+        return Float::NAN if x.nan? || y.nan?
+        raise Error.new('2201F', 'zero raised to a negative power is undefined') if x.zero? && y.negative?
+        raise Error.new('2201F', 'negative number raised to a non-integer power') if x.negative? && x.finite? && y.finite? && y != y.truncate
+      elsif name == 'sqrt'
+        raise Error.new('2201F', 'cannot take square root of a negative number') if x < 0
+      elsif %w[ln log log10].include?(name)
+        raise Error.new('2201E', 'cannot take logarithm of zero or a negative number') if x <= 0 || y && y <= 0
       end
-      raise Error.new('22003', 'float out of range') if result.is_a?(Complex) || (result.infinite? && args.all? { |v| v.to_f.finite? })
+      result = case name
+      when 'sqrt' then Math.sqrt(x)
+      when 'exp' then Math.exp(x)
+      when 'ln' then Math.log(x)
+      when 'log10' then Math.log10(x)
+      when 'log' then y ? Math.log(y, x) : Math.log10(x)
+      else
+        if y.infinite?
+          x.abs == 1 ? 1.0 : ((x.abs > 1) == y.positive? ? Float::INFINITY : 0.0)
+        else x**y
+        end
+      end
+      finite = args.all? { |v| v.to_f.finite? }
+      underflow = result.zero? && (name == 'exp' || %w[pow power].include?(name) && !x.zero?)
+      raise Error.new('22003', 'float out of range') if result.is_a?(Complex) || finite && (result.infinite? || underflow)
       result
-    end
+          end
+
+          def round_float(value, scale)
+            return value unless value.finite?
+            return value if scale > 400
+            return value.negative? || (1.0 / value).negative? ? -0.0 : 0.0 if scale < -400
+            result = value.round(scale, half: :up).to_f
+            result.zero? && (value.negative? || (1.0 / value).negative?) ? -0.0 : result
+          end
+
     def quote_literal(text)
       text.include?('\\') ? "E'" + text.gsub('\\') { '\\\\' }.gsub("'", "''") + "'" : "'" + text.gsub("'", "''") + "'"
     end
@@ -526,7 +563,14 @@ module JedNative
     def encode(bytes, format)
       case format.downcase
       when 'hex' then bytes.unpack1('H*')
-      when 'base64' then [bytes].pack('m').strip
+      when 'base64'
+        output = +''
+        offset = 0
+        while offset + 57 <= bytes.bytesize
+          output << [bytes.byteslice(offset, 57)].pack('m0') << "\n"
+          offset += 57
+        end
+        output << [bytes.byteslice(offset..)].pack('m0')
       when 'escape'
         output = +''
         bytes.each_byte { |byte| output << ESCAPE_BYTES[byte] }
@@ -540,9 +584,31 @@ when 'hex'
   raise Error.new('22023', 'invalid hexadecimal input') unless /\A(?:[ \t\r\n]*[0-9a-fA-F]{2})*[ \t\r\n]*\z/.match?(text)
   Bytea.new([text.delete(" \t\r\n")].pack('H*'))
       when 'base64'
-        compact = text.delete(" \t\r\n")
-        raise Error.new('22023', 'invalid base64 input') unless /\A(?:[A-Za-z0-9+\/]{4})*(?:[A-Za-z0-9+\/]{2}==|[A-Za-z0-9+\/]{3}=)?\z/.match?(compact)
-        Bytea.new(compact.unpack1('m0'))
+        alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
+        output, buffer, position, ending = +''.b, 0, 0, 0
+        text.each_char do |char|
+          next if " \t\r\n".include?(char)
+          if char == '='
+            if ending.zero?
+              raise Error.new('22023', 'unexpected base64 padding') unless position == 2 || position == 3
+              ending = position - 1
+            end
+            bits = 0
+          else
+            bits = alphabet.index(char)
+            raise Error.new('22023', 'invalid base64 symbol') unless bits
+          end
+          buffer = (buffer << 6) | bits
+          position += 1
+          if position == 4
+            output << ((buffer >> 16) & 255)
+            output << ((buffer >> 8) & 255) if ending.zero? || ending > 1
+            output << (buffer & 255) if ending.zero? || ending > 2
+            buffer = position = 0
+          end
+        end
+        raise Error.new('22023', 'invalid base64 end sequence') unless position.zero?
+        Bytea.new(output)
       when 'escape' then Types.cast(text, 'bytea')
       else raise Error.new('22023', 'unrecognized encoding')
       end

@@ -80,7 +80,11 @@ module JedNative
           when Hash
             if node[:kind] == :column && (node[:table] ? labels.include?(node[:table]) : !nested)
               ordinal = stored[:columns].index { |column| column[:name] == node[:name] }
-              ordinals << ordinal if ordinal
+              if ordinal
+                ordinals << ordinal
+              elsif !node[:table] && labels.include?(node[:name])
+                ordinals.concat(stored[:columns].each_index.to_a)
+              end
             elsif node[:kind] == :star && (node[:table] ? labels.include?(node[:table]) : !nested)
               ordinals.concat(stored[:columns].each_index.to_a)
             elsif node[:kind] == :call && node[:name] == 'count' && node[:args]&.first&.dig(:kind) == :star

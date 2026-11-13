@@ -51,7 +51,7 @@ module RubyStorageTest
         raise "#{name}: #{exception.message}" unless REJECTED.include?(name)
       end
     end
-    assert(accepted == 103, "expected 103 readable fixtures, got #{accepted}")
+    assert(accepted == 107, "expected 107 readable fixtures, got #{accepted}")
   end
 
   def self.golden_encode
@@ -69,13 +69,22 @@ module RubyStorageTest
               else
                 JedNative::FileFormat.new
               end
+      # The compact fixture's index existed before its rows and was inserted in table-key order.
+      # Preserve that authored index shape while independently re-encoding every page.
+      if name == 'compact_leaf_table.jed'
+        state[:tables].each do |table|
+          table[:indexes].each do |index|
+            index[:physical_tree] = codec.tree_from_profile(index[:tree_profile], codec.index_entries(table, index))
+          end
+        end
+      end
       page_size = name.start_with?('encrypted_') ? 1024 : 256
       actual = codec.build_image(state[:types], state[:sequences], state[:tables], page_size,
                                  state[:collations], views: state[:views])
       assert(expected == actual, "encoded bytes differ from #{File.basename(path)}")
       count += 1
     end
-    assert(count == 68, "expected 68 byte comparisons, got #{count}")
+    assert(count == 71, "expected 68 byte comparisons, got #{count}")
   end
 
   def self.durable_recovery
@@ -330,7 +339,7 @@ module RubyStorageTest
       public_send(name)
       puts "ruby-native storage: #{name} passed"
     end
-    puts "ruby-native storage: #{tests.length} tests passed (103 shared images, 68 byte-exact encodes)"
+    puts "ruby-native storage: #{tests.length} tests passed (107 shared images, 71 byte-exact encodes)"
   end
 
   def self.temporal_containers_reopen

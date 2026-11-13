@@ -7,6 +7,10 @@ module JedNative
     def compile(node, columns)
       return super unless node[:kind] == :call && node[:name] == 'width_bucket' && node[:args].length == 2
       left, right = node[:args].map { |arg| compile(arg, columns) }
+      if right.kind == :literal && right.extra&.dig(:untyped) && right.value.is_a?(String) && !%w[unknown null record].include?(left.type)
+        right.type = left.type + '[]'
+        right.value = cast_value(right.value, right.type)
+      end
       if %w[unknown null].include?(left.type) && %w[unknown null].include?(right.type)
         raise Error.new('42P18', 'width_bucket needs an element type')
       end

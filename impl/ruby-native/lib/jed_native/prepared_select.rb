@@ -266,16 +266,16 @@ module JedNative
         columns = projections.zip(expressions).map { |entry, expression| { name: entry[:alias] || expression_name(entry[:expr]), type: expression.type } }
         predicate = compile_filter(statement[:where], scope)
         parameters = []
-        visit = lambda do |expression|
+        pending = expressions + [predicate]
+        until pending.empty?
+          expression = pending.pop
           if expression.is_a?(Array)
-            expression.each { |child| visit.call(child) }
-            next
+            pending.concat(expression)
+          elsif expression.is_a?(Expression)
+            parameters << expression if expression.kind == :param && expression.extra&.dig(:context_type)
+            pending.concat(expression.args || [])
           end
-          return unless expression.is_a?(Expression)
-          parameters << expression if expression.kind == :param && expression.extra&.dig(:context_type)
-          (expression.args || []).each { |child| visit.call(child) }
         end
-        (expressions + [predicate]).each { |expression| visit.call(expression) }
         plan = ReadPlan.new(table: stored, scope: scope, projections: projections, expressions: expressions,
                             columns: columns, predicate: predicate, parameters: parameters, context: context,
                             scan_columns: scan_column_inventory(statement))

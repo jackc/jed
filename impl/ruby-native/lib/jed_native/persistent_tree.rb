@@ -20,12 +20,12 @@ module JedNative
       pairs.each do |key, record|
         old = records[key]
         next if old && same_tree_record?(old, record)
-        if record[:size] + leaf_overhead(1, record[:table][:columns]) > capacity
+        if recs_payload_size([record]) > capacity
           raise Error.new('0A000', 'record exceeds page capacity after spilling')
         end
         if root
           result = put_tree_key(root, key, record, capacity)
-          root = result[0] == :split ? { keys: [result[2]], recs: [], children: [result[1], result[3]] } : result[1]
+          root = grow_root(result, capacity)
         else
           root = { keys: [key], recs: [record], children: [] }
         end
@@ -35,7 +35,8 @@ module JedNative
 
     def same_tree_record?(left, right)
       left[:row] == right[:row] && left[:forms] == right[:forms] && left[:comps] == right[:comps] &&
-        left[:table][:columns].map { |column| column[:type] } == right[:table][:columns].map { |column| column[:type] }
+        leaf_table_cols(left[:table]) == leaf_table_cols(right[:table]) &&
+        tree_fixed_key?(left[:table]) == tree_fixed_key?(right[:table])
     end
 
     def tree_from_profile(profile, pairs)
@@ -65,7 +66,7 @@ module JedNative
 
     def put_tree_key(node, key, record, capacity)
       if node[:children].empty?
-        index = node[:keys].bsearch_index { |item| item >= key } || node[:keys].length
+        index = node[:keys].bsearch_index { |item| (item <=> key) >= 0 } || node[:keys].length
         keys, records = node[:keys].dup, node[:recs].dup
         if keys[index] == key
           records[index] = record
@@ -73,20 +74,24 @@ module JedNative
           keys.insert(index, key)
           records.insert(index, record)
         end
-        return split_node({ keys: keys, recs: records, children: [] }, capacity, index == keys.length - 1)
+        return split_node({ keys: keys, recs: records, children: [] }, capacity, index)
       end
-      index = node[:keys].bsearch_index { |item| item > key } || node[:keys].length
+      index = node[:keys].bsearch_index { |item| (item <=> key) > 0 } || node[:keys].length
       result = put_tree_key(node[:children][index], key, record, capacity)
       children = node[:children].dup
       if result[0] == :split
-        children[index] = result[1]
-        children.insert(index + 1, result[3])
-        keys = node[:keys].dup.insert(index, result[2])
-        split_node({ keys: keys, recs: [], children: children }, capacity, index == keys.length - 1)
+        children[index, 1] = result[1]
+        keys = node[:keys].dup.insert(index, *result[2])
+        split_node({ keys: keys, recs: [], children: children }, capacity, index + result[2].length - 1)
       else
         children[index] = result[1]
         [:whole, { keys: node[:keys], recs: [], children: children }]
       end
+    end
+
+    def empty_unary_tree?(node)
+      node = node[:children][0] while node[:keys].empty? && node[:children].length == 1
+      node[:keys].empty? && node[:children].empty?
     end
 
     def delete_tree_key(root, key, capacity)
@@ -98,20 +103,25 @@ module JedNative
 
     def delete_tree_path(node, key, capacity)
       if node[:children].empty?
-        index = node[:keys].bsearch_index { |item| item >= key }
+        index = node[:keys].bsearch_index { |item| (item <=> key) >= 0 }
         return node unless index && node[:keys][index] == key
         keys, records = node[:keys].dup, node[:recs].dup
         keys.delete_at(index)
         records.delete_at(index)
         return { keys: keys, recs: records, children: [] }
       end
-      index = node[:keys].bsearch_index { |item| item > key } || node[:keys].length
+      index = node[:keys].bsearch_index { |item| (item <=> key) > 0 } || node[:keys].length
       child = delete_tree_path(node[:children][index], key, capacity)
       return node if child.equal?(node[:children][index])
       children = node[:children].dup
       children[index] = child
       keys = node[:keys].dup
-      if children.length > 1 && 2 * node_payload(child) < capacity
+      if children.length > 1 && !child[:children].empty? && empty_unary_tree?(child)
+        children.delete_at(index)
+        keys.delete_at([index, keys.length - 1].min)
+        return { keys: keys, recs: [], children: children }
+      end
+      if children.length > 1 && 2 * node_payload(child, capacity) < capacity
         left_index = index + 1 < children.length ? index : index - 1
         left, right = children[left_index, 2]
         merged = if left[:children].empty?
@@ -120,18 +130,18 @@ module JedNative
           { keys: left[:keys] + [keys[left_index]] + right[:keys], recs: [], children: left[:children] + right[:children] }
         end
         begin
-          result = split_node(merged, capacity, false)
+          result = split_node(merged, capacity, nil)
           if result[0] == :whole
             children[left_index, 2] = [result[1]]
             keys.delete_at(left_index)
-          else
-            children[left_index, 2] = [result[1], result[3]]
-            keys[left_index] = result[2]
+          elsif result[1].length == 2 &&
+              node_payload(node, capacity) - keys[left_index].bytesize + result[2][0].bytesize <= capacity
+            children[left_index, 2] = result[1]
+            keys[left_index] = result[2][0]
           end
-        rescue RuntimeError => error
-          # Near-capacity separators can make a merged interior unsplittable.
-          # Keeping the original pair is the deterministic format contract.
-          raise unless !merged[:children].empty? && error.message.start_with?('unsplittable interior')
+        rescue Error => error
+          # A merge never grows the parent or produces more than two children.
+          raise unless !merged[:children].empty? && error.sqlstate == '0A000'
         end
       end
       { keys: keys, recs: [], children: children }

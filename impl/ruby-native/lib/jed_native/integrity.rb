@@ -277,7 +277,7 @@ module JedNative
 
     def check_table(t)
       rows = []
-      walk = BtreeWalk.new(self, t[:name], t[:columns])
+      walk = BtreeWalk.new(self, t[:name], @codec.leaf_table_cols(t))
       damaged = !walk.run(t[:root_data_page]) { |page, key, values| rows << check_row(t, page, key, values) }
       damaged ||= rows.any?(&:nil?)
       if !damaged && t[:row_count] != rows.size
@@ -862,7 +862,14 @@ module JedNative
             end
           end
           keys.each_with_index do |key, i|
-            values = (@columns || []).each_with_index.map { |c, ci| [c[:type], raw_value(regions[ci], i)] }
+            values = (@columns || []).each_with_index.map do |column, ci|
+              raw = raw_value(regions[ci], i)
+              if raw && @check.codec.fixed_decimal_width(column)
+                value = @check.codec.decode_fixed_decimal(column, raw.byteslice(1..))
+                raw = @check.codec.encode_value(column[:type], value)
+              end
+              [column[:type], raw]
+            end
             @block&.call(page, key, values)
           end
         else

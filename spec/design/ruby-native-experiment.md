@@ -35,6 +35,10 @@ brought the surface level with source revision `56f49192` (from `d980b536`),
 including MERGE, DISTINCT ON, SIMILAR TO, per-row key metering, format v50, the
 integrity check and encryption at rest; it lists the remaining omissions and does not
 change the frozen status or refresh benchmark results.
+The explicitly requested [November refresh](../../impl/ruby-native/PARITY_UPDATE_2026-11-12.md)
+tracks `b1a6affc`: format v52, whole-row references, current correctness fixes and
+database serialization. It preserves the same experimental status and historical
+benchmark evidence.
 
 The cleaned integration history retains the implementation, opt-in tooling and
 readable reports. Generated evidence and run-specific drivers remain on the

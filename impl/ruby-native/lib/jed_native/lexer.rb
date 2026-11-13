@@ -17,7 +17,7 @@ module JedNative
 
     def initialize(sql)
       @sql = sql.to_s
-      raise Error.new('22021', 'invalid UTF-8 in SQL input') unless @sql.valid_encoding?
+      raise Error.new('22021', 'invalid UTF-8 in SQL input') unless @sql.dup.force_encoding(Encoding::UTF_8).valid_encoding? && !@sql.include?("\0")
       @length = @sql.bytesize
       @offset = 0
     end

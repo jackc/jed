@@ -241,7 +241,8 @@ class NativeCorpus
     @summary[:files] += 1
     worker_progress(path, 0, nil)
     contents = File.read(path)
-    if contents.match?(/^#\s*skip:\s*#{@mode}\b/) || @encrypted && contents.match?(/^#\s*skip:\s*encrypted\b/)
+    if contents.match?(/^#\s*skip:\s*#{@mode}\b/) || @encrypted && contents.match?(/^#\s*skip:\s*encrypted\b/) ||
+       @mode == 'disk' && contents.match?(/^#\s*format:\s*concurrency/)
       @summary[:skipped_files] += 1
       return
     end

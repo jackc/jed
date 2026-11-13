@@ -26,11 +26,17 @@ module JedNative
         arg = expression.args.first
         # An array cast with the same element type is the identity (array.md
         # §7), including a constructor whose elements already have that type.
-        return arg if expression.type.end_with?('[]') && expression.type == arg.type && !expression.extra&.dig(:type_mod)
+        return arg if (expression.type.end_with?('[]') || Types::RANGES.key?(expression.type) || expression.type == 'jsonpath') && expression.type == arg.type && !expression.extra&.dig(:type_mod)
         if arg.kind == :literal && arg.value.nil? && (expression.type.end_with?('[]') || Types::RANGES.key?(expression.type) || @types.key?(expression.type))
           return Expression.new(kind: :literal, type: expression.type, value: nil)
         end
-        if arg.kind == :literal && arg.value.is_a?(String)
+        if expression.type == 'jsonpath' && arg.kind == :cast && arg.args.first.kind == :literal && arg.args.first.value.nil?
+          expression.args = [arg.args.first]
+        end
+        if expression.type == 'jsonpath' && !%w[text jsonpath null unknown].include?(arg.type)
+          raise Error.new('42846', 'cannot cast source type to jsonpath')
+        end
+        if arg.kind == :literal && arg.value.is_a?(String) && (expression.type != 'jsonpath' || node[:expr][:kind] == :literal)
           value = cast_value(arg.value, expression.type, source_type: arg.type)
           value = explicit_modifier(value, expression.type, expression.extra[:type_mod])
           return Expression.new(kind: :literal, type: expression.type, value: value)
@@ -82,6 +88,13 @@ module JedNative
     end
 
     def evaluate(expression, row, group = nil)
+      if expression.kind == :cast && expression.type == 'jsonpath'
+        value = evaluate(expression.args.first, row, group)
+        charge
+        return nil if value.nil?
+        charge(value.bytesize)
+        return cast_value(value, 'jsonpath')
+      end
       if expression.kind == :cast && expression.extra&.dig(:type_mod)
         charge
         value = cast_value(evaluate(expression.args.first, row, group), expression.type, source_type: expression.args.first.type)

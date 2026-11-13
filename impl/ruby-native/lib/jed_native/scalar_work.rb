@@ -27,7 +27,9 @@ module JedNative
         groups = ->(digits) { [1, (digits + 3).div(4)].max }
         units = case operator
         when '*' then groups.call(first) * groups.call(second)
-        when '/' then groups.call(first + left.division_scale(right) + right.scale - left.scale) * groups.call(second)
+        when '/'
+          shift = left.division_scale(right) + right.scale - left.scale
+          groups.call(first + [shift, 0].max) * groups.call(second + [-shift, 0].max)
         when '%' then groups.call(aligned_first) * groups.call(aligned_second)
         else [groups.call(aligned_first), groups.call(aligned_second)].max
         end

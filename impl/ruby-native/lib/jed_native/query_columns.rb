@@ -148,7 +148,8 @@ module JedNative
                 end
       label = source[:alias] || source[:name]
       columns = columns.reject { |column| column[:qualified_only] } if source[:kind] == :join_group && label
-      columns.each_with_index.map { |column, index| column.merge(table: label || column[:table], name: source[:columns]&.[](index) || column[:name]) }
+      columns = columns.each_with_index.map { |column, index| column.merge(table: label || column[:table], name: source[:columns]&.[](index) || column[:name]) }
+      WholeRowColumns.decorate(source, columns, self, ctes)
     end
 
     def common_query_modifier(values)

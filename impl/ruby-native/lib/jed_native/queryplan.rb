@@ -311,7 +311,7 @@ module JedNative
         detail = []
         detail << "limit=#{limit}" if limit
         detail << "offset=#{offset}" if statement[:offset]
-        node = plan_node('Limit', detail.join(' '), rows, node.cost, [node], :root)
+        node = plan_node('Limit', detail.join(' '), rows, node.cost, [node], :root) if limit || statement[:offset]
       end
       node.cost = [MAX_ESTIMATE, node.cost + node.rows * (1 + outputs.sum { |expression| expression_work(expression) })].min
       if @explain_options[:verbose]

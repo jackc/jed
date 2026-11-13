@@ -2,6 +2,12 @@
 
 module JedNative
   module SpillSemantics
+    def correlated(columns, row)
+      mapping = columns.instance_variable_get(:@spill_outer_mapping)
+      row = mapping.map { |index| index.nil? ? nil : row[index] } if mapping
+      super(columns, row) { yield }
+    end
+
     def select(statement)
       return super unless spill_select_shape?(statement)
       labels = view_query_columns(statement, nil, @outer.flat_map(&:first)) if @environment && !@environment.collations.empty?
@@ -36,6 +42,13 @@ module JedNative
         result.extra = spill_rewrite_metadata(expression.extra, keys, aggregates)
       end
       result.args = spill_rewrite_metadata(expression.args, keys, aggregates) if result.kind != :column && expression.args
+      if result.kind != :column && expression.extra.is_a?(Hash) && expression.extra[:scope]
+        mapping = expression.extra[:scope].each_index.map do |ordinal|
+          keys.index { |key| key.kind == :column && key.value == ordinal }
+        end
+        result.extra[:scope] = expression.extra[:scope].dup
+        result.extra[:scope].instance_variable_set(:@spill_outer_mapping, mapping)
+      end
       result
     end
 

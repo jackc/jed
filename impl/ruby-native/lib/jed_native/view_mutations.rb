@@ -4,9 +4,9 @@ module JedNative
   module ViewSourceBindings
     private
 
-    def statement(node, outer = [])
+    def statement(node, outer = [], targets = nil)
       return super unless node[:kind] == :view_source
-      statement(node[:query], outer) + node[:defaults].map do |name, value|
+      statement(node[:query], outer, targets) + node[:defaults].map do |name, value|
         { name: name, type: expression(value, []) }
       end
     end

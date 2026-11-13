@@ -23,15 +23,15 @@ module JedNative
       end
       tree = base[:native_primary_tree]
       changes.each { |_, _, old_key, key| tree = codec.delete_tree_key(tree, old_key, capacity) if old_key && old_key != key }
-      shape = { columns: table[:columns] }
+      shape = table.slice(:name, :columns, :constraints)
       changes.each do |_, after, _, key|
         next unless after
         values, forms, comps, size = storage_record_plan(table, key, after, codec, capacity)
-        record = { key: key, row: values, table: shape, forms: forms, comps: comps, size: size }
+        record = { key: key, row: values, table: shape, forms: forms, comps: comps, size: size, pointer_tag: (codec.cap_tag(capacity)) }
         tree = pending_tree_put(codec, tree, key, record, capacity)
       end
       raise Error.new('XX001', 'persisted row count does not match empty tree') unless tree.nil? == pending.length.zero?
-      raw = PagedRows.new(base[:rows].pool, 0, table[:columns], pending.length, tree: tree)
+      raw = PagedRows.new(base[:rows].pool, 0, codec.leaf_table_cols(table), pending.length, tree: tree)
       rows = raw.converted { |type, value| from_storage_value(type, value) }
       indexes = table[:indexes].map do |index|
         name = index[:name]
@@ -73,7 +73,7 @@ module JedNative
       raise Error.new('0A000', 'record exceeds page capacity after spilling') if codec.node_payload(singleton) > capacity
       return singleton unless tree
       result = codec.put_tree_key(tree, key, record, capacity)
-      result[0] == :split ? { keys: [result[2]], recs: [], children: [result[1], result[3]] } : result[1]
+      codec.grow_root(result, capacity)
     end
 
     def pending_secondary_key(table, name, metadata, row, key)

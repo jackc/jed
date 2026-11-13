@@ -61,7 +61,7 @@ module NativeLexerTests
     assert(values("U&'d\\0061t'/* comment */UESCAPE '\\'") == ['dat'], 'Unicode escape lookahead changed')
     assert(values("'a''b' \"a\"\"b\"") == ["a'b", 'a"b'], 'escaped quote boundaries changed')
     error('22021', "SELECT '\xFF'".dup.force_encoding(Encoding::UTF_8))
-    error('42601', "SELECT '\0'")
+    error('22021', "SELECT '\0'")
     error('42601', "'unfinished")
     error('42622', '"' + '雪' * 22 + '"')
   end

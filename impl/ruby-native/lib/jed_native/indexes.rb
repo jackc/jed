@@ -96,7 +96,7 @@ module JedNative
           statistics_storage_rows(stored, codec)
         end
         entries = rows.map { |key, row| [key.freeze, row_positions.fetch(row.object_id)].freeze }.freeze
-        shape = { columns: stored[:columns] }
+        shape = stored.slice(:name, :columns, :constraints)
         cap = storage_capacity(stored)
         slab = codec.chain_capacity(cap)
         scan_units = {}
@@ -116,7 +116,7 @@ module JedNative
               units[index] = [pages, slabs].freeze unless pages.zero? && slabs.zero?
             end
             scan_units[row_positions.fetch(row.object_id)] = units.freeze unless units.empty?
-            [key, { key: key, row: values, table: shape, forms: forms, comps: comps, size: size }]
+            [key, { key: key, row: values, table: shape, forms: forms, comps: comps, size: size, pointer_tag: (codec.cap_tag(cap)) }]
         end
         tree = if stored[:storage_tree_profile] && stored[:storage_tree_rows].equal?(stored[:rows])
           codec.tree_from_profile(stored[:storage_tree_profile], pairs)

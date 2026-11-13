@@ -106,7 +106,7 @@ run = ["ruby impl/ruby-native/tools/generate_catalog.rb", "ruby impl/ruby-native
 
 [tasks."ruby-native:test"]
 description = "Explicit opt-in: pure Ruby experimental host/storage tests"
-run = "JED_NATIVE_TIMEOUT=${JED_NATIVE_TIMEOUT:-180} ruby impl/ruby-native/tools/run_bounded.rb ruby -Iimpl/ruby-native/lib -e 'Dir[\"impl/ruby-native/test/*_test.rb\"].sort.each { |f| require_relative f }'"
+run = "ruby impl/ruby-native/tools/run_tests.rb"
 
 [tasks."ruby-native:storage-test"]
 description = "Explicit opt-in: experimental Ruby storage byte and durability tests"

@@ -190,10 +190,22 @@ module JedNative
 
     def drop_index(statement)
       owner = @tables.values.find { |table| table[:constraints].any? { |constraint| constraint[:kind] == :unique && constraint[:name] == statement[:name] } }
-      return super unless owner
-
-      # A UNIQUE constraint owns its index (constraints.md §5.5): drop the constraint instead.
-      raise Error.new('2BP01', "cannot drop index #{statement[:name]} because constraint #{statement[:name]} on table #{owner[:name]} requires it")
+      raise Error.new('2BP01', 'a UNIQUE constraint owns this index') if owner
+      parent = @tables.values.find { |table| table[:indexes].any? { |index| index[:name] == statement[:name] } }
+      if parent
+        references = @tables.values.flat_map { |table| table[:constraints] }.select { |constraint| constraint[:kind] == :foreign_key && (constraint[:table] || constraint[:ref_table]) == parent[:name] }
+        references.each do |constraint|
+          names = constraint[:ref_columns].sort
+          covered = parent[:constraints].any? { |key| %i[primary_key unique].include?(key[:kind]) && key[:columns].sort == names }
+          covered ||= parent[:indexes].any? do |index|
+            next false if index[:name] == statement[:name] || !index[:unique] || index[:where]
+            columns = index[:columns] || index[:elements]&.map { |element| element[:expr][:name] if element[:expr][:kind] == :column }
+            columns && columns.none?(&:nil?) && columns.sort == names
+          end
+          raise Error.new('2BP01', 'foreign key requires this unique index') unless covered
+        end
+      end
+      super
     end
 
     def reindex_targets(statement)

@@ -52,6 +52,10 @@ files in the same change.
   requested. Record coverage and omissions against the experiment's source revision;
   promotion to supported status requires a separate decision. See
   `spec/design/ruby-native-experiment.md` and `spec/design/swift-native-experiment.md`.
+  The explicitly requested Ruby refresh (2026-11-12) tracks supported-core revision
+  `b1a6affc`; coverage and remaining omissions are recorded in
+  `impl/ruby-native/PARITY_UPDATE_2026-11-12.md`. Its experimental status and prior
+  benchmark evidence are unchanged.
   The explicitly authorized Swift refresh (2026-11-12) targets supported-core
   revision `b1a6affca7725e0b07a4f734eddb1c569ef76bcf` and format v52.
   Its recorded inventory is 763 SQL files, 116 database fixtures and 19 saved

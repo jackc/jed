@@ -6,6 +6,18 @@ module JedNative
   module ExpressionWalks
     EMPTY_ARGS = [].freeze
 
+    def aggregate_expr?(expression)
+      pending = [expression]
+      until pending.empty?
+        current = pending.pop
+        next unless current.is_a?(Expression)
+        return true if current.kind == :call && Functions.aggregate?(current.value) && !current.extra&.dig(:over)
+        return true if current.extra.is_a?(Hash) && current.extra[:over] && contains_aggregate?(current.extra[:over])
+        pending.concat(current.args || [])
+      end
+      false
+    end
+
     private
 
     def expression_nodes(expression)
@@ -18,18 +30,22 @@ module JedNative
     end
 
     def append_expression_nodes(expression, nodes)
-      if expression.instance_of?(Expression)
-        nodes << expression
-        args = expression.args
-        if args.instance_of?(Array)
-          args.each { |argument| append_expression_nodes(argument, nodes) }
-        elsif args
-          nodes.concat(args.flat_map { |argument| expression_nodes(argument) })
+      pending = [expression]
+      until pending.empty?
+        current = pending.pop
+        if current.instance_of?(Expression)
+          nodes << current
+          args = current.args || EMPTY_ARGS
+          if args.instance_of?(Array)
+            pending.concat(args.reverse)
+          else
+            nodes.concat(args.flat_map { |argument| expression_nodes(argument) })
+          end
+        elsif current.instance_of?(Array)
+          pending.concat(current.reverse)
+        elsif current.is_a?(Expression) || current.is_a?(Array)
+          nodes.concat(expression_nodes(current))
         end
-      elsif expression.instance_of?(Array)
-        expression.each { |part| append_expression_nodes(part, nodes) }
-      elsif expression.is_a?(Expression) || expression.is_a?(Array)
-        nodes.concat(expression_nodes(expression))
       end
     end
 

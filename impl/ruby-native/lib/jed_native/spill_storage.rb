@@ -154,6 +154,8 @@ module JedNative
       @charged = @resident_bytes = 0
     end
 
+    def close = release
+
     # The scratch stream to seal this owner's scratch files with, or nil for plaintext scratch.
     def scratch_seal
       @engine.respond_to?(:scratch_sealed?) && @engine.scratch_sealed? ? @engine.scratch_stream : nil

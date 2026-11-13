@@ -73,8 +73,43 @@ module JedNative
       when :exists then "exists ( #{query(node[:query])} )"
       when :collate then "( #{expression(node[:expr])} collate #{identifier(node[:name])} )"
       when :field then "( #{expression(node[:expr])} ) . #{identifier(node[:name])}"
+      when :json_table
+        text = "json_table ( #{expression(node[:context])}#{json_format(node[:format_json])} , #{expression(node[:path])}"
+        text += " as #{identifier(node[:path_name])}" if node[:path_name]
+        unless (node[:passing] || []).empty?
+          text += ' passing ' + node[:passing].map { |binding| "#{expression(binding[:expr])}#{json_format(binding[:format_json])} as #{identifier(binding[:name])}" }.join(' , ')
+        end
+        text + " columns ( #{node[:columns].map { |column| json_table_column(column) }.join(' , ')} ) )"
       else raise Error.new('0A000', "persisting expression #{node[:kind]} is not implemented")
       end
+    end
+
+    def json_format(format)
+      return '' unless format
+      ' format json' + (format.is_a?(String) ? " encoding #{format}" : '')
+    end
+
+    def json_table_column(column)
+      if column[:kind] == :nested
+        name = column[:name] ? " as #{identifier(column[:name])}" : ''
+        return "nested path #{string(column[:path])}#{name} columns ( #{column[:columns].map { |child| json_table_column(child) }.join(' , ')} )"
+      end
+      text = identifier(column[:name])
+      return text + ' for ordinality' if column[:kind] == :ordinality
+      text += ' ' + type_name(column[:type], column[:type_mod])
+      text += ' exists' if column[:kind] == :exists
+      text += json_format(column[:format_json])
+      text += " path #{string(column[:path])}" if column[:path]
+      text += " with #{column[:wrapper]} array wrapper" if column[:wrapper] && column[:wrapper] != :without
+      text += ' omit quotes' if column[:keep_quotes] == false
+      %i[on_empty on_error].each do |key|
+        behavior = column[key]
+        next unless behavior
+        text += ' ' + behavior[:kind].to_s.tr('_', ' ')
+        text += ' ' + expression(behavior[:default]) if behavior[:kind] == :default
+        text += ' ' + key.to_s.tr('_', ' ')
+      end
+      text
     end
 
     def relation(source)

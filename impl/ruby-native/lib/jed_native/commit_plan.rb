@@ -56,6 +56,9 @@ module JedNative
         end
         encoded = @codec.table_entry_bytes(table, data_root, roots, table[:row_count] || table[:rows].length)
         metadata, = @codec.decode_table_entry(encoded, 0)
+        metadata[:columns] = @codec.leaf_table_cols(metadata)
+        fixed_key = @codec.tree_fixed_key?(metadata)
+        metadata[:columns].each { |c| c[:tree_fixed_key] = fixed_key }
         metadata[:statistics] = table[:statistics] if table[:statistics]
         @table_catalog << metadata
         entries << "\x00".b + encoded
@@ -103,7 +106,7 @@ module JedNative
     def fresh_table_tree(table)
       pairs = @codec.table_entries(table).map do |key, row|
         forms, comps, size = @codec.plan_record(table, key, row, @capacity)
-        [key, { key: key, row: row, table: table, forms: forms, comps: comps, size: size }]
+        [key, { key: key, row: row, table: table, forms: forms, comps: comps, size: size, pointer_tag: (@codec.cap_tag(@capacity)) }]
       end
       @codec.build_tree(pairs, @capacity)
     end

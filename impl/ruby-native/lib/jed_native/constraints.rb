@@ -37,6 +37,7 @@ module JedNative
     private
 
     def resolve_foreign_key(child, constraint)
+      raise Error.new('0A000', 'foreign keys to attached databases are not supported') if constraint[:native_database]
       parent_name = constraint[:table] || constraint[:ref_table]
       parent = parent_name == child[:name] ? child : table(parent_name)
       raise Error.new('42P16', 'foreign key crosses persistence domains') unless !!child[:temporary] == !!parent[:temporary]
@@ -127,6 +128,11 @@ module JedNative
       visit_index_children(expression.args)
       visit_index_children(expression.extra)
       case expression.kind
+      when :binary
+        if %w[+ -].include?(expression.value) && expression.type == 'timestamptz' && expression.args.any? { |argument| argument.type == 'interval' }
+          interval = expression.args.find { |argument| argument.type == 'interval' }
+          reject_index_dependency unless interval.kind == :literal && (interval.value.nil? || interval.value.months.zero? && interval.value.days.zero?)
+        end
       when :json_image
         reject_index_dependency if expression.args.any? { |argument| json_zoned_argument?(argument) }
       when :text_builder

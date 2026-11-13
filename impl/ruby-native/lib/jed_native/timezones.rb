@@ -33,7 +33,16 @@ module JedNative
         return nil if args.any?(&:nil?)
         wall = super('make_timestamp', args[0, 6], context: context, arg_types: arg_types&.first(6))
         context.charge
-        return TimestampValue.new(context.resolve_timezone(args[6]).local_to_instant(wall.micros), zoned: true)
+        name = args[6]
+        if name && (match = /\A([+-])(\d{1,4})(?::(\d{1,2})(?::(\d{1,2}))?)?\z/.match(name))
+          hours, minutes, seconds = match[2].to_i, match[3].to_i, match[4].to_i
+          hours, minutes = hours.divmod(100) if !match[3] && match[2].length > 2
+          raise Error.new('22023', 'invalid time zone offset') if hours > 15 || minutes > 59 || seconds > 59
+          zone = TimeZoneData::Fixed.new((hours * 3600 + minutes * 60 + seconds) * (match[1] == '+' ? 1 : -1))
+        else
+          zone = context.resolve_timezone(name)
+        end
+        return TimestampValue.new(zone.local_to_instant(wall.micros), zoned: true)
       elsif name == 'current_date'
         value = context.clock_value(name)
         context.charge
@@ -110,7 +119,7 @@ module JedNative
     def resolve_timezone(name = nil)
       name ||= timezone
       @environment ||= Environment.new
-      TimeZoneData.fixed(name) || @environment.timezones[name] || (raise Error.new('22023', "time zone #{name} is not recognized"))
+      TimeZoneData.fixed(name) || @environment.timezones[name] || @environment.timezones.find { |key, _| key.casecmp?(name) }&.last || (raise Error.new('22023', "time zone #{name} is not recognized"))
     end
     def timezone_at(micros) = resolve_timezone.offset_at(micros.div(1_000_000))
     def local_to_instant(micros) = resolve_timezone.local_to_instant(micros)

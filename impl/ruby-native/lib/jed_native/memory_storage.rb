@@ -7,7 +7,7 @@ module JedNative
   # The in-memory host stores the same packed pages. Its free list stays in RAM,
   # so it emits no free-list or manifest pages and has no durability barrier.
   class MemoryStorage
-    attr_reader :page_size, :page_count, :state, :root
+    attr_reader :page_size, :page_count, :state, :root, :version
     attr_writer :reuse_allowed_provider
 
     def initialize(codec, page_size: 8192, image: nil, state: nil)
@@ -24,6 +24,7 @@ module JedNative
       @live_at_compaction = @page_count - @free.length
       @catalog_pages = 1
       @page_ids, @overflow_ids = {}.compare_by_identity, {}.compare_by_identity
+      @version = state&.dig(:meta, :txid) || 0
       @state = state || { tables: [], types: [], sequences: [], views: [], collations: [] }
     end
 
@@ -53,6 +54,7 @@ module JedNative
       @page_ids, @overflow_ids = plan.adopt, plan.overflow_ids
       @catalog_pages = plan.pages.pages.count { |_, bytes| bytes.getbyte(0) == FileFormat::PAGE_CATALOG }
       @state = state
+      @version += 1
       unlisted = @page_count - @free.length
       if reuse_allowed? && unlisted > FreeListPlan::COMPACT_MIN_PAGES && unlisted > FreeListPlan::COMPACT_GROWTH * @live_at_compaction
         reached = @live_pages | @last_written.to_set

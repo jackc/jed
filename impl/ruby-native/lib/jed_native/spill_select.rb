@@ -23,6 +23,12 @@ module JedNative
       input_sources = sources + joins.map { |join| join[:relation] }
       scopes = input_sources.map { |source| spill_source_columns(source) }
       scope = scopes.flatten(1)
+      joins.each_with_index do |join, index|
+        if %i[left left_outer].include?(join[:kind])
+          start = scopes.take(sources.length + index).sum(&:length)
+          scopes[sources.length + index].length.times { |i| scope[start + i] = scope[start + i].merge(whole_nullable: true) }
+        end
+      end
       projections = expand_stars(statement[:columns], scope)
       expressions = projections.map { |item| compile(item[:expr], scope) }
       columns = projections.zip(expressions).map { |item, expression| { name: item[:alias] || expression_name(item[:expr]), type: expression.type } }
@@ -32,8 +38,14 @@ module JedNative
       validate_aggregate_scope(statement, scope, grouped)
       predicate = compile_filter(where, scope)
       having = compile_filter(statement[:having], scope)
-      orderings = spill_order_expressions(statement, expressions, columns, scope)
+      orderings = spill_order_expressions(statement.merge(columns: projections), expressions, columns, scope)
       aggregates = aggregate_nodes.map { |node| compile(node, scope) }
+      orderings.each do |expression, _|
+        expression_nodes(expression).each do |item|
+          id = item.extra.is_a?(Hash) ? item.extra[:aggregate_cache_id] : nil
+          aggregates << item if id && aggregates.none? { |aggregate| aggregate.extra[:aggregate_cache_id] == id }
+        end
+      end
       groupings = (expressions + [having] + orderings.map(&:first)).compact.flat_map { |expression| expression_nodes(expression) }.select { |expression| expression.kind == :grouping }.uniq { |expression| aggregate_expression_key(expression) }
       offset = statement[:offset] ? evaluate(compile(statement[:offset], []), []) || 0 : 0
       limit = statement[:limit] ? evaluate(compile(statement[:limit], []), []) : nil
@@ -58,38 +70,43 @@ module JedNative
         edge = joins.first
         edge[:relation][:native_index_plan] || join_index_plan(Relation.new(columns: scopes.first, rows: []), edge[:relation], edge[:kind], edge[:on], edge[:using])
       end
-      inputs = input_sources.each_with_index.map do |source, index|
-        next nil if index_plan && index == 1
-        contradiction ? spill_owner(owners, RowSpool) : spill_source(source, scopes[index], statement, owners)
-      end
-      rows = inputs.first || spill_owner(owners, RowSpool)
-      rows.push([]) if input_sources.empty? && !contradiction
-      left_columns = scopes.first || []
-      input_sources.drop(1).each_with_index do |_, relative|
-        index = relative + 1
-        join = index < sources.length ? { kind: :cross } : joins[index - sources.length]
-        rows = if index_plan
-          spill_index_join(rows, index_plan, left_columns, scopes[index], join, owners)
-        else
-          spill_join(rows, inputs[index], left_columns, scopes[index], join, owners)
+      lane_groups = spill_group_lane?(statement, sources, joins, nodes, aggregates, groupings, predicate, scope)
+      if lane_groups
+        rows, key_expressions = spill_group_lane(sources.first, scope, nodes.first, aggregates, predicate, contradiction, owners, statement)
+      else
+        inputs = input_sources.each_with_index.map do |source, index|
+          next nil if index_plan && index == 1
+          contradiction ? spill_owner(owners, RowSpool) : spill_source(source, scopes[index], statement, owners)
         end
-        left_columns += scopes[index]
-      end
-      if physical_plan && physical_plan[:reverse]
-        reordered = spill_owner(owners, RowSpool)
-        width = scopes.first.length
-        rows.each { |row| reordered.push(row.drop(width) + row.take(width)) }
+        rows = inputs.first || spill_owner(owners, RowSpool)
+        rows.push([]) if input_sources.empty? && !contradiction
+        left_columns = scopes.first || []
+        input_sources.drop(1).each_with_index do |_, relative|
+          index = relative + 1
+          join = index < sources.length ? { kind: :cross } : joins[index - sources.length]
+          rows = if index_plan
+            spill_index_join(rows, index_plan, left_columns, scopes[index], join, owners)
+          else
+            spill_join(rows, inputs[index], left_columns, scopes[index], join, owners)
+          end
+          left_columns += scopes[index]
+        end
+        if physical_plan && physical_plan[:reverse]
+          reordered = spill_owner(owners, RowSpool)
+          width = scopes.first.length
+          rows.each { |row| reordered.push(row.drop(width) + row.take(width)) }
+          rows.close
+          rows = reordered
+        end
+        profile_checkpoint(:scan) if @explain_profile_frames
+        filtered = spill_owner(owners, RowSpool)
+        rows.each { |row| filtered.push(row) if !predicate || evaluate(predicate, row) == true }
         rows.close
-        rows = reordered
+        rows = filtered
+        profile_checkpoint(:filter) if @explain_profile_frames
       end
-      profile_checkpoint(:scan) if @explain_profile_frames
-      filtered = spill_owner(owners, RowSpool)
-      rows.each { |row| filtered.push(row) if !predicate || evaluate(predicate, row) == true }
-      rows.close
-      rows = filtered
-      profile_checkpoint(:filter) if @explain_profile_frames
       if grouped
-        rows, key_expressions = spill_groups(rows, scope, nodes, aggregates, owners, groupings)
+        rows, key_expressions = spill_groups(rows, scope, nodes, aggregates, owners, groupings) unless lane_groups
         replacements = aggregates + groupings
         expressions = expressions.map { |expression| spill_rewrite(expression, key_expressions, replacements) }
         having = spill_rewrite(having, key_expressions, replacements) if having
@@ -144,6 +161,108 @@ module JedNative
     end
 
     private
+
+    # memory.md §6.6.1: fold directly into a measured group table, then hand
+    # that table over in creation order when a reservation or work_mem rejects it.
+    def spill_group_lane?(statement, sources, joins, nodes, aggregates, groupings, predicate, scope)
+      return false if @explain_profile_frames || @max_cost.positive? || @lifetime_max_cost.positive?
+      return false if statement[:distinct] || statement[:having] || !groupings.empty?
+      return false unless sources.length == 1 && joins.empty? && nodes.length == 1 && nodes.first[:kind] == :column
+      source = sources.first
+      return false unless source[:kind] == :table && !@ctes.key?(source[:name]) && (stored = @tables[source[:name]])
+      return false unless stored[:rows].is_a?(PagedRows) && Types::INTEGER_BITS.key?(compile(nodes.first, scope).type)
+      return false unless aggregates.all? do |aggregate|
+        extra = aggregate.extra
+        %w[count sum avg min max].include?(aggregate.value) && !extra[:distinct] && !extra[:filter_expr] &&
+          !extra[:within_group] && (extra[:aggregate_order] || []).empty? && aggregate.args.all? { |arg| arg.kind == :star || pushdown_safe?(arg) }
+      end
+      access = scan_access_plan(stored, predicate, statement)
+      %i[full primary].include?(access[:kind]) && (!predicate || pushdown_safe?(predicate))
+    end
+
+    def spill_group_lane(source, scope, node, aggregates, predicate, contradiction, owners, statement)
+      stored = @tables.fetch(source[:name])
+      key_expression = compile(node, scope)
+      resident = spill_owner(owners, SpillOwner)
+      entries = {}
+      groups = key_rows = nil
+      input = if contradiction
+        []
+      else
+        access = scan_access_plan(stored, predicate, statement)
+        selected = execute_scan_access(stored, predicate, access)
+        unless selected
+          charge(full_scan_pages(stored))
+          charge_scan_payload(stored)
+          ordinals = stored[:native_primary_entries]&.lazy&.map(&:last) || stored[:rows].each_index
+          selected = scan_rows(stored, ordinals)
+        end
+        selected
+      end
+      input.each do |row|
+        charge
+        next if predicate && evaluate(predicate, row) != true
+        key = [evaluate(key_expression, row)]
+        fresh = false
+        if groups
+          found, state = groups.get(key)
+          unless found
+            state = [key_rows.length] + aggregates.map { |aggregate| spill_accumulator(aggregate) }
+            key_rows.push(key)
+          end
+        else
+          state = entries[key]
+          unless state
+            state = [entries.length] + aggregates.map { |aggregate| spill_accumulator(aggregate) }
+            entries[key] = state
+            fresh = true
+          end
+        end
+        rejected = false
+        if fresh
+          rejected = !resident.reserve(MemorySchedule::ENTRY + (key + state).sum { |value| LogicalMemory.value_bytes(value) })
+        end
+        state = state.dup
+        aggregates.each_with_index do |aggregate, index|
+          charge
+          values = aggregate.args.map { |argument| argument.kind == :star ? 1 : evaluate(argument, row) }
+          before = LogicalMemory.value_bytes(state[index + 1])
+          state[index + 1] = spill_fold(aggregate, state[index + 1], values, nil, index)
+          if !groups
+            accepted = resident.reserve(LogicalMemory.value_bytes(state[index + 1]) - before)
+            rejected ||= !accepted
+          end
+        end
+        if groups
+          groups.put(key, state)
+        else
+          entries[key] = state
+          if rejected
+            resident.release
+            groups, key_rows = spill_owner(owners, SpillStateMap), spill_owner(owners, RowSpool)
+            entries.each do |entry_key, entry_state|
+              groups.put(entry_key, entry_state)
+              key_rows.push(entry_key)
+            end
+            entries = nil
+          end
+        end
+      end
+      output = spill_owner(owners, RowSpool)
+      finalize = lambda do |key, state|
+        key + aggregates.each_with_index.map { |aggregate, index| spill_finalize(aggregate, state[index + 1], nil, index) }
+      end
+      if groups
+        key_rows.each { |key| output.push(finalize.call(key, groups.get(key).last)) }
+        key_rows.close
+        groups.close
+      else
+        values = entries.map { |key, state| finalize.call(key, state) }
+        resident.release
+        values.each { |row| output.push(row) }
+      end
+      [output, [key_expression]]
+    end
 
     # A plain whole-table fold needs no retained input rows. Keep budgeted and
     # profiled statements on the ordinary lane: their admission/abort schedule
@@ -312,7 +431,8 @@ module JedNative
             visit.call(node[:filter])
           elsif %i[column star].include?(node[:kind])
             scope.each_with_index do |column, index|
-              touched[index] = true if (!node[:table] || column[:table] == node[:table]) && (node[:kind] == :star || column[:name] == node[:name])
+              whole_row = !node[:table] && column[:table] == node[:name] && scope.none? { |candidate| candidate[:name] == node[:name] }
+              touched[index] = true if whole_row || (!node[:table] || column[:table] == node[:table]) && (node[:kind] == :star || column[:name] == node[:name])
             end
           else
             node.each_value { |child| visit.call(child) }
@@ -409,9 +529,9 @@ module JedNative
         node = order[:expr]
         expression = if node[:kind] == :literal && node[:value].is_a?(Integer)
           raise Error.new('42P10', 'ORDER BY position out of range') unless node[:value].between?(1, expressions.length)
-          expressions[node[:value] - 1]
+          compile(Marshal.load(Marshal.dump(statement[:columns][node[:value] - 1][:expr])), scope)
         elsif node[:kind] == :column && !node[:table] && (index = columns.index { |column| column[:name] == node[:name] })
-          expressions[index]
+          compile(Marshal.load(Marshal.dump(statement[:columns][index][:expr])), scope)
         else
           compile(node, scope)
         end
@@ -620,7 +740,7 @@ module JedNative
         end
         source = unless name.start_with?('jsonb')
           type = expression.args.first.type
-          composite = type.end_with?('[]') || @types.key?(type)
+          composite = type == 'record' || type.end_with?('[]') || @types.key?(type)
           '[' + fragments.each_with_index.map { |fragment, index| (index.zero? ? '' : composite && !values[index].nil? ? ", \n " : ', ') + fragment }.join + ']'
         end
         JsonValue.new(values, binary: name.start_with?('jsonb'), source: source)

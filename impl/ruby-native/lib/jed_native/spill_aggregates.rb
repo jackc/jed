@@ -250,7 +250,7 @@ module JedNative
         end
         name == 'percentile_disc' ? lower : aggregate_percentile(name, position - position.floor, [lower, upper])
       end
-      fraction.is_a?(Array) ? ArrayValue.new(values, element_type: expression.type.delete_suffix('[]'), lower_bound: fraction.respond_to?(:lower_bound) ? fraction.lower_bound : 1) : values.first
+      fraction.is_a?(Array) ? ArrayValue.new(values, element_type: expression.type.delete_suffix('[]'), dimensions: fraction.respond_to?(:dimensions) ? fraction.dimensions : nil, lower_bounds: fraction.respond_to?(:lower_bounds) ? fraction.lower_bounds : nil) : values.first
     ensure
       sorter&.close
       sorted&.close

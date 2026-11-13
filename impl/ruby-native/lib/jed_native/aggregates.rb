@@ -71,6 +71,7 @@ module JedNative
       slots = nodes.filter_map { |node| compile(node, columns).value if node[:kind] == :column }
       sources = (statement[:from] || []) + (statement[:joins] || []).map { |join| join[:relation] }
       sources.each do |source|
+        next if nodes.any? { |node| %i[rollup cube grouping_sets].include?(node[:kind]) }
         next unless source[:kind] == :table && !@ctes.key?(source[:name]) && (stored = @tables[source[:name]])
         primary = stored[:constraints].find { |constraint| constraint[:kind] == :primary_key }
         next unless primary && !primary[:columns].empty?
@@ -91,7 +92,7 @@ module JedNative
       [statement[:where], *(statement[:joins] || []).map { |join| join[:on] }].each do |value|
         raise Error.new('42803', 'aggregates are not allowed in this clause') if local_aggregate?(value)
       end
-      projections = statement[:columns] || []
+      projections = expand_stars(statement[:columns] || [], columns)
       aliases = projections.to_h { |item| [item[:alias] || expression_name(item[:expr]), item[:expr]] }
       if statement[:distinct] && !statement[:distinct_on]
         (statement[:order_by] || []).each do |order|
@@ -111,6 +112,7 @@ module JedNative
       sources = (statement[:from] || []) + (statement[:joins] || []).map { |join| join[:relation] }
       sources.each do |source|
         next unless source[:kind] == :table && @tables.key?(source[:name])
+        next if nodes.any? { |node| %i[rollup cube grouping_sets].include?(node[:kind]) }
         key = @tables[source[:name]][:constraints].find { |constraint| constraint[:kind] == :primary_key }
         next unless key
         label = source[:alias] || source[:name]
@@ -121,7 +123,14 @@ module JedNative
         if value.is_a?(Array)
           value.each { |child| validator.call(child) }
         elsif value.is_a?(Hash)
-          next if %i[subquery exists array_query].include?(value[:kind])
+          if %i[subquery exists array_query].include?(value[:kind])
+            metadata = query_metadata(value[:query], columns)
+            metadata[:external_columns].each do |column|
+              slot = columns.index { |candidate| candidate[:table] == column[:table] && candidate[:name] == column[:name] }
+              raise Error.new('42803', 'subquery uses an ungrouped outer column') unless slot.nil? || allowed.include?(slot)
+            end
+            next
+          end
           next if keys.include?(value)
           if value[:kind] == :call && value[:name] == 'grouping'
             raise Error.new('42803', 'GROUPING arguments must be grouping expressions') unless value[:args].all? { |arg| keys.include?(arg) }
@@ -132,13 +141,15 @@ module JedNative
             next
           end
           if value[:kind] == :column
-            slot = compile(value, columns).value
-            raise Error.new('42803', "column #{value[:name]} must appear in GROUP BY") unless allowed.include?(slot)
+            expression = compile(value, columns)
+            next if expression.kind == :outer
+            slots = expression.kind == :row ? expression.args.map(&:value) : [expression.value]
+            raise Error.new('42803', "column #{value[:name]} must appear in GROUP BY") unless slots.all? { |slot| allowed.include?(slot) }
           end
           value.each { |key, child| validator.call(child) unless %i[query with].include?(key) }
         end
       end
-      validator.call(statement[:columns])
+      validator.call(projections)
       validator.call(statement[:having])
       validator.call(statement[:windows])
       (statement[:order_by] || []).each do |order|
@@ -171,6 +182,19 @@ module JedNative
       empty_key = [].freeze
       having = compile_filter(statement[:having], relation.columns)
       materialized = projection_aggregates([statement[:columns], statement[:having], statement[:order_by]]).map { |node| compile(node, relation.columns) }
+      # An ORDER BY ordinal or alias resolves its select expression afresh. Its
+      # aggregate occurrences have independent accumulator slots, as explicit
+      # aggregate sort expressions do.
+      (statement[:order_by] || []).each do |order|
+        key = order[:expr]
+        projection = if key[:kind] == :literal && key[:value].is_a?(Integer)
+          statement[:columns][key[:value] - 1]
+        elsif key[:kind] == :column && !key[:table]
+          statement[:columns].find { |item| (item[:alias] || expression_name(item[:expr])) == key[:name] }
+        end
+        next unless projection
+        projection_aggregates(projection[:expr]).each { |node| materialized << compile(node.dup, relation.columns) }
+      end
       contexts = []
       if @query_memory
         rows_owner = query_memory_owner
@@ -308,13 +332,13 @@ module JedNative
       raise Error.new('42883', "#{name} requires WITHIN GROUP") if ORDERED.include?(name)
       return super unless is_aggregate && !HYPOTHETICAL.include?(name)
       args = node[:args] || []
-      raise Error.new('42803', 'aggregate FILTER cannot contain aggregate functions') if contains_aggregate?(node[:filter])
+      raise Error.new('42803', 'aggregate FILTER cannot contain aggregate functions') if local_aggregate?(node[:filter])
       wanted = PAIRS.include?(name) || name == 'string_agg' || name.include?('object_agg') ? 2 : 1
       raise Error.new('42883', "incorrect arguments for #{name}") unless args.length == wanted
       if args.any? { |arg| arg[:kind] == :star } && name != 'count'
         raise Error.new('42883', "#{name} does not accept *")
       end
-      if !node[:over] && args.any? { |arg| contains_aggregate?(arg) }
+      if !node[:over] && args.any? { |arg| local_aggregate?(arg) }
         raise Error.new('42803', 'aggregate function calls cannot be nested')
       end
       expression = super
@@ -364,6 +388,11 @@ module JedNative
         end)
       end
       expression.extra = expression.extra.merge(aggregate_cache_id: node.object_id) unless node[:over]
+      unless node[:over]
+        inputs = expression.args + [expression.extra[:filter_expr]] + (expression.extra[:aggregate_order] || []).map(&:first)
+        references = expression_nodes(inputs).select { |part| %i[column outer].include?(part.kind) }
+        raise Error.new('42803', 'outer-level aggregates are not supported') if references.any? { |part| part.kind == :outer } && references.none? { |part| part.kind == :column }
+      end
       expression
     end
 
@@ -482,7 +511,7 @@ module JedNative
       argument_kernel = native_compiled_aggregate_arguments(expression)
       group.each_with_index do |row, ordinal|
         next if filter && evaluate(filter, row) != true
-        charge
+        charge unless extra[:window_fold_charged]
         values = argument_kernel ? argument_kernel.call(self, row, @params) : expression.args.map { |arg| arg.kind == :star ? 1 : evaluate(arg, row) }
         charge if extra_charge
         if ordered
@@ -621,7 +650,7 @@ module JedNative
       if fraction.is_a?(Array)
         return nil if values.empty?
         items = fraction.map { |value| aggregate_percentile(name, value, values) }
-        return ArrayValue.new(items, element_type: expression.type.delete_suffix('[]'), lower_bound: fraction.respond_to?(:lower_bound) ? fraction.lower_bound : 1)
+        return ArrayValue.new(items, element_type: expression.type.delete_suffix('[]'), dimensions: fraction.respond_to?(:dimensions) ? fraction.dimensions : nil, lower_bounds: fraction.respond_to?(:lower_bounds) ? fraction.lower_bounds : nil)
       end
       aggregate_percentile(name, fraction, values)
     end

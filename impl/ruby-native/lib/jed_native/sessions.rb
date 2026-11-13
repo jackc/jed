@@ -243,6 +243,12 @@ module JedNative
         destination.instance_variable_set(:@dirty, false)
         child.instance_variable_set(:@captured_generation, @publication_generation)
         @pins[child.object_id] = [@logical_version, shared_file_txid] if pin
+        versions = (@domain_versions || {}).dup
+        versions['main'] = @engine.instance_variable_get(:@storage) ? shared_file_txid : @logical_version
+        destination.instance_variable_get(:@attachments).each do |name, attachment|
+          versions[name] = attachment[:storage].meta[:txid] if attachment[:storage]
+        end
+        child.instance_variable_set(:@serialization_versions, versions)
         @sessions[child.object_id] = child
         @engine.instance_variable_get(:@storage)&.reader_watermark_provider = @shared_reader_watermark_provider
         destination.storage_reuse_allowed_provider = @shared_storage_reuse_provider
@@ -269,6 +275,11 @@ module JedNative
     def shared_publish(child)
       @shared_mutex.synchronize do
         before = @main_publication_tag
+        @domain_versions ||= {}
+        child.engine.instance_variable_get(:@memory_domains).each do |name, domain|
+          next if name == 'main' || name == 'temp'
+          @domain_versions[name] = domain.version
+        end
         CATALOGS.each do |name|
           values = child.engine.instance_variable_get(name)
           values = values.reject { |_, value| value.is_a?(Hash) && value[:temporary] }
@@ -278,7 +289,10 @@ module JedNative
         @engine.instance_variable_set(:@memory_domains, child.engine.instance_variable_get(:@memory_domains).reject { |name, _| name == 'temp' })
         @engine.instance_variable_set(:@attachments, child.engine.instance_variable_get(:@attachments).transform_values(&:dup))
         current = shared_tag
-        @logical_version += 1 if before != current
+        if before != current
+          storage = @engine.instance_variable_get(:@storage)
+          @logical_version = storage ? storage.meta[:txid] : @logical_version + 1
+        end
         @main_publication_tag = current
         @publication_generation += 1
       end
@@ -304,6 +318,7 @@ module JedNative
       @shared_mutex.synchronize do
         raise Error.new('55006', 'attachment change while sessions are pinned') unless @pins.empty? && @writer.nil?
         result = super
+        @domain_versions&.delete(name)
         @publication_generation += 1
         result
       end
@@ -312,12 +327,16 @@ module JedNative
       @shared_mutex.synchronize do
         raise Error.new('55006', 'attachment is in use') unless @pins.empty? && @writer.nil?
         result = super
+        @domain_versions&.delete(name)
         @publication_generation += 1
         result
       end
     end
     def close
       return if @database_closed
+      @shared_mutex.synchronize do
+        raise Error.new('55006', 'database has an open write transaction') if @writer
+      end
       @sessions.values.dup.each(&:close)
       @shared_mutex.synchronize do
         @database_closed = true
@@ -397,8 +416,14 @@ module JedNative
       query(writable.nil? ? 'BEGIN' : writable ? 'BEGIN READ WRITE' : 'BEGIN READ ONLY')
       self
     end
-    def commit = query('COMMIT')
-    def rollback = query('ROLLBACK')
+    def commit
+      raise Error.new('2D000', 'cannot end a transaction closure') if @transaction_closure
+      query('COMMIT')
+    end
+    def rollback
+      raise Error.new('2D000', 'cannot end a transaction closure') if @transaction_closure
+      query('ROLLBACK')
+    end
     def query(sql, *params)
       query_prepared(cached_statement(sql), *params)
     rescue Error
@@ -411,6 +436,10 @@ module JedNative
       @database.shared_open!
       ast, was_open = statement.ast, @engine.transaction_open?
       kind = ast[:kind]
+      if @transaction_closure && %i[commit rollback].include?(kind)
+        @engine.instance_variable_set(:@failed, true)
+        raise Error.new('2D000', 'cannot end a transaction closure')
+      end
       if @session_read_only && kind == :begin && !was_open
         raise Error.new('25006', 'read-only session') if ast[:mode] == :read_write
         ast = ast.merge(mode: :read_only, read_only: true)
@@ -489,10 +518,14 @@ module JedNative
     def transaction(writable = nil)
       self.begin(writable)
       owns = true
+      @transaction_closure = true
       result = yield self
+      @transaction_closure = false
+      raise Error.new('25P02', 'transaction closure returned with an aborted block') if @engine.instance_variable_get(:@failed)
       commit
       result
     rescue Exception
+      @transaction_closure = false if owns
       rollback if owns && @engine.transaction_open?
       raise
     end

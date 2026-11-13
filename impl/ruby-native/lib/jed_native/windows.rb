@@ -313,6 +313,10 @@ module JedNative
       if frame[:end][:kind] == :unbounded && frame[:end][:direction] == :preceding
         raise Error.new('42P20', 'frame cannot end with UNBOUNDED PRECEDING')
       end
+      rank = ->(bound) { bound[:kind] == :current_row ? 1 : (bound[:direction] == :preceding ? 0 : 2) }
+      if rank.call(frame[:start]) > rank.call(frame[:end])
+        raise Error.new('42P20', 'frame end cannot precede its start category')
+      end
       if frame[:mode] == :groups && order_exprs.empty?
         raise Error.new('42P20', 'GROUPS requires ORDER BY')
       end
@@ -362,23 +366,29 @@ module JedNative
       aggregate_rows = nil
       aggregate_expr = nil
       if Functions.aggregate?(name)
-        aggregate_rows = partition.map do |entry|
-          values = args.map { |arg| arg.kind == :star ? 1 : evaluate(arg, entry[:row], entry[:group]) }
-          moving = frame[:start][:kind] != :unbounded || frame[:exclude] && frame[:exclude] != :no_others || expression.extra[:filter_expr]
-          retaining = name.match?(/\A(?:array_agg|string_agg|jsonb?_agg|jsonb?_object_agg)/)
-          if @query_memory && (moving || retaining)
-            args.each_with_index do |arg, index|
-              query_memory_add(memory_owner, LogicalMemory.value_bytes(values[index], arg.type)) unless arg.kind == :star
+        aggregate_rows = Array.new(count)
+        values_at = lambda do |position|
+          aggregate_rows[position] ||= begin
+            entry = partition[position]
+            values = args.map { |arg| arg.kind == :star ? 1 : evaluate(arg, entry[:row], entry[:group]) }
+            moving = frame[:start][:kind] != :unbounded || frame[:exclude] && frame[:exclude] != :no_others || expression.extra[:filter_expr]
+            retaining = name.match?(/\A(?:array_agg|string_agg|jsonb?_agg|jsonb?_object_agg)/)
+            if @query_memory && (moving || retaining)
+              args.each_with_index do |arg, index|
+                query_memory_add(memory_owner, LogicalMemory.value_bytes(values[index], arg.type)) unless arg.kind == :star
+              end
             end
+            values
           end
-          values + [expression.extra[:filter_expr] ? evaluate(expression.extra[:filter_expr], entry[:row], entry[:group]) : true]
         end
         synthetic_args = args.each_with_index.map { |arg, index| Expression.new(kind: :column, type: arg.type, value: index) }
         aggregate_expr = Expression.new(kind: :call, type: expression.type, value: name, args: synthetic_args,
-                                       extra: expression.extra.merge(over: nil, filter_expr: Expression.new(kind: :column, type: 'boolean', value: args.length)))
+                                       extra: expression.extra.merge(over: nil, filter_expr: nil))
       end
       incremental = aggregate_expr && %w[count sum avg min max bool_and bool_or every].include?(name) &&
                     !expression.extra[:filter_expr] && (!frame[:exclude] || frame[:exclude] == :no_others)
+      previous_indices = nil
+      previous_result = nil
       accumulator = { count: 0, value: nil }
       previous_low = 0
       previous_high = 0
@@ -428,16 +438,30 @@ module JedNative
                       if name == 'count'
                         previous_low.upto([low, previous_high].min - 1) do |position|
                           charge
-                          accumulator[:count] -= 1 unless aggregate_rows[position][0].nil?
+                          accumulator[:count] -= 1 unless values_at.call(position)[0].nil?
                         end
                       end
                       [previous_high, low].max.upto(high - 1) do |position|
-                        window_accumulate(accumulator, aggregate_rows[position][0], name, expression.type)
+                        window_accumulate(accumulator, values_at.call(position)[0], name, expression.type)
                       end
                       previous_low, previous_high = low, high
                       window_accumulator_value(accumulator, name, expression.type)
                     else
-                      aggregate(aggregate_expr, indices.map { |position| aggregate_rows[position] })
+                      if expression.extra[:filter_expr]
+                        selected = indices.filter_map do |position|
+                          charge
+                          input = partition[position]
+                          next unless evaluate(expression.extra[:filter_expr], input[:row], input[:group]) == true
+                          values_at.call(position)
+                        end
+                        aggregate_expr.extra[:window_fold_charged] = true
+                        aggregate(aggregate_expr, selected)
+                      elsif (!frame[:exclude] || frame[:exclude] == :no_others) && indices == previous_indices
+                        previous_result
+                      else
+                        previous_indices = indices
+                        previous_result = aggregate(aggregate_expr, indices.map { |position| values_at.call(position) })
+                      end
                     end
                   end
                 end

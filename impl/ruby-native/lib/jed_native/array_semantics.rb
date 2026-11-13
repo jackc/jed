@@ -21,6 +21,10 @@ module JedNative
         end
       elsif node[:kind] == :quantified && node[:right][:kind] != :subquery
         left, right = compile(node[:left], columns), compile(node[:right], columns)
+        if right.kind == :literal && right.extra&.dig(:untyped) && right.value.is_a?(String) && !%w[null unknown record].include?(left.type)
+          right.type = left.type + '[]'
+          right.value = cast_value(right.value, right.type)
+        end
         raise Error.new('42P18', 'array type is indeterminate') if right.type == 'unknown'
         raise Error.new('42809', 'ANY/ALL requires an array operand') unless right.type.end_with?('[]')
         element = Expression.new(kind: :element, type: right.type.delete_suffix('[]'))
@@ -44,6 +48,13 @@ module JedNative
     end
 
     def contextual_binary(operator, left, right)
+      [[left, right], [right, left]].each do |value, sibling|
+        if value.kind == :literal && value.extra&.dig(:untyped) && value.value.is_a?(String) &&
+            (sibling.type.end_with?('[]') || Types::RANGES.key?(sibling.type))
+          value.value = cast_value(value.value, sibling.type)
+          value.type = sibling.type
+        end
+      end
       if %w[|| @> <@ &&].include?(operator)
         [[left, right], [right, left]].each do |value, sibling|
           next unless sibling.type.end_with?('[]')

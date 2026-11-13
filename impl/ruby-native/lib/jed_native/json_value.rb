@@ -90,10 +90,7 @@ module JedNative
       when Integer, Decimal
         number = Decimal.parse(value)
         return 0 if number.zero?
-        digits = number.coefficient.abs.to_s
-        high = (digits.length - number.scale - 1).div(4)
-        low = (digits.length - digits.sub(/0+\z/, '').length - number.scale).div(4)
-        4 * (high - low + 1)
+        4 * ((number.coefficient.abs.to_s.length + 3) / 4)
       when Array then value.sum { |item| 32 + payload(item) }
       when Hash then value.sum { |key, item| key.bytesize + 32 + payload(item) }
       else 0
@@ -113,6 +110,11 @@ module JedNative
     end
     def <=>(other)
       return nil unless other.is_a?(JsonValue)
+      if @value.is_a?(Array) && @value.empty? && !other.value.is_a?(Array) && !other.value.is_a?(Hash)
+        return -1
+      elsif other.value.is_a?(Array) && other.value.empty? && !@value.is_a?(Array) && !@value.is_a?(Hash)
+        return 1
+      end
       self.class.compare_nodes(@value, other.value)
     end
     def self.node_rank(value)
@@ -189,6 +191,8 @@ module JedNative
         elsif node.is_a?(Array) && key.is_a?(Integer)
           return nil unless key >= -node.length && key < node.length
           node = node[key]
+        elsif !node.is_a?(Hash) && !node.is_a?(Array) && key.is_a?(Integer) && [0, -1].include?(key)
+          node = @value
         else return nil
         end
       when '#>', '#>>'
@@ -210,7 +214,7 @@ module JedNative
       op.end_with?('>>') ? wrapped.text : wrapped
     end
     def eql?(other) = other.is_a?(JsonValue) && self == other
-    def hash = self.class.render(@value).hash
+    def hash = @value.hash
     def self.path_index(text)
       return nil unless text.is_a?(String) && /\A[ \t\r\n\v\f]*[+-]?\d+\z/.match?(text)
       number = text.to_i

@@ -10,11 +10,7 @@ module JedNative
         factor = Decimal.parse(right).to_r
         raise Error.new('22012', 'division by zero') if op == '/' && factor.zero?
         factor = 1 / factor if op == '/'
-        months = left.months * factor
-        days = left.days * factor + (months - months.to_i) * 30
-        micros = left.micros * factor + (days - days.to_i) * TimestampValue::DAY
-        micros = (micros.abs + Rational(1, 2)).floor * (micros.negative? ? -1 : 1)
-        return IntervalValue.new(months.to_i, days.to_i, micros)
+        return left * factor
       elsif right.is_a?(IntervalValue) && op == '*' && (left.is_a?(Integer) || left.is_a?(Decimal))
         return datetime_binary(op, right, left)
       end
@@ -38,6 +34,45 @@ module JedNative
   Types.singleton_class.prepend(DateTimeArithmeticTypes)
 
   module DateTimeArithmetic
+    def contextual_binary(operator, left, right)
+      if %w[+ -].include?(operator)
+        [[left, right, true], [right, left, false]].each do |literal, other, first|
+          next unless literal.kind == :literal && literal.extra&.dig(:untyped) && literal.value.is_a?(String)
+          next unless %w[timestamp timestamptz].include?(other.type)
+          target = operator == '+' ? 'interval' : other.type
+          literal.value = cast_value(literal.value, target)
+          literal.type = target
+        end
+      end
+      super
+    end
+
+    def shift_zoned_timestamp(left, right, sign = 1)
+      return left if left.micros.is_a?(Float)
+      instant = left.micros
+      [[:months, right.months], [:days, right.days]].each do |field, amount|
+        next if amount.zero?
+        charge
+        zone = resolve_timezone
+        wall = TimestampValue.new(zone.instant_to_local(instant))
+        step = IntervalValue.new(field == :months ? amount : 0, field == :days ? amount : 0, 0)
+        wall = Types.datetime_binary(sign == 1 ? '+' : '-', wall, step)
+        instant = zone.local_to_instant(wall.micros)
+      end
+      return TimestampValue.new(TimeZoneData.finite(instant + sign * right.micros), zoned: true)
+    end
+
+    def evaluate(expression, row, group = nil)
+      if expression.kind == :binary && %w[+ -].include?(expression.value) && expression.type == 'timestamptz' && expression.args.any? { |arg| arg.type == 'interval' }
+        charge
+        left, right = expression.args.map { |arg| evaluate(arg, row, group) }
+        return nil if left.nil? || right.nil?
+        left, right = right, left if left.is_a?(IntervalValue)
+        return shift_zoned_timestamp(left, right, expression.value == '-' ? -1 : 1)
+      end
+      super
+    end
+
     def binary_type(operator, left, right)
       numeric = %w[i16 i32 i64 decimal unknown null]
       return 'interval' if %w[+ -].include?(operator) && [left, right].include?('interval') && [left, right].any? { |type| %w[unknown null].include?(type) }

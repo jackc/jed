@@ -68,11 +68,11 @@ module JedNative
     end
 
     def self.fixed(name)
-      return Fixed.new(0) if name == 'UTC'
+      return Fixed.new(0) if name.casecmp?('UTC')
       match = /\A([+-])(\d{1,3})(?::(\d{1,2})(?::(\d{1,2}))?)?\z/.match(name)
       return nil unless match
       hours, minutes, seconds = match[2].to_i, match[3].to_i, match[4].to_i
-      return nil if hours > 167 || minutes > 59 || seconds > 59
+      return nil if hours > 167 || minutes > 59 || seconds > 60
       Fixed.new((hours * 3600 + minutes * 60 + seconds) * (match[1] == '+' ? -1 : 1))
     end
 

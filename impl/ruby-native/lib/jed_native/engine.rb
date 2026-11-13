@@ -37,10 +37,10 @@ module JedNative
       @cost, @scalar_bytes, @params = 0, 0, params
       @statement_clock, @uuid_counter = nil, 0
       @foreign_key_checks = {}
-      raise Error.new('25001', 'already in transaction') if statement[:kind] == :begin && @transaction
       if @failed && !%i[rollback rollback_to commit].include?(statement[:kind])
         raise Error.new('25P02', 'transaction is aborted')
       end
+      raise Error.new('25001', 'already in transaction') if statement[:kind] == :begin && @transaction
       before = snapshot
       previous_dirty = @dirty
       begin
@@ -188,7 +188,11 @@ module JedNative
     end
 
     def table_columns(table, name = table[:name])
-      table[:columns].each_with_index.map { |c, i| { name: c[:name], table: name, type: c[:type], source_ordinal: i } }
+      primary = table[:constraints]&.find { |constraint| constraint[:kind] == :primary_key }&.dig(:columns) || []
+      table[:columns].each_with_index.map do |column, i|
+        { name: column[:name], table: name, type: column[:type], source_ordinal: i,
+          whole_name: column[:name], whole_not_null: column[:nullable] == false || primary.include?(column[:name]) }
+      end
     end
 
     def create_table(stmt)
@@ -964,6 +968,9 @@ module JedNative
           columns.index { |column| column[:name] == node[:name] }
         end
         slot ||= projections.index { |projection| projection[:expr] == node }
+        if slot && %i[row array].include?(projections[slot][:expr][:kind])
+          next [nil, compile(projections[slot][:expr], input_columns)]
+        end
         [slot, slot ? nil : compile(node, input_columns)]
       end
     end

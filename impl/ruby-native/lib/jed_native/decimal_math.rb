@@ -147,7 +147,9 @@ module JedNative
         return n.negative? ? Decimal.new(1).divide(result, scale) : result.round(scale)
       end
       return Decimal.new(0, 16) if base.zero?
-      raise Error.new('2201F', 'negative number raised to a non-integer power is undefined') if base.negative?
+      negative = base.negative?
+      raise Error.new('2201F', 'negative number raised to a non-integer power is undefined') if negative && integer != exponent
+      base = base.abs
       ln_w = ln_weight(base, context)
       local = [8 - ln_w, 0].max
       logarithm = ln_value(base, local, context)
@@ -158,7 +160,8 @@ module JedNative
       scale = scale_for(estimate.truncate, base, exponent)
       local = [[scale + estimate.truncate, 0].max - ln_w + 8, 0].max
       exponent_value = mul(ln_value(base, local, context), exponent, local)
-      exp_value(exponent_value, scale, context)
+      result = exp_value(exponent_value, scale, context)
+      negative && integer.coefficient.odd? ? -result : result
     end
     def call(name, args, context: nil)
       values = args.map { |v| Decimal.parse(v) }

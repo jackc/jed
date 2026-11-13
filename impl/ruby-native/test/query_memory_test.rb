@@ -22,14 +22,14 @@ module NativeQueryMemoryTests
       db.query('CREATE TABLE c (id i32 PRIMARY KEY, p i32 REFERENCES p(id) ON UPDATE CASCADE)')
       db.query('INSERT INTO p VALUES (1)')
       db.query('INSERT INTO c VALUES (1, 1)')
-      rejected(db, 19, 'UPDATE p SET id = 2')
-      db.max_query_memory_bytes = 20
+      rejected(db, 11, 'UPDATE p SET id = 2')
+      db.max_query_memory_bytes = 12
       db.query('UPDATE p SET id = 2')
       db.max_query_memory_bytes = 0
       raise 'cascade did not preserve rollback and retry' unless db.query('SELECT p FROM c').rows == [[2]]
 
-      rejected(db, 11, 'ALTER TABLE p ADD COLUMN x i32 DEFAULT 4')
-      db.max_query_memory_bytes = 12
+      rejected(db, 7, 'ALTER TABLE p ADD COLUMN x i32 DEFAULT 4')
+      db.max_query_memory_bytes = 8
       db.query('ALTER TABLE p ADD COLUMN x i32 DEFAULT 4')
       rejected(db, 8, 'CREATE INDEX c_p ON c (p)')
       db.max_query_memory_bytes = 9

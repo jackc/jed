@@ -203,7 +203,7 @@ module JedNative
       case node
       when Array then node.any? { |child| target_columns_read?(child, aliases) }
       when Hash
-        return false if %i[select values setop set_operation subquery exists array_query].include?(node[:kind])
+        return true if %i[select values setop set_operation subquery exists array_query].include?(node[:kind])
         return !node[:table] || aliases.include?(node[:table]) if %i[column star].include?(node[:kind])
         node.any? { |_, child| target_columns_read?(child, aliases) }
       else false

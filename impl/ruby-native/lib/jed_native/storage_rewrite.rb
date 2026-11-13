@@ -107,18 +107,18 @@ module JedNative
     end
 
     def rewrite_leaf(payload, count, columns, pool)
-      @codec.parse_pax_leaf(payload, count, columns)
-      key_bytes = count.zero? ? 0 : payload.byteslice(4 * (count - 1), 4).unpack1('N')
-      directory = 4 * count + key_bytes
-      starts = payload.byteslice(directory, 4 * (columns.length + 1)).unpack('N*')
+      _, _, layout = @codec.parse_pax_leaf(payload, count, columns)
+      directory = layout[:col_dir]
+      starts = payload.byteslice(directory, 2 * (columns.length + 1)).unpack('n*')
       count.times do |row|
         columns.each_with_index do |column, index|
-          next if @codec.fixed_width(column[:type])
+          next if @codec.fixed_width(column)
           start = starts[index]
-          previous = row.zero? ? 0 : payload.byteslice(start + 1 + 4 * (row - 1), 4).unpack1('N')
-          finish = payload.byteslice(start + 1 + 4 * row, 4).unpack1('N')
+          next unless payload.getbyte(start) == FileFormat::REGION_PLAIN
+          previous = row.zero? ? 0 : payload.byteslice(start + 1 + 2 * (row - 1), 2).unpack1('n')
+          finish = payload.byteslice(start + 1 + 2 * row, 2).unpack1('n')
           next if previous == finish
-          offset = start + 1 + 4 * count + previous
+          offset = start + 1 + 2 * count + previous
           tag = payload.getbyte(offset)
           next unless [FileFormat::TAG_EXTERNAL, FileFormat::TAG_EXTERNAL_COMP].include?(tag)
           @source_codec.note_external(payload.byteslice(offset, finish - previous))

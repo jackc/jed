@@ -197,7 +197,17 @@ module JedNative
 
     def tuple_estimator_disjuncts(source, key)
       if source.kind == :binary && source.value == 'or'
-        return source.args.flat_map { |part| tuple_estimator_disjuncts(part, key) }
+        pending = [source]
+        result = []
+        until pending.empty?
+          part = pending.pop
+          if part.kind == :binary && part.value == 'or'
+            pending.concat(part.args.reverse)
+          else
+            result.concat(tuple_estimator_disjuncts(part, key))
+          end
+        end
+        return result
       end
       if source.kind == :binary && source.value == 'and'
         left, right = source.args.map { |part| tuple_estimator_disjuncts(part, key) }

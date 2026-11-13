@@ -237,6 +237,7 @@ module JedNative
     end
 
     def compile_json_table_columns(nodes)
+      raise Error.new('42601', 'only one ordinality column is allowed per level') if nodes.count { |n| n[:kind] == :ordinality } > 1
       nodes.map do |node|
         case node[:kind]
         when :nested
@@ -301,7 +302,7 @@ module JedNative
       node = source[:expr] || source
       return super unless node[:kind] == :json_table
       columns = json_table_columns(node[:columns])
-      raise Error.new('42701', 'duplicate JSON_TABLE column') unless columns.map { |column| column[:name] }.uniq.length == columns.length
+      raise Error.new('42712', 'duplicate JSON_TABLE column') unless columns.map { |column| column[:name] }.uniq.length == columns.length
       tree = compile_json_table_columns(node[:columns])
       passing = compile_json_passing(node[:passing], [])
       context = compile(node[:context], [])

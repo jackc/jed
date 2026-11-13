@@ -10,13 +10,13 @@ require_relative "stored_value"
 require_relative "crypto"
 
 module JedNative
-  # Experimental v49 codec. Adapted from the independently handwritten Ruby
+  # Experimental v52 codec. Adapted from the independently handwritten Ruby
   # format verifier; the verifier remains separate and is never loaded here.
   # Instances hold their own composite catalog and decode reachability state.
   class FileFormat
     include PersistentTrees
     MAGIC = "JEDB".b
-    VERSION = 50
+    VERSION = 52
     PAGE_HEADER = 16 # v7: the 12-byte v6 header (page_type/item_count/next_page) + a 4-byte per-page crc32 at offset 12
     ROOT_PAGE = 2  # the catalog root of a *fresh empty* db; relocatable thereafter (meta.root_page)
     TXID = 1
@@ -27,7 +27,7 @@ module JedNative
     PAGE_GIST_LEAF = 5     # v20: a GiST R-tree leaf (spec/design/gist.md §4.1)
     PAGE_GIST_INTERIOR = 6 # v20: a GiST R-tree interior (one bound per child, not N separators / N+1 children)
     GIST_FANOUT = 4 # v20: max entries per GiST node; the (N+1)-th triggers a median picksplit (gist.md §4.1)
-    
+
     # Value-codec presence tags beyond 0x00 present-inline-plain / 0x01 NULL (large-values.md §12/§13;
     # format.md "Large values"): 0x02 external-plain (u32 first_page + u32 payload_len), 0x03
     # inline-compressed (u32 raw_len + u16 comp_len + LZ4 block), 0x04 external-compressed
@@ -40,19 +40,19 @@ module JedNative
     INLINE_COMP_OVERHEAD = 1 + 4 + 2 # + comp_len bytes
     EXTERNAL_COMP_PTR_LEN = 1 + 4 + 4 + 4
     S_COMPRESS = 32 # payloads below this are never fed to the encoder (large-values.md §13)
-    
-    
+
+
     WIDTH = { "i16" => 2, "i32" => 4, "i64" => 8, "timestamp" => 8, "timestamptz" => 8,
               "date" => 4 }.freeze
     TYPECODE = { "i16" => 1, "i32" => 2, "i64" => 3, "text" => 4, "boolean" => 5, "decimal" => 6,
                  "bytea" => 7, "uuid" => 8, "timestamp" => 9, "timestamptz" => 10, "interval" => 11,
                  "f64" => 12, "f32" => 13, "date" => 16, "json" => 18, "jsonb" => 19 }.freeze
     CODETYPE = TYPECODE.invert.freeze
-    
+
     # An array (T[]) column type is the element type's string with a trailing "[]" (spec/design/array.md
     # §2 — structural, no catalog object). `array_elem("i32[]")` => "i32"; nil for a non-array type.
     def array_elem(type) = type.is_a?(String) && type.end_with?("[]") ? type[0...-2] : nil
-    
+
     # The six built-in range types map to their element (subtype) string (spec/design/ranges.md §1 —
     # structural, no catalog object). `range_elem("i32range")` => "i32"; nil for a non-range type. The
     # jed canonical names are used (`int4range`/`int8range` are parser-only aliases, never stored).
@@ -60,32 +60,32 @@ module JedNative
                    "tsrange" => "timestamp", "tstzrange" => "timestamptz",
                    "daterange" => "date" }.freeze
     def range_elem(type) = type.is_a?(String) ? RANGE_ELEM[type] : nil
-    
+
     # uuid-raw16 (encoding.md §2.7): the 16 raw bytes of the canonical 8-4-4-4-12 form. Used both
     # as the value-codec body (fixed 16 bytes, no length prefix) and as the PRIMARY-KEY bytes
     # (uuid is the first non-integer key — no sign-flip, escape, or terminator).
     def uuid_to_bytes(s) = [s.delete("-")].pack("H*")
-    
+
     def uuid_from_bytes(bytes)
       h = bytes.unpack1("H*")
       "#{h[0, 8]}-#{h[8, 4]}-#{h[12, 4]}-#{h[16, 4]}-#{h[20, 12]}"
     end
-    
+
     def col(name, type, pk: false, not_null: nil, precision: nil, scale: nil, varchar_len: nil,
             default: :none, default_expr: nil, identity: nil, collation: nil, temporal: nil)
       { name: name, type: type, pk: pk, not_null: not_null.nil? ? pk : not_null,
         precision: precision, scale: scale, varchar_len: varchar_len, default: default,
         default_expr: default_expr, identity: identity, collation: collation, temporal: temporal }
     end
-    
+
     # A timestamp / interval typmod (v43, spec/design/timestamp.md §8, interval.md §6.1): `fields` is the
     # interval qualifier code (spec/types/datetime_units.toml, 0 = none — always 0 for a timestamp) and
     # `precision` 0..6 or nil.
     def temporal(fields: 0, precision: nil) = { fields: fields, precision: precision }
-    
+
     TEMPORAL_TYPES = %w[timestamp timestamptz interval].freeze
     NO_TEMPORAL_PRECISION = 0xFF
-    
+
     # The v43 temporal typmod slot of a timestamp/timestamptz (u8 precision) or interval (u8 fields ‖ u8
     # precision) column or field; empty for every other type.
     def temporal_typmod_bytes(type, tm)
@@ -96,12 +96,12 @@ module JedNative
       else "".b
       end
     end
-    
+
     # Decode the slot temporal_typmod_bytes writes (nil = no typmod); an out-of-range precision or an
     # unknown qualifier code is corrupt.
     def decode_temporal_typmod(type, buf, pos)
       return [nil, pos] unless TEMPORAL_TYPES.include?(type)
-    
+
       fields = 0
       if type == "interval"
         fb, pos = take(buf, pos, 1)
@@ -111,17 +111,17 @@ module JedNative
       pb, pos = take(buf, pos, 1)
       prec = pb.getbyte(0)
       raise "invalid temporal precision #{prec}" unless prec == NO_TEMPORAL_PRECISION || prec <= 6
-    
+
       precision = prec == NO_TEMPORAL_PRECISION ? nil : prec
       return [nil, pos] if fields.zero? && precision.nil?
 
       [temporal(fields: fields, precision: precision), pos]
     end
-    
+
     def valid_page_size?(size)
       size.is_a?(Integer) && size.between?(256, 65_536) && (size & (size - 1)).zero?
     end
-    
+
     def build_image(types, sequences, tables, page_size, collations = [], **options)
       build_pages(types, sequences, tables, page_size, collations, **options).to_s
     end
@@ -133,7 +133,7 @@ module JedNative
     end
     def u32(v) = [v].pack("N")
     def u64(v) = [v].pack("Q>")
-    
+
     CRC64_TABLE = Array.new(256) do |byte|
       value = byte << 56
       8.times do
@@ -149,18 +149,18 @@ module JedNative
     # The shared format uses standard zlib CRC-32/IEEE. The optional finalized
     # state continues a previous span, including across the skipped checksum field.
     def crc32(data, crc = 0) = Zlib.crc32(data, crc)
-    
+
     # The per-page checksum (v7, format.md *Page header*): CRC-32/IEEE over a body page's bytes
     # EXCLUDING its own 4-byte crc32 field at [12,16) — i.e. [0,12) then [16,ps).
     # Continue the first span's finalized CRC to avoid allocating their concatenation.
     def page_crc(page)
       crc32(page.byteslice(PAGE_HEADER, page.bytesize - PAGE_HEADER), crc32(page.byteslice(0, 12)))
     end
-    
+
     def meta_crc(page)
       crc32(page.byteslice(36, page.bytesize - 36), crc32(page.byteslice(0, 32)))
     end
-    
+
     # CRC-64/ECMA-182: unreflected, init = xorout = 0. A supplied initial state
     # continues a manifest-chain digest without constructing a combined buffer.
     def crc64(data, crc = 0)
@@ -175,7 +175,7 @@ module JedNative
       end
       (high << 32) | low
     end
-    
+
     # int-be-signflip: add bias 2^(bits-1), emit unsigned big-endian (encoding.md).
     INTEGER_PACK = { 2 => 'n', 4 => 'N', 8 => 'Q>' }.freeze
     INTEGER_BIAS = { 2 => 1 << 15, 4 => 1 << 31, 8 => 1 << 63 }.freeze
@@ -187,14 +187,14 @@ module JedNative
       u = value + bias
       Array.new(width) { |i| (u >> (8 * (width - 1 - i))) & 0xFF }.pack("C*")
     end
-    
+
     def decode_int(width, bytes)
       if (format = INTEGER_PACK[width]) && bytes.bytesize == width
         return bytes.unpack1(format) - INTEGER_BIAS.fetch(width)
       end
       bytes.bytes.reduce(0) { |acc, b| (acc << 8) | b } - (1 << (width * 8 - 1))
     end
-    
+
     # text-terminated-escape / bytea-terminated-escape (encoding.md §2.4/§2.6): escape every 0x00 to
     # 0x00 0xFF, terminate with 0x00 0x01 — variable-width and self-delimiting. `content` is the value's
     # raw bytes (UTF-8 for text, raw for bytea).
@@ -207,7 +207,7 @@ module JedNative
       out << 0x00 << 0x01
       out
     end
-    
+
     # The BARE order-preserving KEY body for a decimal (decimal-order-preserving, encoding.md §2.5):
     # class byte (03 neg / 04 zero / 05 pos), the 4-byte int-be-signflip exponent E, the base-100
     # mantissa pairs (pair+1 ∈ [01,64]), and a 00 terminator; negatives complement E+mantissa+
@@ -215,7 +215,7 @@ module JedNative
     def encode_decimal_key(s)
       d = parse_decimal(s)
       return "\x04".b if d[:coeff].zero? # zero is the single class byte
-    
+
       digits = d[:coeff].to_s             # significant digits (leading zeros already stripped)
       decpt = digits.length - d[:scale]   # value = 0.<digits> × 10^decpt
       digits = digits.sub(/0+\z/, "")     # drop trailing zero digits (decpt unchanged)
@@ -228,7 +228,7 @@ module JedNative
       body << 0x00
       d[:neg] ? "\x03".b + body.bytes.map { |b| b ^ 0xFF }.pack("C*") : "\x05".b + body
     end
-    
+
     # The BARE order-preserving KEY body for an interval (interval-span-i128, encoding.md §2.10): the
     # 16-byte canonical span (span = (months·30 + days)·86_400_000_000 + micros), int-be-signflip at
     # i128 width. `v` is the [months, days, micros] triple. Span-equal intervals coincide.
@@ -237,7 +237,7 @@ module JedNative
       span = (m * 30 + d) * 86_400_000_000 + us
       encode_int(16, span)
     end
-    
+
     # The BARE order-preserving KEY body for a range value (range-bounds, encoding.md §2.11) — the first
     # container key. empty = 0x00 (the whole key); non-empty = 0x01 ‖ lower bound ‖ upper bound. Each
     # bound is an infinity marker (−∞ 0x00 lower / +∞ 0x02 upper) or 0x01 ‖ the element's key_body ‖ an
@@ -245,14 +245,14 @@ module JedNative
     # `elem_type` names the element subtype (recursing into its key_body).
     def encode_range_key(elem_type, val)
       return "\x00".b if val == :empty || (val.is_a?(Hash) && val[:empty])
-    
+
       out = +"".b
       out << 0x01
       encode_range_key_bound(out, elem_type, val, :lower, true)
       encode_range_key_bound(out, elem_type, val, :upper, false)
       out
     end
-    
+
     def encode_range_key_bound(out, elem_type, val, side, is_lower)
       v = val[side]
       if v.nil?
@@ -264,7 +264,7 @@ module JedNative
       inc = val[is_lower ? :lower_inc : :upper_inc]
       out << ((inc == is_lower) ? 0x00 : 0x01)
     end
-    
+
     # The BARE order-preserving KEY body for one present (non-NULL) value of `type` — no presence
     # tag (callers add it for nullable index slots; a PK member is NOT NULL). uuid is the 16 raw
     # bytes (uuid-raw16, §2.7), boolean a single bool-byte (0x00 false / 0x01 true, §2.9), text/bytea
@@ -278,7 +278,7 @@ module JedNative
       raise NotImplementedError, "non-C collation key provider is required" unless @collation_key
       @collation_key.call(coll_name, string)
     end
-    
+
     # The BARE order-preserving KEY body for one keyable value: uuid the raw 16 bytes, text/bytea
     # the variable-width …-terminated-escape body (§2.4/§2.6) — or, for a non-C collated text column,
     # the UCA sort key (text-collated-sortkey §2.12) — decimal the decimal-order-preserving
@@ -290,17 +290,17 @@ module JedNative
       if (relem = range_elem(type))
         return encode_range_key(relem, v)
       end
-    
+
       if (aelem = array_elem(type))
         return encode_array_key(aelem, v, collation)
       end
-    
+
       if (cfields = composite_fields(type))
         return encode_composite_key(cfields, v)
       end
-    
+
       return collated_sort_key(collation, v) if collation && type == "text"
-    
+
       case type
       when "uuid" then uuid_to_bytes(v)
       when "boolean" then (v ? "\x01".b : "\x00".b)
@@ -312,7 +312,7 @@ module JedNative
       else encode_int(WIDTH.fetch(type), v)
       end
     end
-    
+
     # float-order-preserving (encoding.md §2.8): canonicalize the Ruby Float (-0 → +0, every NaN → one
     # quiet pattern), take the IEEE bits as a big-endian unsigned integer, then if the sign bit is set
     # flip ALL bits else flip just the sign bit — mapping the float TOTAL order onto unsigned byte
@@ -330,7 +330,7 @@ module JedNative
         [bits].pack("N")
       end
     end
-    
+
     # value codec: presence tag + (when present) the type's body. 0x01 = NULL; 0x00 = present.
     # Integers reuse the order-preserving int bytes; text and bytea diverge to a compact u16
     # byte-length + bytes (text: UTF-8 collation-C bytes; bytea: raw bytes — byte-identical here,
@@ -447,28 +447,28 @@ module JedNative
         page_out(pages, ps, ids[index], PAGE_CATALOG, page[:count], page[:payload], ids[index + 1] || 0, page[:continued] ? 1 : 0)
       end
     end
-    
+
     # The field list of the composite type named `type` (case-insensitive), or nil for a scalar type.
     def composite_fields(type) = @ctypes[type.to_s]
-    
+
     def encode_value(type, v)
       return "\x01".b if v.nil?
-    
+
       if (elem = array_elem(type))
         # An array value (spec/design/array.md §4): present tag, then the compact body.
         return "\x00".b + encode_array_body(elem, v)
       end
-    
+
       if (relem = range_elem(type))
         # A range value (spec/design/ranges.md §4): present tag, then the flags byte + bound bodies.
         return "\x00".b + encode_range_body(relem, v)
       end
-    
+
       if (fields = composite_fields(type))
         # A composite value (spec/design/composite.md §4): present tag, then the recursive body.
         return "\x00".b + encode_composite_body(fields, v)
       end
-    
+
       case type
       when "text", "bytea", "json"
         # json stores the verbatim text body, length-prefixed exactly like text (spec/design/json.md §4).
@@ -497,7 +497,7 @@ module JedNative
         "\x00".b + encode_int(WIDTH.fetch(type), v)
       end
     end
-    
+
     # An array value's BODY (after the 0x00 present tag, spec/design/array.md §4):
     #   ndim u8 ‖ flags u8 ‖ per-dim (len u32 BE, lb i32 BE) ‖ [null bitmap if HAS_NULLS] ‖ element bodies
     # An empty array is ndim=0 (no dims/bitmap/elements); otherwise ndim is the dimension count and each
@@ -533,7 +533,7 @@ module JedNative
       elems.each { |e| out << encode_value(elem_type, e).byteslice(1..) unless e.nil? }
       out
     end
-    
+
     # The order-preserving array-elements-terminated KEY (encoding.md §2.14 — the second container key,
     # the first whose length varies with the element count): per flattened (row-major) element a marker
     # (0x01 present ‖ the element's bare key_body, 0x02 NULL), then a 0x00 terminator, then the shape
@@ -566,7 +566,7 @@ module JedNative
       dims.each_with_index { |d, i| out << u32(d) << encode_int(4, lbounds[i]) }
       out
     end
-    
+
     # The composite-field-slots key for a composite value (encoding.md §2.15, the third container key).
     # `fields` is the resolved field list ({name:, type:}), `vals` the per-field values (declaration
     # order). Each field rides the ordinary §2.2 nullable slot — `0x00` present ‖ the field's own
@@ -585,7 +585,7 @@ module JedNative
       end
       out
     end
-    
+
     # A range value's BODY (after the 0x00 present tag, spec/design/ranges.md §4):
     #   flags u8 ‖ [lower bound body if !EMPTY && !LB_INF] ‖ [upper bound body if !EMPTY && !UB_INF]
     # flags bits: 0 EMPTY, 1 LB_INF, 2 UB_INF, 3 LB_INC, 4 UB_INC (bits 5-7 reserved 0). An empty range
@@ -595,7 +595,7 @@ module JedNative
     # carries the post-canonicalization `[)` form for discrete subtypes — §4).
     def encode_range_body(elem_type, val)
       return "\x01".b if val == :empty || (val.is_a?(Hash) && val[:empty])
-    
+
       flags = 0
       flags |= 0x02 if val[:lower].nil? # LB_INF
       flags |= 0x04 if val[:upper].nil? # UB_INF
@@ -607,7 +607,7 @@ module JedNative
       out << encode_value(elem_type, val[:upper]).byteslice(1..) unless val[:upper].nil?
       out
     end
-    
+
     # An unsigned LEB128 varint (7 bits/byte, high bit = continuation) — the jsonb count/length codec
     # (spec/design/json.md §2.1).
     def write_uvarint(v)
@@ -622,7 +622,7 @@ module JedNative
         out << [byte | 0x80].pack("C")
       end
     end
-    
+
     # A jsonb value's BODY (after the 0x00 present tag, spec/design/json.md §2.1): a self-delimiting
     # depth-first tagged-node tree. The fixture node is a tagged Ruby form: [:null], [:bool, b],
     # [:num, "canonical-decimal-string"], [:str, s], [:arr, [node, …]], [:obj, [[key, node], …]]
@@ -655,7 +655,7 @@ module JedNative
         raise "bad jsonb node #{node.inspect}"
       end
     end
-    
+
     # An array column's ELEMENT-TYPE descriptor (spec/design/array.md §3): the element's type code,
     # then (for a composite element) its name. v1 elements are scalars. Mutates `out`.
     def push_array_element_type(out, elem_type)
@@ -665,7 +665,7 @@ module JedNative
         out << [TYPECODE.fetch(elem_type)].pack("C")
       end
     end
-    
+
     # Decode an array column's element-type descriptor (inverse of push_array_element_type) -> the
     # element type STRING and the new cursor.
     def read_array_element_type(buf, pos)
@@ -678,7 +678,7 @@ module JedNative
         [CODETYPE.fetch(code), pos]
       end
     end
-    
+
     # A composite value's BODY (after the 0x00 present tag, spec/design/composite.md §4): a null bitmap
     # of ceil(field_count/8) bytes (MSB-first — field i is bit 0x80>>(i%8) of byte i/8; a set bit =
     # NULL), then each PRESENT field's value-codec body (no per-field tag) in declaration order. A NULL
@@ -697,7 +697,7 @@ module JedNative
       end
       bitmap.pack("C*").b + bodies
     end
-    
+
     # Float value codec body (format.md code 12/13; spec/design/float.md §10): the IEEE bytes,
     # big-endian, fixed width, no length prefix. Stored VERBATIM for every value except NaN — a -0.0
     # keeps its sign bit (pack preserves it) and ±Inf/finite keep theirs — but a NaN is canonicalized
@@ -706,16 +706,16 @@ module JedNative
     # NOT applied here.
     def encode_float64(f)
       return [0x7FF8000000000000].pack("Q>") if f.nan?
-    
+
       [f].pack("G") # IEEE 754 double, big-endian
     end
-    
+
     def encode_float32(f)
       return [0x7FC00000].pack("N") if f.nan?
-    
+
       [f].pack("g") # IEEE 754 single, big-endian
     end
-    
+
     # Parse a decimal STRING ("[-]int[.frac]") into (neg, scale, coefficient). The coefficient is a
     # Ruby integer (arbitrary precision); scale is the fractional digit count. No negative zero.
     def parse_decimal(s)
@@ -726,18 +726,18 @@ module JedNative
       coeff = (int + frac).to_i # leading zeros are harmless to_i
       { neg: neg && coeff != 0, scale: frac.length, coeff: coeff }
     end
-    
+
     # Render (neg, scale, coefficient) to the canonical decimal string (spec/design/decimal.md §6).
     def render_decimal(neg, scale, coeff)
       digits = coeff.to_s # "0" for zero, no leading zeros
       sign = neg ? "-" : ""
       return sign + digits if scale.zero?
-    
+
       digits = digits.rjust(scale + 1, "0")
       point = digits.length - scale
       "#{sign}#{digits[0...point]}.#{digits[point..]}"
     end
-    
+
     # Decimal value codec body (format.md): flags (bit0 sign), u16 scale, u16 ndigits, then that
     # many big-endian base-10^4 coefficient groups, most-significant first. Zero carries no groups.
     def encode_decimal(s)
@@ -750,16 +750,20 @@ module JedNative
       end
       [d[:neg] ? 1 : 0].pack("C") + u16(d[:scale]) + u16(groups.size) + groups.map { |g| u16(g) }.join
     end
-    
+
     # --- encoding (reference serializer) ----------------------------------------
-    
+
     # The primary-key member ordinals in KEY order (v5): an explicit pk_order when the fixture
     # declares one (key order != declaration order), else the pk-flagged columns in declaration
     # order. [] = no PK (synthetic rowid keys).
     def pk_order(table)
-      table[:pk_order] || table[:columns].each_index.select { |i| table[:columns][i][:pk] }
+      table[:pk_order] || (table[:pk].is_a?(Array) ? table[:pk] : nil) || begin
+        names = table[:constraints]&.find { |c| c[:kind] == :primary_key }&.dig(:columns)
+        names ? names.map { |name| table[:columns].index { |c| c[:name] == name } } : table.key?(:constraints) ? [] :
+          table[:columns].each_index.select { |i| table[:columns][i][:pk] || table[:columns][i][:primary_key] }
+      end
     end
-    
+
     def table_entry_bytes(table, root_data_page, index_roots, row_count)
       out = +"".b
       out << length16(table[:name]) << table[:name].b
@@ -884,7 +888,7 @@ module JedNative
         has_key_options = orders.any? { |o| o != [false, false] }
         out << [(ix[:unique] ? 1 : 0) | (ix[:predicate] ? 2 : 0) | (host_deps.empty? ? 0 : 4) | (has_timezone_deps ? 8 : 0) |
                 (has_key_options ? 16 : 0) | (ix[:unique] && ix[:constraint] ? 32 : 0)].pack("C")
-    
+
         # v13: index_kind byte (0 = btree, 1 = GIN); v20: 2 = GiST (gist.md §8).
         out << [{ "gin" => 1, "gist" => 2 }.fetch(ix[:kind], 0)].pack("C")
         out << pointer(index_roots[k])
@@ -937,11 +941,11 @@ module JedNative
       out << pointer(root_data_page)
       raise "row_count must fit nonnegative i64" unless row_count.between?(0, (1 << 63) - 1)
       raise "root_data_page/row_count invariant violated" unless root_data_page.zero? == row_count.zero?
-    
+
       out << [row_count].pack("q>")
       out
     end
-    
+
     # Serialize one table's v29 kind-4 column-statistics groups. The caller already emits tables in name
     # order; columns are sorted here, and each group is summary, MCV ordinals, then histogram ordinals.
     def statistics_entries(table)
@@ -980,29 +984,29 @@ module JedNative
         out
       end
     end
-    
+
     # A table's statistics facts: written out, or (term_statistics_columns) derived from its rows.
     def table_statistics(table)
       table[:statistics] || (table[:term_statistics_columns] || []).map { |c| term_column_statistics(table, c) }
     end
-    
+
     # The GIN-admitted array element types (gin.md §3); with jsonb, the term-eligible column types.
     GIN_ELEMENT_TYPES = %w[i16 i32 i64 boolean uuid date timestamp timestamptz f32 f64 interval text bytea
                            decimal].freeze
     def term_eligible?(type) = type == "jsonb" || GIN_ELEMENT_TYPES.include?(array_elem(type))
-    
+
     # One value's GIN term set (gin.md §4): distinct terms in ascending byte order; NULL has none.
     def gin_value_terms(type, value)
       return [] if value.nil?
       return gin_jsonb_terms(value).map(&:b).uniq.sort if type == "jsonb"
-    
+
       elems = value.is_a?(Hash) ? value[:elements] : value
       elems.compact.map { |e| gin_element_term(array_elem(type), e).b }.uniq.sort
     end
-    
+
     TERM_BUCKET_WIDTH = 10_000
     TERM_ENTRIES = 100
-    
+
     # A column's GIN term facts (statistics.md §4.5), computed independently of the cores: lossy counting
     # over every row's term set, rows in storage-key order, bucket width 10,000; the 100 most common
     # terms by descending count then ascending bytes; the untracked-row bound.
@@ -1024,7 +1028,7 @@ module JedNative
             entries[term] = [1, bucket - 1]
           end
           next unless (occurrences % TERM_BUCKET_WIDTH).zero?
-    
+
           before = entries.size
           entries.reject! { |_, (count, delta)| count + delta <= bucket }
           pruned ||= entries.size != before
@@ -1037,7 +1041,7 @@ module JedNative
       untracked = [untracked, 1].max if oversized
       { occurrences: occurrences, untracked_rows: untracked, entries: ranked.first(TERM_ENTRIES) }
     end
-    
+
     # A term-eligible column's complete v42 statistics fact, derived from the rows (statistics.md §4):
     # every row is sampled (the fixture is under 30,000 rows), the width is the value-body length, and
     # array / jsonb columns are distribution-ineligible (no NDV, MCV, or histogram).
@@ -1050,7 +1054,7 @@ module JedNative
         sample_rows: values.size, sample_nonnull_rows: nonnull.size, mcv: [], histogram: [],
         terms: term_statistics(table, column) }
     end
-    
+
     # Serialize a composite-type catalog entry's BODY (after the entry_kind=1 byte), v9: name, field
     # count, then per field — name, type code, [type name when code 14 (nested composite), the element
     # descriptor when code 15 (array, v10) or 17 (range, v41)], flags
@@ -1084,7 +1088,7 @@ module JedNative
       end
       out
     end
-    
+
     # Serialize a sequence catalog entry's BODY (after the entry_kind=2 byte): name, then six fixed i64
     # fields (big-endian two's-complement, no sign-flip — `q>`) and a flags byte (bit0 cycle, bit1
     # is_called, bit2 has_owner — v13). When has_owner, the flags byte is followed by the owner reference
@@ -1110,7 +1114,7 @@ module JedNative
       end
       out
     end
-    
+
     # Serialize a view catalog entry's BODY (after the entry_kind=5 byte, v38 — format.md *View entry*):
     # the name; the output columns, each its name then (v48) a flags byte (bit0 has_default) and, when
     # set, the default's text (u32 length + canonical text); the definition (u32 length + canonical token
@@ -1145,7 +1149,7 @@ module JedNative
       out << [(v[:security_barrier] ? 1 : 0) | (v[:security_invoker] ? 2 : 0)].pack("C")
       out.b
     end
-    
+
     # Decode a view catalog entry's body (inverse of view_entry_bytes); the caller consumed the
     # entry_kind byte.
     def decode_view_entry(buf, pos)
@@ -1174,7 +1178,7 @@ module JedNative
         kb, pos = take(buf, pos, 1)
         kind = kb.getbyte(0)
         raise "unknown view dependency kind" unless [0, 1, 2, 3].include?(kind)
-    
+
         dname, pos = take_str(buf, pos)
         nc, pos = take(buf, pos, 2)
         cols = []
@@ -1183,24 +1187,24 @@ module JedNative
           cols << c
         end
         raise "a non-table view dependency lists columns" if kind != 0 && !cols.empty?
-    
+
         deps << { kind: kind, name: dname, columns: cols }
       end
       cb, pos = take(buf, pos, 1)
       check_option = cb.getbyte(0)
       raise "unknown view check_option" unless [0, 1, 2].include?(check_option)
-    
+
       fl, pos = take(buf, pos, 1)
       flags = fl.getbyte(0)
       raise "unknown view flags" unless flags & ~3 == 0
-    
+
       [{ name: name, columns: columns, defaults: defaults, definition: definition.force_encoding("UTF-8"),
          deps: deps, check_option: check_option, security_barrier: flags & 1 != 0,
          security_invoker: flags & 2 != 0 }, pos]
     end
-    
+
     # The view content a fixture should decode to (name-sorted, dependencies and their columns sorted).
-    
+
     # Serialize a collation reference entry's BODY (after its entry_kind = 3 byte, v18): a flags byte
     # (bit0 is_default), then the metadata — name + unicode_version + cldr_version + description, each
     # u16-len + UTF-8. NO table: it is vendored into the binary and resolved by name on open
@@ -1211,21 +1215,21 @@ module JedNative
       [c[:name], c[:unicode], c[:cldr], c[:desc]].each { |s| out << length16(s) << s.b }
       out
     end
-    
+
     # Decode a collation reference entry's body (inverse of collation_entry_bytes); the caller has
     # consumed the entry_kind byte. Reads the metadata only — the table is not in the file.
     def decode_collation_entry(buf, pos)
       fb, pos = take(buf, pos, 1)
       f = fb.getbyte(0)
       raise "reserved collation flag set" if (f & ~0b1) != 0
-    
+
       name, pos = take_str(buf, pos)
       unicode, pos = take_str(buf, pos)
       cldr, pos = take_str(buf, pos)
       desc, pos = take_str(buf, pos)
       [{ name: name, default: (f & 0b1) != 0, unicode: unicode, cldr: cldr, desc: desc }, pos]
     end
-    
+
     # (key, row) pairs in stored (encoded-key) order. PK tables key on the PK member columns —
     # the key is the CONCATENATION of the members' encodings in KEY order (a composite
     # PRIMARY KEY, ../design/encoding.md §2.3; a single-column key is the one-member case).
@@ -1249,7 +1253,7 @@ module JedNative
       end
       pairs.sort_by { |key, _| key } # String#<=> is bytewise == memcmp order
     end
-    
+
     # A secondary-index entry key (indexes.md §3): each indexed column as the encoding.md §2.2
     # NULLABLE SLOT (0x00 + bare order-preserving bytes when present, the lone 0x01 for NULL —
     # always tagged, even for a NOT NULL column), then the row's storage key as the suffix.
@@ -1257,17 +1261,17 @@ module JedNative
     # :asc / :desc / :asc_nulls_first / :desc_nulls_last symbols, default ASC NULLS LAST everywhere.
     ORDER_SYMBOLS = { asc: [false, false], asc_nulls_first: [false, true],
                       desc: [true, true], desc_nulls_last: [true, false] }.freeze
-    
+
     def index_orders(ix)
       ix[:cols].each_index.map { |i| ORDER_SYMBOLS.fetch((ix[:orders] || [])[i] || :asc) }
     end
-    
+
     # The encoding.md §2.16 ordered slot tags: [present, null] per [desc, nulls_first].
     def ordered_slot_tags(desc, nulls_first)
       { [false, false] => [0x00, 0x01], [false, true] => [0x01, 0x00],
         [true, true] => [0xFF, 0xFE], [true, false] => [0xFE, 0xFF] }.fetch([desc, nulls_first])
     end
-    
+
     def index_entry_key(table, ix, storage_key, row)
       out = +"".b
       orders = index_orders(ix)
@@ -1301,7 +1305,7 @@ module JedNative
       out << storage_key
       out
     end
-    
+
     # Whether a (partial) index holds `row`: a fixture's `where:` lambda mirrors the index's SQL predicate
     # (indexes.md §9, gist.md §7.1); an index without one holds every row.
     def index_admits?(ix, row)
@@ -1310,7 +1314,7 @@ module JedNative
       end
       ix[:where].nil? || ix[:where].call(row)
     end
-    
+
     # An index's (entry_key, record-plan) pairs in entry-key order. An index record has an EMPTY
     # payload (key only — format.md "Index trees"), so its plan is trivially inline. `forged_empty: true`
     # authors an index whose tree is empty although the table has rows: the stand-in for an index a newer
@@ -1325,7 +1329,7 @@ module JedNative
         [key, { key: key, row: empty, table: shape, forms: empty, comps: empty, size: key.bytesize }]
       end.sort_by { |key, _| key }
     end
-    
+
     # A GIN index's (entry_key, record-plan) pairs in entry-key order (spec/design/gin.md §4): one
     # entry per DISTINCT non-NULL array element — encode(element) ‖ storage_key, with NO presence tag
     # (a term is never NULL) and an EMPTY payload. A NULL whole-value array and an empty array yield no
@@ -1342,24 +1346,24 @@ module JedNative
     # ascending order, as varint(shared) ‖ varint(suffix length) ‖ suffix against the previous key (the
     # first against the last). A from-scratch image is this greedy packing.
     GIN_RUN_MAX_BYTES = 64
-    
+
     def gin_varint(v)
       out = "".b
       loop do
         byte = v & 0x7F
         v >>= 7
         return out << (v.zero? ? byte : byte | 0x80).chr if v.zero?
-    
+
         out << (byte | 0x80).chr
       end
     end
-    
+
     def gin_shared_prefix(a, b)
       n = 0
       n += 1 while n < a.bytesize && n < b.bytesize && a.getbyte(n) == b.getbyte(n)
       n
     end
-    
+
     def gin_encode_run(term, keys)
       last = keys.last
       body = "".b
@@ -1371,7 +1375,7 @@ module JedNative
       end
       (term + last + body + [body.bytesize].pack("n")).b
     end
-    
+
     def gin_pack_runs(term, keys)
       runs = []
       start = 0
@@ -1383,7 +1387,7 @@ module JedNative
       end
       runs
     end
-    
+
     def gin_index_entries(table, ix)
       postings = Hash.new { |h, k| h[k] = [] }
       ix[:cols].each_with_index do |ci, pos|
@@ -1409,7 +1413,7 @@ module JedNative
         end
       end.sort_by { |key, _| key }
     end
-    
+
     # An array_ops term (spec/design/gin.md §4/§4.2/§4.3): the element's key body, a text or bytea
     # element's over its first 128 bytes (the C key — never a collation sort key; the cut is at a byte),
     # and a decimal element's value-based key cut to its first 128 bytes.
@@ -1420,14 +1424,14 @@ module JedNative
       else key_body(elem_type, e)
       end
     end
-    
+
     # GIN `jsonb_ops` index terms of a tagged jsonb node (spec/design/gin.md §2.1/§4.1): a KEY term
     # (flag 0x01) per object key and per string array element (a top-level string included), a value
     # term per other scalar — 0x02 null, 0x03 boolean (+ 0x00/0x01), 0x04 number, 0x05 string member
     # value. A key/string body is text-terminated-escape over the UTF-8, a number body the same over its
     # decimal-order-preserving key; a source over 128 bytes is cut to 128 and sets flag bit 0x10.
     GIN_JSONB_MAX_TERM_BYTES = 128
-    
+
     def gin_jsonb_framed(flag, content)
       content = content.b
       if content.bytesize > GIN_JSONB_MAX_TERM_BYTES
@@ -1436,7 +1440,7 @@ module JedNative
       end
       [flag].pack("C") + enc_terminated(content)
     end
-    
+
     def gin_jsonb_scalar_term(node, as_key)
       case node[0]
       when :null then "\x02".b
@@ -1446,9 +1450,9 @@ module JedNative
       else raise "not a jsonb scalar #{node.inspect}"
       end
     end
-    
+
     def gin_jsonb_container?(node) = %i[obj arr].include?(node[0])
-    
+
     def gin_jsonb_walk(node, out)
       case node[0]
       when :obj
@@ -1462,7 +1466,7 @@ module JedNative
         end
       end
     end
-    
+
     # The document's deduplicated term set, in ascending byte order.
     def gin_jsonb_terms(node)
       out = []
@@ -1473,7 +1477,7 @@ module JedNative
       end
       out.uniq.sort
     end
-    
+
     # --- GiST R-tree (spec/design/gist.md §3/§4.1) -------------------------------
     #
     # The on-disk form of a GiST index is a persisted R-tree (page types 5/6), NOT the flat leaf-key
@@ -1485,7 +1489,7 @@ module JedNative
     # across every core. A node is { leaf: true, entries: [[bound, skey], ...] } or
     # { leaf: false, children: [[union_bound, child_node], ...] }; `bound`/`union_bound` are range values
     # (:empty or a {lower:,upper:,lower_inc:,upper_inc:} hash) and `skey` is a binary storage key.
-    
+
     # A GiST opclass (gist.md §2/§5/§6): { kind: :range, elem: <subtype> } for `range_ops`, or
     # { kind: :scalar, type: <scalar> } for the scalar `=` opclass (GX2). The opclass is the ONLY
     # type-specific part; the tree machinery below is opclass-agnostic, dispatching on `op[:kind]`.
@@ -1502,23 +1506,23 @@ module JedNative
         end
       end
     end
-    
+
     # One column's leaf component bound for value `v`: the range value itself (range opclass), or `[v, v]`
     # over the order-preserving KEY encoding (scalar opclass — a leaf is the degenerate `[v, v]`, the
     # bytes `key_body` produces, byte-comparable, gist.md §6).
     def gist_comp_leaf(op, v)
       return v if op[:kind] == :range
-    
+
       k = key_body(op[:type], v).b
       [k, k]
     end
-    
+
     # A row's TUPLE leaf bound: one component per indexed column (callers skip a row with any NULL indexed
     # column — gist.md §4.1/§7). For a single-column index this is a one-element tuple.
     def gist_leaf_bound(ops, row, cols)
       ops.each_with_index.map { |op, k| gist_comp_leaf(op, row[cols[k]]) }
     end
-    
+
     # Convex hull under the subtype's canonical key order. Infinite bounds and
     # inclusive ties retain the same range semantics for every supported subtype.
     def gist_range_union(a, b, elem)
@@ -1545,17 +1549,17 @@ module JedNative
     # (byte-wise, the order-preserving key order) for a scalar.
     def gist_comp_union(op, a, b)
       return gist_range_union(a, b, op[:elem]) if op[:kind] == :range
-    
+
       amin, amax = a
       bmin, bmax = b
       [[amin, bmin].min, [amax, bmax].max]
     end
-    
+
     # union of two TUPLE bounds — componentwise (one per indexed column).
     def gist_union(ops, a, b)
       ops.each_index.map { |k| gist_comp_union(ops[k], a[k], b[k]) }
     end
-    
+
     # Serialize a TUPLE bound to its self-delimiting bytes — the per-column components concatenated, each
     # the range body (ranges) or `[min, max]` length-prefixed (scalars). For a single-column index this is
     # exactly the one component's bytes (gist.md §4.1/§6).
@@ -1573,7 +1577,7 @@ module JedNative
       end
       out
     end
-    
+
     # The canonical total-order key for a TUPLE bound — the per-column sort keys concatenated, so the
     # Array compares lexicographically over components (range_total_cmp = encode_range_key bytes for a
     # range; the `[min, max]` key bytes for a scalar). `sort_by` appends the storage-key / subtree-min
@@ -1583,12 +1587,12 @@ module JedNative
         ops[k][:kind] == :range ? [encode_range_key(ops[k][:elem], bound[k])] : bound[k]
       end
     end
-    
+
     def gist_node_union(ops, node)
       bounds = node[:leaf] ? node[:entries].map { |b, _| b } : node[:children].map { |u, _| u }
       bounds.reduce { |acc, b| gist_union(ops, acc, b) }
     end
-    
+
     def gist_subtree_min_skey(node)
       node[:min_skey] ||= if node[:leaf]
         node[:entries].map { |_, s| s }.min
@@ -1596,17 +1600,17 @@ module JedNative
         node[:children].map { |_, c| gist_subtree_min_skey(c) }.min
       end
     end
-    
+
     # Canonical leaf order: (bound_total_cmp(bound), skey).
     def gist_sort_leaf!(ops, entries)
       entries.sort_by! { |b, s| gist_sortkey(ops, b) + [s] }
     end
-    
+
     # Canonical child order: (bound_total_cmp(union), subtree_min_skey).
     def gist_sort_children!(ops, children)
       children.sort_by! { |u, c| gist_sortkey(ops, u) + [gist_subtree_min_skey(c)] }
     end
-    
+
     # choose-subtree (penalty): the child whose union, MERGED with the new entry, has the
     # lexicographically-smallest serialized bound bytes; ties keep the lower slot (gist.md §3).
     def gist_choose_child(ops, children, bound)
@@ -1621,7 +1625,7 @@ module JedNative
       end
       best
     end
-    
+
     # Insert (bound, skey) into `node` (mutated in place); returns nil or a new right-sibling child
     # [union_bound, node] when the node split.
     def gist_insert_node(ops, node, bound, skey)
@@ -1640,32 +1644,32 @@ module JedNative
       end
       gist_split_if_overflow(ops, node)
     end
-    
+
     # Split an over-FANOUT node at the median (ceil(n/2)); return the new right sibling [union, node].
     def gist_split_if_overflow(ops, node)
       key = node[:leaf] ? :entries : :children
       return nil if node[key].size <= GIST_FANOUT
-    
+
       mid = (node[key].size + 1) / 2 # ceil(n/2) = div_ceil
       right_items = node[key].slice!(mid..)
       right = node[:leaf] ? { leaf: true, entries: right_items } : { leaf: false, children: right_items }
       [gist_node_union(ops, right), right]
     end
-    
+
     # Build the canonical R-tree from leaf entries [[bound, skey], ...].
     def gist_build(ops, entries)
       root = { leaf: true, entries: [] }
       entries.sort_by { |b, s| gist_sortkey(ops, b) + [s] }.each do |bound, skey|
         sib = gist_insert_node(ops, root, bound, skey)
         next unless sib
-    
+
         children = [[gist_node_union(ops, root), root], sib]
         gist_sort_children!(ops, children)
         root = { leaf: false, children: children }
       end
       root
     end
-    
+
     # Serialize the R-tree post-order into `pages` (children before parent, root last); returns
     # [root_index, next_index]. Leaf entry: bound_len(u16) ‖ bound ‖ skey_len(u16) ‖ skey.
     # Interior entry: bound_len(u16) ‖ union_bound ‖ child_page(u32). (gist.md §4.1)
@@ -1696,27 +1700,27 @@ module JedNative
         [index, next_index]
       end
     end
-    
+
     # Build + serialize a GiST index's R-tree from a table's rows; returns [root_index, next_index].
     # One leaf entry per row with NO NULL indexed column (any NULL → the row is not indexed, gist.md
     # §4.1/§7). An empty index serializes nothing and returns root 0 (the empty-index convention).
     def serialize_gist_index(table, ix, next_index, pages)
-    
+
       ops = gist_opclasses_for(table, ix)
       entries = []
       table_entries(table).each do |storage_key, row|
         next if ix[:cols].any? { |ci| row[ci].nil? } || !index_admits?(ix, row)
-    
+
         entries << [gist_leaf_bound(ops, row, ix[:cols]), storage_key]
       end
       return [0, next_index] if entries.empty?
-    
+
       gist_serialize(ops, gist_build(ops, entries), next_index, pages)
     end
-    
+
     # A GiST index's leaf keys (bound ‖ skey), one per fully-non-NULL indexed row, sorted bytewise — the
     # SET a round-trip read must reproduce (order-independent: the comparison sorts).
-    
+
     # Walk a persisted GiST R-tree (page types 5/6), returning its leaf keys (bound ‖ skey) — the
     # inverse of serialize_gist_index for the round-trip read.
     def read_gist_keys(image, ps, root_page)
@@ -1724,7 +1728,7 @@ module JedNative
       seen = Set.new
       walk = lambda do |idx|
         return if idx.zero?
-    
+
         raise "GiST page reached twice" unless seen.add?(idx)
         pg = read_page(image, ps, idx)
         case pg[:type]
@@ -1754,15 +1758,15 @@ module JedNative
       walk.call(root_page)
       keys
     end
-    
+
     # --- out-of-line large values (large-values.md §12) -------------------------
-    
-    def spillable?(type) = fixed_width(type).nil?
+
+    def spillable?(col) = fixed_width(col).nil?
     # RECORD_MAX(K) = (C − max(12, 12+16K))/2 (format.md "Why the record cap"): the value is KEPT from
     # v23 (bplus-reshape.md §4.2), re-derived leaf-only — the v24 worst-case two-record leaf overhead
     # (all-variable, 12+13K) stays under the reserve. K=0 (index trees) is exact: 2·(C−12)/2 + 12 = C.
     def record_max(cap, k) = [(cap - [12, 12 + 16 * k].max) / 2, 0].max
-    
+
     # The dense-slot width of a FIXED-WIDTH column's value body (format.md v24 "Leaf node"), or nil for
     # a VARIABLE-WIDTH column (text/bytea/decimal/json/jsonb/composite/array/range — the spillable set).
     # The class decides the column's leaf region shape: fixed regions are flags + null bitmap + dense
@@ -1771,21 +1775,371 @@ module JedNative
     STORAGE_WIDTH = { "i16" => 2, "i32" => 4, "i64" => 8, "boolean" => 1, "uuid" => 16,
                       "timestamp" => 8, "timestamptz" => 8, "date" => 4, "interval" => 16,
                       "f64" => 8, "f32" => 4 }.freeze
-    def fixed_width(type) = type.is_a?(String) ? STORAGE_WIDTH[type] : nil
-    
-    # leaf_overhead(N, cols): a v24 leaf's payload beyond Σ record_size (format.md "Leaf node") — the
-    # key directory (4N), the column directory (4(K+1)), and per region a flags byte plus the null
-    # bitmap (fixed-width, ceil(N/8)) or the value directory (variable, 4N).
-    def leaf_overhead(n, cols)
-      cols.sum(4 * n + 4 * (cols.size + 1)) do |c|
-        1 + (fixed_width(c[:type]) ? (n + 7) / 8 : 4 * n)
+    def fixed_width(col)
+      return STORAGE_WIDTH[col] if col.is_a?(String)
+      STORAGE_WIDTH[col[:type]] || fixed_decimal_width(col)
+    end
+
+    def fixed_decimal_width(col)
+      mod = col[:type_mod] || col[:typmod]
+      p = col[:precision] || (mod.is_a?(Array) ? mod[0] : mod&.dig(:precision))
+      return nil unless col[:type] == "decimal" && p && p.between?(1, 18)
+
+      p <= 4 ? 2 : (p <= 9 ? 4 : 8)
+    end
+
+    # A fixed-width decimal slot: the value's unscaled integer `value * 10^s` in the integer body of
+    # the slot's width (big-endian, sign bit flipped). The value must already be at the column's scale
+    # or a lower one (a constrained column stores only coerced values).
+    def encode_fixed_decimal(col, s)
+      d = parse_decimal(s)
+      scale = (col[:scale] || (col[:type_mod].is_a?(Array) ? col[:type_mod][1] : col[:type_mod]&.dig(:scale)) || 0)
+      raise "decimal #{s} has more than #{scale} fractional digits" if d[:scale] > scale
+
+      u = d[:coeff] * 10**(scale - d[:scale])
+      w = fixed_decimal_width(col)
+      # A magnitude of 10^p or more still fits the slot's integer range: a typmod violation, which the
+      # integrity fixtures build on purpose, never a different byte form.
+      raise "decimal #{s} does not fit a #{w}-byte slot" if u >= (1 << (8 * w - 1))
+
+      u = -u if d[:neg]
+      [u + (1 << (8 * w - 1))].pack(w == 8 ? "Q>" : (w == 4 ? "N" : "n"))
+    end
+
+    # Inverse of encode_fixed_decimal: the slot's unscaled integer rendered at the column's scale.
+    def decode_fixed_decimal(col, bytes)
+      w = fixed_decimal_width(col)
+      u = bytes.unpack1(w == 8 ? "Q>" : (w == 4 ? "N" : "n")) - (1 << (8 * w - 1))
+      render_decimal(u.negative?, (col[:scale] || (col[:type_mod].is_a?(Array) ? col[:type_mod][1] : col[:type_mod]&.dig(:scale)) || 0), u.abs)
+    end
+
+    # --- the compact leaf (format.md v52 "Leaf node" / "Fan-out") ---------------
+    #
+    # Column types by the leaf forms they admit. A string column's inline value is the bare tag 0x05 and
+    # its bytes, and its region may be a dictionary (kind 2); a key-derivable primary-key column in the
+    # leading run of its key is elided; a fixed-key table tree stores its key length once; an offset
+    # column's region may be base plus offsets (kind 1); an integer-array column's may be packed (kind 4).
+    STRING_TYPES = %w[text bytea json].freeze
+    KEY_DERIVABLE_TYPES = %w[i16 i32 i64 date timestamp timestamptz boolean uuid].freeze
+    FIXED_KEY_TYPES = (KEY_DERIVABLE_TYPES + %w[f32 f64 interval]).freeze
+    OFFSET_TYPES = %w[i16 i32 i64 date timestamp timestamptz].freeze
+    PACKED_ARRAY_WIDTH = { "i16[]" => 2, "i32[]" => 4, "i64[]" => 8 }.freeze
+    TAG_INLINE_BARE = 0x05
+    LEAF_FIXED_KEY = 1
+    LEAF_KEY_PREFIX = 2
+    REGION_PLAIN = 0
+    REGION_OFFSETS = 1
+    REGION_DICT = 2
+    REGION_PACKED = 4
+
+    # A table's columns as its leaves see them: copies, with `key_at` (the column's byte offset in the
+    # key) on every ELIDED column — the leading run of key-derivable members of the primary key, in key
+    # order (`pk` is the member ordinals in key order).
+    def leaf_columns(columns, pk)
+      out = columns.map { |column| column.reject { |key, _| key == :key_at } }
+      at = 0
+      pk.each do |ci|
+        c = out[ci]
+        break unless c && KEY_DERIVABLE_TYPES.include?(c[:type])
+
+        c[:key_at] = at
+        at += STORAGE_WIDTH.fetch(c[:type])
+      end
+      out
+    end
+
+
+    # The leaf columns of a fixture table ([] for an index tree, whose record plans carry no columns).
+    def leaf_table_cols(table)
+      return [] if table[:columns].empty?
+
+      leaf_columns(table[:columns], pk_order(table))
+    end
+
+    # fixed_key (format.md "Leaf node"): a table tree whose keys all have one length — no primary key
+    # (the 8-byte rowid) or only fixed-width scalar key members. An index tree never has it.
+    def tree_fixed_key?(table)
+      return table[:columns].first[:tree_fixed_key] if table[:columns].first&.key?(:tree_fixed_key)
+      return false if table[:columns].empty?
+
+      pk_order(table).all? { |i| FIXED_KEY_TYPES.include?(table[:columns][i][:type]) }
+    end
+
+    def string_col?(c) = STRING_TYPES.include?(c[:type])
+    def offset_col?(c) = !c[:key_at] && (OFFSET_TYPES.include?(c[:type]) || !fixed_decimal_width(c).nil?)
+    def packed_width(c) = c[:type].is_a?(String) ? PACKED_ARRAY_WIDTH[c[:type]] : nil
+
+    def be_uint(bytes) = bytes.each_byte.inject(0) { |a, b| (a << 8) | b }
+    def be_bytes(v, w) = (0...w).map { |i| (v >> (8 * (w - 1 - i))) & 0xFF }.pack("C*")
+
+    # leaf_overhead(N, cols): a leaf's payload beyond Σ record_size before the content-dependent savings
+    # (format.md "Page model") — the flags byte, the key directory (2N, or the 2-byte key length of a
+    # fixed-key tree), the column directory (2(K+1)), and per STORED region its kind byte plus the null
+    # bitmap (fixed-width) or the value directory (variable, 2N). An elided column adds nothing.
+    def leaf_overhead(n, cols, fixed_key = false)
+      cols.sum(1 + (fixed_key ? 2 : 2 * n) + 2 * (cols.size + 1)) do |c|
+        if c[:key_at] then 0
+        elsif fixed_width(c) then 1 + (n + 7) / 8
+        else 1 + 2 * n
+        end
       end
     end
-    
-    # The value columns of a leaf's records ([] for an index tree) — the leaf overhead needs their
-    # classes. Derived from the record plan's table, so no extra threading.
-    def leaf_cols(node) = node[:recs].empty? ? [] : node[:recs][0][:table][:columns]
-    
+
+    # The shared key prefix a leaf stores (format.md "Leaf node" item 3): the longest common prefix of
+    # its smallest and largest key (its first and last — a forged leaf may hold them out of order),
+    # capped at 65535, stored exactly when N >= 2 and N·L > L + 2. "" when not stored.
+    def leaf_key_prefix(keys)
+      n = keys.size
+      return "".b if n < 2
+
+      lo, hi = keys.minmax
+      l = 0
+      l += 1 while l < lo.bytesize && l < hi.bytesize && l < 0xFFFF && lo.getbyte(l) == hi.getbyte(l)
+      n * l > l + 2 ? lo.byteslice(0, l) : "".b
+    end
+
+    # Kind 1 (base plus offsets) over a fixed-width region's slots (nil = NULL): [saving, base, bw].
+    def offsets_plan(n, w, slots)
+      present = slots.compact.map { |s| be_uint(s) }
+      base = present.min || 0
+      d = (present.max || 0) - base
+      bw = if d.zero? then 0
+           elsif d < (1 << 8) then 1
+           elsif d < (1 << 16) then 2
+           elsif d < (1 << 32) then 4
+           else 8
+           end
+      saving = bw < w ? n * (w - bw) - (w + 1) : 0
+      [[saving, 0].max, base, bw]
+    end
+
+    # Kind 2 (dictionary) over a string region's spans ("" = NULL): [saving, entries, codes]. Two values
+    # share an entry only when both are NULL or both inline-plain (0x05) with equal content; entries are
+    # in order of first use; `dup` is the bytes of the spans that repeat an earlier entry.
+    def dict_plan(n, spans)
+      entries = []
+      codes = []
+      shared = {}
+      null_at = nil
+      dup = 0
+      spans.each do |s|
+        bare = !s.empty? && s.getbyte(0) == TAG_INLINE_BARE
+        at = if s.empty? then null_at
+             elsif bare then shared[s]
+             end
+        if at.nil?
+          at = entries.size
+          entries << s
+          null_at = at if s.empty?
+          shared[s] = at if bare
+        else
+          dup += s.bytesize
+        end
+        codes << at
+      end
+      d = entries.size
+      saving = d <= 256 ? n - 2 - 2 * d + dup : 0
+      [[saving, 0].max, entries, codes]
+    end
+
+    # Kind 4 (packed integer arrays) over an integer-array region's spans: [saving, counts, elements,
+    # base, bit width]. Saving 0 when any value is not NULL, the empty array, or an inline-plain array
+    # of one dimension, lower bound 1, no NULL element and 1..254 elements.
+    def packed_plan(n, w, spans)
+      counts = []
+      elems = []
+      e = 0
+      a = 0
+      spans.each do |s|
+        if s.empty?
+          counts << 255
+        elsif s == "\x00\x00\x00".b
+          counts << 0
+          e += 1
+        else
+          return [0] unless s.bytesize >= 11 && s.getbyte(0).zero? && s.getbyte(1) == 1 && s.getbyte(2).zero?
+
+          m = s.byteslice(3, 4).unpack1("N")
+          return [0] unless m.between?(1, 254) && s.byteslice(7, 4).unpack1("N") == 1 && s.bytesize == 11 + m * w
+
+          counts << m
+          a += 1
+          m.times { |j| elems << be_uint(s.byteslice(11 + j * w, w)) }
+        end
+      end
+      base = elems.min || 0
+      b = ((elems.max || 0) - base).bit_length
+      plain = 2 * n + 3 * e + 11 * a + elems.size * w
+      typed = n + w + 1 + (elems.size * b + 7) / 8
+      [[plain - typed, 0].max, counts, elems, base, b]
+    end
+
+    # One stored column region's bytes: the kind byte, then the kind's body. `vals[i]` is record i's
+    # slot (fixed-width) or leaf span (variable), nil for NULL. A region takes kind 1, 2 or 4 exactly
+    # when that kind applies to the column and its saving is positive.
+    def encode_leaf_region(c, n, vals)
+      if (w = fixed_width(c))
+        bitmap = Array.new((n + 7) / 8, 0)
+        vals.each_with_index { |v, i| bitmap[i / 8] |= (0x80 >> (i % 8)) if v.nil? }
+        bitmap = bitmap.pack("C*")
+        plain = [REGION_PLAIN].pack("C") + bitmap + vals.map { |v| v || ("\x00".b * w) }.join.b
+        saving, base, bw = offset_col?(c) ? offsets_plan(n, w, vals) : [0]
+        return [plain, 0] unless saving.positive?
+
+        out = [REGION_OFFSETS].pack("C") + bitmap + be_bytes(base, w) + [bw].pack("C")
+        vals.each { |v| out << be_bytes(v.nil? ? 0 : be_uint(v) - base, bw) }
+        [out, saving]
+      else
+        spans = vals.map { |v| v || "".b }
+        off = 0
+        plain = [REGION_PLAIN].pack("C") + spans.map { |s| u16(off += s.bytesize) }.join.b + spans.join.b
+        if string_col?(c)
+          saving, entries, codes = dict_plan(n, spans)
+          return [plain, 0] unless saving.positive?
+
+          off = 0
+          out = [REGION_DICT].pack("C") + u16(entries.size) + entries.map { |s| u16(off += s.bytesize) }.join.b +
+                entries.join.b + codes.pack("C*")
+          [out, saving]
+        elsif (aw = packed_width(c))
+          saving, counts, elems, base, b = packed_plan(n, aw, spans)
+          return [plain, 0] unless saving.positive?
+
+          bits = elems.inject(0) { |acc, x| (acc << b) | (x - base) }
+          nbytes = (elems.size * b + 7) / 8
+          bits <<= nbytes * 8 - elems.size * b # MSB-first, the last byte zero-padded
+          out = [REGION_PACKED].pack("C") + counts.pack("C*") + be_bytes(base, aw) + [b].pack("C") + be_bytes(bits, nbytes)
+          [out, saving]
+        else
+          [plain, 0]
+        end
+      end
+    end
+
+    # A v52 leaf payload (format.md "Leaf node") from its keys and per-column values (`vals[c][i]`: the
+    # slot or leaf span of record i, nil for NULL; ignored for an elided column): leaf flags | key
+    # length (fixed-key) | prefix length + prefix | key directory (no fixed key) | stored keys | column
+    # directory (K+1 absolute offsets) | the stored regions. Returns [payload, total saving].
+    def encode_leaf(cols, keys, vals, fixed_key)
+      n = keys.size
+      k = cols.size
+      prefix = leaf_key_prefix(keys)
+      p = prefix.bytesize
+      saving = p.zero? ? 0 : n * p - p - 2
+      out = [(fixed_key ? LEAF_FIXED_KEY : 0) | (p.zero? ? 0 : LEAF_KEY_PREFIX)].pack("C")
+      if fixed_key
+        len = keys[0].bytesize
+        raise "a key's length is not its tree's fixed key length" unless len.positive? && keys.all? { |kb| kb.bytesize == len }
+        raise "a fixed-key leaf's prefix is the whole key" unless p < len
+
+        out << u16(len)
+      end
+      out << u16(p) << prefix unless p.zero?
+      unless fixed_key
+        off = 0
+        keys.each { |kb| out << u16(off += kb.bytesize - p) }
+      end
+      keys.each { |kb| out << kb.byteslice(p..) }
+      regions = cols.each_with_index.map do |c, ci|
+        next "".b if c[:key_at] # an elided key column: an empty region
+
+        bytes, s = encode_leaf_region(c, n, vals[ci])
+        saving += s
+        bytes
+      end
+      cur = out.bytesize + 2 * (k + 1)
+      starts = regions.map { |r| (cur += r.bytesize) - r.bytesize } << cur
+      raise "leaf payload exceeds a u16 offset" if cur > 0xFFFF + 1
+
+      starts.each { |s| out << u16(s) }
+      regions.each { |r| out << r }
+      [out, saving]
+    end
+
+    # The record_size contribution of one stored value (format.md "Record"): 0 for an elided column, the
+    # width for a fixed-width one (NULL included), the span's bytes for a variable-width one (0 for NULL).
+    def leaf_value_size(c, val)
+      return 0 if c[:key_at]
+
+      fixed_width(c) || (val.nil? ? 0 : val.bytesize)
+    end
+
+    # A leaf's payload size, measured by encoding it — and checked against the *Fan-out* formula
+    # `Σ record_size + leafOverhead(N, cols) − saving(leaf)`, so the two statements of the size in
+    # format.md are held to each other on every leaf this reference measures.
+    def leaf_payload_size(cols, keys, vals, fixed_key)
+      n = keys.size
+      prefix = leaf_key_prefix(keys).bytesize
+      saving = prefix.zero? ? 0 : n * prefix - prefix - 2
+      cols.each_with_index do |c, ci|
+        next if c[:key_at]
+        v = vals[ci]
+        saving += if (w = fixed_width(c)) && offset_col?(c)
+          offsets_plan(n, w, v)[0]
+        elsif string_col?(c)
+          dict_plan(n, v.map { |x| x || ''.b })[0]
+        elsif (w = packed_width(c))
+          packed_plan(n, w, v.map { |x| x || ''.b })[0]
+        else 0
+        end
+      end
+      records = keys.sum(&:bytesize) + cols.each_with_index.sum { |c, ci| (0...n).sum { |i| leaf_value_size(c, vals[ci][i]) } }
+      records + leaf_overhead(n, cols, fixed_key) - saving
+    end
+
+    # The leaf columns of a node's records ([] for an index tree).
+    def leaf_cols(node) = node[:recs].empty? ? [] : leaf_table_cols(node[:recs][0][:table])
+
+    # A fixed-width column's slot for a present value: the untagged inline body, or a fixed-width
+    # decimal's unscaled integer (v51).
+    def fixed_slot(c, v)
+      fixed_decimal_width(c) ? encode_fixed_decimal(c, v) : encode_value(c[:type], v).byteslice(1..)
+    end
+
+    # An inline-plain value's leaf bytes: the bare tag 0x05 and the content for text / bytea / json (the
+    # value directory gives the length), the tagged value codec for every other variable-width type.
+    def leaf_inline(c, v)
+      v = v.resolve if v.is_a?(StoredValue)
+      string_col?(c) ? [TAG_INLINE_BARE].pack("C") + v.b : encode_value(c[:type], v)
+    end
+
+    # A record plan's values as the size rules see them, per leaf column: the slot or leaf span of each
+    # stored value (nil for NULL), an external pointer standing in as zero bytes of its size (a
+    # pointer's bytes never decide a leaf's size — it is always its own dictionary entry).
+    def rec_measure_vals(rec)
+      rec[:mvals] ||= begin
+        cols = leaf_table_cols(rec[:table])
+        vals = cols.each_with_index.map do |c, ci|
+          v = rec[:row][ci]
+          if c[:key_at] || v.nil? then nil
+          elsif fixed_width(c) then fixed_slot(c, v)
+          else
+            case rec[:forms][ci]
+            when :external then [TAG_EXTERNAL].pack("C") + "\x00".b * (EXTERNAL_PTR_LEN - 1 + rec.fetch(:pointer_tag, @crypto ? Crypto::TAG : 0))
+            when :external_comp then [TAG_EXTERNAL_COMP].pack("C") + "\x00".b * (EXTERNAL_COMP_PTR_LEN - 1 + rec.fetch(:pointer_tag, @crypto ? Crypto::TAG : 0))
+            when :inline_comp
+              [TAG_INLINE_COMP].pack("C") + u32(value_payload(c[:type], v).bytesize) + u16(rec[:comps][ci].bytesize) + rec[:comps][ci].to_s
+            else leaf_inline(c, v)
+            end
+          end
+        end
+        size = rec[:key].bytesize + cols.each_with_index.sum { |c, ci| leaf_value_size(c, vals[ci]) }
+        raise "record plan size #{rec[:size]} != record_size #{size}" unless size == rec[:size]
+
+        vals
+      end
+    end
+
+    # The payload size of a leaf holding these record plans.
+    def recs_payload_size(recs)
+      return 3 if recs.empty?
+      table = recs[0][:table]
+      cols = leaf_table_cols(table)
+      mv = recs.map { |r| rec_measure_vals(r) }
+      vals = cols.each_index.map { |ci| mv.map { |m| m[ci] } }
+      leaf_payload_size(cols, recs.map { |r| r[:key] }, vals, tree_fixed_key?(table))
+    end
+
     # A value's content payload P(v) — the bytes stored in the overflow chain when externalized: raw
     # UTF-8 / raw bytes for text/bytea, the decimal body for decimal (large-values.md §12).
     def value_payload(type, v)
@@ -1796,7 +2150,7 @@ module JedNative
       else encode_value(type, v).byteslice(1..)
       end
     end
-    
+
     # Decide each column's disposition for a record: [forms, comps, on-disk record size], where
     # forms[i] is :inline / :inline_comp / :external / :external_comp and comps[i] holds the LZ4
     # block or a length-bearing deferred block for a compressed form. Spill only when forced
@@ -1805,16 +2159,18 @@ module JedNative
     # both passes ties-by-column-index. Deterministic, mirrors the cores' plan_dispositions
     # (large-values.md §12/§13; format.md "Large values").
     def plan_record(table, key, row, cap, compression_units: nil)
-      cols = table[:columns]
+      cols = leaf_table_cols(table)
       # Each column's inline-plain contribution to record_size (the v24 basis — format.md "Record"):
       # a fixed-width column always its width (NULL occupies a zero-filled slot); a variable column 0
       # when NULL (a zero-length span) else its tagged inline encoding.
       inline = cols.each_with_index.map do |c, i|
-        if (w = fixed_width(c[:type]))
+        if c[:key_at]
+          0
+        elsif (w = fixed_width(c))
           w
         else
           value = row[i]
-          value.is_a?(StoredValue) ? value.plain_size : value.nil? ? 0 : encode_value(c[:type], value).bytesize
+          value.is_a?(StoredValue) ? (value.plain_size - (string_col?(c) ? 2 : 0)) : value.nil? ? 0 : leaf_inline(c, value).bytesize
         end
       end
       forms = Array.new(cols.size, :inline)
@@ -1823,18 +2179,18 @@ module JedNative
       size = key.bytesize + inline.sum
       max = record_max(cap, cols.size)
       return [forms, comps, size] if size <= max
-    
+
       # Pass 1 — compress (lz4.md): payload >= S_COMPRESS, largest inline-plain encoded size first,
       # ties by ascending index; adopt iff the encoded compressed form is strictly smaller.
       cand = (0...cols.size).select do |i|
         value = row[i]
-        spillable?(cols[i][:type]) && !value.nil? &&
+        spillable?(cols[i]) && !value.nil? &&
           (value.is_a?(StoredValue) ? value.payload_length : value_payload(cols[i][:type], value).bytesize) >= S_COMPRESS
       end
       cand.sort_by! { |i| [-inline[i], i] }
       cand.each do |i|
         break if size <= max
-    
+
         value = row[i]
         if value.is_a?(StoredValue)
           compression_units&.call((value.payload_length + cap - 1) / cap)
@@ -1846,23 +2202,23 @@ module JedNative
           comp = LZ4.compress(payload)
         end
         next unless INLINE_COMP_OVERHEAD + comp.bytesize < inline[i]
-    
+
         forms[i] = :inline_comp
         comps[i] = comp
         size += INLINE_COMP_OVERHEAD + comp.bytesize - cur[i]
         cur[i] = INLINE_COMP_OVERHEAD + comp.bytesize
       end
       return [forms, comps, size] if size <= max
-    
+
       # Pass 2 — externalize: anything whose current encoded size beats its pointer, largest first.
       cand = (0...cols.size).select do |i|
-        spillable?(cols[i][:type]) &&
+        spillable?(cols[i]) &&
           cur[i] > (forms[i] == :inline_comp ? external_comp_ptr_len(cap) : external_ptr_len(cap))
       end
       cand.sort_by! { |i| [-cur[i], i] }
       cand.each do |i|
         break if size <= max
-    
+
         ptr = forms[i] == :inline_comp ? external_comp_ptr_len(cap) : external_ptr_len(cap)
         forms[i] = forms[i] == :inline_comp ? :external_comp : :external
         size += ptr - cur[i]
@@ -1871,7 +2227,7 @@ module JedNative
       # RECORD_MAX controls disposition, not admission. A wide fixed-width row
       # cannot shrink to that target, but can still occupy a legal single-row
       # leaf. Include the real column directories and bitmaps in this check.
-      raise Error.new('0A000', 'record exceeds page capacity after spilling') if size + leaf_overhead(1, cols) > cap
+      raise Error.new('0A000', 'record exceeds page capacity after spilling') if size + leaf_overhead(1, cols, tree_fixed_key?(table)) > cap
 
       [forms, comps, size]
     end
@@ -1881,7 +2237,7 @@ module JedNative
       plan_record(table, key, row, cap, compression_units: ->(count) { units += count })
       units
     end
-    
+
     # Write a payload across a chain of overflow pages (cap-byte slabs, in order), allocating each via
     # `alloc` and linking with next_page (0 terminates). Returns the first page index for the pointer.
     def write_overflow_chain(payload, cap, alloc, pages)
@@ -1896,7 +2252,7 @@ module JedNative
       end
       indices[0]
     end
-    
+
     # Emit one record's on-disk bytes (key_len | key | values), spilling external columns to overflow
     # pages drawn via `alloc` (large-values.md §12/§13). `rec` is a plan hash
     # { key:, row:, table:, forms:, comps: } from plan_record.
@@ -1906,7 +2262,7 @@ module JedNative
     def emit_value(c, v, form, comp, cap, alloc, pages, retain: nil)
       if v.is_a?(StoredValue)
         if v.form == form
-          return v.stored_bytes unless v.external?
+          return string_col?(c) && form == :inline ? [TAG_INLINE_BARE].pack("C") + v.planning_payload : v.stored_bytes unless v.external?
           if retain
             retain.call(v)
             return v.stored_bytes
@@ -1933,10 +2289,10 @@ module JedNative
         first = write_overflow_chain(comp, cap, alloc, pages) # the chain carries the COMPRESSED block
         [TAG_EXTERNAL_COMP].pack("C") + u32(first) + u32(comp.bytesize) + u32(payload.bytesize) + tag_of(first)
       else
-        encode_value(c[:type], v)
+        leaf_inline(c, v)
       end
     end
-    
+
     # Emit a v24 INTERIOR node payload (format.md "Interior node"): N+1 child pointers, an N-entry
     # end-offset separator directory, then the separator key blob. Record-free.
     def emit_interior(sep_keys, child_pages)
@@ -1947,59 +2303,39 @@ module JedNative
       sep_keys.each { |k| out << k }
       out
     end
-    
+
     # Emit a v24 leaf's payload COLUMN-MAJOR (format.md "Leaf node"): values are encoded in
     # (record, column) order (so overflow chains allocate deterministically), then assembled as
     # key dir (N end offsets) | key blob | col dir (K+1) | per region: flags byte, then null bitmap +
     # dense untagged slots (fixed-width) or an N-entry end-offset value directory + tagged bodies
     # (variable; NULL = a zero-length span). `recs` are record plans.
     def emit_leaf_pax(recs, cap, alloc, pages, retain: nil)
-      n = recs.size
-      cols = recs.empty? ? [] : recs[0][:table][:columns]
-      k = cols.size
-      keys = recs.map { |r| r[:key] }
-      val_bytes = Array.new(k) { Array.new(n) }
-      recs.each_with_index do |rec, i|
+      table = recs[0][:table]
+      cols = leaf_table_cols(table)
+      vals = Array.new(cols.size) { [] }
+      recs.each do |rec|
         cols.each_with_index do |c, ci|
           v = rec[:row][ci]
-          val_bytes[ci][i] =
-            if (w = fixed_width(c[:type]))
-              v.nil? ? ("\x00".b * w) : encode_value(c[:type], v).byteslice(1..) # untagged body; NULL slot zero-filled
-            elsif v.nil?
-              "".b # a zero-length span
-            else
-              emit_value(c, v, rec[:forms][ci], rec[:comps][ci], cap, alloc, pages, retain: retain)
+          vals[ci] <<
+            if c[:key_at]
+              body = v.nil? ? nil : encode_value(c[:type], v).byteslice(1..)
+              unless body && rec[:key].byteslice(c[:key_at], body.bytesize) == body
+                raise "a key column's value is not recoverable from its key"
+              end
+
+              nil
+            elsif v.nil? then nil # a zero-filled slot / a zero-length span
+            elsif fixed_width(c) then fixed_slot(c, v)
+            else emit_value(c, v, rec[:forms][ci], rec[:comps][ci], cap, alloc, pages, retain: retain)
             end
         end
       end
-      out = +"".b
-      off = 0
-      keys.each { |kb| off += kb.bytesize; out << u32(off) }               # key directory (end offsets)
-      keys.each { |kb| out << kb }                                          # key blob
-      base_after_col_dir = out.bytesize + 4 * (k + 1)
-      col_start = []
-      cur = base_after_col_dir
-      (0...k).each do |c|
-        col_start[c] = cur
-        cur += 1 + (fixed_width(cols[c][:type]) ? (n + 7) / 8 : 4 * n) + val_bytes[c].sum(&:bytesize)
-      end
-      col_start[k] = cur
-      (0..k).each { |c| out << u32(col_start[c]) }                          # column directory
-      (0...k).each do |c|
-        out << "\x00".b                                                    # region flags (reserved)
-        if fixed_width(cols[c][:type])
-          bitmap = Array.new((n + 7) / 8, 0)
-          recs.each_with_index { |rec, i| bitmap[i / 8] |= (0x80 >> (i % 8)) if rec[:row][c].nil? }
-          out << bitmap.pack("C*")
-        else
-          voff = 0
-          val_bytes[c].each { |vb| voff += vb.bytesize; out << u32(voff) } # value directory (end offsets)
-        end
-        val_bytes[c].each { |vb| out << vb }                               # value bodies / slots
-      end
-      out
+      payload, = encode_leaf(cols, recs.map { |r| r[:key] }, vals, tree_fixed_key?(table))
+      raise "emitted leaf differs in size from its measure" unless payload.bytesize == recs_payload_size(recs)
+
+      payload
     end
-    
+
     # Lay catalog entries out on pages of capacity `cap` (format.md *Catalog*, v48): packed greedily,
     # each wholly on one page, except that an entry longer than `cap` starts a fresh page and spans as
     # many pages as it needs — the first with item_count 1, the rest 0, every page of the run but the
@@ -2029,14 +2365,14 @@ module JedNative
       out << cur if cur[:count].positive? || out.empty?
       out
     end
-    
+
     def pack(sizes, cap)
       groups = []
       cur = []
       used = 0
       sizes.each_with_index do |sz, i|
         raise "item of size #{sz} exceeds page capacity #{cap}" if sz > cap
-    
+
         if !cur.empty? && used + sz > cap
           groups << cur
           cur = []
@@ -2048,7 +2384,7 @@ module JedNative
       groups << cur
       groups
     end
-    
+
     # `live` defaults to every body page: a from-scratch image has no free list and no manifest.
     def write_meta(image, ps, slot, page_size, txid, root, page_count, live = page_count - first_body, seal: true)
       off = slot * ps
@@ -2102,7 +2438,7 @@ module JedNative
         image[off + 32, 4] = u32(meta_crc(image.byteslice(off, ps)))
       end
     end
-    
+
     def write_page(image, ps, index, type, item_count, next_page, payload, flags: 0)
       return image[index * ps, ps] = seal_page(ps, index, type, item_count, next_page, payload, flags: flags) if @crypto
       raise Error.new('0A000', 'page payload exceeds page capacity') if payload.bytesize > ps - PAGE_HEADER
@@ -2115,7 +2451,7 @@ module JedNative
       # The per-page checksum (v7) is computed last, over every byte but its own field at [12,16).
       image[off + 12, 4] = u32(page_crc(image.byteslice(off, ps)))
     end
-    
+
     # --- size-driven B-tree (format.md "The per-table data B-tree") -------------
     #
     # Built the way the cores do: insert each (key, record) in ascending key order, splitting any
@@ -2124,139 +2460,166 @@ module JedNative
     # A leaf has children == []; an interior has children.size == keys.size + 1. recs[i] is the full
     # record bytes (key_len + key + values) for keys[i] — this B-tree stores a value with every key,
     # separators included. Split point and the RECORD_MAX = C/2 cap mirror format.md exactly.
-    
+
     def node_leaf?(node) = node[:children].empty?
-    
+
     # A LEAF's `recs[i]` is the record PLAN for keys[i] — a hash { key:, row:, table:, forms:, comps:,
     # size: } whose `size` is the on-disk (post-spill) record size (large-values.md §12). The tree
     # splits on `size`; the actual pointer bytes (with allocated overflow pages) are emitted later by
     # serialize_tree. An INTERIOR node has no recs (v24) — its payload is the separators themselves.
     def node_payload(node, cap = nil)
       if node_leaf?(node)
-        node[:recs].sum { |r| r[:size] } + leaf_overhead(node[:keys].size, leaf_cols(node))
+        recs_payload_size(node[:recs])
       else
         ptr = 4 + (cap ? cap_tag(cap) : 0)
         (ptr + 4) * node[:keys].size + ptr + node[:keys].sum(&:bytesize)
       end
     end
-    
+
     # The kind-shared split-point rule (format.md "Split point"): over the kind's range, m_max = the
     # largest m whose left side fits, m_min = the smallest whose right side fits, m_balanced = the
     # smallest m with 2·leftpayload(m) >= payload; a right-edge edit takes m_max, anything else
     # clamp(min(m_balanced, m_max), m_min, m_max). nil when no m keeps both sides fitting.
+    # Side sizes are monotone (format.md). Binary searches retain the exact first/last fitting
+    # boundary without re-encoding every growing prefix in a split scan.
+    def split_bounds(range, cap, leftp, rightp)
+      return [nil, nil] if range.begin > range.end
+      first_bad = range.bsearch { |m| leftp.call(m) > cap }
+      maximum = first_bad ? first_bad - 1 : range.end
+      maximum = nil if maximum < range.begin
+      minimum = range.bsearch { |m| rightp.call(m) <= cap }
+      [maximum, minimum]
+    end
+
+    # The two-way split point: a right-edge edit takes m_max, anything else
+    # clamp(min(m_balanced, m_max), m_min, m_max), m_balanced the smallest m with
+    # 2·leftpayload(m) >= payload. nil when no m keeps both sides fitting.
     def pick_split_m(range, payload, cap, right_edge, leftp, rightp)
-      m_max = nil
-      range.each { |m| leftp.call(m) <= cap ? m_max = m : break }
-      m_min = nil
-      range.reverse_each { |m| rightp.call(m) <= cap ? m_min = m : break }
+      m_max, m_min = split_bounds(range, cap, leftp, rightp)
       return nil if m_max.nil? || m_min.nil? || m_min > m_max
       return m_max if right_edge
-    
-      m_bal = range.find { |m| 2 * leftp.call(m) >= payload } || m_max
+
+      m_bal = range.bsearch { |m| 2 * leftp.call(m) >= payload } || m_max
       m_bal.clamp(m_min, m_max)
     end
-    
-    # Split an overflowing node 2-way (format.md "Fan-out", v24): a LEAF splits COPY-UP — the left
-    # leaf keeps records [0, m), the right leaf [m, N), and the separator handed up is a COPY of
-    # keys[m] (no record leaves the leaf level) — [:split, left, sep_key, right]. An INTERIOR node
-    # splits PUSH-UP — the median separator moves up, left keeps [0, m) + children [0, m], right
-    # keeps [m+1, N) + children [m+1, N]; with N == 2 the split is pinned to m = 1, producing the
-    # legal N = 0 right interior (the degenerate max-separator contract). This builder only inserts
-    # in ascending key order (build_tree), so right_edge is always true here — the balanced arm is
-    # implemented so the reference states the whole contract.
-    def split_node(node, cap, right_edge)
-      payload = node_payload(node, cap)
-      return [:whole, node] if payload <= cap
-    
-      n = node[:keys].size
-      if node_leaf?(node)
-        return [:whole, node] if n < 2 # a single over-cap record: unsupported, surfaces upstream
-    
-        cols = leaf_cols(node)
-        prefix = [0]
-        node[:recs].each { |r| prefix << prefix.last + r[:size] }
-        leftp = ->(m) { prefix[m] + leaf_overhead(m, cols) }
-        rightp = ->(m) { (prefix[n] - prefix[m]) + leaf_overhead(n - m, cols) }
-        m = pick_split_m(1..(n - 1), payload, cap, right_edge, leftp, rightp)
-        raise "unsplittable leaf (record over RECORD_MAX?)" if m.nil?
-    
-        left = { keys: node[:keys][0, m], recs: node[:recs][0, m], children: [] }
-        right = { keys: node[:keys][m..], recs: node[:recs][m..], children: [] }
-        [:split, left, right[:keys][0].dup, right]
-      else
-        m = if n == 2
-              1 # the degenerate pin: sep[1] moves up, the right side is a legal N = 0 interior
-            else
-              prefix = [0]
-              node[:keys].each { |k| prefix << prefix.last + k.bytesize }
-              ptr = 4 + cap_tag(cap)
-              leftp = ->(mm) { (ptr + 4) * mm + ptr + prefix[mm] }
-              rightp = ->(mm) { (ptr + 4) * (n - 1 - mm) + ptr + (prefix[n] - prefix[mm + 1]) }
-              mm = pick_split_m(1..(n - 2), payload, cap, right_edge, leftp, rightp)
-              raise "unsplittable interior on the insert path" if mm.nil?
-    
-              mm
-            end
-        left = { keys: node[:keys][0, m], recs: [], children: node[:children][0, m + 1] }
-        right = { keys: node[:keys][(m + 1)..], recs: [], children: node[:children][(m + 1)..] }
-        [:split, left, node[:keys][m], right]
+
+    # The reference's stand-in for the 0A000 a core reports when a single entry or separator fits no node.
+    class Unsplittable < RuntimeError; end
+
+    # Split an overflowing node (format.md "Fan-out"): [:whole, node] when it fits, else
+    # [:split, nodes, seps] — nodes.size == seps.size + 1, seps[i] the separator between nodes[i] and
+    # nodes[i + 1]. `edited` is the index of the entry whose insert / replace triggered the rebuild (for
+    # an interior node, the last separator a child split handed up), or nil when there is none (a new
+    # root). A right-edge edit is `edited == N - 1`.
+    #
+    # A LEAF splits COPY-UP — the left leaf keeps records [0, m), the right leaf [m, N), and the
+    # separator handed up is a COPY of keys[m] (no record leaves the leaf level). An INTERIOR node splits
+    # PUSH-UP — sep[m] moves up, left keeps [0, m) + children [0, m], right keeps (m, N) + children
+    # (m, N]; with N == 2 the split is pinned to m = 1, producing the legal N = 0 right interior (the
+    # degenerate max-separator contract).
+    #
+    # The split is two-way wherever some m leaves two fitting nodes. Otherwise it is MULTI-WAY (v52):
+    # the left node is entries [0, m_max), the separator is key[m_max], and the remainder ([m_max, N)
+    # of a leaf, the separators after m_max of an interior) is built by this same procedure with the
+    # edited index carried along. No m_max at all — a single entry or separator that fits no node — is
+    # the mutation's 0A000.
+    #
+    # A table tree and most index trees are built in ascending key order (always a right-edge edit); an
+    # `insert_order` index (compact_leaf_table) and an `ops` table (multiway_split) edit out of key order.
+    def split_node(node, cap, edited)
+      return [:whole, node] if node_payload(node, cap) <= cap
+
+      nodes = []
+      seps = []
+      loop do
+        payload = node_payload(node, cap)
+        if payload <= cap
+          nodes << node
+          break
+        end
+        n = node[:keys].size
+        right_edge = !edited.nil? && edited == n - 1
+        if node_leaf?(node)
+          # Each side is measured with its own prefix, bases, widths and dictionaries (v52).
+          leftp = ->(m) { recs_payload_size(node[:recs][0, m]) }
+          rightp = ->(m) { recs_payload_size(node[:recs][m..]) }
+          range = 1..(n - 1)
+          m = pick_split_m(range, payload, cap, right_edge, leftp, rightp)
+          two_way = !m.nil?
+          m ||= split_bounds(range, cap, leftp, rightp)[0]
+          raise Error.new('0A000', "a leaf entry that fits no leaf (0A000)") if m.nil?
+
+          nodes << { keys: node[:keys][0, m], recs: node[:recs][0, m], children: [] }
+          seps << node[:keys][m].dup
+          node = { keys: node[:keys][m..], recs: node[:recs][m..], children: [] }
+          edited = edited && edited >= m ? edited - m : nil
+        else
+          raise Error.new('0A000', "a separator that fits no interior node (0A000)") if n < 2
+
+          if n == 2
+            m = 1 # the degenerate pin: sep[1] moves up, the right side is a legal N = 0 interior
+            two_way = true
+          else
+            prefix = [0]
+            node[:keys].each { |k| prefix << prefix.last + k.bytesize }
+            pw = 4 + cap_tag(cap) # a child pointer's width (encrypted.md §2)
+            leftp = ->(mm) { (pw + 4) * mm + pw + prefix[mm] }
+            rightp = ->(mm) { (pw + 4) * (n - 1 - mm) + pw + (prefix[n] - prefix[mm + 1]) }
+            range = 1..(n - 2)
+            m = pick_split_m(range, payload, cap, right_edge, leftp, rightp)
+            two_way = !m.nil?
+            m ||= split_bounds(range, cap, leftp, rightp)[0]
+            raise Error.new('0A000', "a separator that fits no interior node (0A000)") if m.nil?
+          end
+          left = { keys: node[:keys][0, m], recs: [], children: node[:children][0, m + 1] }
+          raise Error.new('0A000', "a separator that fits no interior node (0A000)") if node_payload(left, cap) > cap
+
+          nodes << left
+          seps << node[:keys][m]
+          node = { keys: node[:keys][(m + 1)..], recs: [], children: node[:children][(m + 1)..] }
+          edited = edited && edited > m ? edited - m - 1 : nil
+        end
+        next unless two_way
+
+        raise Error.new('0A000', "a split side that fits no node (0A000)") if node_payload(node, cap) > cap
+
+        nodes << node
+        break
       end
+      [:split, nodes, seps]
     end
-    
+
     # Insert (key, rec) into the subtree, rebuilding (copy-on-write) and splitting up the path. An
     # interior descent routes by partition_point(sep <= key) — a key equal to a separator lies RIGHT
     # (format.md "Interior node"); leaves hold the records.
-    def tree_insert(node, key, rec, cap)
-      if node_leaf?(node)
-        i = node[:keys].bsearch_index { |k| k >= key } || node[:keys].size
-        raise "duplicate key in fixture" if i < node[:keys].size && node[:keys][i] == key
-    
-        return split_node({ keys: node[:keys].dup.insert(i, key),
-                            recs: node[:recs].dup.insert(i, rec), children: [] }, cap,
-                          i == node[:keys].size)
+    # Both bulk builders and incremental edits use the same native tree mutation path.
+    def tree_insert(node, key, rec, cap) = put_tree_key(node, key, rec, cap)
+
+    def grow_root(result, cap)
+      while result[0] == :split
+        result = split_node({ keys: result[2], recs: [], children: result[1] }, cap, nil)
       end
-      i = node[:keys].bsearch_index { |k| k > key } || node[:keys].size
-      res = tree_insert(node[:children][i], key, rec, cap)
-      if res[0] == :split
-        _, left, sk, right = res
-        children = node[:children].dup
-        children[i] = left
-        children.insert(i + 1, right)
-        split_node({ keys: node[:keys].dup.insert(i, sk), recs: [], children: children }, cap,
-                   i == node[:keys].size)
-      else
-        children = node[:children].dup
-        children[i] = res[1]
-        [:whole, { keys: node[:keys], recs: [], children: children }]
-      end
+      result[1]
     end
-    
-    # Build a table's B-tree from its (key, record) pairs in key order. nil for an empty table.
+
     def build_tree(pairs, cap)
-      root = nil
-      pairs.each do |key, rec|
-        # The packing target may be smaller than a legal single-record leaf,
-        # notably for wide rows and secondary keys larger than half a page.
-        if rec[:size] + leaf_overhead(1, rec[:table][:columns]) > cap
-          raise Error.new('0A000', 'record exceeds page capacity after spilling')
+      pairs.reduce(nil) do |root, (key, rec)|
+        if root
+          grow_root(put_tree_key(root, key, rec, cap), cap)
+        else
+          node = { keys: [key], recs: [rec], children: [] }
+          raise Error.new('0A000', 'record exceeds page capacity after spilling') if node_payload(node, cap) > cap
+          node
         end
-    
-        if root.nil?
-          root = { keys: [key], recs: [rec], children: [] }
-          next
-        end
-        res = tree_insert(root, key, rec, cap)
-        root = res[0] == :split ? { keys: [res[2]], recs: [], children: [res[1], res[3]] } : res[1]
       end
-      root
     end
-    
+
     # Post-order page allocation: children before their parent (so a parent's child pointers
     # reference already-allocated pages). Fills `pages[index] = [page_type, item_count, payload]`.
     # Returns [root_page (0 for an empty tree), next free index].
     def serialize_tree(root, next_index, cap, pages)
       return [0, next_index] if root.nil?
-    
+
       child_pages = root[:children].map do |c|
         cp, next_index = serialize_tree(c, next_index, cap, pages)
         cp
@@ -2278,7 +2641,7 @@ module JedNative
       end
       [index, next_index]
     end
-    
+
     # A from-scratch image (format.md "Allocation & incremental commit"): the special case where
     # every node is dirty — data B-trees post-order (per table, name order) from page 2, then the
     # catalog chain, then both meta slots at txid 1.
@@ -2295,7 +2658,7 @@ module JedNative
       sorted_types = types.sort_by { |t| t[:name] }
       sorted_seqs = sequences.sort_by { |s| s[:name] }
       sorted_colls = collations.sort_by { |c| c[:name] }
-    
+
       data_pages = {} # index => [page_type, item_count, payload]
       root_data = Array.new(sorted.size, 0)
       index_roots = Array.new(sorted.size) { [] }
@@ -2303,7 +2666,7 @@ module JedNative
       sorted.each_with_index do |t, ti|
         pairs = table_entries(t).map do |key, row|
           forms, comps, size = plan_record(t, key, row, cap)
-          [key, { key: key, row: row, table: t, forms: forms, comps: comps, size: size }]
+          [key, { key: key, row: row, table: t, forms: forms, comps: comps, size: size, pointer_tag: (cap_tag(cap)) }]
         end
         tree = t.key?(:physical_tree) ? t[:physical_tree] : build_tree(pairs, cap)
         root_data[ti], next_index = serialize_tree(tree, next_index, cap, data_pages)
@@ -2330,7 +2693,7 @@ module JedNative
           index_roots[ti] << r
         end
       end
-    
+
       # Catalog entries are kind-tagged: composite-type entries (kind 1, name order) first, then
       # sequence entries (kind 2, name order, v12), then collation snapshots (kind 3, name order, v17),
       # then table entries (kind 0) — format.md.
@@ -2360,9 +2723,9 @@ module JedNative
       write_meta(image, ps, 1, page_size, txid, cat_root, page_count, page_count - start_page)
       image
     end
-    
+
     # The bytes a fixture should contain (applying any torn-slot corruption).
-    
+
     def write_host_deps(out, deps)
       out << u16(deps.size)
       deps.each do |dep|
@@ -2374,7 +2737,7 @@ module JedNative
         out << u32(dep[:semantic_version])
       end
     end
-    
+
     def read_host_deps(buf, pos)
       deps = []
       dc, pos = take(buf, pos, 2)
@@ -2398,32 +2761,32 @@ module JedNative
       end
       [deps, pos]
     end
-    
+
     def take(buf, pos, n)
       raise "negative byte extent" if pos.negative? || n.negative?
       raise "unexpected end of page data" if pos + n > buf.bytesize
-    
+
       [buf.byteslice(pos, n), pos + n]
     end
-    
+
     # Read a u16-length-prefixed UTF-8 string (the catalog's name/string encoding).
     def take_str(buf, pos)
       nl, pos = take(buf, pos, 2)
       s, pos = take(buf, pos, nl.unpack1("n"))
       [s.force_encoding("UTF-8"), pos]
     end
-    
+
     def read_meta(image, ps, slot, manifest: true, validate_body: true)
       off = slot * ps
       return nil if off + ps > image.bytesize
-    
+
       m = image.byteslice(off, ps)
       return nil unless m.byteslice(0, 4) == MAGIC
       return nil unless m.byteslice(4, 2).unpack1("n") == VERSION
       return nil unless [m.getbyte(6), m.getbyte(7)] == (@crypto ? [Crypto::SUITE, Crypto::RESERVE] : [0, 0])
       return nil unless m.byteslice(8, 4).unpack1("N") == ps
       return nil unless meta_crc(m) == m.byteslice(32, 4).unpack1("N")
-    
+
       meta = { txid: m.byteslice(12, 8).unpack1("Q>"), root_page: m.byteslice(20, 4).unpack1("N"),
                page_count: m.byteslice(24, 4).unpack1("N"), free_head: m.byteslice(28, 4).unpack1("N"),
                live: m.byteslice(56, 4).unpack1("N") }
@@ -2443,10 +2806,10 @@ module JedNative
       else
         meta[:protected] = []
       end
-    
+
       meta
     end
-    
+
     def valid_manifest?(image, ps, m, meta, validate_body: true)
       head, count, chain_count = m.byteslice(36, 12).unpack("N3")
       digest = m.byteslice(48, 8).unpack1("Q>")
@@ -2502,7 +2865,7 @@ module JedNative
       meta[:manifest_pages] = chain
       true
     end
-    
+
     # Logical free-list checks follow candidate selection, like catalog decoding. They
     # reject the selected database rather than falling back to hide semantic corruption.
     def validate_free_list!(image, ps, meta)
@@ -2527,7 +2890,7 @@ module JedNative
       end
       free_pages
     end
-    
+
     def select_meta(image, ps)
       a = read_meta(image, ps, 0)
       b = read_meta(image, ps, 1)
@@ -2550,7 +2913,7 @@ module JedNative
       @crypto.note(meta[:free_head], meta[:free_tag])
       meta
     end
-    
+
     def read_page(image, ps, index)
       off = index * ps
       raise "page index out of range" if off + ps > image.bytesize
@@ -2563,7 +2926,7 @@ module JedNative
       { type: p.getbyte(0), flags: p.getbyte(1), item_count: p.byteslice(4, 4).unpack1("N"),
         next_page: p.byteslice(8, 4).unpack1("N"), payload: p.byteslice(PAGE_HEADER, ps - PAGE_HEADER) }
     end
-    
+
     # An encrypted body page, checked against the tag its pointer bound and opened, returned in the
     # plaintext page's shape: a chain page without its successor's tag, an interior's and a GiST
     # interior's child pointers without theirs — each tag recorded as the pointer's (encrypted.md §2).
@@ -2630,7 +2993,7 @@ module JedNative
         end
         fl, pos = take(buf, pos, 1)
         raise "reserved composite field flag set" if (fl.getbyte(0) & ~0b1) != 0
-    
+
         not_null = (fl.getbyte(0) & 1) != 0
         if type == "decimal"
           pb, pos = take(buf, pos, 2)
@@ -2650,7 +3013,7 @@ module JedNative
       end
       [{ name: name, fields: fields }, pos]
     end
-    
+
     def decode_table_entry(buf, pos)
       name, pos = take_str(buf, pos)
       col_count, pos = take(buf, pos, 2)
@@ -2666,7 +3029,7 @@ module JedNative
           cf = cflags.getbyte(0)
           raise "reserved flag bit0 set (retired primary_key bit — v5)" if (cf & 0b01) != 0
           raise "invalid composite column flags (v44)" if (cf & ~0b1010 & 0xff) != 0
-    
+
           tname, pos = take_str(buf, pos)
           cdefault_expr = nil
           if (cf & 0b1000) != 0
@@ -2685,13 +3048,13 @@ module JedNative
           aflags, pos = take(buf, pos, 1)
           af = aflags.getbyte(0)
           raise "reserved flag bit0 set (retired primary_key bit — v5)" if (af & 0b01) != 0
-    
+
           elem_type, pos = read_array_element_type(buf, pos)
           # bit6 has_collation (v36): a text[] column's collation name follows the element descriptor.
           collation = nil
           if (af & 0b100_0000) != 0
             raise "has_collation set on a non-text array column (v36)" unless elem_type == "text"
-    
+
             cl, pos = take(buf, pos, 2)
             cb, pos = take(buf, pos, cl.unpack1("n"))
             collation = cb.force_encoding("UTF-8")
@@ -2707,7 +3070,7 @@ module JedNative
           rflags, pos = take(buf, pos, 1)
           rf = rflags.getbyte(0)
           raise "reserved flag bit0 set (retired primary_key bit — v5)" if (rf & 0b01) != 0
-    
+
           ecb, pos = take(buf, pos, 1)
           elem_type = CODETYPE.fetch(ecb.getbyte(0))
           rname = RANGE_ELEM.key(elem_type) or raise "type code is not a valid range element subtype"
@@ -2725,7 +3088,7 @@ module JedNative
         identity = if (f & 0b1_0000) != 0
                      (f & 0b10_0000) != 0 ? :always : :by_default
                    end
-    
+
         type = CODETYPE.fetch(tc.getbyte(0))
         precision = nil
         scale = nil
@@ -2748,7 +3111,7 @@ module JedNative
         # The default follows the typmod: a CONSTANT default (bit2) is a value via the value codec; an
         # EXPRESSION default (bit3, v8) is the expr-text (u16 length + UTF-8). Mutually exclusive.
         raise "column has both a constant and an expression default" if (f & 0b1100) == 0b1100
-    
+
         default = :none
         default, pos = decode_value(type, buf, pos) if (f & 0b100) != 0
         default_expr = nil
@@ -2887,7 +3250,7 @@ module JedNative
           ref << ob.unpack1("n")
         end
         raise "fk column count mismatch (local != ref)" if local.size != ref.size
-    
+
         ab, pos = take(buf, pos, 1)
         raise "reserved fk action bits set / unsupported action code" \
           if (ab.getbyte(0) & 0b1000_0000) != 0 || (ab.getbyte(0) & 0b111) > 4 || ((ab.getbyte(0) >> 3) & 0b111) > 4
@@ -2916,11 +3279,11 @@ module JedNative
       row_count = count_raw.unpack1("q>")
       raise "negative table row_count" if row_count.negative?
       raise "root_data_page/row_count invariant violated" unless root.unpack1("N").zero? == row_count.zero?
-    
+
       [{ name: name, columns: columns, pk: pk, checks: checks, indexes: indexes, fks: fks,
          exclusions: exclusions, root_data_page: root.unpack1("N"), row_count: row_count }, pos]
     end
-    
+
     # Read one value via the value codec (inverse of encode_value): a presence tag, then — when
     # present — the type's body. 0x01 = NULL. Shared by row records and the catalog default.
     # Decode a decimal value's body (flags + u16 scale + u16 ndigits + base-10^4 groups). Shared by the
@@ -2933,14 +3296,14 @@ module JedNative
       ndb.unpack1("n").times do
         gb, pos = take(buf, pos, 2)
         raise "decimal digit group out of range" if gb.unpack1("n") > 9999
-    
+
         coeff = coeff * 10_000 + gb.unpack1("n")
       end
       raise "decimal flags have reserved bits" unless (fb.getbyte(0) & ~1).zero?
 
       [render_decimal((fb.getbyte(0) & 1) != 0, scb.unpack1("n"), coeff), pos]
     end
-    
+
     # Reconstruct a value from the P(v) content gathered from its overflow chain (large-values.md §12).
     def decode_utf8(bytes)
       value = bytes.dup.force_encoding('UTF-8')
@@ -2958,7 +3321,7 @@ module JedNative
       else decode_value(type, "\x00".b + payload, 0).first
       end
     end
-    
+
     # Gather `len` bytes of an external value's payload by following its overflow chain from `first`:
     # each page is page_type 4, carries item_count payload bytes, chained via next_page (0 terminates).
     def read_overflow_chain(first, len, fetch)
@@ -2971,19 +3334,19 @@ module JedNative
         # Chain exclusivity (large-values.md §15): a rewritten record may keep an unchanged value's chain,
         # but no two records of one generation share a chain page.
         raise "overflow page #{p} is referenced twice" if @claimed && !@claimed.add?(p)
-    
+
         pg = fetch.call(p)
         raise "expected an overflow page" unless pg[:type] == PAGE_OVERFLOW
-    
+
         n = pg[:item_count]
         raise "overflow page slab out of range" if n.zero? || n > pg[:payload].bytesize || out.bytesize + n > len
-    
+
         out << pg[:payload].byteslice(0, n)
         p = pg[:next_page]
       end
       out
     end
-    
+
     # Read one value via the value codec (inverse of encode_value/emit_record): a presence tag, then —
     # when present-inline — the type's body, or — when external (0x02) — a pointer whose payload is
     # gathered from the overflow chain via `fetch` and reconstructed by type (large-values.md §12).
@@ -2997,7 +3360,7 @@ module JedNative
         lnb, pos = take(buf, pos, 4)
         pos = read_pointer_tag(buf, pos, fpb.unpack1("N"))
         raise "external value with no overflow reader" if fetch.nil?
-    
+
         return [value_from_payload(type, read_overflow_chain(fpb.unpack1("N"), lnb.unpack1("N"), fetch)), pos]
       end
       if t == TAG_INLINE_COMP
@@ -3012,27 +3375,27 @@ module JedNative
         rlb, pos = take(buf, pos, 4)
         pos = read_pointer_tag(buf, pos, fpb.unpack1("N"))
         raise "external value with no overflow reader" if fetch.nil?
-    
+
         comp = read_overflow_chain(fpb.unpack1("N"), slb.unpack1("N"), fetch)
         return [value_from_payload(type, LZ4.decompress(comp, rlb.unpack1("N"))), pos]
       end
       raise "invalid value presence tag" unless t.zero?
-    
+
       if (elem = array_elem(type))
         # An array value body (inverse of encode_array_body): ndim/flags/dims, optional bitmap, elements.
         return decode_array_body(elem, buf, pos)
       end
-    
+
       if (relem = range_elem(type))
         # A range value body (inverse of encode_range_body): flags byte + present bound bodies.
         return decode_range_body(relem, buf, pos)
       end
-    
+
       if (fields = composite_fields(type))
         # A composite value body (inverse of encode_composite_body): bitmap, then each present field.
         return decode_composite_body(fields, buf, pos)
       end
-    
+
       case type
       when "text"
         len, pos = take(buf, pos, 2)
@@ -3074,7 +3437,7 @@ module JedNative
         [decode_int(WIDTH.fetch(type), vb), pos]
       end
     end
-    
+
     # Read an unsigned LEB128 varint (inverse of write_uvarint, spec/design/json.md §2.1) -> [value, pos].
     def read_uvarint(buf, pos)
       result = 0
@@ -3084,12 +3447,12 @@ module JedNative
         byte = b.getbyte(0)
         result |= (byte & 0x7f) << shift
         return [result, pos] if (byte & 0x80).zero?
-    
+
         shift += 7
         raise "jsonb varint overflows u64" if shift >= 64
       end
     end
-    
+
     # Decode a jsonb node body (inverse of encode_jsonb_body, spec/design/json.md §2.1) into the tagged
     # Ruby form -> [node, pos]. A nonzero flag nibble or the reserved NTAG_STRING_DICT (0x5) is data
     # corruption (XX001 in the cores). Numbers decode to [:num, rendered-decimal-string].
@@ -3097,7 +3460,7 @@ module JedNative
       tb, pos = take(buf, pos, 1)
       tag = tb.getbyte(0)
       raise "jsonb node tag has a reserved flag bit set" if (tag & 0xf0) != 0
-    
+
       case tag & 0x0f
       when 0x0 then [[:null], pos]
       when 0x1 then [[:bool, false], pos]
@@ -3124,7 +3487,7 @@ module JedNative
           ktb, pos = take(buf, pos, 1)
           ktag = ktb.getbyte(0)
           raise "jsonb object key is not a string node" unless (ktag & 0x0f) == 0x4 && (ktag & 0xf0).zero?
-    
+
           key, pos = read_jsonb_string(buf, pos)
           val, pos = decode_jsonb_body(buf, pos)
           members << [key, val]
@@ -3133,14 +3496,14 @@ module JedNative
       else raise "unknown jsonb node tag"
       end
     end
-    
+
     # Read a NTAG_STRING payload (varint len ‖ utf8) after its tag -> [string, pos].
     def read_jsonb_string(buf, pos)
       len, pos = read_uvarint(buf, pos)
       sb, pos = take(buf, pos, len)
       [sb.dup.force_encoding("UTF-8"), pos]
     end
-    
+
     # Decode an array value body (inverse of encode_array_body, spec/design/array.md §4): ndim u8 ‖
     # flags u8 ‖ per-dim (len u32 ‖ lb i32) ‖ [bitmap if HAS_NULLS] ‖ element bodies. ndim 0 = the empty
     # array; ndim through 6 is accepted (multidim + custom lower bounds, §12). A present element has no
@@ -3156,7 +3519,7 @@ module JedNative
       raise "array flags has a reserved bit set" if (flags & ~0x01) != 0
       return [[], pos] if ndim.zero? # empty array
       raise "array ndim exceeds the maximum of 6" if ndim > 6
-    
+
       dims = []
       lbounds = []
       n = 1
@@ -3188,7 +3551,7 @@ module JedNative
               end
       [value, pos]
     end
-    
+
     # Decode a range value body (inverse of encode_range_body, spec/design/ranges.md §4): the flags byte
     # (EMPTY/LB_INF/UB_INF/LB_INC/UB_INC) then the present bound bodies (each the element's value-codec
     # body, no tag — synthesized 0x00 prepended like decode_array_body). Returns [:empty, pos] for the
@@ -3198,7 +3561,7 @@ module JedNative
       flags = fb.getbyte(0)
       raise "range flags has a reserved bit set" if (flags & ~0x1f) != 0
       return [:empty, pos] if (flags & 0x01) != 0
-    
+
       lb_inf = (flags & 0x02) != 0
       ub_inf = (flags & 0x04) != 0
       lower = nil
@@ -3213,7 +3576,7 @@ module JedNative
       end
       [{ lower: lower, upper: upper, lower_inc: (flags & 0x08) != 0, upper_inc: (flags & 0x10) != 0 }, pos]
     end
-    
+
     # Decode a composite value body (inverse of encode_composite_body): read the null bitmap
     # (ceil(n/8) bytes), then for each field either NULL (bit set, no body) or its value body decoded
     # recursively (no per-field presence tag). Returns [field-value array, pos]. Composite fields are
@@ -3237,63 +3600,208 @@ module JedNative
       end
       [vals, pos]
     end
-    
+
     # Parse a v24 PAX leaf payload (format.md "Leaf node") into [keys, regions]: keys[i] the i-th key;
     # regions[c] a class-shaped hash — { width:, bitmap:, body: } for a fixed-width column (bitmap the
     # raw null-bitmap bytes, body the dense slot bytes) or { ends:, body: } for a variable column
     # (ends the N end offsets, body the tagged value blob). `cols` are the table's column defs.
     def parse_pax_leaf(payload, n, cols)
-      raise "PAX leaf directory overruns page" if n > payload.bytesize / 4
-      pos = 0
-      key_end = (0...n).map { |_| v = payload.byteslice(pos, 4).unpack1("N"); pos += 4; v }
-      raise "PAX leaf key directory not ascending" unless key_end.each_cons(2).all? { |a, b| a <= b }
-    
-      key_blob = pos
-      raise "PAX leaf key blob overruns page" if key_blob + (key_end.last || 0) > payload.bytesize
-    
-      keys = (0...n).map do |i|
-        lo = i.zero? ? 0 : key_end[i - 1]
-        payload.byteslice(key_blob + lo, key_end[i] - lo)
+      size = payload.bytesize
+      rd16 = lambda do |at|
+        raise "PAX leaf directory overruns page" if at + 2 > size
+
+        payload.byteslice(at, 2).unpack1("n")
       end
-      pos = key_blob + (n.zero? ? 0 : key_end[n - 1])
+      raise "PAX leaf has no flags byte" if size.zero?
+
+      flags = payload.getbyte(0)
+      raise "PAX leaf flags has a reserved bit set" unless (flags & ~(LEAF_FIXED_KEY | LEAF_KEY_PREFIX)).zero?
+
+      pos = 1
+      key_len = nil
+      if (flags & LEAF_FIXED_KEY) != 0
+        key_len = rd16.call(pos)
+        pos += 2
+        raise "PAX leaf fixed key length is zero" if key_len.zero?
+      end
+      prefix = "".b
+      if (flags & LEAF_KEY_PREFIX) != 0
+        p = rd16.call(pos)
+        pos += 2
+        raise "PAX leaf key prefix is empty" if p.zero?
+        raise "PAX leaf key prefix overruns page" if pos + p > size
+        raise "PAX leaf key prefix is not shorter than the fixed key" if key_len && p >= key_len
+
+        prefix = payload.byteslice(pos, p)
+        pos += p
+      end
+      if key_len
+        stride = key_len - prefix.bytesize
+        raise "PAX leaf key blob overruns page" if pos + n * stride > size
+
+        keys = (0...n).map { |i| prefix + payload.byteslice(pos + i * stride, stride) }
+        pos += n * stride
+      else
+        key_end = (0...n).map { |i| rd16.call(pos + 2 * i) }
+        pos += 2 * n
+        raise "PAX leaf key directory not ascending" unless key_end.each_cons(2).all? { |a, b| a <= b }
+        raise "PAX leaf key blob overruns page" if pos + (key_end.last || 0) > size
+
+        keys = (0...n).map do |i|
+          lo = i.zero? ? 0 : key_end[i - 1]
+          prefix + payload.byteslice(pos + lo, key_end[i] - lo)
+        end
+        pos += key_end.last || 0
+      end
       k = cols.size
-      col_start = (0..k).map { |_| v = payload.byteslice(pos, 4).unpack1("N"); pos += 4; v }
+      col_dir = pos
+      col_start = (0..k).map { |c| rd16.call(pos + 2 * c) }
+      pos += 2 * (k + 1)
       raise "PAX leaf column directory start mismatch" unless col_start[0] == pos
-      raise "PAX leaf column extent invalid" unless col_start.each_cons(2).all? { |a, b| a <= b } && col_start.last <= payload.bytesize
-    
+      raise "PAX leaf column directory not ascending" unless col_start.each_cons(2).all? { |a, b| a <= b }
+      raise "PAX leaf column regions overrun page" if col_start[k] > size
+
       regions = cols.each_with_index.map do |c, ci|
-        start = col_start[ci]
-        flags = payload.getbyte(start)
-        raise "PAX leaf region flags has a reserved bit set" unless flags.zero?
-    
-        if (w = fixed_width(c[:type]))
-          bitmap = payload.byteslice(start + 1, (n + 7) / 8)
-          body = start + 1 + (n + 7) / 8
-          raise "fixed region extent mismatch" unless body + n * w == col_start[ci + 1]
-    
-          { width: w, bitmap: bitmap, body: payload.byteslice(body, n * w) }
+        region = payload.byteslice(col_start[ci], col_start[ci + 1] - col_start[ci])
+        w = fixed_width(c)
+        if c[:key_at]
+          raise "an elided key column has a region" unless region.empty?
+          raise "an elided key column lies outside its key" unless keys.all? { |kb| c[:key_at] + w <= kb.bytesize }
+
+          next { width: w, bitmap: "\x00".b * ((n + 7) / 8), elided: true,
+                 body: keys.map { |kb| kb.byteslice(c[:key_at], w) }.join.b }
+        end
+        raise "PAX leaf region has no kind byte" if region.empty?
+
+        kind = region.getbyte(0)
+        if w
+          bm = (n + 7) / 8
+          raise "fixed region extent mismatch" if region.bytesize < 1 + bm
+
+          bitmap = region.byteslice(1, bm)
+          rest = region.byteslice((1 + bm)..)
+          null = ->(i) { (bitmap.getbyte(i / 8) & (0x80 >> (i % 8))) != 0 }
+          case kind
+          when REGION_PLAIN
+            raise "fixed region extent mismatch" unless rest.bytesize == n * w
+
+            { width: w, bitmap: bitmap, body: rest }
+          when REGION_OFFSETS
+            raise "base-plus-offsets region on a column it does not apply to" unless offset_col?(c)
+            raise "base-plus-offsets region extent mismatch" if rest.bytesize < w + 1
+
+            base = be_uint(rest.byteslice(0, w))
+            bw = rest.getbyte(w)
+            raise "base-plus-offsets offset width is invalid" unless [0, 1, 2, 4].include?(bw) && bw < w
+            raise "base-plus-offsets region extent mismatch" unless rest.bytesize == w + 1 + n * bw
+
+            body = (0...n).map do |i|
+              next "\x00".b * w if null.call(i)
+
+              v = base + be_uint(rest.byteslice(w + 1 + i * bw, bw))
+              raise "base-plus-offsets value overflows its width" if v >= (1 << (8 * w))
+
+              be_bytes(v, w)
+            end.join.b
+            { width: w, bitmap: bitmap, body: body }
+          else
+            raise "invalid region kind #{kind} for a fixed-width column"
+          end
         else
-          ends = (0...n).map { |i| payload.byteslice(start + 1 + i * 4, 4).unpack1("N") }
-          raise "PAX value directory not ascending" unless ends.each_cons(2).all? { |a, b| a <= b }
-          body = start + 1 + 4 * n
-          raise "variable region extent mismatch" unless body + (ends.last || 0) == col_start[ci + 1]
-    
-          { ends: ends, body: payload.byteslice(body, (ends.last || 0)) }
+          spans =
+            case kind
+            when REGION_PLAIN
+              raise "variable region extent mismatch" if region.bytesize < 1 + 2 * n
+
+              ends = (0...n).map { |i| region.byteslice(1 + 2 * i, 2).unpack1("n") }
+              raise "variable region value directory not ascending" unless ends.each_cons(2).all? { |a, b| a <= b }
+              raise "variable region extent mismatch" unless 1 + 2 * n + (ends.last || 0) == region.bytesize
+
+              (0...n).map { |i| region.byteslice(1 + 2 * n + (i.zero? ? 0 : ends[i - 1]), ends[i] - (i.zero? ? 0 : ends[i - 1])) }
+            when REGION_DICT
+              raise "dictionary region on a column it does not apply to" unless string_col?(c)
+              raise "dictionary region extent mismatch" if region.bytesize < 3
+
+              d = region.byteslice(1, 2).unpack1("n")
+              raise "dictionary entry count out of range" unless d.between?(1, 256)
+              raise "dictionary region extent mismatch" if region.bytesize < 3 + 2 * d
+
+              ends = (0...d).map { |i| region.byteslice(3 + 2 * i, 2).unpack1("n") }
+              raise "dictionary directory not ascending" unless ends.each_cons(2).all? { |a, b| a <= b }
+              raise "dictionary region extent mismatch" unless 3 + 2 * d + ends.last + n == region.bytesize
+
+              entries = (0...d).map { |i| region.byteslice(3 + 2 * d + (i.zero? ? 0 : ends[i - 1]), ends[i] - (i.zero? ? 0 : ends[i - 1])) }
+              region.byteslice(3 + 2 * d + ends.last, n).each_byte.map do |code|
+                raise "dictionary code out of range" unless code < d
+
+                entries[code]
+              end
+            when REGION_PACKED
+              aw = packed_width(c)
+              raise "packed-array region on a column it does not apply to" unless aw
+              raise "packed-array region extent mismatch" if region.bytesize < 1 + n + aw + 1
+
+              counts = region.byteslice(1, n).unpack("C*")
+              base = be_uint(region.byteslice(1 + n, aw))
+              b = region.getbyte(1 + n + aw)
+              total = counts.sum { |m| m == 255 ? 0 : m }
+              raise "packed-array bit width is invalid" if b > 8 * aw
+              raise "packed-array region extent mismatch" unless region.bytesize == 1 + n + aw + 1 + (total * b + 7) / 8
+
+              bits = be_uint(region.byteslice((1 + n + aw + 1)..))
+              nbits = 8 * ((total * b + 7) / 8)
+              taken = 0
+              counts.map do |m|
+                next "".b if m == 255
+                next "\x00\x00\x00".b if m.zero?
+
+                out = "\x00\x01\x00".b + u32(m) + u32(1)
+                m.times do
+                  taken += b
+                  v = base + ((bits >> (nbits - taken)) & ((1 << b) - 1))
+                  raise "packed-array element overflows its width" if v >= (1 << (8 * aw))
+
+                  out << be_bytes(v, aw)
+                end
+                out
+              end
+            else
+              raise "invalid region kind #{kind} for a variable-width column"
+            end
+          body = +"".b
+          ends = spans.map do |s|
+            unless s.empty?
+              tag = s.getbyte(0)
+              if string_col?(c)
+                raise "a string column holds the tag 0x00" if tag.zero?
+              elsif tag == TAG_INLINE_BARE
+                raise "the tag 0x05 outside a string column"
+              end
+              raise "the tag 0x01 inside a leaf region" if tag == 0x01
+
+              body << (tag == TAG_INLINE_BARE ? "\x00".b + u16(s.bytesize - 1) + s.byteslice(1..) : s)
+            end
+            body.bytesize
+          end
+          { ends: ends, body: body, spans: spans }
         end
       end
-      [keys, regions]
+      [keys, regions, { flags: flags, key_len: key_len, prefix: prefix, col_dir: col_dir }]
     end
-    
+
     # Decode value (record i, column c) from a parsed v24 leaf region: nil from the bitmap (fixed) or
     # the zero-length span (variable). Fixed regions have already had their extent
     # validated by parse_pax_leaf; read their untagged slots directly, without
     # constructing a synthetic tag and running the container/overflow decoder.
-    def leaf_value(region, type, i, fetch)
+    def leaf_value(region, col, i, fetch)
+      col = { type: col } if col.is_a?(String)
+      type = col[:type]
       if region[:width]
         w = region[:width]
         return nil if (region[:bitmap].getbyte(i / 8) & (0x80 >> (i % 8))) != 0
-    
+
         body, offset = region[:body], i * w
+        return decode_fixed_decimal(col, body.byteslice(offset, w)) if fixed_decimal_width(col)
         raise "negative byte extent" if offset.negative?
         raise "unexpected end of page data" if offset + w > body.bytesize
         case type
@@ -3315,7 +3823,7 @@ module JedNative
         lo = i.zero? ? 0 : region[:ends][i - 1]
         len = region[:ends][i] - lo
         return nil if len.zero?
-    
+
         body = region[:body]
         if (type == "text" || type == "bytea" || type == "json") && body.getbyte(lo) == 0
           # Inline strings have no recursive type work. Keep their value extent
@@ -3336,7 +3844,7 @@ module JedNative
         end
       end
     end
-    
+
     # In-order walk of a table's B+tree -> rows in ascending key order (format.md v24: interior nodes
     # are a record-free routing skeleton; all records live in leaves). Independent of how the tree was
     # built. An external value's chain is followed through `fetch` (large-values.md §12).
@@ -3350,7 +3858,7 @@ module JedNative
         return nil if idx.zero?
         height = [height, depth].max
         raise "B-tree page reached twice" unless seen.add?(idx)
-    
+
         pg = read_page(image, ps, idx)
         case pg[:type]
         when PAGE_LEAF
@@ -3381,7 +3889,7 @@ module JedNative
               end
               scan_units[rows.length] = units.freeze unless units.empty?
             end
-            rows << columns.each_with_index.map { |c, ci| leaf_value(regions[ci], c[:type], i, leaf_fetch) }
+            rows << columns.each_with_index.map { |c, ci| leaf_value(regions[ci], c, i, leaf_fetch) }
           end
           { keys: leaf_keys.freeze, children: [].freeze, page: idx, overflow_pages: overflow_pages.freeze }.freeze if profile
         when PAGE_INTERIOR
@@ -3411,7 +3919,7 @@ module JedNative
         key
       end
     end
-    
+
     # In-order walk of an INDEX B+tree -> entry keys in ascending order. An index record is its key
     # alone (format.md "Index trees"); interior separators are routing copies, not entries.
     def read_tree_keys(image, ps, root_page, profile = nil)
@@ -3422,7 +3930,7 @@ module JedNative
         return nil if idx.zero?
         height = [height, depth].max
         raise "B-tree page reached twice" unless seen.add?(idx)
-    
+
         pg = read_page(image, ps, idx)
         case pg[:type]
         when PAGE_LEAF
@@ -3444,7 +3952,7 @@ module JedNative
       profile.merge!(tree: tree, node_count: seen.length, height: height) if profile
       keys
     end
-    
+
     def decode_statistics_entry(buf, pos, tables, statistics, expected)
       kb, pos = take(buf, pos, 1)
       kind = kb.getbyte(0)
@@ -3453,7 +3961,7 @@ module JedNative
       column = cb.unpack1("n")
       table = tables.find { |t| t[:name] == name } or raise "statistics reference unknown table"
       raise "statistics reference unknown column" if column >= table[:columns].size
-    
+
       key = [name, column]
       if kind.zero?
         raise "duplicate statistics summary" if expected.key?(key)
@@ -3492,7 +4000,7 @@ module JedNative
         expected[key] = [mcv_count, histogram_count, term_count]
         return pos
       end
-    
+
       item = statistics.find { |s| s[:table] == name && s[:column] == column } or
         raise "statistics item precedes summary"
       counts = expected.fetch(key)
@@ -3500,12 +4008,12 @@ module JedNative
       ordinal = ob.unpack1("n")
       if kind == 3
         raise "statistics term under a term-ineligible summary" unless item[:terms]
-    
+
         rb, pos = take(buf, pos, 2 + 8)
         rows = rb.unpack1("q>")
         length = rb.byteslice(8, 2).unpack1("n")
         raise "invalid statistics term length" unless length.between?(1, 128)
-    
+
         term, pos = take(buf, pos, length)
         entries = item[:terms][:entries]
         raise "invalid statistics term ordinal/rows" unless ordinal == entries.size && ordinal < counts[2] &&
@@ -3514,7 +4022,7 @@ module JedNative
         if (last = entries.last) && (rows > last[1] || (rows == last[1] && term < last[0]))
           raise "statistics terms are out of order"
         end
-    
+
         entries << [term.b, rows]
         return pos
       end
@@ -3540,7 +4048,7 @@ module JedNative
       kind == 1 ? item[:mcv] << [value, frequency] : item[:histogram] << value
       pos
     end
-    
+
     def decode_image(image, page_size: nil, lazy: false, meta: nil)
       raise "truncated database header" if image.bytesize < 12
       ps = page_size || image.byteslice(8, 4).unpack1("N")
@@ -3568,28 +4076,28 @@ module JedNative
         raise "catalog chain revisits a page" unless seen_catalog.add?(cat)
         pg = read_page(image, ps, cat)
         raise "expected a catalog page" unless pg[:type] == PAGE_CATALOG && (pg[:flags] & ~1).zero?
-    
+
         # A catalog entry longer than a page continues on the following chain pages (v48).
         nxt = pg[:next_page]
         payload = pg[:payload]
         if pg[:flags] & 1 == 1
           raise "a continued catalog page holds other entries" unless pg[:item_count] == 1
-    
+
           payload = payload.dup
           loop do
             raise "a continued catalog entry ends the chain" if nxt.zero?
-    
+
             raise "catalog continuation revisits a page" unless seen_catalog.add?(nxt)
             cp = read_page(image, ps, nxt)
             raise "bad catalog continuation page" unless cp[:type] == PAGE_CATALOG && cp[:item_count].zero? &&
                                                             (cp[:flags] & ~1).zero?
-    
+
             payload << cp[:payload]
             nxt = cp[:next_page]
             break if (cp[:flags] & 1).zero?
           end
         end
-    
+
         pos = 0
         pg[:item_count].times do
           kb, pos = take(payload, pos, 1) # entry_kind: 0 table, 1 composite, 2 sequence, 3 collation
@@ -3620,8 +4128,10 @@ module JedNative
             next
           end
           raise "unknown catalog entry kind #{kind}" unless kind.zero?
-    
+
           entry, pos = decode_table_entry(payload, pos)
+          entry[:columns] = leaf_columns(entry[:columns], entry[:pk])
+          entry[:columns].each { |c| c[:tree_fixed_key] = tree_fixed_key?(entry) }
           if lazy
             rows = PagedRows.new(pool, entry[:root_data_page], entry[:columns], entry[:row_count])
             entry[:indexes].each do |index|
@@ -3710,8 +4220,8 @@ module JedNative
         end
       end
     end
-    
-    
+
+
     def decode_sequence_entry(buf, pos)
       name, pos = take_str(buf, pos)
       fields = {}
@@ -3722,7 +4232,7 @@ module JedNative
       fb, pos = take(buf, pos, 1)
       flags = fb.getbyte(0)
       raise "reserved sequence flag set" if (flags & ~0b111) != 0
-    
+
       # The OWNED BY tail (v13): present iff bit2 (has_owner) is set.
       owned_by = nil
       if (flags & 0b100) != 0
@@ -3730,13 +4240,13 @@ module JedNative
         col_raw, pos = take(buf, pos, 2)
         owned_by = [table, col_raw.unpack1("n")]
       end
-    
+
       [{ name: name, increment: fields[:increment], min_value: fields[:min_value],
          max_value: fields[:max_value], start: fields[:start], cache: fields[:cache],
          cycle: (flags & 0b1) != 0, last_value: fields[:last_value],
          is_called: (flags & 0b10) != 0, owned_by: owned_by }, pos]
     end
-    
+
   end
 end
 

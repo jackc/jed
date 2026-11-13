@@ -10,7 +10,7 @@ module JedNative
     COMPARISONS = %w[= <> != < <= > >= is\ distinct\ from is\ not\ distinct\ from @> <@ && << >> &< &> -|-].freeze
     UNMETERED_SCALARS = %w[i16 i32 i64 boolean text bytea uuid decimal f32 f64].freeze
     METADATA_STACK_SLICE = 24
-    attr_reader :types, :count, :correlated
+    attr_reader :types, :count, :correlated, :external_columns
 
     def initialize(engine, statement)
       @engine, @statement = engine, statement
@@ -19,6 +19,8 @@ module JedNative
       @ctes = engine.instance_variable_get(:@ctes).transform_values(&:columns)
       @scope_depth = 0
       @type_revision = 0
+      @expression_types = {}.compare_by_identity
+      @external_columns = []
     end
 
     def highest_parameter(node)
@@ -49,12 +51,12 @@ module JedNative
       # A later occurrence can constrain an earlier function or expression.
       (@count + 1).times do
         previous = @types.dup
-        @expression_types = nil
+        @expression_types = {}.compare_by_identity
         statement(@statement)
         break if @types == previous
       end
       @final = true
-      @expression_types = nil
+      @expression_types = {}.compare_by_identity
       statement(@statement)
       raise Error.new('42P18', 'could not determine parameter type') if @types.include?(UNKNOWN)
       self
@@ -76,7 +78,7 @@ module JedNative
       @types = Array.new(@count, UNKNOWN) if @types.empty? && @count.positive?
       @correlated = false
       @validate_names = true
-      @expression_types = nil
+      @expression_types = {}.compare_by_identity
       statement(node, outer.map { |column| column.merge(binding_external: true, binding_scope: -1) })
     end
 
@@ -90,6 +92,7 @@ module JedNative
         if value.nil? && @not_null[index]
           raise Error.new('23502', 'NULL parameter assigned to a NOT NULL column')
         end
+        validate_host_text(value, @types[index])
         result = coerce(value, @types[index])
         if (modifiers = @modifiers[index])
           modifiers.each { |mod| result = @engine.send(:explicit_modifier, result, @types[index], mod) }
@@ -103,6 +106,26 @@ module JedNative
     # conversions keep the ordinary execution-time path because they can charge
     # work, consult the statement clock, or recursively perform either action.
     def reusable_bound_values? = @types.all? { |type| UNMETERED_SCALARS.include?(type) }
+
+    def validate_host_text(value, type)
+      case value
+      when Bytea then nil
+      when String
+        return if type == 'bytea' && value.encoding == Encoding::BINARY
+        text = value.dup.force_encoding(Encoding::UTF_8)
+        raise Error.new('22021', 'text must be valid UTF-8 without NUL') unless text.valid_encoding? && !text.include?("\0")
+      when JsonValue
+        validate_host_text(value.value, nil) if value.binary
+      when Array
+        fields = @engine.instance_variable_get(:@types)[type]
+        value.each_with_index do |element, index|
+          target = fields ? fields[index]&.dig(:type) : type&.delete_suffix('[]')
+          validate_host_text(element, target)
+        end
+      when Hash
+        value.each { |key, element| validate_host_text(key, nil); validate_host_text(element, nil) }
+      end
+    end
 
     def coerce(value, type)
       return nil if value.nil?
@@ -162,14 +185,14 @@ module JedNative
       @not_null[index] = true if not_null
     end
 
-    def statement(node, outer = [])
+    def statement(node, outer = [], targets = nil)
       stack_depth = @metadata_depth || 0
       return [] unless node
       # Metadata is resolved before a cursor can yield. Bound each VM stack
       # independently of the SQL nesting limit while preserving scope order.
       if stack_depth >= METADATA_STACK_SLICE
         @metadata_depth = 0
-        return Fiber.new { statement(node, outer) }.resume
+        return Fiber.new { statement(node, outer, targets) }.resume
       end
       @metadata_depth = stack_depth + 1
       previous_depth = @scope_depth
@@ -192,8 +215,9 @@ module JedNative
         scope = input_columns(node, outer)
         scope = scope.map { |column| column.merge(binding_scope: @scope_depth) } + outer
         expression(node[:where], scope, 'boolean') if node[:where]
-        output = (node[:columns] || []).flat_map do |projection|
+        output = (node[:columns] || []).each_with_index.flat_map do |projection, output_index|
           expr = projection[:expr]
+          assignment(expr, targets&.[](output_index), scope) if targets
           if expr[:kind] == :star
             scope.select { |column| !column[:star_hidden] && (expr[:table] ? column[:table] == expr[:table] : !column[:qualified_only] && column[:binding_scope] == @scope_depth) }
           elsif expr[:kind] == :field_star
@@ -217,10 +241,12 @@ module JedNative
         width = rows.first&.length || 0
         Array.new(width) do |i|
           nodes = rows.map { |row| row[i] }
-          { name: "column#{i + 1}", type: unify(nodes, outer), record_fields: common_record_fields(nodes.map { |item| record_fields(item, outer) }) }
+          { name: "column#{i + 1}", type: unify(nodes, outer, targets&.[](i)&.dig(:type)), record_fields: common_record_fields(nodes.map { |item| record_fields(item, outer) }) }
         end
       when :set_operation, :setop
-        left, right = statement(node[:left], outer), statement(node[:right], outer)
+        expression(node[:limit], outer, 'i64') if node[:limit].is_a?(Hash)
+        expression(node[:offset], outer, 'i64') if node[:offset].is_a?(Hash)
+        left, right = statement(node[:left], outer, targets), statement(node[:right], outer, targets)
         left.each_with_index.map { |column, i| column.merge(type: common(column[:type], right[i]&.dig(:type)), record_fields: common_record_fields([column[:record_fields], right[i]&.dig(:record_fields)])) }
       when :insert, :update, :delete
         view = @engine.instance_variable_get(:@views)[node[:table]]
@@ -231,7 +257,7 @@ module JedNative
           (node[:rows] || []).each do |row|
             row.each_with_index { |value, i| assignment(value, columns[i], scope) if columns[i] }
           end
-          statement(node[:query], outer) if node[:query]
+          statement(node[:query], outer, columns) if node[:query]
           if (conflict = node[:on_conflict])
             conflict_scope = scope + @engine.table_columns(table, 'excluded')
             (conflict[:assignments] || []).each do |item|
@@ -323,6 +349,7 @@ module JedNative
           expression(call[:context], outer, 'jsonb')
           expression(call[:path], outer, 'jsonpath')
           (call[:passing] || []).each { |binding| expression(binding[:expr], outer) }
+          @engine.compile_json_table_columns(call[:columns])
           @engine.json_table_columns(call[:columns])
         elsif defined?(JsonRelations) && JsonRelations::JSON_RELATIONS.include?(call[:name])
           arguments = (call[:args] || []).map { |arg| Expression.new(kind: :metadata, type: expression(arg, outer)) }
@@ -339,6 +366,12 @@ module JedNative
     end
 
     def expression(node, scope, wanted = nil)
+      depth = @expression_depth || 0
+      if depth >= 12
+        @expression_depth = 0
+        return Fiber.new { expression(node, scope, wanted) }.resume
+      end
+      @expression_depth = depth + 1
       return resolve_expression(node, scope, wanted) unless @expression_types && node.is_a?(Hash)
       scopes = (@expression_types[scope] ||= {}.compare_by_identity)
       types = (scopes[node] ||= {})
@@ -346,6 +379,8 @@ module JedNative
       return types[key] if types.key?(key)
       result = resolve_expression(node, scope, wanted)
       types[[wanted, @type_revision]] = result
+    ensure
+      @expression_depth = depth
     end
 
     def resolve_expression(node, scope, wanted = nil)
@@ -373,6 +408,7 @@ module JedNative
           raise Error.new(code, "unknown column #{node[:name]}")
         end
         @correlated = true if matches.first&.dig(:binding_external)
+        @external_columns << matches.first if matches.first&.dig(:binding_external)
         matches.first&.dig(:type) || UNKNOWN
       when :cast
         type = Types.normalize(node[:type])
@@ -461,6 +497,14 @@ module JedNative
         return 'boolean'
       end
       lt, rt = expression(left, scope), expression(right, scope)
+      if left[:kind] == :literal && left[:untyped] && left[:value].is_a?(String)
+        lt = rt if rt.end_with?('[]') || Types::RANGES.key?(rt)
+        lt = 'interval' if op == '+' && %w[timestamp timestamptz].include?(rt)
+      end
+      if right[:kind] == :literal && right[:untyped] && right[:value].is_a?(String)
+        rt = lt if lt.end_with?('[]') || Types::RANGES.key?(lt)
+        rt = op == '+' ? 'interval' : lt if %w[+ -].include?(op) && %w[timestamp timestamptz].include?(lt)
+      end
       # JSON deletion has heterogeneous operands; it does not use arithmetic's
       # common-type rule. Resolution still validates the operand in compile.
       if op == '-' && lt == 'jsonb'
@@ -506,6 +550,12 @@ module JedNative
       # constructors, so reuse its type for the same scope/hint/binding revision.
       @expression_types ||= {}.compare_by_identity if @count.positive?
       types = nodes.map { |node| expression(node, scope) }
+      container = types.find { |t| t.end_with?('[]') || Types::RANGES.key?(t) }
+      if container
+        nodes.each_with_index do |node, i|
+          types[i] = container if node[:kind] == :literal && node[:untyped] && node[:value].is_a?(String)
+        end
+      end
       type = types.reduce(wanted || UNKNOWN) { |a, b| common(a, b) }
       nodes.each { |node| expression(node, scope, type) } if @count.positive? && known?(type)
       type
@@ -616,7 +666,7 @@ module JedNative
     def query_metadata(statement, outer = [])
       binding = ParameterBindings.new(self, statement)
       columns = binding.query_columns(statement, outer, parameter_types: @native_binding_types)
-      { columns: columns, correlated: binding.correlated }
+      { columns: columns, correlated: binding.correlated, external_columns: binding.external_columns }
     end
 
     def dispatch(statement)

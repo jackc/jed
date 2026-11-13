@@ -79,6 +79,42 @@ module JedNative
       @native_expression_work_depth = depth
     end
 
+    def pushdown_safe?(expression)
+      depth = @native_pushdown_depth || 0
+      if depth >= STACK_SLICE
+        @native_pushdown_depth = 0
+        return Fiber.new { pushdown_safe?(expression) }.resume
+      end
+      @native_pushdown_depth = depth + 1
+      super
+    ensure
+      @native_pushdown_depth = depth
+    end
+
+    def symbolic_interval_shape(expression, names)
+      depth = @native_interval_shape_depth || 0
+      if depth >= STACK_SLICE
+        @native_interval_shape_depth = 0
+        return Fiber.new { symbolic_interval_shape(expression, names) }.resume
+      end
+      @native_interval_shape_depth = depth + 1
+      super
+    ensure
+      @native_interval_shape_depth = depth
+    end
+
+    def reduce_intervals(expression, key, encoder)
+      depth = @native_interval_reduce_depth || 0
+      if depth >= STACK_SLICE
+        @native_interval_reduce_depth = 0
+        return Fiber.new { reduce_intervals(expression, key, encoder) }.resume
+      end
+      @native_interval_reduce_depth = depth + 1
+      super
+    ensure
+      @native_interval_reduce_depth = depth
+    end
+
     def evaluate(expression, row, group = nil)
       return super unless @native_evaluation_depth || expression.instance_variable_get(:@native_deep_evaluation)
       depth = @native_evaluation_depth

@@ -276,7 +276,7 @@ module JedNative
     def atom
       char = take
       case char
-      when '(' 
+      when '('
         @depth += 1
         raise Error.new('54001', 'regular expression nesting is too deep') if @depth > 256
         capture = true
@@ -328,7 +328,7 @@ module JedNative
       take if negated
       ranges, first = [], true
       while peek && (peek != ']' || first)
-        invalid('unbalanced bracket expression') if peek == '[' && @characters[@position + 1] == ':'
+        invalid('unsupported bracket expression') if peek == '[' && %w[: . =].include?(@characters[@position + 1])
         node = take == '\\' ? escape(true) : [:char, fold(@characters[@position - 1])]
         if node[0] == :char && peek == '-' && @characters[@position + 1] && @characters[@position + 1] != ']'
           take
@@ -385,7 +385,20 @@ module JedNative
       amount
     end
 
+    def nullable?(node)
+      case node[0]
+      when :char, :any, :any_char, :class then false
+      when :concat then node[1].all? { |child| nullable?(child) }
+      when :alternatives then node[1].any? { |child| nullable?(child) }
+      when :group then nullable?(node[2])
+      when :plus then nullable?(node[1])
+      when :repeat then node[2].zero? || nullable?(node[1])
+      else true
+      end
+    end
+
     def emit(node)
+      return emit([:optional, [:plus, node[1], node[2]], node[2]]) if node[0] == :star && nullable?(node[1])
       case node[0]
       when :concat then node[1].each { |child| emit(child) }
       when :alternatives then emit_alternatives(node[1], 0)

@@ -314,8 +314,8 @@ module JedNative
       work = access[:kind] == :gin ? rows : access[:kind] == :gist ? pages : 0
       original_rows = rows
       order = scan_candidate_order(statement, stored, access)
-      limit = statement && statement[:limit] && statement[:limit][:kind] == :literal && statement[:limit][:value]
-      offset = statement && statement[:offset] && statement[:offset][:kind] == :literal ? statement[:offset][:value] || 0 : 0
+      limit = statement && statement[:limit] && plan_constant(plan_compile(statement[:limit], []))
+      offset = statement && statement[:offset] ? plan_constant(plan_compile(statement[:offset], [])) || 0 : 0
       if order != :blocking && limit.is_a?(Integer)
         target = [limit + offset, 0].max
         cap = required_scan_input(predicate, target, rows)

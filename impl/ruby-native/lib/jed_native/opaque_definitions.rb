@@ -236,7 +236,7 @@ module JedNative
   Engine.prepend(OpaqueDefinitions)
 
   module OpaqueBindingDefinitions
-    def statement(node, outer = [])
+    def statement(node, outer = [], targets = nil)
       @engine.require_parsed_definition(node)
       super
     end

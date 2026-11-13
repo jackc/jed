@@ -280,12 +280,21 @@ module JedNative
 
   def self.from_image(bytes, **options)
     require_relative 'jed_native/persistence'
+    bytes = String(bytes).b.dup.freeze
+    if bytes.bytesize >= 12
+      size = bytes.byteslice(8, 4).unpack1('N')
+      if size.between?(512, 65_536) && bytes.bytesize >= 2 * size && file_suite(bytes.byteslice(0, size), bytes.byteslice(size, size)) != 0
+        raise Error.new('55000', 'an in-memory database cannot be encrypted')
+      end
+    end
     db = Database.new(**options)
     codec = FileFormat.new(collation_key: ->(name, value) { db.engine.resolve_collation(name).sort_key(value) })
     state = codec.decode_image(bytes, lazy: true)
     db.engine.instance_variable_set(:@native_page_size, bytes.byteslice(8, 4).unpack1('N'))
     db.engine.send(:import_storage, state)
     db.engine.seed_memory_image(bytes, state)
+    db.instance_variable_set(:@logical_version, state[:meta][:txid])
+    db.instance_variable_set(:@main_publication_tag, db.shared_tag)
     return db unless block_given?
     begin
       yield db
@@ -306,6 +315,8 @@ module JedNative
     storage_options = options.reject { |key, _| engine_options.key?(key) }
     db = Database.new(**engine_options)
     db.engine.attach_storage(path: path, create: create, **storage_options)
+    db.instance_variable_set(:@logical_version, db.engine.instance_variable_get(:@storage).meta[:txid])
+    db.instance_variable_set(:@main_publication_tag, db.shared_tag)
     db.engine.set_max_storage_bytes(storage_options[:max_storage_bytes]) if storage_options.key?(:max_storage_bytes)
     return db unless block_given?
     begin
@@ -346,3 +357,5 @@ require_relative 'jed_native/query_walks'
 require_relative 'jed_native/expression_walks'
 require_relative 'jed_native/merge'
 require_relative 'jed_native/encryption_operations'
+require_relative 'jed_native/whole_rows'
+require_relative 'jed_native/serialization'

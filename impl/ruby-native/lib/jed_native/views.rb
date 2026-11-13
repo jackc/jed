@@ -717,6 +717,7 @@ module JedNative
                   source = source.merge(from: frozen[:from], joins: frozen[:joins])
                   view_query_columns(frozen, ctes, outer)
                 else
+                  source = freeze_view_expression(source, ctes, outer, dependencies)
                   analyzer = ParameterBindings.new(self, source)
                   analyzer.instance_variable_set(:@ctes, ctes)
                   analyzer.relation_columns(source, outer)

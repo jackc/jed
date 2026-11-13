@@ -100,7 +100,7 @@ module JedNative
             @engine.instance_variable_set(:@storage_publication, signature)
             @engine.instance_variable_get(:@tables).merge!(attached_tables)
             @engine.instance_variable_set(:@persisted_snapshot, @engine.send(:storage_signature, @engine.export_storage))
-            @logical_version += 1
+            @logical_version = storage.meta[:txid]
             @main_publication_tag = shared_tag
           end
           @service_seen[storage.path] = signature

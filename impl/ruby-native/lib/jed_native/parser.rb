@@ -748,6 +748,7 @@ module JedNative
           node = { kind: :in, expr: left, query: right[:query], negated: negated }
         else
           values = separated { expression(31) }
+          raise Error.new('54001', 'IN list exceeds 1000 entries') if values.length > 1000
           node = { kind: :in, expr: left, values: values, negated: negated }
         end
         expect(')')
@@ -893,6 +894,13 @@ module JedNative
             return { kind: :call, name: 'extract', args: [literal(field, 'text'), expr] }
           end
         end
+      end
+      name = 'double precision' if !quoted && name == 'double' && accept('precision')
+      if !quoted && name == 'timestamp' && (at?('with') || at?('without'))
+        zone = advance.value
+        expect('time')
+        expect('zone')
+        name = "timestamp #{zone} time zone"
       end
       name = 'character varying' if !quoted && name == 'character' && accept('varying')
       if current.kind == :string

@@ -72,8 +72,9 @@ The [ordering follow-up](ORDERING_FOLLOWUP.md) specializes typed ORDER BY
 comparators and measures whole-query gains with interpreter/YJIT/ZJIT controls.
 [Runtime instructions](../../bench/ruby-native/RUNTIMES.md)
 describe the separate opt-in build; the repository's normal Ruby version is unchanged.
-The [parity update](PARITY_UPDATE.md) brought the surface level with source revision
-`56f49192`, including encryption at rest, and lists the remaining omissions.
+The [November parity update](PARITY_UPDATE_2026-11-12.md) refreshes the experiment
+against source revision `b1a6affc`, including format v52 and database serialization.
+The [October report](PARITY_UPDATE.md) preserves its earlier baseline and evidence.
 Future features do not update this directory unless explicitly requested.
 
 ```ruby
@@ -87,7 +88,7 @@ JedNative.memory do |db|
 end
 ```
 
-`JedNative.create(path)` and `JedNative.open(path)` use the shared v50 file format
+`JedNative.create(path)` and `JedNative.open(path)` use the shared v52 file format
 and a pure Ruby `flock` host. The default `locking: :auto` uses protocol-v2
 page-service ownership: one process owns the file and other processes run their
 own Ruby engine as page clients. Use `locking: :exclusive` to require sole access.
@@ -183,6 +184,19 @@ its transaction and releases its lock without refunding the accrued cost.
 a session inside a transaction or pinned read exports its committed snapshot.
 Pending changes, temporary objects, and attachments are excluded from that image.
 Use `JedNative.from_image(bytes)` to open the image in memory.
+
+`db.serialize(name = 'main')` exports the named database's committed snapshot at
+its own page size and version, including from an open file. Pending writes and
+session temporary objects are excluded. `JedNative.deserialize(bytes, **options)`
+(or `JedNative::Database.deserialize`) copies a valid image into a new in-memory
+database and preserves its page size/version. The caller retains ownership of the
+input buffer. Export rejects encrypted databases (`0A000`); import rejects
+encrypted images (`55000`). Unknown export names and `temp` are `42704`.
+
+Inside `session.update`/`view`/`transaction`, SQL COMMIT/ROLLBACK returns `2D000`
+and aborts the block; direct `commit`/`rollback` refuses without aborting it. A
+closure that swallows a statement error still returns `25P02` unless it recovers
+through a savepoint. `db.close` refuses an open writer with `55006`.
 
 `#query` and `#query_prepared` return a lazy `Rows` enumerable for reads. Rows have
 numeric and name access. Exhausting enumeration or calling `#close` releases the

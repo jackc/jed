@@ -104,13 +104,17 @@ module JedNative
         args = args[0...-1] + array.map { Expression.new(kind: :literal, type: type) }
         values.concat(array)
       end
-      charge(values.length) if name.include?('_build_') || %w[json_object jsonb_object].include?(name)
+      charge(values.length) if name.include?('_build_')
       if %w[json_object jsonb_object].include?(name)
         return nil if values.any?(&:nil?)
+        charge(values.first.length / (values.length == 1 ? 2 : 1))
         if values.length == 2
+          raise Error.new('2202E', 'arrays must be one-dimensional') if values.any? { |v| v.dimensions.length > 1 }
           raise Error.new('2202E', 'mismatched array dimensions') unless values[0].length == values[1].length
           pairs = values[0].zip(values[1])
         else
+          dims = values[0].dimensions
+          raise Error.new('2202E', 'array must have two columns') if dims.length > 2 || dims.length == 2 && dims[1] != 2
           raise Error.new('2202E', 'array must have an even number of elements') unless values[0].length.even?
           pairs = values[0].each_slice(2).to_a
         end

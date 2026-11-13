@@ -99,7 +99,7 @@ module JedNative
 
     def value(slot, column)
       region = data[:regions].fetch(column)
-      @pool.codec.leaf_value(region, @columns[column][:type], slot, @pool.fetch_page)
+      @pool.codec.leaf_value(region, @columns[column], slot, @pool.fetch_page)
     rescue Error
       raise
     rescue StandardError => error
@@ -162,15 +162,17 @@ module JedNative
 
     def records
       codec = @pool.codec
-      shape = { columns: @columns }
+      shape = { columns: @columns, pk_order: @columns.each_index.select { |i| @columns[i].key?(:key_at) }.sort_by { |i| @columns[i][:key_at] } }
       self[:keys].each_with_index.map do |key, slot|
         row = @columns.each_index.map { |column| storage_reference(slot, column) || value(slot, column) }
         forms = row.map { |value| value.is_a?(StoredValue) ? value.form : :inline }
         comps = row.map { |value| value.is_a?(StoredValue) ? value.compressed_block : nil }
         size = key.bytesize + row.each_with_index.sum do |value, column|
-          codec.fixed_width(@columns[column][:type]) || (value.is_a?(StoredValue) ? value.stored_bytes.bytesize : 0)
+          if @columns[column][:key_at] then 0
+          else codec.fixed_width(@columns[column]) || (value.is_a?(StoredValue) ? value.stored_bytes.bytesize - (codec.string_col?(@columns[column]) && value.form == :inline ? 2 : 0) : 0)
+          end
         end
-        { key: key, row: row, table: shape, forms: forms, comps: comps, size: size }
+        { key: key, row: row, table: shape, forms: forms, comps: comps, size: size, pointer_tag: (codec.encrypted? ? Crypto::TAG : 0) }
       end
     end
 
@@ -375,7 +377,7 @@ module JedNative
       # Fixed-width columns cannot spill or compress. Their zero payload block
       # must not force later leaves merely to price a short LIMIT scan.
       selected = columns || @columns.each_index
-      return [0, 0] if selected.all? { |column| @pool.codec.fixed_width(@columns[column][:type]) }
+      return [0, 0] if selected.all? { |column| @pool.codec.fixed_width(@columns[column]) }
       pages = slabs = 0
       if ordinals
         ordinals.each do |ordinal|

@@ -46,6 +46,7 @@ module JedNative
         context&.charge(program.code.length)
       end
       original = RegexText.new(source)
+      group = 0 if group == 1 && program.groups.zero?
       input = program.input(original)
       if %w[regexp_like regex_match regex_imatch].include?(name)
         return !program.search(input, 0, context: context).nil?
@@ -134,11 +135,12 @@ module JedNative
       result, literal, escaped = [], +'', false
       template.each_char do |char|
         if escaped
-          if char.between?('0', '9') || char == '&'
+          if char.between?('1', '9') || char == '&'
             result << literal unless literal.empty?
             literal = +''
             result << (char == '&' ? 0 : char.to_i)
           else
+            literal << '\\' unless char == '\\'
             literal << char
           end
           escaped = false

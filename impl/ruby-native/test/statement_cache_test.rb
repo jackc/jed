@@ -52,7 +52,7 @@ module NativeStatementCacheTests
         assert(cached.encoding == fresh.encoding, 'equal SQL reused a different source encoding')
       end
       binary = "SELECT '\xff'".b
-      session.execute(binary)
+      error('22021') { session.execute(binary) }
       error('22021') { session.execute(binary.dup.force_encoding(Encoding::UTF_8)) }
       before = entries(database).length
       2.times { error('42601') { session.query('SELECT (') } }

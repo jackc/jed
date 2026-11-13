@@ -270,14 +270,22 @@ module JedNative
     def <=>(other) = other.is_a?(IntervalValue) ? span <=> other.span : nil
     def +(other) = self.class.new(@months + other.months, @days + other.days, @micros + other.micros)
     def -@ = self.class.new(-@months, -@days, -@micros)
-    def -(other) = self + -other
+    def -(other) = self.class.new(@months - other.months, @days - other.days, @micros - other.micros)
     def *(factor)
-      factor = Decimal.parse(factor).to_r
+      factor = factor.is_a?(Rational) ? factor : Decimal.parse(factor).to_r
       months = @months * factor
-      days = @days * factor + (months - months.to_i) * 30
-      micros = @micros * factor + (days - days.to_i) * TimestampValue::DAY
-      rounded = (micros.abs + Rational(1, 2)).floor * (micros.negative? ? -1 : 1)
-      self.class.new(months.to_i, days.to_i, rounded)
+      whole_months = months.to_i
+      whole_days = (@days * factor).to_i
+      month_days = ((months - whole_months) * 30 * 1_000_000).round(half: :even).to_r / 1_000_000
+      remainder = ((@days * factor - whole_days + month_days - month_days.to_i) * TimestampValue::DAY).round(half: :even)
+      whole_days += month_days.to_i
+      if remainder.abs >= TimestampValue::DAY
+        carry = Rational(remainder, TimestampValue::DAY).to_i
+        whole_days += carry
+        remainder -= carry * TimestampValue::DAY
+      end
+      micros = (@micros * factor + remainder).round(half: :even)
+      self.class.new(whole_months, whole_days, micros)
     end
     def to_s
       pieces = []
@@ -317,6 +325,13 @@ module JedNative
       @lower_bounds = lower_bounds || [lower_bound] * @dimensions.length
       raise Error.new('54000', 'number of array dimensions exceeds six') if @dimensions.length > 6
     end
+    def validate_bounds!
+      @dimensions.each_with_index do |n, i|
+        lb = @lower_bounds[i]
+        raise Error.new('54000', 'array bound out of range') unless n.between?(0, 2**31 - 1) && lb.between?(-2**31, 2**31 - 1) && lb + n < 2**31
+      end
+      self
+    end
     def lower_bound = @lower_bounds.first || 1
     def lower_bound=(value)
       @lower_bounds[0] = value
@@ -341,7 +356,7 @@ module JedNative
       prefix + render.call(0)
     end
   end
-  
+
   class CompositeValue < Array
     attr_accessor :type_name, :field_names
     def initialize(values = [], type_name: 'record', field_names: nil)
@@ -368,13 +383,15 @@ module JedNative
         @empty ||= comparison.zero? && !(@lower_inc && @upper_inc)
       end
       if %w[i32 i64 date].include?(element_type) && !@empty
-        @lower += 1 if @lower && !@lower_inc
-        @upper += 1 if @upper && @upper_inc
+        lower_finite = !(@lower.is_a?(DateValue) && @lower.days.is_a?(Float))
+        upper_finite = !(@upper.is_a?(DateValue) && @upper.days.is_a?(Float))
+        @lower += 1 if @lower && !@lower_inc && lower_finite
+        @upper += 1 if @upper && @upper_inc && upper_finite
         Types.check_integer(@lower, element_type) if @lower && Types::INTEGER_BITS.key?(element_type)
         Types.check_integer(@upper, element_type) if @upper && Types::INTEGER_BITS.key?(element_type)
-        @lower_inc = !@lower.nil?
-        @upper_inc = false
-        @empty = !@lower.nil? && !@upper.nil? && Types.compare(@lower, @upper) >= 0
+        @lower_inc = !@lower.nil? if lower_finite
+        @upper_inc = false if upper_finite
+        @empty = !@lower.nil? && !@upper.nil? && (Types.compare(@lower, @upper) > 0 || Types.compare(@lower, @upper).zero? && !(@lower_inc && @upper_inc))
       end
       if @empty then @lower = @upper = nil; @lower_inc = @upper_inc = false end
       freeze
@@ -537,7 +554,7 @@ end
         number = if value.is_a?(Numeric) then value.to_f else
           text = value.to_s.strip
           case text.downcase
-          when 'nan' then Float::NAN
+          when 'nan', '+nan', '-nan' then Float::NAN
           when 'infinity', '+infinity', 'inf', '+inf' then Float::INFINITY
           when '-infinity', '-inf' then -Float::INFINITY
           else Float(text, exception: false) || (raise Error.new('22P02', 'invalid input syntax for float'))
@@ -546,11 +563,29 @@ end
         if number.infinite? && !value.is_a?(Float) && !/\A[+-]?(?:inf|infinity)\z/i.match?(value.to_s.strip)
           raise Error.new('22003', 'float out of range')
         end
-        narrowed = if type == 'f32' && number.finite? && number.abs > 3.4028234663852886e38 && number.abs < (2**128 - 2**103)
-          number.negative? ? -3.4028234663852886e38 : 3.4028234663852886e38
-        else
-          type == 'f32' ? [number].pack('f').unpack1('f') : number
+        narrowed =         if type == 'f32' && number.finite? && number.abs > 3.4028234663852886e38 && number.abs < (2**128 - 2**103)
+                  number.negative? ? -3.4028234663852886e38 : 3.4028234663852886e38
+                else
+                  type == 'f32' ? [number].pack('f').unpack1('f') : number
+                end
+        if type == 'f32' && number.finite? && !value.is_a?(Float)
+          exact = value.is_a?(Decimal) ? value.to_r : value.is_a?(Integer) ? value.to_r : Rational(value.to_s.strip)
+          if exact.abs >= (2**128 - 2**103)
+            raise Error.new('22003', 'float out of range')
+          end
+          bits = [narrowed.abs].pack('g').unpack1('N')
+          candidates = ([bits - 1, 0].max..[bits + 1, 0x7f7fffff].min).map do |u|
+            f = [u].pack('N').unpack1('g')
+            [(f.to_r - exact.abs).abs, u & 1, f]
+          end
+          narrowed = candidates.min[2] * (exact.negative? ? -1 : 1) unless candidates.empty? || exact.zero?
         end
+        nonzero = if value.is_a?(Float) then !value.zero?
+                  elsif value.is_a?(Decimal) then !value.coefficient.zero?
+                  elsif value.is_a?(Integer) then !value.zero?
+                  else value.to_s.match?(/[1-9]/) && Rational(value.to_s.strip) != 0 rescue false
+                  end
+        raise Error.new('22003', 'float underflow') if narrowed.zero? && nonzero
         raise Error.new('22003', 'float out of range') if narrowed.infinite? && number.finite?
         narrowed
       when 'boolean'
@@ -772,6 +807,9 @@ end
       end
   if result.is_a?(Float)
     result = [result].pack('f').unpack1('f') if type == 'f32'
+    underflow = result.zero? && ((%w[* mul].include?(op) && !a.zero? && !b.zero?) ||
+      (%w[/ div].include?(op) && !a.zero? && b.finite?))
+    raise Error.new('22003', 'float underflow') if underflow
     raise Error.new('22003', 'float out of range') if result.infinite? && a.respond_to?(:finite?) && b.respond_to?(:finite?) && a.finite? && b.finite?
   end
   result.is_a?(Integer) ? check_integer(result, type || 'i64') : result
@@ -781,11 +819,11 @@ end
       return a - b if a.is_a?(DateValue) && (b.is_a?(Integer) || b.is_a?(DateValue)) && op == '-'
       return IntervalValue.new(0, 0, a.micros - b.micros) if a.is_a?(TimestampValue) && b.is_a?(TimestampValue) && op == '-'
       if b.is_a?(IntervalValue) && (a.is_a?(TimestampValue) || a.is_a?(DateValue))
-        b = -b if op == '-'
+        sign = op == '-' ? -1 : 1
         micros = a.is_a?(DateValue) ? a.days * TimestampValue::DAY : a.micros
         day, time = micros.divmod(TimestampValue::DAY)
         y, m, d = DateValue.new(day).parts
-        month = y * 12 + m - 1 + b.months
+        month = y * 12 + m - 1 + sign * b.months
         y, m = month.divmod(12)
         m += 1
         begin
@@ -794,7 +832,9 @@ end
           d -= 1
           retry
         end
-        return TimestampValue.new((date.days + b.days) * TimestampValue::DAY + time + b.micros, zoned: a.is_a?(TimestampValue) && a.zoned)
+        micros = TimeZoneData.finite(date.days * TimestampValue::DAY + time)
+        micros = TimeZoneData.finite(micros + sign * b.days * TimestampValue::DAY)
+        return TimestampValue.new(TimeZoneData.finite(micros + sign * b.micros), zoned: a.is_a?(TimestampValue) && a.zoned)
       end
       return a + b if a.is_a?(IntervalValue) && b.is_a?(IntervalValue) && op == '+'
       return a - b if a.is_a?(IntervalValue) && b.is_a?(IntervalValue) && op == '-'
@@ -954,6 +994,7 @@ module JedNative
       while (match = /\A\[(-?\d+):(-?\d+)\]/.match(text))
         lower, upper = match[1].to_i, match[2].to_i
         raise Error.new('2202E', 'upper bound cannot be less than lower bound') if upper < lower
+        raise Error.new('54000', 'array bound out of range') unless lower.between?(-2**31, 2**31 - 1) && upper < 2**31 - 1 && (upper - lower + 1) < 2**31
         dimensions << upper - lower + 1
         lower_bounds << lower
         text = text[match[0].length..]

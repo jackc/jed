@@ -80,7 +80,7 @@ module JedNative
   module MergeBindings
     private
 
-    def statement(node, outer = [])
+    def statement(node, outer = [], targets = nil)
       return super unless node.is_a?(Hash) && node[:kind] == :merge
       previous_ctes, previous_depth = @ctes.dup, @scope_depth
       @scope_depth += 1
@@ -405,6 +405,8 @@ module JedNative
       source_label = merge_source_label(statement)
       raise Error.new('42712', "table name \"#{label}\" specified more than once") if source_label && source_label == label
       raw_source = merge_source_columns(statement)
+      label = statement[:alias] || statement[:table]
+      raise Error.new('42P09', 'ambiguous target alias') if raw_source.any? { |c| c[:table] == label }
       visible = raw_source.reject { |column| column[:qualified_only] || column[:star_hidden] }
       hidden = raw_source.select { |column| column[:qualified_only] && !column[:star_hidden] }
       source_scope = visible + hidden

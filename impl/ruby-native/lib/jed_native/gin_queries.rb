@@ -74,7 +74,7 @@ module JedNative
         end
         if value.is_a?(String)
           last = accessors.last&.dig(:kind)
-          as_key = @strict && %i[elements subscript].include?(last)
+          as_key = @strict && (last.nil? || %i[elements subscript].include?(last))
           either = !@strict || last == :descendants
           if either
             parts << node(:any, [leaf(@codec.gin_jsonb_scalar_term(tag, false)), leaf(@codec.gin_jsonb_scalar_term(tag, true))])

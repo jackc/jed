@@ -108,7 +108,7 @@ module JedNative
       @environment ||= Environment.new
       if name == 'uuidv7'
         instant = clock_value('now')
-        instant = Types.binary('+', instant, shift, type: 'timestamptz') if shift
+        instant = shift_zoned_timestamp(instant, shift) if shift
         milliseconds = instant.micros.div(1000)
         raise Error.new('22008', 'UUID timestamp outside its supported range') unless milliseconds.between?(0, (1 << 48) - 1)
         counter = (@uuid_counter || 0) & 0xfff

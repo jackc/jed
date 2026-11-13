@@ -59,7 +59,7 @@ module JedNative
         record = { key: encoded, row: [], table: { columns: [] }, forms: [], comps: [], size: encoded.bytesize }
         if tree
           result = put_tree_key(tree, encoded, record, capacity)
-          tree = result[0] == :split ? { keys: [result[2]], recs: [], children: [result[1], result[3]] } : result[1]
+          tree = grow_root(result, capacity)
         else
           tree = { keys: [encoded], recs: [record], children: [] }
         end
