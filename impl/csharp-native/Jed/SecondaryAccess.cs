@@ -113,7 +113,27 @@ internal sealed record SecondaryAccess(CatalogIndex Index, StorageTree Tree, Tab
             if (prefix[i] != 255) { var next = prefix[..(i + 1)]; next[i]++; return next; }
         return null;
     }
+    internal async IAsyncEnumerable<StorageRecord> OrderedRecords(CatalogTable table, StorageTree primary, Catalog catalog, Meter meter,
+        IReadOnlySet<int>? touched, [EnumeratorCancellation] CancellationToken token)
+    {
+        if (Scan.Empty) yield break;
+        meter.Charge(Tree.CountRangeNodes(Scan.Lower, Scan.LowerInclusive, Scan.Upper, Scan.UpperInclusive)); meter.Checkpoint(token);
+        await foreach (var entry in Tree.ScanRangeAsync(Scan.Lower, Scan.LowerInclusive, Scan.Upper, Scan.UpperInclusive, cancellationToken: token).ConfigureAwait(false))
+        {
+            var key = StatementExecution.IndexStorageKey(table, Index, entry.Key, catalog);
+            meter.Charge(primary.Height); meter.Checkpoint(token);
+            var record = await primary.FindAsync(key, token).ConfigureAwait(false) ?? throw StorageFormat.Corrupt("secondary index names a missing row");
+            meter.Charge(primary.ValueReadUnits(record, touched)); meter.Charge(Costs.StorageRowRead); meter.Checkpoint(token);
+            yield return record;
+        }
+    }
     internal async IAsyncEnumerable<SqlValue[]> Rows(CatalogTable table, StorageTree primary, Catalog catalog, Meter meter,
+        IReadOnlySet<int>? touched, [EnumeratorCancellation] CancellationToken token, bool reverse = false)
+    {
+        await foreach (var record in Records(table, primary, catalog, meter, touched, token, reverse).ConfigureAwait(false))
+            yield return primary.DecodeDeferredRow(table, record);
+    }
+    internal async IAsyncEnumerable<StorageRecord> Records(CatalogTable table, StorageTree primary, Catalog catalog, Meter meter,
         IReadOnlySet<int>? touched, [EnumeratorCancellation] CancellationToken token, bool reverse = false)
     {
         if (Scan.Empty) yield break;
@@ -129,7 +149,7 @@ internal sealed record SecondaryAccess(CatalogIndex Index, StorageTree Tree, Tab
         foreach (var record in reverse ? records.Values.Reverse() : records.Values)
         {
             meter.Charge(Costs.StorageRowRead); meter.Checkpoint(token);
-            yield return primary.DecodeDeferredRow(table, record);
+            yield return record;
         }
     }
 }

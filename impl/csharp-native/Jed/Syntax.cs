@@ -7,6 +7,8 @@ internal sealed record SelectSyntax(SelectItem[] Items, Expression? Filter, long
     string? Table = null, string? TableAlias = null, OrderSyntax[]? Order = null, bool Distinct = false, Expression[]? GroupBy = null, Expression? Having = null, RelationSyntax? Relation = null, bool ValuesQuery = false, bool SetQuery = false, CteSyntax[]? With = null, bool Recursive = false, Dictionary<string, WindowSyntax>? Windows = null, int[][]? GroupingSets = null, bool GroupingExpansion = false) : StatementSyntax
 {
     internal Expression[]? DistinctOn { get; init; }
+    internal Expression? LimitExpression { get; init; }
+    internal Expression? OffsetExpression { get; init; }
     internal bool HasLimit { get; init; }
     internal bool HasOffset { get; init; }
 }
@@ -143,13 +145,14 @@ internal sealed partial class Parser
             } while (Eat(","));
         }
         long? limit = null; long offset = 0;
+        var limitExpression = query.LimitExpression; var offsetExpression = query.OffsetExpression;
         var hasLimit = query.HasLimit; var hasOffset = query.HasOffset;
         while (Is("limit") || Is("offset"))
         {
-            if (Eat("limit")) { if (hasLimit || query.Limit is not null) throw Errors.Syntax("multiple LIMIT clauses"); hasLimit = true; if (!Eat("all")) limit = Count(); }
-            else { Expect("offset"); if (hasOffset) throw Errors.Syntax("multiple OFFSET clauses"); hasOffset = true; offset = Count(); }
+            if (Eat("limit")) { if (hasLimit || query.Limit is not null) throw Errors.Syntax("multiple LIMIT clauses"); hasLimit = true; if (!Eat("all")) { var count = QueryCount(true); limit = count.Value; limitExpression = count.Parameter; } }
+            else { Expect("offset"); if (hasOffset) throw Errors.Syntax("multiple OFFSET clauses"); hasOffset = true; var count = QueryCount(false); offset = count.Value ?? 0; offsetExpression = count.Parameter; }
         }
-        return query with { Order = order.Count == 0 ? query.Order : order.ToArray(), Limit = limit ?? query.Limit, Offset = offset == 0 ? query.Offset : offset, HasLimit = hasLimit, HasOffset = hasOffset };
+        return query with { Order = order.Count == 0 ? query.Order : order.ToArray(), Limit = limit ?? query.Limit, Offset = offset == 0 ? query.Offset : offset, HasLimit = hasLimit, HasOffset = hasOffset, LimitExpression = limitExpression, OffsetExpression = offsetExpression };
     }
     private string QualifiedName()
     {
@@ -158,12 +161,16 @@ internal sealed partial class Parser
         return name;
     }
     private static bool Clause(string value) => value is "into" or "from" or "where" or "group" or "having" or "window" or "order" or "limit" or "offset" or "union" or "intersect" or "except" or "fetch" or "for" or "returning" or "on" or "join" or "cross" or "inner" or "left" or "right" or "full" or "natural" or "using";
-    private long Count()
+    private (long? Value, Expression? Parameter) QueryCount(bool limit)
     {
-        if (token.Kind != TokenKind.Integer) throw Errors.Syntax("expected nonnegative integer");
-        if (!long.TryParse(Take().Text, System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out var value))
-            throw Errors.Overflow();
-        return value;
+        if (token.Kind == TokenKind.Parameter) return (null, Node("parameter", Take().Text));
+        var negative = Eat("-"); if (!negative) Eat("+");
+        if (token.Kind != TokenKind.Integer) throw Errors.Syntax("expected integer or parameter count");
+        var text = Take().Text;
+        if (negative && text.Any(character => character != '0')) throw new SqlException(limit ? SqlStates.InvalidRowCountInLimitClause : SqlStates.InvalidRowCountInOffsetClause,
+            limit ? "LIMIT must not be negative" : "OFFSET must not be negative");
+        if (!long.TryParse(text, System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out var value)) throw Errors.Overflow();
+        return (value, null);
     }
 
     private Expression Expr(int minimum = 0)

@@ -32,7 +32,7 @@ internal static partial class StatementExecution
         }
         pending.Catalog = pending.Catalog with { Statistics = (pending.Catalog.Statistics ?? []).Where(stat => stat.Table != table.Name || !columns.Contains(stat.Column)).Concat(facts).ToArray() };
         pending.Changed = true;
-        return new([], []);
+        return new([], [], 0);
     }
     private static void StaleStatistics(PendingDatabase pending, string table) => pending.Catalog = pending.Catalog with
     { Statistics = pending.Catalog.Statistics?.Select(stat => stat.Table == table && stat.Kind == 0 ? stat with { Flags = (byte)(stat.Flags | 1) } : stat).ToArray() };

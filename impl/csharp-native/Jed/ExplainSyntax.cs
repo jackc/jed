@@ -33,7 +33,7 @@ internal sealed partial class Parser
         else analyze = Eat("analyze");
         if (Is("explain")) throw Errors.Syntax("nested EXPLAIN");
         StatementSyntax inner = Is("with") || Is("select") || Is("values") || Is("(") ? QueryStatement() : OtherStatement();
-        if (inner is not (SelectSyntax or InsertSyntax or UpdateSyntax or DeleteSyntax or CreateTableAsSyntax or WithStatementSyntax))
+        if (inner is not (SelectSyntax or InsertSyntax or UpdateSyntax or DeleteSyntax or MergeSyntax or CreateTableAsSyntax or WithStatementSyntax))
             throw Errors.Syntax("EXPLAIN requires a query or data manipulation statement");
         return new(inner, analyze, verbose, costs, lane);
     }

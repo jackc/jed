@@ -22,6 +22,7 @@ internal sealed class StoragePager(IBlockStore store, int pageSize, long cacheBy
     private readonly Dictionary<uint, TaskCompletionSource<Entry>> loading = [];
     private readonly LinkedList<Entry> clock = [];
     private LinkedListNode<Entry>? hand;
+    private int revoked;
     private readonly long capacity = StorageFormat.ValidPageSize(pageSize)
         ? Math.Max(1, cacheBytes / pageSize) : throw new ArgumentOutOfRangeException(nameof(pageSize));
 
@@ -32,11 +33,17 @@ internal sealed class StoragePager(IBlockStore store, int pageSize, long cacheBy
     internal int PayloadCapacity => pageSize - 16 - (Encrypted ? StoragePageCodec.Reserve : 0);
     internal int PointerSize => Encrypted ? 20 : 4;
     internal int ResidentPages { get { lock (gate) return resident.Count; } }
+    internal void Revoke() => Interlocked.Exchange(ref revoked, 1);
+    private void CheckLive()
+    {
+        if (Volatile.Read(ref revoked) != 0) throw new SqlException(SqlStates.IoError, "storage was revoked after a failed durable barrier");
+    }
 
     internal ValueTask<ReadOnlyMemory<byte>> ReadPageAsync(uint id, CancellationToken cancellationToken = default) => ReadPageAsync(new StoragePageReference(id, default), cancellationToken);
     internal async ValueTask<ReadOnlyMemory<byte>> ReadPageAsync(StoragePageReference reference, CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
+        CheckLive();
         var id = reference.Page;
         if (id < (Encrypted ? 4 : 2)) throw StorageFormat.Corrupt("body page pointer names reserved slot");
         if (Encrypted && reference.Tag.Length != 16) throw StorageFormat.Corrupt("encrypted page pointer has no authentication tag");
@@ -87,6 +94,7 @@ internal sealed class StoragePager(IBlockStore store, int pageSize, long cacheBy
         }
         void CheckTag(Entry entry)
         {
+            CheckLive();
             if (Encrypted && !CryptographicOperations.FixedTimeEquals(entry.Tag, reference.Tag.Span)) throw StorageFormat.Corrupt("cached encrypted page pointer tag mismatch");
         }
     }

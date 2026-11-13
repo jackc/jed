@@ -32,6 +32,7 @@ public sealed partial class Database
             }
             finally { await EndRemoteReadAsync(client, read.TransactionId).ConfigureAwait(false); }
             database.ObserveClient(client);
+            database.SetWorkMem(options.WorkMem == 0 ? DefaultWorkMem : options.WorkMem);
             database.ScratchHost = new(options.ScratchEncryption == ScratchEncryption.On || database.ownedCodec is not null, options.ScratchEntropy, devices: options.ScratchDevices);
             return database;
         }

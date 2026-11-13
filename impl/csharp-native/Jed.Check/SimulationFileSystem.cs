@@ -31,11 +31,13 @@ internal sealed class SimulationFileSystem(ulong seed, int pageSize, int sectorS
     internal string Fired { get; private set; } = "none";
     internal bool OracleReads { get; set; }
     internal List<string> Operations { get; } = [];
+    private readonly HashSet<string> durableBarriers = new(StringComparer.Ordinal);
+    internal bool DurableBarrier(string path) => durableBarriers.Contains(Name(path));
     private readonly Dictionary<string, HashSet<uint>> writtenPages = new(StringComparer.Ordinal);
     internal IReadOnlySet<uint> WrittenPages(string path) => writtenPages.GetValueOrDefault(Name(path)) ?? [];
 
     internal void BeginStep(ulong step, Fault? armed = null)
-    { Check(); Step = step; fault = armed; barriers = syncs = 0; scratchOrdinal = 0; Fired = "none"; writtenPages.Clear(); }
+    { Check(); Step = step; fault = armed; barriers = syncs = 0; scratchOrdinal = 0; Fired = "none"; writtenPages.Clear(); durableBarriers.Clear(); }
 
     internal void Restart()
     { dead = false; fault = null; barriers = syncs = 0; Fired = "none"; }
@@ -52,6 +54,7 @@ internal sealed class SimulationFileSystem(ulong seed, int pageSize, int sectorS
     { Check(); if (power) PowerLoss(survive, tear); else ProcessCrash(); }
 
     internal byte[] Image(string path) => Find(path).Cache.ToArray();
+    internal bool EntryDurable(string path) => directory.TryGetValue(Name(path), out var current) && durableDirectory.TryGetValue(Name(path), out var durable) && ReferenceEquals(current, durable);
 
     public ValueTask<IBlockStore> CreateAsync(string identity, string? directory, CancellationToken token)
     {
@@ -252,7 +255,11 @@ internal sealed class SimulationFileSystem(ulong seed, int pageSize, int sectorS
         history.Add(bytes.ToArray()); if (history.Count > 32) history.RemoveAt(0);
     }
     private void CommitData(Inode inode)
-    { inode.Durable = inode.Cache.ToArray(); inode.Pending.Clear(); CaptureArchive(inode); }
+    {
+        inode.Durable = inode.Cache.ToArray(); inode.Pending.Clear(); CaptureArchive(inode);
+        foreach (var (path, current) in directory)
+            if (directoryChanges.Count == 0 && ReferenceEquals(current, inode) && durableDirectory.TryGetValue(path, out var durable) && ReferenceEquals(durable, inode)) durableBarriers.Add(path);
+    }
 
     private sealed class ScratchDevice(SimulationFileSystem owner, long generation) : IBlockStore
     {

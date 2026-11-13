@@ -81,7 +81,13 @@ internal sealed record IndexNestedLoop(BaseRelationAccess Source, Resolved[] Bou
         return Estimate.Multiply(outerRows, best);
     }
 
-    internal async IAsyncEnumerable<SqlValue[]> Rows(SqlValue[] outer, Meter meter,
+    internal ExplainNode? Observation { get; set; }
+    internal IAsyncEnumerable<SqlValue[]> Rows(SqlValue[] outer, Meter meter, CancellationToken cancellationToken)
+    {
+        var source = Read(outer, meter, cancellationToken);
+        return Observation is null ? source : ExplainObservation.Rows(source, Observation, meter, cancellationToken, inclusive: true);
+    }
+    private async IAsyncEnumerable<SqlValue[]> Read(SqlValue[] outer, Meter meter,
         [EnumeratorCancellation] CancellationToken cancellationToken)
     {
         var terms = new List<Resolved>();

@@ -36,6 +36,12 @@ internal sealed record GistAccess(CatalogIndex Index, SqlValue Query, byte Strat
     internal async IAsyncEnumerable<SqlValue[]> Rows(CatalogTable table, StorageTree primary, Meter meter,
         IReadOnlySet<int>? touched, [EnumeratorCancellation] CancellationToken token, bool reverse = false)
     {
+        await foreach (var record in Records(table, primary, meter, touched, token, reverse).ConfigureAwait(false))
+            yield return primary.DecodeDeferredRow(table, record);
+    }
+    internal async IAsyncEnumerable<StorageRecord> Records(CatalogTable table, StorageTree primary, Meter meter,
+        IReadOnlySet<int>? touched, [EnumeratorCancellation] CancellationToken token, bool reverse = false)
+    {
         if (Query.IsNull || Strategy == 0 && Query.Type.Kind == SqlKind.Range && Query.AsRange().IsEmpty) yield break;
         var gist = await Storage.Database.GistAsync(table, Index, Storage.Pending, Storage.Snapshot, token).ConfigureAwait(false);
         var keys = gist.Probe([Query], [Strategy], meter);
@@ -44,7 +50,7 @@ internal sealed record GistAccess(CatalogIndex Index, SqlValue Query, byte Strat
             meter.Charge(primary.Height); meter.Checkpoint(token);
             var row = await primary.FindAsync(key, token).ConfigureAwait(false) ?? throw StorageFormat.Corrupt("GiST index names a missing row");
             meter.Charge(primary.ValueReadUnits(row, touched)); meter.Charge(Costs.StorageRowRead); meter.Checkpoint(token);
-            yield return primary.DecodeDeferredRow(table, row);
+            yield return row;
         }
     }
 }

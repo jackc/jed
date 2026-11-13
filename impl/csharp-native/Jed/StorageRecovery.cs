@@ -7,6 +7,7 @@ internal sealed record StorageRecovered(StorageMeta Meta, int Slot, int FloorSlo
 {
     internal HashSet<uint> ManifestPages { get; init; } = [];
     internal StorageEncryptedMeta? Encrypted { get; init; }
+    internal StorageBatch? Batch { get; init; }
     internal uint? LastReclamationLive { get; init; }
     internal ulong? ReclamationTransactionId { get; init; }
     internal ulong FreeGeneration => ReclamationTransactionId ?? Meta.TransactionId;
@@ -116,9 +117,9 @@ internal static class StorageRecovery
                 throw StorageFormat.Corrupt("invalid free-list chain");
             await store.ReadAsync((long)id * meta.PageSize, block, cancellationToken).ConfigureAwait(false);
             var page = StorageFormat.ParsePage(block);
-            if (page.Type != 7 || page.Count == 0 || page.Count > (meta.PageSize - 16) / 4 ||
+            if (page.Type != 7 || page.Count > (meta.PageSize - 16) / 4 ||
                 !StorageFormat.IsZero(block.AsSpan(16 + (int)page.Count * 4)))
-                throw StorageFormat.Corrupt("invalid free-list page");
+                throw StorageFormat.Corrupt($"invalid free-list page {id} (type={page.Type}, count={page.Count}, size={meta.PageSize})");
             for (var i = 0; i < page.Count; i++)
             {
                 var entry = BinaryPrimitives.ReadUInt32BigEndian(block.AsSpan(16 + i * 4));

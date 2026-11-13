@@ -31,11 +31,11 @@ internal static class Corpus
                 {
                     var key = match.Groups[1].Value;
                     if (key is "load-timezone" or "load-collation" or "fixture" or "attach") { i++; continue; }
-                    if (key == "skip" && match.Groups[2].Value.Split(' ', StringSplitOptions.RemoveEmptyEntries).FirstOrDefault() == "disk")
-                    { i++; continue; } // A disk-only reopen restriction does not skip this memory-mode run.
+                    if (key == "skip" && match.Groups[2].Value.Split(' ', StringSplitOptions.RemoveEmptyEntries).FirstOrDefault() is "disk" or "memory" or "encrypted")
+                    { i++; continue; } // Backend declarations select the applicable host; no SQL records are omitted.
                     if (key != "requires" && DirectiveNames.Contains(key))
                     {
-                        if (key is not ("cost" or "types" or "names" or "max_cost" or "lifetime_max_cost" or "clock" or "clock_advance" or "seed" or "timezone" or "max_scalar_bytes" or "max_sql_length" or "params" or "upgrade-collations" or "allow_ddl" or "allow_temp_ddl" or "max_temp_storage_bytes" or "max_query_memory_bytes" or "max_storage_bytes" or "default_privileges" or "grant" or "revoke" or "set"))
+                        if (key is not ("cost" or "types" or "names" or "max_cost" or "lifetime_max_cost" or "clock" or "clock_advance" or "seed" or "timezone" or "max_scalar_bytes" or "max_sql_length" or "params" or "upgrade-collations" or "allow_ddl" or "allow_temp_ddl" or "max_temp_storage_bytes" or "max_query_memory_bytes" or "max_storage_bytes" or "default_privileges" or "grant" or "revoke" or "set" or "work_mem"))
                             throw new InvalidDataException($"{file}:{i + 1}: unsupported harness directive {key}");
                         if (key is "grant" or "revoke" or "max_storage_bytes" && pending.TryGetValue(key, out var previous)) pending[key] = previous + "\n" + match.Groups[2].Value;
                         else if (!pending.TryAdd(key, match.Groups[2].Value)) throw new InvalidDataException($"duplicate directive {key}");
@@ -66,9 +66,12 @@ internal static class Corpus
         return records;
     }
 
-    internal static async Task<int> Run(string file)
+    internal static async Task<int> Run(string file, bool fileBacked = false)
     {
         if (File.ReadLines(file).Any(line => line.Trim() == "# format: concurrency")) return await ConcurrencyCorpus.Run(file).ConfigureAwait(false);
+        var backendRules = File.ReadLines(file).Where(line => line.StartsWith("# skip:", StringComparison.Ordinal)).Select(line => line[7..].Trim().Split(' ')[0]).ToArray();
+        if (backendRules.Contains("memory")) fileBacked = true;
+        else if (backendRules.Contains("disk")) fileBacked = false;
         var records = Parse(file);
         var zones = File.ReadLines(file).Select(line => Regex.Match(line, "^#\\s*load-timezone:\\s*(.*?)\\s*$", RegexOptions.CultureInvariant)).Where(match => match.Success).Select(match => match.Groups[1].Value).ToArray();
         TimeZoneData? timeZones = null;
@@ -92,7 +95,8 @@ internal static class Corpus
             foreach (var name in collationNames) _ = unicodeData.Resolve(name);
         }
         var attachmentNames = File.ReadLines(file).Select(line => Regex.Match(line, "^#\\s*attach:\\s*(\\S+)\\s*$", RegexOptions.CultureInvariant)).Where(match => match.Success).Select(match => match.Groups[1].Value).ToArray();
-        await using var database = fixture is null ? attachmentNames.Length == 0 ? null : await Database.CreateInMemoryAsync().ConfigureAwait(false) : await OpenFixture(file, fixture).ConfigureAwait(false);
+        using var backing = fileBacked && fixture is null ? new CorpusFile() : null;
+        await using var database = backing is not null ? await Database.CreateFileAsync(backing.Path, new() { Locking = FileLocking.None }).ConfigureAwait(false) : fixture is null ? attachmentNames.Length == 0 ? null : await Database.CreateInMemoryAsync().ConfigureAwait(false) : await OpenFixture(file, fixture).ConfigureAwait(false);
         if (database is not null) foreach (var attachment in attachmentNames) await database.AttachInMemoryAsync(attachment).ConfigureAwait(false);
         if (fixture?.ExpectedError is not null)
         {
@@ -107,6 +111,12 @@ internal static class Corpus
         }
         Console.WriteLine($"PASS {file}: {records.Count} records");
         return records.Count;
+    }
+
+    private sealed class CorpusFile : IDisposable
+    {
+        internal string Path { get; } = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "jed-csharp-corpus-" + Guid.NewGuid().ToString("N"));
+        public void Dispose() => File.Delete(Path);
     }
 
     private sealed record FixtureSpec(string RelativePath, string? ExpectedError);
@@ -169,6 +179,7 @@ internal static class Corpus
     internal static async Task RunRecord(Session session, CorpusRecord record)
     {
         session.ResetPrivileges(); session.ResetVariables();
+        await session.SetWorkMemAsync(record.Directives.TryGetValue("work_mem", out var workMem) ? long.Parse(workMem, CultureInfo.InvariantCulture) : Database.DefaultWorkMem).ConfigureAwait(false);
         if (record.Directives.TryGetValue("max_storage_bytes", out var storageLimits)) foreach (var directive in storageLimits.Split('\n'))
         {
             var pieces = directive.Split(' ', StringSplitOptions.RemoveEmptyEntries);

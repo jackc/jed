@@ -2,6 +2,8 @@ using System.Runtime.CompilerServices;
 
 namespace Jed;
 
+internal sealed record MutationObservation(ExplainNode Scan, ExplainNode? Filter);
+
 internal static class ExplainObservation
 {
     // Measure only work performed while this iterator owns control. A consumer's

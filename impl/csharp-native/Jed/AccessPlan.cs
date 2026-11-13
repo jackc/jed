@@ -8,7 +8,7 @@ internal enum AccessKind { Primary, Btree, Gist, Gin, PrimaryIntervals, IndexInt
 // Candidate estimates never inspect table values or charge the runtime meter.
 internal sealed record AccessPlan(AccessKind Kind, long EstimatedRows, long EstimatedPages, long EstimatedEntries,
     long EstimatedCost, Resolved? Predicate = null, CatalogIndex? Index = null, TableScan? Scan = null,
-    TableScan[]? Ranges = null, SecondaryAccess? Btree = null, GistAccess? Gist = null, GinAccess? Gin = null)
+    TableScan[]? Ranges = null, SecondaryAccess? Btree = null, GistAccess? Gist = null, GinAccess? Gin = null, bool Ordered = false, bool Streaming = false, IndexSetAccess? IndexSet = null)
 {
     internal static AccessPlan Primary(CatalogTable table, StorageTree tree, Resolved? filter, Catalog? catalog = null)
     {
@@ -62,6 +62,9 @@ internal sealed record AccessPlan(AccessKind Kind, long EstimatedRows, long Esti
             }
             yield return new(AccessKind.PrimaryIntervals, rows, pages, 0, ScanCost(rows, pages, filter), filter, Ranges: ranges);
         }
+        foreach (var set in IndexSetAccess.Candidates(table, tree, filter, storage))
+            yield return new(AccessKind.IndexIntervals, set.EstimatedRows, set.EstimatedPages, 0, set.EstimatedCost,
+                set.Predicate, set.Index, Ranges: set.Ranges, IndexSet: set);
         yield return new(AccessKind.Full, table.RowCount, tree.NodeCount, 0, ScanCost(table.RowCount, tree.NodeCount, filter), Scan: new());
     }
     private static int Height(GistNode node) => node.Leaf ? 1 : 1 + Height(node.Entries[0].Child!);
@@ -73,37 +76,98 @@ internal sealed record AccessPlan(AccessKind Kind, long EstimatedRows, long Esti
             if (entry.Bound.Matches([access.Query], [access.Strategy], false)) count = Estimate.Add(count, Descent(entry.Child!, access));
         return count;
     }
-    internal async IAsyncEnumerable<SqlValue[]> Rows(CatalogTable table, StorageTree tree, QueryStorage storage, Meter meter,
-        IReadOnlySet<int>? touched, [EnumeratorCancellation] CancellationToken token, bool reverse = false)
+    internal async ValueTask Prime(CatalogTable table, StorageTree tree, QueryStorage storage, Meter meter, IReadOnlySet<int>? touched, CancellationToken token)
     {
+        if (IndexSet is not null) return;
         if (Btree is not null)
         {
-            await foreach (var row in Btree.Rows(table, tree, storage.Catalog, meter, touched, token, reverse).ConfigureAwait(false)) yield return row;
-        }
-        else if (Gist is not null)
-        {
-            await foreach (var row in Gist.Rows(table, tree, meter, touched, token, reverse).ConfigureAwait(false)) yield return row;
+            if (!Btree.Scan.Empty) meter.Charge(Btree.Tree.CountRangeNodes(Btree.Scan.Lower, Btree.Scan.LowerInclusive, Btree.Scan.Upper, Btree.Scan.UpperInclusive));
         }
         else if (Gin is not null)
         {
-            await foreach (var row in Gin.Rows(table, tree, storage.Catalog, meter, touched, token, reverse).ConfigureAwait(false)) yield return row;
+            foreach (var arm in Gin.Arms) _ = await GinGather.Run(Gin.Tree, arm, meter, token).ConfigureAwait(false);
         }
-        else if (Ranges is not null)
+        else if (Gist is not null)
         {
-            // Page/decode work for the whole disjoint set precedes row delivery.
-            foreach (var range in Ranges)
+            if (!Gist.Query.IsNull)
             {
-                meter.Charge(await tree.CountRangePagesAsync(range.Lower, range.LowerInclusive, range.Upper, range.UpperInclusive, token).ConfigureAwait(false));
-                await foreach (var record in tree.ScanRangeAsync(range.Lower, range.LowerInclusive, range.Upper, range.UpperInclusive, cancellationToken: token).ConfigureAwait(false))
-                    meter.Charge(tree.ValueReadUnits(record, touched));
+                var gist = await storage.Database.GistAsync(table, Gist.Index, storage.Pending, storage.Snapshot, token).ConfigureAwait(false);
+                _ = gist.Probe([Gist.Query], [Gist.Strategy], meter);
             }
-            foreach (var range in reverse ? Ranges.Reverse() : Ranges)
-                await foreach (var record in tree.ScanRangeAsync(range.Lower, range.LowerInclusive, range.Upper, range.UpperInclusive, reverse, token).ConfigureAwait(false))
-                { meter.Charge(Costs.StorageRowRead); meter.Checkpoint(token); yield return tree.DecodeDeferredRow(table, record); }
         }
         else
         {
-            await foreach (var row in QueryExecution.TableSource(table, tree, meter, token, (Scan ?? new()) with { Reverse = reverse }, touched).ConfigureAwait(false)) yield return row;
+            if (Streaming && Ranges is not null) return;
+            var ranges = Ranges ?? [Scan ?? new()];
+            foreach (var range in ranges)
+                await ChargeRange(tree, range, meter, touched, token).ConfigureAwait(false);
+        }
+        meter.Checkpoint(token);
+    }
+    private static async ValueTask ChargeRange(StorageTree tree, TableScan range, Meter meter, IReadOnlySet<int>? touched, CancellationToken token)
+    {
+        if (range.Empty) return;
+        meter.Charge(await tree.CountRangePagesAsync(range.Lower, range.LowerInclusive, range.Upper, range.UpperInclusive, token).ConfigureAwait(false));
+        await foreach (var record in tree.ScanRangeAsync(range.Lower, range.LowerInclusive, range.Upper, range.UpperInclusive, cancellationToken: token).ConfigureAwait(false))
+            meter.Charge(tree.ValueReadUnits(record, touched));
+    }
+    internal async IAsyncEnumerable<SqlValue[]> Rows(CatalogTable table, StorageTree tree, QueryStorage storage, Meter meter,
+        IReadOnlySet<int>? touched, [EnumeratorCancellation] CancellationToken token, bool reverse = false)
+    {
+        await foreach (var record in Records(table, tree, storage, meter, touched, token, reverse).ConfigureAwait(false))
+            yield return tree.DecodeDeferredRow(table, record);
+    }
+    internal async IAsyncEnumerable<StorageRecord> Records(CatalogTable table, StorageTree tree, QueryStorage storage, Meter meter,
+        IReadOnlySet<int>? touched, [EnumeratorCancellation] CancellationToken token, bool reverse = false)
+    {
+        if (IndexSet is not null)
+        {
+            await foreach (var record in IndexSet.Records(table, tree, storage.Catalog, meter, touched, Streaming || Ordered, token).ConfigureAwait(false)) yield return record;
+            yield break;
+        }
+        if (Btree is not null)
+        {
+            await foreach (var row in (Ordered ? Btree.OrderedRecords(table, tree, storage.Catalog, meter, touched, token) : Btree.Records(table, tree, storage.Catalog, meter, touched, token, reverse)).ConfigureAwait(false)) yield return row;
+            yield break;
+        }
+        if (Gist is not null)
+        {
+            await foreach (var row in Gist.Records(table, tree, meter, touched, token, reverse).ConfigureAwait(false)) yield return row;
+            yield break;
+        }
+        if (Gin is not null)
+        {
+            await foreach (var row in Gin.Records(tree, meter, touched, token, reverse).ConfigureAwait(false)) yield return row;
+            yield break;
+        }
+        var ranges = Ranges ?? [Scan ?? new()];
+        if (Streaming && Ranges is not null)
+        {
+            foreach (var range in reverse ? ranges.Reverse() : ranges)
+            {
+                if (range.Empty) continue;
+                await ChargeRange(tree, range, meter, touched, token).ConfigureAwait(false);
+                await foreach (var record in tree.ScanRangeAsync(range.Lower, range.LowerInclusive, range.Upper, range.UpperInclusive, reverse, token).ConfigureAwait(false))
+                { meter.Charge(Costs.StorageRowRead); meter.Checkpoint(token); yield return record; }
+            }
+            yield break;
+        }
+        meter.Checkpoint(token);
+        // All structural and touched-value units precede the first emitted row,
+        // including for a disjoint interval set and a consumer that stops early.
+        foreach (var range in ranges)
+        {
+            if (range.Empty) continue;
+            meter.Charge(await tree.CountRangePagesAsync(range.Lower, range.LowerInclusive, range.Upper, range.UpperInclusive, token).ConfigureAwait(false));
+            await foreach (var record in tree.ScanRangeAsync(range.Lower, range.LowerInclusive, range.Upper, range.UpperInclusive, cancellationToken: token).ConfigureAwait(false))
+                meter.Charge(tree.ValueReadUnits(record, touched));
+        }
+        meter.Checkpoint(token);
+        foreach (var range in reverse ? ranges.Reverse() : ranges)
+        {
+            if (range.Empty) continue;
+            await foreach (var record in tree.ScanRangeAsync(range.Lower, range.LowerInclusive, range.Upper, range.UpperInclusive, reverse, token).ConfigureAwait(false))
+            { meter.Charge(Costs.StorageRowRead); meter.Checkpoint(token); yield return record; }
         }
     }
 }

@@ -29,11 +29,14 @@ internal static class WritableCteExecution
             {
                 var columns = inference.Infer(mutation, database, read.Before, read, read.Catalog, meter, token, scope);
                 var partContext = context.InScope(scope);
-                var mutationPlan = meter.Explain is null ? null : ExplainExecution.Prepare(mutation, database, read.Before, read, read.Catalog, meter, token, scope).Root;
+                var mergePlan = mutation is MergeSyntax merge ? StatementExecution.PrepareMerge(database, pending, merge, meter, token, partContext) : null;
+                var explained = mergePlan is not null || meter.Explain is null ? null : ExplainExecution.Prepare(mutation, database, read.Before, pending, read.Catalog, meter, token, scope);
+                var mutationPlan = mergePlan?.Plan ?? explained?.Root;
                 async ValueTask<StatementResult> ExecuteMutation()
                 {
                     var beforeCost = meter.Accrued;
-                    var result = await StatementExecution.Execute(database, pending, mutation, meter, token, partContext).ConfigureAwait(false);
+                    var result = mergePlan is not null ? await mergePlan.Run().ConfigureAwait(false) : explained?.Mutation is { } execute
+                        ? await execute(partContext).ConfigureAwait(false) : await StatementExecution.Execute(database, pending, mutation, meter, token, partContext).ConfigureAwait(false);
                     mutationPlan?.SetInclusive(meter.Accrued - beforeCost); return result;
                 }
                 var buffer = new MutationBuffer(ExecuteMutation, meter);
@@ -128,6 +131,7 @@ internal static class WritableCteExecution
         return statement switch
         {
             SelectSyntax query => CteBuffer.References(query, name),
+            MergeSyntax merge => CteBuffer.References(new SelectSyntax([new(new("star", "", []), null)], null, null, 0, Relation: merge.Source), name) + ExpressionReferences(merge.On) + ReturningReferences(merge.Returning) + merge.Clauses.Sum(clause => (clause.Condition is null ? 0 : ExpressionReferences(clause.Condition)) + (clause.Values ?? []).Sum(ExpressionReferences) + (clause.Assignments ?? []).Sum(item => ExpressionReferences(item.Value))),
             InsertSyntax insert => (insert.Source is null ? 0 : CteBuffer.References(insert.Source, name)) + insert.Values.Sum(row => row.Sum(ExpressionReferences)) +
                 ReturningReferences(insert.Returning) + (insert.Conflict?.Assignments ?? []).Sum(assignment => ExpressionReferences(assignment.Value)) +
                 (insert.Conflict?.Filter is { } filter ? ExpressionReferences(filter) : 0),

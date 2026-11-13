@@ -106,14 +106,100 @@ Do not attribute that run to the later frozen source digest. AVX2 availability d
 backend selection boundary; it does not assert that OS-backed AES uses no hardware acceleration in
 the default-instruction builds. The host-specific AOT artifact is not a portable distribution.
 
+The subsequent public `ChangeCredentialAsync` operation holds the owner role, derives the new
+wrapper before attempting the nonwaiting writer gate, and performs stabilization, alternate-copy
+write/barrier, then selected-copy write/barrier. I/O failure poisons the handle. Existing readers
+retain the same data key. Its JIT host checks passed at source SHA-256
+`94210e5d854c47b689ba6b84bd68192e95286c2be4823339916387875b5090ea`: host-key to
+passphrase replacement and reopen, unchanged meta/data bytes, active-writer refusal, retained
+reader, read-only preservation of divergent copies and writable repair, and injected failures before
+and after all five storage stages. The durability model selects exactly the old or new credential
+after each injected crash. This is a focused key-block failure model, not the complete engine crash
+matrix. Real-process interoperability passed again at
+`082bee42081c1b5388096a0cd5e64ca9f84ad982eff631cc247a9db3c4218ebe`, including a Go
+reader surviving the C# owner's rewrap, a fresh Go client unlocking with the replacement credential,
+and refusal of credential changes from a C# page client. These later additions have not yet repeated
+NativeAOT verification.
+
+The subsequent image/maintenance checks passed under JIT at source SHA-256
+`a40fd3b49a7df7eb539504ed0b8ff0c9ff66bff830cd97a470bea2a48d26ad13` via
+`mise run csharp-native:maintenance`: 28 complete byte-exact plaintext exports, memory/plaintext/
+encrypted compaction with replacement-stage fault injection, and both backup forms across 13 shared
+fixtures (including all six encrypted fixtures). Page-identical backup preserves ciphertext body
+bytes; compacted backup reseals against destination page identities. The backup staging file uses
+exclusive creation and cleanup only after this invocation has created it. Backup remains an internal
+host-test API pending the public API contract. Deserialize rejects encrypted buffers; file restore
+uses the ordinary authenticated file-open seam.
+
+Real-process maintenance interchange passed under JIT at source SHA-256
+`532b1bcb46c2ab40b999d7f2e63715e6f7419cfb0ee1cb5f450a79ac551162f5`: a retained Go
+client blocks compaction while pinned, reloads after C# owner replacement, then commits through the
+same connection; C# page-client copies in both backup forms reopen in Go with intact overflow values.
+These cases run for plaintext and encrypted files. One pinned Go limitation is isolated explicitly:
+when a Go page client appends to a root with inherited overflow references, its post-commit leaf
+refault can poison its writer, so its next write reports `58030`. The same sequence reproduces with
+two unmodified Go actors, without C#. The interoperability test closes that overflow-writing peer
+and uses the separate healthy retained client for maintenance checks; it does not change protocol
+pin requirements or claim the peer defect is fixed. These maintenance additions have not yet repeated
+NativeAOT verification.
+
+The full host suite passed under JIT at source SHA-256
+`0a1948d5fc34077f3ed07274305ad295a35028a436d06f83c35d99b85402fb45`.
+It includes immutable retained tree shapes (height, node count and range overlap after cache
+eviction without page reads), COW/reopen shape preservation, and multi-domain prepare/stage
+failure checks before publication. The scratch host now provides bounded memory-to-file migration
+and per-file XAES protection using independent injected entropy. Its tests cover partial blocks,
+truncate/regrow, replay/file/ordinal rejection, private creation permissions and cleanup. File-host
+temporary databases use that spillable byte device. This verifies the scratch storage foundation;
+SQL operator partition/spool integration and full `work_mem` parity remain separate work.
+These additions have not repeated the frozen checkpoint's NativeAOT verification.
+
+The native process adapter now executes the pinned 31-scenario process inventory with strict C#
+actor identity (no fallback to a supported core). The second complete run passed 24 scenarios at
+`58997c3fb90c4664f45e8cf084f7fe6a1d710a313af860cffc44e79f35a61cae`; subsequent
+focused runs passed both stream scenarios and ownership-never at
+`cba4e7dd312bd1ffe70993202af9726644ea3fc93247f148459c6cf7412a1a64`. The stream
+helper relays page frames to the live owner or acquires protocol-v2 ownership as a yielding owner;
+credentials travel only in the hello, are stripped before forwarding, and owned retained credential
+copies are cleared when the remote handle closes. These runs include encrypted and plaintext
+relay, owner exit, transport ownership, preferred-application handoff and client reconnection.
+
+`mise run csharp-native:rekey` passed at source SHA-256
+`91f4678cbd29bdee8d103d3ca278882ee840c9d1071aebc5f8c2ff2c25f17d81`, including the
+complete byte-exact `encrypted_rekey_index_table.jed` golden from reverse-order source insertion.
+Tables and B-tree/GIN records are reinserted in ascending key order into target-layout scratch trees;
+every insertion settles into the spillable pager, whose residency follows the handle's `CacheBytes`.
+GiST leaf keys use the canonical rebuild. The test forces scratch spill and covers encryption,
+decryption, rotation, target storage admission, retained-reader refusal and pre-rename failure
+recovery. The full encrypted-service process scenario also passes, including the idle client's
+`28P04` after rotation. GiST's semantic builder still retains its leaf entries/node objects; the
+scratch pager bound does not establish a whole-maintenance memory cap. These additions have not yet
+repeated NativeAOT verification.
+
+The internal filesystem adapter now awaits file creation/opening, rename, unlink, permissions and
+directory barriers through the same engine paths used by native maintenance. The first simulated
+host check passed at `6523fb837e05a09ae19bcb46dabf03cda5d34154827050943dc91cf17e10c168`:
+content-keyed write-order independence, delayed removal of unissued writes, directory durability,
+and twelve real-engine recovery histories with torn pending writes. This is host-model evidence;
+the canonical simulation trace driver, complete structural oracles, service scheduling and all
+fault profiles remain separate work. It does not establish full simulation conformance.
+
+The remaining backup and storage-limit process layout checks passed at
+`1d81da34b6931d8fda62b6aa616fa724296625928630426b30265ebc1dbc504c`, after periodic
+owner reclamation, safe truncation, the created-handle reclamation seed and canonical single-leaf
+resident-chain handling. These focused runs include exact generation, live-page, high-water and
+free-page counts. Owner maintenance retains the writer lease after acknowledging a client commit;
+the old write pin is released before reclamation, and lost acknowledgements still take this cleanup
+path after successful publication.
+
 ## Remaining acceptance gates
 
-Public credential-change orchestration, data-key rotation, compaction and backup/restore workflows,
-encrypted scratch storage, relaxed durability batches, the complete shared process suite and
-simulation/fault-injection coverage remain incomplete. Existing key-wrap/rewrap vectors prove the
-codec, not a durable public credential-change operation. Selected recovery and acknowledgement tests
+Complete operator spill integration, relaxed durability batches, the complete shared process
+suite and simulation/fault-injection coverage remain incomplete. Relaxed page-service batches are
+still an explicit unsupported process path; focused passes do not establish one complete passing
+run. Selected recovery and acknowledgement tests
 do not substitute for the full crash matrix. Full SQL parity and performance measurements remain
-separate experiment gates, even though the current host executable passes NativeAOT.
+separate experiment gates, even though the earlier frozen host checkpoint passed NativeAOT.
 
 Secret erasure and constant-time behavior still require explicit security analysis. Owned temporary
 secrets are cleared on cleanup paths, but managed copies, provider scratch state and exceptional

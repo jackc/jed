@@ -23,7 +23,7 @@ public sealed partial class Session
         var query = (options ?? new()) with { Parameters = parameters ?? options?.Parameters ?? [] };
         return QueryCore(statement.Sql, query.MaxCost, cancellationToken, query, statement.Syntax);
     }
-    public async Task<long> ExecuteAsync(PreparedStatement statement, IReadOnlyList<SqlValue>? parameters = null, QueryOptions? options = null, CancellationToken cancellationToken = default)
+    public async Task<long?> ExecuteAsync(PreparedStatement statement, IReadOnlyList<SqlValue>? parameters = null, QueryOptions? options = null, CancellationToken cancellationToken = default)
     {
         await using var rows = await QueryAsync(statement, parameters, options, cancellationToken).ConfigureAwait(false);
         await foreach (var _ in ((IAsyncEnumerable<Row>)rows).WithCancellation(cancellationToken).ConfigureAwait(false)) { }

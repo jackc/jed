@@ -219,7 +219,7 @@ internal static partial class StatementExecution
         return new([], []);
     }
 
-    private static async ValueTask<bool> ParentContains(Database database, PendingDatabase pending, CatalogTable parent, int[] columns, SqlValue[] values, int[] valueColumns, CancellationToken token)
+    private static async ValueTask<bool> ParentContains(Database database, PendingDatabase pending, CatalogTable parent, int[] columns, SqlValue[] values, int[] valueColumns, CancellationToken token, ISet<string>? ignored = null)
     {
         var converted = new Dictionary<int, SqlValue>();
         for (var i = 0; i < columns.Length; i++)
@@ -230,7 +230,8 @@ internal static partial class StatementExecution
         if (SameColumns(columns, parent.PrimaryKey))
         {
             var writer = new WireWriter(); foreach (var column in parent.PrimaryKey) writer.Bytes(KeyEncoding.Encode(converted[column]));
-            return await database.Tree(parent, pending, pending.Before).FindAsync(writer.ToArray(), token).ConfigureAwait(false) is not null;
+            var key = writer.ToArray();
+            return !(ignored?.Contains(Convert.ToHexString(key)) ?? false) && await database.Tree(parent, pending, pending.Before).FindAsync(key, token).ConfigureAwait(false) is not null;
         }
         var index = (parent.Indexes ?? []).FirstOrDefault(index => index.Unique && index.Predicate is null && index.Keys.All(key => key.Expression is null) && SameColumns(columns, index.Keys.Select(key => key.Column)));
         if (index is null) throw StorageFormat.Corrupt("foreign key has no unique covering key");
@@ -242,7 +243,8 @@ internal static partial class StatementExecution
             prefix.Bytes(encoded);
         }
         var start = prefix.ToArray();
-        await foreach (var record in database.IndexTree(index, pending, pending.Before).ScanRangeAsync(start, true, PrefixEnd(start), false, cancellationToken: token).ConfigureAwait(false)) return true;
+        await foreach (var record in database.IndexTree(index, pending, pending.Before).ScanRangeAsync(start, true, PrefixEnd(start), false, cancellationToken: token).ConfigureAwait(false))
+            if (!(ignored?.Contains(Convert.ToHexString(IndexStorageKey(parent, index, record.Key, pending.Catalog))) ?? false)) return true;
         return false;
     }
     private static async ValueTask ValidateForeignKeys(Database database, PendingDatabase pending, CatalogTable table, IReadOnlyList<SqlValue[]> rows, CancellationToken token)

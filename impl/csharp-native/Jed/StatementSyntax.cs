@@ -15,6 +15,7 @@ internal sealed partial class Parser
 {
     private StatementSyntax OtherStatement()
     {
+        if (Eat("merge")) return MergeStatement();
         if (Eat("explain")) return ExplainStatement();
         if (Eat("analyze")) return AnalyzeStatement();
         if (Eat("reindex")) return ReindexStatement();

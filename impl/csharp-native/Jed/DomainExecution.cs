@@ -6,7 +6,7 @@ internal static class DomainExecution
     {
         ReindexSyntax { Kind: "index" or "table" } value => value.Name,
         AnalyzeSyntax value => value.Table,
-        InsertSyntax value => value.Table, UpdateSyntax value => value.Table, DeleteSyntax value => value.Table,
+        InsertSyntax value => value.Table, UpdateSyntax value => value.Table, DeleteSyntax value => value.Table, MergeSyntax value => value.Table,
         CreateTableSyntax value => value.Name, CreateTableAsSyntax value => value.Name, DropTableSyntax value => value.Name, DropTablesSyntax value => value.Names[0],
         CreateIndexSyntax value => value.Table, DropIndexSyntax value => value.Name,
         AlterTableSyntax value => value.Table, AlterBatchSyntax value => value.Actions[0].Table,
@@ -63,7 +63,7 @@ internal static class DomainExecution
         {
             ReindexSyntax { Kind: "index" or "table" } value => value with { Name = Name(value.Name!) },
             AnalyzeSyntax value => value with { Table = Name(value.Table) },
-            InsertSyntax value => value with { Table = Name(value.Table) }, UpdateSyntax value => value with { Table = Name(value.Table) }, DeleteSyntax value => value with { Table = Name(value.Table) },
+            InsertSyntax value => value with { Table = Name(value.Table) }, UpdateSyntax value => value with { Table = Name(value.Table) }, DeleteSyntax value => value with { Table = Name(value.Table) }, MergeSyntax value => value with { Table = Name(value.Table) },
             CreateTableSyntax value => value with { Name = Name(value.Name), Constraints = value.Constraints?.Select(Constraint).ToArray() },
             CreateTableAsSyntax value => value with { Name = Name(value.Name) }, DropTableSyntax value => value with { Name = Name(value.Name) }, DropTablesSyntax value => value with { Names = value.Names.Select(Name).ToArray() },
             CreateIndexSyntax value => value with { Table = Name(value.Table), Name = value.Name is null ? null : Name(value.Name) }, DropIndexSyntax value => value with { Name = Name(value.Name) },

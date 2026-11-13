@@ -83,6 +83,27 @@ internal sealed class PrivilegeDiscovery(Catalog catalog, Action<string, TablePr
                     }
                 }
                 break;
+            case MergeSyntax merge:
+                Target(merge.Table, TablePrivileges.Select, new DeleteSyntax(merge.Table, null, []), visible, tables, depth);
+                Relation(merge.Source, visible, tables, depth); Expr(merge.On, visible, tables, depth);
+                foreach (var clause in merge.Clauses)
+                {
+                    Expr(clause.Condition, visible, tables, depth);
+                    switch (clause.Action)
+                    {
+                        case "insert":
+                            Target(merge.Table, TablePrivileges.Insert, new InsertSyntax(merge.Table, clause.Columns, [clause.Values ?? []], []), visible, tables, depth);
+                            foreach (var value in clause.Values ?? []) Expr(value, visible, tables, depth);
+                            break;
+                        case "update":
+                            Target(merge.Table, TablePrivileges.Update, new UpdateSyntax(merge.Table, clause.Assignments ?? [], null, []), visible, tables, depth);
+                            foreach (var assignment in clause.Assignments ?? []) Expr(assignment.Value, visible, tables, depth);
+                            break;
+                        case "delete": Target(merge.Table, TablePrivileges.Delete, new DeleteSyntax(merge.Table, null, []), visible, tables, depth); break;
+                    }
+                }
+                foreach (var item in merge.Returning) Expr(item.Expression, visible, tables, depth);
+                break;
             case InsertSyntax insert:
                 var insertRead = insert.Conflict?.Elements is not null || insert.Conflict?.Constraint is not null || insert.Returning.Any(item => Reads(item.Expression));
                 var insertOps = TablePrivileges.Insert | (insertRead ? TablePrivileges.Select : 0) | (insert.Conflict?.Assignments is not null ? TablePrivileges.Update : 0);

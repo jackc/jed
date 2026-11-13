@@ -10,6 +10,7 @@ public sealed record DatabaseFileOptions
 {
     internal IFileHost FileHost { get; init; } = NativeFileHost.Instance;
     internal IScratchDeviceHost? ScratchDevices { get; init; }
+    public long WorkMem { get; init; }
     public long CacheBytes { get; init; } = 256L * 1024 * 1024;
     public FileLocking Locking { get; init; } = FileLocking.Auto;
     public FileOwnership Ownership { get; init; } = FileOwnership.Prefer;
@@ -58,6 +59,7 @@ public sealed partial class Database
         internal bool NeedsElection;
         internal bool Closing;
         internal bool RepairKeys;
+        internal bool DirectoryPending;
         internal ulong HandoffRequester;
     }
     private FileState? fileState;
@@ -72,7 +74,7 @@ public sealed partial class Database
     private static async Task<Database> OpenFileCoreAsync(string path, DatabaseFileOptions options, bool creating, int pageSize, CancellationToken token, FileClaim? preparedClaim = null, FileLockBundle? preparedBundle = null)
     {
         ArgumentNullException.ThrowIfNull(path); ArgumentNullException.ThrowIfNull(options.FileHost); ArgumentNullException.ThrowIfNull(options.Entropy); ArgumentNullException.ThrowIfNull(options.KeyEntropy); ArgumentNullException.ThrowIfNull(options.ScratchEntropy);
-        if (options.CacheBytes < 0 || !Enum.IsDefined(options.ScratchEncryption) || !Enum.IsDefined(options.Locking) || !Enum.IsDefined(options.Ownership) || options.FileLockTimeoutMilliseconds < 0 || options.WriterLockTimeoutMilliseconds < 0 ||
+        if (options.WorkMem < 0 || options.CacheBytes < 0 || !Enum.IsDefined(options.ScratchEncryption) || !Enum.IsDefined(options.Locking) || !Enum.IsDefined(options.Ownership) || options.FileLockTimeoutMilliseconds < 0 || options.WriterLockTimeoutMilliseconds < 0 ||
             options.YieldGraceMilliseconds < 0 || options.ShutdownGraceMilliseconds < 0 || options.IdleSessionMilliseconds < 0 || options.IdleTransactionMilliseconds < 0 || options.MaximumConnections < 0)
             throw new ArgumentOutOfRangeException(nameof(options));
         if (options.FileHost is not NativeFileHost && options.Locking != FileLocking.None) throw new ArgumentException("injected file hosts require an explicit host-owned locking adapter", nameof(options));
@@ -117,6 +119,7 @@ public sealed partial class Database
                 finally { await EndRemoteReadAsync(client, read.TransactionId).ConfigureAwait(false); }
                 database.ObserveClient(client);
             }
+            database.SetWorkMem(options.WorkMem == 0 ? DefaultWorkMem : options.WorkMem);
             database.ScratchHost = new(options.ScratchEncryption == ScratchEncryption.On || database.ownedCodec is not null, options.ScratchEntropy, devices: options.ScratchDevices);
             return database;
         }
@@ -208,19 +211,17 @@ public sealed partial class Database
             pager = new(new FileRoleStore(pager.Store, () => CheckRole(ownerRole)), recovered.Meta.PageSize, state.Options.CacheBytes, ownedCodec);
             committer = new(pager, recovered);
         }
-        // The role-aware byte wrapper deliberately hides the underlying file
-        // from the generic committer. Perform this once-per-handle host barrier
-        // before publishing a writable owner, including the remote-writer path.
-        if (!state.Options.ReadOnly) await state.Options.FileHost.SyncDirectoryAsync(state.Path, token).ConfigureAwait(false);
-        if (!state.Options.ReadOnly && committer.Current.RequiresStabilization)
-        { await pager.Store.SyncAsync(token).ConfigureAwait(false); committer.Adopt(committer.Current, stabilized: true); }
+        // Opening only adopts a readable generation. A pending rename and an
+        // adopted incremental generation become durable at the first new write.
+        state.DirectoryPending = true;
         if (state.RepairKeys && !state.Options.ReadOnly && keyBlock is { NeedsRepair: true } repair)
         {
-            await state.Options.FileHost.SyncDirectoryAsync(state.Path, token).ConfigureAwait(false);
+            await SyncOwnerDirectoryAsync(token).ConfigureAwait(false);
             await pager.Store.SyncAsync(token).ConfigureAwait(false);
             await pager.Store.WriteAsync((long)(repair.Page == 2 ? 3 : 2) * pager.PageSize, repair.Block.Bytes, token).ConfigureAwait(false);
             await pager.Store.SyncAsync(token).ConfigureAwait(false);
             keyBlock = repair with { Page = 2, NeedsRepair = false };
+            committer.Adopt(committer.Current, stabilized: true);
         }
         state.RepairKeys = false;
         var meta = new byte[pager.PageSize]; await pager.Store.ReadAsync((long)committer.Current.Slot * pager.PageSize, meta, token).ConfigureAwait(false);
@@ -263,6 +264,22 @@ public sealed partial class Database
         state.Server = new(backend, new(state.Options.ReadOnly, state.Options.Ownership == FileOwnership.Yield, state.Options.MaximumConnections,
             state.Options.IdleSessionMilliseconds, state.Options.IdleTransactionMilliseconds));
         state.Server.Listen(state.Endpoint!);
+    }
+    private async ValueTask SyncOwnerDirectoryAsync(CancellationToken token)
+    {
+        var state = fileState!;
+        if (!state.DirectoryPending) return;
+        await state.Options.FileHost.SyncDirectoryAsync(state.Path, token).ConfigureAwait(false);
+        state.DirectoryPending = false;
+    }
+    private async ValueTask PrepareOwnerWriteAsync(CancellationToken token)
+    {
+        try
+        {
+            await SyncOwnerDirectoryAsync(token).ConfigureAwait(false);
+            await committer.StabilizeAsync(token).ConfigureAwait(false);
+        }
+        catch (Exception error) { PoisonFile(error); throw; }
     }
     private async ValueTask<PageOwnerLedger.PageOwnerPin> AcquireRemoteReadAsync(long role, byte[] incarnation, ulong version, CancellationToken token)
     {
@@ -549,7 +566,7 @@ public sealed partial class Database
             else
             {
                 state.Ledger!.BeginPublication();
-                try { await committer.CommitAsync(plan, token).ConfigureAwait(false); }
+                try { await PrepareOwnerWriteAsync(token).ConfigureAwait(false); await committer.CommitAsync(plan, token).ConfigureAwait(false); }
                 catch (Exception error) { state.Ledger.FailPublication(error); if (committer.IsPoisoned) PoisonFile(new SqlException(SqlStates.IoError, "file commit failed; reopen for recovery")); throw; }
             }
             return new PublicationLease(state.Publication);
@@ -594,6 +611,7 @@ public sealed partial class Database
             validation = new(before.Meta, database.ownedCodec is not null, grant ? before.FreePages : new HashSet<uint>(), new Dictionary<uint, ulong>(), transactionId, meta, manifest, database.ownedCodec);
             try
             {
+                await database.PrepareOwnerWriteAsync(token).ConfigureAwait(false);
                 var required = (long)validation.Meta.PageCount * before.Meta.PageSize;
                 if (await database.pager.Store.GetLengthAsync(token).ConfigureAwait(false) < required) await database.pager.Store.SetLengthAsync(required, token).ConfigureAwait(false);
                 foreach (var page in manifest)

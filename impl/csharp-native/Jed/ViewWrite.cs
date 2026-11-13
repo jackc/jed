@@ -62,10 +62,10 @@ internal static partial class StatementExecution
 
     internal static StatementSyntax RewriteView(Database database, PendingDatabase pending, StatementSyntax statement, CatalogView view, Meter meter, CancellationToken token)
     {
-        var kind = statement is InsertSyntax ? "insert" : statement is UpdateSyntax ? "update" : "delete";
+        var kind = statement is InsertSyntax ? "insert" : statement is UpdateSyntax or MergeSyntax ? "update" : "delete";
         var plan = PlanViewWrite(database, pending, view, kind, meter, token);
         var baseName = plan.Table.Domain is { } home ? DatabaseDomains.Qualified(home.Name, plan.Table.Name) : plan.Table.Name;
-        var label = statement is InsertSyntax { Alias: { } alias } ? alias : view.Name;
+        var label = statement switch { InsertSyntax { Alias: { } alias } => alias, MergeSyntax { Alias: { } alias } => alias, _ => view.Name };
         var viewColumns = view.Columns.Select((column, i) => new BoundColumn(column.Name, plan.Projection[i].Type, label, Collation: plan.Projection[i].Collation, WholeRow: false)).ToArray();
         var pseudo = new CatalogTable(label, viewColumns.Select(column => new CatalogColumn(column.Name, new(column.Type))).ToArray(), []);
         var baseWidth = plan.Table.Columns.Length; var viewWidth = viewColumns.Length;
@@ -133,6 +133,13 @@ internal static partial class StatementExecution
                 rewritten = insert with { Table = baseName, Alias = label, Columns = mapped, Values = rows, Conflict = conflict, Returning = Returning(insert.Returning), ViewChecks = checks, ViewBinding = binding, ViewDefaults = plan.Defaults };
                 break;
             }
+            case MergeSyntax merge:
+                rewritten = merge with { Table = baseName, Alias = label, View = plan, Clauses = merge.Clauses.Select(clause => clause with
+                {
+                    Assignments = clause.Assignments?.Select(assignment => new AssignmentSyntax(plan.Table.Columns[Target(assignment.Column)].Name,
+                        assignment.Value.Op == "default" ? Default(assignment.Column) : assignment.Value)).ToArray(),
+                    Columns = clause.Action == "insert" ? (clause.Columns ?? view.Columns.Select(column => column.Name).ToArray()).Take(clause.Values!.Length).Select(name => plan.Table.Columns[Target(name)].Name).ToArray() : clause.Columns
+                }).ToArray() }; break;
             case UpdateSyntax update:
                 rewritten = update with { Table = baseName, Assignments = update.Assignments.Select(assignment => new AssignmentSyntax(plan.Table.Columns[Target(assignment.Column)].Name, assignment.Value.Op == "default" ? Default(assignment.Column) : Rewrite(assignment.Value))).ToArray(),
                     Filter = Filter(update.Filter), Returning = Returning(update.Returning), ViewChecks = checks, ViewBinding = binding }; break;

@@ -32,6 +32,7 @@ class Actor
               when "rust" then [File.join(ROOT, "impl/rust/target/release/process_actor")]
               when "go" then [File.join(ROOT, "impl/go/process_actor")]
               when "node" then ["node", File.join(ROOT, "impl/ts/src/bin/process_actor.ts")]
+              when "csharp-native" then [ENV.fetch("JED_CSHARP_PROCESS_ACTOR")]
               when "swift-native" then [ENV.fetch("JED_SWIFT_PROCESS_ACTOR")]
               when "ruby-native" then ["ruby", File.join(ROOT, "impl/ruby-native/bin/process_actor.rb")]
               else raise "unknown actor core #{core}"

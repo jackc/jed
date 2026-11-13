@@ -232,3 +232,29 @@ relaxed durability batching is still outstanding. VERIFICATION.md records exact 
 The entire experimental core is still incomplete. Remaining work includes physical access/join
 planning, EXPLAIN estimates and actual counters, residual SQL cases, connecting bounded spill
 operators to SQL, canonical fault-simulation traces and final full-source JIT/NativeAOT checks.
+
+### SQL sorting and continued conformance — 2026-11-13
+
+The latest full diagnostic at `0f9728cac64fc7ce0e1b371a423b14b9062f9a3e3f2ae56ebb932168eb62a2fe`
+passes 595/763 files, with 15,999 records in passing files and 168 failed files. Subsequent scoped
+checks cover real file-backed SQL external sorting, all main/state/transient query-memory files,
+most MERGE files, and secondary-index ordering. Single-process fault simulations now execute the
+real engine and compare transcripts with the pinned Go core; remaining trace differences are
+explicit failures under investigation. See VERIFICATION.md for scoped evidence and remaining gates.
+
+`DatabaseFileOptions.WorkMem` uses the 256 MiB default when zero; `Database.SetWorkMem(0)` selects
+unlimited resident operators. This is experimental host API. Bounded hash/group/DISTINCT spill,
+complete physical planning, residual SQL and final clean verification remain unfinished.
+
+### Continued full-core implementation — 2026-11-13
+
+The next complete diagnostic passes 630/763 files (16,944 records in passing files), with
+133 failed files, at `bed160a7b699f6cc62d23a7d1939249f1a4baa1b0db887428cb50c1a2acc3774`.
+Integrated host verification is green at
+`c696f1094f649a3a566b882aa6b85203a46445f02ba40c80c57625a814cbd5f9`.
+This includes the memory/transient fixes, SQL external sorting, MERGE implementation,
+bound LIMIT/OFFSET parameters, simulator adapters and native storage corrections.
+Five plaintext fault traces now match the pinned Go transcripts across scoped runs.
+Encrypted fault traces, relaxed-durability host integration, complete SQL planning and
+bounded hash/group/DISTINCT spill remain active work. The new keyed scratch-state utility
+is scaffolding awaiting dedicated validation and operator integration.

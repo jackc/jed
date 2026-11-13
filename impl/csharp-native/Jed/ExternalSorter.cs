@@ -62,18 +62,20 @@ internal sealed class ExternalSorter(ScratchHost host, long workMem, Meter meter
         {
             await result.ForceDisk(token).ConfigureAwait(false);
             var hasA = await a.MoveNextAsync().ConfigureAwait(false); var hasB = await b.MoveNextAsync().ConfigureAwait(false);
-            if (hasA) heads.Reserve(a.Current); if (hasB) heads.Reserve(b.Current);
+            if (hasA) heads.TryReserve(a.Current); if (hasB) heads.TryReserve(b.Current);
             while (hasA || hasB)
             {
                 if (hasA && (!hasB || compare(a.Current, b.Current) <= 0))
                 {
-                    await result.Append(a.Current, token).ConfigureAwait(false); heads.Release(a.Current);
-                    hasA = await a.MoveNextAsync().ConfigureAwait(false); if (hasA) heads.Reserve(a.Current);
+                    await result.Append(a.Current, token).ConfigureAwait(false); var previous = a.Current;
+                    hasA = await a.MoveNextAsync().ConfigureAwait(false); if (hasA) heads.TryReserve(a.Current);
+                    heads.Release(previous);
                 }
                 else
                 {
-                    await result.Append(b.Current, token).ConfigureAwait(false); heads.Release(b.Current);
-                    hasB = await b.MoveNextAsync().ConfigureAwait(false); if (hasB) heads.Reserve(b.Current);
+                    await result.Append(b.Current, token).ConfigureAwait(false); var previous = b.Current;
+                    hasB = await b.MoveNextAsync().ConfigureAwait(false); if (hasB) heads.TryReserve(b.Current);
+                    heads.Release(previous);
                 }
             }
             return result;
@@ -91,30 +93,42 @@ internal sealed class ExternalSorter(ScratchHost host, long workMem, Meter meter
             yield break;
         }
         await Flush(token).ConfigureAwait(false);
-        SpillRowSpool? result = null;
+        var runs = new List<SpillRowSpool>();
+        var readers = new List<IAsyncEnumerator<SqlValue[]>>();
+        var heap = new List<int>();
+        using var heads = new QueryInputMemory(meter);
+        int CompareRuns(int left, int right)
+        {
+            var order = compare(readers[left].Current, readers[right].Current);
+            return order == 0 ? left.CompareTo(right) : order;
+        }
         try
         {
             // Higher levels precede lower levels in original input order.
+            // The final merge retains one charged-or-rejected head per run.
             for (var level = levels.Length - 1; level >= 0; level--)
             {
                 if (levels[level] is not { } run) continue;
-                levels[level] = null;
-                if (result is null) { result = run; continue; }
-                try
-                {
-                    var merged = await Merge(result, run, token).ConfigureAwait(false);
-                    await result.DisposeAsync().ConfigureAwait(false); result = merged;
-                }
-                finally { await run.DisposeAsync().ConfigureAwait(false); }
+                levels[level] = null; runs.Add(run);
+                var reader = run.Read(token).GetAsyncEnumerator(token); readers.Add(reader);
+                if (await reader.MoveNextAsync().ConfigureAwait(false))
+                { heads.TryReserve(reader.Current); heap.Add(readers.Count - 1); }
             }
-            if (result is not null)
+            while (heap.Count != 0)
             {
-                using var head = new QueryInputMemory(meter);
-                await foreach (var row in result.Read(token).ConfigureAwait(false))
-                { head.Reserve(row); yield return row; head.Release(row); }
+                heap.Sort(CompareRuns);
+                var slot = heap[0]; var reader = readers[slot]; var row = reader.Current;
+                if (await reader.MoveNextAsync().ConfigureAwait(false)) heads.TryReserve(reader.Current);
+                else heap.RemoveAt(0);
+                heads.Release(row);
+                yield return row;
             }
         }
-        finally { if (result is not null) await result.DisposeAsync().ConfigureAwait(false); }
+        finally
+        {
+            foreach (var reader in readers) await reader.DisposeAsync().ConfigureAwait(false);
+            foreach (var run in runs) await run.DisposeAsync().ConfigureAwait(false);
+        }
     }
     public async ValueTask DisposeAsync()
     {

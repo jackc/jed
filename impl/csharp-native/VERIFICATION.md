@@ -323,3 +323,54 @@ Cumulative process evidence is now 30 of 31 scenarios across scoped runs; relaxe
 batching remains. This is not a single passing process suite. Canonical simulation trace execution,
 complete SQL conformance, SQL spill, full physical planning and final clean JIT/NativeAOT verification
 remain acceptance gates. No full-core or promotion claim is made.
+
+The next full development SQL diagnostic at
+`0f9728cac64fc7ce0e1b371a423b14b9062f9a3e3f2ae56ebb932168eb62a2fe`
+(`mise run csharp-native:conformance --all`, 2026-11-13) passed **595 of 763 complete files**,
+containing **15,999 records in passing files**; **168 files failed explicitly**. This supersedes
+only the earlier development SQL sweep, not the frozen NativeAOT checkpoint. The complete log is
+`/tmp/jed-csharp-full-checkpoint3.log`; its condensed failures are
+`/tmp/jed-csharp-full-checkpoint3-failures.txt`. EXPLAIN now retains physical plan identities,
+reports generic/custom parameter estimates, and observes execution cost. Statistics refine
+NULL/value/histogram/GIN estimates from resident catalog facts. Remaining EXPLAIN attribution,
+join/statistics selection, access-path breadth, and spill integration still require verification;
+this result does not establish full parity.
+
+Further scoped development evidence (2026-11-13):
+
+- `b39388a2c3a4aa570e115bf91b1620b6fb0af2fb80e86a58bb045451ca094efa` passes complete
+  `query_memory` (51), `query_memory_state` (42), and `query_memory_transient` (18) files,
+  including exact collation-key and window operand-cache boundaries. It also passes spill
+  operator and real SQL sort host checks: plaintext/encrypted scratch, stable ties, expression
+  keys, a one-byte query account, cost invariance and early cursor disposal.
+  Logs: `/tmp/jed-csharp-memory-transient4.log`, `/tmp/jed-csharp-spill-final-heads.log`.
+- `1a17fc080fc55b7b8a12148ddaf3eebb853bbe70517e2b10bac4a87b1d744941` passes four full
+  ORDER BY corpus files on native file-backed handles (128 records). This runner retains one
+  file handle across records; it does not yet claim the supported cores' reopen-per-record mode.
+- `b88235b1d1bc30cc824f08b8b0c6620fe598c7749da76c7ed5271e14bed66f32` passes six complete
+  MERGE files (200 records). Later focused work passes nine of ten MERGE files (267 records);
+  complete MERGE acceptance still requires its EXPLAIN file and fresh integrated verification.
+- `bae3f1615ad1be86b3d9b0e3913fa37b5fbfa1ff45d98b0d73a13304202ff43d` passes secondary-index
+  ORDER BY scans (8 records), PK-order scans (15), blocking top-k (12) and scalar GiST scans (19).
+  Four other selected files still fail. Secondary interval selection and complete join planning
+  remain active work; the log is `/tmp/jed-csharp-single-pipeline.log`.
+
+File-backed SQL sorts now use the real external sorter under `work_mem`, including account-driven
+spilling. Hash join, grouped aggregates and DISTINCT still need their bounded spill integration.
+The conformance adapter routes backend-specific files to their applicable host without dropping
+SQL records. Passing isolated sorter checks does not establish complete blocking-operator parity.
+
+### Later integrated checkpoint — 2026-11-13
+
+- Full frozen SQL diagnostic: **630/763 files**, **16,944 records in passing files**,
+  **133 failed files**, source
+  `bed160a7b699f6cc62d23a7d1939249f1a4baa1b0db887428cb50c1a2acc3774`.
+  Log: `/tmp/jed-csharp-full-checkpoint4.log`.
+- Full host task: **PASS**, source
+  `c696f1094f649a3a566b882aa6b85203a46445f02ba40c80c57625a814cbd5f9`.
+  Log: `/tmp/jed-csharp-host-checkpoint4.log`. Unix-socket tests required sandbox escalation.
+  This is JIT host evidence; current-source NativeAOT and complete SQL parity remain pending.
+- Five plaintext simulation traces match pinned peer transcripts across scoped runs;
+  encrypted traces still have cost and crash-boundary discrepancies. No complete simulator
+  acceptance is claimed. Keyed spill state and relaxed batching primitives compile but still
+  require dedicated tests and complete integration.

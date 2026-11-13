@@ -43,8 +43,23 @@ internal static partial class Estimate
         {
             var seen = new HashSet<string>(StringComparer.Ordinal); long rows = 0;
             foreach (var value in predicate.Args.Skip(1))
-                if (!value.Constant.IsNull && seen.Add(GroupExecution.Identity([value.Constant]))) rows = Math.Min(count, Add(rows, Fraction(count, "equality")));
+            {
+                if (value.Op == "constant" && !value.ParameterUnbound && value.Constant.IsNull) continue;
+                var identity = value.ParameterIndex > 0 ? "$" + value.ParameterIndex : value.Op == "constant" ? GroupExecution.Identity([value.Constant]) : null;
+                if (identity is null || seen.Add(identity)) rows = Math.Min(count, Add(rows, Fraction(count, "equality")));
+            }
             return rows;
+        }
+        if (predicate.Op == "not" && predicate.Args[0].Op == "in_list" &&
+            predicate.Args[0].Args.Skip(1).Any(value => value.Op == "constant" && !value.ParameterUnbound && value.Constant.IsNull)) return 0;
+        if (ArrayMembership(predicate, out var elements, out var complement, out var nullArray))
+        {
+            if (nullArray || complement && elements.Any(value => value.Op == "constant" && !value.ParameterUnbound && value.Constant.IsNull)) return 0;
+            long rows = 0;
+            foreach (var element in elements)
+                if (element.Op != "constant" || element.ParameterUnbound || !element.Constant.IsNull)
+                    rows = Math.Min(count, Add(rows, Fraction(count, "equality")));
+            return complement ? count - rows : rows;
         }
         if (predicate.Op is "=" or "<>" or "<" or "<=" or ">" or ">=" && predicate.Args.Any(arg => arg.Op == "constant" && !arg.ParameterUnbound && arg.Constant.IsNull)) return 0;
         return predicate.Op switch
@@ -56,6 +71,44 @@ internal static partial class Estimate
             "column" when predicate.Type == SqlType.Boolean => Fraction(count, "boolean"),
             _ => Fraction(count, "opaque")
         };
+    }
+    private static bool ArrayMembership(Resolved predicate, out Resolved[] elements, out bool complement, out bool nullArray)
+    {
+        elements = []; complement = false; nullArray = false;
+        if (predicate.Op is "in_init" or "quantified_init")
+        {
+            if (predicate.Op == "quantified_init" && predicate.Text is not ("= any" or "<> all")) return false;
+            complement = predicate.Op == "in_init" ? predicate.Text == "not" : predicate.Text == "<> all";
+            var cell = predicate.Subquery!;
+            elements = cell.Initialized ? cell.Values.Select(value => new Resolved("constant", value.Type, value, [])).ToArray() :
+                Enumerable.Repeat(new Resolved("constant", predicate.Args[0].Type, default, [], ParameterUnbound: true), (int)PlannerFacts.ArrayElements).ToArray();
+            return true;
+        }
+        if (predicate.Op != "quantified" || predicate.Text is not ("= any" or "<> all")) return false;
+        complement = predicate.Text == "<> all";
+        var array = predicate.Args[1];
+        static bool Unknown(Resolved value) => value.ParameterUnbound || value.Op == "outer" ||
+            value.Op is "cast" or "promote" && Unknown(value.Args[0]);
+        if (array.Op == "array" && array.Text != "nested")
+        {
+            var items = new List<Resolved>();
+            foreach (var argument in array.Args)
+            {
+                if (Unknown(argument)) items.Add(new("constant", array.Type.Element!, default, [], ParameterUnbound: true));
+                else if (GinQuery.Value(argument, out var known)) items.Add(new("constant", known.Type, known, []));
+                else return false;
+            }
+            elements = items.ToArray(); return true;
+        }
+        if (Unknown(array))
+        {
+            elements = Enumerable.Repeat(new Resolved("constant", array.Type.Element!, default, [], ParameterUnbound: true), (int)PlannerFacts.ArrayElements).ToArray();
+            return true;
+        }
+        if (!GinQuery.Value(array, out var arrayValue) || arrayValue.Type.Kind != SqlKind.Array) return false;
+        nullArray = arrayValue.IsNull;
+        if (!nullArray) elements = arrayValue.AsArray().Values.Select(item => new Resolved("constant", item.Type, item, [])).ToArray();
+        return true;
     }
     private static (Resolved Value, bool Lower)? RangeOperand(Resolved predicate)
     {

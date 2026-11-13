@@ -5,25 +5,42 @@ namespace Jed;
 public sealed partial class Database
 {
     /// <summary>Rewrite live records under a fresh data key, or decrypt when credential is null. Requires an idle file owner.</summary>
-    public Task RekeyAsync(DatabaseCredential? credential, CancellationToken cancellationToken = default) =>
-        RunImageMaintenanceAsync("main", async (snapshot, state, token) =>
+    public async Task RekeyAsync(DatabaseCredential? credential, CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        FileState state; int pageSize;
+        lock (gate)
         {
-            if (state is null) throw new SqlException(SqlStates.ObjectNotInPrerequisiteState, "rekey requires a file database");
-            if (credential is not null && !ScratchHost!.Encrypted) throw new SqlException(SqlStates.ObjectNotInPrerequisiteState, "encrypted rekey requires encrypted scratch storage");
-            if (credential is not null && snapshot.Meta.PageSize < 1024) throw Errors.Unsupported("encrypted page size must be at least 1024");
-            StoragePageCodec? replacement = null; StorageKeyBlock? block = null;
-            try
+            Check();
+            state = fileState ?? throw new SqlException(SqlStates.ObjectNotInPrerequisiteState, "rekey requires a file database");
+            pageSize = pager.PageSize;
+            if (credential is not null && !ScratchHost!.Encrypted)
+                throw new SqlException(SqlStates.ObjectNotInPrerequisiteState, "encrypted rekey requires encrypted scratch storage");
+            if (credential is not null && pageSize < 1024)
+                throw Errors.Unsupported("encrypted page size must be at least 1024");
+        }
+        StoragePageCodec? replacement = null; StorageKeyBlock? block = null;
+        try
+        {
+            // Derive the new key block before maintenance admission. The key
+            // stream advances even when an active reader or writer refuses the
+            // operation; neither the KDF nor its entropy draws hold those gates.
+            if (credential is not null)
             {
-                if (credential is not null)
-                {
-                    var key = StorageKeyBlock.Entropy(state.Options.KeyEntropy, 32);
-                    try { replacement = new(key, state.Options.KeyEntropy); } finally { CryptographicOperations.ZeroMemory(key); }
-                    block = replacement.Wrap(snapshot.Meta.PageSize, 1, credential.Value);
-                }
-                await ReplaceKeyImageAsync(snapshot, state, replacement, block, token).ConfigureAwait(false);
+                var key = StorageKeyBlock.Entropy(state.Options.KeyEntropy, 32);
+                try { replacement = new(key, state.Options.KeyEntropy); }
+                finally { CryptographicOperations.ZeroMemory(key); }
+                block = replacement.Wrap(pageSize, 1, credential.Value);
             }
-            finally { if (!ReferenceEquals(replacement, ownedCodec)) replacement?.Dispose(); }
-        }, cancellationToken);
+            await RunImageMaintenanceAsync("main", async (snapshot, admitted, token) =>
+            {
+                if (!ReferenceEquals(admitted, state))
+                    throw new SqlException(SqlStates.ObjectInUse, "database ownership changed while deriving replacement");
+                await ReplaceKeyImageAsync(snapshot, state, replacement, block, token).ConfigureAwait(false);
+            }, cancellationToken).ConfigureAwait(false);
+        }
+        finally { if (!ReferenceEquals(replacement, ownedCodec)) replacement?.Dispose(); }
+    }
 
     private async ValueTask<StorageMeta> RebuildImageAsync(DatabaseSnapshot snapshot, IBlockStore outputStore,
         StoragePageCodec? replacement, StorageKeyBlock? block, CancellationToken token)

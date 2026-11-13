@@ -47,6 +47,13 @@ internal sealed class QueryInputMemory(Meter meter) : IDisposable
         if (total == bytes) rows.Remove(row); else rows[row] = total - bytes;
         held -= bytes;
     }
+    internal void TryReserve(SqlValue[] row)
+    {
+        if (!meter.Memory.Enabled) return;
+        var bytes = MemorySize.RowBytes(row);
+        if (!meter.Memory.TryReserve(bytes)) return;
+        rows[row] = Meter.Add(rows.GetValueOrDefault(row), bytes); held = Meter.Add(held, bytes);
+    }
     internal void Reserve(SqlValue[] row)
     {
         if (!meter.Memory.Enabled) return;
@@ -57,6 +64,7 @@ internal sealed class QueryInputMemory(Meter meter) : IDisposable
     internal void AdoptBytes(long bytes) { if (meter.Memory.Enabled) held = Meter.Add(held, bytes); }
     internal void TransferBytes(long bytes) { if (meter.Memory.Enabled) held -= bytes; }
     internal void ReserveBytes(long bytes) { meter.Memory.Reserve(bytes); held = Meter.Add(held, bytes); }
+    internal void ReleaseBytes(long bytes) { meter.Memory.Release(bytes); held -= bytes; }
     internal void ReserveValue(SqlValue value)
     {
         if (meter.Memory.Enabled) held = Meter.Add(held, meter.Memory.ReserveValue(value));

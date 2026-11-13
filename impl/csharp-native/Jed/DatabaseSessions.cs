@@ -63,7 +63,7 @@ public sealed partial class Session
     /// <summary>Publish the current write transaction and close this session.</summary>
     public async Task CommitAsync(CancellationToken cancellationToken = default)
     {
-        if (hostReadSession) throw new SqlException(SqlStates.ReadOnlySqlTransaction, "read handle cannot commit");
+        if (hostReadSession) { await DisposeAsync().ConfigureAwait(false); return; }
         try { await using var rows = await QueryAsync("COMMIT", cancellationToken: cancellationToken).ConfigureAwait(false); }
         finally { await DisposeAsync().ConfigureAwait(false); }
     }

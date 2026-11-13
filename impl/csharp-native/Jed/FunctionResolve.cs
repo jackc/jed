@@ -4,6 +4,7 @@ internal static class FunctionResolve
 {
     internal static Resolved Call(Expression expression)
     {
+        if (expression.Text == "merge_action") throw Errors.Syntax("merge_action() requires MERGE RETURNING");
         if (expression.Text == "timezone")
         {
             if (expression.Args.Length != 2) throw new SqlException(SqlStates.UndefinedFunction, "timezone requires two arguments");
@@ -49,7 +50,10 @@ internal static class FunctionResolve
             if (name == "nullif")
             {
                 var (left, right) = Resolve.Pair(expression.Args[0], expression.Args[1]);
+                if (left.Type == SqlType.Unknown && right.Type == SqlType.Unknown)
+                    (left, right) = (Resolve.Adapt(expression.Args[0], left, SqlType.Text), Resolve.Adapt(expression.Args[1], right, SqlType.Text));
                 _ = Resolve.Common(left.Type, right.Type);
+                Resolve.RequireOrderable(left.Type); Resolve.RequireOrderable(right.Type);
                 return new(name, left.Type, default, [left, right]);
             }
             var unified = Resolve.Unify(expression.Args, adaptFloatLiterals: false);

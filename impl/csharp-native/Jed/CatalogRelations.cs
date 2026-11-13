@@ -34,7 +34,10 @@ internal static class CatalogRelations
             _ => throw new InvalidOperationException("unknown catalog relation")
         };
         var context = new QueryStorage(database, snapshot, pending, catalog);
-        return new(RelationExecution.Alias(columns, relation.Alias ?? name, relation.ColumnAliases), Rows(name, context, meter, token));
+        var prepared = new PreparedRelation(RelationExecution.Alias(columns, relation.Alias ?? name, relation.ColumnAliases), Rows(name, context, meter, token));
+        if (meter.Explain is null) return prepared;
+        var count = Generate(name, context, meter, token).LongCount();
+        return ExplainPlanning.Attach(prepared, new("Catalog Scan " + name, "db=" + (qualifier ?? "main"), count, count), meter);
     }
     private static SqlValue T(string? value) => value is null ? SqlValue.Null(SqlType.Text) : SqlValue.Text(value);
     private static SqlValue I(long value) => SqlValue.Integer(value, SqlType.I32);

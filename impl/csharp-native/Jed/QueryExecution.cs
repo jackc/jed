@@ -39,8 +39,8 @@ internal static class QueryExecution
         var touched = StorageTouchedColumns.Collect(initialized);
         if (storage is not null)
         {
-            var selected = initialized.Access ?? AccessPlan.Select(table, tree, initialized.Filter, storage, meter);
-            await foreach (var row in selected.Rows(table, tree, storage, meter, touched, cancellationToken, access.Scan.Reverse).ConfigureAwait(false)) yield return row;
+            var selected = initialized.Access ?? SinglePipeline.Select(table, tree, initialized, storage, meter).Access;
+            await foreach (var row in selected.Rows(table, tree, storage, meter, touched, cancellationToken, initialized.Access is null ? access.Scan.Reverse : initialized.ScanReverse).ConfigureAwait(false)) yield return row;
         }
         else
         {
@@ -124,13 +124,34 @@ internal static class QueryExecution
             yield break;
         }
         var order = plan.Order ?? [];
-        if (plan.Limit == 0 && order.Length == 0) yield break;
+        if (plan.Limit == 0 && order.Length == 0)
+        {
+            if (plan.BeforeZeroLimit is { } prime) await prime().ConfigureAwait(false);
+            yield break;
+        }
         long skipped = 0, produced = 0;
         if (order.Length != 0)
         {
             using var sortMemory = new QueryInputMemory(meter);
+            using var decorations = new QueryInputMemory(meter);
             var rows = new List<(SqlValue[] Row, SortValue[] Keys, int Ordinal)>();
-            var heap = !sourceMemory && plan.DistinctOnCount == 0 && plan.Limit is not null && order.All(key => key.Expression.Op == "column" && key.Expression.Collation?.Table is null);
+            var heap = !sourceMemory && plan.DistinctOnCount == 0 && plan.Limit is not null && order.All(key => SortPlan.Column(key.Expression) is not null);
+            if (heap && plan.Spill is { } budget) heap = budget.TopK(plan);
+            if (!heap && plan.Spill is { } spill && order.All(key => key.Expression.Collation?.Table is null))
+            {
+                await foreach (var row in SpillSort.Run(plan, source, spill, inputMemory, meter, cancellationToken).ConfigureAwait(false)) yield return row;
+                yield break;
+            }
+            var collatedHeap = heap && order.Any(key => key.Expression.Collation?.Table is not null);
+            if (!sourceMemory && order.Any(key => key.Expression.Collation?.Table is not null))
+            {
+                var survivors = new List<SqlValue[]>();
+                await foreach (var row in source.WithCancellation(cancellationToken).ConfigureAwait(false))
+                    if (await KeepsAsync(plan.Filter, row, meter, plan.Observation?.Filter).ConfigureAwait(false))
+                        survivors.Add(await sortMemory.TakeAsync(row, false, StorageTouchedColumns.Collect(plan)).ConfigureAwait(false));
+                source = BufferedSource(survivors); plan = plan with { Filter = null };
+                if (heap) sortMemory.Dispose(); else sourceMemory = true;
+            }
             var capacity = plan.Limit == 0 ? 0 : plan.Limit is { } take ? Estimate.Add(plan.Offset, take) : long.MaxValue;
             var ordinal = 0;
             int Compare((SqlValue[] Row, SortValue[] Keys, int Ordinal) left, (SqlValue[] Row, SortValue[] Keys, int Ordinal) right)
@@ -145,27 +166,36 @@ internal static class QueryExecution
             await foreach (var row in source.WithCancellation(cancellationToken).ConfigureAwait(false))
             {
                 if (!await KeepsAsync(plan.Filter, row, meter, plan.Observation?.Filter).ConfigureAwait(false)) { inputMemory.Release(row); continue; }
-                if (heap && capacity == 0) continue;
+                if (heap && capacity == 0 && order.All(key => key.Expression.Collation?.Table is null)) continue;
                 var keyCost = meter.Accrued;
                 var keys = new SortValue[order.Length];
                 for (var i = 0; i < keys.Length; i++)
                 {
                     var value = await Evaluate.ExprAsync(order[i].Expression, meter, row: row).ConfigureAwait(false);
-                    if (order[i].Expression.Op != "column") sortMemory.ReserveValue(value);
+                    if (SortPlan.Column(order[i].Expression) is null) sortMemory.ReserveValue(value);
                     keys[i] = CollationRules.Decorate(value, order[i].Expression, meter);
                 }
                 plan.Observation?.Sort?.AttributeLocal(meter.Accrued - keyCost);
+                if (heap && capacity == 0) continue;
                 var candidate = (Row: row, Keys: keys, Ordinal: ordinal++);
                 if (heap && rows.Count >= capacity && Compare(candidate, rows[^1]) >= 0) continue;
-                var buffered = sourceMemory ? row : await sortMemory.TakeAsync(row, false, StorageTouchedColumns.Collect(plan)).ConfigureAwait(false);
+                var buffered = sourceMemory || collatedHeap ? row : await sortMemory.TakeAsync(row, false, StorageTouchedColumns.Collect(plan)).ConfigureAwait(false);
+                if (heap && rows.Count >= capacity) sortMemory.Release(rows[^1].Row);
+                decorations.ReserveBytes(MemorySize.SortKeyBytes(keys));
+                if (heap && rows.Count >= capacity)
+                {
+                    decorations.ReleaseBytes(MemorySize.SortKeyBytes(rows[^1].Keys));
+                    rows.RemoveAt(rows.Count - 1);
+                }
                 rows.Add((buffered, keys, candidate.Ordinal));
                 if (heap)
                 {
                     rows.Sort(Compare);
-                    if (rows.Count > capacity) { sortMemory.Release(rows[^1].Row); rows.RemoveAt(rows.Count - 1); }
                 }
             }
             if (!heap) rows.Sort(Compare);
+            decorations.Dispose();
+            if (collatedHeap) foreach (var row in rows) sortMemory.Reserve(row.Row);
             SortValue[]? previous = null;
             foreach (var row in rows)
             {
@@ -198,6 +228,12 @@ internal static class QueryExecution
             if (plan.Limit is { } limit && produced >= limit) yield break;
         }
     }
+    private static async IAsyncEnumerable<SqlValue[]> BufferedSource(IEnumerable<SqlValue[]> rows)
+    {
+        await ValueTask.CompletedTask.ConfigureAwait(false);
+        foreach (var row in rows) yield return row;
+    }
+
     private static async IAsyncEnumerable<SqlValue[]> ColumnarSource(SelectPlan plan, IAsyncEnumerable<SqlValue[]> source, Meter meter,
         [EnumeratorCancellation] CancellationToken token)
     {

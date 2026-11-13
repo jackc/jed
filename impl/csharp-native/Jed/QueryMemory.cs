@@ -4,6 +4,7 @@ namespace Jed;
 // unlimited path; callers test Enabled before measuring buffered values.
 internal static class MemorySize
 {
+    internal static long SortKeyBytes(IEnumerable<SortValue> keys) => keys.Aggregate(0L, (bytes, key) => key.Key is null ? bytes : Meter.Add(bytes, MemorySchedule.Value + key.Key.Length));
     internal static long RowBytes(IReadOnlyList<SqlValue> row, IReadOnlyList<bool>? touched = null)
     {
         var bytes = MemorySchedule.Row;

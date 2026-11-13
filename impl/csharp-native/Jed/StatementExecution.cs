@@ -1,6 +1,6 @@
 namespace Jed;
 
-internal sealed record StatementResult(Column[] Columns, Row[] Rows, long Affected = 0);
+internal sealed record StatementResult(Column[] Columns, Row[] Rows, long? Affected = null);
 
 internal static partial class StatementExecution
 {
@@ -60,7 +60,7 @@ internal static partial class StatementExecution
     {
         if (pending.Catalog.Scope is null && (statement is CreateTableSyntax { Temporary: true } || statement is CreateTableAsSyntax { Temporary: true }))
             throw Errors.Unsupported("temporary tables require a session domain");
-        var target = statement switch { InsertSyntax insert => insert.Table, UpdateSyntax update => update.Table, DeleteSyntax delete => delete.Table, _ => null };
+        var target = statement switch { InsertSyntax insert => insert.Table, UpdateSyntax update => update.Table, DeleteSyntax delete => delete.Table, MergeSyntax merge => merge.Table, _ => null };
         if (target is not null && (pending.Catalog.Views ?? []).FirstOrDefault(view => view.Name == target) is { } view)
             return await WriteView(database, pending, statement, view, meter, cancellationToken, context).ConfigureAwait(false);
         if (target is not null)
@@ -82,7 +82,7 @@ internal static partial class StatementExecution
             case DropSequenceSyntax drop: return DropSequence(pending, drop, meter);
             case CreateTypeSyntax create: return CreateType(pending, create);
             case DropTypeSyntax drop: return DropType(pending, drop);
-            case CreateTableAsSyntax create: return await CreateTableAs(database, pending, create, meter, cancellationToken).ConfigureAwait(false);
+            case CreateTableAsSyntax create: return await CreateTableAs(database, pending, create, meter, cancellationToken, context?.PreparedQuery).ConfigureAwait(false);
             case CreateTableSyntax create: return CreateTable(pending, create, meter);
             case CreateIndexSyntax index: return await CreateIndex(database, pending, index, meter, cancellationToken).ConfigureAwait(false);
             case DropIndexSyntax index: return await DropIndex(database, pending, index, cancellationToken).ConfigureAwait(false);
@@ -134,12 +134,10 @@ internal static partial class StatementExecution
                 var readState = context?.Read ?? pending.Fork();
                 var inputBinder = new SubqueryBinder([], database, pending.Before, readState, readState.Catalog, meter, cancellationToken, context?.Scope);
                 var input = insert.Values.Select(row => row.Select(value => value.Op == "default" ? value : inputBinder.Bind(value)).ToArray()).ToArray();
-                if (insert.Source is { } unboundSource)
+                if (insert.Source is not null)
                 {
                     if (insert.Overriding is null && slots.Any(slot => table.Columns[slot].IdentityAlways)) throw new SqlException(SqlStates.GeneratedAlways, "explicit SELECT source for GENERATED ALWAYS identity");
-                    var sourceSyntax = Resolve.BindTypes(unboundSource, pending.Catalog, meter.Temporal);
-                    sourceSyntax = AdaptInsertSource(sourceSyntax, slots.Select(slot => table.Columns[slot].Type).ToArray(), pending.Catalog, meter);
-                    var source = RelationExecution.Query(sourceSyntax, database, pending.Before, readState, readState.Catalog, meter, cancellationToken, scope: context?.Scope);
+                    var source = context?.PreparedQuery ?? RelationExecution.Query(InsertQuery(insert, table, pending.Catalog, meter), database, pending.Before, readState, readState.Catalog, meter, cancellationToken, scope: context?.Scope);
                     if (source.Columns.Length != slots.Length) throw Errors.Syntax("INSERT source width differs from target");
                     for (var i = 0; i < slots.Length; i++) Assignable(source.Columns[i].Type, table.Columns[slots[i]].Type.Type);
                     var rows = new List<Expression[]>();
@@ -195,6 +193,7 @@ internal static partial class StatementExecution
                 if (returning.Length != 0) foreach (var values in inserted) results.Add((await QueryExecution.ProjectAsync(returning, ReturningRow(table, null, values), meter).ConfigureAwait(false)).RetainMemory(meter));
                 return new(returning.Select(p => new Column(p.Name, p.Expression.Type)).ToArray(), results.ToArray(), input.LongLength);
             }
+            case MergeSyntax merge: return await PrepareMerge(database, pending, merge, meter, cancellationToken, context).Run().ConfigureAwait(false);
             case UpdateSyntax update: return await Mutate(database, pending, update.Table, update.Filter, update.Assignments, update.Returning, meter, cancellationToken, update.ViewChecks, update.ViewBinding, context, update.ReturningAliases).ConfigureAwait(false);
             case DeleteSyntax delete: return await Mutate(database, pending, delete.Table, delete.Filter, null, delete.Returning, meter, cancellationToken, viewBinding: delete.ViewBinding, context: context, aliases: delete.ReturningAliases).ConfigureAwait(false);
             default: throw Errors.Unsupported("statement execution");
@@ -253,14 +252,17 @@ internal static partial class StatementExecution
         var returnBinder = new SubqueryBinder(viewBinding?.Returning ?? ReturningColumns(table, aliases), database, pending.Before, readState, readState.Catalog, meter, cancellationToken, context?.Scope);
         var returning = Returning(table, items, pending.Catalog, meter, returnBinder, aliases);
         foreach (var check in viewChecks ?? []) _ = returnBinder.Bind(check);
-        if (filter is not null && Resolve.EmptyFilter(filter)) return new(returning.Select(projection => new Column(projection.Name, projection.Expression.Type)).ToArray(), []);
+        if (filter is not null && Resolve.EmptyFilter(filter)) return new(returning.Select(projection => new Column(projection.Name, projection.Expression.Type)).ToArray(), [], 0);
         await returnBinder.Initialize().ConfigureAwait(false);
-        await binder.Initialize().ConfigureAwait(false); var results = new List<Row>();
+        var initializationStart = meter.Accrued;
+        await binder.Initialize().ConfigureAwait(false);
+        context?.MutationObservation?.Filter?.AttributeLocal(meter.Accrued - initializationStart);
+        var results = new List<Row>();
         var changes = new List<(StorageRecord Old, SqlValue[] Values)>();
         var storedRows = new Dictionary<string, StorageRecord>(StringComparer.Ordinal);
         var unchanged = Enumerable.Range(0, table.Columns.Length).Where(column => !table.PrimaryKey.Contains(column) && !(targets ?? []).Any(target => target.Slot == column)).ToHashSet();
-        var scan = TableAccess.Bounds(filter, table);
-        var gin = scan.Empty ? null : GinAccess.Select(table, scanTree, filter is null ? null : PlanTransform.InitialValues(filter), new(database, pending.Before, readState, readState.Catalog), meter);
+        var storage = new QueryStorage(database, pending.Before, readState, readState.Catalog);
+        var access = AccessPlan.Select(table, scanTree, filter is null ? null : PlanTransform.InitialValues(filter), storage, meter);
         var touched = new HashSet<int>();
         void Touch(Resolved? node)
         {
@@ -269,21 +271,18 @@ internal static partial class StatementExecution
             if (node.Subquery is { } cell) foreach (var slot in cell.ReferencedSlots) touched.Add(slot % table.Columns.Length);
             foreach (var child in node.Args) Touch(child);
         }
-        if (gin is not null)
-        {
-            Touch(filter); foreach (var projection in returning) Touch(projection.Expression);
-            foreach (var target in targets ?? []) if (target.Value.Op != "default")
-                Touch(Resolve.Expr(AssignmentLiteral(Resolve.Bind(target.Value, columns), table.Columns[target.Slot].Type), table.Columns[target.Slot].Type.Type));
-        }
-        if (gin is null && !scan.Empty) meter.Charge(await scanTree.CountRangePagesAsync(scan.Lower, scan.LowerInclusive, scan.Upper, scan.UpperInclusive, cancellationToken).ConfigureAwait(false)); meter.Checkpoint();
-        var sourceRecords = gin is not null ? gin.Records(scanTree, meter, touched, cancellationToken) :
-            scanTree.ScanRangeAsync(scan.Empty ? [1] : scan.Lower, scan.LowerInclusive, scan.Empty ? [0] : scan.Upper, scan.UpperInclusive, cancellationToken: cancellationToken);
+        Touch(filter); foreach (var projection in returning) Touch(projection.Expression);
+        foreach (var target in targets ?? []) if (target.Value.Op != "default")
+            Touch(Resolve.Expr(AssignmentLiteral(Resolve.Bind(target.Value, columns), table.Columns[target.Slot].Type), table.Columns[target.Slot].Type.Type));
+        var sourceRecords = access.Records(table, scanTree, storage, meter, touched, cancellationToken);
+        if (context?.MutationObservation is { } observation)
+            sourceRecords = ExplainObservation.Rows(sourceRecords, observation.Scan, meter, cancellationToken);
         await foreach (var record in sourceRecords.ConfigureAwait(false))
         {
-            if (gin is null) meter.Charge(Costs.StorageRowRead); meter.Checkpoint();
+            var deferred = scanTree.DecodeDeferredRow(table, record);
+            if (!await QueryExecution.KeepsAsync(filter, deferred, meter, context?.MutationObservation?.Filter).ConfigureAwait(false)) continue;
             var materialized = await scanTree.MaterializeRecordAsync(record, cancellationToken).ConfigureAwait(false);
             var original = table.DecodeRow(materialized);
-            if (!await QueryExecution.KeepsAsync(filter, original, meter).ConfigureAwait(false)) continue;
             var values = original.ToArray();
             if (targets is not null)
                 foreach (var target in targets.OrderBy(target => target.Slot))

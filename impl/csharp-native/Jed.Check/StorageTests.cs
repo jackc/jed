@@ -54,6 +54,7 @@ internal static class StorageTests
         }
         await Cache();
         await Commit(empty);
+        await FreeListBoundary(empty);
         await TrailingTruncation(empty);
         await Leaves(fixtureRoot);
         await Trees(empty, fixtureRoot);
@@ -303,6 +304,26 @@ internal static class StorageTests
                 }
         }
         Console.WriteLine($"PASS COW tree: shared multi-way split bytes, {interiors} interior goldens, async bounded-cache scans, immutable snapshots, 600 permuted deletes and exact retirement delta");
+    }
+
+    private static async Task FreeListBoundary(byte[] image)
+    {
+        await using var device = new MemoryBlockStore(image);
+        var before = await StorageRecovery.OpenAsync(device);
+        // At 256 bytes each list page holds 60 entries. Starting with 63 safe
+        // pages, the catalog draws one and two list pages draw two more. The
+        // canonical monotone serializer keeps the resulting empty second chunk.
+        before = before with { Meta = before.Meta with { PageCount = 66 }, FreePages = new(Enumerable.Range(3, 63).Select(value => (uint)value)) };
+        var allocation = new StorageAllocation(before, eagerReclaim: false);
+        var root = allocation.AddPage(StorageFormat.EncodePage(256, new(1, 0, 0, 0), []));
+        var plan = allocation.Prepare(root, 1);
+        Corpus.Equal(2, plan.FreeListPages.Count, "free-list boundary retains allocated chunks");
+        Corpus.Equal(true, plan.Body.Any(page => StorageFormat.ParsePage(page.Bytes) is { Type: 7, Count: 0 }), "empty free-list tail encoded");
+        var writer = new StorageCommitter(new StoragePager(device, 256), before);
+        await writer.CommitAsync(plan);
+        var recovered = await StorageRecovery.OpenAsync(device);
+        Corpus.Equal(60, recovered.FreePages.Count, "empty free-list tail reopens");
+        Corpus.Equal(2, recovered.FreeListPages.Count, "empty trailing list page stays protected");
     }
 
     private static async Task Commit(byte[] image)

@@ -155,6 +155,12 @@ public sealed partial class Session : IAsyncDisposable
             throw;
         }
     }
+    internal async ValueTask SetWorkMemAsync(long bytes)
+    {
+        var handle = await GetDatabase(CancellationToken.None).ConfigureAwait(false);
+        handle.SetWorkMem(bytes);
+    }
+
     private async ValueTask<Database> GetDatabase(CancellationToken cancellationToken)
     {
         if (database is not null) return database;
@@ -223,13 +229,14 @@ public sealed class Rows : IAsyncEnumerable<Row>, IAsyncDisposable
     public ReadOnlyCollection<Column> Columns { get; }
     public long Cost => meter.Accrued;
 
-    public long AffectedRows { get; }
+    /// <summary>DML/CTAS command count, or null when the statement has no count.</summary>
+    public long? AffectedRows { get; }
     internal Rows(Session session, SelectPlan plan, IAsyncEnumerable<SqlValue[]> source, Meter meter,
         CancellationToken cancellationToken = default, IDisposable? retained = null)
         : this(session, plan.Projections.Select(p => new Column(p.Name, p.Expression.Type)).ToArray(),
             QueryExecution.Select(plan, source, meter, cancellationToken), meter, retained) { }
 
-    internal Rows(Session session, Column[] columns, IAsyncEnumerable<Row> source, Meter meter, IDisposable? retained = null, long affected = 0, bool guardCost = true)
+    internal Rows(Session session, Column[] columns, IAsyncEnumerable<Row> source, Meter meter, IDisposable? retained = null, long? affected = null, bool guardCost = true)
     {
         this.session = session; this.meter = meter; this.retained = retained; this.guardCost = guardCost;
         stream = source.GetAsyncEnumerator(); Columns = Array.AsReadOnly(columns); AffectedRows = affected;

@@ -18,7 +18,7 @@ internal sealed record SimulationRows(string[] Rendered, long Affected, long Cos
             rendered.Add(string.Join('\u001f', cells));
         }
         rendered.Sort(Utf8NameComparer.Instance);
-        return new(rendered.ToArray(), rows.AffectedRows, rows.Cost);
+        return new(rendered.ToArray(), rows.AffectedRows ?? -1, rows.Cost);
     }
     internal static async Task<string> Digest(Session session, SimulationFileSystem fs, string name = "main")
     {

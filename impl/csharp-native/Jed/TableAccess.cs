@@ -9,8 +9,9 @@ internal static class TableAccess
     {
         var scan = Bounds(plan.Filter, table);
         var order = plan.Order ?? [];
-        if (plan.DistinctOnCount == 0 && plan.Group is null && order.Length > 0 && order.Length <= table.PrimaryKey.Length && (!order[0].Descending || order.Length == table.PrimaryKey.Length) &&
-            order.Select((key, i) => key.Expression.Op == "column" && key.Expression.Slot == table.PrimaryKey[i] && key.Descending == order[0].Descending && Compatible(key.Expression, table.Columns[table.PrimaryKey[i]])).All(b => b))
+        if (plan.DistinctOnCount == 0 && plan.Group is null && order.Length > 0 && table.PrimaryKey.Length > 0 && (!order[0].Descending || order.Length >= table.PrimaryKey.Length) &&
+            order.Take(table.PrimaryKey.Length).Select((key, i) => SortPlan.Column(key.Expression) == table.PrimaryKey[i] && key.Descending == order[0].Descending && Compatible(key.Expression, table.Columns[table.PrimaryKey[i]])).All(b => b) &&
+            order.Skip(table.PrimaryKey.Length).All(key => SortPlan.Column(key.Expression) is not null))
         {
             scan = scan with { Reverse = order[0].Descending };
             plan = plan with { Order = [], StreamDistinct = plan.Distinct, WindowPrefix = WindowPrefix.Eligible(plan, table, order[0].Descending) };

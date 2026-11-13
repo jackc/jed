@@ -1,0 +1,54 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#MISE description="Explicit opt-in: execute a complete pinned C# simulation trace twice with structural and durability oracles"
+#USAGE flag "--file <path>" help="Complete .sim trace; defaults to pinned ANALYZE/drop recovery regression"
+#USAGE flag "--peer" help="Compare exact transcript with independently executed pinned Go simulation"
+#USAGE flag "--no-build" help="Use an existing C# Release assembly"
+require_relative "../../impl/csharp-native/Tools/tasks"
+require "tmpdir"
+file = ENV["usage_file"] || File.join(CSharpNativeTasks.baseline_spec, "conformance/sim/regress/analyze-then-drop-table.sim")
+abort "Trace must be an existing .sim file" unless File.file?(file) && file.end_with?(".sim")
+file = File.expand_path(file)
+dll = ENV["usage_no_build"] == "true" ? File.join(CSharpNativeTasks::PACKAGE, "Jed.Check/bin/Release/net11.0/Jed.Check.dll") : CSharpNativeTasks.build
+diagnostics = File.join(Dir.tmpdir, "jed-csharp-simulation-" + File.basename(file, ".sim"))
+FileUtils.mkdir_p(diagnostics)
+output = error = status = nil
+Dir.mktmpdir("jed-csharp-simulation-assembly-") do |artifact|
+  source = File.dirname(dll)
+  hashes = Dir.glob(File.join(source, "*")).select { File.file?(_1) }.to_h { |path| [File.basename(path), Digest::SHA256.file(path).hexdigest] }
+  hashes.each_key { |name| FileUtils.cp(File.join(source, name), File.join(artifact, name)) }
+  hashes.each do |name, hash|
+    abort "Simulation assembly changed while copying" unless Digest::SHA256.file(File.join(source, name)).hexdigest == hash && Digest::SHA256.file(File.join(artifact, name)).hexdigest == hash
+  end
+  output, error, status = Open3.capture3(CSharpNativeTasks.environment.merge("JED_SIM_OUT" => diagnostics), CSharpNativeTasks.dotnet, File.join(artifact, "Jed.Check.dll"), "simulation", file)
+end
+$stdout.write(output)
+$stderr.write(error)
+exit(status.exitstatus || 1) unless status.success?
+exit 0 unless ENV["usage_peer"] == "true"
+revision = CSharpNativeTasks::BASELINE.fetch("semantic_revision")
+peer_root = File.join(CSharpNativeTasks::BUILD, "simulation-peer-#{revision}")
+marker = File.join(peer_root, ".complete")
+unless File.file?(marker)
+  FileUtils.mkdir_p(peer_root)
+  statuses = Open3.pipeline(["git", "archive", revision, "impl/go", { chdir: CSharpNativeTasks::ROOT }], ["tar", "-x", "-C", peer_root])
+  abort "Cannot extract pinned Go simulator" unless statuses.all?(&:success?)
+  File.write(marker, "#{revision}\n")
+end
+peer = File.join(peer_root, "sim.test")
+unless File.executable?(peer)
+  abort "Pinned simulator build failed" unless system("go", "test", "-c", "-o", peer, ".", chdir: File.join(peer_root, "impl/go"))
+end
+Dir.mktmpdir("jed-csharp-sim-peer-") do |directory|
+  peer_output, peer_error, peer_status = Open3.capture3({ "JED_SIM_IN" => file, "JED_SIM_OUT" => directory, "JED_SIM_IMAGES" => "1" }, peer, "-test.run", "^TestSimRunner$", "-test.count=1", chdir: File.join(peer_root, "impl/go"))
+  abort "Pinned simulator failed:\n#{peer_output}\n#{peer_error}" unless peer_status.success?
+  Dir.glob(File.join(directory, "*.img")).each { |image| FileUtils.cp(image, diagnostics) }
+  expected = File.binread(File.join(directory, "#{File.basename(file, '.sim')}.go.jsonl"))
+  unless expected == output
+    actual = File.join(diagnostics, "csharp-native.jsonl"); golden = File.join(diagnostics, "go.jsonl")
+    File.binwrite(actual, output); File.binwrite(golden, expected)
+    mismatch = expected.lines.zip(output.lines).each_with_index.find { |(a,b), _| a != b }
+    abort "Pinned transcript mismatch at line #{mismatch ? mismatch.last + 1 : 'length'}; compare #{golden} and #{actual}"
+  end
+end
+warn "PASS exact pinned Go/C# simulation transcript, baseline #{revision}"

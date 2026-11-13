@@ -7,6 +7,37 @@ internal static partial class Estimate
     internal static long Rows(CatalogTable table, Catalog catalog, Resolved? predicate, long population) =>
         StatisticalRows(population, table, catalog, predicate);
 
+    internal static long JoinRows(PreparedRelation left, PreparedRelation right, Resolved? predicate)
+    {
+        var a = left.EstimatedRows ?? left.Plan?.EstimatedRows ?? 0;
+        var b = right.EstimatedRows ?? right.Plan?.EstimatedRows ?? 0;
+        var population = Multiply(a, b); var rows = population;
+        if (predicate is null) return rows;
+        foreach (var term in PredicatePlan.Conjuncts(predicate))
+        {
+            var refined = false;
+            if (term.Op == "=" && left.BaseAccess is { } first && right.BaseAccess is { } second)
+            {
+                var x = term.Args[0]; var y = term.Args[1];
+                if (x.Op == "column" && y.Op == "column" && x.Slot >= left.Columns.Length) (x, y) = (y, x);
+                if (x.Op == "column" && y.Op == "column" && (uint)x.Slot < first.Table.Columns.Length &&
+                    y.Slot >= left.Columns.Length && (uint)(y.Slot - left.Columns.Length) < second.Table.Columns.Length &&
+                    ColumnStatistics.DistributionEligible(x.Type) && ColumnStatistics.DistributionEligible(y.Type) &&
+                    StatisticsView.Find(first.Storage.Catalog, first.Table, x.Slot) is { } xs &&
+                    StatisticsView.Find(second.Storage.Catalog, second.Table, y.Slot - left.Columns.Length) is { } ys)
+                {
+                    var nonnullA = first.Table.RowCount == 0 ? 0 : Scale(a, xs.NonnullRows, first.Table.RowCount);
+                    var nonnullB = second.Table.RowCount == 0 ? 0 : Scale(b, ys.NonnullRows, second.Table.RowCount);
+                    var ndv = Math.Max(1, Math.Max(xs.DistinctValues, ys.DistinctValues));
+                    var matches = Scale(nonnullA, nonnullB, ndv);
+                    rows = population == 0 ? 0 : Math.Min(rows, Scale(rows, matches, population)); refined = true;
+                }
+            }
+            if (!refined) rows = Rows(rows, term);
+        }
+        return rows;
+    }
+
     private static long StatisticalRows(long count, CatalogTable table, Catalog catalog, Resolved? predicate)
     {
         if (count == 0 || predicate is null) return count;
@@ -46,6 +77,7 @@ internal static partial class Estimate
         if (predicate.Op == "or") return Math.Min(count, Add(StatisticalRows(count, table, catalog, predicate.Args[0]), StatisticalRows(count, table, catalog, predicate.Args[1])));
         if (predicate.Op == "not")
         {
+            if (predicate.Args[0].Op == "in_list" && predicate.Args[0].Args.Skip(1).Any(value => value.Op == "constant" && !value.ParameterUnbound && value.Constant.IsNull)) return 0;
             var population = NonnullPopulation(predicate.Args[0], table, catalog) ?? table.RowCount;
             return Scale(count, Math.Max(0, population - StatisticalRows(table.RowCount, table, catalog, predicate.Args[0])), table.RowCount);
         }
@@ -58,13 +90,9 @@ internal static partial class Estimate
             result = Equality(boolean.Statistics, boolean.Derivation, SqlValue.Boolean(true), false);
         else if (predicate.Op == "in_list" && Column(predicate.Args[0], table, catalog) is { } listColumn)
             result = Membership(listColumn.Statistics, listColumn.Derivation, predicate.Args.Skip(1), listColumn.Type, false);
-        else if (predicate.Op == "quantified" && predicate.Text is "= any" or "<> all" && Column(predicate.Args[0], table, catalog) is { } arrayColumn)
+        else if (ArrayMembership(predicate, out var elements, out var complement, out var nullArray) && Column(predicate.Args[0], table, catalog) is { } arrayColumn)
         {
-            var expression = predicate.Args[1];
-            if (expression.Op == "array") result = Membership(arrayColumn.Statistics, arrayColumn.Derivation, expression.Args, arrayColumn.Type, predicate.Text == "<> all");
-            else if (GinQuery.Value(expression, out var array) && array.Type.Kind == SqlKind.Array)
-                result = array.IsNull ? 0 : Membership(arrayColumn.Statistics, arrayColumn.Derivation,
-                    array.AsArray().Values.Select(value => new Resolved("constant", value.Type, value, [])), arrayColumn.Type, predicate.Text == "<> all");
+            result = nullArray ? 0 : Membership(arrayColumn.Statistics, arrayColumn.Derivation, elements, arrayColumn.Type, complement);
         }
         if (result is null && predicate.Op is "open_predicate" or "json_binary" or "json_path_binary" or "quantified")
         {
@@ -140,6 +168,10 @@ internal static partial class Estimate
     private static long HistogramCdf(StatisticsView facts, CollationDerivation? derivation, SqlValue value, bool inclusive)
     {
         if (facts.Histogram.Length < 2) return Fraction(facts.HistogramRows, "inequality");
+        return Scale(facts.HistogramRows, HistogramOrdinal(facts, derivation, value, inclusive), facts.Histogram.Length - 1);
+    }
+    private static int HistogramOrdinal(StatisticsView facts, CollationDerivation? derivation, SqlValue value, bool inclusive)
+    {
         var ordinal = 0;
         foreach (var bound in facts.Histogram)
         {
@@ -147,7 +179,7 @@ internal static partial class Estimate
             if (order > 0 || !inclusive && order == 0) break;
             ordinal++;
         }
-        return Math.Min(facts.HistogramRows, Scale(facts.HistogramRows, ordinal, facts.Histogram.Length - 1));
+        return Math.Min(ordinal, facts.Histogram.Length - 1);
     }
     private static long Range(StatisticsView facts, CollationDerivation? derivation, ComparisonFact lower, ComparisonFact upper)
     {
@@ -159,7 +191,9 @@ internal static partial class Estimate
             var a = CollationRules.Compare(value, lower.Value, derivation); var b = CollationRules.Compare(value, upper.Value, derivation);
             if ((a > 0 || a == 0 && lower.Op == ">=") && (b < 0 || b == 0 && upper.Op == "<=")) rows = Add(rows, facts.McvRows[i]);
         }
-        var residual = facts.Histogram.Length < 2 ? Fraction(facts.HistogramRows, "paired_range") : Math.Max(0, HistogramCdf(facts, derivation, upper.Value, upper.Op == "<=") - HistogramCdf(facts, derivation, lower.Value, lower.Op == ">"));
+        var residual = facts.Histogram.Length < 2 ? Fraction(facts.HistogramRows, "paired_range") :
+            Scale(facts.HistogramRows, Math.Max(0, HistogramOrdinal(facts, derivation, upper.Value, upper.Op == "<=") -
+                HistogramOrdinal(facts, derivation, lower.Value, lower.Op == ">")), facts.Histogram.Length - 1);
         return Math.Min(facts.NonnullRows, Add(rows, residual));
     }
     private static long Membership(StatisticsView facts, CollationDerivation? derivation, IEnumerable<Resolved> elements, SqlType type, bool complement)
@@ -170,7 +204,13 @@ internal static partial class Estimate
             if (element.ParameterUnbound) { rows = Math.Min(facts.NonnullRows, Add(rows, Equality(facts, derivation, default, true))); continue; }
             if (!GinQuery.Value(element, out var value)) { rows = Math.Min(facts.NonnullRows, Add(rows, Equality(facts, derivation, default, true))); continue; }
             if (value.IsNull) { if (complement) return 0; continue; }
-            try { value = Resolve.Cast(value, type); } catch (SqlException) { continue; }
+            try
+            {
+                var converted = Resolve.Cast(value, type);
+                if (value.Type.IsNumeric() && type.IsNumeric() && Evaluate.Compare(value, converted) != 0) continue;
+                value = converted;
+            }
+            catch (SqlException) { continue; }
             if (known.Any(previous => CollationRules.Compare(previous, value, derivation) == 0)) continue;
             known.Add(value); rows = Math.Min(facts.NonnullRows, Add(rows, Equality(facts, derivation, value, false)));
         }

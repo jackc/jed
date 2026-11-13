@@ -40,6 +40,7 @@ try
         await StorageShapeTests.Run(root);
         await ScratchTests.Run();
         await SpillOperatorTests.Run();
+        await SqlSpillTests.Run();
         CryptoTests.Run(root);
         ScalarBytesTests.Run();
         FloatTests.Run();
@@ -52,7 +53,8 @@ try
     {
         await FileInteropTests.Run(peerExecutable);
     }
-    else if (args is ["spill-operators"]) await SpillOperatorTests.Run();
+    else if (args is ["spill-operators"]) { await SpillOperatorTests.Run(); await SqlSpillTests.Run(); }
+    else if (args is ["simulation", var simulationPath]) await SimulationRunner.Run(simulationPath);
     else if (args is ["simulation-host"]) await SimulationHostTests.Run();
     else if (args is ["rekey", var rekeyRoot]) await RekeyTests.Run(rekeyRoot);
     else if (args is ["maintenance", var maintenanceRoot])
@@ -94,12 +96,12 @@ try
         StorageCryptoTests.Run(cryptoRoot);
         await StorageCryptoTests.Recovery(cryptoRoot);
     }
-    else if (args.Length > 1 && args[0] == "corpus")
+    else if (args.Length > 1 && args[0] is "corpus" or "corpus-file")
     {
         var failures = 0; var records = 0;
         foreach (var file in args.Skip(1))
         {
-            try { records += await Corpus.Run(file); }
+            try { records += await Corpus.Run(file, args[0] == "corpus-file"); }
             catch (Exception error) { Console.Error.WriteLine(error.Message); failures++; }
         }
         Console.WriteLine($"{args.Length - 1} selected files, {records} records in passing files, {failures} failed files; no full-parity claim");

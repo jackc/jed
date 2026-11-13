@@ -132,7 +132,7 @@ internal static class StorageCryptoRecovery
                 throw StorageFormat.Corrupt("invalid encrypted free-list chain");
             await store.ReadAsync((long)id * header.PageSize, stored, cancellationToken).ConfigureAwait(false);
             var bytes = codec.OpenBody(id, stored, tag); var page = StorageFormat.ParsePage(bytes, verifyChecksum: false);
-            if (page.Type != 7 || page.Count == 0 || page.Count > (header.PageSize - 32 - StoragePageCodec.Reserve) / 4 ||
+            if (page.Type != 7 || page.Count > (header.PageSize - 32 - StoragePageCodec.Reserve) / 4 ||
                 !StorageFormat.IsZero(bytes.AsSpan(32 + (int)page.Count * 4)) || page.Next == 0 && !StorageFormat.IsZero(bytes.AsSpan(16, 16)))
                 throw StorageFormat.Corrupt("invalid encrypted free-list page");
             for (var i = 0; i < page.Count; i++)

@@ -21,15 +21,20 @@ internal sealed class FileRoleStore(IBlockStore store, Action checkRole) : IBloc
     private void Leave()
     { lock (gate) { active--; if (active == 0) drained?.TrySetResult(); } }
     public async ValueTask ReadAsync(long offset, Memory<byte> destination, CancellationToken cancellationToken = default)
-    { Enter(); try { await store.ReadAsync(offset, destination, cancellationToken).ConfigureAwait(false); } finally { Leave(); } }
+    { Enter(); try { await store.ReadAsync(offset, destination, cancellationToken).ConfigureAwait(false); } catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+        { throw new SqlException(SqlStates.IoError, error.Message); } finally { Leave(); } }
     public async ValueTask WriteAsync(long offset, ReadOnlyMemory<byte> source, CancellationToken cancellationToken = default)
-    { Enter(); try { await store.WriteAsync(offset, source, cancellationToken).ConfigureAwait(false); } finally { Leave(); } }
+    { Enter(); try { await store.WriteAsync(offset, source, cancellationToken).ConfigureAwait(false); } catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+        { throw new SqlException(SqlStates.IoError, error.Message); } finally { Leave(); } }
     public async ValueTask<long> GetLengthAsync(CancellationToken cancellationToken = default)
-    { Enter(); try { return await store.GetLengthAsync(cancellationToken).ConfigureAwait(false); } finally { Leave(); } }
+    { Enter(); try { return await store.GetLengthAsync(cancellationToken).ConfigureAwait(false); } catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+        { throw new SqlException(SqlStates.IoError, error.Message); } finally { Leave(); } }
     public async ValueTask SetLengthAsync(long length, CancellationToken cancellationToken = default)
-    { Enter(); try { await store.SetLengthAsync(length, cancellationToken).ConfigureAwait(false); } finally { Leave(); } }
+    { Enter(); try { await store.SetLengthAsync(length, cancellationToken).ConfigureAwait(false); } catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+        { throw new SqlException(SqlStates.IoError, error.Message); } finally { Leave(); } }
     public async ValueTask SyncAsync(CancellationToken cancellationToken = default)
-    { Enter(); try { await store.SyncAsync(cancellationToken).ConfigureAwait(false); } finally { Leave(); } }
+    { Enter(); try { await store.SyncAsync(cancellationToken).ConfigureAwait(false); } catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+        { throw new SqlException(SqlStates.IoError, error.Message); } finally { Leave(); } }
     public ValueTask DisposeAsync()
     {
         lock (gate)

@@ -14,7 +14,7 @@ internal sealed record HashJoinPlan(int[] Left, int[] Right, SqlType[] Types)
         };
         foreach (var term in PredicatePlan.Conjuncts(predicate))
         {
-            if (term.Op is not ("=" or "<>" or "!=") || !PredicatePlan.Safe(term) || term.Args.Any(arg => arg.Op is not ("column" or "constant"))) return null;
+            if (term.Op is not ("=" or "<>" or "!=" or "<" or "<=" or ">" or ">=") || !PredicatePlan.Safe(term) || term.Args.Any(arg => arg.Op is not ("column" or "constant"))) return null;
             if (term.Op != "=" || term.Args[0].Op != "column" || term.Args[1].Op != "column") continue;
             var a = term.Args[0]; var b = term.Args[1];
             if (a.Slot >= leftWidth) (a, b) = (b, a);
@@ -22,12 +22,6 @@ internal sealed record HashJoinPlan(int[] Left, int[] Right, SqlType[] Types)
             left.Add(a.Slot); right.Add(b.Slot - leftWidth); types.Add(a.Type);
         }
         if (left.Count == 0) return null;
-        if (kind == "inner")
-        {
-            if (leftRows is not { } a || rightRows is not { } b) return null;
-            var pairs = Estimate.Multiply(a, b);
-            if (Work(a, b, types.ToArray(), residual) > Estimate.Multiply(pairs, residual is null ? 0 : PredicatePlan.Nodes(residual))) return null;
-        }
         return new(left.ToArray(), right.ToArray(), types.ToArray());
     }
     internal static long Work(long a, long b, SqlType[] types, Resolved? residual)

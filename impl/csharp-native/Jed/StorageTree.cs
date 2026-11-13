@@ -377,9 +377,11 @@ internal sealed partial class StorageTree
         if (reference.Dirty is not { } node) return reference;
         if (node.IsLeaf)
         {
-            var id = allocation.ReservePage();
             var original = node.Records();
+            // Incremental post-order includes the leaf's overflow dependencies:
+            // assign their pages before assigning the leaf that names them.
             var rows = original.Select(row => StorageLargeValues.WriteFresh(row, allocation)).ToArray();
+            var id = allocation.ReservePage();
             allocation.SetPage(id, StorageLeaf.Encode(pager.PageSize, schema, rows, pager.Encrypted));
             // Only the root's returned Resident payload survives publication;
             // interior serialization keeps child shapes and drops leaf rows.

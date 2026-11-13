@@ -44,11 +44,12 @@ internal static partial class StatementExecution
         return index < columns.Length && columns[index].Type is { } declared ? declared : new(column.Type == SqlType.Unknown ? SqlType.Text : column.Type);
     }
 
-    private static async ValueTask<StatementResult> CreateTableAs(Database database, PendingDatabase pending, CreateTableAsSyntax create, Meter meter, CancellationToken token)
+    private static async ValueTask<StatementResult> CreateTableAs(Database database, PendingDatabase pending, CreateTableAsSyntax create, Meter meter, CancellationToken token, PreparedRelation? prepared = null)
     {
         if (create.Name.StartsWith("jed_", StringComparison.Ordinal)) throw new SqlException(SqlStates.ReservedName, "reserved table name");
         PreparedRelation query;
-        if (WritableCteExecution.HasWrites(create.Query))
+        if (prepared is not null) query = prepared;
+        else if (WritableCteExecution.HasWrites(create.Query))
         {
             var plan = WritableCteExecution.Prepare(database, pending, create.Query.With!, create.Query.Recursive, create.Query with { With = null }, meter, token);
             query = new(plan.Columns, WritableCteExecution.Rows(plan));

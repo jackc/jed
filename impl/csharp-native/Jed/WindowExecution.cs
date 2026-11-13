@@ -43,6 +43,14 @@ internal static class WindowExecution
                     for (var at = i; at < end; at++) { peerStart[at] = i; peerEnd[at] = end; groupNumber[at] = group; }
                     i = end;
                 }
+                using var operandMemory = new QueryInputMemory(meter);
+                var cachedValues = new SqlValue[n];
+                if (plan.Name is "lag" or "lead" or "first_value" or "last_value" or "nth_value")
+                    for (var i = 0; i < n; i++)
+                    {
+                        cachedValues[i] = await Evaluate.ExprAsync(plan.Args[0], meter, row: rows[indices[i]]).ConfigureAwait(false);
+                        operandMemory.ReserveValue(cachedValues[i]);
+                    }
                 var fold = plan.Aggregate is null ? null : new GroupExecution.Fold(plan.Aggregate);
                 try
                 {
@@ -76,7 +84,7 @@ internal static class WindowExecution
                         else
                         {
                             var target = (Int128)at + (plan.Name == "lag" ? -(Int128)offset.AsInteger() : offset.AsInteger());
-                            result = target >= 0 && target < n ? await Arg(0, (int)target).ConfigureAwait(false) : plan.Args.Length > 2 ? await Arg(2, at).ConfigureAwait(false) : SqlValue.Null(plan.Type);
+                            result = target >= 0 && target < n ? cachedValues[(int)target] : plan.Args.Length > 2 ? await Arg(2, at).ConfigureAwait(false) : SqlValue.Null(plan.Type);
                         }
                     }
                     else
@@ -140,6 +148,11 @@ internal static class WindowExecution
                                     var operands = new SqlValue[aggregate.Extra?.Length ?? 0];
                                     if (operands.Length != 0) { meter.Charge(Costs.OperatorEval); meter.Guard(); }
                                     for (var e = 0; e < operands.Length; e++) operands[e] = await Evaluate.ExprAsync(aggregate.Extra![e], meter, row: rows[indices[i]]).ConfigureAwait(false);
+                                    if (plan.Frame is not null)
+                                    {
+                                        operandMemory.ReserveValue(valueCache[i]);
+                                        foreach (var operand in operands) operandMemory.ReserveValue(operand);
+                                    }
                                     extraCache[i] = operands; cached[i] = true;
                                 }
                                 var value = valueCache[i]; var extra = extraCache[i];
@@ -160,7 +173,7 @@ internal static class WindowExecution
                                     if (!Included(i)) continue;
                                     if (--position == 0) { chosen = i; break; }
                                 }
-                                result = chosen < 0 ? SqlValue.Null(plan.Type) : await Arg(0, chosen).ConfigureAwait(false);
+                                result = chosen < 0 ? SqlValue.Null(plan.Type) : cachedValues[chosen];
                             }
                         }
                     }
@@ -168,7 +181,7 @@ internal static class WindowExecution
                     rows[indices[at]][stage.InputWidth + spec] = appended;
                 }
                 }
-                finally { fold?.Release(meter); }
+                finally { fold?.Release(meter); operandMemory.Dispose(); }
                 foreach (var index in indices) memory.ReserveValue(rows[index][stage.InputWidth + spec]);
             }
         }
@@ -215,6 +228,7 @@ internal static class WindowExecution
                 var value = await Evaluate.ExprAsync(plan.Order[key].Expression, meter, row: rows[i]).ConfigureAwait(false); orderKeys[i][key] = value;
                 decorations[i][key] = CollationRules.Decorate(value, plan.Order[key].Expression, meter);
             }
+            memory.ReserveBytes(MemorySize.SortKeyBytes(decorations[i]));
         }
         foreach (var group in groups) group.Sort((a, b) => { var order = CompareKeys(plan.Order, decorations[a], decorations[b]); return order == 0 ? a.CompareTo(b) : order; });
         return new(groups.Select(group => group.ToArray()).ToList(), orderKeys, decorations);

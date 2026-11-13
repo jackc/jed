@@ -10,6 +10,7 @@ internal sealed record StorageCommitPlan(StorageRecovered Before, StorageMeta Me
     internal StorageEncryptedMeta? Encrypted { get; init; }
     internal uint? LastReclamationLive { get; init; }
     internal ulong? ReclamationTransactionId { get; init; }
+    internal long? DeadlineMilliseconds { get; init; }
 }
 
 // The relational storage serializer owns reachability and passes exact live-page
@@ -34,6 +35,12 @@ internal sealed class StorageAllocation
         if ((before.Encrypted is not null) != (codec is not null)) throw new ArgumentException("storage codec differs from recovered variant");
         remaining = new(before.FreePages);
         safe = new(before.FreePages.Where(id => reuseGrant is null || reuseGrant.Contains(id)));
+        if (before.Batch is { } batch)
+        {
+            safe.IntersectWith(batch.FloorFree);
+            remaining.ExceptWith(batch.Pending.Select(entry => entry.Page));
+            safe.ExceptWith(batch.Pending.Select(entry => entry.Page));
+        }
         // Housekeeping chains become unreachable when the alternate meta is
         // published. Persist them as retired, but never allocate from them in
         // this commit: the current recovery candidate still depends on them.
@@ -42,6 +49,7 @@ internal sealed class StorageAllocation
             remaining.UnionWith(before.FreeListPages);
             remaining.UnionWith(before.ManifestPages);
         }
+        if (before.Batch is { } pendingBatch) remaining.ExceptWith(pendingBatch.Pending.Select(entry => entry.Page));
         high = before.Meta.PageCount;
     }
 
@@ -77,7 +85,7 @@ internal sealed class StorageAllocation
     {
         if (id < (Encrypted ? 4 : 2) || id >= before.Meta.PageCount || body.ContainsKey(id))
             throw new ArgumentException("invalid reclaimed page");
-        if (eagerReclaim) remaining.Add(id);
+        if (eagerReclaim && !Pending(id)) remaining.Add(id);
     }
 
     internal uint PageCount => high;
@@ -90,7 +98,7 @@ internal sealed class StorageAllocation
         for (uint page = Encrypted ? 4U : 2U; page < high; page++)
         {
             if ((page & 1023) == 0) token.ThrowIfCancellationRequested();
-            if (!reachable.Contains(page) && !body.ContainsKey(page)) remaining.Add(page);
+            if (!reachable.Contains(page) && !body.ContainsKey(page) && !Pending(page)) remaining.Add(page);
         }
         lastReclamationLive = checked(high - (uint)remaining.Count - (Encrypted ? 4U : 2U));
         freeGeneration = checked(before.Meta.TransactionId + 1);
@@ -118,7 +126,7 @@ internal sealed class StorageAllocation
     {
         if (body.Count == 0 || !body.ContainsKey(root)) throw new ArgumentException("changed domain must write its catalog root");
         if (body.Values.Any(page => page.Length == 0)) throw new ArgumentException("reserved page has not been encoded");
-        if (truncate)
+        if (truncate && before.Batch is null)
             while (high > (Encrypted ? 4U : 2U) && safe.Remove(high - 1)) { remaining.Remove(--high); }
         var size = before.Meta.PageSize;
         var txid = checked(before.Meta.TransactionId + 1);
@@ -141,7 +149,7 @@ internal sealed class StorageAllocation
                 while ((persist.Count + per - 1) / per > freeIds.Count)
                     freeIds.Add(Draw(available, persist, ref next));
             var inlineCapacity = Encrypted ? StorageCryptoMeta.InlineCapacity(size) : StorageFormat.InlineCapacity(size);
-            var overflowEntries = Math.Max(0, body.Count + freeIds.Count - inlineCapacity);
+            var overflowEntries = Math.Max(0, (before.Batch?.Pending.Length ?? 0) + body.Count + freeIds.Count - inlineCapacity);
             var required = (overflowEntries + StorageFormat.OverflowCapacity(size) - 1) / StorageFormat.OverflowCapacity(size);
             if (required > reserved) { reserved = required; continue; }
             var pages = body.Select(pair => new StorageWrite(pair.Key, pair.Value)).ToList();
@@ -160,8 +168,10 @@ internal sealed class StorageAllocation
                 if (codec is not null) { encoded = codec.SealBody(freeIds[i], encoded); nextTag = encoded.AsSpan(size - 16).ToArray(); }
                 pages.Add(new(freeIds[i], encoded));
             }
-            var entries = pages.OrderBy(page => page.Page).Select(page =>
-                new StorageManifestEntry(page.Page, StorageFormat.Crc64(page.Bytes))).ToArray();
+            var entries = pages.Select(page => new StorageManifestEntry(page.Page, StorageFormat.Crc64(page.Bytes)))
+                .Concat(before.Batch?.Pending ?? []).OrderBy(entry => entry.Page).ToArray();
+            if (entries.Select(entry => entry.Page).Distinct().Count() != entries.Length)
+                throw new InvalidOperationException("pending body page was rewritten within a relaxed batch");
             var overflow = new StorageWrite[reserved];
             var consumed = Math.Min(entries.Length, inlineCapacity);
             ulong chainDigest = 0;
@@ -190,12 +200,15 @@ internal sealed class StorageAllocation
                 var unsigned = StorageCryptoMeta.Encode(meta, encryptedMeta.RootTag, nextTag, entries.AsSpan(0, Math.Min(entries.Length, inlineCapacity)));
                 metaBytes = codec.SealMeta((uint)(1 - before.FloorSlot), unsigned, overflow.Select(page => new StorageManifestPage(page.Page, page.Bytes)).ToArray());
             }
-            var dependencies = new HashSet<uint>(pages.Select(page => page.Page));
+            var dependencies = new HashSet<uint>(entries.Select(entry => entry.Page));
             dependencies.UnionWith(manifests);
             if (persist.Overlaps(dependencies)) throw new InvalidOperationException("free list overlaps commit dependencies");
             return new(before, meta, pages.OrderBy(page => page.Page).ToArray(), overflow, metaBytes, persist, new(freeIds), dependencies) { Encrypted = encryptedMeta, LastReclamationLive = lastReclamationLive, ReclamationTransactionId = freeGeneration };
         }
     }
+
+    private bool Pending(uint page) => before.Batch is { } batch &&
+        Array.BinarySearch(batch.Pending, new StorageManifestEntry(page, 0), StorageBatch.PageComparer) >= 0;
 
     private static uint Draw(SortedSet<uint> safe, SortedSet<uint> persisted, ref uint high)
     {
@@ -208,11 +221,9 @@ internal sealed class StorageAllocation
     }
 }
 
-// Durable synchronous-mode commit executor. Callers own writer admission and
-// the short publication lock; no SQL snapshot is published until this returns.
-// Relaxed batches, live-reader reclamation and encrypted sealing compose above
-// this layer and are not implemented by pretending a write is already durable.
-internal sealed class StorageCommitter
+// Callers own writer admission and the short publication lock. A relaxed
+// publication retains the durable floor and cumulative body manifest until sync.
+internal sealed partial class StorageCommitter
 {
     private readonly StoragePager pager;
     private bool stabilize;
@@ -231,6 +242,22 @@ internal sealed class StorageCommitter
     {
         if (IsPoisoned || Volatile.Read(ref committing) != 0) throw new InvalidOperationException("cannot adopt into active or poisoned storage");
         Current = recovered; stabilize = !stabilized && recovered.RequiresStabilization;
+    }
+
+    // Read-only adoption is not a durability event. Writers call this immediately
+    // before their first byte-device mutation, including a remote owner's delta.
+    internal async ValueTask StabilizeAsync(CancellationToken token)
+    {
+        token.ThrowIfCancellationRequested();
+        if (IsPoisoned) throw new SqlException(SqlStates.IoError, "storage handle failed; close and reopen");
+        try
+        {
+            if (directoryPending && pager.Store is FileBlockStore file) file.SyncDirectory();
+            directoryPending = false;
+            if (stabilize) await pager.Store.SyncAsync(token).ConfigureAwait(false);
+            stabilize = false;
+        }
+        catch { IsPoisoned = true; throw; }
     }
 
     internal async ValueTask StageMemoryAsync(StorageCommitPlan plan, CancellationToken token)
@@ -253,7 +280,8 @@ internal sealed class StorageCommitter
         stabilize = false; directoryPending = false;
     }
 
-    internal async ValueTask CommitAsync(StorageCommitPlan plan, CancellationToken cancellationToken = default)
+    internal async ValueTask CommitAsync(StorageCommitPlan plan, CancellationToken cancellationToken = default,
+        bool synchronous = true, long? deadlineMilliseconds = null)
     {
         cancellationToken.ThrowIfCancellationRequested();
         if (IsPoisoned) throw new SqlException(SqlStates.IoError, "storage handle failed; close and reopen");
@@ -267,8 +295,7 @@ internal sealed class StorageCommitter
             // stabilization onward any failure must require recovery on reopen.
             try
             {
-                if (directoryPending && pager.Store is FileBlockStore file) file.SyncDirectory();
-                if (stabilize) await pager.Store.SyncAsync(cancellationToken).ConfigureAwait(false);
+                await StabilizeAsync(cancellationToken).ConfigureAwait(false);
                 var length = await pager.Store.GetLengthAsync(cancellationToken).ConfigureAwait(false);
                 var needed = (long)plan.Meta.PageCount * pager.PageSize;
                 if (needed > length)
@@ -284,23 +311,31 @@ internal sealed class StorageCommitter
                 }
                 var slot = 1 - Current.FloorSlot;
                 await pager.Store.WriteAsync((long)slot * pager.PageSize, plan.MetaBytes, cancellationToken).ConfigureAwait(false);
-                await pager.Store.SyncAsync(cancellationToken).ConfigureAwait(false);
-                if (plan.Meta.PageCount < plan.Before.Meta.PageCount)
+                if (synchronous) await pager.Store.SyncAsync(cancellationToken).ConfigureAwait(false);
+                var pending = plan.Body.Select(write => new StorageManifestEntry(write.Page, StorageFormat.Crc64(write.Bytes)))
+                    .Concat(plan.Before.Batch?.Pending ?? []).OrderBy(entry => entry.Page).ToArray();
+                var shrink = plan.Meta.PageCount < plan.Before.Meta.PageCount || plan.Before.Batch?.ShrinkAfterFlush == true;
+                var batch = synchronous ? null : new StorageBatch(
+                    plan.Before.Batch?.FloorTransactionId ?? plan.Before.Meta.TransactionId,
+                    plan.Before.Batch?.FloorFree ?? plan.Before.FreePages.ToArray(), pending,
+                    plan.Before.Batch?.DeadlineMilliseconds ?? deadlineMilliseconds, shrink);
+                Current = new(plan.Meta, slot, synchronous ? slot : plan.Before.FloorSlot, plan.ProtectedPages, plan.FreePages, plan.FreeListPages)
                 {
-                    var floor = Math.Max(1, 16 * 1024 / pager.PageSize);
-                    var cap = Math.Max(1, 1024 * 1024 / pager.PageSize);
-                    var targetLength = checked(((long)plan.Meta.PageCount + Math.Clamp((long)plan.Meta.PageCount, floor, cap)) * pager.PageSize);
-                    if (targetLength < length)
-                    {
-                        // Shrinking only drops slack after publication is durable.
-                        // Failure must not turn that successful commit into an error.
-                        try { await pager.Store.SetLengthAsync(targetLength, CancellationToken.None).ConfigureAwait(false); }
-                        catch (Exception error) when (error is IOException or SqlException) { }
-                    }
-                }
-                Current = new(plan.Meta, slot, slot, plan.ProtectedPages, plan.FreePages, plan.FreeListPages)
-                { ManifestPages = plan.Manifest.Select(page => page.Page).ToHashSet(), Encrypted = plan.Encrypted, LastReclamationLive = plan.LastReclamationLive, ReclamationTransactionId = plan.ReclamationTransactionId };
+                    ManifestPages = plan.Manifest.Select(page => page.Page).ToHashSet(), Encrypted = plan.Encrypted,
+                    LastReclamationLive = plan.LastReclamationLive, ReclamationTransactionId = plan.ReclamationTransactionId,
+                    Batch = batch
+                };
+                if (synchronous && shrink) await ShrinkAsync(plan.Meta.PageCount).ConfigureAwait(false);
                 stabilize = false; directoryPending = false;
+                var cap = pager.Encrypted ? StorageCryptoMeta.InlineCapacity(pager.PageSize) : StorageFormat.InlineCapacity(pager.PageSize);
+                if (Current.Batch is { } pendingBatch && pendingBatch.Pending.Length >= cap)
+                {
+                    // The meta is already published. A failed cap flush revokes
+                    // future reads/writes, but cannot fail this committed call.
+                    try { await FlushAsync(token: CancellationToken.None).ConfigureAwait(false); }
+                    catch (Exception error) when (error is IOException or SqlException or OperationCanceledException) { }
+                }
+
             }
             catch { IsPoisoned = true; throw; }
         }

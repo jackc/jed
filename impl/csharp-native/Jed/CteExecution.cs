@@ -94,11 +94,11 @@ internal sealed partial class Parser
             Expect("as"); bool? materialized = Eat("materialized") ? true : null;
             if (Eat("not")) { Expect("materialized"); materialized = false; }
             Expect("("); nesting++; Depth(nesting);
-            StatementSyntax body = Is("insert") || Is("update") || Is("delete") ? OtherStatement() : Select();
+            StatementSyntax body = Is("insert") || Is("update") || Is("delete") || Is("merge") ? OtherStatement() : Select();
             Expect(")"); nesting--;
             definitions.Add(body is SelectSyntax query ? new(name, columns, query, materialized) : new(name, columns, new([], null, null, 0), materialized, body));
         } while (Eat(","));
-        var mutation = Is("insert") || Is("update") || Is("delete");
+        var mutation = Is("insert") || Is("update") || Is("delete") || Is("merge");
         intoAllowed = primaryInto && !mutation;
         StatementSyntax result = mutation ? OtherStatement() : Select();
         if (result is SelectSyntax { With.Length: > 0 }) throw Errors.Syntax("multiple WITH clauses");

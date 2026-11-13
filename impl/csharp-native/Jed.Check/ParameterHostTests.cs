@@ -28,6 +28,19 @@ internal static class ParameterHostTests
         await using (var create = await session2.QueryAsync("CREATE TABLE t (k i32 PRIMARY KEY)"))
             while (await create.ReadAsync() is not null) { }
         if (await session2.ExecuteAsync(insert, [SqlValue.Integer(4)]) != 1) throw new Exception("prepared command affected count");
+        async Task Count(string sql, long? expected)
+        {
+            var actual = await session2.ExecuteAsync(session2.Prepare(sql));
+            if (actual != expected) throw new InvalidDataException($"affected count for {sql}: expected {expected}, got {actual}");
+        }
+        await Count("CREATE TABLE empty_count (id i32 PRIMARY KEY)", null);
+        await Count("SELECT 1", null);
+        await Count("UPDATE t SET k = k WHERE false", 0);
+        await Count("DELETE FROM t WHERE false", 0);
+        await Count("INSERT INTO empty_count SELECT k FROM t WHERE false", 0);
+        await Count("CREATE TABLE count_copy AS SELECT * FROM t", 1);
+        await Count("CREATE TABLE count_schema AS SELECT * FROM t WITH NO DATA", null);
+        await Count("CREATE TABLE IF NOT EXISTS count_copy AS SELECT * FROM t", null);
         Console.WriteLine("PASS prepared host API: detached parse, concurrent independent bindings, parse limits and command result");
     }
 }

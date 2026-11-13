@@ -44,8 +44,9 @@ public sealed partial class Database
             cancellationToken.ThrowIfCancellationRequested();
             try
             {
+                await SyncOwnerDirectoryAsync(cancellationToken).ConfigureAwait(false);
                 var changed = await StorageCredentialChange.ReplaceAsync(pager.Store, selected, replacement).ConfigureAwait(false);
-                lock (gate) keyBlock = changed;
+                lock (gate) { keyBlock = changed; committer.Adopt(committer.Current, stabilized: true); }
             }
             catch (Exception error)
             {

@@ -13,12 +13,16 @@ internal sealed class AggregateOrdered
         if (!Hypothetical(plan.Name) && values[0].IsNull) return;
         var retainedBytes = meter.Memory.Enabled ? Hypothetical(plan.Name) ? MemorySize.RowBytes(values) : MemorySize.ValueBytes(values[0]) : 0;
         if (plan.Name == "percentile_cont" && values[0].Type != SqlType.Interval) values = [Resolve.Cast(values[0], SqlType.F64)];
-        var keys = new SortValue[values.Length];
-        for (var i = 0; i < values.Length; i++) keys[i] = CollationRules.Decorate(values[i], plan.WithinOrder![i].Expression, meter);
-        meter.Guard(); inputs.Add(values); decorations.Add(keys);
+        if (Hypothetical(plan.Name))
+        {
+            var keys = new SortValue[values.Length];
+            for (var i = 0; i < values.Length; i++) keys[i] = CollationRules.Decorate(values[i], plan.WithinOrder![i].Expression, meter);
+            decorations.Add(keys);
+        }
+        meter.Guard(); inputs.Add(values);
         meter.Memory.Reserve(retainedBytes); memoryBytes = Meter.Add(memoryBytes, retainedBytes);
     }
-    internal SqlValue Result(AggregatePlan plan, SqlValue[] direct)
+    internal SqlValue Result(AggregatePlan plan, SqlValue[] direct, Meter meter)
     {
         var order = plan.WithinOrder!;
         if (Hypothetical(plan.Name))
@@ -38,21 +42,32 @@ internal sealed class AggregateOrdered
                 _ => SqlValue.Float((double)(inclusive + 1) / (inputs.Count + 1L), SqlType.F64)
             };
         }
+        using var keyMemory = new QueryInputMemory(meter);
+        decorations.Clear();
+        foreach (var input in inputs)
+        {
+            var keys = new SortValue[input.Length];
+            for (var i = 0; i < input.Length; i++) keys[i] = CollationRules.Decorate(input[i], order[i].Expression, meter);
+            keyMemory.ReserveBytes(MemorySize.SortKeyBytes(keys));
+            decorations.Add(keys);
+        }
         var sorted = inputs.Select((value, ordinal) => (value, ordinal)).ToList();
         sorted.Sort((a, b) => { var comparison = Compare(order, decorations[a.ordinal], decorations[b.ordinal]); return comparison != 0 ? comparison : a.ordinal.CompareTo(b.ordinal); });
         if (plan.Name == "mode")
         {
-            if (sorted.Count == 0) return SqlValue.Null(plan.Type);
+            if (sorted.Count == 0) { decorations.Clear(); return SqlValue.Null(plan.Type); }
             var best = 0; var bestCount = 0;
             for (var start = 0; start < sorted.Count;)
             {
                 var end = start + 1;
-                while (end < sorted.Count && Evaluate.Compare(sorted[start].value[0], sorted[end].value[0]) == 0) end++;
+                while (end < sorted.Count && Compare(order, decorations[sorted[start].ordinal], decorations[sorted[end].ordinal]) == 0) end++;
                 if (end - start > bestCount) { best = start; bestCount = end - start; }
                 start = end;
             }
+            decorations.Clear(); keyMemory.Dispose();
             return sorted[best].value[0];
         }
+        decorations.Clear(); keyMemory.Dispose();
         var fraction = direct[0];
         if (fraction.IsNull) return SqlValue.Null(plan.Type);
         static double? Fraction(SqlValue value)

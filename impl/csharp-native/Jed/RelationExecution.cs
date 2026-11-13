@@ -116,7 +116,7 @@ var columns = left.Columns.Select((column, index) => column with { Type = Resolv
                     }
                     var sourceRows = QueryExecution.DeferredTableSource(table, tree, scanPlan, meter, cancellationToken, new(database, snapshot, pending, catalog));
                     var rows = filter is null ? sourceRows : PredicatePlan.Rows(sourceRows, filter, meter, cancellationToken);
-                    var preparedScan = new PreparedRelation(tableColumns, rows, BaseAccess: new(table, tree, filter, storage), EstimatedRows: Estimate.Rows(table.RowCount, filter), PushFilter: next =>
+                    var preparedScan = new PreparedRelation(tableColumns, rows, BaseAccess: new(table, tree, filter, storage), EstimatedRows: Estimate.Rows(table, catalog, filter), PushFilter: next =>
                         (Scan(PredicatePlan.Order(filter is null ? next : PredicatePlan.Combine([filter, next]))), null));
                     return scanNode is null ? preparedScan : ExplainPlanning.Attach(preparedScan, scanNode, meter);
                 }
@@ -225,7 +225,7 @@ var columns = left.Columns.Select((column, index) => column with { Type = Resolv
                 {
                     var inl = lateral ? null : IndexNestedLoop.Select(b, a.Columns.Length, join.Kind, PredicatePlan.Combine(new[] { on, where }.OfType<Resolved>()));
                     var hash = !lateral && join.Left is not JoinedRelation && join.Right is not JoinedRelation ? HashJoinPlan.Select(authoredPredicate, a.Columns.Length, join.Kind, a.EstimatedRows, b.EstimatedRows, on) : null;
-                    if (a.EstimatedRows is { } outerCount && b.EstimatedRows is { } innerCount && b.BaseAccess is { } innerBase)
+                    if (join.Kind is "inner" or "cross" && a.BaseAccess is not null && a.EstimatedRows is { } outerCount && b.EstimatedRows is { } innerCount && b.BaseAccess is { } innerBase)
                     {
                         var fullCost = AccessPlan.Select(innerBase.Table, innerBase.Tree, innerBase.Filter, innerBase.Storage, meter).EstimatedCost;
                         var residual = PredicatePlan.Combine(new[] { on, where }.OfType<Resolved>());
@@ -249,7 +249,10 @@ var columns = left.Columns.Select((column, index) => column with { Type = Resolv
                         ExplainPlanning.Touched(a.Plan, mask.Count(slot => slot < a.Columns.Length));
                         ExplainPlanning.Touched(b.Plan, mask.Count(slot => slot >= a.Columns.Length && slot < a.Columns.Length + b.Columns.Length));
                     }
-                    prepared = ExplainPlanning.Join(prepared, a, b, join.Kind, on, hash, inl, meter);
+                    var estimated = Estimate.JoinRows(a, b, on);
+                    if (join.Kind is "left" or "full") estimated = Math.Max(estimated, a.EstimatedRows ?? PlannerFacts.SrfRows);
+                    if (join.Kind is "right" or "full") estimated = Math.Max(estimated, b.EstimatedRows ?? PlannerFacts.SrfRows);
+                    prepared = ExplainPlanning.Join(prepared with { EstimatedRows = estimated }, a, b, join.Kind, on, hash, inl, meter);
                     PreparedRelation? Bounded(SortPlan[] order, long count, Resolved? finalFilter)
                     {
                         if (lateral || hash is not null || usingSlots.Length != 0 || join.Kind is not ("inner" or "cross") ||
@@ -285,7 +288,7 @@ var columns = left.Columns.Select((column, index) => column with { Type = Resolv
         Catalog catalog, Meter meter, CancellationToken cancellationToken, bool derived = false, QueryScope? scope = null)
     {
         if (query.With?.Any(definition => definition.Mutation is not null) == true) throw Errors.Unsupported("nested data-modifying WITH");
-        query = Resolve.BindTypes(query, catalog, meter.Temporal);
+        query = QueryCounts.Resolve(Resolve.BindTypes(query, catalog, meter.Temporal));
         var buffers = new List<CteBuffer>();
         var ctePlans = new List<(ExplainNode Node, bool Executed)>();
         if (query.With is { Length: > 0 } definitions)
@@ -354,22 +357,24 @@ var outputColumns = plan.Projections.Select(projection => new BoundColumn(projec
 PreparedRelation Build(SelectPlan requested)
 {
     var active = requested;
+    if (active.Group is null && active.Windows is null && !active.Distinct && database.ScratchHost is { } scratch && database.WorkMem > 0)
+        active = active with { Spill = new(scratch, database.WorkMem, baseInput?.Table) };
     IAsyncEnumerable<SqlValue[]> rows;
     var sourceMemory = false;
     ExplainNode? inputPlan = null;
+    ExplainNode? outputPlan = null;
     if (baseInput is { } source)
     {
+        var pipeline = SinglePipeline.Select(source.Table, source.Tree, active, source.Storage, meter);
+        active = pipeline.Plan;
         if (meter.Explain is not null)
         {
-            var access = AccessPlan.Select(source.Table, source.Tree, active.Filter, source.Storage, meter);
-            active = active with { Access = access };
-            inputPlan = ExplainPlanning.Scan(source.Table, access, active.Filter, StorageTouchedColumns.Collect(active), false, meter, catalog, source.Tree.Height);
+            inputPlan = ExplainPlanning.Scan(source.Table, pipeline.Access, active.Filter, StorageTouchedColumns.Collect(active), false, meter, catalog, source.Tree.Height);
+            if (pipeline.Ordered)
+                inputPlan.Append(pipeline.Access.Ordered ? "ordered: index order: " + pipeline.Access.Index!.Name : "ordered: pk ordered" + (pipeline.Reverse ? " (reverse)" : ""));
         }
         rows = QueryExecution.DeferredTableSource(source.Table, source.Tree, active, meter, cancellationToken, source.Storage);
         if (inputPlan is not null) rows = ExplainObservation.Rows(rows, inputPlan, meter, cancellationToken);
-        active = TableAccess.Prepare(active, source.Table).Plan;
-        if (inputPlan is not null && requested.Order is { Length: > 0 } && active.Order is not { Length: > 0 })
-            inputPlan.Append("ordered: pk ordered" + (requested.Order[0].Descending ? " (reverse)" : ""));
         active = active with { AggregateLane = GroupExecution.Lane(active), ColumnarProjection = active.Group is null && active.Windows is null && !active.Distinct &&
             active.Limit is null && active.Offset == 0 && active.Order is not { Length: > 0 } && active.Projections.All(projection => projection.Expression.Op == "column") };
     }
@@ -390,11 +395,14 @@ PreparedRelation Build(SelectPlan requested)
         }
         rows = input.Rows; sourceMemory = input.MemoryOutput;
         inputPlan = input.Plan;
+        if (meter.Explain is not null && !derived && query.ValuesQuery && inputPlan is { Label: "Values" })
+            inputPlan = new("Subquery *VALUES*", "-", inputPlan.EstimatedRows, inputPlan.EstimatedCost, inputPlan);
     }
     if (meter.Explain is not null)
     {
         inputPlan ??= query.Relation is null ? new ExplainNode("Result", "-", 1, 0) : throw new InvalidOperationException("missing EXPLAIN relation plan");
         active = active with { Observation = ExplainPlanning.Select(active, inputPlan, meter) };
+        outputPlan = active.Observation.Root;
         if (ctePlans.Count != 0)
         {
             var child = active.Observation!.Root;
@@ -408,8 +416,9 @@ PreparedRelation Build(SelectPlan requested)
     var result = Projected(QueryExecution.Select(active, rows, meter, cancellationToken, sourceMemory, eagerInput: baseInput is null && query.Relation is not null, transferIdentity: identityValues, bufferOutput: buffers.Count != 0));
     if (buffers.Count > 0 || subqueries.Count > 0) result = SubqueryExecution.Initialized(Initialize, result, cancellationToken);
     if (buffers.Count > 0) result = CteBuffer.DisposeAfter(buffers, result, cancellationToken);
+    if (outputPlan is not null && !ReferenceEquals(outputPlan, active.Observation?.Root)) result = ExplainObservation.Rows(result, outputPlan, meter, cancellationToken, inclusive: true);
     if (active.Observation is { } observation) result = ExplainObservation.Rows(result, observation.Root, meter, cancellationToken, inclusive: true);
-    var prepared = new PreparedRelation(outputColumns, result, Initialize, dependencies.ToArray(), Constants, MemoryOutput: identityValues || buffers.Count != 0, Plan: active.Observation?.Root);
+    var prepared = new PreparedRelation(outputColumns, result, Initialize, dependencies.ToArray(), Constants, EstimatedRows: Estimate.Output(requested, baseInput?.Table.RowCount ?? preparedInput?.EstimatedRows ?? (query.Relation is null ? 1 : PlannerFacts.SrfRows), baseInput?.Table, catalog), MemoryOutput: identityValues || buffers.Count != 0, Plan: active.Observation?.Root);
     if (query.With is not null || query.ValuesQuery || requested.Limit is not null || requested.Offset != 0) return prepared;
     return prepared with { PushFilter = filter =>
     {

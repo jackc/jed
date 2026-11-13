@@ -33,6 +33,15 @@ public sealed partial class Database : IAsyncDisposable
     internal SemaphoreSlim DomainPublication { get; } = new(1, 1);
     internal long MaxStorageBytes { get; set; }
     internal ScratchHost? ScratchHost { get; private set; }
+    public const long DefaultWorkMem = 256L * 1024 * 1024;
+    private long workMem = DefaultWorkMem;
+    public long WorkMem => Interlocked.Read(ref workMem);
+    /// <summary>Sets the per-operator spill budget; zero keeps operators resident.</summary>
+    public void SetWorkMem(long bytes)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(bytes);
+        Interlocked.Exchange(ref workMem, bytes);
+    }
     private SemaphoreSlim writer = new(1, 1);
     private StoragePager pager;
     private StorageCommitter committer;

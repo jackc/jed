@@ -2,6 +2,13 @@ namespace Jed;
 
 internal static partial class StatementExecution
 {
+    internal static SelectSyntax InsertQuery(InsertSyntax insert, CatalogTable table, Catalog catalog, Meter meter)
+    {
+        var slots = insert.Columns is null ? Enumerable.Range(0, table.Columns.Length).ToArray() : insert.Columns.Select(name => ColumnIndex(table, name)).ToArray();
+        var query = Resolve.BindTypes(insert.Source ?? throw new InvalidOperationException("INSERT has no query source"), catalog, meter.Temporal);
+        return AdaptInsertSource(query, slots.Select(slot => table.Columns[slot].Type).ToArray(), catalog, meter);
+    }
+
     private static SelectSyntax AdaptInsertSource(SelectSyntax query, TypeSpec[] targets, Catalog catalog, Meter meter)
     {
         if (query.Distinct || query.ValuesQuery || query.SetQuery || query.Items.Length != targets.Length || query.Items.Any(item => item.Expression.Op == "star")) return query;

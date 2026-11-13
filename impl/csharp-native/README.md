@@ -56,6 +56,11 @@ cursor advances or closes. `Rows.ReadAsync` exposes a `ValueTask<Row?>` for dire
 advancement. A cursor is single-pass, and overlapping session/cursor operations
 are rejected. Sequential calls may resume on different threads.
 
+`Rows.AffectedRows` is a nullable `long`: zero means a DML statement touched no
+rows; `null` means the statement has no command count. Prepared `ExecuteAsync`
+drains the cursor and returns the same nullable count. `CREATE TABLE AS` reports
+the copied row count, except `WITH NO DATA` and skipped `IF NOT EXISTS` commands.
+
 `SqlException.SqlState` is the stable error identity. Cancellation throws
 `SqlCanceledException`, an `OperationCanceledException` carrying SQLSTATE `57014`
 through `ISqlError`; tasks and value tasks enter the canceled state. Cursor cost

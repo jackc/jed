@@ -7,20 +7,29 @@ internal static class ExplainPlanning
 {
     internal static PreparedRelation Attach(PreparedRelation relation, ExplainNode node, Meter meter) => relation with
     {
-        Plan = node, EstimatedRows = node.EstimatedRows,
+        Plan = node,
         Rows = ExplainObservation.Rows(relation.Rows, node, meter, meter.Cancellation, inclusive: true)
     };
     internal static PreparedRelation Wrapper(PreparedRelation relation, string label, Meter meter)
     {
         if (meter.Explain is null) return relation;
         var child = relation.Plan ?? throw new InvalidOperationException("missing child EXPLAIN plan");
-        return Attach(relation, new(label, "-", child.EstimatedRows, child.EstimatedCost, child), meter);
+        var wrapped = Attach(relation, new(label, "-", child.EstimatedRows, child.EstimatedCost, child), meter);
+        return wrapped with
+        {
+            PushFilter = relation.PushFilter is null ? null : predicate =>
+            {
+                var pushed = relation.PushFilter(predicate);
+                return (Wrapper(pushed.Relation, label, meter), pushed.Residual);
+            },
+            WithTouched = relation.WithTouched is null ? null : mask => Wrapper(relation.WithTouched(mask), label, meter)
+        };
     }
     internal static PreparedRelation Function(PreparedRelation relation, string name, Resolved[] arguments, Meter meter)
     {
         if (meter.Explain is null) return relation;
         var rows = PlannerFacts.SrfRows;
-        if (name == "generate_series" && arguments.All(argument => argument.Op == "constant"))
+        if (name == "generate_series" && arguments.All(argument => argument.Op == "constant" && !argument.ParameterUnbound))
         {
             if (arguments.Any(argument => argument.Constant.IsNull)) rows = 0;
             else
@@ -64,21 +73,48 @@ internal static class ExplainPlanning
         var a = left.Plan ?? throw new InvalidOperationException("missing left join plan");
         var b = right.Plan ?? throw new InvalidOperationException("missing right join plan");
         var product = Estimate.Multiply(a.EstimatedRows, b.EstimatedRows);
-        var rows = Estimate.Rows(product, predicate);
+        var rows = Estimate.JoinRows(left, right, predicate);
         if (kind is "left" or "full") rows = Math.Max(rows, a.EstimatedRows);
         if (kind is "right" or "full") rows = Math.Max(rows, b.EstimatedRows);
         var work = Estimate.Multiply(product, predicate is null ? 0 : Expressions([predicate]));
         if (hash is not null) work = HashJoinPlan.Work(a.EstimatedRows, b.EstimatedRows, hash.Types, predicate);
         if (inl is not null)
         {
+            b = new(b.Label, b.Detail, b.EstimatedRows, b.EstimatedCost, b.Children.ToArray())
+            {
+                LogicalRows = b.LogicalRows, Table = b.Table, Catalog = b.Catalog,
+                Access = b.Access, ScanHeight = b.ScanHeight
+            };
+            var genericBounds = inl.Bounds.Select(term => term with { Args = term.Args.Select(arg => arg.Op == "column"
+                ? arg.Slot >= inl.OuterWidth ? arg with { Slot = arg.Slot - inl.OuterWidth } : new Resolved("constant", arg.Type, SqlValue.Null(arg.Type), [], Collation: arg.Collation, ParameterUnbound: true) : arg).ToArray() });
+            var generic = PredicatePlan.Combine(genericBounds);
+            var access = AccessPlan.Select(inl.Source.Table, inl.Source.Tree, generic, inl.Source.Storage, meter);
+            var innerRows = Estimate.Rows(inl.Source.Table, inl.Source.Storage.Catalog, inl.Source.Filter, access.EstimatedRows);
+            rows = Estimate.Multiply(a.EstimatedRows, innerRows);
+            var remainder = predicate is null ? null : PredicatePlan.Combine(PredicatePlan.Conjuncts(predicate).Where(term => !inl.Bounds.Any(bound => Resolve.Equivalent(bound, term))));
+            rows = Estimate.Rows(rows, remainder);
+            if (kind == "left") rows = Math.Max(a.EstimatedRows, rows);
+            var scanCost = Math.Max(0, access.EstimatedCost - Estimate.Multiply(access.EstimatedRows, generic is null ? 0 : PredicatePlan.Nodes(generic)));
+            scanCost = Estimate.Add(scanCost, Estimate.Multiply(access.EstimatedRows, inl.Source.Filter is null ? 0 : Expressions([inl.Source.Filter])));
+            b.EstimatedRows = Estimate.Multiply(a.EstimatedRows, innerRows);
+            b.EstimatedCost = Estimate.Multiply(a.EstimatedRows, scanCost);
             if (b.Label.StartsWith("Scan ", StringComparison.Ordinal))
             {
-                var bounds = inl.Bounds.Select(term => term with { Args = term.Args.Select(arg => arg.Op == "column"
+                var printed = inl.Bounds.Select(term => term with { Args = term.Args.Select(arg => arg.Op == "column"
                     ? arg.Slot >= inl.OuterWidth ? arg with { Slot = arg.Slot - inl.OuterWidth } : new Resolved("join_source", arg.Type, default, []) : arg).ToArray() });
                 var touched = b.Detail.IndexOf("; touched=", StringComparison.Ordinal);
-                b.Detail = "Index-nested-loop PK bound: " + Bound(PredicatePlan.Combine(bounds), inl.Source.Table) + (touched < 0 ? "" : b.Detail[touched..]);
+                var accessDetail = access.Kind switch
+                {
+                    AccessKind.Primary => "PK bound: " + Bound(PredicatePlan.Combine(printed), inl.Source.Table),
+                    AccessKind.Btree => "Index bound: using " + access.Index!.Name,
+                    AccessKind.Gist => "GiST bound: using " + access.Index!.Name,
+                    AccessKind.Gin => "GIN bound: using " + access.Index!.Name,
+                    _ => "Full scan"
+                };
+                b.Detail = "Index-nested-loop " + accessDetail + (touched < 0 ? "" : b.Detail[touched..]);
             }
-            work = inl.EstimateWork(a.EstimatedRows, predicate);
+            inl.Observation = b;
+            work = Estimate.Add(b.EstimatedCost, Estimate.Multiply(b.EstimatedRows, predicate is null ? 0 : Expressions([predicate])));
         }
         var cost = inl is null ? Estimate.Add(Estimate.Add(a.EstimatedCost, b.EstimatedCost), work) : Estimate.Add(a.EstimatedCost, work);
         var detail = kind + (hash is null ? "" : "; keys=" + hash.Types.Length);
@@ -120,13 +156,14 @@ internal static class ExplainPlanning
         {
             AccessKind.Primary => "PK bound: " + Bound(access.Predicate, table),
             AccessKind.PrimaryIntervals => "PK interval set: " + string.Join(", ", table.PrimaryKey.Select(slot => table.Columns[slot].Name)) + "; intervals=" + (access.Ranges?.Length ?? 0),
-            AccessKind.Btree => (access.Predicate is null ? "Index scan: using " : "Index bound: using ") + access.Index!.Name,
+            AccessKind.Btree => access.Predicate is null && access.Ordered ? "Full scan" : "Index bound: using " + access.Index!.Name,
             AccessKind.IndexIntervals => "Index interval set: using " + access.Index!.Name + "; intervals=" + (access.Ranges?.Length ?? 0),
             AccessKind.Gin => "GIN bound: using " + access.Index!.Name,
             AccessKind.Gist => "GiST bound: using " + access.Index!.Name,
             _ => "Full scan"
         };
-        if (touched.Count != 0) detail += "; touched=" + touched.Count;
+        var referenced = touched.Count(slot => (uint)slot < table.Columns.Length);
+        if (referenced != 0) detail += "; touched=" + referenced;
         var rows = access.EstimatedRows;
         var cost = Math.Max(0, access.EstimatedCost - Estimate.Multiply(rows, filter is null ? 0 : PredicatePlan.Nodes(filter)));
         if (pushed && filter is not null)
@@ -141,7 +178,8 @@ internal static class ExplainPlanning
     {
         if (expression is null) return "-";
         var bounds = new List<string>();
-        foreach (var term in PredicatePlan.Conjuncts(expression))
+        foreach (var term in PredicatePlan.Conjuncts(expression).OrderBy(term =>
+            term.Args.FirstOrDefault(argument => argument.Op == "column") is { } column ? Array.IndexOf(table.PrimaryKey, column.Slot) : int.MaxValue))
         {
             if (term.Args.Length != 2) continue;
             var left = term.Args[0]; var right = term.Args[1]; var operation = term.Op;
@@ -168,7 +206,7 @@ internal static class ExplainPlanning
             var pages = pulled == 0 ? 0 : access.Kind == AccessKind.Full
                 ? Math.Min(access.EstimatedPages, Math.Max(input.ScanHeight, Estimate.Scale(access.EstimatedPages, pulled, input.EstimatedRows)))
                 : access.EstimatedPages;
-            var fetch = access.Kind is AccessKind.Btree or AccessKind.Gin or AccessKind.Gist ? input.ScanHeight + 1L : 1;
+            var fetch = access.Kind is AccessKind.Btree or AccessKind.IndexIntervals or AccessKind.Gin or AccessKind.Gist ? input.ScanHeight + 1L : 1;
             input.EstimatedRows = pulled;
             input.EstimatedCost = Estimate.Add(Estimate.Add(pages, access.EstimatedEntries), Estimate.Multiply(pulled, fetch));
         }
@@ -208,7 +246,7 @@ internal static class ExplainPlanning
         if (plan.Order is { Length: > 0 } order)
         {
             var detail = "keys=" + order.Length;
-            if (plan.Limit is { } top && !plan.Distinct) detail += ", top-k=" + Estimate.Add(top, plan.Offset);
+            if (plan.Limit is { } top && !plan.Distinct && plan.ChargeRows) detail += ", top-k=" + (top == 0 ? 0 : Estimate.Add(top, plan.Offset));
             sort = node = new("Sort", detail, node.EstimatedRows, Estimate.Add(node.EstimatedCost,
                 Estimate.Multiply(node.EstimatedRows, Expressions(order.Select(key => key.Expression)))), node);
         }

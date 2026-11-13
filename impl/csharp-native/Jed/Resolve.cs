@@ -7,9 +7,16 @@ internal sealed record Resolved(string Op, SqlType Type, SqlValue Constant, Reso
     internal bool NeedsAsync { get; } = Op is "column" or "outer" or "correlated" or "in_correlated" or "quantified_correlated" || Args.Any(argument => argument.NeedsAsync);
 }
 internal sealed record Projection(Resolved Expression, string Name);
-internal sealed record SortPlan(Resolved Expression, bool Descending, bool NullsFirst);
+internal sealed record SortPlan(Resolved Expression, bool Descending, bool NullsFirst)
+{
+    internal static int? Column(Resolved expression)
+    {
+        while (expression.Op == "collate") expression = expression.Args[0];
+        return expression.Op == "column" ? expression.Slot : null;
+    }
+}
 internal sealed record SelectPlan(Projection[] Projections, Resolved? Filter, long? Limit, long Offset, bool Empty,
-    SortPlan[]? Order = null, bool Distinct = false, GroupPlan? Group = null, bool StreamDistinct = false, bool ChargeRows = true, WindowStage? Windows = null, bool WindowPrefix = false, bool AggregateLane = false, int DistinctOnCount = 0, ExplainStages? Observation = null, AccessPlan? Access = null, bool ColumnarProjection = false);
+    SortPlan[]? Order = null, bool Distinct = false, GroupPlan? Group = null, bool StreamDistinct = false, bool ChargeRows = true, WindowStage? Windows = null, bool WindowPrefix = false, bool AggregateLane = false, int DistinctOnCount = 0, ExplainStages? Observation = null, AccessPlan? Access = null, bool ColumnarProjection = false, SpillPolicy? Spill = null, bool ScanReverse = false, Func<ValueTask>? BeforeZeroLimit = null);
 internal sealed record BoundColumn(string Name, SqlType Type, string? Qualifier = null, bool Hidden = false, OuterBinding? Outer = null, int Level = 0, Resolved? Projection = null, object? BaseSource = null, bool PrimaryKey = false, CollationDerivation? Collation = null,
     string? RowName = null, bool NotNull = false, bool NullExtended = false, bool WholeRow = true, bool ScalarRelation = false);
 
@@ -21,6 +28,7 @@ internal static partial class Resolve
 
     internal static SelectPlan Select(SelectSyntax syntax, BoundColumn[]? columns = null)
     {
+        syntax = QueryCounts.Resolve(syntax);
         columns ??= [];
         if (syntax.SetQuery && syntax.Order is { } setOrder)
             foreach (var key in setOrder)

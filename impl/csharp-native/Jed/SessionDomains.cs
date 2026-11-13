@@ -13,7 +13,7 @@ public sealed partial class Session
     public void SetAllowTempDdl(bool allowed) { using var operation = Enter(); allowTempDdl = allowed; }
     private void CheckDdl(StatementSyntax statement, bool temporary)
     {
-        if (statement is SelectSyntax or InsertSyntax or UpdateSyntax or DeleteSyntax or WithStatementSyntax or TransactionSyntax) return;
+        if (statement is SelectSyntax or InsertSyntax or UpdateSyntax or DeleteSyntax or MergeSyntax or WithStatementSyntax or TransactionSyntax) return;
         if (!(temporary && statement is not (AnalyzeSyntax or ReindexSyntax) ? allowTempDdl : allowDdl)) throw new SqlException(SqlStates.InsufficientPrivilege, "DDL is not allowed");
     }
     private Database? temporaryDatabase;
@@ -57,7 +57,7 @@ public sealed partial class Session
         if (statement is SelectSyntax select)
             return !WritableCteExecution.HasWrites(select) || select.With!.Any(definition => definition.Mutation is { } mutation && PersistentWrite(mutation, scope));
         var target = DomainExecution.Target(statement);
-        if (target is not null && statement is InsertSyntax or UpdateSyntax or DeleteSyntax)
+        if (target is not null && statement is InsertSyntax or UpdateSyntax or DeleteSyntax or MergeSyntax)
         {
             var seen = new HashSet<string>(StringComparer.Ordinal);
             bool Persistent(string name)

@@ -145,7 +145,7 @@ internal static class GroupExecution
                     var direct = new SqlValue[aggregate.Direct!.Length];
                     using (meter.SuppressCost())
                         for (var d = 0; d < direct.Length; d++) direct[d] = await Evaluate.ExprAsync(aggregate.Direct[d], meter, row: row).ConfigureAwait(false);
-                    row[aggregateStart + i] = ordered.Result(aggregate, direct);
+                    row[aggregateStart + i] = ordered.Result(aggregate, direct, meter);
                     continue;
                 }
                 if (aggregate.Order is { Length: > 0 } order)

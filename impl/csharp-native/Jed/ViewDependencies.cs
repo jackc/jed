@@ -97,6 +97,8 @@ internal static partial class StatementExecution
             foreach (var item in body.Items) Expr(item.Expression, scope, ctes);
             if (body.Filter is { } filter) Expr(filter, scope, ctes);
             if (body.Having is { } having) Expr(having, scope, ctes);
+            if (body.LimitExpression is { } limit) Expr(limit, scope, ctes);
+            if (body.OffsetExpression is { } offset) Expr(offset, scope, ctes);
             foreach (var group in body.GroupBy ?? []) Expr(group, scope, ctes);
             foreach (var key in body.DistinctOn ?? []) Expr(key, scope, ctes);
             foreach (var order in body.Order ?? []) Expr(order.Expression, scope, ctes);

@@ -91,6 +91,8 @@ internal sealed class Parameters
         Frame = window.Frame is not { } frame ? null : frame with { Start = frame.Start with { Offset = frame.Start.Offset is null ? null : Expression(frame.Start.Offset) }, End = frame.End with { Offset = frame.End.Offset is null ? null : Expression(frame.End.Offset) } } };
     internal SelectSyntax Query(SelectSyntax query) => query with
     {
+        LimitExpression = query.LimitExpression is null ? null : Expression(query.LimitExpression),
+        OffsetExpression = query.OffsetExpression is null ? null : Expression(query.OffsetExpression),
         DistinctOn = query.DistinctOn?.Select(Expression).ToArray(),
         Items = query.Items.Select(item => item with { Expression = Expression(item.Expression) }).ToArray(),
         Filter = query.Filter is null ? null : Expression(query.Filter), Having = query.Having is null ? null : Expression(query.Having),
@@ -114,6 +116,7 @@ internal sealed class Parameters
     {
         ExplainSyntax explain => explain with { Inner = Statement(explain.Inner) },
         SelectSyntax query => Query(query),
+        MergeSyntax merge => merge with { Source = Relation(merge.Source), On = Expression(merge.On), Returning = Returning(merge.Returning), Clauses = merge.Clauses.Select(clause => clause with { Condition = clause.Condition is null ? null : Expression(clause.Condition), Assignments = clause.Assignments?.Select(item => item with { Value = Expression(item.Value) }).ToArray(), Values = clause.Values?.Select(Expression).ToArray() }).ToArray() },
         WithStatementSyntax wrapped => wrapped with { Definitions = wrapped.Definitions.Select(cte => cte with { Query = Query(cte.Query), Mutation = cte.Mutation is null ? null : Statement(cte.Mutation) }).ToArray(), Body = Statement(wrapped.Body) },
         CreateTableAsSyntax create => create with { Query = Query(create.Query) },
         InsertSyntax insert => insert with { Values = insert.Values.Select(row => row.Select(Expression).ToArray()).ToArray(), Source = insert.Source is null ? null : Query(insert.Source), Returning = Returning(insert.Returning),
@@ -152,6 +155,7 @@ internal sealed class Parameters
         switch (statement)
         {
             case SelectSyntax query: return Query(query);
+            case MergeSyntax merge: return StatementExecution.PrepareMerge(database, pending ?? new PendingDatabase(snapshot) { Catalog = catalog }, merge, meter, token, scope is null ? null : new StatementContext(pending ?? new PendingDatabase(snapshot) { Catalog = catalog }, scope)).Columns;
             case CreateTableAsSyntax create: return pending is not null && WritableCteExecution.HasWrites(create.Query)
                 ? WritableCteExecution.Prepare(database, pending, create.Query.With!, create.Query.Recursive, create.Query with { With = null }, meter, token).Columns : Query(create.Query);
             case InsertSyntax insert:
