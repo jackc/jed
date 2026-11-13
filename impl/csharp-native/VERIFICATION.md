@@ -2,6 +2,10 @@
 
 ## Frozen experiment verification — 2026-11-13
 
+Frozen implementation: local-only commit
+`757ea35138d50dcb9617231b190f4a5e990dbc1d` on `codex/csharp-native-experiment`.
+This work has not been pushed or merged.
+
 The independent C# core is complete and frozen against semantic baseline
 `b1a6affca7725e0b07a4f734eddb1c569ef76bcf` on Linux x86-64 with .NET SDK
 11.0.100. It remains an opt-in experiment, outside normal CI and future feature

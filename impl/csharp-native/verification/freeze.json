@@ -19,5 +19,7 @@
     "exit_code": 0,
     "log": "/tmp/jed-csharp-verify-freeze.log",
     "log_sha256": "652cd2d2961b62a3e3fcc2bc12519cab6b71ccfb6f3cb7d719613192eed5a453"
-  }
+  },
+  "implementation_revision": "757ea35138d50dcb9617231b190f4a5e990dbc1d",
+  "git_scope": "local-only commit on codex/csharp-native-experiment; not pushed or merged"
 }

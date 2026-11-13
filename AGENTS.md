@@ -53,7 +53,9 @@ files in the same change.
   promotion to supported status requires a separate decision. See
   `spec/design/ruby-native-experiment.md` and `spec/design/swift-native-experiment.md`.
   The C# experiment was authorized 2026-11-12 and completed/frozen 2026-11-13
-  against semantic baseline `b1a6affca7725e0b07a4f734eddb1c569ef76bcf`. It targets
+  against semantic baseline `b1a6affca7725e0b07a4f734eddb1c569ef76bcf`. Its frozen
+  implementation is local-only commit `757ea35138d50dcb9617231b190f4a5e990dbc1d`
+  on `codex/csharp-native-experiment`. It targets
   Linux x86-64, pinned .NET 11 and async-first APIs (inline resident kernels,
   awaited storage I/O, no Task.Run wrapper). Engine34 passes all 12 SQL inventories
   and four host variants; all 763 baseline SQL files pass across applicable storage
