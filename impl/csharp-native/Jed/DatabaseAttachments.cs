@@ -48,6 +48,7 @@ public sealed partial class Database
         ReserveAttachment(name); Database? opened = null;
         try
         {
+            if (ScratchHost?.Encrypted == true) options = (options ?? new()) with { ScratchEncryption = ScratchEncryption.On };
             opened = await OpenFileAsync(path, options, cancellationToken).ConfigureAwait(false);
             lock (gate)
             {
@@ -99,7 +100,7 @@ public sealed partial class Database
             if (disposed || attachments.Count == 0) return;
             if (domainLeases != 0 || attaching.Count != 0 || pins.Count != 0 || writer.CurrentCount == 0)
                 throw new SqlException(SqlStates.ObjectInUse, "database has live domain operations");
-            attachmentsClosing = true; owned = attachments.Values.ToArray();
+            attachmentsClosing = true; owned = attachments.Values.OrderBy(item => item.Name, Utf8NameComparer.Instance).ToArray();
         }
         foreach (var attachment in owned) await attachment.Database.DisposeAsync().ConfigureAwait(false);
         lock (gate) attachments.Clear();

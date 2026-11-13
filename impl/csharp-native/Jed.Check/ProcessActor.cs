@@ -23,6 +23,9 @@ internal static class ProcessActor
             using var credential = settings.TryGetValue("key", out var key) ? DatabaseCredential.FromKey(Convert.FromHexString(key)) : null;
             var options = new DatabaseFileOptions
             {
+                Synchronous = settings.GetValueOrDefault("synchronous", "on") switch
+                { "on" => Synchronous.On, "off" => Synchronous.Off, _ => throw new SqlException("22023", "invalid synchronous mode") },
+                FlushIntervalMilliseconds = Number("flush_interval_ms", 1000),
                 Credential = credential, ReadOnly = action is "open-read-only" or "open-remote-read-only",
                 Locking = action == "open-exclusive" ? FileLocking.Exclusive : FileLocking.Auto,
                 Ownership = settings.GetValueOrDefault("ownership", "prefer") switch { "prefer" => FileOwnership.Prefer, "yield" => FileOwnership.Yield, "never" => FileOwnership.Never, _ => throw new SqlException("22023", "invalid ownership") },
@@ -31,7 +34,6 @@ internal static class ProcessActor
                 MaximumConnections = checked((int)Number("max_connections", 0)), IdleSessionMilliseconds = Number("idle_session", 0),
                 YieldGraceMilliseconds = Number("yield_grace", 5000), ShutdownGraceMilliseconds = Number("shutdown_grace", 30000)
             };
-            if (settings.GetValueOrDefault("synchronous") == "off") throw new SqlException("0A000", "relaxed durability is not implemented by the C# experiment");
             database = action switch
             {
                 "open-remote" or "open-remote-read-only" => await Database.OpenRemoteAsync(token => ProcessDuplexStream.Connect(path, token), options).ConfigureAwait(false),

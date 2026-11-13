@@ -14,7 +14,7 @@ internal sealed record HashJoinPlan(int[] Left, int[] Right, SqlType[] Types)
         };
         foreach (var term in PredicatePlan.Conjuncts(predicate))
         {
-            if (term.Op is not ("=" or "<>" or "!=" or "<" or "<=" or ">" or ">=") || !PredicatePlan.Safe(term) || term.Args.Any(arg => arg.Op is not ("column" or "constant"))) return null;
+            if (term.Op is not ("=" or "<>" or "!=") || !PredicatePlan.Safe(term) || term.Args.Any(arg => arg.Op is not ("column" or "constant"))) return null;
             if (term.Op != "=" || term.Args[0].Op != "column" || term.Args[1].Op != "column") continue;
             var a = term.Args[0]; var b = term.Args[1];
             if (a.Slot >= leftWidth) (a, b) = (b, a);
@@ -24,9 +24,9 @@ internal sealed record HashJoinPlan(int[] Left, int[] Right, SqlType[] Types)
         if (left.Count == 0) return null;
         return new(left.ToArray(), right.ToArray(), types.ToArray());
     }
-    internal static long Work(long a, long b, SqlType[] types, Resolved? residual)
+    internal static long Work(long a, long b, SqlType[] types, Resolved? residual, long minimumCandidates = 0)
     {
-        var pairs = Estimate.Multiply(a, b); var candidates = Estimate.Rows(pairs, residual);
+        var pairs = Estimate.Multiply(a, b); var candidates = Math.Max(minimumCandidates, Estimate.Rows(pairs, residual));
         var nodes = residual is null ? 0 : PredicatePlan.Nodes(residual); long width = 0;
         foreach (var type in types) width = Estimate.Add(width, type.Kind switch
         {
@@ -79,7 +79,7 @@ internal sealed class HashJoinTable(Meter meter) : IDisposable
         }
         return matches.ToArray();
     }
-    private static async ValueTask<byte[]?> Key(SqlValue[] row, int[] slots, long unit, Meter meter)
+    internal static async ValueTask<byte[]?> Key(SqlValue[] row, int[] slots, long unit, Meter meter)
     {
         var writer = new WireWriter(); var present = true;
         foreach (var slot in slots)
@@ -93,7 +93,7 @@ internal sealed class HashJoinTable(Meter meter) : IDisposable
         }
         return present ? writer.ToArray() : null;
     }
-    private static ulong Hash(ReadOnlySpan<byte> bytes)
+    internal static ulong Hash(ReadOnlySpan<byte> bytes)
     {
         var value = 14695981039346656037UL;
         foreach (var item in bytes) value = unchecked((value ^ item) * 1099511628211UL);

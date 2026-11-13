@@ -5,13 +5,19 @@ internal static class TextConcat
     internal static Resolved Resolve(Expression expression)
     {
         var leftSyntax = expression.Args[0]; var rightSyntax = expression.Args[1];
-        var left = Jed.Resolve.Expr(leftSyntax, leftSyntax.Op == "parameter" ? SqlType.Text : SqlType.Unknown);
-        var right = Jed.Resolve.Expr(rightSyntax, rightSyntax.Op == "parameter" ? SqlType.Text : SqlType.Unknown);
+        var left = Jed.Resolve.Expr(leftSyntax);
+        var right = Jed.Resolve.Expr(rightSyntax);
         if (left.Type.Kind == SqlKind.Array || right.Type.Kind == SqlKind.Array)
         {
             var type = left.Type.Kind == SqlKind.Array ? left.Type : right.Type;
-            if (leftSyntax.Op is "text" or "null") left = Jed.Resolve.Expr(leftSyntax, type);
-            if (rightSyntax.Op is "text" or "null") right = Jed.Resolve.Expr(rightSyntax, type);
+            if (leftSyntax.Op == "array" && right.Type.Kind == SqlKind.Array && rightSyntax.Op != "array")
+                left = Jed.Resolve.Adapt(leftSyntax, left, type = right.Type);
+            if (rightSyntax.Op == "array" && left.Type.Kind == SqlKind.Array && leftSyntax.Op != "array")
+                right = Jed.Resolve.Adapt(rightSyntax, right, type = left.Type);
+            if (leftSyntax.Op is "text" or "null" or "parameter") left = Jed.Resolve.Expr(leftSyntax, type);
+            if (rightSyntax.Op is "text" or "null" or "parameter") right = Jed.Resolve.Expr(rightSyntax, type);
+            if (leftSyntax.Op is "integer" or "decimal") left = Jed.Resolve.Expr(leftSyntax, type.Element);
+            if (rightSyntax.Op is "integer" or "decimal") right = Jed.Resolve.Expr(rightSyntax, type.Element);
             try { if (OpenOperators.TryResolve(expression, left, right, out var array)) return array; }
             catch (SqlException error) when (error.SqlState == SqlStates.DatatypeMismatch) { throw Missing(); }
             throw Missing();

@@ -36,12 +36,28 @@ internal static class OpenExpression
         if (expression.Op == "row")
         {
             if (hint.Kind == SqlKind.Composite && hint.Fields.Count != expression.Args.Length) throw new SqlException(SqlStates.CannotCoerce, "record field count mismatch");
-            var fields = expression.Args.Select((arg, index) => Jed.Resolve.Expr(arg, hint.Kind == SqlKind.Composite ? hint.Fields[index].Type : null)).ToArray();
+            var fields = expression.Args.Select((arg, index) =>
+            {
+                var target = hint.Kind == SqlKind.Composite ? hint.Fields[index].Type : null;
+                if (arg.Op == "text" && target?.Kind == SqlKind.Composite)
+                    return Jed.Resolve.LiteralConstant(arg.Text, target, arg.Context);
+                return explicitCast && target is not null && arg.Op is "row" or "array"
+                    ? Resolve(arg, target, explicitCast: true) : Jed.Resolve.Expr(arg, target);
+            }).ToArray();
             var type = hint.Kind == SqlKind.Composite ? hint : SqlType.Record(fields.Select((field, index) => new SqlField($"f{index + 1}", field.Type)));
             for (var i = 0; i < fields.Length; i++)
                 if (fields[i].Type != type.Fields[i].Type)
                 {
-                    if (!Jed.Resolve.CanCast(fields[i].Type, type.Fields[i].Type)) throw new SqlException(SqlStates.CannotCoerce, "record field type mismatch");
+                    if (explicitCast)
+                    {
+                        if (!Jed.Resolve.CanCast(fields[i].Type, type.Fields[i].Type)) throw new SqlException(SqlStates.CannotCoerce, "record field type mismatch");
+                    }
+                    else
+                    {
+                        try { StatementExecution.Assignable(fields[i].Type, type.Fields[i].Type); }
+                        catch (SqlException error) when (error.SqlState is SqlStates.DatatypeMismatch or SqlStates.CannotCoerce)
+                        { throw new SqlException(SqlStates.CannotCoerce, "record field type mismatch"); }
+                    }
                     fields[i] = new("promote", type.Fields[i].Type, default, [fields[i]]);
                 }
             return new("row", type, default, fields);

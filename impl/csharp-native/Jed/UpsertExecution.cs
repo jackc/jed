@@ -34,6 +34,7 @@ internal static partial class StatementExecution
             _ => false
         };
     }
+    private static bool KnownBtreeClass(string name) => name is "int2_ops" or "int4_ops" or "int8_ops" or "bool_ops" or "text_ops" or "varchar_ops" or "numeric_ops" or "bytea_ops" or "uuid_ops" or "timestamp_ops" or "timestamptz_ops" or "interval_ops" or "float4_ops" or "float8_ops" or "date_ops" or "jsonb_ops" or "array_ops" or "range_ops" or "record_ops";
     private static ConflictArbiter[] ConflictArbiters(CatalogTable table, ConflictSyntax syntax, Catalog catalog, Meter meter)
     {
         var candidates = new List<ConflictArbiter>();
@@ -46,7 +47,8 @@ internal static partial class StatementExecution
                 if (syntax.Assignments is not null) throw new SqlException(SqlStates.WrongObjectType, "ON CONFLICT DO UPDATE does not support exclusion constraints");
                 return [new(false, table.Indexes!.First(index => index.Name == exclusion.Index), exclusion)];
             }
-            var match = candidates.FirstOrDefault(candidate => candidate.Primary ? constraint == table.Name + "_pkey" : candidate.Index!.Name == constraint);
+            var match = candidates.FirstOrDefault(candidate => candidate.Primary ? constraint == GeneratedName(table.Name, "", "pkey", static _ => false) :
+                candidate.Index!.IsConstraint && candidate.Index.Name == constraint);
             return match is null ? throw new SqlException(SqlStates.UndefinedObject, "constraint does not exist") : [match];
         }
         if (syntax.Elements is null)
@@ -56,19 +58,18 @@ internal static partial class StatementExecution
                 .Select(exclusion => new ConflictArbiter(false, table.Indexes!.First(index => index.Name == exclusion.Index), exclusion))).ToArray();
         }
         var columns = new List<int>(); var decorations = true;
-        var classes = new HashSet<string>(["int2_ops", "int4_ops", "int8_ops", "bool_ops", "text_ops", "varchar_ops", "numeric_ops", "bytea_ops", "uuid_ops", "timestamp_ops", "timestamptz_ops", "interval_ops", "float4_ops", "float8_ops", "date_ops", "jsonb_ops", "array_ops", "range_ops", "record_ops"], StringComparer.Ordinal);
         foreach (var element in syntax.Elements)
         {
             if (element.Ordered) throw new SqlException(SqlStates.InvalidColumnReference, "ordering is not allowed in a conflict target");
             var column = ColumnIndex(table, element.Column); columns.Add(column);
             if (element.Collation is { } collation)
             {
-                if (collation != "C" && !(catalog.Collations ?? []).Any(item => item.Name == collation)) throw new SqlException(SqlStates.UndefinedObject, "collation does not exist");
+                if (collation != "C") _ = meter.Unicode?.Resolve(collation) ?? throw new SqlException(SqlStates.UndefinedObject, "collation does not exist");
                 decorations &= (table.Columns[column].Type.Type == SqlType.Text || table.Columns[column].Type.Type.Element == SqlType.Text) && (table.Columns[column].Collation ?? "C") == collation;
             }
             if (element.Opclass is { } opclass)
             {
-                if (!classes.Contains(opclass)) throw new SqlException(SqlStates.UndefinedObject, "operator class does not exist");
+                if (!KnownBtreeClass(opclass)) throw new SqlException(SqlStates.UndefinedObject, "operator class does not exist");
                 decorations &= (opclass == "varchar_ops" ? "text_ops" : opclass) == BtreeClass(table.Columns[column].Type.Type);
             }
         }
@@ -117,7 +118,10 @@ internal static partial class StatementExecution
         InsertSyntax insert, int[] slots, Expression[][] input, Meter meter, CancellationToken token, SubqueryBinder inputBinder, StatementContext? context = null)
     {
         var conflict = insert.Conflict!;
-        if (insert.Alias == "excluded" && conflict.Assignments is not null) throw new SqlException(SqlStates.AmbiguousAlias, "excluded target alias is ambiguous");
+        if ((insert.Alias ?? table.Name) == "excluded" && conflict.Assignments is not null &&
+            conflict.Assignments.Select(item => item.Value).Concat(conflict.Filter is null ? [] : [conflict.Filter])
+                .SelectMany(ExpressionNodes).Any(node => node.Op == "name" && node.Text.StartsWith("excluded.", StringComparison.Ordinal)))
+            throw new SqlException(SqlStates.AmbiguousAlias, "excluded target alias is ambiguous");
         var arbiters = ConflictArbiters(table, conflict, pending.Catalog, meter);
         var columns = insert.ViewBinding?.Conflict ?? Columns(table, insert.Alias).Concat(table.Columns.Select(column => new BoundColumn(column.Name, column.Type.Type, "excluded", Hidden: true, Collation: CollationRules.Collatable(column.Type.Type) ? new(Name: column.Collation ?? "C", Table: column.CollationData) : null, WholeRow: false))).ToArray();
         var readState = context?.Read ?? pending.Fork();
@@ -140,7 +144,7 @@ internal static partial class StatementExecution
         var returnBinder = new SubqueryBinder(insert.ViewBinding?.Returning ?? ReturningColumns(returnTable, insert.ReturningAliases), database, pending.Before, readState, readState.Catalog, meter, token, context?.Scope);
         var returning = Returning(returnTable, insert.Returning, pending.Catalog, meter, returnBinder, insert.ReturningAliases);
         foreach (var check in insert.ViewChecks ?? []) _ = returnBinder.Bind(check);
-        await inputBinder.Initialize().ConfigureAwait(false); await binder.Initialize().ConfigureAwait(false); await returnBinder.Initialize().ConfigureAwait(false);
+        await inputBinder.Initialize().ConfigureAwait(false); await binder.Initialize().ConfigureAwait(false);
         var planned = new List<UpsertRow>(); var updated = new HashSet<string>(StringComparer.Ordinal);
         long rowid = -1;
         if (table.PrimaryKey.Length == 0) await foreach (var record in source.ScanAsync(token).ConfigureAwait(false)) rowid = Math.Max(rowid, KeyEncoding.ReadInteger(record.Key));
@@ -194,10 +198,18 @@ internal static partial class StatementExecution
             var encoded = table.EncodeRow(after, table.PrimaryKey.Length == 0 ? KeyEncoding.ReadInteger(existing!.Key) : 0);
             updated.Add(Convert.ToHexString(existing!.Key)); planned.Add(new(existing, encoded, after, null));
         }
+        // Phase two preserves the specified physical history: all inserts, then
+        // replacements, each retaining its phase-one source order.
+        planned = planned.OrderBy(row => row.Old is null ? 0 : 1).ToList();
         await ValidatePinnedKeys(database, context, table, planned.Select(row => (row.Record, row.Values)),
             planned.Where(row => row.Old is not null).Select(row => Convert.ToHexString(row.Old!.Key)).ToHashSet(StringComparer.Ordinal), meter, token).ConfigureAwait(false);
         var tree = source;
         var removed = 0;
+        var inPlace = new HashSet<string>(StringComparer.Ordinal);
+        var newKeys = new HashSet<string>(StringComparer.Ordinal);
+        var changedIndexes = new Dictionary<string, CatalogTable>(StringComparer.Ordinal);
+        foreach (var row in planned)
+            if (!newKeys.Add(Convert.ToHexString(row.Record.Key))) throw new SqlException(SqlStates.UniqueViolation, "duplicate primary key");
         foreach (var row in planned.Where(row => row.Old is not null))
         {
             var currentKey = context?.CurrentKey(table.Name, row.Old!.Key) ?? (context is null ? row.Old!.Key : null);
@@ -205,17 +217,29 @@ internal static partial class StatementExecution
             if (current is not null)
             {
                 var materialized = await tree.MaterializeRecordAsync(current, token).ConfigureAwait(false);
-                tree = await tree.DeleteAsync(current.Key, token).ConfigureAwait(false);
-                await RemoveIndexes(database, pending, table, materialized, meter, token, row.Values, row.Record.Key).ConfigureAwait(false);
+                if (current.Key.AsSpan().SequenceEqual(row.Record.Key)) inPlace.Add(Convert.ToHexString(row.Old!.Key));
+                else tree = await tree.DeleteAsync(current.Key, token).ConfigureAwait(false);
+                var oldValues = table.DecodeRow(materialized);
+                var indexTable = table with { Indexes = (table.Indexes ?? []).Where(index =>
+                {
+                    if (index.Kind == 1) return true;
+                    var oldEntry = IndexRecord(table, index, materialized, oldValues, meter, pending.Catalog);
+                    var newEntry = IndexRecord(table, index, row.Record, row.Values, meter, pending.Catalog);
+                    return (oldEntry is null) != (newEntry is null) || oldEntry is not null && newEntry is not null &&
+                        !oldEntry.Record.Key.AsSpan().SequenceEqual(newEntry.Record.Key);
+                }).ToArray() };
+                changedIndexes[Convert.ToHexString(row.Old!.Key)] = indexTable;
+                await RemoveIndexes(database, pending, indexTable, materialized, meter, token, row.Values, row.Record.Key).ConfigureAwait(false);
                 removed++;
             }
             context?.Move(table.Name, row.Old!.Key, null);
         }
         foreach (var row in planned)
         {
-            if (await tree.FindAsync(row.Record.Key, token).ConfigureAwait(false) is not null) throw new SqlException(SqlStates.UniqueViolation, "duplicate primary key");
+            if (await tree.FindAsync(row.Record.Key, token).ConfigureAwait(false) is not null &&
+                (row.Old is null || !inPlace.Contains(Convert.ToHexString(row.Old.Key)))) throw new SqlException(SqlStates.UniqueViolation, "duplicate primary key");
             tree = await tree.UpsertAsync(tree.PrepareRecord(row.Record, meter), token).ConfigureAwait(false);
-            await AddIndexes(database, pending, table, row.Record, row.Values, meter, token).ConfigureAwait(false);
+            await AddIndexes(database, pending, row.Old is null ? table : changedIndexes.GetValueOrDefault(Convert.ToHexString(row.Old.Key), table), row.Record, row.Values, meter, token).ConfigureAwait(false);
             if (row.Old is not null) context?.Move(table.Name, row.Old.Key, row.Record.Key);
         }
         if (planned.Count != 0) { Put(pending, table with { RowCount = checked(table.RowCount - removed + planned.Count) }, tree); StaleStatistics(pending, table.Name); }
@@ -225,6 +249,7 @@ internal static partial class StatementExecution
         var changes = planned.Where(row => row.Old is not null).Select(row => (row.Old!, row.Values)).ToArray();
         if (changes.Length != 0) await ApplyReferentialActions(database, pending, table, changes, false, meter, token, context: context).ConfigureAwait(false);
         await ForeignCheck(context, () => ValidateForeignKeys(database, pending, table, planned.Select(row => row.Values).ToArray(), token)).ConfigureAwait(false);
+        await returnBinder.Initialize().ConfigureAwait(false);
         var rows = new List<Row>();
         if (returning.Length != 0) foreach (var row in planned) rows.Add((await QueryExecution.ProjectAsync(returning, ReturningRow(table, row.Old is null ? null : table.DecodeRow(row.Old), row.Values), meter).ConfigureAwait(false)).RetainMemory(meter));
         return new(returning.Select(projection => new Column(projection.Name, projection.Expression.Type)).ToArray(), rows.ToArray(), planned.Count);

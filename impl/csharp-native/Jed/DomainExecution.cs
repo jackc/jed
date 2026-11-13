@@ -46,6 +46,8 @@ internal static class DomainExecution
         }
         ConstraintSyntax Constraint(ConstraintSyntax value)
         {
+            if (domain is not ("main" or "temp") && value.Kind == "exclude")
+                throw Errors.Unsupported("exclusion constraint on attached database");
             if (value.Parent is not { } parent) return value;
             if (domains is null) return value with { Parent = Name(parent) };
             var parts = DatabaseDomains.Name(parent);
@@ -54,7 +56,7 @@ internal static class DomainExecution
                 throw Errors.Unsupported("foreign keys on attached databases");
             var self = parts.Local == DatabaseDomains.Name(Target(statement)!).Local && (parts.Domain is null || parts.Domain == domain);
             if (!self && !home.Catalog.Tables.Any(table => table.Name == parts.Local))
-                throw new SqlException(SqlStates.UndefinedTable, "foreign key parent does not exist");
+                throw new SqlException(StatementExecution.RelationExists(home.Catalog, parts.Local) ? SqlStates.WrongObjectType : SqlStates.UndefinedTable, "foreign key parent does not exist");
             if (!self && home.Name != domain) throw new SqlException(SqlStates.InvalidTableDefinition, "foreign key crosses temporary and persistent domains");
             return value with { Parent = parts.Local };
         }
@@ -97,7 +99,14 @@ internal static partial class StatementExecution
         var domain = DomainExecution.ResolveTarget(statement, domains);
         if (domain.ReadOnly || domain.Pending is null) throw new SqlException(SqlStates.ReadOnlySqlTransaction, "database domain is read-only");
         var alreadyExists = RelationExists(domain.Catalog, DatabaseDomains.Name(target).Local);
-        if (alreadyExists && statement is CreateTableSyntax { IfNotExists: true } or CreateTableAsSyntax { IfNotExists: true }) return new([], []);
+        if (alreadyExists && statement is CreateTableSyntax { IfNotExists: true }) return new([], []);
+        if (statement is DropViewSyntax dropping)
+            foreach (var name in dropping.Names)
+            {
+                var home = domains.Resolve(name); var localName = DatabaseDomains.Name(name).Local;
+                if (!(home.Catalog.Views ?? []).Any(view => view.Name == localName) && !dropping.IfExists)
+                    throw new SqlException(RelationExists(home.Catalog, localName) ? SqlStates.WrongObjectType : SqlStates.UndefinedTable, "view does not exist");
+            }
         if (domain.Name is not ("main" or "temp"))
         {
             if (statement is CreateTableSyntax create && create.Columns.Any(column => column.Identity || column.Type is "serial" or "smallserial" or "bigserial" or "serial2" or "serial4" or "serial8"))

@@ -180,9 +180,8 @@ The internal filesystem adapter now awaits file creation/opening, rename, unlink
 directory barriers through the same engine paths used by native maintenance. The first simulated
 host check passed at `6523fb837e05a09ae19bcb46dabf03cda5d34154827050943dc91cf17e10c168`:
 content-keyed write-order independence, delayed removal of unissued writes, directory durability,
-and twelve real-engine recovery histories with torn pending writes. This is host-model evidence;
-the canonical simulation trace driver, complete structural oracles, service scheduling and all
-fault profiles remain separate work. It does not establish full simulation conformance.
+and twelve real-engine recovery histories with torn pending writes. That initial run covered the host model only. The later trace-driver evidence below adds structural
+and differential checks; service scheduling and the complete fault matrix remain acceptance gates.
 
 The remaining backup and storage-limit process layout checks passed at
 `1d81da34b6931d8fda62b6aa616fa724296625928630426b30265ebc1dbc504c`, after periodic
@@ -192,14 +191,69 @@ free-page counts. Owner maintenance retains the writer lease after acknowledging
 the old write pin is released before reclamation, and lost acknowledgements still take this cleanup
 path after successful publication.
 
+The full host suite passed at
+`c696f1094f649a3a566b882aa6b85203a46445f02ba40c80c57625a814cbd5f9`, including
+nullable command-result counts, deferred writable stabilization, key maintenance, page service,
+large-value storage, scratch and simulation host invariants. A later full host run at
+`733d94bb574880c35a78af040efc57d4003e05e431cf9170bd39d796d9a18e75` also covered the relaxed-batch allocator's cumulative manifests, reuse floor, deadline and
+cap-failure rules. The actual owner/client host path then passed **all 31 complete pinned process
+scenarios** at `ae6fe58fb541f58e21c35dc3e5e11df87b6db4cb61b4811742388d3f3fc1d8bf`.
+That run includes mixed synchronous/relaxed clients, ownership transfer, encrypted maintenance,
+backup and exact storage accounting. Its captured actor SHA-256 was
+`6a7dec65ead35fa3b0336f1d07694ad803096e31821a933560e5857abc0eb65d`; engine SHA-256 was
+`3b8b729033d2e8864bcc34cb1a7b91f59691d16ae626b907710651ee2e70b972`.
+
+The native simulator now executes complete single-process traces twice and checks identical
+transcripts and byte-device operations, live/reopened reachability, exact live counts, key atomicity,
+reader snapshots and recovery history. Five complete plaintext regressions matched the pinned Go
+transcript exactly at `6f310d2ae3868c77e2dd7b17dc1a8128841a175a7d1667a8c15a9231f51e1788`:
+`analyze-then-drop-table`, `compaction-crash-before-dir-sync`, `delete-empty-unary-subtree`,
+`delete-merge-separator-overflow` and `stale-root-leaf-chains`. The complete
+`relaxed-close-truncation-floor` trace matched exactly at
+`e092f119fda7fcdb0e874692373a7050b9123c12b81b1b94c8f2a72c76df4f41`. At that same revision,
+the host-clock test checked one read per relaxed commit, microsecond precision at a millisecond
+interval boundary, flush-before-planning and close durability. The simulator disables the idle
+flusher as required by its deterministic clock contract. The complete 402-step encrypted rekey trace
+executes and passes internal oracles, but its peer comparison still exposes a reclamation-history
+mismatch; it is **not** a passing differential trace.
+
+The corrected disk corpus harness reopens the file and session before every eligible record, honors
+explicit mode exclusions and opens fixture copies as real files. At `ae6fe58f…`, its first full run
+selected 763 files: 543 passed (15,246 records), 134 failed and 86 had declared disk exclusions.
+The encrypted variant passed row/type/error checks for 610 files (16,845 records), failed 66 and
+excluded 87. It emits the canonical cost/EXPLAIN transcript instead of comparing those fields with
+plaintext expectations. A subsequent independent pinned Go run passed all 676 eligible encrypted
+files and produced the comparison transcript. Of C#'s 610 complete row/type/error-passing files,
+542 also matched the full cost/EXPLAIN transcript exactly (1,568 events); 68 had differences.
+Consequently **542 complete encrypted files passed every checked field**, with 134 total file
+failures and 87 declared exclusions. This is partial coverage, not full encrypted conformance.
+The comparison is reproducible with `csharp-native:conformance-peer`; its diagnostic log is
+`/tmp/jed-csharp-encrypted-peer-first.log`. Logs for the underlying C# runs are
+`/tmp/jed-csharp-process-all-latest.log`, `/tmp/jed-csharp-full-disk-first.log` and
+`/tmp/jed-csharp-full-encrypted-first.log`; rerun through the corresponding opt-in mise tasks.
+
 ## Remaining acceptance gates
 
-Complete operator spill integration, relaxed durability batches, the complete shared process
-suite and simulation/fault-injection coverage remain incomplete. Relaxed page-service batches are
-still an explicit unsupported process path; focused passes do not establish one complete passing
-run. Selected recovery and acknowledgement tests
-do not substitute for the full crash matrix. Full SQL parity and performance measurements remain
-separate experiment gates, even though the earlier frozen host checkpoint passed NativeAOT.
+The full host suite subsequently passed at
+`db0ab23f0e9fced13fca929bd46b5319bf30d595699b10e1108d3d40833ed9a1`
+(`/tmp/jed-csharp-growth-host.log`). This includes geometric file preallocation with
+durably written zeros, Linux `fdatasync` commit barriers, and simulation invariants
+for inode identity across rename and per-step write-issue decisions. The complete
+encrypted rekey regression executes with its structural/durability oracles and is
+self-deterministic. At
+`dced2ab0e08dea734e1c53be66cfdab1d15c541db57ba4a93105c4407ca59ae4`,
+all its physical image hashes, recovered generations, rows, live/page/free counts
+match the pinned peer through all 403 steps (indices 0–402). Two SQL cost events
+still differ: ANALYZE at step 335 and ALTER TABLE at step 372. It is therefore not
+yet an exact-transcript pass. The complete separator-overflow regression passes
+exactly at that same source; logs are `/tmp/jed-csharp-sim-encrypted-self-pin.log`
+and `/tmp/jed-csharp-sim-reclaim-self-pin.log`.
+
+Complete operator spill integration, cross-core relaxed service coverage and the full simulation/fault
+matrix remain incomplete. Single-process regression passes do not cover attachment/service scheduling,
+all corruption cases or every crash profile. Full SQL parity, resolution of the encrypted transcript differences,
+current full-engine NativeAOT verification and performance measurements remain separate experiment
+gates; the earlier frozen checkpoint's NativeAOT pass does not cover these later changes.
 
 Secret erasure and constant-time behavior still require explicit security analysis. Owned temporary
 secrets are cleared on cleanup paths, but managed copies, provider scratch state and exceptional

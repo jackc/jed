@@ -26,11 +26,11 @@ internal static partial class StatementExecution
             var resolved = Resolve.Expr(Resolve.Bind(Resolve.BindTypes(key.Expression, pending.Catalog, meter.Temporal), Columns(table)));
             if (resolved.Op != "column") throw Errors.Unsupported("GiST expression index");
             GistBounds.ValidateType(resolved.Type);
-            if (key.Options != 0) throw Errors.Unsupported("GiST ordering options");
+            if (key.Ordered || key.Options != 0) throw Errors.Unsupported("GiST ordering options");
             keys.Add(new(resolved.Slot));
         }
         if (create.Unique || keys.Count != 1 || create.Predicate is not null) throw Errors.Unsupported("GiST unique, multi-column or partial CREATE INDEX");
-        if (create.Name is { } explicitName && RelationExists(pending.Catalog, explicitName))
+        if (create.Name is { } explicitName && RelationExistsAnywhere(pending.Catalog, explicitName))
         { if (create.IfNotExists) return new([], []); throw new SqlException(SqlStates.DuplicateTable, "relation already exists"); }
         var name = create.Name ?? GeneratedName(table.Name, table.Columns[keys[0].Column].Name, "idx", candidate => RelationExists(pending.Catalog, candidate));
         var index = new CatalogIndex(name, keys.ToArray(), Kind: 2);

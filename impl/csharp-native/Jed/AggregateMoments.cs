@@ -7,6 +7,22 @@ internal sealed class AggregateMoments
     private ExactDecimal sum = ExactDecimal.Zero;
     private ExactDecimal squares = ExactDecimal.Zero;
     private double sx, sy, sxx, syy, sxy;
+    internal long LogicalBytes(AggregatePlan plan) => plan.Name == "regr_count" ? MemorySchedule.Value :
+        plan.Type == SqlType.Decimal ? MemorySchedule.Value + MemorySize.ValueBytes(SqlValue.StoredDecimal(sum)) + MemorySize.ValueBytes(SqlValue.StoredDecimal(squares)) :
+        (Pair(plan.Name) ? 6 : 3) * MemorySchedule.Value;
+    internal void Write(WireWriter writer)
+    {
+        writer.U64((ulong)Count);
+        ScratchValues.Write(writer, SqlValue.StoredDecimal(sum)); ScratchValues.Write(writer, SqlValue.StoredDecimal(squares));
+        foreach (var value in new[] { sx, sy, sxx, syy, sxy }) writer.U64(BitConverter.DoubleToUInt64Bits(value));
+    }
+    internal void Read(ref WireReader reader)
+    {
+        Count = checked((long)reader.U64());
+        sum = ScratchValues.Read(ref reader, SqlType.Decimal).AsDecimal(); squares = ScratchValues.Read(ref reader, SqlType.Decimal).AsDecimal();
+        sx = BitConverter.UInt64BitsToDouble(reader.U64()); sy = BitConverter.UInt64BitsToDouble(reader.U64());
+        sxx = BitConverter.UInt64BitsToDouble(reader.U64()); syy = BitConverter.UInt64BitsToDouble(reader.U64()); sxy = BitConverter.UInt64BitsToDouble(reader.U64());
+    }
 
     internal static bool Single(string name) => name is "var_pop" or "var_samp" or "variance" or "stddev" or "stddev_samp" or "stddev_pop";
     internal static bool Pair(string name) => name is "covar_pop" or "covar_samp" or "corr" or "regr_count" or "regr_avgx" or "regr_avgy" or "regr_sxx" or "regr_syy" or "regr_sxy" or "regr_slope" or "regr_intercept" or "regr_r2";

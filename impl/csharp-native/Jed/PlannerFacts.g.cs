@@ -46,4 +46,10 @@ internal static class PlannerFacts
         (SqlType.F64, SqlType.Text),
         (SqlType.Boolean, SqlType.Text),
     ];
+    internal static readonly (SqlType, SqlType)[] NonEqualityCasts =
+    [
+        (SqlType.Decimal, SqlType.Text),
+        (SqlType.F32, SqlType.Text),
+        (SqlType.F64, SqlType.Text),
+    ];
 }

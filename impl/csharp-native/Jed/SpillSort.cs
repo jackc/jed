@@ -9,6 +9,12 @@ internal sealed record SpillPolicy(ScratchHost Host, long WorkMem, CatalogTable?
         if (plan.Limit == 0) return true;
         if (Table is null || plan.Limit is not { } limit || limit > long.MaxValue - plan.Offset) return false;
         long bytes = 8 + 40L * Table.Columns.Length;
+        foreach (var key in plan.Order ?? [])
+        {
+            if (SortPlan.Column(key.Expression) is not null) continue;
+            if (key.Expression.Type.Kind is SqlKind.Decimal or SqlKind.Text or SqlKind.Bytea or SqlKind.Json or SqlKind.Jsonb or SqlKind.Jsonpath or SqlKind.Array or SqlKind.Composite or SqlKind.Range) return false;
+            bytes = Estimate.Add(bytes, 40);
+        }
         var touched = StorageTouchedColumns.Collect(plan);
         foreach (var slot in touched)
         {
@@ -33,12 +39,14 @@ internal static class SpillSort
         var order = plan.Order!;
         var touched = StorageTouchedColumns.Collect(plan);
         var slots = new int[order.Length];
+        var keySlots = Enumerable.Repeat(-1, order.Length).ToArray();
         var width = -1;
         int Compare(SqlValue[] a, SqlValue[] b)
         {
             for (var i = 0; i < slots.Length; i++)
             {
-                var result = SortValue.Compare(new(a[slots[i]], null), new(b[slots[i]], null), order[i]);
+                var result = SortValue.Compare(new(a[slots[i]], keySlots[i] < 0 ? null : a[keySlots[i]].AsBytes()),
+                    new(b[slots[i]], keySlots[i] < 0 ? null : b[keySlots[i]].AsBytes()), order[i]);
                 if (result != 0) return result;
             }
             return 0;
@@ -51,11 +59,18 @@ internal static class SpillSort
             {
                 width = row.Length; var next = width;
                 for (var i = 0; i < order.Length; i++) slots[i] = SortPlan.Column(order[i].Expression) ?? next++;
+                for (var i = 0; i < order.Length; i++) if (order[i].Expression.Collation?.Table is not null) keySlots[i] = next++;
             }
-            var retained = new SqlValue[row.Length + order.Count(key => SortPlan.Column(key.Expression) is null)];
+            var retained = new SqlValue[row.Length + order.Count(key => SortPlan.Column(key.Expression) is null) + keySlots.Count(slot => slot >= 0)];
             for (var i = 0; i < row.Length; i++) retained[i] = touched.Contains(i) ? await row[i].ResolveAsync(token).ConfigureAwait(false) : SqlValue.Null(row[i].Type);
+            var keyCost = meter.Accrued;
             for (var i = 0; i < order.Length; i++)
+            {
                 if (SortPlan.Column(order[i].Expression) is null) retained[slots[i]] = await Evaluate.ExprAsync(order[i].Expression, meter, row: row).ConfigureAwait(false);
+                var key = CollationRules.Decorate(retained[slots[i]], order[i].Expression, meter);
+                if (keySlots[i] >= 0) retained[keySlots[i]] = SqlValue.Bytes(key.Key ?? []);
+            }
+            plan.Observation?.Sort?.AttributeLocal(meter.Accrued - keyCost);
             inputMemory.Release(row);
             await sorter.Add(retained, token).ConfigureAwait(false);
         }

@@ -27,8 +27,108 @@ internal static class SimulationHostTests
         fs.BeginStep(3); fs.Crash(power: true); fs.Restart();
         Corpus.Equal(survived, await fs.ExistsAsync("uncommitted"), "recovered directory prefix stays durable");
         await ScratchFaults();
+        await InodeFaultIdentity();
+        await RelaxedClock();
+        await PageService();
         for (ulong seed = 1; seed <= 12; seed++) await Recovery(seed);
         Console.WriteLine("PASS simulation host: write-order independence, delayed unissued writes, directory durability and real-engine crash/recovery across content-keyed torn images");
+    }
+
+    private static async Task PageService()
+    {
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(20));
+        var fs = new SimulationFileSystem(46, 512);
+        var network = new SimulationNetwork(); var roles = new SimulationRoleRegistry(network);
+        DatabaseFileOptions Options(int process) => new()
+        {
+            FileHost = fs, ScratchDevices = fs, RoleHost = roles.Host(process), Locking = FileLocking.Auto,
+            EnableIdleFlush = false, IdleTransactionMilliseconds = 0, ShutdownGraceMilliseconds = 1,
+            Entropy = count => new byte[count]
+        };
+        var owner = await Database.CreateFileAsync("service.jed", Options(0), 512, timeout.Token);
+        await using (var local = owner.CreateSession()) await Execute(local, "CREATE TABLE t(id i64 PRIMARY KEY)");
+        var client = await Database.OpenFileAsync("service.jed", Options(1), timeout.Token);
+        await using (var remote = client.CreateSession()) await Execute(remote, "INSERT INTO t VALUES (4)");
+        await network.SettleAsync(timeout.Token);
+        Corpus.Equal(owner.Version, client.Version, "simulated client commits through the live owner");
+        Corpus.Equal("client", client.FileRole, "simulated role uses real client driver");
+        var reader = await client.OpenReadSessionAsync(cancellationToken: timeout.Token);
+        network.Disconnect(1, Path.GetFullPath("service.jed")); await network.SettleAsync(timeout.Token);
+        try { await SimulationRows.Query(reader, "SELECT id FROM t"); throw new InvalidDataException("disconnected read retained a snapshot"); }
+        catch (SqlException error) when (error.SqlState == SqlStates.ConnectionFailure) { }
+        await reader.DisposeAsync();
+        await using (var reconnected = client.CreateSession())
+        {
+            var rows = await SimulationRows.Query(reconnected, "SELECT id FROM t");
+            Corpus.Equal(1, rows.Rendered.Length, "simulated reconnect restores service access");
+        }
+        await roles.KillAsync(0);
+        await using (var promoted = client.CreateSession()) await Execute(promoted, "INSERT INTO t VALUES (5)");
+        await network.SettleAsync(timeout.Token);
+        Corpus.Equal("owner", client.FileRole, "simulated client promotes through ordinary recovery");
+        Corpus.Equal(1, roles.OwnerOf("service.jed")!.Value, "exclusive simulated owner follows promotion");
+        await client.DisposeAsync(); await network.SettleAsync(timeout.Token);
+        Corpus.Equal<int?>(null, roles.OwnerOf("service.jed"), "clean close releases injected ownership");
+    }
+
+    private static async Task InodeFaultIdentity()
+    {
+        static async Task<byte[]> Crash(bool rename)
+        {
+            var fs = new SimulationFileSystem(39, 256);
+            await using var store = await fs.OpenAsync("sim.jed.jedtmp", FileMode.CreateNew);
+            await store.SetLengthAsync(4096);
+            if (rename) await fs.MoveAsync("sim.jed.jedtmp", "sim.jed", false);
+            await fs.SyncDirectoryAsync("sim.jed");
+            fs.BeginStep(32, new("process_crash", Probability: 665));
+            for (var offset = 0; offset < 4096; offset += 256)
+                await store.WriteAsync(offset, Enumerable.Repeat((byte)7, 256).ToArray());
+            try { await store.SyncAsync(); throw new InvalidDataException("process fault did not fire"); }
+            catch (SimulationFileSystem.CrashException) { }
+            fs.Restart(); return fs.Image(rename ? "sim.jed" : "sim.jed.jedtmp");
+        }
+        var original = await Crash(false); var renamed = await Crash(true);
+        Corpus.Equal(true, original.AsSpan().SequenceEqual(renamed), "fault decisions retain inode creation identity through rename");
+
+        var later = new SimulationFileSystem(1, 256);
+        await using var file = await later.OpenAsync("sim.jed", FileMode.CreateNew);
+        await file.SetLengthAsync(256); await later.SyncDirectoryAsync("sim.jed");
+        later.BeginStep(1, new("process_crash", Probability: 0, Nth: 2));
+        await file.WriteAsync(0, new byte[] { 9 });
+        later.BeginStep(2); later.Crash(power: false); later.Restart();
+        Corpus.Equal((byte)9, later.Image("sim.jed")[0], "unissued-write decisions expire at the step boundary");
+    }
+
+    private static async Task RelaxedClock()
+    {
+        var fs = new SimulationFileSystem(147, 512);
+        long now = 999; var reads = 0;
+        var options = new DatabaseFileOptions { FileHost = fs, ScratchDevices = fs, Locking = FileLocking.None,
+            Synchronous = Synchronous.Off, FlushIntervalMilliseconds = 1, EnableIdleFlush = false,
+            Clock = () => { reads++; return now; }, Entropy = count => new byte[count] };
+        var database = await Database.CreateFileAsync("clock.jed", options, 512);
+        await using (var session = database.CreateSession())
+        {
+            await Execute(session, "CREATE TABLE t(id i32 PRIMARY KEY)");
+            Corpus.Equal(1, reads, "relaxed commit reads host clock once");
+            Corpus.Equal<long?>(1999, database.CommittedStorageForTesting().Batch?.DeadlineMicroseconds, "deadline preserves fractional milliseconds");
+            now = 1000;
+            await Execute(session, "INSERT INTO t VALUES (1)");
+            Corpus.Equal(2, reads, "next relaxed commit reads clock once");
+            Corpus.Equal<long?>(1999, database.CommittedStorageForTesting().Batch?.DeadlineMicroseconds, "submillisecond boundary does not flush early");
+            var previous = database.Version; now = 1999;
+            await Execute(session, "INSERT INTO t VALUES (2)");
+            Corpus.Equal(3, reads, "deadline rollover uses one reading");
+            Corpus.Equal<ulong?>(previous, database.CommittedStorageForTesting().Batch?.FloorTransactionId, "deadline flush precedes the next commit");
+            Corpus.Equal<long?>(2999, database.CommittedStorageForTesting().Batch?.DeadlineMicroseconds, "rollover dates the new batch with the same reading");
+        }
+        var version = database.Version;
+        await database.DisposeAsync();
+        fs.BeginStep(1); fs.Crash(power: true); fs.Restart();
+        await using var reopened = await Database.OpenFileAsync("clock.jed", options);
+        Corpus.Equal(version, reopened.Version, "clean close flushes the relaxed batch");
+        Corpus.Equal(3, reads, "open and close do not read the durability clock");
+        Console.WriteLine("PASS relaxed host clock: one reading per commit, fractional deadline, flush-before-plan and durable close");
     }
 
     private static async Task ScratchFaults()

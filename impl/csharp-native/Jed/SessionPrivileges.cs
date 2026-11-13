@@ -76,8 +76,7 @@ internal sealed class PrivilegeDiscovery(Catalog catalog, Action<string, TablePr
                     {
                         if (option.Name != "security_invoker") continue;
                         var text = TextEncoding.FoldName(option.Value);
-                        if (text is not ("true" or "on" or "1" or "yes" or "false" or "off" or "0" or "no" or "reset")) continue;
-                        var next = text is "true" or "on" or "1" or "yes";
+                        var next = text != "reset" && StatementExecution.ViewBooleanOption(text);
                         if (invoker && !next) Expand(previous, altered.Local, visible, tables, depth);
                         invoker = next;
                     }

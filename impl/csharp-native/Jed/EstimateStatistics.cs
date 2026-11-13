@@ -26,10 +26,10 @@ internal static partial class Estimate
                     StatisticsView.Find(first.Storage.Catalog, first.Table, x.Slot) is { } xs &&
                     StatisticsView.Find(second.Storage.Catalog, second.Table, y.Slot - left.Columns.Length) is { } ys)
                 {
-                    var nonnullA = first.Table.RowCount == 0 ? 0 : Scale(a, xs.NonnullRows, first.Table.RowCount);
-                    var nonnullB = second.Table.RowCount == 0 ? 0 : Scale(b, ys.NonnullRows, second.Table.RowCount);
                     var ndv = Math.Max(1, Math.Max(xs.DistinctValues, ys.DistinctValues));
-                    var matches = Scale(nonnullA, nonnullB, ndv);
+                    var matches = Scale(xs.NonnullRows, ys.NonnullRows, ndv);
+                    matches = first.Table.RowCount == 0 ? 0 : Scale(matches, a, first.Table.RowCount);
+                    matches = second.Table.RowCount == 0 ? 0 : Scale(matches, b, second.Table.RowCount);
                     rows = population == 0 ? 0 : Math.Min(rows, Scale(rows, matches, population)); refined = true;
                 }
             }

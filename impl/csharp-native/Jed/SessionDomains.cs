@@ -138,6 +138,7 @@ public sealed partial class Session
             if (domainTransaction is null)
             {
                 await StatementExecution.TemporaryCommit(scope, meter, token).ConfigureAwait(false);
+                await lease!.ReleaseWriterPinsForCommitAsync().ConfigureAwait(false);
                 await Database.CommitDomainsAsync(scope, token).ConfigureAwait(false);
                 meter.Memory.HoldPending(0);
             }
@@ -181,6 +182,7 @@ public sealed partial class Session
                     {
                         BindDomainCollations(scope, meter.Unicode, meter.Temporal.Data); meter.Sequences.Bind(scope.BindCatalog(scope.Get("main")), scope.Get("main").Pending);
                         await StatementExecution.TemporaryCommit(scope, meter, token).ConfigureAwait(false);
+                        await lease!.ReleaseWriterPinsForCommitAsync().ConfigureAwait(false);
                         await Database.CommitDomainsAsync(scope, token).ConfigureAwait(false);
                     }
                 }

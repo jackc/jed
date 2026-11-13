@@ -23,11 +23,36 @@ internal sealed record AccessPlan(AccessKind Kind, long EstimatedRows, long Esti
     internal static long ScanCost(long rows, long pages, Resolved? filter) =>
         Estimate.Add(pages, Estimate.Multiply(rows, Estimate.Add(1, filter is null ? 0 : PredicatePlan.Nodes(filter))));
 
-    internal static AccessPlan Select(CatalogTable table, StorageTree tree, Resolved? filter, QueryStorage storage, Meter meter) =>
-        Inventory(table, tree, filter, storage, meter).OrderBy(candidate => candidate.EstimatedCost).First();
+    internal static AccessPlan Select(CatalogTable table, StorageTree tree, Resolved? filter, QueryStorage storage, Meter meter)
+    {
+        var selected = Inventory(table, tree, filter, storage, meter).OrderBy(candidate => candidate.EstimatedCost).ThenBy(candidate => candidate.Kind).ThenBy(candidate => candidate.Index?.Name ?? "", Utf8NameComparer.Instance).First();
+        return selected with { Ordered = selected.Kind is AccessKind.Btree or AccessKind.IndexIntervals };
+    }
+
+    internal static AccessPlan Rebind(AccessPlan selected, CatalogTable table, StorageTree tree, Resolved? filter, QueryStorage storage, Meter meter)
+    {
+        var rebound = Inventory(table, tree, filter, storage, meter).FirstOrDefault(candidate => candidate.Kind == selected.Kind && candidate.Index?.Name == selected.Index?.Name);
+        if (rebound is not null) return rebound with { Ordered = selected.Ordered, Streaming = selected.Streaming };
+        // A promoted fractional range endpoint drops its half-bound. Keep the
+        // chosen physical tree even when the remaining range spans that tree.
+        if (selected.Btree is { } btree)
+        {
+            var keys = StatementExecution.ResolveIndexKeys(table, btree.Index, storage.Catalog);
+            var scan = filter is null ? new TableScan() : SecondaryAccess.Bounds(filter, keys, btree.Index.Keys)?.Scan ?? new();
+            return selected with { Scan = scan, Btree = btree with { Scan = scan } };
+        }
+        if (selected.Kind is AccessKind.Primary or AccessKind.Full)
+            return selected with { Scan = TableAccess.Bounds(filter, table) };
+        throw new InvalidOperationException("selected access path disappeared during value binding");
+    }
 
     internal static IEnumerable<AccessPlan> Inventory(CatalogTable table, StorageTree tree, Resolved? filter, QueryStorage storage, Meter meter)
     {
+        if (table.Domain is { Name: not ("main" or "temp") })
+        {
+            yield return new(AccessKind.Full, table.RowCount, tree.NodeCount, 0, ScanCost(table.RowCount, tree.NodeCount, filter), Scan: new());
+            yield break;
+        }
         var primary = Primary(table, tree, filter, storage.Catalog);
         if (primary.Kind == AccessKind.Primary) yield return primary;
         foreach (var access in SecondaryAccess.Candidates(table, tree, filter, storage))
@@ -60,11 +85,16 @@ internal sealed record AccessPlan(AccessKind Kind, long EstimatedRows, long Esti
                 rows = Math.Min(table.RowCount, Estimate.Add(rows, n));
                 pages = Estimate.Add(pages, n == 0 ? 0 : point ? tree.Height : Math.Clamp(Estimate.Fraction(tree.NodeCount, "paired_range"), tree.Height, tree.NodeCount));
             }
+            var keys = table.PrimaryKey.Select(slot => new Resolved("column", table.Columns[slot].Type.Type, default, [], Slot: slot,
+                Collation: CollationRules.Collatable(table.Columns[slot].Type.Type) ? new(table.Columns[slot].Collation ?? "C", Table: table.Columns[slot].CollationData) : null)).ToArray();
+            rows = KeySetEstimate.Rows(table, storage.Catalog, filter!, keys, true, table.RowCount);
+            pages = rows == 0 ? 0 : Math.Clamp(KeySetEstimate.Rows(table, storage.Catalog, filter!, keys, true, tree.NodeCount), tree.Height, tree.NodeCount);
             yield return new(AccessKind.PrimaryIntervals, rows, pages, 0, ScanCost(rows, pages, filter), filter, Ranges: ranges);
         }
         foreach (var set in IndexSetAccess.Candidates(table, tree, filter, storage))
             yield return new(AccessKind.IndexIntervals, set.EstimatedRows, set.EstimatedPages, 0, set.EstimatedCost,
                 set.Predicate, set.Index, Ranges: set.Ranges, IndexSet: set);
+        foreach (var generic in KeySetShape.UnknownCandidates(table, tree, filter, storage)) yield return generic;
         yield return new(AccessKind.Full, table.RowCount, tree.NodeCount, 0, ScanCost(table.RowCount, tree.NodeCount, filter), Scan: new());
     }
     private static int Height(GistNode node) => node.Leaf ? 1 : 1 + Height(node.Entries[0].Child!);

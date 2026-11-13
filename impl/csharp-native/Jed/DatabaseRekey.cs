@@ -4,6 +4,15 @@ namespace Jed;
 
 public sealed partial class Database
 {
+    /// <summary>Rekeys one exact named file database, retaining its attachment registration until the operation ends.</summary>
+    public Task RekeyAsync(DatabaseCredential? credential, string name, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(name);
+        cancellationToken.ThrowIfCancellationRequested();
+        return name == "main" ? RekeyAsync(credential, cancellationToken)
+            : WithAttachmentAsync(name, target => target.RekeyAsync(credential, cancellationToken));
+    }
+
     /// <summary>Rewrite live records under a fresh data key, or decrypt when credential is null. Requires an idle file owner.</summary>
     public async Task RekeyAsync(DatabaseCredential? credential, CancellationToken cancellationToken = default)
     {

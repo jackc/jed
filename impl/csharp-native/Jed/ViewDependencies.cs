@@ -2,7 +2,27 @@ namespace Jed;
 
 internal static partial class StatementExecution
 {
-    internal static CatalogViewDependency[] ViewDependencies(SelectSyntax query, Catalog catalog)
+    private static void RevalidateViews(Database database, PendingDatabase pending, string name, byte kind, Meter meter, CancellationToken token)
+    {
+        var dependents = (pending.Catalog.Views ?? []).Where(view => view.Dependencies.Any(dependency => dependency.Kind == kind && dependency.Name == name)).OrderBy(view => view.Name, Utf8NameComparer.Instance).ToArray();
+        var definitions = dependents.Select(ViewQuery).ToArray(); // Unreadable stored definitions take precedence.
+        for (var at = 0; at < dependents.Length; at++)
+        {
+            var view = dependents[at]; var body = definitions[at];
+            try
+            {
+                _ = RelationExecution.Query(body, database, pending.Before, pending, pending.Catalog, meter, token);
+                var actual = ViewDependencies(body, pending.Catalog);
+                if (actual.Length != view.Dependencies.Length || actual.Where((dependency, index) =>
+                    dependency.Kind != view.Dependencies[index].Kind || dependency.Name != view.Dependencies[index].Name ||
+                    !dependency.Columns.SequenceEqual(view.Dependencies[index].Columns)).Any())
+                    throw Errors.Unsupported("alteration changes a dependent view binding");
+            }
+            catch (SqlException error) when (error.SqlState != SqlStates.UnparsableStoredDefinition)
+            { throw Errors.Unsupported("alteration invalidates a dependent view"); }
+        }
+    }
+    internal static CatalogViewDependency[] ViewDependencies(SelectSyntax query, Catalog catalog, Action<string, string>? viewColumn = null)
     {
         var dependencies = new Dictionary<(byte Kind, string Name), HashSet<string>>();
         Catalog Home(string name) => catalog.Scope?.Resolve(name).Catalog ?? catalog;
@@ -17,14 +37,25 @@ internal static partial class StatementExecution
             if (type.Kind == SqlKind.Composite && type.Identity != "record") Add(3, type.Identity!);
             if (type.Element is { } element) Type(element);
         }
-        void Expr(Expression expression, List<(string Label, string Table)> scope, HashSet<string> ctes)
+        void Expr(Expression expression, List<(string Label, string Table, string[]? Aliases)> scope, HashSet<string> ctes)
         {
             if (expression.Op == "parameter") throw new SqlException(SqlStates.UndefinedParameter, "view cannot contain parameters");
             if (expression.Op == "name")
             {
                 var dot = expression.Text.LastIndexOf('.'); var name = expression.Text[(dot + 1)..]; var label = dot < 0 ? null : expression.Text[..dot];
                 foreach (var source in scope.Where(source => label is null || source.Label == label))
-                    if (SourceTable(source.Table) is { } table && table.Columns.Any(column => column.Name == name)) Add(0, table.Name, name);
+                {
+                    if (SourceTable(source.Table) is { } table)
+                    {
+                        for (var ordinal = 0; ordinal < table.Columns.Length; ordinal++)
+                            if ((source.Aliases is { } aliases && ordinal < aliases.Length ? aliases[ordinal] : table.Columns[ordinal].Name) == name)
+                                Add(0, table.Name, table.Columns[ordinal].Name);
+                    }
+                    else if ((Home(source.Table).Views ?? []).FirstOrDefault(view => view.Name == DatabaseDomains.Name(source.Table).Local) is { } view)
+                        for (var ordinal = 0; ordinal < view.Columns.Length; ordinal++)
+                            if ((source.Aliases is { } aliases && ordinal < aliases.Length ? aliases[ordinal] : view.Columns[ordinal].Name) == name)
+                                viewColumn?.Invoke(view.Name, view.Columns[ordinal].Name);
+                }
             }
             if (expression.Op == "star")
                 foreach (var source in scope.Where(source => expression.Text.Length == 0 || source.Label == expression.Text))
@@ -38,19 +69,20 @@ internal static partial class StatementExecution
                 Add(2, DatabaseDomains.Name(name).Local);
             }
             if (expression.Query is { } body) Query(body, scope, ctes);
-            foreach (var argument in expression.Args) Expr(argument, scope, ctes);
+            foreach (var argument in expression.Args)
+                if (!(expression.Op == "call" && expression.Text == "count" && argument.Op == "star")) Expr(argument, scope, ctes);
             if (expression.Predicate is { } predicate) Expr(predicate, scope, ctes);
             foreach (var order in expression.AggregateOrder ?? []) Expr(order.Expression, scope, ctes);
             if (expression.Window is { } window) Window(window, scope, ctes);
         }
-        void Window(WindowSyntax window, List<(string Label, string Table)> scope, HashSet<string> ctes)
+        void Window(WindowSyntax window, List<(string Label, string Table, string[]? Aliases)> scope, HashSet<string> ctes)
         {
             foreach (var expression in window.Partition) Expr(expression, scope, ctes);
             foreach (var order in window.Order) Expr(order.Expression, scope, ctes);
             if (window.Frame?.Start.Offset is { } start) Expr(start, scope, ctes);
             if (window.Frame?.End.Offset is { } end) Expr(end, scope, ctes);
         }
-        void Relation(RelationSyntax? relation, List<(string Label, string Table)> scope, HashSet<string> ctes)
+        void Relation(RelationSyntax? relation, List<(string Label, string Table, string[]? Aliases)> scope, HashSet<string> ctes)
         {
             switch (relation)
             {
@@ -59,7 +91,7 @@ internal static partial class StatementExecution
                 case TableRelation table when !ctes.Contains(table.Name):
                 {
                     var local = DatabaseDomains.Name(table.Name).Local;
-                    scope.Add((table.Alias ?? local, table.Name));
+                    scope.Add((table.Alias ?? local, table.Name, table.ColumnAliases));
                     var home = Home(table.Name);
                     if (catalog.Scope?.Resolve(table.Name).Name is { } domain && domain is not ("main" or "temp")) throw Errors.Unsupported("view body references an attached database");
                     if (home.Tables.Any(item => item.Name == local)) Add(0, local);
@@ -83,7 +115,7 @@ internal static partial class StatementExecution
                     break;
             }
         }
-        void Query(SelectSyntax body, List<(string Label, string Table)> outer, HashSet<string> inherited)
+        void Query(SelectSyntax body, List<(string Label, string Table, string[]? Aliases)> outer, HashSet<string> inherited)
         {
             var ctes = new HashSet<string>(inherited, StringComparer.Ordinal);
             foreach (var cte in body.With ?? [])
@@ -91,7 +123,7 @@ internal static partial class StatementExecution
                 if (body.Recursive) ctes.Add(cte.Name);
                 Query(cte.Query, [], ctes); ctes.Add(cte.Name);
             }
-            var scope = new List<(string Label, string Table)>(); Relation(body.Relation, scope, ctes);
+            var scope = new List<(string Label, string Table, string[]? Aliases)>(); Relation(body.Relation, scope, ctes);
             if (body.Relation is null && body.Table is { } name) Relation(new TableRelation(name, body.TableAlias), scope, ctes);
             scope.AddRange(outer.Where(source => !scope.Any(inner => inner.Label == source.Label)));
             foreach (var item in body.Items) Expr(item.Expression, scope, ctes);
@@ -124,7 +156,7 @@ internal static partial class StatementExecution
             if (alter.Value!.StartsWith("jed_", StringComparison.Ordinal)) throw new SqlException(SqlStates.ReservedName, "reserved view name");
             RenameViews(pending, view.Name, alter.Value!, 1);
             pending.Catalog = pending.Catalog with { Views = (pending.Catalog.Views ?? []).Select(item => item.Name == view.Name ? item with { Name = alter.Value! } : item).ToArray() };
-            pending.Changed = true; return new([], []);
+            pending.Changed = true; RevalidateViews(database, pending, alter.Value!, 1, meter, token); return new([], []);
         }
         if (alter.Operation is "rename_column" or "default")
         {
@@ -160,7 +192,7 @@ internal static partial class StatementExecution
             if (options.Check != 0 && !UpdatableView(ViewQuery(view))) throw Errors.Unsupported("CHECK OPTION requires an updatable view");
             view = view with { CheckOption = options.Check, SecurityBarrier = options.Barrier, SecurityInvoker = options.Invoker };
         }
-        pending.Catalog = pending.Catalog with { Views = (pending.Catalog.Views ?? []).Select(item => item.Name == view.Name ? view : item).ToArray() }; pending.Changed = true; return new([], []);
+        pending.Catalog = pending.Catalog with { Views = (pending.Catalog.Views ?? []).Select(item => item.Name == view.Name ? view : item).ToArray() }; pending.Changed = true; RevalidateViews(database, pending, view.Name, 1, meter, token); return new([], []);
     }
     private static string RewriteViewRelation(string text, string before, string after, string[]? exposedColumns = null, int renamedColumn = -1, int droppedColumn = -1)
     {
@@ -258,6 +290,8 @@ internal static partial class StatementExecution
     }
     private static void RenameViews(PendingDatabase pending, string before, string after, byte kind, string[]? columns = null, int renamedColumn = -1, string? renamedTo = null)
     {
+        foreach (var view in pending.Catalog.Views ?? [])
+            if (view.Dependencies.Any(dependency => dependency.Kind == kind && dependency.Name == before)) _ = ViewQuery(view);
         EditScopedViews(pending, views => views.Select(view => view.Dependencies.Any(dependency => dependency.Kind == kind && dependency.Name == before) ? view with {
             Definition = RewriteViewRelation(view.Definition, before, after, columns, renamedColumn),
             Dependencies = view.Dependencies.Select(dependency => dependency.Kind == kind && dependency.Name == before ? dependency with { Name = after,

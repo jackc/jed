@@ -2,6 +2,12 @@ namespace Jed;
 
 internal static partial class StatementExecution
 {
+    internal static bool ViewBooleanOption(string value)
+    {
+        try { return Resolve.ParseText(value, SqlType.Boolean).AsBoolean(); }
+        catch (SqlException error) when (error.SqlState == SqlStates.InvalidTextRepresentation)
+        { throw new SqlException(SqlStates.InvalidParameterValue, "invalid boolean view option"); }
+    }
     internal static SelectSyntax ViewQuery(CatalogView view)
     {
         try { return new Parser(view.Definition).Parse(); }
@@ -20,7 +26,7 @@ internal static partial class StatementExecution
                 continue;
             }
             if (name == "check_option") { check = TextEncoding.FoldName(value) switch { "local" => 1, "cascaded" => 2, _ => throw new SqlException(SqlStates.InvalidParameterValue, "invalid check option") }; continue; }
-            var enabled = TextEncoding.FoldName(value) switch { "true" or "on" or "1" or "yes" => true, "false" or "off" or "0" or "no" => false, _ => throw new SqlException(SqlStates.InvalidParameterValue, "invalid boolean view option") };
+            var enabled = ViewBooleanOption(value);
             if (name == "security_barrier") barrier = enabled;
             else if (name == "security_invoker") invoker = enabled;
             else throw new SqlException(SqlStates.InvalidParameterValue, "unknown view option");
@@ -35,6 +41,7 @@ internal static partial class StatementExecution
     {
         if (create.Name.StartsWith("jed_", StringComparison.Ordinal)) throw new SqlException(SqlStates.ReservedName, "reserved view name");
         if (create.IfNotExists && RelationExists(pending.Catalog, create.Name)) return new([], []);
+        ViewLimits.Validate(create.Query, pending.Catalog, baseDepth: 1);
         _ = ViewDependencies(create.Query, pending.Catalog);
         var query = RelationExecution.Query(create.Query, database, pending.Before, pending, pending.Catalog, meter, token);
         if (create.CheckOption != 0 && create.Options.Any(option => option.Name == "check_option")) throw new SqlException(SqlStates.InvalidParameterValue, "view check option specified more than once");
@@ -45,6 +52,8 @@ internal static partial class StatementExecution
         if (names.Distinct(StringComparer.Ordinal).Count() != names.Length) throw new SqlException(SqlStates.DuplicateColumn, "duplicate view column");
         if (query.Columns.Any(column => column.Type.Identity == "record" || column.Type.Element?.Identity == "record")) throw new SqlException(SqlStates.InvalidTableDefinition, "view column has anonymous record type");
         var definition = FreezeViewStars(create.Query, create.Definition, database, pending, meter, token);
+        try { _ = RelationExecution.Query(new Parser(definition).Parse(), database, pending.Before, pending, pending.Catalog, meter, token); }
+        catch (SqlException error) when (error.SqlState == SqlStates.AmbiguousColumn) { throw Errors.Unsupported("stored star expansion has ambiguous names"); }
         var parsed = new Parser(definition).Parse();
         var dependencies = ViewDependencies(parsed, pending.Catalog);
         var old = (pending.Catalog.Views ?? []).FirstOrDefault(view => view.Name == create.Name);
@@ -71,10 +80,25 @@ internal static partial class StatementExecution
         if (dependencies.Where(dependency => dependency.Kind == 1).Any(dependency => Reaches(dependency.Name, []))) throw new SqlException(SqlStates.InvalidObjectDefinition, "recursive view definition");
         var view = new CatalogView(create.Name, names.Select((name, i) => new CatalogViewColumn(name, old is not null && i < old.Columns.Length ? old.Columns[i].DefaultExpression : null)).ToArray(), definition, dependencies, options.Check, options.Barrier, options.Invoker);
         var candidate = pending.Catalog with { Views = (pending.Catalog.Views ?? []).Where(item => item.Name != view.Name).Append(view).ToArray() };
-        foreach (var dependent in (pending.Catalog.Views ?? []).Where(item => item.Name != view.Name && item.Dependencies.Any(dependency => dependency.Kind == 1 && dependency.Name == view.Name)))
-            try { _ = RelationExecution.Query(ViewQuery(dependent), database, pending.Before, pending, candidate, meter, token); }
-            catch (SqlException) { throw Errors.Unsupported("replacement invalidates a dependent view"); }
-        pending.Catalog = candidate; pending.Changed = true; return new([], []);
+        var affectedViews = DependentViews(pending.Catalog, [view.Name], 1);
+        pending.Catalog = candidate;
+        foreach (var dependent in (candidate.Views ?? []).Where(item => affectedViews.Contains(item.Name)).OrderBy(item => item.Name, Utf8NameComparer.Instance))
+        {
+            var dependentBody = ViewQuery(dependent);
+            try
+            {
+                _ = RelationExecution.Query(dependentBody, database, pending.Before, pending, candidate, meter, token);
+                _ = ViewDependencies(dependentBody, candidate, (source, column) =>
+                {
+                    if (source == view.Name && old is not null && !old.Columns.Any(item => item.Name == column))
+                        throw Errors.Unsupported("replacement captures a dependent view column");
+                });
+            }
+            catch (SqlException error) when (error.SqlState != SqlStates.UnparsableStoredDefinition)
+            { throw Errors.Unsupported("replacement invalidates a dependent view"); }
+        }
+        RevalidateViews(database, pending, view.Name, 1, meter, token);
+        pending.Changed = true; return new([], []);
     }
     private static string FreezeViewStars(SelectSyntax query, string definition, Database database, PendingDatabase pending, Meter meter, CancellationToken token)
     {

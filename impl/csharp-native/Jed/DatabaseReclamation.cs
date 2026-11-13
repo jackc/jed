@@ -16,7 +16,7 @@ public sealed partial class Database
         {
             var oldest = pins.Count == 0 ? ulong.MaxValue : pins.Keys.Min();
             if (fileState!.Ledger!.OldestPin is { } remoteOldest) oldest = Math.Min(oldest, remoteOldest);
-            if (oldest < before.Meta.TransactionId) return;
+            if (oldest <= before.Meta.TransactionId) return;
         }
         var snapshot = await OwnerSnapshotAsync(token).ConfigureAwait(false);
         var pending = new PendingDatabase(snapshot) { Changed = true, Role = role, StorageBefore = before };

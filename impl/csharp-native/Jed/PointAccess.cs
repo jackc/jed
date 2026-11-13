@@ -54,8 +54,15 @@ internal static class PointAccess
     private static TableScan[]? Member(Resolved filter, CatalogTable table, bool adjacent)
     {
         var slot = table.PrimaryKey[0]; var type = table.Columns[slot].Type.Type;
+        bool InvalidLeaf(Resolved expression)
+        {
+            if (expression.Op == "or") return expression.Args.Any(InvalidLeaf);
+            return PredicatePlan.Conjuncts(expression).Count(term => term.Op == "quantified" && term.Text == "= any") > 1;
+        }
         List<byte[]>? Points(Resolved expression)
         {
+            if (InvalidLeaf(expression)) return null;
+            if (expression.Op == "quantified" && expression.Args[1] is { Op: "array" } literalArray && literalArray.Type.Element != type && !(type.IsInteger() && literalArray.Args.All(arg => arg.Op == "constant" && arg.Type.IsInteger()))) return null;
             if (expression.Op == "and")
             {
                 var a = Points(expression.Args[0]); var b = Points(expression.Args[1]);
@@ -80,8 +87,8 @@ internal static class PointAccess
             {
                 if (expression.Subquery!.Initialized) { column = expression.Args[0]; values = expression.Subquery.Values; }
             }
-            else if (expression.Op == "quantified" && expression.Text == "= any" && expression.Args[1] is { Op: "array" } array && array.Type.Element == type && array.Args.All(arg => arg.Op == "constant"))
-            { column = expression.Args[0]; values = array.Args.Select(arg => arg.Constant); }
+            else if (expression.Op == "quantified" && expression.Text == "= any" && expression.Args[1] is { Op: "array", Text: not "nested" } array && array.Args.All(arg => AccessConstant.Try(arg, out _)))
+            { column = expression.Args[0]; values = array.Args.Select(arg => { AccessConstant.Try(arg, out var value); return value; }); }
             else if (expression.Op == "quantified" && expression.Text == "= any" && expression.Args[1].Op == "constant")
             {
                 column = expression.Args[0]; var value = expression.Args[1].Constant;
@@ -92,15 +99,14 @@ internal static class PointAccess
             var result = new List<byte[]>();
             foreach (var value in values)
             {
-                if (value.IsNull) continue;
-                if (value.Type != type && !(value.Type.IsInteger() && type.IsInteger())) return null;
-                try { result.Add(KeyEncoding.Encode(Resolve.Cast(value, type), collation: table.Columns[slot].CollationData)); }
-                catch (SqlException error) when (error.SqlState == SqlStates.NumericValueOutOfRange) { }
+                if (!AccessConstant.Point(value, type, out var point)) return null;
+                if (point is not null) result.Add(KeyEncoding.Encode(point.Value, collation: table.Columns[slot].CollationData));
             }
             return result;
         }
         TableScan[]? Reduce(Resolved expression)
         {
+            if (InvalidLeaf(expression)) return null;
             if (expression.Op is "or" or "and")
             {
                 var left = Reduce(expression.Args[0]); var right = Reduce(expression.Args[1]);
@@ -115,12 +121,15 @@ internal static class PointAccess
             if (column.Op == "constant") (column, value) = (value, column);
             if (column.Op != "column" || column.Slot != slot || value.Op != "constant" || !TableAccess.Compatible(expression, table.Columns[slot])) return null;
             if (value.Constant.IsNull) return [];
-            if (value.Type != type) return null;
+            if (value.Type != type && !(value.Type.IsInteger() && type.IsInteger())) return null;
             var range = TableAccess.Bounds(expression, table);
             return range.Empty ? [] : [range];
         }
-        var points = Points(filter);
         var bounds = TableAccess.Bounds(filter, table);
+        var memberTerms = PredicatePlan.Conjuncts(filter).Where(term => PredicatePlan.Slots(term).SetEquals([slot])).ToArray();
+        if (memberTerms.Any(term => HasSet(term, slot)) && PredicatePlan.Combine(memberTerms) is { } member && Reduce(member) is { } reduced)
+            return bounds.Empty ? [] : KeyIntervals.Canonical(reduced.Select(range => KeyIntervals.Intersect(range, bounds)).OfType<TableScan>(), adjacent);
+        var points = Points(filter);
         if (points is null)
         {
             foreach (var term in PredicatePlan.Conjuncts(filter))

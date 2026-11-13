@@ -36,8 +36,31 @@ internal static class DatabaseImageTests
             await HostTests.Error(SqlStates.UndefinedObject, async () => { _ = await database.SerializeAsync("temp"); });
         }
         var encrypted = await File.ReadAllBytesAsync(Path.Combine(root, "spec/fileformat/fixtures/encrypted_empty_db.jed"));
+        await NamedAttachments();
         await HostTests.Error(SqlStates.ObjectNotInPrerequisiteState, async () => { await using var invalid = await Database.DeserializeAsync(encrypted); });
         await HostTests.Error(SqlStates.DataCorrupted, async () => { await using var invalid = await Database.DeserializeAsync(new byte[12]); });
         Console.WriteLine($"PASS database images: {names.Length} complete byte-exact shared images, input ownership, committed-only export, independent imported commits and invalid/encrypted image rejection");
+    }
+
+    private static async Task NamedAttachments()
+    {
+        await using var database = await Database.CreateInMemoryAsync();
+        await database.AttachInMemoryAsync("ExactName");
+        await database.AttachInMemoryAsync("readonly", readOnly: true);
+        await using var session = database.CreateSession();
+        await DatabaseFileTests.Exec(session, "CREATE TABLE \"ExactName\".t(id i32 PRIMARY KEY)");
+        await DatabaseFileTests.Exec(session, "INSERT INTO \"ExactName\".t VALUES(7)");
+        var version = database.Version;
+        await database.CompactAsync("ExactName");
+        Corpus.Equal(version, database.Version, "attachment compaction leaves main generation unchanged");
+        var image = await database.SerializeAsync("ExactName");
+        await using var copy = await Database.DeserializeAsync(image);
+        await using var read = copy.CreateSession();
+        Corpus.Equal("7", await DatabaseFileTests.Scalar(read, "SELECT id FROM t"), "named export selects attachment committed root");
+        await HostTests.Error(SqlStates.ReadOnlySqlTransaction, () => database.CompactAsync("readonly"));
+        await HostTests.Error(SqlStates.UndefinedObject, () => database.CompactAsync("exactname"));
+        await HostTests.Error(SqlStates.UndefinedObject, () => database.RekeyAsync(null, "temp"));
+        await database.DetachAsync("ExactName");
+        Corpus.Equal(false, database.AttachedDatabases.Contains("ExactName"), "named maintenance releases registry lease");
     }
 }

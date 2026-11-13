@@ -62,6 +62,7 @@ public sealed partial class Session
                     if (domainTransaction is null)
                     {
                         await StatementExecution.TemporaryCommit(scope, innerMeter, token).ConfigureAwait(false);
+                        await lease!.ReleaseWriterPinsForCommitAsync().ConfigureAwait(false);
                         await Database.CommitDomainsAsync(scope, token).ConfigureAwait(false);
                         outerMeter.Memory.HoldPending(0);
                     }

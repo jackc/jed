@@ -66,6 +66,8 @@ internal sealed class SimulationTranscript : IDisposable
     internal SimulationTranscript Number(string name, long value) { writer.WriteNumber(name, value); return this; }
     internal SimulationTranscript Number(string name, ulong value) { writer.WriteNumber(name, value); return this; }
     internal SimulationTranscript Flag(string name, bool value) { writer.WriteBoolean(name, value); return this; }
+    internal SimulationTranscript Object(string name) { writer.WriteStartObject(name); return this; }
+    internal SimulationTranscript EndObject() { writer.WriteEndObject(); return this; }
     internal string End()
     {
         writer.WriteEndObject(); writer.Flush();

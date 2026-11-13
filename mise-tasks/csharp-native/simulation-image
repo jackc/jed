@@ -1,0 +1,13 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#MISE description="Explicit opt-in: inspect authenticated native storage topology in a simulated image"
+#USAGE flag "--no-build" help="Use an existing Release diagnostic assembly"
+#USAGE arg "<path>" help="Image path"
+#USAGE arg "<key>" help="Simulation credential number, or -1 for plaintext"
+require_relative "../../impl/csharp-native/Tools/tasks"
+arguments = ["simulation-image", File.expand_path(ENV.fetch("usage_path")), ENV.fetch("usage_key")]
+if ENV["usage_no_build"] == "true"
+  CSharpNativeTasks.run(File.join(CSharpNativeTasks::PACKAGE, "Jed.Check/bin/Release/net11.0/Jed.Check.dll"), *arguments)
+else
+  CSharpNativeTasks.check(*arguments)
+end

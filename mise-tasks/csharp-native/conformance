@@ -1,7 +1,9 @@
 #!/usr/bin/env ruby
 # frozen_string_literal: true
 #MISE description="Explicit opt-in: attempt selected C# corpus files; unsupported behavior fails"
-#USAGE flag "--disk" help="Use native file-backed handles and real scratch storage"
+#USAGE flag "--disk" help="Reopen a native file handle before every record"
+#USAGE flag "--encrypted" help="Use encrypted disk records and write a cost/EXPLAIN transcript for peer comparison"
+#USAGE flag "--no-build" help="Use an existing Release assembly"
 #USAGE flag "--all" help="Attempt every pinned SQL corpus file (incomplete experiment will fail)"
 #USAGE flag "--suite <name>" help="One directory of complete frozen corpus files"
 #USAGE flag "--match <pattern>" help="Complete frozen files whose basenames match this glob"
@@ -27,4 +29,11 @@ else
 end
 abort "No corpus files selected" if files.empty?
 abort "Every selected file must exist and end in .test" unless files.all? { |f| File.file?(f) && f.end_with?(".test") }
-CSharpNativeTasks.check(ENV["usage_disk"] == "true" ? "corpus-file" : "corpus", *files)
+encrypted = ENV["usage_encrypted"] == "true"
+ENV["JED_CONFORMANCE_TRANSCRIPT"] ||= File.join(CSharpNativeTasks::BUILD, "conformance-encrypted.tsv") if encrypted
+mode = encrypted ? "corpus-encrypted" : ENV["usage_disk"] == "true" ? "corpus-file" : "corpus"
+if ENV["usage_no_build"] == "true"
+  CSharpNativeTasks.run(File.join(CSharpNativeTasks::PACKAGE, "Jed.Check/bin/Release/net11.0/Jed.Check.dll"), mode, *files)
+else
+  CSharpNativeTasks.check(mode, *files)
+end

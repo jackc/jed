@@ -27,7 +27,8 @@ internal static class DistinctOnResolve
         var used = new HashSet<int>(); var suffix = false; var count = 0; var effective = order.ToList();
         foreach (var item in order)
         {
-            var slot = resolved.FindIndex(key => Resolve.Equivalent(key, item.Expression));
+            var identity = item.OutputIndex is { } output ? projections[output].Expression : item.Expression;
+            var slot = resolved.FindIndex(key => Resolve.Equivalent(key, identity));
             if (slot < 0) { suffix = true; continue; }
             if (suffix) throw Invalid();
             used.Add(slot); count++;

@@ -6,7 +6,8 @@ internal sealed record LateralRelation(RelationSyntax Source) : RelationSyntax;
 internal sealed record AliasedRelation(RelationSyntax Source, string Alias, string[]? ColumnAliases) : RelationSyntax;
 internal sealed record SetRelation(SelectSyntax Left, SelectSyntax Right, string Operation, bool All) : RelationSyntax;
 internal sealed record ValuesRelation(Expression[][] Values) : RelationSyntax;
-internal sealed record TableRelation(string Name, string? Alias = null, string[]? ColumnAliases = null) : RelationSyntax;
+internal sealed record TableRelation(string Name, string? Alias = null, string[]? ColumnAliases = null) : RelationSyntax
+{ internal int ParseDepth { get; init; } = 1; }
 internal sealed record RecordColumnSyntax(string Name, string TypeName);
 internal sealed record FunctionRelation(Expression Function, string? Alias = null, string[]? ColumnAliases = null, RecordColumnSyntax[]? Definitions = null) : RelationSyntax;
 internal sealed record DerivedRelation(SelectSyntax Query, string? Alias = null, string[]? ColumnAliases = null) : RelationSyntax;
@@ -46,13 +47,14 @@ internal sealed partial class Parser
         }
         return left;
     }
+    private bool insertValuesSource;
     private ValuesRelation ValuesBody()
     {
         Expect("values"); var rows = new List<Expression[]>();
         do
         {
             Expect("("); var values = new List<Expression>();
-            do { if (Is("default")) throw Errors.Syntax("DEFAULT is only valid in INSERT VALUES"); values.Add(Expr()); } while (Eat(","));
+            do { if (Is("default") && !insertValuesSource) throw Errors.Syntax("DEFAULT is only valid in INSERT VALUES"); values.Add(Eat("default") ? Node("default", "") : Expr()); } while (Eat(","));
             Expect(")");
             if (rows.Count != 0 && values.Count != rows[0].Length) throw Errors.Syntax("VALUES rows have different lengths");
             rows.Add(values.ToArray());
@@ -81,6 +83,7 @@ nesting--;
             var name = QualifiedName();
             if (Eat("("))
             {
+                if (DatabaseDomains.Name(name).Domain is not null) throw Errors.Syntax("qualified function calls are not supported");
                 if (name == "json_table") source = new FunctionRelation(JsonTable());
                 else
                 {
@@ -97,7 +100,7 @@ nesting--;
                 source = new FunctionRelation(Node("call", name, args.ToArray()));
                 }
             }
-            else source = new TableRelation(name);
+            else source = new TableRelation(name) { ParseDepth = nesting + 1 };
         }
         var explicitAlias = Eat("as");
         var alias = explicitAlias && Is("(") ? null : explicitAlias ? Name() : token.Kind == TokenKind.QuotedName || token.Kind == TokenKind.Word && !Clause(token.Text) ? Name() : null;

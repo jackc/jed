@@ -216,7 +216,7 @@ public sealed partial class Database : IAsyncDisposable
     {
         CheckPendingRole(pending);
         if (!pending.Changed) return;
-        var prepared = await PrepareCommitAsync(pending, "main", cancellationToken).ConfigureAwait(false);
+        var prepared = await PrepareCommitAsync(pending, "main", cancellationToken, durability: true).ConfigureAwait(false);
         await DomainPublication.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
@@ -244,9 +244,15 @@ public sealed partial class Database : IAsyncDisposable
         else _ = await PrepareCommitAsync(pending, name, cancellationToken).ConfigureAwait(false);
     }
     private sealed record PreparedCommit(PendingDatabase Pending, Catalog Catalog, StorageCommitPlan Plan);
-    private async ValueTask<PreparedCommit> PrepareCommitAsync(PendingDatabase pending, string name, CancellationToken cancellationToken, bool compacted = false)
+    private async ValueTask<PreparedCommit> PrepareCommitAsync(PendingDatabase pending, string name, CancellationToken cancellationToken, bool compacted = false, bool durability = false)
     {
         CheckPendingRole(pending);
+        long? deadline = null;
+        if (durability && !ephemeral && pending.FileWrite is null)
+        {
+            deadline = await PrepareCommitPolicyAsync(cancellationToken).ConfigureAwait(false);
+            pending.StorageBefore = committer.Current;
+        }
         var beforeStorage = pending.StorageBefore ?? committer.Current;
         HashSet<uint> reuse; bool canReclaim;
         lock (gate)
@@ -254,7 +260,9 @@ public sealed partial class Database : IAsyncDisposable
             Check();
             var oldest = pins.Count == 0 ? ulong.MaxValue : pins.Keys.Min();
             if (fileState?.Ledger?.OldestPin is { } remoteOldest) oldest = Math.Min(oldest, remoteOldest);
-            canReclaim = oldest >= beforeStorage.Meta.TransactionId;
+            // The new free list describes the generation being committed.
+            // A reader of the previous current root still pins an older version.
+            canReclaim = oldest > beforeStorage.Meta.TransactionId;
             reuse = !ephemeral ? oldest >= beforeStorage.FreeGeneration ? new(beforeStorage.FreePages) : []
                 : beforeStorage.FreePages.Where(page => !retiredAt.TryGetValue(page, out var at) || at <= oldest).ToHashSet();
         }
@@ -322,7 +330,7 @@ public sealed partial class Database : IAsyncDisposable
                 if (!repair) throw new SqlException(SqlStates.StorageLimitExceeded, $"storage of database \"{name}\" exceeded the limit of {MaxStorageBytes} bytes");
             }
         }
-        return new(pending, catalog with { Pages = encoded.Pages }, plan);
+        return new(pending, catalog with { Pages = encoded.Pages }, plan with { DeadlineMicroseconds = deadline });
     }
     private void AdoptPreparedCommit(PreparedCommit prepared)
     {
@@ -339,6 +347,7 @@ public sealed partial class Database : IAsyncDisposable
                 fileState.CatalogDirty = false;
             }
         }
+        FinishCommitPolicy();
     }
     private void Check()
     {

@@ -28,15 +28,27 @@ internal static class SqlSpillTests
                     "SELECT id, g FROM t ORDER BY g, id DESC",
                     "SELECT id FROM t ORDER BY length(pad), id DESC LIMIT 21 OFFSET 3",
                     "SELECT id FROM t ORDER BY g LIMIT 15",
+                    "SELECT DISTINCT g FROM t",
+                    "SELECT DISTINCT g FROM t LIMIT 3 OFFSET 2",
+                    "SELECT DISTINCT g, length(pad) FROM t ORDER BY g DESC, length(pad) LIMIT 15 OFFSET 2",
+                    "SELECT a.id, b.id FROM t a JOIN t b ON a.g = b.g ORDER BY a.id, b.id",
+                    "SELECT a.id, b.id FROM t a LEFT JOIN t b ON a.g = b.g AND a.g <> 6 ORDER BY a.id",
+                    "SELECT g, count(*), sum(id), avg(id), min(pad), max(pad), count(DISTINCT pad) FROM t GROUP BY g ORDER BY g",
+                    "SELECT g, array_agg(id ORDER BY id DESC), string_agg(pad, ',' ORDER BY id), jsonb_agg(id) FROM t GROUP BY g ORDER BY g",
+                    "SELECT g, var_pop(id), stddev_samp(id::f64), percentile_cont(0.5) WITHIN GROUP (ORDER BY id), mode() WITHIN GROUP (ORDER BY pad) FROM t GROUP BY g ORDER BY g",
+                    "SELECT g, rank(50) WITHIN GROUP (ORDER BY id), dense_rank('pp') WITHIN GROUP (ORDER BY pad), json_object_agg(id::text, pad) FROM t GROUP BY g ORDER BY g",
+                    "SELECT g, sum(id) FROM t GROUP BY GROUPING SETS ((g), ()) ORDER BY g",
                     "SELECT id FROM t ORDER BY length(pad) LIMIT 0 OFFSET 8" })
                 {
                     database.SetWorkMem(0);
                     var resident = await Collect(session, sql, 0);
                     database.SetWorkMem(128); var before = counter.Created;
-                    var spilled = await Collect(session, sql, 1);
+                    (string Values, long Cost) spilled;
+                    try { spilled = await Collect(session, sql, 1); }
+                    catch (Exception error) { throw new InvalidDataException("SQL spill failed: " + sql, error); }
                     Corpus.Equal(resident.Values, spilled.Values, "SQL spill values and stable order");
                     Corpus.Equal(resident.Cost, spilled.Cost, "SQL spill cost invariance");
-                    Corpus.Equal(true, counter.Created > before, "SQL operator used real scratch files");
+                    Corpus.Equal(!sql.Contains("LIMIT 0", StringComparison.Ordinal), counter.Created > before, "nonempty sort/operator uses scratch; zero-capacity heap retains nothing");
                 }
                 database.SetWorkMem(128);
                 await using (var rows = await session.QueryAsync("SELECT id FROM t ORDER BY pad, id", new QueryOptions { MaxQueryMemoryBytes = 1 }))

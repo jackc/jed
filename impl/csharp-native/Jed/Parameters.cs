@@ -139,6 +139,7 @@ internal sealed class Parameters
         var target = statement switch { InsertSyntax insert => insert.Table, UpdateSyntax update => update.Table, DeleteSyntax delete => delete.Table, _ => null };
         if (pending is not null && (catalog.Views ?? []).FirstOrDefault(view => view.Name == target) is { } view)
             statement = StatementExecution.RewriteView(database, pending, statement, view, meter, token);
+        CatalogTable TargetTable(string name) => localDomain && DatabaseDomains.Name(name).Domain is null ? StatementExecution.Table(catalog, name) : StatementExecution.ResolveTable(catalog, name);
         BoundColumn[] Query(SelectSyntax query) => RelationExecution.Query(query, database, snapshot, pending, catalog, meter, token, scope: scope).Columns;
         BoundColumn[] Returning(CatalogTable table, SelectItem[] items, BoundColumn[]? viewColumns = null, ReturningAliases? aliases = null)
         {
@@ -160,7 +161,7 @@ internal sealed class Parameters
                 ? WritableCteExecution.Prepare(database, pending, create.Query.With!, create.Query.Recursive, create.Query with { With = null }, meter, token).Columns : Query(create.Query);
             case InsertSyntax insert:
             {
-                var table = StatementExecution.Table(catalog, insert.Table); var binder = new SubqueryBinder([], database, snapshot, pending, catalog, meter, token, scope);
+                var table = TargetTable(insert.Table); var binder = new SubqueryBinder([], database, snapshot, pending, catalog, meter, token, scope);
                 var targets = insert.Columns is null ? table.Columns : insert.Columns.Select(name => table.Columns.FirstOrDefault(column => column.Name == name) ?? throw new SqlException(SqlStates.UndefinedColumn, "column does not exist")).ToArray();
                 foreach (var row in insert.Values)
                 {
@@ -186,14 +187,14 @@ internal sealed class Parameters
             }
             case UpdateSyntax update:
             {
-                var table = StatementExecution.Table(catalog, update.Table); var binder = new SubqueryBinder(update.ViewBinding?.Columns ?? StatementExecution.Columns(table), database, snapshot, pending, catalog, meter, token, scope);
+                var table = TargetTable(update.Table); var binder = new SubqueryBinder(update.ViewBinding?.Columns ?? StatementExecution.Columns(table), database, snapshot, pending, catalog, meter, token, scope);
                 foreach (var assignment in update.Assignments) Assign(assignment.Value, table.Columns.FirstOrDefault(column => column.Name == assignment.Column) ?? throw new SqlException(SqlStates.UndefinedColumn, "column does not exist"), binder);
                 if (update.Filter is { } filter) _ = Resolve.Expr(binder.Bind(filter), SqlType.Boolean);
                 return Returning(table, update.Returning, update.ViewBinding?.Returning, update.ReturningAliases);
             }
             case DeleteSyntax delete:
             {
-                var table = StatementExecution.Table(catalog, delete.Table); var binder = new SubqueryBinder(delete.ViewBinding?.Columns ?? StatementExecution.Columns(table), database, snapshot, pending, catalog, meter, token, scope);
+                var table = TargetTable(delete.Table); var binder = new SubqueryBinder(delete.ViewBinding?.Columns ?? StatementExecution.Columns(table), database, snapshot, pending, catalog, meter, token, scope);
                 if (delete.Filter is { } filter) _ = Resolve.Expr(binder.Bind(filter), SqlType.Boolean);
                 return Returning(table, delete.Returning, delete.ViewBinding?.Returning, delete.ReturningAliases);
             }

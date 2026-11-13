@@ -7,21 +7,40 @@ internal static class RecursiveExecution
     internal static PreparedRelation Prepare(CteSyntax definition, Database database, DatabaseSnapshot snapshot,
         PendingDatabase? pending, Catalog catalog, Meter meter, CancellationToken cancellationToken, QueryScope scope)
     {
+        var cycle = RecursiveDecoration.BindMarks(definition.Cycle, catalog, meter);
+        var decorated = definition.Search is not null || cycle is not null;
         var body = definition.Query;
         if (body.Relation is not SetRelation { Operation: "union" } set)
             throw Invalid("recursive CTE requires an anchor UNION recursive term");
         if (CteBuffer.References(set.Left, definition.Name) != 0) throw Invalid("recursive reference in anchor");
         if (CteBuffer.References(set.Right, definition.Name) != 1) throw Invalid("recursive term must reference itself once");
         if (body.Order is { Length: > 0 } || body.Limit is not null || body.Offset != 0) throw Errors.Unsupported("recursive body ordering or limit");
-        if (set.Right.SetQuery) throw Errors.Unsupported("set operation in recursive term");
+        if (decorated && set.Left.SetQuery) throw Errors.Unsupported("set operation in SEARCH/CYCLE anchor");
+        if (set.Right.SetQuery) { if (decorated) throw Errors.Syntax("set operation in SEARCH/CYCLE recursive term"); throw Errors.Unsupported("set operation in recursive term"); }
         ValidateTerm(set.Right, definition.Name);
+        StatementExecution.ValidateRecursiveModifiers(definition, set, catalog);
         var anchor = RelationExecution.Query(set.Left, database, snapshot, pending, catalog, meter, cancellationToken, scope: scope);
         var columns = RelationExecution.Alias(anchor.Columns, definition.Name, definition.Columns);
+        var decoration = decorated ? RecursiveDecoration.Create(columns, definition.Search, cycle) : null;
         var working = new WorkingRows(meter);
         var stepScope = new QueryScope(scope);
-        stepScope.Add(definition.Name, new(columns, working.Read(cancellationToken), MemoryOutput: true));
-        var step = RelationExecution.Query(set.Right, database, snapshot, pending, catalog, meter, cancellationToken, scope: stepScope);
-        if (step.Columns.Length != columns.Length) throw Errors.Syntax("recursive term has different column count");
+        var workingColumns = decoration?.Columns.Select((column, index) => column with { RecursiveHidden = index >= columns.Length }).ToArray() ?? columns;
+        stepScope.Add(definition.Name, new(workingColumns, working.Read(cancellationToken), MemoryOutput: true));
+        var stepQuery = set.Right;
+        if (decoration is not null)
+        {
+            string? Self(RelationSyntax? relation) => relation switch
+            {
+                TableRelation table when table.Name == definition.Name => table.Alias ?? table.Name,
+                JoinedRelation join => Self(join.Left) ?? Self(join.Right),
+                GroupedRelation group => Self(group.Source),
+                _ => null
+            };
+            var alias = Self(stepQuery.Relation) ?? throw Errors.Unsupported("SEARCH/CYCLE self-reference must be a direct relation");
+            stepQuery = stepQuery with { Items = [.. stepQuery.Items, .. decoration.Columns.Skip(columns.Length).Select(column => new SelectItem(new("name", alias + "." + column.Name, []), null))] };
+        }
+        var step = RelationExecution.Query(stepQuery, database, snapshot, pending, catalog, meter, cancellationToken, scope: stepScope);
+        if (step.Columns.Length != workingColumns.Length) throw Errors.Syntax("recursive term has different column count");
         for (var i = 0; i < columns.Length; i++)
         {
             if (Resolve.Common(columns[i].Type, step.Columns[i].Type) != columns[i].Type)
@@ -37,7 +56,8 @@ internal static class RecursiveExecution
             if (anchor.InitializeConstants is { } first) await first().ConfigureAwait(false);
             if (step.InitializeConstants is { } second) await second().ConfigureAwait(false);
         }
-        return new(columns, Run(anchor, step, working, columns, set.All, meter, cancellationToken),
+        var outputColumns = decoration?.Columns ?? columns;
+        return new(outputColumns, Run(anchor, step, working, columns, set.All, meter, cancellationToken, decoration),
             Dependencies: (anchor.Dependencies ?? []).Concat(step.Dependencies ?? []).Distinct().ToArray(), InitializeConstants: Constants, MemoryOutput: true);
     }
     private sealed class WorkingRows(Meter meter)
@@ -50,7 +70,7 @@ internal static class RecursiveExecution
         }
     }
     private static async IAsyncEnumerable<SqlValue[]> Run(PreparedRelation anchor, PreparedRelation step, WorkingRows working,
-        BoundColumn[] columns, bool all, Meter meter, [EnumeratorCancellation] CancellationToken cancellationToken)
+        BoundColumn[] columns, bool all, Meter meter, [EnumeratorCancellation] CancellationToken cancellationToken, RecursiveDecoration? decoration)
     {
         var seen = new HashSet<string>(StringComparer.Ordinal); long seenBytes = 0;
         async ValueTask<List<SqlValue[]>> Collect(PreparedRelation source)
@@ -59,7 +79,20 @@ internal static class RecursiveExecution
             if (source.Initialize is { } initialize) await initialize().ConfigureAwait(false);
             await foreach (var values in source.Rows.WithCancellation(cancellationToken).ConfigureAwait(false))
             {
-                var row = values.Select((value, i) => Resolve.Cast(value, columns[i].Type)).ToArray();
+                var row = values.Select((value, i) => i < columns.Length ? Resolve.Cast(value, columns[i].Type) : value).ToArray();
+                if (decoration is not null)
+                {
+                    var initial = ReferenceEquals(source, anchor);
+                    if (!initial && decoration.Keep is { } keep)
+                    {
+                        var accepted = Evaluate.Expr(keep, meter, filter: true, row: row);
+                        if (accepted.IsNull || !accepted.AsBoolean())
+                        { if (source.MemoryOutput && meter.Memory.Enabled) meter.Memory.Release(MemorySize.RowBytes(values)); continue; }
+                    }
+                    var expressions = initial ? decoration.Anchor : decoration.Step;
+                    var added = expressions.Select(expression => Evaluate.Expr(expression, meter, row: row)).ToArray();
+                    row = [.. row.Take(columns.Length), .. added]; meter.Checkpoint(cancellationToken);
+                }
                 if (!all)
                 {
                     foreach (var value in row) GroupExecution.ChargeKey(value, meter);

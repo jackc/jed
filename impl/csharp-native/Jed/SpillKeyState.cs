@@ -17,6 +17,7 @@ internal sealed class SpillKeyState(ScratchHost host, long workMem, Meter meter)
     private IBlockStore? directory;
     private long length;
     private long held;
+    private bool disposed;
     internal long Count { get; private set; }
     internal bool Spilled => data is not null;
 
@@ -154,6 +155,7 @@ internal sealed class SpillKeyState(ScratchHost host, long workMem, Meter meter)
     }
     public async ValueTask DisposeAsync()
     {
+        if (disposed) return; disposed = true;
         resident.Clear(); meter.Memory.Release(held); held = 0;
         try { if (data is not null) await data.DisposeAsync().ConfigureAwait(false); }
         finally { if (directory is not null) await directory.DisposeAsync().ConfigureAwait(false); }

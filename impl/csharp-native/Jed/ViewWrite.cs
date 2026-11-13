@@ -15,6 +15,8 @@ internal static partial class StatementExecution
         if (body.Relation is not TableRelation source || body.Distinct || body.SetQuery || body.With is { Length: > 0 } || body.Limit is not null || body.Offset != 0 ||
             body.GroupBy is { Length: > 0 } || body.Having is not null || body.Items.Any(item => AggregateExpression(item.Expression) || WindowResolve.Contains(item.Expression)))
             throw new SqlException(SqlStates.ObjectNotInPrerequisiteState, "view is not automatically updatable");
+        if (CatalogRelations.IsCatalogName(DatabaseDomains.Name(source.Name).Local))
+            throw new SqlException(SqlStates.ObjectNotInPrerequisiteState, "catalog-backed view is not automatically updatable");
         _ = RelationExecution.Query(body, database, pending.Before, pending, pending.Catalog, meter, token);
         ViewWritePlan? parent = null; CatalogTable table; Resolved[] inputs; BoundColumn[] columns;
         if ((pending.Catalog.Scope?.View(source.Name)?.View ?? (pending.Catalog.Views ?? []).FirstOrDefault(item => item.Name == source.Name)) is { } baseView)
@@ -125,6 +127,13 @@ internal static partial class StatementExecution
                 foreach (var row in insert.Values) if (!defaultValues && row.Length != targets.Length) throw Errors.Syntax("INSERT value count differs from target");
                 var rows = insert.Values.Select(row => row.Select((value, i) => value.Op == "default" ? Default(targets[i], inserting: true) : value).ToArray()).ToArray();
                 var conflict = insert.Conflict;
+                foreach (var element in conflict?.Elements ?? [])
+                {
+                    if (element.Ordered) throw new SqlException(SqlStates.InvalidColumnReference, "ordering is not allowed in a conflict target");
+                    if (!view.Columns.Any(column => column.Name == element.Column)) throw new SqlException(SqlStates.UndefinedColumn, "view conflict column does not exist");
+                    if (element.Collation is { } collation && collation != "C") _ = meter.Unicode?.Resolve(collation) ?? throw new SqlException(SqlStates.UndefinedObject, "collation does not exist");
+                    if (element.Opclass is { } opclass && !KnownBtreeClass(opclass)) throw new SqlException(SqlStates.UndefinedObject, "operator class does not exist");
+                }
                 if (conflict is not null) conflict = conflict with {
                     Elements = conflict.Elements?.Select(element => element with { Column = plan.Table.Columns[Target(element.Column, true)].Name }).ToArray(),
                     Assignments = conflict.Assignments?.Select(assignment => new AssignmentSyntax(plan.Table.Columns[Target(assignment.Column)].Name, assignment.Value.Op == "default" ? Default(assignment.Column) : Rewrite(assignment.Value, excluded: true))).ToArray(),

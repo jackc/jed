@@ -7,8 +7,9 @@ internal sealed class SimulationFileSystem(ulong seed, int pageSize, int sectorS
     internal sealed record Fault(string Kind, int Probability = 0, int Tear = 0, int Nth = 1, string Operation = "");
     internal sealed class CrashException : Exception { }
     private sealed record Pending(byte[] Bytes, bool Issued);
-    private sealed class Inode
+    private sealed class Inode(string origin)
     {
+        internal readonly string Origin = origin;
         internal byte[] Durable = [];
         internal byte[] Cache = [];
         internal readonly SortedDictionary<long, List<Pending>> Pending = [];
@@ -33,11 +34,22 @@ internal sealed class SimulationFileSystem(ulong seed, int pageSize, int sectorS
     internal List<string> Operations { get; } = [];
     private readonly HashSet<string> durableBarriers = new(StringComparer.Ordinal);
     internal bool DurableBarrier(string path) => durableBarriers.Contains(Name(path));
+    internal bool ContentDurable(string path)
+    {
+        var inode = Find(path);
+        return inode.Pending.Count == 0 && inode.Cache.AsSpan().SequenceEqual(inode.Durable);
+    }
     private readonly Dictionary<string, HashSet<uint>> writtenPages = new(StringComparer.Ordinal);
     internal IReadOnlySet<uint> WrittenPages(string path) => writtenPages.GetValueOrDefault(Name(path)) ?? [];
 
     internal void BeginStep(ulong step, Fault? armed = null)
-    { Check(); Step = step; fault = armed; barriers = syncs = 0; scratchOrdinal = 0; Fired = "none"; writtenPages.Clear(); durableBarriers.Clear(); }
+    {
+        Check(); Step = step; fault = armed; barriers = syncs = 0; scratchOrdinal = 0; Fired = "none"; writtenPages.Clear(); durableBarriers.Clear();
+        // A step's process-crash issue decisions apply only to that step's writes.
+        foreach (var inode in inodes)
+            foreach (var versions in inode.Pending.Values)
+                for (var i = 0; i < versions.Count; i++) versions[i] = versions[i] with { Issued = true };
+    }
 
     internal void Restart()
     { dead = false; fault = null; barriers = syncs = 0; Fired = "none"; }
@@ -89,7 +101,7 @@ internal sealed class SimulationFileSystem(ulong seed, int pageSize, int sectorS
         if (mode == FileMode.CreateNew)
         {
             if (directory.ContainsKey(path)) throw new IOException("simulated file already exists");
-            var inode = new Inode(); inodes.Add(inode); directory.Add(path, inode);
+            var inode = new Inode(path); inodes.Add(inode); directory.Add(path, inode);
             directoryChanges.Add(new("create", path, null, inode)); Operations.Add($"create {path}");
         }
         else if (mode != FileMode.Open) throw new InvalidOperationException("unsupported simulation open mode");
@@ -155,7 +167,7 @@ internal sealed class SimulationFileSystem(ulong seed, int pageSize, int sectorS
             foreach (var (offset, versions) in inode.Pending)
             {
                 var newest = versions[^1].Bytes;
-                if (Decision(path, 7, offset, versions.Count - 1) % 2 == 0) Land(inode, offset, newest);
+                if (Decision(inode.Origin, 7, offset, versions.Count - 1) % 2 == 0) Land(inode, offset, newest);
                 else
                 {
                     for (var i = 0; i < newest.Length; i++) inode.Cache[checked((int)offset) + i] = offset + i < inode.Durable.Length ? inode.Durable[offset + i] : (byte)0;
@@ -171,7 +183,7 @@ internal sealed class SimulationFileSystem(ulong seed, int pageSize, int sectorS
     {
         foreach (var inode in inodes)
         {
-            var name = PathOf(inode);
+            var name = inode.Origin;
             foreach (var (offset, versions) in inode.Pending)
             {
                 if (Decision(name, 1, offset, 0) % 1000 >= (uint)survive) continue;
@@ -294,7 +306,7 @@ internal sealed class SimulationFileSystem(ulong seed, int pageSize, int sectorS
         public ValueTask ReadAsync(long offset, Memory<byte> destination, CancellationToken token = default)
         {
             Check(token); MemoryBlockStore.CheckRange(offset, destination.Length);
-            if (!owner.OracleReads && owner.fault is { Kind: "read_error" } active && owner.Decision(Path, 9, offset, 0) % 1000 < (uint)active.Probability)
+            if (!owner.OracleReads && owner.fault is { Kind: "read_error" } active && owner.Decision(inode.Origin, 9, offset, 0) % 1000 < (uint)active.Probability)
             { owner.Fired = "read"; throw new IOException("simulated read failure"); }
             if (offset + destination.Length > inode.Cache.Length) throw new EndOfStreamException("short simulated read");
             inode.Cache.AsMemory((int)offset, destination.Length).CopyTo(destination); return ValueTask.CompletedTask;
@@ -303,9 +315,9 @@ internal sealed class SimulationFileSystem(ulong seed, int pageSize, int sectorS
         {
             Check(token, true); MemoryBlockStore.CheckRange(offset, source.Length);
             if (!inode.Pending.TryGetValue(offset, out var versions)) versions = [];
-            if (owner.fault is { Kind: "io_error", Operation: "write" } active && owner.Fired == "none" && owner.Decision(Path, 5, offset, versions.Count) % 1000 < (uint)active.Probability)
+            if (owner.fault is { Kind: "io_error", Operation: "write" } active && owner.Fired == "none" && owner.Decision(inode.Origin, 5, offset, versions.Count) % 1000 < (uint)active.Probability)
             { owner.Fired = "write"; throw new IOException("simulated write failure"); }
-            var issued = owner.fault is not { Kind: "process_crash" } crash || owner.Decision(Path, 6, offset, versions.Count) % 1000 < (uint)crash.Probability;
+            var issued = owner.fault is not { Kind: "process_crash" } crash || owner.Decision(inode.Origin, 6, offset, versions.Count) % 1000 < (uint)crash.Probability;
             var bytes = source.ToArray(); inode.Pending[offset] = versions; versions.Add(new(bytes, issued)); Copy(ref inode.Cache, offset, bytes);
             if (!owner.writtenPages.TryGetValue(Path, out var pages)) owner.writtenPages.Add(Path, pages = []);
             if (source.Length != 0)

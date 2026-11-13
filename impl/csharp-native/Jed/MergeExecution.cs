@@ -48,12 +48,12 @@ internal static partial class StatementExecution
         var sourceColumns = Positioned(source.Columns, width);
         var all = targetColumns.Concat(sourceColumns).ToArray();
         var binder = new SubqueryBinder(all, database, pending.Before, read, read.Catalog, meter, token, context?.Scope);
-        Resolved Condition(Expression expression, SubqueryBinder binding)
+        Resolved Condition(Expression expression, SubqueryBinder binding, bool reorder = true)
         {
             ValidateReturning([new(expression, null)]);
             var value = Resolve.Expr(binding.Bind(expression), SqlType.Boolean);
             if (value.Type.Kind is not (SqlKind.Boolean or SqlKind.Unknown)) throw Errors.Type("MERGE condition requires boolean");
-            return PredicatePlan.Order(value)!;
+            return reorder ? PredicatePlan.Order(value)! : value;
         }
         void Ambiguous(Expression expression, bool both)
         {
@@ -70,7 +70,7 @@ internal static partial class StatementExecution
             var visible = clause.Match == "target" ? sourceColumns : clause.Match == "source" ? targetColumns : all;
             var binding = new SubqueryBinder(visible, database, pending.Before, read, read.Catalog, meter, token, context?.Scope);
             if (clause.Condition is { } conditional) Ambiguous(conditional, clause.Match == "matched");
-            var condition = clause.Condition is null ? null : Condition(clause.Condition, binding);
+            var condition = clause.Condition is null ? null : Condition(clause.Condition, binding, reorder: false);
             var assignments = new List<(int Slot, Expression Value)>();
             if (clause.Action == "update") assignments.AddRange(clause.Assignments!.Select(item => (ColumnIndex(table, item.Column), item.Value)));
             if (clause.Action == "insert")

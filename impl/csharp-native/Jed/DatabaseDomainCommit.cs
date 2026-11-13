@@ -17,7 +17,7 @@ public sealed partial class Database
         foreach (var domain in changed)
         {
             if (domain.Name == "temp") domain.Pending!.Catalog = scope.BindCatalog(domain);
-            plans.Add((domain, await domain.Database.PrepareCommitAsync(domain.Pending!, domain.Name, cancellationToken).ConfigureAwait(false)));
+            plans.Add((domain, await domain.Database.PrepareCommitAsync(domain.Pending!, domain.Name, cancellationToken, durability: true).ConfigureAwait(false)));
         }
         // These writes target only reusable or newly allocated pages. No root,
         // high-water, free list or storage accounting changes until all succeed.

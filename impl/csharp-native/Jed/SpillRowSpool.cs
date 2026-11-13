@@ -17,7 +17,7 @@ internal sealed class SpillRowSpool(ScratchHost host, long workMem, Meter meter)
     internal long ResidentBytes => residentBytes;
     internal bool Spilled => file is not null;
 
-    internal async ValueTask Append(SqlValue[] row, CancellationToken token)
+    internal async ValueTask Append(SqlValue[] row, CancellationToken token, long? logicalBytes = null)
     {
         ObjectDisposedException.ThrowIf(disposed, this);
         var copy = new SqlValue[row.Length];
@@ -28,7 +28,7 @@ internal sealed class SpillRowSpool(ScratchHost host, long workMem, Meter meter)
         if (file is not null) await Write(copy, token).ConfigureAwait(false);
         else
         {
-            var bytes = MemorySize.RowBytes(copy);
+            var bytes = logicalBytes ?? MemorySize.RowBytes(copy);
             var admitted = meter.Memory.TryReserve(bytes);
             if (admitted) residentBytes = Meter.Add(residentBytes, bytes);
             if (!admitted || workMem > 0 && residentBytes > workMem)
@@ -50,13 +50,7 @@ internal sealed class SpillRowSpool(ScratchHost host, long workMem, Meter meter)
     }
     private async ValueTask Write(SqlValue[] row, CancellationToken token)
     {
-        var writer = new WireWriter();
-        foreach (var value in row)
-        {
-            writer.Byte(value.IsNull ? (byte)0 : (byte)1);
-            if (!value.IsNull) StoredValues.WriteBody(writer, value);
-        }
-        var bytes = writer.ToArray(); var header = new byte[4]; BinaryPrimitives.WriteUInt32BigEndian(header, checked((uint)bytes.Length));
+        var bytes = ScratchValues.Encode(row); var header = new byte[4]; BinaryPrimitives.WriteUInt32BigEndian(header, checked((uint)bytes.Length));
         await file!.WriteAsync(length, header, token).ConfigureAwait(false); length = checked(length + 4);
         await file.WriteAsync(length, bytes, token).ConfigureAwait(false); length = checked(length + bytes.Length);
     }
@@ -74,16 +68,7 @@ internal sealed class SpillRowSpool(ScratchHost host, long workMem, Meter meter)
             yield return Decode(bytes);
         }
     }
-    private SqlValue[] Decode(byte[] bytes)
-    {
-        var reader = new WireReader(bytes); var row = new SqlValue[types!.Length];
-        for (var i = 0; i < row.Length; i++) row[i] = reader.Byte() switch
-        {
-            0 => SqlValue.Null(types[i]), 1 => StoredValues.ReadBody(ref reader, types[i]),
-            _ => throw StorageFormat.Corrupt("invalid scratch null flag")
-        };
-        reader.Finish(); return row;
-    }
+    private SqlValue[] Decode(byte[] bytes) => ScratchValues.Decode(bytes, types!);
     public async ValueTask DisposeAsync()
     {
         if (disposed) return; disposed = true;

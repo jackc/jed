@@ -27,16 +27,16 @@ internal sealed partial class Parser
             if (Eat("sequence")) return DropSequence();
             if (Eat("type"))
             {
-                var optional = Eat("if"); if (optional) Expect("exists"); var name = QualifiedName();
+                var optional = Is("if") && Peek().Text == "exists" && Eat("if"); if (optional) Expect("exists"); var name = QualifiedName();
                 var cascade = Eat("cascade"); if (!cascade) Eat("restrict"); return new DropTypeSyntax(name, optional, cascade);
             }
             if (Eat("index"))
             {
-                var optional = Eat("if"); if (optional) Expect("exists");
+                var optional = Is("if") && Peek().Text == "exists" && Eat("if"); if (optional) Expect("exists");
                 var name = QualifiedName(); var cascade = Eat("cascade"); if (!cascade) Eat("restrict");
                 return new DropIndexSyntax(name, optional, cascade);
             }
-            Expect("table"); var ifExists = Eat("if"); if (ifExists) Expect("exists");
+            Expect("table"); var ifExists = Is("if") && Peek().Text == "exists" && Eat("if"); if (ifExists) Expect("exists");
             var tables = new List<string>(); do { tables.Add(QualifiedName()); } while (Eat(","));
             var all = Eat("cascade"); if (!all) Eat("restrict");
             return tables.Count == 1 ? new DropTableSyntax(tables[0], ifExists, all) : new DropTablesSyntax(tables.ToArray(), ifExists, all);
@@ -44,12 +44,16 @@ internal sealed partial class Parser
         if (Eat("insert"))
         {
             Expect("into"); var name = QualifiedName(); var alias = Eat("as") ? Name() : null; string[]? columns = null;
-            if (Is("(") && Peek().Text is not ("select" or "with" or "values" or "(")) { Take(); var names = new List<string>(); do { names.Add(Name()); } while (Eat(",")); Expect(")"); columns = names.ToArray(); }
+            if (Is("(") && (Peek().Text is not ("select" or "with" or "values" or "(") || Peek(2).Text is "," or ")")) { Take(); var names = new List<string>(); do { names.Add(Name()); } while (Eat(",")); Expect(")"); columns = names.ToArray(); }
             string? overriding = null;
             if (Eat("overriding")) { overriding = Eat("system") ? "system" : Eat("user") ? "user" : throw Errors.Syntax("expected SYSTEM or USER"); Expect("value"); }
             var values = new List<Expression[]>(); SelectSyntax? source = null;
-            if (Eat("default")) { if (columns is not null) throw Errors.Syntax("DEFAULT VALUES cannot have a column list"); Expect("values"); values.Add([]); }
-            else if (Is("select") || Is("with") || Is("(")) source = Select();
+            if (Eat("default")) { if (columns is not null || overriding is not null) throw Errors.Syntax("DEFAULT VALUES cannot have a column list or OVERRIDING"); Expect("values"); values.Add([]); }
+            else if (Is("select") || Is("with") || Is("("))
+            {
+                var previous = insertValuesSource; insertValuesSource = true;
+                try { source = Select(); } finally { insertValuesSource = previous; }
+            }
             else
             {
                 Expect("values");
@@ -60,6 +64,14 @@ internal sealed partial class Parser
                     Expect(")"); values.Add(row.ToArray());
                 } while (Eat(","));
             }
+            if (source is null && (Is("union") || Is("intersect") || Is("except") || Is("order") || Is("limit") || Is("offset")))
+            {
+                source = QueryTail(SetQueryTail(new([new(Node("star", ""), null)], null, null, 0, Relation: new ValuesRelation(values.ToArray()), ValuesQuery: true), 0));
+                values.Clear();
+            }
+            if (source is { ValuesQuery: true, With: null, Relation: ValuesRelation own, Order: null, Limit: null, Offset: 0, HasOffset: false })
+            { values.AddRange(own.Values); source = null; }
+            else if (source is not null) RejectDefaultSource(source);
             var conflict = OnConflict();
             var returning = Returning();
             return new InsertSyntax(name, columns, values.ToArray(), returning.Items, source, overriding, conflict, alias, ReturningAliases: returning.Aliases);
@@ -123,7 +135,8 @@ internal sealed partial class Parser
         do
         {
             var expression = Eat("*") ? Node("star", "") : Expr();
-            items.Add(new(expression, Eat("as") ? Name() : null));
+            var alias = Eat("as") ? Name() : token.Kind == TokenKind.QuotedName || token.Kind == TokenKind.Word && !Clause(token.Text) ? Name() : null;
+            items.Add(new(expression, alias));
         } while (Eat(","));
         return (items.ToArray(), aliases);
     }

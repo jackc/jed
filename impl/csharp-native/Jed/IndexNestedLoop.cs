@@ -6,6 +6,19 @@ internal sealed record BaseRelationAccess(CatalogTable Table, StorageTree Tree, 
 
 internal sealed record IndexNestedLoop(BaseRelationAccess Source, Resolved[] Bounds, int OuterWidth)
 {
+    internal AccessPlan? PinnedAccess { get; set; }
+    internal Resolved? GenericPredicate() => PredicatePlan.Combine(Bounds.Select(Generic).Concat(Source.Filter is null ? [] : [Source.Filter]));
+    private Resolved Generic(Resolved expression) => expression.Op == "column"
+        ? expression.Slot >= OuterWidth ? expression with { Slot = expression.Slot - OuterWidth }
+            : new("constant", expression.Type, SqlValue.Null(expression.Type), [], Collation: expression.Collation, ParameterUnbound: true, BoundSource: true)
+        : expression with { Args = expression.Args.Select(Generic).ToArray() };
+    internal long EstimateRows(long outerRows, Resolved? predicate, Meter meter)
+    {
+        var access = PinnedAccess ?? AccessPlan.Select(Source.Table, Source.Tree, GenericPredicate(), Source.Storage, meter);
+        var inner = Estimate.Rows(Source.Table, Source.Storage.Catalog, Source.Filter, access.EstimatedRows);
+        var residual = predicate is null ? null : PredicatePlan.Combine(PredicatePlan.Conjuncts(predicate).Where(term => !Bounds.Any(bound => Resolve.Equivalent(bound, term))));
+        return Estimate.Rows(Estimate.Multiply(outerRows, inner), residual);
+    }
     internal static IndexNestedLoop? Select(PreparedRelation inner, int outerWidth, string kind, Resolved? predicate)
     {
         if (inner.BaseAccess is not { } source || kind is not ("inner" or "cross" or "left") || predicate is null) return null;
@@ -20,7 +33,7 @@ internal sealed record IndexNestedLoop(BaseRelationAccess Source, Resolved[] Bou
             if (b.Op != "constant" && (b.Op != "column" || b.Slot >= outerWidth)) continue;
             var column = source.Table.Columns[a.Slot - outerWidth];
             if (!TableAccess.Compatible(term, column)) continue;
-            if (a.Type != b.Type && !(a.Type.IsInteger() && b.Type.IsInteger()) && !(term.Op == "open_predicate" && a.Type.Kind == SqlKind.Range && a.Type.Element == b.Type)) continue;
+            if (a.Type != b.Type && !AccessConstant.NumericFamilies(a.Type, b.Type) && !(term.Op == "open_predicate" && a.Type.Kind == SqlKind.Range && a.Type.Element == b.Type)) continue;
             terms.Add(term);
             sibling |= b.Op == "column" && (source.Table.PrimaryKey.Length != 0 && a.Slot - outerWidth == source.Table.PrimaryKey[0] || (source.Table.Indexes ?? []).Any(index => StatementExecution.IndexDependenciesUsable(index, source.Storage.Catalog) && index.Kind is 0 or 2 && index.Keys.Length != 0 && index.Keys[0].Expression is null && index.Keys[0].Column == a.Slot - outerWidth));
         }
@@ -40,44 +53,29 @@ internal sealed record IndexNestedLoop(BaseRelationAccess Source, Resolved[] Bou
                 sibling = true; break;
             }
         }
+        var probe = new IndexNestedLoop(source, [], outerWidth);
+        var keys = source.Table.PrimaryKey.Select(slot => new Resolved("column", source.Table.Columns[slot].Type.Type, default, [], Slot: slot))
+            .Concat((source.Table.Indexes ?? []).Where(index => index.Kind == 0 && StatementExecution.IndexDependenciesUsable(index, source.Storage.Catalog))
+                .SelectMany(index => StatementExecution.ResolveIndexKeys(source.Table, index, source.Storage.Catalog))).ToArray();
+        foreach (var term in PredicatePlan.Conjuncts(predicate))
+        {
+            var generic = probe.Generic(term);
+            if (!keys.Any(key => KeySetEstimate.Expand(generic, key) is not null)) continue;
+            if (!terms.Contains(term)) terms.Add(term);
+            sibling |= PredicatePlan.Slots(term).Any(slot => slot < outerWidth);
+        }
         return sibling ? new(source, terms.ToArray(), outerWidth) : null;
     }
 
-    internal long EstimateWork(long outerRows, Resolved? residual)
+    internal long EstimateWork(long outerRows, Resolved? residual, Meter meter)
     {
-        var table = Source.Table; var tree = Source.Tree;
         var nodes = residual is null ? 0 : PredicatePlan.Nodes(residual);
         var sourceNodes = Source.Filter is null ? 0 : PredicatePlan.Nodes(Source.Filter);
-        long best = long.MaxValue;
-        foreach (var term in Bounds)
+        var best = AccessPlan.Inventory(Source.Table, Source.Tree, GenericPredicate(), Source.Storage, meter).Min(access =>
         {
-            if (term.Args.Length != 2) continue;
-            var column = term.Args.FirstOrDefault(arg => arg.Op == "column" && arg.Slot >= OuterWidth);
-            if (column is null) continue;
-            var slot = column.Slot - OuterWidth;
-            var matching = term.Op == "open_predicate" || column.Type.Kind is SqlKind.Array or SqlKind.Jsonb;
-            var rows = Estimate.Fraction(table.RowCount, matching ? "matching" : term.Op == "=" ? "equality" : "inequality");
-            if (table.PrimaryKey.Length != 0 && table.PrimaryKey[0] == slot && !matching)
-            {
-                if (table.PrimaryKey.Length == 1 && term.Op == "=") rows = Math.Min(rows, 1);
-                var pages = rows == 0 ? 0 : Math.Clamp(Estimate.Fraction(tree.NodeCount, term.Op == "=" ? "equality" : "inequality"), tree.Height, tree.NodeCount);
-                best = Math.Min(best, Estimate.Add(pages, Estimate.Multiply(rows, 1 + nodes + sourceNodes)));
-            }
-            foreach (var index in table.Indexes ?? [])
-            {
-                if (index.Keys.Length == 0 || index.Keys[0].Column != slot || !StatementExecution.IndexDependenciesUsable(index, Source.Storage.Catalog)) continue;
-                var indexTree = Source.Storage.Database.IndexTree(index, Source.Storage.Pending, Source.Storage.Snapshot);
-                var height = indexTree.Height; var count = indexTree.NodeCount;
-                if (index.Kind == 2 && index.Gist?.Root is { } root)
-                {
-                    height = 1; for (var node = root; !node.Leaf; node = node.Entries[0].Child!) height++;
-                    count = root.Count;
-                }
-                var pages = rows == 0 ? 0 : Math.Clamp(Estimate.Fraction(count, matching ? "matching" : term.Op == "=" ? "equality" : "inequality"), height, count);
-                var extra = index.Kind == 1 ? rows : index.Kind == 2 ? Math.Max(0, height - 1) : 0;
-                best = Math.Min(best, Estimate.Add(Estimate.Add(pages, extra), Estimate.Multiply(rows, tree.Height + 1L + nodes + sourceNodes)));
-            }
-        }
+            var fetch = access.Kind is AccessKind.Btree or AccessKind.IndexIntervals or AccessKind.Gin or AccessKind.Gist ? Source.Tree.Height + 1L : 1;
+            return Estimate.Add(Estimate.Add(access.EstimatedPages, access.EstimatedEntries), Estimate.Multiply(access.EstimatedRows, fetch + nodes + sourceNodes));
+        });
         return Estimate.Multiply(outerRows, best);
     }
 
@@ -90,24 +88,19 @@ internal sealed record IndexNestedLoop(BaseRelationAccess Source, Resolved[] Bou
     private async IAsyncEnumerable<SqlValue[]> Read(SqlValue[] outer, Meter meter,
         [EnumeratorCancellation] CancellationToken cancellationToken)
     {
-        var terms = new List<Resolved>();
-        foreach (var term in Bounds)
+        async ValueTask<Resolved> Bind(Resolved expression)
         {
-            var args = new Resolved[2];
-            for (var i = 0; i < args.Length; i++)
-            {
-                var arg = term.Args[i];
-                if (arg.Op == "column" && arg.Slot < OuterWidth)
-                {
-                    var value = await outer[arg.Slot].ResolveAsync(cancellationToken).ConfigureAwait(false);
-                    args[i] = new("constant", arg.Type, value, [], Collation: arg.Collation);
-                }
-                else args[i] = arg.Op == "column" ? arg with { Slot = arg.Slot - OuterWidth } : arg;
-            }
-            terms.Add(term with { Args = args });
+            if (expression.Op == "column") return expression.Slot >= OuterWidth ? expression with { Slot = expression.Slot - OuterWidth } :
+                new("constant", expression.Type, await outer[expression.Slot].ResolveAsync(cancellationToken).ConfigureAwait(false), [], Collation: expression.Collation, BoundSource: true);
+            var args = new Resolved[expression.Args.Length];
+            for (var i = 0; i < args.Length; i++) args[i] = await Bind(expression.Args[i]).ConfigureAwait(false);
+            return expression with { Args = args };
         }
-        var filter = PredicatePlan.Combine(terms);
-        var access = AccessPlan.Select(Source.Table, Source.Tree, filter, Source.Storage, meter);
+        var terms = new List<Resolved>();
+        foreach (var term in Bounds) terms.Add(await Bind(term).ConfigureAwait(false));
+        var filter = PredicatePlan.Combine(terms.Concat(Source.Filter is null ? [] : [Source.Filter]));
+        var selected = PinnedAccess ?? AccessPlan.Select(Source.Table, Source.Tree, GenericPredicate(), Source.Storage, meter);
+        var access = AccessPlan.Rebind(selected, Source.Table, Source.Tree, filter, Source.Storage, meter);
         await foreach (var row in access.Rows(Source.Table, Source.Tree, Source.Storage, meter, null, cancellationToken).ConfigureAwait(false))
             if (await QueryExecution.KeepsAsync(Source.Filter, row, meter).ConfigureAwait(false)) yield return row;
     }

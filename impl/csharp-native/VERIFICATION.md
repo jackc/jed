@@ -374,3 +374,68 @@ SQL records. Passing isolated sorter checks does not establish complete blocking
   encrypted traces still have cost and crash-boundary discrepancies. No complete simulator
   acceptance is claimed. Keyed spill state and relaxed batching primitives compile but still
   require dedicated tests and complete integration.
+
+### Canonical backend checkpoint — 2026-11-13
+
+- Source: `db0ab23f0e9fced13fca929bd46b5319bf30d595699b10e1108d3d40833ed9a1`.
+- `mise run csharp-native:conformance --all`: **679 passing files**, 18,856 records
+  in passing files, **82 failing files**, two declared mode exclusions, 763 selected.
+  Log: `/tmp/jed-csharp-full-checkpoint5.log`. This is the canonical memory mode;
+  older counts that auto-routed backend-specific files are not directly comparable.
+- `mise run csharp-native:test --no-build`: **PASS**, same captured assembly.
+  Log: `/tmp/jed-csharp-growth-host.log`. Includes geometric file growth, Linux
+  durable data barriers, relaxed batching and simulator inode/fault-host invariants.
+- SQL spill checks pass for plaintext/encrypted files with work_mem=128 and
+  max_query_memory_bytes=1, comparing rows/order/cost with resident execution:
+  external sort, INNER/LEFT/RIGHT/FULL joins, ordinary and ordered aggregate
+  collections, grouping sets and DISTINCT. These are host checks, not a substitute
+  for shared exact memory thresholds; derived-table buffer accounting remains open.
+  Follow-up narrowed dispatch after the shared corpus demonstrated that ordinary
+  two-input nested-loop joins retain their resident memory-admission schedule;
+  standalone RIGHT/FULL spill comparisons are mechanism evidence only.
+- Earlier canonical disk diagnostic: 543 passing files, 15,246 records, 134 failures,
+  86 exclusions. Earlier encrypted diagnostic: 610 row/type/error successes, of
+  which 542 also match the pinned Go cost/EXPLAIN transcript (1,568 events);
+  68 transcript mismatches, 66 prior SQL failures, 87 exclusions. Both use source
+  `ae6fe58fb541f58e21c35dc3e5e11df87b6db4cb61b4811742388d3f3fc1d8bf`.
+  Logs: `/tmp/jed-csharp-full-disk-first.log`,
+  `/tmp/jed-csharp-encrypted-peer-first.log`.
+
+No full parity or current-source NativeAOT result is claimed. Implementation and
+verification continue against the frozen semantic baseline.
+
+### Planner and recursive-query checkpoint — 2026-11-13
+
+- Source `b012d973d295869a3b8cfa9fd28dd71d2e55e1f1da3e3eb097d91d6af8e31bb4`:
+  canonical memory SQL **710/763 files passing**, **20,266 records in passing
+  files**, 51 failed files and two declared mode exclusions. Full JIT host task
+  **PASS** at the same capture. Logs: `/tmp/jed-csharp-full-checkpoint6.log` and
+  `/tmp/jed-csharp-host-checkpoint6.log`.
+- Newly complete focused files include SEARCH/CYCLE (43 records), CREATE TABLE AS
+  (117), views (174), composite-PK interval-set EXPLAIN (15), secondary-index
+  interval-set EXPLAIN (27), hash-join EXPLAIN (12), and index nested loops (21).
+- Earlier capture `dced2ab0` passes all four selected memory-account files (135
+  records), file-backed query memory and spill thresholds (64), and complete host
+  and SQL spill checks. A later N-way planner change exposes a remaining eager
+  memory-admission discrepancy; this earlier result does not establish that the
+  latest source passes every memory file.
+- Forced disk spilling passes all 52 aggregate files (894 records) at source
+  `fa9e76dae9dc8ec6b8ad6d59c6eebcc567da8ee2a5f9b412330b5772a31383bc`.
+  Exact group and DISTINCT spill thresholds pass at that capture.
+- The encrypted recovery regression now matches physical images, recovered
+  generations, live/free counts and digests through its complete trace. Subsequent
+  captures continue to investigate SQL cost differences separately. Two complete
+  attachment/relaxed-close traces match pinned peer transcripts at `64a2f99b`.
+
+This remains an implementation checkpoint. Full SQL, all backend/resource gates,
+complete simulator coverage and fresh NativeAOT acceptance are still pending.
+
+- Checkpoint host recapture:
+  `3b092099519185655eac42c9e9527bcc05cdc50e9f9b77854d9bbc2338afdfa9`,
+  `mise run csharp-native:test`: **PASS**. Log:
+  `/tmp/jed-csharp-root-checkpoint7c.log`. Includes the injected owner/client
+  transport test with real page-service handlers, disconnection, reconnect,
+  owner death and promotion, plus expression top-k and zero-capacity accounting.
+  The first simulated-transport test exposed a handshake deadlock in the test
+  network's write acknowledgement; the passing capture acknowledges consumed
+  bytes and separately waits for protocol quiescence.

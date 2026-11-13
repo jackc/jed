@@ -34,12 +34,26 @@ internal static class QueryExecution
     internal static async IAsyncEnumerable<SqlValue[]> DeferredTableSource(CatalogTable table, StorageTree tree, SelectPlan plan, Meter meter,
         [EnumeratorCancellation] CancellationToken cancellationToken, QueryStorage? storage = null)
     {
+        var dynamic = PlanTransform.DynamicAccess(plan.Filter);
         var initialized = PlanTransform.InitialValues(plan);
+        if (dynamic) initialized = initialized with { Filter = await PlanTransform.AccessValues(plan.Filter!, cancellationToken).ConfigureAwait(false) };
+        if (storage is { MembershipBounds: false } && initialized.Filter is not null) initialized = initialized with { Filter = PlanTransform.WithoutMembershipBounds(initialized.Filter) };
         var access = TableAccess.Prepare(initialized, table);
         var touched = StorageTouchedColumns.Collect(initialized);
         if (storage is not null)
         {
-            var selected = initialized.Access ?? SinglePipeline.Select(table, tree, initialized, storage, meter).Access;
+            var selected = !dynamic && initialized.Access is { } retained ? retained : SinglePipeline.Select(table, tree, initialized, storage, meter).Access;
+            if (dynamic && PlanTransform.CorrelatedAccess(plan.Filter) && initialized.Access is { } pinned)
+                selected = AccessPlan.Rebind(pinned, table, tree, initialized.Filter, storage, meter);
+            if (dynamic && !PlanTransform.CorrelatedAccess(plan.Filter) && initialized.AccessOrdering && initialized.Access is { } ordered)
+            {
+                // Rebinding may narrow the walk but must preserve an order whose
+                // explicit Sort was removed when this query frame was prepared.
+                var compatible = AccessPlan.Inventory(table, tree, initialized.Filter, storage, meter).Where(candidate =>
+                    ordered.Ordered ? candidate.Index == ordered.Index && candidate.Kind is AccessKind.Btree or AccessKind.IndexIntervals :
+                    candidate.Kind is AccessKind.Primary or AccessKind.PrimaryIntervals or AccessKind.Full);
+                selected = compatible.OrderBy(candidate => candidate.EstimatedCost).First() with { Ordered = ordered.Ordered, Streaming = ordered.Streaming };
+            }
             await foreach (var row in selected.Rows(table, tree, storage, meter, touched, cancellationToken, initialized.Access is null ? access.Scan.Reverse : initialized.ScanReverse).ConfigureAwait(false)) yield return row;
         }
         else
@@ -79,8 +93,11 @@ internal static class QueryExecution
             sourceMemory = true; retainProjectedSource = true;
         }
         else if (sourceMemory && plan.Group is null && plan.Windows is null) source = inputMemory.Adopt(source, cancellationToken);
+        // Correlated values bind storage bounds per outer row, but do not
+        // turn a non-key residual into a new statement-wide contradiction.
+        var correlatedFilter = plan.Filter is not null && ContainsOuter(plan.Filter);
         plan = PlanTransform.InitialValues(plan);
-        if (plan.Filter is not null && Resolve.EmptyFilter(plan.Filter)) plan = plan with { Empty = true };
+        if (!correlatedFilter && plan.Filter is not null && Resolve.EmptyFilter(plan.Filter)) plan = plan with { Empty = true };
         if (plan.ColumnarProjection)
         {
             source = ColumnarSource(plan, source, meter, cancellationToken);
@@ -88,9 +105,11 @@ internal static class QueryExecution
         }
         if (plan.Group is { } grouping)
         {
-            source = inputMemory.Adopt(GroupExecution.Run(grouping, plan.Empty ? EmptySource() : source, plan.Filter, meter, cancellationToken, sourceMemory, StorageTouchedColumns.Collect(plan), plan.AggregateLane, plan.Observation?.Filter), cancellationToken);
+            var grouped = GroupExecution.Run(grouping, plan.Empty ? EmptySource() : source, plan.Filter, meter, cancellationToken, sourceMemory, StorageTouchedColumns.Collect(plan), plan.AggregateLane, plan.Observation?.Filter, plan.Spill);
+            source = plan.Spill is null ? inputMemory.Adopt(grouped, cancellationToken) : grouped;
             if (plan.Observation?.Aggregate is { } groupObservation) source = ExplainObservation.Rows(source, groupObservation, meter, cancellationToken, inclusive: true);
-            sourceMemory = true;
+            sourceMemory = plan.Spill is null;
+            retainProjectedSource = sourceMemory;
             plan = plan with { Filter = null, Empty = false, Group = null };
             // Aggregates finalize even when LIMIT excludes every output row.
             if (plan.Limit == 0 && !plan.Distinct)
@@ -135,9 +154,9 @@ internal static class QueryExecution
             using var sortMemory = new QueryInputMemory(meter);
             using var decorations = new QueryInputMemory(meter);
             var rows = new List<(SqlValue[] Row, SortValue[] Keys, int Ordinal)>();
-            var heap = !sourceMemory && plan.DistinctOnCount == 0 && plan.Limit is not null && order.All(key => SortPlan.Column(key.Expression) is not null);
+            var heap = !sourceMemory && !plan.Distinct && plan.Group is null && plan.Windows is null && plan.Limit is { } heapLimit && (heapLimit == 0 || heapLimit <= long.MaxValue - plan.Offset);
             if (heap && plan.Spill is { } budget) heap = budget.TopK(plan);
-            if (!heap && plan.Spill is { } spill && order.All(key => key.Expression.Collation?.Table is null))
+            if (!heap && plan.Spill is { } spill)
             {
                 await foreach (var row in SpillSort.Run(plan, source, spill, inputMemory, meter, cancellationToken).ConfigureAwait(false)) yield return row;
                 yield break;
@@ -163,27 +182,34 @@ internal static class QueryExecution
                 }
                 return left.Ordinal.CompareTo(right.Ordinal);
             }
+            void ReleaseKeys(SortValue[] keys)
+            {
+                if (!meter.Memory.Enabled || heap && capacity == 0) return;
+                for (var i = 0; i < keys.Length; i++)
+                    if (SortPlan.Column(order[i].Expression) is null) sortMemory.ReleaseBytes(MemorySize.ValueBytes(keys[i].Value));
+            }
             await foreach (var row in source.WithCancellation(cancellationToken).ConfigureAwait(false))
             {
                 if (!await KeepsAsync(plan.Filter, row, meter, plan.Observation?.Filter).ConfigureAwait(false)) { inputMemory.Release(row); continue; }
-                if (heap && capacity == 0 && order.All(key => key.Expression.Collation?.Table is null)) continue;
+                if (heap && capacity == 0 && order.All(key => SortPlan.Column(key.Expression) is not null && key.Expression.Collation?.Table is null)) continue;
                 var keyCost = meter.Accrued;
                 var keys = new SortValue[order.Length];
                 for (var i = 0; i < keys.Length; i++)
                 {
                     var value = await Evaluate.ExprAsync(order[i].Expression, meter, row: row).ConfigureAwait(false);
-                    if (SortPlan.Column(order[i].Expression) is null) sortMemory.ReserveValue(value);
+                    if (SortPlan.Column(order[i].Expression) is null && !(heap && capacity == 0)) sortMemory.ReserveValue(value);
                     keys[i] = CollationRules.Decorate(value, order[i].Expression, meter);
                 }
                 plan.Observation?.Sort?.AttributeLocal(meter.Accrued - keyCost);
-                if (heap && capacity == 0) continue;
+                if (heap && capacity == 0) { ReleaseKeys(keys); continue; }
                 var candidate = (Row: row, Keys: keys, Ordinal: ordinal++);
-                if (heap && rows.Count >= capacity && Compare(candidate, rows[^1]) >= 0) continue;
+                if (heap && rows.Count >= capacity && Compare(candidate, rows[^1]) >= 0) { ReleaseKeys(keys); continue; }
                 var buffered = sourceMemory || collatedHeap ? row : await sortMemory.TakeAsync(row, false, StorageTouchedColumns.Collect(plan)).ConfigureAwait(false);
                 if (heap && rows.Count >= capacity) sortMemory.Release(rows[^1].Row);
                 decorations.ReserveBytes(MemorySize.SortKeyBytes(keys));
                 if (heap && rows.Count >= capacity)
                 {
+                    ReleaseKeys(rows[^1].Keys);
                     decorations.ReleaseBytes(MemorySize.SortKeyBytes(rows[^1].Keys));
                     rows.RemoveAt(rows.Count - 1);
                 }
@@ -299,6 +325,7 @@ internal static async ValueTask<bool> KeepsValueAsync(Resolved? expression, SqlV
         meter.Checkpoint(); return new(values);
     }
     internal static long KeyBytes(SqlValue value) => OpenValue.PayloadBytes(value);
+    private static bool ContainsOuter(Resolved expression) => expression.Op == "outer" || expression.Args.Any(ContainsOuter);
     internal static async IAsyncEnumerable<Row> Materialized(IEnumerable<Row> rows)
     {
         await ValueTask.CompletedTask.ConfigureAwait(false);

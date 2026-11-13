@@ -21,7 +21,7 @@ internal static class DerivedPushdown
         foreach (var term in PredicatePlan.Conjuncts(filter))
         {
             var slots = PredicatePlan.Slots(term);
-            if (PredicatePlan.Safe(term) && slots.Count > 0 && slots.All(slot => Output(slot) is not null)) pushed.Add(Rewrite(term));
+            if (PredicatePlan.Safe(term) && (!(body.Distinct || body.Group is not null || body.Windows is not null) || PredicatePlan.PreservesEquality(term)) && slots.Count > 0 && slots.All(slot => Output(slot) is not null)) pushed.Add(Rewrite(term));
             else residual.Add(term);
         }
         return (PredicatePlan.Combine(pushed), PredicatePlan.Combine(residual));

@@ -92,8 +92,12 @@ internal static partial class StatementExecution
             {
                 var names = drops.Names.ToHashSet(StringComparer.Ordinal);
                 foreach (var name in names)
+                {
+                    if (!pending.Catalog.Tables.Any(table => table.Name == name) && RelationExists(pending.Catalog, name))
+                        throw new SqlException(SqlStates.WrongObjectType, "relation is not a table");
                     if (!pending.Catalog.Tables.Any(table => table.Name == name) && !drops.IfExists)
                         throw new SqlException(SqlStates.UndefinedTable, "table does not exist");
+                }
                 pending.Catalog = pending.Catalog with { Tables = pending.Catalog.Tables.Select(table => names.Contains(table.Name)
                     ? table with { ForeignKeys = table.ForeignKeys?.Where(key => !names.Contains(key.Parent)).ToArray() } : table).ToArray() };
                 foreach (var name in names.Order(Utf8NameComparer.Instance))
@@ -105,6 +109,8 @@ internal static partial class StatementExecution
                 var table = pending.Catalog.Tables.FirstOrDefault(t => t.Name == drop.Name);
                 if (table is null) { if (RelationExists(pending.Catalog, drop.Name)) throw new SqlException(SqlStates.WrongObjectType, "relation is not a table"); if (!drop.IfExists) throw new SqlException(SqlStates.UndefinedTable, "table does not exist"); return new([], []); }
                 DropDependentViews(pending, table.Name, 0, drop.Cascade);
+                foreach (var owned in (pending.Catalog.Sequences ?? []).Where(sequence => sequence.OwnerTable == table.Name))
+                    DropDependentViews(pending, owned.Name, 2, drop.Cascade);
                 foreach (var child in pending.Catalog.Tables.Where(child => child.Name != table.Name).ToArray())
                 {
                     if (!(child.ForeignKeys ?? []).Any(foreign => foreign.Parent == table.Name)) continue;
@@ -159,7 +165,7 @@ internal static partial class StatementExecution
                     for (var i = 0; i < expressions.Length; i++) if (expressions[i].Op != "default") Assignable(Resolve.Expr(AssignmentLiteral(expressions[i], table.Columns[slots[i]].Type), table.Columns[slots[i]].Type.Type).Type, table.Columns[slots[i]].Type.Type);
                 }
                 foreach (var check in insert.ViewChecks ?? []) _ = returnBinder.Bind(check);
-                await inputBinder.Initialize().ConfigureAwait(false); await returnBinder.Initialize().ConfigureAwait(false);
+                await inputBinder.Initialize().ConfigureAwait(false);
                 var results = new List<Row>(); var inserted = new List<SqlValue[]>(); var exclusionRows = new List<(StorageRecord Record, SqlValue[] Values)>();
                 long nextRow = -1;
                 if (table.PrimaryKey.Length == 0)
@@ -190,6 +196,7 @@ internal static partial class StatementExecution
                 HoldPendingMemory(pending, meter);
                 await ValidateExclusions(database, pending, table, exclusionRows, meter, cancellationToken, context).ConfigureAwait(false);
                 await ForeignCheck(context, () => ValidateForeignKeys(database, pending, table, inserted, cancellationToken)).ConfigureAwait(false);
+                await returnBinder.Initialize().ConfigureAwait(false);
                 if (returning.Length != 0) foreach (var values in inserted) results.Add((await QueryExecution.ProjectAsync(returning, ReturningRow(table, null, values), meter).ConfigureAwait(false)).RetainMemory(meter));
                 return new(returning.Select(p => new Column(p.Name, p.Expression.Type)).ToArray(), results.ToArray(), input.LongLength);
             }
@@ -252,17 +259,19 @@ internal static partial class StatementExecution
         var returnBinder = new SubqueryBinder(viewBinding?.Returning ?? ReturningColumns(table, aliases), database, pending.Before, readState, readState.Catalog, meter, cancellationToken, context?.Scope);
         var returning = Returning(table, items, pending.Catalog, meter, returnBinder, aliases);
         foreach (var check in viewChecks ?? []) _ = returnBinder.Bind(check);
-        if (filter is not null && Resolve.EmptyFilter(filter)) return new(returning.Select(projection => new Column(projection.Name, projection.Expression.Type)).ToArray(), [], 0);
-        await returnBinder.Initialize().ConfigureAwait(false);
         var initializationStart = meter.Accrued;
         await binder.Initialize().ConfigureAwait(false);
         context?.MutationObservation?.Filter?.AttributeLocal(meter.Accrued - initializationStart);
+        if (filter is not null && Resolve.EmptyFilter(filter)) return new(returning.Select(projection => new Column(projection.Name, projection.Expression.Type)).ToArray(), [], 0);
+        await returnBinder.Initialize().ConfigureAwait(false);
         var results = new List<Row>();
         var changes = new List<(StorageRecord Old, SqlValue[] Values)>();
         var storedRows = new Dictionary<string, StorageRecord>(StringComparer.Ordinal);
         var unchanged = Enumerable.Range(0, table.Columns.Length).Where(column => !table.PrimaryKey.Contains(column) && !(targets ?? []).Any(target => target.Slot == column)).ToHashSet();
         var storage = new QueryStorage(database, pending.Before, readState, readState.Catalog);
-        var access = AccessPlan.Select(table, scanTree, filter is null ? null : PlanTransform.InitialValues(filter), storage, meter);
+        var planningDomain = readState.Catalog.Scope?.Items.FirstOrDefault(domain => ReferenceEquals(domain.Database, database));
+        var planningTable = planningDomain is { Name: not ("main" or "temp") } ? table with { Domain = planningDomain } : table;
+        var access = AccessPlan.Select(planningTable, scanTree, filter is null ? null : PlanTransform.InitialValues(filter), storage, meter);
         var touched = new HashSet<int>();
         void Touch(Resolved? node)
         {
@@ -297,6 +306,13 @@ internal static partial class StatementExecution
                 (table.EncodeRow(change.Values, table.PrimaryKey.Length == 0 ? KeyEncoding.ReadInteger(change.Old.Key) : 0), change.Values)),
                 changes.Select(change => Convert.ToHexString(change.Old.Key)).ToHashSet(StringComparer.Ordinal), meter, cancellationToken).ConfigureAwait(false);
         var removed = 0;
+        var inPlace = new HashSet<string>(StringComparer.Ordinal);
+        var newKeys = new HashSet<string>(StringComparer.Ordinal);
+        var changedIndexes = new Dictionary<string, CatalogTable>(StringComparer.Ordinal);
+        if (targets is not null)
+            foreach (var change in changes)
+                if (!newKeys.Add(Convert.ToHexString(table.EncodeRow(change.Values, table.PrimaryKey.Length == 0 ? KeyEncoding.ReadInteger(change.Old.Key) : 0).Key)))
+                    throw new SqlException(SqlStates.UniqueViolation, "duplicate primary key");
         foreach (var change in changes)
         {
             var currentKey = context?.CurrentKey(table.Name, change.Old.Key) ?? (context is null ? change.Old.Key : null);
@@ -304,9 +320,20 @@ internal static partial class StatementExecution
             if (current is not null)
             {
                 var currentValues = await tree.MaterializeRecordAsync(current, cancellationToken).ConfigureAwait(false);
-                tree = await tree.DeleteAsync(current.Key, cancellationToken).ConfigureAwait(false);
-                await RemoveIndexes(database, pending, table, currentValues, meter, cancellationToken, assignments is null ? null : change.Values,
-                    assignments is null ? null : table.EncodeRow(change.Values, table.PrimaryKey.Length == 0 ? KeyEncoding.ReadInteger(change.Old.Key) : 0).Key).ConfigureAwait(false);
+                var replacement = assignments is null ? null : table.EncodeRow(change.Values, table.PrimaryKey.Length == 0 ? KeyEncoding.ReadInteger(change.Old.Key) : 0);
+                if (replacement is not null && current.Key.AsSpan().SequenceEqual(replacement.Key)) inPlace.Add(Convert.ToHexString(change.Old.Key));
+                else tree = await tree.DeleteAsync(current.Key, cancellationToken).ConfigureAwait(false);
+                var oldValues = table.DecodeRow(currentValues);
+                var indexTable = table with { Indexes = (table.Indexes ?? []).Where(index =>
+                {
+                    if (replacement is null || index.Kind == 1) return true;
+                    var oldEntry = IndexRecord(table, index, currentValues, oldValues, meter, pending.Catalog);
+                    var newEntry = IndexRecord(table, index, replacement, change.Values, meter, pending.Catalog);
+                    return (oldEntry is null) != (newEntry is null) || oldEntry is not null && newEntry is not null &&
+                        !oldEntry.Record.Key.AsSpan().SequenceEqual(newEntry.Record.Key);
+                }).ToArray() };
+                changedIndexes[Convert.ToHexString(change.Old.Key)] = indexTable;
+                await RemoveIndexes(database, pending, indexTable, currentValues, meter, cancellationToken, assignments is null ? null : change.Values, replacement?.Key).ConfigureAwait(false);
                 removed++;
             }
             context?.Move(table.Name, change.Old.Key, null);
@@ -316,9 +343,9 @@ internal static partial class StatementExecution
             if (targets is not null)
             {
                 var encoded = tree.KeepUnchangedChains(tree.PrepareRecord(table.EncodeRow(change.Values, table.PrimaryKey.Length == 0 ? KeyEncoding.ReadInteger(change.Old.Key) : 0), meter), storedRows[Convert.ToHexString(change.Old.Key)], unchanged);
-                if (await tree.FindAsync(encoded.Key, cancellationToken).ConfigureAwait(false) is not null) throw new SqlException(SqlStates.UniqueViolation, "duplicate primary key");
+                if (await tree.FindAsync(encoded.Key, cancellationToken).ConfigureAwait(false) is not null && !inPlace.Contains(Convert.ToHexString(change.Old.Key))) throw new SqlException(SqlStates.UniqueViolation, "duplicate primary key");
                 tree = await tree.UpsertAsync(encoded, cancellationToken).ConfigureAwait(false);
-                await AddIndexes(database, pending, table, encoded, change.Values, meter, cancellationToken).ConfigureAwait(false);
+                await AddIndexes(database, pending, changedIndexes.GetValueOrDefault(Convert.ToHexString(change.Old.Key), table), encoded, change.Values, meter, cancellationToken).ConfigureAwait(false);
                 context?.Move(table.Name, change.Old.Key, encoded.Key);
             }
         }

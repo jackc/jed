@@ -5,6 +5,10 @@ internal sealed class AggregateFloat
 {
     private bool nan, positiveInfinity, negativeInfinity;
     private double sum;
+    internal void Write(WireWriter writer)
+    { writer.Byte((byte)((nan ? 1 : 0) | (positiveInfinity ? 2 : 0) | (negativeInfinity ? 4 : 0))); writer.U64(BitConverter.DoubleToUInt64Bits(sum)); }
+    internal void Read(ref WireReader reader)
+    { var flags = reader.Byte(); nan = (flags & 1) != 0; positiveInfinity = (flags & 2) != 0; negativeInfinity = (flags & 4) != 0; sum = BitConverter.UInt64BitsToDouble(reader.U64()); }
     internal void Add(double value, bool single)
     {
         if (double.IsNaN(value)) nan = true;

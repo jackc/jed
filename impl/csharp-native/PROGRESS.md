@@ -258,3 +258,50 @@ Five plaintext fault traces now match the pinned Go transcripts across scoped ru
 Encrypted fault traces, relaxed-durability host integration, complete SQL planning and
 bounded hash/group/DISTINCT spill remain active work. The new keyed scratch-state utility
 is scaffolding awaiting dedicated validation and operator integration.
+
+### Bounded operators and canonical backend checks — 2026-11-13
+
+The next canonical memory run passes 679 of 763 files, with 18,856 records in
+passing files, 82 failures and two declared mode exclusions. Full host verification
+passes at the same source digest, `db0ab23f0e9fced13fca929bd46b5319bf30d595699b10e1108d3d40833ed9a1`.
+The adapter now honors each backend's exclusions and reopens disk files before
+every record. Earlier mixed-backend counts are historical diagnostics.
+
+Keyed scratch state, hash joins, aggregate state/collections, DISTINCT and external
+sorting now have bounded file implementations. Real SQL checks compare resident
+and spilled values, stable order and costs on plaintext and encrypted files with
+a one-byte query-memory account. These scoped checks include INNER/LEFT/RIGHT/FULL
+joins, ordered/hypothetical aggregates, grouping sets and DISTINCT windows. Shared
+corpus work still exposes exact memory-threshold and planner differences; the
+operators are not yet declared conformant across the full baseline.
+
+Exact-memory follow-up found that ordinary two-input nested-loop joins must retain
+their resident lane; only hash or physical multi-step joins, or a grouped/DISTINCT
+parent, select bounded blocking execution. The broader experimental spill dispatch
+was narrowed accordingly. Passing a standalone RIGHT/FULL spill comparison did not
+establish that those shapes were allowed to change their memory-admission schedule.
+
+All 31 process scenarios pass across scoped runs. Relaxed durability is integrated;
+the relaxed-close trace and five other plaintext fault traces match the pinned Go
+transcripts. Encrypted recovery still has physical-image differences under
+investigation. Linux file growth uses geometric reserve and durable data barriers.
+The separate encrypted SQL comparison establishes exact row/type/error/cost/plan
+agreement for 542 files at an earlier snapshot; 610 row/type/error successes alone
+were not complete encrypted acceptance. Current-source NativeAOT, full backend
+parity, complete fault verification and performance measurements remain open.
+
+### Join search, interval sets and recursive queries — 2026-11-13
+
+The canonical memory diagnostic now passes 710 of 763 files (20,266 records), with
+51 failures and two declared mode exclusions, at source
+`b012d973d295869a3b8cfa9fd28dd71d2e55e1f1da3e3eb097d91d6af8e31bb4`.
+The complete JIT host task passes at that capture. SEARCH/CYCLE, CTAS, views,
+composite interval-set EXPLAIN and several two-way join files now pass completely.
+N-way search, retained access identities, body pushdown and exact memory admission
+remain under corpus-driven refinement. A full pass is not claimed.
+
+Bounded aggregate execution passes all 52 aggregate files with forced disk
+spilling at a prior capture, including ordered collections. Shared group/DISTINCT
+spill thresholds and upstream SRF memory accounting have focused passing evidence.
+Encrypted recovery now reproduces every physical image in its saved regression;
+SQL cost checks and additional simulator traces remain separate acceptance work.

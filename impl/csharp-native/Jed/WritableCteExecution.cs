@@ -46,6 +46,7 @@ internal static class WritableCteExecution
             else
             {
                 var isRecursive = recursive && CteBuffer.References(definition.Query, definition.Name) > 0;
+                if (!isRecursive && (definition.Search is not null || definition.Cycle is not null)) throw Errors.Syntax("SEARCH/CYCLE query is not recursive");
                 body = isRecursive ? RecursiveExecution.Prepare(definition, database, read.Before, read, read.Catalog, meter, token, scope) :
                     RelationExecution.Query(definition.Query, database, read.Before, read, read.Catalog, meter, token, scope: scope);
                 materialized = references > 0 && (isRecursive || definition.Materialized == true || definition.Materialized is null && references > 1);
@@ -55,12 +56,15 @@ internal static class WritableCteExecution
                     body = body with { Rows = buffer.Read(token), MemoryOutput = true };
                 }
             }
+            var mutationReference = primary is not SelectSyntax && References(primary, definition.Name) > 0 ||
+                definitions.Any(later => later.Mutation is { } mutation && References(mutation, definition.Name) > 0);
+            if (materialized || references != 1 || mutationReference) body = body with { PushFilter = null, BaseAccess = null };
             if (meter.Explain is not null && body.Plan is { } definitionPlan)
             {
                 var inlined = references > 0 && !materialized;
                 explanations.Add((new("CTE " + definition.Name, materialized ? "materialized" : "inlined",
-                    definitionPlan.EstimatedRows, inlined ? 0 : definitionPlan.EstimatedCost, inlined ? [] : [definitionPlan]), materialized));
-                body = body with { Cte = new(definition.Name, materialized, definitionPlan) };
+                    definitionPlan.EstimatedRows, inlined ? 0 : definitionPlan.EstimatedCost, definitionPlan), materialized));
+                body = body with { Cte = new(definition.Name, materialized, definitionPlan, DefinitionVisible: true) };
             }
             body = body with { Columns = RelationExecution.Alias(body.Columns, definition.Name, definition.Columns) };
             var nextScope = new QueryScope(scope); nextScope.Add(definition.Name, body); scope = nextScope;
@@ -76,7 +80,11 @@ internal static class WritableCteExecution
             ExplainExecution.Prepare(primary, database, read.Before, read, read.Catalog, meter, token, scope).Root;
         var rootPlan = primaryPlan is null ? null : new ExplainNode("WITH", "ctes=" + definitions.Length,
             primaryPlan.EstimatedRows, explanations.Where(item => item.Executed).Aggregate(primaryPlan.EstimatedCost, (sum, item) => Estimate.Add(sum, item.Node.EstimatedCost)),
-            explanations.Select(item => item.Node).Append(primaryPlan).ToArray());
+            explanations.Select(item => item.Node).Append(primaryPlan).ToArray())
+            {
+                SumChildren = false,
+                HiddenActual = () => explanations.Where(item => item.Executed).Aggregate(primaryPlan.ActualCost, (sum, item) => Estimate.Add(sum, item.Node.ActualCost))
+            };
         async ValueTask<StatementResult> Run()
         {
             try

@@ -2,13 +2,17 @@ namespace Jed;
 
 internal sealed record Expression(string Op, string Text, Expression[] Args, int Height = 0, Resolved? Binding = null, Expression? Predicate = null, TypeSpec? Type = null, SelectSyntax? Query = null, TemporalContext? Context = null, ParameterSlot? Parameter = null, OrderSyntax[]? AggregateOrder = null, WindowSyntax? Window = null, JsonSqlSpec? Json = null);
 internal sealed record SelectItem(Expression Expression, string? Alias);
-internal sealed record OrderSyntax(Expression Expression, bool Descending, bool? NullsFirst);
+internal sealed record OrderSyntax(Expression Expression, bool Descending, bool? NullsFirst)
+{
+    internal int? OutputIndex { get; init; }
+}
 internal sealed record SelectSyntax(SelectItem[] Items, Expression? Filter, long? Limit, long Offset,
     string? Table = null, string? TableAlias = null, OrderSyntax[]? Order = null, bool Distinct = false, Expression[]? GroupBy = null, Expression? Having = null, RelationSyntax? Relation = null, bool ValuesQuery = false, bool SetQuery = false, CteSyntax[]? With = null, bool Recursive = false, Dictionary<string, WindowSyntax>? Windows = null, int[][]? GroupingSets = null, bool GroupingExpansion = false) : StatementSyntax
 {
     internal Expression[]? DistinctOn { get; init; }
     internal Expression? LimitExpression { get; init; }
     internal Expression? OffsetExpression { get; init; }
+    internal int ParseDepth { get; init; } = 1;
     internal bool HasLimit { get; init; }
     internal bool HasOffset { get; init; }
 }
@@ -22,6 +26,7 @@ internal sealed partial class Parser
     private readonly List<Token> lookahead = [];
     private List<Token>? capturedTokens = null;
     private int nesting;
+    private readonly List<int> queryDepths = [];
     internal Parser(string sql) { lexer = new(sql); token = lexer.Next(); }
     private bool Is(string text) => token.Kind is TokenKind.Word or TokenKind.Symbol && token.Text == text;
     private Token Peek(int distance = 1)
@@ -38,8 +43,9 @@ internal sealed partial class Parser
     }
     private bool Eat(string text) { if (!Is(text)) return false; Take(); return true; }
     private void Expect(string text) { if (!Eat(text)) throw Errors.Syntax($"expected {text}"); }
-    private static void Depth(int depth)
+    private void Depth(int depth)
     {
+        for (var i = 0; i < queryDepths.Count; i++) queryDepths[i] = Math.Max(queryDepths[i], depth);
         if (depth > MaxDepth) throw new SqlException(SqlStates.StatementTooComplex, "expression nesting exceeds 256");
     }
     private Expression Node(string op, string text, params Expression[] args)
@@ -63,7 +69,16 @@ internal sealed partial class Parser
         if (token.Kind != TokenKind.End) throw Errors.Syntax($"unexpected token: {token.Text}");
         return statement;
     }
-    private SelectSyntax Select() => Eat("with") ? WithQuery() : QueryTail(SetQueryBody(0));
+    private SelectSyntax Select()
+    {
+        queryDepths.Add(nesting + 1);
+        try
+        {
+            var query = Eat("with") ? WithQuery() : QueryTail(SetQueryBody(0));
+            return query with { ParseDepth = queryDepths[^1] };
+        }
+        finally { queryDepths.RemoveAt(queryDepths.Count - 1); }
+    }
     private SelectSyntax SetQueryBody(int minimum)
     {
         SelectSyntax left;
@@ -87,7 +102,7 @@ internal sealed partial class Parser
         var ownsInto = intoAllowed; intoAllowed = false;
         if (Is("values")) return new([new(Node("star", ""), null)], null, null, 0, Relation: ValuesBody(), ValuesQuery: true);
         Expect("select");
-        var distinct = Eat("distinct");
+        var distinct = Is("distinct") && Peek().Text != "from" && Eat("distinct");
         if (!distinct) Eat("all");
         Expression[]? distinctOn = null;
         if (distinct && Is("on") && Peek().Text == "(")
@@ -176,7 +191,7 @@ internal sealed partial class Parser
     private Expression Expr(int minimum = 0)
     {
         Depth(nesting);
-        Expression left;
+        Expression left; var fieldBase = false;
         if (Eat("("))
         {
             nesting++; Depth(nesting);
@@ -184,8 +199,10 @@ internal sealed partial class Parser
             else left = Expr();
             if (left.Op == "subquery" && (Is("union") || Is("except") || Is("intersect")))
                 left = left with { Query = QueryTail(SetQueryTail(left.Query!, 0)) };
+            fieldBase = true;
             if (Eat(","))
             {
+                fieldBase = false;
                 var fields = new List<Expression> { left }; do { fields.Add(Expr()); } while (Eat(","));
                 left = Node("row", "", fields.ToArray());
             }
@@ -322,6 +339,7 @@ internal sealed partial class Parser
             }
             if (Is(".") && minimum <= 80)
             {
+                if (!fieldBase) throw Errors.Syntax("field access requires a parenthesized base");
                 Take(); left = Eat("*") ? Node("field_star", "", left) : Node("field", Name(), left); continue;
             }
             if (Is("::") && minimum <= 80)
@@ -412,6 +430,8 @@ internal sealed partial class Parser
                 var quantifier = Take().Text; Expect("(");
                 var subquery = Is("select") || Is("values") || Is("with");
                 var array = subquery ? Node("subquery_set", "") with { Query = Select() } : Expr();
+                if (array.Op == "subquery" && (Is("union") || Is("intersect") || Is("except")))
+                    array = array with { Query = QueryTail(SetQueryTail(array.Query!, 0)) };
                 Expect(")"); nesting--;
                 if (array.Op == "subquery") { array = array with { Op = "subquery_set" }; subquery = true; }
                 left = Node(subquery ? "quantified_subquery" : "quantified", operation + " " + (quantifier == "all" ? "all" : "any"), left, array);

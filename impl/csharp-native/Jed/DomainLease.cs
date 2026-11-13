@@ -8,7 +8,7 @@ internal sealed class DomainLease : IDisposable, IAsyncDisposable
     {
         internal readonly Database Root = root;
         internal readonly List<(Database Database, PendingDatabase Pending)> Writers = [];
-        internal readonly List<Database.SnapshotPin> Pins = [];
+        internal readonly Dictionary<Database, Database.SnapshotPin> Pins = [];
         internal int References = 1;
         internal bool WritersReleased;
     }
@@ -24,7 +24,7 @@ internal sealed class DomainLease : IDisposable, IAsyncDisposable
             shared.References++; return new(shared, Scope);
         }
     }
-    internal void CheckRoles() { foreach (var pin in shared.Pins) pin.CheckRole(); }
+    internal void CheckRoles() { foreach (var pin in shared.Pins.Values) pin.CheckRole(); }
     internal static async ValueTask<DomainLease> Acquire(Database root, Database? temporary, bool writePersistent, bool writeTemporary, CancellationToken token)
     {
         var registry = root.AcquireAttachmentRegistry(); var shared = new Shared(root);
@@ -43,7 +43,7 @@ internal sealed class DomainLease : IDisposable, IAsyncDisposable
             {
                 foreach (var entry in entries)
                 {
-                    var pin = await entry.Database.PinAsync(token).ConfigureAwait(false); shared.Pins.Add(pin);
+                    var pin = await entry.Database.PinAsync(token).ConfigureAwait(false); shared.Pins.Add(entry.Database, pin);
                     var pending = shared.Writers.FirstOrDefault(writer => ReferenceEquals(writer.Database, entry.Database)).Pending;
                     domains.Add(new(entry.Name, entry.Database, pending?.Before ?? pin.Snapshot, pending, entry.ReadOnly));
                 }
@@ -57,6 +57,19 @@ internal sealed class DomainLease : IDisposable, IAsyncDisposable
             catch (Exception) { } // Preserve the acquisition failure after releasing every resource.
             throw;
         }
+    }
+    // A writer gate protects its pending roots without a reader watermark. A
+    // cursor retaining this lease still needs those old roots after publication.
+    internal async ValueTask ReleaseWriterPinsForCommitAsync()
+    {
+        List<Database.SnapshotPin> released = [];
+        lock (shared)
+        {
+            if (shared.References != 1) return;
+            foreach (var writer in shared.Writers)
+                if (shared.Pins.Remove(writer.Database, out var pin)) released.Add(pin);
+        }
+        foreach (var pin in released) await pin.DisposeAsync().ConfigureAwait(false);
     }
     internal async ValueTask ReleaseWriters()
     {
@@ -82,7 +95,7 @@ internal sealed class DomainLease : IDisposable, IAsyncDisposable
         }
         Exception? failure = null;
         try { await ReleaseWriters().ConfigureAwait(false); } catch (Exception error) { failure = error; }
-        foreach (var pin in shared.Pins)
+        foreach (var pin in shared.Pins.Values)
             try { await pin.DisposeAsync().ConfigureAwait(false); }
             catch (Exception error) { failure ??= error; }
         shared.Root.ReleaseAttachmentRegistry();

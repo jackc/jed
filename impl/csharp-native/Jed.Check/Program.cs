@@ -54,6 +54,7 @@ try
         await FileInteropTests.Run(peerExecutable);
     }
     else if (args is ["spill-operators"]) { await SpillOperatorTests.Run(); await SqlSpillTests.Run(); }
+    else if (args is ["inspect", var inspectPath]) await QueryInspect.Run(inspectPath);
     else if (args is ["simulation", var simulationPath]) await SimulationRunner.Run(simulationPath);
     else if (args is ["simulation-host"]) await SimulationHostTests.Run();
     else if (args is ["rekey", var rekeyRoot]) await RekeyTests.Run(rekeyRoot);
@@ -96,15 +97,35 @@ try
         StorageCryptoTests.Run(cryptoRoot);
         await StorageCryptoTests.Recovery(cryptoRoot);
     }
-    else if (args.Length > 1 && args[0] is "corpus" or "corpus-file")
+    else if (args is ["simulation-image", var imagePath, var imageKey])
+        await SimulationImageDump.Run(imagePath, int.Parse(imageKey, System.Globalization.CultureInfo.InvariantCulture));
+    else if (args.Length > 1 && args[0] is "corpus" or "corpus-file" or "corpus-encrypted")
     {
-        var failures = 0; var records = 0;
+        var failures = 0; var records = 0; var skipped = 0;
+        var transcript = new List<string>();
+        var encrypted = args[0] == "corpus-encrypted";
+        var transcriptPath = Environment.GetEnvironmentVariable("JED_CONFORMANCE_TRANSCRIPT");
+        if (encrypted && string.IsNullOrEmpty(transcriptPath)) throw new ArgumentException("encrypted corpus requires JED_CONFORMANCE_TRANSCRIPT for independent comparison");
         foreach (var file in args.Skip(1))
         {
-            try { records += await Corpus.Run(file, args[0] == "corpus-file"); }
+            try
+            {
+                static string Flat(string value) => value.Replace("\\", "\\\\").Replace("\n", "\\n").Replace("\t", "\\t");
+                var relative = file.Replace('\\', '/');
+                var marker = relative.LastIndexOf("/suites/", StringComparison.Ordinal);
+                if (marker >= 0) relative = relative[(marker + 8)..];
+                void Capture(string kind, string sql, string actual) => transcript.Add(relative + "\t" + kind + "\t" + Flat(sql) + "\t" + Flat(actual));
+                var count = await Corpus.Run(file, args[0] != "corpus", encrypted ? Capture : null);
+                records += count; if (count == 0) skipped++;
+            }
             catch (Exception error) { Console.Error.WriteLine(error.Message); failures++; }
         }
-        Console.WriteLine($"{args.Length - 1} selected files, {records} records in passing files, {failures} failed files; no full-parity claim");
+        if (encrypted)
+        {
+            await File.WriteAllLinesAsync(transcriptPath!, transcript);
+            Console.WriteLine($"Encrypted cost/EXPLAIN transcript: {transcriptPath}; independent comparison remains required");
+        }
+        Console.WriteLine($"{args.Length - 1} selected files, {records} records in passing files, {failures} failed files, {skipped} declared mode exclusions; no full-parity claim");
         if (failures > 0) return 1;
     }
     else

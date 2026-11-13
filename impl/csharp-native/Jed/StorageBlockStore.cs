@@ -184,10 +184,19 @@ internal sealed class FileBlockStore : IBlockStore
     public ValueTask SyncAsync(CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        // .NET exposes no asynchronous durable fsync API. A full fsync is the
-        // sanctioned, correct fallback for a host without a data-only barrier.
-        // FlushAsync alone is NOT a durable barrier; do not hide fsync in Task.Run.
-        stream.Flush(flushToDisk: true);
+        // The Linux host uses a data-only barrier for already allocated pages.
+        // Growth retains its full fsync above. There is no async durable syscall;
+        // FlushAsync alone does not provide durability.
+        if (OperatingSystem.IsLinux())
+        {
+            while (SyncDataHandle(Handle) != 0)
+            {
+                var error = Marshal.GetLastPInvokeError();
+                if (error != 4) throw new IOException($"fdatasync failed (errno {error})");
+                cancellationToken.ThrowIfCancellationRequested();
+            }
+        }
+        else stream.Flush(flushToDisk: true);
         return ValueTask.CompletedTask;
     }
 
@@ -212,4 +221,7 @@ internal sealed class FileBlockStore : IBlockStore
 
     [DllImport("libc", EntryPoint = "fsync", SetLastError = true)]
     private static extern int SyncDirectoryHandle(SafeFileHandle handle);
+
+    [DllImport("libc", EntryPoint = "fdatasync", SetLastError = true)]
+    private static extern int SyncDataHandle(SafeFileHandle handle);
 }

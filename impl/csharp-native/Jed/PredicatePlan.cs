@@ -24,6 +24,12 @@ internal static class PredicatePlan
     {
         var local = expression.Op is "column" or "outer" or "constant" or "promote" ? 0L : 1;
         if (expression.Op == "in_list") local = 2L * (expression.Args.Length - 1) - 1;
+        if (expression.Op == "quantified" && expression.Args.Length == 2)
+        {
+            var array = expression.Args[1];
+            if (array.Op == "constant" && !array.ParameterUnbound && !array.Constant.IsNull) local += array.Constant.AsArray().Values.Count;
+            else if (array.Op == "array" && array.Text != "nested") local += array.Args.Length;
+        }
         foreach (var arg in expression.Args) { var count = Nodes(arg); local = local > long.MaxValue - count ? long.MaxValue : local + count; }
         return local;
     }
@@ -48,6 +54,8 @@ internal static class PredicatePlan
             return expression.Target?.Precision is null && (expression.Type == expression.Args[0].Type || PlannerFacts.SafeCasts.Contains((expression.Args[0].Type, expression.Type))) && Value(expression.Args[0]);
         return expression.Function is { } function && PlannerFacts.SafeFunctions.Contains(function.Name, StringComparer.Ordinal) && expression.Args.All(Value);
     }
+    internal static bool PreservesEquality(Resolved expression) =>
+        !(expression.Op is "cast" or "promote" && PlannerFacts.NonEqualityCasts.Contains((expression.Args[0].Type, expression.Type))) && expression.Args.All(PreservesEquality);
     internal static HashSet<int> Slots(Resolved expression)
     {
         var slots = new HashSet<int>();

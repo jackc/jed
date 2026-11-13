@@ -25,7 +25,7 @@ public sealed partial class Session : IAsyncDisposable
     private readonly SessionOptions options;
     private TimeZoneData? timeZones;
     private UnicodeData? unicodeData;
-    internal TemporalContext NewTemporalContext(QueryOptions? query = null) => new(query?.Clock ?? options.Clock ?? SessionOptions.HostClock, query?.TimeZone ?? options.TimeZone, timeZones, unicodeData);
+    internal TemporalContext NewTemporalContext(QueryOptions? query = null) => new(query?.Clock ?? options.Clock ?? database?.Clock ?? SessionOptions.HostClock, query?.TimeZone ?? options.TimeZone, timeZones, unicodeData);
 
     public Session(long lifetimeMaxCost = 0) : this(new SessionOptions { LifetimeMaxCost = lifetimeMaxCost }) { }
 

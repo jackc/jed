@@ -2,9 +2,9 @@ using System.Globalization;
 using System.Security.Cryptography;
 using Jed;
 
-internal sealed class SimulationRunner
+internal sealed partial class SimulationRunner
 {
-    private sealed record Handle(Session Session, bool Write, ulong Version);
+    private sealed record Handle(Session Session, bool Write, ulong Version, Dictionary<string, ulong> Attachments);
     private readonly SimulationTrace trace;
     private readonly SimulationFileSystem fs;
     private readonly Dictionary<string, Handle> sessions = new(StringComparer.Ordinal);
@@ -39,6 +39,8 @@ internal sealed class SimulationRunner
     {
         var random = new SeededRandomSource(SimulationFileSystem.Decide(trace.Seed, 14, openings++, 0, 0));
         return new() { FileHost = fs, ScratchDevices = fs, Locking = FileLocking.None,
+            Synchronous = trace.Synchronous == "off" ? Synchronous.Off : Synchronous.On,
+            FlushIntervalMilliseconds = trace.FlushIntervalMilliseconds, Clock = () => clock, EnableIdleFlush = false,
             CacheBytes = trace.CacheBytes == 0 ? 256L * 1024 * 1024 : trace.CacheBytes,
             Entropy = count => new byte[count], KeyEntropy = random.Fill, ScratchEntropy = new SeededRandomSource(trace.Seed).Fill,
             ScratchEncryption = trace.Encrypted ? ScratchEncryption.On : ScratchEncryption.Auto, Credential = key < 0 ? null : keys[key] };
@@ -53,13 +55,12 @@ internal sealed class SimulationRunner
     {
         // Reject unsupported driver modes explicitly, before running a partial
         // history. A passing trace always executes every requested operation.
-        if (trace.Synchronous != "on") throw new NotSupportedException("simulation relaxed driver mode is not implemented yet");
         foreach (var step in trace.Steps)
-            if (step.Operation is not ("open" or "on" or "commit" or "rollback" or "close" or "fault" or "crash" or "reopen" or "compact" or "check" or "clock" or "change_key" or "rekey"))
+            if (step.Operation is not ("open" or "on" or "commit" or "rollback" or "close" or "fault" or "crash" or "reopen" or "compact" or "check" or "clock" or "change_key" or "rekey" or "attach"))
                 throw new NotSupportedException("simulation operation " + step.Operation);
         database = await Database.CreateFileAsync("sim.jed", Options(), trace.PageSize);
         await database.DisposeAsync();
-        database = await Database.OpenFileAsync("sim.jed", Options());
+        database = await Database.OpenFileAsync("sim.jed", processOptions = Options());
         Configure(); version = floor = attempted = database.Version;
         AddHistory(version, await Digest());
         foreach (var step in trace.Steps)
@@ -89,7 +90,11 @@ internal sealed class SimulationRunner
     private async Task CloseClean()
     {
         foreach (var handle in sessions.Values) await handle.Session.DisposeAsync();
-        sessions.Clear(); await database.DisposeAsync();
+        sessions.Clear(); var closingVersion = database.Version;
+        await database.DisposeAsync();
+        if (fs.EntryDurable("sim.jed") && fs.ContentDurable("sim.jed")) floor = Math.Max(floor, closingVersion);
+        foreach (var state in attached.Values)
+            if (fs.EntryDurable(state.File) && fs.ContentDurable(state.File)) state.Floor = Math.Max(state.Floor, state.Version);
     }
     private static int Parameter(string[] args, string name, int fallback)
     {
@@ -107,6 +112,8 @@ internal sealed class SimulationRunner
             json.Start(step.Index, "fault").Text("kind", kind); Emit(); return;
         }
         var active = armed; armed = null; fs.BeginStep((ulong)step.Index, active); pendingDigest = null; keyAttempt = null;
+        foreach (var state in attached.Values) state.Pending = null;
+        var attachmentStarts = attached.ToDictionary(pair => pair.Key, pair => pair.Value.Version, StringComparer.Ordinal);
         var start = version;
         if (step.Operation == "crash")
         {
@@ -119,6 +126,7 @@ internal sealed class SimulationRunner
         {
             switch (step.Operation)
             {
+                case "attach": await AttachDomain(args[0]); break;
                 case "open":
                 {
                     if (args.Length > 2) throw new NotSupportedException("simulation service process handle");
@@ -126,7 +134,9 @@ internal sealed class SimulationRunner
                     var write = args[1] == "write";
                     if (!write && args[1] != "read") throw new InvalidDataException("invalid session mode");
                     var session = write ? await database.OpenWriteSessionAsync(SessionOptions((ulong)step.Index)) : await database.OpenReadSessionAsync(SessionOptions((ulong)step.Index));
-                    sessions.Add(args[0], new(session, write, database.Version)); json.Number("version", database.Version); break;
+                    var versions = AttachmentVersions();
+                    sessions.Add(args[0], new(session, write, database.Version, versions));
+                    json.Number("version", database.Version); WriteAttachmentVersions(versions); break;
                 }
                 case "on":
                     if (!sessions.TryGetValue(args[0], out var querying)) { json.Flag("skip", true); break; }
@@ -134,18 +144,34 @@ internal sealed class SimulationRunner
                     json.Number("rows", rows.Rendered.Length).Number("affected", rows.Affected).Text("hash", rows.Hash).Number("cost", rows.Cost); break;
                 case "commit":
                     if (!sessions.Remove(args[0], out var committing)) { json.Flag("skip", true); break; }
-                    try { pendingDigest = await SimulationRows.Digest(committing.Session, fs); }
+                    try { pendingDigest = await SimulationRows.Digest(committing.Session, fs); await PrepareAttachedCommit(committing.Session); }
                     catch (SqlException error) when (error.SqlState == SqlStates.InFailedSqlTransaction) { }
                     var beforeCommit = database.CommittedStorageForTesting();
+                    var attachedBefore = attached.ToDictionary(pair => pair.Key, pair => pair.Value.Database.CommittedStorageForTesting(), StringComparer.Ordinal);
                     await committing.Session.CommitAsync();
                     version = database.Version;
+                    if (Environment.GetEnvironmentVariable("JED_SIM_OUT") is { Length: > 0 } stateDirectory)
+                    {
+                        var state = database.CommittedStorageForTesting();
+                        File.AppendAllText(Path.Combine(stateDirectory, "commits.jsonl"), System.Text.Json.JsonSerializer.Serialize(new
+                        {
+                            step = step.Index, version, state.ReclamationLive, state.FreeGeneration,
+                            free = state.FreePages.Count, state.Meta.PageCount, oldest = database.OldestLiveVersion
+                        }) + "\n");
+                    }
                     var digest = await Digest();
                     SimulationStorageChecks.Require(pendingDigest is null || pendingDigest == digest, "acknowledged commit differs from pending session");
                     SimulationStorageChecks.Require(version != start || history[start].Contains(digest), "unchanged commit changed contents");
-                    AddHistory(version, digest); floor = version;
+                    AddHistory(version, digest);
+                    if (version != start && fs.EntryDurable("sim.jed"))
+                    {
+                        var committed = database.CommittedStorageForTesting();
+                        floor = Math.Max(floor, committed.Batch?.FloorTransactionId ?? version);
+                    }
                     await Oracle(() => SimulationStorageChecks.Live(database));
                     if (version != start) CheckGrowth(beforeCommit, active is null && sessions.Count == 0);
-                    json.Number("version", version); break;
+                    json.Number("version", version);
+                    await FinishAttachedCommit(attachedBefore, active is null && sessions.Count == 0); break;
                 case "rollback":
                 case "close":
                     if (!sessions.Remove(args[0], out var closing)) { json.Flag("skip", true); break; }
@@ -153,14 +179,15 @@ internal sealed class SimulationRunner
                     {
                         var pinned = await SimulationRows.Digest(closing.Session, fs);
                         SimulationStorageChecks.Require(history[closing.Version].Contains(pinned), "reader snapshot changed while pinned");
+                        await CheckAttachedReader(closing);
                     }
                     await closing.Session.DisposeAsync(); break;
                 case "clock": clock = checked(clock + long.Parse(args[0], CultureInfo.InvariantCulture)); break;
                 case "reopen":
-                    await CloseClean(); database = await Database.OpenFileAsync("sim.jed", Options()); Configure();
+                    await CloseClean(); database = await Database.OpenFileAsync("sim.jed", processOptions = Options()); Configure(); await ReattachDomains();
                     version = database.Version; var reopened = await Digest();
                     SimulationStorageChecks.Require(history[version].Contains(reopened), "clean reopen changed contents");
-                    json.Number("version", version).Text("digest", reopened); break;
+                    json.Number("version", version).Text("digest", reopened); await AttachedFields(false, summary: true); break;
                 case "change_key":
                     if (!trace.Encrypted) { json.Flag("skip", true); break; }
                     var replacementKey = int.Parse(args[0], CultureInfo.InvariantCulture);
@@ -184,7 +211,7 @@ internal sealed class SimulationRunner
                     AddHistory(version, pendingDigest); floor = version; Configure(); json.Number("version", version); break;
                 case "check":
                     await Oracle(() => SimulationStorageChecks.Live(database));
-                    await Fields(false); break;
+                    await Fields(false); await AttachedFields(false); break;
                 default: throw new NotSupportedException("simulation operation " + step.Operation);
             }
         }
@@ -197,41 +224,48 @@ internal sealed class SimulationRunner
         }
         Emit();
         if (fs.DurableBarrier("sim.jed")) floor = Math.Max(floor, start);
+        foreach (var state in attached.Values)
+            if (fs.DurableBarrier(state.File) && attachmentStarts.TryGetValue(state.Name, out var old)) state.Floor = Math.Max(state.Floor, old);
         if (active is not null)
         { fs.EndFaultedStep(); var fired = fs.Fired; await Recover(step.Index, fired); }
     }
     private void CheckGrowth(StorageRecovered before, bool quiet)
+        => CheckGrowth(database, "sim.jed", before, quiet, ref growthBound, ref previousReclaimed);
+    private void CheckGrowth(Database selected, string path, StorageRecovered before, bool quiet, ref long bound, ref bool previouslyReclaimed)
     {
-        var after = database.CommittedStorageForTesting();
-        var written = fs.WrittenPages("sim.jed").Where(page => page >= 2).ToArray();
-        var threshold = Math.Max(16, 2 * growthBound);
+        var after = selected.CommittedStorageForTesting();
+        var firstBody = after.Encrypted is null ? 2u : 4u;
+        var written = fs.WrittenPages(path).Where(page => page >= firstBody).ToArray();
+        var threshold = Math.Max(16, 2 * bound);
         var reclaim = quiet && before.Meta.PageCount - before.FreePages.Count > threshold;
         if (quiet)
         {
-            if (reclaim) SimulationStorageChecks.Require((long)after.Meta.PageCount - 2 - after.Meta.LivePages - after.FreePages.Count <= written.Length,
+            if (reclaim) SimulationStorageChecks.Require((long)after.Meta.PageCount - firstBody - after.Meta.LivePages - after.FreePages.Count <= written.Length,
                 "quiet commit exceeded reclamation threshold without reclaiming unreachable pages");
-            if (previousReclaimed) SimulationStorageChecks.Require((long)after.Meta.PageCount - before.Meta.PageCount <= Math.Max(0, written.Length - before.FreePages.Count),
+            var reusable = before.Batch is null ? before.FreePages : new SortedSet<uint>(before.FreePages
+                .Intersect(before.Batch.FloorFree).Except(before.Batch.Pending.Select(entry => entry.Page)));
+            if (previouslyReclaimed) SimulationStorageChecks.Require((long)after.Meta.PageCount - before.Meta.PageCount <= Math.Max(0, written.Length - reusable.Count),
                 "commit grew without first reusing the reclaimed free list");
             var tail = before.Meta.PageCount;
-            while (tail > 2 && before.FreePages.Contains(tail - 1)) tail--;
+            while (tail > firstBody && reusable.Contains(tail - 1)) tail--;
             var high = written.Length == 0 ? 0 : written.Max() + 1;
             SimulationStorageChecks.Require(after.Meta.PageCount == Math.Max(tail, high), "quiet commit did not use canonical trailing truncation/high-water");
-            if (after.Meta.PageCount < before.Meta.PageCount)
+            if (after.Batch is null && after.Meta.PageCount < before.Meta.PageCount)
             {
                 var allowance = Math.Clamp((long)after.Meta.PageCount, Math.Max(1, 16 * 1024 / trace.PageSize), Math.Max(1, 1024 * 1024 / trace.PageSize));
-                SimulationStorageChecks.Require(fs.Image("sim.jed").LongLength <= ((long)after.Meta.PageCount + allowance) * trace.PageSize,
+                SimulationStorageChecks.Require(fs.Image(path).LongLength <= ((long)after.Meta.PageCount + allowance) * trace.PageSize,
                     "trailing truncation retained more than one growth step of slack");
             }
         }
-        growthBound = Math.Max(growthBound, (long)after.Meta.LivePages + written.Length); previousReclaimed = reclaim;
+        bound = Math.Max(bound, (long)after.Meta.LivePages + written.Length); previouslyReclaimed = reclaim;
     }
     private void RecordAttempt(ulong start)
-    { if (pendingDigest is not null && fs.WrittenPages("sim.jed").Count > 0) AddHistory(start + 1, pendingDigest); }
+    { if (pendingDigest is not null && fs.WrittenPages("sim.jed").Count > 0) AddHistory(start + 1, pendingDigest); RecordAttachedAttempts(); }
     private async Task Oracle(Func<Task> action)
     { var before = fs.OracleReads; fs.OracleReads = true; try { await action(); } finally { fs.OracleReads = before; } }
-    private async Task Fields(bool recovered)
+    private async Task Fields(bool recovered, byte[]? recoveredImage = null)
     {
-        var digest = await Digest(); var bytes = fs.Image("sim.jed");
+        var digest = await Digest(); var bytes = recoveredImage ?? fs.Image("sim.jed");
         if (Environment.GetEnvironmentVariable("JED_SIM_OUT") is { Length: > 0 } output)
         {
             Directory.CreateDirectory(output);
@@ -244,6 +278,9 @@ internal sealed class SimulationRunner
     {
         sessions.Clear(); fs.Restart();
         var image = fs.Image("sim.jed");
+        var attachmentImages = new Dictionary<string, byte[]>(StringComparer.Ordinal);
+        foreach (var state in attached.Values)
+            if (await fs.ExistsAsync(state.File)) attachmentImages.Add(state.Name, fs.Image(state.File));
         bool Unlocks(int candidate)
         {
             if (image[6] == 0) return candidate < 0;
@@ -262,7 +299,7 @@ internal sealed class SimulationRunner
                 oldWorks && !newWorks && !change.Acknowledged || !oldWorks && newWorks || change.EntryPending && !oldWorks && !newWorks,
                 "credential recovery violates atomic replacement or acknowledged durability");
         }
-        var options = Options(); var oldKey = key; var opened = false;
+        var options = processOptions = Options(); var oldKey = key; var opened = false;
         foreach (var candidate in new[] { key, -1, 0, 1, 2, 3 }.Distinct())
         {
             if (!trace.Encrypted && candidate != -1) continue;
@@ -276,9 +313,10 @@ internal sealed class SimulationRunner
         SimulationStorageChecks.Require(opened, "recovery cannot unlock with any authorized simulation key");
         if (key != oldKey || keyAttempt is not null) { json.Start(step, "unlocked").Number("key", key); Emit(); }
         Configure(); version = database.Version;
+        await ReattachDomains();
         SimulationStorageChecks.Require(version >= floor && version <= attempted, $"recovered generation {version} outside durability window {floor}..{attempted}");
         var digest = await Digest();
         SimulationStorageChecks.Require(history.TryGetValue(version, out var values) && values.Contains(digest), "recovered unrecorded contents");
-        json.Start(step, "crash").Text("fired", fired); await Fields(true); Emit();
+        json.Start(step, "crash").Text("fired", fired); await Fields(true, image); await AttachedFields(true, attachmentImages); Emit();
     }
 }

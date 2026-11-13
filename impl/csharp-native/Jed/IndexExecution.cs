@@ -157,7 +157,10 @@ internal static partial class StatementExecution
     }
     private static async ValueTask<StatementResult> CreateIndex(Database database, PendingDatabase pending, CreateIndexSyntax create, Meter meter, CancellationToken token)
     {
+        if (!pending.Catalog.Tables.Any(table => table.Name == create.Table) && RelationExists(pending.Catalog, create.Table))
+            throw new SqlException(SqlStates.WrongObjectType, "index target is not a table");
         var table = Table(pending.Catalog, create.Table);
+        if (create.Name?.StartsWith("jed_", StringComparison.Ordinal) == true) throw new SqlException(SqlStates.ReservedName, "reserved index name");
         if (create.Method is not ("btree" or "gin" or "gist")) throw new SqlException(SqlStates.UndefinedObject, $"access method does not exist: {create.Method}");
         WritableCollations(table, pending.Catalog);
         if (create.Method == "gin") return await CreateGin(database, pending, table, create, meter, token).ConfigureAwait(false);
@@ -177,7 +180,7 @@ internal static partial class StatementExecution
             ValidateIndexDependencies(resolved); PinExpressionCollations(pending, resolved, meter); dependencies.Add(resolved);
         }
         if (create.Method != "btree") throw Errors.Unsupported($"index access method {create.Method}");
-        if (create.Name is { } explicitName && RelationExists(pending.Catalog, explicitName))
+        if (create.Name is { } explicitName && RelationExistsAnywhere(pending.Catalog, explicitName))
         {
             if (create.IfNotExists) return new([], []);
             throw new SqlException(SqlStates.DuplicateTable, "relation already exists");
@@ -199,6 +202,7 @@ internal static partial class StatementExecution
         var table = pending.Catalog.Tables.FirstOrDefault(table => (table.Indexes ?? []).Any(index => index.Name == drop.Name));
         if (table is null)
         {
+            if (RelationExists(pending.Catalog, drop.Name)) throw new SqlException(SqlStates.WrongObjectType, "relation is not an index");
             if (drop.IfExists) return new([], []);
             throw new SqlException(SqlStates.UndefinedObject, "index does not exist");
         }

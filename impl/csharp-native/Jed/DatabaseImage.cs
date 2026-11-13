@@ -6,7 +6,7 @@ public sealed partial class Database
     public async Task<byte[]> SerializeAsync(string name = "main", CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(name);
-        if (name != "main") throw new SqlException(SqlStates.UndefinedObject, "database is not attached");
+        if (name != "main") return await WithAttachmentAsync(name, false, target => target.SerializeAsync(cancellationToken: cancellationToken)).ConfigureAwait(false);
         await using var pin = await PinAsync(cancellationToken).ConfigureAwait(false);
         var snapshot = pin.Snapshot; var source = snapshot.Pager ?? pager;
         if (source.Encrypted) throw Errors.Unsupported("encrypted byte-buffer export");

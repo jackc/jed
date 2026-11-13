@@ -1,6 +1,6 @@
 namespace Jed;
 
-internal sealed record ExplainCte(string Name, bool Materialized, ExplainNode Body);
+internal sealed record ExplainCte(string Name, bool Materialized, ExplainNode Body, bool DefinitionVisible = false);
 
 // One object per physical plan position. Repeated labels and expression trees
 // never alias execution observations across derived queries or CTE references.
@@ -19,7 +19,8 @@ internal sealed class ExplainNode(string label, string detail, long rows, long c
     private long measuredActual;
     private long localActual;
     internal Func<long>? HiddenActual { get; set; }
-    internal long ActualCost => Math.Max(measuredActual, Children.Aggregate(Estimate.Add(localActual, HiddenActual?.Invoke() ?? 0),
+    internal bool SumChildren { get; init; } = true;
+    internal long ActualCost => Math.Max(measuredActual, (SumChildren ? Children : []).Aggregate(Estimate.Add(localActual, HiddenActual?.Invoke() ?? 0),
         (cost, child) => Estimate.Add(cost, child.ActualCost)));
     internal void Attribute(long units) => measuredActual = Estimate.Add(measuredActual, Math.Max(0, units));
     internal void AttributeLocal(long units) => localActual = Estimate.Add(localActual, Math.Max(0, units));

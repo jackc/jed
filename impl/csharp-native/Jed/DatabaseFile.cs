@@ -6,10 +6,17 @@ namespace Jed;
 
 public enum FileLocking { Auto, Exclusive, None }
 public enum FileOwnership { Prefer, Yield, Never }
+public enum Synchronous { On, Off }
 public sealed record DatabaseFileOptions
 {
     internal IFileHost FileHost { get; init; } = NativeFileHost.Instance;
+    internal IFileRoleHost? RoleHost { get; init; }
     internal IScratchDeviceHost? ScratchDevices { get; init; }
+    internal bool EnableIdleFlush { get; init; } = true;
+    public Synchronous Synchronous { get; init; } = Synchronous.On;
+    public long FlushIntervalMilliseconds { get; init; } = 1000;
+    /// <summary>Host clock in Unix microseconds, also used by sessions without a clock override.</summary>
+    public Func<long>? Clock { get; init; }
     public long WorkMem { get; init; }
     public long CacheBytes { get; init; } = 256L * 1024 * 1024;
     public FileLocking Locking { get; init; } = FileLocking.Auto;
@@ -53,6 +60,7 @@ public sealed partial class Database
         internal bool CatalogDirty;
         internal SqlException? Failure;
         internal Task? Handoff = null;
+        internal Task? IdleFlush = null;
         internal TaskCompletionSource? Admission = null;
         internal long PauseUntil;
         internal bool PauseAfterDisconnect;
@@ -74,10 +82,10 @@ public sealed partial class Database
     private static async Task<Database> OpenFileCoreAsync(string path, DatabaseFileOptions options, bool creating, int pageSize, CancellationToken token, FileClaim? preparedClaim = null, FileLockBundle? preparedBundle = null)
     {
         ArgumentNullException.ThrowIfNull(path); ArgumentNullException.ThrowIfNull(options.FileHost); ArgumentNullException.ThrowIfNull(options.Entropy); ArgumentNullException.ThrowIfNull(options.KeyEntropy); ArgumentNullException.ThrowIfNull(options.ScratchEntropy);
-        if (options.WorkMem < 0 || options.CacheBytes < 0 || !Enum.IsDefined(options.ScratchEncryption) || !Enum.IsDefined(options.Locking) || !Enum.IsDefined(options.Ownership) || options.FileLockTimeoutMilliseconds < 0 || options.WriterLockTimeoutMilliseconds < 0 ||
+        if (!Enum.IsDefined(options.Synchronous) || options.FlushIntervalMilliseconds < 0 || options.WorkMem < 0 || options.CacheBytes < 0 || !Enum.IsDefined(options.ScratchEncryption) || !Enum.IsDefined(options.Locking) || !Enum.IsDefined(options.Ownership) || options.FileLockTimeoutMilliseconds < 0 || options.WriterLockTimeoutMilliseconds < 0 ||
             options.YieldGraceMilliseconds < 0 || options.ShutdownGraceMilliseconds < 0 || options.IdleSessionMilliseconds < 0 || options.IdleTransactionMilliseconds < 0 || options.MaximumConnections < 0)
             throw new ArgumentOutOfRangeException(nameof(options));
-        if (options.FileHost is not NativeFileHost && options.Locking != FileLocking.None) throw new ArgumentException("injected file hosts require an explicit host-owned locking adapter", nameof(options));
+        if (options.FileHost is not NativeFileHost && options.Locking != FileLocking.None && options.RoleHost is null) throw new ArgumentException("injected file hosts require an explicit host-owned locking adapter", nameof(options));
         if (creating && options.ReadOnly) throw new SqlException(SqlStates.ReadOnlySqlTransaction, "cannot create a read-only database");
         if (!StorageFormat.ValidPageSize(pageSize)) throw new ArgumentOutOfRangeException(nameof(pageSize));
         if (creating && options.Credential is not null && pageSize < 1024) throw new SqlException(SqlStates.FeatureNotSupported, "encrypted page size must be at least 1024");
@@ -85,7 +93,7 @@ public sealed partial class Database
         try
         {
             string normalized;
-            if (options.Locking == FileLocking.None) normalized = Path.GetFullPath(path);
+            if (options.Locking == FileLocking.None || options.RoleHost is not null) normalized = Path.GetFullPath(path);
             else { claim ??= FileClaim.Acquire(path, creating); normalized = claim.Path; }
             if (claim is not null && bundle is null)
             {
@@ -93,6 +101,8 @@ public sealed partial class Database
                 if (creating || options.Locking == FileLocking.Exclusive) await bundle.AcquireExclusiveAsync(options.FileLockTimeoutMilliseconds, token).ConfigureAwait(false);
                 else client = await ElectAsync(bundle, options, 0, token).ConfigureAwait(false);
             }
+            if (options.RoleHost is { } roleHost) client = await roleHost.ElectAsync(normalized, options.ReadOnly, token).ConfigureAwait(false);
+            if (creating && client is not null) throw new SqlException(SqlStates.ObjectInUse, "database already has an owner");
             if (creating) await CreateImageAsync(normalized, pageSize, options, token).ConfigureAwait(false);
             var state = new FileState(claim, normalized, options) { Bundle = bundle, Client = client };
             if (client is null)
@@ -106,7 +116,7 @@ public sealed partial class Database
             }
             else
             {
-                bundle!.Dispose(); state.Bundle = null;
+                bundle?.Dispose(); state.Bundle = null;
                 var read = await client.BeginReadAsync(new byte[16], 0, token).ConfigureAwait(false);
                 try
                 {
@@ -134,7 +144,7 @@ public sealed partial class Database
             else if (openedStore is not null) await openedStore.DisposeAsync().ConfigureAwait(false);
             openingCodec?.Dispose();
             if (client is not null) await client.DisposeAsync().ConfigureAwait(false);
-            bundle?.Dispose(); claim?.Dispose();
+            bundle?.Dispose(); claim?.Dispose(); options.RoleHost?.Release(Path.GetFullPath(path));
             if (error is FileNotFoundException or DirectoryNotFoundException) throw new SqlException(SqlStates.UndefinedFile, error.Message);
             if (error is IOException or UnauthorizedAccessException) throw new SqlException(SqlStates.IoError, error.Message);
             throw;
@@ -169,7 +179,7 @@ public sealed partial class Database
     {
         var host = options.FileHost;
         if (await host.ExistsAsync(path, token).ConfigureAwait(false)) throw new SqlException(SqlStates.DuplicateFile, "database already exists: " + path);
-        var entropy = Draw(options, 16); var temporary = path + ".tmp-" + Convert.ToHexStringLower(entropy);
+        var temporary = path + ".jedtmp";
         var ownsTemporary = false;
         try
         {
@@ -244,12 +254,15 @@ public sealed partial class Database
             }
         }
         state.Ledger = new(gate, Draw(state.Options, 16), meta, previous);
-        if (state.Bundle is null) return;
-        state.Endpoint = state.Options.Locking == FileLocking.Auto ? state.Bundle.SelectEndpoint(state.Ledger.Incarnation) : null;
-        var serving = state.Endpoint is not null;
-        if (serving) state.Bundle.RemoveEndpoint(state.Endpoint!);
-        await state.Bundle.PublishOwnerAsync(new(serving, LinuxFileHost.EffectiveUid, state.Ledger.Incarnation, (uint)Environment.ProcessId, state.Endpoint ?? ""), token).ConfigureAwait(false);
-        if (!serving) return;
+        if (state.Bundle is null && state.Options.RoleHost is null) return;
+        if (state.Bundle is not null)
+        {
+            state.Endpoint = state.Options.Locking == FileLocking.Auto ? state.Bundle.SelectEndpoint(state.Ledger.Incarnation) : null;
+            var serving = state.Endpoint is not null;
+            if (serving) state.Bundle.RemoveEndpoint(state.Endpoint!);
+            await state.Bundle.PublishOwnerAsync(new(serving, LinuxFileHost.EffectiveUid, state.Ledger.Incarnation, (uint)Environment.ProcessId, state.Endpoint ?? ""), token).ConfigureAwait(false);
+            if (!serving) return;
+        }
         var role = state.Role;
         var backend = new PageOwnerBackend(state.Ledger,
             async (index, cancellation) =>
@@ -263,7 +276,8 @@ public sealed partial class Database
             (incarnation, version, cancellation) => AcquireRemoteReadAsync(role, incarnation, version, cancellation));
         state.Server = new(backend, new(state.Options.ReadOnly, state.Options.Ownership == FileOwnership.Yield, state.Options.MaximumConnections,
             state.Options.IdleSessionMilliseconds, state.Options.IdleTransactionMilliseconds));
-        state.Server.Listen(state.Endpoint!);
+        if (state.Options.RoleHost is { } host) host.Publish(state.Path, this, state.Server);
+        else state.Server.Listen(state.Endpoint!);
     }
     private async ValueTask SyncOwnerDirectoryAsync(CancellationToken token)
     {
@@ -342,6 +356,20 @@ public sealed partial class Database
                 var remote = await reconnect(token).ConfigureAwait(false);
                 lock (gate) { EndFileRole(); state.Client = remote; state.NeedsElection = false; }
                 ObserveClient(remote); return;
+            }
+            if (state.Options.RoleHost is { } roleHost)
+            {
+                var elected = await roleHost.ElectAsync(state.Path, state.Options.ReadOnly, token).ConfigureAwait(false);
+                lock (gate) { EndFileRole(); state.Client = elected; state.Ledger = null; state.NeedsElection = false; }
+                if (elected is null)
+                {
+                    var store = await state.Options.FileHost.OpenAsync(state.Path, FileMode.Open, state.Options.ReadOnly, token).ConfigureAwait(false); state.LocalStore = store;
+                    var opened = await OpenFileStorageAsync(store, state.Options, ownedCodec, token).ConfigureAwait(false);
+                    lock (gate) { pager = opened.Pager; committer = new(pager, opened.Recovered); current = new(opened.Catalog, opened.Recovered.Meta) { Encrypted = opened.Recovered.Encrypted }; keyBlock = opened.KeyBlock; state.CatalogDirty = false; }
+                    await StartOwnerAsync(token).ConfigureAwait(false);
+                }
+                else ObserveClient(elected);
+                return;
             }
             if (state.Claim is null) throw new SqlException(SqlStates.ConnectionFailure, "uncoordinated database has no role election");
             var bundle = await FileLockBundle.PrepareAsync(state.Claim, state.Options.FileLockTimeoutMilliseconds, token).ConfigureAwait(false);
@@ -471,7 +499,7 @@ public sealed partial class Database
                     held.Release(); continue;
                 }
                 PageWriteSnapshot lease;
-                try { lease = await client.BeginWriteAsync(new byte[16], 0, (ulong)state.Options.WriterLockTimeoutMilliseconds, cancellationToken: token).ConfigureAwait(false); }
+                try { lease = await client.BeginWriteAsync(new byte[16], 0, (ulong)state.Options.WriterLockTimeoutMilliseconds, relaxed: !SynchronousCommits, cancellationToken: token).ConfigureAwait(false); }
                 catch (SqlException error) when (error.SqlState == SqlStates.ConnectionFailure) { held.Release(); continue; }
                 var context = new FileWriteContext(client, lease);
                 try
@@ -483,7 +511,9 @@ public sealed partial class Database
                     var (free, chain) = served.Encrypted is null
                         ? await StorageRecovery.ReadFreeListAsync(store, meta, [], token).ConfigureAwait(false)
                         : await StorageCryptoRecovery.ReadFreeListAsync(store, served.Encrypted, served.Codec!, [], token).ConfigureAwait(false);
-                    var recovered = new StorageRecovered(meta, 0, 0, [], free, chain) { Encrypted = served.Encrypted };
+                    var recovered = new StorageRecovered(meta, 0, 0, [], free, chain) { Encrypted = served.Encrypted,
+                        Batch = lease.Pending.Length == 0 ? null : new(meta.TransactionId, lease.Reuse,
+                            lease.Pending.Select(entry => new StorageManifestEntry(entry.Index, entry.Digest)).ToArray(), null) };
                     context.Granted = !lease.ReuseGrant ? [] : lease.Pending.Length == 0 ? new(free) : new(lease.Reuse);
                     var snapshot = new DatabaseSnapshot(catalog, meta, snapshotPager) { Encrypted = served.Encrypted };
                     lock (gate) { CheckRole(role); current = snapshot; keyBlock = served.KeyBlock; }
@@ -566,7 +596,7 @@ public sealed partial class Database
             else
             {
                 state.Ledger!.BeginPublication();
-                try { await PrepareOwnerWriteAsync(token).ConfigureAwait(false); await committer.CommitAsync(plan, token).ConfigureAwait(false); }
+                try { await PrepareOwnerWriteAsync(token).ConfigureAwait(false); await committer.CommitAsync(plan, token, SynchronousCommits, plan.DeadlineMicroseconds).ConfigureAwait(false); }
                 catch (Exception error) { state.Ledger.FailPublication(error); if (committer.IsPoisoned) PoisonFile(new SqlException(SqlStates.IoError, "file commit failed; reopen for recovery")); throw; }
             }
             return new PublicationLease(state.Publication);
@@ -575,7 +605,6 @@ public sealed partial class Database
     }
     private async ValueTask<IPageOwnerWrite> BeginRemoteWriterAsync(long role, bool relaxed, CancellationToken token)
     {
-        if (relaxed) throw new SqlException(SqlStates.FeatureNotSupported, "C# relaxed storage batches are not implemented");
         var state = fileState!; SemaphoreSlim held;
         while (true)
         {
@@ -590,30 +619,47 @@ public sealed partial class Database
         try
         {
             CheckRole(role); if (state.Options.ReadOnly) throw new SqlException(SqlStates.ReadOnlySqlTransaction, "owner is read-only");
+            if (committer.Current.Batch is not null)
+            {
+                if (!relaxed) await committer.FlushAsync(shrink: false, token: token).ConfigureAwait(false);
+                else if (state.Options.FlushIntervalMilliseconds != 0)
+                    await committer.BeginPlanAsync(false, (state.Options.Clock ?? SessionOptions.HostClock)(),
+                        state.Options.FlushIntervalMilliseconds, shrink: false, token: token).ConfigureAwait(false);
+            }
             var pin = state.Ledger!.Pin(state.Ledger.Incarnation, state.Ledger.CurrentTransactionId);
             var grant = state.Ledger.CanReuse(committer.Current.FreeGeneration);
-            return new RemoteWriter(this, role, held, pin, committer.Current, grant);
+            return new RemoteWriter(this, role, held, pin, committer.Current, grant, relaxed);
         }
-        catch { held.Release(); throw; }
+        catch (Exception error)
+        {
+            if (committer.IsPoisoned) PoisonFile(error);
+            held.Release(); throw;
+        }
     }
     private sealed class RemoteWriter(Database database, long role, SemaphoreSlim held, PageOwnerLedger.PageOwnerPin pin,
-        StorageRecovered before, bool grant) : IPageOwnerWrite
+        StorageRecovered before, bool grant, bool relaxed) : IPageOwnerWrite
     {
         private PageCommitValidator? validation;
         private int disposed;
         public PageOwnerLedger.PageOwnerPin Pin => pin;
         public bool ReuseGrant => grant;
-        public PageWireDigest[] Pending => [];
-        public uint[] Reuse => [];
+        public PageWireDigest[] Pending => (before.Batch?.Pending ?? []).Select(entry => new PageWireDigest(entry.Page, entry.Digest)).ToArray();
+        public uint[] Reuse => before.Batch is not { } batch || !grant ? [] : before.FreePages
+            .Intersect(batch.FloorFree).Except(batch.Pending.Select(entry => entry.Page)).Order().ToArray();
         public async ValueTask BeginCommitAsync(ulong transactionId, byte[] meta, PageWirePage[] manifest, CancellationToken token)
         {
             database.CheckRole(role);
-            validation = new(before.Meta, database.ownedCodec is not null, grant ? before.FreePages : new HashSet<uint>(), new Dictionary<uint, ulong>(), transactionId, meta, manifest, database.ownedCodec);
+            validation = new(before.Meta, database.ownedCodec is not null,
+                !grant ? new HashSet<uint>() : before.Batch is null ? before.FreePages : Reuse.ToHashSet(),
+                (before.Batch?.Pending ?? []).ToDictionary(entry => entry.Page, entry => entry.Digest),
+                transactionId, meta, manifest, database.ownedCodec);
             try
             {
                 await database.PrepareOwnerWriteAsync(token).ConfigureAwait(false);
                 var required = (long)validation.Meta.PageCount * before.Meta.PageSize;
-                if (await database.pager.Store.GetLengthAsync(token).ConfigureAwait(false) < required) await database.pager.Store.SetLengthAsync(required, token).ConfigureAwait(false);
+                var length = await database.pager.Store.GetLengthAsync(token).ConfigureAwait(false);
+                if (length < required)
+                    await database.pager.Store.SetLengthAsync(StorageGrowth.Length(length, validation.Meta.PageCount, before.Meta.PageSize), token).ConfigureAwait(false);
                 foreach (var page in manifest)
                 { database.pager.Invalidate(page.Index); await database.pager.Store.WriteAsync((long)page.Index * before.Meta.PageSize, page.Bytes, token).ConfigureAwait(false); }
             }
@@ -647,15 +693,23 @@ public sealed partial class Database
                 database.CheckRole(role); state.Ledger!.BeginPublication();
                 var slot = 1 - before.FloorSlot; var meta = validation.MetaForSlot((uint)slot, database.ownedCodec);
                 await database.pager.Store.WriteAsync((long)slot * before.Meta.PageSize, meta, CancellationToken.None).ConfigureAwait(false);
-                await database.pager.Store.SyncAsync(CancellationToken.None).ConfigureAwait(false);
                 var recovered = new StorageRecovered(validation.Meta, slot, slot, dependencies, free, chain)
                 {
                     ManifestPages = validation.Manifest.Select(page => page.Index).ToHashSet(), Encrypted = validation.EncryptedMeta,
                     LastReclamationLive = before.ReclamationLive, ReclamationTransactionId = before.FreeGeneration
                 };
+                long? deadline = before.Batch?.DeadlineMicroseconds;
+                if (relaxed && before.Batch is null && state.Options.FlushIntervalMilliseconds != 0)
+                {
+                    var now = (state.Options.Clock ?? SessionOptions.HostClock)();
+                    var next = (Int128)now + (Int128)state.Options.FlushIntervalMilliseconds * 1000;
+                    deadline = next > long.MaxValue ? long.MaxValue : (long)next;
+                }
+                await database.committer.PublishClientAsync(recovered,
+                    validation.Entries.Select(entry => new StorageManifestEntry(entry.Key, entry.Value)).ToArray(),
+                    !relaxed, deadline, CancellationToken.None).ConfigureAwait(false);
                 lock (database.gate)
                 {
-                    database.committer.Adopt(recovered, stabilized: true);
                     database.current = database.current with { Meta = validation.Meta };
                     state.CatalogDirty = true;
                     foreach (var index in free) if (!before.FreePages.Contains(index)) database.retiredAt[index] = validation.Meta.TransactionId;
@@ -670,7 +724,9 @@ public sealed partial class Database
         public async ValueTask AfterAcknowledgementAsync()
         {
             pin.Dispose();
-            await database.RunRemoteMaintenanceAsync(role, CancellationToken.None).ConfigureAwait(false);
+            database.FinishCommitPolicy();
+            if (!database.committer.IsPoisoned)
+                await database.RunRemoteMaintenanceAsync(role, CancellationToken.None).ConfigureAwait(false);
         }
         public ValueTask DisposeAsync()
         { if (Interlocked.Exchange(ref disposed, 1) == 0) { pin.Dispose(); held.Release(); } return ValueTask.CompletedTask; }
@@ -742,11 +798,23 @@ public sealed partial class Database
         await state.Publication.WaitAsync().ConfigureAwait(false);
         try
         {
-            lock (gate) { EndFileRole(); state.NeedsElection = true; }
-            await pager.Store.DisposeAsync().ConfigureAwait(false);
-            if (state.Endpoint is not null && state.Bundle is not null) state.Bundle.RemoveEndpoint(state.Endpoint);
-            state.Bundle?.Dispose();
-            state.Server = null; state.Ledger = null; state.Bundle = null; state.LocalStore = null; state.Endpoint = null; state.Client = null;
+            try
+            {
+                if (state.LocalStore is not null && !state.Options.ReadOnly)
+                    await committer.FlushAsync(token: CancellationToken.None).ConfigureAwait(false);
+            }
+            finally
+            {
+                lock (gate) { EndFileRole(); state.NeedsElection = true; }
+                try { await pager.Store.DisposeAsync().ConfigureAwait(false); }
+                finally
+                {
+                    if (state.Endpoint is not null && state.Bundle is not null) state.Bundle.RemoveEndpoint(state.Endpoint);
+                    state.Bundle?.Dispose();
+                    state.Options.RoleHost?.Release(state.Path);
+                    state.Server = null; state.Ledger = null; state.Bundle = null; state.LocalStore = null; state.Endpoint = null; state.Client = null;
+                }
+            }
         }
         finally { state.Publication.Release(); }
     }
@@ -774,10 +842,13 @@ public sealed partial class Database
             await DrainAsync(state.Options.ShutdownGraceMilliseconds, true).ConfigureAwait(false);
         }
         if (state.Client is not null) await state.Client.DisposeAsync().ConfigureAwait(false);
-        await ReleaseOwnershipAsync().ConfigureAwait(false);
-        lock (gate) { disposed = true; state.Admission?.TrySetResult(); }
-        try { if (ScratchHost is not null) await ScratchHost.DisposeAsync().ConfigureAwait(false); }
-        finally { ownedCodec?.Dispose(); state.Claim?.Dispose(); if (state.RemoteCredential is { } secret) CryptographicOperations.ZeroMemory(secret.Bytes); }
+        try { await ReleaseOwnershipAsync().ConfigureAwait(false); }
+        finally
+        {
+            lock (gate) { disposed = true; state.Admission?.TrySetResult(); }
+            try { if (ScratchHost is not null) await ScratchHost.DisposeAsync().ConfigureAwait(false); }
+            finally { ownedCodec?.Dispose(); state.Claim?.Dispose(); if (state.RemoteCredential is { } secret) CryptographicOperations.ZeroMemory(secret.Bytes); }
+        }
         }
         finally { state.RoleGate.Release(); }
     }

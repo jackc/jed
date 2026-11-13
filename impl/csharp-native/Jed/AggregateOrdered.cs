@@ -107,7 +107,7 @@ internal sealed class AggregateOrdered
         }
         return 0;
     }
-    private static SqlInterval IntervalLerp(SqlInterval first, SqlInterval second, double factor)
+    internal static SqlInterval IntervalLerp(SqlInterval first, SqlInterval second, double factor)
     {
         var difference = second.Subtract(first);
         static double RoundMicros(double value) => Math.Round(value * 1_000_000, MidpointRounding.ToEven) / 1_000_000;

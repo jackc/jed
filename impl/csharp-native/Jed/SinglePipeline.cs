@@ -14,7 +14,7 @@ internal sealed record SinglePipeline(AccessPlan Access, SelectPlan Plan, bool O
         }
         var candidates = AccessPlan.Inventory(table, tree, plan.Filter, storage, meter).ToList();
         var order = plan.Order ?? [];
-        if (simple && order.Length != 0 && plan.Limit is not null)
+        if (simple && table.Domain is not { Name: not ("main" or "temp") } && order.Length != 0 && plan.Limit is not null)
             foreach (var index in (table.Indexes ?? []).OrderBy(index => index.Name, Utf8NameComparer.Instance))
             {
                 if (candidates.Any(candidate => candidate.Index == index) || !IndexOrder(table, index, order, storage.Catalog)) continue;
@@ -31,7 +31,7 @@ internal sealed record SinglePipeline(AccessPlan Access, SelectPlan Plan, bool O
         SinglePipeline? best = null;
         foreach (var original in candidates.OrderBy(candidate => candidate.Kind).ThenBy(candidate => candidate.Index?.Name ?? "", Utf8NameComparer.Instance))
         {
-            var access = original;
+            var access = original with { Ordered = original.Kind is AccessKind.Btree or AccessKind.IndexIntervals };
             var indexOrder = simple && order.Length != 0 && access.Index is { } index && (access.Btree is not null || access.IndexSet is not null) && IndexOrder(table, index, order, storage.Catalog);
             var naturallyOrdered = indexOrder || pkOrder && access.Btree is null && access.IndexSet is null;
             var streaming = simple && plan.Limit is not null && (order.Length == 0 || naturallyOrdered);
@@ -59,8 +59,8 @@ internal sealed record SinglePipeline(AccessPlan Access, SelectPlan Plan, bool O
             var output = Math.Max(0, matched - plan.Offset);
             if (plan.Limit is { } limit) output = Math.Min(output, limit);
             var pages = access.EstimatedPages;
-            if (streaming && access.Kind == AccessKind.Full && pulled != 0)
-                pages = Math.Min(pages, Math.Max(tree.Height, Estimate.Scale(pages, pulled, Math.Max(1, access.EstimatedRows))));
+            if (streaming && access.Kind is AccessKind.Full or AccessKind.Primary or AccessKind.PrimaryIntervals && pulled != 0)
+                pages = Math.Min(pages, Math.Clamp(pulled, tree.Height, Math.Max(tree.Height, tree.NodeCount)));
             if (pulled == 0) pages = 0;
             var fetch = access.Kind is AccessKind.Btree or AccessKind.Gin or AccessKind.Gist or AccessKind.IndexIntervals ? tree.Height + 1L : 1;
             var cost = Estimate.Add(Estimate.Add(pages, access.EstimatedEntries), Estimate.Multiply(pulled, Estimate.Add(fetch, filterNodes)));
@@ -68,7 +68,7 @@ internal sealed record SinglePipeline(AccessPlan Access, SelectPlan Plan, bool O
             cost = Estimate.Add(cost, Estimate.Multiply(output, projection));
             var active = naturallyOrdered ? plan with { Order = [] } : plan;
             var reverse = naturallyOrdered && !indexOrder && pk.Scan.Reverse;
-            active = active with { Access = access, ScanReverse = reverse, BeforeZeroLimit = streaming && plan.Limit == 0 ? () => access.Prime(table, tree, storage, meter, StorageTouchedColumns.Collect(plan), meter.Cancellation) : null };
+            active = active with { Access = access, ScanReverse = reverse, AccessOrdering = naturallyOrdered, BeforeZeroLimit = streaming && plan.Limit == 0 ? () => access.Prime(table, tree, storage, meter, StorageTouchedColumns.Collect(plan), meter.Cancellation) : null };
             var choice = new SinglePipeline(access, active, naturallyOrdered, reverse, cost);
             if (best is null || choice.Cost < best.Cost) best = choice;
         }

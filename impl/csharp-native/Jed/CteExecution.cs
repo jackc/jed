@@ -2,7 +2,7 @@ using System.Runtime.CompilerServices;
 
 namespace Jed;
 
-internal sealed record CteSyntax(string Name, string[]? Columns, SelectSyntax Query, bool? Materialized, StatementSyntax? Mutation = null);
+internal sealed record CteSyntax(string Name, string[]? Columns, SelectSyntax Query, bool? Materialized, StatementSyntax? Mutation = null, SearchSyntax? Search = null, CycleSyntax? Cycle = null);
 internal sealed record WithStatementSyntax(CteSyntax[] Definitions, bool Recursive, StatementSyntax Body) : StatementSyntax;
 internal sealed class QueryScope(QueryScope? parent = null, OuterFrame? frame = null)
 {
@@ -73,15 +73,31 @@ internal sealed class CteBuffer(PreparedRelation source, Meter meter)
             SetRelation set => References(set.Left, name) + References(set.Right, name),
             _ => 0
         };
-        if (query.With is { } locals && locals.Any(local => local.Name == name)) return 0;
+        var definitions = 0; var shadowed = false;
+        foreach (var local in query.With ?? [])
+        {
+            if (query.Recursive && local.Name == name) shadowed = true;
+            if (!shadowed) definitions += References(local.Query, name);
+            if (local.Name == name) shadowed = true;
+        }
+        if (shadowed) return definitions;
         int ExpressionReferences(Expression expression) => (expression.Query is null ? 0 : References(expression.Query, name)) + expression.Args.Sum(ExpressionReferences) + (expression.Predicate is null ? 0 : ExpressionReferences(expression.Predicate));
-        return Source(query.Relation) + query.Items.Sum(item => ExpressionReferences(item.Expression)) + (query.Filter is null ? 0 : ExpressionReferences(query.Filter)) + (query.Order ?? []).Sum(order => ExpressionReferences(order.Expression)) + (query.With ?? []).Sum(local => References(local.Query, name));
+        return Source(query.Relation) + query.Items.Sum(item => ExpressionReferences(item.Expression)) + (query.Filter is null ? 0 : ExpressionReferences(query.Filter)) + (query.Order ?? []).Sum(order => ExpressionReferences(order.Expression)) + definitions;
     }
 }
 
 internal sealed partial class Parser
 {
     private SelectSyntax WithQuery() => WithStatement() as SelectSyntax ?? throw Errors.Unsupported("data-modifying WITH requires the statement top level");
+    private Expression CycleConstant()
+    {
+        if (Is("+") || Is("-") || Is("cast") || Is("(")) throw Errors.Syntax("CYCLE mark requires an unsigned constant");
+        var expression = Expr(100);
+        if (expression.Op is not ("integer" or "decimal" or "text" or "boolean" or "null") &&
+            !(expression.Op == "cast" && expression.Args.Length == 1 && expression.Args[0].Op == "text"))
+            throw Errors.Syntax("CYCLE mark requires a constant");
+        return expression;
+    }
     private StatementSyntax WithStatement()
     {
         var primaryInto = intoAllowed; intoAllowed = false;
@@ -96,7 +112,22 @@ internal sealed partial class Parser
             Expect("("); nesting++; Depth(nesting);
             StatementSyntax body = Is("insert") || Is("update") || Is("delete") || Is("merge") ? OtherStatement() : Select();
             Expect(")"); nesting--;
-            definitions.Add(body is SelectSyntax query ? new(name, columns, query, materialized) : new(name, columns, new([], null, null, 0), materialized, body));
+            SearchSyntax? search = null; CycleSyntax? cycle = null;
+            if (Eat("search"))
+            {
+                var breadth = Eat("breadth"); if (!breadth) Expect("depth"); Expect("first"); Expect("by");
+                var keys = new List<string>(); do { keys.Add(Name()); } while (Eat(","));
+                Expect("set"); search = new(breadth, keys.ToArray(), Name());
+            }
+            if (Eat("cycle"))
+            {
+                var keys = new List<string>(); do { keys.Add(Name()); } while (Eat(","));
+                Expect("set"); var mark = Name(); Expression marked = new("boolean", "true", []), normal = new("boolean", "false", []);
+                if (Eat("to")) { marked = CycleConstant(); Expect("default"); normal = CycleConstant(); }
+                Expect("using"); cycle = new(keys.ToArray(), mark, marked, normal, Name());
+            }
+            if ((search is not null || cycle is not null) && (!recursive || body is not SelectSyntax)) throw Errors.Syntax("SEARCH/CYCLE requires a recursive query");
+            definitions.Add(body is SelectSyntax query ? new(name, columns, query, materialized, Search: search, Cycle: cycle) : new(name, columns, new([], null, null, 0), materialized, body));
         } while (Eat(","));
         var mutation = Is("insert") || Is("update") || Is("delete") || Is("merge");
         intoAllowed = primaryInto && !mutation;

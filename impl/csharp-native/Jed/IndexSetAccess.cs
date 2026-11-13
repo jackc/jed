@@ -50,11 +50,20 @@ internal sealed record IndexSetAccess(CatalogIndex Index, StorageTree Tree, Tabl
             // Duplicate probes are one physical interval and one estimate.
             if (canonical.Length < ranges.Count && ranges.Count != 0)
             { count = Estimate.Scale(count, canonical.Length, ranges.Count); pages = Estimate.Scale(pages, canonical.Length, ranges.Count); }
+            count = KeySetEstimate.Rows(table, storage.Catalog, filter, keys, index.Unique, table.RowCount);
+            var partial = StatementExecution.ResolveIndexPredicate(table, index, storage.Catalog);
+            if (partial is not null)
+            {
+                var constrained = keys.Where(key => terms.Any(term => PredicatePlan.Slots(term).SetEquals([key.Slot]))).Select(key => key.Slot).ToHashSet();
+                foreach (var term in PredicatePlan.Conjuncts(partial))
+                    if (!PredicatePlan.Slots(term).Overlaps(constrained)) count = Estimate.Rows(count, term);
+            }
+            pages = count == 0 ? 0 : Math.Clamp(KeySetEstimate.Rows(table, storage.Catalog, filter, keys, index.Unique, tree.NodeCount), tree.Height, tree.NodeCount);
             var cost = Estimate.Add(pages, Estimate.Multiply(count, Estimate.Add(primary.Height + 1L, PredicatePlan.Nodes(filter))));
             yield return new(index, tree, canonical, count, pages, cost, filter);
         }
     }
-    private static Resolved[]? Expand(Resolved term, Resolved key)
+    internal static Resolved[]? Expand(Resolved term, Resolved key)
     {
         if (term.Op == "or" && PredicatePlan.Slots(term).SetEquals([key.Slot]))
         {
@@ -79,11 +88,13 @@ internal sealed record IndexSetAccess(CatalogIndex Index, StorageTree Tree, Tabl
             return Arm(term);
         }
         if (term.Args.Length == 0 || !Resolve.Equivalent(term.Args[0], key)) return null;
+        if (term.Op == "quantified" && term.Args[1] is { Op: "array" } literalArray && literalArray.Type.Element != key.Type && !(key.Type.IsInteger() && literalArray.Args.All(arg => arg.Op == "constant" && arg.Type.IsInteger()))) return null;
         IEnumerable<Resolved>? values = null;
         if (term.Op == "in_list" && term.Text != "not" && term.Args.Skip(1).All(value => value.Op == "constant")) values = term.Args.Skip(1);
         else if (term.Op == "quantified" && term.Text == "= any")
         {
-            if (term.Args[1] is { Op: "array" } array && array.Args.All(value => value.Op == "constant")) values = array.Args;
+            if (term.Args[1] is { Op: "array", Text: not "nested" } array && array.Args.All(value => AccessConstant.Try(value, out _)))
+                values = array.Args.Select(value => { AccessConstant.Try(value, out var literal); return new Resolved("constant", literal.Type, literal, []); });
             else if (term.Args[1] is { Op: "constant", ParameterUnbound: false } constant)
                 values = constant.Constant.IsNull ? [] : constant.Constant.AsArray().Values.Select(value => new Resolved("constant", value.Type, value, []));
         }
@@ -91,10 +102,17 @@ internal sealed record IndexSetAccess(CatalogIndex Index, StorageTree Tree, Tabl
             values = cell.Values.Select(value => new Resolved("constant", value.Type, value, []));
         if (values is null) return null;
         var result = new List<Resolved>(); var seen = new HashSet<string>(StringComparer.Ordinal);
-        foreach (var value in values)
+        foreach (var source in values)
         {
+            var value = source;
             if (value.ParameterUnbound) return null;
             if (value.Constant.IsNull) continue;
+            if (value.Type != key.Type)
+            {
+                if (!AccessConstant.Point(value.Constant, key.Type, out var point)) return null;
+                if (point is null) continue;
+                value = new("constant", key.Type, point.Value, []);
+            }
             if (!seen.Add(GroupExecution.Identity([value.Constant]))) continue;
             result.Add(new("=", SqlType.Boolean, default, [term.Args[0], value], Collation: term.Collation));
             if (result.Count > MaximumProbes) return null;

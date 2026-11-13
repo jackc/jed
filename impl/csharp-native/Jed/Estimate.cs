@@ -72,7 +72,7 @@ internal static partial class Estimate
             _ => Fraction(count, "opaque")
         };
     }
-    private static bool ArrayMembership(Resolved predicate, out Resolved[] elements, out bool complement, out bool nullArray)
+    internal static bool ArrayMembership(Resolved predicate, out Resolved[] elements, out bool complement, out bool nullArray)
     {
         elements = []; complement = false; nullArray = false;
         if (predicate.Op is "in_init" or "quantified_init")

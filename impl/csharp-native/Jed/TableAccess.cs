@@ -45,9 +45,14 @@ internal static class TableAccess
                 if (!Compatible(node, table.Columns[slot])) continue;
                 if (constant.ParameterUnbound) continue;
                 if (constant.Constant.IsNull) return new(Empty: true);
-                if (constant.Type != type && !(constant.Type.IsInteger() && type.IsInteger())) continue;
+                if (!AccessConstant.Compatible(constant, type)) continue;
                 byte[] key;
-                try { key = KeyEncoding.Encode(Resolve.Cast(constant.Constant, type), collation: table.Columns[slot].CollationData); }
+                try
+                {
+                    if (!AccessConstant.Point(constant.Constant, type, out var point) || point is null)
+                    { if (op == "=") return new(Empty: true); continue; }
+                    key = KeyEncoding.Encode(point.Value, collation: table.Columns[slot].CollationData);
+                }
                 catch (SqlException) { continue; }
                 if (op == "=")
                 {
@@ -94,7 +99,7 @@ internal static class TableAccess
                 if (term.Op is not ("=" or "<" or "<=" or ">" or ">=") || term.Args.Length != 2) continue;
                 var a = term.Args[0]; var b = term.Args[1]; if (a.Op == "constant") (a, b) = (b, a);
                 if (a.Op != "column" || a.Slot != slot || b.Op != "constant" || !Compatible(term, table.Columns[slot]) ||
-                    a.Type != b.Type && !(a.Type.IsInteger() && b.Type.IsInteger())) continue;
+                    !AccessConstant.Compatible(b, a.Type)) continue;
                 used.Add(term); equality |= term.Op == "=";
             }
             if (!equality) break;

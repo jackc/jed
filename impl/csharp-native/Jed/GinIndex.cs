@@ -89,7 +89,7 @@ internal static partial class StatementExecution
             var resolved = Resolve.Expr(Resolve.Bind(Resolve.BindTypes(key.Expression, pending.Catalog, meter.Temporal), Columns(table)));
             if (resolved.Op != "column") throw Errors.Unsupported("GIN expression index");
             GinIndex.ValidateType(resolved.Type);
-            if (key.Options != 0) throw Errors.Unsupported("GIN ordering options");
+            if (key.Ordered || key.Options != 0) throw Errors.Unsupported("GIN ordering options");
             keys.Add(new(resolved.Slot)); parts.Add(table.Columns[resolved.Slot].Name);
         }
         if (create.Unique) throw Errors.Unsupported("unique GIN index");
@@ -101,7 +101,7 @@ internal static partial class StatementExecution
             if (resolved.Type.Kind is not (SqlKind.Boolean or SqlKind.Unknown)) throw Errors.Type("index predicate requires boolean");
             ValidateIndexDependencies(resolved); PinExpressionCollations(pending, resolved, meter);
         }
-        if (create.Name is { } explicitName && RelationExists(pending.Catalog, explicitName))
+        if (create.Name is { } explicitName && RelationExistsAnywhere(pending.Catalog, explicitName))
         { if (create.IfNotExists) return new([], []); throw new SqlException(SqlStates.DuplicateTable, "relation already exists"); }
         var used = new HashSet<string>(StringComparer.Ordinal);
         for (var i = 0; i < parts.Count; i++)

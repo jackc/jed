@@ -4,7 +4,7 @@ using Jed;
 
 internal sealed record CorpusRecord(int Line, string Header, string Sql, string[] Expected, Dictionary<string, string> Directives);
 
-internal static class Corpus
+internal static partial class Corpus
 {
     // Other comments are prose (e.g. "# fallback:"). Recognized but unsupported
     // stateful actions must fail, including empty-valued and hyphenated forms.
@@ -66,12 +66,14 @@ internal static class Corpus
         return records;
     }
 
-    internal static async Task<int> Run(string file, bool fileBacked = false)
+    internal static async Task<int> Run(string file, bool fileBacked = false, Action<string, string, string>? transcript = null)
     {
-        if (File.ReadLines(file).Any(line => line.Trim() == "# format: concurrency")) return await ConcurrencyCorpus.Run(file).ConfigureAwait(false);
+        var concurrent = File.ReadLines(file).Any(line => line.Trim() == "# format: concurrency");
         var backendRules = File.ReadLines(file).Where(line => line.StartsWith("# skip:", StringComparison.Ordinal)).Select(line => line[7..].Trim().Split(' ')[0]).ToArray();
-        if (backendRules.Contains("memory")) fileBacked = true;
-        else if (backendRules.Contains("disk")) fileBacked = false;
+        if (fileBacked && (concurrent || backendRules.Contains("disk")) ||
+            !fileBacked && backendRules.Contains("memory") || transcript is not null && backendRules.Contains("encrypted"))
+        { Console.WriteLine($"SKIP {file}: declared {(transcript is not null ? "encrypted" : fileBacked ? "disk" : "memory")} mode exclusion"); return 0; }
+        if (concurrent) return await ConcurrencyCorpus.Run(file).ConfigureAwait(false);
         var records = Parse(file);
         var zones = File.ReadLines(file).Select(line => Regex.Match(line, "^#\\s*load-timezone:\\s*(.*?)\\s*$", RegexOptions.CultureInvariant)).Where(match => match.Success).Select(match => match.Groups[1].Value).ToArray();
         TimeZoneData? timeZones = null;
@@ -95,15 +97,22 @@ internal static class Corpus
             foreach (var name in collationNames) _ = unicodeData.Resolve(name);
         }
         var attachmentNames = File.ReadLines(file).Select(line => Regex.Match(line, "^#\\s*attach:\\s*(\\S+)\\s*$", RegexOptions.CultureInvariant)).Where(match => match.Success).Select(match => match.Groups[1].Value).ToArray();
-        using var backing = fileBacked && fixture is null ? new CorpusFile() : null;
-        await using var database = backing is not null ? await Database.CreateFileAsync(backing.Path, new() { Locking = FileLocking.None }).ConfigureAwait(false) : fixture is null ? attachmentNames.Length == 0 ? null : await Database.CreateInMemoryAsync().ConfigureAwait(false) : await OpenFixture(file, fixture).ConfigureAwait(false);
+        var sessionOptions = new SessionOptions { TimeZones = timeZones, UnicodeData = unicodeData };
+        if (fileBacked)
+        {
+            await RunDisk(file, records, sessionOptions, transcript).ConfigureAwait(false);
+            Console.WriteLine($"PASS {file}: {records.Count} records, reopened before every record"); return records.Count;
+        }
+        using var backing = fixture is not null ? new CorpusFile() : null;
+        await using var database = fixture is not null ? await OpenFixture(file, fixture, backing!.Path).ConfigureAwait(false)
+            : attachmentNames.Length == 0 ? null : await Database.CreateInMemoryAsync().ConfigureAwait(false);
         if (database is not null) foreach (var attachment in attachmentNames) await database.AttachInMemoryAsync(attachment).ConfigureAwait(false);
         if (fixture?.ExpectedError is not null)
         {
             if (records.Count != 0) throw new InvalidDataException("fixture open-error case cannot contain SQL records");
             Console.WriteLine($"PASS {file}: 1 fixture open-error record"); return 1;
         }
-        await using var session = database is null ? new Session(new SessionOptions { TimeZones = timeZones, UnicodeData = unicodeData }) : database.CreateSession(new SessionOptions { TimeZones = timeZones, UnicodeData = unicodeData });
+        await using var session = database is null ? new Session(sessionOptions) : database.CreateSession(sessionOptions);
         foreach (var record in records)
         {
             try { await RunRecord(session, record).ConfigureAwait(false); }
@@ -135,7 +144,7 @@ internal static class Corpus
         }
         return result;
     }
-    private static async Task<Database?> OpenFixture(string file, FixtureSpec fixture)
+    private static async Task<Database?> OpenFixture(string file, FixtureSpec fixture, string backing)
     {
         var directory = new DirectoryInfo(Path.GetDirectoryName(Path.GetFullPath(file))!);
         while (directory is not null && directory.Name != "spec") directory = directory.Parent;
@@ -145,7 +154,11 @@ internal static class Corpus
             throw new InvalidDataException("fixture path escapes spec root");
         var bytes = await File.ReadAllBytesAsync(path).ConfigureAwait(false);
         Database database;
-        try { database = await Database.OpenStoreAsync(new MemoryBlockStore(bytes)).ConfigureAwait(false); }
+        try
+        {
+            await File.WriteAllBytesAsync(backing, bytes).ConfigureAwait(false);
+            database = await Database.OpenFileAsync(backing, new() { Locking = FileLocking.None }).ConfigureAwait(false);
+        }
         catch (SqlException error) when (fixture.ExpectedError is not null)
         { Equal(fixture.ExpectedError, error.SqlState, "fixture open SQLSTATE"); return null; }
         if (fixture.ExpectedError is not null)
@@ -176,10 +189,10 @@ internal static class Corpus
         };
         return result;
     }
-    internal static async Task RunRecord(Session session, CorpusRecord record)
+    internal static async Task RunRecord(Session session, CorpusRecord record, Action<string, string, string>? transcript = null)
     {
         session.ResetPrivileges(); session.ResetVariables();
-        await session.SetWorkMemAsync(record.Directives.TryGetValue("work_mem", out var workMem) ? long.Parse(workMem, CultureInfo.InvariantCulture) : Database.DefaultWorkMem).ConfigureAwait(false);
+        await session.SetWorkMemAsync(record.Directives.TryGetValue("work_mem", out var workMem) ? long.Parse(workMem, CultureInfo.InvariantCulture) : ForcedWorkMem()).ConfigureAwait(false);
         if (record.Directives.TryGetValue("max_storage_bytes", out var storageLimits)) foreach (var directive in storageLimits.Split('\n'))
         {
             var pieces = directive.Split(' ', StringSplitOptions.RemoveEmptyEntries);
@@ -272,7 +285,7 @@ internal static class Corpus
 
         if (expectedError is not null) Equal(expectedError, failure?.SqlState ?? "success", "SQLSTATE");
         else if (failure is not null) throw new InvalidDataException($"unexpected SQLSTATE {failure.SqlState}: {failure}");
-        if (record.Directives.TryGetValue("cost", out var cost))
+        if (record.Directives.TryGetValue("cost", out var cost) && transcript is null)
             Equal(long.Parse(cost, CultureInfo.InvariantCulture), rows?.Cost ?? failure?.Cost ?? 0, "cost");
         if (query && failure is null)
         {
@@ -285,11 +298,27 @@ internal static class Corpus
                     actual = SortRows(actual, fields[1].Length); expected = SortRows(expected, fields[1].Length); break;
                 default: throw new InvalidDataException("unsupported sort mode");
             }
+            if (transcript is not null && record.Sql.TrimStart().StartsWith("EXPLAIN", StringComparison.OrdinalIgnoreCase))
+            {
+                transcript("rows", record.Sql, string.Join(' ', actual));
+                if (cost is not null) transcript("cost", record.Sql, (rows?.Cost ?? failure?.Cost ?? 0).ToString(CultureInfo.InvariantCulture));
+                return;
+            }
             Equal(expected.Length, actual.Length, "value count");
             for (var i = 0; i < expected.Length; i++)
                 if (expected[i] != actual[i] && !(fields[1][i % fields[1].Length] == 'R' && RealEqual(expected[i], actual[i])))
                     throw new InvalidDataException($"values: cell {i}: expected {expected[i]}, got {actual[i]}");
         }
+        if (transcript is not null && cost is not null)
+            transcript("cost", record.Sql, (rows?.Cost ?? failure?.Cost ?? 0).ToString(CultureInfo.InvariantCulture));
+    }
+    private static long ForcedWorkMem()
+    {
+        var text = Environment.GetEnvironmentVariable("JED_CONFORMANCE_WORK_MEM");
+        if (text is null) return Database.DefaultWorkMem;
+        if (!long.TryParse(text, NumberStyles.None, CultureInfo.InvariantCulture, out var value))
+            throw new InvalidDataException("JED_CONFORMANCE_WORK_MEM must be nonnegative bytes");
+        return value;
     }
     private static bool RealEqual(string expected, string actual)
     {

@@ -7,6 +7,11 @@ internal static class DistinctExecution
     internal static async IAsyncEnumerable<Row> Run(SelectPlan plan, IAsyncEnumerable<SqlValue[]> source, Meter meter,
         [EnumeratorCancellation] CancellationToken cancellationToken, bool sourceMemory = false, QueryInputMemory? inputOwner = null)
     {
+        if (plan.Spill is { } spill)
+        {
+            await foreach (var row in SpillDistinct.Run(plan, source, spill, inputOwner, meter, cancellationToken).ConfigureAwait(false)) yield return row;
+            yield break;
+        }
         using var inputMemory = new QueryInputMemory(meter);
         using var keptMemory = new QueryInputMemory(meter);
         using var stateMemory = new QueryInputMemory(meter);

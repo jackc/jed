@@ -10,7 +10,7 @@ internal sealed record StorageCommitPlan(StorageRecovered Before, StorageMeta Me
     internal StorageEncryptedMeta? Encrypted { get; init; }
     internal uint? LastReclamationLive { get; init; }
     internal ulong? ReclamationTransactionId { get; init; }
-    internal long? DeadlineMilliseconds { get; init; }
+    internal long? DeadlineMicroseconds { get; init; }
 }
 
 // The relational storage serializer owns reachability and passes exact live-page
@@ -281,7 +281,7 @@ internal sealed partial class StorageCommitter
     }
 
     internal async ValueTask CommitAsync(StorageCommitPlan plan, CancellationToken cancellationToken = default,
-        bool synchronous = true, long? deadlineMilliseconds = null)
+        bool synchronous = true, long? deadlineMicroseconds = null)
     {
         cancellationToken.ThrowIfCancellationRequested();
         if (IsPoisoned) throw new SqlException(SqlStates.IoError, "storage handle failed; close and reopen");
@@ -300,8 +300,7 @@ internal sealed partial class StorageCommitter
                 var needed = (long)plan.Meta.PageCount * pager.PageSize;
                 if (needed > length)
                 {
-                    const long chunk = 1024 * 1024;
-                    var allocation = checked((needed + chunk - 1) / chunk * chunk);
+                    var allocation = StorageGrowth.Length(length, plan.Meta.PageCount, pager.PageSize);
                     await pager.Store.SetLengthAsync(allocation, cancellationToken).ConfigureAwait(false);
                 }
                 foreach (var write in plan.Body.Concat(plan.Manifest))
@@ -314,18 +313,18 @@ internal sealed partial class StorageCommitter
                 if (synchronous) await pager.Store.SyncAsync(cancellationToken).ConfigureAwait(false);
                 var pending = plan.Body.Select(write => new StorageManifestEntry(write.Page, StorageFormat.Crc64(write.Bytes)))
                     .Concat(plan.Before.Batch?.Pending ?? []).OrderBy(entry => entry.Page).ToArray();
-                var shrink = plan.Meta.PageCount < plan.Before.Meta.PageCount || plan.Before.Batch?.ShrinkAfterFlush == true;
+                var shrink = shrinkDeferred || plan.Meta.PageCount < plan.Before.Meta.PageCount || plan.Before.Batch?.ShrinkAfterFlush == true;
                 var batch = synchronous ? null : new StorageBatch(
                     plan.Before.Batch?.FloorTransactionId ?? plan.Before.Meta.TransactionId,
                     plan.Before.Batch?.FloorFree ?? plan.Before.FreePages.ToArray(), pending,
-                    plan.Before.Batch?.DeadlineMilliseconds ?? deadlineMilliseconds, shrink);
+                    plan.Before.Batch?.DeadlineMicroseconds ?? deadlineMicroseconds, shrink);
                 Current = new(plan.Meta, slot, synchronous ? slot : plan.Before.FloorSlot, plan.ProtectedPages, plan.FreePages, plan.FreeListPages)
                 {
                     ManifestPages = plan.Manifest.Select(page => page.Page).ToHashSet(), Encrypted = plan.Encrypted,
                     LastReclamationLive = plan.LastReclamationLive, ReclamationTransactionId = plan.ReclamationTransactionId,
                     Batch = batch
                 };
-                if (synchronous && shrink) await ShrinkAsync(plan.Meta.PageCount).ConfigureAwait(false);
+                if (synchronous && shrink) { await ShrinkAsync(plan.Meta.PageCount).ConfigureAwait(false); shrinkDeferred = false; }
                 stabilize = false; directoryPending = false;
                 var cap = pager.Encrypted ? StorageCryptoMeta.InlineCapacity(pager.PageSize) : StorageFormat.InlineCapacity(pager.PageSize);
                 if (Current.Batch is { } pendingBatch && pendingBatch.Pending.Length >= cap)

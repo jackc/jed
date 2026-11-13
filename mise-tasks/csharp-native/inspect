@@ -1,0 +1,12 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#MISE description="Explicit opt-in: print C# query output from blank-line-separated SQL statements"
+#USAGE flag "--no-build" help="Use the existing diagnostic assembly"
+#USAGE arg "<file>" help="SQL file with blank lines separating statements"
+require_relative "../../impl/csharp-native/Tools/tasks"
+arguments = ["inspect", File.expand_path(ENV.fetch("usage_file"))]
+if ENV["usage_no_build"] == "true"
+  CSharpNativeTasks.run(File.join(CSharpNativeTasks::PACKAGE, "Jed.Check/bin/Release/net11.0/Jed.Check.dll"), *arguments)
+else
+  CSharpNativeTasks.check(*arguments)
+end

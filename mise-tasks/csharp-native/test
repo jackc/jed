@@ -3,7 +3,14 @@
 #MISE description="Explicit opt-in: C# host/invariant tests and scalar shared corpus"
 #USAGE flag "-c --configuration <configuration>" default="Release" help="Debug or Release"
 #USAGE flag "--runtime-async" help="Compile with .NET 11 runtime-native async enabled"
+#USAGE flag "--no-build" help="Use the existing assembly without rebuilding"
 require_relative "../../impl/csharp-native/Tools/tasks"
 require_relative "../../impl/csharp-native/Tools/encoding"
-CSharpNativeEncoding.generate
-CSharpNativeTasks.check("test", CSharpNativeTasks::ROOT, configuration: ENV.fetch("usage_configuration", "Release"), runtime_async: ENV["usage_runtime_async"] == "true")
+configuration = ENV.fetch("usage_configuration", "Release")
+if ENV["usage_no_build"] == "true"
+  abort "configuration must be Debug or Release" unless %w[Debug Release].include?(configuration)
+  CSharpNativeTasks.run(File.join(CSharpNativeTasks::PACKAGE, "Jed.Check/bin", configuration, "net11.0/Jed.Check.dll"), "test", CSharpNativeTasks::ROOT)
+else
+  CSharpNativeEncoding.generate
+  CSharpNativeTasks.check("test", CSharpNativeTasks::ROOT, configuration: configuration, runtime_async: ENV["usage_runtime_async"] == "true")
+end

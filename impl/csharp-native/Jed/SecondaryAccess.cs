@@ -2,7 +2,7 @@ using System.Runtime.CompilerServices;
 
 namespace Jed;
 
-internal sealed record QueryStorage(Database Database, DatabaseSnapshot Snapshot, PendingDatabase? Pending, Catalog Catalog);
+internal sealed record QueryStorage(Database Database, DatabaseSnapshot Snapshot, PendingDatabase? Pending, Catalog Catalog, bool SingleRelation = true, bool MembershipBounds = true);
 internal sealed record SecondaryAccess(CatalogIndex Index, StorageTree Tree, TableScan Scan, long EstimatedRows, long EstimatedPages, long EstimatedCost, Resolved? Predicate)
 {
     internal static SecondaryAccess? Select(CatalogTable table, StorageTree primary, Resolved? filter, QueryStorage context)
@@ -19,13 +19,17 @@ internal sealed record SecondaryAccess(CatalogIndex Index, StorageTree Tree, Tab
             if (index.Kind != 0 || index.Keys.Length == 0 || index.Keys.Any(key => key.CollationSkew)) continue;
             var keys = StatementExecution.ResolveIndexKeys(table, index, context.Catalog);
             if (keys.Any(key => VersionSkew(key, context.Catalog))) continue;
-            if (index.Predicate is not null && !Implies(filter, StatementExecution.ResolveIndexPredicate(table, index, context.Catalog)!)) continue;
+            var partial = StatementExecution.ResolveIndexPredicate(table, index, context.Catalog);
+            if (partial is not null && !Implies(filter, partial)) continue;
             var bound = Bounds(filter, keys, index.Keys);
+            if (bound is null && context.SingleRelation && partial is not null && keys.All(key => Steppable(key.Type))) bound = (new TableScan(), null, 0);
             if (bound is null) continue;
             var tree = context.Database.IndexTree(index, context.Pending, context.Snapshot);
             var count = bound.Value.Scan.Empty ? 0 : Estimate.Rows(table, context.Catalog, bound.Value.Predicate);
+            var accessPredicate = PartialPredicate(bound.Value.Predicate, partial);
+            if (partial is not null && !bound.Value.Scan.Empty) count = Estimate.Rows(table, context.Catalog, accessPredicate);
             if (index.Unique && bound.Value.Equalities == keys.Length) count = Math.Min(count, 1);
-            var reads = count == 0 ? 0 : index.Unique && bound.Value.Equalities == keys.Length ? tree.Height : Math.Clamp(Estimate.Rows(table, context.Catalog, bound.Value.Predicate, tree.NodeCount), tree.Height, tree.NodeCount);
+            var reads = count == 0 ? 0 : bound.Value.Predicate is null ? tree.NodeCount : index.Unique && bound.Value.Equalities == keys.Length ? tree.Height : Math.Clamp(Estimate.Rows(table, context.Catalog, accessPredicate, tree.NodeCount), tree.Height, tree.NodeCount);
             var cost = Estimate.Add(reads, Estimate.Multiply(count, Estimate.Add(primary.Height + 1L, PredicatePlan.Nodes(filter))));
             yield return new(index, tree, bound.Value.Scan, count, reads, cost, bound.Value.Predicate);
         }
@@ -35,10 +39,14 @@ internal sealed record SecondaryAccess(CatalogIndex Index, StorageTree Tree, Tab
         expression.Collation?.Table is { } data && (catalog.Collations ?? []).FirstOrDefault(pin => pin.Name == data.Name) is { } pin &&
         (pin.UnicodeVersion != data.UnicodeVersion || pin.CldrVersion != data.CldrVersion) || expression.Args.Any(arg => VersionSkew(arg, catalog));
 
-    internal static bool Implies(Resolved filter, Resolved predicate)
+    internal static bool Implies(Resolved filter, Resolved predicate) => IndexImplication.Proves(filter, predicate);
+    internal static bool Steppable(SqlType type) => type.Kind is not (SqlKind.Array or SqlKind.Range or SqlKind.Composite or SqlKind.Json or SqlKind.Jsonb or SqlKind.Jsonpath or SqlKind.Unknown);
+    internal static Resolved? PartialPredicate(Resolved? access, Resolved? partial)
     {
-        var terms = PredicatePlan.Conjuncts(filter).ToArray();
-        return PredicatePlan.Conjuncts(predicate).All(required => terms.Any(term => Resolve.Equivalent(term, required)));
+        if (partial is null) return access;
+        var used = access is null ? [] : PredicatePlan.Slots(access);
+        return PredicatePlan.Combine((access is null ? Enumerable.Empty<Resolved>() : [access]).Concat(
+            PredicatePlan.Conjuncts(partial).Where(term => !PredicatePlan.Slots(term).Overlaps(used))));
     }
     internal static (TableScan Scan, Resolved? Predicate, int Equalities)? Bounds(Resolved filter, Resolved[] keys, CatalogIndexKey[] definitions)
     {
@@ -59,12 +67,22 @@ internal sealed record SecondaryAccess(CatalogIndex Index, StorageTree Tree, Tab
                 }
                 else continue;
                 if (value.Op != "constant" || !Resolve.Equivalent(operand, key)) continue;
+                if (!AccessConstant.Compatible(value, key.Type)) continue;
                 if (CollationRules.Collatable(key.Type) && (term.Collation?.Name ?? "C") != (key.Collation?.Name ?? "C") && op is not ("is_null" or "is_not_null")) continue;
                 if (value.ParameterUnbound)
                 { matched = true; consumed.Add(term); unknownEquality |= op == "="; continue; }
                 if (value.Constant.IsNull && op is not ("is_null" or "is_not_null")) return (new(Empty: true), term, equalities);
                 SqlValue converted;
-                try { converted = Resolve.Cast(value.Constant, key.Type); }
+                try
+                {
+                    if (op is "is_null" or "is_not_null") converted = Resolve.Cast(value.Constant, key.Type);
+                    else
+                    {
+                        if (!AccessConstant.Point(value.Constant, key.Type, out var point) || point is null)
+                        { if (op == "=") return (new(Empty: true), term, equalities); continue; }
+                        converted = point.Value;
+                    }
+                }
                 catch (SqlException) { continue; }
                 var encoded = Slot(converted, definition, key.Collation?.Table);
                 matched = true; consumed.Add(term);

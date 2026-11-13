@@ -66,6 +66,7 @@ internal sealed class StoragePager(IBlockStore store, int pageSize, long cacheBy
         {
             var bytes = new byte[pageSize];
             await store.ReadAsync((long)id * pageSize, bytes, cancellationToken).ConfigureAwait(false);
+            CheckLive();
             var tag = Encrypted ? bytes.AsSpan(bytes.Length - 16).ToArray() : [];
             if (codec is not null) bytes = codec.OpenBody(id, bytes, reference.Tag.Span);
             _ = StorageFormat.ParsePage(bytes, verifyChecksum: !Encrypted);

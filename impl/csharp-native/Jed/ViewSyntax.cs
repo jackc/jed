@@ -14,11 +14,12 @@ internal sealed partial class Parser
         do
         {
             var name = Name(); var value = reset ? "reset" : Eat("=") ? Take().Text : "true";
+            if (value is "-" or "+" && token.Kind is TokenKind.Integer or TokenKind.Decimal) value += Take().Text;
             options.Add((name, value));
         } while (Eat(","));
         Expect(")"); return options.ToArray();
     }
-    private CreateViewSyntax CreateView(bool replace, bool temporary = false)
+    private CreateViewSyntax CreateView(bool replace, bool temporary = false, bool recursive = false)
     {
         var optional = Is("if") && Peek().Text == "not";
         if (optional) { Take(); Expect("not"); Expect("exists"); }
@@ -26,6 +27,7 @@ internal sealed partial class Parser
         var name = QualifiedName();
         if (temporary && DatabaseDomains.Name(name).Domain is { } domain && domain != "temp") throw Errors.Syntax("TEMP VIEW requires the temp domain");
         var columns = Is("(") ? ColumnNames() : null;
+        if (recursive && columns is null) throw Errors.Syntax("recursive view requires a column list");
         var options = Eat("with") ? ViewOptions() : [];
         Expect("as"); var tokens = new List<Token>();
         while (token.Kind != TokenKind.End && !Is(";")) tokens.Add(Take());
@@ -36,11 +38,18 @@ internal sealed partial class Parser
             if (length != 0) { check = length == 4 && tokens[^3].Text == "local" ? (byte)1 : (byte)2; tokens.RemoveRange(tokens.Count - length, length); }
         }
         var text = string.Join(' ', tokens.Select(RenderToken));
+        if (recursive)
+        {
+            if (check != 0) throw Errors.Unsupported("recursive view cannot have a check option");
+            var local = RenderToken(new(TokenKind.QuotedName, DatabaseDomains.Name(name).Local));
+            var names = string.Join(" , ", columns!.Select(column => RenderToken(new(TokenKind.QuotedName, column))));
+            text = $"with recursive {local} ( {names} ) as ( {text} ) select {names} from {local}";
+        }
         return new(name, columns, new Parser(text).Parse(), text, replace, optional, check, options, temporary);
     }
     private DropViewSyntax DropView()
     {
-        var optional = Eat("if"); if (optional) Expect("exists");
+        var optional = Is("if") && Peek().Text == "exists" && Eat("if"); if (optional) Expect("exists");
         var names = new List<string>(); do { names.Add(QualifiedName()); } while (Eat(","));
         var cascade = Eat("cascade"); if (!cascade) Eat("restrict"); return new(names.ToArray(), optional, cascade);
     }
@@ -53,6 +62,7 @@ internal sealed partial class Parser
         return actions.Count == 1 ? actions[0] : actions[0] with { Actions = actions.ToArray() };
         AlterViewSyntax Action()
         {
+            if (Is("owner") || Is("set") && Peek().Text == "schema") throw Errors.Unsupported("view owners and schemas");
             if (Eat("rename"))
             {
                 if (Eat("to")) return new(name, "rename", Value: Name(), IfExists: optional);

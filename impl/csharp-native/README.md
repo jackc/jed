@@ -29,7 +29,11 @@ compiler/runtime packs and needs a native compiler such as clang.
 `csharp-native:conformance --file path/to/file.test` attempts one complete file.
 `--suite name` attempts a pinned suite; `--all` attempts the pinned baseline and is expected to fail while the engine and
 adapters are incomplete. Neither option silently skips unsupported records.
-The default conformance selection is the shared scalar foundation supplement.
+`--disk` reopens the native file and session before every eligible record. `--encrypted`
+uses the same reopened file path under a fixed fixture credential and writes the separate
+cost/EXPLAIN transcript; `csharp-native:conformance-peer <run-log>` compares complete passing
+files against an independently executed pinned Go transcript. Explicit shared mode exclusions
+are reported as `SKIP`; unsupported SQL still fails. The default selection is the scalar foundation supplement.
 No normal repository task builds or installs this experiment.
 
 ## Async embedding
@@ -72,6 +76,11 @@ page-client transport await I/O through the same semantic core. Durable barriers
 use the required OS synchronization operation. There is no Task.Run wrapper.
 `Database.CreateFileAsync` and `Database.OpenFileAsync` expose the experimental
 Linux file host; use separate sessions for independent cursors and transactions.
+`DatabaseFileOptions.Synchronous` defaults to `Synchronous.On`. `Off` keeps commits atomic
+while batching durability; the page owner maintains the cumulative manifest and durable floor.
+`FlushIntervalMilliseconds` defaults to 1000 (zero disables the time trigger). Close, maintenance,
+cap and deadline flushes make the pending batch durable. The optional `Clock` callback returns
+Unix microseconds and supplies both durability deadlines and sessions without a clock override.
 
 `Database.ChangeCredentialAsync` rewraps an encrypted file's data key without
 rewriting its data pages. The current file owner performs the operation; retained
@@ -79,6 +88,12 @@ readers keep their existing data key. `SerializeAsync` exports a committed
 plaintext snapshot, and `DeserializeAsync` copies a plaintext image into an
 independent in-memory database. These surfaces have host and byte-fixture checks;
 the verification record identifies the tested source revisions.
+`SerializeAsync(name)`, `CompactAsync(name)`, `ChangeCredentialAsync(credential, name)`
+and `RekeyAsync(credential, name)` also address an attachment by its exact name.
+Maintenance checks that target's read-only state and active readers/writer; it leaves
+the main database's generation unchanged. Passing a null credential to `RekeyAsync`
+decrypts the selected file. An encrypted scratch policy on the parent is inherited
+by its attached file handles.
 
 The public surface includes exact decimal, temporal and recursive values, parameter
 binding and reusable prepared syntax. The scope inventory records missing SQL,

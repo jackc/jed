@@ -39,6 +39,10 @@ internal sealed record MergePlanning(AccessPlan Probe, HashJoinPlan? Hash, Expla
         if (meter.Explain.Verbose && !input.Detail.Contains("output=[", StringComparison.Ordinal))
             input.Append("output=[" + string.Join(", ", source.Columns.Select((column, slot) => (column, slot)).Where(item => !item.column.Hidden)
                 .Select(item => item.column.Projection is { } projection ? ExplainExpression.Print(projection) : "#" + item.slot)) + "]");
+        // Values describes its row count; the surrounding Subquery owns the
+        // SELECT-star projection metadata in this DML source position.
+        foreach (var child in input.Children.Where(child => child.Label == "Values"))
+            child.Detail = string.Join("; ", child.Detail.Split("; ").Where(part => !part.StartsWith("output=[", StringComparison.Ordinal)));
         var scan = ExplainPlanning.Scan(table, probe, generic, touched, false, meter, storage.Catalog, tree.Height);
         if (probe.Kind == AccessKind.Primary) scan.Detail = scan.Detail.Replace(" = null", " = outer", StringComparison.Ordinal)
             .Replace(" < null", " < outer", StringComparison.Ordinal).Replace(" > null", " > outer", StringComparison.Ordinal)

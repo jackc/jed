@@ -131,7 +131,7 @@ internal static partial class StatementExecution
         var names = (reserved ?? []).ToHashSet(StringComparer.Ordinal);
         var name = options.SequenceName ?? GeneratedName(table, definition.Name, "seq", candidate => candidate == table || names.Contains(candidate) || RelationExists(pending.Catalog, candidate));
         if (name == table || names.Contains(name) || RelationExists(pending.Catalog, name)) throw new SqlException(SqlStates.DuplicateTable, "relation already exists");
-        if (name.StartsWith("jed_", StringComparison.Ordinal)) throw new SqlException(SqlStates.ReservedName, "reserved sequence name");
+        if (options.SequenceName is not null && name.StartsWith("jed_", StringComparison.Ordinal)) throw new SqlException(SqlStates.ReservedName, "reserved sequence name");
         PutSequence(pending, SequenceDefinition(name, options, forcedType: type.Type) with { OwnerTable = table, OwnerColumn = ordinal });
         return new(definition.Name, type, true, DefaultExpression: SequenceDefault(name), Identity: definition.Identity, IdentityAlways: definition.IdentityAlways);
     }

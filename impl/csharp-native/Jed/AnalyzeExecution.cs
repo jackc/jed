@@ -8,6 +8,7 @@ internal static partial class StatementExecution
         var table = pending.Catalog.Tables.FirstOrDefault(table => table.Name == statement.Table);
         if (table is null)
         {
+            if ((pending.Catalog.Views ?? []).Any(view => view.Name == statement.Table)) return new([], [], 0);
             if (RelationExists(pending.Catalog, statement.Table)) throw new SqlException(SqlStates.WrongObjectType, "ANALYZE requires a table");
             throw new SqlException(SqlStates.UndefinedTable, "table does not exist");
         }
@@ -18,8 +19,8 @@ internal static partial class StatementExecution
         foreach (var column in columns)
         {
             var touched = new HashSet<int> { column };
-            meter.Charge(await tree.CountPagesAsync(token).ConfigureAwait(false));
-            await foreach (var record in tree.ScanAsync(token).ConfigureAwait(false)) meter.Charge(tree.ValueReadUnits(record, touched));
+            await foreach (var record in tree.ScanAsync(token, () => meter.Charge(Costs.PageRead)).ConfigureAwait(false))
+                meter.Charge(tree.ValueReadUnits(record, touched));
             meter.Checkpoint(); var collector = new ColumnStatistics(table, column, meter);
             await foreach (var record in tree.ScanAsync(token).ConfigureAwait(false))
             {

@@ -77,7 +77,7 @@ internal static class ExplainPlanning
         if (kind is "left" or "full") rows = Math.Max(rows, a.EstimatedRows);
         if (kind is "right" or "full") rows = Math.Max(rows, b.EstimatedRows);
         var work = Estimate.Multiply(product, predicate is null ? 0 : Expressions([predicate]));
-        if (hash is not null) work = HashJoinPlan.Work(a.EstimatedRows, b.EstimatedRows, hash.Types, predicate);
+        if (hash is not null) work = HashJoinPlan.Work(a.EstimatedRows, b.EstimatedRows, hash.Types, predicate, rows);
         if (inl is not null)
         {
             b = new(b.Label, b.Detail, b.EstimatedRows, b.EstimatedCost, b.Children.ToArray())
@@ -85,14 +85,10 @@ internal static class ExplainPlanning
                 LogicalRows = b.LogicalRows, Table = b.Table, Catalog = b.Catalog,
                 Access = b.Access, ScanHeight = b.ScanHeight
             };
-            var genericBounds = inl.Bounds.Select(term => term with { Args = term.Args.Select(arg => arg.Op == "column"
-                ? arg.Slot >= inl.OuterWidth ? arg with { Slot = arg.Slot - inl.OuterWidth } : new Resolved("constant", arg.Type, SqlValue.Null(arg.Type), [], Collation: arg.Collation, ParameterUnbound: true) : arg).ToArray() });
-            var generic = PredicatePlan.Combine(genericBounds);
-            var access = AccessPlan.Select(inl.Source.Table, inl.Source.Tree, generic, inl.Source.Storage, meter);
+            var generic = inl.GenericPredicate();
+            var access = inl.PinnedAccess ?? AccessPlan.Select(inl.Source.Table, inl.Source.Tree, generic, inl.Source.Storage, meter);
             var innerRows = Estimate.Rows(inl.Source.Table, inl.Source.Storage.Catalog, inl.Source.Filter, access.EstimatedRows);
-            rows = Estimate.Multiply(a.EstimatedRows, innerRows);
-            var remainder = predicate is null ? null : PredicatePlan.Combine(PredicatePlan.Conjuncts(predicate).Where(term => !inl.Bounds.Any(bound => Resolve.Equivalent(bound, term))));
-            rows = Estimate.Rows(rows, remainder);
+            rows = inl.EstimateRows(a.EstimatedRows, predicate, meter);
             if (kind == "left") rows = Math.Max(a.EstimatedRows, rows);
             var scanCost = Math.Max(0, access.EstimatedCost - Estimate.Multiply(access.EstimatedRows, generic is null ? 0 : PredicatePlan.Nodes(generic)));
             scanCost = Estimate.Add(scanCost, Estimate.Multiply(access.EstimatedRows, inl.Source.Filter is null ? 0 : Expressions([inl.Source.Filter])));
@@ -109,6 +105,8 @@ internal static class ExplainPlanning
                     AccessKind.Btree => "Index bound: using " + access.Index!.Name,
                     AccessKind.Gist => "GiST bound: using " + access.Index!.Name,
                     AccessKind.Gin => "GIN bound: using " + access.Index!.Name,
+                    AccessKind.PrimaryIntervals => SetDetail(access, inl.Source.Table, generic, inl.Source.Storage.Catalog),
+                    AccessKind.IndexIntervals => SetDetail(access, inl.Source.Table, generic, inl.Source.Storage.Catalog),
                     _ => "Full scan"
                 };
                 b.Detail = "Index-nested-loop " + accessDetail + (touched < 0 ? "" : b.Detail[touched..]);
@@ -147,6 +145,12 @@ internal static class ExplainPlanning
         if (count != 0) parts.Insert(1, "touched=" + count);
         node.Detail = string.Join("; ", parts);
     }
+    internal static void ScanFilterSlots(ExplainNode? node, Resolved? filter, int offset, Meter meter)
+    {
+        if (meter.Explain?.Verbose != true || filter is null || node is null || !node.Label.StartsWith("Scan ", StringComparison.Ordinal)) return;
+        var marker = node.Detail.IndexOf("; filter=", StringComparison.Ordinal);
+        if (marker >= 0) node.Detail = node.Detail[..marker] + "; " + Predicate(PredicatePlan.Shift(filter, offset), true);
+    }
     internal static string Predicate(Resolved filter, bool verbose, string kind = "filter") => verbose
         ? kind + "=" + ExplainExpression.Print(filter) : (kind == "filter" ? "" : kind + ":") + "conjuncts=" + PredicatePlan.Conjuncts(filter).Count();
     internal static ExplainNode Scan(CatalogTable table, AccessPlan access, Resolved? filter, IReadOnlySet<int> touched,
@@ -155,9 +159,9 @@ internal static class ExplainPlanning
         var detail = access.Kind switch
         {
             AccessKind.Primary => "PK bound: " + Bound(access.Predicate, table),
-            AccessKind.PrimaryIntervals => "PK interval set: " + string.Join(", ", table.PrimaryKey.Select(slot => table.Columns[slot].Name)) + "; intervals=" + (access.Ranges?.Length ?? 0),
-            AccessKind.Btree => access.Predicate is null && access.Ordered ? "Full scan" : "Index bound: using " + access.Index!.Name,
-            AccessKind.IndexIntervals => "Index interval set: using " + access.Index!.Name + "; intervals=" + (access.Ranges?.Length ?? 0),
+            AccessKind.PrimaryIntervals => SetDetail(access, table, filter, catalog),
+            AccessKind.Btree => access.Predicate is null ? access.Ordered && access.Index!.Predicate is null ? "Full scan" : "Index scan: using " + access.Index!.Name : "Index bound: using " + access.Index!.Name,
+            AccessKind.IndexIntervals => SetDetail(access, table, filter, catalog),
             AccessKind.Gin => "GIN bound: using " + access.Index!.Name,
             AccessKind.Gist => "GiST bound: using " + access.Index!.Name,
             _ => "Full scan"
@@ -174,6 +178,18 @@ internal static class ExplainPlanning
         }
         return new("Scan " + table.Name, detail, rows, cost) { LogicalRows = pushed ? catalog is null ? Estimate.Rows(table.RowCount, filter) : Estimate.Rows(table, catalog, filter) : table.RowCount, Table = table, Catalog = catalog, Access = access, ScanHeight = height };
     }
+    private static string SetDetail(AccessPlan access, CatalogTable table, Resolved? filter, Catalog? catalog)
+    {
+        var keys = access.Index is not null && catalog is not null ? StatementExecution.ResolveIndexKeys(table, access.Index, catalog) :
+            table.PrimaryKey.Select(slot => new Resolved("column", table.Columns[slot].Type.Type, default, [], Slot: slot)).ToArray();
+        var shape = KeySetShape.Read(filter, keys);
+        var consumed = shape?.Keys ?? keys;
+        var names = string.Join(", ", consumed.Select(key => table.Columns[key.Slot].Name));
+        var detail = access.Index is null ? "PK interval set: " + names : "Index interval set: using " + access.Index.Name + (consumed.Length > 1 ? " (" + names + ")" : "");
+        detail += "; intervals=" + (shape?.Intervals ?? access.Ranges?.Length ?? 0);
+        if (shape is { Arrays: > 0 }) detail += "; arrays=" + shape.Arrays;
+        return detail;
+    }
     private static string Bound(Resolved? expression, CatalogTable table)
     {
         if (expression is null) return "-";
@@ -188,7 +204,7 @@ internal static class ExplainPlanning
                 (left, right) = (right, left);
                 operation = operation switch { "<" => ">", "<=" => ">=", ">" => "<", ">=" => "<=", _ => operation };
             }
-            if (left.Op == "column") bounds.Add(table.Columns[left.Slot].Name + " " + operation + " " + (right.Op == "outer" ? "outer" : ExplainExpression.Print(right)));
+            if (left.Op == "column") bounds.Add(table.Columns[left.Slot].Name + " " + operation + " " + (right.Op == "outer" ? "outer" : right.Op == "constant" && !right.ParameterUnbound && right.Constant.IsNull ? "<value>" : ExplainExpression.Print(right)));
         }
         return bounds.Count == 0 ? "-" : string.Join(" and ", bounds);
     }
@@ -246,7 +262,8 @@ internal static class ExplainPlanning
         if (plan.Order is { Length: > 0 } order)
         {
             var detail = "keys=" + order.Length;
-            if (plan.Limit is { } top && !plan.Distinct && plan.ChargeRows) detail += ", top-k=" + (top == 0 ? 0 : Estimate.Add(top, plan.Offset));
+            if (plan.Limit is { } top && !plan.Distinct && plan.Group is null && plan.Windows is null && plan.ChargeRows &&
+                (top == 0 || top <= long.MaxValue - plan.Offset) && (plan.Spill is null || plan.Spill.TopK(plan))) detail += ", top-k=" + (top == 0 ? 0 : top + plan.Offset);
             sort = node = new("Sort", detail, node.EstimatedRows, Estimate.Add(node.EstimatedCost,
                 Estimate.Multiply(node.EstimatedRows, Expressions(order.Select(key => key.Expression)))), node);
         }

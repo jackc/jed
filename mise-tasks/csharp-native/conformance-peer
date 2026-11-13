@@ -1,0 +1,50 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#MISE description="Explicit opt-in: compare complete passing encrypted C# corpus files with the pinned independent Go transcript"
+#USAGE arg "<results>" help="Complete encrypted C# corpus run log (PASS/FAIL file evidence)"
+#USAGE flag "--transcript <path>" help="C# transcript; defaults to .build/conformance-encrypted.tsv"
+require_relative "../../impl/csharp-native/Tools/tasks"
+require "tmpdir"
+revision = CSharpNativeTasks::BASELINE.fetch("semantic_revision")
+peer_root = File.join(CSharpNativeTasks::BUILD, "simulation-peer-#{revision}")
+unless File.file?(File.join(peer_root, ".complete"))
+  FileUtils.mkdir_p(peer_root)
+  statuses = Open3.pipeline(["git", "archive", revision, "impl/go", { chdir: CSharpNativeTasks::ROOT }], ["tar", "-x", "-C", peer_root])
+  abort "Cannot extract pinned Go source" unless statuses.all?(&:success?)
+  File.write(File.join(peer_root, ".complete"), "#{revision}\n")
+end
+peer = File.join(peer_root, "conformance")
+unless File.executable?(peer)
+  abort "Pinned conformance build failed" unless system("go", "build", "-o", peer, "./cmd/conformance", chdir: File.join(peer_root, "impl/go"))
+end
+corpus = File.join(CSharpNativeTasks.baseline_spec, "conformance/suites")
+passed = File.readlines(ENV.fetch("usage_results")).filter_map do |line|
+  match = /\APASS (.*?): \d+ records, reopened before every record\s*\z/.match(line)
+  next unless match
+  path = File.expand_path(match[1])
+  abort "Result file is outside the pinned corpus: #{path}" unless path.start_with?(corpus + "/")
+  path.delete_prefix(corpus + "/")
+end
+abort "No complete encrypted disk PASS files in results log" if passed.empty?
+actual_path = ENV["usage_transcript"] || File.join(CSharpNativeTasks::BUILD, "conformance-encrypted.tsv")
+actual = File.readlines(actual_path).group_by { _1.split("\t", 2).first }
+expected_path = File.join(CSharpNativeTasks::BUILD, "conformance-encrypted-go.tsv")
+log = File.join(CSharpNativeTasks::BUILD, "conformance-encrypted-go.log")
+env = { "JED_CONFORMANCE_ENCRYPTED" => "1", "JED_CONFORMANCE_TRANSCRIPT" => expected_path, "JED_CONFORMANCE_FILTER" => nil }
+File.open(log, "w") do |output|
+  abort "Pinned Go encrypted corpus failed; see #{log}" unless system(env, peer, "disk", chdir: File.dirname(CSharpNativeTasks.baseline_spec), out: output, err: output)
+end
+expected = File.readlines(expected_path).group_by { _1.split("\t", 2).first }
+matched = 0; failed = 0; events = 0
+passed.sort.each do |file|
+  golden = expected.fetch(file, []); observed = actual.fetch(file, [])
+  if golden == observed
+    matched += 1; events += golden.length
+  else
+    failed += 1
+    index = golden.zip(observed).index { |left, right| left != right } || [golden.length, observed.length].min
+    warn "MISMATCH #{file} event #{index + 1}: expected #{golden[index].inspect}, got #{observed[index].inspect}"
+  end
+end
+puts "#{matched}/#{passed.length} complete row/type/error-passing encrypted files match independent pinned cost/EXPLAIN transcripts (#{events} events); #{failed} mismatches. Other files remain outside this passing subset."
+exit(failed.zero? ? 0 : 1)

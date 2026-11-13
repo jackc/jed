@@ -4,12 +4,17 @@ public sealed partial class Database
 {
     internal Action<string>? MaintenanceStepForTesting { get; set; }
     /// <summary>Rewrites the committed snapshot without free pages. Fails immediately while a reader or writer is active.</summary>
-    public Task CompactAsync(string name = "main", CancellationToken cancellationToken = default) =>
-        RunImageMaintenanceAsync(name, async (snapshot, state, token) =>
+    public Task CompactAsync(string name = "main", CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(name);
+        cancellationToken.ThrowIfCancellationRequested();
+        if (name != "main") return WithAttachmentAsync(name, target => target.CompactAsync(cancellationToken: cancellationToken));
+        return RunImageMaintenanceAsync(name, async (snapshot, state, token) =>
         {
             if (state is null) await CompactMemoryAsync(snapshot, token).ConfigureAwait(false);
             else await CompactFileAsync(state, snapshot, token).ConfigureAwait(false);
         }, cancellationToken);
+    }
 
     private async Task RunImageMaintenanceAsync(string name, Func<DatabaseSnapshot, FileState?, CancellationToken, Task> action, CancellationToken cancellationToken)
     {
@@ -41,14 +46,22 @@ public sealed partial class Database
                 paused = new(TaskCreationOptions.RunContinuationsAsynchronously);
                 if (state is null) maintenance = paused; else state.Admission = paused;
             }
-            if (state is not null) _ = await OwnerSnapshotAsync(cancellationToken).ConfigureAwait(false);
+            if (state is not null)
+            {
+                await committer.FlushAsync(token: cancellationToken).ConfigureAwait(false);
+                _ = await OwnerSnapshotAsync(cancellationToken).ConfigureAwait(false);
+            }
             DatabaseSnapshot snapshot;
             lock (gate) snapshot = current with { Pager = pager };
             if (snapshot.Meta.TransactionId == ulong.MaxValue) throw new SqlException(SqlStates.ProgramLimitExceeded, "database transaction identifier exhausted");
             await action(snapshot, state, cancellationToken).ConfigureAwait(false);
         }
-        catch (Exception error) when (error is IOException or UnauthorizedAccessException)
-        { throw new SqlException(SqlStates.IoError, error.Message); }
+        catch (Exception error)
+        {
+            if (state is not null && committer.IsPoisoned) PoisonFile(error);
+            if (error is IOException or UnauthorizedAccessException) throw new SqlException(SqlStates.IoError, error.Message);
+            throw;
+        }
         finally
         {
             lock (gate)

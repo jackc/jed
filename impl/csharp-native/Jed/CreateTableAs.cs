@@ -6,6 +6,8 @@ internal sealed partial class Parser
 {
     private CreateTableAsSyntax TableAs(string name, string[]? columns, bool ifNotExists, bool temporary = false)
     {
+        if (temporary && DatabaseDomains.Name(name).Domain is { } domain && domain != "temp")
+            throw Errors.Syntax("temporary CREATE TABLE AS requires the temp domain");
         var onCommit = OnCommit(temporary);
         Expect("as"); var tokens = new List<Token>();
         while (token.Kind != TokenKind.End && !Is(";")) tokens.Add(Take());
@@ -13,6 +15,7 @@ internal sealed partial class Parser
         if (tokens.Count >= 3 && tokens[^3].Text == "with" && tokens[^2].Text == "no" && tokens[^1].Text == "data")
         { withData = false; tokens.RemoveRange(tokens.Count - 3, 3); }
         else if (tokens.Count >= 2 && tokens[^2].Text == "with" && tokens[^1].Text == "data") tokens.RemoveRange(tokens.Count - 2, 2);
+        if (tokens.Count != 0 && tokens[^1].Kind == TokenKind.Word && tokens[^1].Text == "with") throw Errors.Syntax("incomplete WITH DATA clause");
         var statement = new Parser(string.Join(' ', tokens.Select(RenderToken))).ParseStatement();
         if (statement is not SelectSyntax query) throw Errors.Syntax("CREATE TABLE AS requires a query");
         return new(name, columns, query, ifNotExists, withData, temporary, onCommit);
@@ -60,8 +63,8 @@ internal static partial class StatementExecution
             if (create.IfNotExists) return new([], []);
             throw new SqlException(SqlStates.DuplicateTable, "relation already exists");
         }
-        if (create.OnCommit >= 128) throw new SqlException(SqlStates.InvalidTableDefinition, "ON COMMIT requires a temporary table");
         if ((create.Columns?.Length ?? 0) > query.Columns.Length) throw Errors.Syntax("too many target column names");
+        if (create.OnCommit >= 128) throw new SqlException(SqlStates.InvalidTableDefinition, "ON COMMIT requires a temporary table");
         var columns = query.Columns.Select((column, i) => new CatalogColumn(create.Columns is { } names && i < names.Length ? names[i] : column.Name,
             QueryColumnType(create.Query, column, i, pending.Catalog))).ToArray();
         for (var i = 0; i < columns.Length; i++)

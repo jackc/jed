@@ -12,6 +12,7 @@ internal static class CredentialChangeTests
         using var replacement = DatabaseCredential.FromPassphrase("replacement credential"u8, 8, 1, 1);
         try
         {
+            await NamedMaintenance(directory);
             await RepairInterruptedChange(root, directory);
             await using (var memory = await Database.CreateInMemoryAsync())
                 await HostTests.Error(SqlStates.ObjectNotInPrerequisiteState, () => memory.ChangeCredentialAsync(replacement));
@@ -48,6 +49,37 @@ internal static class CredentialChangeTests
         }
         finally { Directory.Delete(directory, recursive: true); }
         Console.WriteLine("PASS credential maintenance: key-block-only rewrap, host-key→passphrase reopen, retained reader/key, nonwaiting writer gate, errors and fault injection at all five storage stages");
+    }
+
+    private static async Task NamedMaintenance(string directory)
+    {
+        var path = Path.Combine(directory, "attached.jed");
+        using var old = DatabaseCredential.FromKey(new byte[32]);
+        using var next = DatabaseCredential.FromKey(Enumerable.Repeat((byte)41, 32).ToArray());
+        await using (var attached = await Database.CreateFileAsync(path, new() { Credential = old, Locking = FileLocking.None }, 1024))
+        {
+            await using var session = attached.CreateSession();
+            await DatabaseFileTests.Exec(session, "CREATE TABLE t(id i32 PRIMARY KEY)");
+            await DatabaseFileTests.Exec(session, "INSERT INTO t VALUES(9)");
+        }
+        await using var main = await Database.CreateFileAsync(Path.Combine(directory, "named-main.jed"),
+            new() { Locking = FileLocking.None, ScratchEncryption = ScratchEncryption.On });
+        await main.AttachFileAsync("child", path, new() { Credential = old, Locking = FileLocking.None });
+        var mainVersion = main.Version;
+        await main.ChangeCredentialAsync(next, "child");
+        await main.CompactAsync("child");
+        await main.RekeyAsync(null, "child");
+        var plaintext = await main.SerializeAsync("child");
+        await using var exported = await Database.DeserializeAsync(plaintext);
+        await using var read = exported.CreateSession();
+        Corpus.Equal("9", await DatabaseFileTests.Scalar(read, "SELECT id FROM t"), "named rewrap/compact/decrypt/export retain attachment contents");
+        await main.RekeyAsync(next, "child");
+        Corpus.Equal(mainVersion, main.Version, "named cryptographic maintenance leaves main unchanged");
+        await main.DetachAsync("child");
+        await HostTests.Error(SqlStates.InvalidPassword, async () => { await using var invalid = await Database.OpenFileAsync(path, new() { Credential = old, Locking = FileLocking.None }); });
+        await using var reopened = await Database.OpenFileAsync(path, new() { Credential = next, Locking = FileLocking.None });
+        await using var reopenedSession = reopened.CreateSession();
+        Corpus.Equal("9", await DatabaseFileTests.Scalar(reopenedSession, "SELECT id FROM t"), "named rekey persists independent file credential");
     }
 
     private static async Task RepairInterruptedChange(string root, string directory)

@@ -76,7 +76,7 @@ internal static class AggregateResolve
         var groupingColumns = groupingCalls.Select(call => call.Args.Select(argument =>
         {
             var bound = Resolve.Bind(argument, columns); var slot = Array.FindIndex(keys, key => Same(bound, key));
-            if (slot < 0) throw new SqlException(SqlStates.GroupingError, "GROUPING argument is not a grouping expression");
+            if (slot < 0 || Resolve.Expr(bound).Op == "outer") throw new SqlException(SqlStates.GroupingError, "GROUPING argument is not a local grouping expression");
             return slot;
         }).ToArray()).ToArray();
         Expression Rewrite(Expression expression)
@@ -188,12 +188,12 @@ internal static class AggregateResolve
                 var slot = keys.Length + groupingCalls.Count + aggregates.Count;
 
                 var collation = CollationRules.Collatable(result) ? argument?.Collation : null;
-                if (name is "min" or "max" || expression.Op == "call_distinct") CollationRules.Require(collation, true);
+                if (name is "min" or "max" || expression.Op == "call_distinct") CollationRules.Require(collation, expression.Op == "call_distinct");
                 aggregates.Add(new(name, argument, result, expression.Op == "call_distinct", filter, extra, inputOrder, Collation: collation));
                 return new("bound", name, [], Binding: new("column", result, default, [], Slot: slot, Collation: collation));
             }
             if (expression.Binding?.Subquery is { } cell) cell.Group(resolvedKeys);
-            if (expression.Binding?.Op == "outer") return expression;
+            if (expression.Binding is { } binding && (binding.Op == "outer" || Evaluate.Constant(binding))) return expression;
             if (expression.Op == "bound" || expression.Op == "name") throw new SqlException(SqlStates.GroupingError, "column must be grouped or aggregated");
             return expression with
             {
@@ -218,7 +218,17 @@ internal static class AggregateResolve
         if (having is not null && having.Type.Kind is not (SqlKind.Boolean or SqlKind.Unknown)) throw Errors.Type("HAVING requires boolean");
         var order = (syntax.Order ?? []).Select(item =>
         {
-            // Output aliases and ordinal positions are resolved by the ordinary SELECT resolver.
+            // A computed output used as an ORDER key is independently resolved;
+            // its aggregates fold separately, just as an explicit ORDER expression.
+            int? outputIndex = null;
+            if (item.Expression.Op == "integer" && int.TryParse(item.Expression.Text, out var ordinal) && ordinal > 0 && ordinal <= items.Length) outputIndex = ordinal - 1;
+            if (item.Expression.Op == "name" && !item.Expression.Text.Contains('.'))
+            {
+                var matches = Enumerable.Range(0, items.Length).Where(i => (items[i].Alias ?? items[i].Expression.Text) == item.Expression.Text).ToArray();
+                if (matches.Length == 1) outputIndex = matches[0];
+            }
+            if (outputIndex is { } at && Contains(syntax.Items[at].Expression))
+                return item with { Expression = Rewrite(syntax.Items[at].Expression), OutputIndex = at };
             if (item.Expression.Op == "integer" || item.Expression.Op == "name" && !item.Expression.Text.Contains('.') && items.Any(i => (i.Alias ?? i.Expression.Text) == item.Expression.Text)) return item;
             return item with { Expression = Rewrite(Resolve.Bind(item.Expression, columns)) };
         }).ToArray();

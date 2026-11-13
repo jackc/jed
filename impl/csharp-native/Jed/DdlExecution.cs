@@ -2,7 +2,7 @@ namespace Jed;
 
 internal static partial class StatementExecution
 {
-    private static bool RelationExists(Catalog catalog, string name) => catalog.Tables.Any(t => t.Name == name || (t.Indexes ?? []).Any(i => i.Name == name)) ||
+    internal static bool RelationExists(Catalog catalog, string name) => catalog.Tables.Any(t => t.Name == name || (t.Indexes ?? []).Any(i => i.Name == name)) ||
         (catalog.Views ?? []).Any(v => v.Name == name) || (catalog.Sequences ?? []).Any(s => s.Name == name);
     private static IEnumerable<string> ConstraintNames(CatalogTable table) => (table.Checks ?? []).Select(c => c.Name)
         .Concat((table.ForeignKeys ?? []).Select(c => c.Name)).Concat((table.Exclusions ?? []).Select(c => c.Name))
@@ -15,7 +15,7 @@ internal static partial class StatementExecution
             var first = table; var second = part;
             while (TextEncoding.Utf8.GetByteCount(first) + TextEncoding.Utf8.GetByteCount(second) + tail.Length + (second.Length == 0 ? 1 : 2) > 63)
             {
-                if (TextEncoding.Utf8.GetByteCount(first) >= TextEncoding.Utf8.GetByteCount(second)) first = TrimRune(first);
+                if (TextEncoding.Utf8.GetByteCount(first) > TextEncoding.Utf8.GetByteCount(second)) first = TrimRune(first);
                 else second = TrimRune(second);
             }
             var name = first + "_" + (second.Length == 0 ? "" : second + "_") + tail;
@@ -59,6 +59,8 @@ internal static partial class StatementExecution
     }
     internal static void Assignable(SqlType source, SqlType target)
     {
+        if (source != target && source.Kind == SqlKind.Composite && target.Kind == SqlKind.Composite)
+            throw new SqlException(SqlStates.CannotCoerce, "record value cannot be assigned to this composite type");
         if (source != target && source != SqlType.Unknown && !(source == SqlType.F32 && target == SqlType.F64) &&
             !(source == SqlType.Jsonb && target == SqlType.Json) &&
             !(source.IsInteger() && (target.IsInteger() || target == SqlType.Decimal)))
@@ -130,6 +132,9 @@ internal static partial class StatementExecution
 
     private static CatalogTable AddDefinitions(Catalog catalog, CatalogTable table, ConstraintSyntax[] definitions, Meter meter)
     {
+        // Earlier actions in one ALTER frame may have released relation names.
+        // Resolve new definitions against that frame's current table metadata.
+        catalog = catalog with { Tables = catalog.Tables.Where(item => item.Name != table.Name).Append(table).ToArray() };
         var primaries = definitions.Where(c => c.Kind == "primary").ToArray();
         if (primaries.Length > 1 || primaries.Length != 0 && table.PrimaryKey.Length != 0)
             throw new SqlException(SqlStates.InvalidTableDefinition, "multiple primary keys");
@@ -181,6 +186,8 @@ internal static partial class StatementExecution
             }
             else { part = string.Join('_', definition.Columns); label = definition.Kind == "unique" ? "key" : definition.Kind == "exclude" ? "excl" : "fkey"; }
             var name = definition.Name ?? GeneratedName(table.Name, part, label, candidate => globalNames.Contains(candidate) || definition.Kind is "unique" or "exclude" && (RelationExists(catalog, candidate) || indexes.Any(i => i.Name == candidate)));
+            if (definition.Kind is "unique" or "exclude" && definition.Name?.StartsWith("jed_", StringComparison.Ordinal) == true)
+                throw new SqlException(SqlStates.ReservedName, "reserved backing index name");
             if (definition.Kind is "unique" or "exclude" && (name == table.Name || RelationExists(catalog, name) || indexes.Any(index => index.Name == name)))
                 throw new SqlException(SqlStates.DuplicateTable, "relation already exists");
             if (!names.Add(name)) throw new SqlException(SqlStates.DuplicateObject, "duplicate constraint name");
@@ -210,6 +217,7 @@ internal static partial class StatementExecution
                         {
                             if (op is not ("=" or "&&")) throw Errors.Unsupported("GiST exclusion operator");
                             if (op == "&&" && type.Kind != SqlKind.Range) throw new SqlException(SqlStates.UndefinedObject, "no overlap operator class for exclusion column");
+                            if (op == "=" && type.Kind == SqlKind.Range) throw new SqlException(SqlStates.UndefinedObject, "no scalar equality operator class for exclusion range");
                             GistBounds.ValidateType(type);
                         }
                         operators[i] = op == "&&" ? (byte)0 : (byte)1;
@@ -227,6 +235,8 @@ internal static partial class StatementExecution
                     exclusions.Add(new(name, name, ordinals, operators)); break;
                 }
                 case "foreign":
+                    if (definition.Parent != table.Name && !catalog.Tables.Any(item => item.Name == definition.Parent) && RelationExists(catalog, definition.Parent!))
+                        throw new SqlException(SqlStates.WrongObjectType, "foreign key parent is not a table");
                     var parent = definition.Parent == table.Name ? table : Table(catalog, definition.Parent!);
                     var referenced = definition.ParentColumns is null ? parent.PrimaryKey : definition.ParentColumns.Select(c => ColumnIndex(parent, c)).ToArray();
                     if (definition.ParentColumns is null && referenced.Length == 0) throw new SqlException(SqlStates.UndefinedObject, "referenced table has no primary key");

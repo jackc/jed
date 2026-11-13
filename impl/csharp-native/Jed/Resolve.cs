@@ -2,13 +2,14 @@ using System.Globalization;
 
 namespace Jed;
 
-internal sealed record Resolved(string Op, SqlType Type, SqlValue Constant, Resolved[] Args, string Text = "", TypeSpec? Target = null, FunctionFact? Function = null, int Slot = -1, SubqueryCell? Subquery = null, OuterBinding? Outer = null, Resolved[]? GrowthOperands = null, JsonSqlSpec? Json = null, CollationDerivation? Collation = null, RegexCall? Regex = null, SimilarCall? Similar = null, bool ArrayArguments = false, bool SessionDependent = false, int ParameterIndex = 0, bool ParameterUnbound = false)
+internal sealed record Resolved(string Op, SqlType Type, SqlValue Constant, Resolved[] Args, string Text = "", TypeSpec? Target = null, FunctionFact? Function = null, int Slot = -1, SubqueryCell? Subquery = null, OuterBinding? Outer = null, Resolved[]? GrowthOperands = null, JsonSqlSpec? Json = null, CollationDerivation? Collation = null, RegexCall? Regex = null, SimilarCall? Similar = null, bool ArrayArguments = false, bool SessionDependent = false, int ParameterIndex = 0, bool ParameterUnbound = false, bool BoundSource = false)
 {
     internal bool NeedsAsync { get; } = Op is "column" or "outer" or "correlated" or "in_correlated" or "quantified_correlated" || Args.Any(argument => argument.NeedsAsync);
 }
 internal sealed record Projection(Resolved Expression, string Name);
 internal sealed record SortPlan(Resolved Expression, bool Descending, bool NullsFirst)
 {
+    internal int? OutputIndex { get; init; }
     internal static int? Column(Resolved expression)
     {
         while (expression.Op == "collate") expression = expression.Args[0];
@@ -16,9 +17,9 @@ internal sealed record SortPlan(Resolved Expression, bool Descending, bool Nulls
     }
 }
 internal sealed record SelectPlan(Projection[] Projections, Resolved? Filter, long? Limit, long Offset, bool Empty,
-    SortPlan[]? Order = null, bool Distinct = false, GroupPlan? Group = null, bool StreamDistinct = false, bool ChargeRows = true, WindowStage? Windows = null, bool WindowPrefix = false, bool AggregateLane = false, int DistinctOnCount = 0, ExplainStages? Observation = null, AccessPlan? Access = null, bool ColumnarProjection = false, SpillPolicy? Spill = null, bool ScanReverse = false, Func<ValueTask>? BeforeZeroLimit = null);
+    SortPlan[]? Order = null, bool Distinct = false, GroupPlan? Group = null, bool StreamDistinct = false, bool ChargeRows = true, WindowStage? Windows = null, bool WindowPrefix = false, bool AggregateLane = false, int DistinctOnCount = 0, ExplainStages? Observation = null, AccessPlan? Access = null, bool ColumnarProjection = false, SpillPolicy? Spill = null, bool ScanReverse = false, Func<ValueTask>? BeforeZeroLimit = null, bool AccessOrdering = false);
 internal sealed record BoundColumn(string Name, SqlType Type, string? Qualifier = null, bool Hidden = false, OuterBinding? Outer = null, int Level = 0, Resolved? Projection = null, object? BaseSource = null, bool PrimaryKey = false, CollationDerivation? Collation = null,
-    string? RowName = null, bool NotNull = false, bool NullExtended = false, bool WholeRow = true, bool ScalarRelation = false);
+    string? RowName = null, bool NotNull = false, bool NullExtended = false, bool WholeRow = true, bool ScalarRelation = false, bool RecursiveHidden = false);
 
 internal static partial class Resolve
 {
@@ -58,7 +59,7 @@ if (item.Alias is not null) throw Errors.Syntax("star expansion cannot have an a
             for (var slot = 0; slot < columns.Length; slot++)
             {
                 var column = columns[slot];
-                if (column.Outer is null && (item.Expression.Text.Length == 0 ? !column.Hidden : item.Expression.Text == column.Qualifier))
+                if (column.Outer is null && !column.RecursiveHidden && (item.Expression.Text.Length == 0 ? !column.Hidden : item.Expression.Text == column.Qualifier))
                     expanded.Add(new(new("bound", column.Name, [], Binding: column.Projection is { } projection ? projection with { Collation = column.Collation } : new("column", column.Type, default, [], Slot: slot, Collation: column.Collation)), null));
             }
         }
@@ -89,9 +90,9 @@ if (item.Alias is not null) throw Errors.Syntax("star expansion cannot have an a
             }
             RequireOrderable(expression.Type);
             CollationRules.Require(expression, true);
-            return new SortPlan(expression, item.Descending, item.NullsFirst ?? item.Descending);
+            return new SortPlan(expression, item.Descending, item.NullsFirst ?? item.Descending) { OutputIndex = item.OutputIndex };
         }).ToArray();
-        if (syntax.Distinct && syntax.DistinctOn is null && order.Any(key => !projections.Any(p => Equivalent(p.Expression, key.Expression))))
+        if (syntax.Distinct && syntax.DistinctOn is null && order.Any(key => key.OutputIndex is null && !projections.Any(p => Equivalent(p.Expression, key.Expression))))
             throw new SqlException(SqlStates.InvalidColumnReference, "DISTINCT ORDER BY expression must appear in select list");
         var distinctOnCount = 0;
         if (syntax.DistinctOn is { } on) (order, distinctOnCount) = DistinctOnResolve.Prepare(on, order, projections, columns);
@@ -227,15 +228,24 @@ if (item.Alias is not null) throw Errors.Syntax("star expansion cannot have an a
                 if (source.Op == "null" && target.Kind is SqlKind.Text or SqlKind.Array or SqlKind.Composite or SqlKind.Range) return Constant(SqlValue.Null(target));
                 if (source.Op == "text" && target == SqlType.Date && TemporalText.IsClockDate(source.Text)) return new("stable_date", target, default, [Constant(SqlValue.Text(source.Text))]);
                 if (source.Op == "text" && target == SqlType.Interval) return Constant(SqlValue.Interval(IntervalInput.Parse(source.Text, targetSpec.IntervalFields, targetSpec.Precision)));
+                if (source.Op == "text" && target.Kind == SqlKind.Composite)
+                    return new("cast", target, default, [LiteralConstant(source.Text, target, expression.Context, targetSpec)], Target: targetSpec);
                 if (source.Op == "text") return LiteralConstant(source.Text, target, expression.Context, targetSpec);
                 if (source.Op is "row" or "array")
                 {
+                    if (source.Op == "array" && source.Args.Length != 0 && target.Kind == SqlKind.Array)
+                    {
+                        var inferred = Expr(source);
+                        if (inferred.Type == target) return inferred;
+                    }
                     var constructed = source.Op == "array" && source.Args.Length != 0 && target.Kind == SqlKind.Array && target.Element == SqlType.Text ? Expr(source) : CollationRules.Derive(OpenExpression.Resolve(source, target, explicitCast: true));
                     return new("cast", target, default, [constructed], Target: targetSpec);
                 }
                 var inner = Expr(source, source.Op == "parameter" ? target : target == SqlType.Boolean ? SqlType.I32 : target.IsFloat() && source.Op is "integer" or "decimal" ? target : SqlType.Unknown);
-                if (target.Kind == SqlKind.Range && inner.Type == target) return inner;
-                if (!CanCast(inner.Type, target)) throw new SqlException(SqlStates.CannotCoerce, $"cannot cast {inner.Type.Name()} to {target.Name()}");
+                if (target.Kind is SqlKind.Range or SqlKind.Array && inner.Type == target) return inner;
+                if (!CanCast(inner.Type, target)) throw new SqlException(
+                    inner.Type.Kind is SqlKind.Array or SqlKind.Composite or SqlKind.Range or SqlKind.Jsonpath || target.Kind is SqlKind.Array or SqlKind.Composite or SqlKind.Range or SqlKind.Jsonpath
+                        ? SqlStates.CannotCoerce : SqlStates.DatatypeMismatch, $"cannot cast {inner.Type.Name()} to {target.Name()}");
                 // Text identity is folded; numeric casts remain runtime nodes even
                 // for constants, preserving overflow timing and exact costs.
                 if (target == SqlType.Text && inner.Type == SqlType.Text && targetSpec.Length is null) return inner;
@@ -351,6 +361,8 @@ if (item.Alias is not null) throw Errors.Syntax("star expansion cannot have an a
     }
     internal static (Resolved, Resolved) Pair(Expression left, Expression right, string? operation = null)
     {
+        var comparison = operation is "=" or "<>" or "!=" or "<" or "<=" or ">" or ">=" or "distinct" or "not_distinct";
+        static bool IntegerLiteral(Expression value) => value.Op == "integer" || value.Op is "neg" or "pos" && IntegerLiteral(value.Args[0]);
         if (left.Op == "row" && right.Op == "row")
         {
             if (left.Args.Length != right.Args.Length) throw Errors.Type("row comparison widths differ");
@@ -375,11 +387,11 @@ if (item.Alias is not null) throw Errors.Syntax("star expansion cannot have an a
         {
             var resolvedRight = Expr(right);
             var target = JsonResolve.OperandHint(operation, resolvedRight.Type, true) ?? (operation == "+" && left.Op is "text" or "null" && resolvedRight.Type.Kind is SqlKind.Timestamp or SqlKind.Timestamptz ? SqlType.Interval : resolvedRight.Type);
-            return (Expr(left, target), resolvedRight);
+            return (Expr(left, comparison && target == SqlType.Decimal && IntegerLiteral(left) ? SqlType.Unknown : target), resolvedRight);
         }
         var resolvedLeft = Expr(left);
         var rightTarget = JsonResolve.OperandHint(operation, resolvedLeft.Type, false) ?? (operation == "+" && right.Op is "text" or "null" && resolvedLeft.Type.Kind is SqlKind.Timestamp or SqlKind.Timestamptz ? SqlType.Interval : resolvedLeft.Type);
-        return (resolvedLeft, Expr(right, rightTarget));
+        return (resolvedLeft, Expr(right, comparison && rightTarget == SqlType.Decimal && IntegerLiteral(right) ? SqlType.Unknown : rightTarget));
     }
     internal static SqlType Common(SqlType left, SqlType right)
     {
@@ -413,7 +425,7 @@ if (item.Alias is not null) throw Errors.Syntax("star expansion cannot have an a
     }
     internal static bool CanCast(SqlType from, SqlType to) => from == SqlType.Unknown || from == to || from == SqlType.Text && to.Kind is SqlKind.Json or SqlKind.Jsonb or SqlKind.Jsonpath || from.Kind is SqlKind.Json or SqlKind.Jsonb && to.Kind is SqlKind.Json or SqlKind.Jsonb || CastCatalog.Pairs.Contains((from, to)) || OpenValue.CanCast(from, to);
 
-    private static Resolved LiteralConstant(string text, SqlType target, TemporalContext? context, TypeSpec? modifier = null)
+    internal static Resolved LiteralConstant(string text, SqlType target, TemporalContext? context, TypeSpec? modifier = null)
     {
         var local = context?.LiteralContext() ?? new TemporalContext(static () => throw new InvalidOperationException("literal reads clock"), "UTC");
         var value = TemporalText.Parse(text, target, local);

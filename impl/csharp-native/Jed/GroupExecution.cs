@@ -20,7 +20,8 @@ internal static class GroupExecution
         internal ExactDecimal Sum = ExactDecimal.FromInt64(0);
         internal readonly HashSet<string> Seen = new(StringComparer.Ordinal);
         internal long MemoryBytes;
-        internal void Retain(long bytes, Meter meter) { meter.Memory.Reserve(bytes); MemoryBytes = Meter.Add(MemoryBytes, bytes); }
+        internal bool StorageManaged;
+        internal void Retain(long bytes, Meter meter) { if (StorageManaged) return; meter.Memory.Reserve(bytes); MemoryBytes = Meter.Add(MemoryBytes, bytes); }
         internal void Release(Meter meter) { meter.Memory.Release(MemoryBytes); MemoryBytes = 0; Ordered?.Release(meter); }
     }
     private sealed class Group(SqlValue[] keys, Fold[] folds, int set, long bytes)
@@ -42,8 +43,13 @@ internal static class GroupExecution
     private static async IAsyncEnumerable<SqlValue[]> Buffered(IEnumerable<SqlValue[]> rows)
     { await ValueTask.CompletedTask.ConfigureAwait(false); foreach (var row in rows) yield return row; }
     internal static async IAsyncEnumerable<SqlValue[]> Run(GroupPlan plan, IAsyncEnumerable<SqlValue[]> source, Resolved? filter,
-        Meter meter, [EnumeratorCancellation] CancellationToken cancellationToken = default, bool sourceMemory = false, IReadOnlySet<int>? touched = null, bool lane = false, ExplainNode? filterObservation = null)
+        Meter meter, [EnumeratorCancellation] CancellationToken cancellationToken = default, bool sourceMemory = false, IReadOnlySet<int>? touched = null, bool lane = false, ExplainNode? filterObservation = null, SpillPolicy? spill = null)
     {
+        if (spill is not null)
+        {
+            await foreach (var row in SpillGroup.Run(plan, source, filter, spill, meter, sourceMemory, touched, lane, filterObservation, cancellationToken).ConfigureAwait(false)) yield return row;
+            yield break;
+        }
         using var inputMemory = new QueryInputMemory(meter);
         using var outputMemory = new QueryInputMemory(meter);
         var output = new List<SqlValue[]>();

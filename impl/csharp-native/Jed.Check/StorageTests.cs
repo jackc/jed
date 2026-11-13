@@ -54,6 +54,8 @@ internal static class StorageTests
         }
         await Cache();
         await Commit(empty);
+        await Preallocation(empty);
+        await RelaxedCommits(empty);
         await FreeListBoundary(empty);
         await TrailingTruncation(empty);
         await Leaves(fixtureRoot);
@@ -326,6 +328,75 @@ internal static class StorageTests
         Corpus.Equal(2, recovered.FreeListPages.Count, "empty trailing list page stays protected");
     }
 
+    private static async Task RelaxedCommits(byte[] image)
+    {
+        await using var device = new RecordingStore(image);
+        var before = await StorageRecovery.OpenAsync(device);
+        before = before with { Meta = before.Meta with { PageCount = 32 }, FreePages = new(Enumerable.Range(3, 29).Select(id => (uint)id)) };
+        var pager = new StoragePager(device, 256);
+        var writer = new StorageCommitter(pager, before);
+        var deadline = await writer.BeginPlanAsync(false, 999, 1);
+        Corpus.Equal(1999L, deadline!.Value, "deadline retains fractional milliseconds");
+        StorageCommitPlan Plan()
+        {
+            var allocation = new StorageAllocation(writer.Current, eagerReclaim: false);
+            var root = allocation.AddPage(StorageFormat.EncodePage(256, new(1, 0, 0, 0), []));
+            allocation.CollectUnreachable(new HashSet<uint> { root }, default);
+            return allocation.Prepare(root, 1, truncate: true);
+        }
+        var first = Plan(); await writer.CommitAsync(first, synchronous: false, deadlineMicroseconds: deadline);
+        Corpus.Equal(0, device.Events.Count(item => item == "sync"), "relaxed commit omits barrier");
+        Corpus.Equal(1, writer.Current.FloorSlot, "relaxed commit preserves durable floor slot");
+        var firstIds = first.Body.Select(page => page.Page).ToHashSet();
+        var second = Plan();
+        Corpus.Equal(false, second.Body.Any(page => firstIds.Contains(page.Page)), "batch never rewrites an earlier body page");
+        Corpus.Equal(false, second.Body.Any(page => page.Page == 2), "newly orphaned floor root is not reusable inside batch");
+        Corpus.Equal((uint)(first.Body.Length + second.Body.Length), second.Meta.ManifestEntries, "manifest includes prior batch body writes");
+        Corpus.Equal(false, second.FreePages.Overlaps(firstIds), "pending body pages excluded from persisted free list");
+        await writer.CommitAsync(second, synchronous: false, deadlineMicroseconds: deadline);
+        Corpus.Equal(first.Meta.PageCount <= second.Meta.PageCount, true, "batch cannot lower high-water after its first commit");
+        Corpus.Equal(3UL, (await StorageRecovery.OpenAsync(device)).Meta.TransactionId, "complete cumulative manifest reopens newest generation");
+        // Losing any earlier member rejects the entire newest candidate, even
+        // when that member is already orphaned by the latest catalog root.
+        var torn = first.Body[0].Bytes.ToArray(); torn[20] ^= 1;
+        await device.WriteAsync((long)first.Body[0].Page * 256, torn);
+        Corpus.Equal(1UL, (await StorageRecovery.OpenAsync(device)).Meta.TransactionId, "lost earlier batch page falls back to durable floor");
+        await device.WriteAsync((long)first.Body[0].Page * 256, first.Body[0].Bytes);
+        _ = await writer.BeginPlanAsync(false, 1998, 1);
+        Corpus.Equal(0, device.Events.Count(item => item == "sync"), "before deadline does not flush");
+        var nextDeadline = await writer.BeginPlanAsync(false, 1999, 1);
+        Corpus.Equal(2999L, nextDeadline!.Value, "deadline flush reuses same captured clock reading");
+        Corpus.Equal(1, device.Events.Count(item => item == "sync"), "deadline issues one barrier");
+        Corpus.Equal(true, writer.Current.Batch is null, "flush clears pending batch");
+        Corpus.Equal(writer.Current.Slot, writer.Current.FloorSlot, "flush advances durable floor");
+        var next = Plan();
+        Corpus.Equal(2u, next.Meta.Root, "floor orphan becomes reusable after flush");
+        await writer.CommitAsync(next);
+        Corpus.Equal(2, device.Events.Count(item => item == "sync"), "synchronous commit follows cleared batch");
+
+        foreach (var fail in new[] { false, true })
+        {
+            await using var capped = new RecordingStore(image) { FailSync = fail };
+            var initial = await StorageRecovery.OpenAsync(capped); var cappedPager = new StoragePager(capped, 256);
+            var cappedWriter = new StorageCommitter(cappedPager, initial); var allocation = new StorageAllocation(initial);
+            var root = allocation.AddPage(StorageFormat.EncodePage(256, new(1, 0, 0, 0), []));
+            for (var i = 1; i < StorageFormat.InlineCapacity(256); i++) allocation.AddPage(StorageFormat.EncodePage(256, new(4, 0, 0, 0), []));
+            await cappedWriter.CommitAsync(allocation.Prepare(root, 1), synchronous: false);
+            Corpus.Equal(2UL, cappedWriter.Current.Meta.TransactionId, "cap flush failure cannot fail published commit");
+            Corpus.Equal(1, capped.Events.Count(item => item == "sync"), "cap issues one barrier");
+            Corpus.Equal(fail, cappedWriter.IsPoisoned, "cap flush failure poisons storage");
+            if (fail)
+            {
+                try { _ = await cappedPager.ReadPageAsync(root); throw new InvalidDataException("revoked pager remained readable"); }
+                catch (SqlException error) when (error.SqlState == SqlStates.IoError) { }
+                try { await cappedWriter.FlushAsync(); throw new InvalidDataException("poisoned close flush succeeded"); }
+                catch (SqlException error) when (error.SqlState == SqlStates.IoError) { }
+            }
+            else Corpus.Equal(true, cappedWriter.Current.Batch is null, "successful cap flush clears batch");
+        }
+        Console.WriteLine("PASS relaxed COW invariants: cumulative manifests, floor-safe reuse, orphan exclusion, torn-batch fallback, precise deadlines, cap barriers and post-publication revocation");
+    }
+
     private static async Task Commit(byte[] image)
     {
         await using var device = new RecordingStore(image);
@@ -391,6 +462,26 @@ internal static class StorageTests
         device.FailReadPage = reopened.Meta.Root;
         try { _ = await StorageRecovery.OpenAsync(device); throw new InvalidDataException("I/O error silently ignored"); }
         catch (IOException) { }
+    }
+
+    private static async Task Preallocation(byte[] empty)
+    {
+        Corpus.Equal(67L * 256, StorageGrowth.Length(3L * 256, 4, 256), "small-file 16 KiB growth floor");
+        Corpus.Equal(134L * 256, StorageGrowth.Length(67L * 256, 68, 256), "small-file geometric growth");
+        Corpus.Equal(8192L * 256, StorageGrowth.Length(4096L * 256, 4097, 256), "large-file 1 MiB growth cap");
+        Corpus.Equal(4L * 65536, StorageGrowth.Length(2L * 65536, 3, 65536), "growth floor scales to large pages");
+        await using var store = new RecordingStore(empty);
+        var before = await StorageRecovery.OpenAsync(store);
+        var writer = new StorageCommitter(new StoragePager(store, 256), before);
+        var allocation = new StorageAllocation(before);
+        var root = allocation.AddPage(StorageFormat.EncodePage(256, new(1, 0, 0, 0), []));
+        var plan = allocation.Prepare(root, 1);
+        await writer.CommitAsync(plan);
+        Corpus.Equal(67L * 256, await store.GetLengthAsync(), "commit uses geometric physical reserve");
+        Corpus.Equal(plan.Meta.PageCount, (await StorageRecovery.OpenAsync(store)).Meta.PageCount, "physical slack does not change logical high-water");
+        var tail = new byte[checked((int)(await store.GetLengthAsync() - plan.Meta.PageCount * 256L))];
+        await store.ReadAsync(plan.Meta.PageCount * 256L, tail);
+        Corpus.Equal(true, StorageFormat.IsZero(tail), "unreferenced preallocation tail stays zero");
     }
 
     private static async Task TrailingTruncation(byte[] empty)

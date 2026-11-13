@@ -6,14 +6,14 @@ internal sealed record DropTypeSyntax(string Name, bool IfExists, bool Cascade) 
 internal sealed record ConstraintSyntax(string Kind, string? Name, string[] Columns, Expression? Expression = null,
     string? Text = null, string? Parent = null, string[]? ParentColumns = null, byte OnDelete = 0, byte OnUpdate = 0, bool MatchFull = false, ExclusionSyntax? Exclusion = null);
 internal sealed record ExclusionSyntax(string Method, Expression[] Elements, string[] Operators, Expression? Predicate, string? PredicateText);
-internal sealed record IndexKeySyntax(Expression Expression, string Text, byte Options);
+internal sealed record IndexKeySyntax(Expression Expression, string Text, byte Options, bool Ordered = false);
 internal sealed record CreateIndexSyntax(string? Name, string Table, IndexKeySyntax[] Keys, bool Unique, bool IfNotExists,
     string Method, Expression? Predicate = null, string? PredicateText = null) : StatementSyntax;
 internal sealed record DropIndexSyntax(string Name, bool IfExists, bool Cascade) : StatementSyntax;
 internal sealed record AlterBatchSyntax(AlterTableSyntax[] Actions) : StatementSyntax;
 internal sealed record AlterTableSyntax(string Table, string Operation, string? Column = null, string? Name = null,
     Expression? Expression = null, string? Text = null, ColumnSyntax? Definition = null, ConstraintSyntax? Constraint = null,
-    bool IfExists = false, bool Cascade = false, ConstraintSyntax[]? AddedConstraints = null, SequenceOptions? Sequence = null) : StatementSyntax;
+    bool IfExists = false, bool Cascade = false, ConstraintSyntax[]? AddedConstraints = null, SequenceOptions? Sequence = null, bool TableIfExists = false) : StatementSyntax;
 
 internal sealed partial class Parser
 {
@@ -55,9 +55,11 @@ internal sealed partial class Parser
         var replaceView = Eat("or"); if (replaceView) Expect("replace");
         if (Eat("unlogged")) throw Errors.Unsupported("unlogged tables");
         var temporary = Eat("temp") || Eat("temporary");
-        if (temporary && !Is("table") && !Is("view")) throw Errors.Syntax("expected TABLE or VIEW after TEMP");
+        if (temporary && !Is("table") && !Is("view") && !Is("recursive")) throw Errors.Syntax("expected TABLE or VIEW after TEMP");
         if (Eat("materialized")) throw Errors.Unsupported("materialized views");
-        if (Eat("view")) return CreateView(replaceView, temporary);
+        var recursiveView = Eat("recursive");
+        if (Eat("view")) return CreateView(replaceView, temporary, recursiveView);
+        if (recursiveView) throw Errors.Syntax("expected VIEW after RECURSIVE");
         if (replaceView) throw Errors.Syntax("expected VIEW");
         if (Eat("sequence")) return CreateSequence();
         if (Eat("type"))
@@ -73,25 +75,25 @@ internal sealed partial class Parser
         var unique = Eat("unique");
         if (Eat("index"))
         {
-            var optional = Eat("if"); if (optional) { Expect("not"); Expect("exists"); }
-            var name = Is("on") ? null : QualifiedName(); if (optional && name is null) throw Errors.Syntax("IF NOT EXISTS requires an index name");
+            var optional = Is("if") && Peek().Text == "not" && Eat("if"); if (optional) { Expect("not"); Expect("exists"); }
+            var name = Is("on") && (Peek().Text != "on" || Peek(2).Text is "(" or "using") ? null : QualifiedName(); if (optional && name is null) throw Errors.Syntax("IF NOT EXISTS requires an index name");
             Expect("on"); var table = QualifiedName(); var method = Eat("using") ? Name() : "btree";
             Expect("("); var keys = new List<IndexKeySyntax>();
             do
             {
                 var parenthesized = Is("("); var (expression, text) = CapturedExpression();
                 if (!parenthesized && expression.Op is not ("name" or "call" or "collate")) throw Errors.Syntax("index expression requires parentheses");
-                var descending = Eat("desc"); if (!descending) Eat("asc");
+                var descending = Eat("desc"); var ordered = descending || Eat("asc");
                 var first = descending;
-                if (Eat("nulls")) { if (Eat("first")) first = true; else { Expect("last"); first = false; } }
-                keys.Add(new(expression, text, (byte)((descending ? 1 : 0) | (first ? 2 : 0))));
+                if (Eat("nulls")) { ordered = true; if (Eat("first")) first = true; else { Expect("last"); first = false; } }
+                keys.Add(new(expression, text, (byte)((descending ? 1 : 0) | (first ? 2 : 0)), ordered));
             } while (Eat(","));
             Expect(")"); Expression? predicate = null; string? predicateText = null;
             if (Eat("where")) (predicate, predicateText) = CapturedExpression();
             return new CreateIndexSyntax(name, table, keys.ToArray(), unique, optional, method, predicate, predicateText);
         }
         if (unique) throw Errors.Syntax("expected INDEX after UNIQUE");
-        Expect("table"); var ifAbsent = Eat("if"); if (ifAbsent) { Expect("not"); Expect("exists"); }
+        Expect("table"); var ifAbsent = Is("if") && Peek().Text == "not" && Eat("if"); if (ifAbsent) { Expect("not"); Expect("exists"); }
         var tableName = QualifiedName();
         temporary |= DatabaseDomains.Name(tableName).Domain == "temp";
         if (Is("as") || Is("on")) return TableAs(tableName, null, ifAbsent, temporary);
@@ -119,7 +121,7 @@ internal sealed partial class Parser
         if (Eat("delete")) { Expect("rows"); return (byte)(prefix | 1); }
         Expect("preserve"); Expect("rows"); return (byte)prefix;
     }
-    private bool IsTableConstraint() => Is("constraint") || Is("primary") && Peek().Text == "key" || Is("unique") && Peek().Text == "(" ||
+    private bool IsTableConstraint() => Is("constraint") && Peek(2).Text is "check" or "unique" or "primary" or "foreign" or "exclude" || Is("primary") && Peek().Text == "key" || Is("unique") && Peek().Text == "(" ||
         Is("check") && Peek().Text == "(" || Is("foreign") && Peek().Text == "key" || Is("exclude") && Peek().Text is "(" or "using";
     private ColumnSyntax ColumnDefinition(List<ConstraintSyntax> constraints)
     {
@@ -174,7 +176,7 @@ internal sealed partial class Parser
         var local = column is null ? ReadForeignColumns() : new[] { column };
         Expect("references"); var parent = QualifiedName(); var remote = Is("(") ? ColumnNames() : null;
         byte delete = 0, update = 0; var full = false; var sawDelete = false; var sawUpdate = false;
-        if (Eat("match")) { if (Eat("full")) full = true; else Expect("simple"); }
+        if (Eat("match")) { if (Eat("partial")) throw Errors.Unsupported("MATCH PARTIAL"); if (Eat("full")) full = true; else Expect("simple"); }
         while (Eat("on"))
         {
             var deleting = Eat("delete"); if (!deleting) Expect("update");
@@ -196,10 +198,11 @@ internal sealed partial class Parser
     {
         if (Eat("view")) return AlterView();
         if (Eat("sequence")) return AlterSequence();
-        Expect("table"); var table = QualifiedName();
-        var actions = new List<AlterTableSyntax> { AlterAction(table) };
+        Expect("table"); var optional = Is("if") && Peek().Text == "exists" && Eat("if"); if (optional) Expect("exists");
+        var table = QualifiedName();
+        var actions = new List<AlterTableSyntax> { AlterAction(table) with { TableIfExists = optional } };
         if (actions[0].Operation.StartsWith("rename", StringComparison.Ordinal)) return actions[0];
-        while (Eat(",")) actions.Add(AlterAction(table));
+        while (Eat(",")) actions.Add(AlterAction(table) with { TableIfExists = optional });
         return actions.Count == 1 ? actions[0] : new AlterBatchSyntax(actions.ToArray());
     }
     private AlterTableSyntax AlterAction(string table)
@@ -213,7 +216,7 @@ internal sealed partial class Parser
         if (Eat("add"))
         {
             if (IsTableConstraint()) return new AlterTableSyntax(table, "add_constraint", Constraint: ReadConstraint(null));
-            Eat("column"); var optional = Eat("if"); if (optional) { Expect("not"); Expect("exists"); }
+            Eat("column"); var optional = Is("if") && Peek().Text == "not" && Eat("if"); if (optional) { Expect("not"); Expect("exists"); }
             var constraints = new List<ConstraintSyntax>(); var column = ColumnDefinition(constraints);
             return new AlterTableSyntax(table, "add_column", Definition: column, IfExists: optional, AddedConstraints: constraints.ToArray());
         }
