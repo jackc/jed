@@ -12,6 +12,10 @@ package jed
 //
 // Go-only, no format version bump. The other cores, verify.rb, backup, and the page
 // service do not understand the list.
+//
+// It now runs alongside incremental free-list reclamation (incr_reclaim.go), which it used to switch
+// off. Deferral still halves the bytes of a single-row commit on top of that rule; composing them
+// exposed, and fixed, an entry-lifecycle bug in replace below (spec/design/deferred-interior.md §8).
 
 import (
 	"encoding/binary"
@@ -97,11 +101,27 @@ func (r *remapState) clone() *remapState {
 
 // replace records that the node at page old now lives at cur, in the same slot of a parent whose
 // page is not rewritten.
+//
+// It also retires whatever would collide with the new entry, which keeps fwd injective on target
+// pages (and rev its exact inverse). Both collisions are real: an entry whose child LEFT the tree is
+// not dropped by the write-fresh branch, which only sees the children that remain, so its target page
+// is orphaned, reused, and then claimed by this entry; and a key whose target moves twice without the
+// first move being seen leaves its old target in rev. Left alone, two keys naming one page make
+// rev[page] depend on map iteration order in clone(), so a later replace updates the wrong key and the
+// other entry outlives the page it names — a freed page that an on-disk pointer still reaches.
+// A stale entry nothing else claims merely holds its key page off the free list until a fold or the
+// rebuild's prune.
 func (r *remapState) replace(old uint32, cur pageRef) {
 	disk := old
 	if d, ok := r.rev[old]; ok {
 		disk = d
 		delete(r.rev, old)
+	}
+	if other, ok := r.rev[cur.page]; ok && other != disk {
+		delete(r.fwd, other)
+	}
+	if prev, ok := r.fwd[disk]; ok && prev.page != cur.page {
+		delete(r.rev, prev.page)
 	}
 	r.fwd[disk] = cur
 	r.rev[cur.page] = disk
@@ -202,11 +222,16 @@ func decodeRemap(m []byte) (*remapState, bool) {
 	return r, true
 }
 
-// deferCtx is one commit's deferral state: the list as the commit leaves it, and how many pages kept
-// their place that the live-page delta would otherwise count as replaced.
+// deferCtx is one commit's deferral state: the list as the commit leaves it, how many pages kept
+// their place that the live-page delta would otherwise count as replaced, and which pages those are.
 type deferCtx struct {
 	remap    *remapState
 	retained uint32
+	// retainedIDs is the page each retained node kept, in serialization order.
+	retainedIDs []uint32
+	// migrate is the page this commit moves down rather than keeps in place (0: none) — the page that
+	// blocks trailing truncation, chosen by migrateHint (validated_commit.go).
+	migrate uint32
 }
 
 // catState is the committed catalog chain, kept so a commit whose catalog bytes are unchanged does not

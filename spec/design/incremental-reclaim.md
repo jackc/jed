@@ -166,8 +166,16 @@ writer trims the generations to the new high-water as a precaution.
 suffix of the previous one: it relies on the list shrinking only from its ends between rebuilds (§2
 there). Incremental reclamation adds entries in the middle of the list at almost every commit, so the
 suffix test fails on almost every commit and the kept chain degenerates to today's fresh chain. The two
-do not compose; a commit under this rule writes a fresh chain (Go's kept-chain prototype stays a
-prototype, off by default).
+do not compose; a commit under this rule writes a fresh chain. The Go prototype and its gate were
+removed when this rule was adopted, and [free-list-kept-chain.md](free-list-kept-chain.md) is now a
+closed record (its §8). The *deferred-interior* prototype is the opposite case: it attacks pages this
+rule does not touch and still halves a single-row commit's bytes over it. Composing them exposed a
+bug in that prototype — a remap entry could outlive the page it names, which this rule is the first
+thing to reuse, and which the old rebuild had been healing — fixed in
+[deferred-interior.md](deferred-interior.md) §8.3. It also showed where this rule and that prototype
+pull against each other: trailing truncation cuts only a contiguous run of free pages, so one retained
+interior at the top pins a file's length. The prototype now moves that one page per commit
+([deferred-interior.md](deferred-interior.md) §8.4); nothing in this rule changes.
 
 The cost they each attack shrinks under this proposal anyway: the list is now about the size of the
 pages recent commits orphaned (plus whatever a delete-heavy commit freed), not up to one entry per

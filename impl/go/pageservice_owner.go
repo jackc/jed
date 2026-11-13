@@ -1295,7 +1295,7 @@ func (sc *psServerConn) finishClientCommit(requestID uint32, w *psWriteTxn) erro
 	var free []uint32
 	var fc *freeChain
 	if err == nil {
-		free, fc, err = readFreeList(st.paging, pageRef{page: d.m.freeListHead, tag: d.m.freeListTag}, d.m.freeLow, d.m.pageCount)
+		free, fc, err = readFreeList(st.paging, pageRef{page: d.m.freeListHead, tag: d.m.freeListTag}, d.m.pageCount)
 	}
 	if err != nil {
 		st.mu.Unlock()

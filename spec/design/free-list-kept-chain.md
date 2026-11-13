@@ -1,8 +1,12 @@
-# Free list: keep the chain between rebuilds (proposal)
+# Free list: keep the chain between rebuilds (closed)
 
-**Status: proposal, prototyped in the Go core only.** Nothing here is in `format.md`, the Ruby
-reference, or the Rust and TS cores. It would be a format bump (v50 → v51); the prototype does not bump
-the version. §9 records what the prototype does and what was run against it.
+**Status: closed, 2026-11-13. Superseded by [incremental-reclaim.md](incremental-reclaim.md);** the Go
+prototype and its `JED_FREE_KEPT_CHAIN` gate were removed when that rule was adopted, and meta offset
+60 is reserved (0) again. Nothing here ever reached `format.md`, the Ruby reference, or the Rust and TS
+cores. This document is kept as the research record: the measured cost of the per-commit free-list
+rewrite (§1), the suffix observation the design rested on (§2), the design itself (§3 to §4), and why
+it was closed (§8). Its residual — a list that takes insertions in the middle without a rewrite —
+is [incremental-reclaim.md](incremental-reclaim.md) §8 open question 2.
 
 ## 1. The problem
 
@@ -154,6 +158,9 @@ reachability walk, and the file would stay near its live size. That changes the 
 run to several generations and needs its own design for allocation order, truncation, and the
 batched-durability reuse rule. It is not specified here.
 
+**That follow-on is what landed** ([incremental-reclaim.md](incremental-reclaim.md), 2026-11-13), and
+it is why this proposal is closed — see §8.
+
 ## 7. Open questions
 
 1. Value form (`free_list_low`, this draft) or positional window. The positional form avoids the
@@ -161,22 +168,40 @@ batched-durability reuse rule. It is not specified here.
 2. What replaces the `cow_free_head_manifest` fixture's guarantee, if anything.
 3. Whether to stop rebuilding inside a relaxed batch, which would make the fresh-chain branch rarer.
 
-## 8. Work if adopted
+## 8. Why it was closed
 
-`format.md` (meta table, *Free-list page*, *Reclamation*, *Trailing truncation*, version scope),
-`encrypted.md` §6, `validated-cow.md` §2/§4, `page-service.md` §6 and the `spec/pageservice/` meta
-fixtures, `integrity-check.md` §3; the Ruby reference and `verify.rb`; the three cores; simulator
-checkers for the free-list oracles; per-core incremental-commit tests that pin free-list bytes; the
-bench dataset `generator_version`.
+[incremental-reclaim.md](incremental-reclaim.md) took the §6 follow-on instead: a commit lists the
+pages it orphans rather than only counting them. That removes both of §6's first two items — the
+whole-database rebuild walk becomes a leak backstop, and the file stays near 1× its live size — and in
+doing so it **invalidates §2, the observation this design rests on**. Orphans are merged into the
+middle of the list at almost every commit, so the list no longer shrinks only from its ends: the
+suffix test of §3.2 fails on almost every commit and the kept chain degenerates to today's fresh
+chain. The two do not compose (incremental-reclaim.md §3.7).
 
-## 9. The Go prototype
+The cost of §1 shrank with the same change, which is the second reason not to pursue a rework. The
+list is now about the size of what recent commits orphaned, not up to one entry per live page, so the
+fresh chain each commit writes is small and the TB-scale arithmetic of §1 no longer applies.
 
-Uncommitted, in `impl/go`: `format.go` (meta field, `readFreeList`, `serializeFreeList`, `freeChain`),
-`validated_commit.go` (the rule in `planValidatedCommit`), and the plumbing that carries the chain
-beside `freePages`. `JED_FREE_KEPT_CHAIN=off` restores the old behavior for comparison.
+What survives is narrower: **a large free list — after a big delete — is still rewritten whole by
+every commit until it is consumed or truncated.** Closing that needs a persistent structure that
+takes insertions in the middle without a rewrite (a list of freed runs appended per commit and
+consolidated occasionally, or a free-space B-tree), which would serve both this and incremental
+reclamation. It is a format change and is not specified anywhere;
+[incremental-reclaim.md](incremental-reclaim.md) §8 open question 2 is where it is recorded.
 
-Two shortcuts keep the existing fixtures readable without a version bump, and would not survive into
-a real v51: a chain with `free_list_low = 0` is read whole, and such a file keeps the old
+Had it been adopted, the work would have been: `format.md` (meta table, *Free-list page*,
+*Reclamation*, *Trailing truncation*, version scope), `encrypted.md` §6, `validated-cow.md` §2/§4,
+`page-service.md` §6 and the `spec/pageservice/` meta fixtures, `integrity-check.md` §3; the Ruby
+reference and `verify.rb`; the three cores; simulator checkers for the free-list oracles; per-core
+incremental-commit tests that pin free-list bytes; the bench dataset `generator_version`.
+
+## 9. The Go prototype, as measured before removal
+
+It lived in `impl/go` behind `JED_FREE_KEPT_CHAIN=on`: `format.go` (the meta field, `readFreeList`,
+`serializeFreeList`, `freeChain.lasts`/`from`, `freeSuffix`), `validated_commit.go` (the rule in
+`planValidatedCommit`), and the plumbing that carried the chain beside `freePages`. Two shortcuts kept
+the existing fixtures readable without a version bump, and would not have survived into a real v51: a
+chain with `free_list_low = 0` was read whole, and such a file kept the old
 manifest-names-the-head rule.
 
 Run against it:
@@ -190,10 +215,12 @@ Run against it:
   are the independent Ruby checker rejecting the images, as expected: `verify.rb` does not know the
   field.
 
-Not run: anything cross-core (the other cores cannot read a kept chain), the page-service process
+Never run: anything cross-core (no other core could read a kept chain), the page-service process
 corpus, the race detector.
 
-Measured on the §1 database, 2,000 single-row commits per case, `fsync` off, one run each:
+Measured on the §1 database, 2,000 single-row commits per case, `fsync` off, one run each — against
+the **pre-incremental-reclamation** baseline, which is why these numbers no longer describe a gap that
+exists:
 
 | commit | free-list pages, before → after | bytes written, before → after | time, before → after |
 |---|---|---|---|
@@ -203,3 +230,6 @@ Measured on the §1 database, 2,000 single-row commits per case, `fsync` off, on
 
 The bulk load's free-list pages fell from 3.0 to 0.2 per commit. The file checked clean with a full
 integrity check before and after a reopen.
+
+The remaining `freeChain` type in the Go core is not part of this: it is the pages the persisted chain
+occupies, which the reclamation leak measure subtracts (incremental-reclaim.md §3.5).

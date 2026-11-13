@@ -1885,7 +1885,7 @@ func simFreeList(image []byte, ps uint32, v uint64) ([]uint32, bool) {
 		if err != nil {
 			return nil, false
 		}
-		free, _, err := readFreeList(newSharedPaging(p, 1), pageRef{page: m.freeListHead, tag: m.freeListTag}, m.freeLow, m.pageCount)
+		free, _, err := readFreeList(newSharedPaging(p, 1), pageRef{page: m.freeListHead, tag: m.freeListTag}, m.pageCount)
 		return free, err == nil
 	}
 	return nil, false
@@ -1954,7 +1954,8 @@ func simMetaOf(image []byte, ps uint32, v uint64) (pageCount, live uint32, ok bo
 }
 
 // simIncrState is database d's first body page and the unlisted dead pages its incremental
-// reclamation state carries (incr_reclaim.go).
+// reclamation state carries (incr_reclaim.go): the ones its lifetime began with, plus the pages the
+// deferred-interior prototype's remap list keys, which stay off the list until a fold (remap.go).
 func (r *simRunner) simIncrState(d *simDB) (first uint32, tolerated int) {
 	st, err := r.db.core.withStorage(d.name)
 	if err != nil {
@@ -1963,7 +1964,7 @@ func (r *simRunner) simIncrState(d *simDB) (first uint32, tolerated int) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	if st.incr != nil {
-		tolerated = st.incr.tolerated
+		tolerated = st.incr.tolerated + len(st.incr.remapHeld)
 	}
 	return st.paging.cap().firstBody(), tolerated
 }

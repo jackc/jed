@@ -986,7 +986,7 @@ func (s *snapshot) writeImage(pageSize uint32, txid uint64, codec *pageCodec, si
 	// Meta last: both slots hold the current meta (a fresh from-scratch image has no distinct prior
 	// version; slot alternation is the live incremental-commit path — format.md). A from-scratch image
 	// has an empty free-list, so free_list_head = 0 (v25), and every body page is live (v34).
-	meta := metaPage(pcap, pageSize, txid, next, pageCount, pageRef{}, 0, pageCount-pcap.firstBody())
+	meta := metaPage(pcap, pageSize, txid, next, pageCount, pageRef{}, pageCount-pcap.firstBody())
 	for slot := uint32(0); slot < 2; slot++ {
 		m := append([]byte(nil), meta...)
 		if codec != nil {
@@ -1220,6 +1220,12 @@ type incrementalWrite struct {
 	retained uint32
 	remap    *remapState
 	cat      *catState
+	// retainedIDs is the pages the retained interiors kept (PROTOTYPE, remap.go). They are still live,
+	// but the orphan walk descends into the previous snapshot's node at each of them — it must, to
+	// reach the leaves and chains orphaned underneath — and would list the page itself, so the
+	// incremental reclamation filters them out (incr_reclaim.go). Recording them in kept instead is
+	// wrong: that would also skip the subtree, hiding those leaves and chains from the live-page delta.
+	retainedIDs []uint32
 	// catalogIDs and gistIDs are the catalog pages written (nil when the chain was kept) and the GiST
 	// R-tree pages written, which the next commit orphans whole (incr_reclaim.go).
 	catalogIDs []uint32
@@ -1395,8 +1401,9 @@ func (s *snapshot) incrementalImageDeferred(pageSize, startPage uint32, free []u
 	}
 	var retained uint32
 	var remap *remapState
+	var retainedIDs []uint32
 	if d != nil {
-		retained, remap = d.retained, d.remap
+		retained, remap, retainedIDs = d.retained, d.remap, d.retainedIDs
 	}
 	if prevCat != nil && len(prevCat.payloads) == len(newCat.payloads) {
 		same := true
@@ -1420,6 +1427,7 @@ func (s *snapshot) incrementalImageDeferred(pageSize, startPage uint32, free []u
 				retained:      retained + uint32(len(prevCat.payloads)),
 				remap:         remap,
 				cat:           prevCat,
+				retainedIDs:   retainedIDs,
 				gistIDs:       gistIDs,
 			}, nil
 		}
@@ -1457,6 +1465,7 @@ func (s *snapshot) incrementalImageDeferred(pageSize, startPage uint32, free []u
 		retained:      retained,
 		remap:         remap,
 		cat:           &catState{payloads: newCat.payloads, root: next},
+		retainedIDs:   retainedIDs,
 		catalogIDs:    catPages,
 		gistIDs:       gistIDs,
 	}, nil
@@ -1499,7 +1508,7 @@ func serializeDirty(n *pnode, colTypes []colType, keyLen int, memo *compressMemo
 		// PROTOTYPE (remap.go): an interior whose separators are its persisted page's, and whose
 		// rewritten children each replace a persisted node one for one, keeps its page. The remap
 		// list records where those children went.
-		deferrable := n.origin.page != 0 && n.sameKeys
+		deferrable := n.origin.page != 0 && n.sameKeys && n.origin.page != d.migrate
 		for _, i := range moved {
 			c := n.children[i].node
 			deferrable = deferrable && (c.origin.page != 0)
@@ -1513,6 +1522,7 @@ func serializeDirty(n *pnode, colTypes []colType, keyLen int, memo *compressMemo
 			n.setRef(n.origin) // its page and, in an encrypted file, that page's tag
 			n.stale = true
 			d.retained++
+			d.retainedIDs = append(d.retainedIDs, n.origin.page)
 			return n.ref(), nil
 		}
 		// Written fresh: it names its children directly, so their entries go.
@@ -2119,7 +2129,7 @@ func loadEngineSharedPagingAt(paging *sharedPaging, env *Environment, at loadAt)
 	// v25: load the free-list directly from the persisted chain (meta offset 28) — no reachability
 	// walk (spec/fileformat/format.md *Reclamation*).
 	if at.meta == nil {
-		free, fc, err := readFreeList(paging, pageRef{page: mt.freeListHead, tag: mt.freeListTag}, mt.freeLow, mt.pageCount)
+		free, fc, err := readFreeList(paging, pageRef{page: mt.freeListHead, tag: mt.freeListTag}, mt.pageCount)
 		if err != nil {
 			return nil, err
 		}
@@ -2156,7 +2166,10 @@ func loadEngineSharedPagingAt(paging *sharedPaging, env *Environment, at loadAt)
 		if db.freeChain != nil {
 			chain = len(db.freeChain.refs)
 		}
-		in.tolerated = max(0, int(mt.pageCount)-int(pcap.firstBody())-len(db.freePages)-int(mt.livePages)-chain-int(mt.manifestPages))
+		// PROTOTYPE (remap.go): the loaded list's keys are dead pages held off the free list, not leaks.
+		in.remapHeld = mt.remap.held()
+		sortUint32s(in.remapHeld)
+		in.tolerated = max(0, int(mt.pageCount)-int(pcap.firstBody())-len(db.freePages)-int(mt.livePages)-chain-int(mt.manifestPages)-len(in.remapHeld))
 		db.incr = in
 	}
 	db.committed = snap
@@ -2580,43 +2593,22 @@ func collectTreePages(n *pnode, reached map[uint32]bool) {
 // offset 28) through the pager, collecting every free page index. head == 0 is an empty free-list.
 // The inverse of the serialization in serializeFreeList; replaces the v24 reconstruct-on-open
 // reachability walk (spec/fileformat/format.md *Reclamation*).
-func readFreeList(paging *sharedPaging, head pageRef, low, pageCount uint32) ([]uint32, *freeChain, error) {
-	free, fc, err := readFreeListWindow(paging, head, low, pageCount)
+func readFreeList(paging *sharedPaging, head pageRef, pageCount uint32) ([]uint32, *freeChain, error) {
+	free, fc, err := readFreeListWindow(paging, head, pageCount)
 	if err != nil {
 		return nil, nil, err
 	}
 	return free, fc, nil
 }
 
-// freeChain describes the persisted free-list chain a storage's free list is a window of (PROTOTYPE,
-// spec/design/free-list-kept-chain.md): its pages from the head on, and the last entry each holds. A
-// commit whose new list is a suffix of the old one keeps the chain and only moves the head and low.
+// freeChain is the pages the persisted free-list chain occupies, from the head on. They are neither
+// live nor free, so the reclamation leak measure subtracts them (format.md *Reclamation*,
+// incremental-reclaim.md §3.5).
 type freeChain struct {
-	refs  []pageRef
-	lasts []uint32
+	refs []pageRef
 }
 
-// from is the chain from the page holding entry e on.
-func (fc *freeChain) from(e uint32) *freeChain {
-	i := sort.Search(len(fc.lasts), func(i int) bool { return fc.lasts[i] >= e })
-	return &freeChain{refs: fc.refs[i:], lasts: fc.lasts[i:]}
-}
-
-// freeSuffix reports whether l is a non-empty suffix of p.
-func freeSuffix(l, p []uint32) bool {
-	if len(l) == 0 || len(l) > len(p) {
-		return false
-	}
-	off := len(p) - len(l)
-	for i, e := range l {
-		if p[off+i] != e {
-			return false
-		}
-	}
-	return true
-}
-
-func readFreeListWindow(paging *sharedPaging, head pageRef, low, pageCount uint32) ([]uint32, *freeChain, error) {
+func readFreeListWindow(paging *sharedPaging, head pageRef, pageCount uint32) ([]uint32, *freeChain, error) {
 	pcap := paging.cap()
 	first := pcap.firstBody()
 	var free []uint32
@@ -2656,19 +2648,12 @@ func readFreeListWindow(paging *sharedPaging, head pageRef, low, pageCount uint3
 				return nil, nil, newError(DataCorrupted, "invalid free-list entry")
 			}
 			last = e
-			if e < low {
-				continue // consumed since the chain was written
-			}
 			if e >= pageCount || paging.pgr.manifestProtected[e] {
 				return nil, nil, newError(DataCorrupted, "invalid or protected free-list entry")
 			}
 			free = append(free, e)
 		}
-		if len(fc.refs) == 0 && low != 0 && (len(free) == 0 || free[0] != low) { // low 0: a chain written whole (pre-prototype files)
-			return nil, nil, newError(DataCorrupted, "free-list low is not the head page's first free entry")
-		}
 		fc.refs = append(fc.refs, p)
-		fc.lasts = append(fc.lasts, last)
 		p = next
 	}
 	if len(fc.refs) == 0 {
@@ -2741,7 +2726,7 @@ func serializeFreeList(persist, safe []uint32, seal sealer, next uint32) ([]dirt
 	}
 	// Sealed last page first, so each binds its successor (encrypted.md §7); returned in chain order.
 	pages := make([]dirtyPage, len(flIDs))
-	fc := &freeChain{refs: make([]pageRef, len(flIDs)), lasts: make([]uint32, len(flIDs))}
+	fc := &freeChain{refs: make([]pageRef, len(flIDs))}
 	var nextRef pageRef
 	for ci := len(flIDs) - 1; ci >= 0; ci-- {
 		pageNo := flIDs[ci]
@@ -2767,14 +2752,6 @@ func serializeFreeList(persist, safe []uint32, seal sealer, next uint32) ([]dirt
 		pages[ci] = dirtyPage{index: pageNo, bytes: bytes}
 		nextRef = pageRef{page: pageNo, tag: tag}
 		fc.refs[ci] = nextRef
-		if len(chunk) > 0 {
-			fc.lasts[ci] = chunk[len(chunk)-1]
-		}
-	}
-	for ci := 1; ci < len(fc.lasts); ci++ {
-		if fc.lasts[ci] == 0 {
-			fc.lasts[ci] = fc.lasts[ci-1] // an empty trailing page
-		}
 	}
 	return pages, fc, persisted, hw, nil
 }
@@ -5761,7 +5738,7 @@ func catalogLayout(entries [][]byte, capacity int) []catalogPage {
 // In pcap's encrypted layout (encrypted.md §6) the meta also carries the suite and its reserve at
 // offsets 6/7 and the tags of the catalog root and the free-list head at 64 and 80; the commit seals
 // it (pageCodec.sealMeta) when it writes the slot.
-func metaPage(pcap pageCap, pageSize uint32, txid uint64, root pageRef, pageCount uint32, freeList pageRef, freeLow uint32, livePages uint32) []byte {
+func metaPage(pcap pageCap, pageSize uint32, txid uint64, root pageRef, pageCount uint32, freeList pageRef, livePages uint32) []byte {
 	p := make([]byte, pageSize)
 	copy(p[0:4], magic[:])
 	binary.BigEndian.PutUint16(p[4:], formatVersion)
@@ -5777,7 +5754,6 @@ func metaPage(pcap pageCap, pageSize uint32, txid uint64, root pageRef, pageCoun
 	binary.BigEndian.PutUint32(p[24:], pageCount)
 	binary.BigEndian.PutUint32(p[28:], freeList.page) // v25: the persisted free-list head (0 = empty)
 	binary.BigEndian.PutUint32(p[56:], livePages)     // v34: the exact live page count (memory.md §8.7)
-	binary.BigEndian.PutUint32(p[60:], freeLow)       // PROTOTYPE (free-list-kept-chain.md): the lowest free page of a kept chain
 	binary.BigEndian.PutUint32(p[32:], metaCRC(p))
 	return p
 }
@@ -5812,8 +5788,6 @@ type meta struct {
 	// freeListHead is the persisted free-list head (v25 — meta offset 28): the first page_type 7 page,
 	// or 0 for an empty free-list. Open follows this chain instead of reconstructing the free-list.
 	freeListHead uint32
-	// freeLow is the lowest free page (PROTOTYPE, offset 60): chain entries below it are consumed.
-	freeLow uint32
 	// livePages is the exact live page count (v34 — meta offset 56, spec/design/memory.md §8.7).
 	livePages     uint32
 	manifestHead  uint32
@@ -5885,14 +5859,9 @@ func parseMeta(m []byte) (meta, bool) {
 	if freeListHead != 0 && (freeListHead < first || freeListHead >= pageCount) {
 		return meta{}, false
 	}
-	// PROTOTYPE (free-list-kept-chain.md): offset 60 is the lowest free page of the chain's window.
-	freeLow := binary.BigEndian.Uint32(m[60:64])
-	if (freeListHead == 0 && freeLow != 0) || (freeLow != 0 && (freeLow < first || freeLow >= pageCount)) {
-		return meta{}, false
-	}
-	if freeKeptChainOff && freeLow != 0 {
-		return meta{}, false // reserved (0) in the format
-	}
+	// Bytes 60–63 stay reserved zero (format.md *Meta page*). Not validated: Rust and TS read straight
+	// from live_pages at 56 to the checks below, and a one-core-only rejection would make the two
+	// disagree on a corrupt slot's validity — and so on which generation recovery lands.
 	// v34: the live pages are a subset of the body pages.
 	livePages := binary.BigEndian.Uint32(m[56:60])
 	if livePages > body {
@@ -5914,7 +5883,6 @@ func parseMeta(m []byte) (meta, bool) {
 		rootPage:      binary.BigEndian.Uint32(m[20:24]),
 		pageCount:     pageCount,
 		freeListHead:  freeListHead,
-		freeLow:       freeLow,
 		livePages:     livePages,
 		manifestHead:  head,
 		dirtyCount:    count,

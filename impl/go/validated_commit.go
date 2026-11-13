@@ -8,7 +8,6 @@ import (
 	"bytes"
 	"encoding/binary"
 	"hash/crc32"
-	"os"
 	"sort"
 )
 
@@ -296,9 +295,8 @@ func commitManifestDependencies(m meta, raw []byte, pageSize uint32, read func(u
 	protected := make(map[uint32]bool)
 	last := first - 1
 	seen := uint32(0)
-	// PROTOTYPE: a kept chain's head (low != 0) was written by an earlier commit and is not listed.
 	// PROTOTYPE (remap.go): a meta with a remap list may keep its catalog chain from an earlier commit.
-	rootSeen, freeHeadSeen := metaRemapReserve(raw) != 0, m.freeListHead == 0 || m.freeLow != 0
+	rootSeen, freeHeadSeen := metaRemapReserve(raw) != 0, m.freeListHead == 0
 	size := manifestEntrySize(m.narrow)
 	validate := func(entries []byte, count uint32) (uint32, bool, error) {
 		for i := uint32(0); i < count; i++ {
@@ -411,10 +409,10 @@ func manifestEntriesOf(pages []dirtyPage, encrypted bool) []manifestEntry {
 // commitManifest encodes the fixed meta inline region and the reserved overflow
 // chain. The entries include free-list pages, but not the manifest itself; under
 // batched durability they also include the pending set (validated-cow.md §4).
-func commitManifest(pcap pageCap, ps uint32, txid uint64, root pageRef, pageCount uint32, head pageRef, freeLow uint32, livePages uint32, entries []manifestEntry, manifestIDs []uint32, remap *remapState) ([]byte, []dirtyPage) {
+func commitManifest(pcap pageCap, ps uint32, txid uint64, root pageRef, pageCount uint32, head pageRef, livePages uint32, entries []manifestEntry, manifestIDs []uint32, remap *remapState) ([]byte, []dirtyPage) {
 	ordered := append([]manifestEntry(nil), entries...)
 	sort.Slice(ordered, func(i, j int) bool { return ordered[i].index < ordered[j].index })
-	meta := metaPage(pcap, ps, txid, root, pageCount, head, freeLow, livePages)
+	meta := metaPage(pcap, ps, txid, root, pageCount, head, livePages)
 	narrow := manifestCRC32
 	size := manifestEntrySize(narrow)
 	binary.BigEndian.PutUint32(meta[40:], uint32(len(ordered)))
@@ -475,6 +473,33 @@ func trailingRun(safe []uint32, high uint32) ([]uint32, uint32) {
 	return safe[:n], k
 }
 
+// migrateHint is the one page a commit should move down rather than keep in place: the top page of the
+// file, when it is not free (so it is what blocks trailing truncation) and some lower page is free to
+// land on. 0 when nothing is to be gained.
+//
+// PROTOTYPE (remap.go): deferral's point is that an interior does not move, so one live interior at the
+// top pins the file's whole length — trailing truncation only ever cuts a run of free pages. Writing
+// that one node fresh costs a page and a remap entry in its parent, and the next commit's run reaches
+// past it, so a blocked file drains one page per commit and a drained one pays nothing
+// (spec/design/deferred-interior.md §8.4).
+func migrateHint(free []uint32, high uint32) uint32 {
+	if high < 3 {
+		return 0
+	}
+	top := high - 1
+	lower := false
+	for _, p := range free {
+		if p == top {
+			return 0 // already free: last commit's trailing run will take it
+		}
+		lower = lower || p < top
+	}
+	if !lower {
+		return 0 // nowhere below to land, so moving it would only grow the file
+	}
+	return top
+}
+
 type validatedCommitPlan struct {
 	pages []dirtyPage // free-list pages, then manifest overflow
 	// manifest is the manifest-overflow pages among pages, in chain order — what an encrypted meta's
@@ -498,7 +523,7 @@ type validatedCommitPlan struct {
 // list (validated-cow.md §4). truncate lets the plan lower the high-water past the trailing run of safe
 // free pages (format.md *Trailing truncation*): only an owner's (or an alone process's) own commit that
 // plans against a durable floor — nothing pending — sets it, never a page client's planned delta.
-func planValidatedCommit(snap *snapshot, paging *sharedPaging, write incrementalWrite, pageSize, liveAtCompaction uint32, generation uint64, canReclaim, canReuse, truncate bool, livePages uint32, pending []manifestEntry, allowed map[uint32]bool, prevFree []uint32, prevChain *freeChain, incr *incrPlan) (validatedCommitPlan, error) {
+func planValidatedCommit(snap *snapshot, paging *sharedPaging, write incrementalWrite, pageSize, liveAtCompaction uint32, generation uint64, canReclaim, canReuse, truncate bool, livePages uint32, pending []manifestEntry, allowed map[uint32]bool, incr *incrPlan) (validatedCommitPlan, error) {
 	candidates, live, gen, rebuilt, err := freeListCandidates(snap, paging, write.root, write.pages, write.freeRemaining, write.pageCount, liveAtCompaction, generation, canReclaim, pending, write.remap, incr)
 	if err != nil {
 		return validatedCommitPlan{}, err
@@ -555,40 +580,16 @@ func planValidatedCommit(snap *snapshot, paging *sharedPaging, write incremental
 			}
 		}
 		seal := sealerOf(ps, paging)
-		// PROTOTYPE (spec/design/free-list-kept-chain.md): a commit that is not a rebuild and whose
-		// list is a suffix of the committed one keeps the chain — no free-list page is written — and
-		// records the lowest free page. Anything else writes a fresh chain, as before.
-		var fl []dirtyPage
-		var chain *freeChain
-		var free []uint32
-		pc := next
-		kept := false
-		switch {
-		case freeKeptChainOff:
-		case incr != nil: // the list grows in the middle; always a fresh chain
-		case rebuilt || prevChain == nil:
-		case len(persist) == 0:
-			kept = true // the list is used up: no chain
-		case freeSuffix(persist, prevFree) && prevChain.lasts[len(prevChain.lasts)-1] == prevFree[len(prevFree)-1]:
-			kept, chain, free = true, prevChain.from(persist[0]), persist
+		fl, chain, free, pc, err := serializeFreeList(persist, safe[drawn:], seal, next)
+		if err != nil {
+			return validatedCommitPlan{}, err
 		}
-		if !kept {
-			var err error
-			fl, chain, free, pc, err = serializeFreeList(persist, safe[drawn:], seal, next)
-			if err != nil {
-				return validatedCommitPlan{}, err
-			}
-			if len(free) == 0 {
-				fl, chain = nil, nil
-			}
+		if len(free) == 0 {
+			fl, chain = nil, nil
 		}
 		var head pageRef
-		low := uint32(0)
 		if chain != nil {
 			head = chain.refs[0]
-			if !freeKeptChainOff {
-				low = free[0] // the prototype's meta field; reserved (0) in the format
-			}
 		}
 		left := max(0, len(pending)+len(write.pages)+len(fl)-manifestInlineCapacity(ps, seal.cap))
 		required := (left + manifestOverflowCapacity(ps) - 1) / manifestOverflowCapacity(ps)
@@ -600,7 +601,7 @@ func planValidatedCommit(snap *snapshot, paging *sharedPaging, write incremental
 		dirty = append(dirty, manifestEntriesOf(write.pages, seal.cap.encrypted())...)
 		dirty = append(dirty, manifestEntriesOf(fl, seal.cap.encrypted())...)
 		entries := append(append(make([]manifestEntry, 0, len(pending)+len(dirty)), pending...), dirty...)
-		meta, overflow := commitManifest(seal.cap, pageSize, snap.txid, write.root, pc, head, low, livePages, entries, ids, write.remap)
+		meta, overflow := commitManifest(seal.cap, pageSize, snap.txid, write.root, pc, head, livePages, entries, ids, write.remap)
 		if expCommitHook != nil { // EXPERIMENT
 			expCommitHook(write.pages, fl, overflow, len(persist)+len(free))
 		}
@@ -626,8 +627,3 @@ var expCommitHook func(body, freeList, manifest []dirtyPage, freeEntries int)
 
 // EXPERIMENT hook: a file commit's free list before and after.
 var expFreeCheck func(before, after []uint32, rebuilt, pending, client, canReuse bool)
-
-// freeKeptChainOff is the format's behavior: every commit writes a fresh free-list chain and meta
-// offset 60 stays reserved. JED_FREE_KEPT_CHAIN=on enables the Go-only kept-chain prototype
-// (spec/design/free-list-kept-chain.md), whose files no other core reads.
-var freeKeptChainOff = os.Getenv("JED_FREE_KEPT_CHAIN") != "on"

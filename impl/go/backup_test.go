@@ -139,7 +139,11 @@ func TestPageIdenticalBackupCopiesReachablePagesAtTheirIndices(t *testing.T) {
 	if zeroed == 0 {
 		t.Fatalf("the fixture must leave dead pages")
 	}
-	bootstrap := metaPage(plainCap(compactPage), compactPage, mt.txid, plainRef(mt.rootPage), mt.pageCount, plainRef(mt.freeListHead), mt.freeLow, mt.livePages)
+	bootstrap := metaPage(plainCap(compactPage), compactPage, mt.txid, plainRef(mt.rootPage), mt.pageCount, plainRef(mt.freeListHead), mt.livePages)
+	if mt.remap != nil { // PROTOTYPE (remap.go): the copy carries the source's remap list (backup.go)
+		encodeRemap(bootstrap, mt.remap)
+		resealRemapMeta(bootstrap)
+	}
 	if !bytes.Equal(backup[:compactPage], bootstrap) || !bytes.Equal(backup[compactPage:2*compactPage], bootstrap) {
 		t.Fatalf("both meta slots must carry the bootstrap meta")
 	}

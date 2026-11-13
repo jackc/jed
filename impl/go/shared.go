@@ -293,7 +293,7 @@ type storage struct {
 	mu        sync.Mutex // guards pageCount/freePages (the writer-gate-serialized page accounting)
 	pageSize  uint32     // fixed into the file at creation
 	pageCount uint32     // on-disk high-water; persisted in the meta slot
-	freeChain *freeChain // PROTOTYPE: the persisted chain freePages is a window of, or nil (free-list-kept-chain.md)
+	freeChain *freeChain // the pages the persisted free-list chain occupies, or nil
 	freePages []uint32   // free-list — reused lowest-first: reconstruct-on-open (P6.2) plus, for a reclaim
 	//                      domain, within-session compaction (maybeCompact); watermark-gated safe.
 	paging *sharedPaging
@@ -761,8 +761,11 @@ func (st *storage) commitDurable(snap *snapshot, canReclaim, canReuse bool, budg
 		canDefer := deferOn(int(st.pageSize), encrypted) &&
 			st.paging.remap.len()+snap.dirtyNodeCount() <= remapCapFor(int(st.pageSize), encrypted)
 		if canDefer {
-			d = &deferCtx{remap: st.paging.remap.clone()}
+			d = &deferCtx{remap: st.paging.remap.clone(), migrate: migrateHint(st.freePages, st.pageCount)}
 			prevCat = st.paging.cat
+			if prevCat != nil && d.migrate != 0 && prevCat.root.page == d.migrate {
+				prevCat = nil // the catalog chain blocks truncation too; rewrite it low
+			}
 			// A relaxed batch is open while its pending set is non-empty, so a relaxed commit must
 			// write at least one page: with no dirty tree node, rewrite the catalog.
 			if st.relaxedFile() && snap.dirtyNodeCount() == 0 {
@@ -839,7 +842,7 @@ func (st *storage) commitFile(snap *snapshot, write incrementalWrite, live liveC
 		listed, held = st.incrOrphans(write, pending)
 		incr = &incrPlan{listed: listed, due: st.incrDue()}
 	}
-	plan, err := planValidatedCommit(snap, st.paging, write, st.pageSize, st.liveAtCompaction, st.freeGenTxid, canReclaim, canReuse, truncate, live.live, pending, allowed, st.freePages, st.freeChain, incr)
+	plan, err := planValidatedCommit(snap, st.paging, write, st.pageSize, st.liveAtCompaction, st.freeGenTxid, canReclaim, canReuse, truncate, live.live, pending, allowed, incr)
 	if err != nil {
 		st.paging.remap = prevRemap
 		return false, err
@@ -930,7 +933,7 @@ func (st *storage) commitFile(snap *snapshot, write incrementalWrite, live liveC
 // (maybeCompact) — there is no reopen to worry about, so it need not be in-commit. Caller holds st.mu.
 func (st *storage) commitInMemory(snap *snapshot, write incrementalWrite, canReclaim bool) error {
 	// A memory store is never reopened, so its meta carries no live-page count (memory.md §8.7).
-	meta := metaPage(plainCap(st.pageSize), st.pageSize, snap.txid, write.root, write.pageCount, pageRef{}, 0, 0)
+	meta := metaPage(plainCap(st.pageSize), st.pageSize, snap.txid, write.root, write.pageCount, pageRef{}, 0)
 	if err := st.paging.withPager(func(p *pager) error {
 		if err := p.reserve(write.pageCount); err != nil {
 			return err
