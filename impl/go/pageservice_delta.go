@@ -147,7 +147,7 @@ func beginDelta(base psDeltaBase, cb psCommitBegin) (*psDelta, error) {
 		parsed, err := parsePage(block)
 		count := min(m.dirtyCount-listed, uint32(manifestOverflowCapacityFor(ps, m.narrow)))
 		if err != nil || pageCRC(block) != binary.BigEndian.Uint32(block[12:16]) || parsed.pageType != pageManifest ||
-			!zeroBytes(block[1:4]) || parsed.itemCount != count || binary.BigEndian.Uint64(block[16:24]) != m.txid ||
+			!manifestPageHeaderOK(block, m.txid) || parsed.itemCount != count || binary.BigEndian.Uint64(block[16:24]) != m.txid ||
 			binary.BigEndian.Uint32(block[24:28]) != uint32(ordinal) || !zeroBytes(block[28:32]) || !zeroBytes(block[32+size*int(count):]) {
 			return nil, errDelta("a manifest page is malformed")
 		}

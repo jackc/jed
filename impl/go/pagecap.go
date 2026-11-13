@@ -93,6 +93,15 @@ type sealer struct {
 	ps    int
 	cap   pageCap
 	codec *pageCodec
+	// stamp is the txid16 every page this sealer builds carries at header offset 2 (page_stamp.go;
+	// manifest-crc32.md §2.1), 0 when unstamped.
+	stamp uint16
+}
+
+// stamped is s for a commit at txid: every page it builds carries that commit's stamp.
+func (s sealer) stamped(txid uint64) sealer {
+	s.stamp = stampOf(txid)
+	return s
 }
 
 func plainSealer(ps int) sealer { return sealer{ps: ps, cap: plainCap(uint32(ps))} }
@@ -117,7 +126,7 @@ func (s sealer) page(index uint32, pageType, flags byte, itemCount uint32, next 
 // resident text value is copied onto its page straight from the string.
 func sealPage[S ~string | ~[]byte](s sealer, index uint32, pageType, flags byte, itemCount uint32, next pageRef, payload S) ([]byte, pageTag, error) {
 	if s.codec == nil {
-		p := makePage(s.ps, pageType, itemCount, next.page, payload)
+		p := makeStampedPage(s.ps, pageType, itemCount, next.page, payload, s.stamp)
 		if flags != 0 {
 			p[1] = flags
 			binary.BigEndian.PutUint32(p[12:], pageCRC(p))
@@ -135,6 +144,7 @@ func sealPage[S ~string | ~[]byte](s sealer, index uint32, pageType, flags byte,
 	p := make([]byte, s.ps)
 	p[0] = pageType
 	p[1] = flags
+	binary.BigEndian.PutUint16(p[2:], s.stamp) // sealed with the page: the stamp rides the plaintext
 	binary.BigEndian.PutUint32(p[4:], itemCount)
 	binary.BigEndian.PutUint32(p[8:], next.page)
 	if chain {

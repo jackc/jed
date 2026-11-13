@@ -871,7 +871,7 @@ func (s *snapshot) writeImage(pageSize uint32, txid uint64, codec *pageCodec, si
 	if ps&(ps-1) != 0 {
 		return 0, newError(FeatureNotSupported, "page size must be a power of two")
 	}
-	seal := sealer{ps: ps, cap: capOf(pageSize, codec != nil), codec: codec}
+	seal := sealer{ps: ps, cap: capOf(pageSize, codec != nil), codec: codec}.stamped(txid)
 	pcap := seal.cap
 	// Every check that can refuse the image runs before the first page is sealed.
 	if err := checkCatalogTextLengths(s); err != nil {
@@ -1296,7 +1296,7 @@ func (s *snapshot) incrementalImageAllowed(pageSize, startPage uint32, free []ui
 // catalog chain whose bytes are unchanged is not rewritten.
 func (s *snapshot) incrementalImageDeferred(pageSize, startPage uint32, free []uint32, reuse bool, allowed map[uint32]bool, paging *sharedPaging, d *deferCtx, prevCat *catState) (incrementalWrite, error) {
 	ps := int(pageSize)
-	seal := sealerOf(ps, paging)
+	seal := sealerOf(ps, paging).stamped(s.txid) // s.txid is the txid this commit publishes
 	pcap := seal.cap
 	// Every check that can refuse the commit runs before the first page is sealed, so a refusal draws
 	// no nonce (encrypted.md §8).
@@ -5762,8 +5762,15 @@ func metaPage(pcap pageCap, pageSize uint32, txid uint64, root pageRef, pageCoun
 // copies it into the image; an incremental commit pwrites it directly (file.go). Single-sources the
 // page byte layout.
 func makePage[S ~string | ~[]byte](ps int, pageType byte, itemCount, nextPage uint32, payload S) []byte {
+	return makeStampedPage(ps, pageType, itemCount, nextPage, payload, 0)
+}
+
+// makeStampedPage is makePage carrying a txid16 stamp at header offset 2 (page_stamp.go), written
+// before the checksum so the page's own CRC-32 covers it.
+func makeStampedPage[S ~string | ~[]byte](ps int, pageType byte, itemCount, nextPage uint32, payload S, stamp uint16) []byte {
 	p := make([]byte, ps)
 	p[0] = pageType
+	binary.BigEndian.PutUint16(p[2:], stamp)
 	binary.BigEndian.PutUint32(p[4:], itemCount)
 	binary.BigEndian.PutUint32(p[8:], nextPage)
 	copy(p[pageHeader:], payload)

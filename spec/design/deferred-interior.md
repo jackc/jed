@@ -681,6 +681,10 @@ Beyond the three cores and `verify.rb`:
 - **A race review** of the commit path, which sets a page id on the committing snapshot's own nodes
   and swaps the resident list during planning (§6).
 - **`unassignPages`**, or its equivalent, must undo a retained interior when a plan is discarded.
+- **The stamp's remaining surface** ([manifest-crc32.md](manifest-crc32.md) §4): give the integrity
+  check and the page service's delta check a window, and change the manifest-overflow header check
+  from "bytes 1–3 zero" to "flags zero, stamp equals the meta's txid" in Rust, TS and the Ruby
+  reference, as the Go core already does.
 - ~~A re-measurement of §8.2's three workloads at the tip.~~ **Taken** (§8.5): unchanged at
   `03cc46acc`, so the saving stands as stated. What is still unmeasured is a loosely-packed tree
   mutated away from the right edge, where leaf evening's rebalance is common — a question about that

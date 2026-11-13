@@ -170,10 +170,26 @@ func TestCompactionOfACompactFileIsAFixedPoint(t *testing.T) {
 	if len(first) != len(second) {
 		t.Fatalf("length changed: %d -> %d", len(first), len(second))
 	}
-	// Only the version (and so the meta checksums) moved.
-	if !bytes.Equal(first[compactPage*2:], second[compactPage*2:]) {
+	// Only the version (and so the meta checksums) moved -- and, with the stale-page stamp on, each
+	// body page's stamp and the checksum that covers it (manifest-crc32.md §2.1): a second compaction
+	// runs at a new txid, so it is a fixed point of everything but that.
+	if !bytes.Equal(unstamped(first[compactPage*2:]), unstamped(second[compactPage*2:])) {
 		t.Fatal("body pages changed on a second compaction")
 	}
+}
+
+// unstamped is body with each page's stamp (header bytes 2-3) and checksum (12-15) zeroed when the
+// stamp prototype is on; body unchanged otherwise.
+func unstamped(body []byte) []byte {
+	if !pageTxidStamp {
+		return body
+	}
+	out := append([]byte(nil), body...)
+	for off := 0; off+compactPage <= len(out); off += compactPage {
+		clear(out[off+2 : off+4])
+		clear(out[off+12 : off+16])
+	}
+	return out
 }
 
 func TestInMemoryCompactionLowersStorageBytes(t *testing.T) {

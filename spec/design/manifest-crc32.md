@@ -127,8 +127,37 @@ with deferred interiors, `sim:sweep 1..200 all go` (4,400 traces) and the random
 test. With the switch off the unit tests and an 880-trace sweep pass.
 
 Not run: the simulator's regression traces (their Ruby checker reads 12-byte entries), anything
-cross-core, the page-service process corpus. **None of this covers §2.1**, which postdates the
-prototype and is unmeasured.
+cross-core, the page-service process corpus.
+
+**The stamp (§2.1), Go core, behind `JED_PAGE_TXID_STAMP=on`** (`impl/go/page_stamp.go`). Every
+sealer is stamped with the txid the commit publishes — `snap.txid`, set before `persist` in every
+path, a page client's included, since the write gate fixes its `base + 1` before it builds a page.
+Recovery takes the window's floor from the other meta slot when that slot is older; when it is not
+(torn, or this candidate is the fallback) the floor is unknown and the CRC-32 is the only check.
+Run: the unit suite with the stamp off (unchanged, every v52 golden byte-identical) and on, alone and
+with both other switches; `sim:sweep 1..20 all go` with the stamp alone (440 traces) and
+`sim:sweep 1..100 all go` with all three switches (2,200 traces), every oracle passing. A stamp-off
+rerun of one seed proves the switch reached the simulator: image hashes differ while recovered
+generation, logical digest, live and page counts are identical.
+`TestStampIsAnIndependentDetector` forges the case a narrow manifest alone cannot catch — an older
+stamp on a page whose entry agrees with its CRC-32 — and requires rejection, and acceptance once the
+stamp check is disabled. With every switch on, the only failures are byte comparisons against
+committed v52 fixtures, all of which regenerate at v53.
+
+**One interaction found, and fixed.** "The page header's reserved bytes are unchecked" is true of
+`parsePage` but not of a **manifest-overflow page**, whose validation required header bytes 1–3 to be
+zero (recovery, and the page service's delta check). A stamped overflow page therefore read as
+corrupt and recovery silently fell back to an older generation — caught by three tests, not by any
+stamp-specific one. The rule is now `flags == 0 && txid16 == low16(meta txid)`: a manifest page is
+always written by the commit whose meta names it, under `synchronous = off` too, so it gets an exact
+equality, stronger than the window. **The Rust, TS and Ruby validators carry the same `[1, 4)` zero
+check** and need the same change.
+
+**Not yet covered by the stamp**, each recorded for the landing (deferred-interior.md §9.8):
+the integrity check validates a live generation with no window (it holds one meta slot, not the
+floor); the page service checks a client delta's page digests but not its pages' stamps; and an
+encrypted page's stamp is sealed, so keyless manifest validation cannot read it — there the AEAD tag
+a pointer binds is the stronger check already.
 
 ## 5. Decided
 

@@ -220,7 +220,16 @@ func (p *pager) selectValidatedMeta() (meta, error) {
 			return m, nil
 		}
 		if !bytes.Equal(raw, p.validatedMeta) || p.manifestProtected == nil {
-			valid, err := p.validateCommitManifest(m, raw)
+			// The stamp window (page_stamp.go): the other slot holds this candidate's durability floor
+			// when it is older -- the previous commit under synchronous = on, the batch's floor under
+			// synchronous = off. When it is not (torn, or newer because this candidate is the fallback),
+			// the floor is unknown and the CRC-32 is the only check; a fallback candidate is itself a
+			// durable floor whose pages a later commit never overwrites, so nothing is lost there.
+			win := stampWindow{}
+			if other, ok := parseMeta(blocks[1-k]); ok && other.txid < m.txid {
+				win = stampWindow{floor: other.txid, newest: m.txid}
+			}
+			valid, err := p.validateCommitManifest(m, raw, win)
 			if err != nil {
 				return meta{}, err
 			}
@@ -246,7 +255,7 @@ func (p *pager) selectValidatedMeta() (meta, error) {
 				// manifest before parity may choose it as the durable fallback.
 				if other, ok := parseMeta(blocks[1-k]); ok && other.txid == m.txid &&
 					other.pageCount <= p.allocatedPages && other.suite == m.suite {
-					_, _, valid, err := commitManifestDependencies(other, blocks[1-k], p.pageSize, p.readBlock)
+					_, _, valid, err := commitManifestDependencies(other, blocks[1-k], p.pageSize, p.readBlock, stampWindow{})
 					if err != nil {
 						return meta{}, err
 					}
@@ -273,8 +282,8 @@ func (p *pager) selectValidatedMeta() (meta, error) {
 // Validation uses one body buffer and one overflow buffer at a time. Counts are
 // bounded by the physical file, ids strictly increase, and chain ordinals prevent
 // cycles without a file-sized visited set.
-func (p *pager) validateCommitManifest(m meta, raw []byte) (bool, error) {
-	protected, _, valid, err := commitManifestDependencies(m, raw, p.pageSize, p.readBlock)
+func (p *pager) validateCommitManifest(m meta, raw []byte, win stampWindow) (bool, error) {
+	protected, _, valid, err := commitManifestDependencies(m, raw, p.pageSize, p.readBlock, win)
 	if valid && err == nil {
 		p.manifestProtected = protected
 	}
@@ -287,7 +296,10 @@ func (p *pager) validateCommitManifest(m meta, raw []byte) (bool, error) {
 // also returns the page whose identity failed — a listed page or a manifest-overflow page — or 0 when
 // the failure is the manifest's own shape (counts, chain digest). It changes no pager state, so the
 // integrity check (spec/design/integrity-check.md §3.1) re-validates a live handle's generation with it.
-func commitManifestDependencies(m meta, raw []byte, pageSize uint32, read func(uint32) ([]byte, error)) (map[uint32]bool, uint32, bool, error) {
+//
+// win is the txid window a listed page's stamp must fall in (page_stamp.go); the zero window admits
+// every stamp. An encrypted page's stamp is sealed, so only its ciphertext digest is checked here.
+func commitManifestDependencies(m meta, raw []byte, pageSize uint32, read func(uint32) ([]byte, error), win stampWindow) (map[uint32]bool, uint32, bool, error) {
 	// An encrypted meta: body pages start past the key block, the inline manifest after the tags, and
 	// a listed page is ciphertext, so only its digest is checked (encrypted.md §6).
 	pcap := capOf(uint32(len(raw)), m.suite != 0)
@@ -319,6 +331,10 @@ func commitManifestDependencies(m meta, raw []byte, pageSize uint32, read func(u
 			if !pcap.encrypted() && (block[0] < 1 || block[0] > 7 || pageCRC(block) != binary.BigEndian.Uint32(block[12:16])) {
 				return id, false, nil
 			}
+			// A page a lost write left behind carries the stamp of the commit that really wrote it.
+			if !pcap.encrypted() && !win.contains(binary.BigEndian.Uint16(block[2:4])) {
+				return id, false, nil
+			}
 			seen++
 		}
 		return 0, true, nil
@@ -344,7 +360,7 @@ func commitManifestDependencies(m meta, raw []byte, pageSize uint32, read func(u
 			return protected, id, false, nil
 		}
 		count := min(m.dirtyCount-seen, uint32(manifestOverflowCapacityFor(len(block), m.narrow)))
-		if pg.pageType != pageManifest || !zeroBytes(block[1:4]) || pg.itemCount != count ||
+		if pg.pageType != pageManifest || !manifestPageHeaderOK(block, m.txid) || pg.itemCount != count ||
 			binary.BigEndian.Uint64(block[16:24]) != m.txid || binary.BigEndian.Uint32(block[24:28]) != ordinal || !zeroBytes(block[28:32]) || !zeroBytes(block[32+size*int(count):]) {
 			return protected, id, false, nil
 		}
@@ -445,7 +461,7 @@ func commitManifest(pcap pageCap, ps uint32, txid uint64, root pageRef, pageCoun
 		if ordinal+1 < len(manifestIDs) {
 			next = manifestIDs[ordinal+1]
 		}
-		block := makePage(int(ps), pageManifest, uint32(n), next, payload)
+		block := makeStampedPage(int(ps), pageManifest, uint32(n), next, payload, stampOf(txid))
 		var index [4]byte
 		binary.BigEndian.PutUint32(index[:], id)
 		chainCRC = chainDigest(chainCRC, index[:], narrow)
@@ -579,7 +595,7 @@ func planValidatedCommit(snap *snapshot, paging *sharedPaging, write incremental
 				persist = append(persist, id)
 			}
 		}
-		seal := sealerOf(ps, paging)
+		seal := sealerOf(ps, paging).stamped(snap.txid)
 		fl, chain, free, pc, err := serializeFreeList(persist, safe[drawn:], seal, next)
 		if err != nil {
 			return validatedCommitPlan{}, err

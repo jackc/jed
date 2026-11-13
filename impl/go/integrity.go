@@ -324,7 +324,7 @@ func (k *integrityChecker) checkLiveGeneration(pin *integrityPin) error {
 		}
 	}
 	k.remap, _ = decodeRemap(pin.metaRaw)
-	protected, bad, valid, err := commitManifestDependencies(k.gen.meta, pin.metaRaw, k.paging.pgr.pageSize, k.paging.readBlock)
+	protected, bad, valid, err := commitManifestDependencies(k.gen.meta, pin.metaRaw, k.paging.pgr.pageSize, k.paging.readBlock, stampWindow{})
 	if err != nil {
 		return err
 	}
