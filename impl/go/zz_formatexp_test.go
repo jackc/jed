@@ -32,7 +32,13 @@ func expExec(t testing.TB, s *Session, sql string) {
 		}
 		t.Fatalf("%q: %v", sql, err)
 	}
+	if expAfterExec != nil {
+		expAfterExec(s)
+	}
 }
+
+// expAfterExec, when set, runs after every expExec statement (zz_incr_measure_test.go times commits).
+var expAfterExec func(s *Session)
 
 // expInsert runs multi-row INSERTs of batch rows each, one commit per statement.
 func expInsert(t testing.TB, s *Session, table string, rows, batch int, row func(i int, b *strings.Builder)) {

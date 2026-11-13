@@ -313,9 +313,11 @@ type storage struct {
 	// older version (single-handle, reconstruct-on-open, all readers current) the gate always passes, so the
 	// on-disk byte layout is byte-for-byte unchanged.
 	freeGenTxid uint64
-	readOnly    bool      // opened read-only (api.md §2.1): every session is then read-only, a write is 25006. Always false in-memory.
-	path        string    // the backing file path; "" for an in-memory database (surfaced by Database.Path / Session.Path)
-	spill       spillHost // host scratch files for spill and temp-table spill; independent of path, nil when unavailable
+	// incr is the incremental-reclamation state (PROTOTYPE, incr_reclaim.go); nil until first used.
+	incr     *incrState
+	readOnly bool      // opened read-only (api.md §2.1): every session is then read-only, a write is 25006. Always false in-memory.
+	path     string    // the backing file path; "" for an in-memory database (surfaced by Database.Path / Session.Path)
+	spill    spillHost // host scratch files for spill and temp-table spill; independent of path, nil when unavailable
 	// budget is the committed-storage budget (memory.md §8): the in-memory form (Q4a) or the file form
 	// (§8.7).
 	budget storageBudget
@@ -604,6 +606,10 @@ type budgetCtx struct {
 	// guard, when set, is checked under storage.mu before the commit writes anything: a page-service
 	// commit fails 08006 when the handle's role changed since its transaction began (README.md §6.5).
 	guard func() error
+	// oldest is the reader watermark the commit was gated by, when oldestKnown (PROTOTYPE,
+	// incr_reclaim.go: it lets older free-list generations be reused under a pinned reader).
+	oldest      uint64
+	oldestKnown bool
 }
 
 // budgetDomain is one dirtied attachment's working snapshot, as precheckBudgets takes it.
@@ -645,11 +651,13 @@ func (c *sharedCore) persist(snap *snapshot, stagesRows bool) error {
 	canReclaim := oldest == snap.txid
 	canReuse := oldest >= c.storage.freeGenTxid
 	budget := &budgetCtx{
-		name:       c.domainName(),
-		prev:       c.roots.Load().committed,
-		canCompact: c.canCompactCommitted(),
-		stagesRows: stagesRows,
-		guard:      guard,
+		name:        c.domainName(),
+		prev:        c.roots.Load().committed,
+		canCompact:  c.canCompactCommitted(),
+		stagesRows:  stagesRows,
+		guard:       guard,
+		oldest:      oldest,
+		oldestKnown: true,
 	}
 	return c.storage.commitDurable(snap, canReclaim, canReuse, budget)
 }
@@ -729,7 +737,22 @@ func (st *storage) commitDurable(snap *snapshot, canReclaim, canReuse bool, budg
 				pending = false
 			}
 		}
+		// PROTOTYPE (incr_reclaim.go): fold the generations no reader can observe; the rest stay off
+		// this commit's reuse.
+		var newer map[uint32]bool
+		if st.incrActive() {
+			switch {
+			case canReclaim:
+				st.incrMerge(snap.txid)
+			case budget != nil && budget.oldestKnown:
+				st.incrMerge(budget.oldest)
+			}
+			newer = st.incrNewer()
+		}
 		allowed := st.reuseAllowed(pending)
+		if newer != nil {
+			allowed = excludeNewer(allowed, newer, st.freePages)
+		}
 		// PROTOTYPE (remap.go): defer interior pages when this commit can; otherwise, if any interior
 		// is stale, fold — write every stale interior fresh and empty the remap list.
 		var d *deferCtx
@@ -810,7 +833,13 @@ func (st *storage) commitFile(snap *snapshot, write incrementalWrite, live liveC
 	// PROTOTYPE (remap.go): the walks below read interiors from disk, so they need this commit's list.
 	prevRemap := st.paging.remap
 	st.paging.remap = write.remap
-	plan, err := planValidatedCommit(snap, st.paging, write, st.pageSize, st.liveAtCompaction, st.freeGenTxid, canReclaim, canReuse, truncate, live.live, pending, allowed, st.freePages, st.freeChain)
+	var incr *incrPlan
+	var listed, held []uint32
+	if st.incrActive() {
+		listed, held = st.incrOrphans(write, pending)
+		incr = &incrPlan{listed: listed, due: st.incrDue()}
+	}
+	plan, err := planValidatedCommit(snap, st.paging, write, st.pageSize, st.liveAtCompaction, st.freeGenTxid, canReclaim, canReuse, truncate, live.live, pending, allowed, st.freePages, st.freeChain, incr)
 	if err != nil {
 		st.paging.remap = prevRemap
 		return false, err
@@ -866,9 +895,20 @@ func (st *storage) commitFile(snap *snapshot, write incrementalWrite, live liveC
 			st.lastWritten = append(st.lastWritten, pg.index)
 		}
 	}
+	if incr != nil {
+		st.incrAfter(snap.txid, write, plan, listed, held, pending)
+	}
 	st.pageCount, st.freePages, st.freeChain = plan.pageCount, plan.free, plan.chain
 	st.liveAtCompaction, st.freeGenTxid = plan.live, plan.generation
 	st.live = live
+	if incr != nil && st.incr.unknownBefore {
+		// A commit after a foreign one could not orphan that commit's wholesale pages: they stay
+		// unlisted until a rebuild.
+		st.incr.tolerated = int(max(0, st.incrLeaked()))
+	}
+	if incr != nil && incrVerify {
+		st.incrCheck(snap, write, plan)
+	}
 	st.paging.remap, st.paging.cat = write.remap, write.cat // PROTOTYPE (remap.go)
 	switch {
 	case write.retained == 0 && prevRemap.len() > 0 && write.remap.len() == 0:
@@ -966,7 +1006,13 @@ func (st *storage) admitRepair(write incrementalWrite, budget *budgetCtx) (incre
 // and rewrites no more catalog pages than the last commit). There is no forced compaction: reclaiming
 // dead pages cannot lower the measure. Caller holds st.mu.
 func (st *storage) admitFile(write incrementalWrite, budget *budgetCtx) (liveCount, error) {
-	live, err := st.live.after(write, budget.prev, st.paging)
+	var live liveCount
+	var err error
+	if st.incrActive() {
+		live, st.incr.tree, err = st.live.afterIDs(write, budget.prev, st.paging)
+	} else {
+		live, err = st.live.after(write, budget.prev, st.paging)
+	}
 	if err != nil {
 		return liveCount{}, err
 	}
@@ -1118,6 +1164,7 @@ func (st *storage) compact(snap *snapshot, txid uint64) (*snapshot, error) {
 	st.freePages, st.freeChain = loaded.freePages, loaded.freeChain
 	st.liveAtCompaction = loaded.liveAtCompaction
 	st.freeGenTxid = loaded.freeGenTxid
+	st.incr = loaded.incr
 	st.live = loaded.live
 	st.budget.lastCatRoot = pageRef{}
 	st.budget.lastWritten = nil
@@ -1192,6 +1239,7 @@ func (st *storage) rekey(snap *snapshot, txid uint64, target *pageCodec, spill s
 	st.freePages, st.freeChain = loaded.freePages, loaded.freeChain
 	st.liveAtCompaction = loaded.liveAtCompaction
 	st.freeGenTxid = loaded.freeGenTxid
+	st.incr = loaded.incr
 	st.live = loaded.live
 	st.budget.lastCatRoot = pageRef{}
 	st.budget.lastWritten = nil
@@ -1667,6 +1715,7 @@ func sharedCoreFromEngineCoordinated(e *engine, coordinator *fileCoordinator) *s
 		reclaimWithinSession: true,
 		liveAtCompaction:     e.liveAtCompaction,
 		freeGenTxid:          e.freeGenTxid, // the loaded free-list is "as of" the committed version (§8 reuse gate)
+		incr:                 e.incr,
 		live:                 e.live,
 	}
 	return c
@@ -2072,6 +2121,7 @@ func (db *Database) Attach(name string, source AttachSource, readOnly bool) erro
 			reclaimWithinSession: true,
 			liveAtCompaction:     e.liveAtCompaction,
 			freeGenTxid:          e.freeGenTxid,
+			incr:                 e.incr,
 			budget:               storageBudget{limit: source.maxStorageBytes},
 			live:                 e.live,
 			// A file attachment follows the handle's synchronous setting (validated-cow.md §4).

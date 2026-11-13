@@ -195,6 +195,7 @@ func (c *sharedCore) installRole(next *serviceRole, e *engine) {
 		st.freePages, st.freeChain = e.freePages, e.freeChain
 		st.liveAtCompaction = e.liveAtCompaction
 		st.freeGenTxid = e.freeGenTxid
+		st.incr = e.incr
 		st.live = e.live
 		st.serviceClient = next.client != nil
 		st.recordCommits = true

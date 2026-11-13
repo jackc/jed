@@ -1946,6 +1946,21 @@ func simMetaOf(image []byte, ps uint32, v uint64) (pageCount, live uint32, ok bo
 	return 0, 0, false
 }
 
+// simIncrState is database d's first body page and the unlisted dead pages its incremental
+// reclamation state carries (PROTOTYPE, incr_reclaim.go).
+func (r *simRunner) simIncrState(d *simDB) (first uint32, tolerated int) {
+	st, err := r.db.core.withStorage(d.name)
+	if err != nil {
+		return 2, 0
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if st.incr != nil {
+		tolerated = st.incr.tolerated
+	}
+	return st.paging.cap().firstBody(), tolerated
+}
+
 // simAllocator is database d's page high-water and free-list length in the running process — the
 // allocator state the next commit draws from — and where the free list's trailing run below the
 // high-water starts (the high-water itself when its top page is not free; format.md *Trailing
@@ -2042,7 +2057,19 @@ func (r *simRunner) checkGrowth(i int, d *simDB, quiet bool) {
 		return
 	}
 	reclaimed := false
-	if quiet && d.high-d.free > max(compactMinPages, uint32(compactGrowth)*d.lacBound) {
+	if incrOn() && quiet {
+		// PROTOTYPE (incr_reclaim.go): every quiet commit lists what it orphans, so the file is its live
+		// pages, its free list, and the pages the commit itself wrote that nothing lists (its free-list
+		// chain and manifest overflow), plus the dead pages this lifetime began with unlisted (a held
+		// batch or a one-entry list lost at close), which only a rebuild returns.
+		first, tolerated := r.simIncrState(d)
+		if leaked := int64(pc) - int64(first) - int64(live) - int64(free); leaked < 0 || leaked > int64(written)+int64(tolerated) {
+			r.fail(i, "incremental reclamation: %s has %d pages, %d live and %d free, after a quiet commit that wrote %d "+
+				"(%d unlisted dead pages carried in)", d.name, pc, live, free, written, tolerated)
+			return
+		}
+		reclaimed = true
+	} else if quiet && d.high-d.free > max(compactMinPages, uint32(compactGrowth)*d.lacBound) {
 		reclaimed = true
 		// PROTOTYPE (remap.go): page ids that key a remap entry stay off the free list until a fold.
 		held := uint32(0)
@@ -2744,6 +2771,9 @@ func (r *simRunner) stepCorrupt(i int, st simStep) bool {
 		r.fail(i, "corrupt: reopen after repair failed: %v", err)
 		return false
 	}
+	// The reopen starts a new bounded-growth lifetime (an in-memory one-entry free list did not
+	// survive the close).
+	r.observeGrowth(m)
 	if v := r.db.Version(); v != m.version {
 		r.fail(i, "corrupt: after repair version %d, want %d", v, m.version)
 		return false

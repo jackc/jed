@@ -983,6 +983,14 @@ func (sc *psServerConn) waitForGate(requestID uint32, m psBeginWrite) {
 	var pending []manifestEntry
 	var reuse []uint32
 	st.mu.Lock()
+	// PROTOTYPE (incr_reclaim.go): a client reuses only listed pages no reader can observe; it cannot
+	// tell the generations apart, so any unmerged generation withholds the grant.
+	if st.incrActive() {
+		st.incrMerge(oldest)
+		if len(st.incr.gens) > 0 {
+			grant = false
+		}
+	}
 	if relaxed {
 		_ = st.paging.withPager(func(p *pager) error { pending = p.pendingEntries(); return nil })
 	}
@@ -1306,6 +1314,7 @@ func (sc *psServerConn) finishClientCommit(requestID uint32, w *psWriteTxn) erro
 		return nil
 	}
 	st.pageCount, st.freePages, st.freeChain = d.m.pageCount, free, fc
+	st.incrForeign(free, d.m.manifestPages) // PROTOTYPE (incr_reclaim.go)
 	if w.relaxed {
 		st.afterClientCommit(beganEmpty, capReached)
 	}
@@ -1438,7 +1447,11 @@ func (c *sharedCore) maintenanceCommit(o *pageServiceOwner) {
 	if c.oldestLiveVersion(newTxid) != newTxid {
 		return
 	}
-	if !(st.liveAtCompaction == 0 || reclaimDue(st.pageCount, len(st.freePages), st.liveAtCompaction) || st.endsFree()) {
+	due := reclaimDue(st.pageCount, len(st.freePages), st.liveAtCompaction)
+	if st.incrActive() { // PROTOTYPE (incr_reclaim.go)
+		due = st.incrDue()
+	}
+	if !(st.liveAtCompaction == 0 || due || st.endsFree()) {
 		return
 	}
 	snap := rt.committed.clone()

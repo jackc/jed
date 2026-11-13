@@ -489,6 +489,8 @@ type validatedCommitPlan struct {
 	// dirty is the commit's own manifest entries (its body and free-list pages), which a relaxed commit
 	// adds to the pending set (validated-cow.md §4).
 	dirty []manifestEntry
+	// rebuilt is whether the commit rebuilt the free list by a reachability walk.
+	rebuilt bool
 }
 
 // planValidatedCommit plans a file commit's free-list and manifest pages and its meta. pending is the
@@ -496,8 +498,8 @@ type validatedCommitPlan struct {
 // list (validated-cow.md §4). truncate lets the plan lower the high-water past the trailing run of safe
 // free pages (format.md *Trailing truncation*): only an owner's (or an alone process's) own commit that
 // plans against a durable floor — nothing pending — sets it, never a page client's planned delta.
-func planValidatedCommit(snap *snapshot, paging *sharedPaging, write incrementalWrite, pageSize, liveAtCompaction uint32, generation uint64, canReclaim, canReuse, truncate bool, livePages uint32, pending []manifestEntry, allowed map[uint32]bool, prevFree []uint32, prevChain *freeChain) (validatedCommitPlan, error) {
-	candidates, live, gen, rebuilt, err := freeListCandidates(snap, paging, write.root, write.pages, write.freeRemaining, write.pageCount, liveAtCompaction, generation, canReclaim, pending, write.remap)
+func planValidatedCommit(snap *snapshot, paging *sharedPaging, write incrementalWrite, pageSize, liveAtCompaction uint32, generation uint64, canReclaim, canReuse, truncate bool, livePages uint32, pending []manifestEntry, allowed map[uint32]bool, prevFree []uint32, prevChain *freeChain, incr *incrPlan) (validatedCommitPlan, error) {
+	candidates, live, gen, rebuilt, err := freeListCandidates(snap, paging, write.root, write.pages, write.freeRemaining, write.pageCount, liveAtCompaction, generation, canReclaim, pending, write.remap, incr)
 	if err != nil {
 		return validatedCommitPlan{}, err
 	}
@@ -563,6 +565,7 @@ func planValidatedCommit(snap *snapshot, paging *sharedPaging, write incremental
 		kept := false
 		switch {
 		case freeKeptChainOff:
+		case incr != nil: // PROTOTYPE (incr_reclaim.go): the list grows in the middle; always a fresh chain
 		case rebuilt || prevChain == nil:
 		case len(persist) == 0:
 			kept = true // the list is used up: no chain
@@ -601,7 +604,7 @@ func planValidatedCommit(snap *snapshot, paging *sharedPaging, write incremental
 		if expCommitHook != nil { // EXPERIMENT
 			expCommitHook(write.pages, fl, overflow, len(persist)+len(free))
 		}
-		return validatedCommitPlan{pages: append(fl, overflow...), manifest: overflow, meta: meta, chain: chain, free: free, pageCount: pc, live: live, generation: gen, dirty: dirty}, nil
+		return validatedCommitPlan{pages: append(fl, overflow...), manifest: overflow, meta: meta, chain: chain, free: free, pageCount: pc, live: live, generation: gen, dirty: dirty, rebuilt: rebuilt}, nil
 	}
 }
 

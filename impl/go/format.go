@@ -1220,6 +1220,10 @@ type incrementalWrite struct {
 	retained uint32
 	remap    *remapState
 	cat      *catState
+	// PROTOTYPE (incr_reclaim.go): the catalog pages written (nil when the chain was kept) and the GiST
+	// R-tree pages written, which the next commit orphans whole.
+	catalogIDs []uint32
+	gistIDs    []uint32
 }
 
 // pageAlloc hands out page indices for an incremental commit: the free-list first (lowest index, the
@@ -1309,6 +1313,7 @@ func (s *snapshot) incrementalImageDeferred(pageSize, startPage uint32, free []u
 	kept := make(map[uint32]bool)
 	shared := make(map[uint32]bool)
 	var gistPages uint32
+	var gistIDs []uint32
 	rootDataPage := make([]pageRef, len(keys))
 	indexRoots := make([][]pageRef, len(keys))
 	var indexColTypes []colType
@@ -1330,6 +1335,7 @@ func (s *snapshot) incrementalImageDeferred(pageSize, startPage uint32, free []u
 				// allocator (free-list first), the old tree's pages reclaimed on the next open.
 				root, err := serializeGistIndex(s, s.tables[k], idx, pcap, alloc.take, func(p gistPage) (pageTag, error) {
 					gistPages++
+					gistIDs = append(gistIDs, p.pageNo)
 					bytes, tag, err := seal.page(p.pageNo, p.pageType, 0, p.itemCount, pageRef{}, p.payload)
 					if err != nil {
 						return noTag, err
@@ -1414,6 +1420,7 @@ func (s *snapshot) incrementalImageDeferred(pageSize, startPage uint32, free []u
 				retained:      retained + uint32(len(prevCat.payloads)),
 				remap:         remap,
 				cat:           prevCat,
+				gistIDs:       gistIDs,
 			}, nil
 		}
 	}
@@ -1450,6 +1457,8 @@ func (s *snapshot) incrementalImageDeferred(pageSize, startPage uint32, free []u
 		retained:      retained,
 		remap:         remap,
 		cat:           &catState{payloads: newCat.payloads, root: next},
+		catalogIDs:    catPages,
+		gistIDs:       gistIDs,
 	}, nil
 }
 
@@ -1815,6 +1824,7 @@ func loadEngineSharedPagingAt(paging *sharedPaging, env *Environment, at loadAt)
 	// walk — so the catalog + skeleton load no longer tracks a reached set. The live count is the meta's
 	// (v34); the catalog chain and the GiST R-trees it rewrites whole are counted as they are read.
 	live := liveCount{live: mt.livePages}
+	var loadedGist []uint32 // PROTOTYPE (incr_reclaim.go)
 	catPage := pageRef{page: mt.rootPage, tag: mt.rootTag}
 	catSeen := map[uint32]bool{}
 	// typesChecked records that every composite type registered so far has passed
@@ -2028,6 +2038,7 @@ func loadEngineSharedPagingAt(paging *sharedPaging, env *Environment, at loadAt)
 					var keys [][]byte
 					read := func(p pageRef) (byte, uint32, []byte, error) {
 						live.gist++
+						loadedGist = append(loadedGist, p.page)
 						if at.gist != nil {
 							at.gist(p.page)
 						}
@@ -2123,7 +2134,36 @@ func loadEngineSharedPagingAt(paging *sharedPaging, env *Environment, at loadAt)
 	if live := int(mt.pageCount) - len(db.freePages); live > 0 {
 		db.liveAtCompaction = uint32(live)
 	}
+	if reclaimSeedLive && mt.livePages > 0 {
+		// EXPERIMENT (incremental-reclaim.md §6): the reopen-seed fix landing separately — seed with the
+		// meta's exact live count.
+		db.liveAtCompaction = mt.livePages
+	}
 	db.live = live
+	if incrOn() && at.meta == nil {
+		// PROTOTYPE (incr_reclaim.go): the committed state's wholesale pages, which the next commit
+		// orphans: the catalog chain and GiST pages just read, and the meta's manifest-overflow chain.
+		in := &incrState{known: true, gist: loadedGist, manifestCount: mt.manifestPages}
+		for p := range catSeen {
+			in.catalog = append(in.catalog, p)
+		}
+		sortUint32s(in.catalog)
+		id := mt.manifestHead
+		for i := uint32(0); i < mt.manifestPages; i++ {
+			block, err := pgr.readBlock(id)
+			if err != nil {
+				return nil, err
+			}
+			in.manifest = append(in.manifest, id)
+			id = binary.BigEndian.Uint32(block[8:12])
+		}
+		chain := 0
+		if db.freeChain != nil {
+			chain = len(db.freeChain.refs)
+		}
+		in.tolerated = max(0, int(mt.pageCount)-int(pcap.firstBody())-len(db.freePages)-int(mt.livePages)-chain-int(mt.manifestPages))
+		db.incr = in
+	}
 	db.committed = snap
 	db.paging = paging
 	// Stores created in a LATER session bind this same pager at creation (snapshot.storePaging), so
@@ -2759,14 +2799,22 @@ func reclaimDue(pageCount uint32, free int, liveAtCompaction uint32) bool {
 // orphans and remain protected even when they are unreachable from the new root.
 // pending is a relaxed batch's pending set (validated-cow.md §4): manifest dependencies the rebuilt
 // list must exclude, though they are not live.
-func freeListCandidates(snap *snapshot, paging *sharedPaging, catRoot pageRef, written []dirtyPage, freeRemaining []uint32, pageCount, liveAtCompaction uint32, genTxid uint64, canReclaim bool, pending []manifestEntry, remap *remapState) ([]uint32, uint32, uint64, bool, error) {
+func freeListCandidates(snap *snapshot, paging *sharedPaging, catRoot pageRef, written []dirtyPage, freeRemaining []uint32, pageCount, liveAtCompaction uint32, genTxid uint64, canReclaim bool, pending []manifestEntry, remap *remapState, incr *incrPlan) ([]uint32, uint32, uint64, bool, error) {
 	// liveAtCompaction==0 is the shared-file handoff sentinel: reconstruct on the first proven-alone
 	// commit even when the file is still below the ordinary amortization threshold.
-	compact := canReclaim && (liveAtCompaction == 0 || reclaimDue(pageCount, len(freeRemaining), liveAtCompaction))
+	due := reclaimDue(pageCount, len(freeRemaining), liveAtCompaction)
+	if incr != nil { // PROTOTYPE (incr_reclaim.go): the leak trigger replaces the 2× rule
+		due = incr.due
+	}
+	compact := canReclaim && (liveAtCompaction == 0 || due)
 	persistList := freeRemaining
+	if incr != nil && !compact {
+		persistList = mergeSortedU32(append([]uint32(nil), freeRemaining...), incr.listed)
+	}
 	newLive := liveAtCompaction
 	newGen := genTxid
 	if compact {
+		reclaimWalks.Add(1)
 		reached, err := snap.reachablePages(paging, catRoot)
 		if err != nil {
 			return nil, 0, 0, false, err

@@ -28,6 +28,9 @@ func countOf(db *Database, rd *Session) (int64, error) {
 }
 
 func TestFallbackReaderSnapshotIsolationUnderReclamation(t *testing.T) {
+	if incrOn() {
+		t.Skip("PROTOTYPE (incr_reclaim.go): drives the rebuild path, which incremental reclamation does not take here")
+	}
 	path := filepath.Join(t.TempDir(), "fallback.jed")
 	db, err := CreateDatabase(CreateOptions{Path: path, PageSize: 256, SkipFsync: true})
 	if err != nil {

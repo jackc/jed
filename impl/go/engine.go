@@ -77,6 +77,8 @@ type engine struct {
 	// to reuse only once no reader pins a version older than G. A bare single-handle engine has no live
 	// registry (oldest_live == committed), so the gate always passes and the byte layout is unchanged.
 	freeGenTxid uint64
+	// incr is the incremental-reclamation state the load recovered (PROTOTYPE, incr_reclaim.go).
+	incr *incrState
 	// paging is the shared paging context for a file-backed database (spec/design/pager.md): the open
 	// pager (kept for the handle's life) + the bounded leaf buffer pool, shared with every table store
 	// so reads fault OnDisk leaves through the one pool. The load reads pages through it and every
