@@ -325,10 +325,16 @@ fn damaged_fixtures_reproduce_their_reports() {
     }
 }
 
-/// The one non-malformed golden `open` rejects (validated_cow_tests.rs: a complete manifest whose
-/// free list frees its own dependencies); every other golden opens and checks clean, including the
-/// torn `cow_*` images, through recovery's fallback generation.
-const UNOPENABLE: &[&str] = &["cow_invalid_free_list.jed"];
+/// The non-malformed goldens `open` rejects: a complete manifest whose free list frees its own
+/// dependencies (validated_cow_tests.rs), and the deferred-interior histories with remap entries in
+/// both meta slots, which this core cannot read until it implements the v53 remap layout
+/// (spec/design/deferred-interior.md §9; verify.rb DEFERRED_FIXTURES). Every other golden opens and
+/// checks clean, including the torn `cow_*` images, through recovery's fallback generation.
+const UNOPENABLE: &[&str] = &[
+    "cow_deferred_overwrite.jed",
+    "cow_deferred_retire.jed",
+    "cow_invalid_free_list.jed",
+];
 
 /// The `full` skips of each golden that has any in the golden environment (integrity-check.md §3.5):
 /// stored text this binary cannot parse, and an index pinned to a collation version other than the

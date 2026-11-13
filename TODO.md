@@ -283,10 +283,10 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
     entry pays for almost exactly that third, so the inline capacity — which is also the
     `synchronous = off` batch cap — comes out **unchanged or one better than v52 at every page size**
     (678 vs 677 at 8 KiB plaintext). Deferral alone would have cut it 677 → 452.
-  - `verify.rb` (the Ruby reader and the simulator's independent checker) reads all three parts.
-  - Owes: §9 moved into format.md as v53, Rust + TS + the Ruby writer, every golden
-    regenerated (the stamp changes every page's bytes), the `cow_deferred.jed` fixture family (no
-    from-scratch golden can carry the region), page-service validation of a client delta's list plus
+  - `verify.rb` (the Ruby reader and the simulator's independent checker) reads all three parts, and
+    writes the plaintext `cow_deferred_*` histories, which the Go core reads back identically.
+  - Owes: §9 moved into format.md as v53, Rust + TS, every golden regenerated (the stamp changes
+    every page's bytes), the encrypted `cow_deferred` case, page-service validation of a client delta's list plus
     wire fixtures, the simulator's `replay` step at a remap entry — a new kind of bound pointer, which
     the encryption security review owes an opinion on — a race review of the commit path, and
     `unassignPages` undoing a retained interior (§9.9). The stamp itself is **unmeasured**: it

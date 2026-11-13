@@ -231,8 +231,22 @@ def first_body = $enc ? ENC_FIRST_BODY : ROOT_PAGE
 # as a subprocess of a sweep that set them, so the independent checker reads what the core wrote. At
 # v53 each becomes unconditional and the version byte decides. The narrow-manifest bit (offset 40's top
 # bit) is self-describing and needs no switch.
-DEFER_INTERIOR = ENV["JED_DEFER_INTERIOR"] == "on"
-PAGE_TXID_STAMP = ENV["JED_PAGE_TXID_STAMP"] == "on"
+# A fixture declares its own layout instead (`deferred:`, `stamped:`), so the v52 fixtures and the
+# deferred-interior ones verify side by side whatever the environment says.
+DEFER_INTERIOR_ENV = ENV["JED_DEFER_INTERIOR"] == "on"
+PAGE_TXID_STAMP_ENV = ENV["JED_PAGE_TXID_STAMP"] == "on"
+$defer_interior = DEFER_INTERIOR_ENV
+$page_txid_stamp = PAGE_TXID_STAMP_ENV
+
+# Run the block under a fixture's declared layout, restoring the environment's afterwards.
+def with_fixture_layout(fx)
+  $defer_interior = fx[:deferred] ? true : false
+  $page_txid_stamp = fx[:stamped] ? true : false
+  yield
+ensure
+  $defer_interior = DEFER_INTERIOR_ENV
+  $page_txid_stamp = PAGE_TXID_STAMP_ENV
+end
 MANIFEST_NARROW_FLAG = 1 << 31
 
 # The meta's manifest area [lo, hi): after the header (and an encrypted meta's tags), before an
@@ -248,13 +262,13 @@ def remap_cap(ps, encrypted)
   ((hi - lo) / 3) / remap_entry_size(encrypted)
 end
 
-def remap_reserve(ps, encrypted) = DEFER_INTERIOR ? remap_entry_size(encrypted) * remap_cap(ps, encrypted) : 0
+def remap_reserve(ps, encrypted) = $defer_interior ? remap_entry_size(encrypted) * remap_cap(ps, encrypted) : 0
 
 # The meta's remap list (§9.2-§9.3), keyed by [parent, slot] => [page, tag]; nil when the slot is
 # structurally invalid. Without the deferred layout offset 60 is reserved zero, as through v52.
 def decode_remap(m, ps, encrypted, first, page_count)
   count = m.byteslice(60, 4).unpack1("N")
-  return(count.zero? ? {} : nil) unless DEFER_INTERIOR
+  return(count.zero? ? {} : nil) unless $defer_interior
   return nil if count > remap_cap(ps, encrypted)
 
   size = remap_entry_size(encrypted)
@@ -283,7 +297,7 @@ end
 # The stamp window (manifest-crc32.md §2.1): a page listed by a manifest must carry the low 16 bits of
 # a txid in (floor, newest]. An empty or inverted window, or one of 2^16 or more, admits every stamp.
 def stamp_in_window?(stamp, floor, newest)
-  return true unless PAGE_TXID_STAMP && floor && newest > floor
+  return true unless $page_txid_stamp && floor && newest > floor
 
   span = newest - floor
   return true if span >= 1 << 16
@@ -293,7 +307,7 @@ def stamp_in_window?(stamp, floor, newest)
 end
 
 # The stamp a manifest-overflow page written by the commit at txid carries (0 without stamping).
-def stamp_of(txid) = PAGE_TXID_STAMP ? txid & 0xFFFF : 0
+def stamp_of(txid) = $page_txid_stamp ? txid & 0xFFFF : 0
 
 # The child pointers of an interior page, resolved through the selected meta's remap list: one lookup
 # per slot, never transitive (§9.1). Returns [page, tag] pairs (tag nil in plaintext) so a walker can
@@ -2150,6 +2164,48 @@ COW_FIXTURES = [
     expected_open_error: mutation == :invalid_free_list ? "invalid free-list entry" : nil }
 end.freeze
 
+# Deferred-interior commit histories (../design/deferred-interior.md §9; owed by §9.9). PROTOTYPE:
+# written in the v53 remap layout ahead of v53 (`deferred: true`). A reader without that layout
+# rejects every slot carrying entries: cow_deferred_retained opens through the base generation in
+# slot 1; cow_deferred_fold's newest slot has an empty list, a zero region that a v52 reader takes for
+# padding, so it opens correctly at txid 3; overwrite and retire carry entries in both slots and open
+# nowhere until a core reads the layout (Go under JED_DEFER_INTERIOR=on; Rust and TS list them as
+# unopenable for now).
+#
+# The base is a height-2 tree at page size 256: root I34 over interiors I21 (leaves 2-20, rows 1-57)
+# and I33 (leaves 22-32, rows 58-90), catalog at 35. An edited row keeps every leaf boundary, so a
+# rewritten leaf or interior is lifted from a from-scratch build of the edited table at the same page
+# (deferred_page asserts the shapes agree). Row 40 is slot 13 of I21; row 70 is slot 4 of I33.
+DEFERRED_BASE = {
+  name: "t",
+  columns: [col("id", "i32", pk: true), col("pad", "text")],
+  rows: (1..90).map { |i| [i, format("row-%02d-%s", i, "x" * 48)] }
+}.freeze
+
+def deferred_edit(edits) = DEFERRED_BASE.merge(rows: DEFERRED_BASE[:rows].map { |id, pad| [id, edits.fetch(id, pad)] })
+
+DEFERRED_Y = ->(id) { format("row-%02d-%s", id, "y" * 48) }
+DEFERRED_Z = ->(id) { format("row-%02d-%s", id, "z" * 48) }
+
+# file, history, the table the selected generation holds, its txid. Each history is in
+# deferred_fixture_image.
+DEFERRED_FIXTURES = [
+  # (a) txid 2 rewrites row 40's leaf; I21 keeps its page and keys (21, 13), the catalog is kept.
+  ["retained", { 40 => DEFERRED_Y[40] }, 2],
+  # (b) txid 3 moves the same leaf again: the one entry is overwritten, and the fallback slot (txid 2)
+  # still carries the entry it replaced.
+  ["overwrite", { 40 => DEFERRED_Z[40] }, 3],
+  # (c) txid 3 edits row 41 and folds: I21 and the root are written fresh, the catalog is rewritten,
+  # and the list is empty.
+  ["fold", { 40 => DEFERRED_Y[40], 41 => DEFERRED_Y[41] }, 3],
+  # (d) txid 2 moves a leaf under each of I21 and I33; txid 3 writes I21 fresh, so its entry dies
+  # with it while I33's survives, and the retained root keys (34, 0) to the new I21.
+  ["retire", { 40 => DEFERRED_Y[40], 70 => DEFERRED_Y[70] }, 3]
+].map do |name, edits, txid|
+  { file: "cow_deferred_#{name}.jed", page_size: 256, deferred: true, deferred_history: name.to_sym,
+    tables: [deferred_edit(edits)], expected_txid: txid }
+end.freeze
+
 # Malformed-page fixtures (../design/storage.md §6): images whose pages are CRC-valid, so they
 # pass the checksum, but whose structure lies — the shapes a misdirected or stale page presents.
 # Each is a clean image plus one forged mutation (malformed_fixture_image), page CRCs resealed so
@@ -2362,7 +2418,7 @@ FIXTURES = ([
   # Torn-write fallback: same image as pk_table, with one meta slot's CRC smashed.
   { file: "torn_meta_slot0.jed", page_size: 256, tables: [PK_TABLE], corrupt_slot: 0 },
   { file: "torn_meta_slot1.jed", page_size: 256, tables: [PK_TABLE], corrupt_slot: 1 }
-] + COW_FIXTURES + MALFORMED_FIXTURES).freeze
+] + COW_FIXTURES + DEFERRED_FIXTURES + MALFORMED_FIXTURES).freeze
 
 # --- primitives -------------------------------------------------------------
 
@@ -4934,6 +4990,7 @@ end
 # The bytes a fixture should contain (applying any torn-slot corruption).
 def fixture_image(fx)
   return cow_fixture_image(fx) if fx[:cow]
+  return deferred_fixture_image(fx) if fx[:deferred_history]
   return malformed_fixture_image(fx) if fx[:malformed]
 
   image = build_image(fx[:types] || [], fx[:sequences] || [], fx[:tables], fx[:page_size],
@@ -5047,6 +5104,117 @@ def cow_fixture_image(fx)
   when :bad_padding
     image.setbyte(ps - 1, 1)
     refresh_meta_crc(image, ps, 0)
+  end
+  image
+end
+
+# The page shape of t's tree as nested page numbers, resolved through the installed remap list.
+def deferred_shape(image, ps)
+  walk = lambda do |page|
+    pg = read_page(image, ps, page)
+    next page unless pg[:type] == PAGE_INTERIOR
+
+    [page, interior_children(pg, page).map { |child, _| walk.call(child) }]
+  end
+  walk.call(table_root_pages(image, ps)["t"])
+end
+
+# Page `index` of a from-scratch build of `table`, which must have the base's page shape: the bytes a
+# core writes for that node once the edit is applied (a node's bytes are a function of its content).
+def deferred_page(table, index)
+  base = build_image([], [], [DEFERRED_BASE], 256)
+  image = build_image([], [], [table], 256)
+  raise "an edit moved a leaf boundary" unless deferred_shape(image, 256) == deferred_shape(base, 256)
+
+  image.byteslice(index * 256, 256)
+end
+
+# Interior page `index` of the edited table with the pointer in `slot` replaced: a node written fresh
+# names each child where it now lives.
+def deferred_interior(table, index, moves)
+  page = deferred_page(table, index).dup
+  moves.each { |slot, child| page[PAGE_HEADER + slot * 4, 4] = u32(child) }
+  page[12, 4] = u32(page_crc(page))
+  page
+end
+
+# The catalog chain naming `root` as t's data root (one page at this size), at `index`.
+def deferred_catalog(table, index, root)
+  entries = ["\x00".b + table_entry_bytes(table, root, [], table[:rows].length)] + statistics_entries(table)
+  layout = catalog_layout(entries, 256 - PAGE_HEADER)
+  raise "the catalog should fit one page" unless layout.size == 1
+
+  page = "\x00".b * 256
+  write_page(page, 256, 0, PAGE_CATALOG, layout[0][:count], 0, layout[0][:payload])
+  [index, page]
+end
+
+# Publish a deferred-interior commit into `slot`: the wide manifest listing `listed` (each page's
+# CRC-64), then the remap list (deferred-interior.md §9.2) -- remap_entries at offset 60, entries
+# ascending by (parent, slot) from the start of the region.
+def write_deferred_meta(image, ps, slot, txid, root, live, listed, remap)
+  write_meta(image, ps, slot, ps, txid, root, image.bytesize / ps, live)
+  off = slot * ps
+  lo, hi = manifest_area(ps, false)
+  inline_hi = hi - remap_reserve(ps, false)
+  entries = listed.sort.map { |index| u32(index) + u64(crc64(image.byteslice(index * ps, ps))) }
+  raise "manifest does not fit inline" if entries.size * 12 > inline_hi - lo
+
+  image[off + 40, 4] = u32(entries.size)
+  image[off + lo, entries.size * 12] = entries.join.b
+  image[off + 60, 4] = u32(remap.size)
+  at = off + inline_hi
+  remap.sort.each do |(parent, child_slot), page|
+    image[at, 10] = [parent, child_slot, page].pack("NnN")
+    at += 10
+  end
+  refresh_meta_crc(image, ps, slot)
+end
+
+def append_page(image, ps, bytes)
+  index = image.bytesize / ps
+  image << bytes
+  index
+end
+
+# A deferred-interior commit history over DEFERRED_BASE (DEFERRED_FIXTURES). Slot 0 holds txid 2 and
+# slot 1 txid 3 (the slot is txid & 1), the base's txid-1 bootstrap meta staying in slot 1 until a
+# txid-3 commit replaces it. The live count is the base's throughout: every rewrite replaces a page
+# one for one, and a retained interior or kept catalog stays live.
+def deferred_fixture_image(fx)
+  ps = 256
+  image = build_image([], [], [DEFERRED_BASE], ps)
+  live = image.bytesize / ps - ROOT_PAGE
+  catalog = 35
+  y40 = deferred_edit(40 => DEFERRED_Y[40])
+  case fx[:deferred_history]
+  when :retained
+    leaf = append_page(image, ps, deferred_page(y40, 15))
+    write_deferred_meta(image, ps, 0, 2, catalog, live, [leaf], { [21, 13] => leaf })
+  when :overwrite
+    first = append_page(image, ps, deferred_page(y40, 15))
+    write_deferred_meta(image, ps, 0, 2, catalog, live, [first], { [21, 13] => first })
+    second = append_page(image, ps, deferred_page(fx[:tables][0], 15))
+    write_deferred_meta(image, ps, 1, 3, catalog, live, [second], { [21, 13] => second })
+  when :fold
+    first = append_page(image, ps, deferred_page(y40, 15))
+    write_deferred_meta(image, ps, 0, 2, catalog, live, [first], { [21, 13] => first })
+    final = fx[:tables][0]
+    leaf = append_page(image, ps, deferred_page(final, 15))
+    i21 = append_page(image, ps, deferred_interior(final, 21, { 13 => leaf }))
+    root = append_page(image, ps, deferred_interior(final, 34, { 0 => i21 }))
+    index, page = deferred_catalog(final, image.bytesize / ps, root)
+    append_page(image, ps, page)
+    write_deferred_meta(image, ps, 1, 3, index, live, [leaf, i21, root, index], {})
+  when :retire
+    final = fx[:tables][0]
+    a = append_page(image, ps, deferred_page(final, 15))
+    b = append_page(image, ps, deferred_page(final, 26))
+    write_deferred_meta(image, ps, 0, 2, catalog, live, [a, b], { [21, 13] => a, [33, 4] => b })
+    i21 = append_page(image, ps, deferred_interior(final, 21, { 13 => a }))
+    write_deferred_meta(image, ps, 1, 3, catalog, live, [i21], { [33, 4] => b, [34, 0] => i21 })
+  else
+    raise "unknown deferred history #{fx[:deferred_history]}"
   end
   image
 end
@@ -5290,7 +5458,7 @@ def valid_manifest?(image, ps, m, meta, floor = nil)
   ids = refs.map(&:first)
   return false unless ids == ids.sort.uniq && (ids & chain).empty?
   # A deferring commit may keep its catalog chain, so its root need not be listed (§9.4).
-  return false if count.positive? && !DEFER_INTERIOR && !ids.include?(meta[:root_page])
+  return false if count.positive? && !$defer_interior && !ids.include?(meta[:root_page])
   return false if count.positive? && meta[:free_head].positive? && !ids.include?(meta[:free_head])
   return false unless refs.all? do |index, expected|
     next false unless index >= first && index < meta[:page_count]
@@ -6838,8 +7006,10 @@ def generate
   dir = fixtures_dir
   Dir.mkdir(dir) unless Dir.exist?(dir)
   FIXTURES.each do |fx|
-    File.binwrite(File.join(dir, fx[:file]), fixture_image(fx))
-    puts "wrote #{fx[:file]} (#{fixture_image(fx).bytesize} bytes)"
+    with_fixture_layout(fx) do
+      File.binwrite(File.join(dir, fx[:file]), fixture_image(fx))
+      puts "wrote #{fx[:file]} (#{fixture_image(fx).bytesize} bytes)"
+    end
   end
   File.write(lz4_vectors_path, lz4_vectors_toml)
   File.write(encryption_vectors_path, encryption_vectors_toml)
@@ -6855,6 +7025,9 @@ def verify
   fail!("CRC64 self-test failed") unless crc64("123456789") == 0x6C40DF5F0B497347
 
   FIXTURES.each do |fx|
+    # Each fixture is read in the layout it declares (with_fixture_layout).
+    $defer_interior = fx[:deferred] ? true : false
+    $page_txid_stamp = fx[:stamped] ? true : false
     path = File.join(fixtures_dir, fx[:file])
     fail!("#{fx[:file]}: missing (run `ruby spec/fileformat/verify.rb --generate`)") unless File.exist?(path)
 
@@ -6928,6 +7101,8 @@ def verify
       fail!("#{fx[:file]}: statistics mismatch\n  got:  #{decoded[:statistics].inspect}\n  want: #{want_statistics.inspect}")
     end
   end
+  $defer_interior = DEFER_INTERIOR_ENV
+  $page_txid_stamp = PAGE_TXID_STAMP_ENV
 
   verify_lz4_vectors
   verify_encryption_vectors

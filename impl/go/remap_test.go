@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -249,5 +250,71 @@ func TestRemapEndToEnd(t *testing.T) {
 	}
 	if len(got) != 1 || got[0][0].Int != count || got[0][1].Int != sum || got[0][2].Int != int64(len(ys)) {
 		t.Fatalf("rows after reopen: %v, want count %d sum %d y %d", got, count, sum, len(ys))
+	}
+}
+
+// The Ruby reference writes the cow_deferred_* histories by hand (spec/fileformat/verify.rb,
+// DEFERRED_FIXTURES); this core, reading the same layout, must recover the same generation and rows
+// and find nothing wrong with them. Without the layout a slot carrying entries is invalid: retained
+// recovers the base generation, overwrite and retire (entries in both slots) open nowhere, and fold's
+// newest slot -- an empty list, a zero region, its catalog root listed -- is a valid v52 slot, read
+// correctly as it stands (deferred-interior.md §9.2: an empty list changes nothing a v52 reader sees).
+func TestRemapRubyHistories(t *testing.T) {
+	pad := func(id int, c string) string { return fmt.Sprintf("row-%02d-%s", id, strings.Repeat(c, 48)) }
+	cases := []struct {
+		name    string
+		version uint64
+		rows    map[int]string
+	}{
+		{"retained", 2, map[int]string{40: pad(40, "y"), 41: pad(41, "x"), 70: pad(70, "x")}},
+		{"overwrite", 3, map[int]string{40: pad(40, "z"), 41: pad(41, "x"), 70: pad(70, "x")}},
+		{"fold", 3, map[int]string{40: pad(40, "y"), 41: pad(41, "y"), 70: pad(70, "x")}},
+		{"retire", 3, map[int]string{40: pad(40, "y"), 41: pad(41, "x"), 70: pad(70, "y")}},
+	}
+	ctx := context.Background()
+	for _, c := range cases {
+		file := specPath(t, "fileformat/fixtures/cow_deferred_"+c.name+".jed")
+		t.Run(c.name, func(t *testing.T) {
+			withDefer(t, true)
+			db, err := openIntegrityCopy(t, file, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			if v := db.Version(); v != c.version {
+				t.Fatalf("recovered version %d, want %d", v, c.version)
+			}
+			got := query(t, db, "SELECT count(*), sum(id) FROM t")
+			if got[0][0].Int != 90 || got[0][1].Int != 4095 {
+				t.Fatalf("count/sum %v", got)
+			}
+			for id, want := range c.rows {
+				row := query(t, db, fmt.Sprintf("SELECT pad FROM t WHERE id = %d", id))
+				if len(row) != 1 || row[0][0].str() != want {
+					t.Errorf("row %d: %v, want %s", id, row, want)
+				}
+			}
+			report, err := db.IntegrityCheck(ctx, "main", IntegrityCheckOptions{Level: IntegrityFull, MaxFindings: IntegrityUnlimited, Constraints: true})
+			if err != nil || !report.OK() {
+				t.Fatalf("integrity: %v %+v", err, report.Findings)
+			}
+		})
+		t.Run(c.name+"/without layout", func(t *testing.T) {
+			withDefer(t, false)
+			db, err := openIntegrityCopy(t, file, nil)
+			switch c.name {
+			case "retained", "fold":
+				want := map[string]uint64{"retained": 1, "fold": 3}[c.name]
+				if err != nil || db.Version() != want {
+					t.Fatalf("want version %d: %v", want, err)
+				}
+				db.Close()
+				return
+			}
+			if err == nil {
+				db.Close()
+				t.Fatal("entries in both slots leave no slot a reader without the layout can select")
+			}
+		})
 	}
 }

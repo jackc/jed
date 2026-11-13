@@ -716,10 +716,31 @@ fixtures, 24 integrity fixtures). With each switch alone and all three together 
 agree with the checker (the 61 disagreements are gone), and `sim.rb sweep --seeds 1..25 --profile all
 --cores go --check-images` with all three switches re-decided 21,641 crash images, every one agreeing.
 Coverage of the list itself is thinner than that count: in a 400-image sample, 15 recoveries (about
-4%) selected a meta carrying entries. The rest folded or never deferred. **The Ruby writer is not
-taught**: it cannot yet produce a deferring commit history, so the `cow_deferred.jed` fixtures below
-are still owed, and the committed v52 `cow_*` fixtures fail `mise run verify` with the switches on (their
-inline manifests no longer fit), which the version gate will resolve.
+4%) selected a meta carrying entries. The rest folded or never deferred.
+
+**The Ruby writer (2026-11-13).** `verify.rb` now writes the `cow_deferred_*` group, plaintext, as
+hand-built commit histories over a height-2 tree (root over two interiors), each byte-exact, selected
+and re-walked by the reference and integrity-checked clean:
+
+- `cow_deferred_retained` — one retained parent keying one entry, the catalog kept;
+- `cow_deferred_overwrite` — the same child moved twice: one entry, overwritten, while the fallback
+  slot still carries the entry it replaced;
+- `cow_deferred_fold` — a fold: the stale interior and the root written fresh, the catalog rewritten,
+  the list empty;
+- `cow_deferred_retire` — a parent rewritten fresh drops its entry while another parent's survives,
+  and the retained root keys the new page.
+
+A fixture now declares its layout (`deferred:`, `stamped:`), so these and the v52 fixtures verify
+side by side whatever the environment says — `mise run verify` passes with the switches off and on.
+Sabotaging `retained`'s entry (naming the old leaf, or dropping the list) reverts the row the
+fixture's content check pins; keying it to the wrong slot is caught by the integrity reference as a
+`separator_violation`. The Go core, reading the layout, recovers the same generation and rows from all
+four and checks them clean (`TestRemapRubyHistories`). Without the layout a slot carrying entries is
+invalid: `retained` opens at its base generation, `fold`'s newest slot — an empty list, a zero region —
+is a valid v52 slot read correctly at txid 3, and `overwrite` and `retire`, with entries in both slots,
+open nowhere; Rust and TS list those two as unopenable until they read the layout. **Still owed:** case
+(e), the encrypted entry with its tag, and the writer's own deferral planner — these histories are
+assembled by hand, page by page, rather than planned the way §9.4 plans a commit.
 
 ### 9.9 What the landing change owes
 
@@ -734,9 +755,9 @@ page — so the from-scratch image no longer differs from v52 only by its versio
 
 Beyond the three cores and `verify.rb`:
 
-- **Fixtures.** A from-scratch image has no entries, so no static golden can carry the region's
-  bytes; the list needs a commit history, like the `cow_*.jed` family. A `cow_deferred.jed` group
-  pinning (a) a single retained parent with one entry, (b) a repeated move overwriting one entry,
+- **Fixtures** (plaintext (a)–(d) written, §9.8). A from-scratch image has no entries, so no static
+  golden can carry the region's bytes; the list needs a commit history, like the `cow_*.jed` family. A
+  `cow_deferred.jed` group pinning (a) a single retained parent with one entry, (b) a repeated move overwriting one entry,
   (c) a fold emptying the list, (d) a parent dropped by its own rewrite, and (e) the encrypted entry
   with its tag, each selected and re-walked by the Ruby reference.
 - **The page service.** `begin_read` already carries the meta, so a client reads the list it needs;
@@ -750,8 +771,8 @@ Beyond the three cores and `verify.rb`:
 - **A race review** of the commit path, which sets a page id on the committing snapshot's own nodes
   and swaps the resident list during planning (§6).
 - **`unassignPages`**, or its equivalent, must undo a retained interior when a plan is discarded.
-- **The Ruby writer** must produce deferring histories for the `cow_deferred.jed` fixtures; the reader
-  side is done (§9.8).
+- **The encrypted `cow_deferred` case** (e), an entry carrying its tag; the plaintext histories (a)–(d)
+  and the reader are done (§9.8).
 - **The stamp's remaining surface** ([manifest-crc32.md](manifest-crc32.md) §4): give the integrity
   check and the page service's delta check a window, and change the manifest-overflow header check
   from "bytes 1–3 zero" to "flags zero, stamp equals the meta's txid" in Rust, TS and the Ruby

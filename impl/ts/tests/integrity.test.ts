@@ -135,10 +135,14 @@ test("every damaged fixture reproduces its expected report", () => {
 });
 
 // The goldens the reference rejects or that fail open by design (verify.rb's reject / malformed /
-// expected_open_error), and the one whose index is deliberately misordered.
+// expected_open_error), the one whose index is deliberately misordered, and the deferred-interior
+// histories with remap entries in both meta slots, which this core cannot open until it reads the v53
+// remap layout (spec/design/deferred-interior.md §9; verify.rb DEFERRED_FIXTURES).
 const NOT_CLEAN = (f: string): boolean =>
   f.startsWith("malformed_") ||
   f === "cow_invalid_free_list.jed" ||
+  f === "cow_deferred_overwrite.jed" ||
+  f === "cow_deferred_retire.jed" ||
   f === "collation_skew_corrupt.jed";
 
 test("every clean golden checks with no findings at both levels and with constraints", () => {
