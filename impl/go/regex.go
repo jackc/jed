@@ -12,6 +12,7 @@ package jed
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"unicode/utf8"
@@ -1104,15 +1105,33 @@ func (p *regexProgram) slots(caps regexCaps) []int64 {
 // slots fit in one leaf, treeCaps for a larger one. The VM is instantiated once per representation,
 // so a thread is a pc and one field, and a small pattern's slots stay a pointer-free array.
 type capRep[C any] interface {
-	with(p *regexProgram, caps C, i int, v int64) C
+	with(p *regexProgram, seen *regexSeen, caps C, i int, v int64) C
 	result(caps C) regexCaps
+	// bufs is the search's reusable thread lists for this representation.
+	bufs(seen *regexSeen) *pikeBufs[C]
+	// reset readies seen for a new search.
+	reset(seen *regexSeen)
+}
+
+// pikeBufs is the thread lists and closure stack of a search, kept with the pooled regexSeen so a
+// search allocates none once they have grown to the program's size.
+type pikeBufs[C any] struct {
+	clist, nlist, stack []regexThread[C]
 }
 
 // flatCaps keeps the slots as one array, copied whole on a Save: at most capFan slots.
 type flatCaps struct{}
 
-func (flatCaps) with(p *regexProgram, caps []int64, i int, v int64) []int64 {
-	flat := make([]int64, p.capLeafLen)
+func (flatCaps) with(p *regexProgram, seen *regexSeen, caps []int64, i int, v int64) []int64 {
+	// The slots are cut from a slab the search owns (reset empties it); a full slab is replaced, and
+	// the slots already cut from it stay valid.
+	n := p.capLeafLen
+	if cap(seen.slab)-len(seen.slab) < n {
+		seen.slab = make([]int64, 0, max(1024, 8*n))
+	}
+	at := len(seen.slab)
+	seen.slab = seen.slab[:at+n]
+	flat := seen.slab[at : at+n : at+n]
 	if caps != nil {
 		copy(flat, caps)
 	} else {
@@ -1124,12 +1143,21 @@ func (flatCaps) with(p *regexProgram, caps []int64, i int, v int64) []int64 {
 	return flat
 }
 
-func (flatCaps) result(caps []int64) regexCaps { return regexCaps{flat: caps} }
+// result copies the winning slots out of the slab, which the next search reuses.
+func (flatCaps) result(caps []int64) regexCaps { return regexCaps{flat: slices.Clone(caps)} }
+
+func (flatCaps) bufs(seen *regexSeen) *pikeBufs[[]int64] { return &seen.flat }
+
+func (flatCaps) reset(seen *regexSeen) { seen.slab = seen.slab[:0] }
 
 // treeCaps keeps the slots as a capture-slot tree; a Save copies the path to the slot it sets.
 type treeCaps struct{}
 
-func (treeCaps) with(p *regexProgram, caps *capNode, i int, v int64) *capNode {
+func (treeCaps) bufs(seen *regexSeen) *pikeBufs[*capNode] { return &seen.tree }
+
+func (treeCaps) reset(*regexSeen) {}
+
+func (treeCaps) with(p *regexProgram, _ *regexSeen, caps *capNode, i int, v int64) *capNode {
 	return p.withSlotAt(caps, capFanBits*(p.capDepth-1), i, v)
 }
 
@@ -1147,6 +1175,10 @@ type regexThread[C any] struct {
 type regexSeen struct {
 	marks      []uint32
 	generation uint32
+	// The search's reusable buffers, by capture representation, and the flat representation's slab.
+	flat pikeBufs[[]int64]
+	tree pikeBufs[*capNode]
+	slab []int64
 }
 
 // next starts a new generation. When the counter wraps, the stale marks could alias the new
@@ -1230,8 +1262,11 @@ func pikeSearch[C any, R capRep[C]](p *regexProgram, seen *regexSeen, input []ru
 	var rep R
 	var unset C
 	length := len(input)
-	clist := []regexThread[C]{}
-	nlist := []regexThread[C]{}
+	rep.reset(seen)
+	bufs := rep.bufs(seen)
+	clist := bufs.clist[:0]
+	nlist := bufs.nlist[:0]
+	defer func() { bufs.clist, bufs.nlist = clist, nlist }()
 	var matched C
 	found := false
 
@@ -1299,7 +1334,8 @@ func pikeSearch[C any, R capRep[C]](p *regexProgram, seen *regexSeen, input []ru
 func pikeAddThread[C any, R capRep[C]](p *regexProgram, list *[]regexThread[C], seen *regexSeen, generation uint32, pc0 int, caps0 C, sp int, input []rune, gate []bool, m *costMeter) error {
 	var rep R
 	length := len(input)
-	stack := []regexThread[C]{{pc0, caps0}}
+	bufs := rep.bufs(seen)
+	stack := append(bufs.stack[:0], regexThread[C]{pc0, caps0})
 	for len(stack) > 0 {
 		top := stack[len(stack)-1]
 		stack = stack[:len(stack)-1]
@@ -1317,7 +1353,7 @@ func pikeAddThread[C any, R capRep[C]](p *regexProgram, list *[]regexThread[C], 
 			stack = append(stack, regexThread[C]{in.y, top.caps})
 			stack = append(stack, regexThread[C]{in.x, top.caps})
 		case opSave:
-			stack = append(stack, regexThread[C]{top.pc + 1, rep.with(p, top.caps, in.x, int64(sp))})
+			stack = append(stack, regexThread[C]{top.pc + 1, rep.with(p, seen, top.caps, in.x, int64(sp))})
 		case opAssertStart:
 			if sp == 0 {
 				stack = append(stack, regexThread[C]{top.pc + 1, top.caps})
@@ -1343,6 +1379,7 @@ func pikeAddThread[C any, R capRep[C]](p *regexProgram, list *[]regexThread[C], 
 			*list = append(*list, top)
 		}
 	}
+	bufs.stack = stack
 	return nil
 }
 
