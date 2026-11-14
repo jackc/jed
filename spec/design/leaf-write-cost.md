@@ -42,7 +42,10 @@ Leaf evening (format.md *Evening out with a sibling*) is measured with both.
 - **No-switch check:** this branch with every switch off against the master binary, nine
   alternating rounds: every benchmark within ±2.3% (cascade 2.708 → 2.730 ms, insert 3.850 →
   3.812, range 10.99 → 11.25, churn 5.093 → 5.130, update 0.042 → 0.041). The hooks the
-  prototypes add to the default paths cost nothing measurable.
+  prototypes add to the default paths cost nothing measurable. Re-checked after the runs and blocks
+  prototypes (§4a, §4c), nine rounds: cascade +1.2%, insert −2.8%, range +2.8% (spread 1.19), churn
+  +0.9%, update 0.0%. A first version that kept the two in separate fields made the range struct
+  larger and cost the cascade about 3%; they now share one pointer.
 
 ## 2. Where the time goes (master)
 
@@ -295,27 +298,103 @@ of that column in that leaf. The copy costs an O(N) loop and keeps a resident le
 page. Reading in place would avoid both, so the region kinds are compared on that basis too.
 
 `BenchmarkLeafColumnRead` (`impl/go/leaf_read_bench_test.go`) reads one `bigint` column of 476 rows
-straight from each region's bytes, pinned to one CPU, three runs each (ns; medians):
+straight from each region's bytes, pinned to one CPU, three runs each (ns; medians). Every reader
+decodes a 1-, 2-, 4- or 8-byte integer with one load; an earlier run with a byte-at-a-time decode
+favoured the narrow forms and is superseded. "Bytes" is the region's size; a page holds 8,176.
 
-| column / region | bytes | read one row | scan, a lookup per row | scan, run by run | build the copy |
-|---|---|---|---|---|---|
-| drift, kind 1 | 1,022 | 2.4 | 572 | | 2,170 |
-| drift, exception | 1,032 | 2.5 | 588 | | 2,166 |
-| drift, runs search | 708 | 12.3 | 5,022 | 327 | 6,428 |
-| drift, runs rank | 784 | 11.6 | 4,185 | 327 | 5,836 |
-| outlier, kind 1 | 3,869 | 3.6 | 1,292 | | 2,952 |
-| outlier, exception | 556 | 2.3 | 520 | | 2,051 |
-| outlier, runs search | 577 | 10.8 | 3,408 | 205 | 4,892 |
-| outlier, runs rank | 653 | 11.6 | 4,175 | 202 | 5,812 |
-| random, kind 1 | 1,974 | 2.7 | 1,050 | | 2,743 |
-| reading the full-width copy | | 2.2 | 1,258 | | |
+| column / region | bytes | read one row | scan, a lookup per row | scan, run by run |
+|---|---|---|---|---|
+| drift, kind 1 | 1,022 | 2.3 | 498 | |
+| drift, exception | 1,032 | 2.4 | 537 | |
+| drift, runs search | 708 | 11.9 | 4,288 | 323 |
+| drift, runs rank | 784 | 9.7 | 3,182 | 326 |
+| drift, blocks of 64 | 1,074 | 6.2 | 1,758 | |
+| drift, blocks of 32 + exception | 703 | 5.5 | 1,668 | |
+| outlier, kind 1 | 3,869 | 2.2 | 535 | |
+| outlier, exception | 556 | 2.3 | 499 | |
+| outlier, runs search | 577 | 7.3 | 2,738 | 201 |
+| outlier, blocks of 64 + exception | 636 | 5.6 | 1,680 | |
+| outlier, blocks of 32 + exception | 713 | 5.6 | 1,685 | |
+| random, kind 1 | 1,974 | 2.3 | 492 | |
+| random, blocks of 64 | 2,054 | 5.6 | 1,736 | |
+| the full-width copy | (3,808) | 2.0 | 240 | |
 
-- **Kind 1 and the exception read in place as fast as the copy** (2.3–3.6 ns a row against 2.2), and a
-  scan is faster than scanning the copy, because it reads fewer bytes. Reading in place would remove
-  the copy's 2–3 µs per column per leaf, and its memory, at no cost per read.
-- **Runs cost 4–5 times as much per random read** (11–12 ns): finding the run. The rank index is no
-  faster than binary search at these run counts, and costs 76 more bytes a column. A scan that walks
-  run by run is the fastest of all (200–330 ns), but every reader must then be run-aware.
+Building the copy costs about 1.9 µs per column per leaf from kind 1 or the exception, 2.9 µs from
+blocks, and 4.5–6 µs from runs.
+
+- **Kind 1 and the exception read one row in place as fast as the copy** (2.2–2.4 ns against 2.0). A
+  scan in place takes about twice as long as scanning the copy (≈500 ns against 240), because each
+  value is a base plus an offset of a width known only at run time; a scan loop specialised per
+  width would close most of that. Reading in place would remove the copy's 1.9 µs per column per leaf
+  and its memory.
+- **Blocks read in constant time with no index** but pay an extra header read per value: 5.5–6.2 ns
+  a row, about 2.5 times kind 1. A scan that walks block by block, as runs do, would avoid it.
+- **Runs cost 3–5 times as much per random read** (7–12 ns): finding the run. The rank index is not
+  reliably faster than binary search at these run counts, and costs 76 more bytes a column. A scan
+  that walks run by run is the fastest of all (200–430 ns), but every reader must then be run-aware.
+
+## 4c. Option (e): fixed blocks
+
+Suggested after §4a: give each block of `B` rows its own base and width, so row `i`'s block is `i / B`
+and a read in place needs no index, and add the exception on top for a single outlier. Prototyped as
+region kind 8 (`JED_LEAF_BLOCKS=B`, `JED_LEAF_BLOCKS_EXC=on`, `impl/go/leaf_blocks.go`):
+
+```
+null bitmap | exception flag (u8) | [exception row (u16), body (w)] | ⌈N/B⌉ × (base w, width u8, data offset u16) | offsets
+```
+
+A block's width is the narrowest of 0, 1, 2, 4 below `w` that holds its present values, or `w`. The
+excepted value is the column's single largest (or smallest) present value, taken when it makes the
+region smaller. Size `1 + [2 + w] + Σ (w + 3 + len·width)`: a closed formula per block, with no
+search. Measured with the plain exception kind (option b) also enabled, so each leaf takes whichever
+is smallest.
+
+`TestLeafBlocksRoundTrip` passes for blocks of 16 and 64, with and without the exception. The Go
+corpus passes in full in memory and disk mode with blocks of 64 and the exception. With blocks of
+32, four page-count pins move (`ddl/foreign_key_keyed_actions`, `query/index_key_set` and its
+EXPLAIN file, `query/statistics_estimates_p9`) and no row differs.
+
+**What changes in the specification beyond a closed formula.** A block belongs to its row's position,
+so a half produced by a split has its blocks aligned to its own first row. A left half (rows
+`[0, m)`) only grows at its end, so its size stays nondecreasing in `m`. A right half grows at its
+front, which moves every row into a different block, so its size is **not** monotone in `m`, which the
+`m_min` scan of *Fan-out* assumes. The rule would have to be restated as the scan itself (stop at the
+first boundary that does not fit). The prototype's two split-point implementations agree under that
+reading on every workload run, but it is a weaker property than the one the format states today.
+
+**Size** (live pages, `TestLeafWidenGrowth`):
+
+| table | master | exception | blocks of 64 + exception | blocks of 32 + exception |
+|---|---|---|---|---|
+| `c` (drifting `parent_id`), loaded | 53 | 53 | 43 (−19%) | 45 (−15%) |
+| `c` after one / two widenings per leaf | 84 / 96 | 60 / 72 | 53 / 53 | 56 / 56 |
+| `d` (`v = 7·id`), loaded | 212 | 212 | 212 | 204 (−4%) |
+| `d` after one / two widenings per leaf | 276 / 293 | 214 / 274 | 218 / 273 | 208 / 271 |
+| `wide`, loaded / one / two | 25 / 31 / 31 | 25 / 25 / 30 | 25 / 25 / 30 | 25 / 25 / 30 |
+
+Blocks of 64 match runs on the strongly drifting column (43 against 42 pages) but not on `7·id`,
+whose 64-row span still needs 2-byte offsets; blocks of 32 get it. A second outlier in a block widens
+that block (64 rows × 2 more bytes for `c`), so after two widenings `c` is smaller than master but
+still 25% above its loaded size. The bench datasets are uniform random and never choose blocks: their
+live pages are unchanged, and loading them takes the same time as master (6.3–6.4 s, against 12.7 s
+for runs).
+
+**Write time** (medians of seven alternating rounds, ms; the exception kind is on in both blocks
+columns):
+
+| benchmark | master | exception | blocks of 64 + exception | blocks of 32 + exception |
+|---|---|---|---|---|
+| `fk_cascade_delete_indexed` | 2.817 | 2.776 | 3.523 | 3.388 |
+| `insert_rollback` | 3.762 | 3.626 | 4.897 | 4.831 |
+| `delete_range_rollback` | 11.517 | 11.474 | 18.682 | 18.217 |
+| `delete_insert_churn` | 5.153 | 5.214 | 7.122 | 7.438 |
+| `update_untouched_large_rollback` | 0.044 | 0.011 | 0.013 | 0.012 |
+
+The update is fixed as by the exception. Every insert or delete is 25% to 62% slower, on columns that
+end up not using blocks as well: an insert or delete moves every later row to another block, so each
+edit measures the column again (a min and max per block, far cheaper than runs' dynamic program, but
+over every row). Keeping blocks current incrementally would mean a sliding window per block for each
+shift, which the prototype does not attempt.
 
 ## 5. Leaf evening
 
@@ -349,7 +428,7 @@ rows.
   copying a leaf that is 4.8 times larger (§2). That is the price of density and no edit-path change
   removes it.
 
-**#5: take the exception (b) as format v54; adopt neither slack (a) nor runs (d).**
+**#5: take the exception (b) as format v54; adopt neither slack (a), runs (d) nor fixed blocks (e) now.**
 
 The maintainer confirmed (2026-11-14) that the project is still in development and a format version
 is cheap, which removes the reason given earlier for waiting.
@@ -361,11 +440,14 @@ is cheap, which removes the reason given earlier for waiting.
   column (−21% on the child table) and they handle any number of outliers, but they absorb an
   outlier worse than the exception (two run headers against 10 bytes), make every write that touches
   a leaf re-measure it (range delete 6.5×, bulk load 2×, as built), and make a random read in place
-  4–5 times as costly (§4b). The exception keeps kind 1's constant-time read in place.
-- **If drift compression is wanted later**, prototype fixed-size blocks rather than chosen runs: each
-  block of, say, 64 rows with its own base and width. Row `i`'s block is `i / 64`, so a read in place
-  stays constant-time with no index, and an edit re-measures one block. An outlier widens only its
-  block, and could still take the exception. Not prototyped.
+  3–5 times as costly (§4b).
+- **Fixed blocks (§4c) are the better form of the same idea**: nearly runs' saving on a drifting column
+  (−19% on the child table at 64 rows), a constant-time read in place with no index (about 2.5 times
+  kind 1's, and a block-by-block scan would close that), no bulk-load cost, and the exception on top
+  for outliers. Two costs keep them out of v54: every insert or delete re-measures the column (writes
+  25–62% slower as built, on any column eligible for base plus offsets), and a right half's size is no
+  longer monotone in the split point, which weakens a guarantee *Fan-out* states today. If drift
+  compression is wanted, blocks are the option to develop, starting with incremental size facts.
 - **Open choice before porting: one exception or a few.** One exception absorbs only the first
   outlier per leaf and column; a second in the same leaf widens the column and splits the leaf, and
   in `TestLeafWidenGrowth` that still grew the tables 20% to 36%. A region with up to `k` exceptions
@@ -377,9 +459,10 @@ is cheap, which removes the reason given earlier for waiting.
 - For scale: without any change, widening one value in every leaf grows the tables 24% to 58%,
   still 1.9 to 3.6 times smaller than in v51.
 
-**Separately: read base-plus-offsets columns in place** (§4b). Kind 1 reads as fast in place as from
-the full-width copy every core builds today, so dropping the copy saves its O(N) build per column per
-leaf and keeps a resident leaf the size of its page. It is the open follow-on "keep a resident leaf
+**Separately: read base-plus-offsets columns in place** (§4b). Kind 1 and the exception read one row
+in place as fast as from the full-width copy every core builds today; a scan needs a loop specialised
+per offset width to match the copy. Dropping the copy saves its O(N) build per column per leaf and
+keeps a resident leaf the size of its page. It is the open follow-on "keep a resident leaf
 the size of its page" (leaf-structural.md §12), now with a measurement. No format change.
 
 **How the two interact.**
@@ -405,12 +488,14 @@ All off by default; the corpus, goldens and `mise run test` pass with them off.
 | `JED_LEAF_FORX=on` | `leaf_forx.go` | yes (region kind 6) | one exception per base-plus-offsets region |
 | `JED_LEAF_EVEN=off` | `leaf_even.go` | yes (split points) | no evening, to measure its cost |
 | `JED_LEAF_RUNS=search\|rank` | `leaf_runs.go` | yes (region kind 7) | base-plus-offsets in runs, with a lookup index |
+| `JED_LEAF_BLOCKS=B` | `leaf_blocks.go` | yes (region kind 8) | base-plus-offsets in fixed blocks of `B` rows |
+| `JED_LEAF_BLOCKS_EXC=on` | `leaf_blocks.go` | yes | one exception on top of the blocks |
 
 Tests: `TestLeafEditModes` (the modes write identical bytes), `TestLeafFORXRoundTrip`,
-`TestLeafRunsRoundTrip`, `TestLeafShapes` and `TestLeafWidenGrowth` (the last two log only, under
+`TestLeafRunsRoundTrip`, `TestLeafBlocksRoundTrip`, `TestLeafShapes` and `TestLeafWidenGrowth` (the last two log only, under
 `JED_LEAF_SHAPES=1`); `BenchmarkLeafColumnRead` (§4b).
 
 **Not verified.** Rust and TS were not measured. The gap prototype is safe only because one writer
 owns every dirty node; its close-on-freeze path was exercised by the corpus but not under the race
-detector. Kinds 6 and 7 were not run through the simulation sweep, the Ruby reference or `verify.rb`.
+detector. Kinds 6, 7 and 8 were not run through the simulation sweep, the Ruby reference or `verify.rb`.
 The in-place readers of §4b exist only in the benchmark; no core reads in place yet.

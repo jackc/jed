@@ -217,10 +217,18 @@ func (a *runsAcc) runs() (starts []int, widths []int) {
 
 // newRunsRange is a forRange that also keeps runs, for a column of width w, in runs mode.
 func newRunsRange(w int) forRange {
-	if leafRuns == leafRunsOff {
-		return forRange{}
+	var r forRange
+	if leafRuns == leafRunsOff && leafBlocks == 0 {
+		return r
 	}
-	return forRange{rd: newRunsAcc(w)}
+	r.pos = &forPos{}
+	if leafRuns != leafRunsOff {
+		r.pos.rd = newRunsAcc(w)
+	}
+	if leafBlocks > 0 {
+		r.pos.bk = newBlocksAcc(w) // PROTOTYPE (leaf_blocks.go)
+	}
+	return r
 }
 
 // encodeRuns writes a kind 7 region of n values (encodeRegion's vb and nulls) from their runs.
@@ -379,12 +387,12 @@ func (rr *runsRegion) value(i int) (v uint64, null bool) {
 	}
 	k := rr.runOf(i)
 	s, o, b := rr.run(k)
-	base := beUint(rr.hdr[k*(rr.w+5)+4 : k*(rr.w+5)+4+rr.w])
+	base := beUintN(rr.hdr[k*(rr.w+5)+4:], rr.w)
 	if b == 0 {
 		return base, false
 	}
 	at := o + (i-s)*b
-	return base + beUint(rr.data[at:at+b]), false
+	return base + beUintN(rr.data[at:], b), false
 }
 
 // parseRuns rebuilds a kind 7 region's dense slots, as the reader does for kind 1.

@@ -21,6 +21,7 @@ type readCase struct {
 	region  []byte // after the kind byte
 	kind    byte
 	runsIdx int // leafRuns mode the region was written in
+	blocks  int // leafBlocks the region was written in
 }
 
 // leafReadValues is a column's values: a drifting column (row × 7), small values with one outlier,
@@ -47,8 +48,8 @@ func leafReadValues(pattern string, n int) []uint64 {
 func leafReadCases(b *testing.B) []readCase {
 	const n, w = 476, 8
 	var out []readCase
-	savedRuns, savedFORX := leafRuns, leafFORX
-	defer func() { leafRuns, leafFORX = savedRuns, savedFORX }()
+	savedRuns, savedFORX, savedBlocks, savedExc := leafRuns, leafFORX, leafBlocks, leafBlocksExc
+	defer func() { leafRuns, leafFORX, leafBlocks, leafBlocksExc = savedRuns, savedFORX, savedBlocks, savedExc }()
 	for _, pattern := range []string{"drift", "outlier", "random"} {
 		vals := leafReadValues(pattern, n)
 		vb := make([][]byte, n)
@@ -57,8 +58,8 @@ func leafReadCases(b *testing.B) []readCase {
 			vb[i] = make([]byte, w)
 			putBEUint(vb[i], v)
 		}
-		add := func(name string, runs int, forx bool, force byte) {
-			leafRuns, leafFORX = runs, forx
+		add := func(name string, runs int, forx bool, force byte, blocks int, exc bool) {
+			leafRuns, leafFORX, leafBlocks, leafBlocksExc = runs, forx, blocks, exc
 			r := newRunsRange(w)
 			for _, v := range vals {
 				r.add(v)
@@ -71,17 +72,22 @@ func leafReadCases(b *testing.B) []readCase {
 				}
 				reg = encodeFORX(w, n, vb, nulls, r)
 			case regionRuns:
-				reg = encodeRuns(w, n, vb, nulls, r.rd)
+				reg = encodeRuns(w, n, vb, nulls, r.runs())
+			case regionBlocks:
+				reg = encodeBlocks(w, n, vb, nulls, r.blocks())
 			default:
 				reg = encodeRegion(colType{Scalar: scalarInt64}, n, vb, nulls)
 			}
 			out = append(out, readCase{name: pattern + "/" + name, w: w, n: n, vb: vb, nulls: nulls,
-				region: reg[1:], kind: reg[0], runsIdx: runs})
+				region: reg[1:], kind: reg[0], runsIdx: runs, blocks: blocks})
 		}
-		add("kind1", leafRunsOff, false, 0)
-		add("exception", leafRunsOff, true, regionFORX)
-		add("runs-search", leafRunsSearch, false, regionRuns)
-		add("runs-rank", leafRunsRank, false, regionRuns)
+		add("kind1", leafRunsOff, false, 0, 0, false)
+		add("exception", leafRunsOff, true, regionFORX, 0, false)
+		add("runs-search", leafRunsSearch, false, regionRuns, 0, false)
+		add("runs-rank", leafRunsRank, false, regionRuns, 0, false)
+		add("blocks64", leafRunsOff, false, regionBlocks, 64, false)
+		add("blocks64-exc", leafRunsOff, false, regionBlocks, 64, true)
+		add("blocks32-exc", leafRunsOff, false, regionBlocks, 32, true)
 	}
 	return out
 }
@@ -93,7 +99,7 @@ func (c readCase) inPlace() func(i int) uint64 {
 	switch c.kind {
 	case 0:
 		body := reg[bm:]
-		return func(i int) uint64 { return beUint(body[i*w : (i+1)*w]) }
+		return func(i int) uint64 { return beUintN(body[i*w:], w) }
 	case regionFOR:
 		base := beUint(reg[bm : bm+w])
 		bw := int(reg[bm+w])
@@ -101,7 +107,7 @@ func (c readCase) inPlace() func(i int) uint64 {
 		if bw == 0 {
 			return func(int) uint64 { return base }
 		}
-		return func(i int) uint64 { return base + beUint(offs[i*bw:(i+1)*bw]) }
+		return func(i int) uint64 { return base + beUintN(offs[i*bw:], bw) }
 	case regionFORX:
 		p := bm
 		base := beUint(reg[p : p+w])
@@ -116,7 +122,7 @@ func (c readCase) inPlace() func(i int) uint64 {
 			if bw == 0 {
 				return base
 			}
-			return base + beUint(offs[i*bw:(i+1)*bw])
+			return base + beUintN(offs[i*bw:], bw)
 		}
 	case regionRuns:
 		saved := leafRuns
@@ -127,6 +133,15 @@ func (c readCase) inPlace() func(i int) uint64 {
 			panic(err)
 		}
 		return func(i int) uint64 { v, _ := rr.value(i); return v }
+	case regionBlocks:
+		saved := leafBlocks
+		leafBlocks = c.blocks
+		br, err := parseBlocksRegion(reg, 0, len(reg), n, w)
+		leafBlocks = saved
+		if err != nil {
+			panic(err)
+		}
+		return func(i int) uint64 { v, _ := br.value(i); return v }
 	}
 	panic(fmt.Sprintf("kind %d", c.kind))
 }
@@ -211,7 +226,7 @@ func BenchmarkLeafColumnRead(b *testing.B) {
 		var sink uint64
 		for k := 0; k < b.N; k++ {
 			i := order[k%c.n]
-			sink += beUint(body[i*c.w : (i+1)*c.w])
+			sink += beUintN(body[i*c.w:], c.w)
 		}
 		_ = sink
 	})
@@ -219,7 +234,7 @@ func BenchmarkLeafColumnRead(b *testing.B) {
 		var sink uint64
 		for k := 0; k < b.N; k++ {
 			for i := 0; i < c.n; i++ {
-				sink += beUint(body[i*c.w : (i+1)*c.w])
+				sink += beUintN(body[i*c.w:], c.w)
 			}
 		}
 		_ = sink

@@ -1636,6 +1636,9 @@ func splitPointRunning(keys [][]byte, vals []storedRow, items [][]dictItem, scan
 		clear(fors)
 		for j, fc := range shape.forCols {
 			fors[j] = newRunsRange(fc.w)
+			if fors[j].pos != nil {
+				fors[j].pos.bk = nil // the down pass measures blocks forward (saved)
+			}
 		}
 		clear(facts)
 		clear(nulls)
@@ -1694,10 +1697,27 @@ func splitPointRunning(keys [][]byte, vals []storedRow, items [][]dictItem, scan
 			}
 		}
 	}
-	saved := func(count int) int {
+	// saved is the content saving of the running half: count rows, starting at row lo.
+	saved := func(count, lo int) int {
 		s := 0
 		for j, fc := range shape.forCols {
-			s += forSaving(count, fc.w, fors[j])
+			x := forSaving(count, fc.w, fors[j])
+			if leafBlocks > 0 && lo > 0 {
+				// PROTOTYPE (leaf_blocks.go): a right half's blocks start at its own first row, so they
+				// are measured forward from it rather than kept as the half grows downward.
+				a := newBlocksAcc(fc.w)
+				for i := lo; i < n; i++ {
+					if v := vals[i][fc.col]; !v.IsNull() {
+						a.push(forSlot(fc, v), true)
+					} else {
+						a.push(0, false)
+					}
+				}
+				if b := a.saving(); b > x {
+					x = b
+				}
+			}
+			s += x
 		}
 		for j := range shape.itemCols {
 			if shape.itemArr[j] != 0 || shape.itemTab[j] != nil {
@@ -1722,7 +1742,7 @@ func splitPointRunning(keys [][]byte, vals []storedRow, items [][]dictItem, scan
 			mMax, mSlack = m, m
 			continue
 		}
-		left := prefix[m] + leafOverhead(m, shape) - leafPrefixSaving(m, keys[0], keys[m-1]) - saved(m)
+		left := prefix[m] + leafOverhead(m, shape) - leafPrefixSaving(m, keys[0], keys[m-1]) - saved(m, 0)
 		if left > cap.c {
 			break
 		}
@@ -1754,7 +1774,7 @@ func splitPointRunning(keys [][]byte, vals []storedRow, items [][]dictItem, scan
 		for i := n - 1; i >= m; i-- {
 			add(i, false)
 		}
-		right := total - prefix[m] + leafOverhead(n-m, shape) - leafPrefixSaving(n-m, keys[m], keys[n-1]) - saved(n-m)
+		right := total - prefix[m] + leafOverhead(n-m, shape) - leafPrefixSaving(n-m, keys[m], keys[n-1]) - saved(n-m, m)
 		if right <= cap.c {
 			return m, true
 		}
@@ -1763,7 +1783,7 @@ func splitPointRunning(keys [][]byte, vals []storedRow, items [][]dictItem, scan
 	mMin := 0
 	for m := n - 1; m >= 1; m-- {
 		add(m, false)
-		right := total - prefix[m] + leafOverhead(n-m, shape) - leafPrefixSaving(n-m, keys[m], keys[n-1]) - saved(n-m)
+		right := total - prefix[m] + leafOverhead(n-m, shape) - leafPrefixSaving(n-m, keys[m], keys[n-1]) - saved(n-m, m)
 		if right > cap.c {
 			break
 		}
@@ -1948,7 +1968,7 @@ func buildLeaf(keys [][]byte, vals []storedRow, weights []uint32, cap pageCap, s
 	}
 	// PROTOTYPE (leaf_runs.go): each column's runs saving over every prefix and suffix.
 	var preRuns, sufRuns [][]int
-	if leafRuns != leafRunsOff {
+	if leafPositional() {
 		preRuns, sufRuns = make([][]int, len(shape.forCols)), make([][]int, len(shape.forCols))
 		for j, fc := range shape.forCols {
 			push := func(a *runsAcc, i int) {
@@ -1959,15 +1979,39 @@ func buildLeaf(keys [][]byte, vals []storedRow, weights []uint32, cap pageCap, s
 				}
 			}
 			preRuns[j], sufRuns[j] = make([]int, n+1), make([]int, n+1)
-			a := newRunsAcc(fc.w)
-			for i := 0; i < n; i++ {
-				push(a, i)
-				preRuns[j][i+1] = a.saving()
+			if leafRuns != leafRunsOff {
+				a := newRunsAcc(fc.w)
+				for i := 0; i < n; i++ {
+					push(a, i)
+					preRuns[j][i+1] = a.saving()
+				}
+				b := newRunsAcc(fc.w)
+				for i := n - 1; i >= 0; i-- {
+					push(b, i)
+					sufRuns[j][i] = b.saving()
+				}
 			}
-			b := newRunsAcc(fc.w)
-			for i := n - 1; i >= 0; i-- {
-				push(b, i)
-				sufRuns[j][i] = b.saving()
+			if leafBlocks > 0 {
+				// PROTOTYPE (leaf_blocks.go): blocks start at a half's first row.
+				pushB := func(a *blocksAcc, i int) {
+					if v := vals[i][fc.col]; !v.IsNull() {
+						a.push(forSlot(fc, v), true)
+					} else {
+						a.push(0, false)
+					}
+				}
+				a := newBlocksAcc(fc.w)
+				for i := 0; i < n; i++ {
+					pushB(a, i)
+					preRuns[j][i+1] = max(preRuns[j][i+1], a.saving())
+				}
+				for m := 1; m < n; m++ {
+					b := newBlocksAcc(fc.w)
+					for i := m; i < n; i++ {
+						pushB(b, i)
+					}
+					sufRuns[j][m] = max(sufRuns[j][m], b.saving())
+				}
 			}
 		}
 	}

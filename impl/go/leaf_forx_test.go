@@ -108,3 +108,24 @@ func TestLeafRunsRoundTrip(t *testing.T) {
 		}
 	}
 }
+
+// The same for base-plus-offsets regions in fixed blocks (leaf_blocks.go), with and without the
+// exception on top.
+func TestLeafBlocksRoundTrip(t *testing.T) {
+	saved, savedExc := leafBlocks, leafBlocksExc
+	defer func() { leafBlocks, leafBlocksExc = saved, savedExc }()
+	leafBlocks, leafBlocksExc = 0, false
+	plain := forxWorkload(t)
+	for _, b := range []int{16, 64} {
+		for _, exc := range []bool{false, true} {
+			leafBlocks, leafBlocksExc = b, exc
+			before := blocksWritten.Load()
+			if got := forxWorkload(t); got != plain {
+				t.Fatalf("blocks of %d (exception %v): rows:\n%s\nwithout:\n%s", b, exc, got, plain)
+			}
+			if blocksWritten.Load() == before {
+				t.Fatalf("blocks of %d (exception %v): the workload wrote no region in blocks", b, exc)
+			}
+		}
+	}
+}

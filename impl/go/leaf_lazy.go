@@ -648,8 +648,8 @@ func (sz *leafSizes) replaceCols(n *pnode, i int, key []byte, val storedRow, sha
 				continue
 			}
 			ov, nv := old[fc.col], val[fc.col]
-			if leafRuns != leafRunsOff {
-				sz.fors[j].rd = nil // PROTOTYPE (leaf_runs.go): measure the column again
+			if leafPositional() {
+				sz.fors[j].pos = nil // PROTOTYPE (leaf_runs.go): measure the column again
 				sz.forStale[j], sz.stale = true, true
 			}
 			if !ov.IsNull() {
@@ -731,7 +731,7 @@ func (sz *leafSizes) clone() *leafSizes {
 	}
 	out.fors = slices.Clone(sz.fors)
 	for j := range out.fors {
-		out.fors[j].rd = out.fors[j].rd.clone() // PROTOTYPE (leaf_runs.go)
+		out.fors[j].pos = out.fors[j].pos.clone() // PROTOTYPE (leaf_runs.go, leaf_blocks.go)
 	}
 	out.forCnt = slices.Clone(sz.forCnt)
 	out.forStale = slices.Clone(sz.forStale)
@@ -1018,8 +1018,12 @@ func encodeRegion(ty colType, n int, vb [][]byte, nulls []bool) []byte {
 				out[0] = regionFOR
 				k1 := n*(w-bw) - (w + 1)
 				x := forExcSaving(n, w, r)
-				if rs := r.rd.saving(); rs > k1 && rs > x {
-					return encodeRuns(w, n, vb, nulls, r.rd) // PROTOTYPE (leaf_runs.go)
+				rs, bs := r.runs().saving(), r.blocks().saving()
+				if bs > k1 && bs > x && bs > rs {
+					return encodeBlocks(w, n, vb, nulls, r.blocks()) // PROTOTYPE (leaf_blocks.go)
+				}
+				if rs > k1 && rs > x {
+					return encodeRuns(w, n, vb, nulls, r.runs()) // PROTOTYPE (leaf_runs.go)
 				}
 				if x > k1 {
 					return encodeFORX(w, n, vb, nulls, r) // PROTOTYPE (leaf_forx.go)

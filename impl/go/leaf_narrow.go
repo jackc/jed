@@ -277,9 +277,16 @@ func forSaving(n, w int, r forRange) int {
 	if x := forExcSaving(n, w, r); x > s {
 		s = x // PROTOTYPE (leaf_forx.go)
 	}
-	if r.rd != nil && len(r.rd.vals) == n {
-		if x := r.rd.saving(); x > s {
-			s = x // PROTOTYPE (leaf_runs.go)
+	if r.pos != nil {
+		if rd := r.pos.rd; rd != nil && len(rd.vals) == n {
+			if x := rd.saving(); x > s {
+				s = x // PROTOTYPE (leaf_runs.go)
+			}
+		}
+		if bk := r.pos.bk; bk != nil && bk.n == n {
+			if x := bk.saving(); x > s {
+				s = x // PROTOTYPE (leaf_blocks.go)
+			}
 		}
 	}
 	if s > 0 {
@@ -295,21 +302,59 @@ type forRange struct {
 	any      bool
 	lo2, hi2 uint64
 	two      bool
-	// PROTOTYPE (leaf_runs.go): rd keeps the column's runs, in runs mode, for ranges built over the
-	// rows in order.
+	// PROTOTYPE (leaf_runs.go, leaf_blocks.go): pos keeps the column's runs or blocks, in those
+	// modes, for ranges built over the rows in order. One pointer, so the range stays small.
+	pos *forPos
+}
+
+// forPos is a column's position-dependent measurements (runs, blocks).
+type forPos struct {
 	rd *runsAcc
+	bk *blocksAcc
+}
+
+func (p *forPos) clone() *forPos {
+	if p == nil {
+		return nil
+	}
+	return &forPos{rd: p.rd.clone(), bk: p.bk.clone()}
+}
+
+// runs and blocks are the range's runs and blocks accumulators, nil when not kept.
+func (r *forRange) runs() *runsAcc {
+	if r.pos == nil {
+		return nil
+	}
+	return r.pos.rd
+}
+
+func (r *forRange) blocks() *blocksAcc {
+	if r.pos == nil {
+		return nil
+	}
+	return r.pos.bk
 }
 
 // addNull records a NULL row (only runs keep NULLs: they take an offset slot in their run).
 func (r *forRange) addNull() {
-	if r.rd != nil {
-		r.rd.push(0, false)
+	if p := r.pos; p != nil {
+		if p.rd != nil {
+			p.rd.push(0, false)
+		}
+		if p.bk != nil {
+			p.bk.push(0, false)
+		}
 	}
 }
 
 func (r *forRange) add(v uint64) {
-	if r.rd != nil {
-		r.rd.push(v, true)
+	if p := r.pos; p != nil {
+		if p.rd != nil {
+			p.rd.push(v, true)
+		}
+		if p.bk != nil {
+			p.bk.push(v, true)
+		}
 	}
 	if !r.any {
 		r.lo, r.hi, r.any = v, v, true
@@ -729,9 +774,10 @@ func leafSizesOf(shape leafShape, rows []storedRow, items [][]dictItem, tabs []*
 func (sz *leafSizes) addRow(shape leafShape, pcap pageCap, key []byte, row storedRow) {
 	sz.n++
 	for j, fc := range shape.forCols {
-		if leafRuns != leafRunsOff {
-			// PROTOTYPE (leaf_runs.go): runs depend on where the row goes; measure the column again.
-			sz.fors[j].rd = nil
+		if leafPositional() {
+			// PROTOTYPE (leaf_runs.go, leaf_blocks.go): runs and blocks depend on where the row goes;
+			// measure the column again.
+			sz.fors[j].pos = nil
 			sz.forStale[j], sz.stale = true, true
 		}
 		if v := row[fc.col]; !v.IsNull() {
@@ -866,8 +912,8 @@ func (sz *leafSizes) removeRow(shape leafShape, pcap pageCap, key []byte, row st
 	sz.n--
 	for j, fc := range shape.forCols {
 		v := row[fc.col]
-		if leafRuns != leafRunsOff {
-			sz.fors[j].rd = nil // PROTOTYPE (leaf_runs.go): measured again below
+		if leafPositional() {
+			sz.fors[j].pos = nil // PROTOTYPE (leaf_runs.go): measured again below
 			sz.forStale[j], sz.stale = true, true
 		}
 		if v.IsNull() {
@@ -875,9 +921,9 @@ func (sz *leafSizes) removeRow(shape leafShape, pcap pageCap, key []byte, row st
 		}
 		sz.forCnt[j]--
 		r := &sz.fors[j]
-		if leafRuns != leafRunsOff {
+		if leafPositional() {
 			// PROTOTYPE (leaf_runs.go): measure the column again.
-			r.rd = nil
+			r.pos = nil
 			sz.forStale[j], sz.stale = true, true
 		} else if sz.forCnt[j] == 0 {
 			*r = forRange{}
