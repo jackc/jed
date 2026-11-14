@@ -178,12 +178,8 @@ func TestCompactionOfACompactFileIsAFixedPoint(t *testing.T) {
 	}
 }
 
-// unstamped is body with each page's stamp (header bytes 2-3) and checksum (12-15) zeroed when the
-// stamp prototype is on; body unchanged otherwise.
+// unstamped is body with each page's stamp (header bytes 2-3) and checksum (12-15) zeroed.
 func unstamped(body []byte) []byte {
-	if !pageTxidStamp {
-		return body
-	}
 	out := append([]byte(nil), body...)
 	for off := 0; off+compactPage <= len(out); off += compactPage {
 		clear(out[off+2 : off+4])

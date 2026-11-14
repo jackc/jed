@@ -165,13 +165,13 @@ export function incrOrphans(
   let all = inc.tree.slice();
   if (inc.known) {
     // The previous catalog chain is orphaned whole unless this commit kept it unrewritten
-    // (PROTOTYPE, deferred-interior.md §9.1).
+    // (deferred-interior.md §9.1).
     if (!write.catalogKept) all.push(...inc.catalog);
     all.push(...inc.gist, ...inc.manifest);
   }
   all.push(...db.freeChain);
   if (pending.length === 0) all.push(...inc.held);
-  // PROTOTYPE (deferred-interior.md §9.5): a retained interior is still live at the page the previous
+  // Deferral (deferred-interior.md §9.5): a retained interior is still live at the page the previous
   // snapshot's node holds, which the orphan walk reaches because it must descend through that node.
   if (write.retainedIds.length > 0) {
     const retained = new Set(write.retainedIds);

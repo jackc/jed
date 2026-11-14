@@ -274,7 +274,7 @@ function writePageIdentical(
       undefined,
       codec === null ? undefined : { root: mt.rootTag, freeList: mt.freeListTag },
     );
-    // PROTOTYPE (deferred-interior.md §9.3): the copy's interiors are as stale as the source's, so its
+    // Deferral (deferred-interior.md §9.3): the copy's interiors are as stale as the source's, so its
     // bootstrap meta carries the pinned generation's remap list; a backup cannot fold instead, since
     // it copies interior pages verbatim.
     if (mt.remap.size > 0) {

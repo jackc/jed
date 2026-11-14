@@ -1,28 +1,21 @@
 package jed
 
-// PROTOTYPE (spec/design/deferred-interior.md): deferred interior pages.
+// Deferred interior pages (spec/fileformat/format.md *Remap list*, *Deferral*; v53;
+// spec/design/deferred-interior.md §9).
 //
-// A copy-on-write commit rewrites every interior page above a changed leaf, and the catalog page that
-// holds the tree's root pointer. With JED_DEFER_INTERIOR=on a commit writes only the nodes whose own
-// content changed. An interior node whose only change is which page a child lives at keeps its page;
-// the meta page records "in interior page P, the child pointer in slot i now names page C" in a remap
-// list. Readers apply it as they read an interior's child pointers. When the list would overflow, the
-// commit folds: every stale interior and its ancestors are written fresh and the list empties.
-//
-// This is §9 of the design doc -- the ratified byte layout, keyed by (parent page, slot) -- not the
-// earlier prototype, which keyed entries globally by the child's on-disk page and therefore had to
-// hold those pages off the free list (§8.3). A (parent, slot) entry dies in the commit that orphans
-// its parent, so nothing is held. Go-only, no format version bump: v53 lands it with the narrow
-// manifest and the page stamp.
+// A copy-on-write commit would rewrite every interior page above a changed leaf, and the catalog page
+// that holds the tree's root pointer. A v53 commit writes only the nodes whose own content changed. An
+// interior node whose only change is which page a child lives at keeps its page; the meta page records
+// "in interior page P, the child pointer in slot i now names page C" in a remap list. Readers apply it
+// as they read an interior's child pointers. When the list would overflow, the commit folds: every
+// stale interior and its ancestors are written fresh and the list empties. An entry dies in the commit
+// that orphans its parent, so nothing is held off the free list.
 
 import (
 	"encoding/binary"
 	"os"
 	"sort"
 )
-
-// deferInterior turns the prototype on.
-var deferInterior = os.Getenv("JED_DEFER_INTERIOR") == "on"
 
 // remapEntrySize is one entry's bytes (deferred-interior.md §9.2): parent u32, slot u16, page u32,
 // and in an encrypted file the 16-byte AEAD tag of page, since every pointer binds the page it names.
@@ -57,7 +50,7 @@ func remapReserveFor(ps int, encrypted bool) int {
 // fixed by the format, not by the meta: there is no marker, and a slot with no entries carries a zero
 // region and remap_entries = 0.
 func deferOn(ps int, encrypted bool) bool {
-	return deferInterior && remapCapFor(ps, encrypted) > 0
+	return remapCapFor(ps, encrypted) > 0
 }
 
 // remapKey names one child pointer: slot slot of the interior page parent (§9.1).

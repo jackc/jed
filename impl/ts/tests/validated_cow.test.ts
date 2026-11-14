@@ -101,9 +101,10 @@ test("incomplete equal-txid sibling cannot become the durability floor", () => {
     const root = dv.getUint32(20, false);
     dv.setUint32(40, 1, false);
     dv.setUint32(64, root, false);
-    dv.setBigUint64(
+    // A v53 entry is the page's own header CRC-32; off by one, so the slot parses but never validates.
+    dv.setUint32(
       68,
-      crc64Update(0n, image.subarray(root * pageSize, (root + 1) * pageSize)) ^ 1n,
+      (new DataView(image.buffer).getUint32(root * pageSize + 12, false) ^ 1) >>> 0,
       false,
     );
     dv.setUint32(32, metaChecksum(bad), false);

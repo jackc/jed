@@ -29,12 +29,11 @@ var incrVerify = os.Getenv("JED_INCR_VERIFY") == "on"
 // (leaf_sym.go) keeps pages off the free list by rules of its own, so under it the commit falls back
 // to the compact_growth rebuild.
 //
-// The deferred-interior prototype (remap.go) runs alongside this rule: its retained interiors are
+// Deferred interiors (format v53, remap.go) run alongside this rule: its retained interiors are
 // withheld from the list the way the batch's pages are (incrementalWrite.retainedIDs). Its entries,
 // keyed by (parent page, slot), die in the commit that orphans their parent, so they hold no page off
 // the list (deferred-interior.md §9.5) -- the held set the earlier global keying needed, and the bug
 // it caused (§8.3), are gone.
-// JED_DEFER_INTERIOR remains a research switch: §6 there lists the gaps that are still open.
 func incrOn() bool { return !leafSym && !leafSymCol }
 
 // reclaimWalks counts reachability rebuilds of file commits (test observability).
@@ -156,7 +155,7 @@ func (st *storage) incrOrphans(write incrementalWrite, pending []manifestEntry) 
 	in := st.incr
 	all := append([]uint32(nil), in.tree...)
 	keySet := make(map[uint32]bool, len(write.retainedIDs))
-	// PROTOTYPE (remap.go): a retained interior is still live at the page the previous snapshot's node holds, which the
+	// Deferral (remap.go): a retained interior is still live at the page the previous snapshot's node holds, which the
 	// orphan walk reports because it has to descend through that node.
 	for _, p := range write.retainedIDs {
 		keySet[p] = true

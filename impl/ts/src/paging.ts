@@ -55,7 +55,7 @@ export class SharedPaging {
   // (prefetchSteps), so the synchronous from-scratch serializer finds them without a read under an
   // asynchronous codec or device (spec/design/ts-runtime.md §11.1). null outside a rewrite.
   private prefetched: Map<number, Uint8Array> | null = null;
-  // PROTOTYPE (spec/design/deferred-interior.md §9): the committed generation's remap list, which
+  // Deferral (spec/design/deferred-interior.md §9): the committed generation's remap list, which
   // interior reads of the live generation resolve through, and the catalog chain it committed, which a
   // deferring commit keeps when its bytes are unchanged. Both are set when an engine is loaded from a
   // selected meta (the chain forgotten: another process may have rewritten it) and by every commit.

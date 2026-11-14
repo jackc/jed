@@ -1282,11 +1282,9 @@ def verify_integrity(goldens)
   verify_integrity_registry(reports)
   goldens.each do |fx|
     image = File.binread(File.join(fixtures_dir, fx[:file]))
-    with_fixture_layout(fx) do # read in the layout the golden declares (verify.rb)
-      %w[quick full].each do |level|
-        report = IntegrityCheck.new(image, level: level, max_findings: 0, constraints: level == "full").run
-        fail!("#{fx[:file]}: #{level} integrity check reports #{report[:findings].first}") unless report[:findings].empty?
-      end
+    %w[quick full].each do |level|
+      report = IntegrityCheck.new(image, level: level, max_findings: 0, constraints: level == "full").run
+      fail!("#{fx[:file]}: #{level} integrity check reports #{report[:findings].first}") unless report[:findings].empty?
     end
   end
 end

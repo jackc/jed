@@ -17,9 +17,10 @@ An ordinary incremental commit performs:
 
 1. Allocate and encode dirty tree, overflow, catalog, and free-list pages while preserving
    the previous snapshot and its recovery dependencies.
-2. Write those pages to their final locations. Compute a CRC-64/ECMA-182 digest of each
-   complete encoded page, including its existing CRC-32 field. Sort the `(page, digest)`
-   entries by increasing page number.
+2. Write those pages to their final locations. Record each page's manifest identity -- since v53 its
+   own header CRC-32, copied (an encrypted page's CRC-32 of its ciphertext); through v52 a
+   CRC-64/ECMA-182 of the complete encoded page (format.md *Commit manifest*). Sort the
+   `(page, digest)` entries by increasing page number.
 3. Write any manifest overflow pages. Small manifests fit entirely in the unused part of
    the existing meta page; large transactions use a page chain, without a fixed manifest
    capacity or a reserved region outside the ordinary allocator.
@@ -100,8 +101,9 @@ depend on one another, so all cores use this monotone planning algorithm:
    high-water if necessary. Exclude those ids from the prospective persisted free list and
    the safe pool used to serialize that list.
 3. Run ordinary free-list serialization. Let `N` be the number of dirty body pages plus
-   the resulting free-list pages, `I = floor((page_size - 64) / 12)`, and
-   `O = floor((page_size - 32) / 12)`.
+   the resulting free-list pages, `I` the inline manifest capacity (format.md *Commit manifest*:
+   `floor((page_size - 64 - 10·cap) / 8)` in a plaintext v53 file), and
+   `O = floor((page_size - 32) / 8)`.
 4. Set `required = ceil(max(0, N - I) / O)`. If `required > M`, retry the plan with
    `M = required`. Otherwise keep the plan. Do not shrink `M`.
 
@@ -174,7 +176,7 @@ and the manifest of the newest meta must vouch for every page written since that
 Each durable file domain (the main file, each writable file attachment) keeps two facts in memory:
 
 - the **floor**: the newest generation known durable, and the meta slot that holds it;
-- the **pending set**: the page id and CRC-64 digest of every body page (tree, catalog, overflow,
+- the **pending set**: the page id and manifest identity of every body page (tree, catalog, overflow,
   GiST, and free-list pages — never meta or manifest pages) written by a commit after the floor.
 
 The rules bind every commit that begins with a non-empty pending set, whatever its own handle's
@@ -223,7 +225,7 @@ generation (in the slot it was written to) and the pending set empties. The flus
 - **A credential change** in an encrypted database: its key-block barriers are whole-file syncs,
   so the first of them flushes the pending batch ([encryption.md](encryption.md) §5).
 - **The batch cap.** When a commit leaves the pending set with at least
-  `I = floor((page_size − 64) / 12)` entries — the inline manifest capacity (§2) — the batch ends
+  `I` entries — the inline manifest capacity (§2; format.md *Commit manifest*) — the batch ends
   with it and a flush follows. The cap bounds a pending commit's manifest, the pages recovery
   validates, and the reuse that rule 3 defers, to about one page's worth of entries; at 4 KiB pages
   a one-row commit dirties three or four pages, so one barrier serves about a hundred commits.

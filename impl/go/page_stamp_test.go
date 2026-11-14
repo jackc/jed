@@ -10,10 +10,6 @@ import (
 // The window check is the subtle part of the stamp (manifest-crc32.md §2.1): it compares low-16-bit
 // stamps against a txid window that may straddle a 2^16 boundary.
 func TestStampWindowContains(t *testing.T) {
-	saved := pageTxidStamp
-	pageTxidStamp = true
-	defer func() { pageTxidStamp = saved }()
-
 	cases := []struct {
 		name          string
 		floor, newest uint64
@@ -43,27 +39,11 @@ func TestStampWindowContains(t *testing.T) {
 	}
 }
 
-func TestStampOffIsV52(t *testing.T) {
-	saved := pageTxidStamp
-	pageTxidStamp = false
-	defer func() { pageTxidStamp = saved }()
-	if stampOf(12345) != 0 {
-		t.Fatal("an unstamped page must keep the v52 reserved zero")
-	}
-	if !(stampWindow{floor: 1, newest: 2}).contains(999) {
-		t.Fatal("with the stamp off the window must admit every page")
-	}
-}
-
 // TestStampIsAnIndependentDetector forges the one case a narrow manifest alone cannot catch: a listed
 // page that carries an older commit's stamp but whose content CRC-32 the manifest entry agrees with.
 // The stamp must reject it; with the stamp check disabled (the zero window) the same forged file must
 // validate, which proves the rejection is the stamp's and not the CRC's.
 func TestStampIsAnIndependentDetector(t *testing.T) {
-	savedStamp, savedNarrow := pageTxidStamp, manifestCRC32
-	pageTxidStamp, manifestCRC32 = true, true
-	defer func() { pageTxidStamp, manifestCRC32 = savedStamp, savedNarrow }()
-
 	const ps = 4096
 	path := filepath.Join(t.TempDir(), "stamp.jed")
 	db, err := create(path, databaseOptions{PageSize: ps, noSync: true})

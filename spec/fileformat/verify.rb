@@ -27,7 +27,8 @@ require "zlib"
 # Exit 0 = all fixtures conform; nonzero = mismatch (prints the offending case).
 
 MAGIC = "JEDB".b
-VERSION = 52 # v52: the compact leaf (format.md "Leaf node", leaf-structural.md) — a leaf payload leads with a
+VERSION = 53 # v53: deferred interior pages, narrow commit-manifest entries and the page stamp (format.md
+# "Version scope", deferred-interior.md §9, manifest-crc32.md). v52: the compact leaf (format.md "Leaf node", leaf-structural.md) — a leaf payload leads with a
 # flags byte and every leaf directory entry is a u16; a table column that is a leading key-derivable
 # primary-key member has no region; a fixed-key table tree stores its key length once and no key
 # directory; an inline text / bytea / json leaf value is the tag 0x05 and its bytes; a leaf may store
@@ -225,29 +226,20 @@ ENC_KEY = ("\x4A" * 32).b # the goldens' host key (kdf 2)
 def tag_len = $enc ? TAG_LEN : 0
 def first_body = $enc ? ENC_FIRST_BODY : ROOT_PAGE
 
-# --- The v53 layout, ahead of v53 (deferred-interior.md §9, manifest-crc32.md §2) -------------------
-# Until v53 is a real format version the Go core writes it behind three switches and no version bump,
-# so this reader takes the layout from the same environment variables. The simulator runs this file
-# as a subprocess of a sweep that set them, so the independent checker reads what the core wrote. At
-# v53 each becomes unconditional and the version byte decides. The narrow-manifest bit (offset 40's top
-# bit) is self-describing and needs no switch.
-# A fixture declares its own layout instead (`deferred:`, `stamped:`), so the v52 fixtures and the
-# deferred-interior ones verify side by side whatever the environment says.
-DEFER_INTERIOR_ENV = ENV["JED_DEFER_INTERIOR"] == "on"
-PAGE_TXID_STAMP_ENV = ENV["JED_PAGE_TXID_STAMP"] == "on"
-$defer_interior = DEFER_INTERIOR_ENV
-$page_txid_stamp = PAGE_TXID_STAMP_ENV
+# --- v53: the remap list, narrow manifest entries and the page stamp (format.md *Commit manifest*,
+# *Remap list*, *Page header*; deferred-interior.md §9, manifest-crc32.md) -----------------------------
+# The txid every page the writer seals carries at header offset 2 (format.md *Page header*): the
+# txid of the commit writing it. build_image sets it from the image's txid; the hand-built commit
+# histories set it for each commit they write.
+$stamp_txid = TXID
 
-# Run the block under a fixture's declared layout, restoring the environment's afterwards.
-def with_fixture_layout(fx)
-  $defer_interior = fx[:deferred] ? true : false
-  $page_txid_stamp = fx[:stamped] ? true : false
+def with_stamp(txid)
+  saved = $stamp_txid
+  $stamp_txid = txid
   yield
 ensure
-  $defer_interior = DEFER_INTERIOR_ENV
-  $page_txid_stamp = PAGE_TXID_STAMP_ENV
+  $stamp_txid = saved
 end
-MANIFEST_NARROW_FLAG = 1 << 31
 
 # The meta's manifest area [lo, hi): after the header (and an encrypted meta's tags), before an
 # encrypted meta's reserve.
@@ -262,13 +254,12 @@ def remap_cap(ps, encrypted)
   ((hi - lo) / 3) / remap_entry_size(encrypted)
 end
 
-def remap_reserve(ps, encrypted) = $defer_interior ? remap_entry_size(encrypted) * remap_cap(ps, encrypted) : 0
+def remap_reserve(ps, encrypted) = remap_entry_size(encrypted) * remap_cap(ps, encrypted)
 
 # The meta's remap list (§9.2-§9.3), keyed by [parent, slot] => [page, tag]; nil when the slot is
-# structurally invalid. Without the deferred layout offset 60 is reserved zero, as through v52.
+# structurally invalid.
 def decode_remap(m, ps, encrypted, first, page_count)
   count = m.byteslice(60, 4).unpack1("N")
-  return(count.zero? ? {} : nil) unless $defer_interior
   return nil if count > remap_cap(ps, encrypted)
 
   size = remap_entry_size(encrypted)
@@ -297,7 +288,7 @@ end
 # The stamp window (manifest-crc32.md §2.1): a page listed by a manifest must carry the low 16 bits of
 # a txid in (floor, newest]. An empty or inverted window, or one of 2^16 or more, admits every stamp.
 def stamp_in_window?(stamp, floor, newest)
-  return true unless $page_txid_stamp && floor && newest > floor
+  return true unless floor && newest > floor
 
   span = newest - floor
   return true if span >= 1 << 16
@@ -306,8 +297,8 @@ def stamp_in_window?(stamp, floor, newest)
   d >= 1 && d <= span
 end
 
-# The stamp a manifest-overflow page written by the commit at txid carries (0 without stamping).
-def stamp_of(txid) = $page_txid_stamp ? txid & 0xFFFF : 0
+# The stamp a page written by the commit at txid carries.
+def stamp_of(txid) = txid & 0xFFFF
 
 # The child pointers of an interior page, resolved through the selected meta's remap list: one lookup
 # per slot, never transitive (§9.1). Returns [page, tag] pairs (tag nil in plaintext) so a walker can
@@ -388,6 +379,7 @@ def seal_body(index, type, count, nxt, payload, flags: 0)
   body = "\x00".b * (ps - RESERVE)
   body.setbyte(0, type)
   body.setbyte(1, flags)
+  body[2, 2] = [stamp_of($stamp_txid)].pack("n") # v53: the page stamp, sealed with the page
   body[4, 4] = u32(count)
   body[8, 4] = u32(nxt)
   lead = [PAGE_CATALOG, PAGE_OVERFLOW, 7].include?(type) ? tag_of(nxt) : "".b
@@ -2158,19 +2150,16 @@ COW_FIXTURES = [
   ["invalid_free_list", :invalid_free_list, 0],
   ["bad_padding", :bad_padding, 0]
 ].map do |name, mutation, orphans|
-  accepted = [:valid, :empty_tail].include?(mutation)
+  # v53: a manifest need not list the catalog root (a commit may keep its chain -- format.md
+  # *Deferral*), so a manifest that omits it describes a valid generation.
+  accepted = [:valid, :empty_tail, :missing_root].include?(mutation)
   { file: "cow_#{name}.jed", page_size: 256, tables: [accepted ? COW_NEW_TABLE : COW_OLD_TABLE],
     cow: mutation, cow_orphans: orphans, expected_txid: accepted ? 2 : 1,
     expected_open_error: mutation == :invalid_free_list ? "invalid free-list entry" : nil }
 end.freeze
 
-# Deferred-interior commit histories (../design/deferred-interior.md §9; owed by §9.9). PROTOTYPE:
-# written in the v53 remap layout ahead of v53 (`deferred: true`). A reader without that layout
-# rejects every slot carrying entries: cow_deferred_retained opens through the base generation in
-# slot 1; cow_deferred_fold's newest slot has an empty list, a zero region that a v52 reader takes for
-# padding, so it opens correctly at txid 3; overwrite and retire carry entries in both slots and open
-# nowhere until a core reads the layout (Go under JED_DEFER_INTERIOR=on; Rust and TS list them as
-# unopenable for now).
+# Deferred-interior commit histories (format.md *Remap list*, *Deferral*; ../design/deferred-interior.md
+# §9.9), each commit's pages stamped with its txid.
 #
 # The base is a height-2 tree at page size 256: root I34 over interiors I21 (leaves 2-20, rows 1-57)
 # and I33 (leaves 22-32, rows 58-90), catalog at 35. An edited row keeps every leaf boundary, so a
@@ -2202,7 +2191,7 @@ DEFERRED_FIXTURES = [
   # with it while I33's survives, and the retained root keys (34, 0) to the new I21.
   ["retire", { 40 => DEFERRED_Y[40], 70 => DEFERRED_Y[70] }, 3]
 ].map do |name, edits, txid|
-  { file: "cow_deferred_#{name}.jed", page_size: 256, deferred: true, deferred_history: name.to_sym,
+  { file: "cow_deferred_#{name}.jed", page_size: 256, deferred_history: name.to_sym,
     tables: [deferred_edit(edits)], expected_txid: txid }
 end.freeze
 
@@ -2279,8 +2268,8 @@ ENC_DEFERRED_FIXTURES = [
   # binds the old leaf's tag -- a reader that took the tag from the pointer would fail authentication.
   # One commit (txid 2, slot 0), so slot 1 keeps the base generation and every core opens it with the
   # goldens' key. The prefix is what the cores' every-golden tests key the credential on.
-  { file: "encrypted_cow_deferred_retained.jed", page_size: 1024, deferred: true,
-    deferred_history: :encrypted_retained, encrypted_history: true,
+  { file: "encrypted_cow_deferred_retained.jed", page_size: 1024,
+    deferred_history: :encrypted_retained,
     tables: [ENC_PK_TABLE.merge(rows: ENC_PK_TABLE[:rows].map { |id, v| [id, id == 100 ? 1001 : v] })],
     expected_txid: 2 }
 ].freeze
@@ -4571,6 +4560,7 @@ def write_page(image, ps, index, type, item_count, next_page, payload, flags: 0)
   off = index * ps
   image[off, 1] = [type].pack("C")
   image[off + 1, 1] = [flags].pack("C")
+  image[off + 2, 2] = [stamp_of($stamp_txid)].pack("n") # v53: the page stamp, under the checksum
   image[off + 4, 4] = u32(item_count)
   image[off + 8, 4] = u32(next_page)
   image[off + PAGE_HEADER, payload.bytesize] = payload unless payload.empty?
@@ -4896,6 +4886,8 @@ def build_image(types, sequences, tables, page_size, collations = [], start_page
 
   ps = page_size
   cap = ps - PAGE_HEADER - ($enc ? RESERVE : 0)
+  # Every page carries the stamp of the txid its metas name (format.md *Page header*).
+  $stamp_txid = $enc ? $enc[:txid] : txid
   # Composite types in scope for the recursive value codec, keyed by lowercased name (§4).
   $ctypes = types.to_h { |t| [t[:name], t[:fields]] }
   sorted = tables.sort_by { |t| t[:name] }
@@ -5027,43 +5019,60 @@ def refresh_body_crc(image, ps, index)
 end
 
 def refresh_manifest_chain_digest(image, ps, chain)
-  digest = chain.reduce(0) { |crc, index| crc64(u32(index) + image.byteslice(index * ps, ps), crc) }
+  digest = chain.reduce(0) { |crc, index| Zlib.crc32(u32(index) + image.byteslice(index * ps, ps), crc) }
   image[48, 8] = u64(digest)
   refresh_meta_crc(image, ps, 0)
+end
+
+# A listed plaintext page's manifest entry (format.md *Commit manifest*): its index and its own header
+# checksum.
+def manifest_entry(image, ps, index) = u32(index) + image.byteslice(index * ps + 12, 4)
+
+# The inline manifest capacity of a plaintext meta (format.md *Commit manifest*).
+def inline_capacity(ps)
+  lo, hi = manifest_area(ps, false)
+  (hi - lo - remap_reserve(ps, false)) / 8
 end
 
 def cow_fixture_image(fx)
   ps = fx[:page_size]
   old = build_image([], [], [COW_OLD_TABLE], ps)
   old_count = old.bytesize / ps
-  fresh = build_image([], [], [COW_NEW_TABLE], ps, [], start_page: old_count)
+  # The second commit (txid 2) writes the new leaf and catalog, stamped with its txid.
+  fresh = build_image([], [], [COW_NEW_TABLE], ps, [], start_page: old_count, txid: 2)
   root = fresh.byteslice(20, 4).unpack1("N")
   image = old + fresh.byteslice(old.bytesize, fresh.bytesize - old.bytesize)
   dirty = (old_count...(image.bytesize / ps)).to_a
-  fx[:cow_orphans].times do |i|
-    index = image.bytesize / ps
-    image << "\x00".b * ps
-    write_page(image, ps, index, PAGE_OVERFLOW, 1, 0, [i + 1].pack("C"))
-    dirty << index
+  per = (ps - 32) / 8
+  inline_count = 0
+  chain = []
+  with_stamp(2) do
+    fx[:cow_orphans].times do |i|
+      index = image.bytesize / ps
+      image << "\x00".b * ps
+      write_page(image, ps, index, PAGE_OVERFLOW, 1, 0, [i + 1].pack("C"))
+      dirty << index
+    end
+    entries = dirty.map { |index| manifest_entry(image, ps, index) }
+    inline_count = [entries.length, inline_capacity(ps)].min
+    overflow_count = (entries.length - inline_count + per - 1) / per
+    overflow_count += 1 if fx[:cow] == :empty_tail
+    chain = Array.new(overflow_count) { |i| image.bytesize / ps + i }
+    image << "\x00".b * (overflow_count * ps)
+    remaining = entries.drop(inline_count)
+    chain.each_with_index do |index, ordinal|
+      chunk = remaining.shift(per)
+      payload = u64(2) + u32(ordinal) + u32(0) + chunk.join.b
+      write_page(image, ps, index, 8, chunk.length, chain[ordinal + 1] || 0, payload)
+    end
+    # The new state's live pages are exactly its freshly appended leaf + catalog pages; the orphan
+    # writes and the manifest chain are not reachable.
+    write_meta(image, ps, 0, ps, 2, root, image.bytesize / ps, fresh.bytesize / ps - old_count)
+    image[36, 12] = u32(chain.first || 0) + u32(entries.length) + u32(chain.length)
+    image[64, inline_count * 8] = entries.first(inline_count).join.b
+    refresh_manifest_chain_digest(image, ps, chain)
   end
-  entries = dirty.map { |index| u32(index) + u64(crc64(image.byteslice(index * ps, ps))) }
-  inline_count = [entries.length, (ps - 64) / 12].min
-  overflow_count = (entries.length - inline_count + (ps - 32) / 12 - 1) / ((ps - 32) / 12)
-  overflow_count += 1 if fx[:cow] == :empty_tail
-  chain = Array.new(overflow_count) { |i| image.bytesize / ps + i }
-  image << "\x00".b * (overflow_count * ps)
-  remaining = entries.drop(inline_count)
-  chain.each_with_index do |index, ordinal|
-    chunk = remaining.shift((ps - 32) / 12)
-    payload = u64(2) + u32(ordinal) + u32(0) + chunk.join.b
-    write_page(image, ps, index, 8, chunk.length, chain[ordinal + 1] || 0, payload)
-  end
-  # The new state's live pages are exactly its freshly appended leaf + catalog pages; the orphan
-  # writes and the manifest chain are not reachable.
-  write_meta(image, ps, 0, ps, 2, root, image.bytesize / ps, fresh.bytesize / ps - old_count)
-  image[36, 12] = u32(chain.first || 0) + u32(entries.length) + u32(chain.length)
-  image[64, inline_count * 12] = entries.first(inline_count).join.b
-  refresh_manifest_chain_digest(image, ps, chain)
+  entries_count = dirty.length
 
   # Reseal outer checksums for malformed-but-checksummed structural cases. This
   # prevents a test from passing merely because it rejected an unrelated CRC.
@@ -5090,14 +5099,14 @@ def cow_fixture_image(fx)
     refresh_body_crc(image, ps, chain.last)
     refresh_manifest_chain_digest(image, ps, chain)
   when :duplicate_entry
-    image[76, 12] = image.byteslice(64, 12)
+    image[72, 8] = image.byteslice(64, 8)
     refresh_meta_crc(image, ps, 0)
   when :out_of_bounds
-    image[76, 4] = u32(image.bytesize / ps)
+    image[72, 4] = u32(image.bytesize / ps)
     refresh_meta_crc(image, ps, 0)
   when :missing_root
     image[40, 4] = u32(1)
-    image[76, 12] = "\x00".b * 12
+    image[72, 8] = "\x00".b * 8
     refresh_meta_crc(image, ps, 0)
   when :root_manifest
     image[20, 4] = u32(chain.first)
@@ -5108,11 +5117,11 @@ def cow_fixture_image(fx)
   when :invalid_free_list
     index = image.bytesize / ps
     image << "\x00".b * ps
-    write_page(image, ps, index, 7, 1, 0, u32(old_count))
+    with_stamp(2) { write_page(image, ps, index, 7, 1, 0, u32(old_count)) }
     image[24, 4] = u32(index + 1)
     image[28, 4] = u32(index)
-    image[40, 4] = u32(entries.length + 1)
-    image[64 + entries.length * 12, 12] = u32(index) + u64(crc64(image.byteslice(index * ps, ps)))
+    image[40, 4] = u32(entries_count + 1)
+    image[64 + entries_count * 8, 8] = manifest_entry(image, ps, index)
     refresh_meta_crc(image, ps, 0)
   when :bad_padding
     image.setbyte(ps - 1, 1)
@@ -5134,47 +5143,55 @@ end
 
 # Page `index` of a from-scratch build of `table`, which must have the base's page shape: the bytes a
 # core writes for that node once the edit is applied (a node's bytes are a function of its content).
-def deferred_page(table, index)
+def deferred_page(table, index, txid)
   base = build_image([], [], [DEFERRED_BASE], 256)
   image = build_image([], [], [table], 256)
   raise "an edit moved a leaf boundary" unless deferred_shape(image, 256) == deferred_shape(base, 256)
 
-  image.byteslice(index * 256, 256)
+  restamp(image.byteslice(index * 256, 256), txid)
+end
+
+# A plaintext page stamped for the commit at txid, its checksum refreshed.
+def restamp(page, txid)
+  page = page.dup
+  page[2, 2] = [stamp_of(txid)].pack("n")
+  page[12, 4] = u32(page_crc(page))
+  page
 end
 
 # Interior page `index` of the edited table with the pointer in `slot` replaced: a node written fresh
 # names each child where it now lives.
-def deferred_interior(table, index, moves)
-  page = deferred_page(table, index).dup
+def deferred_interior(table, index, moves, txid)
+  page = deferred_page(table, index, txid).dup
   moves.each { |slot, child| page[PAGE_HEADER + slot * 4, 4] = u32(child) }
   page[12, 4] = u32(page_crc(page))
   page
 end
 
 # The catalog chain naming `root` as t's data root (one page at this size), at `index`.
-def deferred_catalog(table, index, root)
+def deferred_catalog(table, index, root, txid)
   entries = ["\x00".b + table_entry_bytes(table, root, [], table[:rows].length)] + statistics_entries(table)
   layout = catalog_layout(entries, 256 - PAGE_HEADER)
   raise "the catalog should fit one page" unless layout.size == 1
 
   page = "\x00".b * 256
-  write_page(page, 256, 0, PAGE_CATALOG, layout[0][:count], 0, layout[0][:payload])
+  with_stamp(txid) { write_page(page, 256, 0, PAGE_CATALOG, layout[0][:count], 0, layout[0][:payload]) }
   [index, page]
 end
 
-# Publish a deferred-interior commit into `slot`: the wide manifest listing `listed` (each page's
-# CRC-64), then the remap list (deferred-interior.md §9.2) -- remap_entries at offset 60, entries
+# Publish a deferred-interior commit into `slot`: the manifest listing `listed` (each page's own
+# checksum), then the remap list (format.md *Remap list*) -- remap_entries at offset 60, entries
 # ascending by (parent, slot) from the start of the region.
 def write_deferred_meta(image, ps, slot, txid, root, live, listed, remap)
   write_meta(image, ps, slot, ps, txid, root, image.bytesize / ps, live)
   off = slot * ps
   lo, hi = manifest_area(ps, false)
   inline_hi = hi - remap_reserve(ps, false)
-  entries = listed.sort.map { |index| u32(index) + u64(crc64(image.byteslice(index * ps, ps))) }
-  raise "manifest does not fit inline" if entries.size * 12 > inline_hi - lo
+  entries = listed.sort.map { |index| manifest_entry(image, ps, index) }
+  raise "manifest does not fit inline" if entries.size * 8 > inline_hi - lo
 
   image[off + 40, 4] = u32(entries.size)
-  image[off + lo, entries.size * 12] = entries.join.b
+  image[off + lo, entries.size * 8] = entries.join.b
   image[off + 60, 4] = u32(remap.size)
   at = off + inline_hi
   remap.sort.each do |(parent, child_slot), page|
@@ -5202,29 +5219,29 @@ def deferred_fixture_image(fx)
   y40 = deferred_edit(40 => DEFERRED_Y[40])
   case fx[:deferred_history]
   when :retained
-    leaf = append_page(image, ps, deferred_page(y40, 15))
+    leaf = append_page(image, ps, deferred_page(y40, 15, 2))
     write_deferred_meta(image, ps, 0, 2, catalog, live, [leaf], { [21, 13] => leaf })
   when :overwrite
-    first = append_page(image, ps, deferred_page(y40, 15))
+    first = append_page(image, ps, deferred_page(y40, 15, 2))
     write_deferred_meta(image, ps, 0, 2, catalog, live, [first], { [21, 13] => first })
-    second = append_page(image, ps, deferred_page(fx[:tables][0], 15))
+    second = append_page(image, ps, deferred_page(fx[:tables][0], 15, 3))
     write_deferred_meta(image, ps, 1, 3, catalog, live, [second], { [21, 13] => second })
   when :fold
-    first = append_page(image, ps, deferred_page(y40, 15))
+    first = append_page(image, ps, deferred_page(y40, 15, 2))
     write_deferred_meta(image, ps, 0, 2, catalog, live, [first], { [21, 13] => first })
     final = fx[:tables][0]
-    leaf = append_page(image, ps, deferred_page(final, 15))
-    i21 = append_page(image, ps, deferred_interior(final, 21, { 13 => leaf }))
-    root = append_page(image, ps, deferred_interior(final, 34, { 0 => i21 }))
-    index, page = deferred_catalog(final, image.bytesize / ps, root)
+    leaf = append_page(image, ps, deferred_page(final, 15, 3))
+    i21 = append_page(image, ps, deferred_interior(final, 21, { 13 => leaf }, 3))
+    root = append_page(image, ps, deferred_interior(final, 34, { 0 => i21 }, 3))
+    index, page = deferred_catalog(final, image.bytesize / ps, root, 3)
     append_page(image, ps, page)
     write_deferred_meta(image, ps, 1, 3, index, live, [leaf, i21, root, index], {})
   when :retire
     final = fx[:tables][0]
-    a = append_page(image, ps, deferred_page(final, 15))
-    b = append_page(image, ps, deferred_page(final, 26))
+    a = append_page(image, ps, deferred_page(final, 15, 2))
+    b = append_page(image, ps, deferred_page(final, 26, 2))
     write_deferred_meta(image, ps, 0, 2, catalog, live, [a, b], { [21, 13] => a, [33, 4] => b })
-    i21 = append_page(image, ps, deferred_interior(final, 21, { 13 => a }))
+    i21 = append_page(image, ps, deferred_interior(final, 21, { 13 => a }, 3))
     write_deferred_meta(image, ps, 1, 3, catalog, live, [i21], { [33, 4] => b, [34, 0] => i21 })
   when :encrypted_retained
     return encrypted_deferred_image(fx)
@@ -5282,8 +5299,10 @@ def encrypted_deferred_image(fx)
   edited_body = bodies[leaf][1]
 
   index = image.bytesize / ps
-  image << seal_body(index, PAGE_LEAF, edited_body.byteslice(4, 4).unpack1("N"), 0,
-                     edited_body.byteslice(PAGE_HEADER, ps - RESERVE - PAGE_HEADER))
+  image << with_stamp(2) do
+    seal_body(index, PAGE_LEAF, edited_body.byteslice(4, 4).unpack1("N"), 0,
+              edited_body.byteslice(PAGE_HEADER, ps - RESERVE - PAGE_HEADER))
+  end
   tag = $enc[:tags][index]
 
   base_meta = image.byteslice(ps, ps) # slot 1: the base generation, left in place
@@ -5300,7 +5319,7 @@ def encrypted_deferred_image(fx)
   m[64, 16] = base_meta.byteslice(64, 16) # the kept catalog root's tag
   lo, hi = manifest_area(ps, true)
   m[40, 4] = u32(1)
-  m[lo, 12] = u32(index) + u64(crc64(image.byteslice(index * ps, ps)))
+  m[lo, 8] = u32(index) + u32(Zlib.crc32(image.byteslice(index * ps, ps))) # the ciphertext's CRC-32
   m[60, 4] = u32(1)
   m[hi - remap_reserve(ps, true), 10 + TAG_LEN] = [root, slot, index].pack("NnN") + tag
   image[0, ps] = seal_meta(m, 0)
@@ -5501,15 +5520,13 @@ def valid_manifest?(image, ps, m, meta, floor = nil)
   digest = m.byteslice(48, 8).unpack1("Q>")
   encrypted = meta[:suite] == 1
   first = encrypted ? ENC_FIRST_BODY : ROOT_PAGE
-  # PROTOTYPE (manifest-crc32.md §2): the top bit of the count marks 8-byte entries -- the page id and
-  # its CRC-32 -- and a CRC-32 chain digest; otherwise 12-byte entries with a CRC-64.
-  narrow = (count & MANIFEST_NARROW_FLAG) != 0
-  count &= ~MANIFEST_NARROW_FLAG
-  esize = narrow ? 8 : 12
-  entry_pack = narrow ? "NN" : "NQ>"
-  chain_crc = narrow ? ->(data, crc) { Zlib.crc32(data, crc) } : ->(data, crc) { crc64(data, crc) }
-  # An encrypted meta's inline manifest follows its two tags and stops at its reserve (§6); under the
-  # deferred-interior layout the remap region takes the area's last third (deferred-interior.md §9.2).
+  # v53 (format.md *Commit manifest*): 8-byte entries -- the page id and its CRC-32 -- and a CRC-32
+  # chain digest in the low half of offset 48.
+  esize = 8
+  entry_pack = "NN"
+  chain_crc = ->(data, crc) { Zlib.crc32(data, crc) }
+  # An encrypted meta's inline manifest follows its two tags and stops at its reserve (§6); the remap
+  # region takes the area's last third (format.md *Remap list*).
   lo, hi = manifest_area(ps, encrypted)
   hi -= remap_reserve(ps, encrypted)
   return false if count + chain_count > meta[:page_count] - first
@@ -5528,7 +5545,7 @@ def valid_manifest?(image, ps, m, meta, floor = nil)
     return false unless page >= first && page < meta[:page_count] && !chain.include?(page)
     block = image.byteslice(page * ps, ps)
     # Header bytes 1-3: flags zero, and the stamp of the commit whose meta names the page, which always
-    # wrote it (manifest-crc32.md §2.1) -- zero without stamping, as through v52.
+    # wrote it (format.md *Commit manifest*).
     return false unless block.getbyte(0) == 8 && block.getbyte(1).zero? &&
                         block.byteslice(2, 2).unpack1("n") == stamp_of(meta[:txid])
     return false unless page_crc(block) == block.byteslice(12, 4).unpack1("N")
@@ -5547,28 +5564,28 @@ def valid_manifest?(image, ps, m, meta, floor = nil)
   return false unless page.zero? && remaining.zero? && chain_digest == digest
   ids = refs.map(&:first)
   return false unless ids == ids.sort.uniq && (ids & chain).empty?
-  # A deferring commit may keep its catalog chain, so its root need not be listed (§9.4).
-  return false if count.positive? && !$defer_interior && !ids.include?(meta[:root_page])
+  # The catalog root need not be listed -- a commit may keep its chain (format.md *Deferral*) -- but it
+  # and the free-list head are never manifest pages.
+  return false if chain.include?(meta[:root_page]) || chain.include?(meta[:free_head])
   return false if count.positive? && meta[:free_head].positive? && !ids.include?(meta[:free_head])
   return false unless refs.all? do |index, expected|
     next false unless index >= first && index < meta[:page_count]
     block = image.byteslice(index * ps, ps)
     # A listed encrypted page is ciphertext: its digest is the whole check (§6), and its stamp is
     # sealed. A plaintext page must also pass its own checksum and carry a stamp from the window.
-    next crc_of_listed(block, encrypted, narrow) == expected if encrypted
+    next crc_of_listed(block, encrypted) == expected if encrypted
 
     (1..7).cover?(block.getbyte(0)) && page_crc(block) == block.byteslice(12, 4).unpack1("N") &&
-      crc_of_listed(block, encrypted, narrow) == expected &&
+      crc_of_listed(block, encrypted) == expected &&
       stamp_in_window?(block.byteslice(2, 2).unpack1("n"), floor, meta[:txid])
   end
   meta[:protected] = ids + chain
   true
 end
 
-# The manifest identity of a listed page (manifest-crc32.md §2): the CRC-64 of its bytes in a wide
-# manifest; in a narrow one a plaintext page's own header checksum and an encrypted page's CRC-32.
-def crc_of_listed(block, encrypted, narrow)
-  return crc64(block) unless narrow
+# The manifest identity of a listed page (format.md *Commit manifest*): a plaintext page's own header
+# checksum, an encrypted page's CRC-32 of its ciphertext.
+def crc_of_listed(block, encrypted)
   return Zlib.crc32(block) if encrypted
 
   block.byteslice(12, 4).unpack1("N")
@@ -7096,10 +7113,8 @@ def generate
   dir = fixtures_dir
   Dir.mkdir(dir) unless Dir.exist?(dir)
   FIXTURES.each do |fx|
-    with_fixture_layout(fx) do
-      File.binwrite(File.join(dir, fx[:file]), fixture_image(fx))
-      puts "wrote #{fx[:file]} (#{fixture_image(fx).bytesize} bytes)"
-    end
+    File.binwrite(File.join(dir, fx[:file]), fixture_image(fx))
+    puts "wrote #{fx[:file]} (#{fixture_image(fx).bytesize} bytes)"
   end
   File.write(lz4_vectors_path, lz4_vectors_toml)
   File.write(encryption_vectors_path, encryption_vectors_toml)
@@ -7115,9 +7130,6 @@ def verify
   fail!("CRC64 self-test failed") unless crc64("123456789") == 0x6C40DF5F0B497347
 
   FIXTURES.each do |fx|
-    # Each fixture is read in the layout it declares (with_fixture_layout).
-    $defer_interior = fx[:deferred] ? true : false
-    $page_txid_stamp = fx[:stamped] ? true : false
     path = File.join(fixtures_dir, fx[:file])
     fail!("#{fx[:file]}: missing (run `ruby spec/fileformat/verify.rb --generate`)") unless File.exist?(path)
 
@@ -7191,8 +7203,6 @@ def verify
       fail!("#{fx[:file]}: statistics mismatch\n  got:  #{decoded[:statistics].inspect}\n  want: #{want_statistics.inspect}")
     end
   end
-  $defer_interior = DEFER_INTERIOR_ENV
-  $page_txid_stamp = PAGE_TXID_STAMP_ENV
 
   verify_lz4_vectors
   verify_encryption_vectors

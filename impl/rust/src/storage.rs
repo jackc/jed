@@ -902,7 +902,7 @@ impl TableStore {
         self.rows.root()
     }
 
-    /// PROTOTYPE (deferred-interior.md §9.4): fold this store's stale interiors ([`PMap::unstale`]).
+    /// Deferral (deferred-interior.md §9.4): fold this store's stale interiors ([`PMap::unstale`]).
     pub(crate) fn unstale(&mut self, parents: &std::collections::HashSet<u32>) {
         self.rows.unstale(parents);
     }

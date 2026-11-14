@@ -1210,7 +1210,7 @@ impl Storage {
                     &self.free_pages,
                 )));
             }
-            // PROTOTYPE (deferred-interior.md §9.4): defer interior pages when the plan fits the list,
+            // Deferral (deferred-interior.md §9.4): defer interior pages when the plan fits the list,
             // else fold -- write every stale interior fresh and publish an empty list. The decision
             // is a pure function of the committed list, the dirty-node structure, the committed free
             // list and the high-water, taken before allocation.
@@ -1326,7 +1326,7 @@ impl Storage {
             let due = self.incr_due();
             incr = Some((crate::incr_reclaim::IncrPlan { listed, due }, held));
         }
-        // PROTOTYPE (deferred-interior.md §9): the walks below read interiors from disk, so they need
+        // Deferral (deferred-interior.md §9): the walks below read interiors from disk, so they need
         // this commit's list; the committed one comes back if planning fails.
         let prev_remap = self.paging.remap();
         self.paging
@@ -1430,7 +1430,7 @@ impl Storage {
                 .expect("incr_active creates the state")
                 .tolerated = leaked;
         }
-        // PROTOTYPE (deferred-interior.md §9): the list and catalog chain this commit published.
+        // Deferral (deferred-interior.md §9): the list and catalog chain this commit published.
         self.paging
             .set_remap(write.remap.clone().unwrap_or_default());
         self.paging.set_cat(write.cat.clone());

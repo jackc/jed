@@ -2081,7 +2081,7 @@ func (r *simRunner) checkGrowth(i int, d *simDB, quiet bool) {
 		reclaimed = true
 	} else if quiet && d.high-d.free > max(compactMinPages, uint32(compactGrowth)*d.lacBound) {
 		reclaimed = true
-		// PROTOTYPE (remap.go): page ids that key a remap entry stay off the free list until a fold.
+		// Deferral (remap.go): page ids that key a remap entry stay off the free list until a fold.
 		// Deferred interiors need no allowance: an entry dies in the commit that orphans its parent, so
 		// it holds no page off the free list (deferred-interior.md §9.5).
 		if leaked := pc - 2 - live - free; pc < 2+live+free || leaked > written {

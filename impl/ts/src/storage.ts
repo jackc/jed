@@ -940,7 +940,7 @@ export class TableStore {
     return this.rows.rootNode();
   }
 
-  // unstale folds this store's stale interiors (PROTOTYPE, deferred-interior.md §9.4; remap.ts).
+  // unstale folds this store's stale interiors (deferred-interior.md §9.4; remap.ts).
   unstale(fold: (root: PNode | null) => PNode | null): void {
     this.rows.unstale(fold);
   }

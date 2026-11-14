@@ -1,6 +1,5 @@
-//! PROTOTYPE: deferred interior pages (spec/design/deferred-interior.md §9), behind
-//! `JED_DEFER_INTERIOR=on` and without a version bump, mirroring the Go core's `remap.go` function for
-//! function so the two write byte-identical files.
+//! Deferred interior pages (format v53; spec/design/deferred-interior.md §9), mirroring the Go core's
+//! `remap.go` function for function so the two write byte-identical files.
 //!
 //! A commit writes only the nodes whose own content changed. An interior whose only change is which
 //! page a child lives at keeps its page, and the meta records "in interior page P, the child pointer
@@ -39,7 +38,7 @@ pub(crate) fn capacity(ps: usize, encrypted: bool) -> usize {
 /// Whether a file of page size `ps` uses the deferred-interior layout. The layout is fixed by the
 /// format, not the meta: there is no marker, and a slot with no entries is a zero region.
 pub(crate) fn defer_on(ps: usize, encrypted: bool) -> bool {
-    commit_manifest::defer_interior() && capacity(ps, encrypted) > 0
+    capacity(ps, encrypted) > 0
 }
 
 /// The bytes the region takes from the end of the manifest area: 0 without the layout.

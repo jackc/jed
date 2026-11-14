@@ -325,25 +325,11 @@ fn damaged_fixtures_reproduce_their_reports() {
     }
 }
 
-/// The non-malformed goldens `open` rejects: a complete manifest whose free list frees its own
-/// dependencies (validated_cow_tests.rs), and the deferred-interior histories with remap entries in
-/// both meta slots, which this core cannot read until it implements the v53 remap layout
-/// (spec/design/deferred-interior.md §9; verify.rb DEFERRED_FIXTURES). Every other golden opens and
-/// checks clean, including the torn `cow_*` images, through recovery's fallback generation.
-///
-/// PROTOTYPE: the v53 switches move two of these. With `JED_DEFER_INTERIOR=on` the deferred histories
-/// open; with `JED_PAGE_TXID_STAMP=on` the newest slot of `cow_invalid_free_list` lists unstamped pages,
-/// so recovery falls back to its valid generation instead of failing on the free list.
+/// The non-malformed golden `open` rejects: a complete manifest whose free list frees its own
+/// dependencies (validated_cow_tests.rs). Every other golden opens and checks clean, including the
+/// torn `cow_*` images, through recovery's fallback generation.
 fn expected_unopenable() -> Vec<&'static str> {
-    let on = |name: &str| std::env::var(name).is_ok_and(|v| v == "on");
-    let mut out = Vec::new();
-    if !on("JED_DEFER_INTERIOR") {
-        out.extend(["cow_deferred_overwrite.jed", "cow_deferred_retire.jed"]);
-    }
-    if !on("JED_PAGE_TXID_STAMP") {
-        out.push("cow_invalid_free_list.jed");
-    }
-    out
+    vec!["cow_invalid_free_list.jed"]
 }
 
 /// The `full` skips of each golden that has any in the golden environment (integrity-check.md §3.5):
@@ -880,28 +866,18 @@ fn engine_written_constraints_check_clean() {
     );
 }
 
-/// PROTOTYPE (spec/design/deferred-interior.md §9): the Ruby reference writes the `cow_deferred_*`
-/// histories by hand (verify.rb `DEFERRED_FIXTURES`). Under `JED_DEFER_INTERIOR=on` this core must
-/// recover the same generation and rows as the Go core does and find nothing wrong; without the layout
-/// a slot carrying entries is invalid, so `retained` opens at its base generation, `fold`'s newest slot
-/// (an empty list) is a valid v52 slot, `overwrite` and `retire` open nowhere, and the encrypted history
-/// opens at its base. Mirrors impl/go `TestRemapRubyHistories` / `TestRemapRubyEncryptedHistory`.
+/// The Ruby reference writes the `cow_deferred_*` histories by hand (verify.rb `DEFERRED_FIXTURES`);
+/// this core must recover the same generation and rows as the Go core does and find nothing wrong.
+/// Mirrors impl/go `TestRemapRubyHistories` / `TestRemapRubyEncryptedHistory`.
 #[test]
 fn deferred_interior_ruby_histories() {
-    // The histories are written unstamped (verify.rb declares `stamped: false`), so under the stamp
-    // their newest slots fall outside the window and recovery falls back: this check is for the
-    // remap layout alone.
-    if std::env::var("JED_PAGE_TXID_STAMP").is_ok_and(|v| v == "on") {
-        return;
-    }
-    let layout = std::env::var("JED_DEFER_INTERIOR").is_ok_and(|v| v == "on");
     let pad = |id: i64, c: &str| format!("row-{id:02}-{}", c.repeat(48));
-    // (name, version with the layout, version without (None: no slot opens), rows with the layout)
-    let cases: [(&str, u64, Option<u64>, [(i64, &str); 3]); 4] = [
-        ("retained", 2, Some(1), [(40, "y"), (41, "x"), (70, "x")]),
-        ("overwrite", 3, None, [(40, "z"), (41, "x"), (70, "x")]),
-        ("fold", 3, Some(3), [(40, "y"), (41, "y"), (70, "x")]),
-        ("retire", 3, None, [(40, "y"), (41, "x"), (70, "y")]),
+    // (name, recovered version, rows)
+    let cases: [(&str, u64, [(i64, &str); 3]); 4] = [
+        ("retained", 2, [(40, "y"), (41, "x"), (70, "x")]),
+        ("overwrite", 3, [(40, "z"), (41, "x"), (70, "x")]),
+        ("fold", 3, [(40, "y"), (41, "y"), (70, "x")]),
+        ("retire", 3, [(40, "y"), (41, "x"), (70, "y")]),
     ];
     let options = IntegrityCheckOptions {
         constraints: true,
@@ -915,18 +891,10 @@ fn deferred_interior_ruby_histories() {
             .next()
             .unwrap_or_else(|| panic!("{sql}: no row"))
     };
-    for (name, with, without, rows) in cases {
+    for (name, want, rows) in cases {
         let file = format!("cow_deferred_{name}.jed");
         let image = std::fs::read(spec("fileformat/fixtures").join(&file)).unwrap();
         let opened = open_copy(&format!("deferred_{name}"), &image, None);
-        let want = if layout { Some(with) } else { without };
-        let Some(want) = want else {
-            assert!(
-                opened.is_err(),
-                "{file}: entries in both slots leave no slot to select"
-            );
-            continue;
-        };
         let db = opened.unwrap_or_else(|e| panic!("{file}: {e}"));
         assert_eq!(db.version(), want, "{file}: recovered version");
         assert_eq!(
@@ -934,15 +902,13 @@ fn deferred_interior_ruby_histories() {
             vec![jed::Value::Int(90), jed::Value::Int(4095)],
             "{file}"
         );
-        if layout {
-            for (id, c) in rows {
-                let sql = format!("SELECT pad = '{}' FROM t WHERE id = {id}", pad(id, c));
-                assert_eq!(
-                    cell(&db, &sql),
-                    vec![jed::Value::Bool(true)],
-                    "{file}: row {id}"
-                );
-            }
+        for (id, c) in rows {
+            let sql = format!("SELECT pad = '{}' FROM t WHERE id = {id}", pad(id, c));
+            assert_eq!(
+                cell(&db, &sql),
+                vec![jed::Value::Bool(true)],
+                "{file}: row {id}"
+            );
         }
         let report = db.integrity_check("main", &options).unwrap();
         assert!(report.ok(), "{file}: {:#?}", report.findings);
@@ -957,7 +923,7 @@ fn deferred_interior_ruby_histories() {
         Some(Credential::Key([0x4A; 32])),
     )
     .unwrap_or_else(|e| panic!("{file}: {e}"));
-    let (version, v) = if layout { (2, 1001) } else { (1, 1000) };
+    let (version, v) = (2, 1001);
     assert_eq!(db.version(), version, "{file}: recovered version");
     assert_eq!(
         cell(

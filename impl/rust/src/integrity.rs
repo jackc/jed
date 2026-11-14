@@ -208,7 +208,7 @@ struct TableCtx<'t> {
 }
 
 struct Checker<'a> {
-    /// PROTOTYPE (deferred-interior.md §9.3): the checked generation's remap list.
+    /// Deferral (deferred-interior.md §9.3): the checked generation's remap list.
     remap: Arc<crate::format::RemapState>,
     database: &'a str,
     snap: &'a Snapshot,

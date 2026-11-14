@@ -1,12 +1,13 @@
-# Commit manifest: record the page's CRC-32 (ratified 2026-11-13)
+# Commit manifest: record the page's CRC-32 (landed in format v53, 2026-11-13)
 
-**Status: ratified, landing as part of `format_version` 53 together with
-[deferred-interior.md](deferred-interior.md).** The two were sequenced against each other and the
-answer is that they are one change: both rewrite the meta's manifest area, and landing them apart
-would spend two format bumps and write that area's capacity arithmetic twice (§3). Nothing here is
-in `format.md`, the Ruby reference, or the Rust and TS cores yet; the Go prototype behind
-`JED_MANIFEST_CRC32=on` is the measurement artifact and is superseded by this spec, which adds a
-page-header stamp the prototype does not have (§2.1).
+**Status: landed as part of `format_version` 53 together with
+[deferred-interior.md](deferred-interior.md)**, in all three cores and the Ruby reference,
+unconditionally; the byte specification is [format.md](../fileformat/format.md) (*Commit manifest*,
+*Page header*). The two were sequenced against each other and the answer is that they are one
+change: both rewrite the meta's manifest area, and landing them apart would spend two format bumps
+and write that area's capacity arithmetic twice (§3). §4 records the switch-gated work that preceded
+the landing (`JED_MANIFEST_CRC32`, `JED_PAGE_TXID_STAMP`, both since removed); the landing itself is
+[deferred-interior.md](deferred-interior.md) §9.10.
 
 ## 1. The problem
 

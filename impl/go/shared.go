@@ -753,7 +753,7 @@ func (st *storage) commitDurable(snap *snapshot, canReclaim, canReuse bool, budg
 		if newer != nil {
 			allowed = excludeNewer(allowed, newer, st.freePages)
 		}
-		// PROTOTYPE (remap.go): defer interior pages when this commit can; otherwise, if any interior
+		// Deferral (remap.go): defer interior pages when this commit can; otherwise, if any interior
 		// is stale, fold — write every stale interior fresh and empty the remap list.
 		// The decision is §9.4's: a pure function of the committed list, the dirty-node structure, the
 		// committed free list and the high-water, taken before allocation.
@@ -839,7 +839,7 @@ func (st *storage) commitFile(snap *snapshot, write incrementalWrite, live liveC
 	// delta never shrinks it, and a commit inside a relaxed batch may not cut pages the floor's batch
 	// has yet to make durable (format.md *Trailing truncation*, validated-cow.md §4).
 	truncate := !st.serviceClient && len(pending) == 0
-	// PROTOTYPE (remap.go): the walks below read interiors from disk, so they need this commit's list.
+	// Deferral (remap.go): the walks below read interiors from disk, so they need this commit's list.
 	prevRemap := st.paging.remap
 	st.paging.remap = write.remap
 	var incr *incrPlan
@@ -918,7 +918,7 @@ func (st *storage) commitFile(snap *snapshot, write incrementalWrite, live liveC
 	if incr != nil && incrVerify {
 		st.incrCheck(snap, write, plan)
 	}
-	st.paging.remap, st.paging.cat = write.remap, write.cat // PROTOTYPE (remap.go)
+	st.paging.remap, st.paging.cat = write.remap, write.cat // remap.go
 	switch {
 	case write.retained == 0 && prevRemap.len() > 0 && write.remap.len() == 0:
 		remapStat('f')

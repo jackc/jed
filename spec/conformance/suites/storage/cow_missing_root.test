@@ -1,6 +1,8 @@
-# Validated COW: missing root. Ruby-authored file-format recovery fixture.
-# The preceding generation stores 10; the complete new generation stores 20.
-# Continue writing after recovery to prove the selected root remains usable.
+# Validated COW: a manifest that does not list the catalog root. Ruby-authored file-format recovery
+# fixture. The preceding generation stores 10; the complete new generation stores 20. Since v53 a
+# commit may keep its catalog chain (format.md *Deferral*), so a manifest need not list the root and
+# recovery selects the new generation. Continue writing after recovery to prove the selected root
+# remains usable.
 # requires: harness.fixture_open, query.select, query.where_eq, query.order_by, dml.insert, dml.update, dml.delete, types.i32
 # skip: disk prebuilt recovery image must remain the initial state
 # fixture: fileformat/fixtures/cow_missing_root.jed
@@ -9,7 +11,7 @@ query II nosort
 SELECT id, v FROM t ORDER BY id
 ----
 1
-10
+20
 
 statement ok
 UPDATE t SET v = 30 WHERE id = 1

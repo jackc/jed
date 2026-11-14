@@ -142,7 +142,7 @@ impl IncrState {
         let mut all = self.tree.clone();
         if self.known {
             // The previous catalog chain is orphaned whole unless this commit kept it unrewritten
-            // (PROTOTYPE, deferred-interior.md §9.1).
+            // (deferred-interior.md §9.1).
             if !write.catalog_kept {
                 all.extend_from_slice(&self.catalog);
             }
@@ -153,7 +153,7 @@ impl IncrState {
         if pending.is_empty() {
             all.extend_from_slice(&self.held);
         }
-        // PROTOTYPE (deferred-interior.md §9.5): a retained interior is still live at the page the
+        // Deferral (deferred-interior.md §9.5): a retained interior is still live at the page the
         // previous snapshot's node holds, which the orphan walk reaches because it must descend
         // through that node to the leaves and chains orphaned underneath.
         if !write.retained_ids.is_empty() {

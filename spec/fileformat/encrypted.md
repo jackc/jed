@@ -188,7 +188,7 @@ The plaintext meta layout of format.md, with:
 | 7 | 1 | `reserved_bytes` (u8) — `0` when `suite = 0`, `40` when `suite = 1`; anything else `XX001` |
 | 64 | 16 | `root_tag` — the tag of the catalog chain's head page |
 | 80 | 16 | `free_list_tag` — the tag of the free-list head page, zero when `free_list_head = 0` |
-| 96 | variable | the inline manifest, `I = floor((page_size − 96 − 40) / 12)` entries, then zero |
+| 96 | variable | the inline manifest, `I = floor((page_size − 96 − 40 − 26·cap) / 8)` entries (v53, format.md *Commit manifest*), then zero up to the remap region, whose entries carry the tag of the page they name (format.md *Remap list*) |
 | `page_size − 40` | 24 | `nonce` |
 | `page_size − 16` | 16 | `tag` |
 
@@ -200,8 +200,9 @@ whole meta page but its CRC and reserve, and every manifest-overflow page in cha
 the nonce and tag in the reserve. Then compute the meta CRC-32 of format.md over the stored bytes.
 
 **Reading.** Slot selection is keyless and exactly format.md's: magic, version, CRC, bounds, and the
-complete manifest. In this variant a manifest entry is checked by its CRC-64 alone — the body page is
-ciphertext, so the plaintext rule that a listed page has a valid type and CRC-32 does not apply — and
+complete manifest. In this variant a manifest entry is checked by its CRC-32 of the stored ciphertext
+alone (v53; a CRC-64 through v52) — the body page is ciphertext, so the plaintext rule that a listed
+page has a valid type, CRC-32 and stamp does not apply — and
 manifest identities are over **stored** bytes. After selection, the reader that holds the keys checks
 the selected meta's tag; a failure is `XX001`, never a fallback to the other slot (a torn write fails
 the CRC, and a wrong key is refused at the key block, so a CRC-valid meta that fails its tag was

@@ -305,7 +305,7 @@ func (c *sharedCore) writePageIdentical(paging *sharedPaging, mt meta, pages []u
 		}
 	}
 	bootstrap := metaPage(paging.cap(), uint32(ps), mt.txid, pageRef{page: mt.rootPage, tag: mt.rootTag}, mt.pageCount, pageRef{page: mt.freeListHead, tag: mt.freeListTag}, mt.livePages)
-	if mt.remap != nil { // PROTOTYPE (remap.go): the copy's interiors are as stale as the source's
+	if mt.remap != nil { // Deferral (remap.go): the copy's interiors are as stale as the source's
 		encodeRemap(bootstrap, mt.remap)
 		resealRemapMeta(bootstrap)
 	}

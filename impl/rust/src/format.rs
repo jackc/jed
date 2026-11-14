@@ -169,7 +169,14 @@ const MAGIC: [u8; 4] = *b"JEDB";
 // packed integer arrays (kind 4), each exactly when smaller. A leaf's payload is therefore
 // `Σ record_size + leaf_overhead − saving`, which the split and merge rules measure. Only B+tree
 // leaf pages change; kinds 3 and 5 are reserved.
-pub(crate) const FORMAT_VERSION: u16 = 52;
+// v53: narrow commit manifests, the page stamp, and deferred interior pages
+// (spec/design/manifest-crc32.md, spec/design/deferred-interior.md §9). A manifest entry is `page_index
+// u32, crc32 u32` (a plaintext page's own header checksum, an encrypted page's CRC-32 of its
+// ciphertext) and the chain digest at meta offset 48 is a CRC-32; page header offset 2 is the low 16
+// bits of the writing commit's txid, checked against the commit window during manifest validation;
+// and meta offset 60 counts a (parent, slot) remap list in the manifest area's last third, which lets
+// a commit keep an interior whose only change is a child's page, and its catalog chain.
+pub(crate) const FORMAT_VERSION: u16 = 53;
 #[path = "commit_manifest.rs"]
 mod commit_manifest;
 #[path = "remap.rs"]
@@ -2325,7 +2332,7 @@ pub(crate) struct IncrementalWrite {
     /// (incremental-reclaim.md §3.1).
     pub(crate) catalog_ids: Vec<u32>,
     pub(crate) gist_ids: Vec<u32>,
-    /// PROTOTYPE (deferred-interior.md §9): pages that kept their place though the live-page delta
+    /// Deferral (deferred-interior.md §9): pages that kept their place though the live-page delta
     /// counts them as replaced -- retained interiors and a kept catalog chain -- and the retained
     /// interiors' pages, which the orphan walk reaches but which stay live.
     pub(crate) retained: u32,
@@ -2726,7 +2733,7 @@ impl Snapshot {
 
     /// [`incremental_image`](Self::incremental_image) with reuse restricted to `allowed` (`None`:
     /// every free page — validated-cow.md §4 rule 3).
-    /// PROTOTYPE (deferred-interior.md §9.4): the root of every tree a commit serializes, in
+    /// Deferral (deferred-interior.md §9.4): the root of every tree a commit serializes, in
     /// serialization order -- each table's data tree, then its non-GiST index trees (GiST rewrites
     /// its R-tree whole and keeps no B-tree pages).
     pub(crate) fn each_committed_tree(&self, f: &mut dyn FnMut(&Arc<Node>)) {
@@ -3159,7 +3166,7 @@ fn serialize_dirty(
         };
         child_pages.push(cp);
     }
-    // PROTOTYPE (deferred-interior.md §9.4): an interior the plan retains keeps its page; each child
+    // Deferral (deferred-interior.md §9.4): an interior the plan retains keeps its page; each child
     // that moved off the page its slot resolved to takes an entry keyed by this page and that slot,
     // overwriting any earlier one.
     if let Some(d) = d.as_deref_mut()
@@ -3414,7 +3421,7 @@ impl Engine {
                     pg.adopt_generation(
                         m.txid,
                         u32::from_be_bytes(bytes[32..36].try_into().unwrap()),
-                        commit_manifest::count_of(bytes).0 != 0,
+                        u32::from_be_bytes(bytes[40..44].try_into().unwrap()) != 0,
                         floor_slot,
                     );
                     selected = Some(m);
@@ -3423,7 +3430,7 @@ impl Engine {
             }
             selected.ok_or_else(|| corrupt("no complete valid meta page"))?
         };
-        // PROTOTYPE (deferred-interior.md §9): the loaded generation's remap list redirects child
+        // Deferral (deferred-interior.md §9): the loaded generation's remap list redirects child
         // pointers as the skeleton is read. A selected generation becomes the committed one, and the
         // kept catalog chain is forgotten -- another process may have rewritten it. A load at a given
         // meta (a backup's walk) reads through that meta's list and leaves the committed state alone.
@@ -3907,7 +3914,7 @@ pub(crate) fn collect_leaf_overflow_with(
             for _ in 0..=n {
                 cps.push(PageRef::read(page.payload, &mut pos, cap)?);
             }
-            remap.resolve(page_idx.page, &mut cps)?; // PROTOTYPE (deferred-interior.md §9.3)
+            remap.resolve(page_idx.page, &mut cps)?; // Deferral (deferred-interior.md §9.3)
             for cp in cps {
                 collect_leaf_overflow_with(read, cap, cp, shape, reached, seen, depth + 1, remap)?;
             }
@@ -4148,7 +4155,7 @@ pub(crate) fn plan_free_list(
         let mut base = meta_page(
             cap, ps as u32, snap.txid, cat_root, new_pc, head, live_pages,
         );
-        // PROTOTYPE (deferred-interior.md §9.2): the list rides in the meta's last third, written
+        // Deferral (deferred-interior.md §9.2): the list rides in the meta's last third, written
         // before the manifest checksums the page.
         if let Some(remap) = remap {
             remap.encode(&mut base);
@@ -4368,7 +4375,7 @@ fn read_skeleton_node(
             for _ in 0..=n {
                 child_ptrs.push(PageRef::read(payload, &mut pos, cap)?);
             }
-            // PROTOTYPE (deferred-interior.md §9.3): this page's remap entries redirect its slots.
+            // Deferral (deferred-interior.md §9.3): this page's remap entries redirect its slots.
             remap.resolve(page_idx.page, &mut child_ptrs)?;
             // v24: the record-free routing skeleton — an end-offset separator directory + key
             // blob. Separators carry no values, so no lazy decode and no chains to mark.
@@ -5997,7 +6004,7 @@ pub(crate) struct Meta {
     /// pages the next commit orphans (incremental-reclaim.md §3.1).
     pub(crate) manifest_head: u32,
     pub(crate) manifest_pages: u32,
-    /// PROTOTYPE (deferred-interior.md §9): the slot's remap list, validated with the slot (§9.3).
+    /// Deferral (deferred-interior.md §9): the slot's remap list, validated with the slot (§9.3).
     pub(crate) remap: Arc<RemapState>,
 }
 
@@ -6288,13 +6295,11 @@ pub(crate) struct MetaFields {
     pub(crate) page_count: u32,
     pub(crate) free_list_head: u32,
     pub(crate) manifest_head: u32,
-    /// The number of pages the commit manifest lists (meta offset 40, its narrow bit masked).
+    /// The number of pages the commit manifest lists (meta offset 40).
     pub(crate) dirty_count: u32,
-    /// Whether the manifest's entries are narrow (manifest-crc32.md §2).
-    pub(crate) narrow: bool,
     /// The length of the manifest overflow chain (meta offset 44).
     pub(crate) manifest_pages: u32,
-    /// The CRC-64 over the manifest chain (meta offset 48).
+    /// The CRC-32 over the manifest chain (meta offset 48, its high 4 bytes zero).
     pub(crate) manifest_crc: u64,
 }
 
@@ -6307,40 +6312,33 @@ pub(crate) fn meta_fields(m: &[u8]) -> Option<MetaFields> {
         page_count: meta.page_count,
         free_list_head: meta.free_list_head,
         manifest_head: u32_at(36),
-        dirty_count: commit_manifest::count_of(m).0 as u32,
-        narrow: commit_manifest::count_of(m).1,
+        dirty_count: u32_at(40),
         manifest_pages: u32_at(44),
         manifest_crc: u64::from_be_bytes(m[48..56].try_into().unwrap()),
     })
 }
 
-/// CRC-64/ECMA-182 continuing from `crc`: the validated-COW page identity and manifest-chain
-/// digest (spec/design/validated-cow.md), and the page service's commit digest.
+/// CRC-64/ECMA-182 continuing from `crc`: the page service's commit-resolution digest of a meta page
+/// (through v52 also the validated-COW page identity and manifest-chain digest).
 pub(crate) fn commit_crc64(crc: u64, bytes: &[u8]) -> u64 {
     commit_manifest::extend(crc, bytes)
 }
 
-/// A listed page's manifest identity and the chain digest's step, in a manifest of the given width
-/// (manifest-crc32.md §2): the page service checks a client's delta with these.
-/// Whether this process writes narrow manifests (PROTOTYPE, manifest-crc32.md §2).
-pub(crate) fn manifest_narrow() -> bool {
-    commit_manifest::manifest_crc32()
+/// The bytes of one commit-manifest entry (v53: page id and CRC-32).
+pub(crate) const MANIFEST_ENTRY: usize = commit_manifest::ENTRY;
+
+/// A listed page's manifest identity and the chain digest's step (manifest-crc32.md §2): the page
+/// service checks a client's delta with these.
+pub(crate) fn manifest_page_digest(page: &[u8], encrypted: bool) -> u64 {
+    commit_manifest::page_digest(page, encrypted)
 }
 
-pub(crate) fn manifest_page_digest(page: &[u8], encrypted: bool, narrow: bool) -> u64 {
-    commit_manifest::page_digest(page, encrypted, narrow)
-}
-
-pub(crate) fn manifest_chain_extend(crc: u64, bytes: &[u8], narrow: bool) -> u64 {
-    commit_manifest::chain_extend(crc, bytes, narrow)
+pub(crate) fn manifest_chain_extend(crc: u64, bytes: &[u8]) -> u64 {
+    commit_manifest::chain_extend(crc, bytes)
 }
 
 pub(crate) fn manifest_page_header_ok(page: &[u8], txid: u64) -> bool {
     commit_manifest::manifest_page_header_ok(page, txid)
-}
-
-pub(crate) fn manifest_capacities_for(ps: usize, cap: Cap, narrow: bool) -> (usize, usize) {
-    commit_manifest::capacities_for(ps, cap, narrow)
 }
 
 /// How many manifest entries a meta page of `ps` bytes holds inline, and how many one manifest
@@ -9764,7 +9762,7 @@ pub(crate) struct IntegrityGeneration {
     pub(crate) protected: HashSet<u32>,
     /// `meta_invalid` / `manifest_page_mismatch` findings, each with its page.
     pub(crate) findings: Vec<(&'static str, u32)>,
-    /// PROTOTYPE (deferred-interior.md §9.3): the generation's remap list, which its interior reads
+    /// Deferral (deferred-interior.md §9.3): the generation's remap list, which its interior reads
     /// resolve through (empty for a slot that no longer verifies).
     pub(crate) remap: Arc<RemapState>,
 }

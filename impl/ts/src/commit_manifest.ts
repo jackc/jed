@@ -1,11 +1,11 @@
-// Validated COW descriptor (format v33; v34 adds the live page count at meta offset 56). This module is host-independent: recovery hashes raw
+// Validated COW descriptor (format v33; v34 adds the live page count at meta offset 56; v53 narrows
+// manifest entries to CRC-32 and adds the page stamp and the remap list). This module is host-independent: recovery hashes raw
 // stored bytes before decoding any candidate catalog, tree, or free-list page.
 import { crc32Update } from "./crc32.ts";
 import { engineError } from "./errors.ts";
 import { ioSteps, runSync, type Steps } from "./execution.ts";
 import { NO_TAG } from "./cap.ts";
-import { deferOn, RemapState, reserve as remapReserve } from "./remap.ts";
-import { manifestCrc32, pageTxidStamp } from "./v53.ts";
+import { RemapState, reserve as remapReserve } from "./remap.ts";
 
 // PAGE_IO_WINDOW bounds the write side's concurrent page work (ts-runtime.md §11.3): pages encoded at
 // once (and encoded pages awaiting their write), and dependencies recovery reads ahead. Physical
@@ -34,7 +34,8 @@ for (let i = 0; i < 256; i++) {
   TABLE_LO[i] = lo;
 }
 
-// CRC-64/ECMA-182: non-reflected, initial/final zero. Two u32 limbs avoid per-byte BigInt work.
+// CRC-64/ECMA-182: non-reflected, initial/final zero. Through v52 the manifest identity; now only the
+// page service's commit-resolution digest of a meta page. Two u32 limbs avoid per-byte BigInt work.
 export function crc64Update(previous: bigint, bytes: Uint8Array): bigint {
   let hi = Number(previous >> 32n) >>> 0;
   let lo = Number(previous & 0xffff_ffffn) >>> 0;
@@ -49,48 +50,38 @@ export function crc64Update(previous: bigint, bytes: Uint8Array): bigint {
 // The inline manifest's byte range in a meta page: after the 64-byte header, or — in an encrypted
 // meta — after the catalog-root and free-list tags (offset 96) and before the 40-byte reserve
 // (spec/fileformat/encrypted.md §6).
-// Under the deferred-interior layout the remap region takes the area's last third, whether or not it
-// holds entries (deferred-interior.md §9.2).
+// The remap region takes the area's last third, whether or not it holds entries (format.md *Remap
+// list*).
 function inlineArea(pageSize: number, encrypted: boolean): [number, number] {
   const r = remapReserve(pageSize, encrypted);
   return encrypted ? [96, pageSize - 40 - r] : [64, pageSize - r];
 }
 
-// PROTOTYPE (manifest-crc32.md §2): the top bit of a meta's dirty count (offset 40) marks narrow
-// entries -- the page id and a CRC-32 -- so reading is self-describing; this process writes them under
-// JED_MANIFEST_CRC32=on. A wide entry is the page id and the CRC-64 of the page's bytes.
-export const NARROW_FLAG = 0x8000_0000;
-export const entrySize = (narrow: boolean): number => (narrow ? 8 : 12);
+// ENTRY_SIZE is a manifest entry's bytes: the page id and a CRC-32 (v53; manifest-crc32.md §2).
+export const ENTRY_SIZE = 8;
 
-// manifestInlineCapacity and manifestOverflowCapacity default to the width this process writes.
-export const manifestInlineCapacity = (
-  pageSize: number,
-  encrypted = false,
-  narrow = manifestCrc32(),
-): number => {
+export const manifestInlineCapacity = (pageSize: number, encrypted = false): number => {
   const [lo, hi] = inlineArea(pageSize, encrypted);
-  return Math.floor((hi - lo) / entrySize(narrow));
+  return Math.floor((hi - lo) / ENTRY_SIZE);
 };
-export const manifestOverflowCapacity = (pageSize: number, narrow = manifestCrc32()): number =>
-  Math.floor((pageSize - 32) / entrySize(narrow));
+export const manifestOverflowCapacity = (pageSize: number): number =>
+  Math.floor((pageSize - 32) / ENTRY_SIZE);
 export type WrittenPage = { index: number; bytes: Uint8Array };
 type Entry = { index: number; checksum: bigint };
 // ManifestEntry is one manifest record: a page id and its manifest identity (pageDigest).
 export type ManifestEntry = Entry;
 
-// pageDigest is a listed page's manifest identity: the CRC-64 of its bytes (wide); narrow, a plaintext
-// page's own header checksum -- copied, not recomputed -- or an encrypted page's CRC-32 of its
-// ciphertext.
-export function pageDigest(bytes: Uint8Array, encrypted: boolean, narrow: boolean): bigint {
-  if (!narrow) return crc64Update(0n, bytes);
+// pageDigest is a listed page's manifest identity: a plaintext page's own header checksum -- copied,
+// not recomputed -- or an encrypted page's CRC-32 of its ciphertext.
+export function pageDigest(bytes: Uint8Array, encrypted: boolean): bigint {
   if (encrypted) return BigInt(crc32Update(0, bytes) >>> 0);
   return BigInt(view(bytes).getUint32(12, false));
 }
 
 // stampOf is the stamp a commit at txid writes at header offset 2 of every page it seals
-// (manifest-crc32.md §2.1): the txid's low 16 bits, or 0 -- the v52 reserved value -- without stamping.
+// (manifest-crc32.md §2.1): the txid's low 16 bits.
 export function stampOf(txid: bigint): number {
-  return pageTxidStamp() ? Number(txid & 0xffffn) : 0;
+  return Number(txid & 0xffffn);
 }
 
 // StampWindow is the txid window (floor, newest] a page a manifest lists must carry a stamp from:
@@ -101,7 +92,7 @@ export type StampWindow = { floor: bigint; newest: bigint };
 export const NO_STAMP_WINDOW: StampWindow = { floor: 0n, newest: 0n };
 
 export function stampInWindow(stamp: number, w: StampWindow): boolean {
-  if (!pageTxidStamp() || w.newest <= w.floor) return true;
+  if (w.newest <= w.floor) return true;
   const span = w.newest - w.floor;
   if (span >= 1n << 16n) return true;
   const d = BigInt((stamp - Number(w.floor & 0xffffn)) & 0xffff);
@@ -110,18 +101,14 @@ export function stampInWindow(stamp: number, w: StampWindow): boolean {
 
 // manifestPageHeaderOk reports whether a manifest-overflow page's header bytes 1-3 are what the commit
 // at txid wrote: flags zero and the commit's own stamp. A manifest page is always written by the
-// commit whose meta names it, so this is an exact equality (zero without stamping, as through v52).
+// commit whose meta names it, so this is an exact equality.
 export function manifestPageHeaderOk(bytes: Uint8Array, txid: bigint): boolean {
   return bytes[1] === 0 && ((bytes[2]! << 8) | bytes[3]!) === stampOf(txid);
 }
 
-// manifestEntriesOf digests written pages for a manifest, at the width this process writes.
+// manifestEntriesOf digests written pages for a manifest.
 export function manifestEntriesOf(pages: WrittenPage[], encrypted = false): ManifestEntry[] {
-  const narrow = manifestCrc32();
-  return pages.map((pg) => ({
-    index: pg.index,
-    checksum: pageDigest(pg.bytes, encrypted, narrow),
-  }));
+  return pages.map((pg) => ({ index: pg.index, checksum: pageDigest(pg.bytes, encrypted) }));
 }
 export type CommitManifest = { entries: Entry[]; pages: WrittenPage[]; chainChecksum: bigint };
 export type CommitMeta = {
@@ -141,8 +128,6 @@ export type CommitMeta = {
   overflowCount: number;
   chainChecksum: bigint;
   inline: Entry[];
-  // narrow says the entries are 8 bytes and the chain digest a CRC-32 (manifest-crc32.md §2).
-  narrow: boolean;
   // remap is the slot's remap list, validated with the slot (deferred-interior.md §9.3).
   remap: RemapState;
 };
@@ -163,30 +148,21 @@ function zeroRange(bytes: Uint8Array, start: number, end: number): boolean {
   for (let i = start; i < end; i++) if (bytes[i] !== 0) return false;
   return true;
 }
-function putEntry(dv: DataView, offset: number, entry: Entry, narrow: boolean): void {
+function putEntry(dv: DataView, offset: number, entry: Entry): void {
   dv.setUint32(offset, entry.index, false);
-  if (narrow) dv.setUint32(offset + 4, Number(entry.checksum), false);
-  else dv.setBigUint64(offset + 4, entry.checksum, false);
+  dv.setUint32(offset + 4, Number(entry.checksum), false);
 }
-export function getEntry(dv: DataView, offset: number, narrow: boolean): Entry {
-  const checksum = narrow
-    ? BigInt(dv.getUint32(offset + 4, false))
-    : dv.getBigUint64(offset + 4, false);
-  return { index: dv.getUint32(offset, false), checksum };
+export function getEntry(dv: DataView, offset: number): Entry {
+  return { index: dv.getUint32(offset, false), checksum: BigInt(dv.getUint32(offset + 4, false)) };
 }
-// chainStep extends the manifest-overflow chain digest: CRC-64 (wide) or CRC-32 (narrow).
-export function chainStep(crc: bigint, bytes: Uint8Array, narrow: boolean): bigint {
-  return narrow ? BigInt(crc32Update(Number(crc), bytes) >>> 0) : crc64Update(crc, bytes);
+// chainStep extends the manifest-overflow chain digest, a CRC-32 in the low 4 bytes of meta offset 48.
+export function chainStep(crc: bigint, bytes: Uint8Array): bigint {
+  return BigInt(crc32Update(Number(crc), bytes) >>> 0);
 }
-export function chainUpdate(
-  crc: bigint,
-  index: number,
-  bytes: Uint8Array,
-  narrow: boolean,
-): bigint {
+export function chainUpdate(crc: bigint, index: number, bytes: Uint8Array): bigint {
   const id = new Uint8Array(4);
   view(id).setUint32(0, index, false);
-  return chainStep(chainStep(crc, id, narrow), bytes, narrow);
+  return chainStep(chainStep(crc, id), bytes);
 }
 
 // buildCommitManifest encodes the manifest of a commit's entries: its body and free-list pages, never
@@ -203,10 +179,9 @@ export function buildCommitManifest(
     if (entries[i].index === entries[i - 1].index)
       throw engineError("data_corrupted", "duplicate commit page");
   }
-  const narrow = manifestCrc32();
-  const size = entrySize(narrow);
-  const cap = manifestOverflowCapacity(pageSize, narrow);
-  let cursor = Math.min(entries.length, manifestInlineCapacity(pageSize, encrypted, narrow));
+  const size = ENTRY_SIZE;
+  const cap = manifestOverflowCapacity(pageSize);
+  let cursor = Math.min(entries.length, manifestInlineCapacity(pageSize, encrypted));
   const pages: WrittenPage[] = [];
   let chainChecksum = 0n;
   for (let ordinal = 0; ordinal < overflowIds.length; ordinal++) {
@@ -219,11 +194,11 @@ export function buildCommitManifest(
     dv.setUint32(8, overflowIds[ordinal + 1] ?? 0, false);
     dv.setBigUint64(16, txid, false);
     dv.setUint32(24, ordinal, false);
-    for (let j = 0; j < count; j++) putEntry(dv, 32 + j * size, entries[cursor++]!, narrow);
+    for (let j = 0; j < count; j++) putEntry(dv, 32 + j * size, entries[cursor++]!);
     dv.setUint32(12, pageChecksum(bytes), false);
     const index = overflowIds[ordinal]!;
     pages.push({ index, bytes });
-    chainChecksum = chainUpdate(chainChecksum, index, bytes, narrow);
+    chainChecksum = chainUpdate(chainChecksum, index, bytes);
   }
   if (cursor !== entries.length)
     throw engineError("data_corrupted", "commit manifest capacity exhausted");
@@ -237,18 +212,16 @@ export function writeManifestMeta(
 ): void {
   const dv = view(bytes);
   if (manifest !== undefined) {
-    const narrow = manifestCrc32();
     dv.setUint32(36, manifest.pages[0]?.index ?? 0, false);
-    dv.setUint32(40, (manifest.entries.length | (narrow ? NARROW_FLAG : 0)) >>> 0, false);
+    dv.setUint32(40, manifest.entries.length, false);
     dv.setUint32(44, manifest.pages.length, false);
     dv.setBigUint64(48, manifest.chainChecksum, false);
     const [lo] = inlineArea(bytes.length, encrypted);
     const count = Math.min(
       manifest.entries.length,
-      manifestInlineCapacity(bytes.length, encrypted, narrow),
+      manifestInlineCapacity(bytes.length, encrypted),
     );
-    for (let i = 0; i < count; i++)
-      putEntry(dv, lo + i * entrySize(narrow), manifest.entries[i]!, narrow);
+    for (let i = 0; i < count; i++) putEntry(dv, lo + i * ENTRY_SIZE, manifest.entries[i]!);
   }
   dv.setUint32(32, metaChecksum(bytes), false);
 }
@@ -262,7 +235,7 @@ export function parseCommitMeta(
   const dv = view(block);
   if (
     dv.getUint32(0, false) !== 0x4a454442 ||
-    dv.getUint16(4, false) !== 52 || // format_version (format.ts FORMAT_VERSION)
+    dv.getUint16(4, false) !== 53 || // format_version (format.ts FORMAT_VERSION)
     dv.getUint32(8, false) !== pageSize ||
     dv.getUint32(32, false) !== metaChecksum(block)
   )
@@ -279,17 +252,15 @@ export function parseCommitMeta(
   const rootPage = dv.getUint32(20, false);
   const freeListHead = dv.getUint32(28, false);
   const livePages = dv.getUint32(56, false);
-  const rawCount = dv.getUint32(40, false);
-  const narrow = (rawCount & NARROW_FLAG) !== 0;
-  const dirtyCount = (rawCount & ~NARROW_FLAG) >>> 0;
-  const size = entrySize(narrow);
+  const dirtyCount = dv.getUint32(40, false);
+  const size = ENTRY_SIZE;
   const overflowHead = dv.getUint32(36, false);
   const overflowCount = dv.getUint32(44, false);
   const chainChecksum = dv.getBigUint64(48, false);
   const bodyPage = (p: number): boolean => p >= first && p < pageCount;
-  // Bytes 60-63 are reserved zero (format.md *Meta page*) unless the deferred-interior layout gives
-  // them to remap_entries; slot selection validates them either way (deferred-interior.md §9.3), in
-  // every core and in verify.rb, or the cores recover different generations from one damaged file.
+  // Bytes 60-63 are remap_entries (format.md *Remap list*); slot selection validates the list
+  // (deferred-interior.md §9.3), in every core and in verify.rb, or the cores recover different
+  // generations from one damaged file.
   const remap = RemapState.decode(block, first, pageCount);
   if (remap === null) return null;
   if (
@@ -307,9 +278,9 @@ export function parseCommitMeta(
   )
     return null;
   const [lo, hi] = inlineArea(pageSize, encrypted);
-  const inlineCount = Math.min(dirtyCount, manifestInlineCapacity(pageSize, encrypted, narrow));
+  const inlineCount = Math.min(dirtyCount, manifestInlineCapacity(pageSize, encrypted));
   if (
-    dirtyCount - inlineCount > overflowCount * manifestOverflowCapacity(pageSize, narrow) ||
+    dirtyCount - inlineCount > overflowCount * manifestOverflowCapacity(pageSize) ||
     !zeroRange(block, lo + inlineCount * size, hi)
   )
     return null;
@@ -318,7 +289,7 @@ export function parseCommitMeta(
   const freeListTag = encrypted ? block.slice(80, 96) : NO_TAG;
   if (freeListHead === 0 && !zeroRange(freeListTag, 0, freeListTag.length)) return null;
   const inline: Entry[] = [];
-  for (let i = 0; i < inlineCount; i++) inline.push(getEntry(dv, lo + i * size, narrow));
+  for (let i = 0; i < inlineCount; i++) inline.push(getEntry(dv, lo + i * size));
   return {
     suite,
     txid: dv.getBigUint64(12, false),
@@ -333,7 +304,6 @@ export function parseCommitMeta(
     overflowCount,
     chainChecksum,
     inline,
-    narrow,
     remap,
   };
 }
@@ -396,11 +366,18 @@ export function* validateCommitMetaSteps(
   const manifestIds = new Set<number>();
   let next = meta.overflowHead;
   let chainChecksum = 0n;
-  const narrow = meta.narrow;
-  const size = entrySize(narrow);
-  const cap = manifestOverflowCapacity(pageSize, narrow);
+  const size = ENTRY_SIZE;
+  const cap = manifestOverflowCapacity(pageSize);
   for (let ordinal = 0; ordinal < meta.overflowCount; ordinal++) {
-    if (next < first || next >= meta.pageCount || manifestIds.has(next)) return null;
+    // The catalog root and the free-list head are never manifest pages.
+    if (
+      next < first ||
+      next >= meta.pageCount ||
+      next === meta.rootPage ||
+      next === meta.freeListHead ||
+      manifestIds.has(next)
+    )
+      return null;
     const index = next;
     manifestIds.add(index);
     const bytes = yield* read(index);
@@ -418,14 +395,13 @@ export function* validateCommitMetaSteps(
       !zero(bytes, 32 + count * size)
     )
       return null;
-    for (let i = 0; i < count; i++) entries.push(getEntry(dv, 32 + i * size, narrow));
-    chainChecksum = chainUpdate(chainChecksum, index, bytes, narrow);
+    for (let i = 0; i < count; i++) entries.push(getEntry(dv, 32 + i * size));
+    chainChecksum = chainUpdate(chainChecksum, index, bytes);
     next = dv.getUint32(8, false);
   }
   if (next !== 0 || entries.length !== meta.dirtyCount || chainChecksum !== meta.chainChecksum)
     return null;
   let previous = 1;
-  let rootCovered = false;
   let freeCovered = meta.freeListHead === 0;
   let readAhead = window;
   let ahead: ManifestPageRead[] | null = null;
@@ -460,7 +436,7 @@ export function* validateCommitMetaSteps(
     } else bytes = yield* read(entry.index);
     if (
       bytes.length !== pageSize ||
-      pageDigest(bytes, encrypted, narrow) !== entry.checksum ||
+      pageDigest(bytes, encrypted) !== entry.checksum ||
       (!encrypted &&
         (bytes[0] < 1 ||
           bytes[0] > 7 ||
@@ -468,12 +444,12 @@ export function* validateCommitMetaSteps(
           !stampInWindow((bytes[2]! << 8) | bytes[3]!, stamps)))
     )
       return null;
-    if (entry.index === meta.rootPage) rootCovered = true;
     if (entry.index === meta.freeListHead) freeCovered = true;
     previous = entry.index;
   }
-  // A deferring commit may keep its catalog chain, so its root need not be listed (§9.4).
-  if ((!rootCovered && !deferOn(pageSize, encrypted)) || !freeCovered) return null;
+  // The catalog root need not be listed -- a commit may keep its chain (format.md *Deferral*) -- but a
+  // nonzero free-list head must be.
+  if (!freeCovered) return null;
   for (const entry of entries) manifestIds.add(entry.index);
   return manifestIds;
 }

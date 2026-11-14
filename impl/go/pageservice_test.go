@@ -187,10 +187,9 @@ func cloneDelta(cb psCommitBegin, body []psIndexedPage) (psCommitBegin, []psInde
 func TestPageServiceDeltaValidation(t *testing.T) {
 	const ps = 512
 	base := psDeltaBase{committedTxid: 5, pageSize: ps, pageCount: 10, granted: map[uint32]bool{3: true}}
-	// 40 dirty pages overflow the 512-byte meta's 37 inline entries into one manifest page.
+	// 60 dirty pages overflow the 512-byte meta's inline entries into one manifest page.
 	indices := []uint32{12, 3}
-	// (60 with narrow entries, whose inline area holds 56 — manifest_crc32.go.)
-	for i := uint32(13); len(indices) < 40 || (manifestCRC32 && len(indices) < 60); i++ {
+	for i := uint32(13); len(indices) < 60; i++ {
 		indices = append(indices, i)
 	}
 	cb, body := testDelta(t, ps, 10, indices)
@@ -308,7 +307,7 @@ func TestPageServiceRelaxedDeltaValidation(t *testing.T) {
 	pending := map[uint32]uint64{}
 	for _, pg := range all {
 		if pg.index == 4 {
-			pending[4] = pageDigest(pg.page, false, manifestCRC32)
+			pending[4] = pageDigest(pg.page, false)
 		} else {
 			body = append(body, pg)
 		}

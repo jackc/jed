@@ -1213,16 +1213,11 @@ func TestZZFreeCheckSummary(t *testing.T) {
 	f.Close()
 }
 
-// TestDeferInteriorStress (PROTOTYPE, remap.go): random single- and multi-row commits against a file
+// TestDeferInteriorStress (remap.go): random single- and multi-row commits against a file
 // database with deferred interiors, checked against an in-memory database running the same
 // statements. Every so often: a full integrity check, and a close and reopen (which must apply the
 // remap list). Every commit recounts live pages by reachability.
-//
-//	JED_DEFER_INTERIOR=on go test -run TestDeferInteriorStress -count=1 .
 func TestDeferInteriorStress(t *testing.T) {
-	if !deferInterior {
-		t.Skip("set JED_DEFER_INTERIOR=on")
-	}
 	t.Run("plaintext", func(t *testing.T) { deferInteriorStress(t, nil) })
 	t.Run("encrypted", func(t *testing.T) { deferInteriorStress(t, KeyCredential([32]byte{1, 2, 3})) })
 }

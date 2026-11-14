@@ -1,9 +1,8 @@
 package jed
 
-// PROTOTYPE (spec/design/deferred-interior.md §9): the (parent, slot) remap list. Byte layout,
+// Format v53 (spec/design/deferred-interior.md §9): the (parent, slot) remap list. Byte layout,
 // validation and end-to-end commit behavior -- internal invariants and on-disk bytes, out of the
-// conformance corpus's reach (CLAUDE.md §10). These flip the package switch, so none is parallel: Go
-// runs every parallel test only after the sequential ones finish.
+// conformance corpus's reach (CLAUDE.md §10).
 
 import (
 	"context"
@@ -15,38 +14,23 @@ import (
 	"testing"
 )
 
-func withDefer(t *testing.T, on bool) {
-	t.Helper()
-	saved := deferInterior
-	deferInterior = on
-	t.Cleanup(func() { deferInterior = saved })
-}
-
-// §9.2's table, and the inline manifest capacity beside the region for both entry widths.
+// §9.2's table, and the inline manifest capacity beside the region.
 func TestRemapCapacityTable(t *testing.T) {
-	withDefer(t, true)
-	savedNarrow := manifestCRC32
-	t.Cleanup(func() { manifestCRC32 = savedNarrow })
 	for _, c := range []struct {
-		ps                     int
-		encrypted              bool
-		cap, wide, narrow, v52 int
+		ps               int
+		encrypted        bool
+		cap, narrow, v52 int
 	}{
-		{256, false, 6, 11, 16, 16},
-		{4096, false, 134, 224, 336, 336},
-		{8192, false, 270, 452, 678, 677},
-		{1024, true, 11, 50, 75, 74},
-		{8192, true, 103, 448, 672, 671},
+		{256, false, 6, 16, 16},
+		{4096, false, 134, 336, 336},
+		{8192, false, 270, 678, 677},
+		{1024, true, 11, 75, 74},
+		{8192, true, 103, 672, 671},
 	} {
 		pcap := capOf(uint32(c.ps), c.encrypted)
 		if got := remapCapFor(c.ps, c.encrypted); got != c.cap {
 			t.Errorf("%d/%v: cap %d, want %d", c.ps, c.encrypted, got, c.cap)
 		}
-		manifestCRC32 = false
-		if got := manifestInlineCapacity(c.ps, pcap); got != c.wide {
-			t.Errorf("%d/%v: 12-byte inline %d, want %d", c.ps, c.encrypted, got, c.wide)
-		}
-		manifestCRC32 = true
 		if got := manifestInlineCapacity(c.ps, pcap); got != c.narrow {
 			t.Errorf("%d/%v: 8-byte inline %d, want %d", c.ps, c.encrypted, got, c.narrow)
 		}
@@ -68,7 +52,6 @@ func remapMeta(ps int, entries map[remapKey]uint32) []byte {
 }
 
 func TestRemapRoundTrip(t *testing.T) {
-	withDefer(t, true)
 	want := map[remapKey]uint32{{40, 0}: 90, {40, 3}: 91, {7, 2}: 92, {41, 0}: 93}
 	m := remapMeta(512, want)
 	if got := binary.BigEndian.Uint32(m[60:]); got != 4 {
@@ -100,7 +83,6 @@ func TestRemapRoundTrip(t *testing.T) {
 
 // Every §9.3 rule makes the slot structurally invalid.
 func TestRemapValidationRejects(t *testing.T) {
-	withDefer(t, true)
 	const ps = 512
 	size := remapEntrySize(false)
 	at := ps - remapReserveFor(ps, false)
@@ -132,11 +114,6 @@ func TestRemapValidationRejects(t *testing.T) {
 			t.Errorf("%s: accepted", name)
 		}
 	}
-	// Without the layout, offset 60 is reserved zero, as through v52.
-	deferInterior = false
-	if _, ok := decodeRemap(build(1, func(m []byte) { put(m, 0, 10, 0, 20) }), 4, 1000); ok {
-		t.Error("v52 layout accepted a nonzero offset 60")
-	}
 }
 
 // When a pointer is resolved, an entry naming a slot past the parent's item count is XX001 (§9.3).
@@ -161,7 +138,6 @@ func TestRemapResolve(t *testing.T) {
 // the same rows -- with every generation passing the integrity check, which reads interiors through
 // the list.
 func TestRemapEndToEnd(t *testing.T) {
-	withDefer(t, true)
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "remap.jed")
 	db, err := CreateDatabase(CreateOptions{Path: path, PageSize: 512, SkipFsync: true, Locking: LockingExclusive})
@@ -255,10 +231,7 @@ func TestRemapEndToEnd(t *testing.T) {
 
 // The Ruby reference writes the cow_deferred_* histories by hand (spec/fileformat/verify.rb,
 // DEFERRED_FIXTURES); this core, reading the same layout, must recover the same generation and rows
-// and find nothing wrong with them. Without the layout a slot carrying entries is invalid: retained
-// recovers the base generation, overwrite and retire (entries in both slots) open nowhere, and fold's
-// newest slot -- an empty list, a zero region, its catalog root listed -- is a valid v52 slot, read
-// correctly as it stands (deferred-interior.md §9.2: an empty list changes nothing a v52 reader sees).
+// and find nothing wrong with them.
 func TestRemapRubyHistories(t *testing.T) {
 	pad := func(id int, c string) string { return fmt.Sprintf("row-%02d-%s", id, strings.Repeat(c, 48)) }
 	cases := []struct {
@@ -275,7 +248,6 @@ func TestRemapRubyHistories(t *testing.T) {
 	for _, c := range cases {
 		file := specPath(t, "fileformat/fixtures/cow_deferred_"+c.name+".jed")
 		t.Run(c.name, func(t *testing.T) {
-			withDefer(t, true)
 			db, err := openIntegrityCopy(t, file, nil)
 			if err != nil {
 				t.Fatal(err)
@@ -299,55 +271,28 @@ func TestRemapRubyHistories(t *testing.T) {
 				t.Fatalf("integrity: %v %+v", err, report.Findings)
 			}
 		})
-		t.Run(c.name+"/without layout", func(t *testing.T) {
-			withDefer(t, false)
-			db, err := openIntegrityCopy(t, file, nil)
-			switch c.name {
-			case "retained", "fold":
-				want := map[string]uint64{"retained": 1, "fold": 3}[c.name]
-				if err != nil || db.Version() != want {
-					t.Fatalf("want version %d: %v", want, err)
-				}
-				db.Close()
-				return
-			}
-			if err == nil {
-				db.Close()
-				t.Fatal("entries in both slots leave no slot a reader without the layout can select")
-			}
-		})
 	}
 }
 
 // Cow history (e): the encrypted retained parent. The entry carries the tag of the leaf it names while
 // the root's on-disk pointer still binds the old leaf's, so reading the edited row at all means this
-// core took the tag from the entry (deferred-interior.md §9.3). Without the layout the newest slot is
-// invalid and the base generation in slot 1 opens.
+// core took the tag from the entry (deferred-interior.md §9.3).
 func TestRemapRubyEncryptedHistory(t *testing.T) {
 	file := specPath(t, "fileformat/fixtures/encrypted_cow_deferred_retained.jed")
-	for _, on := range []bool{true, false} {
-		t.Run(fmt.Sprintf("layout %v", on), func(t *testing.T) {
-			withDefer(t, on)
-			db, err := openIntegrityCopy(t, file, encGoldenKey())
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer db.Close()
-			want, v := uint64(1), int64(1000)
-			if on {
-				want, v = 2, 1001
-			}
-			if db.Version() != want {
-				t.Fatalf("recovered version %d, want %d", db.Version(), want)
-			}
-			got := query(t, db, "SELECT count(*), sum(id), (SELECT v FROM t WHERE id = 100) FROM t")
-			if got[0][0].Int != 300 || got[0][1].Int != 45150 || got[0][2].Int != v {
-				t.Fatalf("got %v, want 300 rows, sum 45150, v %d", got, v)
-			}
-			report, err := db.IntegrityCheck(context.Background(), "main", IntegrityCheckOptions{Level: IntegrityFull, MaxFindings: IntegrityUnlimited, Constraints: true})
-			if err != nil || !report.OK() {
-				t.Fatalf("integrity: %v %+v", err, report.Findings)
-			}
-		})
+	db, err := openIntegrityCopy(t, file, encGoldenKey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if db.Version() != 2 {
+		t.Fatalf("recovered version %d, want 2", db.Version())
+	}
+	got := query(t, db, "SELECT count(*), sum(id), (SELECT v FROM t WHERE id = 100) FROM t")
+	if got[0][0].Int != 300 || got[0][1].Int != 45150 || got[0][2].Int != 1001 {
+		t.Fatalf("got %v, want 300 rows, sum 45150, v 1001", got)
+	}
+	report, err := db.IntegrityCheck(context.Background(), "main", IntegrityCheckOptions{Level: IntegrityFull, MaxFindings: IntegrityUnlimited, Constraints: true})
+	if err != nil || !report.OK() {
+		t.Fatalf("integrity: %v %+v", err, report.Findings)
 	}
 }

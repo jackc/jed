@@ -27,7 +27,7 @@ All integers are **big-endian** and unsigned, as in the file format. The field t
 | `string` | `u32` byte length, then that many bytes of valid UTF-8 |
 | `page` | exactly `page_size` bytes, where `page_size` is the connection's (from `hello_ok`) |
 | `u32_list` | `u32` count, then `count` × `u32` |
-| `digest_list` | `u32` count, then `count` × (`u32` page index, `u64` CRC-64 page digest) |
+| `digest_list` | `u32` count, then `count` × (`u32` page index, `u64` page digest: the page's manifest identity, a CRC-32 in the low bits since format v53) |
 | `page_list` | `u32` count, then `count` × `page` |
 | `indexed_page_list` | `u32` count, then `count` × (`u32` page index, `page`) |
 | `credential` | `u8` kind, then: `0` none (nothing follows); `1` a passphrase (a `string`); `2` a key (32 raw bytes). Any other kind is malformed |
@@ -199,8 +199,8 @@ non-empty `pending`; otherwise the committed free list under a grant, and none w
   not listed; and the listed pages include the catalog root and the free-list head.
   The manifest pages are then written.
 - **Check B, for each `commit_pages` page, before it is written:** its index is listed, not a `pending` page, and not yet
-  received, its page type is a body type (1–7), its CRC-32 is valid, and its CRC-64 matches the
-  manifest.
+  received, its page type is a body type (1–7), its CRC-32 is valid, and its manifest identity
+  (format.md *Commit manifest*) matches the manifest.
 - **Check C, at `commit_end`:** every listed page that is not a `pending` page arrived.
 
 When a check fails, the owner discards the rest of the delta and answers `commit_end` with a fatal

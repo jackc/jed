@@ -58,8 +58,8 @@ func TestIncompleteEqualTxidSiblingCannotBecomeDurabilityFloor(t *testing.T) {
 			root := binary.BigEndian.Uint32(bad[20:24])
 			binary.BigEndian.PutUint32(bad[40:44], 1)
 			binary.BigEndian.PutUint32(bad[64:68], root)
-			digest := commitCRC64(0, image[int(root)*pageSize:int(root+1)*pageSize])
-			binary.BigEndian.PutUint64(bad[68:76], digest^1)
+			digest := binary.BigEndian.Uint32(image[int(root)*pageSize+12:])
+			binary.BigEndian.PutUint32(bad[68:72], digest^1)
 			binary.BigEndian.PutUint32(bad[32:36], metaCRC(bad))
 			if _, ok := parseMeta(bad); !ok {
 				t.Fatal("crafted sibling must pass header validation")
@@ -241,7 +241,7 @@ func TestValidatedManifestDependenciesAreNotReusedUntilNextGeneration(t *testing
 		raw := base.image()[int(current.txid&1)*256:][:256]
 		check := func(entries []byte, n uint32) {
 			for i := uint32(0); i < n; i++ {
-				if id := binary.BigEndian.Uint32(entries[int(i)*manifestEntrySize(manifestCRC32):]); free[id] {
+				if id := binary.BigEndian.Uint32(entries[int(i)*manifestEntrySize:]); free[id] {
 					t.Fatalf("manifest dependency %d is reusable", id)
 				}
 			}

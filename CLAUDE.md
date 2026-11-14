@@ -797,7 +797,7 @@ session/clock/state dependencies, and pin named timezone data until an explicit 
   by a durable trailer and is copied over the database in place; open finishes a committed copy
   (roll-forward, [hosts.md](spec/design/hosts.md) §5.1). OPFS rekey takes the same path.
 - **Validated COW durable commits (format v33).** Dirty body pages are written once, with
-  CRC-64/ECMA-182 identities recorded inline in the alternate meta page and, for large
+  identities (CRC-64/ECMA-182 through v52; a CRC-32 since v53) recorded inline in the alternate meta page and, for large
   transactions, in reusable manifest overflow pages. A single final durable barrier replaces
   the former body-sync/meta-sync pair. Recovery validates the manifest and dirty pages before
   accepting a root; the free list excludes all current commit dependencies, including orphan
@@ -868,6 +868,21 @@ session/clock/state dependencies, and pin named timezone data until an explicit 
   savings`, a function of its keys and rows, which the split and merge rules measure. Invisible to
   SQL; costs that count pages moved ([spec/design/leaf-structural.md](spec/design/leaf-structural.md)).
   Per-column symbol tables for text and `jsonb` are prototyped and held for a later version.
+- **Deferred interiors and the narrow manifest (format v53).** A commit writes only the tree nodes
+  whose own content changed: an interior whose only change is which page a child lives at keeps its
+  page, and the meta records a `(parent, slot) → page` **remap list** in the manifest area's last
+  third (meta offset 60 counts it), which readers apply to that interior's child pointers; when the
+  list would overflow, the commit **folds** (writes every stale interior fresh, emptying it). An
+  entry dies with its parent, so no page is held off the free list. A commit may also keep its
+  catalog chain unchanged, so a manifest need not list the catalog root. Manifest entries are
+  `page_index u32, crc32 u32` — a plaintext page's own header checksum, copied, or an encrypted
+  page's CRC-32 of its ciphertext — replacing the second CRC-64 pass, and page header offset 2 is
+  the low 16 bits of the writing commit's txid, checked against the commit window during manifest
+  validation, so a stale page left by a lost write is caught outright. Inline capacity (also the
+  `synchronous = off` batch cap) is unchanged or one better than v52 at every page size. Halves the
+  bytes of a single-row commit ([spec/design/deferred-interior.md](spec/design/deferred-interior.md)
+  §9, [spec/design/manifest-crc32.md](spec/design/manifest-crc32.md); format.md *Remap list*,
+  *Deferral*, *Commit manifest*).
 - **Evening out leaves (no format bump).** A leaf that overflows on insert is evened out with an
   adjacent sibling that has room before it is split, so leaves filled in arrival order (an index
   maintained by DML, a table with random keys) settle near 84% full instead of two-thirds. It changes

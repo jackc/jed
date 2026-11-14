@@ -55,7 +55,7 @@ func zeroBytes(b []byte) bool {
 // after the catalog-root and free-list tags (spec/fileformat/encrypted.md §6).
 func manifestInlineArea(ps int, pcap pageCap) (int, int) {
 	lo, hi := remapArea(ps, pcap.encrypted())
-	if deferOn(ps, pcap.encrypted()) { // PROTOTYPE (remap.go): the remap list takes the end of the area
+	if deferOn(ps, pcap.encrypted()) { // the remap list takes the end of the area (format.md *Remap list*)
 		hi -= remapReserveFor(ps, pcap.encrypted())
 	}
 	return lo, hi
@@ -69,16 +69,12 @@ func manifestInlineAreaOf(m []byte, pcap pageCap) (int, int) {
 
 func manifestInlineCapacity(ps int, pcap pageCap) int {
 	lo, hi := manifestInlineArea(ps, pcap)
-	return (hi - lo) / manifestEntrySize(manifestCRC32)
+	return (hi - lo) / manifestEntrySize
 }
 
 // manifestOverflowCapacity is the entries a manifest-overflow page holds as this process writes them;
 // manifestOverflowCapacityFor as a meta of the given entry width declares them (manifest_crc32.go).
-func manifestOverflowCapacity(ps int) int { return manifestOverflowCapacityFor(ps, manifestCRC32) }
-
-func manifestOverflowCapacityFor(ps int, narrow bool) int {
-	return (ps - 32) / manifestEntrySize(narrow)
-}
+func manifestOverflowCapacity(ps int) int { return (ps - 32) / manifestEntrySize }
 
 // Check before serialization, which can fault inherited pages. A failed writer
 // must not do more storage work; a serialization error does not start a commit.
@@ -306,9 +302,10 @@ func commitManifestDependencies(m meta, raw []byte, pageSize uint32, read func(u
 	protected := make(map[uint32]bool)
 	last := first - 1
 	seen := uint32(0)
-	// PROTOTYPE (remap.go): a meta with a remap list may keep its catalog chain from an earlier commit.
-	rootSeen, freeHeadSeen := deferOn(len(raw), pcap.encrypted()), m.freeListHead == 0
-	size := manifestEntrySize(m.narrow)
+	// The catalog root need not be listed — a commit may keep its chain (format.md *Deferral*) — but a
+	// nonzero free-list head must be, and neither is ever a manifest page.
+	freeHeadSeen := m.freeListHead == 0
+	size := manifestEntrySize
 	validate := func(entries []byte, count uint32) (uint32, bool, error) {
 		for i := uint32(0); i < count; i++ {
 			e := entries[int(i)*size:]
@@ -318,13 +315,12 @@ func commitManifestDependencies(m meta, raw []byte, pageSize uint32, read func(u
 			}
 			last = id
 			protected[id] = true
-			rootSeen = rootSeen || id == m.rootPage
 			freeHeadSeen = freeHeadSeen || id == m.freeListHead
 			block, err := read(id)
 			if err != nil {
 				return 0, false, err
 			}
-			if len(block) != int(pageSize) || pageDigest(block, pcap.encrypted(), m.narrow) != entryDigest(e, m.narrow) {
+			if len(block) != int(pageSize) || pageDigest(block, pcap.encrypted()) != entryDigest(e) {
 				return id, false, nil
 			}
 			if !pcap.encrypted() && (block[0] < 1 || block[0] > 7 || pageCRC(block) != binary.BigEndian.Uint32(block[12:16])) {
@@ -346,7 +342,7 @@ func commitManifestDependencies(m meta, raw []byte, pageSize uint32, read func(u
 	id := m.manifestHead
 	chainCRC := uint64(0)
 	for ordinal := uint32(0); ordinal < m.manifestPages; ordinal++ {
-		if id < first || id >= m.pageCount {
+		if id < first || id >= m.pageCount || id == m.rootPage || id == m.freeListHead {
 			return protected, id, false, nil
 		}
 		protected[id] = true
@@ -358,21 +354,21 @@ func commitManifestDependencies(m meta, raw []byte, pageSize uint32, read func(u
 		if err != nil {
 			return protected, id, false, nil
 		}
-		count := min(m.dirtyCount-seen, uint32(manifestOverflowCapacityFor(len(block), m.narrow)))
+		count := min(m.dirtyCount-seen, uint32(manifestOverflowCapacity(len(block))))
 		if pg.pageType != pageManifest || !manifestPageHeaderOK(block, m.txid) || pg.itemCount != count ||
 			binary.BigEndian.Uint64(block[16:24]) != m.txid || binary.BigEndian.Uint32(block[24:28]) != ordinal || !zeroBytes(block[28:32]) || !zeroBytes(block[32+size*int(count):]) {
 			return protected, id, false, nil
 		}
 		var index [4]byte
 		binary.BigEndian.PutUint32(index[:], id)
-		chainCRC = chainDigest(chainCRC, index[:], m.narrow)
-		chainCRC = chainDigest(chainCRC, block, m.narrow)
+		chainCRC = chainDigest(chainCRC, index[:])
+		chainCRC = chainDigest(chainCRC, block)
 		if bad, ok, err := validate(block[32:], count); !ok || err != nil {
 			return protected, bad, ok, err
 		}
 		id = pg.nextPage
 	}
-	valid := id == 0 && seen == m.dirtyCount && chainCRC == m.manifestCRC && (m.dirtyCount == 0 || (rootSeen && freeHeadSeen))
+	valid := id == 0 && seen == m.dirtyCount && chainCRC == m.manifestCRC && (m.dirtyCount == 0 || freeHeadSeen)
 	return protected, 0, valid, nil
 }
 
@@ -416,7 +412,7 @@ type manifestEntry struct {
 func manifestEntriesOf(pages []dirtyPage, encrypted bool) []manifestEntry {
 	entries := make([]manifestEntry, len(pages))
 	for i, pg := range pages {
-		entries[i] = manifestEntry{index: pg.index, digest: pageDigest(pg.bytes, encrypted, manifestCRC32)}
+		entries[i] = manifestEntry{index: pg.index, digest: pageDigest(pg.bytes, encrypted)}
 	}
 	return entries
 }
@@ -428,19 +424,15 @@ func commitManifest(pcap pageCap, ps uint32, txid uint64, root pageRef, pageCoun
 	ordered := append([]manifestEntry(nil), entries...)
 	sort.Slice(ordered, func(i, j int) bool { return ordered[i].index < ordered[j].index })
 	meta := metaPage(pcap, ps, txid, root, pageCount, head, livePages)
-	narrow := manifestCRC32
-	size := manifestEntrySize(narrow)
+	size := manifestEntrySize
 	binary.BigEndian.PutUint32(meta[40:], uint32(len(ordered)))
-	if narrow {
-		binary.BigEndian.PutUint32(meta[40:], uint32(len(ordered))|manifestNarrowFlag)
-	}
 	binary.BigEndian.PutUint32(meta[44:], uint32(len(manifestIDs)))
 	if len(manifestIDs) > 0 {
 		binary.BigEndian.PutUint32(meta[36:], manifestIDs[0])
 	}
 	encode := func(b []byte, records []manifestEntry) {
 		for i, e := range records {
-			putManifestEntry(b[i*size:], e, narrow)
+			putManifestEntry(b[i*size:], e)
 		}
 	}
 	lo, _ := manifestInlineArea(int(ps), pcap)
@@ -463,12 +455,12 @@ func commitManifest(pcap pageCap, ps uint32, txid uint64, root pageRef, pageCoun
 		block := makeStampedPage(int(ps), pageManifest, uint32(n), next, payload, stampOf(txid))
 		var index [4]byte
 		binary.BigEndian.PutUint32(index[:], id)
-		chainCRC = chainDigest(chainCRC, index[:], narrow)
-		chainCRC = chainDigest(chainCRC, block, narrow)
+		chainCRC = chainDigest(chainCRC, index[:])
+		chainCRC = chainDigest(chainCRC, block)
 		pages = append(pages, dirtyPage{index: id, bytes: block})
 	}
 	binary.BigEndian.PutUint64(meta[48:], chainCRC)
-	if deferOn(int(ps), pcap.encrypted()) { // PROTOTYPE (remap.go)
+	if deferOn(int(ps), pcap.encrypted()) {
 		encodeRemap(meta, remap)
 	}
 	binary.BigEndian.PutUint32(meta[32:], metaCRC(meta))
@@ -492,7 +484,7 @@ func trailingRun(safe []uint32, high uint32) ([]uint32, uint32) {
 // file, when it is not free (so it is what blocks trailing truncation) and some lower page is free to
 // land on. 0 when nothing is to be gained.
 //
-// PROTOTYPE (remap.go): deferral's point is that an interior does not move, so one live interior at the
+// Deferral (remap.go): deferral's point is that an interior does not move, so one live interior at the
 // top pins the file's whole length — trailing truncation only ever cuts a run of free pages. Writing
 // that one node fresh costs a page and a remap entry in its parent, and the next commit's run reaches
 // past it, so a blocked file drains one page per commit and a drained one pays nothing

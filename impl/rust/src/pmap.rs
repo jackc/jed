@@ -284,7 +284,7 @@ pub(crate) struct Node {
     /// a plaintext file and while the node is dirty. Set with the page id by the commit that seals
     /// the node, so a parent written later binds it.
     tag: [AtomicU64; 2],
-    /// PROTOTYPE (spec/design/deferred-interior.md §9.4): the persisted page a dirty interior replaces
+    /// Deferral (spec/design/deferred-interior.md §9.4): the persisted page a dirty interior replaces
     /// one for one in its parent's slot ([`PageRef::NONE`]: none -- a split or merge product, or a
     /// leaf, whose origin no decision reads), and whether its separators are still that page's, so
     /// only its child pointers differ. Inherited through every copy; any separator edit clears
@@ -443,7 +443,7 @@ impl Node {
         }
     }
 
-    /// PROTOTYPE (deferred-interior.md §9.4): the persisted page a copy of this node replaces, and
+    /// Deferral (deferred-interior.md §9.4): the persisted page a copy of this node replaces, and
     /// whether the copy's separators are still that page's -- this node's own page when it is
     /// persisted, else what it inherited. The Go core's `originOf`.
     pub(crate) fn origin_of(&self) -> (PageRef, bool) {
@@ -1836,7 +1836,7 @@ impl PMap {
         self.root.as_ref()
     }
 
-    /// PROTOTYPE (deferred-interior.md §9.4): the fold -- replace the root with a copy whose stale
+    /// Deferral (deferred-interior.md §9.4): the fold -- replace the root with a copy whose stale
     /// interiors and their ancestors are dirty, when any is stale.
     pub(crate) fn unstale(&mut self, parents: &std::collections::HashSet<u32>) {
         if let Some(r) = self

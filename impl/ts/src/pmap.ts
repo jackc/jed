@@ -145,7 +145,7 @@ export type PNode = {
   sameRows?: boolean;
   patchOK?: boolean;
   colDirty?: boolean[];
-  // PROTOTYPE (spec/design/deferred-interior.md §9.4): origin is the persisted page a dirty interior
+  // Deferral (spec/design/deferred-interior.md §9.4): origin is the persisted page a dirty interior
   // replaces one for one in its parent's slot (absent: none -- a split or merge product, or a leaf,
   // whose origin no decision reads), and sameKeys says its separators are still that page's, so only
   // its child pointers differ. Inherited through every copy; any separator edit clears sameKeys.

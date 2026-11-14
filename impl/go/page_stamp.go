@@ -1,6 +1,6 @@
 package jed
 
-// PROTOTYPE (spec/design/manifest-crc32.md §2.1): the stale-page stamp.
+// The stale-page stamp (spec/fileformat/format.md *Page header*, *Commit manifest*; v53).
 //
 // Narrowing a manifest entry to the page's CRC-32 (manifest_crc32.go) drops the strength with which
 // recovery rejects a page a lost write left behind from 64 bits to 32. The stamp is the second,
@@ -17,24 +17,11 @@ package jed
 // retained interior is never written and never listed, so it keeps an older stamp, and a stamp
 // checked on every page read would make retention impossible. The same holds for a shared overflow
 // chain (large-values.md §15) and a kept catalog chain.
-//
-// Go-only, no format version bump: v53 lands this together with the narrow manifest and the remap
-// region, and only then is the stamp unconditional.
 
-import (
-	"encoding/binary"
-	"os"
-)
+import "encoding/binary"
 
-// pageTxidStamp makes this process stamp the pages it writes.
-var pageTxidStamp = os.Getenv("JED_PAGE_TXID_STAMP") == "on"
-
-// stampOf is the stamp a commit at txid writes into its pages, or 0 when the prototype is off (which
-// is the v52 reserved value, so an unstamped page is byte-identical to one today).
+// stampOf is the stamp a commit at txid writes into its pages.
 func stampOf(txid uint64) uint16 {
-	if !pageTxidStamp {
-		return 0
-	}
 	return uint16(txid)
 }
 
@@ -55,9 +42,6 @@ type stampWindow struct {
 // wider than 2^16 cannot distinguish them, so it admits every stamp rather than reporting a false
 // mismatch; a window that is empty or inverted does the same, leaving the CRC-32 as the sole check.
 func (w stampWindow) contains(stamp uint16) bool {
-	if !pageTxidStamp {
-		return true
-	}
 	if w.newest <= w.floor {
 		return true
 	}
@@ -72,8 +56,7 @@ func (w stampWindow) contains(stamp uint16) bool {
 // manifestPageHeaderOK reports whether a manifest-overflow page's header bytes 1-3 are what the commit
 // at txid wrote: flags zero and the commit's own stamp. A manifest page is always written by the
 // commit whose meta names it -- under synchronous = off too, since each commit writes its own
-// manifest -- so this is an exact equality, stronger than the window. With the stamp off it is the
-// v52 rule that bytes 1-3 are zero.
+// manifest -- so this is an exact equality, stronger than the window.
 func manifestPageHeaderOK(block []byte, txid uint64) bool {
 	return block[1] == 0 && binary.BigEndian.Uint16(block[2:4]) == stampOf(txid)
 }

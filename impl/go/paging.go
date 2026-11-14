@@ -48,7 +48,7 @@ type sharedPaging struct {
 	// batches is set when the store fetches several pages in one request (a page client over the
 	// stream transport): scans read ahead (prefetchLeaves).
 	batches bool
-	// PROTOTYPE (remap.go): the committed remap list and catalog chain, and whether any persisted
+	// Deferral (remap.go): the committed remap list and catalog chain, and whether any persisted
 	// interior is stale (so a commit that cannot defer must fold first).
 	remap *remapState
 	cat   *catState

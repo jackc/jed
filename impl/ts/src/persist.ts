@@ -403,7 +403,7 @@ function* persistBodySteps(
     allowed = yield* reuseAllowedSteps(db, pending);
     if (newer !== null) allowed = excludeNewer(allowed, newer, db.freePages);
   }
-  // PROTOTYPE (deferred-interior.md §9.4): a durable commit defers interior pages when the plan fits
+  // Deferral (deferred-interior.md §9.4): a durable commit defers interior pages when the plan fits
   // the list, else folds -- writes every stale interior fresh and publishes an empty list. The decision
   // is a pure function of the committed list, the dirty-node structure, the committed free list and the
   // high-water, taken before allocation.
@@ -721,7 +721,7 @@ function* commitFileSteps(
     ({ listable: listed, held } = incrOrphans(db, pending, write));
     incr = { listed, due: incrDue(db) };
   }
-  // PROTOTYPE (deferred-interior.md §9): the walks below read interiors from disk, so they need this
+  // Deferral (deferred-interior.md §9): the walks below read interiors from disk, so they need this
   // commit's list; the committed one comes back if planning fails.
   const prevRemap = paging.remap();
   paging.setRemap(write.remap ?? new RemapState());
@@ -775,7 +775,7 @@ function* commitFileSteps(
     manifest,
     codec !== null ? { root: write.rootTag, freeList: plan.headTag } : undefined,
   );
-  // PROTOTYPE (deferred-interior.md §9.2): the list rides in the meta's last third, written before the
+  // Deferral (deferred-interior.md §9.2): the list rides in the meta's last third, written before the
   // checksum is final and before an encrypted meta is sealed.
   if (write.remap !== null && write.remap.size > 0) {
     write.remap.encode(meta);
@@ -812,7 +812,7 @@ function* commitFileSteps(
   db.liveAtCompaction = plan.newLive;
   db.freeGenTxid = plan.newGen;
   db.live = live;
-  // PROTOTYPE (deferred-interior.md §9): the list and catalog chain this commit published.
+  // Deferral (deferred-interior.md §9): the list and catalog chain this commit published.
   paging.setRemap(write.remap ?? new RemapState());
   paging.setCat(write.cat);
   if (incr !== null && db.incr!.unknownBefore) {

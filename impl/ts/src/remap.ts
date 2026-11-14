@@ -1,6 +1,5 @@
-// PROTOTYPE: deferred interior pages (spec/design/deferred-interior.md §9), behind
-// JED_DEFER_INTERIOR=on and without a version bump, mirroring the Go core's remap.go and the Rust
-// core's remap.rs function for function so all three write byte-identical files.
+// Deferred interior pages (format v53; spec/design/deferred-interior.md §9), mirroring the Go core's
+// remap.go and the Rust core's remap.rs function for function so all three write byte-identical files.
 //
 // A commit writes only the nodes whose own content changed. An interior whose only change is which
 // page a child lives at keeps its page, and the meta records "in interior page P, the child pointer in
@@ -12,7 +11,6 @@ import { NO_TAG } from "./cap.ts";
 import { engineError } from "./errors.ts";
 import { type Child, newFreshInterior, originOf, type PNode, residentRef } from "./pmap.ts";
 import type { Snapshot } from "./snapshot.ts";
-import { deferInterior } from "./v53.ts";
 
 export type PageRef = { page: number; tag: Uint8Array };
 
@@ -33,7 +31,7 @@ export function capacity(ps: number, encrypted: boolean): number {
 // deferOn reports whether a file of page size ps uses the deferred-interior layout. The layout is
 // fixed by the format, not the meta: there is no marker, and a slot with no entries is a zero region.
 export function deferOn(ps: number, encrypted: boolean): boolean {
-  return deferInterior() && capacity(ps, encrypted) > 0;
+  return capacity(ps, encrypted) > 0;
 }
 
 // reserve is the bytes the region takes from the end of the manifest area: 0 without the layout.

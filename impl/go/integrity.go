@@ -357,7 +357,7 @@ type integrityChecker struct {
 	max    int // 0 = no limit
 	snap   *snapshot
 	paging *sharedPaging
-	// remap is the checked generation's remap list (PROTOTYPE, remap.go).
+	// remap is the checked generation's remap list (remap.go).
 	remap *remapState
 	gen   integrityGeneration
 	pcap  pageCap
@@ -400,7 +400,7 @@ func newIntegrityChecker(ctx context.Context, db string, opts IntegrityCheckOpti
 		full:    opts.Level != IntegrityQuick,
 		max:     max,
 		snap:    snap,
-		remap:   paging.remap, // PROTOTYPE (remap.go); a pinned generation replaces it with its own
+		remap:   paging.remap, // remap.go; a pinned generation replaces it with its own
 		paging:  paging,
 		gen:     gen,
 		pcap:    pcap,
@@ -1101,7 +1101,7 @@ func (w *integrityTree) visit(ref pageRef, depth int, lo, hi []byte) error {
 	case pageInterior:
 		children, seps, err := parseIntegrityInterior(pg, w.k.pcap)
 		if err == nil {
-			err = w.k.remap.resolve(ref.page, children) // PROTOTYPE (remap.go)
+			err = w.k.remap.resolve(ref.page, children) // remap.go
 		}
 		if err != nil {
 			return w.corrupt(ref.page, err.Error())
@@ -1396,7 +1396,7 @@ func (k *integrityChecker) scanRows(ref pageRef, colTypes []colType, depth int, 
 	case pageInterior:
 		children, _, err := parseIntegrityInterior(pg, k.pcap)
 		if err == nil {
-			err = k.remap.resolve(ref.page, children) // PROTOTYPE (remap.go)
+			err = k.remap.resolve(ref.page, children) // remap.go
 		}
 		if err != nil {
 			return err

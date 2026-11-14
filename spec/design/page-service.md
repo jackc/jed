@@ -287,7 +287,7 @@ granted free page, so none is reachable from any pinned snapshot or the fallback
   meta's CRC and bounds are valid, and every index the manifest lists is beyond the previous
   `page_count` or in the granted reusable set;
 - before each page is written: its index is listed in the manifest and not yet received, and its
-  CRC-64 identity matches the manifest's;
+  manifest identity matches the manifest's;
 - at the end: every page the manifest lists was received.
 
 A failed check rejects the delta with `08P01` and aborts the transaction. Pages already written are

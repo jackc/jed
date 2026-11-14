@@ -32,7 +32,7 @@ import type { Collation } from "./collation.ts";
 import {
   chainUpdate,
   type CommitMeta,
-  entrySize,
+  ENTRY_SIZE,
   getEntry,
   manifestOverflowCapacity,
   metaChecksum,
@@ -207,7 +207,7 @@ type Generation = {
   livePages: number | null; // null: not recorded (an in-memory store)
   protectedPages: Set<number>;
   memoryFree: number[] | null; // an in-memory store's RAM free list
-  // remap is the generation's remap list, which its interior reads resolve through (PROTOTYPE,
+  // remap is the generation's remap list, which its interior reads resolve through (format v53,
   // deferred-interior.md §9.3).
   remap: RemapState;
 };
@@ -466,9 +466,8 @@ class Checker {
     const chain: { index: number; bytes: Uint8Array }[] = [];
     let next = meta.overflowHead;
     let chainChecksum = 0n;
-    const narrow = meta.narrow; // manifest-crc32.md §2: 8-byte entries, a CRC-32 chain digest
-    const width = entrySize(narrow);
-    const capacity = manifestOverflowCapacity(ps, narrow);
+    const width = ENTRY_SIZE; // manifest-crc32.md §2: 8-byte entries, a CRC-32 chain digest
+    const capacity = manifestOverflowCapacity(ps);
     let chainOk = true;
     for (let ordinal = 0; ordinal < meta.overflowCount; ordinal++) {
       if (next < first || next >= meta.pageCount || deps.has(next)) {
@@ -502,8 +501,8 @@ class Checker {
         chainOk = false;
         break;
       }
-      for (let i = 0; i < count; i++) entries.push(getEntry(dv, 32 + i * width, narrow));
-      chainChecksum = chainUpdate(chainChecksum, index, bytes, narrow);
+      for (let i = 0; i < count; i++) entries.push(getEntry(dv, 32 + i * width));
+      chainChecksum = chainUpdate(chainChecksum, index, bytes);
       next = dv.getUint32(8, false);
     }
     if (chainOk && chainChecksum !== meta.chainChecksum && report) {
@@ -543,7 +542,7 @@ class Checker {
       const bytes = yield* paging.readPageSteps(entry.index);
       const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
       if (
-        pageDigest(bytes, encrypted, narrow) !== entry.checksum ||
+        pageDigest(bytes, encrypted) !== entry.checksum ||
         (!encrypted &&
           (bytes[0]! < 1 || bytes[0]! > 7 || pageChecksum(bytes) !== dv.getUint32(12, false)))
       ) {

@@ -1619,7 +1619,7 @@ impl Snapshot {
     /// successful persist so the published committed tree is the skeletal `interiors + OnDisk
     /// leaves` shape on every host. Table stores and btree/GIN index stores flip; a GiST leaf-key
     /// store's nodes are never persisted (its on-disk form is the R-tree), so it no-ops naturally.
-    /// PROTOTYPE (deferred-interior.md §9.4): the fold -- every stale interior of every tree (one whose
+    /// Deferral (deferred-interior.md §9.4): the fold -- every stale interior of every tree (one whose
     /// page keys an entry in `parents`), and each of its ancestors, becomes a dirty node the commit
     /// writes fresh, so the commit can publish an empty remap list.
     pub(crate) fn unstale(&mut self, parents: &std::collections::HashSet<u32>) {
@@ -1634,7 +1634,7 @@ impl Snapshot {
         }
     }
 
-    /// PROTOTYPE (deferred-interior.md §9.4): whether any store -- a GiST leaf-key store included,
+    /// Deferral (deferred-interior.md §9.4): whether any store -- a GiST leaf-key store included,
     /// whose nodes are never persisted -- has a dirty tree root. The Go core's `dirtyNodeCount() != 0`.
     pub(crate) fn has_dirty_node(&self) -> bool {
         self.stores_iter()

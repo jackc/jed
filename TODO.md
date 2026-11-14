@@ -259,41 +259,29 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   - [ ] _follow-on:_ an integrity fixture with a stored primary-key column (a `text` key), so `row_key_not_primary_key` is produced again; the v52 fixtures' integer keys are elided and cannot disagree with their rows. _(size: S)_
   - [ ] _follow-on:_ have the integrity check verify the content-dependent choices (the stored prefix is the longest one; each region has its smallest kind). _(size: S)_
   - [ ] _follow-on:_ fixed-length keys for index trees whose key columns are all `NOT NULL` (needs `ALTER TABLE … DROP NOT NULL` to rebuild the index), and a shared prefix in interior pages (leaf-structural.md §5, §7).
-- [ ] **Format v53: deferred interior pages + the narrow commit manifest** — **sequenced together and
-  ratified 2026-11-13**; they are one change, not two. Both rewrite the meta's manifest area, and
-  landing them apart would spend two format bumps and write the capacity arithmetic twice.
-  → [deferred-interior.md §9](spec/design/deferred-interior.md), [manifest-crc32.md](spec/design/manifest-crc32.md)
-  - **Deferred interiors** — a commit writes only the nodes whose own content changed; an interior
-    whose only change is a child's page keeps its page and the meta carries a `(parent, slot) → page`
-    remap list, emptied by a fold. Halves the bytes of a single-row commit (48.5 → 24.2, 84.1 → 40.1,
-    96.1 → 48.1 KB, re-measured at `03cc46acc`). The Go core implements the ratified §9 layout behind
-    `JED_DEFER_INTERIOR=on` — (parent, slot) keying, decided before allocation, no held pages
-    (deferred-interior.md §9.8); the byte savings have not been re-measured on it.
-  - **Narrow manifest** — an entry becomes `page_index u32, crc32 u32` (8 bytes, not 12), copied from
-    the page's existing header checksum instead of a second CRC-64 pass, which was the largest single
-    CPU cost of a small commit in the Go core. Prototyped behind `JED_MANIFEST_CRC32=on`, Go only.
-  - **Decision taken:** 32-bit entries, plus a new independent detector the prototypes do not have —
-    the page header's two reserved bytes at offset 2 become `txid16`, the low 16 bits of the writing
-    commit's txid, checked against the commit window only during manifest validation
-    (manifest-crc32.md §2.1). A stale page left by a lost write is then caught with certainty rather
-    than at 2⁻³². Costs no entry bytes and no extra hashing. The 64-bit alternative (two seeded XXH32
-    passes) was declined: a new hand-written hash in three cores plus the Ruby reference, and it
-    reintroduces the second pass the change exists to remove.
-  - **Why together, concretely:** the remap region costs a third of the manifest area and the narrower
-    entry pays for almost exactly that third, so the inline capacity — which is also the
-    `synchronous = off` batch cap — comes out **unchanged or one better than v52 at every page size**
-    (678 vs 677 at 8 KiB plaintext). Deferral alone would have cut it 677 → 452.
-  - `verify.rb` (the Ruby reader and the simulator's independent checker) reads all three parts, and
-    writes the `cow_deferred_*` histories, plaintext and encrypted, which the Go core reads back
-    identically.
-  - All three cores implement all three parts behind the switches and are byte-identical across
-    1,320 composed simulator traces (deferred-interior.md §9.8).
-  - Owes: §9 moved into format.md as v53 with the switches replaced by the version, every golden
-    regenerated (the stamp changes every page's bytes), page-service validation of a client delta's list plus
-    wire fixtures, the simulator's `replay` step at a remap entry — a new kind of bound pointer, which
-    the encryption security review owes an opinion on — a race review of the commit path, and
-    `unassignPages` undoing a retained interior (§9.9). The stamp itself is **unmeasured**: it
-    postdates both prototypes. _(size: L)_
+- [x] **Format v53: deferred interior pages + the narrow commit manifest** — landed 2026-11-13 as one
+  change in all three cores and the Ruby reference, with no switches left: a `(parent, slot) → page`
+  remap list lets a commit keep an interior whose only change is a child's page (and its catalog
+  chain), halving a single-row commit's bytes; manifest entries are `page_index u32, crc32 u32`,
+  copied from the page header instead of a second CRC-64 pass; and page header offset 2 is the
+  writing commit's low-16 txid stamp, checked against the commit window during manifest validation.
+  Inline capacity (the `synchronous = off` batch cap) is unchanged or one better than v52 at every
+  page size. → [deferred-interior.md §9](spec/design/deferred-interior.md), [manifest-crc32.md](spec/design/manifest-crc32.md), format.md *Remap list* / *Deferral* / *Commit manifest*
+  - [ ] _follow-on:_ give the stamp its remaining surface — a window for the integrity check (it holds
+    one meta slot, not the floor) and for the page service's check of a client delta's pages
+    (manifest-crc32.md §4). _(size: S–M)_
+  - [ ] _follow-on:_ page-service validation of a client delta's remap list (count, order, bounds, no
+    parent in the delta's own dirty set) plus `spec/pageservice/` wire fixtures. Page clients do not
+    defer today, so their deltas carry no entries (deferred-interior.md §9.9). _(size: M)_
+  - [ ] _follow-on:_ the simulator's `replay` step at a remap entry — a new kind of bound pointer — and
+    the encryption security review's opinion on it ([encryption.md](spec/design/encryption.md)). _(size: M)_
+  - [ ] _follow-on:_ a race review of the commit path, which sets page ids on the committing
+    snapshot's own nodes and swaps the resident list during planning. _(size: S)_
+  - [ ] _follow-on:_ re-measure the commit CPU and byte savings with all three parts unconditional
+    (the stamp postdates every prototype measurement), and a loosely-packed tree mutated away from the
+    right edge, where leaf evening's rebalance is common. _(size: S)_
+  - [ ] _follow-on:_ a deferral planner in the Ruby reference, so it writes deferred histories from SQL
+    rather than by hand. _(size: M)_
 
 - [ ] **Upgrade path for older files + an on-disk stability commitment (a 1.0 blocker)** — a reader
   accepts only the current `format_version` ([format.md](spec/fileformat/format.md)), so every bump

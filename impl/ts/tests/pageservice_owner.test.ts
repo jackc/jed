@@ -18,7 +18,6 @@ import {
   manifestOverflowCapacity,
 } from "../src/commit_manifest.ts";
 import "../src/crc32_node.ts";
-import { manifestCrc32 } from "../src/v53.ts";
 import { makePage, metaPage } from "../src/format.ts";
 import {
   PS_COMMIT_STATUS_COMMITTED,
@@ -228,7 +227,7 @@ function cloneDelta(
 test("pageservice delta: a valid delta passes; each structural fault is refused", () => {
   const ps = 512;
   const base: DeltaBase = { committedTxid: 5n, pageSize: ps, pageCount: 10, granted: new Set([3]) };
-  // 40 dirty pages overflow the 512-byte meta's 37 inline entries into one manifest page.
+  // 40 dirty pages overflow the 512-byte meta's 38 inline entries into one manifest page.
   const indices = [12, 3];
   for (let i = 13; indices.length < 40; i++) indices.push(i);
   const { cb, body } = testDelta(ps, 10, indices);
@@ -336,7 +335,7 @@ test("pageservice delta: a relaxed delta carries the owner's pending set", () =>
   const body: PsIndexedPage[] = [];
   for (const pg of all) {
     // The pending set's digest at the width this process writes (manifest-crc32.md §2).
-    if (pg.index === 4) pending.set(4, pageDigest(pg.page, false, manifestCrc32()));
+    if (pg.index === 4) pending.set(4, pageDigest(pg.page, false));
     else body.push(pg);
   }
   const base: DeltaBase = {

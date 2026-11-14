@@ -52,7 +52,7 @@ pub(crate) struct SharedPaging {
     codec: Option<Arc<crate::crypto::PageCodec>>,
     /// The capacities the file's variant implies (format.md *Page model*, encrypted.md §1).
     cap: Cap,
-    /// PROTOTYPE (spec/design/deferred-interior.md §9): the committed generation's remap list, which
+    /// Deferral (spec/design/deferred-interior.md §9): the committed generation's remap list, which
     /// interior reads of the live generation resolve through, and the catalog chain it committed, which
     /// a deferring commit keeps when its bytes are unchanged. Both are set when an engine is loaded
     /// from a selected meta (the chain forgotten, since another process may have rewritten it) and by

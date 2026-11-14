@@ -17,12 +17,35 @@ reader/fallback outcomes and production histories' cross-core byte equality are 
 A fourth independent encoder/decoder (the Ruby reference in
 [verify.rb](verify.rb)) pins the goldens so they are not merely self-certified.
 
-## Version scope (`format_version` 52)
+## Version scope (`format_version` 53)
 
 > **The encrypted variant** ([encrypted.md](encrypted.md)) is the same `format_version` with a
 > nonzero `suite` byte at meta offset 6; it amends this layout only where encrypted.md says (page
 > capacity, bound pointers, the key block at pages 2–3, the authenticated meta). A reader that
 > predates it rejects that byte as a nonzero reserved field.
+
+`format_version` **53** — **deferred interior pages, the narrow commit manifest, and the page stamp**
+([../design/deferred-interior.md](../design/deferred-interior.md) §9,
+[../design/manifest-crc32.md](../design/manifest-crc32.md)). Three changes that share the meta's
+manifest area and so land as one version:
+
+- **The remap list.** A commit writes only the nodes whose own content changed. An interior whose
+  only change is which page a child lives at keeps its page, and the meta carries a
+  `(parent page, slot) → page` list in the last third of its manifest area, with its count at meta
+  offset 60 (*Remap list* below). Every reader of an interior page's child pointers resolves them
+  through it. A commit that cannot fit its list **folds**: it writes every stale interior fresh and
+  publishes an empty list (*Deferral* under *Allocation & incremental commit*). A catalog chain whose
+  bytes are unchanged is not rewritten.
+- **Narrow manifest entries.** An entry is `page_index u32, crc32 u32`: a plaintext page's own header
+  checksum, copied, or an encrypted page's CRC-32 of its ciphertext; the overflow chain's digest is a
+  CRC-32 (*Commit manifest*).
+- **The page stamp.** Page header bytes 2–3, reserved through v52, carry the low 16 bits of the txid
+  of the commit that wrote the page, a second and independent detector of a lost page write
+  (*Page header*, *Commit manifest*).
+
+Together the inline manifest capacity is unchanged or one larger than v52's at every page size. A
+from-scratch image changes in every page (each carries its stamp), its version byte, and its meta CRC;
+the remap region of a from-scratch meta is zero. Readers accept only the exact current version.
 
 `format_version` **52** — **the compact leaf** ([../design/leaf-structural.md](../design/leaf-structural.md)).
 Only the leaf page (`page_type 2`) of a table or index B+tree changes (*Leaf node*, *Record* and
@@ -710,7 +733,7 @@ Two slots for torn-write-safe publication, with dirty-page validation since v33
 | offset | size | field |
 |---|---|---|
 | 0  | 4 | `magic` = `4A 45 44 42` (ASCII `JEDB`, for the engine `jed`) |
-| 4  | 2 | `format_version` (u16) — current = **`50`** |
+| 4  | 2 | `format_version` (u16) — current = **`53`** |
 | 6  | 2 | reserved (0) |
 | 8  | 4 | `page_size` (u32) |
 | 12 | 8 | `txid` (u64) — commit counter; the highest valid slot wins on open |
@@ -721,10 +744,11 @@ Two slots for torn-write-safe publication, with dirty-page validation since v33
 | 36 | 4 | `manifest_head` (u32) — first manifest overflow page, or 0 |
 | 40 | 4 | `manifest_entries` (u32) — total dirty body/free-list entries, including inline entries |
 | 44 | 4 | `manifest_pages` (u32) — number of overflow-chain pages |
-| 48 | 8 | `manifest_crc64` (u64) — identity of the complete overflow chain; 0 when no chain |
+| 48 | 8 | `manifest_crc32` (u64 field) — **v53**: the CRC-32/IEEE identity of the complete overflow chain in the low 4 bytes, the high 4 bytes zero; the whole field 0 when no chain (through v52 a CRC-64) |
 | 56 | 4 | `live_pages` (u32) — **new in v34**: the exact count of pages reachable from `root_page` (*Live page count* below). Must be `≤ page_count − 2` |
-| 60 | 4 | reserved (0) |
-| 64 | variable | first `min(manifest_entries, floor((page_size - 64) / 12))` entries, then zero padding |
+| 60 | 4 | `remap_entries` (u32) — **new in v53**: the entries of the remap list (*Remap list* below), at most `cap` |
+| 64 | variable | the inline manifest: the first `min(manifest_entries, I)` entries (*Commit manifest*), then zero padding up to the remap region |
+| `hi − entry_size·cap` | `entry_size·cap` | the remap region (*Remap list*): `remap_entries` entries, then zero |
 
 `page_size` lives at a fixed offset so a reader can learn it before it knows where page 1
 begins (page 1 starts at byte `page_size`).
@@ -784,44 +808,117 @@ file to learn it. A reader bounds the field but cannot cheaply verify it; the Ru
 every golden's count against the pages its decoder reaches. An in-memory store's meta, which is
 never reopened, carries `0`.
 
-### Commit manifest (v33)
+### Commit manifest (v33; narrow entries and the page stamp v53)
 
-An entry is `page_index u32` followed by `expected_crc64 u64`. Entries are globally strictly
-increasing by page index, unique, and within `[2, page_count)`. Nonempty manifests include the
-catalog root and any nonzero free-list head. Referenced pages must have type 1–7 and a valid
-ordinary page CRC-32; a manifest page cannot be a dirty-body entry. The digest is CRC-64/ECMA-182 of
-the **complete encoded body page**, including its existing CRC-32 field. Unlike checking that
-page's self-CRC, this binds the content expected by this transaction and rejects an older but
-internally checksum-valid page at a reused address.
+An entry is `page_index u32` followed by `crc32 u32` (8 bytes; through v52 a 12-byte entry with a
+CRC-64). Entries are globally strictly increasing by page index, unique, and within
+`[first_body, page_count)`. A nonempty manifest includes any nonzero free-list head; it need **not**
+include the catalog root, because a commit may keep an unchanged catalog chain (*Deferral* below).
+Referenced pages must have type 1–7 and a valid ordinary page CRC-32; a manifest page cannot be a
+dirty-body entry.
 
-CRC-64/ECMA-182 uses unreflected polynomial `0x42F0E1EBA9EA3693`, initial register 0, and final
-XOR 0; `crc64("123456789") = 0x6C40DF5F0B497347`. Chunked updates must equal hashing the
-concatenation. Neither checksum is authentication. CRC-64 is independent of the body page's
-CRC-32, so hashing the full page does not collapse into a fixed CRC residue.
+- **Plaintext page:** the entry's `crc32` is the page's own header `crc32` field. The writer copies it;
+  a reader checks the page against its own checksum, as for any read, and additionally requires the
+  field to equal the entry. Unlike checking the self-CRC alone, this binds the content this
+  transaction wrote and rejects an older but internally checksum-valid page at a reused address, with
+  probability 2⁻³² per lost page write.
+- **Encrypted page:** the page has no plaintext checksum, so the entry's `crc32` is the CRC-32/IEEE of
+  its complete stored ciphertext ([encrypted.md](encrypted.md) §6). This check is keyless; the AEAD tag
+  a pointer binds is the authenticating check.
 
-Inline capacity is `I = floor((page_size - 64) / 12)` and is filled maximally. Remaining
-entries occupy a `page_type = 8` chain with this layout:
+**The stamp window.** A listed plaintext page must also carry a page stamp (*Page header*) from the
+txid window `(floor, newest]`, where `newest` is the candidate meta's `txid` and `floor` is the `txid`
+of the other meta slot when that slot is structurally valid and older. The page passes when
+`(stamp − floor) mod 2¹⁶ ∈ [1, newest − floor]`. Under `synchronous = on` the window is one commit;
+under `synchronous = off` a cumulative manifest lists every page written since the durability floor,
+each stamped by its own commit, and a batch is far shorter than 2¹⁶ commits, so the check is exact.
+When the other slot is not older (torn, or the candidate is itself the fallback), or the window spans
+2¹⁶ or more, every stamp passes and the CRC-32 is the only check. A stale page left by a lost write
+carries the stamp of the commit that really wrote it, so it fails outright unless it is exactly
+65,536·k commits old. An encrypted page's stamp is sealed and is not checked here. The stamp is
+checked **only** in manifest validation, never on an ordinary page read: a retained interior, a kept
+catalog chain, and a shared overflow chain keep the older stamp of the commit that wrote them.
+
+CRC-32/IEEE is the meta checksum's routine (*Checksum* above). Neither checksum is authentication.
+
+The inline manifest fills the manifest area `[lo, hi)` up to the remap region: `lo = 64`, `hi =
+page_size` (encrypted: `lo = 96`, `hi = page_size − 40`, [encrypted.md](encrypted.md) §6), and its
+capacity is `I = floor((hi − lo − entry_size·cap) / 8)` (*Remap list* gives `entry_size` and `cap`).
+It is filled maximally:
+
+| page size | variant | remap `cap` | inline `I` (v53) | v52 |
+|---|---|---|---|---|
+| 256 | plaintext | 6 | 16 | 16 |
+| 4096 | plaintext | 134 | 336 | 336 |
+| 8192 | plaintext | 270 | 678 | 677 |
+| 1024 | encrypted | 11 | 75 | 74 |
+| 8192 | encrypted | 103 | 672 | 671 |
+
+The inline capacity is also the `synchronous = off` batch cap ([../design/validated-cow.md](../design/validated-cow.md) §4).
+Remaining entries occupy a `page_type = 8` chain with this layout:
 
 | offset | size | field |
 |---|---|---|
-| 0 | 16 | ordinary body header: type 8, zero reserved bytes, entry count, next page, CRC-32 |
+| 0 | 16 | ordinary body header: type 8, flags 0, the stamp of the owning meta's `txid` (bytes 2–3), entry count, next page, CRC-32 |
 | 16 | 8 | transaction id; must equal the owning meta's `txid` |
 | 24 | 4 | zero-based chain ordinal |
 | 28 | 4 | reserved (0) |
-| 32 | variable | up to `O = floor((page_size - 32) / 12)` entries; zero padding |
+| 32 | variable | up to `O = floor((page_size - 32) / 8)` entries; zero padding |
 
-Chain page ids are unique, within `[2, page_count)`, and disjoint from all dirty-page entries.
-Every non-final link points to the next chain page; the final link is zero, and the visited count
-is exactly `manifest_pages`. Entries fill each page to `min(O, remaining)`; monotone allocation
-can leave empty trailing pages, whose headers and zero tails remain validated. The owning meta's
-`manifest_crc64` is CRC-64 of the concatenated `page_id u32 || complete_encoded_page` for each
-chain page in chain order. This binds stale chains, pointer changes, and every header and padding byte.
-Counts and bounds are checked before allocation or dereferencing; cycles and surplus entries fail.
+A manifest page is always written by the commit whose meta names it, so its stamp must equal that
+`txid`'s low 16 bits exactly. Chain page ids are unique, within `[first_body, page_count)`, and
+disjoint from all dirty-page entries. Every non-final link points to the next chain page; the final
+link is zero, and the visited count is exactly `manifest_pages`. Entries fill each page to
+`min(O, remaining)`; monotone allocation can leave empty trailing pages, whose headers and zero tails
+remain validated. The owning meta's `manifest_crc32` is the CRC-32 of the concatenated
+`page_id u32 || complete_encoded_page` for each chain page in chain order. This binds stale chains,
+pointer changes, and every header and padding byte. Counts and bounds are checked before allocation or
+dereferencing; cycles and surplus entries fail.
 
-Zero dirty entries denote a **bootstrap** whole-file image and require all descriptor fields
-and bytes after 64 to be zero. Nonzero entries with no overflow require head, page count, and chain
-digest zero. Nonzero overflow count requires a nonzero head. All unused bytes are zero. A candidate
-with a complete manifest is accepted only after every expected page digest matches.
+Zero dirty entries denote a **bootstrap** whole-file image and require all manifest descriptor fields
+and the inline manifest area to be zero; its remap region is validated as any other (*Remap list*): a
+from-scratch image's is empty, and a page-identical backup copies its source generation's list.
+Nonzero entries with no overflow require head, page count, and chain digest zero. Nonzero overflow
+count requires a nonzero head. All unused bytes are zero. A candidate with a complete manifest is
+accepted only after every listed page passes its checks.
+
+### Remap list (v53)
+
+> In the interior page `parent`, the child pointer in slot `slot` names a page the node has since
+> moved off; the subtree root is at `page`. The pointer's own on-disk value is ignored.
+
+An entry is:
+
+| offset | size | field |
+|---|---|---|
+| 0 | 4 | `parent` (u32) — the interior page the pointer lives in |
+| 4 | 2 | `slot` (u16) — which child pointer, in `[0, item_count]` |
+| 6 | 4 | `page` (u32) — where that subtree root is now |
+| 10 | 16 | `tag` — **encrypted files only**: the AEAD tag of `page`, as every bound pointer carries ([encrypted.md](encrypted.md) §2) |
+
+So `entry_size` is 10 plaintext and 26 encrypted, and `cap = floor(floor((hi − lo) / 3) / entry_size)`:
+one third of the manifest area at every page size. The region is the last `entry_size·cap` bytes of
+the area. Its `remap_entries` entries are written ascending by `(parent, slot)` from the region's
+start, and the rest of the region is zero. It lies inside the meta CRC, and inside an encrypted meta's
+seal. There is no marker: the version fixes the layout.
+
+**Validation**, with the other header bounds and before any page is read: `remap_entries ≤ cap`;
+entries strictly ascending by `(parent, slot)`; `parent` and `page` both in
+`[first_body, page_count)`; `page ≠ parent`; `page` values pairwise distinct; the rest of the region
+zero. Any failure makes the candidate structurally invalid, and the other slot may be tried.
+
+**Resolution** is per page, one lookup per slot, never transitive: a reader reading the interior page
+at index `p` resolves its slot `i` through the entry `(p, i)` when one exists, and reads the resulting
+page's own pointers the same way. When a pointer is resolved the parent is necessarily `page_type 3`;
+an entry naming a slot greater than the parent's `item_count` is `XX001`. In an encrypted file the
+resolved pointer's tag is the entry's, and the target must authenticate under it as any pointer-bound
+page does. The list is applied everywhere an interior's pointers are read from disk: the open-time
+skeleton, a demand-paged interior read, the integrity check, the free-list rebuild's walk, and a
+backup's walk.
+
+**Scope.** Interior pages of a table B+tree and of a B-tree or GIN index only: not catalog pages (a
+tree root that moves rewrites the catalog chain), not GiST pages (an R-tree is rewritten whole by
+every commit that touches it), not leaves.
 
 Allocation is specified in [validated-cow.md §2](../design/validated-cow.md#2-reuse-proof-and-deterministic-allocation):
 reserve manifest pages from safe free pages before high-water, replan free-list pages with those
@@ -836,7 +933,7 @@ poisoned-handle behavior are part of the durable protocol, not additional on-dis
 |---|---|---|
 | 0 | 1 | `page_type` (u8) — `1` = catalog, `2` = B-tree **leaf**, `3` = B-tree **interior**, `4` = overflow; `5` = GiST **leaf**, `6` = GiST **interior**; `7` = **free-list**; `8` = **commit manifest overflow** (v33, above) |
 | 1 | 1 | `page_flags` (u8) — on a catalog page (v48), bit0 `continued`: the page's last entry continues on the next chain page (*Catalog*); bits 1–7 reserved, `0`. `0` on every other page type |
-| 2 | 2 | reserved (0) |
+| 2 | 2 | `stamp` (u16) — **new in v53**: the low 16 bits of the `txid` of the commit that wrote the page (reserved zero through v52). Checked only in manifest validation (*Commit manifest*); a page an ordinary read reaches is checked by its CRC-32 alone |
 | 4 | 4 | `item_count` (u32) — entries (catalog) / keys `N` (B-tree node) on this page |
 | 8 | 4 | `next_page` (u32) — catalog / overflow / free-list / manifest: next page of the chain, or 0. B-tree nodes write `0` here. |
 | 12 | 4 | `crc32` (u32) — **new in v7**: CRC-32/IEEE over the page bytes *excluding this field* — i.e. `[0, 12)` then `[16, page_size)`, covering the header, the payload, and the zero-fill tail |
@@ -1531,7 +1628,7 @@ change; its rows are unaffected, and no writer produces one.
 Header (`item_count = N`, `next_page = 0`) followed by the **record-free** payload (v24):
 
 1. **`N + 1` child pointers** — each a big-endian `u32` page index, the roots of the `N + 1`
-   subtrees. Child `i` holds keys in `[sep[i−1], sep[i])` (with `sep[−1] = −∞`, `sep[N] = +∞`);
+   subtrees, each subject to the selected meta's remap list (v53, *Remap list*). Child `i` holds keys in `[sep[i−1], sep[i])` (with `sep[−1] = −∞`, `sep[N] = +∞`);
    a key equal to `sep[i]` lies in child `i+1`.
 2. **separator directory** — `N` big-endian `u32` **end offsets** into the key blob (the same
    end-offset convention as the leaf key directory).
@@ -1975,8 +2072,8 @@ only its **dirty** pages, then publishing the new root. Atomicity uses validated
      **post-order** (a node's children before the node — so a parent's child pointers
      reference already-allocated pages), left to right; **then each of its index trees**
      (v5), in the catalog's index order (name byte order ascending), post-order each.
-   - Then the **catalog chain** (always rewritten fresh: it carries the possibly-moved
-     `root_data_page` of every table), as consecutive pages.
+   - Then the **catalog chain**, rewritten fresh when its bytes changed (it carries the possibly-moved
+     `root_data_page` of every table) and otherwise kept (*Deferral* below).
    - Then the **free-list pages**, allocated from safe remaining free pages before high-water;
      prospective manifest page ids are reserved first by the monotone planner described above.
 3. Write **manifest overflow pages**, if the dirty body/free-list identities exceed inline capacity.
@@ -1993,6 +2090,40 @@ without acknowledgment. Corruption of a latest dependency after acknowledgment i
 from incomplete persistence and may likewise select the preceding snapshot. Inherited body pages
 retain their ordinary CRC-on-read protection. Fault-device tests must vary persistence order and
 tear page writes; a write-through-only test is insufficient (storage.md §7).
+
+### Deferral (v53)
+
+The commit decides, **before allocation**, which interiors keep their page. Let `E0` be the remap list
+of the generation being committed against.
+
+1. **The migration page `M`**: the top page of the file (`page_count − 1`) when it is not on the
+   committed free list and some lower page is, else 0 (`page_count < 3`: 0).
+2. **Retention.** A dirty interior keeps its page iff it **replaces a persisted page one for one**, its
+   **separators are still that page's** (so its slot count and every slot index are that page's), and
+   that page is not `M`. "Replaces one for one" and "separators still that page's" are tracked through
+   the mutation, not compared: a copy of a node inherits the page it replaces and whether its
+   separators are unchanged; any edit of its separators (a split absorbed, a leaf evened with a
+   sibling, a merge or an empty subtree removed below it) clears the second; the products of a split or
+   merge replace no page. Every core implements the same rule at the same mutation steps.
+3. **The entry set `E`**: `E0`, minus every entry whose `parent` the commit **retires**, plus
+   `(P, i) → C` for every retained interior at page `P` whose slot-`i` child this commit writes at a
+   page `C` other than the one that slot resolved to. An add overwrites an existing `(P, i)`. A parent
+   is retired when the commit's orphan walk reaches it and does not retain it: the walk over the
+   previous snapshot's B-tree nodes that the new snapshot does not share, which the live page count
+   already makes (*Live page count*). Written fresh, merged away and dropped with its table all orphan
+   a parent; its entries die in the same commit, so a reused page is never read through a surviving
+   entry and no page is held off the free list.
+4. **The fold test**: if `|E| > cap`, the commit **folds**: every stale interior -- one whose page keys
+   an entry of `E0` -- and every ancestor of one is written fresh, nothing is retained, and the meta's
+   remap list is empty.
+
+A retained interior is not written; its page is still live, is not an orphan of this commit, and is
+counted back by the live page count. **Catalog keep:** a deferring (not folding) commit whose new
+catalog chain is byte-identical to the chain the committed generation wrote keeps it; the catalog is
+not rewritten when its root is `M`, and under `synchronous = off` a commit with no dirty tree node
+rewrites it, so the batch writes at least one page. The committed chain is known only to the process
+that wrote it: a process that loads a generation (open, a page client's reload, an owner adopting a
+client's commit) rewrites the catalog on its next commit.
 
 ### Free-list page (`page_type = 7`, v25)
 
