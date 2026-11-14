@@ -4,6 +4,7 @@ import { crc32Update } from "./crc32.ts";
 import { engineError } from "./errors.ts";
 import { ioSteps, runSync, type Steps } from "./execution.ts";
 import { NO_TAG } from "./cap.ts";
+import { manifestCrc32 } from "./v53.ts";
 
 // PAGE_IO_WINDOW bounds the write side's concurrent page work (ts-runtime.md §11.3): pages encoded at
 // once (and encoded pages awaiting their write), and dependencies recovery reads ahead. Physical
@@ -50,20 +51,45 @@ export function crc64Update(previous: bigint, bytes: Uint8Array): bigint {
 function inlineArea(pageSize: number, encrypted: boolean): [number, number] {
   return encrypted ? [96, pageSize - 40] : [64, pageSize];
 }
-export const manifestInlineCapacity = (pageSize: number, encrypted = false): number => {
+
+// PROTOTYPE (manifest-crc32.md §2): the top bit of a meta's dirty count (offset 40) marks narrow
+// entries -- the page id and a CRC-32 -- so reading is self-describing; this process writes them under
+// JED_MANIFEST_CRC32=on. A wide entry is the page id and the CRC-64 of the page's bytes.
+export const NARROW_FLAG = 0x8000_0000;
+export const entrySize = (narrow: boolean): number => (narrow ? 8 : 12);
+
+// manifestInlineCapacity and manifestOverflowCapacity default to the width this process writes.
+export const manifestInlineCapacity = (
+  pageSize: number,
+  encrypted = false,
+  narrow = manifestCrc32(),
+): number => {
   const [lo, hi] = inlineArea(pageSize, encrypted);
-  return Math.floor((hi - lo) / 12);
+  return Math.floor((hi - lo) / entrySize(narrow));
 };
-export const manifestOverflowCapacity = (pageSize: number): number =>
-  Math.floor((pageSize - 32) / 12);
+export const manifestOverflowCapacity = (pageSize: number, narrow = manifestCrc32()): number =>
+  Math.floor((pageSize - 32) / entrySize(narrow));
 export type WrittenPage = { index: number; bytes: Uint8Array };
 type Entry = { index: number; checksum: bigint };
-// ManifestEntry is one manifest record: a page id and the CRC-64 of its complete encoded bytes.
+// ManifestEntry is one manifest record: a page id and its manifest identity (pageDigest).
 export type ManifestEntry = Entry;
 
-// manifestEntriesOf digests written pages for a manifest.
-export function manifestEntriesOf(pages: WrittenPage[]): ManifestEntry[] {
-  return pages.map((pg) => ({ index: pg.index, checksum: crc64Update(0n, pg.bytes) }));
+// pageDigest is a listed page's manifest identity: the CRC-64 of its bytes (wide); narrow, a plaintext
+// page's own header checksum -- copied, not recomputed -- or an encrypted page's CRC-32 of its
+// ciphertext.
+export function pageDigest(bytes: Uint8Array, encrypted: boolean, narrow: boolean): bigint {
+  if (!narrow) return crc64Update(0n, bytes);
+  if (encrypted) return BigInt(crc32Update(0, bytes) >>> 0);
+  return BigInt(view(bytes).getUint32(12, false));
+}
+
+// manifestEntriesOf digests written pages for a manifest, at the width this process writes.
+export function manifestEntriesOf(pages: WrittenPage[], encrypted = false): ManifestEntry[] {
+  const narrow = manifestCrc32();
+  return pages.map((pg) => ({
+    index: pg.index,
+    checksum: pageDigest(pg.bytes, encrypted, narrow),
+  }));
 }
 export type CommitManifest = { entries: Entry[]; pages: WrittenPage[]; chainChecksum: bigint };
 export type CommitMeta = {
@@ -83,6 +109,8 @@ export type CommitMeta = {
   overflowCount: number;
   chainChecksum: bigint;
   inline: Entry[];
+  // narrow says the entries are 8 bytes and the chain digest a CRC-32 (manifest-crc32.md §2).
+  narrow: boolean;
 };
 
 export function metaChecksum(block: Uint8Array): number {
@@ -101,17 +129,30 @@ function zeroRange(bytes: Uint8Array, start: number, end: number): boolean {
   for (let i = start; i < end; i++) if (bytes[i] !== 0) return false;
   return true;
 }
-function putEntry(dv: DataView, offset: number, entry: Entry): void {
+function putEntry(dv: DataView, offset: number, entry: Entry, narrow: boolean): void {
   dv.setUint32(offset, entry.index, false);
-  dv.setBigUint64(offset + 4, entry.checksum, false);
+  if (narrow) dv.setUint32(offset + 4, Number(entry.checksum), false);
+  else dv.setBigUint64(offset + 4, entry.checksum, false);
 }
-function getEntry(dv: DataView, offset: number): Entry {
-  return { index: dv.getUint32(offset, false), checksum: dv.getBigUint64(offset + 4, false) };
+export function getEntry(dv: DataView, offset: number, narrow: boolean): Entry {
+  const checksum = narrow
+    ? BigInt(dv.getUint32(offset + 4, false))
+    : dv.getBigUint64(offset + 4, false);
+  return { index: dv.getUint32(offset, false), checksum };
 }
-function chainUpdate(crc: bigint, index: number, bytes: Uint8Array): bigint {
+// chainStep extends the manifest-overflow chain digest: CRC-64 (wide) or CRC-32 (narrow).
+export function chainStep(crc: bigint, bytes: Uint8Array, narrow: boolean): bigint {
+  return narrow ? BigInt(crc32Update(Number(crc), bytes) >>> 0) : crc64Update(crc, bytes);
+}
+export function chainUpdate(
+  crc: bigint,
+  index: number,
+  bytes: Uint8Array,
+  narrow: boolean,
+): bigint {
   const id = new Uint8Array(4);
   view(id).setUint32(0, index, false);
-  return crc64Update(crc64Update(crc, id), bytes);
+  return chainStep(chainStep(crc, id, narrow), bytes, narrow);
 }
 
 // buildCommitManifest encodes the manifest of a commit's entries: its body and free-list pages, never
@@ -128,8 +169,10 @@ export function buildCommitManifest(
     if (entries[i].index === entries[i - 1].index)
       throw engineError("data_corrupted", "duplicate commit page");
   }
-  const cap = manifestOverflowCapacity(pageSize);
-  let cursor = Math.min(entries.length, manifestInlineCapacity(pageSize, encrypted));
+  const narrow = manifestCrc32();
+  const size = entrySize(narrow);
+  const cap = manifestOverflowCapacity(pageSize, narrow);
+  let cursor = Math.min(entries.length, manifestInlineCapacity(pageSize, encrypted, narrow));
   const pages: WrittenPage[] = [];
   let chainChecksum = 0n;
   for (let ordinal = 0; ordinal < overflowIds.length; ordinal++) {
@@ -141,11 +184,11 @@ export function buildCommitManifest(
     dv.setUint32(8, overflowIds[ordinal + 1] ?? 0, false);
     dv.setBigUint64(16, txid, false);
     dv.setUint32(24, ordinal, false);
-    for (let j = 0; j < count; j++) putEntry(dv, 32 + j * 12, entries[cursor++]);
+    for (let j = 0; j < count; j++) putEntry(dv, 32 + j * size, entries[cursor++]!, narrow);
     dv.setUint32(12, pageChecksum(bytes), false);
-    const index = overflowIds[ordinal];
+    const index = overflowIds[ordinal]!;
     pages.push({ index, bytes });
-    chainChecksum = chainUpdate(chainChecksum, index, bytes);
+    chainChecksum = chainUpdate(chainChecksum, index, bytes, narrow);
   }
   if (cursor !== entries.length)
     throw engineError("data_corrupted", "commit manifest capacity exhausted");
@@ -159,16 +202,18 @@ export function writeManifestMeta(
 ): void {
   const dv = view(bytes);
   if (manifest !== undefined) {
+    const narrow = manifestCrc32();
     dv.setUint32(36, manifest.pages[0]?.index ?? 0, false);
-    dv.setUint32(40, manifest.entries.length, false);
+    dv.setUint32(40, (manifest.entries.length | (narrow ? NARROW_FLAG : 0)) >>> 0, false);
     dv.setUint32(44, manifest.pages.length, false);
     dv.setBigUint64(48, manifest.chainChecksum, false);
     const [lo] = inlineArea(bytes.length, encrypted);
     const count = Math.min(
       manifest.entries.length,
-      manifestInlineCapacity(bytes.length, encrypted),
+      manifestInlineCapacity(bytes.length, encrypted, narrow),
     );
-    for (let i = 0; i < count; i++) putEntry(dv, lo + i * 12, manifest.entries[i]);
+    for (let i = 0; i < count; i++)
+      putEntry(dv, lo + i * entrySize(narrow), manifest.entries[i]!, narrow);
   }
   dv.setUint32(32, metaChecksum(bytes), false);
 }
@@ -200,7 +245,10 @@ export function parseCommitMeta(
   const rootPage = dv.getUint32(20, false);
   const freeListHead = dv.getUint32(28, false);
   const livePages = dv.getUint32(56, false);
-  const dirtyCount = dv.getUint32(40, false);
+  const rawCount = dv.getUint32(40, false);
+  const narrow = (rawCount & NARROW_FLAG) !== 0;
+  const dirtyCount = (rawCount & ~NARROW_FLAG) >>> 0;
+  const size = entrySize(narrow);
   const overflowHead = dv.getUint32(36, false);
   const overflowCount = dv.getUint32(44, false);
   const chainChecksum = dv.getBigUint64(48, false);
@@ -220,10 +268,10 @@ export function parseCommitMeta(
   )
     return null;
   const [lo, hi] = inlineArea(pageSize, encrypted);
-  const inlineCount = Math.min(dirtyCount, manifestInlineCapacity(pageSize, encrypted));
+  const inlineCount = Math.min(dirtyCount, manifestInlineCapacity(pageSize, encrypted, narrow));
   if (
-    dirtyCount - inlineCount > overflowCount * manifestOverflowCapacity(pageSize) ||
-    !zeroRange(block, lo + inlineCount * 12, hi)
+    dirtyCount - inlineCount > overflowCount * manifestOverflowCapacity(pageSize, narrow) ||
+    !zeroRange(block, lo + inlineCount * size, hi)
   )
     return null;
   if (dirtyCount === 0 && overflowCount !== 0) return null;
@@ -231,7 +279,7 @@ export function parseCommitMeta(
   const freeListTag = encrypted ? block.slice(80, 96) : NO_TAG;
   if (freeListHead === 0 && !zeroRange(freeListTag, 0, freeListTag.length)) return null;
   const inline: Entry[] = [];
-  for (let i = 0; i < inlineCount; i++) inline.push(getEntry(dv, lo + i * 12));
+  for (let i = 0; i < inlineCount; i++) inline.push(getEntry(dv, lo + i * size, narrow));
   return {
     suite,
     txid: dv.getBigUint64(12, false),
@@ -246,6 +294,7 @@ export function parseCommitMeta(
     overflowCount,
     chainChecksum,
     inline,
+    narrow,
   };
 }
 
@@ -294,7 +343,9 @@ export function* validateCommitMetaSteps(
   const manifestIds = new Set<number>();
   let next = meta.overflowHead;
   let chainChecksum = 0n;
-  const cap = manifestOverflowCapacity(pageSize);
+  const narrow = meta.narrow;
+  const size = entrySize(narrow);
+  const cap = manifestOverflowCapacity(pageSize, narrow);
   for (let ordinal = 0; ordinal < meta.overflowCount; ordinal++) {
     if (next < first || next >= meta.pageCount || manifestIds.has(next)) return null;
     const index = next;
@@ -313,11 +364,11 @@ export function* validateCommitMetaSteps(
       dv.getUint32(24, false) !== ordinal ||
       dv.getUint32(28, false) !== 0 ||
       count !== Math.min(cap, meta.dirtyCount - entries.length) ||
-      !zero(bytes, 32 + count * 12)
+      !zero(bytes, 32 + count * size)
     )
       return null;
-    for (let i = 0; i < count; i++) entries.push(getEntry(dv, 32 + i * 12));
-    chainChecksum = chainUpdate(chainChecksum, index, bytes);
+    for (let i = 0; i < count; i++) entries.push(getEntry(dv, 32 + i * size, narrow));
+    chainChecksum = chainUpdate(chainChecksum, index, bytes, narrow);
     next = dv.getUint32(8, false);
   }
   if (next !== 0 || entries.length !== meta.dirtyCount || chainChecksum !== meta.chainChecksum)
@@ -358,7 +409,7 @@ export function* validateCommitMetaSteps(
     } else bytes = yield* read(entry.index);
     if (
       bytes.length !== pageSize ||
-      crc64Update(0n, bytes) !== entry.checksum ||
+      pageDigest(bytes, encrypted, narrow) !== entry.checksum ||
       (!encrypted &&
         (bytes[0] < 1 || bytes[0] > 7 || pageChecksum(bytes) !== view(bytes).getUint32(12, false)))
     )

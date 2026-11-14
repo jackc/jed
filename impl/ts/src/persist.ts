@@ -700,8 +700,8 @@ function* commitFileSteps(
   yield* paging.reserveSteps(plan.newPageCount);
   yield* paging.writePagesSteps(plan.pages);
   // The commit's own entries (its body and free-list pages) join the pending set of a relaxed commit.
-  const dirty = manifestEntriesOf([...write.pages, ...plan.pages]);
   const codec = paging.codec();
+  const dirty = manifestEntriesOf([...write.pages, ...plan.pages], codec !== null);
   const manifest = buildCommitManifest(
     db.pageSize,
     snap.txid,

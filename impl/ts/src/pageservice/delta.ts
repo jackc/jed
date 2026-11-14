@@ -7,7 +7,8 @@
 // Browser-safe: no node: imports (the owner's service worker and the unit tests use it).
 
 import {
-  crc64Update,
+  chainStep,
+  pageDigest,
   manifestInlineCapacity,
   manifestOverflowCapacity,
   pageChecksum,
@@ -77,6 +78,10 @@ export class Delta {
   readonly parsed: CommitMeta;
   // encrypted: body pages are ciphertext, checked by their manifest identity alone.
   private readonly encrypted: boolean;
+  // narrow says the client's manifest entries are narrow (manifest-crc32.md §2).
+  private get narrow(): boolean {
+    return this.parsed.narrow;
+  }
   // manifest is the overflow chain, in chain order; it arrives whole in commit_begin.
   readonly manifest: PsIndexedPage[] = [];
   // written is every index the delta writes (listed and manifest pages), ascending: the invalidation
@@ -125,15 +130,19 @@ export class Delta {
     let listed = 0;
     let carried = 0;
     const pending = base.pending ?? null;
+    // The client's entries are as wide as its meta declares (manifest-crc32.md §2).
+    const width = m.narrow ? 8 : 12;
+    const entryDigest = (entries: Uint8Array, e: number): bigint =>
+      m.narrow ? BigInt(u32(entries, e + 4)) : u64(entries, e + 4);
     const list = (entries: Uint8Array, at: number, count: number): void => {
       for (let i = 0; i < count; i++) {
-        const e = at + i * 12;
+        const e = at + i * width;
         const index = u32(entries, e);
         if (index <= last) throw failure("manifest indices are not strictly ascending");
         const digest = pending?.get(index);
         if (digest !== undefined) {
           // A page an earlier commit of the batch wrote: listed, never sent again.
-          if (u64(entries, e + 4) !== digest) {
+          if (entryDigest(entries, e) !== digest) {
             throw failure(`pending page ${index} is listed with another digest`);
           }
           last = index;
@@ -148,7 +157,7 @@ export class Delta {
           throw failure(`page ${index} is neither beyond the high-water nor a granted free page`);
         }
         last = index;
-        d.expected.set(index, u64(entries, e + 4));
+        d.expected.set(index, entryDigest(entries, e));
         protectedPages.add(index);
         rootSeen ||= index === m.rootPage;
         freeHeadSeen ||= index === m.freeListHead;
@@ -158,7 +167,7 @@ export class Delta {
     list(
       cb.meta,
       codec === null ? 64 : 96,
-      Math.min(m.dirtyCount, manifestInlineCapacity(ps, codec !== null)),
+      Math.min(m.dirtyCount, manifestInlineCapacity(ps, codec !== null, m.narrow)),
     );
     let id = m.overflowHead;
     let chain = 0n;
@@ -168,7 +177,7 @@ export class Delta {
         throw failure("the manifest chain names an illegal page");
       }
       const block = pg.page;
-      const count = Math.min(m.dirtyCount - listed, manifestOverflowCapacity(ps));
+      const count = Math.min(m.dirtyCount - listed, manifestOverflowCapacity(ps, m.narrow));
       if (
         block.length !== ps ||
         pageChecksum(block) !== u32(block, 12) ||
@@ -178,13 +187,13 @@ export class Delta {
         u64(block, 16) !== m.txid ||
         u32(block, 24) !== ordinal ||
         !zero(block, 28, 32) ||
-        !zero(block, 32 + 12 * count)
+        !zero(block, 32 + width * count)
       ) {
         throw failure("a manifest page is malformed");
       }
       const index = new Uint8Array(4);
       new DataView(index.buffer).setUint32(0, id, false);
-      chain = crc64Update(crc64Update(chain, index), block);
+      chain = chainStep(chainStep(chain, index, m.narrow), block, m.narrow);
       protectedPages.add(id);
       list(block, 32, count);
       d.manifest.push({ index: id, page: block.slice() });
@@ -221,7 +230,11 @@ export class Delta {
     if (this.received.has(pg.index)) throw failure(`page ${pg.index} arrived twice`);
     const b = pg.page;
     const plainOk = this.encrypted || (b[0]! >= 1 && b[0]! <= 7 && pageChecksum(b) === u32(b, 12));
-    if (b.length !== this.meta.length || !plainOk || crc64Update(0n, b) !== crc) {
+    if (
+      b.length !== this.meta.length ||
+      !plainOk ||
+      pageDigest(b, this.encrypted, this.narrow) !== crc
+    ) {
       throw failure(`page ${pg.index} does not match its manifest identity`);
     }
     this.received.add(pg.index);

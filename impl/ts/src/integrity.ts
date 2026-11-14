@@ -30,11 +30,14 @@ import type {
 import { indexColumnOrdinals, indexKeyOrder, resolveColType } from "./catalog.ts";
 import type { Collation } from "./collation.ts";
 import {
+  chainUpdate,
   type CommitMeta,
-  crc64Update,
+  entrySize,
+  getEntry,
   manifestOverflowCapacity,
   metaChecksum,
   pageChecksum,
+  pageDigest,
   parseCommitMeta,
 } from "./commit_manifest.ts";
 import { cancellationCheckpoint, throwIfAborted } from "./cancel.ts";
@@ -454,7 +457,9 @@ class Checker {
     const chain: { index: number; bytes: Uint8Array }[] = [];
     let next = meta.overflowHead;
     let chainChecksum = 0n;
-    const capacity = manifestOverflowCapacity(ps);
+    const narrow = meta.narrow; // manifest-crc32.md §2: 8-byte entries, a CRC-32 chain digest
+    const width = entrySize(narrow);
+    const capacity = manifestOverflowCapacity(ps, narrow);
     let chainOk = true;
     for (let ordinal = 0; ordinal < meta.overflowCount; ordinal++) {
       if (next < first || next >= meta.pageCount || deps.has(next)) {
@@ -488,13 +493,8 @@ class Checker {
         chainOk = false;
         break;
       }
-      for (let i = 0; i < count; i++) {
-        entries.push({
-          index: dv.getUint32(32 + i * 12, false),
-          checksum: dv.getBigUint64(36 + i * 12, false),
-        });
-      }
-      chainChecksum = crc64Update(crc64Update(chainChecksum, u32Bytes(index)), bytes);
+      for (let i = 0; i < count; i++) entries.push(getEntry(dv, 32 + i * width, narrow));
+      chainChecksum = chainUpdate(chainChecksum, index, bytes, narrow);
       next = dv.getUint32(8, false);
     }
     if (chainOk && chainChecksum !== meta.chainChecksum && report) {
@@ -534,7 +534,7 @@ class Checker {
       const bytes = yield* paging.readPageSteps(entry.index);
       const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
       if (
-        crc64Update(0n, bytes) !== entry.checksum ||
+        pageDigest(bytes, encrypted, narrow) !== entry.checksum ||
         (!encrypted &&
           (bytes[0]! < 1 || bytes[0]! > 7 || pageChecksum(bytes) !== dv.getUint32(12, false)))
       ) {
@@ -1861,12 +1861,6 @@ function paddedEqual(stored: Uint8Array, want: Uint8Array): boolean {
   for (let i = 0; i < want.length; i++) if (stored[i] !== want[i]) return false;
   for (let i = want.length; i < stored.length; i++) if (stored[i] !== 0) return false;
   return true;
-}
-
-function u32Bytes(n: number): Uint8Array {
-  const b = new Uint8Array(4);
-  new DataView(b.buffer).setUint32(0, n, false);
-  return b;
 }
 
 // integrityCheckSteps runs the check over target (spec/design/integrity-check.md §3–§5). The caller
