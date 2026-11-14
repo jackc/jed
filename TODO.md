@@ -277,9 +277,10 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
     the encryption security review's opinion on it ([encryption.md](spec/design/encryption.md)). _(size: M)_
   - [ ] _follow-on:_ a race review of the commit path, which sets page ids on the committing
     snapshot's own nodes and swaps the resident list during planning. _(size: S)_
-  - [ ] _follow-on:_ re-measure the commit CPU and byte savings with all three parts unconditional
-    (the stamp postdates every prototype measurement), and a loosely-packed tree mutated away from the
-    right edge, where leaf evening's rebalance is common. _(size: S)_
+  - [ ] _follow-on:_ re-measure the bytes written per commit with all three parts unconditional, and a
+    loosely-packed tree mutated away from the right edge, where leaf evening's rebalance is common.
+    Commit time is measured (deferred-interior.md §9.10): relaxed lanes 19–44% faster in Go and TS,
+    durable lanes within the fsync noise. _(size: S)_
   - [ ] _follow-on:_ a deferral planner in the Ruby reference, so it writes deferred histories from SQL
     rather than by hand. _(size: M)_
 

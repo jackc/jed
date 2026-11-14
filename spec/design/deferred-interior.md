@@ -883,5 +883,22 @@ crash and backup images); and `mise run ci` — every step, including the real-p
 browser e2e suites and the NoREC sweep. The one corpus entry the change moved is
 `storage/cow_missing_root.test`, whose fixture now recovers the new generation.
 
-Not run: the benchmarks (the saving was measured on the prototypes, §8.5 and manifest-crc32.md §3;
-re-measuring with all three parts unconditional is a TODO follow-on).
+**Benchmarks** (2026-11-13, after the landing). The six `write_durable` lanes, v52 at the merge-base
+`4405f2898` against v53, each core's own `bench-jed` harness, two alternating rounds (base, v53,
+base, v53) on one machine, nothing else running. Mean µs per commit, the two rounds averaged; every
+answer checksum agrees between base and v53:
+
+| lane | Go | Rust | TS |
+|---|---|---|---|
+| `insert_commit_relaxed` | 471 → 383 (−19%) | 220 → 221 (+1%; p50 −10%) | 475 → 362 (−24%) |
+| `update_commit_relaxed` | 822 → 461 (−44%) | 212 → 148 (−30%) | 499 → 392 (−22%) |
+| `insert_commit_durable` | 2,151 → 2,211 (+3%) | 1,752 → 1,645 (−6%) | 1,921 → 1,813 (−6%) |
+| `insert_commit_durable_text` | 2,261 → 2,245 (−1%) | 1,791 → 1,794 (0%) | 1,808 → 1,773 (−2%) |
+| `update_commit_durable` | 2,338 → 1,996 (−15%) | 1,618 → 1,764 (+9%) | 2,117 → 2,079 (−2%) |
+| `update_untouched_large_durable` | 2,289 → 2,006 (−12%) | 1,928 → 1,758 (−9%) | 2,193 → 2,052 (−6%) |
+
+The relaxed lanes, where the barrier is batched and the commit's own CPU and bytes dominate, are
+faster in every core, by a fifth to nearly half for the single-row UPDATE. The durable lanes are
+dominated by the barrier (≈1.5–2 ms), and two base rounds of one lane differ by up to 20% (Rust
+`update_commit_durable`: 1,769 vs 1,466), so their deltas, including Rust's +9%, are within noise.
+Bytes written per commit were not re-measured.
