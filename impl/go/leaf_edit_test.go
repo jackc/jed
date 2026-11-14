@@ -224,8 +224,8 @@ func TestLeafWidenGrowth(t *testing.T) {
 	if os.Getenv("JED_LEAF_SHAPES") == "" {
 		t.Skip("set JED_LEAF_SHAPES=1")
 	}
-	savedSlack, savedFORX := leafSlack, leafFORX
-	defer func() { leafSlack, leafFORX = savedSlack, savedFORX }()
+	savedSlack, savedFORX, savedRuns := leafSlack, leafFORX, leafRuns
+	defer func() { leafSlack, leafFORX, leafRuns = savedSlack, savedFORX, savedRuns }()
 	cases := []struct {
 		name   string
 		setup  []string
@@ -249,10 +249,12 @@ func TestLeafWidenGrowth(t *testing.T) {
 		name  string
 		slack int
 		forx  bool
-	}{{"v53", 0, false}, {"slack32", 32, false}, {"slack16", 16, false}, {"forx", 0, true}}
+		runs  int
+	}{{"v53", 0, false, 0}, {"slack32", 32, false, 0}, {"slack16", 16, false, 0}, {"forx", 0, true, 0},
+		{"runs-s", 0, false, leafRunsSearch}, {"runs-r", 0, false, leafRunsRank}}
 	for _, c := range cases {
 		for _, m := range modes {
-			leafSlack, leafFORX = m.slack, m.forx
+			leafSlack, leafFORX, leafRuns = m.slack, m.forx, m.runs
 			path := filepath.Join(t.TempDir(), c.name+".jed")
 			db, err := CreateDatabase(CreateOptions{Path: path, SkipFsync: true})
 			if err != nil {

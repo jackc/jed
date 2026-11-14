@@ -277,6 +277,11 @@ func forSaving(n, w int, r forRange) int {
 	if x := forExcSaving(n, w, r); x > s {
 		s = x // PROTOTYPE (leaf_forx.go)
 	}
+	if r.rd != nil && len(r.rd.vals) == n {
+		if x := r.rd.saving(); x > s {
+			s = x // PROTOTYPE (leaf_runs.go)
+		}
+	}
 	if s > 0 {
 		return s
 	}
@@ -290,9 +295,22 @@ type forRange struct {
 	any      bool
 	lo2, hi2 uint64
 	two      bool
+	// PROTOTYPE (leaf_runs.go): rd keeps the column's runs, in runs mode, for ranges built over the
+	// rows in order.
+	rd *runsAcc
+}
+
+// addNull records a NULL row (only runs keep NULLs: they take an offset slot in their run).
+func (r *forRange) addNull() {
+	if r.rd != nil {
+		r.rd.push(0, false)
+	}
 }
 
 func (r *forRange) add(v uint64) {
+	if r.rd != nil {
+		r.rd.push(v, true)
+	}
 	if !r.any {
 		r.lo, r.hi, r.any = v, v, true
 		return
@@ -327,10 +345,12 @@ func (r *forRange) add(v uint64) {
 func rowsFORSaving(cols []forCol, rows []storedRow) int {
 	total := 0
 	for _, fc := range cols {
-		var r forRange
+		r := newRunsRange(fc.w)
 		for _, row := range rows {
 			if v := row[fc.col]; !v.IsNull() {
 				r.add(forSlot(fc, v))
+			} else {
+				r.addNull()
 			}
 		}
 		total += forSaving(len(rows), fc.w, r)
@@ -343,9 +363,10 @@ func packedFORSaving(cols []forCol, l *paxLeaf, n int) int {
 	total := 0
 	for _, fc := range cols {
 		reg := &l.regions[fc.col]
-		var r forRange
+		r := newRunsRange(fc.w)
 		for i := 0; i < n; i++ {
 			if reg.bitmap[i/8]&(0x80>>(i%8)) != 0 {
+				r.addNull()
 				continue
 			}
 			r.add(beUint(reg.body[i*fc.w : (i+1)*fc.w]))
@@ -653,10 +674,13 @@ func leafSizesOf(shape leafShape, rows []storedRow, items [][]dictItem, tabs []*
 		sz.tabs, _ = trainTabs(shape, items, nil)
 	}
 	for j, fc := range shape.forCols {
+		sz.fors[j] = newRunsRange(fc.w)
 		for _, row := range rows {
 			if v := row[fc.col]; !v.IsNull() {
 				sz.fors[j].add(forSlot(fc, v))
 				sz.forCnt[j]++
+			} else {
+				sz.fors[j].addNull()
 			}
 		}
 	}
@@ -705,6 +729,11 @@ func leafSizesOf(shape leafShape, rows []storedRow, items [][]dictItem, tabs []*
 func (sz *leafSizes) addRow(shape leafShape, pcap pageCap, key []byte, row storedRow) {
 	sz.n++
 	for j, fc := range shape.forCols {
+		if leafRuns != leafRunsOff {
+			// PROTOTYPE (leaf_runs.go): runs depend on where the row goes; measure the column again.
+			sz.fors[j].rd = nil
+			sz.forStale[j], sz.stale = true, true
+		}
 		if v := row[fc.col]; !v.IsNull() {
 			sz.fors[j].add(forSlot(fc, v))
 			sz.forCnt[j]++
@@ -775,10 +804,13 @@ func leafSizesScanned(shape leafShape, rows []storedRow, items [][]dictItem, sca
 		items:    make([]dictItem, len(shape.itemCols)),
 	}
 	for j, fc := range shape.forCols {
+		sz.fors[j] = newRunsRange(fc.w)
 		for _, row := range rows[lo:hi] {
 			if v := row[fc.col]; !v.IsNull() {
 				sz.fors[j].add(forSlot(fc, v))
 				sz.forCnt[j]++
+			} else {
+				sz.fors[j].addNull()
 			}
 		}
 	}
@@ -834,12 +866,20 @@ func (sz *leafSizes) removeRow(shape leafShape, pcap pageCap, key []byte, row st
 	sz.n--
 	for j, fc := range shape.forCols {
 		v := row[fc.col]
+		if leafRuns != leafRunsOff {
+			sz.fors[j].rd = nil // PROTOTYPE (leaf_runs.go): measured again below
+			sz.forStale[j], sz.stale = true, true
+		}
 		if v.IsNull() {
 			continue
 		}
 		sz.forCnt[j]--
 		r := &sz.fors[j]
-		if sz.forCnt[j] == 0 {
+		if leafRuns != leafRunsOff {
+			// PROTOTYPE (leaf_runs.go): measure the column again.
+			r.rd = nil
+			sz.forStale[j], sz.stale = true, true
+		} else if sz.forCnt[j] == 0 {
 			*r = forRange{}
 			sz.forStale[j] = false
 		} else if r.forRemoved(forSlot(fc, v)) {
@@ -859,13 +899,15 @@ func (sz *leafSizes) refresh(shape leafShape, rows []storedRow) {
 		if !sz.forStale[j] {
 			continue
 		}
-		var r forRange
+		r := newRunsRange(fc.w)
 		for _, row := range rows {
 			if row == nil {
 				continue // PROTOTYPE (leaf_edit.go): an empty slot of a gap
 			}
 			if v := row[fc.col]; !v.IsNull() {
 				r.add(forSlot(fc, v))
+			} else {
+				r.addNull()
 			}
 		}
 		sz.fors[j] = r

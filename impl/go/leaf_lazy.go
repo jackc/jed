@@ -442,6 +442,7 @@ func (p *packedLeaf) regionSaving(c int) int {
 // leaf's rows: dense slots for the rows still on the page, values for the others.
 func (n *pnode) forRangeOf(fc forCol) (r forRange, count int) {
 	reg := &n.lazyBase.dirs.regions[fc.col]
+	r = newRunsRange(fc.w)
 	for i, at := range n.lazy {
 		if at == gapPoison {
 			continue
@@ -450,10 +451,13 @@ func (n *pnode) forRangeOf(fc forCol) (r forRange, count int) {
 			if v := n.vals[i][fc.col]; !v.IsNull() {
 				r.add(forSlot(fc, v))
 				count++
+			} else {
+				r.addNull()
 			}
 			continue
 		}
 		if reg.bitmap[at/8]&(0x80>>(at%8)) != 0 {
+			r.addNull()
 			continue
 		}
 		r.add(beUint(reg.body[int(at)*fc.w : (int(at)+1)*fc.w]))
@@ -644,6 +648,10 @@ func (sz *leafSizes) replaceCols(n *pnode, i int, key []byte, val storedRow, sha
 				continue
 			}
 			ov, nv := old[fc.col], val[fc.col]
+			if leafRuns != leafRunsOff {
+				sz.fors[j].rd = nil // PROTOTYPE (leaf_runs.go): measure the column again
+				sz.forStale[j], sz.stale = true, true
+			}
 			if !ov.IsNull() {
 				sz.forCnt[j]--
 				r := &sz.fors[j]
@@ -722,6 +730,9 @@ func (sz *leafSizes) clone() *leafSizes {
 		out.accs[j].dict.seen = maps.Clone(sz.accs[j].dict.seen)
 	}
 	out.fors = slices.Clone(sz.fors)
+	for j := range out.fors {
+		out.fors[j].rd = out.fors[j].rd.clone() // PROTOTYPE (leaf_runs.go)
+	}
 	out.forCnt = slices.Clone(sz.forCnt)
 	out.forStale = slices.Clone(sz.forStale)
 	out.forFrozen, out.forSave = slices.Clone(sz.forFrozen), slices.Clone(sz.forSave)
@@ -994,16 +1005,23 @@ func encodeRegion(ty colType, n int, vb [][]byte, nulls []bool) []byte {
 		out := make([]byte, 1, 1+(n+7)/8+n*w)
 		useFOR, base, bw := false, uint64(0), 0
 		if forEligible(ty) {
-			var r forRange
+			r := newRunsRange(w)
 			for i := 0; i < n; i++ {
 				if !nulls[i] {
 					r.add(beUint(vb[i]))
+				} else {
+					r.addNull()
 				}
 			}
 			if forSaving(n, w, r) > 0 {
 				useFOR, base, bw = true, r.lo, forWidth(w, r.lo, r.hi)
 				out[0] = regionFOR
-				if x := forExcSaving(n, w, r); x > n*(w-bw)-(w+1) {
+				k1 := n*(w-bw) - (w + 1)
+				x := forExcSaving(n, w, r)
+				if rs := r.rd.saving(); rs > k1 && rs > x {
+					return encodeRuns(w, n, vb, nulls, r.rd) // PROTOTYPE (leaf_runs.go)
+				}
+				if x > k1 {
 					return encodeFORX(w, n, vb, nulls, r) // PROTOTYPE (leaf_forx.go)
 				}
 			}

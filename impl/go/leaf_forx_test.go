@@ -59,21 +59,26 @@ func forxWorkload(t *testing.T) string {
 			fmt.Fprintf(&out, "%s\n", strings.Join(row, "|"))
 		}
 	}
-	mustExec(t, sess, "CREATE TABLE f (id bigint PRIMARY KEY, a integer, b bigint, c smallint, d date)")
+	mustExec(t, sess, "CREATE TABLE f (id bigint PRIMARY KEY, a integer, b bigint, c smallint, d date, e bigint)")
 	mustExec(t, sess, `INSERT INTO f SELECT x, x % 7, CASE WHEN x % 97 = 0 THEN 9000000000 + x ELSE x % 50 END,
-		CASE WHEN x % 13 = 0 THEN NULL ELSE 3 END, DATE '2024-01-01' + (x % 3) FROM generate_series(1, 3000) AS g(x)`)
+		CASE WHEN x % 13 = 0 THEN NULL ELSE 3 END, DATE '2024-01-01' + (x % 3),
+		CASE WHEN x % 29 = 0 THEN NULL ELSE x * 1000 + x % 3 END FROM generate_series(1, 3000) AS g(x)`)
 	reopen()
 	mustExec(t, sess, "UPDATE f SET a = 2000000000 WHERE id = 10")
 	mustExec(t, sess, "UPDATE f SET c = -32000 WHERE id = 500")
 	mustExec(t, sess, "UPDATE f SET a = -2000000000 WHERE id IN (1200, 1201)")
 	reopen()
-	query("SELECT count(*), sum(a), sum(b), sum(c), min(d), max(d) FROM f")
+	query("SELECT count(*), sum(a), sum(b), sum(c), min(d), max(d), sum(e) FROM f")
 	mustExec(t, sess, "UPDATE f SET a = 3 WHERE id = 10")
 	mustExec(t, sess, "DELETE FROM f WHERE id % 97 = 0 AND id < 1500")
-	mustExec(t, sess, "INSERT INTO f VALUES (5000, 1, 7000000000000, NULL, DATE '1999-12-31')")
+	mustExec(t, sess, "INSERT INTO f VALUES (5000, 1, 7000000000000, NULL, DATE '1999-12-31', 123456789012)")
 	reopen()
-	query("SELECT count(*), sum(a), sum(b), sum(c), min(d), max(d) FROM f")
-	query("SELECT id, a, b, c, d FROM f WHERE id IN (10, 97, 500, 1200, 1201, 1552, 5000) ORDER BY id")
+	query("SELECT count(*), sum(a), sum(b), sum(c), min(d), max(d), sum(e) FROM f")
+	mustExec(t, sess, "UPDATE f SET e = -5 WHERE id % 300 = 7")
+	mustExec(t, sess, "DELETE FROM f WHERE id BETWEEN 2000 AND 2100")
+	reopen()
+	query("SELECT count(*), sum(e), min(e), max(e) FROM f")
+	query("SELECT id, a, b, c, d, e FROM f WHERE id IN (10, 97, 500, 1200, 1201, 1552, 1807, 5000) ORDER BY id")
 	sess.Close()
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
@@ -84,4 +89,22 @@ func forxWorkload(t *testing.T) string {
 	}
 	checkPackedSizes(t, file, "f")
 	return out.String()
+}
+
+// The same for base-plus-offsets regions in runs (leaf_runs.go), with each lookup index.
+func TestLeafRunsRoundTrip(t *testing.T) {
+	saved := leafRuns
+	defer func() { leafRuns = saved }()
+	leafRuns = leafRunsOff
+	plain := forxWorkload(t)
+	for _, mode := range []int{leafRunsSearch, leafRunsRank} {
+		leafRuns = mode
+		before := runsWritten.Load()
+		if got := forxWorkload(t); got != plain {
+			t.Fatalf("mode %d: rows in runs:\n%s\nwithout:\n%s", mode, got, plain)
+		}
+		if runsWritten.Load() == before {
+			t.Fatalf("mode %d: the workload wrote no region in runs", mode)
+		}
+	}
 }

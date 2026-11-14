@@ -220,6 +220,103 @@ widens a second value in about every leaf. Live pages:
   switch on).
 - **(c) Accept.** No specification change.
 
+## 4a. Option (d): runs, each with its own base
+
+Proposed by the maintainer after §4: let a base-plus-offsets column change its base and offset width
+partway through the leaf, so an outlier, or a column that drifts with the key, costs only the rows
+near it. Prototyped as region kind 7 (`JED_LEAF_RUNS`, `impl/go/leaf_runs.go`):
+
+```
+null bitmap | run count R (u16) | [rank index] | R × (start row u16, data offset u16, base w, width u8) | offsets
+```
+
+A run's width is one of 0, 1, 2, 4 or 8 bytes below `w`, or `w` itself. The runs are the cheapest
+division of the leaf's rows, found by dynamic programming over the rows in order (exact, amortized
+constant work per row with sliding-window minima per width; ties to the narrowest last run, then the
+earliest start). The region costs `F + Σ (w + 5 + len·width)` and is chosen only when smaller than
+every other kind. A leaf's payload stays nondecreasing in its rows, which the split scan needs: the
+cheapest division of a set of rows is never dearer than that of a subset.
+
+Two lookup layouts, so a reader can find row `i`'s run without decoding the region (the maintainer's
+"additional run data inline so a read could quickly skip"):
+
+- **search** (`F = 2`): binary search over the run starts.
+- **rank** (`F = 2 + ⌈N/8⌉ + 2⌈N/64⌉`): a bit per row set where a run starts, plus per 64 rows the number
+  of runs started before them; row `i`'s run is that count plus one popcount. 76 bytes at 476 rows.
+
+`TestLeafRunsRoundTrip` passes in both layouts (writes, reopens, updates and deletes rows with
+outliers and a drifting column, under the size and patch cross-checks, against the same workload
+without runs). The Go corpus passes in memory and disk mode except for page-count pins: costs and
+EXPLAIN page estimates fall in eight files (`query/index_key_set`, `query/inl_key_set`,
+`query/subquery_point_set` and their EXPLAIN files, `query/statistics_estimates_p9`,
+`ddl/foreign_key_keyed_actions`, and `query/composite_key_set` with search), because the corpus
+tables shrink. No row differs.
+
+**Size.** Runs pay off on a column that drifts with the key: the cascade's child table (`parent_id =
+id mod 10000 + 1`) loads in 42 live pages instead of 53 (−21%), `del_orders` (`v = 7·id`) in 204
+instead of 212 (−4%). The bench datasets are uniform random, so only `large` moves (9,346 → 9,290
+with search, −0.6%; 9,326 with rank).
+
+**Outliers.** Runs absorb an outlier worse than the exception. Isolating one costs two run headers
+(26 bytes for a `bigint`) against the exception's 10, and a leaf loaded in key order has only a few
+spare bytes. In `TestLeafWidenGrowth`:
+
+| table | master | exception | runs, search | runs, rank |
+|---|---|---|---|---|
+| `wide` | 25 → 31 → 31 | 25 → 25 → 30 | 25 → 25 → 30 | 25 → 30 → 30 |
+| `d` | 212 → 276 → 293 | 212 → 214 → 274 | 204 → 270 → 270 | 206 → 273 → 273 |
+| `c` | 53 → 84 → 96 | 53 → 60 → 72 | 42 → 54 → 54 | 44 → 58 → 58 |
+
+(live pages: loaded, after one widening per leaf, after a second.)
+
+**Write time.** As built, every edit to a leaf measures each such column again from all its rows:
+the cheapest division depends on every row, while kind 1 keeps a running minimum and maximum. Medians
+of seven alternating rounds (ms):
+
+| benchmark | master | exception | runs, search | runs, rank |
+|---|---|---|---|---|
+| `fk_cascade_delete_indexed` | 2.734 | 2.736 | 5.741 | 5.636 |
+| `insert_rollback` | 3.836 | 3.666 | 12.230 | 11.673 |
+| `delete_range_rollback` | 11.156 | 11.235 | 72.596 | 74.177 |
+| `delete_insert_churn` | 5.164 | 5.250 | 21.845 | 21.691 |
+| `update_untouched_large_rollback` | 0.043 | 0.011 | 0.019 | 0.057 |
+
+Re-measuring is 52% of the range delete's profile. Loading the four bench datasets takes 12.7 s
+instead of 6.3 s, because the split scan evaluates every candidate half. Some of this is prototype
+overhead (each re-measure allocates afresh), but most of it is inherent to an optimal division. A
+cheaper write path would need a rule that an edit can repair locally, and such a rule does not
+guarantee the monotone size the split scan relies on.
+
+## 4b. Reading a value in place
+
+Today every core rebuilds a base-plus-offsets column, and an elided key column, as a full-width
+copy for the leaf and reads from the copy: Go when it parses the page, Rust and TS on the first read
+of that column in that leaf. The copy costs an O(N) loop and keeps a resident leaf larger than its
+page. Reading in place would avoid both, so the region kinds are compared on that basis too.
+
+`BenchmarkLeafColumnRead` (`impl/go/leaf_read_bench_test.go`) reads one `bigint` column of 476 rows
+straight from each region's bytes, pinned to one CPU, three runs each (ns; medians):
+
+| column / region | bytes | read one row | scan, a lookup per row | scan, run by run | build the copy |
+|---|---|---|---|---|---|
+| drift, kind 1 | 1,022 | 2.4 | 572 | | 2,170 |
+| drift, exception | 1,032 | 2.5 | 588 | | 2,166 |
+| drift, runs search | 708 | 12.3 | 5,022 | 327 | 6,428 |
+| drift, runs rank | 784 | 11.6 | 4,185 | 327 | 5,836 |
+| outlier, kind 1 | 3,869 | 3.6 | 1,292 | | 2,952 |
+| outlier, exception | 556 | 2.3 | 520 | | 2,051 |
+| outlier, runs search | 577 | 10.8 | 3,408 | 205 | 4,892 |
+| outlier, runs rank | 653 | 11.6 | 4,175 | 202 | 5,812 |
+| random, kind 1 | 1,974 | 2.7 | 1,050 | | 2,743 |
+| reading the full-width copy | | 2.2 | 1,258 | | |
+
+- **Kind 1 and the exception read in place as fast as the copy** (2.3–3.6 ns a row against 2.2), and a
+  scan is faster than scanning the copy, because it reads fewer bytes. Reading in place would remove
+  the copy's 2–3 µs per column per leaf, and its memory, at no cost per read.
+- **Runs cost 4–5 times as much per random read** (11–12 ns): finding the run. The rank index is no
+  faster than binary search at these run counts, and costs 76 more bytes a column. A scan that walks
+  run by run is the fastest of all (200–330 ns), but every reader must then be run-aware.
+
 ## 5. Leaf evening
 
 `JED_LEAF_EVEN=off` (measurement only; it changes split decisions) against master: `insert_rollback`
@@ -252,7 +349,7 @@ rows.
   copying a leaf that is 4.8 times larger (§2). That is the price of density and no edit-path change
   removes it.
 
-**#5: take the exception (b) as format v54; do not adopt slack (a).**
+**#5: take the exception (b) as format v54; adopt neither slack (a) nor runs (d).**
 
 The maintainer confirmed (2026-11-14) that the project is still in development and a format version
 is cheap, which removes the reason given earlier for waiting.
@@ -260,6 +357,15 @@ is cheap, which removes the reason given earlier for waiting.
 - Slack costs 3% to 7% of every key-ordered table and only helps leaves of wide rows. The exception
   costs nothing on the datasets, helps leaves of any width, and fixes the benchmark (0.042 to
   0.011 ms, v51 0.018).
+- **Runs (§4a) lose on what matters most here.** They are the only option that shrinks a drifting
+  column (−21% on the child table) and they handle any number of outliers, but they absorb an
+  outlier worse than the exception (two run headers against 10 bytes), make every write that touches
+  a leaf re-measure it (range delete 6.5×, bulk load 2×, as built), and make a random read in place
+  4–5 times as costly (§4b). The exception keeps kind 1's constant-time read in place.
+- **If drift compression is wanted later**, prototype fixed-size blocks rather than chosen runs: each
+  block of, say, 64 rows with its own base and width. Row `i`'s block is `i / 64`, so a read in place
+  stays constant-time with no index, and an edit re-measures one block. An outlier widens only its
+  block, and could still take the exception. Not prototyped.
 - **Open choice before porting: one exception or a few.** One exception absorbs only the first
   outlier per leaf and column; a second in the same leaf widens the column and splits the leaf, and
   in `TestLeafWidenGrowth` that still grew the tables 20% to 36%. A region with up to `k` exceptions
@@ -270,6 +376,11 @@ is cheap, which removes the reason given earlier for waiting.
   update), and size a failed evening candidate from its page (§5). Neither is prototyped.
 - For scale: without any change, widening one value in every leaf grows the tables 24% to 58%,
   still 1.9 to 3.6 times smaller than in v51.
+
+**Separately: read base-plus-offsets columns in place** (§4b). Kind 1 reads as fast in place as from
+the full-width copy every core builds today, so dropping the copy saves its O(N) build per column per
+leaf and keeps a resident leaf the size of its page. It is the open follow-on "keep a resident leaf
+the size of its page" (leaf-structural.md §12), now with a measurement. No format change.
 
 **How the two interact.**
 
@@ -293,10 +404,13 @@ All off by default; the corpus, goldens and `mise run test` pass with them off.
 | `JED_LEAF_SLACK=d` | `leaf_slack.go` | yes (split points) | slack C/d on right-edge splits |
 | `JED_LEAF_FORX=on` | `leaf_forx.go` | yes (region kind 6) | one exception per base-plus-offsets region |
 | `JED_LEAF_EVEN=off` | `leaf_even.go` | yes (split points) | no evening, to measure its cost |
+| `JED_LEAF_RUNS=search\|rank` | `leaf_runs.go` | yes (region kind 7) | base-plus-offsets in runs, with a lookup index |
 
 Tests: `TestLeafEditModes` (the modes write identical bytes), `TestLeafFORXRoundTrip`,
-`TestLeafShapes` and `TestLeafWidenGrowth` (the last two log only, under `JED_LEAF_SHAPES=1`).
+`TestLeafRunsRoundTrip`, `TestLeafShapes` and `TestLeafWidenGrowth` (the last two log only, under
+`JED_LEAF_SHAPES=1`); `BenchmarkLeafColumnRead` (§4b).
 
 **Not verified.** Rust and TS were not measured. The gap prototype is safe only because one writer
 owns every dirty node; its close-on-freeze path was exercised by the corpus but not under the race
-detector. Kind 6 was not run through the simulation sweep, the Ruby reference or `verify.rb`.
+detector. Kinds 6 and 7 were not run through the simulation sweep, the Ruby reference or `verify.rb`.
+The in-place readers of §4b exist only in the benchmark; no core reads in place yet.

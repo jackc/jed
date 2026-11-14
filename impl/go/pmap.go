@@ -1623,6 +1623,9 @@ func splitPointRunning(keys [][]byte, vals []storedRow, items [][]dictItem, scan
 	n := len(keys)
 	total := prefix[n]
 	fors := make([]forRange, len(shape.forCols))
+	for j, fc := range shape.forCols {
+		fors[j] = newRunsRange(fc.w) // PROTOTYPE (leaf_runs.go)
+	}
 	facts := make([]colFacts, len(shape.itemCols))
 	nulls := make([]bool, len(shape.itemCols))
 	headers := make([]int, len(shape.itemCols))
@@ -1631,6 +1634,9 @@ func splitPointRunning(keys [][]byte, vals []storedRow, items [][]dictItem, scan
 	}
 	reset := func() {
 		clear(fors)
+		for j, fc := range shape.forCols {
+			fors[j] = newRunsRange(fc.w)
+		}
 		clear(facts)
 		clear(nulls)
 	}
@@ -1639,6 +1645,8 @@ func splitPointRunning(keys [][]byte, vals []storedRow, items [][]dictItem, scan
 		for j, fc := range shape.forCols {
 			if v := vals[i][fc.col]; !v.IsNull() {
 				fors[j].add(forSlot(fc, v))
+			} else {
+				fors[j].addNull()
 			}
 		}
 		for j, c := range shape.itemCols {
@@ -1938,11 +1946,40 @@ func buildLeaf(keys [][]byte, vals []storedRow, weights []uint32, cap pageCap, s
 			}
 		}
 	}
-	forSaved := func(count int, at int, spans [][]forRange, facts [][]colFacts) int {
+	// PROTOTYPE (leaf_runs.go): each column's runs saving over every prefix and suffix.
+	var preRuns, sufRuns [][]int
+	if leafRuns != leafRunsOff {
+		preRuns, sufRuns = make([][]int, len(shape.forCols)), make([][]int, len(shape.forCols))
+		for j, fc := range shape.forCols {
+			push := func(a *runsAcc, i int) {
+				if v := vals[i][fc.col]; !v.IsNull() {
+					a.push(forSlot(fc, v), true)
+				} else {
+					a.push(0, false)
+				}
+			}
+			preRuns[j], sufRuns[j] = make([]int, n+1), make([]int, n+1)
+			a := newRunsAcc(fc.w)
+			for i := 0; i < n; i++ {
+				push(a, i)
+				preRuns[j][i+1] = a.saving()
+			}
+			b := newRunsAcc(fc.w)
+			for i := n - 1; i >= 0; i-- {
+				push(b, i)
+				sufRuns[j][i] = b.saving()
+			}
+		}
+	}
+	forSaved := func(count int, at int, spans [][]forRange, facts [][]colFacts, runs [][]int) int {
 		total := 0
 		for j, fc := range shape.forCols {
 			r := spans[j][at]
-			total += forSaving(count, fc.w, r)
+			s := forSaving(count, fc.w, r)
+			if runs != nil && runs[j][at] > s {
+				s = runs[j][at]
+			}
+			total += s
 		}
 		for j, c := range shape.itemCols {
 			total += itemSaving(shape, j, count, facts[j][at], tabFor(tabs, c), true)
@@ -1950,10 +1987,10 @@ func buildLeaf(keys [][]byte, vals []storedRow, weights []uint32, cap pageCap, s
 		return total
 	}
 	leftpayload := func(m int) int {
-		return prefix[m] + leafOverhead(m, shape) - leafPrefixSaving(m, keys[0], keys[m-1]) - forSaved(m, m, pre, dpre)
+		return prefix[m] + leafOverhead(m, shape) - leafPrefixSaving(m, keys[0], keys[m-1]) - forSaved(m, m, pre, dpre, preRuns)
 	}
 	rightpayload := func(m int) int {
-		return total - prefix[m] + leafOverhead(n-m, shape) - leafPrefixSaving(n-m, keys[m], keys[n-1]) - forSaved(n-m, m, suf, dsuf)
+		return total - prefix[m] + leafOverhead(n-m, shape) - leafPrefixSaving(n-m, keys[m], keys[n-1]) - forSaved(n-m, m, suf, dsuf, sufRuns)
 	}
 	// A half keeps the tables only when it does not fit without them (it was measured under them).
 	halfTabs := func(lo, hi int) []*symTable {

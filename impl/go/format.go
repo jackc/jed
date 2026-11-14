@@ -6184,6 +6184,17 @@ func parsePaxLeaf(payload []byte, n int, colTypes []colType) (*paxLeaf, error) {
 			start = end
 			continue
 		}
+		if w, fixed := fixedValueWidth(ty); fixed && flags == regionRuns && leafRuns != leafRunsOff && forEligible(ty) {
+			// PROTOTYPE (leaf_runs.go): base plus offsets in runs.
+			r, err := parseRuns(payload, p, end, n, w)
+			if err != nil {
+				return nil, err
+			}
+			r.stored = end - start
+			regions[c] = r
+			start = end
+			continue
+		}
 		if w, fixed := fixedValueWidth(ty); fixed && flags == regionFORX && leafFORX && forEligible(ty) {
 			// PROTOTYPE (leaf_forx.go): base plus offsets with one exception.
 			r, err := parseFORX(payload, p, end, n, w)

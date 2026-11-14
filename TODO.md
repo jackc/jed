@@ -260,7 +260,7 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   - [ ] _follow-on:_ keep chains on the remaining rewrite paths — `INSERT … ON CONFLICT DO UPDATE`, table rewrites (`ALTER TABLE`), and in-session rows of a table whose single root leaf stays resident after commit. Physical only (no byte or cost change). _(size: S–M)_
 - [x] **The compact leaf (format v52)** — 16-bit leaf directories, elided key columns, fixed-length keys without a directory, inline strings without a length, a shared key prefix, base-plus-offsets integer columns, string dictionaries, and bit-packed integer arrays. → [leaf-structural.md](spec/design/leaf-structural.md)
   - [ ] _decide (maintainer):_ **per-column symbol tables** for text and `jsonb` (step 8 of leaf-structural.md §10, prototyped and held): needs the trainer pinned bit-exactly across cores and the training points restated as a rule over rows and pages.
-  - [ ] _follow-on:_ keep a resident leaf the size of its page — rebuild an elided key column lazily, and give range scans the prefix-aware comparison point lookups have (leaf-structural.md §12). Physical only. _(size: M)_
+  - [ ] _follow-on:_ keep a resident leaf the size of its page — rebuild an elided key column lazily, and give range scans the prefix-aware comparison point lookups have (leaf-structural.md §12). Physical only. _(size: M)_ Read base-plus-offsets values in place instead of building a full-width copy per column per leaf (every core does today; Go at parse): in Go, kind 1 reads as fast in place as from the copy and the copy costs 2–3 µs per column per leaf (leaf-write-cost.md §4b).
   - [ ] _follow-on:_ an integrity fixture with a stored primary-key column (a `text` key), so `row_key_not_primary_key` is produced again; the v52 fixtures' integer keys are elided and cannot disagree with their rows. _(size: S)_
   - [ ] _follow-on:_ have the integrity check verify the content-dependent choices (the stored prefix is the longest one; each region has its smallest kind). _(size: S)_
   - [ ] _follow-on:_ fixed-length keys for index trees whose key columns are all `NOT NULL` (needs `ALTER TABLE … DROP NOT NULL` to rebuild the index), and a shared prefix in interior pages (leaf-structural.md §5, §7).
@@ -271,7 +271,9 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
     that indexes a dirty leaf). #5 (one widened value splitting a full leaf, `update_untouched_large_rollback`
     2.3× v51): take the base-plus-offsets region with an exception (kind 6, no density cost, update
     0.011 ms vs v51's 0.018) as format v54, after deciding between one exception and a few; do not
-    adopt slack (+3% to +7% live pages, helps only wide-row leaves). Implementation-only follow-ons either way: split a lazy
+    adopt slack (+3% to +7% live pages, helps only wide-row leaves) or runs with their own base
+    (−21% on a drifting column, but writes 2–6.5× slower as built and random reads in place 4–5×
+    slower). Implementation-only follow-ons either way: split a lazy
     leaf from its page instead of decoding every row, and size a failed evening candidate from its
     page. → [leaf-write-cost.md](spec/design/leaf-write-cost.md) _(size: S for the Go shorter side;
     M for the split path; format v54 with goldens in three cores and the Ruby reference)_
