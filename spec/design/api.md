@@ -1532,7 +1532,9 @@ and their Go/TS equivalents), or later with `set_max_storage_bytes(name, n)` /
 attachment. Every session on the handle shares it; each process sharing a file
 enforces its own setting against the one persisted count. The read-only gauge
 `storage_bytes(name)` / `StorageBytes` / `storageBytes` reports the measure the
-limit checks. Default: **unlimited**; non-positive restores it. A name that is not
+limit checks. The public TS async forms are `await db.setMaxStorageBytes(name, bytes)`
+and `await db.storageBytes(name)`, accepting and returning `bigint` bytes. Default:
+**unlimited**; non-positive restores it. A name that is not
 attached is `42704`. A commit that would grow the measure past the limit fails
 `54P06` and commits nothing (an in-memory database first tries one forced
 compaction); commits that do not grow the measure, and pure deletes and drops, are

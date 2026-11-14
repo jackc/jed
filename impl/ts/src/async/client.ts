@@ -890,6 +890,10 @@ export class AsyncSession extends AsyncHandle {
   async setVar(name: string, value: string): Promise<void> {
     await this.configure({ vars: { [name]: value } });
   }
+  /** Clear one custom variable; case-insensitive, non-transactional, and absent names are a no-op. */
+  async resetVar(name: string): Promise<void> {
+    await this.call("resetVar", { name });
+  }
   async configure(settings: SessionSettings): Promise<void> {
     await this.call("configure", settings);
   }
@@ -985,6 +989,14 @@ export class AsyncDatabase extends AsyncHandle {
     } finally {
       await session.close();
     }
+  }
+  /** Set a handle-wide committed-storage limit for main or an attachment; non-positive is unlimited. */
+  async setMaxStorageBytes(name: string, bytes: bigint): Promise<void> {
+    await this.call("setMaxStorageBytes", { name, bytes });
+  }
+  /** Committed storage in bytes (memory page high-water or file live pages), excluding pending writes. */
+  async storageBytes(name: string): Promise<bigint> {
+    return (await this.call("storageBytes", { name })) as bigint;
   }
   /**
    * Rewrite database `name` (`"main"`, matched exactly) as the garbage-free image of its committed

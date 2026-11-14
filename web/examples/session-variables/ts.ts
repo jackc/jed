@@ -13,6 +13,9 @@ try {
     // Missing variables raise 42704; missing_ok=true returns SQL NULL instead.
     console.log(await session.get("SELECT current_setting('myapp.unset', true) AS missing"));
 
+    await session.resetVar('myapp.tenant');
+    console.log(await session.get("SELECT current_setting('myapp.tenant', true) AS cleared"));
+
     // Cast to text inside SQL to render in the session's time zone. Raw timestamp
     // values retain their exact, zone-free bigint instant across the worker wire.
     await session.configure({ timeZone: '+05:00' }); // POSIX sign: UTC-5

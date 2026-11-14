@@ -399,12 +399,20 @@ fail `BUSY` until that transaction ends. A transaction callback awaits applicati
 without surrendering ownership. `view`/`update` roll back on exceptions and commit on
 success. Do not await a competing writer from inside the callback that holds the writer.
 
-Session limit setters use `await session.configure({...})`. The async surface does not yet expose
-changing per-database storage limits after open, the storage-byte gauge, or resetting an individual
-custom session variable. `maxStorageBytes` is accepted at create/open;
-new sessions start without custom variables and can initialize them through `configure({vars})`.
-These remain host API follow-ons, not methods
-applications can import from the public async entry points today.
+Session limit setters use `await session.configure({...})`. Database storage controls use
+`await db.setMaxStorageBytes(name, bytes)` and `await db.storageBytes(name)`, with bigint
+bytes and the existing committed-storage semantics (api.md, memory.md §8). Names match
+`main` or an attachment exactly; an unknown name is `42704`. Limits are shared by the
+handle's sessions, apply at subsequent commits, are not transactional or persisted, and
+non-positive values restore unlimited storage. The gauge excludes pending writes.
+These operations run on the database handle through the ordinary bounded worker queue.
+
+Custom variables can be set through `session.setVar(name, value)` or `configure({vars})`
+and individually cleared through `await session.resetVar(name)`. Reset uses the core's
+case-insensitive dotted-name rules: a non-dotted name is `42704`, an unset custom name
+is a no-op, and other variables and sessions are unaffected. Reset is session state and
+does not roll back. It retains session submission order and the same transaction ownership
+checks as `configure` (a parent session with an active transaction proxy rejects `BUSY`).
 
 Database maintenance is on the database handle: `await db.compact(name)`,
 `await db.changeCredential(name, credential, kdf?)` and `await db.rekey(name, credential | null,

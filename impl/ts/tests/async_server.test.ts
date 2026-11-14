@@ -803,3 +803,36 @@ test("row close releases its snapshot pin once when source cleanup fails", () =>
   detached.close();
   assert.equal(released, 2);
 });
+
+test("storage controls address attachments and reject malformed worker requests", async () => {
+  const core = createDatabase();
+  core.attach("aux");
+  const { connection, db } = harness(core);
+  await connection.call("open", { mode: "create", limits: connection.limits });
+  try {
+    assert.equal(await db.storageBytes("aux"), core.storageBytes("aux"));
+    await db.setMaxStorageBytes("aux", 1n);
+    await assert.rejects(
+      db.execute("CREATE TABLE aux.t (id i32)"),
+      (e: unknown) => e instanceof EngineError && e.code() === "54P06",
+    );
+    await db.setMaxStorageBytes("aux", 0n);
+    await db.execute("CREATE TABLE aux.t (id i32)");
+    assert.equal(await db.storageBytes("aux"), core.storageBytes("aux"));
+    const { session } = (await connection.call("session.open", {})) as { session: number };
+    for (const [op, args, sid] of [
+      ["setMaxStorageBytes", { name: "main", bytes: 1 }, undefined],
+      ["storageBytes", { name: 1 }, undefined],
+      ["storageBytes", { name: "main" }, session],
+      ["resetVar", { name: 1 }, session],
+      ["resetVar", { name: "app.x" }, undefined],
+    ] as const) {
+      await assert.rejects(
+        connection.call(op, args, sid),
+        (e: unknown) => e instanceof TransportError && e.code === "PROTOCOL",
+      );
+    }
+  } finally {
+    await db.close();
+  }
+});

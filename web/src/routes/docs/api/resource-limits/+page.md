@@ -136,16 +136,16 @@ transactions each fit them. Without it, a session that can insert can grow an in
 until RAM runs out, or a file until the disk fills. It belongs to the database rather than to a
 session, so every session shares it. Set it in the create options (`max_storage_bytes` /
 `MaxStorageBytes` / `maxStorageBytes`) or in the open options of a file. Rust and Go also accept it
-on an attachment's source and can change it later with `set_max_storage_bytes(name, bytes)` /
-`SetMaxStorageBytes(name, bytes)`, where `name` is `main` or an attachment. TypeScript's public async
-API currently sets it only when creating or opening the database. It is **unlimited by default**;
+on an attachment's source. Change it later with `set_max_storage_bytes(name, bytes)` (Rust),
+`SetMaxStorageBytes(name, bytes)` (Go), or `await db.setMaxStorageBytes(name, bytes)` (TypeScript),
+where `name` is `main` or an attachment. It is **unlimited by default**;
 non-positive values restore unlimited. It is a handle setting, not stored in the file.
 
 A commit that would grow the database past the limit fails with **`54P06`** and commits nothing. A
 commit that only deletes rows or drops objects always succeeds, so a full database can always be
-cleaned up. The Rust `storage_bytes(name)` and Go `StorageBytes(name)` gauges report the number
-the limit checks, which depends on where the database lives. TypeScript's public async API does
-not currently expose this gauge.
+cleaned up. The Rust `storage_bytes(name)`, Go `StorageBytes(name)`, and TypeScript
+`await db.storageBytes(name)` gauges report the committed bytes the limit checks, excluding pending
+writes. TypeScript accepts and returns `bigint` bytes. The measure depends on where the database lives.
 
 **In-memory databases** count their pages: the page high-water times the page size. A commit that
 would raise it past the limit first reclaims any dead pages. jed keeps freed pages for reuse and

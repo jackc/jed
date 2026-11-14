@@ -76,3 +76,14 @@ test("ordinary browsers cancel resident scans before their first result batch", 
     recovered: "7",
   });
 });
+
+for (const path of [undefined, "host-controls.jed"]) {
+  test(`async host controls work on ${path ? "OPFS" : "memory"}`, async ({ page }) => {
+    await page.goto("/");
+    const result = await page.evaluate(
+      (name) => window.jedRuntime.hostControlsScenario(name),
+      path,
+    );
+    expect(result).toEqual({ limit: "54P06", grew: true, reset: true });
+  });
+}

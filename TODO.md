@@ -333,8 +333,6 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 - [ ] **OPFS disk-spill** — the browser host has no spill target, so sort/hash spill and temp-table
   spill stay resident there. → [hosts.md §3/§5/§7](spec/design/hosts.md)
 - [x] **TS async application runtime.** → [ts-runtime.md](spec/design/ts-runtime.md)
-  - [ ] _follow-on:_ public async host API gaps — changing database storage limits after open, the
-    storage-byte gauge, and resetting an individual custom session variable.
   - [ ] _follow-on (measure first):_ cold/durable and other-browser public-boundary measurements,
     ARM/package-size measurements; shared-memory result transport and batch-oriented consumption
     (unimplemented investigations; transport overhead remains substantial —

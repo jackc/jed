@@ -448,6 +448,17 @@ export class RuntimeServer {
       yield* this.maintenanceSteps(db, op, args);
       return null;
     }
+    if (op === "setMaxStorageBytes" || op === "storageBytes") {
+      if (sessionId !== 0 || job.request.transaction !== undefined)
+        throw new TransportError("PROTOCOL", "storage controls belong to the database handle");
+      if (typeof args.name !== "string")
+        throw new TransportError("PROTOCOL", "a database name is text");
+      if (op === "storageBytes") return db.storageBytes(args.name);
+      if (typeof args.bytes !== "bigint")
+        throw new TransportError("PROTOCOL", "storage bytes must be a bigint");
+      db.setMaxStorageBytes(args.name, args.bytes);
+      return null;
+    }
     if (op === "serialize") {
       if (sessionId !== 0)
         throw new TransportError("PROTOCOL", "database maintenance belongs to the database handle");
@@ -512,6 +523,11 @@ export class RuntimeServer {
           inTransaction: session.inTransaction(),
           lifetimeCost: session.lifetimeCost(),
         };
+      case "resetVar":
+        if (sessionId === 0 || typeof args.name !== "string")
+          throw new TransportError("PROTOCOL", "resetVar requires a session and a text name");
+        session.resetVar(args.name);
+        return null;
       case "configure":
         this.configure(session, args);
         return null;

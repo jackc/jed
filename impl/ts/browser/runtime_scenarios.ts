@@ -243,3 +243,29 @@ export async function cooperativeCancellationScenario() {
     await db.close();
   }
 }
+
+export async function hostControlsScenario(path?: string) {
+  const db = await createDatabase({ path });
+  try {
+    await db.execute("CREATE TABLE t (id i32 PRIMARY KEY, body text)");
+    const before = await db.storageBytes("main");
+    await db.setMaxStorageBytes("main", 1n);
+    let limit = "";
+    try {
+      await db.execute("INSERT INTO t VALUES (1, repeat('x', 100000))");
+    } catch (error) {
+      if (!(error instanceof EngineError)) throw error;
+      limit = error.code();
+    }
+    await db.setMaxStorageBytes("main", 0n);
+    await db.execute("INSERT INTO t VALUES (1, repeat('x', 100000))");
+    const session = await db.session();
+    await session.setVar("app.tenant", "first");
+    await session.resetVar("APP.TENANT");
+    const row = await session.get("SELECT current_setting('app.tenant', true) AS v");
+    await session.close();
+    return { limit, grew: (await db.storageBytes("main")) > before, reset: row?.v === null };
+  } finally {
+    await db.close();
+  }
+}

@@ -220,3 +220,91 @@ test("trusted extensions register in the execution worker, including worker deat
     rmSync(directory, { recursive: true, force: true });
   }
 });
+
+for (const file of [false, true]) {
+  test(`async storage controls apply at commit and recover (${file ? "file" : "memory"})`, async () => {
+    const directory = mkdtempSync(join(tmpdir(), "jed-async-storage-"));
+    const db = await createDatabase(file ? { path: join(directory, "test.jed") } : {});
+    try {
+      await db.execute("CREATE TABLE t (id i64 PRIMARY KEY, body text)");
+      const before = await db.storageBytes("main");
+      assert.equal(typeof before, "bigint");
+      assert.ok(before > 0n);
+      const session = await db.session();
+      const tx = await session.begin();
+      await tx.execute("INSERT INTO t VALUES (1, repeat('x', 100000))");
+      assert.equal(await db.storageBytes("main"), before, "pending writes are excluded");
+      await db.setMaxStorageBytes("main", 1n);
+      await assert.rejects(
+        tx.commit(),
+        (e: unknown) => e instanceof EngineError && e.code() === "54P06",
+      );
+      assert.equal(await db.storageBytes("main"), before);
+      assert.equal((await db.get("SELECT count(*) AS n FROM t"))?.n, 0n);
+      for (const unlimited of [0n, -1n, 9007199254740993n]) {
+        await db.setMaxStorageBytes("main", unlimited);
+        await session.execute("INSERT INTO t VALUES ($1, repeat('x', 100000))", [
+          intValue(unlimited),
+        ]);
+      }
+      assert.ok((await db.storageBytes("main")) > before);
+      await assert.rejects(
+        db.storageBytes("MAIN"),
+        (e: unknown) => e instanceof EngineError && e.code() === "42704",
+      );
+      await assert.rejects(
+        db.setMaxStorageBytes("missing", 1n),
+        (e: unknown) => e instanceof EngineError && e.code() === "42704",
+      );
+      await session.close();
+    } finally {
+      await db.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
+    await assert.rejects(
+      db.storageBytes("main"),
+      (e: unknown) => e instanceof TransportError && e.code === "CLOSED",
+    );
+  });
+}
+
+test("async resetVar preserves session ordering, isolation and non-transactional state", async () => {
+  const db = await createDatabase();
+  try {
+    const a = await db.session();
+    const b = await db.session();
+    await b.setVar("app.tenant", "other");
+    const set = a.setVar("app.tenant", "first");
+    const reset = a.resetVar("APP.TENANT");
+    const read = a.get("SELECT current_setting('app.tenant', true) AS v");
+    await Promise.all([set, reset]);
+    assert.equal((await read)?.v, null);
+    assert.equal((await b.get("SELECT current_setting('app.tenant') AS v"))?.v, "other");
+    await a.setVar("app.keep", "kept");
+    await a.resetVar("app.absent");
+    await assert.rejects(
+      a.resetVar("timezone"),
+      (e: unknown) => e instanceof EngineError && e.code() === "42704",
+    );
+    await a.setVar("app.tenant", "again");
+    await a.execute("BEGIN");
+    await a.resetVar("app.tenant");
+    await a.rollback();
+    assert.equal((await a.get("SELECT current_setting('app.tenant', true) AS v"))?.v, null);
+    assert.equal((await a.get("SELECT current_setting('app.keep') AS v"))?.v, "kept");
+    const tx = await a.begin();
+    await assert.rejects(
+      a.resetVar("app.keep"),
+      (e: unknown) => e instanceof TransportError && e.code === "BUSY",
+    );
+    await tx.rollback();
+    await a.close();
+    await assert.rejects(
+      a.resetVar("app.keep"),
+      (e: unknown) => e instanceof TransportError && e.code === "CLOSED",
+    );
+    await b.close();
+  } finally {
+    await db.close();
+  }
+});
