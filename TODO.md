@@ -286,10 +286,10 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   - `verify.rb` (the Ruby reader and the simulator's independent checker) reads all three parts, and
     writes the `cow_deferred_*` histories, plaintext and encrypted, which the Go core reads back
     identically.
-  - The Rust core implements all three parts; Go and Rust are byte-identical across 2,200 composed
-    simulator traces (deferred-interior.md §9.8).
-  - Owes: §9 moved into format.md as v53, the TS core, every golden regenerated (the stamp changes
-    every page's bytes), page-service validation of a client delta's list plus
+  - All three cores implement all three parts behind the switches and are byte-identical across
+    1,320 composed simulator traces (deferred-interior.md §9.8).
+  - Owes: §9 moved into format.md as v53 with the switches replaced by the version, every golden
+    regenerated (the stamp changes every page's bytes), page-service validation of a client delta's list plus
     wire fixtures, the simulator's `replay` step at a remap entry — a new kind of bound pointer, which
     the encryption security review owes an opinion on — a race review of the commit path, and
     `unassignPages` undoing a retained interior (§9.9). The stamp itself is **unmeasured**: it

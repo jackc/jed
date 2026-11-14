@@ -4,6 +4,7 @@ import { crc32Update } from "./crc32.ts";
 import { engineError } from "./errors.ts";
 import { ioSteps, runSync, type Steps } from "./execution.ts";
 import { NO_TAG } from "./cap.ts";
+import { deferOn, RemapState, reserve as remapReserve } from "./remap.ts";
 import { manifestCrc32, pageTxidStamp } from "./v53.ts";
 
 // PAGE_IO_WINDOW bounds the write side's concurrent page work (ts-runtime.md §11.3): pages encoded at
@@ -48,8 +49,11 @@ export function crc64Update(previous: bigint, bytes: Uint8Array): bigint {
 // The inline manifest's byte range in a meta page: after the 64-byte header, or — in an encrypted
 // meta — after the catalog-root and free-list tags (offset 96) and before the 40-byte reserve
 // (spec/fileformat/encrypted.md §6).
+// Under the deferred-interior layout the remap region takes the area's last third, whether or not it
+// holds entries (deferred-interior.md §9.2).
 function inlineArea(pageSize: number, encrypted: boolean): [number, number] {
-  return encrypted ? [96, pageSize - 40] : [64, pageSize];
+  const r = remapReserve(pageSize, encrypted);
+  return encrypted ? [96, pageSize - 40 - r] : [64, pageSize - r];
 }
 
 // PROTOTYPE (manifest-crc32.md §2): the top bit of a meta's dirty count (offset 40) marks narrow
@@ -139,6 +143,8 @@ export type CommitMeta = {
   inline: Entry[];
   // narrow says the entries are 8 bytes and the chain digest a CRC-32 (manifest-crc32.md §2).
   narrow: boolean;
+  // remap is the slot's remap list, validated with the slot (deferred-interior.md §9.3).
+  remap: RemapState;
 };
 
 export function metaChecksum(block: Uint8Array): number {
@@ -258,8 +264,7 @@ export function parseCommitMeta(
     dv.getUint32(0, false) !== 0x4a454442 ||
     dv.getUint16(4, false) !== 52 || // format_version (format.ts FORMAT_VERSION)
     dv.getUint32(8, false) !== pageSize ||
-    dv.getUint32(32, false) !== metaChecksum(block) ||
-    dv.getUint32(60, false) !== 0 // bytes 60-63 are reserved zero (format.md *Meta page*): a slot with a bit set here is not a valid candidate, in every core and in verify.rb
+    dv.getUint32(32, false) !== metaChecksum(block)
   )
     return null;
   // Offsets 6/7: the encryption suite and its reserve (encrypted.md §6) — 0, 0 in plaintext; the
@@ -282,6 +287,11 @@ export function parseCommitMeta(
   const overflowCount = dv.getUint32(44, false);
   const chainChecksum = dv.getBigUint64(48, false);
   const bodyPage = (p: number): boolean => p >= first && p < pageCount;
+  // Bytes 60-63 are reserved zero (format.md *Meta page*) unless the deferred-interior layout gives
+  // them to remap_entries; slot selection validates them either way (deferred-interior.md §9.3), in
+  // every core and in verify.rb, or the cores recover different generations from one damaged file.
+  const remap = RemapState.decode(block, first, pageCount);
+  if (remap === null) return null;
   if (
     pageCount <= first ||
     pageCount > physicalPages ||
@@ -324,6 +334,7 @@ export function parseCommitMeta(
     chainChecksum,
     inline,
     narrow,
+    remap,
   };
 }
 
@@ -461,7 +472,8 @@ export function* validateCommitMetaSteps(
     if (entry.index === meta.freeListHead) freeCovered = true;
     previous = entry.index;
   }
-  if (!rootCovered || !freeCovered) return null;
+  // A deferring commit may keep its catalog chain, so its root need not be listed (§9.4).
+  if ((!rootCovered && !deferOn(pageSize, encrypted)) || !freeCovered) return null;
   for (const entry of entries) manifestIds.add(entry.index);
   return manifestIds;
 }

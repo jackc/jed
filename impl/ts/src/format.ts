@@ -84,6 +84,11 @@ import {
   validateCommitMetaSteps,
   writeManifestMeta,
 } from "./commit_manifest.ts";
+import { beginPass, type CatState, type DeferPass, type DeferPlan, RemapState } from "./remap.ts";
+
+// DeferInput is a commit's deferral, decided before allocation (remap.ts planDeferral): the plan and
+// the committed catalog chain it may keep (PROTOTYPE, deferred-interior.md §9).
+export type DeferInput = { plan: DeferPlan; prevCat: CatState | null };
 import {
   type KeyOrder,
   decodeInt,
@@ -5754,6 +5759,16 @@ export type IncrementalWrite = {
   // whole (incremental-reclaim.md §3.1).
   catalogIds: number[];
   gistIds: number[];
+  // PROTOTYPE (deferred-interior.md §9): pages that kept their place though the live-page delta counts
+  // them as replaced -- retained interiors and a kept catalog chain -- and the retained interiors'
+  // pages, which the orphan walk reaches but which stay live. remap is the list this commit publishes
+  // (null: the layout is off), cat the catalog chain it leaves committed, and catalogKept says that
+  // chain is the previous commit's, unrewritten.
+  retained: number;
+  retainedIds: number[];
+  remap: RemapState | null;
+  cat: CatState | null;
+  catalogKept: boolean;
 };
 
 // LiveCount is the live-page accounting of one committed file state (spec/design/memory.md §8.7):
@@ -5792,7 +5807,8 @@ export function* liveAfterSteps(
     paging,
     paging.cap(),
   );
-  const live = count.live + write.pages.length - count.catalog - count.gist - orphaned;
+  const live =
+    count.live + write.pages.length + write.retained - count.catalog - count.gist - orphaned;
   if (live < 0 || live > 0xffff_ffff) {
     throw engineError("data_corrupted", "live page count out of range");
   }
@@ -5809,7 +5825,8 @@ export function* liveAfterIdsSteps(
 ): Steps<{ live: LiveCount; ids: number[] }> {
   const ids: number[] = [];
   yield* orphanedTreePageIdsSteps(prev, write.kept, write.sharedChains, paging, paging.cap(), ids);
-  const live = count.live + write.pages.length - count.catalog - count.gist - ids.length;
+  const live =
+    count.live + write.pages.length + write.retained - count.catalog - count.gist - ids.length;
   if (live < 0 || live > 0xffff_ffff) {
     throw engineError("data_corrupted", "live page count out of range");
   }
@@ -6075,8 +6092,10 @@ export function incrementalImage(
   reuse = true,
   allowed: Set<number> | null = null,
   chains: Map<number, Uint8Array> | null = null,
+  defer: DeferInput | null = null,
 ): IncrementalWrite {
   const pages: { index: number; bytes: Uint8Array }[] = [];
+  const retained: number[] = [];
   try {
     return serializeIncremental(
       snap,
@@ -6088,10 +6107,13 @@ export function incrementalImage(
       allowed,
       chains,
       pages,
+      defer,
+      retained,
     );
   } catch (e) {
-    // A pass stopped for a missing chain is retried: undo its page assignments.
-    if (e instanceof ChainMiss) unassignPartialPages(snap, pages);
+    // A pass stopped for a missing chain is retried: undo its page assignments, a retained interior's
+    // included (deferred-interior.md §9.9).
+    if (e instanceof ChainMiss) unassignPartialPages(snap, pages, retained);
     throw e;
   }
 }
@@ -6113,9 +6135,10 @@ export function* incrementalImageSteps(
   paging: SharedPaging | null,
   reuse = true,
   allowed: Set<number> | null = null,
+  defer: DeferInput | null = null,
 ): Steps<IncrementalWrite> {
   if (paging === null || !paging.writeSideAsync())
-    return incrementalImage(snap, pageSize, startPage, free, paging, reuse, allowed);
+    return incrementalImage(snap, pageSize, startPage, free, paging, reuse, allowed, null, defer);
   const chains = new Map<number, Uint8Array>();
   const awaited = new Set<number>();
   // An asynchronous codec seals through a session: a pass that left seals to await is undone and
@@ -6127,7 +6150,17 @@ export function* incrementalImageSteps(
       session?.beginPass();
       let write: IncrementalWrite;
       try {
-        write = incrementalImage(snap, pageSize, startPage, free, paging, reuse, allowed, chains);
+        write = incrementalImage(
+          snap,
+          pageSize,
+          startPage,
+          free,
+          paging,
+          reuse,
+          allowed,
+          chains,
+          defer,
+        );
       } catch (e) {
         if (!(e instanceof ChainMiss)) throw e;
         // Every page of an awaited chain is cached, so the same chain cannot miss twice.
@@ -6149,7 +6182,7 @@ export function* incrementalImageSteps(
         continue;
       }
       if (session === null || !session.pending()) return write;
-      unassignPages(snap, write.pages);
+      unassignPages(snap, write.pages, write.retainedIds);
       yield* session.resolveSteps();
     }
   } finally {
@@ -6167,8 +6200,14 @@ function serializeIncremental(
   allowed: Set<number> | null,
   chains: Map<number, Uint8Array> | null,
   pages: { index: number; bytes: Uint8Array }[],
+  defer: DeferInput | null,
+  retainedOut: number[],
 ): IncrementalWrite {
   const ps = pageSize;
+  // Each pass starts from the plan: a pass that is undone and repeated must not keep the entries or
+  // retained pages an earlier one recorded.
+  const pass = defer === null ? null : beginPass(defer.plan);
+  if (pass !== null) pass.retainedIds = retainedOut;
   const seal = Sealer.of(ps, paging).stamped(snap.txid); // snap.txid is the txid this commit publishes
   const cap = seal.cap;
   // Every check that can refuse the commit runs before the first page is sealed, so a refusal draws
@@ -6205,6 +6244,7 @@ function serializeIncremental(
         shared,
         paging,
         chains,
+        pass,
       );
     }
     // The commit encoding is the last plan of the writer's rows, so its compression memo goes.
@@ -6263,6 +6303,7 @@ function serializeIncremental(
             shared,
             paging,
             chains,
+            pass,
           );
         }
       }
@@ -6277,6 +6318,39 @@ function serializeIncremental(
   // successor's tag (encrypted.md §7).
   const catEntries = catalogEntries(snap, keys, rootDataPage, indexRoots, cap);
   const catLayout = catalogLayout(catEntries, capChain(cap));
+  const payloads = catLayout.map((cp) => cp.payload);
+  const deferred = {
+    retained: pass?.retained ?? 0,
+    retainedIds: pass?.retainedIds ?? [],
+    remap: pass?.remap ?? null,
+  };
+  const prevCat = defer?.prevCat ?? null;
+  if (
+    prevCat !== null &&
+    prevCat.payloads.length === payloads.length &&
+    prevCat.payloads.every((p, i) => bytesEqual(p, payloads[i]!))
+  ) {
+    // The catalog chain is byte-identical (no root moved, no count changed): keep it
+    // (deferred-interior.md §9.1).
+    return {
+      pages,
+      rootPage: prevCat.root.page,
+      rootTag: prevCat.root.tag,
+      pageCount: alloc.next,
+      freeRemaining: alloc.remaining(),
+      kept,
+      sharedChains: shared,
+      catalogPages: prevCat.payloads.length,
+      gistPages,
+      catalogIds: [],
+      gistIds,
+      retained: deferred.retained + prevCat.payloads.length,
+      retainedIds: deferred.retainedIds,
+      remap: deferred.remap,
+      cat: prevCat,
+      catalogKept: true,
+    };
+  }
   const catPages = catLayout.map(() => alloc.take());
   let next = 0;
   let nextTag = NO_TAG;
@@ -6299,7 +6373,18 @@ function serializeIncremental(
     gistPages,
     catalogIds: catPages.slice(),
     gistIds,
+    retained: deferred.retained,
+    retainedIds: deferred.retainedIds,
+    remap: deferred.remap,
+    cat: { payloads, root: { page: next, tag: nextTag } },
+    catalogKept: false,
   };
+}
+
+function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
 }
 
 // serializeDirty assigns a page to one dirty node (and its dirty descendants) post-order, appending
@@ -6323,12 +6408,14 @@ function serializeDirty(
   shared: Set<number>,
   paging: SharedPaging | null,
   chains: Map<number, Uint8Array> | null,
+  pass: DeferPass | null,
 ): TreeRef {
   if (n.page !== 0) {
     kept.add(n.page);
     return { page: n.page, tag: n.tag ?? NO_TAG };
   }
   const childPages: TreeRef[] = [];
+  const moved: number[] = [];
   for (const c of n.children) {
     // A resident child recurses (dirty descendants get pages); an OnDisk child is a clean leaf already
     // durable at its page — keep it, write nothing (the incremental-commit win).
@@ -6336,6 +6423,7 @@ function serializeDirty(
       kept.add(c.page);
       childPages.push({ page: c.page, tag: c.tag ?? NO_TAG });
     } else {
+      if (c.node.page === 0) moved.push(childPages.length);
       childPages.push(
         serializeDirty(
           c.node,
@@ -6349,9 +6437,27 @@ function serializeDirty(
           shared,
           paging,
           chains,
+          pass,
         ),
       );
     }
+  }
+  // PROTOTYPE (deferred-interior.md §9.4): an interior the plan retains keeps its page; each child
+  // that moved off the page its slot resolved to takes an entry keyed by this page and that slot,
+  // overwriting any earlier one.
+  const origin = n.origin?.page ?? 0;
+  if (pass !== null && n.children.length > 0 && origin !== 0 && pass.retain.has(origin)) {
+    for (const i of moved) {
+      const c = n.children[i]!.node!;
+      if (childPages[i]!.page !== (c.origin?.page ?? 0)) pass.remap.set(origin, i, childPages[i]!);
+    }
+    // planDeferral counted exactly the entries this adds, so this is a logic error.
+    if (pass.remap.size > pass.capacity) throw new Error("deferral plan overran the remap list");
+    n.page = origin; // its page and, in an encrypted file, that page's tag
+    n.tag = seal.codec === null ? undefined : n.origin!.tag;
+    pass.retained++;
+    pass.retainedIds.push(origin);
+    return { page: origin, tag: n.origin!.tag ?? NO_TAG };
   }
   // Encode a leaf's records, spilling over-large values to overflow pages drawn from the same
   // allocator (free-list first, then high-water — large-values.md §12) and sealed into pages ahead of
@@ -6583,6 +6689,7 @@ export function collectLeafOverflowWith(
   depth: number,
   rootTag: Uint8Array = NO_TAG,
   tagLen = 0,
+  remap: RemapState = new RemapState(),
 ): void {
   runSync(
     collectLeafOverflowSteps(
@@ -6594,6 +6701,7 @@ export function collectLeafOverflowWith(
       reached,
       seen,
       depth,
+      remap,
     ),
   );
 }
@@ -6610,6 +6718,7 @@ function* collectLeafOverflowSteps(
   reached: Set<number>,
   seen: Set<number>,
   depth: number,
+  remap: RemapState,
 ): Steps<void> {
   if (seen.has(pageIdx)) throw engineError("data_corrupted", "B-tree page reached twice");
   seen.add(pageIdx);
@@ -6641,6 +6750,7 @@ function* collectLeafOverflowSteps(
     const cur = { pos: 0 };
     const cps: { page: number; tag: Uint8Array }[] = [];
     for (let i = 0; i < pg.itemCount + 1; i++) cps.push(readPointer(pg.payload, cur, tagLen));
+    remap.resolve(pageIdx, cps); // PROTOTYPE (deferred-interior.md §9.3)
     for (const cp of cps)
       yield* collectLeafOverflowSteps(
         read,
@@ -6651,6 +6761,7 @@ function* collectLeafOverflowSteps(
         reached,
         seen,
         depth + 1,
+        remap,
       );
     return;
   }
@@ -6712,6 +6823,7 @@ export function* reachablePagesSteps(
         reached,
         new Set<number>(),
         1,
+        paging.remap(), // the committed generation's list (deferred-interior.md §9.3)
       );
     }
   }
@@ -6734,7 +6846,15 @@ export function* prefetchSnapshotSteps(snap: Snapshot, paging: SharedPaging): St
   for (const st of stores) {
     const root = st.treeRoot();
     if (root === null || root.page === 0) continue;
-    yield* prefetchTreeSteps(read, root.page, root.tag ?? NO_TAG, tagLen, new Set<number>(), 1);
+    yield* prefetchTreeSteps(
+      read,
+      root.page,
+      root.tag ?? NO_TAG,
+      tagLen,
+      new Set<number>(),
+      1,
+      paging.remap(),
+    );
   }
   for (const st of snap.stores.values()) {
     const root = st.treeRoot();
@@ -6748,6 +6868,7 @@ export function* prefetchSnapshotSteps(snap: Snapshot, paging: SharedPaging): St
       new Set<number>(),
       new Set<number>(),
       1,
+      paging.remap(),
     );
   }
 }
@@ -6760,6 +6881,7 @@ function* prefetchTreeSteps(
   tagLen: number,
   seen: Set<number>,
   depth: number,
+  remap: RemapState,
 ): Steps<void> {
   if (seen.has(pageIdx)) throw engineError("data_corrupted", "B-tree page reached twice");
   seen.add(pageIdx);
@@ -6775,7 +6897,9 @@ function* prefetchTreeSteps(
   const cur = { pos: 0 };
   const cps: { page: number; tag: Uint8Array }[] = [];
   for (let i = 0; i < pg.itemCount + 1; i++) cps.push(readPointer(pg.payload, cur, tagLen));
-  for (const cp of cps) yield* prefetchTreeSteps(read, cp.page, cp.tag, tagLen, seen, depth + 1);
+  remap.resolve(pageIdx, cps); // PROTOTYPE (deferred-interior.md §9.3)
+  for (const cp of cps)
+    yield* prefetchTreeSteps(read, cp.page, cp.tag, tagLen, seen, depth + 1, remap);
 }
 
 // catalogPageCount is how many of pages are catalog pages (memory.md §8.3's repair exemption compares
@@ -6788,8 +6912,16 @@ export function catalogPageCount(pages: { index: number; bytes: Uint8Array }[]):
 
 // unassignPages undoes incrementalImage's page assignment for a plan that will not be written, so the
 // snapshot can be planned again (memory.md §8.3). pages is the discarded plan's writes.
-export function unassignPages(snap: Snapshot, pages: { index: number; bytes: Uint8Array }[]): void {
-  const assigned = new Set<number>();
+//
+// retained is the pages a deferring plan's retained interiors kept (deferred-interior.md §9.9): such a
+// node is a dirty copy that took its origin's page, so undoing the plan returns it to dirty and visits
+// the subtree below it, whose pages were assigned too.
+export function unassignPages(
+  snap: Snapshot,
+  pages: { index: number; bytes: Uint8Array }[],
+  retained: number[] = [],
+): void {
+  const assigned = new Set<number>(retained);
   for (const pg of pages) assigned.add(pg.index);
   for (const st of snap.stores.values()) unassignTreePages(st.treeRoot(), assigned);
   for (const ist of snap.indexStores.values()) unassignTreePages(ist.treeRoot(), assigned);
@@ -6798,8 +6930,12 @@ export function unassignPages(snap: Snapshot, pages: { index: number; bytes: Uin
 // unassignPartialPages undoes the assignments of a pass that stopped part way (ChainMiss). Assignment
 // is post-order, so a dirty parent may still be page 0 above assigned children: unlike unassignPages it
 // descends through unassigned nodes too.
-function unassignPartialPages(snap: Snapshot, pages: { index: number; bytes: Uint8Array }[]): void {
-  const assigned = new Set<number>();
+function unassignPartialPages(
+  snap: Snapshot,
+  pages: { index: number; bytes: Uint8Array }[],
+  retained: number[],
+): void {
+  const assigned = new Set<number>(retained);
   for (const pg of pages) assigned.add(pg.index);
   const visit = (n: PNode | null): void => {
     if (n === null) return;
@@ -7281,6 +7417,15 @@ function* loadAtMetaSteps(
   const pageSize = paging.pageSize();
   const cap = paging.cap();
 
+  // PROTOTYPE (deferred-interior.md §9): the loaded generation's remap list redirects child pointers as
+  // the skeleton is read. A selected generation becomes the committed one, and the kept catalog chain
+  // is forgotten -- another process may have rewritten it. A load at a given meta (a backup's walk,
+  // adopt null) reads through that meta's list and leaves the committed state alone.
+  const remap = mt.remap;
+  if (adopt !== null) {
+    paging.setRemap(remap);
+    paging.setCat(null);
+  }
   const snap = new Snapshot(environment, mt.txid);
   // Bound before any store is registered, so every store takes this file's capacities (Snapshot
   // capFor); stores created in a LATER session bind this same pager at creation.
@@ -7408,7 +7553,7 @@ function* loadAtMetaSteps(
       if (root.page !== 0) {
         // Reads only the interior spine — leaves stay OnDisk; the exact row count was restored from
         // the v28 catalog entry (spec/design/storage.md §6).
-        store.setSkeleton(yield* readSkeletonSteps(paging, root, colTypes), rowCount);
+        store.setSkeleton(yield* readSkeletonSteps(paging, root, colTypes, remap), rowCount);
         if (!hasPK) {
           // No-PK rowid reconstruction faults the leaves to find the largest key; only for keyless
           // tables (most have a PK), and bounded by the pool. root !== 0 ⇒ the table is non-empty.
@@ -7460,7 +7605,7 @@ function* loadAtMetaSteps(
         }
         istore.attachPaging(paging);
         if (iroot.page !== 0) {
-          istore.setSkeleton(yield* readSkeletonSteps(paging, iroot, []), null);
+          istore.setSkeleton(yield* readSkeletonSteps(paging, iroot, [], remap), null);
         }
         snap.putIndexStore(table.indexes[k]!.name, istore);
       }
@@ -7702,9 +7847,16 @@ function* readSkeletonSteps(
   paging: SharedPaging,
   root: TreeRef,
   colTypes: ColType[],
+  remap: RemapState,
 ): Steps<PNode> {
-  const child = (yield* readSkeletonNodeSteps(paging, root.page, root.tag, new Set<number>(), 1))
-    .child;
+  const child = (yield* readSkeletonNodeSteps(
+    paging,
+    root.page,
+    root.tag,
+    new Set<number>(),
+    1,
+    remap,
+  )).child;
   if (child.node !== null) return child.node;
   const tag = child.tag ?? NO_TAG;
   return paging.writeSideAsync()
@@ -7737,6 +7889,7 @@ function* readSkeletonNodeSteps(
   pageTag: Uint8Array,
   seen: Set<number>,
   depth: number,
+  remap: RemapState,
 ): Steps<{ child: Child; height: number }> {
   if (depth > MAX_TREE_DEPTH)
     throw engineError("data_corrupted", "B-tree deeper than any valid tree");
@@ -7760,6 +7913,8 @@ function* readSkeletonNodeSteps(
     // Child pointers precede the separator directory (format.md "Interior node").
     const childPtrs: { page: number; tag: Uint8Array }[] = [];
     for (let i = 0; i < n + 1; i++) childPtrs.push(readPointer(pg.payload, cur, tagLen));
+    // PROTOTYPE (deferred-interior.md §9.3): this page's remap entries redirect its slots.
+    remap.resolve(pageIdx, childPtrs);
     // v24: the record-free routing skeleton — an end-offset separator directory + key blob.
     // Separators carry no values, so no lazy decode and no chains to mark.
     const keys = readSeparators(pg.payload, cur, n);
@@ -7771,6 +7926,7 @@ function* readSkeletonNodeSteps(
       childPtrs[0]!.tag,
       seen,
       depth + 1,
+      remap,
     );
     const childrenAreLeaves = first.child.node === null;
     const children: Child[] = [first.child];
@@ -7786,6 +7942,7 @@ function* readSkeletonNodeSteps(
         childPtrs[i]!.tag,
         seen,
         depth + 1,
+        remap,
       );
       if (next.height !== first.height)
         throw engineError("data_corrupted", "B-tree leaves at unequal depths");

@@ -12,7 +12,7 @@ import { join } from "node:path";
 import { after, test } from "node:test";
 
 import { backupPages } from "../src/backup.ts";
-import { type CommitMeta, parseCommitMeta } from "../src/commit_manifest.ts";
+import { type CommitMeta, metaChecksum, parseCommitMeta } from "../src/commit_manifest.ts";
 import { metaPage } from "../src/format.ts";
 import type { SharedPaging } from "../src/paging.ts";
 import {
@@ -141,6 +141,12 @@ test("a page-identical backup copies reachable pages at their indices", () => {
     mt.freeListHead,
     mt.livePages,
   );
+  // PROTOTYPE (deferred-interior.md §9.3): under the deferred-interior layout the bootstrap meta also
+  // carries the pinned generation's remap list -- the copy's interiors are as stale as the source's.
+  if (mt.remap.size > 0) {
+    mt.remap.encode(bootstrap);
+    new DataView(bootstrap.buffer).setUint32(32, metaChecksum(bootstrap), false);
+  }
   assert.deepEqual(backup.subarray(0, PAGE), bootstrap, "slot 0 carries the bootstrap meta");
   assert.deepEqual(backup.subarray(PAGE, 2 * PAGE), bootstrap, "slot 1 carries the bootstrap meta");
 

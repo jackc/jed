@@ -40,6 +40,7 @@ import {
   pageDigest,
   parseCommitMeta,
 } from "./commit_manifest.ts";
+import { RemapState } from "./remap.ts";
 import { cancellationCheckpoint, throwIfAborted } from "./cancel.ts";
 import { EngineError, engineError } from "./errors.ts";
 import { COOPERATE, shouldCooperate, type Steps } from "./execution.ts";
@@ -206,6 +207,9 @@ type Generation = {
   livePages: number | null; // null: not recorded (an in-memory store)
   protectedPages: Set<number>;
   memoryFree: number[] | null; // an in-memory store's RAM free list
+  // remap is the generation's remap list, which its interior reads resolve through (PROTOTYPE,
+  // deferred-interior.md §9.3).
+  remap: RemapState;
 };
 
 // One B+tree record handed to a table walk's visitor.
@@ -225,6 +229,8 @@ class Checker {
   private first = 2;
   private pageCount = 0;
   private readonly tagLen: number;
+  // remap is the checked generation's remap list (deferred-interior.md §9.3).
+  private remap: RemapState = new RemapState();
   private readonly cap: Cap;
   private readonly paging: SharedPaging;
   private readonly target: IntegrityTarget;
@@ -333,6 +339,7 @@ class Checker {
     try {
       const gen = yield* this.generation();
       if (gen !== null) {
+        this.remap = gen.remap;
         this.pageCount = gen.pageCount;
         this.first = capFirstBody(this.cap);
         this.reached = new Uint8Array(Math.ceil(gen.pageCount / 8));
@@ -403,6 +410,7 @@ class Checker {
         livePages: null,
         protectedPages: new Set(),
         memoryFree: st.freePages.slice(),
+        remap: paging.remap(),
       };
     }
     // The slot holding the pinned generation: the first of the slots carrying its txid whose meta
@@ -435,6 +443,7 @@ class Checker {
       livePages: meta.livePages,
       protectedPages,
       memoryFree: null,
+      remap: meta.remap,
     };
   }
 
@@ -1011,6 +1020,9 @@ class Checker {
           let parsed: { children: TreeRef[]; seps: Uint8Array[] } | null = null;
           try {
             parsed = parseInterior(pg.payload, pg.itemCount, this.tagLen);
+            // The generation's remap entries redirect this page's slots; one naming a slot past its
+            // item count is corruption of this page.
+            this.remap.resolve(node.page, parsed.children);
           } catch (e) {
             if (fatal(e)) throw e;
             readable = false;
@@ -1088,6 +1100,7 @@ class Checker {
       const pg = yield* this.readPage(next.page, next.tag);
       if (pg.pageType === PAGE_TYPE_INTERIOR) {
         const parsed = parseInterior(pg.payload, pg.itemCount, this.tagLen);
+        this.remap.resolve(next.page, parsed.children); // as the structural walk resolved it
         stack.push({ ...parsed, i: 0, depth: next.depth, lo: null, hi: null });
       } else {
         const leaf = parseLeafView(pg.payload, pg.itemCount, colTypes);

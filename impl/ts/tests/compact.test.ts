@@ -30,6 +30,7 @@ import {
   openDatabase,
   type Value,
 } from "../src/lib.ts";
+import { pageTxidStamp } from "../src/v53.ts";
 import { createOpfsWithHandle } from "../src/opfs.ts";
 import type { SyncAccessHandle } from "../src/opfsblockstore.ts";
 import { errCode } from "./util.ts";
@@ -135,8 +136,20 @@ test("compaction of a compact file is a fixed point", () => {
   db.compact("main");
   const second = readFileSync(path);
   assert.equal(first.length, second.length);
-  // Only the version (and so the meta checksums) moved.
-  assert.ok(first.subarray(PAGE * 2).equals(second.subarray(PAGE * 2)));
+  // Only the version (and so the meta checksums) moved -- and, with the stale-page stamp on, each body
+  // page's stamp and the checksum covering it (manifest-crc32.md §2.1): a second compaction runs at a
+  // new txid, so it is a fixed point of everything but that.
+  const unstamped = (body: Buffer): Buffer => {
+    const out = Buffer.from(body);
+    if (pageTxidStamp()) {
+      for (let at = 0; at + PAGE <= out.length; at += PAGE) {
+        out.fill(0, at + 2, at + 4);
+        out.fill(0, at + 12, at + 16);
+      }
+    }
+    return out;
+  };
+  assert.ok(unstamped(first.subarray(PAGE * 2)).equals(unstamped(second.subarray(PAGE * 2))));
   db.close();
 });
 

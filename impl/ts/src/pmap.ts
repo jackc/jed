@@ -145,8 +145,39 @@ export type PNode = {
   sameRows?: boolean;
   patchOK?: boolean;
   colDirty?: boolean[];
+  // PROTOTYPE (spec/design/deferred-interior.md §9.4): origin is the persisted page a dirty interior
+  // replaces one for one in its parent's slot (absent: none -- a split or merge product, or a leaf,
+  // whose origin no decision reads), and sameKeys says its separators are still that page's, so only
+  // its child pointers differ. Inherited through every copy; any separator edit clears sameKeys.
+  // Mirrors the Go core's origin / sameKeys site for site, because the commit's retention decision --
+  // and so its bytes -- depends on them.
+  origin?: { page: number; tag?: Uint8Array };
+  sameKeys?: boolean;
   [mutationOwner]?: MutationGeneration;
 };
+
+// originOf is the persisted page a copy of n replaces, and whether the copy's separators are still
+// that page's: n's own page when it is persisted, else what n inherited (Go's originOf).
+export function originOf(n: PNode): { origin?: { page: number; tag?: Uint8Array }; same: boolean } {
+  if (n.page !== 0) return { origin: { page: n.page, tag: n.tag }, same: true };
+  return { origin: n.origin, same: n.sameKeys === true };
+}
+
+// copyInterior is a dirty interior copy of from with these separators and children, inheriting its
+// origin; sameKeys is kept only when the separators are from's unchanged.
+function copyInterior(
+  from: PNode,
+  keys: Uint8Array[],
+  children: Child[],
+  keysUnchanged: boolean,
+  owner?: MutationGeneration,
+): PNode {
+  const out = newInterior(keys, children, owner);
+  const { origin, same } = originOf(from);
+  if (origin !== undefined) out.origin = origin;
+  out.sameKeys = same && keysUnchanged;
+  return out;
+}
 
 // NO_ROW stands in vals for a row a lazy leaf still reads from its page.
 const NO_ROW: Row = Object.freeze([]) as unknown as Row;
@@ -908,6 +939,12 @@ function newInterior(keys: Uint8Array[], children: Child[], owner?: MutationGene
   return { keys, vals: [], weights: [], children, page: 0, [mutationOwner]: owner };
 }
 
+// newFreshInterior is a fresh dirty interior with no origin and no owner -- what the deferred-interior
+// fold writes in place of a stale page and each of its ancestors (remap.ts unstale).
+export function newFreshInterior(keys: Uint8Array[], children: Child[]): PNode {
+  return newInterior(keys, children);
+}
+
 // PMap is a persistent ordered map from encoded key to Row. `clone()` is an O(1) independent
 // snapshot (the root is shared; nodes are immutable).
 //
@@ -929,6 +966,13 @@ export class PMap {
   clone(): PMap {
     this.freezeMutationGeneration();
     return new PMap(this.root, this.rowCount);
+  }
+
+  // unstale is the deferred-interior fold (deferred-interior.md §9.4): replace the root with a copy
+  // whose stale interiors and their ancestors are dirty, when any is stale.
+  unstale(fold: (root: PNode | null) => PNode | null): void {
+    const r = fold(this.root);
+    if (r !== null) this.root = r;
   }
 
   // Invalidate every node stamped by this generation without walking the tree. A later INSERT
@@ -2210,12 +2254,14 @@ function* nodeInsertSteps(
       const ev = yield* evenLeavesSteps(n, i, sub, key, generation, src, cap, shape);
       if (ev !== null) {
         n.keys[ev.j] = ev.sep;
+        n.sameKeys = false;
         n.children[ev.j] = residentRef(ev.left);
         n.children[ev.j + 1] = residentRef(ev.right);
         return { whole: n };
       }
     }
     const edited = absorbSplit(n.keys, n.children, i, sub);
+    n.sameKeys = false;
     if (payload(n, cap, shape) <= cap.c || n.keys.length < 2) return { whole: n };
     const out = buildInterior(n.keys, n.children, cap, edited, generation, true);
     if (out === null) throw new Error("insert-path interior split always has a valid split point");
@@ -2225,7 +2271,7 @@ function* nodeInsertSteps(
     // This node's separators are unchanged, so it cannot overflow — rebuild whole.
     const children = n.children.slice();
     children[i] = residentRef(sub.whole);
-    return { whole: newInterior(n.keys.slice(), children, generation) };
+    return { whole: copyInterior(n, n.keys.slice(), children, true, generation) };
   }
   if (isLeaf(sub.left) && sub.more.length === 0) {
     const ev = yield* evenLeavesSteps(n, i, sub, key, generation, src, cap, shape);
@@ -2235,7 +2281,7 @@ function* nodeInsertSteps(
       const children = n.children.slice();
       children[ev.j] = residentRef(ev.left);
       children[ev.j + 1] = residentRef(ev.right);
-      return { whole: newInterior(keys, children, generation) };
+      return { whole: copyInterior(n, keys, children, false, generation) };
     }
   }
   const keys = n.keys.slice();
@@ -2246,6 +2292,11 @@ function* nodeInsertSteps(
     // The cap arithmetic guarantees a valid split point on the insert path (format.md "Why the
     // record cap") — reaching here would be an internal invariant break, not a data condition.
     throw new Error("insert-path interior split always has a valid split point");
+  }
+  // A rebuild that did not split still replaces this node one for one, with new separators.
+  if (out.whole !== null) {
+    const { origin } = originOf(n);
+    if (origin !== undefined) out.whole.origin = origin;
   }
   return out;
 }
@@ -2341,7 +2392,7 @@ function* nodeRemoveSteps(
   } else {
     const children = n.children.slice();
     children[i] = residentRef(res.node);
-    rebuilt = newInterior(n.keys.slice(), children, generation);
+    rebuilt = copyInterior(n, n.keys.slice(), children, true, generation);
   }
   return {
     ok: true,
@@ -2395,7 +2446,8 @@ function* rebalanceChildSteps(
   if (!isLeaf(child) && emptyUnarySubtree(child)) {
     const parent = ownedBy(n, generation)
       ? n
-      : newInterior(n.keys.slice(), n.children.slice(), generation);
+      : copyInterior(n, n.keys.slice(), n.children.slice(), false, generation);
+    parent.sameKeys = false;
     parent.keys.splice(Math.min(i, parent.keys.length - 1), 1);
     parent.children.splice(i, 1);
     return parent;
@@ -2495,7 +2547,8 @@ function* mergeAtSteps(
 
   const parent = ownedBy(n, generation)
     ? n
-    : newInterior(n.keys.slice(), n.children.slice(), generation);
+    : copyInterior(n, n.keys.slice(), n.children.slice(), false, generation);
+  parent.sameKeys = false; // past every abandon rule: the parent's separators change
   if (merged.whole !== null) {
     parent.keys.splice(j, 1);
     parent.children[j] = residentRef(merged.whole);

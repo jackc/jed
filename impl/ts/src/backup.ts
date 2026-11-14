@@ -17,7 +17,7 @@
 
 import { dirname } from "node:path";
 
-import { type CommitMeta, parseCommitMeta } from "./commit_manifest.ts";
+import { type CommitMeta, metaChecksum, parseCommitMeta } from "./commit_manifest.ts";
 import { engineError } from "./errors.ts";
 import type { Engine, Snapshot } from "./executor.ts";
 import type { Environment } from "./environment.ts";
@@ -185,6 +185,7 @@ export function backupPages(c: BackupCore, paging: SharedPaging, mt: CommitMeta)
         1,
         root.tag ?? NO_TAG,
         cap.tag,
+        mt.remap, // the pinned generation's list (deferred-interior.md §9.3)
       );
     }
   }
@@ -273,6 +274,17 @@ function writePageIdentical(
       undefined,
       codec === null ? undefined : { root: mt.rootTag, freeList: mt.freeListTag },
     );
+    // PROTOTYPE (deferred-interior.md §9.3): the copy's interiors are as stale as the source's, so its
+    // bootstrap meta carries the pinned generation's remap list; a backup cannot fold instead, since
+    // it copies interior pages verbatim.
+    if (mt.remap.size > 0) {
+      mt.remap.encode(meta);
+      new DataView(meta.buffer, meta.byteOffset, meta.byteLength).setUint32(
+        32,
+        metaChecksum(meta),
+        false,
+      );
+    }
     // Each slot is sealed for its own index in an encrypted copy (encrypted.md §6).
     if (codec !== null) codec.sealMeta(slot, meta, []);
     return meta;

@@ -783,6 +783,31 @@ commit and the "all three together" regression run claimed with the Ruby reader.
 with the assignments written out and pass; every other run recorded here set its switches
 explicitly.
 
+**The TS core (2026-11-13).** TS implements all three parts behind the same switches, read once
+through `v53.ts` (a browser has no environment, so there every switch is off), with `remap.ts`
+mirroring the other cores function for function and the tree tracking origin and `sameKeys` at the
+same sites. Two things are TS's alone:
+
+- **Retried serialization passes.** A TS pass may stop for an uncached overflow chain or an
+  asynchronous seal and be undone and repeated. So the deferral plan is taken once before allocation
+  and each pass works on a fresh copy (`beginPass`), and the undo treats retained pages as assigned:
+  a retained interior is a dirty copy that took its origin's page, so it returns to dirty and the
+  walk continues below it, whose pages were assigned too. This is §9.9's "undo a retained interior"
+  obligation, which no Go or Rust path yet needs.
+- **Two more interior read sites**: the snapshot prefetch, which warms the cache through interior
+  pages, and the integrity check's second pass over a table's records for index agreement. The
+  latter was missed at first; the cross-core sweep found it (246 failures, every one the integrity
+  check reading a stale leaf) and a ten-line reproduction pinned it.
+
+Run, switches set explicitly: tsc (Node, browser and worker programs), biome; the TS suite off and
+with deferral alone (all pass) and with all three switches (only the golden and v52-fixture byte
+comparisons the stamp breaks, the same class as Go's and Rust's); `sim:sweep 1..60 all go,rust,ts`
+with deferral alone and with all three switches (1,320 traces each, all three cores byte-identical);
+`sim:regress` across all three cores with the Ruby image checker under all three switches;
+`sim:sweep 1..30` across all three cores with every switch off. TS reads the five Ruby-written
+histories as Go and Rust do. The website's browser e2e suite was not run; the browser runs with every
+switch off.
+
 ### 9.9 What the landing change owes
 
 v53 is **one change carrying both this section and [manifest-crc32.md](manifest-crc32.md)**, so this
@@ -811,11 +836,11 @@ Beyond the three cores and `verify.rb`:
   ([encryption.md](encryption.md)). The bounded-growth oracle needs no allowance (§9.5).
 - **A race review** of the commit path, which sets a page id on the committing snapshot's own nodes
   and swaps the resident list during planning (§6).
-- **`unassignPages`**, or its equivalent, must undo a retained interior when a plan is discarded.
+- **`unassignPages`**, or its equivalent, must undo a retained interior when a plan is discarded --
+  done in TS, the one core that discards deferred plans (§9.8); Go and Rust never do yet.
 - **The stamp's remaining surface** ([manifest-crc32.md](manifest-crc32.md) §4): give the integrity
-  check and the page service's delta check a window, and change the manifest-overflow header check
-  from "bytes 1–3 zero" to "flags zero, stamp equals the meta's txid" in TS, as Go, Rust and the
-  Ruby reference already do.
+  check and the page service's delta check a window. The manifest-overflow header check is "flags
+  zero, stamp equals the meta's txid" in every core and the Ruby reference.
 - ~~A re-measurement of §8.2's three workloads at the tip.~~ **Taken** (§8.5): unchanged at
   `03cc46acc`, so the saving stands as stated. What is still unmeasured is a loosely-packed tree
   mutated away from the right edge, where leaf evening's rebalance is common — a question about that

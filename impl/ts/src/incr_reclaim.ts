@@ -159,14 +159,24 @@ export function incrDue(db: Engine): boolean {
 export function incrOrphans(
   db: Engine,
   pending: ManifestEntry[],
+  write: IncrementalWrite,
 ): { listable: number[]; held: number[] } {
   const inc = db.incr!;
-  const all = inc.tree.slice();
+  let all = inc.tree.slice();
   if (inc.known) {
-    all.push(...inc.catalog, ...inc.gist, ...inc.manifest);
+    // The previous catalog chain is orphaned whole unless this commit kept it unrewritten
+    // (PROTOTYPE, deferred-interior.md §9.1).
+    if (!write.catalogKept) all.push(...inc.catalog);
+    all.push(...inc.gist, ...inc.manifest);
   }
   all.push(...db.freeChain);
   if (pending.length === 0) all.push(...inc.held);
+  // PROTOTYPE (deferred-interior.md §9.5): a retained interior is still live at the page the previous
+  // snapshot's node holds, which the orphan walk reaches because it must descend through that node.
+  if (write.retainedIds.length > 0) {
+    const retained = new Set(write.retainedIds);
+    all = all.filter((p) => !retained.has(p));
+  }
   all.sort((a, b) => a - b);
   for (let i = 1; i < all.length; i++) {
     if (all[i] === all[i - 1]) {
@@ -210,7 +220,7 @@ export function incrAfter(
     inc.held = pending.length === 0 ? [] : mergeSorted(inc.held, held);
   }
   if (plan.newPageCount < db.pageCount) inc.gens = trimGens(inc.gens, plan.newPageCount);
-  inc.catalog = write.catalogIds;
+  if (!write.catalogKept) inc.catalog = write.catalogIds;
   inc.gist = write.gistIds;
   inc.manifest = plan.manifestIds.slice();
   inc.manifestCount = inc.manifest.length;

@@ -940,6 +940,11 @@ export class TableStore {
     return this.rows.rootNode();
   }
 
+  // unstale folds this store's stale interiors (PROTOTYPE, deferred-interior.md §9.4; remap.ts).
+  unstale(fold: (root: PNode | null) => PNode | null): void {
+    this.rows.unstale(fold);
+  }
+
   // demoteCleanLeaves demotes this store's clean, persisted resident leaves to OnDisk references —
   // the post-commit residency flip (bplus-reshape.md B4; pmap.ts PMap.demoteCleanLeaves). A no-op
   // for a store whose nodes were never persisted (a GiST leaf-key store — its on-disk form is the

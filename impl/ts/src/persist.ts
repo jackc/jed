@@ -36,10 +36,21 @@ import {
   type IncrPlan,
 } from "./incr_reclaim.ts";
 import { cacheLeaves } from "./paging.ts";
+import {
+  capacity as remapCapacity,
+  deferOn as remapDeferOn,
+  foldSnapshot,
+  hasDirtyNode,
+  migrateHint,
+  planDeferral,
+  RemapState,
+} from "./remap.ts";
 import { wallClock } from "./seam.ts";
 import type { SpillSink } from "./spill.ts";
 import {
   catalogPageCount,
+  type DeferInput,
+  type FreeListPlan,
   incrementalImage,
   incrementalImageSteps,
   type IncrementalWrite,
@@ -392,6 +403,38 @@ function* persistBodySteps(
     allowed = yield* reuseAllowedSteps(db, pending);
     if (newer !== null) allowed = excludeNewer(allowed, newer, db.freePages);
   }
+  // PROTOTYPE (deferred-interior.md §9.4): a durable commit defers interior pages when the plan fits
+  // the list, else folds -- writes every stale interior fresh and publishes an empty list. The decision
+  // is a pure function of the committed list, the dirty-node structure, the committed free list and the
+  // high-water, taken before allocation.
+  let defer: DeferInput | null = null;
+  const deferring =
+    db.paging !== null &&
+    db.persistHook !== null &&
+    remapDeferOn(db.pageSize, db.paging.codec() !== null);
+  if (deferring) {
+    const paging = db.paging!;
+    const committed = paging.remap();
+    const plan = planDeferral(
+      snap,
+      budget?.prev ?? db.committed,
+      committed,
+      migrateHint(db.freePages, db.pageCount),
+      remapCapacity(db.pageSize, paging.codec() !== null),
+    );
+    if (plan === null) {
+      foldSnapshot(snap, committed.parents());
+    } else {
+      let prevCat = paging.cat();
+      // The catalog chain blocks truncation too: rewrite it low (§9.6).
+      if (prevCat !== null && plan.migrate !== 0 && prevCat.root.page === plan.migrate)
+        prevCat = null;
+      // A relaxed batch is open while its pending set is non-empty, so a relaxed commit must write at
+      // least one page: with no dirty tree node, rewrite the catalog.
+      if (relaxedFile(db) && !hasDirtyNode(snap)) prevCat = null;
+      defer = { plan, prevCat };
+    }
+  }
   const write =
     db.paging !== null && db.persistHook === null
       ? planInMemory(db, snap, canReuse, budget)
@@ -403,7 +446,9 @@ function* persistBodySteps(
           db.paging,
           canReuse,
           allowed,
+          defer,
         );
+  if (deferring && write.remap === null) write.remap = new RemapState(); // a fold publishes an empty list
   if (db.paging === null) return write; // a bare engine with no byte store: nothing to write
   const reclaim = canReclaim ?? db.openStreams === 0;
   // DURABLE (file or OPFS — both reopened, both set a persistHook; the OPFS host leaves `path` null, so
@@ -673,29 +718,39 @@ function* commitFileSteps(
   let listed: number[] = [];
   let held: number[] = [];
   if (incrActive(db)) {
-    ({ listable: listed, held } = incrOrphans(db, pending));
+    ({ listable: listed, held } = incrOrphans(db, pending, write));
     incr = { listed, due: incrDue(db) };
   }
-  const plan = yield* planFreeListSteps(
-    snap,
-    paging,
-    write.rootPage,
-    write.rootTag,
-    write.pages,
-    write.freeRemaining,
-    write.pageCount,
-    db.liveAtCompaction,
-    db.freeGenTxid,
-    db.pageSize,
-    canReclaim,
-    canReuse,
-    pending,
-    allowed,
-    // Only the file's owner lowers the high-water, and only against a durable floor: a commit inside a
-    // relaxed batch may not cut pages the batch has yet to make durable (validated-cow.md §4).
-    truncate && pending.length === 0,
-    incr,
-  );
+  // PROTOTYPE (deferred-interior.md §9): the walks below read interiors from disk, so they need this
+  // commit's list; the committed one comes back if planning fails.
+  const prevRemap = paging.remap();
+  paging.setRemap(write.remap ?? new RemapState());
+  let plan: FreeListPlan;
+  try {
+    plan = yield* planFreeListSteps(
+      snap,
+      paging,
+      write.rootPage,
+      write.rootTag,
+      write.pages,
+      write.freeRemaining,
+      write.pageCount,
+      db.liveAtCompaction,
+      db.freeGenTxid,
+      db.pageSize,
+      canReclaim,
+      canReuse,
+      pending,
+      allowed,
+      // Only the file's owner lowers the high-water, and only against a durable floor: a commit inside a
+      // relaxed batch may not cut pages the batch has yet to make durable (validated-cow.md §4).
+      truncate && pending.length === 0,
+      incr,
+    );
+  } catch (e) {
+    paging.setRemap(prevRemap);
+    throw e;
+  }
   yield* verifyLiveCountSteps(snap, paging, write, live);
   yield* paging.reserveSteps(plan.newPageCount);
   yield* paging.writePagesSteps(plan.pages);
@@ -720,6 +775,16 @@ function* commitFileSteps(
     manifest,
     codec !== null ? { root: write.rootTag, freeList: plan.headTag } : undefined,
   );
+  // PROTOTYPE (deferred-interior.md §9.2): the list rides in the meta's last third, written before the
+  // checksum is final and before an encrypted meta is sealed.
+  if (write.remap !== null && write.remap.size > 0) {
+    write.remap.encode(meta);
+    new DataView(meta.buffer, meta.byteOffset, meta.byteLength).setUint32(
+      32,
+      metaChecksum(meta),
+      false,
+    );
+  }
   // The slot not holding the floor (format.md, *Slot alternation*): txid & 1 under synchronous = on.
   const slot = paging.commitSlot();
   // An encrypted meta is sealed for its slot over its manifest chain (encrypted.md §6).
@@ -747,6 +812,9 @@ function* commitFileSteps(
   db.liveAtCompaction = plan.newLive;
   db.freeGenTxid = plan.newGen;
   db.live = live;
+  // PROTOTYPE (deferred-interior.md §9): the list and catalog chain this commit published.
+  paging.setRemap(write.remap ?? new RemapState());
+  paging.setCat(write.cat);
   if (incr !== null && db.incr!.unknownBefore) {
     // A commit after a foreign one could not orphan that commit's wholesale pages: they stay
     // unlisted until a rebuild.

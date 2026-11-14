@@ -533,3 +533,108 @@ test("damage after open is reported by the live-only kinds", () => {
     db.close();
   }
 });
+
+// PROTOTYPE (spec/design/deferred-interior.md §9): the Ruby reference writes the cow_deferred_*
+// histories by hand (verify.rb DEFERRED_FIXTURES). Under JED_DEFER_INTERIOR=on this core must recover
+// the same generation and rows as the Go and Rust cores do and find nothing wrong; without the layout a
+// slot carrying entries is invalid, so retained opens at its base generation, fold's newest slot (an
+// empty list) is a valid v52 slot, overwrite and retire open nowhere, and the encrypted history opens
+// at its base. The histories are unstamped, so under the stamp their newest slots fall outside the
+// window: this checks the remap layout alone. Mirrors impl/go TestRemapRubyHistories and impl/rust
+// deferred_interior_ruby_histories.
+test("deferred-interior histories written by the Ruby reference", () => {
+  const env = (globalThis as { process?: { env?: Record<string, string | undefined> } }).process
+    ?.env;
+  if (env?.JED_PAGE_TXID_STAMP === "on") return;
+  const layout = env?.JED_DEFER_INTERIOR === "on";
+  const pad = (id: number, c: string): string =>
+    `row-${String(id).padStart(2, "0")}-${c.repeat(48)}`;
+  const count = (db: Database, sql: string): bigint => {
+    for (const row of db.query(sql)) {
+      const v = row[0]!;
+      if (v.kind !== "int") throw new Error(`${sql}: not an integer`);
+      return v.int;
+    }
+    throw new Error(`${sql}: no row`);
+  };
+  const cases: [string, bigint, bigint | null, [number, string][]][] = [
+    [
+      "retained",
+      2n,
+      1n,
+      [
+        [40, "y"],
+        [41, "x"],
+        [70, "x"],
+      ],
+    ],
+    [
+      "overwrite",
+      3n,
+      null,
+      [
+        [40, "z"],
+        [41, "x"],
+        [70, "x"],
+      ],
+    ],
+    [
+      "fold",
+      3n,
+      3n,
+      [
+        [40, "y"],
+        [41, "y"],
+        [70, "x"],
+      ],
+    ],
+    [
+      "retire",
+      3n,
+      null,
+      [
+        [40, "y"],
+        [41, "x"],
+        [70, "y"],
+      ],
+    ],
+  ];
+  for (const [name, withLayout, without, rows] of cases) {
+    const file = join(GOLDEN_DIR, `cow_deferred_${name}.jed`);
+    const want = layout ? withLayout : without;
+    if (want === null) {
+      assert.throws(
+        () => openDatabase(copyOf(file), { readOnly: true }),
+        `${name}: no slot to select`,
+      );
+      continue;
+    }
+    const db = openDatabase(copyOf(file), { readOnly: true });
+    try {
+      assert.equal(db.version, want, `${name}: recovered version`);
+      assert.equal(count(db, "SELECT count(*) FROM t"), 90n, name);
+      assert.equal(count(db, "SELECT sum(id) FROM t"), 4095n, name);
+      if (layout) {
+        const wanted = rows.map(([id, c]) => `(id = ${id} AND pad = '${pad(id, c)}')`).join(" OR ");
+        assert.equal(count(db, `SELECT count(*) FROM t WHERE ${wanted}`), 3n, `${name}: rows`);
+      }
+      const r = db.integrityCheck("main", { level: "full", maxFindings: 0, constraints: true });
+      assert.deepEqual(r.findings, [], `${name}: integrity`);
+    } finally {
+      db.close();
+    }
+  }
+  // History (e): the entry carries the new leaf's tag while the retained root's pointer binds the old
+  // leaf's, so reading the edited row at all means this core took the tag from the entry.
+  const file = join(GOLDEN_DIR, "encrypted_cow_deferred_retained.jed");
+  const db = openDatabase(copyOf(file), { readOnly: true, credential: ENC_KEY });
+  try {
+    assert.equal(db.version, layout ? 2n : 1n, "encrypted: recovered version");
+    assert.equal(count(db, "SELECT count(*) FROM t"), 300n);
+    assert.equal(count(db, "SELECT v FROM t WHERE id = 100"), layout ? 1001n : 1000n);
+    const r = db.integrityCheck("main", { level: "full", maxFindings: 0, constraints: true });
+    assert.deepEqual(r.findings, [], "encrypted: integrity");
+  } finally {
+    db.close();
+  }
+});

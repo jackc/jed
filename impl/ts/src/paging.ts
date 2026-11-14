@@ -22,6 +22,7 @@ import { runSync, type Steps } from "./execution.ts";
 import { engineError } from "./errors.ts";
 import { decodeLeafNode, sameLeafShape } from "./format.ts";
 import type { ManifestEntry } from "./commit_manifest.ts";
+import { type CatState, RemapState } from "./remap.ts";
 import type { BatchMirror, CommitFault, Pager, PageRead, PageTransform } from "./pager.ts";
 
 // DEFAULT_CACHE_BYTES is the default memory budget for the resident leaf cache, in bytes (256 MiB) — the
@@ -54,9 +55,31 @@ export class SharedPaging {
   // (prefetchSteps), so the synchronous from-scratch serializer finds them without a read under an
   // asynchronous codec or device (spec/design/ts-runtime.md §11.1). null outside a rewrite.
   private prefetched: Map<number, Uint8Array> | null = null;
+  // PROTOTYPE (spec/design/deferred-interior.md §9): the committed generation's remap list, which
+  // interior reads of the live generation resolve through, and the catalog chain it committed, which a
+  // deferring commit keeps when its bytes are unchanged. Both are set when an engine is loaded from a
+  // selected meta (the chain forgotten: another process may have rewritten it) and by every commit.
+  private remapList: RemapState = new RemapState();
+  private catalogChain: CatState | null = null;
   // batches is set when the store fetches several pages in one request (a page client over the stream
   // transport): scans read ahead (prefetchLeaves).
   readonly batches: boolean;
+
+  remap(): RemapState {
+    return this.remapList;
+  }
+
+  setRemap(remap: RemapState): void {
+    this.remapList = remap;
+  }
+
+  cat(): CatState | null {
+    return this.catalogChain;
+  }
+
+  setCat(cat: CatState | null): void {
+    this.catalogChain = cat;
+  }
 
   constructor(pager: Pager, capacity: number, codec: PageCodec | null = null) {
     this.pager = pager;

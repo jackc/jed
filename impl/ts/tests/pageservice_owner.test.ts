@@ -12,11 +12,13 @@ import { test } from "node:test";
 import {
   buildCommitManifest,
   crc64Update,
+  pageDigest,
   manifestEntriesOf,
   manifestInlineCapacity,
   manifestOverflowCapacity,
 } from "../src/commit_manifest.ts";
 import "../src/crc32_node.ts";
+import { manifestCrc32 } from "../src/v53.ts";
 import { makePage, metaPage } from "../src/format.ts";
 import {
   PS_COMMIT_STATUS_COMMITTED,
@@ -333,7 +335,8 @@ test("pageservice delta: a relaxed delta carries the owner's pending set", () =>
   const pending = new Map<number, bigint>();
   const body: PsIndexedPage[] = [];
   for (const pg of all) {
-    if (pg.index === 4) pending.set(4, crc64Update(0n, pg.page));
+    // The pending set's digest at the width this process writes (manifest-crc32.md §2).
+    if (pg.index === 4) pending.set(4, pageDigest(pg.page, false, manifestCrc32()));
     else body.push(pg);
   }
   const base: DeltaBase = {
