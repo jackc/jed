@@ -236,16 +236,20 @@ and storage algorithms remain handwritten Ruby; these utility exceptions do not
 authorize a native engine dependency or a Rust/WASM binding.
 
 The **native Java experiment** (`impl/java-native`) was authorized 2026-11-14
-against `3e5962f9affc06c768df1688765162a65a893848`, format v53. It targets full
+against `3e5962f9affc06c768df1688765162a65a893848`, format v53. It has verified full
 frozen-baseline parity on Linux x86-64, with Java 25 as the stable target and a
-controlled JDK 28 early-access/value-class comparison. Public APIs are blocking
+matched JDK 28 early-access/value-class comparison. Public APIs are blocking
 and streaming, usable from ordinary or virtual threads, with explicit cooperative
 cancellation. Narrow JDK FFM calls implement required OS host operations; no
 unsafe engine access is authorized. Bouncy Castle Java `bcprov-jdk18on:1.86` is
 approved only for Argon2id and its internal helpers; other crypto uses JDK providers.
 Toolchain downloads, parallel implementation/review, verification, profiling and
-local commits are authorized. All three variants pass frozen correctness acceptance;
-controlled performance measurement remains in progress. No promotion is implied.
+local commits are authorized. The frozen experiment is complete: 42/42 correctness
+gates pass across the three variants, and 24 workloads across five actors and three repeats
+plus separate memory probes are recorded. Shared-host load and bounded warmup limit
+timing conclusions; performance parity is not established. Exact source/artifact
+identities and limitations are in `impl/java-native/VERIFICATION.md` and
+`impl/java-native/BENCHMARKS.md`. No promotion is implied.
 The experiment remains opt-in, outside normal CI and automatic future updates;
 publication, JDBC/ORM integration, Native Image and other platforms are separate.
 See [java-native-experiment.md](spec/design/java-native-experiment.md).

@@ -1,0 +1,31 @@
+{
+  "source_sha256": "c06506cef70fb89b0369552d396ce79b46d2868310eb7825e991c590579d1118",
+  "qualification": "Pre-aggregate-optimization comparison on a shared host; unidentified overlapping Java processes prevent an idle-host claim.",
+  "files": {
+    "evidence.json.gz": {
+      "original_path": ".dev/java-native/benchmarks/matched-20261114-2680419-j21ev2/evidence.json",
+      "original_sha256": "8e8c6f996b7bf68b2c1bf78e70c777803bee01caecea0a48c99740ac1fc6e3fa",
+      "stored_sha256": "d9ab86cff6cc630a692fe659661e67307a3cb74b72edd14db96f62019665c073"
+    },
+    "summary.json": {
+      "original_path": ".dev/java-native/benchmarks/matched-20261114-2680419-j21ev2/summary.json",
+      "original_sha256": "9bf2a1bff9b9713ae19ab4269305bccef38eb33d69ea7fe2e2ff68af859bed89",
+      "stored_sha256": "9bf2a1bff9b9713ae19ab4269305bccef38eb33d69ea7fe2e2ff68af859bed89"
+    },
+    "context.jsonl.gz": {
+      "original_path": ".dev/java-native/benchmark-controlled-second.context.jsonl",
+      "original_sha256": "94a1b6f053e515fb30afa85a4414f187bb9164f9be4c1d8a9d9a95a714db3b09",
+      "stored_sha256": "0bdbf94e0b2903ead2148a9a2aa23060ca5f76bc0b5c21cf6bb9933bd06be0b9"
+    },
+    "run.log.gz": {
+      "original_path": ".dev/java-native/benchmark-controlled-second.log",
+      "original_sha256": "9282129159caba8334e9883beac0245efb3e79c5058d0dcdfdee8e6ad956d549",
+      "stored_sha256": "7baa75731848164ad3803f26b67885201259dd6c4a1e29a4e440eed7ae1fcb40"
+    },
+    "observer.py": {
+      "original_path": "/tmp/java-benchmark-context.py",
+      "original_sha256": "ce90ea754c32eb98eecd522e0f2ba5f7e81d7ad6d1df38861923217a2f9c0a64",
+      "stored_sha256": "ce90ea754c32eb98eecd522e0f2ba5f7e81d7ad6d1df38861923217a2f9c0a64"
+    }
+  }
+}

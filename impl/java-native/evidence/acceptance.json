@@ -4,49 +4,49 @@
     "schema_version": 1,
     "semantic_revision": "3e5962f9affc06c768df1688765162a65a893848",
     "format_version": 53,
-    "status": "implementation-in-progress",
+    "status": "experimental",
     "platform": "linux-x64",
     "supplemental_corpus": []
   },
-  "source_sha256": "c06506cef70fb89b0369552d396ce79b46d2868310eb7825e991c590579d1118",
+  "source_sha256": "419675aa4fa4b2afeaa9a645d6ebc3e68e38579e77858bb1816e12dd2848c5fc",
   "actors": {
     "stable": {
-      "path": "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/stable-20261114-2477637-p9fkmf",
+      "path": "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/stable-20261114-2737182-z373h5",
       "identity": {
-        "source_sha256": "c06506cef70fb89b0369552d396ce79b46d2868310eb7825e991c590579d1118",
+        "source_sha256": "419675aa4fa4b2afeaa9a645d6ebc3e68e38579e77858bb1816e12dd2848c5fc",
         "source_snapshot": "sources",
         "variant": "stable",
         "runtime": "openjdk 25.0.5 2026-10-20 LTS\nOpenJDK Runtime Environment Temurin-25.0.5+8 (build 25.0.5+8-LTS)\nOpenJDK 64-Bit Server VM Temurin-25.0.5+8 (build 25.0.5+8-LTS, mixed mode, sharing)",
         "release": 25,
         "preview": false,
         "dependency_sha256": "2af190b300cbb0b35e248ccf5f4a06b6072030aeb3da7a98ec73abe5b4cb371f",
-        "jar_sha256": "88ca285be8b251516a88b926c1de4a6347838a4e6c4652599653afe20f296a53"
+        "jar_sha256": "5297152fdaaa41609b90d4cd44bb0a0dc055adee83a6f396067434090c7253b3"
       }
     },
     "ea": {
-      "path": "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/ea-20261114-2477637-aaxpgk",
+      "path": "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/ea-20261114-2737182-usjd9c",
       "identity": {
-        "source_sha256": "c06506cef70fb89b0369552d396ce79b46d2868310eb7825e991c590579d1118",
+        "source_sha256": "419675aa4fa4b2afeaa9a645d6ebc3e68e38579e77858bb1816e12dd2848c5fc",
         "source_snapshot": "sources",
         "variant": "ea",
         "runtime": "openjdk 28-ea 2027-03-23\nOpenJDK Runtime Environment (build 28-ea+24-1988)\nOpenJDK 64-Bit Server VM (build 28-ea+24-1988, mixed mode, sharing)",
         "release": 25,
         "preview": false,
         "dependency_sha256": "2af190b300cbb0b35e248ccf5f4a06b6072030aeb3da7a98ec73abe5b4cb371f",
-        "jar_sha256": "37c0e3f95bc509adb56dc52cf291291a69e11b3e3be8a3a1b656f88956421ede"
+        "jar_sha256": "6663ddf99fc6660e3090b9e9e94b3e465e0f4af8ff0f2fd9498e6f2e8e793927"
       }
     },
     "valhalla": {
-      "path": "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/valhalla-20261114-2477637-oa2hie",
+      "path": "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/valhalla-20261114-2737182-7krf7l",
       "identity": {
-        "source_sha256": "c06506cef70fb89b0369552d396ce79b46d2868310eb7825e991c590579d1118",
+        "source_sha256": "419675aa4fa4b2afeaa9a645d6ebc3e68e38579e77858bb1816e12dd2848c5fc",
         "source_snapshot": "sources",
         "variant": "valhalla",
         "runtime": "openjdk 28-ea 2027-03-23\nOpenJDK Runtime Environment (build 28-ea+24-1988)\nOpenJDK 64-Bit Server VM (build 28-ea+24-1988, mixed mode, sharing)",
         "release": 28,
         "preview": true,
         "dependency_sha256": "2af190b300cbb0b35e248ccf5f4a06b6072030aeb3da7a98ec73abe5b4cb371f",
-        "jar_sha256": "841ff44aef1a00c75704ffdda7b34de56c24ecb0962052309b38c146384acde2"
+        "jar_sha256": "ca426d23dc90420ecc1063888c1c7978724fa90300420072a2c68003d8fb527a"
       }
     }
   },
@@ -56,7 +56,7 @@
       "check": "host",
       "pass": true,
       "exit_status": 0,
-      "seconds": 5.733742720913142,
+      "seconds": 5.616001844406128,
       "command": [
         "mise",
         "run",
@@ -64,17 +64,17 @@
         "--variant",
         "ea",
         "--actor",
-        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/ea-20261114-2477637-aaxpgk"
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/ea-20261114-2737182-usjd9c"
       ],
       "log": "ea-host.log",
-      "log_sha256": "adcad6e9e2344ec9a26d66f987635ccc0865f8536fdb453b4ff7c930cbcfdb6f"
+      "log_sha256": "55966da707bf078b69bdac8b2e325f9709018cbc05986b8aa949864bec395366"
     },
     {
       "variant": "valhalla",
       "check": "host",
       "pass": true,
       "exit_status": 0,
-      "seconds": 5.882448300719261,
+      "seconds": 5.782484762836248,
       "command": [
         "mise",
         "run",
@@ -82,17 +82,17 @@
         "--variant",
         "valhalla",
         "--actor",
-        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/valhalla-20261114-2477637-oa2hie"
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/valhalla-20261114-2737182-7krf7l"
       ],
       "log": "valhalla-host.log",
-      "log_sha256": "d4203c16e8b655ac3418e287f357d02458ca6b6138e27ef695d5149f5da27fff"
+      "log_sha256": "3213f02a179674e85b697e28133c26487777018d538b8fd7818b86b709035eea"
     },
     {
       "variant": "stable",
       "check": "host",
       "pass": true,
       "exit_status": 0,
-      "seconds": 6.083456618245691,
+      "seconds": 5.910022915806621,
       "command": [
         "mise",
         "run",
@@ -100,17 +100,17 @@
         "--variant",
         "stable",
         "--actor",
-        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/stable-20261114-2477637-p9fkmf"
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/stable-20261114-2737182-z373h5"
       ],
       "log": "stable-host.log",
-      "log_sha256": "de245f2a121932fed9b63068a2ddeb48215908296f6ff7e52b5d4391d3bb6ec1"
+      "log_sha256": "a989bbdf006de1eebf683b3a526bd6b44e0467898f4b636b815d15663f353d12"
     },
     {
       "variant": "ea",
       "check": "memory",
       "pass": true,
       "exit_status": 0,
-      "seconds": 92.3579140692018,
+      "seconds": 92.70252921571955,
       "command": [
         "mise",
         "run",
@@ -118,37 +118,18 @@
         "--variant",
         "ea",
         "--actor",
-        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/ea-20261114-2477637-aaxpgk",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/ea-20261114-2737182-usjd9c",
         "--all"
       ],
       "log": "ea-memory.log",
-      "log_sha256": "eaff268ddb0463716dbfae75044c828fdab1a10d848feb26f4596a26983d4f41"
-    },
-    {
-      "variant": "stable",
-      "check": "memory",
-      "pass": true,
-      "exit_status": 0,
-      "seconds": 93.89103264035657,
-      "command": [
-        "mise",
-        "run",
-        "java-native:conformance",
-        "--variant",
-        "stable",
-        "--actor",
-        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/stable-20261114-2477637-p9fkmf",
-        "--all"
-      ],
-      "log": "stable-memory.log",
-      "log_sha256": "10ed5e26c287e2d26a6edf46ac88a56acd104ae5c0676cbedef45cb263dce2c2"
+      "log_sha256": "2fe14bee85fb5a8d9e4b447e7e1a1fc85ac9f4bbeb21e1da30b178388a3f5f55"
     },
     {
       "variant": "valhalla",
       "check": "memory",
       "pass": true,
       "exit_status": 0,
-      "seconds": 94.3554284889251,
+      "seconds": 92.60442802030593,
       "command": [
         "mise",
         "run",
@@ -156,18 +137,37 @@
         "--variant",
         "valhalla",
         "--actor",
-        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/valhalla-20261114-2477637-oa2hie",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/valhalla-20261114-2737182-7krf7l",
         "--all"
       ],
       "log": "valhalla-memory.log",
-      "log_sha256": "6fbac18f49551ef29c282035698eac6e4be47ad9ab23255f2e64fe05a53b3e89"
+      "log_sha256": "4a509d8234f43028ffff5233dbe84708088842564b8dfc3c67ae78ebf1b55235"
+    },
+    {
+      "variant": "stable",
+      "check": "memory",
+      "pass": true,
+      "exit_status": 0,
+      "seconds": 92.88010336784646,
+      "command": [
+        "mise",
+        "run",
+        "java-native:conformance",
+        "--variant",
+        "stable",
+        "--actor",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/stable-20261114-2737182-z373h5",
+        "--all"
+      ],
+      "log": "stable-memory.log",
+      "log_sha256": "17543cdb27d372913ea2db3e30dd9b99b323f73c6f3c922be644702dff5b28f0"
     },
     {
       "variant": "ea",
       "check": "plain",
       "pass": true,
       "exit_status": 0,
-      "seconds": 95.35248659225181,
+      "seconds": 94.23860521707684,
       "command": [
         "mise",
         "run",
@@ -175,19 +175,19 @@
         "--variant",
         "ea",
         "--actor",
-        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/ea-20261114-2477637-aaxpgk",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/ea-20261114-2737182-usjd9c",
         "--all",
         "--disk"
       ],
       "log": "ea-plain.log",
-      "log_sha256": "2218a57c044522449aa8a052ee47dd0b4b8ac1b594f02815487c994ea4c2c8f9"
+      "log_sha256": "d660e07ac1d7577f5e5dd9e17b1ced04437601bf32b05bc6e70d838dcd6fcffd"
     },
     {
       "variant": "valhalla",
       "check": "plain",
       "pass": true,
       "exit_status": 0,
-      "seconds": 97.22104616835713,
+      "seconds": 95.89859519992024,
       "command": [
         "mise",
         "run",
@@ -195,19 +195,19 @@
         "--variant",
         "valhalla",
         "--actor",
-        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/valhalla-20261114-2477637-oa2hie",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/valhalla-20261114-2737182-7krf7l",
         "--all",
         "--disk"
       ],
       "log": "valhalla-plain.log",
-      "log_sha256": "fbc054c675b6df9807f02d61f76c8d82114f32b76e38497d057bac0261646408"
+      "log_sha256": "4516edb5449850451a2418a4d5f4b04c6299fda5d94a4ff343721cd75193ad62"
     },
     {
       "variant": "stable",
       "check": "plain",
       "pass": true,
       "exit_status": 0,
-      "seconds": 98.13186226179823,
+      "seconds": 95.5019518379122,
       "command": [
         "mise",
         "run",
@@ -215,19 +215,19 @@
         "--variant",
         "stable",
         "--actor",
-        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/stable-20261114-2477637-p9fkmf",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/stable-20261114-2737182-z373h5",
         "--all",
         "--disk"
       ],
       "log": "stable-plain.log",
-      "log_sha256": "222ca3b2d68c1cd0cf931d812805b3d2b756989bfbfbf7841fe16c28c2f3bd47"
+      "log_sha256": "43271340710f68a53464ac2fc3f1fcb5b2710c1d026e3066da8be1c3e82692f8"
     },
     {
       "variant": "ea",
       "check": "encrypted",
       "pass": true,
       "exit_status": 0,
-      "seconds": 98.1162383002229,
+      "seconds": 97.1747226701118,
       "command": [
         "mise",
         "run",
@@ -235,37 +235,19 @@
         "--variant",
         "ea",
         "--actor",
-        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/ea-20261114-2477637-aaxpgk",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/ea-20261114-2737182-usjd9c",
         "--all",
         "--encrypted"
       ],
       "log": "ea-encrypted.log",
-      "log_sha256": "c1cc934c105545105c81ffbd11aaa652655a97ba21aa0a50f7d28f41b0643310"
-    },
-    {
-      "variant": "ea",
-      "check": "stress",
-      "pass": true,
-      "exit_status": 0,
-      "seconds": 3.8283252622932196,
-      "command": [
-        "mise",
-        "run",
-        "java-native:stress",
-        "--variant",
-        "ea",
-        "--actor",
-        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/ea-20261114-2477637-aaxpgk"
-      ],
-      "log": "ea-stress.log",
-      "log_sha256": "ded6fb4250c20194910ea5ec6bb22488eb12b1ac87c3e1f50c906cc7b9d2bbe9"
+      "log_sha256": "76d02d36e07c05ad013eb54c5ed243e3dfdebf70efe8dd273f20b268e0f94357"
     },
     {
       "variant": "valhalla",
       "check": "encrypted",
       "pass": true,
       "exit_status": 0,
-      "seconds": 99.80541933188215,
+      "seconds": 98.6737829609774,
       "command": [
         "mise",
         "run",
@@ -273,19 +255,37 @@
         "--variant",
         "valhalla",
         "--actor",
-        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/valhalla-20261114-2477637-oa2hie",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/valhalla-20261114-2737182-7krf7l",
         "--all",
         "--encrypted"
       ],
       "log": "valhalla-encrypted.log",
-      "log_sha256": "35d68b6a1d33da2ec594ead4d471534faebd5a9cbfb50c12ad42dc90e32d3ee9"
+      "log_sha256": "9bbb303c974f533a07ae3640e21eb0521f97e05ac320bace78151b7755d70b19"
+    },
+    {
+      "variant": "ea",
+      "check": "stress",
+      "pass": true,
+      "exit_status": 0,
+      "seconds": 3.7232187031768262,
+      "command": [
+        "mise",
+        "run",
+        "java-native:stress",
+        "--variant",
+        "ea",
+        "--actor",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/ea-20261114-2737182-usjd9c"
+      ],
+      "log": "ea-stress.log",
+      "log_sha256": "76341e3402d5527d224597a711e73897b99b2a40a29c2bcd61bf075d8ca82bbc"
     },
     {
       "variant": "stable",
       "check": "encrypted",
       "pass": true,
       "exit_status": 0,
-      "seconds": 99.57182108424604,
+      "seconds": 100.12576331570745,
       "command": [
         "mise",
         "run",
@@ -293,19 +293,19 @@
         "--variant",
         "stable",
         "--actor",
-        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/stable-20261114-2477637-p9fkmf",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/stable-20261114-2737182-z373h5",
         "--all",
         "--encrypted"
       ],
       "log": "stable-encrypted.log",
-      "log_sha256": "58137fccf1b98a787c6667b610c522da6a6d977e5b82207cd6b7dbf1a8e6056e"
+      "log_sha256": "70dcd8ce8b6c46e231c4c46f926dbf980c050d0c6c502e3d3407309c4cefd201"
     },
     {
       "variant": "valhalla",
       "check": "stress",
       "pass": true,
       "exit_status": 0,
-      "seconds": 4.752158392686397,
+      "seconds": 4.306776766199619,
       "command": [
         "mise",
         "run",
@@ -313,17 +313,17 @@
         "--variant",
         "valhalla",
         "--actor",
-        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/valhalla-20261114-2477637-oa2hie"
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/valhalla-20261114-2737182-7krf7l"
       ],
       "log": "valhalla-stress.log",
-      "log_sha256": "ed8e8bd8afefcbadd33c48edc60bd03b15c44ceb5e8f36a3407b89afdadad56e"
+      "log_sha256": "79d7528a61aa6539e735b31c58536e3d680413c7e11bdfb16e2090d4e535a8fb"
     },
     {
       "variant": "stable",
       "check": "stress",
       "pass": true,
       "exit_status": 0,
-      "seconds": 4.525239804759622,
+      "seconds": 4.160765960346907,
       "command": [
         "mise",
         "run",
@@ -331,17 +331,17 @@
         "--variant",
         "stable",
         "--actor",
-        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/stable-20261114-2477637-p9fkmf"
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/stable-20261114-2737182-z373h5"
       ],
       "log": "stable-stress.log",
-      "log_sha256": "524265826063392dfaf276b6beeb6e802084592032d36c666cb527084dc43fb0"
+      "log_sha256": "c656f5d435a9bf1f43b2068baea0d2c0c6ffcc4773ea30a1a4056f27a8604afb"
     },
     {
       "variant": "ea",
       "check": "process",
       "pass": true,
       "exit_status": 0,
-      "seconds": 113.0267258901149,
+      "seconds": 105.46696292888373,
       "command": [
         "mise",
         "run",
@@ -349,21 +349,21 @@
         "--variant",
         "ea",
         "--actor",
-        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/ea-20261114-2477637-aaxpgk",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/ea-20261114-2737182-usjd9c",
         "--cores",
         "java-native,go,rust,node",
         "--evidence-dir",
-        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-first/ea-process"
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-second/ea-process"
       ],
       "log": "ea-process.log",
-      "log_sha256": "62ca1f1d7c6cb9ca05ff8d4505ee577d2d41ed1d3155ce898dfbd48f2a1377be"
+      "log_sha256": "be1d0087a1456bc1f8d84b82964a918242ef02a40526108ce93279bf9df60341"
     },
     {
       "variant": "stable",
       "check": "process",
       "pass": true,
       "exit_status": 0,
-      "seconds": 113.78674719622359,
+      "seconds": 105.44684145273641,
       "command": [
         "mise",
         "run",
@@ -371,21 +371,21 @@
         "--variant",
         "stable",
         "--actor",
-        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/stable-20261114-2477637-p9fkmf",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/stable-20261114-2737182-z373h5",
         "--cores",
         "java-native,go,rust,node",
         "--evidence-dir",
-        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-first/stable-process"
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-second/stable-process"
       ],
       "log": "stable-process.log",
-      "log_sha256": "af4885628288d7ee767eb34bd6e2696fadddfe7bd52d619f6b43b578fa41aed9"
+      "log_sha256": "325e47a4682013ec3ee41bb3cdbc53db0f2d0e9134591db29e01cc315e1e599b"
     },
     {
       "variant": "valhalla",
       "check": "process",
       "pass": true,
       "exit_status": 0,
-      "seconds": 115.74027212476358,
+      "seconds": 107.22574042482302,
       "command": [
         "mise",
         "run",
@@ -393,21 +393,21 @@
         "--variant",
         "valhalla",
         "--actor",
-        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/valhalla-20261114-2477637-oa2hie",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/valhalla-20261114-2737182-7krf7l",
         "--cores",
         "java-native,go,rust,node",
         "--evidence-dir",
-        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-first/valhalla-process"
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-second/valhalla-process"
       ],
       "log": "valhalla-process.log",
-      "log_sha256": "8ffdb68b8042cf87000584eb0bd75a61a1c4465f1e094f7cec59d920bc1516b8"
+      "log_sha256": "148353e3f0ec7aa841974392e04e83e1b607e1c9dfb96b3f99bce46350465f59"
     },
     {
       "variant": "ea",
       "check": "saved",
       "pass": true,
       "exit_status": 0,
-      "seconds": 19.08386391401291,
+      "seconds": 17.127859632950276,
       "command": [
         "mise",
         "run",
@@ -415,20 +415,20 @@
         "--variant",
         "ea",
         "--actor",
-        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/ea-20261114-2477637-aaxpgk",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/ea-20261114-2737182-usjd9c",
         "--regress",
         "--evidence-dir",
-        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-first/ea-saved"
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-second/ea-saved"
       ],
       "log": "ea-saved.log",
-      "log_sha256": "221add89f98c5c04abe2edb8b53cb8502e362bc2e8c23607ea5dc1d0d0613a2e"
+      "log_sha256": "ebdb7c8404cad73c3c6cb1d874d84538560dd848882fafbddb7006b51a033f5a"
     },
     {
       "variant": "stable",
       "check": "saved",
       "pass": true,
       "exit_status": 0,
-      "seconds": 16.34480084432289,
+      "seconds": 15.908599663991481,
       "command": [
         "mise",
         "run",
@@ -436,20 +436,20 @@
         "--variant",
         "stable",
         "--actor",
-        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/stable-20261114-2477637-p9fkmf",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/stable-20261114-2737182-z373h5",
         "--regress",
         "--evidence-dir",
-        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-first/stable-saved"
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-second/stable-saved"
       ],
       "log": "stable-saved.log",
-      "log_sha256": "4ae6226785161ff32b7fa8bda26691e78798bd1d5ae44df6227298194dbbbc41"
+      "log_sha256": "49a842fa81229ee873e8d8e722053406efe79e093b6a30ae2d2b6795183fa4d6"
     },
     {
       "variant": "valhalla",
       "check": "saved",
       "pass": true,
       "exit_status": 0,
-      "seconds": 17.101642835885286,
+      "seconds": 16.458115878980607,
       "command": [
         "mise",
         "run",
@@ -457,20 +457,20 @@
         "--variant",
         "valhalla",
         "--actor",
-        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/valhalla-20261114-2477637-oa2hie",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/valhalla-20261114-2737182-7krf7l",
         "--regress",
         "--evidence-dir",
-        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-first/valhalla-saved"
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-second/valhalla-saved"
       ],
       "log": "valhalla-saved.log",
-      "log_sha256": "93cfb34785fe5c609e85585e415f9ecb0fc5bf7788f221ab8d163be5e69e7190"
+      "log_sha256": "bf66c87bf329d931b5c515ebffd5c3da5f938a7961210e11a0250782d691e0fb"
     },
     {
       "variant": "ea",
       "check": "seeded",
       "pass": true,
       "exit_status": 0,
-      "seconds": 127.04879329074174,
+      "seconds": 115.97569612972438,
       "command": [
         "mise",
         "run",
@@ -478,21 +478,21 @@
         "--variant",
         "ea",
         "--actor",
-        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/ea-20261114-2477637-aaxpgk",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/ea-20261114-2737182-usjd9c",
         "--seeds",
         "1..3",
         "--evidence-dir",
-        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-first/ea-seeded"
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-second/ea-seeded"
       ],
       "log": "ea-seeded.log",
-      "log_sha256": "4225c348caccb9701adf0970bb3a99b3cc97fc9bf599770c87cc3a558478f1ff"
+      "log_sha256": "b377781b76f206754782c4b54f948357fe655fb987ffcce5d711a41896340ec0"
     },
     {
       "variant": "ea",
       "check": "review",
       "pass": true,
       "exit_status": 0,
-      "seconds": 0.49141611997038126,
+      "seconds": 0.408436574973166,
       "command": [
         "mise",
         "run",
@@ -500,19 +500,19 @@
         "--variant",
         "ea",
         "--actor",
-        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/ea-20261114-2477637-aaxpgk",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/ea-20261114-2737182-usjd9c",
         "--files",
-        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-first/source/impl/java-native/src/test/resources/review/planner.test"
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-second/source/impl/java-native/src/test/resources/review/planner.test"
       ],
       "log": "ea-review.log",
-      "log_sha256": "dc33acb5744a65717c9ed10cf76dcbda96f812f1840327d176bf5e0913942c5d"
+      "log_sha256": "635504c70d92448694d74744477412e3c4b3003efa95475829895ed231a612a4"
     },
     {
       "variant": "ea",
       "check": "review-plain",
       "pass": true,
       "exit_status": 0,
-      "seconds": 0.5525171528570354,
+      "seconds": 0.5145476409234107,
       "command": [
         "mise",
         "run",
@@ -520,20 +520,20 @@
         "--variant",
         "ea",
         "--actor",
-        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/ea-20261114-2477637-aaxpgk",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/ea-20261114-2737182-usjd9c",
         "--disk",
         "--files",
-        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-first/source/impl/java-native/src/test/resources/review/planner.test"
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-second/source/impl/java-native/src/test/resources/review/planner.test"
       ],
       "log": "ea-review-plain.log",
-      "log_sha256": "94b6bb359b0f585e4c0f25a904dca8c67b32abdee762ad0a4261f7fcc1cf0fe9"
+      "log_sha256": "8f114f03306cdd10b5792c773b1368562f67a5a7e083c7dba5bf25a244c4fd9d"
     },
     {
       "variant": "ea",
       "check": "review-analyze-empty-relaxed",
       "pass": true,
       "exit_status": 0,
-      "seconds": 0.5809269640594721,
+      "seconds": 0.4995191069319844,
       "command": [
         "mise",
         "run",
@@ -541,45 +541,22 @@
         "--variant",
         "ea",
         "--actor",
-        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/ea-20261114-2477637-aaxpgk",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/ea-20261114-2737182-usjd9c",
         "--file",
-        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-first/source/impl/java-native/src/test/resources/review/analyze-empty-relaxed.sim",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-second/source/impl/java-native/src/test/resources/review/analyze-empty-relaxed.sim",
         "--peer",
         "--evidence-dir",
-        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-first/ea-review-analyze-empty-relaxed"
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-second/ea-review-analyze-empty-relaxed"
       ],
       "log": "ea-review-analyze-empty-relaxed.log",
-      "log_sha256": "5564f11a0a4032b3f03263a16bc49ecb1bb6d0def9a03e26b7f05ab56c16b1f4"
-    },
-    {
-      "variant": "ea",
-      "check": "review-analyze-empty",
-      "pass": true,
-      "exit_status": 0,
-      "seconds": 0.3763458598405123,
-      "command": [
-        "mise",
-        "run",
-        "java-native:simulation",
-        "--variant",
-        "ea",
-        "--actor",
-        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/ea-20261114-2477637-aaxpgk",
-        "--file",
-        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-first/source/impl/java-native/src/test/resources/review/analyze-empty.sim",
-        "--peer",
-        "--evidence-dir",
-        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-first/ea-review-analyze-empty"
-      ],
-      "log": "ea-review-analyze-empty.log",
-      "log_sha256": "1eaef05e42ea46bce2627abf237022ae1efce130b678609215c3e2ad7bb8bc6e"
+      "log_sha256": "12b22be7afadb3470352253b1a74dbd35bc7e987e09cb85d4293276c076c9ea5"
     },
     {
       "variant": "stable",
       "check": "seeded",
       "pass": true,
       "exit_status": 0,
-      "seconds": 124.5524012139067,
+      "seconds": 113.57010793220252,
       "command": [
         "mise",
         "run",
@@ -587,21 +564,44 @@
         "--variant",
         "stable",
         "--actor",
-        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/stable-20261114-2477637-p9fkmf",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/stable-20261114-2737182-z373h5",
         "--seeds",
         "1..3",
         "--evidence-dir",
-        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-first/stable-seeded"
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-second/stable-seeded"
       ],
       "log": "stable-seeded.log",
-      "log_sha256": "e0a45d3dd6fc59e06bbcb308ec860dfeeb92f111f306d824e3e7470978e441bb"
+      "log_sha256": "85e23d2216a875d319e4934812cbef8582750d8bcb04c48920751b9d89aad5b7"
+    },
+    {
+      "variant": "ea",
+      "check": "review-analyze-empty",
+      "pass": true,
+      "exit_status": 0,
+      "seconds": 0.37807347206398845,
+      "command": [
+        "mise",
+        "run",
+        "java-native:simulation",
+        "--variant",
+        "ea",
+        "--actor",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/ea-20261114-2737182-usjd9c",
+        "--file",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-second/source/impl/java-native/src/test/resources/review/analyze-empty.sim",
+        "--peer",
+        "--evidence-dir",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-second/ea-review-analyze-empty"
+      ],
+      "log": "ea-review-analyze-empty.log",
+      "log_sha256": "952ba4eff0a846dc72f59d3f2cf316b18bcb5ed16c77de18755237dfac9b5d63"
     },
     {
       "variant": "stable",
       "check": "review",
       "pass": true,
       "exit_status": 0,
-      "seconds": 0.48670337069779634,
+      "seconds": 0.4361046073026955,
       "command": [
         "mise",
         "run",
@@ -609,42 +609,19 @@
         "--variant",
         "stable",
         "--actor",
-        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/stable-20261114-2477637-p9fkmf",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/stable-20261114-2737182-z373h5",
         "--files",
-        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-first/source/impl/java-native/src/test/resources/review/planner.test"
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-second/source/impl/java-native/src/test/resources/review/planner.test"
       ],
       "log": "stable-review.log",
-      "log_sha256": "d0ccd61db9d15af06d0e218c0cc4a861c6d5804b4cb458a25e5b81e138cd50c0"
-    },
-    {
-      "variant": "ea",
-      "check": "review-index-maintenance",
-      "pass": true,
-      "exit_status": 0,
-      "seconds": 1.0491888341493905,
-      "command": [
-        "mise",
-        "run",
-        "java-native:simulation",
-        "--variant",
-        "ea",
-        "--actor",
-        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/ea-20261114-2477637-aaxpgk",
-        "--file",
-        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-first/source/impl/java-native/src/test/resources/review/index-maintenance.sim",
-        "--peer",
-        "--evidence-dir",
-        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-first/ea-review-index-maintenance"
-      ],
-      "log": "ea-review-index-maintenance.log",
-      "log_sha256": "2eb426597c41bf0618bdab6afa0c40abf3da74e78efce404d06e82abc3df8592"
+      "log_sha256": "a914fceb7ecbc1c2fc90670d82182e677e86336dca016a59594f45b6658a8a0c"
     },
     {
       "variant": "stable",
       "check": "review-plain",
       "pass": true,
       "exit_status": 0,
-      "seconds": 0.45248325634747744,
+      "seconds": 0.448316837195307,
       "command": [
         "mise",
         "run",
@@ -652,20 +629,20 @@
         "--variant",
         "stable",
         "--actor",
-        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/stable-20261114-2477637-p9fkmf",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/stable-20261114-2737182-z373h5",
         "--disk",
         "--files",
-        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-first/source/impl/java-native/src/test/resources/review/planner.test"
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-second/source/impl/java-native/src/test/resources/review/planner.test"
       ],
       "log": "stable-review-plain.log",
-      "log_sha256": "b6e89ac7fc45ea660e2938eae6a78acd718de4e8dc306df383c516e918cdb993"
+      "log_sha256": "687a2dbe793e6c2b74845112233d2a40612c9084d1f1e6dc8c3350671e50c13e"
     },
     {
       "variant": "ea",
-      "check": "review-repeated-analyze",
+      "check": "review-index-maintenance",
       "pass": true,
       "exit_status": 0,
-      "seconds": 0.34996365988627076,
+      "seconds": 0.984426171053201,
       "command": [
         "mise",
         "run",
@@ -673,22 +650,22 @@
         "--variant",
         "ea",
         "--actor",
-        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/ea-20261114-2477637-aaxpgk",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/ea-20261114-2737182-usjd9c",
         "--file",
-        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-first/source/impl/java-native/src/test/resources/review/repeated-analyze.sim",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-second/source/impl/java-native/src/test/resources/review/index-maintenance.sim",
         "--peer",
         "--evidence-dir",
-        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-first/ea-review-repeated-analyze"
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-second/ea-review-index-maintenance"
       ],
-      "log": "ea-review-repeated-analyze.log",
-      "log_sha256": "6a938b6df5ed279564e17130e6e4d51ab001e65fb79f32512839ac93c0a6389f"
+      "log": "ea-review-index-maintenance.log",
+      "log_sha256": "3ca71e3fba2ab2f86e1a1da08cb93adc36cff2ee05e3bf312c766d0782ded941"
     },
     {
       "variant": "stable",
       "check": "review-analyze-empty-relaxed",
       "pass": true,
       "exit_status": 0,
-      "seconds": 0.4798679109662771,
+      "seconds": 0.4574868683703244,
       "command": [
         "mise",
         "run",
@@ -696,22 +673,45 @@
         "--variant",
         "stable",
         "--actor",
-        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/stable-20261114-2477637-p9fkmf",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/stable-20261114-2737182-z373h5",
         "--file",
-        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-first/source/impl/java-native/src/test/resources/review/analyze-empty-relaxed.sim",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-second/source/impl/java-native/src/test/resources/review/analyze-empty-relaxed.sim",
         "--peer",
         "--evidence-dir",
-        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-first/stable-review-analyze-empty-relaxed"
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-second/stable-review-analyze-empty-relaxed"
       ],
       "log": "stable-review-analyze-empty-relaxed.log",
-      "log_sha256": "475d3b4308acb0b6ffaec76643e20711fb076f0a17ad61819b12978bcaf513cf"
+      "log_sha256": "644c0252c834fab45f149d105776f0594219ab240ef6cde96f6bebdcc431d88f"
+    },
+    {
+      "variant": "ea",
+      "check": "review-repeated-analyze",
+      "pass": true,
+      "exit_status": 0,
+      "seconds": 0.37876091012731194,
+      "command": [
+        "mise",
+        "run",
+        "java-native:simulation",
+        "--variant",
+        "ea",
+        "--actor",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/ea-20261114-2737182-usjd9c",
+        "--file",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-second/source/impl/java-native/src/test/resources/review/repeated-analyze.sim",
+        "--peer",
+        "--evidence-dir",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-second/ea-review-repeated-analyze"
+      ],
+      "log": "ea-review-repeated-analyze.log",
+      "log_sha256": "00921e38c28116b38d8fecc643ac8b46a5bce15c20c1b5ad33e10656629afa90"
     },
     {
       "variant": "stable",
       "check": "review-analyze-empty",
       "pass": true,
       "exit_status": 0,
-      "seconds": 0.3839691588655114,
+      "seconds": 0.38941038493067026,
       "command": [
         "mise",
         "run",
@@ -719,22 +719,22 @@
         "--variant",
         "stable",
         "--actor",
-        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/stable-20261114-2477637-p9fkmf",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/stable-20261114-2737182-z373h5",
         "--file",
-        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-first/source/impl/java-native/src/test/resources/review/analyze-empty.sim",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-second/source/impl/java-native/src/test/resources/review/analyze-empty.sim",
         "--peer",
         "--evidence-dir",
-        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-first/stable-review-analyze-empty"
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-second/stable-review-analyze-empty"
       ],
       "log": "stable-review-analyze-empty.log",
-      "log_sha256": "79d083e5c4c821fb1691f3619756c9c08788a149c3dbafffad53cef669b452ac"
+      "log_sha256": "32545593f6bacd3ea3f22e4b8b1c72c5c3a3ba7838d3cdc4c793a3357662194d"
     },
     {
       "variant": "stable",
       "check": "review-index-maintenance",
       "pass": true,
       "exit_status": 0,
-      "seconds": 1.028089724946767,
+      "seconds": 1.0917240749113262,
       "command": [
         "mise",
         "run",
@@ -742,22 +742,22 @@
         "--variant",
         "stable",
         "--actor",
-        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/stable-20261114-2477637-p9fkmf",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/stable-20261114-2737182-z373h5",
         "--file",
-        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-first/source/impl/java-native/src/test/resources/review/index-maintenance.sim",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-second/source/impl/java-native/src/test/resources/review/index-maintenance.sim",
         "--peer",
         "--evidence-dir",
-        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-first/stable-review-index-maintenance"
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-second/stable-review-index-maintenance"
       ],
       "log": "stable-review-index-maintenance.log",
-      "log_sha256": "c12612eb43529b1d638813655be26ee4545f57374264dd180fddb24f68efdf2f"
+      "log_sha256": "aa6b22b4e1cdc1e9bbe9527f031e4bb26f8b1a2ac322c9076345f17213dac81e"
     },
     {
       "variant": "stable",
       "check": "review-repeated-analyze",
       "pass": true,
       "exit_status": 0,
-      "seconds": 0.3449016520753503,
+      "seconds": 0.3469920647330582,
       "command": [
         "mise",
         "run",
@@ -765,22 +765,22 @@
         "--variant",
         "stable",
         "--actor",
-        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/stable-20261114-2477637-p9fkmf",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/stable-20261114-2737182-z373h5",
         "--file",
-        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-first/source/impl/java-native/src/test/resources/review/repeated-analyze.sim",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-second/source/impl/java-native/src/test/resources/review/repeated-analyze.sim",
         "--peer",
         "--evidence-dir",
-        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-first/stable-review-repeated-analyze"
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-second/stable-review-repeated-analyze"
       ],
       "log": "stable-review-repeated-analyze.log",
-      "log_sha256": "cf18ea895240fa9f3e86352f81761e22295350f4f4defdab2955770dc04eacb9"
+      "log_sha256": "b152eb7cadd4844399bf2de4b527f6b80ecf09f79f579ccec0f171ce8c3f0220"
     },
     {
       "variant": "valhalla",
       "check": "seeded",
       "pass": true,
       "exit_status": 0,
-      "seconds": 128.96802424592897,
+      "seconds": 117.43512247828767,
       "command": [
         "mise",
         "run",
@@ -788,21 +788,21 @@
         "--variant",
         "valhalla",
         "--actor",
-        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/valhalla-20261114-2477637-oa2hie",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/valhalla-20261114-2737182-7krf7l",
         "--seeds",
         "1..3",
         "--evidence-dir",
-        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-first/valhalla-seeded"
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-second/valhalla-seeded"
       ],
       "log": "valhalla-seeded.log",
-      "log_sha256": "1f47edea3f5ba9ce9369d980a5082245ccc898fe208e994615b5703c58d6fc8d"
+      "log_sha256": "5ff02fd55b890bd0adb374e10bce5db3637b184a7f15207af895ac55b52c53f4"
     },
     {
       "variant": "valhalla",
       "check": "review",
       "pass": true,
       "exit_status": 0,
-      "seconds": 0.38776057213544846,
+      "seconds": 0.37184580275788903,
       "command": [
         "mise",
         "run",
@@ -810,19 +810,19 @@
         "--variant",
         "valhalla",
         "--actor",
-        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/valhalla-20261114-2477637-oa2hie",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/valhalla-20261114-2737182-7krf7l",
         "--files",
-        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-first/source/impl/java-native/src/test/resources/review/planner.test"
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-second/source/impl/java-native/src/test/resources/review/planner.test"
       ],
       "log": "valhalla-review.log",
-      "log_sha256": "607a6dca6f39054c85f2022134f60981b7c9399756031701db5c2664bbbfb066"
+      "log_sha256": "5540d6b9494bd164a79f383d963dd13e1a2dad5b99024adab3bd4a73b0e5c306"
     },
     {
       "variant": "valhalla",
       "check": "review-plain",
       "pass": true,
       "exit_status": 0,
-      "seconds": 0.5252476041205227,
+      "seconds": 0.4479408487677574,
       "command": [
         "mise",
         "run",
@@ -830,20 +830,20 @@
         "--variant",
         "valhalla",
         "--actor",
-        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/valhalla-20261114-2477637-oa2hie",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/valhalla-20261114-2737182-7krf7l",
         "--disk",
         "--files",
-        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-first/source/impl/java-native/src/test/resources/review/planner.test"
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-second/source/impl/java-native/src/test/resources/review/planner.test"
       ],
       "log": "valhalla-review-plain.log",
-      "log_sha256": "aaacf1eadb900bc66649ce435445d3ce99f9970a2fe16dae785e211abbbdebcf"
+      "log_sha256": "a8927626292628e14ecf81bc1a3510ccfd94230cc29add3c57a63665a4c6c8be"
     },
     {
       "variant": "valhalla",
       "check": "review-analyze-empty-relaxed",
       "pass": true,
       "exit_status": 0,
-      "seconds": 0.5002370639704168,
+      "seconds": 0.485210700891912,
       "command": [
         "mise",
         "run",
@@ -851,22 +851,22 @@
         "--variant",
         "valhalla",
         "--actor",
-        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/valhalla-20261114-2477637-oa2hie",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/valhalla-20261114-2737182-7krf7l",
         "--file",
-        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-first/source/impl/java-native/src/test/resources/review/analyze-empty-relaxed.sim",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-second/source/impl/java-native/src/test/resources/review/analyze-empty-relaxed.sim",
         "--peer",
         "--evidence-dir",
-        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-first/valhalla-review-analyze-empty-relaxed"
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-second/valhalla-review-analyze-empty-relaxed"
       ],
       "log": "valhalla-review-analyze-empty-relaxed.log",
-      "log_sha256": "ffd801330c03dff47de1f04ddca495dd73f3abd2bb1d7f59ff4c1e35ab476068"
+      "log_sha256": "b31ccf2f3b579f0930417f29a069b54d94ecd1415f51902dbebc59e9c8dd0e91"
     },
     {
       "variant": "valhalla",
       "check": "review-analyze-empty",
       "pass": true,
       "exit_status": 0,
-      "seconds": 0.3794006360694766,
+      "seconds": 0.349799957126379,
       "command": [
         "mise",
         "run",
@@ -874,22 +874,22 @@
         "--variant",
         "valhalla",
         "--actor",
-        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/valhalla-20261114-2477637-oa2hie",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/valhalla-20261114-2737182-7krf7l",
         "--file",
-        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-first/source/impl/java-native/src/test/resources/review/analyze-empty.sim",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-second/source/impl/java-native/src/test/resources/review/analyze-empty.sim",
         "--peer",
         "--evidence-dir",
-        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-first/valhalla-review-analyze-empty"
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-second/valhalla-review-analyze-empty"
       ],
       "log": "valhalla-review-analyze-empty.log",
-      "log_sha256": "01eea6d5efbad5a7639dd480db6059edc88ea1863101a6165e32783982ae7e57"
+      "log_sha256": "8a54b0e6ec6c846e5b689e04399c02dc6d551cb6cd0d42a220b2bcc4eef94be9"
     },
     {
       "variant": "valhalla",
       "check": "review-index-maintenance",
       "pass": true,
       "exit_status": 0,
-      "seconds": 1.0139491991139948,
+      "seconds": 0.9280767547897995,
       "command": [
         "mise",
         "run",
@@ -897,22 +897,22 @@
         "--variant",
         "valhalla",
         "--actor",
-        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/valhalla-20261114-2477637-oa2hie",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/valhalla-20261114-2737182-7krf7l",
         "--file",
-        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-first/source/impl/java-native/src/test/resources/review/index-maintenance.sim",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-second/source/impl/java-native/src/test/resources/review/index-maintenance.sim",
         "--peer",
         "--evidence-dir",
-        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-first/valhalla-review-index-maintenance"
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-second/valhalla-review-index-maintenance"
       ],
       "log": "valhalla-review-index-maintenance.log",
-      "log_sha256": "2bb8881c964de807f4e8cfbb37adbef7c20f284b504b24a1ed5de8396d6839a9"
+      "log_sha256": "a38d53a85c253eb20c03af9447e6378cc46f119837505e6addf57e7bfa5c587f"
     },
     {
       "variant": "valhalla",
       "check": "review-repeated-analyze",
       "pass": true,
       "exit_status": 0,
-      "seconds": 0.353350895922631,
+      "seconds": 0.3391695017926395,
       "command": [
         "mise",
         "run",
@@ -920,15 +920,15 @@
         "--variant",
         "valhalla",
         "--actor",
-        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/valhalla-20261114-2477637-oa2hie",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/valhalla-20261114-2737182-7krf7l",
         "--file",
-        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-first/source/impl/java-native/src/test/resources/review/repeated-analyze.sim",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-second/source/impl/java-native/src/test/resources/review/repeated-analyze.sim",
         "--peer",
         "--evidence-dir",
-        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-first/valhalla-review-repeated-analyze"
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-second/valhalla-review-repeated-analyze"
       ],
       "log": "valhalla-review-repeated-analyze.log",
-      "log_sha256": "e1769a10f69a69264be4bddfb3cc0d28ebbd2c712f762213a38e2cf44245d5c1"
+      "log_sha256": "2495d06c8c2c80cb2f2ddc90db1f34d05df021de0c693edbba73f54b9561626a"
     }
   ],
   "expected_checks": 42,

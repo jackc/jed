@@ -54,13 +54,17 @@ files in the same change.
   `spec/design/ruby-native-experiment.md` and `spec/design/swift-native-experiment.md`.
   The native Java experiment was authorized 2026-11-14 against
   `3e5962f9affc06c768df1688765162a65a893848`, format v53. Full frozen parity on Linux
-  x86-64 is the goal; Java 25 is the stable target with controlled JDK 28/value-class
+  x86-64 is verified; Java 25 is the stable target with matched JDK 28/value-class
   comparisons. Blocking streaming APIs support ordinary/virtual threads and explicit
   cancellation. Narrow JDK FFM OS host calls and Bouncy Castle Java
   `bcprov-jdk18on:1.86` for Argon2id/internal helpers are approved. Setup downloads,
   subagent implementation/review, verification, profiling and local commits are
-  authorized. All three variants pass frozen correctness acceptance; controlled
-  performance measurement remains in progress. No promotion, default CI, website,
+  authorized. The frozen experiment is complete: 42/42 correctness gates pass
+  across the three variants, and 24 workloads across five actors and three repeats plus
+  separate memory probes are recorded. Shared-host load and bounded warmup limit
+  timing conclusions; performance parity is not established. See the exact source,
+  artifact identities and limitations in `impl/java-native/VERIFICATION.md` and
+  `impl/java-native/BENCHMARKS.md`. No promotion, default CI, website,
   publication, JDBC/ORM, Native Image or other-platform obligation is included.
   See `spec/design/java-native-experiment.md`.
   The explicitly authorized C# parity/performance refresh (2026-11-13) targets

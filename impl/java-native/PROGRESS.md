@@ -1,10 +1,10 @@
 # Java experiment progress
 
-## Current checkpoint
+## Completed frozen experiment
 
 The independent Java core has passed full frozen correctness acceptance on
 Linux x86-64. All 42 gates pass on source
-`c06506cef70fb89b0369552d396ce79b46d2868310eb7825e991c590579d1118`:
+`419675aa4fa4b2afeaa9a645d6ebc3e68e38579e77858bb1816e12dd2848c5fc`:
 Java 25, ordinary JDK 28 EA24 and the explicit value-class variant each pass all
 three SQL inventories, the host suite, 16,000 threaded snapshot checks, 496
 mixed-core process cases, 85 shared fault traces and the review regressions.
@@ -12,11 +12,15 @@ Independent review verified gate completeness, actor/log hashes and exact
 transcripts. The default repository CI passes all 18 steps. Detailed counts
 and replayable receipts are in [VERIFICATION.md](VERIFICATION.md).
 
-Profiling removed repeated leaf decoding, per-probe planning and throwaway leaf
-layout buffers. Allocation diagnostics and their limitations are recorded in
-[BENCHMARKS.md](BENCHMARKS.md). Controlled five-actor comparisons are the remaining
-work before closing the experiment. Earlier interrupted checks have been stopped;
-they are excluded from accepted comparative timings.
+Profiling removed repeated leaf decoding, per-probe planning, throwaway leaf
+layout buffers and resident aggregate serialization. The aggregate change has
+passed a fresh complete acceptance run. Allocation diagnostics and their
+limitations are recorded in [BENCHMARKS.md](BENCHMARKS.md). The final comparison
+completed 24 workloads across five actors and three process repeats, plus all
+72 separate Java memory probes, with exact results and costs matching. Shared-host
+load and bounded warmup limit timing conclusions; performance parity is not
+established. Earlier interrupted checks have been stopped and are excluded from
+comparative timings. This completes the authorized frozen experiment.
 
 Toolchains and the approved dependency are installed; no manual dependency
 installation is needed. The experiment stays opt-in. Production delivery,

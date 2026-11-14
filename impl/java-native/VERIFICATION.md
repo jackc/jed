@@ -3,7 +3,7 @@
 ## Final correctness acceptance
 
 All **42 of 42 gates pass** on frozen source
-`c06506cef70fb89b0369552d396ce79b46d2868310eb7825e991c590579d1118`,
+`419675aa4fa4b2afeaa9a645d6ebc3e68e38579e77858bb1816e12dd2848c5fc`,
 against baseline `3e5962f9affc06c768df1688765162a65a893848` (format v53).
 The three variants are Java 25, ordinary JDK 28 EA24 and the same JDK 28 with
 three explicit value classes. Independent evidence review verified actor bytes,
@@ -25,6 +25,10 @@ data catalogs verify. Committed [acceptance evidence](evidence/acceptance.json)
 and compressed gate logs preserve the completed run; the final section below
 records actor identities. Earlier sections are historical checkpoints, not
 current failures or additional acceptance totals.
+
+This final source includes the resident aggregate optimization. Its prior
+`c06506ce` correctness acceptance is preserved separately under
+[acceptance-before-aggregate](evidence/acceptance-before-aggregate/acceptance.json).
 
 This verifies the frozen experiment on Linux x86-64. Performance evaluation is
 recorded separately in [BENCHMARKS.md](BENCHMARKS.md). Production packaging,
@@ -1209,3 +1213,47 @@ inventory totals, all 76 exact shared fault transcript pairs per runtime, and al
 four additional review transcript pairs per runtime. Verification processes
 exited before the controlled benchmark window began. Promotion and production
 delivery remain separate decisions.
+
+### Aggregate resident-state acceptance refresh (2026-11-14)
+
+**PASS: 42/42 gates**, complete and all passed, process exit 0. This revalidates
+bounded resident aggregate state after removing repeated state serialization from
+resident folds. The frozen source is
+`419675aa4fa4b2afeaa9a645d6ebc3e68e38579e77858bb1816e12dd2848c5fc`, against
+baseline `3e5962f9affc06c768df1688765162a65a893848` and format v53. Independent
+source review, the full host suite, all 52 encrypted aggregate files (894 records)
+and the encrypted resource inventory (35 attempted, 27 applicable, 768 passing
+records) passed before capture. Source and task policy remained frozen during
+`mise run java-native:acceptance --evidence-dir .dev/java-native/acceptance-final-second --jobs 3`.
+
+| Runtime | Immutable actor | Result |
+| --- | --- | --- |
+| Stable Java 25 | `stable-20261114-2737182-z373h5` | 14/14 gates |
+| Ordinary JDK 28 EA | `ea-20261114-2737182-usjd9c` | 14/14 gates |
+| Explicit Valhalla variant | `valhalla-20261114-2737182-7krf7l` | 14/14 gates |
+
+Each runtime passed its full host suite; all 766 SQL files attempted in each
+storage mode with zero failures; 16,000 threaded snapshot checks with exact
+checksum `f3e75496a3111181`; and all 496 four-core process cases (31 scenarios,
+16 Java/Go/Rust/Node ordered pairings). SQL totals remain memory 764 applicable /
+21,985 records, plaintext 679 / 19,862, and encrypted 678 / 19,827. Exclusions are
+only the shared storage-mode directives; encrypted cost and EXPLAIN results are
+checked against independently executed frozen Go results.
+
+Each runtime also passed all 19 saved fault traces and all 66 generated traces
+(22 profiles, seeds 1–3): 76 exact shared Java/Go comparisons and nine intrinsic
+checks. Both SQL review inventories and all four additional review simulations
+passed. The independent receipt audit verified all 42 gate log hashes, all 1,249
+actor artifact hashes per runtime, all 255 shared traces including the 228 exact
+transcript pairs, all 12 additional review transcript pairs, and all process-case
+counts. Evidence is `.dev/java-native/acceptance-final-second/report.json` and
+its retained nested manifests/logs; the run log is
+`.dev/java-native/acceptance-final-second.log`.
+
+The acceptance process exited successfully before benchmark handoff. A subsequent
+host process check identified a separate worktree's active Go test, so timing was
+temporarily held. The final comparison proceeded as an explicitly qualified
+shared-host diagnostic, with process attribution and load observations retained
+in [BENCHMARKS.md](BENCHMARKS.md). Parallel acceptance timings are not performance
+measurements. This refresh changes neither experimental status nor the separate
+promotion and production-delivery decisions.

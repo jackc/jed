@@ -3,7 +3,13 @@
 Authorized 2026-11-14. This charter records the maintainer's approval of all
 seven recommendations in the Java readiness investigation, including local
 toolchain/dependency setup, parallel implementation and independent review.
-The experiment is **in progress, not complete or promoted**.
+The frozen experiment is **complete and remains experimental**. All 42 correctness
+gates pass on source
+`419675aa4fa4b2afeaa9a645d6ebc3e68e38579e77858bb1816e12dd2848c5fc`.
+Matched measurements cover 24 workloads, five actors and three process repeats,
+plus separate Java memory probes. Shared-host load and bounded warmup limit the
+timing conclusions; they do not establish performance parity or promotion. See
+`impl/java-native/VERIFICATION.md` and `impl/java-native/BENCHMARKS.md` for evidence.
 
 ## Baseline and lifecycle
 
@@ -115,8 +121,9 @@ post-commit residency operation, not an old query adopting new logical data.
 The experiment's mixed-process test covers both ownership directions and both
 plaintext and encrypted files, with alternating writes and held old readers.
 The owner host test separately rejects reads without a held pin and indices
-at or above the current committed high-water. Other page-service acceptance
-requirements remain independently outstanding.
+at or above the current committed high-water. The complete page-service matrix
+now passes on all three variants; immutable evidence is recorded in
+`impl/java-native/VERIFICATION.md`.
 
 ## Acceptance and autonomy
 

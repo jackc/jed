@@ -22,7 +22,14 @@ final class AggregatePlan implements QueryPlan {
         Fold(String name, ScalarPlan.Expression input, ScalarPlan.Expression filter, SqlType type, boolean distinct, List<SqlParser.Order> order, List<ScalarPlan.Expression> orderKeys) { this(name, input, filter, type, distinct, order, orderKeys, null); }
         Fold unordered() { return new Fold(name, input, filter, type, distinct, List.of(), List.of()); }
     }
-    private record Group(List<SqlValue> keys, List<State> states, int set) {}
+    private record Group(List<SqlValue> keys, List<State> states, int set) implements SpillKeyState.Encodable {
+        @Override public byte[] encode() { return AggregatePlan.encode(this); }
+        Group copyForUpdate() {
+            List<State> copies = new ArrayList<>(states.size());
+            for (State state : states) copies.add(new State(state));
+            return new Group(keys, copies, set);
+        }
+    }
     private final Engine.Table table;
     private final QueryPlan source;
     private final List<ScalarPlan.Binding> sourceBindings;
@@ -658,7 +665,7 @@ final class AggregatePlan implements QueryPlan {
             SpillKeyState.Entry entry;
             while ((entry = cursor.next()) != null) {
                 long beforeFinish = meter.cost();
-                Group group = decode(entry.value().bytes());
+                Group group = group(entry.value());
                 attachCollections(group, entry.value().ordinal());
                 outputFrame.values = group.keys;
                 List<SqlValue> row = new ArrayList<>(group.keys);
@@ -744,8 +751,10 @@ final class AggregatePlan implements QueryPlan {
                 for (int i = 0; i < keys.size(); i++) row.add(groupingSets.get(set).contains(i) ? values.get(i) : SqlValue.nullValue(keys.get(i).type()));
                 group = new Group(row, fresh(), set);
                 if (groupKeyRows != null) groupKeyRows.append(row);
-            } else group = decode(previous.bytes());
+            } else group = group(previous);
             long ordinal = previous == null ? put(group, encoded) : previous.ordinal();
+            // Admission may spill the prior version. Keep it unchanged until replacement succeeds.
+            if (!groups.spilled()) group = group.copyForUpdate();
             attachCollections(group, ordinal);
             for (int index = 0; index < folds.size(); index++) {
                 State state = group.states.get(index); Fold fold = state.fold;
@@ -790,7 +799,7 @@ final class AggregatePlan implements QueryPlan {
             else if (change == 0 || groupAccount.tryReserve(change)) { columnarHeld += change; columnarCharges.put(lookup, bytes); }
             else columnarRejected = true;
         }
-        return groups.put(key, encode(group), bytes);
+        return groups.putResident(key, group, bytes);
     }
     private void handOverGroups() {
         SpillKeyState previous = groups;
@@ -800,7 +809,7 @@ final class AggregatePlan implements QueryPlan {
         try (SpillKeyState.Cursor cursor = previous.cursor()) {
             SpillKeyState.Entry entry;
             while ((entry = cursor.next()) != null) {
-                Group group = decode(entry.value().bytes()); put(group, entry.key()); groupKeyRows.append(group.keys);
+                Group group = group(entry.value()); put(group, entry.key()); groupKeyRows.append(group.keys);
             }
         } finally { previous.close(); }
     }
@@ -852,6 +861,9 @@ final class AggregatePlan implements QueryPlan {
             out.writeInt(group.set); SpillRows.write(out, group.keys); for (State state : group.states) state.write(out); out.flush(); return bytes.toByteArray();
         } catch (IOException error) { throw SpillRows.io(error); }
     }
+    private Group group(SpillKeyState.Value value) {
+        return value.resident() instanceof Group group ? group : decode(value.bytes());
+    }
     private Group decode(byte[] bytes) {
         try {
             DataInputStream input = new DataInputStream(new ByteArrayInputStream(bytes));
@@ -884,6 +896,16 @@ final class AggregatePlan implements QueryPlan {
         double floating;
         final AggregateStatistics statistics;
         State(Fold fold) { this.fold = fold; statistics = AggregateStatistics.accepts(fold.name) ? new AggregateStatistics(fold.name, fold.type) : null; }
+        State(State original) {
+            fold = original.fold;
+            statistics = original.statistics == null ? null : new AggregateStatistics(original.statistics);
+            count = original.count; integer = original.integer; retainedLogicalBytes = original.retainedLogicalBytes;
+            sum = original.sum; extremum = original.extremum; truth = original.truth; floating = original.floating;
+            nan = original.nan; positiveInfinity = original.positiveInfinity; negativeInfinity = original.negativeInfinity;
+            collectionSeen = original.collectionSeen;
+            retained.addAll(original.retained); uniqueKeys.addAll(original.uniqueKeys);
+            // Collection handles are attached to this copy before folding; their storage is separately owned.
+        }
         private void retain(SqlValue image, long bytes) {
             if (collection == null) { retained.add(image); retainedLogicalBytes = MemoryAccount.add(retainedLogicalBytes, bytes); }
             else collection.add(count - 1, image, bytes);

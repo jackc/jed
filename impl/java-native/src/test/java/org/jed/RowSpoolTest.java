@@ -30,6 +30,7 @@ public final class RowSpoolTest {
                 sort(scratch);
                 failures(scratch);
                 keyedState(scratch);
+                residentEncodedState(scratch);
                 releasedState(scratch);
                 transferredRows();
                 residentSort();
@@ -232,6 +233,49 @@ public final class RowSpoolTest {
             }
         }
         check(account.used() == 0, "released keyed state closes account"); empty(scratch);
+    }
+    private record TrackedState(int value, List<Integer> encodings) implements SpillKeyState.Encodable {
+        @Override public byte[] encode() { encodings.add(value); return new byte[] {(byte)value}; }
+    }
+    private static void residentEncodedState(Path scratch) throws Exception {
+        List<Integer> encodings = new ArrayList<>();
+        MemoryAccount memory = account(100);
+        try (SpillKeyState state = new SpillKeyState(null, 0, memory)) {
+            TrackedState first = new TrackedState(7, encodings), next = new TrackedState(8, encodings);
+            check(state.putResident(new byte[] {1}, first, 64) == 0, "resident object first ordinal");
+            check(state.get(new byte[] {1}).resident() == first, "resident object is retained without encoding");
+            check(state.putResident(new byte[] {1}, next, 20) == 0 && memory.used() == 20, "resident replacement releases shrink delta");
+            try (SpillKeyState.Cursor cursor = state.cursor()) {
+                SpillKeyState.Entry entry = cursor.next();
+                check(entry.value().resident() == next && encodings.isEmpty(), "resident replay does not encode");
+                cursor.discardCurrent();
+            }
+            check(memory.used() == 0, "resident replay discard releases logical charge");
+            state.putResident(new byte[] {1}, first, 64);
+            expect("54P05", () -> state.putResident(new byte[] {2}, next, 64));
+        }
+        check(memory.used() == 0 && encodings.isEmpty(), "rejected resident admission cleans up without encoding");
+        for (boolean budgetSpill : new boolean[] {false, true}) {
+            encodings.clear(); MemoryAccount account = account(budgetSpill ? 64 : 0);
+            try (SpillKeyState state = new SpillKeyState(scratch, budgetSpill ? 500 : 64, account)) {
+                state.putResident(new byte[] {1}, new TrackedState(41, encodings), 64);
+                check(state.putResident(new byte[] {1}, new TrackedState(42, encodings), 80) == 0, "resident replacement preserves spill ordinal");
+                check(state.spilled() && account.used() == 0, "resident object spills at original logical boundary");
+                check(encodings.equals(List.of(41, 42)), "spill serializes the prior version before its replacement");
+                check(state.get(new byte[] {1}).resident() == null && state.get(new byte[] {1}).bytes()[0] == 42, "disk lookup returns exact latest encoded bytes");
+                state.putResident(new byte[] {2}, new TrackedState(43, encodings), 64);
+                try (SpillKeyState.Cursor cursor = state.cursor()) {
+                    check(cursor.next().value().ordinal() == 0 && cursor.next().value().ordinal() == 1 && cursor.next() == null, "encoded resident state preserves disk replay order");
+                }
+            }
+            check(account.used() == 0, "encoded state spill closes account"); empty(scratch);
+        }
+        MemoryAccount account = account(0);
+        try (SpillKeyState state = new SpillKeyState(scratch, 64, account)) {
+            state.putResident(new byte[] {1}, () -> { throw new SqlException("XX000", "injected state encoding failure"); }, 64);
+            expect("XX000", () -> state.putResident(new byte[] {2}, new TrackedState(44, encodings), 64));
+        }
+        check(account.used() == 0, "failed state encoding releases charges"); empty(scratch);
     }
     private static void keyedState(Path scratch) throws Exception {
         MemoryAccount account = account(100);

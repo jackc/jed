@@ -1,0 +1,57 @@
+{
+  "qualification": "Shared-host, bounded-warmup diagnostic. All observed timed/retained JVMs attributed; non-actor CPU load and ongoing JIT compilation prevent idle-host or converged steady-state claims.",
+  "files": {
+    "evidence.json.gz": {
+      "original_path": ".dev/java-native/benchmarks/matched-20261114-2890055-1txi9l/evidence.json",
+      "original_sha256": "fd43a21f79408230ee8b3153afc46c9f8fa0e09c9ac1da5013bc7ffb6ca7ddac",
+      "stored_sha256": "8072235313982a4307f801dcb5b3d5c57556572e0d39ce42f892537f6c9c0511"
+    },
+    "summary.json": {
+      "original_path": ".dev/java-native/benchmarks/matched-20261114-2890055-1txi9l/summary.json",
+      "original_sha256": "20f9126b73b8d98959fd68d0188385df167c0955b2b358a0131dc3b401952668",
+      "stored_sha256": "20f9126b73b8d98959fd68d0188385df167c0955b2b358a0131dc3b401952668"
+    },
+    "baseline-summary.json": {
+      "original_path": ".dev/java-native/benchmarks/matched-20261114-2890055-1txi9l/baseline-summary.json",
+      "original_sha256": "2aaf35081e3a781122cb2ad22876eb3dd1d0c8c81eec5b33b96cf1b73f7d3f3b",
+      "stored_sha256": "2aaf35081e3a781122cb2ad22876eb3dd1d0c8c81eec5b33b96cf1b73f7d3f3b"
+    },
+    "context.jsonl.gz": {
+      "original_path": ".dev/java-native/benchmarks/matched-20261114-2890055-1txi9l/context.jsonl",
+      "original_sha256": "4c75d80c8e170864fa5fae677e6cfa7cd462b26fcadaef173bc4ff7f15ea9f11",
+      "stored_sha256": "c20a1a5f85e3176646988b1b3ce387a4db870c214f625ce627a24e57093650b4"
+    },
+    "context-summary.json": {
+      "original_path": ".dev/java-native/benchmarks/matched-20261114-2890055-1txi9l/context-summary.json",
+      "original_sha256": "f0aed8cdc918cbe77b30c40c9e488f106dd9937a7e1b55d2902bb4552501795f",
+      "stored_sha256": "f0aed8cdc918cbe77b30c40c9e488f106dd9937a7e1b55d2902bb4552501795f"
+    },
+    "observer.py": {
+      "original_path": ".dev/java-native/benchmarks/matched-20261114-2890055-1txi9l/observer.py",
+      "original_sha256": "0507faeb2dda5d35c0cf13113b73aa7826d1527a9759e44dfba7dc82d6188c7b",
+      "stored_sha256": "0507faeb2dda5d35c0cf13113b73aa7826d1527a9759e44dfba7dc82d6188c7b"
+    },
+    "summarize.rb": {
+      "original_path": ".dev/java-native/benchmarks/matched-20261114-2890055-1txi9l/summarize.rb",
+      "original_sha256": "7560ad223b15a2acecc823452b69c73c2d60e70aaba72a06e41d1abd9a8e4ef7",
+      "stored_sha256": "7560ad223b15a2acecc823452b69c73c2d60e70aaba72a06e41d1abd9a8e4ef7"
+    },
+    "summarize-context.py": {
+      "original_path": ".dev/java-native/benchmarks/matched-20261114-2890055-1txi9l/summarize-context.py",
+      "original_sha256": "8566751c94811ae544d407cfda7d2a8c9198f1ecff566d4c4c5c216eeb07d28b",
+      "stored_sha256": "8566751c94811ae544d407cfda7d2a8c9198f1ecff566d4c4c5c216eeb07d28b"
+    },
+    "run.log.gz": {
+      "original_path": ".dev/java-native/benchmarks/matched-20261114-2890055-1txi9l/run.log",
+      "original_sha256": "49ef05510032f4c208e3e5136384a22b1d960f5eb55bc66e0c80b0f73e000625",
+      "stored_sha256": "179782ad78995cfa0635e785818923c972288ce7aa7a19ed299b04b9b855923f"
+    },
+    "input.tsv": {
+      "original_path": ".dev/java-native/benchmarks/matched-20261114-2890055-1txi9l/input.tsv",
+      "original_sha256": "55fe0189db35203c99e5f4f79e3026ae1f7953f64cc07686cbfc401d44ddd3ee",
+      "stored_sha256": "55fe0189db35203c99e5f4f79e3026ae1f7953f64cc07686cbfc401d44ddd3ee"
+    }
+  },
+  "source_sha256": "419675aa4fa4b2afeaa9a645d6ebc3e68e38579e77858bb1816e12dd2848c5fc",
+  "semantic_revision": "3e5962f9affc06c768df1688765162a65a893848"
+}

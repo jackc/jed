@@ -15,7 +15,7 @@ and limits belong in [VERIFICATION.md](../../impl/java-native/VERIFICATION.md).
 | Faults and recovery | All 19 saved traces plus generated profiles | Per variant: 19 saved + 66 generated pass (76 exact peer comparisons, 9 intrinsic checks); four additional review traces pass |
 | Java host APIs | Owned rows, prepared statements, cancellation, host functions, resource limits | Complete host suites pass on all three variants |
 | Ordinary JDK 28 and value-class variant | Same semantic engine and applicable corpus | Both pass all 14 acceptance gates, matching the stable variant |
-| Performance | Matched Go/Rust workloads, startup, warmup, steady state, memory, concurrent reads and durable writes | Matched correctness smoke passes; controlled measurements and profiling outstanding |
+| Performance | Matched Go/Rust workloads, startup, warmup, steady state, memory, concurrent reads and durable writes | Completed 24 workloads × five actors × three repeats and 72 separate Java memory probes; exact results/costs match. Shared-host load and bounded warmup limit timings; converged steady state is not established |
 | Default repository tasks | Java absent from normal setup/tests/CI | Complete rerun passes all 18 aggregate CI steps, including 20 browser tests. Java remains opt-in |
 | PostgreSQL oracle | Applicable SQL regressions under declared profile | Profile checked; individual probes and their limitations recorded in verification |
 

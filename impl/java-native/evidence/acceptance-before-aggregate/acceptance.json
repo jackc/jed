@@ -1,0 +1,937 @@
+{
+  "schema": 1,
+  "baseline": {
+    "schema_version": 1,
+    "semantic_revision": "3e5962f9affc06c768df1688765162a65a893848",
+    "format_version": 53,
+    "status": "implementation-in-progress",
+    "platform": "linux-x64",
+    "supplemental_corpus": []
+  },
+  "source_sha256": "c06506cef70fb89b0369552d396ce79b46d2868310eb7825e991c590579d1118",
+  "actors": {
+    "stable": {
+      "path": "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/stable-20261114-2477637-p9fkmf",
+      "identity": {
+        "source_sha256": "c06506cef70fb89b0369552d396ce79b46d2868310eb7825e991c590579d1118",
+        "source_snapshot": "sources",
+        "variant": "stable",
+        "runtime": "openjdk 25.0.5 2026-10-20 LTS\nOpenJDK Runtime Environment Temurin-25.0.5+8 (build 25.0.5+8-LTS)\nOpenJDK 64-Bit Server VM Temurin-25.0.5+8 (build 25.0.5+8-LTS, mixed mode, sharing)",
+        "release": 25,
+        "preview": false,
+        "dependency_sha256": "2af190b300cbb0b35e248ccf5f4a06b6072030aeb3da7a98ec73abe5b4cb371f",
+        "jar_sha256": "88ca285be8b251516a88b926c1de4a6347838a4e6c4652599653afe20f296a53"
+      }
+    },
+    "ea": {
+      "path": "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/ea-20261114-2477637-aaxpgk",
+      "identity": {
+        "source_sha256": "c06506cef70fb89b0369552d396ce79b46d2868310eb7825e991c590579d1118",
+        "source_snapshot": "sources",
+        "variant": "ea",
+        "runtime": "openjdk 28-ea 2027-03-23\nOpenJDK Runtime Environment (build 28-ea+24-1988)\nOpenJDK 64-Bit Server VM (build 28-ea+24-1988, mixed mode, sharing)",
+        "release": 25,
+        "preview": false,
+        "dependency_sha256": "2af190b300cbb0b35e248ccf5f4a06b6072030aeb3da7a98ec73abe5b4cb371f",
+        "jar_sha256": "37c0e3f95bc509adb56dc52cf291291a69e11b3e3be8a3a1b656f88956421ede"
+      }
+    },
+    "valhalla": {
+      "path": "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/valhalla-20261114-2477637-oa2hie",
+      "identity": {
+        "source_sha256": "c06506cef70fb89b0369552d396ce79b46d2868310eb7825e991c590579d1118",
+        "source_snapshot": "sources",
+        "variant": "valhalla",
+        "runtime": "openjdk 28-ea 2027-03-23\nOpenJDK Runtime Environment (build 28-ea+24-1988)\nOpenJDK 64-Bit Server VM (build 28-ea+24-1988, mixed mode, sharing)",
+        "release": 28,
+        "preview": true,
+        "dependency_sha256": "2af190b300cbb0b35e248ccf5f4a06b6072030aeb3da7a98ec73abe5b4cb371f",
+        "jar_sha256": "841ff44aef1a00c75704ffdda7b34de56c24ecb0962052309b38c146384acde2"
+      }
+    }
+  },
+  "results": [
+    {
+      "variant": "ea",
+      "check": "host",
+      "pass": true,
+      "exit_status": 0,
+      "seconds": 5.733742720913142,
+      "command": [
+        "mise",
+        "run",
+        "java-native:check",
+        "--variant",
+        "ea",
+        "--actor",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/ea-20261114-2477637-aaxpgk"
+      ],
+      "log": "ea-host.log",
+      "log_sha256": "adcad6e9e2344ec9a26d66f987635ccc0865f8536fdb453b4ff7c930cbcfdb6f"
+    },
+    {
+      "variant": "valhalla",
+      "check": "host",
+      "pass": true,
+      "exit_status": 0,
+      "seconds": 5.882448300719261,
+      "command": [
+        "mise",
+        "run",
+        "java-native:check",
+        "--variant",
+        "valhalla",
+        "--actor",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/valhalla-20261114-2477637-oa2hie"
+      ],
+      "log": "valhalla-host.log",
+      "log_sha256": "d4203c16e8b655ac3418e287f357d02458ca6b6138e27ef695d5149f5da27fff"
+    },
+    {
+      "variant": "stable",
+      "check": "host",
+      "pass": true,
+      "exit_status": 0,
+      "seconds": 6.083456618245691,
+      "command": [
+        "mise",
+        "run",
+        "java-native:check",
+        "--variant",
+        "stable",
+        "--actor",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/stable-20261114-2477637-p9fkmf"
+      ],
+      "log": "stable-host.log",
+      "log_sha256": "de245f2a121932fed9b63068a2ddeb48215908296f6ff7e52b5d4391d3bb6ec1"
+    },
+    {
+      "variant": "ea",
+      "check": "memory",
+      "pass": true,
+      "exit_status": 0,
+      "seconds": 92.3579140692018,
+      "command": [
+        "mise",
+        "run",
+        "java-native:conformance",
+        "--variant",
+        "ea",
+        "--actor",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/ea-20261114-2477637-aaxpgk",
+        "--all"
+      ],
+      "log": "ea-memory.log",
+      "log_sha256": "eaff268ddb0463716dbfae75044c828fdab1a10d848feb26f4596a26983d4f41"
+    },
+    {
+      "variant": "stable",
+      "check": "memory",
+      "pass": true,
+      "exit_status": 0,
+      "seconds": 93.89103264035657,
+      "command": [
+        "mise",
+        "run",
+        "java-native:conformance",
+        "--variant",
+        "stable",
+        "--actor",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/stable-20261114-2477637-p9fkmf",
+        "--all"
+      ],
+      "log": "stable-memory.log",
+      "log_sha256": "10ed5e26c287e2d26a6edf46ac88a56acd104ae5c0676cbedef45cb263dce2c2"
+    },
+    {
+      "variant": "valhalla",
+      "check": "memory",
+      "pass": true,
+      "exit_status": 0,
+      "seconds": 94.3554284889251,
+      "command": [
+        "mise",
+        "run",
+        "java-native:conformance",
+        "--variant",
+        "valhalla",
+        "--actor",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/valhalla-20261114-2477637-oa2hie",
+        "--all"
+      ],
+      "log": "valhalla-memory.log",
+      "log_sha256": "6fbac18f49551ef29c282035698eac6e4be47ad9ab23255f2e64fe05a53b3e89"
+    },
+    {
+      "variant": "ea",
+      "check": "plain",
+      "pass": true,
+      "exit_status": 0,
+      "seconds": 95.35248659225181,
+      "command": [
+        "mise",
+        "run",
+        "java-native:conformance",
+        "--variant",
+        "ea",
+        "--actor",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/ea-20261114-2477637-aaxpgk",
+        "--all",
+        "--disk"
+      ],
+      "log": "ea-plain.log",
+      "log_sha256": "2218a57c044522449aa8a052ee47dd0b4b8ac1b594f02815487c994ea4c2c8f9"
+    },
+    {
+      "variant": "valhalla",
+      "check": "plain",
+      "pass": true,
+      "exit_status": 0,
+      "seconds": 97.22104616835713,
+      "command": [
+        "mise",
+        "run",
+        "java-native:conformance",
+        "--variant",
+        "valhalla",
+        "--actor",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/valhalla-20261114-2477637-oa2hie",
+        "--all",
+        "--disk"
+      ],
+      "log": "valhalla-plain.log",
+      "log_sha256": "fbc054c675b6df9807f02d61f76c8d82114f32b76e38497d057bac0261646408"
+    },
+    {
+      "variant": "stable",
+      "check": "plain",
+      "pass": true,
+      "exit_status": 0,
+      "seconds": 98.13186226179823,
+      "command": [
+        "mise",
+        "run",
+        "java-native:conformance",
+        "--variant",
+        "stable",
+        "--actor",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/stable-20261114-2477637-p9fkmf",
+        "--all",
+        "--disk"
+      ],
+      "log": "stable-plain.log",
+      "log_sha256": "222ca3b2d68c1cd0cf931d812805b3d2b756989bfbfbf7841fe16c28c2f3bd47"
+    },
+    {
+      "variant": "ea",
+      "check": "encrypted",
+      "pass": true,
+      "exit_status": 0,
+      "seconds": 98.1162383002229,
+      "command": [
+        "mise",
+        "run",
+        "java-native:conformance",
+        "--variant",
+        "ea",
+        "--actor",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/ea-20261114-2477637-aaxpgk",
+        "--all",
+        "--encrypted"
+      ],
+      "log": "ea-encrypted.log",
+      "log_sha256": "c1cc934c105545105c81ffbd11aaa652655a97ba21aa0a50f7d28f41b0643310"
+    },
+    {
+      "variant": "ea",
+      "check": "stress",
+      "pass": true,
+      "exit_status": 0,
+      "seconds": 3.8283252622932196,
+      "command": [
+        "mise",
+        "run",
+        "java-native:stress",
+        "--variant",
+        "ea",
+        "--actor",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/ea-20261114-2477637-aaxpgk"
+      ],
+      "log": "ea-stress.log",
+      "log_sha256": "ded6fb4250c20194910ea5ec6bb22488eb12b1ac87c3e1f50c906cc7b9d2bbe9"
+    },
+    {
+      "variant": "valhalla",
+      "check": "encrypted",
+      "pass": true,
+      "exit_status": 0,
+      "seconds": 99.80541933188215,
+      "command": [
+        "mise",
+        "run",
+        "java-native:conformance",
+        "--variant",
+        "valhalla",
+        "--actor",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/valhalla-20261114-2477637-oa2hie",
+        "--all",
+        "--encrypted"
+      ],
+      "log": "valhalla-encrypted.log",
+      "log_sha256": "35d68b6a1d33da2ec594ead4d471534faebd5a9cbfb50c12ad42dc90e32d3ee9"
+    },
+    {
+      "variant": "stable",
+      "check": "encrypted",
+      "pass": true,
+      "exit_status": 0,
+      "seconds": 99.57182108424604,
+      "command": [
+        "mise",
+        "run",
+        "java-native:conformance",
+        "--variant",
+        "stable",
+        "--actor",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/stable-20261114-2477637-p9fkmf",
+        "--all",
+        "--encrypted"
+      ],
+      "log": "stable-encrypted.log",
+      "log_sha256": "58137fccf1b98a787c6667b610c522da6a6d977e5b82207cd6b7dbf1a8e6056e"
+    },
+    {
+      "variant": "valhalla",
+      "check": "stress",
+      "pass": true,
+      "exit_status": 0,
+      "seconds": 4.752158392686397,
+      "command": [
+        "mise",
+        "run",
+        "java-native:stress",
+        "--variant",
+        "valhalla",
+        "--actor",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/valhalla-20261114-2477637-oa2hie"
+      ],
+      "log": "valhalla-stress.log",
+      "log_sha256": "ed8e8bd8afefcbadd33c48edc60bd03b15c44ceb5e8f36a3407b89afdadad56e"
+    },
+    {
+      "variant": "stable",
+      "check": "stress",
+      "pass": true,
+      "exit_status": 0,
+      "seconds": 4.525239804759622,
+      "command": [
+        "mise",
+        "run",
+        "java-native:stress",
+        "--variant",
+        "stable",
+        "--actor",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/stable-20261114-2477637-p9fkmf"
+      ],
+      "log": "stable-stress.log",
+      "log_sha256": "524265826063392dfaf276b6beeb6e802084592032d36c666cb527084dc43fb0"
+    },
+    {
+      "variant": "ea",
+      "check": "process",
+      "pass": true,
+      "exit_status": 0,
+      "seconds": 113.0267258901149,
+      "command": [
+        "mise",
+        "run",
+        "java-native:process",
+        "--variant",
+        "ea",
+        "--actor",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/ea-20261114-2477637-aaxpgk",
+        "--cores",
+        "java-native,go,rust,node",
+        "--evidence-dir",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-first/ea-process"
+      ],
+      "log": "ea-process.log",
+      "log_sha256": "62ca1f1d7c6cb9ca05ff8d4505ee577d2d41ed1d3155ce898dfbd48f2a1377be"
+    },
+    {
+      "variant": "stable",
+      "check": "process",
+      "pass": true,
+      "exit_status": 0,
+      "seconds": 113.78674719622359,
+      "command": [
+        "mise",
+        "run",
+        "java-native:process",
+        "--variant",
+        "stable",
+        "--actor",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/stable-20261114-2477637-p9fkmf",
+        "--cores",
+        "java-native,go,rust,node",
+        "--evidence-dir",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-first/stable-process"
+      ],
+      "log": "stable-process.log",
+      "log_sha256": "af4885628288d7ee767eb34bd6e2696fadddfe7bd52d619f6b43b578fa41aed9"
+    },
+    {
+      "variant": "valhalla",
+      "check": "process",
+      "pass": true,
+      "exit_status": 0,
+      "seconds": 115.74027212476358,
+      "command": [
+        "mise",
+        "run",
+        "java-native:process",
+        "--variant",
+        "valhalla",
+        "--actor",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/valhalla-20261114-2477637-oa2hie",
+        "--cores",
+        "java-native,go,rust,node",
+        "--evidence-dir",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-first/valhalla-process"
+      ],
+      "log": "valhalla-process.log",
+      "log_sha256": "8ffdb68b8042cf87000584eb0bd75a61a1c4465f1e094f7cec59d920bc1516b8"
+    },
+    {
+      "variant": "ea",
+      "check": "saved",
+      "pass": true,
+      "exit_status": 0,
+      "seconds": 19.08386391401291,
+      "command": [
+        "mise",
+        "run",
+        "java-native:simulation-sweep",
+        "--variant",
+        "ea",
+        "--actor",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/ea-20261114-2477637-aaxpgk",
+        "--regress",
+        "--evidence-dir",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-first/ea-saved"
+      ],
+      "log": "ea-saved.log",
+      "log_sha256": "221add89f98c5c04abe2edb8b53cb8502e362bc2e8c23607ea5dc1d0d0613a2e"
+    },
+    {
+      "variant": "stable",
+      "check": "saved",
+      "pass": true,
+      "exit_status": 0,
+      "seconds": 16.34480084432289,
+      "command": [
+        "mise",
+        "run",
+        "java-native:simulation-sweep",
+        "--variant",
+        "stable",
+        "--actor",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/stable-20261114-2477637-p9fkmf",
+        "--regress",
+        "--evidence-dir",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-first/stable-saved"
+      ],
+      "log": "stable-saved.log",
+      "log_sha256": "4ae6226785161ff32b7fa8bda26691e78798bd1d5ae44df6227298194dbbbc41"
+    },
+    {
+      "variant": "valhalla",
+      "check": "saved",
+      "pass": true,
+      "exit_status": 0,
+      "seconds": 17.101642835885286,
+      "command": [
+        "mise",
+        "run",
+        "java-native:simulation-sweep",
+        "--variant",
+        "valhalla",
+        "--actor",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/valhalla-20261114-2477637-oa2hie",
+        "--regress",
+        "--evidence-dir",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-first/valhalla-saved"
+      ],
+      "log": "valhalla-saved.log",
+      "log_sha256": "93cfb34785fe5c609e85585e415f9ecb0fc5bf7788f221ab8d163be5e69e7190"
+    },
+    {
+      "variant": "ea",
+      "check": "seeded",
+      "pass": true,
+      "exit_status": 0,
+      "seconds": 127.04879329074174,
+      "command": [
+        "mise",
+        "run",
+        "java-native:simulation-sweep",
+        "--variant",
+        "ea",
+        "--actor",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/ea-20261114-2477637-aaxpgk",
+        "--seeds",
+        "1..3",
+        "--evidence-dir",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-first/ea-seeded"
+      ],
+      "log": "ea-seeded.log",
+      "log_sha256": "4225c348caccb9701adf0970bb3a99b3cc97fc9bf599770c87cc3a558478f1ff"
+    },
+    {
+      "variant": "ea",
+      "check": "review",
+      "pass": true,
+      "exit_status": 0,
+      "seconds": 0.49141611997038126,
+      "command": [
+        "mise",
+        "run",
+        "java-native:conformance",
+        "--variant",
+        "ea",
+        "--actor",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/ea-20261114-2477637-aaxpgk",
+        "--files",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-first/source/impl/java-native/src/test/resources/review/planner.test"
+      ],
+      "log": "ea-review.log",
+      "log_sha256": "dc33acb5744a65717c9ed10cf76dcbda96f812f1840327d176bf5e0913942c5d"
+    },
+    {
+      "variant": "ea",
+      "check": "review-plain",
+      "pass": true,
+      "exit_status": 0,
+      "seconds": 0.5525171528570354,
+      "command": [
+        "mise",
+        "run",
+        "java-native:conformance",
+        "--variant",
+        "ea",
+        "--actor",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/ea-20261114-2477637-aaxpgk",
+        "--disk",
+        "--files",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-first/source/impl/java-native/src/test/resources/review/planner.test"
+      ],
+      "log": "ea-review-plain.log",
+      "log_sha256": "94b6bb359b0f585e4c0f25a904dca8c67b32abdee762ad0a4261f7fcc1cf0fe9"
+    },
+    {
+      "variant": "ea",
+      "check": "review-analyze-empty-relaxed",
+      "pass": true,
+      "exit_status": 0,
+      "seconds": 0.5809269640594721,
+      "command": [
+        "mise",
+        "run",
+        "java-native:simulation",
+        "--variant",
+        "ea",
+        "--actor",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/ea-20261114-2477637-aaxpgk",
+        "--file",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-first/source/impl/java-native/src/test/resources/review/analyze-empty-relaxed.sim",
+        "--peer",
+        "--evidence-dir",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-first/ea-review-analyze-empty-relaxed"
+      ],
+      "log": "ea-review-analyze-empty-relaxed.log",
+      "log_sha256": "5564f11a0a4032b3f03263a16bc49ecb1bb6d0def9a03e26b7f05ab56c16b1f4"
+    },
+    {
+      "variant": "ea",
+      "check": "review-analyze-empty",
+      "pass": true,
+      "exit_status": 0,
+      "seconds": 0.3763458598405123,
+      "command": [
+        "mise",
+        "run",
+        "java-native:simulation",
+        "--variant",
+        "ea",
+        "--actor",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/ea-20261114-2477637-aaxpgk",
+        "--file",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-first/source/impl/java-native/src/test/resources/review/analyze-empty.sim",
+        "--peer",
+        "--evidence-dir",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-first/ea-review-analyze-empty"
+      ],
+      "log": "ea-review-analyze-empty.log",
+      "log_sha256": "1eaef05e42ea46bce2627abf237022ae1efce130b678609215c3e2ad7bb8bc6e"
+    },
+    {
+      "variant": "stable",
+      "check": "seeded",
+      "pass": true,
+      "exit_status": 0,
+      "seconds": 124.5524012139067,
+      "command": [
+        "mise",
+        "run",
+        "java-native:simulation-sweep",
+        "--variant",
+        "stable",
+        "--actor",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/stable-20261114-2477637-p9fkmf",
+        "--seeds",
+        "1..3",
+        "--evidence-dir",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-first/stable-seeded"
+      ],
+      "log": "stable-seeded.log",
+      "log_sha256": "e0a45d3dd6fc59e06bbcb308ec860dfeeb92f111f306d824e3e7470978e441bb"
+    },
+    {
+      "variant": "stable",
+      "check": "review",
+      "pass": true,
+      "exit_status": 0,
+      "seconds": 0.48670337069779634,
+      "command": [
+        "mise",
+        "run",
+        "java-native:conformance",
+        "--variant",
+        "stable",
+        "--actor",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/stable-20261114-2477637-p9fkmf",
+        "--files",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-first/source/impl/java-native/src/test/resources/review/planner.test"
+      ],
+      "log": "stable-review.log",
+      "log_sha256": "d0ccd61db9d15af06d0e218c0cc4a861c6d5804b4cb458a25e5b81e138cd50c0"
+    },
+    {
+      "variant": "ea",
+      "check": "review-index-maintenance",
+      "pass": true,
+      "exit_status": 0,
+      "seconds": 1.0491888341493905,
+      "command": [
+        "mise",
+        "run",
+        "java-native:simulation",
+        "--variant",
+        "ea",
+        "--actor",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/ea-20261114-2477637-aaxpgk",
+        "--file",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-first/source/impl/java-native/src/test/resources/review/index-maintenance.sim",
+        "--peer",
+        "--evidence-dir",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-first/ea-review-index-maintenance"
+      ],
+      "log": "ea-review-index-maintenance.log",
+      "log_sha256": "2eb426597c41bf0618bdab6afa0c40abf3da74e78efce404d06e82abc3df8592"
+    },
+    {
+      "variant": "stable",
+      "check": "review-plain",
+      "pass": true,
+      "exit_status": 0,
+      "seconds": 0.45248325634747744,
+      "command": [
+        "mise",
+        "run",
+        "java-native:conformance",
+        "--variant",
+        "stable",
+        "--actor",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/stable-20261114-2477637-p9fkmf",
+        "--disk",
+        "--files",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-first/source/impl/java-native/src/test/resources/review/planner.test"
+      ],
+      "log": "stable-review-plain.log",
+      "log_sha256": "b6e89ac7fc45ea660e2938eae6a78acd718de4e8dc306df383c516e918cdb993"
+    },
+    {
+      "variant": "ea",
+      "check": "review-repeated-analyze",
+      "pass": true,
+      "exit_status": 0,
+      "seconds": 0.34996365988627076,
+      "command": [
+        "mise",
+        "run",
+        "java-native:simulation",
+        "--variant",
+        "ea",
+        "--actor",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/ea-20261114-2477637-aaxpgk",
+        "--file",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-first/source/impl/java-native/src/test/resources/review/repeated-analyze.sim",
+        "--peer",
+        "--evidence-dir",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-first/ea-review-repeated-analyze"
+      ],
+      "log": "ea-review-repeated-analyze.log",
+      "log_sha256": "6a938b6df5ed279564e17130e6e4d51ab001e65fb79f32512839ac93c0a6389f"
+    },
+    {
+      "variant": "stable",
+      "check": "review-analyze-empty-relaxed",
+      "pass": true,
+      "exit_status": 0,
+      "seconds": 0.4798679109662771,
+      "command": [
+        "mise",
+        "run",
+        "java-native:simulation",
+        "--variant",
+        "stable",
+        "--actor",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/stable-20261114-2477637-p9fkmf",
+        "--file",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-first/source/impl/java-native/src/test/resources/review/analyze-empty-relaxed.sim",
+        "--peer",
+        "--evidence-dir",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-first/stable-review-analyze-empty-relaxed"
+      ],
+      "log": "stable-review-analyze-empty-relaxed.log",
+      "log_sha256": "475d3b4308acb0b6ffaec76643e20711fb076f0a17ad61819b12978bcaf513cf"
+    },
+    {
+      "variant": "stable",
+      "check": "review-analyze-empty",
+      "pass": true,
+      "exit_status": 0,
+      "seconds": 0.3839691588655114,
+      "command": [
+        "mise",
+        "run",
+        "java-native:simulation",
+        "--variant",
+        "stable",
+        "--actor",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/stable-20261114-2477637-p9fkmf",
+        "--file",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-first/source/impl/java-native/src/test/resources/review/analyze-empty.sim",
+        "--peer",
+        "--evidence-dir",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-first/stable-review-analyze-empty"
+      ],
+      "log": "stable-review-analyze-empty.log",
+      "log_sha256": "79d083e5c4c821fb1691f3619756c9c08788a149c3dbafffad53cef669b452ac"
+    },
+    {
+      "variant": "stable",
+      "check": "review-index-maintenance",
+      "pass": true,
+      "exit_status": 0,
+      "seconds": 1.028089724946767,
+      "command": [
+        "mise",
+        "run",
+        "java-native:simulation",
+        "--variant",
+        "stable",
+        "--actor",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/stable-20261114-2477637-p9fkmf",
+        "--file",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-first/source/impl/java-native/src/test/resources/review/index-maintenance.sim",
+        "--peer",
+        "--evidence-dir",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-first/stable-review-index-maintenance"
+      ],
+      "log": "stable-review-index-maintenance.log",
+      "log_sha256": "c12612eb43529b1d638813655be26ee4545f57374264dd180fddb24f68efdf2f"
+    },
+    {
+      "variant": "stable",
+      "check": "review-repeated-analyze",
+      "pass": true,
+      "exit_status": 0,
+      "seconds": 0.3449016520753503,
+      "command": [
+        "mise",
+        "run",
+        "java-native:simulation",
+        "--variant",
+        "stable",
+        "--actor",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/stable-20261114-2477637-p9fkmf",
+        "--file",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-first/source/impl/java-native/src/test/resources/review/repeated-analyze.sim",
+        "--peer",
+        "--evidence-dir",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-first/stable-review-repeated-analyze"
+      ],
+      "log": "stable-review-repeated-analyze.log",
+      "log_sha256": "cf18ea895240fa9f3e86352f81761e22295350f4f4defdab2955770dc04eacb9"
+    },
+    {
+      "variant": "valhalla",
+      "check": "seeded",
+      "pass": true,
+      "exit_status": 0,
+      "seconds": 128.96802424592897,
+      "command": [
+        "mise",
+        "run",
+        "java-native:simulation-sweep",
+        "--variant",
+        "valhalla",
+        "--actor",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/valhalla-20261114-2477637-oa2hie",
+        "--seeds",
+        "1..3",
+        "--evidence-dir",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-first/valhalla-seeded"
+      ],
+      "log": "valhalla-seeded.log",
+      "log_sha256": "1f47edea3f5ba9ce9369d980a5082245ccc898fe208e994615b5703c58d6fc8d"
+    },
+    {
+      "variant": "valhalla",
+      "check": "review",
+      "pass": true,
+      "exit_status": 0,
+      "seconds": 0.38776057213544846,
+      "command": [
+        "mise",
+        "run",
+        "java-native:conformance",
+        "--variant",
+        "valhalla",
+        "--actor",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/valhalla-20261114-2477637-oa2hie",
+        "--files",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-first/source/impl/java-native/src/test/resources/review/planner.test"
+      ],
+      "log": "valhalla-review.log",
+      "log_sha256": "607a6dca6f39054c85f2022134f60981b7c9399756031701db5c2664bbbfb066"
+    },
+    {
+      "variant": "valhalla",
+      "check": "review-plain",
+      "pass": true,
+      "exit_status": 0,
+      "seconds": 0.5252476041205227,
+      "command": [
+        "mise",
+        "run",
+        "java-native:conformance",
+        "--variant",
+        "valhalla",
+        "--actor",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/valhalla-20261114-2477637-oa2hie",
+        "--disk",
+        "--files",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-first/source/impl/java-native/src/test/resources/review/planner.test"
+      ],
+      "log": "valhalla-review-plain.log",
+      "log_sha256": "aaacf1eadb900bc66649ce435445d3ce99f9970a2fe16dae785e211abbbdebcf"
+    },
+    {
+      "variant": "valhalla",
+      "check": "review-analyze-empty-relaxed",
+      "pass": true,
+      "exit_status": 0,
+      "seconds": 0.5002370639704168,
+      "command": [
+        "mise",
+        "run",
+        "java-native:simulation",
+        "--variant",
+        "valhalla",
+        "--actor",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/valhalla-20261114-2477637-oa2hie",
+        "--file",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-first/source/impl/java-native/src/test/resources/review/analyze-empty-relaxed.sim",
+        "--peer",
+        "--evidence-dir",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-first/valhalla-review-analyze-empty-relaxed"
+      ],
+      "log": "valhalla-review-analyze-empty-relaxed.log",
+      "log_sha256": "ffd801330c03dff47de1f04ddca495dd73f3abd2bb1d7f59ff4c1e35ab476068"
+    },
+    {
+      "variant": "valhalla",
+      "check": "review-analyze-empty",
+      "pass": true,
+      "exit_status": 0,
+      "seconds": 0.3794006360694766,
+      "command": [
+        "mise",
+        "run",
+        "java-native:simulation",
+        "--variant",
+        "valhalla",
+        "--actor",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/valhalla-20261114-2477637-oa2hie",
+        "--file",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-first/source/impl/java-native/src/test/resources/review/analyze-empty.sim",
+        "--peer",
+        "--evidence-dir",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-first/valhalla-review-analyze-empty"
+      ],
+      "log": "valhalla-review-analyze-empty.log",
+      "log_sha256": "01eea6d5efbad5a7639dd480db6059edc88ea1863101a6165e32783982ae7e57"
+    },
+    {
+      "variant": "valhalla",
+      "check": "review-index-maintenance",
+      "pass": true,
+      "exit_status": 0,
+      "seconds": 1.0139491991139948,
+      "command": [
+        "mise",
+        "run",
+        "java-native:simulation",
+        "--variant",
+        "valhalla",
+        "--actor",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/valhalla-20261114-2477637-oa2hie",
+        "--file",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-first/source/impl/java-native/src/test/resources/review/index-maintenance.sim",
+        "--peer",
+        "--evidence-dir",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-first/valhalla-review-index-maintenance"
+      ],
+      "log": "valhalla-review-index-maintenance.log",
+      "log_sha256": "2bb8881c964de807f4e8cfbb37adbef7c20f284b504b24a1ed5de8396d6839a9"
+    },
+    {
+      "variant": "valhalla",
+      "check": "review-repeated-analyze",
+      "pass": true,
+      "exit_status": 0,
+      "seconds": 0.353350895922631,
+      "command": [
+        "mise",
+        "run",
+        "java-native:simulation",
+        "--variant",
+        "valhalla",
+        "--actor",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/actors/valhalla-20261114-2477637-oa2hie",
+        "--file",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-first/source/impl/java-native/src/test/resources/review/repeated-analyze.sim",
+        "--peer",
+        "--evidence-dir",
+        "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/acceptance-final-first/valhalla-review-repeated-analyze"
+      ],
+      "log": "valhalla-review-repeated-analyze.log",
+      "log_sha256": "e1769a10f69a69264be4bddfb3cc0d28ebbd2c712f762213a38e2cf44245d5c1"
+    }
+  ],
+  "expected_checks": 42,
+  "complete": true,
+  "all_passed": true
+}

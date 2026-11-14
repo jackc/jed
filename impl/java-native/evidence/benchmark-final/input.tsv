@@ -1,0 +1,27 @@
+setup	CREATE TABLE t (id i32 PRIMARY KEY, v i64, k text, payload text)
+setup	INSERT INTO t SELECT i, i::i64*2, 'g'||(i%17)::text, repeat(i::text||'x',32) FROM generate_series(1,4096) AS g(i)
+setup	CREATE INDEX t_v ON t(v)
+case	scalar	query	5000	5000	SELECT 12345*6789
+case	parallel_point	parallel	100	50	SELECT id,v FROM t WHERE id=1024
+case	point	query	5000	5000	SELECT id,v FROM t WHERE id=1024
+case	range	query	200	100	SELECT id,v FROM t WHERE id BETWEEN 1024 AND 1124 ORDER BY id
+case	secondary	query	200	100	SELECT id,v FROM t WHERE v BETWEEN 2048 AND 2248 ORDER BY v
+case	aggregate	query	200	100	SELECT count(*),sum(v) FROM t
+case	join	query	200	100	SELECT count(*),sum(a.v+b.v) FROM t a JOIN t b ON a.id=b.id
+case	sort	query	200	100	SELECT id,v FROM t ORDER BY v DESC,id LIMIT 100
+case	grouped	query	200	100	SELECT k,count(*),sum(v) FROM t GROUP BY k ORDER BY k
+case	distinct	query	200	100	SELECT DISTINCT v%64 AS k FROM t ORDER BY k
+case	distinct_aggregate	query	200	100	SELECT count(DISTINCT v%64) FROM t
+case	window	query	200	100	SELECT id,sum(v) OVER(ORDER BY id ROWS BETWEEN 3 PRECEDING AND CURRENT ROW) FROM t ORDER BY id LIMIT 100
+case	ranking	query	200	100	SELECT id,rank() OVER(PARTITION BY k ORDER BY v%8) FROM t ORDER BY id LIMIT 100
+case	text_filter	query	200	100	SELECT count(*) FROM t WHERE v::text LIKE '12%'
+case	float_aggregate	query	200	100	SELECT sum(v::f64) FROM t
+case	decimal_aggregate	query	200	100	SELECT sum(v::decimal/10) FROM t
+case	expression_projection	query	200	100	SELECT id,v*3+7 FROM t WHERE id BETWEEN 1024 AND 1124 ORDER BY id
+case	json	query	200	100	SELECT jsonb_build_object('id',id,'value',v)->>'value' FROM t WHERE id BETWEEN 1024 AND 1124 ORDER BY id
+case	array	query	200	100	SELECT array_length(ARRAY[id,id+1,id+2],1) FROM t WHERE id BETWEEN 1024 AND 1124 ORDER BY id
+case	rollback	rollback	100	50	UPDATE t SET v=v+1 WHERE id=1024
+case	durable	durable	100	50	UPDATE t SET v=v+1 WHERE id=1024
+case	text_rollback	rollback	100	50	UPDATE t SET v=v+1,payload=reverse(payload) WHERE id=1024 RETURNING payload
+case	text_durable	durable	100	50	UPDATE t SET v=v+1,payload=reverse(payload) WHERE id=1024 RETURNING payload
+case	cold_open	cold_open	100	50	SELECT id,v FROM t WHERE id=1024

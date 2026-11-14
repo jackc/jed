@@ -10,7 +10,12 @@ import java.util.Map;
 
 /** Exact keyed state. Disk buckets grow by linear hashing while first occurrence uses a disk ordinal vector. */
 final class SpillKeyState implements AutoCloseable {
-    record Value(byte[] bytes, long ordinal) {}
+    /** Owned resident state. Encoding is needed only when crossing the scratch boundary. */
+    interface Encodable { byte[] encode(); }
+    record Value(byte[] encoded, Encodable resident, long ordinal) {
+        Value(byte[] encoded, long ordinal) { this(encoded, null, ordinal); }
+        byte[] bytes() { return resident == null ? encoded : resident.encode(); }
+    }
     record Entry(byte[] key, Value value) {}
     interface Cursor extends AutoCloseable { Entry next(); default void discardCurrent() {} @Override default void close() {} }
     private static final class Key {
@@ -20,7 +25,10 @@ final class SpillKeyState implements AutoCloseable {
         @Override public int hashCode() { return hash; }
         @Override public boolean equals(Object value) { return value instanceof Key key && Arrays.equals(bytes, key.bytes); }
     }
-    private record Resident(byte[] bytes, long logical, long ordinal) {}
+    private record Resident(byte[] bytes, Encodable value, long logical, long ordinal) {
+        Value view() { return new Value(bytes == null ? null : bytes.clone(), value, ordinal); }
+        byte[] encode() { return value == null ? bytes : value.encode(); }
+    }
     private final Path scratch;
     private final long workMem;
     private final MemoryAccount account;
@@ -41,7 +49,7 @@ final class SpillKeyState implements AutoCloseable {
         ensureOpen();
         if (data == null) {
             Resident item = resident.get(new Key(key));
-            return item == null ? null : new Value(item.bytes.clone(), item.ordinal);
+            return item == null ? null : item.view();
         }
         try {
             long pointer = find(key, hash(key));
@@ -61,6 +69,13 @@ final class SpillKeyState implements AutoCloseable {
         if (removed != null) { held -= removed.logical; if (account != null) account.release(removed.logical); }
     }
     long put(byte[] key, byte[] value, long logicalBytes) {
+        return put(key, value, null, logicalBytes);
+    }
+    /** Transfers ownership. The object must stay unchanged until replaced or removed. */
+    long putResident(byte[] key, Encodable value, long logicalBytes) {
+        return put(key, null, java.util.Objects.requireNonNull(value), logicalBytes);
+    }
+    private long put(byte[] key, byte[] value, Encodable residentValue, long logicalBytes) {
         ensureOpen();
         if (logicalBytes < 0) throw new IllegalArgumentException("negative logical state size");
         try {
@@ -74,13 +89,13 @@ final class SpillKeyState implements AutoCloseable {
                     held = Math.addExact(held, delta);
                     if (scratch == null || workMem == 0 || held <= workMem) {
                         long ordinal = prior == null ? count++ : prior.ordinal;
-                        resident.put(prior == null ? new Key(key.clone()) : lookup, new Resident(value.clone(), logicalBytes, ordinal));
+                        resident.put(prior == null ? new Key(key.clone()) : lookup, new Resident(value == null ? null : value.clone(), residentValue, logicalBytes, ordinal));
                         return ordinal;
                     }
                 }
                 forceDisk();
             }
-            return putDisk(key, value);
+            return putDisk(key, residentValue == null ? value : residentValue.encode());
         } catch (IOException failure) { throw fail(failure); }
         catch (RuntimeException failure) { cleanup(failure); throw failure; }
     }
@@ -92,7 +107,7 @@ final class SpillKeyState implements AutoCloseable {
         directory.setLength(base * 8); long expected = count; count = 0;
         for (var item : resident.entrySet()) {
             count = item.getValue().ordinal;
-            long ordinal = putDisk(item.getKey().bytes, item.getValue().bytes);
+            long ordinal = putDisk(item.getKey().bytes, item.getValue().encode());
             if (ordinal != item.getValue().ordinal) throw new IllegalStateException("state ordinal changed during spill");
         }
         count = expected; ordinals.setLength(count * 8);
@@ -160,7 +175,7 @@ final class SpillKeyState implements AutoCloseable {
             Iterator<Map.Entry<Key, Resident>> iterator = resident.entrySet().iterator();
             return new Cursor() {
                 private Resident current;
-                public Entry next() { ensureOpen(); if (!iterator.hasNext()) return null; var item = iterator.next(); current = item.getValue(); return new Entry(item.getKey().bytes.clone(), new Value(current.bytes.clone(), current.ordinal)); }
+                public Entry next() { ensureOpen(); if (!iterator.hasNext()) return null; var item = iterator.next(); current = item.getValue(); return new Entry(item.getKey().bytes.clone(), current.view()); }
                 public void discardCurrent() { if (current == null) throw new IllegalStateException("no current state row"); iterator.remove(); held -= current.logical; if (account != null) account.release(current.logical); current = null; }
             };
         }

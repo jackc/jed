@@ -1,0 +1,5431 @@
+{
+  "source": "c06506cef70fb89b0369552d396ce79b46d2868310eb7825e991c590579d1118",
+  "cases": [
+    {
+      "name": "scalar",
+      "actors": {
+        "stable": {
+          "median_ns": 5350.5,
+          "repeat_medians_ns": [
+            5401.0,
+            5277.0,
+            5350.5
+          ],
+          "late_over_early": [
+            0.8685067718155323,
+            0.8267207176125582,
+            0.8544910179640719
+          ],
+          "warmup_tail_ns": [
+            5887.5,
+            5860.0,
+            6077.0
+          ],
+          "compilation_ms": [
+            222,
+            217,
+            190
+          ],
+          "alloc_bytes_per_execution": [
+            10392.9792,
+            10413.144,
+            10422.0064
+          ],
+          "gc_collections": [
+            0,
+            0,
+            0
+          ],
+          "gc_ms": [
+            0,
+            0,
+            0
+          ]
+        },
+        "ea": {
+          "median_ns": 5221.5,
+          "repeat_medians_ns": [
+            5156.0,
+            5239.0,
+            5221.5
+          ],
+          "late_over_early": [
+            0.829537429378531,
+            0.8088095031648314,
+            0.8671278411643158
+          ],
+          "warmup_tail_ns": [
+            5711.0,
+            5914.0,
+            5857.0
+          ],
+          "compilation_ms": [
+            283,
+            313,
+            353
+          ],
+          "alloc_bytes_per_execution": [
+            9516.1408,
+            9562.1424,
+            9623.3104
+          ],
+          "gc_collections": [
+            0,
+            0,
+            0
+          ],
+          "gc_ms": [
+            0,
+            0,
+            0
+          ]
+        },
+        "valhalla": {
+          "median_ns": 5291.0,
+          "repeat_medians_ns": [
+            5246.0,
+            5291.0,
+            5333.0
+          ],
+          "late_over_early": [
+            0.7731504994074826,
+            0.8244912158636285,
+            0.8154339750084431
+          ],
+          "warmup_tail_ns": [
+            6023.0,
+            5795.0,
+            5577.0
+          ],
+          "compilation_ms": [
+            390,
+            259,
+            267
+          ],
+          "alloc_bytes_per_execution": [
+            9620.1216,
+            9561.2064,
+            9569.2432
+          ],
+          "gc_collections": [
+            0,
+            0,
+            0
+          ],
+          "gc_ms": [
+            0,
+            0,
+            0
+          ]
+        },
+        "go": {
+          "median_ns": 589.0,
+          "repeat_medians_ns": [
+            558.0,
+            597.0,
+            589.0
+          ],
+          "late_over_early": [
+            0.9532871972318339,
+            1.0152027027027026,
+            1.0846846846846847
+          ],
+          "warmup_tail_ns": [
+            556.0,
+            609.0,
+            587.0
+          ],
+          "compilation_ms": [
+            null,
+            null,
+            null
+          ],
+          "alloc_bytes_per_execution": [
+            1352.0704,
+            1352.1376,
+            1352.048
+          ],
+          "gc_collections": [
+            2,
+            3,
+            2
+          ],
+          "gc_ms": [
+            0.072407,
+            0.122685,
+            0.068783
+          ]
+        },
+        "rust": {
+          "median_ns": 1630.0,
+          "repeat_medians_ns": [
+            1630.0,
+            1665.0,
+            1627.0
+          ],
+          "late_over_early": [
+            1.0012269938650307,
+            0.9972997299729973,
+            1.0018438844499078
+          ],
+          "warmup_tail_ns": [
+            1628.0,
+            1665.0,
+            1629.0
+          ],
+          "compilation_ms": [
+            null,
+            null,
+            null
+          ],
+          "alloc_bytes_per_execution": [
+            null,
+            null,
+            null
+          ],
+          "gc_collections": [
+            null,
+            null,
+            null
+          ],
+          "gc_ms": [
+            null,
+            null,
+            null
+          ]
+        }
+      },
+      "stable_over_go": 9.084040747028862,
+      "stable_over_rust": 3.282515337423313,
+      "ea_over_stable": 0.9758901037286235,
+      "valhalla_over_ea": 1.0133103514315809
+    },
+    {
+      "name": "parallel_point",
+      "actors": {
+        "stable": {
+          "median_ns": 1541160.5,
+          "repeat_medians_ns": [
+            1541160.5,
+            1738927.5,
+            1509602.5
+          ],
+          "late_over_early": [
+            0.9433486633600212,
+            0.9336074525857347,
+            0.7542321464139541
+          ],
+          "warmup_tail_ns": [
+            1854278,
+            1827597,
+            1701494
+          ],
+          "compilation_ms": [
+            16,
+            18,
+            11
+          ],
+          "alloc_bytes_per_execution": [
+            6058629.76,
+            6058629.76,
+            6058629.76
+          ],
+          "gc_collections": [
+            0,
+            1,
+            0
+          ],
+          "gc_ms": [
+            0,
+            3,
+            0
+          ]
+        },
+        "ea": {
+          "median_ns": 1659974.0,
+          "repeat_medians_ns": [
+            1716840.5,
+            1659974.0,
+            1582530.5
+          ],
+          "late_over_early": [
+            0.903990447986709,
+            0.7148200586048309,
+            0.8221353412491553
+          ],
+          "warmup_tail_ns": [
+            1771294,
+            1791379,
+            1904773
+          ],
+          "compilation_ms": [
+            336,
+            281,
+            384
+          ],
+          "alloc_bytes_per_execution": [
+            5499300.32,
+            5451552.48,
+            5484643.36
+          ],
+          "gc_collections": [
+            1,
+            1,
+            1
+          ],
+          "gc_ms": [
+            1,
+            1,
+            1
+          ]
+        },
+        "valhalla": {
+          "median_ns": 1658266.0,
+          "repeat_medians_ns": [
+            1659280.0,
+            1603091.0,
+            1658266.0
+          ],
+          "late_over_early": [
+            0.65099172990092,
+            0.7193884736384609,
+            0.7174934904193727
+          ],
+          "warmup_tail_ns": [
+            1852978,
+            1754384,
+            1885233
+          ],
+          "compilation_ms": [
+            296,
+            532,
+            532
+          ],
+          "alloc_bytes_per_execution": [
+            5273662.72,
+            5193905.92,
+            5192795.04
+          ],
+          "gc_collections": [
+            1,
+            1,
+            1
+          ],
+          "gc_ms": [
+            0,
+            1,
+            1
+          ]
+        },
+        "go": {
+          "median_ns": 222562.5,
+          "repeat_medians_ns": [
+            222562.5,
+            212107.0,
+            243794.0
+          ],
+          "late_over_early": [
+            0.9131425247286168,
+            0.9986597763036351,
+            1.366444345705156
+          ],
+          "warmup_tail_ns": [
+            240333,
+            224558,
+            250753
+          ],
+          "compilation_ms": [
+            null,
+            null,
+            null
+          ],
+          "alloc_bytes_per_execution": [
+            619080.16,
+            619267.52,
+            619332.16
+          ],
+          "gc_collections": [
+            17,
+            16,
+            18
+          ],
+          "gc_ms": [
+            0.949426,
+            0.800993,
+            1.060654
+          ]
+        },
+        "rust": {
+          "median_ns": 366599.0,
+          "repeat_medians_ns": [
+            372473.0,
+            363008.0,
+            366599.0
+          ],
+          "late_over_early": [
+            0.9832447889933942,
+            0.9988277766096771,
+            1.0047292487954447
+          ],
+          "warmup_tail_ns": [
+            373233,
+            364370,
+            370457
+          ],
+          "compilation_ms": [
+            null,
+            null,
+            null
+          ],
+          "alloc_bytes_per_execution": [
+            null,
+            null,
+            null
+          ],
+          "gc_collections": [
+            null,
+            null,
+            null
+          ],
+          "gc_ms": [
+            null,
+            null,
+            null
+          ]
+        }
+      },
+      "stable_over_go": 6.9246189272676215,
+      "stable_over_rust": 4.203940818169171,
+      "ea_over_stable": 1.0770935278966727,
+      "valhalla_over_ea": 0.9989710682215505
+    },
+    {
+      "name": "point",
+      "actors": {
+        "stable": {
+          "median_ns": 6761.0,
+          "repeat_medians_ns": [
+            6761.0,
+            7002.0,
+            6753.0
+          ],
+          "late_over_early": [
+            0.9556520501138952,
+            0.9086028905712319,
+            0.9616938392728323
+          ],
+          "warmup_tail_ns": [
+            7106.0,
+            7173.5,
+            7077.0
+          ],
+          "compilation_ms": [
+            85,
+            90,
+            47
+          ],
+          "alloc_bytes_per_execution": [
+            23658.9568,
+            23683.6944,
+            23658.9088
+          ],
+          "gc_collections": [
+            0,
+            0,
+            0
+          ],
+          "gc_ms": [
+            0,
+            0,
+            0
+          ]
+        },
+        "ea": {
+          "median_ns": 6684.5,
+          "repeat_medians_ns": [
+            6568.0,
+            6684.5,
+            6775.0
+          ],
+          "late_over_early": [
+            0.9150429799426935,
+            0.9146902901785714,
+            0.9648072429906542
+          ],
+          "warmup_tail_ns": [
+            6794.0,
+            7261.0,
+            6816.0
+          ],
+          "compilation_ms": [
+            52,
+            53,
+            70
+          ],
+          "alloc_bytes_per_execution": [
+            21289.9728,
+            21308.3328,
+            20775.2432
+          ],
+          "gc_collections": [
+            0,
+            0,
+            0
+          ],
+          "gc_ms": [
+            0,
+            0,
+            0
+          ]
+        },
+        "valhalla": {
+          "median_ns": 6989.0,
+          "repeat_medians_ns": [
+            7010.0,
+            6989.0,
+            6634.0
+          ],
+          "late_over_early": [
+            1.0060369318181819,
+            0.9719494100190772,
+            0.9103164467149142
+          ],
+          "warmup_tail_ns": [
+            6918.5,
+            7112.0,
+            6973.0
+          ],
+          "compilation_ms": [
+            110,
+            83,
+            61
+          ],
+          "alloc_bytes_per_execution": [
+            20682.3312,
+            20129.9712,
+            20124.8112
+          ],
+          "gc_collections": [
+            0,
+            0,
+            1
+          ],
+          "gc_ms": [
+            0,
+            0,
+            1
+          ]
+        },
+        "go": {
+          "median_ns": 1403.0,
+          "repeat_medians_ns": [
+            1249.0,
+            1403.0,
+            1501.0
+          ],
+          "late_over_early": [
+            1.120377655389457,
+            0.9513677811550152,
+            0.45933521923620935
+          ],
+          "warmup_tail_ns": [
+            1379.5,
+            1510.5,
+            910.0
+          ],
+          "compilation_ms": [
+            null,
+            null,
+            null
+          ],
+          "alloc_bytes_per_execution": [
+            2136.0032,
+            2136.096,
+            2136.0288
+          ],
+          "gc_collections": [
+            4,
+            4,
+            4
+          ],
+          "gc_ms": [
+            0.157882,
+            0.471546,
+            0.338154
+          ]
+        },
+        "rust": {
+          "median_ns": 2484.0,
+          "repeat_medians_ns": [
+            2464.0,
+            2510.0,
+            2484.0
+          ],
+          "late_over_early": [
+            1.002436053593179,
+            0.9992038216560509,
+            0.9971864951768489
+          ],
+          "warmup_tail_ns": [
+            2463.0,
+            2509.0,
+            2481.0
+          ],
+          "compilation_ms": [
+            null,
+            null,
+            null
+          ],
+          "alloc_bytes_per_execution": [
+            null,
+            null,
+            null
+          ],
+          "gc_collections": [
+            null,
+            null,
+            null
+          ],
+          "gc_ms": [
+            null,
+            null,
+            null
+          ]
+        }
+      },
+      "stable_over_go": 4.81895937277263,
+      "stable_over_rust": 2.721819645732689,
+      "ea_over_stable": 0.9886851057535867,
+      "valhalla_over_ea": 1.0455531453362257
+    },
+    {
+      "name": "range",
+      "actors": {
+        "stable": {
+          "median_ns": 60703.0,
+          "repeat_medians_ns": [
+            60677.0,
+            60703.0,
+            61647.0
+          ],
+          "late_over_early": [
+            0.9228131753847154,
+            0.906140350877193,
+            0.8807270211628565
+          ],
+          "warmup_tail_ns": [
+            67985.0,
+            68751.0,
+            70259.5
+          ],
+          "compilation_ms": [
+            14,
+            19,
+            27
+          ],
+          "alloc_bytes_per_execution": [
+            163441.6,
+            163513.44,
+            163503.44
+          ],
+          "gc_collections": [
+            0,
+            0,
+            0
+          ],
+          "gc_ms": [
+            0,
+            0,
+            0
+          ]
+        },
+        "ea": {
+          "median_ns": 93194.0,
+          "repeat_medians_ns": [
+            62916.0,
+            98193.5,
+            93194.0
+          ],
+          "late_over_early": [
+            0.9279562691750635,
+            0.848445789434357,
+            0.9331269999475423
+          ],
+          "warmup_tail_ns": [
+            69598.5,
+            110918.0,
+            100544.5
+          ],
+          "compilation_ms": [
+            66,
+            93,
+            38
+          ],
+          "alloc_bytes_per_execution": [
+            135735.04,
+            138656.24,
+            136187.84
+          ],
+          "gc_collections": [
+            0,
+            0,
+            0
+          ],
+          "gc_ms": [
+            0,
+            0,
+            0
+          ]
+        },
+        "valhalla": {
+          "median_ns": 72324.0,
+          "repeat_medians_ns": [
+            93718.5,
+            66088.5,
+            72324.0
+          ],
+          "late_over_early": [
+            1.4205641492265697,
+            0.9278120173347129,
+            0.9275399241073224
+          ],
+          "warmup_tail_ns": [
+            70981.5,
+            78424.5,
+            83823.0
+          ],
+          "compilation_ms": [
+            8,
+            10,
+            7
+          ],
+          "alloc_bytes_per_execution": [
+            136804.56,
+            136348.56,
+            150788.72
+          ],
+          "gc_collections": [
+            1,
+            0,
+            0
+          ],
+          "gc_ms": [
+            2,
+            0,
+            0
+          ]
+        },
+        "go": {
+          "median_ns": 29225.0,
+          "repeat_medians_ns": [
+            29225.0,
+            44289.0,
+            27074.5
+          ],
+          "late_over_early": [
+            1.0423046071216824,
+            1.5235980981680883,
+            0.6869408276395513
+          ],
+          "warmup_tail_ns": [
+            18834.5,
+            27800.5,
+            28010.5
+          ],
+          "compilation_ms": [
+            null,
+            null,
+            null
+          ],
+          "alloc_bytes_per_execution": [
+            35217.28,
+            35216.16,
+            35216.32
+          ],
+          "gc_collections": [
+            1,
+            1,
+            2
+          ],
+          "gc_ms": [
+            0.032013,
+            0.04888,
+            0.08315
+          ]
+        },
+        "rust": {
+          "median_ns": 29493.5,
+          "repeat_medians_ns": [
+            29493.5,
+            29391.0,
+            29571.0
+          ],
+          "late_over_early": [
+            0.9997965274009767,
+            1.0101533219761498,
+            1.001625245479786
+          ],
+          "warmup_tail_ns": [
+            29424.5,
+            29301.5,
+            29642.0
+          ],
+          "compilation_ms": [
+            null,
+            null,
+            null
+          ],
+          "alloc_bytes_per_execution": [
+            null,
+            null,
+            null
+          ],
+          "gc_collections": [
+            null,
+            null,
+            null
+          ],
+          "gc_ms": [
+            null,
+            null,
+            null
+          ]
+        }
+      },
+      "stable_over_go": 2.077091531223268,
+      "stable_over_rust": 2.0581823113567395,
+      "ea_over_stable": 1.5352453750226513,
+      "valhalla_over_ea": 0.776058544541494
+    },
+    {
+      "name": "secondary",
+      "actors": {
+        "stable": {
+          "median_ns": 158137.0,
+          "repeat_medians_ns": [
+            201838.5,
+            158137.0,
+            150431.5
+          ],
+          "late_over_early": [
+            0.9698701778432316,
+            0.9478424367772869,
+            0.9797602038464831
+          ],
+          "warmup_tail_ns": [
+            197013.0,
+            159003.5,
+            151196.5
+          ],
+          "compilation_ms": [
+            8,
+            13,
+            11
+          ],
+          "alloc_bytes_per_execution": [
+            229081.12,
+            229086.88,
+            229140.16
+          ],
+          "gc_collections": [
+            0,
+            0,
+            0
+          ],
+          "gc_ms": [
+            0,
+            0,
+            0
+          ]
+        },
+        "ea": {
+          "median_ns": 159730.5,
+          "repeat_medians_ns": [
+            160995.5,
+            159730.5,
+            152347.0
+          ],
+          "late_over_early": [
+            0.9712845851019918,
+            0.9511212560535488,
+            0.9835299773902648
+          ],
+          "warmup_tail_ns": [
+            162109.0,
+            161838.5,
+            154601.5
+          ],
+          "compilation_ms": [
+            296,
+            13,
+            21
+          ],
+          "alloc_bytes_per_execution": [
+            194928.88,
+            197315.92,
+            198114.64
+          ],
+          "gc_collections": [
+            0,
+            0,
+            0
+          ],
+          "gc_ms": [
+            0,
+            0,
+            0
+          ]
+        },
+        "valhalla": {
+          "median_ns": 154122.0,
+          "repeat_medians_ns": [
+            205061.5,
+            154122.0,
+            152544.5
+          ],
+          "late_over_early": [
+            0.9667540330380285,
+            0.9722527949950762,
+            0.9683031891429016
+          ],
+          "warmup_tail_ns": [
+            208492.5,
+            155240.5,
+            153526.0
+          ],
+          "compilation_ms": [
+            10,
+            8,
+            9
+          ],
+          "alloc_bytes_per_execution": [
+            188503.12,
+            187722.32,
+            187738.32
+          ],
+          "gc_collections": [
+            0,
+            0,
+            0
+          ],
+          "gc_ms": [
+            0,
+            0,
+            0
+          ]
+        },
+        "go": {
+          "median_ns": 43587.5,
+          "repeat_medians_ns": [
+            45422.5,
+            32326.0,
+            43587.5
+          ],
+          "late_over_early": [
+            1.0680497183224538,
+            1.3670226130653267,
+            0.554311955439926
+          ],
+          "warmup_tail_ns": [
+            43809.0,
+            57759.0,
+            32088.5
+          ],
+          "compilation_ms": [
+            null,
+            null,
+            null
+          ],
+          "alloc_bytes_per_execution": [
+            58496.0,
+            58496.0,
+            58496.0
+          ],
+          "gc_collections": [
+            2,
+            2,
+            2
+          ],
+          "gc_ms": [
+            0.208036,
+            0.199604,
+            0.269813
+          ]
+        },
+        "rust": {
+          "median_ns": 47584.0,
+          "repeat_medians_ns": [
+            47584.0,
+            46854.0,
+            48006.0
+          ],
+          "late_over_early": [
+            0.9982795518442364,
+            1.0005550100328737,
+            1.0016682654210285
+          ],
+          "warmup_tail_ns": [
+            47475.0,
+            46878.0,
+            47943.0
+          ],
+          "compilation_ms": [
+            null,
+            null,
+            null
+          ],
+          "alloc_bytes_per_execution": [
+            null,
+            null,
+            null
+          ],
+          "gc_collections": [
+            null,
+            null,
+            null
+          ],
+          "gc_ms": [
+            null,
+            null,
+            null
+          ]
+        }
+      },
+      "stable_over_go": 3.6280355606538572,
+      "stable_over_rust": 3.3233229657027574,
+      "ea_over_stable": 1.010076705641311,
+      "valhalla_over_ea": 0.9648877327748927
+    },
+    {
+      "name": "aggregate",
+      "actors": {
+        "stable": {
+          "median_ns": 5613800.5,
+          "repeat_medians_ns": [
+            5613800.5,
+            5835827.5,
+            5580254.5
+          ],
+          "late_over_early": [
+            0.99001771125927,
+            0.9961092914115596,
+            1.566132950753866
+          ],
+          "warmup_tail_ns": [
+            5782466.0,
+            5855426.0,
+            5801734.0
+          ],
+          "compilation_ms": [
+            32,
+            23,
+            19
+          ],
+          "alloc_bytes_per_execution": [
+            14461499.52,
+            14363196.0,
+            14625308.48
+          ],
+          "gc_collections": [
+            2,
+            1,
+            2
+          ],
+          "gc_ms": [
+            5,
+            4,
+            10
+          ]
+        },
+        "ea": {
+          "median_ns": 5879668.0,
+          "repeat_medians_ns": [
+            5879668.0,
+            5980327.5,
+            5682727.0
+          ],
+          "late_over_early": [
+            0.9860521478809972,
+            1.027129760495512,
+            0.9875538996428782
+          ],
+          "warmup_tail_ns": [
+            5693298.0,
+            5956428.0,
+            5663598.5
+          ],
+          "compilation_ms": [
+            34,
+            30,
+            32
+          ],
+          "alloc_bytes_per_execution": [
+            12617660.24,
+            13011081.84,
+            12912980.24
+          ],
+          "gc_collections": [
+            3,
+            2,
+            1
+          ],
+          "gc_ms": [
+            8,
+            4,
+            3
+          ]
+        },
+        "valhalla": {
+          "median_ns": 5872319.0,
+          "repeat_medians_ns": [
+            5764185.0,
+            6092301.0,
+            5872319.0
+          ],
+          "late_over_early": [
+            0.985239227703786,
+            0.9571819517460034,
+            0.9638737354006867
+          ],
+          "warmup_tail_ns": [
+            5753313.5,
+            6133559.0,
+            6053178.5
+          ],
+          "compilation_ms": [
+            19,
+            41,
+            14
+          ],
+          "alloc_bytes_per_execution": [
+            12978490.56,
+            12978314.16,
+            13076668.56
+          ],
+          "gc_collections": [
+            1,
+            2,
+            3
+          ],
+          "gc_ms": [
+            2,
+            4,
+            4
+          ]
+        },
+        "go": {
+          "median_ns": 247374.0,
+          "repeat_medians_ns": [
+            251198.5,
+            247374.0,
+            146978.0
+          ],
+          "late_over_early": [
+            1.021100477301741,
+            1.0066510219714748,
+            1.0223055167478787
+          ],
+          "warmup_tail_ns": [
+            246913.0,
+            247125.5,
+            142379.5
+          ],
+          "compilation_ms": [
+            null,
+            null,
+            null
+          ],
+          "alloc_bytes_per_execution": [
+            19400.0,
+            19402.56,
+            19400.16
+          ],
+          "gc_collections": [
+            1,
+            1,
+            1
+          ],
+          "gc_ms": [
+            0.020364,
+            0.199375,
+            0.046127
+          ]
+        },
+        "rust": {
+          "median_ns": 134868.0,
+          "repeat_medians_ns": [
+            139346.0,
+            134868.0,
+            134597.5
+          ],
+          "late_over_early": [
+            0.9826740394158514,
+            0.7872148419874481,
+            0.7827748056042236
+          ],
+          "warmup_tail_ns": [
+            174800.0,
+            170570.5,
+            170616.0
+          ],
+          "compilation_ms": [
+            null,
+            null,
+            null
+          ],
+          "alloc_bytes_per_execution": [
+            null,
+            null,
+            null
+          ],
+          "gc_collections": [
+            null,
+            null,
+            null
+          ],
+          "gc_ms": [
+            null,
+            null,
+            null
+          ]
+        }
+      },
+      "stable_over_go": 22.693575315109914,
+      "stable_over_rust": 41.624406827416436,
+      "ea_over_stable": 1.0473596274039307,
+      "valhalla_over_ea": 0.9987500994954137
+    },
+    {
+      "name": "join",
+      "actors": {
+        "stable": {
+          "median_ns": 24616551.5,
+          "repeat_medians_ns": [
+            25980031.0,
+            24444604.5,
+            24616551.5
+          ],
+          "late_over_early": [
+            1.0117939785208068,
+            0.992122545812804,
+            0.9682896302289059
+          ],
+          "warmup_tail_ns": [
+            25874399.5,
+            24812684.5,
+            25411353.0
+          ],
+          "compilation_ms": [
+            37,
+            71,
+            59
+          ],
+          "alloc_bytes_per_execution": [
+            83203847.36,
+            82977357.12,
+            82974477.12
+          ],
+          "gc_collections": [
+            9,
+            10,
+            8
+          ],
+          "gc_ms": [
+            22,
+            25,
+            22
+          ]
+        },
+        "ea": {
+          "median_ns": 25343183.5,
+          "repeat_medians_ns": [
+            25343183.5,
+            27546976.5,
+            25150189.0
+          ],
+          "late_over_early": [
+            0.9962073441123276,
+            0.9966361653644162,
+            1.033161944736347
+          ],
+          "warmup_tail_ns": [
+            25427634.0,
+            28047607.5,
+            24602054.0
+          ],
+          "compilation_ms": [
+            72,
+            38,
+            44
+          ],
+          "alloc_bytes_per_execution": [
+            72912616.24,
+            73798384.08,
+            74192400.08
+          ],
+          "gc_collections": [
+            11,
+            9,
+            7
+          ],
+          "gc_ms": [
+            26,
+            23,
+            15
+          ]
+        },
+        "valhalla": {
+          "median_ns": 25435248.0,
+          "repeat_medians_ns": [
+            25435248.0,
+            27925945.5,
+            25341858.5
+          ],
+          "late_over_early": [
+            1.0526738798731439,
+            0.9970616840025094,
+            1.0089221792072736
+          ],
+          "warmup_tail_ns": [
+            25288507.5,
+            27602093.0,
+            24911343.5
+          ],
+          "compilation_ms": [
+            146,
+            75,
+            65
+          ],
+          "alloc_bytes_per_execution": [
+            73311395.04,
+            73111998.48,
+            73013670.48
+          ],
+          "gc_collections": [
+            6,
+            11,
+            10
+          ],
+          "gc_ms": [
+            14,
+            24,
+            22
+          ]
+        },
+        "go": {
+          "median_ns": 5464577.0,
+          "repeat_medians_ns": [
+            5464577.0,
+            5571406.5,
+            5350316.0
+          ],
+          "late_over_early": [
+            0.9745025367528646,
+            0.9310533014882889,
+            1.009405578572594
+          ],
+          "warmup_tail_ns": [
+            5767830.0,
+            5841011.5,
+            5201819.0
+          ],
+          "compilation_ms": [
+            null,
+            null,
+            null
+          ],
+          "alloc_bytes_per_execution": [
+            8715539.2,
+            8715508.64,
+            8715494.08
+          ],
+          "gc_collections": [
+            257,
+            253,
+            257
+          ],
+          "gc_ms": [
+            13.912619,
+            15.461627,
+            9.261916
+          ]
+        },
+        "rust": {
+          "median_ns": 4463659.0,
+          "repeat_medians_ns": [
+            4528823.0,
+            4292806.0,
+            4463659.0
+          ],
+          "late_over_early": [
+            1.0145608578400749,
+            0.9989138527324964,
+            1.0014978549417675
+          ],
+          "warmup_tail_ns": [
+            4513879.0,
+            4319868.0,
+            4466737.0
+          ],
+          "compilation_ms": [
+            null,
+            null,
+            null
+          ],
+          "alloc_bytes_per_execution": [
+            null,
+            null,
+            null
+          ],
+          "gc_collections": [
+            null,
+            null,
+            null
+          ],
+          "gc_ms": [
+            null,
+            null,
+            null
+          ]
+        }
+      },
+      "stable_over_go": 4.504749681448354,
+      "stable_over_rust": 5.514881737157789,
+      "ea_over_stable": 1.0295180257072156,
+      "valhalla_over_ea": 1.003632712520114
+    },
+    {
+      "name": "sort",
+      "actors": {
+        "stable": {
+          "median_ns": 829862.0,
+          "repeat_medians_ns": [
+            805174.0,
+            829862.0,
+            842737.0
+          ],
+          "late_over_early": [
+            1.007102343524158,
+            0.92881112341239,
+            0.998245354216896
+          ],
+          "warmup_tail_ns": [
+            805601.0,
+            875084.0,
+            840342.5
+          ],
+          "compilation_ms": [
+            2,
+            169,
+            1
+          ],
+          "alloc_bytes_per_execution": [
+            3756286.88,
+            3755967.2,
+            3756262.88
+          ],
+          "gc_collections": [
+            0,
+            0,
+            0
+          ],
+          "gc_ms": [
+            0,
+            0,
+            0
+          ]
+        },
+        "ea": {
+          "median_ns": 866191.0,
+          "repeat_medians_ns": [
+            873505.5,
+            856650.5,
+            866191.0
+          ],
+          "late_over_early": [
+            0.9848669195473595,
+            1.001731125114198,
+            1.004878569943782
+          ],
+          "warmup_tail_ns": [
+            878363.5,
+            850056.5,
+            859525.5
+          ],
+          "compilation_ms": [
+            1,
+            1,
+            1
+          ],
+          "alloc_bytes_per_execution": [
+            3346124.4,
+            3348700.4,
+            3348884.24
+          ],
+          "gc_collections": [
+            1,
+            1,
+            1
+          ],
+          "gc_ms": [
+            2,
+            3,
+            1
+          ]
+        },
+        "valhalla": {
+          "median_ns": 911474.0,
+          "repeat_medians_ns": [
+            911474.0,
+            953142.0,
+            891420.0
+          ],
+          "late_over_early": [
+            1.0243706642226875,
+            1.00700046810359,
+            1.0039157465809136
+          ],
+          "warmup_tail_ns": [
+            905687.0,
+            937138.0,
+            975786.0
+          ],
+          "compilation_ms": [
+            5,
+            2,
+            5
+          ],
+          "alloc_bytes_per_execution": [
+            3610988.56,
+            3610868.56,
+            3610884.56
+          ],
+          "gc_collections": [
+            0,
+            1,
+            1
+          ],
+          "gc_ms": [
+            0,
+            3,
+            3
+          ]
+        },
+        "go": {
+          "median_ns": 1108391.5,
+          "repeat_medians_ns": [
+            1108391.5,
+            845556.0,
+            1108523.0
+          ],
+          "late_over_early": [
+            1.0135172913107053,
+            0.999767165075234,
+            0.9962438849995249
+          ],
+          "warmup_tail_ns": [
+            1100375.0,
+            1100820.0,
+            1115709.0
+          ],
+          "compilation_ms": [
+            null,
+            null,
+            null
+          ],
+          "alloc_bytes_per_execution": [
+            558311.84,
+            558331.04,
+            558300.64
+          ],
+          "gc_collections": [
+            27,
+            26,
+            27
+          ],
+          "gc_ms": [
+            1.465448,
+            1.064441,
+            0.8063
+          ]
+        },
+        "rust": {
+          "median_ns": 450578.0,
+          "repeat_medians_ns": [
+            457112.0,
+            450555.0,
+            450578.0
+          ],
+          "late_over_early": [
+            0.99693194985779,
+            0.9984328106409049,
+            1.0014337713068182
+          ],
+          "warmup_tail_ns": [
+            458323.5,
+            449936.0,
+            450617.0
+          ],
+          "compilation_ms": [
+            null,
+            null,
+            null
+          ],
+          "alloc_bytes_per_execution": [
+            null,
+            null,
+            null
+          ],
+          "gc_collections": [
+            null,
+            null,
+            null
+          ],
+          "gc_ms": [
+            null,
+            null,
+            null
+          ]
+        }
+      },
+      "stable_over_go": 0.7487083760566551,
+      "stable_over_rust": 1.8417721238054232,
+      "ea_over_stable": 1.043777158129906,
+      "valhalla_over_ea": 1.0522783081329636
+    },
+    {
+      "name": "grouped",
+      "actors": {
+        "stable": {
+          "median_ns": 7881292.0,
+          "repeat_medians_ns": [
+            7927446.0,
+            7881292.0,
+            7876401.5
+          ],
+          "late_over_early": [
+            0.9533208236457049,
+            0.9823376660600248,
+            1.0005544246438263
+          ],
+          "warmup_tail_ns": [
+            7977751.0,
+            7821164.5,
+            7940287.0
+          ],
+          "compilation_ms": [
+            51,
+            54,
+            98
+          ],
+          "alloc_bytes_per_execution": [
+            22103318.16,
+            22005014.16,
+            22005023.44
+          ],
+          "gc_collections": [
+            3,
+            3,
+            2
+          ],
+          "gc_ms": [
+            7,
+            9,
+            6
+          ]
+        },
+        "ea": {
+          "median_ns": 7883198.5,
+          "repeat_medians_ns": [
+            7811154.0,
+            8324188.0,
+            7883198.5
+          ],
+          "late_over_early": [
+            0.9623332895506971,
+            1.0181013256170013,
+            1.0004801223347108
+          ],
+          "warmup_tail_ns": [
+            7826170.5,
+            8205453.5,
+            7820620.5
+          ],
+          "compilation_ms": [
+            86,
+            46,
+            53
+          ],
+          "alloc_bytes_per_execution": [
+            19522897.84,
+            19621622.0,
+            19622249.92
+          ],
+          "gc_collections": [
+            3,
+            3,
+            2
+          ],
+          "gc_ms": [
+            6,
+            7,
+            7
+          ]
+        },
+        "valhalla": {
+          "median_ns": 8340019.5,
+          "repeat_medians_ns": [
+            8340019.5,
+            8467278.0,
+            7976196.5
+          ],
+          "late_over_early": [
+            0.998899966077193,
+            0.9604331651241048,
+            0.9930919682584285
+          ],
+          "warmup_tail_ns": [
+            8359969.0,
+            8437138.0,
+            7955123.5
+          ],
+          "compilation_ms": [
+            53,
+            89,
+            52
+          ],
+          "alloc_bytes_per_execution": [
+            19754902.16,
+            19721613.44,
+            19721622.16
+          ],
+          "gc_collections": [
+            2,
+            3,
+            3
+          ],
+          "gc_ms": [
+            1,
+            6,
+            7
+          ]
+        },
+        "go": {
+          "median_ns": 2157760.5,
+          "repeat_medians_ns": [
+            2157760.5,
+            2222417.0,
+            2148278.5
+          ],
+          "late_over_early": [
+            1.0034468424983536,
+            1.1156790212747818,
+            0.9971038998417039
+          ],
+          "warmup_tail_ns": [
+            2198962.5,
+            2268915.0,
+            2227094.0
+          ],
+          "compilation_ms": [
+            null,
+            null,
+            null
+          ],
+          "alloc_bytes_per_execution": [
+            2726565.44,
+            2726564.16,
+            2726565.92
+          ],
+          "gc_collections": [
+            100,
+            100,
+            100
+          ],
+          "gc_ms": [
+            6.308466,
+            4.20061,
+            5.546644
+          ]
+        },
+        "rust": {
+          "median_ns": 1660338.0,
+          "repeat_medians_ns": [
+            1679689.0,
+            1660321.0,
+            1660338.0
+          ],
+          "late_over_early": [
+            1.0062315841440603,
+            1.003607166527233,
+            0.9996633156840082
+          ],
+          "warmup_tail_ns": [
+            1661948.0,
+            1661224.0,
+            1658795.5
+          ],
+          "compilation_ms": [
+            null,
+            null,
+            null
+          ],
+          "alloc_bytes_per_execution": [
+            null,
+            null,
+            null
+          ],
+          "gc_collections": [
+            null,
+            null,
+            null
+          ],
+          "gc_ms": [
+            null,
+            null,
+            null
+          ]
+        }
+      },
+      "stable_over_go": 3.6525332630753042,
+      "stable_over_rust": 4.746799748003117,
+      "ea_over_stable": 1.000241901962267,
+      "valhalla_over_ea": 1.0579486866910683
+    },
+    {
+      "name": "distinct",
+      "actors": {
+        "stable": {
+          "median_ns": 1592282.0,
+          "repeat_medians_ns": [
+            1661147.0,
+            1589446.0,
+            1592282.0
+          ],
+          "late_over_early": [
+            1.019454980017479,
+            0.998686061994957,
+            1.0045584838554484
+          ],
+          "warmup_tail_ns": [
+            1694052.0,
+            1581391.5,
+            1602500.5
+          ],
+          "compilation_ms": [
+            1,
+            1,
+            4
+          ],
+          "alloc_bytes_per_execution": [
+            4901911.12,
+            4901911.12,
+            4901911.12
+          ],
+          "gc_collections": [
+            1,
+            0,
+            0
+          ],
+          "gc_ms": [
+            2,
+            0,
+            0
+          ]
+        },
+        "ea": {
+          "median_ns": 1647558.0,
+          "repeat_medians_ns": [
+            1647558.0,
+            1646169.0,
+            1673012.0
+          ],
+          "late_over_early": [
+            0.9927554111622442,
+            1.0074870384989347,
+            1.0800499900071232
+          ],
+          "warmup_tail_ns": [
+            1670980.5,
+            1635365.0,
+            1573309.0
+          ],
+          "compilation_ms": [
+            36,
+            1,
+            1
+          ],
+          "alloc_bytes_per_execution": [
+            4365999.76,
+            4366804.4,
+            4367028.4
+          ],
+          "gc_collections": [
+            0,
+            1,
+            1
+          ],
+          "gc_ms": [
+            0,
+            3,
+            2
+          ]
+        },
+        "valhalla": {
+          "median_ns": 1642290.0,
+          "repeat_medians_ns": [
+            1642290.0,
+            1669720.0,
+            1641831.5
+          ],
+          "late_over_early": [
+            0.9150651507192843,
+            1.0027887787592809,
+            0.9790366295094498
+          ],
+          "warmup_tail_ns": [
+            1821770.5,
+            1868563.0,
+            1773768.0
+          ],
+          "compilation_ms": [
+            111,
+            2,
+            1
+          ],
+          "alloc_bytes_per_execution": [
+            4421386.08,
+            4399636.56,
+            4399652.56
+          ],
+          "gc_collections": [
+            1,
+            0,
+            1
+          ],
+          "gc_ms": [
+            3,
+            0,
+            3
+          ]
+        },
+        "go": {
+          "median_ns": 2549418.5,
+          "repeat_medians_ns": [
+            2549418.5,
+            2434999.0,
+            2623943.5
+          ],
+          "late_over_early": [
+            1.016823539910338,
+            0.996720184970265,
+            0.9700301690006551
+          ],
+          "warmup_tail_ns": [
+            2474079.0,
+            2480015.5,
+            2607926.0
+          ],
+          "compilation_ms": [
+            null,
+            null,
+            null
+          ],
+          "alloc_bytes_per_execution": [
+            6106666.24,
+            6106654.08,
+            6106674.88
+          ],
+          "gc_collections": [
+            195,
+            192,
+            195
+          ],
+          "gc_ms": [
+            8.778625,
+            9.096066,
+            8.267176
+          ]
+        },
+        "rust": {
+          "median_ns": 1424540.0,
+          "repeat_medians_ns": [
+            1470728.0,
+            1417055.5,
+            1424540.0
+          ],
+          "late_over_early": [
+            1.000503532895668,
+            1.0089368237050877,
+            0.9953642690504497
+          ],
+          "warmup_tail_ns": [
+            1473285.0,
+            1416885.5,
+            1416187.5
+          ],
+          "compilation_ms": [
+            null,
+            null,
+            null
+          ],
+          "alloc_bytes_per_execution": [
+            null,
+            null,
+            null
+          ],
+          "gc_collections": [
+            null,
+            null,
+            null
+          ],
+          "gc_ms": [
+            null,
+            null,
+            null
+          ]
+        }
+      },
+      "stable_over_go": 0.6245667394348947,
+      "stable_over_rust": 1.1177516952840918,
+      "ea_over_stable": 1.0347149562703088,
+      "valhalla_over_ea": 0.9968025404871937
+    },
+    {
+      "name": "distinct_aggregate",
+      "actors": {
+        "stable": {
+          "median_ns": 6187519.0,
+          "repeat_medians_ns": [
+            6325836.5,
+            5990155.5,
+            6187519.0
+          ],
+          "late_over_early": [
+            0.9912572388079435,
+            0.9662013199465407,
+            1.0438181254401107
+          ],
+          "warmup_tail_ns": [
+            6022520.5,
+            5994032.0,
+            5983407.5
+          ],
+          "compilation_ms": [
+            3,
+            1,
+            2
+          ],
+          "alloc_bytes_per_execution": [
+            18822671.12,
+            18953743.12,
+            18822671.12
+          ],
+          "gc_collections": [
+            2,
+            2,
+            1
+          ],
+          "gc_ms": [
+            2,
+            6,
+            3
+          ]
+        },
+        "ea": {
+          "median_ns": 5874434.5,
+          "repeat_medians_ns": [
+            5874434.5,
+            6063547.5,
+            5852000.0
+          ],
+          "late_over_early": [
+            0.9673712345259512,
+            1.0167521860452151,
+            1.028968102396774
+          ],
+          "warmup_tail_ns": [
+            5847404.5,
+            6217181.0,
+            5844472.0
+          ],
+          "compilation_ms": [
+            2,
+            1,
+            1
+          ],
+          "alloc_bytes_per_execution": [
+            16519092.4,
+            16519276.4,
+            16519452.4
+          ],
+          "gc_collections": [
+            3,
+            2,
+            1
+          ],
+          "gc_ms": [
+            7,
+            6,
+            3
+          ]
+        },
+        "valhalla": {
+          "median_ns": 5977441.0,
+          "repeat_medians_ns": [
+            5977441.0,
+            6266117.5,
+            5966313.0
+          ],
+          "late_over_early": [
+            0.9567654102741366,
+            1.001531778451183,
+            1.0012109294072382
+          ],
+          "warmup_tail_ns": [
+            5964669.0,
+            6333133.5,
+            5949538.5
+          ],
+          "compilation_ms": [
+            2,
+            4,
+            1
+          ],
+          "alloc_bytes_per_execution": [
+            16781524.56,
+            16846980.56,
+            16846956.56
+          ],
+          "gc_collections": [
+            1,
+            3,
+            2
+          ],
+          "gc_ms": [
+            3,
+            8,
+            5
+          ]
+        },
+        "go": {
+          "median_ns": 1142829.0,
+          "repeat_medians_ns": [
+            1142038.0,
+            1142829.0,
+            1193527.5
+          ],
+          "late_over_early": [
+            1.066599385173538,
+            1.0286203949439972,
+            1.0268197017500134
+          ],
+          "warmup_tail_ns": [
+            1143933.0,
+            1107647.0,
+            1196874.5
+          ],
+          "compilation_ms": [
+            null,
+            null,
+            null
+          ],
+          "alloc_bytes_per_execution": [
+            1595602.08,
+            1595613.12,
+            1595599.84
+          ],
+          "gc_collections": [
+            67,
+            66,
+            65
+          ],
+          "gc_ms": [
+            2.830385,
+            2.945927,
+            2.650145
+          ]
+        },
+        "rust": {
+          "median_ns": 1026498.0,
+          "repeat_medians_ns": [
+            1034039.5,
+            1024906.0,
+            1026498.0
+          ],
+          "late_over_early": [
+            1.0002715865211609,
+            0.9987407751055527,
+            0.9991255481148161
+          ],
+          "warmup_tail_ns": [
+            1033203.0,
+            1035213.5,
+            1025470.5
+          ],
+          "compilation_ms": [
+            null,
+            null,
+            null
+          ],
+          "alloc_bytes_per_execution": [
+            null,
+            null,
+            null
+          ],
+          "gc_collections": [
+            null,
+            null,
+            null
+          ],
+          "gc_ms": [
+            null,
+            null,
+            null
+          ]
+        }
+      },
+      "stable_over_go": 5.414212449981581,
+      "stable_over_rust": 6.027794501304435,
+      "ea_over_stable": 0.9494006402242967,
+      "valhalla_over_ea": 1.017534709085615
+    },
+    {
+      "name": "window",
+      "actors": {
+        "stable": {
+          "median_ns": 281860.5,
+          "repeat_medians_ns": [
+            281860.5,
+            282925.0,
+            277887.5
+          ],
+          "late_over_early": [
+            0.9474570199327345,
+            0.9715525537610891,
+            0.9174062410535356
+          ],
+          "warmup_tail_ns": [
+            284640.5,
+            288347.5,
+            300887.5
+          ],
+          "compilation_ms": [
+            40,
+            53,
+            53
+          ],
+          "alloc_bytes_per_execution": [
+            1416540.24,
+            1407227.76,
+            1407228.24
+          ],
+          "gc_collections": [
+            0,
+            0,
+            0
+          ],
+          "gc_ms": [
+            0,
+            0,
+            0
+          ]
+        },
+        "ea": {
+          "median_ns": 306121.5,
+          "repeat_medians_ns": [
+            307527.5,
+            306121.5,
+            290479.5
+          ],
+          "late_over_early": [
+            0.9828043183140475,
+            0.968263366496805,
+            0.902569389014739
+          ],
+          "warmup_tail_ns": [
+            304889.0,
+            307569.0,
+            315802.5
+          ],
+          "compilation_ms": [
+            80,
+            9,
+            144
+          ],
+          "alloc_bytes_per_execution": [
+            1224754.4,
+            1236466.8,
+            1236860.0
+          ],
+          "gc_collections": [
+            0,
+            0,
+            0
+          ],
+          "gc_ms": [
+            0,
+            0,
+            0
+          ]
+        },
+        "valhalla": {
+          "median_ns": 312530.5,
+          "repeat_medians_ns": [
+            312530.5,
+            311495.5,
+            323445.0
+          ],
+          "late_over_early": [
+            0.961625203844419,
+            0.9663204710121941,
+            0.9650646333362923
+          ],
+          "warmup_tail_ns": [
+            323093.5,
+            323245.0,
+            321112.5
+          ],
+          "compilation_ms": [
+            71,
+            10,
+            73
+          ],
+          "alloc_bytes_per_execution": [
+            1246160.96,
+            1236706.56,
+            1236724.16
+          ],
+          "gc_collections": [
+            0,
+            1,
+            0
+          ],
+          "gc_ms": [
+            0,
+            2,
+            0
+          ]
+        },
+        "go": {
+          "median_ns": 61639.5,
+          "repeat_medians_ns": [
+            63830.5,
+            60235.5,
+            61639.5
+          ],
+          "late_over_early": [
+            1.0180445393532642,
+            0.7821120947993904,
+            0.8908032300540987
+          ],
+          "warmup_tail_ns": [
+            64596.5,
+            62810.0,
+            61989.0
+          ],
+          "compilation_ms": [
+            null,
+            null,
+            null
+          ],
+          "alloc_bytes_per_execution": [
+            228473.6,
+            228475.2,
+            228475.04
+          ],
+          "gc_collections": [
+            9,
+            8,
+            8
+          ],
+          "gc_ms": [
+            0.359488,
+            0.296445,
+            0.262397
+          ]
+        },
+        "rust": {
+          "median_ns": 46311.5,
+          "repeat_medians_ns": [
+            45954.0,
+            46311.5,
+            46993.5
+          ],
+          "late_over_early": [
+            0.9985190347591254,
+            1.000908874510398,
+            1.0030447557807776
+          ],
+          "warmup_tail_ns": [
+            46047.0,
+            46214.5,
+            47178.5
+          ],
+          "compilation_ms": [
+            null,
+            null,
+            null
+          ],
+          "alloc_bytes_per_execution": [
+            null,
+            null,
+            null
+          ],
+          "gc_collections": [
+            null,
+            null,
+            null
+          ],
+          "gc_ms": [
+            null,
+            null,
+            null
+          ]
+        }
+      },
+      "stable_over_go": 4.572725281678145,
+      "stable_over_rust": 6.086188095829329,
+      "ea_over_stable": 1.0860744942977112,
+      "valhalla_over_ea": 1.0209361315686745
+    },
+    {
+      "name": "ranking",
+      "actors": {
+        "stable": {
+          "median_ns": 2219428.5,
+          "repeat_medians_ns": [
+            2219428.5,
+            2258068.0,
+            2145150.0
+          ],
+          "late_over_early": [
+            0.9761671854946433,
+            0.9866944258434885,
+            1.0025588043710882
+          ],
+          "warmup_tail_ns": [
+            2183030.0,
+            2729159.0,
+            2773179.5
+          ],
+          "compilation_ms": [
+            12,
+            133,
+            6
+          ],
+          "alloc_bytes_per_execution": [
+            9888386.0,
+            9888476.24,
+            9888384.56
+          ],
+          "gc_collections": [
+            1,
+            1,
+            1
+          ],
+          "gc_ms": [
+            1,
+            3,
+            2
+          ]
+        },
+        "ea": {
+          "median_ns": 2175877.0,
+          "repeat_medians_ns": [
+            2175877.0,
+            2324296.0,
+            2158742.5
+          ],
+          "late_over_early": [
+            0.9863458153158418,
+            0.957245256164758,
+            0.9952625374583892
+          ],
+          "warmup_tail_ns": [
+            2185047.0,
+            2352422.5,
+            2215052.5
+          ],
+          "compilation_ms": [
+            15,
+            20,
+            9
+          ],
+          "alloc_bytes_per_execution": [
+            8557216.0,
+            8655521.2,
+            8655958.8
+          ],
+          "gc_collections": [
+            1,
+            1,
+            0
+          ],
+          "gc_ms": [
+            2,
+            4,
+            0
+          ]
+        },
+        "valhalla": {
+          "median_ns": 2386905.0,
+          "repeat_medians_ns": [
+            2372550.0,
+            2477575.5,
+            2386905.0
+          ],
+          "late_over_early": [
+            1.0056571675400694,
+            1.025820513758931,
+            0.9975085494838571
+          ],
+          "warmup_tail_ns": [
+            2703941.0,
+            2406545.5,
+            2412422.5
+          ],
+          "compilation_ms": [
+            25,
+            21,
+            23
+          ],
+          "alloc_bytes_per_execution": [
+            8917334.96,
+            8917602.56,
+            8917616.16
+          ],
+          "gc_collections": [
+            0,
+            2,
+            2
+          ],
+          "gc_ms": [
+            0,
+            4,
+            6
+          ]
+        },
+        "go": {
+          "median_ns": 2474384.5,
+          "repeat_medians_ns": [
+            2474384.5,
+            2482265.5,
+            2374861.0
+          ],
+          "late_over_early": [
+            0.993496033746406,
+            1.0121548175067354,
+            1.0313225946116988
+          ],
+          "warmup_tail_ns": [
+            2479685.0,
+            2448049.0,
+            2521127.0
+          ],
+          "compilation_ms": [
+            null,
+            null,
+            null
+          ],
+          "alloc_bytes_per_execution": [
+            5179789.12,
+            5179786.72,
+            5179784.8
+          ],
+          "gc_collections": [
+            161,
+            161,
+            159
+          ],
+          "gc_ms": [
+            7.061154,
+            7.181257,
+            6.600412
+          ]
+        },
+        "rust": {
+          "median_ns": 1395156.0,
+          "repeat_medians_ns": [
+            1469060.5,
+            1395156.0,
+            1395077.0
+          ],
+          "late_over_early": [
+            0.9980126329077248,
+            1.0010711563042742,
+            1.0021849048421168
+          ],
+          "warmup_tail_ns": [
+            1471641.0,
+            1393793.0,
+            1393566.5
+          ],
+          "compilation_ms": [
+            null,
+            null,
+            null
+          ],
+          "alloc_bytes_per_execution": [
+            null,
+            null,
+            null
+          ],
+          "gc_collections": [
+            null,
+            null,
+            null
+          ],
+          "gc_ms": [
+            null,
+            null,
+            null
+          ]
+        }
+      },
+      "stable_over_go": 0.8969618505127235,
+      "stable_over_rust": 1.5908102749800022,
+      "ea_over_stable": 0.9803771556506551,
+      "valhalla_over_ea": 1.096985261574988
+    },
+    {
+      "name": "text_filter",
+      "actors": {
+        "stable": {
+          "median_ns": 1066347.5,
+          "repeat_medians_ns": [
+            1094187.5,
+            1066347.5,
+            1041784.5
+          ],
+          "late_over_early": [
+            1.0226144815038063,
+            1.011868174951205,
+            1.0077390173530207
+          ],
+          "warmup_tail_ns": [
+            1069004.5,
+            1062941.0,
+            1033273.0
+          ],
+          "compilation_ms": [
+            2,
+            4,
+            1
+          ],
+          "alloc_bytes_per_execution": [
+            5016775.12,
+            5016775.12,
+            5016775.12
+          ],
+          "gc_collections": [
+            1,
+            1,
+            1
+          ],
+          "gc_ms": [
+            3,
+            2,
+            4
+          ]
+        },
+        "ea": {
+          "median_ns": 1065263.5,
+          "repeat_medians_ns": [
+            1065263.5,
+            1082129.5,
+            1040219.5
+          ],
+          "late_over_early": [
+            1.0032054417264238,
+            1.0054927209152122,
+            1.0097319853656976
+          ],
+          "warmup_tail_ns": [
+            1061374.0,
+            1065981.0,
+            1032802.5
+          ],
+          "compilation_ms": [
+            0,
+            1,
+            0
+          ],
+          "alloc_bytes_per_execution": [
+            4134260.4,
+            4135628.4,
+            4135996.4
+          ],
+          "gc_collections": [
+            0,
+            0,
+            0
+          ],
+          "gc_ms": [
+            0,
+            0,
+            0
+          ]
+        },
+        "valhalla": {
+          "median_ns": 1048611.5,
+          "repeat_medians_ns": [
+            1048611.5,
+            1193670.0,
+            1044383.5
+          ],
+          "late_over_early": [
+            0.9998941731346584,
+            0.9997025891499495,
+            0.9816194541333972
+          ],
+          "warmup_tail_ns": [
+            1036029.0,
+            1185767.5,
+            1043926.0
+          ],
+          "compilation_ms": [
+            1,
+            0,
+            1
+          ],
+          "alloc_bytes_per_execution": [
+            4004628.56,
+            4202300.56,
+            4005420.56
+          ],
+          "gc_collections": [
+            0,
+            1,
+            0
+          ],
+          "gc_ms": [
+            0,
+            1,
+            0
+          ]
+        },
+        "go": {
+          "median_ns": 358918.5,
+          "repeat_medians_ns": [
+            359751.5,
+            357719.0,
+            358918.5
+          ],
+          "late_over_early": [
+            0.9842519251167468,
+            0.6443797722389462,
+            1.083045399275249
+          ],
+          "warmup_tail_ns": [
+            358608.0,
+            360075.5,
+            235973.0
+          ],
+          "compilation_ms": [
+            null,
+            null,
+            null
+          ],
+          "alloc_bytes_per_execution": [
+            149225.12,
+            149224.64,
+            149226.24
+          ],
+          "gc_collections": [
+            8,
+            7,
+            7
+          ],
+          "gc_ms": [
+            0.441459,
+            0.267643,
+            0.180442
+          ]
+        },
+        "rust": {
+          "median_ns": 300990.5,
+          "repeat_medians_ns": [
+            317875.0,
+            300990.5,
+            300823.5
+          ],
+          "late_over_early": [
+            1.003153499754027,
+            1.002809362767289,
+            0.9922928325993963
+          ],
+          "warmup_tail_ns": [
+            317632.5,
+            300425.0,
+            299683.0
+          ],
+          "compilation_ms": [
+            null,
+            null,
+            null
+          ],
+          "alloc_bytes_per_execution": [
+            null,
+            null,
+            null
+          ],
+          "gc_collections": [
+            null,
+            null,
+            null
+          ],
+          "gc_ms": [
+            null,
+            null,
+            null
+          ]
+        }
+      },
+      "stable_over_go": 2.971001773383094,
+      "stable_over_rust": 3.542794540027011,
+      "ea_over_stable": 0.9989834458279313,
+      "valhalla_over_ea": 0.9843681868382799
+    },
+    {
+      "name": "float_aggregate",
+      "actors": {
+        "stable": {
+          "median_ns": 3593384.0,
+          "repeat_medians_ns": [
+            3625435.0,
+            3593384.0,
+            3562294.5
+          ],
+          "late_over_early": [
+            1.0424073736007615,
+            1.0021378230771907,
+            0.9996977887274074
+          ],
+          "warmup_tail_ns": [
+            3646136.5,
+            3592003.5,
+            3571146.5
+          ],
+          "compilation_ms": [
+            20,
+            15,
+            21
+          ],
+          "alloc_bytes_per_execution": [
+            11850215.12,
+            11849959.12,
+            11849959.12
+          ],
+          "gc_collections": [
+            1,
+            2,
+            1
+          ],
+          "gc_ms": [
+            2,
+            6,
+            4
+          ]
+        },
+        "ea": {
+          "median_ns": 3541349.0,
+          "repeat_medians_ns": [
+            3477892.5,
+            3674458.0,
+            3541349.0
+          ],
+          "late_over_early": [
+            0.9982500186718297,
+            1.0206205541871374,
+            1.0066270463213778
+          ],
+          "warmup_tail_ns": [
+            3601879.5,
+            3556303.0,
+            3521896.5
+          ],
+          "compilation_ms": [
+            22,
+            21,
+            25
+          ],
+          "alloc_bytes_per_execution": [
+            9972116.4,
+            10070444.4,
+            10070668.4
+          ],
+          "gc_collections": [
+            1,
+            2,
+            1
+          ],
+          "gc_ms": [
+            3,
+            5,
+            2
+          ]
+        },
+        "valhalla": {
+          "median_ns": 3621765.5,
+          "repeat_medians_ns": [
+            3621765.5,
+            3867726.5,
+            3538132.0
+          ],
+          "late_over_early": [
+            0.9472584394081744,
+            0.9573951368847099,
+            0.9997029831681041
+          ],
+          "warmup_tail_ns": [
+            3787050.5,
+            3866204.0,
+            3571840.5
+          ],
+          "compilation_ms": [
+            27,
+            19,
+            24
+          ],
+          "alloc_bytes_per_execution": [
+            10070764.56,
+            10332828.56,
+            10136004.56
+          ],
+          "gc_collections": [
+            1,
+            1,
+            2
+          ],
+          "gc_ms": [
+            0,
+            0,
+            4
+          ]
+        },
+        "go": {
+          "median_ns": 196568.5,
+          "repeat_medians_ns": [
+            199104.0,
+            195996.0,
+            196568.5
+          ],
+          "late_over_early": [
+            0.9984384100905822,
+            1.0004540746825303,
+            1.0004834138174934
+          ],
+          "warmup_tail_ns": [
+            198493.0,
+            196440.5,
+            196534.5
+          ],
+          "compilation_ms": [
+            null,
+            null,
+            null
+          ],
+          "alloc_bytes_per_execution": [
+            2264.0,
+            2264.0,
+            2264.0
+          ],
+          "gc_collections": [
+            0,
+            0,
+            0
+          ],
+          "gc_ms": [
+            0.0,
+            0.0,
+            0.0
+          ]
+        },
+        "rust": {
+          "median_ns": 153734.0,
+          "repeat_medians_ns": [
+            161552.5,
+            153734.0,
+            152909.0
+          ],
+          "late_over_early": [
+            1.0072597529701806,
+            0.9998569226667013,
+            0.9987517645213573
+          ],
+          "warmup_tail_ns": [
+            161693.0,
+            154100.0,
+            152998.5
+          ],
+          "compilation_ms": [
+            null,
+            null,
+            null
+          ],
+          "alloc_bytes_per_execution": [
+            null,
+            null,
+            null
+          ],
+          "gc_collections": [
+            null,
+            null,
+            null
+          ],
+          "gc_ms": [
+            null,
+            null,
+            null
+          ]
+        }
+      },
+      "stable_over_go": 18.280568860219212,
+      "stable_over_rust": 23.37403567200489,
+      "ea_over_stable": 0.9855192208792604,
+      "valhalla_over_ea": 1.0227078720566654
+    },
+    {
+      "name": "decimal_aggregate",
+      "actors": {
+        "stable": {
+          "median_ns": 5000489.5,
+          "repeat_medians_ns": [
+            5114212.5,
+            5000489.5,
+            4982113.0
+          ],
+          "late_over_early": [
+            0.942688675433945,
+            0.9616804285514057,
+            0.9944624161283624
+          ],
+          "warmup_tail_ns": [
+            5017833.0,
+            5159215.0,
+            4991146.0
+          ],
+          "compilation_ms": [
+            4,
+            6,
+            7
+          ],
+          "alloc_bytes_per_execution": [
+            16329759.12,
+            16329859.6,
+            16329759.76
+          ],
+          "gc_collections": [
+            2,
+            2,
+            1
+          ],
+          "gc_ms": [
+            6,
+            6,
+            1
+          ]
+        },
+        "ea": {
+          "median_ns": 4989105.5,
+          "repeat_medians_ns": [
+            4989105.5,
+            5256790.5,
+            4984849.0
+          ],
+          "late_over_early": [
+            0.9910086546095933,
+            1.0001128252644877,
+            0.999312226088875
+          ],
+          "warmup_tail_ns": [
+            4960219.0,
+            5042719.0,
+            4985175.0
+          ],
+          "compilation_ms": [
+            7,
+            10,
+            5
+          ],
+          "alloc_bytes_per_execution": [
+            14026741.68,
+            14125065.84,
+            14125444.4
+          ],
+          "gc_collections": [
+            2,
+            2,
+            2
+          ],
+          "gc_ms": [
+            4,
+            2,
+            5
+          ]
+        },
+        "valhalla": {
+          "median_ns": 5039321.0,
+          "repeat_medians_ns": [
+            5021862.5,
+            5150708.5,
+            5039321.0
+          ],
+          "late_over_early": [
+            1.0007948110590688,
+            1.0032666148464826,
+            0.997808276947223
+          ],
+          "warmup_tail_ns": [
+            5113157.5,
+            5136860.5,
+            5020474.0
+          ],
+          "compilation_ms": [
+            28,
+            32,
+            7
+          ],
+          "alloc_bytes_per_execution": [
+            13994056.56,
+            14256425.36,
+            14059551.84
+          ],
+          "gc_collections": [
+            1,
+            2,
+            2
+          ],
+          "gc_ms": [
+            3,
+            5,
+            5
+          ]
+        },
+        "go": {
+          "median_ns": 5657540.5,
+          "repeat_medians_ns": [
+            5657540.5,
+            5782147.5,
+            5472549.0
+          ],
+          "late_over_early": [
+            0.8793307431177412,
+            1.1060491699996713,
+            1.0249451824188953
+          ],
+          "warmup_tail_ns": [
+            5532270.5,
+            5758730.0,
+            5516480.5
+          ],
+          "compilation_ms": [
+            null,
+            null,
+            null
+          ],
+          "alloc_bytes_per_execution": [
+            3875036.8,
+            3874988.48,
+            3875022.72
+          ],
+          "gc_collections": [
+            179,
+            179,
+            179
+          ],
+          "gc_ms": [
+            10.015337,
+            9.127241,
+            10.20316
+          ]
+        },
+        "rust": {
+          "median_ns": 516433.5,
+          "repeat_medians_ns": [
+            540405.5,
+            516433.5,
+            514824.0
+          ],
+          "late_over_early": [
+            1.0223330426021444,
+            0.997465843984134,
+            1.000629061475227
+          ],
+          "warmup_tail_ns": [
+            540874.0,
+            521302.0,
+            515032.5
+          ],
+          "compilation_ms": [
+            null,
+            null,
+            null
+          ],
+          "alloc_bytes_per_execution": [
+            null,
+            null,
+            null
+          ],
+          "gc_collections": [
+            null,
+            null,
+            null
+          ],
+          "gc_ms": [
+            null,
+            null,
+            null
+          ]
+        }
+      },
+      "stable_over_go": 0.8838627845439198,
+      "stable_over_rust": 9.682736499471858,
+      "ea_over_stable": 0.9977234228769003,
+      "valhalla_over_ea": 1.0100650306953822
+    },
+    {
+      "name": "expression_projection",
+      "actors": {
+        "stable": {
+          "median_ns": 43998.0,
+          "repeat_medians_ns": [
+            43213.0,
+            44302.5,
+            43998.0
+          ],
+          "late_over_early": [
+            1.0047161172161172,
+            0.9965631853844936,
+            0.9681757656458055
+          ],
+          "warmup_tail_ns": [
+            43952.5,
+            44568.5,
+            44557.5
+          ],
+          "compilation_ms": [
+            3,
+            0,
+            8
+          ],
+          "alloc_bytes_per_execution": [
+            172872.72,
+            173103.12,
+            173263.12
+          ],
+          "gc_collections": [
+            0,
+            0,
+            0
+          ],
+          "gc_ms": [
+            0,
+            0,
+            0
+          ]
+        },
+        "ea": {
+          "median_ns": 45837.0,
+          "repeat_medians_ns": [
+            43942.5,
+            45837.0,
+            46399.0
+          ],
+          "late_over_early": [
+            0.9925369758921706,
+            1.0058366182459655,
+            0.9968669527896996
+          ],
+          "warmup_tail_ns": [
+            44694.0,
+            45515.0,
+            46854.0
+          ],
+          "compilation_ms": [
+            3,
+            0,
+            0
+          ],
+          "alloc_bytes_per_execution": [
+            142993.6,
+            145332.4,
+            145964.4
+          ],
+          "gc_collections": [
+            0,
+            0,
+            0
+          ],
+          "gc_ms": [
+            0,
+            0,
+            0
+          ]
+        },
+        "valhalla": {
+          "median_ns": 45469.5,
+          "repeat_medians_ns": [
+            45860.0,
+            45269.5,
+            45469.5
+          ],
+          "late_over_early": [
+            0.9809845580750655,
+            0.9957750198045947,
+            0.9924197869698752
+          ],
+          "warmup_tail_ns": [
+            45643.5,
+            45201.0,
+            45560.0
+          ],
+          "compilation_ms": [
+            0,
+            3,
+            3
+          ],
+          "alloc_bytes_per_execution": [
+            142620.56,
+            142290.56,
+            142380.16
+          ],
+          "gc_collections": [
+            0,
+            0,
+            0
+          ],
+          "gc_ms": [
+            0,
+            0,
+            0
+          ]
+        },
+        "go": {
+          "median_ns": 22385.0,
+          "repeat_medians_ns": [
+            29505.5,
+            21363.5,
+            22385.0
+          ],
+          "late_over_early": [
+            1.0172354360565323,
+            1.008575354147913,
+            0.9637652092525739
+          ],
+          "warmup_tail_ns": [
+            32183.0,
+            22021.0,
+            22064.0
+          ],
+          "compilation_ms": [
+            null,
+            null,
+            null
+          ],
+          "alloc_bytes_per_execution": [
+            35216.0,
+            35216.0,
+            35218.24
+          ],
+          "gc_collections": [
+            1,
+            1,
+            1
+          ],
+          "gc_ms": [
+            0.065989,
+            0.030052,
+            0.074418
+          ]
+        },
+        "rust": {
+          "median_ns": 25746.0,
+          "repeat_medians_ns": [
+            27716.5,
+            25656.0,
+            25746.0
+          ],
+          "late_over_early": [
+            0.9988463063777625,
+            0.9986368062317429,
+            1.0014757281553397
+          ],
+          "warmup_tail_ns": [
+            27763.0,
+            25719.0,
+            25707.0
+          ],
+          "compilation_ms": [
+            null,
+            null,
+            null
+          ],
+          "alloc_bytes_per_execution": [
+            null,
+            null,
+            null
+          ],
+          "gc_collections": [
+            null,
+            null,
+            null
+          ],
+          "gc_ms": [
+            null,
+            null,
+            null
+          ]
+        }
+      },
+      "stable_over_go": 1.9655126200580746,
+      "stable_over_rust": 1.708925658354696,
+      "ea_over_stable": 1.041797354425201,
+      "valhalla_over_ea": 0.9919824595850514
+    },
+    {
+      "name": "json",
+      "actors": {
+        "stable": {
+          "median_ns": 90705.0,
+          "repeat_medians_ns": [
+            87349.5,
+            90705.0,
+            91115.0
+          ],
+          "late_over_early": [
+            0.8820706907334326,
+            0.9410418233543704,
+            0.8794604549925703
+          ],
+          "warmup_tail_ns": [
+            94607.0,
+            102758.0,
+            97940.5
+          ],
+          "compilation_ms": [
+            61,
+            65,
+            63
+          ],
+          "alloc_bytes_per_execution": [
+            325365.04,
+            324234.48,
+            325988.88
+          ],
+          "gc_collections": [
+            0,
+            0,
+            0
+          ],
+          "gc_ms": [
+            0,
+            0,
+            0
+          ]
+        },
+        "ea": {
+          "median_ns": 100592.5,
+          "repeat_medians_ns": [
+            100592.5,
+            102929.0,
+            94861.0
+          ],
+          "late_over_early": [
+            0.958092906685318,
+            0.9536229936256816,
+            0.9710117647058824
+          ],
+          "warmup_tail_ns": [
+            106633.5,
+            107856.0,
+            98457.0
+          ],
+          "compilation_ms": [
+            19,
+            57,
+            34
+          ],
+          "alloc_bytes_per_execution": [
+            277164.88,
+            279427.44,
+            280009.44
+          ],
+          "gc_collections": [
+            0,
+            0,
+            0
+          ],
+          "gc_ms": [
+            0,
+            0,
+            0
+          ]
+        },
+        "valhalla": {
+          "median_ns": 102094.5,
+          "repeat_medians_ns": [
+            97225.0,
+            104856.0,
+            102094.5
+          ],
+          "late_over_early": [
+            0.8389747019640097,
+            0.8647854039318578,
+            0.8706936086179303
+          ],
+          "warmup_tail_ns": [
+            117546.0,
+            113653.0,
+            111255.5
+          ],
+          "compilation_ms": [
+            43,
+            50,
+            37
+          ],
+          "alloc_bytes_per_execution": [
+            277122.88,
+            278083.52,
+            277494.8
+          ],
+          "gc_collections": [
+            0,
+            0,
+            0
+          ],
+          "gc_ms": [
+            0,
+            0,
+            0
+          ]
+        },
+        "go": {
+          "median_ns": 64087.0,
+          "repeat_medians_ns": [
+            64087.0,
+            73227.0,
+            62477.0
+          ],
+          "late_over_early": [
+            0.5050613761663503,
+            1.2334131615340507,
+            1.430362229052347
+          ],
+          "warmup_tail_ns": [
+            63977.5,
+            67852.5,
+            54800.0
+          ],
+          "compilation_ms": [
+            null,
+            null,
+            null
+          ],
+          "alloc_bytes_per_execution": [
+            143499.52,
+            143490.72,
+            143490.56
+          ],
+          "gc_collections": [
+            6,
+            6,
+            5
+          ],
+          "gc_ms": [
+            0.529611,
+            0.756558,
+            0.372422
+          ]
+        },
+        "rust": {
+          "median_ns": 37545.5,
+          "repeat_medians_ns": [
+            39661.0,
+            37545.5,
+            37344.5
+          ],
+          "late_over_early": [
+            1.0045425867507887,
+            1.0003478726251003,
+            0.9951087828085743
+          ],
+          "warmup_tail_ns": [
+            39470.5,
+            37570.0,
+            37189.0
+          ],
+          "compilation_ms": [
+            null,
+            null,
+            null
+          ],
+          "alloc_bytes_per_execution": [
+            null,
+            null,
+            null
+          ],
+          "gc_collections": [
+            null,
+            null,
+            null
+          ],
+          "gc_ms": [
+            null,
+            null,
+            null
+          ]
+        }
+      },
+      "stable_over_go": 1.4153416449513943,
+      "stable_over_rust": 2.4158687459216153,
+      "ea_over_stable": 1.10900722121162,
+      "valhalla_over_ea": 1.0149315306807167
+    },
+    {
+      "name": "array",
+      "actors": {
+        "stable": {
+          "median_ns": 70242.0,
+          "repeat_medians_ns": [
+            69514.5,
+            70242.0,
+            71665.5
+          ],
+          "late_over_early": [
+            0.909176344230382,
+            0.9342566169409919,
+            0.8816543115593769
+          ],
+          "warmup_tail_ns": [
+            80817.0,
+            80029.5,
+            79871.0
+          ],
+          "compilation_ms": [
+            27,
+            30,
+            38
+          ],
+          "alloc_bytes_per_execution": [
+            235421.04,
+            233960.56,
+            239285.04
+          ],
+          "gc_collections": [
+            0,
+            0,
+            0
+          ],
+          "gc_ms": [
+            0,
+            0,
+            0
+          ]
+        },
+        "ea": {
+          "median_ns": 69947.0,
+          "repeat_medians_ns": [
+            79891.0,
+            66252.5,
+            69947.0
+          ],
+          "late_over_early": [
+            0.8620259601879208,
+            0.8393592615946015,
+            0.897248212783852
+          ],
+          "warmup_tail_ns": [
+            84159.5,
+            85155.5,
+            84869.5
+          ],
+          "compilation_ms": [
+            35,
+            60,
+            71
+          ],
+          "alloc_bytes_per_execution": [
+            205225.2,
+            200640.16,
+            201967.68
+          ],
+          "gc_collections": [
+            0,
+            0,
+            0
+          ],
+          "gc_ms": [
+            0,
+            0,
+            0
+          ]
+        },
+        "valhalla": {
+          "median_ns": 77408.0,
+          "repeat_medians_ns": [
+            77523.0,
+            72627.5,
+            77408.0
+          ],
+          "late_over_early": [
+            0.8877145846212373,
+            0.8962960111876628,
+            0.8055718441355363
+          ],
+          "warmup_tail_ns": [
+            87865.5,
+            87701.5,
+            88400.5
+          ],
+          "compilation_ms": [
+            88,
+            82,
+            39
+          ],
+          "alloc_bytes_per_execution": [
+            201495.6,
+            194029.2,
+            198151.76
+          ],
+          "gc_collections": [
+            0,
+            0,
+            0
+          ],
+          "gc_ms": [
+            0,
+            0,
+            0
+          ]
+        },
+        "go": {
+          "median_ns": 39286.5,
+          "repeat_medians_ns": [
+            36878.0,
+            39286.5,
+            39400.0
+          ],
+          "late_over_early": [
+            1.467390689518638,
+            1.1208102309771253,
+            1.1400156660885135
+          ],
+          "warmup_tail_ns": [
+            69333.5,
+            37769.5,
+            39649.5
+          ],
+          "compilation_ms": [
+            null,
+            null,
+            null
+          ],
+          "alloc_bytes_per_execution": [
+            57035.36,
+            57033.12,
+            57037.6
+          ],
+          "gc_collections": [
+            2,
+            2,
+            2
+          ],
+          "gc_ms": [
+            0.1999,
+            0.232443,
+            0.120822
+          ]
+        },
+        "rust": {
+          "median_ns": 30537.0,
+          "repeat_medians_ns": [
+            31684.5,
+            30180.5,
+            30537.0
+          ],
+          "late_over_early": [
+            0.9994640267356075,
+            1.0006310405526586,
+            0.9992142225714566
+          ],
+          "warmup_tail_ns": [
+            31682.5,
+            30284.0,
+            30588.0
+          ],
+          "compilation_ms": [
+            null,
+            null,
+            null
+          ],
+          "alloc_bytes_per_execution": [
+            null,
+            null,
+            null
+          ],
+          "gc_collections": [
+            null,
+            null,
+            null
+          ],
+          "gc_ms": [
+            null,
+            null,
+            null
+          ]
+        }
+      },
+      "stable_over_go": 1.7879424229697225,
+      "stable_over_rust": 2.300225955398369,
+      "ea_over_stable": 0.9958002334785456,
+      "valhalla_over_ea": 1.1066664760461493
+    },
+    {
+      "name": "rollback",
+      "actors": {
+        "stable": {
+          "median_ns": 163087.0,
+          "repeat_medians_ns": [
+            152156.5,
+            250818.5,
+            163087.0
+          ],
+          "late_over_early": [
+            1.0007059925720212,
+            0.9916573005108631,
+            0.966252892782281
+          ],
+          "warmup_tail_ns": [
+            163181,
+            256876,
+            168287
+          ],
+          "compilation_ms": [
+            67,
+            7,
+            55
+          ],
+          "alloc_bytes_per_execution": [
+            312206.24,
+            312160.8,
+            312066.4
+          ],
+          "gc_collections": [
+            0,
+            0,
+            0
+          ],
+          "gc_ms": [
+            0,
+            0,
+            0
+          ]
+        },
+        "ea": {
+          "median_ns": 162790.5,
+          "repeat_medians_ns": [
+            162790.5,
+            157855.5,
+            234060.5
+          ],
+          "late_over_early": [
+            1.003194898108235,
+            0.9940616976335328,
+            0.9548537146404412
+          ],
+          "warmup_tail_ns": [
+            169690,
+            160752,
+            237708
+          ],
+          "compilation_ms": [
+            12,
+            22,
+            20
+          ],
+          "alloc_bytes_per_execution": [
+            293299.04,
+            293445.6,
+            293760.48
+          ],
+          "gc_collections": [
+            0,
+            0,
+            0
+          ],
+          "gc_ms": [
+            0,
+            0,
+            0
+          ]
+        },
+        "valhalla": {
+          "median_ns": 161115.5,
+          "repeat_medians_ns": [
+            156250.5,
+            167798.5,
+            161115.5
+          ],
+          "late_over_early": [
+            0.9642266876822646,
+            0.9732561823409508,
+            0.9758175609546572
+          ],
+          "warmup_tail_ns": [
+            164736,
+            174860,
+            171664
+          ],
+          "compilation_ms": [
+            33,
+            18,
+            16
+          ],
+          "alloc_bytes_per_execution": [
+            303892.16,
+            303334.24,
+            303401.12
+          ],
+          "gc_collections": [
+            0,
+            0,
+            0
+          ],
+          "gc_ms": [
+            0,
+            0,
+            0
+          ]
+        },
+        "go": {
+          "median_ns": 21685.0,
+          "repeat_medians_ns": [
+            21685.0,
+            22283.5,
+            16333.0
+          ],
+          "late_over_early": [
+            0.9587652561656745,
+            0.9452124147039401,
+            1.219706926008674
+          ],
+          "warmup_tail_ns": [
+            22419,
+            36449,
+            16173
+          ],
+          "compilation_ms": [
+            null,
+            null,
+            null
+          ],
+          "alloc_bytes_per_execution": [
+            80785.44,
+            80847.68,
+            80857.28
+          ],
+          "gc_collections": [
+            1,
+            2,
+            2
+          ],
+          "gc_ms": [
+            0.190067,
+            0.267695,
+            0.069664
+          ]
+        },
+        "rust": {
+          "median_ns": 17823.5,
+          "repeat_medians_ns": [
+            18620.5,
+            17687.0,
+            17823.5
+          ],
+          "late_over_early": [
+            0.9905607551395889,
+            0.9868096093399191,
+            1.002693375978453
+          ],
+          "warmup_tail_ns": [
+            18679,
+            17632,
+            17748
+          ],
+          "compilation_ms": [
+            null,
+            null,
+            null
+          ],
+          "alloc_bytes_per_execution": [
+            null,
+            null,
+            null
+          ],
+          "gc_collections": [
+            null,
+            null,
+            null
+          ],
+          "gc_ms": [
+            null,
+            null,
+            null
+          ]
+        }
+      },
+      "stable_over_go": 7.520728614249482,
+      "stable_over_rust": 9.15011080876371,
+      "ea_over_stable": 0.998181951964289,
+      "valhalla_over_ea": 0.9897107017915665
+    },
+    {
+      "name": "durable",
+      "actors": {
+        "stable": {
+          "median_ns": 2147996.0,
+          "repeat_medians_ns": [
+            2001167.0,
+            2147996.0,
+            2431328.5
+          ],
+          "late_over_early": [
+            1.0512930179556577,
+            1.046803487779767,
+            0.9985664562733062
+          ],
+          "warmup_tail_ns": [
+            2049135,
+            2181192,
+            2409759
+          ],
+          "compilation_ms": [
+            53,
+            51,
+            48
+          ],
+          "alloc_bytes_per_execution": [
+            1520859.36,
+            1521033.76,
+            1518717.28
+          ],
+          "gc_collections": [
+            0,
+            0,
+            0
+          ],
+          "gc_ms": [
+            0,
+            0,
+            0
+          ]
+        },
+        "ea": {
+          "median_ns": 2292405.5,
+          "repeat_medians_ns": [
+            2370305.0,
+            2292405.5,
+            1953994.0
+          ],
+          "late_over_early": [
+            1.0190578136252828,
+            0.9968047876590239,
+            0.9886205315033879
+          ],
+          "warmup_tail_ns": [
+            2254277,
+            2432048,
+            2072276
+          ],
+          "compilation_ms": [
+            64,
+            63,
+            57
+          ],
+          "alloc_bytes_per_execution": [
+            1413565.92,
+            1439876.64,
+            1440590.56
+          ],
+          "gc_collections": [
+            0,
+            1,
+            0
+          ],
+          "gc_ms": [
+            0,
+            2,
+            0
+          ]
+        },
+        "valhalla": {
+          "median_ns": 2368010.5,
+          "repeat_medians_ns": [
+            2250573.5,
+            2454316.5,
+            2368010.5
+          ],
+          "late_over_early": [
+            0.9596120533198613,
+            0.953571465978778,
+            0.8937977492203784
+          ],
+          "warmup_tail_ns": [
+            2229454,
+            2462616,
+            2409263
+          ],
+          "compilation_ms": [
+            40,
+            94,
+            34
+          ],
+          "alloc_bytes_per_execution": [
+            1443631.68,
+            1441499.84,
+            1442705.44
+          ],
+          "gc_collections": [
+            1,
+            0,
+            0
+          ],
+          "gc_ms": [
+            2,
+            0,
+            0
+          ]
+        },
+        "go": {
+          "median_ns": 1802174.0,
+          "repeat_medians_ns": [
+            1828100.5,
+            1626936.5,
+            1802174.0
+          ],
+          "late_over_early": [
+            0.8522931047130454,
+            0.8957073766032336,
+            1.0163256431827508
+          ],
+          "warmup_tail_ns": [
+            1570225,
+            2155227,
+            1790606
+          ],
+          "compilation_ms": [
+            null,
+            null,
+            null
+          ],
+          "alloc_bytes_per_execution": [
+            237118.56,
+            237173.12,
+            237112.48
+          ],
+          "gc_collections": [
+            5,
+            6,
+            5
+          ],
+          "gc_ms": [
+            0.296238,
+            0.454557,
+            0.444215
+          ]
+        },
+        "rust": {
+          "median_ns": 1722815.0,
+          "repeat_medians_ns": [
+            1237578.0,
+            1867391.0,
+            1722815.0
+          ],
+          "late_over_early": [
+            1.034427488293085,
+            1.0266943006771831,
+            0.881861753771361
+          ],
+          "warmup_tail_ns": [
+            1222970,
+            1867144,
+            1825032
+          ],
+          "compilation_ms": [
+            null,
+            null,
+            null
+          ],
+          "alloc_bytes_per_execution": [
+            null,
+            null,
+            null
+          ],
+          "gc_collections": [
+            null,
+            null,
+            null
+          ],
+          "gc_ms": [
+            null,
+            null,
+            null
+          ]
+        }
+      },
+      "stable_over_go": 1.1918915709581872,
+      "stable_over_rust": 1.2467943453011496,
+      "ea_over_stable": 1.0672298737986476,
+      "valhalla_over_ea": 1.032980639769011
+    },
+    {
+      "name": "text_rollback",
+      "actors": {
+        "stable": {
+          "median_ns": 118376.5,
+          "repeat_medians_ns": [
+            118376.5,
+            118063.5,
+            121471.0
+          ],
+          "late_over_early": [
+            0.8472494108782531,
+            0.859715175556993,
+            0.8494966117038237
+          ],
+          "warmup_tail_ns": [
+            136221,
+            130888,
+            135527
+          ],
+          "compilation_ms": [
+            39,
+            12,
+            35
+          ],
+          "alloc_bytes_per_execution": [
+            323846.24,
+            323798.24,
+            323846.24
+          ],
+          "gc_collections": [
+            0,
+            0,
+            0
+          ],
+          "gc_ms": [
+            0,
+            0,
+            0
+          ]
+        },
+        "ea": {
+          "median_ns": 124103.0,
+          "repeat_medians_ns": [
+            124103.0,
+            121607.0,
+            124448.0
+          ],
+          "late_over_early": [
+            0.8721245698456442,
+            0.8691532472876505,
+            0.8389661884766644
+          ],
+          "warmup_tail_ns": [
+            144046,
+            145001,
+            142362
+          ],
+          "compilation_ms": [
+            20,
+            29,
+            30
+          ],
+          "alloc_bytes_per_execution": [
+            303880.8,
+            304120.8,
+            304592.8
+          ],
+          "gc_collections": [
+            0,
+            0,
+            0
+          ],
+          "gc_ms": [
+            0,
+            0,
+            0
+          ]
+        },
+        "valhalla": {
+          "median_ns": 124758.0,
+          "repeat_medians_ns": [
+            124758.0,
+            129586.0,
+            123734.0
+          ],
+          "late_over_early": [
+            0.8031874398974249,
+            0.859103733931434,
+            0.8142642642642642
+          ],
+          "warmup_tail_ns": [
+            144793,
+            150903,
+            140013
+          ],
+          "compilation_ms": [
+            4,
+            31,
+            5
+          ],
+          "alloc_bytes_per_execution": [
+            304867.68,
+            304060.0,
+            304091.36
+          ],
+          "gc_collections": [
+            0,
+            0,
+            0
+          ],
+          "gc_ms": [
+            0,
+            0,
+            0
+          ]
+        },
+        "go": {
+          "median_ns": 32372.5,
+          "repeat_medians_ns": [
+            31333.5,
+            32372.5,
+            40556.5
+          ],
+          "late_over_early": [
+            1.1472722343598003,
+            0.6207306687028281,
+            2.6799847257672287
+          ],
+          "warmup_tail_ns": [
+            33849,
+            30043,
+            59668
+          ],
+          "compilation_ms": [
+            null,
+            null,
+            null
+          ],
+          "alloc_bytes_per_execution": [
+            95476.48,
+            95482.24,
+            95412.32
+          ],
+          "gc_collections": [
+            2,
+            2,
+            1
+          ],
+          "gc_ms": [
+            0.289455,
+            0.07611,
+            0.047233
+          ]
+        },
+        "rust": {
+          "median_ns": 26722.5,
+          "repeat_medians_ns": [
+            28090.0,
+            26643.5,
+            26722.5
+          ],
+          "late_over_early": [
+            0.9918015332197615,
+            1.00165093897154,
+            1.0066235050469243
+          ],
+          "warmup_tail_ns": [
+            28253,
+            26797,
+            26756
+          ],
+          "compilation_ms": [
+            null,
+            null,
+            null
+          ],
+          "alloc_bytes_per_execution": [
+            null,
+            null,
+            null
+          ],
+          "gc_collections": [
+            null,
+            null,
+            null
+          ],
+          "gc_ms": [
+            null,
+            null,
+            null
+          ]
+        }
+      },
+      "stable_over_go": 3.656699359023863,
+      "stable_over_rust": 4.429843764617831,
+      "ea_over_stable": 1.048375310978108,
+      "valhalla_over_ea": 1.0052778740239963
+    },
+    {
+      "name": "text_durable",
+      "actors": {
+        "stable": {
+          "median_ns": 2069387.0,
+          "repeat_medians_ns": [
+            1802384.0,
+            2069387.0,
+            2412814.0
+          ],
+          "late_over_early": [
+            1.0149062040953933,
+            0.9621503657827998,
+            0.9426804149003485
+          ],
+          "warmup_tail_ns": [
+            1860195,
+            2188545,
+            2471915
+          ],
+          "compilation_ms": [
+            67,
+            29,
+            56
+          ],
+          "alloc_bytes_per_execution": [
+            1529395.2,
+            1529342.72,
+            1529386.56
+          ],
+          "gc_collections": [
+            0,
+            0,
+            0
+          ],
+          "gc_ms": [
+            0,
+            0,
+            0
+          ]
+        },
+        "ea": {
+          "median_ns": 2341297.5,
+          "repeat_medians_ns": [
+            2164559.0,
+            2341297.5,
+            2454189.0
+          ],
+          "late_over_early": [
+            1.1007478463050961,
+            1.0042727112081715,
+            1.0101828333494962
+          ],
+          "warmup_tail_ns": [
+            2075428,
+            2361971,
+            1989712
+          ],
+          "compilation_ms": [
+            118,
+            98,
+            57
+          ],
+          "alloc_bytes_per_execution": [
+            1422022.24,
+            1448208.8,
+            1448924.32
+          ],
+          "gc_collections": [
+            1,
+            0,
+            0
+          ],
+          "gc_ms": [
+            2,
+            0,
+            0
+          ]
+        },
+        "valhalla": {
+          "median_ns": 2315191.5,
+          "repeat_medians_ns": [
+            2315191.5,
+            2269019.5,
+            2662559.0
+          ],
+          "late_over_early": [
+            1.0074093795111114,
+            0.999314877902552,
+            0.9927411216540717
+          ],
+          "warmup_tail_ns": [
+            2157774,
+            2239923,
+            2519737
+          ],
+          "compilation_ms": [
+            144,
+            89,
+            43
+          ],
+          "alloc_bytes_per_execution": [
+            1450612.96,
+            1449718.08,
+            1449643.2
+          ],
+          "gc_collections": [
+            0,
+            0,
+            0
+          ],
+          "gc_ms": [
+            0,
+            0,
+            0
+          ]
+        },
+        "go": {
+          "median_ns": 1909747.0,
+          "repeat_medians_ns": [
+            1690856.5,
+            1999529.0,
+            1909747.0
+          ],
+          "late_over_early": [
+            0.7299037491202145,
+            1.5344638677891689,
+            0.9931807680960147
+          ],
+          "warmup_tail_ns": [
+            1544724,
+            1971031,
+            1772409
+          ],
+          "compilation_ms": [
+            null,
+            null,
+            null
+          ],
+          "alloc_bytes_per_execution": [
+            287078.4,
+            287076.16,
+            287076.8
+          ],
+          "gc_collections": [
+            6,
+            6,
+            6
+          ],
+          "gc_ms": [
+            0.300805,
+            0.50671,
+            0.536211
+          ]
+        },
+        "rust": {
+          "median_ns": 1492746.5,
+          "repeat_medians_ns": [
+            1234054.0,
+            1696179.0,
+            1492746.5
+          ],
+          "late_over_early": [
+            1.0056927694397588,
+            0.8988172709986387,
+            0.9715477518457057
+          ],
+          "warmup_tail_ns": [
+            1234454,
+            1753766,
+            1498224
+          ],
+          "compilation_ms": [
+            null,
+            null,
+            null
+          ],
+          "alloc_bytes_per_execution": [
+            null,
+            null,
+            null
+          ],
+          "gc_collections": [
+            null,
+            null,
+            null
+          ],
+          "gc_ms": [
+            null,
+            null,
+            null
+          ]
+        }
+      },
+      "stable_over_go": 1.0835922245197924,
+      "stable_over_rust": 1.3862949938251405,
+      "ea_over_stable": 1.1313966406476894,
+      "valhalla_over_ea": 0.9888497724018412
+    },
+    {
+      "name": "cold_open",
+      "actors": {
+        "stable": {
+          "median_ns": 496985.0,
+          "repeat_medians_ns": [
+            535557.0,
+            467731.0,
+            496985.0
+          ],
+          "late_over_early": [
+            0.8350593178972389,
+            0.965307022117238,
+            1.0028716894689027
+          ],
+          "warmup_tail_ns": [
+            610796,
+            496298,
+            520993
+          ],
+          "compilation_ms": [
+            25,
+            29,
+            28
+          ],
+          "alloc_bytes_per_execution": [
+            360894.24,
+            360966.24,
+            360931.68
+          ],
+          "gc_collections": [
+            0,
+            0,
+            0
+          ],
+          "gc_ms": [
+            0,
+            0,
+            0
+          ]
+        },
+        "ea": {
+          "median_ns": 519914.5,
+          "repeat_medians_ns": [
+            519914.5,
+            531588.0,
+            507025.5
+          ],
+          "late_over_early": [
+            0.9880530311777744,
+            0.9932565866442042,
+            0.9845671866478217
+          ],
+          "warmup_tail_ns": [
+            544011,
+            567189,
+            536938
+          ],
+          "compilation_ms": [
+            55,
+            35,
+            34
+          ],
+          "alloc_bytes_per_execution": [
+            344269.6,
+            345168.16,
+            345337.28
+          ],
+          "gc_collections": [
+            0,
+            0,
+            0
+          ],
+          "gc_ms": [
+            0,
+            0,
+            0
+          ]
+        },
+        "valhalla": {
+          "median_ns": 546290.0,
+          "repeat_medians_ns": [
+            527556.0,
+            747792.5,
+            546290.0
+          ],
+          "late_over_early": [
+            0.9725965761589466,
+            1.313991394969305,
+            0.9797786652535042
+          ],
+          "warmup_tail_ns": [
+            624280,
+            781755,
+            579517
+          ],
+          "compilation_ms": [
+            30,
+            29,
+            69
+          ],
+          "alloc_bytes_per_execution": [
+            345016.0,
+            345516.32,
+            345431.84
+          ],
+          "gc_collections": [
+            0,
+            0,
+            0
+          ],
+          "gc_ms": [
+            0,
+            0,
+            0
+          ]
+        },
+        "go": {
+          "median_ns": 213935.5,
+          "repeat_medians_ns": [
+            241395.0,
+            213935.5,
+            211997.5
+          ],
+          "late_over_early": [
+            0.8726422025443719,
+            0.9856503956983832,
+            0.8161990571151666
+          ],
+          "warmup_tail_ns": [
+            228690,
+            252446,
+            206044
+          ],
+          "compilation_ms": [
+            null,
+            null,
+            null
+          ],
+          "alloc_bytes_per_execution": [
+            528958.08,
+            527490.08,
+            527731.04
+          ],
+          "gc_collections": [
+            12,
+            11,
+            11
+          ],
+          "gc_ms": [
+            0.771344,
+            0.711249,
+            0.414332
+          ]
+        },
+        "rust": {
+          "median_ns": 196940.5,
+          "repeat_medians_ns": [
+            196940.5,
+            186917.5,
+            229387.5
+          ],
+          "late_over_early": [
+            1.0016859766857862,
+            1.1027144284131767,
+            0.9937625776414407
+          ],
+          "warmup_tail_ns": [
+            193788,
+            301783,
+            229789
+          ],
+          "compilation_ms": [
+            null,
+            null,
+            null
+          ],
+          "alloc_bytes_per_execution": [
+            null,
+            null,
+            null
+          ],
+          "gc_collections": [
+            null,
+            null,
+            null
+          ],
+          "gc_ms": [
+            null,
+            null,
+            null
+          ]
+        }
+      },
+      "stable_over_go": 2.323059987706575,
+      "stable_over_rust": 2.523528679982025,
+      "ea_over_stable": 1.0461372073603832,
+      "valhalla_over_ea": 1.0507304566423903
+    }
+  ],
+  "process": {
+    "stable": {
+      "startup_median_ns": 76279776,
+      "startup_samples_ns": [
+        77075108,
+        80799006,
+        76220056,
+        80577300,
+        80068961,
+        77869757,
+        80138305,
+        75091826,
+        72954784,
+        76041258,
+        81362412,
+        71260993,
+        74056102,
+        76279776,
+        73543922
+      ],
+      "resources": [
+        {
+          "user_seconds": 38.76,
+          "system_seconds": 0.98,
+          "peak_rss_kib": 1671788,
+          "scope": "whole actor process including setup/warmup/all workloads"
+        },
+        {
+          "user_seconds": 38.68,
+          "system_seconds": 0.99,
+          "peak_rss_kib": 1662860,
+          "scope": "whole actor process including setup/warmup/all workloads"
+        },
+        {
+          "user_seconds": 38.63,
+          "system_seconds": 0.94,
+          "peak_rss_kib": 1661456,
+          "scope": "whole actor process including setup/warmup/all workloads"
+        }
+      ]
+    },
+    "ea": {
+      "startup_median_ns": 79968484,
+      "startup_samples_ns": [
+        90442952,
+        83961825,
+        78393759,
+        78294893,
+        75640567,
+        75661775,
+        79968484,
+        77055315,
+        75236213,
+        75935369,
+        84965926,
+        83774959,
+        82215164,
+        80104234,
+        80087995
+      ],
+      "resources": [
+        {
+          "user_seconds": 41.04,
+          "system_seconds": 0.96,
+          "peak_rss_kib": 1692744,
+          "scope": "whole actor process including setup/warmup/all workloads"
+        },
+        {
+          "user_seconds": 42.25,
+          "system_seconds": 0.89,
+          "peak_rss_kib": 1489820,
+          "scope": "whole actor process including setup/warmup/all workloads"
+        },
+        {
+          "user_seconds": 39.96,
+          "system_seconds": 1.01,
+          "peak_rss_kib": 1989524,
+          "scope": "whole actor process including setup/warmup/all workloads"
+        }
+      ]
+    },
+    "valhalla": {
+      "startup_median_ns": 82441599,
+      "startup_samples_ns": [
+        87894045,
+        81785556,
+        87927017,
+        82441599,
+        86170274,
+        85913700,
+        77671405,
+        78739191,
+        82081411,
+        81415706,
+        92465214,
+        86826876,
+        78525062,
+        77237417,
+        82539233
+      ],
+      "resources": [
+        {
+          "user_seconds": 42.74,
+          "system_seconds": 1.1,
+          "peak_rss_kib": 2060496,
+          "scope": "whole actor process including setup/warmup/all workloads"
+        },
+        {
+          "user_seconds": 43.5,
+          "system_seconds": 0.9,
+          "peak_rss_kib": 1421244,
+          "scope": "whole actor process including setup/warmup/all workloads"
+        },
+        {
+          "user_seconds": 41.56,
+          "system_seconds": 0.92,
+          "peak_rss_kib": 1476016,
+          "scope": "whole actor process including setup/warmup/all workloads"
+        }
+      ]
+    },
+    "go": {
+      "startup_median_ns": 1970310,
+      "startup_samples_ns": [
+        2480074,
+        1860501,
+        1806959,
+        1500665,
+        1623711,
+        2568554,
+        2288657,
+        1970310,
+        2073786,
+        1602439,
+        2279620,
+        2142215,
+        1728880,
+        2091530,
+        1499665
+      ],
+      "resources": [
+        {
+          "user_seconds": 9.39,
+          "system_seconds": 0.76,
+          "peak_rss_kib": 27656,
+          "scope": "whole actor process including setup/warmup/all workloads"
+        },
+        {
+          "user_seconds": 9.51,
+          "system_seconds": 0.72,
+          "peak_rss_kib": 26428,
+          "scope": "whole actor process including setup/warmup/all workloads"
+        },
+        {
+          "user_seconds": 9.42,
+          "system_seconds": 0.71,
+          "peak_rss_kib": 27412,
+          "scope": "whole actor process including setup/warmup/all workloads"
+        }
+      ]
+    },
+    "rust": {
+      "startup_median_ns": 1117399,
+      "startup_samples_ns": [
+        1618296,
+        1368248,
+        950793,
+        1281623,
+        1267787,
+        1371683,
+        1117399,
+        1020233,
+        1353741,
+        997703,
+        1327300,
+        1011445,
+        964962,
+        968173,
+        854105
+      ],
+      "resources": [
+        {
+          "user_seconds": 4.13,
+          "system_seconds": 0.07,
+          "peak_rss_kib": 15892,
+          "scope": "whole actor process including setup/warmup/all workloads"
+        },
+        {
+          "user_seconds": 4.06,
+          "system_seconds": 0.06,
+          "peak_rss_kib": 16444,
+          "scope": "whole actor process including setup/warmup/all workloads"
+        },
+        {
+          "user_seconds": 4.1,
+          "system_seconds": 0.06,
+          "peak_rss_kib": 16448,
+          "scope": "whole actor process including setup/warmup/all workloads"
+        }
+      ]
+    }
+  },
+  "retained": {
+    "stable": [
+      {
+        "name": "scalar",
+        "retained_before": 4208528,
+        "retained_live_database": 4325528,
+        "retained_after_close": 4279856
+      },
+      {
+        "name": "parallel_point",
+        "retained_before": 4315312,
+        "retained_live_database": 4375680,
+        "retained_after_close": 4289520
+      },
+      {
+        "name": "point",
+        "retained_before": 4383928,
+        "retained_live_database": 4480944,
+        "retained_after_close": 4394064
+      },
+      {
+        "name": "range",
+        "retained_before": 4390800,
+        "retained_live_database": 4538408,
+        "retained_after_close": 4372272
+      },
+      {
+        "name": "secondary",
+        "retained_before": 4441792,
+        "retained_live_database": 4667248,
+        "retained_after_close": 4412944
+      },
+      {
+        "name": "aggregate",
+        "retained_before": 4474816,
+        "retained_live_database": 7634304,
+        "retained_after_close": 4304472
+      },
+      {
+        "name": "join",
+        "retained_before": 4369968,
+        "retained_live_database": 7712040,
+        "retained_after_close": 4382032
+      },
+      {
+        "name": "sort",
+        "retained_before": 4472136,
+        "retained_live_database": 7760728,
+        "retained_after_close": 4427976
+      },
+      {
+        "name": "grouped",
+        "retained_before": 4521728,
+        "retained_live_database": 7716304,
+        "retained_after_close": 4383392
+      },
+      {
+        "name": "distinct",
+        "retained_before": 4476752,
+        "retained_live_database": 7741312,
+        "retained_after_close": 4409704
+      },
+      {
+        "name": "distinct_aggregate",
+        "retained_before": 4475008,
+        "retained_live_database": 7717600,
+        "retained_after_close": 4387704
+      },
+      {
+        "name": "window",
+        "retained_before": 4479040,
+        "retained_live_database": 7800024,
+        "retained_after_close": 4469472
+      },
+      {
+        "name": "ranking",
+        "retained_before": 4560688,
+        "retained_live_database": 7748648,
+        "retained_after_close": 4419072
+      },
+      {
+        "name": "text_filter",
+        "retained_before": 4484264,
+        "retained_live_database": 7775624,
+        "retained_after_close": 4442984
+      },
+      {
+        "name": "float_aggregate",
+        "retained_before": 4536344,
+        "retained_live_database": 7752336,
+        "retained_after_close": 4423320
+      },
+      {
+        "name": "decimal_aggregate",
+        "retained_before": 4513592,
+        "retained_live_database": 7753944,
+        "retained_after_close": 4425280
+      },
+      {
+        "name": "expression_projection",
+        "retained_before": 4515736,
+        "retained_live_database": 4638456,
+        "retained_after_close": 4475576
+      },
+      {
+        "name": "json",
+        "retained_before": 4539880,
+        "retained_live_database": 4686080,
+        "retained_after_close": 4523072
+      },
+      {
+        "name": "array",
+        "retained_before": 4614016,
+        "retained_live_database": 4754280,
+        "retained_after_close": 4590184
+      },
+      {
+        "name": "rollback",
+        "retained_before": 4655216,
+        "retained_live_database": 8058800,
+        "retained_after_close": 4621888
+      },
+      {
+        "name": "durable",
+        "retained_before": 4663808,
+        "retained_live_database": 8046496,
+        "retained_after_close": 4570360
+      },
+      {
+        "name": "text_rollback",
+        "retained_before": 4616400,
+        "retained_live_database": 8011632,
+        "retained_after_close": 4577008
+      },
+      {
+        "name": "text_durable",
+        "retained_before": 4643632,
+        "retained_live_database": 8051896,
+        "retained_after_close": 4575360
+      },
+      {
+        "name": "cold_open",
+        "retained_before": 4576632,
+        "retained_live_database": 8220040,
+        "retained_after_close": 8220040
+      }
+    ],
+    "ea": [
+      {
+        "name": "scalar",
+        "retained_before": 3577704,
+        "retained_live_database": 3689896,
+        "retained_after_close": 3644352
+      },
+      {
+        "name": "parallel_point",
+        "retained_before": 3678136,
+        "retained_live_database": 3741040,
+        "retained_after_close": 3660960
+      },
+      {
+        "name": "point",
+        "retained_before": 3749896,
+        "retained_live_database": 3845048,
+        "retained_after_close": 3764352
+      },
+      {
+        "name": "range",
+        "retained_before": 3753864,
+        "retained_live_database": 3905872,
+        "retained_after_close": 3749136
+      },
+      {
+        "name": "secondary",
+        "retained_before": 3817064,
+        "retained_live_database": 4015920,
+        "retained_after_close": 3784856
+      },
+      {
+        "name": "aggregate",
+        "retained_before": 3845224,
+        "retained_live_database": 6757048,
+        "retained_after_close": 3682120
+      },
+      {
+        "name": "join",
+        "retained_before": 3770904,
+        "retained_live_database": 6833032,
+        "retained_after_close": 3753992
+      },
+      {
+        "name": "sort",
+        "retained_before": 3844768,
+        "retained_live_database": 6879328,
+        "retained_after_close": 3804224
+      },
+      {
+        "name": "grouped",
+        "retained_before": 3867056,
+        "retained_live_database": 6838920,
+        "retained_after_close": 3763056
+      },
+      {
+        "name": "distinct",
+        "retained_before": 3850848,
+        "retained_live_database": 6862528,
+        "retained_after_close": 3787224
+      },
+      {
+        "name": "distinct_aggregate",
+        "retained_before": 3875624,
+        "retained_live_database": 6840136,
+        "retained_after_close": 3761792
+      },
+      {
+        "name": "window",
+        "retained_before": 3828128,
+        "retained_live_database": 6896712,
+        "retained_after_close": 3817920
+      },
+      {
+        "name": "ranking",
+        "retained_before": 3909008,
+        "retained_live_database": 6873256,
+        "retained_after_close": 3797296
+      },
+      {
+        "name": "text_filter",
+        "retained_before": 3859248,
+        "retained_live_database": 6898792,
+        "retained_after_close": 3820368
+      },
+      {
+        "name": "float_aggregate",
+        "retained_before": 3910896,
+        "retained_live_database": 6876808,
+        "retained_after_close": 3798784
+      },
+      {
+        "name": "decimal_aggregate",
+        "retained_before": 3889848,
+        "retained_live_database": 6878280,
+        "retained_after_close": 3803808
+      },
+      {
+        "name": "expression_projection",
+        "retained_before": 3891472,
+        "retained_live_database": 4005016,
+        "retained_after_close": 3850864
+      },
+      {
+        "name": "json",
+        "retained_before": 3914344,
+        "retained_live_database": 4048792,
+        "retained_after_close": 3895120
+      },
+      {
+        "name": "array",
+        "retained_before": 3980832,
+        "retained_live_database": 4112384,
+        "retained_after_close": 3955448
+      },
+      {
+        "name": "rollback",
+        "retained_before": 4045816,
+        "retained_live_database": 7178656,
+        "retained_after_close": 4015944
+      },
+      {
+        "name": "durable",
+        "retained_before": 4056696,
+        "retained_live_database": 7165296,
+        "retained_after_close": 3966384
+      },
+      {
+        "name": "text_rollback",
+        "retained_before": 4009248,
+        "retained_live_database": 7133568,
+        "retained_after_close": 3970480
+      },
+      {
+        "name": "text_durable",
+        "retained_before": 4011296,
+        "retained_live_database": 7147184,
+        "retained_after_close": 3947896
+      },
+      {
+        "name": "cold_open",
+        "retained_before": 3943480,
+        "retained_live_database": 7413472,
+        "retained_after_close": 7413472
+      }
+    ],
+    "valhalla": [
+      {
+        "name": "scalar",
+        "retained_before": 3601680,
+        "retained_live_database": 3717432,
+        "retained_after_close": 3671816
+      },
+      {
+        "name": "parallel_point",
+        "retained_before": 3703992,
+        "retained_live_database": 3765296,
+        "retained_after_close": 3685696
+      },
+      {
+        "name": "point",
+        "retained_before": 3774424,
+        "retained_live_database": 3869432,
+        "retained_after_close": 3789176
+      },
+      {
+        "name": "range",
+        "retained_before": 3781024,
+        "retained_live_database": 3926144,
+        "retained_after_close": 3772216
+      },
+      {
+        "name": "secondary",
+        "retained_before": 3837472,
+        "retained_live_database": 4036320,
+        "retained_after_close": 3801872
+      },
+      {
+        "name": "aggregate",
+        "retained_before": 3868144,
+        "retained_live_database": 6776640,
+        "retained_after_close": 3698320
+      },
+      {
+        "name": "join",
+        "retained_before": 3765088,
+        "retained_live_database": 6852672,
+        "retained_after_close": 3773632
+      },
+      {
+        "name": "sort",
+        "retained_before": 3862136,
+        "retained_live_database": 6874456,
+        "retained_after_close": 3795976
+      },
+      {
+        "name": "grouped",
+        "retained_before": 3887208,
+        "retained_live_database": 6858512,
+        "retained_after_close": 3782592
+      },
+      {
+        "name": "distinct",
+        "retained_before": 3870848,
+        "retained_live_database": 6882384,
+        "retained_after_close": 3807232
+      },
+      {
+        "name": "distinct_aggregate",
+        "retained_before": 3893264,
+        "retained_live_database": 6859824,
+        "retained_after_close": 3781480
+      },
+      {
+        "name": "window",
+        "retained_before": 3848032,
+        "retained_live_database": 6918456,
+        "retained_after_close": 3839672
+      },
+      {
+        "name": "ranking",
+        "retained_before": 3931088,
+        "retained_live_database": 6895112,
+        "retained_after_close": 3819160
+      },
+      {
+        "name": "text_filter",
+        "retained_before": 3883688,
+        "retained_live_database": 6920848,
+        "retained_after_close": 3845248
+      },
+      {
+        "name": "float_aggregate",
+        "retained_before": 3933336,
+        "retained_live_database": 6898640,
+        "retained_after_close": 3820328
+      },
+      {
+        "name": "decimal_aggregate",
+        "retained_before": 3911520,
+        "retained_live_database": 6900024,
+        "retained_after_close": 3825488
+      },
+      {
+        "name": "expression_projection",
+        "retained_before": 3913456,
+        "retained_live_database": 4027000,
+        "retained_after_close": 3873440
+      },
+      {
+        "name": "json",
+        "retained_before": 3936464,
+        "retained_live_database": 4071872,
+        "retained_after_close": 3918232
+      },
+      {
+        "name": "array",
+        "retained_before": 4006704,
+        "retained_live_database": 4135984,
+        "retained_after_close": 3978752
+      },
+      {
+        "name": "rollback",
+        "retained_before": 4069760,
+        "retained_live_database": 7178016,
+        "retained_after_close": 4011856
+      },
+      {
+        "name": "durable",
+        "retained_before": 4055960,
+        "retained_live_database": 7190000,
+        "retained_after_close": 3989568
+      },
+      {
+        "name": "text_rollback",
+        "retained_before": 4032680,
+        "retained_live_database": 7158400,
+        "retained_after_close": 3990512
+      },
+      {
+        "name": "text_durable",
+        "retained_before": 4034776,
+        "retained_live_database": 7170520,
+        "retained_after_close": 3967760
+      },
+      {
+        "name": "cold_open",
+        "retained_before": 3966384,
+        "retained_live_database": 7466408,
+        "retained_after_close": 7466352
+      }
+    ]
+  },
+  "median_method": "Conventional sample median (mean of the middle pair for even counts), followed by median across three process medians; raw driver summary uses upper medians and is retained unchanged.",
+  "measurement_interpretation": "Shared-host bounded-warmup diagnostic; no idle-host or converged steady-state claim. See context-summary.json and BENCHMARKS.md.",
+  "correctness": {
+    "timed_actor_runs": 15,
+    "cases_per_run": 24,
+    "mismatches": [],
+    "retained_records": 72
+  }
+}

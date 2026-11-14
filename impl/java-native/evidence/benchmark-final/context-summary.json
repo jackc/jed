@@ -1,0 +1,1261 @@
+{
+  "scope": "Five-second process CPU/I/O sampling; excludes named actor processes; names alone do not establish ownership. Short-lived processes and new/exited CPU intervals may be missed. No proof of isolation.",
+  "sample_count": 61,
+  "evidence_start": "2026-11-14T23:41:27Z",
+  "evidence_complete": "2026-11-14T23:46:33Z",
+  "jvms": [
+    {
+      "event": "jvm_seen",
+      "utc": "2026-11-14T23:41:20.199086+00:00",
+      "pid": 2890283,
+      "name": "javac",
+      "ppid": 2890055,
+      "start_ticks": 236642233,
+      "cpu_ticks": 500,
+      "read_bytes": 0,
+      "write_bytes": 8192,
+      "cwd": "/home/jack/.codex/worktrees/3926/jed",
+      "executable": "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/jdks/openjdk-28-ea+24/bin/javac",
+      "stdout": "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/benchmark-final.log",
+      "stderr": "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/benchmark-final.log",
+      "jed_main_classes": [],
+      "ancestors": [
+        {
+          "pid": 2890055,
+          "name": "ruby",
+          "ppid": 2889994,
+          "start_ticks": 236641846,
+          "cpu_ticks": 23,
+          "cwd": "/home/jack/.codex/worktrees/3926/jed",
+          "executable": "/home/jack/.local/share/mise/installs/ruby/4.0.7/bin/ruby",
+          "stdout": "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/benchmark-final.log"
+        },
+        {
+          "pid": 2889994,
+          "name": "mise",
+          "ppid": 164340,
+          "start_ticks": 236641838,
+          "cpu_ticks": 4,
+          "cwd": "/home/jack/.codex/worktrees/3926/jed",
+          "executable": "/home/jack/.local/bin/mise",
+          "stdout": "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/benchmark-final.log"
+        },
+        {
+          "pid": 164340,
+          "name": "codex",
+          "ppid": 1,
+          "start_ticks": 8461,
+          "cpu_ticks": 978139,
+          "cwd": "/home/jack",
+          "executable": "/home/jack/.codex/packages/standalone/releases/0.159.2-x86_64-unknown-linux-musl/bin/codex",
+          "stdout": "/home/jack/.codex/app-server-control/app-server.log"
+        }
+      ]
+    },
+    {
+      "event": "jvm_seen",
+      "utc": "2026-11-14T23:41:25.210339+00:00",
+      "pid": 2890530,
+      "name": "javac",
+      "ppid": 2890055,
+      "start_ticks": 236642585,
+      "cpu_ticks": 1571,
+      "read_bytes": 4096,
+      "write_bytes": 5324800,
+      "cwd": "/home/jack/.codex/worktrees/3926/jed",
+      "executable": "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/jdks/openjdk-28-ea+24/bin/javac",
+      "stdout": "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/benchmark-final.log",
+      "stderr": "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/benchmark-final.log",
+      "jed_main_classes": [],
+      "ancestors": [
+        {
+          "pid": 2890055,
+          "name": "ruby",
+          "ppid": 2889994,
+          "start_ticks": 236641846,
+          "cpu_ticks": 39,
+          "cwd": "/home/jack/.codex/worktrees/3926/jed",
+          "executable": "/home/jack/.local/share/mise/installs/ruby/4.0.7/bin/ruby",
+          "stdout": "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/benchmark-final.log"
+        },
+        {
+          "pid": 2889994,
+          "name": "mise",
+          "ppid": 164340,
+          "start_ticks": 236641838,
+          "cpu_ticks": 4,
+          "cwd": "/home/jack/.codex/worktrees/3926/jed",
+          "executable": "/home/jack/.local/bin/mise",
+          "stdout": "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/benchmark-final.log"
+        },
+        {
+          "pid": 164340,
+          "name": "codex",
+          "ppid": 1,
+          "start_ticks": 8461,
+          "cpu_ticks": 978142,
+          "cwd": "/home/jack",
+          "executable": "/home/jack/.codex/packages/standalone/releases/0.159.2-x86_64-unknown-linux-musl/bin/codex",
+          "stdout": "/home/jack/.codex/app-server-control/app-server.log"
+        }
+      ]
+    },
+    {
+      "event": "jvm_seen",
+      "utc": "2026-11-14T23:41:30.221552+00:00",
+      "pid": 2891063,
+      "name": "java",
+      "ppid": 2891059,
+      "start_ticks": 236643123,
+      "cpu_ticks": 742,
+      "read_bytes": 0,
+      "write_bytes": 6594560,
+      "cwd": "/home/jack/.codex/worktrees/3926/jed",
+      "executable": "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/jdks/temurin-25.0.5+8/bin/java",
+      "stdout": "pipe:[466313748]",
+      "stderr": "pipe:[466313749]",
+      "jed_main_classes": [
+        "org.jed.PerformanceDiagnostics"
+      ],
+      "ancestors": [
+        {
+          "pid": 2891059,
+          "name": "time",
+          "ppid": 2890055,
+          "start_ticks": 236643122,
+          "cpu_ticks": 0,
+          "cwd": "/home/jack/.codex/worktrees/3926/jed",
+          "executable": "/usr/bin/time",
+          "stdout": "pipe:[466313748]"
+        },
+        {
+          "pid": 2890055,
+          "name": "ruby",
+          "ppid": 2889994,
+          "start_ticks": 236641846,
+          "cpu_ticks": 58,
+          "cwd": "/home/jack/.codex/worktrees/3926/jed",
+          "executable": "/home/jack/.local/share/mise/installs/ruby/4.0.7/bin/ruby",
+          "stdout": "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/benchmark-final.log"
+        },
+        {
+          "pid": 2889994,
+          "name": "mise",
+          "ppid": 164340,
+          "start_ticks": 236641838,
+          "cpu_ticks": 4,
+          "cwd": "/home/jack/.codex/worktrees/3926/jed",
+          "executable": "/home/jack/.local/bin/mise",
+          "stdout": "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/benchmark-final.log"
+        },
+        {
+          "pid": 164340,
+          "name": "codex",
+          "ppid": 1,
+          "start_ticks": 8461,
+          "cpu_ticks": 978146,
+          "cwd": "/home/jack",
+          "executable": "/home/jack/.codex/packages/standalone/releases/0.159.2-x86_64-unknown-linux-musl/bin/codex",
+          "stdout": "/home/jack/.codex/app-server-control/app-server.log"
+        }
+      ]
+    },
+    {
+      "event": "jvm_seen",
+      "utc": "2026-11-14T23:41:50.272351+00:00",
+      "pid": 2892856,
+      "name": "java",
+      "ppid": 2892852,
+      "start_ticks": 236645205,
+      "cpu_ticks": 473,
+      "read_bytes": 0,
+      "write_bytes": 3244032,
+      "cwd": "/home/jack/.codex/worktrees/3926/jed",
+      "executable": "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/jdks/openjdk-28-ea+24/bin/java",
+      "stdout": "pipe:[466335375]",
+      "stderr": "pipe:[466335376]",
+      "jed_main_classes": [
+        "org.jed.PerformanceDiagnostics"
+      ],
+      "ancestors": [
+        {
+          "pid": 2892852,
+          "name": "time",
+          "ppid": 2890055,
+          "start_ticks": 236645205,
+          "cpu_ticks": 0,
+          "cwd": "/home/jack/.codex/worktrees/3926/jed",
+          "executable": "/usr/bin/time",
+          "stdout": "pipe:[466335375]"
+        },
+        {
+          "pid": 2890055,
+          "name": "ruby",
+          "ppid": 2889994,
+          "start_ticks": 236641846,
+          "cpu_ticks": 59,
+          "cwd": "/home/jack/.codex/worktrees/3926/jed",
+          "executable": "/home/jack/.local/share/mise/installs/ruby/4.0.7/bin/ruby",
+          "stdout": "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/benchmark-final.log"
+        },
+        {
+          "pid": 2889994,
+          "name": "mise",
+          "ppid": 164340,
+          "start_ticks": 236641838,
+          "cpu_ticks": 4,
+          "cwd": "/home/jack/.codex/worktrees/3926/jed",
+          "executable": "/home/jack/.local/bin/mise",
+          "stdout": "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/benchmark-final.log"
+        },
+        {
+          "pid": 164340,
+          "name": "codex",
+          "ppid": 1,
+          "start_ticks": 8461,
+          "cpu_ticks": 978170,
+          "cwd": "/home/jack",
+          "executable": "/home/jack/.codex/packages/standalone/releases/0.159.2-x86_64-unknown-linux-musl/bin/codex",
+          "stdout": "/home/jack/.codex/app-server-control/app-server.log"
+        }
+      ]
+    },
+    {
+      "event": "jvm_seen",
+      "utc": "2026-11-14T23:42:15.335566+00:00",
+      "pid": 2894325,
+      "name": "java",
+      "ppid": 2894321,
+      "start_ticks": 236647385,
+      "cpu_ticks": 1470,
+      "read_bytes": 0,
+      "write_bytes": 11354112,
+      "cwd": "/home/jack/.codex/worktrees/3926/jed",
+      "executable": "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/jdks/openjdk-28-ea+24/bin/java",
+      "stdout": "pipe:[466335444]",
+      "stderr": "pipe:[466335445]",
+      "jed_main_classes": [
+        "org.jed.PerformanceDiagnostics"
+      ],
+      "ancestors": [
+        {
+          "pid": 2894321,
+          "name": "time",
+          "ppid": 2890055,
+          "start_ticks": 236647385,
+          "cpu_ticks": 0,
+          "cwd": "/home/jack/.codex/worktrees/3926/jed",
+          "executable": "/usr/bin/time",
+          "stdout": "pipe:[466335444]"
+        },
+        {
+          "pid": 2890055,
+          "name": "ruby",
+          "ppid": 2889994,
+          "start_ticks": 236641846,
+          "cpu_ticks": 59,
+          "cwd": "/home/jack/.codex/worktrees/3926/jed",
+          "executable": "/home/jack/.local/share/mise/installs/ruby/4.0.7/bin/ruby",
+          "stdout": "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/benchmark-final.log"
+        },
+        {
+          "pid": 2889994,
+          "name": "mise",
+          "ppid": 164340,
+          "start_ticks": 236641838,
+          "cpu_ticks": 4,
+          "cwd": "/home/jack/.codex/worktrees/3926/jed",
+          "executable": "/home/jack/.local/bin/mise",
+          "stdout": "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/benchmark-final.log"
+        },
+        {
+          "pid": 164340,
+          "name": "codex",
+          "ppid": 1,
+          "start_ticks": 8461,
+          "cpu_ticks": 978175,
+          "cwd": "/home/jack",
+          "executable": "/home/jack/.codex/packages/standalone/releases/0.159.2-x86_64-unknown-linux-musl/bin/codex",
+          "stdout": "/home/jack/.codex/app-server-control/app-server.log"
+        }
+      ]
+    },
+    {
+      "event": "jvm_seen",
+      "utc": "2026-11-14T23:42:50.435647+00:00",
+      "pid": 2897151,
+      "name": "java",
+      "ppid": 2897147,
+      "start_ticks": 236650951,
+      "cpu_ticks": 1382,
+      "read_bytes": 0,
+      "write_bytes": 11354112,
+      "cwd": "/home/jack/.codex/worktrees/3926/jed",
+      "executable": "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/jdks/openjdk-28-ea+24/bin/java",
+      "stdout": "pipe:[466337702]",
+      "stderr": "pipe:[466337703]",
+      "jed_main_classes": [
+        "org.jed.PerformanceDiagnostics"
+      ],
+      "ancestors": [
+        {
+          "pid": 2897147,
+          "name": "time",
+          "ppid": 2890055,
+          "start_ticks": 236650951,
+          "cpu_ticks": 0,
+          "cwd": "/home/jack/.codex/worktrees/3926/jed",
+          "executable": "/usr/bin/time",
+          "stdout": "pipe:[466337702]"
+        },
+        {
+          "pid": 2890055,
+          "name": "ruby",
+          "ppid": 2889994,
+          "start_ticks": 236641846,
+          "cpu_ticks": 63,
+          "cwd": "/home/jack/.codex/worktrees/3926/jed",
+          "executable": "/home/jack/.local/share/mise/installs/ruby/4.0.7/bin/ruby",
+          "stdout": "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/benchmark-final.log"
+        },
+        {
+          "pid": 2889994,
+          "name": "mise",
+          "ppid": 164340,
+          "start_ticks": 236641838,
+          "cpu_ticks": 4,
+          "cwd": "/home/jack/.codex/worktrees/3926/jed",
+          "executable": "/home/jack/.local/bin/mise",
+          "stdout": "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/benchmark-final.log"
+        },
+        {
+          "pid": 164340,
+          "name": "codex",
+          "ppid": 1,
+          "start_ticks": 8461,
+          "cpu_ticks": 978199,
+          "cwd": "/home/jack",
+          "executable": "/home/jack/.codex/packages/standalone/releases/0.159.2-x86_64-unknown-linux-musl/bin/codex",
+          "stdout": "/home/jack/.codex/app-server-control/app-server.log"
+        }
+      ]
+    },
+    {
+      "event": "jvm_seen",
+      "utc": "2026-11-14T23:43:10.491896+00:00",
+      "pid": 2898717,
+      "name": "java",
+      "ppid": 2898713,
+      "start_ticks": 236653146,
+      "cpu_ticks": 836,
+      "read_bytes": 0,
+      "write_bytes": 6488064,
+      "cwd": "/home/jack/.codex/worktrees/3926/jed",
+      "executable": "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/jdks/openjdk-28-ea+24/bin/java",
+      "stdout": "pipe:[466342549]",
+      "stderr": "pipe:[466342550]",
+      "jed_main_classes": [
+        "org.jed.PerformanceDiagnostics"
+      ],
+      "ancestors": [
+        {
+          "pid": 2898713,
+          "name": "time",
+          "ppid": 2890055,
+          "start_ticks": 236653146,
+          "cpu_ticks": 0,
+          "cwd": "/home/jack/.codex/worktrees/3926/jed",
+          "executable": "/usr/bin/time",
+          "stdout": "pipe:[466342549]"
+        },
+        {
+          "pid": 2890055,
+          "name": "ruby",
+          "ppid": 2889994,
+          "start_ticks": 236641846,
+          "cpu_ticks": 64,
+          "cwd": "/home/jack/.codex/worktrees/3926/jed",
+          "executable": "/home/jack/.local/share/mise/installs/ruby/4.0.7/bin/ruby",
+          "stdout": "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/benchmark-final.log"
+        },
+        {
+          "pid": 2889994,
+          "name": "mise",
+          "ppid": 164340,
+          "start_ticks": 236641838,
+          "cpu_ticks": 4,
+          "cwd": "/home/jack/.codex/worktrees/3926/jed",
+          "executable": "/home/jack/.local/bin/mise",
+          "stdout": "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/benchmark-final.log"
+        },
+        {
+          "pid": 164340,
+          "name": "codex",
+          "ppid": 1,
+          "start_ticks": 8461,
+          "cpu_ticks": 978230,
+          "cwd": "/home/jack",
+          "executable": "/home/jack/.codex/packages/standalone/releases/0.159.2-x86_64-unknown-linux-musl/bin/codex",
+          "stdout": "/home/jack/.codex/app-server-control/app-server.log"
+        }
+      ]
+    },
+    {
+      "event": "jvm_seen",
+      "utc": "2026-11-14T23:43:45.573451+00:00",
+      "pid": 2901420,
+      "name": "java",
+      "ppid": 2901416,
+      "start_ticks": 236656745,
+      "cpu_ticks": 403,
+      "read_bytes": 0,
+      "write_bytes": 3244032,
+      "cwd": "/home/jack/.codex/worktrees/3926/jed",
+      "executable": "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/jdks/temurin-25.0.5+8/bin/java",
+      "stdout": "pipe:[466342764]",
+      "stderr": "pipe:[466342765]",
+      "jed_main_classes": [
+        "org.jed.PerformanceDiagnostics"
+      ],
+      "ancestors": [
+        {
+          "pid": 2901416,
+          "name": "time",
+          "ppid": 2890055,
+          "start_ticks": 236656745,
+          "cpu_ticks": 0,
+          "cwd": "/home/jack/.codex/worktrees/3926/jed",
+          "executable": "/usr/bin/time",
+          "stdout": "pipe:[466342764]"
+        },
+        {
+          "pid": 2890055,
+          "name": "ruby",
+          "ppid": 2889994,
+          "start_ticks": 236641846,
+          "cpu_ticks": 68,
+          "cwd": "/home/jack/.codex/worktrees/3926/jed",
+          "executable": "/home/jack/.local/share/mise/installs/ruby/4.0.7/bin/ruby",
+          "stdout": "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/benchmark-final.log"
+        },
+        {
+          "pid": 2889994,
+          "name": "mise",
+          "ppid": 164340,
+          "start_ticks": 236641838,
+          "cpu_ticks": 4,
+          "cwd": "/home/jack/.codex/worktrees/3926/jed",
+          "executable": "/home/jack/.local/bin/mise",
+          "stdout": "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/benchmark-final.log"
+        },
+        {
+          "pid": 164340,
+          "name": "codex",
+          "ppid": 1,
+          "start_ticks": 8461,
+          "cpu_ticks": 978240,
+          "cwd": "/home/jack",
+          "executable": "/home/jack/.codex/packages/standalone/releases/0.159.2-x86_64-unknown-linux-musl/bin/codex",
+          "stdout": "/home/jack/.codex/app-server-control/app-server.log"
+        }
+      ]
+    },
+    {
+      "event": "jvm_seen",
+      "utc": "2026-11-14T23:44:10.640751+00:00",
+      "pid": 2902820,
+      "name": "java",
+      "ppid": 2902816,
+      "start_ticks": 236658937,
+      "cpu_ticks": 1437,
+      "read_bytes": 0,
+      "write_bytes": 11354112,
+      "cwd": "/home/jack/.codex/worktrees/3926/jed",
+      "executable": "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/jdks/openjdk-28-ea+24/bin/java",
+      "stdout": "pipe:[466342859]",
+      "stderr": "pipe:[466342860]",
+      "jed_main_classes": [
+        "org.jed.PerformanceDiagnostics"
+      ],
+      "ancestors": [
+        {
+          "pid": 2902816,
+          "name": "time",
+          "ppid": 2890055,
+          "start_ticks": 236658937,
+          "cpu_ticks": 0,
+          "cwd": "/home/jack/.codex/worktrees/3926/jed",
+          "executable": "/usr/bin/time",
+          "stdout": "pipe:[466342859]"
+        },
+        {
+          "pid": 2890055,
+          "name": "ruby",
+          "ppid": 2889994,
+          "start_ticks": 236641846,
+          "cpu_ticks": 69,
+          "cwd": "/home/jack/.codex/worktrees/3926/jed",
+          "executable": "/home/jack/.local/share/mise/installs/ruby/4.0.7/bin/ruby",
+          "stdout": "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/benchmark-final.log"
+        },
+        {
+          "pid": 2889994,
+          "name": "mise",
+          "ppid": 164340,
+          "start_ticks": 236641838,
+          "cpu_ticks": 4,
+          "cwd": "/home/jack/.codex/worktrees/3926/jed",
+          "executable": "/home/jack/.local/bin/mise",
+          "stdout": "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/benchmark-final.log"
+        },
+        {
+          "pid": 164340,
+          "name": "codex",
+          "ppid": 1,
+          "start_ticks": 8461,
+          "cpu_ticks": 978247,
+          "cwd": "/home/jack",
+          "executable": "/home/jack/.codex/packages/standalone/releases/0.159.2-x86_64-unknown-linux-musl/bin/codex",
+          "stdout": "/home/jack/.codex/app-server-control/app-server.log"
+        }
+      ]
+    },
+    {
+      "event": "jvm_seen",
+      "utc": "2026-11-14T23:44:45.745179+00:00",
+      "pid": 2905590,
+      "name": "java",
+      "ppid": 2905586,
+      "start_ticks": 236662566,
+      "cpu_ticks": 1028,
+      "read_bytes": 0,
+      "write_bytes": 9732096,
+      "cwd": "/home/jack/.codex/worktrees/3926/jed",
+      "executable": "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/jdks/temurin-25.0.5+8/bin/java",
+      "stdout": "pipe:[466361447]",
+      "stderr": "pipe:[466361448]",
+      "jed_main_classes": [
+        "org.jed.PerformanceDiagnostics"
+      ],
+      "ancestors": [
+        {
+          "pid": 2905586,
+          "name": "time",
+          "ppid": 2890055,
+          "start_ticks": 236662566,
+          "cpu_ticks": 0,
+          "cwd": "/home/jack/.codex/worktrees/3926/jed",
+          "executable": "/usr/bin/time",
+          "stdout": "pipe:[466361447]"
+        },
+        {
+          "pid": 2890055,
+          "name": "ruby",
+          "ppid": 2889994,
+          "start_ticks": 236641846,
+          "cpu_ticks": 73,
+          "cwd": "/home/jack/.codex/worktrees/3926/jed",
+          "executable": "/home/jack/.local/share/mise/installs/ruby/4.0.7/bin/ruby",
+          "stdout": "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/benchmark-final.log"
+        },
+        {
+          "pid": 2889994,
+          "name": "mise",
+          "ppid": 164340,
+          "start_ticks": 236641838,
+          "cpu_ticks": 4,
+          "cwd": "/home/jack/.codex/worktrees/3926/jed",
+          "executable": "/home/jack/.local/bin/mise",
+          "stdout": "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/benchmark-final.log"
+        },
+        {
+          "pid": 164340,
+          "name": "codex",
+          "ppid": 1,
+          "start_ticks": 8461,
+          "cpu_ticks": 978282,
+          "cwd": "/home/jack",
+          "executable": "/home/jack/.codex/packages/standalone/releases/0.159.2-x86_64-unknown-linux-musl/bin/codex",
+          "stdout": "/home/jack/.codex/app-server-control/app-server.log"
+        }
+      ]
+    },
+    {
+      "event": "jvm_seen",
+      "utc": "2026-11-14T23:45:05.799975+00:00",
+      "pid": 2907023,
+      "name": "java",
+      "ppid": 2907019,
+      "start_ticks": 236664745,
+      "cpu_ticks": 590,
+      "read_bytes": 0,
+      "write_bytes": 3244032,
+      "cwd": "/home/jack/.codex/worktrees/3926/jed",
+      "executable": "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/jdks/openjdk-28-ea+24/bin/java",
+      "stdout": "pipe:[466354598]",
+      "stderr": "pipe:[466354599]",
+      "jed_main_classes": [
+        "org.jed.PerformanceDiagnostics"
+      ],
+      "ancestors": [
+        {
+          "pid": 2907019,
+          "name": "time",
+          "ppid": 2890055,
+          "start_ticks": 236664745,
+          "cpu_ticks": 0,
+          "cwd": "/home/jack/.codex/worktrees/3926/jed",
+          "executable": "/usr/bin/time",
+          "stdout": "pipe:[466354598]"
+        },
+        {
+          "pid": 2890055,
+          "name": "ruby",
+          "ppid": 2889994,
+          "start_ticks": 236641846,
+          "cpu_ticks": 75,
+          "cwd": "/home/jack/.codex/worktrees/3926/jed",
+          "executable": "/home/jack/.local/share/mise/installs/ruby/4.0.7/bin/ruby",
+          "stdout": "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/benchmark-final.log"
+        },
+        {
+          "pid": 2889994,
+          "name": "mise",
+          "ppid": 164340,
+          "start_ticks": 236641838,
+          "cpu_ticks": 4,
+          "cwd": "/home/jack/.codex/worktrees/3926/jed",
+          "executable": "/home/jack/.local/bin/mise",
+          "stdout": "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/benchmark-final.log"
+        },
+        {
+          "pid": 164340,
+          "name": "codex",
+          "ppid": 1,
+          "start_ticks": 8461,
+          "cpu_ticks": 978305,
+          "cwd": "/home/jack",
+          "executable": "/home/jack/.codex/packages/standalone/releases/0.159.2-x86_64-unknown-linux-musl/bin/codex",
+          "stdout": "/home/jack/.codex/app-server-control/app-server.log"
+        }
+      ]
+    },
+    {
+      "event": "jvm_seen",
+      "utc": "2026-11-14T23:45:30.877202+00:00",
+      "pid": 2908307,
+      "name": "java",
+      "ppid": 2890055,
+      "start_ticks": 236666906,
+      "cpu_ticks": 1340,
+      "read_bytes": 0,
+      "write_bytes": 11354112,
+      "cwd": "/home/jack/.codex/worktrees/3926/jed",
+      "executable": "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/jdks/temurin-25.0.5+8/bin/java",
+      "stdout": "pipe:[466360180]",
+      "stderr": "pipe:[466360181]",
+      "jed_main_classes": [
+        "org.jed.PerformanceDiagnostics"
+      ],
+      "ancestors": [
+        {
+          "pid": 2890055,
+          "name": "ruby",
+          "ppid": 2889994,
+          "start_ticks": 236641846,
+          "cpu_ticks": 99,
+          "cwd": "/home/jack/.codex/worktrees/3926/jed",
+          "executable": "/home/jack/.local/share/mise/installs/ruby/4.0.7/bin/ruby",
+          "stdout": "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/benchmark-final.log"
+        },
+        {
+          "pid": 2889994,
+          "name": "mise",
+          "ppid": 164340,
+          "start_ticks": 236641838,
+          "cpu_ticks": 4,
+          "cwd": "/home/jack/.codex/worktrees/3926/jed",
+          "executable": "/home/jack/.local/bin/mise",
+          "stdout": "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/benchmark-final.log"
+        },
+        {
+          "pid": 164340,
+          "name": "codex",
+          "ppid": 1,
+          "start_ticks": 8461,
+          "cpu_ticks": 978334,
+          "cwd": "/home/jack",
+          "executable": "/home/jack/.codex/packages/standalone/releases/0.159.2-x86_64-unknown-linux-musl/bin/codex",
+          "stdout": "/home/jack/.codex/app-server-control/app-server.log"
+        }
+      ]
+    },
+    {
+      "event": "jvm_seen",
+      "utc": "2026-11-14T23:45:50.936831+00:00",
+      "pid": 2909703,
+      "name": "java",
+      "ppid": 2890055,
+      "start_ticks": 236669279,
+      "cpu_ticks": 386,
+      "read_bytes": 0,
+      "write_bytes": 3162112,
+      "cwd": "/home/jack/.codex/worktrees/3926/jed",
+      "executable": "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/jdks/openjdk-28-ea+24/bin/java",
+      "stdout": "pipe:[466369624]",
+      "stderr": "pipe:[466369625]",
+      "jed_main_classes": [
+        "org.jed.PerformanceDiagnostics"
+      ],
+      "ancestors": [
+        {
+          "pid": 2890055,
+          "name": "ruby",
+          "ppid": 2889994,
+          "start_ticks": 236641846,
+          "cpu_ticks": 99,
+          "cwd": "/home/jack/.codex/worktrees/3926/jed",
+          "executable": "/home/jack/.local/share/mise/installs/ruby/4.0.7/bin/ruby",
+          "stdout": "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/benchmark-final.log"
+        },
+        {
+          "pid": 2889994,
+          "name": "mise",
+          "ppid": 164340,
+          "start_ticks": 236641838,
+          "cpu_ticks": 4,
+          "cwd": "/home/jack/.codex/worktrees/3926/jed",
+          "executable": "/home/jack/.local/bin/mise",
+          "stdout": "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/benchmark-final.log"
+        },
+        {
+          "pid": 164340,
+          "name": "codex",
+          "ppid": 1,
+          "start_ticks": 8461,
+          "cpu_ticks": 978340,
+          "cwd": "/home/jack",
+          "executable": "/home/jack/.codex/packages/standalone/releases/0.159.2-x86_64-unknown-linux-musl/bin/codex",
+          "stdout": "/home/jack/.codex/app-server-control/app-server.log"
+        }
+      ]
+    },
+    {
+      "event": "jvm_seen",
+      "utc": "2026-11-14T23:46:16.016078+00:00",
+      "pid": 2911026,
+      "name": "java",
+      "ppid": 2890055,
+      "start_ticks": 236671494,
+      "cpu_ticks": 1399,
+      "read_bytes": 0,
+      "write_bytes": 11354112,
+      "cwd": "/home/jack/.codex/worktrees/3926/jed",
+      "executable": "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/jdks/openjdk-28-ea+24/bin/java",
+      "stdout": "pipe:[466310134]",
+      "stderr": "pipe:[466310135]",
+      "jed_main_classes": [
+        "org.jed.PerformanceDiagnostics"
+      ],
+      "ancestors": [
+        {
+          "pid": 2890055,
+          "name": "ruby",
+          "ppid": 2889994,
+          "start_ticks": 236641846,
+          "cpu_ticks": 99,
+          "cwd": "/home/jack/.codex/worktrees/3926/jed",
+          "executable": "/home/jack/.local/share/mise/installs/ruby/4.0.7/bin/ruby",
+          "stdout": "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/benchmark-final.log"
+        },
+        {
+          "pid": 2889994,
+          "name": "mise",
+          "ppid": 164340,
+          "start_ticks": 236641838,
+          "cpu_ticks": 4,
+          "cwd": "/home/jack/.codex/worktrees/3926/jed",
+          "executable": "/home/jack/.local/bin/mise",
+          "stdout": "/home/jack/.codex/worktrees/3926/jed/.dev/java-native/benchmark-final.log"
+        },
+        {
+          "pid": 164340,
+          "name": "codex",
+          "ppid": 1,
+          "start_ticks": 8461,
+          "cpu_ticks": 978362,
+          "cwd": "/home/jack",
+          "executable": "/home/jack/.codex/packages/standalone/releases/0.159.2-x86_64-unknown-linux-musl/bin/codex",
+          "stdout": "/home/jack/.codex/app-server-control/app-server.log"
+        }
+      ]
+    }
+  ],
+  "unknown_java_intervals": [],
+  "overlapping_java_intervals": [],
+  "background_cpu_percent_of_one_core": {
+    "median": 103.78,
+    "max": 150.66
+  },
+  "background": {
+    "ruby": {
+      "samples": 18,
+      "first": "2026-11-14T23:41:30.222066+00:00",
+      "last": "2026-11-14T23:46:16.016581+00:00",
+      "pids": [
+        2890055
+      ],
+      "median_cpu_percent": 0.2,
+      "max_cpu_percent": 4.78,
+      "read_bytes": 94208,
+      "write_bytes": 1627029504
+    },
+    "2.1.325-1ef04b3": {
+      "samples": 177,
+      "first": "2026-11-14T23:41:30.222066+00:00",
+      "last": "2026-11-14T23:46:31.061090+00:00",
+      "pids": [
+        165491,
+        732176,
+        1828388,
+        2223022,
+        2234163,
+        3066853,
+        3084298,
+        3089864,
+        3091664,
+        3375458
+      ],
+      "median_cpu_percent": 0.6,
+      "max_cpu_percent": 4.99,
+      "read_bytes": 125521920,
+      "write_bytes": 45588480
+    },
+    "codex": {
+      "samples": 41,
+      "first": "2026-11-14T23:41:30.222066+00:00",
+      "last": "2026-11-14T23:46:26.048771+00:00",
+      "pids": [
+        164340
+      ],
+      "median_cpu_percent": 0.8,
+      "max_cpu_percent": 3.39,
+      "read_bytes": 0,
+      "write_bytes": 24268800
+    },
+    "2.1.321-3fb3e65": {
+      "samples": 170,
+      "first": "2026-11-14T23:41:30.222066+00:00",
+      "last": "2026-11-14T23:46:31.061090+00:00",
+      "pids": [
+        411460,
+        415535,
+        469621,
+        531042,
+        744136,
+        2132002,
+        2144240,
+        3268993,
+        3557301,
+        3693916
+      ],
+      "median_cpu_percent": 0.6,
+      "max_cpu_percent": 1.2,
+      "read_bytes": 0,
+      "write_bytes": 0
+    },
+    "tailscaled": {
+      "samples": 6,
+      "first": "2026-11-14T23:41:30.222066+00:00",
+      "last": "2026-11-14T23:46:31.061090+00:00",
+      "pids": [
+        2718
+      ],
+      "median_cpu_percent": 0.6,
+      "max_cpu_percent": 0.8,
+      "read_bytes": 0,
+      "write_bytes": 0
+    },
+    "python3": {
+      "samples": 35,
+      "first": "2026-11-14T23:41:30.222066+00:00",
+      "last": "2026-11-14T23:46:26.048771+00:00",
+      "pids": [
+        2888441
+      ],
+      "median_cpu_percent": 0.2,
+      "max_cpu_percent": 0.6,
+      "read_bytes": 0,
+      "write_bytes": 151552
+    },
+    "kworker/20:0-mm_percpu_wq": {
+      "samples": 1,
+      "first": "2026-11-14T23:41:35.239050+00:00",
+      "last": "2026-11-14T23:41:35.239050+00:00",
+      "pids": [
+        2725123
+      ],
+      "median_cpu_percent": 1.2,
+      "max_cpu_percent": 1.2,
+      "read_bytes": 0,
+      "write_bytes": 0
+    },
+    "dotnet": {
+      "samples": 52,
+      "first": "2026-11-14T23:41:35.239050+00:00",
+      "last": "2026-11-14T23:46:31.061090+00:00",
+      "pids": [
+        1187162
+      ],
+      "median_cpu_percent": 1.0,
+      "max_cpu_percent": 2.19,
+      "read_bytes": 0,
+      "write_bytes": 0
+    },
+    "kworker/20:1-mm_percpu_wq": {
+      "samples": 1,
+      "first": "2026-11-14T23:41:35.239050+00:00",
+      "last": "2026-11-14T23:41:35.239050+00:00",
+      "pids": [
+        2869647
+      ],
+      "median_cpu_percent": 1.0,
+      "max_cpu_percent": 1.0,
+      "read_bytes": 0,
+      "write_bytes": 0
+    },
+    "process-compose": {
+      "samples": 21,
+      "first": "2026-11-14T23:41:40.250220+00:00",
+      "last": "2026-11-14T23:46:31.061090+00:00",
+      "pids": [
+        2135804
+      ],
+      "median_cpu_percent": 0.2,
+      "max_cpu_percent": 0.4,
+      "read_bytes": 0,
+      "write_bytes": 94208
+    },
+    "server": {
+      "samples": 3,
+      "first": "2026-11-14T23:41:45.261123+00:00",
+      "last": "2026-11-14T23:43:00.469882+00:00",
+      "pids": [
+        340098
+      ],
+      "median_cpu_percent": 0.2,
+      "max_cpu_percent": 0.4,
+      "read_bytes": 32768,
+      "write_bytes": 81920
+    },
+    "setup-pfor": {
+      "samples": 2,
+      "first": "2026-11-14T23:41:50.272919+00:00",
+      "last": "2026-11-14T23:42:00.295157+00:00",
+      "pids": [
+        2892569,
+        2893610
+      ],
+      "median_cpu_percent": 145.765,
+      "max_cpu_percent": 147.26,
+      "read_bytes": 0,
+      "write_bytes": 0
+    },
+    "kworker/2:1-events": {
+      "samples": 1,
+      "first": "2026-11-14T23:42:00.295157+00:00",
+      "last": "2026-11-14T23:42:00.295157+00:00",
+      "pids": [
+        754567
+      ],
+      "median_cpu_percent": 1.0,
+      "max_cpu_percent": 1.0,
+      "read_bytes": 0,
+      "write_bytes": 0
+    },
+    "kworker/2:0-events": {
+      "samples": 1,
+      "first": "2026-11-14T23:42:00.295157+00:00",
+      "last": "2026-11-14T23:42:00.295157+00:00",
+      "pids": [
+        2677894
+      ],
+      "median_cpu_percent": 1.0,
+      "max_cpu_percent": 1.0,
+      "read_bytes": 0,
+      "write_bytes": 0
+    },
+    "kworker/u96:11-kcryptd-252:0-1": {
+      "samples": 1,
+      "first": "2026-11-14T23:42:00.295157+00:00",
+      "last": "2026-11-14T23:42:00.295157+00:00",
+      "pids": [
+        2745694
+      ],
+      "median_cpu_percent": 0.6,
+      "max_cpu_percent": 0.6,
+      "read_bytes": 0,
+      "write_bytes": 0
+    },
+    "gnome-shell": {
+      "samples": 6,
+      "first": "2026-11-14T23:42:10.319831+00:00",
+      "last": "2026-11-14T23:46:10.999806+00:00",
+      "pids": [
+        3185
+      ],
+      "median_cpu_percent": 0.8,
+      "max_cpu_percent": 1.0,
+      "read_bytes": 0,
+      "write_bytes": 0
+    },
+    "kworker/8:1-mm_percpu_wq": {
+      "samples": 1,
+      "first": "2026-11-14T23:42:25.365343+00:00",
+      "last": "2026-11-14T23:42:25.365343+00:00",
+      "pids": [
+        2741954
+      ],
+      "median_cpu_percent": 1.2,
+      "max_cpu_percent": 1.2,
+      "read_bytes": 0,
+      "write_bytes": 0
+    },
+    "kworker/8:0-events": {
+      "samples": 1,
+      "first": "2026-11-14T23:42:25.365343+00:00",
+      "last": "2026-11-14T23:42:25.365343+00:00",
+      "pids": [
+        2858114
+      ],
+      "median_cpu_percent": 1.0,
+      "max_cpu_percent": 1.0,
+      "read_bytes": 0,
+      "write_bytes": 0
+    },
+    "node-MainThread": {
+      "samples": 1,
+      "first": "2026-11-14T23:42:40.401414+00:00",
+      "last": "2026-11-14T23:42:40.401414+00:00",
+      "pids": [
+        2136111
+      ],
+      "median_cpu_percent": 1.0,
+      "max_cpu_percent": 1.0,
+      "read_bytes": 0,
+      "write_bytes": 0
+    },
+    "go-pfor": {
+      "samples": 33,
+      "first": "2026-11-14T23:42:45.418938+00:00",
+      "last": "2026-11-14T23:46:05.982268+00:00",
+      "pids": [
+        2895880,
+        2898370,
+        2899826,
+        2902186,
+        2903676,
+        2904369,
+        2906754,
+        2908225,
+        2909609
+      ],
+      "median_cpu_percent": 99.87,
+      "max_cpu_percent": 100.18,
+      "read_bytes": 0,
+      "write_bytes": 0
+    },
+    "kworker/1:2-mm_percpu_wq": {
+      "samples": 1,
+      "first": "2026-11-14T23:42:50.436164+00:00",
+      "last": "2026-11-14T23:42:50.436164+00:00",
+      "pids": [
+        2749930
+      ],
+      "median_cpu_percent": 1.2,
+      "max_cpu_percent": 1.2,
+      "read_bytes": 0,
+      "write_bytes": 0
+    },
+    "kworker/1:1-display_unordered": {
+      "samples": 1,
+      "first": "2026-11-14T23:42:50.436164+00:00",
+      "last": "2026-11-14T23:42:50.436164+00:00",
+      "pids": [
+        1914345
+      ],
+      "median_cpu_percent": 1.0,
+      "max_cpu_percent": 1.0,
+      "read_bytes": 0,
+      "write_bytes": 0
+    },
+    "kworker/3:0-events": {
+      "samples": 4,
+      "first": "2026-11-14T23:43:15.503411+00:00",
+      "last": "2026-11-14T23:45:00.788910+00:00",
+      "pids": [
+        986842
+      ],
+      "median_cpu_percent": 0.9,
+      "max_cpu_percent": 1.2,
+      "read_bytes": 0,
+      "write_bytes": 0
+    },
+    "kworker/3:2-events": {
+      "samples": 3,
+      "first": "2026-11-14T23:43:20.514589+00:00",
+      "last": "2026-11-14T23:44:10.641269+00:00",
+      "pids": [
+        2494732
+      ],
+      "median_cpu_percent": 1.0,
+      "max_cpu_percent": 1.2,
+      "read_bytes": 0,
+      "write_bytes": 0
+    },
+    "2.1.299-686c67e": {
+      "samples": 4,
+      "first": "2026-11-14T23:43:30.540475+00:00",
+      "last": "2026-11-14T23:46:21.032794+00:00",
+      "pids": [
+        2834997
+      ],
+      "median_cpu_percent": 0.6,
+      "max_cpu_percent": 0.6,
+      "read_bytes": 0,
+      "write_bytes": 0
+    },
+    "kworker/16:0-events": {
+      "samples": 1,
+      "first": "2026-11-14T23:44:35.712518+00:00",
+      "last": "2026-11-14T23:44:35.712518+00:00",
+      "pids": [
+        2730331
+      ],
+      "median_cpu_percent": 1.2,
+      "max_cpu_percent": 1.2,
+      "read_bytes": 0,
+      "write_bytes": 0
+    },
+    "kworker/16:2-mm_percpu_wq": {
+      "samples": 1,
+      "first": "2026-11-14T23:44:35.712518+00:00",
+      "last": "2026-11-14T23:44:35.712518+00:00",
+      "pids": [
+        2214303
+      ],
+      "median_cpu_percent": 1.0,
+      "max_cpu_percent": 1.0,
+      "read_bytes": 0,
+      "write_bytes": 0
+    },
+    "atuin": {
+      "samples": 1,
+      "first": "2026-11-14T23:44:55.773011+00:00",
+      "last": "2026-11-14T23:44:55.773011+00:00",
+      "pids": [
+        6624
+      ],
+      "median_cpu_percent": 0.8,
+      "max_cpu_percent": 0.8,
+      "read_bytes": 0,
+      "write_bytes": 24576
+    },
+    "kworker/3:2-mm_percpu_wq": {
+      "samples": 1,
+      "first": "2026-11-14T23:45:00.788910+00:00",
+      "last": "2026-11-14T23:45:00.788910+00:00",
+      "pids": [
+        2494732
+      ],
+      "median_cpu_percent": 1.0,
+      "max_cpu_percent": 1.0,
+      "read_bytes": 0,
+      "write_bytes": 0
+    },
+    "npm run dev": {
+      "samples": 1,
+      "first": "2026-11-14T23:45:10.816728+00:00",
+      "last": "2026-11-14T23:45:10.816728+00:00",
+      "pids": [
+        2136095
+      ],
+      "median_cpu_percent": 0.0,
+      "max_cpu_percent": 0.0,
+      "read_bytes": 4096,
+      "write_bytes": 0
+    },
+    "kworker/12:2-events": {
+      "samples": 1,
+      "first": "2026-11-14T23:45:25.861258+00:00",
+      "last": "2026-11-14T23:45:25.861258+00:00",
+      "pids": [
+        2669301
+      ],
+      "median_cpu_percent": 1.0,
+      "max_cpu_percent": 1.0,
+      "read_bytes": 0,
+      "write_bytes": 0
+    },
+    "kworker/12:0-mm_percpu_wq": {
+      "samples": 1,
+      "first": "2026-11-14T23:45:25.861258+00:00",
+      "last": "2026-11-14T23:45:25.861258+00:00",
+      "pids": [
+        2853548
+      ],
+      "median_cpu_percent": 1.0,
+      "max_cpu_percent": 1.0,
+      "read_bytes": 0,
+      "write_bytes": 0
+    },
+    "kworker/17:1-events": {
+      "samples": 1,
+      "first": "2026-11-14T23:45:50.937302+00:00",
+      "last": "2026-11-14T23:45:50.937302+00:00",
+      "pids": [
+        2703066
+      ],
+      "median_cpu_percent": 1.0,
+      "max_cpu_percent": 1.0,
+      "read_bytes": 0,
+      "write_bytes": 0
+    },
+    "kworker/17:0-events": {
+      "samples": 1,
+      "first": "2026-11-14T23:45:50.937302+00:00",
+      "last": "2026-11-14T23:45:50.937302+00:00",
+      "pids": [
+        2903640
+      ],
+      "median_cpu_percent": 1.0,
+      "max_cpu_percent": 1.0,
+      "read_bytes": 0,
+      "write_bytes": 0
+    },
+    "kworker/22:2-events": {
+      "samples": 1,
+      "first": "2026-11-14T23:46:16.016581+00:00",
+      "last": "2026-11-14T23:46:16.016581+00:00",
+      "pids": [
+        2733593
+      ],
+      "median_cpu_percent": 1.0,
+      "max_cpu_percent": 1.0,
+      "read_bytes": 0,
+      "write_bytes": 0
+    },
+    "kworker/22:0-mm_percpu_wq": {
+      "samples": 1,
+      "first": "2026-11-14T23:46:16.016581+00:00",
+      "last": "2026-11-14T23:46:16.016581+00:00",
+      "pids": [
+        2888171
+      ],
+      "median_cpu_percent": 1.0,
+      "max_cpu_percent": 1.0,
+      "read_bytes": 0,
+      "write_bytes": 0
+    }
+  }
+}

@@ -1,0 +1,215 @@
+{
+  "schema": 1,
+  "logs": [
+    {
+      "path": "acceptance-logs/ea-host.log.gz",
+      "sha256": "ac3f241cda9fefe75bdc3402a9a4967d22ebf0bf51171a090532f740a2222129",
+      "uncompressed_sha256": "adcad6e9e2344ec9a26d66f987635ccc0865f8536fdb453b4ff7c930cbcfdb6f"
+    },
+    {
+      "path": "acceptance-logs/valhalla-host.log.gz",
+      "sha256": "2bf774ab3f0b287ca74e8f0725c0f7161e6bed14ff7689d51b41f482b3bf3ae8",
+      "uncompressed_sha256": "d4203c16e8b655ac3418e287f357d02458ca6b6138e27ef695d5149f5da27fff"
+    },
+    {
+      "path": "acceptance-logs/stable-host.log.gz",
+      "sha256": "37ed384da3ded187be1828913162752e6a0ae804c9f3360c767a0d7137697a61",
+      "uncompressed_sha256": "de245f2a121932fed9b63068a2ddeb48215908296f6ff7e52b5d4391d3bb6ec1"
+    },
+    {
+      "path": "acceptance-logs/ea-memory.log.gz",
+      "sha256": "9e63aaee888e256a4820a797aec5cfa62dd89d075e03f8c2627e29353c3c3d4d",
+      "uncompressed_sha256": "eaff268ddb0463716dbfae75044c828fdab1a10d848feb26f4596a26983d4f41"
+    },
+    {
+      "path": "acceptance-logs/stable-memory.log.gz",
+      "sha256": "ca11ee4ae5f0bc981e6ec5ad95ff7caa1700e909d2676678971890b404a4d3a7",
+      "uncompressed_sha256": "10ed5e26c287e2d26a6edf46ac88a56acd104ae5c0676cbedef45cb263dce2c2"
+    },
+    {
+      "path": "acceptance-logs/valhalla-memory.log.gz",
+      "sha256": "31ab1d56c3f995f40549f1529114bf2ae0602b457d618c4c35418c67c4f49f10",
+      "uncompressed_sha256": "6fbac18f49551ef29c282035698eac6e4be47ad9ab23255f2e64fe05a53b3e89"
+    },
+    {
+      "path": "acceptance-logs/ea-plain.log.gz",
+      "sha256": "b59ef4eefa25239fba51a4c650dfa966c72f1cff6616951d43ce8b2984e6afee",
+      "uncompressed_sha256": "2218a57c044522449aa8a052ee47dd0b4b8ac1b594f02815487c994ea4c2c8f9"
+    },
+    {
+      "path": "acceptance-logs/valhalla-plain.log.gz",
+      "sha256": "2e829cdc29bfee5c8e7d2c77417d7d5f870ce42ebbc6e4e1c4d88e1f1f04fd27",
+      "uncompressed_sha256": "fbc054c675b6df9807f02d61f76c8d82114f32b76e38497d057bac0261646408"
+    },
+    {
+      "path": "acceptance-logs/stable-plain.log.gz",
+      "sha256": "3fc1fd603bbfb09bd3a7865818cf5a671b4f1f4bc32a861c90f5a2bc85a0ab8e",
+      "uncompressed_sha256": "222ca3b2d68c1cd0cf931d812805b3d2b756989bfbfbf7841fe16c28c2f3bd47"
+    },
+    {
+      "path": "acceptance-logs/ea-encrypted.log.gz",
+      "sha256": "eee797e76aea223930d95b3b6cebd5d072ee46ebb048680ae08f7800f6a7f2f7",
+      "uncompressed_sha256": "c1cc934c105545105c81ffbd11aaa652655a97ba21aa0a50f7d28f41b0643310"
+    },
+    {
+      "path": "acceptance-logs/ea-stress.log.gz",
+      "sha256": "ea3ee4996fae7c4f265f5757376847bf78da0c8731ad28e22ba0268c3308cac5",
+      "uncompressed_sha256": "ded6fb4250c20194910ea5ec6bb22488eb12b1ac87c3e1f50c906cc7b9d2bbe9"
+    },
+    {
+      "path": "acceptance-logs/valhalla-encrypted.log.gz",
+      "sha256": "ed6bf307eaa417f3e79e0bee741b6a8747128dcdb21e91fb267e8761959abc43",
+      "uncompressed_sha256": "35d68b6a1d33da2ec594ead4d471534faebd5a9cbfb50c12ad42dc90e32d3ee9"
+    },
+    {
+      "path": "acceptance-logs/stable-encrypted.log.gz",
+      "sha256": "13dd9183d801c5830a15cad290fbfc398b878fc1cbf987ff287e0127089bc735",
+      "uncompressed_sha256": "58137fccf1b98a787c6667b610c522da6a6d977e5b82207cd6b7dbf1a8e6056e"
+    },
+    {
+      "path": "acceptance-logs/valhalla-stress.log.gz",
+      "sha256": "3a68735877653c35f86016aa6c0cc27992463abca107ef4b0ed13cd0428a6e92",
+      "uncompressed_sha256": "ed8e8bd8afefcbadd33c48edc60bd03b15c44ceb5e8f36a3407b89afdadad56e"
+    },
+    {
+      "path": "acceptance-logs/stable-stress.log.gz",
+      "sha256": "a0ed630897cac7d7440a72e5af8d415849470ad43f109db7ef4e07572ab705ef",
+      "uncompressed_sha256": "524265826063392dfaf276b6beeb6e802084592032d36c666cb527084dc43fb0"
+    },
+    {
+      "path": "acceptance-logs/ea-process.log.gz",
+      "sha256": "ffb6adf58db103e1ffbb87195e4f5b3c0764f23226d98a1d421d9b9b3696ffc8",
+      "uncompressed_sha256": "62ca1f1d7c6cb9ca05ff8d4505ee577d2d41ed1d3155ce898dfbd48f2a1377be"
+    },
+    {
+      "path": "acceptance-logs/stable-process.log.gz",
+      "sha256": "ac3b2f716c0c1d7ea43203865c56dbf23c1d22e36513c6e0d6229a9d978fb753",
+      "uncompressed_sha256": "af4885628288d7ee767eb34bd6e2696fadddfe7bd52d619f6b43b578fa41aed9"
+    },
+    {
+      "path": "acceptance-logs/valhalla-process.log.gz",
+      "sha256": "6b62e596a2823d4ac128d52642363cd4ce5795639da8d3d52f6c40f97d0e6c47",
+      "uncompressed_sha256": "8ffdb68b8042cf87000584eb0bd75a61a1c4465f1e094f7cec59d920bc1516b8"
+    },
+    {
+      "path": "acceptance-logs/ea-saved.log.gz",
+      "sha256": "e2bc44808c7339fbe758798c558f20ffdbafcfd73fad05f221bb7211ce2ac5db",
+      "uncompressed_sha256": "221add89f98c5c04abe2edb8b53cb8502e362bc2e8c23607ea5dc1d0d0613a2e"
+    },
+    {
+      "path": "acceptance-logs/stable-saved.log.gz",
+      "sha256": "1c77f42daac7db5d239f7bc18c76dc30ed0135dfd07ced5d47fa9ba876d80ef7",
+      "uncompressed_sha256": "4ae6226785161ff32b7fa8bda26691e78798bd1d5ae44df6227298194dbbbc41"
+    },
+    {
+      "path": "acceptance-logs/valhalla-saved.log.gz",
+      "sha256": "144d9de6ac02105c74df4c02899d6cc7614b9bcebf921e275908dff87131b7ff",
+      "uncompressed_sha256": "93cfb34785fe5c609e85585e415f9ecb0fc5bf7788f221ab8d163be5e69e7190"
+    },
+    {
+      "path": "acceptance-logs/ea-seeded.log.gz",
+      "sha256": "ec8cd6f0e3193001f2cbc42817e7b1ccb7e683f5a5d52b3dfdb9541c5d71d88c",
+      "uncompressed_sha256": "4225c348caccb9701adf0970bb3a99b3cc97fc9bf599770c87cc3a558478f1ff"
+    },
+    {
+      "path": "acceptance-logs/ea-review.log.gz",
+      "sha256": "a5f29dc375f6558cfc9346fa34c7dd557d39a6a51649583653ec65e3df94a7dc",
+      "uncompressed_sha256": "dc33acb5744a65717c9ed10cf76dcbda96f812f1840327d176bf5e0913942c5d"
+    },
+    {
+      "path": "acceptance-logs/ea-review-plain.log.gz",
+      "sha256": "68af83d644354db9d8361a0a255383c2ec2acbafbbcebf9cfb8608e88d7e7775",
+      "uncompressed_sha256": "94b6bb359b0f585e4c0f25a904dca8c67b32abdee762ad0a4261f7fcc1cf0fe9"
+    },
+    {
+      "path": "acceptance-logs/ea-review-analyze-empty-relaxed.log.gz",
+      "sha256": "8ff00e6fc0fea5e80b00a19e29b496462f04676ed47c831f749f8a5bebb832b9",
+      "uncompressed_sha256": "5564f11a0a4032b3f03263a16bc49ecb1bb6d0def9a03e26b7f05ab56c16b1f4"
+    },
+    {
+      "path": "acceptance-logs/ea-review-analyze-empty.log.gz",
+      "sha256": "60409497c10e45daf23ef38f9934f3550540670267b64480bac497649c2c0577",
+      "uncompressed_sha256": "1eaef05e42ea46bce2627abf237022ae1efce130b678609215c3e2ad7bb8bc6e"
+    },
+    {
+      "path": "acceptance-logs/stable-seeded.log.gz",
+      "sha256": "d018c37f29d7385930ab2af44c90804424e0776a73f4764b93f887932c4ca531",
+      "uncompressed_sha256": "e0a45d3dd6fc59e06bbcb308ec860dfeeb92f111f306d824e3e7470978e441bb"
+    },
+    {
+      "path": "acceptance-logs/stable-review.log.gz",
+      "sha256": "3fdbab52fbd38c8de81a97dcb65f2a0309245d7b97accd7053d415137225ea74",
+      "uncompressed_sha256": "d0ccd61db9d15af06d0e218c0cc4a861c6d5804b4cb458a25e5b81e138cd50c0"
+    },
+    {
+      "path": "acceptance-logs/ea-review-index-maintenance.log.gz",
+      "sha256": "298a36381310342041287120fd52c9120ede5071ecce9fee3e1ce6b04a77e72a",
+      "uncompressed_sha256": "2eb426597c41bf0618bdab6afa0c40abf3da74e78efce404d06e82abc3df8592"
+    },
+    {
+      "path": "acceptance-logs/stable-review-plain.log.gz",
+      "sha256": "f1297544e9187733f00b811e0180e6111e0e4a7ed1babdc9e7d9cf3c85501f31",
+      "uncompressed_sha256": "b6e89ac7fc45ea660e2938eae6a78acd718de4e8dc306df383c516e918cdb993"
+    },
+    {
+      "path": "acceptance-logs/ea-review-repeated-analyze.log.gz",
+      "sha256": "de8333537eda0e224da3ac46e8d0e0bdac98cb5a82d14c98ee8b312f0fa00950",
+      "uncompressed_sha256": "6a938b6df5ed279564e17130e6e4d51ab001e65fb79f32512839ac93c0a6389f"
+    },
+    {
+      "path": "acceptance-logs/stable-review-analyze-empty-relaxed.log.gz",
+      "sha256": "296f248cbc153ce8f21d915d4006f97bf7057fdb12b9fa9b7a401671c1b9dee9",
+      "uncompressed_sha256": "475d3b4308acb0b6ffaec76643e20711fb076f0a17ad61819b12978bcaf513cf"
+    },
+    {
+      "path": "acceptance-logs/stable-review-analyze-empty.log.gz",
+      "sha256": "bb72786b86f2ba64a1c9e057bdc8318379a0a920e35635d9cc8dc49cf806688c",
+      "uncompressed_sha256": "79d083e5c4c821fb1691f3619756c9c08788a149c3dbafffad53cef669b452ac"
+    },
+    {
+      "path": "acceptance-logs/stable-review-index-maintenance.log.gz",
+      "sha256": "7e8dc28ba85cf75b102ba993d2506357a9e59c62678b78b6e3789e7540cc1941",
+      "uncompressed_sha256": "c12612eb43529b1d638813655be26ee4545f57374264dd180fddb24f68efdf2f"
+    },
+    {
+      "path": "acceptance-logs/stable-review-repeated-analyze.log.gz",
+      "sha256": "a0a171c03a1417db91f4d3bc35220e3d3d3736fff52a1e35fa5fc133c2e22777",
+      "uncompressed_sha256": "cf18ea895240fa9f3e86352f81761e22295350f4f4defdab2955770dc04eacb9"
+    },
+    {
+      "path": "acceptance-logs/valhalla-seeded.log.gz",
+      "sha256": "4255d2ed9ea73084209dfefcc24bfbb65f1d89235c2e9b3f3f353b2538d915e2",
+      "uncompressed_sha256": "1f47edea3f5ba9ce9369d980a5082245ccc898fe208e994615b5703c58d6fc8d"
+    },
+    {
+      "path": "acceptance-logs/valhalla-review.log.gz",
+      "sha256": "caa7fdc28edaa38b19a4f279aacb2e7c237c4977c30bff691111932493d939d5",
+      "uncompressed_sha256": "607a6dca6f39054c85f2022134f60981b7c9399756031701db5c2664bbbfb066"
+    },
+    {
+      "path": "acceptance-logs/valhalla-review-plain.log.gz",
+      "sha256": "206c5c8821a9cbf57a6ee7dd7cc8547d5e600eba0a27c8fdfe3087c3e25e29a9",
+      "uncompressed_sha256": "aaacf1eadb900bc66649ce435445d3ce99f9970a2fe16dae785e211abbbdebcf"
+    },
+    {
+      "path": "acceptance-logs/valhalla-review-analyze-empty-relaxed.log.gz",
+      "sha256": "52305fc0e4fc7aea1a9ec539beaa5acf612f4cd9dd3c8cd8bb6025e876737105",
+      "uncompressed_sha256": "ffd801330c03dff47de1f04ddca495dd73f3abd2bb1d7f59ff4c1e35ab476068"
+    },
+    {
+      "path": "acceptance-logs/valhalla-review-analyze-empty.log.gz",
+      "sha256": "6048233cf30f4965d8ae12865aabf224ffd640d41173c6a431b936a07d5c2a7e",
+      "uncompressed_sha256": "01eea6d5efbad5a7639dd480db6059edc88ea1863101a6165e32783982ae7e57"
+    },
+    {
+      "path": "acceptance-logs/valhalla-review-index-maintenance.log.gz",
+      "sha256": "d9277811528d69307e18de18da105cc7608bcc47796747c2fa7b0e77275d246f",
+      "uncompressed_sha256": "2bb8881c964de807f4e8cfbb37adbef7c20f284b504b24a1ed5de8396d6839a9"
+    },
+    {
+      "path": "acceptance-logs/valhalla-review-repeated-analyze.log.gz",
+      "sha256": "68a6b210efd85610fdda05209e51f46fe9caa8e60818cafbcbf1504b785eb33f",
+      "uncompressed_sha256": "e1769a10f69a69264be4bddfb3cc0d28ebbd2c712f762213a38e2cf44245d5c1"
+    }
+  ]
+}

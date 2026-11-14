@@ -25,8 +25,10 @@ failing test the day it is written. Everything below follows from taking that li
 
 The [native Java experiment](java-native-experiment.md) was authorized 2026-11-14
 at `3e5962f9affc06c768df1688765162a65a893848` (v53), targeting Linux x86-64 and
-Java 25, with controlled JDK 28/value-class comparisons. It is in progress and
-opt-in; neither production delivery nor supported-core promotion is selected.
+Java 25, with matched JDK 28/value-class comparisons. Its frozen correctness and
+measurement work is complete, with shared-host and warmup limitations recorded in
+the experiment's benchmark report. It remains opt-in; neither production delivery
+nor supported-core promotion is selected.
 The pre-Valhalla performance leaning below is historical: primitive arrays and
 typed kernels offer efficient on-heap representations today, while JDK 28's
 first value-object preview does not deliver the complete specialized-generics

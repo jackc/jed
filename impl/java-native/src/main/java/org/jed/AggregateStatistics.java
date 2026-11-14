@@ -17,6 +17,10 @@ final class AggregateStatistics {
     private Decimal sum = Decimal.zero(0), squares = Decimal.zero(0);
     private double sx, sy, sxx, syy, sxy;
     AggregateStatistics(String name, SqlType type) { this.name = name; exact = type == SqlType.DECIMAL; }
+    AggregateStatistics(AggregateStatistics original) {
+        name = original.name; exact = original.exact; sum = original.sum; squares = original.squares;
+        sx = original.sx; sy = original.sy; sxx = original.sxx; syy = original.syy; sxy = original.sxy;
+    }
     void add(SqlValue value, long count, CostMeter meter) {
         if (exact) {
             Decimal x = value.type().isInteger() ? Decimal.of(value.asInteger()) : value.asDecimal();
