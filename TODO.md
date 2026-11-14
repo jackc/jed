@@ -269,13 +269,12 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
     dirty leaf's arrays): port the shorter-side shift (cascade −29%, range delete −8%, contained in
     the edit helpers), not the movable gap (cascade −47% but insert +12%, and it touches every site
     that indexes a dirty leaf). #5 (one widened value splitting a full leaf, `update_untouched_large_rollback`
-    2.3× v51): accept it for now; take the one-exception base-plus-offsets region (kind 6, no density
-    cost, update 0.011 ms vs v51's 0.018) with the next format version; do not adopt slack (+3% to +7%
-    live pages, helps only wide-row leaves). Implementation-only follow-ons either way: split a lazy
+    2.3× v51): take the base-plus-offsets region with an exception (kind 6, no density cost, update
+    0.011 ms vs v51's 0.018) as format v54, after deciding between one exception and a few; do not
+    adopt slack (+3% to +7% live pages, helps only wide-row leaves). Implementation-only follow-ons either way: split a lazy
     leaf from its page instead of decoding every row, and size a failed evening candidate from its
     page. → [leaf-write-cost.md](spec/design/leaf-write-cost.md) _(size: S for the Go shorter side;
-    M for the split path; format v54 with goldens in three cores and the Ruby reference if kind 6 is
-    taken)_
+    M for the split path; format v54 with goldens in three cores and the Ruby reference)_
 - [x] **Format v53: deferred interior pages + the narrow commit manifest** — landed 2026-11-13 as one
   change in all three cores and the Ruby reference, with no switches left: a `(parent, slot) → page`
   remap list lets a commit keep an interior whose only change is a child's page (and its catalog

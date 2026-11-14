@@ -1,6 +1,6 @@
 # Write costs on dense leaves
 
-**Status: measured, awaiting the maintainer's decision.** Go prototypes only, every switch off by
+**Status: measured; #5's direction is format v54 (§6), awaiting the maintainer's go-ahead.** Go prototypes only, every switch off by
 default; nothing here is in the format. This note measures two write regressions that came with the
 compact leaf of format v52 ([leaf-structural.md](leaf-structural.md)) and recommends what to do
 about each (§6). Any format change it proposes is the maintainer's decision; if one is approved,
@@ -252,18 +252,24 @@ rows.
   copying a leaf that is 4.8 times larger (§2). That is the price of density and no edit-path change
   removes it.
 
-**#5: accept the cost now (option c), and take the exception (b) when the next format version is
-cut; do not adopt slack (a).**
+**#5: take the exception (b) as format v54; do not adopt slack (a).**
+
+The maintainer confirmed (2026-11-14) that the project is still in development and a format version
+is cheap, which removes the reason given earlier for waiting.
 
 - Slack costs 3% to 7% of every key-ordered table and only helps leaves of wide rows. The exception
-  costs nothing on the datasets, helps leaves of any width, and fixes the benchmark as well. But
-  it is a new region kind in three cores and the Ruby reference, for one outlier per leaf and
-  column. That is worth a format version only if one is being cut anyway.
-- Without a format change, the split itself can be made cheaper. Split a lazy leaf from its page's
-  stored spans instead of decoding every row (decoding is 23% and `buildLeaf` 17% of the update),
-  and size a failed evening candidate from its page (§5). Neither is prototyped.
-- The density cost of accepting is bounded: after widening one value in every leaf the tables are
-  24% to 58% larger than freshly loaded, still 1.9 to 3.6 times smaller than in v51.
+  costs nothing on the datasets, helps leaves of any width, and fixes the benchmark (0.042 to
+  0.011 ms, v51 0.018).
+- **Open choice before porting: one exception or a few.** One exception absorbs only the first
+  outlier per leaf and column; a second in the same leaf widens the column and splits the leaf, and
+  in `TestLeafWidenGrowth` that still grew the tables 20% to 36%. A region with up to `k` exceptions
+  would absorb more, at the price of tracking the `k + 1` smallest and largest values in the size
+  facts and a choice rule over them. Not prototyped.
+- Independently of the format, the split itself can be made cheaper. Split a lazy leaf from its
+  page's stored spans instead of decoding every row (decoding is 23% and `buildLeaf` 17% of the
+  update), and size a failed evening candidate from its page (§5). Neither is prototyped.
+- For scale: without any change, widening one value in every leaf grows the tables 24% to 58%,
+  still 1.9 to 3.6 times smaller than in v51.
 
 **How the two interact.**
 
