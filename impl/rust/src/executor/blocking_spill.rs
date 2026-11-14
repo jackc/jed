@@ -1735,7 +1735,10 @@ mod tests {
 
     #[test]
     fn bounded_scan_releases_untouched_inline_page_references() {
-        let path = std::env::temp_dir().join("jed-bounded-scan-untouched.jed");
+        let path = std::env::temp_dir().join(format!(
+            "{}-jed-bounded-scan-untouched.jed",
+            std::process::id()
+        ));
         let _ = std::fs::remove_file(&path);
         let db = crate::Database::create(crate::CreateOptions {
             path: Some(path.clone()),

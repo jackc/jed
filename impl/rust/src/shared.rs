@@ -6494,7 +6494,10 @@ mod temp_reclaim_internal_tests {
         // persist for a pure-temp commit, so it is the faithful vehicle for the zero-file-write invariant
         // (the Database/Session publish path persists the main image unconditionally, a pre-existing
         // publish-path issue — the publish-decoupling follow-on, attached-databases.md §5).
-        let path = std::env::temp_dir().join("jed_temp_zerofile_internal.jed");
+        let path = std::env::temp_dir().join(format!(
+            "{}-jed_temp_zerofile_internal.jed",
+            std::process::id()
+        ));
         let _ = std::fs::remove_file(&path);
         let mut db = Engine::create(
             &path,
@@ -6676,7 +6679,10 @@ mod temp_reclaim_internal_tests {
     #[test]
     fn temp_on_commit_makes_zero_file_writes() {
         // The commit-time truncate and drop touch only the temp domain (temp-tables.md §2 D1).
-        let path = std::env::temp_dir().join("jed_temp_on_commit_zerofile.jed");
+        let path = std::env::temp_dir().join(format!(
+            "{}-jed_temp_on_commit_zerofile.jed",
+            std::process::id()
+        ));
         let _ = std::fs::remove_file(&path);
         let mut db = Engine::create(
             &path,
@@ -6846,7 +6852,8 @@ mod residency_flip_tests {
 
     #[test]
     fn file_create_session_table_joins_residency_flip() {
-        let path = std::env::temp_dir().join("jed_residency_flip.jed");
+        let path =
+            std::env::temp_dir().join(format!("{}-jed_residency_flip.jed", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let mut db = Database::create(CreateOptions {
             path: Some(path.clone()),
@@ -6979,7 +6986,10 @@ mod reclaim_watermark_tests {
 
     #[test]
     fn fallback_reader_snapshot_isolation_under_reclamation() {
-        let path = std::env::temp_dir().join("jed_fallback_reader_isolation.jed");
+        let path = std::env::temp_dir().join(format!(
+            "{}-jed_fallback_reader_isolation.jed",
+            std::process::id()
+        ));
         let _ = std::fs::remove_file(&path);
         {
             let mut db = Database::create(CreateOptions {

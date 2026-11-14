@@ -233,7 +233,8 @@ fn decimal_folds_match_row_path() {
                  ELSE g::numeric * 1.000001 END \
             FROM generate_series(1, 3000) g",
     ];
-    let path = std::env::temp_dir().join("jed_decimal_fold_lanes.jed");
+    let path =
+        std::env::temp_dir().join(format!("{}-jed_decimal_fold_lanes.jed", std::process::id()));
     remove_db(&path);
     {
         let mut db = Database::create(CreateOptions {
@@ -328,7 +329,7 @@ const ORDERED_GROUP_QUERIES: &[&str] = &[
 /// database: file-backed at `file` in the temp directory and reopened (clean Packed leaves), or in
 /// memory.
 fn gt_session(file: Option<&str>) -> (Option<std::path::PathBuf>, Session) {
-    let path = file.map(|f| std::env::temp_dir().join(f));
+    let path = file.map(|f| std::env::temp_dir().join(format!("{}-{f}", std::process::id())));
     if let Some(p) = &path {
         remove_db(p);
     }
@@ -554,7 +555,7 @@ fn top_n_matches_full_sort_in_memory() {
 
 #[test]
 fn varwidth_lanes_match_row_path() {
-    let path = std::env::temp_dir().join("jed_varwidth_lanes.jed");
+    let path = std::env::temp_dir().join(format!("{}-jed_varwidth_lanes.jed", std::process::id()));
     remove_db(&path);
     {
         let mut db = Database::create(CreateOptions {
@@ -707,7 +708,7 @@ fn sweep_lifetime(db: &mut Session, sql: &str, step: usize) {
 
 /// A 300-row table small enough to try every ceiling: a NULL row, decimals of both signs, text.
 fn ct_session(file: Option<&str>) -> (Option<std::path::PathBuf>, Session) {
-    let path = file.map(|f| std::env::temp_dir().join(f));
+    let path = file.map(|f| std::env::temp_dir().join(format!("{}-{f}", std::process::id())));
     if let Some(p) = &path {
         remove_db(p);
     }

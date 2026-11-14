@@ -16,7 +16,7 @@ use jed::{CreateOptions, Database, Environment, OpenOptions, Outcome, Session, S
 use std::path::{Path, PathBuf};
 
 fn tmp(name: &str) -> PathBuf {
-    std::env::temp_dir().join(name)
+    std::env::temp_dir().join(format!("{}-{name}", std::process::id()))
 }
 
 /// Remove a closed test database and the `<path>.lock/` coordination bundle opening it created

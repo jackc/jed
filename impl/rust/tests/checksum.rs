@@ -32,7 +32,7 @@ fn filler_text(n: usize) -> String {
 }
 
 fn tmp(name: &str) -> std::path::PathBuf {
-    std::env::temp_dir().join(name)
+    std::env::temp_dir().join(format!("{}-{name}", std::process::id()))
 }
 
 /// Remove a closed test database and the `<path>.lock/` coordination bundle opening it created

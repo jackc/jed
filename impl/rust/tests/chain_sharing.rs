@@ -29,7 +29,7 @@ fn filler_text(n: usize) -> String {
 }
 
 fn tmp(name: &str) -> std::path::PathBuf {
-    std::env::temp_dir().join(name)
+    std::env::temp_dir().join(format!("{}-{name}", std::process::id()))
 }
 
 fn remove_db(path: &std::path::Path) {

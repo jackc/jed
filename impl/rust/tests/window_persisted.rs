@@ -65,7 +65,10 @@ fn seed_persisted_window(path: &std::path::Path) -> Session {
 
 #[test]
 fn running_aggregate_over_persisted_column() {
-    let path = std::env::temp_dir().join("jed_window_persisted_running.jed");
+    let path = std::env::temp_dir().join(format!(
+        "{}-jed_window_persisted_running.jed",
+        std::process::id()
+    ));
     let mut db = seed_persisted_window(&path);
 
     // Running SUM over the default frame — amount enters the touched set ONLY through the window arg.
@@ -94,7 +97,10 @@ fn running_aggregate_over_persisted_column() {
 /// (window/topn.test) cannot express — the window_running_sum benchmark's regression twin.
 #[test]
 fn top_n_over_persisted_column() {
-    let path = std::env::temp_dir().join("jed_window_persisted_topn.jed");
+    let path = std::env::temp_dir().join(format!(
+        "{}-jed_window_persisted_topn.jed",
+        std::process::id()
+    ));
     let mut db = seed_persisted_window(&path);
 
     let rows = query_rows(
@@ -118,7 +124,10 @@ fn top_n_over_persisted_column() {
 
 #[test]
 fn filter_and_offset_over_persisted_column() {
-    let path = std::env::temp_dir().join("jed_window_persisted_filter.jed");
+    let path = std::env::temp_dir().join(format!(
+        "{}-jed_window_persisted_filter.jed",
+        std::process::id()
+    ));
     let mut db = seed_persisted_window(&path);
 
     // A bounded moving MAX (frame path) plus an offset function whose value is a persisted column.

@@ -931,7 +931,7 @@ mod tests {
     use crate::value::Value;
 
     fn tmp(name: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(name)
+        std::env::temp_dir().join(format!("{}-{name}", std::process::id()))
     }
 
     /// Demand paging (P6.4b, spec/design/pager.md §1/§4): a file-backed database with many leaf pages,
