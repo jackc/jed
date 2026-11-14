@@ -7,7 +7,12 @@
 //
 // The live checker checks the running process instead (see checkLive).
 
-import { type CommitMeta, parseCommitMeta, validateCommitMeta } from "../commit_manifest.ts";
+import {
+  type CommitMeta,
+  NO_STAMP_WINDOW,
+  parseCommitMeta,
+  validateCommitMeta,
+} from "../commit_manifest.ts";
 import type { Engine, Snapshot } from "../executor.ts";
 import { NO_TAG } from "../cap.ts";
 import type { Credential } from "../crypto.ts";
@@ -53,14 +58,21 @@ const PAGE_GIST_LEAF = 5;
 function selectMeta(paging: SharedPaging): { meta: CommitMeta; protectedPages: Set<number> } {
   const pageSize = paging.pageSize();
   const physical = paging.physicalPages();
-  const candidates = [paging.readBlock(0), paging.readBlock(1)]
-    .map((bytes) => ({ bytes, meta: parseCommitMeta(bytes, pageSize, physical) }))
-    .filter((c): c is { bytes: Uint8Array; meta: CommitMeta } => c.meta !== null)
+  const blocks = [paging.readBlock(0), paging.readBlock(1)];
+  const candidates = blocks
+    .map((bytes, slot) => ({ bytes, slot, meta: parseCommitMeta(bytes, pageSize, physical) }))
+    .filter((c): c is { bytes: Uint8Array; slot: number; meta: CommitMeta } => c.meta !== null)
     .sort((a, b) => (a.meta.txid > b.meta.txid ? -1 : a.meta.txid < b.meta.txid ? 1 : 0));
   for (const c of candidates) {
+    // The stamp window as the loader takes it (format.ts loadEnginePagedAtSteps).
+    const sibling = parseCommitMeta(blocks[c.slot ^ 1]!, pageSize, physical);
+    const stamps =
+      sibling !== null && sibling.txid < c.meta.txid
+        ? { floor: sibling.txid, newest: c.meta.txid }
+        : NO_STAMP_WINDOW;
     const validated =
       paging.cachedValidation(c.bytes) ??
-      validateCommitMeta(c.meta, pageSize, (p) => paging.readBlock(p));
+      validateCommitMeta(c.meta, pageSize, (p) => paging.readBlock(p), stamps);
     if (validated !== null) return { meta: c.meta, protectedPages: validated };
   }
   throw new CheckError("meta: no valid meta page");

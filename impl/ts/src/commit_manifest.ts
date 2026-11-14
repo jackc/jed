@@ -4,7 +4,7 @@ import { crc32Update } from "./crc32.ts";
 import { engineError } from "./errors.ts";
 import { ioSteps, runSync, type Steps } from "./execution.ts";
 import { NO_TAG } from "./cap.ts";
-import { manifestCrc32 } from "./v53.ts";
+import { manifestCrc32, pageTxidStamp } from "./v53.ts";
 
 // PAGE_IO_WINDOW bounds the write side's concurrent page work (ts-runtime.md §11.3): pages encoded at
 // once (and encoded pages awaiting their write), and dependencies recovery reads ahead. Physical
@@ -81,6 +81,34 @@ export function pageDigest(bytes: Uint8Array, encrypted: boolean, narrow: boolea
   if (!narrow) return crc64Update(0n, bytes);
   if (encrypted) return BigInt(crc32Update(0, bytes) >>> 0);
   return BigInt(view(bytes).getUint32(12, false));
+}
+
+// stampOf is the stamp a commit at txid writes at header offset 2 of every page it seals
+// (manifest-crc32.md §2.1): the txid's low 16 bits, or 0 -- the v52 reserved value -- without stamping.
+export function stampOf(txid: bigint): number {
+  return pageTxidStamp() ? Number(txid & 0xffffn) : 0;
+}
+
+// StampWindow is the txid window (floor, newest] a page a manifest lists must carry a stamp from:
+// one commit under synchronous = on, every commit since the durability floor under synchronous = off.
+// NO_STAMP_WINDOW, an empty window, or one of 2^16 or more admits every stamp (the CRC is then the only
+// check).
+export type StampWindow = { floor: bigint; newest: bigint };
+export const NO_STAMP_WINDOW: StampWindow = { floor: 0n, newest: 0n };
+
+export function stampInWindow(stamp: number, w: StampWindow): boolean {
+  if (!pageTxidStamp() || w.newest <= w.floor) return true;
+  const span = w.newest - w.floor;
+  if (span >= 1n << 16n) return true;
+  const d = BigInt((stamp - Number(w.floor & 0xffffn)) & 0xffff);
+  return d >= 1n && d <= span;
+}
+
+// manifestPageHeaderOk reports whether a manifest-overflow page's header bytes 1-3 are what the commit
+// at txid wrote: flags zero and the commit's own stamp. A manifest page is always written by the
+// commit whose meta names it, so this is an exact equality (zero without stamping, as through v52).
+export function manifestPageHeaderOk(bytes: Uint8Array, txid: bigint): boolean {
+  return bytes[1] === 0 && ((bytes[2]! << 8) | bytes[3]!) === stampOf(txid);
 }
 
 // manifestEntriesOf digests written pages for a manifest, at the width this process writes.
@@ -180,6 +208,7 @@ export function buildCommitManifest(
     const dv = view(bytes);
     const count = Math.min(cap, entries.length - cursor);
     bytes[0] = 8;
+    dv.setUint16(2, stampOf(txid), false);
     dv.setUint32(4, count, false);
     dv.setUint32(8, overflowIds[ordinal + 1] ?? 0, false);
     dv.setBigUint64(16, txid, false);
@@ -321,18 +350,31 @@ export function validateCommitMeta(
   meta: CommitMeta,
   pageSize: number,
   read: (index: number) => Uint8Array,
+  stamps: StampWindow = NO_STAMP_WINDOW,
 ): Set<number> | null {
-  return runSync(validateCommitMetaSteps(meta, pageSize, (index) => ioSteps(() => read(index))));
+  return runSync(
+    validateCommitMetaSteps(
+      meta,
+      pageSize,
+      (index) => ioSteps(() => read(index)),
+      undefined,
+      stamps,
+    ),
+  );
 }
 
 // validateCommitMetaSteps is validateCommitMeta over an awaitable page read. window, when it returns
 // a non-null array, reads up to PAGE_IO_WINDOW listed dependencies ahead (ts-runtime.md §11.3);
 // results and errors are consumed in manifest order, so selection matches the sequential walk.
+//
+// stamps is the txid window a listed plaintext page's stamp must fall in (manifest-crc32.md §2.1); an
+// encrypted page's stamp is sealed, so its ciphertext digest is the whole keyless check.
 export function* validateCommitMetaSteps(
   meta: CommitMeta,
   pageSize: number,
   read: (index: number) => Steps<Uint8Array>,
   window?: (indices: number[]) => Steps<ManifestPageRead[] | null>,
+  stamps: StampWindow = NO_STAMP_WINDOW,
 ): Steps<Set<number> | null> {
   if (meta.dirtyCount === 0) return new Set(); // fully flushed bootstrap/snapshot image
   // An encrypted meta (spec/fileformat/encrypted.md §6): body pages start past the key block, and a
@@ -356,9 +398,7 @@ export function* validateCommitMetaSteps(
     const count = dv.getUint32(4, false);
     if (
       bytes[0] !== 8 ||
-      bytes[1] !== 0 ||
-      bytes[2] !== 0 ||
-      bytes[3] !== 0 ||
+      !manifestPageHeaderOk(bytes, meta.txid) ||
       dv.getUint32(12, false) !== pageChecksum(bytes) ||
       dv.getBigUint64(16, false) !== meta.txid ||
       dv.getUint32(24, false) !== ordinal ||
@@ -411,7 +451,10 @@ export function* validateCommitMetaSteps(
       bytes.length !== pageSize ||
       pageDigest(bytes, encrypted, narrow) !== entry.checksum ||
       (!encrypted &&
-        (bytes[0] < 1 || bytes[0] > 7 || pageChecksum(bytes) !== view(bytes).getUint32(12, false)))
+        (bytes[0] < 1 ||
+          bytes[0] > 7 ||
+          pageChecksum(bytes) !== view(bytes).getUint32(12, false) ||
+          !stampInWindow((bytes[2]! << 8) | bytes[3]!, stamps)))
     )
       return null;
     if (entry.index === meta.rootPage) rootCovered = true;

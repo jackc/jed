@@ -78,7 +78,9 @@ import {
   manifestInlineCapacity,
   manifestOverflowCapacity,
   metaChecksum,
+  NO_STAMP_WINDOW,
   parseCommitMeta,
+  stampOf,
   validateCommitMetaSteps,
   writeManifestMeta,
 } from "./commit_manifest.ts";
@@ -1140,11 +1142,20 @@ export class Sealer {
   readonly ps: number;
   readonly cap: Cap;
   readonly codec: PageCodec | null;
+  // stamp is the txid16 every page this sealer builds carries at header offset 2 (manifest-crc32.md
+  // §2.1; 0 when unstamped).
+  readonly stamp: number;
 
-  constructor(ps: number, codec: PageCodec | null) {
+  constructor(ps: number, codec: PageCodec | null, stamp = 0) {
     this.ps = ps;
     this.cap = capOf(ps, codec !== null);
     this.codec = codec;
+    this.stamp = stamp;
+  }
+
+  // stamped is this sealer for a commit at txid: every page it builds carries that commit's stamp.
+  stamped(txid: bigint): Sealer {
+    return new Sealer(this.ps, this.codec, stampOf(txid));
   }
 
   static plain(ps: number): Sealer {
@@ -1170,7 +1181,7 @@ export class Sealer {
   ): { bytes: Uint8Array; tag: Uint8Array } {
     const codec = this.codec;
     if (codec === null) {
-      const p = makePage(this.ps, pageType, itemCount, next, payload);
+      const p = makePage(this.ps, pageType, itemCount, next, payload, this.stamp);
       if (flags !== 0) {
         p[1] = flags;
         new DataView(p.buffer, p.byteOffset, p.byteLength).setUint32(12, pageCrc(p), false);
@@ -1187,6 +1198,7 @@ export class Sealer {
     const dv = new DataView(p.buffer);
     p[0] = pageType;
     p[1] = flags;
+    dv.setUint16(2, this.stamp, false); // sealed with the page
     dv.setUint32(4, itemCount, false);
     dv.setUint32(8, next, false);
     if (chain) p.set(nextTag, PAGE_HEADER);
@@ -5431,7 +5443,7 @@ export function writeImage(
   if ((ps & (ps - 1)) !== 0) {
     throw engineError("feature_not_supported", "page size must be a power of two");
   }
-  const seal = new Sealer(ps, codec);
+  const seal = new Sealer(ps, codec).stamped(txid);
   const cap = seal.cap;
   // Every check that can refuse the image runs before the first page is sealed.
   checkCatalogTextLengths(snap);
@@ -6157,7 +6169,7 @@ function serializeIncremental(
   pages: { index: number; bytes: Uint8Array }[],
 ): IncrementalWrite {
   const ps = pageSize;
-  const seal = Sealer.of(ps, paging);
+  const seal = Sealer.of(ps, paging).stamped(snap.txid); // snap.txid is the txid this commit publishes
   const cap = seal.cap;
   // Every check that can refuse the commit runs before the first page is sealed, so a refusal draws
   // no nonce (encrypted.md §8).
@@ -7064,7 +7076,7 @@ export function* planFreeListSteps(
   // Joint allocation is monotone: reserve descriptor overflow pages first, then encode the free
   // list with those reservations removed. Growing the reservation can shrink the free-list chain,
   // so a final descriptor may have empty tail pages; never release/reallocate them in this trial.
-  const seal = Sealer.of(ps, paging);
+  const seal = Sealer.of(ps, paging).stamped(snap.txid);
   const encrypted = capEncrypted(seal.cap);
   let manifestCount = 0;
   for (;;) {
@@ -7196,6 +7208,13 @@ export function* loadEnginePagedAtSteps(
   let selected: { bytes: Uint8Array; slot: number; meta: CommitMeta } | undefined;
   let protectedPages = new Set<number>();
   for (const candidate of candidates) {
+    // The stamp window's floor is the other slot when it parses and is older (manifest-crc32.md
+    // §2.1); otherwise it is unknown and the CRC is the only check.
+    const sibling = parseCommitMeta(blocks[candidate.slot ^ 1]!, pageSize, physicalPages);
+    const stamps =
+      sibling !== null && sibling.txid < candidate.meta.txid
+        ? { floor: sibling.txid, newest: candidate.meta.txid }
+        : NO_STAMP_WINDOW;
     const validated =
       paging.cachedValidation(candidate.bytes) ??
       (yield* validateCommitMetaSteps(
@@ -7203,6 +7222,7 @@ export function* loadEnginePagedAtSteps(
         pageSize,
         (p) => paging.readPageSteps(p),
         (indices) => paging.readWindowSteps(indices),
+        stamps,
       ));
     if (validated !== null) {
       // An encrypted meta is authenticated after keyless selection; a CRC-valid meta that fails its
@@ -7914,10 +7934,12 @@ export function makePage(
   itemCount: number,
   nextPage: number,
   payload: Uint8Array,
+  stamp = 0,
 ): Uint8Array {
   const p = new Uint8Array(ps);
   const dv = new DataView(p.buffer);
   p[0] = pageType;
+  dv.setUint16(2, stamp, false); // the stale-page stamp (manifest-crc32.md §2.1), under the checksum
   dv.setUint32(4, itemCount, false);
   dv.setUint32(8, nextPage, false);
   p.set(payload, PAGE_HEADER);

@@ -8,6 +8,7 @@
 
 import {
   chainStep,
+  manifestPageHeaderOk,
   pageDigest,
   manifestInlineCapacity,
   manifestOverflowCapacity,
@@ -182,7 +183,7 @@ export class Delta {
         block.length !== ps ||
         pageChecksum(block) !== u32(block, 12) ||
         block[0] !== PAGE_MANIFEST ||
-        !zero(block, 1, 4) ||
+        !manifestPageHeaderOk(block, m.txid) ||
         u32(block, 4) !== count ||
         u64(block, 16) !== m.txid ||
         u32(block, 24) !== ordinal ||
