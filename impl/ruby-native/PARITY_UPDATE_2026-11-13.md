@@ -95,19 +95,28 @@ the process report also records runtime, limits and complete output.
 
 ## Integration on 2026-11-14
 
-Rebased onto local master `f35a470bb0d53d94f2f92e5a4e9d0a315d914b68`,
+Rebased onto local master `1840ab5d72c7f91245c9bd118b6ff273809a9fb2`,
 which adds two shared corpus files (766 total). Integration also brings Ruby's
 numeric resolver up to that revision: `div`/`gcd`/`lcm` validate decimal-island
 arguments through the shared coercion table, preserve promoted integer widths,
 and report the specified NULL result types; `width_bucket` returns `i32`.
 Exact-type subquery membership retains the eager aggregate input memory account,
-while mixed-float membership keeps the existing lane.
+while mixed-float membership keeps the existing lane. The statistics hash now
+applies the shared splitmix64 finalizer to its FNV-1a state, matching the
+updated sample and KMV estimates.
 
-The integration source digest is
+The numeric/memory integration source digest is
 `cf53f77e2ff817b86c767c0c833d1989c430c3c916bb85a33bfc11a545eef668`.
 The expression corpus passes 3,352/3,352 records and the resource corpus passes
 1,013/1,013 records (two shared skips), including both new files. Earlier storage
 and process results above remain evidence for the storage-refresh digest.
+
+The final integration source digest, including the statistics correction, is
+`2bb5707b6233b686db857b28070efdc8306073ff824f6791c20233885205bc3f`.
+All 77 host-test files pass again at this digest. The full memory corpus passes
+22,090/22,090 records across 766 files (2 shared skips), with matching
+initial and final source digests and no failures, unsupported files or timeouts.
+
 
 ## Remaining experimental limitations
 

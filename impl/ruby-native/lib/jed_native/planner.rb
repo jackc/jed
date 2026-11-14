@@ -148,7 +148,11 @@ module JedNative
     def statistics_hash(bytes)
       hash = 0xcbf29ce484222325
       bytes.each_byte { |byte| hash = ((hash ^ byte) * 0x100000001b3) & MASK64 }
-      hash
+      hash ^= hash >> 30
+      hash = (hash * 0xbf58476d1ce4e5b9) & MASK64
+      hash ^= hash >> 27
+      hash = (hash * 0x94d049bb133111eb) & MASK64
+      hash ^ (hash >> 31)
     end
 
     def analyze_table(statement)

@@ -150,7 +150,7 @@ The explicitly requested Ruby refresh (2026-11-13) tracks supported-core revisio
 incremental reclamation and sibling-leaf redistribution.
 [Its report](impl/ruby-native/PARITY_UPDATE_2026-11-13.md) records coverage and
 remaining omissions. Integration on 2026-11-14 also covers the numeric-resolver
-and aggregate-memory corpus additions through `f35a470bb`. Experimental status
+and aggregate-memory corpus additions plus the statistics hash correction through `1840ab5d7`. Experimental status
 and prior benchmark evidence are unchanged.
 
 The separately approved **native Swift experiment** (`impl/swift-native`, 2026-11-05)
