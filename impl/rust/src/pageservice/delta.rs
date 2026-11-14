@@ -227,7 +227,7 @@ pub(crate) fn begin_delta(base: &DeltaBase, cb: CommitBegin) -> Result<Delta> {
             return Err(invalid("a manifest page is malformed"));
         };
         if header.page_type != format::PAGE_MANIFEST_TYPE
-            || block[1..4] != [0; 3]
+            || !format::manifest_page_header_ok(&block, m.txid)
             || header.item_count as usize != count
             || u64_at(&block, 16) != m.txid
             || u32_at(&block, 24) as usize != ordinal

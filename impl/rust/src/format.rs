@@ -312,6 +312,9 @@ pub(crate) struct Sealer<'a> {
     pub(crate) ps: usize,
     pub(crate) cap: Cap,
     pub(crate) codec: Option<&'a crate::crypto::PageCodec>,
+    /// The txid16 every page this sealer builds carries at header offset 2 (manifest-crc32.md §2.1;
+    /// 0 when unstamped).
+    pub(crate) stamp: u16,
 }
 
 impl<'a> Sealer<'a> {
@@ -320,7 +323,14 @@ impl<'a> Sealer<'a> {
             ps,
             cap: Cap::plain(ps as u32),
             codec: None,
+            stamp: 0,
         }
+    }
+
+    /// This sealer for a commit at `txid`: every page it builds carries that commit's stamp.
+    pub(crate) fn stamped(mut self, txid: u64) -> Self {
+        self.stamp = commit_manifest::stamp_of(txid);
+        self
     }
 
     /// The sealer for a database whose paging context is `paging` (`None`: an in-memory or temp
@@ -331,6 +341,7 @@ impl<'a> Sealer<'a> {
             ps,
             cap: Cap::of(ps as u32, codec.is_some()),
             codec,
+            stamp: 0,
         }
     }
 
@@ -346,7 +357,9 @@ impl<'a> Sealer<'a> {
         payload: &[u8],
     ) -> Result<(Vec<u8>, crate::crypto::Tag)> {
         let Some(codec) = self.codec else {
-            let mut page = make_page(self.ps, page_type, item_count, next.page, payload);
+            let mut page = make_stamped_page(
+                self.ps, page_type, item_count, next.page, payload, self.stamp,
+            );
             if flags != 0 {
                 page[1] = flags;
                 let crc = page_crc(&page);
@@ -362,6 +375,7 @@ impl<'a> Sealer<'a> {
         let mut page = vec![0u8; self.ps];
         page[0] = page_type;
         page[1] = flags;
+        page[2..4].copy_from_slice(&self.stamp.to_be_bytes()); // sealed with the page
         page[4..8].copy_from_slice(&item_count.to_be_bytes());
         page[8..12].copy_from_slice(&next.page.to_be_bytes());
         if chain {
@@ -1977,6 +1991,7 @@ impl Snapshot {
             ps,
             cap: Cap::of(page_size, codec.is_some()),
             codec,
+            stamp: commit_manifest::stamp_of(txid),
         };
         let cap = seal.cap;
         check_catalog_text_lengths(self)?;
@@ -2708,7 +2723,7 @@ impl Snapshot {
         paging: Option<&SharedPaging>,
     ) -> Result<IncrementalWrite> {
         let ps = page_size as usize;
-        let seal = Sealer::of(ps, paging);
+        let seal = Sealer::of(ps, paging).stamped(self.txid); // self.txid is the txid this commit publishes
         let cap = seal.cap;
         // Every check that can refuse the commit runs before the first page is sealed, so a refusal
         // draws no nonce (encrypted.md §8).
@@ -3211,7 +3226,16 @@ impl Engine {
                 } else if let Some(pages) = pg.cached_validation(bytes) {
                     Some(pages)
                 } else {
-                    commit_manifest::validate(bytes, physical, |id| pg.read_block(id))?
+                    // The stamp window's floor is the other slot when it is older (manifest-crc32.md
+                    // §2.1); otherwise it is unknown and the CRC is the only check.
+                    let window = match parse_meta(&blocks[(slot ^ 1) as usize]) {
+                        Some(other) if other.txid < m.txid => commit_manifest::StampWindow {
+                            floor: other.txid,
+                            newest: m.txid,
+                        },
+                        _ => commit_manifest::StampWindow::NONE,
+                    };
+                    commit_manifest::validate(bytes, physical, window, |id| pg.read_block(id))?
                         .map(Arc::new)
                 };
                 if let Some(protected) = protected {
@@ -3238,9 +3262,12 @@ impl Engine {
                             && other.page_count <= physical
                             && (pg.trusts_meta()
                                 || pg.cached_validation(other_bytes).is_some()
-                                || commit_manifest::validate(other_bytes, physical, |id| {
-                                    pg.read_block(id)
-                                })?
+                                || commit_manifest::validate(
+                                    other_bytes,
+                                    physical,
+                                    commit_manifest::StampWindow::NONE,
+                                    |id| pg.read_block(id),
+                                )?
                                 .is_some())
                         {
                             floor_slot = (m.txid & 1) as u32;
@@ -3251,7 +3278,7 @@ impl Engine {
                     pg.adopt_generation(
                         m.txid,
                         u32::from_be_bytes(bytes[32..36].try_into().unwrap()),
-                        bytes[40..44] != [0; 4],
+                        commit_manifest::count_of(bytes).0 != 0,
                         floor_slot,
                     );
                     selected = Some(m);
@@ -3959,7 +3986,7 @@ pub(crate) fn plan_free_list(
             .copied()
             .filter(|id| !reserved.contains(id))
             .collect();
-        let seal = Sealer::of(ps, Some(paging));
+        let seal = Sealer::of(ps, Some(paging)).stamped(snap.txid);
         let cap = seal.cap;
         let (pages, head, persisted, new_pc) =
             serialize_free_list(&persist, &remaining, seal, next)?;
@@ -5731,8 +5758,22 @@ pub(crate) fn catalog_layout(entries: &[Vec<u8>], cap: usize) -> Vec<CatalogPage
 /// copies it into the image; an incremental commit pwrites it directly (`file.rs`). Single-sources
 /// the page byte layout.
 fn make_page(ps: usize, page_type: u8, item_count: u32, next_page: u32, payload: &[u8]) -> Vec<u8> {
+    make_stamped_page(ps, page_type, item_count, next_page, payload, 0)
+}
+
+/// `make_page` carrying a txid16 stamp at header offset 2 (manifest-crc32.md §2.1), written before the
+/// checksum so the page's own CRC-32 covers it.
+fn make_stamped_page(
+    ps: usize,
+    page_type: u8,
+    item_count: u32,
+    next_page: u32,
+    payload: &[u8],
+    stamp: u16,
+) -> Vec<u8> {
     let mut p = vec![0u8; ps];
     p[0] = page_type;
+    p[2..4].copy_from_slice(&stamp.to_be_bytes());
     p[4..8].copy_from_slice(&item_count.to_be_bytes());
     p[8..12].copy_from_slice(&next_page.to_be_bytes());
     p[PAGE_HEADER..PAGE_HEADER + payload.len()].copy_from_slice(payload);
@@ -6119,6 +6160,10 @@ pub(crate) fn manifest_chain_extend(crc: u64, bytes: &[u8], narrow: bool) -> u64
     commit_manifest::chain_extend(crc, bytes, narrow)
 }
 
+pub(crate) fn manifest_page_header_ok(page: &[u8], txid: u64) -> bool {
+    commit_manifest::manifest_page_header_ok(page, txid)
+}
+
 pub(crate) fn manifest_capacities_for(ps: usize, cap: Cap, narrow: bool) -> (usize, usize) {
     commit_manifest::capacities_for(ps, cap, narrow)
 }
@@ -6261,9 +6306,17 @@ fn select_meta(image: &[u8], ps: usize) -> Result<Meta> {
         .collect();
     candidates.sort_by_key(|c| std::cmp::Reverse(c.0.txid));
     for (mut meta, slot) in candidates {
+        let window = match parse_meta(&image[(slot ^ 1) * ps..((slot ^ 1) + 1) * ps]) {
+            Some(other) if other.txid < meta.txid => commit_manifest::StampWindow {
+                floor: other.txid,
+                newest: meta.txid,
+            },
+            _ => commit_manifest::StampWindow::NONE,
+        };
         if let Some(protected) = commit_manifest::validate(
             &image[slot * ps..(slot + 1) * ps],
             (image.len() / ps) as u32,
+            window,
             |id| Ok(image[id as usize * ps..(id as usize + 1) * ps].to_vec()),
         )? {
             meta.protected = Arc::new(protected);

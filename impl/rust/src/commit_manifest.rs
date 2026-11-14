@@ -69,6 +69,49 @@ pub(crate) fn chain_extend(crc: u64, bytes: &[u8], narrow: bool) -> u64 {
     }
 }
 
+/// The stamp a commit at `txid` writes at header offset 2 of every page it seals (manifest-crc32.md
+/// §2.1): the txid's low 16 bits, or 0 -- the v52 reserved value -- without stamping.
+pub(crate) fn stamp_of(txid: u64) -> u16 {
+    if page_txid_stamp() { txid as u16 } else { 0 }
+}
+
+/// The txid window a page listed by a manifest must carry a stamp from: `(floor, newest]`. Under
+/// `synchronous = on` the window is the one commit; under `synchronous = off` a cumulative manifest
+/// lists every page since the durability floor, each stamped by its own commit. An empty or inverted
+/// window, or one of 2^16 or more, admits every stamp, leaving the CRC as the only check.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct StampWindow {
+    pub(crate) floor: u64,
+    pub(crate) newest: u64,
+}
+
+impl StampWindow {
+    /// No floor is known: every stamp is admitted.
+    pub(crate) const NONE: StampWindow = StampWindow {
+        floor: 0,
+        newest: 0,
+    };
+
+    pub(crate) fn contains(self, stamp: u16) -> bool {
+        if !page_txid_stamp() || self.newest <= self.floor {
+            return true;
+        }
+        let span = self.newest - self.floor;
+        if span >= 1 << 16 {
+            return true;
+        }
+        let d = u64::from(stamp.wrapping_sub(self.floor as u16));
+        d >= 1 && d <= span
+    }
+}
+
+/// A manifest-overflow page's header bytes 1-3 as the commit at `txid` wrote them: flags zero and the
+/// commit's own stamp. A manifest page is always written by the commit whose meta names it, so this is
+/// an exact equality (zero without stamping, as through v52).
+pub(crate) fn manifest_page_header_ok(page: &[u8], txid: u64) -> bool {
+    page[1] == 0 && u16::from_be_bytes([page[2], page[3]]) == stamp_of(txid)
+}
+
 fn read_entry(e: &[u8], narrow: bool) -> (u32, u64) {
     let digest = if narrow {
         u64::from(u32_at(e, 4))
@@ -223,12 +266,13 @@ pub(super) fn encode(
         payload[..8].copy_from_slice(&meta[12..20]);
         payload[8..12].copy_from_slice(&(ordinal as u32).to_be_bytes());
         put_entries(&mut payload[16..], &entries[lo..hi]);
-        let page = make_page(
+        let page = make_stamped_page(
             ps,
             PAGE_MANIFEST,
             (hi - lo) as u32,
             ids.get(ordinal + 1).copied().unwrap_or(0),
             &payload,
+            stamp_of(u64_at(&meta, 12)),
         );
         digest = chain_extend(
             chain_extend(digest, &id.to_be_bytes(), narrow),
@@ -270,9 +314,10 @@ pub(super) fn chain_pages(
 pub(super) fn validate(
     meta: &[u8],
     physical: u32,
+    window: StampWindow,
     mut read: impl FnMut(u32) -> Result<Vec<u8>>,
 ) -> Result<Option<HashSet<u32>>> {
-    match validate_inner(meta, physical, &mut read) {
+    match validate_inner(meta, physical, window, &mut read) {
         Ok(ids) => Ok(Some(ids)),
         Err(e) if e.state == SqlState::DataCorrupted => Ok(None),
         Err(e) => Err(e),
@@ -281,6 +326,7 @@ pub(super) fn validate(
 fn validate_inner(
     meta: &[u8],
     physical: u32,
+    window: StampWindow,
     read: &mut impl FnMut(u32) -> Result<Vec<u8>>,
 ) -> Result<HashSet<u32>> {
     let pc = u32_at(meta, 24);
@@ -305,8 +351,12 @@ fn validate_inner(
     {
         return Err(bad());
     }
+    // A plaintext page must also carry a stamp from the window (manifest-crc32.md §2.1); an encrypted
+    // page's stamp is sealed, so its ciphertext digest is the whole keyless check.
     let typed = |page: &[u8]| -> Result<bool> {
-        Ok(encrypted || (1..=7).contains(&parse_page(page)?.page_type))
+        Ok(encrypted
+            || ((1..=7).contains(&parse_page(page)?.page_type)
+                && window.contains(u16::from_be_bytes([page[2], page[3]]))))
     };
     let mut protected = HashSet::new();
     let mut last = 1;
@@ -356,7 +406,7 @@ fn validate_inner(
         let number = remaining.min((meta.len() - OVERFLOW_HEADER) / entry);
         if p.page_type != PAGE_MANIFEST
             || p.item_count as usize != number
-            || page[1..4] != [0; 3]
+            || !manifest_page_header_ok(&page, u64_at(meta, 12))
             || u64_at(&page, 16) != u64_at(meta, 12)
             || u32_at(&page, 24) as usize != ordinal
             || u32_at(&page, 28) != 0
