@@ -59,13 +59,13 @@ All full corpus runs report zero unsupported files, timeouts and memory-limit
 terminations. Their 2 / 86 / 87 skipped files are the shared memory/plaintext/
 encrypted exclusions. The full runs started at implementation digest
 `a57a88af1f274091879b5760b7b6b270c1735a04ebde20bd8fb140e72b173356`.
-The final source digest is
+The storage-refresh source digest is
 `44d3d239566ea28469a4233a352a2238585fce0dddb07c99df17f7f3d7db272c`;
 it additionally corrects the owner maintenance pin boundary: a completed client
 write releases its old-generation pin before maintenance, and a pinned reader
 prevents a rebuild/maintenance commit. Final host, process, and both storage
 corpus reruns verify that correction separately. Both storage reruns and the
-process run begin and end at the final digest. `git diff --check` is clean.
+process run begin and end at that digest. `git diff --check` is clean.
 Digests are SHA-256 over sorted
 `lib/**/*.rb` contents, as recorded by the opt-in runners.
 
@@ -92,6 +92,22 @@ JED_PROCESS_CORES=ruby-native,go,rust mise run ruby-native:process
 Set `JED_NATIVE_REPORT` for a corpus JSON report and `JED_NATIVE_RUN_REPORT` for
 the process report. Corpus reports include initial/final implementation digests;
 the process report also records runtime, limits and complete output.
+
+## Integration on 2026-11-14
+
+Rebased onto local master `f35a470bb0d53d94f2f92e5a4e9d0a315d914b68`,
+which adds two shared corpus files (766 total). Integration also brings Ruby's
+numeric resolver up to that revision: `div`/`gcd`/`lcm` validate decimal-island
+arguments through the shared coercion table, preserve promoted integer widths,
+and report the specified NULL result types; `width_bucket` returns `i32`.
+Exact-type subquery membership retains the eager aggregate input memory account,
+while mixed-float membership keeps the existing lane.
+
+The integration source digest is
+`cf53f77e2ff817b86c767c0c833d1989c430c3c916bb85a33bfc11a545eef668`.
+The expression corpus passes 3,352/3,352 records and the resource corpus passes
+1,013/1,013 records (two shared skips), including both new files. Earlier storage
+and process results above remain evidence for the storage-refresh digest.
 
 ## Remaining experimental limitations
 

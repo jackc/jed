@@ -77,6 +77,8 @@ files in the same change.
   `32feb48fd`: format v53, deferred interiors, narrow manifests, page stamps,
   incremental reclamation and sibling-leaf redistribution. Coverage and remaining
   omissions are recorded in `impl/ruby-native/PARITY_UPDATE_2026-11-13.md`.
+  Integration on 2026-11-14 also covers the numeric-resolver and aggregate-memory
+  corpus additions through `f35a470bb`.
   Its experimental status and prior benchmark evidence are unchanged.
   The explicitly authorized Swift refresh (2026-11-13) targets supported-core
   revision `32feb48fd961598c2d7e60f0de284ba619a74ab0` and format v53.

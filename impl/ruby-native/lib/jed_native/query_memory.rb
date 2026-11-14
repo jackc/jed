@@ -331,6 +331,19 @@ module JedNative
       raise Error.new('54P05', "query memory exceeded the limit of #{@query_memory.limit} bytes")
     end
 
+    def compile_filter(node, columns)
+      expression = super
+      context = @query_memory_contexts&.last
+      if context && context[:vector_group] && node.equal?(context[:statement][:where]) && expression
+        # Exact-type membership retains point-list bookkeeping and uses the
+        # eager input account, matching the shared discard-safety contract.
+        if expression_nodes(expression).any? { |part| part.kind == :query_membership && part.args.first.type == part.extra[:element_type] }
+          context[:vector_group] = false
+        end
+      end
+      expression
+    end
+
     def query_memory_vector_group?(statement)
       return false unless statement[:kind] == :select && !statement[:with] && (statement[:joins] || []).empty?
       sources = statement[:from] || []

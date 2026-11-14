@@ -23,6 +23,15 @@ module JedNative
     def return_type(name, arg_types)
       name = name.to_s.downcase
       arg_types = arg_types.map { |t| Types.normalize(t) }
+      if %w[div gcd lcm].include?(name)
+        unless arg_types.length == 2 && arg_types.all? { |type| %w[decimal null unknown].include?(type) || ArgCoercion.cheapest([:typed, type]) { |target| target == 'decimal' } }
+          raise Error.new('42883', "function #{name} has incompatible arguments")
+        end
+        return 'decimal' if name == 'div' || arg_types.include?('decimal')
+        integers = arg_types.select { |type| Types::INTEGER_BITS.key?(type) }
+        return integers.max_by { |type| Types::INTEGER_BITS.fetch(type) } || 'i64'
+      end
+      return 'i32' if name == 'width_bucket'
       return 'decimal' if name == 'extract'
       return 'text[]' if name == 'regexp_matches'
       return 'text' if name == 'regexp_split_to_table'
@@ -124,7 +133,7 @@ module JedNative
           x, y = a.round(scale).coefficient, b.round(scale).coefficient
           Decimal.new(name == 'gcd' ? x.gcd(y) : x.lcm(y), scale)
         else
-          Types.check_integer(name == 'gcd' ? a.gcd(b) : a.lcm(b), (arg_types || []).first || 'i64')
+          Types.check_integer(name == 'gcd' ? a.gcd(b) : a.lcm(b), return_type(name, arg_types || %w[i64 i64]))
         end
       when 'width_bucket'
         count = d
