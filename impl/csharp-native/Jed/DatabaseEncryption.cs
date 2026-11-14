@@ -12,7 +12,7 @@ public sealed partial class Database
         {
             using var codec = new StoragePageCodec(key, options.KeyEntropy);
             var block = codec.Wrap(pageSize, 1, options.Credential!.Value).Bytes.ToArray();
-            var root = codec.SealBody(4, StorageFormat.EncodePage(pageSize, new(1, 0, 0, 0), new byte[16]));
+            var root = codec.SealBody(4, StorageFormat.EncodePage(pageSize, new(1, 0, 0, 0, 1), new byte[16]));
             var meta = StorageCryptoMeta.Encode(new(pageSize, 1, 4, 5, 0, 1), root.AsSpan(pageSize - 16), new byte[16], []);
             var first = codec.SealMeta(0, meta, []); var second = codec.SealMeta(1, meta, []);
             return [first, second, block, block, root];

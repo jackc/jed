@@ -1,7 +1,12 @@
 {
   "schema_version": 1,
-  "semantic_revision": "b1a6affca7725e0b07a4f734eddb1c569ef76bcf",
-  "status": "frozen",
+  "semantic_revision": "6b2355d98a7fd3738c60474779d1d63548f350dc",
+  "status": "refreshed-experimental",
   "platform": "linux-x64",
-  "supplemental_corpus": ["spec/conformance/suites/query/scalar_foundations.test"]
+  "supplemental_corpus": [
+    "spec/conformance/suites/query/scalar_foundations.test",
+    "spec/conformance/suites/resource/query_memory_aggregate_expression.test",
+    "spec/conformance/suites/expr/numeric_resolver_coercion.test"
+  ],
+  "previous_semantic_revision": "b1a6affca7725e0b07a4f734eddb1c569ef76bcf"
 }

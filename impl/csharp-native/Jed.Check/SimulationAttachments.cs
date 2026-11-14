@@ -94,7 +94,7 @@ internal sealed partial class SimulationRunner
         state.Database.MaxStorageBytes = trace.MaxStorage;
         state.Database.SetWorkMem(trace.WorkMemory);
         var storage = state.Database.CommittedStorageForTesting();
-        state.Growth = storage.Meta.PageCount - storage.FreePages.Count; state.Reclaimed = false;
+        state.Growth = Math.Max(0, storage.LeakedPages); state.Reclaimed = false;
     }
     private async Task ReattachDomains()
     {

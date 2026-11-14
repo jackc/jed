@@ -72,7 +72,7 @@ internal static class RecursiveExecution
     private static async IAsyncEnumerable<SqlValue[]> Run(PreparedRelation anchor, PreparedRelation step, WorkingRows working,
         BoundColumn[] columns, bool all, Meter meter, [EnumeratorCancellation] CancellationToken cancellationToken, RecursiveDecoration? decoration)
     {
-        var seen = new HashSet<string>(StringComparer.Ordinal); long seenBytes = 0;
+        var seen = new HashSet<byte[]>(ByteKeyComparer.Instance); long seenBytes = 0;
         async ValueTask<List<SqlValue[]>> Collect(PreparedRelation source)
         {
             var result = new List<SqlValue[]>();
@@ -96,7 +96,7 @@ internal static class RecursiveExecution
                 if (!all)
                 {
                     foreach (var value in row) GroupExecution.ChargeKey(value, meter);
-                    if (!seen.Add(GroupExecution.Identity(row)))
+                    if (!seen.Add(GroupExecution.EncodedIdentity(row)))
                     { if (source.MemoryOutput && meter.Memory.Enabled) meter.Memory.Release(MemorySize.RowBytes(values)); continue; }
                     if (meter.Memory.Enabled) { var bytes = MemorySize.EntryBytes(row); meter.Memory.Reserve(bytes); seenBytes = Meter.Add(seenBytes, bytes); }
                 }

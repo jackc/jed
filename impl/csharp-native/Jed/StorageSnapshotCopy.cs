@@ -34,7 +34,7 @@ internal sealed class StorageSnapshotCopy(StoragePager source, DatabaseSnapshot 
         var header = StorageFormat.ParsePage(page.Span, verifyChecksum: !Encrypted);
         if (header.Type == 3)
         {
-            var interior = StorageInterior.Parse(page.Span, snapshot.Meta.PageCount, Encrypted);
+            var interior = StorageInterior.Parse(page.Span, snapshot.Meta.PageCount, Encrypted, reference.Page, snapshot.Meta.Remap);
             for (var i = 0; i < interior.Children.Length; i++)
                 await TreeAsync(new(interior.Children[i], interior.Tags is null ? default : interior.Tags[i]), schema, depth + 1, token).ConfigureAwait(false);
         }

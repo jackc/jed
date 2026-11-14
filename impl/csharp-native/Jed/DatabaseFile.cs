@@ -201,7 +201,7 @@ public sealed partial class Database
             {
                 ownsTemporary = true;
                 var pages = options.Credential is null
-                    ? new[] { StorageFormat.EncodeMeta(new(pageSize, 1, 2, 3, 0, 1)), StorageFormat.EncodeMeta(new(pageSize, 1, 2, 3, 0, 1)), StorageFormat.EncodePage(pageSize, new(1, 0, 0, 0), []) }
+                    ? new[] { StorageFormat.EncodeMeta(new(pageSize, 1, 2, 3, 0, 1)), StorageFormat.EncodeMeta(new(pageSize, 1, 2, 3, 0, 1)), StorageFormat.EncodePage(pageSize, new(1, 0, 0, 0, 1), []) }
                     : CreateEncryptedImage(pageSize, options);
                 for (var page = 0; page < pages.Length; page++) await store.WriteAsync((long)page * pageSize, pages[page], token).ConfigureAwait(false);
                 await store.SyncAsync(token).ConfigureAwait(false);
@@ -453,7 +453,7 @@ public sealed partial class Database
                     if (state.NeedsElection || state.Client is not null || state.Ledger is null) throw new SqlException(SqlStates.ConnectionFailure, "owner role ended during snapshot adoption");
                     if (!state.CatalogDirty) return current;
                     ledger = state.Ledger; snapshotPager = pager; role = state.Role;
-                    pinned = ledger.Pin(ledger.Incarnation, ledger.CurrentTransactionId);
+                    pinned = ledger.PinLocal();
                 }
                 using var pin = pinned;
                 var encrypted = ownedCodec is null ? null : StorageCryptoMeta.Parse(pin.Snapshot.Meta, long.MaxValue) ?? throw StorageFormat.Corrupt("invalid published encrypted meta");
@@ -489,7 +489,7 @@ public sealed partial class Database
                 {
                     Check();
                     if (role != state.Role || state.Admission is not null || state.NeedsElection) continue;
-                    var pin = state.Ledger!.Pin(state.Ledger.Incarnation, current.Meta.TransactionId);
+                    var pin = state.Ledger!.PinLocal();
                     if (current.Meta.TransactionId != pin.Snapshot.TransactionId) { pin.Dispose(); continue; }
                     pins[current.Meta.TransactionId] = pins.GetValueOrDefault(current.Meta.TransactionId) + 1;
                     return new(this, current with { Pager = pager }, () => { pin.Dispose(); return ValueTask.CompletedTask; });
@@ -677,7 +677,14 @@ public sealed partial class Database
                         state.Options.FlushIntervalMilliseconds, shrink: false, token: token).ConfigureAwait(false);
             }
             var pin = state.Ledger!.Pin(state.Ledger.Incarnation, state.Ledger.CurrentTransactionId);
-            var grant = state.Ledger.CanReuse(committer.Current.FreeGeneration);
+            bool grant;
+            lock (gate)
+            {
+                var oldest = state.Ledger.OldestPin ?? ulong.MaxValue;
+                if (pins.Count != 0) oldest = Math.Min(oldest, pins.Keys.Min());
+                grant = oldest >= committer.Current.FreeGeneration &&
+                    !retiredAt.Any(entry => entry.Value > oldest && committer.Current.FreePages.Contains(entry.Key));
+            }
             return new RemoteWriter(this, role, held, pin, committer.Current, grant, relaxed);
         }
         catch (Exception error)
@@ -747,7 +754,8 @@ public sealed partial class Database
                 var recovered = new StorageRecovered(validation.Meta, slot, slot, dependencies, free, chain)
                 {
                     ManifestPages = validation.Manifest.Select(page => page.Index).ToHashSet(), Encrypted = validation.EncryptedMeta,
-                    LastReclamationLive = before.ReclamationLive, ReclamationTransactionId = before.FreeGeneration
+                    LastReclamationLive = before.ReclamationLive, ReclamationTransactionId = before.FreeGeneration,
+                    HeldOrphans = before.HeldOrphans, IncrementalKnown = false
                 };
                 long? deadline = before.Batch?.DeadlineMicroseconds;
                 if (relaxed && before.Batch is null && state.Options.FlushIntervalMilliseconds != 0)

@@ -11,14 +11,27 @@ internal static class GroupExecution
         internal readonly AggregateJson? Json = AggregateJson.IsJson(plan.Name) ? new() : null;
         internal readonly AggregateOrdered? Ordered = plan.WithinOrder is null ? null : new();
         internal readonly AggregateFloat? Floating = plan.Name is "sum" or "avg" && plan.Type.IsFloat() ? new() : null;
-        internal readonly List<Input> Buffered = [];
-        internal readonly List<SqlValue> Collected = [];
-        internal readonly System.Text.StringBuilder Text = new();
-        internal readonly List<byte> Bytes = [];
+        private List<Input>? buffered;
+        private List<SqlValue>? collected;
+        private System.Text.StringBuilder? text;
+        private List<byte>? bytes;
+        internal List<Input> Buffered => buffered ??= [];
+        internal List<SqlValue> Collected => collected ??= [];
+        internal System.Text.StringBuilder Text => text ??= new();
+        internal List<byte> Bytes => bytes ??= [];
         internal long Count;
         internal SqlValue Value = SqlValue.Null(plan.Type);
-        internal ExactDecimal Sum = ExactDecimal.FromInt64(0);
-        internal readonly HashSet<string> Seen = new(StringComparer.Ordinal);
+        internal AggregateIntegerSum? IntegerSum = plan.Name is "sum" or "avg" && plan.Type == SqlType.Decimal && plan.Argument?.Type.IsInteger() == true ? new() : null;
+        private ExactDecimal decimalSum = ExactDecimal.Zero;
+        internal ExactDecimal Sum
+        {
+            get => IntegerSum?.Result ?? decimalSum;
+            // Scratch restoration can resume with the ordinary decimal fold.
+            set { decimalSum = value; IntegerSum = null; }
+        }
+        internal long SumLogicalBytes => IntegerSum?.LogicalBytes ?? MemorySize.ValueBytes(SqlValue.StoredDecimal(decimalSum));
+        private HashSet<byte[]>? seen;
+        internal HashSet<byte[]> Seen => seen ??= new(ByteKeyComparer.Instance);
         internal long MemoryBytes;
         internal bool StorageManaged;
         internal void Retain(long bytes, Meter meter) { if (StorageManaged) return; meter.Memory.Reserve(bytes); MemoryBytes = Meter.Add(MemoryBytes, bytes); }
@@ -34,12 +47,13 @@ internal static class GroupExecution
         { meter.Memory.Release(MemoryBytes); MemoryBytes = 0; foreach (var fold in Folds) fold.Release(meter); }
     }
 
-    internal static bool Lane(SelectPlan plan) => plan.Group is { } group && !plan.Distinct && plan.Windows is null && group.Having is null &&
+    internal static bool Lane(SelectPlan plan) => plan.Group is { Aggregates.Length: > 0 } group && !plan.Empty && plan.Access?.Kind is null or AccessKind.Full or AccessKind.Primary && !plan.Distinct && plan.DistinctOnCount == 0 && plan.Windows is null && group.Having is null &&
         group.Sets is not { Length: > 1 } && group.GroupingColumns is not { Length: > 0 } &&
         (group.Keys.Length == 0 || group.Keys is [{ Op: "column" } key] && key.Type.IsInteger()) &&
         group.Aggregates.All(aggregate => aggregate.Name is "count" or "sum" or "avg" or "min" or "max" && !aggregate.Distinct &&
             aggregate.Filter is null && aggregate.Order is not { Length: > 0 } && aggregate.WithinOrder is null &&
-            (aggregate.Argument is null || aggregate.Argument.Op == "column" || PredicatePlan.Safe(aggregate.Argument)));
+            (aggregate.Name is not ("sum" or "avg") || aggregate.Argument?.Type.Kind is SqlKind.I16 or SqlKind.I32 or SqlKind.I64 or SqlKind.Decimal or SqlKind.F32 or SqlKind.F64) &&
+            (aggregate.Argument is null || AggregateLanePlan.DiscardSafe(aggregate.Argument)));
     private static async IAsyncEnumerable<SqlValue[]> Buffered(IEnumerable<SqlValue[]> rows)
     { await ValueTask.CompletedTask.ConfigureAwait(false); foreach (var row in rows) yield return row; }
     internal static async IAsyncEnumerable<SqlValue[]> Run(GroupPlan plan, IAsyncEnumerable<SqlValue[]> source, Resolved? filter,
@@ -59,14 +73,28 @@ internal static class GroupExecution
             await foreach (var item in source.WithCancellation(cancellationToken).ConfigureAwait(false))
             {
                 var row = await inputMemory.TakeAsync(item, sourceMemory, touched).ConfigureAwait(false);
-                if (await QueryExecution.KeepsAsync(filter, row, meter, filterObservation).ConfigureAwait(false)) inputs.Add(row);
+                inputs.Add(row);
+            }
+            var retained = 0;
+            for (var index = 0; index < inputs.Count; index++)
+            {
+                var row = inputs[index];
+                if (await QueryExecution.KeepsAsync(filter, row, meter, filterObservation).ConfigureAwait(false)) inputs[retained++] = row;
                 else inputMemory.Release(row);
             }
+            if (retained < inputs.Count) inputs.RemoveRange(retained, inputs.Count - retained);
             source = Buffered(inputs); filter = null;
         }
+        if (lane && filter is not null)
+        {
+            source = AggregateLanePlan.Filtered(source, filter, meter, cancellationToken,
+                !meter.HasCostCeiling && plan.Aggregates.All(aggregate => aggregate.Argument is null or { Op: "column" }), filterObservation);
+            filter = null;
+        }
         var sets = plan.Sets ?? [Enumerable.Range(0, plan.Keys.Length).ToArray()];
+        var identitySets = sets.Select(set => set.Length == plan.Keys.Length && set.Where((slot, index) => slot != index).Any() == false).ToArray();
         var groups = sets.Select(_ => new List<Group>()).ToArray();
-        var positions = sets.Select(_ => new Dictionary<string, int>(StringComparer.Ordinal)).ToArray();
+        var positions = sets.Select(_ => new Dictionary<byte[], int>(ByteKeyComparer.Instance)).ToArray();
         Group Make(SqlValue[] keys, int set)
         {
             var bytes = meter.Memory.Enabled ? MemorySize.EntryBytes(sets[set].Select(slot => keys[slot]).ToArray()) : 0;
@@ -76,17 +104,19 @@ internal static class GroupExecution
         try
         {
         for (var set = 0; set < sets.Length; set++)
-            if (sets[set].Length == 0) { groups[set].Add(Make(plan.Keys.Select(key => SqlValue.Null(key.Type)).ToArray(), set)); positions[set].Add("", 0); }
+            if (sets[set].Length == 0) { groups[set].Add(Make(plan.Keys.Select(key => SqlValue.Null(key.Type)).ToArray(), set)); positions[set].Add(Array.Empty<byte>(), 0); }
         await foreach (var row in source.WithCancellation(cancellationToken).ConfigureAwait(false))
         {
             if (!await QueryExecution.KeepsAsync(filter, row, meter, filterObservation).ConfigureAwait(false)) continue;
-            var keys = new SqlValue[plan.Keys.Length];
+            var keys = plan.Keys.Length == 0 ? Array.Empty<SqlValue>() : new SqlValue[plan.Keys.Length];
             for (var i = 0; i < keys.Length; i++) keys[i] = await Evaluate.ExprAsync(plan.Keys[i], meter, row: row).ConfigureAwait(false);
             for (var set = 0; set < sets.Length; set++)
             {
-                var selected = sets[set].Select(slot => keys[slot]).ToArray();
+                // Keys belong to this row and are never mutated. New groups
+                // retain their separate outputKeys array below.
+                var selected = identitySets[set] ? keys : sets[set].Length == 0 ? Array.Empty<SqlValue>() : sets[set].Select(slot => keys[slot]).ToArray();
                 foreach (var key in selected) ChargeKey(key, meter);
-                var identity = Identity(selected);
+                var identity = EncodedIdentity(selected);
                 if (!positions[set].TryGetValue(identity, out var at))
                 {
                     var outputKeys = plan.Keys.Select(key => SqlValue.Null(key.Type)).ToArray();
@@ -108,9 +138,9 @@ internal static class GroupExecution
                     }
                     var value = aggregate.Argument is null ? SqlValue.Integer(1) : await Evaluate.ExprAsync(aggregate.Argument, meter, row: row).ConfigureAwait(false);
                     if (aggregate.Extra is { Length: > 0 }) { meter.Charge(Costs.OperatorEval); meter.Guard(); }
-                    var extra = new SqlValue[aggregate.Extra?.Length ?? 0];
+                    var extra = aggregate.Extra is { Length: > 0 } extraExpressions ? new SqlValue[extraExpressions.Length] : Array.Empty<SqlValue>();
                     for (var e = 0; e < extra.Length; e++) extra[e] = await Evaluate.ExprAsync(aggregate.Extra![e], meter, row: row).ConfigureAwait(false);
-                    var order = aggregate.Order ?? []; var orderKeys = new SortValue[order.Length];
+                    var order = aggregate.Order ?? []; var orderKeys = order.Length == 0 ? Array.Empty<SortValue>() : new SortValue[order.Length];
                     for (var k = 0; k < order.Length; k++)
                     {
                         var keyValue = await Evaluate.ExprAsync(order[k].Expression, meter, row: row).ConfigureAwait(false);
@@ -119,7 +149,7 @@ internal static class GroupExecution
                     if (aggregate.Distinct)
                     {
                         ChargeKey(value, meter); foreach (var item in extra) ChargeKey(item, meter);
-                        if (!fold.Seen.Add(Identity(new[] { value }.Concat(extra).ToArray()))) continue;
+                        if (!fold.Seen.Add(EncodedIdentity(value, extra))) continue;
                         if (meter.Memory.Enabled && (!value.IsNull || aggregate.Name == "array_agg" || AggregateJson.IsJson(aggregate.Name)))
                             fold.Retain(MemorySize.EntryBytes([value]), meter);
                     }
@@ -229,7 +259,8 @@ internal static class GroupExecution
             case "bool_or":
                 fold.Value = SqlValue.Boolean((!fold.Value.IsNull && fold.Value.AsBoolean()) || value.AsBoolean()); break;
             case "sum": case "avg":
-                if (aggregate.Type == SqlType.Decimal)
+                if (fold.IntegerSum is { } integerSum) integerSum.Add(value.AsInteger(), meter);
+                else if (aggregate.Type == SqlType.Decimal)
                 {
                     var addend = Resolve.Cast(value, SqlType.Decimal).AsDecimal();
                     meter.Charge(fold.Sum.DecimalWork(addend, "+")); meter.Guard();
@@ -257,7 +288,10 @@ internal static class GroupExecution
         if (fold.Count == 0) return SqlValue.Null(aggregate.Type);
         if (aggregate.Name == "string_agg") return aggregate.Type == SqlType.Text ? SqlValue.Text(fold.Text.ToString()) : SqlValue.Bytes(fold.Bytes.ToArray());
         if (aggregate.Type == SqlType.Decimal && aggregate.Name is "sum" or "avg")
-            return SqlValue.Decimal(aggregate.Name == "avg" ? fold.Sum.Divide(ExactDecimal.FromInt64(fold.Count)) : fold.Sum.CheckCap());
+        {
+            var sum = fold.Sum;
+            return SqlValue.Decimal(aggregate.Name == "avg" ? sum.Divide(ExactDecimal.FromInt64(fold.Count)) : sum.CheckCap());
+        }
         return fold.Value;
     }
 
@@ -299,15 +333,59 @@ internal static class GroupExecution
         else foreach (var field in value.AsComposite().Fields) Item(field);
         return writer.ToArray();
     }
-    internal static string Identity(IReadOnlyList<SqlValue> values)
+    internal static string Identity(IReadOnlyList<SqlValue> values) => Convert.ToHexString(EncodedIdentity(values));
+    internal static byte[] EncodedIdentity(IReadOnlyList<SqlValue> values)
     {
-        if (values.Count == 0) return "";
+        if (values.Count == 0) return Array.Empty<byte>();
+        if (IntegerIdentity(values) is { } fixedKey) return fixedKey;
         var writer = new WireWriter();
-        foreach (var value in values)
+        for (var index = 0; index < values.Count; index++)
         {
-            var bytes = IdentityBytes(value);
+            var bytes = IdentityBytes(values[index]);
             writer.U32((uint)bytes.Length); writer.Bytes(bytes);
         }
-        return Convert.ToHexString(writer.ToArray());
+        return writer.ToArray();
+    }
+    internal static byte[] EncodedIdentity(SqlValue first, IReadOnlyList<SqlValue> rest)
+    {
+        if (IntegerIdentity(rest, first, includeFirst: true) is { } fixedKey) return fixedKey;
+        var writer = new WireWriter();
+        var bytes = IdentityBytes(first);
+        writer.U32((uint)bytes.Length); writer.Bytes(bytes);
+        for (var index = 0; index < rest.Count; index++)
+        {
+            bytes = IdentityBytes(rest[index]);
+            writer.U32((uint)bytes.Length); writer.Bytes(bytes);
+        }
+        return writer.ToArray();
+    }
+
+    // Integer/NULL tuples need only one owned allocation. Keep the canonical
+    // framing and integer encoder shared with all other grouping/key paths.
+    private static byte[]? IntegerIdentity(IReadOnlyList<SqlValue> values, SqlValue first = default, bool includeFirst = false)
+    {
+        static int Width(SqlValue value) => value.IsNull ? 0 : value.Type.IsInteger() ? StoredValues.ScalarWidth(value.Type) : -1;
+        var firstWidth = includeFirst ? Width(first) : 0;
+        if (firstWidth < 0) return null;
+        var length = includeFirst ? 5 + firstWidth : 0;
+        for (var i = 0; i < values.Count; i++)
+        {
+            var width = Width(values[i]);
+            if (width < 0) return null;
+            length = checked(length + 5 + width);
+        }
+        var result = new byte[length];
+        var offset = 0;
+        void Write(SqlValue value)
+        {
+            var width = Width(value);
+            System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(result.AsSpan(offset), (uint)(width + 1));
+            result[offset + 4] = value.IsNull ? (byte)1 : (byte)0;
+            if (width != 0) KeyEncoding.WriteInteger(result.AsSpan(offset + 5, width), value.AsInteger());
+            offset += 5 + width;
+        }
+        if (includeFirst) Write(first);
+        for (var i = 0; i < values.Count; i++) Write(values[i]);
+        return result;
     }
 }

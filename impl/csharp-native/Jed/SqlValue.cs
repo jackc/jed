@@ -6,26 +6,24 @@ namespace Jed;
 /// <summary>An immutable, owned scalar value. default(SqlValue) is untyped SQL NULL.</summary>
 public readonly partial struct SqlValue
 {
-    private readonly bool present;
+    private static readonly object NullPayload = new();
     private readonly long integer;
-    private readonly string? text;
     private readonly object? payload;
-    internal int TextBytes { get; }
+    // Text has no numeric payload. Share that slot with its cached UTF-8 size
+    // so an immutable value occupies three words without boxing scalar bits.
+    internal int TextBytes => type?.Kind is SqlKind.Text or SqlKind.Json or SqlKind.Jsonpath ? (int)integer : 0;
     private readonly SqlType? type;
     public SqlType Type => type ?? SqlType.Unknown;
-    public bool IsNull => !present;
+    public bool IsNull => type is null || ReferenceEquals(payload, NullPayload);
     internal bool IsDeferred => payload is DeferredSqlValue;
     internal static SqlValue Deferred(SqlType type, DeferredSqlValue value) => new(type, true, payload: value);
     internal ValueTask<SqlValue> ResolveAsync(CancellationToken cancellationToken = default) => payload is DeferredSqlValue deferred ? deferred.ResolveAsync(cancellationToken) : new(this);
 
-    private SqlValue(SqlType type, bool present, long integer = 0, string? text = null, int textBytes = 0, object? payload = null)
+    private SqlValue(SqlType type, bool present, long integer = 0, int textBytes = 0, object? payload = null)
     {
         this.type = type;
-        this.present = present;
-        this.integer = integer;
-        this.text = text;
-        TextBytes = textBytes;
-        this.payload = payload;
+        this.integer = type.Kind is SqlKind.Text or SqlKind.Json or SqlKind.Jsonpath ? textBytes : integer;
+        this.payload = present ? payload : NullPayload;
     }
 
     public static SqlValue Null(SqlType? type = null) => new(type ?? SqlType.Unknown, false);
@@ -40,11 +38,11 @@ public readonly partial struct SqlValue
         _ = JsonInput.Parse(value, decode: false, canonical: false);
         return StoredJson(value);
     }
-    internal static SqlValue StoredJson(string value) => new(SqlType.Json, true, text: value, textBytes: TextEncoding.ByteCount(value));
-    public static SqlValue Jsonpath(SqlJsonPath value) => new(SqlType.Jsonpath, true, text: value.Text, textBytes: TextEncoding.ByteCount(value.Text), payload: value);
+    internal static SqlValue StoredJson(string value) => new(SqlType.Json, true, payload: value, textBytes: TextEncoding.ByteCount(value));
+    public static SqlValue Jsonpath(SqlJsonPath value) => new(SqlType.Jsonpath, true, textBytes: TextEncoding.ByteCount(value.Text), payload: value);
     public SqlJsonPath AsJsonpath() { RequireValue(); if (Type != SqlType.Jsonpath) throw Errors.Type("value is not jsonpath"); return (SqlJsonPath)payload!; }
     public static SqlValue Jsonb(SqlJsonNode value) => new(SqlType.Jsonb, true, payload: value);
-    public string AsJsonText() { RequireValue(); if (Type != SqlType.Json) throw Errors.Type("value is not json"); return text!; }
+    public string AsJsonText() { RequireValue(); if (Type != SqlType.Json) throw Errors.Type("value is not json"); return (string)payload!; }
     public SqlJsonNode AsJsonb() { RequireValue(); if (Type != SqlType.Jsonb) throw Errors.Type("value is not jsonb"); return (SqlJsonNode)payload!; }
     public static SqlValue Boolean(bool value) => new(SqlType.Boolean, true, value ? 1 : 0);
     public static SqlValue Date(int days) => new(SqlType.Date, true, days);
@@ -120,7 +118,7 @@ public readonly partial struct SqlValue
     {
         ArgumentNullException.ThrowIfNull(value);
         var bytes = TextEncoding.ByteCount(value);
-        return new(SqlType.Text, true, text: value, textBytes: bytes);
+        return new(SqlType.Text, true, payload: value, textBytes: bytes);
     }
 
     public long AsInteger()
@@ -139,7 +137,7 @@ public readonly partial struct SqlValue
     {
         RequireValue();
         if (Type != SqlType.Text) throw Errors.Type("value is not text");
-        return text!;
+        return (string)payload!;
     }
     private void RequireValue()
     {
@@ -149,7 +147,8 @@ public readonly partial struct SqlValue
     public override string ToString() => IsNull ? "NULL" : Type.Kind switch
     {
         SqlKind.Boolean => integer == 0 ? "false" : "true",
-        SqlKind.Text or SqlKind.Json or SqlKind.Jsonpath => text!,
+        SqlKind.Text or SqlKind.Json => (string)payload!,
+        SqlKind.Jsonpath => ((SqlJsonPath)payload!).Text,
         SqlKind.Jsonb => ((SqlJsonNode)payload!).ToString(),
         SqlKind.Decimal => ((ExactDecimal)payload!).ToString(),
         SqlKind.Date => TemporalInput.RenderDate((int)integer),

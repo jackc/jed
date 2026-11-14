@@ -93,12 +93,14 @@ internal sealed record CatalogTable(string Name, CatalogColumn[] Columns, int[] 
 
 internal sealed record CatalogWrite(uint Root, int PageCount, uint[] Pages, int PageDelta)
 {
+    internal List<(byte[] Payload, uint Count, byte Flags)>? Chunks { get; init; }
     internal ReadOnlyMemory<byte> RootTag { get; init; }
 }
 internal sealed partial record Catalog(CatalogTable[] Tables, uint[] Pages, CatalogComposite[]? Types = null,
     CatalogSequence[]? Sequences = null, CatalogCollation[]? Collations = null,
     CatalogStatistic[]? Statistics = null, CatalogView[]? Views = null)
 {
+    internal List<(byte[] Payload, uint Count, byte Flags)>? CommittedChunks { get; init; }
     internal Catalog() : this([], []) { }
 
     internal SqlType? NamedType(string name)
@@ -191,7 +193,12 @@ internal sealed partial record Catalog(CatalogTable[] Tables, uint[] Pages, Cata
     internal CatalogWrite Serialize(StorageAllocation allocation)
     {
         var chunks = ImageChunks(allocation.PayloadCapacity - (allocation.Encrypted ? 16 : 0), allocation.Encrypted);
-        foreach (var page in Pages) allocation.Reclaim(page);
+        if (allocation.Deferral is { } deferral && (!allocation.RequireBodyWrite || allocation.WrittenPages > 0) && Pages.Length > 0 &&
+            Pages[0] != deferral.Migration && CommittedChunks is { } previous && previous.Count == chunks.Count &&
+            chunks.Select((chunk, i) => chunk.Count == previous[i].Count && chunk.Flags == previous[i].Flags &&
+                chunk.Payload.AsSpan().SequenceEqual(previous[i].Payload)).All(equal => equal))
+            return new(Pages[0], Pages.Length, Pages, 0) { RootTag = allocation.Tag(Pages[0]), Chunks = chunks };
+        foreach (var page in Pages) allocation.ReclaimWholesale(page);
         var ids = new uint[chunks.Count];
         for (var i = 0; i < ids.Length; i++) ids[i] = allocation.ReservePage();
         for (var i = ids.Length - 1; i >= 0; i--)
@@ -207,7 +214,7 @@ internal sealed partial record Catalog(CatalogTable[] Tables, uint[] Pages, Cata
             allocation.SetPage(ids[i], StorageFormat.EncodePage(allocation.PageSize,
                 new(1, chunk.Flags, chunk.Count, i + 1 < ids.Length ? ids[i + 1] : 0), payload));
         }
-        return new(ids[0], ids.Length, ids, ids.Length - Pages.Length) { RootTag = allocation.Tag(ids[0]) };
+        return new(ids[0], ids.Length, ids, ids.Length - Pages.Length) { RootTag = allocation.Tag(ids[0]), Chunks = chunks };
     }
 
     internal List<(byte[] Payload, uint Count, byte Flags)> ImageChunks(int capacity, bool encrypted)

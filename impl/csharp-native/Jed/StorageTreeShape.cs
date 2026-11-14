@@ -16,8 +16,12 @@ internal sealed class StorageTreeShape(uint page, ReadOnlyMemory<byte> tag,
 
 internal sealed partial class StorageTree
 {
-    private static Node ShapeNode(StorageTreeShape shape) => new(Children: shape.Children.Select(child =>
-        new Ref(child.Page, Tag: child.Tag, Shape: child)).ToArray(), Keys: shape.Separators);
+    // Shape identity already owns these interior facts. Weak-key memoization
+    // avoids rebuilding every child reference on each point lookup, without
+    // retaining a dead snapshot or any leaf page outside the bounded pager.
+    private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<StorageTreeShape, Node> ShapeNodes = new();
+    private static Node ShapeNode(StorageTreeShape shape) => ShapeNodes.GetValue(shape, static value => new(
+        Children: value.Children.Select(child => new Ref(child.Page, Tag: child.Tag, Shape: child)).ToArray(), Keys: value.Separators));
 
     private static bool HasShape(Ref? reference)
     {

@@ -1,4 +1,5 @@
 using System.Runtime.CompilerServices;
+using System.Buffers.Binary;
 
 namespace Jed;
 
@@ -6,29 +7,37 @@ namespace Jed;
 // first-occurrence directory, once for each grouping set.
 internal static class SpillGroup
 {
-    private sealed record State(SqlValue[] Keys, SpillFold[] Folds, int Set);
+    internal sealed record State(SqlValue[] Keys, SpillFold[] Folds, int Set);
     private static State Empty(GroupPlan plan, SqlValue[] keys, int set) => new(keys, plan.Aggregates.Select(a => new SpillFold(a)).ToArray(), set);
-    private static long Size(State state, SqlValue[] selected) => state.Folds.Aggregate(
-        Meter.Add(MemorySize.EntryBytes(selected), MemorySchedule.Value), (bytes, fold) => Meter.Add(bytes, fold.LogicalBytes()));
-    private static byte[] Encode(State state)
+    private static long Size(State state, SqlValue[] selected)
+    {
+        var bytes = Meter.Add(MemorySize.EntryBytes(selected), MemorySchedule.Value);
+        foreach (var fold in state.Folds) bytes = Meter.Add(bytes, fold.LogicalBytes());
+        return bytes;
+    }
+    internal static byte[] Encode(State state)
     {
         var writer = new WireWriter(); writer.U32((uint)state.Set);
         foreach (var key in state.Keys) ScratchValues.Write(writer, key);
         foreach (var fold in state.Folds) fold.Write(writer);
         return writer.ToArray();
     }
-    private static State Decode(byte[] bytes, GroupPlan plan)
+    internal static State Decode(byte[] bytes, GroupPlan plan)
     {
         var reader = new WireReader(bytes); var set = checked((int)reader.U32());
-        var keys = new SqlValue[plan.Keys.Length];
+        var keys = plan.Keys.Length == 0 ? Array.Empty<SqlValue>() : new SqlValue[plan.Keys.Length];
         for (var i = 0; i < keys.Length; i++) keys[i] = ScratchValues.Read(ref reader, plan.Keys[i].Type);
         var state = Empty(plan, keys, set);
         foreach (var fold in state.Folds) fold.Read(ref reader);
         reader.Finish(); return state;
     }
-    private static byte[] Key(int set, SqlValue[] values)
+    internal static byte[] Key(int set, SqlValue[] values)
     {
-        var writer = new WireWriter(); writer.U32((uint)set); writer.Bytes(Convert.FromHexString(GroupExecution.Identity(values))); return writer.ToArray();
+        var identity = GroupExecution.EncodedIdentity(values);
+        var key = new byte[checked(4 + identity.Length)];
+        BinaryPrimitives.WriteUInt32BigEndian(key, (uint)set);
+        identity.CopyTo(key, 4);
+        return key;
     }
     private static async IAsyncEnumerable<SqlValue[]> Transferred(IAsyncEnumerable<SqlValue[]> source, Meter meter, [EnumeratorCancellation] CancellationToken token)
     {
@@ -41,46 +50,62 @@ internal static class SpillGroup
     {
         await using var inputs = new SpillRowSpool(policy.Host, policy.WorkMem, meter);
         await using var output = new SpillRowSpool(policy.Host, policy.WorkMem, meter);
-        await using var groups = new SpillGroupStore(policy, meter, lane);
+        await using var groups = new SpillGroupStore(policy, meter, lane, plan);
         await using var collections = new SpillAggregateInputs(policy, meter);
         if (lane && sourceMemory) source = Transferred(source, meter, token);
         if (!lane)
         {
+            await using var scanned = new SpillRowSpool(policy.Host, policy.WorkMem, meter);
             await foreach (var item in source.WithCancellation(token).ConfigureAwait(false))
             {
                 var row = new SqlValue[item.Length];
-                for (var i = 0; i < row.Length; i++) row[i] = touched is not null && !touched.Contains(i) ? SqlValue.Null(item[i].Type) : await item[i].ResolveAsync(token).ConfigureAwait(false);
+                for (var i = 0; i < row.Length; i++) row[i] = touched is not null && !touched.Contains(i) ? SqlValue.Null(item[i].Type) : (item[i].IsDeferred ? await item[i].ResolveAsync(token).ConfigureAwait(false) : item[i]);
                 if (sourceMemory) meter.Memory.Release(MemorySize.RowBytes(item));
-                if (await QueryExecution.KeepsAsync(filter, row, meter, filterObservation).ConfigureAwait(false)) await inputs.Append(row, token).ConfigureAwait(false);
+                await scanned.AppendOwned(row, token).ConfigureAwait(false);
             }
+            // Scanned rows are fully resident, never reused or mutated, and
+            // scanned is disposed before folding; retain the same owned array.
+            await foreach (var row in scanned.Read(token).ConfigureAwait(false))
+                if (await QueryExecution.KeepsAsync(filter, row, meter, filterObservation).ConfigureAwait(false))
+                    await inputs.AppendOwned(row, token).ConfigureAwait(false);
             source = inputs.Read(token); filter = null;
         }
+        if (lane && filter is not null)
+        {
+            source = AggregateLanePlan.Filtered(source, filter, meter, token,
+                !meter.HasCostCeiling && plan.Aggregates.All(aggregate => aggregate.Argument is null or { Op: "column" }), filterObservation);
+            filter = null;
+        }
         var sets = plan.Sets ?? [Enumerable.Range(0, plan.Keys.Length).ToArray()];
+        var identitySets = sets.Select(set => set.Length == plan.Keys.Length && set.Where((slot, index) => slot != index).Any() == false).ToArray();
+        var emptyKeys = Enumerable.Range(0, sets.Length).Select(set => Key(set, [])).ToArray();
         for (var set = 0; set < sets.Length; set++)
             if (sets[set].Length == 0)
             {
                 var keys = plan.Keys.Select(key => SqlValue.Null(key.Type)).ToArray();
                 var empty = Empty(plan, keys, set);
-                await groups.Put(Key(set, []), Encode(empty), [], Size(empty, []), token).ConfigureAwait(false);
+                await groups.Put(emptyKeys[set], empty, [], Size(empty, []), token).ConfigureAwait(false);
             }
         await foreach (var row in source.WithCancellation(token).ConfigureAwait(false))
         {
             if (!await QueryExecution.KeepsAsync(filter, row, meter, filterObservation).ConfigureAwait(false)) continue;
-            var keys = new SqlValue[plan.Keys.Length];
+            var keys = plan.Keys.Length == 0 ? Array.Empty<SqlValue>() : new SqlValue[plan.Keys.Length];
             for (var i = 0; i < keys.Length; i++) keys[i] = await Evaluate.ExprAsync(plan.Keys[i], meter, row: row).ConfigureAwait(false);
             for (var set = 0; set < sets.Length; set++)
             {
-                var selected = sets[set].Select(slot => keys[slot]).ToArray();
+                var selected = identitySets[set] ? keys : sets[set].Length == 0 ? Array.Empty<SqlValue>() : new SqlValue[sets[set].Length];
+                if (!identitySets[set])
+                    for (var slot = 0; slot < selected.Length; slot++) selected[slot] = keys[sets[set][slot]];
                 foreach (var key in selected) GroupExecution.ChargeKey(key, meter);
-                var identity = Key(set, selected); var held = await groups.Get(identity, token).ConfigureAwait(false);
+                var identity = selected.Length == 0 ? emptyKeys[set] : Key(set, selected); var held = await groups.Get(identity, token).ConfigureAwait(false);
                 State group; long ordinal;
                 if (held is null)
                 {
                     var outputKeys = plan.Keys.Select(key => SqlValue.Null(key.Type)).ToArray();
                     foreach (var slot in sets[set]) outputKeys[slot] = keys[slot];
-                    group = Empty(plan, outputKeys, set); ordinal = await groups.Put(identity, Encode(group), selected, Size(group, selected), token).ConfigureAwait(false);
+                    group = Empty(plan, outputKeys, set); ordinal = await groups.Put(identity, group, selected, Size(group, selected), token).ConfigureAwait(false);
                 }
-                else { group = Decode(held.Bytes, plan); ordinal = held.Ordinal; }
+                else { group = held.Value.State; ordinal = held.Value.Ordinal; }
                 for (var i = 0; i < plan.Aggregates.Length; i++)
                 {
                     var aggregate = plan.Aggregates[i]; var fold = group.Folds[i];
@@ -95,9 +120,9 @@ internal static class SpillGroup
                     }
                     var value = aggregate.Argument is null ? SqlValue.Integer(1) : await Evaluate.ExprAsync(aggregate.Argument, meter, row: row).ConfigureAwait(false);
                     if (aggregate.Extra is { Length: > 0 }) { meter.Charge(Costs.OperatorEval); meter.Guard(); }
-                    var extra = new SqlValue[aggregate.Extra?.Length ?? 0];
+                    var extra = aggregate.Extra is { Length: > 0 } extraExpressions ? new SqlValue[extraExpressions.Length] : Array.Empty<SqlValue>();
                     for (var e = 0; e < extra.Length; e++) extra[e] = await Evaluate.ExprAsync(aggregate.Extra![e], meter, row: row).ConfigureAwait(false);
-                    var order = aggregate.Order ?? []; var orderKeys = new SortValue[order.Length];
+                    var order = aggregate.Order ?? []; var orderKeys = order.Length == 0 ? Array.Empty<SortValue>() : new SortValue[order.Length];
                     for (var k = 0; k < order.Length; k++) orderKeys[k] = CollationRules.Decorate(await Evaluate.ExprAsync(order[k].Expression, meter, row: row).ConfigureAwait(false), order[k].Expression, meter);
                     if (aggregate.Distinct)
                     {
@@ -107,7 +132,7 @@ internal static class SpillGroup
                     if (order.Length != 0) await collections.Ordered(ordinal, i, fold, value, extra, orderKeys, token).ConfigureAwait(false);
                     else await collections.Add(ordinal, i, 0, aggregate, fold, value, extra, token).ConfigureAwait(false);
                 }
-                await groups.Put(identity, Encode(group), selected, Size(group, selected), token).ConfigureAwait(false);
+                await groups.Put(identity, group, selected, Size(group, selected), token).ConfigureAwait(false);
             }
             await groups.EndRow(token).ConfigureAwait(false);
         }
@@ -115,7 +140,7 @@ internal static class SpillGroup
         for (var set = 0; set < sets.Length; set++)
             await foreach (var entry in groups.Read(token).ConfigureAwait(false))
             {
-                var group = Decode(entry.Value.Bytes, plan); if (group.Set != set) continue;
+                var group = entry.Value.State; if (group.Set != set) continue;
                 var grouping = plan.GroupingColumns ?? []; var aggregateStart = plan.Keys.Length + grouping.Length;
                 var row = new SqlValue[aggregateStart + plan.Aggregates.Length]; group.Keys.CopyTo(row, 0);
                 for (var i = 0; i < grouping.Length; i++)
@@ -129,7 +154,7 @@ internal static class SpillGroup
                     using (meter.SuppressCost()) for (var d = 0; d < direct.Length; d++) direct[d] = await Evaluate.ExprAsync(aggregate.Direct![d], meter, row: row).ConfigureAwait(false);
                     row[aggregateStart + i] = await collections.Result(entry.Value.Ordinal, i, aggregate, group.Folds[i], direct, token).ConfigureAwait(false);
                 }
-                if (await QueryExecution.KeepsAsync(plan.Having, row, meter).ConfigureAwait(false)) await output.Append(row, token).ConfigureAwait(false);
+                if (await QueryExecution.KeepsAsync(plan.Having, row, meter).ConfigureAwait(false)) await output.AppendOwned(row, token).ConfigureAwait(false);
             }
         await groups.DisposeAsync().ConfigureAwait(false); await collections.DisposeAsync().ConfigureAwait(false);
         await foreach (var row in output.Read(token).ConfigureAwait(false)) yield return row;

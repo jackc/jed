@@ -7,6 +7,10 @@ try
     if (args is ["stress", var stressInput, var stressStorage]) { await StressRunner.Run(stressInput, stressStorage); return 0; }
     if (args is ["native-api"]) { await NativeApiTests.Run(); return 0; }
     if (args is ["host-functions"]) { await HostFunctionTests.Run(); return 0; }
+    if (args is ["incremental-reclaim"]) { await IncrementalReclaimTests.Run(); return 0; }
+    if (args is ["packed-overwrite"]) { StorageLeafOverwriteTests.Run(); return 0; }
+    if (args is ["storage-v53", var storageRoot]) { await StorageV53Tests.Run(storageRoot); return 0; }
+    if (args is ["query-optimization"]) { await QueryOptimizationTests.Run(); await StorageScanTests.Run(); await MeterAttemptTests.Run(); LikeTests.Run(); return 0; }
     if (args is ["environment-host", var environmentRoot]) { await EnvironmentHostTests.Run(environmentRoot); return 0; }
     if (args.Length >= 3 && args[0] == "process-actor") return await ProcessActor.Run(args.Skip(1).ToArray());
     if (args is ["test", var root])
@@ -15,9 +19,14 @@ try
         await SessionCapabilityTests.Run();
         await ParameterHostTests.Run();
         await NativeApiTests.Run();
+        await QueryOptimizationTests.Run();
+        await StorageScanTests.Run();
+        await MeterAttemptTests.Run();
+        LikeTests.Run();
         await EnvironmentHostTests.Run(root);
         await HostFunctionTests.Run();
         await DatabaseTests.Run();
+        StorageLeafOverwriteTests.Run();
         DecimalTests.Run();
         EncodingTests.Run(root);
         await MemoryTests.Run(root);
@@ -39,6 +48,7 @@ try
         await PageClientTests.Run();
         await PageOwnerTests.Run();
         await DatabaseFileTests.Run();
+        await IncrementalReclaimTests.Run();
         await CredentialChangeTests.Run(root);
         await RekeyTests.Run(root);
         await DatabaseImageTests.Run(root);
@@ -85,6 +95,7 @@ try
         await PageClientTests.Run();
         await PageOwnerTests.Run();
         await DatabaseFileTests.Run();
+        await IncrementalReclaimTests.Run();
     }
     else if (args is ["encoding", var encodingRoot])
     {

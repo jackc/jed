@@ -14,7 +14,7 @@ internal sealed class SpillFold(AggregatePlan plan)
         else if (Finite.Moments is { } moments) fields = moments.LogicalBytes(plan);
         else if (plan.Name == "count") fields = MemorySchedule.Value;
         else if (Finite.Floating is not null) fields = 5 * MemorySchedule.Value;
-        else if (plan.Name is "sum" or "avg") fields = MemorySize.ValueBytes(plan.Type == SqlType.Decimal ? SqlValue.StoredDecimal(Finite.Sum) : Finite.Value) + MemorySchedule.Value;
+        else if (plan.Name is "sum" or "avg") fields = (plan.Type == SqlType.Decimal ? Finite.SumLogicalBytes : MemorySize.ValueBytes(Finite.Value)) + MemorySchedule.Value;
         else if (AggregateJson.IsJson(plan.Name) || plan.Name is "array_agg" or "string_agg")
             fields = MemorySchedule.Value + (plan.Name == "array_agg" && plan.Argument!.Type.Kind == SqlKind.Array ? MemorySchedule.Value * (1 + 2 * (ArrayShape.Length == 0 ? 0 : ArrayShape[0])) : 0);
         else fields = MemorySize.ValueBytes(Finite.Value);

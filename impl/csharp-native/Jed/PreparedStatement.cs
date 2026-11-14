@@ -5,6 +5,8 @@ public sealed class PreparedStatement
 {
     internal StatementSyntax Syntax { get; }
     internal string Sql { get; }
+    // A conservative lexical guard: quoted dollar signs only disable caching.
+    internal bool MayHaveParameters => Sql.Contains('$');
     internal PreparedStatement(string sql, StatementSyntax syntax) { Sql = sql; Syntax = syntax; }
 }
 
@@ -20,8 +22,8 @@ public sealed partial class Session
     public Task<Rows> QueryAsync(PreparedStatement statement, IReadOnlyList<SqlValue>? parameters = null, QueryOptions? options = null, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(statement);
-        var query = (options ?? new()) with { Parameters = parameters ?? options?.Parameters ?? [] };
-        return QueryCore(statement.Sql, query.MaxCost, cancellationToken, query, statement.Syntax);
+        var query = parameters is null ? options : (options ?? new()) with { Parameters = parameters };
+        return QueryCore(statement.Sql, query?.MaxCost ?? 0, cancellationToken, query, statement);
     }
     public async Task<long?> ExecuteAsync(PreparedStatement statement, IReadOnlyList<SqlValue>? parameters = null, QueryOptions? options = null, CancellationToken cancellationToken = default)
     {

@@ -52,7 +52,9 @@ internal static class FloatValue
         return value;
     }
 
-    internal static double FromInteger(long value, bool single = false) => Parse(value.ToString(CultureInfo.InvariantCulture), single);
+    // Convert directly to the requested IEEE width. Going through double first
+    // for binary32 would introduce double rounding near integer half-way cases.
+    internal static double FromInteger(long value, bool single = false) => single ? (float)value : (double)value;
     internal static double Narrow(double value)
     {
         var result = (float)value;

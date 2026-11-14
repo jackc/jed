@@ -1,0 +1,252 @@
+{
+  "profile": "cleanup",
+  "method": "Three interleaved NativeAOT repeats per source; medians of per-run sample medians and allocated bytes per operation; identical input and paired Go checksum checks.",
+  "sources": {
+    "capture19": {
+      "source_sha256": "abf9e5bd4706a986f45e21e1ee03c9b28557e71df6f61038c6ac7cdebf153168",
+      "files": [
+        {
+          "file": "cleanup-capture19-aot-1.json",
+          "sha256": "47de28199e15aee76fb4bdd41823a626703ddfdd7c3d6f47c55c13470b669464"
+        },
+        {
+          "file": "cleanup-capture19-aot-2.json",
+          "sha256": "7283fa00f8d92eb8a83a8d0b979fe922da7acb639d9d4722db22d800223e01b8"
+        },
+        {
+          "file": "cleanup-capture19-aot-3.json",
+          "sha256": "e9ac84ccbd7716c4e83d74ed3d850ac89915e1ec16187be2aa12265af5570bea"
+        }
+      ],
+      "workloads": {
+        "ranking_numeric": {
+          "csharp_us": 6163.95,
+          "go_us": 3479.1945,
+          "csharp_bytes": 13920680.0,
+          "go_bytes": 7442718.72,
+          "runs": [
+            {
+              "csharp_us": 6245.15,
+              "go_us": 3224.776,
+              "csharp_bytes": 13920680.0,
+              "go_bytes": 7442718.72
+            },
+            {
+              "csharp_us": 5884.05,
+              "go_us": 3658.6385,
+              "csharp_bytes": 13920680.0,
+              "go_bytes": 7442816.8
+            },
+            {
+              "csharp_us": 6163.95,
+              "go_us": 3479.1945,
+              "csharp_bytes": 13920680.0,
+              "go_bytes": 7442713.6
+            }
+          ]
+        },
+        "ranking_text": {
+          "csharp_us": 6475.4,
+          "go_us": 3080.9445,
+          "csharp_bytes": 15694424.0,
+          "go_bytes": 5683505.92,
+          "runs": [
+            {
+              "csharp_us": 6475.4,
+              "go_us": 3196.325,
+              "csharp_bytes": 15694424.0,
+              "go_bytes": 5683503.36
+            },
+            {
+              "csharp_us": 6589.85,
+              "go_us": 3080.9445,
+              "csharp_bytes": 15694424.0,
+              "go_bytes": 5683511.04
+            },
+            {
+              "csharp_us": 6406.8,
+              "go_us": 3048.7915,
+              "csharp_bytes": 15694424.0,
+              "go_bytes": 5683505.92
+            }
+          ]
+        },
+        "text_rollback": {
+          "csharp_us": 54.1,
+          "go_us": 19.4125,
+          "csharp_bytes": 122542.72,
+          "go_bytes": 35829.2,
+          "runs": [
+            {
+              "csharp_us": 54.1,
+              "go_us": 18.982,
+              "csharp_bytes": 122542.72,
+              "go_bytes": 35829.2
+            },
+            {
+              "csharp_us": 82.95,
+              "go_us": 21.902,
+              "csharp_bytes": 122542.72,
+              "go_bytes": 35826.16
+            },
+            {
+              "csharp_us": 51.15,
+              "go_us": 19.4125,
+              "csharp_bytes": 122542.72,
+              "go_bytes": 35863.36
+            }
+          ]
+        },
+        "text_durable": {
+          "csharp_us": 177.65,
+          "go_us": 73.347,
+          "csharp_bytes": 239855.2,
+          "go_bytes": 157212.64,
+          "runs": [
+            {
+              "csharp_us": 176.65,
+              "go_us": 71.112,
+              "csharp_bytes": 239866.72,
+              "go_bytes": 157212.64
+            },
+            {
+              "csharp_us": 178.7,
+              "go_us": 73.347,
+              "csharp_bytes": 239837.92,
+              "go_bytes": 157208.48
+            },
+            {
+              "csharp_us": 177.65,
+              "go_us": 74.1705,
+              "csharp_bytes": 239855.2,
+              "go_bytes": 157214.56
+            }
+          ]
+        }
+      }
+    },
+    "accepted": {
+      "source_sha256": "c43b05cdeecd17a2f439dce5d91e4fa2c2d13c59b7f895b57f3b4458d1911751",
+      "files": [
+        {
+          "file": "cleanup-accepted-aot-1.json",
+          "sha256": "d522a467233c21bc5b72a41034e1d9961a39edadd28ac000aac09e224d0c8f03"
+        },
+        {
+          "file": "cleanup-accepted-aot-2.json",
+          "sha256": "48e945785f915a56cebc1b0679df01f3a6ed139cee846844481974f86a3ab53b"
+        },
+        {
+          "file": "cleanup-accepted-aot-3.json",
+          "sha256": "569d7bfc8809c8c36be9f4485b2c084f8d0ec89fd55c67c2c89eab23e9eb4011"
+        }
+      ],
+      "workloads": {
+        "ranking_numeric": {
+          "csharp_us": 5323.35,
+          "go_us": 3452.472,
+          "csharp_bytes": 12523512.0,
+          "go_bytes": 7442711.36,
+          "runs": [
+            {
+              "csharp_us": 5395.95,
+              "go_us": 3452.472,
+              "csharp_bytes": 12523512.0,
+              "go_bytes": 7442711.36
+            },
+            {
+              "csharp_us": 5152.2,
+              "go_us": 3304.873,
+              "csharp_bytes": 12523512.0,
+              "go_bytes": 7442719.04
+            },
+            {
+              "csharp_us": 5323.35,
+              "go_us": 3560.6955,
+              "csharp_bytes": 12523512.0,
+              "go_bytes": 7442691.84
+            }
+          ]
+        },
+        "ranking_text": {
+          "csharp_us": 6500.55,
+          "go_us": 2938.4065,
+          "csharp_bytes": 14428328.0,
+          "go_bytes": 5683519.36,
+          "runs": [
+            {
+              "csharp_us": 6539.35,
+              "go_us": 2885.6365,
+              "csharp_bytes": 14428328.0,
+              "go_bytes": 5683515.84
+            },
+            {
+              "csharp_us": 6091.1,
+              "go_us": 3087.249,
+              "csharp_bytes": 14428328.0,
+              "go_bytes": 5683520.32
+            },
+            {
+              "csharp_us": 6500.55,
+              "go_us": 2938.4065,
+              "csharp_bytes": 14428328.0,
+              "go_bytes": 5683519.36
+            }
+          ]
+        },
+        "text_rollback": {
+          "csharp_us": 49.2,
+          "go_us": 18.4085,
+          "csharp_bytes": 122536.0,
+          "go_bytes": 35824.4,
+          "runs": [
+            {
+              "csharp_us": 48.5,
+              "go_us": 18.4085,
+              "csharp_bytes": 122536.0,
+              "go_bytes": 35824.24
+            },
+            {
+              "csharp_us": 52.5,
+              "go_us": 19.0185,
+              "csharp_bytes": 122536.0,
+              "go_bytes": 35824.4
+            },
+            {
+              "csharp_us": 49.2,
+              "go_us": 18.083,
+              "csharp_bytes": 122536.0,
+              "go_bytes": 35826.16
+            }
+          ]
+        },
+        "text_durable": {
+          "csharp_us": 169.75,
+          "go_us": 75.4685,
+          "csharp_bytes": 234183.2,
+          "go_bytes": 157273.92,
+          "runs": [
+            {
+              "csharp_us": 147.25,
+              "go_us": 77.0605,
+              "csharp_bytes": 234171.68,
+              "go_bytes": 157273.92
+            },
+            {
+              "csharp_us": 169.75,
+              "go_us": 75.4685,
+              "csharp_bytes": 234194.72,
+              "go_bytes": 157275.52
+            },
+            {
+              "csharp_us": 184.55,
+              "go_us": 72.401,
+              "csharp_bytes": 234183.2,
+              "go_bytes": 157144.32
+            }
+          ]
+        }
+      }
+    }
+  }
+}

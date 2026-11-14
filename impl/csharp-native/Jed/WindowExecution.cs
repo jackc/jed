@@ -44,8 +44,9 @@ internal static class WindowExecution
                     i = end;
                 }
                 using var operandMemory = new QueryInputMemory(meter);
-                var cachedValues = new SqlValue[n];
-                if (plan.Name is "lag" or "lead" or "first_value" or "last_value" or "nth_value")
+                var cacheValues = plan.Name is "lag" or "lead" or "first_value" or "last_value" or "nth_value";
+                var cachedValues = cacheValues ? new SqlValue[n] : Array.Empty<SqlValue>();
+                if (cacheValues)
                     for (var i = 0; i < n; i++)
                     {
                         cachedValues[i] = await Evaluate.ExprAsync(plan.Args[0], meter, row: rows[indices[i]]).ConfigureAwait(false);
@@ -54,8 +55,11 @@ internal static class WindowExecution
                 var fold = plan.Aggregate is null ? null : new GroupExecution.Fold(plan.Aggregate);
                 try
                 {
-                var previousLow = 0; var previousHigh = 0; var counted = new bool[n];
-                var valueCache = new SqlValue[n]; var extraCache = new SqlValue[n][]; var cached = new bool[n];
+                var previousLow = 0; var previousHigh = 0;
+                var counted = plan.Aggregate is null ? Array.Empty<bool>() : new bool[n];
+                var valueCache = plan.Aggregate is null ? Array.Empty<SqlValue>() : new SqlValue[n];
+                var extraCache = plan.Aggregate is null ? Array.Empty<SqlValue[]>() : new SqlValue[n][];
+                var cached = plan.Aggregate is null ? Array.Empty<bool>() : new bool[n];
                 var startOffset = Offset(plan.Frame?.Start, plan.Frame?.Mode, meter); var endOffset = Offset(plan.Frame?.End, plan.Frame?.Mode, meter);
                 for (var at = 0; at < n; at++)
                 {
@@ -145,7 +149,7 @@ internal static class WindowExecution
                                 if (!cached[i])
                                 {
                                     valueCache[i] = aggregate.Argument is null ? SqlValue.Integer(1) : await Evaluate.ExprAsync(aggregate.Argument, meter, row: rows[indices[i]]).ConfigureAwait(false);
-                                    var operands = new SqlValue[aggregate.Extra?.Length ?? 0];
+                                    var operands = aggregate.Extra is { Length: > 0 } extraExpressions ? new SqlValue[extraExpressions.Length] : Array.Empty<SqlValue>();
                                     if (operands.Length != 0) { meter.Charge(Costs.OperatorEval); meter.Guard(); }
                                     for (var e = 0; e < operands.Length; e++) operands[e] = await Evaluate.ExprAsync(aggregate.Extra![e], meter, row: rows[indices[i]]).ConfigureAwait(false);
                                     if (plan.Frame is not null)
@@ -214,15 +218,17 @@ internal static class WindowExecution
     }
     private static async ValueTask<PartitionSet> Partition(WindowPlan plan, List<SqlValue[]> rows, Meter meter, QueryInputMemory memory)
     {
-        var groups = new List<List<int>>(); var lookup = new Dictionary<string, int>(StringComparer.Ordinal); var orderKeys = new SqlValue[rows.Count][];
+        var groups = new List<List<int>>(); var lookup = new Dictionary<byte[], int>(ByteKeyComparer.Instance); var orderKeys = new SqlValue[rows.Count][];
         var decorations = new SortValue[rows.Count][];
         for (var i = 0; i < rows.Count; i++)
         {
-            var keys = new SqlValue[plan.Partition.Length];
+            var keys = plan.Partition.Length == 0 ? Array.Empty<SqlValue>() : new SqlValue[plan.Partition.Length];
             for (var key = 0; key < keys.Length; key++) { keys[key] = await Evaluate.ExprAsync(plan.Partition[key], meter, row: rows[i]).ConfigureAwait(false); GroupExecution.ChargeKey(keys[key], meter); }
-            var identity = GroupExecution.Identity(keys);
+            var identity = GroupExecution.EncodedIdentity(keys);
             if (!lookup.TryGetValue(identity, out var group)) { if (meter.Memory.Enabled) memory.ReserveBytes(MemorySize.EntryBytes(keys)); group = groups.Count; groups.Add([]); lookup.Add(identity, group); }
-            groups[group].Add(i); orderKeys[i] = new SqlValue[plan.Order.Length]; decorations[i] = new SortValue[plan.Order.Length];
+            groups[group].Add(i);
+            orderKeys[i] = plan.Order.Length == 0 ? Array.Empty<SqlValue>() : new SqlValue[plan.Order.Length];
+            decorations[i] = plan.Order.Length == 0 ? Array.Empty<SortValue>() : new SortValue[plan.Order.Length];
             for (var key = 0; key < plan.Order.Length; key++)
             {
                 var value = await Evaluate.ExprAsync(plan.Order[key].Expression, meter, row: rows[i]).ConfigureAwait(false); orderKeys[i][key] = value;

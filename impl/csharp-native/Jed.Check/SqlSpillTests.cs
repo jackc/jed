@@ -41,6 +41,7 @@ internal static class SqlSpillTests
                     "SELECT g, var_pop(id), stddev_samp(id::f64), percentile_cont(0.5) WITHIN GROUP (ORDER BY id), mode() WITHIN GROUP (ORDER BY pad) FROM t GROUP BY g ORDER BY g",
                     "SELECT g, rank(50) WITHIN GROUP (ORDER BY id), dense_rank('pp') WITHIN GROUP (ORDER BY pad), json_object_agg(id::text, pad) FROM t GROUP BY g ORDER BY g",
                     "SELECT g, sum(id) FROM t GROUP BY GROUPING SETS ((g), ()) ORDER BY g",
+                    "SELECT g, sum(id::i64 * 10000000000000000::i64), avg(id::i64) FROM t GROUP BY GROUPING SETS ((g), ()) ORDER BY g",
                     "SELECT id FROM t ORDER BY length(pad) LIMIT 0 OFFSET 8" })
                 {
                     database.SetWorkMem(0);

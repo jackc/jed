@@ -39,12 +39,11 @@ internal static class TemporalText
             return target == SqlType.Date ? SqlValue.Date(TemporalValue.TimestampToDate(micros)) : SqlValue.Timestamp(micros, target == SqlType.Timestamptz);
         }
         if (value.Type.Kind == SqlKind.Array && target.Kind == SqlKind.Array && value.Type != target)
-        {
-            var array = value.AsArray();
-            return SqlValue.Array(new(target.Element!, array.Values.Select(element => Cast(element, target.Element!, meter)), array.Dimensions, array.LowerBounds, true));
-        }
+            return CastArray(value.AsArray(), target.Element!, meter);
         return Resolve.Cast(value, target);
     }
+    private static SqlValue CastArray(SqlArray array, SqlType elementType, Meter meter) =>
+        SqlValue.Array(new(elementType, array.Values.Select(element => Cast(element, elementType, meter)), array.Dimensions, array.LowerBounds, true));
     internal static bool IsClockDate(string input) => ClockDayOffset(input) is not null;
     private static int? ClockDayOffset(string input) => TextEncoding.FoldName(input.Trim(' ', '\t', '\r', '\n', '\f', '\v')) switch
     { "today" or "now" => 0, "tomorrow" => 1, "yesterday" => -1, _ => null };

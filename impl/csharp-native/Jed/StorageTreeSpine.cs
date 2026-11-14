@@ -5,7 +5,7 @@ internal sealed partial class StorageTree
     // Open retains interior structure without decoding leaf directories or
     // values. One first-child peek classifies each bottom interior's level;
     // the remaining leaf siblings stay on disk until a query touches them.
-    internal async ValueTask<StorageTreeShape?> ValidateSpineAsync(CancellationToken cancellationToken = default)
+    internal async ValueTask<StorageTreeShape?> ValidateSpineAsync(CancellationToken cancellationToken = default, StorageRemapEntry[]? remap = null)
     {
         var seen = new HashSet<uint>();
         async ValueTask<StorageTreeShape> Visit(Ref reference, int depth)
@@ -17,7 +17,7 @@ internal sealed partial class StorageTree
             var header = StorageFormat.ParsePage(bytes.Span, verifyChecksum: !pager.Encrypted);
             if (header.Type == 2) return new(reference.Page, reference.Tag);
             if (header.Type != 3) throw StorageFormat.Corrupt("tree spine names a non-tree page");
-            var interior = StorageInterior.Parse(bytes.Span, pageCount, pager.Encrypted);
+            var interior = StorageInterior.Parse(bytes.Span, pageCount, pager.Encrypted, reference.Page, remap);
             var node = InteriorNode(interior);
             var children = new StorageTreeShape[node.Children!.Length];
             children[0] = await Visit(node.Children[0], depth + 1).ConfigureAwait(false);
@@ -46,14 +46,14 @@ internal sealed partial class StorageTree
         for (var t = 0; t < tables.Length; t++)
         {
             var table = catalog.Tables[t];
-            var shape = await new StorageTree(pager, table.LeafSchema(), table.Root, meta.PageCount, table.RootTag).ValidateSpineAsync(token).ConfigureAwait(false);
+            var shape = await new StorageTree(pager, table.LeafSchema(), table.Root, meta.PageCount, table.RootTag).ValidateSpineAsync(token, meta.Remap).ConfigureAwait(false);
             var indexes = (table.Indexes ?? []).ToArray();
             for (var i = 0; i < indexes.Length; i++)
             {
                 var index = indexes[i];
                 if (index.Kind == 2) indexes[i] = index with { Gist = await GistTree.LoadAsync(pager, table, index, meta, token).ConfigureAwait(false) };
                 else if (index.Kind is 0 or 1)
-                    indexes[i] = index with { Shape = await new StorageTree(pager, new([]), index.Root, meta.PageCount, index.RootTag).ValidateSpineAsync(token).ConfigureAwait(false) };
+                    indexes[i] = index with { Shape = await new StorageTree(pager, new([]), index.Root, meta.PageCount, index.RootTag).ValidateSpineAsync(token, meta.Remap).ConfigureAwait(false) };
             }
             tables[t] = table with { Shape = shape, Indexes = table.Indexes is null ? null : indexes };
         }

@@ -35,7 +35,7 @@ internal sealed partial class SimulationRunner
         SimulationStorageChecks.Require(state.Version == oldVersion + 1 && digest == await AttachmentDigest(state), "attachment maintenance changed contents or generation incorrectly");
         state.Floor = state.Version;
         var storage = state.Database.CommittedStorageForTesting();
-        state.Growth = storage.Meta.PageCount - storage.FreePages.Count; state.Reclaimed = false;
+        state.Growth = Math.Max(0, storage.LeakedPages); state.Reclaimed = false;
         json.Number("version", state.Version);
     }
 }

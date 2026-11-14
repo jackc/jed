@@ -6,7 +6,7 @@ namespace Jed;
 internal sealed record StorageInterior(uint[] Children, byte[][] Separators)
 {
     internal byte[][]? Tags { get; init; }
-    internal static StorageInterior Parse(ReadOnlySpan<byte> page, uint pageCount = uint.MaxValue, bool encrypted = false)
+    internal static StorageInterior Parse(ReadOnlySpan<byte> page, uint pageCount = uint.MaxValue, bool encrypted = false, uint parent = 0, StorageRemapEntry[]? remap = null)
     {
         var header = StorageFormat.ParsePage(page, verifyChecksum: !encrypted);
         var pointerSize = encrypted ? 20 : 4; var capacity = page.Length - 16 - (encrypted ? StoragePageCodec.Reserve : 0);
@@ -14,12 +14,26 @@ internal sealed record StorageInterior(uint[] Children, byte[][] Separators)
         var count = (int)header.Count; var payload = page.Slice(16, capacity);
         var children = new uint[count + 1]; var keys = new byte[count][];
         var tags = encrypted ? new byte[count + 1][] : null;
+        var entries = remap ?? [];
+        // Meta validation establishes parent/slot order. Locate this parent's
+        // first substitution once, then merge it with the ordered child slots.
+        var substitution = 0; var remapEnd = entries.Length;
+        while (substitution < remapEnd)
+        {
+            var middle = substitution + (remapEnd - substitution) / 2;
+            if (entries[middle].Parent < parent) substitution = middle + 1;
+            else remapEnd = middle;
+        }
         for (var i = 0; i < children.Length; i++)
         {
-            children[i] = BinaryPrimitives.ReadUInt32BigEndian(payload[(i * pointerSize)..]);
+            var replaced = substitution < entries.Length && entries[substitution].Parent == parent && entries[substitution].Slot == i;
+            var replacement = replaced ? entries[substitution++] : default;
+            children[i] = replaced ? replacement.Page : BinaryPrimitives.ReadUInt32BigEndian(payload[(i * pointerSize)..]);
             if (children[i] < (encrypted ? 4 : 2) || children[i] >= pageCount) throw StorageFormat.Corrupt("interior child out of bounds");
-            if (tags is not null) tags[i] = payload.Slice(i * pointerSize + 4, 16).ToArray();
+            if (tags is not null) tags[i] = replaced ? replacement.Tag.ToArray() : payload.Slice(i * pointerSize + 4, 16).ToArray();
         }
+        if (substitution < entries.Length && entries[substitution].Parent == parent)
+            throw StorageFormat.Corrupt("remap slot exceeds interior child count");
         var directory = (count + 1) * pointerSize; var blob = directory + count * 4; uint previous = 0;
         for (var i = 0; i < count; i++)
         {
@@ -66,9 +80,14 @@ internal sealed partial class StorageTree
     private sealed record Node(StorageRecord[]? Rows = null, StorageLeaf? Packed = null,
         Ref[]? Children = null, byte[][]? Keys = null)
     {
+        internal uint Origin { get; init; }
+        internal ReadOnlyMemory<byte> OriginTag { get; init; }
+        internal bool SameKeys { get; init; }
         internal bool IsLeaf => Children is null;
         internal int Count => IsLeaf ? (Rows?.Length ?? Packed!.Count) : Keys!.Length;
         internal StorageRecord[] Records() => Rows ?? Enumerable.Range(0, Packed!.Count).Select(Packed.Record).ToArray();
+        internal StorageRecord OwnedRecord(int i) => Rows is not null ? Clone(Rows[i]) : Packed!.Record(i);
+        internal int CompareKey(int i, ReadOnlySpan<byte> key) => IsLeaf && Rows is null ? Packed!.CompareKey(i, key) : Key(i).AsSpan().SequenceCompareTo(key);
         internal StorageRecord Record(int i) => Rows is not null ? Rows[i] : Packed!.Record(i);
         internal byte[] Key(int i) => IsLeaf ? (Rows is not null ? Rows[i].Key : Packed!.Key(i)) : Keys![i];
     }
@@ -138,7 +157,10 @@ internal sealed partial class StorageTree
         return root is null ? 0 : await Count(root, 0).ConfigureAwait(false);
     }
 
-    internal async ValueTask<StorageRecord?> FindAsync(ReadOnlyMemory<byte> key, CancellationToken cancellationToken = default, Action? pageRead = null)
+    internal async ValueTask<StorageRecord?> FindAsync(ReadOnlyMemory<byte> key, CancellationToken cancellationToken = default, Action? pageRead = null) =>
+        (await FindRowAsync(key, cancellationToken, pageRead).ConfigureAwait(false))?.Record();
+
+    internal async ValueTask<ScanRow?> FindRowAsync(ReadOnlyMemory<byte> key, CancellationToken cancellationToken, Action? pageRead = null)
     {
         var current = root; var path = new HashSet<uint>(); var depth = 0;
         while (current is not null)
@@ -148,7 +170,7 @@ internal sealed partial class StorageTree
             var node = await Load(current, cancellationToken).ConfigureAwait(false);
             if (!node.IsLeaf) { current = node.Children![Route(node, key.Span)]; continue; }
             var at = LowerBound(node, key.Span);
-            return at < node.Count && node.Key(at).AsSpan().SequenceEqual(key.Span) ? Clone(node.Record(at)) : null;
+            return at < node.Count && node.CompareKey(at, key.Span) == 0 ? new(node.Packed, node.Rows?[at], at) : null;
         }
         return null;
     }
@@ -169,7 +191,7 @@ internal sealed partial class StorageTree
             var node = await Load(reference, cancellationToken).ConfigureAwait(false);
             if (node.IsLeaf)
             {
-                for (var i = 0; i < node.Count; i++) { cancellationToken.ThrowIfCancellationRequested(); yield return Clone(node.Record(i)); }
+                for (var i = 0; i < node.Count; i++) { cancellationToken.ThrowIfCancellationRequested(); yield return node.OwnedRecord(i); }
             }
             else
                 foreach (var child in node.Children!)
@@ -182,7 +204,11 @@ internal sealed partial class StorageTree
     {
         record = PrepareRecord(Clone(record));
         // Validate one record's admissibility before changing a pending path.
-        _ = StorageLeaf.Encode(pager.PageSize, schema, [record], pager.Encrypted);
+        if (record.Key.Length == 0 || record.Cells.Length != schema.Columns.Length ||
+            (schema.FixedKeyWidth != 0 && record.Key.Length != schema.FixedKeyWidth))
+            throw new ArgumentException("invalid leaf records");
+        if (StorageLeaf.MeasurePayload(schema, [record]) > pager.PayloadCapacity)
+            throw Errors.Unsupported("oversize leaf page");
         var dead = new HashSet<uint>(retired);
         await RetainMovedChains(record, dead, cancellationToken).ConfigureAwait(false);
         var split = root is null ? new Split([new(Dirty: new(Rows: [record]))], []) :
@@ -206,24 +232,36 @@ internal sealed partial class StorageTree
             Node changed; int edited;
             if (node.IsLeaf)
             {
+                edited = LowerBound(node, record.Key);
+                if (node.Packed is { } packed && edited < node.Count &&
+                    packed.CompareKey(edited, record.Key) == 0 && packed.ReplaceFixed(edited, record, pager.Encrypted) is { } replacement)
+                {
+                    if (reference.Page != 0) dead.Add(reference.Page);
+                    return new([new(Dirty: Replacement(reference, node, new(Packed: replacement), false))], []);
+                }
                 await RetireResidentChains(reference, dead, token).ConfigureAwait(false);
-                var rows = node.Records().ToList(); edited = LowerBound(node, record.Key);
+                var rows = node.Records().ToList();
                 if (edited < rows.Count && rows[edited].Key.AsSpan().SequenceEqual(record.Key))
                 {
                     await RetireChains(rows[edited], dead, token, record).ConfigureAwait(false);
                     rows[edited] = record;
                 }
                 else rows.Insert(edited, record);
-                changed = new(Rows: rows.ToArray());
+                changed = Replacement(reference, node, new(Rows: rows.ToArray()), false);
             }
             else
             {
                 var at = Route(node, record.Key);
                 var child = await Insert(node.Children![at], record, dead, path, depth + 1, token).ConfigureAwait(false);
+                if (await EvenLeaves(node, at, child, record.Key, dead, token).ConfigureAwait(false) is { } even)
+                {
+                    if (reference.Page != 0) dead.Add(reference.Page);
+                    return new([new(Dirty: Replacement(reference, node, even, false))], []);
+                }
                 var children = node.Children.ToList(); children.RemoveAt(at); children.InsertRange(at, child.Nodes);
                 var keys = node.Keys!.ToList(); keys.InsertRange(at, child.Keys);
                 edited = child.Keys.Length == 0 ? -1 : at + child.Keys.Length - 1;
-                changed = new(Children: children.ToArray(), Keys: keys.ToArray());
+                changed = Replacement(reference, node, new(Children: children.ToArray(), Keys: keys.ToArray()), child.Keys.Length == 0);
             }
             if (reference.Page != 0) dead.Add(reference.Page);
             return Divide(changed, edited, multiway: true)!;
@@ -262,17 +300,17 @@ internal sealed partial class StorageTree
                 var rows = node.Records().ToList();
                 await RetireChains(rows[at], dead, token).ConfigureAwait(false); rows.RemoveAt(at);
                 if (reference.Page != 0) dead.Add(reference.Page);
-                return (new(Dirty: new(Rows: rows.ToArray())), true);
+                return (new(Dirty: Replacement(reference, node, new(Rows: rows.ToArray()), false)), true);
             }
             var childIndex = Route(node, key.Span);
             var (childRef, changed) = await Remove(node.Children![childIndex], key, dead, path, depth + 1, token).ConfigureAwait(false);
             if (!changed) return (reference, false);
             var children = node.Children.ToList(); children[childIndex] = childRef;
-            var keys = node.Keys!.ToList();
+            var keys = node.Keys!.ToList(); var sameKeys = true;
             var child = await Load(childRef, token).ConfigureAwait(false);
             if (keys.Count > 0 && !child.IsLeaf && await EmptyUnary(childRef, token).ConfigureAwait(false))
             {
-                children.RemoveAt(childIndex); keys.RemoveAt(Math.Min(childIndex, keys.Count - 1));
+                sameKeys = false; children.RemoveAt(childIndex); keys.RemoveAt(Math.Min(childIndex, keys.Count - 1));
             }
             else if (keys.Count > 0 && Payload(child) < pager.PayloadCapacity / 2)
             {
@@ -293,12 +331,12 @@ internal sealed partial class StorageTree
                 {
                     if (leftRef.Page != 0) dead.Add(leftRef.Page);
                     if (rightRef.Page != 0) dead.Add(rightRef.Page);
-                    children.RemoveRange(leftAt, 2); children.InsertRange(leftAt, replacement.Nodes);
+                    sameKeys = false; children.RemoveRange(leftAt, 2); children.InsertRange(leftAt, replacement.Nodes);
                     keys.RemoveAt(leftAt); keys.InsertRange(leftAt, replacement.Keys);
                 }
             }
             if (reference.Page != 0) dead.Add(reference.Page);
-            return (new(Dirty: new(Children: children.ToArray(), Keys: keys.ToArray())), true);
+            return (new(Dirty: Replacement(reference, node, new(Children: children.ToArray(), Keys: keys.ToArray()), sameKeys)), true);
         }
         finally { if (reference.Page != 0) path.Remove(reference.Page); }
     }
@@ -324,10 +362,15 @@ internal sealed partial class StorageTree
         if ((!node.IsLeaf && count < 2) || (node.IsLeaf && count < 2)) throw Errors.Unsupported("entry or separator exceeds page size");
         var first = 1; var last = node.IsLeaf ? count - 1 : count == 2 ? 1 : count - 2;
         var min = -1; var max = -1; var balanced = -1;
+        var leafRows = node.IsLeaf ? node.Records() : null;
         for (var m = first; m <= last; m++)
         {
-            var left = Slice(node, 0, m); var right = Slice(node, node.IsLeaf ? m : m + 1, count);
-            var leftSize = Payload(left); var rightSize = Payload(right);
+            var leftSize = leafRows is not null
+                ? StorageLeaf.MeasurePayload(schema, new ArraySegment<StorageRecord>(leafRows, 0, m))
+                : Payload(Slice(node, 0, m));
+            var rightSize = leafRows is not null
+                ? StorageLeaf.MeasurePayload(schema, new ArraySegment<StorageRecord>(leafRows, m, count - m))
+                : Payload(Slice(node, m + 1, count));
             if (min < 0 && rightSize <= cap) min = m;
             if (leftSize <= cap) max = m;
             if (balanced < 0 && leftSize * 2 >= size) balanced = m;
@@ -354,6 +397,7 @@ internal sealed partial class StorageTree
     {
         if (!node.IsLeaf) return pager.PointerSize + (pager.PointerSize + 4L) * node.Count + node.Keys!.Sum(key => (long)key.Length);
         if (node.Count == 0) return 0;
+        if (node.Packed is { } packed) return packed.PayloadLength;
         return StorageLeaf.MeasurePayload(schema, node.Records());
     }
 
@@ -363,30 +407,49 @@ internal sealed partial class StorageTree
     internal async ValueTask<StoragePageReference> SerializeBoundAsync(StorageAllocation allocation, CancellationToken cancellationToken = default)
     {
         if (allocation.Encrypted != pager.Encrypted) throw new ArgumentException("tree and allocator variants differ");
-        foreach (var id in retired) allocation.Reclaim(id);
+        foreach (var id in retired) if (allocation.Deferral?.Retained.Contains(id) != true) allocation.Reclaim(id);
         if (root is null) { SerializedShape = null; SerializedRootRecords = null; return new(0, allocation.Encrypted ? new byte[16] : default); }
-        var written = await Write(root, allocation, cancellationToken).ConfigureAwait(false);
+        var written = await Write(root, allocation, cancellationToken, retainResident: true).ConfigureAwait(false);
         SerializedShape = written.Shape;
         SerializedRootRecords = written.Resident?.Records();
         return new(written.Page, written.Tag);
     }
 
-    private async ValueTask<Ref> Write(Ref reference, StorageAllocation allocation, CancellationToken token)
+    private async ValueTask<Ref> Write(Ref reference, StorageAllocation allocation, CancellationToken token, bool retainResident = false)
     {
         token.ThrowIfCancellationRequested();
         if (reference.Dirty is not { } node) return reference;
         if (node.IsLeaf)
         {
+            if (node.Packed is { } packed)
+            {
+                var packedId = allocation.AddPage(packed.EncodedPage.Span);
+                return new(packedId, Tag: allocation.Tag(packedId), Shape: new(packedId, allocation.Tag(packedId)));
+            }
             var original = node.Records();
             // Incremental post-order includes the leaf's overflow dependencies:
             // assign their pages before assigning the leaf that names them.
-            var rows = original.Select(row => StorageLargeValues.WriteFresh(row, allocation)).ToArray();
+            var rows = original;
+            for (var i = 0; i < original.Length; i++)
+            {
+                var written = StorageLargeValues.WriteFresh(original[i], allocation);
+                if (ReferenceEquals(written, original[i])) continue;
+                if (ReferenceEquals(rows, original)) rows = (StorageRecord[])original.Clone();
+                rows[i] = written;
+            }
             var id = allocation.ReservePage();
             allocation.SetPage(id, StorageLeaf.Encode(pager.PageSize, schema, rows, pager.Encrypted));
-            // Only the root's returned Resident payload survives publication;
-            // interior serialization keeps child shapes and drops leaf rows.
-            var retained = rows.Select((row, index) => row with { FreshChains = original[index].FreshChains }).ToArray();
-            return new(id, Tag: allocation.Tag(id), Shape: new(id, allocation.Tag(id)), Resident: new(Rows: retained));
+            // Only the root retains resident records. A fresh-chain rewrite
+            // owns the cloned array; unchanged immutable rows can be shared.
+            Node? resident = null;
+            if (retainResident)
+            {
+                if (!ReferenceEquals(rows, original))
+                    for (var i = 0; i < rows.Length; i++)
+                        if (!ReferenceEquals(rows[i], original[i])) rows[i] = rows[i] with { FreshChains = original[i].FreshChains };
+                resident = new(Rows: rows);
+            }
+            return new(id, Tag: allocation.Tag(id), Shape: new(id, allocation.Tag(id)), Resident: resident);
         }
         var children = new uint[node.Children!.Length];
         var shapes = new StorageTreeShape?[children.Length];
@@ -395,6 +458,14 @@ internal sealed partial class StorageTree
         {
             var child = await Write(node.Children[i], allocation, token).ConfigureAwait(false); children[i] = child.Page; shapes[i] = child.Shape;
             if (tags is not null) tags[i] = child.Tag.ToArray();
+        }
+        if (allocation.Deferral is { } deferral && deferral.Retained.Contains(node.Origin))
+        {
+            for (var i = 0; i < children.Length; i++)
+                if (node.Children[i].Dirty is { } dirty && !deferral.Retained.Contains(dirty.Origin))
+                    deferral.Set(node.Origin, checked((ushort)i), new(children[i], tags is null ? default : tags[i]));
+            var retainedShape = new StorageTreeShape(node.Origin, node.OriginTag, node.Keys!, shapes.Select(item => item!).ToArray());
+            return new(node.Origin, Tag: node.OriginTag, Shape: retainedShape);
         }
         var page = allocation.AddPage(new StorageInterior(children, node.Keys!) { Tags = tags }.Encode(pager.PageSize, pager.Encrypted));
         var shape = shapes.All(item => item is not null) ? new StorageTreeShape(page, allocation.Tag(page), node.Keys!, shapes.Select(item => item!).ToArray()) : null;
@@ -411,7 +482,7 @@ internal sealed partial class StorageTree
         var page = await pager.ReadPageAsync(new StoragePageReference(reference.Page, reference.Tag), token).ConfigureAwait(false);
         return page.Span[0] switch
         {
-            2 => new(Packed: StorageLeaf.Parse(page, schema, pager.Encrypted)),
+            2 => new(Packed: pager.Leaf(reference.Page, page, schema)),
             3 => InteriorNode(StorageInterior.Parse(page.Span, pageCount, pager.Encrypted)),
             _ => throw StorageFormat.Corrupt("tree pointer names non-tree page")
         };
@@ -421,7 +492,7 @@ internal sealed partial class StorageTree
     private static int LowerBound(Node node, ReadOnlySpan<byte> key)
     {
         var low = 0; var high = node.Count;
-        while (low < high) { var mid = low + (high - low) / 2; if (node.Key(mid).AsSpan().SequenceCompareTo(key) < 0) low = mid + 1; else high = mid; }
+        while (low < high) { var mid = low + (high - low) / 2; if (node.CompareKey(mid, key) < 0) low = mid + 1; else high = mid; }
         return low;
     }
     private static int Route(Node node, ReadOnlySpan<byte> key)
@@ -433,7 +504,7 @@ internal sealed partial class StorageTree
     private static StorageRecord Clone(StorageRecord record) => new(record.Key.ToArray(), record.Cells.Select(cell => cell?.ToArray()).ToArray())
     { Prepared = record.Prepared, FreshChains = record.FreshChains?.Select(cell => cell?.ToArray()).ToArray() };
     private int DirtyCount(Ref? reference) => reference?.Dirty is not { } node ? 0 : checked(1 + (node.IsLeaf
-        ? node.Records().Sum(FreshPageCount) : node.Children!.Sum(DirtyCount)));
+        ? node.Packed is not null ? 0 : node.Records().Sum(FreshPageCount) : node.Children!.Sum(DirtyCount)));
     private static void CheckPath(Ref reference, HashSet<uint> path, int depth)
     {
         if (depth > 128 || reference.Page != 0 && !path.Add(reference.Page)) throw StorageFormat.Corrupt("cyclic or excessively deep tree");

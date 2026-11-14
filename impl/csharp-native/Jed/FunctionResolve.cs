@@ -28,24 +28,7 @@ internal static class FunctionResolve
             var fact = new FunctionFact(name, [], value.Type.Name(), "propagates", 1, false, [], []);
             return new("call", value.Type, default, operands, name, Function: fact);
         }
-        if (name is "mod" or "div" or "gcd" or "lcm" or "width_bucket")
-        {
-            var arity = name == "width_bucket" ? 4 : 2;
-            if (expression.Args.Length != arity) throw new SqlException(SqlStates.UndefinedFunction, $"invalid arity for {name}");
-            Resolved[] operands;
-            try { operands = Resolve.Unify(expression.Args.Take(name == "width_bucket" ? 3 : 2).ToArray()); }
-            catch (SqlException error) when (error.SqlState == SqlStates.DatatypeMismatch) { throw new SqlException(SqlStates.UndefinedFunction, "no matching numeric function"); }
-            if (!operands[0].Type.IsNumeric()) throw Errors.Type("numeric operands required");
-            if (name == "width_bucket")
-            {
-                var count = Resolve.Expr(expression.Args[3]);
-                if (!count.Type.IsInteger() && count.Type != SqlType.Unknown) throw Errors.Type("bucket count requires integer");
-                operands = [.. operands, count];
-            }
-            var specialResult = name == "width_bucket" ? SqlType.I32 : name == "div" ? SqlType.Decimal : operands[0].Type;
-            var fact = new FunctionFact(name, [], specialResult.Name(), "propagates", 1, false, [], []);
-            return new("call", specialResult, default, operands, name, Function: fact);
-        }
+        if (name is "mod" or "div" or "gcd" or "lcm" or "width_bucket") return Numeric(expression);
         if (name is "coalesce" or "greatest" or "least" or "nullif")
         {
             if (name == "nullif" && expression.Args.Length != 2) throw Errors.Syntax("NULLIF requires two arguments");
@@ -137,6 +120,82 @@ internal static class FunctionResolve
             for (var i = 0; i < resolved.Length; i++)
                 if (resolved[i].Type == SqlType.F32) resolved[i] = new("float_widen", SqlType.F64, default, [resolved[i]]);
         return SimilarFunctions.Prepare(RegexResolve.Prepare(new("call", result, default, resolved, name, Function: chosen.Fact), expression.Context?.Unicode));
+    }
+
+    private static Resolved Numeric(Expression expression)
+    {
+        var name = expression.Text;
+        var arity = name == "width_bucket" ? 4 : 2;
+        if (expression.Args.Length != arity || expression.Args.Any(argument => argument.Op == "named"))
+            throw new SqlException(SqlStates.UndefinedFunction, $"invalid arguments for {name}");
+        Resolved[] operands;
+        SqlType result;
+        if (name == "mod")
+        {
+            try { operands = Resolve.Unify(expression.Args); }
+            catch (SqlException error) when (error.SqlState == SqlStates.DatatypeMismatch)
+            { throw new SqlException(SqlStates.UndefinedFunction, "no matching numeric function"); }
+            if (!operands[0].Type.IsNumeric()) throw Errors.Type("numeric operands required");
+            result = operands[0].Type;
+        }
+        else if (name == "width_bucket")
+        {
+            operands = new Resolved[4];
+            for (var i = 0; i < operands.Length; i++) operands[i] = Resolve.Expr(expression.Args[i]);
+            if (!operands[3].Type.IsInteger() && operands[3].Type != SqlType.Unknown)
+                throw new SqlException(SqlStates.UndefinedFunction, "bucket count requires integer");
+            var floating = operands[0].Type.IsFloat() || operands[1].Type.IsFloat() || operands[2].Type.IsFloat();
+            for (var i = 0; i < 3; i++)
+            {
+                if (!floating)
+                {
+                    if (!DecimalArgument(operands[i].Type))
+                        throw new SqlException(SqlStates.UndefinedFunction, "no matching numeric function");
+                    continue;
+                }
+                if (operands[i].Type.IsFloat() || operands[i].Type == SqlType.Unknown) continue;
+                var target = NumericCoercion(operands[i].Type, expression.Args[i].Op, floating: true);
+                if (target != SqlType.Unknown) operands[i] = Resolve.Expr(expression.Args[i], target);
+            }
+            if (floating)
+                for (var i = 0; i < 3; i++)
+                    if (!operands[i].Type.IsFloat() && operands[i].Type != SqlType.Unknown)
+                        throw new SqlException(SqlStates.UndefinedFunction, "no matching numeric function");
+            result = SqlType.I32;
+        }
+        else
+        {
+            var (left, right) = Resolve.Pair(expression.Args[0], expression.Args[1]);
+            if (!DecimalArgument(left.Type) || !DecimalArgument(right.Type))
+                throw new SqlException(SqlStates.UndefinedFunction, "no matching numeric function");
+            operands = [left, right];
+            result = name == "div" ? SqlType.Decimal : Resolve.Common(left.Type, right.Type);
+            if (result == SqlType.Unknown) result = SqlType.I64;
+        }
+        var fact = new FunctionFact(name, [], result.Name(), "propagates", 1, false, [], []);
+        return new("call", result, default, operands, name, Function: fact);
+    }
+
+    // Admission is shared spec data; integer-to-decimal conversion stays inside
+    // the numeric kernel, preserving result widths and avoiding a cast charge.
+    private static bool DecimalArgument(SqlType type) => type == SqlType.Decimal || type == SqlType.Unknown
+        || NumericCoercion(type, "", floating: false) != SqlType.Unknown;
+
+    private static SqlType NumericCoercion(SqlType type, string syntax, bool floating)
+    {
+        var literal = syntax switch { "integer" => "integer_literal", "decimal" => "decimal_literal", _ => "" };
+        var own = type.Name();
+        var best = SqlType.Unknown;
+        var cost = int.MaxValue;
+        foreach (var row in ArgCoercionFacts.Rows)
+        {
+            if (row.From != own && (literal.Length == 0 || row.From != literal)) continue;
+            if (floating ? !row.To.IsFloat() : row.To != SqlType.Decimal) continue;
+            if (row.Cost >= cost) continue;
+            best = row.To;
+            cost = row.Cost;
+        }
+        return best;
     }
 
     private static Expression[]? Arrange(FunctionFact fact, Expression[] supplied)

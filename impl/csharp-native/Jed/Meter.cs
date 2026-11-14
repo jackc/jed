@@ -12,13 +12,37 @@ internal sealed class Meter(Session session, long limit, CancellationToken cance
     private SequenceContext? sequences;
     internal SequenceContext Sequences => sequences ??= new(session.SequenceStateSnapshot(), this);
     internal Dictionary<string, string> Variables { get; } = session.VariableSnapshot();
-    internal UuidContext Uuid { get; } = session.NewUuidContext(options);
+    private UuidContext? uuid;
+    internal UuidContext Uuid => uuid ??= session.NewUuidContext(options);
     internal TemporalContext Temporal { get; } = session.NewTemporalContext(options);
     internal UnicodeData? Unicode => Temporal.Unicode;
-    internal readonly Dictionary<RegexCall, RegexMachine> RegexMachines = new(ReferenceEqualityComparer.Instance);
-    internal readonly Dictionary<SimilarCall, RegexMachine[]> SimilarMachines = new(ReferenceEqualityComparer.Instance);
+    private Dictionary<RegexCall, RegexMachine>? regexMachines;
+    private Dictionary<SimilarCall, RegexMachine[]>? similarMachines;
+    internal Dictionary<RegexCall, RegexMachine> RegexMachines => regexMachines ??= new(ReferenceEqualityComparer.Instance);
+    internal Dictionary<SimilarCall, RegexMachine[]> SimilarMachines => similarMachines ??= new(ReferenceEqualityComparer.Instance);
     private string? firstLimit;
     private long statementOrigin;
+    internal bool HasCostCeiling => limit > 0 || session.LifetimeMaxCost > 0;
+    internal readonly record struct AttemptMark(long Cost, long Lifetime, string? FirstLimit,
+        long ScalarBytes, QueryMemoryAccount.AttemptMark Memory);
+    // cost.md §6.1: only discard-safe blocking lanes may rewind. The caller
+    // must dispose every attempted buffer before restoring these accounts.
+    internal AttemptMark Mark() => new(Accrued, session.LifetimeCost, firstLimit,
+        scalarBytes, memory?.Mark() ?? default);
+    internal void Rewind(AttemptMark mark)
+    {
+        Accrued = mark.Cost; session.LifetimeCost = mark.Lifetime;
+        firstLimit = mark.FirstLimit; scalarBytes = mark.ScalarBytes;
+        memory?.Rewind(mark.Memory);
+    }
+    // cost.md §6.2: a non-attempt lane gives back folds the eager path would
+    // not have reached before a filter error. A ceiling uses full replay.
+    internal void Refund(long units)
+    {
+        if (HasCostCeiling || units < 0 || units > Accrued || units > session.LifetimeCost)
+            throw new InvalidOperationException("invalid unmetered lane refund");
+        Accrued -= units; session.LifetimeCost -= units;
+    }
     private HostBatchReplay? hostBatches;
     internal HostBatchReplay HostBatches => hostBatches ??= new(this);
     internal long? HostBatchHeadroom

@@ -135,7 +135,7 @@ internal sealed class StoragePageCodec : IDisposable
     private static void ValidateBodyHeader(ReadOnlySpan<byte> bytes)
     {
         var type = bytes[0]; var flags = bytes[1];
-        if (type is < 1 or > 7 || bytes[2] != 0 || bytes[3] != 0 || !StorageFormat.IsZero(bytes[12..16]) ||
+        if (type is < 1 or > 7 || !StorageFormat.IsZero(bytes[12..16]) ||
             (type == 1 ? (flags & ~1) != 0 : flags != 0) ||
             (type is 2 or 3 or 5 or 6) && BinaryPrimitives.ReadUInt32BigEndian(bytes[8..]) != 0)
             throw StorageFormat.Corrupt("invalid decrypted body header");

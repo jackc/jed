@@ -5,7 +5,7 @@ namespace Jed;
 // A from-scratch sink keeps no database-sized collection of page buffers.
 // Allocation order is independent of emission order: bound children and chain
 // successors are sealed before their parents even when their IDs are higher.
-internal sealed class StorageImageWriter(IBlockStore destination, int pageSize, StoragePageCodec? codec = null)
+internal sealed class StorageImageWriter(IBlockStore destination, int pageSize, StoragePageCodec? codec = null, ulong transactionId = 0)
 {
     private uint next = codec is null ? 2u : 4u;
     internal int PageSize => pageSize;
@@ -20,6 +20,7 @@ internal sealed class StorageImageWriter(IBlockStore destination, int pageSize, 
     internal async ValueTask<StoragePageReference> WriteAsync(uint id, byte[] page, CancellationToken token)
     {
         if (id < (Encrypted ? 4u : 2u) || id >= next || page.Length != pageSize) throw new ArgumentException("invalid image page");
+        StorageFormat.Stamp(page, transactionId);
         var stored = codec is null ? page : codec.SealBody(id, page);
         await destination.WriteAsync((long)id * pageSize, stored, token).ConfigureAwait(false);
         return new(id, Encrypted ? stored.AsMemory(pageSize - 16).ToArray() : default);

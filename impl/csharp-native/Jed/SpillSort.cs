@@ -34,7 +34,7 @@ internal sealed record SpillPolicy(ScratchHost Host, long WorkMem, CatalogTable?
 internal static class SpillSort
 {
     internal static async IAsyncEnumerable<Row> Run(SelectPlan plan, IAsyncEnumerable<SqlValue[]> source,
-        SpillPolicy spill, QueryInputMemory inputMemory, Meter meter, [EnumeratorCancellation] CancellationToken token)
+        SpillPolicy spill, QueryInputMemory inputMemory, Meter meter, [EnumeratorCancellation] CancellationToken token, AggregateLanePlan.Attempt? attempt = null)
     {
         var order = plan.Order!;
         var touched = StorageTouchedColumns.Collect(plan);
@@ -79,7 +79,8 @@ internal static class SpillSort
         long? Remaining() => plan.Limit is { } limit ? Math.Max(0, Meter.Add(plan.Offset, limit) - skipped) : null;
         // A metered merge updates its charged run heads on each pull. Keep that
         // account schedule scalar; an unmetered merge may read the full window.
-        var output = HostPullWindow.Read(sorter.Read(token), roots, meter, Costs.RowProduced, Remaining, token,
+        var sorted = attempt is null ? sorter.Read(token) : AggregateLanePlan.AcceptedSource(sorter.Read(token), attempt, token);
+        var output = HostPullWindow.Read(sorted, roots, meter, Costs.RowProduced, Remaining, token,
             maximum: meter.Memory.Enabled ? 1 : 64);
         await foreach (var row in output.ConfigureAwait(false))
         {

@@ -12,7 +12,7 @@ internal sealed class SpillKeyState(ScratchHost host, long workMem, Meter meter)
     private sealed record Resident(byte[] Key, byte[] Bytes, long LogicalBytes, long Ordinal);
     private const int BucketCount = 64;
     private const int HeaderBytes = 32;
-    private readonly Dictionary<string, Resident> resident = new(StringComparer.Ordinal);
+    private readonly Dictionary<byte[], Resident> resident = new(ByteKeyComparer.Instance);
     private IBlockStore? data;
     private IBlockStore? directory;
     private long length;
@@ -25,9 +25,18 @@ internal sealed class SpillKeyState(ScratchHost host, long workMem, Meter meter)
     {
         token.ThrowIfCancellationRequested();
         if (data is null)
-            return resident.TryGetValue(Convert.ToBase64String(key), out var item) ? new(item.Bytes.ToArray(), item.Ordinal) : null;
+            return resident.TryGetValue(key, out var item) ? new(item.Bytes.ToArray(), item.Ordinal) : null;
         var found = await Find(key, token).ConfigureAwait(false);
         return found is null ? null : await ReadValue(found.Value.Header, token).ConfigureAwait(false);
+    }
+
+    // Membership probes never expose mutable resident bytes or materialize a
+    // disk value. Get remains the owned-value API for callers that consume it.
+    internal async ValueTask<bool> Contains(byte[] key, CancellationToken token)
+    {
+        token.ThrowIfCancellationRequested();
+        if (data is null) return resident.ContainsKey(key);
+        return await Find(key, token).ConfigureAwait(false) is not null;
     }
 
     internal async ValueTask<long> Put(byte[] key, byte[] value, long logicalBytes, CancellationToken token)
@@ -36,8 +45,7 @@ internal sealed class SpillKeyState(ScratchHost host, long workMem, Meter meter)
         if (logicalBytes < 0) throw new ArgumentOutOfRangeException(nameof(logicalBytes));
         if (data is null)
         {
-            var identity = Convert.ToBase64String(key);
-            resident.TryGetValue(identity, out var previous);
+            resident.TryGetValue(key, out var previous);
             var delta = logicalBytes - (previous?.LogicalBytes ?? 0);
             var admitted = delta <= 0 || meter.Memory.TryReserve(delta);
             if (admitted)
@@ -47,7 +55,8 @@ internal sealed class SpillKeyState(ScratchHost host, long workMem, Meter meter)
                 if (workMem == 0 || held <= workMem)
                 {
                     var ordinal = previous?.Ordinal ?? Count++;
-                    resident[identity] = new(key.ToArray(), value.ToArray(), logicalBytes, ordinal);
+                    var ownedKey = previous?.Key ?? key.ToArray();
+                    resident[ownedKey] = new(ownedKey, value.ToArray(), logicalBytes, ordinal);
                     return ordinal;
                 }
             }

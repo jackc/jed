@@ -18,17 +18,19 @@ internal sealed record StorageRecord(byte[] Key, byte[]?[] Cells)
 
 // Keeps directories and column regions in their immutable page buffer. A caller
 // may decode one requested cell without materializing all records or columns.
-internal sealed class StorageLeaf
+internal sealed partial class StorageLeaf
 {
+    private readonly ReadOnlyMemory<byte> encodedPage;
     private readonly ReadOnlyMemory<byte> payload;
     private readonly StorageLeafSchema schema;
     private readonly int prefixAt, prefixLength, keyDirectory, keyBlob, keyWidth, columnDirectory;
     internal int Count { get; }
 
-    private StorageLeaf(ReadOnlyMemory<byte> page, StorageLeafSchema schema, bool encrypted)
+    private StorageLeaf(ReadOnlyMemory<byte> page, StorageLeafSchema schema, bool encrypted, bool? verifyChecksum = null)
     {
+        encodedPage = page;
         this.schema = schema;
-        var header = StorageFormat.ParsePage(page.Span, verifyChecksum: !encrypted);
+        var header = StorageFormat.ParsePage(page.Span, verifyChecksum: verifyChecksum ?? !encrypted);
         if (header.Type != 2 || header.Count == 0 || header.Count > page.Length - 16)
             throw StorageFormat.Corrupt("invalid leaf header");
         Count = (int)header.Count; payload = page.Slice(16, page.Length - 16 - (encrypted ? StoragePageCodec.Reserve : 0));
@@ -98,6 +100,17 @@ internal sealed class StorageLeaf
         return key;
     }
 
+    internal int CompareKey(int row, ReadOnlySpan<byte> key)
+    {
+        if (row < 0 || row >= Count) throw new ArgumentOutOfRangeException(nameof(row));
+        var prefix = payload.Span.Slice(prefixAt, prefixLength);
+        var common = Math.Min(prefix.Length, key.Length);
+        var compared = prefix[..common].SequenceCompareTo(key[..common]);
+        if (compared != 0) return compared;
+        if (key.Length < prefix.Length) return 1;
+        return StoredKey(row).SequenceCompareTo(key[prefix.Length..]);
+    }
+
     private ReadOnlySpan<byte> StoredKey(int row)
     {
         var bytes = payload.Span;
@@ -157,11 +170,57 @@ internal sealed class StorageLeaf
         return result;
     }
 
+    // Fixed values are decoded directly from the immutable packed page. The
+    // scratch buffer reconstructs elided keys and integer deltas without making
+    // an owned record or byte array for every scalar cell.
+    internal SqlValue[] FixedRow(int row, CatalogTable table)
+    {
+        var values = new SqlValue[schema.Columns.Length];
+        FixedRowInto(row, table, values);
+        return values;
+    }
+    internal void FixedRowInto(int row, CatalogTable table, SqlValue[] values)
+    {
+        if (values.Length != schema.Columns.Length) throw new ArgumentException("row destination width", nameof(values));
+        Span<byte> scratch = stackalloc byte[16];
+        for (var column = 0; column < values.Length; column++)
+        {
+            var descriptor = schema.Columns[column]; var spec = table.Columns[column].Type;
+            if (descriptor.Width is <= 0 or > 16) throw new InvalidOperationException("nonfixed leaf row");
+            var destination = scratch[..descriptor.Width];
+            if (descriptor.KeyOffset >= 0)
+            {
+                var offset = descriptor.KeyOffset;
+                var prefixBytes = Math.Clamp(prefixLength - offset, 0, destination.Length);
+                if (prefixBytes != 0) payload.Span.Slice(prefixAt + offset, prefixBytes).CopyTo(destination);
+                StoredKey(row).Slice(Math.Max(0, offset - prefixLength), destination.Length - prefixBytes).CopyTo(destination[prefixBytes..]);
+            }
+            else
+            {
+                var bytes = Region(column).Span; var bitmap = (Count + 7) / 8;
+                if ((bytes[1 + row / 8] & (0x80 >> (row % 8))) != 0)
+                { values[column] = SqlValue.Null(spec.Type); continue; }
+                if (bytes[0] == 0)
+                {
+                    values[column] = StoredValues.FromLeafBytes(bytes.Slice(1 + bitmap + row * descriptor.Width, descriptor.Width), spec);
+                    continue;
+                }
+                var value = ReadUnsigned(bytes.Slice(1 + bitmap, descriptor.Width));
+                var offsetWidth = bytes[1 + bitmap + descriptor.Width];
+                value += ReadUnsigned(bytes.Slice(2 + bitmap + descriptor.Width + row * offsetWidth, offsetWidth));
+                for (var i = destination.Length - 1; i >= 0; i--) { destination[i] = unchecked((byte)value); value >>= 8; }
+            }
+            values[column] = StoredValues.FromLeafBytes(destination, spec);
+        }
+    }
+
     internal StorageRecord Record(int row)
     {
+        var key = Key(row);
         var cells = new byte[]?[schema.Columns.Length];
-        for (var c = 0; c < cells.Length; c++) cells[c] = Cell(row, c)?.ToArray();
-        return new(Key(row), cells);
+        for (var c = 0; c < cells.Length; c++) cells[c] = schema.Columns[c].KeyOffset >= 0
+            ? key.AsSpan(schema.Columns[c].KeyOffset, schema.Columns[c].Width).ToArray() : Cell(row, c)?.ToArray();
+        return new(key, cells);
     }
 
     private ReadOnlyMemory<byte> Region(int column)
@@ -275,10 +334,110 @@ internal sealed class StorageLeaf
         if (rows.Count == 0) return 0;
         var prefix = SharedPrefix(rows);
         var size = 1L + (schema.FixedKeyWidth == 0 ? 2L * rows.Count : 2) +
-            (prefix == 0 ? 0 : 2 + prefix) + rows.Sum(row => (long)row.Key.Length - prefix) +
+            (prefix == 0 ? 0 : 2 + prefix) +
             2L * (schema.Columns.Length + 1);
-        for (var c = 0; c < schema.Columns.Length; c++) size += EncodeRegion(schema.Columns[c], rows, c).Length;
+        for (var i = 0; i < rows.Count; i++) size += rows[i].Key.Length - prefix;
+        for (var c = 0; c < schema.Columns.Length; c++) size += MeasureRegion(schema.Columns[c], rows, c);
         return size;
+    }
+
+    // Split candidates need only a byte count. In particular, integer columns
+    // must not build two encoded regions for every possible split position.
+    private static long MeasureRegion(StorageColumn descriptor, IReadOnlyList<StorageRecord> rows, int column)
+    {
+        if (descriptor.KeyOffset >= 0)
+        {
+            for (var i = 0; i < rows.Count; i++)
+            {
+                var row = rows[i];
+                if (row.Cells[column] is not { } value || value.Length != descriptor.Width ||
+                    row.Key.Length < (long)descriptor.KeyOffset + descriptor.Width ||
+                    !row.Key.AsSpan(descriptor.KeyOffset, descriptor.Width).SequenceEqual(value))
+                    throw new ArgumentException("key-elided column differs from key");
+            }
+            return 0;
+        }
+        if (descriptor.Width == 0) return MeasureVariableRegion(descriptor, rows, column);
+        var minimum = ulong.MaxValue; ulong maximum = 0; var any = false;
+        for (var i = 0; i < rows.Count; i++)
+        {
+            var row = rows[i];
+            if (row.Cells[column] is not { } value) continue;
+            if (value.Length != descriptor.Width) throw new ArgumentException("wrong fixed cell width");
+            if (descriptor.Integer)
+            {
+                var number = ReadUnsigned(value);
+                minimum = Math.Min(minimum, number); maximum = Math.Max(maximum, number); any = true;
+            }
+        }
+        var plain = 1L + (rows.Count + 7L) / 8 + (long)rows.Count * descriptor.Width;
+        if (!descriptor.Integer) return plain;
+        if (!any) minimum = maximum = 0;
+        var range = maximum - minimum;
+        var width = range == 0 ? 0 : range <= byte.MaxValue ? 1 : range <= ushort.MaxValue ? 2 : range <= uint.MaxValue ? 4 : 8;
+        if (width >= descriptor.Width || (long)rows.Count * (descriptor.Width - width) <= descriptor.Width + 1) return plain;
+        return 2L + (rows.Count + 7L) / 8 + descriptor.Width + (long)rows.Count * width;
+    }
+
+    private static long MeasureVariableRegion(StorageColumn descriptor, IReadOnlyList<StorageRecord> rows, int column)
+    {
+        long total = 0;
+        for (var i = 0; i < rows.Count; i++)
+        {
+            var row = rows[i];
+            var cell = row.Cells[column];
+            if (cell is not null && cell.Length == 0) throw new ArgumentException("present variable cell cannot be empty");
+            if (cell is not null) ValidateCell(cell.AsMemory(), descriptor);
+            total += cell?.Length ?? 0;
+        }
+        var size = 1L + rows.Count * 2L + total;
+        if (descriptor.Dictionary)
+        {
+            var entries = new List<byte[]?>(); long distinctBytes = 0;
+            for (var i = 0; i < rows.Count; i++)
+            {
+                var row = rows[i];
+                var value = row.Cells[column]; var found = false;
+                if (value is null || value[0] == 5)
+                    foreach (var prior in entries)
+                        if (value is null ? prior is null : prior is not null && value.AsSpan().SequenceEqual(prior))
+                        { found = true; break; }
+                if (found) continue;
+                entries.Add(value); distinctBytes += value?.Length ?? 0;
+                // Encoding abandons the entire compact candidate at 257 entries,
+                // including array packing for the (currently disjoint) flags.
+                if (entries.Count > 256) return size;
+            }
+            size = Math.Min(size, 3L + entries.Count * 2L + distinctBytes + rows.Count);
+        }
+        if (descriptor.ArrayElementWidth is 2 or 4 or 8 &&
+            MeasureArrayRegion(rows, column, descriptor.ArrayElementWidth) is { } packed)
+            size = Math.Min(size, packed);
+        return size;
+    }
+
+    private static long? MeasureArrayRegion(IReadOnlyList<StorageRecord> rows, int column, int width)
+    {
+        ulong minimum = ulong.MaxValue, maximum = 0; long elements = 0;
+        for (var rowIndex = 0; rowIndex < rows.Count; rowIndex++)
+        {
+            var row = rows[rowIndex];
+            var value = row.Cells[column];
+            if (value is null || value.Length == 3 && StorageFormat.IsZero(value)) continue;
+            if (value.Length < 11 || value[0] != 0 || value[1] != 1 || value[2] != 0 ||
+                BinaryPrimitives.ReadUInt32BigEndian(value.AsSpan(7)) != 1) return null;
+            var count = BinaryPrimitives.ReadUInt32BigEndian(value.AsSpan(3));
+            if (count is < 1 or > 254 || value.Length != 11 + count * width) return null;
+            elements += count;
+            for (var i = 0; i < count; i++)
+            {
+                var element = ReadUnsigned(value.AsSpan(11 + i * width, width));
+                minimum = Math.Min(minimum, element); maximum = Math.Max(maximum, element);
+            }
+        }
+        if (elements == 0) minimum = maximum = 0;
+        var bits = 64 - BitOperations.LeadingZeroCount(maximum - minimum);
+        return 2L + rows.Count + width + (elements * bits + 7) / 8;
     }
 
     internal static byte[] EncodePayload(StorageLeafSchema schema, IReadOnlyList<StorageRecord> rows)

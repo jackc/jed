@@ -1,7 +1,38 @@
 # Native C# core experiment
 
-Authorized 2026-11-12; completed and frozen 2026-11-13. This is an **opt-in
-experimental core**, not a supported core or a production delivery decision. The semantic baseline is the
+The maintainer explicitly authorized a parity and performance refresh on 2026-11-13,
+including large internal refactoring while preserving correctness. Its target is
+`6b2355d98a7fd3738c60474779d1d63548f350dc` (format v53). Current refresh work and
+verification do not replace the historical freeze below, promote this core, add
+dependencies, or change the normal task/website exclusions. Performance work uses
+measured workloads and stops only when remaining candidates lack a reasonable
+correctness-preserving implementation or measured benefit; matching Go is a goal
+to test, not an assumed property of C# or NativeAOT.
+
+The architectural refresh is implemented. Storage now follows v53 generation
+stamps, retained interior/catalog pages, bounded remaps, leaf evening and
+incremental reclamation with reader and relaxed-batch reuse gates. Optimizations
+include immutable packed leaf overwrites, exact allocation-free payload sizing,
+lazy reuse of encoded UPDATE rows, prepared-plan reuse, resident expression
+kernels, fixed-width page scans and finite numeric aggregate folds. Aggregate
+attempts preserve canonical admission, error precedence, meter rewind and output
+acceptance; memory-enabled execution retains the prescribed accounting path.
+New internal spool ownership transfers avoid duplicate row copies while keeping
+spill admission and release timing.
+
+The refreshed inventory contains 764 pinned SQL files and two additional shared
+regressions for aggregate-expression accounting and numeric coercion (766 distinct
+files). Dedicated numeric resolvers now use the shared admission table, including
+literal-to-float selection and planning-time rejection of typed floats. All final four-variant
+inventories and host executables, 496 process cases, 16,000 threaded snapshot
+checks and 85 complete fault traces pass. Artifact-specific evidence and
+repeated diagnostic measurements are recorded in
+[VERIFICATION.md](../../impl/csharp-native/VERIFICATION.md) and
+[BENCHMARKS.md](../../impl/csharp-native/BENCHMARKS.md).
+
+The original experiment was authorized 2026-11-12 and completed and frozen
+2026-11-13. This is an **opt-in experimental core**, not a supported core or a
+production delivery decision. Its original semantic baseline was the
 supported Rust/Go/TypeScript surface at
 `b1a6affca7725e0b07a4f734eddb1c569ef76bcf`. The language-neutral specification,
 catalogs and corpus at that revision are authoritative. Existing engines supply
@@ -31,7 +62,7 @@ failure/recovery simulation, PostgreSQL oracle checks and healthy default tasks
 without .NET. Harnesses drain public cursors externally and check final costs and
 drain-time errors. Internal collectors cannot substitute for that path.
 
-## Recorded completion
+## Historical frozen completion
 
 Engine34 passes all applicable frozen SQL files across memory/plain/encrypted
 storage and default/runtime-async JIT/NativeAOT: 12 inventories with exact
@@ -45,7 +76,7 @@ intrinsic fault checks under the canonical per-profile policy. Four compilation
 variants each completed three sequential diagnostic measurement runs. See the
 [verification record](../../impl/csharp-native/VERIFICATION.md) for source/artifact
 identities and freeze proof, and [measurements](../../impl/csharp-native/BENCHMARKS.md)
-for results and limits. Current time/allocation overhead against Go is substantial;
+for results and limits. The frozen capture's time/allocation overhead against Go is substantial;
 the tmpfs diagnostics do not validate earlier near-Rust performance expectations
 or physical-disk durability latency. Production delivery remains undecided.
 
@@ -124,7 +155,7 @@ proofs. BCL method names alone do not prove cross-core lock interoperability.
 
 `impl/csharp-native/PROGRESS.md` records work and unresolved gates;
 `VERIFICATION.md` records executed checks and their scope. `baseline.json` pins
-the original revision. Any supplemental corpus files are identified separately;
+the active refresh revision and retains the previous revision. Any supplemental corpus files are identified separately;
 they do not silently move that revision. Implementation and performance evidence
 must identify the actual source tested. No freeze or performance claim is implied
 by this charter.

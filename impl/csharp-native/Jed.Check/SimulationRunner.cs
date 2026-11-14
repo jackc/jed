@@ -86,7 +86,7 @@ internal sealed partial class SimulationRunner
     {
         database.MaxStorageBytes = trace.MaxStorage; database.SetWorkMem(trace.WorkMemory);
         var storage = database.CommittedStorageForTesting();
-        growthBound = storage.Meta.PageCount - storage.FreePages.Count; previousReclaimed = false;
+        growthBound = Math.Max(0, storage.LeakedPages); previousReclaimed = false;
     }
     private void Emit()
     {
@@ -350,18 +350,22 @@ internal sealed partial class SimulationRunner
         var after = selected.PublishedStateForTesting().Storage;
         var firstBody = after.Encrypted is null ? 2u : 4u;
         var written = fs.WrittenPages(path).Where(page => page >= firstBody).ToArray();
-        var threshold = Math.Max(16, 2 * bound);
-        var reclaim = quiet && before.Meta.PageCount - before.FreePages.Count > threshold;
+        var reclaim = quiet && before.Batch is null;
         if (quiet)
         {
-            if (reclaim) SimulationStorageChecks.Require((long)after.Meta.PageCount - firstBody - after.Meta.LivePages - after.FreePages.Count <= written.Length,
-                "quiet commit exceeded reclamation threshold without reclaiming unreachable pages");
+            if (reclaim)
+            {
+                if (before.ReclamationDue) bound = 0;
+                var unlisted = (long)after.Meta.PageCount - firstBody - after.Meta.LivePages - after.FreePages.Count;
+                SimulationStorageChecks.Require(unlisted >= 0 && unlisted <= written.Length + bound,
+                    "quiet commit left new unreachable pages unlisted");
+            }
             var reusable = before.Batch is null ? before.FreePages : new SortedSet<uint>(before.FreePages
                 .Intersect(before.Batch.FloorFree).Except(before.Batch.Pending.Select(entry => entry.Page)));
-            if (previouslyReclaimed) SimulationStorageChecks.Require((long)after.Meta.PageCount - before.Meta.PageCount <= Math.Max(0, written.Length - reusable.Count),
+            if (before.Batch is null && previouslyReclaimed) SimulationStorageChecks.Require((long)after.Meta.PageCount - before.Meta.PageCount <= Math.Max(0, written.Length - reusable.Count),
                 "commit grew without first reusing the reclaimed free list");
             var tail = before.Meta.PageCount;
-            while (tail > firstBody && reusable.Contains(tail - 1)) tail--;
+            if (before.Batch is null) while (tail > firstBody && reusable.Contains(tail - 1)) tail--;
             var high = written.Length == 0 ? 0 : written.Max() + 1;
             SimulationStorageChecks.Require(after.Meta.PageCount == Math.Max(tail, high), "quiet commit did not use canonical trailing truncation/high-water");
             if (after.Batch is null && after.Meta.PageCount < before.Meta.PageCount)
@@ -371,7 +375,7 @@ internal sealed partial class SimulationRunner
                     "trailing truncation retained more than one growth step of slack");
             }
         }
-        bound = Math.Max(bound, (long)after.Meta.LivePages + written.Length); previouslyReclaimed = reclaim;
+        previouslyReclaimed = reclaim;
     }
     private void RecordAttempt(ulong start)
     { if (pendingDigest is not null && fs.WrittenPages("sim.jed").Count > 0) AddHistory(start + 1, pendingDigest); RecordAttachedAttempts(); }

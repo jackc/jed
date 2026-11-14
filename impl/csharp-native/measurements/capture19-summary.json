@@ -1,0 +1,2692 @@
+{
+  "semantic_revision": "9790a3aeabf171ddf185cd6a7cf035ae0050aae4",
+  "source_sha256": "abf9e5bd4706a986f45e21e1ee03c9b28557e71df6f61038c6ac7cdebf153168",
+  "method": "Median of three per-run sample medians; ratio is median of paired run ratios. Allocation is median allocated bytes per operation. JIT uses DOTNET_TieredCompilation=0; AOT uses Speed/default instructions.",
+  "variants": {
+    "jit": {
+      "files": [
+        {
+          "file": "capture19-jit-1.json",
+          "sha256": "4db7c72ef8afcd67c3b706fd0f5c2e838566d3ad94c67c392c037e0cae7588de"
+        },
+        {
+          "file": "capture19-jit-2.json",
+          "sha256": "616eba34335cc18188fbac6bad78f8fa3dcc46665cf04667bd4e2b7d452250ef"
+        },
+        {
+          "file": "capture19-jit-3.json",
+          "sha256": "2f73a33357d88a3ac7275b32013452c6afd38ecba63cf2c709d698d76a0b1c65"
+        }
+      ],
+      "actor_source_sha256": "abf9e5bd4706a986f45e21e1ee03c9b28557e71df6f61038c6ac7cdebf153168",
+      "actor_sha256": [
+        "e1315a23c11ff39328e0cbd2453be75227459d322a24f73ee2383738cf5f6c6e"
+      ],
+      "go_actor_sha256": [
+        "75935d42bec195818e8c06427305455c551816302460d885d47397d7299daa2f"
+      ],
+      "startup_ms": 219.671484,
+      "go_startup_ms": 2.285892,
+      "workloads": {
+        "scalar": {
+          "csharp_us": 0.9,
+          "go_us": 0.563,
+          "ratio": 1.618705035971223,
+          "csharp_bytes": 2752.0,
+          "go_bytes": 1352.016,
+          "runs": [
+            {
+              "csharp_us": 1.6,
+              "go_us": 0.567,
+              "ratio": 2.8218694885361555,
+              "csharp_bytes": 2752.0,
+              "go_bytes": 1352.0
+            },
+            {
+              "csharp_us": 0.9,
+              "go_us": 0.563,
+              "ratio": 1.5985790408525757,
+              "csharp_bytes": 2752.0,
+              "go_bytes": 1352.016
+            },
+            {
+              "csharp_us": 0.9,
+              "go_us": 0.556,
+              "ratio": 1.618705035971223,
+              "csharp_bytes": 2752.0,
+              "go_bytes": 1352.016
+            }
+          ]
+        },
+        "point": {
+          "csharp_us": 3.9,
+          "go_us": 1.3085,
+          "ratio": 3.000750187546887,
+          "csharp_bytes": 8000.0,
+          "go_bytes": 2013.64,
+          "runs": [
+            {
+              "csharp_us": 3.9,
+              "go_us": 1.3085,
+              "ratio": 2.980512036683225,
+              "csharp_bytes": 8000.0,
+              "go_bytes": 2013.752
+            },
+            {
+              "csharp_us": 3.7,
+              "go_us": 0.939,
+              "ratio": 3.940362087326944,
+              "csharp_bytes": 8000.0,
+              "go_bytes": 2008.112
+            },
+            {
+              "csharp_us": 4.0,
+              "go_us": 1.333,
+              "ratio": 3.000750187546887,
+              "csharp_bytes": 8000.0,
+              "go_bytes": 2013.64
+            }
+          ]
+        },
+        "range": {
+          "csharp_us": 60.2,
+          "go_us": 20.1425,
+          "ratio": 2.9887054735013034,
+          "csharp_bytes": 52328.0,
+          "go_bytes": 9296.0,
+          "runs": [
+            {
+              "csharp_us": 58.9,
+              "go_us": 20.0415,
+              "ratio": 2.9389017788089715,
+              "csharp_bytes": 52328.0,
+              "go_bytes": 9296.0
+            },
+            {
+              "csharp_us": 63.6,
+              "go_us": 20.93,
+              "ratio": 3.038700430004778,
+              "csharp_bytes": 52330.08,
+              "go_bytes": 9296.0
+            },
+            {
+              "csharp_us": 60.2,
+              "go_us": 20.1425,
+              "ratio": 2.9887054735013034,
+              "csharp_bytes": 52328.0,
+              "go_bytes": 9296.0
+            }
+          ]
+        },
+        "aggregate": {
+          "csharp_us": 305.45,
+          "go_us": 248.1665,
+          "ratio": 1.226005422639218,
+          "csharp_bytes": 8392.0,
+          "go_bytes": 19320.0,
+          "runs": [
+            {
+              "csharp_us": 305.45,
+              "go_us": 246.7945,
+              "ratio": 1.2376693970084423,
+              "csharp_bytes": 8392.0,
+              "go_bytes": 19320.0
+            },
+            {
+              "csharp_us": 305.9,
+              "go_us": 249.5095,
+              "ratio": 1.226005422639218,
+              "csharp_bytes": 8392.0,
+              "go_bytes": 19322.56
+            },
+            {
+              "csharp_us": 301.8,
+              "go_us": 248.1665,
+              "ratio": 1.2161190168697225,
+              "csharp_bytes": 8392.0,
+              "go_bytes": 19320.0
+            }
+          ]
+        },
+        "join": {
+          "csharp_us": 7857.2,
+          "go_us": 5254.552,
+          "ratio": 1.4953130162190802,
+          "csharp_bytes": 13917632.0,
+          "go_bytes": 5569807.04,
+          "runs": [
+            {
+              "csharp_us": 7880.0,
+              "go_us": 5108.997,
+              "ratio": 1.542377104547135,
+              "csharp_bytes": 13917632.0,
+              "go_bytes": 5569807.04
+            },
+            {
+              "csharp_us": 7857.2,
+              "go_us": 5254.552,
+              "ratio": 1.4953130162190802,
+              "csharp_bytes": 13917632.0,
+              "go_bytes": 5569801.28
+            },
+            {
+              "csharp_us": 7527.4,
+              "go_us": 5367.146,
+              "ratio": 1.4024958516127566,
+              "csharp_bytes": 13917632.0,
+              "go_bytes": 5570106.24
+            }
+          ]
+        },
+        "sort": {
+          "csharp_us": 2074.15,
+          "go_us": 1006.92,
+          "ratio": 2.059895522980972,
+          "csharp_bytes": 355368.0,
+          "go_bytes": 296154.56,
+          "runs": [
+            {
+              "csharp_us": 2074.15,
+              "go_us": 1006.92,
+              "ratio": 2.059895522980972,
+              "csharp_bytes": 355368.0,
+              "go_bytes": 296152.32
+            },
+            {
+              "csharp_us": 2064.9,
+              "go_us": 1012.9665,
+              "ratio": 2.0384682020580147,
+              "csharp_bytes": 355368.0,
+              "go_bytes": 296154.56
+            },
+            {
+              "csharp_us": 2102.85,
+              "go_us": 991.5855,
+              "ratio": 2.120694584581965,
+              "csharp_bytes": 355368.0,
+              "go_bytes": 296156.8
+            }
+          ]
+        },
+        "rollback": {
+          "csharp_us": 51.75,
+          "go_us": 29.082,
+          "ratio": 1.7328883790454341,
+          "csharp_bytes": 68568.0,
+          "go_bytes": 127072.72,
+          "runs": [
+            {
+              "csharp_us": 51.75,
+              "go_us": 29.082,
+              "ratio": 1.7794512069321229,
+              "csharp_bytes": 68568.0,
+              "go_bytes": 127072.72
+            },
+            {
+              "csharp_us": 49.85,
+              "go_us": 28.767,
+              "ratio": 1.7328883790454341,
+              "csharp_bytes": 68568.0,
+              "go_bytes": 127072.4
+            },
+            {
+              "csharp_us": 52.0,
+              "go_us": 30.8045,
+              "ratio": 1.688065055430213,
+              "csharp_bytes": 68568.0,
+              "go_bytes": 127111.68
+            }
+          ]
+        },
+        "durable": {
+          "csharp_us": 155.95,
+          "go_us": 117.399,
+          "ratio": 1.3321317524857348,
+          "csharp_bytes": 115748.96,
+          "go_bytes": 279433.6,
+          "runs": [
+            {
+              "csharp_us": 158.35,
+              "go_us": 117.399,
+              "ratio": 1.348818984829513,
+              "csharp_bytes": 115754.72,
+              "go_bytes": 279431.36
+            },
+            {
+              "csharp_us": 155.95,
+              "go_us": 117.068,
+              "ratio": 1.3321317524857348,
+              "csharp_bytes": 115748.96,
+              "go_bytes": 279440.32
+            },
+            {
+              "csharp_us": 148.55,
+              "go_us": 118.665,
+              "ratio": 1.251843424767202,
+              "csharp_bytes": 115748.96,
+              "go_bytes": 279433.6
+            }
+          ]
+        },
+        "cold_open": {
+          "csharp_us": 337.7,
+          "go_us": 208.503,
+          "ratio": 1.6570504980743683,
+          "csharp_bytes": 228021.44,
+          "go_bytes": 501384.64,
+          "runs": [
+            {
+              "csharp_us": 329.7,
+              "go_us": 198.695,
+              "ratio": 1.6593271093887616,
+              "csharp_bytes": 228021.44,
+              "go_bytes": 501384.64
+            },
+            {
+              "csharp_us": 345.5,
+              "go_us": 208.503,
+              "ratio": 1.6570504980743683,
+              "csharp_bytes": 227919.68,
+              "go_bytes": 502760.64
+            },
+            {
+              "csharp_us": 337.7,
+              "go_us": 211.693,
+              "ratio": 1.5952346086077478,
+              "csharp_bytes": 228025.92,
+              "go_bytes": 501051.52
+            }
+          ]
+        },
+        "grouped": {
+          "csharp_us": 2968.1,
+          "go_us": 2463.9965,
+          "ratio": 1.1856956777333085,
+          "csharp_bytes": 7401912.0,
+          "go_bytes": 3534319.04,
+          "runs": [
+            {
+              "csharp_us": 3051.2,
+              "go_us": 2427.4105,
+              "ratio": 1.2569773427279811,
+              "csharp_bytes": 7401912.0,
+              "go_bytes": 3534296.0
+            },
+            {
+              "csharp_us": 2921.55,
+              "go_us": 2463.9965,
+              "ratio": 1.1856956777333085,
+              "csharp_bytes": 7401912.0,
+              "go_bytes": 3534319.04
+            },
+            {
+              "csharp_us": 2968.1,
+              "go_us": 2530.9605,
+              "ratio": 1.1727168401087253,
+              "csharp_bytes": 7401912.0,
+              "go_bytes": 3534362.56
+            }
+          ]
+        },
+        "distinct": {
+          "csharp_us": 3388.6,
+          "go_us": 2187.6635,
+          "ratio": 1.5489585121294933,
+          "csharp_bytes": 5590408.0,
+          "go_bytes": 4271656.32,
+          "runs": [
+            {
+              "csharp_us": 3380.25,
+              "go_us": 2253.2605,
+              "ratio": 1.5001594356267285,
+              "csharp_bytes": 5590408.0,
+              "go_bytes": 4271756.32
+            },
+            {
+              "csharp_us": 3388.6,
+              "go_us": 2187.6635,
+              "ratio": 1.5489585121294933,
+              "csharp_bytes": 5590408.0,
+              "go_bytes": 4271656.32
+            },
+            {
+              "csharp_us": 3647.4,
+              "go_us": 2133.284,
+              "ratio": 1.7097582881604136,
+              "csharp_bytes": 5590408.0,
+              "go_bytes": 4271624.96
+            }
+          ]
+        },
+        "distinct_aggregate": {
+          "csharp_us": 3374.65,
+          "go_us": 997.0385,
+          "ratio": 3.341300308987241,
+          "csharp_bytes": 7066680.0,
+          "go_bytes": 1333466.88,
+          "runs": [
+            {
+              "csharp_us": 3201.65,
+              "go_us": 997.0385,
+              "ratio": 3.2111598498954654,
+              "csharp_bytes": 7066680.0,
+              "go_bytes": 1333487.36
+            },
+            {
+              "csharp_us": 3390.1,
+              "go_us": 1014.605,
+              "ratio": 3.341300308987241,
+              "csharp_bytes": 7066680.0,
+              "go_bytes": 1333464.0
+            },
+            {
+              "csharp_us": 3374.65,
+              "go_us": 913.172,
+              "ratio": 3.6955250489502527,
+              "csharp_bytes": 7066680.0,
+              "go_bytes": 1333466.88
+            }
+          ]
+        },
+        "window": {
+          "csharp_us": 90.05,
+          "go_us": 52.544,
+          "ratio": 1.7138017661388552,
+          "csharp_bytes": 164320.0,
+          "go_bytes": 183672.64,
+          "runs": [
+            {
+              "csharp_us": 90.05,
+              "go_us": 52.544,
+              "ratio": 1.7138017661388552,
+              "csharp_bytes": 164320.0,
+              "go_bytes": 183672.64
+            },
+            {
+              "csharp_us": 85.2,
+              "go_us": 61.209,
+              "ratio": 1.3919521638974661,
+              "csharp_bytes": 164320.0,
+              "go_bytes": 183675.2
+            },
+            {
+              "csharp_us": 90.05,
+              "go_us": 38.1475,
+              "ratio": 2.3605740874238155,
+              "csharp_bytes": 164320.0,
+              "go_bytes": 183672.0
+            }
+          ]
+        },
+        "text_filter": {
+          "csharp_us": 570.2,
+          "go_us": 225.3665,
+          "ratio": 2.530100968866269,
+          "csharp_bytes": 232032.0,
+          "go_bytes": 149147.52,
+          "runs": [
+            {
+              "csharp_us": 570.85,
+              "go_us": 366.6145,
+              "ratio": 1.5570851671169579,
+              "csharp_bytes": 232032.0,
+              "go_bytes": 149144.64
+            },
+            {
+              "csharp_us": 563.1,
+              "go_us": 222.539,
+              "ratio": 2.530342996059118,
+              "csharp_bytes": 232032.0,
+              "go_bytes": 149149.44
+            },
+            {
+              "csharp_us": 570.2,
+              "go_us": 225.3665,
+              "ratio": 2.530100968866269,
+              "csharp_bytes": 232032.0,
+              "go_bytes": 149147.52
+            }
+          ]
+        },
+        "float_aggregate": {
+          "csharp_us": 457.0,
+          "go_us": 174.3565,
+          "ratio": 2.621066607783478,
+          "csharp_bytes": 19840.0,
+          "go_bytes": 2184.0,
+          "runs": [
+            {
+              "csharp_us": 454.25,
+              "go_us": 174.558,
+              "ratio": 2.602286918961033,
+              "csharp_bytes": 19840.0,
+              "go_bytes": 2184.0
+            },
+            {
+              "csharp_us": 479.8,
+              "go_us": 101.161,
+              "ratio": 4.742934530105475,
+              "csharp_bytes": 19840.0,
+              "go_bytes": 2184.0
+            },
+            {
+              "csharp_us": 457.0,
+              "go_us": 174.3565,
+              "ratio": 2.621066607783478,
+              "csharp_bytes": 19840.0,
+              "go_bytes": 2184.0
+            }
+          ]
+        },
+        "decimal_aggregate": {
+          "csharp_us": 2438.35,
+          "go_us": 5956.258,
+          "ratio": 0.39340975491659363,
+          "csharp_bytes": 2325184.0,
+          "go_bytes": 3874873.6,
+          "runs": [
+            {
+              "csharp_us": 2438.35,
+              "go_us": 6262.2155,
+              "ratio": 0.3893749744000346,
+              "csharp_bytes": 2325184.0,
+              "go_bytes": 3874873.6
+            },
+            {
+              "csharp_us": 2343.25,
+              "go_us": 5956.258,
+              "ratio": 0.39340975491659363,
+              "csharp_bytes": 2325184.0,
+              "go_bytes": 3874854.08
+            },
+            {
+              "csharp_us": 2522.3,
+              "go_us": 5532.51,
+              "ratio": 0.4559051858921177,
+              "csharp_bytes": 2325184.0,
+              "go_bytes": 3874942.08
+            }
+          ]
+        },
+        "expression_projection": {
+          "csharp_us": 66.15,
+          "go_us": 23.136,
+          "ratio": 2.8591804979253115,
+          "csharp_bytes": 49384.0,
+          "go_bytes": 9296.0,
+          "runs": [
+            {
+              "csharp_us": 66.15,
+              "go_us": 23.136,
+              "ratio": 2.8591804979253115,
+              "csharp_bytes": 49384.0,
+              "go_bytes": 9296.0
+            },
+            {
+              "csharp_us": 66.45,
+              "go_us": 24.2965,
+              "ratio": 2.734961825777375,
+              "csharp_bytes": 49384.0,
+              "go_bytes": 9296.0
+            },
+            {
+              "csharp_us": 65.95,
+              "go_us": 15.72,
+              "ratio": 4.19529262086514,
+              "csharp_bytes": 49384.0,
+              "go_bytes": 9296.0
+            }
+          ]
+        }
+      }
+    },
+    "jit-runtime-async": {
+      "files": [
+        {
+          "file": "capture19-jit-runtime-async-1.json",
+          "sha256": "de19373572f16fa4325fc4fe5e5055fa419078418a37b8f1b8a1bb9f4a393254"
+        },
+        {
+          "file": "capture19-jit-runtime-async-2.json",
+          "sha256": "edc65c1ce5314f1b4f6a01849fec43f151400835b096124cf0f924d846bfd5c2"
+        },
+        {
+          "file": "capture19-jit-runtime-async-3.json",
+          "sha256": "26b20d845828bcef1d6ad575af7742cd67828b0145da9f14112796019da75028"
+        }
+      ],
+      "actor_source_sha256": "abf9e5bd4706a986f45e21e1ee03c9b28557e71df6f61038c6ac7cdebf153168",
+      "actor_sha256": [
+        "762f7cf53d458223636786e916722c59ebab3d6e8f57271f7991df4438e8d2fe"
+      ],
+      "go_actor_sha256": [
+        "75935d42bec195818e8c06427305455c551816302460d885d47397d7299daa2f"
+      ],
+      "startup_ms": 193.12205,
+      "go_startup_ms": 1.874956,
+      "workloads": {
+        "scalar": {
+          "csharp_us": 0.8,
+          "go_us": 0.5585,
+          "ratio": 1.4324082363473591,
+          "csharp_bytes": 2608.0,
+          "go_bytes": 1352.016,
+          "runs": [
+            {
+              "csharp_us": 0.8,
+              "go_us": 0.557,
+              "ratio": 1.436265709156194,
+              "csharp_bytes": 2608.0,
+              "go_bytes": 1352.016
+            },
+            {
+              "csharp_us": 0.8,
+              "go_us": 0.5585,
+              "ratio": 1.4324082363473591,
+              "csharp_bytes": 2608.0,
+              "go_bytes": 1352.016
+            },
+            {
+              "csharp_us": 0.8,
+              "go_us": 0.584,
+              "ratio": 1.3698630136986303,
+              "csharp_bytes": 2608.0,
+              "go_bytes": 1352.016
+            }
+          ]
+        },
+        "point": {
+          "csharp_us": 3.8,
+          "go_us": 1.316,
+          "ratio": 2.895238095238095,
+          "csharp_bytes": 7856.0,
+          "go_bytes": 2013.832,
+          "runs": [
+            {
+              "csharp_us": 5.3,
+              "go_us": 1.316,
+              "ratio": 4.027355623100304,
+              "csharp_bytes": 7856.0,
+              "go_bytes": 2013.832
+            },
+            {
+              "csharp_us": 3.5,
+              "go_us": 1.316,
+              "ratio": 2.6595744680851063,
+              "csharp_bytes": 7856.0,
+              "go_bytes": 2013.832
+            },
+            {
+              "csharp_us": 3.8,
+              "go_us": 1.3125,
+              "ratio": 2.895238095238095,
+              "csharp_bytes": 7856.0,
+              "go_bytes": 2008.24
+            }
+          ]
+        },
+        "range": {
+          "csharp_us": 58.6,
+          "go_us": 20.513,
+          "ratio": 2.9140456003381487,
+          "csharp_bytes": 52184.0,
+          "go_bytes": 9296.32,
+          "runs": [
+            {
+              "csharp_us": 67.0,
+              "go_us": 20.513,
+              "ratio": 3.26622142056257,
+              "csharp_bytes": 52184.0,
+              "go_bytes": 9297.12
+            },
+            {
+              "csharp_us": 58.6,
+              "go_us": 20.1095,
+              "ratio": 2.9140456003381487,
+              "csharp_bytes": 52184.0,
+              "go_bytes": 9296.32
+            },
+            {
+              "csharp_us": 56.1,
+              "go_us": 21.743,
+              "ratio": 2.5801407349491794,
+              "csharp_bytes": 52184.0,
+              "go_bytes": 9296.0
+            }
+          ]
+        },
+        "aggregate": {
+          "csharp_us": 285.35,
+          "go_us": 248.906,
+          "ratio": 1.1464167195648156,
+          "csharp_bytes": 8248.0,
+          "go_bytes": 19320.0,
+          "runs": [
+            {
+              "csharp_us": 424.5,
+              "go_us": 249.414,
+              "ratio": 1.7019894633019799,
+              "csharp_bytes": 8248.0,
+              "go_bytes": 19320.0
+            },
+            {
+              "csharp_us": 285.35,
+              "go_us": 248.906,
+              "ratio": 1.1464167195648156,
+              "csharp_bytes": 8248.0,
+              "go_bytes": 19320.0
+            },
+            {
+              "csharp_us": 281.25,
+              "go_us": 247.4215,
+              "ratio": 1.1367241731215758,
+              "csharp_bytes": 8248.0,
+              "go_bytes": 19320.0
+            }
+          ]
+        },
+        "join": {
+          "csharp_us": 7383.2,
+          "go_us": 5316.204,
+          "ratio": 1.3845217376910293,
+          "csharp_bytes": 13917488.0,
+          "go_bytes": 5569833.28,
+          "runs": [
+            {
+              "csharp_us": 7360.4,
+              "go_us": 5316.204,
+              "ratio": 1.3845217376910293,
+              "csharp_bytes": 13917488.0,
+              "go_bytes": 5569833.28
+            },
+            {
+              "csharp_us": 7545.9,
+              "go_us": 4908.052,
+              "ratio": 1.5374531484181504,
+              "csharp_bytes": 13917488.0,
+              "go_bytes": 5569807.04
+            },
+            {
+              "csharp_us": 7383.2,
+              "go_us": 5410.097,
+              "ratio": 1.364707508941152,
+              "csharp_bytes": 13917488.0,
+              "go_bytes": 5569910.72
+            }
+          ]
+        },
+        "sort": {
+          "csharp_us": 2041.05,
+          "go_us": 997.252,
+          "ratio": 2.0466742608688677,
+          "csharp_bytes": 355224.0,
+          "go_bytes": 296156.8,
+          "runs": [
+            {
+              "csharp_us": 2027.2,
+              "go_us": 1016.0385,
+              "ratio": 1.9951999850399371,
+              "csharp_bytes": 355224.0,
+              "go_bytes": 296154.56
+            },
+            {
+              "csharp_us": 2041.05,
+              "go_us": 997.252,
+              "ratio": 2.0466742608688677,
+              "csharp_bytes": 355224.0,
+              "go_bytes": 296156.8
+            },
+            {
+              "csharp_us": 2045.65,
+              "go_us": 923.411,
+              "ratio": 2.2153190724390335,
+              "csharp_bytes": 355224.0,
+              "go_bytes": 296163.52
+            }
+          ]
+        },
+        "rollback": {
+          "csharp_us": 48.95,
+          "go_us": 30.1395,
+          "ratio": 1.62411453408318,
+          "csharp_bytes": 68352.0,
+          "go_bytes": 127077.84,
+          "runs": [
+            {
+              "csharp_us": 48.95,
+              "go_us": 30.1395,
+              "ratio": 1.62411453408318,
+              "csharp_bytes": 68352.0,
+              "go_bytes": 127086.16
+            },
+            {
+              "csharp_us": 47.5,
+              "go_us": 29.564,
+              "ratio": 1.6066838046272494,
+              "csharp_bytes": 68352.0,
+              "go_bytes": 127077.84
+            },
+            {
+              "csharp_us": 51.7,
+              "go_us": 30.4955,
+              "ratio": 1.69533209817842,
+              "csharp_bytes": 68352.0,
+              "go_bytes": 127068.56
+            }
+          ]
+        },
+        "durable": {
+          "csharp_us": 150.0,
+          "go_us": 118.5825,
+          "ratio": 1.2585212375458839,
+          "csharp_bytes": 114136.48,
+          "go_bytes": 279370.08,
+          "runs": [
+            {
+              "csharp_us": 147.0,
+              "go_us": 118.1435,
+              "ratio": 1.2442495778438931,
+              "csharp_bytes": 114138.72,
+              "go_bytes": 279360.48
+            },
+            {
+              "csharp_us": 154.8,
+              "go_us": 123.0015,
+              "ratio": 1.2585212375458839,
+              "csharp_bytes": 114136.48,
+              "go_bytes": 279434.56
+            },
+            {
+              "csharp_us": 150.0,
+              "go_us": 118.5825,
+              "ratio": 1.264942128897603,
+              "csharp_bytes": 114136.48,
+              "go_bytes": 279370.08
+            }
+          ]
+        },
+        "cold_open": {
+          "csharp_us": 306.1,
+          "go_us": 204.755,
+          "ratio": 1.4744450684964958,
+          "csharp_bytes": 224432.96,
+          "go_bytes": 501799.04,
+          "runs": [
+            {
+              "csharp_us": 315.3,
+              "go_us": 216.017,
+              "ratio": 1.459607345718161,
+              "csharp_bytes": 224415.68,
+              "go_bytes": 502107.2
+            },
+            {
+              "csharp_us": 301.9,
+              "go_us": 204.755,
+              "ratio": 1.4744450684964958,
+              "csharp_bytes": 224432.96,
+              "go_bytes": 501799.04
+            },
+            {
+              "csharp_us": 306.1,
+              "go_us": 197.209,
+              "ratio": 1.5521603983591012,
+              "csharp_bytes": 224432.96,
+              "go_bytes": 500621.12
+            }
+          ]
+        },
+        "grouped": {
+          "csharp_us": 2766.0,
+          "go_us": 2263.284,
+          "ratio": 1.2203645637406935,
+          "csharp_bytes": 7401768.0,
+          "go_bytes": 3534332.16,
+          "runs": [
+            {
+              "csharp_us": 2766.0,
+              "go_us": 2485.3005,
+              "ratio": 1.1129438874695434,
+              "csharp_bytes": 7401768.0,
+              "go_bytes": 3534339.52
+            },
+            {
+              "csharp_us": 2684.5,
+              "go_us": 2199.7525,
+              "ratio": 1.2203645637406935,
+              "csharp_bytes": 7401768.0,
+              "go_bytes": 3534332.16
+            },
+            {
+              "csharp_us": 2911.8,
+              "go_us": 2263.284,
+              "ratio": 1.2865376152528802,
+              "csharp_bytes": 7401768.0,
+              "go_bytes": 3534314.88
+            }
+          ]
+        },
+        "distinct": {
+          "csharp_us": 3022.95,
+          "go_us": 2113.3845,
+          "ratio": 1.429929517404752,
+          "csharp_bytes": 5590264.0,
+          "go_bytes": 4271638.72,
+          "runs": [
+            {
+              "csharp_us": 2997.0,
+              "go_us": 2095.9075,
+              "ratio": 1.429929517404752,
+              "csharp_bytes": 5590264.0,
+              "go_bytes": 4271638.08
+            },
+            {
+              "csharp_us": 3135.1,
+              "go_us": 2113.3845,
+              "ratio": 1.4834498880823626,
+              "csharp_bytes": 5590264.0,
+              "go_bytes": 4271638.72
+            },
+            {
+              "csharp_us": 3022.95,
+              "go_us": 2292.4465,
+              "ratio": 1.318656727648824,
+              "csharp_bytes": 5590264.0,
+              "go_bytes": 4271692.16
+            }
+          ]
+        },
+        "distinct_aggregate": {
+          "csharp_us": 2592.4,
+          "go_us": 1010.351,
+          "ratio": 2.580616903219898,
+          "csharp_bytes": 7066536.0,
+          "go_bytes": 1333465.6,
+          "runs": [
+            {
+              "csharp_us": 2592.4,
+              "go_us": 1004.566,
+              "ratio": 2.580616903219898,
+              "csharp_bytes": 7066536.0,
+              "go_bytes": 1333465.6
+            },
+            {
+              "csharp_us": 2641.1,
+              "go_us": 1010.351,
+              "ratio": 2.614042050732864,
+              "csharp_bytes": 7066536.0,
+              "go_bytes": 1333457.28
+            },
+            {
+              "csharp_us": 2575.55,
+              "go_us": 1028.845,
+              "ratio": 2.5033411252423834,
+              "csharp_bytes": 7066536.0,
+              "go_bytes": 1333476.16
+            }
+          ]
+        },
+        "window": {
+          "csharp_us": 83.25,
+          "go_us": 52.7205,
+          "ratio": 1.6008230057014297,
+          "csharp_bytes": 164176.0,
+          "go_bytes": 183673.28,
+          "runs": [
+            {
+              "csharp_us": 83.25,
+              "go_us": 52.0045,
+              "ratio": 1.6008230057014297,
+              "csharp_bytes": 164176.0,
+              "go_bytes": 183672.64
+            },
+            {
+              "csharp_us": 87.7,
+              "go_us": 52.7205,
+              "ratio": 1.6634895344315779,
+              "csharp_bytes": 164176.0,
+              "go_bytes": 183676.8
+            },
+            {
+              "csharp_us": 79.85,
+              "go_us": 61.4865,
+              "ratio": 1.298659055239768,
+              "csharp_bytes": 164176.0,
+              "go_bytes": 183673.28
+            }
+          ]
+        },
+        "text_filter": {
+          "csharp_us": 548.9,
+          "go_us": 227.6795,
+          "ratio": 2.376805992634383,
+          "csharp_bytes": 231888.0,
+          "go_bytes": 149151.36,
+          "runs": [
+            {
+              "csharp_us": 550.95,
+              "go_us": 227.1215,
+              "ratio": 2.425794123409717,
+              "csharp_bytes": 231888.0,
+              "go_bytes": 149151.36
+            },
+            {
+              "csharp_us": 541.15,
+              "go_us": 227.6795,
+              "ratio": 2.376805992634383,
+              "csharp_bytes": 231888.0,
+              "go_bytes": 149151.68
+            },
+            {
+              "csharp_us": 548.9,
+              "go_us": 359.7675,
+              "ratio": 1.5257075750310964,
+              "csharp_bytes": 231888.0,
+              "go_bytes": 149144.32
+            }
+          ]
+        },
+        "float_aggregate": {
+          "csharp_us": 437.55,
+          "go_us": 174.278,
+          "ratio": 2.510643913747002,
+          "csharp_bytes": 19696.0,
+          "go_bytes": 2184.0,
+          "runs": [
+            {
+              "csharp_us": 462.85,
+              "go_us": 96.52,
+              "ratio": 4.795379196021551,
+              "csharp_bytes": 19696.0,
+              "go_bytes": 2184.0
+            },
+            {
+              "csharp_us": 429.45,
+              "go_us": 174.4305,
+              "ratio": 2.462012090775409,
+              "csharp_bytes": 19696.0,
+              "go_bytes": 2184.0
+            },
+            {
+              "csharp_us": 437.55,
+              "go_us": 174.278,
+              "ratio": 2.510643913747002,
+              "csharp_bytes": 19696.0,
+              "go_bytes": 2184.0
+            }
+          ]
+        },
+        "decimal_aggregate": {
+          "csharp_us": 2335.1,
+          "go_us": 5908.2035,
+          "ratio": 0.39523012367465,
+          "csharp_bytes": 2325040.0,
+          "go_bytes": 3874941.76,
+          "runs": [
+            {
+              "csharp_us": 2375.25,
+              "go_us": 5286.7395,
+              "ratio": 0.4492844786469998,
+              "csharp_bytes": 2325040.0,
+              "go_bytes": 3874931.52
+            },
+            {
+              "csharp_us": 2335.1,
+              "go_us": 5908.2035,
+              "ratio": 0.39523012367465,
+              "csharp_bytes": 2325040.0,
+              "go_bytes": 3874941.76
+            },
+            {
+              "csharp_us": 2254.65,
+              "go_us": 6297.59,
+              "ratio": 0.35801790843798975,
+              "csharp_bytes": 2325040.0,
+              "go_bytes": 3875013.76
+            }
+          ]
+        },
+        "expression_projection": {
+          "csharp_us": 62.6,
+          "go_us": 23.211,
+          "ratio": 2.6452974882598768,
+          "csharp_bytes": 49240.0,
+          "go_bytes": 9296.0,
+          "runs": [
+            {
+              "csharp_us": 62.75,
+              "go_us": 22.989,
+              "ratio": 2.729566314324242,
+              "csharp_bytes": 49240.0,
+              "go_bytes": 9296.0
+            },
+            {
+              "csharp_us": 62.6,
+              "go_us": 24.6045,
+              "ratio": 2.5442500355626003,
+              "csharp_bytes": 49240.0,
+              "go_bytes": 9296.0
+            },
+            {
+              "csharp_us": 61.4,
+              "go_us": 23.211,
+              "ratio": 2.6452974882598768,
+              "csharp_bytes": 49240.0,
+              "go_bytes": 9296.0
+            }
+          ]
+        }
+      }
+    },
+    "aot": {
+      "files": [
+        {
+          "file": "capture19-aot-1.json",
+          "sha256": "f60a160180845a151cc1c079774b98ca588567ec535e5b68742ceed5f8daa0f2"
+        },
+        {
+          "file": "capture19-aot-2.json",
+          "sha256": "2aa6cab2eda197ee881cca96398654a5d571ae5c33af34d53d5810218518bbb1"
+        },
+        {
+          "file": "capture19-aot-3.json",
+          "sha256": "3505d02fb647ba47b3dd542a79a1284bd58f952fceaf7ab59d8e9d2c972b4e78"
+        }
+      ],
+      "actor_source_sha256": "abf9e5bd4706a986f45e21e1ee03c9b28557e71df6f61038c6ac7cdebf153168",
+      "actor_sha256": [
+        "d0af4d801c64701325af17d0f36c850accab5d20dcd7e72b8effddbf59e2563e"
+      ],
+      "go_actor_sha256": [
+        "75935d42bec195818e8c06427305455c551816302460d885d47397d7299daa2f"
+      ],
+      "startup_ms": 5.583142,
+      "go_startup_ms": 3.034531,
+      "workloads": {
+        "scalar": {
+          "csharp_us": 1.4,
+          "go_us": 0.557,
+          "ratio": 2.5735294117647056,
+          "csharp_bytes": 2784.0,
+          "go_bytes": 1352.0,
+          "runs": [
+            {
+              "csharp_us": 1.4,
+              "go_us": 0.544,
+              "ratio": 2.5735294117647056,
+              "csharp_bytes": 2784.0,
+              "go_bytes": 1352.0
+            },
+            {
+              "csharp_us": 2.3,
+              "go_us": 0.585,
+              "ratio": 3.9316239316239314,
+              "csharp_bytes": 2784.0,
+              "go_bytes": 1352.0
+            },
+            {
+              "csharp_us": 0.8,
+              "go_us": 0.557,
+              "ratio": 1.436265709156194,
+              "csharp_bytes": 2784.0,
+              "go_bytes": 1352.0
+            }
+          ]
+        },
+        "point": {
+          "csharp_us": 5.1,
+          "go_us": 1.264,
+          "ratio": 4.034810126582278,
+          "csharp_bytes": 8240.0,
+          "go_bytes": 2013.88,
+          "runs": [
+            {
+              "csharp_us": 2.8,
+              "go_us": 1.29,
+              "ratio": 2.1705426356589146,
+              "csharp_bytes": 8240.0,
+              "go_bytes": 2008.032
+            },
+            {
+              "csharp_us": 5.1,
+              "go_us": 1.264,
+              "ratio": 4.034810126582278,
+              "csharp_bytes": 8240.0,
+              "go_bytes": 2013.912
+            },
+            {
+              "csharp_us": 5.3,
+              "go_us": 1.251,
+              "ratio": 4.236610711430855,
+              "csharp_bytes": 8240.0,
+              "go_bytes": 2013.88
+            }
+          ]
+        },
+        "range": {
+          "csharp_us": 65.65,
+          "go_us": 20.2175,
+          "ratio": 3.234786893323479,
+          "csharp_bytes": 52568.0,
+          "go_bytes": 9296.0,
+          "runs": [
+            {
+              "csharp_us": 66.45,
+              "go_us": 13.1845,
+              "ratio": 5.040009101596572,
+              "csharp_bytes": 52568.0,
+              "go_bytes": 9296.0
+            },
+            {
+              "csharp_us": 53.2,
+              "go_us": 20.2175,
+              "ratio": 2.63138370223816,
+              "csharp_bytes": 52568.0,
+              "go_bytes": 9296.0
+            },
+            {
+              "csharp_us": 65.65,
+              "go_us": 20.295,
+              "ratio": 3.234786893323479,
+              "csharp_bytes": 52568.0,
+              "go_bytes": 9296.0
+            }
+          ]
+        },
+        "aggregate": {
+          "csharp_us": 299.05,
+          "go_us": 249.5915,
+          "ratio": 1.1924062237691466,
+          "csharp_bytes": 8488.0,
+          "go_bytes": 19320.0,
+          "runs": [
+            {
+              "csharp_us": 300.45,
+              "go_us": 251.9695,
+              "ratio": 1.1924062237691466,
+              "csharp_bytes": 8488.0,
+              "go_bytes": 19320.0
+            },
+            {
+              "csharp_us": 299.05,
+              "go_us": 249.5915,
+              "ratio": 1.19815778982858,
+              "csharp_bytes": 8488.0,
+              "go_bytes": 19320.0
+            },
+            {
+              "csharp_us": 295.15,
+              "go_us": 249.063,
+              "ratio": 1.1850415356757125,
+              "csharp_bytes": 8488.0,
+              "go_bytes": 19320.0
+            }
+          ]
+        },
+        "join": {
+          "csharp_us": 7215.8,
+          "go_us": 5577.246,
+          "ratio": 1.291244329846913,
+          "csharp_bytes": 13926320.0,
+          "go_bytes": 5569835.84,
+          "runs": [
+            {
+              "csharp_us": 7254.5,
+              "go_us": 5374.495,
+              "ratio": 1.3498012371394894,
+              "csharp_bytes": 13926320.0,
+              "go_bytes": 5569813.44
+            },
+            {
+              "csharp_us": 6946.5,
+              "go_us": 5577.246,
+              "ratio": 1.2455071911836058,
+              "csharp_bytes": 13926320.0,
+              "go_bytes": 5569887.04
+            },
+            {
+              "csharp_us": 7215.8,
+              "go_us": 5588.253,
+              "ratio": 1.291244329846913,
+              "csharp_bytes": 13926320.0,
+              "go_bytes": 5569835.84
+            }
+          ]
+        },
+        "sort": {
+          "csharp_us": 2021.9,
+          "go_us": 993.624,
+          "ratio": 2.024005056238577,
+          "csharp_bytes": 355467.52,
+          "go_bytes": 296154.56,
+          "runs": [
+            {
+              "csharp_us": 2011.1,
+              "go_us": 993.624,
+              "ratio": 2.024005056238577,
+              "csharp_bytes": 355457.44,
+              "go_bytes": 296152.32
+            },
+            {
+              "csharp_us": 2021.9,
+              "go_us": 1002.178,
+              "ratio": 2.017505872210326,
+              "csharp_bytes": 355467.52,
+              "go_bytes": 296154.56
+            },
+            {
+              "csharp_us": 2085.1,
+              "go_us": 789.8185,
+              "ratio": 2.6399736141911085,
+              "csharp_bytes": 355530.4,
+              "go_bytes": 296159.04
+            }
+          ]
+        },
+        "rollback": {
+          "csharp_us": 45.3,
+          "go_us": 30.2255,
+          "ratio": 1.4987345122495905,
+          "csharp_bytes": 70888.0,
+          "go_bytes": 127107.52,
+          "runs": [
+            {
+              "csharp_us": 45.3,
+              "go_us": 30.3715,
+              "ratio": 1.4915298882175723,
+              "csharp_bytes": 70888.0,
+              "go_bytes": 127111.68
+            },
+            {
+              "csharp_us": 45.3,
+              "go_us": 30.2255,
+              "ratio": 1.4987345122495905,
+              "csharp_bytes": 70888.0,
+              "go_bytes": 127107.52
+            },
+            {
+              "csharp_us": 46.9,
+              "go_us": 29.5405,
+              "ratio": 1.5876508522198336,
+              "csharp_bytes": 70888.0,
+              "go_bytes": 127070.8
+            }
+          ]
+        },
+        "durable": {
+          "csharp_us": 146.55,
+          "go_us": 95.3975,
+          "ratio": 1.7029410739393658,
+          "csharp_bytes": 118770.4,
+          "go_bytes": 279369.44,
+          "runs": [
+            {
+              "csharp_us": 139.4,
+              "go_us": 115.8685,
+              "ratio": 1.2030879833604475,
+              "csharp_bytes": 118776.16,
+              "go_bytes": 279428.48
+            },
+            {
+              "csharp_us": 174.75,
+              "go_us": 95.3975,
+              "ratio": 1.8318090096700648,
+              "csharp_bytes": 118764.64,
+              "go_bytes": 279365.28
+            },
+            {
+              "csharp_us": 146.55,
+              "go_us": 86.057,
+              "ratio": 1.7029410739393658,
+              "csharp_bytes": 118770.4,
+              "go_bytes": 279369.44
+            }
+          ]
+        },
+        "cold_open": {
+          "csharp_us": 292.1,
+          "go_us": 202.908,
+          "ratio": 1.4395686715161553,
+          "csharp_bytes": 230016.32,
+          "go_bytes": 501127.04,
+          "runs": [
+            {
+              "csharp_us": 297.6,
+              "go_us": 263.301,
+              "ratio": 1.1302653616963096,
+              "csharp_bytes": 230019.84,
+              "go_bytes": 501726.72
+            },
+            {
+              "csharp_us": 292.1,
+              "go_us": 202.908,
+              "ratio": 1.4395686715161553,
+              "csharp_bytes": 230010.88,
+              "go_bytes": 501127.04
+            },
+            {
+              "csharp_us": 285.1,
+              "go_us": 152.193,
+              "ratio": 1.8732793229649196,
+              "csharp_bytes": 230016.32,
+              "go_bytes": 500675.52
+            }
+          ]
+        },
+        "grouped": {
+          "csharp_us": 3084.1,
+          "go_us": 2337.742,
+          "ratio": 1.3192644868424315,
+          "csharp_bytes": 7534384.0,
+          "go_bytes": 3534323.84,
+          "runs": [
+            {
+              "csharp_us": 3249.65,
+              "go_us": 2349.7945,
+              "ratio": 1.3829507218609969,
+              "csharp_bytes": 7534384.0,
+              "go_bytes": 3534307.84
+            },
+            {
+              "csharp_us": 2976.4,
+              "go_us": 2305.1975,
+              "ratio": 1.2911691948303778,
+              "csharp_bytes": 7534384.0,
+              "go_bytes": 3534356.16
+            },
+            {
+              "csharp_us": 3084.1,
+              "go_us": 2337.742,
+              "ratio": 1.3192644868424315,
+              "csharp_bytes": 7534384.0,
+              "go_bytes": 3534323.84
+            }
+          ]
+        },
+        "distinct": {
+          "csharp_us": 3262.85,
+          "go_us": 2146.055,
+          "ratio": 1.5323829132409659,
+          "csharp_bytes": 5590416.0,
+          "go_bytes": 4271640.64,
+          "runs": [
+            {
+              "csharp_us": 3112.6,
+              "go_us": 1995.879,
+              "ratio": 1.5595133773139553,
+              "csharp_bytes": 5590416.0,
+              "go_bytes": 4271651.52
+            },
+            {
+              "csharp_us": 3300.1,
+              "go_us": 2153.574,
+              "ratio": 1.5323829132409659,
+              "csharp_bytes": 5590416.0,
+              "go_bytes": 4271640.64
+            },
+            {
+              "csharp_us": 3262.85,
+              "go_us": 2146.055,
+              "ratio": 1.5203943980932455,
+              "csharp_bytes": 5590416.0,
+              "go_bytes": 4271636.8
+            }
+          ]
+        },
+        "distinct_aggregate": {
+          "csharp_us": 2504.3,
+          "go_us": 988.6875,
+          "ratio": 2.532954042606992,
+          "csharp_bytes": 7066848.0,
+          "go_bytes": 1333479.68,
+          "runs": [
+            {
+              "csharp_us": 2504.3,
+              "go_us": 988.6875,
+              "ratio": 2.532954042606992,
+              "csharp_bytes": 7066848.0,
+              "go_bytes": 1333474.88
+            },
+            {
+              "csharp_us": 2407.8,
+              "go_us": 990.8085,
+              "ratio": 2.430136600564085,
+              "csharp_bytes": 7066848.0,
+              "go_bytes": 1333499.84
+            },
+            {
+              "csharp_us": 2522.35,
+              "go_us": 946.4385,
+              "ratio": 2.665096569930323,
+              "csharp_bytes": 7066848.0,
+              "go_bytes": 1333479.68
+            }
+          ]
+        },
+        "window": {
+          "csharp_us": 80.1,
+          "go_us": 52.0645,
+          "ratio": 1.5949082740546612,
+          "csharp_bytes": 164424.0,
+          "go_bytes": 183674.88,
+          "runs": [
+            {
+              "csharp_us": 77.8,
+              "go_us": 36.7835,
+              "ratio": 2.115078771731891,
+              "csharp_bytes": 164424.0,
+              "go_bytes": 183674.88
+            },
+            {
+              "csharp_us": 80.1,
+              "go_us": 52.0645,
+              "ratio": 1.5384763130347932,
+              "csharp_bytes": 164424.0,
+              "go_bytes": 183672.32
+            },
+            {
+              "csharp_us": 85.2,
+              "go_us": 53.42,
+              "ratio": 1.5949082740546612,
+              "csharp_bytes": 164424.0,
+              "go_bytes": 183674.88
+            }
+          ]
+        },
+        "text_filter": {
+          "csharp_us": 577.45,
+          "go_us": 358.4595,
+          "ratio": 1.6159820316396964,
+          "csharp_bytes": 232128.0,
+          "go_bytes": 149146.88,
+          "runs": [
+            {
+              "csharp_us": 579.9,
+              "go_us": 358.853,
+              "ratio": 1.6159820316396964,
+              "csharp_bytes": 232128.0,
+              "go_bytes": 149146.88
+            },
+            {
+              "csharp_us": 544.9,
+              "go_us": 358.4595,
+              "ratio": 1.5201159405734819,
+              "csharp_bytes": 232128.0,
+              "go_bytes": 149154.56
+            },
+            {
+              "csharp_us": 577.45,
+              "go_us": 235.676,
+              "ratio": 2.4501858483680987,
+              "csharp_bytes": 232128.0,
+              "go_bytes": 149144.64
+            }
+          ]
+        },
+        "float_aggregate": {
+          "csharp_us": 469.75,
+          "go_us": 174.277,
+          "ratio": 2.695421656328718,
+          "csharp_bytes": 19936.0,
+          "go_bytes": 2184.0,
+          "runs": [
+            {
+              "csharp_us": 469.75,
+              "go_us": 174.277,
+              "ratio": 2.695421656328718,
+              "csharp_bytes": 19936.0,
+              "go_bytes": 2184.0
+            },
+            {
+              "csharp_us": 459.1,
+              "go_us": 174.9,
+              "ratio": 2.624928530588908,
+              "csharp_bytes": 19936.0,
+              "go_bytes": 2184.0
+            },
+            {
+              "csharp_us": 481.8,
+              "go_us": 174.2655,
+              "ratio": 2.7647468948242766,
+              "csharp_bytes": 19936.0,
+              "go_bytes": 2184.0
+            }
+          ]
+        },
+        "decimal_aggregate": {
+          "csharp_us": 2293.7,
+          "go_us": 5577.917,
+          "ratio": 0.38635597578313724,
+          "csharp_bytes": 2325344.0,
+          "go_bytes": 3874943.36,
+          "runs": [
+            {
+              "csharp_us": 2145.75,
+              "go_us": 5553.816,
+              "ratio": 0.38635597578313724,
+              "csharp_bytes": 2325344.0,
+              "go_bytes": 3874912.64
+            },
+            {
+              "csharp_us": 2297.4,
+              "go_us": 5972.0615,
+              "ratio": 0.3846912829012227,
+              "csharp_bytes": 2325344.0,
+              "go_bytes": 3874943.36
+            },
+            {
+              "csharp_us": 2293.7,
+              "go_us": 5577.917,
+              "ratio": 0.41121085164945975,
+              "csharp_bytes": 2325344.0,
+              "go_bytes": 3874968.96
+            }
+          ]
+        },
+        "expression_projection": {
+          "csharp_us": 60.3,
+          "go_us": 15.7885,
+          "ratio": 3.727853939374662,
+          "csharp_bytes": 49552.0,
+          "go_bytes": 9296.0,
+          "runs": [
+            {
+              "csharp_us": 64.1,
+              "go_us": 15.7885,
+              "ratio": 4.05991702821674,
+              "csharp_bytes": 49552.0,
+              "go_bytes": 9296.0
+            },
+            {
+              "csharp_us": 58.6,
+              "go_us": 15.7195,
+              "ratio": 3.727853939374662,
+              "csharp_bytes": 49552.0,
+              "go_bytes": 9296.0
+            },
+            {
+              "csharp_us": 60.3,
+              "go_us": 24.1325,
+              "ratio": 2.498705065782658,
+              "csharp_bytes": 49552.0,
+              "go_bytes": 9296.0
+            }
+          ]
+        }
+      }
+    },
+    "aot-runtime-async": {
+      "files": [
+        {
+          "file": "capture19-aot-runtime-async-1.json",
+          "sha256": "4cff6ec889eb759b3ccf343383006177a94183447e47158e5d3eb186d2b19d77"
+        },
+        {
+          "file": "capture19-aot-runtime-async-2.json",
+          "sha256": "5353a71bf73c3cc343c625662fa33074d64b0db76c4b99c897c76c6f8a9f62cb"
+        },
+        {
+          "file": "capture19-aot-runtime-async-3.json",
+          "sha256": "5d59b1301d5ead79ab0ffbe0a32f831f2317b2e56c86d76d273852398aad4d2a"
+        }
+      ],
+      "actor_source_sha256": "abf9e5bd4706a986f45e21e1ee03c9b28557e71df6f61038c6ac7cdebf153168",
+      "actor_sha256": [
+        "9c17627b7b4d0dce2173daaf8a0065a0e64994662d92c0267f4d95f2a246b1c6"
+      ],
+      "go_actor_sha256": [
+        "75935d42bec195818e8c06427305455c551816302460d885d47397d7299daa2f"
+      ],
+      "startup_ms": 5.141835,
+      "go_startup_ms": 3.038953,
+      "workloads": {
+        "scalar": {
+          "csharp_us": 1.0,
+          "go_us": 0.573,
+          "ratio": 1.7361111111111112,
+          "csharp_bytes": 2640.0,
+          "go_bytes": 1352.0,
+          "runs": [
+            {
+              "csharp_us": 1.0,
+              "go_us": 0.576,
+              "ratio": 1.7361111111111112,
+              "csharp_bytes": 2640.0,
+              "go_bytes": 1352.016
+            },
+            {
+              "csharp_us": 0.7,
+              "go_us": 0.44,
+              "ratio": 1.5909090909090908,
+              "csharp_bytes": 2640.0,
+              "go_bytes": 1352.0
+            },
+            {
+              "csharp_us": 1.0,
+              "go_us": 0.573,
+              "ratio": 1.7452006980802794,
+              "csharp_bytes": 2640.0,
+              "go_bytes": 1352.0
+            }
+          ]
+        },
+        "point": {
+          "csharp_us": 4.5,
+          "go_us": 1.246,
+          "ratio": 3.6595067621320605,
+          "csharp_bytes": 8096.0,
+          "go_bytes": 2008.016,
+          "runs": [
+            {
+              "csharp_us": 4.6,
+              "go_us": 1.257,
+              "ratio": 3.6595067621320605,
+              "csharp_bytes": 8096.0,
+              "go_bytes": 2008.128
+            },
+            {
+              "csharp_us": 4.5,
+              "go_us": 0.934,
+              "ratio": 4.817987152034261,
+              "csharp_bytes": 8096.0,
+              "go_bytes": 2008.0
+            },
+            {
+              "csharp_us": 2.4,
+              "go_us": 1.246,
+              "ratio": 1.9261637239165328,
+              "csharp_bytes": 8096.0,
+              "go_bytes": 2008.016
+            }
+          ]
+        },
+        "range": {
+          "csharp_us": 51.8,
+          "go_us": 13.4645,
+          "ratio": 3.6763340636488544,
+          "csharp_bytes": 52424.0,
+          "go_bytes": 9296.0,
+          "runs": [
+            {
+              "csharp_us": 62.6,
+              "go_us": 13.265,
+              "ratio": 4.719185827365247,
+              "csharp_bytes": 52424.0,
+              "go_bytes": 9296.0
+            },
+            {
+              "csharp_us": 49.5,
+              "go_us": 13.4645,
+              "ratio": 3.6763340636488544,
+              "csharp_bytes": 52424.0,
+              "go_bytes": 9296.0
+            },
+            {
+              "csharp_us": 51.8,
+              "go_us": 19.821,
+              "ratio": 2.613389839059583,
+              "csharp_bytes": 52424.0,
+              "go_bytes": 9296.0
+            }
+          ]
+        },
+        "aggregate": {
+          "csharp_us": 317.3,
+          "go_us": 247.8385,
+          "ratio": 1.2802692075686384,
+          "csharp_bytes": 8344.0,
+          "go_bytes": 19322.56,
+          "runs": [
+            {
+              "csharp_us": 317.3,
+              "go_us": 247.8385,
+              "ratio": 1.2802692075686384,
+              "csharp_bytes": 8344.0,
+              "go_bytes": 19320.0
+            },
+            {
+              "csharp_us": 317.55,
+              "go_us": 149.5065,
+              "ratio": 2.123987920257648,
+              "csharp_bytes": 8344.0,
+              "go_bytes": 19322.56
+            },
+            {
+              "csharp_us": 315.7,
+              "go_us": 249.729,
+              "ratio": 1.264170360670967,
+              "csharp_bytes": 8344.0,
+              "go_bytes": 19324.8
+            }
+          ]
+        },
+        "join": {
+          "csharp_us": 6550.0,
+          "go_us": 5346.302,
+          "ratio": 1.2780235759221983,
+          "csharp_bytes": 13926176.0,
+          "go_bytes": 5569792.32,
+          "runs": [
+            {
+              "csharp_us": 6832.7,
+              "go_us": 5346.302,
+              "ratio": 1.2780235759221983,
+              "csharp_bytes": 13926176.0,
+              "go_bytes": 5569856.96
+            },
+            {
+              "csharp_us": 6550.0,
+              "go_us": 4828.684,
+              "ratio": 1.3564772513587553,
+              "csharp_bytes": 13926176.0,
+              "go_bytes": 5569778.24
+            },
+            {
+              "csharp_us": 6329.8,
+              "go_us": 5400.663,
+              "ratio": 1.172041284560803,
+              "csharp_bytes": 13926176.0,
+              "go_bytes": 5569792.32
+            }
+          ]
+        },
+        "sort": {
+          "csharp_us": 1965.75,
+          "go_us": 1000.353,
+          "ratio": 2.005592026014817,
+          "csharp_bytes": 355313.6,
+          "go_bytes": 296152.32,
+          "runs": [
+            {
+              "csharp_us": 1913.45,
+              "go_us": 816.704,
+              "ratio": 2.3428928963247397,
+              "csharp_bytes": 355313.6,
+              "go_bytes": 296152.32
+            },
+            {
+              "csharp_us": 1965.75,
+              "go_us": 1029.105,
+              "ratio": 1.9101549404579707,
+              "csharp_bytes": 355411.2,
+              "go_bytes": 296152.32
+            },
+            {
+              "csharp_us": 2006.3,
+              "go_us": 1000.353,
+              "ratio": 2.005592026014817,
+              "csharp_bytes": 355313.28,
+              "go_bytes": 296152.32
+            }
+          ]
+        },
+        "rollback": {
+          "csharp_us": 46.45,
+          "go_us": 29.9805,
+          "ratio": 1.5491853852952457,
+          "csharp_bytes": 70672.0,
+          "go_bytes": 127076.72,
+          "runs": [
+            {
+              "csharp_us": 46.8,
+              "go_us": 28.622,
+              "ratio": 1.635105862623157,
+              "csharp_bytes": 70672.0,
+              "go_bytes": 127076.72
+            },
+            {
+              "csharp_us": 46.45,
+              "go_us": 29.9835,
+              "ratio": 1.5491853852952457,
+              "csharp_bytes": 70672.0,
+              "go_bytes": 127070.16
+            },
+            {
+              "csharp_us": 44.6,
+              "go_us": 29.9805,
+              "ratio": 1.487633628525208,
+              "csharp_bytes": 70672.0,
+              "go_bytes": 127115.84
+            }
+          ]
+        },
+        "durable": {
+          "csharp_us": 134.65,
+          "go_us": 117.1385,
+          "ratio": 1.1789462900754235,
+          "csharp_bytes": 117147.68,
+          "go_bytes": 279362.4,
+          "runs": [
+            {
+              "csharp_us": 134.65,
+              "go_us": 113.814,
+              "ratio": 1.1830706240005624,
+              "csharp_bytes": 117147.68,
+              "go_bytes": 279355.36
+            },
+            {
+              "csharp_us": 127.45,
+              "go_us": 127.8745,
+              "ratio": 0.9966803389260565,
+              "csharp_bytes": 117143.2,
+              "go_bytes": 279371.68
+            },
+            {
+              "csharp_us": 138.1,
+              "go_us": 117.1385,
+              "ratio": 1.1789462900754235,
+              "csharp_bytes": 117149.92,
+              "go_bytes": 279362.4
+            }
+          ]
+        },
+        "cold_open": {
+          "csharp_us": 269.4,
+          "go_us": 156.54,
+          "ratio": 1.7209658873131468,
+          "csharp_bytes": 226444.48,
+          "go_bytes": 500412.16,
+          "runs": [
+            {
+              "csharp_us": 269.4,
+              "go_us": 156.54,
+              "ratio": 1.7209658873131468,
+              "csharp_bytes": 226444.48,
+              "go_bytes": 500412.16
+            },
+            {
+              "csharp_us": 275.1,
+              "go_us": 138.529,
+              "ratio": 1.9858657753972095,
+              "csharp_bytes": 226419.52,
+              "go_bytes": 500014.4
+            },
+            {
+              "csharp_us": 261.1,
+              "go_us": 210.692,
+              "ratio": 1.239249710477854,
+              "csharp_bytes": 226446.4,
+              "go_bytes": 501721.6
+            }
+          ]
+        },
+        "grouped": {
+          "csharp_us": 2897.85,
+          "go_us": 2381.467,
+          "ratio": 1.2168339935006447,
+          "csharp_bytes": 7534240.0,
+          "go_bytes": 3534327.68,
+          "runs": [
+            {
+              "csharp_us": 2904.25,
+              "go_us": 2436.352,
+              "ratio": 1.1920486038142273,
+              "csharp_bytes": 7534240.0,
+              "go_bytes": 3534327.68
+            },
+            {
+              "csharp_us": 2889.4,
+              "go_us": 2269.6485,
+              "ratio": 1.2730605642239317,
+              "csharp_bytes": 7534240.0,
+              "go_bytes": 3534333.12
+            },
+            {
+              "csharp_us": 2897.85,
+              "go_us": 2381.467,
+              "ratio": 1.2168339935006447,
+              "csharp_bytes": 7534240.0,
+              "go_bytes": 3534304.32
+            }
+          ]
+        },
+        "distinct": {
+          "csharp_us": 2879.75,
+          "go_us": 2181.353,
+          "ratio": 1.3031819633009296,
+          "csharp_bytes": 5590272.0,
+          "go_bytes": 4271650.24,
+          "runs": [
+            {
+              "csharp_us": 2921.35,
+              "go_us": 2181.353,
+              "ratio": 1.339237619954221,
+              "csharp_bytes": 5590272.0,
+              "go_bytes": 4271742.56
+            },
+            {
+              "csharp_us": 2793.7,
+              "go_us": 2161.453,
+              "ratio": 1.2925101771817382,
+              "csharp_bytes": 5590272.0,
+              "go_bytes": 4271640.0
+            },
+            {
+              "csharp_us": 2879.75,
+              "go_us": 2209.7835,
+              "ratio": 1.3031819633009296,
+              "csharp_bytes": 5590272.0,
+              "go_bytes": 4271650.24
+            }
+          ]
+        },
+        "distinct_aggregate": {
+          "csharp_us": 2278.55,
+          "go_us": 996.3795,
+          "ratio": 2.28682946608195,
+          "csharp_bytes": 7066704.0,
+          "go_bytes": 1333466.56,
+          "runs": [
+            {
+              "csharp_us": 2401.95,
+              "go_us": 1115.1255,
+              "ratio": 2.1539728039579398,
+              "csharp_bytes": 7066704.0,
+              "go_bytes": 1333468.48
+            },
+            {
+              "csharp_us": 2278.55,
+              "go_us": 996.3795,
+              "ratio": 2.28682946608195,
+              "csharp_bytes": 7066704.0,
+              "go_bytes": 1333462.4
+            },
+            {
+              "csharp_us": 2227.3,
+              "go_us": 875.9845,
+              "ratio": 2.5426248980432873,
+              "csharp_bytes": 7066704.0,
+              "go_bytes": 1333466.56
+            }
+          ]
+        },
+        "window": {
+          "csharp_us": 73.5,
+          "go_us": 54.219,
+          "ratio": 1.3556133458750623,
+          "csharp_bytes": 164280.0,
+          "go_bytes": 183674.88,
+          "runs": [
+            {
+              "csharp_us": 75.5,
+              "go_us": 58.179,
+              "ratio": 1.2977191082693067,
+              "csharp_bytes": 164280.0,
+              "go_bytes": 183674.88
+            },
+            {
+              "csharp_us": 73.5,
+              "go_us": 54.219,
+              "ratio": 1.3556133458750623,
+              "csharp_bytes": 164280.0,
+              "go_bytes": 183681.6
+            },
+            {
+              "csharp_us": 72.6,
+              "go_us": 41.5035,
+              "ratio": 1.7492500632476777,
+              "csharp_bytes": 164280.0,
+              "go_bytes": 183674.56
+            }
+          ]
+        },
+        "text_filter": {
+          "csharp_us": 549.35,
+          "go_us": 360.513,
+          "ratio": 1.5238008060735675,
+          "csharp_bytes": 231984.0,
+          "go_bytes": 149144.64,
+          "runs": [
+            {
+              "csharp_us": 549.35,
+              "go_us": 360.513,
+              "ratio": 1.5238008060735675,
+              "csharp_bytes": 231984.0,
+              "go_bytes": 149144.96
+            },
+            {
+              "csharp_us": 549.0,
+              "go_us": 370.141,
+              "ratio": 1.4832185572525065,
+              "csharp_bytes": 231984.0,
+              "go_bytes": 149144.64
+            },
+            {
+              "csharp_us": 562.25,
+              "go_us": 255.8995,
+              "ratio": 2.1971516161618134,
+              "csharp_bytes": 231984.0,
+              "go_bytes": 149144.64
+            }
+          ]
+        },
+        "float_aggregate": {
+          "csharp_us": 484.55,
+          "go_us": 100.967,
+          "ratio": 4.547030217793933,
+          "csharp_bytes": 19792.0,
+          "go_bytes": 2184.0,
+          "runs": [
+            {
+              "csharp_us": 484.55,
+              "go_us": 174.331,
+              "ratio": 2.779482708181563,
+              "csharp_bytes": 19792.0,
+              "go_bytes": 2184.0
+            },
+            {
+              "csharp_us": 459.1,
+              "go_us": 100.967,
+              "ratio": 4.547030217793933,
+              "csharp_bytes": 19792.0,
+              "go_bytes": 2184.0
+            },
+            {
+              "csharp_us": 485.7,
+              "go_us": 95.7635,
+              "ratio": 5.071869762487796,
+              "csharp_bytes": 19792.0,
+              "go_bytes": 2184.0
+            }
+          ]
+        },
+        "decimal_aggregate": {
+          "csharp_us": 2137.55,
+          "go_us": 5430.878,
+          "ratio": 0.3760625814094885,
+          "csharp_bytes": 2325200.0,
+          "go_bytes": 3874935.04,
+          "runs": [
+            {
+              "csharp_us": 2158.15,
+              "go_us": 5870.058,
+              "ratio": 0.3676539482233395,
+              "csharp_bytes": 2325200.0,
+              "go_bytes": 3874935.04
+            },
+            {
+              "csharp_us": 2137.55,
+              "go_us": 5334.625,
+              "ratio": 0.4006935820231038,
+              "csharp_bytes": 2325200.0,
+              "go_bytes": 3874949.12
+            },
+            {
+              "csharp_us": 2042.35,
+              "go_us": 5430.878,
+              "ratio": 0.3760625814094885,
+              "csharp_bytes": 2325200.0,
+              "go_bytes": 3874929.28
+            }
+          ]
+        },
+        "expression_projection": {
+          "csharp_us": 56.5,
+          "go_us": 23.508,
+          "ratio": 2.4283948743522474,
+          "csharp_bytes": 49408.0,
+          "go_bytes": 9296.0,
+          "runs": [
+            {
+              "csharp_us": 56.0,
+              "go_us": 23.0605,
+              "ratio": 2.4283948743522474,
+              "csharp_bytes": 49408.0,
+              "go_bytes": 9296.0
+            },
+            {
+              "csharp_us": 58.0,
+              "go_us": 23.508,
+              "ratio": 2.4672451931257444,
+              "csharp_bytes": 49408.0,
+              "go_bytes": 9296.0
+            },
+            {
+              "csharp_us": 56.5,
+              "go_us": 24.726,
+              "ratio": 2.285044083151339,
+              "csharp_bytes": 49408.0,
+              "go_bytes": 9296.0
+            }
+          ]
+        }
+      }
+    },
+    "original-aot": {
+      "files": [
+        {
+          "file": "unaffined-original-aot-1.json",
+          "sha256": "c22b05e9b070e3991a6d20393c71655bd0d8aaa8466855e987ac7e5a59e212c1"
+        },
+        {
+          "file": "unaffined-original-aot-2.json",
+          "sha256": "616326b0cf212f60d68727864ef96ac3d3b3914353b64f40246d8af3ae44880f"
+        },
+        {
+          "file": "unaffined-original-aot-3.json",
+          "sha256": "7a145a3b8b5930563c30be646bf79552b442caba99438e8d8508a8ce0d453759"
+        }
+      ],
+      "actor_source_sha256": "7124c0e6a67e3fb3955ef6df359faaa94d8d375702b887b72cc439a851a51594",
+      "actor_sha256": [
+        "eb5ec6dbf049bc11327f1d577c835d06a322c84583b14c6a71032d14be9da5b5"
+      ],
+      "go_actor_sha256": [
+        "75935d42bec195818e8c06427305455c551816302460d885d47397d7299daa2f"
+      ],
+      "startup_ms": 5.768306,
+      "go_startup_ms": 2.133257,
+      "workloads": {
+        "scalar": {
+          "csharp_us": 10.3,
+          "go_us": 0.556,
+          "ratio": 18.05792163543441,
+          "csharp_bytes": 27528.336,
+          "go_bytes": 1352.0,
+          "runs": [
+            {
+              "csharp_us": 10.3,
+              "go_us": 0.556,
+              "ratio": 18.52517985611511,
+              "csharp_bytes": 27528.336,
+              "go_bytes": 1352.0
+            },
+            {
+              "csharp_us": 10.6,
+              "go_us": 0.587,
+              "ratio": 18.05792163543441,
+              "csharp_bytes": 27528.336,
+              "go_bytes": 1352.0
+            },
+            {
+              "csharp_us": 6.2,
+              "go_us": 0.554,
+              "ratio": 11.191335740072201,
+              "csharp_bytes": 27528.336,
+              "go_bytes": 1352.0
+            }
+          ]
+        },
+        "point": {
+          "csharp_us": 57.4,
+          "go_us": 1.302,
+          "ratio": 45.95676541232986,
+          "csharp_bytes": 62080.0,
+          "go_bytes": 2008.048,
+          "runs": [
+            {
+              "csharp_us": 62.7,
+              "go_us": 1.302,
+              "ratio": 48.15668202764977,
+              "csharp_bytes": 62080.0,
+              "go_bytes": 2019.216
+            },
+            {
+              "csharp_us": 57.4,
+              "go_us": 1.249,
+              "ratio": 45.95676541232986,
+              "csharp_bytes": 62080.0,
+              "go_bytes": 2008.016
+            },
+            {
+              "csharp_us": 57.0,
+              "go_us": 1.351,
+              "ratio": 42.19096965210955,
+              "csharp_bytes": 62080.0,
+              "go_bytes": 2008.048
+            }
+          ]
+        },
+        "range": {
+          "csharp_us": 221.0,
+          "go_us": 19.751,
+          "ratio": 11.205648540878267,
+          "csharp_bytes": 513304.0,
+          "go_bytes": 9296.0,
+          "runs": [
+            {
+              "csharp_us": 220.6,
+              "go_us": 19.6865,
+              "ratio": 11.205648540878267,
+              "csharp_bytes": 513304.0,
+              "go_bytes": 9296.0
+            },
+            {
+              "csharp_us": 240.9,
+              "go_us": 19.802,
+              "ratio": 12.165437834562166,
+              "csharp_bytes": 513304.0,
+              "go_bytes": 9296.0
+            },
+            {
+              "csharp_us": 221.0,
+              "go_us": 19.751,
+              "ratio": 11.1893068705382,
+              "csharp_bytes": 513304.0,
+              "go_bytes": 9296.0
+            }
+          ]
+        },
+        "aggregate": {
+          "csharp_us": 6772.25,
+          "go_us": 250.252,
+          "ratio": 27.13067271328761,
+          "csharp_bytes": 20130248.0,
+          "go_bytes": 19320.64,
+          "runs": [
+            {
+              "csharp_us": 6772.25,
+              "go_us": 249.616,
+              "ratio": 27.13067271328761,
+              "csharp_bytes": 20130248.0,
+              "go_bytes": 19320.64
+            },
+            {
+              "csharp_us": 6762.9,
+              "go_us": 250.552,
+              "ratio": 26.992001660333983,
+              "csharp_bytes": 20130248.0,
+              "go_bytes": 19320.0
+            },
+            {
+              "csharp_us": 6866.2,
+              "go_us": 250.252,
+              "ratio": 27.43714335949363,
+              "csharp_bytes": 20130248.0,
+              "go_bytes": 19322.88
+            }
+          ]
+        },
+        "join": {
+          "csharp_us": 202917.3,
+          "go_us": 5469.412,
+          "ratio": 37.08367553952783,
+          "csharp_bytes": 85650240.0,
+          "go_bytes": 5569835.2,
+          "runs": [
+            {
+              "csharp_us": 202825.9,
+              "go_us": 5469.412,
+              "ratio": 37.08367553952783,
+              "csharp_bytes": 85650240.0,
+              "go_bytes": 5569852.48
+            },
+            {
+              "csharp_us": 202917.3,
+              "go_us": 5607.094,
+              "ratio": 36.18938794320195,
+              "csharp_bytes": 85650240.0,
+              "go_bytes": 5569835.2
+            },
+            {
+              "csharp_us": 211529.6,
+              "go_us": 5062.84,
+              "ratio": 41.78081867094358,
+              "csharp_bytes": 85650240.0,
+              "go_bytes": 5569785.28
+            }
+          ]
+        },
+        "sort": {
+          "csharp_us": 76682.3,
+          "go_us": 1013.8995,
+          "ratio": 78.13295188080657,
+          "csharp_bytes": 7695200.64,
+          "go_bytes": 296152.32,
+          "runs": [
+            {
+              "csharp_us": 79419.45,
+              "go_us": 1016.4655,
+              "ratio": 78.13295188080657,
+              "csharp_bytes": 7695200.64,
+              "go_bytes": 296152.32
+            },
+            {
+              "csharp_us": 76682.3,
+              "go_us": 1013.8995,
+              "ratio": 75.6310659981586,
+              "csharp_bytes": 7695253.92,
+              "go_bytes": 296152.32
+            },
+            {
+              "csharp_us": 76611.85,
+              "go_us": 787.978,
+              "ratio": 97.2258743264406,
+              "csharp_bytes": 7695200.64,
+              "go_bytes": 296156.8
+            }
+          ]
+        },
+        "rollback": {
+          "csharp_us": 307.15,
+          "go_us": 30.1895,
+          "ratio": 10.08000798416474,
+          "csharp_bytes": 747632.0,
+          "go_bytes": 127079.28,
+          "runs": [
+            {
+              "csharp_us": 313.65,
+              "go_us": 30.1895,
+              "ratio": 10.389373788900114,
+              "csharp_bytes": 747632.0,
+              "go_bytes": 127076.56
+            },
+            {
+              "csharp_us": 303.0,
+              "go_us": 30.0595,
+              "ratio": 10.08000798416474,
+              "csharp_bytes": 747632.0,
+              "go_bytes": 127079.28
+            },
+            {
+              "csharp_us": 307.15,
+              "go_us": 30.5855,
+              "ratio": 10.042340324663646,
+              "csharp_bytes": 747632.0,
+              "go_bytes": 127115.52
+            }
+          ]
+        },
+        "durable": {
+          "csharp_us": 798.6,
+          "go_us": 118.975,
+          "ratio": 6.962245999638718,
+          "csharp_bytes": 1462181.44,
+          "go_bytes": 279370.72,
+          "runs": [
+            {
+              "csharp_us": 783.55,
+              "go_us": 118.975,
+              "ratio": 6.585837360790082,
+              "csharp_bytes": 1462181.44,
+              "go_bytes": 279356.96
+            },
+            {
+              "csharp_us": 828.65,
+              "go_us": 119.0205,
+              "ratio": 6.962245999638718,
+              "csharp_bytes": 1462178.56,
+              "go_bytes": 279438.4
+            },
+            {
+              "csharp_us": 798.6,
+              "go_us": 76.9195,
+              "ratio": 10.382282776149092,
+              "csharp_bytes": 1462181.44,
+              "go_bytes": 279370.72
+            }
+          ]
+        },
+        "cold_open": {
+          "csharp_us": 660.1,
+          "go_us": 195.841,
+          "ratio": 3.370591449185819,
+          "csharp_bytes": 252968.64,
+          "go_bytes": 500492.16,
+          "runs": [
+            {
+              "csharp_us": 664.0,
+              "go_us": 210.292,
+              "ratio": 3.1575143134308483,
+              "csharp_bytes": 252938.24,
+              "go_bytes": 501525.44
+            },
+            {
+              "csharp_us": 652.5,
+              "go_us": 186.601,
+              "ratio": 3.496765826549697,
+              "csharp_bytes": 252968.64,
+              "go_bytes": 500492.16
+            },
+            {
+              "csharp_us": 660.1,
+              "go_us": 195.841,
+              "ratio": 3.370591449185819,
+              "csharp_bytes": 253016.64,
+              "go_bytes": 499961.28
+            }
+          ]
+        },
+        "grouped": {
+          "csharp_us": 10220.9,
+          "go_us": 2412.9395,
+          "ratio": 4.323652779565011,
+          "csharp_bytes": 33028952.0,
+          "go_bytes": 3534330.56,
+          "runs": [
+            {
+              "csharp_us": 10220.9,
+              "go_us": 2319.8865,
+              "ratio": 4.405775886018561,
+              "csharp_bytes": 33028952.0,
+              "go_bytes": 3534348.48
+            },
+            {
+              "csharp_us": 9625.15,
+              "go_us": 2412.9395,
+              "ratio": 3.9889727860976207,
+              "csharp_bytes": 33028952.0,
+              "go_bytes": 3534330.56
+            },
+            {
+              "csharp_us": 10651.15,
+              "go_us": 2463.461,
+              "ratio": 4.323652779565011,
+              "csharp_bytes": 33028952.0,
+              "go_bytes": 3534318.72
+            }
+          ]
+        },
+        "distinct": {
+          "csharp_us": 8085.65,
+          "go_us": 2117.5705,
+          "ratio": 3.8183616554915174,
+          "csharp_bytes": 18885632.0,
+          "go_bytes": 4271647.68,
+          "runs": [
+            {
+              "csharp_us": 8085.65,
+              "go_us": 2117.5705,
+              "ratio": 3.8183616554915174,
+              "csharp_bytes": 18885632.0,
+              "go_bytes": 4271644.16
+            },
+            {
+              "csharp_us": 7881.8,
+              "go_us": 2240.786,
+              "ratio": 3.5174264744603008,
+              "csharp_bytes": 18885632.0,
+              "go_bytes": 4271647.68
+            },
+            {
+              "csharp_us": 8180.25,
+              "go_us": 2031.192,
+              "ratio": 4.02731499533279,
+              "csharp_bytes": 18885632.0,
+              "go_bytes": 4271659.2
+            }
+          ]
+        },
+        "distinct_aggregate": {
+          "csharp_us": 7710.95,
+          "go_us": 1035.225,
+          "ratio": 7.671691111487097,
+          "csharp_bytes": 27433144.0,
+          "go_bytes": 1333464.96,
+          "runs": [
+            {
+              "csharp_us": 8116.35,
+              "go_us": 1057.961,
+              "ratio": 7.671691111487097,
+              "csharp_bytes": 27433144.0,
+              "go_bytes": 1333464.96
+            },
+            {
+              "csharp_us": 7710.95,
+              "go_us": 1035.225,
+              "ratio": 7.448573981501607,
+              "csharp_bytes": 27433144.0,
+              "go_bytes": 1333452.8
+            },
+            {
+              "csharp_us": 7691.0,
+              "go_us": 959.187,
+              "ratio": 8.01824878777548,
+              "csharp_bytes": 27433144.0,
+              "go_bytes": 1333475.84
+            }
+          ]
+        },
+        "window": {
+          "csharp_us": 894.75,
+          "go_us": 52.197,
+          "ratio": 17.56070231414219,
+          "csharp_bytes": 2522048.0,
+          "go_bytes": 183675.2,
+          "runs": [
+            {
+              "csharp_us": 894.75,
+              "go_us": 52.197,
+              "ratio": 17.14178975803207,
+              "csharp_bytes": 2522048.0,
+              "go_bytes": 183672.96
+            },
+            {
+              "csharp_us": 892.45,
+              "go_us": 48.643,
+              "ratio": 18.346935838661267,
+              "csharp_bytes": 2522048.0,
+              "go_bytes": 183675.2
+            },
+            {
+              "csharp_us": 924.65,
+              "go_us": 52.6545,
+              "ratio": 17.56070231414219,
+              "csharp_bytes": 2522048.0,
+              "go_bytes": 183675.84
+            }
+          ]
+        },
+        "text_filter": {
+          "csharp_us": 4928.2,
+          "go_us": 360.78,
+          "ratio": 12.822459648740272,
+          "csharp_bytes": 12785656.0,
+          "go_bytes": 149146.88,
+          "runs": [
+            {
+              "csharp_us": 4939.75,
+              "go_us": 385.242,
+              "ratio": 12.822459648740272,
+              "csharp_bytes": 12785656.0,
+              "go_bytes": 149144.96
+            },
+            {
+              "csharp_us": 4529.85,
+              "go_us": 360.78,
+              "ratio": 12.555712622650924,
+              "csharp_bytes": 12785656.0,
+              "go_bytes": 149146.88
+            },
+            {
+              "csharp_us": 4928.2,
+              "go_us": 226.2345,
+              "ratio": 21.783591804079396,
+              "csharp_bytes": 12785656.0,
+              "go_bytes": 149151.36
+            }
+          ]
+        },
+        "float_aggregate": {
+          "csharp_us": 6914.75,
+          "go_us": 100.395,
+          "ratio": 68.75217153918697,
+          "csharp_bytes": 20242528.0,
+          "go_bytes": 2184.0,
+          "runs": [
+            {
+              "csharp_us": 6925.75,
+              "go_us": 100.735,
+              "ratio": 68.75217153918697,
+              "csharp_bytes": 20242528.0,
+              "go_bytes": 2184.0
+            },
+            {
+              "csharp_us": 6914.75,
+              "go_us": 99.3145,
+              "ratio": 69.62477785217668,
+              "csharp_bytes": 20242528.0,
+              "go_bytes": 2184.0
+            },
+            {
+              "csharp_us": 6888.0,
+              "go_us": 100.395,
+              "ratio": 68.60899447183625,
+              "csharp_bytes": 20242528.0,
+              "go_bytes": 2184.0
+            }
+          ]
+        },
+        "decimal_aggregate": {
+          "csharp_us": 9344.45,
+          "go_us": 5568.679,
+          "ratio": 1.6780371071846663,
+          "csharp_bytes": 27856816.0,
+          "go_bytes": 3874927.04,
+          "runs": [
+            {
+              "csharp_us": 9644.35,
+              "go_us": 6091.6305,
+              "ratio": 1.5832132300210922,
+              "csharp_bytes": 27856816.0,
+              "go_bytes": 3874927.04
+            },
+            {
+              "csharp_us": 9306.85,
+              "go_us": 5487.334,
+              "ratio": 1.696060418410835,
+              "csharp_bytes": 27856816.0,
+              "go_bytes": 3874908.48
+            },
+            {
+              "csharp_us": 9344.45,
+              "go_us": 5568.679,
+              "ratio": 1.6780371071846663,
+              "csharp_bytes": 27856816.0,
+              "go_bytes": 3874947.84
+            }
+          ]
+        },
+        "expression_projection": {
+          "csharp_us": 292.5,
+          "go_us": 23.9255,
+          "ratio": 12.225449833859273,
+          "csharp_bytes": 673928.0,
+          "go_bytes": 9296.0,
+          "runs": [
+            {
+              "csharp_us": 280.95,
+              "go_us": 23.177,
+              "ratio": 12.121931224921259,
+              "csharp_bytes": 673928.0,
+              "go_bytes": 9296.0
+            },
+            {
+              "csharp_us": 302.3,
+              "go_us": 24.6605,
+              "ratio": 12.258470022911133,
+              "csharp_bytes": 673928.0,
+              "go_bytes": 9296.0
+            },
+            {
+              "csharp_us": 292.5,
+              "go_us": 23.9255,
+              "ratio": 12.225449833859273,
+              "csharp_bytes": 673928.0,
+              "go_bytes": 9296.0
+            }
+          ]
+        }
+      }
+    }
+  }
+}

@@ -11,7 +11,7 @@ internal static class DatabaseCompactTests
             await database.CompactAsync();
             var after = await database.SerializeAsync();
             var size = (int)BinaryPrimitives.ReadUInt32BigEndian(fixture.AsSpan(8));
-            Corpus.Equal(true, fixture.AsSpan(2 * size).SequenceEqual(after.AsSpan(2 * size)), "memory compaction preserves node shape, compression and overflow dispositions");
+            DatabaseBackupTests.EqualRestampedBody(fixture, after, size, "memory compaction preserves node shape, compression and overflow dispositions");
             Corpus.Equal(BinaryPrimitives.ReadUInt64BigEndian(fixture.AsSpan(12)) + 1,
                 BinaryPrimitives.ReadUInt64BigEndian(after.AsSpan(12)), "memory compaction advances version");
         }

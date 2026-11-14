@@ -4,8 +4,9 @@
 #USAGE flag "--disk" help="Reopen a native file handle before every record"
 #USAGE flag "--encrypted" help="Use encrypted disk records and write a cost/EXPLAIN transcript for peer comparison"
 #USAGE flag "--no-build" help="Use an existing Release assembly"
+#USAGE flag "--assembly <path>" help="Use a captured DLL or NativeAOT executable without rebuilding"
 #USAGE flag "--variant <name>" default="jit" help="jit, jit-runtime-async, aot, or aot-runtime-async (publish AOT first)"
-#USAGE flag "--all" help="Attempt every pinned SQL corpus file (incomplete experiment will fail)"
+#USAGE flag "--all" help="Attempt every pinned SQL corpus file and current supplemental file"
 #USAGE flag "--suite <name>" help="One directory of complete frozen corpus files"
 #USAGE flag "--match <pattern>" help="Complete frozen files whose basenames match this glob"
 #USAGE flag "--file <path>" help="One complete .test file; default is the shared scalar foundation supplement"
@@ -17,7 +18,15 @@ pattern = ENV["usage_match"]
 abort "Choose only one of --suite, --match, --file, or --all" if [suite, pattern, (!files.empty? ? true : nil), (ENV["usage_all"] == "true" ? true : nil)].compact.length > 1
 if ENV["usage_all"] == "true"
   abort "--all cannot be combined with file arguments" unless files.empty?
-  files = Dir.glob(File.join(CSharpNativeTasks.baseline_spec, "conformance/suites/**/*.test")).sort
+  baseline_spec = CSharpNativeTasks.baseline_spec
+  selected = Dir.glob(File.join(baseline_spec, "conformance/suites/**/*.test")).to_h do |path|
+    [path.delete_prefix(baseline_spec + "/"), path]
+  end
+  CSharpNativeTasks::BASELINE.fetch("supplemental_corpus").each do |path|
+    # The working-tree supplement supersedes its frozen copy when both exist.
+    selected[path.delete_prefix("spec/")] = File.expand_path(path, CSharpNativeTasks::ROOT)
+  end
+  files = selected.sort.map(&:last)
 elsif pattern
   files = Dir.glob(File.join(CSharpNativeTasks.baseline_spec, "conformance/suites/**/*.test")).select { |path| File.fnmatch?(pattern, File.basename(path), File::FNM_EXTGLOB) }.sort
 elsif suite
@@ -36,7 +45,9 @@ ENV["JED_CONFORMANCE_TRANSCRIPT"] ||= File.join(CSharpNativeTasks::BUILD, "confo
 mode = encrypted ? "corpus-encrypted" : ENV["usage_disk"] == "true" ? "corpus-file" : "corpus"
 variant = ENV.fetch("usage_variant", "jit")
 abort "Unknown variant" unless %w[jit jit-runtime-async aot aot-runtime-async].include?(variant)
-if variant.start_with?("aot")
+if ENV["usage_assembly"]
+  actor = File.expand_path(ENV.fetch("usage_assembly"))
+elsif variant.start_with?("aot")
   actor = File.join(CSharpNativeTasks::BUILD, "aot", variant == "aot" ? "default" : "runtime-async", "Jed.Check")
 elsif ENV["usage_no_build"] == "true"
   actor = File.join(CSharpNativeTasks::PACKAGE, "Jed.Check/bin/Release/net11.0/Jed.Check.dll")
@@ -48,6 +59,7 @@ metadata = File.join(File.dirname(actor), "build.json")
 abort "Rebuild/publish to record compilation settings" unless File.file?(metadata)
 build = JSON.parse(File.read(metadata))
 abort "Actor async compilation differs from selected variant" unless build.fetch("runtime_async") == variant.end_with?("runtime-async")
+abort "Actor compilation differs from selected variant" unless build.fetch("compilation") == (variant.start_with?("aot") ? "nativeaot" : "jit")
 source = File.dirname(actor)
 capture = Dir.mktmpdir("conformance-actor-", CSharpNativeTasks::BUILD)
 hashes = Dir.glob(File.join(source, "*")).select { File.file?(_1) }.to_h { |path| [File.basename(path), Digest::SHA256.file(path).hexdigest] }

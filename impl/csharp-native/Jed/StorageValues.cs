@@ -62,12 +62,13 @@ internal static class StoredValues
         18 => SqlType.Json, 19 => SqlType.Jsonb, 20 => SqlType.Jsonpath,
         _ => throw StorageFormat.Corrupt("invalid scalar type code")
     };
-    internal static int Width(TypeSpec spec) => spec.Type.Kind switch
+    internal static int Width(TypeSpec spec) => spec.Type.Kind == SqlKind.Decimal && spec.Precision is > 0 and <= 18
+        ? spec.Precision <= 4 ? 2 : spec.Precision <= 9 ? 4 : 8 : ScalarWidth(spec.Type);
+    internal static int ScalarWidth(SqlType type) => type.Kind switch
     {
         SqlKind.I16 => 2, SqlKind.I32 or SqlKind.Date or SqlKind.F32 => 4,
         SqlKind.I64 or SqlKind.Timestamp or SqlKind.Timestamptz or SqlKind.F64 => 8,
         SqlKind.Boolean => 1, SqlKind.Uuid or SqlKind.Interval => 16,
-        SqlKind.Decimal when spec.Precision is > 0 and <= 18 => spec.Precision <= 4 ? 2 : spec.Precision <= 9 ? 4 : 8,
         _ => 0
     };
     internal static byte[] Encode(SqlValue value)
@@ -77,7 +78,7 @@ internal static class StoredValues
     }
     internal static void WriteBody(WireWriter writer, SqlValue value, int depth = 0)
     {
-        if (value.Type.IsInteger()) { writer.Bytes(KeyEncoding.Integer(value.AsInteger(), Width(new(value.Type)))); return; }
+        if (value.Type.IsInteger()) { writer.Bytes(KeyEncoding.Integer(value.AsInteger(), ScalarWidth(value.Type))); return; }
         switch (value.Type.Kind)
         {
             case SqlKind.Date: writer.Bytes(KeyEncoding.Integer(value.AsDate(), 4)); return;
@@ -119,7 +120,7 @@ internal static class StoredValues
     }
     internal static SqlValue ReadBody(ref WireReader reader, SqlType type, int depth = 0)
     {
-        if (type.IsInteger()) return SqlValue.Integer(KeyEncoding.ReadInteger(reader.Bytes(Width(new(type)))), type);
+        if (type.IsInteger()) return SqlValue.Integer(KeyEncoding.ReadInteger(reader.Bytes(ScalarWidth(type))), type);
         switch (type.Kind)
         {
             case SqlKind.Date: return SqlValue.Date((int)KeyEncoding.ReadInteger(reader.Bytes(4)));
@@ -168,7 +169,10 @@ internal static class StoredValues
     internal static SqlValue FromLeaf(ReadOnlyMemory<byte>? cell, TypeSpec spec)
     {
         if (cell is null) return SqlValue.Null(spec.Type);
-        var bytes = cell.Value.Span;
+        return FromLeafBytes(cell.Value.Span, spec);
+    }
+    internal static SqlValue FromLeafBytes(ReadOnlySpan<byte> bytes, TypeSpec spec)
+    {
         if (spec.Type == SqlType.Decimal && Width(spec) > 0)
             return SqlValue.Decimal(ExactDecimal.FromUnscaled(KeyEncoding.ReadInteger(bytes), spec.Scale!.Value));
         if (spec.Type.Kind is SqlKind.Text or SqlKind.Bytea or SqlKind.Json && bytes.Length > 0 && bytes[0] == 5)
@@ -190,14 +194,18 @@ internal static class KeyEncoding
     internal static byte[] Integer(long value, int width)
     {
         var bytes = new byte[width];
-        switch (width)
+        WriteInteger(bytes, value);
+        return bytes;
+    }
+    internal static void WriteInteger(Span<byte> bytes, long value)
+    {
+        switch (bytes.Length)
         {
             case 2: BinaryPrimitives.WriteUInt16BigEndian(bytes, unchecked((ushort)((short)value ^ short.MinValue))); break;
             case 4: BinaryPrimitives.WriteUInt32BigEndian(bytes, unchecked((uint)((int)value ^ int.MinValue))); break;
             case 8: BinaryPrimitives.WriteUInt64BigEndian(bytes, unchecked((ulong)(value ^ long.MinValue))); break;
-            default: throw new ArgumentOutOfRangeException(nameof(width));
+            default: throw new ArgumentOutOfRangeException(nameof(bytes));
         }
-        return bytes;
     }
     internal static long ReadInteger(ReadOnlySpan<byte> bytes) => bytes.Length switch
     {
@@ -208,6 +216,8 @@ internal static class KeyEncoding
     };
     internal static byte[] Encode(SqlValue value, bool nullable = false, bool descending = false, Collation? collation = null)
     {
+        if (!nullable && !descending && !value.IsNull && value.Type.IsInteger())
+            return Integer(value.AsInteger(), StoredValues.ScalarWidth(value.Type));
         var writer = new WireWriter();
         if (value.IsNull)
         {
@@ -217,7 +227,7 @@ internal static class KeyEncoding
         else
         {
             if (nullable) writer.Byte(0);
-            if (value.Type.IsInteger()) writer.Bytes(Integer(value.AsInteger(), StoredValues.Width(new(value.Type))));
+            if (value.Type.IsInteger()) writer.Bytes(Integer(value.AsInteger(), StoredValues.ScalarWidth(value.Type)));
             else switch (value.Type.Kind)
             {
                 case SqlKind.Date: writer.Bytes(Integer(value.AsDate(), 4)); break;

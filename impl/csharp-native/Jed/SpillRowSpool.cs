@@ -22,23 +22,42 @@ internal sealed class SpillRowSpool(ScratchHost host, long workMem, Meter meter)
         token.ThrowIfCancellationRequested();
         ObjectDisposedException.ThrowIf(disposed, this);
         var copy = new SqlValue[row.Length];
-        for (var i = 0; i < row.Length; i++) copy[i] = await row[i].ResolveAsync(token).ConfigureAwait(false);
-        types ??= copy.Select(value => value.Type).ToArray();
-        if (copy.Length != types.Length || copy.Where((value, slot) => value.Type != types[slot]).Any())
-            throw new InvalidOperationException("spool row type changed");
-        if (file is not null) await Write(copy, token).ConfigureAwait(false);
-        else
+        for (var i = 0; i < row.Length; i++)
+            copy[i] = row[i].IsDeferred ? await row[i].ResolveAsync(token).ConfigureAwait(false) : row[i];
+        await AppendOwned(copy, token, logicalBytes).ConfigureAwait(false);
+    }
+
+    // The caller transfers a newly owned array containing only resident values.
+    // Neither the caller nor any upstream cursor may mutate it after this call.
+    internal ValueTask AppendOwned(SqlValue[] row, CancellationToken token, long? logicalBytes = null)
+    {
+        token.ThrowIfCancellationRequested();
+        ObjectDisposedException.ThrowIf(disposed, this);
+        if (types is not null && row.Length != types.Length) throw new InvalidOperationException("spool row type changed");
+        for (var i = 0; i < row.Length; i++)
         {
-            var bytes = logicalBytes ?? MemorySize.RowBytes(copy);
-            var admitted = meter.Memory.TryReserve(bytes);
-            if (admitted) residentBytes = Meter.Add(residentBytes, bytes);
-            if (!admitted || workMem > 0 && residentBytes > workMem)
-            {
-                await ForceDisk(token).ConfigureAwait(false);
-                await Write(copy, token).ConfigureAwait(false);
-            }
-            else resident.Add(copy);
+            if (row[i].IsDeferred) throw new InvalidOperationException("owned spool row must be resident");
+            if (types is not null && row[i].Type != types[i]) throw new InvalidOperationException("spool row type changed");
         }
+        if (types is null)
+        {
+            types = new SqlType[row.Length];
+            for (var i = 0; i < row.Length; i++) types[i] = row[i].Type;
+        }
+        if (file is not null) return AppendToFile(row, token, force: false);
+        var bytes = logicalBytes ?? MemorySize.RowBytes(row);
+        var admitted = meter.Memory.TryReserve(bytes);
+        if (admitted) residentBytes = Meter.Add(residentBytes, bytes);
+        if (!admitted || workMem > 0 && residentBytes > workMem) return AppendToFile(row, token, force: true);
+        resident.Add(row);
+        Count = checked(Count + 1);
+        return ValueTask.CompletedTask;
+    }
+
+    private async ValueTask AppendToFile(SqlValue[] row, CancellationToken token, bool force)
+    {
+        if (force) await ForceDisk(token).ConfigureAwait(false);
+        await Write(row, token).ConfigureAwait(false);
         Count = checked(Count + 1);
     }
     internal async ValueTask ForceDisk(CancellationToken token)

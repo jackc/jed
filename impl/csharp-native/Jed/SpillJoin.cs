@@ -50,7 +50,7 @@ internal static class SpillJoin
                     {
                         meter.Charge(Math.Max(1, Math.Min(key.Length, entry[0].ByteSpan.Length)) * Costs.HashProbe); meter.Guard();
                         if (key.AsSpan().SequenceEqual(entry[0].ByteSpan))
-                            await candidates.Append(entry[1].AsComposite().Fields.ToArray(), token).ConfigureAwait(false);
+                            await candidates.AppendOwned(entry[1].AsComposite().Fields.ToArray(), token).ConfigureAwait(false);
                     }
                 selected = candidates.Read(token);
             }
@@ -64,7 +64,7 @@ internal static class SpillJoin
             else if (inl is not null)
             {
                 await foreach (var row in inl.Rows(a, meter, token).ConfigureAwait(false))
-                    await candidates.Append(await Owned(row, rightTouched, token).ConfigureAwait(false), token).ConfigureAwait(false);
+                    await candidates.AppendOwned(await Owned(row, rightTouched, token).ConfigureAwait(false), token).ConfigureAwait(false);
                 selected = candidates.Read(token);
             }
             var matched = false; long ordinal = -1;
@@ -72,13 +72,18 @@ internal static class SpillJoin
             {
                 ordinal++;
                 meter.Checkpoint(token);
-                if (!await QueryExecution.KeepsAsync(predicate, a.Concat(b).ToArray(), meter).ConfigureAwait(false)) continue;
+                if (predicate is not null)
+                {
+                    var predicateRow = new SqlValue[a.Length + b.Length];
+                    a.CopyTo(predicateRow, 0); b.CopyTo(predicateRow, a.Length);
+                    if (!await QueryExecution.KeepsAsync(predicate, predicateRow, meter).ConfigureAwait(false)) continue;
+                }
                 if (kind is "right" or "full")
                     await matchedInner.Put(KeyEncoding.Encode(SqlValue.Integer(ordinal)), [], MemorySize.EntryBytes([SqlValue.Integer(ordinal)]), token).ConfigureAwait(false);
-                matched = true; await output.Append(Joined(a, b), token).ConfigureAwait(false);
+                matched = true; await output.AppendOwned(Joined(a, b), token).ConfigureAwait(false);
             }
             if (!matched && kind is "left" or "full")
-                await output.Append(Joined(a, right.Columns.Select(column => SqlValue.Null(column.Type)).ToArray()), token).ConfigureAwait(false);
+                await output.AppendOwned(Joined(a, right.Columns.Select(column => SqlValue.Null(column.Type)).ToArray()), token).ConfigureAwait(false);
         }
         if (kind is "right" or "full")
         {
@@ -86,7 +91,7 @@ internal static class SpillJoin
             var empty = left.Columns.Select(column => SqlValue.Null(column.Type)).ToArray();
             await foreach (var row in inner.Read(token).ConfigureAwait(false))
                 if (await matchedInner.Get(KeyEncoding.Encode(SqlValue.Integer(ordinal++)), token).ConfigureAwait(false) is null)
-                    await output.Append(Joined(empty, row), token).ConfigureAwait(false);
+                    await output.AppendOwned(Joined(empty, row), token).ConfigureAwait(false);
         }
         await outer.DisposeAsync().ConfigureAwait(false); await inner.DisposeAsync().ConfigureAwait(false); await entries.DisposeAsync().ConfigureAwait(false);
         await matchedInner.DisposeAsync().ConfigureAwait(false);
@@ -95,7 +100,8 @@ internal static class SpillJoin
     private static async ValueTask<SqlValue[]> Owned(SqlValue[] row, IReadOnlySet<int> touched, CancellationToken token)
     {
         var owned = new SqlValue[row.Length];
-        for (var i = 0; i < row.Length; i++) owned[i] = touched.Contains(i) ? await row[i].ResolveAsync(token).ConfigureAwait(false) : SqlValue.Null(row[i].Type);
+        for (var i = 0; i < row.Length; i++) owned[i] = !touched.Contains(i) ? SqlValue.Null(row[i].Type) :
+            row[i].IsDeferred ? await row[i].ResolveAsync(token).ConfigureAwait(false) : row[i];
         return owned;
     }
     private static async ValueTask Materialize(PreparedRelation input, SpillRowSpool spool, IReadOnlySet<int> touched, Meter meter, CancellationToken token)
@@ -104,7 +110,7 @@ internal static class SpillJoin
         {
             var owned = await Owned(row, touched, token).ConfigureAwait(false);
             if (input.MemoryOutput) meter.Memory.Release(MemorySize.RowBytes(row));
-            await spool.Append(owned, token).ConfigureAwait(false);
+            await spool.AppendOwned(owned, token).ConfigureAwait(false);
         }
     }
 }

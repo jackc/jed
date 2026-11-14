@@ -2178,3 +2178,14 @@ reason = "jed extension: round(f64, n) rounds a float half away from zero at a d
 file = "expr/float_round_extremes.test"
 sql = "SELECT round(123::f64, -4294967296)::text"
 reason = "jed extension: round(f64, n) rounds a float half away from zero at a decimal precision (float.md §8). PostgreSQL has no two-argument float round overload. This regression pins finite scaling, extreme precisions, and subnormal rounding."
+
+# Dedicated gcd/lcm resolution retains integer-width promotion and NULL propagation.
+[[override]]
+file = "expr/numeric_resolver_coercion.test"
+sql = "SELECT div(NULL, NULL), gcd(NULL, NULL), lcm(NULL, NULL)"
+reason = "jed: the dedicated div/gcd/lcm resolvers admit NULL without overload ambiguity; div returns decimal and gcd/lcm default an all-NULL integer pair to i64. PostgreSQL reports 42725 for gcd(unknown, unknown). The existing integer-promotion/NULL contract is pinned by all three supported cores."
+
+[[override]]
+file = "expr/numeric_resolver_coercion.test"
+sql = "SELECT gcd(12::i16, 18::i32), lcm(4::i16, 6::i32), gcd(12::i16, NULL)"
+reason = "jed: gcd/lcm promote integer operands by width, and a bare NULL adopts the concrete sibling's width; the third result is NULL of type i16. PostgreSQL reports 42725 for gcd(smallint, unknown) instead of applying this dedicated integer-promotion rule. Verified by all three supported cores."

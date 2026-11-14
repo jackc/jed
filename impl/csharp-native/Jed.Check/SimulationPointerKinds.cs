@@ -36,7 +36,7 @@ internal static class SimulationPointerKinds
             var header = StorageFormat.ParsePage(bytes.Span, verifyChecksum: false);
             if (header.Type == 3)
             {
-                var interior = StorageInterior.Parse(bytes.Span, snapshot.Meta.PageCount, true);
+                var interior = StorageInterior.Parse(bytes.Span, snapshot.Meta.PageCount, true, reference.Page, snapshot.Meta.Remap);
                 for (var i = 0; i < interior.Children.Length; i++)
                 { Add("child", interior.Children[i]); await Tree(new(interior.Children[i], interior.Tags![i]), schema, false, depth + 1); }
             }

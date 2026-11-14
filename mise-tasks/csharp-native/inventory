@@ -3,10 +3,15 @@
 #MISE description="Explicit opt-in: report the pinned C# acceptance inventory without claiming coverage"
 require_relative "../../impl/csharp-native/Tools/tasks"
 spec = CSharpNativeTasks.baseline_spec
+pinned_sql = Dir.glob(File.join(spec, "conformance/suites/**/*.test")).map { _1.delete_prefix(spec + "/") }
+supplemental_sql = CSharpNativeTasks::BASELINE.fetch("supplemental_corpus").map { _1.delete_prefix("spec/") }.uniq
+additional_sql = supplemental_sql - pinned_sql
 puts JSON.pretty_generate({
   semantic_revision: CSharpNativeTasks::BASELINE.fetch("semantic_revision"),
   spec_files: Dir.glob(File.join(spec, "**/*")).count { |p| File.file?(p) },
-  sql_files: Dir.glob(File.join(spec, "conformance/suites/**/*.test")).length,
+  sql_files: pinned_sql.length,
+  additional_supplemental_sql_files: additional_sql.length,
+  all_sql_files: (pinned_sql | supplemental_sql).length,
   process_files: Dir.glob(File.join(spec, "conformance/process/**/*.toml")).length,
   simulation_regressions: Dir.glob(File.join(spec, "conformance/sim/regress/*.sim")).length,
   supplemental_corpus: CSharpNativeTasks::BASELINE.fetch("supplemental_corpus"),

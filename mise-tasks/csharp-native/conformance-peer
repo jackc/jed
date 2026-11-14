@@ -18,21 +18,54 @@ unless File.executable?(peer)
   abort "Pinned conformance build failed" unless system("go", "build", "-o", peer, "./cmd/conformance", chdir: File.join(peer_root, "impl/go"))
 end
 corpus = File.join(CSharpNativeTasks.baseline_spec, "conformance/suites")
+working_corpus = File.join(CSharpNativeTasks::ROOT, "spec/conformance/suites")
+supplemental = CSharpNativeTasks::BASELINE.fetch("supplemental_corpus").map { File.expand_path(_1, CSharpNativeTasks::ROOT) }
+additional = {}
 passed = File.readlines(ENV.fetch("usage_results")).filter_map do |line|
   match = /\APASS (.*?): \d+ records, (?:reopened before every record|retained fixture file)\s*\z/.match(line)
   next unless match
   path = File.expand_path(match[1])
-  abort "Result file is outside the pinned corpus: #{path}" unless path.start_with?(corpus + "/")
-  path.delete_prefix(corpus + "/")
+  if path.start_with?(corpus + "/")
+    path.delete_prefix(corpus + "/")
+  elsif supplemental.include?(path) && path.start_with?(working_corpus + "/")
+    relative = path.delete_prefix(working_corpus + "/")
+    pinned = File.join(corpus, relative)
+    if File.file?(pinned)
+      abort "Supplemental result differs from pinned peer corpus file: #{relative}" unless Digest::SHA256.file(path).hexdigest == Digest::SHA256.file(pinned).hexdigest
+    else
+      additional[relative] = path
+    end
+    relative
+  else
+    abort "Result file is outside the pinned corpus and configured supplements: #{path}"
+  end
 end
 abort "No complete encrypted disk PASS files in results log" if passed.empty?
+peer_corpus_root = File.dirname(CSharpNativeTasks.baseline_spec)
+unless additional.empty?
+  # The independent engine stays pinned. New configured regression files run in
+  # a separate corpus snapshot, leaving every baseline file byte-identical.
+  peer_corpus_root = Dir.mktmpdir("conformance-peer-corpus-", CSharpNativeTasks::BUILD)
+  FileUtils.cp_r(CSharpNativeTasks.baseline_spec, File.join(peer_corpus_root, "spec"))
+  hashes = additional.sort.to_h do |relative, source|
+    destination = File.join(peer_corpus_root, "spec/conformance/suites", relative)
+    abort "Supplemental corpus would replace pinned content: #{relative}" if File.exist?(destination)
+    expected_hash = Digest::SHA256.file(source).hexdigest
+    FileUtils.mkdir_p(File.dirname(destination))
+    FileUtils.cp(source, destination)
+    abort "Supplemental corpus changed during capture: #{relative}" unless Digest::SHA256.file(destination).hexdigest == expected_hash && Digest::SHA256.file(source).hexdigest == expected_hash
+    [relative, expected_hash]
+  end
+  File.write(File.join(peer_corpus_root, "supplemental.json"), JSON.pretty_generate(semantic_revision: revision, additional_corpus_sha256: hashes) + "\n")
+  puts "Pinned Go #{revision}; supplemental corpus snapshot: #{peer_corpus_root}"
+end
 actual_path = ENV["usage_transcript"] || File.join(CSharpNativeTasks::BUILD, "conformance-encrypted.tsv")
 actual = File.readlines(actual_path).group_by { _1.split("\t", 2).first }
 expected_path = File.join(CSharpNativeTasks::BUILD, "conformance-encrypted-go.tsv")
 log = File.join(CSharpNativeTasks::BUILD, "conformance-encrypted-go.log")
 env = { "JED_CONFORMANCE_ENCRYPTED" => "1", "JED_CONFORMANCE_TRANSCRIPT" => expected_path, "JED_CONFORMANCE_FILTER" => nil }
 File.open(log, "w") do |output|
-  abort "Pinned Go encrypted corpus failed; see #{log}" unless system(env, peer, "disk", chdir: File.dirname(CSharpNativeTasks.baseline_spec), out: output, err: output)
+  abort "Pinned Go encrypted corpus failed; see #{log}" unless system(env, peer, "disk", chdir: peer_corpus_root, out: output, err: output)
 end
 expected = File.readlines(expected_path).group_by { _1.split("\t", 2).first }
 matched = 0; failed = 0; events = 0

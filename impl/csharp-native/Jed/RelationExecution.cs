@@ -3,7 +3,15 @@ using System.Runtime.CompilerServices;
 namespace Jed;
 
 internal sealed record PreparedRelation(BoundColumn[] Columns, IAsyncEnumerable<SqlValue[]> Rows, Func<ValueTask>? Initialize = null, OuterFrame[]? Dependencies = null, Func<ValueTask>? InitializeConstants = null, bool NoReturning = false,
-    Func<Resolved, (PreparedRelation Relation, Resolved? Residual)>? PushFilter = null, long? EstimatedRows = null, BaseRelationAccess? BaseAccess = null, bool MemoryOutput = false, Func<HashSet<int>, PreparedRelation>? WithTouched = null, CrossJoinChain? CrossChain = null, ExplainNode? Plan = null, Func<SortPlan[], long, Resolved?, PreparedRelation?>? Bounded = null, ExplainCte? Cte = null, bool BoundedOutput = false, Func<AccessPlan, PreparedRelation>? WithAccess = null, AccessPlan? SelectedAccess = null, Func<SelectPlan, PreparedRelation>? WithQuery = null, bool RawLayout = false);
+    Func<Resolved, (PreparedRelation Relation, Resolved? Residual)>? PushFilter = null, long? EstimatedRows = null, BaseRelationAccess? BaseAccess = null, bool MemoryOutput = false, Func<HashSet<int>, PreparedRelation>? WithTouched = null, CrossJoinChain? CrossChain = null, ExplainNode? Plan = null, Func<SortPlan[], long, Resolved?, PreparedRelation?>? Bounded = null, ExplainCte? Cte = null, bool BoundedOutput = false, Func<AccessPlan, PreparedRelation>? WithAccess = null, AccessPlan? SelectedAccess = null, Func<SelectPlan, PreparedRelation>? WithQuery = null, bool RawLayout = false)
+{
+    // A direct public stream is valid only for the exact row source it wraps.
+    // Record copies that transform Rows automatically fall back to conversion.
+    internal IAsyncEnumerable<Row>? PublicOutput { get; init; }
+    internal IAsyncEnumerable<SqlValue[]>? PublicSource { get; init; }
+    internal IAsyncEnumerable<Row> OutputRows() => ReferenceEquals(Rows, PublicSource) && PublicOutput is not null
+        ? PublicOutput : RelationExecution.PublicRows(Rows);
+}
 
 internal static class RelationExecution
 {
@@ -367,8 +375,25 @@ var columns = left.Columns.Select((column, index) => column with { Type = Resolv
         return selected.All(column => selected[0].BaseSource is { } identity ? ReferenceEquals(column.BaseSource, identity) : column.Qualifier == selected[0].Qualifier);
     }
     internal static PreparedRelation Query(SelectSyntax query, Database database, DatabaseSnapshot snapshot, PendingDatabase? pending,
-        Catalog catalog, Meter meter, CancellationToken cancellationToken, bool derived = false, QueryScope? scope = null)
+        Catalog catalog, Meter meter, CancellationToken cancellationToken, bool derived = false, QueryScope? scope = null, PreparedSelectCache? cache = null)
     {
+        if (cache is not null && cache.Matches(snapshot, catalog, meter))
+        {
+            if (cache.SimpleScalar)
+            {
+                var output = cache.ScalarRows(meter); var rows = Projected(output);
+                return new(cache.Columns, rows) { PublicOutput = !derived && scope is null ? output : null, PublicSource = rows };
+            }
+            var active = cache.Plan!;
+            if (active.Windows is null && active.DistinctOnCount == 0 && database.ScratchHost is { } scratch && database.WorkMem > 0)
+                active = active with { Spill = new(scratch, database.WorkMem, cache.Table) };
+            var source = cache.Table is { } table
+                ? QueryExecution.DeferredTableSource(table, database.Tree(table, null, snapshot), active, meter, cancellationToken, new(database, snapshot, null, catalog))
+                : QueryExecution.ScalarSource(meter);
+            var execution = QueryExecution.Select(active, source, meter, cancellationToken);
+            var projected = Projected(execution);
+            return new(cache.Columns, projected) { PublicOutput = !derived && scope is null ? execution : null, PublicSource = projected };
+        }
         ViewLimits.Validate(query, catalog, scope);
         if (query.With?.Any(definition => definition.Mutation is not null) == true) throw Errors.Unsupported("nested data-modifying WITH");
         query = QueryCounts.Resolve(Resolve.BindTypes(query, catalog, meter.Temporal));
@@ -465,6 +490,8 @@ PreparedRelation Build(SelectPlan requested)
         if (inputPlan is not null) rows = ExplainObservation.Rows(rows, inputPlan, meter, cancellationToken);
         active = active with { AggregateLane = GroupExecution.Lane(active), ColumnarProjection = active.Group is null && active.Windows is null && !active.Distinct &&
             active.Limit is null && active.Offset == 0 && active.Order is not { Length: > 0 } && active.Projections.All(projection => projection.Expression.Op == "column") };
+        active = active with { PackedAggregate = PackedAggregateInput.Create(active, source.Table, source.Tree) };
+        active = active with { PackedSelect = PackedSelectInput.Create(active, source.Table, source.Tree) };
     }
     else
     {
@@ -504,7 +531,28 @@ PreparedRelation Build(SelectPlan requested)
     }
     var identityValues = derived && query.ValuesQuery && active.Order is not { Length: > 0 } && active.Filter is null &&
         active.Projections.Select((projection, slot) => projection.Expression.Op == "column" && projection.Expression.Slot == slot).All(value => value);
-    var result = Projected(QueryExecution.Select(active, rows, meter, cancellationToken, sourceMemory, eagerInput: baseInput is null && query.Relation is not null && !boundedInput, transferIdentity: identityValues, bufferOutput: derived || buffers.Count != 0));
+    if (cache is not null && pending is null && !derived && scope is null && meter.Explain is null &&
+        buffers.Count == 0 && subqueries.Count == 0 && dependencies.Count == 0 && active.BeforeZeroLimit is null &&
+        (baseInput is not null || query.Relation is null))
+        cache.Store(snapshot, catalog, meter, active, outputColumns, baseInput?.Table);
+    // Constants initialize outside the executor. Gate a base aggregate only
+    // afterwards, so scalar subqueries have the same lane shape as constants.
+    async IAsyncEnumerable<Row> InitializedAggregate()
+    {
+        var initialized = PlanTransform.InitialValues(active);
+        var source = baseInput!;
+        if (PlanTransform.DynamicAccess(active.Filter))
+            initialized = initialized with { Access = SinglePipeline.Select(source.Table, source.Tree, initialized, source.Storage, meter).Access };
+        initialized = initialized with { AggregateLane = GroupExecution.Lane(initialized) };
+        initialized = initialized with { PackedAggregate = PackedAggregateInput.Create(initialized, source.Table, source.Tree) };
+        await foreach (var row in QueryExecution.Select(initialized, rows, meter, cancellationToken, sourceMemory,
+            bufferOutput: derived || buffers.Count != 0).ConfigureAwait(false)) yield return row;
+    }
+    var execution = baseInput is not null && active.Group is not null && subqueries.Count != 0 && dependencies.Count == 0 &&
+        subqueries.All(cell => !cell.IsCorrelated && !cell.PerRow)
+        ? InitializedAggregate()
+        : QueryExecution.Select(active, rows, meter, cancellationToken, sourceMemory, eagerInput: baseInput is null && query.Relation is not null && !boundedInput, transferIdentity: identityValues, bufferOutput: derived || buffers.Count != 0);
+    var result = Projected(execution);
     if (buffers.Count > 0 || subqueries.Count > 0) result = SubqueryExecution.Initialized(Initialize, result, cancellationToken);
     if (buffers.Count > 0) result = CteBuffer.DisposeAfter(buffers, result, cancellationToken);
     if (outputPlan is not null && !ReferenceEquals(outputPlan, active.Observation?.Root)) result = ExplainObservation.Rows(result, outputPlan, meter, cancellationToken, inclusive: true);
@@ -576,7 +624,7 @@ return Build(plan);
     }
     private static async IAsyncEnumerable<SqlValue[]> Projected(IAsyncEnumerable<Row> source)
     {
-        await foreach (var row in source.ConfigureAwait(false)) yield return Enumerable.Range(0, row.Count).Select(i => row[i]).ToArray();
+        await foreach (var row in source.ConfigureAwait(false)) yield return row.OwnedValues;
     }
 private static PreparedRelation GroupRelation(PreparedRelation input, Meter meter, CancellationToken token)
 {

@@ -277,6 +277,18 @@ internal static partial class StatementExecution
         await returnBinder.Initialize().ConfigureAwait(false);
         var results = new List<Row>();
         var changes = new List<(StorageRecord Old, SqlValue[] Values)>();
+        Dictionary<StorageRecord, StorageRecord>? encodedChanges = null;
+        StorageRecord EncodeChange((StorageRecord Old, SqlValue[] Values) change)
+        {
+            // Encoding is pure but can reject a value. Preserve its first-use
+            // position in validation, then share the immutable record across
+            // uniqueness, key movement, index maintenance and tree insertion.
+            encodedChanges ??= new(ReferenceEqualityComparer.Instance);
+            if (encodedChanges.TryGetValue(change.Old, out var encoded)) return encoded;
+            encoded = table.EncodeRow(change.Values, table.PrimaryKey.Length == 0 ? KeyEncoding.ReadInteger(change.Old.Key) : 0);
+            encodedChanges.Add(change.Old, encoded);
+            return encoded;
+        }
         var storedRows = new Dictionary<string, StorageRecord>(StringComparer.Ordinal);
         var unchanged = Enumerable.Range(0, table.Columns.Length).Where(column => !table.PrimaryKey.Contains(column) && !(targets ?? []).Any(target => target.Slot == column)).ToHashSet();
         var storage = new QueryStorage(database, pending.Before, readState, readState.Catalog);
@@ -314,14 +326,14 @@ internal static partial class StatementExecution
         }
         if (targets is not null)
             await ValidatePinnedKeys(database, context, table, changes.Select(change =>
-                (table.EncodeRow(change.Values, table.PrimaryKey.Length == 0 ? KeyEncoding.ReadInteger(change.Old.Key) : 0), change.Values)),
+                (EncodeChange(change), change.Values)),
                 changes.Select(change => Convert.ToHexString(change.Old.Key)).ToHashSet(StringComparer.Ordinal), meter, cancellationToken).ConfigureAwait(false);
         if (targets is not null)
             await ValidateFinalIndexKeys(database, pending, table, changes.Select(change =>
-                (table.EncodeRow(change.Values, table.PrimaryKey.Length == 0 ? KeyEncoding.ReadInteger(change.Old.Key) : 0), change.Values)),
+                (EncodeChange(change), change.Values)),
                 changes.Select(change => Convert.ToHexString(change.Old.Key)).ToHashSet(StringComparer.Ordinal), meter, cancellationToken).ConfigureAwait(false);
         var rekeys = targets is not null && changes.Any(change => !change.Old.Key.AsSpan().SequenceEqual(
-            table.EncodeRow(change.Values, table.PrimaryKey.Length == 0 ? KeyEncoding.ReadInteger(change.Old.Key) : 0).Key));
+            EncodeChange(change).Key));
         var priorRecords = new Dictionary<string, StorageRecord>(StringComparer.Ordinal);
         var removed = 0;
         var inPlace = new HashSet<string>(StringComparer.Ordinal);
@@ -329,7 +341,7 @@ internal static partial class StatementExecution
         var changedIndexes = new Dictionary<string, CatalogTable>(StringComparer.Ordinal);
         if (targets is not null)
             foreach (var change in changes)
-                if (!newKeys.Add(Convert.ToHexString(table.EncodeRow(change.Values, table.PrimaryKey.Length == 0 ? KeyEncoding.ReadInteger(change.Old.Key) : 0).Key)))
+                if (!newKeys.Add(Convert.ToHexString(EncodeChange(change).Key)))
                     throw new SqlException(SqlStates.UniqueViolation, "duplicate primary key");
         foreach (var change in changes)
         {
@@ -338,7 +350,7 @@ internal static partial class StatementExecution
             if (current is not null)
             {
                 var currentValues = await tree.MaterializeRecordAsync(current, cancellationToken).ConfigureAwait(false);
-                var replacement = assignments is null ? null : table.EncodeRow(change.Values, table.PrimaryKey.Length == 0 ? KeyEncoding.ReadInteger(change.Old.Key) : 0);
+                var replacement = assignments is null ? null : EncodeChange(change);
                 if (replacement is not null && current.Key.AsSpan().SequenceEqual(replacement.Key)) inPlace.Add(Convert.ToHexString(change.Old.Key));
                 else tree = await tree.DeleteAsync(current.Key, cancellationToken).ConfigureAwait(false);
                 var oldValues = table.DecodeRow(currentValues);
@@ -361,7 +373,7 @@ internal static partial class StatementExecution
         {
             if (targets is not null)
             {
-                var encoded = tree.KeepUnchangedChains(tree.PrepareRecord(table.EncodeRow(change.Values, table.PrimaryKey.Length == 0 ? KeyEncoding.ReadInteger(change.Old.Key) : 0), meter), storedRows[Convert.ToHexString(change.Old.Key)], unchanged);
+                var encoded = tree.KeepUnchangedChains(tree.PrepareRecord(EncodeChange(change), meter), storedRows[Convert.ToHexString(change.Old.Key)], unchanged);
                 if (await tree.FindAsync(encoded.Key, cancellationToken).ConfigureAwait(false) is not null && !inPlace.Contains(Convert.ToHexString(change.Old.Key))) throw new SqlException(SqlStates.UniqueViolation, "duplicate primary key");
                 tree = await tree.UpsertAsync(encoded, cancellationToken).ConfigureAwait(false);
                 var indexTable = changedIndexes.GetValueOrDefault(Convert.ToHexString(change.Old.Key), table);
@@ -378,7 +390,7 @@ internal static partial class StatementExecution
         if (changes.Count != 0)
         {
             if (assignments is not null) await ValidateExclusions(database, pending, table, changes.Select(change =>
-                (table.EncodeRow(change.Values, table.PrimaryKey.Length == 0 ? KeyEncoding.ReadInteger(change.Old.Key) : 0), change.Values)), meter, cancellationToken, context,
+                (EncodeChange(change), change.Values)), meter, cancellationToken, context,
                 changes.Select(change => Convert.ToHexString(change.Old.Key)).ToHashSet(StringComparer.Ordinal)).ConfigureAwait(false);
             await ApplyReferentialActions(database, pending, table, changes, assignments is null, meter, cancellationToken, context: context).ConfigureAwait(false);
             if (assignments is not null) await ForeignCheck(context, () => ValidateForeignKeys(database, pending, table, changes.Select(change => change.Values).ToArray(), cancellationToken)).ConfigureAwait(false);

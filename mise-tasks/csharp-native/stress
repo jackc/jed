@@ -2,6 +2,7 @@
 # frozen_string_literal: true
 #MISE description="Explicit opt-in: pinned parallel reader/writer stress on C# memory/plain/encrypted hosts and independent Go checksum"
 #USAGE flag "--no-build" help="Capture the existing C# Release assembly"
+#USAGE flag "--assembly <path>" help="Capture an immutable JIT DLL without rebuilding"
 require_relative "../../impl/csharp-native/Tools/peer_actors"
 require_relative "../../scripts/lib/bundle_setup"
 require "toml-rb"
@@ -22,7 +23,9 @@ go = File.join(peers, "bench/go/stress_actor")
 unless File.executable?(go)
   abort "Offline Go stress peer build failed" unless system({ "GOPROXY" => "off", "CGO_ENABLED" => "0" }, "go", "build", "-o", go, "./cmd/stress", chdir: File.join(peers, "bench/go"))
 end
-dll = ENV["usage_no_build"] == "true" ? File.join(CSharpNativeTasks::PACKAGE, "Jed.Check/bin/Release/net11.0/Jed.Check.dll") : CSharpNativeTasks.build
+dll = ENV["usage_assembly"] ? File.expand_path(ENV.fetch("usage_assembly")) :
+  ENV["usage_no_build"] == "true" ? File.join(CSharpNativeTasks::PACKAGE, "Jed.Check/bin/Release/net11.0/Jed.Check.dll") : CSharpNativeTasks.build
+abort "Missing JIT assembly" unless dll.end_with?(".dll") && File.file?(dll)
 output = Dir.mktmpdir("jed-csharp-stress-")
 warn "Stress evidence: #{output}"
 actor = File.join(output, "actor"); FileUtils.mkdir_p(actor)

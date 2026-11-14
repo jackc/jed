@@ -1,0 +1,444 @@
+{
+  "semantic_revision": "6b2355d98a7fd3738c60474779d1d63548f350dc",
+  "source_sha256": "6f0da47cc73888be3557572ea523a52e80d8c64a131fad80e4a95943c7073bf3",
+  "artifacts": {
+    "jit": {
+      "directory": "/tmp/jed-csharp-refresh-complete-jit",
+      "build": {
+        "source_sha256": "6f0da47cc73888be3557572ea523a52e80d8c64a131fad80e4a95943c7073bf3",
+        "sdk": "11.0.100",
+        "configuration": "Release",
+        "runtime_async": false,
+        "compilation": "jit"
+      },
+      "sha256": {
+        "BouncyCastle.Cryptography.dll": "ef92fc661e8d7ba8ec4d39a7cdfcdba41f14cb327f0d24fe79d0b5bb428899b5",
+        "Jed.CSharpExperiment.dll": "19d193972062ef8d4af6523b8f38cc03f5460392acc40122266ed1c8eae4e87e",
+        "Jed.CSharpExperiment.pdb": "cf7dfa152f7759c4edf4ed24b8a4847c9a05b49bdeddce5ba3e61f55bb35f952",
+        "Jed.Check": "249c10d0b1960b61e52091650d52e1009a3977ab07fb135995199317c579b641",
+        "Jed.Check.deps.json": "203fc9a5e456ea866d125285f8d44fb55551ade67bb601392ed0d24a7f8286b4",
+        "Jed.Check.dll": "feed6eab4213232ea13bab17f8dff14e77e9b7331021ab6cc5a69a519a53770b",
+        "Jed.Check.pdb": "08a126f47a3a954595e789e0e2c0d917cf2718f1d5ab29f796d616aad20c8f02",
+        "Jed.Check.runtimeconfig.json": "8c019e2c7c9acc0440d8b263897f7b0079b1c6895307921604be20e732900366",
+        "build.json": "4786fad097dc4df32994ebd2e59865457b474725e0e4bfad3f90aeec1b7c0cd3",
+        "source.sha256": "c158f6c5ac9ac35e778b7a6b0c8c00874267db4d4e8f47b16262355f6ab9c588"
+      }
+    },
+    "jit-runtime-async": {
+      "directory": "/tmp/jed-csharp-refresh-complete-jit-runtime-async",
+      "build": {
+        "source_sha256": "6f0da47cc73888be3557572ea523a52e80d8c64a131fad80e4a95943c7073bf3",
+        "sdk": "11.0.100",
+        "configuration": "Release",
+        "runtime_async": true,
+        "compilation": "jit"
+      },
+      "sha256": {
+        "BouncyCastle.Cryptography.dll": "ef92fc661e8d7ba8ec4d39a7cdfcdba41f14cb327f0d24fe79d0b5bb428899b5",
+        "Jed.CSharpExperiment.dll": "6a1ec4eae8f62740397706075412964993e4f55674e9800a56c6f4535c0b2ca4",
+        "Jed.CSharpExperiment.pdb": "e8ca80a6496140fa9fe9a17081d1ba5273fc5004bc157b92bf1727af99dbae42",
+        "Jed.Check": "249c10d0b1960b61e52091650d52e1009a3977ab07fb135995199317c579b641",
+        "Jed.Check.deps.json": "203fc9a5e456ea866d125285f8d44fb55551ade67bb601392ed0d24a7f8286b4",
+        "Jed.Check.dll": "b118077c1aad0be420370b72357feec24663926d6a8531fa622098fcf21d76d4",
+        "Jed.Check.pdb": "94bfa960db358b9f714019ff832c30c49249d1f602b16519a6c18df2f2722cda",
+        "Jed.Check.runtimeconfig.json": "8c019e2c7c9acc0440d8b263897f7b0079b1c6895307921604be20e732900366",
+        "build.json": "9fbda3d4f080ddb045a8b1feeb4f09cb20253205256577fe83a04a8a83f750c2",
+        "source.sha256": "c158f6c5ac9ac35e778b7a6b0c8c00874267db4d4e8f47b16262355f6ab9c588"
+      }
+    },
+    "aot": {
+      "directory": "/tmp/jed-csharp-refresh-complete-aot",
+      "build": {
+        "source_sha256": "6f0da47cc73888be3557572ea523a52e80d8c64a131fad80e4a95943c7073bf3",
+        "sdk": "11.0.100",
+        "configuration": "Release",
+        "runtime_async": false,
+        "compilation": "nativeaot",
+        "instructions": "default",
+        "optimization": "Speed"
+      },
+      "sha256": {
+        "Jed.CSharpExperiment.pdb": "badde49c0262ab7a73902dea4f82e198e2dcb442320aa49a1a695fcdd3d8887c",
+        "Jed.Check": "c72d35c6772cac2c0596c7b3a771f704ab9362346d9969e77250a7fe56cfe8b7",
+        "Jed.Check.dbg": "d0063b22ef62b4a01e273f759f4c9ea90590c3a83e22b5f5275311b6da67a2b9",
+        "build.json": "51f24d9f45f70ccfe5daa165187861b34c80ba2f26a80f765f5fee758f9c59ce",
+        "source.sha256": "c158f6c5ac9ac35e778b7a6b0c8c00874267db4d4e8f47b16262355f6ab9c588"
+      }
+    },
+    "aot-runtime-async": {
+      "directory": "/tmp/jed-csharp-refresh-complete-aot-runtime-async",
+      "build": {
+        "source_sha256": "6f0da47cc73888be3557572ea523a52e80d8c64a131fad80e4a95943c7073bf3",
+        "sdk": "11.0.100",
+        "configuration": "Release",
+        "runtime_async": true,
+        "compilation": "nativeaot",
+        "instructions": "default",
+        "optimization": "Speed"
+      },
+      "sha256": {
+        "Jed.CSharpExperiment.pdb": "f9c9da2445dcf0e352f9547604c6e08487846fc4a1cf54b2db9aa72ca034bb90",
+        "Jed.Check": "9521a9dcade79ab7918abf64b841ac84683da6a8b19c2960a9c6c93a215aee1a",
+        "Jed.Check.dbg": "f7c8e3b381be2235e1655890c2175e3fdc0d0b6e16f5f446d55d681564b51808",
+        "build.json": "c0a40e71c1ab14bf1ef320e22d87954cc0f94fc2a60a0f47ddcc4cecfa96a3ee",
+        "source.sha256": "c158f6c5ac9ac35e778b7a6b0c8c00874267db4d4e8f47b16262355f6ab9c588"
+      }
+    }
+  },
+  "host_logs": {
+    "jed-csharp-refresh-complete-jit-host.log": {
+      "sha256": "a99c4df620ebf7ce3523116c56b15bd609f9f969dd8e7e633f49ad97ae768baf",
+      "pass_lines": 66
+    },
+    "jed-csharp-refresh-complete-jit-runtime-async-host.log": {
+      "sha256": "cc58b94ee74e5d93fcaf8bee9a9680cf185c2446a262c4b065887539543a3e76",
+      "pass_lines": 66
+    },
+    "jed-csharp-refresh-complete-aot-host-build.log": {
+      "sha256": "cec791da50a0178b70574c778fd80279f10c01509e66aca6c9fc516561237d6c",
+      "pass_lines": 66
+    },
+    "jed-csharp-refresh-complete-aot-runtime-async-host-build.log": {
+      "sha256": "a2c84f45001ce9e9edb908ac990f9bf1848d3ecc1bcd9ee1fd5a1bc81e9a55da",
+      "pass_lines": 66
+    }
+  },
+  "corpus": [
+    {
+      "variant": "aot",
+      "mode": "disk",
+      "pass": true,
+      "seconds": 70.375177473,
+      "log": "/tmp/jed-csharp-refresh-complete-aot-disk.log",
+      "selected_files": 766,
+      "passing_records": 19857,
+      "mode_exclusions": 87,
+      "passing_files": 679,
+      "log_sha256": "56b46735d2db923e94d924e4056cf04aaad37a0351d281a62ce8059641447c63"
+    },
+    {
+      "variant": "aot",
+      "mode": "encrypted",
+      "pass": true,
+      "seconds": 77.825865841,
+      "log": "/tmp/jed-csharp-refresh-complete-aot-encrypted.log",
+      "selected_files": 766,
+      "passing_records": 19822,
+      "mode_exclusions": 88,
+      "passing_files": 678,
+      "log_sha256": "33887bc0b4bfb8182ad94d216032f16bad798f07470f91e41812e395fa0cd792",
+      "transcript": "/tmp/jed-csharp-refresh-complete-aot-encrypted.tsv",
+      "transcript_sha256": "75a88653d7fc5f5acc32df26fa7cfdbfc0c5e602ba284ec1d9c6664ffb1dd5cc"
+    },
+    {
+      "variant": "aot",
+      "mode": "memory",
+      "pass": true,
+      "seconds": 63.889366579,
+      "log": "/tmp/jed-csharp-refresh-complete-aot-memory.log",
+      "selected_files": 766,
+      "passing_records": 22020,
+      "mode_exclusions": 2,
+      "passing_files": 764,
+      "log_sha256": "57142cbf9965af1d79ea38097f2de91f644dd59f2ed90141728b29b9c9661bea"
+    },
+    {
+      "variant": "aot-runtime-async",
+      "mode": "disk",
+      "pass": true,
+      "seconds": 69.008726037,
+      "log": "/tmp/jed-csharp-refresh-complete-aot-runtime-async-disk.log",
+      "selected_files": 766,
+      "passing_records": 19857,
+      "mode_exclusions": 87,
+      "passing_files": 679,
+      "log_sha256": "2a12831a9a1e77f3311e87ad03812c0e33d4f8169202174db3dcca8b58fe34e2"
+    },
+    {
+      "variant": "aot-runtime-async",
+      "mode": "encrypted",
+      "pass": true,
+      "seconds": 78.346504014,
+      "log": "/tmp/jed-csharp-refresh-complete-aot-runtime-async-encrypted.log",
+      "selected_files": 766,
+      "passing_records": 19822,
+      "mode_exclusions": 88,
+      "passing_files": 678,
+      "log_sha256": "dd6806e8e60e934ece3995c7bc4d0efbbe67b4cb2bcfe20c0c498f96951af7b2",
+      "transcript": "/tmp/jed-csharp-refresh-complete-aot-runtime-async-encrypted.tsv",
+      "transcript_sha256": "75a88653d7fc5f5acc32df26fa7cfdbfc0c5e602ba284ec1d9c6664ffb1dd5cc"
+    },
+    {
+      "variant": "aot-runtime-async",
+      "mode": "memory",
+      "pass": true,
+      "seconds": 70.00199717,
+      "log": "/tmp/jed-csharp-refresh-complete-aot-runtime-async-memory.log",
+      "selected_files": 766,
+      "passing_records": 22020,
+      "mode_exclusions": 2,
+      "passing_files": 764,
+      "log_sha256": "7c6041e66dd3d6306e2710f10b8b42ca857c06bcc9ac321c7e3d9b833f54690d"
+    },
+    {
+      "variant": "jit",
+      "mode": "disk",
+      "pass": true,
+      "seconds": 71.365608281,
+      "log": "/tmp/jed-csharp-refresh-complete-jit-disk.log",
+      "selected_files": 766,
+      "passing_records": 19857,
+      "mode_exclusions": 87,
+      "passing_files": 679,
+      "log_sha256": "9194c699735e4c36f04c81ae9d8cc45c41a90c3cbef35d8acab69cabe1adca56"
+    },
+    {
+      "variant": "jit",
+      "mode": "encrypted",
+      "pass": true,
+      "seconds": 73.442523355,
+      "log": "/tmp/jed-csharp-refresh-complete-jit-encrypted.log",
+      "selected_files": 766,
+      "passing_records": 19822,
+      "mode_exclusions": 88,
+      "passing_files": 678,
+      "log_sha256": "6e37291d545add923f69b15b4c8d81e89033705cb0a23ee7b516fae55bcd2681",
+      "transcript": "/tmp/jed-csharp-refresh-complete-jit-encrypted.tsv",
+      "transcript_sha256": "75a88653d7fc5f5acc32df26fa7cfdbfc0c5e602ba284ec1d9c6664ffb1dd5cc"
+    },
+    {
+      "variant": "jit",
+      "mode": "memory",
+      "pass": true,
+      "seconds": 60.605796882,
+      "log": "/tmp/jed-csharp-refresh-complete-jit-memory.log",
+      "selected_files": 766,
+      "passing_records": 22020,
+      "mode_exclusions": 2,
+      "passing_files": 764,
+      "log_sha256": "352701d315cd65e70bd179b9f0ea077c8fb990866e6ea98f958a3c082c1dd8c7"
+    },
+    {
+      "variant": "jit-runtime-async",
+      "mode": "disk",
+      "pass": true,
+      "seconds": 67.54310251,
+      "log": "/tmp/jed-csharp-refresh-complete-jit-runtime-async-disk.log",
+      "selected_files": 766,
+      "passing_records": 19857,
+      "mode_exclusions": 87,
+      "passing_files": 679,
+      "log_sha256": "a77dc3a840d36f8886e298e5aa62f8cff8a965df40c559d7a91e6b3f926f4629"
+    },
+    {
+      "variant": "jit-runtime-async",
+      "mode": "encrypted",
+      "pass": true,
+      "seconds": 72.847809177,
+      "log": "/tmp/jed-csharp-refresh-complete-jit-runtime-async-encrypted.log",
+      "selected_files": 766,
+      "passing_records": 19822,
+      "mode_exclusions": 88,
+      "passing_files": 678,
+      "log_sha256": "8b4af5799b213d41b7f3a009efcc94c2d53ec07fb8ddcb6a4e23b6b55d390fd9",
+      "transcript": "/tmp/jed-csharp-refresh-complete-jit-runtime-async-encrypted.tsv",
+      "transcript_sha256": "75a88653d7fc5f5acc32df26fa7cfdbfc0c5e602ba284ec1d9c6664ffb1dd5cc"
+    },
+    {
+      "variant": "jit-runtime-async",
+      "mode": "memory",
+      "pass": true,
+      "seconds": 60.632131389,
+      "log": "/tmp/jed-csharp-refresh-complete-jit-runtime-async-memory.log",
+      "selected_files": 766,
+      "passing_records": 22020,
+      "mode_exclusions": 2,
+      "passing_files": 764,
+      "log_sha256": "b6864cc80b88e8d00eeda00a05aa01a660c7ac18c64b6415375c8f38b175d436"
+    }
+  ],
+  "stress": {
+    "baseline": "6b2355d98a7fd3738c60474779d1d63548f350dc",
+    "profiles": {
+      "balance_transfer.stress.toml": "474d387221395587874f488b5de52e9cac2d6001f93d64ad56834a9b5abb67d8"
+    },
+    "csharp_artifacts": {
+      "BouncyCastle.Cryptography.dll": "ef92fc661e8d7ba8ec4d39a7cdfcdba41f14cb327f0d24fe79d0b5bb428899b5",
+      "Jed.CSharpExperiment.dll": "19d193972062ef8d4af6523b8f38cc03f5460392acc40122266ed1c8eae4e87e",
+      "Jed.CSharpExperiment.pdb": "cf7dfa152f7759c4edf4ed24b8a4847c9a05b49bdeddce5ba3e61f55bb35f952",
+      "Jed.Check": "249c10d0b1960b61e52091650d52e1009a3977ab07fb135995199317c579b641",
+      "Jed.Check.deps.json": "203fc9a5e456ea866d125285f8d44fb55551ade67bb601392ed0d24a7f8286b4",
+      "Jed.Check.dll": "feed6eab4213232ea13bab17f8dff14e77e9b7331021ab6cc5a69a519a53770b",
+      "Jed.Check.pdb": "08a126f47a3a954595e789e0e2c0d917cf2718f1d5ab29f796d616aad20c8f02",
+      "Jed.Check.runtimeconfig.json": "8c019e2c7c9acc0440d8b263897f7b0079b1c6895307921604be20e732900366",
+      "build.json": "4786fad097dc4df32994ebd2e59865457b474725e0e4bfad3f90aeec1b7c0cd3",
+      "source.sha256": "c158f6c5ac9ac35e778b7a6b0c8c00874267db4d4e8f47b16262355f6ab9c588"
+    },
+    "go_actor": "a33cd0f46f8cffef47fd95aa0e949cb7766d65ee004d47835ad7e7733c225093",
+    "results": [
+      {
+        "schema": 1,
+        "name": "balance-transfer-sum-invariant",
+        "lang": "csharp-native",
+        "storage": "memory",
+        "mode": "threaded",
+        "status": "pass",
+        "invariant_checks": 4000,
+        "writers": 4,
+        "writer_iters": 1000,
+        "final_ok": true,
+        "checksum": "f3e75496a3111181",
+        "cross_core_checksum": true,
+        "duration_ms": 766
+      },
+      {
+        "schema": 1,
+        "name": "balance-transfer-sum-invariant",
+        "lang": "csharp-native",
+        "storage": "disk",
+        "mode": "threaded",
+        "status": "pass",
+        "invariant_checks": 4000,
+        "writers": 4,
+        "writer_iters": 1000,
+        "final_ok": true,
+        "checksum": "f3e75496a3111181",
+        "cross_core_checksum": true,
+        "duration_ms": 856
+      },
+      {
+        "schema": 1,
+        "name": "balance-transfer-sum-invariant",
+        "lang": "csharp-native",
+        "storage": "encrypted",
+        "mode": "threaded",
+        "status": "pass",
+        "invariant_checks": 4000,
+        "writers": 4,
+        "writer_iters": 1000,
+        "final_ok": true,
+        "checksum": "f3e75496a3111181",
+        "cross_core_checksum": true,
+        "duration_ms": 1035
+      },
+      {
+        "schema": 1,
+        "name": "balance-transfer-sum-invariant",
+        "lang": "go",
+        "mode": "threaded",
+        "status": "pass",
+        "invariant_checks": 4000,
+        "writers": 4,
+        "writer_iters": 1000,
+        "final_ok": true,
+        "checksum": "f3e75496a3111181",
+        "cross_core_checksum": true,
+        "duration_ms": 53
+      }
+    ],
+    "failures": []
+  },
+  "encrypted_peer": {
+    "passing_files": 678,
+    "events": 2778,
+    "mismatches": 0,
+    "log": "/tmp/jed-csharp-refresh-complete-peer.log",
+    "log_sha256": "b5728b8dea15b72eaa88c88a2ffbbcb5e5bc54f8e7aa90898cea98701d6c19a5"
+  },
+  "spec_checks": {
+    "verify": {
+      "pass": true,
+      "log": "/tmp/jed-csharp-refresh-complete-verify.log",
+      "sha256": "e9e07cba47fb58bb51a0c7d8c9da0af99af5054e59d44b842a6188a04ed50ef6"
+    },
+    "codegen": {
+      "pass": true,
+      "log": "/tmp/jed-csharp-refresh-complete-codegen.log",
+      "sha256": "f751fee4e9ef0659f985be1b11b4171504b2ffc62257cae6a577242661ab41e6"
+    }
+  },
+  "shared_regression_oracle": {
+    "log": "/tmp/jed-csharp-refresh-aggregateexpr-oracle.log",
+    "sha256": "dca544cb25c6802a92ebffa56d10f753601334d017cb36b69169cc207ac4333d",
+    "regenerated": "byte-identical",
+    "expected_warnings": "resource-limit and error-precedence PostgreSQL divergences"
+  },
+  "numeric_coercion_regression": {
+    "file": "spec/conformance/suites/expr/numeric_resolver_coercion.test",
+    "records": 12,
+    "sha256": "160b629544d4d1ed4439165d059a9c91e2ffb8f62b81a30b75c99e4ba0dd3473",
+    "oracle": {
+      "log": "/tmp/jed-csharp-baseline6b-oracle.log",
+      "sha256": "4924fe94398aeccbed4cf91a7abf1eb101345ccb7975afb1fc156d149a9156f6",
+      "regenerated": "byte-identical",
+      "overrides": "Two canonical NULL overload result widths versus PostgreSQL 42725 ambiguity",
+      "overrides_file_sha256": "ce03d76a6472430b9cdeaba07dbbb08aa6b8573e01364a3369e8c754caa4564f"
+    },
+    "preliminary_logs": {
+      "go": {
+        "log": "/tmp/jed-csharp-baseline6b-resolver-go.log",
+        "sha256": "511add4932e45a562c4cee4914a1b1773d814f10724d2cb8f3833aa3885ef4d5"
+      },
+      "rust": {
+        "log": "/tmp/jed-csharp-baseline6b-resolver-rust.log",
+        "sha256": "e43ddad8747fb9fd656fe117294e03cf0579f66f9e772c6455cfb29869ff4c73"
+      },
+      "ts": {
+        "log": "/tmp/jed-csharp-baseline6b-resolver-ts.log",
+        "sha256": "3048414ea4020ef69643c696468b96296439599adc6d38a95f607259057131df"
+      },
+      "csharp": {
+        "log": "/tmp/jed-csharp-baseline6b-resolver-csharp.log",
+        "sha256": "8b15af422413934f65e28871c9260dbb7f1636d6ae8e5b71c19800329762ac63"
+      },
+      "csharp-encrypted": {
+        "log": "/tmp/jed-csharp-baseline6b-resolver-csharp-encrypted.log",
+        "sha256": "ec38b7f579aec3f859dc109537c77821ff65e8497280046bcc3c951cf3cd287f"
+      },
+      "peer": {
+        "log": "/tmp/jed-csharp-baseline6b-resolver-peer.log",
+        "sha256": "fe8be0db6efc692947fc890d3ee332ab6d545c43b6ba5fbf0a87d26cb4073c3e"
+      },
+      "before20": {
+        "log": "/tmp/jed-csharp-baseline6b-resolver-before20.log",
+        "sha256": "4b4802daf3c3dd8bdbe6554d3c1772c614b58d53d7a012240633084794c1ff27"
+      }
+    },
+    "final_csharp": "Included in every final full inventory; final encrypted peer comparison includes both cost events."
+  },
+  "corpus_coverage": {
+    "aot": {
+      "distinct_passing_files": 766,
+      "sorted_paths_sha256": "c0ad2ceaec8e30f85d3d4cdacf3c971611820ba039bcbe6d27d0c57e2869f267"
+    },
+    "aot-runtime-async": {
+      "distinct_passing_files": 766,
+      "sorted_paths_sha256": "c0ad2ceaec8e30f85d3d4cdacf3c971611820ba039bcbe6d27d0c57e2869f267"
+    },
+    "jit": {
+      "distinct_passing_files": 766,
+      "sorted_paths_sha256": "c0ad2ceaec8e30f85d3d4cdacf3c971611820ba039bcbe6d27d0c57e2869f267"
+    },
+    "jit-runtime-async": {
+      "distinct_passing_files": 766,
+      "sorted_paths_sha256": "c0ad2ceaec8e30f85d3d4cdacf3c971611820ba039bcbe6d27d0c57e2869f267"
+    }
+  },
+  "post_rebase": {
+    "base_revision": "6b2355d98a7fd3738c60474779d1d63548f350dc",
+    "source_sha256": "6f0da47cc73888be3557572ea523a52e80d8c64a131fad80e4a95943c7073bf3",
+    "source_inputs_unchanged": 451,
+    "checks": {
+      "verify": {
+        "pass": true,
+        "log": "/tmp/jed-csharp-refresh-post-rebase-verify.log",
+        "sha256": "e9e07cba47fb58bb51a0c7d8c9da0af99af5054e59d44b842a6188a04ed50ef6"
+      },
+      "codegen": {
+        "pass": true,
+        "log": "/tmp/jed-csharp-refresh-post-rebase-codegen.log",
+        "sha256": "f751fee4e9ef0659f985be1b11b4171504b2ffc62257cae6a577242661ab41e6"
+      }
+    }
+  }
+}

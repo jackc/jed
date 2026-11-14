@@ -17,7 +17,7 @@ internal static class SpillDistinct
             var values = new SqlValue[plan.Projections.Length];
             for (var i = 0; i < values.Length; i++) values[i] = await Evaluate.ExprAsync(plan.Projections[i].Expression, meter, row: row).ConfigureAwait(false);
             foreach (var value in values) GroupExecution.ChargeKey(value, meter);
-            var key = Convert.FromHexString(GroupExecution.Identity(values));
+            var key = GroupExecution.EncodedIdentity(values);
             if (await seen.Get(key, token).ConfigureAwait(false) is not null) return null;
             await seen.Put(key, [], MemorySize.EntryBytes(values), token).ConfigureAwait(false);
             return values;

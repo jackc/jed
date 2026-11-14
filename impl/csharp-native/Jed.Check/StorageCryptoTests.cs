@@ -21,9 +21,10 @@ internal static class StorageCryptoTests
             _ = recovered.Codec.OpenBody(recovered.Meta.Header.Root, rootPage, recovered.Meta.RootTag);
             var pager = new StoragePager(store, rootPage.Length, cacheBytes: rootPage.Length * 2, codec: recovered.Codec);
             var catalog = await Catalog.ReadAsync(pager, recovered.Meta);
+            catalog = await StorageTree.ValidateCatalogSpinesAsync(pager, catalog, recovered.Meta.Header, default);
             foreach (var table in catalog.Tables)
             {
-                var tree = new StorageTree(pager, table.LeafSchema(), table.Root, recovered.Meta.Header.PageCount, table.RootTag);
+                var tree = new StorageTree(pager, table.LeafSchema(), table.Root, recovered.Meta.Header.PageCount, table.RootTag, table.Shape);
                 long rows = 0; await foreach (var row in tree.ScanAsync()) { _ = row.Key; rows++; }
                 Corpus.Equal(table.RowCount, rows, "authenticated encrypted tree row count");
             }
@@ -65,8 +66,9 @@ internal static class StorageCryptoTests
         using var recovered = await StorageCryptoRecovery.OpenAsync(store, credential, RandomNumberGenerator.GetBytes);
         var pager = new StoragePager(store, recovered.Meta.Header.PageSize, codec: recovered.Codec);
         var catalog = await Catalog.ReadAsync(pager, recovered.Meta);
+            catalog = await StorageTree.ValidateCatalogSpinesAsync(pager, catalog, recovered.Meta.Header, default);
         var table = catalog.Tables.Single(table => table.Name == "crypto_check");
-        var tree = new StorageTree(pager, table.LeafSchema(), table.Root, recovered.Meta.Header.PageCount, table.RootTag);
+        var tree = new StorageTree(pager, table.LeafSchema(), table.Root, recovered.Meta.Header.PageCount, table.RootTag, table.Shape);
         var rows = new List<StorageRecord>(); await foreach (var row in tree.ScanAsync()) rows.Add(row);
         Corpus.Equal(160, rows.Count, "encrypted split tree survives independent recovery");
         Corpus.Equal("1113", table.DecodeRow(rows[^1])[1].ToString(), "encrypted stored value survives recovery");
@@ -102,7 +104,7 @@ internal static class StorageCryptoTests
         Corpus.Equal<StorageKeyBlock?>(null, StorageKeyBlock.TryParse(hostile), "KDF bounds reject before derivation");
 
         var files = Directory.GetFiles(Path.Combine(root, "spec/fileformat/fixtures"), "encrypted_*.jed").Order(StringComparer.Ordinal).ToArray();
-        Corpus.Equal(6, files.Length, "frozen encrypted golden inventory");
+        Corpus.Equal(7, files.Length, "frozen encrypted golden inventory");
         var opened = 0;
         foreach (var path in files)
         {

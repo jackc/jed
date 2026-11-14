@@ -1,4 +1,4 @@
-// Generated data from b1a6affca7725e0b07a4f734eddb1c569ef76bcf.
+// Generated data from 6b2355d98a7fd3738c60474779d1d63548f350dc.
 // Regenerate only with mise run csharp-native:codegen.
 namespace Jed;
 

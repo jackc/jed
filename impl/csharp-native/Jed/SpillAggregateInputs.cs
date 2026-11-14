@@ -1,3 +1,5 @@
+using System.Buffers.Binary;
+
 namespace Jed;
 
 // A fixed number of keyed scratch directories serves every group and aggregate;
@@ -6,10 +8,16 @@ internal sealed class SpillAggregateInputs(SpillPolicy policy, Meter meter) : IA
 {
     private readonly SpillKeyState inputs = new(policy.Host, policy.WorkMem, meter);
     private readonly SpillKeyState membership = new(policy.Host, policy.WorkMem, meter);
-    private static byte[] Key(byte kind, long group, int aggregate, int phase, long ordinal = 0, byte[]? suffix = null)
+    internal static byte[] Key(byte kind, long group, int aggregate, int phase, long ordinal = 0, byte[]? suffix = null)
     {
-        var writer = new WireWriter(); writer.Byte(kind); writer.U64((ulong)group); writer.U32((uint)aggregate); writer.U32((uint)phase); writer.U64((ulong)ordinal);
-        if (suffix is not null) writer.Bytes(suffix); return writer.ToArray();
+        var key = new byte[checked(25 + (suffix?.Length ?? 0))];
+        key[0] = kind;
+        BinaryPrimitives.WriteUInt64BigEndian(key.AsSpan(1), (ulong)group);
+        BinaryPrimitives.WriteUInt32BigEndian(key.AsSpan(9), (uint)aggregate);
+        BinaryPrimitives.WriteUInt32BigEndian(key.AsSpan(13), (uint)phase);
+        BinaryPrimitives.WriteUInt64BigEndian(key.AsSpan(17), (ulong)ordinal);
+        suffix?.CopyTo(key, 25);
+        return key;
     }
     private async ValueTask Append(long group, int aggregate, int phase, SpillFold fold, SqlValue[] values, long bytes, CancellationToken token)
     {
@@ -24,8 +32,8 @@ internal sealed class SpillAggregateInputs(SpillPolicy policy, Meter meter) : IA
     internal async ValueTask<bool> Distinct(long group, int aggregate, SqlValue value, SqlValue[] extra, AggregatePlan plan, CancellationToken token)
     {
         if (value.IsNull && plan.Name != "array_agg" && !AggregateJson.IsJson(plan.Name)) return false;
-        var identity = Key(1, group, aggregate, 0, suffix: Convert.FromHexString(GroupExecution.Identity(new[] { value }.Concat(extra).ToArray())));
-        if (await membership.Get(identity, token).ConfigureAwait(false) is not null) return false;
+        var identity = Key(1, group, aggregate, 0, suffix: GroupExecution.EncodedIdentity(value, extra));
+        if (await membership.Contains(identity, token).ConfigureAwait(false)) return false;
         var bytes = !value.IsNull || plan.Name == "array_agg" || AggregateJson.IsJson(plan.Name) ? MemorySize.EntryBytes([SqlValue.Integer(group), SqlValue.Integer(aggregate), value]) : 0;
         await membership.Put(identity, [], bytes, token).ConfigureAwait(false); return true;
     }
@@ -94,7 +102,7 @@ internal sealed class SpillAggregateInputs(SpillPolicy policy, Meter meter) : IA
             if (plan.Name.Contains("_unique", StringComparison.Ordinal))
             {
                 var identity = Key(2, group, aggregate, phase, suffix: TextEncoding.Utf8.GetBytes(key));
-                if (await membership.Get(identity, token).ConfigureAwait(false) is not null) throw new SqlException("22030", "duplicate JSON object key value");
+                if (await membership.Contains(identity, token).ConfigureAwait(false)) throw new SqlException("22030", "duplicate JSON object key value");
                 await membership.Put(identity, [], MemorySize.EntryBytes([SqlValue.Integer(group), SqlValue.Integer(aggregate), SqlValue.Text(key)]), token).ConfigureAwait(false);
             }
             if (strict && image.IsNull) return;
@@ -186,8 +194,8 @@ internal sealed class SpillAggregateInputs(SpillPolicy policy, Meter meter) : IA
                 before++;
                 if (plan.Name == "dense_rank")
                 {
-                    var identity = Key(3, group, aggregate, 0, suffix: Convert.FromHexString(GroupExecution.Identity(item.Take(width).ToArray())));
-                    if (await membership.Get(identity, token).ConfigureAwait(false) is null)
+                    var identity = Key(3, group, aggregate, 0, suffix: GroupExecution.EncodedIdentity(item.Take(width).ToArray()));
+                    if (!await membership.Contains(identity, token).ConfigureAwait(false))
                     { await membership.Put(identity, [], MemorySize.EntryBytes(item.Take(width).ToArray()), token).ConfigureAwait(false); distinct++; }
                 }
             }

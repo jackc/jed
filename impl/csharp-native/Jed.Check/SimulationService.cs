@@ -151,7 +151,10 @@ internal sealed partial class SimulationRunner
         }
         if (roles.DatabaseOf("sim.jed") is { } owner)
         {
-            var state = owner.CommittedStorageForTesting();
+            // The owner can be poisoned after acknowledging a client commit.
+            // Observe its published generation without reopening a public read;
+            // the mandatory fault recovery checks that generation's bytes.
+            var state = owner.PublishedStateForTesting().Storage;
             var next = state.Meta.TransactionId;
             if (next > version)
             {
@@ -166,7 +169,7 @@ internal sealed partial class SimulationRunner
         foreach (var attachment in attached.Values)
         {
             if (roles.DatabaseOf(attachment.File) is not { } attachedOwner) continue;
-            var state = attachedOwner.CommittedStorageForTesting(); var next = state.Meta.TransactionId;
+            var state = attachedOwner.PublishedStateForTesting().Storage; var next = state.Meta.TransactionId;
             if (next <= attachment.Version) continue;
             var contents = await AttachmentDigest(attachment);
             SimulationStorageChecks.Require(attachment.History[attachment.Version].Contains(contents), "attachment maintenance changed committed contents");

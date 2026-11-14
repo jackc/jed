@@ -74,6 +74,11 @@ internal sealed class PageClientConnection : IAsyncDisposable
                 throw PageWire.Invalid("invalid negotiated page-service limits");
             return new(stream, reply);
         }
+        catch (Exception error) when (error is IOException or SocketException)
+        {
+            await stream.DisposeAsync().ConfigureAwait(false);
+            throw new SqlException(SqlStates.ConnectionFailure, "page-service connection lost: " + error.Message);
+        }
         catch { await stream.DisposeAsync().ConfigureAwait(false); throw; }
     }
     internal static PageWireMessage Message(byte code, uint requestId, params (string Name, object Value)[] fields) =>

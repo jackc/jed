@@ -79,45 +79,45 @@ internal static class StorageCryptoRecovery
     {
         var dependencies = new HashSet<uint>(); var pages = new List<StorageManifestPage>();
         var body = new byte[meta.PageSize]; uint previous = 3, seen = 0;
-        var rootSeen = false; var freeSeen = meta.FreeListHead == 0;
+        var freeSeen = meta.FreeListHead == 0;
         bool Pointer(uint id) => id >= 4 && id < meta.PageCount;
         async ValueTask<bool> Entries(ReadOnlyMemory<byte> bytes, uint count)
         {
             for (var index = 0; index < count; index++)
             {
-                var entry = StorageFormat.ReadEntry(bytes.Span.Slice(index * 12, 12));
+                var entry = StorageFormat.ReadEntry(bytes.Span.Slice(index * 8, 8));
                 if (entry.Page <= previous || !Pointer(entry.Page) || !dependencies.Add(entry.Page)) return false;
-                previous = entry.Page; rootSeen |= entry.Page == meta.Root; freeSeen |= entry.Page == meta.FreeListHead;
+                previous = entry.Page; freeSeen |= entry.Page == meta.FreeListHead;
                 if (readBodies)
                 {
                     await store.ReadAsync((long)entry.Page * meta.PageSize, body, cancellationToken).ConfigureAwait(false);
-                    if (StorageFormat.Crc64(body) != entry.Digest) return false;
+                    if (StorageFormat.ManifestDigest(body, true) != entry.Digest) return false;
                 }
                 seen++;
             }
             return true;
         }
         if (!await Entries(rawMeta[96..], Math.Min(meta.ManifestEntries, (uint)StorageCryptoMeta.InlineCapacity(meta.PageSize))).ConfigureAwait(false)) return null;
-        var id = meta.ManifestHead; ulong digest = 0; var idBytes = new byte[4];
+        var id = meta.ManifestHead; uint digest = 0; var idBytes = new byte[4];
         if ((long)meta.ManifestPages * (meta.PageSize + 4L) + meta.PageSize + 10 > int.MaxValue)
             throw new SqlException(SqlStates.ProgramLimitExceeded, "encrypted manifest authentication input is too large");
         for (uint ordinal = 0; ordinal < meta.ManifestPages; ordinal++)
         {
-            if (!Pointer(id) || !dependencies.Add(id)) return null;
+            if (!Pointer(id) || id == meta.Root || id == meta.FreeListHead || !dependencies.Add(id)) return null;
             var bytes = new byte[meta.PageSize]; await store.ReadAsync((long)id * meta.PageSize, bytes, cancellationToken).ConfigureAwait(false);
             StoragePageHeader page;
             try { page = StorageFormat.ParsePage(bytes); }
             catch (SqlException error) when (error.SqlState == SqlStates.DataCorrupted) { return null; }
             var count = Math.Min(meta.ManifestEntries - seen, (uint)StorageFormat.OverflowCapacity(meta.PageSize));
-            if (page.Type != 8 || page.Count != count || BinaryPrimitives.ReadUInt64BigEndian(bytes.AsSpan(16)) != meta.TransactionId ||
+            if (page.Type != 8 || !StorageFormat.ManifestStamp(bytes, meta.TransactionId) || page.Count != count || BinaryPrimitives.ReadUInt64BigEndian(bytes.AsSpan(16)) != meta.TransactionId ||
                 BinaryPrimitives.ReadUInt32BigEndian(bytes.AsSpan(24)) != ordinal || !StorageFormat.IsZero(bytes.AsSpan(28, 4)) ||
-                !StorageFormat.IsZero(bytes.AsSpan(32 + (int)count * 12))) return null;
-            BinaryPrimitives.WriteUInt32BigEndian(idBytes, id); digest = StorageFormat.Crc64(bytes, StorageFormat.Crc64(idBytes, digest));
+                !StorageFormat.IsZero(bytes.AsSpan(32 + (int)count * 8))) return null;
+            BinaryPrimitives.WriteUInt32BigEndian(idBytes, id); digest = StorageFormat.Crc32(bytes, StorageFormat.Crc32(idBytes, digest));
             pages.Add(new(id, bytes));
             if (!await Entries(bytes.AsMemory(32), count).ConfigureAwait(false)) return null;
             id = page.Next;
         }
-        return id == 0 && seen == meta.ManifestEntries && digest == meta.ManifestDigest && (seen == 0 || rootSeen && freeSeen)
+        return id == 0 && seen == meta.ManifestEntries && digest == meta.ManifestDigest && (seen == 0 || freeSeen)
             ? new(dependencies, pages.ToArray()) : null;
     }
 

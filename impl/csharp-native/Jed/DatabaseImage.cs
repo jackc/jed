@@ -48,7 +48,7 @@ public sealed partial class Database
     {
         var source = snapshot.Pager ?? pager;
         if (source.Encrypted != (codec is not null)) throw new ArgumentException("image copy requires the same page layout");
-        var output = new StorageImageWriter(destination, snapshot.Meta.PageSize, codec);
+        var output = new StorageImageWriter(destination, snapshot.Meta.PageSize, codec, transactionId);
         var tables = new List<CatalogTable>();
         foreach (var table in snapshot.Catalog.Tables.OrderBy(item => item.Name, Utf8NameComparer.Instance))
         {

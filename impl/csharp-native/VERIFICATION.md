@@ -1,5 +1,68 @@
 # C# experiment — verification history
 
+## Refreshed experiment acceptance — 2026-11-13
+
+Semantic baseline: `6b2355d98a7fd3738c60474779d1d63548f350dc`, format **v53**.
+Final capture23 source SHA-256:
+`6f0da47cc73888be3557572ea523a52e80d8c64a131fad80e4a95943c7073bf3`.
+The [451-input manifest](verification/refresh-source.json) covers handwritten and
+generated C#, projects, dependency locks, all opt-in task scripts, baseline facts
+and configured supplements. Documentation and evidence files are outside that
+source digest. This remains an opt-in Linux x86-64/.NET 11 experiment.
+
+All four Release configurations—default/runtime-async JIT and default/runtime-async
+NativeAOT—pass their complete host suites and the following complete inventories.
+AOT uses SDK-default instructions and `OptimizationPreference=Speed`.
+Actor, dependency and log hashes, build settings and threaded results are in
+[refresh-engine.json](verification/refresh-engine.json).
+Rebasing the local change onto the named supported-core revision leaves all 451
+source inputs unchanged; repository verification and C# codegen checks pass again.
+
+| Storage mode | Selected files | Passing files | Records | Failures | Declared mode exclusions |
+|---|---:|---:|---:|---:|---:|
+| Memory | 766 | 764 | 22,020 | 0 | 2 |
+| Reopened plain file | 766 | 679 | 19,857 | 0 | 87 |
+| Reopened encrypted file | 766 | 678 | 19,822 | 0 | 88 |
+
+**All 766 distinct files pass across their applicable storage modes**; none is
+excluded everywhere. The inventory contains 764 pinned files and two additional
+shared regressions: nine aggregate-expression records and 12 numeric-coercion
+records. The scalar supplement is already pinned and counted once. Across four
+configurations these are **12 complete inventories and 246,796 passing records**.
+All four encrypted cost/EXPLAIN transcripts are byte-identical, SHA-256
+`75a88653d7fc5f5acc32df26fa7cfdbfc0c5e602ba284ec1d9c6664ffb1dd5cc`.
+Independent pinned Go matches all **678 encrypted files and 2,778 events**.
+
+The other final gates pass:
+
+- **496/496 process cases:** 31 canonical scenarios across 16 C#/Go/Rust/Node
+  pairings, including exact image/backup interchange and encrypted hosts. See
+  [process evidence](verification/refresh-process.json).
+- **16,000 threaded snapshot checks:** memory/plain/encrypted C# and independent
+  Go agree on final checksum `f3e75496a3111181`.
+- **85/85 complete fault traces:** 19 saved regressions and all 22 generated
+  profiles at seeds 1–3, without shortened trace overrides; **76 exact peer
+  comparisons and nine intrinsic checks**. See
+  [simulation evidence](verification/refresh-simulations.json).
+- **All four full host executables:** 66 passing check groups each, including
+  byte/crypto fixtures, generation/remap/reclamation safety, immutable packed
+  updates, numeric-page folding, point/range bounds and result ownership,
+  prepared-plan invalidation, deferred continuations and callback counts,
+  spill/resource schedules, meter rewind, cancellation and recovery.
+- **Shared regressions and PostgreSQL oracle:** both new files pass C#, Rust,
+  Go and TypeScript and regenerate byte-identically. The aggregate regression
+  records expected resource-limit and filter/error-order differences. Two explicit
+  oracle overrides pin canonical NULL overload widths where PostgreSQL reports
+  ambiguity. The numeric regression catches the former f32 literal-rounding
+  bug in `width_bucket` and pins planning-time errors, types, NULLs and costs.
+- **All 14 generated data catalogs** and repository **`mise run verify`** pass.
+
+[Repeated benchmarks](BENCHMARKS.md) use these same immutable actors after all
+correctness jobs stop, with every process pinned to CPU0. Historical captures
+remain separate evidence, including [capture20](verification/capture20-engine.json);
+they do not certify the refreshed source. No additional platform, production
+packaging or automatic future-maintenance commitment is implied.
+
 ## Frozen experiment verification — 2026-11-13
 
 Frozen implementation: commit

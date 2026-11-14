@@ -17,11 +17,12 @@ internal sealed record SortPlan(Resolved Expression, bool Descending, bool Nulls
     }
 }
 internal sealed record SelectPlan(Projection[] Projections, Resolved? Filter, long? Limit, long Offset, bool Empty,
-    SortPlan[]? Order = null, bool Distinct = false, GroupPlan? Group = null, bool StreamDistinct = false, bool ChargeRows = true, WindowStage? Windows = null, bool WindowPrefix = false, bool AggregateLane = false, int DistinctOnCount = 0, ExplainStages? Observation = null, AccessPlan? Access = null, bool ColumnarProjection = false, SpillPolicy? Spill = null, bool ScanReverse = false, Func<ValueTask>? BeforeZeroLimit = null, bool AccessOrdering = false)
+    SortPlan[]? Order = null, bool Distinct = false, GroupPlan? Group = null, bool StreamDistinct = false, bool ChargeRows = true, WindowStage? Windows = null, bool WindowPrefix = false, bool AggregateLane = false, int DistinctOnCount = 0, ExplainStages? Observation = null, AccessPlan? Access = null, bool ColumnarProjection = false, SpillPolicy? Spill = null, bool ScanReverse = false, Func<ValueTask>? BeforeZeroLimit = null, bool AccessOrdering = false, PackedAggregateInput? PackedAggregate = null)
 {
     // Runtime plan rewrites retain this identity; each invocation supplies its
     // own scoped read-ahead state, including nested/correlated invocations.
     internal object HostBatchIdentity { get; } = new();
+    internal PackedSelectInput? PackedSelect { get; init; }
 }
 internal sealed record BoundColumn(string Name, SqlType Type, string? Qualifier = null, bool Hidden = false, OuterBinding? Outer = null, int Level = 0, Resolved? Projection = null, object? BaseSource = null, bool PrimaryKey = false, CollationDerivation? Collation = null,
     string? RowName = null, bool NotNull = false, bool NullExtended = false, bool WholeRow = true, bool ScalarRelation = false, bool RecursiveHidden = false, bool LateralForbidden = false);

@@ -179,6 +179,12 @@ internal sealed partial class StorageTree
         for (var i = 0; i < cells.Length; i++) cells[i] = await MaterializeCellAsync(record, i, token).ConfigureAwait(false);
         return new(record.Key, cells);
     }
+    internal bool HasValueReadUnits(IReadOnlySet<int>? touched = null)
+    {
+        for (var i = 0; i < schema.Columns.Length; i++)
+            if (schema.Columns[i].Width == 0 && (touched is null || touched.Contains(i))) return true;
+        return false;
+    }
     internal long ValueReadUnits(StorageRecord record, IReadOnlySet<int>? touched = null)
         => StorageLargeValues.ReadUnits(record, schema, pager.PayloadCapacity, pager.Encrypted, touched);
     // The caller proves these columns were not assigned and are not part of the
@@ -202,16 +208,23 @@ internal sealed partial class StorageTree
     internal SqlValue[] DecodeDeferredRow(CatalogTable table, StorageRecord record)
     {
         var values = new SqlValue[record.Cells.Length];
-        for (var i = 0; i < values.Length; i++)
-        {
-            var column = i; var cell = record.Cells[i]; var spec = table.Columns[i].Type;
-            if (schema.Columns[i].Width == 0 && cell is not null)
-                values[i] = SqlValue.Deferred(spec.Type, new DeferredSqlValue(async token =>
-                    StoredValues.FromLeaf(await MaterializeCellAsync(record, column, token).ConfigureAwait(false), spec)));
-            else values[i] = cell is null ? SqlValue.Null(spec.Type) : StoredValues.FromLeaf(cell.AsMemory(), spec);
-        }
+        DecodeDeferredRowInto(table, record, values);
         return values;
     }
+    internal void DecodeDeferredRowInto(CatalogTable table, StorageRecord record, SqlValue[] values)
+    {
+        if (values.Length != record.Cells.Length) throw new ArgumentException("row destination width", nameof(values));
+        for (var i = 0; i < values.Length; i++)
+        {
+            var cell = record.Cells[i]; var spec = table.Columns[i].Type;
+            if (schema.Columns[i].Width == 0 && cell is not null)
+                values[i] = DeferredCell(record, i, spec);
+            else values[i] = cell is null ? SqlValue.Null(spec.Type) : StoredValues.FromLeaf(cell.AsMemory(), spec);
+        }
+    }
+    private SqlValue DeferredCell(StorageRecord record, int column, TypeSpec spec) =>
+        SqlValue.Deferred(spec.Type, new DeferredSqlValue(async token =>
+            StoredValues.FromLeaf(await MaterializeCellAsync(record, column, token).ConfigureAwait(false), spec)));
     private int FreshPageCount(StorageRecord record) => record.FreshChains is null ? 0 : checked((int)record.FreshChains.Sum(payload =>
         payload is null ? 0L : StorageLargeValues.Slabs(payload.Length, pager.PayloadCapacity - (pager.Encrypted ? 16 : 0))));
     private async ValueTask RetireResidentChains(Ref reference, HashSet<uint> dead, CancellationToken token)

@@ -10,6 +10,7 @@ internal sealed record StorageCommitPlan(StorageRecovered Before, StorageMeta Me
     internal StorageEncryptedMeta? Encrypted { get; init; }
     internal uint? LastReclamationLive { get; init; }
     internal ulong? ReclamationTransactionId { get; init; }
+    internal HashSet<uint> HeldOrphans { get; init; } = [];
     internal long? DeadlineMicroseconds { get; init; }
 }
 
@@ -23,15 +24,18 @@ internal sealed class StorageAllocation
     private readonly SortedSet<uint> safe;
     private readonly SortedSet<uint> remaining;
     private readonly SortedDictionary<uint, byte[]> body = [];
+    private readonly Dictionary<uint, byte[]>? tags;
     private uint high;
     private readonly StoragePageCodec? codec;
     private readonly bool eagerReclaim;
+    private readonly HashSet<uint> held = [];
     private uint? lastReclamationLive;
     private ulong freeGeneration;
 
     internal StorageAllocation(StorageRecovered before, IReadOnlySet<uint>? reuseGrant = null, StoragePageCodec? codec = null, bool eagerReclaim = true)
     {
         this.before = before; this.codec = codec; this.eagerReclaim = eagerReclaim; lastReclamationLive = before.ReclamationLive; freeGeneration = before.FreeGeneration;
+        tags = codec is null ? null : [];
         if ((before.Encrypted is not null) != (codec is not null)) throw new ArgumentException("storage codec differs from recovered variant");
         remaining = new(before.FreePages);
         safe = new(before.FreePages.Where(id => reuseGrant is null || reuseGrant.Contains(id)));
@@ -46,8 +50,9 @@ internal sealed class StorageAllocation
         // this commit: the current recovery candidate still depends on them.
         if (eagerReclaim)
         {
-            remaining.UnionWith(before.FreeListPages);
-            remaining.UnionWith(before.ManifestPages);
+            foreach (var page in before.FreeListPages) Retire(page);
+            if (before.IncrementalKnown) foreach (var page in before.ManifestPages) Retire(page);
+            foreach (var page in before.HeldOrphans) Retire(page);
         }
         if (before.Batch is { } pendingBatch) remaining.ExceptWith(pendingBatch.Pending.Select(entry => entry.Page));
         high = before.Meta.PageCount;
@@ -59,7 +64,7 @@ internal sealed class StorageAllocation
         var header = StorageFormat.ParsePage(page);
         if (header.Type is 7 or 8) throw new ArgumentException("allocator owns free-list and manifest pages");
         var id = ReservePage();
-        body[id] = codec is null ? page.ToArray() : codec.SealBody(id, page);
+        body[id] = SealBody(id, page);
         return id;
     }
 
@@ -73,19 +78,43 @@ internal sealed class StorageAllocation
         if (!body.ContainsKey(id) || page.Length != before.Meta.PageSize) throw new ArgumentException("page was not reserved or has wrong size");
         var header = StorageFormat.ParsePage(page);
         if (header.Type is 7 or 8) throw new ArgumentException("allocator owns free-list and manifest pages");
-        body[id] = codec is null ? page.ToArray() : codec.SealBody(id, page);
+        body[id] = SealBody(id, page);
     }
 
+    private byte[] SealBody(uint id, ReadOnlySpan<byte> page)
+    {
+        var stamped = page.ToArray(); StorageFormat.Stamp(stamped, checked(before.Meta.TransactionId + 1));
+        if (codec is null) return stamped;
+        var stored = codec.SealBody(id, stamped);
+        // Committed shapes retain tags after these commit buffers are released.
+        // A slice would retain the entire ciphertext page outside the pager.
+        tags![id] = stored.AsSpan(PageSize - 16, 16).ToArray();
+        return stored;
+    }
+    internal StorageDeferral? Deferral { get; set; }
+    internal bool RequireBodyWrite { get; init; }
+    internal int WrittenPages => body.Count;
     internal int PageSize => before.Meta.PageSize;
     internal bool Encrypted => codec is not null;
     internal int PayloadCapacity => PageSize - 16 - (Encrypted ? StoragePageCodec.Reserve : 0);
-    internal ReadOnlyMemory<byte> Tag(uint page) => !Encrypted ? default : page == 0 ? new byte[16] : body[page].AsMemory(PageSize - 16, 16);
+    internal ReadOnlyMemory<byte> Tag(uint page) => !Encrypted ? default : page == 0 ? new byte[16] : tags!.TryGetValue(page, out var tag) ? tag : page == before.Meta.Root ? before.Encrypted!.RootTag : throw new InvalidOperationException("unknown retained page tag");
 
     internal void Reclaim(uint id)
     {
         if (id < (Encrypted ? 4 : 2) || id >= before.Meta.PageCount || body.ContainsKey(id))
             throw new ArgumentException("invalid reclaimed page");
-        if (eagerReclaim && !Pending(id)) remaining.Add(id);
+        if (eagerReclaim) Retire(id);
+    }
+
+    internal void ReclaimWholesale(uint id)
+    {
+        if (before.IncrementalKnown) Reclaim(id);
+    }
+
+    private void Retire(uint id)
+    {
+        if (Pending(id)) held.Add(id);
+        else remaining.Add(id);
     }
 
     internal uint PageCount => high;
@@ -109,11 +138,11 @@ internal sealed class StorageAllocation
 
     internal StorageCommitPlan PrepareMemory(uint root, uint livePages)
     {
-        if (body.Count == 0 || !body.ContainsKey(root) || body.Values.Any(page => page.Length != PageSize))
+        if (body.Values.Any(page => page.Length != PageSize))
             throw new ArgumentException("incomplete memory commit pages");
         // Memory domains retain the free identities in the handle. They do not
         // reserve physical pages for durable free-list or manifest chains.
-        var meta = new StorageMeta(PageSize, checked(before.Meta.TransactionId + 1), root, high, 0, livePages);
+        var meta = new StorageMeta(PageSize, checked(before.Meta.TransactionId + 1), root, high, 0, livePages) { Remap = Deferral?.Entries ?? [] };
         StorageEncryptedMeta? encrypted = null; byte[] bytes;
         if (codec is null) bytes = StorageFormat.EncodeMeta(meta);
         else
@@ -122,12 +151,11 @@ internal sealed class StorageAllocation
             bytes = codec.SealMeta((uint)(1 - before.FloorSlot), StorageCryptoMeta.Encode(meta, encrypted.RootTag, encrypted.FreeListTag, []), []);
         }
         return new(before, meta, body.Select(page => new StorageWrite(page.Key, page.Value)).ToArray(), [], bytes,
-            new(remaining), [], new(body.Keys)) { Encrypted = encrypted, LastReclamationLive = lastReclamationLive, ReclamationTransactionId = freeGeneration };
+            new(remaining), [], new(body.Keys)) { Encrypted = encrypted, LastReclamationLive = lastReclamationLive, ReclamationTransactionId = freeGeneration, HeldOrphans = new(held) };
     }
 
     internal StorageCommitPlan Prepare(uint root, uint livePages, bool truncate = false)
     {
-        if (body.Count == 0 || !body.ContainsKey(root)) throw new ArgumentException("changed domain must write its catalog root");
         if (body.Values.Any(page => page.Length == 0)) throw new ArgumentException("reserved page has not been encoded");
         if (truncate && before.Batch is null)
             while (high > (Encrypted ? 4U : 2U) && safe.Remove(high - 1)) { remaining.Remove(--high); }
@@ -167,6 +195,7 @@ internal sealed class StorageAllocation
                 if (Encrypted) nextTag.CopyTo(payload, 0);
                 for (var j = 0; j < count; j++) BinaryPrimitives.WriteUInt32BigEndian(payload.AsSpan(contentOffset + j * 4), persisted[from + j]);
                 var encoded = StorageFormat.EncodePage(size, new(7, 0, (uint)count, i + 1 < freeIds.Count ? freeIds[i + 1] : 0), payload);
+                StorageFormat.Stamp(encoded, txid);
                 if (codec is not null) { encoded = codec.SealBody(freeIds[i], encoded); nextTag = encoded.AsSpan(size - 16).ToArray(); }
                 pages.Add(new(freeIds[i], encoded));
             }
@@ -174,29 +203,30 @@ internal sealed class StorageAllocation
             // Encrypted attempts consume their seals even when this plan is
             // discarded, preserving the specified nonce stream across retries.
             if (required > reserved) { reserved = required; continue; }
-            var entries = pages.Select(page => new StorageManifestEntry(page.Page, StorageFormat.Crc64(page.Bytes)))
+            var entries = pages.Select(page => new StorageManifestEntry(page.Page, StorageFormat.ManifestDigest(page.Bytes, Encrypted)))
                 .Concat(before.Batch?.Pending ?? []).OrderBy(entry => entry.Page).ToArray();
             if (entries.Select(entry => entry.Page).Distinct().Count() != entries.Length)
                 throw new InvalidOperationException("pending body page was rewritten within a relaxed batch");
             var overflow = new StorageWrite[reserved];
             var consumed = Math.Min(entries.Length, inlineCapacity);
-            ulong chainDigest = 0;
+            uint chainDigest = 0;
             var idBytes = new byte[4];
             for (var i = 0; i < reserved; i++)
             {
                 var count = Math.Min(StorageFormat.OverflowCapacity(size), entries.Length - consumed);
-                var payload = new byte[16 + count * 12];
+                var payload = new byte[16 + count * 8];
                 BinaryPrimitives.WriteUInt64BigEndian(payload, txid);
                 BinaryPrimitives.WriteUInt32BigEndian(payload.AsSpan(8), (uint)i);
-                for (var j = 0; j < count; j++) StorageFormat.PutEntry(payload.AsSpan(16 + j * 12), entries[consumed + j]);
+                for (var j = 0; j < count; j++) StorageFormat.PutEntry(payload.AsSpan(16 + j * 8), entries[consumed + j]);
                 var bytes = StorageFormat.EncodePage(size, new(8, 0, (uint)count, i + 1 < reserved ? manifests[i + 1] : 0), payload);
+                StorageFormat.Stamp(bytes, txid);
                 overflow[i] = new(manifests[i], bytes);
                 BinaryPrimitives.WriteUInt32BigEndian(idBytes, manifests[i]);
-                chainDigest = StorageFormat.Crc64(bytes, StorageFormat.Crc64(idBytes, chainDigest));
+                chainDigest = StorageFormat.Crc32(bytes, StorageFormat.Crc32(idBytes, chainDigest));
                 consumed += count;
             }
             var meta = new StorageMeta(size, txid, root, next, freeIds.Count > 0 ? freeIds[0] : 0, livePages,
-                reserved > 0 ? manifests[0] : 0, (uint)entries.Length, (uint)reserved, chainDigest);
+                reserved > 0 ? manifests[0] : 0, (uint)entries.Length, (uint)reserved, chainDigest) { Remap = Deferral?.Entries ?? [] };
             StorageEncryptedMeta? encryptedMeta = null;
             byte[] metaBytes;
             if (codec is null) metaBytes = StorageFormat.EncodeMeta(meta, entries.AsSpan(0, Math.Min(entries.Length, inlineCapacity)));
@@ -209,7 +239,7 @@ internal sealed class StorageAllocation
             var dependencies = new HashSet<uint>(entries.Select(entry => entry.Page));
             dependencies.UnionWith(manifests);
             if (persist.Overlaps(dependencies)) throw new InvalidOperationException("free list overlaps commit dependencies");
-            return new(before, meta, pages.OrderBy(page => page.Page).ToArray(), overflow, metaBytes, persist, new(freeIds), dependencies) { Encrypted = encryptedMeta, LastReclamationLive = lastReclamationLive, ReclamationTransactionId = freeGeneration };
+            return new(before, meta, pages.OrderBy(page => page.Page).ToArray(), overflow, metaBytes, persist, new(freeIds), dependencies) { Encrypted = encryptedMeta, LastReclamationLive = lastReclamationLive, ReclamationTransactionId = freeGeneration, HeldOrphans = new(held) };
         }
     }
 
@@ -282,7 +312,7 @@ internal sealed partial class StorageCommitter
     {
         Current = new(plan.Meta, 1 - plan.Before.FloorSlot, 1 - plan.Before.FloorSlot,
             plan.ProtectedPages, plan.FreePages, plan.FreeListPages)
-        { ManifestPages = plan.Manifest.Select(page => page.Page).ToHashSet(), Encrypted = plan.Encrypted, LastReclamationLive = plan.LastReclamationLive, ReclamationTransactionId = plan.ReclamationTransactionId };
+        { ManifestPages = plan.Manifest.Select(page => page.Page).ToHashSet(), Encrypted = plan.Encrypted, LastReclamationLive = plan.LastReclamationLive, ReclamationTransactionId = plan.ReclamationTransactionId, HeldOrphans = plan.HeldOrphans };
         stabilize = false; directoryPending = false;
     }
 
@@ -317,7 +347,7 @@ internal sealed partial class StorageCommitter
                 var slot = 1 - Current.FloorSlot;
                 await pager.Store.WriteAsync((long)slot * pager.PageSize, plan.MetaBytes, cancellationToken).ConfigureAwait(false);
                 if (synchronous) await pager.Store.SyncAsync(cancellationToken).ConfigureAwait(false);
-                var pending = plan.Body.Select(write => new StorageManifestEntry(write.Page, StorageFormat.Crc64(write.Bytes)))
+                var pending = plan.Body.Select(write => new StorageManifestEntry(write.Page, StorageFormat.ManifestDigest(write.Bytes, pager.Encrypted)))
                     .Concat(plan.Before.Batch?.Pending ?? []).OrderBy(entry => entry.Page).ToArray();
                 var shrink = shrinkDeferred || plan.Meta.PageCount < plan.Before.Meta.PageCount || plan.Before.Batch?.ShrinkAfterFlush == true;
                 var batch = synchronous ? null : new StorageBatch(
@@ -327,7 +357,7 @@ internal sealed partial class StorageCommitter
                 Current = new(plan.Meta, slot, synchronous ? slot : plan.Before.FloorSlot, plan.ProtectedPages, plan.FreePages, plan.FreeListPages)
                 {
                     ManifestPages = plan.Manifest.Select(page => page.Page).ToHashSet(), Encrypted = plan.Encrypted,
-                    LastReclamationLive = plan.LastReclamationLive, ReclamationTransactionId = plan.ReclamationTransactionId,
+                    LastReclamationLive = plan.LastReclamationLive, ReclamationTransactionId = plan.ReclamationTransactionId, HeldOrphans = plan.HeldOrphans,
                     Batch = batch
                 };
                 if (synchronous && shrink) { await ShrinkAsync(plan.Meta.PageCount).ConfigureAwait(false); shrinkDeferred = false; }

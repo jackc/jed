@@ -39,7 +39,7 @@ internal sealed class PageCommitValidator
         {
             for (var i = 0; i < count; i++)
             {
-                var entry = StorageFormat.ReadEntry(bytes.Slice(i * 12, 12));
+                var entry = StorageFormat.ReadEntry(bytes.Slice(i * 8, 8));
                 if (entry.Page <= last || entry.Page < minimum || entry.Page >= Meta.PageCount) throw PageWire.Invalid("invalid manifest entry order or bounds");
                 if (pending.TryGetValue(entry.Page, out var prior))
                 { if (prior != entry.Digest) throw PageWire.Invalid("pending page digest differs"); }
@@ -49,25 +49,25 @@ internal sealed class PageCommitValidator
         }
         var inline = Math.Min(Meta.ManifestEntries, (uint)(encrypted ? StorageCryptoMeta.InlineCapacity(meta.Length) : StorageFormat.InlineCapacity(meta.Length)));
         Entries(meta.AsSpan(encrypted ? 96 : 64), inline);
-        var consumed = inline; var next = Meta.ManifestHead; ulong chainDigest = 0;
+        var consumed = inline; var next = Meta.ManifestHead; uint chainDigest = 0;
         var manifestIds = new HashSet<uint>(); var idBytes = new byte[4];
         foreach (var (page, ordinal) in manifest.Select((page, ordinal) => (page, ordinal)))
         {
-            if (page.Index != next || !Legal(page.Index) || !manifestIds.Add(page.Index) || page.Bytes.Length != before.PageSize)
+            if (page.Index != next || page.Index == Meta.Root || page.Index == Meta.FreeListHead || !Legal(page.Index) || !manifestIds.Add(page.Index) || page.Bytes.Length != before.PageSize)
                 throw PageWire.Invalid("invalid manifest chain identity");
             StoragePageHeader header;
             try { header = StorageFormat.ParsePage(page.Bytes); }
             catch (SqlException error) when (error.SqlState == SqlStates.DataCorrupted) { throw PageWire.Invalid("invalid manifest page"); }
             var expected = Math.Min(Meta.ManifestEntries - consumed, (uint)StorageFormat.OverflowCapacity(before.PageSize));
-            if (header.Type != 8 || header.Count != expected || BinaryPrimitives.ReadUInt64BigEndian(page.Bytes.AsSpan(16)) != transactionId ||
+            if (header.Type != 8 || !StorageFormat.ManifestStamp(page.Bytes, transactionId) || header.Count != expected || BinaryPrimitives.ReadUInt64BigEndian(page.Bytes.AsSpan(16)) != transactionId ||
                 BinaryPrimitives.ReadUInt32BigEndian(page.Bytes.AsSpan(24)) != ordinal || !StorageFormat.IsZero(page.Bytes.AsSpan(28, 4)) ||
-                !StorageFormat.IsZero(page.Bytes.AsSpan(32 + (int)expected * 12))) throw PageWire.Invalid("invalid manifest chain contents");
+                !StorageFormat.IsZero(page.Bytes.AsSpan(32 + (int)expected * 8))) throw PageWire.Invalid("invalid manifest chain contents");
             Entries(page.Bytes.AsSpan(32), expected); consumed += expected; next = header.Next;
             BinaryPrimitives.WriteUInt32BigEndian(idBytes, page.Index);
-            chainDigest = StorageFormat.Crc64(page.Bytes, StorageFormat.Crc64(idBytes, chainDigest));
+            chainDigest = StorageFormat.Crc32(page.Bytes, StorageFormat.Crc32(idBytes, chainDigest));
         }
         if (next != 0 || consumed != Meta.ManifestEntries || chainDigest != Meta.ManifestDigest ||
-            !listed.ContainsKey(Meta.Root) || (Meta.FreeListHead != 0 && !listed.ContainsKey(Meta.FreeListHead)) ||
+            (Meta.FreeListHead != 0 && !listed.ContainsKey(Meta.FreeListHead)) ||
             manifestIds.Overlaps(listed.Keys) || pending.Keys.Any(index => !listed.ContainsKey(index)))
             throw PageWire.Invalid("incomplete or overlapping commit manifest");
         if (encrypted)
@@ -89,9 +89,10 @@ internal sealed class PageCommitValidator
     {
         if (page.Length != Meta.PageSize || !listed.TryGetValue(index, out var digest) || pending.Contains(index) || received.Contains(index))
             throw PageWire.Invalid("unexpected or duplicate commit body page");
-        if (StorageFormat.Crc64(page) != digest) throw PageWire.Invalid("commit page digest differs");
+        if (StorageFormat.ManifestDigest(page, encrypted) != digest) throw PageWire.Invalid("commit page digest differs");
         if (!encrypted)
         {
+            if (!StorageFormat.ManifestStamp(page, Meta.TransactionId)) throw PageWire.Invalid("commit body stamp differs");
             try { if (StorageFormat.ParsePage(page).Type == 8) throw PageWire.Invalid("manifest sent as body page"); }
             catch (SqlException error) when (error.SqlState == SqlStates.DataCorrupted) { throw PageWire.Invalid("invalid commit body header or checksum"); }
         }

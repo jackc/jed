@@ -9,9 +9,7 @@ public sealed partial class Database
     {
         CheckRole(role);
         var before = committer.Current;
-        if (before.ReclamationLive != 0 && ((long)before.Meta.PageCount - before.FreePages.Count <= ReclamationFacts.CompactMinPages ||
-            (long)before.Meta.PageCount - before.FreePages.Count <= ReclamationFacts.CompactGrowth * before.ReclamationLive))
-            return;
+        if (!before.ReclamationDue) return;
         lock (gate)
         {
             var oldest = pins.Count == 0 ? ulong.MaxValue : pins.Keys.Min();

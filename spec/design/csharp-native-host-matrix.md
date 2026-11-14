@@ -1,5 +1,27 @@
 # C# experiment host and tool gates
 
+## Refresh gates
+
+Current target: `6b2355d98a7fd3738c60474779d1d63548f350dc`, format v53,
+Linux x86-64 and .NET SDK 11.0.100. Final correctness acceptance passes at source
+`6f0da47cc73888be3557572ea523a52e80d8c64a131fad80e4a95943c7073bf3`.
+The historical matrix below applies only to its named frozen captures.
+
+| Gate | Final refresh evidence |
+|---|---|
+| Corpus inventory | 764 pinned files plus two distinct current supplements; `--all` deduplicates spec-relative paths. Existing pinned supplements must have identical SHA-256; new configured supplements are copied into a separate pinned-spec snapshot with a hash manifest. |
+| Storage/API invariants | Capture23 full default/runtime-async JIT and NativeAOT hosts pass, including v53 storage/reclamation, packed overwrite immutability, spool ownership, native API lifetimes and aggregate attempt/error checks. |
+| Shared regression/oracle | The nine-record aggregate-expression and 12-record numeric-coercion regressions pass all cores; checkout PostgreSQL regeneration is byte-identical. Resource/error-order differences and NULL-overload width overrides are explicit. |
+| Fault simulation | Final refresh capture23 passes all 85 complete traces: 76 exact pinned-Go comparisons and nine intrinsic checks; manifests, results and log hashes are archived in verification/refresh-simulations.json. |
+| Four compilation variants | Default/runtime-async JIT and NativeAOT each pass their complete host suite and all three memory/plain/encrypted inventories: 246,796 passing records, all 766 files covered across modes. |
+| Process, stress and performance | 496/496 mixed-core process cases and 16,000 snapshot checks pass. Final source/artifact identities and repeated matched measurements are in VERIFICATION.md and BENCHMARKS.md. |
+
+[PROGRESS.md](../../impl/csharp-native/PROGRESS.md) records intermediate checks;
+[VERIFICATION.md](../../impl/csharp-native/VERIFICATION.md) records the final
+acceptance matrix. Platform and delivery exclusions are unchanged.
+
+## Historical frozen gates
+
 Baseline: `b1a6affca7725e0b07a4f734eddb1c569ef76bcf`. Initial platform:
 Linux x86-64. **Missing** means no acceptance evidence; it is never a skip waiver.
 
@@ -20,7 +42,7 @@ Linux x86-64. **Missing** means no acceptance evidence; it is never a skip waive
 | NativeAOT | Published host executes conformance; no dynamic engine code | Default and runtime-async NativeAOT pass full host plus all three SQL inventories at capture34, including final-review engine fixes |
 | Performance | JIT and AOT, cold/warm, GC/allocation, durability, matched answers, fixed peer actors | Nine workloads ×3 repeats ×4 variants pass matched-answer checks; paired latency/startup/allocation/GC results and tmpfs limits recorded in BENCHMARKS.md |
 
-The experimental baseline is complete and frozen. Engine34, source
+The original experimental baseline was completed and frozen. Engine34, source
 `7124c0e6a67e3fb3955ef6df359faaa94d8d375702b887b72cc439a851a51594`, passes
 all 12 storage/compiler SQL inventories, all four full host executables, the
 496-case mixed-core process matrix and 16,000 threaded snapshot checks. All 763

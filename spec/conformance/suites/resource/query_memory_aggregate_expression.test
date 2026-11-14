@@ -1,0 +1,61 @@
+# Expression aggregate operands take the same columnar lane as bare columns.
+# A lane attempt keeps its reservations only on success; failure restores the
+# eager path's error precedence (memory.md §5.4, cost.md §6.1).
+# skip: disk — this pins the in-memory group table account
+# requires: query.select, ddl.create_table, dml.insert, dml.insert_multi_row, query.aggregates, query.group_by, types.f64, types.f32, query.subquery_scalar, query.subquery_in, cast.operator, cast.explicit, expr.arithmetic, expr.case, error.overflow_trap, resource.query_memory
+
+statement ok
+CREATE TABLE lane_expr (id i32 PRIMARY KEY, g i32)
+
+statement ok
+INSERT INTO lane_expr VALUES (1,1),(2,0),(3,1),(4,0),(5,1),(6,0)
+
+# Two integer group keys and fixed float accumulators occupy 192 logical bytes.
+# Eager input materialization cannot fit this budget.
+# max_query_memory_bytes: 192
+query IR rowsort
+SELECT g, sum(id::f64) FROM lane_expr GROUP BY g
+----
+0
+12
+1
+9
+
+# max_query_memory_bytes: 191
+statement error 54P05
+SELECT g, sum(id::f64) FROM lane_expr GROUP BY g
+
+# A later filter error must win over an earlier aggregate operand error, even
+# though the lane first encounters division by zero on id=1.
+statement error 22003
+SELECT sum(1 / (id - 1)) FROM lane_expr WHERE CASE WHEN id = 2 THEN 2147483647 + id > 0 ELSE TRUE END
+
+# With the filter error removed, replay retains the aggregate's own error.
+statement error 22012
+SELECT sum(1 / (id - 1)) FROM lane_expr
+
+# Initplan operands become constants before lane admission. The retained scalar
+# and two group states fit, while eager input materialization does not.
+# max_query_memory_bytes: 256
+query IR rowsort
+SELECT g, sum(id::f64 + (SELECT 0::f64)) FROM lane_expr GROUP BY g
+----
+0
+12
+1
+9
+
+# Folded mixed-float membership values have no point-list bookkeeping and are
+# discard-safe. Exact-type membership points must retain the eager path.
+# max_query_memory_bytes: 256
+query IR rowsort
+SELECT g, sum(id::f64) FROM lane_expr WHERE id::f32 NOT IN (SELECT 0::f64) GROUP BY g
+----
+0
+12
+1
+9
+
+# max_query_memory_bytes: 256
+statement error 54P05
+SELECT g, sum(id::f64) FROM lane_expr WHERE id::f64 NOT IN (SELECT 0::f64) GROUP BY g

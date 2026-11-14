@@ -12,6 +12,7 @@ internal static class PageOwnerTests
         var recovered = new StorageRecovered(initial, 1, 1, [], [], []);
         var allocation = new StorageAllocation(recovered);
         var root = allocation.AddPage(rawRoot); var plan = allocation.Prepare(root, 1);
+        LocalPins(rawMeta, plan.MetaBytes);
         var grant = new HashSet<uint>(); var pending = new Dictionary<uint, ulong>();
         var manifest = plan.Manifest.Select(page => new PageWirePage(page.Page, page.Bytes)).ToArray();
         var validator = new PageCommitValidator(initial, false, grant, pending, 2, plan.MetaBytes, manifest);
@@ -78,6 +79,30 @@ internal static class PageOwnerTests
         finally { maintenanceReleased.TrySetResult(); await server.DisposeAsync(); File.Delete(path); }
         Corpus.Equal(0, ledger.PinCount, "connection disposal releases all pins");
         Console.WriteLine("PASS page-owner host adapter: real client reads, writer lease, streamed Check A/B/C, durable publication, cache invalidation, resolution and pin cleanup");
+    }
+    private static void LocalPins(byte[] before, byte[] after)
+    {
+        var source = before.ToArray();
+        var ledger = new PageOwnerLedger(new object(), new byte[16], source);
+        using var old = ledger.PinLocal();
+        using var same = ledger.PinLocal();
+        Corpus.Equal(true, ReferenceEquals(old.Snapshot, same.Snapshot), "local pins share immutable generation metadata");
+        source[0] ^= 1;
+        Equal(before, old.Snapshot.Meta, "local metadata owned independently of constructor input");
+        var published = after.ToArray();
+        ledger.BeginPublication(); ledger.Publish(published, []); published[0] ^= 1;
+        using var current = ledger.PinLocal();
+        Corpus.Equal(false, ReferenceEquals(old.Snapshot, current.Snapshot), "publication replaces local generation metadata");
+        Equal(before, old.Snapshot.Meta, "old local snapshot survives publication");
+        Equal(after, current.Snapshot.Meta, "new local metadata owned independently of publication input");
+        Corpus.Equal(false, ledger.CanReuse(current.Snapshot.TransactionId), "old local pins hold reader watermark");
+        using var remote = ledger.Pin(ledger.Incarnation, current.Snapshot.TransactionId);
+        remote.Snapshot.Meta[0] ^= 1; remote.Snapshot.Incarnation[0] ^= 1;
+        Equal(after, current.Snapshot.Meta, "remote snapshot mutation cannot alter local metadata");
+        Corpus.Equal((byte)0, current.Snapshot.Incarnation[0], "remote incarnation remains independently owned");
+        old.Dispose(); same.Dispose();
+        Corpus.Equal(true, ledger.CanReuse(current.Snapshot.TransactionId), "disposing old local pins advances watermark");
+        Corpus.Equal(2, ledger.PinCount, "local pin disposal is idempotent and preserves current pins");
     }
     private sealed class TestWrite(MemoryBlockStore store, PageOwnerLedger ledger, StorageMeta before, SemaphoreSlim gate,
         TaskCompletionSource maintenanceEntered, TaskCompletionSource maintenanceReleased) : IPageOwnerWrite

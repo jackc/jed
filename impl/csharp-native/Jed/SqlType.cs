@@ -81,7 +81,17 @@ public static class SqlTypes
         SqlKind.Range or SqlKind.Composite => type.Identity!,
         _ => Fact(type).Name
     };
-    internal static ScalarFact Fact(SqlType type) => ScalarCatalog.Facts.Single(f => f.Type == type);
+    // Derive the hot lookup from the canonical catalog once. Value construction
+    // and comparisons must not scan and allocate a capturing predicate per cell.
+    private static readonly ScalarFact?[] ScalarFacts = BuildScalarFacts();
+    private static ScalarFact?[] BuildScalarFacts()
+    {
+        var facts = new ScalarFact?[Enum.GetValues<SqlKind>().Length];
+        foreach (var fact in ScalarCatalog.Facts) facts[(int)fact.Type.Kind] = fact;
+        return facts;
+    }
+    internal static ScalarFact Fact(SqlType type) => ScalarFacts[(int)type.Kind] ?? throw new InvalidOperationException("type has no scalar fact");
+
     internal static bool IsInteger(this SqlType type) => type.Kind is SqlKind.I16 or SqlKind.I32 or SqlKind.I64;
     internal static bool IsFloat(this SqlType type) => type.Kind is SqlKind.F32 or SqlKind.F64;
     internal static bool IsNumeric(this SqlType type) => type.IsInteger() || type.IsFloat() || type == SqlType.Decimal;

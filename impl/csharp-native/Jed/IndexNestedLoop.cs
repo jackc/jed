@@ -85,13 +85,49 @@ internal sealed record IndexNestedLoop(BaseRelationAccess Source, Resolved[] Bou
         var source = Read(outer, meter, cancellationToken);
         return Observation is null ? source : ExplainObservation.Rows(source, Observation, meter, cancellationToken, inclusive: true);
     }
-    private async IAsyncEnumerable<SqlValue[]> Read(SqlValue[] outer, Meter meter,
+    private IAsyncEnumerable<SqlValue[]> Read(SqlValue[] outer, Meter meter, CancellationToken cancellationToken)
+    {
+        if (PinnedAccess is { Kind: AccessKind.Primary } selected && Source.Filter is null &&
+            Source.Table.PrimaryKey is [var key] && Bounds is [{ Op: "=", Args.Length: 2 } bound])
+        {
+            var inner = bound.Args[0]; var input = bound.Args[1];
+            if (inner.Op != "column" || inner.Slot < OuterWidth) (inner, input) = (input, inner);
+            if (inner.Op == "column" && inner.Slot == OuterWidth + key && input.Op == "column" &&
+                input.Slot >= 0 && input.Slot < OuterWidth && input.Type == inner.Type &&
+                inner.Type == Source.Table.Columns[key].Type.Type && TableAccess.Compatible(bound, Source.Table.Columns[key]))
+                return ReadPoint(outer, input.Slot, key, selected, meter, cancellationToken);
+        }
+        return ReadGeneric(outer, meter, cancellationToken);
+    }
+
+    private async IAsyncEnumerable<SqlValue[]> ReadPoint(SqlValue[] outer, int slot, int keyColumn, AccessPlan selected, Meter meter,
+        [EnumeratorCancellation] CancellationToken cancellationToken)
+    {
+        var value = await outer[slot].ResolveAsync(cancellationToken).ConfigureAwait(false);
+        TableScan? scan = null;
+        if (value.IsNull) scan = new(Empty: true);
+        else
+        {
+            try
+            {
+                var key = KeyEncoding.Encode(value, collation: Source.Table.Columns[keyColumn].CollationData);
+                scan = new(key, true, key, true);
+            }
+            catch (SqlException) { } // Bounds drops an unencodable constraint; preserve its generic fallback.
+        }
+        var rows = scan is null ? ReadGeneric(outer, meter, cancellationToken) :
+            (selected with { Scan = scan }).Rows(Source.Table, Source.Tree, Source.Storage, meter, null, cancellationToken);
+        await foreach (var row in rows.ConfigureAwait(false)) yield return row;
+    }
+
+    internal async IAsyncEnumerable<SqlValue[]> ReadGeneric(SqlValue[] outer, Meter meter,
         [EnumeratorCancellation] CancellationToken cancellationToken)
     {
         async ValueTask<Resolved> Bind(Resolved expression)
         {
             if (expression.Op == "column") return expression.Slot >= OuterWidth ? expression with { Slot = expression.Slot - OuterWidth } :
                 new("constant", expression.Type, await outer[expression.Slot].ResolveAsync(cancellationToken).ConfigureAwait(false), [], Collation: expression.Collation, BoundSource: true);
+            if (expression.Args.Length == 0) return expression;
             var args = new Resolved[expression.Args.Length];
             for (var i = 0; i < args.Length; i++) args[i] = await Bind(expression.Args[i]).ConfigureAwait(false);
             return expression with { Args = args };

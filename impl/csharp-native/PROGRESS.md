@@ -1,5 +1,134 @@
 # C# experiment progress
 
+## Authorized refresh and optimization — 2026-11-13
+
+The explicitly requested refresh targets supported-core revision
+`6b2355d98a7fd3738c60474779d1d63548f350dc` and format v53. The prior frozen
+baseline and its measurements below remain historical evidence. The core remains
+experimental and opt-in; this refresh does not promote it or authorize automatic
+future updates. Final aggregate verification and benchmark results belong in
+[VERIFICATION.md](VERIFICATION.md) and [BENCHMARKS.md](BENCHMARKS.md).
+
+Final source23 is
+`6f0da47cc73888be3557572ea523a52e80d8c64a131fad80e4a95943c7073bf3`.
+All four host configurations pass 66 check groups each; all 766 SQL files pass
+across their applicable modes (12 inventories, 246,796 records).
+Encrypted transcripts match across configurations and independent Go
+(678 complete files, 2,778 events). All 496 process cases,
+16,000 threaded snapshot checks and 85 complete fault traces pass.
+
+The final passes add validated numeric-page COUNT/SUM/AVG kernels with prebound
+column views and one query-owned scratch array; direct fixed-table scan/filter/
+projection execution with owned identity results; single-allocation integer group
+identities; and membership-only spill probes. Scanned group rows transfer ownership
+without a second clone. These paths preserve logical reservations, spill timing,
+cost/error order, cancellation and retained public-row lifetimes. Generic fallbacks
+remain for schemas and plans outside the bounded admission rules.
+
+The supported baseline advanced to the shared numeric-coercion resolver change
+while this work was running. The C# refresh follows it and fixes a preexisting
+literal-to-f32 rounding discrepancy in `width_bucket`. A 12-record shared regression
+passes all four cores and the PostgreSQL oracle, with explicit NULL-width overrides.
+For that baseline advance, all 14 generated catalogs have unchanged data bodies
+and updated source provenance.
+
+Repeated final measurements run on CPU0 after correctness jobs finish, covering
+all four compilation variants and the original NativeAOT actor against current Go.
+Historical capture19/capture20 repetitions, the separate allocation-cleanup study,
+the capture20 same-core study and original frozen evidence remain archived.
+The final benchmark record states the measured gains and remaining Go gaps.
+
+The storage refresh adds generation stamps, bounded parent/child remaps and
+retained interiors/catalog chains, canonical leaf evening, and incremental
+reclamation. Owner reclamation lists newly retired pages without making them
+immediately reusable: reader generations and relaxed-batch dependencies still
+gate reuse. Pending batch orphans remain held until a later commit can list
+them safely. The exact leaked-page predicate replaces the old live-size growth
+heuristic. GiST commits preserve the canonical rewrite schedule, including
+unchanged trees, while reusing their immutable in-memory structure.
+
+Write optimization keeps same-key fixed-cell updates in packed leaf buffers.
+Only changed fixed-width regions are recoded; integer regions use the canonical
+minimum/range width rule, and unchanged variable regions retain their exact
+bytes. Each replacement owns new bytes, preserving existing snapshots. Variable
+edits, new overflow chains and splits use the general path. Exact payload sizing
+also removes discarded page encodings from split planning and single-record
+admission. UPDATE shares each encoded row across validation and index/tree work,
+with lazy first encoding to preserve error ordering.
+
+Query optimization reuses eligible prepared plans and evaluates recursively
+resident scalar expressions inline, retaining continuations for deferred inputs.
+Fixed-width page traversal feeds an owned reusable row into whole-table numeric
+folds. This aggregate path is disabled with an active query-memory account and
+requires a conservative finite-state bound within `work_mem`; file output still
+passes through the ordinary spool. Integer SUM/AVG use a bounded Int128
+accumulator with canonical decimal-group charges and ordinary exact-decimal
+finalization. Fresh resident spool rows can transfer ownership without a second
+copy, with unchanged admission, spilling and release schedules.
+
+The canonical aggregate gate now distinguishes bare-column folds from expression
+attempts. Rejected attempts dispose their state and rewind cost, lifetime,
+scalar-byte and query-memory marks before the row path runs. Acceptance occurs
+after blocking work, including sort finalization, and before output. Nonattempt
+filter failures finish charging the bound's scan and refund discarded folds
+without replaying volatile filters. Host regressions pin the independent Go
+error costs and exact callback counts; the shared expression regression passes
+C#, Go, Rust and TypeScript. PostgreSQL regeneration is byte-identical, with the
+expected warnings for its different memory-limit and filter/error ordering.
+
+Capture15's full default-JIT host suite passes, including the new aggregate
+gates, packed scans and spool ownership tests. Its source fingerprint is
+`a19f1a7d1c6fb88770446ae8ad889434c38570985a437e5096fe0767ff2bbe53`;
+the log is `/tmp/jed-csharp-refresh-combined15-host.log`. Final four-variant
+acceptance and a final-source simulation repeat remain separate gates.
+
+Capture17 (`03dcf792caefc03e342d1baec9b886180a8ecfe2a0411ce821b7298c1eb4c660`)
+passes the full default-JIT and default-NativeAOT host suites and the expanded
+nine-record aggregate-expression supplement. Independent subqueries initialize
+before aggregate lane admission, so folded scalar values receive the canonical
+gate; folded membership lists retain the exclusion for exact/promoted point
+bookkeeping. The expanded shared regression passes Go, Rust and TypeScript.
+The checkout PostgreSQL check regenerates it byte-identically, retaining the
+documented memory and error-order differences. Repository `mise run verify` and
+`mise run csharp-native:codegen --check` also pass at this stage; the latter
+verifies all 14 generated data catalogs. Further optimization and final
+artifact verification remain in progress.
+
+Accepted refresh capture20
+(`c43b05cdeecd17a2f439dce5d91e4fa2c2d13c59b7f895b57f3b4458d1911751`)
+passes all 85 complete fault traces: 19 saved regressions and all 22 generated
+profiles at seeds 1, 2 and 3. The result is **76 exact pinned-Go comparisons and
+nine passing intrinsic-oracle traces**, with no trace-length override. Both
+sweeps exit zero. [The archived simulation record](verification/refresh-simulations.json)
+contains actor/engine hashes, both complete manifests, per-trace results and log
+hashes. Other final acceptance gates are recorded separately in VERIFICATION.md.
+
+| Area | Refresh coverage and evidence |
+| --- | --- |
+| Host/platform scope | Linux x86-64, pinned .NET 11, async storage APIs, JIT and NativeAOT remain the experiment's scope; no new dependency or platform claim. |
+| Packed leaf writes | Independent full re-encoding comparisons cover plain/encrypted layouts, NULL bitmap boundaries, integer range widening/contraction and source immutability. |
+| Reclamation | A retained reader survives 300 intervening commits; another 300 commits after its release stop file growth and leave zero unlisted orphan pages. Pending-batch tests verify delayed reuse. |
+| Canonical simulations | Capture12 passes all 19 saved regressions and all 22 generated profiles at seeds 1, 2 and 3: **85/85**, comprising **76 exact current-Go transcript comparisons and nine intrinsic fault checks**. |
+
+Capture12's source fingerprint is
+`390c62a228cc9506e32e17283696cd7a383cb25741b9d1b0734bcc4677c25ec8`.
+The simulation sweeps use the pinned revision's generator and complete trace
+lengths, without a diagnostic step override. Their immutable manifests, actor
+hashes, trace hashes and per-trace logs are in
+`/tmp/jed-csharp-simulation-sweep-20261113-1175639-k5twk0` (saved) and
+`/tmp/jed-csharp-simulation-sweep-20261113-1175462-5f6kl2` (generated). Commands:
+`mise run csharp-native:simulation-sweep --no-build --assembly
+/tmp/jed-csharp-refresh-combined12/Jed.Check.dll --regress` and the same command
+with `--profile all --seeds 1..3`. Both exit zero.
+
+Intermediate failures were resolved rather than excluded: bootstrap catalog
+pages now carry their initial generation; simulator encrypted pointer walks
+apply v53 remaps; handshake transport failures normalize to SQLSTATE `08006`;
+maintenance observation reads a poisoned owner's already published generation
+before mandatory recovery; and a durable unchanged catalog can be retained even
+when no tree page was written. The relaxed-mode catalog guard remains distinct.
+These fixes restored exact current-Go image hashes for the affected traces.
+
 ## Completed experimental baseline — 2026-11-13
 
 The experiment is complete and frozen against semantic baseline

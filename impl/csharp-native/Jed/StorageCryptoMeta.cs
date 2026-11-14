@@ -22,12 +22,13 @@ internal static class StorageCryptoMeta
         BinaryPrimitives.WriteUInt64BigEndian(page.AsSpan(48), meta.ManifestDigest);
         BinaryPrimitives.WriteUInt32BigEndian(page.AsSpan(56), meta.LivePages);
         rootTag.CopyTo(page.AsSpan(64)); freeTag.CopyTo(page.AsSpan(80));
-        for (var i = 0; i < entries.Length; i++) StorageFormat.PutEntry(page.AsSpan(96 + i * 12), entries[i]);
+        for (var i = 0; i < entries.Length; i++) StorageFormat.PutEntry(page.AsSpan(96 + i * 8), entries[i]);
+        StorageRemap.Encode(page, meta.Remap, true);
         StorageFormat.SealMeta(page);
         if (Parse(page, (long)meta.PageCount * meta.PageSize) is null) throw new ArgumentException("invalid encrypted meta fields");
         return page;
     }
-    internal static int InlineCapacity(int size) => (size - 96 - StoragePageCodec.Reserve) / 12;
+    internal static int InlineCapacity(int size) => StorageRemap.InlineCapacity(size, true);
     // Keyless candidate validation. Authentication is a distinct step AFTER
     // complete-manifest selection, and an authentication failure never falls back.
     internal static StorageEncryptedMeta? Parse(ReadOnlySpan<byte> page, long physicalLength)
@@ -35,7 +36,7 @@ internal static class StorageCryptoMeta
         if (!StorageFormat.ValidPageSize(page.Length) || page.Length < 1024 || !page[..4].SequenceEqual("JEDB"u8) ||
             BinaryPrimitives.ReadUInt16BigEndian(page[4..]) != StorageFormat.Version || page[6] != 1 || page[7] != StoragePageCodec.Reserve ||
             BinaryPrimitives.ReadUInt32BigEndian(page[8..]) != page.Length ||
-            BinaryPrimitives.ReadUInt32BigEndian(page[32..]) != StorageFormat.MetaChecksum(page) || !StorageFormat.IsZero(page[60..64])) return null;
+            BinaryPrimitives.ReadUInt32BigEndian(page[32..]) != StorageFormat.MetaChecksum(page) || !StorageFormat.IsZero(page[48..52])) return null;
         var txid = BinaryPrimitives.ReadUInt64BigEndian(page[12..]); var root = BinaryPrimitives.ReadUInt32BigEndian(page[20..]);
         var count = BinaryPrimitives.ReadUInt32BigEndian(page[24..]); var free = BinaryPrimitives.ReadUInt32BigEndian(page[28..]);
         var head = BinaryPrimitives.ReadUInt32BigEndian(page[36..]); var entries = BinaryPrimitives.ReadUInt32BigEndian(page[40..]);
@@ -46,8 +47,9 @@ internal static class StorageCryptoMeta
             (ulong)entries + pages > count - 4 || (head == 0) != (pages == 0) || (head != 0 && !Pointer(head)) ||
             (pages == 0 && digest != 0) || (entries == 0 && pages != 0) || (free == 0 && !StorageFormat.IsZero(page[80..96]))) return null;
         var inline = (int)Math.Min(entries, (uint)InlineCapacity(page.Length));
-        if (!StorageFormat.IsZero(page[(96 + inline * 12)..^StoragePageCodec.Reserve]) ||
+        var remap = StorageRemap.Parse(page, count, true);
+        if (remap is null || !StorageFormat.IsZero(page[(96 + inline * 8)..StorageRemap.Start(page.Length, true)]) ||
             entries > (ulong)inline + (ulong)pages * (uint)StorageFormat.OverflowCapacity(page.Length)) return null;
-        return new(new(page.Length, txid, root, count, free, live, head, entries, pages, digest), page[64..80].ToArray(), page[80..96].ToArray());
+        return new(new(page.Length, txid, root, count, free, live, head, entries, pages, digest) { Remap = remap }, page[64..80].ToArray(), page[80..96].ToArray());
     }
 }

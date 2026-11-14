@@ -13,6 +13,7 @@ internal sealed class PageOwnerLedger
     private readonly Queue<Commit> commits = new();
     private readonly SortedDictionary<ulong, int> pins = [];
     private byte[] meta;
+    private PageReadSnapshot localSnapshot;
     private ulong transactionId;
     private ulong invalidationFloor;
     private uint pageCount;
@@ -29,6 +30,7 @@ internal sealed class PageOwnerLedger
         if (incarnation.Length != 16) throw new ArgumentException("invalid incarnation");
         gate = publicationGate; this.incarnation = incarnation.ToArray(); this.meta = meta.ToArray();
         (transactionId, pageCount) = Header(meta); invalidationFloor = transactionId;
+        localSnapshot = new(this.incarnation, transactionId, false, [], this.meta);
         if (previousMeta is not null)
         {
             var previous = Header(previousMeta);
@@ -36,6 +38,17 @@ internal sealed class PageOwnerLedger
                 commits.Enqueue(new(previous.TransactionId, [], ResolutionDigest(previousMeta)));
         }
         commits.Enqueue(new(transactionId, [], ResolutionDigest(meta)));
+    }
+    // Local readers already share the owner's page cache and do not apply
+    // transport invalidations. These arrays are ledger-owned and immutable:
+    // publication replaces the meta and snapshot, preserving older pins.
+    internal PageOwnerPin PinLocal()
+    {
+        lock (gate)
+        {
+            pins.TryGetValue(transactionId, out var count); pins[transactionId] = checked(count + 1);
+            return new(this, localSnapshot, pageCount);
+        }
     }
     internal PageOwnerPin Pin(byte[] cachedIncarnation, ulong lastTransactionId)
     {
@@ -82,6 +95,7 @@ internal sealed class PageOwnerLedger
         {
             if (transactionId == ulong.MaxValue || next.TransactionId != transactionId + 1) throw new InvalidOperationException("nonsequential page-service publication");
             meta = nextMeta.ToArray(); transactionId = next.TransactionId; pageCount = next.PageCount;
+            localSnapshot = new(incarnation, transactionId, false, [], meta);
             commits.Enqueue(new(transactionId, ordered, ResolutionDigest(meta)));
             while (commits.Count > 256) invalidationFloor = Math.Max(invalidationFloor, commits.Dequeue().TransactionId);
             var pending = publication; publication = null; pending?.TrySetResult();

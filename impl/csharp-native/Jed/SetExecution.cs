@@ -27,11 +27,11 @@ internal static class SetExecution
         if (operation == "union" && all) kept.AddRange(a.Concat(b));
         else
         {
-            var aKeys = new string[a.Count]; var bKeys = new string[b.Count];
-            for (var i = 0; i < a.Count; i++) { foreach (var value in a[i]) GroupExecution.ChargeKey(value, meter); aKeys[i] = GroupExecution.Identity(a[i]); }
-            for (var i = 0; i < b.Count; i++) { foreach (var value in b[i]) GroupExecution.ChargeKey(value, meter); bKeys[i] = GroupExecution.Identity(b[i]); }
-            var emitted = new HashSet<string>(StringComparer.Ordinal);
-            void Keep(SqlValue[] row, string key)
+            var aKeys = new byte[a.Count][]; var bKeys = new byte[b.Count][];
+            for (var i = 0; i < a.Count; i++) { foreach (var value in a[i]) GroupExecution.ChargeKey(value, meter); aKeys[i] = GroupExecution.EncodedIdentity(a[i]); }
+            for (var i = 0; i < b.Count; i++) { foreach (var value in b[i]) GroupExecution.ChargeKey(value, meter); bKeys[i] = GroupExecution.EncodedIdentity(b[i]); }
+            var emitted = new HashSet<byte[]>(ByteKeyComparer.Instance);
+            void Keep(SqlValue[] row, byte[] key)
             {
                 if (!all && !emitted.Add(key)) return;
                 if (!all && meter.Memory.Enabled) stateMemory.ReserveBytes(MemorySize.EntryBytes(row));
@@ -44,7 +44,7 @@ internal static class SetExecution
             }
             else
             {
-                var counts = new Dictionary<string, int>(StringComparer.Ordinal);
+                var counts = new Dictionary<byte[], int>(ByteKeyComparer.Instance);
                 for (var i = 0; i < b.Count; i++)
                 {
                     if (!counts.TryGetValue(bKeys[i], out var count) && meter.Memory.Enabled) stateMemory.ReserveBytes(MemorySize.EntryBytes(b[i]));

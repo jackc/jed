@@ -71,7 +71,7 @@ public sealed partial class Session : IAsyncDisposable
         QueryCore(sql, maxCost, cancellationToken, null);
     public Task<Rows> QueryAsync(string sql, QueryOptions options, CancellationToken cancellationToken = default) =>
         QueryCore(sql, (options ?? throw new ArgumentNullException(nameof(options))).MaxCost, cancellationToken, options);
-    private async Task<Rows> QueryCore(string sql, long maxCost, CancellationToken cancellationToken, QueryOptions? queryOptions, StatementSyntax? prepared = null)
+    private async Task<Rows> QueryCore(string sql, long maxCost, CancellationToken cancellationToken, QueryOptions? queryOptions, PreparedStatement? prepared = null)
     {
         using var operation = Enter();
         ArgumentNullException.ThrowIfNull(sql);
@@ -88,7 +88,7 @@ public sealed partial class Session : IAsyncDisposable
                 throw new SqlException(SqlStates.ProgramLimitExceeded, "SQL input exceeds length limit");
             meter.Checkpoint();
             var parameterContext = new Parameters();
-            var statement = parameterContext.Statement(prepared ?? new Parser(sql).ParseStatement());
+            var statement = prepared is { MayHaveParameters: false } ? prepared.Syntax : parameterContext.Statement(prepared?.Syntax ?? new Parser(sql).ParseStatement());
             // A lost role invalidates the transaction itself. Keep reporting that
             // failure before SQL's aborted-transaction handling, including COMMIT;
             // only a full rollback can discard the unusable admission and pins.
@@ -120,9 +120,13 @@ public sealed partial class Session : IAsyncDisposable
                 var pin = readTransaction?.Retain() ?? await db.PinAsync(cancellationToken).ConfigureAwait(false);
                 try
                 {
-                    var catalog = (transaction?.Catalog ?? readTransaction?.Snapshot.Catalog ?? pin.Snapshot.Catalog).BindCollations(meter.Unicode, meter.Temporal.Data, meter.Temporal.Environment);
+                    var catalog = BindReadCatalog(transaction?.Catalog ?? readTransaction?.Snapshot.Catalog ?? pin.Snapshot.Catalog, meter);
                     CheckPrivileges(statement, catalog);
-                    if (SequenceExecution.Writes(select, catalog))
+                    var snapshot = transaction?.Before ?? readTransaction?.Snapshot ?? pin.Snapshot;
+                    var cache = prepared is { MayHaveParameters: false } && transaction is null ? preparedSelects.GetValue(prepared, static _ => new()) : null;
+                    // A cached plan was admitted as read-only against this exact
+                    // catalog and snapshot. Privilege checks still run above.
+                    if (!(cache?.Matches(snapshot, catalog, meter) ?? false) && SequenceExecution.Writes(select, catalog))
                     {
                         await pin.DisposeAsync().ConfigureAwait(false);
                         return await SequenceQuery(select, meter, cancellationToken, parameterContext, queryOptions?.Parameters ?? []).ConfigureAwait(false);
@@ -130,9 +134,9 @@ public sealed partial class Session : IAsyncDisposable
                     meter.Sequences.Bind(catalog, transaction);
                     if (parameterContext.Any) parameterContext.Infer(statement, db, transaction?.Before ?? readTransaction?.Snapshot ?? pin.Snapshot, transaction, catalog, meter, cancellationToken);
                     parameterContext.Bind(queryOptions?.Parameters ?? [], meter.Temporal);
-                    var query = RelationExecution.Query(select, db, transaction?.Before ?? readTransaction?.Snapshot ?? pin.Snapshot, transaction, catalog, meter, cancellationToken);
+                    var query = RelationExecution.Query(select, db, snapshot, transaction, catalog, meter, cancellationToken, cache: cache);
                     if (query.Initialize is { } initialize) await initialize().ConfigureAwait(false);
-                    return new(this, query.Columns.Select(column => new Column(column.Name, column.Type)).ToArray(), RelationExecution.PublicRows(query.Rows), meter, pin);
+                    return new(this, query.Columns.Select(column => new Column(column.Name, column.Type)).ToArray(), query.OutputRows(), meter, pin);
                 }
                 catch { await pin.DisposeAsync().ConfigureAwait(false); throw; }
             }
@@ -219,6 +223,9 @@ public sealed partial class Row
 {
     private readonly SqlValue[] values;
     internal Row(SqlValue[] values) { this.values = values; }
+    // Internal pipelines transfer the owned array; public callers see only the
+    // immutable indexer. No mutable row buffer is reused between cursor steps.
+    internal SqlValue[] OwnedValues => values;
     private QueryMemoryAccount? memoryOwner;
     private long memoryBytes;
     internal Row RetainMemory(Meter meter, bool alreadyReserved = false)

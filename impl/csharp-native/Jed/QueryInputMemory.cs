@@ -6,7 +6,8 @@ namespace Jed;
 // them. Early cursor disposal and failures release every outstanding row.
 internal sealed class QueryInputMemory(Meter meter) : IDisposable
 {
-    private readonly Dictionary<SqlValue[], long> rows = new(ReferenceEqualityComparer.Instance);
+    private Dictionary<SqlValue[], long>? retainedRows;
+    private Dictionary<SqlValue[], long> rows => retainedRows ??= new(ReferenceEqualityComparer.Instance);
     private long held;
     internal async IAsyncEnumerable<SqlValue[]> Adopt(IAsyncEnumerable<SqlValue[]> source,
         [EnumeratorCancellation] CancellationToken token)
@@ -42,6 +43,7 @@ internal sealed class QueryInputMemory(Meter meter) : IDisposable
     }
     internal void Transfer(SqlValue[] row)
     {
+        if (retainedRows is null) return;
         if (!rows.TryGetValue(row, out var total)) return;
         var bytes = MemorySize.RowBytes(row);
         if (total == bytes) rows.Remove(row); else rows[row] = total - bytes;
@@ -71,10 +73,11 @@ internal sealed class QueryInputMemory(Meter meter) : IDisposable
     }
     internal void Release(SqlValue[] row)
     {
+        if (retainedRows is null) return;
         if (!rows.TryGetValue(row, out var total)) return;
         var bytes = MemorySize.RowBytes(row);
         if (total == bytes) rows.Remove(row); else rows[row] = total - bytes;
         meter.Memory.Release(bytes); held -= bytes;
     }
-    public void Dispose() { meter.Memory.Release(held); held = 0; rows.Clear(); }
+    public void Dispose() { meter.Memory.Release(held); held = 0; retainedRows?.Clear(); }
 }

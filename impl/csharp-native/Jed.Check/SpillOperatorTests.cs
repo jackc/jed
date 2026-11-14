@@ -5,6 +5,7 @@ internal static class SpillOperatorTests
 {
     internal static async Task Run()
     {
+        await SpillScratchTests.Run();
         var directory = Path.Combine(Path.GetTempPath(), "jed-spill-operators-" + Guid.NewGuid().ToString("N")); Directory.CreateDirectory(directory);
         try
         {
@@ -40,6 +41,37 @@ internal static class SpillOperatorTests
                 }
                 Corpus.Equal(0L, tight.Memory.Used, "spool releases all reservations");
                 Corpus.Equal(0, tight.Memory.ReleaseUnderflows, "spool reservation ownership");
+                var borrowed = new[] { SqlValue.Integer(1) };
+                var rowBytes = MemorySize.RowBytes(borrowed);
+                await using (var owned = new SpillRowSpool(host, rowBytes * 2, meter))
+                {
+                    await owned.Append(borrowed, default);
+                    borrowed[0] = SqlValue.Integer(99);
+                    var transferred = new[] { SqlValue.Integer(2) };
+                    await owned.AppendOwned(transferred, default);
+                    Corpus.Equal(false, owned.Spilled, "owned append retains exact work_mem boundary");
+                    Corpus.Equal(rowBytes * 2, owned.ResidentBytes, "owned and copied rows reserve identical logical bytes");
+                    var index = 0;
+                    await foreach (var row in owned.Read())
+                    {
+                        Corpus.Equal((long)++index, row[0].AsInteger(), "borrowed row mutation cannot change spool contents");
+                        if (index == 2) Corpus.Equal(true, ReferenceEquals(transferred, row), "owned array transfers without another copy");
+                    }
+                    var resolved = false;
+                    var deferred = SqlValue.Deferred(SqlType.I64, new(_ => { resolved = true; return new(SqlValue.Integer(3)); }));
+                    try { await owned.AppendOwned([deferred], default); throw new InvalidDataException("owned spool accepted deferred cell"); }
+                    catch (InvalidOperationException) { }
+                    Corpus.Equal(false, resolved, "owned contract rejects deferred values without loading them");
+                    Corpus.Equal(2L, owned.Count, "invalid owned row does not change count");
+                    Corpus.Equal(rowBytes * 2, owned.ResidentBytes, "invalid owned row does not reserve memory");
+                    await owned.AppendOwned([SqlValue.Integer(3)], default);
+                    Corpus.Equal(true, owned.Spilled, "owned append spills at the same next-row boundary");
+                    Corpus.Equal(0L, owned.ResidentBytes, "owned spill releases every resident reservation");
+                    index = 0;
+                    await foreach (var row in owned.Read()) Corpus.Equal((long)++index, row[0].AsInteger(), "owned and copied rows survive spill in order");
+                    Corpus.Equal(3, index, "owned spill preserves all rows");
+                }
+                Corpus.Equal(0L, meter.Memory.Used, "owned spool releases all reservations");
                 var largeText = new string('x', 70_000);
                 var largeArray = SqlValue.Array(new(SqlType.Text, [SqlValue.Text(largeText), SqlValue.Null(SqlType.Text)]));
                 await using (var large = new SpillRowSpool(host, 1, tight))
@@ -53,6 +85,21 @@ internal static class SpillOperatorTests
                         Corpus.Equal(true, row[2].AsArray().Values[1].IsNull, "scratch nested NULL survives");
                     }
                 }
+                await using (var state = new SpillKeyState(host, 4096, meter))
+                {
+                    byte[] key = [1, 2], value = [3, 4];
+                    await state.Put(key, value, 64, default);
+                    key[0] = 9; value[0] = 9;
+                    var first = await state.Get([1, 2], default);
+                    Corpus.Equal((byte)3, first!.Bytes[0], "resident state owns encoded keys and values");
+                    first.Bytes[0] = 8;
+                    Corpus.Equal((byte)3, (await state.Get([1, 2], default))!.Bytes[0], "resident lookup returns an owned value");
+                    Corpus.Equal(0L, await state.Put([1, 2], [5], 48, default), "equal byte keys update the first ordinal");
+                    Corpus.Equal(1L, state.Count, "equal encoded key does not create a second entry");
+                    await state.ForceDisk(default);
+                    Corpus.Equal((byte)5, (await state.Get([1, 2], default))!.Bytes[0], "owned key survives state migration");
+                }
+                Corpus.Equal(0L, meter.Memory.Used, "owned keyed state releases reservations");
                 foreach (var allowance in new[] { 1L, 4096L })
                 {
                     var stateMeter = new Meter(session, 0, default, new QueryOptions { MaxQueryMemoryBytes = allowance });
@@ -101,6 +148,7 @@ internal static class SpillOperatorTests
                     await Reject(async () => { _ = await state.Get([1], canceled.Token); });
                     await Reject(async () => { _ = await state.Put([1], [3], 64, canceled.Token); });
                     await Reject(() => spool.Append([SqlValue.Integer(2)], canceled.Token));
+                    await Reject(() => spool.AppendOwned([SqlValue.Integer(2)], canceled.Token));
                     await Reject(() => hashRows.Add(1, [SqlValue.Integer(2)], canceled.Token));
                     await Reject(() => sort.Add([SqlValue.Integer(2)], canceled.Token));
                     Corpus.Equal(held, meter.Memory.Used, "cancelled scratch operations preserve reservations");

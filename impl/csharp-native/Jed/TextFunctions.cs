@@ -148,24 +148,48 @@ internal static class TextFunctions
 
     internal static bool Like(string text, string pattern)
     {
-        var input = text.EnumerateRunes().ToArray(); var raw = pattern.EnumerateRunes().ToArray();
-        var tokens = new List<(int Kind, Rune Rune)>();
-        for (var i = 0; i < raw.Length; i++)
-        {
-            if (raw[i].Value == '\\')
-            { if (++i == raw.Length) { tokens.Add((3, default)); break; } tokens.Add((0, raw[i])); }
-            else tokens.Add((raw[i].Value == '%' ? 2 : raw[i].Value == '_' ? 1 : 0, raw[i]));
-        }
         var at = 0; var token = 0; var star = -1; var restart = 0;
-        while (at < input.Length)
+        while (at < text.Length)
         {
-            if (token < tokens.Count && tokens[token].Kind == 3) throw new SqlException(SqlStates.InvalidEscapeSequence, "LIKE pattern ends in escape");
-            if (token < tokens.Count && (tokens[token].Kind == 1 || tokens[token].Kind == 0 && tokens[token].Rune == input[at])) { at++; token++; }
-            else if (token < tokens.Count && tokens[token].Kind == 2) { star = token++; restart = at; }
-            else if (star >= 0) { token = star + 1; at = ++restart; }
+            var kind = -1; var literal = 0; var after = token;
+            if (token < pattern.Length)
+            {
+                var current = pattern[token]; after = token + 1;
+                if (current == '\\')
+                {
+                    // Match the existing encountered-error rule: a trailing
+                    // escape fails only while an input scalar still remains.
+                    if (after == pattern.Length) throw new SqlException(SqlStates.InvalidEscapeSequence, "LIKE pattern ends in escape");
+                    literal = LikeRune(pattern, after, out after); kind = 0;
+                }
+                else if (current == '%') kind = 2;
+                else if (current == '_') kind = 1;
+                else { literal = LikeRune(pattern, token, out after); kind = 0; }
+            }
+            var input = LikeRune(text, at, out var next);
+            if (kind == 1 || kind == 0 && literal == input)
+            {
+                at = next; token = after;
+            }
+            else if (kind == 2) { star = after; token = after; restart = at; }
+            else if (star >= 0)
+            {
+                token = star; _ = LikeRune(text, restart, out restart); at = restart;
+            }
             else return false;
         }
-        while (token < tokens.Count && tokens[token].Kind == 2) token++;
-        return token == tokens.Count;
+        while (token < pattern.Length && pattern[token] == '%') token++;
+        return token == pattern.Length;
+    }
+
+    // EnumerateRunes substitutes U+FFFD for an unpaired surrogate. Preserve that
+    // behavior without constructing rune arrays or allocating an enumerator.
+    private static int LikeRune(string value, int index, out int next)
+    {
+        var first = value[index]; next = index + 1;
+        if (!char.IsSurrogate(first)) return first;
+        if (char.IsHighSurrogate(first) && next < value.Length && char.IsLowSurrogate(value[next]))
+            return 0x10000 + ((first - 0xd800) << 10) + value[next++] - 0xdc00;
+        return 0xfffd;
     }
 }

@@ -1,5 +1,28 @@
 # C# experiment scope and acceptance
 
+## Authorized refresh
+
+Target: `6b2355d98a7fd3738c60474779d1d63548f350dc`, format v53. The
+implementation refresh, internal optimizations and final correctness acceptance
+are complete. The inventory is 764 pinned SQL files
+plus two distinct supplemental files. The scalar foundation supplement already
+exists in the new baseline and is counted once.
+
+| Area | Implemented refresh | Evidence boundary |
+|---|---|---|
+| Storage and reclamation | Generation stamps, retained interior/catalog chains, bounded remaps, incremental retired-page lists, reader/batch reuse gates and canonical leaf evening | Byte fixtures, retained-reader and reuse invariants are in the host suite; final cross-core gates are recorded separately |
+| Writes | Immutable packed fixed-cell updates, exact payload sizing and lazy per-row UPDATE encoding reuse | Plain/encrypted canonical re-encoding and old-snapshot ownership tests |
+| Query execution | Prepared-plan reuse, resident expression kernels, fixed-width page traversal, finite numeric folds and owned spool append | Existing SQL contracts remain authoritative; specialized paths retain ordinary fallbacks |
+| Aggregate semantics | Shared lane admission, rejected-attempt meter rewind, canonical filter/fold errors, final output acceptance and bounded state | New shared expression regression passes C#, Rust, Go and TypeScript; PostgreSQL check records the deliberate resource/error-order differences |
+| Numeric resolution | Shared coercion-table admission for dedicated div/gcd/lcm/width_bucket resolvers, with literal precision and planning-time errors preserved | New 12-record regression passes all cores and PostgreSQL regeneration; canonical NULL overload widths have explicit oracle overrides |
+| Acceptance | Four JIT/NativeAOT variants, three storage inventories, host/process/stress/fault checks | All 12 inventories, four host suites, 496 process cases, 16,000 threaded checks and 85 traces pass; artifact-specific counts are in [VERIFICATION.md](../../impl/csharp-native/VERIFICATION.md); intermediate captures do not certify later changes |
+
+No new platform, dependency, public packaging or supported-core status is implied.
+[PROGRESS.md](../../impl/csharp-native/PROGRESS.md) distinguishes intermediate
+evidence from the final acceptance record.
+
+## Historical frozen scope
+
 Baseline: `b1a6affca7725e0b07a4f734eddb1c569ef76bcf`. Full supported
 Rust/Go/TypeScript behavior at that revision is the target. This table records the completed
 experimental scope; it is not a supported-core or production promise. The baseline manifest and spec tree
@@ -25,7 +48,7 @@ Selected-file results must list the files; unselected baseline files remain
 unverified. The eventual full gate attempts every applicable baseline file and
 reports failures rather than filtering by an optimistic capability list.
 
-The experiment is complete and frozen on Linux x86-64. Engine34 passes all
+The original experiment was completed and frozen on Linux x86-64. Engine34 passes all
 applicable baseline SQL files in all three storage modes and four compilation
 variants, plus each full host executable. All 763 distinct SQL files pass in at
 least one storage mode. The stable final saved/generated fault sweep passes all
@@ -59,7 +82,7 @@ Capture34 repeats these host checks under default/runtime-async JIT and NativeAO
 the verification record retains each artifact identity. Later engine changes are
 not implicitly covered by those runs.
 
-The foundation supplement is `spec/conformance/suites/query/scalar_foundations.test`,
-added after the pinned revision and checked against supported cores and PostgreSQL.
+The original foundation supplement is `spec/conformance/suites/query/scalar_foundations.test`,
+added after that frozen revision and checked against supported cores and PostgreSQL.
 It isolates scalar behavior without implying that the broad capabilities in its
 requires header are fully implemented in C#.

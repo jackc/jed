@@ -54,7 +54,7 @@ public sealed partial class Database
     private async ValueTask<StorageMeta> RebuildImageAsync(DatabaseSnapshot snapshot, IBlockStore outputStore,
         StoragePageCodec? replacement, StorageKeyBlock? block, CancellationToken token)
     {
-        var output = new StorageImageWriter(outputStore, snapshot.Meta.PageSize, replacement);
+        var output = new StorageImageWriter(outputStore, snapshot.Meta.PageSize, replacement, checked(snapshot.Meta.TransactionId + 1));
         var tables = new List<CatalogTable>();
         foreach (var table in snapshot.Catalog.Tables.OrderBy(item => item.Name, Utf8NameComparer.Instance))
         {

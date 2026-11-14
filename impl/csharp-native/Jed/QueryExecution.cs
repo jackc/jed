@@ -22,9 +22,19 @@ internal static class QueryExecution
         if (scan.Empty) yield break;
         meter.Checkpoint();
         meter.Charge(await tree.CountRangePagesAsync(scan.Lower, scan.LowerInclusive, scan.Upper, scan.UpperInclusive, cancellationToken).ConfigureAwait(false));
-        await foreach (var record in tree.ScanRangeAsync(scan.Lower, scan.LowerInclusive, scan.Upper, scan.UpperInclusive, cancellationToken: cancellationToken).ConfigureAwait(false))
-            meter.Charge(tree.ValueReadUnits(record, touched));
+        if (tree.HasValueReadUnits(touched))
+            await foreach (var record in tree.ScanRangeAsync(scan.Lower, scan.LowerInclusive, scan.Upper, scan.UpperInclusive, cancellationToken: cancellationToken).ConfigureAwait(false))
+                meter.Charge(tree.ValueReadUnits(record, touched));
         meter.Checkpoint();
+        if (!tree.HasValueReadUnits())
+        {
+            await foreach (var row in tree.ScanRangeRowsAsync(scan.Lower, scan.LowerInclusive, scan.Upper, scan.UpperInclusive, scan.Reverse, cancellationToken).ConfigureAwait(false))
+            {
+                meter.Charge(Costs.StorageRowRead); meter.Checkpoint();
+                yield return row.DecodeFixed(table, tree);
+            }
+            yield break;
+        }
         await foreach (var record in tree.ScanRangeAsync(scan.Lower, scan.LowerInclusive, scan.Upper, scan.UpperInclusive, scan.Reverse, cancellationToken).ConfigureAwait(false))
         {
             meter.Charge(Costs.StorageRowRead); meter.Checkpoint();
@@ -38,7 +48,6 @@ internal static class QueryExecution
         var initialized = PlanTransform.InitialValues(plan);
         if (dynamic) initialized = initialized with { Filter = await PlanTransform.AccessValues(plan.Filter!, cancellationToken).ConfigureAwait(false) };
         if (storage is { MembershipBounds: false } && initialized.Filter is not null) initialized = initialized with { Filter = PlanTransform.WithoutMembershipBounds(initialized.Filter) };
-        var access = TableAccess.Prepare(initialized, table);
         var touched = StorageTouchedColumns.Collect(initialized);
         if (storage is not null)
         {
@@ -54,36 +63,36 @@ internal static class QueryExecution
                     candidate.Kind is AccessKind.Primary or AccessKind.PrimaryIntervals or AccessKind.Full);
                 selected = compatible.OrderBy(candidate => candidate.EstimatedCost).First() with { Ordered = ordered.Ordered, Streaming = ordered.Streaming };
             }
-            await foreach (var row in selected.Rows(table, tree, storage, meter, touched, cancellationToken, initialized.Access is null ? access.Scan.Reverse : initialized.ScanReverse,
+            await foreach (var row in selected.Rows(table, tree, storage, meter, touched, cancellationToken, initialized.Access is null ? TableAccess.Prepare(initialized, table).Scan.Reverse : initialized.ScanReverse,
                 meter.HostBatches.ScanFor(initialized)).ConfigureAwait(false)) yield return row;
         }
         else
         {
-            await foreach (var row in TableSource(table, tree, meter, cancellationToken, access.Scan, touched).ConfigureAwait(false)) yield return row;
+            await foreach (var row in TableSource(table, tree, meter, cancellationToken, TableAccess.Prepare(initialized, table).Scan, touched).ConfigureAwait(false)) yield return row;
         }
     }
 
-    internal static async IAsyncEnumerable<Row> Select(SelectPlan plan, IAsyncEnumerable<SqlValue[]> source, Meter meter,
-        [EnumeratorCancellation] CancellationToken cancellationToken = default, bool sourceMemory = false, bool eagerInput = false,
-        bool transferIdentity = false, bool bufferOutput = false)
+    internal static IAsyncEnumerable<Row> Select(SelectPlan plan, IAsyncEnumerable<SqlValue[]> source, Meter meter,
+        CancellationToken cancellationToken = default, bool sourceMemory = false, bool eagerInput = false,
+        bool transferIdentity = false, bool bufferOutput = false) => bufferOutput
+        ? BufferedSelect(plan, source, meter, cancellationToken, sourceMemory, eagerInput, transferIdentity)
+        : DispatchSelect(plan, source, meter, cancellationToken, sourceMemory, eagerInput, transferIdentity);
+
+    private static async IAsyncEnumerable<Row> BufferedSelect(SelectPlan plan, IAsyncEnumerable<SqlValue[]> source, Meter meter,
+        [EnumeratorCancellation] CancellationToken cancellationToken, bool sourceMemory, bool eagerInput, bool transferIdentity)
     {
-        var execution = SelectCore(plan, source, meter, cancellationToken, sourceMemory, eagerInput, transferIdentity);
-        if (!bufferOutput)
-        {
-            await foreach (var row in execution.ConfigureAwait(false)) yield return row;
-            yield break;
-        }
+        var execution = DispatchSelect(plan, source, meter, cancellationToken, sourceMemory, eagerInput, transferIdentity);
         using var memory = new QueryInputMemory(meter); var rows = new List<SqlValue[]>();
         await foreach (var row in execution.ConfigureAwait(false))
         {
-            var values = Enumerable.Range(0, row.Count).Select(i => row[i]).ToArray();
+            var values = row.OwnedValues;
             memory.Take(values, transferIdentity); rows.Add(values);
         }
         foreach (var row in rows) { memory.Transfer(row); yield return new Row(row); }
     }
 
     private static async IAsyncEnumerable<Row> SelectCore(SelectPlan plan, IAsyncEnumerable<SqlValue[]> source, Meter meter,
-        [EnumeratorCancellation] CancellationToken cancellationToken = default, bool sourceMemory = false, bool eagerInput = false, bool transferIdentity = false)
+        [EnumeratorCancellation] CancellationToken cancellationToken = default, bool sourceMemory = false, bool eagerInput = false, bool transferIdentity = false, AggregateLanePlan.Attempt? attempt = null)
     {
         using var inputMemory = new QueryInputMemory(meter);
         var retainProjectedSource = plan.Group is not null || plan.Windows is not null;
@@ -108,7 +117,9 @@ internal static class QueryExecution
         }
         if (plan.Group is { } grouping)
         {
-            var grouped = GroupExecution.Run(grouping, plan.Empty ? EmptySource() : source, plan.Filter, meter, cancellationToken, sourceMemory, StorageTouchedColumns.Collect(plan), plan.AggregateLane, plan.Observation?.Filter, plan.Spill);
+            var grouped = plan.AggregateLane && plan.PackedAggregate is { } packed && packed.Eligible(plan, meter)
+                ? packed.Run(plan, meter, cancellationToken)
+                : GroupExecution.Run(grouping, plan.Empty ? EmptySource() : source, plan.Filter, meter, cancellationToken, sourceMemory, StorageTouchedColumns.Collect(plan), plan.AggregateLane, plan.Observation?.Filter, plan.Spill);
             source = plan.Spill is null ? inputMemory.Adopt(grouped, cancellationToken) : grouped;
             if (plan.Observation?.Aggregate is { } groupObservation) source = ExplainObservation.Rows(source, groupObservation, meter, cancellationToken, inclusive: true);
             sourceMemory = plan.Spill is null;
@@ -118,7 +129,7 @@ internal static class QueryExecution
             if (plan.Limit == 0 && !plan.Distinct)
             {
                 await foreach (var unused in source.WithCancellation(cancellationToken).ConfigureAwait(false)) { }
-                yield break;
+                attempt?.Accept(); yield break;
             }
         }
         if (plan.Windows is { } windows)
@@ -161,16 +172,17 @@ internal static class QueryExecution
             if (heap && plan.Spill is { } budget) heap = budget.TopK(plan);
             if (!heap && plan.Spill is { } spill)
             {
-                await foreach (var row in SpillSort.Run(plan, source, spill, inputMemory, meter, cancellationToken).ConfigureAwait(false)) yield return row;
+                await foreach (var row in SpillSort.Run(plan, source, spill, inputMemory, meter, cancellationToken, attempt).ConfigureAwait(false)) yield return row;
                 yield break;
             }
+            var sortTouched = StorageTouchedColumns.Collect(plan);
             var collatedHeap = heap && order.Any(key => key.Expression.Collation?.Table is not null);
             if (!sourceMemory && order.Any(key => key.Expression.Collation?.Table is not null))
             {
                 var survivors = new List<SqlValue[]>();
                 await foreach (var row in source.WithCancellation(cancellationToken).ConfigureAwait(false))
                     if (await KeepsAsync(plan.Filter, row, meter, plan.Observation?.Filter).ConfigureAwait(false))
-                        survivors.Add(await sortMemory.TakeAsync(row, false, StorageTouchedColumns.Collect(plan)).ConfigureAwait(false));
+                        survivors.Add(await sortMemory.TakeAsync(row, false, sortTouched).ConfigureAwait(false));
                 source = BufferedSource(survivors); plan = plan with { Filter = null };
                 if (heap) sortMemory.Dispose(); else sourceMemory = true;
             }
@@ -191,12 +203,14 @@ internal static class QueryExecution
                 for (var i = 0; i < keys.Length; i++)
                     if (SortPlan.Column(order[i].Expression) is null) sortMemory.ReleaseBytes(MemorySize.ValueBytes(keys[i].Value));
             }
+            SortValue[]? spareKeys = null;
             await foreach (var row in source.WithCancellation(cancellationToken).ConfigureAwait(false))
             {
                 if (!await KeepsAsync(plan.Filter, row, meter, plan.Observation?.Filter).ConfigureAwait(false)) { inputMemory.Release(row); continue; }
                 if (heap && capacity == 0 && order.All(key => SortPlan.Column(key.Expression) is not null && key.Expression.Collation?.Table is null)) continue;
                 var keyCost = meter.Accrued;
-                var keys = new SortValue[order.Length];
+                var keys = spareKeys ?? new SortValue[order.Length];
+                spareKeys = null;
                 for (var i = 0; i < keys.Length; i++)
                 {
                     var value = await Evaluate.ExprAsync(order[i].Expression, meter, row: row).ConfigureAwait(false);
@@ -204,27 +218,49 @@ internal static class QueryExecution
                     keys[i] = CollationRules.Decorate(value, order[i].Expression, meter);
                 }
                 plan.Observation?.Sort?.AttributeLocal(meter.Accrued - keyCost);
-                if (heap && capacity == 0) { ReleaseKeys(keys); continue; }
+                if (heap && capacity == 0) { ReleaseKeys(keys); spareKeys = keys; continue; }
                 var candidate = (Row: row, Keys: keys, Ordinal: ordinal++);
-                if (heap && rows.Count >= capacity && Compare(candidate, rows[^1]) >= 0) { ReleaseKeys(keys); continue; }
-                var buffered = sourceMemory || collatedHeap ? row : await sortMemory.TakeAsync(row, false, StorageTouchedColumns.Collect(plan)).ConfigureAwait(false);
-                if (heap && rows.Count >= capacity) sortMemory.Release(rows[^1].Row);
+                if (heap && rows.Count >= capacity && Compare(candidate, rows[0]) >= 0) { ReleaseKeys(keys); spareKeys = keys; continue; }
+                var buffered = sourceMemory || collatedHeap ? row : await sortMemory.TakeAsync(row, false, sortTouched).ConfigureAwait(false);
+                if (heap && rows.Count >= capacity) sortMemory.Release(rows[0].Row);
                 decorations.ReserveBytes(MemorySize.SortKeyBytes(keys));
                 if (heap && rows.Count >= capacity)
                 {
-                    ReleaseKeys(rows[^1].Keys);
-                    decorations.ReleaseBytes(MemorySize.SortKeyBytes(rows[^1].Keys));
+                    ReleaseKeys(rows[0].Keys);
+                    decorations.ReleaseBytes(MemorySize.SortKeyBytes(rows[0].Keys));
+                    // The removed row no longer owns these comparison cells.
+                    // Refill them for the next candidate after all charges have
+                    // been released; retained rows keep distinct key arrays.
+                    spareKeys = rows[0].Keys;
+                    rows[0] = rows[^1];
                     rows.RemoveAt(rows.Count - 1);
+                    var parent = 0;
+                    while (parent * 2 + 1 < rows.Count)
+                    {
+                        var child = parent * 2 + 1;
+                        if (child + 1 < rows.Count && Compare(rows[child + 1], rows[child]) > 0) child++;
+                        if (Compare(rows[parent], rows[child]) >= 0) break;
+                        (rows[parent], rows[child]) = (rows[child], rows[parent]); parent = child;
+                    }
+
                 }
                 rows.Add((buffered, keys, candidate.Ordinal));
                 if (heap)
                 {
-                    rows.Sort(Compare);
+                    var child = rows.Count - 1;
+                    while (child > 0)
+                    {
+                        var parent = (child - 1) / 2;
+                        if (Compare(rows[parent], rows[child]) >= 0) break;
+                        (rows[parent], rows[child]) = (rows[child], rows[parent]); child = parent;
+                    }
+
                 }
             }
-            if (!heap) rows.Sort(Compare);
+            rows.Sort(Compare);
             decorations.Dispose();
             if (collatedHeap) foreach (var row in rows) sortMemory.Reserve(row.Row);
+            attempt?.Accept();
             using var hostBatch = HostBatchReplay.HasEligible(plan.Projections.Select(projection => projection.Expression))
                 ? meter.HostBatches.Begin(plan.Projections.Select(projection => projection.Expression),
                     rows.Where((_, index) => index >= plan.Offset && (plan.Limit is null || index - plan.Offset < plan.Limit.Value)).Select(row => row.Row).ToArray()) : null;
@@ -254,6 +290,7 @@ internal static class QueryExecution
             bufferedHostBatch = meter.HostBatches.Begin(bufferedRoots, buffered);
         }
         using var hostBatchScope = bufferedHostBatch;
+        if (attempt is not null) source = AggregateLanePlan.AcceptedSource(source, attempt, cancellationToken);
         if (groupSpool)
             source = HostPullWindow.Read(source, bufferedRoots, meter, Costs.RowProduced,
                 () => plan.Limit is { } count ? Math.Max(0, Meter.Add(plan.Offset, count) - skipped) : null, cancellationToken);
@@ -275,6 +312,49 @@ internal static class QueryExecution
             if (plan.Limit is { } limit && produced >= limit) yield break;
         }
     }
+    private static IAsyncEnumerable<Row> DispatchSelect(SelectPlan plan, IAsyncEnumerable<SqlValue[]> source, Meter meter,
+        CancellationToken token, bool sourceMemory, bool eagerInput, bool transferIdentity)
+    {
+        if (!sourceMemory && !eagerInput && meter.Explain is null && plan.PackedSelect is { } packed)
+            return packed.Run(plan, meter, token);
+        if (meter.Explain?.Analyze == true) plan = plan with { AggregateLane = false };
+        if (!plan.AggregateLane || !AggregateLanePlan.RequiresAttempt(plan, meter))
+            return SelectCore(plan, source, meter, token, sourceMemory, eagerInput, transferIdentity);
+        if (!AggregateLanePlan.DiscardSafe(plan.Filter) || plan.Order?.Any(key => !AggregateLanePlan.DiscardSafe(key.Expression)) == true)
+            return SelectCore(plan with { AggregateLane = false }, source, meter, token, sourceMemory, eagerInput, transferIdentity);
+        return AttemptSelect(plan, source, meter, token, sourceMemory, eagerInput, transferIdentity);
+    }
+
+    private static async IAsyncEnumerable<Row> AttemptSelect(SelectPlan plan, IAsyncEnumerable<SqlValue[]> source, Meter meter,
+        [EnumeratorCancellation] CancellationToken token, bool sourceMemory, bool eagerInput, bool transferIdentity)
+    {
+        meter.Guard();
+        var mark = meter.Mark();
+        var attempt = new AggregateLanePlan.Attempt(meter);
+        var execution = SelectCore(plan, source, meter, token, sourceMemory, eagerInput, transferIdentity, attempt).GetAsyncEnumerator(token);
+        var retry = false;
+        try
+        {
+            while (true)
+            {
+                bool more;
+                try
+                {
+                    more = await execution.MoveNextAsync().ConfigureAwait(false);
+                    if (!more) attempt.Accept();
+                }
+                catch (SqlException error) when (!attempt.Accepted && error.SqlState != SqlStates.QueryCanceled)
+                { retry = true; break; }
+                if (!more) break;
+                yield return execution.Current;
+            }
+        }
+        finally { await execution.DisposeAsync().ConfigureAwait(false); }
+        if (!retry) yield break;
+        meter.Rewind(mark);
+        await foreach (var row in SelectCore(plan with { AggregateLane = false }, source, meter, token, sourceMemory, eagerInput, transferIdentity).ConfigureAwait(false)) yield return row;
+    }
+
     private static async IAsyncEnumerable<SqlValue[]> BufferedSource(IEnumerable<SqlValue[]> rows)
     {
         await ValueTask.CompletedTask.ConfigureAwait(false);
@@ -338,10 +418,12 @@ internal static async ValueTask<bool> KeepsValueAsync(Resolved? expression, SqlV
         var result = Evaluate.Expr(filter, meter, true, row);
         return !result.IsNull && result.AsBoolean();
     }
-    internal static Row Project(Projection[] projections, SqlValue[] row, Meter meter, bool chargeRow = true)
+    // ownedIdentity is admitted only for a complete original-order projection
+    // of an exclusively owned resident row. Every evaluator/guard still runs.
+    internal static Row Project(Projection[] projections, SqlValue[] row, Meter meter, bool chargeRow = true, bool ownedIdentity = false)
     {
         meter.Checkpoint(); if (chargeRow) meter.Charge(Costs.RowProduced);
-        var values = new SqlValue[projections.Length];
+        var values = ownedIdentity ? row : new SqlValue[projections.Length];
         for (var i = 0; i < values.Length; i++) values[i] = Evaluate.Expr(projections[i].Expression, meter, row: row);
         meter.CheckCancellation(); return new(values);
     }

@@ -14,7 +14,8 @@ internal sealed partial class SimulationRunner
                 // These exceptions defer verification to the mandatory recovery
                 // after the faulted step. Corruption and unrelated SQL errors
                 // must never be replaced with the transaction's own digest.
-                if (relaxed && fs.Fired != "none" || service && fs.IsDead) return pending;
+                if (relaxed && fs.Fired != "none" || service && fs.IsDead ||
+                    service && fs.Fired == "write" && error.SqlState == SqlStates.ConnectionFailure) return pending;
                 if (service && !retried && error.SqlState == SqlStates.ConnectionFailure)
                 {
                     // A disconnect may land in read-back itself. One fresh

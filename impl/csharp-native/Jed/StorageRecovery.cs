@@ -10,8 +10,14 @@ internal sealed record StorageRecovered(StorageMeta Meta, int Slot, int FloorSlo
     internal StorageBatch? Batch { get; init; }
     internal uint? LastReclamationLive { get; init; }
     internal ulong? ReclamationTransactionId { get; init; }
+    internal HashSet<uint> HeldOrphans { get; init; } = [];
+    internal bool IncrementalKnown { get; init; } = true;
     internal ulong FreeGeneration => ReclamationTransactionId ?? Meta.TransactionId;
-    internal uint ReclamationLive => LastReclamationLive ?? checked(Meta.PageCount - (uint)FreePages.Count);
+    internal uint ReclamationLive => LastReclamationLive ?? Meta.LivePages;
+    internal long LeakedPages => (long)Meta.PageCount - (Encrypted is null ? 2 : 4) - FreePages.Count -
+        Meta.LivePages - FreeListPages.Count - Meta.ManifestPages - HeldOrphans.Count;
+    internal bool ReclamationDue => LeakedPages > ReclamationFacts.CompactMinPages &&
+        LeakedPages * ReclamationFacts.LeakDen > Meta.LivePages;
     internal bool RequiresStabilization => Meta.ManifestEntries != 0;
 }
 
@@ -42,7 +48,7 @@ internal static class StorageRecovery
             var meta = metas[slot];
             if (meta is null) continue;
             var manifestPages = new HashSet<uint>();
-            var dependencies = await ValidateManifestAsync(store, meta, blocks[slot], cancellationToken, manifestPages).ConfigureAwait(false);
+            var dependencies = await ValidateManifestAsync(store, meta, blocks[slot], cancellationToken, manifestPages, metas[1 - slot]?.TransactionId ?? meta.TransactionId).ConfigureAwait(false);
             if (dependencies is null) continue;
             var floor = slot;
             if (metas[1 - slot] is { } sibling && sibling.TransactionId == meta.TransactionId &&
@@ -56,22 +62,22 @@ internal static class StorageRecovery
 
     // Retain only page identities, never a whole-file or whole-dirty-set byte buffer.
     internal static async ValueTask<HashSet<uint>?> ValidateManifestAsync(IBlockStore store, StorageMeta meta,
-        ReadOnlyMemory<byte> rawMeta, CancellationToken cancellationToken = default, HashSet<uint>? manifestPages = null)
+        ReadOnlyMemory<byte> rawMeta, CancellationToken cancellationToken = default, HashSet<uint>? manifestPages = null, ulong? floorTransactionId = null)
     {
         var dependencies = new HashSet<uint>();
         var body = new byte[meta.PageSize];
         uint last = 1; uint seen = 0;
-        var rootSeen = false; var freeSeen = meta.FreeListHead == 0;
+        var freeSeen = meta.FreeListHead == 0;
         async ValueTask<bool> ValidateEntries(ReadOnlyMemory<byte> entries, uint count)
         {
             for (var i = 0; i < count; i++)
             {
-                var entry = StorageFormat.ReadEntry(entries.Span.Slice(i * 12, 12));
+                var entry = StorageFormat.ReadEntry(entries.Span.Slice(i * 8, 8));
                 if (entry.Page <= last || !StorageFormat.BodyPointer(entry.Page, meta.PageCount) || !dependencies.Add(entry.Page)) return false;
                 last = entry.Page;
-                rootSeen |= entry.Page == meta.Root; freeSeen |= entry.Page == meta.FreeListHead;
+                freeSeen |= entry.Page == meta.FreeListHead;
                 await store.ReadAsync((long)entry.Page * meta.PageSize, body, cancellationToken).ConfigureAwait(false);
-                if (StorageFormat.Crc64(body) != entry.Digest) return false;
+                if (StorageFormat.ManifestDigest(body, false) != entry.Digest || !StorageFormat.StampInWindow(body, floorTransactionId ?? meta.TransactionId, meta.TransactionId)) return false;
                 try { if (StorageFormat.ParsePage(body).Type == 8) return false; }
                 catch (SqlException error) when (error.SqlState == SqlStates.DataCorrupted) { return false; }
                 seen++;
@@ -81,28 +87,28 @@ internal static class StorageRecovery
 
         var inline = Math.Min(meta.ManifestEntries, (uint)StorageFormat.InlineCapacity(meta.PageSize));
         if (!await ValidateEntries(rawMeta[64..], inline).ConfigureAwait(false)) return null;
-        var id = meta.ManifestHead; ulong digest = 0;
+        var id = meta.ManifestHead; uint digest = 0;
         var overflow = new byte[meta.PageSize]; var idBytes = new byte[4];
         for (uint ordinal = 0; ordinal < meta.ManifestPages; ordinal++)
         {
-            if (!StorageFormat.BodyPointer(id, meta.PageCount) || !dependencies.Add(id)) return null;
+            if (!StorageFormat.BodyPointer(id, meta.PageCount) || id == meta.Root || id == meta.FreeListHead || !dependencies.Add(id)) return null;
             manifestPages?.Add(id);
             await store.ReadAsync((long)id * meta.PageSize, overflow, cancellationToken).ConfigureAwait(false);
             StoragePageHeader page;
             try { page = StorageFormat.ParsePage(overflow); }
             catch (SqlException error) when (error.SqlState == SqlStates.DataCorrupted) { return null; }
             var count = Math.Min(meta.ManifestEntries - seen, (uint)StorageFormat.OverflowCapacity(meta.PageSize));
-            if (page.Type != 8 || page.Count != count ||
+            if (page.Type != 8 || !StorageFormat.ManifestStamp(overflow, meta.TransactionId) || page.Count != count ||
                 BinaryPrimitives.ReadUInt64BigEndian(overflow.AsSpan(16)) != meta.TransactionId ||
                 BinaryPrimitives.ReadUInt32BigEndian(overflow.AsSpan(24)) != ordinal ||
-                !StorageFormat.IsZero(overflow.AsSpan(28, 4)) || !StorageFormat.IsZero(overflow.AsSpan(32 + (int)count * 12))) return null;
+                !StorageFormat.IsZero(overflow.AsSpan(28, 4)) || !StorageFormat.IsZero(overflow.AsSpan(32 + (int)count * 8))) return null;
             BinaryPrimitives.WriteUInt32BigEndian(idBytes, id);
-            digest = StorageFormat.Crc64(overflow, StorageFormat.Crc64(idBytes, digest));
+            digest = StorageFormat.Crc32(overflow, StorageFormat.Crc32(idBytes, digest));
             if (!await ValidateEntries(overflow.AsMemory(32), count).ConfigureAwait(false)) return null;
             id = page.Next;
         }
         return id == 0 && seen == meta.ManifestEntries && digest == meta.ManifestDigest &&
-            (seen == 0 || (rootSeen && freeSeen)) ? dependencies : null;
+            (seen == 0 || freeSeen) ? dependencies : null;
     }
 
     internal static async ValueTask<(SortedSet<uint>, HashSet<uint>)> ReadFreeListAsync(IBlockStore store, StorageMeta meta,

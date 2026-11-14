@@ -28,9 +28,43 @@ internal static class PlanTransform
         if (expression.Op == "outer") return new("constant", expression.Type, expression.Outer!.Value, [], Collation: expression.Collation, BoundSource: true);
         if (expression.Op == "initplan" && expression.Subquery!.Initialized)
             return new("constant", expression.Type, expression.Subquery.Value, [], Collation: expression.Collation);
-        return expression with { Args = expression.Args.Select(InitialValues).ToArray() };
+        Resolved[]? changed = null;
+        for (var i = 0; i < expression.Args.Length; i++)
+        {
+            var value = InitialValues(expression.Args[i]);
+            if (!ReferenceEquals(value, expression.Args[i]))
+            {
+                changed ??= (Resolved[])expression.Args.Clone();
+                changed[i] = value;
+            }
+        }
+        return changed is null ? expression : expression with { Args = changed };
+
     }
-    internal static SelectPlan InitialValues(SelectPlan plan) => Map(plan, InitialValues);
+    private static bool HasInitial(Resolved? expression)
+    {
+        if (expression is null) return false;
+        if (expression.Op == "outer" || expression.Op == "initplan" && expression.Subquery!.Initialized) return true;
+        foreach (var argument in expression.Args) if (HasInitial(argument)) return true;
+        return false;
+    }
+    private static bool HasInitial(AggregatePlan aggregate) => HasInitial(aggregate.Argument) || HasInitial(aggregate.Filter) ||
+        (aggregate.Extra?.Any(HasInitial) ?? false) || (aggregate.Order?.Any(key => HasInitial(key.Expression)) ?? false) ||
+        (aggregate.WithinOrder?.Any(key => HasInitial(key.Expression)) ?? false) || (aggregate.Direct?.Any(HasInitial) ?? false);
+    internal static SelectPlan InitialValues(SelectPlan plan)
+    {
+        // Ordinary plans are immutable and have no execution-bound cells. Retain
+        // them instead of copying every expression, projection, and order key.
+        var changed = HasInitial(plan.Filter) || plan.Projections.Any(value => HasInitial(value.Expression)) ||
+            (plan.Order?.Any(key => HasInitial(key.Expression)) ?? false);
+        if (!changed && plan.Group is { } group)
+            changed = group.Keys.Any(HasInitial) || HasInitial(group.Having) || group.Aggregates.Any(HasInitial);
+        if (!changed && plan.Windows is { } windows)
+            changed = windows.Plans.Any(window => window.Args.Any(HasInitial) || window.Partition.Any(HasInitial) ||
+                window.Order.Any(key => HasInitial(key.Expression)) || window.Aggregate is { } aggregate && HasInitial(aggregate));
+        return changed ? Map(plan, InitialValues) : plan;
+    }
+
     internal static SelectPlan Map(SelectPlan plan, Func<Resolved, Resolved> map) => plan with
     {
         Projections = plan.Projections.Select(projection => projection with { Expression = map(projection.Expression) }).ToArray(),

@@ -194,28 +194,32 @@ lookups, which reproduces the general path's charge order with or without a
 cost ceiling, and cached UPDATE/DELETE access inventories. A point lookup is 1.19× Rust and Swift/Rust is 1.28× overall
 (per-statement paths 2.58×; single-row writes remain 6–7×), same gates re-run.
 
-The **native C# experiment** (`impl/csharp-native`) was authorized 2026-11-12 and
-completed/frozen 2026-11-13 against supported-core semantic baseline
-`b1a6affca7725e0b07a4f734eddb1c569ef76bcf`. The frozen implementation is
-commit `2849dd23f3e28b0e91674e27f99be2da58681805`.
-It targets Linux x86-64 with pinned .NET 11
-and async-first public APIs: inline resident kernels and awaited storage I/O, no
-Task.Run wrapper. Engine34 passes all 12 memory/plain/encrypted SQL inventories
-under default/runtime-async JIT/NativeAOT and all four host executables; every one
-of the 763 baseline files passes in at least one storage mode. All 496 mixed-core
-process cases, 16,000 threaded snapshot checks and 85 stable fault traces pass
-(76 exact peer comparisons, nine intrinsic checks). Verification and the
-metadata-only freeze proof are in `impl/csharp-native/VERIFICATION.md`.
-Four variants ×three diagnostic measurement repeats are recorded in
-`impl/csharp-native/BENCHMARKS.md`. Current time/allocation overhead against Go is
-substantial and does not validate earlier near-Rust expectations; tmpfs commit
-timings are not physical-disk durability latency. Production delivery and promotion
-remain separate decisions. The experiment uses only opt-in `csharp-native:*` tasks
-and has no automatic future-maintenance or website obligation.
-The maintainer approved exact-pinned BouncyCastle.Cryptography 2.7.0 for SHA-224
-and Argon2id (including internal helpers) and subagent implementation/review on
-2026-11-12. See [csharp-native-experiment.md](spec/design/csharp-native-experiment.md)
-and its scope, host and crypto inventories.
+The **native C# experiment** (`impl/csharp-native`) was authorized 2026-11-12;
+the explicitly requested parity/performance refresh (2026-11-13) targets
+`6b2355d98a7fd3738c60474779d1d63548f350dc` and format v53. It remains opt-in,
+with no automatic future-maintenance or website obligation. Its scope is Linux
+x86-64, pinned .NET 11 and async-first public APIs: inline resident kernels and
+awaited storage I/O, with no Task.Run wrapper. The refresh implements generation
+stamps, retained-page remaps, incremental reclamation and canonical leaf evening,
+and removes measured query/storage allocation and algorithm overhead.
+
+All 766 SQL files pass across applicable modes in four JIT/NativeAOT configurations
+(12 memory/plain/encrypted inventories). All four host suites, 496 mixed-core
+process cases, 16,000 threaded snapshot checks and 85 complete fault traces pass
+(76 exact peer comparisons, nine intrinsic checks). Source/artifact identities
+and acceptance evidence are in `impl/csharp-native/VERIFICATION.md`; repeated
+matched measurements and their limits are in `impl/csharp-native/BENCHMARKS.md`.
+Performance improves substantially, but the evidence does not establish universal
+Go parity. Tmpfs commit timings are not physical-disk durability latency.
+Production delivery and supported-core promotion remain separate decisions.
+
+The original frozen implementation `2849dd23f3e28b0e91674e27f99be2da58681805`,
+semantic baseline `b1a6affca7725e0b07a4f734eddb1c569ef76bcf`, and its measurements
+remain historical evidence. The maintainer approved exact-pinned
+BouncyCastle.Cryptography 2.7.0 for SHA-224 and Argon2id (including reviewed
+internal helpers) and subagent implementation/review on 2026-11-12. See
+[csharp-native-experiment.md](spec/design/csharp-native-experiment.md) and its
+scope, host and crypto inventories.
 
 The maintainer approved Ruby's OpenSSL binding for vetted cryptographic digest
 functions and stdlib Zlib for byte-identical CRC32 checksums in this experiment.

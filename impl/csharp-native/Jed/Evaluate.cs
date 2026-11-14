@@ -5,18 +5,19 @@ internal static partial class Evaluate
     internal static SqlValue Expr(Resolved expression, Meter meter, bool filter = false, SqlValue[]? row = null, bool entered = false)
     {
         if (!entered) meter.Guard();
+        if (expression.Op == "column") return row is null ? throw new InvalidOperationException("column outside row") : row[expression.Slot];
+        if (expression.Op == "constant") return expression.Constant;
         if (expression.Op == "outer") return expression.Outer!.Value;
         if (expression.Op == "initplan") return expression.Subquery!.Value;
         if (expression.Op == "in_init") return SubqueryExecution.In(expression, meter, row);
-        if (expression.Op == "constant") return expression.Constant;
         if (expression.Op == "collate") return Expr(expression.Args[0], meter, filter, row);
-        if (expression.Op == "column") return row is null ? throw new InvalidOperationException("column outside row") : row[expression.Slot];
         if (expression.Op == "promote") return TemporalText.Cast(Expr(expression.Args[0], meter, row: row), expression.Type, meter);
         if (!entered && !(expression.Op == "not" && expression.Text == "predicate")) meter.Charge(expression.Op == "in_list" ? (expression.Args.Length - 2) * Costs.OperatorEval : expression.HostFunction?.Cost ?? expression.Function?.Cost ?? Costs.OperatorEval);
+        if (expression.Op == "cast") return Unary(expression, Expr(expression.Args[0], meter, row: row), meter);
         if (expression.Op == "host")
         {
             meter.Guard();
-            var arguments = expression.Args.Select(argument => Expr(argument, meter, row: row)).ToArray();
+            var arguments = Arguments(expression.Args, meter, row);
             return HostFunctionExecution.Call(expression, arguments, meter, row);
         }
         if (expression.Op == "in_list") return LiteralMembership(expression, Expr(expression.Args[0], meter, row: row), meter);
@@ -24,27 +25,13 @@ internal static partial class Evaluate
         if (expression.Op is "array" or "row" or "field" or "subscript") return OpenExpression.Evaluate(expression, meter, row);
         if (expression.Op == "float_widen") return Resolve.Cast(Expr(expression.Args[0], meter, row: row), expression.Type);
         if (expression.Op is "json_sql" or "is_json") return JsonSql.Evaluate(expression, meter, row);
-        if (expression.Similar is not null) return SimilarFunctions.Call(expression, expression.Args.Select(argument => Expr(argument, meter, row: row)).ToArray(), meter);
+        if (expression.Similar is not null) return SimilarFunctions.Call(expression, Arguments(expression.Args, meter, row), meter);
         if (expression.Regex is not null)
         {
-            var values = expression.Args.Select(argument => Expr(argument, meter, row: row)).ToArray();
+            var values = Arguments(expression.Args, meter, row);
             return RegexFunctions.Call(expression, values, meter);
         }
-        if (expression.Op == "call")
-        {
-            var args = expression.Args.Select(a => Expr(a, meter, row: row)).ToArray();
-            if (expression.ArrayArguments)
-            {
-                if (args[^1].IsNull && expression.Text != "format") return SqlValue.Null(expression.Type);
-                args = args.Take(args.Length - 1).Concat(args[^1].IsNull ? [] : args[^1].AsArray().Values).ToArray();
-            }
-            if (expression.Function!.Nulls == "propagates" && args.Any(a => a.IsNull)) return SqlValue.Null(expression.Type);
-            if (expression.Function.Variadic && expression.Text is "json_build_array" or "jsonb_build_array" or "json_build_object" or "jsonb_build_object") args = args[0].AsArray().Values.ToArray();
-            var result = expression.Text == "width_bucket_array" ? OpenFunctions.WidthBucket(args, meter, expression.Collation) : ScalarFunctions.Call(expression.Text, args, expression.Type, meter);
-            var grows = expression.Text is "encode" or "overlay" or "quote_literal" or "quote_nullable" or "quote_ident" or "like_escape" or "concat" or "similar_to_escape" or "array_append" or "array_prepend" or "array_cat" or "to_char" or "json_build_array" or "jsonb_build_array" or "json_build_object" or "jsonb_build_object" or "to_json" or "to_jsonb" or "array_to_json" or "row_to_json" or "json_object" or "jsonb_object" or "jsonb_set" or "jsonb_set_lax" or "jsonb_insert" or "jsonb_path_query_array" or "jsonb_path_query_array_tz" or "json_scalar" or "json_serialize";
-            if (grows && !(expression.Text == "jsonb_set_lax" && args[2].IsNull && !args[4].IsNull && args[4].AsText() is "delete_key" or "return_target")) Growth(expression.GrowthOperands ?? expression.Args, result, meter);
-            return result;
-        }
+        if (expression.Op == "call") return Call(expression, Arguments(expression.Args, meter, row), meter);
         if (expression.Op == "case")
         {
             for (var i = 0; i < expression.Args.Length - 1; i += 2)
@@ -67,39 +54,25 @@ internal static partial class Evaluate
             return best;
         }
         var left = Expr(expression.Args[0], meter, filter && expression.Op == "and", row);
-        switch (expression.Op)
-        {
-            case "stable_date": return TemporalText.Date(left.AsText(), meter);
-            case "extract": return TemporalFunctions.Extract(expression.Text, left, meter);
-            case "cast":
-                var cast = TemporalText.Cast(left, expression.Type, meter);
-                if ((expression.Type == SqlType.Text && (left.Type.Kind == SqlKind.Array || left.Type == SqlType.Bytea || left.Type == SqlType.Jsonb)) || expression.Type == SqlType.Json && left.Type == SqlType.Jsonb || left.Type.Kind == SqlKind.Array && left.Type.Element == SqlType.Bytea && expression.Type.Kind == SqlKind.Array && expression.Type.Element == SqlType.Text)
-                    Growth(expression.GrowthOperands ?? expression.Args, cast, meter);
-                if (!left.IsNull && left.Type == SqlType.Text && expression.Type == SqlType.Jsonpath)
-                { meter.Charge(System.Text.Encoding.UTF8.GetByteCount(left.AsText()) * Costs.JsonpathCompile); meter.Guard(); }
-                return Resolve.ApplyModifier(cast, expression.Target!);
-            case "is_boolean":
-                var condition = expression.Text.EndsWith("unknown", StringComparison.Ordinal) ? left.IsNull :
-                    !left.IsNull && left.AsBoolean() == expression.Text.EndsWith("true", StringComparison.Ordinal);
-                return SqlValue.Boolean(expression.Text.StartsWith("not_", StringComparison.Ordinal) ? !condition : condition);
-            case "is_null": return SqlValue.Boolean(left.IsNull || left.Type.Kind == SqlKind.Composite && left.AsComposite().Fields.All(field => field.IsNull));
-            case "is_not_null": return SqlValue.Boolean(!left.IsNull && (left.Type.Kind != SqlKind.Composite || left.AsComposite().Fields.All(field => !field.IsNull)));
-            case "not": return left.IsNull ? SqlValue.Null(SqlType.Boolean) : SqlValue.Boolean(!left.AsBoolean());
-            case "neg":
-                if (left.IsNull) return SqlValue.Null(expression.Type);
-                if (left.Type == SqlType.Interval) return SqlValue.Interval(left.AsInterval().Negate());
-                if (left.Type == SqlType.Decimal) return SqlValue.Decimal(left.AsDecimal().Negate());
-                if (left.Type.IsFloat()) return SqlValue.Float(-left.AsFloat(), left.Type);
-                try { return SqlValue.Integer(checked(-left.AsInteger()), expression.Type); }
-                catch (OverflowException) { throw Errors.Overflow(); }
-            case "and":
-                if ((!left.IsNull && !left.AsBoolean()) || (filter && left.IsNull)) return left;
-                break;
-            case "or":
-                if (!left.IsNull && left.AsBoolean()) return left;
-                break;
-        }
+        if (expression.Op is "stable_date" or "extract" or "cast" or "is_boolean" or "is_null" or "is_not_null" or "not" or "neg")
+            return Unary(expression, left, meter);
+        if (expression.Op == "and" && ((!left.IsNull && !left.AsBoolean()) || filter && left.IsNull)) return left;
+        if (expression.Op == "or" && !left.IsNull && left.AsBoolean()) return left;
         var right = Expr(expression.Args[1], meter, filter && expression.Op == "and", row);
+        return Binary(expression, left, right, meter);
+    }
+
+    private static SqlValue[] Arguments(Resolved[] arguments, Meter meter, SqlValue[]? row)
+    {
+        if (arguments.Length == 0) return Array.Empty<SqlValue>();
+        var values = new SqlValue[arguments.Length];
+        for (var index = 0; index < values.Length; index++) values[index] = Expr(arguments[index], meter, row: row);
+        return values;
+    }
+
+    // Both drivers enter the same resident kernel after consuming operands once.
+    private static SqlValue Binary(Resolved expression, SqlValue left, SqlValue right, Meter meter)
+    {
         if (expression.Op == "nullif") return !left.IsNull && !right.IsNull && Compare(left, right, meter) == 0 ? SqlValue.Null(expression.Type) : left;
         if (expression.Op == "and")
         {
@@ -176,6 +149,52 @@ internal static partial class Evaluate
         });
     }
 
+    private static SqlValue Unary(Resolved expression, SqlValue left, Meter meter)
+    {
+        switch (expression.Op)
+        {
+            case "stable_date": return TemporalText.Date(left.AsText(), meter);
+            case "extract": return TemporalFunctions.Extract(expression.Text, left, meter);
+            case "cast":
+                var cast = TemporalText.Cast(left, expression.Type, meter);
+                if ((expression.Type == SqlType.Text && (left.Type.Kind == SqlKind.Array || left.Type == SqlType.Bytea || left.Type == SqlType.Jsonb)) || expression.Type == SqlType.Json && left.Type == SqlType.Jsonb || left.Type.Kind == SqlKind.Array && left.Type.Element == SqlType.Bytea && expression.Type.Kind == SqlKind.Array && expression.Type.Element == SqlType.Text)
+                    Growth(expression.GrowthOperands ?? expression.Args, cast, meter);
+                if (!left.IsNull && left.Type == SqlType.Text && expression.Type == SqlType.Jsonpath)
+                { meter.Charge(System.Text.Encoding.UTF8.GetByteCount(left.AsText()) * Costs.JsonpathCompile); meter.Guard(); }
+                return Resolve.ApplyModifier(cast, expression.Target!);
+            case "is_boolean":
+                var condition = expression.Text.EndsWith("unknown", StringComparison.Ordinal) ? left.IsNull :
+                    !left.IsNull && left.AsBoolean() == expression.Text.EndsWith("true", StringComparison.Ordinal);
+                return SqlValue.Boolean(expression.Text.StartsWith("not_", StringComparison.Ordinal) ? !condition : condition);
+            case "is_null": return SqlValue.Boolean(left.IsNull || left.Type.Kind == SqlKind.Composite && left.AsComposite().Fields.All(field => field.IsNull));
+            case "is_not_null": return SqlValue.Boolean(!left.IsNull && (left.Type.Kind != SqlKind.Composite || left.AsComposite().Fields.All(field => !field.IsNull)));
+            case "not": return left.IsNull ? SqlValue.Null(SqlType.Boolean) : SqlValue.Boolean(!left.AsBoolean());
+            case "neg":
+                if (left.IsNull) return SqlValue.Null(expression.Type);
+                if (left.Type == SqlType.Interval) return SqlValue.Interval(left.AsInterval().Negate());
+                if (left.Type == SqlType.Decimal) return SqlValue.Decimal(left.AsDecimal().Negate());
+                if (left.Type.IsFloat()) return SqlValue.Float(-left.AsFloat(), left.Type);
+                try { return SqlValue.Integer(checked(-left.AsInteger()), expression.Type); }
+                catch (OverflowException) { throw Errors.Overflow(); }
+            default: throw new InvalidOperationException("unresolved unary operation");
+        }
+    }
+
+    private static SqlValue Call(Resolved expression, SqlValue[] args, Meter meter)
+    {
+        if (expression.ArrayArguments)
+        {
+            if (args[^1].IsNull && expression.Text != "format") return SqlValue.Null(expression.Type);
+            args = args.Take(args.Length - 1).Concat(args[^1].IsNull ? [] : args[^1].AsArray().Values).ToArray();
+        }
+        if (expression.Function!.Nulls == "propagates" && args.Any(a => a.IsNull)) return SqlValue.Null(expression.Type);
+        if (expression.Function.Variadic && expression.Text is "json_build_array" or "jsonb_build_array" or "json_build_object" or "jsonb_build_object") args = args[0].AsArray().Values.ToArray();
+        var result = expression.Text == "width_bucket_array" ? OpenFunctions.WidthBucket(args, meter, expression.Collation) : ScalarFunctions.Call(expression.Text, args, expression.Type, meter);
+        var grows = expression.Text is "encode" or "overlay" or "quote_literal" or "quote_nullable" or "quote_ident" or "like_escape" or "concat" or "similar_to_escape" or "array_append" or "array_prepend" or "array_cat" or "to_char" or "json_build_array" or "jsonb_build_array" or "json_build_object" or "jsonb_build_object" or "to_json" or "to_jsonb" or "array_to_json" or "row_to_json" or "json_object" or "jsonb_object" or "jsonb_set" or "jsonb_set_lax" or "jsonb_insert" or "jsonb_path_query_array" or "jsonb_path_query_array_tz" or "json_scalar" or "json_serialize";
+        if (grows && !(expression.Text == "jsonb_set_lax" && args[2].IsNull && !args[4].IsNull && args[4].AsText() is "delete_key" or "return_target")) Growth(expression.GrowthOperands ?? expression.Args, result, meter);
+        return result;
+    }
+
     internal static bool Constant(Resolved expression) => !expression.ParameterUnbound && expression.Op is not ("column" or "outer" or "correlated" or "in_correlated" or "quantified_correlated" or "quantified_init" or "subquery" or "parameter_host" or "host" or "stable_date" or "initplan" or "in_init") &&
         !(expression.Op == "call" && expression.Text is "now" or "clock_timestamp" or "current_date" or "nextval" or "currval" or "setval" or "lastval" or "uuidv4" or "gen_random_uuid" or "uuidv7" or "current_setting") && expression.Args.All(Constant);
     internal static void Growth(Resolved[] operands, SqlValue result, Meter meter)
@@ -186,6 +205,7 @@ internal static partial class Evaluate
 
     internal static int Compare(SqlValue left, SqlValue right, Meter? meter = null)
     {
+        if (left.Type.IsInteger() && right.Type.IsInteger()) return left.AsInteger().CompareTo(right.AsInteger());
         if (left.Type == SqlType.Jsonb) return JsonOps.Compare(left.AsJsonb(), right.AsJsonb());
         if (left.Type.Kind is SqlKind.Array or SqlKind.Composite or SqlKind.Range) return OpenValue.Compare(left, right);
         if (left.Type.IsFloat() && right.Type.IsFloat()) return FloatValue.Compare(left.AsFloat(), right.AsFloat());
@@ -207,9 +227,15 @@ internal static partial class Evaluate
             return left.ByteSpan.SequenceCompareTo(right.ByteSpan);
         }
         var a = left.AsText(); var b = right.AsText();
-        var length = Math.Min(a.EnumerateRunes().Count(), b.EnumerateRunes().Count());
-        meter?.Charge(Math.Max(0, length - 1) * Costs.VarlenCompare);
-        meter?.Guard();
+        if (meter is not null)
+        {
+            var aLength = 0; var bLength = 0;
+            foreach (var _ in a.EnumerateRunes()) aLength++;
+            foreach (var _ in b.EnumerateRunes()) bLength++;
+            var length = Math.Min(aLength, bLength);
+            meter.Charge(Math.Max(0, length - 1) * Costs.VarlenCompare);
+            meter.Guard();
+        }
         // Valid Unicode scalar order equals UTF-8 byte order. Iterate scalars
         // without allocating encoded copies or using UTF-16 ordinal comparison.
         var ae = a.EnumerateRunes(); var be = b.EnumerateRunes();

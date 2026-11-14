@@ -10,7 +10,23 @@ internal static partial class Evaluate
             var value = expression.Op == "constant" ? expression.Constant : expression.Op == "outer" ? expression.Outer!.Value : row![expression.Slot];
             return value.ResolveAsync(meter.Cancellation);
         }
-        return expression.NeedsAsync ? PendingExpression(expression, meter, filter, row) : ValueTask.FromResult(Expr(expression, meter, filter, row));
+        // Inspect availability only: do not evaluate or resolve an operand here.
+        // Resident expressions use the same synchronous kernel and charge order;
+        // deferred cells and subqueries retain the continuation path, including
+        // short-circuiting and exactly-once host calls.
+        return !expression.NeedsAsync || ResidentInputs(expression, row)
+            ? new(Expr(expression, meter, filter, row)) : PendingExpression(expression, meter, filter, row);
+
+    }
+
+    private static bool ResidentInputs(Resolved expression, SqlValue[]? row)
+    {
+        if (expression.Subquery is not null || expression.Outer is not null || expression.Json is not null) return false;
+        if (expression.Op == "column") return row is not null && !row[expression.Slot].IsDeferred;
+        if (expression.Op == "constant") return !expression.Constant.IsDeferred;
+        foreach (var argument in expression.Args) if (!ResidentInputs(argument, row)) return false;
+        foreach (var argument in expression.GrowthOperands ?? []) if (!ResidentInputs(argument, row)) return false;
+        return true;
     }
 
     private static async ValueTask<SqlValue> PendingExpression(Resolved expression, Meter meter, bool filter, SqlValue[]? row)
@@ -89,7 +105,35 @@ internal static partial class Evaluate
             }
             return best;
         }
+        if (expression.Op is "+" or "-" or "*" or "/" or "%" or "^" or "=" or "<>" or "!=" or "<" or "<=" or ">" or ">=" or
+            "and" or "or" or "nullif" or "distinct" or "not_distinct" or "at_time_zone" or "quantified" or "json_path_binary" or
+            "json_binary" or "open_predicate" or "range_set" or "||" or "like" or "ilike")
+        {
+            var left = await ExprAsync(expression.Args[0], meter, filter && expression.Op == "and", row).ConfigureAwait(false);
+            if (expression.Op == "and" && (!left.IsNull && !left.AsBoolean() || filter && left.IsNull)) return left;
+            if (expression.Op == "or" && !left.IsNull && left.AsBoolean()) return left;
+            var right = await ExprAsync(expression.Args[1], meter, filter && expression.Op == "and", row).ConfigureAwait(false);
+            meter.Guard();
+            return Binary(expression, left, right, meter);
+        }
+        if (expression.Op is "stable_date" or "extract" or "cast" or "is_boolean" or "is_null" or "is_not_null" or "not" or "neg")
+        {
+            var value = await ExprAsync(expression.Args[0], meter, row: row).ConfigureAwait(false);
+            meter.Guard();
+            return Unary(expression, value, meter);
+        }
+        if (expression.Op == "call" || expression.Regex is not null || expression.Similar is not null)
+        {
+            var values = new SqlValue[expression.Args.Length];
+            for (var i = 0; i < values.Length; i++) values[i] = await ExprAsync(expression.Args[i], meter, row: row).ConfigureAwait(false);
+            meter.Guard();
+            if (expression.Similar is not null) return SimilarFunctions.Call(expression, values, meter);
+            if (expression.Regex is not null) return RegexFunctions.Call(expression, values, meter);
+            return Call(expression, values, meter);
+        }
         var args = new Resolved[expression.Args.Length];
+
+
         for (var i = 0; i < args.Length; i++)
         {
             var argument = expression.Args[i];

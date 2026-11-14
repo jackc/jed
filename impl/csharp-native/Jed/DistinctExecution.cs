@@ -16,7 +16,7 @@ internal static class DistinctExecution
         using var keptMemory = new QueryInputMemory(meter);
         using var stateMemory = new QueryInputMemory(meter);
         var touched = StorageTouchedColumns.Collect(plan);
-        var seen = new HashSet<string>(StringComparer.Ordinal);
+        var seen = new HashSet<byte[]>(ByteKeyComparer.Instance);
         var retained = new List<(SqlValue[] Values, SortValue[] Keys, int Ordinal)>();
         var order = plan.Order ?? [];
         long skipped = 0, produced = 0;
@@ -30,7 +30,7 @@ internal static class DistinctExecution
                 for (var i = 0; i < projected.Length; i++) projected[i] = await Evaluate.ExprAsync(plan.Projections[i].Expression, meter, row: row).ConfigureAwait(false);
                 foreach (var value in projected) GroupExecution.ChargeKey(value, meter);
                 inputOwner?.Release(row);
-                if (!seen.Add(GroupExecution.Identity(projected))) continue;
+                if (!seen.Add(GroupExecution.EncodedIdentity(projected))) continue;
                 if (meter.Memory.Enabled) stateMemory.ReserveBytes(MemorySize.EntryBytes(projected));
                 if (skipped++ < plan.Offset) continue;
                 meter.Charge(Costs.RowProduced); meter.Checkpoint(); produced++;
@@ -64,7 +64,7 @@ internal static class DistinctExecution
             var projected = new SqlValue[plan.Projections.Length];
             for (var i = 0; i < projected.Length; i++) projected[i] = await Evaluate.ExprAsync(plan.Projections[i].Expression, meter, row: row.Values).ConfigureAwait(false);
             foreach (var value in projected) GroupExecution.ChargeKey(value, meter);
-            if (!seen.Add(GroupExecution.Identity(projected))) continue;
+            if (!seen.Add(GroupExecution.EncodedIdentity(projected))) continue;
             if (meter.Memory.Enabled) stateMemory.ReserveBytes(MemorySize.EntryBytes(projected));
             keptMemory.Reserve(projected); unique.Add(projected);
         }

@@ -5,6 +5,17 @@ internal static class PageClientTests
 {
     internal static async Task Run()
     {
+        foreach (var failRead in new[] { false, true })
+        {
+            var broken = new HandshakeFailureStream(failRead);
+            try
+            {
+                _ = await PageClientConnection.ConnectStreamAsync(broken, false, new(0, []));
+                throw new InvalidDataException("broken handshake unexpectedly succeeded");
+            }
+            catch (SqlException error) { Corpus.Equal(SqlStates.ConnectionFailure, error.SqlState, "handshake transport failure is canonical connection failure"); }
+            Corpus.Equal(true, broken.Disposed, "failed handshake disposes transport");
+        }
         var path = Path.Combine(Path.GetTempPath(), "jed-csharp-wire-" + Guid.NewGuid().ToString("N") + ".sock");
         using var listener = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified);
         listener.Bind(new UnixDomainSocketEndPoint(path)); listener.Listen(1);
@@ -61,5 +72,15 @@ internal static class PageClientTests
         }
         finally { listener.Dispose(); File.Delete(path); }
         Console.WriteLine("PASS page-client host transport: real Unix socket, negotiated limits, out-of-order writer/read replies, pin messages and cancellation disconnect");
+    }
+
+    private sealed class HandshakeFailureStream(bool failRead) : MemoryStream
+    {
+        internal bool Disposed { get; private set; }
+        public override ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken = default) =>
+            failRead ? ValueTask.CompletedTask : ValueTask.FromException(new IOException("injected hello write failure"));
+        public override ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default) =>
+            ValueTask.FromException<int>(new IOException("injected hello read failure"));
+        protected override void Dispose(bool disposing) { Disposed = true; base.Dispose(disposing); }
     }
 }

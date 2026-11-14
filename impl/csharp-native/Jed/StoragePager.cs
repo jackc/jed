@@ -15,6 +15,8 @@ internal sealed class StoragePager(IBlockStore store, int pageSize, long cacheBy
         internal readonly byte[] Bytes = bytes;
         internal readonly byte[] Tag = tag;
         internal bool Referenced = true;
+        internal StorageLeafSchema? LeafSchema;
+        internal StorageLeaf? Leaf;
     }
 
     private readonly object gate = new();
@@ -98,6 +100,28 @@ internal sealed class StoragePager(IBlockStore store, int pageSize, long cacheBy
             CheckLive();
             if (Encrypted && !CryptographicOperations.FixedTimeEquals(entry.Tag, reference.Tag.Span)) throw StorageFormat.Corrupt("cached encrypted page pointer tag mismatch");
         }
+    }
+
+    // Parsed leaf directories share the byte cache's ownership and eviction.
+    // Cache only the current schema interpretation of a page; an old buffer
+    // held across invalidation must never attach its parse to a reused page id.
+    internal StorageLeaf Leaf(uint id, ReadOnlyMemory<byte> page, StorageLeafSchema schema)
+    {
+        static bool SameSchema(StorageLeafSchema left, StorageLeafSchema right)
+        {
+            if (ReferenceEquals(left, right)) return true;
+            if (left.FixedKeyWidth != right.FixedKeyWidth || left.Columns.Length != right.Columns.Length) return false;
+            for (var i = 0; i < left.Columns.Length; i++) if (left.Columns[i] != right.Columns[i]) return false;
+            return true;
+        }
+        lock (gate)
+            if (resident.TryGetValue(id, out var entry) && page.Equals((ReadOnlyMemory<byte>)entry.Bytes) &&
+                entry.Leaf is { } leaf && SameSchema(entry.LeafSchema!, schema)) return leaf;
+        var parsed = StorageLeaf.Parse(page, schema, Encrypted);
+        lock (gate)
+            if (resident.TryGetValue(id, out var entry) && page.Equals((ReadOnlyMemory<byte>)entry.Bytes))
+            { entry.LeafSchema = schema; entry.Leaf = parsed; }
+        return parsed;
     }
 
     internal void Invalidate(uint id)

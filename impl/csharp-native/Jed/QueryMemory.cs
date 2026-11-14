@@ -4,7 +4,12 @@ namespace Jed;
 // unlimited path; callers test Enabled before measuring buffered values.
 internal static class MemorySize
 {
-    internal static long SortKeyBytes(IEnumerable<SortValue> keys) => keys.Aggregate(0L, (bytes, key) => key.Key is null ? bytes : Meter.Add(bytes, MemorySchedule.Value + key.Key.Length));
+    internal static long SortKeyBytes(SortValue[] keys)
+    {
+        long bytes = 0;
+        foreach (var key in keys) if (key.Key is not null) bytes = Meter.Add(bytes, MemorySchedule.Value + key.Key.Length);
+        return bytes;
+    }
     internal static long RowBytes(IReadOnlyList<SqlValue> row, IReadOnlyList<bool>? touched = null)
     {
         var bytes = MemorySchedule.Row;
@@ -55,7 +60,7 @@ internal static class MemorySize
     }
     internal static long KeyBytes(IReadOnlyList<SqlValue> values)
     {
-        long bytes = 0; foreach (var value in values) bytes = Meter.Add(bytes, ValueBytes(value)); return bytes;
+        long bytes = 0; for (var i = 0; i < values.Count; i++) bytes = Meter.Add(bytes, ValueBytes(values[i])); return bytes;
     }
     internal static long EntryBytes(IReadOnlyList<SqlValue> values) => Meter.Add(MemorySchedule.Entry, KeyBytes(values));
 }
@@ -67,6 +72,15 @@ internal sealed class QueryMemoryAccount(long limit, Meter meter)
     internal long Peak { get; private set; }
     internal long Pending { get; private set; }
     internal int ReleaseUnderflows { get; private set; }
+    internal readonly record struct AttemptMark(long Used, long Peak);
+    internal AttemptMark Mark() => new(Used, Peak);
+    internal void Rewind(AttemptMark mark)
+    {
+        // Pending writes predate the read-only attempt and remain held. Keep
+        // underflow diagnostics: rewinding must not conceal invalid releases.
+        if (mark.Used < Pending) throw new InvalidOperationException("attempt changed pending memory");
+        Used = mark.Used; Peak = mark.Peak;
+    }
     internal bool TryReserve(long bytes)
     {
         if (!Enabled) return true;

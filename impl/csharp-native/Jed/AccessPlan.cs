@@ -31,6 +31,13 @@ internal sealed record AccessPlan(AccessKind Kind, long EstimatedRows, long Esti
 
     internal static AccessPlan Rebind(AccessPlan selected, CatalogTable table, StorageTree tree, Resolved? filter, QueryStorage storage, Meter meter)
     {
+        // Selection and estimates are already pinned. A primary-tree execution
+        // only needs its bound bytes; rebuilding the entire candidate inventory
+        // per outer row needlessly repeats statistics and expression analysis.
+        if (selected.Kind == AccessKind.Primary)
+            return selected with { Scan = TableAccess.Bounds(filter, table) };
+        if (selected.Kind == AccessKind.Full)
+            return selected with { Scan = new() };
         var rebound = Inventory(table, tree, filter, storage, meter).FirstOrDefault(candidate => candidate.Kind == selected.Kind && candidate.Index?.Name == selected.Index?.Name);
         if (rebound is not null) return rebound with { Ordered = selected.Ordered, Streaming = selected.Streaming };
         // A promoted fractional range endpoint drops its half-bound. Keep the
@@ -131,8 +138,9 @@ internal sealed record AccessPlan(AccessKind Kind, long EstimatedRows, long Esti
     {
         if (range.Empty) return;
         meter.Charge(await tree.CountRangePagesAsync(range.Lower, range.LowerInclusive, range.Upper, range.UpperInclusive, token).ConfigureAwait(false));
-        await foreach (var record in tree.ScanRangeAsync(range.Lower, range.LowerInclusive, range.Upper, range.UpperInclusive, cancellationToken: token).ConfigureAwait(false))
-            meter.Charge(tree.ValueReadUnits(record, touched));
+        if (tree.HasValueReadUnits(touched))
+            await foreach (var record in tree.ScanRangeAsync(range.Lower, range.LowerInclusive, range.Upper, range.UpperInclusive, cancellationToken: token).ConfigureAwait(false))
+                meter.Charge(tree.ValueReadUnits(record, touched));
     }
     internal async IAsyncEnumerable<SqlValue[]> Rows(CatalogTable table, StorageTree tree, QueryStorage storage, Meter meter,
         IReadOnlySet<int>? touched, [EnumeratorCancellation] CancellationToken token, bool reverse = false, HostScanBatch? hostBatch = null)
@@ -157,6 +165,43 @@ internal sealed record AccessPlan(AccessKind Kind, long EstimatedRows, long Esti
                 meter.Charge(Costs.StorageRowRead); meter.Checkpoint(token);
                 if (ReferenceEquals(row, failedRow)) System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(decodeFailure!).Throw();
                 yield return row;
+            }
+            yield break;
+        }
+        if (IndexSet is null && Btree is null && Gist is null && Gin is null && !tree.HasValueReadUnits())
+        {
+            var ranges = Ranges ?? [Scan ?? new()];
+            if (!(Streaming && Ranges is not null))
+            {
+                meter.Checkpoint(token);
+                foreach (var range in ranges)
+                    if (!range.Empty) meter.Charge(await tree.CountRangePagesAsync(range.Lower, range.LowerInclusive, range.Upper, range.UpperInclusive, token).ConfigureAwait(false));
+                meter.Checkpoint(token);
+            }
+            foreach (var range in reverse ? ranges.Reverse() : ranges)
+            {
+                if (range.Empty) continue;
+                if (Streaming && Ranges is not null)
+                    meter.Charge(await tree.CountRangePagesAsync(range.Lower, range.LowerInclusive, range.Upper, range.UpperInclusive, token).ConfigureAwait(false));
+                // Keep the single-descent point path. General ranges cross an
+                // async boundary only at leaves; each emitted row still owns
+                // its values and observes cancellation before its row charge.
+                if (KeyIntervals.Point(range))
+                {
+                    await foreach (var row in tree.ScanRangeRowsAsync(range.Lower, range.LowerInclusive, range.Upper, range.UpperInclusive, reverse, token).ConfigureAwait(false))
+                    {
+                        meter.Charge(Costs.StorageRowRead); meter.Checkpoint(token);
+                        yield return row.DecodeFixed(table, tree);
+                    }
+                    continue;
+                }
+                await foreach (var chunk in tree.ScanRangeChunksAsync(range.Lower, range.LowerInclusive, range.Upper, range.UpperInclusive, reverse, token).ConfigureAwait(false))
+                    for (var i = reverse ? chunk.Until - 1 : chunk.From; reverse ? i >= chunk.From : i < chunk.Until; i += reverse ? -1 : 1)
+                    {
+                        token.ThrowIfCancellationRequested();
+                        meter.Charge(Costs.StorageRowRead); meter.Checkpoint(token);
+                        yield return chunk.Row(i).DecodeFixed(table, tree);
+                    }
             }
             yield break;
         }
@@ -205,8 +250,9 @@ internal sealed record AccessPlan(AccessKind Kind, long EstimatedRows, long Esti
         {
             if (range.Empty) continue;
             meter.Charge(await tree.CountRangePagesAsync(range.Lower, range.LowerInclusive, range.Upper, range.UpperInclusive, token).ConfigureAwait(false));
-            await foreach (var record in tree.ScanRangeAsync(range.Lower, range.LowerInclusive, range.Upper, range.UpperInclusive, cancellationToken: token).ConfigureAwait(false))
-                meter.Charge(tree.ValueReadUnits(record, touched));
+            if (tree.HasValueReadUnits(touched))
+                await foreach (var record in tree.ScanRangeAsync(range.Lower, range.LowerInclusive, range.Upper, range.UpperInclusive, cancellationToken: token).ConfigureAwait(false))
+                    meter.Charge(tree.ValueReadUnits(record, touched));
         }
         meter.Checkpoint(token);
         foreach (var range in reverse ? ranges.Reverse() : ranges)

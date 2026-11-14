@@ -23,7 +23,7 @@ internal static class StorageTests
         var empty = await File.ReadAllBytesAsync(Path.Combine(fixtureRoot, "empty_db.jed"));
         var expectedMeta = new StorageMeta(256, 1, 2, 3, 0, 1);
         Corpus.Equal(true, StorageFormat.EncodeMeta(expectedMeta).AsSpan().SequenceEqual(empty.AsSpan(0, 256)), "bootstrap meta exact golden");
-        Corpus.Equal(true, StorageFormat.EncodePage(256, new(1, 0, 0, 0), []).AsSpan().SequenceEqual(empty.AsSpan(512, 256)), "empty catalog exact golden");
+        Corpus.Equal(true, StorageFormat.EncodePage(256, new(1, 0, 0, 0, 1), []).AsSpan().SequenceEqual(empty.AsSpan(512, 256)), "empty catalog exact golden");
         await using (var memory = new MemoryBlockStore(empty))
         {
             var recovered = await StorageRecovery.OpenAsync(memory);
@@ -47,11 +47,13 @@ internal static class StorageTests
                 Corpus.Equal(true, selected.Meta.PageCount >= 3, "fixture has a catalog root");
                 var name = Path.GetFileName(fixture);
                 if (name.StartsWith("cow_", StringComparison.Ordinal))
-                    Corpus.Equal(name is "cow_inline.jed" or "cow_overflow.jed" or "cow_empty_tail.jed" ? 2UL : 1UL,
+                    Corpus.Equal(name is "cow_deferred_fold.jed" or "cow_deferred_overwrite.jed" or "cow_deferred_retire.jed" ? 3UL : name is "cow_inline.jed" or "cow_overflow.jed" or "cow_empty_tail.jed" or "cow_missing_root.jed" or "cow_deferred_retained.jed" ? 2UL : 1UL,
                         selected.Meta.TransactionId, $"recovery candidate for {name}");
             }
             count++;
         }
+        await StorageV53Tests.Run(root);
+        await StorageSerializationTests.Run(root);
         await Cache();
         await Commit(empty);
         await Preallocation(empty);
@@ -118,7 +120,7 @@ internal static class StorageTests
             {
                 var original = await pager.ReadPageAsync(catalog.Pages[i]);
                 var copied = plan.Body.Single(page => page.Page == encoded.Pages[i]).Bytes;
-                Corpus.Equal(true, original.Span[..8].SequenceEqual(copied.AsSpan(0, 8)) && original.Span[16..].SequenceEqual(copied.AsSpan(16)),
+                Corpus.Equal(true, original.Span[..2].SequenceEqual(copied.AsSpan(0, 2)) && original.Span[4..8].SequenceEqual(copied.AsSpan(4, 4)) && original.Span[16..].SequenceEqual(copied.AsSpan(16)),
                     $"catalog canonical metadata bytes {name} page {i}");
             }
             count++;
@@ -204,8 +206,22 @@ internal static class StorageTests
                     try
                     {
                         var leaf = StorageLeaf.Parse(page, schema);
-                        var encoded = StorageLeaf.Encode(size, schema, Enumerable.Range(0, leaf.Count).Select(leaf.Record).ToArray());
+                        var records = Enumerable.Range(0, leaf.Count).Select(leaf.Record).ToArray();
+                        var encoded = StorageLeaf.Encode(size, schema, records);
+                        StorageFormat.Stamp(encoded, BinaryPrimitives.ReadUInt16BigEndian(page.Span[2..]));
                         if (!encoded.AsSpan().SequenceEqual(page.Span)) continue;
+                        for (var split = 1; split <= records.Length; split++)
+                        {
+                            var prefix = records[..split];
+                            Corpus.Equal((long)StorageLeaf.EncodePayload(schema, prefix).Length, StorageLeaf.MeasurePayload(schema, prefix),
+                                "split candidate size equals independent encoding across shared compact-leaf shapes");
+                            if (split < records.Length)
+                            {
+                                var suffix = records[split..];
+                                Corpus.Equal((long)StorageLeaf.EncodePayload(schema, suffix).Length, StorageLeaf.MeasurePayload(schema, suffix),
+                                    "suffix candidate size equals independent compact encoding");
+                            }
+                        }
                         matched = true; break;
                     }
                     catch (SqlException error) when (error.SqlState == SqlStates.DataCorrupted) { }
@@ -259,7 +275,11 @@ internal static class StorageTests
             try
             {
                 _ = StorageLeaf.Parse(golden.AsMemory(at, 256), schema);
-                expectedLeaves.Add(Convert.ToHexString(golden.AsSpan(at, 256)));
+                var expected = golden.AsSpan(at, 256).ToArray();
+                // The fixture is a bootstrap image; these same leaf boundaries
+                // are being persisted by the second commit in this history.
+                StorageFormat.Stamp(expected, plan.Meta.TransactionId);
+                expectedLeaves.Add(Convert.ToHexString(expected));
             }
             catch (SqlException error) when (error.SqlState == SqlStates.DataCorrupted) { }
         }
@@ -301,7 +321,9 @@ internal static class StorageTests
                 if (image[at] == 3)
                 {
                     var page = image.AsSpan(at, 256);
-                    Corpus.Equal(true, StorageInterior.Parse(page, (uint)(image.Length / 256)).Encode(256).AsSpan().SequenceEqual(page), "interior golden re-encoding");
+                    var encoded = StorageInterior.Parse(page, (uint)(image.Length / 256)).Encode(256);
+                    StorageFormat.Stamp(encoded, BinaryPrimitives.ReadUInt16BigEndian(page[2..]));
+                    Corpus.Equal(true, encoded.AsSpan().SequenceEqual(page), "interior golden re-encoding");
                     interiors++;
                 }
         }

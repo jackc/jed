@@ -52,23 +52,27 @@ files in the same change.
   requested. Record coverage and omissions against the experiment's source revision;
   promotion to supported status requires a separate decision. See
   `spec/design/ruby-native-experiment.md` and `spec/design/swift-native-experiment.md`.
-  The C# experiment was authorized 2026-11-12 and completed/frozen 2026-11-13
-  against semantic baseline `b1a6affca7725e0b07a4f734eddb1c569ef76bcf`. Its frozen
-  implementation is commit `2849dd23f3e28b0e91674e27f99be2da58681805`. It targets
-  Linux x86-64, pinned .NET 11 and async-first APIs (inline resident kernels,
-  awaited storage I/O, no Task.Run wrapper). Engine34 passes all 12 SQL inventories
-  and four host variants; all 763 baseline SQL files pass across applicable storage
-  modes. All 496 mixed-core process cases, 16,000 threaded snapshot checks and 85
-  stable fault traces pass (76 exact peer comparisons, nine intrinsic checks).
-  Source identities and freeze proof are in `impl/csharp-native/VERIFICATION.md`.
-  Four variants ×three diagnostic measurement repeats are in
-  `impl/csharp-native/BENCHMARKS.md`:
-  current time/allocation overhead against Go is substantial, does not validate
-  earlier near-Rust expectations, and tmpfs commit timings are not physical-disk
-  durability latency. Production delivery and promotion remain separate decisions.
-  BouncyCastle.Cryptography 2.7.0 is approved for SHA-224 and Argon2id plus their
-  reviewed internal crypto helpers. Subagent implementation/review was authorized.
-  See `spec/design/csharp-native-experiment.md` and its scope/host/crypto matrices.
+  The explicitly authorized C# parity/performance refresh (2026-11-13) targets
+  `6b2355d98a7fd3738c60474779d1d63548f350dc` and format v53. Linux x86-64,
+  pinned .NET 11 and async-first APIs remain its scope: resident kernels run
+  inline and storage I/O is awaited, with no Task.Run wrapper. All 766 SQL files
+  pass across applicable storage modes under four JIT/NativeAOT configurations
+  (12 inventories); all four host suites, 496 mixed-core process cases, 16,000
+  threaded snapshot checks and 85 complete fault traces pass (76 exact peer
+  comparisons, nine intrinsic checks). The refresh adds generation/remap and
+  incremental-reclamation parity and removes measured query/storage allocation
+  and algorithm overhead. Artifact identities and acceptance evidence are in
+  `impl/csharp-native/VERIFICATION.md`; repeated matched measurements and their
+  limits are in `impl/csharp-native/BENCHMARKS.md`. The results show substantial
+  improvement but do not establish universal Go parity. Tmpfs commit timings
+  are not physical-disk durability latency. Production delivery and promotion
+  remain separate decisions; future updates remain opt-in.
+  The original C# freeze at `2849dd23f3e28b0e91674e27f99be2da58681805`, against
+  semantic baseline `b1a6affca7725e0b07a4f734eddb1c569ef76bcf`, and its measurements
+  remain historical evidence. BouncyCastle.Cryptography 2.7.0 is approved for
+  SHA-224 and Argon2id plus their reviewed internal crypto helpers. Subagent
+  implementation/review was authorized. See `spec/design/csharp-native-experiment.md`
+  and its scope/host/crypto matrices.
   The explicitly requested Ruby refresh (2026-11-12) tracks supported-core revision
   `b1a6affc`; coverage and remaining omissions are recorded in
   `impl/ruby-native/PARITY_UPDATE_2026-11-12.md`. Its experimental status and prior

@@ -1,0 +1,84 @@
+{
+  "semantic_revision": "9790a3aeabf171ddf185cd6a7cf035ae0050aae4",
+  "source_sha256": "c43b05cdeecd17a2f439dce5d91e4fa2c2d13c59b7f895b57f3b4458d1911751",
+  "build": {
+    "source_sha256": "c43b05cdeecd17a2f439dce5d91e4fa2c2d13c59b7f895b57f3b4458d1911751",
+    "sdk": "11.0.100",
+    "configuration": "Release",
+    "runtime_async": false,
+    "compilation": "jit"
+  },
+  "command": "mise run csharp-native:process --assembly /tmp/jed-csharp-refresh-accepted-jit/Jed.Check.dll --cores csharp-native,go,rust,node",
+  "exit_code": 0,
+  "cores": [
+    "csharp-native",
+    "go",
+    "rust",
+    "node"
+  ],
+  "scenarios": [
+    "attachment-gate-order",
+    "attachment-read-only-owner",
+    "attachment-service",
+    "backup-forms-through-the-page-service",
+    "backup-while-the-owner-writes",
+    "compaction-presence-and-continuity",
+    "encrypted-database-through-the-page-service",
+    "encrypted-database-through-the-stream-transport",
+    "encrypted-service-commit-resolution",
+    "multi-process-handoff-and-crash-release",
+    "service-client-churn-bounded",
+    "service-client-writes",
+    "service-commit-resolution",
+    "service-commit-resolution-by-promotion",
+    "service-election-and-reads",
+    "service-graceful-close",
+    "service-idle-in-transaction-timeout",
+    "service-owner-exit-and-promotion",
+    "service-owner-limits",
+    "service-ownership-never",
+    "service-read-only-owner-yields-to-writer",
+    "service-relaxed-clients",
+    "service-stream-transport",
+    "service-writer-gate",
+    "service-yield-to-prefer",
+    "storage-limit-live-pages",
+    "unchanged-writable-commits",
+    "validated-cow-manifest-reuse",
+    "validated-cow-overflow-handoff",
+    "validated-cow-serialization-error",
+    "validated-cow-stale-orphan-handoff"
+  ],
+  "cases_passed": 496,
+  "cases_failed": 0,
+  "pair_counts": {
+    "csharp-native->csharp-native": 31,
+    "csharp-native->go": 31,
+    "csharp-native->node": 31,
+    "csharp-native->rust": 31,
+    "go->csharp-native": 31,
+    "go->go": 31,
+    "go->node": 31,
+    "go->rust": 31,
+    "node->csharp-native": 31,
+    "node->go": 31,
+    "node->node": 31,
+    "node->rust": 31,
+    "rust->csharp-native": 31,
+    "rust->go": 31,
+    "rust->node": 31,
+    "rust->rust": 31
+  },
+  "artifacts": {
+    "Jed.Check.dll": {
+      "path": "/tmp/jed-csharp-refresh-accepted-jit/Jed.Check.dll",
+      "sha256": "d59f8a95797622310963bb40b00e1fd2525d4630a0827a7acb8cde90592e718c"
+    },
+    "Jed.CSharpExperiment.dll": {
+      "path": "/tmp/jed-csharp-refresh-accepted-jit/Jed.CSharpExperiment.dll",
+      "sha256": "4f94010e97e8eebf308680419c17f4576eb800b372ebbdeedcc09cfeeeb4541b"
+    }
+  },
+  "log": "/tmp/jed-csharp-refresh-accepted-process.log",
+  "log_sha256": "df2d1a64367b8ec2376961454d26dbeccfd3382e7e3e34355bca770c6041d8e3"
+}

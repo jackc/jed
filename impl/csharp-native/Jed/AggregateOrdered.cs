@@ -27,12 +27,12 @@ internal sealed class AggregateOrdered
         var order = plan.WithinOrder!;
         if (Hypothetical(plan.Name))
         {
-            long before = 0, inclusive = 0; var distinct = new HashSet<string>(StringComparer.Ordinal);
+            long before = 0, inclusive = 0; var distinct = new HashSet<byte[]>(ByteKeyComparer.Instance);
             var directKeys = direct.Select((value, i) => CollationRules.Decorate(value, order[i].Expression)).ToArray();
             for (var i = 0; i < inputs.Count; i++)
             {
                 var input = inputs[i]; var compare = Compare(order, decorations[i], directKeys);
-                if (compare < 0) { before++; distinct.Add(GroupExecution.Identity(input)); }
+                if (compare < 0) { before++; distinct.Add(GroupExecution.EncodedIdentity(input)); }
                 if (compare <= 0) inclusive++;
             }
             return plan.Name switch

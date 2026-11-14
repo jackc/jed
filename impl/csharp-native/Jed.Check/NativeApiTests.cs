@@ -10,6 +10,13 @@ internal static class NativeApiTests
     }
     internal static async Task Run()
     {
+        Check(default(SqlValue).IsNull && SqlValue.Null(SqlType.I64).IsNull, "default and typed SQL NULL");
+        Check(!SqlValue.Integer(0).IsNull && !SqlValue.Boolean(false).IsNull && !SqlValue.Text("").IsNull, "zero and empty scalars are present");
+        Check(SqlValue.Text("é").TextBytes == 2 && SqlValue.Json("\"é\"").TextBytes == 4, "shared text length payload counts UTF-8 bytes");
+        Check(BitConverter.DoubleToInt64Bits(SqlValue.Float(-0.0).AsFloat()) == long.MinValue, "floating scalar preserves signed zero");
+        var deferredNull = SqlValue.Deferred(SqlType.I64, new DeferredSqlValue(_ => new(SqlValue.Null(SqlType.I64))));
+        Check(!deferredNull.IsNull && (await deferredNull.ResolveAsync()).IsNull, "deferred null publishes only on resolution");
+        await PreparedCacheTests.Run();
         await using var session = new Session(new SessionOptions { TimeZone = "-09:00" });
         await session.ExecuteAsync("CREATE TABLE native_api (id i32 PRIMARY KEY, label text)");
         Check(await session.ExecuteAsync("INSERT INTO native_api VALUES ($1, $2)", [42, "owned"]) == 1, "native command count");

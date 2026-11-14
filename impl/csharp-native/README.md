@@ -1,9 +1,26 @@
 # Native C# experiment
 
 An independent, handwritten C# engine experiment targeting **.NET 11** and Linux
-x86-64, completed and frozen against semantic baseline
-`b1a6affca7725e0b07a4f734eddb1c569ef76bcf`. It remains opt-in; production delivery
-and supported-core promotion require separate decisions.
+x86-64. The authorized refresh implements supported-core revision
+`6b2355d98a7fd3738c60474779d1d63548f350dc`, including format v53, and restructures
+storage and query hot paths. All four final JIT/NativeAOT configurations pass
+the complete acceptance matrix. It remains opt-in; production delivery and
+supported-core promotion require separate decisions.
+
+The refresh adds generation stamps, retained-page remaps and incremental
+reclamation. Packed leaf updates, direct fixed-width scans, reusable prepared
+plans, resident expression evaluation and finite numeric aggregate folds reduce
+encoding, copying and per-row overhead. Logical memory, cost, cancellation and
+snapshot ownership contracts still govern these paths. The current inventory is
+764 pinned SQL files plus two distinct supplemental regressions. See
+[progress](PROGRESS.md) and the [verification record](VERIFICATION.md) for the final
+source identity: all 766 files across applicable storage modes, 12 inventories,
+496 process cases, 16,000 threaded checks and 85 recovery traces pass.
+[Repeated measurements](BENCHMARKS.md) compare the refreshed core and original
+NativeAOT actor with the current Go baseline.
+
+The following completion figures describe the **historical frozen experiment**
+at `b1a6affca7725e0b07a4f734eddb1c569ef76bcf`.
 
 All 763 distinct baseline SQL files pass across their applicable storage modes.
 Engine34 passes all 12 memory/plain/encrypted inventories under default/runtime-async
@@ -14,7 +31,7 @@ JIT and NativeAOT, all four host executables, 496 mixed-core process cases and
 [scope](../../spec/design/csharp-native-scope.md) and
 [verification record](VERIFICATION.md) for identities, exclusions and freeze proof.
 
-[Measured diagnostics](BENCHMARKS.md) show substantial current time and allocation
+[Historical measured diagnostics](BENCHMARKS.md) showed substantial time and allocation
 overhead against pinned Go. They do not validate the earlier near-Rust performance
 expectations. Files were on tmpfs: synchronous barriers were enabled, but commit
 timings are not physical-disk durability latency. These results do not select a
@@ -40,7 +57,8 @@ SHA-224/Argon2id dependency. The explicit AOT task also restores the SDK's Micro
 compiler/runtime packs and needs a native compiler such as clang.
 
 `csharp-native:conformance --file path/to/file.test` attempts one complete file.
-`--suite name` attempts a pinned suite; `--all` attempts the pinned baseline.
+`--suite name` attempts a pinned suite; `--all` attempts the pinned baseline and
+configured current supplements, deduplicated by spec-relative path.
 Neither option silently skips unsupported records. `--variant aot` runs the
 published NativeAOT executable; `jit-runtime-async` and `aot-runtime-async`
 select the separately verified runtime-async compilations.
@@ -48,8 +66,26 @@ select the separately verified runtime-async compilations.
 uses the same reopened file path under a fixed fixture credential and writes the separate
 cost/EXPLAIN transcript; `csharp-native:conformance-peer <run-log>` compares complete passing
 files against an independently executed pinned Go transcript. Explicit shared mode exclusions
-are reported as `SKIP`; unsupported SQL still fails. The default selection is the scalar foundation supplement.
+are reported as `SKIP`; unsupported SQL still fails. The default selection runs
+all configured supplements: scalar foundations, aggregate expression memory/error
+ordering, and dedicated numeric coercion.
 No normal repository task builds or installs this experiment.
+
+`mise run csharp-native:performance --profile extended --variant aot` runs the
+17-workload diagnostic profile against the independently pinned Go actor.
+`--profile cleanup` selects four additional diagnostics: numeric and text
+partitioned ranking windows, plus variable-text updates with rollback and durable
+commit. Both profiles use file hosts and verify matched row/checksum results;
+the cleanup profile does not measure the nonspill grouping implementation.
+Use `--assembly /absolute/path/to/actor` for a captured executable or DLL and
+`--output /absolute/path/to/evidence.json` to retain artifact identities, input,
+timing and allocation evidence. Run measurements without overlapping builds or
+tests. The cleanup profile leaves the existing diagnostic and extended inputs
+unchanged; compare each profile only with identical inputs and warmup settings.
+The final recorded comparison uses `--warmup-multiplier 10`, `taskset -c 0`
+on this host's performance core, and `DOTNET_TieredCompilation=0` for JIT only.
+See [benchmark methodology](BENCHMARKS.md) before comparing those results with
+default tiered-JIT startup or physical-disk commit latency.
 
 ## Async embedding
 

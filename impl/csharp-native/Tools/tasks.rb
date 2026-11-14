@@ -93,4 +93,18 @@ module CSharpNativeTasks
     File.write(marker, "#{revision}\n")
     File.join(destination, "spec")
   end
+
+  def baseline_go
+    revision = BASELINE.fetch("semantic_revision")
+    destination = File.join(BUILD, "simulation-peer-#{revision}")
+    marker = File.join(destination, ".complete")
+    unless File.file?(marker)
+      FileUtils.mkdir_p(destination)
+      statuses = Open3.pipeline(["git", "archive", revision, "impl/go", { chdir: ROOT }],
+                                ["tar", "-x", "-C", destination])
+      abort "Cannot extract pinned Go peer #{revision}" unless statuses.all?(&:success?)
+      File.write(marker, "#{revision}\n")
+    end
+    File.join(destination, "impl/go")
+  end
 end

@@ -72,7 +72,7 @@ public sealed partial class Database : IAsyncDisposable
         {
         await store.WriteAsync(0, bytes, cancellationToken).ConfigureAwait(false);
         await store.WriteAsync(pageSize, bytes, cancellationToken).ConfigureAwait(false);
-        await store.WriteAsync(2L * pageSize, StorageFormat.EncodePage(pageSize, new(1, 0, 0, 0), []), cancellationToken).ConfigureAwait(false);
+        await store.WriteAsync(2L * pageSize, StorageFormat.EncodePage(pageSize, new(1, 0, 0, 0, 1), []), cancellationToken).ConfigureAwait(false);
         return await OpenStoreAsync(store, cancellationToken, ephemeral: true, environment: environment).ConfigureAwait(false);
         }
         catch { await store.DisposeAsync().ConfigureAwait(false); throw; }
@@ -266,7 +266,8 @@ public sealed partial class Database : IAsyncDisposable
             // The new free list describes the generation being committed.
             // A reader of the previous current root still pins an older version.
             canReclaim = oldest > beforeStorage.Meta.TransactionId;
-            reuse = !ephemeral ? oldest >= beforeStorage.FreeGeneration ? new(beforeStorage.FreePages) : []
+            reuse = !ephemeral ? oldest >= beforeStorage.FreeGeneration
+                ? beforeStorage.FreePages.Where(page => !retiredAt.TryGetValue(page, out var at) || at <= oldest).ToHashSet() : []
                 : beforeStorage.FreePages.Where(page => !retiredAt.TryGetValue(page, out var at) || at <= oldest).ToHashSet();
             // Raw, host-coordinated file attachments use the frozen conservative
             // policy: their reader watermark must drain before any reuse.
@@ -275,7 +276,21 @@ public sealed partial class Database : IAsyncDisposable
                 fileState is { Options: { Locking: FileLocking.None, RoleHost: null } }) reuse.Clear();
         }
         if (pending.FileWrite is { } remote) reuse = remote.Granted;
-        var allocation = new StorageAllocation(beforeStorage, reuse, (pending.Before.Pager ?? pager).Codec, eagerReclaim: ephemeral);
+        var allocation = new StorageAllocation(beforeStorage, reuse, (pending.Before.Pager ?? pager).Codec,
+            eagerReclaim: pending.FileWrite is null) { RequireBodyWrite = !SynchronousCommits };
+        var ordinaryTrees = pending.Catalog.Tables.Select(table => Tree(table, pending, pending.Before))
+            .Concat(pending.Catalog.Tables.SelectMany(table => table.Indexes ?? []).Where(index => index.Kind != 2)
+                .Select(index => IndexTree(index, pending, pending.Before))).ToArray();
+        allocation.Deferral = StorageTree.PlanDeferral(ordinaryTrees, beforeStorage, pending.RetiredPages);
+        if (allocation.Deferral is null)
+        {
+            foreach (var table in pending.Catalog.Tables)
+            {
+                pending.Trees[table.Name] = Tree(table, pending, pending.Before).FoldRemap(beforeStorage.Meta.Remap);
+                foreach (var index in table.Indexes ?? [])
+                    if (index.Kind != 2) pending.IndexTrees[index.Name] = IndexTree(index, pending, pending.Before).FoldRemap(beforeStorage.Meta.Remap);
+            }
+        }
         long delta = -pending.RetiredPages.Count;
         foreach (var page in pending.RetiredPages) allocation.Reclaim(page);
         var tables = new List<CatalogTable>();
@@ -291,17 +306,22 @@ public sealed partial class Database : IAsyncDisposable
             var indexes = new List<CatalogIndex>();
             foreach (var index in (table.Indexes ?? []).OrderBy(item => item.Name, Utf8NameComparer.Instance))
             {
-                if (pending.IndexTrees.TryGetValue(index.Name, out var indexTree))
+                pending.IndexTrees.TryGetValue(index.Name, out var indexTree);
+                if (index.Kind == 2)
                 {
-                    if (index.Kind == 2)
-                    {
-                        var gist = await GistTree.BuildAsync(indexTree, index.Keys.Select(key => table.Columns[key.Column].Type.Type).ToArray(), cancellationToken).ConfigureAwait(false);
-                        var oldPages = index.Gist?.Pages ?? [];
-                        foreach (var page in oldPages) if (!pending.RetiredPages.Contains(page)) { allocation.Reclaim(page); delta--; }
-                        var serialized = gist.Serialize(allocation); delta += serialized.Pages.Length;
-                        indexes.Add(index with { Root = serialized.Root.Page, RootTag = serialized.Root.Tag, Gist = gist with { Leaves = gist.Leaves.CommittedResidentCopy(), Pages = serialized.Pages }, Domain = null });
-                        continue;
-                    }
+                    // GiST's canonical allocator contract rewrites the whole
+                    // R-tree on every commit, including an unchanged index.
+                    var gist = indexTree is null && index.Gist is { } existing ? existing :
+                        await GistTree.BuildAsync(indexTree ?? IndexTree(index, pending, pending.Before),
+                            index.Keys.Select(key => table.Columns[key.Column].Type.Type).ToArray(), cancellationToken).ConfigureAwait(false);
+                    var oldPages = index.Gist?.Pages ?? [];
+                    foreach (var page in oldPages) if (!pending.RetiredPages.Contains(page)) { allocation.ReclaimWholesale(page); delta--; }
+                    var serialized = gist.Serialize(allocation); delta += serialized.Pages.Length;
+                    indexes.Add(index with { Root = serialized.Root.Page, RootTag = serialized.Root.Tag, Gist = gist with { Leaves = gist.Leaves.CommittedResidentCopy(), Pages = serialized.Pages }, Domain = null });
+                    continue;
+                }
+                if (indexTree is not null)
+                {
                     delta += indexTree.PageDelta;
                     var indexRoot = await indexTree.SerializeBoundAsync(allocation, cancellationToken).ConfigureAwait(false);
                     indexes.Add(index with { Root = indexRoot.Page, RootTag = indexRoot.Tag, Shape = indexTree.SerializedShape, Domain = null });
@@ -313,12 +333,10 @@ public sealed partial class Database : IAsyncDisposable
         var catalog = pending.Catalog with { Tables = tables.ToArray(), Scope = null };
         var encoded = catalog.Serialize(allocation); delta += encoded.PageDelta;
         var live = checked((uint)(beforeStorage.Meta.LivePages + delta));
-        if (!ephemeral && pending.FileWrite is null && canReclaim &&
-            (beforeStorage.ReclamationLive == 0 || allocation.OffFreeListCount > ReclamationFacts.CompactMinPages &&
-            allocation.OffFreeListCount > ReclamationFacts.CompactGrowth * beforeStorage.ReclamationLive))
+        if (!ephemeral && pending.FileWrite is null && canReclaim && beforeStorage.ReclamationDue)
         {
             var plannedMeta = new StorageMeta(allocation.PageSize, checked(beforeStorage.Meta.TransactionId + 1),
-                encoded.Root, allocation.PageCount, 0, live);
+                encoded.Root, allocation.PageCount, 0, live) { Remap = allocation.Deferral?.Entries ?? [] };
             var plannedSnapshot = new DatabaseSnapshot(catalog with { Pages = encoded.Pages }, plannedMeta)
             { Encrypted = allocation.PlannedEncryption(plannedMeta) };
             var reachable = await new StorageSnapshotCopy(allocation.ReadView(pending.Before.Pager ?? pager), plannedSnapshot)
@@ -338,7 +356,7 @@ public sealed partial class Database : IAsyncDisposable
                 if (!repair) throw new SqlException(SqlStates.StorageLimitExceeded, $"storage of database \"{name}\" exceeded the limit of {MaxStorageBytes} bytes");
             }
         }
-        return new(pending, catalog with { Pages = encoded.Pages }, plan with { DeadlineMicroseconds = deadline });
+        return new(pending, catalog with { Pages = encoded.Pages, CommittedChunks = encoded.Chunks }, plan with { DeadlineMicroseconds = deadline });
     }
     private void AdoptPreparedCommit(PreparedCommit prepared)
     {

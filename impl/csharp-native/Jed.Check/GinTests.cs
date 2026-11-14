@@ -59,10 +59,12 @@ internal static class GinTests
                 }
             var actual = await database.SerializeAsync();
             using var after = database.Pin();
-            // DROP/CREATE advances only the fixture's transaction history. Every
-            // structural meta field and every catalog/data/index byte still match.
+            // DROP/CREATE advances the fixture's transaction history and body
+            // stamps. Every structural meta field and encoded payload still match.
             var meta = StorageFormat.EncodeMeta(before.Snapshot.Meta with { TransactionId = after.Snapshot.Meta.TransactionId });
             meta.CopyTo(expected, 0); meta.CopyTo(expected, before.Snapshot.Meta.PageSize);
+            for (var offset = 2 * before.Snapshot.Meta.PageSize; offset < expected.Length; offset += before.Snapshot.Meta.PageSize)
+                StorageFormat.Stamp(expected.AsSpan(offset, before.Snapshot.Meta.PageSize), after.Snapshot.Meta.TransactionId);
             if (!expected.AsSpan().SequenceEqual(actual))
             {
                 await File.WriteAllBytesAsync(Path.Combine(Path.GetTempPath(), "jed-csharp-" + name + "-actual.jed"), actual);
