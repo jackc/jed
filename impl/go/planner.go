@@ -756,6 +756,7 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 	groupKeys := make([]int, 0)
 	groupKeyExprs := make([]*groupKeyExpr, 0)
 	groupExprs := make([]*rExpr, 0)
+	groupExprTypes := make([]resolvedType, 0)
 	resolvedSets := make([][]int, 0, len(expanded))
 	for _, set := range expanded {
 		idxs := make([]int, 0, len(set))
@@ -823,6 +824,7 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 				} else {
 					synth := inputWidth + len(groupExprs)
 					groupExprs = append(groupExprs, gr.node)
+					groupExprTypes = append(groupExprTypes, gr.ty)
 					groupKeys = append(groupKeys, synth)
 					groupKeyExprs = append(groupKeyExprs, &groupKeyExpr{canon: gr.canon, ty: gr.ty, outer: outer})
 					idx = synth
@@ -1459,8 +1461,8 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 	}
 	plan := &selectPlan{
 		rels: planRels, joins: joins, filter: filter, isAgg: isAgg, groupKeys: groupKeys,
-		groupExprs: groupExprs,
-		groupSets:  groupSets, groupingSpecs: groupingSpecs,
+		groupExprs: groupExprs, groupExprTypes: groupExprTypes,
+		groupSets: groupSets, groupingSpecs: groupingSpecs,
 		aggSpecs: aggSpecs, hasWindow: hasWindow, windowSpecs: windowSpecs, windowKeys: windowKeys, having: having,
 		order: order, orderExprs: orderExprs, projections: projections,
 		columnNames: columnNames, columnTypes: columnTypes, columnDerivs: columnDerivs, columnTypmods: columnTypmods, distinct: sel.Distinct && distinctOn == 0, distinctOn: distinctOn,

@@ -254,6 +254,31 @@ func (db *engine) execBoundedBlocking(p *selectPlan, env *evalEnv, m *costMeter)
 	return em, nil
 }
 
+// blockingHaving is the bounded-spill lane's HAVING stage: each group row, in order, is kept in a new
+// spool when the predicate is TRUE; the consumed spool is discarded once the pass completes. The
+// columnar aggregate lane's bounded form runs it over its own output spool (memory.md §6.6.1).
+func (db *engine) blockingHaving(p *selectPlan, rows *rowSpool, env *evalEnv, m *costMeter, own *blockingOwner) (*rowSpool, error) {
+	kept := own.spool()
+	err := rows.each(func(row storedRow) error {
+		if err := m.PollStep(); err != nil {
+			return err
+		}
+		v, err := p.having.evalFilter(row, env, m)
+		if err != nil {
+			return err
+		}
+		if v {
+			return kept.push(row)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	rows.close()
+	return kept, nil
+}
+
 func (db *engine) execBoundedBlockingLane(p *selectPlan, env *evalEnv, m *costMeter) (emitter, error) {
 	if len(p.rels) >= 3 && (len(p.phys.relationOrder) != len(p.rels) || len(p.phys.joinSteps)+1 != len(p.rels)) {
 		copyPlan := *p
@@ -378,25 +403,9 @@ func (db *engine) execBoundedBlockingLane(p *selectPlan, env *evalEnv, m *costMe
 			return emitter{}, err
 		}
 		if p.having != nil {
-			kept := own.spool()
-			err := rows.each(func(row storedRow) error {
-				if err := m.PollStep(); err != nil {
-					return err
-				}
-				v, err := p.having.evalFilter(row, env, m)
-				if err != nil {
-					return err
-				}
-				if v {
-					return kept.push(row)
-				}
-				return nil
-			})
-			if err != nil {
+			if rows, err = db.blockingHaving(p, rows, env, m, own); err != nil {
 				return emitter{}, err
 			}
-			rows.close()
-			rows = kept
 		}
 		if root != "Aggregate" {
 			db.explainActual.recordParent("Aggregate", m.Accrued)

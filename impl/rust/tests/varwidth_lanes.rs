@@ -774,6 +774,16 @@ const CEILING_QUERIES: &[&str] = &[
     // every row before it folds any, so the filter's error is the one it reports.
     "SELECT sum(1000 / (id - 100)) FROM ct WHERE 1000 / (id - 250) <> 7",
     "SELECT n, sum(1000 / (id - 100)) FROM ct GROUP BY n",
+    // An integer grouping expression: always an attempt, as an expression operand is.
+    "SELECT n * 3 + 1, count(*), sum(d) FROM ct GROUP BY n * 3 + 1",
+    "SELECT big % 1000, sum(d), max(s) FROM ct WHERE n > 0 GROUP BY big % 1000 HAVING count(*) > 1 ORDER BY 1 LIMIT 5",
+    // HAVING over the groups, before the ORDER BY.
+    "SELECT n, count(*), sum(d) FROM ct GROUP BY n HAVING sum(d) > 0 ORDER BY n",
+    // A key that overflows at row 215 and a filter that raises at row 250: the row path filters every
+    // row before it evaluates a key, so the filter's error is the one it reports.
+    "SELECT id * 10000000, count(*) FROM ct WHERE 1000 / (id - 250) <> 7 GROUP BY id * 10000000",
+    // HAVING raising at the first group with 60 rows, in creation order.
+    "SELECT n, count(*) FROM ct GROUP BY n HAVING 1000 / (count(*) - 60) > 0 ORDER BY n DESC",
 ];
 
 /// Bare-column projections: the columnar projection lane, an attempt under a ceiling.

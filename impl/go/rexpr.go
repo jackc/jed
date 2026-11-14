@@ -1861,6 +1861,9 @@ type selectPlan struct {
 	// groupKeys / groupSets may point at one — the whole-row bucket machinery stays slot-based. Empty
 	// when every grouping key is a plain column (the common case, byte-identical to before).
 	groupExprs []*rExpr
+	// groupExprTypes is each groupExprs key's resolved type, in the same order (the columnar
+	// aggregate lane takes an integer expression key — memory.md §5.4).
+	groupExprTypes []resolvedType
 	// groupSets are the grouping sets to compute (spec/design/aggregates.md §12). A plain GROUP BY
 	// (and the whole-table aggregate) is a single set; ROLLUP/CUBE/GROUPING SETS produce several.
 	groupSets []groupSetPlan

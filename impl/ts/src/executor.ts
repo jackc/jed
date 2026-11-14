@@ -22126,6 +22126,8 @@ export class Engine {
       isAgg,
       groupKeys,
       groupExprs,
+      // Each expression key's type, in groupExprs order: the non-null groupKeyExprs entries.
+      groupExprTypes: groupKeyExprs.flatMap((gk) => (gk === null ? [] : [gk.ty])),
       groupSets,
       groupingSpecs,
       aggSpecs,
@@ -26772,12 +26774,13 @@ export class Engine {
   }
 
   // vectorizedAggEligible reports whether plan is a shape execVectorizedAgg specializes: a single-base-
-  // table SUM/COUNT/MIN/MAX/AVG with no DISTINCT / FILTER / HAVING / window / ORDER BY, over a full or
-  // primary-key-bounded scan, that is EITHER whole-table (no GROUP BY) OR grouped by a single bare
-  // integer column. Mostly pure plan inspection — it charges nothing, so a bail is free and the general
-  // path runs with identical results + cost; the single-key case additionally reads the group-key
-  // column's static type from the table store (a one-time lookup, not per row) to confirm it is a scalar
-  // integer (so the int64-keyed bucket is a bijection of the value-canonical group key — groupByIntKey).
+  // table SUM/COUNT/MIN/MAX/AVG with no DISTINCT / FILTER / window (a HAVING and an ORDER BY are
+  // allowed), over a full or primary-key-bounded scan, that is EITHER whole-table (no GROUP BY) OR
+  // grouped by a single integer key — a bare column or one expression (memory.md §5.4). Mostly pure
+  // plan inspection — it charges nothing, so a bail is free and the general path runs with identical
+  // results + cost; the single-key case additionally reads the group-key column's static type from the
+  // table store (a one-time lookup, not per row) to confirm it is a scalar integer (so the int64-keyed
+  // bucket is a bijection of the value-canonical group key — groupByIntKey).
   private vectorizedAggEligible(plan: SelectPlan): boolean {
     if (!plan.isAgg) return false;
     // One base table, no join.
@@ -26794,11 +26797,11 @@ export class Engine {
     // Full scan or a primary-key bound only — an index / GIN / GiST / point-set bound changes the scan
     // mechanics and residual filter (needsEagerScan), so it keeps the scalar path.
     if (needsEagerScan(plan.phys.relBounds[0])) return false;
-    // Exactly one grouping set (ROLLUP/CUBE/GROUPING SETS produce several — deferred), no materialized
-    // expression keys (`GROUP BY a + b`), and no GROUPING() calls.
+    // Exactly one grouping set (ROLLUP/CUBE/GROUPING SETS produce several — deferred), at most one
+    // materialized expression key (`GROUP BY a / 1000`), and no GROUPING() calls.
     if (
       plan.groupSets.length !== 1 ||
-      plan.groupExprs.length !== 0 ||
+      plan.groupExprs.length > 1 ||
       plan.groupingSpecs.length !== 0
     ) {
       return false;
@@ -26813,14 +26816,24 @@ export class Engine {
       if (plan.groupKeys.length !== 1 || plan.groupKeys[0] !== gset.keyCols[0]) return false;
       if (gset.slotSrc.length !== 1 || gset.slotSrc[0] !== 0) return false;
       const store = this.lkpStoreScoped(rel.db, rel.tableName);
-      if (!store.columnIsInteger(gset.keyCols[0]! - rel.offset)) return false;
+      const ord = gset.keyCols[0]! - rel.offset;
+      if (plan.groupExprs.length === 1) {
+        // An expression key (memory.md §5.4): its synthetic slot follows the table's columns, its
+        // result is an integer (so the bigint bucket is again a bijection), and it is safe to
+        // discard, since a run that evaluates it is always an attempt (cost.md §6.1).
+        if (ord !== store.columnTypes().length) return false;
+        if (plan.groupExprTypes[0]!.kind !== "int" || !discardSafe(plan.groupExprs[0]!)) return false;
+      } else if (!store.columnIsInteger(ord)) {
+        return false;
+      }
     } else {
       return false;
     }
     // No blocking / re-shaping operator beyond the fold. LIMIT/OFFSET is honored via the window bounds
     // below, so it need not bail. An ORDER BY is the caller's to admit: only the bounded grouped lane
     // sorts its groups (memory.md §5.4, §6.6.1).
-    if (plan.distinct || plan.distinctOn > 0 || plan.having !== null || plan.hasWindow) return false;
+    // A HAVING runs over the finalized groups, as the row path's stage does (memory.md §5.4).
+    if (plan.distinct || plan.distinctOn > 0 || plan.hasWindow) return false;
     if (plan.aggSpecs.length === 0) return false;
     return plan.aggSpecs.every((s) => vectorizedSpecEligible(s));
   }
@@ -26908,6 +26921,7 @@ export class Engine {
           : yield* groupByIntKeySteps(
               plan.aggSpecs,
               gset.keyCols[0]!,
+              plan.groupExprs.length === 1 ? plan.groupExprs[0]! : null,
               at,
               rowAt,
               survivors.length,
@@ -26922,6 +26936,17 @@ export class Engine {
       meter.releaseRowsMasked(survivors, mask);
     }
 
+    // A HAVING first, as the row path's stage runs (memory.md §5.4): over each admitted group row in
+    // creation order, once every group is finalized, releasing each dropped row.
+    if (plan.having !== null) {
+      const kept: Value[][] = [];
+      for (const srow of srows) {
+        if (shouldCooperate()) yield COOPERATE;
+        if (yield* evalFilterSteps(plan.having, srow, env, meter)) kept.push(srow);
+        else meter.releaseRow(srow);
+      }
+      srows = kept;
+    }
     // An ORDER BY over the groups of the unbounded form: the eager aggregate branch's own stage —
     // each order-expression value appended to its group row and admitted, then the in-place sort
     // (memory.md §5.4).
@@ -26983,7 +27008,21 @@ export class Engine {
         return null;
       }
     }
-    if (gset.keyCols.length === 1 && !need(gset.keyCols[0]!)) return null;
+    // An expression key (memory.md §5.4) is evaluated over the scratch row: the columns it reads,
+    // resolved once per record (shared with a filter or operand that read them).
+    const keyExpr = plan.groupExprs.length === 1 ? plan.groupExprs[0]! : null;
+    const keyReads: number[] = [];
+    if (keyExpr !== null) {
+      const reads: boolean[] = new Array(mask.length).fill(false);
+      collectTouched(keyExpr, 0, reads);
+      for (let c = 0; c < reads.length; c++) {
+        if (!reads[c]) continue;
+        if (!need(c)) return null;
+        keyReads.push(c);
+      }
+    } else if (gset.keyCols.length === 1 && !need(gset.keyCols[0]!)) {
+      return null;
+    }
 
     // Determine the scan bound exactly as materializeRel does: a PK-range bound, or the full scan. An
     // empty bound (a contradictory PK predicate) admits no rows — skip the scan entirely.
@@ -27065,7 +27104,7 @@ export class Engine {
           for (let c = 0; c < mask.length; c++) if (reads[c] && mask[c]) cols.push(c);
           return cols;
         });
-        const exprOps = hasExpressionOperand(plan);
+        const exprOps = laneEvaluatesExpressions(plan);
         const metered = meter.hasCeiling();
         // An unmetered run with no expression operand is not an attempt, so a filter error settles
         // to the row path's accrual (cost.md §6.2): what the folds themselves charged (decimal
@@ -27148,8 +27187,19 @@ export class Engine {
               if (settle && meter.accrued !== foldStart) foldLive += meter.accrued - foldStart;
               continue;
             }
-            // A NULL integer key buckets into one sentinel group (matching the scalar/lane path).
-            const kv = colAt(n, i, keyCol);
+            // A NULL integer key buckets into one sentinel group (matching the scalar/lane path). An
+            // expression key is evaluated before the operands (memory.md §5.4).
+            let kv: Value;
+            if (keyExpr !== null) {
+              for (let x = 0; x < keyReads.length; x++) {
+                const c = keyReads[x]!;
+                if (!scratch.ensureNow(n, i, c)) yield* scratch.ensureSteps(n, i, c);
+              }
+              const r = evalExprMaybeSteps(keyExpr, scratch.vals, env, meter);
+              kv = isPendingEval(r) ? yield* r : r;
+            } else {
+              kv = colAt(n, i, keyCol);
+            }
             const key: Value = kv.kind === "int" ? kv : nullValue();
             if (spilled !== null) {
               // Handed over: the per-row step the bounded-spill aggregate runs — load the group's
@@ -27391,16 +27441,27 @@ export class Engine {
     let transferred = false;
     try {
       let rows = groups;
+      const spool = (): RowSpool => {
+        const out = new RowSpool(
+          this.session.workMem,
+          this.spillSink!,
+          new StateCharge(this.session.queryAccount),
+        );
+        resources.push(out);
+        return out;
+      };
+      // The bounded-spill lane's HAVING stage: the kept group rows, in order, copied into a new
+      // spool; the consumed one discarded (memory.md §6.6.1).
+      if (plan.having !== null) {
+        const filtered = spool();
+        for (const row of rows) {
+          if (shouldCooperate()) yield COOPERATE;
+          if (yield* evalFilterSteps(plan.having, row, env, meter)) filtered.push(row);
+        }
+        rows.close();
+        rows = filtered;
+      }
       if (plan.order.length > 0) {
-        const spool = (): RowSpool => {
-          const out = new RowSpool(
-            this.session.workMem,
-            this.spillSink!,
-            new StateCharge(this.session.queryAccount),
-          );
-          resources.push(out);
-          return out;
-        };
         rows = yield* this.blockingOrderSteps(plan, rows, env, meter, spool, resources);
       }
       const total = BigInt(rows.length);
@@ -28606,15 +28667,15 @@ export class Engine {
     fast: boolean,
   ): Steps<Emitter | null> {
     // Vectorized single-table aggregate (the PAX/vectorization program's executor track): a
-    // SUM/COUNT/MIN/MAX/AVG with no DISTINCT / FILTER / HAVING / window, either whole-table or grouped
-    // by a single integer column, folds columnar / int64-bucketed instead of the row-at-a-time group
-    // machinery below (memory.md §5.4). The lane is taken where the statement is not bounded-spill
-    // eligible, for a whole-table fold over a file-backed table (one finite accumulator, no retained
-    // input), and for a grouped fold over a file-backed table, which hands its group table over to
-    // the spill structures (§6.6.1). Results and accrued cost
-    // are byte-identical either way (the conformance corpus proves both). (An aggregate plan skips
-    // every streaming fast-path below — they all require !isAgg — so this front-position placement is
-    // only for clarity, mirroring the Go/Rust cores' ordering.)
+    // SUM/COUNT/MIN/MAX/AVG with no DISTINCT / FILTER / window, either whole-table or grouped by a
+    // single integer column or expression (with any HAVING), folds columnar / int64-bucketed instead
+    // of the row-at-a-time group machinery below (memory.md §5.4). The lane is taken where the
+    // statement is not bounded-spill eligible, for a whole-table fold over a file-backed table (one
+    // finite accumulator, no retained input), and for a grouped fold over a file-backed table, which
+    // hands its group table over to the spill structures (§6.6.1). Results and accrued cost are
+    // byte-identical either way (the conformance corpus proves both). (An aggregate plan skips every
+    // streaming fast-path below — they all require !isAgg — so this front-position placement is only
+    // for clarity, mirroring the Go/Rust cores' ordering.)
     const lane =
       fast &&
       this.explainActualProfile === null &&
@@ -28622,9 +28683,9 @@ export class Engine {
       (!this.boundedBlockingEligible(plan) ||
         this.boundedWholeAggregate(plan) ||
         this.handoverGroupedAggregate(plan));
-    // A run that folds an expression is always an attempt (below): it interleaves filter and
-    // operand evaluation where the row path filters every row first.
-    const exprOps = lane && hasExpressionOperand(plan);
+    // A run that folds an expression or groups by one is always an attempt (below): it interleaves
+    // filter and expression evaluation where the row path filters every row first.
+    const exprOps = lane && laneEvaluatesExpressions(plan);
     if (lane && !exprOps && meter.isUnmetered())
       return yield* this.execVectorizedAggSteps(plan, env, meter, params);
     // Under a cost ceiling or lifetime budget (cost.md §6.1) the lane is an attempt: its result
@@ -28639,6 +28700,7 @@ export class Engine {
       !laneCeiling.off &&
       guardPasses(meter) &&
       (plan.filter === null || discardSafe(plan.filter)) &&
+      (plan.having === null || discardSafe(plan.having)) &&
       plan.orderExprs.every((e) => discardSafe(e))
     ) {
       const mark = meter.mark();
@@ -41573,6 +41635,9 @@ export type SelectPlan = {
   // groupKeys / groupSets may point at one — the whole-row bucket machinery stays slot-based. Empty
   // when every grouping key is a plain column (the common case, byte-identical to before).
   groupExprs: RExpr[];
+  // groupExprTypes is each groupExprs key's resolved type, in the same order (the columnar aggregate
+  // lane takes an integer expression key — memory.md §5.4).
+  groupExprTypes: ResolvedType[];
   // groupSets are the grouping sets to compute (spec/design/aggregates.md §12). A plain GROUP BY
   // (and the whole-table aggregate) is a single set; ROLLUP/CUBE/GROUPING SETS produce several.
   groupSets: GroupSet[];
@@ -48440,6 +48505,14 @@ export const VOLATILE_SCALAR_FUNCS: ReadonlySet<ScalarFuncName> = new Set<Scalar
 // every row first, so it is always an attempt the row path replaces on any error (cost.md §6.1).
 export function hasExpressionOperand(plan: SelectPlan): boolean {
   return plan.aggSpecs.some((s) => s.operand !== null && s.operand.kind !== "column");
+}
+
+// laneEvaluatesExpressions reports whether a lane run for plan evaluates an expression per survivor —
+// an aggregate's expression operand or an expression grouping key. Such a run interleaves that
+// evaluation with the filter where the row path filters every row first, so it is always an attempt
+// the row path replaces on any error (cost.md §6.1).
+export function laneEvaluatesExpressions(plan: SelectPlan): boolean {
+  return hasExpressionOperand(plan) || plan.groupExprs.length !== 0;
 }
 
 // countOnlyLeaf visits a leaf without reading it: a fold over it counts the rows in a bound (the

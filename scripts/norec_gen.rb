@@ -234,6 +234,11 @@
 #              `count(s || '')`) the span compiler leaves to the evaluator, over NULLs, '', multibyte
 #              text, zero bytes, NULL elements, and compressed / out-of-line values. Both must return
 #              the by-construction rows of byte-exact comparison.
+#   lane_key_having — the columnar aggregate lane over an integer grouping expression and a HAVING
+#              (memory.md §5.4): `GROUP BY a / d`, `a % m`, `a - v * 2` with a WHERE, a bare key with
+#              HAVING, and HAVING over the key with LIMIT/OFFSET, against the same query with a no-op
+#              `FILTER (WHERE TRUE)` that keeps the row path; and a key overflow beside a later filter
+#              error, where both must report the filter's. Rows known by construction.
 #   gin_stats — GIN term statistics (statistics.md §4.5/§6.1): the same `tags @> Q AND n = k` and
 #              `c = ANY(tags)` queries before and after ANALYZE, which flips their plans between the GIN
 #              index, the ordered index on n, and a full scan, plus the `<@` full-scan spellings. All
@@ -2859,6 +2864,103 @@ def gen_varwidth_span(seed)
     [rows.count { |r| !r[1].nil? }, rows.count { |r| !r[2].nil? }, rows.count { |r| !r[3].nil? }].map(&:to_s))
   q(out, "III", "SELECT count(s || ''), count(b || ''::bytea), count(#{wrapped}) FROM t",
     [rows.count { |r| !r[1].nil? }, rows.count { |r| !r[2].nil? }, rows.count { |r| !r[3].nil? }].map(&:to_s))
+  out.join("\n") + "\n"
+end
+
+# --- scenario: the columnar aggregate lane's expression keys and HAVING (vs the row path) -----
+# An integer grouping expression (`GROUP BY a / d`) and a HAVING take the columnar aggregate lane
+# (memory.md §5.4); a no-op `FILTER (WHERE TRUE)` on one aggregate keeps the row path. Both must give
+# the by-construction groups: NULL keys one group, PostgreSQL's truncating `/` and dividend-signed
+# `%`, HAVING over the key and the aggregates, ORDER BY / LIMIT / OFFSET over the kept groups, and a
+# key that overflows beside a later filter error (the row path filters every row first, cost.md §6.1).
+LANE_KEY_HAVING_REQ = %w[ddl.create_table ddl.primary_key dml.insert dml.insert_multi_row query.select
+                         query.where_eq query.aggregates query.aggregate_filter query.group_by
+                         query.group_by_expr query.having query.order_by query.limit expr.arithmetic
+                         error.overflow_trap types.i32].freeze
+
+def gen_lane_key_having(seed)
+  rng = Random.new(seed)
+  n = rng.rand(30..80)
+  rows = (1..n).map do |id|
+    [id, rng.rand(8).zero? ? nil : rng.rand(-50..50), rng.rand(8).zero? ? nil : rng.rand(-20..20)]
+  end
+  div = ->(x, y) { x.nil? ? nil : (x.abs / y.abs) * ((x.negative? ^ y.negative?) ? -1 : 1) }
+  rem = ->(x, y) { x.nil? ? nil : x.remainder(y) }
+  sum = ->(vs) { (c = vs.compact).empty? ? nil : c.sum }
+  str = ->(v) { v.nil? ? "NULL" : v.to_s }
+  # Groups of `rows` by key (insertion order irrelevant: every query orders by its unique key).
+  group = ->(rs, key) { rs.group_by { |r| key.call(r) } }
+  # ASC sorts NULL last, DESC first (PostgreSQL's defaults).
+  order = lambda do |keys, desc|
+    vals = keys.compact.sort
+    vals = vals.reverse if desc
+    nulls = keys.include?(nil) ? [nil] : []
+    desc ? nulls + vals : vals + nulls
+  end
+  out = header(seed, LANE_KEY_HAVING_REQ, "columnar aggregate lane expression keys and HAVING (lane vs row path)")
+  stmt(out, "CREATE TABLE t (id i32 PRIMARY KEY, a i32, v i32)")
+  rows.each_slice(20) do |chunk|
+    stmt(out, "INSERT INTO t VALUES #{chunk.map { |id, a, v| "(#{id}, #{str.call(a)}, #{str.call(v)})" }.join(', ')}")
+  end
+  pair = lambda do |label, types, sql, exp|
+    out << "# #{label}"
+    q(out, types, sql, exp)
+    out << "# the row path (a FILTER keeps the lane off) — MUST match"
+    q(out, types, sql.sub("count(*)", "count(*) FILTER (WHERE TRUE)"), exp)
+  end
+
+  d = rng.rand(2..9)
+  g = group.call(rows, ->(r) { div.call(r[1], d) })
+  exp = order.call(g.keys, false).flat_map do |k|
+    vs = g[k].map { |r| r[2] }
+    [str.call(k), vs.size.to_s, vs.compact.size.to_s, str.call(sum.call(vs)), str.call(vs.compact.min), str.call(vs.compact.max)]
+  end
+  pair.call("an expression key a / #{d}", "IIIIII",
+            "SELECT a / #{d} AS k, count(*), count(v), sum(v), min(v), max(v) FROM t GROUP BY a / #{d} ORDER BY k", exp)
+
+  m = rng.rand(3..7)
+  c = rng.rand(2..6)
+  g = group.call(rows, ->(r) { rem.call(r[1], m) })
+  kept = g.keys.select { |k| g[k].size >= c }
+  exp = order.call(kept, true).flat_map { |k| [str.call(k), g[k].size.to_s, str.call(sum.call(g[k].map { |r| r[2] }))] }
+  pair.call("a % #{m} groups HAVING count(*) >= #{c}, descending", "III",
+            "SELECT a % #{m}, count(*), sum(v) FROM t GROUP BY a % #{m} HAVING count(*) >= #{c} ORDER BY 1 DESC", exp)
+
+  s = rng.rand(-30..30)
+  g = group.call(rows, ->(r) { r[2] })
+  kept = g.keys.select { |k| (t = sum.call(g[k].map { |r| r[1] })) && t > s }
+  exp = order.call(kept, false).flat_map { |k| [str.call(k), g[k].size.to_s, str.call(sum.call(g[k].map { |r| r[1] }))] }
+  pair.call("a bare column key HAVING sum(a) > #{s}", "III",
+            "SELECT v, count(*), sum(a) FROM t GROUP BY v HAVING sum(a) > #{s} ORDER BY v", exp)
+
+  w = rng.rand(-10..10)
+  surv = rows.select { |r| r[2] && r[2] > w }
+  g = group.call(surv, ->(r) { r[1] && r[1] - r[2] * 2 })
+  exp = order.call(g.keys, false).flat_map { |k| [str.call(k), g[k].size.to_s, str.call(g[k].map { |r| r[0] }.min)] }
+  pair.call("a two-column key a - v * 2 under WHERE v > #{w}", "III",
+            "SELECT a - v * 2, count(*), min(id) FROM t WHERE v > #{w} GROUP BY a - v * 2 ORDER BY 1", exp)
+
+  x = rng.rand(-10..10)
+  lim = rng.rand(1..4)
+  off = rng.rand(0..2)
+  g = group.call(rows, ->(r) { div.call(r[1], d) })
+  kept = g.keys.select { |k| k != 0 && (mx = g[k].map { |r| r[2] }.compact.max) && mx > x }
+  exp = (order.call(kept, false)[off, lim] || []).flat_map { |k| [str.call(k), g[k].size.to_s, str.call(g[k].map { |r| r[2] }.compact.max)] }
+  pair.call("HAVING over the key and an aggregate, LIMIT #{lim} OFFSET #{off}", "III",
+            "SELECT a / #{d}, count(*), max(v) FROM t GROUP BY a / #{d} HAVING a / #{d} <> 0 AND max(v) > #{x} " \
+            "ORDER BY 1 LIMIT #{lim} OFFSET #{off}", exp)
+
+  # A key that overflows i32 at some row, beside a filter that divides by zero at a later one: the row
+  # path filters every row before it evaluates a key, so both forms report the filter's 22012.
+  big = rows.find { |r| r[1] && r[1].abs >= 2 }
+  if big
+    k = rng.rand(big[0]..n)
+    ["count(*)", "count(*) FILTER (WHERE TRUE)"].each do |agg|
+      out << "statement error 22012"
+      out << "SELECT a * 2000000000, #{agg} FROM t WHERE 10 / (id - #{k}) > -100 GROUP BY a * 2000000000"
+      out << ""
+    end
+  end
   out.join("\n") + "\n"
 end
 
@@ -5626,6 +5728,7 @@ SCENARIOS = {
   "gin_dec" => method(:gen_gin_decimal),
   "gin_bytea" => method(:gen_gin_bytea),
   "varwidth_span" => method(:gen_varwidth_span),
+  "lane_key_having" => method(:gen_lane_key_having),
   "gist" => method(:gen_gist),
   "gist_scalar" => method(:gen_gist_scalar),
   "exclude_btree" => method(:gen_exclude_btree),

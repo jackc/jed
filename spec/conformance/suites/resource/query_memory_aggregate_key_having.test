@@ -1,0 +1,73 @@
+# An integer grouping expression and a HAVING take the columnar aggregate lane, so each statement
+# reserves the lane's group table and group rows rather than the eager path's materialized input
+# (memory.md §5.4). A no-op `FILTER (WHERE TRUE)` keeps the eager path, which cannot fit the same
+# budget. An expression key makes the run an attempt even with no ceiling (cost.md §6.1).
+# skip: disk — this pins the in-memory group table account
+# requires: query.select, ddl.create_table, dml.insert, dml.insert_multi_row, query.aggregates, query.aggregate_filter, query.group_by, query.group_by_expr, query.having, types.f64, cast.operator, expr.arithmetic, resource.query_memory
+
+statement ok
+CREATE TABLE lane_kh (id i32 PRIMARY KEY, g i32)
+
+statement ok
+INSERT INTO lane_kh VALUES (1,1),(2,0),(3,1),(4,0),(5,1),(6,0)
+
+# Three expression-key groups, each row [key, f64 sum] of 96 logical bytes: 288 in all.
+# max_query_memory_bytes: 288
+query IR rowsort
+SELECT id / 3, sum(id::f64) FROM lane_kh GROUP BY id / 3
+----
+0
+3
+1
+12
+2
+6
+
+# max_query_memory_bytes: 287
+statement error 54P05
+SELECT id / 3, sum(id::f64) FROM lane_kh GROUP BY id / 3
+
+# max_query_memory_bytes: 288
+statement error 54P05
+SELECT id / 3, sum(id::f64) FILTER (WHERE TRUE) FROM lane_kh GROUP BY id / 3
+
+# Two groups, each row [key, f64 sum, HAVING's count] of 128 logical bytes: 256 in all.
+# max_query_memory_bytes: 256
+query IR rowsort
+SELECT g, sum(id::f64) FROM lane_kh GROUP BY g HAVING count(*) > 2
+----
+0
+12
+1
+9
+
+# max_query_memory_bytes: 255
+statement error 54P05
+SELECT g, sum(id::f64) FROM lane_kh GROUP BY g HAVING count(*) > 2
+
+# max_query_memory_bytes: 256
+statement error 54P05
+SELECT g, sum(id::f64) FILTER (WHERE TRUE) FROM lane_kh GROUP BY g HAVING count(*) > 2
+
+# A table without a primary key (a synthetic rowid, not a column): the expression key's slot still
+# follows the declared columns, so it takes the lane too.
+statement ok
+CREATE TABLE lane_kh_nopk (id i32, g i32)
+
+statement ok
+INSERT INTO lane_kh_nopk VALUES (1,1),(2,0),(3,1),(4,0),(5,1),(6,0)
+
+# max_query_memory_bytes: 288
+query IR rowsort
+SELECT id / 3, sum(id::f64) FROM lane_kh_nopk GROUP BY id / 3
+----
+0
+3
+1
+12
+2
+6
+
+# max_query_memory_bytes: 287
+statement error 54P05
+SELECT id / 3, sum(id::f64) FROM lane_kh_nopk GROUP BY id / 3

@@ -478,15 +478,16 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 	// over an empty FROM (materializeRel reads nothing), so aggregates still see their empty input.
 	fast := !plan.whereContradiction()
 	// Vectorized single-table aggregate (batch.go, the PAX/vectorization program's executor track): a
-	// SUM/COUNT/MIN/MAX/AVG with no DISTINCT / FILTER / HAVING / window, either whole-table or grouped
-	// by a single integer column, folds columnar / int64-bucketed instead of the row-at-a-time group
-	// machinery below. Results and accrued cost are byte-identical either way (the conformance corpus
-	// proves both). Which statements take it is contract (memory.md §5.4): it decides what a statement
-	// reserves. Ineligible ⇒ this is skipped and the general aggregate branch runs unchanged.
+	// SUM/COUNT/MIN/MAX/AVG with no DISTINCT / FILTER / window, either whole-table or grouped by a
+	// single integer column or expression (with any HAVING), folds columnar / int64-bucketed instead
+	// of the row-at-a-time group machinery below. Results and accrued cost are byte-identical either
+	// way (the conformance corpus proves both). Which statements take it is contract (memory.md §5.4):
+	// it decides what a statement reserves. Ineligible ⇒ this is skipped and the general aggregate
+	// branch runs unchanged.
 	lane := fast && db.aggregateLaneEligible(plan)
-	// A run that folds an expression is always an attempt (below): it interleaves filter and operand
-	// evaluation where the row path filters every row first.
-	exprOps := lane && hasExpressionOperand(plan)
+	// A run that folds an expression or groups by one is always an attempt (below): it interleaves
+	// filter and expression evaluation where the row path filters every row first.
+	exprOps := lane && laneEvaluatesExpressions(plan)
 	if lane && !exprOps && meter.canBatchCosts() {
 		return db.execVectorizedAgg(plan, outer, params, ctes, rng, meter)
 	}

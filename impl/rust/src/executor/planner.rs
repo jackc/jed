@@ -1119,6 +1119,7 @@ impl Engine {
             let mut group_keys: Vec<usize> = Vec::new();
             let mut group_key_exprs: Vec<Option<GroupKeyExpr>> = Vec::new();
             let mut group_exprs: Vec<RExpr> = Vec::new();
+            let mut group_expr_types: Vec<ResolvedType> = Vec::new();
             let mut resolved_sets: Vec<Vec<usize>> = Vec::with_capacity(expanded.len());
             for set in &expanded {
                 outline(|| -> Result<()> {
@@ -1172,6 +1173,7 @@ impl Engine {
                                     None => {
                                         let synth = input_width + group_exprs.len();
                                         group_exprs.push(rexpr);
+                                        group_expr_types.push(ty.clone());
                                         group_keys.push(synth);
                                         group_key_exprs.push(Some((canon, ty, outer)));
                                         synth
@@ -2048,6 +2050,7 @@ impl Engine {
                     is_agg,
                     group_keys,
                     group_exprs,
+                    group_expr_types,
                     group_sets,
                     grouping_specs,
                     agg_specs,

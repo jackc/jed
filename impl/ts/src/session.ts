@@ -23,7 +23,7 @@ import { DEFAULT_WORK_MEM } from "./spill.ts";
 import { resolveZone } from "./timezone.ts";
 import { engineError } from "./errors.ts";
 import type { PrivilegeSet } from "./privileges.ts";
-import type { Acc, AggSpec, EvalEnv, ResolvedFrame, SelectPlan } from "./executor.ts";
+import type { Acc, AggSpec, EvalEnv, ResolvedFrame, RExpr, SelectPlan } from "./executor.ts";
 import type { Value } from "./value.ts";
 import type { Row } from "./storage.ts";
 import { nullValue } from "./value.ts";
@@ -631,6 +631,7 @@ export function groupByIntKey(...args: Parameters<typeof groupByIntKeySteps>): V
 export function* groupByIntKeySteps(
   specs: AggSpec[],
   keyCol: number,
+  keyExpr: RExpr | null,
   at: LaneAt,
   rowAt: LaneRowAt,
   nsurv: number,
@@ -651,7 +652,13 @@ export function* groupByIntKeySteps(
     for (let j = 0; j < nsurv; j++) {
       if ((j & 255) === 0) meter.guard();
       if (shouldCooperate()) yield COOPERATE;
-      const kv = at(j, keyCol);
+      // An expression key is evaluated over the survivor's row before its operands (memory.md §5.4).
+      let kv: Value;
+      if (keyExpr === null) kv = at(j, keyCol);
+      else {
+        const r = evalExprMaybeSteps(keyExpr, rowAt(j), env, meter);
+        kv = isPendingEval(r) ? yield* r : r;
+      }
       let gi: number;
       if (kv.kind === "int") {
         const g = index.get(kv.int);

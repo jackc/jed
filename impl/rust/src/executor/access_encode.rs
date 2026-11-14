@@ -7543,6 +7543,14 @@ pub(crate) fn has_expression_operand(plan: &SelectPlan) -> bool {
         .any(|s| matches!(&s.operand, Some(e) if !matches!(e, RExpr::Column(_))))
 }
 
+/// Whether a lane run for `plan` evaluates an expression per survivor — an aggregate's expression
+/// operand or an expression grouping key. Such a run interleaves that evaluation with the filter where
+/// the row path filters every row first, so it is always an attempt the row path replaces on any
+/// error (cost.md §6.1).
+pub(crate) fn lane_evaluates_expressions(plan: &SelectPlan) -> bool {
+    has_expression_operand(plan) || !plan.group_exprs.is_empty()
+}
+
 thread_local! {
     /// Tooling: the columnar aggregate lane's attempts under a cost ceiling on this thread, and how
     /// many of them fell back to the row path (cost.md §6.1).

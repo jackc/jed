@@ -2934,13 +2934,14 @@ impl Engine {
     }
 
     /// Whether `plan` is a shape [`exec_vectorized_agg`](Engine::exec_vectorized_agg) specializes: a
-    /// single-base-table `SUM`/`COUNT`/`MIN`/`MAX`/`AVG` with no `DISTINCT` / `FILTER` / `HAVING` /
-    /// window / `ORDER BY`, over a full or primary-key-bounded scan, that is EITHER whole-table (no
-    /// `GROUP BY`) OR grouped by a single bare integer column. Mostly pure plan inspection — it charges
-    /// nothing, so a bail is free and the general path runs with identical results + cost; the
-    /// single-key case additionally reads the group-key column's static type from the table store (a
-    /// one-time lookup, not per row) to confirm it is a scalar integer (so the int64-keyed bucket is a
-    /// bijection of the value-canonical group key — see [`group_by_int_key`]).
+    /// single-base-table `SUM`/`COUNT`/`MIN`/`MAX`/`AVG` with no `DISTINCT` / `FILTER` / window (a
+    /// `HAVING` and an `ORDER BY` are allowed), over a full or primary-key-bounded scan, that is EITHER
+    /// whole-table (no `GROUP BY`) OR grouped by a single integer key — a bare column or one
+    /// expression (memory.md §5.4). Mostly pure plan inspection — it charges nothing, so a bail is
+    /// free and the general path runs with identical results + cost; the single-key case additionally
+    /// reads the group-key column's static type from the table store (a one-time lookup, not per row)
+    /// to confirm it is a scalar integer (so the int64-keyed bucket is a bijection of the
+    /// value-canonical group key — see [`group_by_int_key`]).
     pub(crate) fn vectorized_agg_eligible(&self, plan: &SelectPlan) -> bool {
         if !plan.is_agg {
             return false;
@@ -2965,10 +2966,10 @@ impl Engine {
         ) {
             return false;
         }
-        // Exactly one grouping set (ROLLUP/CUBE/GROUPING SETS produce several — deferred), no
-        // materialized expression keys (`GROUP BY a + b`), and no GROUPING() calls.
+        // Exactly one grouping set (ROLLUP/CUBE/GROUPING SETS produce several — deferred), at most
+        // one materialized expression key (`GROUP BY a / 1000`), and no GROUPING() calls.
         if plan.group_sets.len() != 1
-            || !plan.group_exprs.is_empty()
+            || plan.group_exprs.len() > 1
             || !plan.grouping_specs.is_empty()
         {
             return false;
@@ -2993,17 +2994,30 @@ impl Engine {
                 }
                 let store = self.store_scoped(rel.db.as_deref(), &rel.table_name);
                 let ord = gset.key_cols[0].wrapping_sub(rel.offset);
-                match store.col_types().get(ord) {
-                    Some(ColType::Scalar(s)) if s.is_integer() => {}
-                    _ => return false,
+                if let [key_expr] = plan.group_exprs.as_slice() {
+                    // An expression key (memory.md §5.4): its synthetic slot follows the table's
+                    // columns, its result is an integer (so the i64 bucket is again a bijection),
+                    // and it is safe to discard, since a run that evaluates it is always an attempt
+                    // (cost.md §6.1).
+                    if ord != store.col_types().len()
+                        || !matches!(plan.group_expr_types[0], ResolvedType::Int(_))
+                        || !discard_safe(key_expr)
+                    {
+                        return false;
+                    }
+                } else {
+                    match store.col_types().get(ord) {
+                        Some(ColType::Scalar(s)) if s.is_integer() => {}
+                        _ => return false,
+                    }
                 }
             }
             _ => return false,
         }
         // No blocking / re-shaping operator beyond the fold. LIMIT/OFFSET is honored via the window
-        // bounds below, so it need not bail. An `ORDER BY` is the caller's to admit: only the
-        // handed-over grouped lane sorts its groups (packed-leaf.md §11 Track A5).
-        if plan.distinct || plan.distinct_on > 0 || plan.having.is_some() || plan.has_window {
+        // bounds below, so it need not bail. A `HAVING` runs over the finalized groups, as the row
+        // path's stage does, and an `ORDER BY` sorts them (memory.md §5.4).
+        if plan.distinct || plan.distinct_on > 0 || plan.has_window {
             return false;
         }
         if plan.agg_specs.is_empty() {
@@ -3047,6 +3061,10 @@ impl Engine {
             // sorted by the bounded-spill lane's own `ORDER BY` stage and emitted under the
             // LIMIT/OFFSET window exactly as that lane emits its own.
             Some(LaneGroups::Spool(mut rows)) => {
+                if plan.having.is_some() {
+                    let kept = self.blocking_having(plan, rows, env, meter);
+                    rows = meter.cost_first(kept)?;
+                }
                 if !plan.order.is_empty() {
                     let sorted = self.blocking_order(plan, rows, env, meter);
                     rows = meter.cost_first(sorted)?;
@@ -3118,6 +3136,7 @@ impl Engine {
                     group_by_int_key(
                         &plan.agg_specs,
                         gset.key_cols[0],
+                        plan.group_exprs.first(),
                         &src,
                         survivors.len(),
                         &self.session.time_zone,
@@ -3136,7 +3155,21 @@ impl Engine {
         // An ORDER BY over the groups of the unbounded form: the eager aggregate branch's own stage —
         // each order-expression value appended to its group row and admitted, then the in-place sort
         // (memory.md §5.4).
+        // A HAVING first, as the row path's stage runs (memory.md §5.4): over each admitted group row
+        // in creation order, once every group is finalized, releasing each dropped row.
         let mut srows = srows;
+        if let Some(h) = &plan.having {
+            let mut kept: Vec<Vec<Value>> = Vec::with_capacity(srows.len());
+            for srow in srows {
+                meter.poll()?;
+                if h.eval_filter(&srow, env, meter)? {
+                    kept.push(srow);
+                } else {
+                    meter.release_row(&srow);
+                }
+            }
+            srows = kept;
+        }
         if !plan.order.is_empty() {
             materialize_order_exprs(&mut srows, &plan.order_exprs, env, meter)?;
             let acct = meter.query.clone();
@@ -3206,7 +3239,23 @@ impl Engine {
                 return Ok(None);
             }
         }
-        if let Some(&kc) = gset.key_cols.first()
+        // An expression key (memory.md §5.4) is evaluated over the scratch row: the columns it reads,
+        // resolved once per record (shared with a filter or operand that read them).
+        let key_expr = plan.group_exprs.first();
+        let key_reads: Vec<usize> = match key_expr {
+            Some(e) => {
+                let mut reads = vec![false; mask.len()];
+                collect_touched(e, 0, &mut reads);
+                let cols: Vec<usize> = (0..reads.len()).filter(|&c| reads[c]).collect();
+                if !cols.iter().all(|&c| need(c)) {
+                    return Ok(None);
+                }
+                cols
+            }
+            None => Vec::new(),
+        };
+        if key_expr.is_none()
+            && let Some(&kc) = gset.key_cols.first()
             && !need(kc)
         {
             return Ok(None);
@@ -3301,7 +3350,7 @@ impl Engine {
                 _ => Vec::new(),
             })
             .collect();
-        let expr_ops = has_expression_operand(plan);
+        let expr_ops = lane_evaluates_expressions(plan);
         let mut units = crate::format::ScanUnits {
             pages: 0,
             decompress: 0,
@@ -3393,8 +3442,18 @@ impl Engine {
                     return Ok(());
                 }
                 // A NULL integer key buckets into one sentinel group (the value-canonical key groups
-                // all NULLs together — matching the scalar/lane path).
-                let key = match node.col_at(i, key_col)? {
+                // all NULLs together — matching the scalar/lane path). An expression key is evaluated
+                // before the operands (memory.md §5.4).
+                let key_value = match key_expr {
+                    Some(e) => {
+                        for &c in &key_reads {
+                            scratch.ensure(node, i, c)?;
+                        }
+                        e.eval(&scratch.vals, env, meter)?
+                    }
+                    None => node.col_at(i, key_col)?,
+                };
+                let key = match key_value {
                     Value::Int(k) => Some(k),
                     _ => None,
                 };

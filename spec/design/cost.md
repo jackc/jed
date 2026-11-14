@@ -2064,7 +2064,8 @@ is the alternative to revisit.
 
 **Eligibility: the lane's work must be safe to discard.** A discarded attempt must leave nothing
 behind, so an attempt additionally requires that the expressions the lane evaluates (its `WHERE`,
-any expression operand, and any `ORDER BY` expression over its groups) contain:
+any expression operand or grouping key, its `HAVING`, and any `ORDER BY` expression over its groups)
+contain:
 
 - no volatile call — entropy (`uuidv4`, `uuidv7`), `clock_timestamp()`, a sequence
   function, or a volatile host function — by the function catalog's volatility, the data index
@@ -2127,6 +2128,21 @@ filter would raise, the row path reports the filter's error and the lane would r
 operand's. Running it as an attempt makes that unobservable: any error discards the run and the row
 path reports its own. With no ceiling the acceptance guard always passes, so a statement that
 completes still runs once.
+
+**Expression keys: always an attempt, for the same reason.** A grouping expression
+(`GROUP BY amount / 1000`) takes the lane only when it is an integer on the allowlist
+([memory.md](memory.md) §5.4). The row path evaluates it for every survivor once the `WHERE` has
+passed over every row (the eager lane before bucketing, the bounded-spill lane in a decoration pass
+over the `WHERE` spool); the lane evaluates each survivor's key as it filters. A key that traps
+(`GROUP BY 1000000 * a` overflowing) beside a later filter error would therefore change the first
+error, so the run is an attempt even with no ceiling. Both paths evaluate the key once per survivor,
+so a completed run charges the row path's `operator_eval`s.
+
+**`HAVING` needs no attempt of its own.** Both paths evaluate it after every group is finalized, over
+the group rows in creation order (memory.md §5.4), and the lane has charged its whole blocking total by
+then. So a `HAVING` error is the row path's error at the row path's accrued cost, and a statement with
+a `HAVING` and no other reason to attempt runs once. Under a ceiling its run is an attempt as any other,
+which is why the `HAVING` must be on the allowlist.
 
 **The projection lane.** A bare-column projection with no `ORDER BY`, `LIMIT`, or `OFFSET` runs under
 a ceiling by the same rule. Its row path is the eager lane, which also scans and filters every row

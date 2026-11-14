@@ -88,6 +88,7 @@ pub(crate) fn fold_agg_whole(
 pub(crate) fn group_by_int_key(
     specs: &[AggSpec],
     key_col: usize,
+    key_expr: Option<&RExpr>,
     src: &LaneSrc,
     nsurv: usize,
     zone: &crate::timezone::ZoneRef,
@@ -106,7 +107,15 @@ pub(crate) fn group_by_int_key(
         if j & 255 == 0 {
             meter.checkpoint()?;
         }
-        let kv = src.at(j, key_col);
+        // An expression key is evaluated over the survivor's row before its operands (memory.md §5.4).
+        let evaluated;
+        let kv = match key_expr {
+            Some(e) => {
+                evaluated = e.eval(src.row(j), env, meter)?;
+                &evaluated
+            }
+            None => src.at(j, key_col),
+        };
         let gi = match kv {
             Value::Int(k) => match index.get(k) {
                 Some(&g) => g,

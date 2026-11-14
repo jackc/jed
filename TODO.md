@@ -72,12 +72,19 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   - [ ] _follow-on (TS, per-core):_ the TS core's decimal lanes are still several times slower than
     Rust's and Go's; what remains is per-value directory reads, bigint cost arithmetic, and the fold
     dispatch ([benchmarks.md §11](spec/design/benchmarks.md)).
-  - [ ] _follow-on:_ the columnar aggregate lane takes one base table, one integer grouping key and
-    `count`/`sum`/`avg`/`min`/`max`; a non-integer or multi-column key, `GROUP BY` on the primary
-    key, and a top-N by an expression still run on the row path
+  - [x] The columnar aggregate lane takes an integer grouping **expression** (`GROUP BY amount / 1000`,
+    on the safe-to-discard allowlist, always run as an attempt) and a **`HAVING`** (evaluated over the
+    finalized groups in creation order, as the row path's stage) — `group_by_agg` 0.48–1.7 s → 50–210 ms
+    and `group_by_agg_high_card` 0.78–6.1 s → 0.2–0.9 s across the cores
+    ([memory.md §5.4](spec/design/memory.md), [cost.md §6.1](spec/design/cost.md)).
+  - [ ] _follow-on:_ the columnar aggregate lane takes one base table, one integer grouping key (a
+    column or an expression) and `count`/`sum`/`avg`/`min`/`max`; a non-integer or multi-column key,
+    `GROUP BY` on the primary key, and a top-N by an expression still run on the row path
     ([memory.md §5.4](spec/design/memory.md)). The safe-to-discard allowlist ([cost.md §6.1](spec/design/cost.md))
     still excludes regex, array, range and JSON operators, so such filters keep the row path under
-    a cost ceiling.
+    a cost ceiling. A grouped fold over ~100k groups is bound by scattered accumulator access (each
+    group's accumulators are separate heap objects in every core); a flat per-aggregate state array
+    would be the next step.
   - [ ] _follow-on:_ `generate_series(numeric, numeric[, numeric])` — PostgreSQL has a numeric series (`generate_series(1, 3.5)`); jed's SRF is integer-only (`42883`).
 - [x] **`timestamp` / `timestamptz`.** → [timestamp.md](spec/design/timestamp.md), [timezones.md](spec/design/timezones.md), [formatting.md](spec/design/formatting.md)
   - [ ] _follow-on:_ a separate `time` type; `current_timestamp(p)` / `localtimestamp(p)`; the multi-word `timestamp [(p)] with[out] time zone` spelling; `timestamp(p)[]` element typmods (the `varchar(n)[]` narrowing); zone abbreviations in `to_timestamp` input (`'… EST'` under `TZ` is `0A000` until the abbreviation-table decision, [timezones.md §15](spec/design/timezones.md), [formatting.md §5](spec/design/formatting.md)).

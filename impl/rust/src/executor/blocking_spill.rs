@@ -349,16 +349,8 @@ impl Engine {
         }
         if plan.is_agg {
             rows = self.blocking_aggregate(plan, rows, env, meter)?;
-            if let Some(having) = &plan.having {
-                let mut kept = self.blocking_spool();
-                let mut scan = rows.into_reader()?;
-                while let Some(row) = scan.next()? {
-                    meter.poll()?;
-                    if having.eval_filter(&row, env, meter)? {
-                        kept.push(row)?;
-                    }
-                }
-                rows = kept;
+            if plan.having.is_some() {
+                rows = self.blocking_having(plan, rows, env, meter)?;
             }
             if root != "Aggregate"
                 && let Some(profile) = self.explain_actual.borrow_mut().as_mut()
@@ -1443,6 +1435,28 @@ impl Engine {
         }
         self.store_scoped(rel.db.as_deref(), &rel.table_name)
             .is_file_backed()
+    }
+
+    /// The bounded-spill lane's `HAVING` stage: each group row, in order, is kept in a new spool when
+    /// the predicate is TRUE; the consumed spool is discarded once the pass completes. The columnar
+    /// aggregate lane's bounded form runs it over its own output spool (memory.md §6.6.1).
+    pub(crate) fn blocking_having(
+        &self,
+        plan: &SelectPlan,
+        rows: RowSpool,
+        env: &EvalEnv,
+        meter: &mut Meter,
+    ) -> Result<RowSpool> {
+        let having = plan.having.as_ref().expect("a HAVING");
+        let mut kept = self.blocking_spool();
+        let mut scan = rows.into_reader()?;
+        while let Some(row) = scan.next()? {
+            meter.poll()?;
+            if having.eval_filter(&row, env, meter)? {
+                kept.push(row)?;
+            }
+        }
+        Ok(kept)
     }
 
     /// Move the lane's in-memory `groups` (in creation order) into the spill structures — exactly

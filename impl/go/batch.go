@@ -103,12 +103,13 @@ func extractIntColumn(rows []storedRow, idx int) colBatch {
 }
 
 // vectorizedAggEligible reports whether plan is a shape execVectorizedAgg specializes: a
-// single-base-table SUM/COUNT/MIN/MAX/AVG with no DISTINCT / FILTER / HAVING / window / ORDER BY,
-// over a full or primary-key-bounded scan, that is EITHER whole-table (no GROUP BY) OR grouped by a
-// single bare integer column. Mostly pure plan inspection — it charges nothing, so a bail is free
-// and the general path runs with identical results + cost; the single-key case additionally reads
-// the group-key column's static type from the table store (a one-time lookup, not per row) to
-// confirm it is a scalar integer (so the int64-keyed bucket is a bijection of distinctRowKey).
+// single-base-table SUM/COUNT/MIN/MAX/AVG with no DISTINCT / FILTER / window (a HAVING and an ORDER
+// BY are allowed), over a full or primary-key-bounded scan, that is EITHER whole-table (no GROUP BY)
+// OR grouped by a single integer key — a bare column or one expression (memory.md §5.4). Mostly
+// pure plan inspection — it charges nothing, so a bail is free and the general path runs with
+// identical results + cost; the single-key case additionally reads the group-key column's static
+// type from the table store (a one-time lookup, not per row) to confirm it is a scalar integer (so
+// the int64-keyed bucket is a bijection of distinctRowKey).
 func (db *engine) vectorizedAggEligible(plan *selectPlan) bool {
 	if !plan.isAgg {
 		return false
@@ -126,9 +127,9 @@ func (db *engine) vectorizedAggEligible(plan *selectPlan) bool {
 	if len(plan.phys.relBounds) > 0 && plan.phys.relBounds[0].needsEagerScan() {
 		return false
 	}
-	// Exactly one grouping set (ROLLUP/CUBE/GROUPING SETS produce several — deferred), no materialized
-	// expression keys (`GROUP BY a + b`), and no GROUPING() calls.
-	if len(plan.groupSets) != 1 || len(plan.groupExprs) != 0 || len(plan.groupingSpecs) != 0 {
+	// Exactly one grouping set (ROLLUP/CUBE/GROUPING SETS produce several — deferred), at most one
+	// materialized expression key (`GROUP BY a / 1000`), and no GROUPING() calls.
+	if len(plan.groupSets) != 1 || len(plan.groupExprs) > 1 || len(plan.groupingSpecs) != 0 {
 		return false
 	}
 	gset := &plan.groupSets[0]
@@ -152,6 +153,18 @@ func (db *engine) vectorizedAggEligible(plan *selectPlan) bool {
 		if store == nil {
 			return false
 		}
+		if len(plan.groupExprs) == 1 {
+			// An expression key (memory.md §5.4): its synthetic slot follows the table's columns, its
+			// result is an integer (so the int64 bucket is again a bijection), and it is safe to
+			// discard, since a run that evaluates it is always an attempt (cost.md §6.1).
+			if gset.keyCols[0]-rel.offset != len(store.colTypes) {
+				return false
+			}
+			if _, ok := intType(plan.groupExprTypes[0]); !ok || !discardSafe(plan.groupExprs[0]) {
+				return false
+			}
+			break
+		}
 		ord := gset.keyCols[0] - rel.offset
 		if ord < 0 || ord >= len(store.colTypes) {
 			return false
@@ -167,7 +180,8 @@ func (db *engine) vectorizedAggEligible(plan *selectPlan) bool {
 	// to mirror; deferred). LIMIT/OFFSET is honored below via windowBounds, so it need not bail. An
 	// ORDER BY is the dispatch gate's to admit (aggregateLaneEligible): only the bounded grouped lane
 	// sorts its groups.
-	if plan.distinct || plan.distinctOn > 0 || plan.having != nil || plan.hasWindow {
+	// A HAVING runs over the finalized groups, as the row path's stage does (laneHaving).
+	if plan.distinct || plan.distinctOn > 0 || plan.hasWindow {
 		return false
 	}
 	if len(plan.aggSpecs) == 0 {
@@ -232,8 +246,13 @@ func (db *engine) execVectorizedAgg(plan *selectPlan, outer []storedRow, params 
 		}
 		if ok && spool != nil {
 			// A grouped fold on a spill-capable host: its groups are a spool, handed over or not —
-			// sorted by the bounded-spill lane's own ORDER BY stage and emitted under the LIMIT/OFFSET
-			// window exactly as that lane emits its own.
+			// filtered and sorted by the bounded-spill lane's own HAVING and ORDER BY stages and emitted
+			// under the LIMIT/OFFSET window exactly as that lane emits its own.
+			if plan.having != nil {
+				if spool, err = db.blockingHaving(plan, spool, env, meter, own); err != nil {
+					return emitter{}, meter.costFirst(err)
+				}
+			}
 			if len(plan.order) > 0 {
 				if spool, err = db.blockingOrder(plan, spool, env, meter, own); err != nil {
 					return emitter{}, meter.costFirst(err)
@@ -367,7 +386,28 @@ func admitAggRows(srows []storedRow, meter *costMeter) error {
 // orderAggSyntheticRows is emitAggSyntheticRows after an ORDER BY over the groups of the unbounded
 // form: the eager aggregate branch's own stage — each order-expression value appended to its group
 // row and admitted, then the in-place sort (memory.md §5.4).
+//
+// A HAVING runs first, as the row path's stage does (memory.md §5.4): over each admitted group row in
+// creation order, once every group is finalized, releasing each dropped row.
 func orderAggSyntheticRows(plan *selectPlan, srows []storedRow, env *evalEnv, meter *costMeter) (emitter, error) {
+	if plan.having != nil {
+		kept := srows[:0]
+		for _, srow := range srows {
+			if err := meter.PollStep(); err != nil {
+				return emitter{}, err
+			}
+			v, err := plan.having.evalFilter(srow, env, meter)
+			if err != nil {
+				return emitter{}, err
+			}
+			if v {
+				kept = append(kept, srow)
+			} else {
+				meter.releaseRow(srow)
+			}
+		}
+		srows = kept
+	}
 	if len(plan.order) > 0 {
 		if err := materializeOrderExprs(srows, plan.orderExprs, env, meter); err != nil {
 			return emitter{}, err
@@ -425,7 +465,23 @@ func (db *engine) aggColumnar(plan *selectPlan, gset *groupSetPlan, env *evalEnv
 			return nil, nil, false, nil
 		}
 	}
-	if len(gset.keyCols) == 1 && !need(gset.keyCols[0]) {
+	// An expression key (memory.md §5.4) is evaluated over the scratch row: the columns it reads,
+	// resolved once per record (shared with a filter or operand that read them).
+	var keyExpr *rExpr
+	var keyCols []int
+	if len(plan.groupExprs) == 1 {
+		keyExpr = plan.groupExprs[0]
+		reads := make([]bool, len(mask))
+		collectTouched(keyExpr, 0, reads)
+		for c := range reads {
+			if reads[c] && !need(c) {
+				return nil, nil, false, nil
+			}
+			if reads[c] {
+				keyCols = append(keyCols, c)
+			}
+		}
+	} else if len(gset.keyCols) == 1 && !need(gset.keyCols[0]) {
 		return nil, nil, false, nil
 	}
 
@@ -490,7 +546,7 @@ func (db *engine) aggColumnar(plan *selectPlan, gset *groupSetPlan, env *evalEnv
 	opRead := make([]operandRead, len(plan.aggSpecs))
 	opCol := make([]int, len(plan.aggSpecs))
 	operandCols := make([][]int, len(plan.aggSpecs))
-	exprOps := hasExpressionOperand(plan)
+	exprOps := laneEvaluatesExpressions(plan)
 	for s := range plan.aggSpecs {
 		op := plan.aggSpecs[s].operand
 		switch {
@@ -628,8 +684,20 @@ func (db *engine) aggColumnar(plan *selectPlan, gset *groupSetPlan, env *evalEnv
 				return nil
 			}
 			// A NULL integer key buckets into one sentinel group (the value-canonical key groups all
-			// NULLs together — matching the scalar path).
-			kv, e := n.colAt(i, keyIdx)
+			// NULLs together — matching the scalar path). An expression key is evaluated before the
+			// operands (memory.md §5.4).
+			var kv Value
+			var e error
+			if keyExpr != nil {
+				for _, c := range keyCols {
+					if e = scratch.ensure(n, i, c); e != nil {
+						return e
+					}
+				}
+				kv, e = keyExpr.eval(scratch.vals, env, meter)
+			} else {
+				kv, e = n.colAt(i, keyIdx)
+			}
 			if e != nil {
 				return e
 			}
@@ -1059,7 +1127,16 @@ func (db *engine) groupByIntKey(plan *selectPlan, gset *groupSetPlan, survivors 
 				return nil, err
 			}
 		}
-		kv := r[keyIdx]
+		var kv Value
+		if len(plan.groupExprs) == 1 {
+			// An expression key, evaluated over the survivor's row before its operands (memory.md §5.4).
+			var kerr error
+			if kv, kerr = plan.groupExprs[0].eval(r, env, meter); kerr != nil {
+				return nil, kerr
+			}
+		} else {
+			kv = r[keyIdx]
+		}
 		var gi int
 		if kv.Kind == ValNull {
 			if nullGI < 0 {
@@ -1361,10 +1438,19 @@ func hasExpressionOperand(plan *selectPlan) bool {
 	return false
 }
 
-// laneDiscardSafe reports whether every expression the aggregate lane evaluates for plan — its WHERE
-// and each ORDER BY expression over its groups — is safe to discard.
+// laneEvaluatesExpressions reports whether a lane run for plan evaluates an expression per survivor
+// — an aggregate's expression operand or an expression grouping key. Such a run interleaves that
+// evaluation with the filter where the row path filters every row first, so it is always an attempt
+// the row path replaces on any error (cost.md §6.1).
+func laneEvaluatesExpressions(plan *selectPlan) bool {
+	return hasExpressionOperand(plan) || len(plan.groupExprs) != 0
+}
+
+// laneDiscardSafe reports whether every expression the aggregate lane evaluates for plan — its WHERE,
+// its HAVING, and each ORDER BY expression over its groups — is safe to discard. (An expression key
+// and expression operands are part of the lane's shape, which already requires them to be.)
 func laneDiscardSafe(plan *selectPlan) bool {
-	if !discardSafe(plan.filter) {
+	if !discardSafe(plan.filter) || !discardSafe(plan.having) {
 		return false
 	}
 	for _, e := range plan.orderExprs {

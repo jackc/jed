@@ -331,13 +331,22 @@ bounded-spill lane) but never on the core.
 contract, because it decides what a statement reserves:
 
 - *Shape.* One base table under a full or primary-key-bounded scan; one grouping
-  set that is either `()` (whole-table) or a single bare integer column, with no
-  expression keys and no `GROUPING()`; every aggregate one of `count(*)`, `count`,
-  `sum`, `avg`, `min`, `max` (`sum`/`avg` over an integer, decimal, or float) over a
-  bare column or over an expression on the safe-to-discard allowlist
-  ([cost.md](cost.md) §6.1), with no `DISTINCT`, `FILTER`, or in-aggregate `ORDER BY`;
-  no `HAVING`, window, or `DISTINCT`. An `ORDER BY` over the result is part of the
-  shape in every form.
+  set that is either `()` (whole-table) or a single integer key, with no
+  `GROUPING()`. The key is a bare integer column, or one grouping expression whose
+  resolved type is an integer and that is on the safe-to-discard allowlist
+  ([cost.md](cost.md) §6.1) (`GROUP BY amount / 1000`). Every aggregate is one of
+  `count(*)`, `count`, `sum`, `avg`, `min`, `max` (`sum`/`avg` over an integer,
+  decimal, or float) over a bare column or over an expression on the allowlist, with
+  no `DISTINCT`, `FILTER`, or in-aggregate `ORDER BY`; no window or `DISTINCT`. A
+  `HAVING` and an `ORDER BY` over the result are part of the shape in every form.
+- *Expression key.* Each surviving record evaluates the key expression after its
+  `WHERE` and before its aggregates' operands, and buckets by the result; every NULL
+  result is one group, as on the row path. The group holds the evaluated value.
+- *`HAVING`.* Evaluated as the row path's `HAVING` stage is: over each group row in
+  creation order, once every group is finalized and before the `ORDER BY`. The
+  unbounded form filters its admitted group rows, releasing each dropped one; the
+  bounded form passes its output spool through the bounded-spill lane's `HAVING`
+  stage, which copies the kept rows into a new spool.
 - *Unbounded form* (§6.2): the shape above when the statement is not eligible for the
   bounded-spill lane (an in-memory database, `work_mem = 0`), or is whole-table on a
   file-backed table. An `ORDER BY` sorts its group rows as the eager aggregate lane
@@ -348,11 +357,11 @@ contract, because it decides what a statement reserves:
 - Anything else, and every shape while `EXPLAIN ANALYZE` profiles it, takes the eager
   or bounded-spill lane.
 - Under a cost ceiling or lifetime budget — and, for a run that folds an expression
-  operand, always — the lane is an attempt that the row path may replace
-  ([cost.md](cost.md) §6.1): an accepted attempt keeps the lane's reservations; a
-  rejected one returns them all before the row path makes its own. An attempt also
-  requires its `WHERE` and `ORDER BY` expressions to be on the allowlist; a statement
-  that is not keeps the row path.
+  operand or groups by an expression key, always — the lane is an attempt that the
+  row path may replace ([cost.md](cost.md) §6.1): an accepted attempt keeps the lane's
+  reservations; a rejected one returns them all before the row path makes its own. An
+  attempt also requires its `WHERE`, `HAVING`, and `ORDER BY` expressions to be on the
+  allowlist; a statement that is not keeps the row path.
 - The **columnar projection lane** (§6.5) runs under a cost ceiling by the same
   attempt rule; with no ceiling it runs as before.
 
@@ -544,8 +553,13 @@ of failing.
 - *Finish, after a hand-over.* The key spool is read in order; each group's state is
   fetched and finalized and its row pushed to an output spool, while the map and the
   key spool are still held — the bounded-spill aggregate's own emission.
-- *`ORDER BY`.* The output spool then takes the bounded-spill lane's `ORDER BY`
-  stage unchanged (decorated rows, sorter, sorted spool — §6.4, §6.6).
+- *`HAVING`, `ORDER BY`.* The output spool then takes the bounded-spill lane's
+  `HAVING` stage (its kept rows copied into a new spool, the old one discarded) and
+  its `ORDER BY` stage (decorated rows, sorter, sorted spool — §6.4, §6.6), each
+  unchanged.
+
+An expression key changes nothing here: the group's key is the expression's value, measured and
+handed over as a column key is.
 
 The output spool (sorted or not) is the lane's final output spool: it is emitted
 under the `LIMIT`/`OFFSET` window and released when emission completes, as the

@@ -492,6 +492,9 @@ pub(crate) struct SelectPlan {
     /// `group_sets` may point at one — the whole-row bucket machinery stays slot-based. Empty when
     /// every grouping key is a plain column (the common case, byte-identical to before).
     pub(crate) group_exprs: Vec<RExpr>,
+    /// Each `group_exprs` key's resolved type, in the same order (the columnar aggregate lane takes
+    /// an integer expression key — memory.md §5.4).
+    pub(crate) group_expr_types: Vec<ResolvedType>,
     /// The grouping sets to compute (spec/design/aggregates.md §12). A plain `GROUP BY` (and the
     /// whole-table aggregate) is a single set; `ROLLUP`/`CUBE`/`GROUPING SETS` produce several.
     pub(crate) group_sets: Vec<GroupSetPlan>,
