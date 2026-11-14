@@ -4925,8 +4925,7 @@ func resolveIntOrDecimalPair(s *scope, name string, lhs, rhs exprNode, ag *aggCt
 	if err != nil {
 		return nil, nil, 0, err
 	}
-	ok := func(k rtKind) bool { return k == rtInt || k == rtDecimal || k == rtNull }
-	if !ok(lt.kind) || !ok(rt.kind) {
+	if !decimalArgument(lt) || !decimalArgument(rt) {
 		return nil, nil, 0, noFuncOverload(name)
 	}
 	if lt.kind == rtDecimal || rt.kind == rtDecimal {

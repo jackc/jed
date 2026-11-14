@@ -1865,13 +1865,7 @@ pub(crate) fn resolve_int_or_decimal_pair(
     params: &mut ParamTypes,
 ) -> Result<(RExpr, RExpr, ScalarType)> {
     let (rl, lt, rr, rt) = resolve_operand_pair(scope, lhs, rhs, agg, params)?;
-    let numeric_ok = |t: &ResolvedType| {
-        matches!(
-            t,
-            ResolvedType::Int(_) | ResolvedType::Decimal | ResolvedType::Null
-        )
-    };
-    if !numeric_ok(&lt) || !numeric_ok(&rt) {
+    if !decimal_argument(&lt) || !decimal_argument(&rt) {
         return Err(no_func_overload(name));
     }
     let result = if matches!(lt, ResolvedType::Decimal) || matches!(rt, ResolvedType::Decimal) {

@@ -3657,8 +3657,7 @@ func resolveFuncCall(s *scope, fc *funcCallExpr, ag *aggCtx, params *paramTypes)
 		if err != nil {
 			return nil, resolvedType{}, err
 		}
-		numericOK := func(k rtKind) bool { return k == rtInt || k == rtDecimal || k == rtNull }
-		if !numericOK(lt.kind) || !numericOK(rt.kind) {
+		if !decimalArgument(lt) || !decimalArgument(rt) {
 			return nil, resolvedType{}, noFuncOverload("div")
 		}
 		dec := scalarResultType("decimal", nil)
@@ -3709,26 +3708,30 @@ func resolveFuncCall(s *scope, fc *funcCallExpr, ag *aggCtx, params *paramTypes)
 			return nil, resolvedType{}, noFuncOverload("width_bucket")
 		}
 		anyFloat := isFloatKind(tys[0].kind) || isFloatKind(tys[1].kind) || isFloatKind(tys[2].kind)
+		for i := 0; i < 3; i++ {
+			if anyFloat {
+				if isFloatKind(tys[i].kind) || tys[i].kind == rtNull {
+					continue
+				}
+				_, target, ok := cheapestCoercion(argSourceOf(fc.Args[i], tys[i]), func(to scalarType) bool { return to.IsFloat() })
+				if !ok {
+					continue
+				}
+				r, t, err := resolve(s, *fc.Args[i], &target, ag, params)
+				if err != nil {
+					return nil, resolvedType{}, err
+				}
+				rargs[i], tys[i] = r, t
+			} else if !decimalArgument(tys[i]) {
+				return nil, resolvedType{}, noFuncOverload("width_bucket")
+			}
+		}
 		if anyFloat {
-			// A numeric literal beside a float operand adapts to f64 (PostgreSQL reads it as float8).
-			for i := 0; i < 3; i++ {
-				if (tys[i].kind == rtInt || tys[i].kind == rtDecimal) && isNumericLiteral(fc.Args[i]) {
-					r, t, err := floatLiteral(s, fc.Args[i], ag, params)
-					if err != nil {
-						return nil, resolvedType{}, err
-					}
-					rargs[i], tys[i] = r, t
+			for _, t := range tys[:3] {
+				if !isFloatKind(t.kind) && t.kind != rtNull {
+					return nil, resolvedType{}, noFuncOverload("width_bucket")
 				}
 			}
-		}
-		ok := func(k rtKind) bool {
-			if anyFloat {
-				return isFloatKind(k) || k == rtNull
-			}
-			return k == rtInt || k == rtDecimal || k == rtNull
-		}
-		if !ok(tys[0].kind) || !ok(tys[1].kind) || !ok(tys[2].kind) {
-			return nil, resolvedType{}, noFuncOverload("width_bucket")
 		}
 		return &rExpr{kind: reScalarFunc, sfunc: sfWidthBucket, sargs: rargs, result: scalarInt32}, resolvedTypeOf(scalarInt32), nil
 	}
@@ -4116,19 +4119,6 @@ func resolveScalarFunc(s *scope, fc *funcCallExpr, ag *aggCtx, params *paramType
 	return nil, resolvedType{}, noFuncOverload(name)
 }
 
-// isNumericLiteral reports whether e is a bare integer or decimal literal (a negative one included:
-// the parser folds the sign into the literal).
-func isNumericLiteral(e *exprNode) bool {
-	return e.Kind == exprLiteral && (e.Literal.Kind == literalInt || e.Literal.Kind == literalDecimal)
-}
-
-// floatLiteral re-resolves a numeric literal argument that faces a float argument as f64 — the type
-// of every float overload's arguments (PostgreSQL reads the constant as float8).
-func floatLiteral(s *scope, e *exprNode, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
-	f64 := scalarFloat64
-	return resolve(s, *e, &f64, ag, params)
-}
-
 // argSourceKind is where one argument of a call comes from, for the argument-coercion pass
 // (arg-coercion.md §4).
 type argSourceKind int
@@ -4214,6 +4204,17 @@ func cheapestCoercion(src argSource, accept func(scalarType) bool) (int, scalarT
 		}
 	}
 	return bestCost, bestTo, found
+}
+
+// decimalArgument keeps the dedicated numeric resolvers' NULL and result-width rules.
+// Integer promotion comes from the shared table and stays inside the kernel, with no cast charge.
+func decimalArgument(t resolvedType) bool {
+	if t.kind == rtDecimal || t.kind == rtNull {
+		return true
+	}
+	st, ok := resolvedToScalar(t)
+	_, _, admitted := cheapestCoercion(argSource{kind: argTyped, scalar: st, scalarOK: ok}, func(to scalarType) bool { return to == scalarDecimal })
+	return admitted
 }
 
 // coercedCandidate is one overload considered by the coercion pass: a built-in catalog row or a host

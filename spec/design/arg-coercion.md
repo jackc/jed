@@ -1,8 +1,8 @@
 # Implicit argument coercion — design
 
-> Status: **landed in all three cores** (slices 1–4 of §9): the compare.toml cost table, the pass
+> Status: **landed in all three cores** (slices 1–5 of §9): the compare.toml cost table, the pass
 > over built-in and host functions, the catalog cleanup, and the capture check. The resolver
-> consistency cleanup (§9 slice 5) is an optional later refactor. The decisions are in §8: integer
+> consistency cleanup (§9 slice 5) also reads the shared coercion table. The decisions are in §8: integer
 > arguments resolve to `decimal` (§6.3), the table lives in compare.toml (§3), and host functions
 > take part (§4.2). Corpus: `expr/arg_coercion.test` (capability `func.arg_coercion`); host
 > behavior: each core's host-function tests.
@@ -387,10 +387,13 @@ hand-written resolver in each core, because their typing does not fit one row pe
 and defaults), and the regex, range, array, JSON and VARIADIC functions. The pass does not touch
 them, and nothing about their behavior changes.
 
-`div`, `gcd`/`lcm` and `width_bucket` already hand-code the same numeric rules as §3's table:
-integer promotes to `decimal`, and a numeric literal adapts to a float operand. A later
-consistency cleanup can have them read those rules from the table instead of repeating them per
-core. That is refactoring with no observable change. The polymorphic, regex and VARIADIC resolvers
+`div`, `gcd`/`lcm` and `width_bucket` follow the same numeric rules as §3's table:
+integer promotes to `decimal`, and a numeric literal adapts to a float operand. They now read
+conversion admissibility and literal float targets from the shared table. Dedicated resolution
+keeps operand-pair contextual typing, NULL handling, integer result-width promotion, and the
+three-operand float-family choice unchanged. Value promotion remains inside the kernel, without
+new cast nodes or evaluation charges. This is refactoring with no observable change. The
+polymorphic, regex and VARIADIC resolvers
 share nothing with the table.
 
 ## 9. Slices
@@ -406,5 +409,6 @@ share nothing with the table.
    host-API tests (`coercion_*`) for the host rows of §4.1. extensibility.md §4.2 and api.md §12
    updated.
 4. ✅ **Capture check** (§7): coercion_snapshot.rb / .toml, run by `mise run verify`.
-5. **Later, optional: resolver consistency cleanup** (§8). `div`, `gcd`/`lcm` and `width_bucket`
-   read their numeric reconciliation from the table. No corpus change expected.
+5. ✅ **Resolver consistency cleanup** (§8). `div`, `gcd`/`lcm` and `width_bucket`
+   read their numeric reconciliation from the table. Existing numeric, float-island, NULL, and
+   cost corpus entries remain unchanged.

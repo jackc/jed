@@ -6,6 +6,7 @@ import { codePointCount } from "./memsize.ts";
 // column name (spec/design/grammar.md §8). `*` expands across ALL relations in FROM order,
 // each relation's columns in catalog order (§15).
 import {
+  decimalArgument,
   type Engine,
   ParamTypes,
   Scope,
@@ -5331,8 +5332,7 @@ export function resolveIntOrDecimalPair(
   params: ParamTypes,
 ): { args: RExpr[]; result: ScalarType } {
   const p = resolveOperandPair(scope, lhs, rhs, ag, params);
-  const ok = (t: ResolvedType) => t.kind === "int" || t.kind === "decimal" || t.kind === "null";
-  if (!ok(p.lt) || !ok(p.rt)) throw noFuncOverload(name);
+  if (!decimalArgument(p.lt) || !decimalArgument(p.rt)) throw noFuncOverload(name);
   const result: ScalarType =
     p.lt.kind === "decimal" || p.rt.kind === "decimal" ? "decimal" : promote(p.lt, p.rt);
   return { args: [p.rl, p.rr], result };

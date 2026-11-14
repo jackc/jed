@@ -46532,9 +46532,7 @@ export function resolveFuncCall(
     rejectNamed(lname, e.argNames);
     if (e.star) throw engineError("syntax_error", "* is only valid as the argument of COUNT");
     const p = resolveOperandPair(scope, e.args[0]!, e.args[1]!, ag, params);
-    const numericOK = (t: ResolvedType) =>
-      t.kind === "int" || t.kind === "decimal" || t.kind === "null";
-    if (!numericOK(p.lt) || !numericOK(p.rt)) throw noFuncOverload("div");
+    if (!decimalArgument(p.lt) || !decimalArgument(p.rt)) throw noFuncOverload("div");
     return scalarFuncNode("div", [p.rl, p.rr], "decimal", undefined);
   }
   // `gcd(a, b)` / `lcm(a, b)` — resolver-routed for the same integer-promotion the arithmetic
@@ -46570,24 +46568,19 @@ export function resolveFuncCall(
     if (tys[3]!.kind !== "int" && tys[3]!.kind !== "null") throw noFuncOverload("width_bucket");
     const anyFloat =
       tys[0]!.kind === "float" || tys[1]!.kind === "float" || tys[2]!.kind === "float";
-    if (anyFloat) {
-      // A numeric literal beside a float operand adapts to f64 (functions.md §9.2).
-      for (let i = 0; i < 3; i++) {
-        if (
-          (tys[i]!.kind === "int" || tys[i]!.kind === "decimal") &&
-          isNumericLiteral(e.args[i]!)
-        ) {
-          const r = floatLiteral(scope, e.args[i]!, ag, params);
-          rargs[i] = r.node;
-          tys[i] = r.type;
-        }
-      }
+    for (let i = 0; i < 3; i++) {
+      if (anyFloat) {
+        if (tys[i]!.kind === "float" || tys[i]!.kind === "null") continue;
+        const target = cheapestCoercion(argSource(e.args[i]!, tys[i]!), isFloat);
+        if (target === null) continue;
+        const r = resolve(scope, e.args[i]!, target.to, ag, params);
+        rargs[i] = r.node;
+        tys[i] = r.type;
+      } else if (!decimalArgument(tys[i]!)) throw noFuncOverload("width_bucket");
     }
-    const ok = (t: ResolvedType) =>
-      anyFloat
-        ? t.kind === "float" || t.kind === "null"
-        : t.kind === "int" || t.kind === "decimal" || t.kind === "null";
-    if (!ok(tys[0]!) || !ok(tys[1]!) || !ok(tys[2]!)) throw noFuncOverload("width_bucket");
+    if (anyFloat && !tys.slice(0, 3).every(t => t.kind === "float" || t.kind === "null")) {
+      throw noFuncOverload("width_bucket");
+    }
     return scalarFuncNode("width_bucket", rargs, "i32", undefined);
   }
   // `width_bucket(operand, thresholds)` — the array-threshold variant (array-functions.md §14): a
@@ -47124,23 +47117,6 @@ export function resolveScalarFunc(
   return scalarFuncNode(func, rargs, result, argWidth);
 }
 
-// isNumericLiteral reports whether e is a bare integer or decimal literal (a negative one included:
-// the parser folds the sign into the literal).
-function isNumericLiteral(e: Expr): boolean {
-  return e.kind === "literal" && (e.literal.kind === "int" || e.literal.kind === "decimal");
-}
-
-// floatLiteral re-resolves a numeric literal argument that faces a float argument as f64 — the type
-// of every float overload's arguments (PostgreSQL reads the constant as float8).
-function floatLiteral(
-  scope: Scope,
-  e: Expr,
-  ag: AggCtx,
-  params: ParamTypes,
-): { node: RExpr; type: ResolvedType } {
-  return resolve(scope, e, "f64", ag, params);
-}
-
 // An argument's source for the argument-coercion pass (arg-coercion.md §4): a typed value (ty null
 // for a container), a bare numeric constant — which may also take the literal rows of the cost table
 // — or an unknown-typed bare NULL / $N (functions.md §9.1).
@@ -47187,6 +47163,13 @@ function cheapestCoercion(
     if (best === null || row.cost < best.cost) best = { cost: row.cost, to };
   }
   return best;
+}
+
+// Dedicated numeric resolvers retain their NULL and result-width rules. Integer promotion
+// comes from the shared table and stays inside the kernel, without an extra cast charge.
+export function decimalArgument(t: ResolvedType): boolean {
+  return t.kind === "decimal" || t.kind === "null" ||
+    cheapestCoercion({ kind: "typed", ty: resolvedToScalar(t) }, to => to === "decimal") !== null;
 }
 
 // One overload considered by the coercion pass: a built-in catalog row or a host function (by

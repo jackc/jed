@@ -316,13 +316,7 @@ pub(crate) fn resolve_func_call(
             ));
         }
         let (rl, lt, rr, rt) = resolve_operand_pair(scope, &args[0], &args[1], agg, params)?;
-        let numeric_ok = |t: &ResolvedType| {
-            matches!(
-                t,
-                ResolvedType::Int(_) | ResolvedType::Decimal | ResolvedType::Null
-            )
-        };
-        if !numeric_ok(&lt) || !numeric_ok(&rt) {
+        if !decimal_argument(&lt) || !decimal_argument(&rt) {
             return Err(no_func_overload("div"));
         }
         return Ok((
@@ -388,28 +382,28 @@ pub(crate) fn resolve_func_call(
         // (+NULL) → the numeric kernel; a float mixed with a decimal/integer VALUE is 42883, while a
         // numeric literal beside a float operand adapts to f64 (functions.md §9.2).
         let any_float = tys[..3].iter().any(|t| matches!(t, ResolvedType::Float(_)));
-        if any_float {
-            for i in 0..3 {
-                if matches!(tys[i], ResolvedType::Int(_) | ResolvedType::Decimal)
-                    && is_numeric_literal(&args[i])
-                {
-                    let (r, t) = float_literal(scope, &args[i], agg, params)?;
-                    rargs[i] = r;
-                    tys[i] = t;
+        for i in 0..3 {
+            if any_float {
+                if matches!(tys[i], ResolvedType::Float(_) | ResolvedType::Null) {
+                    continue;
                 }
+                let Some((_, target)) =
+                    cheapest_coercion(arg_source(&args[i], &tys[i]), |to| to.is_float())
+                else {
+                    continue;
+                };
+                let (r, t) = resolve(scope, &args[i], Some(target), agg, params)?;
+                rargs[i] = r;
+                tys[i] = t;
+            } else if !decimal_argument(&tys[i]) {
+                return Err(no_func_overload("width_bucket"));
             }
         }
-        let ok = |t: &ResolvedType| {
-            if any_float {
-                matches!(t, ResolvedType::Float(_) | ResolvedType::Null)
-            } else {
-                matches!(
-                    t,
-                    ResolvedType::Int(_) | ResolvedType::Decimal | ResolvedType::Null
-                )
-            }
-        };
-        if !tys[..3].iter().all(ok) {
+        if any_float
+            && !tys[..3]
+                .iter()
+                .all(|t| matches!(t, ResolvedType::Float(_) | ResolvedType::Null))
+        {
             return Err(no_func_overload("width_bucket"));
         }
         return Ok((
@@ -1037,23 +1031,6 @@ pub(crate) fn resolve_scalar_func(
     Err(no_func_overload(name))
 }
 
-/// Whether `e` is a bare integer or decimal literal (a negative one included: the parser folds the
-/// sign into the literal).
-fn is_numeric_literal(e: &Expr) -> bool {
-    matches!(e, Expr::Literal(Literal::Int(_) | Literal::Decimal(_), _))
-}
-
-/// Re-resolve a numeric literal argument that faces a float argument as f64 — the type of every
-/// float overload's arguments (PostgreSQL reads the constant as float8).
-fn float_literal(
-    scope: &Scope,
-    e: &Expr,
-    agg: &mut AggCtx,
-    params: &mut ParamTypes,
-) -> Result<(RExpr, ResolvedType)> {
-    resolve(scope, e, Some(ScalarType::Float64), agg, params)
-}
-
 /// Where one argument of a call comes from, for the argument-coercion pass (arg-coercion.md §4): a
 /// typed value (`None` for a container), a bare numeric constant — which may also take the literal
 /// rows of the cost table — or an unknown-typed bare `NULL` / `$N` (functions.md §9.1).
@@ -1110,6 +1087,17 @@ fn cheapest_coercion(
         }
     }
     best
+}
+
+/// Dedicated numeric resolvers retain their NULL and result-width rules. Integer values
+/// enter the decimal kernel only through the shared argument-coercion table; conversion
+/// stays inside the kernel, without an extra cast node or evaluation charge.
+pub(crate) fn decimal_argument(t: &ResolvedType) -> bool {
+    matches!(t, ResolvedType::Decimal | ResolvedType::Null)
+        || cheapest_coercion(ArgSource::Typed(resolved_to_scalar(t)), |to| {
+            to.is_decimal()
+        })
+        .is_some()
 }
 
 /// One overload considered by the coercion pass: a built-in catalog row or a host function (by
