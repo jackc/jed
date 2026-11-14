@@ -1,5 +1,30 @@
 # Swift experiment progress
 
+## Authorized v53 refresh (2026-11-13, complete)
+
+Target: `32feb48fd961598c2d7e60f0de284ba619a74ab0`. The mechanical snapshot contains 764 SQL files,
+121 database fixtures, 19 saved regressions, 22 generated profiles and 31 process scenarios.
+The native engine now implements sibling leaf redistribution, deferred interiors/catalogs,
+narrow CRC-32 manifests, txid stamps, and owner incremental reclamation with reader generations.
+
+The first release run exposed recovery guards and v52 byte-test assumptions. Recovery now
+rejects manifest-chain roots and requires a listed free-list head while permitting retained
+catalog roots. Tests reconstruct original page stamps, and backups of commit-history fixtures
+check both preserved ciphertext and zeroed dead pages. All 764 SQL files passed the intermediate
+release suite. Independent review fixed bounds checks after remapping, foreign free-list
+accounting, tolerated leak tracking, and owner catalog knowledge after a forced reload.
+
+Cross-core recovery and compact/process checks identified a remote-deferral gate absent from
+all three supported engines. Clients now use the shared deferral plan; reclamation remains
+owner-only and service deltas still require their catalog root in the manifest. The older design
+note saying clients never defer was corrected. Interchange applicability now uses the actual
+90-row deferred histories and the v53-valid omitted-root fixture.
+
+The final release suite passes 560 tests and all 764 SQL files. All resource, encrypted,
+service, interchange, process, stress and saved/generated recovery matrices pass.
+Final acceptance results and actor identities are recorded in [VERIFICATION.md](VERIFICATION.md).
+Earlier evidence below remains attributed to its original actors.
+
 ## Authorized baseline refresh (2026-11-12, complete)
 
 Target: `b1a6affca7725e0b07a4f734eddb1c569ef76bcf`. The snapshot was regenerated from Git

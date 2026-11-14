@@ -49,7 +49,7 @@ internal extension IntegrityChecker {
                     leaf = packed; keys = (0..<packed.count).map { Array(packed.key(at: $0)) }; children = []
                 } else {
                     let interior = try IntegrityInterior(bytes, encrypted: meta.encrypted)
-                    leaf = nil; keys = interior.keys; children = interior.children
+                    leaf = nil; keys = interior.keys; children = try PageRemap.resolve(interior.children, parent: reference.index, entries: meta.remaps)
                 }
             } catch let error as JedError where error.code == "XX001" {
                 result.unreadable = true; try add("page_corrupt", object, page: reference.index, error.message); return
@@ -121,7 +121,7 @@ internal extension IntegrityChecker {
                     try consume(record.key, values)
                 }
             } else if bytes[0] == 3 {
-                for child in try IntegrityInterior(bytes, encrypted: meta.encrypted).children { try visit(child, depth: depth + 1) }
+                for child in try PageRemap.resolve(IntegrityInterior(bytes, encrypted: meta.encrypted).children, parent: reference.index, entries: meta.remaps) { try visit(child, depth: depth + 1) }
             } else { throw JedError.corruption("invalid replay node type") }
         }
         if root.index != 0 { try visit(root, depth: 0) }

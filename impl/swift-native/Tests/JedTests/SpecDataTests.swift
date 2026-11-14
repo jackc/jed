@@ -37,7 +37,7 @@ final class SpecDataTests: XCTestCase {
         XCTAssertEqual(fixture["baseline"] as? String, GeneratedSpec.baseline)
         XCTAssertEqual(fixture["fingerprint"] as? String, GeneratedSpec.fingerprint)
         XCTAssertEqual(fixture["source_hashes"] as? [String: String], GeneratedSpec.sourceHashes)
-        XCTAssertEqual(GeneratedSpec.baseline, "b1a6affca7725e0b07a4f734eddb1c569ef76bcf")
+        XCTAssertEqual(GeneratedSpec.baseline, "32feb48fd961598c2d7e60f0de284ba619a74ab0")
         let scalars = try rows("spec/types/scalars.toml", "type")
         XCTAssertEqual(GeneratedSpec.scalars.count, scalars.count)
         XCTAssertEqual(Set(ScalarType.allCases.map(\.name)), Set(GeneratedSpec.scalars.map(\.id)))

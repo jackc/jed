@@ -80,7 +80,7 @@ internal enum BackupImage {
         }
         let manifest = try CommitManifest.build(pageSize: meta.pageSize, encrypted: meta.encrypted,
             txid: meta.txid, root: meta.root, pageCount: meta.pageCount, freeList: meta.freeList,
-            livePages: meta.livePages, entries: [], chain: [])
+            livePages: meta.livePages, entries: [], chain: [], remaps: meta.remaps)
         let clear = try manifest.meta.encode(inline: [])
         for slot: UInt32 in 0...1 {
             let bytes: [UInt8]

@@ -12,7 +12,7 @@ internal struct ManifestEntry: Equatable, Sendable {
 }
 
 internal struct MetaPage: Sendable {
-    static let version: UInt16 = 52
+    static let version: UInt16 = 53
     let pageSize: Int
     let encrypted: Bool
     let txid: UInt64
@@ -25,11 +25,14 @@ internal struct MetaPage: Sendable {
     let manifestPages: UInt32
     let manifestCRC: UInt64
 
+    var remaps: [PageRemap] = []
+
     var firstBodyPage: UInt32 { encrypted ? 4 : 2 }
     var inlineStart: Int { encrypted ? 96 : 64 }
-    var inlineEnd: Int { pageSize - (encrypted ? 40 : 0) }
-    var inlineCapacity: Int { (inlineEnd - inlineStart) / 12 }
-    var overflowCapacity: Int { (pageSize - 32) / 12 }
+    var remapEnd: Int { pageSize - (encrypted ? 40 : 0) }
+    var inlineEnd: Int { remapEnd - PageRemap.reserve(pageSize: pageSize, encrypted: encrypted) }
+    var inlineCapacity: Int { (inlineEnd - inlineStart) / 8 }
+    var overflowCapacity: Int { (pageSize - 32) / 8 }
 
     static func decode(_ bytes: [UInt8]) throws -> MetaPage {
         try PageEnvelope.validateSize(bytes.count, encrypted: false, opening: true)
@@ -49,15 +52,16 @@ internal struct MetaPage: Sendable {
         }
         let head = try reader.u32(), count = try reader.u32(), pages = try reader.u32()
         let chainCRC = try reader.u64(), live = try reader.u32()
-        guard try reader.u32() == 0 else { throw JedError.corruption("invalid meta reserved field") }
+        let remapCount = try reader.u32()
         let rootTag = suite == 1 ? Array(try reader.take(16)) : []
         let freeTag = suite == 1 ? Array(try reader.take(16)) : []
-        let result = MetaPage(pageSize: bytes.count, encrypted: suite == 1, txid: txid,
+        var result = MetaPage(pageSize: bytes.count, encrypted: suite == 1, txid: txid,
             root: PageReference(rootIndex, tag: rootTag), pageCount: pageCount,
             freeList: PageReference(freeIndex, tag: freeTag), livePages: live,
             manifestHead: head, manifestEntries: count, manifestPages: pages, manifestCRC: chainCRC)
+        result.remaps = try PageRemap.decode(bytes, count: remapCount, meta: result)
         try result.validateShape()
-        let usedEnd = result.inlineStart + min(Int(count), result.inlineCapacity) * 12
+        let usedEnd = result.inlineStart + min(Int(count), result.inlineCapacity) * 8
         guard bytes[usedEnd..<result.inlineEnd].allSatisfy({ $0 == 0 }) else {
             throw JedError.corruption("nonzero meta padding")
         }
@@ -66,6 +70,8 @@ internal struct MetaPage: Sendable {
 
     func validateShape() throws {
         try PageEnvelope.validateSize(pageSize, encrypted: encrypted, opening: true)
+        try PageRemap.validate(remaps, pageSize: pageSize, encrypted: encrypted, pageCount: pageCount)
+        guard manifestCRC <= UInt32.max else { throw JedError.corruption("invalid manifest chain digest") }
         let first = firstBodyPage
         guard pageCount > first, root.index >= first, root.index < pageCount,
               freeList.index == 0 || (freeList.index >= first && freeList.index < pageCount),
@@ -93,7 +99,7 @@ internal struct MetaPage: Sendable {
     /// Encrypted callers seal it for the intended slot only after the manifest.
     func encode(inline: [ManifestEntry]) throws -> [UInt8] {
         try validateShape()
-        guard inline.count == min(Int(manifestEntries), inlineCapacity) else {
+        guard inline.count == min(Int(manifestEntries), inlineCapacity), inline.allSatisfy({ $0.digest <= UInt32.max }) else {
             throw JedError.corruption("incorrect inline manifest length")
         }
         var writer = ByteWriter()
@@ -102,11 +108,17 @@ internal struct MetaPage: Sendable {
         writer.u32(UInt32(pageSize)); writer.u64(txid); writer.u32(root.index)
         writer.u32(pageCount); writer.u32(freeList.index); writer.u32(0)
         writer.u32(manifestHead); writer.u32(manifestEntries); writer.u32(manifestPages)
-        writer.u64(manifestCRC); writer.u32(livePages); writer.u32(0)
+        writer.u64(manifestCRC); writer.u32(livePages); writer.u32(UInt32(remaps.count))
         if encrypted { writer.append(root.tag); writer.append(freeList.tag) }
-        for item in inline { writer.u32(item.pageIndex); writer.u64(item.digest) }
+        for item in inline { writer.u32(item.pageIndex); writer.u32(UInt32(item.digest)) }
         writer.append(repeatElement(UInt8(0), count: pageSize - writer.bytes.count))
         var bytes = writer.bytes
+        var remapBytes = ByteWriter()
+        for entry in remaps {
+            remapBytes.u32(entry.parent); remapBytes.u16(entry.slot)
+            remapBytes.u32(entry.target.index); remapBytes.append(entry.target.tag)
+        }
+        bytes.replaceSubrange(inlineEnd..<(inlineEnd + remapBytes.bytes.count), with: remapBytes.bytes)
         try PageEnvelope.putU32(PageEnvelope.checksum(bytes, at: 32), into: &bytes, at: 32)
         return bytes
     }
@@ -131,11 +143,11 @@ internal struct CommitManifest: Sendable {
 
     static func build(pageSize: Int, encrypted: Bool, txid: UInt64, root: PageReference,
                       pageCount: UInt32, freeList: PageReference, livePages: UInt32,
-                      entries: [ManifestEntry], chain: [UInt32]) throws -> CommitManifest {
+                      entries: [ManifestEntry], chain: [UInt32], remaps: [PageRemap] = []) throws -> CommitManifest {
         try PageEnvelope.validateSize(pageSize, encrypted: encrypted, opening: true)
         let first: UInt32 = encrypted ? 4 : 2
-        let inlineCapacity = (pageSize - (encrypted ? 136 : 64)) / 12
-        let overflowCapacity = (pageSize - 32) / 12
+        let inlineCapacity = PageRemap.inlineCapacity(pageSize: pageSize, encrypted: encrypted)
+        let overflowCapacity = (pageSize - 32) / 8
         guard entries.count <= Int(UInt32.max), chain.count <= Int(UInt32.max),
               pageCount > first, entries.count + chain.count <= Int(pageCount - first),
               entries.count <= inlineCapacity + chain.count * overflowCapacity,
@@ -143,44 +155,41 @@ internal struct CommitManifest: Sendable {
             throw JedError.corruption("invalid manifest allocation")
         }
         let chainIDs = Set(chain)
-        guard chainIDs.count == chain.count,
+        guard !chainIDs.contains(root.index), !chainIDs.contains(freeList.index), chainIDs.count == chain.count,
               chain.allSatisfy({ $0 >= first && $0 < pageCount }) else {
             throw JedError.corruption("invalid manifest page reservation")
         }
         var previous: UInt32 = 0
         for entry in entries {
-            guard entry.pageIndex > previous, entry.pageIndex >= first, entry.pageIndex < pageCount,
+            guard entry.digest <= UInt32.max, entry.pageIndex > previous, entry.pageIndex >= first, entry.pageIndex < pageCount,
                   !chainIDs.contains(entry.pageIndex) else { throw JedError.corruption("invalid manifest entry") }
             previous = entry.pageIndex
         }
-        guard entries.isEmpty || (entries.contains { $0.pageIndex == root.index } &&
-            (freeList.index == 0 || entries.contains { $0.pageIndex == freeList.index })) else {
-            throw JedError.corruption("manifest omits a published root")
-        }
+        guard entries.isEmpty || freeList.index == 0 || entries.contains(where: { $0.pageIndex == freeList.index }) else { throw JedError.corruption("manifest omits free-list head") }
         var offset = min(entries.count, inlineCapacity), crc: UInt64 = 0
         var pages: [ManifestPageBytes] = []
         let codec = try PlainPageCodec(pageSize: pageSize)
         for (ordinal, index) in chain.enumerated() {
             let count = min(entries.count - offset, overflowCapacity)
             var writer = ByteWriter()
-            writer.u8(8); writer.u8(0); writer.u16(0); writer.u32(UInt32(count))
+            writer.u8(8); writer.u8(0); writer.u16(UInt16(truncatingIfNeeded: txid)); writer.u32(UInt32(count))
             writer.u32(ordinal + 1 == chain.count ? 0 : chain[ordinal + 1]); writer.u32(0)
             writer.u64(txid); writer.u32(UInt32(ordinal)); writer.u32(0)
             for entry in entries[offset..<(offset + count)] {
-                writer.u32(entry.pageIndex); writer.u64(entry.digest)
+                writer.u32(entry.pageIndex); writer.u32(UInt32(entry.digest))
             }
             writer.append(repeatElement(UInt8(0), count: pageSize - writer.bytes.count))
             let bytes = try codec.sealBody(pageIndex: index, plaintext: writer.bytes, salt: []).bytes
             var prefix = ByteWriter(); prefix.u32(index)
-            crc = Checksums.crc64Update(crc, prefix.bytes)
-            crc = Checksums.crc64Update(crc, bytes)
+            crc = Checksums.crc32Update(crc, prefix.bytes)
+            crc = Checksums.crc32Update(crc, bytes)
             pages.append(ManifestPageBytes(pageIndex: index, bytes: bytes))
             offset += count
         }
         let meta = MetaPage(pageSize: pageSize, encrypted: encrypted, txid: txid, root: root,
             pageCount: pageCount, freeList: freeList, livePages: livePages,
             manifestHead: chain.first ?? 0, manifestEntries: UInt32(entries.count),
-            manifestPages: UInt32(chain.count), manifestCRC: crc)
+            manifestPages: UInt32(chain.count), manifestCRC: crc, remaps: remaps)
         try meta.validateShape()
         return CommitManifest(meta: meta, inline: Array(entries.prefix(inlineCapacity)), pages: pages)
     }
@@ -231,7 +240,7 @@ internal enum MetaRecovery {
         candidates.sort { $0.1.txid == $1.1.txid ? $0.0 < $1.0 : $0.1.txid > $1.1.txid }
         var rejected: Set<UInt32> = []
         func validate(_ meta: MetaPage, _ bytes: [UInt8]) throws -> (entries: [ManifestEntry], chain: [UInt32]) {
-            try validateManifest(meta, bytes: bytes) { index in
+            try validateManifest(meta, bytes: bytes, floor: candidates.first(where: { $0.1.txid < meta.txid })?.1.txid) { index in
                 do { return try read(index) }
                 catch { throw RecoveryReadFailure(underlying: error) }
             }
@@ -254,14 +263,14 @@ internal enum MetaRecovery {
         throw JedError.corruption("neither meta slot has a complete generation")
     }
 
-    static func validateManifest(_ meta: MetaPage, bytes: [UInt8], verifyBodies: Bool = true,
+    static func validateManifest(_ meta: MetaPage, bytes: [UInt8], verifyBodies: Bool = true, floor: UInt64? = nil,
                                  read: (UInt32) throws -> [UInt8]) throws -> (entries: [ManifestEntry], chain: [UInt32]) {
         var entries: [ManifestEntry] = []
         var previous: UInt32 = 0
         func consume(_ data: ArraySlice<UInt8>, count: Int) throws {
             var reader = ByteReader(data)
             for _ in 0..<count {
-                let index = try reader.u32(), digest = try reader.u64()
+                let index = try reader.u32(), digest = UInt64(try reader.u32())
                 guard index >= meta.firstBodyPage, index < meta.pageCount, index > previous else {
                     throw JedError.corruption("invalid manifest entry order or bounds")
                 }
@@ -270,7 +279,7 @@ internal enum MetaRecovery {
             }
         }
         let inlineCount = min(Int(meta.manifestEntries), meta.inlineCapacity)
-        try consume(bytes[meta.inlineStart..<(meta.inlineStart + 12 * inlineCount)], count: inlineCount)
+        try consume(bytes[meta.inlineStart..<(meta.inlineStart + 8 * inlineCount)], count: inlineCount)
         var chain: [UInt32] = [], seen: Set<UInt32> = []
         var next = meta.manifestHead, chainCRC: UInt64 = 0
         for ordinal in 0..<meta.manifestPages {
@@ -280,7 +289,7 @@ internal enum MetaRecovery {
             let index = next, page = try read(index)
             guard page.count == meta.pageSize else { throw JedError.corruption("short manifest page") }
             try PageEnvelope.validateHeader(page, encrypted: false)
-            guard page[0] == 8, try PageEnvelope.readU32(page, at: 12) == PageEnvelope.checksum(page, at: 12) else {
+            guard page[0] == 8, UInt16(page[2]) << 8 | UInt16(page[3]) == UInt16(truncatingIfNeeded: meta.txid), try PageEnvelope.readU32(page, at: 12) == PageEnvelope.checksum(page, at: 12) else {
                 throw JedError.corruption("invalid manifest page header or checksum")
             }
             var reader = ByteReader(page)
@@ -292,19 +301,18 @@ internal enum MetaRecovery {
                   (ordinal + 1 == meta.manifestPages) == (next == 0) else {
                 throw JedError.corruption("invalid manifest chain descriptor")
             }
-            try consume(try reader.take(count * 12), count: count)
+            try consume(try reader.take(count * 8), count: count)
             guard try reader.take(reader.remaining).allSatisfy({ $0 == 0 }) else {
                 throw JedError.corruption("nonzero manifest padding")
             }
             var prefix = ByteWriter(); prefix.u32(index)
-            chainCRC = Checksums.crc64Update(chainCRC, prefix.bytes)
-            chainCRC = Checksums.crc64Update(chainCRC, page)
+            chainCRC = Checksums.crc32Update(chainCRC, prefix.bytes)
+            chainCRC = Checksums.crc32Update(chainCRC, page)
             chain.append(index)
         }
-        guard entries.count == Int(meta.manifestEntries), chainCRC == meta.manifestCRC,
+        guard !seen.contains(meta.root.index), !seen.contains(meta.freeList.index), entries.count == Int(meta.manifestEntries), chainCRC == meta.manifestCRC,
               entries.allSatisfy({ !seen.contains($0.pageIndex) }),
-              entries.isEmpty || (entries.contains { $0.pageIndex == meta.root.index } &&
-                (meta.freeList.index == 0 || entries.contains { $0.pageIndex == meta.freeList.index })) else {
+              entries.isEmpty || meta.freeList.index == 0 || entries.contains(where: { $0.pageIndex == meta.freeList.index }) else {
             throw JedError.corruption("manifest identities do not match the meta")
         }
         // The service validates manifest structure before receiving body pages;
@@ -312,10 +320,11 @@ internal enum MetaRecovery {
         if !verifyBodies { return (entries, chain) }
         for entry in entries {
             let page = try read(entry.pageIndex)
-            guard page.count == meta.pageSize, Checksums.crc64(page) == entry.digest else {
+            guard page.count == meta.pageSize, try ManifestIdentity.digest(page, encrypted: meta.encrypted) == entry.digest else {
                 throw JedError.corruption("manifest body identity mismatch")
             }
             if !meta.encrypted {
+                guard PageStamp.contains(page, floor: floor, newest: meta.txid) else { throw JedError.corruption("stale manifest body stamp") }
                 try PageEnvelope.validateHeader(page, encrypted: false)
                 guard page[0] <= 7, try PageEnvelope.readU32(page, at: 12) == PageEnvelope.checksum(page, at: 12) else {
                     throw JedError.corruption("invalid manifest body header or checksum")

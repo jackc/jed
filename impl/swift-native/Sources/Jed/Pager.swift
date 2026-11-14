@@ -26,7 +26,7 @@ internal struct PreparedPageCommit: Sendable {
 internal struct PagerAllocationState: Sendable {
     let highWater: UInt32
     let persistedFree: [UInt32]
-    let reusableFree: [UInt32]
+    var reusableFree: [UInt32]
     let pending: [ManifestEntry]
     let protected: Set<UInt32>
 }
@@ -58,6 +58,7 @@ internal final class Pager: Sendable {
         var allocatedPages: UInt32
         var selected: ValidatedMeta
         var freePages: [UInt32]
+        var freeChain: [UInt32] = []
         var floorFree: Set<UInt32> = []
         var pending: [UInt32: UInt64] = [:]
         var batchFlush = BatchFlushState()
@@ -79,6 +80,8 @@ internal final class Pager: Sendable {
         var remoteReuse = true
         var serviceCommitInProgress = false
     }
+    var committedFreeList: FreeList { state.withLock { FreeList(entries: $0.freePages, chain: $0.freeChain) } }
+    var isRemote: Bool { state.withLock { $0.remote } }
     let pageSize: Int
     let codec: any PageCodec
     private let state: Mutex<State>
@@ -138,7 +141,7 @@ internal final class Pager: Sendable {
         guard allocated <= UInt32.max else { throw JedError.corruption("file exceeds the page-address range") }
         let pager = Pager(store: store, selected: selected, codec: codec, freePages: free.entries,
             keyBlock: keyBlock, allocatedPages: UInt32(allocated))
-        pager.state.withLock { $0.ephemeral = ephemeral }
+        pager.state.withLock { $0.ephemeral = ephemeral; $0.freeChain = free.chain }
         if writable, unlockedCodec == nil, keyBlock?.needsRepair == true { try pager.repairKeyBlock(syncDirectory: syncDirectory) }
         return pager
     }
@@ -193,7 +196,7 @@ internal final class Pager: Sendable {
                 throw JedError("08006", "remote storage identity changed")
             }
             state.selected = selected; state.allocatedPages = selected.meta.pageCount
-            state.freePages = free.entries; state.pending.removeAll(); state.floorFree.removeAll()
+            state.freePages = free.entries; state.freeChain = free.chain; state.pending.removeAll(); state.floorFree.removeAll()
             state.floorSlot = 0; state.remoteReuse = false
         }
     }
@@ -443,7 +446,7 @@ internal final class Pager: Sendable {
 
     func prepare(body: [StoredPage], root: PageReference, pageCount: UInt32, freeList: PageReference,
                  livePages: UInt32, freePages: [UInt32], manifestPages: [UInt32], reuseAllowed: Bool,
-                 entropy: KeyEntropy? = nil, initialStage: PageWriteStage? = nil) throws -> PreparedPageCommit {
+                 entropy: KeyEntropy? = nil, initialStage: PageWriteStage? = nil, remaps: [PageRemap] = []) throws -> PreparedPageCommit {
         let snapshot = try state.withLock { state -> State in try Self.checkWritable(state); return state }
         if let initialStage {
             guard (0...body.count).contains(initialStage.count),
@@ -464,7 +467,7 @@ internal final class Pager: Sendable {
                   !oldProtected.contains(page.index) else {
                 throw JedError.corruption("unsafe or malformed prepared body page")
             }
-            identities[page.index] = Checksums.crc64(page.bytes)
+            identities[page.index] = try ManifestIdentity.digest(page.bytes, encrypted: codec.reservedBytes != 0)
         }
         for index in manifestPages {
             guard index >= snapshot.selected.meta.pageCount || safe.contains(index),
@@ -475,7 +478,7 @@ internal final class Pager: Sendable {
         let entries = identities.keys.sorted().map { ManifestEntry(pageIndex: $0, digest: identities[$0]!) }
         let manifest = try CommitManifest.build(pageSize: pageSize, encrypted: codec.reservedBytes != 0,
             txid: txid, root: root, pageCount: pageCount, freeList: freeList, livePages: livePages,
-            entries: entries, chain: manifestPages)
+            entries: entries, chain: manifestPages, remaps: remaps)
         let protected = Set(identities.keys).union(manifestPages)
         var previous: UInt32 = 0
         for index in freePages {
@@ -538,7 +541,7 @@ internal final class Pager: Sendable {
                     state.floorSlot = plan.slot
                     shrinkAfterBarrier(&state)
                 } else {
-                    for page in plan.body { state.pending[page.index] = Checksums.crc64(page.bytes) }
+                    for page in plan.body { state.pending[page.index] = try ManifestIdentity.digest(page.bytes, encrypted: codec.reservedBytes != 0) }
                     if state.pending.count >= meta.inlineCapacity {
                         do { try flushState(&state, shrink: true) }
                         catch { state.poisoned = true; state.revoked = true }
@@ -611,7 +614,7 @@ internal final class Pager: Sendable {
                         sealed: state.store.read(at: UInt64(reference.index) * UInt64(pageSize), count: pageSize),
                         expectedTag: reference.tag)
                 }
-                state.selected = selected; state.freePages = free.entries
+                state.selected = selected; state.freePages = free.entries; state.freeChain = free.chain
                 if synchronous {
                     state.floorSlot = slot
                     state.pending.removeAll(keepingCapacity: true); state.floorFree.removeAll(keepingCapacity: true)

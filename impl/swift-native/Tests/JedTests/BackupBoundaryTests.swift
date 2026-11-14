@@ -35,7 +35,7 @@ final class BackupBoundaryTests: XCTestCase {
         let paths = GeneratedSpec.sourceHashes.keys.filter {
             $0.hasPrefix("spec/fileformat/fixtures/") && !$0.contains("/cow_") && !$0.contains("/malformed_")
         }.sorted()
-        XCTAssertEqual(paths.count, 91)
+        XCTAssertEqual(paths.count, 92)
         for path in paths {
             let name = String(path.split(separator: "/").last!.dropLast(4))
             do {
@@ -49,7 +49,24 @@ final class BackupBoundaryTests: XCTestCase {
                 let random = SeededRandomSource(seed: 18)
                 let target = try copy(source, entropy: { try random.bytes(count: $0) })
                 let first = Int(domain.pager.codec.firstBodyPage) * domain.pager.pageSize
-                XCTAssertEqual(try target.read(at: UInt64(first), count: bytes.count - first), Array(bytes[first...]), name)
+                var expectedBody = Array(bytes[first...])
+                if name == "encrypted_cow_deferred_retained" {
+                    // A commit-history fixture has dead pages. Bootstrap backup
+                    // preserves reachable ciphertext and zeros these holes.
+                    let meta = source.selected.meta
+                    let catalog = try CatalogChain.read(root: meta.root, pageCount: meta.pageCount,
+                        codec: domain.pager.codec, read: domain.pager.readBody)
+                    let reached = try PageReachability.collect(domain.committed, catalogPages: catalog.pages,
+                        gistPages: [], pageCount: meta.pageCount, read: domain.pager.readBody)
+                    let free = try FreeList.load(meta: meta, protected: reached.union(source.selected.protectedPages),
+                        read: domain.pager.readBody)
+                    let copied = reached.union(free.chain), size = domain.pager.pageSize
+                    for index in domain.pager.codec.firstBodyPage..<meta.pageCount where !copied.contains(index) {
+                        let offset = Int(index) * size - first
+                        expectedBody.replaceSubrange(offset..<(offset + size), with: repeatElement(UInt8(0), count: size))
+                    }
+                }
+                XCTAssertEqual(try target.read(at: UInt64(first), count: bytes.count - first), expectedBody, name)
                 if encrypted {
                     let size = domain.pager.pageSize
                     XCTAssertEqual(try target.read(at: UInt64(2 * size), count: 2 * size), Array(bytes[(2 * size)..<(4 * size)]), name)
@@ -58,6 +75,7 @@ final class BackupBoundaryTests: XCTestCase {
                 XCTAssertEqual(opened.committed.txid, source.selected.meta.txid, name)
                 XCTAssertEqual(opened.pager.selected.meta.pageCount, source.selected.meta.pageCount, name)
                 XCTAssertEqual(opened.livePages, source.selected.meta.livePages, name)
+                XCTAssertEqual(opened.pager.selected.meta.remaps, source.selected.meta.remaps, name)
                 XCTAssertEqual(opened.committed.catalog.tables.map(\.rowCount), domain.committed.catalog.tables.map(\.rowCount), name)
             } catch { XCTFail("\(name): \(error)") }
         }

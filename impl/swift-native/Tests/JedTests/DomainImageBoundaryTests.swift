@@ -5,7 +5,7 @@ import XCTest
 final class DomainImageBoundaryTests: XCTestCase {
     private func paths() -> [String] {
         GeneratedSpec.sourceHashes.keys.filter {
-            $0.hasPrefix("spec/fileformat/fixtures/") && !$0.contains("/cow_") && !$0.contains("/malformed_")
+            $0.hasPrefix("spec/fileformat/fixtures/") && !$0.contains("/cow_") && !$0.contains("/encrypted_cow_") && !$0.contains("/malformed_")
         }.sorted()
     }
     private func fixture(_ name: String) throws -> [UInt8] {

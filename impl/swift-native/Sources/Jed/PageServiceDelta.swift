@@ -47,7 +47,7 @@ internal struct ServiceIncomingDelta {
                 guard let bytes = supplied[index] else { throw PageServiceProtocol.violation("missing manifest page") }
                 return bytes
             }
-            guard parsed.chain == begin.manifest.map(\.index) else {
+            guard parsed.chain == begin.manifest.map(\.index), parsed.entries.contains(where: { $0.pageIndex == meta.root.index }) else {
                 throw PageServiceProtocol.violation("manifest pages are not in chain order")
             }
             var expected: [UInt32: UInt64] = [:], carried = 0
@@ -81,7 +81,7 @@ internal struct ServiceIncomingDelta {
     /// Check before writing. A carried pending page may never arrive again.
     mutating func receive(_ page: StoredPage) throws {
         guard let digest = expected[page.index], !received.contains(page.index),
-              page.bytes.count == meta.pageSize, Checksums.crc64(page.bytes) == digest else {
+              page.bytes.count == meta.pageSize, try ManifestIdentity.digest(page.bytes, encrypted: meta.encrypted) == digest else {
             throw PageServiceProtocol.violation("duplicate, unlisted or mismatched body page")
         }
         if !meta.encrypted {

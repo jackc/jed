@@ -1,8 +1,78 @@
 # Swift experiment verification
 
+## Authorized v53 refresh (2026-11-13, complete)
+
+Linux acceptance is complete against supported-core revision
+`32feb48fd961598c2d7e60f0de284ba619a74ab0`: format **v53**, **764 SQL files**,
+**121 database fixtures**, **19 saved simulations**, 22 generated profiles and
+31 process scenarios. The pinned input fingerprint is
+`6dd7e087c9378d21351e762ce1f3405c8a6381bc7d62a2a0804e9a69a0649d5b`.
+
+The refresh implements sibling leaf redistribution, deferred interiors and catalog
+retention, narrow CRC-32 manifests, txid page stamps, and incremental owner
+reclamation with reader-generation and relaxed-batch protection. Page clients use
+the same interior-deferral planner as the supported cores; reclamation remains
+owner-only. Recovery, backup, integrity and service paths understand the new layout.
+Shared corpus and byte fixtures are copied from the target Git blobs.
+
+Swift remains opt-in and experimental. Verification covers Linux x86-64 with Swift
+6.4.2; Apple platforms remain unverified and production delivery is undecided.
+Historical benchmark measurements apply to their recorded actors. No new performance
+measurements, dependencies, default CI inclusion or website integration are claimed.
+
+### V53 acceptance
+
+| Gate | Result |
+|---|---|
+| Release native/API and SQL corpus | **560 tests**, zero failures; **764/764 files**, 22,004 records, 39,866 cells, 2,288 cost / 1,165 name / 111 type assertions. |
+| Exact query-memory and committed storage | Full four-core memory/disk/disk-spill matrix: **246,296 measurements**, zero failures or differences. |
+| Encrypted SQL | Full four-core matrix: **79,240 record measurements**, zero failures or transcript differences. |
+| File interchange | **2,907/2,907 phases**, all 121 fixtures and generated encryption/attachment cases, both writer orders with Rust/Go/TS; zero failures. |
+| Integrity CLI | **50 exact reports + 11 boundary probes**, zero failures. |
+| Saved recovery | **19 traces per core**, 57 transcript comparisons, **153 independently checked Swift images**; zero failures or exemptions. |
+| Generated recovery | **176 traces per core** (22 profiles × seeds 1–8), 459 transcript comparisons, **7,049 independently checked Swift images**; zero failures. The shared driver's 23 per-core-fault exemptions remain explicit. |
+| Mixed processes | **496 pairings**, zero failures, plus both plaintext/encrypted Swift-client/Rust-owner stream cases. Supported-peer preparation passed its 279 pairings. |
+| Page-service SQL | All six client/owner directions, **119,070 records**, zero failures or transcript differences. |
+| Threaded stress | Five core/storage runs, **20,000 snapshot checks**, zero failures; identical checksum `f3e75496a3111181`. |
+| PostgreSQL oracle | `query/scalar_foundations.test` regenerates byte-identically from this checkout's PostgreSQL oracle. |
+| Spec and adapters | `mise run verify`, frozen codegen check, 121-entry/2,907-phase interchange adapter, 157-workload benchmark adapter and 61 benchmark-report checks pass. |
+| Independent review | Recovery bounds, remap folding, reader/reclamation accounting, foreign commits and client deferral reviewed; findings fixed and reverified. |
+
+### V53 reproduction and provenance
+
+Use the acceptance commands in the reproduction section below with distinct empty
+output directories. Also run `swift-native:check-smoke --configuration release --no-build`,
+`swift-native:codegen --check`, and the two Rust-serving stream cases with
+`JED_PROCESS_CORES=swift-native JED_PROCESS_FILTER=_stream mise run swift-native:process --configuration release --no-build --pages-owner rust`.
+The oracle requires `mise run dev`; its host/port come from this checkout's `.dev/`.
+Existing peer binaries and locked benchmark dependencies were prepared through the
+repository's process, simulation and stress tasks. No dependency declarations changed.
+
+All final matrices use the same finalized engine source. Captured Swift actors:
+
+- XCTest: `01cf5730333cc3df455af02d28178ce35385261ec8827ee9940ba8be7844c5a6`
+- Simulator: `fcba595b1b89cbb7d76a4e7af8254a9ca5a27c781926e28862574f5dcb7c49ad`
+- Process actor: `d2d635c2b894ad946a39a25c19d3f71bd54af8bdc45578517865e4fb17538dd8`
+- Interchange: `96828ff953d7947ae58345805afc61003037f750a065963bd2610752f2f3c07e`
+
+Each matrix's report records peer and other actor identities. Final evidence lives
+under `/tmp/swift-v53-`: `test4.log`, `memory`, `encrypted`, `service`,
+`interop-complete`, `regress-complete`, `sims-complete`, `integrity`,
+`stress-complete`, `process-complete.log` and `rust-stream.log`.
+Earlier failed runs are retained and described in [PROGRESS.md](PROGRESS.md),
+not attributed to the final actors.
+
+The ignored [local evidence archive](results/refresh-20261113/manifest.json) preserves
+352 reports/logs/accounting files (41,016,845 bytes), excluding actor binaries and
+database images. Its manifest SHA-256 is
+`f5db7e19e9a64dbaeacefa37398038c9eb7d956e72eabc17b39f175fe64f1d15`.
+Its source manifest covers 1,593 non-Markdown package/tool/fixture files and has
+SHA-256 `578aa9795d446ea46ccfb1badc1f0a6d36207ba1f3021a6fd20652931dad4c5b`.
+This archive is local evidence; it is not a published artifact.
+
 ## Authorized baseline refresh (2026-11-12)
 
-Linux refresh acceptance is complete. The native Swift experiment now targets supported-core revision
+Linux refresh acceptance is complete. That refresh targeted supported-core revision
 `b1a6affca7725e0b07a4f734eddb1c569ef76bcf`: format **v52**, **763 SQL files**,
 **116 database fixtures**, **19 saved simulations**, 22 generated simulation
 profiles and 31 process scenarios. The implementation is verified against that

@@ -25,27 +25,28 @@ internal enum DomainImage {
             let bytes = try keyBlock.encode(pageSize: codec.pageSize)
             try sink(StoredPage(index: 2, bytes: bytes)); try sink(StoredPage(index: 3, bytes: bytes))
         }
+        let stamped = StampedPageCodec(base: codec, txid: txid)
         var allocation = try PageAllocator(highWater: codec.firstBodyPage, free: [], firstBody: codec.firstBodyPage)
         var image = snapshot.catalog
         for position in image.tables.indices.sorted(by: { image.tables[$0].name < image.tables[$1].name }) {
             var table = image.tables[position]
             let store = snapshot.tables[table.name]!
             table.rowCount = store.count!
-            table.root = try store.tree.writeImage(allocator: &allocation, codec: codec, entropy: entropy, sink: sink)
+            table.root = try store.tree.writeImage(allocator: &allocation, codec: stamped, entropy: entropy, sink: sink)
             table.indexes.sort { $0.name < $1.name }
             for ordinal in table.indexes.indices {
                 let index = table.indexes[ordinal]
                 if index.kind == 2 {
                     table.indexes[ordinal].root = try snapshot.gistTrees[index.name]!.writeImage(
-                        allocator: &allocation, codec: codec, entropy: entropy, sink: sink)
+                        allocator: &allocation, codec: stamped, entropy: entropy, sink: sink)
                 } else {
                     table.indexes[ordinal].root = try snapshot.indexes[index.name]!.tree.writeImage(
-                        allocator: &allocation, codec: codec, entropy: entropy, sink: sink)
+                        allocator: &allocation, codec: stamped, entropy: entropy, sink: sink)
                 }
             }
             image.tables[position] = table
         }
-        let root = try CatalogChain.writeImage(image.entries(), allocator: &allocation, codec: codec, entropy: entropy, sink: sink)
+        let root = try CatalogChain.writeImage(image.entries(), allocator: &allocation, codec: stamped, entropy: entropy, sink: sink)
         let live = allocation.highWater - codec.firstBodyPage
         let manifest = try CommitManifest.build(pageSize: codec.pageSize, encrypted: codec.reservedBytes != 0,
             txid: txid, root: root, pageCount: allocation.highWater, freeList: PageSealer.nullReference(codec),

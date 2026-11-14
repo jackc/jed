@@ -868,7 +868,7 @@ the version deciding the layout, three things the switch-era code carried go awa
 - **The root-listed rule.** A nonempty manifest no longer has to list the catalog root, since a commit
   may keep its chain; it must still list a nonzero free-list head, and neither the root nor the free
   head may be a manifest-overflow page — a rule Go's and TS's validators did not yet carry and now do.
-  The page service's delta check still requires the root listed: page clients never defer.
+  The page service's delta check still requires the catalog root listed. Page clients use the same interior-deferral planner as owners; reclamation remains owner-only.
 
 `format.md` carries the specification (*Commit manifest*, *Remap list*, *Deferral*, *Page header*),
 with its companions `encrypted.md`, `validated-cow.md`, `page-service.md` and

@@ -150,8 +150,8 @@ The explicitly requested Ruby refresh (2026-11-12) tracks supported-core revisio
 and remaining omissions. Experimental status and prior benchmark evidence are unchanged.
 
 The separately approved **native Swift experiment** (`impl/swift-native`, 2026-11-05)
-was explicitly refreshed on 2026-11-12 to the supported Rust/Go/TypeScript surface at
-`b1a6affca7725e0b07a4f734eddb1c569ef76bcf`: format v52, 763 SQL files, 116 database
+was explicitly refreshed on 2026-11-13 to the supported Rust/Go/TypeScript surface at
+`32feb48fd961598c2d7e60f0de284ba619a74ab0`: format v53, 764 SQL files, 121 database
 fixtures and 19 saved simulations. The target remains pinned; future supported-core
 features do not update it automatically. It is a
 handwritten independent Swift engine. Linux conformance, host, file, crypto,

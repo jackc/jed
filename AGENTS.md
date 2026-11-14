@@ -77,9 +77,9 @@ files in the same change.
   `b1a6affc`; coverage and remaining omissions are recorded in
   `impl/ruby-native/PARITY_UPDATE_2026-11-12.md`. Its experimental status and prior
   benchmark evidence are unchanged.
-  The explicitly authorized Swift refresh (2026-11-12) targets supported-core
-  revision `b1a6affca7725e0b07a4f734eddb1c569ef76bcf` and format v52.
-  Its recorded inventory is 763 SQL files, 116 database fixtures and 19 saved
+  The explicitly authorized Swift refresh (2026-11-13) targets supported-core
+  revision `32feb48fd961598c2d7e60f0de284ba619a74ab0` and format v53.
+  Its recorded inventory is 764 SQL files, 121 database fixtures and 19 saved
   simulations; Linux verification and historical measured results are in
   `impl/swift-native/VERIFICATION.md` and `impl/swift-native/BENCHMARKS.md`.
   Apple platforms remain unverified. Production Swift delivery is undecided;

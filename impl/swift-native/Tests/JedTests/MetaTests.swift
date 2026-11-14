@@ -5,7 +5,7 @@ import XCTest
 final class MetaTests: XCTestCase {
     private func body(_ index: UInt32, marker: UInt8 = 0) throws -> [UInt8] {
         var page = [UInt8](repeating: 0, count: 256)
-        page[0] = 1; page[16] = marker
+        page[0] = 1; page[3] = 2; page[16] = marker
         return try PlainPageCodec(pageSize: 256).sealBody(pageIndex: index, plaintext: page, salt: []).bytes
     }
 
@@ -43,7 +43,7 @@ final class MetaTests: XCTestCase {
     func testIncompleteLatestFallsBackButHostIOAlwaysPropagates() throws {
         let old = try manifest(txid: 1, root: 2, pageCount: 3)
         let page = try body(3, marker: 99)
-        let entry = ManifestEntry(pageIndex: 3, digest: Checksums.crc64(page))
+        let entry = ManifestEntry(pageIndex: 3, digest: try ManifestIdentity.digest(page, encrypted: false))
         let new = try manifest(txid: 2, root: 3, pageCount: 4, entries: [entry])
         let oldMeta = try old.meta.encode(inline: old.inline), newMeta = try new.meta.encode(inline: new.inline)
         var pages = [newMeta, oldMeta, try body(2), page]
@@ -73,7 +73,7 @@ final class MetaTests: XCTestCase {
         for index: UInt32 in 2...18 {
             let page = try body(index, marker: UInt8(index))
             bodies[index] = page
-            entries.append(ManifestEntry(pageIndex: index, digest: Checksums.crc64(page)))
+            entries.append(ManifestEntry(pageIndex: index, digest: try ManifestIdentity.digest(page, encrypted: false)))
         }
         let built = try manifest(txid: 17, root: 2, pageCount: 22, entries: entries, chain: [20, 21])
         XCTAssertEqual(built.inline.count, 16)

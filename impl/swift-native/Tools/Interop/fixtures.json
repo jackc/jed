@@ -1,19 +1,19 @@
 {
-  "baseline": "b1a6affca7725e0b07a4f734eddb1c569ef76bcf",
-  "scope": "116 frozen spec/fileformat/fixtures images; excludes separate 24 integrity finding images",
+  "baseline": "32feb48fd961598c2d7e60f0de284ba619a74ab0",
+  "scope": "121 frozen spec/fileformat/fixtures images; excludes separate 24 integrity finding images",
   "classes": {
     "ordinary_writable": 81,
     "skewed_collation": 1,
-    "writable_recovery": 18,
+    "writable_recovery": 22,
     "expected_open_error": 4,
-    "encrypted_writable": 6,
+    "encrypted_writable": 7,
     "lazy_corruption": 5,
     "unparsable_definitions": 1
   },
   "fixtures": [
     {
       "file": "array_composite_table.jed",
-      "sha256": "2e16a4f5c649f2b0e421b274f9e6a63bc0ed93df5f8ef532082dbc936f85f776",
+      "sha256": "37cc660c94a520f89a64f409a093a0f891db79af0b325f67806c0a20e4b65565",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -27,7 +27,7 @@
     },
     {
       "file": "array_pk_table.jed",
-      "sha256": "5f4ead9e8cb5d33fbb5eb4c6e542f32c23b5f684a41ab9c6fbb0ce683ef156a9",
+      "sha256": "4da927f6da3a23b880c87b34dfef053992eda8fcb9900db421fe7d49a015ec3c",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -41,7 +41,7 @@
     },
     {
       "file": "array_table.jed",
-      "sha256": "9a359935235b0509c1060383bb697c2b30fc64ad946dd2765405f0c380721c62",
+      "sha256": "616ddc1484e1e94f179ab9c7e9a837d87eb3b5336414bd1a31444728920301bf",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -55,7 +55,7 @@
     },
     {
       "file": "bool_pk_table.jed",
-      "sha256": "037d3670dd8fb138b8c2d8669529eac780905405bd6c6585d52a6ad6abc6b817",
+      "sha256": "b34a764bede4101b1a89f3f6c20139b87c5fa043a565bb86dc89d07caaf4dd51",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -69,7 +69,7 @@
     },
     {
       "file": "bool_table.jed",
-      "sha256": "5a4cc4606a866fd10f9a6faf3fd3731c0cec0f2273b5548b0497a2306fc63414",
+      "sha256": "5a9f3773b6c8575e552f0cad6debc8a203266760dbfd9cf2be635908b675dfa3",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -83,7 +83,7 @@
     },
     {
       "file": "bytea_pk_table.jed",
-      "sha256": "79d7aa90921f537e327ca564b8677dbb3caf997d7dcf0b8af910cec9b0cebe87",
+      "sha256": "dd207a00762c2c891f0b352a1c86f7a7f4acbd2005bf00bdba41303e5495daf8",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -97,7 +97,7 @@
     },
     {
       "file": "bytea_table.jed",
-      "sha256": "2090db89139b90bfb9418bb8238db9ad48b908a3a55a9748ca67252d46c75160",
+      "sha256": "c1a439ccd202224beaa23147d19d3b624542a89d936dc2dacd9907edf6d7e183",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -111,7 +111,7 @@
     },
     {
       "file": "check_table.jed",
-      "sha256": "8af0e8ef0425c6cbc2fa5e388601594ed8ab206eac98893e4509eacbfb88e966",
+      "sha256": "bff84cfd15fd4a924f7be3d28728010bd6ffe366fbcb98acf13dac8d718495b0",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -125,7 +125,7 @@
     },
     {
       "file": "collation_array_table.jed",
-      "sha256": "8b8dd80880d6a0d64276217fdcd10d8e954e7784de99e8ef4e458d15d0488939",
+      "sha256": "a8917551270c5e55e35f88b9e1a134c39a0f655cba09c447f9fbc666b98a0f6b",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -141,7 +141,7 @@
     },
     {
       "file": "collation_pk_table.jed",
-      "sha256": "0976410352f8805ae61f0a2508a86cd9c2ef238e090cbfcd72f911c4894b4a8b",
+      "sha256": "c0fcc3088f042cd8d07e7aa3c3af95232b491e5a6bc3bea2da53c098a6b40c9a",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -157,7 +157,7 @@
     },
     {
       "file": "collation_skew_corrupt.jed",
-      "sha256": "df606728d378e6f74fcc2795d4f7b1c647042b1c4bfcadfa89fe195e6ebaf62c",
+      "sha256": "add22022383297657972e667a8befa8b815d260d25eb349d4af4ab7f6fb136cf",
       "class": "skewed_collation",
       "open": "success",
       "sidecar_mutation": true,
@@ -211,7 +211,7 @@
     },
     {
       "file": "collation_skew_twin.jed",
-      "sha256": "abd5c944670c6d69acb71fe0ac9bd875a98e13f92c4eada410d2b20d137cb1c0",
+      "sha256": "ccf48ff4ac97ce01c0fb234b5ac70ee04a182c5c20b8acf415d5724eef53b093",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -227,7 +227,7 @@
     },
     {
       "file": "collation_table.jed",
-      "sha256": "e820ff7952785275d7c0737e429b9b5967705a35a285e71ddebf7dc7a28ff0cd",
+      "sha256": "f4e1baddd131e6d314411b8d52e9db7857d7e8f6ed6edb7f5b911d9d55cec50d",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -251,11 +251,11 @@
       "sources": [
         "spec/fileformat/format.md"
       ],
-      "sha256": "ebb44448f9d1d65448c928e45271566bff1fdcfc2863d3a88bc360df0c2dde52"
+      "sha256": "d6e8d9c3eee771c0ab457b513f02d9080518af763b45fe6e333ebc8e4de05e36"
     },
     {
       "file": "composite_array_field_table.jed",
-      "sha256": "0cea2ff4348609599c6058ad70860dfc1414b5a2b8bc81c01cc8b1bf0c791cb4",
+      "sha256": "a66d1d44d506e3f24002ad133e65e1edbda39eb922cc7b722335f1561a9a38ff",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -269,7 +269,7 @@
     },
     {
       "file": "composite_key_table.jed",
-      "sha256": "9bea89f3485fe059e5cce2d2f2cc546bb77762d6cb2ab5d6f61deaea1d0f44df",
+      "sha256": "a3f079a1086b9a99c9d2bd1e1820122e48d3a8ef977c6505dc38164a3cb03845",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -283,7 +283,7 @@
     },
     {
       "file": "composite_pk_table.jed",
-      "sha256": "d8cfe4134d832a837292f018787ed8f72a6183d0e63fba598b3f798a01eb132b",
+      "sha256": "f659073756d2abb1ae37ed896d5e2da996b1ed441ecd2e9d44cf1d34b07389aa",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -297,7 +297,7 @@
     },
     {
       "file": "composite_range_field_table.jed",
-      "sha256": "10ca8a1fe42b093acbf29270286d7186b04eff210dcff52f3f721bf6130caea2",
+      "sha256": "99477406bedda56f970171c5f3b91b629f3f42b60c004b65e5166cc13f5c7bf6",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -311,7 +311,7 @@
     },
     {
       "file": "composite_type_table.jed",
-      "sha256": "fc08e9156f3ce3c3bb41747a8ee0a2b9d5e70c946c4cf3224574098c06770a95",
+      "sha256": "7d76b3d6fc6ebae78fe43a46335364daf42a6a8f3c5fc968443d82d6f9ffe321",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -325,7 +325,7 @@
     },
     {
       "file": "compressed_table.jed",
-      "sha256": "e3e945f29a8b138398637b14f976d802f50577e9d37cdb9ec58d0d25d94c7e4b",
+      "sha256": "f88822f2e7fcca557a06539e1eb6a5d686d4cac73822b61237ae33b15c27bc30",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -339,7 +339,7 @@
     },
     {
       "file": "cow_bad_padding.jed",
-      "sha256": "db078ffee7d8b876dc01482799b6734e517c1680d2288071f505c8b0200367a5",
+      "sha256": "74f11b993ae2c85ab8eea8a3c01793ff4eac82bb74bc1661647c801068fc4848",
       "class": "writable_recovery",
       "open": "success",
       "sidecar_mutation": true,
@@ -384,8 +384,1532 @@
       ]
     },
     {
+      "file": "cow_deferred_fold.jed",
+      "sha256": "03ce319aededc8ef143f9390123cb0ee0e0d27115f1d445df6245fc4b3404095",
+      "class": "writable_recovery",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit.",
+      "sources": [
+        "spec/fileformat/format.md:Remap list (v53)",
+        "spec/fileformat/verify.rb"
+      ],
+      "initial_version": 3,
+      "probes": [
+        {
+          "sql": "SELECT id::text,pad::text FROM t ORDER BY t.id",
+          "rows": [
+            [
+              "1",
+              "row-01-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "2",
+              "row-02-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "3",
+              "row-03-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "4",
+              "row-04-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "5",
+              "row-05-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "6",
+              "row-06-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "7",
+              "row-07-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "8",
+              "row-08-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "9",
+              "row-09-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "10",
+              "row-10-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "11",
+              "row-11-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "12",
+              "row-12-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "13",
+              "row-13-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "14",
+              "row-14-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "15",
+              "row-15-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "16",
+              "row-16-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "17",
+              "row-17-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "18",
+              "row-18-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "19",
+              "row-19-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "20",
+              "row-20-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "21",
+              "row-21-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "22",
+              "row-22-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "23",
+              "row-23-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "24",
+              "row-24-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "25",
+              "row-25-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "26",
+              "row-26-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "27",
+              "row-27-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "28",
+              "row-28-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "29",
+              "row-29-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "30",
+              "row-30-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "31",
+              "row-31-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "32",
+              "row-32-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "33",
+              "row-33-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "34",
+              "row-34-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "35",
+              "row-35-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "36",
+              "row-36-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "37",
+              "row-37-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "38",
+              "row-38-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "39",
+              "row-39-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "40",
+              "row-40-yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy"
+            ],
+            [
+              "41",
+              "row-41-yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy"
+            ],
+            [
+              "42",
+              "row-42-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "43",
+              "row-43-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "44",
+              "row-44-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "45",
+              "row-45-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "46",
+              "row-46-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "47",
+              "row-47-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "48",
+              "row-48-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "49",
+              "row-49-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "50",
+              "row-50-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "51",
+              "row-51-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "52",
+              "row-52-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "53",
+              "row-53-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "54",
+              "row-54-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "55",
+              "row-55-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "56",
+              "row-56-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "57",
+              "row-57-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "58",
+              "row-58-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "59",
+              "row-59-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "60",
+              "row-60-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "61",
+              "row-61-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "62",
+              "row-62-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "63",
+              "row-63-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "64",
+              "row-64-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "65",
+              "row-65-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "66",
+              "row-66-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "67",
+              "row-67-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "68",
+              "row-68-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "69",
+              "row-69-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "70",
+              "row-70-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "71",
+              "row-71-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "72",
+              "row-72-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "73",
+              "row-73-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "74",
+              "row-74-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "75",
+              "row-75-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "76",
+              "row-76-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "77",
+              "row-77-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "78",
+              "row-78-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "79",
+              "row-79-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "80",
+              "row-80-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "81",
+              "row-81-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "82",
+              "row-82-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "83",
+              "row-83-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "84",
+              "row-84-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "85",
+              "row-85-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "86",
+              "row-86-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "87",
+              "row-87-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "88",
+              "row-88-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "89",
+              "row-89-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "90",
+              "row-90-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "file": "cow_deferred_overwrite.jed",
+      "sha256": "5a6e0096b5d2d1a7e013a948868cd854f03690142c4492cc4432af961df1dbfc",
+      "class": "writable_recovery",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit.",
+      "sources": [
+        "spec/fileformat/format.md:Remap list (v53)",
+        "spec/fileformat/verify.rb"
+      ],
+      "initial_version": 3,
+      "probes": [
+        {
+          "sql": "SELECT id::text,pad::text FROM t ORDER BY t.id",
+          "rows": [
+            [
+              "1",
+              "row-01-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "2",
+              "row-02-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "3",
+              "row-03-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "4",
+              "row-04-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "5",
+              "row-05-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "6",
+              "row-06-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "7",
+              "row-07-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "8",
+              "row-08-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "9",
+              "row-09-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "10",
+              "row-10-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "11",
+              "row-11-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "12",
+              "row-12-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "13",
+              "row-13-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "14",
+              "row-14-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "15",
+              "row-15-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "16",
+              "row-16-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "17",
+              "row-17-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "18",
+              "row-18-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "19",
+              "row-19-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "20",
+              "row-20-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "21",
+              "row-21-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "22",
+              "row-22-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "23",
+              "row-23-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "24",
+              "row-24-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "25",
+              "row-25-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "26",
+              "row-26-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "27",
+              "row-27-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "28",
+              "row-28-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "29",
+              "row-29-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "30",
+              "row-30-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "31",
+              "row-31-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "32",
+              "row-32-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "33",
+              "row-33-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "34",
+              "row-34-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "35",
+              "row-35-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "36",
+              "row-36-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "37",
+              "row-37-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "38",
+              "row-38-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "39",
+              "row-39-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "40",
+              "row-40-zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"
+            ],
+            [
+              "41",
+              "row-41-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "42",
+              "row-42-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "43",
+              "row-43-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "44",
+              "row-44-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "45",
+              "row-45-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "46",
+              "row-46-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "47",
+              "row-47-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "48",
+              "row-48-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "49",
+              "row-49-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "50",
+              "row-50-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "51",
+              "row-51-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "52",
+              "row-52-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "53",
+              "row-53-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "54",
+              "row-54-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "55",
+              "row-55-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "56",
+              "row-56-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "57",
+              "row-57-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "58",
+              "row-58-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "59",
+              "row-59-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "60",
+              "row-60-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "61",
+              "row-61-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "62",
+              "row-62-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "63",
+              "row-63-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "64",
+              "row-64-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "65",
+              "row-65-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "66",
+              "row-66-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "67",
+              "row-67-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "68",
+              "row-68-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "69",
+              "row-69-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "70",
+              "row-70-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "71",
+              "row-71-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "72",
+              "row-72-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "73",
+              "row-73-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "74",
+              "row-74-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "75",
+              "row-75-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "76",
+              "row-76-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "77",
+              "row-77-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "78",
+              "row-78-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "79",
+              "row-79-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "80",
+              "row-80-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "81",
+              "row-81-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "82",
+              "row-82-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "83",
+              "row-83-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "84",
+              "row-84-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "85",
+              "row-85-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "86",
+              "row-86-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "87",
+              "row-87-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "88",
+              "row-88-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "89",
+              "row-89-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "90",
+              "row-90-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "file": "cow_deferred_retained.jed",
+      "sha256": "a02af29c824dd6e00a938a3aaf21456c1a39bfd77940f2b79a92fe2cd7369c25",
+      "class": "writable_recovery",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit.",
+      "sources": [
+        "spec/fileformat/format.md:Remap list (v53)",
+        "spec/fileformat/verify.rb"
+      ],
+      "initial_version": 2,
+      "probes": [
+        {
+          "sql": "SELECT id::text,pad::text FROM t ORDER BY t.id",
+          "rows": [
+            [
+              "1",
+              "row-01-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "2",
+              "row-02-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "3",
+              "row-03-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "4",
+              "row-04-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "5",
+              "row-05-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "6",
+              "row-06-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "7",
+              "row-07-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "8",
+              "row-08-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "9",
+              "row-09-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "10",
+              "row-10-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "11",
+              "row-11-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "12",
+              "row-12-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "13",
+              "row-13-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "14",
+              "row-14-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "15",
+              "row-15-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "16",
+              "row-16-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "17",
+              "row-17-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "18",
+              "row-18-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "19",
+              "row-19-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "20",
+              "row-20-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "21",
+              "row-21-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "22",
+              "row-22-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "23",
+              "row-23-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "24",
+              "row-24-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "25",
+              "row-25-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "26",
+              "row-26-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "27",
+              "row-27-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "28",
+              "row-28-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "29",
+              "row-29-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "30",
+              "row-30-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "31",
+              "row-31-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "32",
+              "row-32-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "33",
+              "row-33-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "34",
+              "row-34-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "35",
+              "row-35-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "36",
+              "row-36-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "37",
+              "row-37-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "38",
+              "row-38-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "39",
+              "row-39-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "40",
+              "row-40-yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy"
+            ],
+            [
+              "41",
+              "row-41-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "42",
+              "row-42-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "43",
+              "row-43-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "44",
+              "row-44-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "45",
+              "row-45-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "46",
+              "row-46-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "47",
+              "row-47-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "48",
+              "row-48-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "49",
+              "row-49-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "50",
+              "row-50-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "51",
+              "row-51-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "52",
+              "row-52-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "53",
+              "row-53-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "54",
+              "row-54-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "55",
+              "row-55-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "56",
+              "row-56-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "57",
+              "row-57-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "58",
+              "row-58-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "59",
+              "row-59-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "60",
+              "row-60-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "61",
+              "row-61-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "62",
+              "row-62-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "63",
+              "row-63-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "64",
+              "row-64-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "65",
+              "row-65-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "66",
+              "row-66-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "67",
+              "row-67-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "68",
+              "row-68-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "69",
+              "row-69-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "70",
+              "row-70-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "71",
+              "row-71-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "72",
+              "row-72-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "73",
+              "row-73-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "74",
+              "row-74-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "75",
+              "row-75-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "76",
+              "row-76-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "77",
+              "row-77-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "78",
+              "row-78-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "79",
+              "row-79-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "80",
+              "row-80-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "81",
+              "row-81-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "82",
+              "row-82-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "83",
+              "row-83-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "84",
+              "row-84-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "85",
+              "row-85-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "86",
+              "row-86-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "87",
+              "row-87-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "88",
+              "row-88-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "89",
+              "row-89-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "90",
+              "row-90-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "file": "cow_deferred_retire.jed",
+      "sha256": "ff2947347f9eb3aa8aa996920571fd4144c3552e182a21ad074922a9df1d1278",
+      "class": "writable_recovery",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit.",
+      "sources": [
+        "spec/fileformat/format.md:Remap list (v53)",
+        "spec/fileformat/verify.rb"
+      ],
+      "initial_version": 3,
+      "probes": [
+        {
+          "sql": "SELECT id::text,pad::text FROM t ORDER BY t.id",
+          "rows": [
+            [
+              "1",
+              "row-01-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "2",
+              "row-02-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "3",
+              "row-03-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "4",
+              "row-04-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "5",
+              "row-05-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "6",
+              "row-06-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "7",
+              "row-07-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "8",
+              "row-08-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "9",
+              "row-09-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "10",
+              "row-10-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "11",
+              "row-11-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "12",
+              "row-12-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "13",
+              "row-13-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "14",
+              "row-14-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "15",
+              "row-15-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "16",
+              "row-16-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "17",
+              "row-17-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "18",
+              "row-18-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "19",
+              "row-19-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "20",
+              "row-20-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "21",
+              "row-21-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "22",
+              "row-22-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "23",
+              "row-23-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "24",
+              "row-24-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "25",
+              "row-25-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "26",
+              "row-26-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "27",
+              "row-27-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "28",
+              "row-28-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "29",
+              "row-29-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "30",
+              "row-30-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "31",
+              "row-31-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "32",
+              "row-32-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "33",
+              "row-33-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "34",
+              "row-34-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "35",
+              "row-35-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "36",
+              "row-36-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "37",
+              "row-37-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "38",
+              "row-38-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "39",
+              "row-39-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "40",
+              "row-40-yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy"
+            ],
+            [
+              "41",
+              "row-41-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "42",
+              "row-42-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "43",
+              "row-43-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "44",
+              "row-44-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "45",
+              "row-45-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "46",
+              "row-46-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "47",
+              "row-47-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "48",
+              "row-48-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "49",
+              "row-49-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "50",
+              "row-50-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "51",
+              "row-51-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "52",
+              "row-52-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "53",
+              "row-53-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "54",
+              "row-54-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "55",
+              "row-55-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "56",
+              "row-56-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "57",
+              "row-57-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "58",
+              "row-58-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "59",
+              "row-59-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "60",
+              "row-60-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "61",
+              "row-61-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "62",
+              "row-62-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "63",
+              "row-63-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "64",
+              "row-64-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "65",
+              "row-65-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "66",
+              "row-66-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "67",
+              "row-67-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "68",
+              "row-68-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "69",
+              "row-69-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "70",
+              "row-70-yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy"
+            ],
+            [
+              "71",
+              "row-71-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "72",
+              "row-72-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "73",
+              "row-73-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "74",
+              "row-74-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "75",
+              "row-75-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "76",
+              "row-76-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "77",
+              "row-77-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "78",
+              "row-78-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "79",
+              "row-79-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "80",
+              "row-80-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "81",
+              "row-81-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "82",
+              "row-82-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "83",
+              "row-83-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "84",
+              "row-84-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "85",
+              "row-85-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "86",
+              "row-86-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "87",
+              "row-87-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "88",
+              "row-88-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "89",
+              "row-89-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ],
+            [
+              "90",
+              "row-90-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ]
+          ]
+        }
+      ]
+    },
+    {
       "file": "cow_duplicate_entry.jed",
-      "sha256": "afd71403978ee8ec17ba2efedddd1749e4e246b85357b43f841fb7209d2a3ecb",
+      "sha256": "2d3bb8b48240f8debcf370e6347faa1b810dc6af80933463e53edb696eb73ab9",
       "class": "writable_recovery",
       "open": "success",
       "sidecar_mutation": true,
@@ -431,7 +1955,7 @@
     },
     {
       "file": "cow_empty_tail.jed",
-      "sha256": "10279f7874d5d478b3f302f57ca082f18288204e0f56cb4e74f3388e1e83ba29",
+      "sha256": "3ddb9a01e7b2688f97f1ecb682da9001b753ab3f40c121dddc15c941149235ce",
       "class": "writable_recovery",
       "open": "success",
       "sidecar_mutation": true,
@@ -477,7 +2001,7 @@
     },
     {
       "file": "cow_free_head_manifest.jed",
-      "sha256": "63baa539dcd08469a32510026793bbe57fd8d8ff8a70ac3a19eec72d518ee4ea",
+      "sha256": "3d14ead94f2d5077089dbc137d96aff759c6a0e74e5ceebe67afef7889462f6b",
       "class": "writable_recovery",
       "open": "success",
       "sidecar_mutation": true,
@@ -523,7 +2047,7 @@
     },
     {
       "file": "cow_inline.jed",
-      "sha256": "9a08cf165865863c9fb2f008be4dd74a00f01cff6d0ffe7b4ecf978182487069",
+      "sha256": "51acb9caae904bc583bae55105659432daa7bb93da303e7345bc1ab1b9997879",
       "class": "writable_recovery",
       "open": "success",
       "sidecar_mutation": true,
@@ -569,7 +2093,7 @@
     },
     {
       "file": "cow_invalid_free_list.jed",
-      "sha256": "8a66574839ff7746fd229273d5550a5de124c480643d4afab755d7d7a3f7dbda",
+      "sha256": "31a8944f4da626bd41810c6c907b011f6e541c125332278d3850bfde9cab2ef8",
       "class": "expected_open_error",
       "open": "XX001",
       "sidecar_mutation": false,
@@ -583,7 +2107,7 @@
     },
     {
       "file": "cow_manifest_cycle.jed",
-      "sha256": "e19155a421a5dbfdae79a162243297563cfa01763dc8f45f50f96c6a7e7de1e5",
+      "sha256": "943abdd93ebb7bb9f09e2bfc69c2dff5c6259542e785eed525ece196b2719197",
       "class": "writable_recovery",
       "open": "success",
       "sidecar_mutation": true,
@@ -629,7 +2153,7 @@
     },
     {
       "file": "cow_missing_root.jed",
-      "sha256": "4411aba1f8e0e6bfe34a728143e39b6ebe7f6f5e6f4b108f696da02ae49d7ac6",
+      "sha256": "2fef128975a4cd847769945ed5073ab3a53be0ff1255595b4e370a70113722fb",
       "class": "writable_recovery",
       "open": "success",
       "sidecar_mutation": true,
@@ -641,14 +2165,14 @@
         "impl/ts/tests/integrity.test.ts:145",
         "spec/fileformat/verify.rb:1889"
       ],
-      "initial_version": 1,
+      "initial_version": 2,
       "probes": [
         {
           "sql": "SELECT id, v FROM t ORDER BY id",
           "rows": [
             [
               "1",
-              "10"
+              "20"
             ]
           ]
         },
@@ -675,7 +2199,7 @@
     },
     {
       "file": "cow_out_of_bounds.jed",
-      "sha256": "60e15cbef5ceab4e51d945534d65bfe12aa11d90a73749bf9f48fb9ac763f3be",
+      "sha256": "78e508c72fe2d99975b286c1e74bf911932bd14315b2995311b9d88adcfdf8f5",
       "class": "writable_recovery",
       "open": "success",
       "sidecar_mutation": true,
@@ -721,7 +2245,7 @@
     },
     {
       "file": "cow_overflow.jed",
-      "sha256": "b7c4d10dce425c976d66d0b0eec9490a5cebe4362b898bee3ac453254408083f",
+      "sha256": "6449aea7839976f71e209dc6759bcedc33b139fd5239104bedc84b0343d6e489",
       "class": "writable_recovery",
       "open": "success",
       "sidecar_mutation": true,
@@ -767,7 +2291,7 @@
     },
     {
       "file": "cow_root_manifest.jed",
-      "sha256": "771b26993021f9db23afbc570e464b59392e31f3874aec552d368aa4c083c86c",
+      "sha256": "51ea54fbde9bacfc10fd30b83c9530d31c3373d4ec8559e896709fe3dcae0c84",
       "class": "writable_recovery",
       "open": "success",
       "sidecar_mutation": true,
@@ -813,7 +2337,7 @@
     },
     {
       "file": "cow_stale_body.jed",
-      "sha256": "f5502365ad32182d674a2c8df31f129df9571a6205e1313320d80bc62b446f05",
+      "sha256": "766cdc65d19c7a55023486bb1c82b0619cb77c5d194225c34b624ec809e0dc7d",
       "class": "writable_recovery",
       "open": "success",
       "sidecar_mutation": true,
@@ -859,7 +2383,7 @@
     },
     {
       "file": "cow_stale_orphan.jed",
-      "sha256": "6cbb7e2956cbdb88e6be8e90fd10a47a61c9548c6e20e641a83e85c153349098",
+      "sha256": "a8198a5124109d6a29bd456c336e45ab1206d8cf51229c9c188befd6746dc91f",
       "class": "writable_recovery",
       "open": "success",
       "sidecar_mutation": true,
@@ -905,7 +2429,7 @@
     },
     {
       "file": "cow_torn_body.jed",
-      "sha256": "dbc7ef440222e4b206dfdfa643ab196c593a3362bdaf57448e514ec3442cc5d6",
+      "sha256": "f275afd1e956c10afda1b8bf27b657adf16fbb10884a3d97c37d96261bc720eb",
       "class": "writable_recovery",
       "open": "success",
       "sidecar_mutation": true,
@@ -951,7 +2475,7 @@
     },
     {
       "file": "cow_torn_manifest.jed",
-      "sha256": "1f79abdf0b8a012af503f13bef4894a732a4dc11e930c8da6c7586646ade9101",
+      "sha256": "acf9214c09259528e44674480b337018c9fe58048f934d71e2a039c91d3e2e30",
       "class": "writable_recovery",
       "open": "success",
       "sidecar_mutation": true,
@@ -997,7 +2521,7 @@
     },
     {
       "file": "cow_torn_meta.jed",
-      "sha256": "baac2b8c9358fe3e6e991a5887d79521478256d9b95a37bd294df32f7ab4c3c4",
+      "sha256": "7f30894b2086e661c6b446ec2e388ebef9ce5b61c23fe6bea1b2dcf79cbef0fe",
       "class": "writable_recovery",
       "open": "success",
       "sidecar_mutation": true,
@@ -1043,7 +2567,7 @@
     },
     {
       "file": "cow_wrong_manifest_txid.jed",
-      "sha256": "7318b1794a9c726a1693b9a4602a8c3b521d7dd01549236ce28dff5b2cf2948c",
+      "sha256": "676026dcd9a8d679f15b169dff78ee53b8c057cd7dcec03e2bed7ca87cb61e28",
       "class": "writable_recovery",
       "open": "success",
       "sidecar_mutation": true,
@@ -1089,7 +2613,7 @@
     },
     {
       "file": "date_table.jed",
-      "sha256": "907e2b75dc2dbcb6e8520a20d53d6cb9d1c80c2bae0e31e81a7b0998dda3b614",
+      "sha256": "1c16a975fae0d1212b24f78c035ea3d5b2ed3d0e8e90d1cae6f9e59f0e4cc798",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -1111,11 +2635,11 @@
       "sources": [
         "spec/fileformat/format.md"
       ],
-      "sha256": "b41179a3d2fa6ae5e556e4ca7214102a3e71e7949d1f4e9c16d83762918f343f"
+      "sha256": "6497b78db7b707b40c9b54374adf9e99e526efc9bf4ccd509fbf8dc64120cd48"
     },
     {
       "file": "decimal_pk_table.jed",
-      "sha256": "3fe3c0a2dc8ee17e8929f9bfc5de0c4deabff0238249c52a96cd4152896ceb10",
+      "sha256": "f5c5c8daefcd5d0677930667e90e0c7e84f354b79de8c2d94d86da4cba17dada",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -1129,7 +2653,7 @@
     },
     {
       "file": "decimal_table.jed",
-      "sha256": "f11510e766008d626a5fe10e1e14a5277ff557497f945f72e9a9f720257288ae",
+      "sha256": "24df5f8a424e78b309cc20b497bb52215b712b6ad43842615afebcccb1a2deaa",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -1143,7 +2667,7 @@
     },
     {
       "file": "default_expr_table.jed",
-      "sha256": "e58fd40fcf672391ec1b5f766e3153314c5b44a7c9b50af88ad5c0f5700937b7",
+      "sha256": "91a4b05d2faf9b57dcef7c0cd8825c33ec33a66bec04140eece584a06b252305",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -1157,7 +2681,7 @@
     },
     {
       "file": "default_table.jed",
-      "sha256": "176c1393c3825ee0cf76d4ca8bf8d934965bb69f91750015d679e02faf82fa93",
+      "sha256": "e2b0c602a28ab45c960139ca6307bee0d8586ef90bc07d0bab939473b19d097c",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -1171,7 +2695,7 @@
     },
     {
       "file": "empty_db.jed",
-      "sha256": "85045e1b95f2166932f86fc3d65a0b4a04e139b86ae83a71894f96130824e90a",
+      "sha256": "e9e6da9f2c445c5fe09b211c2aecea3b4c1a3337541d9a5a01a6ca9e1c2c7711",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -1185,7 +2709,7 @@
     },
     {
       "file": "encrypted_catalog.jed",
-      "sha256": "8292ea2346024e09d1eb8e572fe87a2f04a8d33cca03bd1f164f475539c1fa5d",
+      "sha256": "e02112ad1ab1aa63405f7769f091f210fc5238d5b4a571bc8fb391b14d30d30a",
       "class": "encrypted_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -1208,8 +2732,27 @@
       "initial_version": 1
     },
     {
+      "file": "encrypted_cow_deferred_retained.jed",
+      "sha256": "86da5f29ae1fac5eedcb06ffa5d915553da0c92b316e0bc229a37ff766897df0",
+      "class": "encrypted_writable",
+      "open": "success",
+      "sidecar_mutation": true,
+      "environment": [],
+      "verification": "Snapshot all original base table values and portable catalog fields before and after opposite-core reopen; perform reserved sidecar insert/update/delete across both readers/writers. Self-update original rows where stored definitions permit. Use actual file handoff/backup, not the plaintext-only serialize API. Deterministic byte comparisons require identical injected key/page entropy streams on both branches.",
+      "sources": [
+        "spec/fileformat/format.md:Remap list (v53)",
+        "spec/fileformat/verify.rb"
+      ],
+      "credential": {
+        "kind": "raw_key",
+        "hex": "4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a"
+      },
+      "page_size": 1024,
+      "initial_version": 2
+    },
+    {
       "file": "encrypted_empty_db.jed",
-      "sha256": "e8ce7373bde907ef90c29f5ec55ddaeb0c8d2d9eb2c20d2d1a2def136898e44d",
+      "sha256": "be44a90da5c0bbbe78b1438ea54238d7887233c37ff3bb413c5e1688a51cc2c7",
       "class": "encrypted_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -1233,7 +2776,7 @@
     },
     {
       "file": "encrypted_index_table.jed",
-      "sha256": "898d6151c8af70267a2fed5703fd68e6c9ef3cb354a6f56d6245eebe34cbf698",
+      "sha256": "a3fcc1fe62d6d8084c326ebb58d626f92f42106dfc771baf1316c834a9df35cf",
       "class": "encrypted_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -1257,7 +2800,7 @@
     },
     {
       "file": "encrypted_overflow_table.jed",
-      "sha256": "492f1a359a1f1b0db47f966bcee4aa90fd08aa3318f6db08129dd108e806eb1e",
+      "sha256": "812c96e25f8c8ef8bdfdf9df894c0b55b1b15050e00c70aa970800901b0911bc",
       "class": "encrypted_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -1281,7 +2824,7 @@
     },
     {
       "file": "encrypted_pk_table.jed",
-      "sha256": "39d8555669356b011ed8f071b427f0297a9998d91bcd4f8c39b667af70eb152d",
+      "sha256": "a243aa5747a29228f8bf41fdddf4a7a6d7c3b46b85471fc77963fa5a6be3800b",
       "class": "encrypted_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -1305,7 +2848,7 @@
     },
     {
       "file": "encrypted_rekey_index_table.jed",
-      "sha256": "96a9c7759160cc8aa640d59c68202853bc0eb0f6fc0577c77491a5a90b2ebe47",
+      "sha256": "f2000f2b62795ad20d9a0adabf75b179c1ec9238718154feedc5f5a006aa1e08",
       "class": "encrypted_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -1329,7 +2872,7 @@
     },
     {
       "file": "exclude_followon_table.jed",
-      "sha256": "4c84c06235991203494ef5873621409499f76780466724c610e67be9b74585f5",
+      "sha256": "65fbc75401b0ce385d696b30a73c9d7c1bf17140315240929f955dcb3bfaa828",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -1343,7 +2886,7 @@
     },
     {
       "file": "expr_index_table.jed",
-      "sha256": "c96b41b6d88643bfac03061d05eb4d7d1979a8b348fa0ab2d62a35a1a9e23db2",
+      "sha256": "2379a005290f2f2d10029f65a5bcb2375d5eb065c21dd1d73e2fdf42ed019646",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -1357,7 +2900,7 @@
     },
     {
       "file": "fk_table.jed",
-      "sha256": "8303df37016d2d259275ad678597c1ebbdeca3886bc653149ac1a1386cec2296",
+      "sha256": "17d8da371400ae3b69086d03c8481f5772fc2ff20b6c9d3ce3afb88b6be7d6eb",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -1371,7 +2914,7 @@
     },
     {
       "file": "float32_pk_table.jed",
-      "sha256": "b4ba36919c9e4a800d15604736a324cf10e6c35ee7642dd117dfd5fd8e14cc5f",
+      "sha256": "7d1121d249cd4ed2201a4b268259045548dffe4b6b15ddf44671fbea88ea27b4",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -1385,7 +2928,7 @@
     },
     {
       "file": "float32_table.jed",
-      "sha256": "ef35775474dcc4f4a8e755d6e2221c86c0dd35332350ab15407a06bf4ee34b58",
+      "sha256": "f37ccc517424f8f11f47629209cbc0bcdad4743ad72c16598eb26d178c077eb2",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -1399,7 +2942,7 @@
     },
     {
       "file": "float64_pk_table.jed",
-      "sha256": "f222881354c2ac8dd0c943f92fcaad015fc73b2d3045447f7198a429d7ca2b68",
+      "sha256": "e6b2f8b9f47ad979b307aa0684d39db32348b7ab67b768030c6705e5be6be78e",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -1413,7 +2956,7 @@
     },
     {
       "file": "float64_table.jed",
-      "sha256": "6ab487f37e3a4043ac3f0997dc63a6bb53d7bccb05f900808859d95bce55a3b3",
+      "sha256": "4312f8d89471189a949c02ce3a37fb2a5df0e2618ef854a7d94e3c6dfbaceb7d",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -1427,7 +2970,7 @@
     },
     {
       "file": "gin_array_table.jed",
-      "sha256": "b95650347f66718c6999c80706f4700b7ad28d01069d0feb83c3ebd68d732c58",
+      "sha256": "8f449d7ee773b26488ffff7dd7bb5ee2db77be12b71cd18b39acac58c338dca5",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -1441,7 +2984,7 @@
     },
     {
       "file": "gin_decimal_bytea_table.jed",
-      "sha256": "295d360140e2f68edbd9dba08e0923e3a6e7afad56e1643833465fbb8099b0e1",
+      "sha256": "f43dab1489b06faed6394a3d22c118e84210cc0595a42554a7c41fbc13c62c26",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -1455,7 +2998,7 @@
     },
     {
       "file": "gin_float_table.jed",
-      "sha256": "ada00f94820f23cefb9469e4c4d992d1938228a8c2cefac0f02f19941c3a1f73",
+      "sha256": "83237db17490d59de15fc6738e1519b2f56b14b03f92c64b9ba3fb1cdd46c65b",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -1469,7 +3012,7 @@
     },
     {
       "file": "gin_interval_table.jed",
-      "sha256": "c276ad35ebc7b9068222d67a2cb4604709e9c96408ceae61b918717123d2dc26",
+      "sha256": "0e1cf984c44d0b33a42d73a171121bf0f4d4f0c28240732755cd9725c27c4845",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -1483,7 +3026,7 @@
     },
     {
       "file": "gin_jsonb_table.jed",
-      "sha256": "ac88c02c1701f34dcbc0eef8adf5c1eab808e6af0956a90daadec04d5e0d1c2e",
+      "sha256": "e90334220b7191e75076aba350af8307d246e46c9d619990d19c75b82948dc60",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -1497,7 +3040,7 @@
     },
     {
       "file": "gin_multi_table.jed",
-      "sha256": "fc5a46fd5b0634c07e2c5b38849eb862e1b7d0e463bc496b07af00e27dffc488",
+      "sha256": "7ed71bd6611835c56ca2490117bb4611fa357551e637ff53f2ee2355f7fc7519",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -1511,7 +3054,7 @@
     },
     {
       "file": "gin_text_table.jed",
-      "sha256": "111b89b3422479a9319391063d38958e2959a45acee2b5bdbb84e9b0f022376a",
+      "sha256": "bab3942bba1c40b22012fa8a3ea3d3c4b469f095ad0414ad2bc7128c27915581",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -1525,7 +3068,7 @@
     },
     {
       "file": "gin_uuid_table.jed",
-      "sha256": "510b253d0159a3a6a7eab1649bb496742cb96e2cfec0f16b39767b7c6dc66588",
+      "sha256": "167f4aa0e11ef879db4503295ee44b3e6cfca4144c2c8d346f651b6abaac5f69",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -1539,7 +3082,7 @@
     },
     {
       "file": "gist_exclude_table.jed",
-      "sha256": "787f7a6a1d0624f7fe31468bda3255e5f78d5eebf4ca0c5cbe8a71918a28e0a2",
+      "sha256": "ff09f71a00adf73559ac0c884595825a875c82b494491dac3499418ba287373e",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -1553,7 +3096,7 @@
     },
     {
       "file": "gist_range_table.jed",
-      "sha256": "c559864dc6819cd2c589f7c7dc51604c2ffdd3d254931ab608a1828f272e66a0",
+      "sha256": "f89ff8def9691a0d455462160cb07c49cad42f63d759001f66f3a8cc77d4a162",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -1567,7 +3110,7 @@
     },
     {
       "file": "gist_scalar_table.jed",
-      "sha256": "94203d7aab9c233e88a0b947cebf645ff27a72484ffcaeb61323b2c23bf0cbdc",
+      "sha256": "6fec94807cdc46fbb3683fb9a6f121810f3a061e961092597139b9b227b98302",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -1581,7 +3124,7 @@
     },
     {
       "file": "hostfunc_check_table.jed",
-      "sha256": "6740a7b0f67b5a18ecbbb3c3cb9da8daec06e7bac16aed1bd135ee8bcc54f1f5",
+      "sha256": "d49731cd13af994d2925ec2d62d51bfdc90ca0ad72877c20906d809facb90cf7",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -1597,7 +3140,7 @@
     },
     {
       "file": "hostfunc_index_table.jed",
-      "sha256": "6b29e93eae12dd6163942e4adb6fdeba5ece821b0cc8f27838a564746005845b",
+      "sha256": "1874371ff069747666137b50ae88a69165e89fa9a53ced717d88eeca8ed133a6",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -1613,7 +3156,7 @@
     },
     {
       "file": "identity_table.jed",
-      "sha256": "b4080355cb286c5357bcaf1f9d5cca7fe8a2183f0f6e60459f9d2ddf76033383",
+      "sha256": "07bad693db21a443437c47cf66ccd200b2b240fbd2e510298cc9e72480e4d3c7",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -1627,7 +3170,7 @@
     },
     {
       "file": "index_table.jed",
-      "sha256": "78738a4e12d325731d5b175700b86a9027c7e3bc480596f9fe8bb3716484f1ee",
+      "sha256": "fb961b1fb2cd382a26019c4243f1907734f168db8bc2e1c4d0fef5ffb1d155c1",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -1641,7 +3184,7 @@
     },
     {
       "file": "interval_pk_table.jed",
-      "sha256": "0444fb91cb2e55c8b5e727267d4d5f7dca6d9a3245ae5f210ec5b112def9105a",
+      "sha256": "bca163b2b35dc1c08270d4ab00b58fe7a12aec9583423a640ee8c9cf5ef5c85d",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -1655,7 +3198,7 @@
     },
     {
       "file": "interval_table.jed",
-      "sha256": "beef592b5f5e6b4a348ba3f09f8a9a81ea3efcba16a0e78e19da99a71456cc89",
+      "sha256": "811ab3c58ef6c6c5d4ace6f2a587e9a054ec0f69e7ddf4702af73bbe82531af8",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -1669,7 +3212,7 @@
     },
     {
       "file": "json_table.jed",
-      "sha256": "8a423866e580acb3d113bbbeb253e356130bc9578bae98220789d6d7fe9e37a8",
+      "sha256": "7f6d3b457da40e63ea26c86d7cf8331f3d70fbb1da90c001dff314b733dd1efa",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -1683,7 +3226,7 @@
     },
     {
       "file": "jsonb_table.jed",
-      "sha256": "57e4e3bdb6b5cace955a548f3ee98a05c8b7cadb5b7acb58d07c8bc40b59c719",
+      "sha256": "58e86fbeffde3e5ff37f32103866c5f7f69b7fc86d10b68a9832dad7ddae9aa5",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -1697,7 +3240,7 @@
     },
     {
       "file": "malformed_decimal_group.jed",
-      "sha256": "fc9458a2fdaca88f707eb8bf61f3b9863dcf2ce313ad716b1b1f3e1932e6bfd7",
+      "sha256": "ede4e53213f743f810e133bf0eb0abb16c77c1b890a06dcdce7d0cedb95be092",
       "class": "lazy_corruption",
       "open": "success",
       "sidecar_mutation": false,
@@ -1724,7 +3267,7 @@
     },
     {
       "file": "malformed_fk_type.jed",
-      "sha256": "4cb2d7494141372729e0d2a86cf039b23e755205aa27f24b8b42ab267bdde23c",
+      "sha256": "c8c39af7d4d93ca0a009c564a032f6cbf8a47295a3f713e6a1dfb260084f1249",
       "class": "expected_open_error",
       "open": "XX001",
       "sidecar_mutation": false,
@@ -1738,7 +3281,7 @@
     },
     {
       "file": "malformed_interior_cycle.jed",
-      "sha256": "8b13d64500a73e3d204d906ca7b62f461b922308818d4824789018307ad56a5d",
+      "sha256": "70b3aacc37b5a77df48bdd4a304701e3fe4f5c0e792d9333368d9b8dbdcd5f69",
       "class": "expected_open_error",
       "open": "XX001",
       "sidecar_mutation": false,
@@ -1752,7 +3295,7 @@
     },
     {
       "file": "malformed_leaf_directory.jed",
-      "sha256": "c1112b94e18c2b4ddf0e56dec66a0c66583c10617a2b84dbb8b4bc6de2714d8a",
+      "sha256": "bb3d7e8a5d58089df378b42e8330da78ae47d7137e9587f959c34af5e0d9a07b",
       "class": "lazy_corruption",
       "open": "success",
       "sidecar_mutation": false,
@@ -1779,7 +3322,7 @@
     },
     {
       "file": "malformed_missing_type.jed",
-      "sha256": "7fa38ef87335d039e76f21202eed88b58c1827aa312c47cb007f4abef7c46e40",
+      "sha256": "0ba833261a5fe83d9edce400c2a3f88ec38e1769bdf29a5284cd4bbfba736155",
       "class": "expected_open_error",
       "open": "XX001",
       "sidecar_mutation": false,
@@ -1793,7 +3336,7 @@
     },
     {
       "file": "malformed_overflow_cycle.jed",
-      "sha256": "864f28da0741d94fda79a70183ba5ff57469be2a4092ee3b6596023265403d3e",
+      "sha256": "5c0706f1a4f2b53f6f51203dced44759ae6356df67537ae9ef8e774711201ace",
       "class": "lazy_corruption",
       "open": "success",
       "sidecar_mutation": false,
@@ -1826,7 +3369,7 @@
     },
     {
       "file": "malformed_row_count.jed",
-      "sha256": "a7b300bc360d00e9cd3d88d529034dbb9034bd3656801776985ccf8a9cc1b514",
+      "sha256": "838b31863bd68d5b8ab61302d2f4c2fd1d3a6f63f33134142c4fe0c008cfc4fe",
       "class": "lazy_corruption",
       "open": "success",
       "sidecar_mutation": false,
@@ -1853,7 +3396,7 @@
     },
     {
       "file": "malformed_wrong_tree_leaf.jed",
-      "sha256": "de130b50421eee4a96c22440d267fcf72538c768514f22f94a70b2c48b8e3433",
+      "sha256": "73a18eda025f9341120203f3add0aa4963aba1602502f0584ef673abf7013c17",
       "class": "lazy_corruption",
       "open": "success",
       "sidecar_mutation": false,
@@ -1889,7 +3432,7 @@
     },
     {
       "file": "max_sep_table.jed",
-      "sha256": "515c28bca2712ad00ada58c5b3f6cef6247a4a4f04ebc19dfde5b8210467d3ac",
+      "sha256": "99814bc5d4d47738ba5b7a1ace0d6d2a1b77efde7e1108d0edcd09301d480acc",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -1911,11 +3454,11 @@
       "sources": [
         "spec/fileformat/format.md"
       ],
-      "sha256": "02ffe125e8789760470a005daa18f34e7e5f4c94ad045aea5ba742f4a0e518f5"
+      "sha256": "fd0f72ff745c4286c792b3dae64a46610c40695e403afa8160da642a0aa1b549"
     },
     {
       "file": "nested_composite_table.jed",
-      "sha256": "3e1350a3cf25fcaf631e13abfd151d5c9e6e2048277dfd6bcaa0aa8063b54651",
+      "sha256": "d367674a6c05c164259a0cbd22688e47aca450baaeb9fb9a003b8f65e8549779",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -1929,7 +3472,7 @@
     },
     {
       "file": "nopk_table.jed",
-      "sha256": "d615cf5988748b6615c3da5e050f46f42828062cd5b3aa1f88c2e9c666af4d72",
+      "sha256": "66db88eb41f7f45ace9aaa4878a9a2501256b96a60658fb1d5d6fedc4c77e3f1",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -1943,7 +3486,7 @@
     },
     {
       "file": "one_table_empty.jed",
-      "sha256": "e200ff7b43d11556e97cd2a948428c6a803f0f7bd695849dbc151c3c7b9f7b1a",
+      "sha256": "8e5fc40d4bbabcae395f1371a5e8e1af8c80fb2ea570a46b93173b9e7beb5c8a",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -1957,7 +3500,7 @@
     },
     {
       "file": "ordered_index_table.jed",
-      "sha256": "16b7f81b415c47258d15c195cba76cadb2ee30aa0137c16aa859cf479814e9d9",
+      "sha256": "736534150859671042d9eccc23585892ebdc1bc7c78d425a3b0f63f72c092b02",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -1971,7 +3514,7 @@
     },
     {
       "file": "overflow_table.jed",
-      "sha256": "b0134b7fb1c6bffaaa264f8516058a106dad7b35c2df9d8e74fc3068be48a74e",
+      "sha256": "2f37b8f94e3a54a891fd5d7e48ee0a596d0fd58e51ce86cddf418cf395e189e9",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -1985,7 +3528,7 @@
     },
     {
       "file": "partial_index_table.jed",
-      "sha256": "29c205d6430f11ab10046ff079cffa1c8a9f4fe15539f887160072985f2368d3",
+      "sha256": "9d9fd20ec025321527a9cf2ccb8740489721d2182855a69e2f6ddf9642037409",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -1999,7 +3542,7 @@
     },
     {
       "file": "pk_table.jed",
-      "sha256": "ff2210075494b866cf8c00697c63191ee9ff4500b84bcd473c45cd961e2cfb10",
+      "sha256": "98fa95f911c3d8d722fd7582fc32bb262ef8080230030262b6151dc861861c9e",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -2013,7 +3556,7 @@
     },
     {
       "file": "range_pk_table.jed",
-      "sha256": "b2ffd38b498b407c2dac487540313c1754d0968e952bcb7e41d41864379a111c",
+      "sha256": "6c522a8e873b432e3510b6fb4be9ccaf9a3f24b87ad0bea362ec9054cd69b939",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -2027,7 +3570,7 @@
     },
     {
       "file": "range_table.jed",
-      "sha256": "3e205732ad5ad5d9f351454644f9a17ba1ffde66d63db997bf6e380beaef52f2",
+      "sha256": "46ca0206f8bbab4385a15e4c9ee8bb3274c2fbf2b786f4032f9aa9b18388c2d6",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -2041,7 +3584,7 @@
     },
     {
       "file": "row_count_table.jed",
-      "sha256": "8bf3772c49935dc18b23f9000fe8a394a3aa82ac59ed7b9c9b9189855083e9d2",
+      "sha256": "81b78109c3bb87debd6336bb376274d55283b6da85af99e9e2b288f37237a483",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -2055,7 +3598,7 @@
     },
     {
       "file": "sequence_table.jed",
-      "sha256": "4ef111cb559dc98e9d3e7cdece2d1b179e0a095a9e6a49e3e349a117d2ab97c6",
+      "sha256": "7905181e3cecb2417b221c1a295cc0d15b4113874e045d7d1ff5b5d28248df92",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -2069,7 +3612,7 @@
     },
     {
       "file": "serial_table.jed",
-      "sha256": "dd45a8cc596964cf118e16e328aa43bc85fa786a52d9d4fc0094c2e43d3a81af",
+      "sha256": "0c0b34709062fb4f1a0f31ce44c450da33973cc0623695b820f4d84fecf7a28f",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -2091,11 +3634,11 @@
       "sources": [
         "spec/fileformat/format.md"
       ],
-      "sha256": "04fef346a9c6c4869600a48487d708e6a15735cdaa1dfa40a01e18b71a056c45"
+      "sha256": "c5408df96098f82e261aa6999fa4998aa917eb59def41bc65f2b3ef6038fd621"
     },
     {
       "file": "statistics_table.jed",
-      "sha256": "b501ca0aef507b5722494503ffb2042a9980dd1e16810adc10852553022e6e1c",
+      "sha256": "29d03e9f5f1037c75b30e553123780f4c0ace987fa4759e08b6a5155f041dac0",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -2109,7 +3652,7 @@
     },
     {
       "file": "statistics_terms_table.jed",
-      "sha256": "d953a4df039dea2e39ff1e9652707498bba020eed68a322b6d0a7c29626e5514",
+      "sha256": "76b030b1adf2c8b01e7b850edf04f044e6dadc7598d3acc1cc97731c339732c8",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -2123,7 +3666,7 @@
     },
     {
       "file": "tall_tree.jed",
-      "sha256": "76cc8657e287cb6c739b2f46f3097777c6674637406540ffce19fc39713bbb39",
+      "sha256": "eeac3bc0ca2eda2c73bae99348f5135b9ca1c3604fa253dac0dfd6d872dc392c",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -2137,7 +3680,7 @@
     },
     {
       "file": "temporal_typmod_table.jed",
-      "sha256": "4103380f2680fec3fe9d4e73171bbcc9a03dd4193b0a2e8bf3c45a9a060e47c3",
+      "sha256": "9c21d040c69fa2ab94f39b86c03e4c02e4ad75cf39616a6d9ed1a1c25de9a6e6",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -2151,7 +3694,7 @@
     },
     {
       "file": "text_pk_table.jed",
-      "sha256": "8783adbcef1cb139556d0ea48251bbc1c9fd10fd8ffc2a003c1b8ac1eca40b2a",
+      "sha256": "60626300f55a9421550e9095b4f24d9d13b97425ff0f1c630c164cd427ec9124",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -2165,7 +3708,7 @@
     },
     {
       "file": "text_table.jed",
-      "sha256": "9e5194eed74ab57dc02c990c2fe7dfdf3979dc7da90b1a3fd7f319d504c56a70",
+      "sha256": "e07eccb251e7e9bc7f80a1295fde8ff96bdadb992e1ab105f3be82d9911cb4c7",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -2179,7 +3722,7 @@
     },
     {
       "file": "timestamp_table.jed",
-      "sha256": "dc8483dd663966e0ef7fcacbd43ceab977fb0aa87ca39b3f9722f4ea9e4872f0",
+      "sha256": "d3ab223e4a047dffdd90b54c4dad9b21dcfa7d04bd87098beea89094a6767e3a",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -2193,7 +3736,7 @@
     },
     {
       "file": "timestamptz_table.jed",
-      "sha256": "19e759c8ae0715da93d6377d7f579feccc471f3c12f18aee50565223190023fb",
+      "sha256": "05d02aa4cd116f4ec12da76eb727b60669202966add34c819f156f377544bce0",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -2207,7 +3750,7 @@
     },
     {
       "file": "timezone_index_table.jed",
-      "sha256": "750cc01ea15b7a9b8bf4628557bb5d057df12f4d33392aca546987c71429afb1",
+      "sha256": "51bfa28f36ed12dc03ad61e3f48cb2aaf57204ba01420b108f8db2fcba714d8c",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -2223,7 +3766,7 @@
     },
     {
       "file": "torn_meta_slot0.jed",
-      "sha256": "2ea50e6a22d93193ac47a8d374bf4be7a20e443e2f2939103d6e2aa362285609",
+      "sha256": "b30d002d3183f08104e1d1e6c95e8d603340c452af356d694edc1f6251a0745e",
       "class": "writable_recovery",
       "open": "success",
       "sidecar_mutation": true,
@@ -2325,7 +3868,7 @@
     },
     {
       "file": "torn_meta_slot1.jed",
-      "sha256": "bfdfaf3cf50ca7d9147cff2ebe9f277eb75a6f48a2561fb9d8f14c82d6987a59",
+      "sha256": "1674cbc8146463a3a4b095a0ccadd4201ccf35e34eff30155ece588d6c3c2bc1",
       "class": "writable_recovery",
       "open": "success",
       "sidecar_mutation": true,
@@ -2427,7 +3970,7 @@
     },
     {
       "file": "unique_table.jed",
-      "sha256": "1ab93a1b721e41f591665d807970d4e043e49858ca60b9773708550e4f2eca2f",
+      "sha256": "143bf3d9d6207c09565afc93135b5968a212498615f527df53d3b5e141f95611",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -2441,7 +3984,7 @@
     },
     {
       "file": "unparsable_definitions.jed",
-      "sha256": "fa5ef7dd30f38f01f0669b36c0721ac196af8b2d3b930e8e148e1bdd3a23ab5a",
+      "sha256": "ddca5477ee6fc52d00aa473570a2d3fbf3278d884526e9ad92e0901fe5e33b32",
       "class": "unparsable_definitions",
       "open": "success",
       "sidecar_mutation": true,
@@ -2548,7 +4091,7 @@
     },
     {
       "file": "uuid_table.jed",
-      "sha256": "fed3d35c59fc37b04693d08b629f674a5edd1725e81f3b06b725020191ec0672",
+      "sha256": "72bd72eca5cf70acb3fe9b7cc8d3f93ebcbab810cd2c8b960c68988a631ba073",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -2562,7 +4105,7 @@
     },
     {
       "file": "varchar_table.jed",
-      "sha256": "707b9e8e8b0ef744696a3d7bc12fbd760be2819227eab34f9ef40f0d579e95ce",
+      "sha256": "4d031ddc12b0b75557eee0262d9e18a9e3beec1674197821f9d68c7aac01c499",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -2576,7 +4119,7 @@
     },
     {
       "file": "view_options_table.jed",
-      "sha256": "395af05d64f709d6353af8f32836c21a0dccbebf8fd16c8310c76d5232ff9cfe",
+      "sha256": "53d9d7ec369f9be1a8af5070e760cf1b0337089cd94925e1ea901eebb48cf852",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,
@@ -2590,7 +4133,7 @@
     },
     {
       "file": "view_table.jed",
-      "sha256": "01825d006415c58ca528e62195656c4d03f32f22c3043af6f86bf91e5c9943d1",
+      "sha256": "74776feae71d63a8cef5e331fc0900dfab9b85bc6eb255183f8e433421552217",
       "class": "ordinary_writable",
       "open": "success",
       "sidecar_mutation": true,

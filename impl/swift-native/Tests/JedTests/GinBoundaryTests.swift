@@ -194,7 +194,7 @@ final class GinBoundaryTests: XCTestCase {
                         return Array(bytes[(end - 40)..<(end - 16)])
                     }.makeIterator()
                     let written = try rebuilt.tree.serialize(allocator: &allocator, fromScratch: true,
-                        entropy: encrypted ? { count in XCTAssertEqual(count, 24); return try XCTUnwrap(salts.next()) } : nil)
+                        entropy: encrypted ? { count in XCTAssertEqual(count, 24); return try XCTUnwrap(salts.next()) } : nil, writeCodec: StampedPageCodec(base: pager.codec, txid: 1))
                     XCTAssertEqual(written.root, definition.root, name)
                     for page in written.pages {
                         let start = Int(page.index) * pager.codec.pageSize

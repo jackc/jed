@@ -19,7 +19,7 @@ final class CatalogTests: XCTestCase {
         let paths = GeneratedSpec.sourceHashes.keys.filter {
             $0.hasPrefix("spec/fileformat/fixtures/") && !$0.contains("/cow_") && !$0.contains("/malformed_")
         }.sorted()
-        XCTAssertEqual(paths.count, 91)
+        XCTAssertEqual(paths.count, 92)
         for path in paths {
             let name = String(path.split(separator: "/").last!.dropLast(4))
             do {
@@ -36,7 +36,9 @@ final class CatalogTests: XCTestCase {
                     let end = (Int(page) + 1) * codec.pageSize
                     return Array(bytes[(end - 40)..<(end - 16)])
                 }.makeIterator()
-                let rebuilt = try CatalogChain.write(image.entries(), allocator: &allocator, codec: codec,
+                let originalRoot = try pager.readBody(pager.selected.meta.root)
+                let stamp = UInt64(originalRoot[2]) << 8 | UInt64(originalRoot[3])
+                let rebuilt = try CatalogChain.write(image.entries(), allocator: &allocator, codec: StampedPageCodec(base: codec, txid: stamp),
                     entropy: encrypted ? { count in XCTAssertEqual(count, 24); return try XCTUnwrap(nonces.next()) } : nil)
                 XCTAssertEqual(rebuilt.root, pager.selected.meta.root, name)
                 XCTAssertEqual(rebuilt.pages.map(\.index), catalog.pages, name)

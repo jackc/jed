@@ -15,7 +15,7 @@ internal final class AdmittedMemoryDomainCommit {
         snapshot = plan.snapshot; self.pages = pages
         accounting = DomainStorageState(snapshot: plan.snapshot, catalogPages: plan.catalogPages,
             gistPages: plan.gistPages, livePages: plan.livePages, liveAtCompaction: plan.liveAtCompaction,
-            freeGeneration: plan.freeGeneration, lastWritten: plan.written, repairCatalogPages: plan.catalogPages.count)
+            freeGeneration: plan.freeGeneration, lastWritten: plan.written, catalogKnown: true, repairCatalogPages: plan.catalogPages.count, reclaim: plan.reclaim, freeChain: plan.freeChain)
     }
 }
 
@@ -122,11 +122,18 @@ internal final class StorageDomain: Sendable {
         let snapshot = try DomainSnapshot(catalogID: catalogID, txid: meta.txid, catalog: catalog,
             pool: pool, tables: tables, indexes: indexes, gistTrees: gistTrees)
         let free = try pager.allocationSnapshot(reuseAllowed: true)
+        let freeChain = try FreeList.load(meta: meta, protected: pager.selected.protectedPages, read: pager.readBody).chain
+        let tolerated = max(0, IncrementalReclaim.leaked(meta: meta, free: free.persistedFree.count, chain: freeChain.count, held: 0))
         return DomainStorageState(snapshot: snapshot, catalogPages: chain.pages, gistPages: gistPages,
             livePages: meta.livePages, liveAtCompaction: meta.pageCount - UInt32(free.persistedFree.count),
-            freeGeneration: meta.txid, lastWritten: [], repairCatalogPages: kind == .file ? chain.pages.count : 0)
+            freeGeneration: meta.txid, lastWritten: [], repairCatalogPages: kind == .file ? chain.pages.count : 0,
+            reclaim: IncrementalReclaim(tolerated: tolerated), freeChain: freeChain)
     }
 
+    func canGrantReuse(oldest: UInt64) -> Bool {
+        state.withLock { oldest >= $0.freeGeneration && $0.reclaim.newer(than: oldest).isEmpty }
+    }
+    var toleratedLeak: Int64 { state.withLock { $0.reclaim.tolerated } }
     var freeGeneration: UInt64 { state.withLock { $0.freeGeneration } }
     var lastWritten: Set<UInt32> { state.withLock { $0.lastWritten } }
     func serviceDirectorySync() throws { try durableDirectorySync() }
@@ -135,8 +142,8 @@ internal final class StorageDomain: Sendable {
     func serviceMaintenanceTrigger() throws -> (needed: Bool, reclaim: Bool) {
         guard kind == .file, !readOnly, pager.selected.meta.txid < UInt64.max else { return (false, false) }
         let current = state.withLock { $0 }, free = try pager.allocationSnapshot(reuseAllowed: true)
-        let reclaim = current.liveAtCompaction == 0 || DomainCommitPlanner.reclaimDue(
-            pageCount: free.highWater, free: free.persistedFree.count, live: current.liveAtCompaction)
+        let reclaim = IncrementalReclaim.due(meta: pager.selected.meta, free: free.persistedFree.count,
+            chain: current.freeChain.count, held: current.reclaim.held.count)
         let tail = free.highWater > pager.codec.firstBodyPage && free.persistedFree.last == free.highWater - 1
         return (reclaim || tail, reclaim)
     }
@@ -145,8 +152,13 @@ internal final class StorageDomain: Sendable {
     /// consulting the local Environment. The coordinator publishes its meta and
     /// invalidation window in the same critical section as reader pins.
     func noteServiceCommit(_ selected: ValidatedMeta, written: Set<UInt32>) {
+        let free = pager.committedFreeList
         state.withLock { current in
             current.livePages = selected.meta.livePages; current.lastWritten = written
+            current.reclaim.known = false; current.catalogKnown = false
+            current.freeChain = free.chain
+            let listed = Set(free.entries)
+            for i in current.reclaim.generations.indices { current.reclaim.generations[i].pages.formIntersection(listed) }
         }
     }
 
@@ -169,9 +181,13 @@ internal final class StorageDomain: Sendable {
                 collationVerdict: { _ in false }, validateCatalog: { _ in })
         }
         var adopted = loaded
+        if current.snapshot.txid == selected.meta.txid { adopted.catalogKnown = current.catalogKnown }
         adopted.freeGeneration = current.freeGeneration
         adopted.liveAtCompaction = current.liveAtCompaction
         adopted.lastWritten = current.lastWritten
+        adopted.reclaim = current.reclaim
+        let listed = Set(try pager.allocationSnapshot(reuseAllowed: true).persistedFree)
+        for i in adopted.reclaim.generations.indices { adopted.reclaim.generations[i].pages.formIntersection(listed) }
         state.withLock { $0 = adopted }
         return adopted.snapshot
     }
@@ -193,7 +209,7 @@ internal final class StorageDomain: Sendable {
             keyBlock = created.block; codec = try EncryptedPageCodec(pageSize: pageSize, dataKey: created.dataKey)
         } else { codec = try PlainPageCodec(pageSize: pageSize) }
         var allocation = try PageAllocator(highWater: codec.firstBodyPage, free: [], firstBody: codec.firstBodyPage)
-        let catalog = try CatalogChain.write([], allocator: &allocation, codec: codec, entropy: entropy)
+        let catalog = try CatalogChain.write([], allocator: &allocation, codec: StampedPageCodec(base: codec, txid: kind == .memory ? 0 : 1), entropy: entropy)
         let manifest = try CommitManifest.build(pageSize: pageSize, encrypted: credential != nil,
             txid: kind == .memory ? 0 : 1, root: catalog.root, pageCount: allocation.highWater,
             freeList: PageSealer.nullReference(codec), livePages: UInt32(catalog.pages.count), entries: [], chain: [])
@@ -223,7 +239,7 @@ internal final class StorageDomain: Sendable {
         return domain
     }
 
-    private func context(_ working: DomainSnapshot, policy: DomainCommitPolicy) throws -> (DomainStorageState, PagerAllocationState, DomainBodyLayout, UInt32)? {
+    private func context(_ working: DomainSnapshot, policy: DomainCommitPolicy, synchronous: Bool = true) throws -> (DomainStorageState, PagerAllocationState, DomainBodyLayout, UInt32)? {
         let previous = state.withLock { $0 }
         guard working.identity === previous.snapshot.identity, working.txid == previous.snapshot.txid,
               previous.snapshot.txid < UInt64.max else { throw JedError("55006", "working snapshot belongs to an obsolete generation") }
@@ -231,7 +247,13 @@ internal final class StorageDomain: Sendable {
         guard !readOnly else { throw JedError("25006", "database is read only") }
         let reuse = policy.oldestPinnedVersion >= previous.freeGeneration
         var free = try pager.allocationSnapshot(reuseAllowed: reuse)
-        var layout = try DomainCommitPlanner.layout(working, highWater: free.highWater, free: free.reusableFree)
+        if kind == .file && !pager.isRemote {
+            let newer = previous.reclaim.newer(than: policy.oldestPinnedVersion)
+            free.reusableFree.removeAll { newer.contains($0) }
+        }
+        let deferral = kind == .file ? InteriorDeferral.plan(working, previous: previous, meta: pager.selected.meta,
+            free: free.persistedFree, enabled: true, synchronous: synchronous) : InteriorDeferral()
+        var layout = try DomainCommitPlanner.layout(working, highWater: free.highWater, free: free.reusableFree, deferral: deferral)
         var live = try DomainCommitPlanner.live(after: layout, previous: previous, pageCount: free.highWater)
         var current = previous
         if try !DomainCommitPlanner.admit(layout: layout, live: live, previous: current, pageCount: free.highWater, kind: kind, policy: policy),
@@ -273,15 +295,15 @@ internal final class StorageDomain: Sendable {
 
     func prepare(_ working: DomainSnapshot, policy: DomainCommitPolicy = DomainCommitPolicy(),
                  entropy: KeyEntropy? = nil, verifyLiveCount: Bool = false, forceReclaim: Bool = false, synchronous: Bool = true) throws -> PreparedDomainCommit? {
-        guard var preparation = try context(working, policy: policy) else { return nil }
+        guard var preparation = try context(working, policy: policy, synchronous: synchronous) else { return nil }
         // Q4 preflight above uses the current batch. Only after every domain's
         // budget admission does a timed flush change this file's allocation view.
         if kind == .file, try pager.beforeCommitTiming(synchronous: synchronous) {
-            guard let refreshed = try context(working, policy: policy) else { return nil }; preparation = refreshed
+            guard let refreshed = try context(working, policy: policy, synchronous: synchronous) else { return nil }; preparation = refreshed
         }
         let (previous, free, layout, live) = preparation
         let codec = pager.codec
-        let body = try DomainCommitPlanner.write(working, highWater: free.highWater, free: free.reusableFree, entropy: entropy)
+        let body = try DomainCommitPlanner.write(working, highWater: free.highWater, free: free.reusableFree, entropy: entropy, deferral: layout.deferral)
         let written = Set(body.pages.map(\.index))
         guard written == layout.written, body.allocation.highWater == layout.allocation.highWater,
               body.kept == layout.kept, body.keptChains == layout.keptChains else {
@@ -294,40 +316,75 @@ internal final class StorageDomain: Sendable {
         }
         let consumed = Set(free.reusableFree).subtracting(body.allocation.remaining)
         let remaining = free.persistedFree.filter { !consumed.contains($0) }
-        let reclaim = policy.reclaimAllowed && policy.oldestPinnedVersion >= body.snapshot.txid &&
-            (forceReclaim || previous.liveAtCompaction == 0 || DomainCommitPlanner.reclaimDue(pageCount: body.allocation.highWater, free: remaining.count, live: previous.liveAtCompaction))
+        let incremental = kind == .file && !pager.isRemote
+        let rebuildDue = incremental
+            ? IncrementalReclaim.due(meta: pager.selected.meta, free: free.persistedFree.count,
+                chain: previous.freeChain.count, held: previous.reclaim.held.count)
+            : previous.liveAtCompaction == 0 || DomainCommitPlanner.reclaimDue(pageCount: body.allocation.highWater, free: remaining.count, live: previous.liveAtCompaction)
+        let reclaim = policy.reclaimAllowed && policy.oldestPinnedVersion >= body.snapshot.txid && (forceReclaim || rebuildDue)
+        var nextReclaim = previous.reclaim
+        nextReclaim.generations.removeAll { $0.txid <= policy.oldestPinnedVersion }
+        var listed: Set<UInt32> = [], held: Set<UInt32> = []
+        if incremental {
+            listed = try PageReachability.orphanIDs(previous.snapshot, kept: body.kept,
+                keptChains: body.keptChains, pageCount: free.highWater)
+            listed.subtract(layout.deferral.retained)
+            if previous.reclaim.known {
+                if !body.catalogKept { listed.formUnion(previous.catalogPages) }
+                listed.formUnion(previous.gistPages)
+                listed.formUnion(pager.selected.chain)
+            }
+            listed.formUnion(previous.freeChain)
+            if free.pending.isEmpty { listed.formUnion(previous.reclaim.held); nextReclaim.held = [] }
+            else {
+                held = listed.intersection(free.pending.map(\.pageIndex)); listed.subtract(held)
+                nextReclaim.held.formUnion(held)
+            }
+        }
         var reached: Set<UInt32>?
         if reclaim || verifyLiveCount {
             reached = try PageReachability.collect(body.snapshot, catalogPages: body.catalogPages, gistPages: body.gistPages,
                 pageCount: body.allocation.highWater, read: read)
             if verifyLiveCount, reached!.count != Int(live) { throw JedError.corruption("live-page delta disagrees with reachability") }
         }
-        var persist = remaining, liveAtCompaction = previous.liveAtCompaction, generation = previous.freeGeneration
+        var persist = Set(remaining).union(listed).sorted(), liveAtCompaction = previous.liveAtCompaction, generation = previous.freeGeneration
         if reclaim {
             var protected = reached!; protected.formUnion(written)
             liveAtCompaction = UInt32(protected.count)
             protected.formUnion(free.pending.map(\.pageIndex))
             persist = (codec.firstBodyPage..<body.allocation.highWater).filter { !protected.contains($0) }
             generation = body.snapshot.txid
+            nextReclaim.generations = []
+            nextReclaim.tolerated = 0
+        } else if incremental && !listed.isEmpty {
+            nextReclaim.generations.append(FreePageGeneration(txid: body.snapshot.txid, pages: listed))
         }
+        nextReclaim.known = true
+        var freeChain: [UInt32] = []
         let prepared: PreparedPageCommit
         if kind == .file {
             let allocation = try CommitAllocation.plan(persist: persist, safe: Array(body.allocation.remaining),
                 highWater: body.allocation.highWater, dirtyCount: body.pages.count, pendingCount: free.pending.count,
-                truncate: free.pending.isEmpty && policy.reclaimAllowed, codec: codec, entropy: entropy)
+                truncate: free.pending.isEmpty && policy.reclaimAllowed,
+                codec: StampedPageCodec(base: codec, txid: body.snapshot.txid), entropy: entropy)
+            freeChain = allocation.freeList.pages.map(\.index)
             prepared = try pager.prepare(body: body.pages + allocation.freeList.pages, root: body.root,
                 pageCount: allocation.freeList.highWater, freeList: allocation.freeList.head, livePages: live,
                 freePages: allocation.freeList.entries, manifestPages: allocation.manifestIDs,
                 reuseAllowed: policy.oldestPinnedVersion >= previous.freeGeneration, entropy: entropy,
-                initialStage: PageWriteStage(count: body.pages.count, highWater: body.allocation.highWater))
+                initialStage: PageWriteStage(count: body.pages.count, highWater: body.allocation.highWater), remaps: body.remaps)
         } else {
             prepared = try pager.prepareMemory(body: body.pages, root: body.root, pageCount: body.allocation.highWater,
                 freePages: persist, reuseAllowed: policy.oldestPinnedVersion >= previous.freeGeneration,
                 reusablePages: free.reusableFree)
         }
+        if incremental && !previous.reclaim.known {
+            nextReclaim.tolerated = max(0, IncrementalReclaim.leaked(meta: prepared.manifest.meta,
+                free: prepared.freePages.count, chain: freeChain.count, held: nextReclaim.held.count))
+        }
         return PreparedDomainCommit(identity: working.identity, pages: prepared, snapshot: body.snapshot,
             catalogPages: body.catalogPages, gistPages: body.gistPages, livePages: live,
-            freeGeneration: generation, liveAtCompaction: liveAtCompaction, written: written)
+            freeGeneration: generation, liveAtCompaction: liveAtCompaction, written: written, reclaim: nextReclaim, freeChain: freeChain)
     }
 
     /// The writer lease stays held across staging, main persistence and root
@@ -370,7 +427,7 @@ internal final class StorageDomain: Sendable {
             try pager.adoptMemory(staged.pages)
             current = DomainStorageState(snapshot: plan.snapshot, catalogPages: plan.catalogPages,
                 gistPages: plan.gistPages, livePages: plan.livePages, liveAtCompaction: plan.liveAtCompaction,
-                freeGeneration: plan.freeGeneration, lastWritten: plan.written, repairCatalogPages: plan.catalogPages.count)
+                freeGeneration: plan.freeGeneration, lastWritten: plan.written, catalogKnown: true, repairCatalogPages: plan.catalogPages.count, reclaim: plan.reclaim, freeChain: plan.freeChain)
             return current.snapshot
         }
     }
@@ -409,7 +466,7 @@ internal final class StorageDomain: Sendable {
                 remotePages: Dictionary(uniqueKeysWithValues: plan.pages.body.map { ($0.index, $0.bytes) }))
             current = DomainStorageState(snapshot: snapshot, catalogPages: plan.catalogPages,
                 gistPages: plan.gistPages, livePages: plan.livePages, liveAtCompaction: plan.liveAtCompaction,
-                freeGeneration: plan.freeGeneration, lastWritten: plan.written, repairCatalogPages: plan.catalogPages.count)
+                freeGeneration: plan.freeGeneration, lastWritten: plan.written, catalogKnown: true, repairCatalogPages: plan.catalogPages.count, reclaim: plan.reclaim, freeChain: plan.freeChain)
             return current.snapshot
         }
     }
@@ -434,7 +491,7 @@ internal final class StorageDomain: Sendable {
             snapshot.finishPersistence(written: plan.written)
             current = DomainStorageState(snapshot: snapshot, catalogPages: plan.catalogPages,
                 gistPages: plan.gistPages, livePages: plan.livePages, liveAtCompaction: plan.liveAtCompaction,
-                freeGeneration: plan.freeGeneration, lastWritten: plan.written, repairCatalogPages: plan.catalogPages.count)
+                freeGeneration: plan.freeGeneration, lastWritten: plan.written, catalogKnown: true, repairCatalogPages: plan.catalogPages.count, reclaim: plan.reclaim, freeChain: plan.freeChain)
             return current.snapshot
         }
     }

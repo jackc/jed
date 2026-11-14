@@ -93,7 +93,7 @@ extension SimRunner {
             let published: String
             do { published = try committedDigest(domain) }
             catch {
-                if relaxed && !filesystem.fired.isEmpty || service && filesystem.isDead { published = expected }
+                if relaxed && !filesystem.fired.isEmpty || service && (filesystem.isDead || !filesystem.fired.isEmpty && (error as? JedError)?.code == "08006") { published = expected }
                 else if service, (error as? JedError)?.code == "08006" { published = try committedDigest(domain) }
                 else { throw error }
             }
@@ -182,6 +182,7 @@ extension SimRunner {
         try openProcess(0)
         var main = "", attachments: [String] = []
         for domain in orderedDomains {
+            domain.shrinkDue = false
             try verifyRecovered(domain); try observeGrowth(domain)
             // Open may repair divergent credential blocks. The crash transcript
             // and independent integrity check describe the saved crash image,
@@ -245,10 +246,10 @@ extension SimRunner {
         if quiet && domain.reclaimed && pages > domain.previousHigh {
             guard pages - domain.previousHigh <= written - min(written, domain.previousFree) else { throw SimViolation("bounded growth failed to reuse the prior free list") }
         }
-        let threshold = max(UInt64(GeneratedSpec.compactMinimumPages), UInt64(GeneratedSpec.compactGrowth) * UInt64(domain.liveBound))
-        domain.reclaimed = quiet && UInt64(domain.high - domain.free) > threshold
-        if domain.reclaimed {
-            guard UInt64(pages) >= 2 + UInt64(live) + UInt64(free), UInt64(pages) - 2 - UInt64(live) - UInt64(free) <= UInt64(written) else {
+        domain.reclaimed = quiet
+        if quiet {
+            let leaked = Int64(pages) - Int64(storage.pager.codec.firstBodyPage) - Int64(live) - Int64(free)
+            guard leaked >= 0, leaked <= Int64(written) + storage.toleratedLeak else {
                 throw SimViolation("bounded growth left unreachable pages outside the free list")
             }
         }

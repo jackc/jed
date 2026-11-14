@@ -24,8 +24,8 @@ private final class RecordedStore: BlockStore {
 }
 
 final class PagerTests: XCTestCase {
-    private func body(_ index: UInt32, marker: UInt8 = 0) throws -> StoredPage {
-        var page = [UInt8](repeating: 0, count: 256); page[0] = 1; page[16] = marker
+    private func body(_ index: UInt32, marker: UInt8 = 0, txid: UInt64 = 1) throws -> StoredPage {
+        var page = [UInt8](repeating: 0, count: 256); page[0] = 1; page[2] = UInt8(truncatingIfNeeded: txid >> 8); page[3] = UInt8(truncatingIfNeeded: txid); page[16] = marker
         let sealed = try PlainPageCodec(pageSize: 256).sealBody(pageIndex: index, plaintext: page, salt: [])
         return StoredPage(index: index, bytes: sealed.bytes)
     }
@@ -45,9 +45,9 @@ final class PagerTests: XCTestCase {
 
     private func prepared(_ pager: Pager, count: UInt32 = 1) throws -> PreparedPageCommit {
         let first = pager.selected.meta.pageCount
-        let pages = try (first..<(first + count)).map { try body($0, marker: UInt8(truncatingIfNeeded: $0)) }
+        let pages = try (first..<(first + count)).map { try body($0, marker: UInt8(truncatingIfNeeded: $0), txid: pager.selected.meta.txid + 1) }
         let total = pager.pendingEntries.count + Int(count)
-        let chainCount = max(0, (max(0, total - 16) + 17) / 18)
+        let chainCount = max(0, (max(0, total - 16) + 27) / 28)
         let chain = (0..<chainCount).map { first + count + UInt32($0) }
         return try pager.prepare(body: pages, root: PageReference(first),
             pageCount: first + count + UInt32(chainCount), freeList: PageReference(0), livePages: 1,

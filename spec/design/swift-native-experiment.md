@@ -1,12 +1,18 @@
 # Native Swift core experiment
 
-Approved 2026-11-05; explicitly refreshed 2026-11-12 to supported-core revision
-`b1a6affca7725e0b07a4f734eddb1c569ef76bcf`. The pinned inventory now contains 763 SQL
-files, 116 database fixtures and 19 saved simulation regressions, including the
+Approved 2026-11-05; explicitly refreshed 2026-11-13 to supported-core revision
+`32feb48fd961598c2d7e60f0de284ba619a74ab0`. The pinned inventory now contains 764 SQL
+files, 121 database fixtures and 19 saved simulation regressions, including the
 v51 numeric slots and v52 compact leaves. [VERIFICATION.md](../../impl/swift-native/VERIFICATION.md)
 records current Linux evidence and its limits. Older implementation checkpoints and
 [BENCHMARKS.md](../../impl/swift-native/BENCHMARKS.md) retain their original actors;
 the refresh does not claim their measured performance.
+
+The explicitly requested 2026-11-13 Swift refresh completed Linux acceptance against
+`32feb48fd961598c2d7e60f0de284ba619a74ab0` (v53, 764 SQL files, 121 byte fixtures).
+Acceptance is tracked in `impl/swift-native/VERIFICATION.md`; previous v52
+verification and historical benchmarks apply only to their recorded actors.
+Swift remains opt-in and experimental.
 
 The language-neutral specification and shared corpus define behavior. Existing cores
 provide implementation patterns, never authority over the spec. Ruby's frozen surface
@@ -35,7 +41,7 @@ capabilities and fixtures. The [host/tool matrix](swift-native-host-matrix.md) i
 embedding APIs, cursor and accounting boundaries, test adapters, process tests,
 simulation and interchange. Together they are the completion checklist. Future TODO
 features remain unsupported. Missing implementation is a failure, never a silent skip
-or a changed expected answer. The current file contract is v52, including encryption
+or a changed expected answer. The current file contract is v53, including encryption
 and relaxed durability; historical milestone descriptions do not narrow this target.
 
 Completion requires all applicable shared suites and byte fixtures, bidirectional

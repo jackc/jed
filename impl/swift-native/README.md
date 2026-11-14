@@ -1,15 +1,15 @@
 # Native Swift experiment
 
-The explicitly requested 2026-11-12 refresh targets the supported jed surface at
-`b1a6affca7725e0b07a4f734eddb1c569ef76bcf`, including format **v52**, **763 SQL files**,
-**116 database fixtures**, and **19 saved simulation regressions**. It remains a
+The explicitly requested 2026-11-13 refresh targets the supported jed surface at
+`32feb48fd961598c2d7e60f0de284ba619a74ab0`, including format **v53**, **764 SQL files**,
+**121 database fixtures**, and **19 saved simulation regressions**. It remains a
 pinned, opt-in experiment. See [VERIFICATION.md](VERIFICATION.md) for the refresh's
 actual Linux checks and remaining platform limits, and [PROGRESS.md](PROGRESS.md)
 for implementation history. The refresh preserves the experiment’s opt-in status
 and pinned maintenance scope.
 
 [BENCHMARKS.md](BENCHMARKS.md) preserves the older actors' measurements. Those
-v50 results are historical and do not establish performance for this v52 refresh.
+v50 results are historical and do not establish performance for this v53 refresh.
 The [experiment design](../../spec/design/swift-native-experiment.md) and scope/host
 matrices record the acceptance boundaries.
 
@@ -78,7 +78,7 @@ disk-spill modes. Filters are diagnostic subsets; see
 comparison; [resource acceptance evidence](Tools/RESOURCE_ACCEPTANCE.md) preserves
 the original baseline investigation.
 
-`swift-native:interop` exercises all 116 frozen images with Swift and each
+`swift-native:interop` exercises all 121 frozen images with Swift and each
 supported core in both writer orders, plus generated plaintext/key/passphrase
 and attachment cases. Corruption and recovery fixtures have explicit probes;
 missing phases fail. See [interchange acceptance](Tools/INTERCHANGE_PLAN.md).
@@ -86,8 +86,7 @@ missing phases fail. See [interchange acceptance](Tools/INTERCHANGE_PLAN.md).
 fixed test credential and compares all cost/EXPLAIN transcripts across the four
 cores. It checks ordinary values/errors and exact file/record coverage, retains
 an immutable Swift actor and logs, and supports labelled diagnostic filters.
-The refresh passes 79,060 encrypted record measurements and all 2,787 interchange
-phases. VERIFICATION.md records the current gates and actor provenance separately
+[VERIFICATION.md](VERIFICATION.md) records the current gates and actor provenance separately
 from the older service/process evidence.
 
 `swift-native:service` runs all six Swift/supported-core client-owner directions

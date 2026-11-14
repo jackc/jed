@@ -120,7 +120,7 @@ expect_error = "58P02"
 actor = "-"
 command = "check_image"
 path = "client_pi"
-expect = "10:12:166:51"
+expect = "10:12:83:68"
 
 [[step]]
 actor = "-"
@@ -132,7 +132,7 @@ expect = "11:12:14:0"
 actor = "-"
 command = "check_image"
 path = "owner_pi"
-expect = "11:12:166:47"
+expect = "11:12:25:10"
 
 [[step]]
 actor = "-"

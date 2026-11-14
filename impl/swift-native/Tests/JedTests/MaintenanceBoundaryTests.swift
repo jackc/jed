@@ -116,7 +116,15 @@ final class MaintenanceBoundaryTests: XCTestCase {
         try database.compact()
         XCTAssertEqual(database.version, version + 1); XCTAssertEqual(database.storageBytes, live)
         XCTAssertEqual(try Data(contentsOf: path).count, original.count)
-        XCTAssertEqual(Array(try Data(contentsOf: path).dropFirst(2 * size)), Array(original.dropFirst(2 * size)))
+        var expected = original
+        for start in stride(from: 2 * size, to: expected.count, by: size) {
+            var page = Array(expected[start..<(start + size)])
+            page[2] = UInt8(truncatingIfNeeded: (version + 1) >> 8)
+            page[3] = UInt8(truncatingIfNeeded: version + 1)
+            try PageEnvelope.putU32(PageEnvelope.checksum(page, at: 12), into: &page, at: 12)
+            expected.replaceSubrange(start..<(start + size), with: page)
+        }
+        XCTAssertEqual(Array(try Data(contentsOf: path).dropFirst(2 * size)), Array(expected.dropFirst(2 * size)))
         XCTAssertEqual((try FileManager.default.attributesOfItem(atPath: path.path)[.posixPermissions] as? NSNumber)?.intValue, 0o640)
         XCTAssertFalse(FileManager.default.fileExists(atPath: path.path + ".jedtmp"))
         fails("55006") { _ = try Database.open(path.path, options: OpenOptions(locking: .exclusive, fileLockTimeoutMilliseconds: 0)) }

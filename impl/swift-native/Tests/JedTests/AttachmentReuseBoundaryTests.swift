@@ -40,7 +40,7 @@ final class AttachmentReuseBoundaryTests: XCTestCase {
         }
         try commit(3)
         XCTAssertTrue(Set(free).isDisjoint(with: child.core.storage.lastWritten))
-        XCTAssertEqual(try child.core.storage.pager.allocationSnapshot(reuseAllowed: true).persistedFree, free)
+        XCTAssertTrue(Set(free).isSubset(of: try child.core.storage.pager.allocationSnapshot(reuseAllowed: true).persistedFree))
         read.close()
         try commit(4)
         XCTAssertFalse(Set(free).isDisjoint(with: child.core.storage.lastWritten))

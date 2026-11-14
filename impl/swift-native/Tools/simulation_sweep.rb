@@ -12,7 +12,7 @@ module SwiftSimulationSweep
   SOURCES = {
     "scripts/sim_gen.rb" => "bd497ee9703f0340f350008fc8de6b04847b20c8ae9f784bb78b392400293b12",
     "scripts/sim.rb" => "3fce68d66dbd9a6bffe0e79b588d5c699025672fabd768974c855c295546eaa2",
-    "spec/fileformat/verify.rb" => "64308c4c1044d6d30eafb4ba34fb3ea49a45970545ecbf3c7018b7e439bc3dec",
+    "spec/fileformat/verify.rb" => "ba6455106cce40198e4ea7a1424f2f8d6e5dea467f659b25db9df2a944b5ee20",
     "spec/fileformat/lz4.rb" => "c4eb2a3fd9fe6d455d83351deb6512f8277661f1b6c3e287125e65417663e609",
     "spec/fileformat/xaes.rb" => "aeebcb1541f0c3312006852ec0928ce2aef0fa50fce328bc0b8bbde24b7d1882",
     "spec/fileformat/expr.rb" => "7b09424c5beb719a4527d8fed113010cd219bfc55752b1ccf9120bdff6111e76"

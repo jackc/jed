@@ -94,9 +94,12 @@ internal enum Checksums {
         return value
     }
     static func crc32(_ bytes: some Sequence<UInt8>) -> UInt32 {
-        var crc: UInt32 = .max
+        UInt32(crc32Update(0, bytes))
+    }
+    static func crc32Update(_ initial: UInt64, _ bytes: some Sequence<UInt8>) -> UInt64 {
+        var crc = ~UInt32(truncatingIfNeeded: initial)
         for byte in bytes { crc = (crc >> 8) ^ crc32Table[Int((crc ^ UInt32(byte)) & 255)] }
-        return ~crc
+        return UInt64(~crc)
     }
     static func crc64(_ bytes: some Sequence<UInt8>) -> UInt64 {
         crc64Update(0, bytes)

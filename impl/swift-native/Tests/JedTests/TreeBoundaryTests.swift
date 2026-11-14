@@ -220,7 +220,7 @@ final class TreeBoundaryTests: XCTestCase {
             var rebuilt = BPlusTree(codec: codec, types: types, layout: layout), cursor = TreeCursor(source)
             while let record = try cursor.next() { try rebuilt.insert(record) }
             var allocator = try PageAllocator(highWater: XCTUnwrap(expected.keys.min()), free: [], firstBody: 2)
-            let result = try rebuilt.serialize(allocator: &allocator, fromScratch: true)
+            let result = try rebuilt.serialize(allocator: &allocator, fromScratch: true, writeCodec: StampedPageCodec(base: codec, txid: 1))
             XCTAssertEqual(result.root.index, root, name)
             XCTAssertEqual(result.pages.count, expected.count, name)
             for page in result.pages { XCTAssertEqual(page.bytes, expected[page.index], "\(name) page \(page.index)") }

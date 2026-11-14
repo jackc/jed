@@ -128,8 +128,8 @@ internal struct CommitAllocation {
         }
         let trimmed = truncate ? PageAllocator.trimTrailing(safe: safe, highWater: highWater) : (safe, highWater)
         let candidates = persist.filter { $0 < trimmed.1 }
-        let inline = (codec.pageSize - (codec.reservedBytes == 0 ? 64 : 136)) / 12
-        let overflow = (codec.pageSize - 32) / 12
+        let inline = PageRemap.inlineCapacity(pageSize: codec.pageSize, encrypted: codec.reservedBytes != 0)
+        let overflow = (codec.pageSize - 32) / 8
         var reserved = 0
         while true {
             var allocator = try PageAllocator(highWater: trimmed.1, free: trimmed.0, firstBody: codec.firstBodyPage)

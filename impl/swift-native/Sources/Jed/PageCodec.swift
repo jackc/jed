@@ -56,7 +56,7 @@ internal enum PageEnvelope {
     static func validateHeader(_ bytes: [UInt8], encrypted: Bool) throws {
         guard bytes.count >= 16 else { throw JedError.corruption("truncated body page") }
         let type = bytes[0], flags = bytes[1]
-        guard (1...(encrypted ? 7 : 8)).contains(Int(type)), bytes[2] == 0, bytes[3] == 0,
+        guard (1...(encrypted ? 7 : 8)).contains(Int(type)),
               type == 1 ? flags & ~1 == 0 : flags == 0 else {
             throw JedError.corruption("invalid body page header")
         }
@@ -177,8 +177,7 @@ internal struct EncryptedPageCodec: PageCodec {
     private func validateMetaEnvelope(_ page: [UInt8], slot: UInt32) throws {
         guard slot <= 1, page.count == pageSize else { throw JedError.corruption("invalid meta envelope") }
         guard Array(page.prefix(4)) == Array("JEDB".utf8), page[4] == 0, page[5] == UInt8(MetaPage.version),
-              page[6] == 1, page[7] == 40, try PageEnvelope.readU32(page, at: 8) == UInt32(pageSize),
-              page[60..<64].allSatisfy({ $0 == 0 }) else {
+              page[6] == 1, page[7] == 40, try PageEnvelope.readU32(page, at: 8) == UInt32(pageSize) else {
             throw JedError.corruption("invalid encrypted meta header")
         }
     }

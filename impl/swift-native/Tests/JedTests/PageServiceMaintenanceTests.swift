@@ -50,6 +50,13 @@ final class PageServiceMaintenanceTests: XCTestCase {
         XCTAssertFalse(try core.storage.pager.allocationSnapshot(reuseAllowed: true).persistedFree.isEmpty)
         let local = try core.beginRead(); defer { local.close() }
         XCTAssertEqual(local.snapshot.catalog.sequences.count, 23)
+        // The local begin forced a same-generation reload after maintenance.
+        // An identical catalog remains eligible for retention on owner writes.
+        var working = local.snapshot
+        working.requireStorageMaintenance()
+        let plan = try XCTUnwrap(core.storage.prepare(working, entropy: entropy))
+        XCTAssertEqual(plan.pages.manifest.meta.root, core.storage.pager.selected.meta.root)
+        XCTAssertFalse(plan.written.contains(core.storage.pager.selected.meta.root.index))
     }
     func testEncryptedMaintenanceNeverUsesOwnerEnvironmentAndDoesNotBypassLaterValidation() throws {
         let (core, entropy) = try setup(encrypted: true, environment: Environment.builder().build())

@@ -19,6 +19,8 @@ internal struct PreparedDomainCommit: Sendable {
     let freeGeneration: UInt64
     let liveAtCompaction: UInt32
     let written: Set<UInt32>
+    var reclaim = IncrementalReclaim()
+    var freeChain: [UInt32] = []
 }
 
 internal struct DomainStorageState: Sendable {
@@ -30,7 +32,10 @@ internal struct DomainStorageState: Sendable {
     var freeGeneration: UInt64
     var lastWritten: Set<UInt32>
     // Memory bootstrap/open has no last commit for Q4 repair; files use their loaded catalog size.
+    var catalogKnown = false
     var repairCatalogPages: Int
+    var reclaim = IncrementalReclaim()
+    var freeChain: [UInt32] = []
 }
 
 internal struct DomainBodyLayout {
@@ -42,6 +47,8 @@ internal struct DomainBodyLayout {
     let gistPages: [UInt32]
     let kept: Set<UInt32>
     let keptChains: Set<UInt32>
+    var deferral = InteriorDeferral()
+    var catalogKept = false
 }
 
 internal struct DomainBodyWrite {
@@ -53,12 +60,14 @@ internal struct DomainBodyWrite {
     let gistPages: [UInt32]
     let kept: Set<UInt32>
     let keptChains: Set<UInt32>
+    var remaps: [PageRemap] = []
+    var catalogKept = false
 }
 
 /// Handwritten structural preflight and serialization compose the same existing
 /// tree/chain primitives. A dry layout draws no entropy and performs no writes.
 internal enum DomainCommitPlanner {
-    static func layout(_ snapshot: DomainSnapshot, highWater: UInt32, free: [UInt32]) throws -> DomainBodyLayout {
+    static func layout(_ snapshot: DomainSnapshot, highWater: UInt32, free: [UInt32], deferral: InteriorDeferral = InteriorDeferral()) throws -> DomainBodyLayout {
         let codec = snapshot.pool.codec, slab = codec.capacity - (codec.reservedBytes == 0 ? 0 : 16)
         var allocation = try PageAllocator(highWater: highWater, free: free, firstBody: codec.firstBodyPage)
         var written: Set<UInt32> = [], kept: Set<UInt32> = [], chains: Set<UInt32> = [], gistPages: [UInt32] = []
@@ -68,7 +77,7 @@ internal enum DomainCommitPlanner {
             return PageReference(page, tag: zero.tag)
         }
         func visitTree(_ child: TreeChild, source: BPlusTree) throws -> PageReference {
-            if let reference = child.reference { kept.insert(reference.index); return reference }
+            if let reference = child.reference, !deferral.rewrite.contains(reference.index) { kept.insert(reference.index); return reference }
             let node = try source.resolve(child)
             for child in node.children { _ = try visitTree(child, source: source) }
             guard node.payloadSize <= codec.capacity else { throw JedError("0A000", "tree node exceeds page capacity") }
@@ -86,6 +95,7 @@ internal enum DomainCommitPlanner {
                     }
                 }
             }
+            if let origin = node.origin, deferral.retained.contains(origin.index) { return origin }
             return try allocate()
         }
         func gist(_ node: GistNode, ops: [GistOpclass]) throws -> PageReference {
@@ -141,26 +151,29 @@ internal enum DomainCommitPlanner {
             throw JedError.corruption("orphaned index store")
         }
         // Validate all catalog strings and metadata before the first page seal.
-        let count = try CatalogChain.pageCount(image.entries(), codec: codec)
+        let catalogKept = try deferral.keepsCatalog(image, codec: codec)
+        let count = catalogKept ? 0 : try CatalogChain.pageCount(image.entries(), codec: codec)
         var catalogPages: [UInt32] = []
         for _ in 0..<count { catalogPages.append(try allocate().index) }
-        return DomainBodyLayout(catalog: image, root: PageReference(catalogPages[0], tag: zero.tag),
-            allocation: allocation, written: written, catalogPages: catalogPages, gistPages: gistPages, kept: kept, keptChains: chains)
+        return DomainBodyLayout(catalog: image, root: catalogKept ? deferral.catalogRoot! : PageReference(catalogPages[0], tag: zero.tag),
+            allocation: allocation, written: written, catalogPages: catalogKept ? deferral.catalogPages : catalogPages, gistPages: gistPages, kept: kept, keptChains: chains, deferral: deferral, catalogKept: catalogKept)
     }
 
     static func write(_ snapshot: DomainSnapshot, highWater: UInt32, free: [UInt32],
-                      entropy: KeyEntropy?) throws -> DomainBodyWrite {
-        let codec = snapshot.pool.codec
+                      entropy: KeyEntropy?, deferral: InteriorDeferral = InteriorDeferral()) throws -> DomainBodyWrite {
+        let codec = StampedPageCodec(base: snapshot.pool.codec, txid: snapshot.txid + 1)
         var allocation = try PageAllocator(highWater: highWater, free: free, firstBody: codec.firstBodyPage)
         var image = snapshot.catalog, tables = snapshot.tables, indexes = snapshot.indexes
         var pages: [StoredPage] = [], kept: Set<UInt32> = [], chains: Set<UInt32> = [], gistPages: [UInt32] = []
+        var remaps = deferral.entries
         func append(_ result: TreeWrite) {
+            remaps = result.remaps
             pages.append(contentsOf: result.pages); kept.formUnion(result.keptRoots)
             chains.formUnion(result.keptOverflowHeads.map(\.index))
         }
         for position in image.tables.indices.sorted(by: { image.tables[$0].name < image.tables[$1].name }) {
             var table = image.tables[position], store = tables[image.tables[position].name]!
-            let result = try store.tree.serialize(allocator: &allocation, entropy: entropy)
+            let result = try store.tree.serialize(allocator: &allocation, entropy: entropy, writeCodec: codec, deferral: deferral, remaps: remaps)
             append(result); store.installPersistedTree(result.tree); tables[table.name] = store
             table.root = result.root; table.rowCount = store.count!
             table.indexes.sort { $0.name < $1.name }
@@ -172,26 +185,28 @@ internal enum DomainCommitPlanner {
                     table.indexes[ordinal].root = result.root
                     indexes[name]!.clearPending()
                 } else {
-                    let result = try indexes[name]!.tree.serialize(allocator: &allocation, entropy: entropy)
+                    let result = try indexes[name]!.tree.serialize(allocator: &allocation, entropy: entropy, writeCodec: codec, deferral: deferral, remaps: remaps)
                     append(result); indexes[name]!.installPersistedTree(result.tree); table.indexes[ordinal].root = result.root
                 }
             }
             image.tables[position] = table
         }
-        let catalog = try CatalogChain.write(image.entries(), allocator: &allocation, codec: codec, entropy: entropy)
+        let catalogKept = try deferral.keepsCatalog(image, codec: codec)
+        let catalog = catalogKept ? CatalogChainWrite(root: deferral.catalogRoot!, pages: [])
+            : try CatalogChain.write(image.entries(), allocator: &allocation, codec: codec, entropy: entropy)
         pages.append(contentsOf: catalog.pages)
         var cleaned = snapshot
         guard snapshot.txid < UInt64.max else { throw JedError.corruption("transaction id exhausted") }
         cleaned.finishCommit(txid: snapshot.txid + 1, catalog: image, tables: tables, indexes: indexes)
         return DomainBodyWrite(snapshot: cleaned, root: catalog.root, allocation: allocation, pages: pages,
-            catalogPages: catalog.pages.map(\.index), gistPages: gistPages, kept: kept, keptChains: chains)
+            catalogPages: catalogKept ? deferral.catalogPages : catalog.pages.map(\.index), gistPages: gistPages, kept: kept, keptChains: chains, remaps: remaps, catalogKept: catalogKept)
     }
 
     static func live(after layout: DomainBodyLayout, previous: DomainStorageState, pageCount: UInt32) throws -> UInt32 {
         let orphaned = try PageReachability.orphaned(previous.snapshot, kept: layout.kept,
             keptChains: layout.keptChains, pageCount: pageCount)
         let before = UInt64(previous.livePages) + UInt64(layout.written.count)
-        let removed = UInt64(previous.catalogPages.count) + UInt64(previous.gistPages.count) + orphaned
+        let removed = UInt64(layout.catalogKept ? 0 : previous.catalogPages.count) + UInt64(previous.gistPages.count) + orphaned - UInt64(layout.deferral.retained.count)
         guard removed <= before, before - removed <= UInt32.max else { throw JedError.corruption("live page count out of range") }
         return UInt32(before - removed)
     }

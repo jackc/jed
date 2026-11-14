@@ -1,11 +1,12 @@
 # Native Swift experiment — baseline scope and completion matrix
 
-## Authorized refresh (2026-11-12)
+## Authorized refresh (2026-11-13)
 
-The current semantic target is **`b1a6affca7725e0b07a4f734eddb1c569ef76bcf`**, superseding the
-original November 5 target. The mechanical snapshot pins **763 SQL files**, **116
+The current semantic target is **`32feb48fd961598c2d7e60f0de284ba619a74ab0`**, superseding the
+original November 5 target. The mechanical snapshot pins **764 SQL files**, **121
 byte fixtures**, **19 simulation regressions**, 22 simulation profiles and the
-unchanged 31 process scenarios. Format v52 includes fixed numeric slots, key-column
+unchanged 31 process scenarios. Format v53 adds deferred interiors, narrow CRC-32 manifests and page stamps; incremental
+reclamation and sibling leaf redistribution are included. Earlier format v52 includes fixed numeric slots, key-column
 elision, narrow directories, shared key prefixes, offset/dictionary/array regions,
 and multi-way leaf splits. SQL additions include timestamp aliases, LIMIT/OFFSET
 parameters, INSERT/CTE parameter inference, whole-row references, cast-derived

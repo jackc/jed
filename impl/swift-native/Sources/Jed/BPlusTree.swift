@@ -33,6 +33,8 @@ internal final class TreeNode: @unchecked Sendable {
     fileprivate(set) var keys: [[UInt8]]
     fileprivate(set) var children: ChildList
     let reference: PageReference?
+    /// Persisted interior replaced one for one with its separators unchanged.
+    fileprivate(set) var origin: PageReference? = nil
     fileprivate(set) var payloadSize: Int
     let height: Int
     fileprivate(set) var nodeCount: Int
@@ -83,6 +85,7 @@ internal final class TreeNode: @unchecked Sendable {
     init(replacing index: Int, in node: TreeNode, with child: TreeNode, replacedCount: Int,
          owner: TreeEditToken? = nil) {
         leaf = nil; recordLeaf = nil; pending = [:]; keys = node.keys; reference = nil; self.owner = owner
+        origin = node.reference ?? node.origin
         var children = node.children
         children[index] = .resident(child)
         self.children = children
@@ -112,6 +115,7 @@ internal final class TreeNode: @unchecked Sendable {
     /// `init(keys:children:codec:)` applied to this node itself: the same
     /// derived sizes. Siblings have equal depth, so the height stands.
     fileprivate func setRouting(keys: [[UInt8]], children: ChildList, codec: any PageCodec) {
+        origin = nil
         self.keys = keys; self.children = children
         payloadSize = PackedInterior.payloadSize(keys: keys, codec: codec)
         nodeCount = children.reduce(1) { $0 + $1.nodeCount }
@@ -184,6 +188,7 @@ internal struct TreeWrite: Sendable {
     let keptRoots: Set<UInt32>
     /// Heads of inherited chains in freshly written leaves.
     let keptOverflowHeads: [PageReference]
+    var remaps: [PageRemap] = []
 }
 
 /// Value snapshots share immutable nodes. Every mutation builds a replacement
@@ -256,7 +261,7 @@ internal struct BPlusTree: Sendable {
             // Classify only. PAX directories and values stay deferred until fault.
             return .onDisk(reference, lower: lower, upper: upper)
         }
-        let packed = try PackedInterior(bytes: bytes, codec: codec, pageCount: pageCount)
+        let packed = try PackedInterior(bytes: bytes, codec: codec, pageCount: pageCount, parent: reference.index, remaps: pool!.pager?.selected.meta.remaps ?? [])
         try Self.checkBounds(packed.keys.first, packed.keys.last, lower: lower, upper: upper)
         var children: [TreeChild] = []
         let first = try loadSkeleton(packed.children[0], pageCount: pageCount, lower: lower,
@@ -490,6 +495,10 @@ internal struct BPlusTree: Sendable {
         if case .whole(let child) = result {
             return .whole(replacing(index, in: node, with: child, replacedCount: replacedCount))
         }
+        if case .split(let halves, _) = result, halves.count == 2, halves[0].isLeaf,
+           let evened = try evenLeaves(node, at: index, halves: halves, key: record.key) {
+            return .whole(evened)
+        }
         var keys = node.keys, children = node.children
         switch result {
         case .whole(let child): children[index] = .resident(child)
@@ -504,6 +513,29 @@ internal struct BPlusTree: Sendable {
         if case .split(_, let separators) = result { lastInserted = index + separators.count - 1 } else { lastInserted = index }
         return buildInterior(keys, children: Array(children), edited: lastInserted)
             ?? .whole(TreeNode(keys: keys, children: children, codec: codec, owner: editToken))
+    }
+
+    /// Format v53: try the right sibling, then the left, before splitting a
+    /// leaf. Right-edge edits never inspect the left sibling.
+    private func evenLeaves(_ parent: TreeNode, at index: Int, halves: [TreeNode], key: [UInt8]) throws -> TreeNode? {
+        let rightEdge = halves[1].key(at: halves[1].entryCount - 1).elementsEqual(key)
+        let limit = codec.capacity - codec.capacity / 8
+        for sibling in [index + 1, index - 1] {
+            if sibling < 0 || sibling >= parent.children.count || (sibling < index && rightEdge) { continue }
+            let node = try resolve(parent.children[sibling])
+            guard node.isLeaf, node.payloadSize <= limit else { continue }
+            let records = sibling < index
+                ? node.records() + halves[0].records() + halves[1].records()
+                : halves[0].records() + halves[1].records() + node.records()
+            guard case .split(let pair, let separators) = try buildLeaf(records, edited: nil), pair.count == 2 else { continue }
+            let slot = min(index, sibling)
+            guard parent.payloadSize - parent.keys[slot].count + separators[0].count <= codec.capacity else { continue }
+            var keys = parent.keys, children = parent.children
+            keys[slot] = separators[0]
+            children[slot] = .resident(pair[0]); children[slot + 1] = .resident(pair[1])
+            return TreeNode(keys: keys, children: children, codec: codec, owner: editToken)
+        }
+        return nil
     }
 
     private func removing(_ node: TreeNode, key: [UInt8]) throws -> (TreeNode, PackedRecord?) {
@@ -594,7 +626,8 @@ internal struct BPlusTree: Sendable {
     /// Whole-image export renumbers and copies inherited chains; incremental
     /// commit retains clean subtrees and unchanged chain pointers.
     func serialize(allocator: inout PageAllocator, fromScratch: Bool = false,
-                   entropy: KeyEntropy? = nil) throws -> TreeWrite {
+                   entropy: KeyEntropy? = nil, writeCodec: (any PageCodec)? = nil, deferral: InteriorDeferral = InteriorDeferral(), remaps: [PageRemap] = []) throws -> TreeWrite {
+        var remaps = remaps
         var allocation = allocator, pages: [StoredPage] = [], kept: Set<UInt32> = []
         var chains: [PageReference] = []
         // A whole-image export has a different page-address space. Its returned
@@ -603,23 +636,39 @@ internal struct BPlusTree: Sendable {
         var result = fromScratch ? BPlusTree(codec: codec, types: types, layout: layout) : self
         result.count = count
         if let root {
-            result.root = try serialize(root, isRoot: true, allocator: &allocation, fromScratch: fromScratch, entropy: entropy,
-                pages: &pages, kept: &kept, chains: &chains)
+            result.root = try serialize(root, isRoot: true, allocator: &allocation, fromScratch: fromScratch, entropy: entropy, writeCodec: writeCodec ?? codec,
+                pages: &pages, kept: &kept, chains: &chains, deferral: deferral, remaps: &remaps)
         }
         allocator = allocation
         return TreeWrite(tree: result, root: result.root?.reference ?? PageSealer.nullReference(codec),
-                         pages: pages, keptRoots: kept, keptOverflowHeads: chains)
+                         pages: pages, keptRoots: kept, keptOverflowHeads: chains, remaps: remaps)
     }
 
     private func serialize(_ child: TreeChild, isRoot: Bool = false, allocator: inout PageAllocator, fromScratch: Bool,
-                           entropy: KeyEntropy?, pages: inout [StoredPage], kept: inout Set<UInt32>,
-                           chains: inout [PageReference]) throws -> TreeChild {
-        if !fromScratch, let reference = child.reference { kept.insert(reference.index); return child }
+                           entropy: KeyEntropy?, writeCodec: any PageCodec, pages: inout [StoredPage], kept: inout Set<UInt32>,
+                           chains: inout [PageReference], deferral: InteriorDeferral, remaps: inout [PageRemap]) throws -> TreeChild {
+        if !fromScratch, let reference = child.reference, !deferral.rewrite.contains(reference.index) { kept.insert(reference.index); return child }
         let node = try resolve(child)
         var children: [TreeChild] = []
         for child in node.children {
-            children.append(try serialize(child, allocator: &allocator, fromScratch: fromScratch, entropy: entropy,
-                pages: &pages, kept: &kept, chains: &chains))
+            children.append(try serialize(child, allocator: &allocator, fromScratch: fromScratch, entropy: entropy, writeCodec: writeCodec,
+                pages: &pages, kept: &kept, chains: &chains, deferral: deferral, remaps: &remaps))
+        }
+        if !fromScratch, let origin = node.origin, deferral.retained.contains(origin.index) {
+            for (slot, child) in children.enumerated() {
+                let old = node.children[slot]
+                let unchanged = old.reference != nil || {
+                    if case .resident(let node) = old, let origin = node.origin {
+                        return deferral.retained.contains(origin.index)
+                    }
+                    return false
+                }()
+                if unchanged { continue }
+                remaps.removeAll { $0.parent == origin.index && Int($0.slot) == slot }
+                remaps.append(PageRemap(parent: origin.index, slot: UInt16(slot), target: child.reference!))
+            }
+            remaps.sort { $0.parent == $1.parent ? $0.slot < $1.slot : $0.parent < $1.parent }
+            return .resident(TreeNode(keys: node.keys, children: children, codec: codec, reference: origin))
         }
         guard node.payloadSize <= codec.capacity else { throw JedError("0A000", "tree node exceeds page capacity") }
         // From-scratch: leaf's own id precedes its chains. Incremental: fresh
@@ -644,7 +693,7 @@ internal struct BPlusTree: Sendable {
                     } else { chains.append(head) }
                 }
                 if !pending.isEmpty { record = PackedRecord(key: record.key, cells: record.cells, overflows: pending) }
-                let sealed = try record.sealOverflow(allocator: &allocator, codec: codec, entropy: entropy)
+                let sealed = try record.sealOverflow(allocator: &allocator, codec: writeCodec, entropy: entropy)
                 // The baseline root leaf stays resident. Preserve only payloads
                 // already resident before this commit; inherited disk pointers
                 // remain references. Non-root leaves shed these after sealing.
@@ -657,7 +706,7 @@ internal struct BPlusTree: Sendable {
             payload = try PackedInterior.encodePayload(keys: node.keys, children: children.map { $0.reference! }, codec: codec)
         }
         let index = try earlyIndex ?? allocator.allocate()
-        let sealed = try PageSealer.seal(codec: codec, index: index, type: node.isLeaf ? 2 : 3,
+        let sealed = try PageSealer.seal(codec: writeCodec, index: index, type: node.isLeaf ? 2 : 3,
             count: UInt32(node.entryCount), payload: payload, entropy: entropy)
         if fromScratch { pages.append(sealed.page); pages.append(contentsOf: overflowPages) }
         else { pages.append(contentsOf: overflowPages); pages.append(sealed.page) }

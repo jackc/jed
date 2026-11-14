@@ -384,7 +384,7 @@ internal final class DatabaseCore: Sendable {
                 if !relaxed { try pager.flush(shrink: false) }
                 else { try pager.beforeClientTiming() }
                 let version = state.meta.meta.txid
-                let allowed = (state.pins.keys.min() ?? version) >= state.storage.freeGeneration
+                let allowed = state.storage.canGrantReuse(oldest: state.pins.keys.min() ?? version)
                 let allocation = try pager.allocationSnapshot(reuseAllowed: allowed)
                 let pending = relaxed ? allocation.pending : []
                 let reuse = pending.isEmpty ? [] : Array(allocation.reusableFree.prefix(PageServiceProtocol.maxReusePages))

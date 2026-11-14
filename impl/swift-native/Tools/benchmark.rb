@@ -14,12 +14,12 @@ require "time"
 # and transport references; no default benchmark/CI task imports this module.
 module SwiftNativeBenchmark
   ROOT = SwiftNativeTasks::ROOT
-  BASELINE = "b1a6affca7725e0b07a4f734eddb1c569ef76bcf"
+  BASELINE = "32feb48fd961598c2d7e60f0de284ba619a74ab0"
   WORKLOAD_COUNT = 157
   CORES = %w[swift rust go ts].freeze
   HASHES = {
     "benchmarks.toml" => "8cc81154901f7d89b2738cea9a6687821cd7d59613e10220b9be0779b5ff7c2f",
-    "datasets.toml" => "ad83efd09f71b214f125c6c37206bfd2ceea6c8d43d31a5282b531d55fa82baf",
+    "datasets.toml" => "77e7b55e6a890ad4aac467e35dd5231a7582090dff8cf7398b483709408767ca",
     "spill.toml" => "53c7d9034296e5c6cb03c61f30323f859f034a0ceb8645a49032f00790f084fb"
   }.freeze
   INTEGER_FIELDS = %w[iterations warmup readers total_ns ns_per_op min_ns p50_ns p90_ns p99_ns rows_total].freeze

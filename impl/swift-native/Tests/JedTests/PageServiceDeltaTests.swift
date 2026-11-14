@@ -42,7 +42,7 @@ final class PageServiceDeltaTests: XCTestCase {
         fails { _ = try ServiceIncomingDelta(base: fixed, begin: premature) }
         let manifest = try CommitManifest.build(pageSize: 1024, encrypted: false, txid: fixed.txid + 1,
             root: PageReference(2), pageCount: fixed.pageCount, freeList: PageReference(0), livePages: 1,
-            entries: [ManifestEntry(pageIndex: 2, digest: Checksums.crc64(plan.body[0].bytes))], chain: [])
+            entries: [ManifestEntry(pageIndex: 2, digest: try ManifestIdentity.digest(plan.body[0].bytes, encrypted: false))], chain: [])
         let unsafe = try ServiceCommitBegin(txid: fixed.txid + 1, meta: manifest.meta.encode(inline: manifest.inline), manifest: [])
         fails { _ = try ServiceIncomingDelta(base: fixed, begin: unsafe) }
     }

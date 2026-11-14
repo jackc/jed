@@ -38,7 +38,7 @@ final class GistBoundaryTests: XCTestCase {
                         let end = (Int(page) + 1) * pager.codec.pageSize
                         return Array(bytes[(end - 40)..<(end - 16)])
                     }.makeIterator()
-                    let rebuilt = try opened.tree.serialize(allocator: &allocator, codec: pager.codec,
+                    let rebuilt = try opened.tree.serialize(allocator: &allocator, codec: StampedPageCodec(base: pager.codec, txid: 1),
                         entropy: encrypted ? { count in XCTAssertEqual(count, 24); return try XCTUnwrap(salts.next()) } : nil)
                     XCTAssertEqual(rebuilt.root, index.root, name)
                     XCTAssertEqual(rebuilt.pages.map(\.index), opened.pages, name)

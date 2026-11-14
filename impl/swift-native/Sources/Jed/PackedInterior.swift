@@ -5,7 +5,7 @@ internal struct PackedInterior: Sendable {
     let children: [PageReference]
     let payloadSize: Int
 
-    init(bytes: [UInt8], codec: any PageCodec, pageCount: UInt32) throws {
+    init(bytes: [UInt8], codec: any PageCodec, pageCount: UInt32, parent: UInt32 = 0, remaps: [PageRemap] = []) throws {
         guard bytes.count == codec.pageSize - codec.reservedBytes else {
             throw JedError.corruption("invalid interior page size")
         }
@@ -23,11 +23,14 @@ internal struct PackedInterior: Sendable {
         var seen: Set<UInt32> = []
         for _ in 0...count {
             let index = try reader.u32()
-            guard index >= codec.firstBodyPage, index < pageCount, seen.insert(index).inserted else {
-                throw JedError.corruption("invalid or repeated interior child")
-            }
             let tag = width == 4 ? [] : Array(try reader.take(16))
             children.append(PageReference(index, tag: tag))
+        }
+        children = try PageRemap.resolve(children, parent: parent, entries: remaps)
+        for child in children {
+            guard child.index >= codec.firstBodyPage, child.index < pageCount, seen.insert(child.index).inserted else {
+                throw JedError.corruption("invalid or repeated interior child")
+            }
         }
         var ends: [Int] = [], previous = 0
         let available = codec.capacity - reader.offset - 4 * count

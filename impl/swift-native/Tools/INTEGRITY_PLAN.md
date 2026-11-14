@@ -1,7 +1,7 @@
 # Frozen public integrity acceptance
 
-The authorized 2026-11-12 refresh targets `b1a6affca7725e0b07a4f734eddb1c569ef76bcf`
-(v52, 763 SQL files, 116 database fixtures, 19 saved simulations). See
+The authorized 2026-11-13 refresh targets `32feb48fd961598c2d7e60f0de284ba619a74ab0`
+(v53, 764 SQL files, 121 database fixtures, 19 saved simulations). See
 [current verification](../VERIFICATION.md) for its results and actor provenance.
 The investigation and measurements below retain their original baseline.
 

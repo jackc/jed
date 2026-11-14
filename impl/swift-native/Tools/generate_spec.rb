@@ -14,7 +14,7 @@ require "fileutils"
 
 module SwiftSpecGenerator
   ROOT = File.expand_path("../../..", __dir__)
-  BASELINE = "b1a6affca7725e0b07a4f734eddb1c569ef76bcf"
+  BASELINE = "32feb48fd961598c2d7e60f0de284ba619a74ab0"
   INPUTS = %w[
     spec/integrity/findings.toml
     spec/types/scalars.toml
@@ -75,7 +75,7 @@ module SwiftSpecGenerator
   )
   abort "cannot list frozen conformance corpus: #{corpus_error}" unless corpus_status.success?
   CORPUS_INPUTS = corpus_listing.lines.map(&:strip).select { |path| path.end_with?(".test") }.sort.freeze
-  abort "frozen corpus inventory changed" unless CORPUS_INPUTS.length == 763 &&
+  abort "frozen corpus inventory changed" unless CORPUS_INPUTS.length == 764 &&
     CORPUS_INPUTS.count { |path| path.include?("/concurrency/") } == 7
 
   process_listing, process_error, process_status = Open3.capture3(

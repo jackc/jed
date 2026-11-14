@@ -175,7 +175,7 @@ final class EncryptionTests: XCTestCase {
             expect("XX001") { _ = try codec.openBody(pageIndex: 4, sealed: damaged) }
         }
         let pageKey = try JedCrypto.hkdfSHA256(inputKeyMaterial: key, salt: [], info: Array("jed/v1/page".utf8))
-        for offset in [1, 2, 3, 8, 12] {
+        for offset in [1, 8, 12] {
             var invalid = clear; invalid[offset] = 1
             let sealed = try JedCrypto.xaesSeal(key: pageKey, nonce: nonce, plaintext: invalid,
                                                 aad: hex("4a454442010100000004"))
@@ -201,7 +201,7 @@ final class EncryptionTests: XCTestCase {
     func testMetaAuthenticationBindsSlotAndOrderedManifest() throws {
         let codec = try EncryptedPageCodec(pageSize: 1024, dataKey: Array(repeating: 7, count: 32))
         var meta = [UInt8](repeating: 0, count: 1024)
-        meta.replaceSubrange(0..<8, with: [0x4a, 0x45, 0x44, 0x42, 0, 52, 1, 40])
+        meta.replaceSubrange(0..<8, with: [0x4a, 0x45, 0x44, 0x42, 0, UInt8(MetaPage.version), 1, 40])
         try PageEnvelope.putU32(1024, into: &meta, at: 8)
         let manifest = [ManifestPageBytes(pageIndex: 7, bytes: Array(repeating: 7, count: 1024)),
                         ManifestPageBytes(pageIndex: 5, bytes: Array(repeating: 5, count: 1024))]
