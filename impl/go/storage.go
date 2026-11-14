@@ -852,6 +852,7 @@ func (s *tableStore) demoteCleanLeaves() {
 // overflow chain: the rows in vals, and a lazy root's untouched rows on its base page. A lazy root
 // whose base rows do not decode counts as holding one, so it is re-faulted from the page just written.
 func rootReferencesChains(root *pnode) bool {
+	root.closeGap()
 	if root.lazyBase == nil || !root.lazyBase.hasChains() {
 		return rowsReferenceChains(root.vals)
 	}

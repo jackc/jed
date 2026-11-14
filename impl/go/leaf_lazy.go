@@ -65,7 +65,7 @@ func (n *pnode) stored(i int) (*packedLeaf, int) {
 		return n.packed, i
 	}
 	if n.lazyBase != nil {
-		if at := n.lazy[i]; at >= 0 {
+		if at := n.lazy[n.pi(i)]; at >= 0 {
 			return n.lazyBase, int(at)
 		}
 	}
@@ -236,6 +236,7 @@ func (n *pnode) rowSetChanged() {
 // materialize decodes every row a lazy leaf still reads from its page and copies its keys, making it
 // an ordinary decoded leaf. Only the owning writer calls it.
 func (n *pnode) materialize() error {
+	n.closeGap()
 	rows, err := n.decodedRows()
 	if err != nil {
 		return err
@@ -332,6 +333,7 @@ func rowAllInline(shape leafShape, pcap pageCap, key []byte, row storedRow) bool
 
 // replaceRow replaces row i of a lazy leaf its writer owns.
 func (n *pnode) replaceRow(i int, key []byte, val storedRow, weight uint32, shape leafShape, pcap pageCap) {
+	n.closeGap()
 	wasLazy := n.lazy[i] >= 0
 	var buf [32]bool
 	var changed []bool
@@ -441,6 +443,9 @@ func (p *packedLeaf) regionSaving(c int) int {
 func (n *pnode) forRangeOf(fc forCol) (r forRange, count int) {
 	reg := &n.lazyBase.dirs.regions[fc.col]
 	for i, at := range n.lazy {
+		if at == gapPoison {
+			continue
+		}
 		if at < 0 {
 			if v := n.vals[i][fc.col]; !v.IsNull() {
 				r.add(forSlot(fc, v))
@@ -499,6 +504,7 @@ func (n *pnode) itemAccOf(shape leafShape, pcap pageCap, j int, scratch []dictIt
 	var counts [256]int
 	for i, at := range n.lazy {
 		switch {
+		case at == gapPoison:
 		case at < 0:
 			rowItems(shape, pcap, n.keys[i], n.vals[i], scratch)
 			acc.add(shape, j, scratch[j], nil)
@@ -537,7 +543,7 @@ func (n *pnode) itemAccOf(shape leafShape, pcap pageCap, j int, scratch []dictIt
 // than by newLeafSizes; leafSizesCheck compares the two at every use.
 func (n *pnode) newLazySizes(shape leafShape, pcap pageCap) *leafSizes {
 	sz := &leafSizes{
-		n:        len(n.vals),
+		n:        n.rowCount(),
 		accs:     make([]colAcc, len(shape.itemCols)),
 		fors:     make([]forRange, len(shape.forCols)),
 		forCnt:   make([]int, len(shape.forCols)),
@@ -580,7 +586,7 @@ func newLeafSizesPacked(shape leafShape, pcap pageCap, p *packedLeaf) *leafSizes
 // lazySaving is contentSaving's item and base-plus-offsets part for a lazy leaf.
 func (n *pnode) lazySaving(pcap pageCap, shape leafShape) int {
 	sz := n.sizes
-	if sz == nil || sz.n != len(n.vals) {
+	if sz == nil || sz.n != n.rowCount() {
 		sz = n.newLazySizes(shape, pcap)
 		if n.page == 0 && n.owner != nil {
 			n.sizes = sz // a dirty node is its writer's alone
@@ -597,6 +603,7 @@ func (n *pnode) lazySaving(pcap pageCap, shape leafShape) int {
 	}
 	got := sz.saving(shape, false)
 	if leafSizesCheck.Load() {
+		n.closeGap()
 		rows, err := n.decodedRows()
 		if err != nil {
 			panic(err)
@@ -643,7 +650,7 @@ func (sz *leafSizes) replaceCols(n *pnode, i int, key []byte, val storedRow, sha
 				if sz.forCnt[j] == 0 {
 					*r = forRange{}
 					sz.forStale[j] = false
-				} else if s := forSlot(fc, ov); s == r.lo || s == r.hi {
+				} else if r.forRemoved(forSlot(fc, ov)) {
 					sz.forStale[j] = true
 					sz.stale = true
 				}
@@ -821,6 +828,7 @@ func decodedLeafCopy(n *pnode) (*pnode, error) {
 // encodeLazyLeaf is a dirty lazy leaf's payload: patched from its page when it can be, else the full
 // encoder's over its rows.
 func encodeLazyLeaf(n *pnode, colTypes []colType, keyLen int, seal sealer, take func() uint32, ovf *[]dirtyPage, src *chainSource, memo *compressMemo) ([]byte, error) {
+	n.closeGap()
 	patch, ok := patchLeaf(n, colTypes, keyLen, seal, src)
 	if ok {
 		if n.sameRows {
@@ -992,9 +1000,12 @@ func encodeRegion(ty colType, n int, vb [][]byte, nulls []bool) []byte {
 					r.add(beUint(vb[i]))
 				}
 			}
-			if forSaving(n, w, r.lo, r.hi, r.any) > 0 {
+			if forSaving(n, w, r) > 0 {
 				useFOR, base, bw = true, r.lo, forWidth(w, r.lo, r.hi)
 				out[0] = regionFOR
+				if x := forExcSaving(n, w, r); x > n*(w-bw)-(w+1) {
+					return encodeFORX(w, n, vb, nulls, r) // PROTOTYPE (leaf_forx.go)
+				}
 			}
 		}
 		bm := len(out)

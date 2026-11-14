@@ -264,6 +264,18 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   - [ ] _follow-on:_ an integrity fixture with a stored primary-key column (a `text` key), so `row_key_not_primary_key` is produced again; the v52 fixtures' integer keys are elided and cannot disagree with their rows. _(size: S)_
   - [ ] _follow-on:_ have the integrity check verify the content-dependent choices (the stored prefix is the longest one; each region has its smallest kind). _(size: S)_
   - [ ] _follow-on:_ fixed-length keys for index trees whose key columns are all `NOT NULL` (needs `ALTER TABLE … DROP NOT NULL` to rebuild the index), and a shared prefix in interior pages (leaf-structural.md §5, §7).
+  - [ ] _decide (maintainer):_ **write costs on dense leaves** — measured in Go with prototypes behind
+    default-off switches; the recommendation awaits a decision. #4 (inserts and removes shifting a
+    dirty leaf's arrays): port the shorter-side shift (cascade −29%, range delete −8%, contained in
+    the edit helpers), not the movable gap (cascade −47% but insert +12%, and it touches every site
+    that indexes a dirty leaf). #5 (one widened value splitting a full leaf, `update_untouched_large_rollback`
+    2.3× v51): accept it for now; take the one-exception base-plus-offsets region (kind 6, no density
+    cost, update 0.011 ms vs v51's 0.018) with the next format version; do not adopt slack (+3% to +7%
+    live pages, helps only wide-row leaves). Implementation-only follow-ons either way: split a lazy
+    leaf from its page instead of decoding every row, and size a failed evening candidate from its
+    page. → [leaf-write-cost.md](spec/design/leaf-write-cost.md) _(size: S for the Go shorter side;
+    M for the split path; format v54 with goldens in three cores and the Ruby reference if kind 6 is
+    taken)_
 - [x] **Format v53: deferred interior pages + the narrow commit manifest** — landed 2026-11-13 as one
   change in all three cores and the Ruby reference, with no switches left: a `(parent, slot) → page`
   remap list lets a commit keep an interior whose only change is a child's page (and its catalog

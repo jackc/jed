@@ -1,0 +1,87 @@
+package jed
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+// A base-plus-offsets region with one exception (leaf_forx.go) must read back the rows it was
+// written from, and a leaf's size from its page must equal the size measured from its rows, through
+// inserts, in-place updates that create and remove an outlier, and deletes. The workload runs with
+// the lazy-leaf size and patch cross-checks on, once without exceptions and once with them; the
+// query results must agree.
+func TestLeafFORXRoundTrip(t *testing.T) {
+	saved := leafFORX
+	defer func() { leafFORX = saved }()
+	leafFORX = false
+	plain := forxWorkload(t)
+	leafFORX = true
+	before := forxWritten.Load()
+	if got := forxWorkload(t); got != plain {
+		t.Fatalf("rows with exceptions:\n%s\nwithout:\n%s", got, plain)
+	}
+	if forxWritten.Load() == before {
+		t.Fatal("the workload wrote no region with an exception")
+	}
+}
+
+func forxWorkload(t *testing.T) string {
+	t.Helper()
+	defer leafSizesCheck.Store(leafSizesCheck.Load())
+	defer leafPatchCheck.Store(leafPatchCheck.Load())
+	leafSizesCheck.Store(true)
+	leafPatchCheck.Store(true)
+
+	path := filepath.Join(t.TempDir(), "forx.jed")
+	db, err := CreateDatabase(CreateOptions{Path: path, PageSize: 4096, SkipFsync: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sess := db.Session(SessionOptions{})
+	reopen := func() {
+		t.Helper()
+		sess.Close()
+		if err := db.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if db, err = OpenDatabaseWithOptions(path, OpenOptions{SkipFsync: true}); err != nil {
+			t.Fatal(err)
+		}
+		sess = db.Session(SessionOptions{})
+	}
+	var out strings.Builder
+	query := func(sql string) {
+		t.Helper()
+		for _, row := range renderRows(queryRows(t, sess, sql)) {
+			fmt.Fprintf(&out, "%s\n", strings.Join(row, "|"))
+		}
+	}
+	mustExec(t, sess, "CREATE TABLE f (id bigint PRIMARY KEY, a integer, b bigint, c smallint, d date)")
+	mustExec(t, sess, `INSERT INTO f SELECT x, x % 7, CASE WHEN x % 97 = 0 THEN 9000000000 + x ELSE x % 50 END,
+		CASE WHEN x % 13 = 0 THEN NULL ELSE 3 END, DATE '2024-01-01' + (x % 3) FROM generate_series(1, 3000) AS g(x)`)
+	reopen()
+	mustExec(t, sess, "UPDATE f SET a = 2000000000 WHERE id = 10")
+	mustExec(t, sess, "UPDATE f SET c = -32000 WHERE id = 500")
+	mustExec(t, sess, "UPDATE f SET a = -2000000000 WHERE id IN (1200, 1201)")
+	reopen()
+	query("SELECT count(*), sum(a), sum(b), sum(c), min(d), max(d) FROM f")
+	mustExec(t, sess, "UPDATE f SET a = 3 WHERE id = 10")
+	mustExec(t, sess, "DELETE FROM f WHERE id % 97 = 0 AND id < 1500")
+	mustExec(t, sess, "INSERT INTO f VALUES (5000, 1, 7000000000000, NULL, DATE '1999-12-31')")
+	reopen()
+	query("SELECT count(*), sum(a), sum(b), sum(c), min(d), max(d) FROM f")
+	query("SELECT id, a, b, c, d FROM f WHERE id IN (10, 97, 500, 1200, 1201, 1552, 5000) ORDER BY id")
+	sess.Close()
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkPackedSizes(t, file, "f")
+	return out.String()
+}

@@ -1152,6 +1152,7 @@ func serializeNode(n *pnode, store *tableStore, nextIndex uint32, body *pageSink
 		pageType = pageInterior
 		payload = encodeInterior(n.keys, childPages, pcap)
 	} else {
+		n.closeGap()
 		// A leaf may be Packed here: a demand-paged load keeps leaves as page blocks and toImage
 		// re-serializes them. Materialize through the seam (decodedRows reconstructs a Packed leaf,
 		// clones a Decoded one). A deferred large value is written from its stored bytes, its chain
@@ -1538,6 +1539,7 @@ func serializeDirty(n *pnode, colTypes []colType, keyLen int, memo *compressMemo
 		pageType = pageInterior
 		payload = encodeInterior(n.keys, childPages, seal.cap)
 	} else {
+		n.closeGap()
 		src := &chainSource{paging: paging, share: true}
 		var err error
 		var tabs []*symTable
@@ -6179,6 +6181,17 @@ func parsePaxLeaf(payload []byte, n int, colTypes []colType) (*paxLeaf, error) {
 				putBEUint(body[i*w:(i+1)*w], base+beUint(payload[p+i*bw:p+(i+1)*bw]))
 			}
 			regions[c] = paxRegion{width: w, bitmap: bitmap, body: body, stored: end - start}
+			start = end
+			continue
+		}
+		if w, fixed := fixedValueWidth(ty); fixed && flags == regionFORX && leafFORX && forEligible(ty) {
+			// PROTOTYPE (leaf_forx.go): base plus offsets with one exception.
+			r, err := parseFORX(payload, p, end, n, w)
+			if err != nil {
+				return nil, err
+			}
+			r.stored = end - start
+			regions[c] = r
 			start = end
 			continue
 		}

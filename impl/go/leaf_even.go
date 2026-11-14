@@ -1,6 +1,13 @@
 package jed
 
-import "bytes"
+import (
+	"bytes"
+	"os"
+)
+
+// leafEvenOff turns evening out off (JED_LEAF_EVEN=off), to measure what it costs
+// (spec/design/leaf-write-cost.md). It changes split decisions, so file bytes; on by default.
+var leafEvenOff = os.Getenv("JED_LEAF_EVEN") == "off"
 
 // leafEvenRoom sets the room a sibling needs to take part in evening out: C/leafEvenRoom bytes free
 // (spec/fileformat/format.md "Evening out with a sibling").

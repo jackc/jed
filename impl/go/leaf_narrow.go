@@ -267,21 +267,29 @@ func forWidth(w int, lo, hi uint64) int {
 
 // forSaving is the bytes a column of width w saves in a leaf of n records whose present values span
 // [lo, hi] (any reports whether one is present): 0 when the plain region is no larger.
-func forSaving(n, w int, lo, hi uint64, any bool) int {
-	if !any {
+func forSaving(n, w int, r forRange) int {
+	lo, hi := r.lo, r.hi
+	if !r.any {
 		lo, hi = 0, 0
 	}
 	bw := forWidth(w, lo, hi)
-	if s := n*(w-bw) - (w + 1); s > 0 {
+	s := n*(w-bw) - (w + 1)
+	if x := forExcSaving(n, w, r); x > s {
+		s = x // PROTOTYPE (leaf_forx.go)
+	}
+	if s > 0 {
 		return s
 	}
 	return 0
 }
 
-// forRange accumulates the span of a column's present values.
+// forRange accumulates the span of a column's present values. PROTOTYPE (leaf_forx.go): lo2 and hi2
+// are the second smallest and second largest of them (as a multiset), valid once two is set.
 type forRange struct {
-	lo, hi uint64
-	any    bool
+	lo, hi   uint64
+	any      bool
+	lo2, hi2 uint64
+	two      bool
 }
 
 func (r *forRange) add(v uint64) {
@@ -289,11 +297,29 @@ func (r *forRange) add(v uint64) {
 		r.lo, r.hi, r.any = v, v, true
 		return
 	}
+	if !r.two {
+		r.two = true
+		if v < r.lo {
+			r.lo2, r.lo = r.lo, v
+		} else {
+			r.lo2 = v
+		}
+		if v > r.hi {
+			r.hi2, r.hi = r.hi, v
+		} else {
+			r.hi2 = v
+		}
+		return
+	}
 	if v < r.lo {
-		r.lo = v
+		r.lo2, r.lo = r.lo, v
+	} else if v < r.lo2 {
+		r.lo2 = v
 	}
 	if v > r.hi {
-		r.hi = v
+		r.hi2, r.hi = r.hi, v
+	} else if v > r.hi2 {
+		r.hi2 = v
 	}
 }
 
@@ -307,7 +333,7 @@ func rowsFORSaving(cols []forCol, rows []storedRow) int {
 				r.add(forSlot(fc, v))
 			}
 		}
-		total += forSaving(len(rows), fc.w, r.lo, r.hi, r.any)
+		total += forSaving(len(rows), fc.w, r)
 	}
 	return total
 }
@@ -324,7 +350,7 @@ func packedFORSaving(cols []forCol, l *paxLeaf, n int) int {
 			}
 			r.add(beUint(reg.body[i*fc.w : (i+1)*fc.w]))
 		}
-		total += forSaving(n, fc.w, r.lo, r.hi, r.any)
+		total += forSaving(n, fc.w, r)
 	}
 	return total
 }
@@ -816,7 +842,7 @@ func (sz *leafSizes) removeRow(shape leafShape, pcap pageCap, key []byte, row st
 		if sz.forCnt[j] == 0 {
 			*r = forRange{}
 			sz.forStale[j] = false
-		} else if s := forSlot(fc, v); s == r.lo || s == r.hi {
+		} else if r.forRemoved(forSlot(fc, v)) {
 			sz.forStale[j] = true
 			sz.stale = true
 		}
@@ -835,6 +861,9 @@ func (sz *leafSizes) refresh(shape leafShape, rows []storedRow) {
 		}
 		var r forRange
 		for _, row := range rows {
+			if row == nil {
+				continue // PROTOTYPE (leaf_edit.go): an empty slot of a gap
+			}
 			if v := row[fc.col]; !v.IsNull() {
 				r.add(forSlot(fc, v))
 			}
@@ -864,10 +893,10 @@ func (sz *leafSizes) saving(shape leafShape, sym bool) int {
 			continue
 		}
 		if sz.forStale[j] {
-			total += forSaving(sz.n, fc.w, 0, 0, true)
+			total += forSaving(sz.n, fc.w, forRange{any: true})
 			continue
 		}
-		total += forSaving(sz.n, fc.w, sz.fors[j].lo, sz.fors[j].hi, sz.fors[j].any)
+		total += forSaving(sz.n, fc.w, sz.fors[j])
 	}
 	for j, c := range shape.itemCols {
 		if sz.itemFrozen != nil && sz.itemFrozen[j] {

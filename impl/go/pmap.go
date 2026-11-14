@@ -40,6 +40,8 @@ import (
 type mutationGeneration struct {
 	active atomic.Bool
 	_      byte
+	// PROTOTYPE (leaf_edit.go): the leaves holding a gap, closed when the generation is frozen.
+	gapped []*pnode
 }
 
 func newMutationGeneration() *mutationGeneration {
@@ -104,6 +106,8 @@ type pnode struct {
 	sameRows bool
 	patchOK  bool
 	colDirty []bool
+	// PROTOTYPE (leaf_edit.go): edit is the dirty leaf's array-edit state (nil: none).
+	edit *leafEdit
 }
 
 // ref is this node's page and tag (the zero pageRef while dirty).
@@ -124,7 +128,7 @@ func (n *pnode) rowAt(i int) (storedRow, error) {
 	if pk, at := n.stored(i); pk != nil {
 		return pk.row(at)
 	}
-	return n.vals[i], nil
+	return n.vals[n.pi(i)], nil
 }
 
 // colAt reconstructs ONLY column c of row i — the touched-column path (packed-leaf.md §4/§6, the
@@ -133,7 +137,7 @@ func (n *pnode) colAt(i, c int) (Value, error) {
 	if pk, at := n.stored(i); pk != nil {
 		return pk.value(c, at)
 	}
-	return n.vals[i][c], nil
+	return n.vals[n.pi(i)][c], nil
 }
 
 // colAtResolved is colAt with a deferred value resolved — for a reader that uses the value now. A
@@ -143,7 +147,7 @@ func (n *pnode) colAtResolved(i, c int) (Value, error) {
 	if pk, at := n.stored(i); pk != nil {
 		return pk.valueResolved(c, at)
 	}
-	v := n.vals[i][c]
+	v := n.vals[n.pi(i)][c]
 	if v.Kind == ValUnfetched {
 		return resolveUnfetchedSelf(v.unfetched())
 	}
@@ -228,7 +232,7 @@ func (n *pnode) colIsNull(i, c int) bool {
 	if pk, at := n.stored(i); pk != nil {
 		return pk.dirs.isNull(c, at)
 	}
-	return n.vals[i][c].IsNull()
+	return n.vals[n.pi(i)][c].IsNull()
 }
 
 // colSpan returns the stored bytes of column c of row i, borrowed from a Packed leaf's page (Track
@@ -250,7 +254,7 @@ func (n *pnode) colSpan(i, c int) (span []byte, present, ok bool) {
 func (n *pnode) recordScanUnits(i int, colTypes []colType, capacity pageCap, mask []bool) (pages, decompress int) {
 	pk, at := n.stored(i)
 	if pk == nil {
-		return recordScanUnits(colTypes, n.keyAt(i), n.vals[i], capacity, mask)
+		return recordScanUnits(colTypes, n.keyAt(i), n.vals[n.pi(i)], capacity, mask)
 	}
 	for c, ty := range colTypes {
 		if !mask[c] {
@@ -285,7 +289,7 @@ func spillUnitCols(colTypes []colType, mask []bool) []int {
 func (n *pnode) recordScanUnitsCols(i int, cols []int, colTypes []colType, capacity pageCap, mask []bool) (pages, decompress int) {
 	pk, at := n.stored(i)
 	if pk == nil {
-		return recordScanUnits(colTypes, n.keyAt(i), n.vals[i], capacity, mask)
+		return recordScanUnits(colTypes, n.keyAt(i), n.vals[n.pi(i)], capacity, mask)
 	}
 	for _, c := range cols {
 		if span, present := pk.valueSpan(c, at); present && len(span) > 0 && span[0] != 0x00 {
@@ -299,6 +303,7 @@ func (n *pnode) recordScanUnitsCols(i int, cols []int, colTypes []colType, capac
 // (packed-leaf.md §7). A Decoded leaf clones vals; a Packed leaf reconstructs every row so the
 // rebuilt node is Decoded (buildLeaf / nodeInsert / nodeRemove / mergeAt then run unchanged).
 func (n *pnode) decodedRows() ([]storedRow, error) {
+	n.closeGap()
 	if n.packed == nil && n.lazyBase == nil {
 		return cloneVals(n.vals), nil
 	}
@@ -317,7 +322,7 @@ func (n *pnode) keyLen() int {
 	if n.packed != nil {
 		return n.packed.n
 	}
-	return len(n.keys)
+	return len(n.keys) - n.gapSize()
 }
 
 // keyAt returns key i as a borrowed span; a Packed leaf's span points into its retained page block.
@@ -325,12 +330,13 @@ func (n *pnode) keyAt(i int) []byte {
 	if n.packed != nil {
 		return n.packed.key(i)
 	}
-	return n.keys[i]
+	return n.keys[n.pi(i)]
 }
 
 // keyViews returns the leaf keys as a transient slice of borrowed spans for serialization. Packed
 // leaves allocate only this short-lived directory; the resident node still owns no per-key objects.
 func (n *pnode) keyViews() [][]byte {
+	n.closeGap()
 	if n.packed == nil {
 		return n.keys
 	}
@@ -345,7 +351,7 @@ func (n *pnode) weightAt(i int) uint32 {
 	if n.packed != nil {
 		return n.packed.recordWeight(i)
 	}
-	return n.weights[i]
+	return n.weights[n.pi(i)]
 }
 
 func (n *pnode) totalWeight() int {
@@ -370,6 +376,7 @@ func (n *pnode) totalWeight() int {
 
 // decodedParts materializes a leaf once at the Packed→Decoded mutation boundary.
 func (n *pnode) decodedParts() ([][]byte, []storedRow, []uint32, error) {
+	n.closeGap()
 	if n.packed == nil {
 		if n.lazyBase != nil {
 			rows, err := n.decodedRows()
@@ -399,6 +406,7 @@ func (n *pnode) decodedParts() ([][]byte, []storedRow, []uint32, error) {
 // leafParts returns a leaf's keys, rows, and weights for reading only: a Decoded leaf's own slices,
 // which the caller must not modify, or a Packed leaf's freshly decoded parts.
 func (n *pnode) leafParts() ([][]byte, []storedRow, []uint32, error) {
+	n.closeGap()
 	if n.packed == nil && n.lazyBase == nil {
 		return n.keys, n.vals, n.weights, nil
 	}
@@ -563,7 +571,8 @@ func (n *pnode) contentSaving(pcap pageCap, shape leafShape) int {
 		} else {
 			sym := n.needsSym(pcap, shape)
 			sz := n.sizes
-			if sz == nil || sz.n != len(n.vals) || (sym && !sz.coded) {
+			if sz == nil || sz.n != n.rowCount() || (sym && !sz.coded) {
+				n.closeGap()
 				var tabs []*symTable
 				if sym {
 					tabs = n.symTabs
@@ -578,8 +587,12 @@ func (n *pnode) contentSaving(pcap pageCap, shape leafShape) int {
 					}
 				}
 			}
+			if sz.stale {
+				n.closeGap() // PROTOTYPE (leaf_edit.go): refresh reads every slot
+			}
 			sz.refresh(shape, n.vals)
 			if leafSizesCheck.Load() {
+				n.closeGap()
 				var tabs []*symTable
 				if sym {
 					tabs = n.symTabs
@@ -606,6 +619,7 @@ func (n *pnode) leafTabs(pcap pageCap, shape leafShape) []*symTable {
 	if !shape.hasSym || !n.isLeaf() {
 		return nil
 	}
+	n.closeGap()
 	if n.packed != nil {
 		return packedTabs(n.packed.dirs)
 	}
@@ -641,7 +655,7 @@ func (n *pnode) payloadAtMost(limit int, pcap pageCap, shape leafShape) bool {
 	if plain <= limit {
 		return true
 	}
-	if sz := n.sizes; sz != nil && sz.stale && n.packed == nil && sz.n == len(n.vals) && !n.needsSym(pcap, shape) {
+	if sz := n.sizes; sz != nil && sz.stale && n.packed == nil && sz.n == n.rowCount() && !n.needsSym(pcap, shape) {
 		// A stale range overstates the saving: when even that leaves the leaf above the limit, the
 		// columns need no rescan.
 		c := n.keyLen()
@@ -730,6 +744,13 @@ func (m *pMap) clone() pMap {
 // further in-place mutation. It does not walk the tree and is safe to call repeatedly/concurrently.
 func (m *pMap) freezeMutationGeneration() {
 	if m.generation != nil {
+		if leafEditMode == leafEditGap {
+			// Only the writer can hold the active token, so only it wins the swap and touches its nodes.
+			if m.generation.active.CompareAndSwap(true, false) {
+				m.generation.closeGaps()
+			}
+			return
+		}
 		m.generation.active.Store(false)
 	}
 }
@@ -1469,7 +1490,7 @@ func (c *rangeCursor) nextInto(dst *storedRow) (key []byte, row storedRow, ok bo
 			} else {
 				// Decoded leaves belong to the immutable snapshot. Never resolve or
 				// overwrite their shared row in place.
-				row = append((*dst)[:0], fr.node.vals[p]...)
+				row = append((*dst)[:0], fr.node.vals[fr.node.pi(p)]...)
 			}
 			if err != nil {
 				return nil, nil, false, err
@@ -1668,7 +1689,7 @@ func splitPointRunning(keys [][]byte, vals []storedRow, items [][]dictItem, scan
 	saved := func(count int) int {
 		s := 0
 		for j, fc := range shape.forCols {
-			s += forSaving(count, fc.w, fors[j].lo, fors[j].hi, fors[j].any)
+			s += forSaving(count, fc.w, fors[j])
 		}
 		for j := range shape.itemCols {
 			if shape.itemArr[j] != 0 || shape.itemTab[j] != nil {
@@ -1680,17 +1701,25 @@ func splitPointRunning(keys [][]byte, vals []storedRow, items [][]dictItem, scan
 		return s
 	}
 	mMax, mBalanced := 0, 0
+	// PROTOTYPE (leaf_slack.go): a right-edge split leaves the left leaf at most C - slack full.
+	slackLim, mSlack := cap.c, 0
+	if rightEdge && leafSlack > 0 {
+		slackLim = cap.c - cap.c/leafSlack
+	}
 	for m := 1; m <= n-1; m++ {
 		add(m-1, true)
 		// A half is no larger than its records and overhead (a one-key prefix costs up to two
 		// bytes), so a boundary whose bound decides neither test is not measured.
-		if bound := prefix[m] + leafOverhead(m, shape) + 2; bound <= cap.c && (mBalanced != 0 || 2*bound < payload) {
-			mMax = m
+		if bound := prefix[m] + leafOverhead(m, shape) + 2; bound <= slackLim && (mBalanced != 0 || 2*bound < payload) {
+			mMax, mSlack = m, m
 			continue
 		}
 		left := prefix[m] + leafOverhead(m, shape) - leafPrefixSaving(m, keys[0], keys[m-1]) - saved(m)
 		if left > cap.c {
 			break
+		}
+		if left <= slackLim {
+			mSlack = m
 		}
 		mMax = m
 		if mBalanced == 0 && 2*left >= payload {
@@ -1710,6 +1739,9 @@ func splitPointRunning(keys [][]byte, vals []storedRow, items [][]dictItem, scan
 		m := mMax
 		if !rightEdge && mBalanced != 0 {
 			m = mBalanced
+		}
+		if rightEdge && mSlack > 0 {
+			m = mSlack
 		}
 		for i := n - 1; i >= m; i-- {
 			add(i, false)
@@ -1735,6 +1767,9 @@ func splitPointRunning(keys [][]byte, vals []storedRow, items [][]dictItem, scan
 	m := mMax
 	if !rightEdge && mBalanced != 0 {
 		m = mBalanced
+	}
+	if rightEdge && mSlack > 0 {
+		m = mSlack
 	}
 	if m < mMin {
 		m = mMin
@@ -1907,7 +1942,7 @@ func buildLeaf(keys [][]byte, vals []storedRow, weights []uint32, cap pageCap, s
 		total := 0
 		for j, fc := range shape.forCols {
 			r := spans[j][at]
-			total += forSaving(count, fc.w, r.lo, r.hi, r.any)
+			total += forSaving(count, fc.w, r)
 		}
 		for j, c := range shape.itemCols {
 			total += itemSaving(shape, j, count, facts[j][at], tabFor(tabs, c), true)
@@ -1928,6 +1963,17 @@ func buildLeaf(keys [][]byte, vals []storedRow, weights []uint32, cap pageCap, s
 		return tabs
 	}
 	m, ok := splitPoint(1, n-1, payload, cap.c, edited == n-1, leftpayload, rightpayload)
+	if ok && edited == n-1 && leafSlack > 0 {
+		// PROTOTYPE (leaf_slack.go): the largest left leaf within C - C/d, when one is.
+		for k := m; k >= 1; k-- {
+			if leftpayload(k) <= cap.c-cap.c/leafSlack {
+				if rightpayload(k) <= cap.c {
+					m = k
+				}
+				break
+			}
+		}
+	}
 	if fastM >= 0 && (fastOK != ok || (ok && fastM != m)) {
 		panic(fmt.Sprintf("BUG: the running split point is %d (%v), the tabled one %d (%v)", fastM, fastOK, m, ok))
 	}
@@ -2041,35 +2087,31 @@ func nodeInsert(n *pnode, key []byte, val storedRow, weight uint32, old *storedR
 					}
 					n.replaceRow(i, key, val, weight, shape, cap)
 				} else {
+					p := n.pi(i)
 					if old != nil {
-						*old = n.vals[i]
+						*old = n.vals[p]
 					}
 					if sz := n.sizes; sz != nil {
 						// The facts follow the row: the old one out, the new one in.
 						// Facts with a dictionary kept as distinct cannot take a row: they are dropped, and
 						// the leaf is measured again only if its plain size no longer decides.
-						if !sz.distinct && sz.n == len(n.vals) && sz.removeRow(shape, cap, key, n.vals[i]) {
+						if !sz.distinct && sz.n == n.rowCount() && sz.removeRow(shape, cap, key, n.vals[p]) {
 							sz.addRow(shape, cap, key, val)
 						} else {
 							n.sizes = nil
 						}
 					}
-					n.vals[i] = val
-					n.wsum += int(weight) - int(n.weights[i])
-					n.weights[i] = weight
+					n.vals[p] = val
+					n.wsum += int(weight) - int(n.weights[p])
+					n.weights[p] = weight
 				}
 			} else {
 				if sz := n.sizes; sz != nil && sz.distinct {
 					n.sizes = nil // see the replacement above
 				}
-				n.keys = insertKeyAtMutable(n.keys, i, key)
-				n.vals = insertValAtMutable(n.vals, i, val)
-				n.weights = insertWeightAtMutable(n.weights, i, weight)
+				n.editInsert(i, key, val, weight, generation)
 				n.wsum += int(weight)
 				if n.lazyBase != nil {
-					n.lazy = append(n.lazy, 0)
-					copy(n.lazy[i+1:], n.lazy[i:])
-					n.lazy[i] = -1
 					n.rowSetChanged()
 					if n.patchOK && !rowAllInline(shape, cap, key, val) {
 						n.patchOK = false
@@ -2082,6 +2124,7 @@ func nodeInsert(n *pnode, key []byte, val storedRow, weight uint32, old *storedR
 			if n.payloadAtMost(cap.c, cap, shape) || n.keyLen() < 2 {
 				return insOut{whole: n}, nil
 			}
+			n.closeGap()
 			if n.lazyBase != nil {
 				// A split needs every row.
 				if err := n.materialize(); err != nil {
@@ -2130,7 +2173,7 @@ func nodeInsert(n *pnode, key []byte, val storedRow, weight uint32, old *storedR
 			n.children[i] = residentRef(sub.whole)
 			return insOut{whole: n}, nil
 		}
-		if childNode.isLeaf() && len(sub.more) == 0 {
+		if childNode.isLeaf() && len(sub.more) == 0 && !leafEvenOff {
 			// Even the leaf out with a sibling before accepting its two-way split (leaf_even.go).
 			j, ev, ok, err := evenLeaves(n, i, sub, key, generation, src, cap, shape)
 			if err != nil {
@@ -2163,7 +2206,7 @@ func nodeInsert(n *pnode, key []byte, val storedRow, weight uint32, old *storedR
 		origin, same := originOf(n)
 		return insOut{whole: &pnode{keys: cloneKeys(n.keys), children: children, owner: generation, origin: origin, sameKeys: same}}, nil
 	}
-	if childNode.isLeaf() && len(sub.more) == 0 {
+	if childNode.isLeaf() && len(sub.more) == 0 && !leafEvenOff {
 		j, ev, ok, err := evenLeaves(n, i, sub, key, generation, src, cap, shape)
 		if err != nil {
 			return insOut{}, err
@@ -2218,7 +2261,7 @@ func nodeRemove(n *pnode, key []byte, want bool, generation *mutationGeneration,
 			n.trackWeight()
 			if n.lazyBase != nil {
 				sz := n.sizes
-				exact := sz != nil && sz.frozen == 0 && sz.n == len(n.vals)
+				exact := sz != nil && sz.frozen == 0 && sz.n == n.rowCount()
 				if want || exact {
 					row, err := n.rowAt(i)
 					if err != nil {
@@ -2230,22 +2273,16 @@ func nodeRemove(n *pnode, key []byte, want bool, generation *mutationGeneration,
 				if sz != nil && !(exact && sz.removeRow(shape, cap, key, removed)) {
 					n.sizes = nil
 				}
-				copy(n.lazy[i:], n.lazy[i+1:])
-				n.lazy = n.lazy[:len(n.lazy)-1]
 				n.rowSetChanged()
-				n.wsum -= int(n.weights[i])
-				n.keys = removeKeyAtMutable(n.keys, i)
-				n.vals, _ = removeValAtMutable(n.vals, i)
-				n.weights = removeWeightAtMutable(n.weights, i)
+				n.wsum -= int(n.weights[n.pi(i)])
+				n.editRemove(i, generation)
 				return n, removed, true, nil
 			}
-			if sz := n.sizes; sz != nil && !(sz.n == len(n.vals) && sz.removeRow(shape, cap, key, n.vals[i])) {
+			if sz := n.sizes; sz != nil && !(sz.n == n.rowCount() && sz.removeRow(shape, cap, key, n.vals[n.pi(i)])) {
 				n.sizes = nil
 			}
-			n.wsum -= int(n.weights[i])
-			n.keys = removeKeyAtMutable(n.keys, i)
-			n.vals, removed = removeValAtMutable(n.vals, i)
-			n.weights = removeWeightAtMutable(n.weights, i)
+			n.wsum -= int(n.weights[n.pi(i)])
+			removed = n.editRemove(i, generation)
 			return n, removed, true, nil
 		}
 		keys, rows, weights, err := n.decodedParts()
