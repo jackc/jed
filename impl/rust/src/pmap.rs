@@ -284,6 +284,14 @@ pub(crate) struct Node {
     /// a plaintext file and while the node is dirty. Set with the page id by the commit that seals
     /// the node, so a parent written later binds it.
     tag: [AtomicU64; 2],
+    /// PROTOTYPE (spec/design/deferred-interior.md §9.4): the persisted page a dirty interior replaces
+    /// one for one in its parent's slot ([`PageRef::NONE`]: none -- a split or merge product, or a
+    /// leaf, whose origin no decision reads), and whether its separators are still that page's, so
+    /// only its child pointers differ. Inherited through every copy; any separator edit clears
+    /// `same_keys`. Mirrors the Go core's `origin` / `sameKeys` site for site, because the commit's
+    /// retention decision -- and so its bytes -- depends on them.
+    pub(crate) origin: PageRef,
+    pub(crate) same_keys: bool,
 }
 
 fn tag_words(tag: &crate::crypto::Tag) -> [AtomicU64; 2] {
@@ -307,6 +315,8 @@ impl Node {
             sizes: Mutex::new(None),
             page: AtomicU32::new(0),
             tag: tag_words(&crate::crypto::NO_TAG),
+            origin: PageRef::NONE,
+            same_keys: false,
         })
     }
 
@@ -336,6 +346,12 @@ impl Node {
         Arc::new(Node::interior(keys, children))
     }
 
+    /// A fresh dirty interior with no origin -- what the deferred-interior fold writes in place of a
+    /// stale page and each of its ancestors (format.rs `remap::unstale`).
+    pub(crate) fn new_interior_fresh(keys: Vec<Vec<u8>>, children: Vec<Child>) -> Arc<Node> {
+        Node::new_interior(keys, children)
+    }
+
     /// The bare dirty interior behind [`Node::new_interior`], for a caller that edits it before
     /// sharing it (the delete path-copy rebalances the rebuilt parent in place).
     fn interior(keys: Vec<Vec<u8>>, children: Vec<Child>) -> Node {
@@ -351,6 +367,8 @@ impl Node {
             sizes: Mutex::new(None),
             page: AtomicU32::new(0),
             tag: tag_words(&crate::crypto::NO_TAG),
+            origin: PageRef::NONE,
+            same_keys: false,
         }
     }
 
@@ -374,6 +392,8 @@ impl Node {
             sizes: Mutex::new(None),
             page: AtomicU32::new(page.page),
             tag: tag_words(&page.tag),
+            origin: PageRef::NONE,
+            same_keys: false,
         })
     }
 
@@ -397,6 +417,8 @@ impl Node {
             sizes: Mutex::new(None),
             page: AtomicU32::new(page.page),
             tag: tag_words(&page.tag),
+            origin: PageRef::NONE,
+            same_keys: false,
         })
     }
 
@@ -416,7 +438,36 @@ impl Node {
             sizes: Mutex::new(None),
             page: AtomicU32::new(page.page),
             tag: tag_words(&page.tag),
+            origin: PageRef::NONE,
+            same_keys: false,
         }
+    }
+
+    /// PROTOTYPE (deferred-interior.md §9.4): the persisted page a copy of this node replaces, and
+    /// whether the copy's separators are still that page's -- this node's own page when it is
+    /// persisted, else what it inherited. The Go core's `originOf`.
+    pub(crate) fn origin_of(&self) -> (PageRef, bool) {
+        let r = self.page_ref();
+        if r.page != 0 {
+            (r, true)
+        } else {
+            (self.origin, self.same_keys)
+        }
+    }
+
+    /// A dirty interior copy of `from` with these separators and children, inheriting its origin;
+    /// `same_keys` is kept only when the separators are `from`'s unchanged.
+    fn copy_interior(
+        from: &Node,
+        keys: Vec<Vec<u8>>,
+        children: Vec<Child>,
+        keys_unchanged: bool,
+    ) -> Node {
+        let mut n = Node::interior(keys, children);
+        let (origin, same) = from.origin_of();
+        n.origin = origin;
+        n.same_keys = same && keys_unchanged;
+        n
     }
 
     /// This node's page and tag ([`PageRef::NONE`] while dirty).
@@ -847,6 +898,8 @@ impl Node {
             sizes: Mutex::new(None),
             page: AtomicU32::new(0),
             tag: tag_words(&crate::crypto::NO_TAG),
+            origin: PageRef::NONE,
+            same_keys: false,
         };
         out.set_page_ref(self.page_ref());
         Ok(out)
@@ -871,6 +924,8 @@ impl Node {
             sizes: Mutex::new(None),
             page: AtomicU32::new(0),
             tag: tag_words(&crate::crypto::NO_TAG),
+            origin: PageRef::NONE,
+            same_keys: false,
         };
         if let Some(p) = &node.packed {
             let n = p.len();
@@ -1779,6 +1834,18 @@ impl PMap {
     /// The root node, for the serializer (format.rs). `None` for an empty map.
     pub(crate) fn root(&self) -> Option<&Arc<Node>> {
         self.root.as_ref()
+    }
+
+    /// PROTOTYPE (deferred-interior.md §9.4): the fold -- replace the root with a copy whose stale
+    /// interiors and their ancestors are dirty, when any is stale.
+    pub(crate) fn unstale(&mut self, parents: &std::collections::HashSet<u32>) {
+        if let Some(r) = self
+            .root
+            .as_ref()
+            .and_then(|root| crate::format::remap::unstale(root, parents))
+        {
+            self.root = Some(r);
+        }
     }
 
     /// Replace the root with an equivalent node — the same page, freshly faulted
@@ -2720,6 +2787,7 @@ fn node_insert(
                         even_leaves(node, i, &mut left, &mut right, right_edge, src, cap, shape)?
                 {
                     node.keys[j] = even_sep;
+                    node.same_keys = false;
                     node.children[j] = Child::Resident(l);
                     node.children[j + 1] = Child::Resident(r);
                     return Ok(Ins::Kept);
@@ -2733,6 +2801,7 @@ fn node_insert(
                     right,
                     more,
                 );
+                node.same_keys = false;
                 let payload = interior_payload(cap, &node.keys);
                 if payload <= cap.c || node.keys.len() < 2 {
                     Ok(Ins::Kept)
@@ -2764,13 +2833,23 @@ fn node_insert(
         Ins::Kept => {
             let mut children = node.children.clone();
             children[i] = Child::Resident(c);
-            Ok(Ins::Whole(Node::new_interior(node.keys.clone(), children)))
+            Ok(Ins::Whole(Arc::new(Node::copy_interior(
+                node,
+                node.keys.clone(),
+                children,
+                true,
+            ))))
         }
         Ins::Whole(c) => {
             // This node's separators are unchanged, so it cannot overflow — rebuild whole.
             let mut children = node.children.clone();
             children[i] = Child::Resident(c);
-            Ok(Ins::Whole(Node::new_interior(node.keys.clone(), children)))
+            Ok(Ins::Whole(Arc::new(Node::copy_interior(
+                node,
+                node.keys.clone(),
+                children,
+                true,
+            ))))
         }
         Ins::Split {
             mut left,
@@ -2788,11 +2867,20 @@ fn node_insert(
                 keys[j] = even_sep;
                 children[j] = Child::Resident(l);
                 children[j + 1] = Child::Resident(r);
-                return Ok(Ins::Whole(Node::new_interior(keys, children)));
+                return Ok(Ins::Whole(Arc::new(Node::copy_interior(
+                    node, keys, children, false,
+                ))));
             }
             let edited = absorb_split(&mut keys, &mut children, i, left, sep, right, more);
-            Ok(build_interior(keys, children, cap, Some(edited), true)
-                .expect("insert-path interior split always has a valid split point"))
+            let mut out = build_interior(keys, children, cap, Some(edited), true)
+                .expect("insert-path interior split always has a valid split point");
+            // A rebuild that did not split still replaces this node one for one, with new separators.
+            if let Ins::Whole(w) = &mut out {
+                Arc::get_mut(w)
+                    .expect("a fresh interior is unshared")
+                    .origin = node.origin_of().0;
+            }
+            Ok(out)
         }
     }
 }
@@ -2890,7 +2978,7 @@ fn node_remove(
     }
     let mut children = node.children.clone();
     children[i] = Child::Resident(c);
-    let mut rebuilt = Node::interior(node.keys.clone(), children);
+    let mut rebuilt = Node::copy_interior(node, node.keys.clone(), children, true);
     rebalance_child(&mut rebuilt, i, src, cap, shape)?;
     *node = Arc::new(rebuilt);
     Ok(removed)
@@ -2918,6 +3006,7 @@ fn rebalance_child(
     }
     let child = node.children[i].resident();
     if !child.is_leaf() && empty_unary_subtree(child) {
+        node.same_keys = false;
         node.keys.remove(i.min(node.keys.len() - 1));
         node.children.remove(i);
         return Ok(());
@@ -3129,6 +3218,8 @@ fn merge_at(
         }
     };
 
+    // Past every abandon rule: the parent's separators change.
+    node.same_keys = false;
     match merged {
         Ins::Kept | Ins::Exists => unreachable!("fresh merge builders never edit an existing node"),
         Ins::Whole(m) => {

@@ -112,6 +112,15 @@ pub(crate) fn manifest_page_header_ok(page: &[u8], txid: u64) -> bool {
     page[1] == 0 && u16::from_be_bytes([page[2], page[3]]) == stamp_of(txid)
 }
 
+/// Whether a listed page still carries the identity its manifest entry records. A narrow plaintext
+/// entry is a copy of the page's own header checksum, so the page must also still verify against that
+/// checksum (manifest-crc32.md §2); a wide entry hashes the whole page, and an encrypted page's
+/// ciphertext digest is the whole keyless check.
+fn listed_page_matches(page: &[u8], encrypted: bool, narrow: bool, expected: u64) -> bool {
+    page_digest(page, encrypted, narrow) == expected
+        && (encrypted || !narrow || crate::format::page_crc(page) == u32_at(page, 12))
+}
+
 fn read_entry(e: &[u8], narrow: bool) -> (u32, u64) {
     let digest = if narrow {
         u64::from(u32_at(e, 4))
@@ -188,10 +197,13 @@ fn u64_at(b: &[u8], at: usize) -> u64 {
 /// The byte range of a meta page of `ps` bytes that holds its inline manifest: after the header,
 /// before an encrypted meta's reserve.
 fn inline_area(ps: usize, encrypted: bool) -> (usize, usize) {
+    // Under the deferred-interior layout the remap region takes the area's last third, whether or not
+    // it holds entries (deferred-interior.md §9.2).
+    let reserve = remap::reserve(ps, encrypted);
     if encrypted {
-        (ENCRYPTED_HEADER, ps - crate::crypto::RESERVE)
+        (ENCRYPTED_HEADER, ps - crate::crypto::RESERVE - reserve)
     } else {
-        (HEADER, ps)
+        (HEADER, ps - reserve)
     }
 }
 
@@ -344,7 +356,6 @@ fn validate_inner(
     if pc > physical
         || pc <= first
         || count as u64 + n as u64 > u64::from(pc - first)
-        || meta[60..64].iter().any(|b| *b != 0)
         || (n == 0) != (next == 0)
         || (count == 0 && (n != 0 || u64_at(meta, 48) != 0))
         || overflow_needed_for(meta.len(), cap, count, narrow) > n
@@ -434,7 +445,8 @@ fn validate_inner(
         || remaining != 0
         || digest != u64_at(meta, 48)
         || (count != 0
-            && (!protected.contains(&u32_at(meta, 20))
+            // A deferring commit may keep its catalog chain, so its root need not be listed (§9.4).
+            && ((!remap::defer_on(meta.len(), encrypted) && !protected.contains(&u32_at(meta, 20)))
                 || (u32_at(meta, 28) != 0 && !protected.contains(&u32_at(meta, 28)))))
     {
         return Err(bad());
@@ -475,7 +487,7 @@ pub(super) fn audit(
                 bad.push(id);
                 continue;
             }
-            if page_digest(&read(id)?, encrypted, narrow) != expected {
+            if !listed_page_matches(&read(id)?, encrypted, narrow, expected) {
                 bad.push(id);
             }
         }

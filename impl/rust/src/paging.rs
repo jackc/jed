@@ -52,6 +52,13 @@ pub(crate) struct SharedPaging {
     codec: Option<Arc<crate::crypto::PageCodec>>,
     /// The capacities the file's variant implies (format.md *Page model*, encrypted.md §1).
     cap: Cap,
+    /// PROTOTYPE (spec/design/deferred-interior.md §9): the committed generation's remap list, which
+    /// interior reads of the live generation resolve through, and the catalog chain it committed, which
+    /// a deferring commit keeps when its bytes are unchanged. Both are set when an engine is loaded
+    /// from a selected meta (the chain forgotten, since another process may have rewritten it) and by
+    /// every commit.
+    remap: Mutex<Arc<crate::format::RemapState>>,
+    cat: Mutex<Option<Arc<crate::format::CatState>>>,
 }
 
 impl SharedPaging {
@@ -74,7 +81,27 @@ impl SharedPaging {
             batches,
             codec,
             cap,
+            remap: Mutex::new(Arc::default()),
+            cat: Mutex::new(None),
         })
+    }
+
+    /// The committed remap list (deferred-interior.md §9).
+    pub(crate) fn remap(&self) -> Arc<crate::format::RemapState> {
+        Arc::clone(&self.remap.lock().unwrap())
+    }
+
+    pub(crate) fn set_remap(&self, remap: Arc<crate::format::RemapState>) {
+        *self.remap.lock().unwrap() = remap;
+    }
+
+    /// The committed catalog chain a deferring commit may keep (`None`: forgotten).
+    pub(crate) fn cat(&self) -> Option<Arc<crate::format::CatState>> {
+        self.cat.lock().unwrap().clone()
+    }
+
+    pub(crate) fn set_cat(&self, cat: Option<Arc<crate::format::CatState>>) {
+        *self.cat.lock().unwrap() = cat;
     }
 
     /// The database's page codec, when it is encrypted.

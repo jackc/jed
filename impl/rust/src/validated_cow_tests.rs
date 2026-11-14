@@ -157,8 +157,14 @@ fn assert_snapshot(image: &[u8], rows: usize) {
 #[test]
 fn all_small_write_subsets_and_each_large_manifest_tear_are_atomic() {
     // 4000 rows: ten times the pre-v52 count, so the commit still dirties enough compact leaves to
-    // need manifest overflow pages.
-    for rows in [2, 4000] {
+    // need manifest overflow pages -- twice that with narrow entries, which fit half again as many
+    // per page (manifest-crc32.md §3).
+    let large = if crate::format::manifest_narrow() {
+        8000
+    } else {
+        4000
+    };
+    for rows in [2, large] {
         let (device, mut db) = seeded(rows);
         let initial = device.lock().unwrap().durable.clone();
         execute(&mut db, "UPDATE t SET v=1").unwrap();

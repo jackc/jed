@@ -259,6 +259,7 @@ impl Shared {
                     &mut reached,
                     &mut HashSet::new(),
                     1,
+                    &mt.remap, // the pinned generation's list (deferred-interior.md §9.3)
                 )?;
             }
         }
@@ -355,7 +356,7 @@ impl Shared {
             // The file must span the snapshot's page count: its trailing dead pages are zero.
             write_at(last as u64 * ps, &vec![0u8; page_size as usize])?;
         }
-        let bootstrap = crate::format::meta_page(
+        let mut bootstrap = crate::format::meta_page(
             paging.cap(),
             page_size,
             mt.txid,
@@ -370,6 +371,14 @@ impl Shared {
             },
             mt.live_pages,
         );
+        // PROTOTYPE (deferred-interior.md §9.3): the copy's interiors are as stale as the source's, so
+        // its bootstrap meta carries the pinned generation's remap list; a backup cannot fold instead,
+        // since it copies interior pages verbatim.
+        if !mt.remap.is_empty() {
+            mt.remap.encode(&mut bootstrap);
+            let crc = crate::format::meta_crc(&bootstrap);
+            bootstrap[32..36].copy_from_slice(&crc.to_be_bytes());
+        }
         // Each slot is sealed for its own index in an encrypted copy (encrypted.md §6).
         write_at(0, &crate::format::seal_meta(paging, 0, &bootstrap, &[])?)?;
         write_at(ps, &crate::format::seal_meta(paging, 1, &bootstrap, &[])?)

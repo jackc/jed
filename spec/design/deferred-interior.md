@@ -751,6 +751,38 @@ base generation without (`TestRemapRubyEncryptedHistory`). **Still owed:** the w
 planner — these histories are assembled by hand, page by page, rather than planned the way §9.4 plans
 a commit.
 
+**The Rust core (2026-11-13).** Rust implements all three parts behind the same switches, reading
+them once from the environment (`commit_manifest.rs`, `format/remap.rs`). Its tree tracks a dirty
+interior's origin and `same_keys` site for site with the Go core's -- inherited through every copy,
+cleared by any separator edit, absent from split and merge products -- because retention, and so the
+bytes, depend on them; only interiors carry them, since no decision reads a leaf's. The deferral
+plan, the fold, catalog keep, the relaxed-batch rule (which counts never-persisted GiST leaf-key
+stores as dirty, as Go does), the migration hint, the list on `Meta` and `SharedPaging`, the three
+read sites, integrity, backup's bootstrap list, and reclamation's catalog-keep and retained-page rules
+mirror Go's. `commit_durable` now takes the snapshot mutably, since the fold replaces stale roots.
+A deferred plan is never discarded in either core (the budget precheck plans without deferral), so
+§9.9's undo obligation does not yet arise; it will if a deferred plan is ever retried.
+
+Run, with switches set explicitly: the Rust suite off and with deferral alone (all pass) and with all
+three (only the nine golden and v52-fixture byte comparisons the stamp breaks, the same nine Go has);
+`sim:sweep 1..100 all go,rust` with deferral alone and with all three switches (2,200 traces each,
+Go and Rust byte-identical in transcripts and crash images); `sim:sweep 1..50 all go,rust` with the
+stamp and the narrow manifest; `sim:regress go,rust` with the Ruby image checker, deferral alone and
+all three; `sim:sweep 1..40` across all three cores with every switch off. Rust reads the five
+Ruby-written histories as Go does, with the layout and without (`deferred_interior_ruby_histories`).
+
+**Found on the way.** Under narrow entries the Rust integrity audit compared each listed page only
+with its entry -- a copy of the page's header checksum -- so a payload corrupted under an intact header
+passed it; recovery's validation and the Go integrity check both also verify the page against its own
+checksum. Rust's audit now does too (`live_only_findings` caught it). TS needs the same rule.
+
+**A correction to earlier claims.** Several multi-switch runs in this work were written as shell
+loops over a variable holding `A=on B=on`; zsh does not word-split such a variable, so those runs had
+the switches **off**. Affected: the "stamp and narrow manifest" Rust sweep claimed in the stamp
+commit and the "all three together" regression run claimed with the Ruby reader. Both were re-run
+with the assignments written out and pass; every other run recorded here set its switches
+explicitly.
+
 ### 9.9 What the landing change owes
 
 v53 is **one change carrying both this section and [manifest-crc32.md](manifest-crc32.md)**, so this
@@ -782,8 +814,8 @@ Beyond the three cores and `verify.rb`:
 - **`unassignPages`**, or its equivalent, must undo a retained interior when a plan is discarded.
 - **The stamp's remaining surface** ([manifest-crc32.md](manifest-crc32.md) §4): give the integrity
   check and the page service's delta check a window, and change the manifest-overflow header check
-  from "bytes 1–3 zero" to "flags zero, stamp equals the meta's txid" in Rust, TS and the Ruby
-  reference, as the Go core already does.
+  from "bytes 1–3 zero" to "flags zero, stamp equals the meta's txid" in TS, as Go, Rust and the
+  Ruby reference already do.
 - ~~A re-measurement of §8.2's three workloads at the tip.~~ **Taken** (§8.5): unchanged at
   `03cc46acc`, so the saving stands as stated. What is still unmeasured is a loosely-packed tree
   mutated away from the right edge, where leaf evening's rebalance is common — a question about that

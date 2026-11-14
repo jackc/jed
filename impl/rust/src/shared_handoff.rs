@@ -937,7 +937,7 @@ impl Shared {
     pub(crate) fn persist_client(
         &self,
         role: &Arc<ServiceRole>,
-        snap: &Snapshot,
+        snap: &mut Snapshot,
         stages_rows: bool,
     ) -> Result<()> {
         let conn = role.client.as_ref().expect("a client role");

@@ -172,6 +172,9 @@ const MAGIC: [u8; 4] = *b"JEDB";
 pub(crate) const FORMAT_VERSION: u16 = 52;
 #[path = "commit_manifest.rs"]
 mod commit_manifest;
+#[path = "remap.rs"]
+pub(crate) mod remap;
+pub(crate) use remap::{CatState, RemapState};
 #[path = "leaf_compact.rs"]
 mod leaf_compact;
 #[path = "leaf_lazy.rs"]
@@ -2322,6 +2325,16 @@ pub(crate) struct IncrementalWrite {
     /// (incremental-reclaim.md §3.1).
     pub(crate) catalog_ids: Vec<u32>,
     pub(crate) gist_ids: Vec<u32>,
+    /// PROTOTYPE (deferred-interior.md §9): pages that kept their place though the live-page delta
+    /// counts them as replaced -- retained interiors and a kept catalog chain -- and the retained
+    /// interiors' pages, which the orphan walk reaches but which stay live.
+    pub(crate) retained: u32,
+    pub(crate) retained_ids: Vec<u32>,
+    /// The remap list this commit publishes (`None`: none -- the layout is off) and the catalog chain
+    /// it leaves committed; `catalog_kept` says the chain is the previous commit's, unrewritten.
+    pub(crate) remap: Option<Arc<RemapState>>,
+    pub(crate) cat: Option<Arc<CatState>>,
+    pub(crate) catalog_kept: bool,
 }
 
 /// The live-page accounting of one committed file state (spec/design/memory.md §8.7): `live` is the
@@ -2355,7 +2368,7 @@ impl LiveCount {
             paging,
             paging.cap(),
         )?;
-        let live = i64::from(self.live) + write.pages.len() as i64
+        let live = i64::from(self.live) + write.pages.len() as i64 + i64::from(write.retained)
             - i64::from(self.catalog)
             - i64::from(self.gist)
             - orphaned as i64;
@@ -2382,7 +2395,7 @@ impl LiveCount {
             paging,
             paging.cap(),
         )?;
-        let live = i64::from(self.live) + write.pages.len() as i64
+        let live = i64::from(self.live) + write.pages.len() as i64 + i64::from(write.retained)
             - i64::from(self.catalog)
             - i64::from(self.gist)
             - ids.len() as i64;
@@ -2713,6 +2726,27 @@ impl Snapshot {
 
     /// [`incremental_image`](Self::incremental_image) with reuse restricted to `allowed` (`None`:
     /// every free page — validated-cow.md §4 rule 3).
+    /// PROTOTYPE (deferred-interior.md §9.4): the root of every tree a commit serializes, in
+    /// serialization order -- each table's data tree, then its non-GiST index trees (GiST rewrites
+    /// its R-tree whole and keeps no B-tree pages).
+    pub(crate) fn each_committed_tree(&self, f: &mut dyn FnMut(&Arc<Node>)) {
+        let mut tables = self.catalog_and_stores();
+        tables.sort_by(|a, b| a.0.cmp(b.0));
+        for (_, table, store) in &tables {
+            if let Some(root) = store.tree_root() {
+                f(root);
+            }
+            for idx in &table.indexes {
+                if idx.kind == IndexKind::Gist {
+                    continue;
+                }
+                if let Some(root) = self.index_store(&idx.name).tree_root() {
+                    f(root);
+                }
+            }
+        }
+    }
+
     pub(crate) fn incremental_image_allowed(
         &self,
         page_size: u32,
@@ -2721,6 +2755,26 @@ impl Snapshot {
         reuse: bool,
         allowed: Option<&HashSet<u32>>,
         paging: Option<&SharedPaging>,
+    ) -> Result<IncrementalWrite> {
+        self.incremental_image_deferred(
+            page_size, start_page, free, reuse, allowed, paging, None, None,
+        )
+    }
+
+    /// [`incremental_image_allowed`](Self::incremental_image_allowed) under the deferred-interior
+    /// prototype (deferred-interior.md §9): with `d`, the interiors the plan retains keep their page;
+    /// with `prev_cat`, a catalog chain whose bytes are unchanged is not rewritten.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn incremental_image_deferred(
+        &self,
+        page_size: u32,
+        start_page: u32,
+        free: &[u32],
+        reuse: bool,
+        allowed: Option<&HashSet<u32>>,
+        paging: Option<&SharedPaging>,
+        mut d: Option<&mut remap::DeferCtx>,
+        prev_cat: Option<&Arc<CatState>>,
     ) -> Result<IncrementalWrite> {
         let ps = page_size as usize;
         let seal = Sealer::of(ps, paging).stamped(self.txid); // self.txid is the txid this commit publishes
@@ -2767,6 +2821,7 @@ impl Snapshot {
                     &mut kept,
                     &mut shared,
                     paging,
+                    &mut d,
                 )?;
             }
             // The table's index trees follow its data tree, in catalog (name) order — only
@@ -2810,6 +2865,7 @@ impl Snapshot {
                             &mut kept,
                             &mut shared,
                             paging,
+                            &mut d,
                         )?,
                         None => PageRef::NONE,
                     }
@@ -2826,6 +2882,47 @@ impl Snapshot {
         // each page binds its successor's tag (encrypted.md §7).
         let cat_entries = self.catalog_entries(&tables, &root_data_page, &index_roots, cap)?;
         let cat_layout = catalog_layout(&cat_entries, cap.chain());
+        let (retained, retained_ids, remap) = match d {
+            Some(d) => (
+                d.retained,
+                std::mem::take(&mut d.retained_ids),
+                Some(Arc::new(d.remap.clone())),
+            ),
+            None => (0, Vec::new(), None),
+        };
+        let payloads: Vec<Vec<u8>> = cat_layout.iter().map(|cp| cp.payload.clone()).collect();
+        if let Some(prev) = prev_cat
+            && prev.payloads == payloads
+        {
+            // The catalog chain is byte-identical (no root moved, no count changed): keep it.
+            if alloc.exhausted {
+                return Err(EngineError::new(
+                    SqlState::ProgramLimitExceeded,
+                    "database page limit exceeded",
+                ));
+            }
+            return Ok(IncrementalWrite {
+                pages,
+                root: prev.root,
+                page_count: alloc.next,
+                free_remaining: {
+                    let mut rest = std::mem::take(&mut alloc.skipped);
+                    rest.extend_from_slice(&alloc.free[alloc.cursor..]);
+                    rest
+                },
+                kept,
+                shared_chains: shared,
+                catalog_pages: prev.payloads.len() as u32,
+                gist_pages,
+                catalog_ids: Vec::new(),
+                gist_ids,
+                retained: retained + prev.payloads.len() as u32,
+                retained_ids,
+                remap,
+                cat: Some(Arc::clone(prev)),
+                catalog_kept: true,
+            });
+        }
         let cat_pages: Vec<u32> = (0..cat_layout.len()).map(|_| alloc.take()).collect();
         if alloc.exhausted {
             return Err(EngineError::new(
@@ -2866,6 +2963,14 @@ impl Snapshot {
             gist_pages,
             catalog_ids: cat_pages,
             gist_ids,
+            retained,
+            retained_ids,
+            remap,
+            cat: Some(Arc::new(CatState {
+                payloads,
+                root: next,
+            })),
+            catalog_kept: false,
         })
     }
 }
@@ -3028,6 +3133,7 @@ fn serialize_dirty(
     kept: &mut HashSet<u32>,
     shared: &mut HashSet<u32>,
     paging: Option<&SharedPaging>,
+    d: &mut Option<&mut remap::DeferCtx>,
 ) -> Result<PageRef> {
     let existing = node.page_ref();
     if existing.page != 0 {
@@ -3035,12 +3141,16 @@ fn serialize_dirty(
         return Ok(existing);
     }
     let mut child_pages = Vec::with_capacity(node.children.len());
-    for child in &node.children {
+    let mut moved = Vec::new();
+    for (i, child) in node.children.iter().enumerate() {
         // A `Resident` child recurses (dirty descendants get pages); an `OnDisk` child is a clean
         // leaf already durable at its page — keep it, write nothing (the incremental-commit win).
         let cp = match child {
             Child::Resident(n) => {
-                serialize_dirty(n, shape, memo, seal, alloc, pages, kept, shared, paging)?
+                if n.page_ref().page == 0 {
+                    moved.push(i);
+                }
+                serialize_dirty(n, shape, memo, seal, alloc, pages, kept, shared, paging, d)?
             }
             Child::OnDisk(p) => {
                 kept.insert(p.page);
@@ -3048,6 +3158,32 @@ fn serialize_dirty(
             }
         };
         child_pages.push(cp);
+    }
+    // PROTOTYPE (deferred-interior.md §9.4): an interior the plan retains keeps its page; each child
+    // that moved off the page its slot resolved to takes an entry keyed by this page and that slot,
+    // overwriting any earlier one.
+    if let Some(d) = d.as_deref_mut()
+        && !node.children.is_empty()
+        && node.origin.page != 0
+        && d.retain.contains(&node.origin.page)
+    {
+        for &i in &moved {
+            let Child::Resident(c) = &node.children[i] else {
+                unreachable!("a moved child is resident")
+            };
+            if child_pages[i].page != c.origin.page {
+                d.remap.set(node.origin.page, i as u16, child_pages[i]);
+            }
+        }
+        // plan_deferral counted exactly the entries this adds, so this is a logic error.
+        assert!(
+            d.remap.len() <= d.capacity,
+            "deferral plan overran the remap list"
+        );
+        node.set_page_ref(node.origin); // its page and, in an encrypted file, that page's tag
+        d.retained += 1;
+        d.retained_ids.push(node.origin.page);
+        return Ok(node.origin);
     }
     let n = node.len() as u32;
     // Encode a leaf's records, spilling over-large values to overflow pages drawn from the same
@@ -3287,6 +3423,15 @@ impl Engine {
             }
             selected.ok_or_else(|| corrupt("no complete valid meta page"))?
         };
+        // PROTOTYPE (deferred-interior.md §9): the loaded generation's remap list redirects child
+        // pointers as the skeleton is read. A selected generation becomes the committed one, and the
+        // kept catalog chain is forgotten -- another process may have rewritten it. A load at a given
+        // meta (a backup's walk) reads through that meta's list and leaves the committed state alone.
+        let remap = Arc::clone(&meta.remap);
+        if !given {
+            paging.set_remap(Arc::clone(&remap));
+            paging.set_cat(None);
+        }
 
         let cap = paging.cap();
         let mut snap = Snapshot::with_environment(env.clone());
@@ -3454,7 +3599,7 @@ impl Engine {
                 if root_data_page.page != 0 {
                     // Reads only the interior spine — leaves stay `OnDisk`; the exact row count was
                     // restored from the v28 catalog entry (spec/design/storage.md §6).
-                    let root = read_skeleton(&paging, root_data_page, &shape)?;
+                    let root = read_skeleton(&paging, root_data_page, &shape, &remap)?;
                     let store = snap.store_mut(&name);
                     store.set_skeleton(Some(root), Some(row_count));
                     if !has_pk {
@@ -3511,7 +3656,7 @@ impl Engine {
                             istore.attach_paging(paging.clone());
                             // An index tree has zero value columns (empty-payload records); its
                             // Packed leaves reconstruct empty rows from a shared empty col-type list.
-                            let root = read_skeleton(&paging, iroot, index_shape())?;
+                            let root = read_skeleton(&paging, iroot, index_shape(), &remap)?;
                             istore.set_skeleton(Some(root), None);
                         }
                     } else {
@@ -3717,6 +3862,7 @@ fn collect_leaf_overflow(
         reached,
         seen,
         depth,
+        &paging.remap(), // the committed generation's list (deferred-interior.md §9.3)
     )
 }
 
@@ -3730,6 +3876,7 @@ pub(crate) fn collect_leaf_overflow_with(
     reached: &mut HashSet<u32>,
     seen: &mut HashSet<u32>,
     depth: usize,
+    remap: &RemapState,
 ) -> Result<()> {
     if !seen.insert(page_idx.page) {
         return Err(corrupt("B-tree page reached twice"));
@@ -3760,8 +3907,9 @@ pub(crate) fn collect_leaf_overflow_with(
             for _ in 0..=n {
                 cps.push(PageRef::read(page.payload, &mut pos, cap)?);
             }
+            remap.resolve(page_idx.page, &mut cps)?; // PROTOTYPE (deferred-interior.md §9.3)
             for cp in cps {
-                collect_leaf_overflow_with(read, cap, cp, shape, reached, seen, depth + 1)?;
+                collect_leaf_overflow_with(read, cap, cp, shape, reached, seen, depth + 1, remap)?;
             }
             Ok(())
         }
@@ -3887,6 +4035,7 @@ pub(crate) fn plan_free_list(
     pending: &[(u32, u64)],
     allowed: Option<&HashSet<u32>>,
     incr: Option<&crate::incr_reclaim::IncrPlan>,
+    remap: Option<&RemapState>,
 ) -> Result<CommitPlan> {
     // `live_at_compaction == 0` marks a store whose reclaimable set is unknown, so a commit that may
     // reclaim reconstructs it immediately even for a small file. Ordinary stores retain the amortized
@@ -3996,9 +4145,14 @@ pub(crate) fn plan_free_list(
             n = needed;
             continue;
         }
-        let base = meta_page(
+        let mut base = meta_page(
             cap, ps as u32, snap.txid, cat_root, new_pc, head, live_pages,
         );
+        // PROTOTYPE (deferred-interior.md §9.2): the list rides in the meta's last third, written
+        // before the manifest checksums the page.
+        if let Some(remap) = remap {
+            remap.encode(&mut base);
+        }
         let mut dirty = commit_manifest::entries_of(written, cap.encrypted_variant());
         dirty.extend(commit_manifest::entries_of(&pages, cap.encrypted_variant()));
         let mut entries = Vec::with_capacity(pending.len() + dirty.len());
@@ -4145,8 +4299,18 @@ fn read_skeleton(
     paging: &Arc<SharedPaging>,
     root_page: PageRef,
     shape: &Arc<LeafShape>,
+    remap: &RemapState,
 ) -> Result<Arc<Node>> {
-    match read_skeleton_node(paging, root_page, &shape.col_types, &mut HashSet::new(), 1)?.0 {
+    match read_skeleton_node(
+        paging,
+        root_page,
+        &shape.col_types,
+        &mut HashSet::new(),
+        1,
+        remap,
+    )?
+    .0
+    {
         Child::Resident(node) => Ok(node),
         Child::OnDisk(page) => paging.fault_leaf(page, shape),
     }
@@ -4177,6 +4341,7 @@ fn read_skeleton_node(
     col_types: &[ColType],
     seen: &mut HashSet<u32>,
     depth: usize,
+    remap: &RemapState,
 ) -> Result<(Child, usize)> {
     if depth > MAX_TREE_DEPTH {
         return Err(corrupt("B-tree deeper than any valid tree"));
@@ -4203,6 +4368,8 @@ fn read_skeleton_node(
             for _ in 0..=n {
                 child_ptrs.push(PageRef::read(payload, &mut pos, cap)?);
             }
+            // PROTOTYPE (deferred-interior.md §9.3): this page's remap entries redirect its slots.
+            remap.resolve(page_idx.page, &mut child_ptrs)?;
             // v24: the record-free routing skeleton — an end-offset separator directory + key
             // blob. Separators carry no values, so no lazy decode and no chains to mark.
             let keys = read_separators(payload, &mut pos, n)?;
@@ -4210,14 +4377,15 @@ fn read_skeleton_node(
             // leaf sibling that is not a leaf is caught when it faults (`decode_leaf_node`).
             let mut children = Vec::with_capacity(n + 1);
             let (first, height) =
-                read_skeleton_node(paging, child_ptrs[0], col_types, seen, depth + 1)?;
+                read_skeleton_node(paging, child_ptrs[0], col_types, seen, depth + 1, remap)?;
             let children_are_leaves = matches!(first, Child::OnDisk(_));
             children.push(first);
             for &cp in &child_ptrs[1..] {
                 children.push(if children_are_leaves {
                     Child::OnDisk(cp) // a leaf sibling — not read at open
                 } else {
-                    let (child, h) = read_skeleton_node(paging, cp, col_types, seen, depth + 1)?;
+                    let (child, h) =
+                        read_skeleton_node(paging, cp, col_types, seen, depth + 1, remap)?;
                     if h != height {
                         return Err(corrupt("B-tree leaves at unequal depths"));
                     }
@@ -5829,6 +5997,8 @@ pub(crate) struct Meta {
     /// pages the next commit orphans (incremental-reclaim.md §3.1).
     pub(crate) manifest_head: u32,
     pub(crate) manifest_pages: u32,
+    /// PROTOTYPE (deferred-interior.md §9): the slot's remap list, validated with the slot (§9.3).
+    pub(crate) remap: Arc<RemapState>,
 }
 
 /// The meta page a demand-paged open selected (deterministic-simulation integrity checker,
@@ -6152,6 +6322,11 @@ pub(crate) fn commit_crc64(crc: u64, bytes: &[u8]) -> u64 {
 
 /// A listed page's manifest identity and the chain digest's step, in a manifest of the given width
 /// (manifest-crc32.md §2): the page service checks a client's delta with these.
+/// Whether this process writes narrow manifests (PROTOTYPE, manifest-crc32.md §2).
+pub(crate) fn manifest_narrow() -> bool {
+    commit_manifest::manifest_crc32()
+}
+
 pub(crate) fn manifest_page_digest(page: &[u8], encrypted: bool, narrow: bool) -> u64 {
     commit_manifest::page_digest(page, encrypted, narrow)
 }
@@ -6252,12 +6427,10 @@ pub(crate) fn parse_meta(m: &[u8]) -> Option<Meta> {
     if root_page < first_body || root_page >= page_count {
         return None;
     }
-    // Bytes 60–63 are reserved zero (format.md *Meta page*), and slot selection validates the
-    // reserved fields: a slot with a bit set here is not a valid candidate. All four implementations
-    // must agree, or they recover different generations from one damaged file.
-    if u32::from_be_bytes(m[60..64].try_into().unwrap()) != 0 {
-        return None;
-    }
+    // Bytes 60–63 are reserved zero (format.md *Meta page*) unless the deferred-interior layout gives
+    // them to remap_entries; slot selection validates them either way (deferred-interior.md §9.3), as
+    // all four implementations must, or they recover different generations from one damaged file.
+    let remap = RemapState::decode(m, first_body, page_count)?;
     // v34: the live pages are a subset of the body pages.
     let live_pages = u32::from_be_bytes(m[56..60].try_into().unwrap());
     if live_pages > page_count - first_body {
@@ -6286,6 +6459,7 @@ pub(crate) fn parse_meta(m: &[u8]) -> Option<Meta> {
         live_pages,
         manifest_head: u32::from_be_bytes(m[36..40].try_into().unwrap()),
         manifest_pages: u32::from_be_bytes(m[44..48].try_into().unwrap()),
+        remap: Arc::new(remap),
     })
 }
 
@@ -9590,6 +9764,9 @@ pub(crate) struct IntegrityGeneration {
     pub(crate) protected: HashSet<u32>,
     /// `meta_invalid` / `manifest_page_mismatch` findings, each with its page.
     pub(crate) findings: Vec<(&'static str, u32)>,
+    /// PROTOTYPE (deferred-interior.md §9.3): the generation's remap list, which its interior reads
+    /// resolve through (empty for a slot that no longer verifies).
+    pub(crate) remap: Arc<RemapState>,
 }
 
 /// The generation `txid` as its meta slot records it, re-verified: the slot's checksum (and in an
@@ -9657,6 +9834,7 @@ pub(crate) fn integrity_generation(
             }),
             protected,
             findings,
+            remap: Arc::clone(&m.remap),
         }));
     }
     let Some(slot) = claimed else {
@@ -9683,6 +9861,7 @@ pub(crate) fn integrity_generation(
         free: IntegrityFree::Unknown,
         protected: HashSet::new(),
         findings: vec![(META_INVALID, slot as u32)],
+        remap: Arc::default(),
     }))
 }
 

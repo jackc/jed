@@ -208,6 +208,8 @@ struct TableCtx<'t> {
 }
 
 struct Checker<'a> {
+    /// PROTOTYPE (deferred-interior.md §9.3): the checked generation's remap list.
+    remap: Arc<crate::format::RemapState>,
     database: &'a str,
     snap: &'a Snapshot,
     paging: &'a Arc<SharedPaging>,
@@ -246,6 +248,7 @@ pub(crate) fn run(
 ) -> Result<IntegrityReport> {
     let cap = paging.cap();
     let mut c = Checker {
+        remap: Arc::clone(&generation.remap),
         database,
         snap,
         paging,
@@ -662,7 +665,18 @@ impl Checker<'_> {
                 Err(e) => return Err(Halt::Error(e)),
             };
             match read {
-                TreeRead::Interior { children, seps } => {
+                TreeRead::Interior { mut children, seps } => {
+                    // The generation's remap entries redirect this page's slots; one naming a slot
+                    // past its item count is corruption of this page.
+                    if let Err(e) = self.remap.resolve(page, &mut children) {
+                        if !mark {
+                            return Err(Halt::Error(e));
+                        }
+                        let detail = corrupt_message(e)?;
+                        readable = false;
+                        self.add(kinds::PAGE_CORRUPT, Some(object), Some(page), None, detail)?;
+                        continue;
+                    }
                     if mark {
                         let n = seps.len();
                         self.check_keys(object, page, n, &|i| seps[i].as_slice(), &v.lo, &v.hi)?;

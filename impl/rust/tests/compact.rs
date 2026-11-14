@@ -126,8 +126,23 @@ fn compaction_of_a_compact_file_is_a_fixed_point() {
     db.compact("main").unwrap();
     let second = std::fs::read(&path).unwrap();
     assert_eq!(first.len(), second.len());
-    // Only the version (and so the meta checksums) moved.
-    assert_eq!(first[PAGE as usize * 2..], second[PAGE as usize * 2..]);
+    // Only the version (and so the meta checksums) moved -- and, with the stale-page stamp on, each
+    // body page's stamp and the checksum covering it (manifest-crc32.md §2.1): a second compaction
+    // runs at a new txid, so it is a fixed point of everything but that.
+    let unstamped = |body: &[u8]| -> Vec<u8> {
+        let mut out = body.to_vec();
+        if std::env::var("JED_PAGE_TXID_STAMP").is_ok_and(|v| v == "on") {
+            for page in out.chunks_mut(PAGE as usize) {
+                page[2..4].fill(0);
+                page[12..16].fill(0);
+            }
+        }
+        out
+    };
+    assert_eq!(
+        unstamped(&first[PAGE as usize * 2..]),
+        unstamped(&second[PAGE as usize * 2..])
+    );
     db.close().unwrap();
 }
 

@@ -902,6 +902,11 @@ impl TableStore {
         self.rows.root()
     }
 
+    /// PROTOTYPE (deferred-interior.md §9.4): fold this store's stale interiors ([`PMap::unstale`]).
+    pub(crate) fn unstale(&mut self, parents: &std::collections::HashSet<u32>) {
+        self.rows.unstale(parents);
+    }
+
     /// Demote this store's clean, persisted resident leaves to `OnDisk` references — the
     /// post-commit residency flip (bplus-reshape.md B4; [`crate::pmap::PMap::demote_clean_leaves`]).
     /// A no-op for a store whose nodes were never persisted (a GiST leaf-key store — its on-disk

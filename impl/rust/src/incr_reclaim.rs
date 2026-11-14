@@ -137,18 +137,28 @@ impl IncrState {
         &self,
         free_chain: &[u32],
         pending: &[(u32, u64)],
+        write: &crate::format::IncrementalWrite,
     ) -> (Vec<u32>, Vec<u32>) {
         let mut all = self.tree.clone();
         if self.known {
-            // Every Rust commit rewrites the catalog chain (no kept-chain prototype), so the
-            // previous chain is always orphaned whole.
-            all.extend_from_slice(&self.catalog);
+            // The previous catalog chain is orphaned whole unless this commit kept it unrewritten
+            // (PROTOTYPE, deferred-interior.md §9.1).
+            if !write.catalog_kept {
+                all.extend_from_slice(&self.catalog);
+            }
             all.extend_from_slice(&self.gist);
             all.extend_from_slice(&self.manifest);
         }
         all.extend_from_slice(free_chain);
         if pending.is_empty() {
             all.extend_from_slice(&self.held);
+        }
+        // PROTOTYPE (deferred-interior.md §9.5): a retained interior is still live at the page the
+        // previous snapshot's node holds, which the orphan walk reaches because it must descend
+        // through that node to the leaves and chains orphaned underneath.
+        if !write.retained_ids.is_empty() {
+            let retained: HashSet<u32> = write.retained_ids.iter().copied().collect();
+            all.retain(|p| !retained.contains(p));
         }
         all.sort_unstable();
         for w in all.windows(2) {
@@ -205,7 +215,9 @@ impl IncrState {
         if plan.page_count < page_count {
             trim_gens(&mut self.gens, plan.page_count);
         }
-        self.catalog = write.catalog_ids.clone();
+        if !write.catalog_kept {
+            self.catalog = write.catalog_ids.clone();
+        }
         self.gist = write.gist_ids.clone();
         self.manifest = plan.manifest.iter().map(|(index, _)| *index).collect();
         self.manifest_count = self.manifest.len() as u32;

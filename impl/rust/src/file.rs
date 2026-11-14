@@ -665,7 +665,7 @@ impl Engine {
                 self.live.live,
             );
             crate::incr_reclaim::IncrPlan {
-                listed: incr.orphans(&self.free_chain, &[]).0,
+                listed: incr.orphans(&self.free_chain, &[], &write).0,
                 due: crate::incr_reclaim::leak_due(leaked, self.live.live),
             }
         });
@@ -688,6 +688,7 @@ impl Engine {
             &[],
             None,
             incr_plan.as_ref(),
+            write.remap.as_deref(),
         )?;
         crate::format::verify_live_count(snap, &paging, &write, live)?;
         {

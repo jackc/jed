@@ -330,11 +330,21 @@ fn damaged_fixtures_reproduce_their_reports() {
 /// both meta slots, which this core cannot read until it implements the v53 remap layout
 /// (spec/design/deferred-interior.md §9; verify.rb DEFERRED_FIXTURES). Every other golden opens and
 /// checks clean, including the torn `cow_*` images, through recovery's fallback generation.
-const UNOPENABLE: &[&str] = &[
-    "cow_deferred_overwrite.jed",
-    "cow_deferred_retire.jed",
-    "cow_invalid_free_list.jed",
-];
+///
+/// PROTOTYPE: the v53 switches move two of these. With `JED_DEFER_INTERIOR=on` the deferred histories
+/// open; with `JED_PAGE_TXID_STAMP=on` the newest slot of `cow_invalid_free_list` lists unstamped pages,
+/// so recovery falls back to its valid generation instead of failing on the free list.
+fn expected_unopenable() -> Vec<&'static str> {
+    let on = |name: &str| std::env::var(name).is_ok_and(|v| v == "on");
+    let mut out = Vec::new();
+    if !on("JED_DEFER_INTERIOR") {
+        out.extend(["cow_deferred_overwrite.jed", "cow_deferred_retire.jed"]);
+    }
+    if !on("JED_PAGE_TXID_STAMP") {
+        out.push("cow_invalid_free_list.jed");
+    }
+    out
+}
 
 /// The `full` skips of each golden that has any in the golden environment (integrity-check.md §3.5):
 /// stored text this binary cannot parse, and an index pinned to a collation version other than the
@@ -448,7 +458,11 @@ fn clean_goldens_check_clean() {
         }
         checked += 1;
     }
-    assert_eq!(unopenable, UNOPENABLE, "the goldens that do not open");
+    assert_eq!(
+        unopenable,
+        expected_unopenable(),
+        "the goldens that do not open"
+    );
     assert!(checked > 60, "checked {checked} goldens");
 }
 
@@ -864,4 +878,99 @@ fn engine_written_constraints_check_clean() {
         r.findings,
         r.skipped
     );
+}
+
+/// PROTOTYPE (spec/design/deferred-interior.md §9): the Ruby reference writes the `cow_deferred_*`
+/// histories by hand (verify.rb `DEFERRED_FIXTURES`). Under `JED_DEFER_INTERIOR=on` this core must
+/// recover the same generation and rows as the Go core does and find nothing wrong; without the layout
+/// a slot carrying entries is invalid, so `retained` opens at its base generation, `fold`'s newest slot
+/// (an empty list) is a valid v52 slot, `overwrite` and `retire` open nowhere, and the encrypted history
+/// opens at its base. Mirrors impl/go `TestRemapRubyHistories` / `TestRemapRubyEncryptedHistory`.
+#[test]
+fn deferred_interior_ruby_histories() {
+    // The histories are written unstamped (verify.rb declares `stamped: false`), so under the stamp
+    // their newest slots fall outside the window and recovery falls back: this check is for the
+    // remap layout alone.
+    if std::env::var("JED_PAGE_TXID_STAMP").is_ok_and(|v| v == "on") {
+        return;
+    }
+    let layout = std::env::var("JED_DEFER_INTERIOR").is_ok_and(|v| v == "on");
+    let pad = |id: i64, c: &str| format!("row-{id:02}-{}", c.repeat(48));
+    // (name, version with the layout, version without (None: no slot opens), rows with the layout)
+    let cases: [(&str, u64, Option<u64>, [(i64, &str); 3]); 4] = [
+        ("retained", 2, Some(1), [(40, "y"), (41, "x"), (70, "x")]),
+        ("overwrite", 3, None, [(40, "z"), (41, "x"), (70, "x")]),
+        ("fold", 3, Some(3), [(40, "y"), (41, "y"), (70, "x")]),
+        ("retire", 3, None, [(40, "y"), (41, "x"), (70, "y")]),
+    ];
+    let options = IntegrityCheckOptions {
+        constraints: true,
+        ..opts(IntegrityLevel::Full, 0)
+    };
+    let cell = |db: &Database, sql: &str| -> Vec<jed::Value> {
+        db.session(SessionOptions::default())
+            .query(sql, &[])
+            .unwrap_or_else(|e| panic!("{sql}: {e}"))
+            .map(|r| r.unwrap())
+            .next()
+            .unwrap_or_else(|| panic!("{sql}: no row"))
+    };
+    for (name, with, without, rows) in cases {
+        let file = format!("cow_deferred_{name}.jed");
+        let image = std::fs::read(spec("fileformat/fixtures").join(&file)).unwrap();
+        let opened = open_copy(&format!("deferred_{name}"), &image, None);
+        let want = if layout { Some(with) } else { without };
+        let Some(want) = want else {
+            assert!(
+                opened.is_err(),
+                "{file}: entries in both slots leave no slot to select"
+            );
+            continue;
+        };
+        let db = opened.unwrap_or_else(|e| panic!("{file}: {e}"));
+        assert_eq!(db.version(), want, "{file}: recovered version");
+        assert_eq!(
+            cell(&db, "SELECT count(*), sum(id) FROM t"),
+            vec![jed::Value::Int(90), jed::Value::Int(4095)],
+            "{file}"
+        );
+        if layout {
+            for (id, c) in rows {
+                let sql = format!("SELECT pad = '{}' FROM t WHERE id = {id}", pad(id, c));
+                assert_eq!(
+                    cell(&db, &sql),
+                    vec![jed::Value::Bool(true)],
+                    "{file}: row {id}"
+                );
+            }
+        }
+        let report = db.integrity_check("main", &options).unwrap();
+        assert!(report.ok(), "{file}: {:#?}", report.findings);
+    }
+    // History (e): the entry carries the new leaf's tag while the retained root's pointer binds the
+    // old leaf's, so reading the edited row at all means this core took the tag from the entry.
+    let file = "encrypted_cow_deferred_retained.jed";
+    let image = std::fs::read(spec("fileformat/fixtures").join(file)).unwrap();
+    let db = open_copy(
+        "deferred_encrypted",
+        &image,
+        Some(Credential::Key([0x4A; 32])),
+    )
+    .unwrap_or_else(|e| panic!("{file}: {e}"));
+    let (version, v) = if layout { (2, 1001) } else { (1, 1000) };
+    assert_eq!(db.version(), version, "{file}: recovered version");
+    assert_eq!(
+        cell(
+            &db,
+            "SELECT count(*), sum(id), (SELECT v FROM t WHERE id = 100) FROM t"
+        ),
+        vec![
+            jed::Value::Int(300),
+            jed::Value::Int(45150),
+            jed::Value::Int(v)
+        ],
+        "{file}"
+    );
+    let report = db.integrity_check("main", &options).unwrap();
+    assert!(report.ok(), "{file}: {:#?}", report.findings);
 }

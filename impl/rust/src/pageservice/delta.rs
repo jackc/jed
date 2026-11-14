@@ -389,10 +389,12 @@ mod tests {
             pending: HashMap::new(),
             encrypted: false,
         };
-        // 40 dirty pages overflow the 512-byte meta's 37 inline entries into one manifest page.
+        // Three more dirty pages than the 512-byte meta holds inline overflow into one manifest page
+        // (37 inline at the wide entry width, more with narrow entries -- manifest-crc32.md §2).
+        let inline = format::manifest_capacities(PS as usize, format::Cap::plain(PS)).0;
         let mut indices = vec![12, 3];
         let mut next = 13;
-        while indices.len() < 40 {
+        while indices.len() < inline + 3 {
             indices.push(next);
             next += 1;
         }
@@ -474,7 +476,10 @@ mod tests {
         let mut pending = HashMap::new();
         for page in &all {
             if page.index == 4 {
-                pending.insert(4, format::commit_crc64(0, &page.page));
+                pending.insert(
+                    4,
+                    format::manifest_page_digest(&page.page, false, format::manifest_narrow()),
+                );
             } else {
                 body.push(page.clone());
             }

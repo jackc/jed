@@ -621,6 +621,7 @@ impl Storage {
             free: crate::format::IntegrityFree::List(self.free_pages.clone()),
             protected: HashSet::new(),
             findings: Vec::new(),
+            remap: self.paging.remap(),
         };
         Ok(Some((generation, Arc::clone(&self.paging))))
     }
@@ -1159,7 +1160,7 @@ impl Storage {
     /// Runs under the caller's writer gate; reclamation and reuse obey the reader watermark.
     pub(crate) fn commit_durable(
         &mut self,
-        snap: &Snapshot,
+        snap: &mut Snapshot,
         can_reclaim: bool,
         can_reuse: bool,
         budget: Option<&BudgetCtx<'_>>,
@@ -1209,14 +1210,56 @@ impl Storage {
                     &self.free_pages,
                 )));
             }
-            let write = snap.incremental_image_allowed(
+            // PROTOTYPE (deferred-interior.md §9.4): defer interior pages when the plan fits the list,
+            // else fold -- write every stale interior fresh and publish an empty list. The decision
+            // is a pure function of the committed list, the dirty-node structure, the committed free
+            // list and the high-water, taken before allocation.
+            let encrypted = self.paging.codec().is_some();
+            let ps = self.page_size as usize;
+            let defer = crate::format::remap::defer_on(ps, encrypted);
+            let committed = self.paging.remap();
+            let mut d = None;
+            if defer {
+                d = crate::format::remap::plan_deferral(
+                    snap,
+                    Some(ctx.prev),
+                    &committed,
+                    crate::format::remap::migrate_hint(&self.free_pages, self.page_count),
+                    crate::format::remap::capacity(ps, encrypted),
+                );
+            }
+            let mut prev_cat = None;
+            match &d {
+                Some(d) => {
+                    prev_cat = self.paging.cat();
+                    // The catalog chain blocks truncation too: rewrite it low (§9.6).
+                    if prev_cat
+                        .as_ref()
+                        .is_some_and(|c| d.migrate != 0 && c.root.page == d.migrate)
+                    {
+                        prev_cat = None;
+                    }
+                    // A relaxed batch is open while its pending set is non-empty, so a relaxed commit
+                    // must write at least one page: with no dirty tree node, rewrite the catalog.
+                    if self.relaxed_file() && !snap.has_dirty_node() {
+                        prev_cat = None;
+                    }
+                }
+                None => snap.unstale(&committed.parents()),
+            }
+            let mut write = snap.incremental_image_deferred(
                 self.page_size,
                 self.page_count,
                 &self.free_pages,
                 can_reuse,
                 allowed.as_deref(),
                 Some(&self.paging),
+                d.as_mut(),
+                prev_cat.as_ref(),
             )?;
+            if defer && write.remap.is_none() {
+                write.remap = Some(Arc::default()); // a folded commit publishes an empty list
+            }
             let (live, tree) = self.admit_file(&write, ctx)?;
             if self.incr_on()
                 && let Some(incr) = self.incr.as_mut()
@@ -1279,11 +1322,16 @@ impl Storage {
                 .incr
                 .as_ref()
                 .expect("incr_active creates the state")
-                .orphans(&self.free_chain, &pending);
+                .orphans(&self.free_chain, &pending, &write);
             let due = self.incr_due();
             incr = Some((crate::incr_reclaim::IncrPlan { listed, due }, held));
         }
-        let plan = crate::format::plan_free_list(
+        // PROTOTYPE (deferred-interior.md §9): the walks below read interiors from disk, so they need
+        // this commit's list; the committed one comes back if planning fails.
+        let prev_remap = self.paging.remap();
+        self.paging
+            .set_remap(write.remap.clone().unwrap_or_default());
+        let plan = match crate::format::plan_free_list(
             snap,
             &self.paging,
             write.root,
@@ -1306,7 +1354,14 @@ impl Storage {
             &pending,
             allowed,
             incr.as_ref().map(|(plan, _)| plan),
-        )?;
+            write.remap.as_deref(),
+        ) {
+            Ok(plan) => plan,
+            Err(e) => {
+                self.paging.set_remap(prev_remap);
+                return Err(e);
+            }
+        };
         crate::format::verify_live_count(snap, &self.paging, &write, live)?;
         let (cap_reached, sealed_meta) = {
             let mut pager = self.paging.pager();
@@ -1375,6 +1430,10 @@ impl Storage {
                 .expect("incr_active creates the state")
                 .tolerated = leaked;
         }
+        // PROTOTYPE (deferred-interior.md §9): the list and catalog chain this commit published.
+        self.paging
+            .set_remap(write.remap.clone().unwrap_or_default());
+        self.paging.set_cat(write.cat.clone());
         if cap_reached {
             self.start_cap_flush();
         }
@@ -2280,7 +2339,10 @@ impl Shared {
             stages_rows: false,
             oldest: None,
         };
-        if st.commit_durable(&snap, true, true, Some(&budget)).is_err() {
+        if st
+            .commit_durable(&mut snap, true, true, Some(&budget))
+            .is_err()
+        {
             let reopen = st.paging.pager().commit_requires_reopen();
             drop(st);
             if reopen {
@@ -2933,7 +2995,7 @@ impl Shared {
     /// `page_count`/`free_pages` mutation is single-writer. Writes the dirty pages this commit
     /// introduced, their validation descriptor, and the alternate meta, then syncs once. The
     /// published root and allocator accounting advance only after successful durability.
-    fn persist(&self, snap: &Snapshot, stages_rows: bool) -> Result<()> {
+    fn persist(&self, snap: &mut Snapshot, stages_rows: bool) -> Result<()> {
         // Under the page service the writer's role decides: a client commits through the owner; an
         // owner commits locally after checking, under the storage lock, that its role is still
         // current (README.md §6.5).
@@ -5142,7 +5204,8 @@ impl Session {
         let mut snap = self.engine.committed.clone();
         snap.txid = self.base_version + 1; // main-domain version and reclamation watermark
         // durable before publish (packs into the byte store, any host)
-        self.shared.persist(&snap, self.engine.commit_stages_rows)?;
+        self.shared
+            .persist(&mut snap, self.engine.commit_stages_rows)?;
         #[cfg(test)]
         if let Some(hook) = AFTER_PERSIST_HOOK.lock().expect("hook lock").as_ref() {
             hook(); // the persist→publish window (test seam; §8 fallback-reader race point)
