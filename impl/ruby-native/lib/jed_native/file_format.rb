@@ -10,13 +10,13 @@ require_relative "stored_value"
 require_relative "crypto"
 
 module JedNative
-  # Experimental v52 codec. Adapted from the independently handwritten Ruby
+  # Experimental v53 codec. Adapted from the independently handwritten Ruby
   # format verifier; the verifier remains separate and is never loaded here.
   # Instances hold their own composite catalog and decode reachability state.
   class FileFormat
     include PersistentTrees
     MAGIC = "JEDB".b
-    VERSION = 52
+    VERSION = 53
     PAGE_HEADER = 16 # v7: the 12-byte v6 header (page_type/item_count/next_page) + a 4-byte per-page crc32 at offset 12
     ROOT_PAGE = 2  # the catalog root of a *fresh empty* db; relocatable thereafter (meta.root_page)
     TXID = 1
@@ -352,7 +352,8 @@ module JedNative
     # @crypto is the PageCodec of the encrypted database whose pages this codec reads and writes (nil:
     # plaintext). Sealing records each written page's tag in it, and reading a pointer records the tag
     # it binds, so every pointer a writer emits and every page a reader follows is checked against it.
-    attr_accessor :crypto
+    attr_accessor :crypto, :stamp_txid
+    attr_reader :remap
 
     def encrypted? = !@crypto.nil?
 
@@ -420,7 +421,7 @@ module JedNative
       if lead.bytesize + payload.bytesize > payload_capacity(ps)
         raise Error.new("0A000", "page payload exceeds page capacity")
       end
-      plain = [type, flags, 0, item_count, next_page, 0].pack("CCnNNN") + lead + payload
+      plain = [type, flags, (@stamp_txid || TXID) & 0xFFFF, item_count, next_page, 0].pack("CCnNNN") + lead + payload
       @crypto.seal_body(index, plain.ljust(ps - Crypto::RESERVE, "\0"))
     end
 
@@ -2407,7 +2408,61 @@ module JedNative
 
     # The inline manifest's offset and capacity in a meta page (encrypted.md §6).
     def manifest_offset = encrypted? ? 96 : 64
-    def inline_manifest_capacity(ps) = encrypted? ? (ps - 96 - Crypto::RESERVE) / 12 : (ps - 64) / 12
+    def manifest_limit(ps) = ps - (encrypted? ? Crypto::RESERVE : 0)
+    def remap_entry_size = encrypted? ? 10 + Crypto::TAG : 10
+    def remap_capacity(ps) = (manifest_limit(ps) - manifest_offset) / 3 / remap_entry_size
+    def remap_offset(ps) = manifest_limit(ps) - remap_capacity(ps) * remap_entry_size
+    def inline_manifest_capacity(ps) = (remap_offset(ps) - manifest_offset) / 8
+    def listed_crc(bytes) = encrypted? ? crc32(bytes) : bytes.byteslice(12, 4).unpack1('N')
+
+    def decode_remap(bytes, ps, page_count)
+      count = bytes.byteslice(60, 4).unpack1('N')
+      return nil if count > remap_capacity(ps)
+      at = remap_offset(ps)
+      result, targets, previous = {}, Set.new, nil
+      count.times do
+        parent, slot, page = bytes.byteslice(at, 10).unpack('NnN')
+        key = [parent, slot]
+        return nil if previous && (key <=> previous) <= 0
+        return nil unless [parent, page].all? { |id| id >= first_body && id < page_count }
+        return nil if parent == page || !targets.add?(page)
+        result[key] = [page, encrypted? ? bytes.byteslice(at + 10, Crypto::TAG) : nil]
+        previous = key
+        at += remap_entry_size
+      end
+      return nil unless bytes.byteslice(at, manifest_limit(ps) - at).bytes.all?(&:zero?)
+      result
+    end
+
+    def write_remap(image, ps, slot, entries)
+      raise Error.new('XX001', 'remap capacity exceeded') if entries.length > remap_capacity(ps)
+      image[slot * ps + 60, 4] = u32(entries.length)
+      at = slot * ps + remap_offset(ps)
+      entries.sort.each do |(parent, child_slot), (page, tag)|
+        bytes = [parent, child_slot, page].pack('NnN')
+        bytes += tag if encrypted?
+        image[at, bytes.bytesize] = bytes
+        at += bytes.bytesize
+      end
+    end
+
+    def stamp_in_window?(stamp, floor, newest)
+      return true unless floor && newest > floor && newest - floor < 65_536
+      delta = (stamp - (floor & 0xFFFF)) & 0xFFFF
+      delta >= 1 && delta <= newest - floor
+    end
+
+    def resolve_interior(payload, parent, count)
+      entries = (@remap || {}).select { |(page, _), _| page == parent }
+      return payload if entries.empty?
+      payload = payload.dup
+      entries.each do |(_, slot), (page, tag)|
+        raise 'remap slot past parent item count' if slot > count
+        payload[slot * 4, 4] = u32(page)
+        @crypto.note(page, tag) if @crypto
+      end
+      payload
+    end
 
     # A commit's resolution digest (spec/pageservice/README.md §3.5): the CRC-64 of its meta page, with
     # the CRC field and the reserve zeroed in the encrypted variant, so the meta a client sent and the
@@ -2445,6 +2500,7 @@ module JedNative
       off = index * ps
       image[off, 1] = [type].pack("C")
       image[off + 1, 1] = [flags].pack("C")
+      image[off + 2, 2] = u16((@stamp_txid || TXID) & 0xFFFF)
       image[off + 4, 4] = u32(item_count)
       image[off + 8, 4] = u32(next_page)
       image[off + PAGE_HEADER, payload.bytesize] = payload unless payload.empty?
@@ -2646,6 +2702,7 @@ module JedNative
     # every node is dirty — data B-trees post-order (per table, name order) from page 2, then the
     # catalog chain, then both meta slots at txid 1.
     def build_pages(types, sequences, tables, page_size, collations = [], start_page: nil, views: [], txid: TXID)
+      @stamp_txid = txid
       raise ArgumentError, "invalid page size" unless valid_page_size?(page_size)
       raise Error.new("0A000", "an encrypted database needs a page size of at least 1024") if @crypto && page_size < Crypto::MIN_PAGE_SIZE
       ps = page_size
@@ -2800,9 +2857,13 @@ module JedNative
         meta[:free_tag] = m.byteslice(80, Crypto::TAG)
         return nil if meta[:free_head].zero? && meta[:free_tag] != Crypto::ZERO_TAG
       end
+      meta[:remap] = decode_remap(m, ps, meta[:page_count])
+      return nil unless meta[:remap]
       meta[:slot_index] = slot
       if manifest
-        return nil unless valid_manifest?(image, ps, m, meta, validate_body: validate_body)
+        other = read_meta(image, ps, slot ^ 1, manifest: false)
+        floor = other && other[:txid] < meta[:txid] ? other[:txid] : nil
+        return nil unless valid_manifest?(image, ps, m, meta, validate_body: validate_body, floor: floor)
       else
         meta[:protected] = []
       end
@@ -2810,21 +2871,20 @@ module JedNative
       meta
     end
 
-    def valid_manifest?(image, ps, m, meta, validate_body: true)
+    def valid_manifest?(image, ps, m, meta, validate_body: true, floor: nil)
       head, count, chain_count = m.byteslice(36, 12).unpack("N3")
       digest = m.byteslice(48, 8).unpack1("Q>")
       first = first_body
-      return false unless m.byteslice(60, 4) == "\x00".b * 4
       return false if count + chain_count > meta[:page_count] - first
       return false unless (chain_count.zero? && head.zero? && digest.zero?) ||
                           (chain_count.positive? && head >= first && head < meta[:page_count])
       return false if count.zero? && (!chain_count.zero? || !head.zero? || !digest.zero?)
 
       base = manifest_offset
-      limit = ps - (@crypto ? Crypto::RESERVE : 0)
+      limit = remap_offset(ps)
       inline = [count, inline_manifest_capacity(ps)].min
-      refs = m.byteslice(base, inline * 12).unpack("NQ>" * inline).each_slice(2).to_a
-      return false unless m.byteslice(base + inline * 12, limit - base - inline * 12).bytes.all?(&:zero?)
+      refs = m.byteslice(base, inline * 8).unpack("NN" * inline).each_slice(2).to_a
+      return false unless m.byteslice(base + inline * 8, limit - base - inline * 8).bytes.all?(&:zero?)
       chain = []
       chain_digest = 0
       remaining = count - inline
@@ -2832,16 +2892,16 @@ module JedNative
       chain_count.times do |ordinal|
         return false unless page >= first && page < meta[:page_count] && !chain.include?(page)
         block = image.byteslice(page * ps, ps)
-        return false unless block.getbyte(0) == 8 && block.byteslice(1, 3) == "\x00".b * 3
+        return false unless block.getbyte(0) == 8 && block.getbyte(1).zero? && block.byteslice(2, 2).unpack1("n") == (meta[:txid] & 0xFFFF)
         return false unless page_crc(block) == block.byteslice(12, 4).unpack1("N")
         return false unless block.byteslice(16, 8).unpack1("Q>") == meta[:txid]
         return false unless block.byteslice(24, 4).unpack1("N") == ordinal
         return false unless block.byteslice(28, 4) == "\x00".b * 4
         entries = block.byteslice(4, 4).unpack1("N")
-        return false unless entries == [remaining, (ps - 32) / 12].min
-        refs.concat(block.byteslice(32, entries * 12).unpack("NQ>" * entries).each_slice(2).to_a)
-        return false unless block.byteslice(32 + entries * 12, ps - 32 - entries * 12).bytes.all?(&:zero?)
-        chain_digest = crc64(u32(page) + block, chain_digest)
+        return false unless entries == [remaining, (ps - 32) / 8].min
+        refs.concat(block.byteslice(32, entries * 8).unpack("NN" * entries).each_slice(2).to_a)
+        return false unless block.byteslice(32 + entries * 8, ps - 32 - entries * 8).bytes.all?(&:zero?)
+        chain_digest = crc32(u32(page) + block, chain_digest)
         chain << page
         page = block.byteslice(8, 4).unpack1("N")
         remaining -= entries
@@ -2849,16 +2909,16 @@ module JedNative
       return false unless page.zero? && remaining.zero? && chain_digest == digest
       ids = refs.map(&:first)
       return false unless ids == ids.sort.uniq && (ids & chain).empty?
-      return false if count.positive? && !ids.include?(meta[:root_page])
+      return false if chain.include?(meta[:root_page]) || chain.include?(meta[:free_head])
       return false if count.positive? && meta[:free_head].positive? && !ids.include?(meta[:free_head])
       return false unless refs.all? do |index, expected|
         next false unless index >= first && index < meta[:page_count]
         next true unless validate_body
         block = image.byteslice(index * ps, ps)
         # An encrypted body page is ciphertext: its manifest identity alone checks it (encrypted.md §6).
-        next crc64(block) == expected if @crypto
+        next listed_crc(block) == expected if @crypto
         (1..7).cover?(block.getbyte(0)) && page_crc(block) == block.byteslice(12, 4).unpack1("N") &&
-          crc64(block) == expected
+          listed_crc(block) == expected && stamp_in_window?(block.byteslice(2, 2).unpack1("n"), floor, meta[:txid])
       end
       meta[:protected] = ids + chain
       meta[:manifest] = refs
@@ -2888,6 +2948,7 @@ module JedNative
              (free_pages & (meta[:protected] + seen)).empty?
         raise "invalid free-list entry"
       end
+      meta[:free_chain] = seen
       free_pages
     end
 
@@ -2903,6 +2964,7 @@ module JedNative
     # The selected meta of an encrypted file must authenticate under the held key — never a fallback
     # to the other slot (encrypted.md §6) — and its root and free-list tags become the pointers' tags.
     def authenticate_meta(image, ps, meta, slots: [meta[:slot_index]])
+      @remap = meta[:remap] || {}
       return meta unless @crypto
       stored = image.byteslice(meta[:slot_index] * ps, ps)
       manifest = (meta[:manifest_pages] || []).map { |page| [page, image.byteslice(page * ps, ps)] }
@@ -2924,7 +2986,7 @@ module JedNative
       raise "page checksum mismatch (corrupted page)" unless page_crc(p) == p.byteslice(12, 4).unpack1("N")
       @reached << index if @reached
       { type: p.getbyte(0), flags: p.getbyte(1), item_count: p.byteslice(4, 4).unpack1("N"),
-        next_page: p.byteslice(8, 4).unpack1("N"), payload: p.byteslice(PAGE_HEADER, ps - PAGE_HEADER) }
+        next_page: p.byteslice(8, 4).unpack1("N"), payload: p.getbyte(0) == PAGE_INTERIOR ? resolve_interior(p.byteslice(PAGE_HEADER, ps - PAGE_HEADER), index, p.byteslice(4, 4).unpack1("N")) : p.byteslice(PAGE_HEADER, ps - PAGE_HEADER) }
     end
 
     # An encrypted body page, checked against the tag its pointer bound and opened, returned in the
@@ -2934,19 +2996,23 @@ module JedNative
       raise "page index below the first body page" if index < Crypto::FIRST_BODY
       plain = @crypto.open_body(index, stored, @crypto.tag(index))
       type, flags, reserved, item_count, next_page = plain.unpack("CCnNN")
-      raise "reserved page header bytes are nonzero" unless reserved.zero?
       payload = plain.byteslice(PAGE_HEADER, ps - PAGE_HEADER - Crypto::RESERVE)
       if CHAIN_TYPES.include?(type)
         payload = payload.byteslice(read_pointer_tag(payload, 0, next_page)..)
       elsif type == PAGE_INTERIOR
         pos = 0
-        children = Array.new(item_count + 1) do
+        entries = @remap || {}
+        raise 'remap slot past parent item count' if entries.keys.any? { |parent, slot| parent == index && slot > item_count }
+        children = Array.new(item_count + 1) do |slot|
           child, pos = take(payload, pos, 4)
           child = child.unpack1("N")
-          pos = read_pointer_tag(payload, pos, child)
+          tag, pos = take(payload, pos, Crypto::TAG)
+          raise 'a pointer to no page carries a tag' if child.zero? && tag != Crypto::ZERO_TAG
+          child, tag = entries.fetch([index, slot], [child, tag])
+          @crypto.note(child, tag)
           child
         end
-        payload = children.pack("N*") + payload.byteslice(pos..)
+        payload = resolve_interior(children.pack("N*") + payload.byteslice(pos..), index, item_count)
       elsif type == PAGE_GIST_INTERIOR
         pos = 0
         out = +"".b
@@ -4054,6 +4120,7 @@ module JedNative
       ps = page_size || image.byteslice(8, 4).unpack1("N")
       raise "invalid page size" unless valid_page_size?(ps)
       meta ||= select_meta(image, ps)
+      @remap = meta[:remap] || {}
       free_pages = validate_free_list!(image, ps, meta)
       pool = LeafPool.new(self, image, ps, image.respond_to?(:cache_pages) ? image.cache_pages : meta[:page_count]) if lazy
       # Every page the decode reads from the catalog root is live (v34): the catalog chain, each tree
@@ -4178,6 +4245,7 @@ module JedNative
       raise "a free-list page is reachable" unless (free_pages & reached.to_a).empty?
       { types: types, sequences: sequences, collations: collations, tables: tables,
         statistics: statistics, views: views, meta: meta, free_pages: free_pages,
+        catalog_ids: seen_catalog.to_a,
         live_pages: paged ? DeferredLivePages.new(reached, tables) : reached.to_a }
     end
 

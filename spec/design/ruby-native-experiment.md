@@ -40,6 +40,11 @@ tracks `b1a6affc`: format v52, whole-row references, current correctness fixes a
 database serialization. It preserves the same experimental status and historical
 benchmark evidence.
 
+The explicitly requested [November 13 refresh](../../impl/ruby-native/PARITY_UPDATE_2026-11-13.md)
+tracks `32feb48fd`: format v53, deferred interiors, narrow manifests and page stamps,
+incremental reclamation and sibling-leaf redistribution. It preserves experimental
+status and the historical benchmark evidence.
+
 The cleaned integration history retains the implementation, opt-in tooling and
 readable reports. Generated evidence and run-specific drivers remain on the
 [original experiment branch](../../bench/ruby-native/ARCHIVE.md); both Ruby result

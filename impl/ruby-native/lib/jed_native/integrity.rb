@@ -92,6 +92,7 @@ module JedNative
         collation = engine.resolve_collation(name)
         collation ? collation.sort_key(value) : value.b
       }, crypto: crypto)
+      @codec.instance_variable_set(:@remap, meta[:remap] || {})
       @findings, @skipped = [], []
       @truncated = false
       @reached = Set.new
@@ -171,7 +172,7 @@ module JedNative
         end
         block = @image.byteslice(index * @ps, @ps)
         # An encrypted body page is ciphertext: its manifest identity alone checks it.
-        next if @codec.crc64(block) == expected && (@codec.encrypted? || (1..7).cover?(block.getbyte(0)) &&
+        next if @codec.listed_crc(block) == expected && (@codec.encrypted? || (1..7).cover?(block.getbyte(0)) &&
                 @codec.page_crc(block) == block.byteslice(12, 4).unpack1('N'))
 
         add('manifest_page_mismatch', page: index, detail: "page #{index} no longer carries its recorded identity")

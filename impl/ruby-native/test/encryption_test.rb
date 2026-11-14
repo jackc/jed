@@ -95,7 +95,7 @@ module RubyEncryptionTest
   def self.golden_roundtrip
     count = 0
     Dir[File.join(GOLDENS, 'encrypted_*.jed')].sort.each do |path|
-      next if File.basename(path).include?('rekey')
+      next if File.basename(path).match?(/rekey|cow_deferred/) # commit histories are not bootstrap images
       image = File.binread(path)
       state = JedNative::FileFormat.new(crypto: unlock(image)).decode_image(image)
       writer = JedNative::FileFormat.new(crypto: JedNative::PageCodec.create(golden_key, nil, JedNative::SeededRandom.new(GOLDEN_SEED)))

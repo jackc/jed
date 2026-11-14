@@ -25,10 +25,13 @@ module JedNative
   # Encoding is a preparation step: neither the file nor a node's committed page
   # identity changes until every page and manifest has been validated and synced.
   class CommitPlan
-    attr_reader :pages, :root, :live, :allocator, :assignments, :live_pages, :overflow_ids, :table_catalog
+    attr_reader :pages, :root, :live, :allocator, :assignments, :live_pages, :overflow_ids, :table_catalog, :remap, :catalog_layout, :catalog_ids
 
-    def initialize(codec, snapshot, page_size, allocator, page_ids: {}.compare_by_identity, overflow_ids: {}.compare_by_identity)
+    def initialize(codec, snapshot, page_size, allocator, page_ids: {}.compare_by_identity, overflow_ids: {}.compare_by_identity, previous: nil, force_catalog: false)
       @codec, @page_size, @allocator = codec, page_size, allocator
+      @retained, @forced = {}.compare_by_identity, {}.compare_by_identity
+      @remap = {}
+      @migration = previous && !allocator.free.empty? && !allocator.free.include?(allocator.high_water - 1) ? allocator.high_water - 1 : 0
       @page_ids, @next_page_ids = page_ids, {}.compare_by_identity
       @old_overflow_ids, @overflow_ids = overflow_ids, {}.compare_by_identity
       @live_pages = Set.new
@@ -41,6 +44,7 @@ module JedNative
       snapshot.fetch(:collations, []).sort_by { |collation| collation[:name].b }.each { |collation| entries << "\x03".b + @codec.collation_entry_bytes(collation) }
       tables = snapshot.fetch(:tables, []).sort_by { |table| table[:name].b }
       @table_catalog = []
+      prepare_deferral(tables) if previous
       tables.each do |table|
         tree = table.key?(:physical_tree) ? table[:physical_tree] : fresh_table_tree(table)
         data_root = write_tree(tree)
@@ -66,13 +70,25 @@ module JedNative
       tables.each { |table| entries.concat(@codec.statistics_entries(table)) }
       snapshot.fetch(:views, []).sort_by { |view| view[:name].b }.each { |view| entries << "\x05".b + @codec.view_entry_bytes(view) }
       catalog = @codec.catalog_layout(entries, @codec.chain_capacity(@capacity))
-      ids = catalog.map { @allocator.allocate }
+      keep_catalog = previous && previous[:catalog_layout] == catalog && previous[:catalog_ids]&.first != @migration &&
+                     !(force_catalog && @body.empty?)
+      ids = keep_catalog ? previous[:catalog_ids] : catalog.map { @allocator.allocate }
+      @catalog_layout, @catalog_ids = catalog, ids
       @root = ids.first
-      @codec.catalog_out(@body, @page_size, ids, catalog)
+      @codec.catalog_out(@body, @page_size, ids, catalog) unless keep_catalog
       @live_pages.merge(ids)
       @live += catalog.length
       @pages = PageBuffer.new(page_size, @allocator.high_water, compact: true)
       @body.each { |page, descriptor| @codec.write_descriptor(@pages, @page_size, page, descriptor) }
+      @remap = (codec.remap || {}).select { |(parent, _), (page, _)| @live_pages.include?(parent) && @live_pages.include?(page) } unless @fold
+      @retained.each do |node, parent|
+        node[:children].each_with_index do |child, slot|
+          page = @next_page_ids[child] || @page_ids[child] || child[:page]
+          old_child = node[:origin][:children][slot]
+          old_page = @page_ids[old_child] || old_child[:page]
+          @remap[[parent, slot]] = [page, codec.encrypted? ? codec.tag_of(page) : nil] if page != old_page
+        end
+      end
     end
 
     def adopt
@@ -103,6 +119,49 @@ module JedNative
 
     private
 
+    # Decide retention and the exact entry count before allocating. Origins
+    # name the persisted one-for-one predecessor, never a chain of edits.
+    def prepare_deferral(tables)
+      roots = tables.flat_map do |table|
+        [table[:physical_tree]] + table.fetch(:indexes, []).reject { |index| index[:kind] == 'gist' }.map { |index| index[:physical_tree] }
+      end.compact
+      parents = Set.new
+      visit = lambda do |node|
+        next if node[:children].empty?
+        page = @page_ids[node] || node[:page]
+        origin = node[:origin]
+        if !page && origin && origin[:keys] == node[:keys]
+          old_page = @page_ids[origin] || origin[:page]
+          @retained[node] = old_page if old_page && old_page != @migration
+        end
+        parents.add(page || @retained[node]) if page || @retained[node]
+        node[:children].each { |child| visit.call(child) }
+      end
+      roots.each { |root| visit.call(root) }
+      keys = (@codec.remap || {}).keys.select { |parent, _| parents.include?(parent) }.to_set
+      @retained.each do |node, parent|
+        node[:children].each_with_index do |child, slot|
+          old = node[:origin][:children][slot]
+          old_page = @page_ids[old] || old[:page]
+          page = @page_ids[child] || child[:page] || @retained[child]
+          keys.add([parent, slot]) if page.nil? || page != old_page
+        end
+      end
+      return if keys.length <= @codec.remap_capacity(@page_size)
+      @fold = true
+      @retained.clear
+      stale = (@codec.remap || {}).keys.map(&:first).to_set
+      force = lambda do |node|
+        next false if node[:children].empty?
+        child_changed = node[:children].map { |child| force.call(child) }.any?
+        page = @page_ids[node] || node[:page]
+        changed = child_changed || stale.include?(page)
+        @forced[node] = true if changed
+        changed
+      end
+      roots.each { |root| force.call(root) }
+    end
+
     def fresh_table_tree(table)
       pairs = @codec.table_entries(table).map do |key, row|
         forms, comps, size = @codec.plan_record(table, key, row, @capacity)
@@ -126,11 +185,17 @@ module JedNative
 
     def write_tree(node)
       return 0 unless node
-      if (page = @page_ids[node] || node[:page])
+      if !@forced[node] && (page = @page_ids[node] || node[:page])
         @live += remember_tree(node)
         return page
       end
       children = node[:children].map { |child| write_tree(child) }
+      if (page = @retained[node])
+        @next_page_ids[node] = page
+        @live_pages.add(page)
+        @live += 1
+        return page
+      end
       if children.empty?
         overflow = {}
         kept = []

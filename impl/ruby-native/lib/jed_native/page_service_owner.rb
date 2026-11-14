@@ -439,7 +439,8 @@ module JedNative
         end
         meta = @codec.read_meta(image, @page_size, 0, validate_body: false)
         raise Error.new('08P01', 'invalid commit manifest') unless meta && meta[:txid] == txid && !meta[:manifest].empty? && meta[:manifest_pages] == manifest.map(&:first)
-        raise Error.new('08P01', 'body page is not reusable') unless meta[:manifest].all? { |page, _| legal_page?(page, high) }
+        rejected = meta[:manifest].find { |page, _| !legal_page?(page, high) }
+        raise Error.new('08P01', "body page #{rejected.first} is not reusable") if rejected
         # An encrypted client cannot know the slot the owner writes: its meta must authenticate under
         # either slot index before any page is written (encrypted.md §14).
         if @codec.encrypted? && [0, 1].none? { |slot| @codec.crypto.meta_authentic?(slot, meta_bytes, manifest) }
@@ -460,7 +461,7 @@ module JedNative
           expected = @delta[:expected][page]
           # An encrypted body page is ciphertext, checked by its manifest identity alone.
           plain_ok = @codec.encrypted? || bytes.getbyte(0).between?(1, 7) && @codec.page_crc(bytes) == bytes.byteslice(12, 4).unpack1('N')
-          unless expected && @delta[:received].add?(page) && bytes.bytesize == @page_size && plain_ok && @codec.crc64(bytes) == expected
+          unless expected && @delta[:received].add?(page) && bytes.bytesize == @page_size && plain_ok && @codec.listed_crc(bytes) == expected
             raise Error.new('08P01', 'commit page identity mismatch')
           end
           @storage.send(:write_at, @storage.instance_variable_get(:@file), bytes, page * @page_size)
@@ -484,6 +485,8 @@ module JedNative
         end
         @committing = true
         @storage.send(:accept_service_commit, @delta)
+        @owner.unpin(self, @write_txid) if @write_txid && @pins[@write_txid]
+        @write_txid = nil
         published = true
         if @storage.instance_variable_get(:@service_crash_ack)
           exit! 197

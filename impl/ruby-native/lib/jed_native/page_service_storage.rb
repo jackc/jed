@@ -74,6 +74,7 @@ module JedNative
           if @foreign_snapshot
             reader = @codec.reader
             @snapshot = reader.decode_image(@image, page_size: @page_size, lazy: true, meta: @meta)
+            @snapshot[:foreign_commit] = true
             @foreign_snapshot = false
           end
         end
@@ -263,8 +264,8 @@ module JedNative
     end
 
     def service_maintenance
-      unlisted = @meta[:page_count] - @free_pages.length
-      rebuild = @live_at_compaction.zero? || unlisted > FreeListPlan::COMPACT_MIN_PAGES && unlisted > FreeListPlan::COMPACT_GROWTH * @live_at_compaction
+      return unless effective_reader_watermark > @meta[:txid]
+      rebuild = reclamation_due?
       truncate = @free_pages.last == @meta[:page_count] - 1 && effective_reader_watermark >= @free_generation
       return unless rebuild || truncate
 

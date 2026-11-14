@@ -70,7 +70,15 @@ module RubyRewriteTest
       first = File.binread(path)
       storage.compact
       second = File.binread(path)
-      assert(first.byteslice(1024..) == second.byteslice(1024..), 'second compaction changed body')
+      normalize = lambda do |image|
+        body = image.byteslice(1024..).dup
+        (0...body.bytesize).step(512) do |offset|
+          body[offset + 2, 2] = "\0" * 2
+          body[offset + 12, 4] = "\0" * 4
+        end
+        body
+      end
+      assert(normalize.call(first) == normalize.call(second), 'second compaction changed body beyond stamps/checksums')
       database.close
       reopened = JedNative.open(path)
       assert(reopened.execute('SELECT v FROM t WHERE id=1').rows == [[text]], 'compaction changed overflow text')

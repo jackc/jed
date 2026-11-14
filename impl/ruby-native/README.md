@@ -72,8 +72,10 @@ The [ordering follow-up](ORDERING_FOLLOWUP.md) specializes typed ORDER BY
 comparators and measures whole-query gains with interpreter/YJIT/ZJIT controls.
 [Runtime instructions](../../bench/ruby-native/RUNTIMES.md)
 describe the separate opt-in build; the repository's normal Ruby version is unchanged.
-The [November parity update](PARITY_UPDATE_2026-11-12.md) refreshes the experiment
-against source revision `b1a6affc`, including format v52 and database serialization.
+The [November 13 parity update](PARITY_UPDATE_2026-11-13.md) refreshes the experiment
+against source revision `32feb48fd`, including format v53, deferred commits and
+incremental reclamation. The [previous refresh](PARITY_UPDATE_2026-11-12.md)
+records format v52 and database serialization.
 The [October report](PARITY_UPDATE.md) preserves its earlier baseline and evidence.
 Future features do not update this directory unless explicitly requested.
 
@@ -88,7 +90,7 @@ JedNative.memory do |db|
 end
 ```
 
-`JedNative.create(path)` and `JedNative.open(path)` use the shared v52 file format
+`JedNative.create(path)` and `JedNative.open(path)` use the shared v53 file format
 and a pure Ruby `flock` host. The default `locking: :auto` uses protocol-v2
 page-service ownership: one process owns the file and other processes run their
 own Ruby engine as page clients. Use `locking: :exclusive` to require sole access.

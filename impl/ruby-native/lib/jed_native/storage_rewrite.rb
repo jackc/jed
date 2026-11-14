@@ -14,6 +14,7 @@ module JedNative
 
     def write(snapshot, txid, &sink)
       raise Error.new('54000', 'transaction id overflow') unless txid.between?(0, 0xFFFF_FFFF_FFFF_FFFF)
+      @codec.stamp_txid = txid
       @sink = sink
       if @codec.encrypted?
         block = @codec.crypto.key_block_page(@page_size)
@@ -59,6 +60,7 @@ module JedNative
       2.times do |slot|
         codec.write_meta(buffer, page_size, slot, page_size, meta[:txid], meta[:root_page], meta[:page_count], meta[:live], seal: false)
         codec.write_meta_free_head(buffer, page_size, slot, meta[:free_head] || 0)
+        codec.write_remap(buffer, page_size, slot, meta[:remap] || {})
         codec.finish_meta(buffer, page_size, slot)
       end
       buffer.pages

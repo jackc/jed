@@ -145,9 +145,11 @@ them only when explicitly requested; future features do not refresh them. Their
 recorded baseline revision, coverage, omissions, and performance are part of the
 experiment, and promotion requires a separate decision. See
 [ruby-native-experiment.md](spec/design/ruby-native-experiment.md).
-The explicitly requested Ruby refresh (2026-11-12) tracks supported-core revision
-`b1a6affc`; [its report](impl/ruby-native/PARITY_UPDATE_2026-11-12.md) records coverage
-and remaining omissions. Experimental status and prior benchmark evidence are unchanged.
+The explicitly requested Ruby refresh (2026-11-13) tracks supported-core revision
+`32feb48fd`: format v53, deferred interiors, narrow manifests, page stamps,
+incremental reclamation and sibling-leaf redistribution.
+[Its report](impl/ruby-native/PARITY_UPDATE_2026-11-13.md) records coverage and
+remaining omissions. Experimental status and prior benchmark evidence are unchanged.
 
 The separately approved **native Swift experiment** (`impl/swift-native`, 2026-11-05)
 was explicitly refreshed on 2026-11-13 to the supported Rust/Go/TypeScript surface at

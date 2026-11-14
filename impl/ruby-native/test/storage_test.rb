@@ -51,7 +51,7 @@ module RubyStorageTest
         raise "#{name}: #{exception.message}" unless REJECTED.include?(name)
       end
     end
-    assert(accepted == 107, "expected 107 readable fixtures, got #{accepted}")
+    assert(accepted == 112, "expected 112 readable fixtures, got #{accepted}")
   end
 
   def self.golden_encode
@@ -339,7 +339,7 @@ module RubyStorageTest
       public_send(name)
       puts "ruby-native storage: #{name} passed"
     end
-    puts "ruby-native storage: #{tests.length} tests passed (107 shared images, 71 byte-exact encodes)"
+    puts "ruby-native storage: #{tests.length} tests passed (112 shared images, 71 byte-exact encodes)"
   end
 
   def self.temporal_containers_reopen

@@ -205,10 +205,12 @@ module JedNative
       # routing metadata and private dirty pages, so it performs no page RPC
       # after acknowledgement and needs no additional old-generation pin.
       base = @storage.meta
+      @codec.stamp_txid = base[:txid] + 1
+      @codec.instance_variable_set(:@remap, base[:remap] || {})
       allocator = PageAllocator.new(base[:page_count], @grant ? @storage.instance_variable_get(:@free_pages) : [])
       plan = CommitPlan.new(@codec, snapshot, @page_size, allocator,
                             page_ids: @storage.instance_variable_get(:@page_ids) || {}.compare_by_identity,
-                            overflow_ids: @storage.instance_variable_get(:@overflow_ids) || {}.compare_by_identity)
+                            overflow_ids: @storage.instance_variable_get(:@overflow_ids) || {}.compare_by_identity, previous: @storage.instance_variable_get(:@snapshot))
       maximum = @storage.instance_variable_get(:@max_storage_bytes)
       raise Error.new('54P06', 'database storage limit exceeded') if maximum.positive? && plan.live > base[:live] && plan.live * @page_size > maximum
       txid, slot = base[:txid] + 1, (base[:slot] || base[:txid] & 1) ^ 1
@@ -248,13 +250,16 @@ module JedNative
       end
       raise Error.new('08P01', 'invalid commit acknowledgement') unless name == :committed && reply[:txid] == txid
       meta = { txid: txid, slot: slot, root_page: plan.root, page_count: pages.page_count, free_head: free_plan.head,
-               live: plan.live, protected: free_plan.protected }
+               live: plan.live, protected: free_plan.protected, remap: plan.remap, free_chain: free_plan.free_chain, manifest_pages: free_plan.manifest_ids }
       @txid = txid
       @image.adopt(meta_bytes, pages.page_count, pages.pages.keys)
       @pending_overlay = overlay
       @storage.instance_variable_set(:@meta, meta)
-      @storage.instance_variable_set(:@snapshot, prepared.merge(meta: meta, free_pages: free_plan.free))
-      @storage.instance_variable_set(:@free_pages, free_plan.free)
+      # A singleton free list is not persisted. The owner cannot grant that
+      # private residue back to a client on its next write transaction.
+      persisted_free = free_plan.head.zero? ? [] : free_plan.free
+      @storage.instance_variable_set(:@snapshot, prepared.merge(meta: meta, free_pages: persisted_free))
+      @storage.instance_variable_set(:@free_pages, persisted_free)
       @storage.instance_variable_set(:@free_generation, txid)
       @storage.instance_variable_set(:@page_ids, plan.adopt)
       @storage.instance_variable_set(:@overflow_ids, plan.overflow_ids)

@@ -184,9 +184,27 @@ module JedNative
 
         slot = (@durability_floor_slot || @meta[:slot] || (@meta[:txid] & 1)) ^ 1
         pending = @durability_pending
+        old_live = @snapshot.fetch(:live_pages).to_set
+        retired = old_live - plan.live_pages
+        unless @snapshot[:foreign_commit]
+          retired.merge(@meta[:manifest_pages] || [])
+        else
+          # A foreign commit forgets the owner's auxiliary retirement inventory.
+          # Those pages are leaks recovered by the shared backstop threshold.
+          retired.subtract(@snapshot[:catalog_ids] || [])
+          visit_gist = lambda do |node|
+            next unless node
+            retired.delete(node[:page])
+            node[:children].each { |_, child| visit_gist.call(child) } unless node[:leaf]
+          end
+          @snapshot[:tables].each do |table|
+            table[:indexes].each { |index| visit_gist.call(index.dig(:gist_profile, :tree)) }
+          end
+        end
+        orphans = retired.to_a + (@meta[:free_chain] || [])
         free_plan = FreeListPlan.new(@codec, plan, @page_size, @live_at_compaction, txid, slot,
                                     truncate: pending.empty?, pending: pending,
-                                    deferred_free: @durability_deferred_free || [])
+                                    deferred_free: @durability_deferred_free || [], orphans: orphans, held_orphans: @held_orphans || [], rebuild: reclamation_due? && effective_reader_watermark > @meta[:txid])
         overlay = PageOverlay.new(@image, pages)
         prepared_snapshot = published_snapshot(snapshot, plan, overlay)
         begin
@@ -205,25 +223,23 @@ module JedNative
           end
           write_at(@file, pages.pages.fetch(slot), slot * @page_size)
           durable_sync(@file) if @sync && @synchronous == :on
-          if @synchronous == :on && @file.size > pages.page_count * @page_size
-            begin
-              @file.truncate(pages.page_count * @page_size)
-            rescue SystemCallError, IOError
-              # A completed commit is durable already. Excess trailing bytes
-              # are outside its logical high-water and may be trimmed later.
-            end
-          end
+          @shrink_pending ||= pages.page_count < @meta[:page_count]
+          trim_slack(pages.page_count) if @synchronous == :on && @shrink_pending
         rescue SystemCallError, IOError => error
           @poisoned = true
           @service_owner&.close
           raise Error.new("58030", error.message)
         end
         @meta = { txid: txid, root_page: root, page_count: pages.page_count,
-                  free_head: free_plan.head, live: live, slot: slot, protected: free_plan.protected }
+                  free_head: free_plan.head, live: live, slot: slot, protected: free_plan.protected, remap: free_plan.remap, free_chain: free_plan.free_chain, manifest_pages: free_plan.manifest_ids }
+        @held_orphans = free_plan.held_orphans
         @page_ids = plan.adopt
         @overflow_ids = plan.overflow_ids
+        previous_retirements = @free_retirements || {}
+        @free_retirements = free_plan.free.to_h { |page| [page, previous_retirements.fetch(page, txid)] }
+        @retirement_txid = txid
         @free_pages, @live_at_compaction = free_plan.free, free_plan.live_at_compaction
-        @free_generation = txid if free_plan.compacted
+        @free_generation = @free_retirements.values.max || txid
         @image.invalidate(pages.pages.keys)
         overlay.publish
         @snapshot = prepared_snapshot.merge(meta: @meta, free_pages: @free_pages)
@@ -231,7 +247,7 @@ module JedNative
           reset_durability_floor(@meta)
         else
           manifest = free_plan.manifest_ids.to_set
-          pages.pages.each { |page, bytes| @durability_pending[page] = @codec.crc64(bytes) if page >= 2 && !manifest.include?(page) }
+          pages.pages.each { |page, bytes| @durability_pending[page] = @codec.listed_crc(bytes) if page >= 2 && !manifest.include?(page) }
           if reading && starts_batch && !@durability_pending.empty?
             @flush_deadline = [reading + @flush_interval_ms * 1000, (1 << 63) - 1].min
             start_idle_flusher
@@ -331,11 +347,23 @@ module JedNative
       @idle_flusher = nil
     end
 
+    # A durable shrink leaves one shared geometric growth step (pager.md §7).
+    # Failure is harmless slack after the already completed commit barrier.
+    def trim_slack(page_count)
+      @shrink_pending = false
+      floor = [16_384 / @page_size, 1].max
+      cap = [1_048_576 / @page_size, 1].max
+      target = [page_count + page_count.clamp(floor, cap), 0xFFFF_FFFF].min * @page_size
+      @file.truncate(target) if @file.size > target
+    rescue SystemCallError, IOError
+      nil
+    end
+
     def flush_pending(shrink: true)
       return if @durability_pending.empty?
       durable_sync(@file) if @sync
       reset_durability_floor
-      @file.truncate(@meta[:page_count] * @page_size) if shrink && @file.size > @meta[:page_count] * @page_size
+      trim_slack(@meta[:page_count]) if shrink && @shrink_pending
     rescue SystemCallError, IOError => error
       @poisoned = true
       @service_owner&.close
@@ -346,6 +374,7 @@ module JedNative
     # path neither rereads meta pages nor reparses SQL after its own publication.
     def published_snapshot(snapshot, plan, image)
       reader = @codec.reader
+      reader.instance_variable_set(:@remap, plan.remap)
       reader.instance_variable_set(:@ctypes, snapshot.fetch(:types, []).to_h { |type| [type[:name], type[:fields]] })
       pool = LeafPool.new(reader, image, @page_size, image.cache_pages)
       previous = @snapshot.fetch(:tables, []).to_h { |table| [table[:name], table] }
@@ -355,7 +384,7 @@ module JedNative
       end
       tables = plan.table_catalog.map do |entry|
         old = previous[entry[:name]]
-        rows = if old && old[:root_data_page] == entry[:root_data_page] && old[:columns] == entry[:columns] && old[:rows].is_a?(PagedRows)
+        rows = if old && old[:root_data_page] == entry[:root_data_page] && old[:columns] == entry[:columns] && old[:rows].is_a?(PagedRows) && old[:rows].tree.equal?(physical[entry[:name]])
                  old[:rows]
                else
                  tree = physical[entry[:name]]
@@ -368,7 +397,7 @@ module JedNative
                end
         entry[:indexes].each do |index|
           prior = old && old[:indexes].find { |item| item[:name] == index[:name] && item[:root_page] == index[:root_page] }
-          if prior && (prior[:tree_profile] || prior[:gist_profile])
+          if prior && (prior[:tree_profile] || prior[:gist_profile]) && plan.remap == (@meta[:remap] || {})
             index[:tree_profile], index[:gist_profile] = prior.values_at(:tree_profile, :gist_profile)
           elsif index[:kind] == 'gist'
             operations = index[:cols].all? { |column| column.is_a?(Integer) } ? reader.gist_opclasses_for(entry, index) : nil
@@ -383,17 +412,29 @@ module JedNative
         end
         entry.merge(pk_order: entry[:pk], rows: rows, storage_keys: rows.keys, tree_profile: rows.profile)
       end
-      snapshot.merge(tables: tables, meta: @meta, free_pages: @free_pages, live_pages: plan.live_pages)
+      snapshot.merge(tables: tables, meta: @meta, free_pages: @free_pages, live_pages: plan.live_pages, catalog_layout: plan.catalog_layout, catalog_ids: plan.catalog_ids, foreign_commit: false)
+    end
+
+    def reclamation_due?
+      leaked = @meta[:page_count] - @codec.first_body - @free_pages.length - @meta[:live] -
+               (@meta[:free_chain] || []).length - (@meta[:manifest_pages] || []).length - (@held_orphans || []).length
+      @live_at_compaction.zero? || leaked > FreeListPlan::COMPACT_MIN_PAGES && leaked * FreeListPlan::LEAK_DEN > @meta[:live]
     end
 
     def plan_commit(snapshot)
-      reusable = effective_reader_watermark >= @free_generation
+      @codec.instance_variable_set(:@remap, @meta[:remap] || {})
+      @codec.stamp_txid = @meta.fetch(:txid) + 1
+      if @retirement_txid != @meta[:txid]
+        @free_retirements = @free_pages.to_h { |page| [page, @free_generation] }
+        @retirement_txid = @meta[:txid]
+      end
+      watermark = effective_reader_watermark
       @durability_floor_free = @free_pages.to_set if @durability_pending.empty?
-      allowed = reusable ? @free_pages : []
+      allowed = @free_pages.select { |page| @free_retirements.fetch(page) <= watermark }
       allowed = allowed.select { |page| @durability_floor_free.include?(page) } unless @durability_pending.empty?
       @durability_deferred_free = @free_pages - allowed
       CommitPlan.new(@codec, snapshot, @page_size, PageAllocator.new(@meta.fetch(:page_count), allowed),
-                     page_ids: @page_ids || {}.compare_by_identity, overflow_ids: @overflow_ids || {}.compare_by_identity)
+                     page_ids: @page_ids || {}.compare_by_identity, overflow_ids: @overflow_ids || {}.compare_by_identity, previous: @snapshot, force_catalog: @synchronous == :off)
     rescue NotImplementedError => error
       raise Error.new('0A000', error.message)
     rescue Error

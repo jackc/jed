@@ -80,13 +80,50 @@ module JedNative
       result = put_tree_key(node[:children][index], key, record, capacity)
       children = node[:children].dup
       if result[0] == :split
+        if result[1].length == 2 && result[1][0][:children].empty?
+          even = even_leaves(node, index, result[1][0], result[1][1], key, capacity)
+          if even
+            at, left, separator, right = even
+            children[at, 2] = [left, right]
+            keys = node[:keys].dup
+            keys[at] = separator
+            return [:whole, { keys: keys, recs: [], children: children }]
+          end
+        end
         children[index, 1] = result[1]
         keys = node[:keys].dup.insert(index, *result[2])
         split_node({ keys: keys, recs: [], children: children }, capacity, index + result[2].length - 1)
       else
         children[index] = result[1]
-        [:whole, { keys: node[:keys], recs: [], children: children }]
+        [:whole, { keys: node[:keys], recs: [], children: children, origin: node[:origin] || (node if node[:page]) }]
       end
+    end
+
+    # format.md: try the right sibling first; right-edge edits never pull
+    # records from the left. Redistribution must retain the parent's fanout.
+    def even_leaves(node, index, left, right, key, capacity)
+      right_edge = right[:keys].last == key
+      own_keys, own_recs = left[:keys] + right[:keys], left[:recs] + right[:recs]
+      [index + 1, index - 1].each do |sibling_index|
+        next if sibling_index.negative? || sibling_index >= node[:children].length
+        next if sibling_index < index && right_edge
+        sibling = node[:children][sibling_index]
+        next if node_payload(sibling, capacity) > capacity - capacity / 8
+        keys, records = if sibling_index < index
+          [sibling[:keys] + own_keys, sibling[:recs] + own_recs]
+        else
+          [own_keys + sibling[:keys], own_recs + sibling[:recs]]
+        end
+        left_size = ->(m) { recs_payload_size(records[0, m]) }
+        right_size = ->(m) { recs_payload_size(records[m..]) }
+        middle = pick_split_m(1..(keys.length - 1), recs_payload_size(records), capacity, false, left_size, right_size)
+        next unless middle
+        at = [index, sibling_index].min
+        next if node_payload(node, capacity) - node[:keys][at].bytesize + keys[middle].bytesize > capacity
+        return [at, { keys: keys[0, middle], recs: records[0, middle], children: [] }, keys[middle].dup,
+                { keys: keys[middle..], recs: records[middle..], children: [] }]
+      end
+      nil
     end
 
     def empty_unary_tree?(node)
@@ -144,7 +181,7 @@ module JedNative
           raise unless !merged[:children].empty? && error.sqlstate == '0A000'
         end
       end
-      { keys: keys, recs: [], children: children }
+      { keys: keys, recs: [], children: children, origin: keys == node[:keys] ? (node[:origin] || (node if node[:page])) : nil }
     end
   end
 end
