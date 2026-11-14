@@ -427,6 +427,10 @@ class Parser {
   // none). A bare row is not a parenthesized base, so parsePostfix refuses `.field` on it
   // (PostgreSQL: `(1,2).f1` is a syntax error, `((1,2)).f1` is field access).
   private bareRowEnd: number;
+  // The token index of the `(` of the most recent bare `(a, b, …)` row constructor. A GROUP BY term
+  // that is a bare row (however parenthesized) is a column group, flattened into its members; an
+  // explicit `ROW(a, b)` is one row-valued key (PostgreSQL). See parseGroupSet.
+  private bareRowStart: number;
   // Per token index, whether a PARENTHESIZED QUERY begins there (isQueryStartAtOffset, grammar.md
   // §25). Precomputed once in one backward pass so every probe is O(1) — a long run of `(` costs
   // linear time, not time per nesting level.
@@ -464,6 +468,7 @@ class Parser {
     this.depth = 0;
     this.maxDepth = 0;
     this.bareRowEnd = 0;
+    this.bareRowStart = 0;
     this.parenQuery = [];
     this.parenQuery = this.computeParenQuery();
   }
@@ -3922,29 +3927,30 @@ class Parser {
     return sets;
   }
 
-  // parseGroupSet parses a single grouping "expression group": a parenthesized `( e, ... )` / empty
-  // `()`, or a bare grouping term. Each member is a general expression — a bare/qualified column, a
-  // select-list ordinal (a bare integer literal), an output alias, or any expression (aggregates.md
-  // §15). A parenthesized list of two-or-more is a column group `(a, b)`; a single parenthesized
-  // expression `(a + b)` is one term — both fall out of parsing a comma-list of expressions.
+  // parseGroupSet parses a single grouping "expression group": the empty set `()`, or one general
+  // expression — a bare/qualified column, a select-list ordinal (a bare integer literal), an output
+  // alias, or any expression (aggregates.md §15). A bare row constructor `(a, b)`, however
+  // parenthesized, is a column group, flattened into its members (PostgreSQL's implicit-row
+  // rule); a parenthesized expression is ordinary expression syntax, so `(a + v) % 4` and
+  // `(a) + 1` are single terms.
   private parseGroupSet(): Expr[] {
-    if (this.peek().kind === "lparen") {
+    if (this.peek().kind === "lparen" && this.tokens[this.pos + 1]?.kind === "rparen") {
       this.advance();
-      const cols: Expr[] = [];
-      if (this.peek().kind !== "rparen") {
-        for (;;) {
-          cols.push(this.parseExpr());
-          if (this.peek().kind === "comma") {
-            this.advance();
-            continue;
-          }
-          break;
-        }
-      }
-      this.expect("rparen");
-      return cols;
+      this.advance();
+      return [];
     }
-    return [this.parseExpr()];
+    const start = this.pos;
+    const e = this.parseExpr();
+    // The term is a bare row exactly when the most recent bare row began inside it and only `(`
+    // precede that row's own `(` — an explicit `ROW(…)` puts its keyword there.
+    let bare = this.bareRowStart >= start;
+    for (let i = start; bare && i < this.bareRowStart; i++) {
+      bare = this.tokens[i]!.kind === "lparen";
+    }
+    if (e.kind === "row" && bare) {
+      return e.fields;
+    }
+    return [e];
   }
 
   // parseFromClause parses `from_clause ::= table_ref join_clause*` (grammar.md §15): the first
@@ -5798,6 +5804,7 @@ class Parser {
   // parseParenPrimary parses a parenthesized expression, scalar subquery, or bare row constructor (a parsePrimary arm).
   private parseParenPrimary(): Expr {
     const parenLoc = this.here();
+    const parenTok = this.pos;
     this.advance();
     // `(SELECT ...)` is a scalar subquery (grammar.md §26), disambiguated by a leading `SELECT`
     // (or a nested `WITH` — cte.md §7) after the `(`; otherwise a parenthesized expression.
@@ -5818,6 +5825,7 @@ class Parser {
       }
       this.expect("rparen");
       this.bareRowEnd = this.pos;
+      this.bareRowStart = parenTok;
       return { kind: "row", fields, loc: parenLoc };
     }
     this.expect("rparen");

@@ -153,3 +153,274 @@ SELECT a, count(*) FROM t GROUP BY a+b
 # projected a (= a AS b) is not a grouping key -> 42803 (PG).
 statement error 42803
 SELECT a AS b, count(*) FROM t GROUP BY b
+
+# A grouping term that starts with a parenthesized expression and continues with an operator is
+# one expression (PostgreSQL's a_expr), not a column group followed by trailing input.
+# names: k, count
+query II nosort
+SELECT (a + b) % 4 AS k, count(*) FROM t GROUP BY (a + b) % 4 ORDER BY 1
+----
+0
+2
+1
+1
+3
+2
+
+# names: k, count
+query II nosort
+SELECT (a + b) * 2 AS k, count(*) FROM t GROUP BY (a + b) * 2 ORDER BY 1
+----
+22
+1
+42
+1
+64
+2
+86
+1
+
+# names: ?column?, count
+query II nosort
+SELECT (a) + 1, count(*) FROM t GROUP BY (a) + 1 ORDER BY 1
+----
+2
+2
+3
+2
+4
+1
+
+# Parentheses around one term, nested or not, are just grouping: GROUP BY (a), ((a)).
+# names: a, count
+query II nosort
+SELECT a, count(*) FROM t GROUP BY (a) ORDER BY 1
+----
+1
+2
+2
+2
+3
+1
+
+# names: a, count
+query II nosort
+SELECT a, count(*) FROM t GROUP BY ((a)) ORDER BY 1
+----
+1
+2
+2
+2
+3
+1
+
+# A bare row (a, b) is a column group: a and b are both grouping columns.
+# names: a, b, count
+query III nosort
+SELECT a, b, count(*) FROM t GROUP BY (a, b) ORDER BY 1, 2
+----
+1
+10
+1
+1
+20
+1
+2
+30
+2
+3
+40
+1
+
+# ... however parenthesized: ((a, b)) is the same column group (PG flattens the implicit row).
+# names: a, b, count
+query III nosort
+SELECT a, b, count(*) FROM t GROUP BY ((a, b)) ORDER BY 1, 2
+----
+1
+10
+1
+1
+20
+1
+2
+30
+2
+3
+40
+1
+
+# A bare row continued by an operator is an ordinary (boolean) expression key.
+# names: a, count
+query II nosort
+SELECT a, count(*) FROM t GROUP BY (a, b) IS NOT NULL, a ORDER BY 1
+----
+1
+2
+2
+2
+3
+1
+
+# An explicit ROW(a, b) is one row-valued key, not a column group: a alone is not grouped.
+statement error 42803
+SELECT a, b, count(*) FROM t GROUP BY ROW(a, b)
+
+# A scalar subquery is a parenthesized expression too (a constant key: one group).
+# names: count
+query I nosort
+SELECT count(*) FROM t GROUP BY (SELECT 1)
+----
+5
+
+# The grouping-set spellings keep their column groups; parenthesized expressions inside them are
+# expressions.
+# names: a, b, count
+query III nosort
+SELECT a, b, count(*) FROM t GROUP BY GROUPING SETS ((a), (b)) ORDER BY 1 NULLS LAST, 2 NULLS LAST
+----
+1
+NULL
+2
+2
+NULL
+2
+3
+NULL
+1
+NULL
+10
+1
+NULL
+20
+1
+NULL
+30
+2
+NULL
+40
+1
+
+# names: a, b, count
+query III nosort
+SELECT a, b, count(*) FROM t GROUP BY GROUPING SETS ((a, b), ()) ORDER BY 1 NULLS LAST, 2 NULLS LAST
+----
+1
+10
+1
+1
+20
+1
+2
+30
+2
+3
+40
+1
+NULL
+NULL
+5
+
+# names: k, b, count
+query III nosort
+SELECT (a) + 1 AS k, b, count(*) FROM t GROUP BY GROUPING SETS ((a) + 1, b) ORDER BY 1 NULLS LAST, 2 NULLS LAST
+----
+2
+NULL
+2
+3
+NULL
+2
+4
+NULL
+1
+NULL
+10
+1
+NULL
+20
+1
+NULL
+30
+2
+NULL
+40
+1
+
+# names: a, b, count
+query III nosort
+SELECT a, b, count(*) FROM t GROUP BY ROLLUP (a, b) ORDER BY 1 NULLS LAST, 2 NULLS LAST
+----
+1
+10
+1
+1
+20
+1
+1
+NULL
+2
+2
+30
+2
+2
+NULL
+2
+3
+40
+1
+3
+NULL
+1
+NULL
+NULL
+5
+
+# names: k, b, count
+query III nosort
+SELECT (a + b) % 4 AS k, b, count(*) FROM t GROUP BY ROLLUP ((a + b) % 4, b) ORDER BY 1 NULLS LAST, 2 NULLS LAST
+----
+0
+30
+2
+0
+NULL
+2
+1
+20
+1
+1
+NULL
+1
+3
+10
+1
+3
+40
+1
+3
+NULL
+2
+NULL
+NULL
+5
+
+# names: a, b, count
+query III nosort
+SELECT a, b, count(*) FROM t GROUP BY CUBE ((a, b)) ORDER BY 1 NULLS LAST, 2 NULLS LAST
+----
+1
+10
+1
+1
+20
+1
+2
+30
+2
+3
+40
+1
+NULL
+NULL
+5

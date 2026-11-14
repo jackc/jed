@@ -315,9 +315,8 @@ names **several** at once: each *grouping set* is grouped independently and the 
   (2ⁿ sets).
 - A plain term **cross-products** with the grouping-set forms: `GROUP BY a, GROUPING SETS ((b), (c))`
   ≡ `GROUPING SETS ((a, b), (a, c))`, and several grouping-set clauses multiply. `ROLLUP`/`CUBE` may
-  also nest inside `GROUPING SETS`. Each element is a **column group** — a bare column, a
-  parenthesized `(a, b)`, or the empty `()` — never an expression/ordinal/alias (the same narrowing
-  as plain `GROUP BY`, §10).
+  also nest inside `GROUPING SETS`. Each element is a **column group** — a single grouping term
+  (since §15 any expression, ordinal or alias), a parenthesized `(a, b)`, or the empty `()`.
 
 **The master grouping columns.** The resolver expands the clause to a flat list of grouping sets and
 takes the **ordered union** of every set's columns — a column is *groupable* if it appears in **at
@@ -517,6 +516,13 @@ The first `GROUP BY` slice grouped only by a bare/qualified **column** (the same
   An **aggregate operand stays per-row** — `sum(a+b)` under `GROUP BY a+b` is the per-row `a+b`
   folded, *not* the single group value (the operand resolves with grouping-expression matching
   **off**, since it is evaluated before the fold). A non-grouped column is still `42803`.
+
+**Parentheses.** A grouping term is parsed as one ordinary expression, as PostgreSQL's `a_expr`:
+`GROUP BY (a + b) % 4` and `GROUP BY (a) + 1` are single expression keys, and `(SELECT 1)` is a
+scalar subquery. Only a **bare row constructor** that is the whole term — `(a, b)`, however
+parenthesized (`((a, b))`) — is a column group, flattened into its members (PG's implicit-row rule);
+an explicit `ROW(a, b)`, or a bare row continued by an operator (`(a, b) IS NOT NULL`), is one key.
+The same holds for each element of `ROLLUP` / `CUBE` / `GROUPING SETS`.
 
 All three forms compose with `ROLLUP` / `CUBE` / `GROUPING SETS` (the term may be an ordinal /
 alias / expression in any grouping set). An expression grouping key that has type `json` is `42883`

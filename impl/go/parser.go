@@ -85,6 +85,11 @@ type parser struct {
 	// constructor (0 = none). A bare row is not a parenthesized base, so parsePostfix refuses
 	// `.field` on it (PostgreSQL: `(1,2).f1` is a syntax error, `((1,2)).f1` is field access).
 	bareRowEnd int
+	// bareRowStart is the token index of the `(` of the most recent bare `(a, b, …)` row
+	// constructor. A GROUP BY term that is a bare row (however parenthesized) is a column group,
+	// flattened into its members; an explicit `ROW(a, b)` is one row-valued key (PostgreSQL). See
+	// parseGroupSet.
+	bareRowStart int
 	// parenQuery records, per token index, whether a PARENTHESIZED QUERY begins there
 	// (isQueryStartAtOffset, grammar.md §25). Precomputed once in one backward pass so every probe is
 	// O(1) — a long run of `(` costs linear time, not time per nesting level.
@@ -5828,37 +5833,31 @@ func (p *parser) parseGroupSetList() ([][]exprNode, error) {
 	return sets, nil
 }
 
-// parseGroupSet parses a single grouping "expression group": a parenthesized `( e, ... )` / empty
-// `()`, or a bare grouping term. Each member is a general expression — a bare/qualified column, a
-// select-list ordinal (a bare integer literal), an output alias, or any expression (aggregates.md
-// §15). A parenthesized list of two-or-more is a column group `(a, b)`; a single parenthesized
-// expression `(a + b)` is one term — both fall out of parsing a comma-list of expressions.
+// parseGroupSet parses a single grouping "expression group": the empty set `()`, or one general
+// expression — a bare/qualified column, a select-list ordinal (a bare integer literal), an output
+// alias, or any expression (aggregates.md §15). A bare row constructor `(a, b)`, however
+// parenthesized, is a column group, flattened into its members (PostgreSQL's implicit-row
+// rule); a parenthesized expression is ordinary expression syntax, so `(a + v) % 4` and
+// `(a) + 1` are single terms.
 func (p *parser) parseGroupSet() ([]exprNode, error) {
-	if p.peek().Kind == tokLParen {
+	if p.peek().Kind == tokLParen && p.pos+1 < len(p.tokens) && p.tokens[p.pos+1].Kind == tokRParen {
 		p.advance()
-		cols := []exprNode{}
-		if p.peek().Kind != tokRParen {
-			for {
-				e, err := p.parseExpr()
-				if err != nil {
-					return nil, err
-				}
-				cols = append(cols, e)
-				if p.peek().Kind == tokComma {
-					p.advance()
-					continue
-				}
-				break
-			}
-		}
-		if err := p.expect(tokRParen); err != nil {
-			return nil, err
-		}
-		return cols, nil
+		p.advance()
+		return []exprNode{}, nil
 	}
+	start := p.pos
 	e, err := p.parseExpr()
 	if err != nil {
 		return nil, err
+	}
+	// The term is a bare row exactly when the most recent bare row began inside it and only `(`
+	// precede that row's own `(` — an explicit `ROW(…)` puts its keyword there.
+	bare := p.bareRowStart >= start
+	for i := start; bare && i < p.bareRowStart; i++ {
+		bare = p.tokens[i].Kind == tokLParen
+	}
+	if e.Kind == exprRow && bare {
+		return e.RowItems, nil
 	}
 	return []exprNode{e}, nil
 }
@@ -7326,6 +7325,7 @@ func (p *parser) parsePrimary() (exprNode, error) {
 	}
 	if p.peek().Kind == tokLParen {
 		parenPos := p.here()
+		parenTok := p.pos
 		p.advance()
 		// `(SELECT ...)` is a scalar subquery (grammar.md §26), disambiguated by a leading
 		// `SELECT` (or a nested `WITH` — cte.md §7) after the `(`; otherwise a parenthesized expr.
@@ -7360,6 +7360,7 @@ func (p *parser) parsePrimary() (exprNode, error) {
 				return exprNode{}, err
 			}
 			p.bareRowEnd = p.pos
+			p.bareRowStart = parenTok
 			return exprNode{Kind: exprRow, RowItems: items, Pos: parenPos}, nil
 		}
 		if err := p.expect(tokRParen); err != nil {

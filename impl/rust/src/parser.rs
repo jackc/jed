@@ -72,6 +72,10 @@ pub struct Parser {
     /// (0 = none). A bare row is not a parenthesized base, so `parse_postfix` refuses `.field` on it
     /// (PostgreSQL: `(1,2).f1` is a syntax error, `((1,2)).f1` is field access).
     bare_row_end: usize,
+    /// The token index of the `(` of the most recent bare `(a, b, …)` row constructor. A GROUP BY
+    /// term that is a bare row (however parenthesized) is a column group, flattened into its
+    /// members; an explicit `ROW(a, b)` is one row-valued key (PostgreSQL). See `parse_group_set`.
+    bare_row_start: usize,
     /// For each token index, whether a PARENTHESIZED QUERY begins there (`is_query_start_at`,
     /// grammar.md §25). Precomputed once in one backward pass so every probe is O(1) — a long run
     /// of `(` costs linear time, not time per nesting level.
@@ -123,6 +127,7 @@ impl Parser {
             depth: 0,
             max_depth: 0,
             bare_row_end: 0,
+            bare_row_start: 0,
             paren_query: Vec::new(),
             into_ok: false,
             into_top: false,
@@ -4391,29 +4396,29 @@ impl Parser {
         Ok(sets)
     }
 
-    /// A single grouping "expression group": a parenthesized `( e, ... )` / empty `()`, or a bare
-    /// grouping term. Each member is a general expression — a bare/qualified column, a select-list
-    /// ordinal (a bare integer literal), an output alias, or any expression (aggregates.md §15). A
-    /// parenthesized list of two-or-more is a column group `(a, b)`; a single parenthesized
-    /// expression `(a + b)` is one term — both fall out of parsing a comma-list of expressions.
+    /// A single grouping "expression group": the empty set `()`, or one general expression — a
+    /// bare/qualified column, a select-list ordinal (a bare integer literal), an output alias, or
+    /// any expression (aggregates.md §15). A bare row constructor `(a, b)`, however
+    /// parenthesized, is a column group, flattened into its members (PostgreSQL's implicit-row
+    /// rule); a parenthesized expression is ordinary expression syntax, so `(a + v) % 4` and
+    /// `(a) + 1` are single terms.
     fn parse_group_set(&mut self) -> Result<Vec<Expr>> {
-        if matches!(self.peek(), Token::LParen) {
+        if matches!(self.peek(), Token::LParen) && matches!(self.peek_at(1), Token::RParen) {
             self.bump();
-            let mut cols = Vec::new();
-            if !matches!(self.peek(), Token::RParen) {
-                loop {
-                    cols.push(self.parse_expr()?);
-                    if matches!(self.peek(), Token::Comma) {
-                        self.bump();
-                        continue;
-                    }
-                    break;
-                }
-            }
-            self.expect(&Token::RParen)?;
-            Ok(cols)
-        } else {
-            Ok(vec![self.parse_expr()?])
+            self.bump();
+            return Ok(Vec::new());
+        }
+        let start = self.pos;
+        let e = self.parse_expr()?;
+        // The term is a bare row exactly when the most recent bare row began inside it and only
+        // `(` precede that row's own `(` — an explicit `ROW(…)` puts its keyword there.
+        let bare = self.bare_row_start >= start
+            && self.tokens[start..self.bare_row_start]
+                .iter()
+                .all(|t| matches!(t, Token::LParen));
+        match e {
+            Expr::Row(fields, _) if bare => Ok(fields),
+            e => Ok(vec![e]),
         }
     }
 
@@ -6735,6 +6740,7 @@ impl Parser {
         if matches!(self.peek(), Token::LParen) {
             return outline(|| {
                 let paren_pos = self.here();
+                let paren_tok = self.pos;
                 self.bump();
                 // `(SELECT ...)` is a scalar subquery (grammar.md §26), disambiguated by a leading
                 // `SELECT` (or a nested `WITH` — cte.md §7) after the `(`; otherwise this is a
@@ -6756,6 +6762,7 @@ impl Parser {
                     }
                     self.expect(&Token::RParen)?;
                     self.bare_row_end = self.pos;
+                    self.bare_row_start = paren_tok;
                     return Ok(Expr::Row(fields, paren_pos));
                 }
                 self.expect(&Token::RParen)?;
