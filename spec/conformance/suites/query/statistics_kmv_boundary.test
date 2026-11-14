@@ -49,8 +49,8 @@ SELECT analyzed_rows, null_count, distinct_count FROM jed_statistics
 1
 4096
 
-# The 4097th distinct hash switches to estimation. For these i32 keys the estimate exceeds the
-# non-NULL population, so the canonical upper clamp gives 4098, not the exact distinct count.
+# The 4097th distinct hash switches to estimation. For these i32 keys stats_hash (statistics.md
+# §4.0) gives an estimate of exactly 4097, inside the [K + 1, non-NULL rows] = [4097, 4098] clamp.
 statement ok
 INSERT INTO kmv_boundary VALUES (4097)
 
@@ -62,4 +62,4 @@ SELECT analyzed_rows, null_count, distinct_count FROM jed_statistics
 ----
 4099
 1
-4098
+4097

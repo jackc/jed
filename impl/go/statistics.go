@@ -1171,13 +1171,19 @@ func (h uint64MaxHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
 func (h *uint64MaxHeap) Push(x any)        { *h = append(*h, x.(uint64)) }
 func (h *uint64MaxHeap) Pop() any          { old := *h; x := old[len(old)-1]; *h = old[:len(old)-1]; return x }
 
-func statisticsFNV1a64(b []byte) uint64 {
+// statisticsHash is stats_hash (statistics.md §4.0): FNV-1a-64 finished by splitmix64's finalizer,
+// so the row-sample priority and the KMV state see a uniform hash even over short, structured keys.
+func statisticsHash(b []byte) uint64 {
 	h := uint64(0xcbf29ce484222325)
 	for _, c := range b {
 		h ^= uint64(c)
 		h *= 0x100000001b3
 	}
-	return h
+	h ^= h >> 30
+	h *= 0xbf58476d1ce4e5b9
+	h ^= h >> 27
+	h *= 0x94d049bb133111eb
+	return h ^ (h >> 31)
 }
 
 func statisticsDistributionEligible(ty dataType) bool {
@@ -1401,7 +1407,7 @@ func (db *engine) executeAnalyze(analyze *analyzeStmt) (outcome, error) {
 				return outcome{}, err
 			}
 			value := row[column]
-			priority, ordinal := statisticsFNV1a64(storageKey), uint64(analyzedRows)
+			priority, ordinal := statisticsHash(storageKey), uint64(analyzedRows)
 			if analyzedRows < math.MaxInt64 {
 				analyzedRows++
 			}
@@ -1433,7 +1439,7 @@ func (db *engine) executeAnalyze(analyze *analyzeStmt) (outcome, error) {
 			}
 			meter.Charge(costs.StatisticsValue * int64(max(1, width)))
 			if eligible {
-				kmvOverflow = retainStatisticsKMV(kmv, kmvSeen, statisticsFNV1a64(key)) || kmvOverflow
+				kmvOverflow = retainStatisticsKMV(kmv, kmvSeen, statisticsHash(key)) || kmvOverflow
 			}
 			if termsEligible {
 				resident, err := residentValue(value)

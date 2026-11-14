@@ -130,7 +130,7 @@ For each row:
 1. increment the exact NULL count, or add the non-NULL canonical width to `width_sum` with i64
    saturation;
 2. if the type is distribution-eligible, hash its canonical comparison key into the KMV state;
-3. compute the row-sample priority `FNV-1a-64(storage_key)` and retain the lowest 30,000
+3. compute the row-sample priority `stats_hash(storage_key)` (§4.0) and retain the lowest 30,000
    `(priority, storage_ordinal)` pairs. `storage_ordinal` is the zero-based position in this scan and
    breaks hash collisions. A retained non-NULL value carries its ordinary value bytes and comparison
    key only when both are at most 128 bytes; otherwise it is an `oversized` sample marker.
@@ -141,6 +141,27 @@ For each row:
 The bounded sample is therefore a pure function of the table's storage-key/value set, not scan
 timing, host randomness, map order, or the entropy seam. If the table has at most 30,000 rows, it is
 the complete population.
+
+### 4.0 The statistics hash
+
+Both the row-sample priority and the KMV state use one 64-bit hash:
+
+```text
+stats_hash(bytes) = mix(FNV-1a-64(bytes))
+FNV-1a-64: h = 0xCBF29CE484222325; for each byte b: h = (h ^ b) × 0x100000001B3   (mod 2^64)
+mix(z):    z ^= z >> 30; z ×= 0xBF58476D1CE4E5B9; z ^= z >> 27; z ×= 0x94D049BB133111EB; z ^ (z >> 31)
+```
+
+`mix` is splitmix64's finalizer, the mixer [../encoding/prng.toml](../encoding/prng.toml) pins. It is
+a bijection on 64-bit values, so two inputs collide under `stats_hash` exactly when they collide under
+FNV-1a-64, and every exact count below the KMV capacity is unchanged by it. It is required because
+both consumers treat the hash as uniform over `[0, 2^64)`, and bare FNV-1a-64 is not uniform over the
+short, structured keys that dominate real tables: its final multiply moves an input's last byte
+only into the low and middle bits, so the smallest hashes over consecutive integer keys cluster.
+Before the mixer, the KMV estimate for 100,000 distinct `i32` values was 16,087 (and 409,568 for
+1,000,000), and a 1M-row table with a serial `i64` key drew all 30,000 sample rows from ids
+200,000–400,000. With it the same inputs give 101,509, 1,003,344, and about 3,000 sample rows per
+100,000-id decile.
 
 ### 4.1 Distribution eligibility and canonical equality
 
@@ -157,7 +178,7 @@ codec, but their comparison keys are regenerated and validated on load.
 
 ### 4.2 KMV NDV
 
-FNV-1a-64 hashes each non-NULL canonical comparison key. Retain the 4,096 numerically smallest
+`stats_hash` (§4.0) hashes each non-NULL canonical comparison key. Retain the 4,096 numerically smallest
 distinct hashes in ascending order. Equal hashes are one KMV item; a hash collision can affect only
 estimate quality, never SQL results, and is deterministic.
 

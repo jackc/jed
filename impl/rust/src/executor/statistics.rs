@@ -139,13 +139,19 @@ impl Ord for SampleRow {
     }
 }
 
-fn fnv1a64(bytes: &[u8]) -> u64 {
+/// `stats_hash` (statistics.md §4.0): FNV-1a-64 finished by splitmix64's finalizer, so the row-sample
+/// priority and the KMV state see a uniform hash even over short, structured keys.
+fn stats_hash(bytes: &[u8]) -> u64 {
     let mut hash = 0xcbf29ce484222325u64;
     for &byte in bytes {
         hash ^= u64::from(byte);
         hash = hash.wrapping_mul(0x100000001b3);
     }
-    hash
+    hash ^= hash >> 30;
+    hash = hash.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    hash ^= hash >> 27;
+    hash = hash.wrapping_mul(0x94d0_49bb_1331_11eb);
+    hash ^ (hash >> 31)
 }
 
 pub(crate) fn distribution_eligible(ty: &Type) -> bool {
@@ -1439,7 +1445,7 @@ impl Engine {
                 );
                 scan.resolve_columns(&mut row, &mask)?;
                 let value = &row[column];
-                let priority = fnv1a64(&storage_key);
+                let priority = stats_hash(&storage_key);
                 let ordinal = analyzed_rows as u64;
                 analyzed_rows = analyzed_rows.saturating_add(1);
                 if matches!(value, Value::Null) {
@@ -1477,7 +1483,7 @@ impl Engine {
                     COSTS.statistics_value * i64::try_from(width.max(1)).unwrap_or(i64::MAX),
                 );
                 if let Some(key) = &key {
-                    kmv_overflow |= retain_kmv(&mut kmv, &mut kmv_seen, fnv1a64(key));
+                    kmv_overflow |= retain_kmv(&mut kmv, &mut kmv_seen, stats_hash(key));
                 }
                 if let Some(opclass) = term_opclass {
                     for term in gin_value_terms(opclass, value) {

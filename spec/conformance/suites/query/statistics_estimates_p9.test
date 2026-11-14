@@ -207,8 +207,9 @@ Full scan; touched=2
 # --- bounded sample and KMV cap ----------------------------------------------------------------
 
 # 30,001 unique values force the 30,000-row priority-sample cap and the 4,096-hash KMV estimate.
-# FNV-1a over the canonical i32 keys makes the stored deterministic estimate 14,315; the bounded
-# sample has no duplicate groups, so it produces 101 equi-depth bounds and no MCVs.
+# stats_hash (statistics.md §4.0) over the canonical i32 keys estimates 30,081, which the non-NULL
+# clamp makes 30,001; the bounded sample has no duplicate groups, so it produces 101 equi-depth
+# bounds and no MCVs.
 statement ok
 CREATE TABLE p9_bounded (id i32 PRIMARY KEY, v i32)
 
@@ -225,10 +226,49 @@ SELECT analyzed_rows, distinct_count, sample_rows, mcv_count, histogram_count
 FROM jed_statistics WHERE table_name = 'p9_bounded'
 ----
 30001
-14315
+30001
 30000
 0
 101
+
+# The row sample must not follow the storage key. The lowest fifth of the key range, 20,000 of
+# 100,000 rows, shares v = 0. A uniform sample sees v = 0 in about a fifth of its rows, so the MCV
+# estimate is near 20,000. Before stats_hash finished FNV-1a with a mixer (statistics.md §4.0), the
+# sample's priorities clustered by key and drew none of those rows, so v = 0 was not an MCV.
+statement ok
+CREATE TABLE p9_correlated (id i32 PRIMARY KEY, v i32)
+
+statement ok
+INSERT INTO p9_correlated
+SELECT CAST(generate_series AS i32),
+       CASE WHEN generate_series <= 20000 THEN 0 ELSE CAST(generate_series AS i32) END
+FROM generate_series(1, 100000)
+
+statement ok
+ANALYZE p9_correlated (v)
+
+query IIII nosort
+SELECT analyzed_rows, sample_rows, mcv_count, histogram_count
+FROM jed_statistics WHERE table_name = 'p9_correlated'
+----
+100000
+30000
+1
+101
+
+query ITTII nosort
+EXPLAIN SELECT id FROM p9_correlated WHERE v = 0
+----
+0
+Filter
+conjuncts=1
+20130
+220178
+1
+Scan p9_correlated
+Full scan; touched=2
+100000
+100048
 
 # --- analyzed join-local filters and parameter-sensitive access selection ------------------------
 

@@ -62,13 +62,19 @@ type SampleRow = {
 
 const I64_MAX = 9223372036854775807n;
 
-function fnv1a64(bytes: Uint8Array): bigint {
+// statsHash is stats_hash (statistics.md §4.0): FNV-1a-64 finished by splitmix64's finalizer, so the
+// row-sample priority and the KMV state see a uniform hash even over short, structured keys.
+function statsHash(bytes: Uint8Array): bigint {
   let hash = 0xcbf29ce484222325n;
   for (const byte of bytes) {
     hash ^= BigInt(byte);
     hash = BigInt.asUintN(64, hash * 0x100000001b3n);
   }
-  return hash;
+  hash ^= hash >> 30n;
+  hash = BigInt.asUintN(64, hash * 0xbf58476d1ce4e5b9n);
+  hash ^= hash >> 27n;
+  hash = BigInt.asUintN(64, hash * 0x94d049bb133111ebn);
+  return hash ^ (hash >> 31n);
 }
 
 function distributionEligible(type: Type): boolean {
@@ -312,7 +318,7 @@ export function* collectColumnStatisticsSteps(
       );
       const row = yield* store.resolveColumnsSteps(stored, mask);
       const value = row[column]!;
-      const priority = fnv1a64(storageKey);
+      const priority = statsHash(storageKey);
       const ordinal = analyzedRows;
       if (analyzedRows < I64_MAX) analyzedRows++;
       if (value.kind === "null") {
@@ -337,7 +343,7 @@ export function* collectColumnStatisticsSteps(
       widthSum += BigInt(width);
       if (widthSum > I64_MAX) widthSum = I64_MAX;
       meter.charge(COSTS.statisticsValue * BigInt(Math.max(1, width)));
-      if (key !== null) kmvOverflow = retainKmv(kmv, kmvSeen, fnv1a64(key)) || kmvOverflow;
+      if (key !== null) kmvOverflow = retainKmv(kmv, kmvSeen, statsHash(key)) || kmvOverflow;
       if (termCounter !== null) {
         for (const term of ginValueTerms(columnType, value)) {
           meter.charge(COSTS.statisticsValue * BigInt(Math.max(1, term.length)));
