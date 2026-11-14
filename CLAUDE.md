@@ -235,6 +235,21 @@ it, with the standard library preferred. SQL parsing, planning, other evaluation
 and storage algorithms remain handwritten Ruby; these utility exceptions do not
 authorize a native engine dependency or a Rust/WASM binding.
 
+The **native Java experiment** (`impl/java-native`) was authorized 2026-11-14
+against `3e5962f9affc06c768df1688765162a65a893848`, format v53. It targets full
+frozen-baseline parity on Linux x86-64, with Java 25 as the stable target and a
+controlled JDK 28 early-access/value-class comparison. Public APIs are blocking
+and streaming, usable from ordinary or virtual threads, with explicit cooperative
+cancellation. Narrow JDK FFM calls implement required OS host operations; no
+unsafe engine access is authorized. Bouncy Castle Java `bcprov-jdk18on:1.86` is
+approved only for Argon2id and its internal helpers; other crypto uses JDK providers.
+Toolchain downloads, parallel implementation/review, verification, profiling and
+local commits are authorized. All three variants pass frozen correctness acceptance;
+controlled performance measurement remains in progress. No promotion is implied.
+The experiment remains opt-in, outside normal CI and automatic future updates;
+publication, JDBC/ORM integration, Native Image and other platforms are separate.
+See [java-native-experiment.md](spec/design/java-native-experiment.md).
+
 4. **Java**, **C#**, **Swift** (and later reach languages) — **native or wrapped, chosen
    per language on best-experience grounds**, not by a blanket rule. Current leanings
    (`spec/design/cores.md` §2): **C#** is the strongest *native* candidate (value-type

@@ -1,0 +1,8 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#MISE description="Explicit opt-in: execute SQL through the Java public streaming API"
+#USAGE flag "--variant <variant>" default="stable" help="stable, ea, or valhalla"
+#USAGE arg "<sql>" help="SQL statement"
+require_relative "../../impl/java-native/Tools/tasks"
+variant = ENV.fetch("usage_variant", "stable")
+JavaNativeTasks.run(JavaNativeTasks.build(variant), variant, "query", ENV.fetch("usage_sql"))

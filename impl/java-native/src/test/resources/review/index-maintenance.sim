@@ -1,0 +1,54 @@
+# format: simulation
+# profile: index-maintenance-review
+# seed: 1
+# page_size: 1024
+# cache_bytes: 2048
+# clock: 1700000000000000
+# Physical edit order: per-row non-PK UPDATE, end-state uniqueness, then PK moves.
+open w1 write
+on w1 CREATE TABLE t(id i32 PRIMARY KEY, u i32, n i32, a i64[])
+on w1 INSERT INTO t SELECT g,g,(g*32+1)%1000,ARRAY[g%7,g%11] FROM generate_series(1,150) g
+on w1 CREATE UNIQUE INDEX tu ON t(u)
+on w1 CREATE INDEX tn ON t(n)
+on w1 CREATE INDEX ta ON t USING gin(a)
+commit w1
+check
+open w2 write
+on w2 UPDATE t SET n=(id*76)%1000 WHERE id BETWEEN 90 AND 111
+commit w2
+check
+open w3 write
+on w3 UPDATE t SET u=151-u, a=ARRAY[id::i64%13,id::i64%17] WHERE id BETWEEN 1 AND 150
+commit w3
+check
+open w4 write
+on w4 UPDATE t SET id=id, n=(id*43)%1000 WHERE id BETWEEN 40 AND 80
+commit w4
+check
+open w5 write
+on w5 UPDATE t SET id=151-id
+commit w5
+reopen
+check
+open w6 write
+on w6 INSERT INTO t SELECT g,NULL,(g*57)%1000,ARRAY[g%19,g%23] FROM generate_series(141,180) g ON CONFLICT(id) DO UPDATE SET u=excluded.u,n=excluded.n,a=excluded.a
+commit w6
+check
+open w7 write
+on w7 INSERT INTO t SELECT g,NULL,(g*71)%1000,ARRAY[g%23,g%29] FROM generate_series(11,210) g ON CONFLICT(id) DO UPDATE SET id=CASE WHEN excluded.id%2=0 THEN excluded.id+1000 ELSE excluded.id END,u=excluded.u,n=excluded.n,a=excluded.a
+commit w7
+reopen
+check
+# The scan walks this secondary key backwards in table-key space. Wider rows
+# make replaying replacements in sorted primary-key order observably different.
+open w8 write
+on w8 CREATE TABLE scan_order(id i32 PRIMARY KEY, n i32, v text)
+on w8 INSERT INTO scan_order SELECT g,1000-g,md5(g::text) FROM generate_series(1,150) g
+on w8 CREATE INDEX scan_n ON scan_order(n)
+commit w8
+check
+open w9 write
+on w9 UPDATE scan_order SET v=repeat(md5(id::text),10) WHERE n BETWEEN 968 AND 995
+commit w9
+reopen
+check

@@ -1,0 +1,6 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#MISE description="Explicit opt-in: compile native Java with pinned javac and package a JAR"
+#USAGE flag "--variant <variant>" default="stable" help="stable, ea (same Java 25 source), or valhalla (preview replacements)"
+require_relative "../../impl/java-native/Tools/tasks"
+JavaNativeTasks.build(ENV.fetch("usage_variant", "stable"))

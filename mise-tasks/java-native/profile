@@ -1,0 +1,53 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#MISE description="Explicit opt-in: JFR profile selected workloads from an immutable Java benchmark actor"
+#USAGE flag "--evidence <path>" required help="Matched benchmark evidence.json supplying immutable actor and input"
+#USAGE flag "--variant <name>" default="stable" help="stable, ea, or valhalla"
+#USAGE flag "--cases <list>" default="join,grouped,window,decimal_aggregate,parallel_point" help="Comma-separated workloads to profile"
+#USAGE flag "--warmup <n>" default="20" help="Warmup executions per selected workload"
+#USAGE flag "--iterations <n>" default="100" help="Measured/profiled executions; these timings are not comparison evidence"
+#USAGE flag "--rows <n>" help="Override generated setup row count for diagnostic profiling"
+#USAGE flag "--data-directory <path>" help="Database filesystem parent (defaults beside benchmark evidence)"
+require_relative "../../impl/java-native/Tools/tasks"
+require "time"
+variant=ENV.fetch("usage_variant","stable")
+abort "Unknown Java variant" unless JavaNativeTasks::VARIANTS.include?(variant)
+evidence_path=File.expand_path(ENV.fetch("usage_evidence"))
+evidence=JSON.parse(File.read(evidence_path))
+actor=evidence.fetch("actors").fetch(variant)
+actor.fetch("artifacts").each do |path,digest|
+  abort "Captured actor changed: #{path}" unless Digest::SHA256.file(File.join(actor.fetch("actor"),path)).hexdigest==digest
+end
+command=actor.fetch("command")
+abort "Unexpected benchmark command" unless command.first==JavaNativeTasks.tool("java",variant) && command.last=="org.jed.PerformanceDiagnostics"
+input_path=File.join(File.dirname(evidence_path),"input.tsv")
+abort "Benchmark input changed" unless Digest::SHA256.file(input_path).hexdigest==evidence.fetch("input_sha256")
+selected=ENV.fetch("usage_cases").split(",")
+warmup=Integer(ENV.fetch("usage_warmup")); iterations=Integer(ENV.fetch("usage_iterations"))
+abort "Invalid profile counts" unless warmup>=0 && iterations>0
+lines=File.readlines(input_path).map { _1.chomp.split("\t",6) }
+abort "Unknown workload" unless (selected-lines.select { _1.first=="case" }.map { _1[1] }).empty?
+if ENV["usage_rows"]
+  rows=Integer(ENV.fetch("usage_rows")); abort "Invalid setup rows" unless rows.positive?
+  setup=lines.find { _1.first=="setup" && _1[1].start_with?("INSERT INTO t SELECT") }
+  abort "Cannot identify benchmark setup" unless setup && setup[1].match?(/generate_series\(1,\d+\)/)
+  setup[1]=setup[1].sub(/generate_series\(1,\d+\)/,"generate_series(1,#{rows})")
+end
+lines.select! { _1.first=="setup" || selected.include?(_1[1]) }
+lines.each { |fields| if fields.first=="case"; fields[3]=warmup; fields[4]=iterations; end }
+destination=Dir.mktmpdir("jfr-",File.dirname(evidence_path))
+input=File.join(destination,"input.tsv"); File.write(input,lines.map { _1.join("\t") }.join("\n")+"\n")
+data_base=File.expand_path(ENV.fetch("usage_data_directory",destination)); FileUtils.mkdir_p(data_base)
+data=Dir.mktmpdir("database-",data_base)
+recording=File.join(destination,"execution.jfr")
+profile_command=[command.first,"-XX:StartFlightRecording=filename=#{recording},settings=profile,dumponexit=true",*command.drop(1),input,data]
+puts "JFR actor #{variant}; output #{destination}. Profiled times are not benchmark comparison evidence."; $stdout.flush
+out,err,status=Open3.capture3(*profile_command,chdir:JavaNativeTasks::ROOT)
+File.write(File.join(destination,"stdout.log"),out); File.write(File.join(destination,"stderr.log"),err)
+abort "Profile execution failed: #{err}" unless status.success?
+summary,errors,result=Open3.capture3(JavaNativeTasks.tool("jfr",variant),"summary",recording)
+File.write(File.join(destination,"summary.txt"),summary)
+abort "Cannot summarize JFR: #{errors}" unless result.success?
+metadata={generated_at:Time.now.utc.iso8601,benchmark_evidence:evidence_path,benchmark_evidence_sha256:Digest::SHA256.file(evidence_path).hexdigest,actor:actor,command:profile_command,input_sha256:Digest::SHA256.file(input).hexdigest,recording_sha256:Digest::SHA256.file(recording).hexdigest,notes:"JDK profile settings; startup, setup, warmup, execution and rendering included. Sampling/profiling overhead prevents using these timings as benchmark evidence. Inspect ExecutionSample, ObjectAllocationSample, GC and thread events; allocation events are samples, not exact counts."}
+File.write(File.join(destination,"profile.json"),JSON.pretty_generate(metadata)+"\n")
+puts "JFR complete: #{recording}; event summary: #{File.join(destination,'summary.txt')}"

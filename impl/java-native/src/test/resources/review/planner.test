@@ -1,0 +1,91 @@
+# Experimental Java review regressions, separate from the immutable acceptance inventory.
+# Predicate ownership, physical/logical column order, and fixed-prefix join namespaces.
+
+statement ok
+CREATE TABLE a(id i32 PRIMARY KEY, v i32)
+
+statement ok
+CREATE TABLE b(id i32 PRIMARY KEY)
+
+statement ok
+CREATE TABLE c(id i32 PRIMARY KEY)
+
+statement ok
+INSERT INTO a SELECT g,101-g FROM generate_series(1,100) g
+
+statement ok
+INSERT INTO b VALUES(1)
+
+statement ok
+INSERT INTO c VALUES(1)
+
+query I rowsort
+SELECT a.id FROM a JOIN b ON (1=2) JOIN c ON a.id=c.id
+----
+
+query I nosort
+SELECT count(*) FROM a JOIN b ON a IS NOT NULL CROSS JOIN c
+----
+100
+
+query I nosort
+SELECT count(*) FROM a JOIN b ON EXISTS (SELECT a.id) CROSS JOIN c
+----
+100
+
+statement ok
+CREATE INDEX av ON a(v)
+
+query I nosort
+SELECT a.id FROM a CROSS JOIN b CROSS JOIN c WHERE a.v<=2 ORDER BY a.id LIMIT 1
+----
+99
+
+statement ok
+CREATE TABLE p(id i32 PRIMARY KEY)
+
+statement ok
+CREATE TABLE q(id i32 PRIMARY KEY)
+
+statement ok
+CREATE TABLE d(id i32 PRIMARY KEY)
+
+statement ok
+CREATE TABLE e(id i32 PRIMARY KEY)
+
+statement ok
+INSERT INTO p VALUES(1)
+
+statement ok
+INSERT INTO q VALUES(2)
+
+statement ok
+INSERT INTO d VALUES(1),(2),(3)
+
+statement ok
+INSERT INTO e VALUES(1),(2)
+
+query I nosort
+SELECT id FROM p LEFT JOIN q USING(id) JOIN d USING(id) JOIN e USING(id) ORDER BY id
+----
+1
+
+query III nosort
+WITH x AS (SELECT id FROM p UNION ALL SELECT id FROM q) SELECT x.id,d.id,e.id FROM x JOIN d ON x.id=d.id JOIN e ON d.id=e.id ORDER BY x.id
+----
+1
+1
+1
+2
+2
+2
+
+query I nosort
+SELECT count(*) FROM a LEFT JOIN b ON a.id=b.id JOIN c ON a IS NOT NULL CROSS JOIN e
+----
+200
+
+query I nosort
+SELECT count(*) FROM a LEFT JOIN b ON a.id=b.id JOIN c ON EXISTS(SELECT a.id) CROSS JOIN e
+----
+200

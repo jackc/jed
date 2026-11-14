@@ -1,0 +1,24 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#MISE description="Explicit opt-in: list frozen Java acceptance inventory without claiming coverage"
+#USAGE flag "--output <path>" help="Write the full path/checksum inventory as JSON"
+require_relative "../../impl/java-native/Tools/tasks"
+spec = JavaNativeTasks.baseline_spec
+files = Dir.glob(File.join(spec, "**/*")).select { File.file?(_1) }.sort.to_h do |path|
+  [path.delete_prefix(spec + "/"), Digest::SHA256.file(path).hexdigest]
+end
+inventory = {
+  semantic_revision: JavaNativeTasks::BASELINE.fetch("semantic_revision"),
+  format_version: JavaNativeTasks::BASELINE.fetch("format_version"),
+  spec_files: files.length,
+  sql_files: files.keys.count { _1.start_with?("conformance/suites/") && _1.end_with?(".test") },
+  process_files: files.keys.count { _1.start_with?("conformance/process/") && _1.end_with?(".toml") },
+  simulation_regressions: files.keys.count { _1.start_with?("conformance/sim/regress/") && _1.end_with?(".sim") },
+  database_fixtures: files.keys.count { _1.start_with?("fileformat/") && _1.end_with?(".jed") },
+  full_parity: false,
+  inventory_sha256: Digest::SHA256.hexdigest(JSON.generate(files))
+}
+if ENV["usage_output"]
+  File.write(File.expand_path(ENV.fetch("usage_output")), JSON.pretty_generate(inventory.merge(files: files)) + "\n")
+end
+puts JSON.pretty_generate(inventory)

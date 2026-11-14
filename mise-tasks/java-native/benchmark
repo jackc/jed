@@ -1,0 +1,12 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#MISE description="Explicit opt-in: matched Java variants and frozen Go/Rust public-API benchmarks"
+#USAGE flag "--profile <name>" default="smoke" help="smoke correctness or diagnostic repeated timing; use an otherwise idle host for accepted timings"
+#USAGE flag "--repeats <n>" help="Independent process repetitions (default smoke1, diagnostic3)"
+#USAGE flag "--variants <list>" default="stable,ea,valhalla" help="Comma-separated Java variants, compiled from one frozen source snapshot"
+#USAGE flag "--cases <list>" help="Optional workload subset"
+#USAGE flag "--directory <path>" help="Evidence/build capture parent directory"
+#USAGE flag "--retained-memory" help="Run separate Java processes with requested GC before/after live and closed workloads; outside compared timings"
+#USAGE flag "--data-directory <path>" help="Database filesystem parent; filesystem identity is recorded"
+require_relative "../../impl/java-native/Tools/performance"
+JavaPerformance.run

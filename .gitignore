@@ -30,6 +30,10 @@
 /impl/csharp-native/**/obj/
 /impl/csharp-native/results/
 
+# Opt-in native Java experiment; JDKs and dependency archives live under .dev/.
+/impl/java-native/.build/
+/impl/java-native/results/
+
 # Go build artifacts. NOTE: do not ignore "*.test" — the conformance corpus files
 # use that extension (spec/conformance/suites/**/*.test).
 /impl/go/bin/

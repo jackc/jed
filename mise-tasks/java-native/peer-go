@@ -1,0 +1,5 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#MISE description="Explicit opt-in: build the frozen independent Go process peer offline"
+require_relative "../../impl/java-native/Tools/peer_actors"
+puts JavaPeerActors.go

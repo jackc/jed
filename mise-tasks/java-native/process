@@ -1,0 +1,67 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#MISE description="Explicit opt-in: Java processes against the frozen page-service corpus"
+#USAGE flag "--variant <variant>" default="stable" help="stable, ea, or valhalla"
+#USAGE flag "--filter <substring>" help="Select scenario filenames containing this substring"
+#USAGE flag "--evidence-dir <directory>" help="Preserve per-pair committed images through the frozen driver diagnostic seam"
+#USAGE flag "--actor <directory>" help="Use an existing immutable Java actor capture"
+#USAGE flag "--cores <cores>" default="java-native" help="Unique cores including java-native; optional frozen go, rust, node peers"
+require_relative "../../impl/java-native/Tools/peer_actors"
+require "shellwords"
+cores = ENV.fetch("usage_cores", "java-native").split(",", -1)
+abort "Select unique cores including java-native and only go, rust, node peers" unless cores.include?("java-native") && cores.uniq == cores && (cores - %w[java-native go rust node]).empty?
+variant = ENV.fetch("usage_variant", "stable")
+revision = JavaNativeTasks::BASELINE.fetch("semantic_revision")
+driver, error, status = Open3.capture3("git", "show", "#{revision}:scripts/process_conformance.rb", chdir: JavaNativeTasks::ROOT)
+abort "Cannot read frozen process driver: #{error}" unless status.success?
+replacements = {
+  'require_relative "lib/bundle_setup"' => 'require ' + File.join(JavaNativeTasks::ROOT, "scripts/lib/bundle_setup").dump,
+  'ROOT = File.expand_path("..", __dir__)' => 'ROOT = ' + JavaNativeTasks::ROOT.dump,
+  '              when "swift-native" then' => '              when "java-native" then [ENV.fetch("JED_JAVA_PROCESS_ACTOR")]' + "\n" + '              when "swift-native" then'
+}
+{ "go" => '[File.join(ROOT, "impl/go/process_actor")]',
+  "rust" => '[File.join(ROOT, "impl/rust/target/release/process_actor")]',
+  "node" => '["node", File.join(ROOT, "impl/ts/src/bin/process_actor.ts")]' }.each do |core, source|
+  replacements[source] = JavaPeerActors.command(core).inspect if cores.include?(core)
+end
+replacements.each { |from, to| abort "Frozen process transport adapter changed: #{from}" unless driver.sub!(from, to) }
+spec = JavaNativeTasks.baseline_spec
+corpus = File.join(spec, "conformance/process")
+files = Dir.glob(File.join(corpus, "*.process.toml")).sort
+abort "Frozen process inventory must contain 31 scenarios" unless files.length == 31
+filter = ENV["usage_filter"]
+selected = files.select { filter.nil? || File.basename(_1).include?(filter) }
+abort "Filter selects no process scenario" if selected.empty?
+capture = ENV["usage_actor"] ? File.expand_path(ENV.fetch("usage_actor")) : JavaNativeTasks.capture(JavaNativeTasks.build(variant), variant)
+manifest = JSON.parse(File.read(File.join(capture, "artifacts.json")))
+manifest.each { |name, hash| abort "Immutable Java actor differs: #{name}" unless Digest::SHA256.file(File.join(capture, name)).hexdigest == hash }
+metadata = JSON.parse(File.read(File.join(capture, "build.json")))
+abort "Actor runtime variant mismatch" unless metadata.fetch("variant") == variant
+if ENV["usage_evidence_dir"]
+  evidence = File.expand_path(ENV.fetch("usage_evidence_dir")); FileUtils.mkdir_p(evidence)
+  peers = cores.reject { _1 == "java-native" }.to_h do |core|
+    identity = core == "go" ? "#{JavaPeerActors.go}.json" : File.join(JavaNativeTasks::DEV, "peers", revision, "process-#{core}.json")
+    [core, JSON.parse(File.read(identity))]
+  end
+  File.write(File.join(evidence, "actors.json"), JSON.pretty_generate({ semantic_revision: revision, cores: cores,
+    java_actor: capture, java_build: metadata, java_artifacts: manifest, peers: peers,
+    adapted_driver_sha256: Digest::SHA256.hexdigest(driver),
+    scenarios: selected.to_h { [File.basename(_1), Digest::SHA256.file(_1).hexdigest] } }) + "\n")
+end
+status = nil
+Dir.mktmpdir("jed-java-process-") do |directory|
+  actor = File.join(directory, "actor")
+  File.write(actor, "#!/bin/sh\nexec #{(JavaNativeTasks.actor_command(capture, variant) + ['process-actor']).shelljoin} \"$@\"\n")
+  File.chmod(0o500, actor)
+  driver_path = File.join(directory, "process_conformance.rb")
+  File.write(driver_path, driver)
+  warn "Frozen Java process selection: #{selected.length}/31 scenarios; source #{metadata.fetch('source_sha256')}; actor #{capture}"
+  environment = { "JED_PROCESS_CORES" => cores.join(","), "JED_JAVA_PROCESS_ACTOR" => actor,
+    "JED_PROCESS_PAGES_ACTOR" => actor, "JED_PROCESS_CORPUS" => corpus,
+    "JED_PROCESS_FIXTURE_ROOT" => File.join(spec, "fileformat/fixtures"), "JED_PROCESS_STRICT_CORES" => "1" }
+  environment["JED_PROCESS_FILTER"] = filter if filter
+  environment["JED_PROCESS_ARTIFACTS"] = File.expand_path(ENV.fetch("usage_evidence_dir")) if ENV["usage_evidence_dir"]
+  system(environment, "ruby", driver_path)
+  status = $?
+end
+exit(status&.exitstatus || 1)

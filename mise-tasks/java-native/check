@@ -1,0 +1,12 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#MISE description="Explicit opt-in: compile and run Java host/invariant checks"
+#USAGE flag "--actor <directory>" help="Reuse and validate an immutable Java actor capture"
+#USAGE flag "--variant <variant>" default="stable" help="stable, ea, or valhalla"
+require_relative "../../impl/java-native/Tools/tasks"
+variant = ENV.fetch("usage_variant", "stable")
+if ENV["usage_actor"]
+  JavaNativeTasks.run_actor(ENV.fetch("usage_actor"), variant, "check", JavaNativeTasks.baseline_spec)
+else
+  JavaNativeTasks.run(JavaNativeTasks.build(variant), variant, "check", JavaNativeTasks.baseline_spec)
+end

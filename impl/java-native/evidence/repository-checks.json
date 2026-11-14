@@ -1,0 +1,44 @@
+{
+  "schema": 1,
+  "baseline": "3e5962f9affc06c768df1688765162a65a893848",
+  "checks": [
+    {
+      "name": "default-ci",
+      "original_log": ".dev/java-native/default-ci-second.log",
+      "log_sha256": "e7bc18b1d6f910b8403267a8335bd576a499bdabfebeae2b480dfc80fd827e6c",
+      "compressed_log": "default-ci.log.gz",
+      "compressed_sha256": "2d79287e8f5698512a5d306849a6e3d6a682b0b16de58d41df311015eb61c415",
+      "summary": [
+        "ci: 18 steps in 154.3s",
+        "ok     verify                           41.7s",
+        "ok     fmt                               9.0s",
+        "ok     lint                              0.3s",
+        "ok     lint:rust                         0.4s",
+        "ok     typecheck:ts                     41.0s",
+        "ok     web:check                        23.3s",
+        "ok     conformance:all --checked       125.6s",
+        "ok     unit                             93.1s",
+        "ok     cli:test                          7.5s",
+        "ok     ruby:test                         1.1s",
+        "ok     migrate:test                      6.6s",
+        "ok     concurrency:process              80.0s",
+        "ok     sim:regress                      27.0s",
+        "ok     sim:sweep 1..8                  133.2s",
+        "ok     e2e:ts                           53.6s",
+        "ok     e2e:web                         130.9s",
+        "ok     corpus:norec_sweep               11.6s",
+        "ok     corpus:reduce_selftest            0.3s"
+      ]
+    },
+    {
+      "name": "codegen",
+      "original_log": ".dev/java-native/codegen-final.log",
+      "log_sha256": "02caac3b168b00ac596d0130ddf8d36680e2ff53325e1bc1eec77ef1d871bc29",
+      "compressed_log": "codegen.log.gz",
+      "compressed_sha256": "959ce14441e355a1124fdcad0ce3ee90e2fdc58e71bb8dda9f8127c85b1fee5f",
+      "summary": [
+        "17 Java data catalogs verified"
+      ]
+    }
+  ]
+}

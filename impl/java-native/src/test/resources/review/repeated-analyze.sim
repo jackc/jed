@@ -1,0 +1,27 @@
+# format: simulation
+# profile: repeated-analyze-review
+# seed: 1
+# page_size: 512
+# cache_bytes: 2048
+# clock: 1700000000000000
+# ANALYZE publishes even when the retained catalog bytes are unchanged.
+# Empty transactions and zero-row DML still preserve the committed generation.
+open w1 write
+on w1 CREATE TABLE t(id i32 PRIMARY KEY, n i32)
+on w1 INSERT INTO t VALUES (1,10),(2,20),(3,30)
+on w1 ANALYZE t
+commit w1
+open r1 read
+open w2 write
+on w2 DELETE FROM t WHERE id=99
+on w2 ANALYZE t
+commit w2
+check
+open w3 write
+on w3 UPDATE t SET n=n+1 WHERE id=99
+commit w3
+open w4 write
+commit w4
+close r1
+reopen
+check

@@ -47,11 +47,22 @@ files in the same change.
   supply a fresh worker through `workerFactory` and call the public
   `startDatabaseWorker({ configure })` helper. Jed owns worker cleanup. Configuration may await;
   SQL kernels remain synchronous, with no application-thread callback RPC.
-- Experimental cores (`impl/ruby-native`, `impl/swift-native`, and `impl/csharp-native`) are opt-in: exclude them
+- Experimental cores (`impl/ruby-native`, `impl/swift-native`, `impl/csharp-native`, and `impl/java-native`) are opt-in: exclude them
   from normal tests, benchmarks, CI, and future feature updates unless explicitly
   requested. Record coverage and omissions against the experiment's source revision;
   promotion to supported status requires a separate decision. See
   `spec/design/ruby-native-experiment.md` and `spec/design/swift-native-experiment.md`.
+  The native Java experiment was authorized 2026-11-14 against
+  `3e5962f9affc06c768df1688765162a65a893848`, format v53. Full frozen parity on Linux
+  x86-64 is the goal; Java 25 is the stable target with controlled JDK 28/value-class
+  comparisons. Blocking streaming APIs support ordinary/virtual threads and explicit
+  cancellation. Narrow JDK FFM OS host calls and Bouncy Castle Java
+  `bcprov-jdk18on:1.86` for Argon2id/internal helpers are approved. Setup downloads,
+  subagent implementation/review, verification, profiling and local commits are
+  authorized. All three variants pass frozen correctness acceptance; controlled
+  performance measurement remains in progress. No promotion, default CI, website,
+  publication, JDBC/ORM, Native Image or other-platform obligation is included.
+  See `spec/design/java-native-experiment.md`.
   The explicitly authorized C# parity/performance refresh (2026-11-13) targets
   `6b2355d98a7fd3738c60474779d1d63548f350dc` and format v53. Linux x86-64,
   pinned .NET 11 and async-first APIs remain its scope: resident kernels run

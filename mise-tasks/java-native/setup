@@ -1,0 +1,46 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#MISE description="Explicit opt-in: install checksum-pinned Java experiment JDKs and scoped crypto artifacts"
+#USAGE flag "--downloads <directory>" help="Use already downloaded archives/JARs from a directory; verify pinned SHA-256"
+require_relative "../../impl/java-native/Tools/tasks"
+
+abort "Initial Java setup supports Linux x86-64 only" unless RUBY_PLATFORM.include?("linux") && RUBY_PLATFORM.include?("x86_64")
+FileUtils.mkdir_p(JavaNativeTasks::DEV)
+File.open(File.join(JavaNativeTasks::DEV, ".setup.lock"), "w") do |lock|
+  lock.flock(File::LOCK_EX)
+  JavaNativeTasks::TOOLCHAINS.fetch("artifacts").each do |name, item|
+    destination = JavaNativeTasks.artifact_path(name)
+    checksum = item.fetch("sha256")
+    marker = File.join(destination, ".archive.sha256")
+    if item.fetch("kind") == "jdk"
+      next if File.file?(marker) && File.read(marker).strip == checksum && File.executable?(File.join(destination, "bin/java"))
+    else
+      next if File.file?(destination) && Digest::SHA256.file(destination).hexdigest == checksum
+    end
+    Dir.mktmpdir("install-", JavaNativeTasks::DEV) do |temporary|
+      filename = item.fetch("url").split("/").last
+      archive = ENV["usage_downloads"] ? File.join(File.expand_path(ENV.fetch("usage_downloads")), filename) : File.join(temporary, filename)
+      unless ENV["usage_downloads"]
+        puts "Downloading #{name} #{item.fetch('version')}"
+        $stdout.flush
+        JavaNativeTasks.command!("curl", "--fail", "--location", "--retry", "2", "--silent", "--show-error", "--output", archive, item.fetch("url"))
+      end
+      abort "Missing #{archive}" unless File.file?(archive)
+      abort "SHA-256 mismatch for #{name}; refusing installation" unless Digest::SHA256.file(archive).hexdigest == checksum
+      FileUtils.mkdir_p(File.dirname(destination))
+      if item.fetch("kind") == "jdk"
+        unpacked = File.join(temporary, "unpacked")
+        FileUtils.mkdir_p(unpacked)
+        JavaNativeTasks.command!("tar", "-xzf", archive, "--strip-components=1", "-C", unpacked)
+        abort "Incomplete JDK archive" unless %w[java javac jar].all? { File.executable?(File.join(unpacked, "bin", _1)) }
+        File.write(File.join(unpacked, ".archive.sha256"), checksum + "\n")
+        FileUtils.rm_rf(destination)
+        FileUtils.mv(unpacked, destination)
+      else
+        FileUtils.cp(archive, destination)
+      end
+    end
+  end
+end
+%w[stable ea].each { JavaNativeTasks.command!(JavaNativeTasks.tool("java", _1), "--version") }
+puts "Java dependencies installed under #{JavaNativeTasks::DEV}"

@@ -1,0 +1,101 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#MISE description="Explicit opt-in: freeze one source and run Java SQL/host/process/stress/fault acceptance across selected JVM variants"
+#USAGE flag "--variants <variants>" default="stable,ea,valhalla" help="Unique comma-separated stable,ea,valhalla variants"
+#USAGE flag "--evidence-dir <directory>" help="New output directory for source snapshot, actors, logs and report"
+#USAGE flag "--jobs <jobs>" default="3" help="Maximum parallel JVM-variant verification runs; this task records no performance timings"
+require_relative "../../impl/java-native/Tools/tasks"
+
+variants = ENV.fetch("usage_variants", "stable,ea,valhalla").split(",", -1)
+abort "Choose unique known JVM variants" unless !variants.empty? && variants.uniq == variants && (variants - JavaNativeTasks::VARIANTS).empty?
+jobs_count = Integer(ENV.fetch("usage_jobs", "3"))
+abort "Jobs must be between 1 and 3" unless (1..3).cover?(jobs_count)
+output = ENV["usage_evidence_dir"] ? File.expand_path(ENV.fetch("usage_evidence_dir")) : Dir.mktmpdir("acceptance-", JavaNativeTasks::DEV)
+abort "Evidence directory is not empty" if File.directory?(output) && !Dir.empty?(output)
+FileUtils.mkdir_p(output)
+source = File.join(output, "source")
+source_hash = JavaNativeTasks.capture_sources(source)
+spec = JavaNativeTasks.baseline_spec
+actors = variants.to_h do |variant|
+  actor = JavaNativeTasks.capture(JavaNativeTasks.build(variant, source_root: source), variant)
+  identity = JSON.parse(File.read(File.join(actor, "build.json")))
+  abort "Variant source changed during build" unless identity.fetch("source_sha256") == source_hash
+  [variant, { path: actor, identity: identity }]
+end
+puts "Acceptance source #{source_hash}; evidence #{output}"
+$stdout.flush
+policy_paths = ->(root) do
+  (Dir.glob("mise-tasks/java-native/*", base: root) + Dir.glob("impl/java-native/Tools/**/*", base: root) +
+    %w[impl/java-native/baseline.json impl/java-native/toolchains.json]).select { File.file?(File.join(root, _1)) }.sort
+end
+frozen_policy = policy_paths.call(source).to_h { |path| [path, File.binread(File.join(source, path))] }
+check_policy = -> do
+  abort "Acceptance policy file set changed" unless policy_paths.call(JavaNativeTasks::ROOT) == frozen_policy.keys
+  frozen_policy.each do |path, bytes|
+    abort "Acceptance policy changed: #{path}" unless bytes == File.binread(File.join(JavaNativeTasks::ROOT, path))
+  end
+end
+check_policy.call
+results = []
+report_lock = Mutex.new
+review_traces = Dir.glob(File.join(source, "impl/java-native/src/test/resources/review/*.sim")).sort
+expected_checks = variants.length * (10 + review_traces.length)
+report = -> do
+  File.write(File.join(output, "report.json"), JSON.pretty_generate(schema: 1, baseline: JavaNativeTasks::BASELINE,
+    source_sha256: source_hash, actors: actors, results: results, expected_checks: expected_checks, complete: results.length == expected_checks,
+    all_passed: results.length == expected_checks && results.all? { _1[:pass] }) + "\n")
+end
+report.call
+run_variant = ->(variant, actor) do
+  common = ["--variant", variant, "--actor", actor.fetch(:path)]
+  jobs = [
+    ["host", "check", *common],
+    ["memory", "conformance", *common, "--all"],
+    ["plain", "conformance", *common, "--all", "--disk"],
+    ["encrypted", "conformance", *common, "--all", "--encrypted"],
+    ["stress", "stress", *common],
+    ["process", "process", *common, "--cores", "java-native,go,rust,node", "--evidence-dir", File.join(output, "#{variant}-process")],
+    ["saved", "simulation-sweep", *common, "--regress", "--evidence-dir", File.join(output, "#{variant}-saved")],
+    ["seeded", "simulation-sweep", *common, "--seeds", "1..3", "--evidence-dir", File.join(output, "#{variant}-seeded")],
+    ["review", "conformance", *common, "--files", Dir.glob(File.join(source, "impl/java-native/src/test/resources/review/*.test")).sort.join(",")],
+    ["review-plain", "conformance", *common, "--disk", "--files", Dir.glob(File.join(source, "impl/java-native/src/test/resources/review/*.test")).sort.join(",")]
+  ]
+  review_traces.each do |trace|
+    name = "review-#{File.basename(trace, '.sim')}"
+    jobs << [name, "simulation", *common, "--file", trace, "--peer", "--evidence-dir", File.join(output, "#{variant}-#{name}")]
+  end
+  jobs.each do |name, task, *arguments|
+    # The driver policy is part of the captured source too. Running live task
+    # adapters after an edit would not be evidence for this frozen source.
+    check_policy.call
+    log = File.join(output, "#{variant}-#{name}.log")
+    command = ["mise", "run", "java-native:#{task}", *arguments]
+    started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    passed = system(*command, chdir: JavaNativeTasks::ROOT, out: log, err: [:child, :out])
+    check_policy.call
+    row = { variant: variant, check: name, pass: passed, exit_status: $?&.exitstatus,
+      seconds: Process.clock_gettime(Process::CLOCK_MONOTONIC) - started, command: command,
+      log: File.basename(log), log_sha256: Digest::SHA256.file(log).hexdigest }
+    report_lock.synchronize { results << row; report.call }
+    puts "#{passed ? 'PASS' : 'FAIL'} Java #{variant} #{name}: #{log}"; $stdout.flush
+  end
+end
+queue = Queue.new
+actors.each { |entry| queue << entry }
+workers = Array.new([jobs_count, actors.length].min) do
+  Thread.new do
+    loop do
+      begin
+        variant, actor = queue.pop(true)
+      rescue ThreadError
+        break
+      end
+      run_variant.call(variant, actor)
+    end
+  end
+end
+workers.each(&:value)
+check_policy.call
+report.call
+abort "Acceptance contains failing gates; see #{output}/report.json" unless results.all? { _1[:pass] }
+puts "PASS frozen Java acceptance: #{variants.join(',')}; source #{source_hash}; #{results.length} gates"

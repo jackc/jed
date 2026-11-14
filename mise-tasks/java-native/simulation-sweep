@@ -1,0 +1,88 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#MISE description="Explicit opt-in: complete pinned saved or generated simulation traces with exact independent Go comparison"
+#USAGE flag "--actor <directory>" help="Reuse a validated immutable Java actor capture"
+#USAGE flag "--variant <variant>" default="stable" help="stable, ea, or valhalla"
+#USAGE flag "--evidence-dir <directory>" help="Retain generated traces, actor identity and complete-run logs"
+#USAGE flag "--regress" help="Run every saved baseline regression instead of generated profiles"
+#USAGE flag "--profile <profile>" default="all" help="Pinned profile name or all"
+#USAGE flag "--seeds <seeds>" default="1" help="Unsigned seed or inclusive range, for example 1..8"
+#USAGE flag "--steps <steps>" help="Explicit diagnostic trace length; default preserves each canonical profile length"
+require_relative "../../impl/java-native/Tools/peer_actors"
+require_relative "../../scripts/lib/bundle_setup"
+require "tmpdir"
+
+policy_paths = %w[mise-tasks/java-native/simulation mise-tasks/java-native/simulation-sweep].map { File.join(JavaNativeTasks::ROOT, _1) }
+policy_hashes = policy_paths.to_h { |path| [path, Digest::SHA256.file(path).hexdigest] }
+check_policy = -> { abort "Simulation tooling changed during the sweep; rerun for stable evidence" unless policy_hashes.all? { |path, hash| Digest::SHA256.file(path).hexdigest == hash } }
+
+revision = JavaNativeTasks::BASELINE.fetch("semantic_revision")
+peers = File.dirname(JavaPeerActors.go(:simulation))
+generator = File.join(peers, "scripts/sim_gen.rb")
+File.open("#{peers}.lock", File::RDWR | File::CREAT, 0o600) do |lock|
+  lock.flock(File::LOCK_EX)
+  marker = File.join(peers, ".simulation-generator-complete")
+  unless File.file?(marker)
+    statuses = Open3.pipeline(["git", "archive", revision, "scripts/sim_gen.rb", "scripts/lib", { chdir: JavaNativeTasks::ROOT }], ["tar", "-x", "-C", peers])
+    abort "Cannot extract frozen trace generator" unless statuses.all?(&:success?)
+    File.write(marker, "#{revision}\n")
+  end
+end
+# The pinned generator uses the same bootstrap; avoid loading two DevPaths modules.
+$LOADED_FEATURES << File.join(peers, "scripts/lib/bundle_setup.rb")
+require generator
+output = ENV["usage_evidence_dir"] ? File.expand_path(ENV.fetch("usage_evidence_dir")) : Dir.mktmpdir("jed-java-simulation-sweep-", JavaNativeTasks::DEV)
+FileUtils.mkdir_p(output)
+warn "Simulation sweep evidence: #{output}"
+seed_text = ENV.fetch("usage_seeds", "1")
+abort "Seeds must be an unsigned integer or inclusive range" unless seed_text.match?(/\A\d+(?:\.\.\d+)?\z/)
+first, last = seed_text.split("..").map { Integer(_1) }; last ||= first
+abort "Invalid seed range" unless first <= last && last <= 0xffff_ffff_ffff_ffff && last - first < 10000
+seeds = (first..last).to_a
+selected = ENV.fetch("usage_profile", "all")
+selected = selected == "all" ? SimGen.profile_names : [selected]
+abort "Unknown pinned profile" unless (selected - SimGen.profile_names).empty?
+steps = ENV["usage_steps"] && Integer(ENV["usage_steps"])
+abort "Steps must be positive" if steps && steps <= 0
+traces = if ENV["usage_regress"] == "true"
+           Dir.glob(File.join(peers, "spec/conformance/sim/regress/*.sim")).sort
+         else
+           directory = File.join(output, "traces"); FileUtils.mkdir_p(directory)
+           selected.product(seeds).map do |profile, seed|
+             path = File.join(directory, "#{profile}-#{seed}.sim")
+             File.write(path, SimGen.generate(profile, seed, steps: steps)); path
+           end
+         end
+abort "No complete traces selected" if traces.empty?
+variant = ENV.fetch("usage_variant", "stable")
+actor = ENV["usage_actor"] ? File.expand_path(ENV.fetch("usage_actor")) : JavaNativeTasks.capture(JavaNativeTasks.build(variant), variant)
+hashes = JSON.parse(File.read(File.join(actor, "artifacts.json")))
+hashes.each { |name, hash| abort "Immutable actor changed" unless Digest::SHA256.file(File.join(actor, name)).hexdigest == hash }
+identity = JSON.parse(File.read(File.join(actor, "build.json")))
+abort "Actor variant mismatch" unless identity.fetch("variant") == variant
+manifest = { baseline: revision, generator_sha256: Digest::SHA256.file(generator).hexdigest,
+  actor: actor, source: identity, artifacts: hashes, tool_policy_sha256: policy_hashes, profile_names: selected, seeds: seeds, steps_override: steps,
+  traces: traces.to_h { |path| [File.basename(path), Digest::SHA256.file(path).hexdigest] } }
+File.write(File.join(output, "manifest.json"), JSON.pretty_generate(manifest) + "\n")
+results = traces.map do |path|
+  check_policy.call
+  log = File.join(output, File.basename(path, ".sim") + ".log")
+  progress = log + ".progress"
+  command = ["timeout", "180", "mise", "run", "java-native:simulation", "--actor", actor, "--variant", variant,
+    "--file", path, "--peer", "--evidence-dir", File.join(output, File.basename(path, ".sim"))]
+  passed = system({ "JED_SIM_PROGRESS" => progress }, *command, out: log, err: [:child, :out])
+  status = $?&.exitstatus
+  check_policy.call
+  mode = File.foreach(path).any? { |line| line.start_with?("fault read_error", "fault enospc", "fault spill_error", "corrupt") } ? "intrinsic" : "exact"
+  row = { trace: File.basename(path), pass: passed, mode: mode, status: status, log: log }
+  puts "#{passed ? 'PASS' : 'FAIL'} #{mode} complete simulation #{File.basename(path)}"
+  row
+end
+check_policy.call
+File.write(File.join(output, "results.json"), JSON.pretty_generate(results) + "\n")
+puts "Simulation sweep: #{results.count { _1[:pass] }}/#{results.length} complete peer-oracle traces passed"
+%w[exact intrinsic].each do |mode|
+  selected_results = results.select { _1[:mode] == mode }
+  puts "  #{mode}: #{selected_results.count { _1[:pass] }}/#{selected_results.length}"
+end
+exit(results.all? { _1[:pass] } ? 0 : 1)

@@ -23,6 +23,15 @@ failing test the day it is written. Everything below follows from taking that li
 
 ## 1. The principle: a core only earns its place if it can *disagree*
 
+The [native Java experiment](java-native-experiment.md) was authorized 2026-11-14
+at `3e5962f9affc06c768df1688765162a65a893848` (v53), targeting Linux x86-64 and
+Java 25, with controlled JDK 28/value-class comparisons. It is in progress and
+opt-in; neither production delivery nor supported-core promotion is selected.
+The pre-Valhalla performance leaning below is historical: primitive arrays and
+typed kernels offer efficient on-heap representations today, while JDK 28's
+first value-object preview does not deliver the complete specialized-generics
+roadmap. Measurements, not that leaning, govern the experiment.
+
 The [native C# experiment](csharp-native-experiment.md), authorized 2026-11-12,
 is in progress under `impl/csharp-native`, with semantic baseline
 `b1a6affca7725e0b07a4f734eddb1c569ef76bcf`. It follows the opt-in experimental

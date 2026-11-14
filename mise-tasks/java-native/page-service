@@ -1,0 +1,8 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#MISE description="Explicit opt-in: Java Unix socket and frozen Go mixed-core page service checks"
+#USAGE flag "--variant <variant>" default="stable" help="stable, ea, or valhalla"
+require_relative "../../impl/java-native/Tools/peer_actors"
+variant = ENV.fetch("usage_variant", "stable")
+peer = JavaPeerActors.go
+JavaNativeTasks.run(JavaNativeTasks.build(variant), variant, "page-service", peer)

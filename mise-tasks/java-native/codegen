@@ -1,0 +1,313 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#MISE description="Explicit opt-in: generate Java mechanical catalogs from its frozen spec"
+#USAGE flag "--check" help="Fail on stale generated catalogs without writing"
+require "bundler/setup"
+require "toml-rb"
+require_relative "../../impl/java-native/Tools/tasks"
+
+spec = JavaNativeTasks.baseline_spec
+header = "// Generated data from #{JavaNativeTasks::BASELINE.fetch('semantic_revision')}.\n// Regenerate only with mise run java-native:codegen.\npackage org.jed;\n\n"
+quote = ->(value) { JSON.generate(value.to_s) }
+array = ->(values) { "java.util.List.of(#{values.map { quote.call(_1) }.join(', ')})" }
+constant = ->(name) { name.upcase }
+schedule = TomlRB.load_file(File.join(spec, "cost/schedule.toml"))
+costs = schedule.fetch("unit").map { "    public static final long #{constant.call(_1.fetch('id'))} = #{_1.fetch('weight')}L;" }
+states = TomlRB.load_file(File.join(spec, "errors/registry.toml")).fetch("error").map do |entry|
+  "    public static final String #{constant.call(entry.fetch('name'))} = #{quote.call(entry.fetch('code'))};"
+end
+outputs = {}
+outputs["Costs.java"] = header + "public final class Costs {\n    private Costs() {}\n#{costs.join("\n")}\n}\n"
+outputs["SqlStates.java"] = header + "public final class SqlStates {\n    private SqlStates() {}\n#{states.join("\n")}\n}\n"
+%w[memory limits reclamation].each do |table|
+  name = table.capitalize + "Schedule"
+  rows = schedule.fetch(table).map { |key, value| "    public static final long #{constant.call(key)} = #{value}L;" }
+  outputs["#{name}.java"] = header + "public final class #{name} {\n    private #{name}() {}\n#{rows.join("\n")}\n}\n"
+end
+estimator = TomlRB.load_file(File.join(spec, "cost/estimator.toml"))
+constants = estimator.filter_map { |key, value| "    static final long #{constant.call(key)} = #{value}L;" if value.is_a?(Integer) }
+fractions = estimator.fetch("selectivity").map { |entry| "    static final Fraction #{constant.call(entry.fetch('id'))} = new Fraction(#{entry.fetch('numerator')}L, #{entry.fetch('denominator')}L);" }
+outputs["EstimatorFacts.java"] = header + "final class EstimatorFacts {\n    private EstimatorFacts() {}\n    record Fraction(long numerator, long denominator) {}\n#{constants.join("\n")}\n#{fractions.join("\n")}\n}\n"
+scalars = TomlRB.load_file(File.join(spec, "types/scalars.toml")).fetch("type")
+facts = scalars.map do |entry|
+  "        new Fact(#{quote.call(entry.fetch('id'))}, #{quote.call(entry.fetch('family'))}, #{entry.fetch('min', 0)}L, #{entry.fetch('max', 0)}L, #{entry.fetch('rank', 0)}, #{array.call([entry.fetch('id'), *entry.fetch('aliases')])}, #{quote.call(entry.fetch('btree_opclass', ''))})"
+end
+outputs["ScalarCatalog.java"] = header + <<~JAVA
+  public final class ScalarCatalog {
+      private ScalarCatalog() {}
+      public record Fact(String id, String family, long min, long max, int rank, java.util.List<String> aliases, String btreeOpclass) {}
+      public static final java.util.List<Fact> FACTS = java.util.List.of(
+  #{facts.join(",\n")}
+      );
+  }
+JAVA
+ranges = TomlRB.load_file(File.join(spec, "types/ranges.toml")).fetch("range")
+facts = ranges.map do |entry|
+  "        new Fact(#{quote.call(entry.fetch('id'))}, #{quote.call(entry.fetch('element'))}, #{entry.fetch('discrete')}, #{array.call([entry.fetch('id'), *entry.fetch('aliases')])})"
+end
+outputs["RangeCatalog.java"] = header + <<~JAVA
+  public final class RangeCatalog {
+      private RangeCatalog() {}
+      public record Fact(String id, String element, boolean discrete, java.util.List<String> aliases) {}
+      public static final java.util.List<Fact> FACTS = java.util.List.of(
+  #{facts.join(",\n")}
+      );
+  }
+JAVA
+casts = TomlRB.load_file(File.join(spec, "types/casts.toml")).fetch("cast")
+facts = casts.map do |entry|
+  "        new Fact(#{quote.call(entry.fetch('from'))}, #{quote.call(entry.fetch('to'))}, #{quote.call(entry.fetch('mode'))}, #{entry.fetch('traps', true)}, #{entry.fetch('preserves_equality', false)})"
+end
+outputs["CastCatalog.java"] = header + <<~JAVA
+  public final class CastCatalog {
+      private CastCatalog() {}
+      public record Fact(String from, String to, String mode, boolean traps, boolean preservesEquality) {}
+      public static final java.util.List<Fact> FACTS = java.util.List.of(
+  #{facts.join(",\n")}
+      );
+  }
+JAVA
+functions = TomlRB.load_file(File.join(spec, "functions/catalog.toml")).fetch("operator").select { _1.fetch("kind") == "function" }
+facts = functions.map do |entry|
+  "        new Fact(#{quote.call(entry.fetch('name'))}, #{entry.fetch('arity')}, #{array.call(entry.fetch('arg_families'))}, #{quote.call(entry.fetch('result'))}, #{array.call(entry.fetch('arg_names', []))}, #{array.call(entry.fetch('arg_defaults', []))}, #{entry.fetch('traps', true)}, #{quote.call(entry.fetch('volatility'))}, #{entry.fetch('preserves_equality', false)})"
+end
+outputs["FunctionCatalog.java"] = header + <<~JAVA
+  public final class FunctionCatalog {
+      private FunctionCatalog() {}
+      public record Fact(String name, int arity, java.util.List<String> families, String result, java.util.List<String> argumentNames, java.util.List<String> defaults, boolean traps, String volatility, boolean preservesEquality) {}
+      public static final java.util.List<Fact> FACTS = java.util.List.of(
+  #{facts.join(",\n")}
+      );
+  }
+JAVA
+srfs = TomlRB.load_file(File.join(spec, "functions/catalog.toml")).fetch("set_returning")
+facts = srfs.map do |entry|
+  "        new Fact(#{quote.call(entry.fetch('name'))}, #{entry.fetch('arity')}, #{array.call(entry.fetch('arg_families'))}, #{quote.call(entry.fetch('result'))}, #{quote.call(entry.fetch('column', ''))}, #{quote.call(entry.fetch('column_source', ''))})"
+end
+outputs["SetReturningCatalog.java"] = header + <<~JAVA
+  public final class SetReturningCatalog {
+      private SetReturningCatalog() {}
+      public record Fact(String name, int arity, java.util.List<String> families, String result, String column, String columnSource) {}
+      public static final java.util.List<Fact> FACTS = java.util.List.of(
+  #{facts.join(",\n")}
+      );
+  }
+JAVA
+windows = TomlRB.load_file(File.join(spec, "functions/catalog.toml")).fetch("window")
+facts = windows.map do |entry|
+  "        new Fact(#{quote.call(entry.fetch('name'))}, #{quote.call(entry.fetch('args'))}, #{quote.call(entry.fetch('result'))}, #{entry.fetch('frame_sensitive')})"
+end
+outputs["WindowCatalog.java"] = header + <<~JAVA
+  public final class WindowCatalog {
+      private WindowCatalog() {}
+      public record Fact(String name, String arguments, String result, boolean frameSensitive) {}
+      public static final java.util.List<Fact> FACTS = java.util.List.of(
+  #{facts.join(",\n")}
+      );
+  }
+JAVA
+coercions = TomlRB.load_file(File.join(spec, "types/compare.toml")).fetch("arg_coercion")
+facts = coercions.map do |entry|
+  "        new Fact(#{quote.call(entry.fetch('from'))}, #{quote.call(entry.fetch('to'))}, #{entry.fetch('cost')})"
+end
+outputs["ArgCoercionCatalog.java"] = header + <<~JAVA
+  public final class ArgCoercionCatalog {
+      private ArgCoercionCatalog() {}
+      public record Fact(String from, String to, int cost) {}
+      public static final java.util.List<Fact> FACTS = java.util.List.of(
+  #{facts.join(",\n")}
+      );
+  }
+JAVA
+operators = TomlRB.load_file(File.join(spec, "functions/catalog.toml")).fetch("operator").select { _1.key?("precedence") }
+facts = operators.map do |entry|
+  "        new Fact(#{quote.call(entry.fetch('name'))}, #{quote.call(entry.fetch('symbol', ''))}, #{quote.call(entry.fetch('kind'))}, #{entry.fetch('arity')}, #{entry.fetch('precedence')})"
+end.uniq
+outputs["OperatorCatalog.java"] = header + <<~JAVA
+  public final class OperatorCatalog {
+      private OperatorCatalog() {}
+      public record Fact(String name, String symbol, String kind, int arity, int precedence) {}
+      public static final java.util.List<Fact> FACTS = java.util.List.of(
+  #{facts.join(",\n")}
+      );
+  }
+JAVA
+keywords = TomlRB.load_file(File.join(spec, "grammar/pg_keywords.toml")).fetch("keywords").map { _1.fetch("word") }
+outputs["QuotedKeywords.java"] = header + <<~JAVA
+  public final class QuotedKeywords {
+      private QuotedKeywords() {}
+      public static final java.util.Set<String> WORDS = java.util.Set.copyOf(#{array.call(keywords)});
+  }
+JAVA
+units = TomlRB.load_file(File.join(spec, "types/datetime_units.toml"))
+qualifiers = units.fetch('interval_qualifier').map { |entry| "        new Qualifier(#{entry.fetch('code')}, #{quote.call(entry.fetch('name'))}, #{quote.call(entry.fetch('least'))}, #{entry.fetch('mm_ss', false)})" }
+facts = %w[delta date].flat_map do |table|
+  units.fetch(table).map { |entry| "        new Fact(#{quote.call(table)}, #{quote.call(entry.fetch('token'))}, #{quote.call(entry.fetch('type'))}, #{quote.call(entry.fetch('value', ''))})" }
+end
+outputs["DatetimeUnits.java"] = header + <<~JAVA
+  public final class DatetimeUnits {
+      private DatetimeUnits() {}
+      public static final int TOKEN_MAX_LEN = #{units.fetch('token_max_len')};
+      public record Fact(String table, String token, String type, String value) {}
+      public record Qualifier(int code, String name, String least, boolean minuteSecond) {}
+      public static final java.util.List<Qualifier> QUALIFIERS = java.util.List.of(
+  #{qualifiers.join(",\n")}
+      );
+      public static final java.util.List<Fact> FACTS = java.util.List.of(
+  #{facts.join(",\n")}
+      );
+  }
+JAVA
+formatting = TomlRB.load_file(File.join(spec, "types/formatting.toml"))
+format_fields = %w[dch num].map do |key|
+  entries = formatting.fetch(key).map { |entry| "        new Keyword(#{quote.call(entry.fetch('name'))}, #{quote.call(entry.fetch('id'))}, #{entry.fetch('is_digit', false)}, #{quote.call(entry.fetch('date_mode', 'none'))})" }
+  "    static final java.util.List<Keyword> #{key.upcase} = java.util.List.of(\n#{entries.join(",\n")}\n    );"
+end
+format_words = formatting.fetch("words").map { |key, words| "    static final java.util.List<String> #{key.upcase} = #{array.call(words)};" }
+outputs["FormattingCatalog.java"] = header + "final class FormattingCatalog {\n    private FormattingCatalog() {}\n    record Keyword(String name, String id, boolean digit, String mode) {}\n#{format_fields.join("\n")}\n#{format_words.join("\n")}\n}\n"
+outputs.each do |name, content|
+  path = File.join(JavaNativeTasks::PACKAGE, "src/main/java/org/jed", name)
+  if ENV["usage_check"] == "true"
+    abort "Stale generated catalog #{path}" unless File.file?(path) && File.binread(path) == content
+  else
+    FileUtils.mkdir_p(File.dirname(path))
+    File.write(path, content)
+  end
+end
+key_rows = ["# source\tgroup\tmode\tbase\ttype\tinput_kind\tinput_hex\tkey_hex"]
+%w[integers text bytea decimal float].each do |source|
+  fixture = TomlRB.load_file(File.join(spec, "encoding/#{source}.toml"))
+  %w[bare nullable descending].each do |mode|
+    fixture.fetch(mode, []).each_with_index do |group, ordinal|
+      next unless %w[i16 i32 i64 boolean text bytea decimal f32 f64].include?(group.fetch("type"))
+      group.fetch("cases").each do |entry|
+        kind = entry["null"] ? "null" : entry.key?("hex") ? "bytes" : "text"
+        input = kind == "null" ? "" : kind == "bytes" ? entry.fetch("hex") : entry.fetch("value").to_s.b.unpack1("H*")
+        key_rows << [source, ordinal, mode, group.fetch("base", "nullable"), group.fetch("type"), kind, input, entry.fetch("bytes")].join("\t")
+      end
+    end
+  end
+end
+TomlRB.load_file(File.join(spec, "encoding/ordered.toml")).fetch("group").each_with_index do |group, ordinal|
+  vector_type = group.fetch("type") == "addr (street text, zip i32)" ? "addr" : group.fetch("type")
+  next unless %w[i32[] text[] i32range numrange addr].include?(vector_type)
+  group.fetch("cases").each do |entry|
+    kind = entry["null"] ? "null" : "text"
+    input = if entry["null"]
+      ""
+    elsif group.fetch("type").end_with?("range")
+      range = entry.fetch("value").fetch("range")
+      range["empty"] ? "empty" : (range["lower_inc"] ? "[" : "(") + range.fetch("lower", "").to_s + "," + range.fetch("upper", "").to_s + (range["upper_inc"] ? "]" : ")")
+    elsif vector_type == "addr"
+      "(" + entry.fetch("value").fetch("composite").map { |field| field["null"] ? "" : '"' + field.values.first.to_s.gsub(/["\\]/) { |c| c + c } + '"' }.join(",") + ")"
+    else
+      "{" + entry.fetch("value").fetch("array").fetch("elements").map { |item| item.is_a?(Hash) && item["null"] ? "NULL" : '"' + item.to_s.gsub(/["\\]/) { |c| "\\" + c } + '"' }.join(",") + "}"
+    end
+    key_rows << ["ordered", ordinal, "nullable", "nullable", vector_type, kind, input.b.unpack1("H*"), entry.fetch("asc_nulls_last")].join("\t")
+  end
+end
+path = File.join(JavaNativeTasks::PACKAGE, "src/test/resources/encoding.tsv")
+content = key_rows.join("\n") + "\n"
+if ENV["usage_check"] == "true"
+  abort "Stale generated fixture #{path}" unless File.file?(path) && File.binread(path) == content
+else
+  FileUtils.mkdir_p(File.dirname(path))
+  File.write(path, content)
+end
+temporal_rows = ["# mode\ttype\tinput_hex\tvalue\texpected_hex\tsqlstate"]
+%w[dates timestamps].each do |source|
+  fixture = TomlRB.load_file(File.join(spec, "encoding/#{source}.toml"))
+  %w[parse parse_error render].each do |mode|
+    fixture.fetch(mode).each do |group|
+      group.fetch("cases").each do |entry|
+        temporal_rows << [mode, group.fetch("type"), entry.fetch("input", "").b.unpack1("H*"), entry.fetch("micros", entry.fetch("days", "")), entry.fetch("text", "").b.unpack1("H*"), entry.fetch("error", "")].join("\t")
+      end
+    end
+  end
+end
+path = File.join(JavaNativeTasks::PACKAGE, "src/test/resources/temporal.tsv")
+content = temporal_rows.join("\n") + "\n"
+if ENV["usage_check"] == "true"
+  abort "Stale generated fixture #{path}" unless File.file?(path) && File.binread(path) == content
+else
+  FileUtils.mkdir_p(File.dirname(path))
+  File.write(path, content)
+end
+interval_rows = ["# mode\tinput_hex\tmonths\tdays\tmicros\texpected_hex\tsqlstate"]
+fixture = TomlRB.load_file(File.join(spec, "encoding/intervals.toml"))
+%w[parse parse_error render].each do |mode|
+  fixture.fetch(mode).each do |group|
+    group.fetch("cases").each do |entry|
+      interval_rows << [mode, entry.fetch("input", "").b.unpack1("H*"), entry.fetch("months", ""), entry.fetch("days", ""), entry.fetch("micros", ""), entry.fetch("text", "").b.unpack1("H*"), entry.fetch("error", "")].join("\t")
+    end
+  end
+end
+path = File.join(JavaNativeTasks::PACKAGE, "src/test/resources/interval.tsv")
+content = interval_rows.join("\n") + "\n"
+if ENV["usage_check"] == "true"
+  abort "Stale generated fixture #{path}" unless File.file?(path) && File.binread(path) == content
+else
+  FileUtils.mkdir_p(File.dirname(path))
+  File.write(path, content)
+end
+timezone_rows = ["# zone\tinstant_micros\toffset_seconds\tabbreviation\tdaylight"]
+prng_rows = ["# seed\tbytes"]
+TomlRB.load_file(File.join(spec, "encoding/prng.toml")).fetch("stream").each do |entry|
+  prng_rows << [entry.fetch("seed"), entry.fetch("outputs").join].join("\t")
+end
+TomlRB.load_file(File.join(spec, "tz/vectors/tzif.toml")).fetch("case").each do |entry|
+  timezone_rows << [entry.fetch("zone"), entry.fetch("instant_micros"), entry.fetch("utoff_secs"), entry.fetch("abbrev"), entry.fetch("is_dst")].join("\t")
+end
+{"prng.tsv" => prng_rows.join("\n") + "\n", "timezones.tsv" => timezone_rows.join("\n") + "\n", "tzdata.jtz" => File.binread(File.join(spec, "tz/fixtures/tzdata.jtz"))}.each do |name, content|
+  path = File.join(JavaNativeTasks::PACKAGE, "src/test/resources", name)
+  if ENV["usage_check"] == "true"
+    abort "Stale generated fixture #{path}" unless File.file?(path) && File.binread(path) == content
+  else
+    File.binwrite(path, content)
+  end
+end
+puts "#{outputs.length} Java data catalogs #{ENV['usage_check'] == 'true' ? 'verified' : 'generated'}"
+regex_rows = ["# kind\tpattern_hex\tflags\tinput_hex\tprogram_or_caps\tclasses_or_matched\tcount"]
+TomlRB.load_file(File.join(spec, "regex/program_vectors.toml")).fetch("case").each do |entry|
+  regex_rows << ["program", entry.fetch("pattern").b.unpack1("H*"), entry.fetch("flags", ""), "", entry.fetch("prog").join(";").b.unpack1("H*"), entry.fetch("classes", []).join(";").b.unpack1("H*"), entry.fetch("count")].join("\t")
+end
+TomlRB.load_file(File.join(spec, "regex/match_vectors.toml")).fetch("case").each do |entry|
+  regex_rows << ["match", entry.fetch("pattern").b.unpack1("H*"), entry.fetch("flags", ""), entry.fetch("input").b.unpack1("H*"), entry.fetch("caps").flatten.map { |value| value.nil? ? -1 : value }.join(","), entry.fetch("matched"), entry.fetch("steps")].join("\t")
+end
+path = File.join(JavaNativeTasks::PACKAGE, "src/test/resources/regex.tsv")
+content = regex_rows.join("\n") + "\n"
+if ENV["usage_check"] == "true"
+  abort "Stale generated fixture #{path}" unless File.file?(path) && File.binread(path) == content
+else
+  File.binwrite(path, content)
+end
+similar_rows = ["# pattern_hex\tescape_hex\tinput_hex\ttranslation_hex\tsimilar\tcompile\tsteps\tsubstring_hex\tnull\tsubstring_compile\tsubstring_steps\terror\tsubstring_error"]
+TomlRB.load_file(File.join(spec, "regex/similar_vectors.toml")).fetch("case").each do |entry|
+  similar_rows << [entry.fetch("pattern").b.unpack1("H*"), entry.fetch("escape", "\\").b.unpack1("H*"), entry.fetch("input").b.unpack1("H*"), entry.fetch("translation", "").b.unpack1("H*"), entry.fetch("similar", ""), entry.fetch("similar_compile", ""), entry.fetch("similar_steps", ""), entry.fetch("substring", "").b.unpack1("H*"), entry.fetch("substring_null", false), entry.fetch("substring_compile", ""), entry.fetch("substring_steps", ""), entry.fetch("error", ""), entry.fetch("substring_error", "")].join("\t")
+end
+path = File.join(JavaNativeTasks::PACKAGE, "src/test/resources/similar.tsv")
+content = similar_rows.join("\n") + "\n"
+if ENV["usage_check"] == "true"
+  abort "Stale generated fixture #{path}" unless File.file?(path) && File.binread(path) == content
+else
+  File.binwrite(path, content)
+end
+
+collation_rows = ["# kind\tname\tinput_hex\texpected_hex"]
+TomlRB.load_file(File.join(spec, "collation/vectors/compiler.toml")).fetch("compiler").each do |entry|
+  collation_rows << ["artifact", entry.fetch("coll_name"), entry.fetch("artifact_hex"), entry.fetch("table_hex")].join("\t")
+end
+TomlRB.load_file(File.join(spec, "collation/vectors/bundle.toml")).fetch("bundle").each do |entry|
+  collation_rows << ["bundle", entry.fetch("name"), entry.fetch("bundle_hex"), ""].join("\t")
+end
+TomlRB.load_file(File.join(spec, "collation/vectors/sortkey.toml")).fetch("sortkey").each do |entry|
+  collation_rows << ["key", entry.fetch("coll_name"), entry.fetch("string").b.unpack1("H*"), entry.fetch("sortkey_hex")].join("\t")
+end
+{"collation.tsv" => collation_rows.join("\n") + "\n", "unicode.jucd" => File.binread(File.join(spec, "collation/fixtures/unicode.jucd"))}.each do |name, content|
+  path = File.join(JavaNativeTasks::PACKAGE, "src/test/resources", name)
+  if ENV["usage_check"] == "true"
+    abort "Stale generated fixture #{path}" unless File.file?(path) && File.binread(path) == content
+  else
+    FileUtils.mkdir_p(File.dirname(path)); File.binwrite(path, content)
+  end
+end

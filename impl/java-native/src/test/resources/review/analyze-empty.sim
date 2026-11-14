@@ -1,0 +1,40 @@
+# format: simulation
+# profile: analyze-empty-review
+# seed: 1
+# page_size: 1024
+# cache_bytes: 2048
+# clock: 1700000000000000
+open w1 write
+on w1 CREATE TABLE t(id i32)
+commit w1
+check
+open w2 write
+on w2 ANALYZE t
+commit w2
+check
+open w3 write
+on w3 ANALYZE t
+commit w3
+check
+open w4 write
+on w4 ANALYZE t
+commit w4
+check
+open w5 write
+on w5 ANALYZE t
+commit w5
+check
+open w6 write
+on w6 ANALYZE t
+commit w6
+check
+open w7 write
+on w7 ANALYZE t
+commit w7
+check
+open w8 write
+on w8 ANALYZE t
+commit w8
+check
+reopen
+check

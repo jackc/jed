@@ -1,0 +1,50 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#MISE description="Explicit opt-in: complete pinned Java fault trace with deterministic replay and optional Go comparison"
+#USAGE flag "--file <path>" help="Complete .sim trace, default frozen analyze-then-drop-table"
+#USAGE flag "--peer" help="Execute frozen Go trace and compare exact transcript where the shared contract permits"
+#USAGE flag "--variant <variant>" default="stable" help="stable, ea, or valhalla"
+#USAGE flag "--actor <directory>" help="Use an immutable Java actor capture"
+#USAGE flag "--evidence-dir <directory>" help="Retain exact transcripts, peer images and actor identities"
+require_relative "../../impl/java-native/Tools/peer_actors"
+variant = ENV.fetch("usage_variant", "stable")
+spec = JavaNativeTasks.baseline_spec
+file = File.expand_path(ENV["usage_file"] || File.join(spec, "conformance/sim/regress/analyze-then-drop-table.sim"))
+abort "Trace must be an existing complete .sim file" unless File.file?(file) && file.end_with?(".sim")
+capture = ENV["usage_actor"] ? File.expand_path(ENV.fetch("usage_actor")) : JavaNativeTasks.capture(JavaNativeTasks.build(variant), variant)
+JSON.parse(File.read(File.join(capture, "artifacts.json"))).each do |name, hash|
+  abort "Immutable Java actor differs: #{name}" unless Digest::SHA256.file(File.join(capture, name)).hexdigest == hash
+end
+metadata = JSON.parse(File.read(File.join(capture, "build.json")))
+abort "Actor runtime variant mismatch" unless metadata.fetch("variant") == variant
+evidence = File.expand_path(ENV["usage_evidence_dir"] || File.join(JavaNativeTasks::DEV, "simulation-evidence", File.basename(file, ".sim"), File.basename(capture)))
+FileUtils.mkdir_p(evidence)
+FileUtils.cp(file, File.join(evidence, "trace.sim"))
+File.write(File.join(evidence, "actor.json"), JSON.pretty_generate(metadata) + "\n")
+warn "Java complete simulation #{file}; source #{metadata.fetch('source_sha256')}; actor #{capture}"
+output, error, status = Open3.capture3({ "JED_SIM_OUT" => evidence }, *JavaNativeTasks.actor_command(capture, variant), "simulation", file)
+File.binwrite(File.join(evidence, "java-native.jsonl"), output)
+File.binwrite(File.join(evidence, "java-native.stderr"), error)
+$stdout.write(output); $stderr.write(error)
+exit(status.exitstatus || 1) unless status.success?
+exit 0 unless ENV["usage_peer"] == "true"
+peer = JavaPeerActors.go(:simulation)
+peer_dir = File.join(evidence, "go")
+FileUtils.mkdir_p(peer_dir)
+peer_output, peer_error, peer_status = Open3.capture3({ "JED_SIM_IN" => file, "JED_SIM_OUT" => peer_dir, "JED_SIM_IMAGES" => "1" }, peer, "-test.run", "^TestSimRunner$", "-test.count=1", chdir: File.join(File.dirname(peer), "impl/go"))
+File.binwrite(File.join(evidence, "go.stdout"), peer_output)
+File.binwrite(File.join(evidence, "go.stderr"), peer_error)
+abort "Frozen Go simulator failed:\n#{peer_output}\n#{peer_error}" unless peer_status.success?
+expected = File.binread(File.join(peer_dir, "#{File.basename(file, '.sim')}.go.jsonl"))
+File.binwrite(File.join(evidence, "go.jsonl"), expected)
+# simulation-testing.md §6.3: physical read, allocation, spill and corruption fault positions differ.
+intrinsic = File.foreach(file).any? { |line| line.start_with?("fault read_error", "fault enospc", "fault spill_error", "corrupt") }
+if intrinsic
+  warn "PASS complete Java/Go intrinsic oracles; exact transcript comparison inapplicable under simulation-testing.md §6.3; evidence #{evidence}"
+else
+  unless expected == output
+    mismatch = expected.lines.zip(output.lines).each_with_index.find { |(a,b), _| a != b }
+    abort "Frozen transcript mismatch at line #{mismatch ? mismatch.last + 1 : 'length'}; evidence #{evidence}"
+  end
+  warn "PASS exact frozen Java/Go simulation transcript; evidence #{evidence}"
+end

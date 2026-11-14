@@ -1,0 +1,198 @@
+# source	group	mode	base	type	input_kind	input_hex	key_hex
+integers	0	bare	nullable	i16	text	2d3332373638	0000
+integers	0	bare	nullable	i16	text	2d323536	7f00
+integers	0	bare	nullable	i16	text	2d31	7fff
+integers	0	bare	nullable	i16	text	30	8000
+integers	0	bare	nullable	i16	text	31	8001
+integers	0	bare	nullable	i16	text	313030	8064
+integers	0	bare	nullable	i16	text	323536	8100
+integers	0	bare	nullable	i16	text	3332373637	ffff
+integers	1	bare	nullable	i32	text	2d32313437343833363438	00000000
+integers	1	bare	nullable	i32	text	2d31	7fffffff
+integers	1	bare	nullable	i32	text	30	80000000
+integers	1	bare	nullable	i32	text	31	80000001
+integers	1	bare	nullable	i32	text	313030	80000064
+integers	1	bare	nullable	i32	text	3332373638	80008000
+integers	1	bare	nullable	i32	text	32303030303030303030	f7359400
+integers	1	bare	nullable	i32	text	32313437343833363437	ffffffff
+integers	2	bare	nullable	i64	text	2d39323233333732303336383534373735383038	0000000000000000
+integers	2	bare	nullable	i64	text	2d31	7fffffffffffffff
+integers	2	bare	nullable	i64	text	30	8000000000000000
+integers	2	bare	nullable	i64	text	31	8000000000000001
+integers	2	bare	nullable	i64	text	3130303030303030303030	80000002540be400
+integers	2	bare	nullable	i64	text	39323233333732303336383534373735383037	ffffffffffffffff
+integers	4	bare	nullable	boolean	text	66616c7365	00
+integers	4	bare	nullable	boolean	text	74727565	01
+integers	0	nullable	nullable	i16	text	2d31	007fff
+integers	0	nullable	nullable	i16	text	30	008000
+integers	0	nullable	nullable	i16	text	31	008001
+integers	0	nullable	nullable	i16	null		01
+integers	2	nullable	nullable	boolean	text	66616c7365	0000
+integers	2	nullable	nullable	boolean	text	74727565	0001
+integers	2	nullable	nullable	boolean	null		01
+integers	0	descending	nullable	i16	null		fe
+integers	0	descending	nullable	i16	text	31	ff7ffe
+integers	0	descending	nullable	i16	text	30	ff7fff
+integers	0	descending	nullable	i16	text	2d31	ff8000
+integers	2	descending	nullable	boolean	null		fe
+integers	2	descending	nullable	boolean	text	74727565	fffe
+integers	2	descending	nullable	boolean	text	66616c7365	ffff
+text	0	bare	nullable	text	text		0001
+text	0	bare	nullable	text	text	61	610001
+text	0	bare	nullable	text	text	610062	6100ff620001
+text	0	bare	nullable	text	text	6161	61610001
+text	0	bare	nullable	text	text	6162	61620001
+text	0	bare	nullable	text	text	62	620001
+text	0	bare	nullable	text	text	c3a9	c3a90001
+text	0	bare	nullable	text	text	e4b8ad	e4b8ad0001
+text	0	bare	nullable	text	text	efa480	efa4800001
+text	0	bare	nullable	text	text	efac80	efac800001
+text	0	bare	nullable	text	text	efbfbd	efbfbd0001
+text	0	bare	nullable	text	text	f09d9080	f09d90800001
+text	0	bare	nullable	text	text	f09f9880	f09f98800001
+text	0	bare	nullable	text	text	f09f9a80	f09f9a800001
+text	0	nullable	nullable	text	text		000001
+text	0	nullable	nullable	text	text	61	00610001
+text	0	nullable	nullable	text	text	62	00620001
+text	0	nullable	nullable	text	null		01
+text	0	descending	nullable	text	null		fe
+text	0	descending	nullable	text	text	62	ff9dfffe
+text	0	descending	nullable	text	text	61	ff9efffe
+text	0	descending	nullable	text	text		fffffe
+bytea	0	bare	nullable	bytea	bytes		0001
+bytea	0	bare	nullable	bytea	bytes	00	00ff0001
+bytea	0	bare	nullable	bytea	bytes	61	610001
+bytea	0	bare	nullable	bytea	bytes	6100ff62	6100ffff620001
+bytea	0	bare	nullable	bytea	bytes	6161	61610001
+bytea	0	bare	nullable	bytea	bytes	62	620001
+bytea	0	bare	nullable	bytea	bytes	ff	ff0001
+bytea	0	nullable	nullable	bytea	bytes		000001
+bytea	0	nullable	nullable	bytea	bytes	61	00610001
+bytea	0	nullable	nullable	bytea	null		01
+bytea	0	descending	nullable	bytea	null		fe
+bytea	0	descending	nullable	bytea	bytes	61	ff9efffe
+bytea	0	descending	nullable	bytea	bytes		fffffe
+decimal	0	bare	nullable	decimal	text	2d3939393939393939393939393939393939393939	037ffffff59b9b9b9b9b9b9b9b9b9bff
+decimal	0	bare	nullable	decimal	text	2d31323334352e36373839	037ffffffcfde7d1bba5ff
+decimal	0	bare	nullable	decimal	text	2d313233	037ffffffdfde7ff
+decimal	0	bare	nullable	decimal	text	2d313031	037ffffffdfdfdff
+decimal	0	bare	nullable	decimal	text	2d313030	037ffffffdfdff
+decimal	0	bare	nullable	decimal	text	2d3132	037ffffffef2ff
+decimal	0	bare	nullable	decimal	text	2d3130	037ffffffef4ff
+decimal	0	bare	nullable	decimal	text	2d35	037ffffffef9ff
+decimal	0	bare	nullable	decimal	text	2d312e35	037ffffffefdccff
+decimal	0	bare	nullable	decimal	text	2d31	037ffffffefdff
+decimal	0	bare	nullable	decimal	text	2d302e35	037fffffffccff
+decimal	0	bare	nullable	decimal	text	2d302e3035	037ffffffff9ff
+decimal	0	bare	nullable	decimal	text	2d302e303031	0380000000f4ff
+decimal	0	bare	nullable	decimal	text	30	04
+decimal	0	bare	nullable	decimal	text	302e303031	057fffffff0b00
+decimal	0	bare	nullable	decimal	text	302e3035	05800000000600
+decimal	0	bare	nullable	decimal	text	302e35	05800000003300
+decimal	0	bare	nullable	decimal	text	31	05800000010200
+decimal	0	bare	nullable	decimal	text	312e35	0580000001023300
+decimal	0	bare	nullable	decimal	text	35	05800000010600
+decimal	0	bare	nullable	decimal	text	3130	05800000010b00
+decimal	0	bare	nullable	decimal	text	3132	05800000010d00
+decimal	0	bare	nullable	decimal	text	313030	05800000020200
+decimal	0	bare	nullable	decimal	text	313031	0580000002020200
+decimal	0	bare	nullable	decimal	text	313233	0580000002021800
+decimal	0	bare	nullable	decimal	text	31323334352e36373839	058000000302182e445a00
+decimal	0	bare	nullable	decimal	text	3939393939393939393939393939393939393939	058000000a6464646464646464646400
+decimal	0	nullable	nullable	decimal	text	2d312e35	00037ffffffefdccff
+decimal	0	nullable	nullable	decimal	text	2d302e303031	000380000000f4ff
+decimal	0	nullable	nullable	decimal	text	30	0004
+decimal	0	nullable	nullable	decimal	text	302e303031	00057fffffff0b00
+decimal	0	nullable	nullable	decimal	text	312e35	000580000001023300
+decimal	0	nullable	nullable	decimal	text	313030	0005800000020200
+decimal	0	nullable	nullable	decimal	null		01
+decimal	0	descending	nullable	decimal	null		fe
+decimal	0	descending	nullable	decimal	text	313030	fffa7ffffffdfdff
+decimal	0	descending	nullable	decimal	text	312e35	fffa7ffffffefdccff
+decimal	0	descending	nullable	decimal	text	302e303031	fffa80000000f4ff
+decimal	0	descending	nullable	decimal	text	30	fffb
+decimal	0	descending	nullable	decimal	text	2d302e303031	fffc7fffffff0b00
+decimal	0	descending	nullable	decimal	text	2d312e35	fffc80000001023300
+float	0	bare	nullable	f64	text	2d496e66696e697479	000fffffffffffff
+float	0	bare	nullable	f64	text	2d312e3739373639333133343836323331353765333038	0010000000000000
+float	0	bare	nullable	f64	text	2d312e35	4007ffffffffffff
+float	0	bare	nullable	f64	text	302e30	8000000000000000
+float	0	bare	nullable	f64	text	312e35	bff8000000000000
+float	0	bare	nullable	f64	text	312e3739373639333133343836323331353765333038	ffefffffffffffff
+float	0	bare	nullable	f64	text	496e66696e697479	fff0000000000000
+float	0	bare	nullable	f64	text	4e614e	fff8000000000000
+float	1	bare	nullable	f32	text	2d496e66696e697479	007fffff
+float	1	bare	nullable	f32	text	2d332e34303238323334363633383532383836653338	00800000
+float	1	bare	nullable	f32	text	2d312e35	403fffff
+float	1	bare	nullable	f32	text	302e30	80000000
+float	1	bare	nullable	f32	text	312e35	bfc00000
+float	1	bare	nullable	f32	text	332e34303238323334363633383532383836653338	ff7fffff
+float	1	bare	nullable	f32	text	496e66696e697479	ff800000
+float	1	bare	nullable	f32	text	4e614e	ffc00000
+float	0	nullable	nullable	f64	text	2d496e66696e697479	00000fffffffffffff
+float	0	nullable	nullable	f64	text	2d312e3739373639333133343836323331353765333038	000010000000000000
+float	0	nullable	nullable	f64	text	2d312e35	004007ffffffffffff
+float	0	nullable	nullable	f64	text	302e30	008000000000000000
+float	0	nullable	nullable	f64	text	312e35	00bff8000000000000
+float	0	nullable	nullable	f64	text	312e3739373639333133343836323331353765333038	00ffefffffffffffff
+float	0	nullable	nullable	f64	text	496e66696e697479	00fff0000000000000
+float	0	nullable	nullable	f64	text	4e614e	00fff8000000000000
+float	0	nullable	nullable	f64	null		01
+float	1	nullable	nullable	f32	text	2d496e66696e697479	00007fffff
+float	1	nullable	nullable	f32	text	2d332e34303238323334363633383532383836653338	0000800000
+float	1	nullable	nullable	f32	text	2d312e35	00403fffff
+float	1	nullable	nullable	f32	text	302e30	0080000000
+float	1	nullable	nullable	f32	text	312e35	00bfc00000
+float	1	nullable	nullable	f32	text	332e34303238323334363633383532383836653338	00ff7fffff
+float	1	nullable	nullable	f32	text	496e66696e697479	00ff800000
+float	1	nullable	nullable	f32	text	4e614e	00ffc00000
+float	1	nullable	nullable	f32	null		01
+float	0	descending	nullable	f64	null		fe
+float	0	descending	nullable	f64	text	4e614e	ff0007ffffffffffff
+float	0	descending	nullable	f64	text	496e66696e697479	ff000fffffffffffff
+float	0	descending	nullable	f64	text	312e3739373639333133343836323331353765333038	ff0010000000000000
+float	0	descending	nullable	f64	text	312e35	ff4007ffffffffffff
+float	0	descending	nullable	f64	text	302e30	ff7fffffffffffffff
+float	0	descending	nullable	f64	text	2d312e35	ffbff8000000000000
+float	0	descending	nullable	f64	text	2d312e3739373639333133343836323331353765333038	ffffefffffffffffff
+float	0	descending	nullable	f64	text	2d496e66696e697479	fffff0000000000000
+float	1	descending	nullable	f32	null		fe
+float	1	descending	nullable	f32	text	4e614e	ff003fffff
+float	1	descending	nullable	f32	text	496e66696e697479	ff007fffff
+float	1	descending	nullable	f32	text	332e34303238323334363633383532383836653338	ff00800000
+float	1	descending	nullable	f32	text	312e35	ff403fffff
+float	1	descending	nullable	f32	text	302e30	ff7fffffff
+float	1	descending	nullable	f32	text	2d312e35	ffbfc00000
+float	1	descending	nullable	f32	text	2d332e34303238323334363633383532383836653338	ffff7fffff
+float	1	descending	nullable	f32	text	2d496e66696e697479	ffff800000
+ordered	14	nullable	nullable	i32range	text	656d707479	0000
+ordered	14	nullable	nullable	i32range	text	282c3329	000100018000000300
+ordered	14	nullable	nullable	i32range	text	5b312c3429	0001018000000100018000000400
+ordered	14	nullable	nullable	i32range	text	5b312c3529	0001018000000100018000000500
+ordered	14	nullable	nullable	i32range	text	5b312c29	000101800000010002
+ordered	14	nullable	nullable	i32range	text	5b322c3329	0001018000000200018000000300
+ordered	14	nullable	nullable	i32range	null		01
+ordered	15	nullable	nullable	numrange	text	5b2d312e352c3229	000101037ffffffefdccff00010580000001030000
+ordered	15	nullable	nullable	numrange	text	5b312e352c325d	000101058000000102330000010580000001030001
+ordered	15	nullable	nullable	numrange	text	28312e352c325d	000101058000000102330001010580000001030001
+ordered	15	nullable	nullable	numrange	null		01
+ordered	16	nullable	nullable	i32[]	text	7b7d	000000
+ordered	16	nullable	nullable	i32[]	text	7b2231227d	00018000000100010000000180000001
+ordered	16	nullable	nullable	i32[]	text	7b2231222c2232227d	000180000001018000000200010000000280000001
+ordered	16	nullable	nullable	i32[]	text	7b2231222c2232222c2233227d	0001800000010180000002018000000300010000000380000001
+ordered	16	nullable	nullable	i32[]	text	7b2231222c4e554c4c7d	0001800000010200010000000280000001
+ordered	16	nullable	nullable	i32[]	text	7b2232227d	00018000000200010000000180000001
+ordered	16	nullable	nullable	i32[]	null		01
+ordered	17	nullable	nullable	text[]	text	7b7d	000000
+ordered	17	nullable	nullable	text[]	text	7b2261227d	000161000100010000000180000001
+ordered	17	nullable	nullable	text[]	text	7b2261222c2262227d	00016100010162000100010000000280000001
+ordered	17	nullable	nullable	text[]	text	7b2261222c4e554c4c7d	00016100010200010000000280000001
+ordered	17	nullable	nullable	text[]	text	7b226162227d	00016162000100010000000180000001
+ordered	17	nullable	nullable	text[]	text	7b2262227d	000162000100010000000180000001
+ordered	17	nullable	nullable	text[]	null		01
+ordered	18	nullable	nullable	addr	text	2822222c22312229	000000010080000001
+ordered	18	nullable	nullable	addr	text	28224d6169222c22352229	00004d616900010080000005
+ordered	18	nullable	nullable	addr	text	28224d61696e222c2239303231302229	00004d61696e00010080016062
+ordered	18	nullable	nullable	addr	text	28224d61696e222c29	00004d61696e000101
+ordered	18	nullable	nullable	addr	text	282c22312229	00010080000001
+ordered	18	nullable	nullable	addr	null		01

@@ -1,0 +1,45 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#MISE description="Explicit opt-in: attempt complete frozen Java corpus files; unsupported records fail"
+#USAGE flag "--actor <directory>" help="Reuse and validate an immutable Java actor capture"
+#USAGE flag "--variant <variant>" default="stable" help="stable, ea, or valhalla"
+#USAGE flag "--all" help="Attempt every pinned SQL file"
+#USAGE flag "--suite <name>" help="Attempt all complete files in a frozen suite directory"
+#USAGE flag "--file <path>" help="Attempt one complete .test file"
+#USAGE flag "--files <paths>" help="Comma-separated complete .test files in one immutable actor"
+#USAGE flag "--disk" help="Use plain durable storage"
+#USAGE flag "--encrypted" help="Use encrypted durable storage"
+require_relative "../../impl/java-native/Tools/tasks"
+all = ENV["usage_all"] == "true"
+suite = ENV["usage_suite"]
+file = ENV["usage_file"]
+selected = ENV["usage_files"]
+abort "Choose exactly one of --all, --suite, --file, or --files" unless [all ? true : nil, suite, file, selected].compact.length == 1
+abort "Choose either --disk or --encrypted" if ENV["usage_disk"] == "true" && ENV["usage_encrypted"] == "true"
+base = File.join(JavaNativeTasks.baseline_spec, "conformance/suites")
+files = if selected
+  selected.split(",").map { File.expand_path(_1) }
+elsif file
+  [File.expand_path(file)]
+else
+  directory = suite ? File.expand_path(suite, base) : base
+  abort "Unknown suite" unless (directory == base || directory.start_with?(base + "/")) && File.directory?(directory)
+  Dir.glob(File.join(directory, "**/*.test")).sort
+end
+abort "Every selected file must exist and end in .test" unless !files.empty? && files.all? { File.file?(_1) && _1.end_with?(".test") }
+variant = ENV.fetch("usage_variant", "stable")
+mode = ENV["usage_encrypted"] == "true" ? "corpus-encrypted" : ENV["usage_disk"] == "true" ? "corpus-file" : "corpus"
+puts "Attempting #{files.length} complete files; baseline #{JavaNativeTasks::BASELINE.fetch('semantic_revision')}"
+$stdout.flush
+if mode == "corpus-encrypted"
+  if ENV["usage_actor"] && !File.file?(File.join(ENV.fetch("usage_actor"), "test-classes/org/jed/EncryptedCorpusOracle.class"))
+    abort "Encrypted acceptance requires a rebuilt actor with independent peer assertions"
+  end
+  require_relative "../../impl/java-native/Tools/encrypted_oracle"
+  JavaEncryptedOracle.prepare(files)
+end
+if ENV["usage_actor"]
+  JavaNativeTasks.run_actor(ENV.fetch("usage_actor"), variant, mode, *files)
+else
+  JavaNativeTasks.run(JavaNativeTasks.build(variant), variant, mode, *files)
+end

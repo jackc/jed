@@ -1,0 +1,70 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#MISE description="Explicit opt-in: frozen threaded snapshot stress in Java memory/plain/encrypted modes and independent Go"
+#USAGE flag "--variant <variant>" default="stable" help="stable, ea, or valhalla"
+#USAGE flag "--actor <directory>" help="Reuse an immutable Java actor"
+require_relative "../../impl/java-native/Tools/peer_actors"
+require_relative "../../scripts/lib/bundle_setup"
+require "toml-rb"
+
+revision = JavaNativeTasks::BASELINE.fetch("semantic_revision")
+root = File.dirname(JavaPeerActors.go)
+File.open("#{root}.lock", File::RDWR | File::CREAT, 0o600) do |lock|
+  lock.flock(File::LOCK_EX)
+  marker = File.join(root, ".stress-complete")
+  unless File.file?(marker)
+    statuses = Open3.pipeline(["git", "archive", revision, "bench/go", "stress", { chdir: JavaNativeTasks::ROOT }], ["tar", "-x", "-C", root])
+    abort "Cannot export pinned stress peer" unless statuses.all?(&:success?)
+    File.write(marker, revision + "\n")
+  end
+end
+profiles = Dir.glob(File.join(root, "stress/*.stress.toml")).sort
+abort "Pinned stress inventory changed" unless profiles.map { File.basename(_1) } == ["balance_transfer.stress.toml"]
+inputs = profiles.map { TomlRB.parse(File.read(_1)) }
+go = File.join(root, "stress_actor")
+unless File.executable?(go)
+  abort "Offline Go stress peer build failed" unless system({ "GOPROXY" => "off", "GOSUMDB" => "off", "GOTOOLCHAIN" => "local", "CGO_ENABLED" => "0" }, "go", "build", "-trimpath", "-o", go, "./cmd/stress", chdir: File.join(root, "bench/go"))
+end
+variant = ENV.fetch("usage_variant", "stable")
+actor = ENV["usage_actor"] ? File.expand_path(ENV.fetch("usage_actor")) : JavaNativeTasks.capture(JavaNativeTasks.build(variant), variant)
+metadata = JSON.parse(File.read(File.join(actor, "build.json")))
+abort "Actor variant differs" unless metadata.fetch("variant") == variant
+JSON.parse(File.read(File.join(actor, "artifacts.json"))).each do |name, hash|
+  abort "Actor changed: #{name}" unless Digest::SHA256.file(File.join(actor, name)).hexdigest == hash
+end
+output = Dir.mktmpdir("stress-#{variant}-", JavaNativeTasks::DEV)
+warn "Stress evidence: #{output}"
+input = File.join(output, "profiles.json"); File.write(input, JSON.generate(schema: 1, profiles: inputs))
+results = []; failures = []
+%w[memory disk encrypted].each do |storage|
+  stdout, stderr, status = Open3.capture3(*JavaNativeTasks.actor_command(actor, variant), "stress", input, storage)
+  File.write(File.join(output, storage + ".jsonl"), stdout); File.write(File.join(output, storage + ".log"), stderr)
+  failures << "Java #{storage} failed: #{stderr}" unless status.success?
+  rows = stdout.lines.map { JSON.parse(_1) }
+  failures << "Java #{storage} incomplete profiles" unless rows.length == inputs.length
+  results.concat(rows)
+end
+go_results = File.join(output, "go.jsonl")
+stdout, stderr, status = Open3.capture3(go, File.join(root, "stress"), go_results)
+File.write(File.join(output, "go.log"), stdout + stderr)
+failures << "Pinned Go stress failed" unless status.success?
+results.concat(File.readlines(go_results).map { JSON.parse(_1) }) if File.file?(go_results)
+inputs.each do |profile|
+  rows = results.select { _1["name"] == profile.fetch("meta").fetch("name") }
+  writers = profile.fetch("worker").select { _1["kind"] == "writer" }
+  expected = { "schema" => 1, "status" => "pass", "mode" => "threaded", "final_ok" => true,
+    "invariant_checks" => profile.fetch("worker").select { _1["kind"] == "reader" }.sum { _1.fetch("count") * _1.fetch("iterations") },
+    "writers" => writers.sum { _1.fetch("count") }, "writer_iters" => writers.sum { _1.fetch("count") * _1.fetch("iterations") },
+    "cross_core_checksum" => profile.fetch("final").fetch("cross_core_checksum") }
+  observed = rows.map { [_1["lang"], _1["storage"]] }.sort_by(&:inspect)
+  failures << "Missing or duplicate stress results" unless observed == [["java-native", "memory"], ["java-native", "disk"], ["java-native", "encrypted"], ["go", nil]].sort_by(&:inspect)
+  rows.each do |row|
+    expected.each { |key, value| failures << "#{row['lang']}/#{row['storage']}: #{key} differs" unless row[key] == value && (!value.is_a?(Integer) || row[key].is_a?(Integer)) }
+    failures << "Invalid stress checksum" unless row["checksum"].is_a?(String) && row["checksum"].match?(/\A[0-9a-f]{16}\z/)
+  end
+  failures << "Independent final checksum differs" unless rows.map { _1["checksum"] }.uniq.length == 1
+end
+File.write(File.join(output, "report.json"), JSON.pretty_generate(baseline: revision, profiles: profiles.to_h { [File.basename(_1), Digest::SHA256.file(_1).hexdigest] },
+  actor: actor, java: metadata, go_sha256: Digest::SHA256.file(go).hexdigest, results: results, failures: failures) + "\n")
+abort failures.join("\n") unless failures.empty?
+puts "PASS threaded stress: Java #{variant} memory/plain/encrypted and pinned Go; #{results.sum { _1.fetch('invariant_checks') }} snapshot checks; exact checksum #{results.first.fetch('checksum')}"
