@@ -78,8 +78,10 @@ func leafReadCases(b *testing.B) []readCase {
 			default:
 				reg = encodeRegion(colType{Scalar: scalarInt64}, n, vb, nulls)
 			}
-			out = append(out, readCase{name: pattern + "/" + name, w: w, n: n, vb: vb, nulls: nulls,
-				region: reg[1:], kind: reg[0], runsIdx: runs, blocks: blocks})
+			out = append(out, readCase{
+				name: pattern + "/" + name, w: w, n: n, vb: vb, nulls: nulls,
+				region: reg[1:], kind: reg[0], runsIdx: runs, blocks: blocks,
+			})
 		}
 		add("kind1", leafRunsOff, false, 0, 0, false)
 		add("exception", leafRunsOff, true, regionFORX, 0, false)

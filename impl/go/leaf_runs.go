@@ -104,8 +104,10 @@ type runsAcc struct {
 
 func newRunsAcc(w int) *runsAcc {
 	ws := runsWidths(w)
-	return &runsAcc{w: w, ws: ws, dp: []int{0}, choiceS: []int32{0}, choiceB: []uint8{0},
-		lo: make([]int, len(ws)), minQ: make([]deque, len(ws)), maxQ: make([]deque, len(ws)), cand: make([]deque, len(ws))}
+	return &runsAcc{
+		w: w, ws: ws, dp: []int{0}, choiceS: []int32{0}, choiceB: []uint8{0},
+		lo: make([]int, len(ws)), minQ: make([]deque, len(ws)), maxQ: make([]deque, len(ws)), cand: make([]deque, len(ws)),
+	}
 }
 
 func (a *runsAcc) clone() *runsAcc {

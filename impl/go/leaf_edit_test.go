@@ -254,10 +254,18 @@ func TestLeafWidenGrowth(t *testing.T) {
 		runs   int
 		blocks int
 		bexc   bool
-	}{{"v53", 0, false, 0, 0, false}, {"slack32", 32, false, 0, 0, false}, {"slack16", 16, false, 0, 0, false},
-		{"forx", 0, true, 0, 0, false}, {"runs-s", 0, false, leafRunsSearch, 0, false}, {"runs-r", 0, false, leafRunsRank, 0, false},
-		{"blk64", 0, false, 0, 64, false}, {"blk64x", 0, false, 0, 64, true}, {"blk32x", 0, false, 0, 32, true},
-		{"blk64x+fx", 0, true, 0, 64, true}}
+	}{
+		{"v53", 0, false, 0, 0, false},
+		{"slack32", 32, false, 0, 0, false},
+		{"slack16", 16, false, 0, 0, false},
+		{"forx", 0, true, 0, 0, false},
+		{"runs-s", 0, false, leafRunsSearch, 0, false},
+		{"runs-r", 0, false, leafRunsRank, 0, false},
+		{"blk64", 0, false, 0, 64, false},
+		{"blk64x", 0, false, 0, 64, true},
+		{"blk32x", 0, false, 0, 32, true},
+		{"blk64x+fx", 0, true, 0, 64, true},
+	}
 	for _, c := range cases {
 		for _, m := range modes {
 			leafSlack, leafFORX, leafRuns, leafBlocks, leafBlocksExc = m.slack, m.forx, m.runs, m.blocks, m.bexc
